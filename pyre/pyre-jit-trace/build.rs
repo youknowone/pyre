@@ -754,7 +754,7 @@ fn real_main() {
     let mut source_paths = Vec::new();
 
     for dir in &source_dirs {
-        collect_rs_files(dir, &mut source_paths);
+        source_paths.extend(majit_translate::module_path::collect_rs_files(dir));
     }
 
     // Include the canonical portal source so its module-qualified identity is
@@ -928,7 +928,7 @@ fn real_main() {
     // object identity, descr.py:108-118).
     let module_paths: Vec<String> = source_paths
         .iter()
-        .map(|p| module_path_from_source_file(p))
+        .map(|p| majit_translate::module_path::module_path_from_source_file(p))
         .collect();
     let module_path_refs: Vec<&str> = module_paths.iter().map(|s| s.as_str()).collect();
 
@@ -2091,86 +2091,17 @@ impl CacheHasher {
     }
 }
 
-/// Collect a single `.rs` file by absolute path, mirroring
-/// `collect_rs_files`'s read-into-vecs convention.  Used to thread
+/// Collect a single `.rs` file by absolute path, appending to the same
+/// vec the directory walk fills.  Used to thread
 /// `pyre-jit/src/eval.rs` (the portal canonical)
 /// into the analysis without including the rest of pyre-jit's JIT
 /// infrastructure (codewriter, assembler, regalloc, ...).
-/// Crate-stripped module path for a source file at `path`.
-///
-/// Strips the crate root (`/.../<crate>/src/` prefix) and the `.rs`
-/// suffix, then converts `/` to `::` for nested files.  Matches the
-/// runtime `module_path!()` macro output after the leading crate
-/// segment is dropped — both sides hash the same string so
-/// `gc_cache._cache_size[LLType::Struct(path_hash(path))]` slots
-/// align (PyPy descr.py:108-118 `cache[STRUCT]` identity).
-///
-/// Examples (input → output):
-/// - `"pyre/pyre-object/src/intobject.rs"` → `"intobject"`
-/// - `"pyre/pyre-interpreter/src/pyframe.rs"` → `"pyframe"`
-/// - `"pyre/pyre-interpreter/src/foo/bar.rs"` → `"foo::bar"`
-/// - `"pyre/pyre-interpreter/src/lib.rs"` → `""` (crate root, no qualifier)
-///
-/// Returns `""` when the path does not contain `/src/` — callers
-/// outside the canonical layout (synthesized files, fixtures) keep
-/// the simple-name registration.
-fn module_path_from_source_file(path: &str) -> String {
-    // Windows `WalkDir` yields native paths with `\` separators; the marker
-    // search + `/lib` / `/mod` suffix strips + final `/` → `::` rewrite
-    // below all assume forward slashes, so an unnormalised Windows path
-    // falls into the `rfind` `None` branch and every source file ends up
-    // with an empty `module_path`.  Empty module paths skip
-    // `register_struct_origins` (`lib.rs:374-382`), which breaks
-    // classdef-keyed method resolution downstream and silently drops
-    // graphs from the analyzer — surfacing later as missing opcodes in
-    // `pipeline.insns` (e.g. `setfield_vable_i/rid`).
-    let normalized_path = path.replace('\\', "/");
-    let path = normalized_path.as_str();
-    let marker = "/src/";
-    let Some(idx) = path.rfind(marker) else {
-        return String::new();
-    };
-    let rest = &path[idx + marker.len()..];
-    let stem = rest.strip_suffix(".rs").unwrap_or(rest);
-    let normalized = stem
-        .strip_suffix("/lib")
-        .or_else(|| stem.strip_suffix("/mod"))
-        .unwrap_or(stem);
-    if normalized == "lib" || normalized == "mod" {
-        return String::new();
-    }
-    normalized.replace('/', "::")
-}
-
 fn collect_single_file(path: &str, paths: &mut Vec<String>) {
     match std::fs::metadata(path) {
         Ok(_) => paths.push(path.to_string()),
         Err(e) => {
             eprintln!("[pyre-jit-trace build.rs] warning: cannot read {path}: {e}");
         }
-    }
-}
-
-/// Collect all `.rs` files from a directory tree.
-///
-/// Sorts entries by path so the collected source order is stable
-/// across platforms.  Without this, `WalkDir` yields entries in the
-/// filesystem's native `readdir` order — APFS (macOS) and ext4
-/// (Linux) and NTFS (Windows) return different sequences, which
-/// causes the analyzer to encounter type/method definitions in a
-/// different order and exposes platform-divergent classdef-less
-/// SomeInstance failures (PR 91 CI: Ubuntu/Windows fail with
-/// `SomeBuiltin.call(): no analyser registered for std.ptr.null_mut`
-/// and `SomeInstance.getattr on classdef-less instance` while macOS
-/// passes).  Stable lexicographic order makes the build reproducible
-/// and lets one fix cover every platform.
-fn collect_rs_files(dir: &str, paths: &mut Vec<String>) {
-    for entry in WalkDir::new(dir).sort_by_file_name() {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().is_file() || entry.path().extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        paths.push(entry.path().to_string_lossy().to_string());
     }
 }
 

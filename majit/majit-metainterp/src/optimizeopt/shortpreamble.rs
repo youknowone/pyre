@@ -942,6 +942,56 @@ impl ShortBoxes {
             .collect()
     }
 
+    /// shortpreamble.py:272-280 -- the `for short_op in
+    /// self.const_short_boxes:` half of `create_short_boxes`. Split out from
+    /// `create_short_boxes` so the production path (which calls
+    /// `produced_ops` for the :263-267 half) can run it too; it must be called
+    /// AFTER `produced_ops`, because `produce_arg` reads
+    /// `produced_short_boxes`.
+    pub fn produced_const_ops(
+        &mut self,
+        ctx: &mut crate::optimizeopt::OptContext,
+    ) -> Vec<ProducedShortOp> {
+        let mut short_boxes = Vec::new();
+        let const_pending: Vec<PreambleOp> = std::mem::take(&mut self.const_short_boxes);
+        for short_op in const_pending {
+            let getfield_op = &short_op.op;
+            if getfield_op.num_args() == 0 {
+                continue;
+            }
+            let struct_arg = getfield_op.arg(0);
+            let Some(preamble_arg) = self.produce_arg(ctx, struct_arg.to_opref()) else {
+                continue;
+            };
+            // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
+            let mut new_args = vec![preamble_arg];
+            new_args.extend_from_slice(&getfield_op.getarglist()[1..]);
+            let mut new_op = Op::with_descr(
+                getfield_op.opcode,
+                &new_args,
+                getfield_op
+                    .getdescr()
+                    .unwrap_or_else(|| panic!("const_short_boxes heap op without descr")),
+            );
+            // shortpreamble.py:277 `copy_and_change` produces a fresh result
+            // box distinct from `short_op.res`; the latter remains the Const.
+            new_op
+                .pos
+                .set(ctx.alloc_op_position_typed(new_op.result_type()));
+            // shortpreamble.py:279: ProducedShortOp(short_op, preamble_op)
+            short_boxes.push(ProducedShortOp {
+                res: ctx.materialize_operand_at(getfield_op.pos.get()),
+                preamble_op: std::rc::Rc::new(new_op),
+                source_op: short_op.source_op.unwrap_or_else(|| short_op.op.clone()),
+                kind: PreambleOpKind::Heap,
+                invented_name: false,
+                same_as_source: None,
+                label_arg_idx: None,
+            });
+        }
+        short_boxes
+    }
+
     /// shortpreamble.py:246-281 ShortBoxes.create_short_boxes
     ///
     /// Materialize all `potential_ops` (already populated by
@@ -949,8 +999,8 @@ impl ShortBoxes {
     /// `produced_short_boxes`, then walk `const_short_boxes`: for each
     /// constant heap read, try to produce its struct argument; if that
     /// succeeds, emit a `getfield` short op whose first arg is the
-    /// produced preamble box. Constant heap reads do not allocate fresh
-    /// names — they reuse the original constant box.
+    /// produced preamble box. Constant heap reads keep the original Const as
+    /// `res`; only the copied replay operation receives a fresh result box.
     ///
     /// `label_args` / `label_arg_types` populate `short_inputargs` via
     /// `add_short_input_arg` (RPython:
@@ -989,40 +1039,7 @@ impl ShortBoxes {
             .map(|(_, op)| op)
             .collect();
 
-        // shortpreamble.py:272-280: walk const_short_boxes and try to
-        // produce a struct preamble arg, then emit the getfield op.
-        let const_pending: Vec<PreambleOp> = std::mem::take(&mut self.const_short_boxes);
-        for short_op in const_pending {
-            let getfield_op = &short_op.op;
-            if getfield_op.num_args() == 0 {
-                continue;
-            }
-            let struct_arg = getfield_op.arg(0);
-            let Some(preamble_arg) = self.produce_arg(ctx, struct_arg.to_opref()) else {
-                continue;
-            };
-            // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
-            let mut new_args = vec![preamble_arg];
-            new_args.extend_from_slice(&getfield_op.getarglist()[1..]);
-            let mut new_op = Op::with_descr(
-                getfield_op.opcode,
-                &new_args,
-                getfield_op
-                    .getdescr()
-                    .unwrap_or_else(|| panic!("const_short_boxes heap op without descr")),
-            );
-            new_op.pos.set(getfield_op.pos.get());
-            // shortpreamble.py:279: ProducedShortOp(short_op, preamble_op)
-            short_boxes.push(ProducedShortOp {
-                res: ctx.materialize_operand_at(getfield_op.pos.get()),
-                preamble_op: std::rc::Rc::new(new_op),
-                source_op: short_op.source_op.unwrap_or_else(|| short_op.op.clone()),
-                kind: PreambleOpKind::Heap,
-                invented_name: false,
-                same_as_source: None,
-                label_arg_idx: None,
-            });
-        }
+        short_boxes.extend(self.produced_const_ops(ctx));
         short_boxes
     }
 
@@ -1700,7 +1717,16 @@ impl ProducedShortOp {
         // shortpreamble.py:62-75 keeps two distinct Boxes: `self.res` is
         // body-visible, while `preamble_op` is the freshly replayed GETFIELD
         // result.  `result_opref` belongs only to that replay operation.
-        let result_opref = *result_map.get(&source)?;
+        //
+        // A const-result entry arrives on the separate const channel, which
+        // never registers a `result_map` slot: `produced_const_ops` minted the
+        // replay position itself and `source` already names it.
+        let const_res = self.res.to_opref().is_constant();
+        let result_opref = if const_res {
+            source
+        } else {
+            *result_map.get(&source)?
+        };
         let _ = result_type;
         // `info.py:212-214` indexes `_fields` by the field's position in its
         // parent struct, so the seed has to carry the slot index every reader
@@ -1752,7 +1778,14 @@ impl ProducedShortOp {
             .unwrap_or_else(|| std::rc::Rc::new(getfield_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
             // PreambleOp.op carries the Box itself (shortpreamble.py:12).
-            op: ctx.materialize_operand_at(source),
+            // shortpreamble.py:76 `PreambleOp(self.res, ...)`: for a const
+            // entry the body-visible Box is the Const, which has no position
+            // to materialize an operand at.
+            op: if const_res {
+                self.res.clone()
+            } else {
+                ctx.materialize_operand_at(source)
+            },
             invented_name: self.invented_name,
             preamble_op: replay_rc,
             same_as_source: self.same_as_source.clone(),
@@ -1840,8 +1873,15 @@ impl ProducedShortOp {
             _ => return None,
         };
         // shortpreamble.py:80-85 preserves the same source/replay Box
-        // distinction for GETARRAYITEM.
-        let result_opref = *result_map.get(&source)?;
+        // distinction for GETARRAYITEM, and the same const-channel rule as
+        // `produce_heap_field`: no `result_map` slot, `source` is the replay
+        // position `produced_const_ops` minted.
+        let const_res = self.res.to_opref().is_constant();
+        let result_opref = if const_res {
+            source
+        } else {
+            *result_map.get(&source)?
+        };
         let _ = result_type;
         let obj_resolved = ctx.get_replacement_opref(obj);
         // shortpreamble.py:68-71 applies to both getfield and
@@ -1887,7 +1927,12 @@ impl ProducedShortOp {
             .unwrap_or_else(|| std::rc::Rc::new(getarrayitem_op.clone()));
         let pop = crate::optimizeopt::info::PreambleOp {
             // PreambleOp.op carries the Box itself (shortpreamble.py:12).
-            op: ctx.materialize_operand_at(source),
+            // Same const-entry rule as `produce_heap_field`.
+            op: if const_res {
+                self.res.clone()
+            } else {
+                ctx.materialize_operand_at(source)
+            },
             invented_name: self.invented_name,
             preamble_op: replay_rc,
             same_as_source: self.same_as_source.clone(),
@@ -4192,6 +4237,39 @@ mod tests {
             alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
             Some(OpRef::int_op(10))
         );
+    }
+
+    /// shortpreamble.py:272-280 -- const heap reads survive the production
+    /// split and keep the const result distinct from the replay operation.
+    #[test]
+    fn const_heap_short_box_survives_production() {
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(16, &[Type::Ref]);
+        let struct_arg = OpRef::input_arg_ref(0);
+        let constant = OpRef::const_int(7);
+        let mut sb = ShortBoxes::with_label_args(&[struct_arg]);
+        sb.add_short_input_arg(&mut ctx, struct_arg, Type::Ref);
+
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[ctx.materialize_operand_at(struct_arg)],
+            majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed),
+        );
+        heap.pos.set(constant);
+        sb.add_heap_op(&mut ctx, heap);
+
+        let produced = sb.produced_ops(&mut ctx);
+        let produced_const = sb.produced_const_ops(&mut ctx);
+
+        assert!(
+            produced
+                .iter()
+                .all(|(_, produced)| produced.res.to_opref() != constant),
+            "produced_ops must not carry the const result"
+        );
+        assert_eq!(produced_const.len(), 1);
+        assert_eq!(produced_const[0].kind, PreambleOpKind::Heap);
+        assert_eq!(produced_const[0].res.to_opref(), constant);
+        assert_ne!(produced_const[0].preamble_op.pos.get(), constant);
     }
 
     #[test]

@@ -80,6 +80,14 @@ pub(crate) fn next_snapshot_pos<T>(store: &[Option<T>]) -> i32 {
 
 pub(crate) use crate::majit_log_enabled;
 
+// Temporary probe: the const heap short-box path has never executed, so
+// enabling it moves the compiled short preamble on every fixture.
+pub(crate) fn const_short_boxes_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PYRE_CONST_SHORT_BOXES").is_some());
+    *ON
+}
+
 /// info.py:865-894 `getrawptrinfo` / `getptrinfo` return shape, with
 /// RPython `_forwarded` object identity preserved.
 ///
@@ -667,6 +675,12 @@ pub struct OptContext {
     /// RPython shortpreamble.py: pass-collected preamble producers aligned to
     /// the exported loop-header inputargs.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
+    /// shortpreamble.py:251-253: a way to produce const boxes, e.g.
+    /// `setfield_gc(p0, Const)`. We need to remember those, but they don't
+    /// produce any new boxes. This list is consumed only by import-side
+    /// `produce_op` replay, never by `used_boxes`: unroll.py:33-36 never
+    /// registers a const PreambleOp in `potential_extra_ops`.
+    pub exported_const_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
     /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args
     /// + virtuals)` — the ShortBoxes-stored renamed inputarg positions
     /// themselves, carried from the preview pass (optimizer.rs, where the
@@ -1710,6 +1724,7 @@ impl OptContext {
             potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
+            exported_const_short_boxes: Vec::new(),
             exported_short_inputargs: Vec::new(),
             exported_short_inputarg_refs: Vec::new(),
             exported_short_args_state: None,
@@ -2336,6 +2351,7 @@ impl OptContext {
             potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
+            exported_const_short_boxes: Vec::new(),
             exported_short_inputargs: Vec::new(),
             exported_short_inputarg_refs: Vec::new(),
             exported_short_args_state: None,
@@ -3266,7 +3282,11 @@ impl OptContext {
             // Look up by the result BOX (`produced_op.res`) — the exporter keyed
             // `_expand_info(produced_op.res)` by the same Rc (cloned from the
             // shared `exported_short_boxes` entry), so the box-identity lookup
-            // hits. Const results are skipped (unroll.py:483 export skips them).
+            // hits. unroll.py:483 gates only `_expand_info`; const heap short
+            // boxes take the optimizer.getinfo(op) arm at
+            // shortpreamble.py:419-420. They travel on the separate const
+            // channel, so a Const arriving through this non-const list is
+            // still declined here.
             if produced_op.res.to_opref().is_constant() {
                 continue;
             }

@@ -7020,6 +7020,33 @@ mod dict_method_tests {
     }
 
     #[test]
+    fn dict_setdefault_rejects_unhashable_key_on_a_typed_strategy() {
+        // A dict that already holds one entry is on the strategy that entry's
+        // key type chose, and `DictStrategy.setdefault` there is `getitem`
+        // then `setitem`.  Both answer for a key of another type by switching
+        // to the object strategy and asking again, so the key is hashed on the
+        // way -- and an unhashable one has to be refused there rather than
+        // stored under no hash at all.
+        for (label, key, value) in [
+            ("unicode", w_str_new("a"), w_int_new(1)),
+            ("int", w_int_new(7), w_int_new(1)),
+            (
+                "bytes",
+                pyre_object::bytesobject::w_bytes_from_bytes(b"a"),
+                w_int_new(1),
+            ),
+        ] {
+            init_dict_test_runtime();
+            let dict = w_dict_new();
+            crate::baseobjspace::setitem(dict, key, value).expect("seed the strategy");
+            let unhashable = w_list_new(vec![]);
+
+            assert_type_error(dict_method_setdefault(&[dict, unhashable, w_int_new(9)]));
+            assert_eq!(unsafe { w_dict_len(dict) }, 1, "{label} strategy");
+        }
+    }
+
+    #[test]
     fn dict_pop_empty_returns_default_without_hashing_key() {
         init_dict_test_runtime();
         let dict = w_dict_new();

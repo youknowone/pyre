@@ -1349,6 +1349,11 @@ pub struct CallControl {
     /// bypassing the type-string heuristic. The runtime/proc-macro populates
     /// this via `set_struct_layout()`.
     pub struct_layouts: HashMap<majit_ir::descr::StructId, StructLayout>,
+    /// Consumer-supplied low-level storage kind, keyed by the same nominal
+    /// struct identity as `struct_layouts`. RPython stores this on the lltype
+    /// STRUCT; the Rust source declaration alone cannot distinguish a host
+    /// raw object from a JIT-GC object.
+    struct_storage: HashMap<majit_ir::descr::StructId, (bool, bool)>,
     /// RPython: `_immutable_fields_` per class. Maps struct_name →
     /// `(field_name, rank)` pairs declared immutable / quasi-immutable.
     /// Consulted by the heuristic fallback in `all_interiorfielddescrs`
@@ -1814,6 +1819,7 @@ impl CallControl {
             enum_variant_by_discriminant: HashMap::new(),
             trait_unique_impls: HashMap::new(),
             trait_family_registrations: Vec::new(),
+            struct_storage: HashMap::new(),
             // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
             // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
             //
@@ -1937,6 +1943,34 @@ impl CallControl {
         layout: StructLayout,
     ) {
         self.struct_layouts.insert(struct_id, layout);
+    }
+
+    /// Install the embedding runtime's lltype storage classification.
+    pub fn set_struct_storage(&mut self, descriptors: &[crate::StructStorageDescriptor]) {
+        self.struct_storage.clear();
+        for descriptor in descriptors {
+            let owner = majit_ir::descr::canonical_struct_name(&descriptor.owner);
+            let struct_id = majit_ir::descr::struct_id_for_name(&owner).unwrap_or_else(|| {
+                panic!(
+                    "struct storage owner {:?} does not resolve to one analyzed struct",
+                    descriptor.owner
+                )
+            });
+            let shape = (descriptor.is_gc_managed, descriptor.headerless);
+            if let Some(previous) = self.struct_storage.insert(struct_id, shape) {
+                assert_eq!(
+                    previous, shape,
+                    "struct storage owner {:?} was configured with two shapes",
+                    descriptor.owner
+                );
+            }
+        }
+    }
+
+    /// Return `(is_gc_managed, headerless)` for one configured struct.
+    pub fn struct_storage_for(&self, name: &str) -> Option<(bool, bool)> {
+        let struct_id = majit_ir::descr::struct_id_for_name(name)?;
+        self.struct_storage.get(&struct_id).copied()
     }
 
     /// Resolve a registered [`StructLayout`] by a struct / enum-variant
@@ -4105,6 +4139,37 @@ impl CallControl {
             .unwrap_or_else(|| declared.clone());
         Some(return_type_string_to_value_type(Some(&effective)))
     }
+
+    /// The shared low-level result type of an indirect-call family.
+    ///
+    /// RPython's `FunctionReprBase.call` gets this from the selected
+    /// call-family row's `FuncType.RESULT`.  Charon may leave a dependency's
+    /// transparent newtype opaque in the caller artefact, so the front-end
+    /// destination alone can only say `Ref`; the locally defined family
+    /// member still carries the authoritative translated result type.
+    pub(crate) fn declared_result_type_for_indirect(
+        &self,
+        trait_root: &str,
+        method_name: &str,
+    ) -> Option<Type> {
+        let mut declared = self
+            .all_impls_for_indirect(trait_root, method_name)
+            .into_iter()
+            .filter_map(|path| self.function_graphs.get(&path))
+            .filter_map(|graph| graph.return_type.as_ref())
+            .map(|result| {
+                let effective = crate::front::typestr::transparent_result_ok_type(result)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| result.clone());
+                return_type_string_to_value_type(Some(&effective))
+            });
+        let first = declared.next()?;
+        assert!(
+            declared.all(|result| result == first),
+            "indirect-call family {trait_root}::{method_name} has inconsistent result types"
+        );
+        Some(first)
+    }
 }
 
 /// Map a Rust return-type string to the BhCallDescr kind char used by
@@ -5260,8 +5325,7 @@ impl CallControl {
         self.target_func_effects(target).is_some_and(|f| f.elidable)
     }
 
-    /// Pyre extension: register a target as carrying the
-    /// `#[elidable_cannot_raise]` user assertion.
+    /// Register a target carrying an explicit cannot-raise assertion.
     pub fn mark_cannot_raise_assertion(&mut self, path: CallPath) {
         assert!(
             !self
@@ -5273,8 +5337,8 @@ impl CallControl {
         self.func_effects_mut(&path).cannot_raise_assertion = true;
     }
 
-    /// Pyre extension: check if `target` carries the
-    /// `#[elidable_cannot_raise]` assertion.
+    /// Check whether an elidable target has an executable cannot-raise
+    /// assertion.
     ///
     /// Additionally requires the target's fnaddr to be registered via
     /// `register_function_fnaddr`.  Without a real fnaddr,
@@ -5298,6 +5362,16 @@ impl CallControl {
                     .get(&p)
                     .is_some_and(|&fnaddr| fnaddr != 0)
         })
+    }
+
+    /// Check whether a target declares that it cannot raise.
+    ///
+    /// Unlike [`Self::has_cannot_raise_assertion`], this does not require a
+    /// native function address: non-elidable calls do not enter the executor's
+    /// pure-call folding path.
+    fn declares_cannot_raise(&self, target: &CallTarget) -> bool {
+        self.target_func_effects(target)
+            .is_some_and(|effects| effects.cannot_raise_assertion)
     }
 
     /// Pyre extension: register a target as carrying the
@@ -6565,13 +6639,20 @@ impl CallControl {
                     }
                 }
             } else {
-                let canraise = match shape {
-                    CallShape::Direct(target) => self._canraise(target, cache),
-                    CallShape::Indirect(graphs) => self.cached_can_raise_family(graphs, cache),
-                };
-                match canraise {
-                    CanRaise::Yes | CanRaise::MemoryErrorOnly => ExtraEffect::CanRaise,
-                    CanRaise::No => ExtraEffect::CannotRaise,
+                match shape {
+                    CallShape::Direct(target) if self.declares_cannot_raise(target) => {
+                        ExtraEffect::CannotRaise
+                    }
+                    CallShape::Direct(target) => match self._canraise(target, cache) {
+                        CanRaise::Yes | CanRaise::MemoryErrorOnly => ExtraEffect::CanRaise,
+                        CanRaise::No => ExtraEffect::CannotRaise,
+                    },
+                    CallShape::Indirect(graphs) => {
+                        match self.cached_can_raise_family(graphs, cache) {
+                            CanRaise::Yes | CanRaise::MemoryErrorOnly => ExtraEffect::CanRaise,
+                            CanRaise::No => ExtraEffect::CannotRaise,
+                        }
+                    }
                 }
             });
         }
@@ -9966,6 +10047,48 @@ mod tests {
                 .write_descrs_fields
                 .as_ref()
                 .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+        );
+    }
+
+    #[test]
+    fn declared_cannot_raise_retains_write_effects() {
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("opaque_writer");
+        let base_var = graph.alloc_value_var();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: base_var.clone(),
+                field: crate::model::FieldDescriptor::new("next", Some("Node".into())),
+                value: crate::model::LinkArg::Value(base_var),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_raise(graph.startblock, "conservative analyzer result");
+        let path = CallPath::from_segments(["opaque_writer"]);
+        cc.register_function_graph(path.clone(), graph);
+        cc.mark_cannot_raise_assertion(path);
+        cc.find_all_graphs_for_tests();
+
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["opaque_writer"])),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        assert!(
+            descriptor
+                .extra_info
+                .write_descrs_fields
+                .as_ref()
+                .is_some_and(|bits| bits.iter().any(|&byte| byte != 0)),
+            "cannot-raise must not erase the graph's write set"
         );
     }
 

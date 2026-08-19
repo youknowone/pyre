@@ -3162,7 +3162,13 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
         let cell = unsafe { majit_ir::recover_fail_descr_cell(jf_force_descr as usize) };
         cell.descr.clone()
     };
-    deadframe_from_jitframe(jf_gcref, fail_descr, None)
+    // `llmodel.py:280-284 force` returns the resolved frame itself.  The frame
+    // is the one the compiled run is executing in — still on the JF shadow
+    // stack, inside the residual call that armed `jf_force_descr` — so this
+    // deadframe borrows it: the call site pushed `jf_gcmap` before the call and
+    // clears it with `pop_gcmap` on return, and releasing it here would leave
+    // the frame's spilled `Ref` slots untraced for the rest of the call.
+    DeadFrame::JitFrame(JitFrameDeadFrame::borrowing(jf_gcref, fail_descr, None))
 }
 
 fn deadframe_from_jitframe(
@@ -10430,10 +10436,24 @@ impl CraneliftBackend {
                             let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                             let label_args = ops[op_idx].getarglist();
                             for &(i, raw, ofs) in positions {
-                                let opref = label_args[i].to_opref();
-                                let v = resolve_opref(&mut builder, &constants, opref);
-                                let v = coerce_ty(&mut builder, v, cl_types::I64);
-                                builder.ins().store(MemFlagsData::new(), v, cur_jf, ofs);
+                                // A raw demoted at an earlier LABEL already owns this
+                                // word — both LABELs derive the offset from the same
+                                // `ref_root_slots` entry — and the collector forwards it in
+                                // place.  Its SSA value stops being refreshed the moment it
+                                // is demoted, because `spill_ref_roots` and
+                                // `reload_ref_roots` both skip a demoted raw, so a call
+                                // between the two LABELs leaves the register holding a
+                                // pre-collection pointer.  Re-storing that here would put a
+                                // corpse back over the forwarded word; the re-materialize
+                                // below re-defines the SSA variable from the word instead.
+                                let already_demoted =
+                                    is_demoted_failarg(&demoted_failarg_slots, raw);
+                                if !already_demoted {
+                                    let opref = label_args[i].to_opref();
+                                    let v = resolve_opref(&mut builder, &constants, opref);
+                                    let v = coerce_ty(&mut builder, v, cl_types::I64);
+                                    builder.ins().store(MemFlagsData::new(), v, cur_jf, ofs);
+                                }
                                 synced_ref_vars.insert(raw);
                                 demoted_failarg_slots.insert(raw, ofs);
                             }
@@ -10517,18 +10537,22 @@ impl CraneliftBackend {
                     // store per live reference on the loop header, i.e. on every
                     // iteration of the loop.
                     //
-                    // A raw carried in `demoted_failarg_slots` is the exception and
-                    // still has to be reconciled.  That map is trace-global while
-                    // `loop_phi_keep` is per LABEL, so a raw demoted at an earlier
-                    // LABEL can be a kept block param at this one — and for that
-                    // raw the home, not the SSA value, is what the readers use:
-                    // `get_gcmap` marks it with no liveness test, `spill_ref_roots`
-                    // and `reload_ref_roots` refuse to write it, and
-                    // `resolve_failarg_opref` tests the demoted offset before it
-                    // falls back to `use_var`.  Nothing else writes that word on a
-                    // loader re-entry, so dropping the store would leave the
-                    // collector tracing a slot this entry never wrote and guard
-                    // exits publishing an earlier iteration's object.
+                    // A raw carried in `demoted_failarg_slots` is the exception
+                    // and still has to be reconciled, in either home kind.  That
+                    // map is trace-global while `loop_phi_keep` is per LABEL, so a
+                    // raw demoted at an earlier LABEL can be a kept block param at
+                    // this one — and for that raw the home, not the SSA value, is
+                    // what the readers use: `resolve_failarg_opref` tests the
+                    // demoted offset before it falls back to `use_var`, and for a
+                    // ref home `get_gcmap` marks it with no liveness test while
+                    // `spill_ref_roots` and `reload_ref_roots` refuse to write it.
+                    // A loader re-entry refreshes only the dense carried slot this
+                    // block param arrives in, so without a store here the home
+                    // keeps the earlier LABEL's seed: the collector would trace a
+                    // ref slot this entry never wrote, and a guard below this
+                    // LABEL would publish an earlier iteration's value.  A demoted
+                    // non-ref is never in `ref_root_slots`, so `sync_ref_root_var`
+                    // emits nothing for it and its home takes the store directly.
                     let mut param_idx = 0usize;
                     let mut label_param_sync_jf_ptr = None;
                     for (i, arg_ref) in ops[op_idx].getarglist().iter().enumerate() {
@@ -10551,16 +10575,31 @@ impl CraneliftBackend {
                             let raw = arg_ref.to_opref().raw();
                             builder.def_var(var(raw), param);
                             if is_demoted_failarg(&demoted_failarg_slots, raw) {
-                                sync_ref_root_var(
-                                    &mut builder,
-                                    ptr_type,
-                                    &mut label_param_sync_jf_ptr,
-                                    &ref_root_slots,
-                                    raw,
-                                    param,
-                                    ref_root_base_ofs,
-                                    &mut synced_ref_vars,
-                                );
+                                if ref_root_slots.iter().any(|(idx, _)| *idx == raw) {
+                                    sync_ref_root_var(
+                                        &mut builder,
+                                        ptr_type,
+                                        &mut label_param_sync_jf_ptr,
+                                        &ref_root_slots,
+                                        raw,
+                                        param,
+                                        ref_root_base_ofs,
+                                        &mut synced_ref_vars,
+                                    );
+                                } else {
+                                    let offset =
+                                        demoted_failarg_offset(&demoted_failarg_slots, raw)
+                                            .expect("demoted failarg has a frame home");
+                                    let value = coerce_ty(&mut builder, param, cl_types::I64);
+                                    let jf_ptr = cached_pinned_reg(
+                                        &mut builder,
+                                        ptr_type,
+                                        &mut label_param_sync_jf_ptr,
+                                    );
+                                    builder
+                                        .ins()
+                                        .store(MemFlagsData::new(), value, jf_ptr, offset);
+                                }
                             }
                         }
                     }
@@ -10858,18 +10897,6 @@ impl CraneliftBackend {
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
                     let a = coerce_ty(&mut builder, a, want);
                     builder.def_var(var(vi), a);
-                    if op.opcode == OpCode::SameAsR {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            a,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
 
                 // PyPy `assembler.py:1528-1529` (x86) /
@@ -11929,21 +11956,6 @@ impl CraneliftBackend {
                     }
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
-                    if let Some(result) = call_result
-                        && op.result_type() == Type::Ref
-                        && !force_tokens.contains(&vi)
-                    {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
 
                 OpCode::CallAssemblerI
@@ -12409,18 +12421,6 @@ impl CraneliftBackend {
 
                     if op.result_type() != Type::Void {
                         builder.def_var(var(vi), merged_result);
-                        if op.result_type() == Type::Ref && !force_tokens.contains(&vi) {
-                            sync_ref_root_var(
-                                &mut builder,
-                                ptr_type,
-                                &mut None,
-                                &ref_root_slots,
-                                vi,
-                                merged_result,
-                                ref_root_base_ofs,
-                                &mut synced_ref_vars,
-                            );
-                        }
                     }
                     mark_ref_roots_synced(&mut synced_ref_vars, &live_ref_root_slots);
                 }
@@ -13460,18 +13460,6 @@ impl CraneliftBackend {
                         op.opcode,
                     )?;
                     builder.def_var(var(vi), result);
-                    if value_type == Type::Ref {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
                 OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
                     let scale = resolve_constant_i64(
@@ -13518,18 +13506,6 @@ impl CraneliftBackend {
                         op.opcode,
                     )?;
                     builder.def_var(var(vi), result);
-                    if value_type == Type::Ref {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
                 OpCode::RawLoadI | OpCode::RawLoadF => {
                     let descr = op.getdescr().expect("raw load op must have a descriptor");
@@ -14380,18 +14356,6 @@ impl CraneliftBackend {
                 OpCode::VirtualRefI | OpCode::VirtualRefR => {
                     let obj = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     builder.def_var(var(vi), obj);
-                    if op.opcode == OpCode::VirtualRefR {
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            obj,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
-                    }
                 }
 
                 // ── Vector guards ──
@@ -15005,17 +14969,18 @@ impl CraneliftBackend {
                                 vtable_off_i32,
                             );
                         }
+                        // An op that defines a Ref does not write its ref-root home here,
+                        // and no reader misses that store.  A demoted raw's definition
+                        // always precedes the LABEL that demotes it — `compute_loop_phi_keep`
+                        // refuses to demote a raw redefined after the LABEL — and that
+                        // LABEL's fall-through seeding writes the same word with the same
+                        // value just before it records the demotion, so an eager store here
+                        // is subsumed.  Ahead of that seeding the raw is not demoted yet, so
+                        // it follows the ordinary discipline: `spill_ref_roots` over the live
+                        // slot list immediately precedes every `emit_push_gcmap`, under the
+                        // predicate `get_gcmap` itself applies.  Guard maps name dense
+                        // fail-arg slots only, never a home.
                         builder.def_var(var(vi), result);
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
                     } else {
                         // No GC runtime: plain malloc fallback for non-GC languages.
                         let alloc_fn = builder
@@ -15041,16 +15006,6 @@ impl CraneliftBackend {
                             );
                         }
                         builder.def_var(var(vi), result);
-                        sync_ref_root_var(
-                            &mut builder,
-                            ptr_type,
-                            &mut None,
-                            &ref_root_slots,
-                            vi,
-                            result,
-                            ref_root_base_ofs,
-                            &mut synced_ref_vars,
-                        );
                     }
                 }
                 OpCode::NewArray | OpCode::NewArrayClear => {
@@ -15095,16 +15050,6 @@ impl CraneliftBackend {
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
                     builder.def_var(var(vi), result);
-                    sync_ref_root_var(
-                        &mut builder,
-                        ptr_type,
-                        &mut None,
-                        &ref_root_slots,
-                        vi,
-                        result,
-                        ref_root_base_ofs,
-                        &mut synced_ref_vars,
-                    );
                 }
 
                 // ── Integer sign extension ──
@@ -15169,16 +15114,6 @@ impl CraneliftBackend {
                             .ins()
                             .load(cl_types::I64, MemFlagsData::trusted(), addr, 0);
                     builder.def_var(var(vi), result);
-                    sync_ref_root_var(
-                        &mut builder,
-                        ptr_type,
-                        &mut None,
-                        &ref_root_slots,
-                        vi,
-                        result,
-                        ref_root_base_ofs,
-                        &mut synced_ref_vars,
-                    );
                 }
 
                 // ── Thread-local reference get ──
@@ -15196,16 +15131,6 @@ impl CraneliftBackend {
                     )
                     .expect("jit_threadlocalref_get must return a value");
                     builder.def_var(var(vi), result);
-                    sync_ref_root_var(
-                        &mut builder,
-                        ptr_type,
-                        &mut None,
-                        &ref_root_slots,
-                        vi,
-                        result,
-                        ref_root_base_ofs,
-                        &mut synced_ref_vars,
-                    );
                 }
 
                 // ── Load from GC table ──
@@ -15284,16 +15209,6 @@ impl CraneliftBackend {
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
                     builder.def_var(var(vi), result);
-                    sync_ref_root_var(
-                        &mut builder,
-                        ptr_type,
-                        &mut None,
-                        &ref_root_slots,
-                        vi,
-                        result,
-                        ref_root_base_ofs,
-                        &mut synced_ref_vars,
-                    );
                 }
                 // All OpCode variants are explicitly handled above.
                 // This arm is unreachable but kept for forward-compatibility
@@ -19094,6 +19009,74 @@ mod tests {
         let moved = backend.get_ref_value(&frame, 0);
         assert_ne!(moved, root);
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0001);
+    }
+
+    /// A raw an earlier LABEL demoted already owns its ref-root word, and the
+    /// collector forwards that word in place. Its SSA value stops being
+    /// refreshed at the moment of demotion — `spill_ref_roots` and
+    /// `reload_ref_roots` both skip a demoted raw — so the collecting call
+    /// between the two LABELs leaves the register holding a pre-collection
+    /// address. A later LABEL's fall-through must therefore not re-store it.
+    #[test]
+    fn a_later_labels_fallthrough_keeps_an_already_demoted_refs_forwarded_home() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xD30F_0005;
+        }
+
+        let mut backend = backend_with_gc(gc);
+        let carried = OpRef::ref_op(1);
+        let guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        // Both LABELs carry the same descr so the single back-edge demotes the
+        // position at each of them; the trace then reaches the second LABEL by
+        // fall-through, with a collection in between.
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(60),
+            ),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 3),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(60),
+            ),
+            guard,
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(60),
+            ),
+        ];
+        backend.set_constants(indexmap::IndexMap::new());
+
+        let token = JitCellToken::new(1710);
+        backend
+            .compile_loop(&[InputArg::new_ref(0)], &ops, &token)
+            .unwrap();
+        let frame = backend.execute_token(&token, &[Value::Ref(root)]);
+        let moved = backend.get_ref_value(&frame, 0);
+        assert_ne!(
+            moved, root,
+            "the guard published the address the ref had before the collection"
+        );
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0005);
     }
 
     #[test]

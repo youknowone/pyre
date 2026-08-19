@@ -981,6 +981,7 @@ impl UnrollOptimizer {
                         virtual_state: state.virtual_state.clone(),
                         exported_infos: indexmap::IndexMap::new(),
                         exported_short_boxes: Vec::new(),
+                        const_short_boxes: Vec::new(),
                         short_boxes: Vec::new(),
                         short_preamble: None,
                         renamed_inputargs: state.renamed_inputargs.clone(),
@@ -2233,6 +2234,10 @@ pub struct ExportedState {
     /// This preserves the original preamble ops so the active path can build
     /// short preambles without re-extracting them from the peeled trace.
     pub exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
+    /// Const-result heap short boxes. Kept separate from `short_boxes` so
+    /// they are replayed on import but never feed carried short-preamble
+    /// boxes, label args, or `used_boxes`.
+    pub const_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
     /// RPython unroll.py:478-479 `short_boxes = sb.create_short_boxes(...)`
     /// stored directly on ExportedState. Consumer sites
     /// (`build_imported_short_preamble`, `import_short_preamble_state`)
@@ -2360,6 +2365,7 @@ impl ExportedState {
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
         exported_infos: indexmap::IndexMap<Operand, crate::optimizeopt::info::OpInfo>,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
+        const_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
         short_inputargs: Vec<OpRef>,
         short_inputarg_refs: Vec<majit_ir::InputArgRc>,
@@ -2386,6 +2392,7 @@ impl ExportedState {
             virtual_state,
             exported_infos,
             exported_short_boxes,
+            const_short_boxes,
             short_boxes,
             short_preamble: None,
             renamed_inputargs,
@@ -2507,7 +2514,11 @@ impl ExportedState {
             key.walk_const_ptr_refs(visitor);
             visit_op_info(info, visitor);
         }
-        for entry in &mut self.exported_short_boxes {
+        for entry in self
+            .exported_short_boxes
+            .iter_mut()
+            .chain(self.const_short_boxes.iter_mut())
+        {
             visit_preamble_op(entry, visitor);
         }
         for (key, produced) in &mut self.short_boxes {
@@ -2592,7 +2603,11 @@ impl ExportedState {
             }
         }
 
-        for preamble_op in &self.exported_short_boxes {
+        for preamble_op in self
+            .exported_short_boxes
+            .iter()
+            .chain(self.const_short_boxes.iter())
+        {
             visit_op(&preamble_op.op, &mut visit);
             if let Some(source_op) = preamble_op.source_op.as_ref() {
                 visit_op(source_op, &mut visit);
@@ -2889,6 +2904,7 @@ impl Clone for ExportedState {
             virtual_state: self.virtual_state.clone(),
             exported_infos: self.exported_infos.clone(),
             exported_short_boxes: self.exported_short_boxes.clone(),
+            const_short_boxes: self.const_short_boxes.clone(),
             short_boxes: self.short_boxes.clone(),
             short_preamble: self.short_preamble.clone(),
             renamed_inputargs: self.renamed_inputargs.clone(),
@@ -3129,6 +3145,7 @@ impl OptUnroll {
                 )
             };
         let exported_short_boxes = ctx.exported_short_boxes.clone();
+        let const_short_boxes = ctx.exported_const_short_boxes.clone();
         // #173 producer-rooting: capture each exported short-box's Phase-1
         // producer Op (`res.bound_op()`) while the Phase-1 ctx still owns the
         // strong `OpRc`, so `res`'s Weak still upgrades after the peel boundary
@@ -3218,6 +3235,7 @@ impl OptUnroll {
             virtual_state,
             infos,
             exported_short_boxes,
+            const_short_boxes,
             renamed_inputargs.to_vec(),
             short_inputargs,
             short_inputarg_refs,
@@ -4590,6 +4608,37 @@ impl OptUnroll {
                 "ProducedShortOp::produce_op failed for source {:?} kind {:?}",
                 produced.preamble_op.pos.get(),
                 produced.kind
+            );
+        }
+
+        let const_short_boxes =
+            crate::optimizeopt::shortpreamble::produced_short_boxes_from_exported_boxes(
+                &exported_state.const_short_boxes,
+            );
+        // shortpreamble.py:417-421: Const results use optimizer.getinfo(op),
+        // and that info is forwarded on the replay operation itself before
+        // HeapOp.produce_op installs the PreambleOp in the heap cache.
+        for (_, produced) in &const_short_boxes {
+            let info = self.collect_exported_info(produced.res.to_opref(), ctx, None);
+            if let Some(info) = &info {
+                ctx.set_preamble_forwarded_info(produced.preamble_op.pos.get(), info);
+            }
+        }
+        // unroll.py:512-513 covers both groups upstream, because
+        // `create_short_boxes` returns one list. pyre keeps the const heap short
+        // boxes on a separate channel so they cannot reach `used_boxes`
+        // (unroll.py:33-36 never registers a const PreambleOp in
+        // `potential_extra_ops`), so they are replayed here explicitly.
+        for (_, produced) in &const_short_boxes {
+            let _ = produced.produce_op(
+                ctx,
+                optimizer,
+                &exported_state.exported_infos,
+                &exported_state.short_inputargs,
+                &short_args,
+                &result_map,
+                &mut produced_results,
+                &mut imported_constants,
             );
         }
     }
@@ -6109,6 +6158,7 @@ mod tests {
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             indexmap::IndexMap::new(),
             Vec::new(),
+            Vec::new(),
             vec![OpRef::int_op(14)],
             vec![OpRef::int_op(23)],
             // short_inputarg_refs: this fixture stores plain OpRef positions,
@@ -6352,6 +6402,7 @@ mod tests {
                 invented_name: false,
                 same_as_source: Some(Operand::from_opref(old_ref)),
             }],
+            Vec::new(),
             vec![old_ref],
             vec![old_ref],
             // short_inputarg_refs: `old_ref` is a ConstPtr inline position.
@@ -7544,6 +7595,7 @@ mod tests {
                 invented_name: false,
                 same_as_source: None,
             }],
+            Vec::new(),
             Vec::new(),
             vec![source_box.to_opref()],
             // short_inputarg_refs: this fixture stores plain OpRef positions.

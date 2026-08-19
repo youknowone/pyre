@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=25
+# pyre-check: skip-cpython
+# cpython 4.45s vs pyre 0.21s (21.2x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # A bare `raise X` of an exception kind whose `descr_init` writes flattened
 # slots beyond `args_w` — `interp_exceptions.py:496-499 W_StopIteration`
 # (`value`), `:810-812 W_NameError` and `:1134-1137 W_AttributeError` (`name` /

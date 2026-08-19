@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=11
+# pyre-check: skip-cpython
+# cpython 2.67s vs pyre 0.23s (11.6x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # Two operand-stack temps holding heap ints (>= 256) are swapped across a
 # `goto_if_not` branch guard, a shape a per-jitcode merge-color map is prone
 # to COLLAPSE (alias both slots onto one color).  The flat-free boxed-int

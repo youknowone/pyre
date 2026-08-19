@@ -932,11 +932,6 @@ struct GuardToken {
     /// stored on `Assembler386::fail_descrs` so registration on the owning CLT
     /// keeps it alive while the recovery stub references its address.
     fail_descr: std::sync::Arc<majit_ir::FailDescrCell>,
-    /// Fail argument OpRefs for recovery (to save to sequential output slots).
-    fail_args: Vec<OpRef>,
-    /// regalloc parity: snapshot of opref_to_slot at guard emission time.
-    /// Needed by recovery stubs to read fail_args from correct slots.
-    opref_to_slot_snapshot: IndexMap<OpRef, usize>,
     /// Constants to store in frame during recovery.
     /// Each entry: (frame_slot_index, constant_value).
     const_stores: Vec<(usize, i64)>,
@@ -2340,8 +2335,9 @@ impl<'a> Assembler386<'a> {
         self._assemble(true)?;
         self.check_unrelocated_jump_target()?;
 
-        // regalloc sets fail_arg_locs in append_guard_token_with_faillocs.
-        // No allocate_unmapped_fail_arg_slots needed.
+        // regalloc sets fail_arg_locs in append_guard_token_with_faillocs,
+        // which stamps `rd_locs` from them right there
+        // (`llsupport/assembler.py:279`), so no post-regalloc fixup pass runs.
 
         // assembler.py:553 write_pending_failure_recoveries
         let stub_offsets = self.write_pending_failure_recoveries();
@@ -5221,11 +5217,6 @@ impl<'a> Assembler386<'a> {
         self.pending_guard_tokens.push(GuardToken {
             fail_label,
             fail_descr: cell.clone(),
-            fail_args: op
-                .getfailargs()
-                .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
-                .unwrap_or_default(),
-            opref_to_slot_snapshot: self.opref_to_slot.clone(),
             const_stores,
             gcmap,
             must_save_exception: matches!(
@@ -5237,38 +5228,6 @@ impl<'a> Assembler386<'a> {
             self.finish_gcmap = Some(gcmap);
         }
         self.fail_descrs.push(cell);
-    }
-
-    /// Update `rd_locs` on all pending guard descriptors after the
-    /// regalloc opref→slot map is finalised.  Unmapped (virtual/dead)
-    /// OpRefs and constants get `0xFFFF` — the resume system handles
-    /// them via `rd_numb` TAGVIRTUAL/TAGCONST encoding
-    /// (`resume.py:450-488`).
-    ///
-    /// Parallels the pending_force path of PyPy
-    /// `regalloc.py::store_force_descr → assembler.store_info_on_descr`
-    /// (`llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`).
-    fn allocate_unmapped_fail_arg_slots(&mut self) {
-        for gt in &self.pending_guard_tokens {
-            let positions: Vec<u16> = gt
-                .fail_args
-                .iter()
-                .map(|opref| {
-                    if opref.is_none() || opref.is_constant() {
-                        0xFFFFu16
-                    } else {
-                        self.opref_to_slot
-                            .get(opref)
-                            .copied()
-                            .map(|slot| (slot + JITFRAME_FIXED_SIZE) as u16)
-                            .unwrap_or(0xFFFFu16)
-                    }
-                })
-                .collect();
-            if let Some(meta_fd) = gt.fail_descr.as_fail_descr() {
-                meta_fd.set_rd_locs(positions);
-            }
-        }
     }
 
     // assembler.py:652 write_pending_failure_recoveries

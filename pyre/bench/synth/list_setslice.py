@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=1.4
+# pyre-check: skip-cpython
+# cpython 1.07s vs pyre 0.15s (7.1x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # Re-recorded at twice the slowest native ratio: macOS 0.2x, Ubuntu 0.7x,
 # Windows 0.5x.  The lower ceiling also lowers the derived speed floor.
 # Benchmark: integer list setslice (per-strategy ops)

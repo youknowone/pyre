@@ -989,13 +989,39 @@ impl OptHeap {
     /// (`info.py:203-214`).  In majit this is `FieldDescr::index_in_parent`
     /// when a parent SizeDescr is available; older/simple descriptors fall
     /// back to their `Descr::index()`.
+    ///
+    /// "A parent is available" is not the same question as "this number is a
+    /// position in that parent's list".  A header word carries no position at
+    /// all — the positional census skips it by name (`heaptracker.py:64-66`),
+    /// so the mint hands it the placeholder `0` and documents that consumers
+    /// resolve it through `FieldDescr::is_w_class()` instead.  A parent that
+    /// publishes an empty `all_fielddescrs` has no positions to hand out
+    /// either.  Both reach here as slot `0`, and slot `0` is a REAL slot: the
+    /// one the parent's first enumerated field occupies.  A `Ref` header read
+    /// then answers out of the entry an `Int` field of the same object filled,
+    /// which is what `make_equal_to`'s `Box.type` invariant fires on.
+    ///
+    /// So use the position only where the parent's list actually holds this
+    /// field at it, and otherwise fall back to the descr's own key, which for
+    /// an unnumbered field is minted out of its payload and cannot collide
+    /// with a position.
     pub(crate) fn field_slot_index(descr: &DescrRef) -> u32 {
         let descr_idx = descr.index();
         let Some(field_descr) = descr.as_field_descr() else {
             return descr_idx;
         };
-        if field_descr.get_parent_descr().is_some() {
-            field_descr.index_in_parent() as u32
+        let index = field_descr.index_in_parent();
+        let holds_this_field = match field_descr.get_parent_descr() {
+            Some(parent) => parent
+                .as_size_descr()
+                .and_then(|size| size.all_fielddescrs().get(index).cloned())
+                .is_some_and(|row| {
+                    crate::optimizeopt::virtualize::slot_holds_field(row.as_ref(), field_descr)
+                }),
+            None => false,
+        };
+        if holds_this_field {
+            index as u32
         } else {
             descr_idx
         }
@@ -4125,6 +4151,53 @@ mod tests {
         })
     }
 
+    /// A parent that publishes the positional list its fields' `index_in_parent`
+    /// numbers are positions in. `field_slot_index` reads the slot off that
+    /// list, so a parent without one hands every field the same fallback and
+    /// the tests below would stop exercising the slot they name.
+    #[derive(Debug)]
+    struct ListedSizeDescr {
+        rows: Vec<Arc<dyn FieldDescr>>,
+    }
+
+    impl Descr for ListedSizeDescr {
+        fn index(&self) -> u32 {
+            0xFFFF_0000
+        }
+        fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl SizeDescr for ListedSizeDescr {
+        fn size(&self) -> usize {
+            64
+        }
+        fn type_id(&self) -> u32 {
+            0xFFFF_0000
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+        fn is_object(&self) -> bool {
+            false
+        }
+        fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+            &self.rows
+        }
+    }
+
+    /// Eight `Ref` slots at `i * 8`, the shape `ParentIndexedDescr` describes.
+    fn listed_parent_descr() -> DescrRef {
+        Arc::new(ListedSizeDescr {
+            rows: (0..8u32)
+                .map(|parent_idx| {
+                    Arc::new(ParentIndexedDescr { parent_idx }) as Arc<dyn FieldDescr>
+                })
+                .collect(),
+        })
+    }
+
     #[derive(Debug)]
     struct ParentIndexedDescr {
         parent_idx: u32,
@@ -4142,7 +4215,7 @@ mod tests {
 
     impl FieldDescr for ParentIndexedDescr {
         fn get_parent_descr(&self) -> Option<DescrRef> {
-            Some(test_parent_descr())
+            Some(listed_parent_descr())
         }
 
         fn offset(&self) -> usize {
@@ -4160,6 +4233,62 @@ mod tests {
         fn index_in_parent(&self) -> usize {
             self.parent_idx as usize
         }
+    }
+
+    /// The header words are outside the positional census: `heaptracker.py:64-66`
+    /// skips `typeptr` by name, so the mint has no position to give them and
+    /// hands over the placeholder `0`. Slot `0` is the first slot the parent
+    /// DOES enumerate, so answering with the placeholder makes a `Ref` header
+    /// read resolve into whatever bank that field last stored — the shape
+    /// `make_equal_to`'s `Box.type` invariant fires on.
+    #[derive(Debug)]
+    struct HeaderWordDescr;
+
+    impl Descr for HeaderWordDescr {
+        fn index(&self) -> u32 {
+            // The disjoint key an unnumbered field is minted with.
+            0x1000_0049
+        }
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for HeaderWordDescr {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            Some(listed_parent_descr())
+        }
+        fn field_name(&self) -> &str {
+            "pyobject::PyObject.w_class"
+        }
+        fn offset(&self) -> usize {
+            4
+        }
+        fn field_size(&self) -> usize {
+            4
+        }
+        fn field_type(&self) -> Type {
+            Type::Ref
+        }
+        fn index_in_parent(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn a_header_word_does_not_share_the_first_enumerated_slot() {
+        let header: DescrRef = Arc::new(HeaderWordDescr);
+        let first_enumerated: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 0 });
+
+        assert_eq!(header.as_field_descr().unwrap().index_in_parent(), 0);
+        assert_eq!(
+            first_enumerated.as_field_descr().unwrap().index_in_parent(),
+            0
+        );
+        assert_ne!(
+            OptHeap::field_slot_index(&header),
+            OptHeap::field_slot_index(&first_enumerated),
+        );
     }
 
     #[test]

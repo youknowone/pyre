@@ -5,6 +5,15 @@
 //! through `rustpython_host_env::errno::errors` (a `pub use libc::*`
 //! re-export).  The `host_env = off` build keeps a darwin/BSD-flavoured
 //! fallback so pyre-wasm preserves its previous behaviour.
+//!
+//! Which names exist is the other half of the contract: `interp_errno.py`
+//! declares one list for every platform and lets `DefinedConstantInteger`
+//! drop the entries the host's `errno.h` does not define, so a name absent
+//! here is a name the module claims no platform has.  A Rust port cannot
+//! probe, so the same partition is spelled with target gates — anything
+//! `libc` (or, on windows, the `WSA` re-exports) supplies everywhere goes in
+//! the common list, and the Darwin-only Mach/RPC block sits behind
+//! `target_vendor = "apple"`.
 
 crate::py_module! {
     "errno",
@@ -109,6 +118,14 @@ crate::py_module! {
                 ("ECONNREFUSED", host_errno::ECONNREFUSED),
                 ("EHOSTDOWN", host_errno::EHOSTDOWN),
                 ("EHOSTUNREACH", host_errno::EHOSTUNREACH),
+                // `interp_errno.py` declares these in the same list, and
+                // every platform pyre builds for defines them in its own
+                // `errno.h`.
+                ("EILSEQ", host_errno::EILSEQ),
+                ("ECANCELED", host_errno::ECANCELED),
+                ("ENOTSUP", host_errno::ENOTSUP),
+                ("EOWNERDEAD", host_errno::EOWNERDEAD),
+                ("ENOTRECOVERABLE", host_errno::ENOTRECOVERABLE),
             ];
             for (name, value) in entries {
                 store(name, *value as i64);
@@ -116,6 +133,21 @@ crate::py_module! {
             #[cfg(unix)]
             {
                 let unix_entries: &[(&str, i32)] = &[
+                    // Declared in the same list, and supplied by `libc` here.
+                    // Windows reaches them only through `win_errors`
+                    // (`interp_errno.py:91-101`), which registers the `WSA`
+                    // spelling, adds the stripped name as a second binding
+                    // and leaves the reverse mapping naming the `WSA` one.
+                    // This module exports no `WSA` name to carry that reverse
+                    // entry, so storing the stripped names there would answer
+                    // `errorcode[code]` with a spelling the declaration never
+                    // assigns.
+                    ("ESTALE", host_errno::ESTALE),
+                    ("EUSERS", host_errno::EUSERS),
+                    ("EREMOTE", host_errno::EREMOTE),
+                    ("ETOOMANYREFS", host_errno::ETOOMANYREFS),
+                    ("EPFNOSUPPORT", host_errno::EPFNOSUPPORT),
+                    ("ESOCKTNOSUPPORT", host_errno::ESOCKTNOSUPPORT),
                     ("ENOTBLK", host_errno::ENOTBLK),
                     ("ETXTBSY", host_errno::ETXTBSY),
                     ("ENOMSG", host_errno::ENOMSG),
@@ -129,6 +161,37 @@ crate::py_module! {
                     ("ETIME", host_errno::ETIME),
                 ];
                 for (name, value) in unix_entries {
+                    store(name, *value as i64);
+                }
+            }
+            // `interp_errno.py`'s "MacOSX specific errnos" block, plus the
+            // `EQFULL` the 3.14 surface adds.  `DefinedConstantInteger`
+            // drops each of these on a platform whose `errno.h` lacks it;
+            // the equivalent here is the target gate, since `libc` declares
+            // them for apple targets only.
+            #[cfg(target_vendor = "apple")]
+            {
+                let apple_entries: &[(&str, i32)] = &[
+                    ("ENOATTR", host_errno::ENOATTR),
+                    ("EAUTH", host_errno::EAUTH),
+                    ("EBADARCH", host_errno::EBADARCH),
+                    ("EBADEXEC", host_errno::EBADEXEC),
+                    ("EBADMACHO", host_errno::EBADMACHO),
+                    ("EBADRPC", host_errno::EBADRPC),
+                    ("EDEVERR", host_errno::EDEVERR),
+                    ("EFTYPE", host_errno::EFTYPE),
+                    ("ENEEDAUTH", host_errno::ENEEDAUTH),
+                    ("ENOPOLICY", host_errno::ENOPOLICY),
+                    ("EPROCLIM", host_errno::EPROCLIM),
+                    ("EPROCUNAVAIL", host_errno::EPROCUNAVAIL),
+                    ("EPROGMISMATCH", host_errno::EPROGMISMATCH),
+                    ("EPROGUNAVAIL", host_errno::EPROGUNAVAIL),
+                    ("EPWROFF", host_errno::EPWROFF),
+                    ("EQFULL", host_errno::EQFULL),
+                    ("ERPCMISMATCH", host_errno::ERPCMISMATCH),
+                    ("ESHLIBVERS", host_errno::ESHLIBVERS),
+                ];
+                for (name, value) in apple_entries {
                     store(name, *value as i64);
                 }
             }
@@ -217,6 +280,21 @@ crate::py_module! {
                 ("ECONNREFUSED", 61),
                 ("EHOSTDOWN", 64),
                 ("EHOSTUNREACH", 65),
+                // The portable tail of `interp_errno.py`'s list, in the same
+                // darwin/BSD numbering the rest of this table uses.  The
+                // Darwin-only Mach/RPC names are deliberately absent: this
+                // arm also serves wasm, where they describe nothing.
+                ("ESOCKTNOSUPPORT", 44),
+                ("ENOTSUP", 45),
+                ("EPFNOSUPPORT", 46),
+                ("ETOOMANYREFS", 59),
+                ("EUSERS", 68),
+                ("ESTALE", 70),
+                ("EREMOTE", 71),
+                ("ECANCELED", 89),
+                ("EILSEQ", 92),
+                ("ENOTRECOVERABLE", 104),
+                ("EOWNERDEAD", 105),
             ];
             for (name, value) in entries {
                 store(name, *value);

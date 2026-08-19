@@ -44,12 +44,19 @@ impl<'c> Lowerer<'c> {
             .iter()
             .filter(|(segments, _, _, _)| *segments == func_segments)
             .collect();
-        let mut layouts: Vec<(&syn::Path, Vec<TokenStream>)> = Vec::new();
+        let mut layouts: Vec<(syn::Path, Vec<TokenStream>)> = Vec::new();
         // `(key, element_path)` for the `field[]` declarations, deduplicated by
         // key: naming one array from two helpers of the same residual would
         // otherwise repeat its descr in the write set.
         let mut arrays: Vec<(String, &syn::Path)> = Vec::new();
         for (_, path, field, writes_elements) in writes {
+            // A write set names the descriptors an opaque call may invalidate,
+            // and a descriptor belongs to the struct that declares the field.
+            // Resolving the entry the same way an access site does is what
+            // makes the two name one descriptor: entries written against
+            // different structs that share an inlined base collapse onto it,
+            // and the grouping below merges them.
+            let path = config.declaring_struct(path, &field.to_string());
             let struct_last = path
                 .segments
                 .last()
@@ -79,7 +86,7 @@ impl<'c> Lowerer<'c> {
             let fields = if let Some((_, fields)) = layouts.iter_mut().find(|(p, _)| *p == path) {
                 fields
             } else {
-                layouts.push((path, Vec::new()));
+                layouts.push((path.clone(), Vec::new()));
                 &mut layouts.last_mut().unwrap().1
             };
             // Same declared width the getfield/setfield lowering registers, so
@@ -112,7 +119,7 @@ impl<'c> Lowerer<'c> {
                 ),
                 None => {
                     let (size, signed, check) =
-                        super::lower_vable::field_scalar_tokens(config, &key, path, &member);
+                        super::lower_vable::field_scalar_tokens(config, &key, &path, &member);
                     (config.ref_fields.contains_key(&key), size, signed, check)
                 }
             };
@@ -132,18 +139,30 @@ impl<'c> Lowerer<'c> {
         let layouts: Vec<_> = layouts
             .iter()
             .map(|(struct_path, fields)| {
-                // Raw host-owned struct (the ref-scalar's pointee, no GC header)
-                // → `is_gc_managed = false`, the same id the getfield/setfield
-                // lowering uses so the write-EI rebuilds the SAME parent
+                // The struct's own gc-kind — the same id the getfield/setfield
+                // lowering uses, so the write-EI rebuilds the SAME parent
                 // SizeDescr identity.
-                let tid = struct_type_id_tokens(struct_path, false);
+                let gc_managed = config.struct_gc_kind_is_managed(struct_path);
+                let tid = struct_type_id_tokens(struct_path, gc_managed);
+                // An inlined base's fields, exactly as the access sites list
+                // them. This layout is a second producer of the same struct's
+                // spec, and `index_in_parent` comes from the positions in it:
+                // a write set that named only the struct's own fields would
+                // number the first of them zero, the slot the base's first
+                // field holds for the same object, and the two would share a
+                // cache entry.
+                let (prefix_fields, prefix_witness) =
+                    config.prefix_field_entries_tokens(struct_path);
                 quote! {
-                    (
-                        ::core::mem::size_of::<#struct_path>(),
-                        #tid,
-                        false,
-                        &[#(#fields),*],
-                    )
+                    {
+                        #prefix_witness
+                        (
+                            ::core::mem::size_of::<#struct_path>(),
+                            #tid,
+                            #gc_managed,
+                            &[#(#prefix_fields,)* #(#fields),*],
+                        )
+                    }
                 }
             })
             .collect();
@@ -167,10 +186,9 @@ impl<'c> Lowerer<'c> {
             })
             .collect();
         Some(quote! {
-            // The residual mutates a host-owned native struct field (no
-            // GC header) → `is_gc_managed = false`, matching the
-            // getfield/setfield lowering so the write-EI rebuilds the
-            // SAME parent SizeDescr identity the getfield reads back.
+            // Each layout carries the struct's own gc-kind, matching the
+            // getfield/setfield lowering so the write-EI rebuilds the SAME
+            // parent SizeDescr identity the getfield reads back.
             majit_metainterp::residual_write_effect_info(
                 &[#(#layouts),*],
                 &[#(#arrays),*],
@@ -1516,6 +1534,31 @@ impl<'c> Lowerer<'c> {
                         quote! {
                             let __sub_jitcode = #builder_path(__asm);
                             let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                            #inline_call
+                        },
+                    );
+                    self.emit_op(OpMeta::live_marker(), post_live);
+                }
+                crate::jit_interp::CallPolicyKind::InlinePipelineVoid => {
+                    let pipeline_name = match &*call.func {
+                        syn::Expr::Path(ep) => ep
+                            .path
+                            .segments
+                            .last()
+                            .map(|segment| segment.ident.to_string()),
+                        _ => None,
+                    }?;
+                    let (inline_call, post_live) = inline_call_tokens_void(&arg_bindings);
+                    let arg_regs: Vec<Register> =
+                        arg_bindings.iter().map(Register::from_binding).collect();
+                    self.inline_liveness_prebuild.push(quote! {
+                        __majit_pipeline_liveness_prebuild(__asm);
+                    });
+                    self.emit_op(
+                        OpMeta::linear(OpKind::InlineCall, arg_regs, vec![]),
+                        quote! {
+                            let __sub_jitcode = __majit_pipeline_jitcode(#pipeline_name);
+                            let __sub_idx = __builder.add_sub_jitcode_arc(__sub_jitcode);
                             #inline_call
                         },
                     );

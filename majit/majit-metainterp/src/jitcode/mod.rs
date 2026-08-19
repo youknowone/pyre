@@ -308,6 +308,20 @@ pub trait RuntimeDescrTable: Sync {
     /// a second numbering must continue above them rather than restart —
     /// `resume.py:1338-1340` indexes one list by a frame's `jitcode_pos`, and
     /// two numberings over the same slots make that lookup ambiguous.
+    ///
+    /// The default is therefore only sound while no `JitCode` this table hands
+    /// out can reach a dispatch registry's numbering walk. Two properties keep
+    /// a lazily-decoded table on that side of the line, and **both** are load
+    /// bearing: a walk reads a jitcode's own `exec.descrs`, never this pool
+    /// (which is consulted only through [`JitCode::descr_at`]'s fallback), and
+    /// a build-time shell's `exec.descrs` is empty. A host that grows an
+    /// inline-call policy puts `JitCode` entries into a *runtime-emitted*
+    /// `exec.descrs`, where the walk does see them — such a host must
+    /// implement this method, and one that does not is caught by the assert in
+    /// `build_jitcode_registry` rather than silently misnumbered. Doing so also
+    /// requires one `Arc` per jitcode index shared by every descr naming it:
+    /// minting a fresh shell per descr breaks the identity
+    /// `codewriter.py:80 all_jitcodes[jitcode.index] is jitcode` asserts.
     fn jitcodes(&self) -> &'static [std::sync::Arc<JitCode>] {
         &[]
     }

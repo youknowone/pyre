@@ -459,6 +459,14 @@ impl PyreCallRegistry {
                 }
                 continue;
             }
+            let qualified_owner = segs[..segs.len() - 1].join("::");
+            if reg.fields.contains_key(&qualified_owner) {
+                let class_host = self.bookkeeper.intern_class_by_qualname(&qualified_owner);
+                class_host.class_set(
+                    method.clone(),
+                    ConstValue::HostObject(entry.host_object.clone()),
+                );
+            }
             if !reg.fields.contains_key(owner) {
                 continue;
             }

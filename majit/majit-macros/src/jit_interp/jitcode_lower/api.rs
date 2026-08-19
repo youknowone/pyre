@@ -400,6 +400,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
     native_int_binops: &[(Path, Ident)],
     native_tag_small: &[Path],
     headerless_structs: &[Path],
+    inlined_prefix: &[crate::jit_interp::InlinedPrefixEntry],
 ) -> syn::Result<Option<InlineHelperJitCode>> {
     if !func.sig.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -439,6 +440,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
         && native_int_binops.is_empty()
         && native_tag_small.is_empty()
         && headerless_structs.is_empty()
+        && inlined_prefix.is_empty()
     {
         None
     } else {
@@ -449,6 +451,7 @@ pub(crate) fn generate_inline_helper_jitcode_with_calls(
             native_int_binops,
             native_tag_small,
             headerless_structs,
+            inlined_prefix,
         ))
     };
     let mut lowerer = Lowerer::new_with_call_policies(

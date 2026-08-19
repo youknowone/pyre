@@ -1220,17 +1220,39 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 
 /// The `Function` fields PyPy declares quasi-immutable — `function.py:34-42`
 /// `_immutable_fields_ = ['code?', 'w_func_globals?', 'closure?[*]',
-/// 'defs_w?[*]', ...]`.
+/// 'defs_w?[*]', 'name?', 'qualname?', 'w_objclass?', 'w_text_signature?',
+/// 'w_kw_defs?']`.
 ///
-/// The `?` makes each field quasi-immutable upstream and `[*]` makes the
-/// selected elements immutable after the field has been promoted.  Pyre's
-/// setters (`function_set_defaults` and friends) do not yet call
-/// `do_force_quasi_immutable`, so marking these descriptors quasi-immutable
-/// would leave compiled loops alive after `f.__defaults__ = ...` /
-/// `f.__code__ = ...`.  Keep the fields live/mutable for now; the inline-call
-/// path pairs every read with a `GuardValue`, which is the sound
-/// pre-invalidation equivalent.  A tuple's backing array has its own immutable
-/// descriptor and is read with `GetarrayitemGcPureR`.
+/// The `?` makes each field quasi-immutable and `[*]` makes the selected
+/// elements immutable after the field has been promoted.  All nine are marked
+/// here through the `quasi` row: `descr.py:229 is_pure =
+/// STRUCT._immutable_field(fieldname) != False` answers true for a
+/// quasi-immutable field — `IR_QUASIIMMUTABLE` is an object, so `!= False`
+/// holds — which is what the `is_immutable` column carries.  The rank is what
+/// keeps the read from folding on that column alone:
+/// `SimpleFieldDescr::is_always_pure` is `is_immutable && !is_quasi_immutable`,
+/// so the fold stays behind `record_quasiimmut_field` + `GUARD_NOT_INVALIDATED`
+/// exactly as `jtransform.py:895-903` sequences it.
+///
+/// The write half these descriptors depend on is `function_notify_quasi_immut`
+/// (pyre-interpreter `function.rs`), called immediately before every store to
+/// one of the nine — RPython gets it from the rtyper rewriting writes to a `?`
+/// field, pyre spells it out.  `f.__defaults__ = ...` / `f.__code__ = ...`
+/// therefore runs `QuasiImmut::invalidate()` and retires every loop that
+/// folded the field, which is the termination guarantee a value guard cannot
+/// give: a guard that can no longer pass is re-derived by the next trace
+/// forever.  The inline-call path's `GuardValue`s stay on top; over-strictness
+/// is sound, and they still carry the identity checks that path's later reads
+/// assume.  A tuple's backing array has its own immutable descriptor and is
+/// read with `GetarrayitemGcPureR`.
+///
+/// `#[majit_macros::jit_immutable_fields("code?", ...)]` on the struct is the
+/// declarative spelling of the same list, and it is deliberately NOT applied:
+/// it would make the codewriter emit `record_quasiimmut_field` into the
+/// analyzer's interpreter jitcodes, and that bytecode has no trace-time arm in
+/// `pyjitpl/dispatch.rs` (unknown bytecodes panic there) and no registration in
+/// the production blackhole builder.  Until both land, the declaration lives on
+/// this group, which is what every hand-written trace path resolves through.
 ///
 /// The entries are in byte-offset order and each key is the struct's own field
 /// name, which is what makes the group's numbering agree with the analyzer's.
@@ -1268,12 +1290,24 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             false,
         )
     };
+    // A `function.py:34-42` entry: pure by `descr.py:229`, quasi by its `?`.
+    let quasi = |key, offset| {
+        (
+            key,
+            offset,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            true,
+            true,
+        )
+    };
     build_object_descr_group_with_def_path(
         f::FUNCTION_OBJECT_SIZE,
         FUNCTION_GC_TYPE_ID,
         &pyre_interpreter::FUNCTION_TYPE as *const _ as usize,
         &[
-            field("code", f::FUNCTION_CODE_OFFSET),
+            quasi("code", f::FUNCTION_CODE_OFFSET),
             // `function.py:33 can_change_code = True`; `False` for the
             // `FunctionWithFixedCode` / `BuiltinFunction` subclasses.  A plain
             // byte, so `clear_gc_fields` leaves it alone and the value a
@@ -1294,28 +1328,39 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // permanent (a builtin's `malloc_raw` box, or the code object's
             // borrowed `co_name`), which the walker's managed-heap guard sorts
             // out.
-            field("name", f::FUNCTION_NAME_OFFSET),
+            quasi("name", f::FUNCTION_NAME_OFFSET),
+            // `w_name` has no `function.py:34-42` twin — upstream's `name?` is
+            // the str this field wraps — so it stays a plain mutable slot.
             field("w_name", f::FUNCTION_W_NAME_OFFSET),
-            field("closure", f::FUNCTION_CLOSURE_OFFSET),
-            field("defs_w", f::FUNCTION_DEFS_W_OFFSET),
-            field("w_kw_defs", f::FUNCTION_W_KW_DEFS_OFFSET),
+            quasi("closure", f::FUNCTION_CLOSURE_OFFSET),
+            quasi("defs_w", f::FUNCTION_DEFS_W_OFFSET),
+            quasi("w_kw_defs", f::FUNCTION_W_KW_DEFS_OFFSET),
             field("w_module", f::FUNCTION_W_MODULE_OFFSET),
-            field("w_func_globals_obj", f::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET),
+            quasi("w_func_globals_obj", f::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET),
             field("w_builtins", f::FUNCTION_W_BUILTINS_OFFSET),
             field("w_ann", f::FUNCTION_W_ANN_OFFSET),
             field("w_annotate", f::FUNCTION_W_ANNOTATE_OFFSET),
             field("w_func_dict", f::FUNCTION_W_FUNC_DICT_OFFSET),
             field("w_typeparams", f::FUNCTION_W_TYPEPARAMS_OFFSET),
             field("w_doc", f::FUNCTION_W_DOC_OFFSET),
-            field("w_qualname", f::FUNCTION_W_QUALNAME_OFFSET),
-            field("w_objclass", f::FUNCTION_W_OBJCLASS_OFFSET),
-            field("w_text_signature", f::FUNCTION_W_TEXT_SIGNATURE_OFFSET),
+            quasi("w_qualname", f::FUNCTION_W_QUALNAME_OFFSET),
+            quasi("w_objclass", f::FUNCTION_W_OBJCLASS_OFFSET),
+            quasi("w_text_signature", f::FUNCTION_W_TEXT_SIGNATURE_OFFSET),
             // `w_new_self` is absent from `FUNCTION_GC_PTR_OFFSETS` (it names a
             // static-region type that is never relocated), but it is still a
             // pointer slot an app-level `__self__` read dereferences, so it
             // needs the census entry that gets it NULLed behind the allocation.
             field("w_new_self", f::FUNCTION_W_NEW_SELF_OFFSET),
             field("w_moduleobj", f::FUNCTION_W_MODULEOBJ_OFFSET),
+            // The `mutate_<name>` block pointer.  `Type::Ref` puts it in
+            // `gc_fielddescrs`, which is what `rewrite.py:498-504
+            // clear_gc_fields` walks, so a JIT-allocated function gets its NULL
+            // from the allocation clear — the same footing upstream's
+            // `mutate_<field>` sits on, that one being a real GC pointer.  The
+            // collector does NOT follow it: its census is the hand-maintained
+            // `FUNCTION_GC_PTR_OFFSETS`, which this word is deliberately absent
+            // from, so the `Box` behind it is never traced as a child.
+            field("mutate_slots", f::FUNCTION_MUTATE_SLOTS_OFFSET),
             // The inline emit can escape a guard and be materialized, so the
             // inherited Python class is a proper virtual field of this group —
             // same reasoning as the `Method` / `W_ListObject` entries.  It sits
@@ -2586,9 +2631,8 @@ fn function_field_descr(offset: usize) -> DescrRef {
     majit_ir::descr::field_descr_from_parent_by_offset(&parent, offset)
 }
 
-/// Live `Function.defs_w` field used by the positional-default inline path.
-/// See [`FUNCTION_DESCR_GROUP`] for why this is deliberately mutable until
-/// pyre wires the upstream quasi-immutable invalidation hook.
+/// `Function.defs_w` — the positional defaults the inline path reads.
+/// `defs_w?[*]`, so the read is paired with `record_quasiimmut_field`.
 pub fn function_defs_w_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_DEFS_W_OFFSET)
 }
@@ -2633,6 +2677,74 @@ pub fn function_w_builtins_descr() -> DescrRef {
 /// qualified name stamped at construction from the code object.
 pub fn function_w_qualname_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_W_QUALNAME_OFFSET)
+}
+
+/// `Function.w_kw_defs` — `w_kw_defs?`, the keyword-only defaults mapping.
+pub fn function_w_kw_defs_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_KW_DEFS_OFFSET)
+}
+
+/// `Function.w_objclass` — `w_objclass?`, the owning class a descriptor-backed
+/// builtin reports through `__objclass__`.
+pub fn function_w_objclass_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_OBJCLASS_OFFSET)
+}
+
+/// `Function.w_text_signature` — `w_text_signature?`, the parsed `__text_signature__`.
+pub fn function_w_text_signature_descr() -> DescrRef {
+    function_field_descr(pyre_interpreter::function::FUNCTION_W_TEXT_SIGNATURE_OFFSET)
+}
+
+/// Resolve a field-descr index to the `Function` watcher slot it names, or
+/// `None` when the index is not one of the nine `function.py:34-42` fields.
+///
+/// `quasiimmut.py:116-126 get_current_qmut_instance` reaches the hidden
+/// `mutate_<name>` field through a `mutatefielddescr` the rtyper minted next to
+/// the field's own descr.  Pyre carries the same pairing as this table: both
+/// the record-time install (`state.rs`) and the compile-time watcher
+/// registration (`pyre-jit/src/eval.rs`) key on `descr.index()`, so they resolve
+/// through one list instead of two chains that could drift apart.
+///
+/// The index carries no struct identity — `stable_field_index` derives it from
+/// `(offset, field_size, field_type, signed)` — so keying an arm on it is only
+/// safe while no other quasi-immutable descriptor can land on the same number.
+/// None can: the two that also address a real struct field
+/// ([`TYPE_VERSION_TAG_FIELD_DESCR`], [`MODULE_DICT_VERSION_FIELD_DESCR`]) are
+/// `Type::Int`, which `type_bits` separates from these nine `Type::Ref` slots,
+/// and the other five carry reserved [`MAPDICT_DESCR_TAG`] indices outside the
+/// `FIELD_DESCR_TAG` range altogether.  A descriptor that is not quasi-immutable
+/// reaches neither caller.
+pub fn function_quasi_immut_slot(index: u32) -> Option<pyre_interpreter::function::QuasiImmutSlot> {
+    use pyre_interpreter::function::QuasiImmutSlot;
+    static SLOTS: LazyLock<Vec<(u32, QuasiImmutSlot)>> = LazyLock::new(|| {
+        vec![
+            (function_code_descr().index(), QuasiImmutSlot::Code),
+            (
+                function_w_globals_descr().index(),
+                QuasiImmutSlot::WFuncGlobalsObj,
+            ),
+            (function_closure_descr().index(), QuasiImmutSlot::Closure),
+            (function_defs_w_descr().index(), QuasiImmutSlot::DefsW),
+            (function_name_descr().index(), QuasiImmutSlot::Name),
+            (
+                function_w_qualname_descr().index(),
+                QuasiImmutSlot::WQualname,
+            ),
+            (
+                function_w_objclass_descr().index(),
+                QuasiImmutSlot::WObjclass,
+            ),
+            (
+                function_w_text_signature_descr().index(),
+                QuasiImmutSlot::WTextSignature,
+            ),
+            (function_w_kw_defs_descr().index(), QuasiImmutSlot::WKwDefs),
+        ]
+    });
+    SLOTS
+        .iter()
+        .find(|(slot_index, _)| *slot_index == index)
+        .map(|(_, slot)| *slot)
 }
 
 /// `function.py:33 can_change_code = True` — a plain byte, so a fresh
@@ -6024,11 +6136,24 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // produces a `SimpleFieldDescr` whose `index()` matches the
             // upstream value rather than a `u32::MAX` sentinel.
             let field = majit_translate::jitcode::BhFieldSpec {
-                // `unwrap_or(0)` and not the `u32::MAX` "no index" sentinel
-                // used elsewhere in this file: `0` is the value this field has
-                // carried on this path all along, and swapping in the sentinel
-                // would change a descr's identity, not just measure it.
-                index: index_in_parent.unwrap_or(0) as u32,
+                // `index()` is the key the `HeapCache` files a field read
+                // under, so it has to separate every field one object can be
+                // read through.  A numbered field answers with its position;
+                // an unnumbered one used to answer `0`, which is a position
+                // too — the one held by the first own field of whatever struct
+                // is read off that same object.  `PyObject.ob_type` carries no
+                // number (the positional census skips the header words), so it
+                // filed its read under slot 0 and `W_StringIO.buffer` — offset
+                // 16, position 0 — hit that entry and was handed the type
+                // pointer, whose `+24` word then reached `arraylen_gc` as an
+                // array.  Number the unnumbered ones off the payload instead,
+                // the scheme the runtime-minted field descrs already use: its
+                // `FIELD_DESCR_TAG` is disjoint from the positional numbers,
+                // and two fields of one object cannot share an offset.
+                index: match index_in_parent {
+                    Some(index) => *index as u32,
+                    None => stable_field_index(*offset, *field_size, *field_type, *is_field_signed),
+                },
                 field_key,
                 name: full_name,
                 offset: *offset,
@@ -6814,40 +6939,51 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
 /// whether to clear the bitstrings.  A half-populated EI would clear them
 /// while `extraeffect` still claims concrete effects, and the next
 /// `check_readonly_descr_field` would then read a `None` bitstring.
+/// `effectinfo.py:285-292` wildcard: the shape to fall back to whenever the
+/// concrete sets cannot be rebuilt faithfully.  Conservative in the sound
+/// direction — `has_random_effects()` makes every heap consumer assume the
+/// call touched everything.
+///
+/// Both raw-set families have to be cleared, not just the compacted one.
+/// `EffectInfo::default()` seeds every `_*_descrs_*` with `Some(vec![])` and
+/// serde skips them, so a deserialized EI arrives carrying empty concrete sets;
+/// leaving those behind states "writes nothing" — the bottom of the lattice —
+/// next to an `extraeffect` saying "writes everything".  Readers that consult
+/// the raw set directly (`writes_field_descr_by_identity`, which
+/// `OptHeap::force_from_effectinfo` uses before `compute_bitstrings` has run)
+/// would take the unsound half, and `compute_bitstrings` asserts the
+/// biconditional outright (`effectinfo.py:484-489`).
+fn degrade_to_random_effects(ei: &mut majit_ir::EffectInfo) {
+    ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
+    // effectinfo.py:364-365 — the wildcard forces can_collect.
+    ei.can_collect = true;
+    // `call.py:284-286` states it outright: "random_effects implies
+    // can_invalidate".  `effectinfo.py:271-273 MOST_GENERAL` is built with
+    // `can_invalidate=True`, and so is pyre's own `EffectInfo::MOST_GENERAL`.
+    // Without this a degraded EI is a shape upstream cannot construct —
+    // random effects with `check_can_invalidate()` still false — and
+    // `check_can_invalidate` is read on a path `has_random_effects()` does not
+    // cover (`heap.py:457-459`; `_seen_guard_not_invalidated` is otherwise only
+    // reset in `__init__`, `heap.py:341`), so a quasi-immutable guard would
+    // survive a call the wildcard says invalidates everything.
+    ei.can_invalidate = true;
+    ei._readonly_descrs_fields = None;
+    ei._write_descrs_fields = None;
+    ei._readonly_descrs_arrays = None;
+    ei._write_descrs_arrays = None;
+    ei._readonly_descrs_interiorfields = None;
+    ei._write_descrs_interiorfields = None;
+    ei.readonly_descrs_fields = None;
+    ei.write_descrs_fields = None;
+    ei.readonly_descrs_arrays = None;
+    ei.write_descrs_arrays = None;
+    ei.readonly_descrs_interiorfields = None;
+    ei.write_descrs_interiorfields = None;
+    ei.single_write_descr_array = None;
+}
+
 pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
-    // `effectinfo.py:285-292` wildcard: the shape to fall back to whenever
-    // the concrete sets cannot be rebuilt faithfully.  Conservative in the
-    // sound direction — `has_random_effects()` makes every heap consumer
-    // assume the call touched everything.
-    fn degrade(ei: &mut majit_ir::EffectInfo) {
-        ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
-        // effectinfo.py:364-365 — the wildcard forces can_collect.
-        ei.can_collect = true;
-        // `call.py:284-286` states it outright: "random_effects implies
-        // can_invalidate".  `effectinfo.py:271-273 MOST_GENERAL` is built with
-        // `can_invalidate=True`, and so is pyre's own
-        // `EffectInfo::MOST_GENERAL`.  Without this a degraded EI is a shape
-        // upstream cannot construct — random effects with
-        // `check_can_invalidate()` still false — and `check_can_invalidate`
-        // is read on a path `has_random_effects()` does not cover
-        // (`heap.py:457-459`; `_seen_guard_not_invalidated` is otherwise only
-        // reset in `__init__`, `heap.py:341`), so a quasi-immutable guard
-        // would survive a call the wildcard says invalidates everything.
-        ei.can_invalidate = true;
-        ei._readonly_descrs_fields = None;
-        ei._write_descrs_fields = None;
-        ei._readonly_descrs_arrays = None;
-        ei._write_descrs_arrays = None;
-        ei._readonly_descrs_interiorfields = None;
-        ei._write_descrs_interiorfields = None;
-        ei.readonly_descrs_fields = None;
-        ei.write_descrs_fields = None;
-        ei.readonly_descrs_arrays = None;
-        ei.write_descrs_arrays = None;
-        ei.readonly_descrs_interiorfields = None;
-        ei.write_descrs_interiorfields = None;
-        ei.single_write_descr_array = None;
-    }
+    use degrade_to_random_effects as degrade;
 
     // `descr_set_keys` is the build-process -> runtime-process wire channel
     // for the six raw sets skipped by serde.  Consume it here: after the
@@ -6952,18 +7088,11 @@ pub fn rehydrate_effect_info(ei: &mut majit_ir::EffectInfo) {
 /// descriptor reference EffectInfo deliberately keeps after compaction
 /// (`effectinfo.py:201-206`), so that singleton alone remains live.
 pub fn prepare_frozen_effect_info(ei: &mut majit_ir::EffectInfo) {
-    fn degrade(ei: &mut majit_ir::EffectInfo) {
-        ei.extraeffect = majit_ir::ExtraEffect::RandomEffects;
-        ei.can_collect = true;
-        ei.can_invalidate = true;
-        ei.readonly_descrs_fields = None;
-        ei.write_descrs_fields = None;
-        ei.readonly_descrs_arrays = None;
-        ei.write_descrs_arrays = None;
-        ei.readonly_descrs_interiorfields = None;
-        ei.write_descrs_interiorfields = None;
-        ei.single_write_descr_array = None;
-    }
+    // Shared with `rehydrate_effect_info` rather than spelled out again: the
+    // two had drifted, and this one was clearing only the compacted sets while
+    // the six `_*_descrs_*` kept the `Some(vec![])` that `EffectInfo::default()`
+    // seeds and serde skips.
+    use degrade_to_random_effects as degrade;
 
     let Some(keys) = ei.descr_set_keys.take() else {
         if ei.extraeffect != majit_ir::ExtraEffect::RandomEffects {
@@ -7048,6 +7177,11 @@ pub fn make_call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> De
         majit_metainterp::make_call_descr_sized_with_translated_effect(
             &arg_types,
             result_type,
+            // `descr.py:524-526 get_result_type()` — the raw char, same as the
+            // non-translated arm below.  Dropping it here would collapse `'S'`
+            // onto `'i'` and `'L'` onto `'f'` for every descr that carries a
+            // translated EffectInfo id.
+            bh.result_type,
             bh.result_signed,
             result_size,
             translated_id,
@@ -7111,6 +7245,62 @@ pub fn make_interior_field_descr(
     ));
     majit_ir::descr_registry::register_interior_field(interior.clone());
     interior
+}
+
+#[cfg(test)]
+mod degrade_shape_tests {
+    use super::*;
+
+    /// `effectinfo.py:149-162` makes the six raw sets `None` **iff** the EI is
+    /// `EF_RANDOM_EFFECTS`, and `compute_bitstrings` (`effectinfo.py:484-489`)
+    /// asserts that biconditional.  Both degrade paths therefore have to clear
+    /// the `_*_descrs_*` family as well as the compacted one — `serde(skip)`
+    /// plus `EffectInfo::default()` means a deserialized EI arrives with
+    /// `Some(vec![])` in all six, and an EI left holding those while
+    /// `extraeffect` says random effects reads as "writes nothing" through
+    /// `writes_field_descr_by_identity`, the unsound direction.
+    #[test]
+    fn both_degrade_paths_clear_the_raw_sets_too() {
+        for (label, prepare) in [
+            (
+                "prepare_frozen_effect_info",
+                prepare_frozen_effect_info as fn(&mut majit_ir::EffectInfo),
+            ),
+            (
+                "rehydrate_effect_info",
+                rehydrate_effect_info as fn(&mut majit_ir::EffectInfo),
+            ),
+        ] {
+            // A concrete classification with no key channel — the shape whose
+            // sets cannot be rebuilt, so it must fall back to the wildcard.
+            let mut ei = majit_ir::EffectInfo {
+                extraeffect: majit_ir::ExtraEffect::CanRaise,
+                descr_set_keys: None,
+                ..majit_ir::EffectInfo::default()
+            };
+            // The premise: `default()` really does seed the raw sets, so
+            // clearing them is not vacuous.
+            assert!(ei._write_descrs_fields.is_some(), "{label}: premise");
+
+            prepare(&mut ei);
+
+            assert_eq!(
+                ei.extraeffect,
+                majit_ir::ExtraEffect::RandomEffects,
+                "{label}"
+            );
+            assert!(ei._readonly_descrs_fields.is_none(), "{label}");
+            assert!(ei._write_descrs_fields.is_none(), "{label}");
+            assert!(ei._readonly_descrs_arrays.is_none(), "{label}");
+            assert!(ei._write_descrs_arrays.is_none(), "{label}");
+            assert!(ei._readonly_descrs_interiorfields.is_none(), "{label}");
+            assert!(ei._write_descrs_interiorfields.is_none(), "{label}");
+            assert!(ei.write_descrs_fields.is_none(), "{label}");
+            assert!(ei.single_write_descr_array.is_none(), "{label}");
+            assert!(ei.can_collect, "{label}");
+            assert!(ei.can_invalidate, "{label}");
+        }
+    }
 }
 
 #[cfg(test)]

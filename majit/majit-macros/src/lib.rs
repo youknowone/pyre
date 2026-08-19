@@ -40,6 +40,7 @@ struct JitInlineArgs {
     native_tag_small: Vec<Path>,
     struct_allocs: Vec<(Path, Path)>,
     headerless_structs: Vec<Path>,
+    inlined_prefix: Vec<jit_interp::InlinedPrefixEntry>,
 }
 
 impl Parse for JitInlineArgs {
@@ -52,6 +53,7 @@ impl Parse for JitInlineArgs {
         let mut native_tag_small: Vec<Path> = Vec::new();
         let mut struct_allocs: Vec<(Path, Path)> = Vec::new();
         let mut headerless_structs: Vec<Path> = Vec::new();
+        let mut inlined_prefix: Vec<jit_interp::InlinedPrefixEntry> = Vec::new();
         let mut array_fields: Vec<jit_interp::ArrayFieldEntry> = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -123,6 +125,9 @@ impl Parse for JitInlineArgs {
                 "headerless_structs" => {
                     headerless_structs = jit_interp::parse_path_set(input)?;
                 }
+                "inlined_prefix" => {
+                    inlined_prefix = jit_interp::parse_inlined_prefix_map(input)?;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -142,6 +147,7 @@ impl Parse for JitInlineArgs {
             native_tag_small,
             struct_allocs,
             headerless_structs,
+            inlined_prefix,
         })
     }
 }
@@ -151,7 +157,9 @@ fn rewrite_jit_inline_ref_param_fields(
     ref_params: &[(Ident, Path)],
     ref_fields: &[jit_interp::RefFieldEntry],
     array_fields: &[jit_interp::ArrayFieldEntry],
+    int_fields: &[jit_interp::IntFieldEntry],
     struct_allocs: &[(Path, Path)],
+    inlined_prefix: &[jit_interp::InlinedPrefixEntry],
 ) -> syn::Block {
     use std::collections::HashMap;
     use syn::visit_mut::VisitMut;
@@ -164,6 +172,11 @@ fn rewrite_jit_inline_ref_param_fields(
         // through it rather than reading the field itself.
         array_field_elems: HashMap<String, syn::Path>,
         struct_allocs: HashMap<Vec<String>, syn::Path>,
+        // Outer struct segments -> (base field, base path); empty unless a
+        // caller declares a leading substructure.
+        inlined_prefix: HashMap<Vec<String>, (String, syn::Path)>,
+        // Every `"StructLast::field"` this block's vocabularies declare.
+        declared_field_keys: std::collections::HashSet<String>,
     }
 
     impl InlineRefFieldRewriter {
@@ -179,6 +192,24 @@ fn rewrite_jit_inline_ref_param_fields(
             let struct_last = struct_path.segments.last()?.ident.to_string();
             let key = format!("{}::{}", struct_last, field_name);
             self.field_pointees.get(&key).cloned()
+        }
+
+        // The struct that declares `field_name`, so the emitted cast names
+        // the type it really lives on.  The JIT lowerer redirects the same
+        // way; a disagreement leaves this walk dereferencing a struct with
+        // no such field.
+        fn declaring_struct(&self, struct_path: &syn::Path, field_name: &str) -> syn::Path {
+            jit_interp::declaring_struct_of(
+                &self.inlined_prefix,
+                |path, field| {
+                    path.segments.last().is_some_and(|last| {
+                        self.declared_field_keys
+                            .contains(&format!("{}::{}", last.ident, field))
+                    })
+                },
+                struct_path,
+                field_name,
+            )
         }
 
         fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
@@ -200,6 +231,7 @@ fn rewrite_jit_inline_ref_param_fields(
             let syn::Member::Named(member) = &field.member else {
                 return;
             };
+            let struct_path = self.declaring_struct(&struct_path, &member.to_string());
             let Some(pointee) = self.field_pointee(&struct_path, &member.to_string()) else {
                 return;
             };
@@ -319,6 +351,7 @@ fn rewrite_jit_inline_ref_param_fields(
                     syn::Member::Named(id) => id.to_string(),
                     _ => String::new(),
                 };
+                let struct_path = self.declaring_struct(&struct_path, &member_name);
                 let mut rhs = (*assign.right).clone();
                 self.visit_expr_mut(&mut rhs);
                 if let Some(pointee) = self.field_pointee(&struct_path, &member_name) {
@@ -342,6 +375,7 @@ fn rewrite_jit_inline_ref_param_fields(
                     syn::Member::Named(id) => id.to_string(),
                     _ => String::new(),
                 };
+                let struct_path = self.declaring_struct(&struct_path, &member_name);
                 if self.field_pointee(&struct_path, &member_name).is_some() {
                     *expr = syn::parse_quote! {
                         {
@@ -395,6 +429,8 @@ fn rewrite_jit_inline_ref_param_fields(
         })
         .collect();
     let mut rewriter = InlineRefFieldRewriter {
+        inlined_prefix: jit_interp::inlined_prefix_index(inlined_prefix),
+        declared_field_keys: jit_interp::declared_field_keys(ref_fields, int_fields, array_fields),
         local_ref_types: ref_params
             .iter()
             .map(|(name, struct_type)| (name.to_string(), struct_type.clone()))
@@ -466,7 +502,9 @@ fn helper_call_target_fn_name(path: &Path) -> syn::Result<Ident> {
 /// alongside `_elidable_function_`, so the ullbc hint harvester
 /// (`front::llbc_hints`) can recover the strengthened-effect sub-flag
 /// the policy byte collapses to `UNSUPPORTED` for ref/float-return
-/// helpers.
+/// helpers. `dont_look_inside_cannot_raise` similarly emits
+/// `_jit_cannot_raise_` alongside `_jit_look_inside_` so graph-pipeline
+/// residual calls retain the declared exception effect.
 ///
 /// Receiver methods get the `elidable` / `elidable_cannot_raise` /
 /// `elidable_or_memerror` / `dont_look_inside` markers as associated
@@ -530,9 +568,11 @@ fn rpython_attribute_const_for(
             ("_elidable_function_", true, true),
             ("_jit_elidable_or_memerror_", true, true),
         ],
-        "dont_look_inside" | "dont_look_inside_cannot_raise" => {
-            &[("_jit_look_inside_", false, true)]
-        }
+        "dont_look_inside" => &[("_jit_look_inside_", false, true)],
+        "dont_look_inside_cannot_raise" => &[
+            ("_jit_look_inside_", false, true),
+            ("_jit_cannot_raise_", true, true),
+        ],
         "look_inside" => &[("_jit_look_inside_", true, false)],
         "jit_loop_invariant" => &[("_jit_loop_invariant_", true, false)],
         _ => return None,
@@ -1399,12 +1439,9 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Use when `#[dont_look_inside]` is parity-conservative: the function
 /// is opaque to the tracer (RPython annotation analysis would mark it
-/// as `EF_CANNOT_RAISE`) but pyre's analyzer output (which lives in
-/// the codewriter pipeline at `majit-translate/src/codewriter/
-/// call.rs:3250 effectinfo_from_writeanalyze`) is not yet plumbed to
-/// the runtime trace recorder. This attribute provides explicit user
-/// opt-in for the cannot-raise effect-info until the codewriter→
-/// recorder wire-up lands.
+/// as `EF_CANNOT_RAISE`) while pyre's conservative analyzer cannot prove
+/// that result. This attribute records the user's exception-effect
+/// assertion for both macro-generated and graph-pipeline JitCode.
 #[proc_macro_attribute]
 pub fn dont_look_inside_cannot_raise(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_dont_look_inside_attribute(item, "dont_look_inside_cannot_raise")
@@ -2502,6 +2539,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         &args.native_int_binops,
         &args.native_tag_small,
         &args.headerless_structs,
+        &args.inlined_prefix,
     ) {
         Ok(Some(lowered)) => lowered,
         Ok(None) => {
@@ -2523,7 +2561,9 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         &args.ref_params,
         &args.ref_fields,
         &args.array_fields,
+        &args.int_fields,
         &args.struct_allocs,
+        &args.inlined_prefix,
     );
     let helper_with_asm_name = format_ident!("__majit_inline_jitcode_{}_with_asm", sig.ident);
     let helper_prebuild_name = format_ident!("__majit_inline_jitcode_{}_prebuild", sig.ident);

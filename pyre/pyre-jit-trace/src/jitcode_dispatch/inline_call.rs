@@ -3861,10 +3861,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // iteration.
         //
         // Reading them live is what `f.__code__ = g.__code__` needs: pinning
-        // the object pins none of its fields.  Upstream is safe there because
-        // `code?` is quasi-immutable and assigning it invalidates the traces
-        // that folded it; pyre has no such hook yet, so the value guard stands
-        // in for the invalidation.
+        // the object pins none of its fields.  `code?` is quasi-immutable, so
+        // `opimpl_getfield_gc_r` pairs each read with `record_quasiimmut_field`
+        // and assigning the field invalidates the traces that folded it; the
+        // value guards stay on top as the stricter identity check the reads
+        // below assume.
         //
         // Guarding the function OBJECT instead pinned its identity, which a
         // callee built by a `MAKE_FUNCTION` in the caller's own loop body can
@@ -3923,7 +3924,27 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     }
 
     if let Some(defaults) = positional_defaults {
-        // `defs_w?`: read the live field on every compiled iteration.
+        // `defs_w?[*]`: read the live field on every compiled iteration.
+        //
+        // `jtransform.py:895-903` prefixes a quasi-immutable read with
+        // `record_quasiimmut_field`; the read below records the op directly
+        // rather than through `opimpl_getfield_gc_r`, so the pairing is spelled
+        // out here.  It is what installs the watcher on this callee and puts the
+        // field in `quasi_immutable_deps`, so a later `f.__defaults__ = ...`
+        // retires this loop instead of leaving the guard below to fail forever.
+        //
+        // Gated on the same flag as the field guards above, and for a stronger
+        // reason: installing dereferences `callable_guard_op` as a `Function` to
+        // reach its `mutate_defs_w` slot.  The specializer-owned callers arrive
+        // here with the CALL's own operand — a `PyCFunction` — so an ungated
+        // install would write through a type-confused pointer.
+        if guards_the_callee_function {
+            crate::state::record_quasiimmut_field(
+                ctx.trace_ctx,
+                callable_guard_op,
+                crate::descr::function_defs_w_descr(),
+            );
+        }
         let defaults_op = ctx.trace_ctx.record_op_with_descr(
             OpCode::GetfieldGcR,
             &[callable_guard_op],

@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=22
+# pyre-check: skip-cpython
+# cpython 1.72s vs pyre 0.38s (4.5x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # Both `append` and `pop` now fold, so this reads 3.2x on dynasm and 4.3x on
 # cranelift where it read 73.5x here before the pop fold -- and the loop that
 # reached 188.0x on windows-latest is the same one. The ceiling is twice the

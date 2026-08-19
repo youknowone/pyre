@@ -271,6 +271,9 @@ pub struct Assembler {
         reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
     )]
     all_liveness_positions: indexmap::IndexMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), usize>,
+    /// Length of the build-time liveness prefix installed by an embedded
+    /// JitCode table; zero until one is installed.
+    embedded_liveness_prefix_len: usize,
     /// RPython: Assembler.num_liveness_ops (assembler.py:32).
     pub num_liveness_ops: usize,
     /// State-field JIT canonical "all-live" liveness triple, set once at
@@ -319,6 +322,7 @@ impl Assembler {
             all_liveness: Vec::new(),
             all_liveness_length: 0,
             all_liveness_positions: indexmap::IndexMap::new(),
+            embedded_liveness_prefix_len: 0,
             num_liveness_ops: 0,
             canonical_liveness_triple: None,
             canonical_liveness_offset: None,
@@ -3477,6 +3481,8 @@ fn bh_size_spec_from_callcontrol(
     if owner.is_empty() {
         return None;
     }
+    let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
+    let owner = canonical_owner.as_str();
     // RPython keys SizeDescrs on the low-level STRUCT object, not on an
     // annotation-side generic instantiation. Charon registers one physical
     // layout for a nominal generic TypeDecl, so `Result<T>::Ok` and
@@ -3595,28 +3601,28 @@ fn bh_size_spec_from_callcontrol(
             );
         }
     }
+    let (is_gc_managed, headerless) = cc.struct_storage_for(layout_owner).unwrap_or((true, false));
     Some(crate::jitcode::BhSizeSpec {
         size,
-        // Analyzer-side structs keep the guard (unchanged); the raw
-        // header-less gate is driven by the runtime
-        // `register_struct_layout` path.
-        is_gc_managed: true,
-        headerless: false,
+        is_gc_managed,
+        headerless,
         // `descr.py:105-127 get_size_descr` keys `_cache_size[STRUCT]` on
         // the lltype STRUCT object identity.  Pyre's analogue is
-        // `path_hash(owner)` per `majit_ir::descr::path_hash` doc
+        // `path_hash_for_gc_kind(owner, is_gc_managed)` per
+        // `majit_ir::descr::path_hash_for_gc_kind` doc
         // (`majit-ir/src/descr.rs:120-141`): the analyzer side hashes
         // `field.owner_root`, the runtime macro hashes
         // `concat!(module_path!(), "::", stringify!(Struct))`.  The
-        // analyzer hashes `owner` to the SAME u64 so analyzer-side
-        // `BhSizeSpec` and runtime-side `__majit_type_id` produce the
-        // same `LLType::Struct(u64)` cache key in `gc_cache._cache_size`.
+        // analyzer hashes `owner` with the same raw-struct discriminator so
+        // analyzer-side `BhSizeSpec` and runtime-side `__majit_type_id`
+        // produce the same `LLType::Struct(u64)` cache key in
+        // `gc_cache._cache_size`.
         // MUST NOT truncate to u32 — `path_hash` has 64-bit range and
         // `as u32` collisions approach certainty around 2^16 distinct
         // structs (birthday paradox), whereas PyPy's `id(STRUCT)` never
         // aliases.  The rare hash-to-zero case (1 in 2^64) is handled
         // by `simple_descr_group_from_bh_size`'s no-identity branch.
-        type_id: majit_ir::descr::path_hash(layout_owner),
+        type_id: majit_ir::descr::path_hash_for_gc_kind(layout_owner, is_gc_managed),
         vtable: 0,
         all_fielddescrs,
     })
@@ -3711,8 +3717,15 @@ fn bh_all_field_specs_for_struct_into(
             .map(|fs| fs.to_vec())
             .unwrap_or_default();
         for fl in &layout.fields {
+            // Header words are skipped against the owner that declares them,
+            // which is the nested owner once the walk has descended. They are
+            // not part of the positional census (`heaptracker.py:51`), so a
+            // list that keeps them numbers every following field two slots
+            // past where `get_fielddescr_index_in` puts it — and the index a
+            // descr is minted with is then a position in a different list
+            // than the one attached to it as the parent.
             if fl.field_type == majit_ir::value::Type::Void
-                || fl.name == "typeptr"
+                || crate::codewriter::heaptracker::is_header_word(owner, &fl.name)
                 || fl.name.starts_with("c__pad")
             {
                 continue;
@@ -3776,7 +3789,8 @@ fn bh_all_field_specs_for_struct_into(
         }
         let align = scalar_align(field_size);
         offset = (offset + align - 1) & !(align - 1);
-        let is_skipped_field = field_name == "typeptr" || field_name.starts_with("c__pad");
+        let is_skipped_field = crate::codewriter::heaptracker::is_header_word(owner, field_name)
+            || field_name.starts_with("c__pad");
         if !is_skipped_field {
             if field_flag == majit_ir::descr::ArrayFlag::Struct {
                 // `heaptracker.py:68-69` recursive flatten for nested
@@ -3865,6 +3879,43 @@ fn unique_slot_at_offset(fields: &[crate::jitcode::BhFieldSpec], offset: usize) 
     at_offset.next().is_none().then_some(idx)
 }
 
+fn transparent_scalar_field<'a>(
+    parent: &'a crate::jitcode::BhSizeSpec,
+    field_name: &str,
+    offset: usize,
+    expected_type: majit_ir::value::Type,
+) -> Option<&'a crate::jitcode::BhFieldSpec> {
+    let prefix = format!("{field_name}.");
+    let mut matches = parent.all_fielddescrs.iter().filter(|spec| {
+        spec.offset == offset
+            && spec.field_type == expected_type
+            && spec.field_key().starts_with(&prefix)
+    });
+    let field = matches.next()?;
+    matches.next().is_none().then_some(field)
+}
+
+fn canonical_field_owner(field: &crate::model::FieldDescriptor) -> Option<String> {
+    let owner = field.owner_root.as_deref()?;
+    let canonical = majit_ir::descr::canonical_struct_name(owner);
+    if !owner.contains("::") {
+        return Some(canonical);
+    }
+    let leaf = owner.rsplit("::").next().unwrap_or(owner);
+    let leaf_canonical = majit_ir::descr::canonical_struct_name(leaf);
+    let owner_id = field
+        .owner_id
+        .or_else(|| majit_ir::descr::struct_id_for_name(owner));
+    if leaf_canonical != leaf
+        && owner_id.is_some()
+        && majit_ir::descr::struct_id_for_name(&leaf_canonical) == owner_id
+    {
+        Some(leaf_canonical)
+    } else {
+        Some(canonical)
+    }
+}
+
 fn fielddescrof(
     field: &crate::model::FieldDescriptor,
     ty: &crate::model::ValueType,
@@ -3896,7 +3947,8 @@ fn fielddescrof(
         field.name.clone()
     };
 
-    if let (Some(cc), Some(owner)) = (callcontrol, field.owner_root.as_deref()) {
+    let canonical_owner = canonical_field_owner(field);
+    if let (Some(cc), Some(owner)) = (callcontrol, canonical_owner.as_deref()) {
         parent = bh_size_spec_from_callcontrol(cc, owner);
         // RPython `descr.py:108-118,218-239` keys both the SizeDescr and
         // FieldDescr caches on the low-level STRUCT object, never on the
@@ -3912,10 +3964,17 @@ fn fielddescrof(
                 .owner_id
                 .or_else(|| majit_ir::descr::struct_id_for_name(owner))
         {
-            parent_spec.type_id = owner_id.as_u64();
+            parent_spec.type_id = if parent_spec.is_gc_managed {
+                owner_id.as_u64()
+            } else {
+                // StructId identifies the nominal declaration only. Raw and
+                // GC variants of that declaration are distinct lltypes, so
+                // retain the storage discriminator installed above.
+                majit_ir::descr::path_hash_for_gc_kind(owner, false)
+            };
         }
         let field_lookup = bh_field_lookup(cc, field);
-        let found_parent_field = matches!(field_lookup, BhFieldLookup::Parent(_));
+        let mut found_parent_field = matches!(field_lookup, BhFieldLookup::Parent(_));
         match field_lookup {
             BhFieldLookup::Parent(spec) => {
                 offset = spec.offset;
@@ -3928,13 +3987,35 @@ fn fielddescrof(
                 index_in_parent = Some(spec.index_in_parent);
             }
             BhFieldLookup::Layout(layout_field) => {
-                offset = layout_field.offset;
-                field_size = layout_field.size;
-                field_type = layout_field.field_type;
-                field_flag = layout_field.flag;
-                is_field_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
-                is_immutable = layout_field.is_immutable();
-                is_quasi_immutable = layout_field.is_quasi_immutable();
+                if layout_field.flag == majit_ir::descr::ArrayFlag::Struct
+                    && field_type != majit_ir::value::Type::Ref
+                    && let Some(spec) = parent.as_ref().and_then(|parent| {
+                        transparent_scalar_field(
+                            parent,
+                            &field.name,
+                            layout_field.offset,
+                            field_type,
+                        )
+                    })
+                {
+                    offset = spec.offset;
+                    field_size = spec.field_size;
+                    field_type = spec.field_type;
+                    field_flag = spec.field_flag;
+                    is_field_signed = spec.is_field_signed;
+                    is_immutable = spec.is_immutable;
+                    is_quasi_immutable = spec.is_quasi_immutable;
+                    index_in_parent = Some(spec.index_in_parent);
+                    found_parent_field = true;
+                } else {
+                    offset = layout_field.offset;
+                    field_size = layout_field.size;
+                    field_type = layout_field.field_type;
+                    field_flag = layout_field.flag;
+                    is_field_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
+                    is_immutable = layout_field.is_immutable();
+                    is_quasi_immutable = layout_field.is_quasi_immutable();
+                }
             }
             BhFieldLookup::Missing => {
                 if let Some((
@@ -3974,9 +4055,31 @@ fn fielddescrof(
         // flattened inline aggregate shares an address with its first leaf
         // (`heaptracker.py:68-69`).  So resolve only when exactly one field sits
         // there, and otherwise leave the caller's number rather than name a
-        // sibling.  The `found_parent_field` arm is untouched for the converse
-        // reason: it picked its spec BY NAME, which is the better key.
-        if !found_parent_field
+        // sibling.
+        //
+        // The name arm runs first and covers `found_parent_field` too.  That
+        // arm carries a number STORED on the spec it matched, and the list that
+        // number counts is not always the list `parent` holds: `bh_field_lookup`
+        // probes the owner spelling the field descriptor arrived with, while
+        // `parent` is built for the canonical one, and the two flatten
+        // differently whenever only one of them reaches the field registry a
+        // by-value member's leaves are enumerated through.  Measured on this
+        // tree, 23 field descrs claimed a slot the list attached to them gives
+        // to a sibling; `builtins::WritableBuffer.owner_slot` (an `Int`) claimed
+        // slot 2, which its own parent gives to `address` (a `Ref`).  A
+        // consumer that resolves a field through `all_fielddescrs[index]` — the
+        // optimizer's `init_fields` slot space — then reads one bank's value
+        // out of the other's slot.  `descr.py:228` has no such split because
+        // one walker answers both questions upstream; taking the position from
+        // the attached list restores that.
+        if let Some(parent_spec) = parent.as_ref()
+            && let Some(pos) = parent_spec
+                .all_fielddescrs
+                .iter()
+                .position(|spec| spec.field_key() == field_key)
+        {
+            index_in_parent = Some(pos);
+        } else if !found_parent_field
             && let Some(parent_spec) = parent.as_ref()
             && let Some(pos) = unique_slot_at_offset(&parent_spec.all_fielddescrs, offset)
         {
@@ -4026,7 +4129,7 @@ fn fielddescrof(
         index_in_parent,
         parent,
         name: field_key,
-        owner: field.owner_root.clone().unwrap_or_default(),
+        owner: canonical_owner.unwrap_or_default(),
     }
 }
 
@@ -4738,6 +4841,48 @@ impl Assembler {
     /// position table.
     pub fn all_liveness(&self) -> &[u8] {
         &self.all_liveness
+    }
+
+    /// Place an embedded codewriter's liveness table before entries already
+    /// registered by the runtime JitCode builder.
+    ///
+    /// The embedded JitCodes already contain offsets relative to byte zero of
+    /// `prefix`, so that table cannot be appended. Entries registered in this
+    /// Assembler have not yet been patched into runtime-built JitCodes; moving
+    /// their cached offsets by the prefix length keeps both producers in one
+    /// `metainterp_sd.liveness_info` stream. Repeated installation of the same
+    /// prefix is idempotent.
+    pub fn prepend_embedded_liveness(&mut self, prefix: &[u8]) {
+        if prefix.is_empty() {
+            return;
+        }
+        if self.embedded_liveness_prefix_len != 0 {
+            assert_eq!(
+                self.embedded_liveness_prefix_len,
+                prefix.len(),
+                "a different embedded liveness prefix was already installed"
+            );
+            assert_eq!(
+                &self.all_liveness[..prefix.len()],
+                prefix,
+                "the installed embedded liveness prefix changed"
+            );
+            return;
+        }
+
+        let shift = prefix.len();
+        let mut combined = Vec::with_capacity(shift + self.all_liveness.len());
+        combined.extend_from_slice(prefix);
+        combined.extend_from_slice(&self.all_liveness);
+        self.all_liveness = combined;
+        self.embedded_liveness_prefix_len = shift;
+        self.all_liveness_length = self.all_liveness.len();
+        for offset in self.all_liveness_positions.values_mut() {
+            *offset += shift;
+        }
+        if let Some(offset) = self.canonical_liveness_offset.as_mut() {
+            *offset += shift;
+        }
     }
 
     /// Snapshot the descriptor table after all jitcodes have been fully
@@ -7057,5 +7202,20 @@ mod tests {
         assert_eq!(opnames[0], "int_guard_value");
         assert_eq!(opnames[1], "ref_guard_value");
         assert_eq!(opnames[2], "float_guard_value");
+    }
+
+    #[test]
+    fn embedded_liveness_prefix_shifts_runtime_registered_offsets() {
+        let mut asm = Assembler::new();
+        assert_eq!(asm._register_liveness_offset(&[2], &[], &[]), 0);
+        let original = asm.all_liveness().to_vec();
+        let prefix = [0_u8, 0, 0];
+
+        asm.prepend_embedded_liveness(&prefix);
+
+        assert_eq!(asm.all_liveness(), [prefix.as_slice(), &original].concat());
+        assert_eq!(asm._register_liveness_offset(&[2], &[], &[]), prefix.len());
+        asm.prepend_embedded_liveness(&prefix);
+        assert_eq!(asm.all_liveness(), [prefix.as_slice(), &original].concat());
     }
 }

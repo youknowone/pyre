@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=20
+# pyre-check: skip-cpython
+# cpython 4.98s vs pyre 0.29s (17.2x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # A hot loop FOLLOWED by a try/except whose handler `return`s.  The
 # `return`-from-`except` cleanup compiles to `SWAP 2; POP_EXCEPT;
 # RETURN_VALUE` (the SWAP exchanges the return value with the saved

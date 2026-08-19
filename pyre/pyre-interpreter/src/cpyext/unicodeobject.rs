@@ -388,15 +388,23 @@ pub unsafe extern "C" fn PyUnicode_IS_ASCII(object: *mut CPyObject) -> c_uint {
     }
 }
 
+/// The widest code point a representation of this width can hold, which is
+/// what a write to it is measured against.
+fn max_char_value(kind: c_int, ascii: bool) -> c_uint {
+    match (kind, ascii) {
+        (_, true) => 0x7f,
+        (1, _) => 0xff,
+        (2, _) => 0xffff,
+        _ => 0x10ffff,
+    }
+}
+
 /// `PyUnicode_MAX_CHAR_VALUE` — the widest code point the representation can
 /// hold, not the widest it does hold.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_MAX_CHAR_VALUE(object: *mut CPyObject) -> c_uint {
     match canonical(object) {
-        Some((_, _, true, _)) => 0x7f,
-        Some((1, _, _, _)) => 0xff,
-        Some((2, _, _, _)) => 0xffff,
-        Some(_) => 0x10ffff,
+        Some((kind, _, ascii, _)) => max_char_value(kind, ascii),
         None => 0,
     }
 }
@@ -405,7 +413,7 @@ pub unsafe extern "C" fn PyUnicode_MAX_CHAR_VALUE(object: *mut CPyObject) -> c_u
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_ReadChar(object: *mut CPyObject, index: isize) -> Py_UCS4 {
     let Some((kind, length, _, data)) = canonical(object) else {
-        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        unsafe { super::pyerrors::PyErr_BadArgument() };
         return Py_UCS4::MAX;
     };
     if index < 0 || index as usize >= length {
@@ -428,14 +436,22 @@ pub unsafe extern "C" fn PyUnicode_WriteChar(
     index: isize,
     value: Py_UCS4,
 ) -> c_int {
-    let Some((kind, length, _, data)) = canonical(object) else {
-        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+    let Some((kind, length, ascii, data)) = canonical(object) else {
+        unsafe { super::pyerrors::PyErr_BadArgument() };
         return -1;
     };
     if index < 0 || index as usize >= length {
         super::pyerrors::set_pending_error(crate::PyError::new(
             crate::PyErrorKind::IndexError,
             "string index out of range",
+        ));
+        return -1;
+    }
+    // The width was fixed when the string was made, so a code point wider than
+    // it holds has nowhere to go and the write is refused rather than cut down.
+    if value > max_char_value(kind, ascii) {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "character out of range".to_owned(),
         ));
         return -1;
     }
@@ -491,33 +507,37 @@ fn error_handler(errors: *const c_char) -> String {
 
 /// The body every `PyUnicode_Decode*` shares.
 ///
-/// The error handler is the interpreter's own, reached by decoding through
-/// `bytes.decode` rather than by naming the handlers this understands.
+/// The codec set and the error handlers are the interpreter's own: this is the
+/// body `bytes.decode` runs, reached without going through the method, so that
+/// nothing an extension decodes depends on an attribute lookup.
 fn decode_through(
     string: *const c_char,
     length: isize,
     encoding: &str,
     errors: *const c_char,
 ) -> *mut CPyObject {
+    if length == 0 {
+        // Nothing to read, so the caller need not have named a buffer at all.
+        return pyobject::make_ref(pyre_object::w_str_new(""));
+    }
     if string.is_null() || length < 0 {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
     let bytes = unsafe { std::slice::from_raw_parts(string as *const u8, length as usize) };
     let handler = error_handler(errors);
-    let w_bytes = pyre_object::bytesobject::w_bytes_from_bytes(bytes);
-    super::object::result(super::object::call_method(
-        w_bytes,
-        "decode",
-        &[
-            pyre_object::w_str_new(encoding),
-            pyre_object::w_str_new(&handler),
-        ],
-    ))
+    super::object::result(
+        crate::typedef::decode_bytes_to_wtf8(bytes, encoding, &handler)
+            .map(pyre_object::w_str_from_wtf8_managed),
+    )
 }
 
-/// The body every `PyUnicode_As*String` shares: `str.encode`, refusing
-/// anything that is not a `str` the way `PyErr_BadArgument` does.
+/// The body every `PyUnicode_As*String` shares, refusing anything that is not a
+/// `str` the way `PyErr_BadArgument` does.
+///
+/// This is the body `str.encode` runs, reached without going through the
+/// method: a subclass that defines `encode` gets the codec its string names
+/// here, not the one its own method would have chosen.
 fn encode_through(object: *mut CPyObject, encoding: &str, errors: *const c_char) -> *mut CPyObject {
     let Some(value) = argument(object) else {
         return std::ptr::null_mut();
@@ -527,14 +547,10 @@ fn encode_through(object: *mut CPyObject, encoding: &str, errors: *const c_char)
         return std::ptr::null_mut();
     }
     let handler = error_handler(errors);
-    super::object::result(super::object::call_method(
-        value,
-        "encode",
-        &[
-            pyre_object::w_str_new(encoding),
-            pyre_object::w_str_new(&handler),
-        ],
-    ))
+    super::object::result(
+        crate::type_methods::encode_object(value, encoding, &handler)
+            .map(|bytes| pyre_object::bytesobject::w_bytes_from_bytes(&bytes)),
+    )
 }
 
 /// The encoding an entry point was given, `utf-8` for a NULL one.
@@ -662,6 +678,10 @@ pub unsafe extern "C" fn PyUnicode_FromWideChar(
     wide: *const wchar_t,
     size: isize,
 ) -> *mut CPyObject {
+    if size == 0 {
+        // Nothing to read, so the caller need not have named a buffer at all.
+        return pyobject::make_ref(pyre_object::w_str_new(""));
+    }
     if wide.is_null() {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
@@ -929,6 +949,19 @@ pub unsafe extern "C" fn PyUnicode_EncodeLocale(
     pyobject::make_ref(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
 }
 
+/// The `count` units of `T` that `buffer` addresses, empty for a zero count so
+/// that a caller with nothing to hand over need not name a buffer at all.
+///
+/// # Safety
+/// `buffer` must address `count` readable, aligned units of `T` unless `count`
+/// is zero.
+unsafe fn units<'a, T>(buffer: *const std::ffi::c_void, count: usize) -> &'a [T] {
+    match count {
+        0 => &[],
+        count => unsafe { std::slice::from_raw_parts(buffer as *const T, count) },
+    }
+}
+
 /// `PyUnicode_FromKindAndData(kind, buffer, size)` — a string from an array of
 /// code points of one of the three widths.
 ///
@@ -950,15 +983,15 @@ pub unsafe extern "C" fn PyUnicode_FromKindAndData(
     }
     let count = size as usize;
     let points: Vec<u32> = match kind {
-        1 => unsafe { std::slice::from_raw_parts(buffer as *const u8, count) }
+        1 => unsafe { units::<u8>(buffer, count) }
             .iter()
             .map(|&unit| unit as u32)
             .collect(),
-        2 => unsafe { std::slice::from_raw_parts(buffer as *const u16, count) }
+        2 => unsafe { units::<u16>(buffer, count) }
             .iter()
             .map(|&unit| unit as u32)
             .collect(),
-        4 => unsafe { std::slice::from_raw_parts(buffer as *const u32, count) }.to_vec(),
+        4 => unsafe { units::<u32>(buffer, count) }.to_vec(),
         _ => {
             super::pyerrors::set_pending_error(crate::PyError::new(
                 crate::PyErrorKind::SystemError,

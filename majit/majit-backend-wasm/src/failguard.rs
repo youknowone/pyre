@@ -671,9 +671,19 @@ pub struct CompiledWasmLoop {
     /// onto it. A re-emission retains the old array for an already-running
     /// module before switching its baked base to a new array.
     pub _bridge_owned_cells: RefCell<Vec<Box<[u32]>>>,
-    /// Direct-loop guard index to bridge table slot. A re-emission replays
-    /// these slots into its fresh loop cell array.
+    /// Direct-loop guard index to bridge table slot. `patch_jump_for_descr`
+    /// rewrites the guard's own jump to reach a newly attached bridge; a wasm
+    /// module is immutable once compiled, so the branch instead reads a slot
+    /// out of a mutable cell array, and these are the writes a re-emission has
+    /// to replay into its fresh array.
     pub bridge_slots: RefCell<std::collections::HashMap<u32, u32>>,
+    /// The same, for a guard that lives inside a trace chained onto this loop,
+    /// keyed by `(owning trace_id, per-trace fail index)`. A standalone chained
+    /// bridge keeps its cells in its own module's array, which survives; a
+    /// region merged into this loop does not, because a re-emission reallocates
+    /// the loop array its guards are carved out of. Replayed once the rebuilt
+    /// `chained_trace_meta` names the new bases.
+    pub chained_bridge_slots: RefCell<std::collections::HashMap<(u64, u32), u32>>,
     /// Post-intern module inputs retained for a loop re-emission. Entry
     /// bridges store `None` because they tail-call another loop.
     pub reemit: RefCell<Option<crate::codegen::ModuleBuildInputs>>,

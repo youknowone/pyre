@@ -483,6 +483,8 @@ impl<'c> Lowerer<'c> {
 
         self.next_reg = self.next_reg.max(nested.next_reg);
         self.next_label = self.next_label.max(nested.next_label);
+        self.inline_liveness_prebuild
+            .extend(nested.inline_liveness_prebuild);
         Some(LoweredSequence::new(nested.statements, nested.op_metadata))
     }
 

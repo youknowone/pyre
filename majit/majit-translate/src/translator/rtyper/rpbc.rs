@@ -32,7 +32,7 @@ use crate::call::CallControl;
 use crate::flowspace::argument::CallShape;
 use crate::flowspace::pygraph::PyGraph;
 use crate::model::{
-    BlockId, CallTarget, FunctionGraph as JitFunctionGraph, OpKind, SpaceOperation,
+    BlockId, CallTarget, FunctionGraph as JitFunctionGraph, OpKind, SpaceOperation, ValueType,
 };
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
@@ -381,7 +381,7 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
     for (bid, oi) in sites.into_iter().rev() {
         let block_id = BlockId(bid);
         let op = graph.blocks[bid].operations[oi].clone();
-        let (target, args, result_ty, result) = match op.kind {
+        let (target, args, mut result_ty, result) = match op.kind {
             OpKind::Call {
                 target,
                 args,
@@ -396,9 +396,36 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
             } => (trait_root, method_name),
             _ => unreachable!("site filter mismatch"),
         };
+        // `rpbc.py:199-217 FunctionReprBase.call` assigns the call result's
+        // concretetype from the selected call-family row.  Use that family
+        // result here as well: a dependency LLBC can expose a transparent
+        // scalar wrapper only as an opaque declaration, while a local family
+        // member still supplies the complete translated signature.
+        if let Some(declared) =
+            call_control.declared_result_type_for_indirect(&trait_root, &method_name)
+        {
+            result_ty = match declared {
+                majit_ir::value::Type::Int => ValueType::Int,
+                majit_ir::value::Type::Ref => ValueType::Ref(None),
+                majit_ir::value::Type::Float => ValueType::Float,
+                majit_ir::value::Type::Void => ValueType::Void,
+            };
+            if let Some(result) = &result {
+                JitFunctionGraph::set_concretetype_of_inline(
+                    result,
+                    crate::codewriter::type_state::valuetype_to_concrete(&result_ty),
+                );
+            }
+        }
         let receiver_var = args
             .first()
-            .expect("dyn-Trait method call must have a receiver arg")
+            .unwrap_or_else(|| {
+                panic!(
+                    "dyn-Trait method call must have a receiver arg \
+                     (trait_root={trait_root:?} method={method_name:?} graph={:?})",
+                    graph.name,
+                )
+            })
             .clone();
         // RPython rclass.py:371-377 (condensed into a single op).
         let funcptr_var = rclass::class_get_method_ptr(
@@ -878,6 +905,63 @@ pub(crate) mod tests {
             .count();
         assert_eq!(vtable_ptr_count, 1);
         assert_eq!(indirect_call_count, 1);
+    }
+
+    #[test]
+    fn indirect_family_result_retypes_opaque_caller_result() {
+        use crate::call::CallControl;
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "pop",
+            Some("Storage"),
+            "<default methods of Storage>",
+            crate::model::FunctionGraph::new("Storage::pop").with_return_type("i64"),
+        );
+
+        let mut graph = crate::model::FunctionGraph::new("caller");
+        let receiver = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "storage".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::indirect("Storage", "pop"),
+                    args: vec![receiver],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        lower_indirect_calls(&mut graph, &cc);
+
+        assert_eq!(
+            JitFunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed
+        );
+        assert!(
+            graph.blocks[graph.startblock.0]
+                .operations
+                .iter()
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::IndirectCall {
+                        result_ty: ValueType::Int,
+                        ..
+                    }
+                ))
+        );
     }
 
     /// Regression: inherent (non-trait) method calls —

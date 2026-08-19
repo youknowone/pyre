@@ -103,6 +103,10 @@ pub unsafe extern "C" fn PyUnicodeWriter_WriteChar(
 /// # Safety
 /// `string` must address `size` readable bytes, or be NUL-terminated.
 unsafe fn sized_bytes<'a>(string: *const c_char, size: isize) -> Option<&'a [u8]> {
+    if size == 0 {
+        // Nothing to read, so the caller need not have named a buffer at all.
+        return Some(&[]);
+    }
     if string.is_null() {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return None;
@@ -185,6 +189,10 @@ pub unsafe extern "C" fn PyUnicodeWriter_WriteWideChar(
     let Some(handle) = (unsafe { writer(handle) }) else {
         return -1;
     };
+    if size == 0 {
+        // Nothing to read, so the caller need not have named a buffer at all.
+        return 0;
+    }
     if string.is_null() {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return -1;
@@ -286,11 +294,22 @@ pub unsafe extern "C" fn PyUnicodeWriter_WriteStr(
 }
 
 /// `PyUnicodeWriter_WriteRepr(writer, obj)` -- `repr(obj)`.
+///
+/// A NULL object is spelled `<NULL>` rather than refused: the caller reaching
+/// here is often reporting a failure, and there is nothing left to report with
+/// if describing what failed can fail in turn.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicodeWriter_WriteRepr(
     handle: *mut CPyUnicodeWriter,
     object: *mut CPyObject,
 ) -> c_int {
+    if object.is_null() {
+        let Some(handle) = (unsafe { writer(handle) }) else {
+            return -1;
+        };
+        handle.text.push_str("<NULL>");
+        return 0;
+    }
     write_converted(handle, object, crate::display::py_repr_wtf8)
 }
 

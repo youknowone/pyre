@@ -1276,6 +1276,7 @@ fn inlined_bridge_without_owner_loop_label_declines() {
             inputargs: vec![InputArg::from_type(Type::Int, 1)],
             ops: vec![Op::new(OpCode::Finish, &[])],
             gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
         }],
         constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
@@ -1302,6 +1303,127 @@ fn inlined_bridge_without_owner_loop_label_declines() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("no local loop LABEL"));
+}
+
+/// A region's value ids are its own trace's, so they collide with the owner's.
+/// The merged stream has one local namespace, so an unrebased collision makes
+/// the region's entry moves land in locals the owner still holds live across
+/// the back edge. Where a region's numbering happens to start must therefore
+/// not be observable in the emitted code.
+#[test]
+fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
+    fn owner_ops() -> Vec<Op> {
+        vec![
+            // Defined before the LABEL and read after it, so it is live across
+            // the back edge and is restored only on preamble/resume entry.
+            make_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::int_op(2),
+            ),
+            Op::new(
+                OpCode::Label,
+                &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+            ),
+            make_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                OpRef::int_op(3),
+            ),
+            make_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(3), OpRef::const_int(10)],
+                OpRef::int_op(4),
+            ),
+            make_guard(
+                OpCode::GuardTrue,
+                &[OpRef::int_op(4)],
+                &[OpRef::int_op(3), OpRef::input_arg_int(1)],
+            ),
+            make_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(1), OpRef::int_op(2)],
+                OpRef::int_op(5),
+            ),
+            make_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(5), OpRef::const_int(1000)],
+                OpRef::int_op(6),
+            ),
+            make_guard(
+                OpCode::GuardTrue,
+                &[OpRef::int_op(6)],
+                &[OpRef::int_op(3), OpRef::int_op(5)],
+            ),
+            Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(5))]),
+        ]
+    }
+
+    // `base` picks where the region numbers its own values. `base = 2` makes
+    // its first input arg share an id with the owner's loop-invariant
+    // `int_op(2)`; `base = 40` clears every owner id.
+    fn build(base: u32) -> Vec<u8> {
+        let inputargs = vec![
+            InputArg::from_type(Type::Int, 0),
+            InputArg::from_type(Type::Int, 1),
+        ];
+        let region_ops = vec![
+            make_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(base), OpRef::input_arg_int(base + 1)],
+                OpRef::int_op(base + 2),
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[
+                    rb(OpRef::int_op(base + 2)),
+                    rb(OpRef::input_arg_int(base + 1)),
+                ],
+            ),
+        ];
+        let inputs = codegen::ModuleBuildInputs {
+            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            ops: owner_ops(),
+            inlined_bridges: vec![codegen::InlinedBridge {
+                source_fail_index: 1,
+                trace_id: 7,
+                inputargs: vec![
+                    InputArg::from_type(Type::Int, base),
+                    InputArg::from_type(Type::Int, base + 1),
+                ],
+                ops: region_ops,
+                gc_table_base: 0,
+                constants: indexmap::IndexMap::new(),
+            }],
+            constants: indexmap::IndexMap::new(),
+            vtable_offset: Some(0),
+            classptr_to_typeid: HashMap::new(),
+            guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+            alloc: codegen::AllocHelpers::default(),
+            wb_fn_ptr: 0,
+            nursery: None,
+            invalidated_flag_addr: 0,
+            gc_table_base: 0,
+            fail_index_base: 0,
+            bridge_cells_base: 0,
+            bridge_entry_arity: None,
+            bridge_param_dispatch: false,
+            trace_entry_census: None,
+            external_jump_slot: 0,
+            external_jump_key: 0,
+            frame: codegen::FrameGeometry::fixed(),
+            ca: codegen::CaParams::default(),
+        };
+        codegen::build_wasm_module(&inputs)
+            .expect("a loop-closing region merges into its owner")
+            .0
+    }
+
+    let colliding = build(2);
+    let disjoint = build(40);
+    validate_wasm(&colliding);
+    validate_wasm(&disjoint);
+    assert_eq!(colliding, disjoint);
 }
 
 #[test]

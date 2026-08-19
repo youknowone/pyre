@@ -1987,6 +1987,24 @@ impl WasmBackend {
             for region in &inputs.inlined_bridges {
                 let count = codegen::guard_exit_count(&region.inputargs, &region.ops);
                 let exits = &guard_exits[offset..offset + count];
+                // This region's guards are carved out of the array that was
+                // just reallocated, so every bridge already chained onto one of
+                // them has lost its dispatch entry. Unreplayed, that guard
+                // deopts to the tracer on every failure and retraces a bridge
+                // it can never reach.
+                #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                if new_cells_base != 0 {
+                    for (&(trace_id, fail_index), &bridge_slot) in
+                        compiled.chained_bridge_slots.borrow().iter()
+                    {
+                        if trace_id != region.trace_id || fail_index as usize >= count {
+                            continue;
+                        }
+                        let cell = (new_cells_base as usize + (offset + fail_index as usize) * 4)
+                            as *mut u32;
+                        unsafe { core::ptr::write(cell, bridge_slot) };
+                    }
+                }
                 metas.insert(
                     region.trace_id,
                     ChainedTraceMeta {
@@ -2889,6 +2907,7 @@ impl majit_backend::Backend for WasmBackend {
             chained_trace_meta: std::cell::RefCell::new(std::collections::HashMap::new()),
             _bridge_owned_cells: std::cell::RefCell::new(bridge_cells_owner.into_iter().collect()),
             bridge_slots: std::cell::RefCell::new(HashMap::new()),
+            chained_bridge_slots: std::cell::RefCell::new(HashMap::new()),
             // Retaining the snapshot costs long-lived heap for the token's
             // whole lifetime, which moves when the collector next runs and so
             // moves which iteration a back edge's eval-breaker guard bails on.
@@ -3320,6 +3339,7 @@ impl majit_backend::Backend for WasmBackend {
                         inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                         ops: ops_owned.clone(),
                         gc_table_base,
+                        constants: self.constants.clone(),
                     });
                     let mut merged_ops = candidate.ops.clone();
                     for region in &candidate.inlined_bridges {
@@ -3646,16 +3666,23 @@ impl majit_backend::Backend for WasmBackend {
             }
             // Retained module replacement and loop-closing bridge inlining
             // restore this cell after allocating a fresh dispatch array.
-            if is_direct && (reemit_enabled() || inline_bridge_enabled()) {
+            if reemit_enabled() || inline_bridge_enabled() {
                 if let Some(source_loop) = original_token
                     .compiled
                     .get()
                     .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
                 {
-                    source_loop
-                        .bridge_slots
-                        .borrow_mut()
-                        .insert(source_fail_index, bridge_slot);
+                    if is_direct {
+                        source_loop
+                            .bridge_slots
+                            .borrow_mut()
+                            .insert(source_fail_index, bridge_slot);
+                    } else {
+                        source_loop
+                            .chained_bridge_slots
+                            .borrow_mut()
+                            .insert((source_trace_id, source_fail_index), bridge_slot);
+                    }
                 }
             }
         }

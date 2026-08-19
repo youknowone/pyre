@@ -49,6 +49,7 @@ use crate::flowspace::model::{
     SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
+use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, _ptr_obj, Array, ForwardReference, LowLevelType, LowLevelValue, MallocFlavor, Ptr,
@@ -9248,6 +9249,493 @@ pub(crate) fn build_ll_strconcat_helper_graph(
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["s1".to_string(), "s2".to_string()],
+        func,
+    ))
+}
+
+/// `LLHelpers._ll_stringslice` plus the three wrappers selected by
+/// `AbstractStringRepr.rtype_getslice` (`rstr.py:432-437`,
+/// `lltypesystem/rstr.py:844-876`).  The start/stop wrapper preserves the
+/// identity-bearing `jit.we_are_jitted()` branch: the JIT arm clamps
+/// `stop > len`, while the no-JIT arm returns `s1` for `[0:>=len]`.
+pub(crate) fn build_ll_stringslice_helper_graph(
+    rtyper: &crate::translator::rtyper::rtyper::RPythonTyper,
+    name: &str,
+    ptr_lltype: LowLevelType,
+    kind: crate::translator::rtyper::rtyper::SliceKind,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rtyper::SliceKind;
+
+    let core_name = if ptr_lltype == STRPTR.clone() {
+        "_ll_stringslice"
+    } else {
+        "_ll_unicode_slice"
+    };
+    let core_name_owned = core_name.to_string();
+    let ptr_for_core = ptr_lltype.clone();
+    let core = rtyper.lowlevel_helper_function_with_builder(
+        core_name.to_string(),
+        vec![
+            ptr_lltype.clone(),
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        ptr_lltype.clone(),
+        move |_rtyper, _args, _result| {
+            build_ll_stringslice_core_helper_graph(&core_name_owned, ptr_for_core)
+        },
+    )?;
+    let core_ptr = sub_helper_funcptr_constant(rtyper, &core)?;
+
+    let s = variable_with_lltype("s1", ptr_lltype.clone());
+    let start = variable_with_lltype("start", LowLevelType::Signed);
+    let stop = variable_with_lltype("stop", LowLevelType::Signed);
+    let inputargs = match kind {
+        SliceKind::MinusOne => vec![Hlvalue::Variable(s.clone())],
+        SliceKind::StartOnly => vec![
+            Hlvalue::Variable(s.clone()),
+            Hlvalue::Variable(start.clone()),
+        ],
+        SliceKind::StartStop => vec![
+            Hlvalue::Variable(s.clone()),
+            Hlvalue::Variable(start.clone()),
+            Hlvalue::Variable(stop.clone()),
+        ],
+    };
+    let startblock = Block::shared(inputargs);
+    let result = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(result),
+    );
+    let chars_ty = chars_array_ptr_lltype_from_strptr(&ptr_lltype)?;
+    let chars = variable_with_lltype("chars", chars_ty);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![
+            Hlvalue::Variable(s.clone()),
+            constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void),
+        ],
+        Hlvalue::Variable(chars.clone()),
+    ));
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(chars)],
+        Hlvalue::Variable(length.clone()),
+    ));
+
+    let signed = |n| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    match kind {
+        SliceKind::MinusOne => {
+            let end = variable_with_lltype("end", LowLevelType::Signed);
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "int_sub",
+                vec![Hlvalue::Variable(length), signed(1)],
+                Hlvalue::Variable(end.clone()),
+            ));
+            emit_stringslice_direct_call(
+                &startblock,
+                core_ptr,
+                s,
+                signed(0),
+                Hlvalue::Variable(end),
+                &graph.returnblock,
+                ptr_lltype,
+            );
+        }
+        SliceKind::StartOnly => emit_stringslice_direct_call(
+            &startblock,
+            core_ptr,
+            s,
+            Hlvalue::Variable(start),
+            Hlvalue::Variable(length),
+            &graph.returnblock,
+            ptr_lltype,
+        ),
+        SliceKind::StartStop => {
+            // lltypesystem/rstr.py:862-871 preserves both arms of
+            // `jit.we_are_jitted()`: the JIT arm clamps only `stop > len`,
+            // while the no-JIT arm returns `s1` unchanged for `[0:>=len]`.
+            let call_s = variable_with_lltype("s1", ptr_lltype.clone());
+            let call_start = variable_with_lltype("start", LowLevelType::Signed);
+            let call_stop = variable_with_lltype("stop", LowLevelType::Signed);
+            let call_block = Block::shared(vec![
+                Hlvalue::Variable(call_s.clone()),
+                Hlvalue::Variable(call_start.clone()),
+                Hlvalue::Variable(call_stop.clone()),
+            ]);
+
+            let jit_s = variable_with_lltype("s1", ptr_lltype.clone());
+            let jit_start = variable_with_lltype("start", LowLevelType::Signed);
+            let jit_stop = variable_with_lltype("stop", LowLevelType::Signed);
+            let jit_len = variable_with_lltype("length", LowLevelType::Signed);
+            let jit_block = Block::shared(vec![
+                Hlvalue::Variable(jit_s.clone()),
+                Hlvalue::Variable(jit_start.clone()),
+                Hlvalue::Variable(jit_stop.clone()),
+                Hlvalue::Variable(jit_len.clone()),
+            ]);
+            let jit_too_far = variable_with_lltype("stop_too_far", LowLevelType::Bool);
+            jit_block.borrow_mut().operations.push(SpaceOperation::new(
+                "int_gt",
+                vec![
+                    Hlvalue::Variable(jit_stop.clone()),
+                    Hlvalue::Variable(jit_len.clone()),
+                ],
+                Hlvalue::Variable(jit_too_far.clone()),
+            ));
+            jit_block.borrow_mut().exitswitch = Some(Hlvalue::Variable(jit_too_far));
+            jit_block.closeblock(vec![
+                Link::new(
+                    vec![
+                        Hlvalue::Variable(jit_s.clone()),
+                        Hlvalue::Variable(jit_start.clone()),
+                        Hlvalue::Variable(jit_len),
+                    ],
+                    Some(call_block.clone()),
+                    Some(constant_with_lltype(
+                        ConstValue::Bool(true),
+                        LowLevelType::Bool,
+                    )),
+                )
+                .into_ref(),
+                Link::new(
+                    vec![
+                        Hlvalue::Variable(jit_s),
+                        Hlvalue::Variable(jit_start),
+                        Hlvalue::Variable(jit_stop),
+                    ],
+                    Some(call_block.clone()),
+                    Some(constant_with_lltype(
+                        ConstValue::Bool(false),
+                        LowLevelType::Bool,
+                    )),
+                )
+                .into_ref(),
+            ]);
+
+            let nojit_s = variable_with_lltype("s1", ptr_lltype.clone());
+            let nojit_start = variable_with_lltype("start", LowLevelType::Signed);
+            let nojit_stop = variable_with_lltype("stop", LowLevelType::Signed);
+            let nojit_len = variable_with_lltype("length", LowLevelType::Signed);
+            let nojit_block = Block::shared(vec![
+                Hlvalue::Variable(nojit_s.clone()),
+                Hlvalue::Variable(nojit_start.clone()),
+                Hlvalue::Variable(nojit_stop.clone()),
+                Hlvalue::Variable(nojit_len.clone()),
+            ]);
+            let reaches_end = variable_with_lltype("stop_reaches_end", LowLevelType::Bool);
+            nojit_block
+                .borrow_mut()
+                .operations
+                .push(SpaceOperation::new(
+                    "int_ge",
+                    vec![
+                        Hlvalue::Variable(nojit_stop.clone()),
+                        Hlvalue::Variable(nojit_len.clone()),
+                    ],
+                    Hlvalue::Variable(reaches_end.clone()),
+                ));
+            let full_s = variable_with_lltype("s1", ptr_lltype.clone());
+            let full_start = variable_with_lltype("start", LowLevelType::Signed);
+            let full_len = variable_with_lltype("length", LowLevelType::Signed);
+            let full_block = Block::shared(vec![
+                Hlvalue::Variable(full_s.clone()),
+                Hlvalue::Variable(full_start.clone()),
+                Hlvalue::Variable(full_len.clone()),
+            ]);
+            nojit_block.borrow_mut().exitswitch = Some(Hlvalue::Variable(reaches_end));
+            nojit_block.closeblock(vec![
+                Link::new(
+                    vec![
+                        Hlvalue::Variable(nojit_s.clone()),
+                        Hlvalue::Variable(nojit_start.clone()),
+                        Hlvalue::Variable(nojit_len),
+                    ],
+                    Some(full_block.clone()),
+                    Some(constant_with_lltype(
+                        ConstValue::Bool(true),
+                        LowLevelType::Bool,
+                    )),
+                )
+                .into_ref(),
+                Link::new(
+                    vec![
+                        Hlvalue::Variable(nojit_s),
+                        Hlvalue::Variable(nojit_start),
+                        Hlvalue::Variable(nojit_stop),
+                    ],
+                    Some(call_block.clone()),
+                    Some(constant_with_lltype(
+                        ConstValue::Bool(false),
+                        LowLevelType::Bool,
+                    )),
+                )
+                .into_ref(),
+            ]);
+            let starts_at_zero = variable_with_lltype("starts_at_zero", LowLevelType::Bool);
+            full_block.borrow_mut().operations.push(SpaceOperation::new(
+                "int_eq",
+                vec![Hlvalue::Variable(full_start.clone()), signed(0)],
+                Hlvalue::Variable(starts_at_zero.clone()),
+            ));
+            full_block.borrow_mut().exitswitch = Some(Hlvalue::Variable(starts_at_zero));
+            full_block.closeblock(vec![
+                Link::new(
+                    vec![Hlvalue::Variable(full_s.clone())],
+                    Some(graph.returnblock.clone()),
+                    Some(constant_with_lltype(
+                        ConstValue::Bool(true),
+                        LowLevelType::Bool,
+                    )),
+                )
+                .into_ref(),
+                Link::new(
+                    vec![
+                        Hlvalue::Variable(full_s),
+                        Hlvalue::Variable(full_start),
+                        Hlvalue::Variable(full_len),
+                    ],
+                    Some(call_block.clone()),
+                    Some(constant_with_lltype(
+                        ConstValue::Bool(false),
+                        LowLevelType::Bool,
+                    )),
+                )
+                .into_ref(),
+            ]);
+
+            startblock.borrow_mut().exitswitch =
+                Some(Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+                    LowLevelType::Bool,
+                )));
+            startblock.closeblock(vec![
+                Link::new(
+                    vec![
+                        Hlvalue::Variable(s.clone()),
+                        Hlvalue::Variable(start.clone()),
+                        Hlvalue::Variable(stop.clone()),
+                        Hlvalue::Variable(length.clone()),
+                    ],
+                    Some(jit_block),
+                    Some(constant_with_lltype(
+                        ConstValue::Bool(true),
+                        LowLevelType::Bool,
+                    )),
+                )
+                .into_ref(),
+                Link::new(
+                    vec![
+                        Hlvalue::Variable(s),
+                        Hlvalue::Variable(start),
+                        Hlvalue::Variable(stop),
+                        Hlvalue::Variable(length),
+                    ],
+                    Some(nojit_block),
+                    Some(constant_with_lltype(
+                        ConstValue::Bool(false),
+                        LowLevelType::Bool,
+                    )),
+                )
+                .into_ref(),
+            ]);
+            emit_stringslice_direct_call(
+                &call_block,
+                core_ptr,
+                call_s,
+                Hlvalue::Variable(call_start),
+                Hlvalue::Variable(call_stop),
+                &graph.returnblock,
+                ptr_lltype,
+            );
+        }
+    }
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    let args = match kind {
+        SliceKind::MinusOne => vec!["s1"],
+        SliceKind::StartOnly => vec!["s1", "start"],
+        SliceKind::StartStop => vec!["s1", "start", "stop"],
+    };
+    Ok(helper_pygraph_from_graph(
+        graph,
+        args.into_iter().map(str::to_string).collect(),
+        func,
+    ))
+}
+
+fn emit_stringslice_direct_call(
+    block: &crate::flowspace::model::BlockRef,
+    funcptr: Constant,
+    s: Variable,
+    start: Hlvalue,
+    stop: Hlvalue,
+    returnblock: &crate::flowspace::model::BlockRef,
+    ptr_lltype: LowLevelType,
+) {
+    let result = variable_with_lltype("result", ptr_lltype);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(funcptr),
+            Hlvalue::Variable(s),
+            start,
+            stop,
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    block.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result)],
+            Some(returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+}
+
+fn build_ll_stringslice_core_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let chars_ty = chars_array_ptr_lltype_from_strptr(&ptr_lltype)?;
+    let LowLevelType::Ptr(chars_ptr) = &chars_ty else {
+        return Err(TyperError::message(
+            "stringslice chars must be an array pointer",
+        ));
+    };
+    let PtrTarget::Array(array) = &chars_ptr.TO else {
+        return Err(TyperError::message(
+            "stringslice chars target must be an array",
+        ));
+    };
+    let copy_op = if array.OF == LowLevelType::Char {
+        "copystrcontent"
+    } else {
+        "copyunicodecontent"
+    };
+    let struct_ty = struct_lltype_from_strptr(&ptr_lltype)?;
+    let s = variable_with_lltype("s1", ptr_lltype.clone());
+    let start = variable_with_lltype("start", LowLevelType::Signed);
+    let stop = variable_with_lltype("stop", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(s.clone()),
+        Hlvalue::Variable(start.clone()),
+        Hlvalue::Variable(stop.clone()),
+    ]);
+    let result = variable_with_lltype("result", ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(result),
+    );
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_sub",
+        vec![Hlvalue::Variable(stop), Hlvalue::Variable(start.clone())],
+        Hlvalue::Variable(length.clone()),
+    ));
+    let negative = variable_with_lltype("negative", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![
+            Hlvalue::Variable(length.clone()),
+            constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(negative.clone()),
+    ));
+    let alloc_s = variable_with_lltype("s1", ptr_lltype.clone());
+    let alloc_start = variable_with_lltype("start", LowLevelType::Signed);
+    let alloc_len = variable_with_lltype("length", LowLevelType::Signed);
+    let alloc_block = Block::shared(vec![
+        Hlvalue::Variable(alloc_s.clone()),
+        Hlvalue::Variable(alloc_start.clone()),
+        Hlvalue::Variable(alloc_len.clone()),
+    ]);
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(negative));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(s.clone()),
+                Hlvalue::Variable(start.clone()),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            ],
+            Some(alloc_block.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(s),
+                Hlvalue::Variable(start),
+                Hlvalue::Variable(length),
+            ],
+            Some(alloc_block.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref(),
+    ]);
+    let newstr = variable_with_lltype("newstr", ptr_lltype.clone());
+    alloc_block
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(struct_ty),
+                gc_flavor_const()?,
+                Hlvalue::Variable(alloc_len.clone()),
+            ],
+            Hlvalue::Variable(newstr.clone()),
+        ));
+    alloc_block
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            copy_op,
+            vec![
+                Hlvalue::Variable(alloc_s),
+                Hlvalue::Variable(newstr.clone()),
+                Hlvalue::Variable(alloc_start),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                Hlvalue::Variable(alloc_len),
+            ],
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::None,
+                LowLevelType::Void,
+            )),
+        ));
+    alloc_block.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(newstr)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["s1".to_string(), "start".to_string(), "stop".to_string()],
         func,
     ))
 }

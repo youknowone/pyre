@@ -757,8 +757,23 @@ fn build_jitcode_registry(
                 if registry.iter().any(|j| std::sync::Arc::ptr_eq(j, sub)) {
                     continue;
                 }
-                // Reached here only if the seed does not already hold it, so
-                // it is a jitcode built at run time and has no index yet.
+                // A jitcode the seed does not hold has to be one built at run
+                // time, which carries no index yet. One that already names an
+                // index came from a build-time table this registry never saw,
+                // so the seed is incomplete — and renumbering it is not a
+                // recoverable error: it either aborts in `set_index`, or, when
+                // the walk order happens to reproduce the build-time position,
+                // silently yields a registry whose slots are not the objects a
+                // callee's nested frame indices resolve against. Fail at the
+                // point that names the cause instead.
+                assert!(
+                    sub.try_index().is_none(),
+                    "jitcode {:?} already names index {:?} but the registry seed does not hold it; \
+                     a `RuntimeDescrTable` that hands out `JitCode` entries must implement \
+                     `jitcodes()` so the seed covers them",
+                    sub.name(),
+                    sub.try_index(),
+                );
                 let idx = registry.len();
                 sub.set_index(idx);
                 registry.push(sub.clone());
@@ -10106,5 +10121,32 @@ mod jitcode_registry_tests {
         assert_eq!(helper.index(), 4);
         assert_eq!(registry.len(), 5);
         assert_self_indexed(&registry);
+    }
+
+    /// A table that hands out `JitCode` entries while leaving
+    /// `RuntimeDescrTable::jitcodes()` at its default seeds nothing, so the
+    /// walk meets a callee the build already numbered.
+    ///
+    /// This is the case `set_index` structurally cannot catch: the walk hands
+    /// the callee the very index it already holds, and a same-value
+    /// `set_index` is a documented no-op. It would therefore have produced a
+    /// registry whose slot 1 holds this shell rather than the build-time
+    /// object a callee's nested frame indices resolve against — silently. The
+    /// panic has to come from here, and has to name the missing method.
+    #[test]
+    #[should_panic(expected = "must implement `jitcodes()`")]
+    fn an_incomplete_seed_names_the_method_that_would_have_supplied_it() {
+        let callee = jitcode("build_time_callee", Some(1));
+        build_jitcode_registry(&[], dispatch_calling(&[callee]));
+    }
+
+    /// The same defect where the walk order does *not* reproduce the
+    /// build-time index. `set_index` would abort here too, but on an internal
+    /// set-once invariant that names neither the seed nor the table.
+    #[test]
+    #[should_panic(expected = "already names index Some(7)")]
+    fn an_incomplete_seed_is_reported_before_the_set_once_invariant_trips() {
+        let callee = jitcode("build_time_callee", Some(7));
+        build_jitcode_registry(&[], dispatch_calling(&[callee]));
     }
 }

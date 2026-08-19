@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=20
+# pyre-check: skip-cpython
+# cpython 2.63s vs pyre 0.72s (3.7x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # Depth-1 kept-stack short-circuit with a BARE loop-varying local on the left
 # and a loop-invariant constant on the right.
 #

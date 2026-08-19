@@ -26,6 +26,11 @@ struct MetaCallDescr {
     heapcache_index: u32,
     arg_types: Vec<Type>,
     result_type: Type,
+    /// `descr.py:524-526 get_result_type()` returns the RAW char.  Carrying it
+    /// keeps `'S'` (singlefloat) and `'L'` distinguishable from the
+    /// `'i'`/`'f'` they normalise to, which the resume path depends on when it
+    /// rebuilds a `BhCallDescr` off this descr for `bh_call_i`.
+    result_class: char,
     result_signed: bool,
     result_size: usize,
     effect_info: Arc<EffectInfoCell>,
@@ -87,6 +92,11 @@ impl CallDescr for MetaCallDescr {
     }
     fn result_type(&self) -> Type {
         self.result_type
+    }
+    /// `descr.py:524-526 get_result_type()` — the raw char, not the class the
+    /// normalised `result_type` would derive.
+    fn result_class(&self) -> char {
+        self.result_class
     }
     fn result_size(&self) -> usize {
         self.result_size
@@ -695,6 +705,7 @@ pub fn make_call_descr_sized_with_effect(
 pub fn make_call_descr_sized_with_translated_effect(
     arg_types: &[Type],
     result_type: Type,
+    result_class: char,
     result_signed: bool,
     result_size: usize,
     translated_effect_info_id: u32,
@@ -708,6 +719,7 @@ pub fn make_call_descr_sized_with_translated_effect(
     make_call_descr_sized_with_cell(
         arg_types,
         result_type,
+        result_class,
         result_signed,
         result_size,
         effect_info,
@@ -752,6 +764,7 @@ fn make_call_descr_sized(
     make_call_descr_sized_with_cell(
         arg_types,
         result_type,
+        majit_ir::descr::result_class_of(result_type),
         result_signed,
         result_size,
         effect_info,
@@ -761,6 +774,7 @@ fn make_call_descr_sized(
 fn make_call_descr_sized_with_cell(
     arg_types: &[Type],
     result_type: Type,
+    result_class: char,
     result_signed: bool,
     result_size: usize,
     effect_info: Arc<majit_ir::effectinfo::EffectInfoCell>,
@@ -768,6 +782,7 @@ fn make_call_descr_sized_with_cell(
     let key = majit_ir::descr::LLType::func_key(
         arg_types,
         result_type,
+        result_class,
         result_signed,
         result_size,
         &effect_info,
@@ -778,6 +793,7 @@ fn make_call_descr_sized_with_cell(
             heapcache_index: majit_ir::descr::next_call_descr_heapcache_index(),
             arg_types: arg_types.to_vec(),
             result_type,
+            result_class,
             result_signed,
             result_size,
             effect_info,
@@ -1167,5 +1183,67 @@ mod set_effect_bitstrings_tests {
         assert!(unanalyzed._write_descrs_fields.is_none());
         assert_eq!(unanalyzed, default_effect_info());
         assert_ne!(can_raise, unanalyzed);
+    }
+}
+
+#[cfg(test)]
+mod translated_result_class_tests {
+    use super::*;
+    use majit_ir::EffectInfo;
+
+    /// `descr.py:524-526 get_result_type()` returns the raw result char, and
+    /// `descr.py:665` keys the call-descr cache on it.  A descr rehydrated
+    /// from the translated image goes through
+    /// `make_call_descr_sized_with_translated_effect`, which normalises `'S'`
+    /// to `Type::Int` for the IR; the raw char has to survive alongside it,
+    /// because the resume path rebuilds a `BhCallDescr` off this descr
+    /// (`pyre-jit-trace`'s `state.rs`) and hands it to `bh_call_i`.
+    #[test]
+    fn a_translated_descr_keeps_its_raw_result_class() {
+        // Two ids so this test cannot be perturbed by a sibling publishing
+        // over the same dense slot.
+        let cell_id = 4242u32;
+        majit_ir::effectinfo::intern_translated_effect_info(cell_id, EffectInfo::default());
+
+        let singlefloat = make_call_descr_sized_with_translated_effect(
+            &[Type::Int],
+            Type::Int,
+            'S',
+            false,
+            4,
+            cell_id,
+        );
+        assert_eq!(singlefloat.as_call_descr().unwrap().result_class(), 'S');
+        // The normalised view is unchanged — `'S'` is an int-shaped result.
+        assert_eq!(
+            singlefloat.as_call_descr().unwrap().result_type(),
+            Type::Int
+        );
+
+        // Everything the pre-fix key compared is identical here — arg types,
+        // normalised result type, signedness, size, and the EffectInfo cell —
+        // so if the raw char were absent from the key this second mint would
+        // return the descr above and report `'S'`.
+        let plain_int = make_call_descr_sized_with_translated_effect(
+            &[Type::Int],
+            Type::Int,
+            'i',
+            false,
+            4,
+            cell_id,
+        );
+        assert_eq!(plain_int.as_call_descr().unwrap().result_class(), 'i');
+        assert!(!std::sync::Arc::ptr_eq(&singlefloat, &plain_int));
+
+        // Interning still holds for a repeat of the same raw char.
+        let again = make_call_descr_sized_with_translated_effect(
+            &[Type::Int],
+            Type::Int,
+            'S',
+            false,
+            4,
+            cell_id,
+        );
+        assert!(std::sync::Arc::ptr_eq(&singlefloat, &again));
     }
 }

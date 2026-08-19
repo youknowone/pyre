@@ -3367,6 +3367,61 @@ impl JitCodeBuilder {
         self.inline_call_typed(sub_jitcode_idx, &typed_args, return_i, return_r, return_f);
     }
 
+    /// Reject an inline call whose argument kinds disagree with the callee's
+    /// own declared signature.
+    ///
+    /// `BC_INLINE_CALL` moves each argument into the callee frame's register
+    /// file *for that argument's kind*: an `Int` argument lands among the
+    /// callee's integer registers, a `Ref` argument among its reference
+    /// registers.  Nothing downstream re-checks that the register the callee
+    /// goes on to read is one this call actually wrote, so a caller passing an
+    /// integer where the callee declares a reference leaves the callee reading
+    /// whatever its reference register happened to hold.  That is not a crash
+    /// but a wrong value, and it appears only once the frame is compiled —
+    /// the interpreter runs the host function directly and never decodes this
+    /// bytecode, so the two disagree with no diagnostic in between.
+    ///
+    /// The kinds are compared as per-kind counts rather than position by
+    /// position.  `arg_classes` is in source parameter order while a caller
+    /// groups its arguments by kind, so a `(i, r, i)` signature legitimately
+    /// arrives as `i, i, r`; each argument already names the callee register
+    /// that places it, so the order within a kind is not this check's business.
+    ///
+    /// Only a callee that declares a signature is checked.  A jitcode this
+    /// assembler builds carries `BhCallDescr::default()` — an empty
+    /// `arg_classes` — because no caller stages one through `set_calldescr`,
+    /// so an empty declaration reads as "not stated" rather than "takes
+    /// nothing", and a genuinely nullary callee is indistinguishable from it.
+    fn check_inline_call_arg_classes(&self, sub_jitcode_idx: u16, args: &[(JitArgKind, u16, u16)]) {
+        let Some(callee) = self
+            .descrs
+            .get(sub_jitcode_idx as usize)
+            .and_then(RuntimeBhDescr::as_jitcode)
+        else {
+            return;
+        };
+        let Some(body) = callee.try_body() else {
+            return;
+        };
+        let declared = &body.calldescr.arg_classes;
+        if declared.is_empty() {
+            return;
+        }
+        let declares = |want: char| declared.chars().filter(|&class| class == want).count();
+        let passes = |want: JitArgKind| args.iter().filter(|&&(kind, ..)| kind == want).count();
+        assert!(
+            declares('i') == passes(JitArgKind::Int)
+                && declares('r') == passes(JitArgKind::Ref)
+                && declares('f') == passes(JitArgKind::Float),
+            "inline call into jitcode {:?} passes {} int / {} ref / {} float argument(s), \
+             but that jitcode's signature declares {declared:?}",
+            callee.name,
+            passes(JitArgKind::Int),
+            passes(JitArgKind::Ref),
+            passes(JitArgKind::Float),
+        );
+    }
+
     fn inline_call_typed(
         &mut self,
         sub_jitcode_idx: u16,
@@ -3375,6 +3430,7 @@ impl JitCodeBuilder {
         return_r: Option<u16>,
         return_f: Option<u16>,
     ) {
+        self.check_inline_call_arg_classes(sub_jitcode_idx, args);
         for &(kind, caller_src, _) in args {
             match kind {
                 JitArgKind::Int => self.touch_reg(caller_src),
@@ -5324,7 +5380,7 @@ impl JitCodeBuilder {
         self.patch_switch_descrs();
         self.patch_const_refs();
         self.patch_field_descr_parents();
-        if cfg!(debug_assertions)
+        if crate::jit_strict_mode()
             && let Some(disagreement) = self.field_descr_position_disagreement()
         {
             panic!("{disagreement}");
@@ -5986,10 +6042,12 @@ impl JitCodeBuilder {
     /// correctly and merely shares an address with a sibling.
     ///
     /// Returns the first disagreement as a message, so the caller's panic says
-    /// which descr and both numbers. Gated on `cfg!(debug_assertions)` at the
-    /// call site rather than wrapped in `debug_assert!`, because the message
-    /// needs the same walk the predicate does and `debug_assert!` would run it
-    /// twice.
+    /// which descr and both numbers. Gated at the call site on
+    /// [`jit_strict_mode`](crate::jit_strict_mode) rather than wrapped in a
+    /// `debug_assert!`: the message needs the same walk the predicate does and
+    /// `debug_assert!` would run it twice, and `cfg!(debug_assertions)` alone
+    /// would leave the check inert for the release corpus, which is where the
+    /// producers this covers are exercised most widely.
     ///
     /// [`patch_field_descr_parents`]: Self::patch_field_descr_parents
     fn field_descr_position_disagreement(&self) -> Option<String> {
@@ -6434,7 +6492,7 @@ mod tests {
                 &[(8, false, "agg", 8, true), (8, true, "leaf", 8, false)],
             );
             builder.getfield_gc_i(0, 1, 8, TID, name);
-            // `finish` runs the postcondition under `cfg!(debug_assertions)`; a
+            // `finish` runs the postcondition under `jit_strict_mode`; a
             // resolution that guessed would trip it before this returns.
             let jitcode = builder.finish();
             let (index_in_parent, name, parent) = jitcode
@@ -6677,6 +6735,53 @@ mod tests {
         let cd = bh_descr.as_calldescr();
         assert_eq!(cd.arg_classes, "i");
         assert_eq!(cd.result_type, 'v');
+    }
+
+    /// A callee that declares its argument kinds, the way one assembled from a
+    /// source function does.
+    fn callee_declaring(arg_classes: &str) -> JitCode {
+        let mut builder = JitCodeBuilder::new();
+        builder.set_calldescr(
+            majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
+                arg_classes.to_string(),
+                majit_ir::value::Type::Void,
+                majit_ir::descr::EffectInfo::MOST_GENERAL,
+            ),
+        );
+        builder.finish()
+    }
+
+    #[test]
+    #[should_panic(expected = "passes 1 int / 0 ref / 0 float argument(s)")]
+    fn an_inline_call_passing_the_wrong_argument_kind_is_rejected() {
+        // The callee takes one reference; the caller hands it an integer. The
+        // callee would read its reference register 0, which this call never
+        // wrote, and the frame would carry a stale value forward with nothing
+        // reporting it.
+        let mut builder = JitCodeBuilder::new();
+        let idx = builder.add_sub_jitcode(callee_declaring("r"));
+        builder.inline_call_ir_v(idx, &[(0, 0)], &[], None);
+    }
+
+    #[test]
+    fn an_inline_call_matching_the_callees_signature_is_emitted() {
+        let mut builder = JitCodeBuilder::new();
+        let idx = builder.add_sub_jitcode(callee_declaring("r"));
+        let start = builder.current_pos();
+        builder.inline_call_ir_v(idx, &[], &[(0, 0)], None);
+        assert!(builder.current_pos() > start);
+    }
+
+    #[test]
+    fn an_inline_call_into_a_callee_that_states_no_signature_is_not_checked() {
+        // A jitcode this assembler builds carries the default calldescr, so
+        // its empty `arg_classes` says nothing about what it accepts and the
+        // check has to stand aside rather than read it as nullary.
+        let mut builder = JitCodeBuilder::new();
+        let idx = builder.add_sub_jitcode(JitCodeBuilder::new().finish());
+        let start = builder.current_pos();
+        builder.inline_call_ir_v(idx, &[(0, 0)], &[], None);
+        assert!(builder.current_pos() > start);
     }
 
     #[test]

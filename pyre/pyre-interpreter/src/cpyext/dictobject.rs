@@ -384,13 +384,6 @@ pub unsafe extern "C" fn PyDict_SetDefaultRef(
     ) else {
         return -1;
     };
-    let present = match crate::baseobjspace::contains(dict, key) {
-        Ok(present) => present,
-        Err(error) => {
-            super::pyerrors::set_pending_error(error);
-            return -1;
-        }
-    };
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(dict);
@@ -398,6 +391,13 @@ pub unsafe extern "C" fn PyDict_SetDefaultRef(
     roots.pin_root(key);
     let default_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(default_value);
+    // The key is looked for once, so which of the two things happened is read
+    // off the size either side of it.  Asking the dict whether it holds the key
+    // would run the key's `__hash__` and `__eq__` a second time, and a key that
+    // counts them would see this call as two.
+    let before = unsafe {
+        pyre_object::dictmultiobject::w_dict_len(pyre_object::gc_roots::shadow_stack_get(dict_slot))
+    };
     let key = pyre_object::gc_roots::shadow_stack_get(key_slot);
     let found = unsafe {
         pyre_object::dictmultiobject::w_dict_setdefault_checked(
@@ -410,6 +410,9 @@ pub unsafe extern "C" fn PyDict_SetDefaultRef(
     let Some(found) = trap(found) else {
         return -1;
     };
+    let present = unsafe {
+        pyre_object::dictmultiobject::w_dict_len(pyre_object::gc_roots::shadow_stack_get(dict_slot))
+    } == before;
     if !result.is_null() {
         unsafe { *result = pyobject::make_ref(found) };
     }

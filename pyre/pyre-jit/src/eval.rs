@@ -1455,8 +1455,11 @@ use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::{INT_INTVAL_OFFSET, W_IntObject};
 use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
 
-// rlib/jit.py PARAMETERS default: loop hot-count threshold.
-const JIT_THRESHOLD: u32 = 1039;
+// rlib/jit.py:588 PARAMETERS default: loop hot-count threshold. Read from
+// the parameter table rather than restated — upstream a jitdriver that does
+// not set the value takes it from `PARAMETERS`, so there is one place the
+// default can be read and one place it can change.
+const JIT_THRESHOLD: u32 = majit_metainterp::jit::PARAMETERS.threshold;
 type JitDriverPair = (
     JitDriver<PyreJitState>,
     std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
@@ -1904,15 +1907,19 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `BUILTIN_FUNCTION_TYPE` is a separate static `PyType` for module-level
     // builtins (`pypy/interpreter/function.py:706 BuiltinFunction`) but its
     // instances are the same Rust struct, so the vtable map sends
-    // both PyTypes to `function_tid`. No `.with_destructor_fn`: a mortal
-    // function's `name` box is reclaimed by its own tid's drop glue (off-GC
-    // storage); a holder destructor would double-free a box swept before
-    // its owner.
-    let function_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-        std::mem::size_of::<pyre_interpreter::function::Function>(),
-        object_tid,
-        pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
-    ));
+    // both PyTypes to `function_tid`. The destructor reclaims only the inline
+    // `mutate_<name>` slots (`function.py:34-42 _immutable_fields_`), which the
+    // function owns outright: a mortal function's `name` box is reclaimed by
+    // its own tid's drop glue (off-GC storage), and reaching it from here would
+    // double-free a box swept before its owner.
+    let function_tid = gc.register_type(
+        TypeInfo::object_subclass_with_gc_ptrs(
+            std::mem::size_of::<pyre_interpreter::function::Function>(),
+            object_tid,
+            pyre_interpreter::function::FUNCTION_GC_PTR_OFFSETS.to_vec(),
+        )
+        .with_destructor_fn(pyre_interpreter::function::function_destructor),
+    );
     debug_assert_eq!(function_tid, FUNCTION_GC_TYPE_ID);
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
@@ -6334,7 +6341,7 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 /// no `PyObject` header, so offering it to the type-keyed registrar would read
 /// one that is not there.
 ///
-/// The two `?` fields:
+/// The declared `?` fields:
 ///
 /// `celldict.py:34 _immutable_fields_ = ["version?"]` — the global cell fast
 /// path bakes a slot's stored cell as a `ConstPtr` under a
@@ -6349,6 +6356,13 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 /// constant under a `QUASIIMMUT_FIELD(w_type, _version_tag)`. `mutated()`
 /// (typeobject.py:285-291) bumps the tag and walks subclasses, and the setter
 /// revokes each level's loops.
+///
+/// `function.py:34-42 _immutable_fields_ = ['code?', 'w_func_globals?',
+/// 'closure?[*]', 'defs_w?[*]', 'name?', 'qualname?', 'w_objclass?',
+/// 'w_text_signature?', 'w_kw_defs?']` — the inline-call path reads these off
+/// the live callee, and `f.__defaults__ = ...` / `f.__code__ = ...` retires
+/// every loop that folded one.  All nine share `function_register_quasi_immut_watcher`,
+/// which the slot the index resolves to picks apart.
 pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
     let (driver, _) = driver_pair();
     let deps: Vec<(u64, u32)> =
@@ -6371,8 +6385,10 @@ pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
     // Hoisted because each accessor clones a `LazyLock` descr; the index also
     // decides which type `dep_ptr` is cast to, so the chain below ends in a
     // fail-loud default rather than reinterpreting a headerless map node as a
-    // `W_TypeObject`.  These seven are every quasi-immutable descr this binary
-    // mints — see the same reasoning on `state.rs install_quasiimmut_field`.
+    // `W_TypeObject`.  These seven plus the nine `Function` fields
+    // `function_quasi_immut_slot` resolves are every quasi-immutable descr this
+    // binary mints — see the same reasoning on `state.rs
+    // install_quasiimmut_field`.
     for (dep_ptr, field_index) in deps {
         unsafe {
             if field_index == module_dict_version {
@@ -6408,6 +6424,13 @@ pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
             } else if field_index == audit_holder_hooks {
                 pyre_interpreter::module::sys::vm::audit_holder_register_hooks_watcher(
                     dep_ptr as *const _,
+                    &flag,
+                );
+            } else if let Some(slot) = pyre_jit_trace::descr::function_quasi_immut_slot(field_index)
+            {
+                pyre_interpreter::function::function_register_quasi_immut_watcher(
+                    dep_ptr as pyre_object::PyObjectRef,
+                    slot,
                     &flag,
                 );
             } else {
@@ -12948,25 +12971,27 @@ fn write_barrier_after_ref_store(container: i64) {
     }
 }
 
-/// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` byte-write
-/// helper for integer and float fields. Ref fields use a pointer-width
-/// store in `bh_setfield_gc_r`, matching `llmodel.py:723`.
-fn bh_setfield_gc_byte_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-    let field_offset = descr_info.offset;
+/// `resume.py:1518 cpu.bh_setfield_gc_i` → `llmodel.py:717-721
+/// bh_setfield_gc_i`, which unpacks the field's size and hands it to
+/// `write_int_at_mem`.
+///
+/// The width dispatch is the CPU model's, not this object model's, so
+/// it is not repeated here.
+fn bh_setfield_gc_int_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
     if struct_ptr == 0 {
         return;
     }
-    majit_gc::bh_probe_note_store(struct_ptr as usize, field_offset, 8);
+    majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 8);
+    // SAFETY: `struct_ptr` is a materialized virtual; offset and size come
+    // from the field descriptor that described the store being replayed.
     unsafe {
-        let ptr = (struct_ptr as *mut u8).add(field_offset);
-        match descr_info.field_size {
-            8 => (ptr as *mut i64).write(value),
-            4 => (ptr as *mut i32).write(value as i32),
-            2 => (ptr as *mut i16).write(value as i16),
-            1 => ptr.write(value as u8),
-            _ => (ptr as *mut i64).write(value),
-        }
-    }
+        majit_backend::llmodel::write_int_at_mem(
+            struct_ptr as usize,
+            descr_info.offset,
+            descr_info.field_size,
+            value,
+        )
+    };
 }
 
 const LOWLEVEL_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
@@ -13159,7 +13184,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     }
 
     fn bh_setfield_gc_i(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
+        bh_setfield_gc_int_write(struct_ptr, value, descr_info);
     }
 
     fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
@@ -13178,16 +13203,36 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         // points at it, and the following major mark reads a dangling header.
         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
         majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 7);
+        // SAFETY: see `bh_setfield_gc_int_write`.
         unsafe {
-            ((struct_ptr as *mut u8).add(descr_info.offset) as *mut usize).write(value as usize);
-        }
+            majit_backend::llmodel::write_ref_at_mem(
+                struct_ptr as usize,
+                descr_info.offset,
+                value as usize,
+            )
+        };
         // llmodel.py:723 `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
         // ref store carries an implied write barrier on the destination struct.
         write_barrier_after_ref_store(struct_ptr);
     }
 
     fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
-        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
+        if struct_ptr == 0 {
+            return;
+        }
+        majit_gc::bh_probe_note_store(struct_ptr as usize, descr_info.offset, 8);
+        // `resume.py:1515` → `llmodel.py:730-734 bh_setfield_gc_f`, which
+        // unpacks only the offset: float fields are excluded from the size
+        // table, so this store takes the storage width and no `field_size`.
+        // `value` carries the FLOATSTORAGE bits, the deadframe's untyped form.
+        // SAFETY: see `bh_setfield_gc_int_write`.
+        unsafe {
+            majit_backend::llmodel::write_float_at_mem(
+                struct_ptr as usize,
+                descr_info.offset,
+                f64::from_bits(value as u64),
+            )
+        };
     }
 
     fn bh_setarrayitem_gc_i(

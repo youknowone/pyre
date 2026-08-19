@@ -2555,16 +2555,22 @@ impl Optimization for OptVirtualize {
 /// the other end of this pipe.
 ///
 /// Returns the disagreement as a message so the caller's panic names both the
-/// slot and the field. Compiled out of release builds: it is a debug assertion,
-/// written as a function only because the message needs the same walk the
+/// slot and the field. Gated on [`jit_strict_mode`], not `cfg!(debug_assertions)`:
+/// the producers this states a postcondition over are exercised by the release
+/// corpus far more widely than by the unit tests, and a check that is inert
+/// exactly where the wide corpus runs covers the narrow half only. Off in plain
+/// release so production keeps graceful degradation. Written as a function
+/// rather than a `debug_assert!` because the message needs the same walk the
 /// predicate does. [`field_slot_identifies`] is the same walk without the
 /// message, for the read side, which has to answer in release too.
+///
+/// [`jit_strict_mode`]: crate::jit_strict_mode
 fn field_slot_disagreement(
     descr: &DescrRef,
     field_idx: u32,
     field: &dyn FieldDescr,
 ) -> Option<String> {
-    if !cfg!(debug_assertions) {
+    if !crate::jit_strict_mode() {
         return None;
     }
     let fields = descr.as_size_descr()?.all_fielddescrs();
@@ -2599,7 +2605,7 @@ fn field_slot_disagreement(
 /// Neither alone is sufficient: a name can be absent, and a flattened layout
 /// puts an aggregate and its first leaf at one address
 /// (`heaptracker.py:68-69`).
-fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
+pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
     let named_apart = !field.field_name().is_empty()
         && !slot.field_name().is_empty()
         && slot.field_name() != field.field_name();

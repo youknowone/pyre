@@ -64,6 +64,20 @@ pub struct Llbc {
     /// `i64`-returning helpers from pointer-returning ones, defeating
     /// `fn_return_types`-based type checks.
     dedup_body: Vec<(u64, DedupBody)>,
+    /// Qualified transparent-type path → scalar register shape learned from
+    /// another LLBC in the same linked translation input. Dependency LLBCs
+    /// retain layout attributes but may expose the type body as `Opaque`; the
+    /// defining crate supplies the missing one-field scalar shape.
+    transparent_scalar_kinds: std::sync::RwLock<Vec<(String, TransparentScalarKind)>>,
+}
+
+/// Register-bank shape of a `#[repr(transparent)]` scalar wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransparentScalarKind {
+    Signed,
+    Unsigned,
+    Bool,
+    Float,
 }
 
 /// One hash-consed type body, kept as its raw JSON text and exploded to a
@@ -125,7 +139,41 @@ impl Llbc {
             file,
             dedup_adt,
             dedup_body,
+            transparent_scalar_kinds: std::sync::RwLock::new(Vec::new()),
         })
+    }
+
+    /// Merge transparent scalar shapes discovered across the linked LLBC set.
+    /// Entries are kept sorted for deterministic, allocation-free lookup.
+    pub fn register_transparent_scalar_kinds(
+        &self,
+        entries: impl IntoIterator<Item = (String, TransparentScalarKind)>,
+    ) {
+        let mut kinds = self
+            .transparent_scalar_kinds
+            .write()
+            .expect("transparent scalar registry poisoned");
+        for (path, kind) in entries {
+            match kinds.binary_search_by(|(known, _)| known.cmp(&path)) {
+                Ok(index) => assert_eq!(
+                    kinds[index].1, kind,
+                    "transparent scalar type {path} has inconsistent linked definitions"
+                ),
+                Err(index) => kinds.insert(index, (path, kind)),
+            }
+        }
+    }
+
+    /// Look up the linked scalar shape of an opaque transparent declaration.
+    pub fn transparent_scalar_kind(&self, path: &str) -> Option<TransparentScalarKind> {
+        let kinds = self
+            .transparent_scalar_kinds
+            .read()
+            .expect("transparent scalar registry poisoned");
+        let index = kinds
+            .binary_search_by(|(known, _)| known.as_str().cmp(path))
+            .ok()?;
+        Some(kinds[index].1)
     }
 
     /// Resolve a Charon `Deduplicated: <id>` type reference to the

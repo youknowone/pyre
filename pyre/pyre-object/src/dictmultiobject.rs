@@ -3108,11 +3108,22 @@ pub unsafe fn w_dict_setdefault_checked(
         strategy.switch_to_object_strategy(obj);
         return w_dict_setdefault_checked(obj, key, value);
     }
-    let result = strategy.setdefault(obj, key, value);
-    if take_dict_key_error() {
-        return Err(DictKeyError);
+    // `dictmultiobject.py:487-493 DictStrategy.setdefault` is `getitem`
+    // followed by `setitem`.  Both of those are the infallible spellings here,
+    // and a typed strategy answering either for a key of another type reaches
+    // the object strategy through them -- where a key that cannot be hashed
+    // has nowhere to report itself, so the store went ahead on a key with no
+    // hash.  Run the checked pair, which is the same two steps.  The lookup
+    // can run a probing `__eq__`, so the three by-value words are slotted and
+    // read back after it.
+    let roots = crate::gc_roots::push_roots();
+    let dict_slot = roots.publish(&[obj, key, value]);
+    if let Some(existing) = w_dict_lookup_checked(obj, key)? {
+        return Ok(existing);
     }
-    Ok(result)
+    let value = roots.get(dict_slot + 2);
+    w_dict_store_checked(roots.get(dict_slot), roots.get(dict_slot + 1), value)?;
+    Ok(value)
 }
 
 /// `dictmultiobject.py:624-634 DictStrategy.pop` (base) +

@@ -1641,6 +1641,14 @@ pub fn translate_op(
                             result,
                         )]);
                     }
+                    if segments.as_slice() == ["__getslice_range"] && arg_hls.len() == 3 {
+                        // slice, start, end -> getslice(slice, start, end)
+                        // The frontend plants this marker only after proving
+                        // `0 <= start <= end == len(slice)`, preserving Rust's
+                        // checked Range semantics before entering RPython's
+                        // startstop list-slice lowering.
+                        return Ok(vec![FlowspaceOp::new("getslice", arg_hls, result)]);
+                    }
                     // `[v; N]` array literal.  `front::mir` lowers
                     // `Rvalue::Repeat` to the `__array_repeat` synthetic
                     // carrying `(fill, count)` whenever the count decodes.

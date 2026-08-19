@@ -87,6 +87,7 @@ mod local_crates;
 )]
 pub mod model;
 pub mod model_ssa;
+pub mod module_path;
 mod parse;
 #[cfg_attr(
     test,
@@ -96,8 +97,6 @@ mod parse;
     )
 )]
 pub mod pipeline;
-#[cfg(test)]
-mod test_support;
 // `translator/` is the RPython-orthodox port home — see
 // `translator/mod.rs` for the contract.  Currently hosts
 // `translator/rtyper/{rclass.rs, rpbc.rs}`, the `rpython/rtyper/` 1:1
@@ -121,7 +120,8 @@ pub use flatten::{FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten_graph
 pub use front::{AstGraphOptions, SemanticFunction, SemanticProgram};
 pub use jtransform::{
     CallEffectKind, CallEffectOverride, DeclaredCallEffects, DeclaredExtraEffect,
-    GraphTransformConfig, GraphTransformResult, VirtualizableFieldDescriptor, transform_graph,
+    GraphTransformConfig, GraphTransformResult, StructStorageDescriptor,
+    VirtualizableFieldDescriptor, transform_graph,
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
@@ -457,7 +457,8 @@ fn auto_discover_workspace_llbc_paths(module_paths: &[&str]) -> Option<Vec<Strin
 /// `front::llbc_hints::harvest_hints_from_llbcs` reads the
 /// `#[doc(hidden)]` marker consts the `majit_macros` proc-macros emit
 /// (`_elidable_function_<NAME>`, `_jit_elidable_cannot_raise_<NAME>`,
-/// `_jit_look_inside_<NAME>`, …) out of Charon's `global_decls`,
+/// `_jit_cannot_raise_<NAME>`, `_jit_look_inside_<NAME>`, …) out of
+/// Charon's `global_decls`,
 /// keyed by the crate-stripped function path.  Each `SemanticFunction`
 /// is matched by its `{module_path}::{name}` path so same-named helpers
 /// in different modules cannot inherit each other's hints.
@@ -1568,6 +1569,7 @@ fn analyze_pipeline_from_module_paths(
                     "elidable_cannot_raise" => {
                         call_control.mark_cannot_raise_assertion(path.clone())
                     }
+                    "cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
                     "elidable_or_memerror" => {
                         call_control.mark_memerror_only_assertion(path.clone())
                     }
@@ -1589,6 +1591,7 @@ fn analyze_pipeline_from_module_paths(
                         "elidable_cannot_raise" => {
                             call_control.mark_cannot_raise_assertion(dp.clone())
                         }
+                        "cannot_raise" => call_control.mark_cannot_raise_assertion(dp.clone()),
                         "elidable_or_memerror" => {
                             call_control.mark_memerror_only_assertion(dp.clone())
                         }
@@ -1676,30 +1679,14 @@ fn analyze_pipeline_from_module_paths(
     // to `dual_gate_registry`, which mints each family before the
     // class-method seeding.
     //
-    // Per-family builder shared by the config and the gated auto-population
-    // paths.  Skips a family whose impl owners collapse to one leaf under
-    // the leaf-keyed (`canonical_struct_name`) family interning + method
-    // seeding — that would silently drop a member; leaving the trait's
-    // classdef-less / fail-loud disposition is the fail-safe.  Mirrors the
-    // `struct_leaf_counts` bail on the single-impl path below.
+    // Per-family builder shared by the config and auto-population paths.
+    // Concrete owners retain their qualified type identity: two unrelated
+    // `Port` structs must become two distinct subclasses, just as RPython
+    // keys classes by object identity rather than by the final name segment.
     let make_registration = |trait_qualified: &str,
                              owners: &std::collections::BTreeSet<String>|
      -> Option<call::TraitFamilyRegistration> {
-        let impl_roots: Vec<String> = owners
-            .iter()
-            .map(|owner| owner.rsplit("::").next().unwrap_or(owner).to_string())
-            .collect();
-        // Within-family leaf collision: two impls of THIS trait whose
-        // qualified owners share a leaf across modules.
-        let mut seen = std::collections::HashSet::new();
-        if let Some(dup) = impl_roots.iter().find(|leaf| !seen.insert(leaf.as_str())) {
-            eprintln!(
-                "register_trait_families: {trait_qualified:?} has impls sharing \
-                 leaf {dup:?} across modules ({owners:?}); skipping — leaf-keyed \
-                 seeding cannot disambiguate them"
-            );
-            return None;
-        }
+        let impl_roots = owners.iter().cloned().collect();
         Some(call::TraitFamilyRegistration {
             base_root: trait_qualified.to_string(),
             impl_roots,
@@ -1739,40 +1726,21 @@ fn analyze_pipeline_from_module_paths(
     // to the family base ClassDef.  Union with the config list (dedup by
     // base_root), never replacing it, so an existing configuration stays
     // valid. Minting base/impl subclass classdefs and lowering the indirect
-    // call are one decision. Applies the same within-family
-    // `dup_leaf` guard as the config path plus the cross-registry
-    // `struct_leaf_counts` bail: an impl leaf that also names a DIFFERENT
-    // registered struct would mis-seed the family, so skip it (fail-safe
-    // classdef-less).
+    // call are one decision. Implementations retain their qualified owner
+    // paths, so same-leaf types from different modules remain distinct
+    // subclasses of their respective trait families.
     {
         let already: std::collections::HashSet<&str> = trait_family_registrations
             .iter()
             .map(|r| r.base_root.as_str())
             .collect();
-        let mut auto: Vec<call::TraitFamilyRegistration> =
-            trait_impl_owners
-                .iter()
-                .filter(|(trait_qualified, owners)| {
-                    owners.len() >= 2 && !already.contains(trait_qualified.as_str())
-                })
-                .filter_map(|(trait_qualified, owners)| {
-                    let reg = make_registration(trait_qualified, owners)?;
-                    // Cross-registry leaf collision: an impl leaf shared by
-                    // another qualified struct in the field registry would
-                    // collapse the subclass onto that struct's classdef.
-                    if let Some(dup) = reg.impl_roots.iter().find(|leaf| {
-                        struct_leaf_counts.get(leaf.as_str()).copied().unwrap_or(0) > 1
-                    }) {
-                        eprintln!(
-                            "register_trait_families: auto {trait_qualified:?} impl leaf {dup:?} \
-                         collides with another registered struct; skipping — leaf-keyed \
-                         seeding cannot disambiguate them"
-                        );
-                        return None;
-                    }
-                    Some(reg)
-                })
-                .collect();
+        let mut auto: Vec<call::TraitFamilyRegistration> = trait_impl_owners
+            .iter()
+            .filter(|(trait_qualified, owners)| {
+                owners.len() >= 2 && !already.contains(trait_qualified.as_str())
+            })
+            .filter_map(|(trait_qualified, owners)| make_registration(trait_qualified, owners))
+            .collect();
         // Deterministic mint order (BTreeMap iteration on `trait_impl_owners`
         // is already sorted, but sort defensively since a HashMap seeded it).
         auto.sort_by(|a, b| a.base_root.cmp(&b.base_root));
@@ -1828,6 +1796,7 @@ fn analyze_pipeline_from_module_paths(
                 "elidable_cannot_raise" => {
                     call_control.mark_cannot_raise_assertion(direct_path.clone())
                 }
+                "cannot_raise" => call_control.mark_cannot_raise_assertion(direct_path.clone()),
                 "elidable_or_memerror" => {
                     call_control.mark_memerror_only_assertion(direct_path.clone())
                 }
@@ -1881,6 +1850,7 @@ fn analyze_pipeline_from_module_paths(
             match hint.as_str() {
                 "elidable" => call_control.mark_elidable(path.clone()),
                 "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
+                "cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
                 "elidable_or_memerror" => call_control.mark_memerror_only_assertion(path.clone()),
                 "loopinvariant" => call_control.mark_loopinvariant(path.clone()),
                 "close_stack" => call_control.mark_close_stack(path.clone()),
@@ -1958,6 +1928,7 @@ fn analyze_pipeline_from_module_paths(
                 match hint.as_str() {
                     "elidable" => call_control.mark_elidable(p.clone()),
                     "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(p.clone()),
+                    "cannot_raise" => call_control.mark_cannot_raise_assertion(p.clone()),
                     "elidable_or_memerror" => call_control.mark_memerror_only_assertion(p.clone()),
                     "loopinvariant" => call_control.mark_loopinvariant(p.clone()),
                     "close_stack" => call_control.mark_close_stack(p.clone()),
@@ -2249,6 +2220,7 @@ fn make_jitcodes(
     // `collect_jitcodes_in_alloc_order` materialises the `all_jitcodes[]`
     // vector with `all_jitcodes[i].index == i` (RPython codewriter.py:80
     // invariant).
+    call_control.set_struct_storage(&pipeline_config.transform.struct_storage);
     let mut codewriter = codewriter::CodeWriter::new();
 
     // `warmspot.py:262-264` `vrefinfo = VirtualRefInfo(self);

@@ -29,6 +29,7 @@ pub type Bytecode = [u8];
 
 const OP_NOP: u8 = 0;
 const OP_DOUBLE: u8 = 1;
+const OP_VOID: u8 = 2;
 
 /// The callee the fixture inline-calls. Its body is what the host would have
 /// deserialized, so it is spelled here the way the blob spells it: a committed
@@ -42,10 +43,21 @@ fn build_time_table() -> &'static EmbeddedJitCodeTable {
         // 1, which happens to be free.
         let filler = canonical_jitcode("pipeline_filler", 0);
         let callee = canonical_jitcode("pipeline_double", 1);
-        let table = EmbeddedJitCodeTable::materialize(&[filler, callee], Vec::new());
+        let void_callee = canonical_void_jitcode("pipeline_void", 2);
+        let table = EmbeddedJitCodeTable::materialize(&[filler, callee, void_callee], Vec::new());
         table.install_as_global_pool();
         table
     })
+}
+
+fn canonical_void_jitcode(name: &str, index: usize) -> Arc<majit_translate::jitcode::JitCode> {
+    let core = majit_translate::jitcode::JitCode::new(name);
+    core.set_body(majit_translate::jitcode::JitCodeBody {
+        code: vec![majit_metainterp::jitcode::insns::BC_VOID_RETURN],
+        ..Default::default()
+    });
+    core.set_index(index);
+    Arc::new(core)
 }
 
 /// `int_return/i` reading int register 0 — the minimum
@@ -72,11 +84,15 @@ fn __majit_pipeline_jitcode(name: &str) -> Arc<majit_metainterp::JitCode> {
         .clone()
 }
 
+fn __majit_pipeline_liveness_prebuild(_assembler: &mut majit_metainterp::Assembler) {}
+
 /// The concrete (non-tracing) path. The jitcode above stands in for its traced
 /// form, exactly as a pipeline-built callee stands in for the real function.
 fn pipeline_double(value: i64) -> i64 {
     value * 2
 }
+
+fn pipeline_void() {}
 
 struct DoublingState {
     a: i64,
@@ -87,7 +103,10 @@ struct DoublingState {
     env = Bytecode,
     state_fields = { a: int },
     greens = [],
-    calls = { pipeline_double => inline_pipeline_int },
+    calls = {
+        pipeline_double => inline_pipeline_int,
+        pipeline_void => inline_pipeline_void,
+    },
 )]
 #[allow(unused_assignments, unused_variables)]
 fn doubling_interp(program: &Bytecode, threshold: u32) -> i64 {
@@ -107,10 +126,17 @@ fn doubling_interp(program: &Bytecode, threshold: u32) -> i64 {
         match opcode {
             OP_NOP => {}
             OP_DOUBLE => state.a = pipeline_double(state.a),
+            OP_VOID => pipeline_void(),
             _ => break,
         }
     }
     state.a
+}
+
+#[test]
+fn a_traced_void_pipeline_callee_returns_to_its_caller() {
+    let program = [OP_VOID, OP_DOUBLE, OP_NOP];
+    assert_eq!(doubling_interp(&program, 0), 2);
 }
 
 /// The subject: installing the driver over a dispatch JitCode that

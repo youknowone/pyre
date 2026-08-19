@@ -3396,6 +3396,11 @@ impl Optimizer {
                 }
                 self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
                 let produced = short_boxes.produced_ops(&mut ctx);
+                let produced_const = if crate::optimizeopt::const_short_boxes_enabled() {
+                    short_boxes.produced_const_ops(&mut ctx)
+                } else {
+                    Vec::new()
+                };
                 // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
                 // label_args + virtuals)` — read off the ShortBoxes object and
                 // carry to export_state through the ctx channel (sibling of
@@ -3437,30 +3442,40 @@ impl Optimizer {
                         seen.push(ptr);
                     }
                 }
-                ctx.exported_short_boxes = produced
-                    .into_iter()
-                    .filter_map(|(result, produced)| {
+                let mut convert_produced =
+                    |result: OpRef,
+                     produced: crate::optimizeopt::shortpreamble::ProducedShortOp,
+                     const_group: bool| {
                         let canonical_result = ctx.get_replacement_opref(result);
-                        // A produced short box whose result forwards to an inline
-                        // Const after optimization is not a real short box: a pure
-                        // op (e.g. an IntLe on loop-constant args) folds to a Const,
-                        // whose value is reproduced by inlining at use sites. A
-                        // Const must never enter exported_short_boxes / used_boxes —
-                        // it has no box index, so the carried-slot `.raw()` in
-                        // unroll.rs panics. RPython folds such ops away before
-                        // short-box creation, so its short boxes are always genuine
-                        // value Boxes. The filter still backstops pure operations
-                        // that fold to a Const during optimization.
-                        if canonical_result.is_constant() {
-                            return None;
-                        }
+                        let replay_result = if const_group {
+                            None
+                        } else {
+                            // A produced short box whose result forwards to an inline
+                            // Const after optimization is not a real short box: a pure
+                            // op (e.g. an IntLe on loop-constant args) folds to a Const,
+                            // whose value is reproduced by inlining at use sites. A
+                            // Const must never enter exported_short_boxes / used_boxes —
+                            // it has no box index, so the carried-slot `.raw()` in
+                            // unroll.rs panics. RPython folds such ops away before
+                            // short-box creation, so its short boxes are always genuine
+                            // value Boxes. The filter still backstops pure operations
+                            // that fold to a Const during optimization.
+                            if canonical_result.is_constant() {
+                                return None;
+                            }
+                            Some(canonical_result)
+                        };
                         let preamble_op = produced.preamble_op.clone();
                         // For ShortInputArg, RPython keeps two identities:
                         // short_op.res is the original label Box and
                         // preamble_op is the fresh renamed InputArg.  Preserve
                         // the renamed replay position. Other short-op kinds
-                        // replay into the canonical result position.
-                        preamble_op.pos.set(canonical_result);
+                        // replay into the canonical result position; the const
+                        // channel keeps the fresh replay position minted by
+                        // produced_const_ops.
+                        if let Some(replay_result) = replay_result {
+                            preamble_op.pos.set(replay_result);
+                        }
                         // optimizer.py:651-652 force_box loop parity.
                         //
                         // Resolve POSITIONALLY when a producer is registered at
@@ -3537,8 +3552,19 @@ impl Optimizer {
                             invented_name: produced.invented_name,
                             same_as_source: produced.same_as_source.clone(),
                         })
+                    };
+                let exported_short_boxes = produced
+                    .into_iter()
+                    .filter_map(|(result, produced)| convert_produced(result, produced, false))
+                    .collect();
+                let exported_const_short_boxes = produced_const
+                    .into_iter()
+                    .filter_map(|produced| {
+                        convert_produced(produced.res.to_opref(), produced, true)
                     })
                     .collect();
+                ctx.exported_short_boxes = exported_short_boxes;
+                ctx.exported_const_short_boxes = exported_const_short_boxes;
                 if crate::majit_log_enabled() {
                     for entry in &ctx.exported_short_boxes {
                         // Print args / same_as_source as OpRefs, not via the
@@ -3903,8 +3929,13 @@ impl Optimizer {
                 // already moved through the shared set_position Cell above; a
                 // mem::take + re-insert under a remapped OpRef would only re-mint
                 // fresh non-ptr_eq keys and break the carry.
-                // Remap exported short boxes
-                for entry in &mut state.exported_short_boxes {
+                // Remap exported short boxes, including the const-only replay
+                // channel whose fresh operation positions remain live in state.
+                for entry in state
+                    .exported_short_boxes
+                    .iter_mut()
+                    .chain(state.const_short_boxes.iter_mut())
+                {
                     // Cell::get() returns a copy; the previous
                     // `remap_opref(&mut entry.op.pos.get())` mutated that
                     // temporary and never wrote back.  Read into a local,

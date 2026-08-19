@@ -143,7 +143,7 @@ pub use crate::codewriter::AllJitCodes;
 ///   entry points.
 ///
 /// Crate-stripped module paths, matching the form
-/// `pyre-jit-trace/build.rs::module_path_from_source_file` emits, so
+/// `crate::module_path::module_path_from_source_file` emits, so
 /// analyzer-side `struct_origins[bare_name] = module_path` and
 /// `canonical_struct_name` produce the same canonical spelling
 /// the runtime + production analyser pipeline produce.  Empty module

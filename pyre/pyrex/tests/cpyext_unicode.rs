@@ -79,6 +79,36 @@ except TypeError:
 else:
     raise AssertionError('escape() accepted a non-str')
 
+# ── a write is measured against the width the string was made with ─────
+assert u.new_and_write(3, 0x7f, 0x41) == 'Axx'
+assert u.new_and_write(3, 0xff, 0xff) == '\u00ffxx'
+assert u.new_and_write(3, 0xffff, 0xffff) == '\uffffxx'
+assert u.new_and_write(3, 0x10ffff, 0x1f363) == '\U0001f363xx'
+# A surrogate is a code point a str holds, so it is written like any other.
+# The width asked for is the one that holds it: a string wider than its
+# contents need is not the string the same text spells.
+assert u.new_and_write(3, 0xffff, 0xd800) == '\ud800xx'
+for maxchar, value in [
+    (0x7f, 0xff), (0x7f, 0x1f363), (0xff, 0x100),
+    (0xffff, 0x10000), (0x10ffff, 0x110000),
+]:
+    try:
+        u.new_and_write(3, maxchar, value)
+    except ValueError as error:
+        assert str(error) == 'character out of range', (maxchar, value, error)
+    else:
+        raise AssertionError(f'wrote {value:#x} into a string of {maxchar:#x}')
+
+# ── neither accessor takes anything but a string ───────────────────────
+refused = ('TypeError', 'bad argument type for built-in operation')
+assert u.not_a_string(b'abc') == (refused, refused), u.not_a_string(b'abc')
+assert u.not_a_string(3) == (refused, refused)
+
+# ── a count of nothing names no buffer, but the kind is still checked ───
+rows, refused_kind = u.from_nothing()
+assert rows == ['', '', '', ''], rows
+assert refused_kind == ('SystemError', 'invalid kind'), refused_kind
+
 print('cpyext-unicode-ok')
 "#;
 

@@ -125,6 +125,15 @@ pub struct GraphTransformConfig {
     /// rather than being rediscovered from source text.
     #[serde(default)]
     pub call_effects: Vec<CallEffectOverride>,
+    /// Low-level storage shape for structs whose Rust representation is not
+    /// the default headered GC object.
+    ///
+    /// RPython carries this on the lltype itself (`Struct` versus `GcStruct`,
+    /// plus the allocation hints). Rust source types do not encode whether a
+    /// consumer stores one in its own heap, so an embedding pipeline supplies
+    /// that part of the translated low-level type here.
+    #[serde(default)]
+    pub struct_storage: Vec<StructStorageDescriptor>,
 }
 
 impl Default for GraphTransformConfig {
@@ -135,6 +144,32 @@ impl Default for GraphTransformConfig {
             vable_fields: Vec::new(),
             vable_arrays: Vec::new(),
             call_effects: Vec::new(),
+            struct_storage: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructStorageDescriptor {
+    pub owner: String,
+    pub is_gc_managed: bool,
+    pub headerless: bool,
+}
+
+impl StructStorageDescriptor {
+    pub fn raw(owner: impl Into<String>) -> Self {
+        Self {
+            owner: owner.into(),
+            is_gc_managed: false,
+            headerless: false,
+        }
+    }
+
+    pub fn headerless(owner: impl Into<String>) -> Self {
+        Self {
+            owner: owner.into(),
+            is_gc_managed: true,
+            headerless: true,
         }
     }
 }
@@ -151,6 +186,12 @@ pub enum CallEffectKind {
     /// The three variants above are shorthands for three particular rows;
     /// this one carries the row.
     Declared(DeclaredCallEffects),
+}
+
+impl Default for CallEffectKind {
+    fn default() -> Self {
+        Self::Residual
+    }
 }
 
 /// `effectinfo.py:17-24` `EF_*`, minus `EF_RANDOM_EFFECTS`.
@@ -222,6 +263,10 @@ pub struct CallEffectOverride {
     /// match counter in the same output — a row that reads `0x INERT` is not
     /// installed, whatever it looks like here.
     pub target: CallTarget,
+    /// The declared classification, retained so a full `Declared` row is not
+    /// collapsed back to the generic residual category during lookup.
+    #[serde(default)]
+    pub effect: CallEffectKind,
     /// `calldescr`-equivalent EffectInfo wrapper attached to the call.
     pub descriptor: CallDescriptor,
 }
@@ -230,6 +275,7 @@ impl CallEffectOverride {
     pub fn new(target: CallTarget, effect: CallEffectKind) -> Self {
         Self {
             target,
+            effect,
             descriptor: CallDescriptor::override_effect(effect_info_for_kind(effect)),
         }
     }
@@ -700,6 +746,22 @@ fn variable_has_declared_unsigned_type(
                 }
             )
         })
+}
+
+/// Preserve the MIR distinction between reading a by-value field and taking
+/// the address of an inline substructure. RPython receives distinct
+/// `getfield`/`getsubstruct` operations from its rtyper; Rust references are
+/// aliases in the flow graph, so the front records that distinction on the
+/// field access instead.
+fn getsubstruct_offset_for_access(
+    field: &FieldDescriptor,
+    resolve_offset: impl FnOnce() -> Option<usize>,
+) -> Option<usize> {
+    if field.taken_by_address {
+        resolve_offset()
+    } else {
+        None
+    }
 }
 
 impl<'a> Transformer<'a> {
@@ -2909,10 +2971,19 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
-        let inline_substruct_offset = self
-            .callcontrol
-            .as_deref()
-            .and_then(|cc| crate::assembler::inline_substruct_field_offset(cc, field));
+        // `rewrite_op_getsubstruct` applies only to an address-producing
+        // projection.  A by-value Rust field can itself have an inline-struct
+        // layout (notably a `#[repr(transparent)]` newtype) while the operation
+        // is still an ordinary load.  Treating every offset-zero Struct field
+        // as getsubstruct aliases the result to the container pointer and
+        // silently drops the load.  The MIR front records the distinction on
+        // the access because `Rvalue::Ref` otherwise has the same FieldRead
+        // shape as `Rvalue::Use`.
+        let inline_substruct_offset = getsubstruct_offset_for_access(field, || {
+            self.callcontrol
+                .as_deref()
+                .and_then(|cc| crate::assembler::inline_substruct_field_offset(cc, field))
+        });
         if let Some(0) = inline_substruct_offset {
             let OpKind::FieldRead { base, .. } = &op.kind else {
                 unreachable!("rewrite_op_getfield called on non-FieldRead op")
@@ -3746,9 +3817,11 @@ impl<'a> Transformer<'a> {
                         .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;
                     let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
-                    let extraeffect = classify_call(target, &self.config.call_effects)
-                        .map(|(d, _)| d.extra_info.extraeffect);
-                    let descriptor = cc_ref.getcalldescr(
+                    let classified = classify_call(target, &self.config.call_effects);
+                    let extraeffect = classified
+                        .as_ref()
+                        .map(|(descriptor, _)| descriptor.extra_info.extraeffect);
+                    let mut descriptor = cc_ref.getcalldescr(
                         op,
                         non_void_args,
                         result_ir_type,
@@ -3757,6 +3830,9 @@ impl<'a> Transformer<'a> {
                         &mut self.analysis_cache,
                         None,
                     );
+                    if let Some((declared, CallEffectKind::Declared(_))) = classified {
+                        descriptor.extra_info = declared.extra_info;
+                    }
                     self.handle_residual_call(
                         graph,
                         op,
@@ -7289,6 +7365,7 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // All jit.* oopspecs are intercepted by _handle_jit_call() before
         // reaching this function. Remaining oopspecs map to OS_* indices.
         "virtual_ref" | "virtual_ref_finish" => OopSpecIndex::JitForceVirtualizable,
+        "raw_free" => OopSpecIndex::RawFree,
         // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
         _ => OopSpecIndex::None,
@@ -7478,8 +7555,7 @@ fn classify_call(
     {
         record_override_match(&override_.target);
         let descriptor = override_.descriptor.clone();
-        let effect = classify_effect_info(&descriptor.get_extra_info());
-        return Some((descriptor, effect));
+        return Some((descriptor, override_.effect));
     }
     let descriptor = crate::call::describe_call(target)?;
     let effect = classify_effect_info(&descriptor.get_extra_info());
@@ -7508,6 +7584,23 @@ mod tests {
             kind: OpKind::Live,
         };
         assert_eq!(keep_operation_unchanged(&transformer, &op), op);
+    }
+
+    #[test]
+    fn inline_struct_value_read_is_not_getsubstruct() {
+        let value_read = FieldDescriptor::new("value", Some("Node".into()));
+        assert_eq!(
+            getsubstruct_offset_for_access(&value_read, || {
+                panic!("a by-value field read must not consult getsubstruct layout")
+            }),
+            None,
+        );
+
+        let address = value_read.with_taken_by_address(true);
+        assert_eq!(
+            getsubstruct_offset_for_access(&address, || Some(0)),
+            Some(0)
+        );
     }
 
     /// A `FunctionPath` override matches its own segmentation and nothing
@@ -8964,13 +9057,20 @@ mod tests {
         }
     }
 
+    /// A method call whose override says `Residual` lowers to the const
+    /// target plus a `CallResidual`, and is counted once.
+    ///
+    /// The table is built here rather than borrowed from an interpreter:
+    /// the subject is the transformer's reading of an override, so the
+    /// only row that matters is the one the call matches, and its
+    /// spelling is arbitrary.
     #[test]
     fn transform_graph_classifies_calls() {
         let mut graph = FunctionGraph::new("test");
         graph.push_op_var(
             graph.startblock,
             OpKind::Call {
-                target: CallTarget::method("call_callable", Some("PyFrame".into())),
+                target: CallTarget::method("do_call", Some("Frame".into())),
                 args: vec![],
                 result_ty: ValueType::Ref(None),
             },
@@ -8978,10 +9078,14 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = transform_graph(
-            &graph,
-            &crate::test_support::pyre_pipeline_config().transform,
-        );
+        let config = GraphTransformConfig {
+            call_effects: vec![CallEffectOverride::new(
+                CallTarget::method("do_call", Some("Frame".to_string())),
+                CallEffectKind::Residual,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
         assert_eq!(result.calls_classified, 1);
         assert!(matches!(
             result.graph.block(graph.startblock).operations[0].kind,
@@ -9483,6 +9587,64 @@ mod tests {
         } else {
             panic!("expected CallResidual");
         }
+    }
+
+    #[test]
+    fn declared_override_replaces_analyzer_effect_sets() {
+        let target = CallTarget::function_path(["opaque_cleanup"]);
+        let mut graph = FunctionGraph::new("caller");
+        let arg = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "node".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: target.clone(),
+                args: vec![arg],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            call_effects: vec![CallEffectOverride::new(
+                target,
+                CallEffectKind::Declared(DeclaredCallEffects {
+                    extra: DeclaredExtraEffect::CannotRaise,
+                    can_collect: false,
+                    can_invalidate: false,
+                }),
+            )],
+            ..Default::default()
+        };
+        let mut cc = crate::call::CallControl::new();
+        let result = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let descriptor = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .expect("declared call must lower to CallResidual");
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
+        assert!(!descriptor.extra_info.can_collect);
+        assert!(!descriptor.extra_info.can_invalidate);
+        assert_eq!(descriptor.extra_info.write_descrs_fields, Some(Vec::new()));
+        assert_eq!(descriptor.extra_info.write_descrs_arrays, Some(Vec::new()));
     }
 
     #[test]
@@ -11364,6 +11526,10 @@ mod tests {
     #[test]
     fn map_user_oopspec_dict_lookup() {
         use majit_ir::descr::OopSpecIndex;
+        assert_eq!(
+            super::map_user_oopspec_to_index("raw_free(node)"),
+            OopSpecIndex::RawFree
+        );
         assert_eq!(
             super::map_user_oopspec_to_index("ordereddict.lookup(d, key, hash, flag)"),
             OopSpecIndex::DictLookup

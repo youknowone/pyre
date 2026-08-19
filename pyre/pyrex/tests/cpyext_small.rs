@@ -145,6 +145,36 @@ eq('setdefault hash raises', raising, (-1, None, ('ValueError', 'boom')))
 refused = m.set_default([], 'a', 1)
 eq('setdefault not a dict', (refused[0], refused[1]), (-1, None))
 eq('setdefault untouched', mapping, {'a': 1, 'b': 2, 'c': 3})
+# Whether the key was there is answered without looking for it a second time,
+# so a key that counts what is asked of it sees one hash either way.
+
+
+class Counted:
+    def __init__(self, name):
+        self.name = name
+        self.hashes = 0
+
+    def __hash__(self):
+        self.hashes += 1
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return isinstance(other, Counted) and other.name == self.name
+
+
+held = Counted('k')
+counted = {held: 'was there'}
+probe = Counted('k')
+eq('setdefault counted present', m.set_default(counted, probe, 'default'),
+   (1, 'was there', None))
+eq('setdefault probes once', probe.hashes, 1)
+fresh = Counted('new')
+eq('setdefault counted absent', m.set_default(counted, fresh, 'default'),
+   (0, 'default', None))
+eq('setdefault probes once inserting', fresh.hashes, 1)
+# The default landing on a key that already maps to an equal value is still
+# the key having been there.
+eq('setdefault same value', m.set_default({'x': 1}, 'x', 1), (1, 1, None))
 
 # ── origin[args] ───────────────────────────────────────────────────────
 

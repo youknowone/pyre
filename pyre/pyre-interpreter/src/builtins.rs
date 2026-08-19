@@ -3693,7 +3693,12 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2)
     });
     crate::module_ns_get_or_insert_with(ns, "__import__", || {
-        make_module_builtin_function("__import__", builtin_dunder_import)
+        // `moduledef.py:78-87 startup` — "Copy our __import__ to builtins".
+        // `baseobjspace.py:730` keeps that same object as
+        // `space.w_default_importlib_import`.
+        let w_import = make_module_builtin_function("__import__", builtin_dunder_import);
+        crate::importing::set_default_importlib_import(w_import);
+        w_import
     });
 
     // Descriptor types
@@ -13434,8 +13439,15 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     // `space.id` (baseobjspace.py): a plain `int` yields its
     // value-derived `immutable_unique_id`; every other object falls back
-    // to `compute_unique_id`, which incminimark implements through
-    // `id_or_identityhash` (incminimark.py) so nursery moves preserve it.
+    // to `compute_unique_id` (objectmodel.py:572-582), which incminimark
+    // implements through `id_or_identityhash` (incminimark.py:2864) so
+    // nursery moves preserve it.  The address-valued function is a
+    // different one — `current_object_addr_as_int`
+    // (objectmodel.py:584-590), whose docstring exists to say the value
+    // "can change over time for moving GCs".  A list and a dict header do
+    // move, so answering with the raw pointer would give such an object two
+    // different ids over its lifetime, and every structure keyed on `id()`
+    // would lose track of it.
     let obj = args[0];
     let w_res = match crate::function::immutable_unique_id(obj) {
         Some(w_id) => w_id,

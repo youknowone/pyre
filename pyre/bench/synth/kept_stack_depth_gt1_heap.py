@@ -1,4 +1,7 @@
 # pyre-check: max-pypy-ratio=19
+# pyre-check: skip-cpython
+# cpython 2.40s vs pyre 0.64s (3.8x on the ubuntu runner), and it is not
+# gated on — only pypy is.
 # Depth > 1 kept-stack branch guards whose kept / merge slot is a HEAP int
 # (>= 256, a LOAD_CONST rather than the inline LoadSmallInt).  Sibling of
 # `kept_stack_depth_gt1.py`, which keeps only small-int slots (11, 5, 2); here

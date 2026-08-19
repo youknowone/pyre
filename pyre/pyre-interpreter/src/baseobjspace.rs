@@ -6104,9 +6104,12 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    match name.as_str() {
-        Ok(s) => getattr_str(obj, s),
-        Err(_) => unsafe { getattr_surrogate(obj, w_name, name) },
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        getattr_str(obj, unsafe {
+            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
+        })
+    } else {
+        unsafe { getattr_surrogate(obj, w_name, name) }
     }
 }
 
@@ -6121,9 +6124,15 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    match name.as_str() {
-        Ok(s) => getattr_str_impl(obj, s, true, true),
-        Err(_) => unsafe { getattr_surrogate(obj, w_name, name) },
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        getattr_str_impl(
+            obj,
+            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+            true,
+            true,
+        )
+    } else {
+        unsafe { getattr_surrogate(obj, w_name, name) }
     }
 }
 
@@ -6136,9 +6145,14 @@ pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyR
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    match name.as_str() {
-        Ok(s) => setattr_str(obj, s, value),
-        Err(_) => unsafe { setattr_surrogate(obj, w_name, name, value) },
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        setattr_str(
+            obj,
+            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
+            value,
+        )
+    } else {
+        unsafe { setattr_surrogate(obj, w_name, name, value) }
     }
 }
 
@@ -6151,9 +6165,12 @@ pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
         )));
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    match name.as_str() {
-        Ok(s) => delattr_str(obj, s),
-        Err(_) => unsafe { delattr_surrogate(obj, w_name, name) },
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        delattr_str(obj, unsafe {
+            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
+        })
+    } else {
+        unsafe { delattr_surrogate(obj, w_name, name) }
     }
 }
 
@@ -7751,22 +7768,16 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             if name == "__doc__" {
                 return type_get_doc(obj);
             }
-            if name == "__code__"
-                || name == "__func__"
-                || name == "__self__"
-                || name == "__globals__"
-                || name == "__closure__"
-                || name == "__defaults__"
-                || name == "__kwdefaults__"
-            {
-                // Check class dict first, then return None.  `__wrapped__` is
-                // excluded so an unset value raises AttributeError rather than
-                // feeding `inspect.unwrap` a bogus None chain.
-                if let Some(v) = lookup_in_type_where(obj, name) {
-                    return Ok(v);
-                }
-                return Ok(w_none());
-            }
+            // `__code__` / `__func__` / `__self__` / `__globals__` /
+            // `__closure__` / `__defaults__` / `__kwdefaults__` are NOT
+            // short-circuited here.  typeobject.py defines no such branch: a
+            // class has these only when its MRO does, and the ordinary
+            // descriptor path below both finds that value and raises
+            // AttributeError when there is none.  Answering `None` instead
+            // broke the standard unwrap idiom `getattr(fn, "__func__", fn)`,
+            // which then carries `None` forward — the same failure the
+            // `__wrapped__` exclusion was written to avoid.
+
             // `__module__` is NOT in the short-circuit list — it falls
             // through to the normal descriptor protocol so type's
             // `__module__` GetSetProperty (`typedef.rs init_type_type`)

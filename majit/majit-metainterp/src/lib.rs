@@ -61,6 +61,41 @@ pub fn __pyre_struct_type_id<T: 'static>(is_gc_managed: bool) -> u64 {
     hasher.finish()
 }
 
+/// Resolve a `crate`/`self`/`super` type path at its macro expansion module
+/// and hash the crate-stripped definition path used by the graph codewriter.
+#[doc(hidden)]
+pub fn __pyre_struct_type_id_path(module_path: &str, type_path: &str, is_gc_managed: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut resolved: Vec<&str> = module_path.split("::").collect();
+    let mut segments = type_path.split("::").peekable();
+    match segments.peek().copied() {
+        Some("crate") => {
+            resolved.truncate(1);
+            segments.next();
+        }
+        Some("self") => {
+            segments.next();
+        }
+        Some("super") => {
+            while segments.peek().copied() == Some("super") {
+                assert!(resolved.len() > 1, "type path escapes its crate root");
+                resolved.pop();
+                segments.next();
+            }
+        }
+        _ => unreachable!("only crate/self/super paths use this resolver"),
+    }
+    resolved.extend(segments);
+    let definition_path = resolved.into_iter().skip(1).collect::<Vec<_>>().join("::");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    definition_path.hash(&mut hasher);
+    if !is_gc_managed {
+        "raw".hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 pub mod blackhole;
 pub mod box_trace;
 pub(crate) mod call_descr;

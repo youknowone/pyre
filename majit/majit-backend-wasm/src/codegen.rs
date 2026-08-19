@@ -792,8 +792,9 @@ impl RefHomes {
         ops: &[Op],
         include_ca_collects: bool,
         forced_refs: &[OpRef],
+        regions: &[InlinedRegionSpan],
     ) -> Self {
-        let liveness = HomeLiveness::collect(inputargs, ops);
+        let liveness = HomeLiveness::collect_with_regions(inputargs, ops, regions);
         let collect_positions = collecting_call_positions(ops, include_ca_collects);
         let ref_values = RefValues::collect(inputargs, ops);
         let mut by_id = Vec::new();
@@ -895,8 +896,45 @@ struct LabelResumeData {
     ref_slots: usize,
 }
 
+/// Where one inlined bridge region starts in a merged analysis stream, and
+/// which value ids carry that region's own live-ins.
+struct InlinedRegionSpan {
+    ops_start: usize,
+    inputarg_ids: Vec<u32>,
+}
+
+impl InlinedRegionSpan {
+    /// The regions occupy the tail of the merged stream in `inlined_bridges`
+    /// order, so their starts run back from the end of `ops`. `bridges` must be
+    /// the rebased copies the merged stream was built from, so the recorded ids
+    /// are the ids that stream reads.
+    fn collect(ops_len: usize, bridges: &[InlinedBridge]) -> Vec<Self> {
+        let mut start =
+            ops_len.saturating_sub(bridges.iter().map(|bridge| bridge.ops.len()).sum::<usize>());
+        bridges
+            .iter()
+            .map(|bridge| {
+                let span = Self {
+                    ops_start: start,
+                    inputarg_ids: bridge.inputargs.iter().map(|ia| ia.index).collect(),
+                };
+                start += bridge.ops.len();
+                span
+            })
+            .collect()
+    }
+}
+
 impl LabelResumeData {
     fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+        Self::collect_with_regions(inputargs, ops, &[])
+    }
+
+    fn collect_with_regions(
+        inputargs: &[InputArg],
+        ops: &[Op],
+        regions: &[InlinedRegionSpan],
+    ) -> Self {
         let (_, num_vars) = collect_guards_and_vars(inputargs, ops);
         let ref_values = RefValues::collect(inputargs, ops);
         let normal_value_slots = normal_frame_value_slots(inputargs, ops);
@@ -961,6 +999,24 @@ impl LabelResumeData {
                     && let Some(v) = available.get_mut(r.raw() as usize)
                 {
                     *v = true;
+                }
+            }
+            // An appended region's live-ins reach it only through the
+            // guard-fail branch that is the region's sole predecessor, and that
+            // branch assigns them. Nothing the entry dispatch can land on
+            // reaches a region's first read without passing it, so those ids
+            // are dead until written here. Treating them as live would reserve
+            // one frozen-frame slot per region live-in at every resumable
+            // label, and the resume loader would reload a value the guard
+            // overwrites before anything reads it.
+            for region in regions {
+                if region.ops_start <= label_pos {
+                    continue;
+                }
+                for &id in &region.inputarg_ids {
+                    if let Some(v) = available.get_mut(id as usize) {
+                        *v = true;
+                    }
                 }
             }
 
@@ -1087,7 +1143,7 @@ pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
     // This pre-sizing query is used for CA bridges before `CaParams` exists, so
     // count CALL_ASSEMBLER as a collecting position to match CA codegen.
     let resume = LabelResumeData::collect(inputargs, ops);
-    RefHomes::collect(inputargs, ops, true, &resume.captured_refs).len()
+    RefHomes::collect(inputargs, ops, true, &resume.captured_refs, &[]).len()
 }
 
 /// Number of high GC-rooted homes reserved exclusively for LABEL live-ins.
@@ -1336,7 +1392,11 @@ struct HomeLiveness {
 }
 
 impl HomeLiveness {
-    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+    fn collect_with_regions(
+        inputargs: &[InputArg],
+        ops: &[Op],
+        regions: &[InlinedRegionSpan],
+    ) -> Self {
         let mut n = inputargs
             .iter()
             .map(|ia| ia.index as usize + 1)
@@ -1376,6 +1436,22 @@ impl HomeLiveness {
                     if a != OpRef::NONE && !a.is_constant() && (a.raw() as usize) < n {
                         last_use[a.raw() as usize] = i as i32;
                     }
+                }
+            }
+        }
+        // An appended region's live-ins are written by the guard-fail branch
+        // that is the region's sole predecessor, and that branch jumps straight
+        // into the region. Their entry in the merged input-arg list would
+        // otherwise date them to trace entry, making them live across every
+        // collecting call in the owner's body: each would take a Ref home and
+        // be reloaded there on every iteration, for a value nothing in the
+        // owner reads. Date them to the region instead, so they stay live
+        // across the region's own collect points and nowhere else.
+        for region in regions {
+            let defined_at = region.ops_start as i32 - 1;
+            for &id in &region.inputarg_ids {
+                if let Some(d) = def_pos.get_mut(id as usize) {
+                    *d = defined_at;
                 }
             }
         }
@@ -2151,9 +2227,9 @@ pub struct ModuleBuildInputs {
     /// already allocated GC-table base encoded by `gc_table_base`.
     pub ops: Vec<Op>,
     /// Loop-closing bridge regions emitted inside this loop's wasm function.
-    /// Their value ids are already in the owning trace's global space; retain
-    /// them verbatim so every analysis and the generated locals see the same
-    /// identities as the bridge metadata.
+    /// Each is retained in its own trace's numbering; `build_wasm_module`
+    /// rebases them onto a private id range before merging, because the owner
+    /// and every region number their values independently from zero.
     pub inlined_bridges: Vec<InlinedBridge>,
     pub constants: indexmap::IndexMap<u32, i64>,
     pub vtable_offset: Option<usize>,
@@ -2190,6 +2266,11 @@ pub struct InlinedBridge {
     /// Base of this already-interned region's GC table. Each region retains
     /// its own roots; codegen selects it by the LoadFromGcTable producer.
     pub gc_table_base: u32,
+    /// The constant pool registered for this region's own trace. A pool is
+    /// per-trace (`Backend::set_constants_pool` names the next compile), and
+    /// its value-id keys — the folded values that have no producing op — are
+    /// in that trace's numbering, so the merge rebases them with the region.
+    pub constants: indexmap::IndexMap<u32, i64>,
 }
 
 /// Whether the exact operation stream emitted for `inputs` has a local loop
@@ -2215,6 +2296,7 @@ impl Clone for InlinedBridge {
                 .collect(),
             ops: self.ops.clone(),
             gc_table_base: self.gc_table_base,
+            constants: self.constants.clone(),
         }
     }
 }
@@ -2249,6 +2331,109 @@ impl Clone for ModuleBuildInputs {
             ca: self.ca.clone(),
         }
     }
+}
+
+/// One past the highest value id `inputargs`/`ops` define or read. Mirrors the
+/// `max_var` half of `collect_guards_and_vars` without its guard collection,
+/// which stamps per-value counters onto guard descrs and must run once only.
+fn value_id_end(inputargs: &[InputArg], ops: &[Op]) -> u32 {
+    let mut end: u32 = 0;
+    let widen = |r: OpRef, end: &mut u32| {
+        if r != OpRef::NONE && !r.is_constant() && r.raw() + 1 > *end {
+            *end = r.raw() + 1;
+        }
+    };
+    for ia in inputargs {
+        if ia.index + 1 > end {
+            end = ia.index + 1;
+        }
+    }
+    for op in ops {
+        widen(op.pos.get(), &mut end);
+        for a in op.getarglist().iter() {
+            widen(a.to_opref(), &mut end);
+        }
+        if let Some(fa) = op.getfailargs() {
+            for a in fa.iter() {
+                widen(a.to_opref(), &mut end);
+            }
+        }
+    }
+    end
+}
+
+/// Move every value id a region defines or reads up by `offset`, returning the
+/// rebased region and the width of the id range it now occupies.
+///
+/// The owner trace and each region are separately recorded traces, so both
+/// number their values from zero and their ids overlap. A region is entered by
+/// `local.set`ting the id each of its input args carries
+/// (`emit_guard_inline_bridge_move`) and leaves through the loop header, so an
+/// id it shares with an owner value that is live across the back edge
+/// overwrites that value for every following iteration. Rebasing onto a
+/// disjoint range is what makes the merged stream's single local namespace
+/// sound.
+///
+/// `TempVar` ids live in a reserved high strip and constants in their own
+/// namespace; neither indexes a value local, so both pass through unchanged.
+fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridge, u32) {
+    use majit_ir::operand::Operand;
+
+    let shift = |r: OpRef| -> OpRef {
+        if r.is_none() || r.is_constant() || r.is_temp_var() {
+            r
+        } else {
+            r.with_raw(r.raw() + offset)
+        }
+    };
+
+    let width = value_id_end(&bridge.inputargs, &bridge.ops);
+    let inputargs: Vec<InputArg> = bridge
+        .inputargs
+        .iter()
+        .map(|ia| InputArg::from_type(ia.tp, ia.index + offset))
+        .collect();
+    // `Op::clone` gives the copy its own arg/failarg slots, but the operands in
+    // them keep pointing at the region's original producers, whose `pos` this
+    // must not touch — the region is retained for the next re-emission. So each
+    // moved reference is rebound to a synthetic producer carrying the new id.
+    let ops: Vec<Op> = bridge.ops.to_vec();
+    for op in &ops {
+        op.pos.set(shift(op.pos.get()));
+        for (i, arg) in op.getarglist().iter().enumerate() {
+            let before = arg.to_opref();
+            let after = shift(before);
+            if after != before {
+                op.setarg(i, Operand::bound_from_opref(after));
+            }
+        }
+        if let Some(mut fail_args) = op.getfailargs() {
+            let mut moved = false;
+            for slot in fail_args.iter_mut() {
+                let before = slot.to_opref();
+                let after = shift(before);
+                if after != before {
+                    *slot = Operand::bound_from_opref(after);
+                    moved = true;
+                }
+            }
+            if moved {
+                op.setfailargs(fail_args);
+            }
+        }
+    }
+
+    (
+        InlinedBridge {
+            source_fail_index: bridge.source_fail_index,
+            trace_id: bridge.trace_id,
+            inputargs,
+            ops,
+            gc_table_base: bridge.gc_table_base,
+            constants: bridge.constants.clone(),
+        },
+        width,
+    )
 }
 
 /// Build a wasm module from majit IR.
@@ -2289,12 +2474,37 @@ pub fn build_wasm_module(
     let mut merged_inputargs = Vec::new();
     let mut merged_ops = Vec::new();
     let mut gc_table_bases = HashMap::new();
+    let mut rebased_bridges: Vec<InlinedBridge> = Vec::new();
+    let mut rebased_constants = indexmap::IndexMap::new();
     let (analysis_inputargs, analysis_ops): (&[InputArg], &[Op]) = if inlined_bridges.is_empty() {
         (inputargs, ops)
     } else {
         merged_inputargs.extend(inputargs.iter().map(InputArg::fresh_value_copy));
         merged_ops.extend(ops.iter().cloned());
+        // The merged stream has one local namespace, so every region has to be
+        // moved off the ids the owner and the earlier regions already use.
+        rebased_constants = constants.clone();
+        let mut next_value_id = value_id_end(inputargs, ops);
         for bridge in inlined_bridges {
+            let (bridge, width) = rebase_region_value_ids(bridge, next_value_id);
+            // The pool is keyed by value position for a folded value with no
+            // producing op, so rebasing the region's ids moved its reads off
+            // its own entries. Replay that window at the offset, and drop a
+            // key another trace left inside it, or `unbound_pool_const_seeds`
+            // either declines a resolvable value or seeds an unrelated one's
+            // bits. Keys outside the window are left alone: rewriting them
+            // would overwrite the entries the owner's own operations read.
+            for id in 0..width {
+                match bridge.constants.get(&id) {
+                    Some(&bits) => {
+                        rebased_constants.insert(id + next_value_id, bits);
+                    }
+                    None => {
+                        rebased_constants.shift_remove(&(id + next_value_id));
+                    }
+                }
+            }
+            next_value_id += width;
             merged_inputargs.extend(bridge.inputargs.iter().map(InputArg::fresh_value_copy));
             for op in &bridge.ops {
                 if op.opcode == OpCode::LoadFromGcTable {
@@ -2302,8 +2512,22 @@ pub fn build_wasm_module(
                 }
             }
             merged_ops.extend(bridge.ops.iter().cloned());
+            rebased_bridges.push(bridge);
         }
         (&merged_inputargs, &merged_ops)
+    };
+    // Guard-entry moves and region emission must name the rebased ids, not the
+    // ids the retained regions still carry.
+    let emitted_bridges: &[InlinedBridge] = if inlined_bridges.is_empty() {
+        inlined_bridges
+    } else {
+        &rebased_bridges
+    };
+    let region_spans = InlinedRegionSpan::collect(analysis_ops.len(), emitted_bridges);
+    let constants = if inlined_bridges.is_empty() {
+        constants
+    } else {
+        &rebased_constants
     };
     let (mut guards, num_vars) = collect_guards_and_vars(analysis_inputargs, analysis_ops);
 
@@ -2383,7 +2607,8 @@ pub fn build_wasm_module(
     // Ref homes, and the always-present tail call area; a chained bridge must
     // fit the source token's frozen value-slot count before it can share that
     // frame.
-    let label_resume = LabelResumeData::collect(&analysis_inputargs, &analysis_ops);
+    let label_resume =
+        LabelResumeData::collect_with_regions(&analysis_inputargs, &analysis_ops, &region_spans);
     let max_value_slots =
         normal_frame_value_slots(&analysis_inputargs, &analysis_ops) + label_resume.scalar_slots;
     if max_value_slots > frame.value_slots {
@@ -2422,6 +2647,7 @@ pub fn build_wasm_module(
         &analysis_ops,
         ca.emit_ca,
         &label_resume.captured_refs,
+        &region_spans,
     );
     let num_ref_homes = ref_homes.len();
     let shortage = if num_ref_homes > frame.ordinary_home_slots() {
@@ -2716,7 +2942,7 @@ pub fn build_wasm_module(
         inputargs,
         &analysis_inputargs,
         &analysis_ops,
-        inlined_bridges,
+        emitted_bridges,
         constants,
         num_vars,
         &value_types,
@@ -2936,8 +3162,11 @@ fn build_function(
         )
     })?;
 
-    // Def / last-use positions for the post-collection Ref reload filter.
-    let liveness = HomeLiveness::collect(inputargs, ops);
+    // Def / last-use positions for the post-collection Ref reload filter. The
+    // spans must match the ones `RefHomes` was built from, or a home would be
+    // reserved and never reloaded (or the reverse).
+    let region_spans = InlinedRegionSpan::collect(ops.len(), inlined_bridges);
+    let liveness = HomeLiveness::collect_with_regions(inputargs, ops, &region_spans);
 
     // `LOAD_FROM_GC_TABLE` is the backend form of a ConstPtr.  Native PyPy
     // keeps such loop-invariant references in their allocated location across
@@ -3039,8 +3268,13 @@ fn build_function(
     // immediately and nothing between the two allocates, so no collection can
     // read the slot while it is stale. Homes no input fills keep their clear
     // because store-on-def writes them only later.
+    // The loop below fills `entry_inputargs`, not every arg of the merged
+    // stream: an appended region's live-ins are stored by the guard-fail branch
+    // that reaches the region, which is nowhere near this entry. Marking those
+    // homes filled here would skip their clear and leave the collector reading
+    // an uninitialised slot.
     let mut input_filled_home = vec![false; ref_homes.len()];
-    for ia in inputargs {
+    for ia in entry_inputargs {
         if let Some(h) = ref_homes.home_id(ia.index) {
             input_filled_home[h as usize] = true;
         }

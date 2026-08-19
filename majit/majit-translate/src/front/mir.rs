@@ -181,6 +181,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    link_transparent_scalar_types(llbcs);
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `module_path`, and `name`.  Without `self_ty_root`, two distinct
@@ -701,6 +702,11 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
     llbc: &Llbc,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    // The linking pass belongs to a whole translation input, so the
+    // multi-artefact entry point runs it once over all of them and the
+    // per-artefact builder below does not repeat it. A caller handing over a
+    // single artefact has named its whole input here, so link it here.
+    link_transparent_scalar_types(std::slice::from_ref(llbc));
     build_semantic_program_from_llbc_with_static_addrs_filtered(llbc, static_addrs, None, None)
 }
 
@@ -1427,6 +1433,9 @@ fn derive_program_metadata(
                 // bare-leaf fallback) resolve either spelling.
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
                 let is_rbigint = name == "rbigint::RBigInt" || name.ends_with("::rbigint::RBigInt");
+                let is_tuple_object = leaf == "W_TupleObject"
+                    && (name == "tupleobject::W_TupleObject"
+                        || name.ends_with("::tupleobject::W_TupleObject"));
                 let rows: Vec<(String, String)> = fields
                     .iter()
                     .enumerate()
@@ -1443,8 +1452,18 @@ fn derive_program_metadata(
                         // field offset/size to the backend.
                         let field_ty = if is_rbigint && fname == "_digits" {
                             "[i64]".to_string()
+                        } else if is_tuple_object && fname == "wrappeditems" {
+                            // tupleobject.py:376-390: wrappeditems is the
+                            // immutable `list` / translated
+                            // `GcArray(OBJECTPTR)`. Rust's `*mut ItemsBlock`
+                            // is only its physical storage spelling; exposing
+                            // that wrapper makes getitem dispatch on a
+                            // classdef-less instance. Preserve the upstream
+                            // field shape while Charon's ExactLayout continues
+                            // to provide the real pointer-sized offset.
+                            "[*mut PyObject]".to_string()
                         } else {
-                            tyref_to_ast_string(&f.ty, llbc)
+                            tyref_to_field_layout_string(&f.ty, llbc)
                         };
                         (fname, field_ty)
                     })
@@ -1693,7 +1712,7 @@ fn derive_program_metadata(
                                 ("u32".to_string(), ValueType::Int)
                             } else {
                                 (
-                                    tyref_to_ast_string(&f.ty, llbc),
+                                    tyref_to_field_layout_string(&f.ty, llbc),
                                     tyref_to_attr_value_type(&f.ty, llbc),
                                 )
                             };
@@ -2148,6 +2167,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
             || !lo.option_try_sites.is_empty()
+            || !lo.slice_index_range_sites.is_empty()
             || !lo.slice_index_rangeto_sites.is_empty()
         {
             // The exception-link transforms run on a simplified graph,
@@ -2161,6 +2181,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             simplify_lowered_graph(&mut lo.graph, struct_field_attrs, false);
         }
         let mut tail_forwarded_returns = 0usize;
+        if !lo.slice_index_range_sites.is_empty() {
+            crate::front::slice_index::rewire_slice_index_range_sites(
+                &mut lo.graph,
+                &lo.slice_index_range_sites,
+            );
+        }
         if !lo.slice_index_rangeto_sites.is_empty() {
             crate::front::slice_index::rewire_slice_index_rangeto_sites(
                 &mut lo.graph,
@@ -2953,6 +2979,10 @@ struct Lowering<'a> {
     /// recognizer. The end's unsigned coloring is captured from MIR here,
     /// before the operand can become a block inputarg.
     slice_index_rangeto_sites: Vec<crate::front::slice_index::SliceIndexRangeToSite>,
+    /// Full `Range { start, end }` aggregates retained for the orthodox
+    /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
+    /// `range_iter` candidate; both passes are consumer-gated.
+    slice_index_range_sites: Vec<crate::front::slice_index::SliceIndexRangeSite>,
     /// `RangeInclusive::contains(&self, &x)` call sites paired with the
     /// `new` sites above by the `front::range_contains` post-pass (see
     /// [`crate::front::range_contains::RangeContainsSite`]).
@@ -3186,6 +3216,7 @@ impl<'a> Lowering<'a> {
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             slice_index_rangeto_sites: Vec::new(),
+            slice_index_range_sites: Vec::new(),
             range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
@@ -4825,6 +4856,22 @@ impl<'a> Lowering<'a> {
                         }
                     }
                 }
+                // A transparent one-field aggregate is represented by its
+                // only operand. Constructing a separate instance would split
+                // one machine word into incompatible scalar and reference
+                // annotations at later merges.
+                if tyref_transparent_inner_value_type(dest_ty, self.llbc).is_some()
+                    && operands.len() == 1
+                {
+                    let value = self.resolve_operand(
+                        mir_bb,
+                        operands
+                            .into_iter()
+                            .next()
+                            .expect("one transparent aggregate operand"),
+                    )?;
+                    return Ok((None, value));
+                }
                 // Resolve operand Variables up front; they flow into the
                 // synthesised FieldWrite chain rather than the ctor's
                 // arg list.
@@ -4924,6 +4971,13 @@ impl<'a> Lowering<'a> {
                             start: arg_vars[0].clone(),
                             end: arg_vars[1].clone(),
                         });
+                    self.slice_index_range_sites.push(
+                        crate::front::slice_index::SliceIndexRangeSite {
+                            range_result: res.clone(),
+                            start: arg_vars[0].clone(),
+                            end: arg_vars[1].clone(),
+                        },
+                    );
                 }
                 if owner_path.as_slice() == ["core", "ops", "range"]
                     && ctor_name == "RangeTo"
@@ -5412,6 +5466,16 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
                         self.resolve_adt_field(field_payload)
                 {
+                    // Projecting the sole field of a transparent wrapper is
+                    // the identity on its low-level value. The wrapper and
+                    // field share one register bank and one machine word, so
+                    // emitting a FieldRead would try to dereference that word
+                    // as an aggregate base.
+                    if field_name == "__pos_0"
+                        && tyref_transparent_inner_value_type(&inner.ty, self.llbc).is_some()
+                    {
+                        return self.resolve_place(mir_bb, *inner);
+                    }
                     // A one-word niche `Option` is represented by its payload
                     // pointer, so the
                     // `Some` payload IS the base pointer — reading `Some.__pos_0`
@@ -7235,6 +7299,9 @@ impl<'a> Lowering<'a> {
                     && (self.is_workspace_index_call(&reg)
                         || (self.is_vec_index_call(&reg)
                             && (!is_vec_index_mut_regular(&reg, self.llbc)
+                                || add_dest_used_only_as_single_deref(self.body, dest_local)))
+                        || (self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                            && (!self.is_slice_scalar_index_mut_call(&reg)
                                 || add_dest_used_only_as_single_deref(self.body, dest_local))))
                 {
                     let res = self
@@ -7920,9 +7987,35 @@ impl<'a> Lowering<'a> {
                 // allocation, not an alias of the source.)
                 let (segments, method_hint) = if args.len() == 1 && is_slice_to_vec(&segments) {
                     (vec!["list".to_string()], None)
+                } else if args.len() == 2
+                    && crate::front::str_find::is_rpython_str_slice_prefix(&segments)
+                {
+                    // PyPy's `name[:dotindex]` reaches ordinary
+                    // `rtype_getslice`.  Rust's core string index body is
+                    // opaque to Charon, so route the exact interpreter
+                    // compatibility helper through the existing marker that
+                    // becomes `getslice(s, 0, stop)` after annotation.
+                    (vec!["__getslice_rangeto".to_string()], None)
                 } else {
                     (segments, method_hint)
                 };
+                // PyPy's `__import__` fast path uses the signed
+                // `str.find` operation directly.  Replace the
+                // interpreter's native compatibility helper with that same
+                // existing RPython method lowering.
+                if crate::front::str_find::is_rpython_str_find_char(&segments) {
+                    let index = crate::front::str_find::emit_rpython_str_find_char(
+                        &mut self.graph,
+                        bb_id,
+                        &args,
+                    )
+                    .map_err(LowerError::Unsupported)?;
+                    self.local_var[dest_local] = Some(index);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `vec![e0, …, eN]` lowers to
                 // `box_assume_init_into_vec_unsafe(box [e0, …, eN])`, whose
                 // `box_assume_init` primitive is unregistered, so the legacy
@@ -8284,7 +8377,13 @@ impl<'a> Lowering<'a> {
                     // shape as the `elidable_promote` wrapper's
                     // `hint_promote_or_string`.
                     let promote_marker = self.jit_promote_marker(&reg);
-                    let target = if args.len() == 1
+                    let target = if let Some((trait_root, method_name)) =
+                        abstract_trait_call_target(&reg, self.llbc)
+                    {
+                        CallTarget::indirect(trait_root, method_name)
+                    } else if let Some(path) = transparent_inherent_method_path(&reg, self.llbc) {
+                        CallTarget::FunctionPath { segments: path }
+                    } else if args.len() == 1
                         && let Some(marker) = promote_marker
                     {
                         CallTarget::FunctionPath {
@@ -9797,6 +9896,35 @@ impl<'a> Lowering<'a> {
     /// same gate is shared with the deferred-write liveness pre-pass.
     fn is_vec_index_call(&self, reg: &RegularCall) -> bool {
         is_vec_index_regular(reg, self.llbc)
+    }
+
+    /// `core::slice::index::SliceIndex<usize>::index(_mut)` — scalar slice
+    /// indexing.  RPython represents the same operation directly as
+    /// `getitem` / `setitem`; the Rust trait shim is opaque in Charon and must
+    /// not survive as a residual call.  Range implementations share the same
+    /// name, so accept only the literal `usize` second argument; RangeFrom /
+    /// RangeTo continue through `front::slice_index`'s bounded getslice
+    /// rewrites.
+    fn is_slice_scalar_index_call(&self, reg: &RegularCall, index_ty: Option<&TyRef>) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let is_index = self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
+            )
+        });
+        is_index && index_ty.and_then(|ty| self.tyref_literal_uint_atom(ty)) == Some("Usize")
+    }
+
+    fn is_slice_scalar_index_mut_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::index::<Impl>::index_mut")
     }
 
     /// `<[T]>::swap(s, a, b)` (`core::slice::<Impl>::swap`) — an
@@ -12693,7 +12821,8 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Lower an infallible numeric widening `<i64 as From<u32>>::from(x)`
+    /// Lower an infallible numeric widening `<i64 as From<u32>>::from(x)` or
+    /// `<usize as From<bool>>::from(flag)`
     /// (`core::convert::num::<Impl>::from`, Opaque in the LLBC) to an
     /// identity bind on the destination local.  `From` is implemented in
     /// core only for value-preserving conversions, and a
@@ -12740,13 +12869,17 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        // Only smaller-than-word unsigned sources widen as a
-        // value-preserving identity in the word carrier (the same gate
-        // `try_lower_usize_try_from` uses).
-        if !matches!(
+        // Smaller-than-word unsigned sources widen as a value-preserving
+        // identity in the word carrier (the same gate
+        // `try_lower_usize_try_from` uses). Bool is the RPython BoolRepr
+        // sibling: converting it to Unsigned emits `cast_bool_to_uint`
+        // through the ordinary `r_uint` builtin (`rbool.py:63-74`).
+        let src_is_bool = tyref_to_value_type(src, self.llbc) == ValueType::Bool;
+        let src_is_small_uint = matches!(
             self.tyref_literal_uint_atom(src),
             Some("U8" | "U16" | "U32")
-        ) {
+        );
+        if !src_is_small_uint && !src_is_bool {
             return Ok(false);
         }
         // Destination must be a word-sized integer carrier.  A signed
@@ -12768,7 +12901,25 @@ impl<'a> Lowering<'a> {
         }
         let arg = arg.clone();
         let bb_id = self.block_id[mir_bb];
-        if dest_signed_word {
+        if src_is_bool && dest_unsigned_word {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    },
+                    args: vec![arg],
+                    result_ty: ValueType::Unsigned,
+                },
+            });
+            self.local_var[dest_local] = Some(res);
+        } else if dest_signed_word {
             let res = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -15456,6 +15607,13 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
         return inner;
     }
+    // A transparent one-field struct has the same low-level value shape as
+    // its field. Charon records the representation in `TypeDecl.layout`, so
+    // preserve the field's register bank instead of treating the wrapper as
+    // a GC reference.
+    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc) {
+        return inner;
+    }
     // `OpArg` and compiler-core's `newtype_oparg!` wrappers are transparent
     // `u32` bytecode operands.  Their dependency declarations are opaque in
     // interpreter LLBC, so model the exact upstream family as unsigned
@@ -15778,9 +15936,10 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
 /// picks `SomeInteger { unsigned: true }`, matching the per-field shells
 /// the syn classifier produced for `u8`..`usize`.  `char` and every
 /// signed width fold to `Int`; `bool`/`float` keep their classes; every
-/// non-primitive shape (named struct/enum, reference, raw pointer, tuple,
-/// slice, array, `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose
-/// someshell ignores the payload.
+/// non-scalar shape (named struct/enum, reference, raw pointer, tuple, slice,
+/// array, `Box`/`Rc`/`Arc` wrapper) folds to `Ref(None)` whose someshell ignores
+/// the payload. A `repr(transparent)` scalar wrapper keeps its inner register
+/// class, as it does at ordinary value sites.
 fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     let value = match ty {
         TyRef::Inline { value: (_, v) } => v,
@@ -15836,6 +15995,9 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // the per-field someshell matches the inner scalar.  Checked after
     // the cheap `Literal` fast-path so primitive fields never pay it.
     if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+        return inner;
+    }
+    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc) {
         return inner;
     }
     // A fieldless (C-like) enum field is represented by-value as its
@@ -16049,6 +16211,77 @@ fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
         l if l.starts_with("AtomicI") => Some(ValueType::Int),
         l if l.starts_with("AtomicU") => Some(ValueType::Unsigned),
         _ => None,
+    }
+}
+
+fn tyref_transparent_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    // Peel the reference the way the atomic sibling does. A borrow of the
+    // wrapper has to answer with the same bank as the wrapper itself:
+    // `Rvalue::Ref` aliases the referent's Variable rather than introducing a
+    // new one, so a wrapper that types as its inner scalar by value and as a
+    // GC reference through a borrow puts one machine word in two register
+    // banks — the caller passes it in the int list while the callee's
+    // parameter is declared `r`. `strip_ty_wrappers` leaves `RawPtr` alone,
+    // so a raw pointer to the wrapper keeps pointer semantics.
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let id = adt_node_def_id(node)?;
+    let decl = llbc.type_by_id(id)?;
+    if !decl.is_repr_transparent() {
+        return None;
+    }
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) => {
+            let [field] = fields.as_slice() else {
+                return None;
+            };
+            Some(tyref_to_value_type(&field.ty, llbc))
+        }
+        TypeDeclKind::Opaque => llbc
+            .transparent_scalar_kind(&decl.item_meta.name_path())
+            .map(|kind| match kind {
+                majit_charon_reader::TransparentScalarKind::Signed => ValueType::Int,
+                majit_charon_reader::TransparentScalarKind::Unsigned => ValueType::Unsigned,
+                majit_charon_reader::TransparentScalarKind::Bool => ValueType::Bool,
+                majit_charon_reader::TransparentScalarKind::Float => ValueType::Float,
+            }),
+        _ => None,
+    }
+}
+
+/// Link complete transparent-scalar declarations to opaque dependency views.
+///
+/// Charon keeps `repr(transparent)` in an external declaration's layout but
+/// omits its private field type. The defining crate's LLBC contains that field;
+/// both declarations share the same qualified Rust path. RPython translates a
+/// linked type universe, so collect that one register-bank fact before lowering
+/// any body and publish it to every artefact in the same translation input.
+fn link_transparent_scalar_types(llbcs: &[Llbc]) {
+    let mut discovered = Vec::new();
+    for llbc in llbcs {
+        for decl in llbc.iter_type_decls() {
+            if !decl.is_repr_transparent() {
+                continue;
+            }
+            let TypeDeclKind::Struct(fields) = &decl.kind else {
+                continue;
+            };
+            let [field] = fields.as_slice() else {
+                continue;
+            };
+            let kind = match tyref_to_value_type(&field.ty, llbc) {
+                ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
+                ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
+                ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
+                ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
+                _ => continue,
+            };
+            discovered.push((decl.item_meta.name_path(), kind));
+        }
+    }
+    discovered.sort_by(|a, b| a.0.cmp(&b.0));
+    discovered.dedup();
+    for llbc in llbcs {
+        llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
     }
 }
 
@@ -16802,6 +17035,55 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
             TyRef::Dedup { id } => format!("??unresolved_dedup#{id}"),
             _ => "??no_body".to_string(),
         },
+    }
+}
+
+fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return tyref_to_ast_string(ty, llbc);
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return tyref_to_ast_string(ty, llbc);
+    };
+    let Some(decl) = llbc.type_by_id(id) else {
+        return tyref_to_ast_string(ty, llbc);
+    };
+    if !decl.is_repr_transparent() {
+        return tyref_to_ast_string(ty, llbc);
+    }
+    if let TypeDeclKind::Struct(fields) = &decl.kind
+        && let [field] = fields.as_slice()
+        && !matches!(
+            tyref_to_value_type(&field.ty, llbc),
+            ValueType::Ref(_)
+                | ValueType::Str
+                | ValueType::Void
+                | ValueType::State
+                | ValueType::Unknown
+        )
+    {
+        return tyref_to_ast_string(&field.ty, llbc);
+    }
+    let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path()) else {
+        return tyref_to_ast_string(ty, llbc);
+    };
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let size = decl
+        .layout_for_target(&target)
+        .and_then(|layout| layout.size)
+        .unwrap_or(8);
+    match (kind, size) {
+        (majit_charon_reader::TransparentScalarKind::Signed, 1) => "i8".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, 2) => "i16".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, 4) => "i32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Signed, _) => "i64".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 1) => "u8".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 2) => "u16".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, 4) => "u32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Unsigned, _) => "u64".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Bool, _) => "bool".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Float, 4) => "f32".to_string(),
+        (majit_charon_reader::TransparentScalarKind::Float, _) => "f64".to_string(),
     }
 }
 
@@ -17700,6 +17982,95 @@ fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
         _ => return None,
     };
     Some((parent, leaf))
+}
+
+/// Whether the call's trait reference leaves its implementation to be
+/// selected at run time.
+///
+/// Charon records where the reference came from in its `kind`: `Dyn` for a
+/// trait object, whose vtable is the only thing that names the target, as
+/// against `Clause` (a bound on the enclosing generic, fixed by whoever
+/// instantiated it), `TraitImpl` (an impl named outright) and `BuiltinOrAuto`.
+/// Only the first is a dispatch; each of the others stands for exactly one
+/// implementation, and a family of one has nothing to select.
+///
+/// `rpbc.py:212-217` splits the same two cases on whether the row's function
+/// came out constant — `if isinstance(vlist[0], Constant): v =
+/// hop.genop('direct_call', vlist, ...)`, and only the `else` arm appends the
+/// row of graphs and emits `indirect_call`.
+///
+/// The reference arrives either inline or hash-consed: Charon writes
+/// `HashConsedValue: [id, body]` at the first occurrence and `Deduplicated:
+/// id` afterwards. [`traitref_unwrap`] resolves both, and resolves them in a
+/// loop — either spelling can nest inside the other, so peeling one of each
+/// in a fixed order would leave a wrapper standing and make the `kind` read
+/// miss. Missing it declines the call, which is safe but would make the
+/// classification depend on how Charon happened to serialize the reference.
+fn trait_ref_is_dyn(trait_ref: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(resolved) = traitref_unwrap(trait_ref, llbc, 0) else {
+        return false;
+    };
+    resolved.get("kind").and_then(serde_json::Value::as_str) == Some("Dyn")
+}
+
+/// Resolve a call on a trait object as dynamic dispatch.
+///
+/// Charon keeps a call such as `self.head()` inside a trait default method as
+/// `CallKind::Trait` pointing at the declaration of `head`. When the receiver
+/// is a trait object and that declaration has no body, the direct
+/// `[Trait, method]` path has nothing to execute; the receiver's
+/// implementation family must select the target.
+///
+/// A reference the caller's instantiation already resolved is excluded, even
+/// though its declaration is equally bodyless: the implementation is unique,
+/// so the direct path names the impl's own graph and the call stays inside
+/// the inline closure. See [`trait_ref_is_dyn`].
+///
+/// A bodyless declaration that takes no receiver is excluded too. `rpbc.py`
+/// dispatches a methods-PBC on the instance the call is bound to, and the
+/// lowering below reads that instance off the call's first argument; an
+/// associated function has none, and the type it would be selected by is
+/// fixed at the call site rather than carried by a value. Classifying one
+/// here hands the lowering an argument list whose first entry is either
+/// absent or an ordinary parameter standing in for a receiver.
+fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String, String)> {
+    let CallKind::Trait(value) = &reg.kind else {
+        return None;
+    };
+    let payload = value.as_array()?;
+    if !trait_ref_is_dyn(payload.first()?, llbc) {
+        return None;
+    }
+    let method_id = payload.get(2)?.as_u64()?;
+    let declaration = llbc.fn_by_id(method_id)?;
+    if declaration.unstructured().is_some() {
+        return None;
+    }
+    declaration.signature.inputs.first()?;
+    trait_method_owner(declaration)
+}
+
+/// Return the static graph path for an inherent method on a transparent type.
+///
+/// Its receiver is a scalar in the low-level model, so routing through
+/// `CallTarget::Method` would perform an attribute lookup on an integer. The
+/// Rust call is statically resolved already; use the registered impl graph
+/// directly and keep the scalar receiver as its first argument.
+fn transparent_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Vec<String>> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let declaration = llbc.fn_by_id(*id)?;
+    let (owner, method) = impl_method_owner_for_fundecl(llbc, declaration)?;
+    let receiver = declaration.signature.inputs.first()?;
+    let node = strip_ty_wrappers(tyref_node(receiver, llbc)?, llbc)?;
+    let owner_id = adt_node_def_id(node)?;
+    if !llbc.type_by_id(owner_id)?.is_repr_transparent() {
+        return None;
+    }
+    let mut path = owner.split("::").map(str::to_string).collect::<Vec<_>>();
+    path.push(method);
+    Some(path)
 }
 
 /// Compact identifier for a `CallKind::Trait` payload — the triple
@@ -23136,10 +23507,10 @@ mod tests {
     ///
     /// The literal is READ from the artefact this fold consumes, not
     /// computed: `pyre-interpreter.ullbc` carries exactly one layout
-    /// entry for `Function`, `"size":176`, `"align":8`, `"repr_algo":"C"`,
-    /// with 21 `field_offsets` running `[0,16,24,…,168]`.  A source census
-    /// of `struct Function` reads the same 21 fields, and `168 + 8` is the
-    /// same 176.  Because there is a single entry, `select_target_layout`
+    /// entry for `Function`, `"size":184`, `"align":8`, `"repr_algo":"C"`,
+    /// with 22 `field_offsets` running `[0,16,24,…,176]`.  A source census
+    /// of `struct Function` reads the same 22 fields, and `176 + 8` is the
+    /// same 184.  Because there is a single entry, `select_target_layout`
     /// resolves it through its sole-entry fallback even when `TARGET` is
     /// unset, so a declining fold cannot be the reason this reds — the
     /// second assertion below is what catches that case.
@@ -23168,8 +23539,8 @@ mod tests {
 
         // The `size_of::<Function>()` const read folded to its byte size.
         assert!(
-            ops.iter().any(|k| matches!(k, OpKind::ConstInt(176))),
-            "expected a ConstInt(176) for the folded FUNCTION_OBJECT_SIZE"
+            ops.iter().any(|k| matches!(k, OpKind::ConstInt(184))),
+            "expected a ConstInt(184) for the folded FUNCTION_OBJECT_SIZE"
         );
         // No residual accessor call to the const remains.
         let residual = ops.iter().any(|k| {
@@ -23613,6 +23984,348 @@ mod tests {
             ]
         );
         assert_ne!(ids["Array<i64;1>"], ids["Array<bool;2>"]);
+    }
+
+    #[test]
+    fn bodyless_trait_method_on_a_trait_object_uses_indirect_dispatch() {
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Storage", 0]}, {"Ident": ["head", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 10}
+                }},
+                "source_text": "fn head(&self);",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                // The `&self` the source text declares. Its shape does not
+                // matter to the classifier, only that the receiver is there.
+                "inputs": [{"Adt": {"id": "Tuple", "generics": {"types": []}}}],
+                "output": {"Tuple": []}
+            },
+            "body": "Missing"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{"kind": "Dyn"}, 0, 1]},
+            "generics": {}
+        }))
+        .expect("fixture trait call parses");
+
+        assert_eq!(
+            super::abstract_trait_call_target(&call, &llbc),
+            Some(("Storage".to_string(), "head".to_string()))
+        );
+    }
+
+    #[test]
+    fn bodyless_trait_method_behind_a_clause_is_not_indirect() {
+        // `fn body<H: Storage>(h: &mut H) { h.head() }`: the declaration of
+        // `head` is as bodyless as the trait-object case above, but the
+        // reference is the bound on `H`, which whoever instantiated `body`
+        // has already resolved. The implementation is unique, so the direct
+        // `[Storage, head]` path names the impl's graph and the callee stays
+        // inside the inline closure instead of becoming a residual call.
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Storage", 0]}, {"Ident": ["head", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 10}
+                }},
+                "source_text": "fn head(&self);",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"Adt": {"id": "Tuple", "generics": {"types": []}}}],
+                "output": {"Tuple": []}
+            },
+            "body": "Missing"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 1]}}}, 0, 1]},
+            "generics": {}
+        }))
+        .expect("fixture trait call parses");
+
+        assert_eq!(super::abstract_trait_call_target(&call, &llbc), None);
+    }
+
+    #[test]
+    fn a_hash_consed_trait_ref_wrapping_a_deduplicated_one_still_reads_dyn() {
+        // Charon's two indirections nest: the reference arrives as
+        // `HashConsedValue: [id, {Deduplicated: n}]`. Peeling one of each in a
+        // fixed order leaves the inner `Deduplicated` standing, the `kind`
+        // read misses, and a genuine trait-object call is declined — a
+        // classification that would then depend on how the reference happened
+        // to be serialized. The receiver type below registers body 9 so the
+        // inner hop has somewhere to land.
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Storage", 0]}, {"Ident": ["head", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 10}
+                }},
+                "source_text": "fn head(&self);",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"HashConsedValue": [9, {"kind": "Dyn"}]}],
+                "output": {"Tuple": []}
+            },
+            "body": "Missing"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            "kind": {"Trait": [{"HashConsedValue": [7, {"Deduplicated": 9}]}, 0, 1]},
+            "generics": {}
+        }))
+        .expect("fixture trait call parses");
+
+        assert_eq!(
+            super::abstract_trait_call_target(&call, &llbc),
+            Some(("Storage".to_string(), "head".to_string()))
+        );
+    }
+
+    #[test]
+    fn receiverless_trait_associated_function_is_not_indirect() {
+        // `fn type_id() -> u64` on a trait: the implementation is chosen by
+        // the type argument at the call site, and there is no instance the
+        // dispatch could read it from. `lower_indirect_calls` would take the
+        // call's first argument for a receiver, so this has to stay direct.
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["GcType", 0]}, {"Ident": ["type_id", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 10}
+                }},
+                "source_text": "fn type_id() -> u64;",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Literal": {"UInt": "U64"}}
+            },
+            "body": "Missing"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let call = serde_json::from_value::<super::RegularCall>(serde_json::json!({
+            // `Dyn` so the receiver guard is what rejects this, not the
+            // reference kind.
+            "kind": {"Trait": [{"kind": "Dyn"}, 0, 1]},
+            "generics": {}
+        }))
+        .expect("fixture trait call parses");
+
+        assert_eq!(super::abstract_trait_call_target(&call, &llbc), None);
+    }
+
+    #[test]
+    fn transparent_scalar_struct_uses_inner_register_bank() {
+        let type_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Word", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 16}
+                }},
+                "source_text": "struct Word(i64);",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "kind": {"Struct": [{
+                "name": null,
+                "ty": {"HashConsedValue": [7, {"Literal": {"Int": "I64"}}]},
+                "attr_info": null
+            }]},
+            "layout": [{
+                "key": "x86_64-unknown-linux-gnu",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"repr_algo": "Rust", "transparent": true}
+                }
+            }]
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, type_decl],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let word_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "HashConsedValue": [8, {
+                "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
+            }]
+        }))
+        .expect("fixture TyRef parses");
+
+        assert_eq!(
+            super::tyref_to_value_type(&word_ty, &llbc),
+            crate::model::ValueType::Int
+        );
+    }
+
+    #[test]
+    fn linked_transparent_definition_types_opaque_dependency_view() {
+        let type_decl = |kind: serde_json::Value| {
+            serde_json::json!({
+                "def_id": 1,
+                "item_meta": {
+                    "name": [{"Ident": ["shared", 0]}, {"Ident": ["Word", 0]}],
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 16}
+                    }},
+                    "source_text": "struct Word(i64);",
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "kind": kind,
+                "layout": [{
+                    "key": "x86_64-unknown-linux-gnu",
+                    "value": {
+                        "size": 8,
+                        "align": 8,
+                        "variant_layouts": [{"field_offsets": [0]}],
+                        "repr": {"repr_algo": "Rust", "transparent": true}
+                    }
+                }]
+            })
+        };
+        let artifact = |kind| {
+            serde_json::json!({
+                "charon_version": "0.1.201",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "fixture",
+                    "type_decls": [null, type_decl(kind)],
+                    "fun_decls": [],
+                    "global_decls": [],
+                    "trait_decls": [],
+                    "trait_impls": []
+                }
+            })
+        };
+        let defining = Llbc::from_slice(
+            artifact(serde_json::json!({"Struct": [{
+                "name": null,
+                "ty": {"HashConsedValue": [7, {"Literal": {"Int": "I64"}}]},
+                "attr_info": null
+            }]}))
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let opaque =
+            Llbc::from_slice(artifact(serde_json::json!("Opaque")).to_string().as_bytes()).unwrap();
+        let llbcs = vec![defining, opaque];
+        super::link_transparent_scalar_types(&llbcs);
+        super::build_semantic_program_from_llbc_with_static_addrs_filtered(
+            &llbcs[1],
+            crate::HostStaticAddrs::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let linked_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "HashConsedValue": [8, {
+                "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            super::tyref_to_value_type(&linked_ty, &llbcs[1]),
+            crate::model::ValueType::Int
+        );
+        assert_eq!(
+            super::tyref_to_attr_value_type(&linked_ty, &llbcs[1]),
+            crate::model::ValueType::Int
+        );
+        assert_eq!(
+            super::tyref_to_field_layout_string(&linked_ty, &llbcs[1]),
+            "i64"
+        );
     }
 
     /// The `Vec` index fold must accept a `usize` index.
@@ -25208,13 +25921,13 @@ mod tests {
         );
     }
 
-    /// The real site is in bounds: its `args: &[PyObjectRef]` is shared and
-    /// therefore cannot change length between the two `ArrayLen` reads. The
-    /// frontend has no shared-reference/immutability notion with which to
-    /// prove that fact, however, so the sound static-length fold declines.
+    /// PyPy carries `call_function` arguments as one dynamic RPython list.
+    /// The Rust interpreter must not reintroduce a fixed-array RangeTo index
+    /// shortcut into this core dispatcher: core's array index body is opaque
+    /// to Charon and blocks the dispatcher from two-phase translation.
     #[test]
     #[ignore]
-    fn call_function_impl_result_declines_residual_array_index() {
+    fn call_function_impl_result_has_no_residual_array_index() {
         use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -25242,13 +25955,111 @@ mod tests {
         };
         assert_eq!(
             calls_path(&["core", "array", "<Impl>", "index"]),
-            1,
-            "unproved RangeTo array index remains residual"
+            0,
+            "PyPy-shaped dynamic arguments must not leave a fixed-array index"
         );
         assert_eq!(
             calls_path(&["__getslice_rangeto"]),
             0,
             "no RangeTo getslice call is planted without an immutability proof"
+        );
+    }
+
+    /// PyPy's `_match_keywords` indexes its small signature and argument
+    /// lists with ordinary `getitem`.  The Rust `SliceIndex<usize>` shim must
+    /// lower to the same ArrayRead shape instead of remaining an opaque core
+    /// call that prevents the whole builtin-call chain from being annotated.
+    #[test]
+    #[ignore]
+    fn bind_kwargs_scalar_slice_indexes_lower_to_array_reads() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "bind_kwargs_to_signature")
+            .expect("lower bind_kwargs_to_signature");
+
+        let residual_scalar_indexes: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[
+                        "core".to_string(),
+                        "slice".to_string(),
+                        "index".to_string(),
+                        "<Impl>".to_string(),
+                        "index".to_string(),
+                    ]
+                )
+            })
+            .collect();
+        assert_eq!(
+            residual_scalar_indexes.len(),
+            0,
+            "scalar SliceIndex<usize> calls must become getitem operations"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| { matches!(op.kind, OpKind::ArrayRead { .. }) }),
+            "keyword matching should contain the lowered signature getitems"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["__getslice_range".to_string()]
+                )
+            }),
+            "the proven *args tail Range should use the annotated getslice marker"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[
+                        "core".to_string(),
+                        "convert".to_string(),
+                        "num".to_string(),
+                        "<Impl>".to_string(),
+                        "from".to_string(),
+                    ]
+                )
+            }),
+            "bool-to-usize offset conversion must not remain an opaque core call"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[
+                        "rpython".to_string(),
+                        "rlib".to_string(),
+                        "rarithmetic".to_string(),
+                        "r_uint".to_string(),
+                    ]
+                )
+            }),
+            "From<bool> for usize should use RPython's cast_bool_to_uint path"
         );
     }
 }

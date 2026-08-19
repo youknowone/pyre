@@ -248,6 +248,10 @@ pub struct LowererConfig {
     pub(super) call_returns: HashMap<Vec<String>, syn::Path>,
     /// Struct types whose `New` allocation should carry the headerless bit.
     pub(super) headerless_structs: std::collections::HashSet<Vec<String>>,
+    /// `Outer` canonical segments -> (base field name, base path), from
+    /// `inlined_prefix`.  Empty unless a caller declares one, in which case
+    /// [`LowererConfig::declaring_struct`] is the identity.
+    pub(super) inlined_prefix: HashMap<Vec<String>, (String, syn::Path)>,
     /// Pure function → native IR integer binop aliases.  Key = canonical func
     /// path segments, value = IR opcode name (e.g. "IntAdd").  When
     /// `lower_native_int_binop_call` encounters a call whose path matches a
@@ -566,6 +570,7 @@ pub(super) fn call_policy_effect_slot(
         | K::InlinePipelineInt
         | K::InlinePipelineRef
         | K::InlinePipelineFloat
+        | K::InlinePipelineVoid
         | K::ConcreteOnlyVoid => None,
     }
 }
@@ -580,7 +585,11 @@ pub(super) fn call_policy_effect_slot(
 /// conditional-call slot but force / may raise, so they keep the marker.
 pub(super) fn explicit_call_emits_post_live(kind: crate::jit_interp::CallPolicyKind) -> bool {
     if binding_kind_for_inline_policy(kind).is_some()
-        || matches!(kind, crate::jit_interp::CallPolicyKind::InlineVoid)
+        || matches!(
+            kind,
+            crate::jit_interp::CallPolicyKind::InlineVoid
+                | crate::jit_interp::CallPolicyKind::InlinePipelineVoid
+        )
     {
         return false;
     }
@@ -608,6 +617,7 @@ pub(super) fn call_policy_result_kind(
         | K::LoopInvariantVoid
         | K::LoopInvariantVoidWrapped
         | K::InlineVoid
+        | K::InlinePipelineVoid
         | K::ConcreteOnlyVoid => Some(CallResultKind::Void),
 
         K::ResidualInt
@@ -958,6 +968,7 @@ impl LowererConfig {
         native_int_binops: &[(syn::Path, syn::Ident)],
         native_tag_small: &[syn::Path],
         headerless_structs: &[syn::Path],
+        inlined_prefix: &[crate::jit_interp::InlinedPrefixEntry],
     ) -> Self {
         let array_fields_map = build_array_fields_map(array_fields);
         let ref_fields_map: HashMap<String, (syn::Path, Ident, syn::Path)> = ref_fields
@@ -1009,6 +1020,7 @@ impl LowererConfig {
                 .iter()
                 .map(canonical_path_segments)
                 .collect(),
+            inlined_prefix: inlined_prefix_map(inlined_prefix),
             native_int_binops: native_int_binops
                 .iter()
                 .map(|(path, op)| (canonical_path_segments(path), op.to_string()))
@@ -1044,6 +1056,7 @@ impl LowererConfig {
         int_fields: &[crate::jit_interp::IntFieldEntry],
         call_returns: &[(Path, Path)],
         headerless_structs: &[Path],
+        inlined_prefix: &[crate::jit_interp::InlinedPrefixEntry],
         native_int_binops: &[(Path, Ident)],
         native_tag_small: &[Path],
         split_dispatch: bool,
@@ -1285,6 +1298,7 @@ impl LowererConfig {
                 .iter()
                 .map(canonical_path_segments)
                 .collect(),
+            inlined_prefix: inlined_prefix_map(inlined_prefix),
             pool_arrays,
             native_int_binops: native_int_binops
                 .iter()
@@ -1311,6 +1325,214 @@ impl LowererConfig {
         self.headerless_structs
             .contains(&canonical_path_segments(struct_path))
     }
+
+    /// The gc-kind of a struct type — a property of the TYPE, never of the
+    /// operation reaching it.
+    ///
+    /// `lltype.py:418` keeps `_gckind` on the STRUCT itself, and
+    /// `jtransform.py:880` reads it off the struct a field belongs to rather
+    /// than off the operation touching the field. One type therefore has one
+    /// answer, and every descriptor minted for it has to give the same one:
+    /// [`struct_type_id_tokens`](super::lower_value::struct_type_id_tokens)
+    /// folds this flag into the type id, so two answers mint two identities
+    /// for a single field. An optimizer that keys its field cache by
+    /// descriptor identity then cannot see a write through one identity when
+    /// it reads through the other, and serves the value from before the write.
+    ///
+    /// A struct declared in `headerless_structs` is allocated out of the
+    /// interpreter's own GC pool, so it is gc-managed. What it lacks is the
+    /// type-id word ahead of the payload, and that absence is carried by the
+    /// descriptor's `headerless` flag — the flag the type guard actually
+    /// consults — not by a separate type id.
+    ///
+    /// Every other struct stays raw here. A type the interpreter only ever
+    /// reaches through a pointer it did not allocate is a genuinely separate
+    /// low-level type from anything it allocates itself, and two ids for the
+    /// two of them is the right answer rather than an accident.
+    pub(super) fn struct_gc_kind_is_managed(&self, struct_path: &syn::Path) -> bool {
+        self.is_headerless_struct(struct_path)
+    }
+
+    /// The struct that DECLARES `field`, following inlined leading
+    /// substructures outward-in.
+    ///
+    /// `rclass.py:987-1001 InstanceRepr.getfield` resolves a field against the
+    /// repr that owns it: `if attr in self.fields` … else recurse into
+    /// `self.rbase` with `force_cast=True`. The cast is why
+    /// `jtransform.py:881` always reads the descr off the declaring struct,
+    /// and therefore why one physical field has one descriptor no matter how
+    /// many outer structs embed it.
+    ///
+    /// Callers rebind their struct path through this before building the field
+    /// key, so the declaration lookup, the type id, and every compile-time
+    /// witness (`size_of`, `offset_of!`) move together onto the declaring
+    /// struct. That is the whole of the cast: `jtransform.py:254
+    /// rewrite_op_cast_pointer` lowers `cast_pointer` to `same_as`, so no
+    /// operation is emitted and the base pointer is unchanged — which holds
+    /// only because an inlined base is required to start at offset 0.
+    ///
+    /// Returns `struct_path` unchanged when the struct declares the field
+    /// itself, when it has no inlined base, or when nothing declared one.
+    pub(super) fn declaring_struct(&self, struct_path: &syn::Path, field: &str) -> syn::Path {
+        crate::jit_interp::declaring_struct_of(
+            &self.inlined_prefix,
+            |path, field| self.declares_field(path, field),
+            struct_path,
+            field,
+        )
+    }
+
+    /// The layout entries an inlined base contributes to the struct embedding
+    /// it, plus the witness that the base really is the leading field.
+    ///
+    /// `heaptracker.py:68-69` recurses into a nested struct when building a
+    /// struct's positional field list, so an outer struct's list begins with
+    /// the base's own fields and its own fields are numbered after them. That
+    /// numbering is load-bearing twice over: `get_fielddescr_index_in`
+    /// (`heaptracker.py:97`) assigns `index_in_parent` from it, and the
+    /// per-object field cache slots by that index. Without the base's entries
+    /// an outer struct's first own field takes slot 0 — the slot the base's
+    /// first field already occupies for the same object.
+    ///
+    /// Returns `(entries, witness)`. `entries` are `(offset, is_ref, name,
+    /// size, signed)` tuples in the shape the layout registration takes;
+    /// offsets are relative to the OUTER struct. Empty when the struct embeds
+    /// no declared base, which is the case for every struct unless a caller
+    /// declares one.
+    pub(super) fn prefix_field_entries_tokens(
+        &self,
+        outer: &syn::Path,
+    ) -> (Vec<TokenStream>, TokenStream) {
+        let mut entries = Vec::new();
+        let mut witnesses = TokenStream::new();
+        let mut current = outer.clone();
+        let mut base_offset = quote! { 0usize };
+        // Bounded for the same reason the declaring-struct walk is: the map is
+        // hand-written and can name a cycle the Rust types never see.
+        let mut remaining = self.inlined_prefix.len();
+        while let Some((base_field, base)) = crate::jit_interp::inlined_prefix_entry(
+            &self.inlined_prefix,
+            &canonical_path_segments(&current),
+        ) {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            let base_field = syn::Ident::new(base_field, proc_macro2::Span::call_site());
+            // `lltype.py:296-305` admits an inlined substructure only at
+            // `_names[0]`, and the offsets below assume it: a redirected access
+            // keeps the outer pointer in its register and offsets by the
+            // field's place within the base, which names the right word only
+            // when the base starts at zero.
+            let message = format!(
+                "`{}` is declared as the inlined leading substructure of `{}`, so it must be \
+                 that struct's first field at offset 0.",
+                path_display(base),
+                path_display(&current),
+            );
+            witnesses.extend(quote! {
+                const _: () = assert!(
+                    ::core::mem::offset_of!(#current, #base_field) == 0,
+                    #message,
+                );
+            });
+            let outer_to_base = quote! {
+                (#base_offset + ::core::mem::offset_of!(#current, #base_field))
+            };
+            for (field, is_ref, size, signed) in self.declared_fields_of(base) {
+                entries.push(quote! {
+                    (
+                        #outer_to_base + ::core::mem::offset_of!(#base, #field),
+                        #is_ref,
+                        stringify!(#field),
+                        #size,
+                        #signed,
+                    )
+                });
+            }
+            base_offset = outer_to_base;
+            current = base.clone();
+        }
+        (entries, witnesses)
+    }
+
+    /// The fields `struct_path` declares, as `(field, is_ref, size, signed)`.
+    ///
+    /// All three vocabularies, because all three take a slot: an array field's
+    /// access site registers its base pointer as a layout entry of its own, so
+    /// a base that declares one and is omitted here would leave the embedding
+    /// struct's own fields numbered a slot too low, which is the collision the
+    /// prefix exists to prevent. `declares_field` reads the same three, and the
+    /// two must agree — a field the walk redirects onto a base but does not
+    /// number after it is worse than one it never redirected.
+    ///
+    /// Sorted by field name. The declarations live in hash maps, whose
+    /// iteration order varies per process, and an unsorted walk would emit a
+    /// different token order on every compile of the same source.
+    fn declared_fields_of(
+        &self,
+        struct_path: &syn::Path,
+    ) -> Vec<(syn::Ident, bool, TokenStream, TokenStream)> {
+        let Some(last) = struct_path.segments.last() else {
+            return Vec::new();
+        };
+        let prefix = format!("{}::", last.ident);
+        let mut fields: Vec<_> = self
+            .ref_fields
+            .keys()
+            .map(|key| (key, true))
+            .chain(self.int_fields.keys().map(|key| (key, false)))
+            .chain(self.array_fields.keys().map(|key| (key, true)))
+            .filter_map(|(key, is_ref)| key.strip_prefix(&prefix).map(|field| (field, is_ref)))
+            .collect();
+        fields.sort_unstable();
+        fields.dedup();
+        fields
+            .into_iter()
+            .map(|(field, is_ref)| {
+                let key = format!("{prefix}{field}");
+                // The same widths the access sites register: a declared integer
+                // reports its own type's width, an array field the pointer it
+                // reaches its buffer through, and anything else the eight-byte
+                // scalar an undeclared field defaults to.
+                let (size, signed) = match self.int_fields.get(&key) {
+                    Some((ty, signed)) => {
+                        (quote! { ::core::mem::size_of::<#ty>() }, quote! { #signed })
+                    }
+                    None if self.array_fields.contains_key(&key) => {
+                        (quote! { ::core::mem::size_of::<usize>() }, quote! { false })
+                    }
+                    None => (quote! { ::core::mem::size_of::<i64>() }, quote! { true }),
+                };
+                (
+                    syn::Ident::new(field, proc_macro2::Span::call_site()),
+                    is_ref,
+                    size,
+                    signed,
+                )
+            })
+            .collect()
+    }
+
+    /// Whether `struct_path` itself declares `field` in any of the three field
+    /// vocabularies. A field in none of them is undeclared everywhere, so the
+    /// walk stops at the struct it was spelled with and the default applies.
+    fn declares_field(&self, struct_path: &syn::Path, field: &str) -> bool {
+        let Some(struct_name) = struct_path.segments.last() else {
+            return false;
+        };
+        let key = format!("{}::{}", struct_name.ident, field);
+        self.ref_fields.contains_key(&key)
+            || self.int_fields.contains_key(&key)
+            || self.array_fields.contains_key(&key)
+    }
+}
+
+use crate::jit_interp::inlined_prefix_index as inlined_prefix_map;
+
+/// A path as written, for a diagnostic that has to name it.
+fn path_display(path: &Path) -> String {
+    canonical_path_segments(path).join("::")
 }
 
 pub(super) fn canonical_path_segments(path: &Path) -> Vec<String> {
@@ -2663,9 +2885,10 @@ mod tests {
             ),
             &[inline_policy("callee")],
             // ref_params, ref_fields, array_fields, int_fields,
-            // native_int_binops, native_tag_small, headerless_structs — the
-            // surface these tests assert is the call encoding, which none of
-            // them participate in.
+            // native_int_binops, native_tag_small, headerless_structs,
+            // inlined_prefix — the surface these tests assert is the call
+            // encoding, which none of them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2693,9 +2916,10 @@ mod tests {
             ),
             &[inline_policy("callee")],
             // ref_params, ref_fields, array_fields, int_fields,
-            // native_int_binops, native_tag_small, headerless_structs — the
-            // surface these tests assert is the call encoding, which none of
-            // them participate in.
+            // native_int_binops, native_tag_small, headerless_structs,
+            // inlined_prefix — the surface these tests assert is the call
+            // encoding, which none of them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2723,9 +2947,10 @@ mod tests {
             ),
             &[inline_policy("callee")],
             // ref_params, ref_fields, array_fields, int_fields,
-            // native_int_binops, native_tag_small, headerless_structs — the
-            // surface these tests assert is the call encoding, which none of
-            // them participate in.
+            // native_int_binops, native_tag_small, headerless_structs,
+            // inlined_prefix — the surface these tests assert is the call
+            // encoding, which none of them participate in.
+            &[],
             &[],
             &[],
             &[],
@@ -2841,5 +3066,81 @@ mod tests {
         assert!(body.contains("stack_pop"));
         assert!(body.contains("add_sub_jitcode_arc"));
         assert!(body.contains("__sub_return_kind"));
+    }
+
+    #[test]
+    fn inline_pipeline_void_policy_resolves_callee_by_name() {
+        let expr: syn::Expr = syn::parse_quote! { stack_swap() };
+        let mut lowerer = Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                vec!["stack_swap".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlinePipelineVoid),
+            )],
+            InferenceFailureMode::Panic,
+        );
+
+        lowerer
+            .lower_config_call_stmt(&expr)
+            .expect("inline-pipeline void call should lower");
+
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("__majit_pipeline_jitcode"));
+        assert!(body.contains("stack_swap"));
+        assert!(body.contains("add_sub_jitcode_arc"));
+        let prebuild = &lowerer.inline_liveness_prebuild;
+        let prebuild = quote! { #(#prebuild)* }.to_string();
+        assert!(prebuild.contains("__majit_pipeline_liveness_prebuild"));
+    }
+
+    #[test]
+    fn nested_branch_preserves_pipeline_liveness_prebuild() {
+        let mut lowerer = Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                vec!["stack_pop".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlinePipelineInt),
+            )],
+            InferenceFailureMode::Panic,
+        );
+        let expr_if: syn::ExprIf = syn::parse_quote! {
+            if 1 {
+                let popped = stack_pop();
+            }
+        };
+
+        lowerer
+            .lower_if_stmt(&expr_if)
+            .expect("branch containing a pipeline call should lower");
+
+        let prebuild = &lowerer.inline_liveness_prebuild;
+        let tokens = quote! { #(#prebuild)* }.to_string();
+        assert!(tokens.contains("__majit_pipeline_liveness_prebuild"));
+    }
+
+    #[test]
+    fn rejected_inline_arm_rolls_back_pipeline_liveness_prebuild() {
+        let mut lowerer = Lowerer::new_with_call_policies(
+            None,
+            vec![(
+                vec!["stack_pop".to_string()],
+                CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::InlinePipelineInt),
+            )],
+            InferenceFailureMode::Panic,
+        );
+        let body: syn::Expr = syn::parse_quote! {{
+            let popped = stack_pop();
+            match 0 {
+                (1, 2) => unsupported_body(),
+                _ => 1,
+            };
+        }};
+
+        assert_eq!(
+            lowerer.try_inline_dispatch_arm(&body),
+            dispatch::InlineArmOutcome::Rejected,
+        );
+        assert!(lowerer.inline_liveness_prebuild.is_empty());
     }
 }

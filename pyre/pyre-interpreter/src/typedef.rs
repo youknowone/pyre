@@ -688,6 +688,11 @@ pub fn init_typeobjects() {
         // typedef.py:664 PyCode.typedef.acceptable_as_base_class = False
         let code_type = new_typeobject_with_base("code", init_code_type, object_type);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(code_type, false) };
+        // typedef.py:725 `__weakref__ = make_weakref_descr(PyCode)` — a code
+        // object carries a weakref lifeline, which is what lets a caller
+        // attach per-code state that expires with the code.  Without the flag
+        // `setweakref` reports the type as one that takes no weak reference.
+        unsafe { pyre_object::w_type_set_weakrefable(code_type, true) };
         reg.insert(
             &crate::pycode::CODE_TYPE as *const PyType as usize,
             code_type as usize,
