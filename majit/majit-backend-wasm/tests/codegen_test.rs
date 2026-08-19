@@ -32,6 +32,12 @@ fn workspace_root() -> PathBuf {
 /// overwrite each other, so a tree that last built `web` leaves a module there
 /// which loads and runs but is not the one whose counters these tests pin.
 /// `check.py` copies the wasm-host build here for exactly that reason.
+/// A release runtime binary, named the way the host names an executable.
+fn runtime_binary(root: &Path, name: &str) -> PathBuf {
+    root.join("target/release")
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+}
+
 fn wasm_host_module(root: &Path) -> PathBuf {
     root.join("target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wasm")
 }
@@ -95,6 +101,27 @@ fn assert_ran_ok(label: &str, output: &std::process::Output) {
     );
 }
 
+/// Assert the two runtimes printed the same thing, up to the line ending
+/// their hosts spell a newline with.
+///
+/// What is being compared is what the two backends computed. `pyre-dynasm`
+/// runs on the host, where a text stream translates `\n` on the way out and
+/// Windows spells the result `\r\n`; the wasm guest is its own platform and
+/// spells it `\n`. Comparing the bytes would make every one of these tests
+/// fail on a Windows host over the separator alone.
+#[track_caller]
+fn assert_same_stdout(label: &str, wasm: &std::process::Output, dynasm: &std::process::Output) {
+    fn lines(stdout: &[u8]) -> String {
+        String::from_utf8_lossy(stdout).replace("\r\n", "\n")
+    }
+    assert_eq!(
+        lines(&wasm.stdout),
+        lines(&dynasm.stdout),
+        "{label} output diverged from dynasm:\n{}",
+        String::from_utf8_lossy(&wasm.stderr),
+    );
+}
+
 fn stat_value(stderr: &str, name: &str) -> u64 {
     stderr
         .split_whitespace()
@@ -109,8 +136,8 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
     let root = workspace_root();
-    let dynasm = root.join("target/release/pyre-dynasm");
-    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let dynasm = runtime_binary(&root, "pyre-dynasm");
+    let wasm_runner = runtime_binary(&root, "pyre-wasm-runner");
     let wasm_module = wasm_host_module(&root);
 
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
@@ -138,10 +165,7 @@ fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
         );
         let stderr = String::from_utf8_lossy(&wasm_run.stderr);
         assert_ran_ok(&format!("wasm {bench}"), &wasm_run);
-        assert_eq!(
-            wasm_run.stdout, dynasm_run.stdout,
-            "wasm output diverged from dynasm for {bench}:\n{stderr}"
-        );
+        assert_same_stdout(&format!("wasm {bench}"), &wasm_run, &dynasm_run);
         assert!(
             stat_value(&stderr, "compiles") > 1,
             "{bench} did not recompile after its global invalidation:\n{stderr}"
@@ -158,8 +182,8 @@ fn global_reassign_retraces_non_last_label_backedge_at_runtime() {
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn raise_catch_clear_root_does_not_cross_the_host_per_exception() {
     let root = workspace_root();
-    let dynasm = root.join("target/release/pyre-dynasm");
-    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let dynasm = runtime_binary(&root, "pyre-dynasm");
+    let wasm_runner = runtime_binary(&root, "pyre-wasm-runner");
     let wasm_module = wasm_host_module(&root);
     let script = root.join("pyre/bench/raise_catch_loop.py");
 
@@ -185,10 +209,7 @@ fn raise_catch_clear_root_does_not_cross_the_host_per_exception() {
     );
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
     assert_ran_ok("wasm raise/catch", &wasm_run);
-    assert_eq!(
-        wasm_run.stdout, dynasm_run.stdout,
-        "wasm raise/catch output diverged from dynasm:\n{stderr}"
-    );
+    assert_same_stdout("wasm raise/catch", &wasm_run, &dynasm_run);
     assert!(
         stat_value(&stderr, "jit_calls") < 100_000,
         "caught-exception root clearing crossed the host trampoline per iteration:\n{stderr}"
@@ -200,8 +221,8 @@ fn raise_catch_clear_root_does_not_cross_the_host_per_exception() {
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
     let root = workspace_root();
-    let dynasm = root.join("target/release/pyre-dynasm");
-    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let dynasm = runtime_binary(&root, "pyre-dynasm");
+    let wasm_runner = runtime_binary(&root, "pyre-wasm-runner");
     let wasm_module = wasm_host_module(&root);
     let script = root.join("pyre/bench/fib_recursive.py");
 
@@ -228,10 +249,7 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
     );
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
     assert_ran_ok("wasm recursive fib", &wasm_run);
-    assert_eq!(
-        wasm_run.stdout, dynasm_run.stdout,
-        "wasm recursive fib output diverged from dynasm:\n{stderr}"
-    );
+    assert_same_stdout("wasm recursive fib", &wasm_run, &dynasm_run);
     // `compiles` is the host's module-compile tally, one per loop and one per
     // bridge, and `BRIDGE_OK` counts the bridges the backend accepted — the
     // same event `bridges_compiled` counts, since both are bumped only on the
@@ -251,8 +269,8 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     let root = workspace_root();
-    let dynasm = root.join("target/release/pyre-dynasm");
-    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let dynasm = runtime_binary(&root, "pyre-dynasm");
+    let wasm_runner = runtime_binary(&root, "pyre-wasm-runner");
     let wasm_module = wasm_host_module(&root);
     let script = root.join("pyre/bench/fannkuch.py");
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
@@ -277,10 +295,7 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     );
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
     assert_ran_ok("wasm fannkuch", &wasm_run);
-    assert_eq!(
-        wasm_run.stdout, dynasm_run.stdout,
-        "wasm fannkuch output diverged from dynasm:\n{stderr}"
-    );
+    assert_same_stdout("wasm fannkuch", &wasm_run, &dynasm_run);
     assert_eq!(stat_value(&stderr, "compiles"), 28);
     assert!(
         stat_value(&stderr, "jit_calls") < 100,
@@ -293,8 +308,8 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
     let root = workspace_root();
-    let dynasm = root.join("target/release/pyre-dynasm");
-    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let dynasm = runtime_binary(&root, "pyre-dynasm");
+    let wasm_runner = runtime_binary(&root, "pyre-wasm-runner");
     let wasm_module = wasm_host_module(&root);
     let script = root.join("pyre/bench/ca_terminal_decline.py");
 
@@ -321,10 +336,7 @@ fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
     );
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
     assert_ran_ok("wasm terminal-decline", &wasm_run);
-    assert_eq!(
-        wasm_run.stdout, dynasm_run.stdout,
-        "forced terminal-decline wasm output diverged from dynasm\nwasm stderr:\n{stderr}"
-    );
+    assert_same_stdout("forced terminal-decline wasm", &wasm_run, &dynasm_run);
     assert!(
         stderr.contains("accepted_ca=") && !stderr.contains("accepted_ca=0"),
         "fixture did not compile its outer CALL_ASSEMBLER trace:\n{stderr}"
@@ -340,8 +352,8 @@ fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn wasm_outlier_bridges_stay_compiled_at_runtime() {
     let root = workspace_root();
-    let dynasm = root.join("target/release/pyre-dynasm");
-    let wasm_runner = root.join("target/release/pyre-wasm-runner");
+    let dynasm = runtime_binary(&root, "pyre-dynasm");
+    let wasm_runner = runtime_binary(&root, "pyre-wasm-runner");
     let wasm_module = wasm_host_module(&root);
 
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
@@ -371,10 +383,7 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
         );
         let stderr = String::from_utf8_lossy(&wasm_run.stderr);
         assert_ran_ok(&format!("wasm {bench}"), &wasm_run);
-        assert_eq!(
-            wasm_run.stdout, dynasm_run.stdout,
-            "wasm output diverged from dynasm for {bench}:\n{stderr}"
-        );
+        assert_same_stdout(&format!("wasm {bench}"), &wasm_run, &dynasm_run);
         assert!(
             stat_value(&stderr, expected_counter) > 0,
             "{bench} did not compile its formerly-declined bridge:\n{stderr}"
