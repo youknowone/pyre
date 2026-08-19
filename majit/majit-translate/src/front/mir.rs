@@ -4664,7 +4664,7 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, .. } => {
-                let projection = matches!(&place.kind, PlaceKind::Projection(..));
+                let projection = Self::place_ref_is_address_of(&place);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
@@ -4675,7 +4675,7 @@ impl<'a> Lowering<'a> {
             // and references identically at the IR level (lifetime
             // tracking lives outside the JIT).
             Rvalue::RawPtr { place, .. } => {
-                let projection = matches!(&place.kind, PlaceKind::Projection(..));
+                let projection = Self::place_ref_is_address_of(&place);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
@@ -5373,6 +5373,24 @@ impl<'a> Lowering<'a> {
             kind: op,
         });
         Ok(var)
+    }
+
+    /// Whether `&<place>` / `&raw [mut] <place>` takes the address of a
+    /// place, as opposed to reading the value one holds.
+    ///
+    /// `&*(*p).f` — a projection whose outermost element is `Deref` — yields
+    /// the value the pointer in `(*p).f` holds, so the underlying read stays
+    /// a value read and keeps its lowering.  `&(*p).f`, Field-last, is the
+    /// real place-address and stays marked.
+    ///
+    /// The `Deref` test is spelled as `resolve_place` and
+    /// `emit_projection_write` already spell it, applied one level out.
+    fn place_ref_is_address_of(place: &Place) -> bool {
+        match &place.kind {
+            PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref" => false,
+            PlaceKind::Projection(..) => true,
+            _ => false,
+        }
     }
 
     /// Record that the `Variable` just resolved for a place is the
@@ -21724,6 +21742,67 @@ mod tests {
         assert_eq!(resolve_to_producer_op(&graph, &x), Some((a, 0)));
         // An unrelated free Variable has no producer.
         assert_eq!(resolve_to_producer_op(&graph, &Variable::new()), None);
+    }
+
+    /// `&*(*p).f` reads the value the field holds; `&(*p).f` names the
+    /// field's address.
+    ///
+    /// Both reach `build_rvalue`'s `Ref` / `RawPtr` arms as a
+    /// `PlaceKind::Projection`, so a bare `matches!(.., Projection(..))`
+    /// calls them both an address-of.  On `locals_cells_stack_w` the false
+    /// mark is not inert: `rewrite_op_getfield` reads
+    /// `suppresses_virtualizable` and skips the `vable_array_vars`
+    /// registration, so the read leaves the protocol and becomes a plain
+    /// `getarrayitem_gc` against a heap array that is only synchronised at
+    /// the three `sync_virtualizable_*` points — a stale read, not a slow
+    /// equivalent.  `locals_w!` expands to the deref-then-ref spelling, so
+    /// every one of its readers took that path.
+    #[test]
+    fn a_deref_last_projection_reads_a_value_rather_than_naming_an_address() {
+        use super::Lowering;
+        use majit_charon_reader::ullbc::{Place, PlaceKind, ProjectionElem};
+
+        fn ty() -> TyRef {
+            TyRef::Other(serde_json::Value::Null)
+        }
+        fn place(kind: PlaceKind) -> Place {
+            Place { kind, ty: ty() }
+        }
+        fn field(inner: Place, name: &str) -> Place {
+            place(PlaceKind::Projection(
+                Box::new(inner),
+                ProjectionElem::Tagged(serde_json::json!({ "Field": name })),
+            ))
+        }
+        fn deref(inner: Place) -> Place {
+            place(PlaceKind::Projection(
+                Box::new(inner),
+                ProjectionElem::Atom("Deref".to_string()),
+            ))
+        }
+
+        let local = || place(PlaceKind::Local(0));
+        let is_addr = Lowering::place_ref_is_address_of;
+
+        // `&(*p).f` — the outermost step names a field, so the reference
+        // stands for that field's address and the mark is owed.
+        assert!(is_addr(&field(deref(local()), "locals_cells_stack_w")));
+
+        // `&*(*p).f` — the outermost step dereferences what the field
+        // holds, so the reference stands for the pointee.  The field read
+        // underneath is an ordinary value read.
+        assert!(!is_addr(&deref(field(
+            deref(local()),
+            "locals_cells_stack_w"
+        ))));
+
+        // `&*p`, the same shape one level in, and a bare local: neither
+        // names a field address either.
+        assert!(!is_addr(&deref(local())));
+        assert!(!is_addr(&local()));
+
+        // A nested field is still an address-of at its outermost step.
+        assert!(is_addr(&field(field(deref(local()), "a"), "b")));
     }
 
     #[test]
