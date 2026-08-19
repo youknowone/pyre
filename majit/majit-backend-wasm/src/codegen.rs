@@ -792,8 +792,9 @@ impl RefHomes {
         ops: &[Op],
         include_ca_collects: bool,
         forced_refs: &[OpRef],
+        regions: &[InlinedRegionSpan],
     ) -> Self {
-        let liveness = HomeLiveness::collect(inputargs, ops);
+        let liveness = HomeLiveness::collect_with_regions(inputargs, ops, regions);
         let collect_positions = collecting_call_positions(ops, include_ca_collects);
         let ref_values = RefValues::collect(inputargs, ops);
         let mut by_id = Vec::new();
@@ -900,6 +901,28 @@ struct LabelResumeData {
 struct InlinedRegionSpan {
     ops_start: usize,
     inputarg_ids: Vec<u32>,
+}
+
+impl InlinedRegionSpan {
+    /// The regions occupy the tail of the merged stream in `inlined_bridges`
+    /// order, so their starts run back from the end of `ops`. `bridges` must be
+    /// the rebased copies the merged stream was built from, so the recorded ids
+    /// are the ids that stream reads.
+    fn collect(ops_len: usize, bridges: &[InlinedBridge]) -> Vec<Self> {
+        let mut start =
+            ops_len.saturating_sub(bridges.iter().map(|bridge| bridge.ops.len()).sum::<usize>());
+        bridges
+            .iter()
+            .map(|bridge| {
+                let span = Self {
+                    ops_start: start,
+                    inputarg_ids: bridge.inputargs.iter().map(|ia| ia.index).collect(),
+                };
+                start += bridge.ops.len();
+                span
+            })
+            .collect()
+    }
 }
 
 impl LabelResumeData {
@@ -1120,7 +1143,7 @@ pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
     // This pre-sizing query is used for CA bridges before `CaParams` exists, so
     // count CALL_ASSEMBLER as a collecting position to match CA codegen.
     let resume = LabelResumeData::collect(inputargs, ops);
-    RefHomes::collect(inputargs, ops, true, &resume.captured_refs).len()
+    RefHomes::collect(inputargs, ops, true, &resume.captured_refs, &[]).len()
 }
 
 /// Number of high GC-rooted homes reserved exclusively for LABEL live-ins.
@@ -1369,7 +1392,11 @@ struct HomeLiveness {
 }
 
 impl HomeLiveness {
-    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+    fn collect_with_regions(
+        inputargs: &[InputArg],
+        ops: &[Op],
+        regions: &[InlinedRegionSpan],
+    ) -> Self {
         let mut n = inputargs
             .iter()
             .map(|ia| ia.index as usize + 1)
@@ -1409,6 +1436,22 @@ impl HomeLiveness {
                     if a != OpRef::NONE && !a.is_constant() && (a.raw() as usize) < n {
                         last_use[a.raw() as usize] = i as i32;
                     }
+                }
+            }
+        }
+        // An appended region's live-ins are written by the guard-fail branch
+        // that is the region's sole predecessor, and that branch jumps straight
+        // into the region. Their entry in the merged input-arg list would
+        // otherwise date them to trace entry, making them live across every
+        // collecting call in the owner's body: each would take a Ref home and
+        // be reloaded there on every iteration, for a value nothing in the
+        // owner reads. Date them to the region instead, so they stay live
+        // across the region's own collect points and nowhere else.
+        for region in regions {
+            let defined_at = region.ops_start as i32 - 1;
+            for &id in &region.inputarg_ids {
+                if let Some(d) = def_pos.get_mut(id as usize) {
+                    *d = defined_at;
                 }
             }
         }
@@ -2424,7 +2467,6 @@ pub fn build_wasm_module(
     let mut merged_inputargs = Vec::new();
     let mut merged_ops = Vec::new();
     let mut gc_table_bases = HashMap::new();
-    let mut region_spans: Vec<InlinedRegionSpan> = Vec::new();
     let mut rebased_bridges: Vec<InlinedBridge> = Vec::new();
     let (analysis_inputargs, analysis_ops): (&[InputArg], &[Op]) = if inlined_bridges.is_empty() {
         (inputargs, ops)
@@ -2437,13 +2479,6 @@ pub fn build_wasm_module(
         for bridge in inlined_bridges {
             let (bridge, width) = rebase_region_value_ids(bridge, next_value_id);
             next_value_id += width;
-            // Taken before this region's ops are appended, so it names the
-            // first op of the region. `fresh_value_copy` keeps `index`, so the
-            // ids recorded here are the ids the merged stream reads.
-            region_spans.push(InlinedRegionSpan {
-                ops_start: merged_ops.len(),
-                inputarg_ids: bridge.inputargs.iter().map(|ia| ia.index).collect(),
-            });
             merged_inputargs.extend(bridge.inputargs.iter().map(InputArg::fresh_value_copy));
             for op in &bridge.ops {
                 if op.opcode == OpCode::LoadFromGcTable {
@@ -2462,6 +2497,7 @@ pub fn build_wasm_module(
     } else {
         &rebased_bridges
     };
+    let region_spans = InlinedRegionSpan::collect(analysis_ops.len(), emitted_bridges);
     let (mut guards, num_vars) = collect_guards_and_vars(analysis_inputargs, analysis_ops);
 
     // An inlined bridge branches back into the owner with wasm `br`.  The
@@ -2580,6 +2616,7 @@ pub fn build_wasm_module(
         &analysis_ops,
         ca.emit_ca,
         &label_resume.captured_refs,
+        &region_spans,
     );
     let num_ref_homes = ref_homes.len();
     let shortage = if num_ref_homes > frame.ordinary_home_slots() {
@@ -3094,8 +3131,11 @@ fn build_function(
         )
     })?;
 
-    // Def / last-use positions for the post-collection Ref reload filter.
-    let liveness = HomeLiveness::collect(inputargs, ops);
+    // Def / last-use positions for the post-collection Ref reload filter. The
+    // spans must match the ones `RefHomes` was built from, or a home would be
+    // reserved and never reloaded (or the reverse).
+    let region_spans = InlinedRegionSpan::collect(ops.len(), inlined_bridges);
+    let liveness = HomeLiveness::collect_with_regions(inputargs, ops, &region_spans);
 
     // `LOAD_FROM_GC_TABLE` is the backend form of a ConstPtr.  Native PyPy
     // keeps such loop-invariant references in their allocated location across
