@@ -1221,13 +1221,14 @@ fn emit_traceback_node<Sym: WalkSym>(
     // even though `last_instr` is declared virtualizable by
     // `interp_jit.py:25-30`.
     let last_instr_value = ctx.trace_ctx.const_int(i64::from(site.last_instruction));
-    let vinfo = ctx
-        .trace_ctx
-        .virtualizable_info()
-        .expect("traceback frame last_instr requires PyFrame virtualizable info");
+    let unavailable = || DispatchError::TracebackNodeVableFieldUnavailable {
+        pc: opcode_position,
+        field: "last_instr",
+    };
+    let vinfo = ctx.trace_ctx.virtualizable_info().ok_or_else(unavailable)?;
     let last_instr_index = vinfo
         .static_field_index_by_name("last_instr")
-        .expect("PyFrame virtualizable must contain last_instr");
+        .ok_or_else(unavailable)?;
     let last_instr_descr = vinfo.static_field_descr(last_instr_index);
     // A traceback node names an inlined callee's frame as often as the walk's
     // own, and a frame that is not `virtualizable_boxes[-1]` sends
@@ -2530,6 +2531,16 @@ pub enum DispatchError {
     /// `pyjitpl.py:2865 _interpret` calls `blackhole_if_trace_too_long()` right
     /// after `run_one_step()` — and raises `SwitchToBlackhole(ABORT_TOO_LONG)`.
     TraceTooLong { pc: usize, ops: usize },
+    /// The traceback node's `last_instr` store could not resolve the
+    /// virtualizable static field named `field`: either the trace carries no
+    /// `VirtualizableInfo` at all, or the registered one declares no such
+    /// field.  `interp_jit.py:25-30` declares `last_instr` virtualizable and
+    /// `pyjitpl.py:1188-1199 _opimpl_setfield_vable` routes the write through
+    /// it, so an unresolvable descr means the walk is recording against a
+    /// frame layout the jitdriver never registered.  Abort rather than fall
+    /// back to a raw SETFIELD_GC, which writes the root frame's shadow on
+    /// every caught-exception bridge.
+    TracebackNodeVableFieldUnavailable { pc: usize, field: &'static str },
 }
 
 impl DispatchError {
@@ -2601,6 +2612,7 @@ impl DispatchError {
             }
             Self::ExcEdgeNoInFrameCatch { .. } => "ExcEdgeNoInFrameCatch",
             Self::TraceTooLong { .. } => "TraceTooLong",
+            Self::TracebackNodeVableFieldUnavailable { .. } => "TracebackNodeVableFieldUnavailable",
         }
     }
 
@@ -2663,7 +2675,8 @@ impl DispatchError {
             | Self::BranchGuardUnrestorableKeptStackPermanent { pc, .. }
             | Self::InplaceContainerMutationUnsupported { pc, .. }
             | Self::ExcEdgeNoInFrameCatch { pc, .. }
-            | Self::TraceTooLong { pc, .. } => *pc,
+            | Self::TraceTooLong { pc, .. }
+            | Self::TracebackNodeVableFieldUnavailable { pc, .. } => *pc,
         }
     }
 
