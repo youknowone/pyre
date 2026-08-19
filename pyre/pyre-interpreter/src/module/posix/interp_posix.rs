@@ -1799,7 +1799,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if value == -1 || value == libc::c_uint::MAX as i64 {
                 return pyre_object::w_int_new(-1);
             }
-            pyre_object::w_int_new(value as i64)
+            pyre_object::w_int_new(value)
         }
         fn major_minor_arg(value: PyObjectRef) -> Result<libc::dev_t, crate::PyError> {
             // Where `NODEV` is spelled -1 that one value passes through, rather
@@ -6028,12 +6028,37 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         #[cfg(target_vendor = "apple")]
         unsafe extern "C" {
             #[link_name = "getgroups$DARWIN_EXTSN"]
-            fn getgroups_unlimited(gidsetsize: libc::c_int, grouplist: *mut libc::gid_t)
-            -> libc::c_int;
+            fn getgroups_unlimited(
+                gidsetsize: libc::c_int,
+                grouplist: *mut libc::gid_t,
+            ) -> libc::c_int;
+        }
+
+        /// The group list, sized by the count the kernel reports first.
+        #[cfg(target_vendor = "apple")]
+        fn host_getgroups() -> std::io::Result<Vec<libc::gid_t>> {
+            let count = unsafe { getgroups_unlimited(0, std::ptr::null_mut()) };
+            if count < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut groups = Vec::<libc::gid_t>::with_capacity(count as usize);
+            let filled = unsafe { getgroups_unlimited(count, groups.as_mut_ptr()) };
+            if filled < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe { groups.set_len(filled as usize) };
+            Ok(groups)
+        }
+
+        /// Elsewhere one symbol answers the question and `host_env` names it.
+        #[cfg(not(target_vendor = "apple"))]
+        fn host_getgroups() -> std::io::Result<Vec<libc::gid_t>> {
+            host_posix::getgroups()
         }
 
         /// Replace the supplementary group list.  The `host_env` binding for
         /// this call is gated off on the apple targets, which do have it.
+        #[cfg(target_vendor = "apple")]
         fn host_setgroups(groups: &[libc::gid_t]) -> std::io::Result<()> {
             let ret = unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()) };
             if ret != 0 {
@@ -6042,23 +6067,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Ok(())
         }
 
-        /// The group list, sized by the count the kernel reports first.
-        fn host_getgroups() -> std::io::Result<Vec<libc::gid_t>> {
-            #[cfg(not(target_vendor = "apple"))]
-            use libc::getgroups as getgroups_unlimited;
-
-            let count = unsafe { getgroups_unlimited(0, std::ptr::null_mut()) };
-            if count < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let mut groups = Vec::<libc::gid_t>::with_capacity(count as usize);
-            let filled =
-                unsafe { getgroups_unlimited(count, groups.as_mut_ptr()) };
-            if filled < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            unsafe { groups.set_len(filled as usize) };
-            Ok(groups)
+        #[cfg(not(target_vendor = "apple"))]
+        fn host_setgroups(groups: &[libc::gid_t]) -> std::io::Result<()> {
+            host_posix::setgroups_raw(groups)
         }
 
         // os.getgroups() -> list[int]
@@ -6086,21 +6097,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "setgroups",
                 |args| {
-                    let Some(&seq) = args.first() else {
-                        return Err(crate::PyError::type_error(
-                            "setgroups() requires 1 argument",
-                        ));
+                    let Some(&w_list) = args.first() else {
+                        return Err(crate::PyError::type_error("setgroups() requires 1 argument"));
                     };
-                    let items = crate::builtins::sequence_fast(seq, "setgroups(): argument must be a sequence")?;
-                    let mut groups = Vec::with_capacity(items.len());
-                    for item in items {
-                        let value = crate::baseobjspace::space_index(item)?;
-                        let value = crate::baseobjspace::uint_w(value)?;
-                        groups.push(libc::gid_t::try_from(value).map_err(|_| {
-                            crate::PyError::overflow_error(
-                                "Python int too large to convert to C gid_t",
-                            )
-                        })?);
+                    // interp_posix.py:1053-1064 — the list is unpacked as any
+                    // iterable and each element read with `c_uid_t_w`, which is
+                    // what lets -1 name `(gid_t)-1` instead of being refused.
+                    let items = crate::builtins::collect_iterable(w_list)?;
+                    let mut groups: Vec<libc::gid_t> = Vec::with_capacity(items.len());
+                    for w_gid in items {
+                        groups.push(crate::baseobjspace::c_uid_t_w(w_gid)?);
                     }
                     host_setgroups(&groups).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
