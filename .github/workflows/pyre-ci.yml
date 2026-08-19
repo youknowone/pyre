@@ -414,9 +414,14 @@ jobs:
 
     - name: Build test binaries (cranelift)
       shell: bash
-      # Keep this package list identical to the cranelift test step below.
+      # Keep the package list AND the feature list identical to the cranelift
+      # test step below. This step exists only to compile what that step then
+      # runs, so a feature the two do not share defeats it twice: the binaries
+      # built here are ones nobody runs, and the test step still has to compile
+      # the stack it does run. `cpyext` changes the pyre-interpreter/pyrex
+      # build, so it belongs in both.
       run: |
-        cargo test --no-run --no-default-features --features cranelift \
+        cargo test --no-run --no-default-features --features cranelift,cpyext \
           -p majit-metainterp -p majit-backend-cranelift \
           -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
           -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
