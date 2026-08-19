@@ -1983,9 +1983,18 @@ impl Assembler {
                 // dispatches the `i`-index argcode; a ref/float index is a
                 // kind-flow bug upstream of the codewriter — fail here rather
                 // than emit an unconsumable ref-index (`rrd`/`ird`) shape.
+                //
+                // The array's identity is part of the report: one graph can
+                // hold several `getarrayitem_gc`s and only some of them carry
+                // the bad index, so without it the message names the graph and
+                // leaves the op to be found by bisection.
                 assert_eq!(
                     kc, 'i',
-                    "getarrayitem_gc array index must be int-kind, got {kc:?}",
+                    "getarrayitem_gc array index must be int-kind, got {kc:?} — \
+                     graph {:?}, array_type_id {array_type_id:?}, item_ty \
+                     {item_ty:?}, flatop {:?} (set MAJIT_COVERAGE_PANIC=1 to \
+                     populate the flatop context)",
+                    self.current_graph_name, self.current_flatop_debug,
                 );
                 state.code.push(reg);
                 argcodes.push(kc);
