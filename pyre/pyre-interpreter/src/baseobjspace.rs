@@ -11406,6 +11406,49 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
     }
 }
 
+/// Trace-time predicate for the read-only-data-descriptor STORE_ATTR raise.
+///
+/// `objspace.py:723-739` reaches the terminal descriptor error only when the
+/// receiver keeps `object.__setattr__`, the class MRO resolves `name`, and the
+/// descriptor type resolves no `__set__` but does resolve `__delete__`.  The
+/// caller guards both type version tags before folding the raise, so later MRO
+/// mutation side-exits instead of reusing this answer.
+///
+/// The property, member, and getset families are deliberately excluded: their
+/// dedicated arms in `set` and `descr_has_delete` have value- and
+/// descriptor-specific behaviour rather than the general
+/// `descroperation.py:114-126` terminal.
+pub fn readonly_descr_attr_raise_is_stable(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    unsafe {
+        if obj.is_null()
+            || !is_instance(obj)
+            || pyre_object::is_exception(obj)
+            || name == "__dict__"
+        {
+            return None;
+        }
+        let w_type = w_instance_get_type(obj);
+        if w_type.is_null() || setattr_if_not_from_object(w_type).is_some() {
+            return None;
+        }
+        let descr = lookup_in_type_where(w_type, name)?;
+        if is_property(descr)
+            || pyre_object::is_member(descr)
+            || pyre_object::typedef::is_getset_property(descr)
+        {
+            return None;
+        }
+        let descr_type = crate::typedef::r#type(descr)?.as_ptr();
+        if descr_type.is_null()
+            || lookup_in_type_where(descr_type, "__set__").is_some()
+            || lookup_in_type_where(descr_type, "__delete__").is_none()
+        {
+            return None;
+        }
+        Some(descr)
+    }
+}
+
 /// The `W_BaseException` typedef's attribute writes, shared by the
 /// per-class `GetSetProperty` descriptors and the instance-attribute store
 /// path.  `PY_NULL` means the name is not one this exception kind

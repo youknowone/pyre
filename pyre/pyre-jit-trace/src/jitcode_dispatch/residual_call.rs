@@ -6331,6 +6331,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 )? {
                     return Ok(outcome);
                 }
+                if let Some(outcome) = try_walker_trace_readonly_descr_attr_raise(
+                    ctx,
+                    op,
+                    obj_opref,
+                    value_opref,
+                    w_code_ptr,
+                    namei as usize,
+                )? {
+                    return Ok(outcome);
+                }
                 if let Some(specialization) = spec_gate_store_attr(|| {
                     try_walker_specialize_store_attr(
                         ctx,
