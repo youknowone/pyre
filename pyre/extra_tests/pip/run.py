@@ -160,18 +160,29 @@ class Context:
         return self.venv / SCRIPTS / f"{name}{EXE}"
 
     def env(self) -> dict[str, str]:
-        """The child environment, pinned so no check can reach an index.
+        """The child environment, pinned so no check inherits a wheel source.
 
-        Three of these are belt and braces over the `--no-index` every install
-        already carries: a developer's or runner's `pip.conf` can re-add an
-        index and a find-links, and an inherited cache can answer a resolve
-        that should have failed. The dead index URL turns any path that
-        survives all of that into an immediate error instead of a timeout, and
-        the first check asserts that it does.
+        Every `PIP_*` the caller had is dropped, not just the ones with an
+        obvious reach: pip takes a long option's value from the matching
+        `PIP_*` name, and `--find-links` is one of them. `--no-index` closes
+        the index and leaves link directories open, so a developer or a runner
+        with a configured wheelhouse would resolve the isolated build's
+        backend from outside the checkout and still see a green gate. The
+        `pip download` guard cannot catch that on its own -- it asks for a
+        name a wheelhouse has no reason to carry.
+
+        A configuration file is another such source and is disowned in both
+        modes: the networked leg wants the default index rather than whichever
+        mirror the host is pointed at. What is left is the dead index URL,
+        which turns any resolve that still gets out into an immediate error
+        rather than a timeout -- and the guard asserts it does.
         """
-        env = dict(os.environ)
+        env = {
+            name: value for name, value in os.environ.items() if not name.startswith("PIP_")
+        }
         env.update(
             {
+                "PIP_CONFIG_FILE": os.devnull,
                 "PIP_NO_INPUT": "1",
                 "PIP_NO_CACHE_DIR": "1",
                 "PIP_DISABLE_PIP_VERSION_CHECK": "1",
@@ -183,7 +194,6 @@ class Context:
         if not self.network:
             env.update(
                 {
-                    "PIP_CONFIG_FILE": os.devnull,
                     "PIP_INDEX_URL": "http://127.0.0.1:1/simple",
                     "PIP_RETRIES": "0",
                     "PIP_TIMEOUT": "5",
@@ -457,11 +467,14 @@ def check_uninstall(ctx: Context) -> None:
     )
     _contains(result, "Successfully uninstalled stpkg-0.2.0")
     _contains(result, "Successfully uninstalled tinypkg-0.1.0")
-    gone = _spawn(ctx, [ctx.python, "-P", "-c", "import stpkg"], cwd=ctx.root)
-    if gone.returncode == 0:
-        raise Failed("the module still imports after being uninstalled", gone.describe())
-    if "ModuleNotFoundError" not in gone.output:
-        raise Failed("import failed for some other reason", gone.describe())
+    # Both, separately: one command reported two uninstalls, and a module left
+    # behind by either of them is the thing worth catching.
+    for module in ("stpkg", "tinypkg"):
+        gone = _spawn(ctx, [ctx.python, "-P", "-c", f"import {module}"], cwd=ctx.root)
+        if gone.returncode == 0:
+            raise Failed(f"{module} still imports after being uninstalled", gone.describe())
+        if "ModuleNotFoundError" not in gone.output:
+            raise Failed(f"the {module} import failed for some other reason", gone.describe())
     if ctx.script("stpkg-hi").exists():
         raise Failed(f"{ctx.script('stpkg-hi')} outlived its distribution")
 
