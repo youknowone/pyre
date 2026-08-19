@@ -80,10 +80,14 @@ pub mod _ssl;
 #[allow(non_snake_case)]
 pub mod _stat;
 #[allow(non_snake_case)]
+pub mod _statistics;
+#[allow(non_snake_case)]
 pub mod _symtable;
 #[allow(non_snake_case)]
 pub mod _template;
 pub mod _tokenize;
+#[allow(non_snake_case)]
+pub mod _types;
 #[allow(non_snake_case)]
 pub mod _typing;
 pub mod _warnings;

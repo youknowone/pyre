@@ -376,7 +376,7 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
 /// full rich-comparison surface, pickle reducer and `__replace__`.  Storage
 /// remains PyPy-shaped: the values live in the instance dict, not a side
 /// table or a second native mapping.
-fn simple_namespace_type() -> PyObjectRef {
+pub(crate) fn simple_namespace_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     let raw = *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("types.SimpleNamespace", |ns| {

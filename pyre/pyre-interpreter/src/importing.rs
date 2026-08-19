@@ -754,6 +754,8 @@ pub fn install_builtin_modules() {
         crate::module::array::startup_array_module,
     );
     register_builtin_module("_csv", crate::module::_csv::init);
+    register_builtin_module("_statistics", crate::module::_statistics::init);
+    register_builtin_module("_types", crate::module::_types::init);
     register_builtin_module("_json", crate::module::_json::init);
     register_builtin_module("_tokenize", crate::module::_tokenize::init);
     // `_scproxy` is built only on macOS, and `urllib.request` reaches it only

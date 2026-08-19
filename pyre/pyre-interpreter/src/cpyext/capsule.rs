@@ -22,7 +22,7 @@ const DESTRUCTOR_KEY: &str = "__pyre_destructor__";
 
 static CAPSULE_TYPE: OnceLock<usize> = OnceLock::new();
 
-fn capsule_type() -> PyObjectRef {
+pub(crate) fn capsule_type() -> PyObjectRef {
     *CAPSULE_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("PyCapsule", |ns| unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
