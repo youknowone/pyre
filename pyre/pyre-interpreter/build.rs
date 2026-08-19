@@ -73,6 +73,16 @@ fn main() {
             .compile("pyre_cjkcodecs_jp");
     }
 
+    // `__try`/`__except` is the only thing that reaches a structured exception
+    // and no Rust compiler emits one, so the fence a foreign call is made
+    // inside (`src/module/_ctypes/seh.rs`) is a C translation unit of its own.
+    if target.ends_with("-pc-windows-msvc") {
+        println!("cargo:rerun-if-changed=src/module/_ctypes/seh.c");
+        cc::Build::new()
+            .file("src/module/_ctypes/seh.c")
+            .compile("pyre_ctypes_seh");
+    }
+
     // Only do work for the wasm_vfs feature; native builds need nothing here.
     if std::env::var_os("CARGO_FEATURE_WASM_VFS").is_none() {
         return;

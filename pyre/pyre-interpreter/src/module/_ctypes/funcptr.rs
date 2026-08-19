@@ -24,6 +24,11 @@ use std::sync::OnceLock;
 /// `_flags_ & FUNCFLAG_USE_ERRNO` — swap the ctypes-local errno around the call.
 pub(super) const FUNCFLAG_USE_ERRNO: i64 = 0x8;
 
+/// `_flags_ & FUNCFLAG_USE_LASTERROR` — swap the ctypes-local last error
+/// around the call, so `ctypes.get_last_error()` reports what the callee set
+/// and no call made since can have overwritten it.
+pub(super) const FUNCFLAG_USE_LASTERROR: i64 = 0x10;
+
 /// Reserved instance-dict keys.
 const PTR_KEY: &str = "_ptr";
 const RESTYPE_KEY: &str = "_restype";
@@ -605,20 +610,24 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .collect();
 
     let addr = funcptr_addr(self_obj);
-    let use_errno = funcptr_flags(self_obj) & FUNCFLAG_USE_ERRNO != 0;
+    let flags = funcptr_flags(self_obj);
     let options = host_ctypes::CallOptions {
-        use_errno,
-        ..Default::default()
+        use_errno: flags & FUNCFLAG_USE_ERRNO != 0,
+        use_last_error: flags & FUNCFLAG_USE_LASTERROR != 0,
     };
     // `clibffi.py:350-352` declares `ffi_call` with the default
     // `releasegil='auto'`, i.e. released: the callee is arbitrary foreign code
     // and may block on another Python thread's progress.  `owned` / `keepalive`
-    // hold the marshalled buffers across the released window.
+    // hold the marshalled buffers across the released window.  Being arbitrary
+    // foreign code is also why the call goes inside `seh::guard`, which is what
+    // stands between a faulting callee and the process.
     let result = {
         let _blocked = crate::module::thread::before_external_block();
-        host_ctypes::call(addr, &host_args, restype, options)
-    }
-    .map_err(|e| match e {
+        super::seh::guard(|| host_ctypes::call(addr, &host_args, restype, options))
+    };
+    // `owned` / `keepalive` must outlive the call above.
+    drop(keepalive);
+    let result = result?.map_err(|e| match e {
         host_ctypes::CallError::NullFunctionPointer => {
             crate::PyError::value_error("NULL function pointer")
         }
@@ -629,8 +638,6 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             format!("aggregate argument buffer too small: expected {expected}, got {got}"),
         ),
     });
-    // `owned` / `keepalive` must outlive the call above.
-    drop(keepalive);
     let result = result?;
     match ret {
         Ret::Pointer(rt) => {

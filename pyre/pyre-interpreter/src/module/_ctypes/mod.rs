@@ -26,4 +26,6 @@ pub mod funcptr;
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 pub mod metaclass;
 #[cfg(all(any(unix, windows), feature = "host_env"))]
+mod seh;
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 pub mod stginfo;
