@@ -721,18 +721,33 @@ mod profiler_methods {
             if self.is_enabled {
                 return Ok(());
             }
-            // `_lsprof.c profiler_enable` claims the profiler tool id before
-            // touching any of its own state, so a second profiler's `enable`
-            // reports the conflict and leaves the first one installed.
+            // `subcalls` and `builtins` are declared `bool`, so their truth
+            // value is taken while the arguments are parsed -- before
+            // `profiler_enable` reaches `use_tool_id`. Converting them after
+            // the claim instead would leave the tool id held when `__bool__`
+            // raises, and nothing could release it: `disable` returns early
+            // while `is_enabled` is still false.
+            let flag = |w: PyObjectRef| -> Result<Option<bool>, crate::PyError> {
+                if unsafe { pyre_object::is_none(w) } {
+                    Ok(None)
+                } else {
+                    Ok(Some(crate::baseobjspace::is_true(w)?))
+                }
+            };
+            let subcalls = flag(w_subcalls)?;
+            let builtins = flag(w_builtins)?;
+            // The tool id is claimed before any of the profiler's own state is
+            // touched, so a second profiler's `enable` reports the conflict and
+            // leaves the first one installed.
             crate::module::sys::vm::monitoring_use_tool_id(
                 crate::module::sys::vm::MONITORING_PROFILER_ID,
                 w_str_new("cProfile"),
             )?;
-            if !unsafe { pyre_object::is_none(w_subcalls) } {
-                self.subcalls = crate::baseobjspace::is_true(w_subcalls)?;
+            if let Some(value) = subcalls {
+                self.subcalls = value;
             }
-            if !unsafe { pyre_object::is_none(w_builtins) } {
-                self.builtins = crate::baseobjspace::is_true(w_builtins)?;
+            if let Some(value) = builtins {
+                self.builtins = value;
             }
             self.is_enabled = true;
             self.total_real_time -= read_real_time();
