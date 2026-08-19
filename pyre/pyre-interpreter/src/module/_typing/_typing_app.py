@@ -581,11 +581,10 @@ class ParamSpecArgs(_Immutable, metaclass=_ImmutableTypeMeta):
             return NotImplemented
         return self.__origin__ == other.__origin__
 
-    # The native `paramspecargs` type defines only rich comparison, so it keeps
-    # `object`'s identity hash. Defining `__eq__` at app level would otherwise
-    # set `__hash__` to None and make `P.args` unhashable, which breaks the
-    # caches and sets `typing` builds during substitution.
-    __hash__ = object.__hash__
+    # `P.args` builds a fresh object per access while `__eq__` compares by
+    # origin, so an identity hash would give equal objects different hashes.
+    # The native `paramspecargs` supplies `tp_richcompare` and no `tp_hash`,
+    # which is the unhashable that leaving `__hash__` alone reproduces here.
 
     def __mro_entries__(self, bases):
         raise TypeError("Cannot subclass an instance of ParamSpecArgs")
@@ -613,8 +612,7 @@ class ParamSpecKwargs(_Immutable, metaclass=_ImmutableTypeMeta):
             return NotImplemented
         return self.__origin__ == other.__origin__
 
-    # See `ParamSpecArgs.__hash__`.
-    __hash__ = object.__hash__
+    # Unhashable for the reason given on `ParamSpecArgs`.
 
     def __mro_entries__(self, bases):
         raise TypeError("Cannot subclass an instance of ParamSpecKwargs")

@@ -1755,9 +1755,14 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
     let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
     // Register the trace into the shared indirect function table so it is
     // reachable by table index. `grow` returns the newly appended slot.
-    let entries = if trace_wide.is_some() { 2 } else { 1 };
+    //
+    // The pair is appended even for a narrow module. An emitted module names
+    // its wide entry `handle + 1`, and `jit_replace` may install a wide entry
+    // where this compile had none; without the reservation that write would
+    // land on the next trace's own entry. The spare slot holds the narrow
+    // function, which nothing calls: absence is encoded as `wide_slot == 0`.
     let slot = table
-        .grow(&mut *caller, entries, Ref::Func(Some(trace)))
+        .grow(&mut *caller, 2, Ref::Func(Some(trace)))
         .context("register trace into shared table")? as u32;
     if let Some(wide) = trace_wide {
         table

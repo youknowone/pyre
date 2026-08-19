@@ -927,6 +927,14 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(obj);
+    // The shadow-stack root forwards the wrapper itself; only the raw walker
+    // driven from this registry reaches its `co_consts_w` slots. Enrol an
+    // off-GC wrapper before the fill loop, or a collection triggered by a
+    // later constant reclaims the constants already published into it. A
+    // managed wrapper is traced from its own allocation and stays out.
+    if !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        register_prebuilt_code_root(obj);
+    }
     if code_ptr_aligned {
         let consts_len = unsafe { &*(code_ptr as *const crate::CodeObject) }
             .constants
@@ -935,11 +943,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
             unsafe { w_code_const(pyre_object::gc_roots::shadow_stack_get(obj_slot), index) };
         }
     }
-    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    if !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
-        register_prebuilt_code_root(obj);
-    }
-    obj
+    pyre_object::gc_roots::shadow_stack_get(obj_slot)
 }
 
 /// pypy/interpreter/pycode.py `PyCode.__init__` shorthand —

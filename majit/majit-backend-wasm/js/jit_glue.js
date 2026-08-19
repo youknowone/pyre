@@ -125,17 +125,19 @@ export function jit_replace_wasm(funcId, bytesPtr, bytesLen) {
 function registerTrace(entries) {
   const { trace, wide } = entries;
   let id;
+  // The pair is appended even for a narrow module, mirroring the wasmtime
+  // host. An emitted module names its wide entry `id + 1`, and a later
+  // `jit_replace_wasm` may install one where this compile had none; without
+  // the reservation that write would land on the next trace's own entry.
   if (mainTable) {
-    id = mainTable.grow(wide ? 2 : 1);
+    id = mainTable.grow(2, trace);
     mainTable.set(id, trace);
     if (wide) {
       mainTable.set(id + 1, wide);
     }
   } else {
-    id = nextFuncId++;
-    if (wide) {
-      nextFuncId++;
-    }
+    id = nextFuncId;
+    nextFuncId += 2;
   }
   funcTable[id] = trace;
   if (wide) {

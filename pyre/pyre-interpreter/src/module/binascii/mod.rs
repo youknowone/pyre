@@ -66,8 +66,15 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
             }
             Ok(s.as_bytes().to_vec())
         } else {
-            crate::typedef::require_contiguous_buffer(obj)?;
-            match crate::typedef::buffer_as_bytes_like(obj)? {
+            // `ascii_buffer_converter` replaces every buffer-acquisition
+            // failure with the type error below, so a released or
+            // non-contiguous memoryview names its own type rather than
+            // surfacing the ValueError or BufferError the acquisition
+            // raised. Only the `b2a_*` converter keeps those.
+            let acquired = crate::typedef::require_contiguous_buffer(obj)
+                .and_then(|()| crate::typedef::buffer_as_bytes_like(obj))
+                .unwrap_or(None);
+            match acquired {
                 Some(src) => Ok(bytesobject::bytes_like_data(src).to_vec()),
                 None => Err(crate::PyError::type_error(format!(
                     "argument should be bytes, buffer or ASCII string, not '{}'",
