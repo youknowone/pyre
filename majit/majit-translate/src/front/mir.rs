@@ -7726,7 +7726,16 @@ impl<'a> Lowering<'a> {
                         .flatten()
                         .and_then(|rt| append_accumulator_of_arg_temp(self.body, self.llbc, rt))
                 {
-                    let concat = emit_str_add(&mut self.graph, bb_id, &args[acc_i], &args[piece_i]);
+                    // Concatenate onto the accumulator's current binding
+                    // (`local_var[buf_local]`), not `args[acc_i]`: the latter is
+                    // the value the `&mut buf` borrow resolved to, which an
+                    // earlier append in the same block — or the loop-header phi —
+                    // may already have superseded.  Fall back to the borrow value
+                    // only if the slot is somehow unbound.
+                    let acc_val = self.local_var[buf_local]
+                        .clone()
+                        .unwrap_or_else(|| args[acc_i].clone());
+                    let concat = emit_str_add(&mut self.graph, bb_id, &acc_val, &args[piece_i]);
                     self.local_var[buf_local] = Some(concat);
                     self.local_var[dest_local] = Some(
                         self.graph
