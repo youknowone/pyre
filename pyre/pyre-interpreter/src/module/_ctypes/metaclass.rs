@@ -1246,10 +1246,7 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
                 }
                 return Ok(pyre_object::longobject::w_long_new(BigInt::from(raw)));
             }
-            Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
-                &tc,
-                &field_bytes,
-            )))
+            Ok(cdata::decode_slot(&tc, &field_bytes))
         }
         "array" => {
             let element = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
@@ -1319,6 +1316,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 cdata::cdata_write(obj, offset, &bytes);
                 return Ok(pyre_object::w_none());
             }
+            cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             let mut bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
             if field_needs_swap(obj, proto, size) {
                 bytes.reverse();
@@ -1919,10 +1917,7 @@ fn array_get_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResult {
                 .ok_or_else(|| crate::PyError::type_error("instance has no buffer"))?;
             let end = (offset + meta.element_size).min(all.len());
             let start = offset.min(end);
-            Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
-                &tc,
-                &all[start..end],
-            )))
+            Ok(cdata::decode_slot(&tc, &all[start..end]))
         }
         "struct" | "union" | "array" | "pointer" => Ok(cdata::make_indexed_subview(
             meta.proto,
@@ -1958,6 +1953,7 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
         "simple" => {
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
+            cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             let bytes = cdata::encode_instance_or_value(&tc, value, obj, &idx.to_string())?;
             cdata::cdata_write(obj, offset, &bytes);
             if cdata::is_cdata_instance(value) {
@@ -2421,9 +2417,7 @@ fn pointer_get_index(obj: PyObjectRef, index: isize) -> PyResult {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
             let bytes = unsafe { host_ctypes::borrow_memory(addr as *const u8, element_size) };
-            Ok(cdata::decoded_to_pyobject(host_ctypes::decode_type_code(
-                &tc, bytes,
-            )))
+            Ok(cdata::decode_slot(&tc, bytes))
         }
         _ => Ok(cdata::make_at_address(proto, addr, element_size, obj)),
     }
@@ -2448,6 +2442,7 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
         "simple" => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
+            cdata::release_bstr_slot(&tc, addr);
             let bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
             unsafe { host_ctypes::copy_bytes_to_address(addr, &bytes, element_size) };
             if cdata::is_cdata_instance(value) {
