@@ -6321,8 +6321,10 @@ pub mod fbw_diag {
     pub const ROLLED_BACK_WITH_EFFECTS: usize = 1;
     /// Reachability of the two walk-end flush legs whose resume pc can precede
     /// an effect the walk already recorded, and of the hazardous subset of
-    /// each.  The native corpus reaches neither leg, so these say whether the
-    /// wasm target does.
+    /// each.  The native corpus reached neither leg when these were added — so
+    /// a nonzero value on native is itself the news, and both readers print
+    /// them (a native run that starts reaching a leg must not be the run that
+    /// says nothing).
     pub const MIDBODY_LATCH: usize = 2;
     pub const MIDBODY_LATCH_NEW_UNJOURNALED: usize = 3;
     pub const ESCAPE_PLAIN_FALLBACK: usize = 4;
@@ -6339,6 +6341,44 @@ pub mod fbw_diag {
     /// Successful multi-frame blackhole adoptions. A fall means the walk
     /// stopped handing the interpreter an image and went back to legacy replay.
     pub const BLACKHOLE_ADOPTED_MULTI_FRAME: usize = 13;
+
+    /// The `[jit-stats]` key for each tally slot, in index order, so a slot
+    /// cannot be added without naming it and no reader can print a subset of
+    /// them by accident.  Both readers join these against `get(i)`:
+    /// `pyre/pyrex` reads them directly, `pyre-wasm-runner` mirrors the array
+    /// positionally (it links no pyre crate), so a native and a wasm
+    /// `[jit-stats] fbw_diag` line carry the same keys in the same order and
+    /// diff field by field.
+    ///
+    /// Two of the pairs are a subset and its population, and the subset is the
+    /// hazardous half: `..._NEW_UNJOURNALED` counts inside `MIDBODY_LATCH`, and
+    /// `..._UNCLEAN` inside `ESCAPE_PLAIN_FALLBACK`.  They are named rather
+    /// than printed as a `subset/total` fraction because `check.py`'s
+    /// `_jit_stats_merged` folds every `[jit-stats]` line into one flat
+    /// `key -> value` map and reads each value as an integer.
+    ///
+    /// Every key is `fbw_`-prefixed for that same reason: that map is flat and
+    /// shared with every other counter, so a bare name like `portal_only`
+    /// collides with whatever else ever picks it.
+    ///
+    /// The length is `RING_BASE` because the tallies are exactly the slots
+    /// below the ring.
+    pub const LABELS: [&str; RING_BASE] = [
+        "fbw_walks",
+        "fbw_rolled_back_with_effects",
+        "fbw_midbody_latch",
+        "fbw_midbody_latch_new_unjournaled",
+        "fbw_escape_plain_fallback",
+        "fbw_escape_plain_fallback_unclean",
+        "fbw_escape_portal_only",
+        "fbw_escape_published_callee_only",
+        "fbw_escape_portal_and_published_callee",
+        "fbw_force_by_portal",
+        "fbw_force_by_callee_only",
+        "fbw_store_journal_rollback_failed",
+        "fbw_blackhole_adopted_single_frame",
+        "fbw_blackhole_adopted_multi_frame",
+    ];
 
     /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
     /// slot, little-endian) followed by one slot of packed counters.  A `u64`

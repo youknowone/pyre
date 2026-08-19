@@ -926,42 +926,35 @@ fn maybe_print_jit_stats() {
     if descr_demanded != 0 {
         eprintln!("[jit-stats] descr_demand touched={descr_demanded} pool={descr_pool}");
     }
-    eprintln!(
-        "[jit-stats] fbw_escape_split portal_only={} published_callee_only={} portal_and_published_callee={}",
-        pyre_jit::fbw_diag_counter(6),
-        pyre_jit::fbw_diag_counter(7),
-        pyre_jit::fbw_diag_counter(8),
-    );
-    eprintln!(
-        "[jit-stats] fbw_force_attrib by_portal={} by_callee_only={}",
-        pyre_jit::fbw_diag_counter(9),
-        pyre_jit::fbw_diag_counter(10),
-    );
-    // Walks that ended uncommitted after a residual had already run an effect
-    // no journal undoes — it wrote live heap or entered a Python frame — so the
-    // replay the caller falls back to applies that effect twice.
-    // `fbw_diag::ROLLED_BACK_WITH_EFFECTS`, which the wasm runner also exports;
-    // a nonzero value names a walk-abort variant that reaches
-    // `run_perfn_walk`'s epilogue without an adopt leg.
+    // Every full-body-walk tally, joined against the names declared beside the
+    // counters (`pyre_jit_trace::trace::fbw_diag::LABELS`). ALL of them, in
+    // slot order: this reader and the wasm runner used to print two disjoint
+    // subsets, so five slots were bumped on native and printed only by the wasm
+    // host, and five more the other way round — a counter nobody can read on
+    // the backend that bumps it cannot answer the question it was added for.
+    // The runner prints the same keys in the same order, so the two lines diff
+    // field by field.
     //
-    // `STORE_JOURNAL_ROLLBACK_FAILED` is the hole that subtraction would
-    // otherwise open: a journaled store the rollback could not restore is
-    // subtracted out of the count above, so it needs one of its own.
+    // What the individual slots mean is documented at the declaration; the
+    // gated ones are why this line may not lose a key silently:
     //
-    // The two adoption tallies are the same population read from the other end:
-    // the walks that DID hand the interpreter a resumable image. Nothing else
-    // counts them, so a change that silently sends a shape back to the legacy
-    // replay moves no gated counter without these.
-    eprintln!(
-        "[jit-stats] fbw_rolled_back_with_effects={} \
-         fbw_store_journal_rollback_failed={} \
-         fbw_blackhole_adopted_single_frame={} \
-         fbw_blackhole_adopted_multi_frame={}",
-        pyre_jit::fbw_diag_counter(1),
-        pyre_jit::fbw_diag_counter(11),
-        pyre_jit::fbw_diag_counter(12),
-        pyre_jit::fbw_diag_counter(13),
-    );
+    // * `fbw_rolled_back_with_effects` — walks that ended uncommitted after a
+    //   residual had already run an effect no journal undoes (it wrote live
+    //   heap or entered a Python frame), so the replay the caller falls back to
+    //   applies that effect twice. A nonzero value names a walk-abort variant
+    //   that reaches `run_perfn_walk`'s epilogue without an adopt leg.
+    // * `fbw_store_journal_rollback_failed` — the hole subtraction would
+    //   otherwise open: a journaled store the rollback could not restore is
+    //   subtracted out of the count above, so it needs one of its own.
+    // * the two adoption tallies are the same population read from the other
+    //   end: the walks that DID hand the interpreter a resumable image. Nothing
+    //   else counts them, so a change that silently sends a shape back to the
+    //   legacy replay moves no gated counter without these.
+    let mut fbw = String::from("[jit-stats] fbw_diag");
+    for (slot, key) in pyre_jit::FBW_DIAG_LABELS.iter().enumerate() {
+        fbw.push_str(&format!(" {key}={}", pyre_jit::fbw_diag_counter(slot)));
+    }
+    eprintln!("{fbw}");
     let stats = pyre_jit::eval::driver_pair().0.get_stats();
     eprintln!(
         "[jit-stats] loops_compiled={} bridges_compiled={} retraces_compiled={} loops_aborted={} \

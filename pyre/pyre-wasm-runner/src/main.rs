@@ -786,6 +786,13 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // the native backends print as `[fbw-census]` under PYRE_FBW_CENSUS,
         // which the guest cannot read. Slot layout in
         // `pyre_jit_trace::trace::fbw_diag`.
+        //
+        // The tallies BELOW the ring are not printed here: they live on the
+        // `[jit-stats] fbw_diag` line in the MAJIT_STATS block, which is the
+        // gate the native reader prints its copy under, so the two lines can be
+        // diffed from runs made the same way. check.py never sets
+        // PYRE_WASM_JIT_STATS, so printing them here would have kept them off
+        // every gated wasm run.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
             const RING_BASE: u32 = 14;
             const RING_ENTRIES: u32 = 24;
@@ -793,17 +800,6 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             const NAME_SLOTS: u32 = 4;
             let mut slot = |i: u32| fbw.call(&mut store, i).unwrap_or(0);
             let walks = slot(0);
-            eprintln!(
-                "[jit-stats] fbw_diag walks={walks} ROLLED_BACK_WITH_EFFECTS={} \
-                 midbody_latch={}/{} escape_plain_fallback={}/{} \
-                 fbw_store_journal_rollback_failed={}",
-                slot(1),
-                slot(3),
-                slot(2),
-                slot(5),
-                slot(4),
-                slot(11),
-            );
             for entry in 0..RING_ENTRIES.min(walks as u32) {
                 let base = RING_BASE + entry * RING_STRIDE;
                 let mut end = String::new();
@@ -1061,36 +1057,70 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         let field_pos_parent_empty = counter("pyre_jit_field_pos_parent_empty", &mut missing);
         let field_pos_rederived = counter("pyre_jit_field_pos_rederived", &mut missing);
         let field_pos_unresolved = counter("pyre_jit_field_pos_unresolved", &mut missing);
-        // Walks that ended uncommitted after a residual had already run an
-        // irreversible effect. Reached through the slot-indexed `pyre_fbw_diag`
-        // export rather than a counter of its own; slot 1 is
-        // `pyre_jit_trace::trace::fbw_diag::ROLLED_BACK_WITH_EFFECTS`. It carries
-        // the same key the native backends print, because `_jit_stats_change`
-        // compares by name and a name only one backend emits gates nothing on
-        // the others.
-        // Slot 11 is `STORE_JOURNAL_ROLLBACK_FAILED`, the store restores the
-        // rollback could not perform — the one journaled effect the walk-end
-        // subtraction must not silently absorb. Both slots come from one
-        // export lookup so an absent export names itself once.
-        let (
-            fbw_rolled_back_with_effects,
-            fbw_store_journal_rollback_failed,
-            fbw_blackhole_adopted_single_frame,
-            fbw_blackhole_adopted_multi_frame,
-        ) = match instance
+        // Every full-body-walk tally, reached through the slot-indexed
+        // `pyre_fbw_diag` export rather than a counter export of its own.
+        //
+        // POSITIONAL MIRROR of `pyre_jit_trace::trace::fbw_diag::LABELS` — the
+        // same discipline as the mc_diag labels above, since the runner links
+        // no pyre crate: a slot added there must be APPENDED here, and the two
+        // arrays make this line and the native reader's
+        // (`pyre/pyrex/src/lib.rs`) carry the same keys in the same order.
+        // Printing a subset is what this replaces: the two readers used to
+        // print disjoint halves, so five slots were bumped on native and
+        // readable only on wasm, and five more the other way round.
+        //
+        // The second of each `*_latch` / `*_plain_fallback` pair is the
+        // HAZARDOUS SUBSET of the first — `..._new_unjournaled` counts inside
+        // `fbw_midbody_latch`, `..._unclean` inside
+        // `fbw_escape_plain_fallback` — which is what the `subset/total`
+        // fraction this line used to print said. They are named instead of
+        // divided because check.py folds every `[jit-stats]` line into one flat
+        // `key -> value` map and reads each value as an integer.
+        //
+        // Four of these are gated: slot 1 (`ROLLED_BACK_WITH_EFFECTS`, walks
+        // that ended uncommitted after a residual had already run an
+        // irreversible effect), slot 11 (`STORE_JOURNAL_ROLLBACK_FAILED`, the
+        // store restores the rollback could not perform — the one journaled
+        // effect the walk-end subtraction must not silently absorb) and the two
+        // adoption tallies. They carry the same keys the native backends print,
+        // because `_jit_stats_change` compares by name and a name only one
+        // backend emits gates nothing on the others; and they must not resolve
+        // to 0 when the export is absent, which reads as healthy. Hence the one
+        // lookup feeding the refusal below, and hence this line — not the
+        // counter line — being where those four keys are emitted now.
+        // Both arrays take their length from this one constant, so a label
+        // added without a slot (or the reverse) is a compile error rather than
+        // a `zip` that silently drops the tail.
+        const FBW_SLOTS: usize = 14;
+        let fbw_labels: [&str; FBW_SLOTS] = [
+            "fbw_walks",
+            "fbw_rolled_back_with_effects",
+            "fbw_midbody_latch",
+            "fbw_midbody_latch_new_unjournaled",
+            "fbw_escape_plain_fallback",
+            "fbw_escape_plain_fallback_unclean",
+            "fbw_escape_portal_only",
+            "fbw_escape_published_callee_only",
+            "fbw_escape_portal_and_published_callee",
+            "fbw_force_by_portal",
+            "fbw_force_by_callee_only",
+            "fbw_store_journal_rollback_failed",
+            "fbw_blackhole_adopted_single_frame",
+            "fbw_blackhole_adopted_multi_frame",
+        ];
+        let fbw_slots = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")
             .and_then(|f| {
-                Ok((
-                    f.call(&mut store, 1)?,
-                    f.call(&mut store, 11)?,
-                    f.call(&mut store, 12)?,
-                    f.call(&mut store, 13)?,
-                ))
+                let mut values = [0u64; FBW_SLOTS];
+                for (slot, value) in values.iter_mut().enumerate() {
+                    *value = f.call(&mut store, slot as u32)?;
+                }
+                Ok(values)
             }) {
-            Ok(slots) => slots,
+            Ok(values) => values,
             Err(_) => {
                 missing.push("pyre_fbw_diag");
-                (0, 0, 0, 0)
+                [0; FBW_SLOTS]
             }
         };
         if !missing.is_empty() {
@@ -1101,6 +1131,11 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             );
             std::process::exit(1);
         }
+        let mut fbw = String::from("[jit-stats] fbw_diag");
+        for (key, value) in fbw_labels.iter().zip(fbw_slots) {
+            fbw.push_str(&format!(" {key}={value}"));
+        }
+        eprintln!("{fbw}");
         eprintln!(
             "[jit-stats] loops_compiled={loops_compiled} \
              bridges_compiled={bridges_compiled} \
@@ -1113,7 +1148,6 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
              descr_set_absent={descr_set_absent} \
              descr_set_ambiguous={descr_set_ambiguous} \
              descr_set_stale_absent={descr_set_stale_absent} \
-             fbw_rolled_back_with_effects={fbw_rolled_back_with_effects} \
              field_pos_spec_checked={field_pos_spec_checked} \
              field_pos_spec_misplaced={field_pos_spec_misplaced} \
              field_pos_attached_checked={field_pos_attached_checked} \
@@ -1121,10 +1155,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
              field_pos_parent_absent={field_pos_parent_absent} \
              field_pos_parent_empty={field_pos_parent_empty} \
              field_pos_rederived={field_pos_rederived} \
-             field_pos_unresolved={field_pos_unresolved} \
-             fbw_store_journal_rollback_failed={fbw_store_journal_rollback_failed} \
-             fbw_blackhole_adopted_single_frame={fbw_blackhole_adopted_single_frame} \
-             fbw_blackhole_adopted_multi_frame={fbw_blackhole_adopted_multi_frame}"
+             field_pos_unresolved={field_pos_unresolved}"
         );
     }
     let packed = match run_result {

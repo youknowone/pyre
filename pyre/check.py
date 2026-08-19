@@ -1208,6 +1208,26 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # removing it. It is printed on the `[jit-stats]` line either way, so a reader
 # diagnosing a `guard_failures` move can still see it.
 
+# The rest of the `fbw_diag` tallies — `fbw_walks`, the two `fbw_midbody_latch*`
+# and `fbw_escape_plain_fallback*` pairs, `fbw_escape_*`, `fbw_force_*` — are
+# deliberately absent too, and unlike `back_edge_polls` that is a decision to
+# revisit rather than a rule. They were emitted with BARE keys (`portal_only`,
+# `by_portal`, …) until they were namespaced, so no committed baseline carries
+# them under any spelling. Two reasons to leave them ungated for now:
+#
+# * They are workload counts, not badness counters: none has a healthy value,
+#   and neither direction is a defect on its own — the same reason
+#   `bridges_compiled` sits in neither regression list. Gating needs a polarity,
+#   and nothing here has measured one yet.
+# * A count that is nonzero on the fbw fixtures reads as 0 on the baseline side
+#   the moment it is listed here (`_jit_stats_change` treats an absent field as
+#   "0"), so adding one would fail every affected baseline until all of them are
+#   re-recorded. That re-record is the decision, and it should be made
+#   deliberately with a polarity in hand, not as a side effect of naming a key.
+#
+# They are on the `[jit-stats] fbw_diag` line on both the native and the wasm
+# reader, so a human can read them without a gate.
+
 
 # Which way each counter has to move to be a regression rather than a gain.
 # Both outcomes fail — a baseline that stopped describing the tree has to be
