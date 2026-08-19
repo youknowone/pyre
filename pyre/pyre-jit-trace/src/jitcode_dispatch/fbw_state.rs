@@ -1741,22 +1741,32 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 /// `disable_noninlinable_function`.  Declining it at its own callsite makes
 /// the next attempt residualize that call, so the surviving nest is
 /// hazard-free and the enclosing loop can compile.
-fn fbw_inline_callee_hazardous<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
+///
+/// The second element names which of the three clauses fired.  The clauses
+/// are not equally tight: `repeat` and `self-recursive` name the frame that
+/// is actually recursing, while `for-iter` fires on any code object whose
+/// bytecode contains a `FOR_ITER` anywhere, whether or not an iterator is in
+/// flight at the decline point.  Reporting them apart is what lets a census
+/// say how much of the decline the loose clause is carrying.
+fn fbw_inline_callee_hazardous<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(usize, &'static str)> {
     let session = ctx.session.borrow();
     let mut seen: Vec<usize> = Vec::with_capacity(session.framestack.len());
     for frame in session.framestack.iter() {
         if seen.contains(&frame.w_code) {
-            return Some(frame.w_code);
+            return Some((frame.w_code, "repeat"));
         }
         seen.push(frame.w_code);
         if let Some(idx) = crate::state::ensure_jitcode_index(frame.w_code as *const ()) {
             if let Some(raw_code) = crate::state::raw_code_for_jitcode_index(idx) {
                 let code = unsafe { raw_code.as_ref() };
                 if let Some(code) = code {
-                    if pyre_interpreter::code_has_for_iter(code)
-                        || pyre_interpreter::code_is_self_recursive(code)
-                    {
-                        return Some(frame.w_code);
+                    if pyre_interpreter::code_has_for_iter(code) {
+                        return Some((frame.w_code, "for-iter"));
+                    }
+                    if pyre_interpreter::code_is_self_recursive(code) {
+                        return Some((frame.w_code, "self-recursive"));
                     }
                 }
             }
@@ -1829,7 +1839,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
             eprintln!(
                 "[lb-arm] pc={pc} cause={cause:?} deferred={} hazard={}",
                 foriter_deferred_inline.is_some(),
-                hazardous_callee.is_some(),
+                hazardous_callee.map(|(_, why)| why).unwrap_or("false"),
             );
         }
         if let Some(callee_code_key) = foriter_deferred_inline {
@@ -1842,7 +1852,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         // the enclosing location is retired, so the loop never compiles at
         // all.  Upstream answers the same situation by denying the callee and
         // letting the enclosing loop retrace (`pyjitpl.py:2818-2828`).
-        if let Some(callee_code_key) = hazardous_callee {
+        if let Some((callee_code_key, _)) = hazardous_callee {
             fbw_deny_hazardous_inline(callee_code_key);
             // `fbw_deny_hazardous_inline` writes a thread-local set that only
             // this walker reads, so the deny stayed invisible to the warm
