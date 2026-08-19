@@ -23,12 +23,16 @@ use majit_ir::{
 // downcast `Arc<dyn Descr>` to a specific concrete trait via type id,
 // so the index itself encodes the discriminant.
 //
-// The Field tag is also load-bearing for `FieldIndexDescr` in
-// `optimizeopt/virtualize.rs:1620-1654` — that synthetic descriptor
-// reconstructs `offset`/`field_size`/`field_type`/`signed` from the
-// packed bits. Replacing the tag with a flat counter is contingent on
-// that synthetic descriptor being replaced with a real
-// `Arc<dyn FieldDescr>` lookup.
+// Nothing decodes the tag any more. It once was load-bearing for a
+// synthetic `FieldIndexDescr` that reconstructed
+// `offset`/`field_size`/`field_type`/`signed` out of the packed bits,
+// but that descriptor and its helpers are gone (`majit-ir`'s `descr`
+// module records the removal): `VirtualizableFieldState.fields` is keyed
+// by `FieldDescr::index_in_parent()` now, matching
+// `info.AbstractStructPtrInfo._fields[fielddescr.get_index()]`
+// (`info.py:203-206`). What the tags still buy is disjoint index ranges,
+// so two descr kinds cannot collide on one `HeapCache` key — a flat
+// counter would have to preserve that much and nothing else.
 const FIELD_DESCR_TAG: u32 = 0x1000_0000;
 const ARRAY_DESCR_TAG: u32 = 0x2000_0000;
 const SIZE_DESCR_TAG: u32 = 0x3000_0000;
