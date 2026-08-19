@@ -2513,16 +2513,21 @@ impl NamespaceOpcodeHandler for PyFrame {
             // the globals dict borrow-based via `getitem_str` + the cell cache).
             let w_globals = self.get_w_globals();
             if !std::ptr::eq(w_locals, w_globals) {
-                let key = unsafe { pyre_object::w_str_new(name) };
-                match crate::baseobjspace::getitem(w_locals, key) {
-                    Ok(value) => return Ok(value),
-                    Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {
-                        // pyopcode.py:LOAD_NAME `if not w_value: w_value =
-                        // ec.space.finditem_str(self.w_globals, name)` —
-                        // a missing locals entry falls through to globals.
-                    }
-                    Err(err) => return Err(err),
+                // pyopcode.py:967-968 `w_value = space.finditem_str(
+                // self.getorcreatedebug().w_locals, varname)`. The probe is
+                // `finditem_str`, not `getitem`: an exact dict answers from its
+                // strategy with the borrowed key, so neither the wrapped key nor
+                // a KeyError is built. A class body reads every one of its names
+                // through here, and the names it does not bind itself — a module
+                // global, a builtin — miss on every pass, which is the miss that
+                // shortcut exists for. `finditem_str` keeps a dict subclass on
+                // the generic path, where a `__getitem__` or `__missing__`
+                // override still runs.
+                if let Some(value) = crate::baseobjspace::finditem_str(w_locals, name)? {
+                    return Ok(value);
                 }
+                // pyopcode.py:972 — a missing locals entry falls through to
+                // `LOAD_GLOBAL_cached`.
             }
             return self.load_global_value(name, nameindex);
         }
