@@ -72,9 +72,9 @@ before any test, a denied resource, or a suite whose every case was skipped).
 
 ## CI
 
-- `.github/workflows/pyre-ci.yml` job `cpython-tests` — gates PRs on the
-  baseline-`PASS` subset, dynasm with **JIT on** (`MAJIT_STRICT=1`), on
-  `ubuntu-24.04` (x86_64). The baseline is recorded on linux-x86_64 and the JIT
+- `.github/workflows/pyre-ci.yml` job `cargo-test-linux`, in its trailing
+  `Run CPython suite` step — gates PRs on the baseline-`PASS` subset, dynasm
+  with **JIT on** (`MAJIT_STRICT=1`), on `ubuntu-24.04` (x86_64). The baseline is recorded on linux-x86_64 and the JIT
   codegen is architecture-specific, so local baseline comparisons must use the
   same host.
 - `.github/workflows/pyre-cpython-nightly.yml` — non-gating nightly `--full`

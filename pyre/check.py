@@ -3095,7 +3095,7 @@ class Check:
 
         Off by default and reached only through `--cpython-suite`: the suite
         costs more wall time than every other stage here put together, and the
-        `cpython-tests` CI job already runs it on its own schedule.  Pass the
+        `cargo-test-linux` CI job already runs it on its own schedule.  Pass the
         flag locally when a change could move a verdict the synthetic corpus
         does not cover.
         """
