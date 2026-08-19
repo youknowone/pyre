@@ -19011,6 +19011,74 @@ mod tests {
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0001);
     }
 
+    /// A raw an earlier LABEL demoted already owns its ref-root word, and the
+    /// collector forwards that word in place. Its SSA value stops being
+    /// refreshed at the moment of demotion — `spill_ref_roots` and
+    /// `reload_ref_roots` both skip a demoted raw — so the collecting call
+    /// between the two LABELs leaves the register holding a pre-collection
+    /// address. A later LABEL's fall-through must therefore not re-store it.
+    #[test]
+    fn a_later_labels_fallthrough_keeps_an_already_demoted_refs_forwarded_home() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xD30F_0005;
+        }
+
+        let mut backend = backend_with_gc(gc);
+        let carried = OpRef::ref_op(1);
+        let guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![rb(carried)]);
+        // Both LABELs carry the same descr so the single back-edge demotes the
+        // position at each of them; the trace then reaches the second LABEL by
+        // fall-through, with a collection in between.
+        let ops = vec![
+            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(60),
+            ),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 3),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(60),
+            ),
+            guard,
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[carried],
+                OpRef::NONE.raw(),
+                make_label_descr(60),
+            ),
+        ];
+        backend.set_constants(indexmap::IndexMap::new());
+
+        let token = JitCellToken::new(1710);
+        backend
+            .compile_loop(&[InputArg::new_ref(0)], &ops, &token)
+            .unwrap();
+        let frame = backend.execute_token(&token, &[Value::Ref(root)]);
+        let moved = backend.get_ref_value(&frame, 0);
+        assert_ne!(
+            moved, root,
+            "the guard published the address the ref had before the collection"
+        );
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0005);
+    }
+
     #[test]
     fn loop_invariant_deopt_ref_survives_backedge_after_nursery_collection() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
