@@ -1650,7 +1650,7 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
                 "[call-overrides-absent] slot={slot} nlocals={nlocals} depth={depth} \
                  vstack_box={vstack_box:?} vstack_concrete={vstack_concrete:?} \
                  pcdep_color={pcdep_color:?} shadow={shadow:?} \
-                 null_or_self_slot={null_or_self_slot}"
+                 proof_slot={proof_slot}"
             );
         }
     }

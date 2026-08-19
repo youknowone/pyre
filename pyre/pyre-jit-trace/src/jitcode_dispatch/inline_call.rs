@@ -7048,13 +7048,6 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     if body_facts.owns_loop_header || body_facts.has_exception_table {
         return Ok(None);
     }
-    // Preserve any deferred-call denial already attached to this callee.  The
-    // keyed route does not itself admit DeferredCall: its sub-walk leaves the
-    // deferred-inline guard unarmed.
-    if fbw_foriter_deferred_call_denied(w_code as usize) {
-        return Ok(None);
-    }
-
     let body_coord = fbw_foriter_body_from_op_pc(ctx, op.pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
     fbw_foriter_inflight_mark_attempt(body_coord);
