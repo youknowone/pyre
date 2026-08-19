@@ -7034,7 +7034,22 @@ impl<M: Clone> MetaInterp<M> {
                     crate::debug::debug_print(line);
                 }
             } else {
-                crate::debug::debug_print("[trace too large for full dump]");
+                // The pre-optimizer dump above answers the same truncation with an
+                // op-count table. Answering it here with a bare notice instead
+                // leaves a census over this log reading zero of every opcode it
+                // looks for, which is indistinguishable from a trace that really
+                // contains none.
+                crate::debug::debug_print("[trace too large for full dump, showing op counts]");
+                let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
+                    indexmap::IndexMap::new();
+                for op in &compiled_ops {
+                    *counts.entry(op.opcode).or_insert(0) += 1;
+                }
+                let mut sorted: Vec<_> = counts.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                for (opcode, count) in sorted.iter().take(15) {
+                    crate::debug::debug_print(&format!("  {opcode:?}: {count}"));
+                }
             }
             for op in &compiled_ops {
                 if op.opcode == majit_ir::OpCode::GuardNotInvalidated
