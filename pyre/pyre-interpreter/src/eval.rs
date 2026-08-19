@@ -2623,12 +2623,32 @@ impl NamespaceOpcodeHandler for PyFrame {
 
 impl StackOpcodeHandler for PyFrame {
     fn swap_values(&mut self, depth: usize) -> Result<(), PyError> {
-        // `localsplus[top], localsplus[other] = localsplus[other], localsplus[top]`
-        // spelled element-wise so the flow lowers to getitem/setitem instead of a
-        // `<[T]>::swap` method call (the localsplus list carries no class row).
-        let top_idx = self.valuestackdepth - 1;
-        let other_idx = self.valuestackdepth - depth;
-        locals_w_mut!(self).swap(top_idx, other_idx);
+        // `pyopcode.py:1844-1852 SWAP`, peek/settop element-wise.  A
+        // `<[T]>::swap` call hands the locals array to a callee, which the
+        // codewriter can only residualize; the element-wise spelling stays
+        // native array operations, and it is what the preceding comment
+        // already claimed this function did.
+        //
+        // `assert oparg >= 2` is upstream's own precondition, and it is what
+        // makes both indices known non-negative to the annotator.
+        assert!(depth >= 2);
+        // Both halves go through the `maybe_none` read: a stack slot holds
+        // NULL while an inlined comprehension runs, where
+        // `LOAD_FAST_AND_CLEAR` pushed an unbound local and cleared its slot.
+        let w_top = self.peekvalue_maybe_none(0);
+        let w_other = self.peekvalue_maybe_none(depth - 1);
+        // The first store overwrites the only stack slot still holding
+        // `w_top`.  `FixedObjectArray::set_ref` roots its receiver and the
+        // value it was handed, and nothing else, across a barrier that can
+        // wait behind a foreign collection — so an unrooted `w_top` would be
+        // stale by the second store.  The GC transform carries every live
+        // variable on the shadow stack across that point; spell the same
+        // thing out here and read `w_top` back.
+        let roots = pyre_object::gc_roots::push_roots();
+        let top_slot = roots.base();
+        roots.pin_root(w_top);
+        self.settopvalue(w_other, 0);
+        self.settopvalue(roots.get(top_slot), depth - 1);
         Ok(())
     }
 }
