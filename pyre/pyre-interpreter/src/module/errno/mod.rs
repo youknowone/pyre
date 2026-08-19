@@ -130,18 +130,34 @@ crate::py_module! {
             for (name, value) in entries {
                 store(name, *value as i64);
             }
+            // The MSVC runtime carries these under the same names, so they
+            // are not the Unix-only set they were grouped with.
+            #[cfg(any(unix, windows))]
+            {
+                let posix_entries: &[(&str, i32)] = &[
+                    ("ETXTBSY", host_errno::ETXTBSY),
+                    ("ENOMSG", host_errno::ENOMSG),
+                    ("EIDRM", host_errno::EIDRM),
+                    ("EBADMSG", host_errno::EBADMSG),
+                    ("ENODATA", host_errno::ENODATA),
+                    ("ENOLINK", host_errno::ENOLINK),
+                    ("ENOSR", host_errno::ENOSR),
+                    ("ENOSTR", host_errno::ENOSTR),
+                    ("ETIME", host_errno::ETIME),
+                ];
+                for (name, value) in posix_entries {
+                    store(name, *value as i64);
+                }
+            }
             #[cfg(unix)]
             {
                 let unix_entries: &[(&str, i32)] = &[
                     // Declared in the same list, and supplied by `libc` here.
-                    // Windows reaches them only through `win_errors`
+                    // Windows reaches the first six through `win_errors`
                     // (`interp_errno.py:91-101`), which registers the `WSA`
-                    // spelling, adds the stripped name as a second binding
-                    // and leaves the reverse mapping naming the `WSA` one.
-                    // This module exports no `WSA` name to carry that reverse
-                    // entry, so storing the stripped names there would answer
-                    // `errorcode[code]` with a spelling the declaration never
-                    // assigns.
+                    // spelling and adds the stripped name as a second binding
+                    // -- the windows block below stores them in that order, so
+                    // the reverse mapping names the `WSA` one there.
                     ("ESTALE", host_errno::ESTALE),
                     ("EUSERS", host_errno::EUSERS),
                     ("EREMOTE", host_errno::EREMOTE),
@@ -149,16 +165,7 @@ crate::py_module! {
                     ("EPFNOSUPPORT", host_errno::EPFNOSUPPORT),
                     ("ESOCKTNOSUPPORT", host_errno::ESOCKTNOSUPPORT),
                     ("ENOTBLK", host_errno::ENOTBLK),
-                    ("ETXTBSY", host_errno::ETXTBSY),
-                    ("ENOMSG", host_errno::ENOMSG),
-                    ("EIDRM", host_errno::EIDRM),
-                    ("EBADMSG", host_errno::EBADMSG),
                     ("EMULTIHOP", host_errno::EMULTIHOP),
-                    ("ENODATA", host_errno::ENODATA),
-                    ("ENOLINK", host_errno::ENOLINK),
-                    ("ENOSR", host_errno::ENOSR),
-                    ("ENOSTR", host_errno::ENOSTR),
-                    ("ETIME", host_errno::ETIME),
                 ];
                 for (name, value) in unix_entries {
                     store(name, *value as i64);
@@ -197,6 +204,76 @@ crate::py_module! {
                     ("ESHLIBVERS", host_errno::ESHLIBVERS),
                 ];
                 for (name, value) in apple_entries {
+                    store(name, *value as i64);
+                }
+            }
+            // The rest of the runtime's own set, then the Winsock codes.
+            //
+            // A socket reports the Winsock code, so the classic socket names
+            // above already resolve to those and the `WSAE*` spellings share
+            // their values.  They are stored second on purpose: `errorcode`
+            // is keyed by the number, and the name it answers with for a
+            // shared one is the Winsock spelling.
+            #[cfg(windows)]
+            {
+                let windows_entries: &[(&str, i32)] = &[
+                    ("EDEADLOCK", host_errno::EDEADLOCK),
+                    ("ESOCKTNOSUPPORT", host_errno::ESOCKTNOSUPPORT),
+                    ("EPFNOSUPPORT", host_errno::EPFNOSUPPORT),
+                    ("ETOOMANYREFS", host_errno::ETOOMANYREFS),
+                    ("EUSERS", host_errno::EUSERS),
+                    ("ESTALE", host_errno::ESTALE),
+                    ("EREMOTE", host_errno::EREMOTE),
+                    ("WSABASEERR", host_errno::WSABASEERR),
+                    ("WSAEINTR", host_errno::WSAEINTR),
+                    ("WSAEBADF", host_errno::WSAEBADF),
+                    ("WSAEACCES", host_errno::WSAEACCES),
+                    ("WSAEFAULT", host_errno::WSAEFAULT),
+                    ("WSAEINVAL", host_errno::WSAEINVAL),
+                    ("WSAEMFILE", host_errno::WSAEMFILE),
+                    ("WSAEWOULDBLOCK", host_errno::WSAEWOULDBLOCK),
+                    ("WSAEINPROGRESS", host_errno::WSAEINPROGRESS),
+                    ("WSAEALREADY", host_errno::WSAEALREADY),
+                    ("WSAENOTSOCK", host_errno::WSAENOTSOCK),
+                    ("WSAEDESTADDRREQ", host_errno::WSAEDESTADDRREQ),
+                    ("WSAEMSGSIZE", host_errno::WSAEMSGSIZE),
+                    ("WSAEPROTOTYPE", host_errno::WSAEPROTOTYPE),
+                    ("WSAENOPROTOOPT", host_errno::WSAENOPROTOOPT),
+                    ("WSAEPROTONOSUPPORT", host_errno::WSAEPROTONOSUPPORT),
+                    ("WSAESOCKTNOSUPPORT", host_errno::WSAESOCKTNOSUPPORT),
+                    ("WSAEOPNOTSUPP", host_errno::WSAEOPNOTSUPP),
+                    ("WSAEPFNOSUPPORT", host_errno::WSAEPFNOSUPPORT),
+                    ("WSAEAFNOSUPPORT", host_errno::WSAEAFNOSUPPORT),
+                    ("WSAEADDRINUSE", host_errno::WSAEADDRINUSE),
+                    ("WSAEADDRNOTAVAIL", host_errno::WSAEADDRNOTAVAIL),
+                    ("WSAENETDOWN", host_errno::WSAENETDOWN),
+                    ("WSAENETUNREACH", host_errno::WSAENETUNREACH),
+                    ("WSAENETRESET", host_errno::WSAENETRESET),
+                    ("WSAECONNABORTED", host_errno::WSAECONNABORTED),
+                    ("WSAECONNRESET", host_errno::WSAECONNRESET),
+                    ("WSAENOBUFS", host_errno::WSAENOBUFS),
+                    ("WSAEISCONN", host_errno::WSAEISCONN),
+                    ("WSAENOTCONN", host_errno::WSAENOTCONN),
+                    ("WSAESHUTDOWN", host_errno::WSAESHUTDOWN),
+                    ("WSAETOOMANYREFS", host_errno::WSAETOOMANYREFS),
+                    ("WSAETIMEDOUT", host_errno::WSAETIMEDOUT),
+                    ("WSAECONNREFUSED", host_errno::WSAECONNREFUSED),
+                    ("WSAELOOP", host_errno::WSAELOOP),
+                    ("WSAENAMETOOLONG", host_errno::WSAENAMETOOLONG),
+                    ("WSAEHOSTDOWN", host_errno::WSAEHOSTDOWN),
+                    ("WSAEHOSTUNREACH", host_errno::WSAEHOSTUNREACH),
+                    ("WSAENOTEMPTY", host_errno::WSAENOTEMPTY),
+                    ("WSAEPROCLIM", host_errno::WSAEPROCLIM),
+                    ("WSAEUSERS", host_errno::WSAEUSERS),
+                    ("WSAEDQUOT", host_errno::WSAEDQUOT),
+                    ("WSAESTALE", host_errno::WSAESTALE),
+                    ("WSAEREMOTE", host_errno::WSAEREMOTE),
+                    ("WSASYSNOTREADY", host_errno::WSASYSNOTREADY),
+                    ("WSAVERNOTSUPPORTED", host_errno::WSAVERNOTSUPPORTED),
+                    ("WSANOTINITIALISED", host_errno::WSANOTINITIALISED),
+                    ("WSAEDISCON", host_errno::WSAEDISCON),
+                ];
+                for (name, value) in windows_entries {
                     store(name, *value as i64);
                 }
             }

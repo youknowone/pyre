@@ -191,6 +191,23 @@ fn check_signum_in_range(signum: i64) -> Result<(), crate::PyError> {
     }
 }
 
+/// Whether the runtime has a signal under this number at all.  `SIGBREAK` is
+/// its own, so the set is spelled out rather than taken from `libc`.
+#[cfg(windows)]
+fn windows_handles_signal(signum: i32) -> bool {
+    const SIGBREAK: i32 = 21;
+    matches!(
+        signum,
+        libc::SIGINT
+            | libc::SIGILL
+            | libc::SIGFPE
+            | libc::SIGSEGV
+            | libc::SIGTERM
+            | SIGBREAK
+            | libc::SIGABRT
+    )
+}
+
 /// interp_signal.py:291-326 `signal(signum, handler) -> previous`.
 fn signal_signal(
     w_signum: PyObjectRef,
@@ -208,6 +225,13 @@ fn signal_signal(
     check_signum_in_range(signum)?;
     // The range check bounds it to `1..NSIG`, so the narrowing is exact.
     let signum = signum as i32;
+    // The runtime handles seven numbers and reports any other through the
+    // invalid parameter handler, so the range check is not the whole answer
+    // here (`signal_signal_impl`).
+    #[cfg(windows)]
+    if !windows_handles_signal(signum) {
+        return Err(crate::PyError::value_error("invalid signal value"));
+    }
 
     // interp_signal.py:313-321 — SIG_DFL / SIG_IGN are the ints 0 / 1;
     // anything else must be callable.  PyPy compares with
@@ -246,6 +270,13 @@ fn signal_getsignal(w_signum: PyObjectRef) -> Result<PyObjectRef, crate::PyError
     let signum = signum_arg(w_signum)?;
     check_signum_in_range(signum)?;
     let signum = signum as i32;
+    // A number the runtime has no signal under was never anyone's to handle,
+    // which `signal_module_exec` records as no handler at all rather than as
+    // the default one.
+    #[cfg(windows)]
+    if !windows_handles_signal(signum) {
+        return Ok(pyre_object::w_none());
+    }
     let h = get_handler(signum);
     Ok(if h.is_null() {
         pyre_object::w_int_new(0)
@@ -494,7 +525,7 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
         signalstate::register_ticker(ticker_addr);
 
         // app_main.py:926 — `signal.signal(SIGINT, default_int_handler)`.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let sigint = libc::SIGINT;
             if signalstate::pypysig_setflag(sigint) {
@@ -647,7 +678,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "raise_signal() missing argument",
                         ));
                     };
-                    match rustpython_host_env::signal::raise_signal(signum) {
+                    // The MSVC runtime reports a signal number it does not
+                    // have through its invalid parameter handler, whose
+                    // default action ends the process before `raise` can
+                    // return.  Silenced, it answers -1 and sets `EINVAL`
+                    // (`signal_raise_signal_impl`).
+                    #[cfg(windows)]
+                    let raised = {
+                        crate::builtins::clear_crt_errno();
+                        if crate::builtins::crt_call!(libc::raise(signum)) == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(
+                                crate::builtins::crt_errno(),
+                            ))
+                        }
+                    };
+                    #[cfg(not(windows))]
+                    let raised = rustpython_host_env::signal::raise_signal(signum);
+                    match raised {
                         Ok(()) => {
                             // interp_signal.py:583-584 — the signal may
                             // have been delivered to this thread; run the
@@ -737,23 +786,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // moduledef.py:17 `'ItimerError': 'interp_signal.get_itimer_error(space)'`
-    // — `signal.new_exception_class("signal.ItimerError", space.w_IOError)`.
-    // An OSError subclass so `setitimer`'s `exception_from_saved_errno`
-    // instance carries errno / strerror.
-    let w_os_error = crate::builtins::lookup_exc_class("OSError")
-        .expect("OSError must be installed before _signal init");
-    crate::module_ns_store(
-        ns,
-        "ItimerError",
-        crate::builtins::make_exc_type(
-            "signal.ItimerError",
-            crate::builtins::exc_os_error_new,
-            w_os_error,
-        ),
-    );
     #[cfg(unix)]
     {
+        // moduledef.py:17 `'ItimerError': 'interp_signal.get_itimer_error(space)'`
+        // — `signal.new_exception_class("signal.ItimerError", space.w_IOError)`.
+        // An OSError subclass so `setitimer`'s `exception_from_saved_errno`
+        // instance carries errno / strerror.  It is published beside the
+        // itimers it reports on, so a platform without them does not carry it.
+        let w_os_error = crate::builtins::lookup_exc_class("OSError")
+            .expect("OSError must be installed before _signal init");
+        crate::module_ns_store(
+            ns,
+            "ItimerError",
+            crate::builtins::make_exc_type(
+                "signal.ItimerError",
+                crate::builtins::exc_os_error_new,
+                w_os_error,
+            ),
+        );
         crate::module_ns_store(
             ns,
             "alarm",
@@ -1266,8 +1316,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
     crate::module_ns_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
     crate::module_ns_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
-    // libc crate doesn't surface NSIG portably; use POSIX 64-signal cap.
-    crate::module_ns_store(ns, "NSIG", pyre_object::w_int_new(64));
+    // libc crate doesn't surface NSIG portably; use POSIX 64-signal cap, or
+    // the count the MSVC runtime defines, one past its highest signal.
+    #[cfg(windows)]
+    const NSIG: i64 = 23;
+    #[cfg(not(windows))]
+    const NSIG: i64 = 64;
+    crate::module_ns_store(ns, "NSIG", pyre_object::w_int_new(NSIG));
     // Common signal numbers (POSIX subset, sourced from libc so numerics
     // match the host — Linux SIGUSR1=10 / macOS SIGUSR1=30, etc.).
     #[cfg(unix)]
@@ -1309,5 +1364,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
         crate::module_ns_store(ns, "SIGIO", pyre_object::w_int_new(libc::SIGIO as i64));
         crate::module_ns_store(ns, "SIGSYS", pyre_object::w_int_new(libc::SIGSYS as i64));
+    }
+    // The seven the MSVC runtime defines, and the two console events
+    // `os.kill` sends in place of a signal.  `Lib/signal.py` builds its
+    // `Signals` enum out of exactly these names, so `valid_signals()` and
+    // `Signals(2)` answer from here.
+    #[cfg(windows)]
+    {
+        // `SIGBREAK` is the runtime's own, absent from the libc crate.
+        const SIGBREAK: i64 = 21;
+        crate::module_ns_store(ns, "SIGINT", pyre_object::w_int_new(libc::SIGINT as i64));
+        crate::module_ns_store(ns, "SIGILL", pyre_object::w_int_new(libc::SIGILL as i64));
+        crate::module_ns_store(ns, "SIGFPE", pyre_object::w_int_new(libc::SIGFPE as i64));
+        crate::module_ns_store(ns, "SIGSEGV", pyre_object::w_int_new(libc::SIGSEGV as i64));
+        crate::module_ns_store(ns, "SIGTERM", pyre_object::w_int_new(libc::SIGTERM as i64));
+        crate::module_ns_store(ns, "SIGBREAK", pyre_object::w_int_new(SIGBREAK));
+        crate::module_ns_store(ns, "SIGABRT", pyre_object::w_int_new(libc::SIGABRT as i64));
+        crate::module_ns_store(ns, "CTRL_C_EVENT", pyre_object::w_int_new(0));
+        crate::module_ns_store(ns, "CTRL_BREAK_EVENT", pyre_object::w_int_new(1));
     }
 }

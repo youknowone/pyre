@@ -6583,8 +6583,25 @@ fn winerror_derived_errno(w_winerror: PyObjectRef) -> Option<i64> {
 }
 
 /// The POSIX errno a Win32 error code maps to.
+///
+/// A Winsock code is its own errno: the range was built by adding `WSABASEERR`
+/// to the classic numbers, and `errno` publishes the socket names at the
+/// Winsock values, so `errno` and `winerror` agree there and the `OSError`
+/// subclass follows.  The six the table below names are the exception — the
+/// runtime kept its own meaning for those, so they come back down by
+/// `WSABASEERR` to the number they were built from.
 #[cfg(windows)]
 pub(crate) fn winerror_to_errno(code: i64) -> i64 {
+    const WSABASEERR: i64 = 10000;
+    // WSAEINTR, WSAEBADF, WSAEACCES, WSAEFAULT, WSAEINVAL, WSAEMFILE.
+    const WINSOCK_KEEPS_POSIX_ERRNO: &[i64] = &[10004, 10009, 10013, 10014, 10022, 10024];
+    if (WSABASEERR..12000).contains(&code) {
+        return if WINSOCK_KEEPS_POSIX_ERRNO.contains(&code) {
+            code - WSABASEERR
+        } else {
+            code
+        };
+    }
     WINERROR_TO_ERRNO
         .iter()
         .find(|&&(win, _)| win == code)
@@ -6661,18 +6678,28 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) {
     unsafe { interp_exceptions::w_exception_set_args(exc, args_list) };
 }
 
-/// `ESHUTDOWN` is a POSIX errno absent from the MSVC CRT, so the
-/// `BrokenPipeError` mapping is gated on it being defined (`#ifdef ESHUTDOWN`).
+/// `ESHUTDOWN` is a POSIX errno absent from the MSVC runtime's own `errno.h`,
+/// so the `BrokenPipeError` mapping is gated on it being defined
+/// (`#ifdef ESHUTDOWN`).  Windows has it as the Winsock code, which is the
+/// value a socket reports and the one the `errno` module publishes.
 #[cfg(unix)]
 fn errno_is_eshutdown(e: i32) -> bool {
     e == libc::ESHUTDOWN
+}
+#[cfg(all(windows, feature = "host_env"))]
+fn errno_is_eshutdown(e: i32) -> bool {
+    e == rustpython_host_env::errno::errors::ESHUTDOWN
 }
 /// wasm32 has no libc errnos; match the darwin/BSD numeric value.
 #[cfg(target_arch = "wasm32")]
 fn errno_is_eshutdown(e: i32) -> bool {
     e == 58
 }
-#[cfg(all(not(unix), not(target_arch = "wasm32")))]
+#[cfg(all(
+    not(unix),
+    not(target_arch = "wasm32"),
+    not(all(windows, feature = "host_env"))
+))]
 fn errno_is_eshutdown(_e: i32) -> bool {
     false
 }
@@ -6702,14 +6729,35 @@ mod wasm_errno {
     pub const ETIMEDOUT: i32 = 60;
 }
 
+/// On Windows `ETIMEDOUT` above is the Winsock code, and the runtime's own
+/// `errno.h` has a second value under the same name that a descriptor call
+/// reports; both select `TimeoutError`.
+#[cfg(all(windows, feature = "host_env"))]
+fn errno_is_crt_etimedout(e: i32) -> bool {
+    e == libc::ETIMEDOUT
+}
+#[cfg(not(all(windows, feature = "host_env")))]
+fn errno_is_crt_etimedout(_e: i32) -> bool {
+    false
+}
+
 /// `interp_exceptions.py:1207-1227 ERRNO_MAP` — the OSError subclass the
 /// exact `OSError` constructor selects for a recognised errno, by
 /// registered class name.  Returns `None` for an unmapped errno.
 pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
-    // `ESHUTDOWN` is sourced through `errno_is_eshutdown` (MSVC CRT lacks it);
-    // the rest come from `libc`, or the darwin/BSD `wasm_errno` table on wasm32.
-    #[cfg(not(target_arch = "wasm32"))]
+    // `ESHUTDOWN` is sourced through `errno_is_eshutdown` (the MSVC runtime's
+    // own `errno.h` lacks it); the rest come from the same table the `errno`
+    // module is published from, so `OSError(errno.X)` selects the subclass the
+    // name `X` implies.  On Windows that table answers the socket names with
+    // their Winsock codes, which is what a socket reports.  Failing that
+    // `libc`, or the darwin/BSD `wasm_errno` table on wasm32.
+    #[cfg(all(not(feature = "host_env"), not(target_arch = "wasm32")))]
     use libc::{
+        EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
+        EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
+    };
+    #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
+    use rustpython_host_env::errno::errors::{
         EACCES, EAGAIN, EALREADY, ECHILD, ECONNABORTED, ECONNREFUSED, ECONNRESET, EEXIST,
         EINPROGRESS, EINTR, EISDIR, ENOENT, ENOTDIR, EPERM, EPIPE, ESRCH, ETIMEDOUT, EWOULDBLOCK,
     };
@@ -6745,7 +6793,7 @@ pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
         "PermissionError"
     } else if e == ESRCH {
         "ProcessLookupError"
-    } else if e == ETIMEDOUT {
+    } else if e == ETIMEDOUT || errno_is_crt_etimedout(e) {
         "TimeoutError"
     } else {
         return None;

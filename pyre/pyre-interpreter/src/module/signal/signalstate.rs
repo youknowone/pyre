@@ -384,17 +384,59 @@ pub fn block_async_signals_on_origin_thread() {}
 #[cfg(not(unix))]
 pub fn unblock_async_signals_on_interp_thread() {}
 
-#[cfg(not(unix))]
+/// The runtime's own `signal`, which is what stands in for `sigaction` here.
+/// The signal number is one the caller has already answered for, so the
+/// invalid parameter handler has nothing to fire on; it is silenced anyway,
+/// its default action being to end the process.
+#[cfg(windows)]
+fn install_handler(signum: i32, handler: libc::sighandler_t) -> bool {
+    let previous = crate::builtins::crt_call!(libc::signal(signum, handler));
+    previous != libc::SIG_ERR as libc::sighandler_t
+}
+
+/// The OS signal handler.  It flags the signal for the next checkpoint and
+/// puts itself back: the runtime resets a handler to the default before
+/// running it, so a second delivery would otherwise end the process.
+///
+/// The wakeup descriptor the POSIX handler also writes to is a socket here,
+/// which this context cannot write to, so `set_wakeup_fd` stays a record.
+#[cfg(windows)]
+extern "C" fn signal_setflag_handler(signum: libc::c_int) {
+    signal_pushback(signum);
+    install_handler(signum, signal_setflag_handler as *const () as usize);
+}
+
+#[cfg(windows)]
+pub fn pypysig_setflag(signum: i32) -> bool {
+    install_handler(signum, signal_setflag_handler as *const () as usize)
+}
+
+#[cfg(windows)]
+pub fn pypysig_default(signum: i32) -> bool {
+    install_handler(signum, libc::SIG_DFL)
+}
+
+#[cfg(windows)]
+pub fn pypysig_ignore(signum: i32) -> bool {
+    install_handler(signum, libc::SIG_IGN)
+}
+
+/// The handler puts itself back as it runs, so there is nothing left to do
+/// here.
+#[cfg(windows)]
+pub fn pypysig_reinstall(_signum: i32) {}
+
+#[cfg(not(any(unix, windows)))]
 pub fn pypysig_setflag(_signum: i32) -> bool {
     false
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn pypysig_default(_signum: i32) -> bool {
     false
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn pypysig_ignore(_signum: i32) -> bool {
     false
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn pypysig_reinstall(_signum: i32) {}
