@@ -3519,8 +3519,14 @@ mod tests {
         fn field_type(&self) -> Type {
             Type::Ref
         }
+        // Deliberately *not* spelled `w_class`, and deliberately spelled like
+        // an ordinary payload field. `clear_gc_fields` must find this slot
+        // through `is_w_class()` above; a consumer that recognised the class
+        // word by name instead would see an ordinary field here and re-arm the
+        // delayed NULL store that overwrites the class object, which is what
+        // the tests below assert against.
         fn field_name(&self) -> &str {
-            "w_class"
+            "cls"
         }
     }
 
