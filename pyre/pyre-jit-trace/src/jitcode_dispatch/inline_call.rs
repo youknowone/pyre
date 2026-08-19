@@ -3174,6 +3174,41 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if !positional_only && vararg_slot.is_none() {
         return Ok(None);
     }
+    // Not every caller pins the callee function itself.  A specializer that
+    // resolves an app-level method behind a builtin — `str(e)` reaching an
+    // exception subclass's `__str__` — passes the CALL's own operand, which is
+    // the `str` builtin, while `callable` is the resolved `Function`.  Reading
+    // `Function.code` off that operand is a type-confused load: it returns
+    // whatever sits at the same offset in a `PyCFunction`, so the guard
+    // compares a value that is not `code` and fails every iteration (99480
+    // failures and 497 bridges on `synth/exception_subclass_attrs`, a 31x
+    // slowdown).  Guard the fields only when the pinned object really is the
+    // function whose code this inline resolved.
+    let pinned_object_is_the_callee = unsafe {
+        (*callable_guard_value).ob_type as *const () as usize
+            == &pyre_interpreter::FUNCTION_TYPE as *const _ as usize
+            && pyre_interpreter::function_get_code(callable_guard_value) as usize
+                == w_code as pyre_object::PyObjectRef as usize
+    };
+    // A trace-constant callable is excluded for a second reason: the field
+    // reads would dereference a baked `ConstPtr`, and loading through one
+    // dangles as soon as a minor collection moves the object
+    // (`synth/inline_subwalk_property_mutates` — a property getter that
+    // allocates on every iteration — segfaulted on cranelift under CI's macOS
+    // runner with the reads in place).  Comparing against such a constant is
+    // fine; that is why the `code?` marker below covers this arm instead.
+    let guards_the_callee_function =
+        !callable_guard_op.is_constant() && pinned_object_is_the_callee;
+    if !guards_the_callee_function && majit_gc::can_move(majit_ir::GcRef(callable as usize)) {
+        // The arm below stands the baked code up on `function.py:47`'s `code?`
+        // instead of a per-iteration guard, and the marker names its owner by
+        // raw address at both record and compile time.  The jitcode
+        // `MAKE_FUNCTION` lowering allocates its function in the nursery, so
+        // such a callee can be relocated between those two reads; refuse the
+        // inline rather than bake a body no invalidation covers.  `rgc.can_move`
+        // parity — false when no moving GC is active.
+        return Ok(None);
+    }
     // `Function.funccall_valuestack` fills every parameter the call left
     // unbound from `defs_w` before entering the frame
     // (`function.py:188-193,217-231`); `Arguments.parse` reaches the same frame
@@ -3967,35 +4002,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
     }
 
-    // Not every caller pins the callee function itself.  A specializer that
-    // resolves an app-level method behind a builtin — `str(e)` reaching an
-    // exception subclass's `__str__` — passes the CALL's own operand, which is
-    // the `str` builtin, while `callable` is the resolved `Function`.  Reading
-    // `Function.code` off that operand is a type-confused load: it returns
-    // whatever sits at the same offset in a `PyCFunction`, so the guard
-    // compares a value that is not `code` and fails every iteration (99480
-    // failures and 497 bridges on `synth/exception_subclass_attrs`, a 31x
-    // slowdown).  Guard the fields only when the pinned object really is the
-    // function whose code this inline resolved.
-    //
-    // A trace-constant callable is excluded for a second reason: the field
-    // reads would dereference a baked `ConstPtr`, and a baked constant object
-    // pointer is not GC-forwarded yet (gh #108 gc-table — see the note in
-    // `synth/exception_subclass_attrs.py`).  Comparing against such a constant
-    // is fine, but loading through one dangles as soon as a minor collection
-    // moves the object: `synth/inline_subwalk_property_mutates` — a property
-    // getter that allocates on every iteration — segfaults on cranelift under
-    // CI's macOS runner with the reads in place.  The callable being constant
-    // means something already pinned the object, so this only gives up the
-    // `f.__code__ = g.__code__` re-check on that path.
-    let guards_the_callee_function = !callable_guard_op.is_constant()
-        && unsafe {
-            (*callable_guard_value).ob_type as *const () as usize
-                == &pyre_interpreter::FUNCTION_TYPE as *const _ as usize
-                && pyre_interpreter::function_get_code(callable_guard_value) as usize
-                    == callee_code_key
-        };
-
     // Keep the closure cells as red operands.  A MAKE_FUNCTION in the caller's
     // loop creates a fresh function and fresh enclosing cells on every
     // iteration; the trace-time cell pointers are only the concrete shadow
@@ -4021,6 +4027,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 .record_guard(OpCode::GuardValue, &[callable_guard_op, expected], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
+        // Pinning the operand pins none of the callee's fields, and this inline
+        // bakes `code` in the strongest form there is — it selects which callee
+        // body the trace walks into.  `function.py:47 _immutable_fields_ =
+        // ['code?', ...]` is what covers that, and the `?` costs one marker
+        // plus one `GUARD_NOT_INVALIDATED` per trace instead of a load and a
+        // `GUARD_VALUE` per iteration.  It is also the only form available
+        // here: the guard arm below reads the field off the pinned operand,
+        // which this arm either cannot do (the operand is not the callee) or
+        // must not do (a baked `ConstPtr`).
+        walker_pin_function_code(ctx, op.pc, callable)?;
     } else {
         // `function.py:91-96 getcode()` promotes `self.code`, never `self`.
         // The code object below and globals namespace in `InlineCalleeConsts`
@@ -4035,7 +4051,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `opimpl_getfield_gc_r` pairs each read with `record_quasiimmut_field`
         // and assigning the field invalidates the traces that folded it; the
         // value guards stay on top as the stricter identity check the reads
-        // below assume.
+        // below assume.  They also stay because this arm exists for a callee
+        // whose identity changes every iteration, so the field is re-read
+        // anyway, and because the marker resolves its owner by raw address —
+        // the guard is the only answer that keeps working for a callee the
+        // collector can relocate.
         //
         // Guarding the function OBJECT instead pinned its identity, which a
         // callee built by a `MAKE_FUNCTION` in the caller's own loop body can
