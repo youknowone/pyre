@@ -2591,11 +2591,21 @@ fn handle_jitexception(
     mut bh: BlackholeInterpreter,
     exc: JitException,
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
+    on_leave_level: Option<&dyn Fn(i64)>,
     terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> Result<(BlackholeInterpreter, i64), JitException> {
     // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
     while bh.jitcode.jitdriver_sd().is_none() {
         let next = bh.nextblackholeinterp.take();
+        // `pyopcode.py:184 handle_operation_error` — the no-handler propagation
+        // out of a frame stores `frame_finished_execution = True` there too, and
+        // this walk is exactly that: each level it discards on the way to the
+        // portal has been left by an exception it did not catch.  The `Ok` arm's
+        // twin store sits in `run_forever_with_portal`, which never sees these
+        // levels.
+        if let Some(on_leave_level) = on_leave_level {
+            on_leave_level(bh.virtualizable_ptr);
+        }
         builder.release_interp(bh);
         match next.map(|b| *b) {
             Some(caller) => bh = caller,
@@ -2691,6 +2701,7 @@ pub fn run_forever_with_portal(
                     bh,
                     jit_exc,
                     portal_runner,
+                    on_leave_level,
                     terminal_out.as_deref_mut(),
                 ) {
                     Ok((new_bh, exc)) => {
@@ -4190,6 +4201,7 @@ mod tests {
                     bh,
                     crate::jitexc::JitException::DoneWithThisFrameInt(42),
                     None,
+                    None,
                     Some(&mut terminal),
                 );
                 assert!(
@@ -4205,6 +4217,56 @@ mod tests {
                     assert_eq!(terminal.registers_i[0], 42);
                 }
             }
+        }
+
+        /// `pyopcode.py:184 handle_operation_error` stores
+        /// `frame_finished_execution = True` on the no-handler propagation out
+        /// of a frame, and the walk to the recursive portal
+        /// (`blackhole.py:1764`) discards exactly such frames.  The `Ok` arm's
+        /// twin store lives in `run_forever_with_portal`, which never sees a
+        /// level this walk released, so a frame left by an exception would read
+        /// back as still executing and refuse `frame.clear()`.
+        #[test]
+        fn handle_jitexception_finishes_each_non_portal_level_it_unwinds() {
+            let build = |portal: bool| {
+                let mut b = JitCodeBuilder::default();
+                b.load_const_i_value(0, 1);
+                b.int_return(0);
+                let jitcode = b.finish();
+                jitcode.set_index(0);
+                if portal {
+                    jitcode.set_jitdriver_sd(0);
+                }
+                jitcode
+            };
+
+            let mut builder = super::build_inline_call_only_bh_builder();
+            let mut portal_bh = builder.acquire_interp();
+            portal_bh.setposition(std::sync::Arc::new(build(true)), 0);
+            portal_bh.virtualizable_ptr = 0x2000;
+            let mut leaf = builder.acquire_interp();
+            leaf.setposition(std::sync::Arc::new(build(false)), 0);
+            leaf.virtualizable_ptr = 0x1000;
+            leaf.nextblackholeinterp = Some(Box::new(portal_bh));
+
+            let left = std::cell::RefCell::new(Vec::new());
+            let on_leave_level = |ptr: i64| left.borrow_mut().push(ptr);
+            let outcome = super::handle_jitexception(
+                &mut builder,
+                leaf,
+                crate::jitexc::JitException::DoneWithThisFrameInt(1),
+                None,
+                Some(&on_leave_level),
+                None,
+            );
+
+            assert!(outcome.is_err(), "the portal frame here is bottommost");
+            assert_eq!(
+                left.into_inner(),
+                vec![0x1000],
+                "the unwound non-portal level is finished; the portal one leaves \
+                 through the propagating arm, whose caller owns the store",
+            );
         }
 
         #[test]
