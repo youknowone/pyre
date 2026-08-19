@@ -1320,7 +1320,11 @@ def write_readfiles(path: Path, by_crate: dict[str, set[Path]]) -> None:
         {item for crate_files in by_crate.values() for item in crate_files},
         key=lambda item: item.as_posix(),
     )
-    path.write_text("".join(f"{item.as_posix()}\n" for item in files), encoding="utf-8")
+    path.write_text(
+        "".join(f"{item.as_posix()}\n" for item in files),
+        encoding="utf-8",
+        newline="\n",
+    )
 
 
 def assert_readfiles_resolve(root: Path, dest: Path, by_crate: dict[str, set[Path]]) -> None:
@@ -2285,7 +2289,13 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                 f" unstamped — reported as freshness UNKNOWN, not as fresh."
             )
             continue
-        stamp_path.write_text(current_stamp + "\n")
+        # The line ending is pinned, not left to the platform: the stamp is
+        # compared against a string built in memory with "\n", so a writer
+        # that translates makes the artefact describe the same tree
+        # differently on Windows than everywhere else.
+        stamp_path.write_text(
+            current_stamp + "\n", encoding="utf-8", newline="\n"
+        )
         print(f"    wrote {dest} ({dest.stat().st_size} bytes)")
 
     print()
@@ -2414,7 +2424,14 @@ def check(eng: Engine, args: argparse.Namespace) -> None:
                 f"records no source digest, so it cannot match the tree"
             )
             continue
-        text = stamp_bytes.decode("utf-8", errors="replace")
+        # Bytes and not `read_text`, so a truncated or foreign stamp is seen
+        # as it is — but a stamp written before the writer above pinned its
+        # line endings holds CRLF on Windows, and comparing that against an
+        # LF string reports every one of them as carrying content this
+        # engine did not write.
+        text = stamp_bytes.decode("utf-8", errors="replace").replace(
+            "\r\n", "\n"
+        )
         if not text.strip():
             stale.append(
                 f"{crate}: fingerprint stamp {stamp_path} holds only whitespace"
