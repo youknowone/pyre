@@ -983,6 +983,12 @@ impl OptHeap {
         currentbox == constantfieldbox
     }
 
+    /// Slot space for the object header words, above every position a parent's
+    /// field list can hand out. Keyed by offset so `ob_type` and `w_class` stay
+    /// apart. A `PtrInfo`'s field list is an association list, not a dense
+    /// array, so a sparse high slot costs one entry and nothing else.
+    const HEADER_FIELD_SLOT_BASE: u32 = 0x8000_0000;
+
     /// Compute the `PtrInfo._fields` slot for a field descriptor.
     ///
     /// RPython uses `descr.get_index()` only for `info._fields[index]`
@@ -1005,11 +1011,22 @@ impl OptHeap {
     /// field at it, and otherwise fall back to the descr's own key, which for
     /// an unnumbered field is minted out of its payload and cannot collide
     /// with a position.
+    ///
+    /// That fallback does NOT cover the header words, which is why they are
+    /// answered before it: `PyObject.ob_type` carries `index()` `0`, a real
+    /// position, so routing it through the fallback returns it to the very slot
+    /// the check just refused. They resolve through no field list at all --
+    /// `OptVirtualize` folds `is_typeptr` from `known_class` and `is_w_class`
+    /// from the virtual's class identity -- so give them a band above the
+    /// positional space instead, keyed by offset to keep the two apart.
     pub(crate) fn field_slot_index(descr: &DescrRef) -> u32 {
         let descr_idx = descr.index();
         let Some(field_descr) = descr.as_field_descr() else {
             return descr_idx;
         };
+        if field_descr.is_typeptr() || field_descr.is_w_class() {
+            return Self::HEADER_FIELD_SLOT_BASE + field_descr.offset() as u32;
+        }
         let index = field_descr.index_in_parent();
         let holds_this_field = match field_descr.get_parent_descr() {
             Some(parent) => parent
