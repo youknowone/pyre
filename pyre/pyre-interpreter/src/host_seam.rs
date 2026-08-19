@@ -101,7 +101,7 @@ pub mod sys {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     pub use ::libc::RTLD_DEEPBIND;
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub use ::libc::{SCHED_BATCH, SCHED_IDLE};
+    pub use ::libc::{SCHED_BATCH, SCHED_DEADLINE, SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK};
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     pub use ::libc::{SCHED_FIFO, SCHED_OTHER, SCHED_RR};
     // `SEEK_HOLE`/`SEEK_DATA` carry the same host list as the table that
