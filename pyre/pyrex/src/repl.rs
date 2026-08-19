@@ -322,7 +322,7 @@ fn shell_exec(
                 Ok(frame) => frame,
                 Err(err) => return ShellExecResult::RuntimeErr(err),
             };
-            match eval_with_jit(&mut frame) {
+            match eval_with_jit(&mut frame, None) {
                 Ok(result) => {
                     if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
                         println!("{}", PyDisplay(result));

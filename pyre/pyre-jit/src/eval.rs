@@ -6407,14 +6407,17 @@ fn stack_almost_full() -> bool {
 /// Evaluate a Python frame with JIT compilation.
 ///
 /// This is the main entry point for pyre-jit.
-pub fn eval_with_jit(frame: &mut PyFrame) -> PyResult {
+pub fn eval_with_jit(
+    frame: &mut PyFrame,
+    resume: Option<&mut pyre_interpreter::call::FrameResumeArgs>,
+) -> PyResult {
     // pypy/interpreter/pyframe.py:360 marks execute_frame as a stack-check
     // entry.  The portal runner is pyre's JIT-aware execution entry for the
     // same frame and must perform the interpreter-side check before compiled
     // code exists; compiled callees additionally carry the backend prologue.
     pyre_interpreter::stack_check::drain_jit_pending_exception()?;
     pyre_interpreter::stack_check::stack_check()?;
-    eval_with_jit_inner(frame)
+    eval_with_jit_inner(frame, resume)
 }
 
 /// Hook target for `pyre_interpreter::call::set_jit_param`. Routes
@@ -8106,7 +8109,10 @@ fn unsupported_jit_shape_uncached(
     (UnsupportedJitShape::None, "")
 }
 
-fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
+fn eval_with_jit_inner(
+    frame: &mut PyFrame,
+    resume: Option<&mut pyre_interpreter::call::FrameResumeArgs>,
+) -> PyResult {
     // The JIT-side frame-activation seam: a frame that runs entirely as
     // compiled code returns from `try_function_entry_jit` without reaching an
     // eval loop, so the recursion budget is spent here, where every JIT route
@@ -8120,13 +8126,13 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
-        return frame.execute_frame(None, None);
+        return frame.execute_frame_plain(resume);
     }
     // A traced frame runs interpreted: `call_trace` / `return_trace` /
     // `bytecode_trace` are driven from the plain eval path, so a frame the JIT
     // takes over reports no events at all.
     if pyre_interpreter::pyframe::frame_tracing_active(frame) {
-        return frame.execute_frame(None, None);
+        return frame.execute_frame_plain(resume);
     }
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
@@ -8165,7 +8171,7 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
                 code as *const _ as usize,
                 unsupported_jit_shape(code).1,
             );
-            return frame_root.frame().execute_frame(None, None);
+            return frame_root.frame().execute_frame_plain(resume);
         }
     }
     frame_root.frame().fix_array_ptrs();
@@ -8178,7 +8184,22 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
-            return frame_root.frame().execute_frame(None, None);
+            return frame_root.frame().execute_frame_plain(resume);
+        }
+    }
+
+    // A resumed frame reaches the portal already positioned mid-body, so its
+    // payload has to be consumed before the merge point is consulted: the
+    // green key is `(pycode, next_instr)`, and the sent value belongs on the
+    // operand stack at the pc that key names.  This is the last point at
+    // which the frame can still decline, so nothing below may need the
+    // payload again.  A suspended `yield from` delegate that yields finishes
+    // the resumption on its own and this frame never runs.
+    if let Some(resume) = resume {
+        if let Some(delegated) =
+            pyre_interpreter::eval::prepare_frame_resume_for_dispatch(frame_root.frame(), resume)?
+        {
+            return Ok(delegated);
         }
     }
 

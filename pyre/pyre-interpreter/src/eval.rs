@@ -2005,13 +2005,20 @@ pub fn handle_exception_with_context(
 /// surface is `PyFrame::run` / `PyFrame::execute_frame` (PyPy
 /// `pyframe.py:268 run` / `pyframe.py:331 execute_frame`).  Retained as a
 /// free function because pyre's JIT override mechanism (call.rs
-/// `EVAL_OVERRIDE: OnceLock<EvalFn>` where `EvalFn = fn(&mut PyFrame) ->
-/// PyResult`) requires a `fn` pointer.  Rust methods cannot be cast to
-/// `fn` pointers, so the canonical body stays as a free function and the
-/// `EVAL_OVERRIDE.unwrap_or(eval_frame_plain)` fallback (`call.rs`'s `get_eval_fn`)
-/// continues to reference it directly.
-pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
-    frame.execute_frame(None, None)
+/// `EVAL_OVERRIDE: OnceLock<EvalFn>` where `EvalFn = fn(&mut PyFrame,
+/// Option<&mut FrameResumeArgs>) -> PyResult`) requires a `fn` pointer.  Rust
+/// methods cannot be cast to `fn` pointers, so the canonical body stays as a
+/// free function and the `EVAL_OVERRIDE.unwrap_or(eval_frame_plain)` fallback
+/// (`call.rs`'s `get_eval_fn`) continues to reference it directly.
+///
+/// `resume` is `Some` only for a suspended frame being resumed
+/// (`generator.py:121-145 _invoke_execute_frame`); an ordinary call passes
+/// `None` and enters at the frame's first instruction.
+pub(crate) fn eval_frame_plain(
+    frame: &mut PyFrame,
+    resume: Option<&mut crate::call::FrameResumeArgs>,
+) -> PyResult {
+    frame.execute_frame_plain(resume)
 }
 
 /// pyframe.py:270-299 execute_frame body — enter/call_trace/eval_loop/
@@ -2065,6 +2072,43 @@ fn prepare_frame_resume(
     Ok(FrameResume::Dispatch(pending_operr))
 }
 
+/// Seed a suspended frame with its resumption payload, leaving it positioned to
+/// dispatch from its own pc.
+///
+/// `Ok(Some(value))` means a suspended `yield from` delegate yielded and this
+/// frame must not run at all; `Ok(None)` means dispatch.
+///
+/// Split out of `eval_frame_plain_with_resume` because the JIT portal performs
+/// the same seeding before it enters: the merge point is keyed on the frame's
+/// current pc, so the resumed state has to be in place first.
+pub fn prepare_frame_resume_for_dispatch(
+    frame: &mut PyFrame,
+    resume: &mut crate::call::FrameResumeArgs,
+) -> Result<Option<PyObjectRef>, PyError> {
+    match prepare_frame_resume(
+        frame,
+        resume.w_inputvalue.take(),
+        resume.operr.take(),
+        resume.throw_args.take(),
+    )? {
+        FrameResume::Yielded(value) => Ok(Some(value)),
+        FrameResume::Dispatch(Some(mut err)) => {
+            let mut next_instr = frame.next_instr();
+            if !handle_exception_with_context(
+                frame,
+                &mut err,
+                &mut next_instr,
+                ContextSource::ResumedFrameOnly,
+            ) {
+                return Err(err);
+            }
+            frame.last_instr = next_instr as isize - 1;
+            Ok(None)
+        }
+        FrameResume::Dispatch(None) => Ok(None),
+    }
+}
+
 pub(crate) fn eval_frame_plain_with_resume(
     frame: &mut PyFrame,
     w_inputvalue: Option<PyObjectRef>,
@@ -2077,22 +2121,14 @@ pub(crate) fn eval_frame_plain_with_resume(
     // depth `stack_check()` reads is the number of live Python frames.
     let _recursion_depth = crate::call::enter_recursive_frame(frame);
     frame.fix_array_ptrs();
+    let mut resume = crate::call::FrameResumeArgs {
+        w_inputvalue,
+        operr,
+        throw_args,
+    };
     if frame.execution_context.is_null() {
-        match prepare_frame_resume(frame, w_inputvalue, operr, throw_args)? {
-            FrameResume::Yielded(value) => return Ok(value),
-            FrameResume::Dispatch(Some(mut err)) => {
-                let mut next_instr = frame.next_instr();
-                if !handle_exception_with_context(
-                    frame,
-                    &mut err,
-                    &mut next_instr,
-                    ContextSource::ResumedFrameOnly,
-                ) {
-                    return Err(err);
-                }
-                frame.last_instr = next_instr as isize - 1;
-            }
-            FrameResume::Dispatch(None) => {}
+        if let Some(value) = prepare_frame_resume_for_dispatch(frame, &mut resume)? {
+            return Ok(value);
         }
         return eval_loop(frame);
     }
@@ -2126,24 +2162,9 @@ pub(crate) fn eval_frame_plain_with_resume(
     let outer_result = (|| -> PyResult {
         execution_context.call_trace(frame as *mut PyFrame)?;
         let inner_result = (|| -> PyResult {
-            match prepare_frame_resume(frame, w_inputvalue, operr, throw_args)? {
-                FrameResume::Yielded(value) => {
-                    w_exitvalue = value;
-                    return Ok(value);
-                }
-                FrameResume::Dispatch(Some(mut err)) => {
-                    let mut next_instr = frame.next_instr();
-                    if !handle_exception_with_context(
-                        frame,
-                        &mut err,
-                        &mut next_instr,
-                        ContextSource::ResumedFrameOnly,
-                    ) {
-                        return Err(err);
-                    }
-                    frame.last_instr = next_instr as isize - 1;
-                }
-                FrameResume::Dispatch(None) => {}
+            if let Some(value) = prepare_frame_resume_for_dispatch(frame, &mut resume)? {
+                w_exitvalue = value;
+                return Ok(value);
             }
             let result = eval_loop(frame)?;
             w_exitvalue = result;

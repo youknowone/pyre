@@ -3551,7 +3551,7 @@ impl PyFrame {
         if self._is_generator_or_coroutine() {
             self.initialize_as_generator()
         } else {
-            crate::call::get_eval_fn()(self)
+            crate::call::get_eval_fn()(self, None)
         }
     }
 
@@ -3597,6 +3597,14 @@ impl PyFrame {
     /// arguments for non-generator delegates.  This is the Rust representation
     /// of PyPy's `SApplicationException` payload passed through
     /// `PyFrame.execute_frame(w_arg_or_err)`.
+    ///
+    /// Dispatches through the registered eval function for the same reason
+    /// `run_with_jit` does: `interp_jit.py:81-99` applies the jitdriver to
+    /// every frame uniformly, and a resumed frame is a frame.  Routing this
+    /// straight to the plain evaluator instead kept every generator,
+    /// coroutine and async-generator body off the portal — 15.9% of the
+    /// standard library's loop-bearing code objects, none of which the tracer
+    /// could ever see.
     #[inline]
     pub fn execute_generator_frame(
         &mut self,
@@ -3604,9 +3612,48 @@ impl PyFrame {
         operr: Option<crate::PyError>,
         throw_args: Option<([PyObjectRef; 3], usize)>,
     ) -> crate::PyResult {
+        let mut resume = crate::call::FrameResumeArgs {
+            w_inputvalue,
+            operr,
+            throw_args,
+        };
+        crate::call::get_eval_fn()(self, Some(&mut resume))
+    }
+
+    /// Plain-interpreter entry for a frame that may or may not be a resumption.
+    ///
+    /// This is what the default eval function runs, and what every JIT decline
+    /// path falls back to.  A declining path that dropped `resume` and called
+    /// `execute_frame(None, None)` instead would silently discard the value a
+    /// `send()` delivered or the exception a `throw()` did, so the payload
+    /// travels with the frame through the fallback.
+    #[inline]
+    pub fn execute_frame_plain(
+        &mut self,
+        resume: Option<&mut crate::call::FrameResumeArgs>,
+    ) -> crate::PyResult {
+        match resume {
+            Some(resume) => self.execute_frame_resumed(resume),
+            None => self.execute_frame(None, None),
+        }
+    }
+
+    /// `execute_generator_frame`'s plain-interpreter half: the resume without
+    /// the portal.  The stack check that used to sit in
+    /// `execute_generator_frame` lives here — the JIT entry performs its own.
+    #[inline]
+    pub fn execute_frame_resumed(
+        &mut self,
+        resume: &mut crate::call::FrameResumeArgs,
+    ) -> crate::PyResult {
         crate::stack_check::drain_jit_pending_exception()?;
         crate::stack_check::stack_check()?;
-        crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, throw_args)
+        crate::eval::eval_frame_plain_with_resume(
+            self,
+            resume.w_inputvalue.take(),
+            resume.operr.take(),
+            resume.throw_args.take(),
+        )
     }
 
     /// pyframe.py:521-522 `hide(self): return self.pycode.hidden_applevel`.

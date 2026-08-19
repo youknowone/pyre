@@ -223,7 +223,27 @@ use crate::eval::eval_frame_plain;
 use crate::pyframe::PyFrame;
 
 // ── Eval function injection ──────────────────────────────────────
-type EvalFn = fn(&mut PyFrame) -> PyResult;
+
+/// The payload a suspended frame is resumed with.
+///
+/// `generator.py:121-145 _invoke_execute_frame` hands the frame the sent value
+/// and, on `throw()`, the operation error — `pyframe.py:285-315
+/// resume_execute_frame` then consumes them.  `throw_args` carries the original
+/// three-argument form for a non-generator delegate, the Rust representation of
+/// the `SApplicationException` payload.
+///
+/// Passed by `&mut` and `take()`n field by field as the resume consumes each
+/// one, so this stays a single pointer in [`EvalFn`]: spreading the three
+/// options across the signature would widen the ABI of every ordinary Python
+/// call, which is the hottest path in the interpreter, for the benefit of the
+/// one caller that resumes a frame.
+pub struct FrameResumeArgs {
+    pub w_inputvalue: Option<PyObjectRef>,
+    pub operr: Option<crate::PyError>,
+    pub throw_args: Option<([PyObjectRef; 3], usize)>,
+}
+
+type EvalFn = fn(&mut PyFrame, Option<&mut FrameResumeArgs>) -> PyResult;
 static EVAL_OVERRIDE: OnceLock<EvalFn> = OnceLock::new();
 type ThreadEntryFn = fn();
 static THREAD_ENTRY_HOOK: OnceLock<ThreadEntryFn> = OnceLock::new();
@@ -376,7 +396,7 @@ pub fn enter_runtime_thread() {
 /// Get the current eval function (JIT-aware if registered, plain otherwise).
 /// Respects the force-plain-eval mode.
 #[inline]
-pub fn get_eval_fn() -> fn(&mut PyFrame) -> PyResult {
+pub fn get_eval_fn() -> EvalFn {
     let plain_mode = FORCE_PLAIN_EVAL.with(|c| c.get() > 0);
     if plain_mode {
         eval_frame_plain
@@ -878,7 +898,7 @@ fn call_user_function_with_eval(
     func_frame.fix_array_ptrs();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
-    eval_fn(&mut func_frame)
+    eval_fn(&mut func_frame, None)
 }
 
 /// [`call_user_function`] with the execution context in place of the caller
@@ -928,7 +948,7 @@ pub fn call_user_function_with_ctx(
     };
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
-    get_eval_fn()(&mut func_frame)
+    get_eval_fn()(&mut func_frame, None)
 }
 
 /// Call a user function with pre-resolved args (scope already packed by
@@ -975,7 +995,7 @@ pub fn call_user_function_resolved(
         )?);
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
-    eval_fn(&mut func_frame)
+    eval_fn(&mut func_frame, None)
 }
 
 /// Invoke a builtin's function pointer for a positional-only call,
@@ -3136,7 +3156,7 @@ fn call_with_kwargs_in_ctx_impl(
                     .copied()
                     .unwrap_or(crate::eval::eval_frame_plain)
             };
-            return eval_fn(&mut func_frame);
+            return eval_fn(&mut func_frame, None);
         } // end user function branch
     } // end is_function
 

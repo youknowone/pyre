@@ -837,7 +837,7 @@ fn run_python_impl(source: &str) -> String {
 
     // catch_unwind to capture panics from JIT as error messages
     let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pyre_jit::eval::eval_with_jit(&mut frame)
+        pyre_jit::eval::eval_with_jit(&mut frame, None)
     })) {
         Ok(r) => r,
         Err(_) => {

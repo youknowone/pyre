@@ -1916,7 +1916,7 @@ fn eval_source_in_main(
     seed_main_loader(canonical, script_file, ec_ptr);
     import_site(no_site, canonical, ec_ptr);
 
-    match eval_with_jit(&mut frame) {
+    match eval_with_jit(&mut frame, None) {
         Ok(result) => {
             if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
                 println!("{}", PyDisplay(result));

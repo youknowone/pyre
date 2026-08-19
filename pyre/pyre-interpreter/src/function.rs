@@ -3818,7 +3818,7 @@ fn _flat_pycall(
     } else {
         let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
         let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame) {
+        match eval_fn(&mut new_frame, None) {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);
@@ -3902,7 +3902,7 @@ fn _flat_pycall_defaults(
     } else {
         let _callee_locals_root = FrameLocalsRoot::new(&mut new_frame);
         let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame) {
+        match eval_fn(&mut new_frame, None) {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);

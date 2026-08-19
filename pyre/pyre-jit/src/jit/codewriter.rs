@@ -13577,19 +13577,24 @@ impl CodeWriter {
                         // purity, not runtime effect-freedom), not a signal that a
                         // residual is possible.
                         //
-                        // Measured, though, the marker is unreachable, and the
-                        // reason sits one level up: a resumption runs
-                        // `PyFrame::execute_generator_frame`, which calls
-                        // `eval_frame_plain_with_resume` directly instead of the
-                        // registered eval override, so no frame of a generator is
-                        // ever offered to the tracer.  No loop in a generator body
-                        // compiles today — whether or not a yield is in it.
-                        // Upstream runs one eval loop, so the same resumption is
-                        // traceable there, and it gives the resumption a merge
-                        // point of its own on top (`generator.py:604`
+                        // The marker was long unreachable for a reason that sat
+                        // one level up — a resumption ran
+                        // `PyFrame::execute_generator_frame`, which called the
+                        // plain evaluator directly instead of the registered
+                        // eval override, so no frame of a generator was ever
+                        // offered to the tracer and no loop in a generator body
+                        // could compile, yield or not.  That entry now goes
+                        // through the override, so a loop that stays clear of
+                        // the yield compiles and this arm is what stops a trace
+                        // at the suspension itself.
+                        //
+                        // Upstream additionally gives the resumption a merge
+                        // point of its own (`generator.py:604`
                         // `generatorentry_driver`, taken at `:63` when
-                        // `should_not_inline` (`:614`) counts two or more yields;
-                        // below that the body is inlined into the caller's trace).
+                        // `should_not_inline` (`:614`) counts two or more
+                        // yields; below that the body is inlined into the
+                        // caller's trace).  Pyre has no such driver yet, so a
+                        // resumption enters the portal as an ordinary frame.
                         Instruction::YieldValue { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
