@@ -550,7 +550,7 @@ fn sched_param_seq_type() -> PyObjectRef {
 
         let new_descr = crate::typedef::make_new_descr_with_signature(
             crate::_structseq::structseq_descr_new,
-            crate::gateway::Signature::new(vec!["cls", "sched_priority"], None, None, 0, 0),
+            crate::gateway::Signature::new(vec!["cls", "sched_priority"], None, None, 0, 1),
         );
         pyre_object::gc_roots::pin_root(new_descr);
         let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
