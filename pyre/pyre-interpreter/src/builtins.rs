@@ -6833,7 +6833,12 @@ pub(crate) use crt_call;
 /// (`1 << 32` seeks to 0), and a position read back off a larger file comes
 /// back wrong.  `_lseeki64` is the one that carries it, and `off_t` is
 /// already 64 bits everywhere else.
-#[cfg(not(feature = "sandbox"))]
+///
+/// Every caller is a file descriptor operation and so already stops at the
+/// targets whose libc has one; the same condition is spelled here because
+/// `wasm32-unknown-unknown` has no `lseek`, no `off_t` and no `c_int` to
+/// declare this with.
+#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
 pub(crate) fn crt_lseek(fd: libc::c_int, offset: i64, whence: libc::c_int) -> i64 {
     #[cfg(windows)]
     {
