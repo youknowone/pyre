@@ -2184,9 +2184,9 @@ pub struct ModuleBuildInputs {
     /// already allocated GC-table base encoded by `gc_table_base`.
     pub ops: Vec<Op>,
     /// Loop-closing bridge regions emitted inside this loop's wasm function.
-    /// Their value ids are already in the owning trace's global space; retain
-    /// them verbatim so every analysis and the generated locals see the same
-    /// identities as the bridge metadata.
+    /// Each is retained in its own trace's numbering; `build_wasm_module`
+    /// rebases them onto a private id range before merging, because the owner
+    /// and every region number their values independently from zero.
     pub inlined_bridges: Vec<InlinedBridge>,
     pub constants: indexmap::IndexMap<u32, i64>,
     pub vtable_offset: Option<usize>,
@@ -2284,6 +2284,108 @@ impl Clone for ModuleBuildInputs {
     }
 }
 
+/// One past the highest value id `inputargs`/`ops` define or read. Mirrors the
+/// `max_var` half of `collect_guards_and_vars` without its guard collection,
+/// which stamps per-value counters onto guard descrs and must run once only.
+fn value_id_end(inputargs: &[InputArg], ops: &[Op]) -> u32 {
+    let mut end: u32 = 0;
+    let widen = |r: OpRef, end: &mut u32| {
+        if r != OpRef::NONE && !r.is_constant() && r.raw() + 1 > *end {
+            *end = r.raw() + 1;
+        }
+    };
+    for ia in inputargs {
+        if ia.index + 1 > end {
+            end = ia.index + 1;
+        }
+    }
+    for op in ops {
+        widen(op.pos.get(), &mut end);
+        for a in op.getarglist().iter() {
+            widen(a.to_opref(), &mut end);
+        }
+        if let Some(fa) = op.getfailargs() {
+            for a in fa.iter() {
+                widen(a.to_opref(), &mut end);
+            }
+        }
+    }
+    end
+}
+
+/// Move every value id a region defines or reads up by `offset`, returning the
+/// rebased region and the width of the id range it now occupies.
+///
+/// The owner trace and each region are separately recorded traces, so both
+/// number their values from zero and their ids overlap. A region is entered by
+/// `local.set`ting the id each of its input args carries
+/// (`emit_guard_inline_bridge_move`) and leaves through the loop header, so an
+/// id it shares with an owner value that is live across the back edge
+/// overwrites that value for every following iteration. Rebasing onto a
+/// disjoint range is what makes the merged stream's single local namespace
+/// sound.
+///
+/// `TempVar` ids live in a reserved high strip and constants in their own
+/// namespace; neither indexes a value local, so both pass through unchanged.
+fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridge, u32) {
+    use majit_ir::operand::Operand;
+
+    let shift = |r: OpRef| -> OpRef {
+        if r.is_none() || r.is_constant() || r.is_temp_var() {
+            r
+        } else {
+            r.with_raw(r.raw() + offset)
+        }
+    };
+
+    let width = value_id_end(&bridge.inputargs, &bridge.ops);
+    let inputargs: Vec<InputArg> = bridge
+        .inputargs
+        .iter()
+        .map(|ia| InputArg::from_type(ia.tp, ia.index + offset))
+        .collect();
+    // `Op::clone` gives the copy its own arg/failarg slots, but the operands in
+    // them keep pointing at the region's original producers, whose `pos` this
+    // must not touch — the region is retained for the next re-emission. So each
+    // moved reference is rebound to a synthetic producer carrying the new id.
+    let ops: Vec<Op> = bridge.ops.to_vec();
+    for op in &ops {
+        op.pos.set(shift(op.pos.get()));
+        for (i, arg) in op.getarglist().iter().enumerate() {
+            let before = arg.to_opref();
+            let after = shift(before);
+            if after != before {
+                op.setarg(i, Operand::bound_from_opref(after));
+            }
+        }
+        if let Some(mut fail_args) = op.getfailargs() {
+            let mut moved = false;
+            for slot in fail_args.iter_mut() {
+                let before = slot.to_opref();
+                let after = shift(before);
+                if after != before {
+                    *slot = Operand::bound_from_opref(after);
+                    moved = true;
+                }
+            }
+            if moved {
+                op.setfailargs(fail_args);
+            }
+        }
+    }
+
+    (
+        InlinedBridge {
+            source_fail_index: bridge.source_fail_index,
+            trace_id: bridge.trace_id,
+            inputargs,
+            ops,
+            gc_table_base: bridge.gc_table_base,
+        },
+        width,
+    )
+}
+
 /// Build a wasm module from majit IR.
 pub fn build_wasm_module(
     inputs: &ModuleBuildInputs,
@@ -2323,12 +2425,18 @@ pub fn build_wasm_module(
     let mut merged_ops = Vec::new();
     let mut gc_table_bases = HashMap::new();
     let mut region_spans: Vec<InlinedRegionSpan> = Vec::new();
+    let mut rebased_bridges: Vec<InlinedBridge> = Vec::new();
     let (analysis_inputargs, analysis_ops): (&[InputArg], &[Op]) = if inlined_bridges.is_empty() {
         (inputargs, ops)
     } else {
         merged_inputargs.extend(inputargs.iter().map(InputArg::fresh_value_copy));
         merged_ops.extend(ops.iter().cloned());
+        // The merged stream has one local namespace, so every region has to be
+        // moved off the ids the owner and the earlier regions already use.
+        let mut next_value_id = value_id_end(inputargs, ops);
         for bridge in inlined_bridges {
+            let (bridge, width) = rebase_region_value_ids(bridge, next_value_id);
+            next_value_id += width;
             // Taken before this region's ops are appended, so it names the
             // first op of the region. `fresh_value_copy` keeps `index`, so the
             // ids recorded here are the ids the merged stream reads.
@@ -2343,8 +2451,16 @@ pub fn build_wasm_module(
                 }
             }
             merged_ops.extend(bridge.ops.iter().cloned());
+            rebased_bridges.push(bridge);
         }
         (&merged_inputargs, &merged_ops)
+    };
+    // Guard-entry moves and region emission must name the rebased ids, not the
+    // ids the retained regions still carry.
+    let emitted_bridges: &[InlinedBridge] = if inlined_bridges.is_empty() {
+        inlined_bridges
+    } else {
+        &rebased_bridges
     };
     let (mut guards, num_vars) = collect_guards_and_vars(analysis_inputargs, analysis_ops);
 
@@ -2758,7 +2874,7 @@ pub fn build_wasm_module(
         inputargs,
         &analysis_inputargs,
         &analysis_ops,
-        inlined_bridges,
+        emitted_bridges,
         constants,
         num_vars,
         &value_types,
