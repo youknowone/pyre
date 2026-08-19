@@ -6329,38 +6329,32 @@ impl<M: Clone> MetaInterp<M> {
             return CompileOutcome::Aborted;
         }
 
-        // pyjitpl.py:3015-3032 parity: pyre caches the retrace limit per
-        // green_key so guard-heavy recompilations do not loop forever.
-        // The limit check happens BEFORE we consume the trace ctx so
-        // Cancelled here keeps `self.tracing` + `active_trace_session`
-        // alive — the caller (reached_loop_header analogue) then falls
-        // through to `current_merge_points.append(...)` and records more
-        // ops. `warm_state.abort_tracing(..., permanent=true)` disables
-        // future entries at this key without disturbing the live trace.
-        let prior_front_target_tokens_early = self
-            .compiled_loops
-            .get(&green_key)
-            .map(|compiled| compiled.front_target_tokens.clone())
-            .unwrap_or_default();
+        // `unroll.py:270-272 disable_retracing_if_max_retrace_guards` writes
+        // `retraced_count = sys.maxint`, and the one reader of that value is
+        // `unroll.py:216 if cell_token.retraced_count < limit` — it stops the
+        // cell from RETRACING and nothing else. Upstream never lets it decide
+        // whether a loop may be compiled: `pyjitpl.py:3185-3189` gives up on a
+        // key that already has compiled targets, which the
+        // `has_compiled_targets` arm above already answers, and that give-up is
+        // an ordinary `SwitchToBlackhole(ABORT_BAD_LOOP)` whose abort is
+        // counted like any other.
+        //
+        // Reading it a second time here as "never compile this key again" is
+        // reachable and wrong. `has_compiled_targets` asks the WARMSTATE cell
+        // for its procedure token while `live_token()` upgrades the
+        // `compiled_loops` entry's own `Weak`, so the two disagree exactly when
+        // the cell has lost its token — an invalidated or reclaimed loop, which
+        // is the state upstream expects a fresh compile from. A guard-heavy
+        // loop that reached that state was being answered with
+        // `abort_tracing(green_key, permanent = true)`, i.e. `DONT_TRACE_HERE`
+        // forever, where the ordinary abort path escalates only after
+        // `MAX_TRACE_ABORT_COUNT` aborts.
         let prior_retraced_count_early = self
             .compiled_loops
             .get(&green_key)
             .and_then(|compiled| compiled.live_token())
             .map(|token| token.get_retraced_count())
             .unwrap_or(0);
-        if prior_retraced_count_early == u32::MAX && !prior_front_target_tokens_early.is_empty() {
-            if crate::debug::have_debug_prints() {
-                crate::debug::log_one(
-                    "jit-tracing",
-                    &format!("skipping recompile: retraced_count=MAX for key={green_key}"),
-                );
-            }
-            self.warm_state.abort_tracing(green_key, true);
-            if crate::closedbg_enabled() {
-                eprintln!("@@@CANCEL-SITE line={}", line!());
-            }
-            return CompileOutcome::Cancelled;
-        }
 
         // compile.py:269-270 `jitcell_token = cross_loop.jitcell_token`: mark
         // the key this loop is about to be stored under as cut-owned, before
