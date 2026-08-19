@@ -10,8 +10,16 @@ import sys
 N = 20000
 
 
+at_getframe = set()
+
+
 def leaf(x):
-    return sys._getframe(0)
+    frame = sys._getframe(0)
+    # The `_getframe` transition, read while the callee still owns the frame.
+    # The return coordinate `main` checks cannot stand in for it: a missing
+    # publication here is overwritten by the return one before `main` looks.
+    at_getframe.add(frame.f_lasti)
+    return frame
 
 
 def main():
@@ -24,6 +32,9 @@ def main():
 
     if total != sum(range(N)):
         print(f"FAIL dropped iteration: total={total} expected={sum(range(N))}")
+        return 1
+    if len(at_getframe) != 1 or next(iter(at_getframe)) < 0:
+        print(f"FAIL inlined frame f_lasti at _getframe: {sorted(at_getframe)}")
         return 1
     if len(seen) != 1 or next(iter(seen)) < 0:
         print(f"FAIL inlined frame f_lasti diverged: {sorted(seen)}")
