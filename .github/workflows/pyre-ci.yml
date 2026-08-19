@@ -535,18 +535,6 @@ jobs:
       # native backends.
       if: runner.os == 'Linux'
       run: rustup target add wasm32-unknown-unknown
-    - name: Build pyre-wasm web binding (Linux only)
-      # check.py builds and exercises the wasm-host binding below. Build the
-      # browser binding in the same release target first so the two flavours
-      # share their compiled dependencies without spending two additional
-      # runner jobs on checkout, cache restore, and LLBC download. check.py's
-      # later wasm-host build intentionally replaces pyre_wasm.wasm before it
-      # snapshots and runs that module.
-      if: runner.os == 'Linux'
-      run: |
-        cargo build --release -p pyre-wasm \
-          --target wasm32-unknown-unknown \
-          --no-default-features --features web
     - name: Run pyre/check.py
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
@@ -678,7 +666,7 @@ jobs:
     steps: *pyre-check-steps
 
   sandbox-build:
-    name: sandbox build + e2e (ubuntu-24.04)
+    name: sandbox e2e + wasm web build (ubuntu-24.04)
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
@@ -727,6 +715,26 @@ jobs:
           # where the cause is still visible.
           test -s "build/llbc/${crate}.ullbc.readfiles"
         done
+    - name: Add wasm32 target
+      run: rustup target add wasm32-unknown-unknown
+    - name: Build pyre-wasm web binding
+      # Compile check only: nothing here runs the browser binding, and the
+      # `pyre/check.py` job overwrites pyre_wasm.wasm with its own wasm-host
+      # build before it snapshots and runs that module. It runs here, and
+      # first, because this job already carries the checkout, toolchain, Cargo
+      # cache and prepared Charon/LLBC set the build needs, and finishes well
+      # inside the wall time of the check.py leg it used to sit in.
+      #
+      # It was placed ahead of check.py on the premise that the two wasm
+      # flavours would share compiled dependencies. Measured: the web build
+      # takes 6m and leaves the later wasm-host build 50s cheaper (2m32 ->
+      # 1m42), because check.py sets RUSTFLAGS the web build does not and half
+      # the graph recompiles under the difference. So the sharing is real and
+      # costs about seven times what it returns.
+      run: |
+        cargo build --release -p pyre-wasm \
+          --target wasm32-unknown-unknown \
+          --no-default-features --features web
     - name: Build pyre --features sandbox
       # A green sandbox build is the fails-closed proof: every mediated module
       # names libc through host_seam::sys, so any direct syscall left outside
