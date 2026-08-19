@@ -164,11 +164,14 @@ crate::py_module! {
                     store(name, *value as i64);
                 }
             }
-            // `interp_errno.py`'s "MacOSX specific errnos" block, plus the
-            // `EQFULL` the 3.14 surface adds.  `DefinedConstantInteger`
-            // drops each of these on a platform whose `errno.h` lacks it;
-            // the equivalent here is the target gate, since `libc` declares
-            // them for apple targets only.
+            // `interp_errno.py`'s "MacOSX specific errnos" block, plus
+            // `EQFULL`, which that list omits: measured under 3.14.6 on
+            // darwin, `errno.EQFULL` is 106, and
+            // `extra_tests/snippets/errno_platform_names.py` asserts the whole
+            // block so the reference lane re-measures it on every run.
+            // `DefinedConstantInteger` drops each of these on a platform whose
+            // `errno.h` lacks it; the equivalent here is the target gate,
+            // since `libc` declares them for apple targets only.
             #[cfg(target_vendor = "apple")]
             {
                 let apple_entries: &[(&str, i32)] = &[

@@ -27,7 +27,7 @@ use std::path::Path;
     not(feature = "sandbox"),
     not(target_arch = "wasm32")
 ))]
-use std::path::Component;
+use std::path::{Component, Prefix};
 
 use crate::PyExecutionContext;
 use crate::{CodeObject, Mode, PyFrame, compile_source_with_filename};
@@ -2101,6 +2101,22 @@ fn absolute_from(path: PathBuf, cwd: &Path) -> PathBuf {
     not(target_arch = "wasm32")
 ))]
 fn normalize_lexically(path: &Path) -> PathBuf {
+    // `\\.\` device names and `\\?\` literal paths are handed to the OS as
+    // spelled and are returned unchanged (rpath.py:106-111): a `.` or `..`
+    // inside one is an ordinary name, so collapsing it would rewrite which
+    // object the path reaches.  No such component exists on unix, where the
+    // arm is unreachable.
+    if let Some(Component::Prefix(prefix)) = path.components().next()
+        && matches!(
+            prefix.kind(),
+            Prefix::Verbatim(_)
+                | Prefix::VerbatimUNC(..)
+                | Prefix::VerbatimDisk(_)
+                | Prefix::DeviceNS(_)
+        )
+    {
+        return path.to_path_buf();
+    }
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
