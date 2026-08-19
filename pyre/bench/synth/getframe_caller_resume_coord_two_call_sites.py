@@ -43,15 +43,6 @@
 # `fbw_blackhole_adopted_single_frame` 5 -> 0 / `loops_aborted` 10 -> 5, and
 # `outer`'s loop compiles now — which makes the assertion above stricter, not
 # weaker, since the coordinate it reads comes out of a compiled activation.
-#
-# Publishing a trivia-normalized coordinate at the blackhole's `-live-` marker
-# moved the recorded shape again: `loops_aborted` 5 -> 0 and
-# `fbw_blackhole_adopted_multi_frame` 5 -> 0 against `bridges_compiled` 0 -> 1
-# and `guard_failures` 0 -> 201.  The stale coordinate named a `Cache` unit, so
-# a replay resumed one code unit inside the `LOAD_GLOBAL` and aborted; with the
-# coordinate on the CALL the leg-1 guard simply fails until its bridge
-# compiles, which is the shape a two-legged loop is supposed to have.  Those
-# 201 failures are the same window the extra `f_lasti` row occupied.
 import sys
 
 N = 30000
