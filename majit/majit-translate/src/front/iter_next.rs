@@ -125,6 +125,33 @@ fn originates_from_iter_op(graph: &FunctionGraph, var: &Variable) -> bool {
 /// discarded; [`iter_next_item_type`] needs it, because the container is the
 /// only thing that separates the two iterator reprs.
 fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
+    walk_back_to_source(graph, var, |op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if is_iter_op_segments(segments) => args.first().cloned(),
+        _ => None,
+    })
+}
+
+/// Walk backwards from `var` to the op that produced it, asking `probe`
+/// about each candidate, and stop at the first `Some`.
+///
+/// Two steps per var: (1) an op whose result is the var — hand it to
+/// `probe`; (2) a block inputarg — trace each predecessor's link arg in
+/// the matching slot, so a loop header's phi resolves through its entry
+/// edge to the pre-loop definition while the back edge re-threads an
+/// already-seen var.
+///
+/// Conservative: a var produced by an op `probe` declines is not followed
+/// any further, so a result is always a positively-confirmed source rather
+/// than the absence of a contrary one.
+fn walk_back_to_source<T>(
+    graph: &FunctionGraph,
+    var: &Variable,
+    probe: impl Fn(&SpaceOperation) -> Option<T>,
+) -> Option<T> {
     let mut visited: Vec<Variable> = Vec::new();
     let mut stack: Vec<Variable> = vec![var.clone()];
     while let Some(v) = stack.pop() {
@@ -132,23 +159,15 @@ fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> 
             continue;
         }
         visited.push(v.clone());
-        // (1) produced directly by an iter op → confirmed list iterator.
         for b in &graph.blocks {
             for op in &b.operations {
                 if op.result.as_ref() == Some(&v)
-                    && let OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        args,
-                        ..
-                    } = &op.kind
-                    && is_iter_op_segments(segments)
+                    && let Some(found) = probe(op)
                 {
-                    return args.first().cloned();
+                    return Some(found);
                 }
             }
         }
-        // (2) a block inputarg → trace each predecessor's link arg in the
-        // matching slot (the loop-carried iterator phi).
         for b in &graph.blocks {
             if let Some(pos) = b.inputargs.iter().position(|iv| iv == &v) {
                 let target_id = b.id;
@@ -170,9 +189,17 @@ fn iter_op_container(graph: &FunctionGraph, var: &Variable) -> Option<Variable> 
 /// The element type the native `next` op yields for the iterator `var`.
 ///
 /// `ListIteratorRepr::rtype_next` (`rlist.py ll_listnext`) hands back the
-/// list's item repr — a GC reference for every list this fold admits —
-/// while `RangeIteratorRepr::rtype_next` (`rrange.py ll_rangenext_*`) hands
-/// back a `Signed`.  `front::range_iter` reroutes an exclusive int `Range`
+/// list's item repr, while `RangeIteratorRepr::rtype_next`
+/// (`rrange.py ll_rangenext_*`) hands back a `Signed`.
+///
+/// The `Ref` answer is the fold's assumption about every other container,
+/// not a decision: [`is_iter_op_segments`] admits any `core::slice::…::iter`,
+/// including a slice whose items are not GC references (`&[usize]`,
+/// `&[u8]`).  Such a loop would type raw integers into the ref register
+/// bank.  No graph the codewriter looks inside iterates one today — the two
+/// production `#[unroll_safe]` sites iterate a `range` and a
+/// `&[PyObjectRef]` — so closing it needs the container's element type,
+/// which the fold does not consult.  `front::range_iter` reroutes an exclusive int `Range`
 /// for-loop onto the `range()` builtin plus the same `iter` bridge, so both
 /// reprs arrive here behind one `iter` op and only the container that op was
 /// given tells them apart.
@@ -195,24 +222,25 @@ fn iter_next_item_type(graph: &FunctionGraph, iterator: &Variable) -> ValueType 
     }
 }
 
-/// Whether `var` is the result of `front::range_iter`'s reserved
+/// Whether `var` traces back to `front::range_iter`'s reserved
 /// `["__pyre_range"]` call — the `range(a, b)` builtin standing in for an
 /// exclusive int `Range`.
+///
+/// The same backward walk the iterator itself gets.  `range_iter` emits the
+/// `range` call and the `iter` bridge adjacent, so today the container is
+/// that call's direct result; a copy or a block boundary between them would
+/// otherwise flip the answer back to `Ref`, and the failure mode is the
+/// assembler reject [`iter_next_item_type`] exists to prevent rather than a
+/// graceful degrade.
 fn produced_by_range_builtin(graph: &FunctionGraph, var: &Variable) -> bool {
-    graph
-        .blocks
-        .iter()
-        .flat_map(|b| b.operations.iter())
-        .any(|op| {
-            op.result.as_ref() == Some(var)
-                && matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        ..
-                    } if segments.len() == 1 && segments[0] == "__pyre_range"
-                )
-        })
+    walk_back_to_source(graph, var, |op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            ..
+        } if segments.len() == 1 && segments[0] == "__pyre_range" => Some(()),
+        _ => None,
+    })
+    .is_some()
 }
 
 /// Transitive closure of dead forwarded inputarg slots starting from
