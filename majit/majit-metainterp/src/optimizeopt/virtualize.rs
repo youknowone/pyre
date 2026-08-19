@@ -1106,6 +1106,15 @@ impl OptVirtualize {
                     .fields
                     .iter()
                     .find(|(idx, _)| *idx == field_idx)
+                    .filter(|(_, b)| {
+                        virtualizable_slot_identifies(
+                            vstate,
+                            field_idx,
+                            field_descr,
+                            b,
+                            op.result_type(),
+                        )
+                    })
                     .map(|(_, b)| b.to_opref()),
                 _ => None,
             };
@@ -2631,6 +2640,36 @@ fn field_slot_identifies(descr: &DescrRef, field_idx: u32, field: &dyn FieldDesc
         .all_fielddescrs()
         .get(field_idx as usize)
         .is_some_and(|slot| slot_holds_field(slot.as_ref(), field))
+}
+
+/// Whether `field_idx` addresses `field` in a virtualizable's slot list.
+///
+/// The virtualizable half of [`field_slot_identifies`], which cannot serve
+/// here. `VirtualizableFieldState.fields` is keyed in `VirtualizableInfo::
+/// static_fields` order while the read computes `index_in_parent`
+/// (`majit-ir ptr_info.rs` spells both), so `vstate.descr`'s field list does
+/// not index that slot and cannot say what it holds. What the state does carry
+/// is the descr each store recorded, so the check runs against that; a slot no
+/// store described falls back to the value's type, which is what separates an
+/// `Int` field read from a slot holding a `Ref`.
+///
+/// A slot that does not identify the field leaves the read unfolded. That is
+/// the answer a virtualizable needs: `folds_to_zero` covers only `Virtual` and
+/// `VirtualStruct`, so the caller emits the real load instead of reading a
+/// zeroed allocation off a live frame.
+fn virtualizable_slot_identifies(
+    vstate: &VirtualizableFieldState,
+    field_idx: u32,
+    field: &dyn FieldDescr,
+    stored: &Operand,
+    result_type: Type,
+) -> bool {
+    match get_field_descr(&vstate.field_descrs, field_idx) {
+        Some(slot) => slot
+            .as_field_descr()
+            .is_some_and(|slot| slot_holds_field(slot, field)),
+        None => stored.type_() == result_type,
+    }
 }
 
 fn set_field(fields: &mut Vec<(u32, Operand)>, field_idx: u32, value: Operand) {

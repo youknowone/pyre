@@ -880,22 +880,32 @@ Added on `perf-bridge`. `shortpreamble.py:272-281` appends every produced op to
 upstream has no such switch; the gate exists because pyre cannot yet run that
 arm. Default-OFF, so an unset tree behaves exactly as its base does.
 
-Turning it on was measured with `check.py --backend dynasm --synthetic-only`
-and is not viable today — it crashes the JIT on seven of the 431 synthetic
-fixtures, with two distinct panics:
+Turning it on crashed the JIT on seven of the 431 synthetic fixtures, with two
+distinct panics. **Both are fixed and all seven run clean with the gate on**
+(2026-08-19):
 
 - `optimizeopt`, `assertion left == right failed: make_equal_to: cross-type
-  forward (Box.type invariant)`: a const-result short box forwarded into a
-  typed box slot. Six fixtures — `check_exc_match_invalid_class`,
+  forward (Box.type invariant)`, on `check_exc_match_invalid_class`,
   `exc_mixed_classes_bridge_flavor`, `except_tuple_clause_hot`,
   `exception_traceback_frame_lineno`, `frame_lineno_mid_replay_regression`,
-  `jit_callee_raised_exc_value`.
-- `resume.rs`, `decode_ref: unexpected tag 1`, on
-  `call_loop_local_function`.
+  `jit_callee_raised_exc_value`. The forward was
+  `GetfieldGcI PyFrame.last_instr <- InputArgRef`: the read resolved a
+  virtualizable slot by `index_in_parent` while
+  `VirtualizableFieldState.fields` is keyed in `VirtualizableInfo::
+  static_fields` order, and `Virtualizable` was the one `PtrInfo` the read's
+  `field_slot_identifies` check did not cover. `virtualize.rs
+  virtualizable_slot_identifies` now checks the slot against the descr its
+  store recorded, and a slot that does not identify the field leaves the read
+  unfolded.
+- `resume.rs`, `decode_ref: unexpected tag 1`, on `call_loop_local_function`.
+  Fixed by declaring `Function.mutate_slots` `Type::Ref`; the field reached
+  resume data int-tagged while it was `Type::Int` with a hand-written NULL
+  store.
 
 A three-fixture sample (`v4_onlylongtail` 66000, `v13_readdefs` 74000,
-`synth/closure_per_call` 733264) does pass with the gate on, which is why a
-narrow check reads as clear; the 431-fixture run is the one that decides.
+`synth/closure_per_call` 733264) passed with the gate on even while those
+panics stood, which is why a narrow check reads as clear; the 431-fixture run
+is the one that decides whether the gate can go.
 
 | var | reader | what it gates | polarity | retires when |
 |---|---|---|---|---|

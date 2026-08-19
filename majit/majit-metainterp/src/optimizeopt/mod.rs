@@ -530,6 +530,24 @@ pub use crate::optimizeopt::info::{StringConstantAllocator, StringContentResolve
 
 use crate::optimizeopt::info::PtrInfoExt;
 
+/// One line naming an operand for an assertion message: its producing opcode
+/// and, for a field access, the descr's field name. The operand's own `Debug`
+/// walks the whole abstract-value graph, which is unusable in a panic message.
+fn describe_operand_for_assert(b: &Operand) -> String {
+    let Some(op) = b.bound_op() else {
+        return format!("{:?}", b.to_opref());
+    };
+    let name = op
+        .getdescr()
+        .and_then(|d| d.as_field_descr().map(|fd| fd.field_name().to_string()))
+        .unwrap_or_default();
+    if name.is_empty() {
+        format!("{:?} {:?}", op.opcode, op.pos.get())
+    } else {
+        format!("{:?} {:?} `{name}`", op.opcode, op.pos.get())
+    }
+}
+
 /// Context provided to optimization passes.
 ///
 /// Holds the shared state that passes read from and write to.
@@ -4500,10 +4518,15 @@ impl OptContext {
         // silently retype the chain head. Always-on (not `debug_assert_eq!`)
         // for parity with the Const-invariant `assert!`s in `set_forwarded_*`;
         // asserted on the already-chain-walked `op` so it costs no extra walk.
+        // The message names both sides: which two operations disagree is the
+        // whole content of this failure, and the operand `Debug` walks the
+        // abstract-value graph, so it cannot be printed here.
         assert_eq!(
             op.type_(),
             newop.type_(),
-            "make_equal_to: cross-type forward (Box.type invariant)",
+            "make_equal_to: cross-type forward (Box.type invariant): {} <- {}",
+            describe_operand_for_assert(&op),
+            describe_operand_for_assert(newop),
         );
         // optimizer.py:392 if op is newop: return
         if &op == newop {
