@@ -3516,13 +3516,14 @@ static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
-/// `W_ObjectObject.map` (`objectobject.rs:38`) — the erased `*const MapNode`
-/// instance shape pointer, `self.map` of PyPy's `MapdictStorageMixin`
-/// (`mapdict.py:907`). Read as an opaque `Int` word so the LOAD_ATTR fast path
-/// can `guard_value` it to a constant map (`jit.promote(self.map)`,
-/// mapdict.py:905), after which the resolved `storageindex` is a green
-/// constant. The map nodes are interned + immortal, so the pointer is a stable
-/// identity and the guard need not treat it as a GC ref.
+/// `W_ObjectObject.map` — the instance shape word, `self.map` of PyPy's
+/// `MapdictStorageMixin` (`mapdict.py:907`). Read as an `Int` word so the
+/// LOAD_ATTR fast path can `guard_value` it to a constant map
+/// (`jit.promote(self.map)`, mapdict.py:905), after which the resolved
+/// `storageindex` is a green constant. The map nodes are interned + immortal,
+/// so the address is a stable identity and the guard need not treat it as a GC
+/// ref — the field is declared `usize` so the translator lowers its reads to
+/// the same `Int` kind rather than the `Ref` a pointer type would imply.
 pub fn object_map_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 0)
 }

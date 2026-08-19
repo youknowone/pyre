@@ -15,7 +15,7 @@ use std::time::Instant;
 #[crate::pyre_class("_lsprof.Profiler")]
 #[derive(Default)]
 pub struct W_Profiler {
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
     subcalls: bool,
     builtins: bool,

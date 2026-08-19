@@ -23,7 +23,7 @@ pub struct W_IntObject {
 #[repr(C)]
 pub struct W_IntObjectUser {
     pub base: W_IntObject,
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
@@ -269,7 +269,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
             },
             intval: value,
         },
-        map: std::ptr::null(),
+        map: 0,
         storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(

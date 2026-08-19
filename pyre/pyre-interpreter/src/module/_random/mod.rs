@@ -140,7 +140,7 @@ pub struct W_Random {
     /// `[PyObject | map | storage]` prefix as `W_ObjectObject`, so the shared
     /// mapdict implementation can operate on both layouts.  The builtin
     /// `_random.Random` itself simply retains the empty/null state.
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
     /// `interp_random.py:21 self._rnd = rrandom.Random()` — the reference to a
     /// separately allocated generator.  `random_object_custom_trace` forwards

@@ -84,7 +84,7 @@ pub struct W_TupleObject {
 #[repr(C)]
 pub struct W_TupleObjectUser {
     pub base: W_TupleObject,
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut ItemsBlock,
 }
 
@@ -403,7 +403,7 @@ fn w_tuple_new_array_backed_impl(
                 wrappeditems: items_block,
                 w_dict: PY_NULL,
             },
-            map: std::ptr::null(),
+            map: 0,
             storage: std::ptr::null_mut(),
         }) as PyObjectRef
     } else {
@@ -435,7 +435,7 @@ unsafe fn write_tuple_layout(
                         wrappeditems,
                         w_dict: PY_NULL,
                     },
-                    map: std::ptr::null(),
+                    map: 0,
                     storage: std::ptr::null_mut(),
                 },
             )

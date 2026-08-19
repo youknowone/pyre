@@ -20,7 +20,7 @@ const CERT_REQUIRED: i32 = 2;
 #[crate::pyre_class("_ssl._SSLContext")]
 #[derive(Default)]
 pub struct W_SSLContext {
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
     pub backend: *mut pyre_native::ssl::Context,
     pub sni_callback: PyObjectRef,
@@ -36,7 +36,7 @@ pub struct W_SSLContext {
 #[crate::pyre_class("_ssl.MemoryBIO")]
 #[derive(Default)]
 pub struct W_MemoryBIO {
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
     pub backend: *mut pyre_native::ssl::MemoryBio,
 }
@@ -547,7 +547,7 @@ mod context_methods {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
             },
-            map: std::ptr::null(),
+            map: 0,
             storage: std::ptr::null_mut(),
             backend,
             sni_callback: w_none(),
@@ -1344,7 +1344,7 @@ mod memory_bio_methods {
                     ob_type: std::ptr::null(),
                     w_class: std::ptr::null_mut(),
                 },
-                map: std::ptr::null(),
+                map: 0,
                 storage: std::ptr::null_mut(),
                 backend: pyre_native::ssl::memory_bio_new(),
             });

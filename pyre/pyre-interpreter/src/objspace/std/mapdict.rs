@@ -2802,7 +2802,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         self.map as MapRef
     }
     fn _set_mapdict_map(&mut self, map: MapRef) {
-        self.map = map as *const u8;
+        self.map = map as usize;
     }
     fn _mapdict_read_storage(&self, storageindex: usize) -> PyObjectRef {
         // mapdict.py:914-916. A read is always preceded by the
@@ -2898,7 +2898,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         }
         unsafe {
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
-            owner.map = map as *const u8;
+            owner.map = map as usize;
         }
     }
     fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef) {
@@ -2931,7 +2931,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             *base.add(needed - 1) = pyre_object::gc_roots::shadow_stack_get(value_slot);
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             owner.storage = block;
-            owner.map = map as *const u8;
+            owner.map = map as usize;
             instance_write_barrier(owner as *mut Self as PyObjectRef);
             if !std::ptr::eq(block, old) {
                 pyre_object::object_array::dealloc_instance_items_block(old);
@@ -2966,7 +2966,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
             let fresh_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let owner = &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut Self);
             owner.storage = pyre_object::gc_roots::shadow_stack_get(fresh_slot) as *mut _;
-            owner.map = map as *const u8;
+            owner.map = map as usize;
             instance_write_barrier(owner as *mut Self as PyObjectRef);
             pyre_object::object_array::dealloc_instance_items_block(old);
         }
@@ -2997,7 +2997,7 @@ impl MapdictCarrier {
     unsafe fn slots(
         &self,
     ) -> (
-        *mut *const u8,
+        *mut usize,
         *mut *mut pyre_object::object_array::ItemsBlock,
     ) {
         let obj = self.obj;
@@ -3054,7 +3054,7 @@ impl MapdictObject for MapdictCarrier {
     }
 
     fn _set_mapdict_map(&mut self, map: MapRef) {
-        unsafe { *self.slots().0 = map as *const u8 };
+        unsafe { *self.slots().0 = map as usize };
     }
 
     fn _mapdict_read_storage(&self, storageindex: usize) -> PyObjectRef {

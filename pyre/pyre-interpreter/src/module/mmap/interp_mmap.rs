@@ -115,7 +115,7 @@ impl Drop for NativeMMap {
 #[crate::pyre_class("mmap.mmap")]
 #[derive(Default)]
 pub struct W_MMap {
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
     backend: *mut NativeMMap,
     pos: i64,
@@ -1618,7 +1618,7 @@ fn mmap_new_object(
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
-        map: std::ptr::null(),
+        map: 0,
         storage: std::ptr::null_mut(),
         backend,
         pos: 0,

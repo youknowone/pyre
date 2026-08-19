@@ -3206,18 +3206,18 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     let shadow = unsafe {
         if pyre_object::is_instance(concrete_obj) {
             let map = (*(concrete_obj as *const pyre_object::W_ObjectObject)).map;
-            if map.is_null() {
+            if map == 0 {
                 return Ok(None);
             }
             // A devolved instance holds its attributes in a dictionary and
             // keeps the same map across a later `e.<name> = ...`, so pinning
             // the map would not observe the shadow the assignment installs.
-            // `W_ObjectObject.map` is stored untyped; the map layer owns the
-            // node type.
-            if pyre_interpreter::objspace::std::mapdict::map_is_devolved(map.cast()) {
+            // `W_ObjectObject.map` is stored as a raw word; the map layer
+            // owns the node type.
+            if pyre_interpreter::objspace::std::mapdict::map_is_devolved(map as *const _) {
                 return Ok(None);
             }
-            ShadowGuard::InstanceMap(map)
+            ShadowGuard::InstanceMap(map as *const u8)
         } else if pyre_object::is_exception(concrete_obj) {
             ShadowGuard::ExceptionDictIsNull(pyre_object::w_exception_get_kind(concrete_obj))
         } else {

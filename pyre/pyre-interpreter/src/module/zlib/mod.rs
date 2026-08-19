@@ -20,7 +20,7 @@ use std::sync::Mutex;
 #[crate::pyre_class("zlib.Compress")]
 #[derive(Default)]
 pub struct W_Compress {
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
     backend: *mut Mutex<backend::Compressor>,
 }
@@ -29,7 +29,7 @@ pub struct W_Compress {
 #[crate::pyre_class("zlib.Decompress")]
 #[derive(Default)]
 pub struct W_Decompress {
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
     backend: *mut Mutex<backend::Decompressor>,
 }
@@ -38,7 +38,7 @@ pub struct W_Decompress {
 #[crate::pyre_class("zlib._ZlibDecompressor")]
 #[derive(Default)]
 pub struct W_ZlibDecompressor {
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
     backend: *mut Mutex<backend::ZlibDecompressor>,
 }
@@ -384,7 +384,7 @@ fn allocate_compress(
     let cls_slot = gc_roots::shadow_stack_len() - 1;
     let obj = W_Compress::allocate_stable(W_Compress {
         ob: PyObject::default(),
-        map: std::ptr::null(),
+        map: 0,
         storage: std::ptr::null_mut(),
         backend,
     });
@@ -639,7 +639,7 @@ fn allocate_decompress(
     let cls_slot = gc_roots::shadow_stack_len() - 1;
     let obj = W_Decompress::allocate_stable(W_Decompress {
         ob: PyObject::default(),
-        map: std::ptr::null(),
+        map: 0,
         storage: std::ptr::null_mut(),
         backend,
     });
@@ -705,7 +705,7 @@ fn allocate_zdecompress(
     let cls_slot = gc_roots::shadow_stack_len() - 1;
     let obj = W_ZlibDecompressor::allocate_stable(W_ZlibDecompressor {
         ob: PyObject::default(),
-        map: std::ptr::null(),
+        map: 0,
         storage: std::ptr::null_mut(),
         backend,
     });

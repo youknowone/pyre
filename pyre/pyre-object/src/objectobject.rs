@@ -34,8 +34,14 @@ use crate::pyobject::*;
 #[repr(C)]
 pub struct W_ObjectObject {
     pub ob_header: PyObject,
-    /// `self.map` (`mapdict.py:907`); erased `*const MapNode`.
-    pub map: *const u8,
+    /// `self.map` (`mapdict.py:907`) — the interned map node's address held as
+    /// a raw word, not a pointer.  Map nodes are interned, shared per type and
+    /// never freed, so the GC neither owns nor traces this slot
+    /// (`object_object_custom_trace` walks only `storage`).  A pointer-typed
+    /// field would make the translator lower every read of it to a `Ref`,
+    /// which is what the JIT reserves for GC references; the word spelling
+    /// keeps the one field on one kind.  Cast to `MapRef` at each use.
+    pub map: usize,
     /// `self.storage` (`mapdict.py:910`) — a `Ptr(GcArray(OBJECTPTR))` block of
     /// attribute values (`ItemsBlock`, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID`).
     /// null = `None`, the `_mapdict_init_empty` empty state (`mapdict.py:910`).
@@ -94,14 +100,14 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
         //
         // Reading it here rather than installing it on first attribute access
         // is what makes `_get_mapdict_map`'s `jit.promote(self.map)` promotable.
-        // A deferred install leaves every fresh instance at null until the
+        // A deferred install leaves every fresh instance at zero until the
         // first access, so the promoted map guard the JIT bakes — recorded
         // AFTER that install, hence naming the terminator — cannot hold on the
         // next iteration's fresh instance. It then fails on every pass through
         // a loop that constructs an object and touches an attribute, and each
         // failure is a full deopt.
         //
-        // Null stays legal: `pyre-object` cannot build a terminator (it lives
+        // Zero stays legal: `pyre-object` cannot build a terminator (it lives
         // in the interpreter's mapdict layer and `pyre-object` must not depend
         // on it), so a type whose terminator has not been created yet still
         // gets one from `ensure_mapdict_initialized` on first access — which
@@ -113,9 +119,9 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
         // terminator field would be read off whatever that address points at.
         map: unsafe {
             if crate::typeobject::is_type(w_type) {
-                crate::typeobject::w_type_get_terminator(w_type)
+                crate::typeobject::w_type_get_terminator(w_type) as usize
             } else {
-                std::ptr::null()
+                0
             }
         },
         storage: std::ptr::null_mut(),

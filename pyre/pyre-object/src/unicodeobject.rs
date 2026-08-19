@@ -66,7 +66,7 @@ pub struct W_UnicodeObject {
 #[repr(C)]
 pub struct W_UnicodeObjectUser {
     pub base: W_UnicodeObject,
-    pub map: *const u8,
+    pub map: usize,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
@@ -438,7 +438,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
             index_storage: std::ptr::null_mut(),
             hash: 0,
         },
-        map: std::ptr::null(),
+        map: 0,
         storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
