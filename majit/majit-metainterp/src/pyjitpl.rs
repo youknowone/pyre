@@ -3449,6 +3449,12 @@ impl<M: Clone> MetaInterp<M> {
         self.leave_profiler_tracing();
         self.active_trace_session = None;
         self.bridge_info = None;
+        // bridgeopt.py:124-126: frontend_boxes belongs to the bridge
+        // compilation that receives it.  It is also an explicit GC-root
+        // source while that compilation can allocate, so it must not outlive
+        // the tracing session after the bridge has consumed it.
+        self.pending_frontend_boxes = None;
+        self.pending_frontend_box_types = None;
     }
 
     /// `pyjitpl.py:2890 / 2916`
@@ -23879,6 +23885,10 @@ mod tests {
         assert_eq!(storage.rd_numb, expected_rd_numb);
         assert!(storage.rd_consts().is_empty());
         assert!(storage.rd_virtuals.is_empty());
+        assert_eq!(meta.pending_frontend_boxes_ref(), Some([42].as_slice()));
+        meta.clear_trace_session();
+        assert!(meta.pending_frontend_boxes_ref().is_none());
+        assert!(meta.pending_frontend_box_types.is_none());
     }
 
     #[cfg(feature = "cranelift")]
