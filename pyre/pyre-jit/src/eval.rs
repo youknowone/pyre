@@ -9738,18 +9738,26 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
 /// frame each time.  The store is the barriered one: a fresh box is young and
 /// the array it lands in may be old, which is exactly the edge the remembered
 /// set exists to carry.
+///
+/// The frame moves for the same reason, so it is taken as its [`FrameRoot`]
+/// rather than as a reference: a `&mut PyFrame` resolved by the caller names the
+/// pre-move block from the first boxed slot onwards, and every later read and
+/// store would land there.
 #[inline]
-fn untag_tagged_frame_locals(frame: &mut PyFrame) {
+fn untag_tagged_frame_locals(frame_root: &mut FrameRoot) {
     if !pyre_object::tagged_int::CAN_BE_TAGGED {
         return;
     }
-    let n = frame.nlocals().min(locals_w!(frame).len());
+    let n = {
+        let frame = frame_root.frame();
+        frame.nlocals().min(locals_w!(frame).len())
+    };
     for i in 0..n {
-        let slot = locals_w!(frame)[i];
+        let slot = locals_w!(frame_root.frame())[i];
         if !slot.is_null() && pyre_object::tagged_int::is_tagged_int(slot) {
             let value = pyre_object::tagged_int::untag_int(slot);
             let boxed = pyre_object::intobject::w_int_new_unique(value);
-            frame.set_locals_w(i, boxed);
+            frame_root.frame().set_locals_w(i, boxed);
         }
     }
 }
@@ -9775,7 +9783,7 @@ fn execute_assembler(
     // Convert tagged-immediate frame locals to heap `W_IntObject` before the
     // compiled loop reads them, so the trace body operates on the flag-false
     // heap-int representation (no in-loop tag test). See `untag_tagged_frame_locals`.
-    untag_tagged_frame_locals(frame);
+    untag_tagged_frame_locals(&mut frame_root);
 
     if majit_metainterp::majit_log_enabled() {
         let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame_root.frame()).len().min(5))
@@ -10565,7 +10573,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // this path never runs `execute_assembler`, so convert here too. A
         // recursive callee (`fib(n-1)`) arrives with a tagged-immediate arg
         // local; without this the compiled `GuardClass(n)` derefs the tag.
-        untag_tagged_frame_locals(frame_root.frame());
+        untag_tagged_frame_locals(&mut frame_root);
         let mut jit_state = build_jit_state(frame_root.frame(), info);
         let outcome = {
             let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
