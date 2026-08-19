@@ -382,6 +382,36 @@ jobs:
       # links >2900 tests).
       run: cargo test --all --no-default-features --features dynasm
 
+    - name: Run process-exclusive tests (dynasm, serial)
+      shell: bash
+      # Eleven tests that are `#[ignore]`d for driving process-global state — a
+      # registered mutator, stop-the-world — so they cannot share a process
+      # with the parallel run above. Not skipped for being slow or broken: they
+      # all pass, and executing them takes under a second. `--test-threads=1`
+      # is what makes them safe, and it is why they get their own step rather
+      # than a filter on the run above. majit-gc carries no backend feature of
+      # its own, so naming one here is rejected outright; selecting it alone
+      # recompiles its harness, about fifteen seconds. The cranelift backend's
+      # two equivalents run at the end of the cranelift pass below, where the
+      # artefacts they need already exist.
+      run: |
+        cargo test -p majit-gc --lib -- --ignored --test-threads=1
+        cargo test --no-default-features --features dynasm \
+          -p majit-backend-dynasm --lib -- --ignored --test-threads=1
+
+    - name: Check the LLBC fingerprint format against its producer
+      if: runner.os == 'Linux'
+      shell: bash
+      # `real_driver_output_parses` is the one test that asks
+      # `scripts/extract-llbc.py --fingerprint` what it actually prints instead
+      # of asserting a shape its author believed in, so a producer that extends
+      # the format cannot silently turn every consumer into "not checked". It
+      # is `#[ignore]`d because it spawns `python3`, which is why it is pinned
+      # to Linux: `python3` is not a name that resolves on the windows runner.
+      run: |
+        cargo test --no-default-features --features dynasm \
+          -p pyre-jit-trace --test llbc_fingerprint_format_test -- --ignored
+
     - name: Build test binaries (cranelift)
       shell: bash
       # Keep this package list identical to the cranelift test step below.
@@ -428,6 +458,19 @@ jobs:
           -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
           -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
           -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount
+        # The two label-selector tests set PYRE_CL_NO_CLOSING_JUMP, a
+        # process-global env var read while compiling, so they are `#[ignore]`d
+        # out of the parallel run above and need a serial process of their own.
+        # The package list is repeated verbatim and the name filter narrows the
+        # run to those two: selecting the backend crate alone would be a fourth
+        # feature set and would relink its harness for two tests.
+        cargo test --no-fail-fast --no-default-features --features cranelift,cpyext \
+          -p majit-metainterp -p majit-backend-cranelift \
+          -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
+          -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
+          -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount \
+          --lib -- --ignored --test-threads=1 \
+          compiler::tests::test_host_loop_external_jump_to
 
     # The CPython suite rides this job's Linux copy rather than a job of its
     # own: it needs the same checkout, toolchain, Cargo cache and prepared
