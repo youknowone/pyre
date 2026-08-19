@@ -8438,10 +8438,14 @@ pub fn uint_w(obj: PyObjectRef) -> Result<u64, PyError> {
             "int too large to convert to unsigned int",
         ));
     }
-    // W_Root.uint_w → _typed_unwrap_error(space, "integer").
-    let tp_name = unsafe { (*(*obj).ob_type).name };
+    // W_Root.uint_w → _typed_unwrap_error(space, "integer"), whose body
+    // (baseobjspace.py:316-318) is `"expected %s, got %T object"`.  `%T`
+    // formats `space.type(w_obj).getname(space)`, the user-visible class —
+    // not the `ob_type` tag, which every instance of a Python-level class
+    // shares and which would name them all `object`.
     Err(PyError::type_error(format!(
-        "expected integer, got {tp_name} object"
+        "expected integer, got {} object",
+        object_functionstr_type_name(obj)
     )))
 }
 

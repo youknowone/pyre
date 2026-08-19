@@ -137,6 +137,24 @@ for _name in ("setreuid", "setregid"):
     assert_raises(OverflowError, lambda f=_setter: f(0, 1 << 32))
 
 
+# An object that is not an integer at all is refused by the `uid_t` conversion,
+# and the refusal names the object's own class — `_typed_unwrap_error` formats
+# `%T`, not the tag every instance of a Python-level class shares.  Only the
+# class name is asserted, because that is what both runtimes agree on: the
+# wording around it differs.
+class _NotAnId:
+    pass
+
+
+for _name in ("setuid", "seteuid", "setgid", "setegid"):
+    _setter = getattr(os, _name, None)
+    if _setter is None:
+        continue
+    with assert_raises(TypeError) as _exc:
+        _setter(_NotAnId())
+    assert "_NotAnId" in str(_exc.exception), (_name, _exc.exception)
+
+
 # An iterator from `os.scandir` that was neither closed nor run to the end is
 # an unclosed one, and says so when it is collected.  Closing it, or reaching
 # the end of the enumeration, is what makes it silent.
