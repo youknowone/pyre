@@ -110,11 +110,22 @@ impl<'c> Lowerer<'c> {
                     true,
                     quote! { ::core::mem::size_of::<usize>() },
                     quote! { false },
-                    // The array base's witness, for the same reason it gives:
-                    // naming the pointee accepts `*const T` as well as `*mut T`.
+                    // The array base's witness, and it claims the same thing:
+                    // the element's WIDTH, not its name.  Reading through the
+                    // field rather than naming a pointer type accepts
+                    // `*const T` as well as `*mut T`, and `transmute` accepts a
+                    // `#[repr(transparent)]` wrapper over the declared type —
+                    // which has the declared type's size and, by the definition
+                    // of `repr(transparent)`, its representation.  A
+                    // declaration that drifted in width (`=> u16` over a
+                    // `*mut u8`) still fails to compile; one that keeps the
+                    // width and flips the sign does not, the same gap the base
+                    // witness documents.
                     quote! {
-                        const _: fn(&#path) -> #element_path =
-                            |__s| unsafe { *__s.#field };
+                        const _: fn(&#path) = |__s| {
+                            let _: #element_path =
+                                unsafe { ::core::mem::transmute(*__s.#field) };
+                        };
                     },
                 ),
                 None => {
