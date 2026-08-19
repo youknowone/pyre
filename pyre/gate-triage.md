@@ -873,16 +873,6 @@ Kept as-is; listed for completeness.
   the STORE_SUBSCR walker specialization gate, deleted.)
 - **Test harness (1)**: `PYRE_MIR_STRESS_LLBC`.
 
-## §5b — The const heap short-box gate (2026-08-19, default-OFF)
-
-Added on `perf-bridge`. Default-OFF and staging, not a home: it exists to make
-one measurement and is to be deleted — with its OFF path — before the branch
-merges.
-
-| var | reader | what it gates | polarity | retires when |
-|---|---|---|---|---|
-| PYRE_CONST_SHORT_BOXES | `majit-metainterp/src/optimizeopt/optimizer.rs` | appends the const-result heap short boxes to the exported short preamble, which `shortpreamble.py:272-281 ← :369-373` does unconditionally | OFF | the const short boxes are either adopted unconditionally or the channel is deleted |
-
 ## §6 — The 66 gates the audits never listed (2026-08-07)
 
 The hand audits above enumerated what they were looking at. Measured against the
