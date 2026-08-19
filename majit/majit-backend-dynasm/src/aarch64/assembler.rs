@@ -11,7 +11,6 @@
 ///   redirect_call_assembler — assembler.py:1138
 use crate::regloc::ebp_loc_pat;
 use indexmap::IndexMap;
-use majit_ir::IndexMapExt;
 use std::sync::Arc;
 
 // aarch64/assembler.py parity: aarch64-only backend.
@@ -505,16 +504,15 @@ pub struct CompiledCode {
     pub source_guard: Option<(u64, u32)>,
 }
 
-#[allow(dead_code)]
+/// The `genop_*` methods here are line-by-line ports of the RPython emitters
+/// (`aarch64/assembler.py` / `x86/assembler.py` `genop_*`).  Emission runs
+/// through `regalloc_perform`, which works from regalloc `arglocs`, so the
+/// ports whose opcode that dispatch reaches by another route carry
+/// `#[allow(dead_code)]` individually.  They are annotated rather than
+/// deleted so the upstream method boundary stays where a later porter looks
+/// for it; the attribute is per method so the lint still reports anything
+/// else in this `impl` that stops being reached.
 impl<'a> AssemblerARM64<'a> {
-    /// rpython/jit/metainterp/history.py:220 `box.type` parity.
-    /// Single source of truth: `op.type_` for ops, `inputarg.tp` for
-    /// inputargs, the `Const` variant tag for constants.
-    #[inline]
-    fn opref_type(&self, opref: OpRef) -> Option<Type> {
-        self.opref_type_at(opref, None)
-    }
-
     #[inline]
     fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
         let type_index = OpTypeIndex::from_parts(
@@ -872,46 +870,6 @@ impl<'a> AssemblerARM64<'a> {
             }
             OpCode::IntXor => {
                 dynasm!(self.mc ; .arch aarch64 ; eor X(d), X(l), X(s));
-            }
-            _ => {}
-        }
-    }
-
-    /// Emit: ADD/SUB/AND/OR/XOR reg, loc
-    fn emit_binop_reg_loc(&mut self, opcode: OpCode, dst_reg: u8, src: &Loc) {
-        // aarch64: load src to x16 scratch if not in register
-        let src_reg = match src {
-            Loc::Reg(s) => s.value,
-            Loc::Frame(f) => {
-                self.emit_ldr_fp(16, f.ebp_loc.value);
-                16
-            }
-            Loc::Immed(i) => {
-                self.emit_mov_imm64(16, i.value);
-                16
-            }
-            _ => return,
-        };
-        let d = dst_reg;
-        let s = src_reg as u8;
-        match opcode {
-            OpCode::IntAdd | OpCode::IntAddOvf | OpCode::NurseryPtrIncrement => {
-                dynasm!(self.mc ; .arch aarch64 ; add X(d), X(d), X(s));
-            }
-            OpCode::IntSub | OpCode::IntSubOvf => {
-                dynasm!(self.mc ; .arch aarch64 ; sub X(d), X(d), X(s));
-            }
-            OpCode::IntMul | OpCode::IntMulOvf => {
-                dynasm!(self.mc ; .arch aarch64 ; mul X(d), X(d), X(s));
-            }
-            OpCode::IntAnd => {
-                dynasm!(self.mc ; .arch aarch64 ; and X(d), X(d), X(s));
-            }
-            OpCode::IntOr => {
-                dynasm!(self.mc ; .arch aarch64 ; orr X(d), X(d), X(s));
-            }
-            OpCode::IntXor => {
-                dynasm!(self.mc ; .arch aarch64 ; eor X(d), X(d), X(s));
             }
             _ => {}
         }
@@ -1951,10 +1909,12 @@ impl<'a> AssemblerARM64<'a> {
             input_slot_depth.max(JITFRAME_FIXED_SIZE + ra.get_final_frame_depth());
         self.frame_depth = self.frame_depth.max(frame_slot_depth);
 
-        // Sync regalloc frame positions to opref_to_slot for backward
-        // compatibility with genop_call/genop_call_assembler which still
-        // use resolve_opref. When regalloc spills a value to a frame slot,
-        // that slot's position must be visible to resolve_opref.
+        // Sync regalloc frame positions to opref_to_slot for the emitters that
+        // still read resolve_opref instead of arglocs: emit_call,
+        // genop_discard_setfield, genop_cond_call_value, genop_alloc_varsize
+        // and genop_discard_zero_array reach it through load_arg_to_rax /
+        // load_arg_to_rcx. When regalloc spills a value to a frame slot, that
+        // slot's position must be visible to resolve_opref.
         // opref_to_slot stores ABSOLUTE jitframe slots (user position +
         // JITFRAME_FIXED_SIZE) so slot_offset(slot) gives the correct byte
         // offset without further adjustment.
@@ -3705,15 +3665,6 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; str xzr, [x16]);
     }
 
-    /// aarch64/opassembler.py:720-724 `emit_op_guard_no_exception`.
-    fn emit_cmp_no_exception(&mut self) {
-        self.emit_mov_imm64(16, crate::jit_exc_type_addr() as i64);
-        dynasm!(self.mc ; .arch aarch64
-            ; ldr x16, [x16]
-            ; cmp x16, xzr
-        );
-    }
-
     /// Emit SETcc into a register (zero-extend to 64-bit).
     fn emit_setcc(&mut self, cc: u8, dst_reg: u8) {
         match cc {
@@ -4384,6 +4335,7 @@ impl<'a> AssemblerARM64<'a> {
     // ----------------------------------------------------------------
 
     /// INT_ADD: result = arg0 + arg1
+    #[allow(dead_code)]
     fn genop_int_add(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4394,6 +4346,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_SUB: result = arg0 - arg1
+    #[allow(dead_code)]
     fn genop_int_sub(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4404,6 +4357,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_MUL: result = arg0 * arg1
+    #[allow(dead_code)]
     fn genop_int_mul(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4414,6 +4368,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_AND: result = arg0 & arg1
+    #[allow(dead_code)]
     fn genop_int_and(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4424,6 +4379,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_OR: result = arg0 | arg1
+    #[allow(dead_code)]
     fn genop_int_or(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4434,6 +4390,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_XOR: result = arg0 ^ arg1
+    #[allow(dead_code)]
     fn genop_int_xor(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4444,6 +4401,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_NEG: result = -arg0
+    #[allow(dead_code)]
     fn genop_int_neg(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -4453,6 +4411,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_INVERT: result = ~arg0
+    #[allow(dead_code)]
     fn genop_int_invert(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -4462,6 +4421,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_LSHIFT: result = arg0 << arg1
+    #[allow(dead_code)]
     fn genop_int_lshift(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4472,6 +4432,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_RSHIFT: result = arg0 >> arg1 (arithmetic/signed)
+    #[allow(dead_code)]
     fn genop_int_rshift(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4482,6 +4443,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// UINT_RSHIFT: result = arg0 >> arg1 (logical/unsigned)
+    #[allow(dead_code)]
     fn genop_uint_rshift(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4497,6 +4459,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// assembler.py:1856 genop_int_add_ovf — delegates to genop_int_add,
     /// then sets guard_success_cc = 'NO'. On x86, ADD always sets OF.
+    #[allow(dead_code)]
     fn genop_int_add_ovf(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4506,6 +4469,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// assembler.py:1860 genop_int_sub_ovf.
+    #[allow(dead_code)]
     fn genop_int_sub_ovf(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -4515,6 +4479,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// assembler.py:1864 genop_int_mul_ovf.
+    #[allow(dead_code)]
     fn genop_int_mul_ovf(&mut self, op: &Op) {
         // aarch64/opassembler.py multiplies, computes SMULH, and then
         // compares the high word against the sign-extension of the low
@@ -4537,30 +4502,10 @@ impl<'a> AssemblerARM64<'a> {
     // genop_* — comparisons
     // ----------------------------------------------------------------
 
-    /// INT_LT/LE/GT/GE/EQ/NE/UINT_*: CMP arg0, arg1 then store CC.
-    /// If the next op is a guard, guard_success_cc is set and consumed.
-    /// Otherwise, materialize the boolean result via SETcc/CSET.
-    fn genop_int_cmp(&mut self, op: &Op) {
-        let cc = Self::opcode_to_cc(op.opcode);
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        dynasm!(self.mc ; .arch aarch64
-            ; cmp x0, x1
-        );
-
-        // Store the CC for a following guard to consume.
-        self.guard_success_cc = Some(cc);
-
-        // Also materialize the boolean result for non-guard consumers.
-        if !op.pos.get().is_none() {
-            self.emit_setcc_to_result(cc, op.pos.get());
-        }
-    }
-
     /// Emit SETcc/CSET to materialize a boolean result.
     /// x64: SETcc AL; MOVZX EAX, AL
     /// aarch64: CSET X0, cc
+    #[allow(dead_code)]
     fn emit_setcc_to_result(&mut self, cc: u8, result_opref: OpRef) {
         // CSET Xd, cc — sets Xd to 1 if condition is true, 0 otherwise.
         // Note: CSET Xd, cc is an alias for CSINC Xd, XZR, XZR, invert(cc).
@@ -4583,6 +4528,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_IS_TRUE: result = (arg0 != 0)
+    #[allow(dead_code)]
     fn genop_int_is_true(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -4595,6 +4541,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_IS_ZERO: result = (arg0 == 0)
+    #[allow(dead_code)]
     fn genop_int_is_zero(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -4909,201 +4856,8 @@ impl<'a> AssemblerARM64<'a> {
     // genop_* — control flow
     // ----------------------------------------------------------------
 
-    /// LABEL: define the back-edge target for JUMP.
-    ///
-    /// RPython: LABEL does NOT emit code. The regalloc establishes
-    /// the slot mapping. JUMP handles slot remapping.
-    ///
-    /// In our frame-slot model: preamble values may be in non-canonical
-    /// slots. We emit copies from old→canonical slots BEFORE the
-    /// LABEL binding, so they execute only on first entry from the
-    /// preamble. JUMP writes directly to canonical slots and jumps
-    /// to the LABEL, skipping the copies.
-    fn genop_label(&mut self, op: &Op) {
-        // Emit preamble→canonical copies BEFORE the label.
-        // Two-pass push/pop: safely handles slot overlaps.
-        let n_label = op.num_args();
-        // Pass 1: push source values
-        for i in 0..n_label {
-            let arg_ref = op.arg(i).to_opref();
-            if arg_ref.is_none() {
-                let dst = Self::slot_offset(i);
-                self.emit_ldr_fp(0, dst);
-                dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!);
-            } else if arg_ref.is_constant() {
-                let val = arg_ref.inline_const_bits().unwrap_or_else(|| {
-                    self.constants
-                        .get(&arg_ref.raw())
-                        .map(|c| c.as_raw_i64())
-                        .unwrap_or(0)
-                });
-                self.emit_mov_imm64(0, val);
-                dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!);
-            } else if let Some(&old_slot) = self.opref_to_slot.get(&arg_ref) {
-                let src = Self::slot_offset(old_slot);
-                self.emit_ldr_fp(0, src);
-                dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!);
-            } else {
-                dynasm!(self.mc ; .arch aarch64 ; str xzr, [sp, #-16]!);
-            }
-        }
-        // Pass 2: pop in reverse into canonical slots
-        for i in (0..n_label).rev() {
-            let dst = Self::slot_offset(i);
-            dynasm!(self.mc ; .arch aarch64 ; ldr x0, [sp], #16);
-            self.emit_str_fp(0, dst);
-        }
-
-        // Bind the LABEL — JUMP targets here (after the copies).
-        let label = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch aarch64 ; =>label);
-        let descr_arc = op.getdescr();
-        if let Some(descr) = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr()) {
-            descr.set_ll_loop_code(self.mc.offset().0);
-            if let Some(id) = loop_target_id(op) {
-                self.target_tokens_currently_compiling.insert(id, label);
-            }
-            if let Some(descr_ref) = op.getdescr() {
-                self.compiled_target_tokens.push(descr_ref.clone());
-            }
-        }
-
-        // Remap: Label's arg[i] → canonical slot i
-        for (i, arg_ref) in op.getarglist().iter().enumerate() {
-            if !arg_ref.is_none() {
-                self.opref_to_slot.insert(arg_ref.to_opref(), i);
-            }
-        }
-        self.next_slot = self.next_slot.max(op.num_args());
-    }
-
-    /// jump.py:66 _move: emit a single slot-to-slot or const-to-slot move.
-    fn emit_slot_move(&mut self, src: i32, dst: i32, is_const: bool, val: i64) {
-        if is_const {
-            self.emit_mov_imm64(0, val);
-            self.emit_str_fp(0, dst);
-        } else if src != dst {
-            self.emit_ldr_fp(0, src);
-            self.emit_str_fp(0, dst);
-        }
-    }
-
-    /// JUMP: unconditional branch to the loop label.
-    /// jump.py:1 remap_frame_layout parity: parallel move algorithm
-    /// to handle cyclic slot dependencies.
-    fn genop_jump(&mut self, op: &Op) {
-        // Build src→dst move list.
-        // Each entry: (src_offset_or_const, dst_offset, is_const, const_val)
-        let n = op.num_args();
-        let mut moves: Vec<(i32, i32, bool, i64)> = Vec::with_capacity(n);
-        for (i, arg_ref) in op.getarglist().iter().enumerate() {
-            let dst = Self::slot_offset(i);
-            match self.resolve_opref(arg_ref.to_opref()) {
-                ResolvedArg::Slot(src) => moves.push((src, dst, false, 0)),
-                ResolvedArg::Const(val) => moves.push((0, dst, true, val)),
-            }
-        }
-
-        // jump.py:1-64 remap_frame_layout: topological order with
-        // cycle breaking via push/pop.
-        // srccount[dst] = number of times dst appears as a src
-        let mut srccount: IndexMap<i32, i32> = IndexMap::new();
-        for m in &moves {
-            srccount.entry_or_default(m.1); // ensure dst exists
-        }
-        let mut pending = n as i32;
-        for (i, m) in moves.iter().enumerate() {
-            if m.2 {
-                continue;
-            } // constant → no src dependency
-            let src = m.0;
-            if let Some(cnt) = srccount.get_mut(&src) {
-                if src == moves[i].1 {
-                    // self-move: skip
-                    *cnt = -(n as i32) - 1;
-                    pending -= 1;
-                } else {
-                    *cnt += 1;
-                }
-            }
-        }
-
-        while pending > 0 {
-            let mut progress = false;
-            for &(src, dst, is_const, const_val) in moves.iter().take(n) {
-                if srccount.get(&dst).copied().unwrap_or(-1) == 0 {
-                    *srccount.get_mut(&dst).unwrap() = -1; // done
-                    pending -= 1;
-                    if !is_const && let Some(cnt) = srccount.get_mut(&src) {
-                        *cnt -= 1;
-                    }
-                    self.emit_slot_move(src, dst, is_const, const_val);
-                    progress = true;
-                }
-            }
-            if !progress {
-                // Cycle: use push/pop to break it.
-                for i in 0..n {
-                    let dst = moves[i].1;
-                    if srccount.get(&dst).copied().unwrap_or(-1) >= 0 {
-                        // Push first dst in the cycle
-                        self.emit_ldr_fp(0, dst);
-                        dynasm!(self.mc ; .arch aarch64
-                            ; str x0, [sp, #-16]!
-                        );
-                        // Walk the cycle
-                        let mut cur = i;
-                        loop {
-                            let cd = moves[cur].1;
-                            *srccount.get_mut(&cd).unwrap() = -1;
-                            pending -= 1;
-                            // Find the move whose dst is this src
-                            let src = moves[cur].0;
-                            let next = moves.iter().position(|m| m.1 == src);
-                            if let Some(ni) = next {
-                                if srccount.get(&moves[ni].1).copied().unwrap_or(-1) < 0 {
-                                    // End of cycle: pop into this slot
-                                    dynasm!(self.mc ; .arch aarch64
-                                        ; ldr x0, [sp], #16
-                                    );
-                                    self.emit_str_fp(0, cd);
-                                    break;
-                                }
-                                self.emit_slot_move(src, cd, false, 0);
-                                cur = ni;
-                            } else {
-                                // No cycle found — emit move and break
-                                self.emit_slot_move(moves[cur].0, cd, moves[cur].2, moves[cur].3);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let descr_arc = op.getdescr();
-        let jump_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
-        if let Some(label) =
-            loop_target_id(op).and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
-        {
-            // Same-buffer jump (loop body)
-            dynasm!(self.mc ; .arch aarch64 ; b =>label);
-        } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
-            // assembler.py closing_jump parity: bridge jumps back to
-            // the original loop's LABEL via absolute address.
-            // assembler.py:1167-1171 `_assemble`: record the target loop's
-            // frame depth so this trace's frame grows to fit it.
-            if let Some(descr) = jump_descr {
-                self.jump_target_frame_depth =
-                    self.jump_target_frame_depth.max(descr.target_frame_depth());
-            }
-            self.emit_mov_imm64(0, target as i64);
-            dynasm!(self.mc ; .arch aarch64 ; br x0);
-        }
-    }
-
     /// FINISH: store result (if any), store descr ptr, return jf_ptr.
+    #[allow(dead_code)]
     fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
         // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
@@ -5194,25 +4948,13 @@ impl<'a> AssemblerARM64<'a> {
     // genop_* — type conversions
     // ----------------------------------------------------------------
 
-    /// SAME_AS: result = arg0 (copy value)
-    /// SAME_AS: result = arg0 (identity).
-    /// regalloc.py parity: no code emitted — just alias the slot.
-    fn genop_same_as(&mut self, op: &Op) {
-        let arg = op.arg(0).to_opref();
-        if let Some(&slot) = self.opref_to_slot.get(&arg) {
-            self.opref_to_slot.insert(op.pos.get(), slot);
-        } else {
-            self.load_arg_to_rax(arg);
-            self.store_rax_to_result(op.pos.get());
-        }
-    }
-
     // ----------------------------------------------------------------
     // Float helpers
     // ----------------------------------------------------------------
 
     /// Load a float value from `opref` into XMM0 (x64) / D0 (aarch64).
     /// Float values are stored as bit-cast i64 in frame slots.
+    #[allow(dead_code)]
     fn load_float_arg_to_d0(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
@@ -5229,6 +4971,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// Load a float value from `opref` into XMM1 (x64) / D1 (aarch64).
+    #[allow(dead_code)]
     fn load_float_arg_to_d1(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
             ResolvedArg::Slot(offset) => {
@@ -5257,6 +5000,7 @@ impl<'a> AssemblerARM64<'a> {
     // ----------------------------------------------------------------
 
     /// FLOAT_ADD: result = arg0 + arg1
+    #[allow(dead_code)]
     fn genop_float_add(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         self.load_float_arg_to_d1(op.arg(1).to_opref());
@@ -5267,6 +5011,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// FLOAT_SUB: result = arg0 - arg1
+    #[allow(dead_code)]
     fn genop_float_sub(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         self.load_float_arg_to_d1(op.arg(1).to_opref());
@@ -5277,6 +5022,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// FLOAT_MUL: result = arg0 * arg1
+    #[allow(dead_code)]
     fn genop_float_mul(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         self.load_float_arg_to_d1(op.arg(1).to_opref());
@@ -5287,6 +5033,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// FLOAT_TRUEDIV: result = arg0 / arg1
+    #[allow(dead_code)]
     fn genop_float_truediv(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         self.load_float_arg_to_d1(op.arg(1).to_opref());
@@ -5299,6 +5046,7 @@ impl<'a> AssemblerARM64<'a> {
     /// FLOAT_NEG: result = -arg0
     /// x64: XOR with sign-bit mask (0x8000000000000000).
     /// aarch64: FNEG d0, d0.
+    #[allow(dead_code)]
     fn genop_float_neg(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -5308,6 +5056,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
+    #[allow(dead_code)]
     fn genop_cast_int_to_float(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -5317,6 +5066,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// CAST_FLOAT_TO_INT: result = (i64)arg0 (truncation)
+    #[allow(dead_code)]
     fn genop_cast_float_to_int(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -5342,35 +5092,6 @@ impl<'a> AssemblerARM64<'a> {
         op.with_field_descr(|fd| fd.field_size()).unwrap_or(8)
     }
 
-    /// GETFIELD_GC_*: result = [arg0 + offset]
-    /// The offset comes from the op's FieldDescr.
-    fn genop_getfield(&mut self, op: &Op) {
-        let offset = Self::field_offset_from_descr(op);
-        let size = Self::field_size_from_descr(op);
-
-        // Load the object pointer from arg0.
-        self.load_arg_to_rax(op.arg(0).to_opref());
-
-        // Load the field value at [rax + offset] into rax/x0.
-
-        match size {
-            1 => dynasm!(self.mc ; .arch aarch64
-                ; ldrb w0, [x0, offset as u32]
-            ),
-            2 => dynasm!(self.mc ; .arch aarch64
-                ; ldrh w0, [x0, offset as u32]
-            ),
-            4 => dynasm!(self.mc ; .arch aarch64
-                ; ldr w0, [x0, offset as u32]
-            ),
-            _ => dynasm!(self.mc ; .arch aarch64
-                ; ldr x0, [x0, offset as u32]
-            ),
-        }
-
-        self.store_rax_to_result(op.pos.get());
-    }
-
     /// SETFIELD_GC: [arg0 + offset] = arg1
     fn genop_discard_setfield(&mut self, op: &Op) {
         let offset = Self::field_offset_from_descr(op);
@@ -5394,126 +5115,6 @@ impl<'a> AssemblerARM64<'a> {
                 ; str x1, [x0, offset as u32]
             ),
         }
-    }
-
-    /// GETARRAYITEM_GC_*: result = array[index]
-    /// arg0 = array pointer, arg1 = index.
-    /// The base_size and item_size come from the op's ArrayDescr.
-    fn genop_getarrayitem(&mut self, op: &Op) {
-        let (base_size, item_size) = op
-            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
-            .unwrap_or((8, 8));
-
-        // Load array pointer and index.
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-
-        // Compute address: rax = rax + base_size + rcx * item_size
-
-        // x1 = x1 * item_size; x0 = x0 + base_size + x1
-        if item_size != 1 {
-            self.emit_mov_imm64(2, item_size as i64); // x2 = item_size
-            dynasm!(self.mc ; .arch aarch64
-                ; mul x1, x1, x2
-            );
-        }
-        if base_size != 0 {
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, base_size as u32
-            );
-        }
-        dynasm!(self.mc ; .arch aarch64
-            ; add x0, x0, x1
-        );
-        match item_size {
-            1 => dynasm!(self.mc ; .arch aarch64
-                ; ldrb w0, [x0]
-            ),
-            2 => dynasm!(self.mc ; .arch aarch64
-                ; ldrh w0, [x0]
-            ),
-            4 => dynasm!(self.mc ; .arch aarch64
-                ; ldr w0, [x0]
-            ),
-            _ => dynasm!(self.mc ; .arch aarch64
-                ; ldr x0, [x0]
-            ),
-        }
-
-        self.store_rax_to_result(op.pos.get());
-    }
-
-    /// SETARRAYITEM_GC: array[index] = value
-    /// arg0 = array pointer, arg1 = index, arg2 = value.
-    fn genop_discard_setarrayitem(&mut self, op: &Op) {
-        let (base_size, item_size) = op
-            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
-            .unwrap_or((8, 8));
-
-        // Load array pointer.
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        // Load index.
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-
-        // Compute element address: rax = rax + base_size + rcx * item_size
-        if item_size != 1 {
-            self.emit_mov_imm64(2, item_size as i64);
-            dynasm!(self.mc ; .arch aarch64
-                ; mul x1, x1, x2
-            );
-        }
-        if base_size != 0 {
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, base_size as u32
-            );
-        }
-        dynasm!(self.mc ; .arch aarch64
-            ; add x0, x0, x1
-        );
-
-        // Now load value from arg2 and store it.
-        // We need a third register: use rcx/x1 again for the value
-        // (the address is in rax/x0).
-        // Save rax/x0 (element address) before loading value.
-
-        // Save x0 (element address) in x2, load value into x1.
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x2, x0
-        );
-        self.load_arg_to_rcx(op.arg(2).to_opref()); // loads into x1
-        match item_size {
-            1 => dynasm!(self.mc ; .arch aarch64
-                ; strb w1, [x2]
-            ),
-            2 => dynasm!(self.mc ; .arch aarch64
-                ; strh w1, [x2]
-            ),
-            4 => dynasm!(self.mc ; .arch aarch64
-                ; str w1, [x2]
-            ),
-            _ => dynasm!(self.mc ; .arch aarch64
-                ; str x1, [x2]
-            ),
-        }
-    }
-
-    /// ARRAYLEN_GC: result = array.length
-    /// The length field location comes from the ArrayDescr's len_descr().
-    fn genop_arraylen(&mut self, op: &Op) {
-        let len_offset = op
-            .with_array_descr(|ad| ad.len_descr().map(|ld| ld.offset() as i32))
-            .flatten()
-            .unwrap_or(0); // Default: length at offset 0 in array header
-
-        // Load array pointer.
-        self.load_arg_to_rax(op.arg(0).to_opref());
-
-        // Load length from [array + len_offset].
-        dynasm!(self.mc ; .arch aarch64
-            ; ldr x0, [x0, len_offset as u32]
-        );
-
-        self.store_rax_to_result(op.pos.get());
     }
 
     // ----------------------------------------------------------------
@@ -5761,19 +5362,6 @@ impl<'a> AssemblerARM64<'a> {
         self.emit_call_from_arglocs(arglocs, func_index);
         if op.opcode.result_type() == Type::Int {
             self.ensure_call_result_bit_extension(arglocs);
-        }
-    }
-
-    /// assembler.py:2169-2174 _genop_real_call.
-    /// genop_call_i = genop_call_r = genop_call_f = genop_call_n
-    fn genop_call(&mut self, op: &Op) {
-        self._genop_call(op);
-        if !op.pos.get().is_none() {
-            if op.opcode.result_type() == Type::Float {
-                self.store_d0_to_result(op.pos.get());
-            } else {
-                self.store_rax_to_result(op.pos.get());
-            }
         }
     }
 
@@ -6661,88 +6249,6 @@ impl<'a> AssemblerARM64<'a> {
     // genop_* — misc
     // ----------------------------------------------------------------
 
-    /// FORCE_TOKEN: return the jitframe pointer itself.
-    /// x86/assembler.py genop_force_token: mov resloc, ebp
-    fn genop_force_token(&mut self, op: &Op) {
-        // The frame pointer is the force token.
-        dynasm!(self.mc ; .arch aarch64
-            ; mov x0, x29
-        );
-        self.store_rax_to_result(op.pos.get());
-    }
-
-    /// STRLEN / UNICODELEN: result = string.length
-    /// Load the length field from the string/unicode object header.
-    /// arg0 = string pointer. The length is at a fixed offset in the
-    /// RPython string representation. For RPython strings, the length
-    /// is typically at offset 8 (after the GC header / hash field).
-    fn genop_strlen(&mut self, op: &Op) {
-        // rewrite.py:273-282 parity — the length field offset comes from
-        // `get_array_token(rstr.STR/UNICODE, ...)` → `ArrayDescr.lendescr`
-        // in the JIT descr model.  Upstream emits `GC_LOAD_I` reading
-        // `ArrayDescr.lendescr.offset`; the direct path mirrors that.
-        let offset = op
-            .with_array_descr(|ad| ad.len_descr().map(|ld| ld.offset() as i32))
-            .flatten()
-            .unwrap_or_else(|| Self::field_offset_from_descr(op));
-        self.load_arg_to_rax(op.arg(0).to_opref());
-
-        dynasm!(self.mc ; .arch aarch64
-            ; ldr x0, [x0, offset as u32]
-        );
-
-        self.store_rax_to_result(op.pos.get());
-    }
-
-    /// STRGETITEM / UNICODEGETITEM: result = string[index]
-    /// arg0 = string pointer, arg1 = index.
-    /// Address = base + (basesize - extra_null) + index * itemsize, per
-    /// `rewrite.py:295-306` — STR has `extra_item_after_alloc=1` so the
-    /// token basesize overshoots the first char by 1.
-    fn genop_strgetitem(&mut self, op: &Op) {
-        let (mut base_size, item_size) = op
-            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
-            .unwrap_or((17, 1)); // rstr.STR token defaults (basesize=17, itemsize=1)
-        if op.opcode == OpCode::Strgetitem {
-            debug_assert_eq!(item_size, 1, "STRGETITEM itemsize must be 1");
-            base_size -= 1; // rewrite.py:299 — skip the extra null character
-        }
-
-        self.load_arg_to_rax(op.arg(0).to_opref()); // string pointer
-        self.load_arg_to_rcx(op.arg(1).to_opref()); // index
-
-        if item_size != 1 {
-            self.emit_mov_imm64(2, item_size as i64);
-            dynasm!(self.mc ; .arch aarch64
-                ; mul x1, x1, x2
-            );
-        }
-        if base_size != 0 {
-            dynasm!(self.mc ; .arch aarch64
-                ; add x0, x0, base_size as u32
-            );
-        }
-        dynasm!(self.mc ; .arch aarch64
-            ; add x0, x0, x1
-        );
-        match item_size {
-            1 => dynasm!(self.mc ; .arch aarch64
-                ; ldrb w0, [x0]
-            ),
-            2 => dynasm!(self.mc ; .arch aarch64
-                ; ldrh w0, [x0]
-            ),
-            4 => dynasm!(self.mc ; .arch aarch64
-                ; ldr w0, [x0]
-            ),
-            _ => dynasm!(self.mc ; .arch aarch64
-                ; ldr x0, [x0]
-            ),
-        }
-
-        self.store_rax_to_result(op.pos.get());
-    }
-
     // ================================================================
     // assembler.py:1817 genop_save_exc_class / genop_save_exception
     // ================================================================
@@ -6793,28 +6299,8 @@ impl<'a> AssemblerARM64<'a> {
     // genop_* — extended integer arithmetic
     // ================================================================
 
-    /// INT_FLOORDIV: result = arg0 / arg1 (signed)
-    fn genop_int_floordiv(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        dynasm!(self.mc ; .arch aarch64
-            ; sdiv x0, x0, x1
-        );
-        self.store_rax_to_result(op.pos.get());
-    }
-
-    /// INT_MOD: result = arg0 % arg1 (signed)
-    fn genop_int_mod(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        dynasm!(self.mc ; .arch aarch64
-            ; sdiv x2, x0, x1
-            ; msub x0, x2, x1, x0
-        );
-        self.store_rax_to_result(op.pos.get());
-    }
-
     /// UINT_MUL_HIGH: upper 64 bits of unsigned multiply
+    #[allow(dead_code)]
     fn genop_uint_mul_high(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());
@@ -6825,6 +6311,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
+    #[allow(dead_code)]
     fn genop_int_signext(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         let num_bytes = match self.resolve_opref(op.arg(1).to_opref()) {
@@ -6847,6 +6334,7 @@ impl<'a> AssemblerARM64<'a> {
     // ================================================================
 
     /// FLOAT_ABS: result = |arg0|
+    #[allow(dead_code)]
     fn genop_float_abs(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -6855,44 +6343,8 @@ impl<'a> AssemblerARM64<'a> {
         self.store_d0_to_result(op.pos.get());
     }
 
-    /// FLOAT_LT/LE/EQ/NE/GT/GE: float comparison.
-    /// For lt/le, swap operands so JA/JAE handles NaN correctly.
-    fn genop_float_cmp(&mut self, op: &Op) {
-        let swap = matches!(op.opcode, OpCode::FloatLt | OpCode::FloatLe);
-        if swap {
-            self.load_float_arg_to_d0(op.arg(1).to_opref());
-            self.load_float_arg_to_d1(op.arg(0).to_opref());
-        } else {
-            self.load_float_arg_to_d0(op.arg(0).to_opref());
-            self.load_float_arg_to_d1(op.arg(1).to_opref());
-        }
-
-        dynasm!(self.mc ; .arch aarch64 ; fcmp d0, d1);
-        match op.opcode {
-            OpCode::FloatLt | OpCode::FloatGt => {
-                dynasm!(self.mc ; .arch aarch64 ; cset x0, gt);
-            }
-            OpCode::FloatLe | OpCode::FloatGe => {
-                dynasm!(self.mc ; .arch aarch64 ; cset x0, ge);
-            }
-            OpCode::FloatEq => {
-                dynasm!(self.mc ; .arch aarch64 ; cset x0, eq);
-            }
-            OpCode::FloatNe => {
-                dynasm!(self.mc ; .arch aarch64 ; cset x0, ne);
-            }
-            _ => {
-                dynasm!(self.mc ; .arch aarch64 ; cset x0, eq);
-            }
-        }
-        dynasm!(self.mc ; .arch aarch64 ; cmp x0, 0);
-        self.guard_success_cc = Some(CC_NE);
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
-        }
-    }
-
     /// CAST_FLOAT_TO_SINGLEFLOAT: f64 → f32 (bits in lower 32 of i64)
+    #[allow(dead_code)]
     fn genop_cast_float_to_singlefloat(&mut self, op: &Op) {
         self.load_float_arg_to_d0(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -6903,6 +6355,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
+    #[allow(dead_code)]
     fn genop_cast_singlefloat_to_float(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         dynasm!(self.mc ; .arch aarch64
@@ -6916,23 +6369,8 @@ impl<'a> AssemblerARM64<'a> {
     // genop_* — GC memory operations
     // ================================================================
 
-    /// Emit a sized load from [rax]/[x0]. Positive size = zero-extend,
-    /// negative = sign-extend.
-    fn emit_load_from_rax_sized(&mut self, itemsize: i32) {
-        let abs_size = itemsize.unsigned_abs() as usize;
-        let signed = itemsize < 0;
-        match (abs_size, signed) {
-            (1, true) => dynasm!(self.mc ; .arch aarch64 ; ldrsb x0, [x0]),
-            (2, true) => dynasm!(self.mc ; .arch aarch64 ; ldrsh x0, [x0]),
-            (4, true) => dynasm!(self.mc ; .arch aarch64 ; ldrsw x0, [x0]),
-            (1, false) => dynasm!(self.mc ; .arch aarch64 ; ldrb w0, [x0]),
-            (2, false) => dynasm!(self.mc ; .arch aarch64 ; ldrh w0, [x0]),
-            (4, false) => dynasm!(self.mc ; .arch aarch64 ; ldr w0, [x0]),
-            _ => dynasm!(self.mc ; .arch aarch64 ; ldr x0, [x0]),
-        }
-    }
-
     /// Emit a sized store of rcx/x1 to [rax]/[x0].
+    #[allow(dead_code)]
     fn emit_store_to_rax_sized(&mut self, size: usize) {
         match size {
             1 => dynasm!(self.mc ; .arch aarch64 ; strb w1, [x0]),
@@ -6950,43 +6388,9 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// GC_LOAD_I/R/F: load from base + offset with given itemsize.
-    /// arg(0) = base, arg(1) = offset, arg(2) = itemsize.
-    fn genop_gc_load(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-
-        let itemsize = self.resolve_const_or(op.arg(2).to_opref(), 8) as i32;
-        self.emit_load_from_rax_sized(itemsize);
-        self.store_rax_to_result(op.pos.get());
-    }
-
-    /// GC_LOAD_INDEXED_I/R/F: load from base + base_offset + index * scale.
-    /// arg(0)=base, arg(1)=index, arg(2)=scale, arg(3)=base_offset, arg(4)=itemsize.
-    fn genop_gc_load_indexed(&mut self, op: &Op) {
-        let scale = self.resolve_const_or(op.arg(2).to_opref(), 1) as i32;
-        let base_offset = self.resolve_const_or(op.arg(3).to_opref(), 0) as i32;
-        let itemsize = self.resolve_const_or(op.arg(4).to_opref(), 8) as i32;
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-
-        if scale != 1 {
-            self.emit_mov_imm64(2, scale as i64);
-            dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-        }
-        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-        if base_offset != 0 {
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, base_offset as u32);
-        }
-
-        self.emit_load_from_rax_sized(itemsize);
-        self.store_rax_to_result(op.pos.get());
-    }
-
     /// GC_STORE: store value to base + offset.
     /// 4-arg form: arg(0)=base, arg(1)=offset, arg(2)=value, arg(3)=itemsize.
+    #[allow(dead_code)]
     fn genop_discard_gc_store(&mut self, op: &Op) {
         if op.num_args() < 4 {
             return; // 3-arg GC rewrite form — skip for now
@@ -7007,6 +6411,7 @@ impl<'a> AssemblerARM64<'a> {
     /// GC_STORE_INDEXED: store to base + base_offset + index * scale.
     /// arg(0)=base, arg(1)=index, arg(2)=value, arg(3)=scale,
     /// arg(4)=base_offset, arg(5)=itemsize.
+    #[allow(dead_code)]
     fn genop_discard_gc_store_indexed(&mut self, op: &Op) {
         let scale = self.resolve_const_or(op.arg(3).to_opref(), 1) as i32;
         let base_offset = self.resolve_const_or(op.arg(4).to_opref(), 0) as i32;
@@ -7030,102 +6435,9 @@ impl<'a> AssemblerARM64<'a> {
         self.emit_store_to_rax_sized(itemsize);
     }
 
-    /// RAW_LOAD_I/F: load from base + offset using descriptor.
-    fn genop_raw_load(&mut self, op: &Op) {
-        let offset = Self::field_offset_from_descr(op);
-        let size = Self::field_size_from_descr(op);
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-
-        self.emit_load_from_rax_sized(size as i32);
-        let _ = offset; // offset is in the descriptor, not used for raw_load
-        self.store_rax_to_result(op.pos.get());
-    }
-
-    /// RAW_STORE: store value to base + offset using descriptor.
-    fn genop_discard_raw_store(&mut self, op: &Op) {
-        let size = Self::field_size_from_descr(op);
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-        dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-        self.load_arg_to_rcx(op.arg(2).to_opref());
-        dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
-        self.emit_store_to_rax_sized(size);
-    }
-
     // ================================================================
     // genop_* — interior field operations
     // ================================================================
-
-    /// GETINTERIORFIELD_GC_I/R/F: load field from array-of-structs element.
-    fn genop_getinteriorfield(&mut self, op: &Op) {
-        let (base_size, item_size, field_offset, field_size) = op
-            .with_interior_field_descr(|id| {
-                let ad = id.array_descr();
-                let fd = id.field_descr();
-                (
-                    ad.base_size() as i32,
-                    ad.item_size() as i32,
-                    fd.offset() as i32,
-                    fd.field_size(),
-                )
-            })
-            .unwrap_or((8, 8, 0, 8));
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        let total_offset = base_size + field_offset;
-
-        if item_size != 1 {
-            self.emit_mov_imm64(2, item_size as i64);
-            dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-        }
-        if total_offset != 0 {
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, total_offset as u32);
-        }
-        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-
-        self.emit_load_from_rax_sized(field_size as i32);
-        self.store_rax_to_result(op.pos.get());
-    }
-
-    /// SETINTERIORFIELD_GC/RAW: write field in array-of-structs element.
-    fn genop_discard_setinteriorfield(&mut self, op: &Op) {
-        let (base_size, item_size, field_offset, field_size) = op
-            .with_interior_field_descr(|id| {
-                let ad = id.array_descr();
-                let fd = id.field_descr();
-                (
-                    ad.base_size() as i32,
-                    ad.item_size() as i32,
-                    fd.offset() as i32,
-                    fd.field_size(),
-                )
-            })
-            .unwrap_or((8, 8, 0, 8));
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        let total_offset = base_size + field_offset;
-
-        if item_size != 1 {
-            self.emit_mov_imm64(2, item_size as i64);
-            dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-        }
-        if total_offset != 0 {
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, total_offset as u32);
-        }
-        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-        dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-        self.load_arg_to_rcx(op.arg(2).to_opref());
-        dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
-
-        self.emit_store_to_rax_sized(field_size);
-    }
 
     // ================================================================
     // genop_* — call variants
@@ -7213,104 +6525,6 @@ impl<'a> AssemblerARM64<'a> {
     // ================================================================
     // genop_* — string/array operations
     // ================================================================
-
-    /// STRSETITEM / UNICODESETITEM: string[index] = value.
-    /// Address = base + (basesize - extra_null) + index * itemsize, per
-    /// `rewrite.py:307-318` — STR has `extra_item_after_alloc=1` so the
-    /// token basesize overshoots the first char by 1; UNICODE does not.
-    fn genop_discard_strsetitem(&mut self, op: &Op) {
-        let (mut base_size, item_size) = op
-            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
-            .unwrap_or((17, 1));
-        if op.opcode == OpCode::Strsetitem {
-            debug_assert_eq!(item_size, 1, "STRSETITEM itemsize must be 1");
-            base_size -= 1; // rewrite.py:311 — skip the extra null character
-        }
-
-        self.load_arg_to_rax(op.arg(0).to_opref()); // string
-        self.load_arg_to_rcx(op.arg(1).to_opref()); // index
-        if item_size != 1 {
-            self.emit_mov_imm64(2, item_size as i64);
-            dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-        }
-        dynasm!(self.mc ; .arch aarch64
-            ; add x0, x0, base_size as u32
-            ; add x0, x0, x1
-        );
-        dynasm!(self.mc ; .arch aarch64 ; mov x2, x0);
-        self.load_arg_to_rcx(op.arg(2).to_opref());
-        dynasm!(self.mc ; .arch aarch64 ; mov x0, x2);
-        self.emit_store_to_rax_sized(item_size as usize);
-    }
-
-    /// COPYSTRCONTENT / COPYUNICODECONTENT: copy substring.
-    /// arg(0)=src, arg(1)=dst, arg(2)=src_start, arg(3)=dst_start, arg(4)=length.
-    ///
-    /// Fallback emitter for the no-rewriter path.  When the GC rewriter is
-    /// present (production), `rewrite.py:1045-1080
-    /// rewrite_copy_str_content` replaces this op with
-    /// LOAD_EFFECTIVE_ADDRESS × 2 + CALL_N(memcpy, …) before assembly, so
-    /// this function is never reached.  Kept for tests that run the
-    /// backend directly on un-rewritten ops.  Mirrors upstream's basesize
-    /// handling (`rewrite.py:1049-1053`).
-    fn genop_discard_copystrcontent(&mut self, op: &Op) {
-        let (mut base_size, item_size) = op
-            .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
-            .unwrap_or((16, 1));
-        // rewrite.py:1049-1053 `rewrite_copy_str_content` — COPYSTRCONTENT
-        // uses `str_descr.basesize - 1` to skip the `extra_item_after_alloc`
-        // null terminator carried by `rstr.STR.chars` (`rstr.py:1226-1228`).
-        // COPYUNICODECONTENT's unicode_descr has no extra item.  Mirrors the
-        // same correction `strgetsetitem_token` applies for STR{GET,SET}ITEM.
-        if op.opcode == OpCode::Copystrcontent {
-            debug_assert_eq!(item_size, 1, "COPYSTRCONTENT itemsize must be 1");
-            base_size -= 1;
-        }
-
-        // Compute byte_count = length * item_size
-        self.load_arg_to_rax(op.arg(4).to_opref());
-        if item_size != 1 {
-            self.emit_mov_imm64(1, item_size);
-            dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
-        }
-        dynasm!(self.mc ; .arch aarch64 ; str x0, [sp, #-16]!); // byte_count
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(2).to_opref());
-        if item_size != 1 {
-            self.emit_mov_imm64(2, item_size);
-            dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-        }
-        dynasm!(self.mc ; .arch aarch64
-            ; add x0, x0, base_size as u32
-            ; add x0, x0, x1
-            ; str x0, [sp, #-16]!  // src_addr
-        );
-
-        self.load_arg_to_rax(op.arg(1).to_opref());
-        self.load_arg_to_rcx(op.arg(3).to_opref());
-        if item_size != 1 {
-            self.emit_mov_imm64(2, item_size);
-            dynasm!(self.mc ; .arch aarch64 ; mul x1, x1, x2);
-        }
-        dynasm!(self.mc ; .arch aarch64
-            ; add x0, x0, base_size as u32
-            ; add x0, x0, x1
-        );
-
-        let memmove_ptr = libc::memmove as *const () as i64;
-        dynasm!(self.mc ; .arch aarch64
-            ; ldr x1, [sp], #16  // src
-            ; ldr x2, [sp], #16  // count
-        );
-        // x0 = dst already
-        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
-        self.emit_mov_imm64(3, memmove_ptr);
-        dynasm!(self.mc ; .arch aarch64
-            ; blr x3
-            ; ldp x29, x30, [sp], #16
-        );
-    }
 
     /// NEWSTR: allocate a byte string of given length.
     /// `base_size` / `item_size` come from the injected ArrayDescr
@@ -7513,29 +6727,6 @@ impl<'a> AssemblerARM64<'a> {
     // ================================================================
     // genop_* — address computation
     // ================================================================
-
-    /// LOAD_EFFECTIVE_ADDRESS: result = base + (index << shift) + baseofs.
-    /// resoperation.py:1052-1054 — `[v_gcptr, v_index, c_baseofs, c_shift]`.
-    /// arg(0)=base, arg(1)=index, arg(2)=baseofs, arg(3)=shift.
-    fn genop_load_effective_address(&mut self, op: &Op) {
-        let baseofs = self.resolve_const_or(op.arg(2).to_opref(), 0) as i32;
-        let shift = self.resolve_const_or(op.arg(3).to_opref(), 0) as i32;
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-
-        if shift != 0 {
-            // add x0, x0, x1, lsl #shift fuses << and + in one insn;
-            // opencode via a scratch shift to keep store_rax_to_result in rax.
-            dynasm!(self.mc ; .arch aarch64 ; lsl x1, x1, shift as u32);
-        }
-        dynasm!(self.mc ; .arch aarch64 ; add x0, x0, x1);
-        if baseofs != 0 {
-            dynasm!(self.mc ; .arch aarch64 ; add x0, x0, baseofs as u32);
-        }
-
-        self.store_rax_to_result(op.pos.get());
-    }
 }
 
 /// Flush icache — aarch64 only.

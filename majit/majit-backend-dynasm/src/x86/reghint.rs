@@ -8,7 +8,7 @@ use crate::regalloc::LifetimeManager;
 use crate::regloc::{EAX, ECX, EDX, RegLoc};
 use crate::x86::callbuilder::{ARGUMENTS_GPR, ARGUMENTS_XMM};
 use indexmap::IndexMap;
-use majit_ir::{Op, OpCode, OpRc, OpRef, Type};
+use majit_ir::{Op, OpCode, OpRef, Type};
 
 /// regalloc.py:26-28.
 pub const SAVE_DEFAULT_REGS: u8 = 0;
