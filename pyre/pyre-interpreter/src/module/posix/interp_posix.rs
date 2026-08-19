@@ -2726,18 +2726,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // interp_posix.py:340 `@unwrap_spec(fd=c_int, position=r_longlong,
                 // how=c_int)` — the position is a 64-bit offset, not a C int.
                 let fd = crate::baseobjspace::c_int_w(args[0])? as libc::c_int;
-                let offset = crate::baseobjspace::int_w(args[1])? as libc::off_t;
+                let offset = crate::baseobjspace::int_w(args[1])?;
                 let whence = crate::baseobjspace::c_int_w(args[2])? as libc::c_int;
                 #[cfg(not(feature = "sandbox"))]
                 let ret = {
-                    let ret = crate::builtins::crt_call!(libc::lseek(fd, offset, whence));
+                    let ret = crate::builtins::crt_lseek(fd, offset, whence);
                     if ret < 0 {
                         return Err(errno_err(crate::builtins::crt_errno(), ""));
                     }
-                    ret as i64
+                    ret
                 };
                 #[cfg(feature = "sandbox")]
-                let ret = crate::host_seam::ops::lseek(fd, offset as i64, whence)
+                let ret = crate::host_seam::ops::lseek(fd, offset, whence)
                     .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_int_new(ret))
             },

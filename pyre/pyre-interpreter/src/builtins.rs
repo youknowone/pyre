@@ -6825,6 +6825,26 @@ macro_rules! crt_call {
 }
 pub(crate) use crt_call;
 
+/// `lseek`, taking and reporting the whole 64-bit file position.
+///
+/// The MSVC runtime's `lseek` is `_lseek`, whose offset and return are a C
+/// `long` — 32 bits there.  A position past 2 GiB therefore arrives as a
+/// negative offset (`1 << 31` fails with `EINVAL`) or as a truncated one
+/// (`1 << 32` seeks to 0), and a position read back off a larger file comes
+/// back wrong.  `_lseeki64` is the one that carries it, and `off_t` is
+/// already 64 bits everywhere else.
+#[cfg(not(feature = "sandbox"))]
+pub(crate) fn crt_lseek(fd: libc::c_int, offset: i64, whence: libc::c_int) -> i64 {
+    #[cfg(windows)]
+    {
+        crt_call!(libc::lseek64(fd, offset, whence))
+    }
+    #[cfg(not(windows))]
+    {
+        crt_call!(libc::lseek(fd, offset as libc::off_t, whence)) as i64
+    }
+}
+
 /// Clear the C runtime errno, so the next `crt_errno` describes the call made
 /// in between rather than whichever one last set the cell.  A caller needs
 /// this wherever the runtime reports through errno on a return value that is
@@ -15242,7 +15262,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                 {
                     #[cfg(not(feature = "sandbox"))]
                     let pos = {
-                        let pos = crt_call!(libc::lseek(fd, offset as libc::off_t, whence));
+                        let pos = crt_lseek(fd, offset, whence);
                         if pos < 0 {
                             return Err(fd_errno_err(crt_errno()));
                         }
@@ -15287,7 +15307,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     {
                         #[cfg(not(feature = "sandbox"))]
                         let pos = {
-                            let pos = crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR));
+                            let pos = crt_lseek(fd, 0, libc::SEEK_CUR);
                             if pos < 0 {
                                 return Err(fd_errno_err(crt_errno()));
                             }
@@ -15690,7 +15710,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             {
                 #[cfg(not(feature = "sandbox"))]
-                if crt_call!(libc::lseek(fd, 0, libc::SEEK_END)) < 0 {
+                if crt_lseek(fd, 0, libc::SEEK_END) < 0 {
                     // A pipe has no end to seek to, and opening one for append
                     // is legal; only a real seek failure is an error.
                     let errno = crt_errno();
@@ -16106,7 +16126,7 @@ fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         {
             #[cfg(not(feature = "sandbox"))]
             {
-                crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR)) >= 0
+                crt_lseek(fd, 0, libc::SEEK_CUR) >= 0
             }
             #[cfg(feature = "sandbox")]
             {
@@ -16322,8 +16342,8 @@ fn fileio_readall_bufsize(self_obj: PyObjectRef, fd: i32) -> usize {
     if size > 65536 {
         #[cfg(not(feature = "sandbox"))]
         let position = {
-            let position = crt_call!(libc::lseek(fd, 0, libc::SEEK_CUR));
-            (position >= 0).then_some(position as i64)
+            let position = crt_lseek(fd, 0, libc::SEEK_CUR);
+            (position >= 0).then_some(position)
         };
         #[cfg(feature = "sandbox")]
         let position = crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR).ok();

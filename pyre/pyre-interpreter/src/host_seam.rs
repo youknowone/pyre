@@ -793,7 +793,7 @@ mod real {
         }
 
         fn lseek(fd: i32, pos: i64, how: i32) -> SeamResult<i64> {
-            let r = unsafe { libc::lseek(fd, pos as libc::off_t, how) };
+            let r = crate::builtins::crt_lseek(fd, pos, how);
             if r < 0 {
                 Err(last_os_error())
             } else {
