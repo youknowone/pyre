@@ -1907,13 +1907,13 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         // residual re-applies it.  That is not a property of this gate — the
         // walk reaches the same state through any non-committing abort inside a
         // sub-walk — so this gate does not attempt to repair it.
-        let (outer_resume, stack_overrides) = {
+        let (outer_resume, stack_overrides, blackhole_required) = {
             let session = ctx.session.borrow();
             let outermost = session
                 .framestack
                 .first()
                 .filter(|f| fbw_executed_effect_count() == f.entry_executed_effects);
-            match outermost.and_then(|f| f.parent.as_ref()) {
+            let (outer_resume, stack_overrides) = match outermost.and_then(|f| f.parent.as_ref()) {
                 Some(frame) => (
                     frame.call_jitcode_pc.map(|jit_pc| {
                         (
@@ -1925,13 +1925,26 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
                     frame.call_stack_overrides.clone(),
                 ),
                 None => (None, Vec::new()),
-            }
+            };
+            // The aborting operation belongs to the innermost live MIFrame.
+            // If that frame has applied nothing since its CALL, discard the
+            // attempted frame and let its caller resume at the CALL.  A
+            // multi-frame blackhole conversion is required only once that
+            // frame itself has state to preserve; effects in paused ancestors
+            // are already represented by their own frame images.  This is the
+            // per-frame boundary `convert_and_run_from_pyjitpl` preserves when
+            // it copies every `MIFrame` independently (`blackhole.py:1799-1821`).
+            let blackhole_required = session
+                .framestack
+                .last()
+                .is_some_and(|frame| fbw_executed_effect_count() != frame.entry_executed_effects);
+            (outer_resume, stack_overrides, blackhole_required)
         };
         FBW_ABORT_OUTER_RESUME.with(|c| c.set(outer_resume));
         FBW_ABORT_OUTER_STACK_OVERRIDES.with(|c| {
             *c.borrow_mut() = stack_overrides;
         });
-        return Err(DispatchError::callee_inline_blackhole_required(pc));
+        return Err(DispatchError::callee_inline_abort(pc, blackhole_required));
     }
     Ok(())
 }

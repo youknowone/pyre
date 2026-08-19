@@ -2609,9 +2609,9 @@ pub enum DispatchError {
     /// the walker itself covers loop-callee inlining.
     LoopBearingCalleeInlineUnsupported {
         pc: usize,
-        /// The decline stopped before the next residual executed with a
-        /// complete MIFrame image.  RPython converts that whole frame stack
-        /// and runs forward; rewinding an outer CALL would repeat effects.
+        /// Whether the aborting MIFrame has applied an effect since its caller
+        /// entered it.  A clean attempted frame can be discarded and re-entered
+        /// from the CALL; an applied frame must be preserved and run forward.
         blackhole_required: bool,
     },
     /// An in-flight FOR_ITER body executed a non-journalable
@@ -2842,20 +2842,18 @@ impl DispatchError {
             let loc = std::panic::Location::caller();
             eprintln!("[lb-site] {}:{} pc={pc}", loc.file(), loc.line());
         }
-        Self::LoopBearingCalleeInlineUnsupported {
-            pc,
-            blackhole_required: false,
-        }
+        Self::callee_inline_abort(pc, false)
     }
 
-    /// The nested residual-decline arm has proved that the current operation
-    /// has not run and that the MIFrame banks are complete.  Preserve each
-    /// inlined frame and continue through the blackhole, as
-    /// `convert_and_run_from_pyjitpl` does in RPython.
-    pub(crate) fn callee_inline_blackhole_required(pc: usize) -> Self {
+    /// Classify a nested residual decline by whether the aborting MIFrame has
+    /// already applied an effect.  A clean attempted frame can be discarded
+    /// and re-entered from its caller's CALL; an applied frame must be retained
+    /// and run forward with the rest of the live stack, as
+    /// `convert_and_run_from_pyjitpl` does (`blackhole.py:1799-1821`).
+    pub(crate) fn callee_inline_abort(pc: usize, blackhole_required: bool) -> Self {
         Self::LoopBearingCalleeInlineUnsupported {
             pc,
-            blackhole_required: true,
+            blackhole_required,
         }
     }
 }

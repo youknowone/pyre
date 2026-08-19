@@ -4192,27 +4192,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // than silently becoming a wrong answer" — adopts an inline-escape
         // shape whose caller banks are incomplete and dies on an unwired
         // blackhole opcode.
-        // The effect half of the sentence above.  A `blackhole_required: true`
-        // abort whose walk executed NOTHING has nothing for a replay to
-        // repeat, so the legacy entry replay is exactly right — and driving
-        // instead hands the outer frame a resume state the walk never
-        // committed: `bench/synth/inline_subwalk_user_iterator` reads its
-        // callee's result back as a non-object and
-        // `bench/synth/list_append_write_barrier_gc` underflows its operand
-        // stack, both only once this variant is admitted.  This is the same
-        // predicate, for the same reason, that `TraceTooLong` applies above.
-        let nested_residual_ran_nothing = matches!(
-            &walk_result,
-            Err(
-                crate::jitcode_dispatch::DispatchError::LoopBearingCalleeInlineUnsupported {
-                    blackhole_required: true,
-                    ..
-                }
-            )
-        ) && crate::jitcode_dispatch::fbw_executed_effect_count()
-            == 0;
         let walk_abort_adopted = !trace_too_long_adopted
-            && !nested_residual_ran_nothing
             && matches!(&walk_result, Err(error) if error.leaves_complete_image()
             && !matches!(
                 error,
