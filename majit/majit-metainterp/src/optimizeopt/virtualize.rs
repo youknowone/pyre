@@ -2599,7 +2599,7 @@ fn field_slot_disagreement(
 /// Neither alone is sufficient: a name can be absent, and a flattened layout
 /// puts an aggregate and its first leaf at one address
 /// (`heaptracker.py:68-69`).
-fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
+pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
     let named_apart = !field.field_name().is_empty()
         && !slot.field_name().is_empty()
         && slot.field_name() != field.field_name();

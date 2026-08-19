@@ -1016,8 +1016,7 @@ impl OptHeap {
                 .as_size_descr()
                 .and_then(|size| size.all_fielddescrs().get(index).cloned())
                 .is_some_and(|row| {
-                    row.offset() == field_descr.offset()
-                        && row.field_type() == field_descr.field_type()
+                    crate::optimizeopt::virtualize::slot_holds_field(row.as_ref(), field_descr)
                 }),
             None => false,
         };
