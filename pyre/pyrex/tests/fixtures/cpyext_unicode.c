@@ -6,6 +6,21 @@
 
 static struct PyModuleDef moduledef;
 
+/* The exception an entry point left behind, as `(type name, message)`. */
+static PyObject *pending(void)
+{
+    PyObject *value = PyErr_GetRaisedException();
+    if (value == NULL) {
+        Py_RETURN_NONE;
+    }
+    PyObject *text = PyObject_Str(value);
+    PyObject *pair = Py_BuildValue("(sO)", Py_TYPE(value)->tp_name,
+                                   text == NULL ? Py_None : text);
+    Py_XDECREF(text);
+    Py_DECREF(value);
+    return pair;
+}
+
 /* The shape a real extension uses: measure the input, allocate a string wide
    enough for it, then fill it through the caller's own pointer. */
 static PyObject *u_escape(PyObject *self, PyObject *arg)
@@ -161,6 +176,85 @@ static PyObject *u_rejects(PyObject *self, PyObject *arg)
     Py_RETURN_TRUE;
 }
 
+/* The width is fixed when the string is made, so a write of a code point
+   wider than it holds is refused rather than cut down.  Both halves happen
+   here: a string is modifiable only while nothing else names it. */
+static PyObject *u_new_and_write(PyObject *self, PyObject *args)
+{
+    (void)self;
+    Py_ssize_t length;
+    unsigned long maxchar;
+    unsigned long value;
+    if (!PyArg_ParseTuple(args, "nkk", &length, &maxchar, &value)) {
+        return NULL;
+    }
+    PyObject *text = PyUnicode_New(length, (Py_UCS4)maxchar);
+    if (text == NULL) {
+        return NULL;
+    }
+    for (Py_ssize_t index = 0; index < length; index++) {
+        Py_UCS4 point = index == 0 ? (Py_UCS4)value : (Py_UCS4)'x';
+        if (PyUnicode_WriteChar(text, index, point) < 0) {
+            Py_DECREF(text);
+            return NULL;
+        }
+    }
+    return text;
+}
+
+/* Neither accessor takes anything but a string, and saying so is what
+   `PyErr_BadArgument` is for. */
+static PyObject *u_not_a_string(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    if (PyUnicode_ReadChar(arg, 0) != (Py_UCS4)-1 || !PyErr_Occurred()) {
+        PyErr_SetString(PyExc_SystemError, "ReadChar accepted something that is not a string");
+        return NULL;
+    }
+    PyObject *read = pending();
+    if (PyUnicode_WriteChar(arg, 0, 'x') != -1 || !PyErr_Occurred()) {
+        Py_XDECREF(read);
+        PyErr_SetString(PyExc_SystemError, "WriteChar accepted something that is not a string");
+        return NULL;
+    }
+    return Py_BuildValue("(NN)", read, pending());
+}
+
+/* A count of nothing names no buffer, so neither builder needs one. */
+static PyObject *u_from_nothing(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    (void)arg;
+    PyObject *wide = PyUnicode_FromWideChar(NULL, 0);
+    if (wide == NULL) {
+        return NULL;
+    }
+    PyObject *rows = PyList_New(0);
+    if (rows == NULL || PyList_Append(rows, wide) < 0) {
+        Py_DECREF(wide);
+        Py_XDECREF(rows);
+        return NULL;
+    }
+    Py_DECREF(wide);
+    int kinds[] = {PyUnicode_1BYTE_KIND, PyUnicode_2BYTE_KIND, PyUnicode_4BYTE_KIND};
+    for (size_t index = 0; index < sizeof(kinds) / sizeof(kinds[0]); index++) {
+        PyObject *text = PyUnicode_FromKindAndData(kinds[index], NULL, 0);
+        if (text == NULL || PyList_Append(rows, text) < 0) {
+            Py_XDECREF(text);
+            Py_DECREF(rows);
+            return NULL;
+        }
+        Py_DECREF(text);
+    }
+    /* The kind is still checked, a count of nothing or not. */
+    if (PyUnicode_FromKindAndData(3, NULL, 0) != NULL || !PyErr_Occurred()) {
+        Py_DECREF(rows);
+        PyErr_SetString(PyExc_SystemError, "PyUnicode_FromKindAndData accepted kind 3");
+        return NULL;
+    }
+    return Py_BuildValue("(NN)", rows, pending());
+}
+
 /* An empty string still allocates, and reads back as ''. */
 static PyObject *u_empty(PyObject *self, PyObject *arg)
 {
@@ -251,6 +345,9 @@ static PyMethodDef methods[] = {
     {"out_of_range", u_out_of_range, METH_NOARGS, "the index checks of the char accessors"},
     {"rejects", u_rejects, METH_NOARGS, "the argument checks of PyUnicode_New"},
     {"empty", u_empty, METH_NOARGS, "PyUnicode_New(0, 0)"},
+    {"new_and_write", u_new_and_write, METH_VARARGS, "PyUnicode_New then PyUnicode_WriteChar"},
+    {"not_a_string", u_not_a_string, METH_O, "the type checks of the char accessors"},
+    {"from_nothing", u_from_nothing, METH_NOARGS, "the builders handed a count of nothing"},
     {NULL, NULL, 0, NULL},
 };
 

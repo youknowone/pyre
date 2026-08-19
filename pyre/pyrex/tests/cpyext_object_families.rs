@@ -45,6 +45,15 @@ eq('from_string_and_size', m.ba_from_string_and_size(b'hello', 5), bytearray(b'h
 eq('from_string_and_size, shorter', m.ba_from_string_and_size(b'hello', 2), bytearray(b'he'))
 # A NULL source asks for a buffer of that size; what is in it is not defined.
 eq('from NULL is that long', len(m.ba_from_null(4)), 4)
+eq('from NULL of nothing', m.ba_from_null(0), bytearray())
+# A length below zero is the caller's mistake, not a buffer of no bytes.
+try:
+    m.ba_from_null(-1)
+except SystemError as error:
+    eq('from negative', str(error),
+       'Negative size passed to PyByteArray_FromStringAndSize')
+else:
+    raise AssertionError('PyByteArray_FromStringAndSize accepted a negative size')
 
 eq('from_object(bytes)', m.ba_from_object(b'xy'), bytearray(b'xy'))
 eq('from_object(list)', m.ba_from_object([1, 2, 3]), bytearray(b'\x01\x02\x03'))

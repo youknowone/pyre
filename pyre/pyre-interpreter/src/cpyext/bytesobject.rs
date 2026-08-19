@@ -139,6 +139,21 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     );
 }
 
+/// Give up the reference `pv` holds and leave it naming nothing, which every
+/// failure below does: it is what lets a caller write
+/// `if (_PyBytes_Resize(&v, n) < 0) return NULL;` and owe nothing further.
+///
+/// # Safety
+/// `pv` must be a writable `PyObject *` holding a reference this takes over.
+unsafe fn release_resized(pv: *mut *mut CPyObject) {
+    unsafe {
+        let raw = std::mem::replace(&mut *pv, std::ptr::null_mut());
+        if !raw.is_null() {
+            pyobject::decref(raw);
+        }
+    }
+}
+
 /// `_PyBytes_Resize(&v, newsize)` — give what `*pv` names the new length,
 /// writing back whatever object answers it now.
 ///
@@ -172,13 +187,8 @@ pub unsafe extern "C" fn _PyBytes_Resize(pv: *mut *mut CPyObject, newsize: isize
             .map(|value| unsafe { pyre_object::bytesobject::w_bytes_len(value) }),
     };
     let (Some(current), true) = (current, newsize >= 0) else {
-        // The reference is given up whatever went wrong, which is what lets
-        // the caller write `if (_PyBytes_Resize(&v, n) < 0) return NULL;`.
         unsafe {
-            *pv = std::ptr::null_mut();
-            if !raw.is_null() {
-                pyobject::decref(raw);
-            }
+            release_resized(pv);
             super::pyerrors::PyErr_BadInternalCall();
         }
         return -1;
@@ -191,18 +201,25 @@ pub unsafe extern "C" fn _PyBytes_Resize(pv: *mut *mut CPyObject, newsize: isize
         // No object exists yet, so there is nothing to replace: the block
         // stays and only what C is writing into changes size.
         if unsafe { pyobject::resize_cached_bytes(raw, newsize) }.is_none() {
-            unsafe { super::pyerrors::PyErr_NoMemory() };
+            unsafe {
+                release_resized(pv);
+                super::pyerrors::PyErr_NoMemory();
+            }
             return -1;
         }
         return 0;
     }
     let Some(value) = argument(raw) else {
+        unsafe { release_resized(pv) };
         return -1;
     };
     let data = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
     let mut resized: Vec<u8> = Vec::new();
     if resized.try_reserve_exact(newsize).is_err() {
-        unsafe { super::pyerrors::PyErr_NoMemory() };
+        unsafe {
+            release_resized(pv);
+            super::pyerrors::PyErr_NoMemory();
+        }
         return -1;
     }
     resized.extend_from_slice(&data[..current.min(newsize)]);

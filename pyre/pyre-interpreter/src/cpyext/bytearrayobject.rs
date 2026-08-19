@@ -46,7 +46,14 @@ pub unsafe extern "C" fn PyByteArray_FromStringAndSize(
     bytes: *const c_char,
     length: isize,
 ) -> *mut CPyObject {
-    let length = length.max(0) as usize;
+    if length < 0 {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "Negative size passed to PyByteArray_FromStringAndSize".to_owned(),
+        ));
+        return std::ptr::null_mut();
+    }
+    let length = length as usize;
     let created = if bytes.is_null() {
         pyre_object::bytearrayobject::w_bytearray_new(length)
     } else {

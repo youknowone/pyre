@@ -79,10 +79,19 @@ pub unsafe extern "C" fn PyEval_ReleaseThread(_state: *mut CPyThreadState) {
 
 /// `pystate.py:179 PyThreadState_Get`.
 ///
-/// Upstream ends the process with a fatal error when there is no current thread
-/// state.  A thread that reaches here is running pyre code and so has one.
+/// There is no state to answer with while this thread's is not current, and no
+/// way to say so: the return is a state and every caller reads it.  So the
+/// process ends here rather than one dereference later.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_Get() -> *mut CPyThreadState {
+    if !STATE_IS_CURRENT.with(|current| current.get()) {
+        super::pyerrors::fatal_error(
+            Some("PyThreadState_Get"),
+            "the function must be called with the GIL held, after Python \
+             initialization and before Python finalization, but the GIL is \
+             released (the current Python thread state is NULL)",
+        );
+    }
     thread_state()
 }
 

@@ -91,6 +91,20 @@ eq('as ascii nonstr', m.as_ascii(b'abc'), BAD)
 eq('as utf8 nonstr', m.as_utf8_string(42), BAD)
 eq('as encoded nonstr', m.as_encoded(42, 'ascii', None), BAD)
 
+# A subclass is still a `str`, and what these encode is the string: they
+# reach the codec directly, so an `encode` of its own is never looked up.
+
+
+class Shouty(str):
+    def encode(self, *arguments, **keywords):
+        raise AssertionError('encode() was looked up')
+
+
+eq('as ascii subclass', m.as_ascii(Shouty('abc')), (b'abc', None))
+eq('as utf8 subclass', m.as_utf8_string(Shouty('a一z')), (b'a\xe4\xb8\x80z', None))
+eq('as latin1 subclass', m.as_latin1(Shouty('a\xe9z')), (b'a\xe9z', None))
+eq('as encoded subclass', m.as_encoded(Shouty('a一z'), 'ascii', 'replace'), (b'a?z', None))
+
 # ── the `wchar_t` forms ────────────────────────────────────────────────
 
 eq('from wide nul terminated', m.from_wide([104, 105], -1), ('hi', None))

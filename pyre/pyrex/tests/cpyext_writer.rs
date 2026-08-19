@@ -88,6 +88,11 @@ eq('refuse str', m.write_refusals('str', NoText(), 0, 0),
 eq('refuse repr', m.write_refusals('repr', NoText(), 0, 0),
    (-1, ('RuntimeError', 'no repr'), 'keep'))
 
+# A count of nothing names no buffer, so none of the sized writes needs one;
+# `repr` of nothing is spelled rather than refused, which is what a caller
+# already reporting a failure has left to report with.
+eq('write nothing', m.write_nothing(), '<NULL>')
+
 # The substring bounds are in code points, so a character outside the basic
 # plane counts once.
 eq('substring', m.write_substring('h☃llo', 1, 4), ('☃ll', None))

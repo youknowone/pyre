@@ -304,9 +304,11 @@ header declaring it wrongly.
 - the conversions at the C boundary (`cpyext/unicodeobject.rs`,
   `cpyext/osmodule.rs`): the named codecs `PyUnicode_Decode` /
   `DecodeASCII` / `DecodeLatin1` / `DecodeUTF8` and `PyUnicode_AsEncodedString`
-  / `AsASCIIString` / `AsLatin1String` / `AsUTF8String`, each reached through
-  `bytes.decode` and `str.encode` so the error handler is the interpreter's
-  own; the `wchar_t` forms `PyUnicode_FromWideChar` / `AsWideChar` /
+  / `AsASCIIString` / `AsLatin1String` / `AsUTF8String`, each running the body
+  `bytes.decode` and `str.encode` run so the codec set and the error handlers
+  are the interpreter's own, and reaching it without the method lookup so that
+  a `str` subclass defining `encode` does not change what these encode; the
+  `wchar_t` forms `PyUnicode_FromWideChar` / `AsWideChar` /
   `AsWideCharString`, whose unit is one code point where a `wchar_t` is four
   bytes and one UTF-16 unit where it is two; and the filesystem encoding
   `PyUnicode_DecodeFSDefault` / `DecodeFSDefaultAndSize` / `EncodeFSDefault`
@@ -360,7 +362,7 @@ header declaring it wrongly.
   `Substring`, `Join`, `FromOrdinal`, `FromObject`, `DecodeUTF8`,
   `InternFromString` / `InternInPlace`, `FindChar`, `Contains`, and the five
   comparisons `Compare` / `CompareWithASCIIString` / `RichCompare` / `Equal` /
-  `EqualToUTF8`. `PyUnicode_DecodeUTF8` decodes through `bytes.decode`, so
+  `EqualToUTF8`. `PyUnicode_DecodeUTF8` runs the body `bytes.decode` runs, so
   every error handler the interpreter has is reachable rather than the three
   a hand-written decoder would name;
 - the `%`-format engine and `PyUnicode_FromFormat` / `FromFormatV` over it

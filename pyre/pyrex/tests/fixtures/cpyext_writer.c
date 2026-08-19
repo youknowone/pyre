@@ -139,6 +139,27 @@ static PyObject *write_refusals(PyObject *self, PyObject *args)
     return Py_BuildValue("(iNN)", written, left, held);
 }
 
+/* Every writer entry point handed a count of nothing, which names no buffer,
+   followed by `repr` of nothing, which is spelled rather than refused. */
+static PyObject *write_nothing(PyObject *self, PyObject *arg)
+{
+    (void)self;
+    (void)arg;
+    PyUnicodeWriter *writer = PyUnicodeWriter_Create(0);
+    if (writer == NULL) {
+        return NULL;
+    }
+    if (PyUnicodeWriter_WriteUTF8(writer, NULL, 0) < 0
+        || PyUnicodeWriter_WriteASCII(writer, NULL, 0) < 0
+        || PyUnicodeWriter_WriteWideChar(writer, NULL, 0) < 0
+        || PyUnicodeWriter_WriteUCS4(writer, NULL, 0) < 0
+        || PyUnicodeWriter_WriteRepr(writer, NULL) < 0) {
+        PyUnicodeWriter_Discard(writer);
+        return NULL;
+    }
+    return PyUnicodeWriter_Finish(writer);
+}
+
 /* The substring cases that work. */
 static PyObject *write_substring(PyObject *self, PyObject *args)
 {
@@ -318,6 +339,7 @@ static PyMethodDef methods[] = {
     {"write_discard", write_discard, METH_NOARGS, NULL},
     {"write_bad_create", write_bad_create, METH_NOARGS, NULL},
     {"write_refusals", write_refusals, METH_VARARGS, NULL},
+    {"write_nothing", write_nothing, METH_NOARGS, NULL},
     {"write_substring", write_substring, METH_VARARGS, NULL},
     {"dict_pop", dict_pop, METH_VARARGS, NULL},
     {"dict_pop_no_result", dict_pop_no_result, METH_VARARGS, NULL},
