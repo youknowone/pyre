@@ -593,40 +593,19 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// enter, because the abort propagates from any depth.  A body already on the
 /// scan stack is a cycle and answers `false`: the occurrence that opened it
 /// decides.
-/// Whether descending into this jitcode body can reach a residual call whose
-/// funcbox is an un-lowered helper's symbolic hash.
 ///
-/// [`try_execute_residual_call_via_executor`] refuses to record such a call
-/// while inlining a sub-jitcode — the hash is not a code address, so a
-/// compiled trace would branch to it — and raises
-/// `OrthodoxSubWalkTraceUnsupported` at that call.  By then the descent has
-/// executed every earlier op for real, including residual calls that advance
-/// a generator's internal state, and the abort resumes the enclosing frame at
-/// its own `CALL`.  The Python call therefore runs a second time and the first
-/// result is discarded: `random.random()` in a loop advances the Mersenne
-/// Twister once per aborted descent without producing a value for it
-/// (`gen.random()` drew 4003 times for 4000 appends).
-///
-/// The funcbox is a jitcode constant, so whether a body holds such a call is a
-/// static property of the body.  Answering it before the descent starts turns
-/// the mid-descent abort into an ordinary residual call, which applies the
-/// effect exactly once.
-///
-/// The scan follows `inline_call_*` into the callee bodies the descent would
-/// enter, because the abort propagates from any depth.  A body already on the
-/// scan stack is a cycle and answers `false`: the occurrence that opened it
-/// decides.
+/// The answer is memoized on the jitcode itself, so the scan runs once per
+/// body rather than once per call site.  Only this entry point memoizes: the
+/// `false` a cycle produces belongs to the occurrence that opened it, not to
+/// the body, so [`scan_body_for_unlowered_helper_call`] caches nothing.
 fn descent_reaches_unlowered_helper_call(jitcode_index: usize) -> bool {
-    thread_local! {
-        static VERDICTS: std::cell::RefCell<std::collections::HashMap<usize, bool>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    if let Some(cached) = VERDICTS.with(|v| v.borrow().get(&jitcode_index).copied()) {
-        return cached;
-    }
-    let verdict = scan_body_for_unlowered_helper_call(jitcode_index, &mut Vec::new());
-    VERDICTS.with(|v| v.borrow_mut().insert(jitcode_index, verdict));
-    verdict
+    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+        // Same condition the caller declines on; nothing to answer for.
+        return false;
+    };
+    jitcode.descent_reaches_unlowered_helper_call(|| {
+        scan_body_for_unlowered_helper_call(jitcode_index, &mut Vec::new())
+    })
 }
 
 /// Recursive worker of [`descent_reaches_unlowered_helper_call`].  `seen` is

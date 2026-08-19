@@ -3640,6 +3640,53 @@ mod tests {
     /// apart, so a registry that passes here can still feed
     /// `runtime_fnaddr_patch` an ambiguous build address — that direction is
     /// what its own assertion catches.
+    /// Whether two registered paths are two spellings of one item, which is
+    /// the only legitimate reason for them to share an address.
+    ///
+    /// The shape every real pair has: a crate-root re-export
+    /// (`pyre_interpreter::acquire_buffered_lock`) beside the defining path
+    /// (`pyre_interpreter::module::_io::acquire_buffered_lock`). Neither is a
+    /// suffix of the other — the crate segment leads both — so drop that
+    /// segment first, after which one is a `::`-boundary suffix of the other.
+    ///
+    /// Comparing only the last segment would accept far more than this: two
+    /// genuinely different items ending in the same name, `module::a::
+    /// type_object` and `module::b::type_object`, would read as aliases while
+    /// address-keyed patching between them stays ambiguous. Those are related
+    /// by no suffix under this rule and are reported.
+    fn are_alias_spellings(a: &str, b: &str) -> bool {
+        fn spellings(path: &str) -> [&str; 2] {
+            [path, path.split_once("::").map_or(path, |(_, rest)| rest)]
+        }
+        spellings(a).into_iter().any(|x| {
+            spellings(b).into_iter().any(|y| {
+                let (short, long) = if x.len() > y.len() { (y, x) } else { (x, y) };
+                long == short
+                    || long
+                        .strip_suffix(short)
+                        .is_some_and(|prefix| prefix.ends_with("::"))
+            })
+        })
+    }
+
+    #[test]
+    fn two_distinct_items_sharing_an_address_are_not_alias_spellings() {
+        // The pair the leaf-name grouping used to accept.
+        assert!(!are_alias_spellings(
+            "pyre_interpreter::module::a::type_object",
+            "pyre_interpreter::module::b::type_object",
+        ));
+        // Both shapes the registry actually produces.
+        assert!(are_alias_spellings(
+            "pyre_interpreter::acquire_buffered_lock",
+            "pyre_interpreter::module::_io::acquire_buffered_lock",
+        ));
+        assert!(are_alias_spellings(
+            "module::_io::stringio::type_object",
+            "pyre_interpreter::module::_io::stringio::type_object",
+        ));
+    }
+
     #[test]
     fn registered_paths_sharing_an_address_are_alias_spellings() {
         let mut by_addr: HashMap<i64, Vec<&'static str>> = HashMap::new();
@@ -3652,12 +3699,17 @@ mod tests {
         // names a different pair.
         let mut collisions: Vec<String> = Vec::new();
         for (addr, paths) in &by_addr {
-            let leaves: std::collections::BTreeSet<&str> = paths
-                .iter()
-                .map(|p| p.rsplit("::").next().unwrap_or(p))
-                .collect();
-            if leaves.len() > 1 {
-                collisions.push(format!("{addr:#x} {leaves:?}"));
+            let mut unrelated: Vec<(&str, &str)> = Vec::new();
+            for (i, a) in paths.iter().enumerate() {
+                for b in &paths[i + 1..] {
+                    if !are_alias_spellings(a, b) {
+                        unrelated.push((a, b));
+                    }
+                }
+            }
+            if !unrelated.is_empty() {
+                unrelated.sort_unstable();
+                collisions.push(format!("{addr:#x} {unrelated:?}"));
             }
         }
         collisions.sort();

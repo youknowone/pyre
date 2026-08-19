@@ -737,12 +737,49 @@ fn handle_fail_resume_guard(
         unsafe { majit_gc::gc_add_root(&mut guard_exc_root as *mut majit_ir::GcRef) };
     }
 
+    // `raw_values` is a host copy of the jitframe slots, and only the jitframe
+    // itself is walked (`jitframe_trace`).  The bridge hook below traces and
+    // compiles, so it allocates: a moving collection forwards the frame's own
+    // slots and leaves this copy naming the addresses the objects have left,
+    // which the blackhole call further down then reads.  Register the copy's
+    // GC slots for the hook's duration so the collector writes the forwarded
+    // addresses back through them.
+    //
+    // `pyre-jit`'s other guard-failure path already does this around its own
+    // bridge decision (`DeadFrameRefRoots::enter`, `eval.rs handle_fail`); that
+    // type sits behind `majit-metainterp`, which this crate does not depend on,
+    // so the same shadow-stack primitives are used directly here.
+    //
+    // The scope ends before the blackhole call rather than wrapping it: the
+    // blackhole receiver registers the same buffer itself, and a slot left
+    // registered across the resumed run pins whatever the guard happened to
+    // leave in it (`blackhole.py:1782-1796` ends `deadframe`'s live range at
+    // `_prepare_resume_from_failure`, before `_run_forever`).
+    //
+    // `is_gc_ref_slot` rather than a bare `Type::Ref` test: a force-token slot
+    // is typed `Ref` but carries an opaque virtualizable handle, so it is not a
+    // pointer to hand the collector.
+    let ref_roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    for slot in 0..raw_values.len() {
+        if descr.is_gc_ref_slot(slot) {
+            // SAFETY: `slot` indexes `raw_values`, which outlives the pop below
+            // and is not resized while the roots are registered.
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
+                    raw_values.as_mut_ptr().add(slot),
+                    1,
+                ));
+            }
+        }
+    }
+
     // compile.py:704-709 `_trace_and_compile_from_bridge`.
     // The hook compiles+attaches; it does NOT re-enter the bridge.
     // Skipped on giveup (None).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
         bridge_fn(raw_values.as_ptr(), raw_values.len(), descr_raw);
     }
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(ref_roots_depth);
 
     // compile.py:710-716 `resume_in_blackhole(descr, deadframe)`: the
     // descr is the sole identity carrier; the receiver derives green_key /
