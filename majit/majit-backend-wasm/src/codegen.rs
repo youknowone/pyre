@@ -2376,7 +2376,10 @@ fn value_id_end(inputargs: &[InputArg], ops: &[Op]) -> u32 {
 ///
 /// `TempVar` ids live in a reserved high strip and constants in their own
 /// namespace; neither indexes a value local, so both pass through unchanged.
-fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridge, u32) {
+fn rebase_region_value_ids(
+    bridge: &InlinedBridge,
+    offset: u32,
+) -> Result<(InlinedBridge, u32), BackendError> {
     use majit_ir::operand::Operand;
 
     let shift = |r: OpRef| -> OpRef {
@@ -2388,6 +2391,20 @@ fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridg
     };
 
     let width = value_id_end(&bridge.inputargs, &bridge.ops);
+    // `with_raw` keeps the variant, but the emitters classify by raw payload
+    // (`OpRef::raw_is_constant`), so an id shifted to or past the limit reads
+    // as a constant and its result is skipped. Decline instead: the merged
+    // stream is an optimization, and no renumbering is correct once the
+    // region's range no longer fits below the limit.
+    if offset
+        .checked_add(width)
+        .is_none_or(|end| end > OpRef::VALUE_ID_LIMIT)
+    {
+        return Err(BackendError::Unsupported(format!(
+            "wasm backend: inlined bridge value ids exceed the value-id space \
+             (offset {offset}, width {width})"
+        )));
+    }
     let inputargs: Vec<InputArg> = bridge
         .inputargs
         .iter()
@@ -2423,7 +2440,7 @@ fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridg
         }
     }
 
-    (
+    Ok((
         InlinedBridge {
             source_fail_index: bridge.source_fail_index,
             trace_id: bridge.trace_id,
@@ -2433,7 +2450,7 @@ fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridg
             constants: bridge.constants.clone(),
         },
         width,
-    )
+    ))
 }
 
 /// Build a wasm module from majit IR.
@@ -2486,7 +2503,7 @@ pub fn build_wasm_module(
         rebased_constants = constants.clone();
         let mut next_value_id = value_id_end(inputargs, ops);
         for bridge in inlined_bridges {
-            let (bridge, width) = rebase_region_value_ids(bridge, next_value_id);
+            let (bridge, width) = rebase_region_value_ids(bridge, next_value_id)?;
             // The pool is keyed by value position for a folded value with no
             // producing op, so rebasing the region's ids moved its reads off
             // its own entries. Replay that window at the offset, and drop a

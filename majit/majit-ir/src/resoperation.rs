@@ -301,6 +301,13 @@ impl OpRef {
         raw & Self::CONST_BIT != 0 && raw < Self::SENTINEL_BASE
     }
 
+    /// One past the highest raw an ordinary value id may carry. Everything
+    /// from here up is either the constant namespace or the `TempVar`
+    /// sentinel strip, so a value id renumbered to or past this stops naming
+    /// a value and starts reading as a constant. A pass that shifts ids has
+    /// to check its range against this before it moves anything.
+    pub const VALUE_ID_LIMIT: u32 = Self::CONST_BIT;
+
     /// Bit-helper variant of `const_index()` for callers that hold a raw
     /// u32 known to be a constant-namespace key.  See `raw_is_constant`
     /// for context.
