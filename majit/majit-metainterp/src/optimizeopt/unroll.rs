@@ -6402,7 +6402,23 @@ mod tests {
                 invented_name: false,
                 same_as_source: Some(Operand::from_opref(old_ref)),
             }],
-            Vec::new(),
+            // The const-result heap entries ride their own channel, and the
+            // walk reaches them by chaining that channel onto
+            // `exported_short_boxes`. An inline ConstPtr receiver here has to
+            // be forwarded by the same visitor.
+            vec![PreambleOp {
+                op: std::rc::Rc::new(Op::with_descr(
+                    OpCode::GetfieldGcI,
+                    &[Operand::from_opref(old_ref)],
+                    majit_ir::descr::make_field_descr_full(0, 0, 8, Type::Int, true),
+                )),
+                source_op: None,
+                res: Operand::from_opref(OpRef::const_int(7)),
+                kind: PreambleOpKind::Heap,
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            }],
             vec![old_ref],
             vec![old_ref],
             // short_inputarg_refs: `old_ref` is a ConstPtr inline position.
@@ -6468,6 +6484,7 @@ mod tests {
                 .map(|b| b.to_opref()),
             Some(new_ref)
         );
+        assert_eq!(state.const_short_boxes[0].op.arg(0).to_opref(), new_ref);
         let produced = state
             .short_boxes
             .iter()
@@ -7417,6 +7434,114 @@ mod tests {
             si0.to_opref(),
             "heap replay must retain the renamed short-inputarg receiver"
         );
+        drop(parent);
+    }
+
+    /// shortpreamble.py:272-280 replays the `const_short_boxes` half of
+    /// `create_short_boxes` through the same `produce_op` loop as the
+    /// `produced_ops` half. pyre keeps those entries on their own channel so
+    /// they cannot reach `used_boxes`, so the replay is driven explicitly at
+    /// the end of `import_short_preamble_state`; this covers that channel
+    /// end-to-end, the way the sibling test covers `exported_short_boxes`.
+    #[test]
+    fn test_exported_state_reimports_const_short_heap_field_facts() {
+        let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
+        // optimizer.py:478 ensure_ptr_info_arg0 parity: keep the parent Arc
+        // alive until import_state has run, as SimpleFieldDescr holds it Weak.
+        let parent = majit_ir::descr::make_size_descr(16);
+        let field_descr = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(0, 0, 8, majit_ir::Type::Int, false)
+                .with_signed(true)
+                .with_parent_descr(parent.clone(), 0),
+        ) as majit_ir::DescrRef;
+        let (si0, ia0) = crate::history::test_support::bound_inputarg_operand(
+            Type::Int,
+            ctx.alloc_op_position_typed(Type::Int).raw(),
+        );
+        let (si1, ia1) = crate::history::test_support::bound_inputarg_operand(
+            Type::Int,
+            ctx.alloc_op_position_typed(Type::Int).raw(),
+        );
+        let source_receiver = ctx.materialize_operand_at(OpRef::int_op(10));
+        ctx.exported_short_inputargs = vec![si0.to_opref(), si1.to_opref()];
+        ctx.exported_short_inputarg_refs = vec![ia0, ia1];
+        // shortpreamble.py:274-279: the entry the const half carries is the
+        // heap read whose result folded to a Const — `short_op.res` stays that
+        // Const while `copy_and_change` mints a fresh replay position.
+        ctx.exported_const_short_boxes
+            .push(crate::optimizeopt::shortpreamble::PreambleOp {
+                op: {
+                    let mut op = Op::with_descr(
+                        OpCode::GetfieldGcI,
+                        std::slice::from_ref(&si0),
+                        field_descr.clone(),
+                    );
+                    op.pos.set(OpRef::int_op(11));
+                    std::rc::Rc::new(op)
+                },
+                source_op: Some({
+                    let mut op = Op::with_descr(
+                        OpCode::GetfieldGcI,
+                        std::slice::from_ref(&source_receiver),
+                        field_descr.clone(),
+                    );
+                    op.pos.set(OpRef::int_op(11));
+                    std::rc::Rc::new(op)
+                }),
+                res: Operand::from_opref(OpRef::const_int(7)),
+                kind: crate::optimizeopt::shortpreamble::PreambleOpKind::Heap,
+                // A Const result occupies no label slot: `lookup_label_arg`
+                // has nothing to report for it.
+                label_arg_idx: None,
+                invented_name: false,
+                same_as_source: None,
+            });
+        ctx.materialize_operand_at(OpRef::int_op(11));
+
+        let exported = export_state(
+            &[OpRef::int_op(10), OpRef::int_op(11)],
+            &[],
+            &mut optimizer,
+            &mut ctx,
+            None,
+        );
+        assert_eq!(
+            exported.const_short_boxes.len(),
+            1,
+            "the const channel must survive export"
+        );
+
+        let mut ctx2 =
+            crate::optimizeopt::OptContext::with_inputarg_types(4, &[Type::Int, Type::Int]);
+        let targetargs = [OpRef::input_arg_int(0), OpRef::input_arg_int(1)];
+        let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
+        import_short_preamble_state(
+            &targetargs,
+            &label_args,
+            &exported,
+            &mut optimizer,
+            &mut ctx2,
+        );
+        // shortpreamble.py:72-76: the replayed entry lands in the receiver's
+        // `_fields`, and for a const entry `PreambleOp(self.res, ...)` keeps
+        // the Const as the body-visible Box.
+        let obj_box = ctx2.get_box_replacement_operand_opt(targetargs[0]).unwrap();
+        let pop = ctx2
+            .with_ptr_info_mut(&obj_box, |info| info.take_preamble_field(0))
+            .flatten();
+        assert!(
+            pop.is_some(),
+            "const short box must reach PtrInfo._fields on import"
+        );
+        let pop = pop.unwrap();
+        assert_eq!(pop.op.to_opref(), OpRef::const_int(7));
+        // The const entries never reach `used_boxes`, so no short-preamble
+        // builder holds a replay for this one and `produce_heap_field` builds
+        // it from the resolved receiver: `classify_short_arg` maps the renamed
+        // `short_inputargs[0]` back through `short_args` to the imported label
+        // arg, which is what the replay must carry.
+        assert_eq!(pop.preamble_op.arg(0).to_opref(), label_args[0]);
         drop(parent);
     }
 
