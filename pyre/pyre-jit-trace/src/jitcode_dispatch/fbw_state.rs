@@ -2635,12 +2635,13 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // replay reads the same value again.  Its writing twin
             // `SetCurrentException` is not here — it is journalled, and so
             // reaches the `deferred_call` arm below instead.
-            // `load_deref` is that same shape once more, and it is the one every
-            // closure body carries: `bh_load_deref_value_fn` dereferences a cell
-            // and returns its contents, writing nothing, so a replay reads the
-            // same cell again.  Its raise on an unbound free variable is no
-            // barrier — `load_global` above raises `NameError` too, and a replay
-            // raises the same one.  Its writing twin `StoreDeref` is not here.
+            // `load_deref` reads the same shape once more — `bh_load_deref_value_fn`
+            // dereferences a cell and returns its contents, writing nothing —
+            // but it is absent from this list because it reaches it untagged:
+            // the `load_deref_value` emit in `codewriter.rs` passes no
+            // `PyreHelperKind`, so `ei.pyre_helper` is `None` and every closure
+            // body that reads a free variable declines here.  Admitting it is a
+            // tag away, not a proof away.
             let replay_safe_read = matches!(
                 ei.pyre_helper,
                 majit_ir::PyreHelperKind::LoadConst
