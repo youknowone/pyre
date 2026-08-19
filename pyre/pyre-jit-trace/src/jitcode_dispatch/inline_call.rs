@@ -6492,6 +6492,10 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // Everything below emits, and the callee inline has decline paths of its
+    // own past this point, so keep a rewind point the way the property twins
+    // do.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // Both pins the oracle asked for, plus the layout guard its map read needs.
     walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
     // The pins above make the DESCRIPTOR a constant; they say nothing about the
@@ -6531,7 +6535,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     callee_args.push(name_const);
     callee_arg_concretes.push(ConcreteValue::Ref(name_obj));
     let getattr_const = ctx.trace_ctx.const_ref(w_func as i64);
-    try_walker_inline_resolved_user_call(
+    let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -6559,7 +6563,12 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         true,
         false,
         None,
-    )
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
 }
 
 /// Inline a `property` setter store (`obj.value = x`) after the plain-attribute
