@@ -23886,6 +23886,10 @@ mod tests {
         assert!(storage.rd_consts().is_empty());
         assert!(storage.rd_virtuals.is_empty());
         assert_eq!(meta.pending_frontend_boxes_ref(), Some([42].as_slice()));
+        assert_eq!(
+            meta.pending_frontend_box_types.as_deref(),
+            Some([Type::Int].as_slice()),
+        );
         meta.clear_trace_session();
         assert!(meta.pending_frontend_boxes_ref().is_none());
         assert!(meta.pending_frontend_box_types.is_none());
