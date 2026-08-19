@@ -1363,20 +1363,46 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
     // its first input arg share an id with the owner's loop-invariant
     // `int_op(2)`; `base = 40` clears every owner id.
     fn build(base: u32) -> Vec<u8> {
+        let region_pool = indexmap::IndexMap::from([(base + 3, 0x5a5a_007)]);
+        let first = build_with(base, region_pool.clone(), indexmap::IndexMap::new())
+            .expect("a loop-closing region merges into its owner");
+        // A region is RETAINED for the next re-emission, and `reemit_loop`
+        // rebases the same retained copy every time, so the rebase must leave
+        // it untouched. Building twice is what catches a rebase that wrote
+        // through to the region it read.
+        let second = build_with(base, region_pool, indexmap::IndexMap::new())
+            .expect("a retained region rebases identically on re-emission");
+        assert_eq!(first, second, "rebasing mutated the retained region");
+        first
+    }
+
+    fn build_with(
+        base: u32,
+        region_constants: indexmap::IndexMap<u32, i64>,
+        owner_constants: indexmap::IndexMap<u32, i64>,
+    ) -> Result<Vec<u8>, majit_backend::BackendError> {
         let inputargs = vec![
             InputArg::from_type(Type::Int, 0),
             InputArg::from_type(Type::Int, 1),
         ];
+        // `int_op(base + 3)` has no producing op: it is a folded value that
+        // only the region's own constant pool binds, so the merge has to move
+        // its pool key by the same offset it moves the read by.
         let region_ops = vec![
             make_op(
                 OpCode::IntAdd,
                 &[OpRef::input_arg_int(base), OpRef::input_arg_int(base + 1)],
                 OpRef::int_op(base + 2),
             ),
+            make_op(
+                OpCode::IntAdd,
+                &[OpRef::int_op(base + 2), OpRef::int_op(base + 3)],
+                OpRef::int_op(base + 4),
+            ),
             Op::new(
                 OpCode::Jump,
                 &[
-                    rb(OpRef::int_op(base + 2)),
+                    rb(OpRef::int_op(base + 4)),
                     rb(OpRef::input_arg_int(base + 1)),
                 ],
             ),
@@ -1393,9 +1419,9 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
                 ],
                 ops: region_ops,
                 gc_table_base: 0,
-                constants: indexmap::IndexMap::new(),
+                constants: region_constants,
             }],
-            constants: indexmap::IndexMap::new(),
+            constants: owner_constants,
             vtable_offset: Some(0),
             classptr_to_typeid: HashMap::new(),
             guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -1414,9 +1440,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             frame: codegen::FrameGeometry::fixed(),
             ca: codegen::CaParams::default(),
         };
-        codegen::build_wasm_module(&inputs)
-            .expect("a loop-closing region merges into its owner")
-            .0
+        codegen::build_wasm_module(&inputs).map(|(bytes, _, _)| bytes)
     }
 
     let colliding = build(2);
@@ -1424,6 +1448,28 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
     validate_wasm(&colliding);
     validate_wasm(&disjoint);
     assert_eq!(colliding, disjoint);
+
+    // A key the owner pool carries inside the window the region is rebased
+    // into names one of the REGION's ids once the merge is done, not the
+    // owner value it was recorded for. Left in place it answers a read the
+    // region's own pool declines, so the module builds on unrelated bits
+    // instead of declining. Dropping the region's seed must therefore reach
+    // the decline even though the owner pool has an entry at that position.
+    let stale = build_with(
+        2,
+        indexmap::IndexMap::new(),
+        indexmap::IndexMap::from([(12, 0x1234)]),
+    );
+    let error = match stale {
+        Ok(_) => panic!("a stale owner key inside the region window answered the region's read"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("read with no producing op and no"),
+        "unexpected decline: {error}"
+    );
 }
 
 #[test]
