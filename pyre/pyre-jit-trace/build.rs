@@ -2,6 +2,8 @@
 mod call_spec;
 #[path = "src/llbc_fingerprint.rs"]
 mod llbc_fingerprint;
+#[path = "src/pypyjit_driver_layout.rs"]
+mod pypyjit_driver_layout;
 #[path = "src/virtualizable_spec.rs"]
 mod virtualizable_spec;
 
@@ -833,15 +835,28 @@ fn real_main() {
             jit_drivers: vec![
                 majit_translate::JitDriverSpec {
                     portal: majit_translate::CallPath::from_segments(["eval", "eval_loop_jit"]),
-                    greens: vec![
-                        "next_instr".to_string(),
-                        "is_being_profiled".to_string(),
-                        "pycode".to_string(),
-                    ],
-                    reds: vec!["frame".to_string(), "ec".to_string()],
+                    greens: pypyjit_driver_layout::PYPYJIT_GREEN_VARS
+                        .iter()
+                        .map(|(name, _)| (*name).to_string())
+                        .collect(),
+                    reds: pypyjit_driver_layout::PYPYJIT_RED_VARS
+                        .iter()
+                        .map(|(name, _)| (*name).to_string())
+                        .collect(),
+                    green_kinds: pypyjit_driver_layout::PYPYJIT_GREEN_VARS
+                        .iter()
+                        .map(|(_, kind)| *kind)
+                        .collect(),
+                    red_kinds: pypyjit_driver_layout::PYPYJIT_RED_VARS
+                        .iter()
+                        .map(|(_, kind)| *kind)
+                        .collect(),
                     autoreds: false,
-                    virtualizables: vec!["frame".to_string()],
-                    red_types: vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
+                    virtualizables: vec![pypyjit_driver_layout::PYPYJIT_VIRTUALIZABLE.to_string()],
+                    red_types: pypyjit_driver_layout::PYPYJIT_RED_TYPES
+                        .iter()
+                        .map(|name| (*name).to_string())
+                        .collect(),
                 },
                 majit_translate::JitDriverSpec {
                     // pypy/interpreter/baseobjspace.py:1003 `_unpackiterable_unknown_length`;
@@ -852,6 +867,8 @@ fn real_main() {
                     ]),
                     greens: vec!["greenkey".to_string()],
                     reds: vec![],
+                    green_kinds: vec![majit_ir::Type::Ref],
+                    red_kinds: vec![],
                     autoreds: true,
                     virtualizables: vec![],
                     red_types: vec![],

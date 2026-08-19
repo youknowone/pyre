@@ -5379,10 +5379,16 @@ impl<'a> Transformer<'a> {
                 Some(self.handle_jit_marker__loop_header(jitdriver_index))
             }
             JitMarkerKey::JitMergePoint => {
-                let (num_greens, autoreds) = {
+                let (num_greens, autoreds, green_kinds, red_kinds, driver_name) = {
                     let cc = self.callcontrol.as_deref()?;
                     let jd = cc.jitdriver_sd_from_jitdriver(jitdriver_index)?;
-                    (jd.greens.len(), jd.autoreds)
+                    (
+                        jd.greens.len(),
+                        jd.autoreds,
+                        jd.green_kinds.clone(),
+                        jd.red_kinds.clone(),
+                        jd.portal_graph.canonical_key(),
+                    )
                 };
                 // Skip the receiver: pyre lowers `driver.jit_merge_point(...)`
                 // (`front::mir`) as a method call whose
@@ -5406,6 +5412,14 @@ impl<'a> Transformer<'a> {
                 let detected_reds =
                     autoreds.then(|| autodetect_jit_markers_redvars(graph, greens_raw));
                 let reds_raw = detected_reds.as_deref().unwrap_or(&user_args[num_greens..]);
+                self.check_jit_marker_operand_kinds(
+                    jitdriver_index,
+                    &driver_name,
+                    greens_raw,
+                    reds_raw,
+                    &green_kinds,
+                    &red_kinds,
+                );
                 if autoreds {
                     let jd = self
                         .callcontrol
@@ -5462,21 +5476,59 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    fn check_jit_marker_operand_kinds(
+        &self,
+        jitdriver_index: usize,
+        driver_name: &str,
+        greens_raw: &[crate::flowspace::model::Variable],
+        reds_raw: &[crate::flowspace::model::Variable],
+        expected_green_kinds: &[majit_ir::Type],
+        expected_red_kinds: &[majit_ir::Type],
+    ) {
+        let actual_green_kinds = self.marker_operand_kinds(greens_raw);
+        let actual_red_kinds = self.marker_operand_kinds(reds_raw);
+        let green_ok = expected_green_kinds.is_empty()
+            || expected_green_kinds == actual_green_kinds.as_slice();
+        let red_ok =
+            expected_red_kinds.is_empty() || expected_red_kinds == actual_red_kinds.as_slice();
+        if !(green_ok && red_ok) {
+            panic!(
+                "jit driver `{driver_name}` (index {jitdriver_index}) marker kind mismatch\n\
+                 expected greens: {expected_green_kinds:?}, reds: {expected_red_kinds:?}\n\
+                 actual greens: {actual_green_kinds:?}, reds: {actual_red_kinds:?}\n\
+                 marker operands must be greens-first"
+            );
+        }
+    }
+
+    fn marker_operand_kinds(
+        &self,
+        args: &[crate::flowspace::model::Variable],
+    ) -> Vec<majit_ir::Type> {
+        args.iter()
+            .filter_map(|arg| match self.get_value_kind_var(arg) {
+                'i' => Some(majit_ir::Type::Int),
+                'r' => Some(majit_ir::Type::Ref),
+                'f' => Some(majit_ir::Type::Float),
+                'v' => None,
+                _ => Some(majit_ir::Type::Ref),
+            })
+            .collect()
+    }
+
     /// RPython: `Transformer.handle_jit_marker__jit_merge_point(op, jitdriver)`
     /// (jtransform.py:1690-1712). Called from `rewrite_op_jit_marker` when the
     /// marker key is `'jit_merge_point'`.
     ///
     /// Upstream takes a `SpaceOperation('jit_marker', [key, jitdriver, *args])`
-    /// and `make_three_lists` both green and red args inside. pyre's
-    /// `rewrite_op_direct_call` already splits call args by kind, so this port
-    /// accepts already-split vectors — the caller feeds `args_i/args_r/args_f`
-    /// partitioned at the green/red boundary.
+    /// and `make_three_lists` both green and red args inside. This port accepts
+    /// already-split vectors: the caller partitions the marker operands at the
+    /// green/red boundary and runs `split_args_by_kind` over each half.
     ///
     /// Returns `[live_preamble, jit_merge_point, live_recursive]`, matching
-    /// upstream's `ops + [op3, op1, op2]` shape. The leading `promote_greens`
-    /// prefix (`ops`) is empty because `promote_greens` is not yet ported;
-    /// greens arrive as Variables/Constants and are forwarded to
-    /// the marker unchanged.
+    /// upstream's `ops + [op3, op1, op2]` shape. The caller supplies the
+    /// leading `promote_greens` prefix (`ops`) and prepends it to this
+    /// function's result.
     fn handle_jit_marker__jit_merge_point(
         &mut self,
         greens_i: Vec<crate::flowspace::model::Variable>,
@@ -10312,6 +10364,8 @@ mod tests {
             CallPath::from_segments(["pyre_jit", "other_portal"]),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             false,
             Vec::new(),
             Vec::new(),
@@ -10325,6 +10379,8 @@ mod tests {
                 "pycode".into(),
             ],
             vec!["frame".into(), "ec".into()],
+            Vec::new(),
+            Vec::new(),
             false,
             Vec::new(),
             Vec::new(),
@@ -10422,6 +10478,8 @@ mod tests {
             crate::parse::CallPath::from_segments(["autoreds_portal"]),
             vec!["greenkey".to_string()],
             Vec::new(),
+            Vec::new(),
+            Vec::new(),
             true,
             Vec::new(),
             Vec::new(),
@@ -10445,6 +10503,8 @@ mod tests {
         let mut cc = crate::call::CallControl::new();
         cc.setup_jitdriver(
             crate::parse::CallPath::from_segments(["portal"]),
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             false,
@@ -10612,6 +10672,8 @@ mod tests {
             CallPath::from_segments(["test", "portal"]),
             vec!["green1".into(), "green2".into()],
             vec!["red1".into()],
+            Vec::new(),
+            Vec::new(),
             false,
             Vec::new(),
             Vec::new(),
@@ -10692,6 +10754,115 @@ mod tests {
         );
     }
 
+    #[test]
+    fn try_handle_jit_marker_accepts_declared_green_red_operand_kinds() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::parse::CallPath;
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+            vec![
+                "next_instr".into(),
+                "is_being_profiled".into(),
+                "pycode".into(),
+            ],
+            vec!["frame".into(), "ec".into()],
+            vec![
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+            ],
+            vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0));
+        let mut graph = crate::model::FunctionGraph::new("declared_marker_kind_fixture");
+        let receiver = graph.alloc_value_var();
+        let next_instr = graph.alloc_value_var();
+        let profiled = graph.alloc_value_var();
+        let pycode = graph.alloc_value_var();
+        let frame = graph.alloc_value_var();
+        let ec = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&next_instr, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&profiled, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&pycode, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&ec, ConcreteType::GcRef);
+
+        let ops = transformer
+            .try_handle_jit_marker(
+                JitMarkerKey::JitMergePoint,
+                &[receiver, next_instr, profiled, pycode, frame, ec],
+                &graph,
+            )
+            .expect("declared greens-first marker should lower");
+
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::JitMergePoint { .. })),
+            "greens-first marker should emit a JitMergePoint"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "marker operands must be greens-first")]
+    fn try_handle_jit_marker_rejects_declared_driver_with_reds_first_operands() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::parse::CallPath;
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
+            vec![
+                "next_instr".into(),
+                "is_being_profiled".into(),
+                "pycode".into(),
+            ],
+            vec!["frame".into(), "ec".into()],
+            vec![
+                majit_ir::Type::Int,
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+            ],
+            vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0));
+        let mut graph = crate::model::FunctionGraph::new("reds_first_marker_kind_fixture");
+        let receiver = graph.alloc_value_var();
+        let frame = graph.alloc_value_var();
+        let ec = graph.alloc_value_var();
+        let next_instr = graph.alloc_value_var();
+        let profiled = graph.alloc_value_var();
+        let pycode = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&ec, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&next_instr, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&profiled, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&pycode, ConcreteType::GcRef);
+
+        let _ = transformer.try_handle_jit_marker(
+            JitMarkerKey::JitMergePoint,
+            &[receiver, frame, ec, next_instr, profiled, pycode],
+            &graph,
+        );
+    }
+
     /// jtransform.py:1699-1701 — `assert isinstance(v, Variable),
     /// "Constant specified red in jit_merge_point()"`.  front::mir
     /// materialises a Constant red into a Const-defined Variable, so
@@ -10709,6 +10880,8 @@ mod tests {
             CallPath::from_segments(["test", "portal"]),
             vec!["green1".into()],
             vec!["red1".into()],
+            Vec::new(),
+            Vec::new(),
             false,
             Vec::new(),
             Vec::new(),

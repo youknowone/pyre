@@ -84,6 +84,7 @@ pub mod llbc_fingerprint;
 pub mod py_coord;
 pub mod pyjitcode;
 pub mod pyjitpl;
+pub mod pypyjit_driver_layout;
 pub mod pyre_cpu;
 pub mod runtime_fnaddr_patch;
 pub mod state;

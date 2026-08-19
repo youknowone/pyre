@@ -5582,13 +5582,18 @@ impl PyPyJitDriver {
     /// The untranslated body is intentionally a runtime no-op.  During source
     /// translation, `ExtEnterLeaveMarker` lowers the call to `jit_marker` and
     /// jtransform emits the JitCode `jit_merge_point` operation.
+    ///
+    /// The argument order is load-bearing: marker operands are emitted as the
+    /// green list followed by the red list, and jtransform splits the payload
+    /// by position. rlib/jit.py:1003-1004 `vlist.extend(greens_v)` then
+    /// `vlist.extend(reds_v)`.
     pub fn jit_merge_point(
         &self,
+        next_instr: usize,
+        is_being_profiled: bool,
+        pycode: pyre_object::PyObjectRef,
         frame: &mut PyFrame,
         ec: *const PyExecutionContext,
-        next_instr: usize,
-        pycode: pyre_object::PyObjectRef,
-        is_being_profiled: bool,
     ) {
         let _ = (frame, ec, next_instr, pycode, is_being_profiled);
     }
@@ -5598,13 +5603,19 @@ impl PyPyJitDriver {
     /// lowers it to `jit_marker('can_enter_jit', ...)`, which jtransform aliases
     /// to the JitCode `loop_header` operation.  The live runtime warmstate call
     /// remains alongside it until generic `warmspot.apply_jit` is wired.
+    ///
+    /// The argument order mirrors `jit_merge_point` so both markers carry one
+    /// shape, but this marker's operands are discarded: it lowers to
+    /// `loop_header`, which takes only the driver index
+    /// (jtransform.py:1723 `handle_jit_marker__can_enter_jit =
+    /// handle_jit_marker__loop_header`).
     pub fn can_enter_jit(
         &self,
+        next_instr: usize,
+        is_being_profiled: bool,
+        pycode: pyre_object::PyObjectRef,
         frame: &mut PyFrame,
         ec: *const PyExecutionContext,
-        next_instr: usize,
-        pycode: pyre_object::PyObjectRef,
-        is_being_profiled: bool,
     ) {
         let _ = (frame, ec, next_instr, pycode, is_being_profiled);
     }
@@ -8695,11 +8706,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         let marker_pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
         let marker_profiled = unsafe { &*f }.get_is_being_profiled();
         pypyjitdriver.jit_merge_point(
+            pc,
+            marker_profiled,
+            marker_pycode,
             unsafe { &mut *f },
             marker_ec,
-            pc,
-            marker_pycode,
-            marker_profiled,
         );
         // jit_merge_point is a lowered no-op / merge point and does not itself
         // collect, but is treated as a collection boundary conservatively.
@@ -8876,11 +8887,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 let marker_pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
                 let marker_profiled = unsafe { &*f }.get_is_being_profiled();
                 pypyjitdriver.can_enter_jit(
+                    loop_header_pc,
+                    marker_profiled,
+                    marker_pycode,
                     unsafe { &mut *f },
                     marker_ec,
-                    loop_header_pc,
-                    marker_pycode,
-                    marker_profiled,
                 );
                 // can_enter_jit is a lowered no-op / merge point; re-seed
                 // conservatively before the next frame reads.

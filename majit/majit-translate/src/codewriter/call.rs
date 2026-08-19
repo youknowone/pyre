@@ -487,6 +487,15 @@ pub struct JitDriverStaticData {
     pub greens: Vec<String>,
     /// RPython: `jitdriver.reds` — loop-variant variable names.
     pub reds: Vec<String>,
+    /// Optional declared operand kinds parallel to `greens`.
+    ///
+    /// Upstream derives these from `PORTALFUNC.ARGS` at warmspot.py:658-670.
+    /// Pyre's codewriter does not have that signature layer, so consumers can
+    /// declare the positional marker kinds and jtransform checks them.
+    pub green_kinds: Vec<majit_ir::Type>,
+    /// Optional declared operand kinds parallel to `reds`; empty disables the
+    /// check for legacy and auto-red drivers.
+    pub red_kinds: Vec<majit_ir::Type>,
     /// RPython: `jitdriver.autoreds` — true for `reds='auto'` drivers.
     pub autoreds: bool,
     /// RPython: `jitdriver.numreds` — fixed immediately for explicit reds,
@@ -3179,7 +3188,16 @@ impl CallControl {
     /// with no green/red layout. Used by tests that need a portal without a
     /// full driver registration; production seeds via `setup_jitdriver`.
     pub fn mark_portal(&mut self, path: CallPath) {
-        self.setup_jitdriver(path, Vec::new(), Vec::new(), false, Vec::new(), Vec::new());
+        self.setup_jitdriver(
+            path,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
     }
 
     /// `codewriter.py:91-94 CodeWriter.setup_vrefinfo(self, vrefinfo)`.
@@ -3223,6 +3241,8 @@ impl CallControl {
         portal_graph: CallPath,
         greens: Vec<String>,
         reds: Vec<String>,
+        green_kinds: Vec<majit_ir::Type>,
+        red_kinds: Vec<majit_ir::Type>,
         autoreds: bool,
         virtualizables: Vec<String>,
         red_types: Vec<String>,
@@ -3232,12 +3252,22 @@ impl CallControl {
             red_types.is_empty() || red_types.len() == reds.len(),
             "setup_jitdriver: red_types length must match reds when supplied",
         );
+        debug_assert!(
+            green_kinds.is_empty() || green_kinds.len() == greens.len(),
+            "setup_jitdriver: green_kinds length must match greens when supplied",
+        );
+        debug_assert!(
+            red_kinds.is_empty() || red_kinds.len() == reds.len(),
+            "setup_jitdriver: red_kinds length must match reds when supplied",
+        );
         self.jitdrivers_sd.push(JitDriverStaticData {
             index,
             active: true,
             greens,
             numreds: if autoreds { None } else { Some(reds.len()) },
             reds,
+            green_kinds,
+            red_kinds,
             autoreds,
             virtualizables,
             red_types,
@@ -10844,6 +10874,8 @@ mod tests {
             CallPath::from_segments(["portal_runner"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            vec![],
+            vec![],
             false,
             vec![],
             vec![],
@@ -10876,6 +10908,8 @@ mod tests {
         let mut cc = cc_with_one_driver();
         cc.setup_jitdriver(
             CallPath::from_segments(["portal_runner_b"]),
+            vec![],
+            vec![],
             vec![],
             vec![],
             false,
@@ -10947,6 +10981,8 @@ mod tests {
             CallPath::from_segments(["execute_opcode_step"]),
             vec!["pc".into()],
             vec!["frame".into(), "ec".into()],
+            vec![],
+            vec![],
             false,
             vec!["frame".into()],
             vec!["PyFrame".into(), "ExecutionContext".into()],
@@ -10972,6 +11008,8 @@ mod tests {
             CallPath::from_segments(["portal"]),
             vec!["frame.code".into()],
             vec!["frame".into()],
+            vec![],
+            vec![],
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
@@ -10987,6 +11025,8 @@ mod tests {
             CallPath::from_segments(["portal"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            vec![],
+            vec![],
             false,
             vec![],
             vec![],
@@ -11010,6 +11050,8 @@ mod tests {
             CallPath::from_segments(["portal_with_greenfield"]),
             vec!["frame.code".into(), "pc".into()],
             vec!["frame".into()],
+            vec![],
+            vec![],
             false,
             vec![],
             vec!["PyFrame".into()],
@@ -11036,6 +11078,8 @@ mod tests {
             CallPath::from_segments(["portal_a"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            vec![],
+            vec![],
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
@@ -11044,6 +11088,8 @@ mod tests {
             CallPath::from_segments(["portal_b"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            vec![],
+            vec![],
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
@@ -11081,6 +11127,8 @@ mod tests {
             CallPath::from_segments(["portal"]),
             vec!["pc".into()],
             vec!["frame".into()],
+            vec![],
+            vec![],
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],

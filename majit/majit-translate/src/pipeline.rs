@@ -27,6 +27,20 @@ pub struct JitDriverSpec {
     pub portal: CallPath,
     pub greens: Vec<String>,
     pub reds: Vec<String>,
+    /// Optional operand-kind declarations parallel to `greens`.
+    ///
+    /// Upstream derives the portal argument kinds from `PORTALFUNC.ARGS` in
+    /// warmspot.py:658-670. This layer does not carry that portal signature,
+    /// so consumers may declare the positional marker kinds and the codewriter
+    /// checks them. This is the positional-argument counterpart to the keyword
+    /// validation in rlib/jit.py:892-901.
+    #[serde(default)]
+    pub green_kinds: Vec<majit_ir::Type>,
+    /// Optional operand-kind declarations parallel to `reds`. Empty leaves
+    /// the check disabled, which keeps auto-red drivers and legacy tests
+    /// compatible.
+    #[serde(default)]
+    pub red_kinds: Vec<majit_ir::Type>,
     /// RPython: `jitdriver.autoreds` — true when the driver declared
     /// `reds='auto'` and the portal marker reds must be discovered by
     /// `autodetect_jit_markers_redvars`.
@@ -247,6 +261,8 @@ mod tests {
                 portal: CallPath::from_segments(["engine", "mainloop"]),
                 greens: Vec::new(),
                 reds: Vec::new(),
+                green_kinds: Vec::new(),
+                red_kinds: Vec::new(),
                 autoreds: false,
                 virtualizables: Vec::new(),
                 red_types: Vec::new(),

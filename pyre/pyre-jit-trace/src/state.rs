@@ -4,6 +4,7 @@
 //! infrastructure. It extracts live values from the frame, restores them
 //! after compiled code runs, and provides the meta/sym types for tracing.
 
+use crate::pypyjit_driver_layout;
 use majit_backend::Backend;
 use majit_ir::{DescrRef, OpCode, OpRef, Type, Value};
 use majit_metainterp::virtualizable::VirtualizableInfo;
@@ -6833,13 +6834,9 @@ impl PyreJitState {
     /// with the descriptor the walker validates against.
     pub fn pypyjit_driver_descriptor() -> JitDriverStaticData {
         let mut descriptor = JitDriverStaticData::with_virtualizable(
-            vec![
-                ("next_instr", Type::Int),
-                ("is_being_profiled", Type::Int),
-                ("pycode", Type::Ref),
-            ],
-            vec![("frame", Type::Ref), ("ec", Type::Ref)],
-            Some("frame"),
+            pypyjit_driver_layout::PYPYJIT_GREEN_VARS.to_vec(),
+            pypyjit_driver_layout::PYPYJIT_RED_VARS.to_vec(),
+            Some(pypyjit_driver_layout::PYPYJIT_VIRTUALIZABLE),
         );
         descriptor.is_recursive = true;
         // The portal's frames are numbered in the CodeObject-keyed runtime
