@@ -190,8 +190,11 @@ pub struct JitCode {
     body: OnceLock<JitCodeBody>,
     /// Memoized verdicts derived from `body`, not assembled into it, so they
     /// are recomputed rather than serialized. Each is a static property of the
-    /// body: one answer serves every call site and every thread, which is why
-    /// it lives on the shared jitcode instead of a per-thread cache.
+    /// body, so the memo travels with the body it describes instead of sitting
+    /// in a map keyed beside it. It is not shared across threads: the runtime
+    /// jitcode table is itself per-thread (`jitcode_runtime.rs JITCODE_CELLS`,
+    /// which cites the GIL for that shape), so a thread that decodes its own
+    /// `JitCode` computes its own answer.
     #[serde(skip)]
     derived: DerivedBodyFacts,
 }
@@ -312,8 +315,9 @@ impl JitCode {
     /// Whether descending into this body can reach a residual call whose
     /// funcbox is an un-lowered helper's symbolic hash, computing the answer
     /// with `compute` the first time it is asked. The property is fixed by the
-    /// assembled body, so the first answer is the only one; every later caller
-    /// on any thread reads it back.
+    /// assembled body, so the first answer is the only one this instance gives:
+    /// `body_mut` needs `&mut self`, which `runtime_fnaddr_patch` can only take
+    /// before the jitcode is published behind an `Arc`.
     pub fn descent_reaches_unlowered_helper_call(&self, compute: impl FnOnce() -> bool) -> bool {
         *self
             .derived

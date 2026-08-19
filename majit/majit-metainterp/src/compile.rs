@@ -1141,8 +1141,6 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             })
         };
 
-        // Empty because this path classifies no force-token slots; the
-        // predicate still reads it, so the two stay one fact.
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {

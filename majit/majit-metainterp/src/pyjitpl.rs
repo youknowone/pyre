@@ -14164,9 +14164,6 @@ impl<M: Clone> MetaInterp<M> {
                     let exit_types: ExitTypes = typed_fail_values
                         .map(|values| values.iter().map(Value::get_type).collect())
                         .unwrap_or_default();
-                    // Empty because this path classifies no force-token
-                    // slots; the predicate still reads it, so the two stay
-                    // one fact.
                     CompiledExitLayout {
                         rd_loop_token: green_key, // from trace context
                         trace_id,

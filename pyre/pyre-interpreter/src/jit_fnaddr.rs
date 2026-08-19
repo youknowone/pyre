@@ -3642,31 +3642,42 @@ mod tests {
     /// what its own assertion catches.
     /// Whether two registered paths are two spellings of one item, which is
     /// the only legitimate reason for them to share an address.
-    ///
-    /// The shape every real pair has: a crate-root re-export
-    /// (`pyre_interpreter::acquire_buffered_lock`) beside the defining path
-    /// (`pyre_interpreter::module::_io::acquire_buffered_lock`). Neither is a
-    /// suffix of the other — the crate segment leads both — so drop that
-    /// segment first, after which one is a `::`-boundary suffix of the other.
-    ///
-    /// Comparing only the last segment would accept far more than this: two
-    /// genuinely different items ending in the same name, `module::a::
-    /// type_object` and `module::b::type_object`, would read as aliases while
-    /// address-keyed patching between them stays ambiguous. Those are related
-    /// by no suffix under this rule and are reported.
     fn are_alias_spellings(a: &str, b: &str) -> bool {
-        fn spellings(path: &str) -> [&str; 2] {
-            [path, path.split_once("::").map_or(path, |(_, rest)| rest)]
+        /// One path is the other with more leading segments, on a `::`
+        /// boundary — the shape a registry entry recorded with its crate
+        /// segment has against the same entry recorded without one.
+        fn extends(a: &str, b: &str) -> bool {
+            let (short, long) = if a.len() > b.len() { (b, a) } else { (a, b) };
+            long == short
+                || long
+                    .strip_suffix(short)
+                    .is_some_and(|prefix| prefix.ends_with("::"))
         }
-        spellings(a).into_iter().any(|x| {
-            spellings(b).into_iter().any(|y| {
-                let (short, long) = if x.len() > y.len() { (y, x) } else { (x, y) };
-                long == short
-                    || long
-                        .strip_suffix(short)
-                        .is_some_and(|prefix| prefix.ends_with("::"))
-            })
-        })
+        fn split_head(path: &str) -> Option<(&str, &str)> {
+            path.split_once("::")
+        }
+        // A crate-root re-export (`pyre_interpreter::acquire_buffered_lock`)
+        // beside its defining path (`pyre_interpreter::module::_io::
+        // acquire_buffered_lock`) is related by neither suffix while the crate
+        // segment leads both, so drop that segment — but only when the two
+        // paths lead with the same one. No crate re-exports another crate's
+        // item, so `pyre_object::module::x::f` and
+        // `pyre_interpreter::module::x::f` are two functions whose modules are
+        // spelled alike, and comparing their tails would call them one.
+        //
+        // Comparing only the last segment would accept far more than either
+        // rule: `module::a::type_object` and `module::b::type_object` would
+        // read as aliases while address-keyed patching between them stays
+        // ambiguous. Those are related by no suffix here and are reported.
+        if extends(a, b) {
+            return true;
+        }
+        match (split_head(a), split_head(b)) {
+            (Some((head_a, rest_a)), Some((head_b, rest_b))) => {
+                head_a == head_b && extends(rest_a, rest_b)
+            }
+            _ => false,
+        }
     }
 
     #[test]
@@ -3684,6 +3695,12 @@ mod tests {
         assert!(are_alias_spellings(
             "module::_io::stringio::type_object",
             "pyre_interpreter::module::_io::stringio::type_object",
+        ));
+        // Two crates cannot re-export one another's item, so identical module
+        // paths under different crates are two functions, not two spellings.
+        assert!(!are_alias_spellings(
+            "pyre_object::module::x::type_object",
+            "pyre_interpreter::module::x::type_object",
         ));
     }
 

@@ -159,13 +159,6 @@ pub struct ResumeGuardDescr {
     /// the meta Arc is the single source of truth.  `None` for synthetic
     /// FINISH / external-JUMP descrs that have no associated trace op.
     pub source_op_index: UnsafeCell<Option<usize>>,
-    /// Force-token slot positions for runtime GC-root filtering.
-    /// PyPy encodes the same information into the machine code's
-    /// GC-map immediates (`assembler.py` handles force-token slot
-    /// produce/consume inline); cranelift IR has no equivalent inline
-    /// encoding so the vector lives on the descr.  Migrated here from
-    /// the meta Arc is the single source of truth.  Sorted and deduped
-    /// at write time so a reader can `binary_search` it.
     /// This guard is the eval-breaker word's back-edge poll, not a check on
     /// traced values.  Stamped once per emission by the optimizer, which is
     /// where the guard's condition chain is still in hand; read by the

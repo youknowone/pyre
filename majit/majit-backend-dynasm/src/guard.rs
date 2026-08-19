@@ -94,9 +94,6 @@ pub fn layout_for_fail_descr(
         is_exception_exit: fd.is_exit_frame_with_exception(),
         trace_id,
         source_op_index: fd.source_op_index(),
-        // Classified from the descr's own force-token list, so a descr
-        // that suppresses force-token producer slots from GC
-        // classification contributes correct metadata to the layout.
         frame_stack: None,
         // Backend no longer caches recovery_layout.  The
         // metainterp `pyjitpl.rs:6322` falls back to
