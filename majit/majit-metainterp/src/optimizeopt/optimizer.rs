@@ -6225,7 +6225,7 @@ mod tests {
             1,
             0,
             &[majit_ir::descr::SimpleFieldDescrSpec {
-                is_class_word: false,
+                is_class_word: Some(false),
                 index: 91,
                 field_key: "CallResult.field".to_string(),
                 name: "CallResult.field".to_string(),
@@ -6318,7 +6318,7 @@ mod tests {
             0,
             &[
                 majit_ir::descr::SimpleFieldDescrSpec {
-                    is_class_word: false,
+                    is_class_word: Some(false),
                     index: 101,
                     field_key: "CallResult.type".to_string(),
                     name: "CallResult.type".to_string(),
@@ -6332,7 +6332,7 @@ mod tests {
                     index_in_parent: 0,
                 },
                 majit_ir::descr::SimpleFieldDescrSpec {
-                    is_class_word: false,
+                    is_class_word: Some(false),
                     index: 102,
                     field_key: "CallResult.value".to_string(),
                     name: "CallResult.value".to_string(),

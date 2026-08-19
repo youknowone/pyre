@@ -66,7 +66,10 @@ fn field_spec_from_bh(
     majit_ir::descr::SimpleFieldDescrSpec {
         index: f.index,
         field_key: f.field_key().to_string(),
-        is_class_word: majit_ir::descr::class_word_inferred_from_name(&f.name),
+        // A blackhole spec carries no declaration, so the descr infers from
+        // the name it is minted with rather than being handed a guess dressed
+        // up as its layout producer's answer.
+        is_class_word: None,
         name: f.name.clone(),
         offset: f.offset,
         field_size: f.field_size,
@@ -241,9 +244,10 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                 specs.push(majit_ir::descr::SimpleFieldDescrSpec {
                                     index: u32::MAX,
                                     field_key: name.clone(),
-                                    is_class_word: majit_ir::descr::class_word_inferred_from_name(
-                                        name,
-                                    ),
+                                    // The container name is all this arm
+                                    // has; nothing declared, so the descr
+                                    // infers from it.
+                                    is_class_word: None,
                                     name: name.clone(),
                                     offset: *offset,
                                     field_size: *field_size,
@@ -376,7 +380,10 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         let spec = majit_ir::descr::SimpleFieldDescrSpec {
                             index: u32::MAX,
                             field_key: name.clone(),
-                            is_class_word: majit_ir::descr::class_word_inferred_from_name(name),
+                            // A parentless field with no layout carrier:
+                            // nothing declared, so the descr infers from the
+                            // name.
+                            is_class_word: None,
                             name: name.clone(),
                             offset: *offset,
                             field_size: *field_size,
@@ -547,7 +554,9 @@ pub fn residual_write_effect_info(
                 majit_ir::descr::SimpleFieldDescrSpec {
                     index: u32::MAX,
                     field_key: name.to_string(),
-                    is_class_word: majit_ir::descr::class_word_inferred_from_name(name),
+                    // The layout table names fields but declares no header
+                    // row, so the descr infers from the name.
+                    is_class_word: None,
                     name: name.to_string(),
                     offset,
                     // Same width rule as the `field_specs_from_layout` twin

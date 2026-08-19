@@ -113,7 +113,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
 use crate::OpRef;
 use crate::effectinfo::{DescrMintEntry, DescrMintSpec, DescrSetMember};
@@ -811,6 +811,8 @@ define_field_mint_census! {
     cache_hit_immutability,
     cache_hit_virtualizable,
     cache_hit_index_in_parent,
+    cache_hit_class_word_conflict,
+    cache_hit_class_word_settled,
     offset_layout_hit,
     offset_accumulator_fallback,
     struct_size_layout,
@@ -2185,6 +2187,16 @@ impl GcCache {
                 descr.virtualizable,
                 descr.index_in_parent,
             );
+            // The class word is not one of the components checked above: it is
+            // settled, not compared. `describes_same_field` asks whether this
+            // slot answers for the field the caller means, and both answers
+            // describe the same field either way — what differs is how much
+            // the two producers knew. `declare_class_word` resolves that,
+            // replacing a name guess and refusing to silently pick between two
+            // declarations.
+            if let Some(is_class_word) = declared_class_word {
+                descr.declare_class_word(is_class_word);
+            }
             return descr;
         }
         // descr.py:227: name = '%s.%s' % (STRUCT._name, fieldname)
@@ -4787,6 +4799,23 @@ pub trait FieldDescr: Descr {
         false
     }
 
+    /// The class-word answer *as a declaration*, or `None` when this descr's
+    /// `is_w_class()` is a fallback guess rather than something its producer
+    /// stated.
+    ///
+    /// Serialization asks this rather than `is_w_class()` so a guess is not
+    /// laundered into a declaration by crossing a wire: a rebuilt descr can
+    /// re-guess for itself from the same name, whereas a declaration it
+    /// wrongly believes is one would outrank the layout producer that later
+    /// finds it cached.
+    ///
+    /// The default answers `Some` because the trait contract above is
+    /// "declared, not inferred" — every implementation that stores a fixed
+    /// answer is stating it. Only the name fallback overrides.
+    fn declared_w_class(&self) -> Option<bool> {
+        Some(self.is_w_class())
+    }
+
     /// Whether this descr names *any* header slot — the class word or the
     /// `typeptr`/vtable.  Both are resolved from class identity and neither
     /// resolves through the owner's value-field list, so the sites that must
@@ -5497,16 +5526,19 @@ pub struct SimpleFieldDescr {
     /// FLAG_POINTER, FLAG_FLOAT, FLAG_SIGNED, FLAG_UNSIGNED, FLAG_STRUCT, FLAG_VOID.
     flag: ArrayFlag,
     virtualizable: bool,
-    /// Whether this field is the owning struct's class word — the declared
-    /// answer behind `FieldDescr::is_w_class()`.
+    /// Whether this field is the owning struct's class word — the answer
+    /// behind `FieldDescr::is_w_class()`, together with where that answer came
+    /// from (see [`ClassWordDeclaration`]).
     ///
-    /// `new_with_name` seeds it from the `"STRUCT.fieldname"` the codewriter
-    /// supplies, which for this descr *is* the producer's declaration:
-    /// `descr.py:227` builds that name from the struct and field being
-    /// described, so a caller cannot pass a class-word name for a field that
-    /// is not one.  `with_class_word` overrides it for a producer that knows
-    /// its layout without going through the name.
-    is_class_word: bool,
+    /// `new_with_name` seeds it as an *inference* off the
+    /// `"STRUCT.fieldname"` display name; `with_class_word` and
+    /// `declare_class_word` record a producer's *declaration*.  Atomic for the
+    /// same reason `index` / `descr_index` / `ei_index` above are: the descr
+    /// is shared by `(STRUCT, fieldname)` as an `Arc<SimpleFieldDescr>`, so a
+    /// producer that arrives at an already-cached field
+    /// (`get_field_descr_declaring`'s cache-hit path) holds only `&self` and
+    /// must still be able to settle the guess.
+    class_word: AtomicU8,
     /// descr.py:158 FieldDescr.index — slot position within the
     /// parent struct's `all_fielddescrs`.
     pub index_in_parent: usize,
@@ -5528,6 +5560,71 @@ pub struct SimpleFieldDescr {
     pub vinfo: Option<Weak<dyn VinfoMarker>>,
 }
 
+/// Where a [`SimpleFieldDescr`]'s class-word answer came from.
+///
+/// The distinction is load-bearing, not bookkeeping: a descr is shared by
+/// `(STRUCT, fieldname)`, so the producer that mints it and the producer that
+/// later finds it cached are different callers with different amounts of
+/// layout knowledge.  A declaration must be able to replace a guess whichever
+/// order they arrive in, while two declarations that disagree describe one
+/// slot two ways and cannot both be honoured.
+///
+/// Discriminants are the two bits the value is stored as: bit 0 is the answer,
+/// bit 1 is whether a producer supplied it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClassWordDeclaration {
+    /// `class_word_inferred_from_name` saw an ordinary field name.
+    InferredNot = 0b00,
+    /// `class_word_inferred_from_name` saw a class-word name.
+    InferredIs = 0b01,
+    /// A producer that knows its layout says this field is not the class word.
+    DeclaredNot = 0b10,
+    /// A producer that knows its layout says this field is the class word.
+    DeclaredIs = 0b11,
+}
+
+impl ClassWordDeclaration {
+    const VALUE_BIT: u8 = 0b01;
+    const DECLARED_BIT: u8 = 0b10;
+
+    /// The answer itself — what `FieldDescr::is_w_class()` reports.
+    pub fn is_class_word(self) -> bool {
+        (self as u8) & Self::VALUE_BIT != 0
+    }
+
+    /// Whether a producer supplied the answer, as opposed to the name
+    /// fallback having guessed it.
+    pub fn is_declared(self) -> bool {
+        (self as u8) & Self::DECLARED_BIT != 0
+    }
+
+    fn inferred(is_class_word: bool) -> Self {
+        if is_class_word {
+            Self::InferredIs
+        } else {
+            Self::InferredNot
+        }
+    }
+
+    fn declared(is_class_word: bool) -> Self {
+        if is_class_word {
+            Self::DeclaredIs
+        } else {
+            Self::DeclaredNot
+        }
+    }
+
+    fn from_bits(bits: u8) -> Self {
+        match bits & (Self::VALUE_BIT | Self::DECLARED_BIT) {
+            0b00 => Self::InferredNot,
+            0b01 => Self::InferredIs,
+            0b10 => Self::DeclaredNot,
+            _ => Self::DeclaredIs,
+        }
+    }
+}
+
 /// Guess from a descr's display name whether it is a class word.
 ///
 /// This is a fallback, not a layout rule. It cannot separate a header row from a
@@ -5537,10 +5634,11 @@ pub struct SimpleFieldDescr {
 /// declare instead, through `SimpleFieldDescrSpec::is_class_word` or
 /// `SimpleFieldDescr::with_class_word`.
 ///
-/// It survives for one caller: the serialized-`BhDescr` path, which rebuilds a
-/// descr from a field name with no layout in reach. Consequently, a
-/// declaration does **not** survive a blackhole round trip — `BhFieldSpec`
-/// carries no flag, so a descr rebuilt from one falls back to this guess.
+/// It is reached only where nothing declared: a descr whose producer had no
+/// layout in reach, and a serialized `BhFieldSpec` whose `is_class_word` is
+/// `None`.  A declaration itself round-trips through the blackhole specs, so
+/// a `Method.w_class` payload declared not-a-class-word stays declared across
+/// serialization instead of reverting to this guess.
 pub fn class_word_inferred_from_name(name: &str) -> bool {
     name == "w_class" || name.ends_with(".w_class")
 }
@@ -5560,7 +5658,7 @@ impl Clone for SimpleFieldDescr {
             is_quasi_immutable: self.is_quasi_immutable,
             flag: self.flag,
             virtualizable: self.virtualizable,
-            is_class_word: self.is_class_word,
+            class_word: AtomicU8::new(self.class_word.load(Ordering::Relaxed)),
             index_in_parent: self.index_in_parent,
             parent_descr: RwLock::new(self.parent_descr.read().unwrap().clone()),
             vinfo: self.vinfo.clone(),
@@ -5633,8 +5731,10 @@ impl SimpleFieldDescr {
             flag,
             virtualizable: false,
             // Unnamed: this constructor describes a field by geometry alone,
-            // and a producer with a header slot uses `with_class_word`.
-            is_class_word: false,
+            // so there is no name to read and nothing has declared yet. Left
+            // as an inference so a producer with a header slot can still
+            // settle it through `with_class_word` / `declare_class_word`.
+            class_word: AtomicU8::new(ClassWordDeclaration::InferredNot as u8),
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
             vinfo: None,
@@ -5659,7 +5759,7 @@ impl SimpleFieldDescr {
         field_key: String,
     ) -> Self {
         let field_key_start = field_key_start(&name, &field_key);
-        let is_class_word = class_word_inferred_from_name(&name);
+        let class_word = ClassWordDeclaration::inferred(class_word_inferred_from_name(&name));
         SimpleFieldDescr {
             index: AtomicU32::new(index),
             descr_index: AtomicI32::new(-1),
@@ -5673,7 +5773,7 @@ impl SimpleFieldDescr {
             is_quasi_immutable: false,
             flag,
             virtualizable: false,
-            is_class_word,
+            class_word: AtomicU8::new(class_word as u8),
             index_in_parent: 0,
             parent_descr: RwLock::new(None),
             vinfo: None,
@@ -5694,8 +5794,74 @@ impl SimpleFieldDescr {
     /// the field's name in the `"STRUCT.fieldname"` form `new_with_name`
     /// reads.
     pub fn with_class_word(mut self, is_class_word: bool) -> Self {
-        self.is_class_word = is_class_word;
+        self.class_word = AtomicU8::new(ClassWordDeclaration::declared(is_class_word) as u8);
         self
+    }
+
+    /// The class-word answer and its provenance.
+    pub fn class_word_declaration(&self) -> ClassWordDeclaration {
+        ClassWordDeclaration::from_bits(self.class_word.load(Ordering::Relaxed))
+    }
+
+    /// Settle the class-word answer from a producer that arrived after this
+    /// descr was minted.
+    ///
+    /// `descr.py:218-239 get_field_descr` returns a cached descr with no
+    /// caller re-check, because upstream derives every component from
+    /// `(STRUCT, fieldname)` itself and a second caller therefore cannot know
+    /// anything the first did not.  Pyre's producers are not equal that way:
+    /// the serialized-`BhDescr` path can populate the cache from a field name
+    /// with no layout in reach, and a layout producer that reaches the same
+    /// slot afterwards knows strictly more.  So a declaration replaces a
+    /// guess, in either arrival order.
+    ///
+    /// Two *declarations* that disagree are a different matter: each names one
+    /// slot of one struct, and honouring the first silently would let
+    /// `SizeDescr::class_word_field` answer a payload field for the whole
+    /// process.  That is counted and asserted rather than resolved, on the
+    /// same split the cache-hit component checks use — the census is the only
+    /// channel that survives a release build and crosses the
+    /// build/runtime boundary, while the `debug_assert!` stops a debug build
+    /// at the disagreement instead of at whatever reads the wrong slot later.
+    /// First-wins remains the *stored* outcome so a release build stays
+    /// deterministic.
+    pub fn declare_class_word(&self, is_class_word: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let current = self.class_word_declaration();
+        if !current.is_declared() {
+            self.class_word
+                .store(ClassWordDeclaration::declared(is_class_word) as u8, Relaxed);
+            FIELD_MINT
+                .cache_hit_class_word_settled
+                .fetch_add(1, Relaxed);
+            return;
+        }
+        if current.is_class_word() == is_class_word {
+            return;
+        }
+        FIELD_MINT
+            .cache_hit_class_word_conflict
+            .fetch_add(1, Relaxed);
+        if field_mint_trace_enabled() {
+            eprintln!(
+                "MAJIT_FIELD_MINT_TRACE cache_hit_class_word_conflict name={:?} \
+                 offset={} kept={} rejected={is_class_word}",
+                self.name,
+                self.offset,
+                current.is_class_word(),
+            );
+            if field_mint_backtrace_enabled() {
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+            }
+        }
+        debug_assert!(
+            false,
+            "two producers declare different class-word answers for {:?} (offset {}): \
+             cached declared {}, caller declares {is_class_word}",
+            self.name,
+            self.offset,
+            current.is_class_word(),
+        );
     }
 
     /// descr.py:151: set flag directly.
@@ -5794,7 +5960,18 @@ impl Descr for SimpleFieldDescr {
 
 impl FieldDescr for SimpleFieldDescr {
     fn is_w_class(&self) -> bool {
-        self.is_class_word
+        self.class_word_declaration().is_class_word()
+    }
+
+    /// The only implementation whose `is_w_class()` can be a guess: the
+    /// display-name fallback seeded by `new_with_name`. Report `None` while
+    /// the answer is still that guess, so a serialized spec carries the
+    /// absence of a declaration rather than laundering the guess into one.
+    fn declared_w_class(&self) -> Option<bool> {
+        let declaration = self.class_word_declaration();
+        declaration
+            .is_declared()
+            .then(|| declaration.is_class_word())
     }
 
     fn offset(&self) -> usize {
@@ -6113,14 +6290,17 @@ pub struct SimpleFieldDescrSpec {
     pub flag: ArrayFlag,
     pub virtualizable: bool,
     pub index_in_parent: usize,
-    /// Whether this field is the owning layout's class word.
+    /// Whether this field is the owning layout's class word, as *declared* by
+    /// the producer — `None` when this producer has no layout in reach and
+    /// leaves the question to `class_word_inferred_from_name`.
     ///
-    /// Declared by the producer, which knows its own layout.  majit-ir cannot
-    /// derive it: a host may spell a *payload* field with the same tail as its
-    /// header row (pyre's `Method` has both `Method.w_class` at the method's
-    /// own class and the inherited header), so any name rule either misses a
-    /// header or claims a payload.
-    pub is_class_word: bool,
+    /// majit-ir cannot derive it: a host may spell a *payload* field with the
+    /// same tail as its header row (pyre's `Method` has both `Method.w_class`
+    /// at the method's own class and the inherited header), so any name rule
+    /// either misses a header or claims a payload.  `None` rather than a
+    /// pre-applied guess, so a producer that only guessed does not outrank one
+    /// that knows.
+    pub is_class_word: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -6208,7 +6388,7 @@ pub fn make_simple_descr_group_keyed_with_headerless(
                 // bound is exact only for callers that hand the `Option` in
                 // themselves — the deserialized-`BhDescr::Field` path.
                 Some(spec.index_in_parent),
-                Some(spec.is_class_word),
+                spec.is_class_word,
             )
         })
         .collect();
@@ -6283,7 +6463,12 @@ fn make_simple_descr_group_inner(
                     is_quasi_immutable: spec.is_quasi_immutable,
                     flag: spec.flag,
                     virtualizable: spec.virtualizable,
-                    is_class_word: spec.is_class_word,
+                    class_word: AtomicU8::new(match spec.is_class_word {
+                        Some(is_class_word) => ClassWordDeclaration::declared(is_class_word),
+                        None => ClassWordDeclaration::inferred(class_word_inferred_from_name(
+                            &spec.name,
+                        )),
+                    } as u8),
                     index_in_parent: spec.index_in_parent,
                     parent_descr: RwLock::new(Some(parent_descr.clone())),
                     vinfo: None,
@@ -7060,7 +7245,7 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     virtualizable: false,
                     // `typeptr` is the other header field, not the class
                     // word; `is_typeptr()` answers for it.
-                    is_class_word: false,
+                    class_word: AtomicU8::new(ClassWordDeclaration::DeclaredNot as u8),
                     index_in_parent: 0,
                     parent_descr: RwLock::new(Some(parent_descr)),
                     vinfo: None,
@@ -7808,6 +7993,156 @@ mod tests {
         assert!(typeptr.is_typeptr());
         assert!(!typeptr.is_w_class());
         assert!(typeptr.is_header_field());
+
+        // A name guess and a declaration report the same `is_w_class()` and
+        // are still different states: only the declaration survives
+        // serialization as one, and only the guess can be replaced.
+        assert_eq!(w.declared_w_class(), None);
+        assert_eq!(value.declared_w_class(), None);
+        assert_eq!(
+            SimpleFieldDescr::new(0, 8, 8, Type::Ref, false)
+                .with_class_word(true)
+                .declared_w_class(),
+            Some(true)
+        );
+    }
+
+    /// `descr.py:218-239 get_field_descr` hands back a cached descr with no
+    /// caller re-check, because upstream derives every component from
+    /// `(STRUCT, fieldname)` and a later caller cannot know more.  Pyre's
+    /// producers are unequal that way: the serialized-`BhDescr` path can
+    /// populate the cache from a field name with no layout in reach, and a
+    /// layout producer that reaches the same slot afterwards knows strictly
+    /// more.  If the declaration is only consumed on the cache-*miss* path,
+    /// whichever producer arrives first decides for the whole process — and
+    /// `Method` has a payload field whose qualified name `"Method.w_class"`
+    /// the guess accepts, so the loser is the inherited header row.
+    #[test]
+    fn a_declaration_replaces_a_name_guess_on_a_cache_hit() {
+        // Distinct key per test: `gc_cache()` is a process-global singleton
+        // shared by every test in this binary.
+        let struct_key = LLType::struct_key(0xc1a5_c0de_0000_0001);
+        let mut gc = gc_cache().lock().unwrap();
+
+        // The name-only producer arrives first and the fallback claims the
+        // payload field.
+        let guessed = gc.get_field_descr_declaring(
+            struct_key.clone(),
+            "w_class",
+            Some("Method.w_class"),
+            24,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            7,
+            false,
+            Some(0),
+            None,
+        );
+        assert!(
+            guessed.is_w_class(),
+            "the name fallback seeds the cache here"
+        );
+        assert_eq!(guessed.declared_w_class(), None, "nobody declared it");
+
+        // The layout producer reaches the same slot on a cache hit.
+        let declared = gc.get_field_descr_declaring(
+            struct_key.clone(),
+            "w_class",
+            Some("Method.w_class"),
+            24,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            7,
+            false,
+            Some(0),
+            Some(false),
+        );
+        assert!(
+            Arc::ptr_eq(&guessed, &declared),
+            "descr.py:220-221 returns the cached Arc, not a fresh mint"
+        );
+        assert!(
+            !declared.is_w_class(),
+            "the declaration must settle the guess on the cache-hit path"
+        );
+        assert_eq!(declared.declared_w_class(), Some(false));
+        assert!(
+            !guessed.is_w_class(),
+            "one Arc is shared by (STRUCT, fieldname), so every earlier holder \
+             sees the settled answer too"
+        );
+
+        // A later producer with nothing to declare leaves the settled answer
+        // alone rather than restoring its own guess.
+        let name_only = gc.get_field_descr_declaring(
+            struct_key,
+            "w_class",
+            Some("Method.w_class"),
+            24,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            7,
+            false,
+            Some(0),
+            None,
+        );
+        assert!(!name_only.is_w_class());
+        assert_eq!(name_only.declared_w_class(), Some(false));
+    }
+
+    /// Two producers that both *declare*, and disagree, describe one slot two
+    /// ways.  Keeping the first silently would leave
+    /// `SizeDescr::class_word_field` answering a payload field for the rest of
+    /// the process, so the disagreement is raised rather than resolved.
+    ///
+    /// Exercised through `declare_class_word` directly: routed through
+    /// `get_field_descr_declaring` the panic would unwind while holding the
+    /// `gc_cache()` mutex and poison it for every other test in this binary.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "two producers declare different class-word answers")]
+    fn two_disagreeing_declarations_are_not_settled_by_first_wins() {
+        let declared_header = SimpleFieldDescr::new_with_name(
+            0,
+            24,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Pointer,
+            "Method.w_class".to_string(),
+            "w_class".to_string(),
+        )
+        .with_class_word(true);
+        declared_header.declare_class_word(false);
+    }
+
+    /// A second declaration that agrees is the ordinary case — one field spec
+    /// reached through two producers — and must stay silent.
+    #[test]
+    fn a_repeated_declaration_that_agrees_is_not_a_conflict() {
+        let declared_header = SimpleFieldDescr::new_with_name(
+            0,
+            24,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Pointer,
+            "Method.payload".to_string(),
+            "payload".to_string(),
+        )
+        .with_class_word(true);
+        declared_header.declare_class_word(true);
+        assert!(declared_header.is_w_class());
+        assert_eq!(declared_header.declared_w_class(), Some(true));
     }
 
     /// A gc-only header edge must never answer a POSITIONAL question.
@@ -7834,7 +8169,7 @@ mod tests {
             virtualizable: false,
             index_in_parent: idx,
             // A value field; the class word here arrives as a gc-only edge.
-            is_class_word: false,
+            is_class_word: Some(false),
         };
         let header: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
             0,

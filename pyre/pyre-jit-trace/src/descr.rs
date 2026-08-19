@@ -844,7 +844,7 @@ fn build_object_descr_group_with_extra_gc_edges(
                 // function was found on) whose qualified name
                 // `"Method.w_class"` matches the header spelling exactly, and
                 // it sits ahead of the real header in the field list.
-                is_class_word: offset == pyre_object::pyobject::W_CLASS_OFFSET,
+                is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
                 index_in_parent,
             },
         )
@@ -3864,7 +3864,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
         // is the class word and `class_word_field` answers `None` for this
         // layout. Testing `offset == W_CLASS_OFFSET` the way the object-group
         // factory does would read as if the header could appear here.
-        is_class_word: false,
+        is_class_word: Some(false),
         index_in_parent: 0,
     };
     let mut specs = vec![
@@ -4727,7 +4727,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         // word. Its offsets are `EC_*` and share no origin with
         // `W_CLASS_OFFSET`, so matching on offset here would be a coincidence,
         // not an invariant.
-        is_class_word: false,
+        is_class_word: Some(false),
         // Stamped below, once the specs are in offset order.
         index_in_parent: 0,
     };
@@ -5833,11 +5833,11 @@ fn simple_field_spec_from_bh(
         is_quasi_immutable: spec.is_quasi_immutable,
         flag: spec.field_flag,
         virtualizable: false,
-        // `BhFieldSpec` carries no class-word flag, so a declaration does not
-        // survive the blackhole round trip and the name is all that is left.
-        // Inherits the fallback's limitation: a `Method.w_class` payload
-        // rebuilt from a blackhole spec still reads as a class word.
-        is_class_word: majit_ir::descr::class_word_inferred_from_name(&spec.name),
+        // `BhFieldSpec` carries no class-word flag, so a spec arrives with
+        // nothing declared and the descr infers from the name it is minted
+        // with.  Inherits the fallback's limitation: a `Method.w_class`
+        // payload rebuilt from a blackhole spec still reads as a class word.
+        is_class_word: None,
         index_in_parent: spec.index_in_parent,
     }
 }
