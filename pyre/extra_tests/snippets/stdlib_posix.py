@@ -120,12 +120,36 @@ for cls in (FsPathNone, FsPathNoneOverride, FsPathPropertyNone):
 
 # Every exercised user/group ID setter rejects these values during `uid_t`
 # conversion, before a privilege-changing syscall can run.
+class _IndexId:
+    def __init__(self, value):
+        self.value = value
+
+    def __index__(self):
+        return self.value
+
+
+class _RaisingIndexId:
+    def __index__(self):
+        raise ValueError("index failed")
+
+
+class _IntOnlyId:
+    def __int__(self):
+        return 0
+
+
 for _name in ("setuid", "seteuid", "setgid", "setegid"):
     _setter = getattr(os, _name, None)
     if _setter is None:
         continue
     assert_raises(TypeError, lambda f=_setter: f("not an int"))
     assert_raises(OverflowError, lambda f=_setter: f(1 << 32))
+    assert_raises(OverflowError, lambda f=_setter: f(_IndexId(-2)))
+    assert_raises(OverflowError, lambda f=_setter: f(_IndexId(1 << 32)))
+    with assert_raises(TypeError) as _exc:
+        _setter(_RaisingIndexId())
+    assert "_RaisingIndexId" in str(_exc.exception), (_name, _exc.exception)
+    assert_raises(TypeError, lambda f=_setter: f(_IntOnlyId()))
 
 for _name in ("setreuid", "setregid"):
     _setter = getattr(os, _name, None)

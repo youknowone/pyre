@@ -8502,12 +8502,14 @@ pub fn c_ushort_w(obj: PyObjectRef) -> Result<u16, PyError> {
     Ok(value as u16)
 }
 
-/// pypy/interpreter/baseobjspace.py c_uid_t_w. Equivalent to c_uint_w,
-/// except -1 maps to UINT_MAX ((uid_t)-1) and values below -1 raise
-/// OverflowError rather than ValueError. `uint_w` does not run any
-/// __index__ conversion, so the `int_w` retry on the negative branch sees
-/// only the real int and is side-effect free.
+/// `baseobjspace.py:2110` c_uid_t_w. Equivalent to c_uint_w, except -1 maps to
+/// UINT_MAX ((uid_t)-1) and values below -1 raise OverflowError rather than
+/// ValueError. `posixmodule.c:823` applies the index protocol before the range
+/// checks, but reports the original object's type if conversion fails. A
+/// successful conversion happens once up front, so `c_uint_w` and the `int_w`
+/// retry see the same integer and the retry is side-effect free.
 pub fn c_uid_t_w(obj: PyObjectRef) -> Result<u32, PyError> {
+    let obj = space_index(obj).unwrap_or(obj);
     match c_uint_w(obj) {
         Ok(value) => Ok(value),
         Err(e) if e.kind == PyErrorKind::ValueError => {
