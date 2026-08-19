@@ -873,21 +873,15 @@ Kept as-is; listed for completeness.
   the STORE_SUBSCR walker specialization gate, deleted.)
 - **Test harness (1)**: `PYRE_MIR_STRESS_LLBC`.
 
-## §5b — Bridge/short-preamble investigation gates (2026-08-19, all default-OFF)
+## §5b — The const heap short-box gate (2026-08-19, default-OFF)
 
-Added on `perf-bridge` while tracking why a bridge that accepts the LABEL reads a
-stale hoisted `Function` field. All five are **default-OFF** and all five are
-**staging, not a home**: they exist to make one measurement each and are to be
-deleted — with their ON paths — before the branch merges. None of them changes
-behaviour when unset.
+Added on `perf-bridge`. Default-OFF and staging, not a home: it exists to make
+one measurement and is to be deleted — with its OFF path — before the branch
+merges.
 
 | var | reader | what it gates | polarity | retires when |
 |---|---|---|---|---|
-| PYRE_CONST_SHORT_BOXES | `majit-metainterp/src/optimizeopt/mod.rs` | appends the const-result heap short boxes to the exported short preamble, which `shortpreamble.py:272-281 ← :369-373` does unconditionally | OFF | the const short boxes are either adopted unconditionally or the channel is deleted |
-| PYRE_INPUTARG_VALUE_MODE | `majit-metainterp/src/optimizeopt/mod.rs` | how a bridge inputarg's runtime value reaches the optimizer (`off` / `value` / `shifted`); `shifted` deliberately feeds wrong values to expose which fallbacks read them | VALUE (default off) | the runtime-value channel lands or is abandoned |
-| PYRE_INPUTARG_VALUE_DIAG | `majit-metainterp/src/optimizeopt/optimizer.rs` | prints which inputargs received a runtime value | OFF (diagnostic) | with the gate above |
-| PYRE_VSTATE_FALLBACK | `majit-metainterp/src/optimizeopt/virtualstate.rs` | enables the `_jump_to_existing_trace` runtime fallbacks (`virtualstate.py:400-405`, `:493-498`, `:579`, `:601-620`) that the value channel feeds | OFF | with the gate above |
-| PYRE_VSTATE_TRACE | `majit-metainterp/src/optimizeopt/virtualstate.rs` | prints a verdict line per virtual-state entry, not only the mismatch | OFF (diagnostic) | with the gate above |
+| PYRE_CONST_SHORT_BOXES | `majit-metainterp/src/optimizeopt/optimizer.rs` | appends the const-result heap short boxes to the exported short preamble, which `shortpreamble.py:272-281 ← :369-373` does unconditionally | OFF | the const short boxes are either adopted unconditionally or the channel is deleted |
 
 ## §6 — The 66 gates the audits never listed (2026-08-07)
 

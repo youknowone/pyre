@@ -12489,8 +12489,6 @@ impl<M: Clone> MetaInterp<M> {
                 ia.set_value(value);
             }
         }
-        optimizer.trace_inputarg_values =
-            bridge_inputargs.iter().map(InputArg::get_value).collect();
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
@@ -13205,8 +13203,6 @@ impl<M: Clone> MetaInterp<M> {
         // `renamed_inputargs` OpRefs that carry their type intrinsically
         // (history.py:220 InputArg{Int,Ref,Float}.type Box parity).
         optimizer.trace_inputargs = bridge_inputarg_types;
-        optimizer.trace_inputarg_values =
-            bridge_inputargs.iter().map(InputArg::get_value).collect();
 
         // RPython-orthodox: no source→bridge constant_types merge.
         // bridgeopt.py / unroll.py do not copy the source loop's constant

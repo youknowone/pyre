@@ -381,11 +381,6 @@ pub struct Optimizer {
     /// Typed InputArg OpRefs (InputArgInt/InputArgRef/InputArgFloat)
     /// carrying `box.type` (history.py:220) intrinsically via variant tag.
     pub trace_inputargs: Vec<OpRef>,
-    /// Concrete values carried by the bridge frontend inputargs, indexed by
-    /// logical inputarg position. `unroll.py:183-193` keeps these values on
-    /// the fresh iterator's inputarg boxes; pyre copies only the value half
-    /// into each run's fresh forwarding hosts.
-    pub trace_inputarg_values: Vec<Option<majit_ir::Value>>,
     /// unroll.py / compile.py parity: original live values at the jump
     /// point, threaded into export_state as `runtime_boxes`. Dormant
     /// until the export/import pair starts reading it.
@@ -1494,7 +1489,6 @@ impl Optimizer {
             quasi_immutable_deps: Vec::new(),
             imported_virtuals: Vec::new(),
             trace_inputargs: Vec::new(),
-            trace_inputarg_values: Vec::new(),
             runtime_boxes: Vec::new(),
             exported_loop_state: None,
             imported_loop_state: None,
@@ -2532,7 +2526,6 @@ impl Optimizer {
         //    (history.py:220 box.type parity).
         // optimizer.py:34 `self.inputargs = inputargs` parity.
         ctx.inputargs = self.trace_inputargs.clone();
-        ctx.trace_inputarg_values = self.trace_inputarg_values.clone();
         // Bind inputarg hosts so `make_equal_to` routes InputArg-targeted
         // chain steps through `Forwarded::InputArg(_)` (the orphan-box
         // forwarding fallback has been retired). Phase 2 enters with a
@@ -4193,21 +4186,6 @@ impl Optimizer {
         self.building_bridge = building_bridge_saved;
         self.skip_flush = skip_flush_saved;
         let optimized_ops = optimized_ops?;
-        if std::env::var("PYRE_INPUTARG_VALUE_DIAG").is_ok() {
-            let with_value = self
-                .trace_inputarg_values
-                .iter()
-                .filter(|value| value.is_some())
-                .count();
-            let stamped = self
-                .final_ctx
-                .as_ref()
-                .map_or(0, |ctx| ctx.inputarg_value_stamped_positions);
-            eprintln!(
-                "[inputarg-value-diag] bridge inputargs={} with_value={} stamped={}",
-                num_inputs, with_value, stamped,
-            );
-        }
 
         // A bridge trace carries no GUARD_FUTURE_CONDITION
         // (reached_loop_header's GFC lives in pyre's loop-creation path,
