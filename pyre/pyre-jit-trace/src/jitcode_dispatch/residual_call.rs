@@ -2542,6 +2542,21 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN
     );
     if is_pure {
+        // Only the CANNOT-raise half is obligation-free.
+        // `select_residual_call_opcode` picks `CallPure*` on
+        // `check_is_elidable()` alone, so `EF_ELIDABLE_CAN_RAISE` arrives
+        // wearing the same opcode, and `try_fold_pure_call_via_executor`
+        // deliberately refuses to run it — there is no metainterp here to
+        // transcribe the exception out of `BH_LAST_EXC_VALUE`.  An elidable
+        // call applies no heap effect either way, but a RAISE is an observable
+        // of its own: waving the can-raise half through opens the no-replay
+        // walk-end roads for a call the interpreter never ran, so the
+        // `ZeroDivisionError` / shift error / `MemoryError` it would have
+        // raised is skipped outright.  Decline it the way every other
+        // unexecuted call is declined, which keeps the replay obligation.
+        if call_descr.get_extra_info().check_can_raise(false) {
+            return Ok(declined_symbolic(call_opcode));
+        }
         return Ok(ResidualExecOutcome::Declined(ResidualDecline::PureUnfolded));
     }
     if !plain_or_loopinvariant && !is_may_force {
@@ -6150,7 +6165,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // walk-end no-replay commit must stay off for this trace (see
         // `fbw_has_unjournaled_effect`).  A `CallPure*` reaches this
         // dispatcher too when its fold could not answer, and declines as
-        // `PureUnfolded` — no effect, so no such obligation.
+        // `PureUnfolded` when it also cannot raise — no effect and no
+        // exception, so no such obligation; the can-raise half declines as
+        // `Symbolic` and keeps it.
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
@@ -7315,7 +7332,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // walk-end no-replay commit must stay off for this trace (see
         // `fbw_has_unjournaled_effect`).  A `CallPure*` reaches this
         // dispatcher too when its fold could not answer, and declines as
-        // `PureUnfolded` — no effect, so no such obligation.
+        // `PureUnfolded` when it also cannot raise — no effect and no
+        // exception, so no such obligation; the can-raise half declines as
+        // `Symbolic` and keeps it.
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {
@@ -7563,7 +7582,9 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // walk-end no-replay commit must stay off for this trace (see
         // `fbw_has_unjournaled_effect`).  A `CallPure*` reaches this
         // dispatcher too when its fold could not answer, and declines as
-        // `PureUnfolded` — no effect, so no such obligation.
+        // `PureUnfolded` when it also cannot raise — no effect and no
+        // exception, so no such obligation; the can-raise half declines as
+        // `Symbolic` and keeps it.
         let resid_raised = match resid_exec {
             ResidualExecOutcome::Executed(result) => result.is_err(),
             ResidualExecOutcome::Declined(cause) => {

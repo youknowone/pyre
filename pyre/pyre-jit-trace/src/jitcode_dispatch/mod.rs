@@ -5127,10 +5127,13 @@ pub fn bool_box_truth_reset() {
 pub(crate) enum ResidualDecline {
     ValueUnavailable,
     Symbolic,
-    /// A `CallPure*` the fold could not answer, because some argbox is still
-    /// symbolic.  Recording it and moving on IS the tracing behaviour — an
-    /// elidable call has no effect for anything to apply later — so unlike the
-    /// other two this decline leaves no obligation behind.
+    /// A CANNOT-raise `CallPure*` the fold could not answer, because some
+    /// argbox is still symbolic.  Recording it and moving on IS the tracing
+    /// behaviour — an elidable call that cannot raise has neither an effect for
+    /// anything to apply later nor an exception to miss — so unlike the other
+    /// two this decline leaves no obligation behind.  An `EF_ELIDABLE_CAN_RAISE`
+    /// callee wears the same opcode but is declined as `Symbolic`, because the
+    /// raise it may owe is an observable a no-replay walk-end road would drop.
     PureUnfolded,
 }
 
