@@ -1352,6 +1352,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         return 0;
     }
     const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
+    const IMMUTABLETYPE: i64 = 1 << 8;
     const ABSTRACT: i64 = 1 << 20;
     const PATMA_SEQUENCE: i64 = 1 << 5;
     const PATMA_MAPPING: i64 = 1 << 6;
@@ -1361,6 +1362,18 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     let mut flags = 0;
     if t.flag_heaptype {
         flags |= HEAPTYPE;
+    } else {
+        // `Py_TPFLAGS_IMMUTABLETYPE` (`object.h`, read at v3.14.6): a type
+        // whose attributes cannot be set.  `get_flags` publishes no such bit
+        // — it reports the heap flag and stops — while every type pyre builds
+        // itself already answers "cannot set 'x' attribute of immutable type"
+        // to a store, so the flag names something already true here rather
+        // than changing what any of them does.  Measured over 39 builtins on
+        // 3.14: the bit is set on exactly the types that are not heap types,
+        // and those are exactly the ones that refuse the store, in both
+        // interpreters.  `test_ctypes/_support.py` spells the constant and
+        // `test_win32.py:81` reads it back off `COMError`.
+        flags |= IMMUTABLETYPE;
     }
     // typeobject.py `flag_cpytype` marks cpyext-defined static types; pyre has
     // no equivalent type owner, so its bit is always absent.
