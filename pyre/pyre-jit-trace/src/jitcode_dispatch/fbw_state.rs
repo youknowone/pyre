@@ -1752,24 +1752,21 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     let in_selfrec_fold = selfrec_ca_fold_active();
     let in_exception_string_inline = EXCEPTION_STRING_INLINE_ACTIVE.with(|c| c.get());
     // A FOR_ITER-body inline admitted under `CalleeReplaySafety::DeferredCall`
-    // used to abort before the first nested residual and deny the whole callee
-    // on the next trace.  That was an entry-replay workaround: the unseeded
-    // inline frame could only resume at its caller's CALL, so executing the
-    // residual before a later abort risked applying it twice.  The inline frame
-    // is now a real red frame in the captured chain and aborts resume forward;
-    // execute and record the residual exactly as RPython's `do_residual_call`
-    // does instead of manufacturing one `loops_aborted` per callee.
-    // Narrowed decline: the general depth-≥2 nested
-    // residual inline is sound now that the portal-runner ABI is correct — a
-    // straight-line mutating callee inlines bit-exact.  One callee shape still
-    // miscompiles, masked by the old blanket decline and captured by
-    // [`fbw_inline_callee_hazardous`]: a SELF-RECURSIVE callee whose hot
-    // `CALL_ASSEMBLER` recursion-bridge frame the residual trampoline cannot
-    // retain (the `wasm_ca_trampoline_decline` witness).  The loop-bearing
-    // half formerly checked here was an entry-replay workaround; the
-    // per-frame forward-resume handoff now owns that case.  Every other nested
-    // residual inlines.  The hazard scan is last so the cheap checks
-    // short-circuit it.
+    // does not abort before the first nested residual.  Aborting there guarded
+    // an entry-replay hazard: an unseeded inline frame could only resume at its
+    // caller's CALL, so executing the residual before a later abort risked
+    // applying it twice.  The inline frame is a real red frame in the captured
+    // chain and aborts resume forward, so execute and record the residual
+    // exactly as RPython's `do_residual_call` does instead of manufacturing one
+    // `loops_aborted` per callee.
+    // Narrowed decline: under the current portal-runner ABI the general
+    // depth-≥2 nested residual inline is sound — a straight-line mutating
+    // callee inlines bit-exact.  One callee shape still miscompiles and is
+    // captured by [`fbw_inline_callee_hazardous`]: a SELF-RECURSIVE callee
+    // whose hot `CALL_ASSEMBLER` recursion-bridge frame the residual
+    // trampoline cannot retain (the `wasm_ca_trampoline_decline` witness).
+    // Every other nested residual inlines.  The hazard scan is last so the
+    // cheap checks short-circuit it.
     // A carrier-resume sub-walk starts at the failed guard; it does not replay
     // an enclosing CALL. RPython resumes residual calls at every rebuilt
     // framestack depth, so this forward-capture hazard excludes the carrier.
