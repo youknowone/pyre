@@ -1305,6 +1305,134 @@ fn inlined_bridge_without_owner_loop_label_declines() {
     assert!(error.to_string().contains("no local loop LABEL"));
 }
 
+/// A region merged into an owner brings its own CALL_ASSEMBLER callee, but the
+/// dedicated CA arm is selected by `ca.emit_ca` and bakes the callee geometry
+/// out of `ca.targets` — both decided when the OWNER was compiled. An op that
+/// misses that arm does not fail: it falls through to the ordinary
+/// residual-call arm, which lowers arg 0 as an `__indirect_function_table`
+/// slot, while a CALL_ASSEMBLER's arg 0 is the callee's first frame slot. That
+/// calls whatever the slot happens to index and hands the answer back as the
+/// callee's — a silent wrong result rather than a trap. Every trace's own ops
+/// are screened for unsupported opcodes before compilation; the merged stream
+/// is the one place that question is never re-asked, so the merge asks it.
+#[test]
+fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
+    fn build(
+        region_ops: Vec<Op>,
+        ca: codegen::CaParams,
+    ) -> Result<Vec<u8>, majit_backend::BackendError> {
+        let inputargs = vec![
+            InputArg::from_type(Type::Int, 0),
+            InputArg::from_type(Type::Int, 1),
+        ];
+        let owner_ops = vec![
+            Op::new(
+                OpCode::Label,
+                &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+            ),
+            make_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                OpRef::int_op(2),
+            ),
+            make_guard(
+                OpCode::GuardTrue,
+                &[OpRef::int_op(2)],
+                &[OpRef::int_op(2), OpRef::input_arg_int(1)],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[rb(OpRef::int_op(2)), rb(OpRef::input_arg_int(1))],
+            ),
+        ];
+        let inputs = codegen::ModuleBuildInputs {
+            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            ops: owner_ops,
+            inlined_bridges: vec![codegen::InlinedBridge {
+                source_fail_index: 0,
+                trace_id: 7,
+                inputargs: vec![
+                    InputArg::from_type(Type::Int, 40),
+                    InputArg::from_type(Type::Int, 41),
+                ],
+                ops: region_ops,
+                gc_table_base: 0,
+                constants: indexmap::IndexMap::new(),
+            }],
+            constants: indexmap::IndexMap::new(),
+            vtable_offset: Some(0),
+            classptr_to_typeid: HashMap::new(),
+            guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+            alloc: codegen::AllocHelpers::default(),
+            wb_fn_ptr: 0,
+            nursery: None,
+            invalidated_flag_addr: 0,
+            gc_table_base: 0,
+            fail_index_base: 0,
+            bridge_cells_base: 0,
+            bridge_entry_arity: None,
+            bridge_param_dispatch: false,
+            trace_entry_census: None,
+            external_jump_slot: 0,
+            external_jump_key: 0,
+            frame: codegen::FrameGeometry::fixed(),
+            ca,
+        };
+        codegen::build_wasm_module(&inputs).map(|(bytes, _, _)| bytes)
+    }
+
+    /// The region the decline arms use, with `opcode` producing its one value.
+    /// The loop-closing JUMP carries the region's own inputs, so the result
+    /// type never reaches the owner's label and only the opcode varies.
+    fn region_ops(opcode: OpCode, result: OpRef) -> Vec<Op> {
+        vec![
+            make_op(
+                opcode,
+                &[OpRef::input_arg_int(40), OpRef::input_arg_int(41)],
+                result,
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[rb(OpRef::input_arg_int(40)), rb(OpRef::input_arg_int(41))],
+            ),
+        ]
+    }
+
+    // The same region under an ordinary opcode, to pin that what declines
+    // below is the CALL_ASSEMBLER and not the fixture.
+    let plain = build(
+        region_ops(OpCode::IntAdd, OpRef::int_op(42)),
+        codegen::CaParams::default(),
+    )
+    .expect("a loop-closing region with no CALL_ASSEMBLER merges into its owner");
+    validate_wasm(&plain);
+
+    for (opcode, result) in [
+        (OpCode::CallAssemblerI, OpRef::int_op(42)),
+        (OpCode::CallAssemblerR, OpRef::ref_op(42)),
+    ] {
+        for ca in [
+            // The owner emitted no CA arm at all.
+            codegen::CaParams::default(),
+            // The owner has the arm, but not for THIS callee: the region's
+            // target is absent from the table the arm bakes its geometry from.
+            codegen::CaParams {
+                emit_ca: true,
+                ..codegen::CaParams::default()
+            },
+        ] {
+            let error = match build(region_ops(opcode, result), ca) {
+                Ok(_) => panic!("{opcode:?} has no arm in this build, so the merge must decline"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("no CALL_ASSEMBLER arm for"),
+                "declined for the wrong reason: {error}"
+            );
+        }
+    }
+}
+
 /// A region's value ids are its own trace's, so they collide with the owner's.
 /// The merged stream has one local namespace, so an unrebased collision makes
 /// the region's entry moves land in locals the owner still holds live across

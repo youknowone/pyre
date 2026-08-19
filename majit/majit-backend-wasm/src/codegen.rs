@@ -2562,6 +2562,33 @@ pub fn build_wasm_module(
                 "wasm backend: inlined bridge stream has an empty region".into(),
             ));
         }
+        // A region can carry a CALL_ASSEMBLER this build has no arm for. The
+        // dedicated arm is selected by `ca.emit_ca`, which is decided when the
+        // OWNER is compiled, and it reads the callee's geometry out of
+        // `ca.targets`; a region merged in later brings its own callee. An op
+        // that misses that arm does not fail — it falls through to the ordinary
+        // residual-call arm, which lowers arg 0 as an
+        // `__indirect_function_table` slot, and a CALL_ASSEMBLER's arg 0 is the
+        // callee's first frame slot. That calls whatever the slot happens to
+        // index and returns its result as the callee's, which is a silent wrong
+        // answer rather than a trap. `wasm_unsupported_trace_reason` asks this
+        // question of every trace's own ops; the merged stream is the one place
+        // it is never re-asked, so ask it here.
+        for op in &bridge.ops {
+            if !op.opcode.is_call_assembler() {
+                continue;
+            }
+            let target = op
+                .getdescr()
+                .and_then(|descr| descr.as_call_descr().and_then(|d| d.call_target_token()));
+            if !ca.emit_ca || target.is_none_or(|token| !ca.targets.contains_key(&token)) {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm backend: inlined bridge carries {:?}, which the owner \
+                     build has no CALL_ASSEMBLER arm for",
+                    op.opcode
+                )));
+            }
+        }
         let source_guard = guards
             .get(bridge.source_fail_index as usize)
             .ok_or_else(|| {

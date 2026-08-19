@@ -83,8 +83,9 @@ use std::sync::{Arc, Mutex};
 /// because the source module has frame-only dispatch; 46 = parameter entry
 /// declined because the source guard and bridge input arities disagree; 47 =
 /// LABEL publication suppressed because the bridge entry has nonzero parameters.
-/// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame.
-pub static BRIDGE_DIAG: [AtomicU64; 49] = [const { AtomicU64::new(0) }; 49];
+/// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
+/// the region carries a CALL_ASSEMBLER the owner build emits no arm for.
+pub static BRIDGE_DIAG: [AtomicU64; 50] = [const { AtomicU64::new(0) }; 50];
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -185,6 +186,8 @@ fn classify_inline_install_error(error: &BackendError) {
         diag_bump(41);
     } else if reason.contains("label resume layout") {
         diag_bump(48);
+    } else if reason.contains("no CALL_ASSEMBLER arm for") {
+        diag_bump(49);
     } else if reason.contains("inlined bridge stream has no local loop LABEL") {
         diag_bump(42);
     } else {
