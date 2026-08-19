@@ -1914,10 +1914,46 @@ fn startup_builtin_module_impl(
 /// shadowing check to compare against absolute module origins.  Under the
 /// sandbox the path is left as given (a virtual path the controller mediates);
 /// `canonicalize` would issue raw host syscalls past the seccomp lockdown.
+/// The extended-length spelling `canonicalize` answers with on Windows, back
+/// as the name everything else uses.
+///
+/// It resolves through `GetFinalPathNameByHandleW`, whose result carries the
+/// `\\?\` prefix — `\\?\Z:\src` for `Z:\src`, `\\?\UNC\host\share` for
+/// `\\host\share`.  A module's `__spec__.origin` is the plain name the
+/// finder joined, so `is_possibly_shadowing` would be comparing two spellings
+/// of the same directory and finding them different.  A prefix with no plain
+/// spelling (`\\?\Volume{...}`) is left as it is.
+#[cfg(all(windows, not(feature = "sandbox")))]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const fn wide(s: &str) -> [u16; 4] {
+        let b = s.as_bytes();
+        [b[0] as u16, b[1] as u16, b[2] as u16, b[3] as u16]
+    }
+    const SEP: u16 = b'\\' as u16;
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let Some(rest) = units.strip_prefix(&wide(r"\\?\")) else {
+        return path;
+    };
+    let plain = if let Some(unc) = rest.strip_prefix(&wide(r"UNC\")) {
+        [&[SEP, SEP][..], unc].concat()
+    } else if let [_, colon, SEP, ..] = rest
+        && *colon == b':' as u16
+    {
+        rest.to_vec()
+    } else {
+        return path;
+    };
+    PathBuf::from(std::ffi::OsString::from_wide(&plain))
+}
+
 fn canonical_startup_dir(dir: &Path) -> Wtf8Buf {
     #[cfg(not(feature = "sandbox"))]
     if let Ok(abs) = std::path::absolute(dir) {
-        let abs = abs.canonicalize().unwrap_or(abs);
+        let abs = abs.canonicalize().unwrap_or_else(|_| abs.clone());
+        #[cfg(windows)]
+        let abs = strip_verbatim_prefix(abs);
         return crate::gateway::fsdecode_os_str_wtf8(abs.as_os_str());
     }
     crate::gateway::fsdecode_os_str_wtf8(dir.as_os_str())
