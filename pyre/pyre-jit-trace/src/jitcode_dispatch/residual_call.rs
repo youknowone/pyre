@@ -3191,6 +3191,18 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // stamping one would leave `tracing_after_residual_call` reading a token
     // nobody will clear.
     if is_may_force {
+        // How many pairs the bracket actually walks.  Both halves iterate
+        // `virtualref_boxes`, and nothing in-tree reports its length, so
+        // "the bracket iterates zero times" has never been a measured claim —
+        // only a restatement of which call sites populate it.  Report the
+        // count here so a sweep can settle it; gated like the rest of the
+        // walk's build reporting.
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[vref-bracket] pairs={}",
+                ctx.trace_ctx.virtualref_boxes_len() / 2
+            );
+        }
         ctx.trace_ctx.vrefs_before_residual_call();
     }
     let live_frame = if ctx.fbw_mode.snapshot_sym.is_null() {

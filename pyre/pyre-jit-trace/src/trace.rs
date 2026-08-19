@@ -4652,10 +4652,20 @@ fn run_perfn_walk<Sym: WalkSym>(
                     };
                 if !walk_end_resume_provable(resume) {
                     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                        // The two ways this leg can be unprovable are different
+                        // failures and want different fixes, so name which one
+                        // happened.  `RewindUnproven` means no opcode-entry
+                        // sample was taken at all (no boundary crossed, or a
+                        // different opcode); a `Rewind` that is still unprovable
+                        // means the sample exists but the opcode had already
+                        // applied an effect by the resume point.
+                        let reason = match resume {
+                            WalkEndResume::RewindUnproven => "no opcode-entry sample",
+                            _ => "opcode already applied an effect",
+                        };
                         eprintln!(
                             "[fbw-qmut-flush] declined at resume_py_pc={resume_py_pc} \
-                             (opcode already applied an effect, or no entry sample) \
-                             — legacy replay kept"
+                             ({reason}) — legacy replay kept"
                         );
                     }
                 } else if crate::jitcode_dispatch::flush_qmut_abort_state(

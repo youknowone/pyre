@@ -1667,6 +1667,39 @@ fn caller_operand_slots<Sym: WalkSym>(
     }
 }
 
+/// Name the live color that refused a caller image.
+///
+/// The liveness pass below DEMANDS a concrete for every color live at the
+/// resume pc and answers `None` for the whole image when one is missing.  That
+/// `None` surfaces far downstream as `[s2-build-decline] ... parent.blackhole
+/// None (capture missing)`, which cannot say which bank, which color, or
+/// whether the shadow was merely too short.  A corpus sweep of 524 fixtures
+/// found exactly one caller image declining anywhere, so the refusal is rare
+/// enough that the answer has to come from the refusal itself rather than from
+/// a re-run.  Gated like the rest of the walk's build reporting.
+fn report_caller_image_decline<T: std::fmt::Debug>(
+    jitcode_index: u32,
+    call_jit_pc: usize,
+    bank: char,
+    color: usize,
+    shadow_len: usize,
+    got: Option<T>,
+) {
+    if !fbw_debug_abort_enabled() {
+        return;
+    }
+    let why = if color >= shadow_len {
+        "color past the end of the walk's shadow"
+    } else {
+        "shadow holds a different concrete kind"
+    };
+    eprintln!(
+        "[fbw-blackhole] caller image DECLINED jitcode_index={jitcode_index} \
+         call_jit_pc={call_jit_pc} bank={bank} live_color={color} \
+         shadow_len={shadow_len} ({why}) got={got:?}"
+    );
+}
+
 fn capture_inline_parent_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode_index: u32,
@@ -1719,7 +1752,16 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         if result_bank == 'i' && result_color == Some(color) {
             continue;
         }
-        let ConcreteValue::Int(value) = ctx.concrete_registers_i.get(color).copied()? else {
+        let got = ctx.concrete_registers_i.get(color).copied();
+        let Some(ConcreteValue::Int(value)) = got else {
+            report_caller_image_decline(
+                jitcode_index,
+                call_jit_pc,
+                'i',
+                color,
+                ctx.concrete_registers_i.len(),
+                got,
+            );
             return None;
         };
         int_values.push((color, value));
@@ -1753,7 +1795,16 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         // `set_stack_at` on a concrete PyFrame — a different index space.
         // Reading the shadow through it stamped whatever register happened to
         // live at the slot's number.
-        let ConcreteValue::Ref(value) = ctx.concrete_registers_r.get(color).copied()? else {
+        let got = ctx.concrete_registers_r.get(color).copied();
+        let Some(ConcreteValue::Ref(value)) = got else {
+            report_caller_image_decline(
+                jitcode_index,
+                call_jit_pc,
+                'r',
+                color,
+                ctx.concrete_registers_r.len(),
+                got,
+            );
             return None;
         };
         ref_values.push((color, value));
@@ -1780,10 +1831,18 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         if result_bank == 'f' && result_color == Some(color) {
             continue;
         }
-        let opref = ctx.registers_f.get(color).copied()?;
-        if opref == OpRef::NONE {
+        let got = ctx.registers_f.get(color).copied();
+        let Some(opref) = got.filter(|&opref| opref != OpRef::NONE) else {
+            report_caller_image_decline(
+                jitcode_index,
+                call_jit_pc,
+                'f',
+                color,
+                ctx.registers_f.len(),
+                got,
+            );
             return None;
-        }
+        };
         float_values.push((color, opref));
         if let Some(seeded) = float_seeded.get_mut(color) {
             *seeded = true;
