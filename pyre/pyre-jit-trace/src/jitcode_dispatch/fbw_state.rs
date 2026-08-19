@@ -1844,6 +1844,24 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
         // letting the enclosing loop retrace (`pyjitpl.py:2818-2828`).
         if let Some(callee_code_key) = hazardous_callee {
             fbw_deny_hazardous_inline(callee_code_key);
+            // `fbw_deny_hazardous_inline` writes a thread-local set that only
+            // this walker reads, so the deny stayed invisible to the warm
+            // state: `dont_trace_here` counted zero on every fixture that
+            // reaches here.  The upstream answer cited above is
+            // `disable_noninlinable_function(greenkey_of_huge_function)`
+            // (`pyjitpl.py:2821`), which sets `JC_DONT_TRACE_HERE` on the
+            // callee's cell (`warmstate.py:331-337`).  The recursion-bound deny
+            // in `inline_call.rs` already calls it for the callee it names;
+            // this one names a callee the same way and had no reason not to.
+            if let Some((driver, _)) = crate::driver::try_driver_pair() {
+                driver
+                    .meta_interp_mut()
+                    .warm_state_mut()
+                    .disable_noninlinable_function(crate::driver::make_green_key(
+                        callee_code_key as *const (),
+                        0,
+                    ));
+            }
         }
         // The flush this latch feeds resumes the OUTERMOST caller at the CALL
         // that entered the inline region, re-executing that call from scratch,
