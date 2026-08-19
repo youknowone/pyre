@@ -5099,11 +5099,17 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
 ///   - `vrefs_before_residual_call` / `vrefs_after_residual_call` ARE called
 ///     by the walker, under the `is_may_force` gate that mirrors
 ///     `do_residual_call`'s `assembler_call or effectinfo.check_forces_...`
-///     (`pyjitpl.py:2007`). Their loops are empty in practice because no
-///     `jit.virtual_ref` producers exist today, so the observable behaviour is
-///     still "nothing happens" — but that is a fact about the vref list, not
-///     about the call sites. Vable forces are detected separately, by the
-///     residual-call execution path's heap-token bracket.
+///     (`pyjitpl.py:2007`). Their loops are NOT empty: [`walker_ec_enter`]
+///     takes a vref of every seeded callee frame via
+///     `TraceCtx::opimpl_virtual_ref` — `ExecutionContext.enter`'s vref — and
+///     pairs it with `opimpl_virtual_ref_finish` when the frame leaves, so
+///     `virtualref_boxes` carries real entries whenever an inlined callee is
+///     live across a may-force call. Measured over 431 synth + 93 parity
+///     fixtures via the `[vref-bracket] pairs=` report: 5487 bracket entries,
+///     686 of them (12.5%) with at least one pair, 66 of the 316 emitting
+///     fixtures reaching a nonzero count, maximum 7 pairs. Vable forces are
+///     detected separately, by the residual-call execution path's heap-token
+///     bracket.
 ///   - `direct_libffi_call` (`pyjitpl.py`) — pyre's live
 ///     tracer also returns `None` from this helper unless a
 ///     `CIF_DESCRIPTION_P` parser + dynamic `calldescr` builder lands
