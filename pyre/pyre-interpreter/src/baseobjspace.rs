@@ -17475,11 +17475,12 @@ unsafe fn generator_invoke_execute_frame(
             // `_leak_stopasynciteration`, which differ only in the name they
             // format after KIND.  The second is reachable on async generators
             // alone, which is why it tests the flavour and the first does not.
-            let leaked = if e.kind == crate::PyErrorKind::StopIteration {
+            // generator.py:135-139 selects between them with `e.match(space,
+            // ...)`, so a subclass of either class leaks the same way its base
+            // does and a flat `PyErrorKind` comparison would miss it.
+            let leaked = if e.matches_stop_iteration() {
                 Some("StopIteration")
-            } else if is_async_generator(gen_obj)
-                && e.kind == crate::PyErrorKind::StopAsyncIteration
-            {
+            } else if is_async_generator(gen_obj) && e.matches_stop_async_iteration() {
                 Some("StopAsyncIteration")
             } else {
                 None
