@@ -18,53 +18,48 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // `_abc_negative_cache_version` is compared against this on every check.
 static INVALIDATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// `ref(cls)` as `SimpleWeakSet` spells it (`app_abc.py:20`).  This is the
-/// interpreter-level `weakref.ref` object, not [`weakref::w_weakref_new`]'s
-/// bare GC struct: the caches are ordinary sets, so an entry has to be a real
-/// object with a type — one whose `__hash__` and `__eq__` go by referent, which
-/// is what lets a probe find an entry recorded earlier.
+/// The app-level `SimpleWeakSet` (`app_abc.py:15-44`), stashed at module init
+/// the way `weakref_type` stashes its own.  The registry and both caches are
+/// instances of it, so the collection this module installs is the one
+/// `_get_dump` describes and a collected member drops itself.
+static SIMPLE_WEAK_SET_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn simple_weak_set_type() -> PyObjectRef {
+    *SIMPLE_WEAK_SET_TYPE
+        .get()
+        .expect("_abc.SimpleWeakSet must be installed at module init") as PyObjectRef
+}
+
+/// `SimpleWeakSet()` — the empty collection `_abc_init` installs and the
+/// invalidation in `subclass_of` rebinds to.
+fn new_simple_weak_set() -> Result<PyObjectRef, crate::PyError> {
+    crate::call::call_function_impl_result(simple_weak_set_type(), &[])
+}
+
+/// Whether `cls` can be weak-referenced at all, which is what decides whether
+/// a `SimpleWeakSet` can hold it.
 ///
-/// `get_or_make_weakref` returns the one weakref a class already has, so only
-/// the first probe of a given class allocates.
-///
-/// `None` for a class that cannot be weak-referenced at all; the caller reads
-/// that as "not cacheable" rather than raising, since the answer to the
-/// subclass question does not depend on whether it can be remembered.
-fn class_weakref(cls: PyObjectRef) -> Option<PyObjectRef> {
+/// `app_abc.py:39-40 add` has no such test — upstream reaches it only with a
+/// real class, because `_abc_register` rejects everything else. Pyre admits a
+/// callable non-type there (see `register`), so the test lives on this side of
+/// the boundary rather than in the app-level source, which stays verbatim.
+/// `__contains__` needs none: `app_abc.py:33-38` already reads a referent-less
+/// item as absent.
+fn can_weakref(cls: PyObjectRef) -> bool {
     use crate::module::_weakref::interp__weakref as wr;
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
-    // Both calls below allocate, and an allocation can claim root slots of its
-    // own — so every slot index comes back from the `publish` that made it
-    // rather than from arithmetic on an earlier one, and every argument is read
-    // out of its slot rather than from a local copy.
-    let type_slot = roots.publish(&[wr::weakref_type()]);
-    let lifeline = wr::getlifeline(roots.get(cls_slot)).ok()?;
-    let lifeline_slot = roots.publish(&[lifeline]);
-    Some(wr::get_or_make_weakref(
-        roots.get(lifeline_slot),
-        roots.get(type_slot),
-        roots.get(cls_slot),
-    ))
+    wr::getlifeline(roots.get(cls_slot)).is_ok()
 }
 
-/// `app_abc.py:33-38 SimpleWeakSet.__contains__` — `ref(item) in self.data`, a
-/// set whose members are weakrefs, probed with a weakref to the same class.
+/// `app_abc.py:33-38 SimpleWeakSet.__contains__` through the membership
+/// protocol, which is where the weakref probe and the `TypeError` fallback
+/// live.
 ///
-/// A missing or non-set attribute reads as "not cached" rather than raising:
-/// `_abc_init` installs both caches, but an ABC built before this module (a
+/// A missing collection reads as "not cached" rather than raising:
+/// `_abc_init` installs all three, but an ABC built before this module (a
 /// pickled class, a hand-rolled `ABCMeta` subclass that skips `_abc_init`)
-/// has neither, and such a class must still answer subclass checks.
-///
-/// Takes the class and the attribute name rather than the set itself, so that
-/// the set is read only after the probe exists: making the probe allocates, and
-/// a reference read across an allocation names where the object used to be.
-///
-/// `wr in self.data` goes through the membership protocol rather than
-/// [`w_set_contains`]: a weakref hashes by running interpreter-level code
-/// (`_weakref.ref.__hash__` hashes the referent and memoises the result), and
-/// the raw set primitives document that a caller whose element hashes that way
-/// owes them a digest taken while the operands are still rooted.
+/// has none, and such a class must still answer subclass checks.
 fn weak_cache_contains(
     cls: PyObjectRef,
     name: &str,
@@ -72,47 +67,60 @@ fn weak_cache_contains(
 ) -> Result<bool, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
-    let Some(probe) = class_weakref(item) else {
-        return Ok(false);
-    };
-    let probe_slot = roots.publish(&[probe]);
+    let item_slot = roots.publish(&[item]);
     let cache = cache_attr(roots.get(cls_slot), name)?;
-    if cache.is_null() || !unsafe { is_set(cache) } {
+    if cache.is_null() {
         return Ok(false);
     }
-    crate::baseobjspace::contains(cache, roots.get(probe_slot))
+    let cache_slot = roots.publish(&[cache]);
+    crate::baseobjspace::contains(roots.get(cache_slot), roots.get(item_slot))
 }
 
-/// `app_abc.py:39-40 SimpleWeakSet.add` — `self.data.add(ref(item))`.  Silently
-/// declines a class with no cache slot, for the same reason
-/// [`weak_cache_contains`] reads one as a miss, and calls the set's own `add`
-/// for the same reason it uses the membership protocol.
+/// `app_abc.py:39-40 SimpleWeakSet.add` — `self.data.add(ref(item, self._remove))`.
+/// Called rather than open-coded so the entry carries the callback that
+/// discards it once the referent dies; a bare `ref` would leave a spent one
+/// behind for every class the check ever saw.
 ///
-/// Upstream's `add` passes `ref()` a callback that discards the entry once the
-/// referent dies; this does not, so a checked class that is later collected
-/// leaves its spent weakref behind as a member.  Such an entry answers no
-/// probe — a weakref compares by referent and this one has none — and it keeps
-/// no class alive, so what it costs is the weakref itself.
+/// Silently declines a class with no collection, for the same reason
+/// [`weak_cache_contains`] reads one as a miss, and one that cannot be
+/// weak-referenced, for the reason [`can_weakref`] records.
 fn weak_cache_add(cls: PyObjectRef, name: &str, item: PyObjectRef) -> Result<(), crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
-    let Some(entry) = class_weakref(item) else {
-        return Ok(());
-    };
-    let entry_slot = roots.publish(&[entry]);
-    let cache = cache_attr(roots.get(cls_slot), name)?;
-    if cache.is_null() || !unsafe { is_set(cache) } {
+    let item_slot = roots.publish(&[item]);
+    if !can_weakref(roots.get(item_slot)) {
         return Ok(());
     }
-    let add = crate::baseobjspace::getattr_str(cache, "add")?;
+    let cache = cache_attr(roots.get(cls_slot), name)?;
+    if cache.is_null() {
+        return Ok(());
+    }
+    let cache_slot = roots.publish(&[cache]);
+    let add = crate::baseobjspace::getattr_str(roots.get(cache_slot), "add")?;
     let add_slot = roots.publish(&[add]);
-    crate::call::call_function_impl_result(roots.get(add_slot), &[roots.get(entry_slot)])?;
+    crate::call::call_function_impl_result(roots.get(add_slot), &[roots.get(item_slot)])?;
     Ok(())
 }
 
-/// The named cache attribute of `cls`, or null when it has none.  Read fresh
-/// at every use: the walks between two reads run arbitrary Python, which can
-/// rebind the attribute and can move the set.
+/// `SimpleWeakSet.clear` (`app_abc.py:43-44`) on the named collection, in
+/// place, so anything already holding it sees the clear.
+fn weak_cache_clear(cls: PyObjectRef, name: &str) -> Result<(), crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.publish(&[cls]);
+    let cache = cache_attr(roots.get(cls_slot), name)?;
+    if cache.is_null() {
+        return Ok(());
+    }
+    let cache_slot = roots.publish(&[cache]);
+    let clear = crate::baseobjspace::getattr_str(roots.get(cache_slot), "clear")?;
+    let clear_slot = roots.publish(&[clear]);
+    crate::call::call_function_impl_result(roots.get(clear_slot), &[])?;
+    Ok(())
+}
+
+/// The named collection attribute of `cls`, or null when it has none.  Read
+/// fresh at every use: the walks between two reads run arbitrary Python, which
+/// can rebind the attribute and can move the object.
 ///
 /// `app_abc.py:110` reads the slot as a plain attribute, so only its absence
 /// is a miss.  A metaclass hook that raises something else raises out of the
@@ -146,17 +154,15 @@ fn negative_cache_version(cls: PyObjectRef) -> Result<u64, crate::PyError> {
 // single registry).
 fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if let Some(&cls) = args.first() {
-        let fresh = w_list_new(vec![]);
-        crate::baseobjspace::setattr_str(cls, "_abc_registry", fresh)?;
-        // `app_abc.py:75-77` — the caches are per-class for the same reason the
-        // registry is: resolved up the MRO, one base's caches would answer for
-        // every descendant ABC, and a hit on `Rational` would satisfy
-        // `Integral`.  Each value is built before the call that stores it, so
-        // that no allocation happens between reading `cls` and using it.
-        let cache = w_set_new();
-        crate::baseobjspace::setattr_str(cls, "_abc_cache", cache)?;
-        let negative_cache = w_set_new();
-        crate::baseobjspace::setattr_str(cls, "_abc_negative_cache", negative_cache)?;
+        // `app_abc.py:74-77` — registry and both caches are per-class for the
+        // same reason: resolved up the MRO, one base's would answer for every
+        // descendant ABC, and a hit on `Rational` would satisfy `Integral`.
+        // Each value is built before the call that stores it, so that no
+        // allocation happens between reading `cls` and using it.
+        for name in ["_abc_registry", "_abc_cache", "_abc_negative_cache"] {
+            let fresh = new_simple_weak_set()?;
+            crate::baseobjspace::setattr_str(cls, name, fresh)?;
+        }
         let version = w_int_new(INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64);
         crate::baseobjspace::setattr_str(cls, "_abc_negative_cache_version", version)?;
         let mut abstract_names = Vec::new();
@@ -239,17 +245,14 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     } else if !crate::baseobjspace::callable_w(subclass) {
         return Err(crate::PyError::type_error("Can only register classes"));
     }
-    let registry = match crate::baseobjspace::getattr_str(cls, "_abc_registry") {
-        Ok(r) if !unsafe { is_none(r) } => r,
-        _ => {
-            let fresh = w_list_new(vec![]);
-            crate::baseobjspace::setattr_str(cls, "_abc_registry", fresh)?;
-            fresh
-        }
-    };
-    unsafe {
-        w_list_append(registry, subclass);
+    // `app_abc.py:99 cls._abc_registry.add(subclass)`.  An ABC that never ran
+    // `_abc_init` has no collection to add to; it gets one here rather than
+    // dropping the registration.
+    if cache_attr(cls, "_abc_registry")?.is_null() {
+        let fresh = new_simple_weak_set()?;
+        crate::baseobjspace::setattr_str(cls, "_abc_registry", fresh)?;
     }
+    weak_cache_add(cls, "_abc_registry", subclass)?;
     // `app_abc.py:100-101` — invalidate every negative cache.  A class this
     // registration now makes a subclass may already be recorded as a non-match
     // somewhere, and only the counter can reach those entries: they live on
@@ -335,7 +338,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     // than trusting any entry in it.
     let counter = INVALIDATION_COUNTER.load(Ordering::Relaxed);
     if negative_cache_version(roots.get(cls_slot))? < counter {
-        let fresh = w_set_new();
+        let fresh = new_simple_weak_set()?;
         crate::baseobjspace::setattr_str(roots.get(cls_slot), "_abc_negative_cache", fresh)?;
         let version = w_int_new(counter as i64);
         crate::baseobjspace::setattr_str(
@@ -380,37 +383,42 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
                 }
             }
         }
-        // _py_abc.py:135-139 — subclass of a registered class (recursive).
-        if let Ok(registry) = crate::baseobjspace::getattr_str(roots.get(cls_slot), "_abc_registry")
-            && !registry.is_null()
-            && unsafe { is_list(registry) }
-        {
+        // `app_abc.py:154-157 for rcls in cls._abc_registry:` — subclass of a
+        // registered class (recursive).  `SimpleWeakSet.__iter__` copies the
+        // set before yielding and skips entries whose referent is gone, so the
+        // walk survives a collection that fires the discard callback partway
+        // through it.
+        let registry = cache_attr(roots.get(cls_slot), "_abc_registry")?;
+        if !registry.is_null() {
             let registry_roots = pyre_object::gc_roots::push_roots();
             let registry_slot = registry_roots.base();
             registry_roots.pin_root(registry);
-            let n = unsafe { w_list_len(registry_roots.get(registry_slot)) };
-            for i in 0..n {
-                if let Some(rcls) =
-                    unsafe { w_list_getitem(registry_roots.get(registry_slot), i as i64) }
-                {
-                    // A registered entry that is not a class cannot be a base
-                    // class, so it can never make `subclass` a subclass — skip
-                    // it rather than letting `issubclass` raise.  `range` is
-                    // registered to `Sequence` but is a builtin function in
-                    // pyre, so without this guard a single bad entry aborts the
-                    // whole recursive check.
-                    if !unsafe { is_type(rcls) } {
-                        continue;
-                    }
-                    let item_roots = pyre_object::gc_roots::push_roots();
-                    let rcls_slot = item_roots.base();
-                    item_roots.pin_root(rcls);
-                    if crate::baseobjspace::issubclass(
-                        roots.get(subclass_slot),
-                        item_roots.get(rcls_slot),
-                    )? {
-                        break 'decide true;
-                    }
+            let iterator = crate::baseobjspace::iter(registry_roots.get(registry_slot))?;
+            let iterator_slot = registry_slot + 1;
+            registry_roots.pin_root(iterator);
+            loop {
+                let rcls = match crate::baseobjspace::next(registry_roots.get(iterator_slot)) {
+                    Ok(rcls) => rcls,
+                    Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+                    Err(err) => return Err(err),
+                };
+                // A registered entry that is not a class cannot be a base
+                // class, so it can never make `subclass` a subclass — skip
+                // it rather than letting `issubclass` raise.  `range` is
+                // registered to `Sequence` but is a builtin function in
+                // pyre, so without this guard a single bad entry aborts the
+                // whole recursive check.
+                if !unsafe { is_type(rcls) } {
+                    continue;
+                }
+                let item_roots = pyre_object::gc_roots::push_roots();
+                let rcls_slot = item_roots.base();
+                item_roots.pin_root(rcls);
+                if crate::baseobjspace::issubclass(
+                    roots.get(subclass_slot),
+                    item_roots.get(rcls_slot),
+                )? {
+                    break 'decide true;
                 }
             }
         }
@@ -457,24 +465,85 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     Ok(verdict)
 }
 
+/// `_abc_instancecheck` (`app_abc.py:108-121`).
+///
+/// The two classes are asked separately because they can differ: `__class__`
+/// is an ordinary attribute an object may answer with something other than its
+/// real type, and a proxy that does so is meant to pass the check for what it
+/// claims to be.  Reading only `type(instance)` would ignore the claim;
+/// reading only `__class__` would let it deny the real one.  A positive cache
+/// hit on the claimed class is taken before the real type is even read, which
+/// is the whole point of inlining the cache check here rather than leaving it
+/// to `__subclasscheck__`.
 fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 2 {
         return Ok(w_bool_from(false));
     }
-    let cls = args[0];
-    let instance = args[1];
-    if unsafe { crate::baseobjspace::isinstance_w(instance, cls) } {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.publish(&[args[0]]);
+    let instance_slot = roots.publish(&[args[1]]);
+
+    // `app_abc.py:111 subclass = instance.__class__`.
+    let subclass = crate::baseobjspace::getattr_str(roots.get(instance_slot), "__class__")?;
+    let subclass_slot = roots.publish(&[subclass]);
+    if weak_cache_contains(roots.get(cls_slot), "_abc_cache", roots.get(subclass_slot))? {
         return Ok(w_bool_from(true));
     }
-    // `type(instance)` — the instance's real class.  User-defined instances
-    // carry the generic layout marker in `ob_type` and the real class in
-    // `w_class`, so reading `ob_type` directly would resolve to `object`;
-    // `r#type` returns the class for both builtin and user instances.
-    let subclass = crate::typedef::r#type(instance).map_or(std::ptr::null_mut(), |p| p.as_ptr());
-    if subclass.is_null() {
+
+    // `app_abc.py:113 subtype = type(instance)` — the instance's real class.
+    // User-defined instances carry the generic layout marker in `ob_type` and
+    // the real class in `w_class`, so reading `ob_type` directly would resolve
+    // to `object`; `r#type` returns the class for both builtin and user
+    // instances.
+    let subtype = crate::typedef::r#type(roots.get(instance_slot))
+        .map_or(std::ptr::null_mut(), |p| p.as_ptr());
+    if subtype.is_null() {
         return Ok(w_bool_from(false));
     }
-    Ok(w_bool_from(subclass_of(cls, subclass)?))
+    let subtype_slot = roots.publish(&[subtype]);
+
+    if std::ptr::eq(roots.get(subtype_slot), roots.get(subclass_slot)) {
+        // `app_abc.py:115-117` — one class, so the negative cache can answer.
+        // The version test is `==`, not `<`: a cache recorded against a
+        // *later* counter than the one read here cannot describe this
+        // registry either.
+        if negative_cache_version(roots.get(cls_slot))?
+            == INVALIDATION_COUNTER.load(Ordering::Relaxed)
+            && weak_cache_contains(
+                roots.get(cls_slot),
+                "_abc_negative_cache",
+                roots.get(subclass_slot),
+            )?
+        {
+            return Ok(w_bool_from(false));
+        }
+        return Ok(w_bool_from(subclasscheck_of(
+            roots.get(cls_slot),
+            roots.get(subclass_slot),
+        )?));
+    }
+    // `app_abc.py:121 any(cls.__subclasscheck__(c) for c in (subclass, subtype))`.
+    for slot in [subclass_slot, subtype_slot] {
+        if subclasscheck_of(roots.get(cls_slot), roots.get(slot))? {
+            return Ok(w_bool_from(true));
+        }
+    }
+    Ok(w_bool_from(false))
+}
+
+/// `cls.__subclasscheck__(subclass)` through attribute lookup, the way
+/// `app_abc.py:118` and `:121` spell it, so an `ABCMeta` subclass that
+/// overrides the hook is the one that answers.
+fn subclasscheck_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.publish(&[cls]);
+    let subclass_slot = roots.publish(&[subclass]);
+    let check = crate::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasscheck__")?;
+    let check_slot = roots.publish(&[check]);
+    let result =
+        crate::call::call_function_impl_result(roots.get(check_slot), &[roots.get(subclass_slot)])?;
+    let result_slot = roots.publish(&[result]);
+    crate::baseobjspace::is_true(roots.get(result_slot))
 }
 
 fn subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -491,7 +560,7 @@ fn subclasscheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// an outstanding `get_cache_token` survives a registry reset.
 fn reset_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if let Some(&cls) = args.first() {
-        crate::baseobjspace::setattr_str(cls, "_abc_registry", w_list_new(vec![]))?;
+        weak_cache_clear(cls, "_abc_registry")?;
     }
     Ok(w_none())
 }
@@ -506,13 +575,40 @@ fn reset_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn reset_caches(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if let Some(&cls) = args.first() {
         for name in ["_abc_cache", "_abc_negative_cache"] {
-            let cache = cache_attr(cls, name)?;
-            if !cache.is_null() && unsafe { is_set(cache) } {
-                unsafe { w_set_clear(cache) };
-            }
+            weak_cache_clear(cls, name)?;
         }
     }
     Ok(w_none())
+}
+
+/// `_abc._get_dump(cls)` (`app_abc.py:165-173`): shallow copies of the
+/// registry, both caches, and the negative-cache version.  The three sets are
+/// the collections' own `data`, which is why they are `SimpleWeakSet`s and not
+/// bare sets — `ABC._dump_registry` prints what this returns.
+fn get_dump(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&cls) = args.first() else {
+        return Ok(w_tuple_new(vec![]));
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.publish(&[cls]);
+    let mut items = Vec::with_capacity(4);
+    for name in ["_abc_registry", "_abc_cache", "_abc_negative_cache"] {
+        let cache = cache_attr(roots.get(cls_slot), name)?;
+        // A class that never ran `_abc_init` has nothing to describe; an empty
+        // set keeps the tuple's shape rather than raising at a debug helper.
+        let data = if cache.is_null() {
+            w_set_new()
+        } else {
+            let cache_slot = roots.publish(&[cache]);
+            crate::baseobjspace::getattr_str(roots.get(cache_slot), "data")?
+        };
+        roots.publish(&[data]);
+        items.push(data);
+    }
+    items.push(w_int_new(
+        negative_cache_version(roots.get(cls_slot))? as i64
+    ));
+    Ok(w_tuple_new(items))
 }
 
 crate::py_module! {
@@ -523,8 +619,20 @@ crate::py_module! {
         "_abc_register"       / 2 = register,
         "_abc_instancecheck"  / 2 = instancecheck,
         "_abc_subclasscheck"  / 2 = subclasscheck,
-        "_get_dump"           / 1 = |_| Ok(w_tuple_new(vec![])),
+        "_get_dump"           / 1 = get_dump,
         "_reset_registry"     / 1 = reset_registry,
         "_reset_caches"       / 1 = reset_caches,
+    },
+    extra_init: |ns| {
+        crate::importing::appleveldef_install_seeded(
+            ns,
+            include_str!("app_abc.py"),
+            "app_abc.py",
+            &["SimpleWeakSet"],
+            &[],
+        );
+        let simple_weak_set = crate::module_ns_get(ns, "SimpleWeakSet")
+            .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
+        let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
     },
 }
