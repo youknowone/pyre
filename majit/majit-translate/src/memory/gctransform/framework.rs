@@ -116,6 +116,47 @@ impl CallGraph {
         out
     }
 
+    /// A shortest call chain from `from` down to one of `seeds`, as names.
+    ///
+    /// A reachability verdict is only as good as the path behind it, and a
+    /// path through an error-formatting helper is a very different claim from
+    /// one through a dunder invocation.  Adjudicating a finding means reading
+    /// this, not trusting the bit.
+    pub fn path_to(&self, from: u64, seeds: &HashSet<u64>) -> Option<Vec<String>> {
+        let mut prev: HashMap<u64, u64> = HashMap::new();
+        let mut seen: HashSet<u64> = HashSet::from([from]);
+        let mut queue: std::collections::VecDeque<u64> = std::collections::VecDeque::from([from]);
+        while let Some(cur) = queue.pop_front() {
+            if seeds.contains(&cur) {
+                let mut chain = vec![cur];
+                let mut walk = cur;
+                while let Some(&up) = prev.get(&walk) {
+                    chain.push(up);
+                    walk = up;
+                }
+                chain.reverse();
+                return Some(
+                    chain
+                        .into_iter()
+                        .map(|id| {
+                            self.names
+                                .get(&id)
+                                .map(|n| n.rsplit("::").take(2).collect::<Vec<_>>().join("::"))
+                                .unwrap_or_else(|| format!("#{id}"))
+                        })
+                        .collect(),
+                );
+            }
+            for &down in self.callees.get(&cur).into_iter().flatten() {
+                if seen.insert(down) {
+                    prev.insert(down, cur);
+                    queue.push_back(down);
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve the configured seed patterns against the real name table.
     pub fn seeds_for(&self, patterns: &[&str]) -> (HashSet<u64>, Vec<String>) {
         let mut ids = HashSet::new();

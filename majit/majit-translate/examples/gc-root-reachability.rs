@@ -182,6 +182,36 @@ fn main() {
                 );
             }
         }
+        // Tier 1.5: not a direct dispatch seed, but a live pointer that this
+        // body later hands to a `list`/`dict` accessor — the shape both
+        // confirmed defects in `list.index` and `mul` had.
+        let mut tier15: Vec<&liveness::Finding> = found
+            .iter()
+            .filter(|f| !seeds.contains(&f.callee_id) && !f.movable_use.is_empty())
+            .collect();
+        tier15.sort_by(|a, b| a.func_name.cmp(&b.func_name).then(a.line.cmp(&b.line)));
+        let t15_fns: std::collections::BTreeSet<&str> =
+            tier15.iter().map(|f| f.func_name.as_str()).collect();
+        println!(
+            "       tier 1.5 (live ptr later addressed as list/dict): {} call(s) in {} fn(s)",
+            tier15.len(),
+            t15_fns.len()
+        );
+        if std::env::var("GC_LIVENESS_TIER15").is_ok() {
+            for f in &tier15 {
+                println!(
+                    "           {}:{}  across {}  movable-use: {:?}",
+                    f.func_name,
+                    f.line,
+                    f.callee_name.rsplit("::").next().unwrap_or(""),
+                    f.movable_use
+                );
+                match cg.path_to(f.callee_id, &seeds) {
+                    Some(chain) => println!("               path: {}", chain.join(" -> ")),
+                    None => println!("               path: (none — reached only via a seed alias)"),
+                }
+            }
+        }
         let show: usize = std::env::var("GC_LIVENESS_SHOW")
             .ok()
             .and_then(|v| v.parse().ok())

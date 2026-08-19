@@ -37,6 +37,28 @@ pub struct Finding {
     pub live_non_arg: Vec<String>,
     /// Live across the call because the call itself takes them.
     pub live_arg: Vec<String>,
+    /// Of the live pointers, those the function later hands to a callee whose
+    /// name says it addresses a `list` or a `dict` — the only two kinds whose
+    /// header a minor collection relocates.  A stale pointer that is only
+    /// stored or returned is a different (and rarer) problem; this column is
+    /// where a stale pointer is actually dereferenced as a movable object.
+    pub movable_use: Vec<String>,
+}
+
+/// Callee names that address a `list` or a `dict` through the pointer.
+fn addresses_movable(name: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "w_list_",
+        "w_dict_",
+        "list_concat",
+        "list_repeat",
+        "sequence_repeat",
+        "require_list",
+        "require_dict",
+        "dict_method_",
+        "list_method_",
+    ];
+    MARKERS.iter().any(|m| name.contains(m))
 }
 
 fn ty_id(t: &TyRef) -> Option<u64> {
@@ -267,6 +289,35 @@ pub fn scan(
                 .collect();
             non_arg.sort();
             in_arg.sort();
+            // Does any live pointer reach a list/dict-addressing callee later
+            // in this body?  Scanning the whole function rather than only the
+            // dominated successors keeps this a ranking signal, not a proof.
+            let mut movable_use: Vec<String> = Vec::new();
+            for other in &body.body {
+                let Ok(TermKind::Call { call: c2, .. }) = other.term() else {
+                    continue;
+                };
+                let CallFunc::Regular(r2) = &c2.func else {
+                    continue;
+                };
+                let CallKind::Fun(FunId::Regular { id: cid }) = &r2.kind else {
+                    continue;
+                };
+                if !cg.names.get(cid).is_some_and(|n| addresses_movable(n)) {
+                    continue;
+                }
+                let mut used = HashSet::new();
+                for a in &c2.args {
+                    use_operand(a, &mut used);
+                }
+                for l in after.iter().filter(|l| used.contains(l)) {
+                    let nm = gc_locals[l].clone();
+                    if !movable_use.contains(&nm) {
+                        movable_use.push(nm);
+                    }
+                }
+            }
+            movable_use.sort();
             findings.push(Finding {
                 func: id,
                 func_name: fd.item_meta.name_path(),
@@ -278,6 +329,7 @@ pub fn scan(
                 callee_name: cg.names.get(callee).cloned().unwrap_or_default(),
                 live_non_arg: non_arg,
                 live_arg: in_arg,
+                movable_use,
             });
         }
     }
