@@ -11270,8 +11270,23 @@ impl CodeWriter {
 
                             // True consumes StopIteration and converges on the
                             // existing exhaustion split with a NULL next result.
-                            let mut stop_match_args =
-                                stop_match_state.getoutputargs(&current_state);
+                            //
+                            // The last two `mergeable()` entries are the
+                            // `last_exception` pair, so taking them from the
+                            // catch state would hand the successor the
+                            // StopIteration this edge just consumed.  A
+                            // FOR_ITER inside an `except` body runs with the
+                            // handled exception live in that pair, and the
+                            // bare-`raise` lowering re-raises it directly when
+                            // the PC is not itself catch-covered.  Carry the
+                            // enclosing pair across instead: after exhaustion
+                            // the frame's exception state is what it was before
+                            // the loop.
+                            let mut matched_source = stop_match_state.clone();
+                            matched_source
+                                .last_exception
+                                .clone_from(&current_state.last_exception);
+                            let mut stop_match_args = matched_source.getoutputargs(&current_state);
                             stop_match_args.push(null_stack_sentinel());
                             let matched_link = super::flow::Link::new(
                                 stop_match_args,
