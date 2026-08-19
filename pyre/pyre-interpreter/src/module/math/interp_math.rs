@@ -748,6 +748,14 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     };
     let rel_tol = read("rel_tol")?;
     let abs_tol = read("abs_tol")?;
+    // `interp_math.py:703-705` — the sanity check on the tolerances runs
+    // before the comparison and names them.  `pymath` reports the same
+    // rejection as EDOM, which `map_int_err` relabels "math domain error".
+    if rel_tol.is_some_and(|t| t < 0.0) || abs_tol.is_some_and(|t| t < 0.0) {
+        return Err(crate::PyError::value_error(
+            "tolerances must be non-negative",
+        ));
+    }
     match pymath::math::isclose(
         try_get_double(pos[0])?,
         try_get_double(pos[1])?,
@@ -888,8 +896,28 @@ fn get_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
     ))
 }
 
+/// `space.abs(space.index(w))` in the machine-word domain.  `None` is
+/// `interp_math.py:753`'s `except OverflowError` direction, which replays the
+/// pair in the rbigint domain: `is_long` values never fit, and `i64::MIN` is
+/// the one machine int whose absolute value leaves the range.
+fn index_abs_machine_word(obj: PyObjectRef) -> Option<i64> {
+    if !unsafe { pyre_object::is_int(obj) } {
+        return None;
+    }
+    unsafe { pyre_object::w_int_get_value(obj) }.checked_abs()
+}
+
 pub fn gcd(args: &[PyObjectRef]) -> PyResult {
     let args = no_keywords(args, "gcd")?;
+    // `interp_math.py:747 gcd_two` reads both operands as Signed and only
+    // falls back to rbigint when one overflows.  Taking the pair through
+    // `get_bigint` unconditionally allocates five digit blocks and runs a
+    // divmod to reduce two machine words.
+    if let [a, b] = args
+        && let (Some(a), Some(b)) = (index_abs_machine_word(*a), index_abs_machine_word(*b))
+    {
+        return Ok(w_int_new(majit_rlib::rbigint::gcd_binary(a, b)));
+    }
     // RPython's GC transform roots this running rbigint across the next
     // argument's potentially user-defined `__index__` call.
     let mut result = RBigIntGcRoot::new(BigInt::zero());

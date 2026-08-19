@@ -5468,7 +5468,7 @@ fn parse_string_from_binary_base(
 
 /// rbigint.py `gcd_binary`.
 #[majit_macros::jit_elidable]
-fn gcd_binary(mut a: i64, mut b: i64) -> i64 {
+pub fn gcd_binary(mut a: i64, mut b: i64) -> i64 {
     debug_assert!(a >= 0 && b >= 0);
     if a == 0 {
         return b;

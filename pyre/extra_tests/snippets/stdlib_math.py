@@ -336,3 +336,46 @@ assert math.floor(FloatLike(41.9)) == 41
 assert math.ceil(FloatLike(42.5)) == 43
 assert type(math.floor(FloatLike(41.9))) is int
 assert_raises(TypeError, lambda: math.trunc(FloatLike(23.5)))
+
+
+# gcd reduces a pair of machine words without going through rbigint.  The
+# machine-word arm must decline where |x| leaves the signed range, must read a
+# bool and an int subclass as their raw value, and must never return the
+# operand object itself.
+_MIN64 = -(2**63)
+assert math.gcd(_MIN64, 0) == 2**63
+assert math.gcd(_MIN64, 6) == 2
+assert math.gcd(_MIN64, _MIN64) == 2**63
+assert math.gcd(True, False) == 1
+assert type(math.gcd(True, False)) is int
+assert math.gcd(-120, 84) == 12
+
+
+class _IndexingInt(int):
+    def __index__(self):
+        return 99
+
+
+class _AbsingInt(int):
+    def __abs__(self):
+        return 7
+
+
+assert math.gcd(_IndexingInt(10), 4) == 2
+assert math.gcd(_AbsingInt(-10), 4) == 2
+
+
+# The tolerance sanity check names the tolerances rather than reporting the
+# generic domain error the underlying comparison raises.
+assert_raises(
+    ValueError,
+    lambda: math.isclose(1, 2, rel_tol=-1),
+    _msg="tolerances must be non-negative",
+)
+assert_raises(
+    ValueError,
+    lambda: math.isclose(1, 2, abs_tol=-1),
+    _msg="tolerances must be non-negative",
+)
+assert math.isclose(1.0, 1.0 + 1e-12)
+assert not math.isclose(1.0, 2.0)
