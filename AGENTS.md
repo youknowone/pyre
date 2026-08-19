@@ -1,311 +1,217 @@
 # AGENTS.md
 
-## How pyre's JIT is built: meta-tracing by source translation
+## The JIT is generated from the interpreter source
 
-pyre is structured like PyPy. `pyre-interpreter` is the Rust interpreter (the
-analog of PyPy's RPython interpreter). **The JIT is not hand-written** —
-`majit-translate` reads the interpreter's Rust source and *generates* it:
-`front/ast.rs` (parse) → `flowspace/` (flow-graph build, the
-`flowcontext.py`/`framestate.py` analog) → `annotator/` (`annrpython.py` type
-inference) → `rtyper/` (low-level lowering) → `codewriter/`
-(`jtransform.py`/`codewriter.py`, emits JitCode). This is the same pipeline
-RPython's translator + `jtransform` run over PyPy's interpreter.
+pyre is structured like PyPy: `pyre-interpreter` is the RPython-interpreter
+analog, and **the JIT is not hand-written**. `majit-translate` reads the
+interpreter's Rust source and generates it — `front/ast.rs` (parse) →
+`flowspace/` (`flowcontext.py`/`framestate.py`) → `annotator/` (`annrpython.py`)
+→ `rtyper/` → `codewriter/` (`jtransform.py`/`codewriter.py`, emits JitCode) —
+the same pipeline RPython's translator runs over PyPy.
 
-**Consequence — "Rust can't be meta-traced" is never a valid excuse for a
-deviation.** Generating the JIT from the interpreter source *is* meta-tracing,
-by the same principle: whatever semantics the interpreter source expresses is
-what the generated JIT must preserve. A JIT that diverges from the
-interpreter's behavior has a *generation defect to fix*, not an inherent
-limitation of "the JIT is Rust, not Python." Do not justify a mismatch by
-appeal to the implementation language.
+**So "Rust can't be meta-traced" is never a valid excuse for a deviation.**
+Whatever the interpreter source expresses is what the generated JIT must
+preserve; a JIT that diverges from the interpreter has a generation defect to
+fix. Never justify a mismatch by appeal to the implementation language.
 
-### Frame identity must be preserved per frame
+### One red frame per frame
 
-PyPy keeps one frame object per inlined Python call — `MIFrame` while tracing,
-`BlackholeInterpreter` on resume — each carrying its own
-`jitcode → pycode → w_globals → locals`. `LOAD_GLOBAL` reads
-`self.get_w_globals()` off the *live* frame (`pyframe.py:128-132`:
-`jit.promote(self.pycode).w_globals`); guard-failure resume rebuilds one frame
-per encoded jitcode header (`resume.py:1042-1057`). Caller/callee namespace
-confusion is therefore *impossible* — there is no shared frame slot.
+PyPy keeps one frame object per inlined Python call (`MIFrame` tracing,
+`BlackholeInterpreter` resuming), each with its own
+`jitcode → pycode → w_globals → locals`. `LOAD_GLOBAL` reads it off the *live*
+frame (`pyframe.py` `get_w_globals`); resume rebuilds one frame per encoded
+jitcode header (`resume.py` `rebuild_from_resumedata`). No shared frame slot
+exists, so namespace confusion is impossible.
 
-The frame is the interpreter loop's single **red** input; `pycode` is the
-**green**. The generated per-code jitcode must thread that red frame for
-**every** frame, including inlined non-portal callees. Collapsing inlined
-callees onto a single shared anchor (one `portal_frame_reg`, or a single
-bridge-resume root frame) drops the callee's own pycode/globals/locals and
-makes a cross-module `LOAD_GLOBAL` resolve against the *caller's* globals.
-This whole class of bug (the pycode-`names` miscompile, the LOAD_GLOBAL
-namespace mismatch, bridge-resume inline-frame globals, vable-resident root
-locals) is one root cause — a *frame-identity collapse*. Fix it by restoring
-the per-frame red frame (converging on RPython's 1-red-arg frame shape), never
-by baking a single anchor's value as a constant.
+The frame is the loop's single **red** input, `pycode` the **green**. Thread
+that red frame through **every** frame, inlined non-portal callees included.
+Collapsing callees onto one anchor (a single `portal_frame_reg`, a single
+bridge-resume root frame) drops the callee's own pycode/globals/locals — the one
+root cause behind the pycode-`names` miscompile, the LOAD_GLOBAL namespace
+mismatch, bridge-resume inline-frame globals and vable-resident root locals. Fix
+it by restoring the per-frame red frame, never by baking an anchor's value as a
+constant.
 
-## Charon LLBC extraction — the prepass/census input
+## Charon LLBC extraction — the prepass input
 
-The annotator/rtyper prepass (and the `PYRE_RTYPER_VERBOSE` census) does **not**
-read the interpreter's Rust source directly — it reads pre-extracted Charon
-`.ullbc` artefacts under `build/llbc/*.ullbc`. **These are frozen snapshots: a
-change to `pyre-interpreter` / `pyre-object` / `pyre-jit` *source* is invisible
-to the prepass until the `.ullbc` is re-extracted.** Only `majit-translate`
-(translator) changes take effect without re-extraction, because the translator
-runs live over the frozen `.ullbc` bodies.
+The annotator/rtyper prepass and the `PYRE_RTYPER_VERBOSE` census read
+**pre-extracted `.ullbc` under `build/llbc/`, not the Rust source**. A change to
+`pyre-interpreter` / `pyre-object` / `pyre-jit` is invisible until re-extraction;
+`majit-translate` changes take effect immediately, because the translator runs
+live over the frozen bodies.
 
-Charon is a **shared, pre-installed** dependency — it lives in the communal
-build cache (`../.pyre-build/charon/<platform>/charon`, pinned
-`nightly-2026.05.29`), **not** on `PATH`. So `which charon` finds nothing, yet
-the scripts below work because they resolve that cache path directly. Do **not**
-conclude "charon is missing" from `which charon`; check
-`../.pyre-build/charon/<platform>/` (override with `PYRE_SHARED_BUILD` /
-`CHARON_DEST`).
-
-Two scripts manage this (both `python3`, run from repo root):
-
-- **`scripts/install-charon.py`** — fetch/build the pinned Charon into the
-  shared cache. Idempotent: prints "already installed" and exits if the stamped
-  version matches. Usually a no-op since the cache is communal.
-- **`scripts/extract-llbc.py [crates…]`** — (re)extract `.ullbc`. No args ⇒
-  `DEFAULT_CRATES` (`pyre-object pyre-interpreter pyre-jit`); known crates are
-  `corpus pyre-object pyre-module pyre-interpreter pyre-jit`. It has
-  **source-fingerprint skip logic**: a crate whose tracked source is unchanged
-  prints `=== skipping <crate> … (fingerprint unchanged) ===` and is *not*
-  rewritten. Force a full rebuild with `--force` (or `LLBC_FORCE_REEXTRACT=1`).
-  `pyre-interpreter.ullbc` is ~300 MB and a forced re-extract takes minutes.
-
-  While extracting `pyre-jit.ullbc`, the shared extraction driver sets the
-  internal `MAJIT_LLBC_EXTRACTION=1` mode. This breaks the
-  `pyre-jit → pyre-jit-trace → pyre-jit.ullbc` bootstrap cycle by making
-  `pyre-jit-trace/build.rs` emit compile-only placeholder artifacts. Do not set
-  this variable for ordinary builds: the placeholders contain no usable JIT
-  metadata. `cargo::rerun-if-env-changed` makes the next normal build replace
-  them with artifacts generated from the completed LLBC set.
+Charon is shared and pre-installed at `../.pyre-build/charon/<platform>/charon`
+(pinned `nightly-2026.05.29`), **not on `PATH`** — `which charon` finding nothing
+does not mean it is missing.
 
 ```bash
-python3 scripts/install-charon.py                 # ensure charon (usually no-op)
-python3 scripts/extract-llbc.py                   # re-extract the 3 default crates
-```
-
-After re-extraction, **rebuild the prepass** to re-run it against the new
-`.ullbc`, then bucket the census:
-
-```bash
+python3 scripts/install-charon.py    # idempotent, usually a no-op
+python3 scripts/extract-llbc.py      # pyre-object pyre-interpreter pyre-jit
 touch pyre/pyre-jit-trace/build.rs
-PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # build.rs runs the prepass
-# newest stderr: target/release/build/pyre-jit-trace-*/stderr
-#   rg -c 'PREPASS phaseA fail' <stderr>   # / phaseB
+PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # runs the prepass
+# census: target/release/build/pyre-jit-trace-*/stderr, rg -c 'PREPASS phaseA fail'
 ```
 
-So: interpreter-source work that should move the census ⇒ `extract-llbc.py`
-first, then the prepass rebuild. Translator-only work ⇒ just the prepass
-rebuild. (`rg` note: a stray `--replace` in user config can mangle these long
-lines, e.g. `GcType`→`n`; pass `rg --no-config` when bucketing.)
+- `extract-llbc.py` **skips** a crate whose source fingerprint is unchanged;
+  `--force` / `LLBC_FORCE_REEXTRACT=1` overrides. `pyre-interpreter.ullbc` is
+  ~300 MB and takes minutes.
+- It internally sets `MAJIT_LLBC_EXTRACTION=1` to break the
+  `pyre-jit → pyre-jit-trace → pyre-jit.ullbc` bootstrap cycle, which makes
+  `build.rs` emit placeholder artifacts. Never set it for an ordinary build.
+- Interpreter-source work ⇒ re-extract, then rebuild the prepass.
+  Translator-only work ⇒ prepass rebuild alone.
+- `rg` note: a stray `--replace` in user config mangles long lines; pass
+  `rg --no-config` when bucketing.
+
+## The wasm gate runs on every OS
+
+Its only prerequisite beyond the native backends is the
+`wasm32-unknown-unknown` target — wasmtime is linked into `pyre-wasm-runner`,
+and the guest builds on stable with no `-Z build-std`. Once the target is
+installed `DEFAULT_BACKENDS` **adds wasm by itself**, so a bare
+`python3 pyre/check.py` runs three backends and `--backend dynasm,cranelift`
+*narrows* it.
+
+CI installs that target on the ubuntu leg alone because wasm output is
+platform-independent — **a cost decision, not a capability limit.** Never defer
+a wasm-only failure to CI on the grounds that the host cannot reproduce it.
 
 ## Data structure parity with RPython/PyPy
 
-**Treat every `HashMap` and every thread-local (`thread_local!`, TLS) as
-suspicious when porting RPython/PyPy code.** Find the corresponding PyPy or
-RPython owner and storage shape before choosing a Rust container or lifetime.
+majit and pyre are line-by-line ports, so the container choice is part of the
+port. **Treat every `HashMap` and every `thread_local!` as suspicious**: find the
+upstream owner and storage shape first.
 
-majit and pyre are line-by-line ports. The data structure choice is part of
-the port — it must match what RPython/PyPy actually uses, even when a Rust
-collection looks more convenient.
+1. **Look up the upstream attribute before choosing a container.** A Rust
+   `HashMap` is not the default translation of a Python `dict` — over a
+   small/dense key space, or where insertion order or index lookup suffices,
+   `VecMap` / `IndexMap` / `Vec` is closer. Prove the semantics from upstream.
+2. **Side-tables are usually wrong.** RPython stores per-box information *on the
+   box* (`box._forwarded`, `PtrInfo`, `IntBound`, descr attributes). Reaching for
+   `HashMap<OpRef, _>` means you skipped that machinery; route through
+   `OptContext::with_intbound_mut` / `set_ptr_info` instead.
+3. **A borrow-checker workaround** is acceptable only when every alternative was
+   tried, the deviation is minimal, and a comment cites the RPython original.
+4. **Do not delete an RPython method to "simplify".** If `optimizer.py` has
+   `ensure_ptr_info_arg0`, the port has it — the shortcut diverges, and the next
+   porter's `heap.py` port stops compiling for no visible reason.
+5. **TLS is almost never the right owner.** Type objects, module state,
+   registries and semantic caches are process-global or interpreter-owned in
+   PyPy and stay shared here; never duplicate them per thread to satisfy `Sync`.
+   TLS is right only where upstream makes the state itself thread-specific
+   (current thread/execution context, errno) or for a disposable cache that
+   cannot affect identity, semantics, lifetime or GC reachability. Anything else
+   needs an upstream citation in the code.
 
-### Rules
+The measured cascade this prevents: deleting `ensure_ptr_info_arg0` for a
+side-table `OptHeap.array_min_lengths` left `postprocess_arraylen_gc` unable to
+read it, so it was crippled to a hardcoded `IntBound::nonnegative()`, which then
+forced a parallel `ExportedValueInfo::int_lower_bound`. One non-orthodox
+`HashMap`, four files of divergence.
 
-1. **Look up the RPython/PyPy source first.** Before adding `HashMap`, `HashSet`,
-   `BTreeMap`, etc., find the corresponding RPython attribute and check what
-   container it uses (`dict`, `list`, an attribute on a class instance, a
-   field on `_forwarded`, …). Port that exact shape.
+## The PyPy oracle: run it before arguing about orthodoxy
 
-   A Rust `HashMap` is not the default translation of a Python `dict`. When
-   lookup is over a small/dense key space, stable insertion order matters, or
-   identity/index lookup is sufficient, `VecMap`, `IndexMap`, or an ordinary
-   `Vec` is often the closer representation. Prove the required semantics from
-   the upstream code before choosing among them.
+`rpython/` says what upstream *claims*; a real `pypy3` shows what it *does*. For
+"is this orthodox or our deviation?", run the oracle **first** — before reading
+source, forming a theory, or recording a verdict.
 
-2. **Side-tables are usually wrong.** RPython optimizers store information
-   *on the box itself* via `box._forwarded` / `PtrInfo` / `IntBound` /
-   descr attributes. If you find yourself reaching for
-   `HashMap<OpRef, Something>` to track a per-box property, that is almost
-   always a sign you skipped the proper PtrInfo / forwarded slot and are
-   inventing a parallel store that RPython does not have. Stop and route
-   the data through the existing forwarded/PtrInfo machinery instead.
-
-3. **Borrow-checker workarounds must be minimal and documented.** A
-   `HashMap` introduced purely because the borrow checker rejected a more
-   direct port is acceptable only when (a) every alternative has been
-   tried, (b) the deviation is the smallest possible, and (c) a comment
-   cites the RPython original it stands in for. See the
-   "RPython Parity Rules" section below.
-
-4. **Removing an RPython method to "simplify" things is not allowed.**
-   If `optimizer.py` defines `ensure_ptr_info_arg0`, the Rust port has
-   `ensure_ptr_info_arg0`. Do not delete it because callers can be
-   rewritten to a shortcut — the shortcut diverges from RPython and the
-   next porter will have no idea why their `heap.py` line-by-line port
-   no longer compiles.
-
-5. **TLS is almost never the right owner for runtime state.** Type objects,
-   module state, registries, semantic caches, and any value whose identity or
-   contents must be visible across threads are process-global or
-   interpreter-owned in PyPy and must remain shared in pyre. Never duplicate
-   them per thread merely to make a raw pointer satisfy Rust's `Sync` rules;
-   use the proper global/interpreter owner (for example the established
-   process-global immortal-type `OnceLock<usize>` pattern) and preserve GC
-   rooting as required.
-
-   TLS is acceptable only when the PyPy/RPython source makes the state itself
-   thread-specific (for example the current thread/execution context or errno),
-   or for a disposable temporary cache that cannot affect observable identity,
-   semantics, lifetime, or GC reachability. Every other TLS use requires an
-   upstream citation and a written justification in the code. When in doubt,
-   assume TLS is wrong and find the shared owner.
-
-### Why
-
-We have already been bitten by this. A previous change deleted
-`ensure_ptr_info_arg0` and replaced `arrayinfo.lenbound.make_gt_const(...)`
-with a side-table `OptHeap.array_min_lengths: HashMap<OpRef, i64>`. The
-side-table then could not be read by `postprocess_arraylen_gc`, so that
-function was crippled to a hardcoded `IntBound::nonnegative()`, which then
-forced `ExportedValueInfo` to grow a parallel `int_lower_bound` field.
-One non-orthodox `HashMap` cascaded into four files of divergence from
-RPython. Don't start the cascade.
-
-### When in doubt
-
-Grep RPython:
-
-```
-rg -t py 'lenbound|getlenbound|_x86_arglocs|_ll_loop_code' rpython/jit/
+```bash
+PYPYLOG=jit-summary:- pypy3 pyre/bench/synth/<fixture>.py    # vs MAJIT_STATS=1
 ```
 
-For a *behavioural* question rather than a structural one — "does upstream
-really do this?" — grepping is the second step; see "The PyPy oracle" below.
+Most `pyre/bench/synth` fixtures need no stdlib, so this costs one command. Read
+`Total # of loops`/`bridges`, `forcings`, `virtualizables forced`, every
+`abort: *`, `nvirtuals`. **A differing counter is a pointer, not the answer** —
+find the upstream line behind it, usually a single JIT hint
+(`@jit.look_inside_iff`, `dont_look_inside`, `elidable`, `unroll_safe`), and cite
+it. `PYPYLOG=jit-log-opt:FILE` dumps the optimized trace when the summary is too
+coarse. `pypy3` is 3.11, so trim newer syntax out of the fixture.
 
+This overturned a weeks-old "unfixable by construction" verdict on
+`getframe_inline_subwalk_multiframe` in one command: the oracle reported
+`forcings: 0`, and the `@jit.look_inside_iff` on `getframe`
+(`pypy/module/sys/vm.py`) named the reason.
 
-### Workflow guideline
+## Spec follows CPython 3.14t; engineering follows PyPy
 
-If RPython stores it on an object attribute, store it on the equivalent
-Rust struct field. If RPython stores it on `box._forwarded`, route it
-through `OptContext::with_intbound_mut` / `set_ptr_info` / etc. Reach
-for `HashMap` only after you have proven that RPython itself uses a
-dict-like container in that exact spot. Apply the same test to TLS: locate the
-upstream owner, then preserve whether it is global, interpreter-local,
-execution-context-local, or genuinely thread-local.
+**Pursue PyPy parity to the extreme as engineering, and CPython 3.14t as spec;
+where they collide, take the 3.14t behaviour and engineer it the way PyPy
+would.** Neither goal yields wholesale — the axis decides which one governs the
+line in front of you.
 
-## The PyPy oracle: run it before you argue about orthodoxy
+The `t` is the **free-threaded** build: "CPython does X" is an answer only once X
+holds without the GIL. Correct-because-a-global-lock-serialises-it is not
+on-spec.
 
-Reading `rpython/` tells you what upstream *says*. Running a real `pypy3` tells
-you what upstream *does*. When the question is "is this JIT behaviour orthodox,
-or is it our deviation?", run the oracle FIRST — before reading source, before
-forming a theory, and certainly before recording a verdict.
-
-```
-PYPYLOG=jit-summary:- pypy3 pyre/bench/synth/<fixture>.py
-```
-
-Most `pyre/bench/synth` fixtures use no stdlib and run unmodified under the
-real interpreter, so this costs one command. Read these keys: `Total # of
-loops` / `Total # of bridges`, `forcings`, `virtualizables forced`, every
-`abort: *`, `nvirtuals`. Compare against `MAJIT_STATS=1` on the same file.
-
-**A counter that differs is a pointer, not the answer.** Go find the upstream
-line that produces it — the decision is usually one JIT hint
-(`@jit.look_inside_iff`, `@jit.dont_look_inside`, `@jit.elidable`,
-`@jit.unroll_safe`) sitting on the function in question. Cite it. If the
-summary is too coarse, `PYPYLOG=jit-log-opt:FILE` dumps the optimized trace.
-
-Worked example (2026-08-03). `getframe_inline_subwalk_multiframe` failed 8948
-GUARD_NOT_FORCED, and the standing conclusion was "a GUARD_NOT_FORCED never
-compiles a bridge (`compile.py:950-953`), so this is unfixable by construction."
-The oracle reported one loop, no bridges, **`forcings: 0`**, **`virtualizables
-forced: 0`**, no aborts — PyPy never forces here at all, so the guard should not
-exist. `pypy/module/sys/vm.py:41` then names the decision in one line:
-`@jit.look_inside_iff(lambda space, depth: jit.isconstant(depth))` on
-`getframe`, which pyre folds into a single opaque builtin. A verdict that had
-stood for weeks was overturned, and an unbounded "epic" turned into a named
-port, by one command. Note also `pypy3` is 3.11 — a fixture using newer syntax
-needs trimming to the subset that runs.
-
-## Spec follows CPython 3.14; implementation follows PyPy
-
-Standing ruling: **pyre's *implementation* is a port of PyPy; pyre's *spec* —
-what a Python program can observe — is CPython 3.14.** A behavioural difference
-from PyPy is a parity regression **unless** a CPython 3.14 artefact shows PyPy is
-wrong about what the caller observes. Then it is a spec fix, and PyPy's shape
-still governs every other line on the way there.
-
-**This is not a 3.11-vs-3.14 question, and reading it as one is why the same
-findings get re-filed every review cycle.** Of seven adjudicated cases, six have
-no version delta at all: `sched_setscheduler` has returned None since 3.3,
-`PyUnicode_FSConverter` has accepted bytes since 3.3, PEP 529 surrogatepass is
-3.6, `DirEntry` has cached its `stat_result` since PEP 471. These are standing
-PyPy-vs-CPython divergences, not PyPy lagging a release. "3.14" pins *which*
-CPython you read (`lib-python/stdlib-version.txt`); it does not narrow the rule
-to version lag, and the absence of a delta is not grounds to refuse the
-exception. Conversely a real delta earns nothing on its own.
-
-**What the spec governs** is only what a caller can observe: a return value, an
-exception's type / message / attributes, object identity, an
-encoding-and-errors contract, and which argument shapes are accepted or
-rejected. Everything else follows PyPy **unconditionally** — names, module
+**The spec governs only what a caller can observe** — return value, exception
+type/message/attributes, identity, encoding-and-errors contract, accepted
+argument shapes. Everything else follows PyPy **unconditionally**: names, module
 paths, control-flow order, data structures, storage owner, JIT hints. A
 structural divergence does not become a spec fix by sitting next to one.
 
-**Six tests, in order; stop at the first leaf.** The full procedure, with the
-evidence rules and worked examples, is in the `/parity` skill under
-"SPEC-DEVIATION"; do not invoke this ruling without reading it.
+**It is not a 3.11-vs-3.14 question** — six of seven adjudicated cases had no
+version delta at all (`sched_setscheduler` since 3.3, `PyUnicode_FSConverter`
+since 3.3, PEP 529, PEP 471). "3.14" pins *which* CPython you read
+(`lib-python/stdlib-version.txt`); a missing delta is not grounds to refuse the
+exception, and a real one earns nothing by itself.
 
-1. **Can a Python snippet print a difference?** No → ordinary parity finding.
-2. **Do you hold an admissible artefact for the 3.14 side?** An in-tree
-   `lib-python/3/…:line` assertion, a measured run at the pinned version, or C
-   source read at that tag in a named checkout. Prose (docs, PEPs) is not
-   admissible, and a comment in pyre's own source is never the artefact. No
-   artefact → you may not invoke this section.
-3. **Do the two upstreams actually disagree?** If they agree and pyre differs
-   from both, that is a plain regression and no spec reasoning rescues it.
-4. **Is PyPy's shape load-bearing for a mechanism pyre also has?** Search the
-   whole definition — decorators included — plus the class/module bindings it
-   reads, in `rpython/` as well as `pypy/`, for `@jit.*`, `_immutable_*`,
-   `_attrs_`, `unrolling_iterable`, `make_sure_not_resized`, `rgc.*`. A hint
-   that governs the value you are changing → **STOP, follow PyPy**; that is
-   implementation, which this ruling assigns to PyPy. Record the negative
-   search too.
-5. **Per-site artefact plus a blast-radius census.** Every departing
-   `file:line` needs the artefact that forces *that site*; "consistency with a
-   sibling" is not one. Then `rg` pyre's own readers of the shape you are
-   deleting, `pyre-jit*` and `majit*` included.
-6. **Does pyre land on 3.14 across the whole decision?** Adjacency is what
-   reads the state you changed, not "the same function". Landing where
-   **neither** upstream sits is a defect regardless of which axis matched.
+**Six tests, in order; stop at the first leaf.** The full procedure is in
+`/parity` under "SPEC-DEVIATION" — do not invoke this ruling without reading it.
 
-Reaching the end: file it under the review's `## 4. Structural adaptations` as
-`[3.14-spec] our_file.rs:line ↔ pypy_file.py:line — <observable>; evidence:
-<route + cite>`, and comment at the site citing both sides. That records the
-decision; it does not close it.
+1. Can a Python snippet print a difference? No → ordinary parity finding.
+2. Do you hold an admissible 3.14 artefact — an in-tree `lib-python/3/…`
+   assertion, a measured run at the pinned version, or C source read at that tag?
+   Prose is not admissible; a comment in pyre's own source is never the artefact.
+3. Do the two upstreams actually disagree? If they agree and pyre differs from
+   both, it is a plain regression that no spec reasoning rescues.
+4. Is PyPy's shape load-bearing for a mechanism pyre also has? Search the whole
+   definition, decorators included, in `rpython/` and `pypy/` for `@jit.*`,
+   `_immutable_*`, `_attrs_`, `unrolling_iterable`, `make_sure_not_resized`,
+   `rgc.*`. A hint governing the value you are changing → **STOP, follow PyPy**.
+   Record the negative search too.
+5. Per-site artefact plus a blast-radius census: every departing site needs the
+   artefact forcing *that* site ("consistency with a sibling" is not one), then
+   `rg` pyre's own readers, `pyre-jit*` and `majit*` included.
+6. Does pyre land on 3.14t across the whole decision? Landing where **neither**
+   upstream sits is a defect however well one axis matched.
 
-## RPython Parity Rules
-- When porting from RPython/PyPy, do STRICT line-by-line structural parity. Do NOT take shortcuts, reimplement from scratch, or declare phases 'complete' without the literal refactor.
-- If a parity fix causes regressions, investigate root cause before reverting. Do not declare success if structural alignment was skipped, even if benchmarks pass.
-- Always verify which worktree/repo you're in (`git rev-parse --show-toplevel`) before editing. Common worktrees: pypy/main, pypy-pyre, pypy-stdlib, pypy-side.
+File the result under the review's `## 4. Structural adaptations` as
+`[3.14-spec] <ours> ↔ <pypy> — <observable>; evidence: <route + cite>`, and
+comment at the site citing both sides.
 
-## Before Committing
-- Always run `cargo check` and `cargo test` with `--features dynasm`.
-- Run the full benchmark suite (all 8 benchmarks) after JIT changes. A regression
-  is a finding to explain, not an automatic veto. The `/parity` skill's
-  Principle 4 governs: *"Performance can temporarily regress. If a benchmark
-  slows down because parity-correct code replaced a clever local shortcut,
-  accept it. Performance is recovered by further line-by-line porting of the
-  upstream optimization, not by reintroducing the shortcut."* So: if the slower
-  code is the line-by-line port and the faster code was the shortcut, the port
-  stands — record the regression and name the upstream optimization that would
-  recover it. Revert only when the regression has no such explanation. This file
-  is loaded every session and Principle 4 is not; do not restate the rule here
-  in a form that contradicts it.
-- Check `git status` and `git rev-parse --show-toplevel` before staging to confirm correct worktree.
-- When rebasing/cherry-picking, verify the fix isn't already on main first (`git log main --grep=...`).
+## Porting discipline
 
-## Debugging Discipline
-- When adding trace/debug logs, verify the code path is actually reached (check gating, feature flags) before running the test.
-- For root-cause bugs, do NOT implement workarounds (e.g., builtin fallback modules) - fix the actual interpreter/JIT issue.
+- Strict line-by-line structural parity. No shortcuts, no reimplementation from
+  scratch, no declaring a phase complete without the literal refactor.
+- If a parity fix regresses, find the root cause before reverting. Structural
+  alignment skipped is not success, even with green benchmarks.
+- Cite upstream by **symbol**, not `file:line`. Numbers rot silently and a
+  rotted citation still reads as authoritative; a symbol stays checkable with
+  `rg`. Use a line number only where no symbol pins the claim, and name the
+  enclosing symbol beside it.
+- Confirm the worktree (`git rev-parse --show-toplevel`) before editing and
+  before staging — dozens of sibling worktrees share one `.git`.
+
+## Before committing
+
+- `cargo test --all --features dynasm`. The feature flag is mandatory: without it
+  `majit-metainterp` emits `compile_error!` and every error after it is noise.
+- `python3 pyre/check.py` — every backend the host can build. A perf regression
+  is a finding to explain, not an automatic veto: if the slower code is the
+  line-by-line port and the faster was a shortcut, **the port stands** — record
+  it and name the upstream optimization that would recover it (`/parity`
+  Principle 4). Revert only when the regression has no such explanation. This
+  file is loaded every session and Principle 4 is not, so do not restate that
+  rule here in a form that contradicts it.
+- Re-record a `.jitstats` baseline only when the new number is the one that
+  should hold. "The recorded number no longer matches" is never on its own a
+  reason: a gate is a target to reach, not a figure to refit.
+- When rebasing or cherry-picking, check the fix isn't already on main
+  (`git log main --grep=…`).
+
+## Debugging discipline
+
+- Before running the test, verify the traced path is actually reached — check
+  gating and feature flags.
+- Fix the interpreter/JIT root cause. Do not build workarounds (fallback
+  modules, special cases) around it.
