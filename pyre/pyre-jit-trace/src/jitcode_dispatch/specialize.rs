@@ -11022,8 +11022,47 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     // Unicode constructors still require their dedicated parsing and remain
     // residual.
     let fills_os_error_slots = is_os_error_family && (2..=5).contains(&args.len());
-    if !kind.has_trivial_args_constructor() && !is_os_error_family && !is_system_exit {
-        return Ok(None);
+
+    // Admit the kind exactly when the concretely built instance left its extra
+    // slots defaulted — the slot-content test [`try_walker_trace_raise_bare_class`]
+    // already runs, in place of a per-kind tag that rejected a whole kind on
+    // faith and so kept `AttributeError(msg)` / `NameError(msg)` /
+    // `StopIteration()` on the opaque constructor residual.  A `NULL` slot needs
+    // no store; a `None` one takes an explicit `SetfieldGc` below.
+    //
+    // The bare-class sibling censuses an instance built with NO arguments, so
+    // every slot it sees is a trace-time constant.  Here the instance is built
+    // from the runtime operands `args`, which nothing pins — only the callable
+    // is guarded.  A slot that reads `None` because an ARGUMENT was `None`
+    // would therefore be emitted as a constant `None` store while `args_w`
+    // keeps the live operand: `StopIteration(x)` traced with `x is None` would
+    // answer `e.value is None` for every later `x`.  Each of these
+    // constructors fills a slot with either a constant default or one of the
+    // passed values, so requiring every argument to be non-`None` makes a
+    // `None` slot provably a default.  The check is read only once a defaulted
+    // slot is actually found, leaving the all-`NULL` kinds this fold already
+    // admitted on their existing path.
+    //
+    // OSError / SystemExit fill their slots from the arguments, and the emit
+    // tail writes them from the argument OpRefs; they skip the census.
+    let w_none = pyre_object::w_none();
+    let mut w_none_slot_descrs = Vec::new();
+    if !is_os_error_family && !is_system_exit {
+        let any_none_arg = concrete_args.iter().any(|a| std::ptr::eq(*a, w_none));
+        for (offset, value) in
+            unsafe { pyre_object::interp_exceptions::w_exception_traced_construction_slots(exc) }
+        {
+            if value.is_null() {
+                continue;
+            }
+            if !std::ptr::eq(value, w_none) || any_none_arg {
+                return Ok(None);
+            }
+            let Some(descr) = crate::descr::w_exception_slot_descr(kind, offset) else {
+                return Ok(None);
+            };
+            w_none_slot_descrs.push(descr);
+        }
     }
 
     // `interp_exceptions.py:993-998 W_SystemExit.descr_init` stores one
@@ -11201,6 +11240,18 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     };
     let new_op =
         crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, emitted_w_class, args_list);
+
+    // The slots the constructor defaulted to `None`.  `NewWithVtable` leaves
+    // them null, which reads as "unset" rather than `None`, so each one the
+    // census collected needs its own store.
+    let w_none_const = ctx.trace_ctx.const_ref(w_none as i64);
+    for descr in w_none_slot_descrs {
+        let descr_index = descr.index();
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_none_const], descr);
+        ctx.trace_ctx
+            .heapcache_setfield_cached(new_op, descr_index, w_none_const);
+    }
 
     if let Some((direct_code, tuple_shape)) = system_exit_code {
         let code = if let Some((specialised_oo, concrete_code)) = tuple_shape {
