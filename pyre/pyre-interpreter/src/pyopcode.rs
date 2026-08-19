@@ -1151,10 +1151,13 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Self: SharedOpcodeHandler + NamespaceOpcodeHandler,
     {
         let obj = self.pop_value()?;
+        // The lookup runs descriptor code, so it can allocate and relocate a
+        // moving frame; both pushes go through the anchor.
+        let anchor = self.anchor();
         let attr = SharedOpcodeHandler::load_special_attr(self, obj, name)?;
-        self.push_value(attr)?;
+        Self::push_anchored(&anchor, attr)?;
         let null = self.null_value()?;
-        self.push_value(null)
+        Self::push_anchored(&anchor, null)
     }
 
     fn store_attr(&mut self, name: &str) -> Result<(), PyError>
