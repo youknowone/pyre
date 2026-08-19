@@ -66,11 +66,13 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
             }
             Ok(s.as_bytes().to_vec())
         } else {
+            crate::typedef::require_contiguous_buffer(obj)?;
             match crate::typedef::buffer_as_bytes_like(obj)? {
                 Some(src) => Ok(bytesobject::bytes_like_data(src).to_vec()),
-                None => Err(crate::PyError::type_error(
-                    "argument should be bytes, buffer or ASCII string",
-                )),
+                None => Err(crate::PyError::type_error(format!(
+                    "argument should be bytes, buffer or ASCII string, not '{}'",
+                    crate::baseobjspace::object_functionstr_type_name(obj)
+                ))),
             }
         }
     }
@@ -79,6 +81,7 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
 /// The `Py_buffer` converter — the `b2a_*` encoders and the checksums take a
 /// bytes-like source only, so a str of any kind is rejected by its type.
 fn as_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    crate::typedef::require_contiguous_buffer(obj)?;
     match unsafe { crate::typedef::buffer_as_bytes_like(obj) }? {
         Some(src) => Ok(unsafe { bytesobject::bytes_like_data(src) }.to_vec()),
         _ => Err(crate::PyError::type_error(format!(
@@ -107,23 +110,15 @@ fn binascii_error(msg: impl Into<String>) -> crate::PyError {
 fn base64_decode_message(e: transforms::Base64DecodeError) -> String {
     use transforms::Base64DecodeError as E;
     match e {
-        E::InvalidByte {
-            index: 0,
-            byte: transforms::PAD,
-        } => "Leading padding not allowed".to_owned(),
-        E::InvalidByte {
-            byte: transforms::PAD,
-            ..
-        } => "Discontinuous padding not allowed".to_owned(),
-        E::InvalidByte { .. } => "Only base64 data is allowed".to_owned(),
-        E::InvalidLastSymbol {
-            byte: transforms::PAD,
-            ..
-        } => "Excess data after padding".to_owned(),
-        E::InvalidLastSymbol { index: length, .. } => format!(
+        E::LeadingPaddingNotAllowed => "Leading padding not allowed".to_owned(),
+        E::ExcessPaddingNotAllowed => "Excess padding not allowed".to_owned(),
+        E::OnlyBase64DataAllowed => "Only base64 data is allowed".to_owned(),
+        E::ExcessDataAfterPadding => "Excess data after padding".to_owned(),
+        E::DiscontinuousPaddingNotAllowed => "Discontinuous padding not allowed".to_owned(),
+        E::InvalidLastSymbol { index: length } => format!(
             "Invalid base64-encoded string: number of data characters ({length}) cannot be 1 more than a multiple of 4"
         ),
-        E::InvalidLength(_) => "Incorrect padding".to_owned(),
+        E::IncorrectPadding => "Incorrect padding".to_owned(),
     }
 }
 
@@ -132,6 +127,7 @@ fn transform_error(e: transforms::Error) -> crate::PyError {
     let msg = match e {
         transforms::Error::OddLengthString => "Odd-length string".to_owned(),
         transforms::Error::NonHexadecimalDigit => "Non-hexadecimal digit found".to_owned(),
+        transforms::Error::MissingLengthByte => "Missing length byte".to_owned(),
         transforms::Error::IllegalChar => "Illegal char".to_owned(),
         transforms::Error::TrailingGarbage => "Trailing garbage".to_owned(),
         transforms::Error::TooLong => "At most 45 bytes at once".to_owned(),

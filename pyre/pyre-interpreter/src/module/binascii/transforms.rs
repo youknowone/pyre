@@ -21,6 +21,8 @@ pub enum Error {
     OddLengthString,
     /// `unhexlify`: a byte outside `[0-9a-fA-F]` was found.
     NonHexadecimalDigit,
+    /// `a2b_uu`: the input has no length byte.
+    MissingLengthByte,
     /// `a2b_uu`: an illegal character was found.
     IllegalChar,
     /// `a2b_uu`: trailing garbage after the decoded length.
@@ -31,14 +33,24 @@ pub enum Error {
     Base64(Base64DecodeError),
 }
 
-/// Mirrors the `base64::DecodeError` variants that `a2b_base64` produces, so the
-/// caller can build the exact Python error message without depending on the
-/// `base64` crate's error type.
+/// Mirrors CPython's `binascii_a2b_base64_impl` (`Modules/binascii.c`) error
+/// paths one-for-one, so the caller can build the exact Python error message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Base64DecodeError {
-    InvalidByte { index: usize, byte: u8 },
-    InvalidLastSymbol { index: usize, byte: u8 },
-    InvalidLength(usize),
+    /// A `=` at `quad_pos == 0, i == 0`, strict mode.
+    LeadingPaddingNotAllowed,
+    /// A `=` outside the padding-completion window, strict mode.
+    ExcessPaddingNotAllowed,
+    /// A byte outside the base64 alphabet, strict mode.
+    OnlyBase64DataAllowed,
+    /// A valid base64 char after a completed pad sequence, strict mode.
+    ExcessDataAfterPadding,
+    /// A valid base64 char after an incomplete pad sequence, strict mode.
+    DiscontinuousPaddingNotAllowed,
+    /// Exactly one dangling data character at end of input.
+    InvalidLastSymbol { index: usize },
+    /// `quad_pos != 0` and the trailing padding does not complete the quad.
+    IncorrectPadding,
 }
 
 const fn hex_nibble(n: u8) -> u8 {
@@ -218,7 +230,13 @@ pub fn crc_hqx(bytes: &[u8], init: u32) -> u32 {
     crc
 }
 
-/// `a2b_base64`.
+/// `a2b_base64`. A line-by-line port of `binascii_a2b_base64_impl`
+/// (CPython `Modules/binascii.c`): padding characters within the completion
+/// window (`quad_pos >= 2 && quad_pos + pads <= 4`) are always skipped —
+/// even in strict mode — and non-strict mode additionally skips *every*
+/// pad and every non-alphabet byte outside that window. Errors therefore
+/// only fire in strict mode (mid-loop) or from the two post-loop length
+/// checks, which apply unconditionally.
 pub fn a2b_base64(b: &[u8], strict_mode: bool) -> Result<Vec<u8>, Error> {
     // Converts between ASCII and base-64 characters. The index of a given number yields the
     // number in ASCII while the value of said index yields the number in base-64. For example
@@ -244,60 +262,48 @@ pub fn a2b_base64(b: &[u8], strict_mode: bool) -> Result<Vec<u8>, Error> {
         -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
     ];
 
-    if b.is_empty() {
-        return Ok(vec![]);
-    }
+    let mut decoded: Vec<u8> = Vec::with_capacity((b.len() + 3) / 4 * 3);
 
-    if strict_mode && b[0] == PAD {
-        return Err(Error::Base64(Base64DecodeError::InvalidByte {
-            index: 0,
-            byte: 61,
-        }));
-    }
-
-    let mut decoded: Vec<u8> = vec![];
-
-    let mut quad_pos = 0; // position in the nibble
-    let mut pads = 0;
+    let mut quad_pos: u32 = 0; // position in the quad, 0..=3
+    let mut pads: u32 = 0;
     let mut left_char: u8 = 0;
-    let mut padding_started = false;
     for (i, &el) in b.iter().enumerate() {
         if el == PAD {
-            padding_started = true;
-
             pads += 1;
-            if quad_pos >= 2 && quad_pos + pads >= 4 {
-                if strict_mode && i + 1 < b.len() {
-                    // Represents excess data after padding error
-                    return Err(Error::Base64(Base64DecodeError::InvalidLastSymbol {
-                        index: i,
-                        byte: PAD,
-                    }));
-                }
-
-                return Ok(decoded);
+            if quad_pos >= 2 && quad_pos + pads <= 4 {
+                continue;
             }
-
-            continue;
+            // RFC 4648 section-3.3: implementations MAY ignore a pad
+            // character present before the end of the encoded data, and
+            // MAY ignore excess pad characters. Non-strict mode does.
+            if !strict_mode {
+                continue;
+            }
+            if quad_pos == 1 {
+                // One dangling data character: handled by the post-loop
+                // `quad_pos == 1` check below.
+                break;
+            }
+            return Err(Error::Base64(if quad_pos == 0 && i == 0 {
+                Base64DecodeError::LeadingPaddingNotAllowed
+            } else {
+                Base64DecodeError::ExcessPaddingNotAllowed
+            }));
         }
 
         let binary_char = BASE64_TABLE[el as usize];
-        if binary_char >= 64 || binary_char == -1 {
+        if binary_char < 0 {
             if strict_mode {
-                // Represents non-base64 data error
-                return Err(Error::Base64(Base64DecodeError::InvalidByte {
-                    index: i,
-                    byte: el,
-                }));
+                return Err(Error::Base64(Base64DecodeError::OnlyBase64DataAllowed));
             }
             continue;
         }
 
-        if strict_mode && padding_started {
-            // Represents discontinuous padding error
-            return Err(Error::Base64(Base64DecodeError::InvalidByte {
-                index: i,
-                byte: PAD,
+        if pads > 0 && strict_mode {
+            return Err(Error::Base64(if quad_pos + pads == 4 {
+                Base64DecodeError::ExcessDataAfterPadding
+            } else {
+                Base64DecodeError::DiscontinuousPaddingNotAllowed
             }));
         }
         pads = 0;
@@ -330,14 +336,19 @@ pub fn a2b_base64(b: &[u8], strict_mode: bool) -> Result<Vec<u8>, Error> {
         }
     }
 
-    match quad_pos {
-        0 => Ok(decoded),
-        1 => Err(Error::Base64(Base64DecodeError::InvalidLastSymbol {
+    if quad_pos == 1 {
+        // Exactly one extra valid, non-padding character: no possible
+        // input encodes to this length.
+        return Err(Error::Base64(Base64DecodeError::InvalidLastSymbol {
             index: decoded.len() / 3 * 4 + 1,
-            byte: 0,
-        })),
-        _ => Err(Error::Base64(Base64DecodeError::InvalidLength(quad_pos))),
+        }));
     }
+
+    if quad_pos != 0 && quad_pos + pads < 4 {
+        return Err(Error::Base64(Base64DecodeError::IncorrectPadding));
+    }
+
+    Ok(decoded)
 }
 
 /// `b2a_base64`.
@@ -677,11 +688,10 @@ pub fn rledecode_hqx(buffer: &[u8]) -> Vec<u8> {
 /// `a2b_uu`.
 pub fn a2b_uu(b: &[u8]) -> Result<Vec<u8>, Error> {
     // First byte: binary data length (in bytes)
-    let length = if b.is_empty() {
-        ((-0x20i32) & 0x3fi32) as usize
-    } else {
-        ((b[0] - b' ') & 0x3f) as usize
-    };
+    if b.is_empty() {
+        return Err(Error::MissingLengthByte);
+    }
+    let length = (b[0].wrapping_sub(b' ') & 0x3f) as usize;
 
     // Allocate the buffer
     let mut res = Vec::<u8>::with_capacity(length);
