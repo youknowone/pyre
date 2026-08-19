@@ -283,8 +283,15 @@ fn rewrite_jit_inline_ref_param_fields(
             if let syn::Expr::Assign(assign) = expr
                 && let syn::Expr::Index(index_expr) = &*assign.left
                 && let syn::Expr::Field(field) = &*index_expr.expr
-                && let Some(struct_path) = self.local_ref_struct_of_base(&field.base)
+                && let Some(binding_path) = self.local_ref_struct_of_base(&field.base)
                 && let syn::Member::Named(member_id) = &field.member
+                // Resolve against the struct that DECLARES the field, the way
+                // `match_array_field_base` does on the JIT side. Looking the
+                // element type up under the binding's own spelling misses a
+                // field an embedded base declares, and the plain-field arm
+                // below then rewrites `<base>.<field>` to the buffer pointer
+                // and leaves the `[]` on it, which does not compile.
+                && let struct_path = self.declaring_struct(&binding_path, &member_id.to_string())
                 && self
                     .array_field_elem(&struct_path, &member_id.to_string())
                     .is_some()
@@ -317,8 +324,9 @@ fn rewrite_jit_inline_ref_param_fields(
             // Array element READ: `<base>.<array_field>[<idx>]`.
             if let syn::Expr::Index(index_expr) = expr
                 && let syn::Expr::Field(field) = &*index_expr.expr
-                && let Some(struct_path) = self.local_ref_struct_of_base(&field.base)
+                && let Some(binding_path) = self.local_ref_struct_of_base(&field.base)
                 && let syn::Member::Named(member_id) = &field.member
+                && let struct_path = self.declaring_struct(&binding_path, &member_id.to_string())
                 && self
                     .array_field_elem(&struct_path, &member_id.to_string())
                     .is_some()
