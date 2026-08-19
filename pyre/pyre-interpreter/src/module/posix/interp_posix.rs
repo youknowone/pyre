@@ -6032,6 +6032,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             -> libc::c_int;
         }
 
+        /// Replace the supplementary group list.  The `host_env` binding for
+        /// this call is gated off on the apple targets, which do have it.
+        fn host_setgroups(groups: &[libc::gid_t]) -> std::io::Result<()> {
+            let ret = unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()) };
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
         /// The group list, sized by the count the kernel reports first.
         fn host_getgroups() -> std::io::Result<Vec<libc::gid_t>> {
             #[cfg(not(target_vendor = "apple"))]
@@ -6066,6 +6076,36 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     Ok(pyre_object::w_list_new(items))
                 },
                 0,
+            ),
+        );
+
+        // os.setgroups(list) -> None
+        crate::module_ns_store(
+            ns,
+            "setgroups",
+            crate::make_builtin_function_with_arity(
+                "setgroups",
+                |args| {
+                    let Some(&seq) = args.first() else {
+                        return Err(crate::PyError::type_error(
+                            "setgroups() requires 1 argument",
+                        ));
+                    };
+                    let items = crate::builtins::sequence_fast(seq, "setgroups(): argument must be a sequence")?;
+                    let mut groups = Vec::with_capacity(items.len());
+                    for item in items {
+                        let value = crate::baseobjspace::space_index(item)?;
+                        let value = crate::baseobjspace::uint_w(value)?;
+                        groups.push(libc::gid_t::try_from(value).map_err(|_| {
+                            crate::PyError::overflow_error(
+                                "Python int too large to convert to C gid_t",
+                            )
+                        })?);
+                    }
+                    host_setgroups(&groups).map_err(|e| io_err(e, ""))?;
+                    Ok(pyre_object::w_none())
+                },
+                1,
             ),
         );
 
