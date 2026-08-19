@@ -3362,15 +3362,47 @@ pub fn make_resume_guard_descr_range_foriter(green_key: u64) -> DescrRef {
 /// Tag a guard emitted while inlining a user instance's `__next__` with the
 /// caller FOR_ITER key.  A guard-failure bridge uses the tag to keep the
 /// exception-to-exhaustion conversion on the generic residual path.
-pub fn make_resume_guard_descr_instance_next_foriter(green_key: u64) -> DescrRef {
-    let descr = make_resume_guard_descr_typed(Vec::new());
-    descr
-        .as_any()
-        .and_then(|any| any.downcast_ref::<ResumeGuardDescr>())
-        .expect("make_resume_guard_descr_typed constructs a ResumeGuardDescr")
+///
+/// `opcode` selects the subtype `compile.py:919-937 invent_fail_descr_for_op`
+/// would have minted.  Stamping this descr fills `op.getdescr()`, and
+/// `store_final_boxes_in_guard` only invents on the empty arm — so a marker
+/// minted as a plain `ResumeGuardDescr` would cost a `GUARD_NOT_FORCED` its
+/// `is_guard_forced()` (which vetoes bridge compilation) or a
+/// `GUARD_NO_EXCEPTION` its `is_guard_exc()` (which routes the pending
+/// exception).  The whole inlined `__next__` body is tagged, residual guards
+/// included, so both opcodes reach here.
+pub fn make_resume_guard_descr_instance_next_foriter(
+    opcode: Option<OpCode>,
+    green_key: u64,
+) -> DescrRef {
+    let descr = match opcode {
+        Some(OpCode::GuardNotForced | OpCode::GuardNotForced2) => {
+            make_resume_guard_forced_descr_typed(Vec::new())
+        }
+        Some(OpCode::GuardException | OpCode::GuardNoException) => {
+            make_resume_guard_exc_descr_typed(Vec::new())
+        }
+        _ => make_resume_guard_descr_typed(Vec::new()),
+    };
+    resume_guard_inner(&descr)
+        .expect("every arm above constructs a ResumeGuardDescr or a newtype over one")
         .instance_next_foriter_key
         .store(green_key, Ordering::Relaxed);
     descr
+}
+
+/// The `ResumeGuardDescr` inside a descr that either is one or is one of its
+/// tag-only newtypes.
+fn resume_guard_inner(descr: &DescrRef) -> Option<&ResumeGuardDescr> {
+    let any = descr.as_any()?;
+    if let Some(plain) = any.downcast_ref::<ResumeGuardDescr>() {
+        return Some(plain);
+    }
+    if let Some(forced) = any.downcast_ref::<ResumeGuardForcedDescr>() {
+        return Some(&forced.inner);
+    }
+    any.downcast_ref::<ResumeGuardExcDescr>()
+        .map(|exc| &exc.inner)
 }
 
 /// compile.py:892: ResumeAtPositionDescr(ResumeGuardDescr) — subclass

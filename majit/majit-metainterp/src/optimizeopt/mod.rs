@@ -6319,7 +6319,9 @@ impl OptContext {
         if let Some(key) = refinalize_marked_key {
             op.setdescr(crate::compile::make_resume_guard_descr_range_foriter(key));
         } else if let Some(key) = refinalize_instance_next_key {
-            op.setdescr(crate::compile::make_resume_guard_descr_instance_next_foriter(key));
+            op.setdescr(
+                crate::compile::make_resume_guard_descr_instance_next_foriter(Some(op.opcode), key),
+            );
         }
 
         // resume.py:397 `assert not storage.rd_numb` — finish() runs at

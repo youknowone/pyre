@@ -328,7 +328,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
 ) -> Result<(), DispatchError> {
     let instance_next_foriter_keyed =
         if let Some(green_key) = ctx.fbw_mode.instance_next_foriter_green_key {
-            let descr = majit_metainterp::make_resume_guard_descr_instance_next_foriter(green_key);
+            // Mint the marker as the subtype this op's opcode requires: the
+            // whole inlined `__next__` body is tagged, so a may-force or
+            // can-raise residual inside it brings its `GuardNotForced` /
+            // `GuardNoException` through here, and the stamp is what
+            // `store_final_boxes_in_guard` finds instead of inventing.
+            let opcode = match scope.guard_stamp {
+                GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
+                GuardStampTarget::GuardFromEnd(from_end) => {
+                    ctx.trace_ctx.guard_op_opcode_from_end(from_end)
+                }
+            };
+            let descr =
+                majit_metainterp::make_resume_guard_descr_instance_next_foriter(opcode, green_key);
             match scope.guard_stamp {
                 GuardStampTarget::LastOp => ctx.trace_ctx.set_last_op_descr(descr),
                 GuardStampTarget::GuardFromEnd(from_end) => {

@@ -7076,8 +7076,10 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     let iter_layout = unsafe { (*iter_obj).ob_type } as i64;
     if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
         let type_const = ctx.trace_ctx.const_int(iter_layout);
-        let descr =
-            majit_metainterp::make_resume_guard_descr_instance_next_foriter(foriter_green_key);
+        let descr = majit_metainterp::make_resume_guard_descr_instance_next_foriter(
+            Some(OpCode::GuardClass),
+            foriter_green_key,
+        );
         ctx.trace_ctx
             .record_guard_with_descr(OpCode::GuardClass, &[iter_op, type_const], descr);
         spec_census_record_instance_next_route_guard_keyed();
