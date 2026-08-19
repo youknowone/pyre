@@ -127,6 +127,16 @@ impl<'a> LineTableReader<'a> {
         self.data.get(self.pos).copied()
     }
 
+    /// Read one location-table varint: 6 bits per byte, **least
+    /// significant group first**, bit 6 (0x40) marking continuation.
+    ///
+    /// This inverts `write_varint`, and deliberately differs from
+    /// `decode_varint` below, which reads the exception table most
+    /// significant group first to invert `parse_varint`. Both helpers sit
+    /// a few lines apart in `pycore_code.h`: the byte order is a property
+    /// of the table, not of the file. `_decode_varint` in PyPy's pycode.py
+    /// is the exception-table reader despite its generic name, so reusing
+    /// it here would decode every multi-byte line delta wrong.
     fn read_varint(&mut self) -> u32 {
         let Some(first) = self.read_byte() else {
             return 0;
@@ -165,6 +175,10 @@ impl<'a> LineTableReader<'a> {
 /// (0x40) is the continuation flag; bit 7 (0x80) is the start-of-entry
 /// marker, ignored here and masked off along with the continuation bit
 /// via `& 63`.
+///
+/// Mirrors `parse_varint`. The location table uses the opposite byte
+/// order — see `LineTableReader::read_varint` — so this decoder must not
+/// be reused for `co_linetable`.
 #[inline]
 pub fn decode_varint(table: &[u8], mut i: usize) -> (u32, usize) {
     let mut b = table[i] as u32;
@@ -3349,6 +3363,24 @@ mod tests {
             }
             out.push(byte);
         }
+    }
+
+    /// The two tables disagree on byte order: `co_exceptiontable` puts the
+    /// most significant 6-bit group first (`parse_varint`), `co_linetable`
+    /// the least significant one (`write_varint`). 70 therefore encodes
+    /// differently under each, and handing either reader the other's bytes
+    /// yields 385 — the failure a shared decoder would produce on every
+    /// multi-byte delta.
+    #[test]
+    fn the_two_varint_tables_use_opposite_byte_order() {
+        let exception_bytes = [0x41u8, 0x06];
+        let location_bytes = [0x46u8, 0x01];
+
+        assert_eq!(decode_varint(&exception_bytes, 0), (70, 2));
+        assert_eq!(LineTableReader::new(&location_bytes).read_varint(), 70);
+
+        assert_eq!(decode_varint(&location_bytes, 0), (385, 2));
+        assert_eq!(LineTableReader::new(&exception_bytes).read_varint(), 385);
     }
 
     #[test]
