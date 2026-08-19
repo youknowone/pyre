@@ -1954,28 +1954,44 @@ fn stack_size(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_int_new(old as i64))
 }
 
+/// The message `PyLong_AsLong` reports a number that does not fit with.
+fn c_long_overflow() -> crate::PyError {
+    crate::PyError::overflow_error("Python int too large to convert to C long")
+}
+
 fn interrupt_main(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() > 1 {
         return Err(crate::PyError::type_error(
             "interrupt_main() takes at most 1 argument",
         ));
     }
+    // `PyArg_ParseTuple("|i:interrupt_main")` reads the argument as a C
+    // `long`, so a non-integer is a TypeError and a number too large for one
+    // an OverflowError.  Reading the payload word of whatever was passed
+    // instead takes `(1 << 32) | SIGINT` for `SIGINT` and interrupts the main
+    // thread over a number that is not a signal at all.
+    let signum = match args.first() {
+        Some(&arg) => {
+            let value = crate::baseobjspace::int_w(crate::baseobjspace::space_index(arg)?)
+                .map_err(|err| {
+                    if err.kind == crate::PyErrorKind::OverflowError {
+                        c_long_overflow()
+                    } else {
+                        err
+                    }
+                })?;
+            i32::try_from(value).map_err(|_| c_long_overflow())?
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        None => libc::SIGINT,
+        #[cfg(target_arch = "wasm32")]
+        None => 2,
+    };
     #[cfg(not(target_arch = "wasm32"))]
-    let signum = args
-        .first()
-        .map(|&arg| unsafe { w_int_get_value(arg) as i32 })
-        .unwrap_or(libc::SIGINT);
+    let nsig = crate::module::signal::signalstate::NSIG;
     #[cfg(target_arch = "wasm32")]
-    let signum = args
-        .first()
-        .map(|&arg| unsafe { w_int_get_value(arg) as i32 })
-        .unwrap_or(2);
-    #[cfg(not(target_arch = "wasm32"))]
-    if !(1..crate::module::signal::signalstate::NSIG).contains(&signum) {
-        return Err(crate::PyError::value_error("signal number out of range"));
-    }
-    #[cfg(target_arch = "wasm32")]
-    if !(1..65).contains(&signum) {
+    let nsig = 65;
+    if !(1..nsig).contains(&signum) {
         return Err(crate::PyError::value_error("signal number out of range"));
     }
     let ec = crate::call::getexecutioncontext();

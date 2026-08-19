@@ -179,7 +179,24 @@ pub unsafe fn walk_signal_handler_roots_area(
 /// valid signal in its low 32 bits — `(1 << 32) | SIGINT` — would pass the
 /// check and act on the signal it aliases.
 fn signum_arg(w_signum: PyObjectRef) -> Result<i64, crate::PyError> {
-    crate::baseobjspace::gateway_int_w(w_signum)
+    let signum = crate::baseobjspace::gateway_int_w(w_signum).map_err(|err| {
+        if err.kind == crate::PyErrorKind::OverflowError {
+            c_int_overflow()
+        } else {
+            err
+        }
+    })?;
+    if i32::try_from(signum).is_err() {
+        return Err(c_int_overflow());
+    }
+    Ok(signum)
+}
+
+/// `signalnum: int` lands in a C `int`, so a number too large for one is an
+/// OverflowError from the conversion rather than a signal number out of range
+/// (`PyLong_AsInt`).
+fn c_int_overflow() -> crate::PyError {
+    crate::PyError::overflow_error("Python int too large to convert to C int")
 }
 
 /// interp_signal.py:285-288 `check_signum_in_range`.
@@ -222,16 +239,18 @@ fn signal_signal(
             "signal only works in main thread or with _signals_enabled",
         ));
     }
+    // The runtime handles seven numbers and reports any other through the
+    // invalid parameter handler.  `signal_signal_impl` spells that set out
+    // ahead of the range check, so a number outside it is refused as an
+    // invalid value rather than as one out of range — and the conversion
+    // above has already bounded it to a C `int`.
+    #[cfg(windows)]
+    if !windows_handles_signal(signum as i32) {
+        return Err(crate::PyError::value_error("invalid signal value"));
+    }
     check_signum_in_range(signum)?;
     // The range check bounds it to `1..NSIG`, so the narrowing is exact.
     let signum = signum as i32;
-    // The runtime handles seven numbers and reports any other through the
-    // invalid parameter handler, so the range check is not the whole answer
-    // here (`signal_signal_impl`).
-    #[cfg(windows)]
-    if !windows_handles_signal(signum) {
-        return Err(crate::PyError::value_error("invalid signal value"));
-    }
 
     // interp_signal.py:313-321 — SIG_DFL / SIG_IGN are the ints 0 / 1;
     // anything else must be callable.  PyPy compares with
@@ -774,11 +793,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             |args| {
                 #[cfg(feature = "host_env")]
                 {
-                    let signum = if let Some(&a) = args.first() {
-                        unsafe { pyre_object::w_int_get_value(a) }
-                    } else {
+                    let Some(&a) = args.first() else {
                         return Err(crate::PyError::type_error("strsignal() missing argument"));
                     };
+                    let signum = signum_arg(a)?;
                     // interp_signal.py:593-594 spells this bound inline rather
                     // than calling `check_signum_in_range`, and its `signalnum
                     // > NSIG` admits `NSIG` itself.  3.14 rejects it — its own
@@ -1359,13 +1377,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
     crate::module_ns_store(ns, "SIG_DFL", pyre_object::w_int_new(0));
     crate::module_ns_store(ns, "SIG_IGN", pyre_object::w_int_new(1));
-    // libc crate doesn't surface NSIG portably; use POSIX 64-signal cap, or
-    // the count the MSVC runtime defines, one past its highest signal.
-    #[cfg(windows)]
-    const NSIG: i64 = 23;
-    #[cfg(not(windows))]
-    const NSIG: i64 = 64;
-    crate::module_ns_store(ns, "NSIG", pyre_object::w_int_new(NSIG));
+    crate::module_ns_store(
+        ns,
+        "NSIG",
+        pyre_object::w_int_new(i64::from(signalstate::NSIG)),
+    );
     // Common signal numbers (POSIX subset, sourced from libc so numerics
     // match the host — Linux SIGUSR1=10 / macOS SIGUSR1=30, etc.).
     #[cfg(unix)]

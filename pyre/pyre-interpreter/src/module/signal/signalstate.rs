@@ -9,8 +9,14 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
 
-/// `signals.c:34` — reasonable default cap; the libc crate does not
-/// surface `NSIG` portably.  64 fits a single `i64` bitmask.
+/// `signals.c:34` — one past the highest signal number the platform has,
+/// which is what `Py_NSIG` names and what every range check answers from.
+/// The libc crate does not surface it portably; the POSIX cap is the
+/// reasonable default and fits a single `i64` bitmask, and the MSVC runtime
+/// defines its own, smaller, count.
+#[cfg(windows)]
+pub const NSIG: i32 = 23;
+#[cfg(not(windows))]
 pub const NSIG: i32 = 64;
 
 /// Identity of the signal-driving `ActionFlag` ticker cell (`signals.c:45-49
