@@ -1125,7 +1125,24 @@ pub fn publish_last_instr_at_live_marker(
         if raw_code as *const CodeObject != jitcode.payload.code_ptr {
             return;
         }
-        let py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(metadata, marker_pc);
+        let raw_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(metadata, marker_pc);
+        // A marker resolves through inverse tables that pick one owner per
+        // JitCode offset by position, not by whether that Python PC is
+        // executable: `block_head_py_by_jit_pc` keeps the first PC mapped to an
+        // offset and the floor tier keeps the last, so a run of `Cache` units
+        // sharing the following opcode's offset can win either way. The field
+        // has to name a real opcode — `next_instr` is `last_instr + 1` and
+        // `offset2lineno` keys on it — so advance to the instruction the
+        // blackhole is about to replay, the normalization the resume reader
+        // already applies (`trivia_normalized_py_pc_for_jitcode_pc`). Without
+        // it a callee's `sys._getframe(1).f_lasti` reads its caller as paused
+        // one code unit past the opcode that pushed the callee.
+        // SAFETY: `raw_code` is this JitCode's own code object, checked equal to
+        // `code_ptr` above.
+        let py_pc = crate::jitcode_dispatch::skip_python_trivia_forward(
+            unsafe { &*(raw_code as *const CodeObject) },
+            raw_py_pc as usize,
+        );
         // SAFETY: same frame, and `last_instr` carries the same compile-time
         // offset assertion.
         unsafe {
