@@ -785,29 +785,6 @@ impl Default for RootSet {
 /// Default card page shift: each card covers 2^7 = 128 array elements.
 pub const DEFAULT_CARD_PAGE_SHIFT: u32 = 7;
 
-/// Whether an old-generation birth clears its payload.
-///
-/// `malloc_zero_filled = False` (incminimark.py:211) leaves the choice to the
-/// allocating site: the transform selects the `_clear` malloc variant only
-/// where the site asked for one (framework.py:279-290), and the raw-malloc
-/// tier documents the same in `external_malloc` (incminimark.py:955-960).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ZeroPayload {
-    Yes,
-    No,
-}
-
-impl ZeroPayload {
-    #[inline]
-    fn clears(self) -> bool {
-        // WASM-ONLY ADAPTATION, paired with `Nursery::reset`: wasm skips the
-        // GC rewrite, so its JIT code emits no `clear_gc_fields` stores and
-        // needs recycled bytes zero-filled. A spill stands in for a nursery
-        // bump, so it owes whatever the nursery arm provides on that target.
-        self == Self::Yes || cfg!(target_arch = "wasm32")
-    }
-}
-
 /// incminimark.py:2390-2634 major-collection state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GcState {
@@ -1465,7 +1442,7 @@ impl MiniMarkGC {
     fn alloc_with_type_slow(&mut self, type_id: u32, total_size: usize) -> GcRef {
         // Large objects go directly to old gen.
         if total_size > self.config.large_object_threshold {
-            return self.alloc_in_oldgen(type_id, total_size, ZeroPayload::Yes);
+            return self.alloc_in_oldgen_clear(type_id, total_size);
         }
 
         // Nursery full: trigger minor collection and retry.
@@ -1495,7 +1472,7 @@ impl MiniMarkGC {
             // nursery size. Tiny backend tests can configure the two
             // independently; retain their external-allocation fallback
             // only for an object that cannot physically fit anywhere.
-            return self.alloc_in_oldgen(type_id, total_size, ZeroPayload::Yes);
+            return self.alloc_in_oldgen_clear(type_id, total_size);
         }
         assert!(
             !ptr.is_null(),
@@ -1620,7 +1597,7 @@ impl MiniMarkGC {
         // slot needs no temporary registration.
         if total_size > self.config.large_object_threshold {
             unsafe { *needs_write_barrier = true };
-            return self.alloc_in_oldgen(type_id, total_size, ZeroPayload::Yes);
+            return self.alloc_in_oldgen_clear(type_id, total_size);
         }
 
         self.pending_reserving_size = total_size;
@@ -1639,7 +1616,7 @@ impl MiniMarkGC {
         };
         if ptr.is_null() && Self::nursery_allocation_size(total_size) > self.nursery.size() {
             unsafe { *needs_write_barrier = true };
-            return self.alloc_in_oldgen(type_id, total_size, ZeroPayload::Yes);
+            return self.alloc_in_oldgen_clear(type_id, total_size);
         }
         assert!(
             !ptr.is_null(),
@@ -1838,12 +1815,12 @@ impl MiniMarkGC {
         // nothing — the same reading `spill_to_oldgen_or_null` takes for this
         // function's fallible counterpart.
         if total_size > self.config.large_object_threshold {
-            return self.alloc_in_oldgen(type_id, total_size, ZeroPayload::No);
+            return self.alloc_in_oldgen_nursery_substitute(type_id, total_size);
         }
 
         let ptr = self.nursery.alloc(total_size);
         if ptr.is_null() {
-            return self.alloc_in_oldgen(type_id, total_size, ZeroPayload::No);
+            return self.alloc_in_oldgen_nursery_substitute(type_id, total_size);
         }
 
         self.finish_nursery_object(ptr, type_id)
@@ -1972,7 +1949,7 @@ impl MiniMarkGC {
     #[cold]
     #[inline(never)]
     fn spill_to_oldgen_or_null(&mut self, type_id: u32, total_size: usize) -> GcRef {
-        self.try_alloc_in_oldgen(type_id, total_size, ZeroPayload::No)
+        self.try_alloc_in_oldgen_nursery_substitute(type_id, total_size)
             .unwrap_or(GcRef(0))
     }
 
@@ -2330,32 +2307,94 @@ impl MiniMarkGC {
     }
 
     /// Allocate directly in old gen (for large objects or post-collection
-    /// fallback). `zero` is the allocating site's `malloc_*_clear` choice; see
-    /// [`ZeroPayload`].
-    fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize, zero: ZeroPayload) -> GcRef {
+    /// fallback).
+    ///
+    /// The block comes back uninitialized, as `external_malloc`'s "fully
+    /// initialized, but not zero-filled" (incminimark.py:955-960) does: with
+    /// `malloc_zero_filled = False` (incminimark.py:211) no allocation tier
+    /// clears, and a site that needs zeroed memory appends the clear itself —
+    /// see [`alloc_in_oldgen_clear`](Self::alloc_in_oldgen_clear).
+    fn alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> GcRef {
         let ptr = self.oldgen.alloc(total_size);
-        self.finish_alloc_in_oldgen(type_id, total_size, ptr, zero)
+        self.finish_alloc_in_oldgen(type_id, total_size, ptr)
+    }
+
+    /// `framework.py:1031-1043 gct_do_malloc_fixedsize_clear`: the plain malloc
+    /// above, then the `emit_raw_memclear` the transform appends after it.
+    ///
+    /// This is the out-of-line tail of the entry points that stand in for the
+    /// `_clear` malloc variant — [`alloc_with_type`](Self::alloc_with_type) and
+    /// [`alloc_with_type_rooted`](Self::alloc_with_type_rooted), which compiled
+    /// code reaches as `do_malloc_fixedsize_clear`, and `alloc_oldgen_typed`,
+    /// whose resume materialization writes only the fields present in
+    /// resumedata and needs the PyFrame owned-content fields it omits to read
+    /// null for the destructor.
+    ///
+    /// [`alloc_with_type_no_collect`](Self::alloc_with_type_no_collect) and the
+    /// spill stand in for the plain `malloc_fixedsize` instead, and take
+    /// [`alloc_in_oldgen`](Self::alloc_in_oldgen) directly.
+    fn alloc_in_oldgen_clear(&mut self, type_id: u32, total_size: usize) -> GcRef {
+        let obj = self.alloc_in_oldgen(type_id, total_size);
+        Self::raw_memclear(obj, total_size);
+        obj
+    }
+
+    /// `framework.py:1042 emit_raw_memclear` — zero the block after the header.
+    #[inline]
+    fn raw_memclear(obj: GcRef, total_size: usize) {
+        // SAFETY: `obj` names the payload of a block the allocator has just
+        // returned, whose header it has already stamped.
+        unsafe {
+            std::ptr::write_bytes(
+                obj.0 as *mut u8,
+                0,
+                total_size.saturating_sub(GcHeader::SIZE),
+            );
+        }
+    }
+
+    /// The clear an old-gen block owes when it stands in for a nursery bump.
+    ///
+    /// WASM-ONLY ADAPTATION, paired with `Nursery::reset`: wasm skips the GC
+    /// rewrite, so its JIT code emits none of the `clear_gc_fields` stores that
+    /// carry `emit_raw_memclear`'s job there, and reads recycled bytes as
+    /// initialized. Its nursery arm hands out zero-filled memory, so a stand-in
+    /// for that arm owes the same. Every other target leaves the block as
+    /// `external_malloc` does.
+    #[inline]
+    fn clear_nursery_substitute(obj: GcRef, total_size: usize) {
+        if cfg!(target_arch = "wasm32") {
+            Self::raw_memclear(obj, total_size);
+        }
+    }
+
+    /// [`alloc_in_oldgen`](Self::alloc_in_oldgen) for a request the nursery
+    /// could not serve; see [`clear_nursery_substitute`](Self::clear_nursery_substitute).
+    fn alloc_in_oldgen_nursery_substitute(&mut self, type_id: u32, total_size: usize) -> GcRef {
+        let obj = self.alloc_in_oldgen(type_id, total_size);
+        Self::clear_nursery_substitute(obj, total_size);
+        obj
+    }
+
+    /// [`try_alloc_in_oldgen`](Self::try_alloc_in_oldgen) for the same.
+    fn try_alloc_in_oldgen_nursery_substitute(
+        &mut self,
+        type_id: u32,
+        total_size: usize,
+    ) -> Option<GcRef> {
+        let obj = self.try_alloc_in_oldgen(type_id, total_size)?;
+        Self::clear_nursery_substitute(obj, total_size);
+        Some(obj)
     }
 
     /// Fallible old-gen allocation used by host allocation hooks. Upstream
     /// rawmalloc failure returns NULL so the caller can raise `MemoryError`.
-    fn try_alloc_in_oldgen(
-        &mut self,
-        type_id: u32,
-        total_size: usize,
-        zero: ZeroPayload,
-    ) -> Option<GcRef> {
+    fn try_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> Option<GcRef> {
         let ptr = self.oldgen.try_alloc(total_size)?;
-        Some(self.finish_alloc_in_oldgen(type_id, total_size, ptr, zero))
+        Some(self.finish_alloc_in_oldgen(type_id, total_size, ptr))
     }
 
-    fn finish_alloc_in_oldgen(
-        &mut self,
-        type_id: u32,
-        total_size: usize,
-        ptr: *mut u8,
-        zero: ZeroPayload,
-    ) -> GcRef {
+    fn finish_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize, ptr: *mut u8) -> GcRef {
         if crate::bh_probe_enabled() {
             let lo = self.nursery.start_ptr() as usize;
             crate::BH_PROBE_NURSERY_LO.store(lo, std::sync::atomic::Ordering::Relaxed);
@@ -2363,28 +2402,6 @@ impl MiniMarkGC {
                 lo + self.nursery.size(),
                 std::sync::atomic::Ordering::Relaxed,
             );
-        }
-        // `malloc_zero_filled = False` (incminimark.py:211) makes zeroing a
-        // per-call-site decision rather than a property of the tier: the
-        // transform picks `malloc_fixedsize_clear`/`malloc_varsize_clear` only
-        // for the sites that ask (framework.py:279-290), and `external_malloc`
-        // hands back a block that is "fully initialized, but not zero-filled"
-        // (incminimark.py:955-960).  `do_malloc_fixedsize_clear` and the
-        // resume.py direct reader are two sites that do ask — resume
-        // materialization writes only the fields present in resumedata, and the
-        // omitted PyFrame owned-content fields must read null for its
-        // destructor — so an explicit old-gen birth still clears.  A
-        // nursery-full spill does not: it stands in for a nursery bump, and
-        // ArenaCollection.malloc and nursery promotion's alloc-and-copy path
-        // stay uninitialized too.
-        if zero.clears() {
-            unsafe {
-                std::ptr::write_bytes(
-                    ptr.add(GcHeader::SIZE),
-                    0,
-                    total_size.saturating_sub(GcHeader::SIZE),
-                );
-            }
         }
         let hdr = unsafe { &mut *(ptr as *mut GcHeader) };
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
@@ -7026,7 +7043,7 @@ impl GcAllocator for MiniMarkGC {
         let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
             return GcRef(0);
         };
-        self.alloc_in_oldgen(type_id, total_size, ZeroPayload::Yes)
+        self.alloc_in_oldgen_clear(type_id, total_size)
     }
 
     fn collection_counts(&self) -> (usize, usize) {
@@ -7602,11 +7619,10 @@ mod tests {
         assert_eq!(initial.total_gc_time_ms, 0);
 
         let tid = gc.register_type(TypeInfo::object(64));
-        let _small = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 64, ZeroPayload::Yes);
-        let _large = gc.alloc_in_oldgen(
+        let _small = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 64);
+        let _large = gc.alloc_in_oldgen_clear(
             tid,
             gc.oldgen.small_request_threshold() + std::mem::size_of::<usize>(),
-            ZeroPayload::Yes,
         );
         let after = GcAllocator::gc_memory_stats(&gc);
         assert_eq!(
@@ -7692,7 +7708,7 @@ mod tests {
         majit_ir::eval_breaker_word::take_gc();
 
         set_deferred_major_request_probe(None);
-        gc.alloc_in_oldgen(tid, size, ZeroPayload::Yes);
+        gc.alloc_in_oldgen_clear(tid, size);
         assert!(
             !majit_ir::eval_breaker_word::take_gc(),
             "no consumer installed, so no request should be armed"
@@ -7700,7 +7716,7 @@ mod tests {
 
         set_deferred_major_request_probe(Some(refuse));
         for _ in 0..4 {
-            gc.alloc_in_oldgen(tid, size, ZeroPayload::Yes);
+            gc.alloc_in_oldgen_clear(tid, size);
         }
         assert!(
             !majit_ir::eval_breaker_word::take_gc(),
@@ -7708,7 +7724,7 @@ mod tests {
         );
 
         set_deferred_major_request_probe(Some(accept));
-        gc.alloc_in_oldgen(tid, size, ZeroPayload::Yes);
+        gc.alloc_in_oldgen_clear(tid, size);
         assert!(majit_ir::eval_breaker_word::take_gc());
 
         set_deferred_major_request_probe(None);
@@ -8561,7 +8577,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(16));
 
         // Allocate a large object (goes to old gen).
-        let old_obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let old_obj = gc.alloc_in_oldgen_clear(0, GcHeader::SIZE + 16);
         assert!(!gc.is_in_nursery(old_obj.0));
 
         // The old object should have TRACK_YOUNG_PTRS.
@@ -8629,7 +8645,7 @@ mod tests {
     fn track_young_ptrs_set_on_direct_oldgen_alloc() {
         let mut gc = test_gc(1024);
         gc.register_type(TypeInfo::simple(16));
-        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let obj = gc.alloc_in_oldgen_clear(0, GcHeader::SIZE + 16);
         assert!(unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
     }
 
@@ -8671,7 +8687,7 @@ mod tests {
     fn born_old_typed_payload_is_zero_filled() {
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(24));
-        let obj = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 24, ZeroPayload::Yes);
+        let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 24);
         let payload = unsafe { std::slice::from_raw_parts(obj.0 as *const u8, 24) };
         assert!(payload.iter().all(|&byte| byte == 0));
     }
@@ -9144,11 +9160,7 @@ mod tests {
         ));
 
         // Create an old-gen object.
-        let old_obj = gc.alloc_in_oldgen(
-            tid,
-            GcHeader::SIZE + std::mem::size_of::<GcRef>(),
-            ZeroPayload::Yes,
-        );
+        let old_obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + std::mem::size_of::<GcRef>());
 
         // Create a young object.
         let young_obj = gc.alloc_with_type(tid, std::mem::size_of::<GcRef>());
@@ -9303,7 +9315,7 @@ mod tests {
         // Allocate parent in old-gen. Field pointer will be set to a
         // raw `Box::into_raw` block — what `std::alloc` does for an
         // unmigrated `wrappeditems` / `items` slot today.
-        let parent = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
+        let parent = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         let unmanaged = Box::into_raw(Box::new(0xCAFEBABEu64));
         unsafe {
             *(parent.0 as *mut GcRef) = GcRef(unmanaged as usize);
@@ -9350,7 +9362,7 @@ mod tests {
         ));
 
         let total_payload = base_size + ptr_size * length;
-        let parent = gc.alloc_in_oldgen(tid, GcHeader::SIZE + total_payload, ZeroPayload::Yes);
+        let parent = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + total_payload);
         unsafe {
             *(parent.0 as *mut usize) = length;
         }
@@ -9429,7 +9441,7 @@ mod tests {
         // snapshot re-enters the marking worklist at the next minor.
         let mut gc = test_gc(2048);
         let tid = gc.register_type(TypeInfo::simple(8));
-        let old = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 8, ZeroPayload::Yes);
+        let old = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 8);
         let hdr = unsafe { header_of(old.0) };
         assert!(!unsafe { (*hdr).has_flag(flags::VISITED) });
 
@@ -9556,7 +9568,7 @@ mod tests {
         let mut gc = test_gc(4096);
         gc.register_type(TypeInfo::simple(16));
 
-        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let obj = gc.alloc_in_oldgen_clear(0, GcHeader::SIZE + 16);
         // Do NOT set HAS_CARDS — no card header space allocated.
 
         gc.do_write_barrier_card(obj, 5, DEFAULT_CARD_PAGE_SHIFT);
@@ -9921,7 +9933,7 @@ mod tests {
         // step cannot finish it.
         let mut prev = GcRef::NULL;
         for _ in 0..6 {
-            let obj = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
+            let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
             unsafe {
                 *(obj.0 as *mut GcRef) = prev;
             }
@@ -10035,7 +10047,7 @@ mod tests {
         // swapped in and drained completely.
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
-        let modified = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let modified = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         unsafe { (*header_of(modified.0)).set_flag(flags::VISITED) };
 
         gc.gc_state = GcState::Marking;
@@ -10115,7 +10127,7 @@ mod tests {
         // More than two arena pages of white old objects ensure that the
         // one-page budget used by this tiny test nursery cannot finish sweep.
         for _ in 0..900 {
-            gc.alloc_in_oldgen(tid, total_size, ZeroPayload::Yes);
+            gc.alloc_in_oldgen_clear(tid, total_size);
         }
 
         gc.start_incremental_cycle();
@@ -10151,7 +10163,7 @@ mod tests {
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
         let raw_size = gc.oldgen.small_request_threshold() + std::mem::size_of::<usize>();
-        gc.alloc_in_oldgen(tid, raw_size, ZeroPayload::Yes);
+        gc.alloc_in_oldgen_clear(tid, raw_size);
         gc.oldgen.sweep_prepare();
         assert!(gc.oldgen.rawmalloc_sweep_pending());
         assert_eq!(gc.gc_state, GcState::Scanning);
@@ -10162,13 +10174,13 @@ mod tests {
     fn stop_the_world_full_collection_drains_marking_and_sweeping() {
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
-        let live = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let live = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         let mut root = live;
         unsafe { gc.roots.add(&mut root) };
 
         let raw_size = gc.oldgen.small_request_threshold() + std::mem::size_of::<usize>();
         for _ in 0..20 {
-            gc.alloc_in_oldgen(tid, raw_size, ZeroPayload::Yes);
+            gc.alloc_in_oldgen_clear(tid, raw_size);
         }
         let majors_before = gc.major_collections;
 
@@ -10919,7 +10931,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(16));
 
         // Allocate an old-gen object.
-        let obj = gc.alloc_in_oldgen(0, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let obj = gc.alloc_in_oldgen_clear(0, GcHeader::SIZE + 16);
         assert!(!gc.is_in_nursery(obj.0));
 
         // Initially TRACK_YOUNG_PTRS is set.
@@ -10949,11 +10961,7 @@ mod tests {
         ));
 
         // Create an old-gen parent and a young child.
-        let parent = gc.alloc_in_oldgen(
-            tid,
-            GcHeader::SIZE + std::mem::size_of::<GcRef>(),
-            ZeroPayload::Yes,
-        );
+        let parent = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + std::mem::size_of::<GcRef>());
         let child = gc.alloc_with_type(tid, std::mem::size_of::<GcRef>());
         unsafe {
             *(child.0 as *mut u64) = 0xABCD_1234;
@@ -11081,7 +11089,7 @@ cache size\t: 8192 kB\n";
     fn test_gc_step_respects_enabled_flag() {
         let mut gc = test_gc(4096);
         gc.register_type(TypeInfo::simple(16));
-        gc.alloc_in_oldgen(0, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        gc.alloc_in_oldgen_clear(0, GcHeader::SIZE + 16);
         gc.next_major_collection_threshold = 0.0;
         assert!(gc.threshold_reached(0));
 
@@ -11109,7 +11117,7 @@ cache size\t: 8192 kB\n";
         // Fill old gen to trigger the major-cycle ratio threshold.
         // Allocate many objects directly in old gen.
         for _ in 0..200 {
-            gc.alloc_in_oldgen(0, GcHeader::SIZE + 16, ZeroPayload::Yes);
+            gc.alloc_in_oldgen_clear(0, GcHeader::SIZE + 16);
         }
 
         // gc_step should now start an incremental cycle and do work.
@@ -11158,7 +11166,7 @@ cache size\t: 8192 kB\n";
         // small objects is intentionally not enough under the parity-correct
         // floor.
         for _ in 0..4000 {
-            gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16, ZeroPayload::Yes);
+            gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         }
 
         // First step: start cycle.
@@ -11823,17 +11831,17 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
 
         // q: an old-gen leaf reachable ONLY through a nursery object.
-        let q = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
+        let q = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         unsafe { *(q.0 as *mut GcRef) = GcRef(0) };
         // n: nursery object pointing at q (nursery -> old edge).
         let n = gc.alloc_with_type(tid, ptr_size);
         assert!(gc.is_in_nursery(n.0));
         unsafe { *(n.0 as *mut GcRef) = q };
         // o: old-gen root pointing at n (old -> nursery edge).
-        let o = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
+        let o = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         unsafe { *(o.0 as *mut GcRef) = n };
         // d: unreachable old-gen object that must be swept.
-        let d = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
+        let d = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         unsafe { *(d.0 as *mut GcRef) = GcRef(0) };
 
         let mut root = o;
@@ -11875,11 +11883,7 @@ cache size\t: 8192 kB\n";
         // w: weakref born directly in the old generation, pointing at n.
         // `alloc_in_oldgen` records born-old weakrefs onto
         // `old_objects_with_weakrefs`, so no manual registration is needed.
-        let w = gc.alloc_in_oldgen(
-            wref_tid,
-            GcHeader::SIZE + crate::weakref::SIZEOF_WEAKREF,
-            ZeroPayload::Yes,
-        );
+        let w = gc.alloc_in_oldgen_clear(wref_tid, GcHeader::SIZE + crate::weakref::SIZEOF_WEAKREF);
         unsafe { *((w.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = n };
 
         let mut w_root = w;
@@ -11913,7 +11917,7 @@ cache size\t: 8192 kB\n";
         let target_tid = gc.register_type(TypeInfo::simple(16));
         let wref_tid = gc.register_type(TypeInfo::weakref());
 
-        let target = gc.alloc_in_oldgen(target_tid, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let target = gc.alloc_in_oldgen_clear(target_tid, GcHeader::SIZE + 16);
         let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
         unsafe {
             *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
@@ -11937,7 +11941,7 @@ cache size\t: 8192 kB\n";
         let target_tid = gc.register_type(TypeInfo::simple(16));
         let wref_tid = gc.register_type(TypeInfo::weakref());
 
-        let target = gc.alloc_in_oldgen(target_tid, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let target = gc.alloc_in_oldgen_clear(target_tid, GcHeader::SIZE + 16);
         let wref = gc.alloc_with_type(wref_tid, crate::weakref::SIZEOF_WEAKREF);
         unsafe {
             *((wref.0 + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef) = target;
@@ -12002,7 +12006,7 @@ cache size\t: 8192 kB\n";
         TRIGGERS.store(0, Ordering::Relaxed);
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
-        let obj = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         let mut root = obj;
         unsafe { gc.roots.add(&mut root) };
         GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
@@ -12051,9 +12055,9 @@ cache size\t: 8192 kB\n";
         gc.next_major_collection_threshold = 1_000_000_000.0;
         gc.max_delta = f64::MAX;
 
-        let live = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
-        let child = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
-        let finalizable = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
+        let live = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        let child = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        let finalizable = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         unsafe {
             *(live.0 as *mut GcRef) = GcRef::NULL;
             *(child.0 as *mut GcRef) = GcRef::NULL;
@@ -12092,8 +12096,8 @@ cache size\t: 8192 kB\n";
         gc.next_major_collection_threshold = 1_000_000_000.0;
         gc.max_delta = f64::MAX;
 
-        let live = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
-        let finalizable = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size, ZeroPayload::Yes);
+        let live = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
+        let finalizable = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         let young_child = gc.alloc_with_type(tid, ptr_size);
         assert!(gc.is_in_nursery(young_child.0));
         unsafe {
@@ -12132,7 +12136,7 @@ cache size\t: 8192 kB\n";
         TRIGGERS.store(0, Ordering::Relaxed);
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
-        let obj = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 16, ZeroPayload::Yes);
+        let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         let mut root = obj;
         unsafe { gc.roots.add(&mut root) };
 
@@ -12256,8 +12260,8 @@ cache size\t: 8192 kB\n";
         let mut gc = rrc_test_gc();
         let tid = gc.register_type(TypeInfo::object(64));
 
-        let mut kept = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 64, ZeroPayload::Yes);
-        let dying = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 64, ZeroPayload::Yes);
+        let mut kept = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 64);
+        let dying = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 64);
         assert!(!gc.is_in_nursery(kept.0) && !gc.is_in_nursery(dying.0));
 
         let kept_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
@@ -12322,7 +12326,7 @@ cache size\t: 8192 kB\n";
     fn mark_deallocating_replaces_the_link_with_the_sentinel() {
         let mut gc = rrc_test_gc();
         let tid = gc.register_type(TypeInfo::object(64));
-        let object = gc.alloc_in_oldgen(tid, GcHeader::SIZE + 64, ZeroPayload::Yes);
+        let object = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 64);
         let mirror = test_mirror(rawrefcount::REFCNT_FROM_PYRE + 1);
         gc.rawrefcount_create_link_pyre(object.0, mirror);
 
@@ -12347,7 +12351,7 @@ cache size\t: 8192 kB\n";
             let leaf = gc.register_type(TypeInfo::object(word));
             let holder = gc.register_type(TypeInfo::object_with_gc_ptrs(word, vec![0]));
 
-            let old = gc.alloc_in_oldgen(leaf, GcHeader::SIZE + word, ZeroPayload::Yes);
+            let old = gc.alloc_in_oldgen_clear(leaf, GcHeader::SIZE + word);
             let young = gc.alloc_with_type(holder, word);
             assert!(gc.is_in_nursery(young.0) && !gc.is_in_nursery(old.0));
             // The old object is reachable from the nursery object and from
