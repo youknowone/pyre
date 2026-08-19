@@ -5156,27 +5156,52 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     }
 
     // `start_pc` is a code-unit index; the exception table lookup takes byte offsets (×2).
-    let loop_in_try = unsafe {
+    let loop_handler = unsafe {
         pyre_interpreter::pycode::w_code_lookup_exceptiontable(
             w_code as pyre_object::PyObjectRef,
             (start_pc as u32) * 2,
         )
-    }
-    .is_some();
+    };
 
-    // `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY` drops the `loop_in_try` widening
-    // entirely, the counterpart of `PYRE_FBW_LOOPBODY_SCAN_FULL`, so the whole
-    // carve-out stays measurable without a rebuild.
-    let scan_end = if !std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some()
-        && (loop_in_try || std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some())
-    {
-        code.len()
+    // The loop body always scans.  What a covering exception-table entry adds
+    // is its HANDLER, not the whole tail: an uncaught raise inside a compiled
+    // loop has to be delivered into that handler and the backend cannot do it,
+    // so a marker there still declines the loop — but straight-line code after
+    // the loop is not reachable from the loop at all, and scanning it declines
+    // loops over markers they can never run.
+    //
+    // A generator is where the difference shows.  Its body is a single entry
+    // whose target is the PEP 479 epilogue, so a whole-tail scan sweeps up the
+    // `YIELD_VALUE` markers sitting between the back edge and that target and
+    // declines every generator's loop — including a loop that never goes near
+    // a yield.
+    //
+    // `PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY` drops the handler region too and
+    // `PYRE_FBW_LOOPBODY_SCAN_FULL` restores the whole-tail scan, so both ends
+    // of the carve-out stay measurable without a rebuild.
+    let loop_end = back_edge_end.unwrap_or(code.len());
+    let handler_py_pc = if std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some() {
+        None
+    } else if std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some() {
+        Some(0)
     } else {
-        back_edge_end.unwrap_or(code.len())
+        // `lookup_exceptiontable` reports byte offsets; a marker's owner is
+        // reported as an instruction index.
+        loop_handler.map(|(target, _, _)| target as usize / 2)
     };
     abort_permanent_pcs
         .into_iter()
-        .filter(|pc| *pc < scan_end)
+        .filter(|pc| {
+            if *pc < loop_end {
+                return true;
+            }
+            let Some(handler_py_pc) = handler_py_pc else {
+                return false;
+            };
+            // A marker whose owner cannot be named keeps declining, the
+            // conservative direction `abort_permanent_owner` documents.
+            abort_permanent_owner(w_code, &pjc, *pc).is_none_or(|(py_pc, _)| py_pc >= handler_py_pc)
+        })
         .find(|pc| !marker_is_load_fast_check_null_arm(w_code, &pjc, *pc))
 }
 
