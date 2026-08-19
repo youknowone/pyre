@@ -527,8 +527,10 @@ fn waitid_result_seq_type() -> PyObjectRef {
 }
 
 /// `posix.sched_param` structseq — the single field `app_posix.py:140-147`
-/// declares.  Its `__new__` takes the priority itself rather than a sequence,
-/// which is what `_structseq.py:102-107` already gives every 1-field structseq.
+/// declares.  `_structseq.py:102-107` already wraps the scalar a 1-field
+/// structseq is handed, so `__new__` only has to name the argument;
+/// `__reduce__` has to be replaced outright, because the generic one hands
+/// back `(tuple(self), self.__dict__)` and this `__new__` takes one argument.
 #[cfg(all(
     unix,
     any(
@@ -541,8 +543,56 @@ fn waitid_result_seq_type() -> PyObjectRef {
 fn sched_param_seq_type() -> PyObjectRef {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        crate::_structseq::make_struct_seq("posix.sched_param", &["sched_priority"]) as usize
+        let _roots = pyre_object::gc_roots::push_roots();
+        let ty = crate::_structseq::make_struct_seq("posix.sched_param", &["sched_priority"]);
+        pyre_object::gc_roots::pin_root(ty);
+        let ty_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+
+        let new_descr = crate::typedef::make_new_descr_with_signature(
+            crate::_structseq::structseq_descr_new,
+            crate::gateway::Signature::new(vec!["cls", "sched_priority"], None, None, 0, 0),
+        );
+        pyre_object::gc_roots::pin_root(new_descr);
+        let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let reduce = crate::make_builtin_function_with_arity("__reduce__", sched_param_reduce, 1);
+
+        unsafe {
+            let ty = pyre_object::gc_roots::shadow_stack_get(ty_slot);
+            let ns = pyre_object::w_type_get_dict_ptr(ty) as PyObjectRef;
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__new__",
+                pyre_object::gc_roots::shadow_stack_get(new_slot),
+            );
+            pyre_object::w_dict_setitem_str_no_proxy(ns, "__reduce__", reduce);
+            crate::baseobjspace::mutated(ty, None);
+            pyre_object::gc_roots::shadow_stack_get(ty_slot) as usize
+        }
     }) as PyObjectRef
+}
+
+/// `os_sched_param_reduce` — `(type(self), (self[0],))`, the one shape this
+/// type's own `__new__` can be called back with.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd"
+    )
+))]
+fn sched_param_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&inst) = args.first().filter(|inst| !inst.is_null()) else {
+        return Err(crate::PyError::type_error(
+            "sched_param.__reduce__ missing self",
+        ));
+    };
+    let cls = unsafe { (*inst).w_class };
+    let priority =
+        unsafe { pyre_object::w_tuple_getitem(inst, 0) }.unwrap_or_else(pyre_object::w_none);
+    let inner = pyre_object::w_tuple_new(vec![priority]);
+    Ok(pyre_object::w_tuple_new(vec![cls, inner]))
 }
 
 /// The `w_param` argument `sched_setparam` and `sched_setscheduler` share.

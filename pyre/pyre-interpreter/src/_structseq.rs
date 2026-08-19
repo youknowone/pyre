@@ -339,7 +339,7 @@ fn structseq_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// dict])` constructor.  The first `n_sequence_fields` items fill the
 /// tuple body; any surplus positional items, then the optional dict, then
 /// `None` defaults, fill the named-only extra fields.
-fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if args.len() < 2 || args[1].is_null() {
         return Err(PyError::type_error("structseq() requires class + sequence"));
     }
