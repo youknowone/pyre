@@ -873,12 +873,13 @@ Kept as-is; listed for completeness.
   the STORE_SUBSCR walker specialization gate, deleted.)
 - **Test harness (1)**: `PYRE_MIR_STRESS_LLBC`.
 
-## §5b — The const heap short-box gate (2026-08-19, default-OFF)
+## §5b — The const heap short-box gate (2026-08-19, added and retired)
 
-Added on `perf-bridge`. `shortpreamble.py:272-281` appends every produced op to
-`short_boxes` and `:369-373` is the const-result arm of that production, so
-upstream has no such switch; the gate exists because pyre cannot yet run that
-arm. Default-OFF, so an unset tree behaves exactly as its base does.
+Added on `perf-bridge` and deleted on it the same day, once the 431-fixture run
+below said the arm could run unconditionally. `shortpreamble.py:272-281`
+appends every produced op to `short_boxes` and `:369-373` is the const-result
+arm of that production, so upstream has no such switch; the gate existed only
+while pyre could not run that arm. It was default-OFF for as long as it stood.
 
 Turning it on crashed the JIT on seven of the 431 synthetic fixtures, with two
 distinct panics. **Both are fixed and all seven run clean with the gate on**
@@ -904,12 +905,23 @@ distinct panics. **Both are fixed and all seven run clean with the gate on**
 
 A three-fixture sample (`v4_onlylongtail` 66000, `v13_readdefs` 74000,
 `synth/closure_per_call` 733264) passed with the gate on even while those
-panics stood, which is why a narrow check reads as clear; the 431-fixture run
-is the one that decides whether the gate can go.
+panics stood, which is why a narrow check reads as clear.
 
-| var | reader | what it gates | polarity | retires when |
-|---|---|---|---|---|
-| PYRE_CONST_SHORT_BOXES | `majit-metainterp/src/optimizeopt/optimizer.rs` | appends the const-result heap short boxes to the exported short preamble, which `shortpreamble.py:272-281 ← :369-373` does unconditionally | OFF | both panics above are fixed, after which the gate is deleted with its OFF path |
+The 431-fixture run is what decided it. With the arm running: no panic and no
+output difference anywhere, and exactly one fixture's counters moved —
+`global_quasiimmut_invalidation`, `bridges_compiled 3 -> 2` with
+`guard_failures 602 -> 402`, the same two numbers on all three backends. One
+bridge fewer and 200 bailouts fewer is the arm doing its work, and it is the
+direction that fixture's own header already describes (the steady state no
+longer re-enters the invalidated loop). So the reader and its OFF path are
+deleted and all three baselines re-recorded, which is what leaves pyre running
+`shortpreamble.py:272-281` the way upstream does.
+
+Read the wasm leg only off a run that rebuilt the module. The first gate-on
+sweep reported `wasm 424/424` and it meant nothing: setting the env var
+changes no source, so cargo reused the module built without the arm. The
+numbers above come from the run after the reader was deleted, where the wasm
+module was rebuilt and landed on the same delta as the other two.
 
 ## §6 — The 66 gates the audits never listed (2026-08-07)
 

@@ -3396,11 +3396,10 @@ impl Optimizer {
                 }
                 self.produce_potential_short_preamble_ops(&mut short_boxes, &mut ctx);
                 let produced = short_boxes.produced_ops(&mut ctx);
-                let produced_const = if crate::optimizeopt::const_short_boxes_enabled() {
-                    short_boxes.produced_const_ops(&mut ctx)
-                } else {
-                    Vec::new()
-                };
+                // shortpreamble.py:272-281 — the `for short_op in
+                // self.const_short_boxes:` half of `create_short_boxes`, which
+                // upstream runs on every unroll with no condition on it.
+                let produced_const = short_boxes.produced_const_ops(&mut ctx);
                 // unroll.py:480 `short_inputargs = sb.create_short_inputargs(
                 // label_args + virtuals)` — read off the ShortBoxes object and
                 // carry to export_state through the ctx channel (sibling of
