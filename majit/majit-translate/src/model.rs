@@ -5205,6 +5205,7 @@ impl FuncEffects {
         }
         self.cannot_collect |= other.cannot_collect;
         self.random_effects_on_gcobjs |= other.random_effects_on_gcobjs;
+        self.canmallocgc |= other.canmallocgc;
         self.cannot_raise_assertion |= other.cannot_raise_assertion;
         self.memerror_only_assertion |= other.memerror_only_assertion;
         self.elidable |= other.elidable;
@@ -6442,6 +6443,44 @@ impl FunctionGraph {
 
 #[cfg(test)]
 mod tests {
+
+    /// `merge_from`'s contract is that every set flag in `other` wins and that
+    /// registration order does not matter. Each boolean is folded by hand, so
+    /// a field added to `FuncEffects` without a matching `|=` is silently
+    /// dropped — which is how `canmallocgc` was first written.
+    ///
+    /// The two directions are the two callers: `insert_function_graph_indexed`
+    /// folds a pending `external_funcobjs` record into a graph registered
+    /// later, and `GraphStore::insert` folds two aliases of one graph. A flag
+    /// that survives only one direction still loses metadata in the other.
+    #[test]
+    fn merge_from_folds_every_effect_flag_in_both_directions() {
+        let set = FuncEffects {
+            cannot_collect: true,
+            random_effects_on_gcobjs: true,
+            canmallocgc: true,
+            cannot_raise_assertion: true,
+            memerror_only_assertion: true,
+            elidable: true,
+            loop_invariant: true,
+            close_stack: true,
+            ..FuncEffects::default()
+        };
+
+        let mut into_default = FuncEffects::default();
+        into_default.merge_from(&set);
+        assert_eq!(
+            into_default, set,
+            "a set flag in `other` must win over a cleared `self`"
+        );
+
+        let mut from_default = set.clone();
+        from_default.merge_from(&FuncEffects::default());
+        assert_eq!(
+            from_default, set,
+            "a cleared flag in `other` must never unset `self`"
+        );
+    }
     use super::*;
 
     /// `CallTarget::SyntheticTransparentCtor::path_segments()` must
