@@ -7490,6 +7490,18 @@ fn loop_region_ranges(
             // Without a handler to name a start the jump is not an out-of-line
             // rejoin, and the span back to the body is kept whole rather than
             // guessed at.
+            //
+            // With several disjoint handlers laid out after the body this
+            // swallows the bytecode between the earliest one and the jump, and
+            // the two readers of these ranges want opposite things from that.
+            // `loop_region_for_iter_bodies_all_jit_safe` only loses inlining —
+            // an unsafe `FOR_ITER` in the swallowed span declines a loop that
+            // could not reach it — while narrowing to the handler nearest the
+            // jump would let it admit a frame whose unsafe `FOR_ITER` really
+            // does run.  The pessimistic side is the one that cannot be wrong,
+            // so it stands until the ranges are built from the exception
+            // table's `(start, end, target)` extents, which name the block a
+            // jump belongs to instead of inferring it from target order.
             let start = handler_starts
                 .iter()
                 .copied()
@@ -7554,6 +7566,13 @@ fn loop_region_contains_escaping_range_append(
     for (pc, unit) in code.instructions.iter().copied().enumerate() {
         let (instr, op_arg) = decode.get(unit);
         if !ranges.iter().any(|range| range.contains(&pc)) {
+            // The region is a body span plus the out-of-line handler spans that
+            // rejoin it, so the scan crosses gaps.  A partial match may not span
+            // one: a body's trailing `LOAD_ATTR append` would otherwise stay
+            // `AwaitRange` until a handler's own `LOAD_GLOBAL range` and two
+            // calls completed the pattern, reporting an `append(range(...))` no
+            // execution path performs.
+            state = State::Searching;
             continue;
         }
         match instr {
