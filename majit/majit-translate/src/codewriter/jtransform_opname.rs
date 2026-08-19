@@ -447,6 +447,37 @@ fn transduce_op(
                 result,
             );
         }
+        // `direct_call(funcptr, arg0, arg1, …)` → `Call`.  The callee is the
+        // `_func._name` carried by the leading funcptr constant
+        // (`ConstValue::LLPtr` → `_ptr_obj::Func`); it becomes a
+        // `CallTarget::FunctionPath` whose single segment matches the helper's
+        // registered `CallPath`, so `register_opname_helper_graph` makes it
+        // resolve as a *regular* callee rather than a residual synthetic
+        // fnaddr.  The trailing operands are the call arguments; `OpKind::Call`
+        // takes `Variable`s, so constant arguments (e.g. `ll_min(size, 1280)`)
+        // are materialised through the same `ConstInt`/`ConstBool` path the
+        // `int_*` arm uses.  The builder helpers' `direct_call`s all return a
+        // value (`ll_min` → uint, `mallocfn` → the char buffer), so the result
+        // is bound as a result var.
+        "direct_call" => {
+            let callee = callee_name_from_funcptr(&op.args[0]);
+            let target = crate::model::CallTarget::function_path([callee]);
+            let args: Vec<FVar> = op.args[1..]
+                .iter()
+                .map(|a| materialize(out, block, a))
+                .collect();
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::Call {
+                    target,
+                    args,
+                    result_ty,
+                },
+                result,
+            );
+        }
         other => panic!("jtransform_opname::lower_graph: unsupported opname {other:?}"),
     }
 }
@@ -488,6 +519,29 @@ fn materialize(out: &mut crate::model::FunctionGraph, block: BlockId, hlv: &Hlva
             result.set_concretetype(Some(lltype));
             result
         }
+    }
+}
+
+/// Decode a `direct_call` callee operand — the leading funcptr constant.
+/// `ConstValue::LLPtr` wraps an `_ptr` whose underlying object is an
+/// `_ptr_obj::Func`; its `_func._name` is the callee identity that keys the
+/// `CallPath` a helper is registered under.
+fn callee_name_from_funcptr(hlv: &Hlvalue) -> String {
+    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+    let Hlvalue::Constant(c) = hlv else {
+        panic!("jtransform_opname::lower_graph: direct_call callee operand is not a constant");
+    };
+    let ConstValue::LLPtr(ptr) = &c.value else {
+        panic!(
+            "jtransform_opname::lower_graph: direct_call callee constant is not an LLPtr: {:?}",
+            c.value
+        );
+    };
+    match ptr._obj0_value() {
+        Ok(Some(_ptr_obj::Func(func))) => func._name.clone(),
+        other => panic!(
+            "jtransform_opname::lower_graph: direct_call callee funcptr does not resolve to a Func object: {other:?}"
+        ),
     }
 }
 
@@ -1150,8 +1204,10 @@ mod tests {
     /// `New{owner:"stringbuilder"}`, `setfield(b, "current_pos", 0)` →
     /// `FieldWrite` with the `0` kept as an inline `Const`, and
     /// `cast_int_to_uint` → a droppable `UnaryOp`.  Exercised on a synthetic
-    /// graph because `ll_new`'s two `direct_call`s (`ll_min`/`mallocstr`) are
-    /// not yet lowered.
+    /// graph rather than the full `ll_new` because `build_ll_new_helper_graph`'s
+    /// unit test wires its two `direct_call` callees as dummy `None` consts (no
+    /// real funcptr), which the `direct_call` arm rejects; a faithful `ll_new`
+    /// drain needs real funcptr consts (a live rtyper).
     #[test]
     fn lower_graph_lowers_malloc_setfield_and_cast() {
         use crate::translator::rtyper::lltypesystem::rbuilder::STRINGBUILDER;
@@ -1227,6 +1283,84 @@ mod tests {
         assert_eq!(news, vec!["stringbuilder"]);
         assert_eq!(writes, vec![("current_pos".to_string(), ValueType::Int)]);
         assert_eq!(casts, vec!["cast_int_to_uint"]);
+        assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    /// `direct_call(funcptr, size, 1280)` (the `ll_min` shape from `ll_new`:
+    /// one Variable arg + one constant arg) → `Call{FunctionPath[callee]}`.
+    /// The callee name is read off the leading funcptr constant's
+    /// `_func._name`; the `1280` constant argument materialises through the
+    /// same `ConstInt` path the `int_*` arm uses because `OpKind::Call` takes
+    /// `Variable`s.  The funcptr is a hand-built `._example()` LLPtr whose
+    /// `_func._name` is the marker `"<example>"` (a live rtyper carries the
+    /// real helper name); this exercises the extraction + materialisation
+    /// mechanism without the `None` callee `build_ll_new_helper_graph`'s test
+    /// wires in.
+    #[test]
+    fn lower_graph_lowers_direct_call_to_a_function_path_call() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, PtrTarget};
+
+        let size = variable_with_lltype("size", LowLevelType::Unsigned);
+        let startblock = Block::shared(vec![Hlvalue::Variable(size.clone())]);
+        let return_var = variable_with_lltype("out", LowLevelType::Unsigned);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_direct_call_fragment",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+
+        // A funcptr constant `_func._name == "<example>"`.  The concretetype is
+        // inert to the name extraction, so a Void spelling suffices (matching
+        // the `dummy_funcptr_const` convention for callee consts).
+        let func_type = FuncType {
+            args: vec![LowLevelType::Unsigned, LowLevelType::Unsigned],
+            result: LowLevelType::Unsigned,
+        };
+        let funcptr = Ptr {
+            TO: PtrTarget::Func(func_type),
+        }
+        ._example();
+        let callee =
+            constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+
+        let out = variable_with_lltype("out", LowLevelType::Unsigned);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                callee,
+                Hlvalue::Variable(size),
+                constant_with_lltype(ConstValue::Int(1280), LowLevelType::Unsigned),
+            ],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+
+        let mut calls = Vec::new();
+        let mut const_ints = 0;
+        let mut residual = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::Call { target, args, .. } => calls.push((target.clone(), args.len())),
+                    OpKind::ConstInt(_) => const_ints += 1,
+                    other => residual.push(format!("{other:?}")),
+                }
+            }
+        }
+        assert_eq!(const_ints, 1, "the 1280 constant arg materialises once");
+        assert_eq!(calls.len(), 1);
+        let (target, argc) = &calls[0];
+        assert_eq!(*target, crate::model::CallTarget::function_path(["<example>"]));
+        assert_eq!(*argc, 2, "size + the materialised 1280");
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
     }
 }
