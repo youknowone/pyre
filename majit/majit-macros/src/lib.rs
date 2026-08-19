@@ -535,6 +535,12 @@ fn rpython_attribute_const_for(
         }
         "look_inside" => &[("_jit_look_inside_", true, false)],
         "jit_loop_invariant" => &[("_jit_loop_invariant_", true, false)],
+        // `rlib/jit.py:151 def unroll_safe` emits no policy fn, so a
+        // sibling const would be rejected in a trait impl — `unroll_safe`
+        // decorates those (`majit-macros/tests/macros.rs` `NameCollider`).
+        // It stays free-fn-only here and reaches methods through the
+        // body-local marker instead, as `jit_elidable` does.
+        "unroll_safe" => &[("_jit_unroll_safe_", true, false)],
         _ => return None,
     };
     let consts: Vec<proc_macro2::TokenStream> = markers
@@ -2055,22 +2061,23 @@ pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     // RPython attribute-name parity: `rlib/jit.py:159 func._jit_unroll_safe_
-    // = True`.  Emit a module-level `pub const _jit_unroll_safe_<NAME>:
-    // bool = true` next to the wrapper so `rg _jit_unroll_safe_` finds
-    // the parity counterpart in both pyre and PyPy.  Skip for methods
-    // (`self`-receiver) because trait-impl blocks reject foreign
-    // associated items — see `rpython_attribute_const_for`'s receiver
-    // guard for the same reasoning.
-    let unroll_safe_const = if sig.receiver().is_none() {
-        let const_name = format_ident!("_jit_unroll_safe_{}", sig.ident);
-        Some(quote! {
-            #[doc(hidden)]
-            #[allow(non_upper_case_globals)]
-            #vis const #const_name: bool = true;
-        })
-    } else {
-        None
-    };
+    // = True`.  `front/llbc_hints.rs` harvests `_jit_unroll_safe_<NAME>` and
+    // nothing else; the marker this used to leave in the body was spelled
+    // `_MAJIT_UNROLL_SAFE`, carrying neither the prefix nor the function
+    // name, so it was never read — and a method got no sibling const, so a
+    // method got no hint at all.  `@unroll_safe` decorates methods upstream
+    // (`pyframe.py` `fast2locals`, `peekvalues`, `dropvalues`), which is
+    // exactly the shape that was being dropped.
+    //
+    // The body-local spelling is what carries it, as for `jit_elidable`: a
+    // trait impl rejects a foreign associated const, and an attribute macro
+    // cannot tell an inherent impl from a trait impl.  Charon promotes a
+    // body-local const under the method's own path, and
+    // `llbc_hints::marker_path_to_fn_path` already resolves that spelling.
+    // A free function additionally gets the module-level sibling, so
+    // `rg _jit_unroll_safe_` still finds the parity counterpart there.
+    let marker = format_ident!("_jit_unroll_safe_{}", sig.ident);
+    let unroll_safe_const = rpython_attribute_const_for("unroll_safe", sig, vis);
 
     let expanded = quote! {
         #(#attrs)*
@@ -2078,8 +2085,8 @@ pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         #vis #sig {
             #[doc(hidden)]
-            #[allow(dead_code)]
-            const _MAJIT_UNROLL_SAFE: bool = true;
+            #[allow(non_upper_case_globals, dead_code)]
+            const #marker: bool = true;
             #block
         }
 

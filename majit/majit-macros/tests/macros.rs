@@ -676,9 +676,9 @@ mod jit_module {
         assert!(std::hint::black_box(_elidable_function_pure_or_memerror));
         // Methods (`self`-receiver) skip module-level const emission —
         // `rpython_attribute_const_for`'s receiver guard avoids
-        // trait-impl associated-item conflicts.  RPython's
-        // `func._elidable_function_` parity at method scope is left for
-        // a follow-up slice that knows the surrounding `impl` context.
+        // trait-impl associated-item conflicts.  A method reaches the
+        // harvester through the body-local marker instead; see
+        // `test_unroll_safe_marker_reaches_methods`.
 
         // `rlib/jit.py:139 _jit_look_inside_ = False` — both opaque
         // variants share the upstream attribute.
@@ -693,6 +693,56 @@ mod jit_module {
 
         // `rlib/jit.py:159 _jit_unroll_safe_ = True`.
         assert!(std::hint::black_box(_jit_unroll_safe_unrolled_helper));
+    }
+
+    mod unroll_safe_method_module {
+        use majit_macros::unroll_safe;
+
+        pub struct Counter(pub i64);
+
+        impl Counter {
+            /// The marker `unroll_safe` leaves on a method is body-local, so
+            /// the body is the only scope that can name it.  Returning it is
+            /// the assertion: it has to be spelled
+            /// `_jit_unroll_safe_<NAME>` — what `front/llbc_hints.rs`
+            /// harvests — or this does not compile.
+            #[unroll_safe]
+            pub fn bump(&mut self) -> bool {
+                self.0 += 1;
+                _jit_unroll_safe_bump
+            }
+        }
+
+        pub trait Step {
+            fn step(&mut self) -> bool;
+        }
+
+        impl Step for Counter {
+            /// The same marker inside a trait impl, which is what rules out
+            /// a sibling associated const: the trait does not declare one,
+            /// so emitting it here is `error[E0438]`.
+            #[unroll_safe]
+            fn step(&mut self) -> bool {
+                self.0 += 2;
+                _jit_unroll_safe_step
+            }
+        }
+    }
+
+    /// A method carries `unroll_safe` under its own name.
+    ///
+    /// The marker used to be spelled `_MAJIT_UNROLL_SAFE`, carrying neither
+    /// the `_jit_unroll_safe_` prefix nor the function name, so nothing
+    /// harvested it; a free function was covered only by the module-level
+    /// sibling const, which a method never gets.
+    #[test]
+    fn test_unroll_safe_marker_reaches_methods() {
+        use unroll_safe_method_module::{Counter, Step};
+
+        let mut counter = Counter(0);
+        assert!(counter.bump());
+        assert!(counter.step());
+        assert_eq!(counter.0, 3);
     }
 
     mod look_inside_alias_module {
