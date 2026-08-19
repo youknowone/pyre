@@ -714,10 +714,19 @@ pub fn emit_make_function_inline(
         crate::descr::w_function_size_descr(),
     );
     ctx.heap_cache_mut().new_object(new_op);
+    // `Function.mutate_slots` is not a GC pointer, so `rewrite.py:498-504
+    // clear_gc_fields` does not emit its NULL and incminimark does not
+    // zero-fill.  Left unwritten it keeps whatever the address last held, and
+    // `function_destructor` would free that word as a `Box` on sweep.
+    let null_mutate_slots = ctx.const_int(0);
     for (descr, value) in [
         (
             crate::descr::function_header_w_class_descr(),
             header_w_class,
+        ),
+        (
+            crate::descr::function_mutate_slots_descr(),
+            null_mutate_slots,
         ),
         (crate::descr::function_code_descr(), code),
         (

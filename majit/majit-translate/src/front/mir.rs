@@ -23136,10 +23136,10 @@ mod tests {
     ///
     /// The literal is READ from the artefact this fold consumes, not
     /// computed: `pyre-interpreter.ullbc` carries exactly one layout
-    /// entry for `Function`, `"size":176`, `"align":8`, `"repr_algo":"C"`,
-    /// with 21 `field_offsets` running `[0,16,24,…,168]`.  A source census
-    /// of `struct Function` reads the same 21 fields, and `168 + 8` is the
-    /// same 176.  Because there is a single entry, `select_target_layout`
+    /// entry for `Function`, `"size":184`, `"align":8`, `"repr_algo":"C"`,
+    /// with 22 `field_offsets` running `[0,16,24,…,176]`.  A source census
+    /// of `struct Function` reads the same 22 fields, and `176 + 8` is the
+    /// same 184.  Because there is a single entry, `select_target_layout`
     /// resolves it through its sole-entry fallback even when `TARGET` is
     /// unset, so a declining fold cannot be the reason this reds — the
     /// second assertion below is what catches that case.
@@ -23168,8 +23168,8 @@ mod tests {
 
         // The `size_of::<Function>()` const read folded to its byte size.
         assert!(
-            ops.iter().any(|k| matches!(k, OpKind::ConstInt(176))),
-            "expected a ConstInt(176) for the folded FUNCTION_OBJECT_SIZE"
+            ops.iter().any(|k| matches!(k, OpKind::ConstInt(184))),
+            "expected a ConstInt(184) for the folded FUNCTION_OBJECT_SIZE"
         );
         // No residual accessor call to the const remains.
         let residual = ops.iter().any(|k| {
