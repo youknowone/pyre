@@ -158,8 +158,17 @@ mod decompressor_methods {
                     "Decompressor is unusable after a previous error",
                 ));
             }
+            // A cap too large for the platform's index type is an error, not
+            // silently unlimited -- only a negative value means unlimited.
+            let max_length = if max_length < 0 {
+                None
+            } else {
+                Some(usize::try_from(max_length).map_err(|_| {
+                    crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+                })?)
+            };
             decompressor
-                .decompress(&data, usize::try_from(max_length).ok())
+                .decompress(&data, max_length)
                 .map_err(bz2_error)
         }
 
