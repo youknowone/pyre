@@ -21889,7 +21889,7 @@ pub(crate) fn buffer_as_bytes_like(
     // `W_MMap.readbuf_w` — the mapping is a bytes-like source in its own
     // right, so `bytes(m)` / `bytearray(m)` copy it here instead of falling
     // through to the iterable path.
-    #[cfg(all(unix, not(feature = "sandbox")))]
+    #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
     if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
         let (address, length, _readonly) = view?;
         let data = unsafe { std::slice::from_raw_parts(address as *const u8, length) };

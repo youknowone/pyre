@@ -111,3 +111,8 @@ CLAUDE.md
 
 # Scratch probes, profiles and baseline binaries (not committed)
 /scratchpad/
+
+# The scratch files `lib-python/3/test` writes into the working directory
+# (`test.support.TESTFN` is `@test_<pid>_tmp<suffix>`), left behind whenever a
+# run dies before its `tearDown`.
+/@test_*_tmp*

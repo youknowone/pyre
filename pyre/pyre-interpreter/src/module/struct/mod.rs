@@ -686,7 +686,7 @@ unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError>
         }
         // `W_MMap.writebuf_w` — the live mapping, unless it was opened
         // read-only.
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
             let (address, length, readonly) = view?;
             if !readonly {
@@ -1523,7 +1523,7 @@ unsafe fn readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
             return Ok(bytesobject::bytes_like_data(obj));
         }
         // `W_MMap.readbuf_w` — the live mapping.
-        #[cfg(all(unix, not(feature = "sandbox")))]
+        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
             let (address, length, _readonly) = view?;
             return Ok(std::slice::from_raw_parts(address as *const u8, length));

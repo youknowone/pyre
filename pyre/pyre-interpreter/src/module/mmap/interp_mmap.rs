@@ -1466,11 +1466,7 @@ fn mmap_resize_mapping(
         // here until one of the two remaps below puts a mapping back.
         mmap_native(obj)?.mapped = None;
         let remap = |size: usize, reject_existing: bool| {
-            if named {
-                mmap_remap_named(handle, offset, access, size, &tagname, reject_existing)
-            } else {
-                host_mmap::map_handle(handle, offset, size, access).map(MappedObj::Mapped)
-            }
+            mmap_remap_named(handle, offset, access, size, &tagname, reject_existing)
         };
         match host_mmap::extend_file(handle, offset + newsize as i64)
             .and_then(|()| remap(newsize, true))
@@ -1524,10 +1520,12 @@ fn mmap_resize_mapping(
     Ok(())
 }
 
-/// Recreate the Windows mapping object under its original tag name, matching
-/// `rmmap.py:634-645`.  `CreateFileMappingW` reports ERROR_ALREADY_EXISTS when
-/// another mapping still owns the name; a resize surfaces that OS error, while
-/// the recovery remap is allowed to reopen the existing object.
+/// Recreate the Windows mapping object under the name it already had, matching
+/// `rmmap.py:635-636`, which passes `self.tagname` whether or not one was
+/// given.  `CreateFileMappingW` reports ERROR_ALREADY_EXISTS when another
+/// mapping still owns the name; a resize surfaces that OS error, while the
+/// recovery remap is allowed to reopen the existing object.  An untagged
+/// mapping cannot reach it — a zero-length name is not a name.
 #[cfg(windows)]
 fn mmap_remap_named(
     handle: host_mmap::Handle,
@@ -1751,7 +1749,15 @@ fn mmap_construct(
                 if file_size == 0 {
                     return Err(crate::PyError::value_error("cannot mmap an empty file"));
                 }
-                if offset_usize > file_size {
+                // `rmmap.py:757-761` rejects only offset > size, which
+                // leaves an offset landing exactly on EOF asking `mmap(2)` for
+                // a zero-length mapping — EINVAL rather than the ValueError the
+                // caller is told to expect.  `mmapmodule.c new_mmap_object`
+                // refuses it as `if (offset >= status.st_size)` (`:1872`, and
+                // `:2087` for the Windows block) — read at v3.14.6 in the
+                // checkout at Z:/cpython; not executable on the Windows host
+                // this was written on.
+                if offset_usize >= file_size {
                     return Err(crate::PyError::value_error(
                         "mmap offset is greater than file size",
                     ));
@@ -1884,8 +1890,15 @@ fn mmap_construct(
                 if file_len == 0 {
                     return Err(crate::PyError::value_error("cannot mmap an empty file"));
                 }
-                // `rmmap.py:943-945` rejects only offset > size.
-                if offset > file_len {
+                // `rmmap.py:943-945` rejects only offset > size, so an
+                // offset landing exactly on EOF resolves to a zero-length
+                // mapping and asks `MapViewOfFile` for an empty view, which
+                // fails with a Win32 error instead.  `mmapmodule.c
+                // new_mmap_object` refuses the offset one step earlier, `if
+                // (offset >= size)`, in its Windows size block (`:2087`; the
+                // POSIX one spells the same test at `:1872`) — read at v3.14.6
+                // in the checkout at Z:/cpython.
+                if offset >= file_len {
                     return Err(crate::PyError::value_error(
                         "mmap offset is greater than file size",
                     ));
@@ -1895,18 +1908,20 @@ fn mmap_construct(
                 if map_size as i64 != remaining {
                     return Err(crate::PyError::value_error("mmap length is too large"));
                 }
-            } else {
-                // `rmmap.py:949-950` rejects a mapping past EOF rather than
-                // letting `CreateFileMapping` grow the file to fit it.
-                let required = offset
-                    .checked_add(map_size as i64)
-                    .ok_or_else(|| crate::PyError::value_error("mmap length is too large"))?;
-                if required > file_len {
-                    return Err(crate::PyError::value_error(
-                        "mmap length is greater than file size",
-                    ));
-                }
             }
+            // A given length is not measured against the file at all here.
+            // `CreateFileMapping` is asked for `offset + length` and grows the
+            // file to it, so a length past EOF is how the mapping is extended
+            // on this platform.  `rmmap.py:949-950` rejects it with "mmap
+            // length is greater than file size" instead; the run fails on that
+            // at `lib-python/3/test/test_mmap.py:202-209`, which calls
+            // `mmap(fileno(), mapsize + 1)` and, on `sys.platform` starting
+            // with "win", turns a ValueError into
+            // `self.fail("Opening mmap with size+1 should work on Windows.")`.
+            // `pypy/module/mmap/test/test_mmap.py:747-749` concedes the same
+            // point from the other side, skipping its own
+            // `raises(ValueError, ...)` under `os.name == "nt"` with the note
+            // "this should work under windows".
         }
         file_handle = Some(guard);
     }
@@ -1914,10 +1929,17 @@ fn mmap_construct(
     let handle = file_handle
         .as_ref()
         .map_or(host_mmap::INVALID_HANDLE, |guard| guard.0);
-    // A tag names a mapping object other processes can open by the same name,
-    // which memmap2 cannot express, so those go straight through
-    // `CreateFileMappingW`/`MapViewOfFile` (`rmmap.py:999-1004`).
-    let (mapped, owned_handle) = if !tagname.is_empty() {
+    // `rmmap.py:998-1000` reaches every file-backed mapping through one
+    // `CreateFileMapping(m.file_handle, NULL, flProtect, size_hi, size_lo,
+    // m.tagname)`, where the maximum size is `offset + map_size` and the name
+    // is whatever `tagname` holds — the empty string when none was given.  A
+    // zero-length name is not a name: two mappings created with one do not
+    // report ERROR_ALREADY_EXISTS to each other, so the untagged mapping needs
+    // no second route.  memmap2 is the wrong one to give it, because it asks
+    // for a maximum size of 0, which means "the file as it stands" and cannot
+    // extend it, and because it rounds the offset down to the allocation
+    // granularity instead of letting `MapViewOfFile` reject an unaligned one.
+    let (mapped, owned_handle) = if file_handle.is_some() || !tagname.is_empty() {
         let named = host_mmap::create_named_mapping(
             handle,
             tagname,
@@ -1932,14 +1954,6 @@ fn mmap_construct(
             MappedObj::Named(named),
             file_handle.map_or(host_mmap::INVALID_HANDLE, |guard| guard.release()),
         )
-    } else if let Some(guard) = file_handle {
-        let handle = guard.release();
-        let mapped = host_mmap::map_handle(handle, offset, map_size, mmap_access_mode(access))
-            .map_err(|e| {
-                host_mmap::close_handle(handle);
-                mmap_io_err(e, "mmap")
-            })?;
-        (MappedObj::Mapped(mapped), handle)
     } else {
         let mapped = host_mmap::map_anon(map_size).map_err(|e| mmap_io_err(e, "mmap"))?;
         (MappedObj::Mapped(mapped), host_mmap::INVALID_HANDLE)
