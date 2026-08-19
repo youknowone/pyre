@@ -435,14 +435,23 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
             "dist() takes exactly 2 arguments",
         ));
     }
-    let p: Vec<f64> = crate::builtins::collect_iterable(args[0])?
-        .iter()
-        .map(|&a| try_get_double(a))
-        .collect::<Result<Vec<_>, _>>()?;
-    let q: Vec<f64> = crate::builtins::collect_iterable(args[1])?
-        .iter()
-        .map(|&a| try_get_double(a))
-        .collect::<Result<Vec<_>, _>>()?;
+    let collect_coords = |obj: PyObjectRef| -> Result<Vec<f64>, crate::PyError> {
+        let items = crate::builtins::collect_iterable(obj)?;
+        // Conversion can call an element's `__float__`, so publish the whole
+        // materialized sequence before converting any member.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let items_base = pyre_object::gc_roots::shadow_stack_len();
+        for &item in &items {
+            pyre_object::gc_roots::pin_root(item);
+        }
+        (0..items.len())
+            .map(|index| {
+                try_get_double(pyre_object::gc_roots::shadow_stack_get(items_base + index))
+            })
+            .collect()
+    };
+    let p = collect_coords(args[0])?;
+    let q = collect_coords(args[1])?;
     if p.len() != q.len() {
         return Err(crate::PyError::value_error(
             "both points must have the same number of dimensions",
@@ -1207,13 +1216,24 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
             "prod() takes at least 1 argument",
         ));
     }
-    let iterable = positional[0];
-    let items = crate::builtins::collect_iterable(iterable)?;
-    let mut acc = start;
-    for item in items {
-        acc = crate::baseobjspace::mul(acc, item)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let acc_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(start);
+    let items = crate::builtins::collect_iterable(positional[0])?;
+    let items_base = pyre_object::gc_roots::shadow_stack_len();
+    for &item in &items {
+        pyre_object::gc_roots::pin_root(item);
     }
-    Ok(acc)
+    // Multiplication can call `__mul__`; reload both operands after every
+    // collection and keep the running product in its rooted slot.
+    for index in 0..items.len() {
+        let product = crate::baseobjspace::mul(
+            pyre_object::gc_roots::shadow_stack_get(acc_slot),
+            pyre_object::gc_roots::shadow_stack_get(items_base + index),
+        )?;
+        pyre_object::gc_roots::shadow_stack_set(acc_slot, product);
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(acc_slot))
 }
 
 /// math.sumprod(p, q) — multiply paired elements, then sum. Added in
@@ -1227,24 +1247,26 @@ pub fn sumprod(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let p = crate::builtins::collect_iterable(args[0])?;
-    let q = crate::builtins::collect_iterable(args[1])?;
-    if p.len() != q.len() {
-        return Err(crate::PyError::value_error(
-            "Inputs are not the same length",
-        ));
-    }
-    // `mul` and `add` dispatch to the operands' `__mul__` / `__add__`, so a
-    // Decimal or Fraction element makes every turn a collection point.  Both
-    // collected sequences and the running total are native locals no root
-    // walker updates, so publish them and read each operand back per turn.
+    // Collecting the second input runs its iterator, so publish the first
+    // materialized sequence before that call.
     let _roots = pyre_object::gc_roots::push_roots();
     let p_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in &p {
         pyre_object::gc_roots::pin_root(item);
     }
+    let q = crate::builtins::collect_iterable(args[1])?;
+    // `mul` and `add` dispatch to the operands' `__mul__` / `__add__`, so a
+    // Decimal or Fraction element makes every turn a collection point.  Both
+    // collected sequences and the running total are native locals no root
+    // walker updates, so publish them and read each operand back per turn.
     let q_base = pyre_object::gc_roots::shadow_stack_len();
     for &item in &q {
         pyre_object::gc_roots::pin_root(item);
+    }
+    if p.len() != q.len() {
+        return Err(crate::PyError::value_error(
+            "Inputs are not the same length",
+        ));
     }
     // The accumulator starts as int 0 so type coercion follows the pure
     // Python `total = 0; total += p_i * q_i` recipe: int stays int, and a
