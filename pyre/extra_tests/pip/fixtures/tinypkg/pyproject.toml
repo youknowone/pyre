@@ -1,0 +1,13 @@
+# `build-backend` is spelled out even though `tinybackend` is the only backend
+# here: a `[build-system]` table without it means the legacy setuptools backend
+# and `requires = ["setuptools>=40.8.0"]`, which would turn this fixture --
+# whose whole point is a PEP 517 build that needs nothing installed -- into a
+# second copy of the `stpkg` one.
+[build-system]
+requires = []
+build-backend = "tinybackend"
+backend-path = ["."]
+
+[project]
+name = "tinypkg"
+version = "0.1.0"

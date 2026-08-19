@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=40.8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stpkg"
+version = "0.2.0"
+
+[project.scripts]
+stpkg-hi = "stpkg:main"
+
+[tool.setuptools]
+py-modules = ["stpkg"]

@@ -44,14 +44,48 @@ works.  `testutils.py` is the helper module shipped with the snippets
   rejects missing header fields. Each script cites the upstream file:line it guards;
   passing requires `exit 0` AND the final stdout line being `OK`.  Runner:
   `pyre/extra_tests/parity_tests/run.py`.
+- `pip/` — one stateful end-to-end sequence rather than a corpus: a release
+  binary is driven through `-m venv`, `ensurepip`, a wheel install, a PEP 517
+  build under real isolation, the console script and metadata that install
+  produced, and an uninstall.  Everything it resolves is a wheel the checkout
+  already carries (`lib-python/3/ensurepip/_bundled`, `lib-python/3/test/wheeldata`),
+  so it never reaches an index — and one of its checks asserts that by
+  requiring a plain `pip download` to fail.  It sits apart from `snippets/`
+  because it is stateful, because it needs a per-check timeout an order of
+  magnitude larger, and because the reference interpreter is not a comparand
+  here: pip succeeding under CPython says nothing about pyre, so CPython is
+  used only as a control, and only after something has already failed, to
+  separate a runtime defect from a rotted fixture.  Runner:
+  `pyre/extra_tests/pip/run.py`.
 - `upstream/` — no tests of its own: a runner plus a driver for the
   vendored PyPy tree at the repository **root** `extra_tests/`.  Those
   files stay where upstream put them and run in place, so anything they
   already cover does not get rewritten under `parity_tests/`.
   Runner: `pyre/extra_tests/upstream/run.py`.
 
-All three runners share the same backend discovery (cpython +
-pyre-dynasm + pyre-cranelift) and exit code semantics.
+The runners share the same backend discovery (pyre-dynasm + pyre-cranelift,
+plus cpython where a reference comparison is the point) and exit code
+semantics.
+
+## Running the pip gate
+
+```sh
+python3 pyre/extra_tests/pip/run.py                # every backend present
+python3 pyre/extra_tests/pip/run.py --dynasm-only  # what CI runs
+python3 pyre/extra_tests/pip/run.py --keep         # keep the working tree
+python3 pyre/extra_tests/pip/run.py --with-network # also resolve from a real index
+```
+
+Each backend gets its own temporary tree, kept and named on failure.  The
+fixtures are copied into it before anything is built, because installing from
+a source directory writes build artefacts beside it.  `--with-network` adds
+the one thing the gate cannot assert offline — that an index answers over TLS
+— and is never what CI runs, so a package server being down cannot turn a
+merge red.
+
+No version is written down: the pip and setuptools versions come from the
+filenames of the wheels in the checkout, so a stdlib sync that bumps either
+needs no edit here.
 
 ## The vendored root `extra_tests/`
 

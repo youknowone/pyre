@@ -439,6 +439,21 @@ jobs:
       if: ${{ !cancelled() && runner.os == 'Linux' }}
       shell: bash
       run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
+    - name: Run pyre/extra_tests/pip (hermetic pip end-to-end)
+      # Drives the binary built above through venv, ensurepip, a wheel
+      # install, a PEP 517 build under real isolation, and an uninstall.
+      # Everything it resolves is a wheel already in the checkout, so it never
+      # reaches an index — and one of its checks asserts that, by requiring a
+      # plain `pip download` to fail.
+      #
+      # It rides this job's Linux copy for the same reason the suite below
+      # does: the release binary and the interpreter to drive it are already
+      # here. Ahead of the suite so its verdict lands early rather than after
+      # the suite's wall time, and `--dynasm-only` because the restored target
+      # directory can hold a `pyre-cranelift` this job never built.
+      if: ${{ !cancelled() && runner.os == 'Linux' }}
+      shell: bash
+      run: ${{ steps.cpython.outputs.python-path }} pyre/extra_tests/pip/run.py --dynasm-only
     - name: Run CPython suite (gate regressions, JIT on)
       # This is the only place CI runs the suite — `pyre/check.py` keeps the
       # stage behind `--cpython-suite`, which no job passes, so its wall time is
