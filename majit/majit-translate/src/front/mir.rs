@@ -2813,6 +2813,21 @@ impl std::error::Error for LowerError {}
 // Lowering state
 // ---------------------------------------------------------------------------
 
+/// Identity carrier for the length-prefixed `Ptr(GcArray(PyObjectRef))`
+/// block — the `ItemsBlock` behind list / tuple storage and the
+/// `FixedObjectArray` behind frame locals and mro blocks, which share one
+/// tid and one runtime descr singleton (`pyobject_gcarray_descr`).
+///
+/// `descr.py:348-378 get_array_descr` keys `cache[ARRAY]` on the ARRAY
+/// lltype's object identity; every lltype op carries its `concretetype`,
+/// so upstream never meets an identity-less array. The arms below reach
+/// these blocks through devirtualized accessor calls rather than a MIR
+/// `Place` projection, so there is no type to read the identity off —
+/// name it explicitly instead. Without a name `arraydescrof_concrete`
+/// returns no descr-set key, `canonicalize_keyed_descrs` drops the whole
+/// set, and the callee's `EffectInfo` degrades to `EF_RANDOM_EFFECTS`.
+const PYOBJECT_GCARRAY_TYPE_ID: &str = "pyre::pyobject_gcarray";
+
 /// The `(base, index)` operands of a devirtualized workspace index call,
 /// recorded for the paired `*p = v` write.  Each operand keeps the
 /// resolving-block Variable plus its source MIR local (`None` for a
@@ -2825,6 +2840,9 @@ struct IndexElemAlias {
     base_var: Variable,
     index_local: Option<usize>,
     index_var: Variable,
+    /// Identity the paired write must repeat, so `arr[i] = v` keys the
+    /// same ARRAY as the `arr[i]` read that recorded this alias.
+    array_type_id: Option<String>,
 }
 
 struct Lowering<'a> {
@@ -4271,7 +4289,7 @@ impl<'a> Lowering<'a> {
                         index: idx,
                         value: value.clone(),
                         item_ty: tyref_to_value_type(dest_ty, self.llbc),
-                        array_type_id: None,
+                        array_type_id: alias.array_type_id.clone(),
                         nolength: false,
                     }
                 } else {
@@ -7334,6 +7352,7 @@ impl<'a> Lowering<'a> {
                             base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
+                            array_type_id: None,
                         },
                     );
                     self.local_var[dest_local] = Some(res);
@@ -7402,7 +7421,7 @@ impl<'a> Lowering<'a> {
                             base: args[0].clone(),
                             index: args[1].clone(),
                             item_ty: ValueType::Ref(None),
-                            array_type_id: None,
+                            array_type_id: Some(PYOBJECT_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
                             pure: false,
                         },
@@ -7414,6 +7433,7 @@ impl<'a> Lowering<'a> {
                             base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
+                            array_type_id: Some(PYOBJECT_GCARRAY_TYPE_ID.to_string()),
                         },
                     );
                     self.local_var[dest_local] = Some(res);
@@ -7446,7 +7466,7 @@ impl<'a> Lowering<'a> {
                             index: args[1].clone(),
                             value: LinkArg::Value(args[2].clone()),
                             item_ty: ValueType::Ref(None),
-                            array_type_id: None,
+                            array_type_id: Some(PYOBJECT_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
                         },
                     });
