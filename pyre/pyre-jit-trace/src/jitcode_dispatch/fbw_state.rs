@@ -1747,7 +1747,22 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 /// is actually recursing, while `for-iter` fires on any code object whose
 /// bytecode contains a `FOR_ITER` anywhere, whether or not an iterator is in
 /// flight at the decline point.  Reporting them apart is what lets a census
-/// say how much of the decline the loose clause is carrying.
+/// say how much of the decline the loose clause is carrying: over 441 synth +
+/// 83 parity fixtures it fires 8 times on 6 fixtures for its 2 witnesses.
+///
+/// The looseness is load-bearing and the clause must stay FORWARD-looking.
+/// Requiring that a consume have ALREADY run in that frame — asking
+/// `FBW_FORITER_INFLIGHT`, whose `Jit` entries carry the `jitcode_index` each
+/// consume ran in, which needs no per-frame Python pc — cuts the census to 3
+/// fires and produces WRONG OUTPUT on `foriter_exempt_shared_generator` on all
+/// three backends, plus a jitstats regression on `inline_subwalk_user_iterator`
+/// (loops_aborted 1 -> 5, `fbw_rolled_back_with_effects` 0 -> 5, loops_compiled
+/// 3 -> 2) and on `list_append_write_barrier_gc` (loops_compiled 13 -> 12).
+/// Inlining the residual is what CARRIES the walk to the consume, so a decline
+/// conditioned on the consume having happened always arrives one step late: the
+/// witness still declined, at pc 533 instead of 261.  A real narrowing has to
+/// ask whether a `FOR_ITER` is REACHABLE from the frame's current position,
+/// which does need the per-frame pc `InlineFrame` does not carry.
 fn fbw_inline_callee_hazardous<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<(usize, &'static str)> {
