@@ -966,13 +966,14 @@ impl ShortBoxes {
             // shortpreamble.py:277-278: copy_and_change(opnum, [preamble_arg] + args[1:])
             let mut new_args = vec![preamble_arg];
             new_args.extend_from_slice(&getfield_op.getarglist()[1..]);
-            let mut new_op = Op::with_descr(
-                getfield_op.opcode,
-                &new_args,
-                getfield_op
-                    .getdescr()
-                    .unwrap_or_else(|| panic!("const_short_boxes heap op without descr")),
-            );
+            // A heap op reaches here with its descr, so this is the same
+            // never-taken arm `produce_heap_field` and `produce_heap_array_item`
+            // spell as `getdescr()?`; drop the short box rather than abort the
+            // optimizer if that ever stops holding.
+            let Some(descr) = getfield_op.getdescr() else {
+                continue;
+            };
+            let mut new_op = Op::with_descr(getfield_op.opcode, &new_args, descr);
             // shortpreamble.py:277 `copy_and_change` produces a fresh result
             // box distinct from `short_op.res`; the latter remains the Const.
             new_op
