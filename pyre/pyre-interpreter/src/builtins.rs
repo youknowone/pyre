@@ -4902,9 +4902,10 @@ pub(crate) fn clinic_arity(
 /// `Arguments._match_signature` (`pypy/interpreter/argument.py`). Each
 /// slot is filled by a positional, then by a keyword of the matching
 /// name; an absent optional slot becomes `PY_NULL` (the generated
-/// `#[pyre_function]` unwrap reads that as "argument omitted"). An absent
-/// required slot, an unknown keyword, a keyword duplicating a positional,
-/// or too many positionals raises `TypeError`.
+/// `#[pyre_function]` unwrap reads that as "argument omitted"), and a
+/// `PY_NULL` arriving in `args` is read the same way. An absent required
+/// slot, an unknown keyword, a keyword duplicating a positional, or too many
+/// positionals raises `TypeError`.
 ///
 /// This is the consumer-side counterpart that lets a builtin resolve
 /// keywords by parameter name without a per-function `Signature`; the
@@ -4917,9 +4918,15 @@ pub(crate) fn bind_builtin_kwargs(
     fn_name: &str,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let (positional, kwargs) = split_builtin_kwargs(args);
+    // A builtin registered with a `Signature` reaches its body through
+    // `bind_kwargs_to_signature`, which lays out every declared slot and
+    // leaves an omitted one `PY_NULL`; a positional-only registration hands
+    // the body just the arguments the call made. Reading a null slot as an
+    // argument that was not passed makes the two registrations bind alike.
+    let supplied = positional.iter().filter(|v| !v.is_null()).count();
     clinic_arity(
         fn_name,
-        positional.len(),
+        supplied,
         real_kwarg_count(kwargs),
         required.iter().filter(|r| **r).count(),
         names.len(),
@@ -4933,7 +4940,7 @@ pub(crate) fn bind_builtin_kwargs(
     let mut unknown: Option<Wtf8Buf> = None;
     for (i, &v) in positional.iter().enumerate() {
         scope[i] = v;
-        filled[i] = true;
+        filled[i] = !v.is_null();
     }
     if let Some(dict) = kwargs {
         let entries = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) };
