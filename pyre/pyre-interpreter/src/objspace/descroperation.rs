@@ -3212,7 +3212,8 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__add__", "__radd__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
         {
             return Ok(result);
         }
@@ -3235,7 +3236,8 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             // subclass overriding `__add__`/`__radd__` must reach the
             // reflected dispatch; otherwise concat directly.
             if needs_seq_binop_dispatch(a, b, SeqBase::Str, "__add__", "__radd__")
-                && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
+                && let Some(result) =
+                    try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
             {
                 return Ok(result);
             }
@@ -3243,7 +3245,8 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         }
         if is_list(a) && is_list(b) {
             if needs_seq_binop_dispatch(a, b, SeqBase::List, "__add__", "__radd__")
-                && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
+                && let Some(result) =
+                    try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
             {
                 return Ok(result);
             }
@@ -3251,7 +3254,8 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         }
         if is_tuple(a) && is_tuple(b) {
             if needs_seq_binop_dispatch(a, b, SeqBase::Tuple, "__add__", "__radd__")
-                && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
+                && let Some(result) =
+                    try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
             {
                 return Ok(result);
             }
@@ -3266,13 +3270,16 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
                 // a memoryview cannot, so dispatch only when both are bytes-like.
                 if pyre_object::bytesobject::is_bytes_like(b)
                     && needs_bytes_binop_dispatch(a, b, "__add__", "__radd__")
-                    && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
+                    && let Some(result) =
+                        try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
                 {
                     return Ok(result);
                 }
                 return bytes_concat(a, b_src);
             }
-            if let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")? {
+            if let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
+            {
                 return Ok(result);
             }
             // A non-buffer rhs is rejected with the generic operator TypeError
@@ -3288,7 +3295,8 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         // already implements the reflected-first reordering rule for
         // subclass operands.
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
         {
             return Ok(result);
         }
@@ -3303,7 +3311,9 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 
 pub fn matmul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__matmul__", "__rmatmul__")? {
+        if let Some(result) =
+            try_dispatch_binary_special(&mut a, &mut b, "__matmul__", "__rmatmul__")?
+        {
             return Ok(result);
         }
         let a_name = (*ll_type(a)).name;
@@ -3318,13 +3328,15 @@ pub fn sub(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
         {
             return Ok(result);
         }
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__sub__", "__rsub__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
         {
             return Ok(result);
         }
@@ -3352,7 +3364,8 @@ pub fn sub(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             return crate::typedef::set_method_difference(&[a, b]);
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
         {
             return Ok(result);
         }
@@ -3368,7 +3381,8 @@ pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__mul__", "__rmul__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {
             return Ok(result);
         }
@@ -3392,7 +3406,8 @@ pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         // list repetition — the same gate the concat branches of `add` apply.
         const MUL_SPECIALS: &[&str] = &["__mul__", "__rmul__"];
         if (seq_repeat_override(a, MUL_SPECIALS) || seq_repeat_override(b, MUL_SPECIALS))
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {
             return Ok(result);
         }
@@ -3541,7 +3556,8 @@ pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__mod__", "__rmod__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__mod__", "__rmod__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__mod__", "__rmod__")?
         {
             return Ok(result);
         }
@@ -3583,7 +3599,8 @@ pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             };
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__mod__", "__rmod__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__mod__", "__rmod__")?
         {
             return Ok(result);
         }
@@ -3607,7 +3624,8 @@ pub fn truediv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__truediv__", "__rtruediv__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__truediv__", "__rtruediv__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__truediv__", "__rtruediv__")?
         {
             return Ok(result);
         }
@@ -3649,7 +3667,8 @@ pub fn truediv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             return complex_truediv(a, b);
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__truediv__", "__rtruediv__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__truediv__", "__rtruediv__")?
         {
             return Ok(result);
         }
@@ -4424,7 +4443,8 @@ pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         numeric_override = needs_numeric_binop_dispatch(a, b, "__divmod__", "__rdivmod__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__divmod__", "__rdivmod__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__divmod__", "__rdivmod__")?
         {
             return Ok(result);
         }
@@ -4448,7 +4468,8 @@ pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         }
     }
     if !numeric_override
-        && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__divmod__", "__rdivmod__")?
+        && let Some(result) =
+            try_dispatch_binary_special(&mut a, &mut b, "__divmod__", "__rdivmod__")?
     {
         return Ok(result);
     }
@@ -4605,7 +4626,8 @@ pub fn lshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__lshift__", "__rlshift__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__lshift__", "__rlshift__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__lshift__", "__rlshift__")?
         {
             return Ok(result);
         }
@@ -4618,7 +4640,8 @@ pub fn lshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             }
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__lshift__", "__rlshift__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__lshift__", "__rlshift__")?
         {
             return Ok(result);
         }
@@ -4636,7 +4659,8 @@ pub fn rshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__rshift__", "__rrshift__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__rshift__", "__rrshift__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__rshift__", "__rrshift__")?
         {
             return Ok(result);
         }
@@ -4649,7 +4673,8 @@ pub fn rshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             }
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__rshift__", "__rrshift__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__rshift__", "__rrshift__")?
         {
             return Ok(result);
         }
@@ -4667,13 +4692,15 @@ pub fn and_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
         {
             return Ok(result);
         }
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__and__", "__rand__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
         {
             return Ok(result);
         }
@@ -4701,7 +4728,8 @@ pub fn and_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             return crate::typedef::set_method_intersection(&[a, b]);
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
         {
             return Ok(result);
         }
@@ -4758,7 +4786,9 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        if numeric && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__or__", "__ror__")? {
+        if numeric
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__or__", "__ror__")?
+        {
             return Ok(result);
         }
         // boolobject.py:75 W_BoolObject.descr_or — both operands bool
@@ -4837,13 +4867,15 @@ pub fn xor(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
         {
             return Ok(result);
         }
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__xor__", "__rxor__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
         {
             return Ok(result);
         }
@@ -4870,7 +4902,8 @@ pub fn xor(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             return crate::typedef::set_method_symmetric_difference(&[a, b]);
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
+            && let Some(result) =
+                try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
         {
             return Ok(result);
         }

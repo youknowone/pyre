@@ -286,9 +286,9 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     let seen_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(pyre_object::w_set_new());
     let sentinel_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(
-        crate::typedef::gettypeobject(&pyre_object::pyobject::INSTANCE_TYPE),
-    ));
+    pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(crate::typedef::gettypeobject(
+        &pyre_object::pyobject::INSTANCE_TYPE,
+    )));
     let values_base = pyre_object::gc_roots::shadow_stack_len();
     let mut value_count = 0usize;
     let mut all_match = true;
@@ -302,9 +302,7 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
                 ")"
             )));
         }
-        unsafe {
-            pyre_object::w_set_add(pyre_object::gc_roots::shadow_stack_get(seen_slot), key)
-        };
+        unsafe { pyre_object::w_set_add(pyre_object::gc_roots::shadow_stack_get(seen_slot), key) };
         let w_sentinel = pyre_object::gc_roots::shadow_stack_get(sentinel_slot);
         let w_value = crate::baseobjspace::call_method(
             pyre_object::gc_roots::shadow_stack_get(subject_slot),

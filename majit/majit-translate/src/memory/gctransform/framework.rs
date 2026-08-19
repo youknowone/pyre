@@ -417,14 +417,14 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
     let mut note_opaque = |raw: Option<&serde_json::Value>, variant: &'static str| {
         *opaque.by_variant.entry(variant).or_insert(0) += 1;
         match raw.and_then(first_trait_id) {
-        Some(tid) => {
-            let name = llbc
-                .trait_by_id(tid)
-                .map(|t| t.item_meta.name_path())
-                .unwrap_or_else(|| format!("trait#{tid}"));
-            *opaque.dyn_trait.entry(name).or_insert(0) += 1;
-        }
-        None => opaque.fn_value += 1,
+            Some(tid) => {
+                let name = llbc
+                    .trait_by_id(tid)
+                    .map(|t| t.item_meta.name_path())
+                    .unwrap_or_else(|| format!("trait#{tid}"));
+                *opaque.dyn_trait.entry(name).or_insert(0) += 1;
+            }
+            None => opaque.fn_value += 1,
         }
     };
 

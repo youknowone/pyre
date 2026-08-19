@@ -21,8 +21,8 @@
 use std::collections::{HashMap, HashSet};
 
 use majit_charon_reader::ullbc::{
-    CallFunc, CallKind, FunId, Operand, Place, PlaceKind, Rvalue, StmtKind, SwitchTargets, TermKind,
-    TyRef,
+    CallFunc, CallKind, FunId, Operand, Place, PlaceKind, Rvalue, StmtKind, SwitchTargets,
+    TermKind, TyRef,
 };
 
 /// One call that can collect, with GC pointers live across it and no bracket.
@@ -394,10 +394,10 @@ pub fn scan(
             findings.push(Finding {
                 func: id,
                 func_name: fd.item_meta.name_path(),
-                line: bb.statements.last().map_or(
-                    fd.item_meta.span.data.beg.line,
-                    |s| s.span.data.beg.line,
-                ),
+                line: bb
+                    .statements
+                    .last()
+                    .map_or(fd.item_meta.span.data.beg.line, |s| s.span.data.beg.line),
                 callee_id: *callee,
                 callee_name: cg.names.get(callee).cloned().unwrap_or_default(),
                 live_non_arg: non_arg,

@@ -62,7 +62,11 @@ fn main() {
             "   can reach a collection: {} / {} ({}%)",
             reach.len(),
             total,
-            if total == 0 { 0 } else { reach.len() * 100 / total }
+            if total == 0 {
+                0
+            } else {
+                reach.len() * 100 / total
+            }
         );
         println!(
             "   unresolved-callee fns : {} (call through fn-ptr / dyn / unresolved trait)",
@@ -157,7 +161,10 @@ fn main() {
             unjustified.len()
         );
         for id in unjustified.iter().take(40) {
-            println!("           {}", cg.names.get(id).map_or("?", String::as_str));
+            println!(
+                "           {}",
+                cg.names.get(id).map_or("?", String::as_str)
+            );
         }
         if unjustified.len() > 40 {
             println!("           … and {} more", unjustified.len() - 40);
@@ -259,9 +266,7 @@ fn main() {
             .iter()
             .filter(|f| !seeds.contains(&f.callee_id) && !f.movable_use.is_empty())
             .count();
-        println!(
-            "       tier 1.5 counting unresolved dispatch too: {t15_conservative} call(s)"
-        );
+        println!("       tier 1.5 counting unresolved dispatch too: {t15_conservative} call(s)");
         if std::env::var("GC_LIVENESS_TIER15").is_ok() {
             for f in &tier15 {
                 println!(
