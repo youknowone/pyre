@@ -40,6 +40,20 @@ typedef intptr_t Py_ssize_t;
 #define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX - 1)
 typedef Py_ssize_t Py_hash_t;
 typedef size_t Py_uhash_t;
+/* The widest integer the C compiler offers, under the name an extension
+   spells it by, and the limits `<limits.h>` gives it. */
+#define PY_LONG_LONG long long
+#define PY_LLONG_MIN LLONG_MIN
+#define PY_LLONG_MAX LLONG_MAX
+#define PY_ULLONG_MAX ULLONG_MAX
+
+/* The fixed-width integer names an extension may spell a field or a cast
+   with, alongside the `<stdint.h>` names they stand for. */
+#define PY_UINT32_T uint32_t
+#define PY_UINT64_T uint64_t
+#define PY_INT32_T int32_t
+#define PY_INT64_T int64_t
+
 typedef uint32_t Py_UCS4;
 typedef uint16_t Py_UCS2;
 typedef uint8_t Py_UCS1;

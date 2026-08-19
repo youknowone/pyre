@@ -352,6 +352,20 @@ static inline PyObject *PyErr_Format(PyObject *type, const char *format, ...)
     return NULL;
 }
 
+/* `PyErr_FormatUnraisable` states what was going on where
+   `PyErr_WriteUnraisable` names the object, so the message is built with this
+   engine and handed to the core the two share. */
+static inline void PyErr_FormatUnraisable(const char *format, ...)
+{
+    va_list va;
+    PyObject *message;
+    va_start(va, format);
+    message = PyUnicode_FromFormatV(format, va);
+    va_end(va);
+    _PyPyre_WriteUnraisable(message, NULL);
+    Py_XDECREF(message);
+}
+
 #ifdef __cplusplus
 }
 #endif

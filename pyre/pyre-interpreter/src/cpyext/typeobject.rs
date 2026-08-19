@@ -368,10 +368,14 @@ type_mirrors! {
     PyDictItems_Type => builtin_type(&pyre_object::dictmultiobject::DICT_ITEMS_TYPE),
     PyDictKeys_Type => builtin_type(&pyre_object::dictmultiobject::DICT_KEYS_TYPE),
     PyDictValues_Type => builtin_type(&pyre_object::dictmultiobject::DICT_VALUES_TYPE),
-    // Functions, methods and descriptors.  `PyCFunction_Type` is absent: a
-    // method an extension defines carries `methodobject`'s own
-    // `builtin_function_or_method`, not the interpreter's, so one symbol
-    // cannot name the type of both it and `len`.
+    // Functions, methods and descriptors.  `PyCFunction_Type` names
+    // `methodobject`'s own `builtin_function_or_method` -- the type a method
+    // an extension defines carries, and so the one a type derived from it is
+    // derived from.  The interpreter's `len` is the other
+    // `builtin_function_or_method`, which no symbol here names, and
+    // `PyCFunction_Check` answers no for it; `methodobject`'s
+    // `pycfunction_type` says why that is the safe half of the gap.
+    PyCFunction_Type => super::methodobject::pycfunction_type(),
     PyClassMethodDescr_Type => builtin_type(&crate::function::CLASSMETHOD_DESCRIPTOR_TYPE),
     PyClassMethod_Type => builtin_type(&pyre_object::function::CLASSMETHOD_TYPE),
     PyFunction_Type => builtin_type(&crate::function::FUNCTION_TYPE),

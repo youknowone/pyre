@@ -26,11 +26,35 @@ extern "C" {
 /* Version as a string */
 #define PY_VERSION "3.14.6"
 
+/* The same four digits packed as `PY_VERSION_HEX` packs them, read at run
+   time: the macros above are what an extension was compiled against, and this
+   is what it is running against. */
+PyAPI_DATA(const unsigned long) Py_Version;
+
 /* Pyre version as a string. Keep in sync with the `pyrex` package version,
    which is what `sys.pyre_version_info` reports; `cpyext_patchlevel.rs`
    compares the two. */
 #define PYRE_VERSION "0.0.2"
 #define PYRE_VERSION_NUM 0x00000200
+
+/* What an extension asks when it wants to know whether the object layouts
+   behind these headers are CPython's.  They are not: pyre's cpyext mirrors
+   `pypy/module/cpyext`, so a `PyObject *` names a block that stands for an
+   interpreter object rather than the object itself, and nothing may read a
+   field of one that is not declared here.
+
+   `PYPY_VERSION` is the name that question is already spelled under -- Cython
+   branches on it, and so does much of the ecosystem -- and the value tracks
+   PyPy's own so that a version gate written for PyPy lands on the same side
+   for pyre.  Code that wants to know which of the two it has reads
+   `PYRE_VERSION` above. */
+#define PYPY_VERSION "8.0.0-alpha0"
+#define PYPY_VERSION_NUM 0x08000000
+
+/* A reference cpyext holds is a regular one: it keeps the interpreter object
+   alive for as long as the block does. */
+#define PYPY_CPYEXT_GC 1
+#define PyPy_Borrow(a, b) ((void)0)
 
 /* Version as a single 4-byte hex number, e.g. 0x030E06F0 == 3.14.6 final.
    Use this for numeric comparisons, e.g. #if PY_VERSION_HEX >= ...

@@ -32,6 +32,10 @@ extern "C" {
         }                                                       \
     } while (0)
 
+/* The reference header reads the flag out of the collector's own header word
+   in front of the block; here the answer is a call. */
+#define _PyGC_FINALIZED(o) PyObject_GC_IsFinalized((PyObject *)(o))
+
 #ifdef __cplusplus
 }
 #endif

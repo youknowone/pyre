@@ -106,12 +106,121 @@ pub unsafe extern "C" fn PyImport_ImportModuleAttrString(
     attribute
 }
 
+/// `import_.py:33 PyImport_GetModuleDict()` — `sys.modules`, borrowed.
+///
+/// The borrow is sound where `PyImport_AddModule`'s is not: the modules dict
+/// is made during start-up and lives for as long as the interpreter does, so
+/// the mirror it is handed out through outlives every caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyImport_GetModuleDict() -> *mut CPyObject {
+    let modules = crate::importing::sys_modules_dict();
+    if modules.is_null() {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::RuntimeError,
+            "sys.modules is not set",
+        ));
+        return std::ptr::null_mut();
+    }
+    pyobject::borrow_mirror(modules)
+}
+
+/// `import_.py:58 PyImport_ImportModuleLevelObject(name, globals, locals,
+/// fromlist, level)` — `__import__` with each of its arguments.
+///
+/// A NULL stands for the argument's default, which is what an extension that
+/// only wants one of them passes for the rest.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyImport_ImportModuleLevelObject(
+    name: *mut CPyObject,
+    globals: *mut CPyObject,
+    locals: *mut CPyObject,
+    fromlist: *mut CPyObject,
+    level: std::ffi::c_int,
+) -> *mut CPyObject {
+    super::object::realize_all([name, globals, locals, fromlist]);
+    let Some(name) = argument(name) else {
+        return std::ptr::null_mut();
+    };
+    if level < 0 {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "level must be >= 0".to_owned(),
+        ));
+        return std::ptr::null_mut();
+    }
+    result(import_module_level(
+        name,
+        globals,
+        locals,
+        fromlist,
+        level as i64,
+    ))
+}
+
+/// `PyImport_ImportModuleLevel(name, globals, locals, fromlist, level)` — the
+/// `const char *` spelling of the entry point above.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyImport_ImportModuleLevel(
+    name: *const c_char,
+    globals: *mut CPyObject,
+    locals: *mut CPyObject,
+    fromlist: *mut CPyObject,
+    level: std::ffi::c_int,
+) -> *mut CPyObject {
+    if name.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let text = unsafe { super::unicodeobject::PyUnicode_FromString(name) };
+    if text.is_null() {
+        return std::ptr::null_mut();
+    }
+    let answer =
+        unsafe { PyImport_ImportModuleLevelObject(text, globals, locals, fromlist, level) };
+    unsafe { pyobject::decref(text) };
+    answer
+}
+
+/// The body of [`PyImport_ImportModuleLevelObject`], with the defaults filled
+/// in and every argument rooted across the allocations the others make.
+fn import_module_level(
+    name: PyObjectRef,
+    globals: *mut CPyObject,
+    locals: *mut CPyObject,
+    fromlist: *mut CPyObject,
+    level: i64,
+) -> Result<PyObjectRef, crate::PyError> {
+    let builtins = crate::importing::get_sys_module("builtins").ok_or_else(|| {
+        crate::PyError::new(crate::PyErrorKind::ImportError, "builtins is not loaded")
+    })?;
+    let import = crate::baseobjspace::getattr_str(builtins, "__import__")?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(import);
+    roots.pin_root(name);
+    // Each default allocates, so every argument is on the stack before the
+    // next one is built and all five are read back afterwards.
+    for (raw, default) in [(globals, None), (locals, None), (fromlist, Some(()))] {
+        let given = unsafe { pyobject::from_ref(raw) };
+        let value = if !given.is_null() {
+            given
+        } else if default.is_some() {
+            pyre_object::w_tuple_new_array_backed(Vec::new())
+        } else {
+            pyre_object::w_none()
+        };
+        roots.pin_root(value);
+    }
+    roots.pin_root(pyre_object::w_int_new(level));
+    let at = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+    crate::call::call_function_impl_result(at(0), &[at(1), at(2), at(3), at(4), at(5)])
+}
+
 /// `PyImport_AddModuleRef` — the module under `name`, created empty when
 /// `sys.modules` does not have it yet.
 ///
-/// The 3.12-and-earlier `PyImport_AddModule` and `PyImport_GetModuleDict`
-/// return *borrowed* references with no container for pyre to hang the borrow
-/// on, so only the strong-reference forms are provided.
+/// The 3.12-and-earlier `PyImport_AddModule` returns a *borrowed* reference
+/// with no container for pyre to hang the borrow on, so only the
+/// strong-reference form is provided.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyImport_AddModuleRef(name: *const c_char) -> *mut CPyObject {
     let Some(name) = name_of(name) else {

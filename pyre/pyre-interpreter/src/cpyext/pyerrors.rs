@@ -827,6 +827,50 @@ pub unsafe extern "C" fn _PyErr_ChainExceptions1(exception: *mut CPyObject) {
     unsafe { PyErr_SetRaisedException(pending) };
 }
 
+/// `write_unraisable` over whatever the indicator holds, which the two
+/// entry points below share.
+///
+/// The indicator is taken first: reporting runs `sys.unraisablehook`, and a
+/// hook that raises has to find the slot free to leave its own error in.
+fn write_unraisable(context: Option<String>, object: *mut CPyObject) {
+    let Some(mut error) = take_pending_error() else {
+        return;
+    };
+    let object = unsafe { pyobject::from_ref(object) };
+    let object = if object.is_null() {
+        pyre_object::w_none()
+    } else {
+        object
+    };
+    let context = context.unwrap_or_default();
+    error.write_unraisable(
+        pyre_object::w_none(),
+        rustpython_wtf8::Wtf8::new(context.as_str()),
+        object,
+    );
+}
+
+/// `PyErr_WriteUnraisable(object)` — report the pending exception through
+/// `sys.unraisablehook` and clear it, naming `object` as what was being
+/// operated on.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyErr_WriteUnraisable(object: *mut CPyObject) {
+    write_unraisable(None, object);
+}
+
+/// The core `PyErr_FormatUnraisable` is built on, whose message states what
+/// was going on rather than leaving the report to name the object.
+///
+/// `message` is a `str`, because the header composes it with the same format
+/// engine every other variadic entry point uses.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _PyPyre_WriteUnraisable(message: *mut CPyObject, object: *mut CPyObject) {
+    let text = unsafe { pyobject::from_ref(message) };
+    let context = (!text.is_null() && unsafe { pyre_object::unicodeobject::is_str(text) })
+        .then(|| unsafe { pyre_object::w_str_get_wtf8(text) }.to_string());
+    write_unraisable(context, object);
+}
+
 /// End the process, reporting `message` the way a caller that cannot go on
 /// does.
 ///

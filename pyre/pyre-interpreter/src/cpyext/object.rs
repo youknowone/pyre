@@ -1009,6 +1009,103 @@ pub unsafe extern "C" fn PyObject_GC_IsFinalized(_object: *mut CPyObject) -> c_i
     0
 }
 
+/// `PyObject_CallFinalizerFromDealloc(object)` — run the type's
+/// `tp_finalize` from a deallocator that is about to free the block.
+///
+/// The block is at zero when a deallocator reaches here, and a finalizer may
+/// hand `self` out, so it holds one reference of its own while it runs: a
+/// count above that afterwards is something else having kept the object, and
+/// the caller is told to leave the block alone.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_CallFinalizerFromDealloc(object: *mut CPyObject) -> c_int {
+    if object.is_null() {
+        return 0;
+    }
+    let tp = unsafe { (*object).ob_type };
+    if tp.is_null() {
+        return 0;
+    }
+    let finalize = unsafe { (*tp).tp_finalize };
+    if finalize.is_null() {
+        return 0;
+    }
+    let finalize: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(finalize) };
+    unsafe { (*object).ob_refcnt = 1 };
+    unsafe { finalize(object) };
+    if unsafe { (*object).ob_refcnt } > 1 {
+        return -1;
+    }
+    unsafe { (*object).ob_refcnt = 0 };
+    0
+}
+
+/// `PyObject_VisitManagedDict(object, visit, arg)` — nothing to visit.
+///
+/// A traversal reports the references the C block holds, and the instance
+/// namespace is not one of them: it hangs off the interpreter object, which
+/// the collector reaches without going through this layer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_VisitManagedDict(
+    _object: *mut CPyObject,
+    _visit: *const c_void,
+    _arg: *mut c_void,
+) -> c_int {
+    0
+}
+
+/// `PyObject_ClearManagedDict(object)` — empty the instance namespace.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_ClearManagedDict(object: *mut CPyObject) {
+    let Some(object) = argument(object) else {
+        return;
+    };
+    let dict = crate::baseobjspace::getdict_native(object);
+    if !dict.is_null() {
+        unsafe { pyre_object::dictmultiobject::w_dict_clear(dict) };
+    }
+}
+
+/// `PyObject_VectorcallDict(callable, args, nargsf, keywords)` — the vector
+/// call whose keywords arrive as a mapping rather than as names beside the
+/// values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_VectorcallDict(
+    callable: *mut CPyObject,
+    args: *const *mut CPyObject,
+    nargsf: usize,
+    keywords: *mut CPyObject,
+) -> *mut CPyObject {
+    if keywords.is_null() {
+        return unsafe { PyObject_Vectorcall(callable, args, nargsf, std::ptr::null_mut()) };
+    }
+    let nargs = vectorcall_nargs(nargsf);
+    let positional = unsafe { PyTuple_from_vector(args, nargs) };
+    if positional.is_null() {
+        return std::ptr::null_mut();
+    }
+    let answer = unsafe { PyObject_Call(callable, positional, keywords) };
+    unsafe { pyobject::decref(positional) };
+    answer
+}
+
+/// The `tuple` a vector's first `count` entries make, as a new reference.
+#[allow(non_snake_case)]
+unsafe fn PyTuple_from_vector(args: *const *mut CPyObject, count: usize) -> *mut CPyObject {
+    let tuple = unsafe { super::tupleobject::PyTuple_New(count as isize) };
+    if tuple.is_null() {
+        return std::ptr::null_mut();
+    }
+    for index in 0..count {
+        let item = unsafe { *args.add(index) };
+        unsafe { pyobject::incref(item) };
+        if unsafe { super::tupleobject::PyTuple_SetItem(tuple, index as isize, item) } != 0 {
+            unsafe { pyobject::decref(tuple) };
+            return std::ptr::null_mut();
+        }
+    }
+    tuple
+}
+
 // ── the object allocator ──────────────────────────────────────────────────
 //
 // `PyObject_Free` is the deallocator for all three of these, and for a block

@@ -23,6 +23,7 @@ pub mod complexobject;
 pub mod dictobject;
 pub mod exception;
 pub mod floatobject;
+pub mod funcobject;
 pub mod gc;
 pub mod genericaliasobject;
 pub mod import_;

@@ -41,6 +41,16 @@ pub unsafe extern "C" fn PySys_AuditTuple(event: *const c_char, args: *mut CPyOb
     }
 }
 
+/// `Py_Version` — the running version, packed the way `PY_VERSION_HEX` packs
+/// it.  An extension reads this when it wants the version it is running
+/// against rather than the one its headers were.
+///
+/// The digits are `sys.version_info`'s, and `patchlevel.h` states the same
+/// four; `PY_RELEASE_LEVEL_FINAL` with serial 0 is the low byte.
+#[unsafe(no_mangle)]
+pub static Py_Version: std::ffi::c_ulong = 0x030e_06f0;
+
 pub(super) fn ensure_linked() {
     std::hint::black_box(PySys_AuditTuple as *const ());
+    std::hint::black_box(&raw const Py_Version);
 }

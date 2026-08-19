@@ -105,6 +105,7 @@ PyAPI_FUNC(PyObject *) PyDict_New(void);
 PyAPI_FUNC(int) PyDict_Next(PyObject *, Py_ssize_t *, PyObject **, PyObject **);
 PyAPI_FUNC(int) PyDict_Pop(PyObject *, PyObject *, PyObject **);
 PyAPI_FUNC(int) PyDict_PopString(PyObject *, const char *, PyObject **);
+PyAPI_FUNC(PyObject *) PyDict_SetDefault(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(int) PyDict_SetDefaultRef(PyObject *, PyObject *, PyObject *, PyObject **);
 PyAPI_FUNC(int) PyDict_SetItem(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(int) PyDict_SetItemString(PyObject *, const char *, PyObject *);
@@ -131,6 +132,11 @@ PyAPI_FUNC(int) PyFloat_Check(PyObject *);
 PyAPI_FUNC(int) PyFloat_CheckExact(PyObject *);
 PyAPI_FUNC(PyObject *) PyFloat_FromDouble(double);
 
+/* cpyext/funcobject.rs */
+PyAPI_FUNC(PyObject *) PyMethod_Function(PyObject *);
+PyAPI_FUNC(PyObject *) PyMethod_New(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) PyMethod_Self(PyObject *);
+
 /* cpyext/gc.rs */
 PyAPI_FUNC(void) PyObject_GC_Track(void *);
 PyAPI_FUNC(void) PyObject_GC_UnTrack(void *);
@@ -141,10 +147,13 @@ PyAPI_FUNC(PyObject *) Py_GenericAlias(PyObject *, PyObject *);
 /* cpyext/import_.rs */
 PyAPI_FUNC(PyObject *) PyImport_AddModuleRef(const char *);
 PyAPI_FUNC(PyObject *) PyImport_GetModule(PyObject *);
+PyAPI_FUNC(PyObject *) PyImport_GetModuleDict(void);
 PyAPI_FUNC(PyObject *) PyImport_Import(PyObject *);
 PyAPI_FUNC(PyObject *) PyImport_ImportModule(const char *);
 PyAPI_FUNC(PyObject *) PyImport_ImportModuleAttr(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyImport_ImportModuleAttrString(const char *, const char *);
+PyAPI_FUNC(PyObject *) PyImport_ImportModuleLevel(const char *, PyObject *, PyObject *, PyObject *, int);
+PyAPI_FUNC(PyObject *) PyImport_ImportModuleLevelObject(PyObject *, PyObject *, PyObject *, PyObject *, int);
 PyAPI_FUNC(PyObject *) PyImport_ImportModuleNoBlock(const char *);
 
 /* cpyext/iterator.rs */
@@ -240,6 +249,13 @@ PyAPI_FUNC(int) PyMapping_SetItemString(PyObject *, const char *, PyObject *);
 PyAPI_FUNC(Py_ssize_t) PyMapping_Size(PyObject *);
 PyAPI_FUNC(PyObject *) PyMapping_Values(PyObject *);
 
+/* cpyext/methodobject.rs */
+PyAPI_FUNC(int) PyCFunction_GetFlags(PyObject *);
+PyAPI_FUNC(PyCFunction) PyCFunction_GetFunction(PyObject *);
+PyAPI_FUNC(PyObject *) PyCFunction_GetSelf(PyObject *);
+PyAPI_FUNC(PyObject *) PyCFunction_New(PyMethodDef *, PyObject *);
+PyAPI_FUNC(PyObject *) PyCFunction_NewEx(PyMethodDef *, PyObject *, PyObject *);
+
 /* cpyext/modsupport.rs */
 PyAPI_FUNC(PyObject *) PyModuleDef_Init(PyModuleDef *);
 PyAPI_FUNC(int) PyModule_Add(PyObject *, const char *, PyObject *);
@@ -309,10 +325,12 @@ PyAPI_FUNC(PyObject *) PyObject_ASCII(PyObject *);
 PyAPI_FUNC(int) PyObject_AsFileDescriptor(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_Bytes(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_Call(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(int) PyObject_CallFinalizerFromDealloc(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_CallNoArgs(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_CallObject(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_CallOneArg(PyObject *, PyObject *);
 PyAPI_FUNC(void *) PyObject_Calloc(size_t, size_t);
+PyAPI_FUNC(void) PyObject_ClearManagedDict(PyObject *);
 PyAPI_FUNC(int) PyObject_DelAttr(PyObject *, PyObject *);
 PyAPI_FUNC(int) PyObject_DelAttrString(PyObject *, const char *);
 PyAPI_FUNC(int) PyObject_DelItem(PyObject *, PyObject *);
@@ -354,7 +372,9 @@ PyAPI_FUNC(Py_ssize_t) PyObject_Size(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_Str(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_Type(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_Vectorcall(PyObject *, PyObject *const *, size_t, PyObject *);
+PyAPI_FUNC(PyObject *) PyObject_VectorcallDict(PyObject *, PyObject *const *, size_t, PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_VectorcallMethod(PyObject *, PyObject *const *, size_t, PyObject *);
+PyAPI_FUNC(int) PyObject_VisitManagedDict(PyObject *, visitproc, void *);
 PyAPI_FUNC(PyObject *) PyVectorcall_Call(PyObject *, PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) Py_GetConstant(unsigned int);
 PyAPI_FUNC(PyObject *) Py_GetConstantBorrowed(unsigned int);
@@ -392,8 +412,10 @@ PyAPI_FUNC(void) PyErr_SetNone(PyObject *);
 PyAPI_FUNC(void) PyErr_SetObject(PyObject *, PyObject *);
 PyAPI_FUNC(void) PyErr_SetRaisedException(PyObject *);
 PyAPI_FUNC(void) PyErr_SetString(PyObject *, const char *);
+PyAPI_FUNC(void) PyErr_WriteUnraisable(PyObject *);
 PyAPI_FUNC(void) _PyErr_BadInternalCall(const char *, int);
 PyAPI_FUNC(void) _PyErr_ChainExceptions1(PyObject *);
+PyAPI_FUNC(void) _PyPyre_WriteUnraisable(PyObject *, PyObject *);
 PyAPI_FUNC(void) _Py_FatalErrorFunc(const char *, const char *);
 
 /* cpyext/pymem.rs */
@@ -420,6 +442,8 @@ PyAPI_FUNC(PyThreadState *) PyEval_SaveThread(void);
 PyAPI_FUNC(int) PyEval_ThreadsInitialized(void);
 PyAPI_FUNC(int) PyGILState_Check(void);
 PyAPI_FUNC(PyThreadState *) PyGILState_GetThisThreadState(void);
+PyAPI_FUNC(PyInterpreterState *) PyInterpreterState_Get(void);
+PyAPI_FUNC(int64_t) PyInterpreterState_GetID(PyInterpreterState *);
 PyAPI_FUNC(PyThreadState *) PyThreadState_Get(void);
 PyAPI_FUNC(PyThreadState *) PyThreadState_Swap(PyThreadState *);
 PyAPI_FUNC(PyThreadState *) _PyThreadState_UncheckedGet(void);
@@ -588,6 +612,7 @@ PyAPI_FUNC(int) _PyPyre_WarnExplicitMessage(PyObject *, PyObject *, const char *
 PyAPI_FUNC(int) _PyPyre_WarnUnicode(PyObject *, PyObject *, PyObject *, Py_ssize_t);
 
 /* cpyext/weakrefobject.rs */
+PyAPI_FUNC(void) PyObject_ClearWeakRefs(PyObject *);
 PyAPI_FUNC(int) PyWeakref_Check(PyObject *);
 PyAPI_FUNC(int) PyWeakref_CheckProxy(PyObject *);
 PyAPI_FUNC(int) PyWeakref_CheckRef(PyObject *);

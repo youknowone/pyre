@@ -5,8 +5,11 @@
  * from the exports themselves; the rest is the hand-written half --
  * the structs an extension lays out, and the macros it expands.
  */
-#ifndef PYRE_PYTHON_H
-#define PYRE_PYTHON_H
+/* The guard is the name CPython and PyPy both give it: an extension that
+ * wants to know whether it has Python's headers at all tests `Py_PYTHON_H`,
+ * and Cython's generated C refuses to compile without it. */
+#ifndef Py_PYTHON_H
+#define Py_PYTHON_H
 
 #include <assert.h>
 #include <inttypes.h>
@@ -19,8 +22,10 @@
 #include <string.h>
 #include <wchar.h>
 
-#include "patchlevel.h"
+/* `pyport.h` first: `patchlevel.h` declares one object, and `PyAPI_DATA` is
+ * what declares it. */
 #include "pyport.h"
+#include "patchlevel.h"
 #include "pymacro.h"
 #include "pytypedefs.h"
 #include "object.h"
@@ -59,9 +64,12 @@
 #include "sliceobject.h"
 #include "memoryobject.h"
 #include "pycapsule.h"
+#include "code.h"
+#include "funcobject.h"
+#include "traceback.h"
 #include "import.h"
 #include "modsupport.h"
 #include "audit.h"
 #include "abstract.h"
 
-#endif /* !PYRE_PYTHON_H */
+#endif /* !Py_PYTHON_H */

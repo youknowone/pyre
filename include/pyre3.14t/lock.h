@@ -53,6 +53,19 @@ _PyMutex_IsLocked(PyMutex *m)
 }
 #define PyMutex_IsLocked _PyMutex_IsLocked
 
+/* A critical section serializes the operations that name the same object.
+   Here every Python thread runs under one global lock, which already gives
+   that ordering, so entering one costs nothing and the macros are the braces
+   that scope the block an extension wrote between them.  `op` is not
+   evaluated: an extension that writes `Py_BEGIN_CRITICAL_SECTION(f(x))` gets
+   no call, the same as when the reference header serializes on the lock. */
+#define Py_BEGIN_CRITICAL_SECTION(op)               {
+#define Py_BEGIN_CRITICAL_SECTION_MUTEX(mutex)      {
+#define Py_END_CRITICAL_SECTION()                   }
+#define Py_BEGIN_CRITICAL_SECTION2(a, b)            {
+#define Py_BEGIN_CRITICAL_SECTION2_MUTEX(m1, m2)    {
+#define Py_END_CRITICAL_SECTION2()                  }
+
 #ifdef __cplusplus
 }
 #endif

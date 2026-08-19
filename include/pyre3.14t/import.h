@@ -10,9 +10,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Imports.  The borrowed-reference `PyImport_AddModule` and
-   `PyImport_GetModuleDict` are absent: pyre has no container to hang the
-   borrow on, so only the strong-reference forms exist. */
+/* Imports.  The borrowed-reference `PyImport_AddModule` is absent: pyre has no
+   container to hang the borrow on, so only the strong-reference form exists.
+   `PyImport_GetModuleDict` is present because `sys.modules` outlives every
+   caller, which is what makes its borrow sound. */
 
 #ifdef __cplusplus
 }

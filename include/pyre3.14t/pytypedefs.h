@@ -43,6 +43,9 @@ typedef void (*PyCapsule_Destructor)(PyObject *);
 /* The buffer a `str` is written into piece by piece.  Opaque: only this
    runtime ever looks inside one. */
 typedef struct PyUnicodeWriter PyUnicodeWriter;
+/* A code object.  Opaque: nothing outside this runtime reads a field of one,
+   and an extension only ever holds a pointer. */
+typedef struct PyCodeObject PyCodeObject;
 
 #ifdef __cplusplus
 }

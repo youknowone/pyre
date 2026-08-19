@@ -355,6 +355,26 @@ pub unsafe extern "C" fn PyDict_GetItemRef(
     unsafe { get_item_ref(found, result) }
 }
 
+/// `PyDict_SetDefault(dict, key, default)` — the value `key` already had, or
+/// `default` after storing it, borrowed from the dict either way.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyDict_SetDefault(
+    object: *mut CPyObject,
+    key: *mut CPyObject,
+    default_value: *mut CPyObject,
+) -> *mut CPyObject {
+    let mut value = std::ptr::null_mut();
+    if unsafe { PyDict_SetDefaultRef(object, key, default_value, &mut value) } < 0 {
+        return std::ptr::null_mut();
+    }
+    // The strong reference the `Ref` spelling answers with is what makes this
+    // one a borrow: the dict holds the value, and the caller is handed the
+    // dict's reference rather than one of its own.
+    let borrowed = pyobject::borrow_from(object, unsafe { pyobject::from_ref(value) });
+    unsafe { pyobject::decref(value) };
+    borrowed
+}
+
 /// `PyDict_SetDefaultRef(dict, key, default, &result)` — 1 when the key was
 /// already there, 0 when the default was inserted, -1 on failure.
 ///

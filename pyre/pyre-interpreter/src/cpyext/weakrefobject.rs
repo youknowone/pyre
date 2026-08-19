@@ -174,3 +174,18 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyWeakref_GetRef as *const ());
     std::hint::black_box(PyWeakref_IsDead as *const ());
 }
+
+/// `object.py:141 PyObject_ClearWeakRefs(object)` — break every weak
+/// reference to `object` and run the callbacks they carry.
+///
+/// An object that was never the target of one has no lifeline, and there is
+/// nothing to break.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_ClearWeakRefs(object: *mut CPyObject) {
+    let Some(object) = super::object::argument(object) else {
+        return;
+    };
+    if let Some(lifeline) = crate::baseobjspace::getweakref(object) {
+        crate::module::_weakref::interp__weakref::finalize_weakrefs(lifeline);
+    }
+}

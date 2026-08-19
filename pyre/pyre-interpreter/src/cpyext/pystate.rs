@@ -16,12 +16,30 @@
 use std::cell::{Cell, UnsafeCell};
 use std::ffi::c_int;
 
+/// The interpreter an extension is handed a pointer to.
+///
+/// Opaque, and for the same reason `CPyThreadState` is: what it stands for is
+/// reached through entry points rather than through the struct.
+#[repr(C)]
+pub struct CPyInterpreterState {
+    _private: u8,
+}
+
+/// The one interpreter, which every thread runs in.
+///
+/// Nothing is kept behind the handle: it exists so that an extension asking
+/// which interpreter it is in gets an answer to compare and to pass on, and
+/// the address of a static gives one that is stable and never NULL.
+static INTERPRETER: CPyInterpreterState = CPyInterpreterState { _private: 0 };
+
 /// The per-thread state an extension is handed a pointer to.
 ///
-/// Opaque: what upstream's `PyThreadState` carries is interpreter bookkeeping
-/// an extension reaches through entry points, not through the struct.
+/// `interp` is the one field an extension reads directly, which is how it asks
+/// which interpreter the thread runs in without a call; everything else this
+/// stands for is reached through an entry point.
 #[repr(C)]
 pub struct CPyThreadState {
+    interp: *mut CPyInterpreterState,
     /// Never read through the pointer; a distinct byte so two threads' states
     /// are distinct addresses.
     _private: u8,
@@ -30,8 +48,10 @@ pub struct CPyThreadState {
 thread_local! {
     /// Stable for as long as the thread lives, which is as long as a
     /// `PyThreadState *` naming it is valid.
-    static THREAD_STATE: UnsafeCell<CPyThreadState> =
-        const { UnsafeCell::new(CPyThreadState { _private: 0 }) };
+    static THREAD_STATE: UnsafeCell<CPyThreadState> = UnsafeCell::new(CPyThreadState {
+        interp: &INTERPRETER as *const CPyInterpreterState as *mut CPyInterpreterState,
+        _private: 0,
+    });
     /// `ec.cpyext_threadstate_is_current`.  Swapping NULL in clears it, which
     /// is how an extension says the thread state it was handed is no longer the
     /// one in force.
@@ -142,6 +162,23 @@ pub unsafe extern "C" fn PyGILState_GetThisThreadState() -> *mut CPyThreadState 
 
 /// `pystate.py:51 PyEval_InitThreads` — threads are always available, so
 /// upstream's `setup_threads` has nothing left to do here.
+/// `PyInterpreterState_Get()` — the interpreter the calling thread runs in.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyInterpreterState_Get() -> *mut CPyInterpreterState {
+    &INTERPRETER as *const CPyInterpreterState as *mut CPyInterpreterState
+}
+
+/// `PyInterpreterState_GetID(interp)` — the identifier an interpreter is
+/// known by, which is 0 for the one pyre runs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyInterpreterState_GetID(interp: *mut CPyInterpreterState) -> i64 {
+    if interp.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return -1;
+    }
+    0
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyEval_InitThreads() {}
 

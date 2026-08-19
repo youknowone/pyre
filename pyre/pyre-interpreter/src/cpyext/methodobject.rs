@@ -92,6 +92,13 @@ fn method_def_at(index: i64) -> Option<*mut CPyMethodDef> {
 static PYCFUNCTION_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
 
 /// The carrier type, named as upstream names its typedef.
+///
+/// This is what `PyCFunction_Type` names, and so what `PyCFunction_Check`
+/// answers for.  An interpreter builtin such as `len` is a *different*
+/// `builtin_function_or_method` and answers no: it carries no `PyMethodDef`,
+/// so an entry point that agreed it was one would then have nothing to hand
+/// back from `PyCFunction_GetFunction` but an error, which a caller spelling
+/// the two as one expression does not look for.
 pub fn pycfunction_type() -> PyObjectRef {
     *PYCFUNCTION_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("builtin_function_or_method", |ns| {
@@ -111,6 +118,88 @@ pub fn pycfunction_type() -> PyObjectRef {
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         tp as usize
     }) as PyObjectRef
+}
+
+/// The `PyMethodDef` behind `object`, or NULL with a `SystemError` when
+/// nothing is.
+fn checked_method_def(object: *mut CPyObject) -> Option<*mut CPyMethodDef> {
+    let object = unsafe { pyobject::from_ref(object) };
+    let definition = (!object.is_null()).then(|| method_def(object)).flatten();
+    if definition.is_none() {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "bad argument to internal function",
+        ));
+    }
+    definition
+}
+
+/// `methodobject.py:563 PyCFunction_GetFunction(object)` — the C function the
+/// carrier calls.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyCFunction_GetFunction(object: *mut CPyObject) -> *mut c_void {
+    match checked_method_def(object) {
+        Some(definition) => (unsafe { (*definition).ml_meth }) as *mut c_void,
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `PyCFunction_GetFlags(object)` — the `METH_*` set the definition carries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyCFunction_GetFlags(object: *mut CPyObject) -> c_int {
+    match checked_method_def(object) {
+        Some(definition) => unsafe { (*definition).ml_flags },
+        None => -1,
+    }
+}
+
+/// `PyCFunction_GetSelf(object)` — the receiver the carrier was bound to,
+/// borrowed, and NULL for a definition declared `METH_STATIC`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyCFunction_GetSelf(object: *mut CPyObject) -> *mut CPyObject {
+    let Some(definition) = checked_method_def(object) else {
+        return std::ptr::null_mut();
+    };
+    if unsafe { (*definition).ml_flags } & METH_STATIC != 0 {
+        return std::ptr::null_mut();
+    }
+    let carrier = unsafe { pyobject::from_ref(object) };
+    match carrier_get(carrier, SELF_KEY) {
+        Some(receiver) => pyobject::borrow_from(object, receiver),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `PyCFunction_New(ml, self)` — the callable a `PyMethodDef` row describes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyCFunction_New(
+    method: *mut CPyMethodDef,
+    receiver: *mut CPyObject,
+) -> *mut CPyObject {
+    unsafe { PyCFunction_NewEx(method, receiver, std::ptr::null_mut()) }
+}
+
+/// `PyCFunction_NewEx(ml, self, module)` — the same, naming the module the
+/// definition came from.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyCFunction_NewEx(
+    method: *mut CPyMethodDef,
+    receiver: *mut CPyObject,
+    module: *mut CPyObject,
+) -> *mut CPyObject {
+    if method.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    super::object::realize_all([receiver, module]);
+    let receiver = unsafe { pyobject::from_ref(receiver) };
+    let module = unsafe { pyobject::from_ref(module) };
+    let module = if module.is_null() {
+        pyre_object::w_none()
+    } else {
+        module
+    };
+    super::object::result(new_pycfunction(method, receiver, module))
 }
 
 fn carrier_get(carrier: PyObjectRef, key: &str) -> Option<PyObjectRef> {
