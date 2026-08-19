@@ -165,10 +165,12 @@ crate::py_module! {
                 }
             }
             // `interp_errno.py`'s "MacOSX specific errnos" block, plus
-            // `EQFULL`, which that list omits: measured under 3.14.6 on
-            // darwin, `errno.EQFULL` is 106, and
-            // `extra_tests/snippets/errno_platform_names.py` asserts the whole
-            // block so the reference lane re-measures it on every run.
+            // `EQFULL`, which that list omits.  Nothing here writes a number
+            // down -- `libc` supplies each one, and `errno.EQFULL` read 106
+            // under 3.14.6 on darwin when that omission was checked.
+            // `extra_tests/snippets/errno_platform_names.py` asserts that
+            // every name in this block is exported and reaches `errorcode`,
+            // on the reference interpreter as well as on pyre.
             // `DefinedConstantInteger` drops each of these on a platform whose
             // `errno.h` lacks it; the equivalent here is the target gate,
             // since `libc` declares them for apple targets only.

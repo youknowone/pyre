@@ -27,7 +27,7 @@ use std::path::Path;
     not(feature = "sandbox"),
     not(target_arch = "wasm32")
 ))]
-use std::path::{Component, Prefix};
+use std::path::Component;
 
 use crate::PyExecutionContext;
 use crate::{CodeObject, Mode, PyFrame, compile_source_with_filename};
@@ -2102,20 +2102,23 @@ fn absolute_from(path: PathBuf, cwd: &Path) -> PathBuf {
 ))]
 fn normalize_lexically(path: &Path) -> PathBuf {
     // `\\.\` device names and `\\?\` literal paths are handed to the OS as
-    // spelled and are returned unchanged (rpath.py:106-111): a `.` or `..`
+    // spelled and are returned unchanged (`_nt_rnormpath`): a `.` or `..`
     // inside one is an ordinary name, so collapsing it would rewrite which
-    // object the path reaches.  No such component exists on unix, where the
-    // arm is unreachable.
-    if let Some(Component::Prefix(prefix)) = path.components().next()
-        && matches!(
-            prefix.kind(),
-            Prefix::Verbatim(_)
-                | Prefix::VerbatimUNC(..)
-                | Prefix::VerbatimDisk(_)
-                | Prefix::DeviceNS(_)
-        )
+    // object the path reaches.
+    //
+    // The exemption is read off the spelling rather than off the parsed
+    // prefix, and the difference is observable: `//./name` parses as the same
+    // device prefix, but `_nt_rnormpath` tests for the two literal prefixes
+    // *before* it rewrites `/` into `\`, so a slash-spelled device path is
+    // never exempt and goes on to be normalized like any other.  The whole
+    // arm is Windows-only because `_posix_rnormpath` has no counterpart to
+    // it, and on unix a backslash is an ordinary filename character.
+    #[cfg(windows)]
     {
-        return path.to_path_buf();
+        let spelled = path.as_os_str().as_encoded_bytes();
+        if spelled.starts_with(br"\\.\") || spelled.starts_with(br"\\?\") {
+            return path.to_path_buf();
+        }
     }
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -2127,8 +2130,10 @@ fn normalize_lexically(path: &Path) -> PathBuf {
                     out.pop();
                 }
                 // `/..` is `/`: nothing sits above a root, so the component
-                // names nothing and is dropped rather than kept
-                // (`rpath.py:53-57`, and `:142` for the drive-rooted spelling).
+                // names nothing and is dropped rather than kept -- the
+                // `i == 0 and prefix.endswith(sep)` arm of `_posix_rnormpath`,
+                // and the same arm of `_nt_rnormpath` for the drive-rooted
+                // spelling.
                 Some(Component::RootDir) => {}
                 // A relative path may open with `..`, `../..` keeps both, and
                 // a drive-relative `C:..` keeps its own: popping a prefix
@@ -2146,7 +2151,8 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 
 /// A path opening with exactly two slashes is reserved for the host to
 /// interpret, so `//host/bin` keeps both while `///x` collapses to one
-/// (`rpath.py:43-47`).  `Path::components` yields a single `RootDir` either
+/// (the `initial_slashes == 2` arm of `_posix_rnormpath`).  `Path::components`
+/// yields a single `RootDir` either
 /// way, so the distinction has to be read off the original spelling and put
 /// back afterwards.
 #[cfg(all(
@@ -5938,5 +5944,45 @@ mod tests {
         assert_eq!(rpython_str_find_char("pkg.child.leaf", '.', 10), -1);
         assert_eq!(rpython_str_find_char("plain", '.', 0), -1);
         assert_eq!(rpython_str_slice_prefix("pkg.child", 3), "pkg");
+    }
+
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32"),
+        windows
+    ))]
+    #[test]
+    fn only_a_literally_spelled_device_or_literal_path_skips_normalization() {
+        // Spelled with the two backslashes the exemption is written in, so a
+        // `..` inside names a file rather than a level to walk up.
+        for spelled in [
+            r"\\.\device\..\name",
+            r"\\?\C:\dir\..\file",
+            r"\\?\UNC\host\share\..\x",
+        ] {
+            assert_eq!(
+                normalize_lexically(Path::new(spelled)),
+                PathBuf::from(spelled)
+            );
+        }
+
+        // The same device prefix spelled with slashes is not exempt:
+        // `_nt_rnormpath` matches the literal prefixes before it rewrites `/`
+        // into `\`, so this one is normalized. What is asserted is that the
+        // `..` was resolved, not the separators it comes back with -- this
+        // walk never rewrites `/` into `\`, for any path.
+        let normalized = normalize_lexically(Path::new("//./device/../name"));
+        assert!(
+            !normalized
+                .components()
+                .any(|part| part == Component::ParentDir),
+            "{normalized:?}"
+        );
+        assert!(normalized.ends_with("name"), "{normalized:?}");
+        assert!(
+            matches!(normalized.components().next(), Some(Component::Prefix(_))),
+            "{normalized:?}"
+        );
     }
 }
