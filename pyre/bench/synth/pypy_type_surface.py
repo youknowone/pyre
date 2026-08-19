@@ -12,6 +12,16 @@ class Derived(Heap):
     pass
 
 
+# Py_TPFLAGS_IMMUTABLETYPE.  pyre publishes it on every type that is not a
+# heap type and `get_flags` publishes no such bit, so it is the one bit of this
+# word that follows 3.14 rather than PyPy — which makes it the one bit this
+# fixture cannot compare against its oracle.  Masked out below rather than
+# dropped: what it names is asserted directly in
+# `check_exception_group_immutable`, by making the store and failing if it
+# succeeds.
+PYPY_FLAGS = ~(1 << 8)
+
+
 def check_flags():
     # `get_flags`: _HEAPTYPE 1<<9, PATMA_SEQUENCE 1<<5, PATMA_MAPPING 1<<6,
     # _ABSTRACT 1<<20, Py_TPFLAGS_METHOD_DESCRIPTOR 1<<17.  _CPYTYPE marks
@@ -36,8 +46,9 @@ def check_flags():
         Derived: 0x200,
     }
     for cls, want in expected.items():
-        if cls.__flags__ != want:
-            raise AssertionError((cls.__name__, hex(cls.__flags__), hex(want)))
+        got = cls.__flags__ & PYPY_FLAGS
+        if got != want:
+            raise AssertionError((cls.__name__, hex(got), hex(want)))
     return len(expected)
 
 
@@ -53,10 +64,10 @@ def check_exception_group_immutable():
     # `moduledef.py` names `W_ExceptionGroup` under `interpleveldefs`, so
     # `ExceptionGroup` is a static builtin beside `BaseExceptionGroup` rather
     # than a heap type over it.
-    if ExceptionGroup.__flags__ != 0x0 or BaseExceptionGroup.__flags__ != 0x0:
-        raise AssertionError(
-            (hex(ExceptionGroup.__flags__), hex(BaseExceptionGroup.__flags__))
-        )
+    group = ExceptionGroup.__flags__ & PYPY_FLAGS
+    base = BaseExceptionGroup.__flags__ & PYPY_FLAGS
+    if group != 0x0 or base != 0x0:
+        raise AssertionError((hex(group), hex(base)))
     try:
         ExceptionGroup._probe = 1
     except TypeError:
