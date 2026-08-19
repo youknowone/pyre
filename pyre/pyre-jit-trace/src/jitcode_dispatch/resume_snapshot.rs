@@ -1673,10 +1673,12 @@ fn caller_operand_slots<Sym: WalkSym>(
 /// resume pc and answers `None` for the whole image when one is missing.  That
 /// `None` surfaces far downstream as `[s2-build-decline] ... parent.blackhole
 /// None (capture missing)`, which cannot say which bank, which color, or
-/// whether the shadow was merely too short.  A corpus sweep of 524 fixtures
-/// found exactly one caller image declining anywhere, so the refusal is rare
-/// enough that the answer has to come from the refusal itself rather than from
-/// a re-run.  Gated like the rest of the walk's build reporting.
+/// whether the shadow was merely too short — and which is printed only when a
+/// multi-frame build was actually attempted, so counting it undercounts the
+/// refusals tenfold.  Reporting at the refusal itself, a sweep of 524 fixtures
+/// found 21 declines across 10 fixtures, every one of them a ref color whose
+/// shadow held the untracked `Null` sentinel.  Gated like the rest of the
+/// walk's build reporting.
 fn report_caller_image_decline<T: std::fmt::Debug>(
     jitcode_index: u32,
     call_jit_pc: usize,
@@ -1697,6 +1699,37 @@ fn report_caller_image_decline<T: std::fmt::Debug>(
         "[fbw-blackhole] caller image DECLINED jitcode_index={jitcode_index} \
          call_jit_pc={call_jit_pc} bank={bank} live_color={color} \
          shadow_len={shadow_len} ({why}) got={got:?}"
+    );
+}
+
+/// Ref-bank addendum to [`report_caller_image_decline`]: name the box the
+/// declining color holds and whether the recorded producer could still supply
+/// its value.
+///
+/// The innermost-frame fill (`residual_call.rs`, `build_single_frame_miframe`'s
+/// `live.ref_` loop) meets the same situation and does not decline on it. It
+/// carries two refinements this site lacks: a live color whose register holds
+/// no box at all is SKIPPED, because a `-live-` set is the union over the paths
+/// INTO its coordinate and the walk took one of them; and a color whose shadow
+/// is the untracked `Null` sentinel is recovered through
+/// `TraceCtx::recover_ref_value`, which replays a `GetfieldGcR` producer chain.
+///
+/// Which of the two would have applied — or neither — is what separates a
+/// decline that is a missing refinement from one where the value is genuinely
+/// lost, so print it rather than infer it.
+fn report_caller_image_ref_box<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, color: usize) {
+    if !fbw_debug_abort_enabled() {
+        return;
+    }
+    let opref = ctx.registers_r.get(color).copied();
+    let box_is_none = opref.map(|o| o.is_none()).unwrap_or(true);
+    let recovered = opref
+        .filter(|o| !o.is_none())
+        .and_then(|o| ctx.trace_ctx.recover_ref_value(o, 8))
+        .is_some();
+    eprintln!(
+        "[fbw-blackhole] caller image ref detail live_color={color} box={opref:?} \
+         box_is_none={box_is_none} recoverable={recovered}"
     );
 }
 
@@ -1796,16 +1829,61 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         // Reading the shadow through it stamped whatever register happened to
         // live at the slot's number.
         let got = ctx.concrete_registers_r.get(color).copied();
-        let Some(ConcreteValue::Ref(value)) = got else {
-            report_caller_image_decline(
-                jitcode_index,
-                call_jit_pc,
-                'r',
-                color,
-                ctx.concrete_registers_r.len(),
-                got,
-            );
-            return None;
+        let value = match got {
+            Some(ConcreteValue::Ref(value)) => value,
+            // The shadow holds `ConcreteValue::Null`, the walker's UNTRACKED
+            // sentinel rather than a proven Python null: `write_ref_reg` stamps
+            // it for every op whose result the walk records without observing
+            // (field reads, residual calls).  The innermost-frame fill
+            // (`residual_call.rs`, `build_single_frame_miframe`'s `live.ref_`
+            // loop) meets the same two situations and answers them without
+            // refusing the image; this site is the one copy that never received
+            // those answers.
+            _ => {
+                let opref = ctx.registers_r.get(color).copied();
+                match opref {
+                    // No box at this color at all.  A `-live-` set is the union
+                    // over the paths INTO its coordinate and the walk took one
+                    // of them, so the color can be live at the coordinate and
+                    // undefined on the path actually walked.  Leave it unset,
+                    // exactly as `_copy_data_from_miframe`
+                    // (`blackhole.py:1711-1730`) leaves a `None` box unset —
+                    // refusing here discards the whole image over a register
+                    // nothing on this path will read.
+                    Some(o) if o.is_none() => continue,
+                    // The shadow never held this color's concrete, but the
+                    // recorded producer still can: `recover_ref_value` walks a
+                    // `GetfieldGcR` chain back to a value the walk did observe
+                    // and rereads the field.
+                    Some(o) => match ctx.trace_ctx.recover_ref_value(o, 8) {
+                        Some(majit_ir::Value::Ref(gc)) => gc.0 as pyre_object::PyObjectRef,
+                        _ => {
+                            report_caller_image_decline(
+                                jitcode_index,
+                                call_jit_pc,
+                                'r',
+                                color,
+                                ctx.concrete_registers_r.len(),
+                                got,
+                            );
+                            report_caller_image_ref_box(ctx, color);
+                            return None;
+                        }
+                    },
+                    None => {
+                        report_caller_image_decline(
+                            jitcode_index,
+                            call_jit_pc,
+                            'r',
+                            color,
+                            ctx.concrete_registers_r.len(),
+                            got,
+                        );
+                        report_caller_image_ref_box(ctx, color);
+                        return None;
+                    }
+                }
+            }
         };
         ref_values.push((color, value));
         if let Some(seeded) = ref_seeded.get_mut(color) {
