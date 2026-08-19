@@ -479,21 +479,26 @@ fn math_unary_int(
             "{fname}() takes exactly 1 argument",
         )));
     }
-    // If the descriptor itself raises (e.g. BadDescr.__get__ → ValueError),
-    // propagate that error rather than silently falling back to float.
-    match unsafe { crate::baseobjspace::lookup_special(args[0], dunder) } {
-        Ok(Some(method)) => {
-            crate::call::clear_call_error();
-            let result = crate::call_function(method, &[]);
-            if !result.is_null() {
-                return Ok(result);
-            }
-            if let Some(err) = crate::call::take_call_error() {
-                return Err(err);
-            }
-        }
-        Ok(None) => {}
-        Err(err) => return Err(err),
+    // `interp_math.py:393 floor` / `:496 ceil` / `:59 trunc`:
+    //
+    //     w_descr = space.lookup(w_x, '__floor__')
+    //     if w_descr is not None:
+    //         return space.get_and_call_function(w_descr, w_x)
+    //
+    // The unbound descriptor is called with the object leading the
+    // positionals, so a plain `float` argument does not pay for a bound method
+    // object per call.  A descriptor whose `__get__` itself raises (e.g.
+    // BadDescr.__get__ → ValueError) still propagates that error:
+    // `get_and_call_function` binds through `get` for every descriptor other
+    // than a function or method descriptor, and neither of those runs user
+    // code to bind.  `lookup` reads the type MRO only, so an instance
+    // attribute of the same name stays ignored.
+    if let Some(w_descr) = unsafe { crate::baseobjspace::lookup(args[0], dunder) }
+        && let Some(w_type) = crate::typedef::r#type(args[0])
+    {
+        return unsafe {
+            crate::baseobjspace::get_and_call_function(w_descr, args[0], w_type.as_ptr(), &[])
+        };
     }
     if !fallback_float {
         return Err(crate::PyError::type_error(format!(
