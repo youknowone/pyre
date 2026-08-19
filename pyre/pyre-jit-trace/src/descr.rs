@@ -5786,6 +5786,142 @@ fn simple_field_spec_from_bh(
 /// never aliases distinct STRUCTs; absent a real identity carrier,
 /// the closest orthodox behaviour is "each call is a distinct
 /// STRUCT" — mint fresh per call.
+/// Every STRUCT this module declares a descriptor group for, by the def path
+/// the group is registered under.
+///
+/// `build_object_descr_group_with_def_path` keys a group as
+/// `path_hash(def_path)`, which is the `GcCache` `(STRUCT, fieldname)`
+/// namespace a serialized `BhDescr` resolves into as well.  The two producers
+/// do not carry the same information: a group spells out `descr.py:229
+/// STRUCT._immutable_field(fieldname)` for each field, while the codewriter's
+/// `immutable_fields_by_struct` is empty for the whole LLBC pipeline, so every
+/// field a `BhDescr` describes reads as plain mutable.  `GcCache` hands the
+/// slot to whoever asks first and returns it unchanged after that, so without
+/// forcing the group here the rank a field ends up carrying is decided by
+/// which of the two reached it first -- and a `BhDescr` that got there first
+/// takes the declaration off every field of the STRUCT at once.
+///
+/// A group that does not reach that namespace is absent from the list:
+/// `PYCODE` and `EC` mint through the unkeyed factory, and `PYTRACEBACK` is
+/// registered under an empty def path, so its key is `path_hash("")` --
+/// none of the three names a STRUCT a `BhDescr` can carry.
+static DECLARED_GROUPS: &[(&str, fn())] = &[
+    ("intobject::W_IntObject", || {
+        LazyLock::force(&W_INT_DESCR_GROUP);
+    }),
+    ("intobject::W_IntObjectUser", || {
+        LazyLock::force(&W_INT_USER_DESCR_GROUP);
+    }),
+    ("floatobject::W_FloatObject", || {
+        LazyLock::force(&W_FLOAT_DESCR_GROUP);
+    }),
+    ("longobject::W_LongObject", || {
+        LazyLock::force(&W_LONG_DESCR_GROUP);
+    }),
+    ("boolobject::W_BoolObject", || {
+        LazyLock::force(&W_BOOL_DESCR_GROUP);
+    }),
+    ("unicodeobject::W_UnicodeObject", || {
+        LazyLock::force(&W_UNICODE_DESCR_GROUP);
+    }),
+    ("unicodeobject::W_UnicodeObjectUser", || {
+        LazyLock::force(&W_UNICODE_USER_DESCR_GROUP);
+    }),
+    ("functional::W_IntRangeIterator", || {
+        LazyLock::force(&RANGE_ITER_DESCR_GROUP);
+    }),
+    ("functional::W_Range", || {
+        LazyLock::force(&RANGE_DESCR_GROUP);
+    }),
+    ("functional::W_Zip", || {
+        LazyLock::force(&W_ZIP_DESCR_GROUP);
+    }),
+    ("iterobject::W_SeqIterObject", || {
+        LazyLock::force(&SEQ_ITER_DESCR_GROUP);
+    }),
+    ("iterobject::W_TupleIterObject", || {
+        LazyLock::force(&TUPLE_ITER_DESCR_GROUP);
+    }),
+    ("function::Function", || {
+        LazyLock::force(&FUNCTION_DESCR_GROUP);
+    }),
+    ("function::Method", || {
+        LazyLock::force(&W_METHOD_DESCR_GROUP);
+    }),
+    ("dictmultiobject::W_DictObject", || {
+        LazyLock::force(&W_DICT_DESCR_GROUP);
+    }),
+    ("celldict::ObjectMutableCell", || {
+        LazyLock::force(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP);
+    }),
+    ("listobject::W_ListObject", || {
+        LazyLock::force(&W_LIST_DESCR_GROUP);
+    }),
+    ("tupleobject::W_TupleObject", || {
+        LazyLock::force(&W_TUPLE_DESCR_GROUP);
+    }),
+    ("tupleobject::W_TupleObjectUser", || {
+        LazyLock::force(&W_TUPLE_USER_DESCR_GROUP);
+    }),
+    (
+        "specialisedtupleobject::W_SpecialisedTupleObject_ii",
+        || {
+            LazyLock::force(&SPECIALISED_TUPLE_II_DESCR_GROUP);
+        },
+    ),
+    (
+        "specialisedtupleobject::W_SpecialisedTupleObject_ff",
+        || {
+            LazyLock::force(&SPECIALISED_TUPLE_FF_DESCR_GROUP);
+        },
+    ),
+    (
+        "specialisedtupleobject::W_SpecialisedTupleObject_oo",
+        || {
+            LazyLock::force(&SPECIALISED_TUPLE_OO_DESCR_GROUP);
+        },
+    ),
+    ("object_array::ItemsBlock", || {
+        LazyLock::force(&ITEMS_BLOCK_DESCR_GROUP);
+    }),
+    ("rbigint::RBigIntPair", || {
+        LazyLock::force(&RBIGINT_PAIR_DESCR_GROUP);
+    }),
+    ("pyframe::FrameDebugData", || {
+        LazyLock::force(&FRAME_DEBUG_DATA_DESCR_GROUP);
+    }),
+    ("pyframe::PyFrame", || {
+        LazyLock::force(&PYFRAME_DESCR_GROUP);
+    }),
+    ("sliceobject::W_SliceObject", || {
+        LazyLock::force(&W_SLICE_DESCR_GROUP);
+    }),
+    ("objectobject::W_ObjectObject", || {
+        LazyLock::force(&W_OBJECT_OBJECT_DESCR_GROUP);
+    }),
+];
+
+/// The [`DECLARED_GROUPS`] rows by the `GcCache` key each one owns.
+static DECLARED_GROUP_BY_KEY: LazyLock<std::collections::HashMap<u64, fn()>> =
+    LazyLock::new(|| {
+        DECLARED_GROUPS
+            .iter()
+            .map(|(def_path, force)| (majit_ir::descr::path_hash(def_path), *force))
+            .collect()
+    });
+
+/// Force this module's own group for `cache_key`, if it declares one, so the
+/// declaration takes the STRUCT's `(STRUCT, fieldname)` slots before a
+/// serialized `BhDescr` can.
+///
+/// Idempotent and cheap after the first call for a STRUCT: the group is a
+/// `LazyLock` and the second force is a load.
+fn force_declared_group(cache_key: u64) {
+    if let Some(force) = DECLARED_GROUP_BY_KEY.get(&cache_key) {
+        force();
+    }
+}
+
 fn simple_descr_group_from_bh_size(
     spec: &majit_translate::jitcode::BhSizeSpec,
 ) -> majit_ir::descr::SimpleDescrGroup {
@@ -5817,6 +5953,14 @@ fn simple_descr_group_from_bh_size(
             &field_specs,
         );
     }
+    // The spec describes every field as plain mutable: the codewriter's
+    // `immutable_fields_by_struct` is empty for the whole LLBC pipeline, so a
+    // serialized `BhDescr` carries no `descr.py:229
+    // STRUCT._immutable_field(fieldname)` rank.  Minting this STRUCT's fields
+    // from it would take that rank off them for every later reader, since the
+    // slot goes to whoever asks first.  Where this module declares the STRUCT,
+    // let the declaration ask first.
+    force_declared_group(spec.type_id);
     // `descr.py:108-118 get_size_descr` + `:218-239 get_field_descr`
     // keyed publish: GcCache is the sole owner/cache for this STRUCT.
     majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
@@ -6390,6 +6534,10 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             }
             if let Some(parent) = parent {
                 if parent.type_id != 0 {
+                    // Before the lookup, not after it: a declared group that
+                    // has not been forced yet leaves the slot empty, and the
+                    // rebuild below would then fill it from the spec.
+                    force_declared_group(parent.type_id);
                     let key = majit_ir::descr::LLType::Struct(parent.type_id);
                     if let Some(fd) = majit_ir::descr::gc_cache()
                         .lock()
