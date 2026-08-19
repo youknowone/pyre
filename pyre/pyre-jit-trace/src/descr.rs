@@ -4664,8 +4664,9 @@ mod tests {
     /// both accessors must name that one field.
     ///
     /// `SimpleFieldDescr`'s legacy producer infers `is_w_class` from the field
-    /// name (`name_is_class_word`: `== "w_class"` or `ends_with(".w_class")`),
-    /// and `build_object_descr_group_with_extra_gc_edges` qualifies every name
+    /// name (`class_word_inferred_from_name`: `== "w_class"` or
+    /// `ends_with(".w_class")`), and
+    /// `build_object_descr_group_with_extra_gc_edges` qualifies every name
     /// with the group's simple name.  So a group that declares a payload field
     /// literally called `w_class` publishes *two* descrs reporting
     /// `is_w_class()`, and both accessors take the first — which is the payload
