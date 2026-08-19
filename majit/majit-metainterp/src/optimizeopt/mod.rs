@@ -6607,7 +6607,29 @@ impl OptContext {
         // and a 0-length vable section reached the backend unremarked. It then
         // surfaced only if the guard was actually deopted, as
         // `assert!(vable_size > 0)` in `resume.rs::consume_vable_info`.
+        // optimizer.py:761-766 answers a failed numbering by abandoning the
+        // whole compilation:
+        //
+        //     try:
+        //         newboxes = modifier.finish(pendingfields)
+        //         ...
+        //     except resume.TagOverflow:
+        //         raise compile.giveup()
+        //
+        // Returning without that signal leaves this guard with no resume data
+        // and lets the trace compile regardless. Nothing reports it: the guard
+        // is only consulted if it later fails, and the deopt then rebuilds
+        // interpreter state out of an empty numbering, so the interpreter
+        // resumes holding values that are not the ones it had. The witness is
+        // the interpreted program's own answer, not any JIT statistic.
+        //
+        // `signal_invalid_loop` rather than a literal `giveup()`: pyre has no
+        // `SwitchToBlackhole`, and this is the established way for a leaf that
+        // cannot raise to abandon the trace (`protect_speculative_operation`
+        // uses the same one). Both discard the compilation and leave the
+        // interpreter to carry on from state the JIT never took over.
         let Ok(numb_state) = memo.number(&snapshot, &env, self.minimum_virtualizable_size) else {
+            self.signal_invalid_loop("resume numbering: TagOverflow");
             return;
         };
 
