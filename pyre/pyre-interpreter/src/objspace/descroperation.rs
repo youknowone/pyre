@@ -3208,11 +3208,11 @@ unsafe fn try_numeric_unaryop_override(
     Ok(Some(crate::call::call_function_impl_result(method, &[a])?))
 }
 
-pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__add__", "__radd__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
         {
             return Ok(result);
         }
@@ -3235,7 +3235,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             // subclass overriding `__add__`/`__radd__` must reach the
             // reflected dispatch; otherwise concat directly.
             if needs_seq_binop_dispatch(a, b, SeqBase::Str, "__add__", "__radd__")
-                && let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")?
+                && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
             {
                 return Ok(result);
             }
@@ -3243,7 +3243,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_list(a) && is_list(b) {
             if needs_seq_binop_dispatch(a, b, SeqBase::List, "__add__", "__radd__")
-                && let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")?
+                && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
             {
                 return Ok(result);
             }
@@ -3251,7 +3251,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if is_tuple(a) && is_tuple(b) {
             if needs_seq_binop_dispatch(a, b, SeqBase::Tuple, "__add__", "__radd__")
-                && let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")?
+                && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
             {
                 return Ok(result);
             }
@@ -3266,13 +3266,13 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 // a memoryview cannot, so dispatch only when both are bytes-like.
                 if pyre_object::bytesobject::is_bytes_like(b)
                     && needs_bytes_binop_dispatch(a, b, "__add__", "__radd__")
-                    && let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")?
+                    && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
                 {
                     return Ok(result);
                 }
                 return bytes_concat(a, b_src);
             }
-            if let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")? {
+            if let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")? {
                 return Ok(result);
             }
             // A non-buffer rhs is rejected with the generic operator TypeError
@@ -3288,7 +3288,7 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // already implements the reflected-first reordering rule for
         // subclass operands.
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__add__", "__radd__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__add__", "__radd__")?
         {
             return Ok(result);
         }
@@ -3301,9 +3301,9 @@ pub fn add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-pub fn matmul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn matmul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
-        if let Some(result) = try_dispatch_binary_special(a, b, "__matmul__", "__rmatmul__")? {
+        if let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__matmul__", "__rmatmul__")? {
             return Ok(result);
         }
         let a_name = (*ll_type(a)).name;
@@ -3314,17 +3314,17 @@ pub fn matmul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn sub(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
         {
             return Ok(result);
         }
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__sub__", "__rsub__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
         {
             return Ok(result);
         }
@@ -3352,7 +3352,7 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return crate::typedef::set_method_difference(&[a, b]);
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__sub__", "__rsub__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__sub__", "__rsub__")?
         {
             return Ok(result);
         }
@@ -3364,11 +3364,11 @@ pub fn sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__mul__", "__rmul__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {
             return Ok(result);
         }
@@ -3392,7 +3392,7 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // list repetition — the same gate the concat branches of `add` apply.
         const MUL_SPECIALS: &[&str] = &["__mul__", "__rmul__"];
         if (seq_repeat_override(a, MUL_SPECIALS) || seq_repeat_override(b, MUL_SPECIALS))
-            && let Some(result) = try_dispatch_binary_special(a, b, "__mul__", "__rmul__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {
             return Ok(result);
         }
@@ -3428,6 +3428,13 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // numeric implementation.
         let a_seq = is_repeat_sequence(a);
         let b_seq = is_repeat_sequence(b);
+        // Every arm below can run Python — the two reflected invocations
+        // directly, `try_dispatch_binary_special` through its own — and by
+        // this point either operand may be a list, whose header moves.  Pin
+        // the pair so the error path can name the types, and the repeat path
+        // can address the sequence, at their post-collection addresses.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let operands = pyre_object::gc_roots::pin_roots(&[a, b]);
         let dispatched = match (a_seq, b_seq) {
             (true, true) => None,
             (true, false) => match lookup_type_special(b, "__rmul__") {
@@ -3439,26 +3446,31 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
                 None => None,
             },
             (false, false) if !numeric_override => {
-                try_dispatch_binary_special(a, b, "__mul__", "__rmul__")?
+                try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
             }
             (false, false) => None,
         };
         if let Some(result) = dispatched {
             return Ok(result);
         }
+        let a = pyre_object::gc_roots::shadow_stack_get(operands);
+        let b = pyre_object::gc_roots::shadow_stack_get(operands + 1);
         let a_name = crate::baseobjspace::object_functionstr_type_name(a);
         let b_name = crate::baseobjspace::object_functionstr_type_name(b);
         // `sequence_repeat`: the count goes through `__index__`, and an
         // operand that has none is reported by its own type — the sequence is
         // never the one named.
         if a_seq || b_seq {
-            let (seq, other, other_name) = if a_seq {
-                (a, b, b_name)
+            let (seq_slot, other, other_name) = if a_seq {
+                (operands, b, b_name)
             } else {
-                (b, a, a_name)
+                (operands + 1, a, a_name)
             };
             if !(a_seq && b_seq) && crate::baseobjspace::lookup(other, "__index__").is_some() {
-                return sequence_repeat(seq, crate::baseobjspace::getindex_repeat(other)?);
+                // `__index__` is Python, so the sequence is addressed again
+                // only after the count is in hand.
+                let count = crate::baseobjspace::getindex_repeat(other)?;
+                return sequence_repeat(pyre_object::gc_roots::shadow_stack_get(seq_slot), count);
             }
             return Err(PyError::type_error(format!(
                 "can't multiply sequence by non-int of type '{other_name}'"
@@ -3470,12 +3482,12 @@ pub fn mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn floordiv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__floordiv__", "__rfloordiv__");
         if numeric_override
             && let Some(result) =
-                try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")?
+                try_dispatch_binary_special(&mut a, &mut b, "__floordiv__", "__rfloordiv__")?
         {
             return Ok(result);
         }
@@ -3492,7 +3504,7 @@ pub fn floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
         if !numeric_override
             && let Some(result) =
-                try_dispatch_binary_special(a, b, "__floordiv__", "__rfloordiv__")?
+                try_dispatch_binary_special(&mut a, &mut b, "__floordiv__", "__rfloordiv__")?
         {
             return Ok(result);
         }
@@ -3525,11 +3537,11 @@ unsafe fn try_subclass_binop_override(
     Ok((!is_not_implemented(result)).then_some(result))
 }
 
-pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__mod__", "__rmod__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__mod__", "__rmod__")?
         {
             return Ok(result);
         }
@@ -3571,7 +3583,7 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             };
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__mod__", "__rmod__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__mod__", "__rmod__")?
         {
             return Ok(result);
         }
@@ -3591,11 +3603,11 @@ pub fn mod_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// longobject.py:62-70 `_truediv` catches OverflowError from
 /// `rbigint.truediv` and reissues it as
 /// "integer division result too large for a float".
-pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn truediv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__truediv__", "__rtruediv__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__truediv__", "__rtruediv__")?
         {
             return Ok(result);
         }
@@ -3637,7 +3649,7 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return complex_truediv(a, b);
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__truediv__", "__rtruediv__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__truediv__", "__rtruediv__")?
         {
             return Ok(result);
         }
@@ -3651,38 +3663,38 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// `descroperation.py:425 pow_binary` — return `None` when neither numeric
 /// fast paths nor `__pow__` / `__rpow__` produce a result.
-fn pow_binary(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+fn pow_binary(a: &mut PyObjectRef, b: &mut PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
-        let numeric_override = needs_numeric_binop_dispatch(a, b, "__pow__", "__rpow__");
+        let numeric_override = needs_numeric_binop_dispatch(*a, *b, "__pow__", "__rpow__");
         if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, "__pow__", "__rpow__")? {
                 return Ok(Some(result));
             }
             return Ok(None);
         }
-        if is_int_like(a) && is_int_like(b) {
-            return int_pow(a, b).map(Some);
+        if is_int_like(*a) && is_int_like(*b) {
+            return int_pow(*a, *b).map(Some);
         }
-        if is_int_or_long(a) && is_int_or_long(b) {
-            return long_pow(a, b).map(Some);
+        if is_int_or_long(*a) && is_int_or_long(*b) {
+            return long_pow(*a, *b).map(Some);
         }
-        if is_float_pair(a, b) {
-            reject_pow_operand_overflow(a)?;
-            reject_pow_operand_overflow(b)?;
-            return float_pow_impl(as_float(a), as_float(b)).map(Some);
+        if is_float_pair(*a, *b) {
+            reject_pow_operand_overflow(*a)?;
+            reject_pow_operand_overflow(*b)?;
+            return float_pow_impl(as_float(*a), as_float(*b)).map(Some);
         }
-        if is_complex_pair(a, b) {
-            reject_pow_operand_overflow(a)?;
-            reject_pow_operand_overflow(b)?;
-            return complex_pow(a, b).map(Some);
+        if is_complex_pair(*a, *b) {
+            reject_pow_operand_overflow(*a)?;
+            reject_pow_operand_overflow(*b)?;
+            return complex_pow(*a, *b).map(Some);
         }
         try_dispatch_binary_special(a, b, "__pow__", "__rpow__")
     }
 }
 
 /// Power operation dispatch (`**` operator).
-pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    if let Some(result) = pow_binary(a, b)? {
+pub fn pow(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
+    if let Some(result) = pow_binary(&mut a, &mut b)? {
         return Ok(result);
     }
     let a_name = crate::baseobjspace::object_functionstr_type_name(a);
@@ -3694,11 +3706,11 @@ pub fn pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// `descroperation.py:486-499 inplace_pow` — unlike the generated in-place
 /// binary operations, power has its own fallback error spelling.
-pub fn inplace_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn inplace_pow(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     if let Some(result) = try_inplace_special(a, b, "__ipow__", None, false)? {
         return Ok(result);
     }
-    if let Some(result) = pow_binary(a, b)? {
+    if let Some(result) = pow_binary(&mut a, &mut b)? {
         return Ok(result);
     }
     Err(binary_builtin_type_error("**=", a, b))
@@ -3998,27 +4010,38 @@ pub(crate) fn try_call_special(
 /// `lookup_where`, decide whether to try the reflected operand first by
 /// comparing the two defining classes, then invoke forward-then-reverse.
 pub(crate) fn try_dispatch_binary_special(
-    lhs: PyObjectRef,
-    rhs: PyObjectRef,
+    lhs: &mut PyObjectRef,
+    rhs: &mut PyObjectRef,
     dunder: &str,
     rdunder: &str,
 ) -> Result<Option<PyObjectRef>, PyError> {
     // descroperation.py:687 `seq_bug_compat = (symbol == '+' or symbol == '*')`.
     let seq_bug_compat = dunder == "__add__" || dunder == "__mul__";
     unsafe {
-        let Some(w_typ1) = crate::typedef::r#type(lhs) else {
+        let Some(w_typ1) = crate::typedef::r#type(*lhs) else {
             return Ok(None);
         };
-        let Some(w_typ2) = crate::typedef::r#type(rhs) else {
+        let Some(w_typ2) = crate::typedef::r#type(*rhs) else {
             return Ok(None);
         };
+        // From here on Python can run: `p_abstract_issubclass_w` reaches
+        // `__bases__`, and the two invocations below are Python calls
+        // outright.  Both operands are pinned for the whole span and read
+        // back through `operand`, so neither this frame nor the caller — which
+        // goes on to concatenate, repeat or name them — is left holding a
+        // pre-collection address.  That is why they arrive by `&mut`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let operands = pyre_object::gc_roots::pin_roots(&[*lhs, *rhs]);
+        let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
         let (w_left_src, mut w_left_impl) =
             match lookup_where_with_method_cache(w_typ1.as_ptr(), dunder) {
                 Some((src, imp)) => (Some(src), Some(imp)),
                 None => (None, None),
             };
-        let mut w_obj1 = lhs;
-        let mut w_obj2 = rhs;
+        // Which slot the forward call's first operand is read from.  Upstream
+        // swaps the two values; swapping the *index* keeps the pinned copies
+        // authoritative across a collection.
+        let mut swapped = false;
         let mut w_right_impl: Option<PyObjectRef> = None;
         // descroperation.py:652 — same type means the reflected method is
         // never considered.
@@ -4044,24 +4067,33 @@ pub(crate) fn try_dispatch_binary_special(
                     && !p_abstract_issubclass_w(lsrc, rsrc)?
                     && !p_abstract_issubclass_w(w_typ1.as_ptr(), rsrc)?
                 {
-                    std::mem::swap(&mut w_obj1, &mut w_obj2);
+                    swapped = true;
                     std::mem::swap(&mut w_left_impl, &mut w_right_impl);
                 }
             }
         }
+        let (first, second) = if swapped { (1, 0) } else { (0, 1) };
+        // The reflected implementation has to survive the forward call too.
+        let right_slot = w_right_impl.map(|method| {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(method);
+            slot
+        });
+        let mut result = None;
         // descroperation.py:676 — _invoke_binop(w_left_impl, w_obj1, w_obj2).
-        if let Some(method) = w_left_impl
-            && let Some(result) = try_call_special(method, &[w_obj1, w_obj2])?
-        {
-            return Ok(Some(result));
+        if let Some(method) = w_left_impl {
+            result = try_call_special(method, &[operand(first), operand(second)])?;
         }
         // descroperation.py:679 — _invoke_binop(w_right_impl, w_obj2, w_obj1).
-        if let Some(method) = w_right_impl
-            && let Some(result) = try_call_special(method, &[w_obj2, w_obj1])?
+        if result.is_none()
+            && let Some(slot) = right_slot
         {
-            return Ok(Some(result));
+            let method = pyre_object::gc_roots::shadow_stack_get(slot);
+            result = try_call_special(method, &[operand(second), operand(first)])?;
         }
-        Ok(None)
+        *lhs = operand(0);
+        *rhs = operand(1);
+        Ok(result)
     }
 }
 
@@ -4071,23 +4103,30 @@ pub(crate) fn try_dispatch_binary_special(
 /// distinct `__rpow__` is tried first, then the base's `__pow__`, then the
 /// reflected method when it has not already been tried.
 fn try_dispatch_ternary_pow_special(
-    base: PyObjectRef,
-    exp: PyObjectRef,
-    modulus: PyObjectRef,
+    base: &mut PyObjectRef,
+    exp: &mut PyObjectRef,
+    modulus: &mut PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
-        let Some(w_base_type) = crate::typedef::r#type(base) else {
+        let Some(w_base_type) = crate::typedef::r#type(*base) else {
             return Ok(None);
         };
-        let Some(w_exp_type) = crate::typedef::r#type(exp) else {
+        let Some(w_exp_type) = crate::typedef::r#type(*exp) else {
             return Ok(None);
         };
+        // Up to three Python invocations follow, and a `list` subclass
+        // defining `__pow__` puts a movable header in an operand slot.  Pin
+        // all three, read them back through `operand`, and hand them out — the
+        // caller spells the error message from them.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let operands = pyre_object::gc_roots::pin_roots(&[*base, *exp, *modulus]);
+        let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
         let (w_base_src, w_base_impl) =
             match lookup_where_with_method_cache(w_base_type.as_ptr(), "__pow__") {
                 Some((src, imp)) => (Some(src), Some(imp)),
                 None => (None, None),
             };
-        let (w_exp_src, mut w_exp_impl) = if w_base_type != w_exp_type {
+        let (w_exp_src, w_exp_impl) = if w_base_type != w_exp_type {
             match lookup_where_with_method_cache(w_exp_type.as_ptr(), "__rpow__") {
                 Some((src, imp)) => (Some(src), Some(imp)),
                 None => (None, None),
@@ -4095,35 +4134,55 @@ fn try_dispatch_ternary_pow_special(
         } else {
             (None, None)
         };
+        // Each implementation also has to survive the invocations that precede
+        // it.  A class attribute is an arbitrary object, so a `dict` subclass
+        // defining `__call__` puts a movable header in this slot as readily as
+        // in an operand's.
+        let pin = |method: PyObjectRef| {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(method);
+            slot
+        };
+        let base_impl_slot = w_base_impl.map(pin);
+        let mut exp_impl_slot = w_exp_impl.map(pin);
 
         // slot_nb_power: a proper exponent subtype whose reflected method is
         // distinct from the base type's definition gets the first chance.
         if issubtype_w(w_exp_type.as_ptr(), w_base_type.as_ptr())
-            && let (Some(exp_src), Some(base_src), Some(exp_impl)) =
-                (w_exp_src, w_base_src, w_exp_impl)
+            && let (Some(exp_src), Some(base_src), Some(slot)) =
+                (w_exp_src, w_base_src, exp_impl_slot)
             && !std::ptr::eq(base_src, exp_src)
             && !p_abstract_issubclass_w(base_src, exp_src)?
             && !p_abstract_issubclass_w(w_base_type.as_ptr(), exp_src)?
         {
-            if let Some(result) = try_call_special(exp_impl, &[exp, base, modulus])? {
+            let exp_impl = pyre_object::gc_roots::shadow_stack_get(slot);
+            if let Some(result) = try_call_special(exp_impl, &[operand(1), operand(0), operand(2)])?
+            {
+                *base = operand(0);
+                *exp = operand(1);
+                *modulus = operand(2);
                 return Ok(Some(result));
             }
             // CPython clears `do_other` after the subtype-first call,
             // including when it returns NotImplemented.
-            w_exp_impl = None;
+            exp_impl_slot = None;
         }
 
-        if let Some(method) = w_base_impl
-            && let Some(result) = try_call_special(method, &[base, exp, modulus])?
-        {
-            return Ok(Some(result));
+        let mut result = None;
+        if let Some(slot) = base_impl_slot {
+            let method = pyre_object::gc_roots::shadow_stack_get(slot);
+            result = try_call_special(method, &[operand(0), operand(1), operand(2)])?;
         }
-        if let Some(method) = w_exp_impl
-            && let Some(result) = try_call_special(method, &[exp, base, modulus])?
+        if result.is_none()
+            && let Some(slot) = exp_impl_slot
         {
-            return Ok(Some(result));
+            let method = pyre_object::gc_roots::shadow_stack_get(slot);
+            result = try_call_special(method, &[operand(1), operand(0), operand(2)])?;
         }
-        Ok(None)
+        *base = operand(0);
+        *exp = operand(1);
+        *modulus = operand(2);
+        Ok(result)
     }
 }
 
@@ -4153,17 +4212,37 @@ pub(crate) fn try_inplace_special(
         // descroperation.py:831 seq_bug_compat — for `+=` / `*=` where the
         // lhs is a builtin sequence and the rhs is not, try the rhs
         // reflected method before the lhs in-place method.
-        if seq_bug_compat
+        let rmethod = if seq_bug_compat
             && let Some(rd) = rdunder
             && let (Some(lhs_type), Some(rhs_type)) =
                 (crate::typedef::r#type(lhs), crate::typedef::r#type(rhs))
             && crate::baseobjspace::flag_sequence_bug_compat(lhs_type.as_ptr())
             && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type.as_ptr())
-            && let Some(rmethod) = unsafe { lookup_type_special(rhs, rd) }
-            && let Some(result) = try_call_special(rmethod, &[rhs, lhs])?
         {
-            return Ok(Some(result));
-        }
+            unsafe { lookup_type_special(rhs, rd) }
+        } else {
+            None
+        };
+        // That reflected call runs Python, and the branch guarding it is
+        // reached precisely when the lhs is a builtin sequence — a list, whose
+        // header moves.  Pin both operands and the in-place method across it
+        // and read them back, or the in-place call below is handed a
+        // pre-collection address.
+        let (lhs, rhs, method) = match rmethod {
+            Some(rmethod) => {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = pyre_object::gc_roots::pin_roots(&[lhs, rhs, method]);
+                if let Some(result) = try_call_special(rmethod, &[rhs, lhs])? {
+                    return Ok(Some(result));
+                }
+                (
+                    pyre_object::gc_roots::shadow_stack_get(base),
+                    pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    pyre_object::gc_roots::shadow_stack_get(base + 2),
+                )
+            }
+            None => (lhs, rhs, method),
+        };
         if let Some(result) = try_call_special(method, &[lhs, rhs])? {
             return Ok(Some(result));
         }
@@ -4321,11 +4400,11 @@ pub(crate) fn ternary_builtin_type_error(
 /// `pypy/objspace/descroperation.py:441` tries only the base's `__pow__`;
 /// Python 3.14 changed this to offer the exponent's `__rpow__` the modulus
 /// too (`Objects/typeobject.c:slot_nb_power`).
-pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResult {
+pub fn pow3(mut base: PyObjectRef, mut exp: PyObjectRef, mut modulus: PyObjectRef) -> PyResult {
     if unsafe { is_none(modulus) } {
         return pow(base, exp);
     }
-    if let Some(result) = try_dispatch_ternary_pow_special(base, exp, modulus)? {
+    if let Some(result) = try_dispatch_ternary_pow_special(&mut base, &mut exp, &mut modulus)? {
         return Ok(result);
     }
     Err(ternary_builtin_type_error(
@@ -4340,12 +4419,12 @@ pub fn pow3(base: PyObjectRef, exp: PyObjectRef, modulus: PyObjectRef) -> PyResu
 /// `('divmod', 'divmod', 2, ['__divmod__', '__rdivmod__'])`. Numeric
 /// fast path then forward + reverse special-method dispatch with the
 /// standard NotImplemented fallback.
-pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     let numeric_override;
     unsafe {
         numeric_override = needs_numeric_binop_dispatch(a, b, "__divmod__", "__rdivmod__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__divmod__", "__rdivmod__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__divmod__", "__rdivmod__")?
         {
             return Ok(result);
         }
@@ -4369,7 +4448,7 @@ pub fn divmod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         }
     }
     if !numeric_override
-        && let Some(result) = try_dispatch_binary_special(a, b, "__divmod__", "__rdivmod__")?
+        && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__divmod__", "__rdivmod__")?
     {
         return Ok(result);
     }
@@ -4522,11 +4601,11 @@ fn float_pow_impl(x: f64, y: f64) -> PyResult {
 
 /// Left shift dispatch (`<<` operator).
 
-pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn lshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__lshift__", "__rlshift__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__lshift__", "__rlshift__")?
         {
             return Ok(result);
         }
@@ -4539,7 +4618,7 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             }
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__lshift__", "__rlshift__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__lshift__", "__rlshift__")?
         {
             return Ok(result);
         }
@@ -4553,11 +4632,11 @@ pub fn lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Right shift dispatch (`>>` operator).
 
-pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn rshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__rshift__", "__rrshift__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__rshift__", "__rrshift__")?
         {
             return Ok(result);
         }
@@ -4570,7 +4649,7 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             }
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__rshift__", "__rrshift__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__rshift__", "__rrshift__")?
         {
             return Ok(result);
         }
@@ -4584,17 +4663,17 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Bitwise AND dispatch (`&` operator).
 
-pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn and_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
         {
             return Ok(result);
         }
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__and__", "__rand__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
         {
             return Ok(result);
         }
@@ -4622,7 +4701,7 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return crate::typedef::set_method_intersection(&[a, b]);
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__and__", "__rand__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__and__", "__rand__")?
         {
             return Ok(result);
         }
@@ -4657,14 +4736,14 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // each side so the dict-arm below sees plain dicts and produces
     // the same merge result.  The proxy-on-rhs case mirrors
     // `descr_ror` (proxy wraps the rhs operand inside `__or__`).
-    let a = unsafe {
+    let mut a = unsafe {
         if pyre_object::is_dict_proxy(a) {
             pyre_object::w_dict_proxy_get_mapping(a)
         } else {
             a
         }
     };
-    let b = unsafe {
+    let mut b = unsafe {
         if pyre_object::is_dict_proxy(b) {
             pyre_object::w_dict_proxy_get_mapping(b)
         } else {
@@ -4675,11 +4754,11 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let set_override = needs_set_binop_dispatch(a, b);
         let numeric = needs_numeric_binop_dispatch(a, b, "__or__", "__ror__");
         if set_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__or__", "__ror__")?
         {
             return Ok(result);
         }
-        if numeric && let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")? {
+        if numeric && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__or__", "__ror__")? {
             return Ok(result);
         }
         // boolobject.py:75 W_BoolObject.descr_or — both operands bool
@@ -4731,7 +4810,7 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // set-/numeric-subclass override is never re-invoked.
         if !set_override
             && !numeric
-            && let Some(result) = try_dispatch_binary_special(a, b, "__or__", "__ror__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__or__", "__ror__")?
         {
             return Ok(result);
         }
@@ -4754,17 +4833,17 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// Bitwise XOR dispatch (`^` operator).
 
-pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+pub fn xor(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let set_override = needs_set_binop_dispatch(a, b);
         if set_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
         {
             return Ok(result);
         }
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__xor__", "__rxor__");
         if numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
         {
             return Ok(result);
         }
@@ -4791,7 +4870,7 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             return crate::typedef::set_method_symmetric_difference(&[a, b]);
         }
         if !numeric_override
-            && let Some(result) = try_dispatch_binary_special(a, b, "__xor__", "__rxor__")?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, "__xor__", "__rxor__")?
         {
             return Ok(result);
         }
