@@ -10025,6 +10025,232 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `math.fabs(x)` on an exact int/float argument.  `interp_math.py:386` is
+/// `math1(space, math.fabs, w_x)`, and RPython lowers `ll_math_fabs` to a sign
+/// mask, so the whole builtin is one `FloatAbs` once the operand is unboxed.
+/// `fabs` is total — it raises for no input and needs no domain guard — so the
+/// only guards are the operand's own class and exact-`w_class` checks.
+/// Rebound callables, numeric subclasses, and non-numeric inputs retain the
+/// ordinary residual call.
+pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
+        return Ok(None);
+    }
+    if !pyre_interpreter::module::math::interp_math::is_math_fabs_function(concrete_callable) {
+        return Ok(None);
+    }
+    let (is_int, val) = unsafe {
+        if !pyre_object::is_exact_builtin_instance(arg_obj) {
+            return Ok(None);
+        }
+        if pyre_object::is_int(arg_obj) {
+            (true, pyre_object::w_int_get_value(arg_obj) as f64)
+        } else if pyre_object::is_float(arg_obj) {
+            (false, pyre_object::w_float_get_value(arg_obj))
+        } else {
+            return Ok(None);
+        }
+    };
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], arg_obj, is_int, val, false)?;
+    let raw = ctx.trace_ctx.record_op(OpCode::FloatAbs, &[x]);
+    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Float(result_val));
+    let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+    ctx.trace_ctx.set_opref_concrete(
+        boxed,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
+/// Which reduction `try_walker_specialize_math_round_to_int` is folding.
+#[derive(Clone, Copy)]
+pub(crate) enum MathRoundMode {
+    Floor,
+    Ceil,
+    Trunc,
+}
+
+/// `math.floor(x)` / `math.ceil(x)` / `math.trunc(x)` on an exact float.
+///
+/// `interp_math.py:393`/`:496`/`:59` look the dunder up on the type and call
+/// it; for an exact float that resolves to `W_FloatObject`'s own reduction
+/// followed by `newint_from_float`, whose `ovfcheck_float_to_int` arm is a
+/// machine cast.  Recreate that shape: unbox, guard the operand into the
+/// signed range, round, and cast.
+///
+/// Only an exact float is folded.  An `int` argument reaches
+/// `int.__floor__`, which returns the argument object itself rather than a
+/// fresh box, and a float subclass may override the dunder — both keep the
+/// residual.
+///
+/// The range guard is on the operand rather than the rounded value, which is
+/// sufficient for all three modes: `-2**63` is an integer so `floor` cannot
+/// leave the range from below, `|trunc(x)| <= |x|`, and every float below
+/// `2**63` large enough for `ceil` to move it is already integral (the ulp
+/// there is 2048).
+pub(crate) fn try_walker_specialize_math_round_to_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+    mode: MathRoundMode,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 3 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(arg_obj),
+    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
+        return Ok(None);
+    }
+    let is_this_builtin: fn(pyre_object::PyObjectRef) -> bool = match mode {
+        MathRoundMode::Floor => pyre_interpreter::module::math::interp_math::is_math_floor_function,
+        MathRoundMode::Ceil => pyre_interpreter::module::math::interp_math::is_math_ceil_function,
+        MathRoundMode::Trunc => pyre_interpreter::module::math::interp_math::is_math_trunc_function,
+    };
+    if !is_this_builtin(concrete_callable) {
+        return Ok(None);
+    }
+    let value = unsafe {
+        if !pyre_object::is_exact_builtin_instance(arg_obj) || !pyre_object::is_float(arg_obj) {
+            return Ok(None);
+        }
+        pyre_object::w_float_get_value(arg_obj)
+    };
+    // `2**63` is exactly representable while `i64::MAX` is not; use a strict
+    // upper bound, matching ovfcheck_float_to_int on a signed 64-bit target.
+    // NaN and both infinities fail these comparisons and keep the residual,
+    // which raises for them.
+    const SIGNED_MIN_AS_FLOAT: f64 = -9223372036854775808.0;
+    const SIGNED_LIMIT_AS_FLOAT: f64 = 9223372036854775808.0;
+    if !(value >= SIGNED_MIN_AS_FLOAT && value < SIGNED_LIMIT_AS_FLOAT) {
+        return Ok(None);
+    }
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_int(boxed_result) } {
+        return Ok(None);
+    }
+    let result_value = unsafe { pyre_object::w_int_get_value(boxed_result) };
+
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let arg_op = r_args[2];
+    let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+    let raw_float = walker_unbox_float(ctx, op.pc, arg_op, float_type_addr)?;
+    walker_guard_exact_w_class(
+        ctx,
+        op.pc,
+        arg_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE),
+    )?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_float, majit_ir::Value::Float(value));
+    let low = ctx
+        .trace_ctx
+        .const_float(SIGNED_MIN_AS_FLOAT.to_bits() as i64);
+    let high = ctx
+        .trace_ctx
+        .const_float(SIGNED_LIMIT_AS_FLOAT.to_bits() as i64);
+    walker_float_cmp_guard(ctx, op.pc, OpCode::FloatGe, &[raw_float, low], true)?;
+    walker_float_cmp_guard(ctx, op.pc, OpCode::FloatLt, &[raw_float, high], true)?;
+
+    // `CastFloatToInt` already truncates toward zero, so only floor and ceil
+    // need a rounding step.  Both are elidable and cannot raise.
+    let rounded = match mode {
+        MathRoundMode::Trunc => raw_float,
+        MathRoundMode::Floor | MathRoundMode::Ceil => {
+            let (helper, rounded_value) = match mode {
+                MathRoundMode::Floor => (
+                    pyre_interpreter::module::math::interp_math::jit_math_floor_raw as *const (),
+                    value.floor(),
+                ),
+                _ => (
+                    pyre_interpreter::module::math::interp_math::jit_math_ceil_raw as *const (),
+                    value.ceil(),
+                ),
+            };
+            let rounded = ctx.trace_ctx.call_float_typed_with_effect(
+                helper,
+                &[raw_float],
+                &[majit_ir::Type::Float],
+                majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(rounded, majit_ir::Value::Float(rounded_value));
+            rounded
+        }
+    };
+    let raw_int = ctx.trace_ctx.record_op(OpCode::CastFloatToInt, &[rounded]);
+    ctx.trace_ctx
+        .set_opref_concrete(raw_int, majit_ir::Value::Int(result_value));
+    let boxed = walker_box_int(ctx, op.pc, raw_int, result_value)?;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(result_value, boxed_result as i64));
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(()))
+}
+
 /// `float(x)` on an exact int/float argument: inline the conversion
 /// (`W_IntObject.descr_float` → `space.newfloat`, or the identity
 /// `float(f) is f` for an exact float) instead of the opaque

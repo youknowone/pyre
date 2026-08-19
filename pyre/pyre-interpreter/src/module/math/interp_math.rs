@@ -229,6 +229,10 @@ static MATH_SIN_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new()
 static MATH_FREXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_LDEXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_ISQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_FABS_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_FLOOR_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_CEIL_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_TRUNC_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Record the checked-arity wrapper pointers installed by `py_module!`.
 ///
@@ -246,6 +250,10 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         ("frexp", &MATH_FREXP_WRAPPER),
         ("ldexp", &MATH_LDEXP_WRAPPER),
         ("isqrt", &MATH_ISQRT_WRAPPER),
+        ("fabs", &MATH_FABS_WRAPPER),
+        ("floor", &MATH_FLOOR_WRAPPER),
+        ("ceil", &MATH_CEIL_WRAPPER),
+        ("trunc", &MATH_TRUNC_WRAPPER),
     ] {
         let callable = crate::module_ns_get(ns, name)
             .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
@@ -310,6 +318,34 @@ pub fn is_math_ldexp_function(callable: PyObjectRef) -> bool {
 
 pub fn is_math_isqrt_function(callable: PyObjectRef) -> bool {
     unsafe { math_builtin_wrapper_matches(callable, &MATH_ISQRT_WRAPPER) }
+}
+
+pub fn is_math_fabs_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_FABS_WRAPPER) }
+}
+
+pub fn is_math_floor_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_FLOOR_WRAPPER) }
+}
+
+pub fn is_math_ceil_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_CEIL_WRAPPER) }
+}
+
+pub fn is_math_trunc_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_TRUNC_WRAPPER) }
+}
+
+/// Raw counterparts of `ll_math_floor` / `ll_math_ceil` for a guarded JIT fast
+/// path.  Both are total on finite input and cannot raise, so the walker emits
+/// them as pure elidable calls; the trace guards the rounded value into the
+/// machine range before casting.
+pub extern "C" fn jit_math_floor_raw(x: f64) -> f64 {
+    x.floor()
+}
+
+pub extern "C" fn jit_math_ceil_raw(x: f64) -> f64 {
+    x.ceil()
 }
 
 /// Raw, allocation-free counterparts of RPython's `ll_math_frexp` result

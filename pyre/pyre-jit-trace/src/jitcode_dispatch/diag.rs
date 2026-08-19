@@ -266,7 +266,7 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// `parent` marks the second row as a split of the first so the reader does not
 /// sum them.
 #[rustfmt::skip]
-pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 60] = [
+pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 64] = [
     // (label, site, parent)
     ("truth_int",                 "residual_call", "-"),
     ("truth_bool",                "residual_call", "-"),
@@ -298,6 +298,10 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 60] = [
     ("math_frexp",                "residual_call", "-"),
     ("math_ldexp",                "residual_call", "-"),
     ("math_isqrt",                "residual_call", "-"),
+    ("math_fabs",                 "residual_call", "-"),
+    ("math_floor",                "residual_call", "-"),
+    ("math_ceil",                 "residual_call", "-"),
+    ("math_trunc",                "residual_call", "-"),
     ("int_call",                  "residual_call", "-"),
     ("float_call",                "residual_call", "-"),
     ("builtin_divmod",            "residual_call", "-"),
