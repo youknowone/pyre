@@ -85,6 +85,7 @@ mod local_crates;
         reason = "the model test spells the exact nested RPython graph shape under test; a one-use alias would conceal rather than simplify that contract"
     )
 )]
+pub mod memory;
 pub mod model;
 pub mod model_ssa;
 pub mod module_path;
