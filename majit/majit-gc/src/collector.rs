@@ -3717,10 +3717,20 @@ impl MiniMarkGC {
             None => {
                 let type_info = self.types.get(type_id);
                 let length = unsafe { *((obj_addr + type_info.length_offset) as *const usize) };
+                // `set_forwarding_address` stores the new address in the word
+                // right after the header — `obj_addr + 0`.  Every type whose
+                // `length_offset` is 0 therefore has its length word overwritten
+                // the moment it is forwarded, and `ItemsBlock` is one
+                // (`ITEMS_BLOCK_LEN_OFFSET` is `capacity`, its first field).  A
+                // length that is a plausible heap address is that corpse, read
+                // by a path that skipped the `is_forwarded` check, not an
+                // uninitialized allocation — name which one this is rather than
+                // leaving both readings open.
+                let forwarded = unsafe { (*header_of(obj_addr)).is_forwarded() };
                 panic!(
                     "GC BUG: varsize length describes no allocation: length={} (read at \
                      obj_addr={:#x} + length_offset={}) item_size={} fixed_size={} \
-                     type_id={} header_addr={:#x} nursery_start={:#x} site={}",
+                     type_id={} header_addr={:#x} nursery_start={:#x} forwarded={} site={}",
                     length,
                     obj_addr,
                     type_info.length_offset,
@@ -3729,6 +3739,7 @@ impl MiniMarkGC {
                     type_id,
                     obj_addr - GcHeader::SIZE,
                     self.nursery.start_ptr() as usize,
+                    forwarded,
                     site,
                 );
             }

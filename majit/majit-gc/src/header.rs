@@ -96,6 +96,12 @@ impl GcHeader {
     /// `hdr + SIZE` lies outside the single-field extent a `&mut GcHeader`
     /// reference is allowed to touch under Rust's aliasing model.
     ///
+    /// `hdr + SIZE` is the object's own first payload word, so a varsize type
+    /// registered with `length_offset == 0` — `ItemsBlock`, whose `capacity`
+    /// is its first field — has its length destroyed here.  Any size read of a
+    /// forwarded object of such a type returns the forwarding address in place
+    /// of the length; check `is_forwarded` and follow it first.
+    ///
     /// # Safety
     /// `hdr` must point to a valid `GcHeader` followed by at least
     /// `size_of::<usize>()` bytes of writable memory, and no other reference
