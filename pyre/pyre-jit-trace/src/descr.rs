@@ -3791,18 +3791,22 @@ pub fn str_len_descr() -> DescrRef {
 /// without registering a second collector layout.
 static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+    // `is_immutable` follows `pycode.py:95-106 _immutable_fields_` per field.
+    // `co_firstlineno` is listed there; `co_name` and `hidden_applevel` are
+    // not, and `code_ptr` is the raw body pointer with no upstream slot.
     let field = |field_key: &str,
                  offset: usize,
                  field_size: usize,
                  field_type: Type,
-                 flag: ArrayFlag| SimpleFieldDescrSpec {
+                 flag: ArrayFlag,
+                 is_immutable: bool| SimpleFieldDescrSpec {
         index: stable_field_index(offset, field_size, field_type, flag == ArrayFlag::Signed),
         field_key: field_key.to_string(),
         name: field_key.to_string(),
         offset,
         field_size,
         field_type,
-        is_immutable: false,
+        is_immutable,
         is_quasi_immutable: false,
         flag,
         virtualizable: false,
@@ -3821,13 +3825,19 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             std::mem::size_of::<*const ()>(),
             Type::Int,
             ArrayFlag::Unsigned,
+            false,
         ),
+        // The slot is written once, by `box_code_constant_with_firstlineno`,
+        // onto the object `box_code_constant` has just boxed out of a fresh
+        // `Box` — no caching, so nothing can have read it first. `code.replace`
+        // reads it and builds a new code object rather than writing this one.
         field(
             "co_firstlineno_raw",
             pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
             std::mem::size_of::<i32>(),
             Type::Int,
             ArrayFlag::Signed,
+            true,
         ),
         field(
             "hidden_applevel",
@@ -3835,13 +3845,18 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             std::mem::size_of::<bool>(),
             Type::Int,
             ArrayFlag::Unsigned,
+            false,
         ),
+        // `co_name` is absent from `_immutable_fields_`, and this slot is
+        // realized lazily besides: `w_code_name_obj` fills it on first demand,
+        // so it goes null -> non-null after construction.
         field(
             "w_name",
             pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
             std::mem::size_of::<pyre_object::PyObjectRef>(),
             Type::Ref,
             ArrayFlag::Pointer,
+            false,
         ),
     ];
     specs.sort_by_key(|spec| spec.offset);
