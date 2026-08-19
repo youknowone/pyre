@@ -1059,8 +1059,12 @@ fn marshal_typed_arg(
     }
     let tc = cdata::type_code_of(at)
         .ok_or_else(|| crate::PyError::type_error("argtype has no valid '_type_'"))?;
-    // `encode_value` copies a same-typed cdata's bytes and otherwise converts,
-    // so a mismatched cdata cannot be reinterpreted through the wrong argtype.
+    // `PyCSimpleType.from_param` hands an instance of the argtype itself
+    // straight through and converts anything else, so a mismatched cdata
+    // cannot be reinterpreted through the wrong argtype.
+    if let Some(bytes) = cdata::same_type_bytes(&tc, arg) {
+        return Ok(OwnedArg::Typed(tc, bytes));
+    }
     let buf = cdata::encode_value(&tc, arg)?;
     Ok(OwnedArg::Typed(tc, buf))
 }
@@ -1109,7 +1113,7 @@ fn marshal_default_arg(
     } else if unsafe { pyre_object::is_bytes(arg) } {
         Ok(OwnedArg::Pointer(bytes_pointer_addr(arg, keepalive)))
     } else if unsafe { pyre_object::is_str(arg) } {
-        Err(str_arg_unsupported())
+        Ok(OwnedArg::Pointer(wstr_pointer_addr(arg, keepalive)))
     } else if unsafe { pyre_object::is_float(arg) } {
         Ok(OwnedArg::Double(crate::baseobjspace::float_w(arg)?))
     } else if unsafe { pyre_object::is_int(arg) } {
@@ -1151,12 +1155,12 @@ pub(super) fn resolve_pointer_addr(
     }
     if unsafe { pyre_object::is_none(arg) } {
         Ok(0)
-    } else if unsafe { pyre_object::is_int(arg) } {
-        Ok(crate::baseobjspace::int_w(arg)? as usize)
+    } else if unsafe { pyre_object::pyobject::is_int_or_long(arg) } {
+        Ok(cdata::pointer_word(arg)?)
     } else if unsafe { pyre_object::is_bytes(arg) } {
         Ok(bytes_pointer_addr(arg, keepalive))
     } else if unsafe { pyre_object::is_str(arg) } {
-        Err(str_arg_unsupported())
+        Ok(wstr_pointer_addr(arg, keepalive))
     } else {
         Err(crate::PyError::type_error(
             "expected bytes, integer address, ctypes instance, or None",
@@ -1173,9 +1177,14 @@ fn bytes_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
     keepalive.last().unwrap().as_ptr() as usize
 }
 
-fn str_arg_unsupported() -> crate::PyError {
-    crate::PyError::type_error(
-        "str argument marshalling (wchar_t*) is not implemented in this ctypes slice; \
-         pass bytes for char* arguments",
-    )
+/// Copy a `str` into a NUL-terminated `wchar_t` buffer, keep the copy alive,
+/// and return its address.  `_conv_param` reaches the same place by building
+/// a `c_wchar_p(arg)` and taking its ffi parameter, and `ConvParam` by
+/// `PyUnicode_AsWideCharString` with the buffer held in a capsule for the
+/// duration of the call; `c_wchar_p`'s own setter (`encode_value_into`, the
+/// `Z` arm) spells the copy the same way.
+fn wstr_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
+    let raw = unsafe { pyre_object::w_str_get_wtf8(arg) };
+    keepalive.push(host_ctypes::wchar_null_terminated_bytes(raw));
+    keepalive.last().unwrap().as_ptr() as usize
 }

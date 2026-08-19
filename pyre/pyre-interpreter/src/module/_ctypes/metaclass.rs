@@ -1319,7 +1319,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 cdata::cdata_write(obj, offset, &bytes);
                 return Ok(pyre_object::w_none());
             }
-            let mut bytes = cdata::encode_value_into(&tc, value, obj, &index.to_string())?;
+            let mut bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
             if field_needs_swap(obj, proto, size) {
                 bytes.reverse();
             }
@@ -1958,7 +1958,7 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
         "simple" => {
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
-            let bytes = cdata::encode_value_into(&tc, value, obj, &idx.to_string())?;
+            let bytes = cdata::encode_instance_or_value(&tc, value, obj, &idx.to_string())?;
             cdata::cdata_write(obj, offset, &bytes);
             if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &idx.to_string(), value);
@@ -2448,7 +2448,7 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
         "simple" => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
-            let bytes = cdata::encode_value_into(&tc, value, obj, &index.to_string())?;
+            let bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
             unsafe { host_ctypes::copy_bytes_to_address(addr, &bytes, element_size) };
             if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &index.to_string(), value);

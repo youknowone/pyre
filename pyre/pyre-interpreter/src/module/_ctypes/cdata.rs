@@ -1230,20 +1230,69 @@ pub(super) fn invalid_type_code_error() -> crate::PyError {
 
 // ── scalar value ⇄ bytes ──────────────────────────────────────────────
 
+/// `Py_TYPE(value)->tp_name` — the class an instance reports itself as, which
+/// for an instance-layout object is its `w_class` rather than the layout type
+/// its `ob_type` names.
+fn value_type_name(obj: PyObjectRef) -> String {
+    match crate::typedef::r#type(obj) {
+        Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string(),
+        None => unsafe { pyre_object::type_name_of(obj) }.to_string(),
+    }
+}
+
+/// The pointer-width word an `int` names, over the whole unsigned range.
+/// `PyLong_AsVoidPtr` reads the value as a signed word and falls back to the
+/// unsigned conversion when that overflows, so an address with the top bit set
+/// — every Windows pseudo-handle, `GetCurrentProcess()` among them — is an
+/// address like any other rather than an integer too large to be one.
+pub(super) fn pointer_word(obj: PyObjectRef) -> Result<usize, crate::PyError> {
+    match crate::baseobjspace::int_w(obj) {
+        Ok(value) => Ok(value as usize),
+        Err(err) if err.kind == crate::PyErrorKind::OverflowError => {
+            Ok(crate::baseobjspace::uint_w(obj)? as usize)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The bytes of a `_SimpleCData` whose own type code is `tc`, which a
+/// destination that takes an *instance* copies byte-for-byte
+/// (`_PyCData_set`, the `PyObject_IsInstance` arm reached when the field
+/// carries no setfunc of its own).
+pub(super) fn same_type_bytes(tc: &str, obj: PyObjectRef) -> Option<Vec<u8>> {
+    if !is_simplecdata_instance(obj) {
+        return None;
+    }
+    let src_cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    (type_code_of(src_cls).as_deref() == Some(tc)).then(|| cdata_bytes(obj).unwrap_or(&[]).to_vec())
+}
+
+/// Store into a destination that takes an instance — a struct field, an array
+/// item, a pointer item.  `_PyCData_set` reaches those with a null field
+/// setfunc, so a same-typed instance is copied and everything else falls to
+/// the type's own setter.  `Simple_init` and the `value` setter call that
+/// setter directly (`Simple_set_value`) and so take no instance at all:
+/// `c_long(c_long(42))` is a TypeError from `PyNumber_Index`.
+pub(super) fn encode_instance_or_value(
+    tc: &str,
+    value: PyObjectRef,
+    dest: PyObjectRef,
+    key: &str,
+) -> Result<Vec<u8>, crate::PyError> {
+    match same_type_bytes(tc, value) {
+        Some(bytes) => Ok(bytes),
+        None => encode_value_into(tc, value, dest, key),
+    }
+}
+
 /// Encode a Python scalar into the native-endian buffer bytes for `tc`.
 ///
-/// A `_SimpleCData` instance of the *same* type code is copied byte-for-byte; a
-/// differently-typed one falls through to normal conversion (which rejects it
-/// unless it is int/float-like), so a larger scalar cannot overwrite a smaller
-/// field with its raw buffer.
+/// This is the type's own setter (`setfunc`), which takes a value and not a
+/// cdata: a `_SimpleCData` instance is converted like anything else, and so
+/// rejected unless it is int/float-like.  A destination that also accepts an
+/// instance of its own type reaches it through `encode_instance_or_value`.
 pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     use host_ctypes::SimpleStorageValue as V;
-    if is_simplecdata_instance(obj) {
-        let src_cls = unsafe { pyre_object::w_instance_get_type(obj) };
-        if type_code_of(src_cls).as_deref() == Some(tc) {
-            return Ok(cdata_bytes(obj).unwrap_or(&[]).to_vec());
-        }
-    }
     let val = match tc {
         "c" => {
             if unsafe { pyre_object::is_bytes(obj) } {
@@ -1300,10 +1349,22 @@ pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate:
         "P" | "z" | "Z" => {
             if unsafe { pyre_object::is_none(obj) } {
                 V::Pointer(0)
-            } else if unsafe { pyre_object::is_int(obj) } {
-                V::Pointer(crate::baseobjspace::int_w(obj)? as usize)
+            } else if unsafe { pyre_object::pyobject::is_int_or_long(obj) } {
+                V::Pointer(pointer_word(obj)?)
             } else {
-                return Err(crate::PyError::type_error("cannot be converted to pointer"));
+                // Each of the three says what it takes.  `z_set` and `Z_set`
+                // name the type that was passed instead
+                // (`Py_TYPE(value)->tp_name`, the bare name); `P_set` takes
+                // nothing but an address and says only that.
+                let refused = |what: &str| {
+                    let got = value_type_name(obj);
+                    format!("{what} or integer address expected instead of {got} instance")
+                };
+                return Err(crate::PyError::type_error(match tc {
+                    "z" => refused("bytes"),
+                    "Z" => refused("unicode string"),
+                    _ => "cannot be converted to pointer".to_string(),
+                }));
             }
         }
         "O" => V::ObjectId(obj as usize),
