@@ -236,13 +236,25 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 ///
 /// Declared beside the counters so that a fold added next to an existing gated
 /// one is hard to leave unnamed.  It is NOT a complete census, and cannot
-/// become one by adding rows: this table names a fold by its function, and two
-/// shapes have no name to give.  A fold whose emit is inlined into a `match`
-/// arm has no function (`bool_box_truth_lookup`'s arm), and a fold that
-/// dispatches through a registry grows by one entry with no new call site and
-/// no new function (`try_fold_registered_symbolic_residual`).  Treat a count
-/// taken from these rows as a lower bound on the fold population, not a total.
-/// `site` is `"none"` for a fold with no call site at all.
+/// become one by adding rows: this table names a fold by its function, and
+/// three shapes have no name to give.
+///
+/// * **Functionless replace** — the emit is inlined into a `match` arm, so
+///   there is no function to name (`bool_box_truth_lookup`'s arm).
+/// * **Registry** — one entry more means one fold more, with no new call site
+///   and no new function (`try_fold_registered_symbolic_residual`).
+/// * **Elision** — the arm recognises a shape and emits *nothing*, so a census
+///   keyed on "what did this fold emit instead" has nothing to key on.  The
+///   three `fbw_strict_fold_frame_reg` arms in `vable_ops.rs` are this: a
+///   store to the current inline level's own unseeded portal frame is a
+///   virtual-field write, folded away with no `SETFIELD_GC` recorded.  Their
+///   recognisers (`fbw_strict_fold_frame_reg`,
+///   `folded_store_is_observable_local`) are predicates — they cannot emit,
+///   because the eliding IS the arm.
+///
+/// Treat a count taken from these rows as a lower bound on the fold
+/// population, not a total.  `site` is `"none"` for a fold with no call site
+/// at all.
 ///
 /// `store_attr` occupies two rows because its single call site has two firing
 /// outcomes that must not be summed: `Direct` folds the store away, while
