@@ -570,6 +570,140 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
     true
 }
 
+/// Whether descending into this jitcode body can reach a residual call whose
+/// funcbox is an un-lowered helper's symbolic hash.
+///
+/// [`try_execute_residual_call_via_executor`] refuses to record such a call
+/// while inlining a sub-jitcode — the hash is not a code address, so a
+/// compiled trace would branch to it — and raises
+/// `OrthodoxSubWalkTraceUnsupported` at that call.  By then the descent has
+/// executed every earlier op for real, including residual calls that advance
+/// a generator's internal state, and the abort resumes the enclosing frame at
+/// its own `CALL`.  The Python call therefore runs a second time and the first
+/// result is discarded: `random.random()` in a loop advances the Mersenne
+/// Twister once per aborted descent without producing a value for it
+/// (`gen.random()` drew 4003 times for 4000 appends).
+///
+/// The funcbox is a jitcode constant, so whether a body holds such a call is a
+/// static property of the body.  Answering it before the descent starts turns
+/// the mid-descent abort into an ordinary residual call, which applies the
+/// effect exactly once.
+///
+/// The scan follows `inline_call_*` into the callee bodies the descent would
+/// enter, because the abort propagates from any depth.  A body already on the
+/// scan stack is a cycle and answers `false`: the occurrence that opened it
+/// decides.
+/// Whether descending into this jitcode body can reach a residual call whose
+/// funcbox is an un-lowered helper's symbolic hash.
+///
+/// [`try_execute_residual_call_via_executor`] refuses to record such a call
+/// while inlining a sub-jitcode — the hash is not a code address, so a
+/// compiled trace would branch to it — and raises
+/// `OrthodoxSubWalkTraceUnsupported` at that call.  By then the descent has
+/// executed every earlier op for real, including residual calls that advance
+/// a generator's internal state, and the abort resumes the enclosing frame at
+/// its own `CALL`.  The Python call therefore runs a second time and the first
+/// result is discarded: `random.random()` in a loop advances the Mersenne
+/// Twister once per aborted descent without producing a value for it
+/// (`gen.random()` drew 4003 times for 4000 appends).
+///
+/// The funcbox is a jitcode constant, so whether a body holds such a call is a
+/// static property of the body.  Answering it before the descent starts turns
+/// the mid-descent abort into an ordinary residual call, which applies the
+/// effect exactly once.
+///
+/// The scan follows `inline_call_*` into the callee bodies the descent would
+/// enter, because the abort propagates from any depth.  A body already on the
+/// scan stack is a cycle and answers `false`: the occurrence that opened it
+/// decides.
+fn descent_reaches_unlowered_helper_call(jitcode_index: usize) -> bool {
+    thread_local! {
+        static VERDICTS: std::cell::RefCell<std::collections::HashMap<usize, bool>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(cached) = VERDICTS.with(|v| v.borrow().get(&jitcode_index).copied()) {
+        return cached;
+    }
+    let verdict = scan_body_for_unlowered_helper_call(jitcode_index, &mut Vec::new());
+    VERDICTS.with(|v| v.borrow_mut().insert(jitcode_index, verdict));
+    verdict
+}
+
+/// Recursive worker of [`descent_reaches_unlowered_helper_call`].  `seen` is
+/// the stack of jitcode indices currently being scanned.
+fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usize>) -> bool {
+    if seen.contains(&jitcode_index) {
+        return false;
+    }
+    let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode_index) else {
+        // No installed body means no descent, so there is nothing to answer
+        // for; the caller declines on the same lookup.
+        return false;
+    };
+    seen.push(jitcode_index);
+    let descrs = crate::jitcode_runtime::descr_ref_table();
+    // What each Int-bank slot is known to hold.  `allocate_callee_register_banks`
+    // pre-fills the slots at and above `num_regs_i` from `constants_i`; the
+    // rest start unknown and are tracked below, because the codewriter loads a
+    // call's funcbox into an ordinary register before the call reads it.
+    let mut known_i = vec![None; body.num_regs_i + body.constants_i.len()];
+    for (slot, &value) in body.constants_i.iter().enumerate() {
+        known_i[body.num_regs_i + slot] = Some(value);
+    }
+    let mut pc = 0usize;
+    let mut verdict = false;
+    while pc < body.code.len() {
+        let Some(d) = crate::jitcode_runtime::decode_op_at(body.code, pc) else {
+            break;
+        };
+        if d.opname.starts_with("residual_call") {
+            // Every `residual_call_*` argcode string opens with the `i` funcbox
+            // operand, so it is the byte right after the opcode.
+            let funcbox = body.code.get(d.pc + 1).copied().unwrap_or(0) as usize;
+            if let Some(Some(fnaddr)) = known_i.get(funcbox)
+                && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
+            {
+                verdict = true;
+                break;
+            }
+        } else if d.opname.starts_with("inline_call") {
+            // `inline_call_*` opens with the `d` descr operand, a two-byte
+            // index into the descriptor pool, naming the callee JitCode.
+            let descr_index = body.code.get(d.pc + 1).copied().unwrap_or(0) as usize
+                | ((body.code.get(d.pc + 2).copied().unwrap_or(0) as usize) << 8);
+            if let Some(callee) = descrs
+                .at(descr_index)
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+                && scan_body_for_unlowered_helper_call(callee, seen)
+            {
+                verdict = true;
+                break;
+            }
+        }
+        // An op writes at most one register, named by the argcode suffix after
+        // `>` and encoded as the instruction's last byte.  Only `int_copy/i>i`
+        // carries a known value forward; every other Int-bank write makes its
+        // destination unknown again.
+        if d.argcodes
+            .split_once('>')
+            .is_some_and(|(_, dst)| dst == "i")
+            && let Some(&dst) = body.code.get(d.next_pc.wrapping_sub(1))
+        {
+            let carried = (d.key == "int_copy/i>i")
+                .then(|| body.code.get(d.pc + 1))
+                .flatten()
+                .and_then(|&src| known_i.get(src as usize).copied())
+                .flatten();
+            if let Some(slot) = known_i.get_mut(dst as usize) {
+                *slot = carried;
+            }
+        }
+        pc = d.next_pc;
+    }
+    seen.pop();
+    verdict
+}
+
 /// Whether an exception string-override body issues a nested Python call.  The
 /// bounded string-override route inlines the override as a leaf; a nested call
 /// (`CallFn` residual, or a `cond_call`/`call_assembler`/`inline_call`) forces a
@@ -2409,6 +2543,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         return Ok(None);
     }
     if body.num_regs_r < 1 {
+        return Ok(None);
+    }
+    if descent_reaches_unlowered_helper_call(jitcode.index()) {
+        builtin_inline_decline!("un-lowered helper call in body", fnaddr);
         return Ok(None);
     }
     let nested_helper = ctx.fbw_mode.inline_subwalk;
