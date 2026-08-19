@@ -19761,6 +19761,16 @@ pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef
         FloatToIntMode::Floor => v.floor(),
         FloatToIntMode::Ceil => v.ceil(),
     };
+    // `floatobject.py:151-158 newint_from_float` reaches for
+    // `ovfcheck_float_to_int` first and only materialises a long when that
+    // overflows.  `2**63` is exactly representable while `i64::MAX` is not, so
+    // the upper bound is strict — the same pair the `int(x)` walker
+    // specialization uses.
+    const SIGNED_MIN_AS_FLOAT: f64 = -9223372036854775808.0;
+    const SIGNED_LIMIT_AS_FLOAT: f64 = 9223372036854775808.0;
+    if reduced >= SIGNED_MIN_AS_FLOAT && reduced < SIGNED_LIMIT_AS_FLOAT {
+        return Ok(pyre_object::w_int_new(reduced as i64));
+    }
     use num_traits::FromPrimitive;
     let big = BigInt::from_f64(reduced).expect("finite already checked");
     if pyre_object::jit_bigint_to_i64_fits(&big) != 0 {

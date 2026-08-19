@@ -512,11 +512,18 @@ fn math_unary_int(
     // `__float__`, or the `OverflowError` for an int too wide for an f64 —
     // propagates; relabelling here would swallow exactly those.
     let v = try_get_double(args[0])?;
-    Ok(w_int_new(match dunder {
-        "__ceil__" => v.ceil() as i64,
-        "__floor__" => v.floor() as i64,
-        _ => v.trunc() as i64,
-    }))
+    // `float_to_pyint` is `newlong_from_float`: NaN raises, an infinity raises,
+    // and a finite value outside the machine range becomes a long.  A direct
+    // `as i64` saturates instead, so `floor(FloatLike(1e300))` answered
+    // `i64::MAX` and `floor(FloatLike(nan))` answered `0`.
+    crate::typedef::float_to_pyint(
+        v,
+        match dunder {
+            "__ceil__" => crate::typedef::FloatToIntMode::Ceil,
+            "__floor__" => crate::typedef::FloatToIntMode::Floor,
+            _ => crate::typedef::FloatToIntMode::Trunc,
+        },
+    )
 }
 
 pub fn floor(args: &[PyObjectRef]) -> PyResult {

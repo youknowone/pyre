@@ -311,3 +311,28 @@ assert math.fmod(0.0, 3.0) == 0.0
 assert math.fmod(0.0, NINF) == 0.0
 
 assert math.gamma(1) == 1.0
+
+
+# The `__float__` fallback of math.floor/ceil goes through newlong_from_float,
+# so a value outside the machine-int range stays exact and a non-finite one
+# raises rather than saturating to a machine bound.  math.trunc has no such
+# fallback and requires `__trunc__`.
+class FloatLike:
+    def __init__(self, value):
+        self.value = value
+
+    def __float__(self):
+        return self.value
+
+
+for _unary in (math.floor, math.ceil):
+    assert _unary(FloatLike(1e300)) == int(1e300)
+    assert _unary(FloatLike(-1e300)) == int(-1e300)
+    assert_raises(ValueError, lambda f=_unary: f(FloatLike(NAN)))
+    assert_raises(OverflowError, lambda f=_unary: f(FloatLike(INF)))
+    assert_raises(OverflowError, lambda f=_unary: f(FloatLike(NINF)))
+
+assert math.floor(FloatLike(41.9)) == 41
+assert math.ceil(FloatLike(42.5)) == 43
+assert type(math.floor(FloatLike(41.9))) is int
+assert_raises(TypeError, lambda: math.trunc(FloatLike(23.5)))
