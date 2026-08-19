@@ -1538,10 +1538,8 @@ impl UnrollOptimizer {
                             }
                             visited_force.insert(arg);
                             let resolved = final_ctx.get_replacement_opref(arg);
-                            let needs_force = final_ctx
-                                .potential_extra_ops
-                                .iter()
-                                .any(|(k, _)| *k == arg || *k == resolved);
+                            let needs_force = final_ctx.potential_extra_ops.contains_key(&arg)
+                                || final_ctx.potential_extra_ops.contains_key(&resolved);
                             if !needs_force
                                 && let Some((_, produced)) =
                                     exported_short_boxes_produced.iter().find(|(_, produced)| {

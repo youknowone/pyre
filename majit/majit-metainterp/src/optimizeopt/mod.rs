@@ -707,10 +707,15 @@ pub struct OptContext {
     imported_short_preamble_used: Vec<OpRef>,
     /// `unroll.py:37` `self.optunroll.potential_extra_ops[op] = preamble_op` /
     /// `optimizer.py:354` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
-    /// PyPy uses a dict keyed by the box; pyre uses a Vec of `(OpRef,
-    /// PreambleOp)` with linear-scan insert/pop/contains. The pool stays
-    /// small per trace (one entry per imported pure short-preamble op),
-    /// so O(n) operations are acceptable.
+    /// A keyed map, like the dict upstream keeps: insert, pop and `in` are
+    /// each one lookup, where the `Vec<(OpRef, PreambleOp)>` this replaced
+    /// scanned the whole pool for all three.
+    ///
+    /// `swap_remove` is the removal the `Vec` already performed, and nothing
+    /// iterates this map — every use is a keyed insert, pop or membership
+    /// test — so the order it leaves behind is unobservable. `IndexMap`
+    /// rather than `HashMap` because iteration order stays deterministic
+    /// even if a later reader does walk it.
     ///
     /// The key stays the box's `OpRef` position rather than PyPy's box
     /// identity (`unroll.py:37` keys by the box object). This is a
@@ -722,7 +727,8 @@ pub struct OptContext {
     /// `Rc::ptr_eq` key would silent-miss the pop. Re-keying to box identity
     /// is gated on the same short-preamble / InputArg identity unification
     /// that defers `resolve_box_box`'s InputArg arm (#9).
-    pub(crate) potential_extra_ops: Vec<(OpRef, crate::optimizeopt::info::PreambleOp)>,
+    pub(crate) potential_extra_ops:
+        indexmap::IndexMap<OpRef, crate::optimizeopt::info::PreambleOp>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
     active_short_preamble_producer:
@@ -1758,7 +1764,7 @@ impl OptContext {
             const_infos: indexmap::IndexMap::new(),
             imported_short_preamble_used: Vec::new(),
 
-            potential_extra_ops: Vec::new(),
+            potential_extra_ops: indexmap::IndexMap::new(),
             active_short_preamble_producer: None,
             preview_short_state: None,
             exported_const_short_boxes: Vec::new(),
@@ -2382,7 +2388,7 @@ impl OptContext {
             const_infos: indexmap::IndexMap::new(),
             imported_short_preamble_used: Vec::new(),
 
-            potential_extra_ops: Vec::new(),
+            potential_extra_ops: indexmap::IndexMap::new(),
             active_short_preamble_producer: None,
             preview_short_state: None,
             exported_const_short_boxes: Vec::new(),
@@ -3707,11 +3713,7 @@ impl OptContext {
                 }
                 // `unroll.py:37` dict-assign semantics — overwrite if the
                 // key already exists, otherwise append.
-                if let Some(entry) = self.potential_extra_ops.iter_mut().find(|(k, _)| *k == key) {
-                    entry.1 = preamble_op.clone();
-                } else {
-                    self.potential_extra_ops.push((key, preamble_op.clone()));
-                }
+                self.potential_extra_ops.insert(key, preamble_op.clone());
             }
         }
         // unroll.py:38 `return preamble_op.op`. RPython's `preamble_op.op`
@@ -4362,11 +4364,7 @@ impl OptContext {
         &mut self,
         result: OpRef,
     ) -> Option<crate::optimizeopt::info::PreambleOp> {
-        let idx = self
-            .potential_extra_ops
-            .iter()
-            .position(|(k, _)| *k == result)?;
-        Some(self.potential_extra_ops.swap_remove(idx).1)
+        self.potential_extra_ops.swap_remove(&result)
     }
 
     /// `unroll.py:37` `self.optunroll.potential_extra_ops[op] = preamble_op` —
@@ -4376,16 +4374,12 @@ impl OptContext {
         key: OpRef,
         preamble_op: crate::optimizeopt::info::PreambleOp,
     ) {
-        if let Some(entry) = self.potential_extra_ops.iter_mut().find(|(k, _)| *k == key) {
-            entry.1 = preamble_op;
-        } else {
-            self.potential_extra_ops.push((key, preamble_op));
-        }
+        self.potential_extra_ops.insert(key, preamble_op);
     }
 
     /// Dict-`in` parity for `potential_extra_ops`.
     pub fn has_potential_extra_op(&self, key: OpRef) -> bool {
-        self.potential_extra_ops.iter().any(|(k, _)| *k == key)
+        self.potential_extra_ops.contains_key(&key)
     }
 
     pub fn activate_short_preamble_producer(
