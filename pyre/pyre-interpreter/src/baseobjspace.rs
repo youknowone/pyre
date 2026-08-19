@@ -1312,10 +1312,35 @@ pub(crate) unsafe fn get_and_call_function(
             &crate::METHOD_DESCRIPTOR_TYPE as *const _,
         ))
     {
-        let mut full = Vec::with_capacity(args_w.len() + 1);
-        full.push(w_obj);
-        full.extend_from_slice(args_w);
-        return crate::call::call_function_impl_result(w_descr, &full);
+        // `DescrOperation.get_and_call_function`'s fast path spells this
+        // `w_descr.funccall(w_obj, *args_w)` — the varargs unpack at
+        // translation time and build no list, so the receiver-prepend must
+        // not become an allocation here either: a
+        // `Vec::with_capacity` is an opaque residual the walker cannot descend
+        // through, and it walls off every `__instancecheck__` /
+        // `__getattr__`-style dunder dispatch that reaches this arm. Keep the
+        // common small arity on a stack array — the same shape and the same
+        // reason as `call::call_function_impl_result`'s own `INLINE_ARGS` —
+        // and retain a `Vec` only for genuinely wide calls.
+        const INLINE_ARGS: usize = 8;
+        let mut inline_full = [pyre_object::PY_NULL; INLINE_ARGS + 1];
+        let mut wide_full;
+        let full: &[PyObjectRef] = if args_w.len() <= INLINE_ARGS {
+            inline_full[0] = w_obj;
+            // The index loop lowers to `setarrayitem`; iterator adapters are
+            // residual calls.
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..args_w.len() {
+                inline_full[i + 1] = args_w[i];
+            }
+            &inline_full[..args_w.len() + 1]
+        } else {
+            wide_full = Vec::with_capacity(args_w.len() + 1);
+            wide_full.push(w_obj);
+            wide_full.extend_from_slice(args_w);
+            &wide_full
+        };
+        return crate::call::call_function_impl_result(w_descr, full);
     }
     let w_impl = unsafe { get(w_descr, w_obj, w_type) }?.unwrap_or(w_descr);
     crate::call::call_function_impl_result(w_impl, args_w)
