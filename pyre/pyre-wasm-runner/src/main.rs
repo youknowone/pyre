@@ -1756,6 +1756,30 @@ fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> R
     Ok(ret)
 }
 
+/// Name a call-area FUNC field that indexes no live function, once per value.
+///
+/// The zero sentinel above is the only slot that legitimately has no function
+/// behind it. Any other index that misses leaves nothing to call, and the 0
+/// written in its place is indistinguishable from a null Ref the callee
+/// returned -- so a call lowered against the wrong operand is answered with a
+/// plausible value instead of a trap, and only surfaces much later as a wrong
+/// result. Say the slot out loud here so it surfaces at the call instead.
+fn report_dead_call_slot(func_ptr: u32) {
+    static SEEN: std::sync::Mutex<Option<std::collections::BTreeSet<u32>>> =
+        std::sync::Mutex::new(None);
+    if SEEN
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(func_ptr)
+    {
+        eprintln!(
+            "[warn] residual call area names function table slot {func_ptr}, \
+             which holds no function; the call answers 0"
+        );
+    }
+}
+
 /// Dispatch a residual call requested by a running trace.
 // PROBE(PYRE_WASM_CALL_HIST): temporary per-callee crossing histogram.
 static PROBE_CALL_HIST: std::sync::Mutex<Option<std::collections::BTreeMap<u32, u64>>> =
@@ -1834,6 +1858,7 @@ fn jit_call_trampoline_inner(
     let func = match table.get(&mut *caller, func_ptr as u64) {
         Some(Ref::Func(Some(f))) => f,
         _ => {
+            report_dead_call_slot(func_ptr);
             write_i64(&memory, &mut *caller, call_area, 0)?;
             return Ok(());
         }
