@@ -174,7 +174,7 @@ pub struct LowererConfig {
     pub(super) state_float_scalars: HashMap<String, usize>,
     /// Green-variable expressions for `jit_merge_point` / `promote_greens`.
     ///
-    /// Source: `JitInterpConfig.greens` (mod.rs:65) — the `greens = [...]` list
+    /// Source: `JitInterpConfig.greens` (mod.rs) — the `greens = [...]` list
     /// from the `#[jit_interp]` attribute.  Consumed by A.3.2 (green register
     /// byte list emit) and A.3.5 (promote_greens pre-portal emission).
     pub greens: Vec<Expr>,

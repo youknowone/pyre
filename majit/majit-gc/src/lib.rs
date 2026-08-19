@@ -2058,7 +2058,8 @@ pub fn set_active_alloc_nursery_typed(hook: Option<AllocNurseryTypedFn>) {
 /// as a GC reference, and the caller must fail instead.
 ///
 /// `set_gc_allocator` publishes every allocation hook in one block
-/// (`majit-backend-dynasm/src/runner.rs:310-323` and its cranelift/wasm twins),
+/// (`register_active_hooks` in `majit-backend-dynasm/src/runner.rs` and its
+/// cranelift/wasm twins),
 /// so this one cell answers for all of them.
 ///
 /// Upstream has neither state: the GC is a prebuilt constant

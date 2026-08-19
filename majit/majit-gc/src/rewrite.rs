@@ -223,7 +223,7 @@ pub struct GcRewriterImpl {
     /// `true` when the allocation path itself guarantees zero-filled
     /// payload bytes. Production backends set this to `false` whenever a
     /// real collector is installed and to `true` for the Boehm/raw-calloc
-    /// fallback (compiler.rs:8303, runner.rs:1704). Gates
+    /// fallback (both backends' `gc_rewriter`). Gates
     /// `clear_gc_fields` per rewrite.py:499-500; the non-zero-fill path
     /// emits explicit NULL-pointer stores at flush time
     /// (rewrite.py:761-766).
@@ -1964,7 +1964,7 @@ impl GcRewriterImpl {
     /// Under the Boehm/raw-calloc fallback (`malloc_zero_filled = true`),
     /// `clear_gc_fields` skips its insertion path, so this is effectively a
     /// no-op. With a real collector, production backends set the flag to
-    /// false (compiler.rs:8303, runner.rs:1704), activating the delayed-zero
+    /// false (in their `gc_rewriter`), activating the delayed-zero
     /// tracking.
     fn consider_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
         let Some(descr) = op.getdescr() else { return };
@@ -2782,7 +2782,7 @@ impl GcRewriterImpl {
     /// upper 32 bits, and the slow `dynasm_nursery_slowpath` /
     /// cranelift-side malloc helpers may promote large or
     /// post-collection allocations to the old gen, where
-    /// `collector.rs:449 alloc_in_oldgen` pre-stamps `TRACK_YOUNG_PTRS`
+    /// `collector.rs`'s `alloc_in_oldgen` pre-stamps `TRACK_YOUNG_PTRS`
     /// in those upper bits.  A full-word store from this helper would
     /// wipe that bit and leave a fresh oldgen object invisible to the
     /// remembered-set machinery, dropping any subsequent young pointer
@@ -3807,7 +3807,7 @@ mod tests {
         // GcHeader packs type id (lower 32 bits) and gc flags (upper 32
         // bits) into a single u64.  gen_initialize_tid must emit a
         // 4-byte store so that the runtime-set flags
-        // (collector.rs:449 alloc_in_oldgen ORs in TRACK_YOUNG_PTRS for
+        // (collector.rs's alloc_in_oldgen ORs in TRACK_YOUNG_PTRS for
         // oldgen-promoted allocs) survive the type id stamp.
         let store_size = result[1]
             .arg(3)

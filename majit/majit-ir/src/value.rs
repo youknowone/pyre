@@ -1260,7 +1260,7 @@ impl GreenAsI64 for f32 {
     fn __green_repr(self) -> (i64, GreenType) {
         // Promote f32 → f64 before extracting the i64 bit pattern.
         // [`equal_whatever`] / [`hash_whatever`] interpret the stored
-        // bits as an `f64` (`value.rs:378 f64::from_bits(x as u64)`);
+        // bits as an `f64` (`f64::from_bits(x as u64)`);
         // storing the bare `f32::to_bits()` (a u32 in the low 32 bits
         // of an i64) would round-trip to a subnormal f64 instead of
         // the float value the caller intended.  PyPy / RPython's
@@ -1441,7 +1441,8 @@ mod tests {
     #[test]
     fn green_repr_f32_promotes_to_f64_for_consistent_hash() {
         // `equal_whatever(Float, x, y)` interprets bits as `f64`
-        // (`value.rs:378`).  An f32 green that stored only its 32-bit
+        // (the same `f64::from_bits` read).  An f32 green that stored
+        // only its 32-bit
         // pattern would round-trip to a subnormal f64; promoting to
         // f64 first keeps the i64 representation consistent with the
         // f64 green carrying the same numeric value.

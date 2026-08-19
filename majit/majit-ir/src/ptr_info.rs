@@ -188,7 +188,7 @@ pub struct VirtualInfo {
     pub last_guard_pos: i32,
     /// info.py:124-128 `AbstractVirtualPtrInfo._cached_vinfo` inherited
     /// state. Lifted into `AbstractVirtualPtrInfo` per RPython `_attrs_`
-    /// inheritance — see the shared-struct doc above.
+    /// inheritance — see the [`AbstractVirtualPtrInfo`] doc.
     pub avpi: AbstractVirtualPtrInfo,
 }
 

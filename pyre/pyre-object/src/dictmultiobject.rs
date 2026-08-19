@@ -1503,7 +1503,7 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
 /// `space.w_dict` to user code (`dictmultiobject.py:67
 /// allocate_instance(W_ModuleDictObject, space.w_dict)`).  The
 /// `TYPEOBJECT_CACHE` registration at
-/// `pyre-interpreter/typedef.rs:300-303` maps `MODULE_DICT_TYPE` to
+/// `pyre-interpreter/typedef.rs` maps `MODULE_DICT_TYPE` to
 /// the same `dict` W_TypeObject as `DICT_TYPE`, so `type(g) is dict`
 /// and `isinstance(g, dict)` hold on `W_ModuleDictObject` instances
 /// even though they carry a different Rust layout / GC type id.

@@ -203,7 +203,7 @@ pub unsafe fn w_sre_match_get_span(obj: PyObjectRef, groupnum: usize) -> Option<
 /// sre-engine context borrows the subject string and code, so it cannot
 /// be parked in a GC object.  Instead the resumable cursor is reduced to
 /// the character position `pos` and the `must_advance` flag — exactly
-/// the two fields `SearchIter` threads across calls (engine.rs:255-256)
+/// the two fields `SearchIter` threads across calls (engine.rs)
 /// — and a fresh `Request`/`State` is rebuilt from the pattern + subject
 /// on each step (both are leaked `&'static`, so this is stable across
 /// callbacks).
@@ -225,7 +225,7 @@ pub struct W_SRE_Scanner {
     pub pos: i64,
     /// Character end position (`ctx.end`) — the `endpos` argument of finditer.
     pub endpos: i64,
-    /// `req.must_advance` (engine.rs:255) — set after a zero-width match so
+    /// `req.must_advance` (engine.rs) — set after a zero-width match so
     /// the next search refuses to re-match at the same position.
     pub must_advance: i64,
     /// Whether this lazy scanner owns one buffer export on `w_string`.

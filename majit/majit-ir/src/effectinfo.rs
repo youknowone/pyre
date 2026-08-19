@@ -4,7 +4,7 @@
 //!
 //! TODO: the upstream module path is
 //! `rpython/jit/codewriter/effectinfo.py`, but in pyre this lives in
-//! `majit-ir` because `LLType::for_call` (descr.rs:46) holds
+//! `majit-ir` because `LLType::for_call` (descr.rs) holds
 //! `extraeffect`/`oopspecindex` indices and `EffectInfo` is constructed
 //! from RPython call analysis. Putting it in `majit-translate` would
 //! create a circular crate dependency (`majit-ir` ↔ `majit-translate`).
@@ -508,7 +508,7 @@ pub struct EffectInfo {
     // Pyre's lift carries `Vec<DescrRef>` (Arc identity) so the
     // partition step honours PyPy's object-identity semantic — two
     // distinct descrs with the same `descr.index()` (e.g. two structs'
-    // `index_in_parent = 0` fields at `call.rs:3849`) stay separate.
+    // `index_in_parent = 0` fields in `call.rs`) stay separate.
     // Each Vec is sorted-deduped by `Arc::as_ptr` at construction
     // (`canonicalize_descr_set`); `None` mirrors PyPy's
     // `_readonly_descrs_fields = None` wildcard (random-effects EI).
@@ -1191,7 +1191,7 @@ impl EffectInfo {
     ///
     /// `effectinfo.py:149-155` + `compute_bitstrings` line 488-489 keep
     /// the bitstrings as `None` for `EF_RANDOM_EFFECTS`; the optimizer's
-    /// `has_random_effects()` guard (heap.py:460 / heap.rs:2602) prevents
+    /// `has_random_effects()` guard (heap.py:460 / heap.rs) prevents
     /// `check_*_descr_*` from being called on the wildcard.
     pub const MOST_GENERAL: EffectInfo = EffectInfo {
         extraeffect: ExtraEffect::RandomEffects,
@@ -1231,7 +1231,7 @@ impl EffectInfo {
     //
     // Pyre `MOST_GENERAL` (line 380) populates every bitset with `None`,
     // matching `effectinfo.py:271-273 MOST_GENERAL`.  The optimizer
-    // caller (`heap.rs:2589 call_has_random_effects`) gates the same
+    // caller (`heap.rs`'s `call_has_random_effects`) gates the same
     // way as PyPy, so the `None`-bitstring case must never be queried;
     // the helpers below `expect()` the bitstring rather than silently
     // returning `false`, mirroring `bitstring.bitcheck(None, ...)`'s
@@ -2352,7 +2352,7 @@ mod compute_bitstrings_tests {
 
     /// Two distinct field descrs that happen to share the same
     /// `descr.index()` (e.g. two structs' `index_in_parent = 0`
-    /// fields per `call.rs:3849`) MUST get distinct `ei_index`
+    /// fields per `call.rs`) MUST get distinct `ei_index`
     /// values when their (eisetr, eisetw) shape diverges.  PyPy
     /// `effectinfo.py:493-526` guarantees this by `id(descr)`
     /// (object identity) keyed `frozenset`/`set` — the Arc-identity

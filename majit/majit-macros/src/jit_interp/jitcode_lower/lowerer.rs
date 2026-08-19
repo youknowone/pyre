@@ -29,7 +29,7 @@ pub(super) struct Lowerer<'c> {
     /// EXTENDED_ARG-shape recognizer). When `Some`,
     /// `lower_dispatch_body` returns `None` so the dispatch
     /// JitCode body is empty and the runtime install gate at
-    /// `codegen_state.rs:786-823` refuses to register the singleton —
+    /// `generate_state_fields_jit_state` refuses to register the singleton —
     /// matching the Pre-A.2.3 codex (gpt-5.5, 2026-05-05) "fail-closed"
     /// requirement that an unrecognized inner while must NOT silently
     /// pass the existing `BC_GETARRAYITEM_GC_I`-presence gate.

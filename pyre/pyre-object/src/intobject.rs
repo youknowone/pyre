@@ -489,7 +489,7 @@ mod tests {
     }
 
     /// `#[elidable_cannot_raise]` macro on a production helper must
-    /// emit `INT_ELIDABLE_CANNOT_RAISE = 19` (`call_policy_byte.rs:96`)
+    /// emit `INT_ELIDABLE_CANNOT_RAISE = 19` (`call_policy_byte.rs`)
     /// and a non-null trace_target / concrete_target trampoline pair.
     #[test]
     fn test_int_bit_count_advertises_int_elidable_cannot_raise_byte() {

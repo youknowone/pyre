@@ -1210,8 +1210,9 @@ fn write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
 /// un-elided over-approximation so an arm that emits a barrier always has the
 /// `jit_call` import available.  Unlike SETARRAYITEM_GC, a SETFIELD_GC can
 /// carry a non-pointer field descriptor even when its value has a Ref home
-/// (the ForceToken layout is one such case).  rewrite.rs:1917-1923 rejects
-/// that store because the collector does not trace the field.
+/// (the ForceToken layout is one such case).  rewrite.rs's
+/// `handle_write_barrier_setfield` rejects that store because the collector
+/// does not trace the field.
 fn emitted_write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
     let base = write_barrier_base(op, ref_values)?;
     if op.opcode == OpCode::SetfieldGc
@@ -1294,7 +1295,7 @@ fn emit_write_barrier_if_needed(
         wb_fn_ptr,
         base,
     );
-    // rewrite.rs:1941-1947 `gen_write_barrier`: remember only after the
+    // rewrite.rs's `gen_write_barrier`: remember only after the
     // barrier has been emitted.
     wb_applied.insert(wb_key);
 }
@@ -5688,10 +5689,11 @@ fn build_function(
                         frame,
                     );
                 }
-                // No `remember_wb` for the result. rewrite.rs:1130 and :2731
-                // seed it only on the branches that reached
-                // `can_use_nursery`; the `gen_malloc_fixedsize` decline does
-                // not, and :2720 spells out why — "the first result can come
+                // No `remember_wb` for the result. rewrite.rs's `handle_new`
+                // and `gen_malloc_nursery` seed it only on the branches that
+                // reached `can_use_nursery`; the `gen_malloc_fixedsize`
+                // decline does not, and `gen_malloc_nursery` spells out why
+                // — "the first result can come
                 // from an old-gen slow path whose TRACK_YOUNG_PTRS flag
                 // gen_initialize_tid intentionally preserves". Here the
                 // generation is not a codegen-time fact at all: a
@@ -6677,7 +6679,7 @@ fn emit_guard_false(
 /// materialising a boolean, when that op is the condition's only reader. x86
 /// leaves the condition in the flags (`x86/regalloc.py:265
 /// force_allocate_reg_or_cc`, ported to the dynasm sibling at
-/// `majit-backend-dynasm/src/regalloc.rs:3665 next_op_can_accept_cc`); wasm's
+/// `next_op_can_accept_cc` in `majit-backend-dynasm/src/regalloc.rs`); wasm's
 /// operand stack plays that role — [`push_cond`]'s i32 stays on the stack and
 /// the guard's `if` tests it, so the `i64.extend_i32_u`/`local.set` and the
 /// guard's own `local.get`/re-test disappear.

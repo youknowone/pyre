@@ -876,7 +876,7 @@ impl<'c> Lowerer<'c> {
         //                                  "loop-invariant function!")
         // The canonical `call_loopinvariant_*_canonical_via_target`
         // builders enforce the same invariant via `arg_regs.is_empty()`
-        // (`jitcode/assembler.rs:1849`), but the cond_call helper
+        // (`jitcode/assembler.rs`), but the cond_call helper
         // dispatch routes through `conditional_call_ir_v_typed_args`
         // which doesn't share that assert. Mirror the check here so
         // a `conditional_call!(cond, loop_invariant_helper, arg)`

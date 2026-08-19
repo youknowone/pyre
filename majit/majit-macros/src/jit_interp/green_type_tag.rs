@@ -2,7 +2,7 @@
 //!
 //! Extends the bracketed `greens = [pc, env: ref]` syntax so each green can
 //! carry an optional type tag. Tagged greens override the trait dispatch in
-//! `green_key_expr` (mod.rs:2105), forcing the `GreenType` bucket explicitly
+//! `green_key_expr` (mod.rs), forcing the `GreenType` bucket explicitly
 //! instead of letting `GreenAsI64` pick it.
 //!
 //! `str` and `unicode` parse but are refused. Their codegen ABI

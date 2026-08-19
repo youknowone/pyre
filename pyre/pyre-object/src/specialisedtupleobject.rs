@@ -13,7 +13,7 @@
 //! Python-level `type(t)` returns the same `tuple` class for every
 //! variant. pyre mirrors this by giving each specialised variant a
 //! distinct `ob_type` (the JIT-visible "RPython vtable" equivalent —
-//! see `pyobject.rs:25-38`) while the user-visible `w_class` field
+//! see `pyobject.rs`) while the user-visible `w_class` field
 //! always resolves to `get_instantiate(&TUPLE_TYPE)`.
 //! Each variant also carries Python 3.14's mutable-once tuple hash cache;
 //! this is the requested 3.14 delta from PyPy's specialized layouts.
@@ -108,7 +108,7 @@ pub static SPECIALISED_TUPLE_OO_TYPE: PyType = new_pytype("tuple");
 /// (mark-sweep, non-moving) when the host hook is installed; falls
 /// back to `Box::into_raw` for unit tests run outside `JitDriver`
 /// init. The variant carries no GC-pointer fields
-/// (`gc_ptr_offsets = []`, `eval.rs:336`), so mark-sweep traversal
+/// (`gc_ptr_offsets = []`, `eval.rs`), so mark-sweep traversal
 /// has nothing to follow and routing through the GC stays
 /// correctness-safe. Unrelated to W_TupleObject canonical allocations
 /// (those depend on ItemsBlock migration before they can
@@ -146,7 +146,7 @@ pub fn w_specialised_tuple_ii_new(value0: i64, value1: i64) -> PyObjectRef {
 
 /// Allocate an arity-2 specialised float tuple. Same shape as
 /// `w_specialised_tuple_ii_new` — `gc_ptr_offsets = []`
-/// (`eval.rs:343`) keeps mark-sweep traversal trivially safe.
+/// (`eval.rs`) keeps mark-sweep traversal trivially safe.
 pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
     let header = PyObject {
         ob_type: &SPECIALISED_TUPLE_FF_TYPE as *const PyType,
@@ -179,7 +179,7 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
 }
 
 /// Allocate an arity-2 specialised object tuple. Carries
-/// `gc_ptr_offsets = [value0, value1]` (`eval.rs:350`); the values may
+/// `gc_ptr_offsets = [value0, value1]` (`eval.rs`); the values may
 /// transiently point at an off-heap `malloc_typed` W_IntObject /
 /// W_FloatObject during the L1 stepping-stone window — headered, but
 /// outside the collector's heap. The mark walker's

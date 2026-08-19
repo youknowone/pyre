@@ -1,5 +1,5 @@
 //! `Operand` — the operand-union carrier for `Op.args` /
-//! `Op.fail_args` (#9 / S-11).
+//! `Op.fail_args` (#9).
 //!
 //! `resoperation.py:281` `N_aryOp._args` stores operands as the
 //! `AbstractValue` objects themselves — a result op, an input arg, or a
@@ -57,7 +57,7 @@ pub enum Operand {
     /// surfaced as [`same_box`](Self::same_box). This is the same shared-cell
     /// in-place-forward contract the const-kind `Forwarded::Const(Const)`
     /// carrier provided. The forwarding visitor is
-    /// idempotent on an already-forwarded object (collector.rs:1133), so a
+    /// idempotent on an already-forwarded object (collector.rs), so a
     /// const cell reachable from two slots forwards safely.
     Const(Rc<Cell<Value>>),
 }

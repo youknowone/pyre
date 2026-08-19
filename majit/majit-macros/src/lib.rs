@@ -840,7 +840,7 @@ fn helper_policy_tokens_for_fn(
     // 6-tuple: (policy, inline_builder, trace_target, concrete_target, prebuild, save_err).
     // `prebuild` is the per-helper liveness prebuild fn pointer or null
     // for non-Inline helpers (these have no per-marker triples to register).
-    // Only `#[jit_inline]` emits a real prebuild fn at `lib.rs:1330`; every
+    // Only `#[jit_inline]` emits a real prebuild fn; every
     // other helper attribute that flows through here advertises null and
     // the parent `#[jit_interp]` lowerer's inferred-policy site
     // (`jitcode_lower.rs::CallPolicySpec::Infer`) skips the call.
@@ -2776,7 +2776,7 @@ const JIT_HELPER_ATTRS: &[&str] = &[
     "elidable_cannot_raise",
     "elidable_or_memerror",
     "elidable_promote",
-    // ImplItemFn-friendly pass-through variant (lib.rs:993).  The
+    // ImplItemFn-friendly pass-through variant.  The
     // `#[elidable]` family emits a module-level trampoline, so attaching
     // it inside an `impl` block fails with `not found in this scope`.
     // `#[jit_elidable]` flows the hint without a trampoline, so it can
@@ -2831,7 +2831,7 @@ fn jit_attr_name(attr: &syn::Attribute) -> Option<String> {
 /// `getfunctionptr(graph)`
 /// (call.py:174-187) does not distinguish free fns from methods; pyre
 /// keys methods by the `[impl_type_joined, method]` 2-segment CallPath
-/// (lib.rs:406-433), so the macro emits exactly that.
+/// (lib.rs), so the macro emits exactly that.
 struct DiscoveredHelper {
     fn_name: Ident,
     attr_name: String,
@@ -3047,7 +3047,7 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // `CallControl::register_macro_impl_helper_trace_fnaddr` which applies
     // its module-prefix-qualification rule to decide whether to prepend
     // the module prefix before registering the canonical 2-segment
-    // CallPath `[impl_type_joined, method]` (lib.rs:406-433).
+    // CallPath `[impl_type_joined, method]` (lib.rs).
     let impl_entries: Vec<proc_macro2::TokenStream> = discovered
         .iter()
         .filter_map(|h| {
@@ -3105,7 +3105,7 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         /// applies its module-prefix-qualification rule to decide whether
         /// to prepend the module prefix before storing the canonical
         /// 2-segment CallPath `[impl_type_joined, method]` — same shape
-        /// used for `self_ty_root`-keyed methods (lib.rs:406-433).
+        /// used for `self_ty_root`-keyed methods (lib.rs).
         #[doc(hidden)]
         #[allow(dead_code)]
         pub fn __majit_helper_impl_trace_fnaddrs()
@@ -3143,16 +3143,16 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
 fn attr_is_passthrough(attr_name: &str) -> bool {
     matches!(
         attr_name,
-        // lib.rs:1008 `#[jit_elidable]` — ImplItemFn-friendly pass-through.
+        // `#[jit_elidable]` — ImplItemFn-friendly pass-through.
         "jit_elidable"
-        // lib.rs:1018 `#[unroll_safe]`.
+        // `#[unroll_safe]`.
         | "unroll_safe"
-        // lib.rs:1047 `#[not_in_trace]`.
+        // `#[not_in_trace]`.
         | "not_in_trace"
-        // lib.rs:1243 `#[oopspec(...)]` — body untouched, only `_MAJIT_OOPSPEC`
+        // `#[oopspec(...)]` — body untouched, only `_MAJIT_OOPSPEC`
         // marker constant added.
         | "oopspec"
-        // lib.rs:1281 `#[look_inside_iff(...)]` — emits dispatch wrapper around
+        // `#[look_inside_iff(...)]` — emits dispatch wrapper around
         // `_orig_<name>` / `<name>_trampoline`; the public name keeps its body
         // but no policy fn is generated.
         | "look_inside_iff"

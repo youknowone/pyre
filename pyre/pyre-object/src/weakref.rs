@@ -323,7 +323,7 @@ pub const GC_WEAKREF_BOX_OBJECT_SIZE: usize = std::mem::size_of::<GcWeakrefBox>(
 
 /// Byte offset of the inline `*mut Weakref` field the GC must trace
 /// (as a strong GcRef) during minor / major collection. Mirrors the
-/// `W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS` convention on celldict.rs:120.
+/// `W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS` convention in celldict.rs.
 pub const GC_WEAKREF_BOX_GC_PTR_OFFSETS: [usize; 1] = [std::mem::offset_of!(GcWeakrefBox, inner)];
 
 impl crate::lltype::GcType for GcWeakrefBox {

@@ -244,7 +244,7 @@ mod tests {
 
     /// Distinct Arcs that share `descr.index() == 0` (e.g. two
     /// different structs' `index_in_parent = 0` fields at
-    /// `call.rs:3849`) must NOT collapse — `Arc::ptr_eq` is by
+    /// `call.rs`) must NOT collapse — `Arc::ptr_eq` is by
     /// pointer, not by content.  PyPy `_cache_field` parity:
     /// `(STRUCT, fieldname)` keyed dict.
     #[test]

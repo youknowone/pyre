@@ -2820,7 +2820,7 @@ fn rewrite_body(
                     // failure is silent in release —
                     // `run_pending_abort_blackhole` reaches
                     // `ContinueRunningNormally` with an empty `green_int`
-                    // (`jitdriver.rs:2041-2059`), sets `single_pass_finish`, and
+                    // (`jitdriver.rs`), sets `single_pass_finish`, and
                     // the dispatch loop ends after exactly `threshold` passes,
                     // returning a truncated result that still looks plausible.
                     // The `debug_assert!` naming that contract is compiled out

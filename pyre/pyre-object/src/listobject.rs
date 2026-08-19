@@ -532,7 +532,7 @@ pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     if is_int(item) && !is_bool(item) {
         // type(w_obj) is W_IntObject — reject int subclasses.
         // Subclass instances share ob_type == &INT_TYPE but have w_class
-        // overwritten to the subclass type object (typedef.rs:673).
+        // overwritten to the subclass type object (typedef.rs).
         let int_typeobj = get_instantiate(&INT_TYPE);
         let w_class = (*item).w_class;
         if int_typeobj.is_null() {

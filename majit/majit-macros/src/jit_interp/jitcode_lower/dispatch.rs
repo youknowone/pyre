@@ -575,7 +575,7 @@ pub(super) fn lower_pre_dispatch_stmts(
         // BLOCKERs (c) merge arithmetic + (d) HAVE_ARGUMENT polarity).
         // When recognition or body emission fails, signal taint so
         // `lower_dispatch_body` returns `None` → dispatch body empty →
-        // gate at `codegen_state.rs:786-823` misses
+        // gate in `generate_state_fields_jit_state` misses
         // `BC_GETARRAYITEM_GC_I` and refuses install (fail-closed per
         // Pre-A.2.3 codex review item (a)).
         if let Some(while_expr) = stmt_as_inner_while(stmt) {
@@ -688,7 +688,7 @@ fn block_contains_can_enter_jit(block: &syn::Block) -> bool {
 ///
 /// Recognises `Stmt::Expr(Expr::Call(_), _)` where the callee path
 /// resolves to a `CallPolicySpec` via `resolve_call_policy`. The
-/// existing `lower_config_call_stmt` (`jitcode_lower.rs:2319+`) handles
+/// existing `lower_config_call_stmt` (`jitcode_lower.rs`) handles
 /// every `CallPolicyKind` (ResidualVoid / MayForceVoid / LoopInvariant
 /// / Elidable / etc.); this recognizer is the gate that lets the same
 /// path fire in the dispatch JitCode body, where `lower_stmt`'s
@@ -1096,8 +1096,8 @@ fn try_lower_have_argument_guard(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
             );
         },
     );
-    // BC_ABORT is the canonical local bailout — `assembler.rs:1352-1354`
-    // + `dispatch.rs:3632-3633` resume protocol. Pre-A.2.3 codex review
+    // BC_ABORT is the canonical local bailout — `assembler.rs`
+    // + `dispatch.rs` resume protocol. A codex review
     // BLOCKER (d): `guard_value` is the wrong shape (range vs equality);
     // BC_ABORT preserves RPython L190-191 `raise BytecodeCorruption`
     // semantics through the existing trace-abort path.
@@ -1631,7 +1631,7 @@ fn expr_int_literal_value(expr: &Expr) -> Option<i64> {
 /// Recognises both `while cond { ... }` (e.g. `while pc < program.size`)
 /// and `loop { ... }` (e.g. `rpython/jit/tl/tinyframe/tinyframe.py` and
 /// other tinyframe-family interpreters whose dispatch loop is unconditional
-/// with a `break`-driven exit).  Mirrors `codegen_trace.rs:520
+/// with a `break`-driven exit).  Mirrors `codegen_trace.rs
 /// expr_inner_match_block`'s recognition set.
 pub(super) fn find_dispatch_loop_body<'b>(
     func_block: &'b syn::Block,
@@ -1678,7 +1678,7 @@ pub(super) fn is_jit_merge_point_macro(stmt: &Stmt) -> bool {
 /// - else → `inline_call_r_v` (Ref-only arg vector; degenerates to the
 ///   no-arg form when layout is empty).
 ///
-/// Arg pairs are `(parent_reg, callee_reg)` per `assembler.rs:1421
+/// Arg pairs are `(parent_reg, callee_reg)` per `assembler.rs
 /// inline_call_<types>_v` API.  Mirrors `inline_call_tokens` at
 /// `:5098`'s family-by-bank pattern but always selects the void-result
 /// variant — dispatch arms never produce an inline_call return value
@@ -3863,9 +3863,10 @@ pub(crate) fn lower_dispatch_body(
     // A.2.3a fail-closed install gate: if pre-dispatch lowering detected
     // a structurally unrecognized inner construct (currently only the
     // `Expr::While` shape mismatch path), abort dispatch JitCode body
-    // generation and return None. The caller (`codegen_trace.rs:81-88`)
+    // generation and return None. The caller (`codegen_trace.rs`'s
+    // `generate_trace_fn`)
     // emits an empty body for the dispatch_jitcode_fn, so the runtime
-    // gate at `codegen_state.rs:786-823` misses `BC_GETARRAYITEM_GC_I`
+    // gate in `generate_state_fields_jit_state` misses `BC_GETARRAYITEM_GC_I`
     // and refuses to register the singleton.
     if lowerer.dispatch_tainted_reason.is_some() {
         return None;

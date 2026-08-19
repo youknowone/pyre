@@ -73,7 +73,7 @@ thread_local! {
 
 /// `rewrite.py:665-695` `handle_call_assembler` per-callee metadata
 /// lookup, sourced from the registered `DynasmCaTarget`'s CLT Arc.
-/// Mirrors `majit-backend-cranelift::compiler.rs:6097-6121`.
+/// Mirrors `majit-backend-cranelift::compiler.rs`.
 pub(crate) fn lookup_call_assembler_callee_locs(
     token_number: u64,
 ) -> Option<majit_gc::rewrite::CallAssemblerCalleeLocs> {
@@ -82,7 +82,7 @@ pub(crate) fn lookup_call_assembler_callee_locs(
         let target = guard.get(&token_number)?;
         let clt = &target.compiled_loop_token;
         // `JitFrameInfo` is `#[repr(C)]` and the Arc keeps the allocation
-        // pinned, matching cranelift's `compiler.rs:6107-6110` pattern.
+        // pinned, matching cranelift's `compiler.rs` pattern.
         let frame_info_ptr = {
             let info = clt.frame_info.lock();
             &*info as *const majit_backend::JitFrameInfo as usize
@@ -1238,7 +1238,7 @@ fn dynasm_alloc_oldgen_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
 /// id so callers MUST NOT emit a separate `gen_initialize_tid`.
 pub extern "C" fn dynasm_malloc_big_fixedsize(size: u64, type_id: u64) -> u64 {
     // The CALL_R arg is `total = payload + GcHeader::SIZE` (built by
-    // `handle_new` at rewrite.rs:857 to include the GC header).  The
+    // `handle_new` in rewrite.rs to include the GC header).  The
     // runtime allocators (`alloc_oldgen_typed`, `alloc_nursery_typed`)
     // and the raw fallback both prepend the GC header themselves and
     // expect a payload-only size, so subtract `HDR` here once —
@@ -2146,10 +2146,10 @@ impl DynasmBackend {
         //     raise jitexc.ExitFrameWithExceptionRef(exception)
         //
         // pyre routes this through the same FailDescr the toplevel
-        // consumer (eval.rs:2564, 3166) already understands —
+        // consumer (eval.rs) already understands —
         // `is_exit_frame_with_exception=true` + `fail_arg_types=[Ref]`
         // — by transferring `jf_guard_exc` (set by Layer 3's emitted
-        // _store_and_reset_exception, x86/assembler.rs:2304-...) into
+        // _store_and_reset_exception, x86/assembler.rs) into
         // `jf_frame[0]` so the existing slot-0 Ref reader picks it up.
         if ptr != 0 && ptr == attached.propagate_exception_descr {
             // grab_exc_value reads jf_guard_exc (llmodel.py:240-242); the
@@ -2248,7 +2248,7 @@ impl DynasmBackend {
     /// `compiled_bridge_fail_descr_layouts`) that legitimately probe
     /// "is this guard already compiled?" and must treat the miss as
     /// `None` (matching cranelift's `?`-on-miss semantics in
-    /// `compiler.rs:11723`).
+    /// `compiler.rs`).
     fn find_descr(token: &JitCellToken, trace_id: u64, fail_index: u32) -> majit_ir::DescrRef {
         Self::try_find_descr(token, trace_id, fail_index).unwrap_or_else(|| {
             panic!(
@@ -2270,7 +2270,7 @@ impl DynasmBackend {
         // not been attached, or one rotated into `previous_tokens`),
         // probing callers like `compiled_bridge_fail_descr_layouts`
         // must observe `None` instead of a panic.  Cranelift's
-        // counterpart at `compiler.rs:13955-13958`
+        // counterpart at `compiler.rs`
         // (`token.compiled.as_ref().and_then(|c|
         // c.downcast_ref::<CompiledLoop>())?`) follows the same
         // contract.
@@ -2287,8 +2287,8 @@ impl DynasmBackend {
         // pyre-only deviation removed alongside `normalize_trace_id`.
         //
         // `fail_descrs[i].fail_index_per_trace() == i` is enforced at
-        // codegen end (`x86/assembler.rs:1741` / `:1863`,
-        // `aarch64/assembler.rs:1403` / `:1532`); the per-Compiled trace
+        // codegen end (`x86/assembler.rs` and
+        // `aarch64/assembler.rs`); the per-Compiled trace
         // identity is the `CompiledCode::trace_id` field rather than a
         // per-descr `trace_id()` read.  Look up by position so the
         // descr's internal per-emission state is not required —
@@ -2493,8 +2493,8 @@ impl Backend for DynasmBackend {
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
         // RPython predicates the stamp on `isinstance(descr, ResumeDescr)`
         // (`compile.py:185`); pyre uses the `is_resume_guard()` trait
-        // method (descr.rs:779), implemented true on the
-        // `ResumeGuardDescr` family (compile.rs:3117/3296/3434/3558/4125).
+        // method (descr.rs), implemented true on the
+        // `ResumeGuardDescr` family (compile.rs).
         //
         // `compile.py:183-186` walks `loop.operations` and writes
         // `op.descr.rd_loop_token` directly.  Pyre's `compiled.fail_descrs`
@@ -2856,7 +2856,7 @@ impl Backend for DynasmBackend {
         // assembler.py:1080 `_call_header_with_stack_check` emits the
         // inline probe at the top of every compiled loop, matching
         // cranelift's `jit_prologue_stack_check_shim` call in
-        // `compiler.rs:5868`. The prior runner-level `jit_prologue_stack_check`
+        // `compiler.rs`. The prior runner-level `jit_prologue_stack_check`
         // call only guarded top-level entry and missed compiled-to-
         // compiled CALL_ASSEMBLER recursion.
         let compiled = Self::get_compiled(token);
@@ -3046,7 +3046,7 @@ impl Backend for DynasmBackend {
         // Same non-null JITFRAMEINFO + `jfi_frame_depth` sizing as
         // `execute_token` (jitframe.py:51) — the bridge realloc slowpath
         // needs the frame_info, and the depth matches cranelift's
-        // `max_output_slots`-sized raw outputs (compiler.rs:14994).
+        // `max_output_slots`-sized raw outputs (compiler.rs).
         let clt = token.compiled_loop_token_expect();
         let (fi_ptr, num_slots) = {
             let info = clt.frame_info.lock();
@@ -3236,7 +3236,7 @@ impl Backend for DynasmBackend {
     /// stale `descr_addr`.
     ///
     /// `compile_loop` inserts the token into `CALL_ASSEMBLER_TARGETS`
-    /// (`runner.rs:1578`) and that map stores a strong
+    /// (`runner.rs`) and that map stores a strong
     /// `Arc<CompiledLoopToken>`; without removal here the CLT — and the
     /// fail-descr cells it pins — would live for the entire process
     /// lifetime.  Drop the entry so the Arc chain unwinds.
@@ -3493,7 +3493,7 @@ impl Backend for DynasmBackend {
     /// matches `i64` on 64-bit, so we transmute via the shared int
     /// dispatcher and wrap the result. Without this override
     /// `bhimpl_residual_call_*_r` would silently no-op via the default
-    /// trait impl at `majit-backend/lib.rs:1992`.
+    /// `bh_call_r` trait impl in `majit-backend/src/lib.rs`.
     fn bh_call_r(
         &self,
         func: i64,
@@ -3526,7 +3526,7 @@ impl Backend for DynasmBackend {
     /// dispatcher so an f64-returning C callee delivers via xmm0 / d0
     /// instead of rax / x0. Without this override
     /// `bhimpl_residual_call_*_f` would silently no-op via the default
-    /// trait impl at `majit-backend/lib.rs:2003`.
+    /// `bh_call_f` trait impl in `majit-backend/src/lib.rs`.
     fn bh_call_f(
         &self,
         func: i64,
@@ -3562,7 +3562,7 @@ impl Backend for DynasmBackend {
     ///
     /// Without this override the canonical `residual_call_*_v` walker
     /// would silently no-op via the default trait impl
-    /// (`majit-backend/lib.rs:2013`).
+    /// (`bh_call_v` in `majit-backend/src/lib.rs`).
     fn bh_call_v(
         &self,
         func: i64,
@@ -3874,7 +3874,7 @@ impl Backend for DynasmBackend {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         let offset = fielddescr.as_offset();
-        // Route through `read_float_at_mem` (`runner.rs:611-615` —
+        // Route through `read_float_at_mem` (`runner.rs` —
         // `llmodel.py:490-491` parity) so misaligned struct fields use
         // `read_unaligned`. Direct `*const f64` deref was UB-prone on
         // misaligned vable float slots.
@@ -3891,9 +3891,10 @@ impl Backend for DynasmBackend {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
         let offset = fielddescr.as_offset();
-        // Route through `write_float_at_mem` (`runner.rs:617-621` —
-        // `llmodel.py:493-494` parity); see read sibling above for
-        // alignment rationale.
+        // Route through `write_float_at_mem` (`runner.rs` —
+        // `llmodel.py:493-494` parity) so misaligned struct fields use
+        // `write_unaligned`; a direct `*mut f64` deref was UB-prone on
+        // misaligned vable float slots.
         self.write_float_at_mem(struct_ptr, offset as i64, value);
     }
 
@@ -3977,7 +3978,7 @@ impl Backend for DynasmBackend {
         // majit query-style callers (`bridge_was_compiled` etc.) probe
         // by (trace_id, fail_index) and must treat the miss as `None`
         // — match cranelift's `?` semantics in
-        // `compiler.rs:11723 compiled_bridge_fail_descr_layouts`.
+        // `compiler.rs`'s `compiled_bridge_fail_descr_layouts`.
         let bridge_addr =
             self.lookup_bridge_addr(original_token, source_trace_id, source_fail_index);
         if bridge_addr == 0 {

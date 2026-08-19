@@ -252,7 +252,7 @@ mod jit_module {
     // (`impl Trait for Foo { fn ... }`) methods land in the same registry
     // via the structured `__majit_helper_impl_trace_fnaddrs()` registry,
     // keyed by `impl_type_joined / method` that matches the parser's
-    // `self_ty_root` canonicalization (parse.rs:702, lib.rs:406-433) —
+    // `self_ty_root` canonicalization (parse.rs, lib.rs) —
     // RPython `call.py:174-187 getfunctionptr(graph)` parity.
     //
     // `#[unroll_safe]` is used here because it is one of the JIT attribute
@@ -428,7 +428,7 @@ mod jit_module {
     // `#[elidable]` / `#[elidable_cannot_raise]` and friends emit a
     // module-level trampoline (`__majit_call_target_*`), so they cannot be
     // attached inside an `impl` block (probe result: `not found in this
-    // scope`).  `#[jit_elidable]` (lib.rs:993) is a pure pass-through and
+    // scope`).  `#[jit_elidable]` (lib.rs) is a pure pass-through and
     // only relies on `front::llbc_hints`'s hint flip (the
     // `_elidable_function_` marker const → `elidable`), so it can safely
     // sit on impl methods.  This fixture verifies that live wire.
@@ -507,7 +507,7 @@ mod jit_module {
 
     // ── pass-through attribute on a *free* fn under `#[jit_module]` ───
     //
-    // `#[jit_elidable]` (lib.rs:1008) is a pure pass-through and emits no
+    // `#[jit_elidable]` (lib.rs) is a pure pass-through and emits no
     // `__majit_call_policy_<name>()` trampoline.  `__majit_helper_trace_fnaddrs()`
     // must therefore record the function's direct address (impl_addr_expr's
     // pass-through branch) instead of routing through the missing policy fn —

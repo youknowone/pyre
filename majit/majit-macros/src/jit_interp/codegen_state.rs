@@ -2859,7 +2859,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             //
             // resume.py:1042-1057 rebuild_from_resumedata parity for the
             // JitDriver state.  Without this the trait default returns None and
-            // `start_bridge_tracing` aborts (jitdriver.rs:3789) so no guard-exit
+            // `start_bridge_tracing` aborts (jitdriver.rs) so no guard-exit
             // bridge ever forms — a failing loop guard re-enters via
             // ContinueRunningNormally instead of forming a bridge.  Adding it
             // flips `start_bridge_tracing` ok=false→ok=true and bridges form;
@@ -3356,7 +3356,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // jitdriver-level guard sites (e.g. `force_finish_trace`'s
             // GuardAlwaysFails fallback) get the same snapshot wire-up
             // as the dispatch-level `record_state_guard`
-            // (`pyjitpl/dispatch.rs:284`).  Calls the macro-emitted
+            // (`pyjitpl/dispatch.rs`).  Calls the macro-emitted
             // `JitCodeSym::populate_frame_int_regs` to bridge
             // `__JitSym_<fn>` slots onto `MIFrame.int_regs`, then builds a
             // single-frame snapshot via the canonical helper.
@@ -3383,7 +3383,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // `codegen_state.rs` populate_ref_scalar_parts), so the ref
                 // bank needs the same transient save/restore the int bank
                 // gets — mirrors `record_state_guard`
-                // (`pyjitpl/dispatch.rs:959-1019`).  Without it the ref
+                // (`pyjitpl/dispatch.rs`).  Without it the ref
                 // scalars stay clobbered in the live frame after the
                 // jitdriver-level GuardAlwaysFails snapshot is built.
                 let __rn = sym.ref_identity_slots_end().min(__root.ref_regs.len());

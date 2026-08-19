@@ -6,8 +6,8 @@
 //!
 //! Methods that read/write the shared `RegAlloc` state are declared
 //! as a second `impl` block on `crate::regalloc::RegAlloc<'a>`. The
-//! `x86` module is `#[cfg(target_arch = "x86_64")]` gated at
-//! `lib.rs:35`, so these methods only compile on x86_64.
+//! `x86` module is `#[cfg(target_arch = "x86_64")]` gated in
+//! `lib.rs`, so these methods only compile on x86_64.
 
 use crate::regalloc::{RegAlloc, RegAllocOp, fits_in_32bits};
 use crate::regloc::Loc;

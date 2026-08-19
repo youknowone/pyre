@@ -79,8 +79,8 @@ fn enabled(audit: &mut Audit) -> bool {
 /// Record that the caller wrote `slot` of the `int_regs` buffer at `regs`.
 ///
 /// `regs` is the buffer address (`self.int_regs.as_ptr() as usize`), not the
-/// frame — see the module doc for why depth is unavailable at three of the
-/// writers.
+/// frame — a callee's registers may be populated before it has a stack
+/// depth.
 #[track_caller]
 #[inline]
 pub fn note_int_write(regs: usize, slot: usize, _opref: Option<OpRef>) {

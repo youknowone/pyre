@@ -42,7 +42,7 @@ pub mod x86;
 
 // ── llmodel.py:194-199 JIT exception state ──
 // RPython stores exception state in thread-local (GIL-protected) globals.
-// Cranelift uses JIT_EXC_VALUE / JIT_EXC_TYPE atomics (compiler.rs:515-517).
+// Cranelift uses JIT_EXC_VALUE / JIT_EXC_TYPE atomics (compiler.rs).
 // Dynasm uses the same pattern for structural equivalence.
 
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
@@ -663,12 +663,12 @@ fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
 ///
 /// **TODO**: pyre's CA slow path runs
 /// the bridge-tracer hook (`CA_BRIDGE_FN` → `jit_ca_handle_guard_failure`
-/// in pyre-jit/src/call_jit.rs:2425) and then the blackhole hook
+/// in pyre-jit/src/call_jit.rs) and then the blackhole hook
 /// (`CA_BLACKHOLE_FN`) sequentially, instead of choosing one via the
 /// outer `if must_compile` branch.  The PyPy line-by-line port of
 /// must_compile / stack_almost_full / start_compiling /
 /// `_trace_and_compile_from_bridge` / done_compiling is carried out
-/// inside `jit_ca_handle_guard_failure` (call_jit.rs:2438-2499) — the
+/// inside `jit_ca_handle_guard_failure` (call_jit.rs) — the
 /// flow IS modeled, just one layer down.
 ///
 /// **Why the outer dispatch shape differs**: PyPy's
@@ -719,10 +719,10 @@ fn handle_fail_resume_guard(
     // not run: it leaves `handle_guard_failure` with nothing traced.  Pyre
     // mirrors this by gating bridge tracing on `Some(jct)` and passing
     // `green_key=0` to the blackhole callback so it derives the key from
-    // the deadframe's pyframe pointer (call_jit.rs:1694-1704); never
+    // the deadframe's pyframe pointer (call_jit.rs); never
     // substitute the parent CALL_ASSEMBLER caller's green_key here — that
     // would mis-route resume storage and trip `compile_bridge`'s
-    // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl.rs:8297-8301).
+    // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl.rs).
     let owning_jct = majit_backend::descr_owning_jct(descr);
 
     // llmodel.py:240-242 `grab_exc_value(deadframe)`: read `jf_guard_exc`

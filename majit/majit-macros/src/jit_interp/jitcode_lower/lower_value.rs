@@ -798,7 +798,7 @@ impl<'c> Lowerer<'c> {
     /// pyjitpl.py:393-410 `opimpl_record_exact_class`. RPython
     /// `rlib/jit.py:1181 record_exact_class` is a void hint, so this is
     /// the only emission shape — there is no value-form (the runtime
-    /// stub at `jit.rs:735` returns `()`).
+    /// stub in `jit.rs` returns `()`).
     ///
     /// `value` must be Ref-kind and `cls` must be Int-kind, matching
     /// `blackhole.py:616 @arguments("r", "i")`.  Non-matching kinds
@@ -863,7 +863,7 @@ impl<'c> Lowerer<'c> {
     /// `heap_cache.is_nullity_known` + bumps `HEAPCACHED_OPS` on cache
     /// hit. Only fires for ref-typed bindings — `jit::assert_not_none<T>`
     /// is documented as the `Option<T>::expect` analog at the runtime
-    /// stub (`jit.rs:756`), so non-ref bindings (int/float) cannot
+    /// stub (`jit.rs`), so non-ref bindings (int/float) cannot
     /// reach this site through `Option<T>` unwrap.
     fn lower_assert_not_none_call(&mut self, call: &ExprCall) -> Option<Binding> {
         if !is_assert_not_none_call_path(&call.func) {

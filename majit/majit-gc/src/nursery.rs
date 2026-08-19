@@ -129,7 +129,7 @@ impl Nursery {
     /// sites initialize their own GC-pointer fields.  Poison mode mirrors
     /// llarena.py mode 3 for detecting violations of that contract.
     ///
-    /// WASM-ONLY ADAPTATION: majit-backend-wasm/src/codegen.rs:2592-2599
+    /// WASM-ONLY ADAPTATION: majit-backend-wasm/src/codegen.rs
     /// documents that wasm skips the GC rewrite, so its JIT code has no
     /// `clear_gc_fields` stores and still requires recycled nursery bytes to
     /// be zero-filled.  Delete this target branch once wasm runs the rewrite

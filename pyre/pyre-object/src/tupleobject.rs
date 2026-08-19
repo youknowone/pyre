@@ -348,7 +348,7 @@ fn w_tuple_new_array_backed_impl(
     // `alloc_tuple_items_block_gc` roots the fresh block only inside its own
     // `push_roots` frame, which it pops on return, so from here the block is a
     // livevar of *this* frame across the barrier below. That barrier is a
-    // `gc_op`: it leaves RUNNING before taking `gc_mutex` (`gc_sync.rs:22`) and
+    // `gc_op`: it leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`) and
     // roots only the object it is handed, so a foreign collector runs there
     // with the block reachable from nowhere. Inert for a null or std::alloc
     // block, as in `w_list_new_with_strategy`.

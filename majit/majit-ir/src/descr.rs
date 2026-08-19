@@ -8,21 +8,21 @@
 ///
 /// # Descr identity status (Unified-Descr Port follow-up)
 ///
-/// **Done.** `Op::descr` is `Option<DescrRef>` (resoperation.rs:992) and
+/// **Done.** `Op::descr` is `Option<DescrRef>` (resoperation.rs) and
 /// every resume-metadata variant that carries a descr now stores it as
 /// `Option<DescrRef>` rather than a `descr_index: u32` handle:
 ///
-/// * `RdVirtualInfo` variants (resoperation.rs:519-643).  `PartialEq`
-///   (resoperation.rs:664-814) uses `opt_descr_ptr_eq` (Arc::ptr_eq),
+/// * `RdVirtualInfo` variants (resoperation.rs).  `PartialEq`
+///   (resoperation.rs) uses `opt_descr_ptr_eq` (Arc::ptr_eq),
 ///   matching `history.py:125 id(descr)`.
-/// * `ExitVirtualLayout` (`majit-backend/src/lib.rs:370`) and
-///   `ExitPendingFieldLayout` (`majit-backend/src/lib.rs:549`) compare
+/// * `ExitVirtualLayout` (`majit-backend/src/lib.rs`) and
+///   `ExitPendingFieldLayout` (`majit-backend/src/lib.rs`) compare
 ///   descrs via `opt_descr_ptr_eq` for the same reason.
 /// * `ResolvedPendingFieldWrite` / `EncodedPendingFieldWrite`
 ///   (`majit-metainterp/src/resume.rs`) and
-///   `PendingFieldLayoutSummary` (`majit-ir/src/resumedata.rs:137`) use
+///   `PendingFieldLayoutSummary` (`majit-ir/src/resumedata.rs`) use
 ///   the canonical `resumedata::opt_descr_arc_ptr_eq`.
-/// * `GuardPendingFieldEntry` (resoperation.rs:892) carries
+/// * `GuardPendingFieldEntry` (resoperation.rs) carries
 ///   `Option<DescrRef>` directly and intentionally has no `PartialEq`
 ///   impl: `PENDINGFIELDSTRUCT` (`resume.py:87-92`) is write-only
 ///   resume data that RPython never compares by value.
@@ -36,8 +36,8 @@
 /// | Edge | Direction | Strength | Status |
 /// |---|---|---|---|
 /// | `SimpleSizeDescr.all_fielddescrs` → `FieldDescr` | child | strong | OK |
-/// | `SimpleFieldDescr.parent_descr` → `SizeDescr` | parent | **Weak** (descr.rs:3147, 3272) | OK — cycle broken |
-/// | `SimpleFieldDescr.vinfo` → `VirtualizableInfo` | back | **Weak** (descr.rs:3154, 3281) | OK — cycle broken |
+/// | `SimpleFieldDescr.parent_descr` → `SizeDescr` | parent | **Weak** (descr.rs) | OK — cycle broken |
+/// | `SimpleFieldDescr.vinfo` → `VirtualizableInfo` | back | **Weak** (descr.rs) | OK — cycle broken |
 /// | `VirtualizableInfo._static_field_descrs` → `FieldDescr` | child | strong | OK (paired with Weak above) |
 /// | `CallDescr → EffectInfo._readonly/write_descrs_*` → `FieldDescr/ArrayDescr` | uni | strong | OK — no back-ref |
 /// | `SimpleArrayDescr.lendescr` → length `FieldDescr` (parent_descr=None) | uni | strong | OK — no back-ref |
@@ -49,7 +49,7 @@
 /// (`descr.py:372-375` + `descr.py:388-391`).  Python tolerates it via
 /// cycle-collecting GC; Rust's `Arc` does not.  In practice the descr
 /// graph is process-lifetime pinned by `GcCache._cache_size` /
-/// `_cache_array` / `_cache_interiorfield` (descr.rs:498/660/710) — the
+/// `_cache_array` / `_cache_interiorfield` (descr.rs) — the
 /// global singleton `gc_cache()` keeps strong roots for every minted
 /// descr, so dropping IR-side `DescrRef` clones never decrements the
 /// last strong count, and the cycle never gets a chance to leak.  If a
@@ -3205,7 +3205,7 @@ pub trait LoopTargetDescr: Descr {
     /// `compile.py:237` / `compile.py:289` once the freshly-made JitCellToken
     /// is bound to the loop. Returns `None` for a TargetToken constructed
     /// before the owner exists (the preamble sentinel at
-    /// `unroll.rs:196 TargetToken::new_preamble(0)`); `record_loop_or_bridge`
+    /// `unroll.rs`'s `TargetToken::new_preamble(0)`); `record_loop_or_bridge`
     /// (`compile.py:197-199`) must then leave this JUMP branch unhandled.
     fn original_jitcell_token_number(&self) -> Option<u64> {
         None
@@ -3371,7 +3371,7 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
 
     /// Codewriter-side `index()` setter — pyre adaptation for the
     /// per-trace tracking key used by `pyre-jit-trace::state` field
-    /// descr lookup (`fd.index() == field_idx`, state.rs:5879/5933).
+    /// descr lookup (`fd.index() == field_idx`, state.rs).
     /// `gc_cache.get_field_descr` cache-hit path lets the analyzer's
     /// `fielddescrof_concrete` stamp its `descr_indices.field_index`
     /// value onto a previously-cached `Arc<SimpleFieldDescr>` so
@@ -6981,7 +6981,7 @@ pub fn make_vtable_field_descr() -> DescrRef {
 /// `offset = 0`, `field_size = 4 bytes`.  Restricting the store width
 /// to four bytes is what lets `gen_initialize_tid` overwrite the type
 /// id without disturbing flag bits the runtime may already have set on
-/// the same word: collector.rs:449 `alloc_in_oldgen` ORs in
+/// the same word: collector.rs's `alloc_in_oldgen` ORs in
 /// `TRACK_YOUNG_PTRS` for any object the malloc-nursery slow path
 /// promotes to the old gen, and a full-word store would silently wipe
 /// it.  Upstream rewrite.py:914-918 has no analogue because

@@ -233,7 +233,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         /// `make_jitcodes()` / `pyjitpl.py:2255 finish_setup()` only
         /// install completed jitcodes — there is no "empty body installed
         /// as success" path.  The install pipeline at
-        /// `codegen_state.rs:840` `if let Some(jc) = ... { register }`
+        /// `codegen_state.rs` `if let Some(jc) = ... { register }`
         /// matches that lifecycle by skipping `register_dispatch_jitcode`
         /// when this returns `None`.
         #[allow(non_snake_case, unused_variables, unused_mut)]

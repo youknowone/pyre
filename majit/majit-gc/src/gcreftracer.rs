@@ -20,13 +20,14 @@
 //! `model.py:294`) so the tracer header sits in the live object graph.
 //!
 //! pyre has the custom-trace-hook facility — `TypeInfo::custom_trace`
-//! (`trace.rs:314`, `register_custom_trace_hook` parity), already used by
-//! `JITFRAME` (`jitframe.rs:333`), the structural twin of `GCREFTRACER` —
+//! (`trace.rs`, `register_custom_trace_hook` parity), already used by
+//! `JITFRAME` (`jitframe.rs`), the structural twin of `GCREFTRACER` —
 //! so a managed `GCREFTRACER` GcStruct with a slot-tracing hook is
 //! portable *in isolation*. What is not yet portable is the
 //! *reachability*: pyre's `CompiledLoopToken` is a Rust-owned struct and
 //! its `asmmemmgr_gcreftracers` is a `Mutex<Vec<Arc<dyn Any>>>` keepalive
-//! (`majit-backend/src/lib.rs:910`), not a GC edge — the collector has no
+//! (`CompiledLoopToken` in `majit-backend/src/lib.rs`), not a GC edge — the
+//! collector has no
 //! object-graph path to a managed header. A GcStruct header would still
 //! need a GC root to be reached, and that root would be a walker over the
 //! Rust-owned keepalive — a header allocation, a hook, and a mark step
@@ -34,8 +35,9 @@
 //!
 //! So pyre forwards the slots directly from an extra root walker
 //! (`shadow_stack::register_extra_root_walker`, walked at
-//! `collector.rs:668` minor and `collector.rs:1185` major) over the
-//! live-table registry — the analog of RPython reaching the tracer
+//! `collector.rs`'s `do_collect_nursery` and
+//! `rescan_major_nonstack_roots_and_drain`) over
+//! the live-table registry — the analog of RPython reaching the tracer
 //! through the CLT keepalive. Convergence path: once
 //! `asmmemmgr_gcreftracers` (or `CompiledLoopToken` itself) is GC-traced,
 //! this collapses to a managed `GCREFTRACER` GcStruct + custom trace
@@ -159,7 +161,8 @@ fn register_table(table: &Arc<GcTable>) {
 
 /// Forward the slots of every live per-loop table. Registered once via
 /// [`install_gc_table_walker`]; fires at both the minor
-/// (`collector.rs:668`) and major (`collector.rs:1185`) collection
+/// (`do_collect_nursery`) and major
+/// (`rescan_major_nonstack_roots_and_drain`) collection
 /// phases.
 fn walk_all_gc_tables(visitor: &mut dyn FnMut(&mut GcRef)) {
     // In test builds, hold the read side of the walk lock so a registry
@@ -176,7 +179,7 @@ fn walk_all_gc_tables(visitor: &mut dyn FnMut(&mut GcRef)) {
 fn walk_all_gc_tables_inner(visitor: &mut dyn FnMut(&mut GcRef)) {
     // Snapshot the live tables under a read guard, then release the lock
     // before tracing (same snapshot-then-iterate discipline as
-    // `walk_extra_roots`, `shadow_stack.rs:622`). Dead `Weak`s are
+    // `walk_extra_roots`, `shadow_stack.rs`). Dead `Weak`s are
     // filtered by `upgrade`.
     let live: Vec<Arc<GcTable>> = {
         let guard = LIVE_GC_TABLES.read().unwrap();
@@ -195,7 +198,7 @@ fn gc_table_extra_root_walker(visitor: &mut dyn FnMut(&mut GcRef)) {
 
 /// Install the per-loop gc_table forwarding walker. Idempotent —
 /// `register_extra_root_walker` dedups by fn address
-/// (`shadow_stack.rs:602`). Call once at backend init.
+/// (`shadow_stack.rs`). Call once at backend init.
 pub fn install_gc_table_walker() {
     crate::shadow_stack::register_extra_root_walker(gc_table_extra_root_walker);
 }

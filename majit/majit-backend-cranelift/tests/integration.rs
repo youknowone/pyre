@@ -2136,7 +2136,7 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     // Backend's `describe_deadframe` no longer caches the recovery
     // layout — `frame_stack`/`recovery_layout` come from the
     // metainterp's `StoredExitLayout.recovery_layout` (consumed via
-    // `trace_layout_ref.recovery_layout` at `pyjitpl.rs:6431`).
+    // `trace_layout_ref.recovery_layout` at `pyjitpl.rs`).
     // Without a pyre-jit boot here, the backend reports None; this
     // matches the dynasm contract (see `runner.rs` describe_deadframe
     // default impl returning recovery_layout=None).

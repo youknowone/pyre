@@ -395,7 +395,7 @@ pub(crate) fn build_propagate_exception_path(
 /// (assembler.py:247 `_push_all_regs_to_frame(mc, [ecx, edx], floats)`),
 /// `edx` is the runtime size carrier and the caller's regalloc has
 /// already spilled any live value out of both before the call via
-/// `MALLOC_NURSERY_CLOBBER` (regalloc.rs:101).
+/// `MALLOC_NURSERY_CLOBBER` (regalloc.rs).
 ///
 /// On OOM (`rax == 0` after the helper call) the trampoline tail-jumps
 /// to `propagate_path` — the standalone `_build_propagate_exception_path`
@@ -845,7 +845,7 @@ pub struct Assembler386<'a> {
     pending_force_descr: Option<majit_ir::DescrRef>,
     /// Pre-wrapped `FailDescrCell` for the same pending guard.  Codegen
     /// bakes the cell's thin pointer into `JF_FORCE_DESCR_OFS` so that
-    /// `force_token_to_dead_frame` (cranelift/compiler.rs:2660) can
+    /// `force_token_to_dead_frame` (cranelift/compiler.rs) can
     /// recover the descr via `recover_fail_descr_cell` without the
     /// fat-pointer mismatch a bare `Arc<dyn Descr>` ptr would cause.
     /// The same cell is consumed by `append_guard_token_with_faillocs`
@@ -2019,7 +2019,7 @@ impl<'a> Assembler386<'a> {
         // assembler.py:173 — `_store_and_reset_exception(mc, None,
         // ebx, tmpreg)` parity.  pos_exc_value goes into
         // [rbp + JF_GUARD_EXC_OFS] (copied by `realloc_frame` to the
-        // new frame at jitframe.rs:432); pos_exception goes into RBX
+        // new frame in jitframe.rs); pos_exception goes into RBX
         // (callee-save across the C `realloc_frame` call).  Both globals
         // are cleared so the helper does not see leftover state.
         //
@@ -2285,7 +2285,7 @@ impl<'a> Assembler386<'a> {
                 // must become visible first — otherwise the reader pairs the
                 // new code pointer with a stale 0 depth and bypasses the
                 // frame-capacity check (descr.rs set_dispatch_target ordering
-                // contract).  Dynasm ignores `label_block_id` (descr.rs:1236 —
+                // contract).  Dynasm ignores `label_block_id` (descr.rs —
                 // it bakes the LABEL address straight into `ll_loop_code`), so
                 // that companion is not published here.
                 let old = loop_descr.ll_loop_code();
@@ -2820,7 +2820,7 @@ impl<'a> Assembler386<'a> {
             // value (the bug seen in fannkuch as `q.int_items.ptr - 1`
             // landing in a fresh result register that previously held
             // the base pointer).  IntMul / IntAnd / IntOr / IntXor never
-            // take the LEA path (regalloc.rs:2960 routes them through
+            // take the LEA path (regalloc.rs routes them through
             // `consider_binop_symm` which keeps result==arglocs[0]), so
             // a plain in-place op is correct for them.
             OpCode::IntSub => {
@@ -3222,7 +3222,7 @@ impl<'a> Assembler386<'a> {
                 // `base_loc = self.rm.make_sure_var_in_reg(op.getarg(0), args)`
                 // and `result_loc = self.force_allocate_reg(op)` force
                 // register materialisation — pyre's
-                // `consider_getfield_j2` (regalloc.rs:4309-4321) does the
+                // `consider_getfield_j2` (regalloc.rs) does the
                 // same.  Silently no-op'ing on a non-Reg base or result
                 // would mask a regalloc bug (e.g. a fresh `GETFIELD_GC`
                 // arm that forgot the `make_sure_var_in_reg` call), so
@@ -3484,7 +3484,7 @@ impl<'a> Assembler386<'a> {
                     // dynasm emits a tighter encoding without it.
                     // Immediate stores stage the value through
                     // `X86_64_SCRATCH_REG` (r11).  `r0`/rax is in the GPR
-                    // allocation pool (x86/regalloc.rs:19), so using it as
+                    // allocation pool (x86/regalloc.rs), so using it as
                     // the scratch here would silently clobber `base.value`
                     // or `ofs_reg.value` whenever regalloc assigned them
                     // to EAX.  Upstream `save_into_mem` emits `MOV [mem],
@@ -5062,7 +5062,7 @@ impl<'a> Assembler386<'a> {
         // slots for the `ResumeDescr` family; gate the writes accordingly
         // so non-resume meta descrs (Done* / Exit* / Propagate) take the
         // default panic path.  The metainterp's `build_guard_metadata`
-        // (`compile.rs:232`) used to do this after backend codegen with
+        // (`compile.rs`) used to do this after backend codegen with
         // the same sequential counter; doing it here lets readers consume
         // the canonical metainterp identity before metadata builds.
         let descr_arc = op.getdescr();
@@ -5153,7 +5153,7 @@ impl<'a> Assembler386<'a> {
             .collect();
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
-        // resume_guard_descr.rs:166); `layout_for_fail_descr` reads it back
+        // resume_guard_descr.rs); `layout_for_fail_descr` reads it back
         // via `fd.source_op_index()` so no side-table is needed.
         if descr_fd.is_resume_guard() || descr_fd.is_resume_guard_copied() {
             descr_fd.set_source_op_index(op_index);
@@ -5724,12 +5724,12 @@ impl<'a> Assembler386<'a> {
         if let Some(fd) = descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
             // Step A installs op.descr = ResumeGuardDescr with
             // post-numbering fail_arg_types via
-            // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404).
+            // store_final_boxes_in_guard (optimizeopt/mod.rs).
             // The hash once cited for Step A resolves nowhere in this
             // repository, so that symbol is the reference.
             // Prefer the descr for guards too; fall through to
             // op.fail_arg_types only for sharing-path guards
-            // (optimizeopt/mod.rs:3068-3088) where op.descr=None.
+            // (optimizeopt/mod.rs) where op.descr=None.
             let dt = fd.fail_arg_types();
             let expected_len = op.getfailargs().map(|fa| fa.len()).unwrap_or(0);
             if dt.len() == expected_len && !dt.is_empty() {
@@ -5891,7 +5891,7 @@ impl<'a> Assembler386<'a> {
             }
             fresh
         };
-        // `force_token_to_dead_frame` (cranelift/compiler.rs:2660)
+        // `force_token_to_dead_frame` (cranelift/compiler.rs)
         // recovers `jf_force_descr` via `recover_fail_descr_cell`, which
         // requires a `FailDescrCell` thin pointer.  Bake the cell pointer
         // here (not the bare `Arc<dyn Descr>` fat-pointer data half) and
@@ -5923,7 +5923,7 @@ impl<'a> Assembler386<'a> {
     /// FINISH: store result (if any), store descr ptr, return jf_ptr.
     #[allow(dead_code)]
     fn genop_finish(&mut self, op: &Op, fail_index: u32) {
-        // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
+        // compiler.rs parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
         let finish_refs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
@@ -7328,7 +7328,7 @@ impl<'a> Assembler386<'a> {
         // (`MOV_rr(ecx, eax)` inside the trampoline) so the value
         // survives the trampoline's `pop_all_regs([ECX, EDX])`.  The
         // regalloc forces `result_reg = MALLOC_NURSERY_RESULT = ECX`
-        // (regalloc.rs:105), so the value already lives in the right
+        // (regalloc.rs), so the value already lives in the right
         // register and no caller-side copy is needed.  If a future
         // regalloc change picks a different `result_reg`, copy it
         // from RCX (not RAX, which is now the caller's preserved

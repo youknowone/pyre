@@ -581,7 +581,7 @@ fn stamp_and_publish_label_targets(
         // there would re-run that work. Before the descr-strict dispatch every
         // such trace was `is_resumable_peeled` and never reached this branch; a
         // `jump_to_preamble` retrace (own LABEL, foreign closing JUMP) is not, so
-        // state the assumption the comment below already relies on.
+        // state the assumption the `is_last_label: true` publication relies on.
         let first_label_at_entry = ops
             .iter()
             .position(|op| op.opcode == majit_ir::OpCode::Label)
@@ -2831,7 +2831,7 @@ impl majit_backend::Backend for WasmBackend {
             Self::register_gc_table(token, table);
         }
 
-        // `runner.rs:2269` / `compiler.rs:15613` parity: the entry path reads
+        // `runner.rs` / `compiler.rs` parity: the entry path reads
         // this to size the live-value list it hands `execute_token`
         // (`jitdriver.rs extend_compiled_live_values` →
         // `warmstate.py:188 cell.loop_token`). Leaving it unset makes a trace

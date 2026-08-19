@@ -7,7 +7,7 @@
 //! as a second `impl` block on `crate::regalloc::RegAlloc<'a>`, so
 //! Rust's name resolution picks up the right arch flavour at link
 //! time (the `aarch64` module is `#[cfg(target_arch = "aarch64")]`
-//! gated at `lib.rs:33`).
+//! gated in `lib.rs`).
 
 use crate::aarch64::registers;
 use crate::regalloc::{RegAlloc, RegAllocOp};

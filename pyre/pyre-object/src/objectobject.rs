@@ -84,7 +84,7 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     // (`pyre-object::typeobject` GC type id 33) — user-defined types
     // are stable old-gen GC objects, so the pinned typeptr remains a live,
     // non-moving GC reference across the instance allocation. The
-    // `is_in_nursery` filter in the walker (`majit-gc/src/collector.rs:764`)
+    // `is_in_nursery` filter in the walker (`majit-gc/src/collector.rs`)
     // keeps the built-in static `PyType` case (e.g. `INT_TYPE`) untouched.
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_type);

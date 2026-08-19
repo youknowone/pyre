@@ -403,7 +403,7 @@ pub struct AssemblerARM64<'a> {
     pending_force_descr: Option<majit_ir::DescrRef>,
     /// Pre-wrapped `FailDescrCell` for the same pending guard.  Codegen
     /// bakes the cell's thin pointer into `JF_FORCE_DESCR_OFS` so that
-    /// `force_token_to_dead_frame` (cranelift/compiler.rs:2660) can
+    /// `force_token_to_dead_frame` (cranelift/compiler.rs) can
     /// recover the descr via `recover_fail_descr_cell` without the
     /// fat-pointer mismatch a bare `Arc<dyn Descr>` ptr would cause.
     /// The same cell is consumed by `append_guard_token_with_faillocs`
@@ -1585,7 +1585,7 @@ impl<'a> AssemblerARM64<'a> {
                 // must become visible first — otherwise the reader pairs the
                 // new code pointer with a stale 0 depth and bypasses the
                 // frame-capacity check (descr.rs set_dispatch_target ordering
-                // contract).  Dynasm ignores `label_block_id` (descr.rs:1236 —
+                // contract).  Dynasm ignores `label_block_id` (descr.rs —
                 // it bakes the LABEL address straight into `ll_loop_code`), so
                 // that companion is not published here.
                 let old = loop_descr.ll_loop_code();
@@ -2672,7 +2672,7 @@ impl<'a> AssemblerARM64<'a> {
             }
             // ── aarch64/opassembler.py:365 emit_op_gc_store ──
             // `value_loc, base_loc, ofs_loc, size_loc = arglocs`.
-            // regalloc.rs:3042 `consider_gc_store` (mirroring RPython
+            // regalloc.rs's `consider_gc_store` (mirroring RPython
             // aarch64/regalloc.py:520 prepare_op_gc_store) always emits a
             // 4-tuple `[Reg|Immed(value), Reg(base), Reg|Immed(ofs),
             // Immed(size)]`; value_loc may be Immed when the source is a
@@ -2728,7 +2728,7 @@ impl<'a> AssemblerARM64<'a> {
             }
             // ── aarch64/opassembler.py:396-412 _emit_op_gc_load_indexed ──
             // arglocs = [res_loc, base_loc, index_loc, imm(nsize), imm(ofs)]
-            // per `consider_gc_load_indexed` in regalloc.rs:2981-3014.
+            // per `consider_gc_load_indexed` in regalloc.rs.
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
                 if let (Some(Loc::Reg(res)), Some(Loc::Reg(base)), Some(Loc::Reg(index))) =
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
@@ -3902,7 +3902,7 @@ impl<'a> AssemblerARM64<'a> {
         // ResumeGuardDescr (`op.descr`).  See x86 counterpart for rationale:
         // routing the writes through the trait at codegen time lets readers
         // consume the canonical metainterp identity before
-        // `build_guard_metadata` (`compile.rs:232`) re-stamps.
+        // `build_guard_metadata` (`compile.rs`) re-stamps.
         if let Some(d) = op.getdescr()
             && (d.is_resume_guard() || d.is_resume_guard_copied())
             && let Some(fd) = d.as_fail_descr()
@@ -3990,7 +3990,7 @@ impl<'a> AssemblerARM64<'a> {
             .collect();
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
-        // resume_guard_descr.rs:166); `layout_for_fail_descr` reads it back
+        // resume_guard_descr.rs); `layout_for_fail_descr` reads it back
         // via `fd.source_op_index()` so no side-table is needed.
         // Recovery layouts are owned by the metainterp's
         // `StoredExitLayout.recovery_layout` (populated by
@@ -4661,10 +4661,10 @@ impl<'a> AssemblerARM64<'a> {
         if let Some(fd) = descr_arc.as_ref().and_then(|d| d.as_fail_descr()) {
             // op.descr is a ResumeGuardDescr carrying post-numbering
             // fail_arg_types installed by
-            // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404).
+            // store_final_boxes_in_guard (optimizeopt/mod.rs).
             // Prefer the descr for guards too; fall through to
             // op.fail_arg_types only for sharing-path guards
-            // (optimizeopt/mod.rs:3068-3088) where op.descr=None.
+            // (optimizeopt/mod.rs) where op.descr=None.
             let dt = fd.fail_arg_types();
             let expected_len = op.getfailargs().map(|fa| fa.len()).unwrap_or(0);
             if dt.len() == expected_len && !dt.is_empty() {
@@ -4832,7 +4832,7 @@ impl<'a> AssemblerARM64<'a> {
             }
             fresh
         };
-        // `force_token_to_dead_frame` (cranelift/compiler.rs:2660)
+        // `force_token_to_dead_frame` (cranelift/compiler.rs)
         // recovers `jf_force_descr` via `recover_fail_descr_cell`, which
         // requires a `FailDescrCell` thin pointer.  Bake the cell pointer
         // here (not the bare `Arc<dyn Descr>` fat-pointer data half) and
@@ -4859,7 +4859,7 @@ impl<'a> AssemblerARM64<'a> {
     /// FINISH: store result (if any), store descr ptr, return jf_ptr.
     #[allow(dead_code)]
     fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
-        // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
+        // compiler.rs parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
         let finish_refs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {

@@ -2139,7 +2139,7 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         // `get_standard_ll_exc_instance_by_class` has a prebuilt
         // instance for it.  Pyre doesn't have an LL-side StackOverflow
         // class — the stack-check slowpath raises a Python-level
-        // `RecursionError` directly (`eval.rs:2979 stack_check_slow
+        // `RecursionError` directly (`eval.rs stack_check_slow
         // path → pos_exception()`) — so we alias the RPython name to
         // pyre's `RecursionError` ExcKind: every consumer that looks
         // up the standard pointer receives the singleton instance
