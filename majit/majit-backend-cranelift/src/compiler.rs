@@ -19284,6 +19284,126 @@ mod tests {
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xD30F_0004);
     }
 
+    /// `demoted_failarg_slots` is trace-global while `loop_phi_keep` is per
+    /// LABEL, so a raw the first LABEL demoted can be a kept block param at a
+    /// later one. For such a raw the home, not the SSA value, is what a guard
+    /// below that LABEL reads, and a loader re-entry refreshes only the dense
+    /// carried slot the param arrives in — so the later LABEL's header has to
+    /// store the param into the home itself.
+    ///
+    /// The second LABEL here carries no back-jump, which is what makes
+    /// `compute_loop_phi_keep` skip it and keep every one of its positions
+    /// while the first LABEL still demotes. Giving it a back-jump of its own
+    /// instead un-demotes the first LABEL through the escape pass.
+    #[test]
+    fn demoted_nonref_header_updates_frame_home_after_bridge_jump() {
+        let mut backend = CraneliftBackend::new();
+        let start_descr = make_label_descr(1706);
+        let body_descr = make_label_descr(1707);
+        let carried = OpRef::int_op(2);
+        let more = OpRef::int_op(4);
+        let next = OpRef::int_op(5);
+        let exit_guard = mk_op(OpCode::GuardTrue, &[more], OpRef::NONE.raw());
+        exit_guard.setfailargs(smallvec::smallvec![
+            rb(carried),
+            rb(OpRef::input_arg_int(1)),
+        ]);
+        let bridge_guard = mk_op(OpCode::GuardFalse, &[OpRef::int_op(103)], OpRef::NONE.raw());
+        bridge_guard.setfailargs(smallvec::smallvec![rb(carried), rb(next)]);
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let root_ops = vec![
+            mk_op(OpCode::SameAsI, &[OpRef::input_arg_int(0)], carried.raw()),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried, OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                start_descr.clone(),
+            ),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)], 3),
+            mk_op_with_descr(
+                OpCode::Label,
+                &[carried, OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                body_descr.clone(),
+            ),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::input_arg_int(1), OpRef::int_op(102)],
+                more.raw(),
+            ),
+            exit_guard,
+            mk_op(
+                OpCode::IntSub,
+                &[OpRef::input_arg_int(1), OpRef::int_op(100)],
+                next.raw(),
+            ),
+            bridge_guard,
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[carried, next],
+                OpRef::NONE.raw(),
+                start_descr,
+            ),
+        ];
+
+        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        root_constants.insert(100, 1);
+        root_constants.insert(101, 2);
+        root_constants.insert(102, 0);
+        root_constants.insert(103, 1);
+        backend.set_constants(root_constants);
+
+        let token = JitCellToken::new(1706);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
+
+        let initial_carried = 7;
+        let counter = 2;
+        let failed =
+            backend.execute_token(&token, &[Value::Int(initial_carried), Value::Int(counter)]);
+        let guard_descr =
+            get_latest_descr_from_deadframe(&failed).expect("bridge guard should fail");
+
+        let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let bridge_increment = 100;
+        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        bridge_constants.insert(100, bridge_increment);
+        backend.set_constants(bridge_constants);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                2,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(2), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                body_descr,
+            ),
+        ];
+        backend
+            .compile_bridge(
+                guard_descr,
+                &bridge_inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
+            .unwrap();
+
+        backend.set_constants(indexmap::IndexMap::new());
+        let frame =
+            backend.execute_token(&token, &[Value::Int(initial_carried), Value::Int(counter)]);
+        // Each of the two bridge trips adds 100 before the counter reaches zero.
+        let expected = initial_carried + counter * bridge_increment;
+        assert_eq!(
+            backend.get_int_value(&frame, 0),
+            expected,
+            "the exit guard published the value the first LABEL seeded, not the one              the bridge carried into the second LABEL's loader"
+        );
+    }
+
     #[test]
     fn loop_phi_keeps_ref_escaping_via_kept_backedge_position() {
         // A deopt-only invariant ref that also flows through a *kept* back-edge
