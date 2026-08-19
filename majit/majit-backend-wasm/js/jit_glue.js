@@ -55,8 +55,8 @@ function jitCallTrampoline(framePtr, callAreaOfs = CALL_RESULT_OFS) {
 }
 
 export function jit_compile_wasm(bytesPtr, bytesLen) {
-  const trace = instantiateTrace(bytesPtr, bytesLen);
-  return registerTrace(trace);
+  const entries = instantiateTrace(bytesPtr, bytesLen);
+  return registerTrace(entries);
 }
 
 function instantiateTrace(bytesPtr, bytesLen) {
@@ -74,14 +74,22 @@ function instantiateTrace(bytesPtr, bytesLen) {
     const instance = new WebAssembly.Instance(module, {
       env: { memory: mainMemory, jit_call: jitCallTrampoline, jit_call_compact: jitCallTrampoline, __indirect_function_table: mainTable }
     });
-    return instance.exports.trace;
+    return traceEntries(instance);
   } catch (e) {
     // Retry without jit_call (for traces without CALL ops)
     const instance = new WebAssembly.Instance(module, {
       env: { memory: mainMemory }
     });
-    return instance.exports.trace;
+    return traceEntries(instance);
   }
+}
+
+// A resumable peeled loop exports a fixed-arity `trace_wide` beside the narrow
+// `trace` shim, and the backend publishes its table slot as `handle + 1`. Both
+// hosts must therefore install the pair adjacently or that published slot names
+// an unrelated trace.
+function traceEntries(instance) {
+  return { trace: instance.exports.trace, wide: instance.exports.trace_wide };
 }
 
 // Compile and instantiate a trace, then overwrite an existing shared-table
@@ -92,11 +100,17 @@ export function jit_replace_wasm(funcId, bytesPtr, bytesLen) {
     if (!funcTable[funcId]) {
       return 0;
     }
-    const trace = instantiateTrace(bytesPtr, bytesLen);
+    const { trace, wide } = instantiateTrace(bytesPtr, bytesLen);
     if (mainTable) {
       mainTable.set(funcId, trace);
+      if (wide) {
+        mainTable.set(funcId + 1, wide);
+      }
     }
     funcTable[funcId] = trace;
+    if (wide) {
+      funcTable[funcId + 1] = wide;
+    }
     return funcId;
   } catch (e) {
     console.error('[jit_replace_wasm] failed:', e);
@@ -108,15 +122,25 @@ export function jit_replace_wasm(funcId, bytesPtr, bytesLen) {
 // table slot as the id, mirroring the wasmtime host. The slot is both the
 // jit_execute_wasm handle and the index an in-module call_indirect targets.
 // Falls back to a private counter when no table is available.
-function registerTrace(traceFn) {
+function registerTrace(entries) {
+  const { trace, wide } = entries;
   let id;
   if (mainTable) {
-    id = mainTable.grow(1);
-    mainTable.set(id, traceFn);
+    id = mainTable.grow(wide ? 2 : 1);
+    mainTable.set(id, trace);
+    if (wide) {
+      mainTable.set(id + 1, wide);
+    }
   } else {
     id = nextFuncId++;
+    if (wide) {
+      nextFuncId++;
+    }
   }
-  funcTable[id] = traceFn;
+  funcTable[id] = trace;
+  if (wide) {
+    funcTable[id + 1] = wide;
+  }
   return id;
 }
 

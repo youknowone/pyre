@@ -2963,6 +2963,26 @@ fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
         (1 + majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY, 1),
         "trace_wide takes frame_ptr plus one word per fixed label parameter"
     );
+
+    // The shim reads from `FRAME_SLOT_BASE`, so its loads land in slots
+    // 1..=FROZEN_LABEL_PARAM_ARITY and a frame holding exactly that many slots
+    // is one short — its last load would run off the end.
+    let exact = codegen::FrameGeometry {
+        value_slots: majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY,
+        ..frame
+    };
+    assert!(
+        !codegen::has_label_param_entry(&inputargs, &ops, exact, None),
+        "a frame with FROZEN_LABEL_PARAM_ARITY slots must be rejected"
+    );
+    let one_more = codegen::FrameGeometry {
+        value_slots: majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY + 1,
+        ..frame
+    };
+    assert!(
+        codegen::has_label_param_entry(&inputargs, &ops, one_more, None),
+        "one slot past the arity is the smallest frame the shim can read"
+    );
 }
 
 #[test]

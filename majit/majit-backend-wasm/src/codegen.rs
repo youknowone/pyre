@@ -6488,7 +6488,11 @@ pub fn has_label_param_entry(
         .all(|arity| arity <= crate::FROZEN_LABEL_PARAM_ARITY);
     labels_fit
         && inputargs.len() <= crate::FROZEN_LABEL_PARAM_ARITY
-        && frame.value_slots >= crate::FROZEN_LABEL_PARAM_ARITY
+        // The shim loads from `FRAME_SLOT_BASE`, so its `FROZEN_LABEL_PARAM_ARITY`
+        // reads occupy slots 1..=FROZEN_LABEL_PARAM_ARITY — slot 0 is the
+        // dispatch key. A frame with exactly that many slots would let the last
+        // load run off the end.
+        && frame.value_slots >= crate::FROZEN_LABEL_PARAM_ARITY + 1
 }
 
 /// Per-label `(resume_safe, requires_own_frame)` metadata in ordinal order.
