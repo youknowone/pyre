@@ -4344,6 +4344,42 @@ fn build_gc() -> Box<MiniMarkGC> {
         weakref_descr.ptr_offsets,
     );
 
+    // rbuilder epic task #43: the StringBuilder box (`New{"stringbuilder"}`) is a
+    // bare (no `w_class`) GcStruct with exactly one traced edge — `extra_pieces`
+    // (offset 32) points at a chain of GC-managed STRINGPIECE nodes the grow path
+    // allocates via `malloc(STRINGPIECE)`, so the collector must trace it, exactly
+    // as `bigint_pair_tid` above traces its pair members. `current_buf` (offset 0)
+    // is a raw off-GC low-level string, so the tid also carries drop glue to free
+    // it on sweep. Append at the absolute tail so every established id above stays
+    // stable, then force its size descriptor so it registers into gc_cache
+    // RESOLVED (stamped with this tid) before the unresolved-struct walker below —
+    // which would otherwise hand the synthetic struct a destructor-less
+    // `with_gc_ptrs` tid and leak the buffer.
+    let stringbuilder_tid = gc.register_type(
+        TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<StringBuilderBox>(),
+            vec![std::mem::offset_of!(StringBuilderBox, extra_pieces)],
+        )
+        .with_destructor_fn(pyre_object::gc_storage::storage_box_destructor::<StringBuilderBox>),
+    );
+    pyre_object::rbuilder::set_stringbuilder_gc_type_id(stringbuilder_tid);
+    let _ = pyre_jit_trace::descr::stringbuilder_size_descr();
+    // rbuilder task #48: each `extra_pieces` chain node (`New{"stringpiece"}` from
+    // the grow path's `malloc(STRINGPIECE)`). Same bare-GcStruct shape as the
+    // builder: `prev_piece` (offset 8) is the one traced edge (`gc_ptr [8]`);
+    // `buf` (offset 0) is a raw off-GC low-level string the destructor frees.
+    // Appended immediately after the builder so established ids stay stable, then
+    // force its descr so it registers RESOLVED before the unresolved-struct walker.
+    let stringpiece_tid = gc.register_type(
+        TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<StringPieceBox>(),
+            vec![std::mem::offset_of!(StringPieceBox, prev_piece)],
+        )
+        .with_destructor_fn(pyre_object::gc_storage::storage_box_destructor::<StringPieceBox>),
+    );
+    pyre_object::rbuilder::set_stringpiece_gc_type_id(stringpiece_tid);
+    let _ = pyre_jit_trace::descr::stringpiece_size_descr();
+
     // `gc.py GcLLDescr_framework.init_size_descr` asks the
     // gctypelayout layoutbuilder for a collector type id after the translated
     // GC layouts are known. The baked descriptor pool is lazy in pyre, so
@@ -13288,6 +13324,101 @@ fn bh_lowlevel_string_len(string: i64) -> usize {
     unsafe { *((string as *const u8).add(LOWLEVEL_STRING_LEN_OFFSET) as *const usize) }
 }
 
+/// Free a low-level string allocated by [`bh_alloc_lowlevel_string`].
+///
+/// Reconstructs the exact `Layout` the allocation used from the capacity word
+/// stored at `LOWLEVEL_STRING_LEN_OFFSET` (the allocation stores its `length`
+/// argument there, and the StringBuilder passes the buffer *capacity* as that
+/// argument). `base_size`/`item_size` must match the allocation call.
+fn bh_free_lowlevel_string(string: i64, base_size: usize, item_size: usize) {
+    if string == 0 {
+        return;
+    }
+    let capacity = bh_lowlevel_string_len(string);
+    let total_size = base_size + capacity * item_size;
+    let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
+        .expect("low-level string layout");
+    unsafe { std::alloc::dealloc(string as *mut u8, layout) };
+}
+
+/// Runtime realization of the RPython `StringBuilder` GcStruct (rbuilder epic
+/// task #43). A bare (no `w_class`) but *headered* GcStruct carrying exactly one
+/// traced field:
+/// - `current_buf` (offset 0) points at a raw `std::alloc` low-level string
+///   ([`bh_alloc_lowlevel_string`]), off-GC and immobile; this drop glue frees
+///   it on sweep (the incminimark light-finalizer path runs it on nursery death
+///   too).
+/// - `extra_pieces` (offset 32) is a **GC edge**: the grow path allocates each
+///   chain node with `malloc(STRINGPIECE)` (a `New{"stringpiece"}` GC alloc), so
+///   the collector traces this field (via the tid's `gc_ptr_offsets = [32]`) and
+///   reclaims the STRINGPIECE nodes itself — each node's own tid destructor
+///   frees that node's buffer (task #48). This drop glue must **not** walk the
+///   chain (the nodes are GC-owned, not `Box`-owned).
+/// `#[repr(C)]` with five `i64` fields fixes the body layout the analyzer's
+/// `New{"stringbuilder"}` size descriptor mirrors: current_buf@0, current_pos@8,
+/// current_end@16, total_size@24, extra_pieces@32, size 40.
+// Allocated by `bh_new` (raw GC memory) and by the ctor runtime primitive
+// (task #48), never via a Rust literal; `current_pos`/`current_end`/`total_size`
+// are written by the ctor/append/grow primitives. The layout slots are
+// load-bearing now, so silence the not-yet-constructed / unread-field lints.
+#[allow(dead_code)]
+#[repr(C)]
+struct StringBuilderBox {
+    current_buf: i64,
+    current_pos: i64,
+    current_end: i64,
+    total_size: i64,
+    extra_pieces: i64,
+}
+
+impl Drop for StringBuilderBox {
+    fn drop(&mut self) {
+        // Free only the raw, off-GC current buffer. `extra_pieces` is a chain of
+        // GC-managed STRINGPIECE nodes: the collector reclaims each node once the
+        // builder is unreachable, and each node's own destructor frees its buffer
+        // (task #48). Walking it here would double-free GC-owned memory.
+        bh_free_lowlevel_string(self.current_buf, LOWLEVEL_STR_BASE_SIZE, 1);
+        self.current_buf = 0;
+    }
+}
+
+const _: () = assert!(
+    std::mem::size_of::<StringBuilderBox>() == 40,
+    "StringBuilderBox body must be 40 bytes to match the analyzer's stringbuilder layout",
+);
+
+/// One node of a [`StringBuilderBox`] `extra_pieces` chain (rbuilder task #48).
+/// RPython `rbuilder.py` STRINGPIECE `GcStruct("stringpiece", {buf, prev_piece})`:
+/// - `buf` (offset 0) is a full (raw, off-GC) low-level string handed off when
+///   the current buffer filled; this drop glue frees it on sweep.
+/// - `prev_piece` (offset 8) is a **GC edge** to the previous node (`0` at the
+///   chain end); the collector traces it (via the node tid's `gc_ptr_offsets =
+///   [8]`) and reclaims the previous node — this drop glue must NOT walk it.
+/// A bare (no `w_class`) headered GcStruct: `bh_new`/`malloc(STRINGPIECE)`
+/// allocates it; the item size for `buf` is the STR width (1).
+// Allocated by the grow runtime primitive (task #48), never via a Rust literal.
+#[allow(dead_code)]
+#[repr(C)]
+struct StringPieceBox {
+    buf: i64,
+    prev_piece: i64,
+}
+
+impl Drop for StringPieceBox {
+    fn drop(&mut self) {
+        // Free only this node's own raw buffer. `prev_piece` is a GC-managed
+        // node the collector reclaims (running its own destructor); walking it
+        // here would double-free GC-owned memory.
+        bh_free_lowlevel_string(self.buf, LOWLEVEL_STR_BASE_SIZE, 1);
+        self.buf = 0;
+    }
+}
+
+const _: () = assert!(
+    std::mem::size_of::<StringPieceBox>() == 16,
+    "StringPieceBox body must be 16 bytes to match the analyzer's stringpiece layout",
+);
+
 fn bh_lowlevel_chars_offset(item_size: usize) -> usize {
     if item_size == 1 {
         LOWLEVEL_STR_BASE_SIZE - 1
@@ -13360,6 +13491,395 @@ fn bh_slice_lowlevel_string(string: i64, start: i64, stop: i64, item_size: usize
         bh_write_lowlevel_char(result, index, char, item_size);
     }
     result
+}
+
+/// Native runtime realization of the RPython `StringBuilder` helper graphs
+/// (`rpython/rtyper/lltypesystem/rbuilder.py`) — rbuilder epic task #48b.
+///
+/// The `New{"stringbuilder"}`/`New{"stringpiece"}` + FieldRead/FieldWrite the
+/// analyzer drains manipulate the [`StringBuilderBox`]/[`StringPieceBox`] layouts
+/// registered in [`build_gc`]; these are the leaf primitives those graphs call
+/// (`mallocfn` / `copy_string_contents` / `ll_shrink_array` /
+/// `malloc(STRINGPIECE)`). Wiring the drained graphs' `Call`s to these is task
+/// #48c, so they are unreferenced from production for now.
+///
+/// String width only (`item_size == 1`) — the `STR` specialization the analyzer
+/// drains; the `UNICODE` builder is a future parallel set.
+///
+/// **B1 ownership discipline.** `current_buf`, every grow-allocated buffer, and
+/// every STRINGPIECE `buf` are raw `std::alloc` low-level strings owned by
+/// exactly one holder; that holder's drop glue frees the buffer. A *transfer*
+/// must therefore null the source's owning field so the source's drop becomes a
+/// no-op. This is the one place the port diverges from `rbuilder.py`, whose STR
+/// buffers are GC-managed and freely aliased — pyre frees manually, so it must
+/// never alias a caller-owned buffer into a holder it will later free.
+#[allow(dead_code)]
+mod rbuilder_runtime {
+    use super::{
+        LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_UNICODE_BASE_SIZE, StringBuilderBox, StringPieceBox,
+        bh_alloc_lowlevel_string, bh_free_lowlevel_string, bh_lowlevel_chars_offset,
+        bh_lowlevel_string_len, bh_write_lowlevel_char,
+    };
+
+    /// `StringBuilderRepr.basetp = STR` ⇒ one byte per char.
+    pub const STR_ITEM_SIZE: usize = 1;
+    /// `ll_new` clamps `init_size` into `[0, 1280]`.
+    const INIT_SIZE_MAX: i64 = 1280;
+
+    #[inline]
+    fn str_base_size(item_size: usize) -> usize {
+        if item_size == 1 {
+            LOWLEVEL_STR_BASE_SIZE
+        } else {
+            LOWLEVEL_UNICODE_BASE_SIZE
+        }
+    }
+
+    /// `rstr.copy_string_contents(src, dst, srcstart, dststart, length)`: copy
+    /// `count` chars from `src[src_start..]` into `dst[dst_start..]`. `src` and
+    /// `dst` are always distinct allocations on the builder paths.
+    fn copy_string_contents(
+        src: i64,
+        dst: i64,
+        src_start: usize,
+        dst_start: usize,
+        count: usize,
+        item_size: usize,
+    ) {
+        if src == 0 || dst == 0 || count == 0 {
+            return;
+        }
+        let chars_off = bh_lowlevel_chars_offset(item_size);
+        // SAFETY: the builder's size arithmetic guarantees both ranges fit; the
+        // two low-level strings are distinct allocations.
+        unsafe {
+            let s = (src as *const u8).add(chars_off + src_start * item_size);
+            let d = (dst as *mut u8).add(chars_off + dst_start * item_size);
+            std::ptr::copy_nonoverlapping(s, d, count * item_size);
+        }
+    }
+
+    /// `rgc.ll_shrink_array(buf, new_len)`: pyre's raw low-level strings have no
+    /// in-place shrink, so allocate a fresh `new_len` buffer, copy, free the old.
+    fn ll_shrink_array(buf: i64, new_len: usize, item_size: usize) -> i64 {
+        if buf == 0 {
+            return 0;
+        }
+        let base = str_base_size(item_size);
+        let new_buf = bh_alloc_lowlevel_string(new_len, base, item_size);
+        if new_buf == 0 {
+            return 0;
+        }
+        copy_string_contents(buf, new_buf, 0, 0, new_len, item_size);
+        bh_free_lowlevel_string(buf, base, item_size);
+        new_buf
+    }
+
+    #[inline]
+    fn alloc_builder(value: StringBuilderBox) -> i64 {
+        let tid = pyre_object::rbuilder::stringbuilder_gc_type_id();
+        pyre_object::gc_storage::gc_alloc_storage_box::<StringBuilderBox>(value, tid) as i64
+    }
+
+    #[inline]
+    fn alloc_piece(value: StringPieceBox) -> i64 {
+        let tid = pyre_object::rbuilder::stringpiece_gc_type_id();
+        pyre_object::gc_storage::gc_alloc_storage_box::<StringPieceBox>(value, tid) as i64
+    }
+
+    /// `StringBuilderRepr.ll_new(init_size)` (`rbuilder.py:445-455`).
+    pub fn ll_new(init_size: i64, item_size: usize) -> i64 {
+        // `intmask(min(r_uint(init_size), r_uint(1280)))` — negatives (huge as
+        // unsigned) and anything over 1280 clamp to 1280.
+        let init = if !(0..=INIT_SIZE_MAX).contains(&init_size) {
+            INIT_SIZE_MAX as usize
+        } else {
+            init_size as usize
+        };
+        let base = str_base_size(item_size);
+        let current_buf = bh_alloc_lowlevel_string(init, base, item_size);
+        if current_buf == 0 {
+            return 0;
+        }
+        alloc_builder(StringBuilderBox {
+            current_buf,
+            current_pos: 0,
+            current_end: init as i64,
+            total_size: init as i64,
+            extra_pieces: 0,
+        })
+    }
+
+    /// `rbuilder.py:96-115 ll_grow_by`: round the growth up to a multiple of 64,
+    /// chain the filled `current_buf` into a fresh STRINGPIECE, install a new
+    /// empty `current_buf`. (Overflow → MemoryError is deferred; builder sizes
+    /// here are small.)
+    fn ll_grow_by(builder: i64, needed: i64, item_size: usize) {
+        // SAFETY: `builder` is a live StringBuilderBox body pointer.
+        let (old_buf, old_extra, total_size) = {
+            let b = unsafe { &*(builder as *const StringBuilderBox) };
+            (b.current_buf, b.extra_pieces, b.total_size)
+        };
+        let needed = ((needed + total_size + 63) & !63) as usize;
+        let new_total = total_size + needed as i64;
+        let base = str_base_size(item_size);
+        let new_string = bh_alloc_lowlevel_string(needed, base, item_size);
+        let old_piece = alloc_piece(StringPieceBox {
+            buf: old_buf,
+            prev_piece: old_extra,
+        });
+        let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
+        b.current_buf = new_string;
+        b.current_pos = 0;
+        b.current_end = needed as i64;
+        b.total_size = new_total;
+        b.extra_pieces = old_piece;
+    }
+
+    /// `rbuilder.py:117-150 ll_grow_and_append`: split the append across the
+    /// current buffer's remaining room and a freshly grown buffer.
+    ///
+    /// The upstream `size > 1280` single-big-string fast path *aliases* `ll_str`
+    /// into the piece chain (no copy); pyre's manual-free model would then free a
+    /// caller-owned buffer on the builder's death, so this port always copies —
+    /// the one B1 deviation from `rbuilder.py`.
+    fn ll_grow_and_append(builder: i64, ll_str: i64, start: i64, size: i64, item_size: usize) {
+        let (part1, cur_pos, cur_buf) = {
+            let b = unsafe { &*(builder as *const StringBuilderBox) };
+            (b.current_end - b.current_pos, b.current_pos, b.current_buf)
+        };
+        // First, the part that still fits in the current piece.
+        copy_string_contents(
+            ll_str,
+            cur_buf,
+            start as usize,
+            cur_pos as usize,
+            part1 as usize,
+            item_size,
+        );
+        let start = start + part1;
+        let size = size - part1;
+        // Allocate the new piece, then copy the remainder into the fresh buffer.
+        ll_grow_by(builder, size, item_size);
+        let new_buf = {
+            let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
+            b.current_pos = size;
+            b.current_buf
+        };
+        copy_string_contents(ll_str, new_buf, start as usize, 0, size as usize, item_size);
+    }
+
+    /// `rbuilder.py:80-89 _ll_append`.
+    pub fn ll_append(builder: i64, ll_str: i64, start: i64, size: i64, item_size: usize) {
+        let (pos, end, cur_buf) = {
+            let b = unsafe { &*(builder as *const StringBuilderBox) };
+            (b.current_pos, b.current_end, b.current_buf)
+        };
+        if (end - pos) < size {
+            ll_grow_and_append(builder, ll_str, start, size, item_size);
+        } else {
+            let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
+            b.current_pos = pos + size;
+            copy_string_contents(
+                ll_str,
+                cur_buf,
+                start as usize,
+                pos as usize,
+                size as usize,
+                item_size,
+            );
+        }
+    }
+
+    /// `rbuilder.py:178-184 ll_append_char`.
+    pub fn ll_append_char(builder: i64, char: i64, item_size: usize) {
+        let full = {
+            let b = unsafe { &*(builder as *const StringBuilderBox) };
+            b.current_pos == b.current_end
+        };
+        if full {
+            ll_grow_by(builder, 1, item_size);
+        }
+        let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
+        let pos = b.current_pos;
+        b.current_pos = pos + 1;
+        bh_write_lowlevel_char(b.current_buf, pos as usize, char, item_size);
+    }
+
+    /// `rbuilder.py:346-350 ll_getlength`.
+    pub fn ll_getlength(builder: i64) -> i64 {
+        let b = unsafe { &*(builder as *const StringBuilderBox) };
+        b.total_size - (b.current_end - b.current_pos)
+    }
+
+    /// `rbuilder.py:365-372 ll_shrink_final`.
+    fn ll_shrink_final(builder: i64, item_size: usize) {
+        let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
+        let final_size = b.current_pos;
+        // `ll_shrink_array` frees the old `current_buf` and returns a fresh one.
+        b.current_buf = ll_shrink_array(b.current_buf, final_size as usize, item_size);
+        b.current_end = final_size;
+        b.total_size = final_size;
+    }
+
+    /// `rbuilder.py:374-412 ll_fold_pieces`: concatenate `current_buf` and the
+    /// `extra_pieces` chain (newest-first ⇒ filled back-to-front) into one buffer.
+    ///
+    /// B1 reclamation: nulling `extra_pieces` makes the detached STRINGPIECE
+    /// nodes unreachable, so the collector reclaims them and each node's drop glue
+    /// frees its own `buf` — this must NOT free a piece's buf. A buffer this
+    /// *transfers* into `current_buf` (the single-big-piece fast path) is removed
+    /// from its node first (null the node's `buf`) so the node's drop glue does
+    /// not double-free it. The discarded empty `current_buf` (general path) and
+    /// the folded-away old `current_buf` are builder-owned raw memory with no
+    /// node, so they are freed here.
+    fn ll_fold_pieces(builder: i64, item_size: usize) {
+        let final_size = ll_getlength(builder);
+        let (extra, current_pos, current_buf) = {
+            let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
+            let e = b.extra_pieces;
+            b.extra_pieces = 0;
+            (e, b.current_pos, b.current_buf)
+        };
+        // Fast path: an empty current buffer and exactly one piece — adopt the
+        // piece's buffer directly, discarding the empty allocated current_buf.
+        {
+            let extra_box = unsafe { &mut *(extra as *mut StringPieceBox) };
+            if current_pos == 0 && extra_box.prev_piece == 0 {
+                let piece = extra_box.buf;
+                // Transfer ownership: null the node's buf so its drop is a no-op.
+                extra_box.buf = 0;
+                bh_free_lowlevel_string(current_buf, str_base_size(item_size), item_size);
+                let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
+                b.total_size = final_size;
+                b.current_buf = piece;
+                b.current_pos = final_size;
+                b.current_end = final_size;
+                return;
+            }
+        }
+        // General path: allocate the result and copy every piece back-to-front.
+        let base = str_base_size(item_size);
+        let result = bh_alloc_lowlevel_string(final_size as usize, base, item_size);
+        {
+            let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
+            b.total_size = final_size;
+            b.current_buf = result;
+            b.current_pos = final_size;
+            b.current_end = final_size;
+        }
+        let mut piece = current_buf;
+        let mut piece_lgt = current_pos;
+        let mut extra = extra;
+        let mut dst = final_size;
+        loop {
+            dst -= piece_lgt;
+            copy_string_contents(piece, result, 0, dst as usize, piece_lgt as usize, item_size);
+            if extra == 0 {
+                break;
+            }
+            let eb = unsafe { &*(extra as *const StringPieceBox) };
+            piece = eb.buf;
+            piece_lgt = bh_lowlevel_string_len(piece) as i64;
+            extra = eb.prev_piece;
+        }
+        // The first `piece` was the old `current_buf` — builder-owned raw memory
+        // with no STRINGPIECE node — so free it. Every later `piece` belongs to a
+        // node the collector reclaims (its drop glue frees the buf).
+        bh_free_lowlevel_string(current_buf, base, item_size);
+    }
+
+    /// `rbuilder.py:355-363 ll_build`: consolidate to a single buffer and return
+    /// it. The builder keeps owning the returned `current_buf` (its drop glue
+    /// frees it) — the caller must copy or take ownership before the builder dies
+    /// (task #48c/#49 handoff).
+    pub fn ll_build(builder: i64, item_size: usize) -> i64 {
+        let (extra_pieces, current_pos, total_size) = {
+            let b = unsafe { &*(builder as *const StringBuilderBox) };
+            (b.extra_pieces, b.current_pos, b.total_size)
+        };
+        if extra_pieces != 0 {
+            ll_fold_pieces(builder, item_size);
+        } else if current_pos != total_size {
+            ll_shrink_final(builder, item_size);
+        }
+        let b = unsafe { &*(builder as *const StringBuilderBox) };
+        b.current_buf
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::bh_read_lowlevel_string;
+        use super::*;
+
+        fn make_str(bytes: &[u8]) -> i64 {
+            let s = bh_alloc_lowlevel_string(bytes.len(), LOWLEVEL_STR_BASE_SIZE, STR_ITEM_SIZE);
+            for (i, &b) in bytes.iter().enumerate() {
+                bh_write_lowlevel_char(s, i, b as i64, STR_ITEM_SIZE);
+            }
+            s
+        }
+
+        fn read_str(s: i64) -> Vec<u8> {
+            bh_read_lowlevel_string(s, STR_ITEM_SIZE)
+                .into_iter()
+                .map(|c| c as u8)
+                .collect()
+        }
+
+        // These tests exercise the append/grow/build LOGIC + buffer arithmetic
+        // over the real low-level-string primitives. The GC is not initialized in
+        // a unit test, so `gc_alloc_storage_box` falls back to `malloc_raw` (no
+        // sweep destructor) — GC tracing/reclamation of the builder + chain is
+        // validated by the end-to-end fixture (task #50). STRINGPIECE nodes the
+        // fold detaches therefore leak here; that is expected without a collector.
+
+        #[test]
+        fn ll_build_single_buffer_shrinks_and_roundtrips() {
+            let item = STR_ITEM_SIZE;
+            let builder = ll_new(100, item);
+            let hello = make_str(b"hello");
+            ll_append(builder, hello, 0, 5, item);
+            assert_eq!(ll_getlength(builder), 5);
+            // current_pos (5) != total_size (100) ⇒ ll_shrink_final.
+            let result = ll_build(builder, item);
+            assert_eq!(read_str(result), b"hello");
+            assert_eq!(ll_getlength(builder), 5);
+        }
+
+        #[test]
+        fn ll_build_across_grow_folds_pieces_in_order() {
+            let item = STR_ITEM_SIZE;
+            // init 4 forces a grow when appending 10 chars.
+            let builder = ll_new(4, item);
+            let s = make_str(b"abcdefghij");
+            ll_append(builder, s, 0, 10, item);
+            // Must have chained a piece.
+            let extra = {
+                let b = unsafe { &*(builder as *const StringBuilderBox) };
+                b.extra_pieces
+            };
+            assert_ne!(extra, 0, "append across init size must chain a piece");
+            ll_append_char(builder, b'!' as i64, item);
+            assert_eq!(ll_getlength(builder), 11);
+            // extra_pieces present ⇒ ll_fold_pieces.
+            let result = ll_build(builder, item);
+            assert_eq!(read_str(result), b"abcdefghij!");
+            assert_eq!(ll_getlength(builder), 11);
+        }
+
+        #[test]
+        fn ll_append_char_grows_when_full() {
+            let item = STR_ITEM_SIZE;
+            let builder = ll_new(2, item);
+            for &c in b"xyz" {
+                ll_append_char(builder, c as i64, item);
+            }
+            assert_eq!(ll_getlength(builder), 3);
+            let result = ll_build(builder, item);
+            assert_eq!(read_str(result), b"xyz");
+        }
+    }
 }
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {

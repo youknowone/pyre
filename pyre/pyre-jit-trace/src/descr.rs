@@ -901,6 +901,135 @@ fn build_object_descr_group_with_extra_gc_edges(
     }
 }
 
+/// Build + publish a SizeDescr group for a **bare** low-level `GcStruct` — a
+/// headered, movable GC object that is NOT a `PyObject` (no `ob_header` /
+/// `w_class`), unlike [`build_object_descr_group_with_def_path`]. Used by
+/// `New{owner}` for synthetic rtyper structs such as the rbuilder
+/// `StringBuilder`. No `W_CLASS` GC edge is added and no field is flagged the
+/// class word; `is_gc_managed = true` + `headerless = false` keep it forwardable
+/// under a tid the caller assigned. Any `Type::Ref` field enters `gc_fielddescrs`
+/// (via `with_all_fielddescrs`' `is_pointer_field` filter) as a traced edge; a
+/// pure-scalar struct therefore yields an empty `gc_fielddescrs` (a GC leaf).
+/// Published under `LLType::Struct(path_hash(simple_name))` so the analyzer's
+/// `New{simple_name}` resolves it.
+fn build_bare_gcstruct_descr_group(
+    obj_size: usize,
+    type_id: u32,
+    fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
+    simple_name: &str,
+) -> PyreObjectDescrGroup {
+    let cache_key = majit_ir::descr::path_hash(simple_name);
+    let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = fields
+        .iter()
+        .enumerate()
+        .map(
+            |(
+                index_in_parent,
+                &(field_key, offset, field_size, field_type, signed, immutable, quasi_immutable),
+            )| majit_ir::descr::SimpleFieldDescrSpec {
+                index: stable_field_index(offset, field_size, field_type, signed),
+                field_key: field_key.to_string(),
+                name: format!("{simple_name}.{field_key}"),
+                offset,
+                field_size,
+                field_type,
+                is_immutable: immutable,
+                is_quasi_immutable: quasi_immutable,
+                flag: runtime_array_flag(field_type, signed),
+                virtualizable: false,
+                // A bare GcStruct has no class word.
+                is_class_word: false,
+                index_in_parent,
+            },
+        )
+        .collect();
+    let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+        SIZE_DESCR_TAG | (obj_size as u32 & 0x0FFF_FFFF),
+        obj_size,
+        type_id,
+        cache_key,
+        0,     // vtable: a bare GcStruct is not an object
+        true,  // is_gc_managed: headered + forwardable
+        false, // headerless: carries a GcHeader tid word
+        &specs,
+        // No edge beyond the positional fields: `with_all_fielddescrs` already
+        // puts every `Type::Ref` spec (e.g. `extra_pieces`) into gc_fielddescrs.
+        &[],
+    );
+    let field_descrs = group.field_descrs;
+    let size_descr = group.size_descr;
+    if !simple_name.is_empty() {
+        let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(simple_name));
+        majit_ir::descr_registry::register_keyed_size(key, size_descr.clone() as majit_ir::DescrRef);
+    }
+    PyreObjectDescrGroup {
+        size_descr,
+        field_descrs,
+    }
+}
+
+/// Upstream `rpython/rtyper/lltypesystem/rbuilder.py` STRINGBUILDER:
+///   `GcStruct("stringbuilder", ("current_buf", STRPTR), ("current_pos", Signed),
+///     ("current_end", Signed), ("total_size", Signed), ("extra_pieces", STRINGPIECEPTR))`
+/// A bare GcStruct (not a PyObject). `current_buf` is a raw off-GC low-level
+/// string pointer modeled as scalar `Int` so it stays out of `gc_fielddescrs`
+/// (the box tid's drop glue reclaims it — `pyre-jit::eval` `StringBuilderBox`).
+/// `extra_pieces` is a `Ref`: the grow path allocates each STRINGPIECE chain node
+/// with `malloc(STRINGPIECE)` (a GC alloc), so it must be a traced edge — the
+/// `Ref` flag puts it into `gc_fielddescrs`, and the runtime tid's
+/// `gc_ptr_offsets = [32]` mirrors that so the collector reclaims the chain. The
+/// 40-byte body must match `size_of::<StringBuilderBox>()`.
+static STRINGBUILDER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_bare_gcstruct_descr_group(
+        40,
+        pyre_object::rbuilder::stringbuilder_gc_type_id(),
+        &[
+            ("current_buf", 0, 8, Type::Int, true, false, false),
+            ("current_pos", 8, 8, Type::Int, true, false, false),
+            ("current_end", 16, 8, Type::Int, true, false, false),
+            ("total_size", 24, 8, Type::Int, true, false, false),
+            ("extra_pieces", 32, 8, Type::Ref, false, false, false),
+        ],
+        "stringbuilder",
+    )
+});
+
+/// Force + return the `StringBuilder` bare-GcStruct size descriptor, keyed at
+/// `path_hash("stringbuilder")` so `New{"stringbuilder"}` resolves it. Forced by
+/// `pyre-jit::eval build_gc` right after the box tid is published, so it lands in
+/// gc_cache RESOLVED before the unresolved-struct walker.
+pub fn stringbuilder_size_descr() -> DescrRef {
+    STRINGBUILDER_DESCR_GROUP.size_descr.clone()
+}
+
+/// Upstream `rpython/rtyper/lltypesystem/rbuilder.py` STRINGPIECE:
+///   `GcStruct("stringpiece", ("buf", STRPTR), ("prev_piece", Ptr(STRINGPIECE)))`
+/// A bare GcStruct chain node the builder's grow path allocates
+/// (`malloc(STRINGPIECE)` = `New{"stringpiece"}`) when `current_buf` fills.
+/// `buf` (offset 0) is a raw off-GC low-level string modeled as scalar `Int`
+/// (drop glue frees it — `pyre-jit::eval` `StringPieceBox`). `prev_piece`
+/// (offset 8) is a `Ref` edge to the previous node, so it is traced
+/// (`gc_fielddescrs = [8]`, tid `gc_ptr_offsets = [8]`). 16-byte body.
+static STRINGPIECE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_bare_gcstruct_descr_group(
+        16,
+        pyre_object::rbuilder::stringpiece_gc_type_id(),
+        &[
+            ("buf", 0, 8, Type::Int, true, false, false),
+            ("prev_piece", 8, 8, Type::Ref, false, false, false),
+        ],
+        "stringpiece",
+    )
+});
+
+/// Force + return the `StringPiece` bare-GcStruct size descriptor, keyed at
+/// `path_hash("stringpiece")` so `New{"stringpiece"}` (the grow path's
+/// `malloc(STRINGPIECE)`) resolves it. Forced by `pyre-jit::eval build_gc` right
+/// after the node tid is published, before the unresolved-struct walker.
+pub fn stringpiece_size_descr() -> DescrRef {
+    STRINGPIECE_DESCR_GROUP.size_descr.clone()
+}
+
 static W_INT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<W_IntObject>(),
@@ -5860,6 +5989,115 @@ mod tests {
             .map(|field| field.offset())
             .collect();
         assert!(list_gc_offsets.contains(&std::mem::offset_of!(W_ListObject, w_slots)));
+    }
+
+    #[test]
+    fn stringbuilder_bare_gcstruct_descr_reconciles_at_path_hash() {
+        // rbuilder epic task #43. Publish a distinctive tid the way `build_gc`
+        // would (a small dynamic id, NOT the truncated `cache_key as u32`
+        // placeholder), then force the group. A resolved tid keeps the
+        // unresolved-struct walker from re-stamping a destructor-less tid.
+        let fake_tid = 0x00AB_CDEF_u32;
+        pyre_object::rbuilder::set_stringbuilder_gc_type_id(fake_tid);
+
+        let size = stringbuilder_size_descr();
+        let sd = size.as_size_descr().expect("stringbuilder is a SizeDescr");
+
+        // Body layout mirrors `size_of::<StringBuilderBox>()` and the analyzer's
+        // layer-2a structural layout (current_buf@0 .. extra_pieces@32).
+        assert_eq!(sd.size(), 40, "stringbuilder body must be 40 bytes");
+        // Headered (forwardable across a minor GC), GC-managed — NOT a raw
+        // headerless struct, which could not survive a collection while live.
+        assert!(!sd.headerless(), "stringbuilder must be a headered GcStruct");
+        assert!(sd.is_gc_managed(), "stringbuilder is GC-managed");
+        // `current_buf` (offset 0) is a raw off-GC low-level string modeled as
+        // scalar `Int`, so it is NOT traced — the box tid's drop glue
+        // (`StringBuilderBox::drop`) reclaims it. `extra_pieces` (offset 32) is a
+        // `Ref` edge to a GC-managed STRINGPIECE chain, so exactly it is traced.
+        let traced: Vec<usize> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+        assert_eq!(
+            traced,
+            vec![32],
+            "stringbuilder must trace only extra_pieces@32; got offsets {traced:?}",
+        );
+        assert_eq!(
+            sd.type_id(),
+            fake_tid,
+            "descr must carry the published box tid",
+        );
+        assert_eq!(
+            sd.cache_key(),
+            majit_ir::descr::path_hash("stringbuilder"),
+            "keyed at path_hash(\"stringbuilder\") for New{{\"stringbuilder\"}}",
+        );
+
+        // Reconciliation: `New{"stringbuilder"}` resolves via
+        // `_cache_size[LLType::Struct(path_hash("stringbuilder"))]`.
+        let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("stringbuilder"));
+        let resolved = majit_ir::descr::gc_cache()
+            .lock()
+            .unwrap()
+            ._cache_size
+            .get(&key)
+            .cloned()
+            .expect("stringbuilder descr registered under its path_hash key");
+        let resolved = resolved
+            .as_size_descr()
+            .expect("resolved stringbuilder entry is a SizeDescr");
+        assert_eq!(resolved.size(), 40);
+        assert_eq!(resolved.type_id(), fake_tid);
+        let resolved_traced: Vec<usize> =
+            resolved.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+        assert_eq!(resolved_traced, vec![32]);
+    }
+
+    #[test]
+    fn stringpiece_bare_gcstruct_descr_reconciles_at_path_hash() {
+        // rbuilder epic task #48. The `extra_pieces` chain node, registered the
+        // same way as the builder: a headered bare GcStruct resolved via
+        // `New{"stringpiece"}` (the grow path's `malloc(STRINGPIECE)`).
+        let fake_tid = 0x00BE_EF01_u32;
+        pyre_object::rbuilder::set_stringpiece_gc_type_id(fake_tid);
+
+        let size = stringpiece_size_descr();
+        let sd = size.as_size_descr().expect("stringpiece is a SizeDescr");
+
+        // Body layout mirrors `size_of::<StringPieceBox>()`: buf@0, prev_piece@8.
+        assert_eq!(sd.size(), 16, "stringpiece body must be 16 bytes");
+        assert!(!sd.headerless(), "stringpiece must be a headered GcStruct");
+        assert!(sd.is_gc_managed(), "stringpiece is GC-managed");
+        // `buf` (offset 0) is a raw off-GC low-level string modeled as scalar
+        // `Int`, so it is NOT traced — the node tid's drop glue frees it.
+        // `prev_piece` (offset 8) is a `Ref` edge to the previous node, traced.
+        let traced: Vec<usize> = sd.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+        assert_eq!(
+            traced,
+            vec![8],
+            "stringpiece must trace only prev_piece@8; got offsets {traced:?}",
+        );
+        assert_eq!(sd.type_id(), fake_tid, "descr must carry the published node tid");
+        assert_eq!(
+            sd.cache_key(),
+            majit_ir::descr::path_hash("stringpiece"),
+            "keyed at path_hash(\"stringpiece\") for New{{\"stringpiece\"}}",
+        );
+
+        let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("stringpiece"));
+        let resolved = majit_ir::descr::gc_cache()
+            .lock()
+            .unwrap()
+            ._cache_size
+            .get(&key)
+            .cloned()
+            .expect("stringpiece descr registered under its path_hash key");
+        let resolved = resolved
+            .as_size_descr()
+            .expect("resolved stringpiece entry is a SizeDescr");
+        assert_eq!(resolved.size(), 16);
+        assert_eq!(resolved.type_id(), fake_tid);
+        let resolved_traced: Vec<usize> =
+            resolved.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+        assert_eq!(resolved_traced, vec![8]);
     }
 
     #[test]
