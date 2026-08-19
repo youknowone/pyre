@@ -207,23 +207,39 @@ WIN_TIMER_QUANTUM_S = 1.0 / 64
 STARTUP_SAMPLES = 5
 EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # `exec` is `bench - startup`, and startup is a measured median rather than a
-# constant.  Between runs of the same job on the same platform, pypy readings
-# moved 0.013s -> 0.031s and 0.019s -> 0.029s, dynasm moved 0.088s -> 0.158s,
-# and cranelift moved 0.084s -> 0.144s (while cpython moved 0.022s -> 0.023s).
-# As a fraction of the larger reading in each pair that is 34%, 58%, 44% and
-# 42%.  Whatever the startup estimate is off by lands whole in `exec`, so the
-# residual error of a startup-subtracted time scales with the startup, not
-# with the timer quantum -- for pypy it is 2-6x EXEC_TIME_FLOOR_S and for the
-# backends more than 10x.  Half the measured startup sits in the middle of the
-# observed range.
-# Consequently the effective ceiling becomes
-# `limit * (1 + STARTUP_DRIFT_FRACTION * startup / exec_baseline)`: a fixture
-# whose baseline is real work is barely affected, while one whose baseline is
-# the same size as its own startup gets several times the slack -- which is
-# what its measurement can actually support.
-# The allowance applies only to the recorded-ratio gates; the wasm/dynasm gate
-# opts out at its call site.
-STARTUP_DRIFT_FRACTION = 0.5
+# constant, so whatever the estimate is off by lands whole in `exec`.  That
+# error is real, but NO allowance is granted for it, and a standing allowance
+# was tried and removed.  It read `0.5 * startup`, added to the baseline on
+# every recorded ceiling and to the measured side on every floor.
+#
+# It was withdrawn because its evidence did not survive being checked against
+# the 234 job logs carrying a startup line across 125 CI runs.  Consecutive
+# same-platform movement |delta|/max has median 0.125 and p90 0.45, putting 0.5
+# near p95 rather than mid-range; on ubuntu and macos only 6 of 432 pairs reach
+# it (ubuntu dynasm median 0.07, macos dynasm 0.14).  What does reach it is
+# windows, where every reading is an exact multiple of WIN_TIMER_QUANTUM_S --
+# cpython reads only 0.000s or 0.016s, so its pairs move by a full 1.0 as pure
+# quantization, which `_compare_buffer` already pays for separately there.  The
+# four pairs the number was fitted on turned out to be two macos lines from
+# different branches four hours apart, with ten macos runs in between reading
+# 0.130 0.077 0.069 0.076 0.072 0.076 0.118 0.092 0.079 0.106 for dynasm: they
+# bracket the range rather than measuring an adjacent step.
+#
+# It was also the wrong shape.  It multiplied the READING, so it grew where the
+# startup was largest rather than where it was least certain, and vanished
+# exactly where the clock is coarsest -- windows cpython measured 0.000s in 17
+# of 56 runs, yielding no allowance at all.  Widening the floor was worse than
+# widening the ceiling: the floor is what reports a fixture that got FASTER
+# than its recorded ceiling, so an allowance there dampens the signal a
+# performance change is supposed to produce.  And it was the only gate
+# adjustment the comparison table could not show, because `_ratio` never
+# applied it.
+#
+# What replaces it is not a threshold.  A failing gate reports how far the
+# startup estimate would have to be wrong to erase the failure, in units of the
+# startup it subtracted (`_gate_fail_detail`), so a red carries its own
+# measurement context and a small one can be told from a real regression
+# without a constant deciding in advance.
 # A floor failure is only trustworthy when the baseline clears the execution
 # floor enough for small relative error: execution time is the difference
 # between two independently measured values.
@@ -2605,11 +2621,15 @@ class Check:
             pyre_times.append(elapsed)
         return statistics.median(pyre_times), statistics.median(baseline_times)
 
-    def _startup_drift(self, key):
-        """Run-to-run error of the startup `_exec_time` subtracted for *key*."""
+    def _subtracted_startup(self, key):
+        """The startup `_exec_time` actually subtracted for *key*.
+
+        The unit a gate failure's margin is reported in: nothing is subtracted
+        under --no-startup-subtract, so there is no error to report against.
+        """
         if self.args.no_startup_subtract:
             return 0.0
-        return STARTUP_DRIFT_FRACTION * self.startup.get(key, 0.0)
+        return self.startup.get(key, 0.0)
 
     def _baseline_exec_time_clamped(self, baseline, baseline_time):
         """Whether startup subtraction pinned a baseline to its floor."""
@@ -2635,16 +2655,12 @@ class Check:
             and EXEC_TIME_FLOOR_S < float(exec_b) < FLOOR_GATE_MIN_BASELINE_S
         )
 
-    def _performance_gate_passed(
-        self, backend, script, timeout, elapsed, limit, baseline_time,
-        baseline_cmd, expected_output, baseline_key, minimum=None,
-        *, allow_startup_drift=True,
-    ):
-        """Check one performance ratio, retrying a failure by median.
+    @staticmethod
+    def _compare_buffer(limit):
+        """Clock granularity the comparison has to absorb, at this *limit*.
 
-        The pass/fail decision compares execution-only (startup-subtracted)
-        times; the returned elapsed/baseline stay raw for reporting. The
-        returned bound is ``ceiling`` or ``floor`` when the gate fails.
+        Shared with `_gate_fail_detail`, which reports a failure's margin and
+        so has to reconstruct the same bound the gate applied.
         """
         # Each execution-only value is a difference between two independently
         # measured quantities (bench - empty-program startup).  On Windows each
@@ -2668,18 +2684,26 @@ class Check:
         # ~2.3s exec, a 0.06s baseline wobbling +-0.004s across the 36x line.
         #
         # That term stays: it is the granularity of the clock, and it is what a
-        # baseline sitting at the floor is worth.  It is not the whole error.
-        # An exec time also carries whatever its startup estimate was off by,
-        # which is a separate quantity of a different size -- see
-        # STARTUP_DRIFT_FRACTION, applied per side below rather than folded in
-        # here, because the two bounds are distorted by opposite sides.
-        compare_buffer = BENCH_COMPARE_BUFFER_S
+        # baseline sitting at the floor is worth.  It is deliberately the ONLY
+        # term -- an exec time also carries whatever its startup estimate was
+        # off by, a separate quantity of a different size, and no allowance is
+        # granted for it.  See the STARTUP_SAMPLES block for what was tried.
+        buf = BENCH_COMPARE_BUFFER_S
         if sys.platform == "win32":
-            compare_buffer += 2 * WIN_TIMER_QUANTUM_S * (1 + limit)
-        else:
-            compare_buffer += limit * EXEC_TIME_FLOOR_S
+            return buf + 2 * WIN_TIMER_QUANTUM_S * (1 + limit)
+        return buf + limit * EXEC_TIME_FLOOR_S
 
-        drift = self._startup_drift if allow_startup_drift else (lambda _key: 0.0)
+    def _performance_gate_passed(
+        self, backend, script, timeout, elapsed, limit, baseline_time,
+        baseline_cmd, expected_output, baseline_key, minimum=None,
+    ):
+        """Check one performance ratio, retrying a failure by median.
+
+        The pass/fail decision compares execution-only (startup-subtracted)
+        times; the returned elapsed/baseline stay raw for reporting. The
+        returned bound is ``ceiling`` or ``floor`` when the gate fails.
+        """
+        compare_buffer = self._compare_buffer(limit)
 
         def failed_bound(measured, baseline_value):
             exec_measured = self._exec_time(backend, measured)
@@ -2715,33 +2739,25 @@ class Check:
             # wants a ratio gate has to give pypy enough work to measure.
             if self._baseline_exec_time_clamped(baseline_key, baseline_value):
                 return None
-            # Each bound is distorted by one side only, so each gets the
-            # allowance on that side. A startup estimate that came out high
-            # under-states every exec derived from it: for the ceiling that
-            # shrinks the DENOMINATOR and inflates the ratio, so the allowance
-            # goes to the baseline; for the floor it shrinks the NUMERATOR and
-            # the fixture reads as having reached parity, so the allowance goes
-            # to the measured side. The opposite side of each bound is left
-            # alone -- an under-stated numerator only makes the ceiling pass,
-            # and a gate is not made honest by relaxing it where it cannot
-            # falsely fire.
-            #
-            # One run demonstrated both at once: pypy startup read 0.029s
-            # against 0.019s on the same base, and dynasm 0.158s against
-            # 0.088s, which failed four ceilings and three floors while every
-            # fixture's own measured time had gone down.
-            if exec_measured > (
-                exec_baseline + drift(baseline_key)
-            ) * limit + compare_buffer:
+            # Each bound is distorted by one side only. A startup estimate that
+            # came out high under-states every exec derived from it: for the
+            # ceiling that shrinks the DENOMINATOR and inflates the ratio, and
+            # for the floor it shrinks the NUMERATOR so the fixture reads as
+            # having reached parity. Both are real and neither is bought off
+            # here. `_gate_fail_detail` reports instead how far the estimate
+            # would have to be wrong to erase the failure, in units of the
+            # startup subtracted on the side that bound is distorted by, so a
+            # small margin is legible as one without a constant deciding in
+            # advance that every fixture gets it.
+            if exec_measured > exec_baseline * limit + compare_buffer:
                 return "ceiling"
             # The measured side enters amplified by `limit / minimum`, so its
-            # error is amplified with it: the allowance belongs inside that
-            # factor, not in the flat buffer.
+            # error is amplified with it -- which is also why the floor's
+            # margin is reported against `limit / minimum`, not flat.
             if (
                 minimum is not None
                 and exec_baseline >= FLOOR_GATE_MIN_BASELINE_S
-                and (exec_measured + drift(backend))
-                * (limit / minimum) + compare_buffer
+                and exec_measured * (limit / minimum) + compare_buffer
                 < exec_baseline * limit
             ):
                 return "floor"
@@ -2776,6 +2792,10 @@ class Check:
         their true measured ratio and the failed gate threshold. Every number
         on the line is arithmetically self-consistent: exec_measured /
         exec_baseline equals the shown ratio, which is outside the shown gate.
+
+        The line closes with what it would take for the startup estimate to be
+        the whole story, since no allowance is granted for that error: see
+        `_startup_error_margin`.
         """
         exec_m = self._exec_time(backend, measured)
         exec_b = self._exec_time(baseline, baseline_time)
@@ -2794,7 +2814,48 @@ class Check:
                 f"exec {exec_m:.2f}s > {baseline} {exec_b:.2f}s  "
                 f"ratio {ratio} > gate {float(limit):g}x"
             )
-        return detail
+        margin = self._startup_error_margin(
+            backend, baseline, exec_m, exec_b, limit, bound, minimum,
+        )
+        return detail + margin if margin else detail
+
+    def _startup_error_margin(
+        self, backend, baseline, exec_m, exec_b, limit, bound, minimum,
+    ):
+        """How wrong the startup estimate has to be for this failure to vanish.
+
+        `exec` is `bench - startup`, so an over-stated startup understates
+        every exec built on it -- shrinking the ceiling's denominator, and the
+        floor's numerator. Solving each bound for the correction that would put
+        it exactly on its threshold gives the size of the startup error the
+        verdict rests on, and dividing by the startup actually subtracted on
+        that side states it in the only unit that travels between hosts.
+
+        `0.05 x` says the run is arguing about a twentieth of an empty-program
+        spawn and should not be believed; `3.0 x` says no plausible mis-reading
+        reaches it. This replaces the withdrawn standing allowance, which
+        answered the same question with one constant for every fixture.
+        """
+        # Nothing was subtracted, so there is no subtraction error to report.
+        side = baseline if bound == "ceiling" else backend
+        startup = self._subtracted_startup(side)
+        if startup <= 0:
+            return ""
+        buffer_s = self._compare_buffer(limit)
+        if bound == "ceiling":
+            # exec_m > (exec_b + d) * limit + buffer  =>  d erases it at
+            needed = (float(exec_m) - buffer_s) / limit - float(exec_b)
+        else:
+            if not minimum:
+                return ""
+            # (exec_m + d) * (limit / minimum) + buffer < exec_b * limit
+            needed = (
+                (float(exec_b) * limit - buffer_s) * minimum / limit
+                - float(exec_m)
+            )
+        if needed <= 0:
+            return ""
+        return f"; needs {needed / startup:.3g}x {side} startup to be noise"
 
     def _run_backend_bench(
         self, backend, name, script, timeout,
@@ -2969,27 +3030,20 @@ class Check:
             ):
                 self.wasm_ratio_ungated.append(name)
             else:
-                # The startup-drift allowance is calibrated on the recorded
-                # per-bench ratios, whose baseline is re-measured on every host
-                # while the ceiling stays fixed at what the fitting run saw.
-                # This gate's failures have not been shown to move that way,
-                # and widening it costs a red that names a real backend gap:
-                # `short_circuit_value_kept_stack` reads 5.3x here against a 4x
-                # ceiling and clears it only with the allowance. The denominator
-                # concern this gate does have is handled above by declining the
-                # gate outright and naming the fixture in the summary, not by
-                # quietly widening the bound.
-                #
-                # This ceiling is also meant to come back down as the backend
-                # closes the gap, so it has to mean the number it states. A
-                # standing allowance underneath it would be re-fitted along with
-                # it, and the tightening would buy less than it says it does.
+                # This ceiling is meant to come back down as the backend closes
+                # the gap, so it has to mean the number it states: a standing
+                # allowance underneath it would be re-fitted along with it, and
+                # the tightening would buy less than it says it does. That is
+                # now true of every ratio gate rather than this one alone, so
+                # the opt-out this call site used to carry is gone. The
+                # denominator concern it does have is handled above, by
+                # declining the gate outright and naming the fixture in the
+                # summary rather than quietly widening the bound.
                 passed, bound, checked_elapsed, checked_baseline, retry_note = (
                     self._performance_gate_passed(
                         backend, script, timeout, elapsed,
                         ceiling, dynasm_elapsed,
                         [self._pyre("dynasm"), script], pypy_output, "dynasm",
-                        allow_startup_drift=False,
                     )
                 )
                 if not passed:
