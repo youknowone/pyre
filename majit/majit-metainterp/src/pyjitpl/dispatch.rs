@@ -3772,12 +3772,17 @@ where
                     let frame = self.frames.current_mut();
                     frame.read_setfield_gc()
                 };
-                let (offset, fielddescr) = {
+                let (offset, field_size, fielddescr) = {
                     let frame = self.frames.current_mut();
                     let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
                         panic!("BC_SETFIELD_GC: descrs[{descr_idx}] is not a BhDescr entry")
                     });
-                    field_descr_ref_from_bh(bh)
+                    let field_size = match bh {
+                        crate::blackhole::BhDescr::Field { field_size, .. } => *field_size,
+                        _ => 8,
+                    };
+                    let (offset, fielddescr) = field_descr_ref_from_bh(bh);
+                    (offset, field_size, fielddescr)
                 };
                 let (struct_opref, struct_ptr) = self.read_ref_reg(struct_reg);
                 let (value_opref, concrete) = match bytecode {
@@ -3795,7 +3800,25 @@ where
                     fielddescr,
                 );
                 if struct_ptr != 0 {
-                    unsafe { *((struct_ptr as *mut u8).add(offset) as *mut i64) = concrete };
+                    // blackhole.py:1471-1483 stores through the fielddescr,
+                    // which carries the field's byte width, and the getfield
+                    // twin above already reads at that width. A sub-word field
+                    // written as a full word writes over whatever follows it —
+                    // for a `u32` with a live `u32` sibling behind it, the
+                    // store of one silently zeroes the other — and a field the
+                    // walk widened would then disagree with the same store as
+                    // the backend emits it.
+                    let addr = (struct_ptr as usize).wrapping_add(offset);
+                    unsafe {
+                        match field_size {
+                            1 => core::ptr::write_unaligned(addr as *mut u8, concrete as u8),
+                            2 => core::ptr::write_unaligned(addr as *mut u16, concrete as u16),
+                            4 => core::ptr::write_unaligned(addr as *mut u32, concrete as u32),
+                            // A non-{1,2,4,8}-byte field has no fixed-width
+                            // primitive store; fall back to the word-sized one.
+                            _ => core::ptr::write_unaligned(addr as *mut i64, concrete),
+                        }
+                    }
                     // A ref store adds a heap edge struct→value; notify the GC
                     // on the container so a young value survives a minor
                     // collection triggered later in the walk (mirrors
