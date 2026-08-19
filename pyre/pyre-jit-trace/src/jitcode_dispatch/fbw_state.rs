@@ -1006,6 +1006,26 @@ mod foriter_delivery_tests {
         fbw_store_journal_reset();
     }
 
+    /// A `PureUnfolded` decline is the one cause that must leave the walk
+    /// unmarked: the call it stands for applies no effect, so there is no
+    /// pending write a replay could be the only carrier of.  Marking it would
+    /// shut every no-replay walk-end road and leave replay — which re-applies
+    /// the already-executed effects — as the only exit.  Guard both flag
+    /// components, not just the aggregate, so a future rewrite of the `match`
+    /// cannot set one of them and still read false through some other path.
+    #[test]
+    fn a_pure_unfolded_decline_leaves_the_walk_unmarked() {
+        fbw_store_journal_reset();
+        assert!(!fbw_has_unjournaled_effect());
+
+        fbw_mark_unjournaled_effect(ResidualDecline::PureUnfolded);
+
+        assert_eq!(fbw_unjournaled_kinds(), (false, false));
+        assert!(!fbw_has_unjournaled_effect());
+
+        fbw_store_journal_reset();
+    }
+
     /// Two FOR_ITERs of one frame can be in flight at once (an outer `list`
     /// loop through the residual leg, a `range` body inside it through the
     /// specialised leg). The deliver site can only push at the header the
@@ -1342,9 +1362,14 @@ pub(crate) fn fbw_journaled_effect_lens() -> (usize, usize, usize) {
 /// cause here and the flag itself keeps no provenance; `PYRE_UNJOURNALED_SITE`
 /// names the caller, in the shape `PYRE_LB_SITE` uses for the callee-inline
 /// declines.
+fn unjournaled_site_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_UNJOURNALED_SITE").is_some())
+}
+
 #[track_caller]
 pub(crate) fn fbw_mark_unjournaled_effect(cause: ResidualDecline) {
-    if std::env::var_os("PYRE_UNJOURNALED_SITE").is_some() {
+    if unjournaled_site_enabled() {
         let loc = std::panic::Location::caller();
         // Only a `Symbolic` decline records a site, so read the cell only for
         // that cause: on any other one it still holds whichever earlier
