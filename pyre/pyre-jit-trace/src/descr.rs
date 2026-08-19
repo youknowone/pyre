@@ -4878,6 +4878,11 @@ mod tests {
 
     #[test]
     fn pycode_field_descrs_share_parent_and_preserve_specs() {
+        // The `always_pure` column is `pycode.py:95-106 _immutable_fields_`:
+        // only `co_firstlineno` is listed there, so only its descr answers
+        // `is_always_pure()`. Stating it per field rather than asserting a
+        // blanket "nothing is pure" keeps the test able to fail when a field's
+        // immutability moves in either direction.
         let expected = [
             (
                 pycode_code_ptr_descr(),
@@ -4887,6 +4892,7 @@ mod tests {
                 Type::Int,
                 false,
                 0,
+                false,
             ),
             (
                 pycode_co_firstlineno_descr(),
@@ -4896,6 +4902,7 @@ mod tests {
                 Type::Int,
                 true,
                 1,
+                true,
             ),
             (
                 pycode_hidden_applevel_descr(),
@@ -4905,6 +4912,7 @@ mod tests {
                 Type::Int,
                 false,
                 2,
+                false,
             ),
             (
                 pycode_w_name_descr(),
@@ -4914,17 +4922,20 @@ mod tests {
                 Type::Ref,
                 false,
                 3,
+                false,
             ),
         ];
         let mut shared_parent = None;
-        for (descr, name, offset, field_size, field_type, signed, index_in_parent) in expected {
+        for (descr, name, offset, field_size, field_type, signed, index_in_parent, always_pure) in
+            expected
+        {
             let field = descr.as_field_descr().expect("PyCode FieldDescr");
             assert_eq!(field.field_name(), name);
             assert_eq!(field.offset(), offset);
             assert_eq!(field.field_size(), field_size);
             assert_eq!(field.field_type(), field_type);
             assert_eq!(field.is_field_signed(), signed);
-            assert!(!descr.is_always_pure());
+            assert_eq!(descr.is_always_pure(), always_pure, "{name}");
             assert!(!descr.is_quasi_immutable());
             assert_eq!(field.index_in_parent(), index_in_parent);
             let parent = field

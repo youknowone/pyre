@@ -3600,7 +3600,7 @@ impl Optimizer {
                 // longer see one vector from this evaluation next to another
                 // that was never written.  Alignment is narrower than that —
                 // `short_inputargs` / `short_inputarg_refs` share an index
-                // space, `short_boxes_exported` does not.
+                // space, `exported_short_boxes` does not.
                 ctx.preview_short_state = Some(crate::optimizeopt::PreviewShortState {
                     short_inputargs,
                     short_inputarg_refs,
