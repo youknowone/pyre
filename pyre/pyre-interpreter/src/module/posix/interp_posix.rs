@@ -10153,10 +10153,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ns,
             "symlink",
             crate::make_builtin_function("symlink", |args| {
-                use windows_sys::Win32::Storage::FileSystem::{
-                    CreateSymbolicLinkW, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
-                    SYMBOLIC_LINK_FLAG_DIRECTORY,
-                };
                 let (bound, kwargs) = bind_path_args(
                     args,
                     "symlink",
@@ -10183,37 +10179,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     None => false,
                 };
                 let (wide_src, wide_dst) = (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);
-                let flags = if target_is_directory {
-                    SYMBOLIC_LINK_FLAG_DIRECTORY
-                } else {
-                    0
-                };
-                // Creating one is a privilege the account may not hold; the
-                // flag asks for the developer-mode path instead, and a Windows
-                // too old to know it rejects the whole call, which is what the
-                // retry without it is for.
-                let mut ok = unsafe {
-                    CreateSymbolicLinkW(
-                        wide_dst.as_ptr(),
-                        wide_src.as_ptr(),
-                        flags | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
-                    )
-                };
-                if !ok
-                    && std::io::Error::last_os_error().raw_os_error()
-                        == Some(windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER as i32)
-                {
-                    ok =
-                        unsafe { CreateSymbolicLinkW(wide_dst.as_ptr(), wide_src.as_ptr(), flags) };
-                }
-                if !ok {
-                    return Err(fs_err_with_filename2(
-                        std::io::Error::last_os_error(),
-                        0,
-                        src.w_path(),
-                        dst.w_path(),
-                    ));
-                }
+                // The kind is not read off `target_is_directory` alone.
+                // `os_symlink_impl` also asks `_check_dirW`, which resolves a
+                // relative `src` against `dirname(dst)` and reports whether
+                // `GetFileAttributesExW` calls it a directory — so
+                // `os.symlink(os.path.join('a', 'bcd'), 'sym3')` makes a link
+                // that can be walked into rather than a file link nothing can
+                // list.  Creating either is a privilege the account may not
+                // hold, so the call asks for the developer-mode path and
+                // retries without it on the Windows too old to know the flag.
+                // The host wrapper carries both, including the
+                // `windows_has_symlink_unprivileged_flag` latch that stops
+                // paying for the first attempt once it is known to fail.
+                rustpython_host_env::nt::symlink(
+                    &path_from_bytes(&src.as_bytes),
+                    &path_from_bytes(&dst.as_bytes),
+                    &wide_src,
+                    &wide_dst,
+                    target_is_directory,
+                )
+                .map_err(|e| fs_err_with_filename2(e, 0, src.w_path(), dst.w_path()))?;
                 Ok(pyre_object::w_none())
             }),
         );
