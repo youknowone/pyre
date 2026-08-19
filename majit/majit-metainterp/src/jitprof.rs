@@ -185,23 +185,21 @@ struct TimingState {
 /// "a bridge aborted" sends the next reader looking for bridge activity that is
 /// not there.
 ///
-/// `ABORT_FORCE_QUASIIMMUT` is the one reason nothing on this side can raise,
-/// because the quasi-immutable *write* path is unimplemented. `hook_setfield`
-/// (`rclass.rs`) genops `jit_force_quasi_immutable`, but no `OpKind` carries it,
-/// `jtransform` has no arm for it, it has no jitcode opcode, and there is
-/// neither a metainterp opimpl nor a `do_force_quasi_immutable` — so unlike
-/// `opimpl_jit_force_quasi_immutable` (`pyjitpl.py:1094-1118`), which raises
-/// `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` once the mutate field is
-/// non-null, no path here reaches a `SwitchToBlackhole`. The *read* half
-/// (`record_quasiimmut_field` → [`majit_ir::OpCode::QuasiimmutField`]) is
-/// complete, so the asymmetry is in the port, not in this table.
+/// `ABORT_FORCE_QUASIIMMUT` has two producers, both sitting on the residual-call
+/// boundary, because that is where a quasi-immutable write lands here:
+/// `try_walker_force_quasi_immut_namespace_write` and
+/// `try_walker_force_quasi_immut_mapdict_write`
+/// (`pyre-jit-trace/src/jitcode_dispatch/residual_call.rs`). Each calls
+/// `note_force_quasi_immut_abort`, which stages the reason so the single
+/// `aborted_tracing` that follows tallies it here instead of in the `Generic`
+/// catch-all — the stand-in for the reason
+/// `opimpl_jit_force_quasi_immutable` (`pyjitpl.py:1094-1118`) carries on the
+/// `SwitchToBlackhole` instance it raises.
 ///
-/// That tally is therefore a true zero rather than a dead slot, and it stays
-/// zero for as long as the write path is missing. Nothing currently declares a
-/// `?`-suffixed field, so the gap is unreachable rather than latent — but
-/// `AbortReason` gains no variant for it either, so the first `?` field anyone
-/// declares gets a setfield hook with nothing downstream and no abort. Keep the
-/// slot; do not synthesise a producer for it.
+/// The mapdict producer is gated behind `PYRE_QMUT_MAPDICT_FORCE` and ships off,
+/// so a default run reaches this tally only through the namespace one; that path
+/// is live, and `MAJIT_STATS=1 PYRE_MC_DIAG=1` on
+/// `bench/synth/trace_too_long_effect_replay.py` prints `abrt_force_qmut=1`.
 pub const ABORT_COUNTER_KINDS: &[(i32, &str)] = &[
     (counters::ABORT_TOO_LONG, "too_long"),
     (counters::ABORT_BRIDGE, "bridge_or_generic"),
