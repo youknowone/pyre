@@ -1443,12 +1443,30 @@ impl<'c> Lowerer<'c> {
                 // real pointer while the emitted descr takes its stride and
                 // signedness from the declaration, so a declaration that
                 // drifted from the struct (`Stack::data => u16` over a
-                // `*mut u8`) would compile and read past the buffer.  Naming
-                // the pointee rather than the pointer accepts `*const T` as
-                // well as `*mut T`; the closure body is type-checked but never
-                // evaluated.
-                const _: fn(&#struct_path) -> #element_type =
-                    |__s| unsafe { *__s.#member };
+                // `*mut u8`) would compile and read past the buffer.
+                //
+                // The claim is the element's WIDTH, not its name.  A
+                // `#[repr(transparent)]` wrapper over the declared type has
+                // the declared type's size and, by the definition of
+                // `repr(transparent)`, its representation — a legitimate
+                // element that nominal equality rejects.  `transmute` states
+                // the width, so the drifted `u16`-over-`*mut u8` declaration
+                // above still fails to compile.
+                //
+                // What this no longer catches: a declaration that keeps the
+                // width and flips the sign (`=> i8` over a `*mut u8`).  The
+                // stride is what bounds the access, so that mistake stays
+                // in-buffer and misreads a value rather than the heap, but it
+                // IS unchecked here — the sign now comes from the declaration
+                // alone.
+                //
+                // Reading through the field rather than naming a pointer type
+                // accepts `*const T` as well as `*mut T`; the closure body is
+                // type-checked but never evaluated.
+                const _: fn(&#struct_path) = |__s| {
+                    let _: #element_type =
+                        unsafe { ::core::mem::transmute(*__s.#member) };
+                };
                 #prefix_witness
                 __builder.register_struct_layout(
                     ::core::mem::size_of::<#struct_path>(),
