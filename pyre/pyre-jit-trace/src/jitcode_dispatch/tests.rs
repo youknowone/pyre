@@ -13122,3 +13122,29 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
         "the shadow half must carry the published value too",
     );
 }
+
+/// A decline recorded on one thread must be visible to a reader on another.
+/// `_thread` gives Python real OS threads and each traces on its own, so a
+/// per-thread census reports only whichever thread happened to dump it and
+/// silently loses every decline the others took.
+#[test]
+fn the_decline_census_counts_a_record_from_another_thread() {
+    const PROBE: &str = "CensusCrossThreadProbe";
+    let count_of = || {
+        census_entries()
+            .into_iter()
+            .find(|(name, _)| *name == PROBE)
+            .map_or(0, |(_, count)| count)
+    };
+
+    let before = count_of();
+    std::thread::spawn(|| census_record(PROBE))
+        .join()
+        .expect("probe thread panicked");
+
+    assert_eq!(
+        count_of(),
+        before + 1,
+        "a decline recorded off-thread never reached the census"
+    );
+}
