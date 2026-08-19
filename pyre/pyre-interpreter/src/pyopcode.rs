@@ -712,8 +712,10 @@ pub fn opcode_swap<H: StackOpcodeHandler + ?Sized>(
 
 pub fn opcode_get_iter<H: IterOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
     let iterable = handler.pop_value()?;
+    // A user-defined `__iter__` allocates, so the push goes through the anchor.
+    let anchor = handler.anchor();
     let iterator = handler.iter_value(iterable)?;
-    handler.push_value(iterator)
+    H::push_anchored(&anchor, iterator)
 }
 
 pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>(

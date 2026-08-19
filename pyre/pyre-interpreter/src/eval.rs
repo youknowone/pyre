@@ -207,12 +207,19 @@ pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard 
 /// This mirrors the JIT eval layer's `FrameRoot`.
 pub struct FrameAnchor {
     depth: usize,
+    /// The shadow stack is per-thread, so a depth taken on one thread names a
+    /// different slot on another. The marker is what keeps an anchor from
+    /// being sent or shared across threads now that the type is public.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl FrameAnchor {
     pub fn new(frame: &mut PyFrame) -> Self {
         let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as *mut PyFrame as usize));
-        Self { depth }
+        Self {
+            depth,
+            _not_send: std::marker::PhantomData,
+        }
     }
 
     pub fn live(&self) -> *mut PyFrame {
