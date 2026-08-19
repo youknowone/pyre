@@ -39,7 +39,13 @@ fn queue_lock<'a>(
     guard
 }
 
+/// `_queue_SimpleQueue_get_impl` reads `timeout` only on the blocking path:
+/// `block=False` is answered from the queue immediately, so the argument is
+/// neither converted nor range-checked there.
 fn parse_timeout(block: bool, timeout: PyObjectRef) -> Result<Option<f64>, crate::PyError> {
+    if !block {
+        return Ok(None);
+    }
     if timeout.is_null() || unsafe { pyre_object::is_none(timeout) } {
         return Ok(None);
     }
@@ -47,11 +53,6 @@ fn parse_timeout(block: bool, timeout: PyObjectRef) -> Result<Option<f64>, crate
     if seconds < 0.0 {
         return Err(crate::PyError::value_error(
             "'timeout' must be a non-negative number",
-        ));
-    }
-    if !block {
-        return Err(crate::PyError::value_error(
-            "can't specify timeout for non-blocking acquire",
         ));
     }
     Ok(Some(seconds))

@@ -3,6 +3,16 @@
 use pyre_object::*;
 
 fn normal_dist_inv_cdf_impl(p: f64, mu: f64, sigma: f64) -> Result<f64, crate::PyError> {
+    // `_statisticsmodule.c` refuses `p` outside the open unit interval and
+    // checks nothing else -- `sigma` of 0 or below is accepted, and a NaN `p`
+    // fails both comparisons and comes back out of the approximation as NaN.
+    // `statistics.py`'s own copy has no check at all, because the only caller
+    // there, `NormalDist.inv_cdf`, raises before reaching it.
+    if p <= 0.0 || p >= 1.0 {
+        return Err(crate::PyError::value_error(
+            "inv_cdf undefined for these parameters",
+        ));
+    }
     let q = p - 0.5;
 
     if q.abs() <= 0.425 {
@@ -37,9 +47,6 @@ fn normal_dist_inv_cdf_impl(p: f64, mu: f64, sigma: f64) -> Result<f64, crate::P
     }
 
     let mut r = if q <= 0.0 { p } else { 1.0 - p };
-    if r <= 0.0 {
-        return Err(crate::PyError::value_error("math domain error"));
-    }
     r = (-r.ln()).sqrt();
     let num;
     let den;
