@@ -12630,15 +12630,36 @@ impl CodeWriter {
                             // UnaryPositive→`pos`, ListToTuple→`list_to_tuple`
                             // are the two CALL_INTRINSIC_1 variants with a
                             // residual; both are single-Ref→Ref.  The remaining
-                            // variants (import-star, stopiteration-error, the PEP
-                            // 695 type-param helpers) are def-time or error-path
+                            // variants (import-star, async-gen-wrap, the PEP 695
+                            // type-param helpers) are def-time or error-path
                             // only, so no residual has been written for them.
+                            //
+                            // `StopIterationError` is a no-op: `pyopcode.rs`
+                            // leaves the value on the stack unchanged, because
+                            // the PEP 479 conversion happens in the generator
+                            // machinery (`leak_generator_iteration`) rather
+                            // than at this opcode.  An opcode the interpreter
+                            // executes as a no-op has nothing to residualize
+                            // and nothing to bail for, so leave TOS alone and
+                            // let the trace carry on — the same treatment
+                            // `ExitInitCheck` gets.
+                            //
+                            // It is load-bearing for generators specifically:
+                            // the PEP 479 epilogue carries this opcode in 648
+                            // of the 649 generator/coroutine code objects in
+                            // `lib-python/3`, and a generator body always sits
+                            // inside an exception-table range, which widens the
+                            // loop-body prescan to the whole code object.  A
+                            // marker here therefore declined essentially every
+                            // generator frame, loop and epilogue alike.
                             let opname = match func.get(op_arg) {
                                 IntrinsicFunction1::UnaryPositive => Some("pos"),
                                 IntrinsicFunction1::ListToTuple => Some("list_to_tuple"),
                                 _ => None,
                             };
-                            if let Some(opname) = opname {
+                            if matches!(func.get(op_arg), IntrinsicFunction1::StopIterationError) {
+                                // TOS stays as it is — no pop, no fresh push.
+                            } else if let Some(opname) = opname {
                                 let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 let result_value = emit_graph_op_with_result(
