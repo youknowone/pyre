@@ -149,7 +149,13 @@ impl<'a> LineTableReader<'a> {
                 break;
             };
             shift += 6;
-            value |= ((next & 0x3f) as u32) << shift;
+            // `code.replace(co_linetable=...)` stores arbitrary bytes, so the
+            // continuation chain can run past what a u32 holds. Those groups
+            // are unrepresentable either way; drop them rather than shift by
+            // the full width, which panics in a debug build.
+            if shift < u32::BITS {
+                value |= ((next & 0x3f) as u32) << shift;
+            }
             byte = next;
         }
         value
@@ -1159,8 +1165,29 @@ unsafe fn w_code_fill_consts_from_tuple(obj: PyObjectRef, constants: PyObjectRef
         }
     }
     if filled {
-        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        publish_code_slot_store(obj);
     }
+}
+
+/// Record a store into one of the Rust-side tables a `PyCode` owns —
+/// `co_consts_w`, `w_globals`, the mapdict method cache.
+///
+/// Those tables are not collector objects: only the wrapper's custom trace
+/// reaches them, so a store there is a store into the wrapper. A prebuilt
+/// wrapper is covered by the root walk, which clean minor collections skip,
+/// hence `mark_prebuilt_roots_dirty`. A managed wrapper is not in that
+/// registry at all — `w_code_new` registers a code object only when the
+/// collector does not already own it — so a tenured wrapper that now points at
+/// a nursery constant needs its remembered-set entry back, which is what the
+/// write barrier restores. Without it the next minor collection never traces
+/// the slot and leaves the wrapper holding a stale pointer.
+#[inline]
+fn publish_code_slot_store(obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
+    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
 }
 
 /// `w_code_fill_consts_from_tuple` for the marshal reader, whose `co_consts`
@@ -1178,7 +1205,7 @@ pub(crate) unsafe fn w_code_fill_wrapped_consts(obj: PyObjectRef, constants: &[P
         slots[index].store(constants[index], std::sync::atomic::Ordering::Release);
     }
     if count != 0 {
-        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        publish_code_slot_store(obj);
     }
 }
 
@@ -1202,7 +1229,7 @@ unsafe fn w_code_copy_const_slots(dst: PyObjectRef, src: PyObjectRef) {
         }
     }
     if copied {
-        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        publish_code_slot_store(dst);
     }
 }
 
@@ -2436,7 +2463,7 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
         std::sync::atomic::Ordering::Acquire,
     ) {
         Ok(_) => {
-            pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+            publish_code_slot_store(w_code_obj);
             realized
         }
         Err(winner) => winner,
@@ -2682,7 +2709,7 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     }
     // A bootstrap code slot is reached only by the prebuilt root walk, which
     // clean minor collections may skip; record the store.
-    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    publish_code_slot_store(obj);
     if !w_globals.is_null() {
         let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
         register_live_code_wrapper(code_ptr, obj);
@@ -2703,7 +2730,7 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     if code.w_globals.is_null() {
         code.w_globals = w_globals;
         // Prebuilt-family store (see `w_code_set_w_globals`).
-        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        publish_code_slot_store(obj);
         register_live_code_wrapper(code.code_ptr, obj);
         register_w_globals_stamped_code(obj);
         return false;
@@ -3177,14 +3204,16 @@ pub unsafe fn w_code_mapdict_caches_set(
         // The LOAD_METHOD fill (mapdict.py:1474) stores a movable
         // `w_method` reference; register this code object so
         // `walk_mapdict_method_cache_gc` forwards the slot.
-        if !entry.w_method.is_null() && !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
-            mapdict_method_cache_codes()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(obj as usize);
-            // Prebuilt-family store: the slot is reached only by
-            // `walk_mapdict_method_cache_gc`, skipped on clean minors.
-            pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        if !entry.w_method.is_null() {
+            if !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
+                mapdict_method_cache_codes()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(obj as usize);
+            }
+            // The slot is reached only by `walk_mapdict_method_cache_gc`,
+            // skipped on clean minors.
+            publish_code_slot_store(obj);
         }
     }
 }
@@ -3381,6 +3410,19 @@ mod tests {
 
         assert_eq!(decode_varint(&location_bytes, 0), (385, 2));
         assert_eq!(LineTableReader::new(&exception_bytes).read_varint(), 385);
+    }
+
+    /// `code.replace(co_linetable=...)` accepts arbitrary bytes, so the
+    /// continuation chain can be longer than a u32 holds. Shifting by the full
+    /// width panics in a debug build, so the groups past it are dropped.
+    #[test]
+    fn a_location_varint_chain_past_the_word_width_does_not_panic() {
+        let overlong = [0x7fu8, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x00];
+        let mut expected = 0x3fu32;
+        for shift in [6u32, 12, 18, 24, 30] {
+            expected |= 0x3fu32 << shift;
+        }
+        assert_eq!(LineTableReader::new(&overlong).read_varint(), expected);
     }
 
     #[test]
