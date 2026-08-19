@@ -935,7 +935,10 @@ pub enum PyreHelperKind {
     /// raise instead of declining to the trait.
     RaiseVarargs,
     /// `get_current_exception()` — the PUSH_EXC_INFO `prev = ec.sys_exc_value`
-    /// save residual (`() → Ref`, TLS read via `cpu.get_current_exception_fn`).
+    /// save residual, and the read a catch-covered bare `raise` uses to obtain
+    /// the exception it re-raises (`() → Ref`, TLS read via
+    /// `cpu.get_current_exception_fn`).  Only the save is followed by a store
+    /// and a matching POP_EXCEPT restore.
     /// The full-body walker recognises this tag to
     /// lower it to `GETFIELD_GC_R(ec, sys_exc_value)` so the exc-info save
     /// participates in the balanced save/restore the heap optimizer

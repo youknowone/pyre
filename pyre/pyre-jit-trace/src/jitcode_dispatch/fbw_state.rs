@@ -2577,10 +2577,11 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // nothing to the live heap.  The BUILD_TUPLE / BUILD_LIST array
             // consumers are the same shape one level up: they read a
             // freshly-built backing array and return a brand-new container.
-            // `get_current_exception` is the PUSH_EXC_INFO `prev` save, which
+            // `get_current_exception` is the PUSH_EXC_INFO `prev` save and the
+            // catch-covered bare `raise` read, which
             // `try_walker_lower_exc_info_residual` lowers to a bare
-            // `GETFIELD_GC_R(ec, sys_exc_value)`: a field read, so a replay
-            // reads the same value again.  Its writing twin
+            // `GETFIELD_GC_R(ec, sys_exc_value)` either way: a field read, so a
+            // replay reads the same value again.  Its writing twin
             // `SetCurrentException` is not here — it is journalled, and so
             // reaches the `deferred_call` arm below instead.
             // `load_deref` is that same shape once more, and it is the one every

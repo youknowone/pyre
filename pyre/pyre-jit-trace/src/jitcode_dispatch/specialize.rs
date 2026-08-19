@@ -11889,7 +11889,10 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
 /// exception_fn` wrappers in `pyre-jit`, which `pyre-jit-trace` cannot name).
 ///
 ///   * `GetCurrentException` — `get_current_exception()` (`[]→Ref`,
-///     dst_bank `'r'`): the PUSH_EXC_INFO `prev` save.  Emit
+///     dst_bank `'r'`): the PUSH_EXC_INFO `prev` save, and also the read a
+///     catch-covered bare `raise` uses to obtain the exception it re-raises.
+///     Only the first owns a matching store and POP_EXCEPT restore, so only
+///     the first pushes onto the saved-prev stack.  Emit
 ///     `GETFIELD_GC_R(ec, sys_exc_value)`, stamp the live `prev` concrete
 ///     (the residual executor would have returned it) so a downstream read
 ///     of the dst sees the right value.
@@ -11942,7 +11945,7 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
             return Ok(None);
         }
         // Two Python instructions lower to this helper, and they want
-        // different things from a bridge seed.  A bare `raise` / `RERAISE` wants
+        // different things from a bridge seed.  A bare `raise` wants
         // the exception the bridge is resuming with — the compiled loop is free
         // to elide its `sys_exc_value` store (a balanced save/store/restore
         // DCEs), so the live slot is not a source there and only the seed
@@ -11956,8 +11959,15 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         // entry, so the slot is current.  A seed this walk stored itself is a
         // view of the field either way, and reusing its OpRef keeps the
         // save/store/restore triple balanced.
-        let seed_answers_this_read = ctx.fbw_mode.current_exception_seed_from_walk_store
-            || super::recording_raise_keeps_existing_traceback(ctx, op.pc);
+        // The predicate is true for `RAISE_VARARGS 0`, `RERAISE` and `FOR_ITER`,
+        // but only the first can reach here: `RERAISE` reads its exception off
+        // the vable stack and `FOR_ITER` re-raises the value its own
+        // `catch_exception` caught, so neither emits this helper.  The name
+        // records the one shape that does.
+        let is_covered_bare_raise_read =
+            super::recording_raise_keeps_existing_traceback(ctx, op.pc);
+        let seed_answers_this_read =
+            ctx.fbw_mode.current_exception_seed_from_walk_store || is_covered_bare_raise_read;
         let (prev, prev_obj) = if let Some(seed) = ctx
             .fbw_mode
             .current_exception_seed
@@ -11981,14 +11991,21 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
             prev,
             majit_ir::Value::Ref(majit_ir::GcRef(prev_obj as usize)),
         );
-        // Save (OpRef, concrete) for the matching POP_EXCEPT restore, and mark
-        // the immediately-following `set_current_exception` as this PUSH's slot
-        // store (not a restore).  The codewriter pushes `prev` then `exc` onto
-        // the operand stack and POP_EXCEPT pops them, but the walker resolves
-        // the popped `prev` operand to the caught exception, not the saved
-        // prev; the LIFO stack carries the authoritative value instead.
-        FBW_EXC_PREV.with(|s| s.borrow_mut().push((prev, prev_obj)));
-        FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(true));
+        // Only PUSH_EXC_INFO owns a matching set + POP_EXCEPT pair.  A covered
+        // bare raise uses the same read helper to obtain the exception it
+        // re-raises, but has no following PUSH store.  Treating that read as a
+        // save arms the next POP as a PUSH and leaves the bare raise's value on
+        // this stack, so a second enclosing POP restores the inner exception.
+        // For PUSH_EXC_INFO, save (OpRef, concrete) for the matching restore and
+        // mark the immediately-following set as this PUSH's slot store.  The
+        // codewriter pushes `prev` then `exc` onto the operand stack and
+        // POP_EXCEPT pops them, but the walker resolves the popped `prev`
+        // operand to the caught exception, not the saved prev; the LIFO stack
+        // carries the authoritative value instead.
+        if !is_covered_bare_raise_read {
+            FBW_EXC_PREV.with(|s| s.borrow_mut().push((prev, prev_obj)));
+            FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(true));
+        }
         write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', prev)?;
         return Ok(Some(()));
     }
