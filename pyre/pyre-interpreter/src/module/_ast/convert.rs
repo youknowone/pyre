@@ -1706,6 +1706,10 @@ pub fn parse_to_object_with_opts(
     opts: crate::compile::CompileOpts,
     syntax_check_only: bool,
 ) -> crate::PyResult {
+    // The tokenizer sees a source whose line terminators are all `\n`
+    // (`pytokenizer.py:654-662`), so the same rewrite runs here; the nodes and
+    // the text `module_to_object` slices segments out of then agree.
+    let source = &*crate::compile::universal_newline(source);
     let mut module = match mode {
         crate::compile::Mode::Eval => parser::parse_expression(source)
             .map(|parsed| ast::Mod::Expression(parsed.into_syntax())),

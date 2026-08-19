@@ -344,10 +344,11 @@ fn compile_repl_input(
     empty_line_given: bool,
     continuing_block: bool,
 ) -> ShellCompileAction {
-    #[cfg(windows)]
-    let normalized = source.replace("\r\n", "\n");
-    #[cfg(windows)]
-    let source = normalized.as_str();
+    // `generate_tokens` normalizes every line it takes, on every platform and
+    // for a lone `\r` as well (`pytokenizer.py:654-662`), so the shell hands the
+    // compiler the same shape a script would rather than a windows-only
+    // `\r\n` rewrite.
+    let source = &*pyre_interpreter::universal_newline(source);
 
     match pyre_interpreter::rp_compile(source, Mode::Single, "<stdin>", Default::default()) {
         Ok(code) => {

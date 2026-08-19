@@ -95,6 +95,13 @@ fn drain_args(parser: &mut lexopt::Parser) -> Result<Vec<std::ffi::OsString>, le
 /// and keeps its carriage return, where `"  "` alone is blank. That is a
 /// narrower notion of blank than `textwrap.dedent`'s, which empties every line
 /// `str.isspace()` answers for.
+///
+/// A carriage return does reach this point, and is meant to: the dedent runs on
+/// the argument as it was given, and the tokenizer's own `\r\n` / lone-`\r`
+/// rewrite (`pytokenizer.py:654-662`) happens after it. Counting `"  \r"` as a
+/// line that holds something is what the reference does as well -- against a
+/// two-space margin a `"    \r"` line comes back as `"  "`, where a `"    "`
+/// line comes back empty.
 fn dedent_command(source: &str) -> std::borrow::Cow<'_, str> {
     fn split_newline(line: &str) -> (&str, &str) {
         match line.strip_suffix('\n') {

@@ -11802,6 +11802,11 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     source: &str,
     allow_incomplete: bool,
 ) -> crate::PyError {
+    // Every location in `e` indexes the source the compiler was handed, which
+    // `compile_source_with_opts` had already run through `universal_newline`.
+    // Slice the same string here, or a `\r\n` input reports a line that still
+    // carries its carriage return and a lone-`\r` one finds no line at all.
+    let source = &*crate::compile::universal_newline(source);
     use rustpython_compiler::parser::{
         InterpolatedStringErrorType, LexicalErrorType, ParseErrorType,
     };

@@ -12,6 +12,36 @@ pub use rustpython_compiler_core::bytecode::{
     MakeFunctionFlags, OpArg, OpArgState, SpecialMethod,
 };
 
+/// Rewrite every `\r\n` and every lone `\r` in a source as `\n`.
+///
+/// `pytokenizer.py:654-662` universal_newline does this one line at a time, and
+/// `generate_tokens` calls it on every line it takes. The lines come from
+/// `splitlines(True)` (`pyparse.py:202`), which ends a line at `\r`, `\r\n` and
+/// `\n` alike, so a carriage return can only ever sit at a line's end there —
+/// which makes rewriting them all in one pass the same transformation over the
+/// whole source. Pyre needs the whole-source form because its tokenizer takes
+/// the source rather than a line at a time.
+///
+/// A line terminator is not string syntax, so this reaches the text of a
+/// triple-quoted literal, raw and bytes ones included, exactly as it does the
+/// code around it. Neither rewrite moves a line boundary, so line numbers and
+/// the column of anything on a line are what they were.
+pub fn universal_newline(source: &str) -> std::borrow::Cow<'_, str> {
+    if !source.contains('\r') {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut normalized = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(carriage_return) = rest.find('\r') {
+        normalized.push_str(&rest[..carriage_return]);
+        normalized.push('\n');
+        rest = &rest[carriage_return + 1..];
+        rest = rest.strip_prefix('\n').unwrap_or(rest);
+    }
+    normalized.push_str(rest);
+    std::borrow::Cow::Owned(normalized)
+}
+
 /// Compile Python source code to a RustPython CodeObject.
 ///
 /// The filename is the one `exec`/`eval` report for a str source, surfacing
@@ -20,8 +50,7 @@ pub use rustpython_compiler_core::bytecode::{
 /// The `CompileError` is returned unflattened so the SyntaxError builders
 /// can read its `python_location` / `python_end_location` / `source_path`.
 pub fn compile_source(source: &str, mode: Mode) -> Result<CodeObject, CompileError> {
-    crate::module::thread::ensure_runtime_thread();
-    rp_compile(source, mode, "<string>", default_compile_opts())
+    compile_source_with_opts(source, mode, "<string>", default_compile_opts())
 }
 
 /// The `CompileOpts` for an implicit compile (script / `-c` / import): the
@@ -56,7 +85,7 @@ pub fn compile_source_with_opts(
     opts: CompileOpts,
 ) -> Result<CodeObject, CompileError> {
     crate::module::thread::ensure_runtime_thread();
-    rp_compile(source, mode, filename, opts)
+    rp_compile(&universal_newline(source), mode, filename, opts)
 }
 
 /// Scan the first two lines of `source` for a PEP 263 coding cookie
