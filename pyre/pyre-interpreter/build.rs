@@ -83,6 +83,20 @@ fn main() {
             .compile("pyre_ctypes_seh");
     }
 
+    // `sys.version` names the C compiler the build used, and on an MSVC target
+    // that name is the `MSC v.<_MSC_VER>` token
+    // (`rpython/rlib/compilerinfo.py:22`).  `ctypes.util._get_build_version`
+    // reads the number back out to decide which C runtime `find_library("c")`
+    // may hand out; with no token at all it assumes MSVC 6 and answers
+    // `msvcrt.dll`, a runtime this build does not share an `errno` with.  The
+    // number comes from the preprocessor rather than a parsed banner: `/EP`
+    // writes the expansion to stdout and nothing else.
+    if target.ends_with("-pc-windows-msvc")
+        && let Some(msc_ver) = msc_ver()
+    {
+        println!("cargo:rustc-env=PYRE_MSC_VER={msc_ver}");
+    }
+
     // Only do work for the wasm_vfs feature; native builds need nothing here.
     if std::env::var_os("CARGO_FEATURE_WASM_VFS").is_none() {
         return;
@@ -114,4 +128,23 @@ fn main() {
     let blob_path = Path::new(&out_dir).join("stdlib_vfs.lz4");
     std::fs::write(&blob_path, &compressed)
         .unwrap_or_else(|e| panic!("wasm_vfs: cannot write {}: {e}", blob_path.display()));
+}
+
+/// `_MSC_VER`, as the compiler itself expands it.  `None` when the probe
+/// cannot be compiled, which leaves `sys.version` naming Rust alone.
+fn msc_ver() -> Option<String> {
+    let out_dir = std::env::var("OUT_DIR").ok()?;
+    let probe = Path::new(&out_dir).join("pyre_msc_ver.c");
+    std::fs::write(&probe, "_MSC_VER\n").ok()?;
+    let output = cc::Build::new()
+        .get_compiler()
+        .to_command()
+        .arg("/nologo")
+        .arg("/EP")
+        .arg(&probe)
+        .output()
+        .ok()?;
+    let expanded = String::from_utf8_lossy(&output.stdout);
+    let digits: String = expanded.chars().filter(char::is_ascii_digit).collect();
+    (!digits.is_empty()).then_some(digits)
 }

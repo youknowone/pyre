@@ -1276,17 +1276,31 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // reads it back out of `sys.version` to answer `win-amd64`/`win-arm64`,
     // and pip turns that answer into the wheel platform tag. Elsewhere the
     // compiler string carries no architecture, so neither does this one.
-    let compiler = if !cfg!(windows) {
-        "Rust"
-    } else if cfg!(target_arch = "x86_64") {
-        "Rust 64 bit (AMD64)"
-    } else if cfg!(target_arch = "aarch64") {
-        "Rust 64 bit (ARM64)"
-    } else if cfg!(target_arch = "arm") {
-        "Rust 32 bit (ARM)"
-    } else {
-        "Rust 32 bit (Intel)"
+    //
+    // The name itself is the compiler that built the C the interpreter
+    // carries, which is what `compilerinfo.py:20-27` publishes: `MSC v.` and
+    // `_MSC_VER` on an MSVC build, the compiler's own name elsewhere.
+    // `ctypes.util._get_build_version` reads that number back out to decide
+    // which C runtime `find_library("c")` may hand out, and with no token at
+    // all it assumes MSVC 6 and answers `msvcrt.dll` — a runtime this build
+    // links none of, and whose `errno` is therefore not the one `use_errno`
+    // reports.
+    let name = match option_env!("PYRE_MSC_VER") {
+        Some(msc_ver) => format!("MSC v.{msc_ver}"),
+        None => "Rust".to_string(),
     };
+    let arch = if !cfg!(windows) {
+        ""
+    } else if cfg!(target_arch = "x86_64") {
+        " 64 bit (AMD64)"
+    } else if cfg!(target_arch = "aarch64") {
+        " 64 bit (ARM64)"
+    } else if cfg!(target_arch = "arm") {
+        " 32 bit (ARM)"
+    } else {
+        " 32 bit (Intel)"
+    };
+    let compiler = format!("{name}{arch}");
     module_ns_store(
         ns,
         "version",
