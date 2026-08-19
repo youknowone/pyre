@@ -4155,6 +4155,13 @@ impl PyFrame {
     /// silently dropped).  A function frame with no locals bound yet lazily
     /// allocates a fresh dict (pyframe.py:557 `self.space.newdict(instance=True)`)
     /// and caches it, so `locals() is locals()` holds.  Errors propagate.
+    ///
+    /// `@jit.unroll_safe` (`pyframe.py:572`) cancels `contains_loop` in the
+    /// policy (`codewriter/policy.rs look_inside_graph`), so the slot loop
+    /// below does not keep the codewriter out.  Without it the whole function
+    /// is one residual call, and the `f_locals` read behind it forces the
+    /// virtualizable for the length of that call.
+    #[majit_macros::unroll_safe]
     pub fn fast2locals(&mut self) -> Result<(), crate::PyError> {
         // `space.setitem_str` / `space.delitem` allocate one key per slot and
         // can collect.  RPython's GC transform keeps both the frame and its
