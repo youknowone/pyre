@@ -3135,6 +3135,19 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
 /// user call nested inside a specialized builtin: it deliberately leaves the
 /// outer residual's destination untouched, so guards still snapshot the
 /// caller at the builtin-call boundary.
+/// Report which decline in [`try_walker_inline_resolved_user_call_inner`] a
+/// call hit.  The function has three dozen of them and reaches them from every
+/// call shape, so a caller that only learns "declined" has to guess; the
+/// `[binop-inline-decline]` and `[type-call-decline]` lines above name the
+/// call, and this names the test inside it that refused.
+#[inline]
+fn resolved_inline_decline<T>(op_pc: usize, line: u32) -> Result<Option<T>, DispatchError> {
+    if fbw_inline_diag_enabled() {
+        eprintln!("[resolved-inline-decline] pc={op_pc} inline_call.rs:{line}");
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3172,7 +3185,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let positional_only = fbw_callee_scope_is_positional_only(w_code);
     let vararg_slot = fbw_callee_vararg_slot(w_code);
     if !positional_only && vararg_slot.is_none() {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // Not every caller pins the callee function itself.  A specializer that
     // resolves an app-level method behind a builtin — `str(e)` reaching an
@@ -3207,7 +3220,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // such a callee can be relocated between those two reads; refuse the
         // inline rather than bake a body no invalidation covers.  `rgc.can_move`
         // parity — false when no moving GC is active.
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // `Function.funccall_valuestack` fills every parameter the call left
     // unbound from `defs_w` before entering the frame
@@ -3231,7 +3244,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let Some(defaults) =
             (unsafe { positional_defaults_for_inline(callable, &missing, nparams) })
         else {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         };
         callee_args.resize(nparams, OpRef::NONE);
         callee_arg_concretes.resize(nparams, ConcreteValue::Null);
@@ -3253,22 +3266,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // below; folding the placeholder into the tuple would put the Method
         // object where the receiver belongs.  Decline that one shape.
         if bound_method.is_some() && nparams == 0 {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         if callee_arg_concretes.len() != callee_args.len() || callee_args.len() <= nparams {
             // The empty tuple is a runtime singleton (`() is tuple([])`), so a
             // freshly allocated walker tuple would not be the object the
             // interpreter installs for a zero-surplus call.
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         let surplus_ops: Vec<OpRef> = callee_args[nparams..].to_vec();
         let mut surplus_concretes = Vec::with_capacity(surplus_ops.len());
         for concrete in &callee_arg_concretes[nparams..] {
             let ConcreteValue::Ref(obj) = *concrete else {
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             };
             if obj.is_null() {
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             }
             surplus_concretes.push(obj);
         }
@@ -3276,7 +3289,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // same constructor `emit_object_tuple_inline` reproduces.
         let concrete = pyre_object::w_tuple_new_array_backed(surplus_concretes);
         if concrete.is_null() {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         callee_args.truncate(nparams);
         callee_arg_concretes.truncate(nparams);
@@ -3312,38 +3325,38 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // needs fresh cell allocation and stays residual until that constructor
     // half is ported too.
     if callee_args.len() != seeded_locals {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     let raw_callee_code = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
     if raw_callee_code.is_null() {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     let callee_code = unsafe { &*raw_callee_code };
     let mut concrete_freevar_cells = Vec::new();
     let concrete_closure = if has_closure {
         if !callee_code.cellvars.is_empty() {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         let closure = unsafe { pyre_interpreter::function_get_closure(callable) };
         if closure.is_null()
             || !unsafe { pyre_object::is_tuple(closure) }
             || unsafe { pyre_object::w_tuple_len(closure) } != callee_code.freevars.len()
         {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         for i in 0..callee_code.freevars.len() {
             let Some(cell) = (unsafe { pyre_object::w_tuple_getitem(closure, i as i64) }) else {
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             };
             concrete_freevar_cells.push(cell);
         }
         closure
     } else {
         if !callee_code.freevars.is_empty() {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         pyre_object::PY_NULL
     };
@@ -3361,7 +3374,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             .warm_state_mut()
             .can_inline_callable(callee_green_key)
     {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     if fbw_inline_recursion_count(ctx, callee_code_key) >= FBW_MAX_INLINE_RECURSION {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
@@ -3370,13 +3383,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 .warm_state_mut()
                 .disable_noninlinable_function(callee_green_key);
         }
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     };
     if nparams > body.num_regs_r {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // Inlining a callee whose body carries an `abort_permanent` marker walks
     // the sub-walk straight into it.  That surfaces as
@@ -3403,10 +3416,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // means no installed body or descr pool, which the pool fetch immediately
     // below declines on regardless.
     let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     };
     if body_facts.has_abort_permanent {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // The callee body resolves its `d`/`j` descr operands through its OWN
     // per-fn pool, not the caller's.  Without this the sub-walk reads the
@@ -3415,7 +3428,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let Some((callee_descr_refs, callee_perfn_descrs, callee_lookup)) =
         crate::state::sub_jitcode_descr_pool_for_code(w_code)
     else {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     };
     // EXACT int/float only.  These feed `fbw_callee_body_replay_safety`, whose
     // question is "will the walker specialize this body's BINARY_OP to a native
@@ -3518,7 +3531,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let subwalk_admit = ctx.fbw_mode.carrier_resume && !ctx.fbw_mode.snapshot_sym.is_null();
         let safe_root_bridge = root_bridge || subwalk_admit;
         if !safe_root_bridge {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         bridge_rec_root_selfrec = unsafe {
             let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
@@ -3539,7 +3552,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `SELFREC_CA_FOLD_ACTIVE` exemption from the hazard arm (:2696), so its
     // recursive residual is not what named the callee here.
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // A legacy, unseeded inline sub-walk inside a FOR_ITER body resumes a guard
     // at the caller's CALL boundary, so deopt re-executes the whole callee.
@@ -3638,6 +3651,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !body_facts.has_exception_table
                     && !fbw_foriter_deferred_call_denied(callee_code_key);
+                if !foriter_deferred_admit && fbw_inline_diag_enabled() {
+                    eprintln!(
+                        "[inline-foriter-deferred] pc={} boundary={entry_is_call_boundary} \
+                         header={loop_header_admitted} for_iter={} exc_table={} denied={}",
+                        op.pc,
+                        pyre_interpreter::code_has_for_iter(callee_code),
+                        body_facts.has_exception_table,
+                        fbw_foriter_deferred_call_denied(callee_code_key),
+                    );
+                }
                 foriter_deferred_admit
             }
             CalleeReplaySafety::Dirty => {
@@ -3666,7 +3689,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // source handles it.  Stored bound methods instead take the explicit
         // multi-frame red-frame path above.
         if !legacy_admit {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
     }
     // A widened method-form body that also raises was declined here until the
@@ -3737,7 +3760,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // and re-runs the instantiation, making the result discard unnecessary to
     // represent.
     if constructor_result.is_some() && !strict_inlinable {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // A zero-param callee has no positional argument to seed, so the register
     // convention above holds vacuously and the strict path serves it like any
@@ -3748,7 +3771,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // body still takes the residual rather than the decline-to-interpretation
     // below.
     if nparams == 0 && !strict_inlinable {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
 
     // A self-recursive callee unrolls until its own frame count reaches
@@ -3818,7 +3841,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 "InlineCallee::BranchyHandlerDirty"
             },
         );
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     // A callee that raises inline needs the cross-frame bridge the carrier
     // drain builds once a guard inside the compiled chain fails.  The drain
@@ -3887,7 +3910,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         None
     };
     if foriter_dirty_bound && !try_multiframe {
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
     if !strict_inlinable && !try_multiframe && !force_caller_boundary_resume {
         // A non-self-recursive loop/branch callee that neither the strict nor
@@ -3900,13 +3923,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // cache; making an uninlineable method body blacklist the whole outer
         // loop turns a correct specialization into a compile regression.
         if method_form {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         // Full-portal cutover: instead of poisoning the trace, fall through to
         // the CALL_ASSEMBLER fold (`try_walker_call_assembler_self_recursive`,
         // reached next in the residual-call dispatch) so a recursive callee at
         // the inline cap enters via its own (possibly tmp-callback) loop token.
-        return Ok(None);
+        return resolved_inline_decline(op.pc, line!());
     }
 
     let mut callable_guard_op = callable_guard_op;
@@ -4291,7 +4314,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             None => i,
         };
         if reg >= callee_regs_r.len() {
-            return Ok(None);
+            return resolved_inline_decline(op.pc, line!());
         }
         callee_regs_r[reg] = callee_args[i];
         callee_concrete_r[reg] = callee_arg_concretes[i];
@@ -4390,7 +4413,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // `strict_seed` already excludes such a callee, so only the
             // multiframe path reaches this.
             if !callee_code.cellvars.is_empty() {
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             }
             // POP_JUMP_IF_NONE / POP_JUMP_IF_NOT_NONE lower to an `is`/`is_not`
             // identity residual call whose operands must be Ref (the codewriter
@@ -4459,7 +4482,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 });
                 if has_is_none_branch {
                     if try_multiframe {
-                        return Ok(None);
+                        return resolved_inline_decline(op.pc, line!());
                     }
                     seed_break_reason = "Collapse::IsNoneBranch";
                     break 'seed;
@@ -4473,7 +4496,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 crate::state::ensure_jitcode_index(callee_code_key as *const ())
             else {
                 if try_multiframe {
-                    return Ok(None);
+                    return resolved_inline_decline(op.pc, line!());
                 }
                 seed_break_reason = "Collapse::NoCalleeJitcode";
                 break 'seed;
@@ -4485,7 +4508,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 || ec_reg as usize >= callee_regs_r.len()
             {
                 if try_multiframe {
-                    return Ok(None);
+                    return resolved_inline_decline(op.pc, line!());
                 }
                 seed_break_reason = "Collapse::NoPortalRedRegs";
                 break 'seed;
@@ -4501,7 +4524,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let sym_ptr = ctx.fbw_mode.snapshot_sym;
             if sym_ptr.is_null() {
                 if try_multiframe {
-                    return Ok(None);
+                    return resolved_inline_decline(op.pc, line!());
                 }
                 seed_break_reason = "Collapse::NoSnapshotSym";
                 break 'seed;
@@ -5392,7 +5415,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // observes and changes nothing (`exc_override_sample_safe`),
                 // and it keeps a legal program from killing the enclosing
                 // loop's trace, which `callee_inline_unsupported` would.
-                return Ok(None);
+                return resolved_inline_decline(op.pc, line!());
             }
             // `descr_call` discards `__init__`'s result after checking it is
             // None and returns the instance instead (`check_init_returned_none`).
