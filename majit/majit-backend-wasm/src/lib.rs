@@ -3339,6 +3339,7 @@ impl majit_backend::Backend for WasmBackend {
                         inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
                         ops: ops_owned.clone(),
                         gc_table_base,
+                        constants: self.constants.clone(),
                     });
                     let mut merged_ops = candidate.ops.clone();
                     for region in &candidate.inlined_bridges {

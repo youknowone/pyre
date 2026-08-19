@@ -2266,6 +2266,11 @@ pub struct InlinedBridge {
     /// Base of this already-interned region's GC table. Each region retains
     /// its own roots; codegen selects it by the LoadFromGcTable producer.
     pub gc_table_base: u32,
+    /// The constant pool registered for this region's own trace. A pool is
+    /// per-trace (`Backend::set_constants_pool` names the next compile), and
+    /// its value-id keys — the folded values that have no producing op — are
+    /// in that trace's numbering, so the merge rebases them with the region.
+    pub constants: indexmap::IndexMap<u32, i64>,
 }
 
 /// Whether the exact operation stream emitted for `inputs` has a local loop
@@ -2291,6 +2296,7 @@ impl Clone for InlinedBridge {
                 .collect(),
             ops: self.ops.clone(),
             gc_table_base: self.gc_table_base,
+            constants: self.constants.clone(),
         }
     }
 }
@@ -2424,6 +2430,7 @@ fn rebase_region_value_ids(bridge: &InlinedBridge, offset: u32) -> (InlinedBridg
             inputargs,
             ops,
             gc_table_base: bridge.gc_table_base,
+            constants: bridge.constants.clone(),
         },
         width,
     )
@@ -2468,6 +2475,7 @@ pub fn build_wasm_module(
     let mut merged_ops = Vec::new();
     let mut gc_table_bases = HashMap::new();
     let mut rebased_bridges: Vec<InlinedBridge> = Vec::new();
+    let mut rebased_constants = indexmap::IndexMap::new();
     let (analysis_inputargs, analysis_ops): (&[InputArg], &[Op]) = if inlined_bridges.is_empty() {
         (inputargs, ops)
     } else {
@@ -2475,9 +2483,27 @@ pub fn build_wasm_module(
         merged_ops.extend(ops.iter().cloned());
         // The merged stream has one local namespace, so every region has to be
         // moved off the ids the owner and the earlier regions already use.
+        rebased_constants = constants.clone();
         let mut next_value_id = value_id_end(inputargs, ops);
         for bridge in inlined_bridges {
             let (bridge, width) = rebase_region_value_ids(bridge, next_value_id);
+            // The pool is keyed by value position for a folded value with no
+            // producing op, so rebasing the region's ids moved its reads off
+            // its own entries. Replay that window at the offset, and drop a
+            // key another trace left inside it, or `unbound_pool_const_seeds`
+            // either declines a resolvable value or seeds an unrelated one's
+            // bits. Keys outside the window are left alone: rewriting them
+            // would overwrite the entries the owner's own operations read.
+            for id in 0..width {
+                match bridge.constants.get(&id) {
+                    Some(&bits) => {
+                        rebased_constants.insert(id + next_value_id, bits);
+                    }
+                    None => {
+                        rebased_constants.shift_remove(&(id + next_value_id));
+                    }
+                }
+            }
             next_value_id += width;
             merged_inputargs.extend(bridge.inputargs.iter().map(InputArg::fresh_value_copy));
             for op in &bridge.ops {
@@ -2498,6 +2524,11 @@ pub fn build_wasm_module(
         &rebased_bridges
     };
     let region_spans = InlinedRegionSpan::collect(analysis_ops.len(), emitted_bridges);
+    let constants = if inlined_bridges.is_empty() {
+        constants
+    } else {
+        &rebased_constants
+    };
     let (mut guards, num_vars) = collect_guards_and_vars(analysis_inputargs, analysis_ops);
 
     // An inlined bridge branches back into the owner with wasm `br`.  The
