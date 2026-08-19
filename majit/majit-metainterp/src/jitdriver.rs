@@ -75,6 +75,11 @@ pub struct SingleFrameBlackholeResult {
     pub registers_f: Vec<i64>,
     pub position: usize,
     pub last_opcode_position: usize,
+    /// The drive's virtualizable, forwarded across every collection the run
+    /// performed. The register banks above cannot answer this: a `-live-`
+    /// marker clears each Ref the live set omits, so the frame red reads 0
+    /// whenever the run stopped past that register's last use.
+    pub virtualizable_ptr: i64,
 }
 
 fn bh_jitdrivers_sd(
@@ -146,7 +151,7 @@ pub fn drive_single_frame_blackhole(
     miframe: &mut crate::pyjitpl::MIFrame,
     state_field_layout: crate::blackhole::StateFieldLayout,
     virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
-    virtualizable_ptr: i64,
+    mut virtualizable_ptr: i64,
     virtualizable_stack_base: usize,
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
     mut last_exc_value: i64,
@@ -174,6 +179,17 @@ pub fn drive_single_frame_blackhole(
         packed_ref_roots.push(last_exc_value);
         index
     });
+    // The virtualizable is reachable from the Ref bank only while a `-live-`
+    // marker still names its register. The marker hook clears every Ref the
+    // live set omits, so a run that stops past the frame red's last use leaves
+    // that slot at 0 and the bank can no longer answer where the frame moved.
+    // Root the address beside the bank, the same way the exception value above
+    // is rooted, so the identity survives independently of the liveness set.
+    let virtualizable_root = (virtualizable_ptr != 0).then(|| {
+        let index = packed_ref_roots.len();
+        packed_ref_roots.push(virtualizable_ptr);
+        index
+    });
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
     }
@@ -190,6 +206,9 @@ pub fn drive_single_frame_blackhole(
     }
     if let Some(index) = exception_root {
         last_exc_value = packed_ref_roots[index];
+    }
+    if let Some(index) = virtualizable_root {
+        virtualizable_ptr = packed_ref_roots[index];
     }
 
     builder.setup_jitdrivers_sd(bh_jitdrivers_sd(metainterp_sd));
@@ -224,6 +243,10 @@ pub fn drive_single_frame_blackhole(
             ))
         }
     };
+    // Read the forwarded frame address out of the root area before dropping it.
+    if let Some(index) = virtualizable_root {
+        virtualizable_ptr = packed_ref_roots[index];
+    }
     majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
 
     let result = SingleFrameBlackholeResult {
@@ -233,6 +256,7 @@ pub fn drive_single_frame_blackhole(
         registers_f: std::mem::take(&mut bh.registers_f),
         position: bh.position,
         last_opcode_position: bh.last_opcode_position,
+        virtualizable_ptr,
     };
     builder.release_interp(bh);
     result

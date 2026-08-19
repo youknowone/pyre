@@ -2730,17 +2730,29 @@ fn try_adopt_single_frame_blackhole(
         latched.last_exc_value,
         latched.raising_exception,
     );
-    // The blackhole roots and forwards its Ref bank in place. A collection
-    // during the drive can therefore move the live frame away from the
-    // pre-drive `committed_root_addr`; recover the authoritative post-drive
-    // identity from the same per-frame red register before dereferencing it.
-    let forwarded_root_addr = terminal
-        .registers_r
-        .get(frame_reg as usize)
-        .copied()
-        .filter(|&addr| addr != 0)
-        .expect("post-blackhole frame register lost the live frame identity")
-        as usize;
+    // The blackhole roots and forwards both its Ref bank and the virtualizable
+    // in place. A collection during the drive can therefore move the live frame
+    // away from the pre-drive `committed_root_addr`, so the post-drive identity
+    // has to come from one of those forwarded channels.
+    //
+    // The frame red is not that channel. The `-live-` marker hook clears every
+    // Ref register the marker's live set omits, so the register reads 0 as soon
+    // as the drive stops past that register's last use — which is the ordinary
+    // shape for a frame that ran to its return. The driver roots the frame
+    // address separately for exactly this reason; read it there, and keep the
+    // register only as the cross-check that the two channels name one frame.
+    let forwarded_root_addr = terminal.virtualizable_ptr as usize;
+    assert!(
+        forwarded_root_addr != 0,
+        "post-blackhole drive returned no virtualizable for a preflighted frame"
+    );
+    debug_assert!(
+        matches!(
+            terminal.registers_r.get(frame_reg as usize).copied(),
+            None | Some(0)
+        ) || terminal.registers_r[frame_reg as usize] as usize == forwarded_root_addr,
+        "post-blackhole frame red and rooted virtualizable name different frames"
+    );
     // Vable opcodes address the frame carried in the MIFrame's red register,
     // i.e. the live frame whose locals were published above. Fold every
     // blackhole write back into the tracing snapshot before the portal
