@@ -3714,6 +3714,18 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
     fn is_resume_guard(&self) -> bool {
         true
     }
+    /// Subclassing in RPython keeps the base attributes readable; a Rust
+    /// newtype only exposes what it forwards, and the default accessor walks
+    /// `prev_descr`, which a wrapper does not have.  Forward both walker
+    /// marker keys explicitly: the FOR_ITER routes key failure handling on
+    /// them, and `store_final_boxes_in_guard` re-mints a marked descr on
+    /// unroll's second emission only while it can still read the key.
+    fn range_foriter_green_key(&self) -> Option<u64> {
+        self.inner.range_foriter_green_key()
+    }
+    fn instance_next_foriter_green_key(&self) -> Option<u64> {
+        self.inner.instance_next_foriter_green_key()
+    }
     /// compile.py:873-876 ResumeGuardDescr.clone() — `ResumeGuardForcedDescr`
     /// inherits the base implementation (no override at compile.py:939+),
     /// so cloning produces a plain `ResumeGuardDescr` with resume attributes
@@ -3966,6 +3978,15 @@ impl majit_ir::Descr for ResumeGuardExcDescr {
     }
     fn is_resume_guard(&self) -> bool {
         true
+    }
+    /// The `ResumeGuardForcedDescr` reasoning applies here unchanged: a
+    /// newtype exposes only what it forwards, and both walker marker keys
+    /// have to stay readable through it.
+    fn range_foriter_green_key(&self) -> Option<u64> {
+        self.inner.range_foriter_green_key()
+    }
+    fn instance_next_foriter_green_key(&self) -> Option<u64> {
+        self.inner.instance_next_foriter_green_key()
     }
     /// compile.py:881-882 `class ResumeGuardExcDescr(ResumeGuardDescr): pass`
     /// — no clone() override, so inheriting compile.py:873-876
@@ -6026,6 +6047,34 @@ mod fail_descr_tests {
     }
 
     /// compile.py:832-851 ResumeGuardCopiedDescr(prev) parity:
+    /// The instance-next FOR_ITER marker key must stay readable no matter
+    /// which subtype the guard's opcode selects.  Two consumers depend on it:
+    /// guard-failure routing keys the FOR_ITER handling on it, and
+    /// `store_final_boxes_in_guard` re-mints a marked descr for unroll's
+    /// second emission only while it can still read the key — without that
+    /// re-mint the second emission finalizes an already-finalized descr and
+    /// trips the once-per-descr `finish()` assert.
+    #[test]
+    fn test_instance_next_marker_survives_every_guard_subtype() {
+        const KEY: u64 = 0xF0_1D_ED;
+        for opcode in [
+            None,
+            Some(OpCode::GuardNotForced),
+            Some(OpCode::GuardNotForced2),
+            Some(OpCode::GuardException),
+            Some(OpCode::GuardNoException),
+            Some(OpCode::GuardClass),
+        ] {
+            let descr = make_resume_guard_descr_instance_next_foriter(opcode, KEY);
+            assert_eq!(
+                descr.instance_next_foriter_green_key(),
+                Some(KEY),
+                "opcode {opcode:?} minted a descr whose marker key is unreadable"
+            );
+            assert!(descr.is_resume_guard(), "opcode {opcode:?}");
+        }
+    }
+
     /// `get_resumestorage()` chases to `prev`, `fail_arg_types`
     /// shares the donor's vector, `is_resume_guard_copied()` flags
     /// the subtype, and the exc variant additionally reports
