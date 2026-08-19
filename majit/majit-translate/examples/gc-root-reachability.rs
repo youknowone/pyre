@@ -105,6 +105,40 @@ fn main() {
                 unjustified.push(*id);
             }
         }
+        let mut traits: Vec<(&String, &usize)> = cg.opaque.dyn_trait.iter().collect();
+        traits.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let top: Vec<String> = traits
+            .iter()
+            .take(8)
+            .map(|(n, c)| format!("{}={c}", n.rsplit("::").next().unwrap_or(n)))
+            .collect();
+        println!(
+            "   opaque call census    : dyn-trait={} sites over {} traits, fn-value={}, unknown={}",
+            traits.iter().map(|(_, c)| **c).sum::<usize>(),
+            traits.len(),
+            cg.opaque.fn_value,
+            cg.opaque.unknown
+        );
+        let mut variants: Vec<(&&str, &usize)> = cg.opaque.by_variant.iter().collect();
+        variants.sort_by(|a, b| b.1.cmp(a.1));
+        println!(
+            "       by charon spelling: {}",
+            variants
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        println!("       top traits: {}", top.join(" "));
+        if std::env::var("GC_OPAQUE_SOURCES").is_ok() {
+            let src = framework::dynamic_call_sources(&llbc);
+            let mut rows: Vec<(&String, &usize)> = src.iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            println!("       fn-value callee sources:");
+            for (label, count) in rows.iter().take(20) {
+                println!("           {count:5}  {label}");
+            }
+        }
         println!(
             "   fns tainted by an unresolved callee (transitive): {} / {}",
             opaque.len(),
