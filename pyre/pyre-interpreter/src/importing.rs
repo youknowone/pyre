@@ -1524,6 +1524,14 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
             crate::gateway::with_module(static_name, value);
         }
     }
+    // `mixedmodule.py:192-193` — a module def that names no `__doc__` still
+    // publishes one, through `get__doc__`'s `newtext_or_none(cls.__doc__)`.
+    // A Rust module def carries no class docstring, so the None arm is what
+    // every def that stays silent resolves to; the key itself is not optional,
+    // and `dir(<module>)` lists it.
+    if unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, "__doc__") }.is_none() {
+        crate::module_ns_store(w_dict, "__doc__", pyre_object::w_none());
+    }
     // Before `sys.modules` exists the native bootstrap registry is the only
     // owner and retains the legacy immortal module shape. Afterwards an
     // audited collectible module follows the PyPy `space.sys.modules` object

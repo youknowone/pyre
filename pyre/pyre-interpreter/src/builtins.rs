@@ -2835,6 +2835,14 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
 }
 
 pub fn install_default_builtins(ns: PyObjectRef) {
+    // The `Module` class docstring at `pypy/module/__builtin__/moduledef.py:9`,
+    // which `MixedModule.get__doc__` publishes as this module's `__doc__`.
+    // Seeded here rather than in the module def because the execution
+    // context builds this namespace directly, and the module `import
+    // builtins` returns wraps that same dict.
+    crate::module_ns_get_or_insert_with(ns, "__doc__", || {
+        pyre_object::w_str_new("Built-in functions, exceptions, and other objects.")
+    });
     crate::module_ns_get_or_insert_with(ns, "print", || {
         make_module_builtin_function("print", builtin_print)
     });

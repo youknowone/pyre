@@ -1585,6 +1585,40 @@ pub fn init_typeobjects() {
                 &pyre_object::functional::ZIP_TYPE as *const PyType,
                 "(*iterables, strict=False)",
             ),
+            // The internal object families 3.14 also publishes a signature
+            // for. Each is constructible from Python, so `inspect.signature`
+            // resolves against these rather than falling back to `(*args,
+            // **kwargs)`.
+            (&pyre_object::ELLIPSIS_TYPE as *const PyType, "()"),
+            (
+                &pyre_object::GENERIC_ALIAS_TYPE as *const PyType,
+                "(origin, args, /)",
+            ),
+            (
+                &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType,
+                "()",
+            ),
+            (&pyre_object::MODULE_TYPE as *const PyType, "(name, doc=None)"),
+            (
+                &pyre_object::MAPPING_PROXY_TYPE as *const PyType,
+                "(mapping)",
+            ),
+            (
+                &pyre_object::nestedscope::CELL_TYPE as *const PyType,
+                "([contents])",
+            ),
+            (
+                &pyre_object::function::METHOD_TYPE as *const PyType,
+                "(function, instance, /)",
+            ),
+            (
+                &crate::function::FUNCTION_TYPE as *const PyType,
+                "(code, globals, name=None, argdefs=None, closure=None,\n         kwdefaults=None)",
+            ),
+            (
+                &crate::pycode::CODE_TYPE as *const PyType,
+                "(argcount, posonlyargcount, kwonlyargcount, nlocals, stacksize,\n     flags, codestring, constants, names, varnames, filename, name,\n     qualname, firstlineno, linetable, exceptiontable, freevars=(),\n     cellvars=(), /)",
+            ),
         ] {
             let w_typeobject = *reg
                 .get(&(pytype as usize))

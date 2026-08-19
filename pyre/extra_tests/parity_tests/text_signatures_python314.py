@@ -11,6 +11,7 @@ import array
 import builtins
 import inspect
 import sys
+import types
 
 
 def check_descriptors(owner, expected):
@@ -1021,5 +1022,51 @@ check_descriptors(type, EXPECTED)
 assert str(inspect.signature(type.__call__)) == "(self, /, *args, **kwargs)"
 assert str(inspect.signature(type.__prepare__)) == "(name, bases, /, **kwds)"
 assert str(inspect.signature(type.__instancecheck__)) == "(self, instance, /)"
+
+
+# internal_type_text_signatures_python314
+#
+# The signature sits on the type object rather than on a `__new__` descriptor,
+# so `inspect.signature` resolves against it instead of falling back to
+# `(*args, **kwargs)`.
+
+EXPECTED_TYPES = {
+    types.EllipsisType: "()",
+    types.GenericAlias: "(origin, args, /)",
+    types.NotImplementedType: "()",
+    types.ModuleType: "(name, doc=None)",
+    types.MappingProxyType: "(mapping)",
+    types.CellType: "([contents])",
+    types.MethodType: "(function, instance, /)",
+    types.FunctionType: (
+        "(code, globals, name=None, argdefs=None, closure=None,\n"
+        "         kwdefaults=None)"
+    ),
+    types.CodeType: (
+        "(argcount, posonlyargcount, kwonlyargcount, nlocals, stacksize,\n"
+        "     flags, codestring, constants, names, varnames, filename, name,\n"
+        "     qualname, firstlineno, linetable, exceptiontable, freevars=(),\n"
+        "     cellvars=(), /)"
+    ),
+}
+
+for owner, signature in EXPECTED_TYPES.items():
+    assert owner.__text_signature__ == signature, (owner, owner.__text_signature__)
+
+assert str(inspect.signature(types.MethodType)) == "(function, instance, /)"
+assert str(inspect.signature(types.ModuleType)) == "(name, doc=None)"
+
+
+# module_doc_python314
+#
+# Every module publishes `__doc__` in its own dict, so the key is listed by
+# `dir()` and the read never falls through to the `module` type's docstring.
+
+assert "__doc__" in builtins.__dict__
+assert "__doc__" in dir(builtins)
+assert isinstance(builtins.__doc__, str)
+
+for name in ("sys", "gc", "_ast", "_io"):
+    assert "__doc__" in __import__(name).__dict__, name
 
 print("OK")
