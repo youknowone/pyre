@@ -857,19 +857,44 @@ impl VirtualState {
         if concrete_refs.len() != self.state.len() {
             return None;
         }
+        // Resolve each candidate ONCE and look the answer up, rather than
+        // rescanning `concrete_refs` per inputarg.
+        //
+        // virtualstate.py:427-431 `_enum` assigns `position_in_notvirtuals` in
+        // constant time on the same walk that will later place the box, and
+        // virtualstate.py:412-425 `enum_forced_boxes` writes straight to
+        // `boxes[self.position_in_notvirtuals]`. Upstream never searches for
+        // the slot, so its cost is one pass. Recovering the mapping by a
+        // nested scan makes it quadratic in the entry count, and
+        // `get_replacement_opref` is not a cheap comparison: it walks the
+        // producer maps and then the forwarding chain, so the same candidate
+        // was being re-resolved once per inputarg.
+        //
+        // Both lists are one entry per loop-carried value, so a virtualizable
+        // array contributes one entry per declared element whether or not the
+        // loop reads it (pyjitpl.py:3329 `original_boxes +=
+        // self.virtualizable_boxes`). The quadratic term is therefore paid in
+        // the square of the declared array length.
+        //
+        // Reverse iteration with an overwriting insert leaves the LOWEST
+        // matching index in the map, which is what the first-match-wins scan
+        // this replaces returned.
+        let mut index_by_resolved: std::collections::HashMap<OpRef, usize> =
+            std::collections::HashMap::with_capacity(concrete_refs.len());
+        for (index, &candidate) in concrete_refs.iter().enumerate().rev() {
+            if self.state[index].is_virtual() || candidate.is_constant() {
+                continue;
+            }
+            let resolved_candidate = ctx.get_replacement_opref(candidate);
+            index_by_resolved.insert(resolved_candidate, index);
+        }
         inputargs
             .iter()
             .map(|&inputarg| {
                 let resolved_inputarg = ctx.get_replacement_opref(inputarg);
-                concrete_refs
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, &candidate)| {
-                        if self.state[index].is_virtual() || candidate.is_constant() {
-                            return None;
-                        }
-                        (ctx.get_replacement_opref(candidate) == resolved_inputarg).then_some(index)
-                    })
+                index_by_resolved
+                    .get(&resolved_inputarg)
+                    .copied()
                     .or_else(|| inputarg.is_input_arg().then_some(inputarg.raw() as usize))
             })
             .collect()
