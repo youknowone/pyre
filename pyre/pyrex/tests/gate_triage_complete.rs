@@ -209,12 +209,18 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
 
 /// Does this `##` heading introduce a section that records history?
 ///
-/// §1/§1b/§1c list gates whose readers were deleted, §2 lists names that were
-/// never env vars, and §3 lists names with no read site. A name there is the
-/// record of a gate that is *gone*, so it must not satisfy the brake — otherwise
-/// re-introducing a reader for `PYRE_SINGLE_PASS` lands green on the strength of
-/// its own retirement row, with neither its new polarity nor a retirement plan
+/// §2 lists names that were never env vars; a section of retired gates or of
+/// names with no read site records gates that are *gone*. A name in either is
+/// the record of something that does not gate anything today, so it must not
+/// satisfy the brake — otherwise re-introducing a reader lands green on the
+/// strength of an obituary, with neither its new polarity nor a retirement plan
 /// written down.
+///
+/// `gate-triage.md` carries no retirement sections today (they were removed on
+/// 2026-08-20 in favour of the file's history), so only the "not gates" arm
+/// matches. The other two stay because either document may grow such a section
+/// again, and the per-row check below is what covers a retirement note written
+/// under a heading that reads live.
 fn is_history_heading(heading: &str) -> bool {
     let lower = heading.to_ascii_lowercase();
     // "retired", not "retire": §4 is a *live* section whose heading says when
@@ -259,15 +265,14 @@ fn gate_names_in<'a>(line: &'a str, prefix: &str) -> Vec<&'a str> {
 ///
 /// **Retirement is a property of the gate, not of the line.** A retirement line
 /// retires its *subject*, and a name stays retired wherever else it is written:
-/// §5's table records `PYRE_CARRIER_EXC_RESUME` retired with its reader deleted,
-/// while §1e's prose — a live section — discusses the seam that gate used to
-/// guard and names it three more times. Counting those mentions as documentation
-/// made a gate with no reader look live.
+/// a gate recorded retired in one table, then named again by live prose
+/// discussing the seam it used to guard, would otherwise look live on the
+/// strength of those mentions while having no reader at all.
 ///
 /// **Subject, not mention**: only the *first* name on a retirement line is
-/// retired by it. §1c's row for `PYRE_AUTHORITATIVE` ends "`PYRE_PROBE_AUTHORITATIVE`
-/// is separate and remains live" — the whole point of that clause is that the
-/// second name is not the one being retired.
+/// retired by it. A row retiring `PYRE_AUTHORITATIVE` may end
+/// "`PYRE_PROBE_AUTHORITATIVE` is separate and remains live" — the whole point
+/// of that clause is that the second name is not the one being retired.
 ///
 /// "retired", not "retire": §4 is a live section whose gates are the ones that
 /// "retire when the epic closes".
@@ -397,7 +402,7 @@ fn namespace(prefix: &str) -> &'static GateNamespace {
 /// and a heading reword would otherwise change what they accept without failing.
 /// Anchored on each side: a retired name must not count, a listed live name must.
 #[test]
-fn pyre_triage_live_history_split_holds_at_four_anchors() {
+fn pyre_triage_live_history_split_holds_at_both_anchors() {
     let root = repo_root();
     let ns = namespace("PYRE_");
     // Bound, not inlined: the returned set borrows the document text.
@@ -405,21 +410,11 @@ fn pyre_triage_live_history_split_holds_at_four_anchors() {
     let documented = gates_documented_in(&triage, ns.prefix);
 
     assert!(
-        !documented.contains("PYRE_SINGLE_PASS"),
-        "PYRE_SINGLE_PASS is named only in a retirement section and has no read \
-         site, so it must not count as documented — is_history_heading no longer \
-         matches gate-triage.md's headings"
-    );
-    assert!(
-        !documented.contains("PYRE_FBW_VABLE_SCALAR_CA"),
-        "PYRE_FBW_VABLE_SCALAR_CA is marked RETIRED inside §1d, a section whose \
-         heading reads live — the per-row retirement check is no longer catching it"
-    );
-    assert!(
-        !documented.contains("PYRE_CARRIER_EXC_RESUME"),
-        "PYRE_CARRIER_EXC_RESUME is recorded retired in §5 and its reader is gone, \
-         but §1e's live prose names it three times — a retired subject is retired \
-         wherever else it is written, and this check is what enforces that"
+        !documented.contains("PYRE_STR_DESCR"),
+        "PYRE_STR_DESCR is a field-descriptor const named only in §2, the \
+         not-gates section, and nothing reads it from the environment — so it \
+         must not count as documented. is_history_heading no longer matches \
+         gate-triage.md's headings"
     );
     assert!(
         documented.contains("PYRE_JD1"),
@@ -478,9 +473,9 @@ fn every_live_triage_entry_still_has_a_reader() {
             stale.is_empty(),
             "{} name(s) are listed live in {} but nothing in the tree reads \
              them:\n{}\n\n\
-             Deleting the row loses why the gate existed. Move each to a retirement \
-             section (§1c) naming the change that removed its reader — that is what \
-             stops the next reader of this name from passing on an obituary.",
+             Delete the row in the same change that deleted the reader: this file \
+             records what is live, and the document's own history is where a \
+             retired gate's polarity and epic are read from.",
             stale.len(),
             ns.doc,
             stale
