@@ -3447,7 +3447,7 @@ pub(crate) fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
 }
 
 /// `unroll.py:497 ExportedState.short_boxes` shape: per-OpRef
-/// `ProducedShortOp` records derived from `ctx.exported_short_boxes`.
+/// `ProducedShortOp` records derived from `PreviewShortState::short_boxes`.
 ///
 /// The label-arg → short-inputarg rename happens at EXPORT time inside
 /// `produce_arg` (shortpreamble.py:285/294): every short op the import
