@@ -178,6 +178,19 @@ jobs:
     # current. The `llbc2-` prefix retires the keys whose payload predates it —
     # the key is the wide digest, which no edit to the extraction driver moves,
     # so without a new namespace the shapeless entries would restore forever.
+    #
+    # Each entry also takes a `restore-keys` prefix, so a miss falls back to
+    # this crate's most recent entry instead of restoring nothing. The exact
+    # key is the WIDE digest — `Compute LLBC fingerprints` runs before any
+    # `.readfiles` exists, so `source=` is the whole cargo closure there and
+    # any edit anywhere misses every crate. The fallback is what lets the
+    # narrow digest decide instead: `extract-llbc.py` recomputes each crate's
+    # stamp against the current tree, using the restored `.readfiles` to
+    # narrow `source=`, and compares it to the restored stamp as exact text.
+    # A crate whose own closure did not move skips; every other crate
+    # re-extracts. So the key only chooses what is OFFERED — a stale
+    # restore costs a download and is then re-extracted, it cannot survive
+    # into the artefact.
     - name: Cache LLBC (majit-rlib)
       id: llbc-cache-rlib
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -188,6 +201,8 @@ jobs:
           build/llbc/majit-rlib.ullbc.readfiles
           build/llbc/majit-rlib.*.layouts.ullbc
         key: llbc2-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
+        restore-keys: |
+          llbc2-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
     - name: Cache LLBC (pyre-object)
       id: llbc-cache-object
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -198,6 +213,8 @@ jobs:
           build/llbc/pyre-object.ullbc.readfiles
           build/llbc/pyre-object.*.layouts.ullbc
         key: llbc2-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
+        restore-keys: |
+          llbc2-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
     - name: Cache LLBC (pyre-interpreter)
       id: llbc-cache-interpreter
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -208,6 +225,8 @@ jobs:
           build/llbc/pyre-interpreter.ullbc.readfiles
           build/llbc/pyre-interpreter.*.layouts.ullbc
         key: llbc2-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
+        restore-keys: |
+          llbc2-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
     - name: Cache LLBC (pyre-jit)
       id: llbc-cache-jit
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -217,6 +236,8 @@ jobs:
           build/llbc/pyre-jit.ullbc.fingerprint
           build/llbc/pyre-jit.ullbc.readfiles
         key: llbc2-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
+        restore-keys: |
+          llbc2-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
     - name: Extract LLBC
       # Runs only when some crate's cache missed. extract-llbc.py self-skips
       # the crates whose .ullbc + matching .fingerprint stamp were restored
