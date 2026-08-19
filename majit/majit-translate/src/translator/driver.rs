@@ -1537,6 +1537,11 @@ impl TranslationDriver {
     }
 
     /// Upstream `task_jittest_lltype(self)` at `:365-376`.
+    ///
+    /// Untested here: `restartable_point(auto='run')` skips its prompt and
+    /// falls through to `RealRuntime::fork`, so a unit test that calls this
+    /// forks the test runner. Covering the ordering needs the driver to
+    /// accept an injectable `CheckpointRuntime`.
     pub fn task_jittest_lltype(&self) -> Result<TaskOutput, TaskError> {
         // Upstream `:371-372`: `from rpython.translator.goal import
         // unixcheckpoint; unixcheckpoint.restartable_point(auto='run')`.
@@ -2598,30 +2603,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "task_jittest_lltype calls the real `restartable_point(auto='run')`, \
-                which now matches upstream `unixcheckpoint.py:13-16` (skip prompt) and \
-                falls through to `RealRuntime::fork`, forking the test runner. \
-                Re-enable once the driver accepts an injectable CheckpointRuntime; \
-                in production the contract still holds and is exercised by `pyre/check.py`."]
-    fn task_jittest_lltype_calls_unixcheckpoint_first() {
-        // Upstream `:371-372`: `unixcheckpoint.restartable_point(auto='run')`
-        // runs *before* the jittest module is imported. The local port
-        // dispatches `restartable_point` first and surfaces *its*
-        // TaskError before reaching the cross-crate jittest stub.
-        let td = TranslationDriver::new_default().expect("driver");
-        td.setup(None, None, None, HashMap::new(), None)
-            .expect("setup");
-        let err = td
-            .task_jittest_lltype()
-            .expect_err("jittest leaf is still missing");
-        assert!(
-            err.message.contains("rpython.jit.tl.jittest.jittest"),
-            "task_jittest_lltype must surface the cross-crate jittest stub, got: {}",
-            err.message
-        );
-    }
-
-    #[test]
     fn task_database_c_sets_translator_frozen_before_c_backend_leaf() {
         let td = TranslationDriver::new_default().expect("driver");
         td.setup(None, None, None, HashMap::new(), None)
@@ -2751,38 +2732,14 @@ mod tests {
             .expect("default fork_before=None must skip body");
     }
 
-    /// Upstream `_event(self, "pre", goal, ...)` at `:613-622`: when
-    /// `fork_before` matches the resolved goal, the body dispatches
-    /// `unixcheckpoint.restartable_point(auto='run')`.  Now that the
-    /// Rust `restartable_point` matches upstream `unixcheckpoint.py:13-16`
-    /// (skip prompt under `auto='run'`, then fall through to
-    /// `RealRuntime::fork`), this test would fork the test runner.
-    /// Re-enable once the driver accepts an injectable runtime.
-    #[test]
-    #[ignore = "_event 'pre' calls the real `restartable_point(auto='run')`, which \
-                now follows upstream and would fork the test runner. \
-                Re-enable when the driver accepts an injectable CheckpointRuntime."]
-    fn event_pre_fork_before_matching_goal_propagates_unixcheckpoint_error() {
-        // `fork_before` is a `ChoiceOption` per `translationoption.rs:399-414`
-        // (upstream `translationoption.py:146-150`); the raw value is
-        // one of `["annotate", "rtype", "backendopt", "database",
-        // "source", "pyjitpl"]`. After `backend_select_goals`,
-        // `'rtype'` resolves to `'rtype_lltype'`.
-        let setopts: Vec<(String, OptionValue)> = vec![(
-            "fork_before".to_string(),
-            OptionValue::Choice("rtype".to_string()),
-        )];
-        let td = TranslationDriver::new(Some(setopts), None, Vec::new(), None, None, None, None)
-            .expect("driver");
-        let _ = td
-            ._event_with_func("pre", "rtype_lltype", false)
-            .expect_err("must surface DEFERRED");
-    }
-
     /// Upstream `_event(self, "pre", goal, ...)` at `:617`: when
     /// `fork_before` is set but doesn't match the resolved goal
     /// (e.g. fork_before='rtype' but goal='annotate'), the body skips.
     /// Pinned so the goal-mismatch path stays observable.
+    ///
+    /// The matching arm has no test: it dispatches
+    /// `restartable_point(auto='run')`, which forks the test runner.
+    /// Covering it needs an injectable `CheckpointRuntime`.
     #[test]
     fn event_pre_fork_before_non_matching_goal_returns_ok() {
         let setopts: Vec<(String, OptionValue)> = vec![(
