@@ -11,24 +11,37 @@ use majit_charon_reader::Llbc;
 use majit_translate::flowspace::model::Variable;
 use majit_translate::front::mir::lower_fun_decl;
 use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
+use std::sync::OnceLock;
 
 const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-interpreter.ullbc"
 );
 
+/// Load the shipped interpreter LLBC once and share it across every test.
+/// `Llbc` is read-only after `load`, so a single parse behind a `OnceLock` is
+/// sufficient: `get_or_init` runs the load exactly once even under the
+/// concurrent test threads, and the lowering entry points only borrow it.
+/// `None` means the artefact is absent, which degrades the tests to a skip
+/// rather than a failure on a tree that has not run the extraction.
+fn interpreter_llbc() -> Option<&'static Llbc> {
+    static LLBC: OnceLock<Option<Llbc>> = OnceLock::new();
+    LLBC.get_or_init(|| {
+        if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
+            eprintln!(
+                "skipping: {INTERPRETER_LLBC} is missing; run \
+                 `python3 scripts/extract-llbc.py pyre-interpreter`"
+            );
+            return None;
+        }
+        Some(Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc"))
+    })
+    .as_ref()
+}
+
 /// Lower `pyframe::<Impl>::<leaf>` out of the shipped interpreter LLBC.
-/// Returns `None` when the artefact is absent so the tests degrade to a
-/// skip rather than a failure on a tree that has not run the extraction.
 fn lower_pyframe_method(leaf: &str) -> Option<FunctionGraph> {
-    if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
-        eprintln!(
-            "skipping: {INTERPRETER_LLBC} is missing; run \
-             `python3 scripts/extract-llbc.py pyre-interpreter`"
-        );
-        return None;
-    }
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let llbc = interpreter_llbc()?;
     let suffix = format!("::{leaf}");
     let fd = llbc
         .iter_local_fns()
@@ -41,11 +54,7 @@ fn lower_pyframe_method(leaf: &str) -> Option<FunctionGraph> {
 /// distinct functions in `pyframe` render as `pyframe::<Impl>::new`, so a
 /// test that wants one of them has to pick it out by shape.
 fn lower_all_named(leaf: &str) -> Option<Vec<FunctionGraph>> {
-    if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
-        eprintln!("skipping: {INTERPRETER_LLBC} is missing");
-        return None;
-    }
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let llbc = interpreter_llbc()?;
     let suffix = format!("::{leaf}");
     Some(
         llbc.iter_local_fns()
