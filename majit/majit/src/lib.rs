@@ -33,7 +33,9 @@ pub use majit_trace as trace;
 /// Backend abstraction: Backend trait, JitCellToken, DeadFrame.
 pub use majit_backend as backend;
 
-/// Cranelift backend: native code generation.
+/// Cranelift backend: native code generation. Present under the `cranelift`
+/// feature, which is what pulls the backend crate in.
+#[cfg(feature = "cranelift")]
 pub use majit_backend_cranelift as cranelift;
 
 /// Meta-interpreter: JitDriver, MetaInterp, JitState, resume, blackhole.

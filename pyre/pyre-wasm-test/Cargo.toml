@@ -11,4 +11,12 @@ path = "src/main.rs"
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
-pyre-jit = { workspace = true, features = ["cranelift"] }
+# Inherited without a backend feature of its own. This binary drives the plain
+# interpreter and names no `pyre_jit` item; the dependency is here because
+# `pyre-interpreter` reaches `majit-metainterp`, which does not compile with
+# neither backend arm enabled. Naming one here would be unconditional —
+# `--no-default-features` does not reach a feature written into a dependency —
+# and feature unification would carry it to every other member, so a
+# `cargo test --all --features dynasm` would build the other backend's
+# toolchain as well.
+pyre-jit = { workspace = true }

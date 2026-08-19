@@ -7,7 +7,7 @@ repository.workspace = true
 description = "Meta-tracing JIT compiler framework"
 
 [features]
-cranelift = ["majit-metainterp/cranelift"]
+cranelift = ["majit-metainterp/cranelift", "dep:majit-backend-cranelift"]
 dynasm = ["majit-metainterp/dynasm"]
 
 [dependencies]
@@ -15,6 +15,10 @@ majit-ir = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-trace = { workspace = true }
 majit-backend = { workspace = true }
-majit-backend-cranelift = { workspace = true }
+# Optional so the arm above is what pulls it. Written unconditionally it
+# reached every build that names this crate, including one that selected the
+# other backend, and feature unification carried the cranelift arms of
+# majit-metainterp and its dependents along with it.
+majit-backend-cranelift = { workspace = true, optional = true }
 majit-gc = { workspace = true }
 majit-macros = { workspace = true }
