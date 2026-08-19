@@ -3689,15 +3689,51 @@ impl MiniMarkGC {
     #[inline]
     fn validate_type_id(&self, type_id: u32, obj_addr: usize, site: &str) {
         if type_id as usize >= self.types.len() {
+            self.report_invalid_type_id(type_id, obj_addr, site);
+        }
+    }
+
+    /// Out-of-line half of [`validate_type_id`](Self::validate_type_id).
+    ///
+    /// A type id past the end of the type table has two very different
+    /// causes, and the bare number does not separate them.  When the header
+    /// word is `FORWARDED_MARKER` the object is not mistyped at all: it is a
+    /// nursery corpse whose live copy sits at the forwarding address, and the
+    /// caller reached it through a field nothing updated.  Say so, and give
+    /// the copy plus the nursery geometry and collection cadence, so the
+    /// surviving question is only which holder kept the stale pointer.
+    #[cold]
+    #[inline(never)]
+    fn report_invalid_type_id(&self, type_id: u32, obj_addr: usize, site: &str) -> ! {
+        let header_addr = obj_addr - GcHeader::SIZE;
+        let nursery_start = self.nursery.start_ptr() as usize;
+        let nursery_end = nursery_start + self.nursery.size();
+        let in_nursery = (nursery_start..nursery_end).contains(&obj_addr);
+        let header = unsafe { *(header_addr as *const GcHeader) };
+        if header.is_forwarded() {
+            let moved_to = unsafe { GcHeader::forwarding_address(header_addr as *const GcHeader) };
+            let moved_to_type_id = self
+                .is_managed_heap_object(moved_to)
+                .then(|| unsafe { (*header_of(moved_to)).type_id() });
             panic!(
-                "GC BUG: invalid type_id={} at obj_addr={:#x} (header_addr={:#x}, nursery_start={:#x}, site={})",
-                type_id,
-                obj_addr,
-                obj_addr - GcHeader::SIZE,
-                self.nursery.start_ptr() as usize,
-                site,
+                "GC BUG: {site} was handed {obj_addr:#x}, a STALE address whose object a                  minor collection already moved to {moved_to:#x}                  (live copy type_id={moved_to_type_id:?}).                  nursery=[{nursery_start:#x}, {nursery_end:#x}) obj_in_nursery={in_nursery}                  offset_from_nursery_start={:#x} minor_collections={} major_collections={}.                  FORWARDED_MARKER sets every flag bit, so an inline TRACK_YOUNG_PTRS test                  cannot tell this corpse from a live old object — the defect is the holder                  that kept the pre-collection pointer, not this barrier.",
+                obj_addr.wrapping_sub(nursery_start),
+                self.minor_collections,
+                self.major_collections,
             );
         }
+        panic!(
+            "GC BUG: invalid type_id={} at obj_addr={:#x} (header_addr={:#x}, nursery_start={:#x}, site={})              header_word={:#x} obj_in_nursery={} minor_collections={} major_collections={}",
+            type_id,
+            obj_addr,
+            header_addr,
+            nursery_start,
+            site,
+            header.tid_and_flags,
+            in_nursery,
+            self.minor_collections,
+            self.major_collections,
+        );
     }
 
     /// `base.py:134-144 _get_size_for_typeid` — the payload size of `obj_addr`,
@@ -10424,6 +10460,39 @@ mod tests {
             gc.minor_collections, 0,
             "stress_collect defaults off: no collection without opt-in"
         );
+    }
+
+    /// A forwarded header is a moved object, not an unknown type.  The
+    /// barrier's type-id validation must say so and name the live copy: the
+    /// bare out-of-range number reads the same whether the header is a corpse
+    /// marker or genuine corruption, and only the first has a holder to go
+    /// find.
+    #[test]
+    #[should_panic(expected = "already moved to")]
+    fn write_barrier_on_a_forwarded_object_names_the_live_copy() {
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(1 << 20);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        let obj = gc.alloc_with_type(tid, ptr_size);
+        unsafe {
+            *(obj.0 as *mut GcRef) = GcRef::NULL;
+        }
+        let stale = obj.0;
+        let mut root = obj;
+        unsafe {
+            gc.roots.add(&mut root as *mut GcRef);
+        }
+        gc.do_collect_nursery();
+        gc.roots.clear();
+        assert_ne!(root.0, stale, "the collection must move the object");
+        assert!(
+            unsafe { (*header_of(stale)).is_forwarded() },
+            "the moved-from header must carry the forwarding marker"
+        );
+
+        // What a holder that kept the pre-collection pointer does next.
+        gc.remember_young_pointer(GcRef(stale));
     }
 
     #[test]

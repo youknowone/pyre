@@ -941,6 +941,14 @@ impl FixedObjectArray {
             unsafe { self.items_mut_ptr().add(index).write(value) };
             return;
         }
+        // `FORWARDED_MARKER` sets every flag bit, so the test above cannot
+        // tell an array a minor collection already moved from a live old one.
+        // Report it here, where the array and the store that reached it are
+        // both still named, instead of one frame deeper where the barrier sees
+        // only a type id past the end of the type table.
+        if unsafe { (*header).is_forwarded() } {
+            stale_array_abort(self as *mut Self as usize, index);
+        }
         let _roots = crate::gc_roots::push_roots();
         let root_base = _roots.base();
         _roots.pin_root(self as *mut Self as PyObjectRef);
@@ -969,6 +977,29 @@ impl FixedObjectArray {
     pub fn swap(&mut self, a: usize, b: usize) {
         self.as_mut_slice().swap(a, b);
     }
+}
+
+/// Out-of-line half of [`FixedObjectArray::set_ref`]'s forwarded-header check.
+///
+/// A forwarded header means the array is a nursery corpse: the collection that
+/// moved it left this holder's field naming the old copy.  Print the live copy
+/// and hand the address to whoever can name the holder before aborting, so the
+/// surviving question is only which field kept the pre-collection pointer.
+#[cold]
+#[inline(never)]
+fn stale_array_abort(array_addr: usize, index: usize) -> ! {
+    let header = unsafe { majit_gc::header::header_of(array_addr) };
+    let moved_to = unsafe { majit_gc::header::GcHeader::forwarding_address(header) };
+    eprintln!(
+        "STALE ARRAY: FixedObjectArray::set_ref(index={index}) reached {array_addr:#x}, \
+         already moved to {moved_to:#x}"
+    );
+    let named = crate::gc_hook::report_stale_array_holder(array_addr);
+    panic!(
+        "FixedObjectArray::set_ref on {array_addr:#x}: a minor collection moved this \
+         array to {moved_to:#x} and its holder kept the pre-collection pointer \
+         (holder named: {named})"
+    );
 }
 
 impl Index<usize> for FixedObjectArray {

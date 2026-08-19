@@ -5233,6 +5233,59 @@ pub extern "C" fn jit_locals_dict_snapshot(w_locals: i64) -> i64 {
     }
 }
 
+/// Name whichever frame on the current call chain still points at a
+/// `locals_cells_stack_w` array a collection has already moved.
+///
+/// Installed as `pyre_object::gc_hook`'s stale-array holder reporter: the
+/// object-space store site sees only the array, while the holder's generation
+/// is the datum that separates the two causes.  An old-generation holder means
+/// the minor collection never scanned it — a remembered-set miss.  A holder
+/// that is itself forwarded means the frame was never traced, so every field
+/// read out of it names pre-collection memory.  Walks `f_backref` because a
+/// JIT-built inline callee frame sits on that chain and nowhere else.
+///
+/// This runs on an already-fatal path, so it stops rather than chase an
+/// unvalidated `f_backref`: losing the walk costs one line, while faulting
+/// inside it would cost the whole report.
+pub fn report_stale_locals_array_holder(stale_addr: usize) -> bool {
+    let mut frame = crate::eval::current_frame();
+    let mut depth = 0usize;
+    let mut found = false;
+    while !frame.is_null() && depth < 64 {
+        let frame_addr = frame as usize;
+        let owned = pyre_object::gc_hook::try_gc_owns_object(frame_addr as *mut u8);
+        if depth > 0 && !owned {
+            eprintln!(
+                "STALE ARRAY holder scan: depth={depth} frame={frame_addr:#x} is not GC-owned; \
+stopping rather than dereferencing an unvalidated f_backref"
+            );
+            break;
+        }
+        let array = unsafe { (*frame).locals_cells_stack_w } as usize;
+        let nursery = majit_gc::gc_is_nursery_object(frame_addr);
+        let (type_id, forwarded, tracks_young) = if owned {
+            let header = unsafe { *majit_gc::header::header_of(frame_addr) };
+            (
+                header.type_id(),
+                header.is_forwarded(),
+                header.has_flag(majit_gc::flags::TRACK_YOUNG_PTRS),
+            )
+        } else {
+            (u32::MAX, false, false)
+        };
+        let holds = array == stale_addr;
+        found |= holds;
+        eprintln!(
+            "STALE ARRAY holder scan: depth={depth} frame={frame_addr:#x} \
+locals={array:#x} holds_stale={holds} gc_owned={owned} nursery={nursery} \
+type_id={type_id} frame_forwarded={forwarded} track_young_ptrs={tracks_young}"
+        );
+        frame = unsafe { (*frame).f_backref };
+        depth += 1;
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::load_const_from_code;

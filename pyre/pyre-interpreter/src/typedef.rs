@@ -251,6 +251,12 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
 ///
 /// Must be called before any getattr on builtin objects.
 pub fn init_typeobjects() {
+    // The object-space store site can see that a `locals_cells_stack_w` array
+    // has already moved, but not who still points at it; this crate owns the
+    // frame chain, so it supplies the holder scan.
+    pyre_object::gc_hook::register_stale_array_holder_hook(
+        crate::pyframe::report_stale_locals_array_holder,
+    );
     // Interpreter-only test path: libtest runs each `#[test]` on a fresh
     // thread and `dict_eq_hook`'s hash hook is thread-local, so install it
     // here — the single type-system entry every dict-building test funnels

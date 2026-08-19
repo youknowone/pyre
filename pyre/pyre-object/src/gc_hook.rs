@@ -543,6 +543,31 @@ pub fn try_gc_remove_root(slot: *mut *mut u8) -> bool {
     }
 }
 
+/// Signature of the host-side reporter that names whoever still points at a
+/// GC array a collection has already moved. `pyre-object` sees only the array;
+/// the interpreter owns the frame chain the array hangs off, so it installs
+/// this and reports the holder's identity and generation. Returns whether a
+/// holder was found.
+pub type StaleArrayHolderHookFn = fn(stale_addr: usize) -> bool;
+
+majit_gc::global_hook!(static STALE_ARRAY_HOLDER_HOOK: StaleArrayHolderHookFn);
+
+/// Install the stale-array holder reporter. Overwrites any previously-
+/// installed hook.
+pub fn register_stale_array_holder_hook(hook: StaleArrayHolderHookFn) {
+    STALE_ARRAY_HOLDER_HOOK.set(Some(hook));
+}
+
+/// Ask the installed reporter to describe whoever still points at
+/// `stale_addr`. Returns `false` when no hook is installed, which is the
+/// answer a bare object-space build (unit tests, the L1 stepping stone) gives.
+pub fn report_stale_array_holder(stale_addr: usize) -> bool {
+    match STALE_ARRAY_HOLDER_HOOK.get() {
+        Some(f) => f(stale_addr),
+        None => false,
+    }
+}
+
 /// Signature of the host-side "is GC-managed" predicate. Callers
 /// (host-side allocators with mixed `try_gc_alloc_stable` /
 /// `std::alloc` allocation paths during the L1/L2 stepping-stone
