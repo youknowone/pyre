@@ -55,6 +55,29 @@ pub(crate) fn containing_py_pc_for_jitcode_pc(
     0
 }
 
+/// Name the Python instruction a JitCode PC falls inside.
+///
+/// Every walk outcome that maps to `TraceAction::AbortPermanent` reports the
+/// same `DispatchError` name, so the bytecode is the only thing that tells one
+/// permanent decline from another. Diagnostics that have to attribute an
+/// outcome to an opcode go through here rather than projecting the offset
+/// themselves, so the census and the residual-decline probe cannot drift onto
+/// different coordinate systems.
+///
+/// `None` for the name means the caller had no code object or the coordinate
+/// is past the end of the bytecode; the Python PC is still returned.
+pub(crate) fn py_op_name_for_jitcode_pc(
+    metadata: &crate::PyJitCodeMetadata,
+    code: Option<&pyre_interpreter::CodeObject>,
+    jit_pc: usize,
+) -> (usize, Option<String>) {
+    let py_pc = containing_py_pc_for_jitcode_pc(metadata, jit_pc) as usize;
+    let name = code
+        .and_then(|code| pyre_interpreter::decode_instruction_at(code, py_pc))
+        .map(|(instruction, _)| format!("{instruction:?}"));
+    (py_pc, name)
+}
+
 /// Resolve `MetaInterpStaticData.jitcodes[jitcode_index]` to the containing
 /// Python instruction coordinate for a stored JitCode offset.
 pub fn containing_py_pc_for_jitcode_pc_public(jitcode_index: i32, offset: i32) -> Option<i32> {

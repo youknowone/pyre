@@ -2331,14 +2331,9 @@ pub(crate) fn probe_resid_decline_ctx<Sym: WalkSym>(
         let s = unsafe { &*sym };
         if !s.jitcode().is_null() {
             let jc = unsafe { &*s.jitcode() };
-            let pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op_pc)
-                as usize;
-            let op = if !jc.payload.code_ptr.is_null() {
-                pyre_interpreter::decode_instruction_at(unsafe { &*jc.payload.code_ptr }, pc)
-                    .map(|(i, _)| format!("{i:?}"))
-            } else {
-                None
-            };
+            let code = (!jc.payload.code_ptr.is_null()).then(|| unsafe { &*jc.payload.code_ptr });
+            let (pc, op) =
+                crate::py_coord::py_op_name_for_jitcode_pc(&jc.payload.metadata, code, op_pc);
             (Some(pc), op)
         } else {
             (None, None)

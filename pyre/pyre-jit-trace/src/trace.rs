@@ -4995,12 +4995,35 @@ fn run_perfn_walk<Sym: WalkSym>(
             leg,
         );
         if std::env::var_os("PYRE_FBW_CENSUS").is_some() {
+            // Every compilation cliff ends the walk under one error name, so
+            // `end` alone cannot say which bytecode the location was lost to.
+            // Name the opcode for the permanent decline, the one outcome that
+            // takes the location out of tracing for good
+            // (`TraceAction::AbortPermanent` -> DONT_TRACE_HERE).
+            let cliff = match &walk_result {
+                Err(crate::jitcode_dispatch::DispatchError::AbortPermanentMarkerReached { pc }) => {
+                    let code = (!pjc.code_ptr.is_null()).then(|| unsafe { &*pjc.code_ptr });
+                    let (py_pc, name) =
+                        crate::py_coord::py_op_name_for_jitcode_pc(&pjc.metadata, code, *pc);
+                    // Cut the operand rendering off the variant the same way
+                    // `end` is cut above, so a corpus run tallies the line with
+                    // `sort | uniq -c` instead of splitting one opcode across
+                    // every distinct argument shape.
+                    let mut name = name.unwrap_or_else(|| "?".to_string());
+                    if let Some(at) = name.find(|c: char| matches!(c, '(' | '{' | ' ')) {
+                        name.truncate(at);
+                    }
+                    Some(format!(" py_pc={py_pc} py_op={name}"))
+                }
+                _ => None,
+            };
             eprintln!(
                 "[fbw-census] end={end} committed={committed} leg={leg} bridge={} \
                  unj_val={unj_val} unj_sym={unj_sym} exec_v={exec_v} exec_mf={exec_mf} \
                  exec_pl={exec_pl} effects={effects} jstore={jstore} jappend={jappend} \
-                 jcell={jcell} unrecoverable={unrecoverable}",
+                 jcell={jcell} unrecoverable={unrecoverable}{}",
                 ctx.is_bridge_trace,
+                cliff.as_deref().unwrap_or(""),
             );
         }
     }
