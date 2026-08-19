@@ -120,7 +120,8 @@ pub fn set_handler(signum: i32, handler: PyObjectRef) {
 
 /// Drop every registered handler, at the point in teardown where running
 /// app-level code is no longer sound.  A signal recorded after this reaches
-/// `report_signal` with nothing to call and is reported rather than run.
+/// `report_signal` with nothing to call, which is the case that returns
+/// without running anything.
 pub fn clear_handlers() {
     let d = handlers_dict();
     unsafe { pyre_object::w_dict_clear(d) };
@@ -378,14 +379,11 @@ impl CheckSignalAction {
 /// interp_signal.py:196-209 `report_signal`.
 fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError> {
     let w_handler = get_handler(n);
-    // A handler can be replaced between the moment the signal is recorded and
-    // this poll, and teardown drops every handler outright.  Delivering the
-    // default action here would turn a simulated signal into a real one —
-    // `raise_signal`/`interrupt_main` only ever pretend — so the lost signal
-    // is written out as an unraisable error instead.
-    if w_handler.is_null() || !crate::baseobjspace::callable_w(w_handler) {
-        report_ignored_signal(n);
-        return Ok(());
+    if w_handler.is_null() {
+        return Ok(()); // no handler, ignore signal
+    }
+    if !crate::baseobjspace::callable_w(w_handler) {
+        return Ok(()); // w_handler is SIG_IGN or SIG_DFL (an int)
     }
     // interp_signal.py:205 — re-install for OSes that clear the handler
     // (no-op on SA_RESTART platforms).
@@ -403,15 +401,6 @@ fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError
             return Err(err);
         }
     Ok(())
-}
-
-/// Report a signal that was recorded while a handler was installed but had
-/// none left to run by the time it was polled.
-fn report_ignored_signal(n: i32) {
-    crate::host_seam::emit_stderr(b"Exception ignored while calling signal handler:\n");
-    crate::host_seam::emit_stderr(
-        format!("OSError: Signal {n} ignored due to race condition\n").as_bytes(),
-    );
 }
 
 /// interp_signal.py:169-193 `_report_wakeup_fd_error` — surface the errno
