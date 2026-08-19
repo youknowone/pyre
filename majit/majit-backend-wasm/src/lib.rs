@@ -117,6 +117,10 @@ impl FrameShortage {
 /// shortage without changing the compile result.
 static INLINE_GEOMETRY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static INLINE_GEOMETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+/// The first three reasons an inline-bridge install was refused, verbatim.
+/// The names carry "trial" because they are a guest export the runner looks up
+/// by string; the errors themselves come from the install itself, which is the
+/// only build there is.
 static INLINE_TRIAL_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub(crate) fn record_inline_geometry(kind: FrameShortageKind, needed: usize, available: usize) {
@@ -154,6 +158,37 @@ fn record_inline_trial_error(error: &BackendError) {
     let mut errors = INLINE_TRIAL_ERRORS.lock().unwrap();
     if errors.len() < 3 {
         errors.push(error.to_string());
+    }
+}
+
+/// Sort a refused inline install into the decline tallies the host prints.
+/// `replace_module` rejecting the bytes, or a build with no host binding to
+/// replace them through, is a re-emission outcome and stays on its own counter;
+/// every other reason is the merged module declining to emit, which is what the
+/// per-shortage buckets are for.
+fn classify_inline_install_error(error: &BackendError) {
+    let BackendError::Unsupported(reason) = error else {
+        diag_bump(37);
+        diag_bump(43);
+        return;
+    };
+    if reason.contains("wasm host rejected the re-emitted trace module")
+        || reason.contains("no host replacement binding")
+    {
+        diag_bump(30);
+        return;
+    }
+    diag_bump(37);
+    if reason.contains("frame value slots exceed frozen frame layout") {
+        diag_bump(40);
+    } else if reason.contains("ordinary ref homes") {
+        diag_bump(41);
+    } else if reason.contains("label resume layout") {
+        diag_bump(48);
+    } else if reason.contains("inlined bridge stream has no local loop LABEL") {
+        diag_bump(42);
+    } else {
+        diag_bump(43);
     }
 }
 
@@ -3349,84 +3384,62 @@ impl majit_backend::Backend for WasmBackend {
                     candidate.classptr_to_typeid = self.collect_classptr_typeid_table(&merged_ops);
                     candidate.guard_gc_type_info = self.collect_guard_gc_type_info(&merged_ops);
                     candidate.nursery = nursery_alloc_params(&merged_ops);
-                    match codegen::build_wasm_module(&candidate) {
-                        Err(ref error @ BackendError::Unsupported(ref reason)) => {
-                            record_inline_trial_error(error);
-                            diag_bump(37);
-                            if reason.contains("frame value slots exceed frozen frame layout") {
-                                diag_bump(40);
-                            } else if reason.contains("ordinary ref homes") {
-                                diag_bump(41);
-                            } else if reason.contains("label resume layout") {
-                                diag_bump(48);
-                            } else if reason
-                                .contains("inlined bridge stream has no local loop LABEL")
-                            {
-                                diag_bump(42);
-                            } else {
-                                diag_bump(43);
+                    let source_loop = original_token
+                        .compiled
+                        .get()
+                        .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+                        .expect("source loop disappeared before inline install");
+                    // The local branch supersedes any previous direct-cell
+                    // dispatch for this guard. Remove it before reemit so
+                    // the fresh array cannot replay a contradictory slot.
+                    let old_bridge_slot = source_loop
+                        .bridge_slots
+                        .borrow_mut()
+                        .remove(&source_fail_index);
+                    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                    if source_cells_base != 0 {
+                        let cell = (source_cells_base as usize + source_fail_index as usize * 4)
+                            as *mut u32;
+                        unsafe { core::ptr::write(cell, 0) };
+                    }
+                    // Eligibility IS the emission: `reemit_loop` runs the same
+                    // `build_wasm_module` over the same candidate, and nothing
+                    // it does before that call mutates state a failure would
+                    // have to unwind — it reads the fail-index base and
+                    // allocates a cell array that is dropped on the error path.
+                    // So install directly and let the build answer, instead of
+                    // asking it once as a trial and once for real.
+                    let old_inputs = source_loop.reemit.replace(Some(candidate));
+                    match self.reemit_loop(original_token) {
+                        Ok(()) => {
+                            self.trace_counter += 1;
+                            if let Some(table) = gc_table {
+                                Self::register_gc_table(original_token, table);
                             }
+                            diag_bump(31);
+                            diag_bump(32);
+                            return Ok(AsmInfo {
+                                code_addr: 0,
+                                code_size: 0,
+                            });
                         }
-                        Err(ref error @ BackendError::CompilationFailed(_)) => {
-                            record_inline_trial_error(error);
-                            diag_bump(37);
-                            diag_bump(43);
-                        }
-                        Ok(_) => {
-                            let source_loop = original_token
-                                .compiled
-                                .get()
-                                .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-                                .expect("source loop disappeared before inline install");
-                            // The local branch supersedes any previous direct-cell
-                            // dispatch for this guard. Remove it before reemit so
-                            // the fresh array cannot replay a contradictory slot.
-                            let old_bridge_slot = source_loop
-                                .bridge_slots
-                                .borrow_mut()
-                                .remove(&source_fail_index);
-                            #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-                            if source_cells_base != 0 {
-                                let cell = (source_cells_base as usize
-                                    + source_fail_index as usize * 4)
-                                    as *mut u32;
-                                unsafe { core::ptr::write(cell, 0) };
-                            }
-                            let old_inputs = source_loop.reemit.replace(Some(candidate));
-                            match self.reemit_loop(original_token) {
-                                Ok(()) => {
-                                    self.trace_counter += 1;
-                                    if let Some(table) = gc_table {
-                                        Self::register_gc_table(original_token, table);
-                                    }
-                                    diag_bump(31);
-                                    diag_bump(32);
-                                    return Ok(AsmInfo {
-                                        code_addr: 0,
-                                        code_size: 0,
-                                    });
-                                }
-                                Err(_) => {
-                                    source_loop.reemit.replace(old_inputs);
-                                    if let Some(slot) = old_bridge_slot {
-                                        source_loop
-                                            .bridge_slots
-                                            .borrow_mut()
-                                            .insert(source_fail_index, slot);
-                                        #[cfg(all(
-                                            target_arch = "wasm32",
-                                            not(target_os = "wasi")
-                                        ))]
-                                        if source_cells_base != 0 {
-                                            let cell = (source_cells_base as usize
-                                                + source_fail_index as usize * 4)
-                                                as *mut u32;
-                                            unsafe { core::ptr::write(cell, slot) };
-                                        }
-                                    }
-                                    diag_bump(30);
+                        Err(error) => {
+                            source_loop.reemit.replace(old_inputs);
+                            if let Some(slot) = old_bridge_slot {
+                                source_loop
+                                    .bridge_slots
+                                    .borrow_mut()
+                                    .insert(source_fail_index, slot);
+                                #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                                if source_cells_base != 0 {
+                                    let cell = (source_cells_base as usize
+                                        + source_fail_index as usize * 4)
+                                        as *mut u32;
+                                    unsafe { core::ptr::write(cell, slot) };
                                 }
                             }
+                            record_inline_trial_error(&error);
+                            classify_inline_install_error(&error);
                         }
                     }
                 }
