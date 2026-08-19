@@ -5325,14 +5325,32 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     if unsafe { is_function(callable) } {
         let code = unsafe { pyre_interpreter::getcode(callable) };
         if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
-            let call_args = reload_args();
+            // `reload_args` allocates a vector per residual builtin call.  A
+            // call with no bound receiver and at most four positionals reads
+            // them straight out of the shadow slots instead — the same
+            // allocation-free shape the bound-receiver arm above takes.  The
+            // slice contents are identical either way, so the dispatch below
+            // is unchanged.
+            let mut inline_args = [pyre_object::PY_NULL; 4];
+            let spilled_args;
+            let call_args: &[pyre_object::PyObjectRef] = if args.len() <= inline_args.len()
+                && pyre_object::gc_roots::shadow_stack_get(root_base + 1).is_null()
+            {
+                for (index, slot) in inline_args[..args.len()].iter_mut().enumerate() {
+                    *slot = pyre_object::gc_roots::shadow_stack_get(root_base + 2 + index);
+                }
+                &inline_args[..args.len()]
+            } else {
+                spilled_args = reload_args();
+                &spilled_args
+            };
             // `call_args` are raw positionals; a HOPELESS-arity Signature
             // (`*args`, optional positional) needs `_match_signature` binding
             // before the body reads its slots.  `builtin_code_call` never binds,
             // so route through the positional entry that does.
             return match pyre_interpreter::call::builtin_code_call_positional(
                 code as pyre_object::PyObjectRef,
-                &call_args,
+                call_args,
             ) {
                 Ok(result) if !result.is_null() => result as i64,
                 Ok(_) => 0,
