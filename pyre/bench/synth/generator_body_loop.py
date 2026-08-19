@@ -36,4 +36,4 @@ def run(rounds, m):
 total = run(ROUNDS, N)
 print("total:", total)
 assert total == 287280600, total
-print("OK")
+print("PASS")

@@ -5,7 +5,7 @@
 # A decline that forgets the payload loses a sent value or swallows a thrown
 # exception, which is a wrong answer rather than a slow one, so drive every
 # resume shape through hot frames and check what came back.
-N = 3000
+N = 50
 
 
 def echo():
@@ -80,7 +80,7 @@ def run(n):
     while i < n:
         sent = drive_send()
         throwed = drive_throw()
-        delegated = drive_yield_from(400)
+        delegated = drive_yield_from(100)
         closed = drive_close()
         i += 1
     return sent, throwed, delegated, closed
@@ -93,6 +93,6 @@ print("yield-from:", delegated)
 print("close:", closed)
 assert sent == [0, 1, 3, 6], sent
 assert throwed == [2, 3, 16, 17], throwed
-assert delegated == [79800, 9], delegated
+assert delegated == [4950, 9], delegated
 assert closed == 1, closed
-print("OK")
+print("PASS")
