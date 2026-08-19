@@ -5534,7 +5534,16 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     // CPython/PyPy LOAD_FROM_DICT_OR_GLOBALS uses mapping subscription, not
     // attribute lookup.  Preserve __getitem__/__missing__ and propagate every
     // exception except the KeyError that selects the globals fallback.
-    let key = pyre_object::w_str_new(varname);
+    // `pycode.py:127-129 co_names_w[idx]` — this residual already resolved the
+    // name through `code.names[idx]`, so it names the key from the same index
+    // instead of minting an immortal `w_str` on every execution.
+    let key = unsafe {
+        pyre_interpreter::pycode::w_code_getname_w_or_new(
+            w_code_ptr as pyre_object::PyObjectRef,
+            idx,
+            varname,
+        )
+    };
     match pyre_interpreter::baseobjspace::getitem(dict, key) {
         Ok(val) => return val as i64,
         Err(err) if matches!(err.kind, pyre_interpreter::PyErrorKind::KeyError) => {}
@@ -6252,7 +6261,9 @@ pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: i64, namei: i64) -> i6
 /// `space.setitem` and module/class namespaces through the dict
 /// strategy.  Same blackhole-only execution contract and `w_name` ABI
 /// as `bh_load_name_fn`.  `STORE_NAME` carries no nameindex-keyed
-/// cache upstream, so the trait's `nameindex` argument is passed as 0.
+/// cache upstream and this residual is handed the wrapped name rather than an
+/// index, so it enters through `store_name_value_w`, which names the key from
+/// that `w_name` instead of resolving a `co_names_w` slot.
 /// Returns 1 on success; on error it sets `BH_LAST_EXC_VALUE` and
 /// returns 0, matching `bh_store_subscr_fn`.
 pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i64 {
@@ -6263,9 +6274,13 @@ pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i
          site must thread portal_frame_reg as the leading ref operand"
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let name =
-        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
-    match frame.store_name_value(name, 0, value as pyre_object::PyObjectRef) {
+    match unsafe {
+        pyre_interpreter::eval::store_name_value_w(
+            frame,
+            w_name as pyre_object::PyObjectRef,
+            value as pyre_object::PyObjectRef,
+        )
+    } {
         Ok(()) => 1,
         Err(mut err) => {
             // Publish into both exception cells: STORE_NAME lowers into the
@@ -6286,8 +6301,9 @@ pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i
 /// routes through `w_dict_setitem_str` on the eagerly-resolved
 /// `w_globals` (or the back-mirror dict storage when null).  Same
 /// blackhole-only execution contract and `w_name` ABI as
-/// `bh_store_name_fn`.  `STORE_GLOBAL` carries no nameindex-keyed cache,
-/// so the trait's `nameindex` argument is passed as 0.  Returns 1 on
+/// `bh_store_name_fn`.  `STORE_GLOBAL` carries no nameindex-keyed cache
+/// and this residual is handed the wrapped name rather than an index, so it
+/// enters through `store_global_value_w`.  Returns 1 on
 /// success; on error it sets `BH_LAST_EXC_VALUE` and returns 0.
 pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) -> i64 {
     use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
@@ -6297,9 +6313,13 @@ pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) ->
          site must thread portal_frame_reg as the leading ref operand"
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let name =
-        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
-    match frame.store_global_value(name, 0, value as pyre_object::PyObjectRef) {
+    match unsafe {
+        pyre_interpreter::eval::store_global_value_w(
+            frame,
+            w_name as pyre_object::PyObjectRef,
+            value as pyre_object::PyObjectRef,
+        )
+    } {
         Ok(()) => 1,
         Err(mut err) => {
             // Publish into both exception cells, matching the STORE_NAME arm.

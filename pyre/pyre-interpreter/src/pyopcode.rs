@@ -639,6 +639,21 @@ pub fn opcode_store_fast_store_fast<H: LocalOpcodeHandler + ?Sized>(
     handler.store_local_value(idx2, v2)
 }
 
+/// The `nameindex` a caller passes when it addresses no `co_names_w` slot
+/// (`pycode.py:127-129`).
+///
+/// `0` cannot say this — it is a valid index, and naming the first entry of the
+/// name table is exactly the wrong answer.  Out of range for every table, so
+/// `w_code_getname_w` resolves it to `PY_NULL` and the key is minted the way it
+/// was before the table existed.
+///
+/// The caller that needs it is the implicit class-body `__class__` store, whose
+/// name is a literal rather than a `co_names` entry.  (The JIT's
+/// `bh_store_name_fn` / `bh_store_global_fn` residuals also hold no index, but
+/// they are handed an already-wrapped `w_name` and enter through
+/// `eval::store_name_value_w`, which needs no index at all.)
+pub const NO_NAMEINDEX: usize = usize::MAX;
+
 pub fn opcode_store_name<H: NamespaceOpcodeHandler + ?Sized>(
     handler: &mut H,
     name: &str,

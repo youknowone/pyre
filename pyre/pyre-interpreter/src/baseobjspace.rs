@@ -4335,11 +4335,38 @@ unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObject
 /// Take the `_checked` variant so that surfaces as an error rather than a
 /// miss; only that path wraps the key, to name it in a 3.14 hash-error.
 pub fn finditem_str(obj: PyObjectRef, key: &str) -> Result<Option<PyObjectRef>, PyError> {
+    finditem_str_named(obj, key, pyre_object::PY_NULL, 0)
+}
+
+/// [`finditem_str`] for a caller that can name the key without allocating — a
+/// `(code object, name index)` pair addressing a `co_names_w` slot
+/// (`pycode.py:127-129`), as `pyopcode.py:965` reaches its varname.
+///
+/// The pair is resolved only on the arm that consumes a wrapped key, so a
+/// shortcut dict answers from the borrowed `&str` without touching the slot.
+/// That laziness is the point: reading it is a `dont_look_inside` call the JIT
+/// residualises, and the shortcut is the arm that already allocated nothing.
+///
+/// A `PY_NULL` `pycode` addresses no slot, which is also what a wrapper with no
+/// name table resolves to, so [`finditem_str`] and a nameless code object land
+/// on the same mint.
+pub fn finditem_str_named(
+    obj: PyObjectRef,
+    key: &str,
+    pycode: PyObjectRef,
+    nameindex: usize,
+) -> Result<Option<PyObjectRef>, PyError> {
     if is_shortcut_dict(obj) {
         return unsafe { pyre_object::dictmultiobject::w_dict_getitem_str_checked(obj, key) }
-            .map_err(|_| take_pending_dict_key_error(w_str_new(key)));
+            .map_err(|_| take_pending_dict_key_error(wrapped_key(key, pycode, nameindex)));
     }
-    finditem(obj, w_str_new(key))
+    finditem(obj, wrapped_key(key, pycode, nameindex))
+}
+
+/// The wrapped lookup key: the code object's shared name when the caller named
+/// one, otherwise a freshly minted `w_str`.
+fn wrapped_key(key: &str, pycode: PyObjectRef, nameindex: usize) -> PyObjectRef {
+    unsafe { crate::pycode::w_code_getname_w_or_new(pycode, nameindex, key) }
 }
 
 /// PyPy-compatible identity check returning a raw boolean value.

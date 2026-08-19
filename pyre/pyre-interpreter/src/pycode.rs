@@ -280,6 +280,27 @@ pub struct PyCode {
     /// never resized; a `null` slot is unrealized.  The whole pointer is `null`
     /// when `code_ptr` is null or unaligned (test fixtures, gateway builtins).
     pub co_consts_w: *mut Vec<std::sync::atomic::AtomicPtr<PyObject>>,
+    /// `pycode.py:127-129 self.co_names_w = [space.new_interned_str(aname) for
+    /// aname in names]` (`_immutable_fields_ co_names_w[*]`, pycode.py:100).
+    /// The realized name objects indexed by name index.  `getname_w(index)`
+    /// (`pyopcode.py:521-522`) returns `co_names_w[index]`, so every opcode
+    /// needing a wrapped name hands back the one object this code object owns
+    /// rather than minting a `W_UnicodeObject` per execution — the identity
+    /// argument of `w_qualname` below, applied per name index.
+    ///
+    /// PyPy interns the whole list in the constructor.  Pyre realizes slots
+    /// lazily at the same wrapped/unwrapped compiler boundary `co_consts_w`
+    /// uses, so a name that never executes costs nothing.
+    ///
+    /// Slots hold `w_str_new` results — `malloc_typed`-immortal, so a published
+    /// pointer is fixed and the table needs no walking: there is nothing to
+    /// forward and nothing whose liveness a trace could decide.  That is also
+    /// why a lost publish race can simply abandon its candidate.
+    ///
+    /// Owned via `Box::into_raw`, sized to `code.names.len()` at construction,
+    /// never resized; a `null` slot is unrealized.  The whole pointer is `null`
+    /// when `code_ptr` is null or unaligned (test fixtures, gateway builtins).
+    pub co_names_w: *mut Vec<std::sync::atomic::AtomicPtr<PyObject>>,
     /// `pycode.py:127 self.co_qualname = qualname` realized as one shared
     /// wrapped object.
     ///
@@ -629,6 +650,19 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         });
         Box::into_raw(Box::new(v))
     };
+    // `pycode.py:127-129 self.co_names_w = [...]` — the realized-name table
+    // sized to the name count, with slots filled lazily by `w_code_getname_w`.
+    let co_names_w = if !code_ptr_aligned {
+        std::ptr::null_mut()
+    } else {
+        let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        let names_len = code_ref.names.len();
+        let mut v: Vec<std::sync::atomic::AtomicPtr<PyObject>> = Vec::with_capacity(names_len);
+        v.resize_with(names_len, || {
+            std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())
+        });
+        Box::into_raw(Box::new(v))
+    };
     let npure_cellvars = if !code_ptr_aligned {
         u32::MAX
     } else {
@@ -658,6 +692,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         globals_caches,
         mapdict_caches,
         co_consts_w,
+        co_names_w,
         w_qualname: pyre_object::PY_NULL,
         w_name: pyre_object::PY_NULL,
     };
@@ -2012,6 +2047,80 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     published
 }
 
+/// `pyopcode.py:521-522 getname_w(index) -> self.getcode().co_names_w[index]`
+/// — the one wrapped name this code object holds at `idx`.
+///
+/// Realized on first demand with `w_str_new`, whose result is
+/// `malloc_typed`-immortal: the published pointer is fixed, so a slot is never
+/// forwarded and a thread losing the publish race abandons its candidate rather
+/// than freeing it.
+///
+/// Returns `PY_NULL` when the enclosing code or the slot cannot be resolved
+/// (test fixtures and gateway builtins carry no name table); callers fall back
+/// to wrapping the key themselves.
+///
+/// # Safety
+/// `w_code_obj` must point to a valid `PyCode`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
+    if w_code_obj.is_null() {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    let w_code = unsafe { &*(w_code_obj as *const PyCode) };
+    if w_code.co_names_w.is_null() {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    let slot_table = unsafe { &*w_code.co_names_w };
+    let Some(slot) = slot_table.get(idx) else {
+        return pyre_object::pyobject::PY_NULL;
+    };
+    // PyPy's GIL serializes first access to its already-interned list. Pyre is
+    // free-threaded and realizes this slot lazily, so every reader and writer
+    // uses the AtomicPtr element stored in co_names_w.
+    let existing = slot.load(std::sync::atomic::Ordering::Acquire);
+    if !existing.is_null() {
+        return existing;
+    }
+    // Guard `code_ptr` before dereferencing it — the same null/alignment check
+    // the lazy-cache initializers use.
+    let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
+    if w_code.code_ptr.is_null() || (w_code.code_ptr as i64) & align_mask != 0 {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    let code = unsafe { &*(w_code.code_ptr as *const crate::CodeObject) };
+    let Some(name) = code.names.get(idx) else {
+        return pyre_object::pyobject::PY_NULL;
+    };
+    let realized = w_str_new(name);
+    match slot.compare_exchange(
+        std::ptr::null_mut(),
+        realized,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    ) {
+        Ok(_) => realized,
+        Err(winner) => winner,
+    }
+}
+
+/// [`w_code_getname_w`] with the caller's own fallback folded in: a wrapper
+/// carrying no name table answers `PY_NULL`, and the key is then minted the way
+/// it was before `co_names_w` existed.
+///
+/// # Safety
+/// `w_code_obj` must be null or point to a valid `PyCode`.
+pub unsafe fn w_code_getname_w_or_new(
+    w_code_obj: PyObjectRef,
+    idx: usize,
+    name: &str,
+) -> PyObjectRef {
+    let w_name = unsafe { w_code_getname_w(w_code_obj, idx) };
+    if w_name.is_null() {
+        return w_str_new(name);
+    }
+    w_name
+}
+
 /// pypy/module/__pypy__/interp_magic.py:79
 /// `func.getcode().hidden_applevel = True` — explicit setter for the
 /// `__pypy__.hidden_applevel(func)` builtin marker, plus the
@@ -2297,6 +2406,10 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     if !code.co_consts_w.is_null() {
         drop(unsafe { Box::from_raw(code.co_consts_w) });
         code.co_consts_w = std::ptr::null_mut();
+    }
+    if !code.co_names_w.is_null() {
+        drop(unsafe { Box::from_raw(code.co_names_w) });
+        code.co_names_w = std::ptr::null_mut();
     }
 }
 
