@@ -1133,6 +1133,22 @@ pub struct BhFieldSpec {
     pub is_immutable: bool,
     pub is_quasi_immutable: bool,
     pub index_in_parent: usize,
+    /// Whether the producing layout *declared* this field its struct's class
+    /// word, or `None` when nothing declared and the rebuilding side is left
+    /// to guess from `name` (`class_word_inferred_from_name`).
+    ///
+    /// Carried on the wire because the guess cannot reconstruct it: pyre's
+    /// `Method` has a payload field whose qualified name `"Method.w_class"`
+    /// is spelled exactly like the inherited header row, so a rebuilt descr
+    /// that re-guessed would report *two* class words for one layout and
+    /// `SizeDescr::class_word_field` would answer the payload.
+    ///
+    /// `Option`, not a pre-applied `bool`: a spec built from parts that had no
+    /// layout in reach (`bh_field_spec_from_parts`) must not launder its guess
+    /// into a declaration, which would then outrank the layout producer that
+    /// finds the same `(STRUCT, fieldname)` slot cached.
+    #[serde(default)]
+    pub is_class_word: Option<bool>,
 }
 
 impl BhFieldSpec {
@@ -1183,6 +1199,10 @@ impl BhFieldSpec {
             is_immutable: fd.is_immutable(),
             is_quasi_immutable: fd.is_quasi_immutable(),
             index_in_parent: fd.index_in_parent(),
+            // `declared_w_class`, not `is_w_class`: the latter answers for a
+            // descr that only guessed from its name, and putting that on the
+            // wire would make the rebuilt descr a declaration nothing declared.
+            is_class_word: fd.declared_w_class(),
         }
     }
 }

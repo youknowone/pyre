@@ -832,6 +832,10 @@ impl JitCodeBuilder {
                     is_immutable: false,
                     is_quasi_immutable: false,
                     index_in_parent: idx,
+                    // The emit-site layout table names fields but declares no
+                    // header row, so the rebuilding side falls back to the
+                    // name.
+                    is_class_word: None,
                 }
             })
             .collect()

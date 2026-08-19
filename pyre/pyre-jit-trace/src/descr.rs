@@ -5123,8 +5123,8 @@ mod tests {
         // `find()` stopped on it in both lists.
         //
         // Now `build_object_descr_group_with_extra_gc_edges` declares
-        // `is_class_word: offset == W_CLASS_OFFSET`, a layout invariant a name
-        // rule cannot express, and the exceptions retired.
+        // `is_class_word: Some(offset == W_CLASS_OFFSET)`, a layout invariant a
+        // name rule cannot express, and the exceptions retired.
         assert!(
             violations.is_empty(),
             "{} of {} groups resolve a class word that is not the inherited \
@@ -5324,6 +5324,96 @@ mod tests {
         assert!(!call.is_result_signed());
     }
 
+    /// A class-word declaration must survive serialization into a blackhole
+    /// spec and back.
+    ///
+    /// `BhFieldSpec` is the only channel between a layout producer and the
+    /// descriptors rebuilt from `descrs.bin`, so a flag it does not carry is a
+    /// flag the far side has to guess — and the guess
+    /// (`class_word_inferred_from_name`) reads a name, which a *payload* field
+    /// can spell exactly like its layout's header row. The synthetic layout
+    /// below is that shape: the payload at offset 24 is the one the name rule
+    /// picks, and the header at offset 8 is the one the layout declares.
+    #[test]
+    fn a_class_word_declaration_survives_the_blackhole_round_trip() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::{BhFieldSpec, BhSizeSpec};
+
+        let spec = |field_key: &str,
+                    name: &str,
+                    offset: usize,
+                    index_in_parent: usize,
+                    is_class_word: bool| {
+            majit_ir::descr::SimpleFieldDescrSpec {
+                index: index_in_parent as u32,
+                field_key: field_key.to_string(),
+                name: name.to_string(),
+                offset,
+                field_size: 8,
+                field_type: Type::Ref,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                flag: ArrayFlag::Pointer,
+                virtualizable: false,
+                index_in_parent,
+                is_class_word: Some(is_class_word),
+            }
+        };
+        let group = majit_ir::descr::make_simple_descr_group(
+            u32::MAX,
+            32,
+            0,
+            0,
+            &[
+                spec("w_class", "Synth.w_class", 24, 0, false),
+                spec("header", "Synth.header", 8, 1, true),
+            ],
+        );
+        assert_eq!(
+            group.size_descr.class_word_field().map(|fd| fd.offset()),
+            Some(8),
+            "the declaration outranks the name on the producing side"
+        );
+
+        let wire: Vec<BhFieldSpec> = group
+            .size_descr
+            .all_fielddescrs()
+            .iter()
+            .map(|fd| BhFieldSpec::from_field_descr(fd.as_ref()))
+            .collect();
+        assert_eq!(
+            (wire[0].is_class_word, wire[1].is_class_word),
+            (Some(false), Some(true)),
+            "the wire must carry the declaration, not the name's answer"
+        );
+
+        let bytes = bincode::serialize(&wire).expect("BhFieldSpec is a wire record");
+        let wire: Vec<BhFieldSpec> = bincode::deserialize(&bytes).expect("round trip");
+
+        // A `type_id` used by no other test: `simple_descr_group_from_bh_size`
+        // publishes into the process-global `gc_cache`, and an existing slot
+        // would answer from the producing side and prove nothing.
+        let rebuilt = simple_descr_group_from_bh_size(&BhSizeSpec {
+            size: 32,
+            type_id: 0xc1a5_0000_57ea_d001,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: wire,
+        });
+        assert_eq!(
+            rebuilt.size_descr.class_word_field().map(|fd| fd.offset()),
+            Some(8),
+            "a rebuilt descr that re-guessed from the name would answer the \
+             payload field at offset 24"
+        );
+        assert_eq!(
+            rebuilt.size_descr.class_word_index_in_parent(),
+            Some(1),
+            "the positional answer must index the declared header row"
+        );
+    }
+
     #[test]
     fn make_descr_from_bh_field_preserves_parent_name_index() {
         use majit_ir::descr::ArrayFlag;
@@ -5348,6 +5438,7 @@ mod tests {
                     is_immutable: false,
                     is_quasi_immutable: false,
                     index_in_parent: 0,
+                    is_class_word: None,
                 },
                 BhFieldSpec {
                     index: 1,
@@ -5361,6 +5452,7 @@ mod tests {
                     is_immutable: true,
                     is_quasi_immutable: false,
                     index_in_parent: 1,
+                    is_class_word: None,
                 },
             ],
         };
@@ -5413,6 +5505,7 @@ mod tests {
             is_immutable: false,
             is_quasi_immutable: false,
             index_in_parent: 0,
+            is_class_word: None,
         };
         let parent = BhSizeSpec {
             size: std::mem::size_of::<usize>(),
@@ -5704,6 +5797,7 @@ mod tests {
                 is_immutable: false,
                 is_quasi_immutable: false,
                 index_in_parent: 0,
+                is_class_word: None,
             },
             BhFieldSpec {
                 index: 1,
@@ -5717,6 +5811,7 @@ mod tests {
                 is_immutable: false,
                 is_quasi_immutable: false,
                 index_in_parent: 1,
+                is_class_word: None,
             },
         ];
         let owner = BhSizeSpec {
@@ -5833,11 +5928,10 @@ fn simple_field_spec_from_bh(
         is_quasi_immutable: spec.is_quasi_immutable,
         flag: spec.field_flag,
         virtualizable: false,
-        // `BhFieldSpec` carries no class-word flag, so a spec arrives with
-        // nothing declared and the descr infers from the name it is minted
-        // with.  Inherits the fallback's limitation: a `Method.w_class`
-        // payload rebuilt from a blackhole spec still reads as a class word.
-        is_class_word: None,
+        // The producer's declaration, carried straight through — `None`
+        // included, so a spec that declared nothing leaves the question to the
+        // name fallback instead of arriving as a declaration of a guess.
+        is_class_word: spec.is_class_word,
         index_in_parent: spec.index_in_parent,
     }
 }
@@ -6096,7 +6190,7 @@ fn field_descr_from_bh_field(
             // needs the `_cache_size` slot, so only take this route when it
             // is populated.
             if gc._cache_size.contains_key(&key) {
-                let fd = gc.get_field_descr(
+                let fd = gc.get_field_descr_declaring(
                     key,
                     &field_key,
                     Some(field.name.as_str()),
@@ -6109,6 +6203,11 @@ fn field_descr_from_bh_field(
                     field.index,
                     false,
                     claimed_index,
+                    // This is the route that lets a serialized spec populate
+                    // the `(STRUCT, fieldname)` slot a layout producer will
+                    // later find cached, so it carries the declaration rather
+                    // than leaving the name fallback to seed it.
+                    field.is_class_word,
                 );
                 return fd as DescrRef;
             }
@@ -6127,7 +6226,7 @@ fn field_descr_from_bh_field(
         }
     }
 
-    let descr = majit_ir::descr::SimpleFieldDescr::new_with_name(
+    let mut descr = majit_ir::descr::SimpleFieldDescr::new_with_name(
         field.index,
         field.offset,
         field.field_size,
@@ -6138,6 +6237,11 @@ fn field_descr_from_bh_field(
         field.field_key().to_string(),
     )
     .with_quasi_immutable(field.is_quasi_immutable);
+    // `new_with_name` seeded the answer from the display name; a spec that
+    // declared one replaces that guess. A spec that declared nothing leaves it.
+    if let Some(is_class_word) = field.is_class_word {
+        descr = descr.with_class_word(is_class_word);
+    }
     let arc: DescrRef = Arc::new(descr);
     // descr.py:225-235 `get_field_descr` cache-miss path — register the
     // freshly-minted field descr so `compute_bitstrings` enumerates it.
@@ -6716,6 +6820,9 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 is_immutable: *is_immutable,
                 is_quasi_immutable: *is_quasi_immutable,
                 index_in_parent: index_in_parent.unwrap_or(0),
+                // A standalone `BhDescr::Field` carries no layout, so nothing
+                // here declares and the name is what the rebuild reads.
+                is_class_word: None,
             };
             // The claim itself goes beside the spec, unflattened.
             field_descr_from_bh_field(&field, parent.as_ref(), *index_in_parent)

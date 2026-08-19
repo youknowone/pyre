@@ -3508,6 +3508,10 @@ fn bh_field_spec_from_parts(
         is_immutable,
         is_quasi_immutable,
         index_in_parent,
+        // Built from an owner name and a field name, with no layout in reach:
+        // there is nothing here to declare with, so the rebuilding side falls
+        // back to the name.
+        is_class_word: None,
     }
 }
 
@@ -4257,6 +4261,10 @@ fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> crate::jitc
         is_immutable: fd.is_immutable(),
         is_quasi_immutable: fd.is_quasi_immutable(),
         index_in_parent: fd.index_in_parent(),
+        // `declared_w_class`, not `is_w_class`: a descr that guessed from its
+        // name must round-trip as "nobody declared", so the far side re-guesses
+        // instead of receiving a declaration that outranks a real one.
+        is_class_word: fd.declared_w_class(),
     }
 }
 

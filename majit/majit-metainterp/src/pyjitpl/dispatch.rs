@@ -66,10 +66,10 @@ fn field_spec_from_bh(
     majit_ir::descr::SimpleFieldDescrSpec {
         index: f.index,
         field_key: f.field_key().to_string(),
-        // A blackhole spec carries no declaration, so the descr infers from
-        // the name it is minted with rather than being handed a guess dressed
-        // up as its layout producer's answer.
-        is_class_word: None,
+        // Carry the producer's declaration through unchanged, `None` included:
+        // a spec that declared nothing leaves the question to the name
+        // fallback rather than arriving as a declaration of the guess.
+        is_class_word: f.is_class_word,
         name: f.name.clone(),
         offset: f.offset,
         field_size: f.field_size,
@@ -10449,6 +10449,7 @@ mod tests {
             is_immutable: false,
             is_quasi_immutable: false,
             index_in_parent: 0,
+            is_class_word: None,
         };
         crate::blackhole::BhDescr::Field {
             offset: 0,
