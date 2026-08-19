@@ -101,6 +101,18 @@ export function jit_replace_wasm(funcId, bytesPtr, bytesLen) {
       return 0;
     }
     const { trace, wide } = instantiateTrace(bytesPtr, bytesLen);
+    // Modules emitted while this slot was wide carry `call_indirect funcId + 1`
+    // baked in. A narrow replacement cannot retract those, so accepting one
+    // would leave the pair straddling two compiles: `funcId` on the new trace
+    // and `funcId + 1` still on the old. `funcTable` records the wide entry
+    // only when one existed, so it is the discriminator the shared table
+    // cannot be — its spare slot holds the narrow function either way. Reject
+    // the shape change before touching either table; narrow-to-wide stays
+    // allowed, mirroring the wasmtime host.
+    if (!wide && funcTable[funcId + 1] !== undefined) {
+      console.error('[jit_replace_wasm] refused: id', funcId, 'has a published wide entry the replacement does not');
+      return 0;
+    }
     if (mainTable) {
       mainTable.set(funcId, trace);
       if (wide) {

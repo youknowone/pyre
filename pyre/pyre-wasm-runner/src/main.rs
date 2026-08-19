@@ -106,6 +106,13 @@ struct Host {
     /// `PYRE_WASM_GUEST_PROFILE` sampling profiler; taken/restored around each
     /// epoch tick so `sample` can borrow the store it lives in.
     guest_profiler: Option<wasmtime::GuestProfiler>,
+    /// Trace slots whose compile exported a `trace_wide`, and whose `slot + 1`
+    /// is therefore a published call target. The reserved spare slot holds the
+    /// narrow function when a compile had no wide entry, so the table alone
+    /// cannot tell the two apart; a replacement that would drop the wide entry
+    /// is rejected against this set rather than leaving `slot + 1` pointing at
+    /// the replaced compile.
+    wide_slots: std::collections::HashSet<u32>,
 }
 
 /// Report `PYRE_*` / `MAJIT_*` settings the guest cannot see.
@@ -1768,6 +1775,7 @@ fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) ->
         table
             .set(&mut *caller, slot as u64 + 1, Ref::Func(Some(wide)))
             .context("register wide trace entry into shared table")?;
+        caller.data_mut().wide_slots.insert(slot);
     }
     Ok(slot)
 }
@@ -1793,6 +1801,16 @@ fn jit_replace(
             "jit_replace_wasm: id {func_id} is not a live trace"
         )));
     }
+    // Modules emitted while this slot was wide carry `call_indirect func_id +
+    // 1` baked in. A narrow replacement cannot retract those, so accepting one
+    // would leave the pair straddling two compiles: `func_id` on the new trace
+    // and `func_id + 1` still on the old. Reject the shape change before
+    // either table is touched; a narrow-to-wide replacement stays allowed.
+    if trace_wide.is_none() && caller.data().wide_slots.contains(&func_id) {
+        return Err(Error::msg(format!(
+            "jit_replace_wasm: id {func_id} has a published wide entry the replacement does not"
+        )));
+    }
     // The Store retains every instantiated module. Replacing this table entry
     // therefore leaves an old trace live when a non-tail indirect call still
     // has one of its frames on the guest stack.
@@ -1803,6 +1821,7 @@ fn jit_replace(
         table
             .set(&mut *caller, func_id as u64 + 1, Ref::Func(Some(wide)))
             .context("replace wide trace entry in shared table")?;
+        caller.data_mut().wide_slots.insert(func_id);
     }
     Ok(func_id)
 }

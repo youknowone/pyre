@@ -3728,6 +3728,16 @@ mod tests {
             })
             .expect("large integer constant");
         let w_code = box_code_constant(&code) as usize;
+        // The constructor publishes every slot eagerly, so readers would all
+        // observe that one store and never reach the path the identity
+        // guarantee actually rests on. Clear the slot under test first: each
+        // worker then realizes its own candidate and races to install it, and
+        // the assertion below becomes a statement about the CAS rather than
+        // about the constructor.
+        let pycode = unsafe { &*(w_code as *const PyCode) };
+        assert!(!pycode.co_consts_w.is_null(), "wrapped constant array");
+        let slots = unsafe { &*pycode.co_consts_w };
+        slots[idx].store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let mut workers = Vec::new();
         for _ in 0..8 {
@@ -3744,7 +3754,7 @@ mod tests {
         assert!(values[0] != 0);
         assert!(
             values.iter().all(|value| *value == values[0]),
-            "all readers must observe the eager canonical co_consts_w wrapper"
+            "all readers must observe one canonical co_consts_w wrapper"
         );
     }
 }

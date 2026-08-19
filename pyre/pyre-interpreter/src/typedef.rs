@@ -28083,12 +28083,13 @@ fn init_coroutine_wrapper_type(ns: PyObjectRef) {
     }
 }
 
-/// PyPy `iterobject.py W_AbstractSeqIterObject.typedef`.
+/// Attach `__text_signature__` to callables an iterator namespace already holds.
+///
+/// The TypeDefs remain the owner of the concrete methods; 3.14's slot wrappers
+/// and Argument Clinic descriptors additionally carry these introspection
+/// strings, so this fills the corresponding Function field without replacing
+/// the carriers.
 fn set_iterator_text_signatures(ns: PyObjectRef, signatures: &[(&'static str, &'static str)]) {
-    // PyPy's TypeDefs above remain the owner of the concrete methods.  CPython
-    // 3.14's slot wrappers and Argument Clinic descriptors additionally carry
-    // these introspection strings, so fill the corresponding Function field
-    // without replacing the PyPy-shaped carriers.
     for &(name, text_signature) in signatures {
         let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
             .expect("iterator TypeDef callable was just installed");
@@ -28096,6 +28097,7 @@ fn set_iterator_text_signatures(ns: PyObjectRef, signatures: &[(&'static str, &'
     }
 }
 
+/// PyPy `iterobject.py W_AbstractSeqIterObject.typedef`.
 fn init_sequence_iterator_type(ns: PyObjectRef) {
     // PyPy carries the `iter()` builtin documentation on the abstract typedef;
     // Python 3.14's concrete `iterator` type exposes `__doc__ is None`.
