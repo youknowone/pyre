@@ -56,7 +56,8 @@ use super::flow::{
 };
 
 /// `rpython/translator/simplify.py:52-69` `eliminate_empty_blocks`.
-/// Port reference: `majit-translate/src/translator/simplify.rs:44`.
+/// Port reference: `majit-translate/src/translator/simplify.rs`'s
+/// `eliminate_empty_blocks`.
 ///
 /// ```py
 /// def eliminate_empty_blocks(graph):
@@ -138,7 +139,8 @@ pub fn eliminate_empty_blocks(graph: &FunctionGraph) {
 }
 
 /// `rpython/translator/simplify.py:242-268` `remove_trivial_links`.
-/// Port reference: `majit-translate/src/translator/simplify.rs:2674`.
+/// Port reference: `majit-translate/src/translator/simplify.rs`'s
+/// `remove_trivial_links`.
 ///
 /// ```py
 /// def remove_trivial_links(graph):
@@ -387,7 +389,8 @@ fn renamevariables_value(block: &BlockRef, mapping: &HashMap<Variable, FlowValue
 }
 
 /// `rpython/translator/simplify.py:540-595` `remove_identical_vars_SSA`.
-/// Port reference: `majit-translate/src/translator/simplify.rs:967`.
+/// Port reference: `majit-translate/src/translator/simplify.rs`'s
+/// `remove_identical_vars_SSA`.
 ///
 /// When the same value is passed multiple times into the next block, pass it
 /// only once.  Uses its own `UnionFind(Representative)` (not
@@ -519,7 +522,8 @@ fn simplify_phis_inner(
 // ── constfold_exitswitch ────────────────────────────────────────────────
 
 /// `rpython/translator/simplify.py:36-48` `replace_exitswitch_by_constant`.
-/// Port reference: `majit-translate/src/translator/simplify.rs:212`.
+/// Port reference: `majit-translate/src/translator/simplify.rs`'s
+/// `replace_exitswitch_by_constant`.
 ///
 /// ```py
 /// def replace_exitswitch_by_constant(block, const):
@@ -577,7 +581,8 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
 }
 
 /// `rpython/translator/simplify.py:218-239` `constfold_exitswitch`.
-/// Port reference: `majit-translate/src/translator/simplify.rs:2599`.
+/// Port reference: `majit-translate/src/translator/simplify.rs`'s
+/// `constfold_exitswitch`.
 ///
 /// When a block's `exitswitch` has been folded to a `Constant` (and the block
 /// cannot raise), only one exit can be taken — drop the others.
@@ -632,8 +637,8 @@ pub fn constfold_exitswitch(graph: &FunctionGraph) {
 /// chain-of-`is_`/`issubtype`-tests that RPython's *flowspace* emits into a
 /// single list of `exitcase=cls` links on the raising block.  That chain is a
 /// property of RPython's flow-graph construction; the port reference
-/// (`majit-translate/src/translator/simplify.rs:1266`) reproduces it because
-/// the AOT translator path consumes flowspace graphs.
+/// (`majit-translate/src/translator/simplify.rs`'s `simplify_exceptions`)
+/// reproduces it because the AOT translator path consumes flowspace graphs.
 ///
 /// pyre-jit's production codewriter is a **CPython-bytecode walker**, not the
 /// RPython flowspace.  Two concrete Pyre constraints make a literal port
@@ -642,8 +647,8 @@ pub fn constfold_exitswitch(graph: &FunctionGraph) {
 ///  1. The walker never emits the `is_`/`issubtype` exception-dispatch chain
 ///     (no `is_`/`issubtype` ops exist anywhere in `pyre-jit/src/jit`).  Its
 ///     exception model "bakes type into per-subclass" exits
-///     (`pyre/pyre-jit/src/jit/flatten.rs:679`), so the input shape this pass
-///     targets is never present.
+///     (`flatten.rs`'s `is_pyre_canonical_elidable_hlop`), so the input shape
+///     this pass targets is never present.
 ///  2. The subclass oracle the pass needs — `issubclass(case, cov)` and
 ///     `issubclass(case, BaseException)` (`simplify.py:140,146`) — has no
 ///     equivalent on pyre-jit's flow `Constant`s, which carry exception types
@@ -749,7 +754,7 @@ fn can_remove_opname(op: &str) -> bool {
 
 /// `rpython/translator/simplify.py:397-524` `transform_dead_op_vars`
 /// (`transform_dead_op_vars_in_blocks`).  Port reference:
-/// `majit-translate/src/translator/simplify.rs:610`.
+/// `majit-translate/src/translator/simplify.rs`'s `transform_dead_op_vars`.
 ///
 /// Classification (scope #4): **direct PyPy parity**.  Removes side-effect-free
 /// operations whose result is never read, then drops link args / inputargs that

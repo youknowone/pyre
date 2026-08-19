@@ -39,7 +39,7 @@ pub struct Cpu {
     /// `bhimpl_residual_call_r_r` carries no frame; the parent frame is
     /// resolved from the execution context inside `bh_call_fn_impl`.  A
     /// non-null `null_or_self` is the method receiver — the helper
-    /// prepends it as arg0 (eval.rs:3216-3226).  The arity ceiling is
+    /// prepends it as arg0 (`eval.rs`'s `PyFrame::call`).  The arity ceiling is
     /// nargs=14: each helper takes `callable + null_or_self + nargs`
     /// i64s, and the backend dispatch table (`call_stub.rs::
     /// dispatch_arity_body!`, `MAX_HOST_CALL_ARITY` = 16) tops out at

@@ -111,7 +111,7 @@ pub struct SSARepr {
     /// `serialize_op`: for each non-negative `op.offset` (Python PC)
     /// encountered, the FIRST `insns` index where an op with that
     /// PC was emitted.  Drives `pc_map` construction at exit-recovery
-    /// time (call_jit.rs:3939).  Sparse `Vec<(py_pc, first_insn_pos)>`
+    /// time (call_jit.rs).  Sparse `Vec<(py_pc, first_insn_pos)>`
     /// keyed by py_pc.
     pub pc_first_insn_pos: Vec<(i64, usize)>,
     /// Pyre-only side-table: `(insns index, py_pc)` for EVERY
@@ -482,7 +482,7 @@ pub enum DescrOperand {
 pub struct CallDescrStub {
     /// Upstream-shape `EffectInfo` — the canonical dispatch source read
     /// by `dispatch_residual_call` via [`dispatch_kind_for_effect_info`]
-    /// (`pyre/pyre-jit/src/jit/assembler.rs:1437`).
+    /// (`assembler.rs`).
     pub effect_info: majit_ir::EffectInfo,
     /// Per-arg kind sequence in C-function parameter order. Exact length
     /// equals the sum of the int/ref/float `ListOfKind` sublists for the
@@ -490,7 +490,7 @@ pub struct CallDescrStub {
     pub arg_kinds: Vec<Kind>,
     /// `descr.py:665` carries `result_type` on both the cache key and
     /// the constructed `CallDescr`. Pyre mirrors that redundancy so
-    /// `dispatch_residual_call` (`assembler.rs:1370`) can cross-check
+    /// `dispatch_residual_call` (`assembler.rs`) can cross-check
     /// the descr-side answer against the opname-tail-derived `ResKind`
     /// it would have computed independently — RPython's invariant is
     /// that the two MUST agree per `descr.create_call_stub` /
@@ -596,16 +596,16 @@ pub fn intern_call_descr_stub(
 /// All six analyzers + the public `getcalldescr` are ported in
 /// `majit-translate/src/codewriter/call.rs`:
 ///
-/// | Analyzer                | Pyre site                              |
-/// |-------------------------|----------------------------------------|
-/// | `RaiseAnalyzer`         | `analyze_can_raise_impl` (call.rs:2271)|
-/// | `VirtualizableAnalyzer` | `analyze_forces_virtualizable` (:2341) |
-/// | `RandomEffectsAnalyzer` | `analyze_random_effects` (:2401)       |
-/// | `QuasiImmutAnalyzer`    | `analyze_can_invalidate` (:2452)       |
-/// | `CollectAnalyzer`       | `analyze_can_collect` (:2505)          |
-/// | `ReadWriteAnalyzer`     | `analyze_readwrite` (:3123)            |
-/// | `_canraise` 3-way       | `_canraise` (:2773)                    |
-/// | `getcalldescr`          | `getcalldescr` (:2799)                 |
+/// | Analyzer                | Pyre site                      |
+/// |-------------------------|--------------------------------|
+/// | `RaiseAnalyzer`         | `analyze_can_raise_impl`       |
+/// | `VirtualizableAnalyzer` | `analyze_forces_virtualizable` |
+/// | `RandomEffectsAnalyzer` | `analyze_random_effects`       |
+/// | `QuasiImmutAnalyzer`    | `analyze_can_invalidate`       |
+/// | `CollectAnalyzer`       | `analyze_can_collect`          |
+/// | `ReadWriteAnalyzer`     | `analyze_readwrite`            |
+/// | `_canraise` 3-way       | `_canraise`                    |
+/// | `getcalldescr`          | `getcalldescr`                 |
 ///
 /// What is NOT plumbed is the *consumer side*: this producer (the
 /// pyre-jit `CallFlavor` enum) does not query
@@ -619,16 +619,16 @@ pub fn intern_call_descr_stub(
 /// Implications for the optimizer (audited in
 /// `majit-metainterp/src/optimizeopt/`):
 ///   - `oopspecindex == None` → every `match ei.oopspecindex { ... }`
-///     site (vstring.rs:759, intbounds.rs:2825, rewrite.rs:2774/2915,
-///     virtualize.rs:1397/1450/1493/1512/1531, earlyforce.rs:31,
-///     heap.rs:1416-1429) takes the default arm and skips the
+///     site (vstring.rs, intbounds.rs, rewrite.rs, virtualize.rs,
+///     earlyforce.rs, heap.rs) takes the default arm and skips the
 ///     OS_*-specialized rewrite.  Functionally safe (default arm is
 ///     conservative; missing the rewrite costs trace quality, not
 ///     correctness) but means pyre never benefits from `OS_STR_CONCAT`,
 ///     `OS_DICT_LOOKUP`, `OS_RAW_MALLOC_VARSIZE_CHAR`,
 ///     `OS_JIT_FORCE_VIRTUALIZABLE` etc. specialization.
-///   - `write_descrs_arrays == 0` → `rewrite.rs:1993` heap
-///     invalidation reads "this call writes no arrays".  Currently
+///   - `write_descrs_arrays == 0` → `rewrite.rs`'s
+///     `optimize_call_arrayop` heap invalidation reads "this call writes no
+///     arrays".  Currently
 ///     load-bearing only when the trace records both an array
 ///     write-in-callee and a subsequent reader of the same array;
 ///     pyre's active callees (`box_int`, `load_const`, etc.) don't
@@ -637,9 +637,9 @@ pub fn intern_call_descr_stub(
 ///   - `can_invalidate == false` → quasiimmut invalidation guards
 ///     are conservatively elided (not currently load-bearing because
 ///     pyre's quasi-immutable layer is itself unported).
-///   - `extradescrs == None` → `heap.rs:712 rordereddict` descriptor
-///     specialization unreachable (also unported on the consumer
-///     side; matches by missing).
+///   - `extradescrs == None` → `heap.rs`'s `_optimize_call_dict_lookup`
+///     rordereddict descriptor specialization unreachable (also unported on
+///     the consumer side; matches by missing).
 ///
 /// Convergence: build a callee-identity-keyed registry of
 /// codewriter `getcalldescr` results so this producer can resolve a
@@ -740,7 +740,7 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `setattr` — emitted by `codewriter.rs::emit_frontend_setattr`
 /// mirroring `flowcontext.py:1031-1036 op.setattr(w_obj,
 /// w_attributename, w_newvalue)`.  Same shape as `getattr`: the
-/// `StoreAttr` arm (codewriter.rs:8542) pairs it with an inline
+/// `StoreAttr` arm (codewriter.rs) pairs it with an inline
 /// `emit_abort_permanent!`, so the compiled trace bails to the
 /// interpreter at the `abort_permanent` Insn canonical already emits.
 /// A literal `setattr` Insn would be unreachable at runtime and
@@ -915,8 +915,8 @@ pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
 /// `rop.CALL_ASSEMBLER_*` is a separate operation chosen via
 /// `OpHelpers.call_assembler_for_descr` (`resoperation.py:1251-1260`),
 /// not derived from `EffectInfo`. pyre's portal-call lowering follows
-/// the same split (`majit-ir/src/resoperation.rs:1120-1123
-/// CallAssembler{I,R,F,N}`); reintroducing an `Assembler` flavor here
+/// the same split (`majit-ir/src/resoperation.rs`'s
+/// `CallAssembler{I,R,F,N}`); reintroducing an `Assembler` flavor here
 /// would push the wrong path back into the residual_call shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallFlavor {
@@ -1217,8 +1217,9 @@ impl Insn {
 /// `GraphFlattener`. Owns the whole `FunctionGraph -> SSARepr` lowering:
 /// `flatten_graph` builds one per graph and drives `enforce_input_args`
 /// + `generate_ssa_form`, emitting the production `ssarepr.insns` the
-/// codewriter adopts (`codewriter.rs:10800` builds it, `:10914` installs
-/// `ssarepr.insns`). The earlier direct-SSA-emission dual-write is retired.
+/// codewriter adopts (`codewriter.rs`'s `transform_graph_to_jitcode` builds
+/// it and splices it in as `ssarepr.insns`). The earlier
+/// direct-SSA-emission dual-write is retired.
 pub struct GraphFlattener<'a> {
     // ─── PyPy-mirror fields (in `flatten.py:77-86 __init__` order) ───
     /// `rpython/jit/codewriter/flatten.py:77 self.graph = graph`.
@@ -1245,7 +1246,7 @@ pub struct GraphFlattener<'a> {
     /// get_standard_ll_exc_instance_by_class(OverflowError)` on the
     /// `handling_ovf=True` arm (`flatten.py:166-170`).  Pyre stores it
     /// as a borrow; production callers thread `CodeWriter::cpu()`
-    /// (`codewriter.rs:2661`).  Test fixtures that do not exercise
+    /// (`codewriter.rs`).  Test fixtures that do not exercise
     /// the overflow path leave it `None`, matching upstream's
     /// `cpu=None` default at `flatten.py:64`.
     cpu: Option<&'a super::cpu::Cpu>,
@@ -1381,7 +1382,7 @@ impl<'a> GraphFlattener<'a> {
         // Record FIRST insn position per
         // non-negative `op.offset` (Python PC) into
         // `ssarepr.pc_first_insn_pos`.  Drives `pc_map` construction at
-        // exit recovery (call_jit.rs:3939).  Synthetic ops with
+        // exit recovery (call_jit.rs).  Synthetic ops with
         // `offset = -1` (insert_renamings ref_copy / overflow
         // trampolines / catch-landing entries) are skipped — they have
         // no Python PC counterpart.  Sparse `Vec<(py_pc, first_insn_pos)>`.
@@ -2751,7 +2752,7 @@ fn is_default_exitcase(exitcase: &Option<FlowValue>) -> bool {
     // construction site rather than papered over here — either set
     // `exitcase = Str("default")` for a true switch catch-all, or
     // make both bool-branch links carry a `Bool` `llexitcase` so the
-    // bool-branch path (`flatten.rs:1761 is_bool_or_tuple_exitswitch`)
+    // bool-branch path (`is_bool_or_tuple_exitswitch`)
     // fires instead of the switch path.
     matches!(
         exitcase,
@@ -3180,7 +3181,7 @@ where
         // `GraphFlattener::flatten_arg`; both match the `DescrByPtr`
         // singleton by `Arc::ptr_eq` and lower to the same
         // `DescrOperand` variant so the diagnostic shape compare at
-        // `codewriter.rs:6013` sees identical operand sequences when
+        // `codewriter.rs` sees identical operand sequences when
         // graph and SSA agree.
         super::flow::SpaceOperationArg::Descr(descr_by_ptr) => flatten_descr_by_ptr(descr_by_ptr),
     }
@@ -3260,18 +3261,18 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
 /// one per HLOp family that the lowering pass brings online.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LoweringContext {
-    /// `binary_op_fn` descrs-pool index — see codewriter.rs:3081
-    /// (`descrs.intern_int_method_index("binary_op_fn", ...)`) for
+    /// `binary_op_fn` descrs-pool index — see `register_helper_fn_pointers`
+    /// in codewriter.rs, which binds the helper and mints its index, for
     /// the production source.
     pub binary_op_fn_idx: u16,
-    /// `compare_fn` descrs-pool index — see codewriter.rs:3076
-    /// for the production source.  COMPARE_OP family
+    /// `compare_fn` descrs-pool index — see `register_helper_fn_pointers`
+    /// in codewriter.rs for the production source.  COMPARE_OP family
     /// (`lt`/`le`/`eq`/`ne`/`gt`/`ge`) shares the same `(ref, ref,
     /// int) → ref` signature as BINARY_OP, so the lowered Insn
     /// shape is identical apart from the leading fn-idx ConstInt.
     pub compare_op_fn_idx: u16,
-    /// `truth_fn` descrs-pool index — see codewriter.rs:3091 for
-    /// the production source.  BOOL family (single HLOp opname
+    /// `truth_fn` descrs-pool index — see `register_helper_fn_pointers`
+    /// in codewriter.rs for the production source.  BOOL family (single HLOp opname
     /// `bool`) lowers to `residual_call_r_i` (one Ref input, Int
     /// result) — different shape from the `_ir_r` family because
     /// `truth_fn` has signature `(ref) → int` and no scalar Int
@@ -3279,12 +3280,12 @@ pub struct LoweringContext {
     /// to `opcode_ops::truth_value(obj)` which invokes Python
     /// `__bool__` / `__len__` per PyPy `descroperation.py:265` and
     /// may run user code that observes virtualizables — matches the
-    /// `MayForce` bind site at codewriter.rs:2208 and the SSA
+    /// `MayForce` bind site in `register_helper_fn_pointers` and the SSA
     /// helper at flatten.rs:`build_residual_call_r_i_insn_from_
     /// operands`).
     pub truth_fn_idx: u16,
     /// `store_subscr_fn` descrs-pool index — see
-    /// codewriter.rs:3101 for the production source.  SETITEM
+    /// `register_helper_fn_pointers` for the production source.  SETITEM
     /// family (single HLOp opname `setitem`) lowers to
     /// `residual_call_r_v` (three Ref inputs, void result) —
     /// different from the `_ir_r` and `_r_i` shapes because
@@ -3352,7 +3353,7 @@ pub struct LoweringContext {
     /// `new_array_clear` constant and inside the length-prefixed array.
     pub newlist_from_array_fn_idx: u16,
     /// `call_fn_N` descrs-pool indices for nargs ∈ 0..=8 — see
-    /// codewriter.rs:3206-3245 for the production source.  CALL
+    /// `register_helper_fn_pointers` for the production source.  CALL
     /// (single HLOp opname `simple_call`) lowers to
     /// `residual_call_r_r(call_fn_N_idx, [callable, arg0, ...],
     /// Descr) → reg`; the lowered ListR is frame-less
@@ -3710,8 +3711,8 @@ pub struct LoweringContext {
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
 /// `inplace_*` siblings) to the `op_val` integer that the inline emit
-/// at codewriter.rs:5348 passes as the third `residual_call_ir_r`
-/// argument.  The mapping mirrors
+/// in codewriter.rs's `Instruction::BinaryOp` arm passes as the third
+/// `residual_call_ir_r` argument.  The mapping mirrors
 /// `pyre_interpreter::runtime_ops::binary_op_tag` — both decode
 /// `BinaryOperator` to the same compact tag the blackhole interpreter
 /// reads back via `binary_op_from_tag`.  Returns `None` for opnames
@@ -3757,9 +3758,9 @@ fn binary_op_tag_for_opname(opname: &str) -> Option<i64> {
 /// `residual_call_ir_r(ConstInt(fn_idx), ListR([lhs, rhs]),
 /// ConstInt(op_val), Descr) → reg` Insn.  The shape mirrors what
 /// `emit_residual_call_shape` produces inline at the BinaryOp
-/// callsite (codewriter.rs:5335-5352) and what
+/// callsite (codewriter.rs's `Instruction::BinaryOp` arm) and what
 /// `record_residual_call_graph_op` records on the graph side
-/// (codewriter.rs:5366-5377).  Both shapes coexist on portal graphs
+/// (codewriter.rs).  Both shapes coexist on portal graphs
 /// today and are byte-equivalent when flattened — this helper
 /// produces the same Insn directly from the HLOp, without going
 /// through the dual-write.
@@ -3852,7 +3853,7 @@ pub fn build_binary_op_residual_call_ir_r_insn(
 /// the `CallFlavor` carried on the EffectInfo descr.
 ///
 /// Inline arg order produced by `emit_residual_call_shape`
-/// (codewriter.rs:2745-2802) buckets each `CallArgInput` by `Kind`
+/// (codewriter.rs) buckets each `CallArgInput` by `Kind`
 /// into per-kind lists then concatenates `[ConstInt(fn), ListI?,
 /// ListR?, ListF?, Descr]`.  For these families the call_args are
 /// `[Reg(Ref, lhs), Reg(Ref, rhs), ConstInt(op_val)]`, so:
@@ -3936,8 +3937,8 @@ fn build_residual_call_ir_r_insn_from_ref_list(
 
 /// Map a COMPARE_OP HLOp opname (`lt`/`le`/`eq`/`ne`/`gt`/`ge`)
 /// to the `op_val` integer that the inline emit at
-/// codewriter.rs:5406 passes as the third `residual_call_ir_r`
-/// argument.  The mapping mirrors
+/// codewriter.rs's `Instruction::CompareOp` arm passes as the third
+/// `residual_call_ir_r` argument.  The mapping mirrors
 /// `pyre_interpreter::runtime_ops::compare_op_tag` (codewriter
 /// uses the same source of truth).  Returns `None` for opnames
 /// outside the COMPARE_OP family so the caller can fall through.
@@ -4007,7 +4008,7 @@ where
 /// bypasses the SpaceOperation→Insn round-trip and
 /// emits this Insn directly into the SSARepr, replacing the prior
 /// `emit_residual_call(compare_fn_idx, ...)` + matching graph
-/// dual-write at codewriter.rs:5393-5428.
+/// dual-write in codewriter.rs's `Instruction::CompareOp` arm.
 ///
 /// `op_val` is the `compare_op_tag` integer derived from the
 /// `ComparisonOperator` (`lt → 0`, `le → 1`, `gt → 2`, `ge → 3`,
@@ -4034,13 +4035,13 @@ pub fn build_compare_op_residual_call_ir_r_insn(
 /// Construct the LOAD_GLOBAL-family `residual_call_ir_r` Insn from
 /// raw register indices.  The production codewriter callsite
 /// replaces the prior `emit_residual_call(
-/// load_global_fn_idx, ...)` SSARepr emit at codewriter.rs:5598-5615
-/// with a single direct push of this helper's output.  The matching
-/// graph dual-write at codewriter.rs:5622-5635 stays in place — this
-/// slice is incremental factor refactor, not retirement.
+/// load_global_fn_idx, ...)` SSARepr emit in codewriter.rs's
+/// `Instruction::LoadGlobal` arm with a single direct push of this
+/// helper's output.  The matching graph dual-write in the same arm stays
+/// in place — this slice is incremental factor refactor, not retirement.
 ///
 /// `load_global_fn` has signature `(ns: Ref, code: Ref, frame: Ref, namei: Int)
-/// → Ref` with `CallFlavor::Plain` (per codewriter.rs:2176-2185 —
+/// → Ref` with `CallFlavor::Plain` (per `register_helper_fn_pointers` —
 /// `bh_load_global_fn` can `NameError` but cannot force virtuals; matches
 /// `EF_CAN_RAISE`).  The explicit frame Ref is the Rust residual-helper
 /// adaptation for PyPy's `_load_global(self, ...)` receiver.
@@ -4513,22 +4514,22 @@ where
 
 /// Construct the CALL-family `residual_call_r_r` Insn from raw
 /// register indices.  Production codewriter callsite replaces the prior `emit_residual_call(
-/// call_fn_N_idx, ...)` SSARepr emit at codewriter.rs:5747-5754
-/// (the `nargs <= 8` branch of the Instruction::Call arm) with a
+/// call_fn_N_idx, ...)` SSARepr emit in codewriter.rs's
+/// `Instruction::Call` arm (its `nargs <= 8` branch) with a
 /// single direct push of this helper's output.  The matching graph
-/// dual-write at codewriter.rs:5760-5777 stays in place — this slice
+/// dual-write in the same arm stays in place — this slice
 /// is incremental factor refactor, not retirement.
 ///
 /// `call_fn_N` has signature `(frame: Ref, callable: Ref, arg0: Ref,
 /// ..., arg_{N-1}: Ref) → Ref` with `CallFlavor::MayForce` for every
 /// arity-specific variant `call_fn_0` / `call_fn` (= nargs=1) /
-/// `call_fn_2` / ... / `call_fn_8` (per codewriter.rs:2175 and
-/// 2238-2245).  All-Ref call_args produce a different SSARepr
+/// `call_fn_2` / ... / `call_fn_8` (per `register_helper_fn_pointers`).
+/// All-Ref call_args produce a different SSARepr
 /// shape from the `_ir_r` family: `args_i = []`, `args_r =
 /// [Reg(frame), Reg(callable), Reg(arg0), ..., Reg(arg_{N-1})]`,
 /// `args_f = []` → opname `residual_call_r_r` (kinds `"r"` +
 /// reskind `'r'`) with NO leading `ListI`
-/// (`emit_residual_call_shape` at codewriter.rs:2745-2802 omits the
+/// (`emit_residual_call_shape` in codewriter.rs omits the
 /// per-kind list when `args_K` is empty).  The frame operand is the
 /// active portal red variable (`portal_frame_reg`), mirroring
 /// `bh_load_global_fn`'s frame-as-arg ABI.
@@ -4563,11 +4564,11 @@ pub fn build_call_fn_residual_call_r_r_insn(
 /// Construct the get_current_exception-family `residual_call_r_r`
 /// Insn.  Production codewriter callsite replaces the prior `emit_residual_call(
 /// get_current_exception_fn_idx, ...)` SSARepr emit at
-/// codewriter.rs:6116-6123 (PushExcInfo).  The matching graph
-/// dual-write at codewriter.rs:6141-6152 stays in place.
+/// codewriter.rs's `Instruction::PushExcInfo` arm.  The matching graph
+/// dual-write in the same arm stays in place.
 ///
 /// `get_current_exception_fn` has signature `() → Ref` with
-/// `CallFlavor::PlainCannotRaiseNoHeap` (per codewriter.rs:2246-2252 —
+/// `CallFlavor::PlainCannotRaiseNoHeap` (per `register_helper_fn_pointers` —
 /// TLS read of `CURRENT_EXCEPTION`; `EF_CANNOT_RAISE`, no heap access,
 /// no GC).  Zero-arg (`ref_operands` empty) produces a
 /// `residual_call_r_r(ConstInt(fn_idx), ListR([]), Descr) → Reg(Ref,
@@ -4906,14 +4907,14 @@ pub fn build_residual_call_r_r_insn_from_operands(
 /// raw register indices.  The production codewriter callsite
 /// replaces the prior `emit_residual_call(
 /// normalize_raise_varargs_fn_idx, ...)` SSARepr emit at
-/// codewriter.rs:6068-6082 with a single direct push of this
-/// helper's output.  No graph dual-write exists for
+/// codewriter.rs's `Instruction::RaiseVarargs` arm with a single direct
+/// push of this helper's output.  No graph dual-write exists for
 /// `normalize_raise_varargs_fn` (the graph carries an `emit_raise!`
 /// edge instead).
 ///
 /// `normalize_raise_varargs_fn` has signature `(frame: Ref, exc: Ref,
 /// cause: Ref) → Ref` with `CallFlavor::MayForce` (per
-/// codewriter.rs:2227-2236 — `bh_normalize_raise_varargs_with_frame`
+/// `register_helper_fn_pointers` — `bh_normalize_raise_varargs_with_frame`
 /// instantiates user `__init__` and may observe virtualizables;
 /// matches `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`).  The frame operand
 /// is the active portal red variable (`portal_frame_reg`), matching
@@ -4959,19 +4960,19 @@ pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
 /// register indices.  Production codewriter callsites replace three prior `emit_residual_call(
 /// box_int_fn_idx, ...)` SSARepr emits with single direct pushes of
 /// this helper's output:
-///   * LoadSmallInt at codewriter.rs:4867-4874 (val = literal small
+///   * `Instruction::LoadSmallInt` (val = literal small
 ///     int from the consts table).
-///   * UnaryNegative `box_int(0)` at codewriter.rs:5832-5839 (val =
+///   * `Instruction::UnaryNegative` `box_int(0)` (val =
 ///     0, materialises the zero operand for the trailing
 ///     `binary_op_fn(zero, operand, sub_tag)` emit).
-///   * Exception-frame lasti boxing at codewriter.rs:6633-6640 (val
+///   * Exception-frame lasti boxing in codewriter.rs (val
 ///     = `lasti_py_pc`, captures the frame's last-instruction offset
 ///     into the exception slot).
 /// All 3 sites' graph dual-writes stay in place — incremental
 /// factor refactor only.
 ///
 /// `box_int_fn` has signature `(val: Int) → Ref` with
-/// `CallFlavor::Plain` (per codewriter.rs:2200 — `bh_box_int_fn`
+/// `CallFlavor::Plain` (per `register_helper_fn_pointers` — `bh_box_int_fn`
 /// allocates a fresh `PyLong` wrapper without user dispatch and
 /// cannot force virtuals; matches `EF_CAN_RAISE` for allocation
 /// MemoryError).  RPython `jtransform.py:424-426 rewrite_call`
@@ -5120,8 +5121,9 @@ pub fn build_build_slice_fn_residual_call_ir_r_insn(
 /// ListR([operand]), Descr) → reg` Insn.  `truth_fn` has signature
 /// `(ref) → int` (no Int `op_val` argument), so the lowered shape
 /// has no leading `ListI` — the inline `emit_residual_call_shape`
-/// at codewriter.rs:5453-5463 with `args_i = []`, `args_r =
-/// [cond_reg]` produces `kinds = "r"` + `reskind = 'i'` →
+/// in codewriter.rs's `Instruction::PopJumpIfFalse` arm with
+/// `args_i = []`, `args_r = [cond_reg]` produces `kinds = "r"` +
+/// `reskind = 'i'` →
 /// `residual_call_r_i`.
 ///
 /// `bool` is a single HLOp opname (no inplace siblings, unlike
@@ -5181,8 +5183,8 @@ where
 /// bypasses the SpaceOperation→Insn round-trip and
 /// emits this Insn directly into the SSARepr, replacing the prior
 /// `emit_residual_call(truth_fn_idx, ...)` + graph dual-write at
-/// codewriter.rs:5453-5480 (PopJumpIfFalse) and :5518-5544
-/// (PopJumpIfTrue).
+/// codewriter.rs's `Instruction::PopJumpIfFalse` and
+/// `Instruction::PopJumpIfTrue` arms.
 pub fn build_truth_fn_residual_call_r_i_insn(
     truth_fn_idx: u16,
     cond_reg: u16,
@@ -5201,7 +5203,7 @@ pub fn build_truth_fn_residual_call_r_i_insn(
 /// `bh_truth_fn` delegates to `opcode_ops::truth_value(obj)` which
 /// invokes Python `__bool__` / `__len__` and may run arbitrary user
 /// code that observes (and therefore forces) virtualizables, matching
-/// the `MayForce` binding at codewriter.rs:2208 and PyPy
+/// the `MayForce` binding in `register_helper_fn_pointers` and PyPy
 /// `descroperation.py:265`.  ResKind = Int → kinds `"r"` + reskind
 /// `'i'` → opname `"residual_call_r_i"`.
 ///
@@ -7290,8 +7292,8 @@ where
     // args_r, ...)`).  The parent frame is resolved at runtime from the
     // execution context inside `bh_call_fn_impl`, not threaded as a
     // leading operand; a non-null null_or_self is the method receiver the
-    // helper prepends as arg0 (eval.rs:3216-3226).  `get_register` routes
-    // each arg through `regallocs[Ref].getcolor(v)` per upstream
+    // helper prepends as arg0 (`eval.rs`'s `PyFrame::call`).  `get_register`
+    // routes each arg through `regallocs[Ref].getcolor(v)` per upstream
     // `flatten.py:382-391`, so every Register index lands in
     // `[0, num_colors)`.
     let mut operands: Vec<Operand> = Vec::with_capacity(op.args.len());
@@ -7325,7 +7327,7 @@ where
 /// bypasses the SpaceOperation→Insn round-trip and
 /// emits this Insn directly into the SSARepr, replacing the prior
 /// `emit_residual_call(store_subscr_fn_idx, ...)` + matching graph
-/// dual-write at codewriter.rs:5244-5282.
+/// dual-write in codewriter.rs's `Instruction::StoreSubscr` arm.
 pub fn build_store_subscr_fn_residual_call_r_v_insn(
     store_subscr_fn_idx: u16,
     obj_reg: u16,
@@ -7349,12 +7351,12 @@ pub fn build_store_subscr_fn_residual_call_r_v_insn(
 /// Insn from a raw register index.  Production codewriter callsites
 /// replace the prior
 /// `emit_residual_call(set_current_exception_fn_idx, ...)` SSARepr
-/// emits at codewriter.rs:6134-6144 (PushExcInfo) and
-/// codewriter.rs:6269-6279 (PopExcept).  Both sites' graph
+/// emits in codewriter.rs's `Instruction::PushExcInfo` and
+/// `Instruction::PopExcept` arms.  Both sites' graph
 /// dual-writes stay in place.
 ///
 /// `set_current_exception_fn` has signature `(exc: Ref) → Void` with
-/// `CallFlavor::PlainCannotRaiseNoHeap` (per codewriter.rs:2253-2258 —
+/// `CallFlavor::PlainCannotRaiseNoHeap` (per `register_helper_fn_pointers` —
 /// TLS write to `CURRENT_EXCEPTION`; `EF_CANNOT_RAISE`, no heap access,
 /// no GC).  Same opname `residual_call_r_v` as SETITEM but fixed-arity
 /// 1 vs SETITEM's 3, plus PlainCannotRaiseNoHeap flavor vs SETITEM's
@@ -7409,13 +7411,14 @@ fn build_residual_call_r_v_insn_from_operands(
 
 /// Construct the LoadConst-family `residual_call_ir_r` Insn from raw
 /// register indices.  Production codewriter callsite replaces the prior `emit_residual_call(
-/// load_const_fn_idx, ...)` SSARepr emit at codewriter.rs:4933-4946
-/// with a single direct push of this helper's output.  The matching
-/// graph dual-write at codewriter.rs:4954-4965 stays in place — this
-/// slice is incremental factor refactor, not retirement.
+/// load_const_fn_idx, ...)` SSARepr emit in codewriter.rs's
+/// `Instruction::LoadConst` arm with a single direct push of this
+/// helper's output.  The matching graph dual-write in the same arm
+/// stays in place — this slice is incremental factor refactor, not
+/// retirement.
 ///
 /// `load_const_fn` has signature `(pycode: Ref, idx: Int) → Ref` with
-/// `CallFlavor::Plain` (per codewriter.rs:2207-2215 — `load_const_fn`
+/// `CallFlavor::Plain` (per `register_helper_fn_pointers` — `load_const_fn`
 /// re-materializes int/float/str/bool constants per call but never
 /// runs user `__bool__`/`__init__`, so it cannot force virtuals).
 /// Distinct from BINARY_OP/COMPARE_OP's `_ir_r` arity (`(Ref, Ref,
@@ -9360,10 +9363,11 @@ mod tests {
         // Lowering an `add(lhs, rhs) → result`
         // HLOp must produce the same Insn shape that
         // `emit_residual_call_shape` produces inline at the BINARY_OP
-        // callsite (codewriter.rs:5335-5352): `residual_call_ir_r`
+        // callsite (codewriter.rs's `Instruction::BinaryOp` arm):
+        // `residual_call_ir_r`
         // with args `[ConstInt(fn_idx), ListI([ConstInt(op_val)]),
         // ListR([lhs, rhs]), Descr(CallDescrStub)] → reg`.
-        // (`emit_residual_call_shape` codewriter.rs:2745-2802 buckets
+        // (`emit_residual_call_shape` in codewriter.rs buckets
         // each call-arg by `Kind` then concatenates lists in
         // `i,r,f` order, so the `ConstInt(op_val)` rides inside `ListI`
         // — not as a trailing standalone `ConstInt`.)
@@ -9488,10 +9492,10 @@ mod tests {
 
         // Build the equivalent dual-write residual_call SpaceOperation
         // by hand — same shape as `record_residual_call_graph_op`
-        // produces at codewriter.rs:5366-5377 for `sub`:
+        // produces in codewriter.rs's `Instruction::BinaryOp` arm for `sub`:
         //   `[ConstInt(fn_idx), ListI([ConstInt(op_val)]),
         //     ListR([lhs, rhs]), Descr]`.
-        // (`record_residual_call_graph_op` codewriter.rs:1378-1404
+        // (`record_residual_call_graph_op` in codewriter.rs
         // pushes `args_i` before `args_r` per the upstream
         // `i,r,f` order; the `op_val` is bucketed into args_i because
         // its `Kind` is `Int` per arg_kinds.)
@@ -9568,7 +9572,7 @@ mod tests {
         // Lowering an `lt(lhs, rhs) → result`
         // HLOp must produce the same Insn shape that
         // `emit_residual_call_shape` produces inline at the
-        // CompareOp callsite (codewriter.rs:5393-5410):
+        // CompareOp callsite (codewriter.rs's `Instruction::CompareOp` arm):
         // `residual_call_ir_r` with args `[ConstInt(fn_idx),
         // ListI([ConstInt(op_val)]), ListR([lhs, rhs]), Descr]`.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
@@ -9707,7 +9711,8 @@ mod tests {
         // result` HLOp must produce the same Insn shape that
         // `emit_residual_call_shape` produces inline at the
         // PopJumpIfFalse / PopJumpIfTrue callsites
-        // (codewriter.rs:5453-5463 / :5509-5519): `residual_call_r_i`
+        // (codewriter.rs's `Instruction::PopJumpIfFalse` /
+        // `Instruction::PopJumpIfTrue` arms): `residual_call_r_i`
         // with args `[ConstInt(fn_idx), ListR([cond]), Descr]` and a
         // Register(Int) result.  No `ListI` — `truth_fn` has no
         // scalar Int arg, so `args_i` is empty in
@@ -9809,9 +9814,10 @@ mod tests {
         // Lowering a `setitem(obj, key,
         // value)` HLOp (no result — `emit_frontend_setitem` records
         // the SpaceOperation with `result = None` per
-        // codewriter.rs:1518-1524) must produce the same Insn shape
-        // that `emit_residual_call_shape` produces inline at the
-        // StoreSubscr callsite (codewriter.rs:5244-5263):
+        // `emit_frontend_setitem` in codewriter.rs) must produce the same
+        // Insn shape that `emit_residual_call_shape` produces inline at the
+        // StoreSubscr callsite (codewriter.rs's `Instruction::StoreSubscr`
+        // arm):
         // `residual_call_r_v` with args `[ConstInt(fn_idx),
         // ListR([obj, key, value]), Descr]` and **no** result
         // Register.
@@ -10182,7 +10188,8 @@ mod tests {
         // LoadConst factor refactor.  The
         // helper must produce the same `residual_call_ir_r` Insn shape
         // that `emit_residual_call_shape` produced inline at
-        // codewriter.rs:4933-4946 before the refactor: `[ConstInt(
+        // codewriter.rs's `Instruction::LoadConst` arm before the
+        // refactor: `[ConstInt(
         // fn_idx), ListI([ConstInt(idx)]), ListR([Reg(pycode)]),
         // Descr(CallDescrStub{Plain, [Ref, Int]})] → Reg(Ref, dst)`.
         // Distinct from BINARY_OP/COMPARE_OP `_ir_r` shape: 1-element
@@ -10321,7 +10328,8 @@ mod tests {
         // production helper must match the Insn produced by feeding
         // the equivalent `residual_call_ir_r` SpaceOperation through
         // `flatten_op_to_insn`.  This guarantees the factor refactor
-        // at codewriter.rs:4933-4946 produces the same SSARepr bytes
+        // in codewriter.rs's `Instruction::LoadConst` arm produces the same
+        // SSARepr bytes
         // `emit_residual_call_shape` would have produced before the
         // refactor — no behavior change, only a more direct emit
         // path.
@@ -10369,7 +10377,8 @@ mod tests {
         // LoadGlobal factor refactor.  The
         // helper must produce the same `residual_call_ir_r` Insn shape
         // that `emit_residual_call_shape` produced inline at
-        // codewriter.rs:5598-5615 before the refactor: `[ConstInt(
+        // codewriter.rs's `Instruction::LoadGlobal` arm before the
+        // refactor: `[ConstInt(
         // fn_idx), ListI([ConstInt(namei)]), ListR([Reg(ns), Reg(
         // code), Reg(frame)]), Descr(CallDescrStub{Plain,
         // [Ref, Ref, Ref, Int]})] → Reg(Ref, dst)`.  The explicit
@@ -10595,7 +10604,8 @@ mod tests {
         // production helper must match the Insn produced by feeding
         // the equivalent `residual_call_ir_r` SpaceOperation through
         // `flatten_op_to_insn`.  This guarantees the factor refactor
-        // at codewriter.rs:5598-5615 produces the same SSARepr bytes
+        // in codewriter.rs's `Instruction::LoadGlobal` arm produces the same
+        // SSARepr bytes
         // `emit_residual_call_shape` would have produced before the
         // refactor — no behavior change, only a more direct emit
         // path.
@@ -10697,7 +10707,8 @@ mod tests {
         // CALL family factor refactor.  The
         // helper must produce the same `residual_call_r_r` Insn shape
         // that `emit_residual_call_shape` produced inline at
-        // codewriter.rs:5747-5754 before the refactor.  For nargs=2:
+        // codewriter.rs's `Instruction::Call` arm before the refactor.
+        // For nargs=2:
         // `[ConstInt(fn_idx), ListR([Reg(frame), Reg(callable),
         // Reg(arg0), Reg(arg1)]), Descr(CallDescrStub{MayForce, [Ref,
         // Ref, Ref, Ref]})] → Reg(Ref, dst)`.  No leading `ListI` —

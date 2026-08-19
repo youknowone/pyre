@@ -356,7 +356,7 @@ impl Assembler {
                 //
                 // RPython's `write_insn` iterates every operand and dispatches
                 // by Python type.  pyre's `dispatch_op` is keyed on `opname`
-                // (Note — see below), so operand iteration
+                // and matches no operand type at all, so operand iteration
                 // is split: `IndirectCallTargets` is collected here before the
                 // opcode-specific lowering runs.  The operand is purely
                 // metadata for the call — it is not written into the jitcode
@@ -1732,14 +1732,15 @@ fn dispatch_residual_call(
 
     // The int / ref / float arms route through the
     // canonical `residual_call_<kind>_canonical_via_target_with_effect_info`
-    // wrappers (jitcode/assembler.rs:2026 / 2067 / 2171), threading
-    // `stub.effect_info` end-to-end exactly like the void path at line
-    // 1495.  RPython `pyjitpl.py:1995-2068 do_residual_call` carries
+    // wrappers (jitcode/assembler.rs), threading
+    // `stub.effect_info` end-to-end exactly like the
+    // `residual_call_void_canonical_via_target_with_effect_info_and_word_abi`
+    // arm above.  RPython `pyjitpl.py:1995-2068 do_residual_call` carries
     // the same calldescr across every result kind via
     // `record_nospec(opnum, ..., calldescr)`; pyre now matches that for
     // i / r / f as well — the policy is encoded inside
     // `stub.effect_info` (already shaped by `effect_info_for_call_flavor`
-    // at flatten.rs:485-633), and the canonical typed recording arms in
+    // in `flatten.rs`), and the canonical typed recording arms in
     // pyjitpl/dispatch.rs read it back via
     // `effectinfo.is_call_release_gil()` /
     // `check_forces_virtual_or_virtualizable()` /

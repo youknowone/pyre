@@ -806,7 +806,7 @@ impl std::hash::Hash for SpamBlockRef {
 ///
 /// Branch-guard PCs are re-keyed off their guard-op position, not
 /// their first insn: a branch guard emits its condition ops BEFORE its
-/// leading `-live-` marker (flatten.rs:1868-69 / 1971-72), so first-insn
+/// leading `-live-` marker (`flatten.rs`'s `insert_exits`), so first-insn
 /// keying resolves to an earlier marker, whereas the runtime resumes a
 /// branch at orgpc = the guard's own pc and needs the guard's own
 /// leading marker.  Can-raise calls are re-keyed off their
@@ -892,8 +892,9 @@ fn derive_pc_live_indices_from_sparse(
     // the PC's first insn; no branch-guard re-key.
     // Can-raise fallthrough re-key: a can-raise `residual_call` at
     // stream position `q` carries a TRAILING `-live-` at `q+1`
-    // (jtransform.py:467-482, flatten.rs:1373).  When the call raises the
-    // runtime resumes at the call's FALLTHROUGH py_pc — not the call's own
+    // (jtransform.py:467-482, `flatten.rs`'s `serialize_op`).  When the call
+    // raises the runtime resumes at the call's FALLTHROUGH py_pc — not the
+    // call's own
     // pc — reading `pc_map[fallthrough_pc]` (trace_opcode.rs
     // `resume_pc = self.fallthrough_pc` for `after_residual_call` guards).
     // So the fallthrough PC's resume marker must be the call's trailing
@@ -1141,7 +1142,7 @@ fn fresh_variable_for_state(
 /// SSARepr regalloc) happens at the consumer.
 ///
 /// Filter: only Ref-kind pairs are emitted, matching the per-kind
-/// gate inside `allocate_registers` (`regalloc.rs:670-677`).  Every
+/// gate inside `allocate_registers` (`regalloc.rs`).  Every
 /// `FrameState.mergeable()` position in pyre holds a Ref-kind
 /// Variable (locals, stack, last_exc pair), so Int / Float kinds
 /// never produce CFG pairs in practice.
@@ -1410,9 +1411,8 @@ fn exception_edge_vars(
     graph: &mut super::flow::FunctionGraph,
 ) -> (super::flow::Variable, super::flow::Variable) {
     // `last_exception/>i` (Kind::Int) + `last_exc_value/>r` (Kind::Ref)
-    // per `assembler.py:220`.  Matches the walker emit at
-    // `codewriter.rs:4491` / `:4509` and the fixture etype/evalue kinds
-    // at `flatten.rs:5495-5496` / `:7649-7650`.  Untyped Variables
+    // per `assembler.py:220`.  Matches the walker emit in this file and the
+    // fixture etype/evalue kinds in `flatten.rs`.  Untyped Variables
     // crash the canonical SSARepr build's `regalloc_color` when an
     // exception edge propagates them into a colored slot
     // (raise_catch_loop reproducer).
@@ -1530,8 +1530,8 @@ fn update_catch_landing_state(
     // same handler) merges via `existing.union(&candidate)` and the
     // inputargs become the union state's Variables.  Mirrors the
     // `target.inputargs = state.getvariables()` pattern at
-    // `make_next_block` (codewriter.rs:932) and `initialize_spam_block`
-    // (codewriter.rs:913).  When `union` returns `None` (incompatible
+    // `make_next_block` and `initialize_spam_block` in this file.  When
+    // `union` returns `None` (incompatible
     // states), framestate and inputargs both stay at the existing
     // values.
     if let Some(state) = new_state {
@@ -2059,7 +2059,7 @@ fn vable_getfield_ref_graph_args(
 /// mirroring the SSA shape produced by [`emit_residual_call_shape`].
 ///
 /// Args follow the same kinds-string selection logic as the SSA emit
-/// (`codewriter.rs:2545-2587`):
+/// (`emit_residual_call_shape`):
 ///   - opname suffix `kinds` ∈ `{"r", "ir", "irf"}` chosen by which arg
 ///     kinds are present + whether `reskind == ResKind::Float`;
 ///   - argv `[Const(fn_idx), ListI?, ListR?, ListF?, Descr(stub)]`,
@@ -3444,7 +3444,7 @@ struct RegisterLayout {
     /// Compile-time depth bound from `code.max_stackdepth` (= CPython
     /// `co_stacksize`). Used directly without clamping so it matches the
     /// runtime PyFrame allocation `nlocals + ncells + max_stackdepth`
-    /// (`pyframe.rs:1576`).
+    /// (`pyframe.rs`'s `PyFrame::__init__`).
     ///
     /// NOTE: this is the FRAME-LENGTH bound. Stack slots are NOT pinned to
     /// identity colors — like body locals they are freely chordal-colored,
@@ -3709,7 +3709,7 @@ fn register_helper_fn_pointers(
     // which invokes Python `__bool__` and may run arbitrary user
     // code that observes (and therefore forces) virtualizables.
     // Matches `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
-    // (`effectinfo.py:23`) → `MayForce` per Slice α-2.
+    // (`effectinfo.py:23`) → `MayForce`.
     let truth_fn = bind(assembler, cpu.truth_fn as *const (), CallFlavor::MayForce);
     // PyPy's `LOAD_CONST` is a pure pre-wrapped list read. Pyre now preserves
     // that slot identity, but the first read is still the unwrapped compiler
@@ -3733,7 +3733,7 @@ fn register_helper_fn_pointers(
     // value pair and instantiates user `__init__` — arbitrary
     // user code that may observe virtualizables.  Matches
     // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` (`effectinfo.py:23`)
-    // → `MayForce` per Slice α-2.
+    // → `MayForce`.
     let normalize_raise_varargs_fn = bind(
         assembler,
         cpu.normalize_raise_varargs_fn as *const (),
@@ -4096,7 +4096,7 @@ fn register_helper_fn_pointers(
         CallFlavor::MayForce,
     );
     // `bh_reraise_varargs_zero` reads the TLS current-exception and, when none
-    // is live, allocates a `RuntimeError` (`raise_varargs(0)`, eval.rs:2624):
+    // is live, allocates a `RuntimeError` (`eval.rs`'s `raise_varargs(0)`):
     // can `MemoryError`, runs no user code, does not force virtuals →
     // `CallFlavor::Plain` (symmetric with `newtuple_from_array_fn`).  Appended
     // last to preserve fn_ptr indices.
@@ -4827,7 +4827,7 @@ fn catch_live_coverage_census(
 /// upstream `assembler.py:150-152`
 /// (`get_liveness_info(insn[1:], 'int'/'ref'/'float')`). The
 /// tracer (`trace_opcode.rs`) and the blackhole bridge-resume
-/// (`call_jit.rs:870-887`) read the three banks in order via
+/// (`call_jit.rs`) read the three banks in order via
 /// `LivenessIterator`, so the post-rename `-live-` marker is the
 /// sole source.
 ///
@@ -5845,7 +5845,7 @@ impl CodeWriter {
         // `result_kind` AND the stored stub carries it too, so the
         // assembler can cross-validate the descr's `result_kind` against
         // the opname-tail-derived `ResKind` at dispatch time
-        // (`assembler.rs:1370`).
+        // (`assembler.rs`'s `dispatch_residual_call`).
         let key = (effect_info, arg_kinds, result_kind);
         // `jit_list_append` is recorded as a void LIST_APPEND operation, but
         // its registered fallback has the uniform `(i64, i64) -> i64` helper
@@ -6017,7 +6017,7 @@ impl CodeWriter {
         // `interp_jit.py:64` portal red `(frame, ec)` registers — pre-regalloc
         // placeholder slots in the conflated Ref index space. Their final
         // post-regalloc colors are looked up from `alloc_result.rename` after
-        // `apply_rename` runs (see below). Slot `+10` was the dedicated
+        // `apply_rename` runs. Slot `+10` was the dedicated
         // `null_ref_reg` PY_NULL holder before null_ref_reg retirement retired it; the
         // portal red regs keep their numerical positions so layout-sensitive
         // tests stay stable.
@@ -6981,7 +6981,7 @@ impl CodeWriter {
                 // Record the graph offset as the
                 // walker's current py_pc.  Walker emits emit_vsd!
                 // INLINE during each PC's handler; canonical
-                // make_bytecode_block (flatten.rs:2258-2303) sorts ops
+                // make_bytecode_block (flatten.rs) sorts ops
                 // by op.offset for per-PC label interleaving, and
                 // offset=-1 routes synthetic ops to current_pc (the
                 // last anchored PC), landing them in the wrong PC's
@@ -7077,7 +7077,7 @@ impl CodeWriter {
         // position; pyre emits a dedicated `BC_JUMP_TARGET` opcode so the
         // runtime inner-loop can cheaply identify back-edge targets
         // without consulting a label table. The runtime-side adaptation
-        // stays (assembler dispatch at `assembler.rs:367-372`) but the
+        // stays (`assembler.rs`'s `write_insn` dispatch) but the
         // pyre-only opname is not surfaced into the RPython-parity
         // SSARepr layer — `flatten.py:106` uses plain `Label` for loop
         // headers.
@@ -7196,7 +7196,7 @@ impl CodeWriter {
         // single-SSARepr requirement forces it through the walker-local
         // `ssarepr` too; the alternative — a hybrid "some ops go through
         // SSARepr, some don't" dispatch — defeats the purpose of the
-        // switchover. `dispatch_op` in `assembler.rs:510` already routes
+        // switchover. `dispatch_op` in `assembler.rs` already routes
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
         // The value stack as the opcode being walked was entered, refreshed per
@@ -7896,7 +7896,7 @@ impl CodeWriter {
         // (`flatten.py:142, 259, 285, 303`) — those four SSA-only sites
         // are mirrored line-for-line by pyre's renderer-side
         // `flatten_graph` (`super::flatten::FlattenGraph::insert_exits` /
-        // `make_return` at `flatten.rs:1000, 1139, 1208, 1228`).
+        // `make_return`).
         //
         // pyre's walker, by contrast, runs 1:1 against the Python
         // bytecode and emits `-live-` at every PC entry to seed the
@@ -7979,7 +7979,8 @@ impl CodeWriter {
                 // and queues the target block.  `flatten.py:240-267`
                 // linkfalse mergeblock.  The bare `-live-` before the guard
                 // and the `goto_if_not` op itself are produced by the
-                // canonical splice (`flatten.rs:1888`) from the graph.
+                // canonical splice (`flatten.rs`'s `insert_exits`) from the
+                // graph.
                 let _ = mergeblock(
                     code,
                     &mut graph,
@@ -8126,7 +8127,7 @@ impl CodeWriter {
         // shadow's third operand is the canonical null ref constant —
         // `Constant::none()` (`ConstantValue::None` + `Kind::Ref`),
         // matching pyframe.py:411 (`None`) and assembler.py:109's null
-        // ref handling. flatten.rs:1163 lowers it to `ConstRef(0)`,
+        // ref handling. `flatten_constant_operand` lowers it to `ConstRef(0)`,
         // which is the same sentinel `PY_NULL` (a null pointer) that
         // the SSA emit writes via `emit_vable_setarrayitem_ref_const`.
         // All current callers pass `PY_NULL`; the parameter is retained
@@ -8174,8 +8175,8 @@ impl CodeWriter {
         // operand is `Constant::none()` (`ConstantValue::None` +
         // `Kind::Ref`), the canonical null ref representation upstream
         // uses for stack-slot clears (pyframe.py:411 `None`,
-        // assembler.py:109 null ref handling). flatten.rs:1163 lowers
-        // it to `ConstRef(0)`.
+        // assembler.py:109 null ref handling). `flatten_constant_operand`
+        // lowers it to `ConstRef(0)`.
         macro_rules! emit_popvalue_ref {
             ($depth:ident, $py_pc:expr) => {{
                 // Do not change this to a plain `$depth -= 1` until the
@@ -8938,7 +8939,7 @@ impl CodeWriter {
                                 current_state.store_local_value(store_reg as usize, stored);
                                 // Graph-side dual-write of BOTH halves of the
                                 // LOAD half lowering — symmetric to
-                                // `emit_load_fast_ref!` (codewriter.rs:3833+):
+                                // `emit_load_fast_ref!` in this file:
                                 //   - local read: jtransform.py:1877
                                 //     `do_fixed_list_getitem` lowers
                                 //     `locals_cells_stack_w[load_slot]` to
@@ -9191,7 +9192,7 @@ impl CodeWriter {
                                 // first from
                                 // `pendingblocks`; `emit_goto_if_not!`
                                 // then appends the FALSE link.  Canonical
-                                // `flatten.rs:1875-1880 insert_exits`
+                                // `flatten.rs`'s `insert_exits`
                                 // normalises the [TRUE, FALSE] exits
                                 // ordering via the llexitcase swap.
                                 mergeblock(
@@ -9425,8 +9426,8 @@ impl CodeWriter {
                             // The global lands at the deeper slot; the
                             // `raw_namei & 1` NULL sentinel is pushed ON TOP
                             // afterwards, matching the interpreter
-                            // `[callable, null_or_self]` order (eval.rs:3141,
-                            // shared_opcode.rs opcode_call).
+                            // `[callable, null_or_self]` order (`eval.rs`'s
+                            // `PyFrame::call`, shared_opcode.rs `opcode_call`).
                             let loaded_dst_reg = stack_base + current_depth;
                             if is_true_portal {
                                 let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
@@ -9640,7 +9641,7 @@ impl CodeWriter {
                         // Here we pop args and callable from the stack into
                         // registers, then call the helper with explicit args.
                         //
-                        // shared_opcode.rs:56 opcode_call parity:
+                        // shared_opcode.rs `opcode_call` parity:
                         // Stack layout before CALL(argc):
                         //   [callable, null_or_self, arg0, ..., arg(argc-1)]
                         // Pop in reverse: args, null_or_self, callable.
@@ -9670,7 +9671,7 @@ impl CodeWriter {
                                 let arg_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 graph_arg_values_rev.push(arg_value);
                             }
-                            // shared_opcode.rs:56 opcode_call pops null_or_self
+                            // shared_opcode.rs `opcode_call` pops null_or_self
                             // BEFORE callable — the callable sits at the deeper
                             // slot.  Resume restores tracer-recorded stack slots
                             // into these registers, so the pop order here must
@@ -9886,7 +9887,8 @@ impl CodeWriter {
                             // via `jtransform.py:1898 do_fixed_list_setitem`), not
                             // just bump the symbolic depth.  `LIST_APPEND` reads
                             // its accumulator back through `getarrayitem_vable_r`
-                            // (see below), and the blackhole runs
+                            // (the `Instruction::ListAppend` arm below), and the
+                            // blackhole runs
                             // BUILD_LIST→LIST_APPEND from the jitcode on a
                             // mid-frame resume, so the slot must be populated by
                             // the emitted op rather than relying on a prior
@@ -9971,8 +9973,8 @@ impl CodeWriter {
                                     // any slot, and the assembler's
                                     // dispatch_residual_call routes ConstRef
                                     // through the ref constants pool
-                                    // (assembler.rs:1709-1724
-                                    // expect_ref_reg_or_pool).
+                                    // (`assembler.rs`'s
+                                    // `expect_ref_reg_or_pool`).
                                     // `Constant::none()` lowers to
                                     // `Operand::ConstRef(0)` per
                                     // `flatten_constant_operand`'s
@@ -10015,7 +10017,7 @@ impl CodeWriter {
                                 // Insn shape.
                                 // Helper hardcodes `CallFlavor::MayForce`
                                 // matching the production source at
-                                // codewriter.rs:2235.  The polymorphic
+                                // `register_helper_fn_pointers`.  The polymorphic
                                 // `cause` Operand (Reg or ConstRef) is
                                 // built inline above.
                                 // Graph-side `residual_call_r_r` dual-write so the
@@ -10064,7 +10066,7 @@ impl CodeWriter {
                                     // be null / None — a bare `raise` reached by normal
                                     // fall-through (e.g. in a `finally`) rather than by
                                     // exception propagation.  Materialize the value the
-                                    // interpreter's `raise_varargs(0)` (eval.rs:2624)
+                                    // interpreter's `raise_varargs(0)` (eval.rs)
                                     // re-raises: the active exception when live, else a
                                     // `RuntimeError("No active exception to reraise")`.
                                     // `bh_reraise_varargs_zero` performs that
@@ -10096,7 +10098,8 @@ impl CodeWriter {
                                     // exception is non-null (we are inside a handler),
                                     // so materialize it via `get_current_exception()`
                                     // — exactly what `raise_varargs(0)` re-raises
-                                    // (eval.rs:2624).  The per-thread current-exception
+                                    // (`eval.rs`'s `raise_varargs`).  The per-thread
+                                    // current-exception
                                     // slot is maintained by `PUSH_EXC_INFO` /
                                     // `POP_EXCEPT` and survives the compiled-trace ↔
                                     // blackhole resume boundary, unlike the
@@ -10131,7 +10134,7 @@ impl CodeWriter {
                         }
 
                         Instruction::PushExcInfo => {
-                            // eval.rs:1220-1229 / pyopcode.py:786 parity:
+                            // `eval.rs`'s `push_exc_info` / pyopcode.py:786 parity:
                             //   exc  = pop()
                             //   prev = CURRENT_EXCEPTION
                             //   CURRENT_EXCEPTION = exc
@@ -10146,7 +10149,7 @@ impl CodeWriter {
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let exc_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // A bare handler entry (no recorded catch-site
-                            // FrameState, codewriter.rs:5427-5443) fills the
+                            // FrameState) fills the
                             // symbolic stack with null sentinels, so the popped
                             // slot can be a `Constant` — illegal as an op result
                             // and unpinnable.  Bind a fresh Variable instead:
@@ -10216,7 +10219,7 @@ impl CodeWriter {
                             // (shape residual_call_r_v).
                             // Walker-orthodoxy: TLS-only helpers,
                             // no frame_var threading.  Match helper
-                            // bind-site flavors at codewriter.rs:2207-2217
+                            // bind-site flavors in `register_helper_fn_pointers`
                             // — both current-exception helpers are TLS
                             // read/write only and statically prove "no GC
                             // heap touched", binding `PlainCannotRaiseNoHeap`
@@ -10335,7 +10338,7 @@ impl CodeWriter {
                             // accepts any `op_val: i64` and the dual-write
                             // already records the same `compare_fn(...,
                             // ISINSTANCE_OP:Int) → Ref` `residual_call_ir_r`
-                            // shape (codewriter.rs:6219-6232).
+                            // shape (recorded in this arm).
                             // Walker-orthodoxy: compare_fn(exc,
                             // match_type, ISINSTANCE_OP:Int) → Ref shape
                             // residual_call_ir_r.  No frame_var threading.
@@ -10363,7 +10366,7 @@ impl CodeWriter {
                             // reads NULL and mis-branches once the regalloc
                             // colours the fresh ref differently from the compare
                             // result (reproducible on a nested except resume).
-                            // Mirror CompareOp (codewriter.rs:6744): pin the
+                            // Mirror the `Instruction::CompareOp` arm: pin the
                             // result to the stack slot it is pushed to so
                             // PopJumpIfFalse's pop re-pins the same value to the
                             // same slot and `truth_fn` reads the compare's own
@@ -10393,7 +10396,7 @@ impl CodeWriter {
                         }
 
                         Instruction::PopExcept => {
-                            // eval.rs:1243-1249 / pyopcode.py:778 parity:
+                            // `eval.rs`'s `pop_except` / pyopcode.py:778 parity:
                             //   prev = pop()
                             //   CURRENT_EXCEPTION = prev
                             //
@@ -11011,7 +11014,7 @@ impl CodeWriter {
                         // (range-only spike) so the for-loop body stays on the
                         // full-body-walk tracer like a while-loop, instead of the
                         // `abort_permanent` decline that routed it to the weaker
-                        // trait leg (the +1 double-apply, #57).  pyopcode.rs:584
+                        // trait leg (the +1 double-apply, #57).  pyopcode.rs
                         // `opcode_get_iter` → `baseobjspace::iter`; a user
                         // `__iter__` may run Python → `CallFlavor::MayForce`.
                         Instruction::GetIter => {
@@ -11048,7 +11051,7 @@ impl CodeWriter {
                         // FOR_ITER — peek the iterator (kept on the stack), call
                         // `next(iter)`, push the next item.  Net: +1.
                         // `opcode_for_iter` peeks but never pops the iterator
-                        // (pyopcode.rs:589-608); the iterator stays at TOS-after the
+                        // (pyopcode.rs); the iterator stays at TOS-after the
                         // GET_ITER above, and the next item is pushed above it.
                         // The exhaustion case (a null return) is handled by the
                         // interpreter on side-exit; the trace only records the
@@ -11062,8 +11065,9 @@ impl CodeWriter {
                             // `jtransform.py:760-767 do_fixed_list_getitem`
                             // lowers to `getarrayitem_vable_r` inside the loop
                             // body.  GET_ITER's `pushvalue` populated the slot
-                            // via `setarrayitem_vable_r` (see above), so the
-                            // reload always finds the live iterator.
+                            // via `setarrayitem_vable_r` (the
+                            // `Instruction::GetIter` arm above), so the reload
+                            // always finds the live iterator.
                             //
                             // The reload is required, not optional: pyre's
                             // `jit_merge_point` reds are `[frame, ec]` only
@@ -11364,7 +11368,7 @@ impl CodeWriter {
                         }
 
                         Instruction::EndFor => {
-                            // Pyre's end_for() is a no-op (pyopcode.rs:999). Net: 0.
+                            // Pyre's end_for() is a no-op (pyopcode.rs). Net: 0.
                             // The actual pop is handled by the subsequent PopIter (-1).
                         }
 
@@ -11425,7 +11429,8 @@ impl CodeWriter {
                         // CallKw: like Call but with extra kwnames tuple.
                         // Pops: kwnames + argc args + null_or_self + callable = argc + 3.
                         // Pushes: result. Net stack effect: -(argc + 2).
-                        // pyopcode.py CALL_FUNCTION_KW / CALL_KW / eval.rs:2570-2726.
+                        // pyopcode.py CALL_FUNCTION_KW / CALL_KW / `eval.rs`'s
+                        // `call_kw`.
                         //
                         // Records `call_kw(callable, null_or_self, kwnames,
                         // arg0..argN-1)` → `residual_call_r_r(call_kw_fn_N,
@@ -11555,7 +11560,8 @@ impl CodeWriter {
                         }
 
                         // LoadFastAndClear: push local, clear it. Net: +1.
-                        // pyopcode.py LOAD_FAST_AND_CLEAR / eval.rs:2052-2058.
+                        // pyopcode.py LOAD_FAST_AND_CLEAR / `eval.rs`'s
+                        // `load_fast_and_clear`.
                         // LOAD_FAST_AND_CLEAR: push the local's value (like
                         // LOAD_FAST, but no unbound-slot error — a cleared slot
                         // reads as NULL) then clear the slot to NULL.  Net: +1.
@@ -11933,7 +11939,8 @@ impl CodeWriter {
                         // CallFunctionEx: pops callable+null+args+kwargs_or_null
                         // (4), pushes 1. Net: -3.  Stack top→bottom is
                         // kwargs_or_null, starargs, self_or_null, callable
-                        // (eval.rs:3636-3639).  Lowers to `call_function_ex(
+                        // (`eval.rs`'s `call_function_ex`).  Lowers to
+                        // `call_function_ex(
                         // callable, self_or_null, starargs, kwargs_or_null)` →
                         // `residual_call_r_r(call_function_ex_fn, ListR[...])`;
                         // `bh_call_function_ex_fn` unpacks `*`/`**` and
@@ -12250,7 +12257,7 @@ impl CodeWriter {
                         }
 
                         // EndSend: pops result (TOS), pops iter (TOS1), pushes result back.
-                        // Net: -1. Preserve result identity. eval.rs:2305-2309.
+                        // Net: -1. Preserve result identity. `eval.rs`'s `end_send`.
                         Instruction::EndSend => {
                             let result = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
@@ -12558,7 +12565,7 @@ impl CodeWriter {
                         // then pops 2 (value, expression_str) via build_tuple, pushes 1.
                         // No spec: pops 2, pushes 1. Net: -1.
                         // With spec: pops 3, pushes 1. Net: -2.
-                        // pyopcode.rs:1798-1806.
+                        // pyopcode.rs `build_interpolation_op`.
                         Instruction::BuildInterpolation { format } => {
                             let has_format_spec = (u32::from(format.get(op_arg)) & 1) != 0;
                             if has_format_spec {
@@ -12589,7 +12596,8 @@ impl CodeWriter {
                         }
 
                         // CallIntrinsic1: pops 1, pushes 1 (result may differ). Net: 0.
-                        // UnaryPositive (`+value`, pyopcode.rs:1390 → space.pos)
+                        // UnaryPositive (`+value`, pyopcode.rs `unary_positive`
+                        // → space.pos)
                         // is lowered to the object-space `pos(value)` op, the
                         // single-Ref FORMAT_SIMPLE shape (mirrors UNARY_INVERT);
                         // the other intrinsics remain unported → abort_permanent.
@@ -12628,7 +12636,7 @@ impl CodeWriter {
                         // CallIntrinsic2: variant-dependent stack effect.
                         // SetFunctionTypeParams: pops type_params (TOS), leaves func. Net: -1.
                         // Other variants: general pop 2, push 1. Net: -1.
-                        // pyopcode.rs:1302-1316.
+                        // pyopcode.rs `call_intrinsic_2`.
                         //
                         // Every variant is a PEP 695 / def-time intrinsic that
                         // imports `_typing` and calls a Python helper, never a hot
@@ -12724,7 +12732,8 @@ impl CodeWriter {
                         },
 
                         // LoadFromDictOrGlobals: pops 1 (dict), pushes 1 (result). Net: 0.
-                        // Replace shadow value. eval.rs:2028.
+                        // Replace shadow value. `eval.rs`'s
+                        // `load_from_dict_or_globals`.
                         // LoadFromDictOrGlobals(i): pop dict, push result. Net 0.
                         // `flowcontext.py` resolves via find_global, but the op
                         // carries a runtime dict operand so it lowers to a
@@ -12764,14 +12773,16 @@ impl CodeWriter {
 
                         // LoadFromDictOrDeref: structural adaptation — CPython pops dict,
                         // pushes result (net 0). Pyre's trait default raises before stack
-                        // mutation (pyopcode.rs:1247), so this models the intended CPython
+                        // mutation (pyopcode.rs `load_from_dict_or_deref`), so this
+                        // models the intended CPython
                         // shape, not current pyre runtime behavior.
                         Instruction::LoadFromDictOrDeref { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
                             // No residual is possible while the interpreter
                             // itself raises here: the trait default
-                            // (pyopcode.rs:1247) never implements the opcode, so
+                            // (`load_from_dict_or_deref`) never implements the
+                            // opcode, so
                             // there is no value-level function to call.
                             emit_abort_permanent!(py_pc);
                         }
@@ -13153,7 +13164,8 @@ impl CodeWriter {
                         }
 
                         // Structural adaptation: async opcodes. Pyre's dispatcher
-                        // errors immediately (pyopcode.rs:2027) without stack mutation.
+                        // errors immediately (pyopcode.rs `get_aiter` /
+                        // `get_awaitable`) without stack mutation.
                         // Stack effects model intended CPython shape for convergence.
                         Instruction::GetAiter | Instruction::GetAwaitable { .. } => {
                             let _ = current_state.stack.pop();
@@ -13519,7 +13531,8 @@ impl CodeWriter {
                         // ExitInitCheck: no-op in pyre. Net: 0.
                         // RustPython pops the __init__ return value, but pyre's
                         // dispatch is a plain `Ok(StepResult::Continue)`
-                        // (pyopcode.rs), and liveness.rs:579 models it as pop 0 /
+                        // (pyopcode.rs), and `liveness.rs`'s
+                        // `Instruction::ExitInitCheck` arm models it as pop 0 /
                         // push 0 to match. An opcode the interpreter executes as a
                         // no-op has nothing to residualize and nothing to bail for,
                         // so the trace just carries on.
@@ -13530,7 +13543,8 @@ impl CodeWriter {
 
                         // YieldValue: pops yielded value, pushes placeholder back. Net: 0.
                         // Replace shadow value. rpython/flowspace/flowcontext.py:721,
-                        // liveness.rs:569, assemble.py:1543.
+                        // `liveness.rs`'s `Instruction::YieldValue` arm,
+                        // assemble.py:1543.
                         //
                         // Fundamentally unsound to port: YIELD_VALUE suspends the
                         // frame (StepResult::Yield), resuming later in a different
@@ -13571,7 +13585,8 @@ impl CodeWriter {
                         }
 
                         // Structural adaptation: async opcodes below. Pyre's dispatcher
-                        // errors immediately (pyopcode.rs:2027) without stack mutation.
+                        // errors immediately (pyopcode.rs `get_anext`) without stack
+                        // mutation.
                         // Stack effects model intended CPython shape for convergence.
 
                         // GetAnext: pushes 1. Net: +1.
@@ -13610,7 +13625,8 @@ impl CodeWriter {
                         }
 
                         // MatchSequence: peeks TOS (subject), pushes bool. Net: +1.
-                        // assemble.py:1614, liveness.rs:601.  `match_sequence(
+                        // assemble.py:1614, `liveness.rs`'s
+                        // `Instruction::MatchSequence` arm.  `match_sequence(
                         // subject)` HLOp → `bh_match_sequence_fn` residual.
                         Instruction::MatchSequence | Instruction::MatchMapping => {
                             let opname = if matches!(instruction, Instruction::MatchSequence) {
@@ -14027,7 +14043,7 @@ impl CodeWriter {
                  emit_mark_label_catch_landing!",
                     site.landing_label,
                 );
-                // eval.rs:150-168 handle_exception parity:
+                // `eval.rs`'s `handle_exception` parity:
                 // the handler edge enters with the protected prefix of the
                 // value stack preserved, then `push_lasti` (if any), then the
                 // exception value. `emit_goto!(handler_py_pc)` snapshots
@@ -14061,7 +14077,7 @@ impl CodeWriter {
                     .map(|(_, value)| value.clone())
                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                 current_state.stack.push(exc_value.clone());
-                // pyframe.py:503-510 + eval.rs:155-158 `dropvaluesuntil` parity:
+                // pyframe.py:503-510 + `eval.rs`'s `dropvaluesuntil` parity:
                 //
                 //     while frame.valuestackdepth > target_depth:
                 //         frame.pop()          # locals_cells_stack_w[d] = None
@@ -14089,7 +14105,7 @@ impl CodeWriter {
                         unwind_depth -= 1;
                         let depth_value = (stack_base_absolute + unwind_depth as usize) as i64;
                         // Graph-side dual-write — same shape as
-                        // `emit_pushvalue_ref_const!` at codewriter.rs:3576-3603.
+                        // `emit_pushvalue_ref_const!` in this file.
                         // The unwind PY_NULL is `Constant::none()` per
                         // assembler.py:109 ConstPtr.NULL.
                         let v_idx: super::flow::FlowValue =
@@ -14164,7 +14180,7 @@ impl CodeWriter {
                 // every exception link landing where
                 // `link.last_exception` is in `link.args`.  pyre's walker
                 // synthesises both Variables (exception_edge_vars,
-                // codewriter.rs:944-951); the canonical splice produces
+                // in this file); the canonical splice produces
                 // both insns from the graph.  The fresh Int scratch var
                 // stays: it advances the Variable-ID counter the splice
                 // output depends on (the slot itself has no live consumer
@@ -16045,7 +16061,7 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 ///     fallback required by `pyopcode.py:957` (breaks `print`/`len`),
 ///     and non-portal jitcode bytecode IS walked by the trace recorder
 ///     (`jitcode_dispatch.rs` walker) during callee inlining — its
-///     `read_ref_var_list` (jitcode_dispatch.rs:1029) reads
+///     `read_ref_var_list` (jitcode_dispatch.rs) reads
 ///     `ctx.registers_r[reg]` for each ref operand, so register-form
 ///     operands produce TRACED variables (results of `GetfieldVableR`
 ///     IR ops) that participate in the optimizer's
@@ -16080,7 +16096,8 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 ///     `getexecutioncontext().gettopframe()` inside `bh_call_fn_impl`,
 ///     so the CALL ListR carries no frame operand (portal and non-portal
 ///     callees share the same shape).  A non-null `null_or_self` is the
-///     method receiver the helper prepends as arg0 (eval.rs:3216-3226).
+///     method receiver the helper prepends as arg0 (`eval.rs`'s
+///     `PyFrame::call`).
 ///   * `bh_normalize_raise_varargs_with_frame(frame_ptr, exc, cause)` —
 ///     `frame_ptr` non-null asserted; pins
 ///     `(*parent_frame_ptr).execution_context` for the normalization

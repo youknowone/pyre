@@ -721,7 +721,7 @@ pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationRes
 ///   no `register_idx < nlocals → slot` identity contract.
 /// - Portal red args (`frame_reg`, `ec_reg`) are pre-populated by
 ///   `BlackholeInterpreter::fill_portal_registers`
-///   (blackhole.rs:1133-1140) at compile-time-fixed register slots
+///   (blackhole.rs) at compile-time-fixed register slots
 ///   produced by `RegisterLayout::compute`; `enforce_input_args` pins
 ///   their colors as well.
 #[derive(Clone, Copy)]

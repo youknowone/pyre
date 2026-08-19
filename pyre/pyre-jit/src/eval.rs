@@ -824,9 +824,9 @@ unsafe fn winapi_overlapped_destructor(obj_addr: usize) {
 /// equivalent of PyPy reaching the class through the traced
 /// `terminator.w_cls` (`mapdict.py:751-752`, a strong `_immutable_field_`).
 /// Pyre stores the class in the inline header word
-/// (`objectobject.rs:24`, `typeptr` in `rclass.py`), so it must be
-/// forwarded here or an instance whose class is reachable only through
-/// it would have that class reclaimed once heap types become
+/// (`objectobject.rs`'s `W_ObjectObject`, `typeptr` in `rclass.py`), so it
+/// must be forwarded here or an instance whose class is reachable only
+/// through it would have that class reclaimed once heap types become
 /// GC-managed.  Inert while heap types remain `malloc_typed`
 /// Box-immortal — the visitor's `is_in_nursery` / `is_managed_heap_object`
 /// guard skips the non-managed type pointer — exactly as
@@ -1022,9 +1022,10 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 }
 
 /// Custom trace for `W_TupleObject`. `wrappeditems` points at an off-GC
-/// `std::alloc`'d `ItemsBlock` (`tupleobject.rs:56`), so the element
-/// slots are unreachable through inline `gc_ptr_offsets` — the collector
-/// would see `wrappeditems` as a single non-managed pointer and stop.
+/// `std::alloc`'d `ItemsBlock` (`tupleobject.rs`'s `W_TupleObject`), so the
+/// element slots are unreachable through inline `gc_ptr_offsets` — the
+/// collector would see `wrappeditems` as a single non-managed pointer and
+/// stop.
 /// Forward each element slot in place, exactly as `set_object_custom_trace`
 /// walks the off-GC `Vec`, so a moving collector relocates young tuple
 /// elements and rewrites the block. The block is exact-size for tuples
@@ -1039,7 +1040,7 @@ unsafe fn tuple_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
         return;
     }
     if pyre_object::gc_hook::try_gc_owns_object(block as *mut u8) {
-        // Phase L2: forward the `wrappeditems` field slot; the type-9 varsize
+        // Forward the `wrappeditems` field slot; the type-9 varsize
         // walker forwards items[0..capacity] (tuples are exact-size).
         let items_slot = unsafe { std::ptr::addr_of_mut!((*tuple_ptr).wrappeditems) };
         f(items_slot as *mut majit_ir::GcRef);
@@ -1104,10 +1105,10 @@ unsafe fn list_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
     f(&mut list.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     if list.strategy == pyre_object::listobject::ListStrategy::Object && !list.items.is_null() {
         if pyre_object::gc_hook::try_gc_owns_object(list.items as *mut u8) {
-            // Phase L2: a GC-managed (moving) block is forwarded by handing the
+            // A GC-managed (moving) block is forwarded by handing the
             // collector the `items` field slot itself; the type-9 varsize walker
             // then forwards items[0..capacity] (spare slots are NULL). This is
-            // the `gc_ptr_offsets = [offset_of!(items)]` edge that collector.rs:377
+            // the `gc_ptr_offsets = [offset_of!(items)]` edge that collector.rs
             // declines while the block stays std::alloc.
             let items_slot = unsafe { std::ptr::addr_of_mut!((*list_ptr).items) };
             f(items_slot as *mut majit_ir::GcRef);
@@ -1288,7 +1289,7 @@ unsafe fn memoryview_object_destructor(obj_addr: usize) {
 /// varsize walker never runs), and the in-place scan of old-gen / Box
 /// `FrameDebugData` fields. Both require a custom trace.
 ///
-/// Forwarded (mirrors `walk_pyframe_roots` eval.rs:496-556):
+/// Forwarded (mirrors `walk_pyframe_roots` in `pyre-interpreter::eval`):
 ///   - `f_backref` — the parent frame pointer, or the `JitVirtualRef` standing
 ///     in for it once the JIT virtualizes an inlined callee. The vref is a GC
 ///     object whose `forced` and `virtual_token` slots are traced, so forwarding
@@ -2379,7 +2380,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `std::alloc` block, and the `debugdata->{w_locals, w_f_trace}`
     // refs one indirection away — so a custom trace is required.
     // `custom_trace` fully replaces offset tracing on both the minor
-    // (collector.rs:1471) and major-mark (collector.rs:1746) paths.
+    // (`trace_and_update_object`) and major-mark (`mark_object`) paths
+    // in `collector.rs`.
     //
     // Frames stamped with this type id: JIT-built inline frames
     // (`emit_new_pyframe_inline_self_recursive`, whose locals array is a
@@ -2696,7 +2698,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // that must be traced during minor collection — otherwise the
     // wrapped value could be reclaimed while a still-installed
     // cell holds the pointer.  Mirrors `Cell`'s
-    // `contents` registration (`nestedscope.rs:42`).
+    // `contents` registration (`nestedscope.rs`'s `Cell`).
     let w_object_mutable_cell_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::celldict::ObjectMutableCell>(),
         object_tid,
@@ -8462,8 +8464,9 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
             LoopResult::ContinueRunningNormally => {
                 // RPython warmspot.py:976-978: result = portal_ptr(*args).
                 // The blackhole has already written back the merge point
-                // state to the frame (call_jit.rs:999-1013). Re-enter
-                // eval_loop_jit with that state — do NOT reset to entry.
+                // state to the frame (`call_jit.rs`'s
+                // `handle_blackhole_result`). Re-enter eval_loop_jit with
+                // that state — do NOT reset to entry.
                 frame_root.frame().fix_array_ptrs();
                 continue;
             }
@@ -9622,8 +9625,9 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
 /// Only the `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2` failure reads the cache
 /// `handle_async_forcing` saved; every other `handle_fail` resumes with
 /// `all_virtuals = None`. `invent_fail_descr_for_op` marks exactly those two
-/// guards (`optimizeopt/mod.rs:6524`), so `is_guard_forced()` is the same
-/// discriminator upstream gets from the descr subtype.
+/// guards (`optimizeopt/mod.rs`'s `store_final_boxes_in_guard`), so
+/// `is_guard_forced()` is the same discriminator upstream gets from the
+/// descr subtype.
 fn forced_guard_cache_owner(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     frame: *const pyre_interpreter::PyFrame,
@@ -9714,7 +9718,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // resume frame, so it reconstructs the full inline framestack.
     // exit_layout already carries (rd_loop_token, trace_id, fail_index,
     // storage), mirroring the CALL_ASSEMBLER caller
-    // `jit_blackhole_resume_from_guard` (call_jit.rs:1855-1881) without the
+    // `jit_blackhole_resume_from_guard` (call_jit.rs) without the
     // green_key recovery that path needs.
     if let Some(storage) = exit_layout.storage.as_deref() {
         // The failing guard's own `exit_types`, not a re-lookup of them:
@@ -9731,7 +9735,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         // and `resume.py:1312 blackhole_from_resumedata` read every slot's
         // kind out of the self-describing deadframe+descr it was handed.
         // The sibling resume paths already pass this slice directly
-        // (`jitdriver.rs:493`, `:3772`).
+        // (`jitdriver.rs`).
         let all_virtuals = take_forced_virtuals_for_frame(forced_cache_owner);
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
             &storage.rd_numb,
@@ -9996,7 +10000,8 @@ fn execute_assembler(
                 majit_ir::Value::Ref(value) => {
                     // compile.py:640 DoneWithThisFrameDescrRef parity:
                     // return get_result() as-is. jitframe GC trace hook
-                    // (jitframe.rs:293) keeps interior refs alive.
+                    // (`jitframe.rs`'s `jitframe_trace`) keeps interior refs
+                    // alive.
                     value.as_usize() as pyre_object::PyObjectRef
                 }
                 majit_ir::Value::Float(f) => pyre_object::floatobject::w_float_new(*f),
@@ -12087,7 +12092,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     // vable-sync mode inside `build_resumed_frames`.
     //
     // RPython parity: every guard reaching this path MUST carry rd_numb.
-    // `store_final_boxes_in_guard` (optimizeopt/mod.rs:2936) populates
+    // `store_final_boxes_in_guard` (optimizeopt/mod.rs) populates
     // it for tracer-origin guards; backend-origin layouts propagate it
     // via `FailDescrLayout.rd_numb`. An empty
     // `rd_numb` here indicates an unported guard-emission site — hard
@@ -12107,9 +12112,10 @@ pub(crate) fn decode_and_restore_guard_failure(
             exit_layout.fail_index
         );
         // GuardFailureSync mode writes the captured vable boxes back onto
-        // the physical frame (see comment above). The decoded frame chain
-        // is also consumed below to recover the innermost frame's section
-        // pc (its resume opcode), which the full-body walk does not track
+        // the physical frame — `build_resumed_frames` picks that mode for a
+        // guard failure. The decoded frame chain is also consumed below to
+        // recover the innermost frame's section pc (its resume opcode),
+        // which the full-body walk does not track
         // in the vable `last_instr` field.
         build_resumed_frames(
             raw_values,
@@ -12891,7 +12897,7 @@ fn _prepare_next_section(
 
 // `cranelift_resumedata_deopt` lives in `call_jit.rs` so it stays
 // outside `pyre-jit-trace`'s build-script translator file set
-// (build.rs:66 reads pyre-jit/src/eval.rs verbatim; `eval.rs` must
+// (build.rs reads pyre-jit/src/eval.rs verbatim; `eval.rs` must
 // remain expressible in the translator's RPython subset, which the
 // downcast-driven on-demand decode implementation is not).
 
