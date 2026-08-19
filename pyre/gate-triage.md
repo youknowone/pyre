@@ -873,6 +873,34 @@ Kept as-is; listed for completeness.
   the STORE_SUBSCR walker specialization gate, deleted.)
 - **Test harness (1)**: `PYRE_MIR_STRESS_LLBC`.
 
+## §5b — The const heap short-box gate (2026-08-19, default-OFF)
+
+Added on `perf-bridge`. `shortpreamble.py:272-281` appends every produced op to
+`short_boxes` and `:369-373` is the const-result arm of that production, so
+upstream has no such switch; the gate exists because pyre cannot yet run that
+arm. Default-OFF, so an unset tree behaves exactly as its base does.
+
+Turning it on was measured with `check.py --backend dynasm --synthetic-only`
+and is not viable today — it crashes the JIT on seven of the 431 synthetic
+fixtures, with two distinct panics:
+
+- `optimizeopt`, `assertion left == right failed: make_equal_to: cross-type
+  forward (Box.type invariant)`: a const-result short box forwarded into a
+  typed box slot. Six fixtures — `check_exc_match_invalid_class`,
+  `exc_mixed_classes_bridge_flavor`, `except_tuple_clause_hot`,
+  `exception_traceback_frame_lineno`, `frame_lineno_mid_replay_regression`,
+  `jit_callee_raised_exc_value`.
+- `resume.rs`, `decode_ref: unexpected tag 1`, on
+  `call_loop_local_function`.
+
+A three-fixture sample (`v4_onlylongtail` 66000, `v13_readdefs` 74000,
+`synth/closure_per_call` 733264) does pass with the gate on, which is why a
+narrow check reads as clear; the 431-fixture run is the one that decides.
+
+| var | reader | what it gates | polarity | retires when |
+|---|---|---|---|---|
+| PYRE_CONST_SHORT_BOXES | `majit-metainterp/src/optimizeopt/optimizer.rs` | appends the const-result heap short boxes to the exported short preamble, which `shortpreamble.py:272-281 ← :369-373` does unconditionally | OFF | both panics above are fixed, after which the gate is deleted with its OFF path |
+
 ## §6 — The 66 gates the audits never listed (2026-08-07)
 
 The hand audits above enumerated what they were looking at. Measured against the

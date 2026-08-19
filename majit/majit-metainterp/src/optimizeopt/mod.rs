@@ -80,6 +80,14 @@ pub(crate) fn next_snapshot_pos<T>(store: &[Option<T>]) -> i32 {
 
 pub(crate) use crate::majit_log_enabled;
 
+// Temporary probe: the const heap short-box path has never executed, so
+// enabling it moves the compiled short preamble on every fixture.
+pub(crate) fn const_short_boxes_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PYRE_CONST_SHORT_BOXES").is_some());
+    *ON
+}
+
 /// info.py:865-894 `getrawptrinfo` / `getptrinfo` return shape, with
 /// RPython `_forwarded` object identity preserved.
 ///
