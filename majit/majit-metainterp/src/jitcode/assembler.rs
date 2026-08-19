@@ -5380,7 +5380,7 @@ impl JitCodeBuilder {
         self.patch_switch_descrs();
         self.patch_const_refs();
         self.patch_field_descr_parents();
-        if cfg!(debug_assertions)
+        if crate::jit_strict_mode()
             && let Some(disagreement) = self.field_descr_position_disagreement()
         {
             panic!("{disagreement}");
@@ -6042,10 +6042,12 @@ impl JitCodeBuilder {
     /// correctly and merely shares an address with a sibling.
     ///
     /// Returns the first disagreement as a message, so the caller's panic says
-    /// which descr and both numbers. Gated on `cfg!(debug_assertions)` at the
-    /// call site rather than wrapped in `debug_assert!`, because the message
-    /// needs the same walk the predicate does and `debug_assert!` would run it
-    /// twice.
+    /// which descr and both numbers. Gated at the call site on
+    /// [`jit_strict_mode`](crate::jit_strict_mode) rather than wrapped in a
+    /// `debug_assert!`: the message needs the same walk the predicate does and
+    /// `debug_assert!` would run it twice, and `cfg!(debug_assertions)` alone
+    /// would leave the check inert for the release corpus, which is where the
+    /// producers this covers are exercised most widely.
     ///
     /// [`patch_field_descr_parents`]: Self::patch_field_descr_parents
     fn field_descr_position_disagreement(&self) -> Option<String> {
@@ -6490,7 +6492,7 @@ mod tests {
                 &[(8, false, "agg", 8, true), (8, true, "leaf", 8, false)],
             );
             builder.getfield_gc_i(0, 1, 8, TID, name);
-            // `finish` runs the postcondition under `cfg!(debug_assertions)`; a
+            // `finish` runs the postcondition under `jit_strict_mode`; a
             // resolution that guessed would trip it before this returns.
             let jitcode = builder.finish();
             let (index_in_parent, name, parent) = jitcode
