@@ -358,13 +358,22 @@ fn async_signal_set() -> libc::sigset_t {
     }
 }
 
+/// The signals the process already had blocked before the routing below
+/// started, captured on the original thread.  A mask inherited across `exec`
+/// — what `posix_spawn`'s `setsigmask` installs — has to outlive the routing,
+/// so those signals are never unblocked on the interpreter thread.
+#[cfg(unix)]
+static INHERITED_BLOCKED: std::sync::OnceLock<libc::sigset_t> = std::sync::OnceLock::new();
+
 /// Block the async signals on the calling thread — called on the process's
 /// original thread before the interpreter thread is spawned.
 #[cfg(unix)]
 pub fn block_async_signals_on_origin_thread() {
     unsafe {
         let set = async_signal_set();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
+        let _ = INHERITED_BLOCKED.set(previous);
     }
 }
 
@@ -374,7 +383,14 @@ pub fn block_async_signals_on_origin_thread() {
 #[cfg(unix)]
 pub fn unblock_async_signals_on_interp_thread() {
     unsafe {
-        let set = async_signal_set();
+        let mut set = async_signal_set();
+        if let Some(inherited) = INHERITED_BLOCKED.get() {
+            for signum in 1..NSIG {
+                if libc::sigismember(inherited, signum) == 1 {
+                    libc::sigdelset(&mut set, signum);
+                }
+            }
+        }
         libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
     }
 }
