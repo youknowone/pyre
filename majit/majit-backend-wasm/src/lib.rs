@@ -3770,8 +3770,6 @@ impl majit_backend::Backend for WasmBackend {
                     is_exception_exit: meta
                         .map(|fd| fd.is_exit_frame_with_exception())
                         .unwrap_or(false),
-                    gc_ref_slots: Vec::new(),
-                    force_token_slots: Vec::new(),
                     recovery_layout: None,
                     frame_stack: None,
                     rd_numb: meta.and_then(|fd| fd.rd_numb().map(|s| s.to_vec())),
@@ -3853,8 +3851,6 @@ impl majit_backend::Backend for WasmBackend {
                     is_exception_exit: meta
                         .map(|fd| fd.is_exit_frame_with_exception())
                         .unwrap_or(false),
-                    gc_ref_slots: Vec::new(),
-                    force_token_slots: Vec::new(),
                     recovery_layout: None,
                     frame_stack: None,
                     rd_numb: meta.and_then(|fd| fd.rd_numb().map(|s| s.to_vec())),

@@ -3119,9 +3119,9 @@ impl Backend for DynasmBackend {
                 // `Type::Void` is the resume.py:411-417 hole sentinel —
                 // the slot's value is reconstructed from the resume
                 // snapshot (TAGCONST/TAGVIRTUAL), not from the deadframe.
-                // Surfacing `Value::Void` keeps `gc_ref_slots` and
-                // downstream type-tag dispatchers from misclassifying
-                // it as a live `Ref` and leaking a NULL `GcRef`.
+                // Surfacing `Value::Void` keeps the gcmap and downstream
+                // type-tag dispatchers from misclassifying it as a live
+                // `Ref` and leaking a NULL `GcRef`.
                 Type::Void => Value::Void,
                 Type::Int => Value::Int(raw),
             });
@@ -3144,7 +3144,6 @@ impl Backend for DynasmBackend {
             outputs,
             typed_outputs,
             exit_layout,
-            force_token_slots: Vec::new(),
             savedata: None,
             exception_value,
             fail_index: descr_fd.fail_index_per_trace(),

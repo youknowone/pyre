@@ -309,8 +309,6 @@ pub(crate) struct CompiledTrace {
 #[derive(Debug, Clone)]
 pub(crate) struct StoredExitLayout {
     pub(crate) source_op_index: Option<usize>,
-    pub(crate) gc_ref_slots: Vec<usize>,
-    pub(crate) force_token_slots: Vec<usize>,
     pub(crate) recovery_layout: Option<ExitRecoveryLayout>,
     pub(crate) resume_layout: Option<ResumeLayoutSummary>,
     /// compile.py:853 `ResumeGuardDescr` storage — single guard-owned
@@ -361,8 +359,6 @@ impl StoredExitLayout {
             exit_types: ExitTypes::from_slice(self.resolve_exit_types()),
             is_finish: self.resolve_is_finish(),
             is_exception_exit: self.resolve_is_exception_exit(),
-            gc_ref_slots: self.gc_ref_slots.clone(),
-            force_token_slots: self.force_token_slots.clone(),
             recovery_layout: self.recovery_layout.clone().map(Box::new),
             resume_layout: self.resume_layout.clone().map(Box::new),
             storage: self.storage.clone(),
@@ -2683,12 +2679,6 @@ impl<M: Clone> MetaInterp<M> {
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
         let exit_types = ExitTypes::from_slice(descr.fail_arg_types());
-        let gc_ref_slots: Vec<usize> = exit_types
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
-            .collect();
-        let force_token_slots = descr.force_token_slots().to_vec();
         let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
 
         let default_layout = || CompiledExitLayout {
@@ -2699,8 +2689,6 @@ impl<M: Clone> MetaInterp<M> {
             exit_types: exit_types.clone(),
             is_finish,
             is_exception_exit: is_exit_frame_with_exception,
-            gc_ref_slots: gc_ref_slots.clone(),
-            force_token_slots: force_token_slots.clone(),
             recovery_layout: None,
             resume_layout: None,
             storage: None,
@@ -2889,15 +2877,6 @@ impl<M: Clone> MetaInterp<M> {
                 } else {
                     layout.fail_arg_types
                 });
-                let gc_ref_slots = if layout.gc_ref_slots.is_empty() {
-                    exit_types
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(idx, ty)| (*ty == Type::Ref).then_some(idx))
-                        .collect()
-                } else {
-                    layout.gc_ref_slots
-                };
                 CompiledExitLayout {
                     rd_loop_token: owning_key, // compile.py:186
                     trace_id,
@@ -2906,8 +2885,6 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types,
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
-                    gc_ref_slots,
-                    force_token_slots: layout.force_token_slots,
                     recovery_layout: layout.recovery_layout.map(Box::new),
                     resume_layout: None,
                     storage,
@@ -2931,8 +2908,6 @@ impl<M: Clone> MetaInterp<M> {
                 exit_types: ExitTypes::from_vec(layout.exit_types),
                 is_finish: layout.is_finish,
                 is_exception_exit: layout.is_exception_exit,
-                gc_ref_slots: layout.gc_ref_slots,
-                force_token_slots: layout.force_token_slots,
                 recovery_layout: layout.recovery_layout.map(Box::new),
                 resume_layout: None,
                 storage: None,
@@ -2978,8 +2953,6 @@ impl<M: Clone> MetaInterp<M> {
                         exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                         is_finish: layout.is_finish,
                         is_exception_exit: layout.is_exception_exit,
-                        gc_ref_slots: layout.gc_ref_slots,
-                        force_token_slots: layout.force_token_slots,
                         recovery_layout: layout.recovery_layout.map(Box::new),
                         resume_layout: merged
                             .get(&layout.fail_index)
@@ -3034,8 +3007,6 @@ impl<M: Clone> MetaInterp<M> {
                             exit_types: ExitTypes::from_vec(layout.exit_types),
                             is_finish: layout.is_finish,
                             is_exception_exit: layout.is_exception_exit,
-                            gc_ref_slots: layout.gc_ref_slots,
-                            force_token_slots: layout.force_token_slots,
                             recovery_layout: layout.recovery_layout.map(Box::new),
                             resume_layout: merged
                                 .get(&layout.op_index)
@@ -10446,8 +10417,6 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
-                    gc_ref_slots: layout.gc_ref_slots,
-                    force_token_slots: layout.force_token_slots,
                     recovery_layout: layout.recovery_layout.map(Box::new).or_else(|| {
                         trace_layout_ref.and_then(|layout| layout.recovery_layout.clone())
                     }),
@@ -10456,24 +10425,21 @@ impl<M: Clone> MetaInterp<M> {
                 }
             })
             .or(trace_layout)
-            .unwrap_or_else(|| CompiledExitLayout {
-                rd_loop_token: green_key, // from trace context
-                trace_id,
-                fail_index,
-                source_op_index: None,
-                exit_types: result.typed_outputs.iter().map(Value::get_type).collect(),
-                is_finish: result.is_finish,
-                is_exception_exit: result.is_exit_frame_with_exception,
-                gc_ref_slots: result
-                    .typed_outputs
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, value)| (value.get_type() == Type::Ref).then_some(slot))
-                    .collect(),
-                force_token_slots: result.force_token_slots.clone(),
-                recovery_layout: None,
-                resume_layout: None,
-                storage: None,
+            .unwrap_or_else(|| {
+                let exit_types: ExitTypes =
+                    result.typed_outputs.iter().map(Value::get_type).collect();
+                CompiledExitLayout {
+                    rd_loop_token: green_key, // from trace context
+                    trace_id,
+                    fail_index,
+                    source_op_index: None,
+                    exit_types,
+                    is_finish: result.is_finish,
+                    is_exception_exit: result.is_exit_frame_with_exception,
+                    recovery_layout: None,
+                    resume_layout: None,
+                    storage: None,
+                }
             });
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
@@ -10561,12 +10527,6 @@ impl<M: Clone> MetaInterp<M> {
         // `run_compiled_detailed_with_values_at_dispatch_key` for why the copy
         // does not belong on a path every entry takes.
         let exit_types: &[Type] = descr.fail_arg_types();
-        let gc_ref_slots: Vec<usize> = exit_types
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
-            .collect();
-        let force_token_slots = descr.force_token_slots().to_vec();
         let status = descr.get_status();
         // compile.py:186 `descr.rd_loop_token` — owning loop's clt,
         // stamped at compile time.  Walk the chain
@@ -10604,8 +10564,6 @@ impl<M: Clone> MetaInterp<M> {
                 exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
-                gc_ref_slots,
-                force_token_slots,
                 recovery_layout: None,
                 resume_layout: None,
                 storage: None,
@@ -10633,8 +10591,6 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types: ExitTypes::from_slice(exit_types),
                     is_finish,
                     is_exception_exit: is_exit_frame_with_exception,
-                    gc_ref_slots,
-                    force_token_slots,
                     recovery_layout: None,
                     resume_layout: None,
                     // The green-key index no longer holds this trace, but the
@@ -10861,8 +10817,6 @@ impl<M: Clone> MetaInterp<M> {
                 exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
-                gc_ref_slots: Vec::new(),
-                force_token_slots: Vec::new(),
                 recovery_layout: None,
                 resume_layout: None,
                 storage: None,
@@ -10887,12 +10841,6 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
 
-        let gc_ref_slots: Vec<usize> = exit_types
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
-            .collect();
-        let force_token_slots = descr.force_token_slots().to_vec();
         let status = descr.get_status();
         // compile.py:186 `descr.rd_loop_token` — see `run_compiled_detailed`.
         let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
@@ -10933,8 +10881,6 @@ impl<M: Clone> MetaInterp<M> {
                 exit_types: ExitTypes::from_slice(exit_types),
                 is_finish,
                 is_exception_exit: is_exit_frame_with_exception,
-                gc_ref_slots,
-                force_token_slots,
                 recovery_layout: None,
                 resume_layout: None,
                 // The green-key index no longer holds this trace, but the
@@ -14214,31 +14160,25 @@ impl<M: Clone> MetaInterp<M> {
                         compiled, green_key, trace_id, fail_index,
                     )
                 })
-                .unwrap_or_else(|| CompiledExitLayout {
-                    rd_loop_token: green_key, // from trace context
-                    trace_id,
-                    fail_index,
-                    source_op_index: None,
-                    exit_types: typed_fail_values
+                .unwrap_or_else(|| {
+                    let exit_types: ExitTypes = typed_fail_values
                         .map(|values| values.iter().map(Value::get_type).collect())
-                        .unwrap_or_default(),
-                    is_finish: false,
-                    is_exception_exit: false,
-                    gc_ref_slots: typed_fail_values
-                        .map(|values| {
-                            values
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(slot, value)| {
-                                    (value.get_type() == Type::Ref).then_some(slot)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    force_token_slots: Vec::new(),
-                    recovery_layout: None,
-                    resume_layout: None,
-                    storage: None,
+                        .unwrap_or_default();
+                    // Empty because this path classifies no force-token
+                    // slots; the predicate still reads it, so the two stay
+                    // one fact.
+                    CompiledExitLayout {
+                        rd_loop_token: green_key, // from trace context
+                        trace_id,
+                        fail_index,
+                        source_op_index: None,
+                        is_finish: false,
+                        is_exception_exit: false,
+                        exit_types,
+                        recovery_layout: None,
+                        resume_layout: None,
+                        storage: None,
+                    }
                 });
         // pyjitpl.py:3277-3288 initialize_state_from_guard_failure:
         // guard failure rebuild is stack-critical code — must not be
@@ -23202,8 +23142,6 @@ mod tests {
             fail_index,
             StoredExitLayout {
                 source_op_index: Some(0),
-                gc_ref_slots: vec![0],
-                force_token_slots: vec![],
                 recovery_layout: Some(recovery_layout),
                 resume_layout: None,
                 storage: Some(crate::resume::ResumeStorage::new(
@@ -23292,8 +23230,6 @@ mod tests {
             fail_index,
             StoredExitLayout {
                 source_op_index: Some(0),
-                gc_ref_slots: vec![],
-                force_token_slots: vec![],
                 recovery_layout: None,
                 resume_layout: None,
                 storage: Some(crate::resume::ResumeStorage::new(

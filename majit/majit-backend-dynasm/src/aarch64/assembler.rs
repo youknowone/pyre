@@ -1579,6 +1579,10 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
+    /// `llsupport/assembler.py:46-64 GuardToken.compute_gcmap`: every
+    /// `REF`-typed failarg is marked and nothing narrows it further.  That
+    /// includes a force token — `resoperation.py FORCE_TOKEN/0/r` returns
+    /// the jitframe, itself a moving GC object.
     fn guard_gcmap_from_faillocs(
         &self,
         fail_arg_types: &[Type],
@@ -1600,23 +1604,6 @@ impl<'a> AssemblerARM64<'a> {
                     gcmap_set_bit(gcmap, f.position + JITFRAME_FIXED_SIZE);
                 }
                 _ => {}
-            }
-        }
-        gcmap
-    }
-
-    fn gcmap_from_fail_arg_locs(
-        &self,
-        fail_arg_types: &[Type],
-        fail_arg_locs: &[Option<usize>],
-    ) -> *mut usize {
-        let frame_depth = self.frame_depth.saturating_sub(JITFRAME_FIXED_SIZE);
-        let gcmap = allocate_gcmap(frame_depth, JITFRAME_FIXED_SIZE);
-        for (tp, loc) in fail_arg_types.iter().zip(fail_arg_locs.iter()) {
-            if *tp == Type::Ref
-                && let Some(position) = loc
-            {
-                gcmap_set_bit(gcmap, *position);
             }
         }
         gcmap
@@ -4770,11 +4757,11 @@ impl<'a> AssemblerARM64<'a> {
                             // `Type::Void` is the "hole" sentinel — value
                             // comes from the resume snapshot, not the
                             // deadframe, so downstream consumers
-                            // (`gc_ref_slots`, `guard_gcmap_from_faillocs`,
-                            // `typed_outputs` reconstruction) must skip
-                            // these slots. Earlier code used `Type::Ref`
-                            // which silently leaked a NULL `GcRef` into
-                            // `gc_ref_slots` and the shadow stack.
+                            // (`guard_gcmap_from_faillocs`, `typed_outputs`
+                            // reconstruction) must skip these slots. Earlier
+                            // code used `Type::Ref`, which silently leaked a
+                            // NULL `GcRef` into the gcmap and the shadow
+                            // stack.
                             Type::Void
                         } else {
                             self.opref_type_at(opref.to_opref(), op_index).unwrap_or_else(|| {

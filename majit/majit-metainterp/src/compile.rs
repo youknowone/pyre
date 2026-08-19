@@ -175,8 +175,6 @@ pub struct CompiledExitLayout {
     /// `make_finish_fail_descr_typed` routes a `[Type::Ref]` exit to the
     /// correct `_DoneWithThisFrameDescr` subclass.
     pub is_exception_exit: bool,
-    pub gc_ref_slots: Vec<usize>,
-    pub force_token_slots: Vec<usize>,
     /// Held behind a pointer, not inline. Both this and [`Self::resume_layout`]
     /// describe how to REBUILD interpreter state after a guard failed, so both
     /// are `None` on the two exits the steady path actually takes — a FINISH
@@ -196,6 +194,23 @@ pub struct CompiledExitLayout {
     /// compile.py:853 `ResumeGuardDescr` storage handle — shared
     /// pool with rd_numb / rd_consts / rd_virtuals / rd_pendingfields.
     pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
+}
+
+impl CompiledExitLayout {
+    /// Whether the collector traces exit slot `slot`.
+    ///
+    /// The rule `llsupport/assembler.py compute_gcmap` applies: every
+    /// `REF`-typed failarg is marked, and nothing narrows it further.  A
+    /// force token is included, because `resoperation.py FORCE_TOKEN/0/r`
+    /// is REF upstream as well — it returns the jitframe, itself a GC
+    /// object that moves — and both emitted gcmaps
+    /// (`guard_gcmap_from_faillocs`, `collect_guards`) mark it.
+    ///
+    /// Do not narrow it by force-token position: that would stop rooting a
+    /// live jitframe pointer.
+    pub fn is_traced_ref_slot(&self, slot: usize) -> bool {
+        self.exit_types.get(slot) == Some(&Type::Ref)
+    }
 }
 
 /// Typed result from running compiled code.
@@ -1126,16 +1141,12 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             })
         };
 
+        // Empty because this path classifies no force-token slots; the
+        // predicate still reads it, so the two stay one fact.
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
                 source_op_index: Some(op_idx),
-                gc_ref_slots: exit_types
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, tp)| (*tp == Type::Ref).then_some(slot))
-                    .collect(),
-                force_token_slots: Vec::new(),
                 recovery_layout,
                 resume_layout,
                 storage,
@@ -1204,8 +1215,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
                 .entry(layout.fail_index)
                 .or_insert_with(|| StoredExitLayout {
                     source_op_index: layout.source_op_index,
-                    gc_ref_slots: layout.gc_ref_slots.clone(),
-                    force_token_slots: layout.force_token_slots.clone(),
                     recovery_layout: layout.recovery_layout.clone(),
                     resume_layout: None,
                     storage: storage_from_backend.clone(),
@@ -1220,8 +1229,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         if entry.descr.is_none() {
             entry.descr = descr_from_op;
         }
-        entry.gc_ref_slots = layout.gc_ref_slots.clone();
-        entry.force_token_slots = layout.force_token_slots.clone();
         // Merge recovery_layout: preserve header_pc from the frontend's
         // rd_numb-based layout when the backend doesn't provide it.
         // The frontend populates header_pc from the guard's snapshot
@@ -1510,8 +1517,6 @@ pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
             .entry(layout.op_index)
             .or_insert_with(|| StoredExitLayout {
                 source_op_index: Some(layout.op_index),
-                gc_ref_slots: layout.gc_ref_slots.clone(),
-                force_token_slots: layout.force_token_slots.clone(),
                 recovery_layout: layout.recovery_layout.clone(),
                 resume_layout: None,
                 storage: None,
@@ -1519,8 +1524,6 @@ pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
                 op_arg_types_for_jump: op_arg_types_for_jump.clone(),
             });
         entry.source_op_index = Some(layout.op_index);
-        entry.gc_ref_slots = layout.gc_ref_slots.clone();
-        entry.force_token_slots = layout.force_token_slots.clone();
         entry.recovery_layout = layout.recovery_layout.clone();
         if entry.descr.is_none() {
             entry.descr = descr_from_op;
@@ -1629,34 +1632,15 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>>(
         .iter()
         .map(|opref| {
             // `OpRef::NONE` represents a null-ref placeholder per
-            // `fail_arg_type`; preserve `Type::Ref` so downstream
-            // `gc_ref_slots` + `decode_values_with_layout` see the same
-            // null-Ref typing the rest of the resume path uses.
+            // `fail_arg_type`; preserve `Type::Ref` so the gcmap and
+            // `decode_values_with_layout` see the same null-Ref typing the
+            // rest of the resume path uses.
             if opref.is_none() {
                 return Type::Ref;
             }
             type_index
                 .opref_type_at(opref.to_opref(), op_index)
                 .unwrap_or(Type::Int)
-        })
-        .collect();
-    let force_token_slots: Vec<usize> = op
-        .getarglist()
-        .iter()
-        .enumerate()
-        .filter_map(|(slot, opref)| {
-            type_index
-                .op_at(opref.to_opref())
-                .map(|op| op.opcode)
-                .filter(|opcode| *opcode == OpCode::ForceToken)
-                .map(|_| slot)
-        })
-        .collect();
-    let gc_ref_slots: Vec<usize> = exit_types
-        .iter()
-        .enumerate()
-        .filter_map(|(slot, tp)| {
-            (*tp == Type::Ref && !force_token_slots.contains(&slot)).then_some(slot)
         })
         .collect();
     let is_exception_exit = op
@@ -1672,8 +1656,6 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>>(
         exit_types,
         is_finish,
         is_exception_exit,
-        gc_ref_slots,
-        force_token_slots,
         recovery_layout: None,
         resume_layout: None,
         storage: None,
@@ -1704,8 +1686,6 @@ pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
                 op_index,
                 StoredExitLayout {
                     source_op_index: Some(op_index),
-                    gc_ref_slots: layout.gc_ref_slots,
-                    force_token_slots: layout.force_token_slots,
                     recovery_layout: None,
                     resume_layout: None,
                     storage: None,
@@ -2731,6 +2711,31 @@ mod tests {
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
 
+    /// The deadframe rooting in `handle_fail` reaches the layout, not the
+    /// descr it came from, so the layout answers from its own types.  A
+    /// force-token slot is traced like any other ref — `compute_gcmap`
+    /// marks every REF failarg.
+    #[test]
+    fn exit_layout_traces_every_ref_slot_including_force_tokens() {
+        let layout = CompiledExitLayout {
+            rd_loop_token: 0,
+            trace_id: 0,
+            fail_index: 0,
+            source_op_index: None,
+            exit_types: ExitTypes::from_slice(&[Type::Ref, Type::Int, Type::Ref]),
+            is_finish: false,
+            is_exception_exit: false,
+            recovery_layout: None,
+            resume_layout: None,
+            storage: None,
+        };
+
+        assert!(layout.is_traced_ref_slot(0));
+        assert!(!layout.is_traced_ref_slot(1));
+        assert!(layout.is_traced_ref_slot(2));
+        assert!(!layout.is_traced_ref_slot(3));
+    }
+
     // history.py:227 ConstInt.value inline — SimpleBoxEnv.get_const
     // reads inline-Const directly without the legacy raw-u32 side table.
     #[test]
@@ -3232,7 +3237,6 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
-        force_token_slots: UnsafeCell::new(Vec::new()),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
@@ -3326,7 +3330,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
-        force_token_slots: UnsafeCell::new(Vec::new()),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
@@ -3587,12 +3590,6 @@ impl FailDescr for ResumeAtPositionDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn force_token_slots(&self) -> Vec<usize> {
-        FailDescr::force_token_slots(&self.inner)
-    }
-    fn set_force_token_slots(&self, slots: Vec<usize>) {
-        FailDescr::set_force_token_slots(&self.inner, slots);
-    }
     fn fail_count(&self) -> u32 {
         FailDescr::fail_count(&self.inner)
     }
@@ -3654,7 +3651,6 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
-            force_token_slots: UnsafeCell::new(Vec::new()),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
@@ -3868,12 +3864,6 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn force_token_slots(&self) -> Vec<usize> {
-        FailDescr::force_token_slots(&self.inner)
-    }
-    fn set_force_token_slots(&self, slots: Vec<usize>) {
-        FailDescr::set_force_token_slots(&self.inner, slots);
-    }
     fn fail_count(&self) -> u32 {
         FailDescr::fail_count(&self.inner)
     }
@@ -3935,7 +3925,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
-            force_token_slots: UnsafeCell::new(Vec::new()),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
@@ -4130,12 +4119,6 @@ impl FailDescr for ResumeGuardExcDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn force_token_slots(&self) -> Vec<usize> {
-        FailDescr::force_token_slots(&self.inner)
-    }
-    fn set_force_token_slots(&self, slots: Vec<usize>) {
-        FailDescr::set_force_token_slots(&self.inner, slots);
-    }
     fn fail_count(&self) -> u32 {
         FailDescr::fail_count(&self.inner)
     }
@@ -4197,7 +4180,6 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
-            force_token_slots: UnsafeCell::new(Vec::new()),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
@@ -4289,7 +4271,6 @@ pub struct ResumeGuardCopiedDescr {
     /// per emission; cranelift has no inline encoding so the slot list
     /// lives on the descr.  Same per-emission scoping as
     /// `source_op_index` / `rd_locs` — owned per copied descr.
-    force_token_slots: UnsafeCell<Vec<usize>>,
     /// Pyre-only per-emission slot: this guard is the eval-breaker word's
     /// back-edge poll.  Same per-emission scoping as `source_op_index`; a
     /// copy guards the same back edge as its donor, so the optimizer stamps
@@ -4440,7 +4421,6 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
-            force_token_slots: UnsafeCell::new(Vec::new()),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
@@ -4620,7 +4600,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
     }
-    /// Per-emission like `force_token_slots` below, and deliberately NOT
+    /// Per-emission, and deliberately NOT
     /// chased through `prev`: the classification describes this guard's own
     /// condition chain, which a sharer does not inherit from its donor.  A
     /// copied descr always answers `false`, and that is correct twice over.
@@ -4639,19 +4619,6 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_back_edge_poll(&self) {
         self.back_edge_poll
             .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    /// Per-emission `force_token_slots` (see field comment).  Owned
-    /// per copied descr so each emission's GC-root classification
-    /// stays distinct — PyPy bakes the equivalent map inline per
-    /// emission via `assembler.py:write_failure_recovery_description`,
-    /// no sharing through `prev`.
-    fn force_token_slots(&self) -> Vec<usize> {
-        unsafe { (&*self.force_token_slots.get()).clone() }
-    }
-    fn set_force_token_slots(&self, mut slots: Vec<usize>) {
-        slots.sort_unstable();
-        slots.dedup();
-        unsafe { *self.force_token_slots.get() = slots };
     }
     /// Per-emission `fail_count` (see field comment).  Owned per
     /// copied descr — PyPy parity with per-descr `status` jitcounter
@@ -4777,7 +4744,6 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
-                force_token_slots: UnsafeCell::new(Vec::new()),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
                 trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
@@ -4906,12 +4872,6 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_back_edge_poll(&self) {
         self.inner.set_back_edge_poll();
     }
-    fn force_token_slots(&self) -> Vec<usize> {
-        self.inner.force_token_slots()
-    }
-    fn set_force_token_slots(&self, slots: Vec<usize>) {
-        self.inner.set_force_token_slots(slots);
-    }
     fn fail_count(&self) -> u32 {
         self.inner.fail_count()
     }
@@ -4988,7 +4948,6 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
-        force_token_slots: UnsafeCell::new(Vec::new()),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
         trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
@@ -5029,7 +4988,6 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
-            force_token_slots: UnsafeCell::new(Vec::new()),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
@@ -5143,7 +5101,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
 /// Modeled as a newtype wrapping `ResumeGuardDescr` so the subclass
 /// inherits the full `_attrs_` slot set (adr_jump_offset, rd_locs,
 /// status, rd_loop_token, plus the pyre-side per-emission cells:
-/// source_op_index, force_token_slots, trace_info, fail_count,
+/// source_op_index, trace_info, fail_count,
 /// external_jump_target, bridge_*) the cranelift codegen path reads
 /// off every guard descr at `collect_guards` / dispatch emission.
 /// Same shape as `ResumeAtPositionDescr` (compile.py:892).
@@ -5194,7 +5152,6 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
-                force_token_slots: UnsafeCell::new(Vec::new()),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
@@ -5351,12 +5308,6 @@ impl FailDescr for CompileLoopVersionDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn force_token_slots(&self) -> Vec<usize> {
-        FailDescr::force_token_slots(&self.inner)
-    }
-    fn set_force_token_slots(&self, slots: Vec<usize>) {
-        FailDescr::set_force_token_slots(&self.inner, slots);
-    }
     fn fail_count(&self) -> u32 {
         FailDescr::fail_count(&self.inner)
     }
@@ -5416,7 +5367,6 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
-            force_token_slots: UnsafeCell::new(Vec::new()),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
@@ -5938,7 +5888,6 @@ mod fail_descr_tests {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
-                force_token_slots: UnsafeCell::new(Vec::new()),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),

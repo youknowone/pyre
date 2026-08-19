@@ -9396,12 +9396,12 @@ fn handle_fail(
     let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
     // The exit values are a host copy of the JITFRAME slots; the JITFRAME's
     // own gcmap rooting ended when `execute_token` returned. Bridge tracing
-    // below allocates, so root the Ref slots for this whole call
-    // (`DeadFrameRefRoots`).
+    // below allocates, so root the traced Ref slots for this whole call
+    // (`DeadFrameRefRoots`), the set `compute_gcmap` marks — force tokens
+    // included, since one is a jitframe pointer and the jitframe moves.
     let _deadframe_roots = unsafe {
         majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
-            exit_layout.exit_types.get(index) == Some(&majit_ir::Type::Ref)
-                || exit_layout.gc_ref_slots.contains(&index)
+            exit_layout.is_traced_ref_slot(index)
         })
     };
 
@@ -9605,9 +9605,8 @@ fn forced_guard_cache_owner(
 /// surfaces the running frame instead, so the cache is keyed by the frame the
 /// force ran against (`force_pyframe`) and taken back here by the same frame.
 ///
-/// The jitframe address is not usable as the key: only cranelift populates
-/// `FailDescr::force_token_slots`, so on dynasm the failing exit does not name
-/// its own force token at all.
+/// The jitframe address is not usable as the key: the failing exit does not
+/// name which of its slots holds the force token.
 ///
 /// A miss returns `None`, which resumes the ordinary way. Upstream instead
 /// substitutes an empty `VirtualCache` (`compile.py:959-960`) and still runs
@@ -9658,8 +9657,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // live range at `_prepare_resume_from_failure`, before `_run_forever`.
     let deadframe_roots = unsafe {
         majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
-            exit_layout.exit_types.get(index) == Some(&majit_ir::Type::Ref)
-                || exit_layout.gc_ref_slots.contains(&index)
+            exit_layout.is_traced_ref_slot(index)
         })
     };
     if majit_metainterp::majit_log_enabled() {

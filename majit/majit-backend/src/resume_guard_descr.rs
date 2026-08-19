@@ -165,8 +165,7 @@ pub struct ResumeGuardDescr {
     /// produce/consume inline); cranelift IR has no equivalent inline
     /// encoding so the vector lives on the descr.  Migrated here from
     /// the meta Arc is the single source of truth.  Sorted and deduped
-    /// at write time so `is_force_token_slot` can use `binary_search`.
-    pub force_token_slots: UnsafeCell<Vec<usize>>,
+    /// at write time so a reader can `binary_search` it.
     /// This guard is the eval-breaker word's back-edge poll, not a check on
     /// traced values.  Stamped once per emission by the optimizer, which is
     /// where the guard's condition chain is still in hand; read by the
@@ -318,7 +317,6 @@ impl Descr for ResumeGuardDescr {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
-            force_token_slots: UnsafeCell::new(Vec::new()),
             back_edge_poll: AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
@@ -474,16 +472,6 @@ impl FailDescr for ResumeGuardDescr {
     fn set_back_edge_poll(&self) {
         self.back_edge_poll.store(true, Ordering::Relaxed);
     }
-    fn force_token_slots(&self) -> Vec<usize> {
-        // Safety: single-threaded JIT.
-        unsafe { (&*self.force_token_slots.get()).clone() }
-    }
-    fn set_force_token_slots(&self, mut slots: Vec<usize>) {
-        slots.sort_unstable();
-        slots.dedup();
-        // Safety: single-threaded JIT.
-        unsafe { *self.force_token_slots.get() = slots };
-    }
     fn fail_count(&self) -> u32 {
         self.fail_count.load(Ordering::Relaxed)
     }
@@ -604,7 +592,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
-        force_token_slots: UnsafeCell::new(Vec::new()),
         back_edge_poll: AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
@@ -631,25 +618,6 @@ impl ResumeGuardDescr {
     pub fn set_source_op_index(&self, source_op_index: usize) {
         // Safety: single-threaded JIT.
         unsafe { *self.source_op_index.get() = Some(source_op_index) };
-    }
-
-    /// Read the codegen-time `force_token_slots`.
-    /// Returns `&[]` when codegen has not stamped any slots (the
-    /// common case for guards that do not produce force tokens).
-    pub fn force_token_slots(&self) -> &[usize] {
-        // Safety: single-threaded JIT.
-        unsafe { &*self.force_token_slots.get() }
-    }
-
-    /// Write the codegen-time `force_token_slots`.
-    /// Sorts + dedups so the stored vector satisfies the
-    /// `binary_search` invariant used by
-    /// `CraneliftFailDescr::is_force_token_slot`.
-    pub fn set_force_token_slots(&self, mut slots: Vec<usize>) {
-        slots.sort_unstable();
-        slots.dedup();
-        // Safety: single-threaded JIT.
-        unsafe { *self.force_token_slots.get() = slots };
     }
 
     /// Increment the per-descr `fail_count`.  Returns

@@ -109,7 +109,6 @@ pub struct RawExecResult {
     /// Backend-origin static metadata for this exit, when available.
     pub exit_layout: Option<FailDescrLayout>,
     /// Output slots that carry opaque force tokens instead of GC refs.
-    pub force_token_slots: Vec<usize>,
     /// Optional saved-data GC ref captured by this exit.
     pub savedata: Option<GcRef>,
     /// Pending exception value captured by this exit (`GcRef::NULL` = none).
@@ -766,9 +765,7 @@ pub struct FailDescrLayout {
     /// correct `_DoneWithThisFrameDescr` subclass.
     pub is_exception_exit: bool,
     /// Exit slot indices that hold rooted GC references.
-    pub gc_ref_slots: Vec<usize>,
     /// Exit slot indices that carry opaque FORCE_TOKEN handles.
-    pub force_token_slots: Vec<usize>,
     /// Optional backend-origin recovery layout for this exit.
     pub recovery_layout: Option<ExitRecoveryLayout>,
     /// Complete frame stack from innermost (this guard's frame) to outermost.
@@ -810,9 +807,7 @@ pub struct TerminalExitLayout {
     /// see `FailDescrLayout::is_exception_exit`.
     pub is_exception_exit: bool,
     /// Exit slot indices that hold rooted GC references.
-    pub gc_ref_slots: Vec<usize>,
     /// Exit slot indices that carry opaque FORCE_TOKEN handles.
-    pub force_token_slots: Vec<usize>,
     /// Optional backend-origin recovery layout for this terminal exit.
     pub recovery_layout: Option<ExitRecoveryLayout>,
     /// resume.py:450 — compact resume numbering (terminal exits rarely need
@@ -2587,7 +2582,6 @@ pub trait Backend: Send {
             outputs,
             typed_outputs,
             exit_layout,
-            force_token_slots: descr.force_token_slots().to_vec(),
             savedata,
             exception_value,
             fail_index: descr.fail_index(),
@@ -2697,13 +2691,6 @@ pub trait Backend: Send {
             fail_arg_types: descr.fail_arg_types().to_vec(),
             is_finish: descr.is_finish(),
             is_exception_exit: descr.is_exit_frame_with_exception(),
-            gc_ref_slots: descr
-                .fail_arg_types()
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, _)| descr.is_gc_ref_slot(slot).then_some(slot))
-                .collect(),
-            force_token_slots: descr.force_token_slots().to_vec(),
             recovery_layout: None,
             frame_stack: None,
             rd_numb: None,

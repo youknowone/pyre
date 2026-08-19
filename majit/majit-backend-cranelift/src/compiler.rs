@@ -30,7 +30,7 @@ use majit_backend::{
 };
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
-use majit_gc::{GcAllocator, GcMap, GcRewriter};
+use majit_gc::{GcAllocator, GcRewriter};
 use majit_ir::{
     AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op,
     OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
@@ -7471,21 +7471,6 @@ impl CompiledLoop {
     }
 }
 
-/// `assembler.py:write_failure_recovery_description` parity —
-/// derive the GC-map classification on demand from `fail_arg_types`
-/// and the per-emission `force_token_slots`.  Takes `&dyn FailDescr`
-/// so callers can invoke it on the bare metainterp `DescrRef`.
-pub(crate) fn fail_descr_gc_map(fd: &dyn FailDescr) -> GcMap {
-    let slots = fd.force_token_slots();
-    let mut gc_map = GcMap::new();
-    for (slot, tp) in fd.fail_arg_types().iter().enumerate() {
-        if *tp == Type::Ref && !slots.contains(&slot) {
-            gc_map.set_ref(slot);
-        }
-    }
-    gc_map
-}
-
 /// Resolve the `ExitRecoveryLayout` for a fail descr via the on-demand
 /// callback.  The cranelift backend no longer caches a
 /// recovery layout — pyre-jit's
@@ -7535,12 +7520,6 @@ fn fail_descr_layout(
         .as_fail_descr()
         .expect("fail_descr_layout requires a Descr that exposes the FailDescr trait");
     let fail_arg_types = fd.fail_arg_types();
-    let gc_map_local = fail_descr_gc_map(fd);
-    let gc_ref_slots = fail_arg_types
-        .iter()
-        .enumerate()
-        .filter_map(|(slot, _)| gc_map_local.is_ref(slot).then_some(slot))
-        .collect();
     let recovery = fail_descr_recovery_layout(descr);
     let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
     majit_backend::FailDescrLayout {
@@ -7551,8 +7530,6 @@ fn fail_descr_layout(
         fail_arg_types: fail_arg_types.to_vec(),
         is_finish: fd.is_finish(),
         is_exception_exit: fd.is_exit_frame_with_exception(),
-        gc_ref_slots,
-        force_token_slots: fd.force_token_slots(),
         recovery_layout: recovery,
         frame_stack,
         rd_numb: fd.rd_numb().map(|s| s.to_vec()),
@@ -9418,7 +9395,6 @@ impl CraneliftBackend {
         collect_guards(
             ops,
             inputargs,
-            &force_tokens,
             &mut fail_descrs,
             &mut fail_descr_cells,
             &mut guard_infos,
@@ -9440,7 +9416,6 @@ impl CraneliftBackend {
         let terminal_exit_layouts = collect_terminal_exit_layouts(
             ops,
             inputargs,
-            &force_tokens,
             trace_id,
             header_pc,
             source_guard,
@@ -15624,7 +15599,6 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
 fn collect_guards(
     ops: &[Op],
     inputargs: &[InputArg],
-    force_tokens: &IndexSet<u32>,
     fail_descrs: &mut Vec<DescrRef>,
     fail_descr_cells: &mut Vec<Arc<majit_ir::FailDescrCell>>,
     guard_infos: &mut Vec<GuardInfo>,
@@ -15750,20 +15724,6 @@ fn collect_guards(
         if n > *max_output_slots {
             *max_output_slots = n;
         }
-
-        let force_token_slots: Vec<usize> = fail_arg_refs
-            .iter()
-            .enumerate()
-            // Const operands carry value inline (history.py:227/268/314)
-            // — never force-token slots which live in the body namespace.
-            .filter_map(|(slot, opref)| {
-                if opref.is_constant() {
-                    None
-                } else {
-                    force_tokens.contains(&opref.raw()).then_some(slot)
-                }
-            })
-            .collect();
 
         // RPython resume.py:396: on guard failure the resume PC is taken
         // from the rebuilt top frame (`RebuiltFrame.pc`). rd_numb/rd_consts
@@ -16130,6 +16090,9 @@ fn collect_guards(
         //     also contain Const (handled by regalloc.py:1192-1193 in the same
         //     loop). majit groups external JUMP with FINISH for fail_args
         //     bookkeeping; treat their gcmap the same way.
+        // `compute_gcmap` marks every REF failarg and narrows nothing: a
+        // force token is REF too (`FORCE_TOKEN/0/r` returns the jitframe, a
+        // moving GC object), so its slot is marked like any other.
         let failarg_ref_slots = {
             let mut slots = Vec::new();
             for (i, tp) in fail_arg_types.iter().enumerate() {
@@ -16226,8 +16189,7 @@ fn collect_guards(
                 // op.descr for external JUMP is the TargetToken (already
                 // captured in external_jump_target above) — not a
                 // FailDescr.  Synthesize a `ResumeGuardDescr` so the
-                // meta-side slots for `force_token_slots` and
-                // `external_jump_target` are reachable.
+                // meta-side slot for `external_jump_target` is reachable.
                 majit_backend::make_resume_guard_descr_typed(fail_arg_types.to_vec())
             } else if let Some(d) = op.getdescr() {
                 // Preserve `op.descr` identity for every guard that carries
@@ -16269,15 +16231,13 @@ fn collect_guards(
                     fd.set_fail_arg_types(fail_arg_types.to_vec());
                 }
             }
-            // Per-emission setters publish into ResumeGuardDescr slots
-            // reached directly off `descr` (source_op_index,
-            // force_token_slots).  Gate on Resume-family
+            // The per-emission setter publishes into a ResumeGuardDescr
+            // slot reached directly off `descr`.  Gate on Resume-family
             // ownership — non-Resume descrs (PropagateExceptionDescr
-            // attached via compile_tmp_callback, etc.) carry neither
-            // slot and the trait-default panic would fire otherwise.
+            // attached via compile_tmp_callback, etc.) carry no such slot
+            // and the trait-default panic would fire otherwise.
             if descr.is_resume_guard() || descr.is_resume_guard_copied() {
                 as_fd(&descr).set_source_op_index(op_idx);
-                as_fd(&descr).set_force_token_slots(force_token_slots);
             }
             // Backend no longer caches an `ExitRecoveryLayout` per descr;
             // `fail_descr_recovery_layout` reads on demand via
@@ -16430,7 +16390,6 @@ fn collect_guards(
 fn collect_terminal_exit_layouts(
     ops: &[Op],
     inputargs: &[InputArg],
-    force_tokens: &IndexSet<u32>,
     trace_id: u64,
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
@@ -16450,27 +16409,6 @@ fn collect_terminal_exit_layouts(
             let arg_oprefs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
             let exit_types =
                 infer_fail_arg_types(&arg_oprefs, &type_index, &type_overrides, op_index)?;
-            let force_token_slots: Vec<usize> = op
-                .getarglist()
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, opref)| {
-                    if opref.is_constant() {
-                        None
-                    } else {
-                        force_tokens
-                            .contains(&opref.to_opref().raw())
-                            .then_some(slot)
-                    }
-                })
-                .collect();
-            let gc_ref_slots = exit_types
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, tp)| {
-                    (*tp == Type::Ref && !force_token_slots.contains(&slot)).then_some(slot)
-                })
-                .collect();
             let recovery_layout = (is_jump || is_finish).then(|| {
                 identity_recovery_layout(
                     trace_id,
@@ -16498,8 +16436,6 @@ fn collect_terminal_exit_layouts(
                     .as_ref()
                     .and_then(|d| d.as_fail_descr())
                     .is_some_and(|fd| fd.is_exit_frame_with_exception()),
-                gc_ref_slots,
-                force_token_slots,
                 recovery_layout,
                 // Terminal exits (FINISH/JUMP) don't carry per-guard resume
                 // data — RPython's jitdriver dispatches them via a separate
@@ -17219,7 +17155,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     outputs: result,
                     typed_outputs: typed_result,
                     exit_layout,
-                    force_token_slots: descr.force_token_slots().to_vec(),
                     savedata,
                     exception_value,
                     fail_index: descr.fail_index(),
@@ -17312,7 +17247,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     outputs,
                     typed_outputs,
                     exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
-                    force_token_slots: fail_descr_fd.force_token_slots().to_vec(),
                     savedata,
                     exception_value: exception,
                     fail_index,
@@ -17373,7 +17307,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 outputs,
                 typed_outputs,
                 exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
-                force_token_slots: fail_descr_fd.force_token_slots().to_vec(),
                 savedata,
                 exception_value: exception,
                 fail_index,
@@ -19918,8 +19851,6 @@ mod tests {
         assert_eq!(layout.fail_index, u32::MAX);
         assert_eq!(layout.exit_types, vec![Type::Ref, Type::Int]);
         assert!(!layout.is_finish);
-        assert_eq!(layout.gc_ref_slots, vec![0]);
-        assert!(layout.force_token_slots.is_empty());
         let recovery = layout
             .recovery_layout
             .as_ref()
@@ -19974,8 +19905,6 @@ mod tests {
         assert_eq!(layout.fail_index, 0);
         assert_eq!(layout.exit_types, vec![Type::Ref, Type::Float]);
         assert!(layout.is_finish);
-        assert_eq!(layout.gc_ref_slots, vec![0]);
-        assert!(layout.force_token_slots.is_empty());
         let recovery = layout
             .recovery_layout
             .as_ref()
@@ -23237,63 +23166,6 @@ mod tests {
         assert_eq!(descr.fail_index(), 0);
         assert_eq!(backend.get_float_value(&frame, 0), 9.25);
         assert_eq!(backend.get_ref_value(&frame, 1), GcRef(0xBEEF));
-    }
-
-    #[test]
-    fn test_fail_descr_gc_map_tracks_ref_slots() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![
-            InputArg::new_int(0),
-            InputArg::new_ref(1),
-            InputArg::new_float(2),
-            InputArg::new_ref(3),
-        ];
-        let guard_op = mk_op(
-            OpCode::GuardTrue,
-            &[OpRef::input_arg_int(0)],
-            OpRef::NONE.raw(),
-        );
-        guard_op.setfailargs(smallvec::smallvec![
-            rb(OpRef::input_arg_int(0)),
-            rb(OpRef::input_arg_ref(1)),
-            rb(OpRef::input_arg_float(2)),
-            rb(OpRef::input_arg_ref(3)),
-        ]);
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[
-                    OpRef::input_arg_int(0),
-                    OpRef::input_arg_ref(1),
-                    OpRef::input_arg_float(2),
-                    OpRef::input_arg_ref(3),
-                ],
-                OpRef::NONE.raw(),
-            ),
-            guard_op,
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-
-        let token = JitCellToken::new(1005);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        let compiled = token
-            .compiled
-            .get()
-            .unwrap()
-            .downcast_ref::<CompiledLoop>()
-            .unwrap();
-        let descr = &compiled.fail_descrs[0];
-        let gc_map = fail_descr_gc_map(as_fd(descr));
-        assert!(!gc_map.is_ref(0));
-        assert!(gc_map.is_ref(1));
-        assert!(!gc_map.is_ref(2));
-        assert!(gc_map.is_ref(3));
     }
 
     #[test]

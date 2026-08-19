@@ -3990,55 +3990,6 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// Whether the given exit slot should be treated as a real GC root.
-    ///
-    /// Backends may override this to distinguish rooted refs from opaque
-    /// handles that reuse `Type::Ref`, such as FORCE_TOKEN values.
-    fn is_gc_ref_slot(&self, slot: usize) -> bool {
-        if !matches!(self.fail_arg_types().get(slot), Some(Type::Ref)) {
-            return false;
-        }
-        // Exclude force-token positions: their Type::Ref typing is
-        // synthetic — they carry opaque virtualizable handles (FORCE_TOKEN
-        // op output), not real GC pointers.  The retired
-        // `CraneliftFailDescr` wrapper performed this exclusion explicitly
-        // before computing `fail_descr_gc_map`; the metainterp
-        // `ResumeGuardDescr` now owns the slot list directly, so the
-        // exclusion moves to this trait default and is inherited by every
-        // Resume-family impl that overrides `force_token_slots()`.
-        !self.force_token_slots().contains(&slot)
-    }
-
-    /// Exit slot indices that carry opaque force-token handles.
-    ///
-    /// Returns owned `Vec<usize>` (cloned per call) — the
-    /// the cranelift implementation to `FORCE_TOKEN_SLOTS_TABLE`, a
-    /// backend-static side-table that cannot hand out a borrow under a
-    /// lock.
-    fn force_token_slots(&self) -> Vec<usize> {
-        Vec::new()
-    }
-
-    /// Pyre-only per-emission write of the force-token slot list.
-    /// `assembler.py:write_failure_recovery_description` bakes the
-    /// equivalent GC map into machine code at codegen time per
-    /// emission; the slot list is the cranelift analog and follows
-    /// the same per-emission classification as `rd_locs`
-    /// (`assembler.py:279`).
-    ///
-    /// Default panics — only `ResumeGuardDescr`-family carries the
-    /// slot.  Callers must gate by `is_resume_guard() ||
-    /// is_resume_guard_copied()` before invoking, mirroring
-    /// `set_trace_id` / `set_rd_*` / `set_adr_jump_offset`.
-    /// Implementations must sort+dedup so consumers can `binary_search`.
-    fn set_force_token_slots(&self, _slots: Vec<usize>) {
-        panic!(
-            "set_force_token_slots invoked on a FailDescr that does not \
-             carry the per-emission force_token_slots slot (only \
-             ResumeGuardDescr / ResumeGuardCopiedDescr own it)"
-        );
-    }
-
     /// Pyre-only per-emission failure counter.  PyPy carries the
     /// equivalent jitcounter hash in the per-descr `status` slot
     /// (`compile.py:683` `AbstractResumeGuardDescr._attrs_ =
@@ -4219,11 +4170,6 @@ pub trait FailDescr: Descr {
     /// `compile.py:790-795` `done_compiling — self.status &=
     /// ~ST_BUSY_FLAG`.
     fn done_compiling(&self) {}
-
-    /// `compile.py:750` check `ST_BUSY_FLAG`.
-    fn is_compiling(&self) -> bool {
-        false
-    }
 
     /// `compile.py:826-830` `store_hash(metainterp_sd)` — write the
     /// jitcounter hash bits (status with `ST_SHIFT_MASK` applied).
@@ -8358,10 +8304,6 @@ mod tests {
         assert_eq!(fd.fail_arg_types(), &[Type::Int, Type::Ref]);
         assert!(!fd.is_finish());
         assert_eq!(fd.trace_id(), 0);
-        // Ref slot is a GC ref
-        assert!(fd.is_gc_ref_slot(1));
-        // Int slot is not
-        assert!(!fd.is_gc_ref_slot(0));
     }
 
     #[test]

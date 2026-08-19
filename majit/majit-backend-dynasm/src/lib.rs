@@ -756,12 +756,12 @@ fn handle_fail_resume_guard(
     // leave in it (`blackhole.py:1782-1796` ends `deadframe`'s live range at
     // `_prepare_resume_from_failure`, before `_run_forever`).
     //
-    // `is_gc_ref_slot` rather than a bare `Type::Ref` test: a force-token slot
-    // is typed `Ref` but carries an opaque virtualizable handle, so it is not a
-    // pointer to hand the collector.
+    // The rooted set is `compute_gcmap`'s: every `Ref`-typed exit slot, force
+    // tokens included — one is the jitframe pointer, and the jitframe moves.
     let ref_roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    let fail_arg_types = descr.fail_arg_types();
     for slot in 0..raw_values.len() {
-        if descr.is_gc_ref_slot(slot) {
+        if matches!(fail_arg_types.get(slot), Some(majit_ir::Type::Ref)) {
             // SAFETY: `slot` indexes `raw_values`, which outlives the pop below
             // and is not resized while the roots are registered.
             unsafe {

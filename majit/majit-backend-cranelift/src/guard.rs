@@ -11,7 +11,7 @@
 //
 // Per-descr backend state slots (source_op_index, recovery_layout,
 // trace_info, external_jump_target, fail_count, bridge caches,
-// bridge_dispatch_cell, force_token_slots) live on the metainterp
+// bridge_dispatch_cell) live on the metainterp
 // `ResumeGuardDescr` (Slices 7-Tβ6..12) — see `majit-backend::
 // resume_guard_descr`.  PyPy `AbstractFailDescr._attrs_` (history.py:132)
 // carries none of these; Pyre's metainterp descr is the single source
