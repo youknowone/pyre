@@ -10436,10 +10436,24 @@ impl CraneliftBackend {
                             let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                             let label_args = ops[op_idx].getarglist();
                             for &(i, raw, ofs) in positions {
-                                let opref = label_args[i].to_opref();
-                                let v = resolve_opref(&mut builder, &constants, opref);
-                                let v = coerce_ty(&mut builder, v, cl_types::I64);
-                                builder.ins().store(MemFlagsData::new(), v, cur_jf, ofs);
+                                // A raw demoted at an earlier LABEL already owns this
+                                // word — both LABELs derive the offset from the same
+                                // `ref_root_slots` entry — and the collector forwards it in
+                                // place.  Its SSA value stops being refreshed the moment it
+                                // is demoted, because `spill_ref_roots` and
+                                // `reload_ref_roots` both skip a demoted raw, so a call
+                                // between the two LABELs leaves the register holding a
+                                // pre-collection pointer.  Re-storing that here would put a
+                                // corpse back over the forwarded word; the re-materialize
+                                // below re-defines the SSA variable from the word instead.
+                                let already_demoted =
+                                    is_demoted_failarg(&demoted_failarg_slots, raw);
+                                if !already_demoted {
+                                    let opref = label_args[i].to_opref();
+                                    let v = resolve_opref(&mut builder, &constants, opref);
+                                    let v = coerce_ty(&mut builder, v, cl_types::I64);
+                                    builder.ins().store(MemFlagsData::new(), v, cur_jf, ofs);
+                                }
                                 synced_ref_vars.insert(raw);
                                 demoted_failarg_slots.insert(raw, ofs);
                             }
