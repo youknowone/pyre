@@ -302,9 +302,8 @@ fn make_sys_namespace_instance() -> PyObjectRef {
 
 /// Fresh `types.SimpleNamespace` instance — `type(sys.implementation)`, the
 /// attribute bag `time.get_clock_info` fills in and returns.
-pub fn new_simple_namespace_instance() -> PyObjectRef {
+pub fn new_simple_namespace_instance() -> crate::PyResult {
     simple_namespace_new(&[simple_namespace_type()])
-        .expect("the builtin SimpleNamespace type is always instantiable")
 }
 
 /// CPython 3.14 `namespace_new`: allocate the instance and give it an

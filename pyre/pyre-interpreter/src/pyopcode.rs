@@ -3951,6 +3951,27 @@ mod tests {
         assert!(decode_instruction_for_dispatch(&code, 0).is_err());
     }
 
+    /// An opcode byte the enum cannot spell decodes to `Reserved`, and the
+    /// `unknown opcode N` report is raised by dispatch rather than by the
+    /// decoder, so an `ExtendedArg` prefix in front of one must not be
+    /// rejected as a malformed chain.
+    #[test]
+    fn decode_instruction_for_dispatch_keeps_reserved_after_extended_arg() {
+        let code = compile_exec("x = 1").expect("compile failed");
+        assert!(
+            code.instructions.len() >= 2,
+            "expected at least two instructions"
+        );
+        unsafe {
+            code.instructions.replace_op(0, Instruction::ExtendedArg);
+            code.instructions.replace_op(1, Instruction::Reserved);
+        }
+        let (opcode_pc, instruction, _) =
+            decode_instruction_for_dispatch(&code, 0).expect("Reserved stays decodable");
+        assert_eq!(opcode_pc, 1);
+        assert!(matches!(instruction, Instruction::Reserved));
+    }
+
     #[test]
     fn forward_decode_matches_full_scan_and_dispatch() {
         let source = (0..400)

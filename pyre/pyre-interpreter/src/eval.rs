@@ -2363,16 +2363,6 @@ pub(crate) fn finalize_failed_attr_receiver_now(obj: PyObjectRef) -> bool {
     })
 }
 
-impl PyFrame {
-    #[majit_macros::dont_look_inside]
-    fn run_discarded_reference_finalizers(&mut self) {
-        let ec = self.execution_context as *mut crate::executioncontext::ExecutionContext;
-        if !ec.is_null() {
-            unsafe { (*ec).finalize_discarded_reference_now() };
-        }
-    }
-}
-
 impl SharedOpcodeHandler for PyFrame {
     type Value = PyObjectRef;
 
@@ -4106,11 +4096,7 @@ impl OpcodeStepExecutor for PyFrame {
                 "cannot access local variable '{name}' where it is not associated with a value"
             )));
         }
-        let needs_finalizer = finalize_failed_attr_receiver_now(locals_w!(self)[idx]);
         self.set_locals_w(idx, PY_NULL);
-        if needs_finalizer {
-            self.run_discarded_reference_finalizers();
-        }
         Ok(())
     }
 
@@ -4629,12 +4615,6 @@ impl OpcodeStepExecutor for PyFrame {
         // globals dict, so a module DELETE_NAME routes through the canonical
         // W_DictObject too.  KeyError → NameError.
         let w_locals = self.get_or_create_w_locals();
-        // Read the binding before the delete: `backing` is a raw pointer, and
-        // the key lookup below can allocate.
-        let backing = unsafe { crate::type_methods::resolve_dict_backing(w_locals) };
-        let needs_finalizer = !backing.is_null()
-            && unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(backing, name) }
-                .is_some_and(finalize_failed_attr_receiver_now);
         let key = unsafe {
             crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
         };
@@ -4645,9 +4625,6 @@ impl OpcodeStepExecutor for PyFrame {
                 err
             }
         })?;
-        if needs_finalizer {
-            self.run_discarded_reference_finalizers();
-        }
         Ok(())
     }
 
@@ -4660,15 +4637,9 @@ impl OpcodeStepExecutor for PyFrame {
     fn delete_global(&mut self, name: &str) -> Result<(), PyError> {
         let w_globals = self.get_w_globals();
         let backing = unsafe { crate::type_methods::resolve_dict_backing(w_globals) };
-        let needs_finalizer = !backing.is_null()
-            && unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(backing, name) }
-                .is_some_and(finalize_failed_attr_receiver_now);
         let found = !backing.is_null() && unsafe { pyre_object::w_dict_delitem_str(backing, name) };
         if !found {
             return Err(PyError::key_error(format!("'{name}'")));
-        }
-        if needs_finalizer {
-            self.run_discarded_reference_finalizers();
         }
         Ok(())
     }

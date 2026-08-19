@@ -926,9 +926,15 @@ impl wire::MarshalBag for PyreMarshalBag {
         constants: Vec<Rooted>,
         code_bytes: Vec<u8>,
     ) -> Result<Rooted, wire::MarshalError> {
-        let raw_code_bytes = crate::pycode::decode_code_units(&code_bytes)
-            .ok()
-            .and_then(|(_, raw)| raw);
+        // `code_units_from_bytes` already substituted the `Reserved`
+        // placeholder for every opcode byte `CodeUnit` cannot spell, so the
+        // decoded stream itself says whether the exact public bytes still have
+        // to be carried; decoding them a second time would only rediscover it.
+        let raw_code_bytes = code
+            .instructions
+            .iter()
+            .any(|unit| matches!(unit.op, crate::bytecode::Instruction::Reserved))
+            .then_some(code_bytes);
         self.make_runtime_code(code, constants, raw_code_bytes)
     }
 

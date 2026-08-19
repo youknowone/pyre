@@ -1793,7 +1793,7 @@ pub fn get_clock_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let _roots = pyre_object::gc_roots::push_roots();
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(name);
-    let info = crate::module::sys::vm::new_simple_namespace_instance();
+    let info = crate::module::sys::vm::new_simple_namespace_instance()?;
     let info_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(info);
     // `_get_time_info` overwrites implementation/monotonic/adjustable/resolution

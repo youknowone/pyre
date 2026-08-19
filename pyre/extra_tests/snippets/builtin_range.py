@@ -9,13 +9,18 @@ assert len(range(5, 10, 2)) == 3, "Expected length 3, for elements: 5, 7, 9"
 
 # Range iterators expose their remaining count as __length_hint__, not as a
 # sequence length.  Both the machine-word and bigint iterator variants must
-# therefore reject len().
+# therefore reject len(), and the hint has to fall as items are consumed
+# rather than repeat the length of the range it came from.
 small_iter = iter(range(3))
 assert small_iter.__length_hint__() == 3
 assert_raises(TypeError, len, small_iter)
+assert next(small_iter) == 0
+assert small_iter.__length_hint__() == 2
 big_iter = iter(range(2**100))
 assert big_iter.__length_hint__() == 2**100
 assert_raises(TypeError, len, big_iter)
+assert next(big_iter) == 0
+assert big_iter.__length_hint__() == 2**100 - 1
 
 # index tests
 assert range(10).index(6) == 6

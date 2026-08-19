@@ -351,7 +351,9 @@ class TypeVar(
             self, "_bound", _MISSING if evaluate_bound is not None else None
         )
         object.__setattr__(self, "_evaluate_bound", evaluate_bound)
-        object.__setattr__(self, "__module__", _caller_module())
+        # `_Py_make_typevar` passes a NULL module, so the compiler-created
+        # parameter never gets an instance `__module__` and reports the class
+        # attribute instead.
         return self
 
     @property
@@ -461,7 +463,7 @@ class ParamSpec(
         "_default_value", "_evaluate_default",
     ))
 
-    def __init__(self, name, *, bound=_MISSING, default=NoDefault,
+    def __init__(self, name, *, bound=None, default=NoDefault,
                  covariant=False, contravariant=False, infer_variance=False):
         if not isinstance(name, str):
             raise TypeError(
@@ -478,11 +480,11 @@ class ParamSpec(
         object.__setattr__(self, "__infer_variance__", bool(infer_variance))
         object.__setattr__(self, "_default_value", default)
         object.__setattr__(self, "_evaluate_default", None)
-        if bound is _MISSING:
-            bound = None
-        else:
-            import typing
-            bound = typing._type_check(bound, "Bound must be a type.")
+        # `paramspec_new_impl` has no `None` shortcut: `bound` defaults to
+        # `None` and reaches `type_check` either way, so an omitted bound is
+        # `type(None)` here, unlike `TypeVar`, which drops `None` first.
+        import typing
+        bound = typing._type_check(bound, "Bound must be a type.")
         object.__setattr__(self, "__bound__", bound)
         object.__setattr__(self, "__module__", _caller_module())
 
@@ -498,7 +500,8 @@ class ParamSpec(
         object.__setattr__(self, "_default_value", _MISSING)
         object.__setattr__(self, "_evaluate_default", None)
         object.__setattr__(self, "__bound__", None)
-        object.__setattr__(self, "__module__", _caller_module())
+        # `paramspec_alloc` is handed a NULL module here, so `__module__` stays
+        # the class attribute.
         return self
 
     @property
@@ -650,7 +653,8 @@ class TypeVarTuple(
         object.__setattr__(self, "__name__", name)
         object.__setattr__(self, "_default_value", _MISSING)
         object.__setattr__(self, "_evaluate_default", None)
-        object.__setattr__(self, "__module__", _caller_module())
+        # `typevartuple_alloc` takes no module here, so `__module__` stays the
+        # class attribute.
         return self
 
     def __iter__(self):

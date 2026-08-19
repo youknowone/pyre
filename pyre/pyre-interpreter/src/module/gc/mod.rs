@@ -24,6 +24,23 @@ static GC_ENABLED: AtomicBool = AtomicBool::new(true);
 /// exactly so callers can bracket a collection and restore the prior flags.
 static GC_DEBUG: AtomicI64 = AtomicI64::new(0);
 
+/// `GCState.collecting`. `gc_collect_main` refuses to start a
+/// nested collection and `gc_collect_impl` reports 0 for it, which is what
+/// keeps a `gc.collect()` call from inside a `gc.callbacks` entry from
+/// re-running the whole callback sequence until the stack is exhausted. The
+/// flag covers the collection, the finalizer drain, and both callback phases.
+static GC_COLLECTING: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`GC_COLLECTING`] however the collection leaves, so a callback that
+/// escapes cannot strand the flag and disable every later collection.
+struct CollectingGuard;
+
+impl Drop for CollectingGuard {
+    fn drop(&mut self) {
+        GC_COLLECTING.store(false, Ordering::Release);
+    }
+}
+
 /// The collection thresholds `gc.get_threshold()` reports.  pyre's collector
 /// has no generational allocation counters to drive, so the values are only
 /// remembered: `set_threshold` stores what it was given and `get_threshold`
@@ -740,7 +757,12 @@ fn pin_unboxed_container_referents(source_slot: usize) {
 /// during scalar materialisation cannot leave a stale result behind.
 fn remove_root_slot_preserving_tail(slot: usize) {
     let end = pyre_object::gc_roots::shadow_stack_len();
-    debug_assert!(slot < end);
+    // Every caller pushes the root it names, so `slot < end` holds. Keep it a
+    // runtime check anyway: a release build would otherwise underflow `end - 1`
+    // below and truncate the stack to a nonsense length.
+    if slot >= end {
+        return;
+    }
     for index in slot + 1..end {
         let value = pyre_object::gc_roots::shadow_stack_get(index);
         pyre_object::gc_roots::shadow_stack_set(index - 1, value);
@@ -1229,6 +1251,13 @@ crate::py_module! {
             if generation < 0 || generation >= 3 {
                 return Err(crate::PyError::value_error("invalid generation"));
             }
+            // `gc_collect_impl`: a nested call — a `gc.callbacks` entry or a
+            // finalizer reaching `gc.collect()` — reports 0 and collects
+            // nothing rather than repeating the callback sequence.
+            if GC_COLLECTING.swap(true, Ordering::AcqRel) {
+                return Ok(w_int_new(0));
+            }
+            let _collecting = CollectingGuard;
             GC_COLLECTIONS[generation as usize].fetch_add(1, Ordering::Relaxed);
             invoke_gc_callbacks("start", generation, 0, 0);
             crate::baseobjspace::clear_method_cache();

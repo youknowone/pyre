@@ -13054,6 +13054,9 @@ pub fn call_args(
         debug_assert_eq!(keyword_names_w.len(), keywords_w.len());
         let mut kwargs = Vec::with_capacity(keyword_names_w.len());
         for (&name, &value) in keyword_names_w.iter().zip(keywords_w.iter()) {
+            // `do_combine_starstarargs_wrapped` already rejects a non-string
+            // key while `**` is expanded, so this only guards the WTF-8 read
+            // below for `Arguments` values built natively instead.
             if unsafe { !is_str(name) } {
                 return Err(PyError::type_error("keywords must be strings"));
             }
@@ -19873,6 +19876,19 @@ mod tests {
         let error = crate::call::take_call_error().expect("non-mapping **kwargs error");
         assert_eq!(error.kind, PyErrorKind::TypeError);
         assert!(error.message_text().contains("argument after **"));
+
+        // A mapping whose keys are not strings is rejected while `**` is
+        // expanded, before any of them reaches `call_args`; the identical
+        // check there only guards the unsafe text read for `Arguments`
+        // instances built natively rather than from a packed mapping.
+        crate::call::clear_call_error();
+        let int_keyed = w_dict_new();
+        setitem(int_keyed, w_int_new(1), w_int_new(2)).unwrap();
+        let result = call(dict_type, w_tuple_new(Vec::new()), Some(int_keyed));
+        assert!(result.is_null());
+        let error = crate::call::take_call_error().expect("non-string keyword error");
+        assert_eq!(error.kind, PyErrorKind::TypeError);
+        assert!(error.message_text().contains("keywords must be strings"));
     }
 
     #[test]

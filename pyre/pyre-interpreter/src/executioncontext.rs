@@ -936,14 +936,6 @@ impl ExecutionContext {
         }
     }
 
-    /// CPython decrefs the removed value inside a DELETE opcode.  Pyre's
-    /// tracing collector reproduces that observable finalizer boundary with a
-    /// reachability pass after the container/frame slot has been cleared.
-    pub fn finalize_discarded_reference_now(&mut self) {
-        pyre_object::gc_hook::try_gc_collect_oldgen();
-        self._run_finalizers_now();
-    }
-
     /// Consume a failed-attribute finalization request after the live red
     /// frame has cleared its own dispatch flag.  This boundary has no live
     /// opcode temporaries outside the published PyFrame roots.
