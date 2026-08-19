@@ -24,23 +24,6 @@ static GC_ENABLED: AtomicBool = AtomicBool::new(true);
 /// exactly so callers can bracket a collection and restore the prior flags.
 static GC_DEBUG: AtomicI64 = AtomicI64::new(0);
 
-/// `GCState.collecting`. `gc_collect_main` refuses to start a
-/// nested collection and `gc_collect_impl` reports 0 for it, which is what
-/// keeps a `gc.collect()` call from inside a `gc.callbacks` entry from
-/// re-running the whole callback sequence until the stack is exhausted. The
-/// flag covers the collection, the finalizer drain, and both callback phases.
-static GC_COLLECTING: AtomicBool = AtomicBool::new(false);
-
-/// Clears [`GC_COLLECTING`] however the collection leaves, so a callback that
-/// escapes cannot strand the flag and disable every later collection.
-struct CollectingGuard;
-
-impl Drop for CollectingGuard {
-    fn drop(&mut self) {
-        GC_COLLECTING.store(false, Ordering::Release);
-    }
-}
-
 /// The collection thresholds `gc.get_threshold()` reports.  pyre's collector
 /// has no generational allocation counters to drive, so the values are only
 /// remembered: `set_threshold` stores what it was given and `get_threshold`
@@ -50,15 +33,6 @@ impl Drop for CollectingGuard {
 /// it was set to.  The initial values are the ones a fresh interpreter starts
 /// with.
 static GC_THRESHOLD: [AtomicI64; 2] = [AtomicI64::new(2000), AtomicI64::new(10)];
-
-/// CPython 3.14 `GCState.generations[i].gcstate.stats`. Pyre's MiniMark
-/// collector is not generational in CPython's sense, but the public frontend
-/// still owns one statistics record for each accepted `gc.collect(generation)`
-/// selector. Keep that interpreter state in the same process-global owner as
-/// `GC_THRESHOLD`, not in a side table keyed by Python objects.
-static GC_COLLECTIONS: [AtomicI64; 3] = [AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)];
-static GC_COLLECTED: [AtomicI64; 3] = [AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)];
-static GC_UNCOLLECTABLE: [AtomicI64; 3] = [AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)];
 
 const STATE_SCANNING: u8 = 0;
 const STATE_MARKING: u8 = 1;
@@ -589,9 +563,9 @@ impl StatValue {
 /// Both the field constructors and the mapdict transition inside
 /// `instance_node_setdictvalue` allocate, so either can move the instance and
 /// the value a Rust local names. Pin each on the shadow stack and read them
-/// back through their slots for every store. The instance is created here
-/// rather than passed in so a caller cannot hand over one that was allocated
-/// before any root existed.
+/// back through their slots for every store, the way `populate_public_gc_stats`
+/// below does. The instance is created here rather than passed in so a caller
+/// cannot hand over one that was allocated before any root existed.
 fn initialize_stats(
     stats_type: PyObjectRef,
     fields: &[(&'static str, StatValue)],
@@ -688,18 +662,6 @@ fn new_collect_stats(
 
 fn pin_object(object: majit_ir::GcRef) {
     pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
-}
-
-/// CPython 3.14 `_PyObject_GC_IS_TRACKED` first requires the type to carry
-/// `Py_TPFLAGS_HAVE_GC`; objects of scalar builtin types therefore never
-/// appear in `gc.get_objects()`, even though pyre's collector must manage
-/// their wider implementation structs.  Keep that implementation detail out
-/// of the CPython-facing inspector at the app-level conversion boundary.
-fn pin_cpython_tracked_object(object: majit_ir::GcRef) {
-    let w_obj = object.0 as PyObjectRef;
-    if crate::typedef::cpython_object_is_gc(w_obj) {
-        pyre_object::gc_roots::pin_root(w_obj);
-    }
 }
 
 /// CPython's container traversal sees logical entries even where a PyPy list
@@ -843,128 +805,6 @@ fn list_from_roots(first: usize) -> PyObjectRef {
     list_from_root_slots(first..pyre_object::gc_roots::shadow_stack_len())
 }
 
-/// CPython 3.14 `gc_get_stats_impl`: return a fresh list containing one fresh
-/// dict per public generation. The values are snapshots, so later collections
-/// never mutate dicts returned by an earlier call.
-fn cpython_gc_stats_dict(generation: usize) -> PyObjectRef {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_dict_new());
-    for (name, value) in [
-        (
-            "collections",
-            GC_COLLECTIONS[generation].load(Ordering::Relaxed),
-        ),
-        (
-            "collected",
-            GC_COLLECTED[generation].load(Ordering::Relaxed),
-        ),
-        (
-            "uncollectable",
-            GC_UNCOLLECTABLE[generation].load(Ordering::Relaxed),
-        ),
-    ] {
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_int_new(value));
-        unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                name,
-                pyre_object::gc_roots::shadow_stack_get(value_slot),
-            );
-        }
-    }
-    pyre_object::gc_roots::shadow_stack_get(dict_slot)
-}
-
-fn cpython_gc_stats() -> PyObjectRef {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let first = pyre_object::gc_roots::shadow_stack_len();
-    for generation in 0..3 {
-        pyre_object::gc_roots::pin_root(cpython_gc_stats_dict(generation));
-    }
-    list_from_roots(first)
-}
-
-fn gc_callback_info(generation: i64, collected: i64, uncollectable: i64) -> PyObjectRef {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_dict_new());
-    for (name, value) in [
-        ("generation", generation),
-        ("collected", collected),
-        ("uncollectable", uncollectable),
-    ] {
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_int_new(value));
-        unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                name,
-                pyre_object::gc_roots::shadow_stack_get(value_slot),
-            );
-        }
-    }
-    pyre_object::gc_roots::shadow_stack_get(dict_slot)
-}
-
-/// CPython 3.14 `invoke_gc_callback` (`Python/gc.c`): read the public list on
-/// every iteration so callback mutations affect the same collection, and
-/// report callback exceptions as unraisable without interrupting GC.
-fn invoke_gc_callbacks(phase: &'static str, generation: i64, collected: i64, uncollectable: i64) {
-    let Some(module) = crate::importing::check_sys_modules("gc") else {
-        return;
-    };
-    let _roots = pyre_object::gc_roots::push_roots();
-    let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(module);
-    let module_dict = unsafe {
-        pyre_object::w_module_get_w_dict(pyre_object::gc_roots::shadow_stack_get(module_slot))
-    };
-    let Some(callbacks) = (unsafe { pyre_object::w_dict_getitem_str(module_dict, "callbacks") })
-    else {
-        return;
-    };
-    if !unsafe { is_list(callbacks) } || unsafe { w_list_len(callbacks) } == 0 {
-        return;
-    }
-    let callbacks_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(callbacks);
-    let info_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(gc_callback_info(generation, collected, uncollectable));
-    let phase_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(w_str_new(phase));
-
-    let mut index = 0usize;
-    while index < unsafe { w_list_len(pyre_object::gc_roots::shadow_stack_get(callbacks_slot)) } {
-        let Some(callback) = (unsafe {
-            w_list_getitem(
-                pyre_object::gc_roots::shadow_stack_get(callbacks_slot),
-                index as i64,
-            )
-        }) else {
-            break;
-        };
-        let callback_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(callback);
-        let result = crate::call::call_function_impl_result(
-            pyre_object::gc_roots::shadow_stack_get(callback_slot),
-            &[
-                pyre_object::gc_roots::shadow_stack_get(phase_slot),
-                pyre_object::gc_roots::shadow_stack_get(info_slot),
-            ],
-        );
-        if let Err(mut error) = result {
-            error.write_unraisable(
-                w_none(),
-                Wtf8::new("while calling GC callback"),
-                pyre_object::gc_roots::shadow_stack_get(callback_slot),
-            );
-        }
-        index += 1;
-    }
-}
-
 fn user_del_action() -> Option<&'static mut crate::executioncontext::UserDelAction> {
     let action = crate::executioncontext::space_user_del_action();
     if action.is_null() {
@@ -1015,6 +855,214 @@ fn run_finalizers_now() {
             disable_finalizers(action);
         }
     }
+}
+
+fn format_gc_stat(value: i64) -> String {
+    if value < 1_000_000 {
+        format!("{:.1}kB", value as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", value as f64 / 1024.0 / 1024.0)
+    }
+}
+
+fn gc_stats_public_type() -> PyObjectRef {
+    static TYPE: OnceLock<usize> = OnceLock::new();
+    *TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("GcStats", |ns| unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__init__",
+                crate::make_builtin_function_with_arity("__init__", gc_stats_public_init, 2),
+            );
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
+                "__repr__",
+                crate::make_builtin_function_with_arity("__repr__", gc_stats_repr, 1),
+            );
+            pyre_object::w_dict_setitem_str_no_proxy(ns, "__dict__", crate::typedef::dict_descr());
+        });
+        // app_referents.py:GcStats is an ordinary app-level class.
+        unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
+}
+
+fn gc_stats_public_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    populate_public_gc_stats(args[0], args[1])?;
+    Ok(w_none())
+}
+
+fn gc_stats_attr_string(self_slot: usize, name: &'static str) -> Result<String, crate::PyError> {
+    let value =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(self_slot), name)?;
+    Ok(unsafe { crate::display::py_str_wtf8(value)? }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn gc_stats_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
+    let raw =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(self_slot), "_s")?;
+    pyre_object::gc_roots::pin_root(raw);
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let raw = stats::W_GcStats::from_obj(pyre_object::gc_roots::shadow_stack_get(raw_slot))
+        .ok_or_else(|| crate::PyError::type_error("GcStats._s is not a native GcStats"))?;
+    let total_memory_pressure = raw.total_memory_pressure;
+    let total_arena_allocated = format_gc_stat(
+        raw.total_allocated_memory - raw.total_rawmalloced_memory - raw.nursery_size,
+    );
+
+    // app_referents.py:76-120. Read the public attributes afresh: this class
+    // has a normal instance dict upstream, and user mutation affects repr.
+    let total_gc_memory = gc_stats_attr_string(self_slot, "total_gc_memory")?;
+    let peak_memory = gc_stats_attr_string(self_slot, "peak_memory")?;
+    let total_arena_memory = gc_stats_attr_string(self_slot, "total_arena_memory")?;
+    let peak_arena_memory = gc_stats_attr_string(self_slot, "peak_arena_memory")?;
+    let total_rawmalloced_memory = gc_stats_attr_string(self_slot, "total_rawmalloced_memory")?;
+    let peak_rawmalloced_memory = gc_stats_attr_string(self_slot, "peak_rawmalloced_memory")?;
+    let nursery_size = gc_stats_attr_string(self_slot, "nursery_size")?;
+    let jit_backend_used = gc_stats_attr_string(self_slot, "jit_backend_used")?;
+    let total_memory_pressure_text = gc_stats_attr_string(self_slot, "total_memory_pressure")?;
+    let memory_used_sum = gc_stats_attr_string(self_slot, "memory_used_sum")?;
+    let total_allocated_memory = gc_stats_attr_string(self_slot, "total_allocated_memory")?;
+    let peak_allocated_memory = gc_stats_attr_string(self_slot, "peak_allocated_memory")?;
+    let jit_backend_allocated = gc_stats_attr_string(self_slot, "jit_backend_allocated")?;
+    let memory_allocated_sum = gc_stats_attr_string(self_slot, "memory_allocated_sum")?;
+    let total_gc_time_obj = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        "total_gc_time",
+    )?;
+    pyre_object::gc_roots::pin_root(total_gc_time_obj);
+    let total_gc_time_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let total_gc_time =
+        crate::baseobjspace::float_w(pyre_object::gc_roots::shadow_stack_get(total_gc_time_slot))?
+            / 1000.0;
+    let extra = if total_memory_pressure != -1 {
+        format!("\n    memory pressure:         {total_memory_pressure_text}")
+    } else {
+        String::new()
+    };
+    Ok(w_str_new(&format!(
+        concat!(
+            "Total memory consumed:\n",
+            "    GC used:                 {total_gc_memory} (peak: {peak_memory})\n",
+            "       in arenas:            {total_arena_memory} (peak: {peak_arena_memory})\n",
+            "       rawmalloced:          {total_rawmalloced_memory} (peak: {peak_rawmalloced_memory})\n",
+            "       nursery:              {nursery_size}\n",
+            "    raw assembler used:      {jit_backend_used}{extra}\n",
+            "    -----------------------------\n",
+            "    Total:                   {memory_used_sum}\n\n",
+            "    Total memory allocated (includes freelists):\n",
+            "    GC allocated:            {total_allocated_memory} (peak: {peak_allocated_memory})\n",
+            "       in arenas:            {total_arena_allocated}\n",
+            "       rawmalloced:          {total_rawmalloced_memory}\n",
+            "       nursery:              {nursery_size}\n",
+            "    raw assembler allocated: {jit_backend_allocated}{extra}\n",
+            "    -----------------------------\n",
+            "    Total:                   {memory_allocated_sum}\n\n",
+            "    Total time spent in GC:  {total_gc_time}\n    "
+        ),
+        total_gc_memory = total_gc_memory,
+        peak_memory = peak_memory,
+        total_arena_memory = total_arena_memory,
+        peak_arena_memory = peak_arena_memory,
+        total_rawmalloced_memory = total_rawmalloced_memory,
+        peak_rawmalloced_memory = peak_rawmalloced_memory,
+        nursery_size = nursery_size,
+        jit_backend_used = jit_backend_used,
+        extra = extra,
+        memory_used_sum = memory_used_sum,
+        total_allocated_memory = total_allocated_memory,
+        peak_allocated_memory = peak_allocated_memory,
+        total_arena_allocated = total_arena_allocated,
+        jit_backend_allocated = jit_backend_allocated,
+        memory_allocated_sum = memory_allocated_sum,
+        total_gc_time = total_gc_time,
+    )))
+}
+
+fn populate_public_gc_stats(obj: PyObjectRef, raw: PyObjectRef) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(raw);
+    let raw = stats::W_GcStats::from_obj(pyre_object::gc_roots::shadow_stack_get(raw_slot))
+        .ok_or_else(|| crate::PyError::type_error("GcStats() requires a native GcStats"))?;
+    let memory_pressure_value = if raw.total_memory_pressure == -1 {
+        0
+    } else {
+        raw.total_memory_pressure
+    };
+    let formatted = [
+        ("total_gc_memory", raw.total_gc_memory),
+        ("jit_backend_used", raw.jit_backend_used),
+        ("total_memory_pressure", raw.total_memory_pressure),
+        ("total_allocated_memory", raw.total_allocated_memory),
+        ("jit_backend_allocated", raw.jit_backend_allocated),
+        ("peak_memory", raw.peak_memory),
+        ("peak_allocated_memory", raw.peak_allocated_memory),
+        ("total_arena_memory", raw.total_arena_memory),
+        ("total_rawmalloced_memory", raw.total_rawmalloced_memory),
+        ("nursery_size", raw.nursery_size),
+        ("peak_arena_memory", raw.peak_arena_memory),
+        ("peak_rawmalloced_memory", raw.peak_rawmalloced_memory),
+        (
+            "memory_used_sum",
+            raw.total_gc_memory + memory_pressure_value + raw.jit_backend_used,
+        ),
+        (
+            "memory_allocated_sum",
+            raw.total_allocated_memory + memory_pressure_value + raw.jit_backend_allocated,
+        ),
+    ];
+    let total_gc_time = raw.total_gc_time;
+    crate::baseobjspace::setattr_str(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "_s",
+        pyre_object::gc_roots::shadow_stack_get(raw_slot),
+    )?;
+    for (name, value) in formatted {
+        let text = w_str_new(&format_gc_stat(value));
+        pyre_object::gc_roots::pin_root(text);
+        let text_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(text_slot),
+        )?;
+    }
+    // Build and pin the value before reading `obj_slot`: Rust evaluates the
+    // receiver first, so an inline `w_int_new` here would allocate — and
+    // possibly collect — after the argument already held a raw address.
+    let time_value = w_int_new(total_gc_time);
+    pyre_object::gc_roots::pin_root(time_value);
+    let time_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    crate::baseobjspace::setattr_str(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "total_gc_time",
+        pyre_object::gc_roots::shadow_stack_get(time_slot),
+    )?;
+    Ok(())
+}
+
+fn new_public_gc_stats(memory_pressure: bool) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let raw = stats::new(memory_pressure);
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(raw);
+    let public_type = gc_stats_public_type();
+    let obj = w_instance_new(public_type);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(obj);
+    populate_public_gc_stats(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        pyre_object::gc_roots::shadow_stack_get(raw_slot),
+    )?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
 }
 
 fn gc_call_method(
@@ -1235,46 +1283,20 @@ crate::py_module! {
     },
     inline_functions: {
         fn collect(
-            #[default(w_int_new(2))] generation: PyObjectRef,
+            #[default(w_int_new(0))] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // PyPy `interp_gc.py` accepts and ignores every integer, while
-            // CPython 3.14 accepts exactly generations 0..=2 and defaults to 2.
-            // The project targets 3.14 where the public APIs differ.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let generation_slot = pyre_object::gc_roots::shadow_stack_len();
-            pyre_object::gc_roots::pin_root(generation);
-            let generation = unsafe {
-                crate::baseobjspace::getindex_w_index(
-                    pyre_object::gc_roots::shadow_stack_get(generation_slot),
-                )?
-            };
-            if generation < 0 || generation >= 3 {
-                return Err(crate::PyError::value_error("invalid generation"));
-            }
-            // `gc_collect_impl`: a nested call — a `gc.callbacks` entry or a
-            // finalizer reaching `gc.collect()` — reports 0 and collects
-            // nothing rather than repeating the callback sequence.
-            if GC_COLLECTING.swap(true, Ordering::AcqRel) {
-                return Ok(w_int_new(0));
-            }
-            let _collecting = CollectingGuard;
-            GC_COLLECTIONS[generation as usize].fetch_add(1, Ordering::Relaxed);
-            invoke_gc_callbacks("start", generation, 0, 0);
+            // `interp_gc.py collect` unwraps the optional generation
+            // as an int, but deliberately ignores its value.  In particular,
+            // unlike CPython's three-generation frontend, every integer is
+            // accepted and the default is 0.
+            let _generation = crate::baseobjspace::int_w(
+                crate::baseobjspace::space_index(generation)?,
+            )?;
             crate::baseobjspace::clear_method_cache();
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
             run_finalizers_now();
-            // The generation is bound and ignored, but the return value is a
-            // spec axis, and there the caller-observable answer is an int
-            // engineered the way upstream would.  `interp_gc.py:48` still
-            // carries the `return space.newint(0)` that closed `collect` until
-            // `_run_finalizers` was split out of it (`b5632df5b6e0`) and
-            // neither caller of the helper reads its result: the constant is
-            // upstream's own answer for a collector that never counts
-            // unreachable objects.  The same absent accounting is why the
-            // callback's collected/uncollectable pair is zero.
-            invoke_gc_callbacks("stop", generation, 0, 0);
-            Ok(w_int_new(0))
+            Ok(w_none())
         }
 
         fn collect_step() -> Result<PyObjectRef, crate::PyError> {
@@ -1298,34 +1320,24 @@ crate::py_module! {
         fn get_objects(
             #[default(w_none())] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // CPython 3.14 `gc_get_objects_impl`: Argument Clinic converts
-            // `None` to -1 and every other value through `__index__` before
-            // the audit event; range validation follows the audit. PyPy's
-            // `referents.py:112-123` has no generation argument, so the
-            // CPython 3.14 extension wins here.
+            // `referents.py:116-126 get_objects`: "Return a list of all
+            // app-level objects." The audit event always reports -1 and fires
+            // before the argument is examined, so a non-None value is still
+            // audited; only None is then accepted, because the collector has
+            // no generations to select between.
             let _generation_root = pyre_object::gc_roots::push_roots();
             let generation_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(generation);
+            crate::module::sys::vm::audit("gc.get_objects", &[w_int_new(-1)])?;
             let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
-            let generation = if unsafe { is_none(generation) } {
-                -1
-            } else {
-                unsafe { crate::baseobjspace::getindex_w_index(generation)? }
-            };
-            crate::module::sys::vm::audit("gc.get_objects", &[w_int_new(generation)])?;
-            if generation >= 3 {
-                return Err(crate::PyError::value_error(
-                    "generation parameter must be less than the number of available generations (3)",
-                ));
-            }
-            if generation < -1 {
-                return Err(crate::PyError::value_error(
-                    "generation parameter cannot be negative",
+            if !unsafe { is_none(generation) } {
+                return Err(crate::PyError::not_implemented(
+                    "get_objects(generation=None) accepts only None on PyPy",
                 ));
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(generation as i8, pin_cpython_tracked_object);
+            majit_gc::get_objects(-1, pin_object);
             Ok(list_from_roots(first))
         }
 
@@ -1336,8 +1348,10 @@ crate::py_module! {
             Ok(stats::new(crate::baseobjspace::is_true(memory_pressure)?))
         }
 
-        fn get_stats() -> Result<PyObjectRef, crate::PyError> {
-            Ok(cpython_gc_stats())
+        fn get_stats(
+            #[default(w_bool_from(false))] memory_pressure: PyObjectRef,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            new_public_gc_stats(crate::baseobjspace::is_true(memory_pressure)?)
         }
 
         fn dump_rpy_heap(file: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -1409,7 +1423,7 @@ crate::py_module! {
             pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
             crate::module::sys::vm::audit("gc.get_referrers", &rooted_args)?;
             let all_first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_cpython_tracked_object);
+            majit_gc::get_objects(-1, pin_object);
             let all_last = pyre_object::gc_roots::shadow_stack_len();
             // Accumulate the matches as slot indices, not as addresses: the
             // entries stay pinned in `all_first..all_last`, but a copy of one
