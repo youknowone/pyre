@@ -320,6 +320,21 @@ def green(s):  return f"\033[32m{s}\033[0m"
 def dim(s):    return f"\033[2m{s}\033[0m"
 def bold(s):   return f"\033[1m{s}\033[0m"
 
+# ── cargo ────────────────────────────────────────────────────────────
+
+def cargo_finished_line(proc):
+    """cargo's `Finished` line, or a stand-in when it printed none.
+
+    Not the last line of the output: cargo ends with its future-incompat
+    `note:`, which says nothing about the build that just ran. `Finished` is
+    the line that names the profile cargo actually produced.
+    """
+    lines = (proc.stdout or "").splitlines() + (proc.stderr or "").splitlines()
+    return next(
+        (line.strip() for line in reversed(lines) if line.strip().startswith("Finished")),
+        "cargo build done",
+    )
+
 # ── Child-process user CPU time and peak RSS ─────────────────────────
 
 # Peak RSS in MiB of the most recent `run_timed` child, or None when the run
@@ -2270,21 +2285,23 @@ class Check:
 
     def build_backend(self, backend):
         # `pyre-jit-trace/build.rs` compares each `build/llbc/*.ullbc` against
-        # what its crate's sources hash to now, and by default reports a
-        # mismatch as a `cargo::warning` — which cargo replays only when it
-        # re-runs the build script, so a run whose crates were cached prints
-        # nothing at all. Every number this script produces is read out of a
-        # binary whose field offsets come from those artefacts, so a stale one
-        # does not fail: it answers, wrongly and quietly. Four measurement runs
-        # on this tree carried the mismatch and none of their logs named it.
+        # what its crate's sources hash to now and fails the build on a
+        # mismatch. Every number this script produces is read out of a binary
+        # whose field offsets come from those artefacts, so a stale one does
+        # not fail: it answers, wrongly and quietly.
         #
-        # `PYRE_LLBC_STRICT=1` is the promotion build.rs already documents "for
-        # callers that want a gate" — the same finding as `cargo::error`. The
-        # cost is that a rebase which moves the LLBC crates makes the next
-        # check.py stop and ask for a multi-minute re-extraction; the
-        # alternative is a green run that measured the wrong bytes. Set here
-        # rather than per-command so the wasm build gets it too.
-        os.environ["PYRE_LLBC_STRICT"] = "1"
+        # This used to set `PYRE_LLBC_STRICT=1` to arm that gate. It was
+        # already armed: `freshness_policy` maps an unset switch and `=1` to
+        # the same `FreshnessMode::Strict`, so the assignment selected no
+        # behaviour build.rs would not have taken anyway — while build.rs
+        # declares `cargo::rerun-if-env-changed=PYRE_LLBC_STRICT`, so it made
+        # every alternation between a cargo invocation that set the variable
+        # and one that did not re-run the build script and recompile
+        # `pyre-jit-trace -> pyre-jit -> pyrex`. Measured on a 16-core Windows
+        # box: 1s to repeat a build at the same value, 123s and 122s to switch
+        # it, 0.4s once nothing sets it. That is a working-tree cost rather
+        # than a CI one — rust-cache cleans workspace crates before saving,
+        # so the CI job rebuilds them either way.
         cfg = CARGO_CONFIG[backend]
         if cfg.get("wasm"):
             return self.build_wasm_backend()
@@ -2295,10 +2312,18 @@ class Check:
         ]
         print("  $ " + " ".join(cmd))
         cargo_path = shutil.which("cargo") or "(not found on PATH)"
-        print(f"  cargo resolved to: {cargo_path}")
+        # `capture_output` holds cargo's progress until it exits and this
+        # script's stdout is block-buffered under a harness, so without the
+        # flush the whole build is one gap with nothing in it. On the Windows
+        # runner it was 2766s of a 3392s step, every build line stamped at the
+        # instant the buffer finally drained; the next largest gap anywhere in
+        # that step was 31s.
+        print(f"  cargo resolved to: {cargo_path}", flush=True)
+        started = time.perf_counter()
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        elapsed = time.perf_counter() - started
         if proc.returncode != 0:
-            print(f"ERROR: cargo build failed (exit {proc.returncode})")
+            print(f"ERROR: cargo build failed (exit {proc.returncode}) after {elapsed:.1f}s")
             if proc.stdout:
                 print("─── cargo stdout ───")
                 print(proc.stdout.rstrip())
@@ -2308,10 +2333,10 @@ class Check:
             print("────────────────────")
             cargo_output = (proc.stderr or "") + (proc.stdout or "")
             if "LLBC STALE" in cargo_output:
-                # `PYRE_LLBC_STRICT=1` above turned build.rs's staleness
-                # warning into the build failure that got us here. It already
-                # printed the exact `extract-llbc.py` line naming the crates
-                # that moved, so repeat the reason rather than the command.
+                # build.rs refuses a stale artefact by default, which is the
+                # failure that got us here. It already printed the exact
+                # `extract-llbc.py` line naming the crates that moved, so
+                # repeat the reason rather than the command.
                 print(red("LLBC artefacts under build/llbc/ are STALE."))
                 print("Field offsets come from them, so a run on this tree "
                       "would measure the wrong bytes.")
@@ -2332,16 +2357,16 @@ class Check:
                 print(red("LLBC artefacts are missing under build/llbc/."))
                 print("Run the extractor first, then re-run this script:")
                 # No crate arguments: extract the full DEFAULT_CRATES set
-                # (pyre-object, pyre-interpreter, pyre-jit). The exact
-                # eval::eval_loop_jit portal lives in pyre-jit.ullbc, so a
-                # production JIT build requires all three artifacts.
+                # (majit-rlib, pyre-object, pyre-interpreter, pyre-jit). The
+                # exact eval::eval_loop_jit portal lives in pyre-jit.ullbc, so
+                # a production JIT build requires all four artifacts.
                 print("    scripts/extract-llbc.py")
             else:
                 self._print_cargo_diagnostics(cargo_path)
             sys.exit(1)
-        lines = (proc.stdout or "").strip().splitlines() + (proc.stderr or "").strip().splitlines()
-        if lines:
-            print(lines[-1])
+        # The wall clock beside cargo's own figure is what makes a build that
+        # recompiled the world distinguishable from a cache hit.
+        print(f"  {cargo_finished_line(proc)} — {elapsed:.1f}s wall", flush=True)
 
     def build_wasm_backend(self):
         """Build the wasm32 `pyre-wasm` module and the native `pyre-wasm-runner`.
@@ -2374,13 +2399,17 @@ class Check:
         ]
         for label, cmd, env in steps:
             print(f"Building {label}...")
-            print("  $ " + " ".join(cmd))
+            # Flushed for the same reason `build_backend` flushes: the command
+            # is the only thing naming the gap it is about to spend.
+            print("  $ " + " ".join(cmd), flush=True)
+            started = time.perf_counter()
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", env=env,
             )
+            elapsed = time.perf_counter() - started
             if proc.returncode != 0:
-                print(f"ERROR: cargo build failed (exit {proc.returncode})")
+                print(f"ERROR: cargo build failed (exit {proc.returncode}) after {elapsed:.1f}s")
                 if proc.stdout:
                     print("─── cargo stdout ───")
                     print(proc.stdout.rstrip())
@@ -2389,9 +2418,7 @@ class Check:
                     print(proc.stderr.rstrip())
                 print("────────────────────")
                 sys.exit(1)
-            lines = (proc.stderr or "").strip().splitlines()
-            if lines:
-                print(lines[-1])
+            print(f"  {cargo_finished_line(proc)} — {elapsed:.1f}s wall", flush=True)
         if not Path(WASM_BUILD_OUTPUT).exists():
             print(f"ERROR: wasm module not produced at {WASM_BUILD_OUTPUT}")
             sys.exit(1)
