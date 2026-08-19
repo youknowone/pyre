@@ -7090,6 +7090,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         .class_now_known(iter_op, iter_layout);
 
     let next_const = ctx.trace_ctx.const_ref(w_next as i64);
+    let executed_effects_before = fbw_executed_effect_count();
     let inline = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
@@ -7123,9 +7124,28 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         false,
         Some(foriter_green_key),
     );
-    let inline_resume_pc = match &inline {
-        Ok(Some((DispatchOutcome::Continue, next))) => *next,
-        _ => {
+    let inline_resume_pc = match inline {
+        Ok(Some((DispatchOutcome::Continue, next))) => next,
+        outcome => {
+            // Rewinding the emission and falling through to the caller's
+            // residual re-runs the whole `__next__`.  The sibling decline that
+            // does the same states its precondition outright — "sound because
+            // the body is admitted only when re-running it observes and changes
+            // nothing" — and the legacy route can state it because
+            // `fbw_callee_body_replay_safety` proved the body `Clean` first.
+            // This keyed route deliberately bypasses that classification, so
+            // read the odometer instead: once the sub-walk has executed a
+            // concrete effect, `cut_trace_with_snapshots` cannot undo it (it
+            // truncates recorded ops and snapshots, nothing else) and the
+            // residual `next` compiles a loop that advances the iterator twice
+            // per iteration.  Surface the decline as an abort there, the same
+            // disposition every other caller of the inliner already takes.
+            if fbw_executed_effect_count() != executed_effects_before {
+                return Err(match outcome {
+                    Err(e) => e,
+                    _ => DispatchError::callee_inline_unsupported(op.pc),
+                });
+            }
             ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             return Ok(None);
