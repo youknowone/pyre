@@ -569,6 +569,11 @@ SERIAL_MODULES = {
 DEFAULT_RESOURCE_MODULES = {
     "test.test_datetime",
     "test.test_urllibnet",
+    # `EnsurePipTest.test_with_pip` is 115s of this module's 133s, nearly all
+    # of it waiting on two pip bootstraps and two uninstalls in subprocesses.
+    # `pyre/extra_tests/pip/run.py` covers that ground in the same CI job,
+    # offline and in a fraction of the time.
+    "test.test_venv",
     "test.test_zipimport",
 }
 

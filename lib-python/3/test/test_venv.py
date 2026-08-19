@@ -23,7 +23,8 @@ from test.support import (captured_stdout, captured_stderr,
                           requires_subprocess, is_android, is_apple_mobile,
                           is_wasm32,
                           requires_venv_with_pip, TEST_HOME_DIR,
-                          requires_resource, copy_python_src_ignore)
+                          requires_resource, copy_python_src_ignore,
+                          cpython_only)
 from test.support.os_helper import (can_symlink, EnvironmentVarGuard, rmtree,
                                     TESTFN, FakePath)
 import unittest
@@ -76,7 +77,13 @@ class BaseTest(unittest.TestCase):
             self.include = 'Include'
         else:
             self.bindir = 'bin'
-            self.lib = ('lib', f'python{sysconfig._get_python_version_abi()}')
+            # An implementation keeps its own installation tree rather than
+            # claiming `lib/pythonX.Y`, and `_get_implementation` is what the
+            # install schemes substitute to spell it -- reading it here asks
+            # for the layout the runtime actually builds instead of pinning
+            # one implementation's spelling of it.
+            self.lib = ('lib', f'{sysconfig._get_implementation().lower()}'
+                               f'{sysconfig._get_python_version_abi()}')
             self.include = 'include'
         executable = sys._base_executable
         self.exe = os.path.split(executable)[-1]
@@ -705,6 +712,11 @@ class BasicTest(BaseTest):
 
     @unittest.skipIf(os.name == 'nt', 'not relevant on Windows')
     @requireVenvCreate
+    # The landmark asserted here is `pythonXY[t]` on `sys.path`, put there
+    # whether or not that zip exists.  A stdlib zip reaches `sys.path` here
+    # only when the file is present, and the name is spelled for the running
+    # implementation, so neither half of the assertion can hold.
+    @cpython_only
     def test_zippath_from_non_installed_posix(self):
         """
         Test that when create venv from non-installed python, the zip path

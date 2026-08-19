@@ -1336,7 +1336,7 @@
       "dynasm": "PASS"
     },
     "test.test_venv": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_wait3": {
       "dynasm": "IMPORTERROR"
