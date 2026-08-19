@@ -7682,8 +7682,8 @@ impl<S: JitState> JitDriver<S> {
         if !self.has_compiled_loop(key_hash) {
             // warmstate.py:446,465: cold fast path — check would_fire without
             // ticking to skip GreenKey allocation and build_meta for cold keys.
-            // Advance counter via counter_tick which respects cell state
-            // (DONT_TRACE_HERE, DontTraceHere — warmstate.py:484).
+            // Advance counter via counter_tick, which respects the cell's
+            // `JC_DONT_TRACE_HERE` flag (warmstate.py:484).
             if !self.meta.warm_state_ref().counter_would_fire(key_hash) {
                 self.meta.warm_state_mut().counter_tick(key_hash);
                 return None;

@@ -41,9 +41,16 @@ pub mod jc_flags {
 ///   - JC_TRACING set               → Tracing
 ///   - loop_token present, valid    → Compiled
 ///   - loop_token.invalidated       → Invalidated
-///   - JC_DONT_TRACE_HERE set       → DontTraceHere
 ///
 /// We make these states explicit.
+///
+/// `JC_DONT_TRACE_HERE` is deliberately NOT one of them.  It is orthogonal to
+/// the lifecycle: a denied cell keeps tracing, compiles, and is invalidated
+/// like any other, and `warmstate.py:485-496` retraces it once its procedure
+/// token dies.  Modelling it as a state made the flag and the state answer the
+/// same question differently — a cell denied while `JC_TRACING` was set kept
+/// the flag but never took the state, so every reader that asked the state
+/// (`get_stats`) undercounted the denials.  Ask the flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseJitCellState {
     /// Not yet hot; still interpreting.
@@ -54,8 +61,6 @@ pub enum BaseJitCellState {
     Compiled,
     /// Compiled loop was invalidated (quasi-immutable mutation, etc.).
     Invalidated,
-    /// Tracing was aborted; don't trace at this location.
-    DontTraceHere,
 }
 
 /// Per-greenkey cell that tracks JIT state for a specific program location.
@@ -360,7 +365,8 @@ pub struct JitStats {
     pub num_tracing: usize,
     /// Number of cells in Invalidated state.
     pub num_invalidated: usize,
-    /// Number of cells in DontTraceHere state.
+    /// Number of cells carrying `JC_DONT_TRACE_HERE`, whatever lifecycle state
+    /// they are in.
     pub num_disable_noninlinable_function: usize,
     /// Total number of BaseJitCells.
     pub num_cells: usize,
@@ -656,9 +662,6 @@ impl WarmEnterState {
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
                 return false;
             }
-            if cell.state == BaseJitCellState::DontTraceHere {
-                return false;
-            }
         }
         self.counter
             .would_tick_fire(self.bucket_of(cell_key), self.increment_threshold)
@@ -668,9 +671,6 @@ impl WarmEnterState {
     pub fn counter_tick(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
-                return;
-            }
-            if cell.state == BaseJitCellState::DontTraceHere {
                 return;
             }
         }
@@ -904,10 +904,8 @@ impl WarmEnterState {
                 || cell.abort_count >= MAX_TRACE_ABORT_COUNT
             {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
-                cell.state = BaseJitCellState::DontTraceHere;
-            } else {
-                cell.state = BaseJitCellState::NotHot;
             }
+            cell.state = BaseJitCellState::NotHot;
         }
 
         if disable_noninlinable_function {
@@ -941,9 +939,6 @@ impl WarmEnterState {
             .lookup_chain_with_key_mut(key)
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags |= jc_flags::DONT_TRACE_HERE;
-        if cell.flags & jc_flags::TRACING == 0 {
-            cell.state = BaseJitCellState::DontTraceHere;
-        }
     }
 
     /// Force-start tracing for a green key, bypassing the hot counter.
@@ -1026,16 +1021,15 @@ impl WarmEnterState {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
-            if disable_noninlinable_function || (cell.flags & jc_flags::DONT_TRACE_HERE != 0) {
+            // The last disjunct is pyre's abort ceiling: too many failed
+            // attempts permanently disable tracing here.
+            if disable_noninlinable_function
+                || (cell.flags & jc_flags::DONT_TRACE_HERE != 0)
+                || cell.abort_count >= MAX_TRACE_ABORT_COUNT
+            {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
-                cell.state = BaseJitCellState::DontTraceHere;
-            } else if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
-                // Too many failed attempts — permanently disable tracing here.
-                cell.flags |= jc_flags::DONT_TRACE_HERE;
-                cell.state = BaseJitCellState::DontTraceHere;
-            } else {
-                cell.state = BaseJitCellState::NotHot;
             }
+            cell.state = BaseJitCellState::NotHot;
         }
 
         if disable_noninlinable_function {
@@ -1280,10 +1274,10 @@ impl WarmEnterState {
         self.counter.reset_all();
     }
 
-    /// Check if a green key is marked DontTraceHere.
+    /// Check if a green key carries `JC_DONT_TRACE_HERE`.
     pub fn is_dont_trace_here(&self, cell_key: u64) -> bool {
         self.cell_by_key(cell_key)
-            .is_some_and(|c| c.state == BaseJitCellState::DontTraceHere)
+            .is_some_and(|c| c.flags & jc_flags::DONT_TRACE_HERE != 0)
     }
 
     /// Get a reference to the BaseJitCell for a green key, if it exists.
@@ -1640,9 +1634,6 @@ impl WarmEnterState {
     pub fn disable_noninlinable_function(&mut self, callee_key: u64) {
         let cell = self.ensure_cell_by_key(callee_key);
         cell.flags |= jc_flags::DONT_TRACE_HERE;
-        if cell.flags & jc_flags::TRACING == 0 {
-            cell.state = BaseJitCellState::DontTraceHere;
-        }
     }
 
     /// Mark a callee as currently being traced.
@@ -1985,11 +1976,6 @@ impl WarmEnterState {
                 }
                 cell.state = BaseJitCellState::Invalidated;
             }
-            BaseJitCellState::DontTraceHere => {
-                cell.flags &= !jc_flags::TRACING;
-                cell.flags |= jc_flags::DONT_TRACE_HERE;
-                cell.state = BaseJitCellState::DontTraceHere;
-            }
         }
     }
 
@@ -2221,8 +2207,13 @@ impl WarmEnterState {
                     BaseJitCellState::Compiled => stats.num_compiled += 1,
                     BaseJitCellState::Tracing => stats.num_tracing += 1,
                     BaseJitCellState::Invalidated => stats.num_invalidated += 1,
-                    BaseJitCellState::DontTraceHere => stats.num_disable_noninlinable_function += 1,
                     BaseJitCellState::NotHot => {}
+                }
+                // Counted off the flag, not the lifecycle state: a denial is
+                // orthogonal to where the cell is in that lifecycle, and a cell
+                // denied while it goes on to trace carries only the flag.
+                if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+                    stats.num_disable_noninlinable_function += 1;
                 }
                 cur = cell.next.as_deref();
             }
@@ -3723,9 +3714,9 @@ mod tests {
             _ => panic!("expected StartTracing"),
         }
 
-        // Abort with DONT_TRACE_HERE → state should be DontTraceHere
+        // Abort with DONT_TRACE_HERE → the cell carries the flag
         ws.abort_tracing(key, true);
-        assert_eq!(ws.get_cell_state(key), BaseJitCellState::DontTraceHere);
+        assert!(ws.is_dont_trace_here(key));
 
         // Future calls return NotHot
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));

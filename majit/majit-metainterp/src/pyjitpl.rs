@@ -24906,7 +24906,7 @@ mod tests {
         );
 
         // Start another trace and compile it.
-        // After abort, the cell goes to DontTraceHere if retrace limit is exceeded.
+        // After abort, the cell gains DONT_TRACE_HERE if the retrace limit is exceeded.
         // Use a fresh green key to avoid this.
         let green_key2 = 200;
         for _ in 0..2 {
