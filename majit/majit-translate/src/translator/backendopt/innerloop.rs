@@ -116,8 +116,8 @@ pub fn find_inner_loops(
                 // check_exitswitch_type:` (`innerloop.py:71`).
                 //
                 // PRE-EXISTING-ADAPTATION: upstream compares the concrete
-                // type by `is` identity; `LowLevelType` (lltype.rs:476) is a
-                // value enum with a structural `PartialEq` (lltype.rs:506) and
+                // type by `is` identity; `LowLevelType` (lltype.rs) is a
+                // value enum with a structural `PartialEq` (lltype.rs) and
                 // carries no identity handle, so this uses `==`. The
                 // divergence is currently latent: every caller passes a
                 // singleton primitive — the default `None`, and `funcgen.py:99`
@@ -163,7 +163,8 @@ pub fn find_inner_loops(
         // `self.inputargs = list(inputargs)  # mixed list of variable/const`
         // (model.py:176): the stored list is untyped, and `checkgraph`'s
         // `definevar` (model.py:586 `assert isinstance(v, Variable)`, mirrored
-        // at model.rs:4485) enforces the Variable-only shape only on
+        // in `flowspace/model.rs`'s `checkgraph`) enforces the
+        // Variable-only shape only on
         // well-formed graphs. Iterating it (`innerloop.py:87`) and handing
         // each element to `find_rep` mirrors upstream's untyped `find_rep`
         // over the same list; a non-Variable — excluded by checkgraph — would

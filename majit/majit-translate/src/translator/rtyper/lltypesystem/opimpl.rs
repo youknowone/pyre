@@ -452,7 +452,7 @@ pub fn op_float_ge(args: &[ConstValue]) -> Option<ConstValue> {
 // `opimpl.py:23-28`: `if r_longlong is r_int: r_longlong_arg =
 // (r_longlong, int, long)`). The Rust port keeps the
 // [`ConstValue::Int(i64)`] carrier for `LowLevelType::SignedLongLong`
-// per `lltype.rs:204-217`, so every `llong_*` arm mirrors its
+// per `lltype.rs`, so every `llong_*` arm mirrors its
 // `int_*` counterpart. On 32-bit hosts this would diverge — convergence
 // path: add a separate `ConstValue::LongLong` variant once
 // `lltype.rs` carries `r_longlong` distinctly.
@@ -549,7 +549,7 @@ pub fn op_llong_ge(args: &[ConstValue]) -> Option<ConstValue> {
 // Upstream `op_uint_*` (`opimpl.py:330-378`) operates on `r_uint` —
 // `unsigned long` in C, `u64` on 64-bit hosts. The Rust port carries
 // `LowLevelType::Unsigned` and `LowLevelType::UnsignedLongLong` values
-// in [`ConstValue::Int(i64)`] (per `lltype.rs:204-217`) using bit-
+// in [`ConstValue::Int(i64)`] (per `lltype.rs`) using bit-
 // pattern equivalence: an `r_uint(N)` is stored as `Int(N as i64)`.
 // Each fold reinterprets the i64 as u64, applies the unsigned
 // operation, and re-encodes the bit pattern as i64.
@@ -1124,7 +1124,7 @@ pub fn op_cast_unichar_to_int(args: &[ConstValue]) -> Option<ConstValue> {
 // ---- wide-int casts (i64 / u64 carrier preserves bit pattern) -----
 //
 // On 64-bit hosts every signed/unsigned long-long type collapses onto
-// the single [`ConstValue::Int(i64)`] carrier (per `lltype.rs:204-217`).
+// the single [`ConstValue::Int(i64)`] carrier (per `lltype.rs`).
 // The `cast_int_to_longlong` / `cast_int_to_uint` family is therefore
 // identity at the bit-pattern level. Upstream's per-type asserts
 // remain available for parity once the carriers diverge.

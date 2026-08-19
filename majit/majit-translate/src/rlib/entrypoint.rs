@@ -69,8 +69,8 @@ mod tests {
 
     fn sample_user_function(name: &str) -> HostObject {
         // Minimum viable GraphFunc for `HostObject::new_user_function`
-        // — upstream `GraphFunc.new(name, globals)` at
-        // `model.rs:3068-3088` defaults every non-essential slot. No
+        // — upstream `GraphFunc.new(name, globals)` in
+        // `flowspace/model.rs` defaults every non-essential slot. No
         // code object is needed because the `exported_symbol` flag
         // lives on `GraphFunc` itself, not on `HostCode`.
         let globals = Constant::new(ConstValue::Dict(Default::default()));

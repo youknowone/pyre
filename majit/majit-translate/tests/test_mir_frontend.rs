@@ -274,7 +274,7 @@ fn semantic_program_builder_lowers_every_corpus_function() {
     );
     let names: std::collections::HashSet<_> =
         program.functions.iter().map(|f| f.name.as_str()).collect();
-    // Names are crate-prefix-stripped (lib.rs:444
+    // Names are crate-prefix-stripped (lib.rs
     // register_function_graph_alias walks bare leaf + crate aliases
     // off this shape).
     for required in [

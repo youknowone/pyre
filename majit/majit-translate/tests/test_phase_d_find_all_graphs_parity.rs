@@ -247,7 +247,7 @@ fn find_all_graphs_leaves_unregistered_targets_as_residual() {
     // equivalent mechanism: the `PYRE_JIT_GRAPH_MODULES` whitelist plus
     // `register_function_graph` plays the "allowed module" role, and an
     // unregistered callee is treated as residual by construction —
-    // `find_all_graphs_bfs` at `call.rs:1466` only pulls a callee into
+    // `find_all_graphs_bfs` at `call.rs` only pulls a callee into
     // `candidate_graphs` when `function_graphs.get(callee_path)` succeeds.
     //
     // The two mechanisms converge on the same observable behaviour: a

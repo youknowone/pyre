@@ -20,7 +20,7 @@
 //! Python-runtime function metadata that pyre's surface DSL does not
 //! produce (`parse → front → SemanticProgram` operates on Rust source,
 //! not CPython callables). `RPythonTyper::specialize`
-//! (`rtyper.rs:1743`) does NOT consume `PyGraph` directly — it iterates
+//! (`rtyper.rs`) does NOT consume `PyGraph` directly — it iterates
 //! `RPythonAnnotator.annotated` / `all_blocks`, which
 //! `specialize_legacy_graph` will populate with the
 //! [`FlowspaceAdapterOutput`] this adapter returns. Skipping the PyGraph
@@ -48,7 +48,7 @@
 //!    `Block`, translates `exits` / `exitcase` / `exitswitch`,
 //!    designates `startblock` / `returnblock` / `exceptblock`, and
 //!    assembles a `flowspace::FunctionGraph`.  `getreturnvar`
-//!    (`rtyper.rs:1633-1638`) is non-degenerate because the
+//!    (`rtyper.rs`) is non-degenerate because the
 //!    returnblock's inputarg is materialised as the canonical
 //!    flowspace return `Variable`.
 //!
@@ -99,7 +99,7 @@ pub use crate::codewriter::annotation_state::valuetype_to_someshell;
 ///
 /// The legacy `Variable.id` does NOT carry over to the fresh
 /// Variable's id — `Variable::new` allocates a fresh process-wide
-/// identity (`flowspace/model.rs:2042`). Identity correspondence is
+/// identity (`flowspace/model.rs`). Identity correspondence is
 /// preserved out-of-band by [`LegacyToTyped`].
 fn seed_variable(legacy_var: &Variable) -> Variable {
     let var = Variable::new();
@@ -219,7 +219,7 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> LegacyToTyp
         // `OpKind::Abort` (pyre-only front-end marker for unsupported
         // expression forms) is intentionally NOT seeded into
         // `value_to_var`.  `translate_op`'s Abort arm emits no
-        // flowspace op (`flowspace_adapter.rs:648 OpKind::Abort { .. }
+        // flowspace op (`OpKind::Abort { .. }
         // => Ok(Vec::new())`), so seeding the result_var here would
         // hand consumer ops a `Hlvalue::Variable` that never gets
         // *defined* by any emitted flowspace op — `checkgraph`
@@ -403,7 +403,7 @@ fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
 /// `"args[i]"`, `"result"`) so per-graph diagnosis can locate the
 /// broken op without re-traversing the graph. The required substring
 /// `"undefined operand"` is preserved verbatim so the dual
-/// gate's `is_known_unported` predicate (`cutover.rs:441`) keeps
+/// gate's `is_known_unported` predicate (`cutover.rs`) keeps
 /// matching this category.
 #[expect(
     clippy::mutable_key_type,
@@ -488,15 +488,15 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
         // `guessbool` fork.  Pyre's frontend emits
         // `OpKind::UnaryOp { op: "bool", .. }` from the `&&` / `||`
         // short-circuit desugar,
-        // mirroring `build_flow.rs:1191 lower_short_circuit`.
+        // mirroring `build_flow.rs` `lower_short_circuit`.
         // Pass through unchanged.
         "bool" => Ok("bool".to_string()),
         // `invert` — PyPy `add_operator('invert', 1, .., pure=True)` at
         // `operation.py:474`, emitted by `flowcontext.py:188-191
         // UNARY_INVERT` and dispatched through
         // `RPythonTyper::translate_op`'s `"invert"` arm
-        // (`rtyper.rs:2025`) into `IntegerRepr::rtype_invert`
-        // (`rint.py:107-110` → `rint.rs:284`). Pyre's frontend
+        // (`rtyper.rs`) into `IntegerRepr::rtype_invert`
+        // (`rint.py:107-110` → `rint.rs`). Pyre's frontend
         // emits `OpKind::UnaryOp { op: "invert", .. }` directly for the
         // integer bitwise-complement form (the case Rust's `!42_i64`
         // denotes).  Without this arm the
@@ -508,10 +508,10 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
         // on graphs that carry `same_as` from any source: identity /
         // source-type-unknown cast lowering in the frontend,
         // `unsimplify::split_block`'s
-        // Void-variable recreation (`unsimplify.rs:280`), and the
+        // Void-variable recreation (`unsimplify.rs`), and the
         // backendopt pipeline's block-prefix `same_as` insertion
-        // (`backendopt/constfold.rs:859`, `backendopt/all.rs:615`,
-        // `removenoops.rs:86`, `storesink.rs:95`).  All other typed
+        // (`backendopt/constfold.rs`, `backendopt/all.rs`,
+        // `removenoops.rs`, `storesink.rs`).  All other typed
         // `(source, target)` casts have no unary-op route — they
         // route through `simple_call(<host_callable>, v)` per upstream
         // `__builtin__.int/float/bool` / `lltype.cast_*` /
@@ -551,7 +551,7 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
 /// Rust-side identifiers (`bitand`, `bitor`, `bitxor`, `add_assign`,
 /// ...) become the trailing-underscore / `inplace_*` forms RPython
 /// registers and `RPythonTyper::translate_op_with_map`
-/// (`rtyper.rs:2023-2078`) dispatches on.  Names already matching
+/// (`rtyper.rs`) dispatches on.  Names already matching
 /// RPython (`add`, `sub`, `mul`, `mod`, `lshift`, `rshift`, `lt`, ...)
 /// pass through unchanged.
 ///
@@ -679,7 +679,7 @@ fn array_aggregate_elements(
 }
 
 /// `true` iff `kind` is `front::mir`'s synthetic string-literal
-/// define-op (`Call(["__str_const", <text>])`, `mir.rs:1576`).
+/// define-op (`Call(["__str_const", <text>])`, `mir.rs`).
 /// Upstream flowspace carries a string literal as a bare
 /// `Constant('text')` SSA value, so the pre-pass
 /// ([`legacy_const_define_hlvalue`]) folds the op to that Constant and
@@ -1043,7 +1043,7 @@ pub fn translate_op(
     // The call registry is consulted by the `OpKind::Call::FunctionPath`
     // arm to resolve a registered `(HostObject, FunctionDesc)` pair
     // and emit a flowspace `simple_call` (`operation.py:152`,
-    // `rpbc.rs:1621 FunctionRepr::rtype_simple_call`).  Empty registry
+    // `rpbc.rs`'s `FunctionRepr::rtype_simple_call`).  Empty registry
     // callsites surface a distinct fail-loud message; producers
     // must pre-register every reachable FunctionPath.
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
@@ -1217,7 +1217,7 @@ pub fn translate_op(
         // The model-graph op carries the boxing struct leaf `owner` and flows
         // straight to the codewriter/assembler (`new_with_vtable`).  For the
         // ephemeral annotation / rtype type-oracle it mirrors the
-        // `SyntheticTransparentCtor` struct path (flowspace_adapter.rs:1705): a
+        // `SyntheticTransparentCtor` struct path (flowspace_adapter.rs): a
         // zero-arg `simple_call` against the interned class host annotates the
         // result as a fresh `SomeInstance(owner)`.  `getuniqueclassdef_for_
         // struct_root` first forces the struct's field rows to be projected so
@@ -1281,7 +1281,7 @@ pub fn translate_op(
         // (`rpython/flowspace/operation.py:485-507`): `and_`, `or_`,
         // `xor`, `inplace_add`, `inplace_sub`, ...  Translate the
         // pyre-side name to its RPython counterpart so the rtyper's
-        // `translate_op` arm matching (`rtyper.rs:2023-2078`) finds
+        // `translate_op` arm matching (`rtyper.rs`) finds
         // the proper `pair_rtype_*` dispatch.
         OpKind::BinOp {
             op: opname,
@@ -1341,7 +1341,7 @@ pub fn translate_op(
         // `add_operator('pos', 1, ..)` etc.
         // (`rpython/flowspace/operation.py:465-474`).  Translate the
         // pyre-side name to its RPython counterpart so the rtyper's
-        // unary dispatch (`rtyper.rs:2023-2078 translate_op_*`) finds
+        // unary dispatch (`rtyper.rs` `translate_op_*`) finds
         // the proper `unary_rtype_*` arm.
         OpKind::UnaryOp {
             op: opname,
@@ -1362,7 +1362,7 @@ pub fn translate_op(
         // Emitted pre-rtyper by `front/ast.rs` at `TupleStruct` /
         // composite match-cascade payload sites where a unit-variant
         // ptr_eq does not suffice. The rtyper dispatches `"isinstance"`
-        // at `rtyper.rs:2035 translate_unary_operation` →
+        // at `rtyper.rs`'s `translate_unary_operation` →
         // `InstanceRepr::rtype_isinstance`, which mints either a
         // per-class `ll_isinstance_const_*` helper (Constant
         // `class_carrier`) or the generic `ll_isinstance` helper
@@ -1386,7 +1386,7 @@ pub fn translate_op(
         // attribute-access op carries the field name as a
         // `ConstValue::ByteStr` (Python 2 `str`), matching the rtyper's
         // `rtype_getattr` / `rtype_setattr` dispatch
-        // (`rtyper.rs:2013-2014`). InstanceRepr later lowers the
+        // (`rtyper.rs`'s `translate_operation`). InstanceRepr later lowers the
         // `getattr`/`setattr` op into a `getfield_*` / `setfield_*`
         // bytecode keyed on the field's lltype kind.
         OpKind::FieldRead { base, field, .. } => {
@@ -1610,7 +1610,7 @@ pub fn translate_op(
                     // ordinary residual call and cannot carry an unwired
                     // `getslice` op to the assembler.
                     //
-                    // Upstream: `decompose_slice_args` (`rtyper.rs:2798`)
+                    // Upstream: `decompose_slice_args` (`rtyper.rs`)
                     // selects `SliceKind::MinusOne` for annotated constants
                     // `0` and `-1`, then `rlist.py:906-911` calls
                     // `ll_listslice_minusone` (asserting, not clamping).
@@ -1835,7 +1835,7 @@ pub fn translate_op(
                     // registers as `["range"]` — would therefore bind this
                     // synthesized call to *its* `HostObject`, and since
                     // `BUILTIN_TYPER` is keyed by Arc identity
-                    // (`rbuiltin.rs:98-101`) the rtyper then fails
+                    // (`rbuiltin.rs`) the rtyper then fails
                     // `findbltintyper` with "don't know about built-in
                     // function <host range>".  Resolving the reserved
                     // spelling straight to the `HOST_ENV` singleton keeps the
@@ -1860,7 +1860,7 @@ pub fn translate_op(
                     // `<str>::len` method.  Rust lowers `slice.len()` /
                     // `s.len()` to MIR calls to those intrinsics, which
                     // have no source body to register.  Route all three to
-                    // the rtyper's `len` operation (`rtyper.rs:2016 "len"
+                    // the rtyper's `len` operation (`rtyper.rs "len"
                     // arm` → `Repr.rtype_len`), the same dispatch upstream
                     // `op.len(v)` reaches via `unaryop.py:867-870`.  The
                     // rtyper dispatches on the receiver repr: a slice maps
@@ -2045,8 +2045,8 @@ pub fn translate_op(
                     // (`OBJECT_VTABLE` `hints={'immutable': True}`,
                     // rclass.py:167-174).  Mirror that by rewriting the
                     // recognised call back into the high-level operation, so
-                    // `ClassRepr.rtype_issubtype` (`rclass.rs:1500`) /
-                    // `InstanceRepr.rtype_isinstance` (`rclass.rs:3682`) emit
+                    // `ClassRepr.rtype_issubtype` (`rclass.rs`) /
+                    // `InstanceRepr.rtype_isinstance` (`rclass.rs`) emit
                     // the seqlock-free `int_between` helper the same as a
                     // Python-level `issubtype`/`isinstance`.
                     if segments.len() >= 2 && segments[segments.len() - 2] == "pyobject" {
@@ -2238,8 +2238,10 @@ pub fn translate_op(
                             HOST_ENV.import_module(&segments[..segments.len() - 1].join("."))
                         && let Some(attr) = module.module_get(&segments[segments.len() - 1])
                     {
-                        // Branch 3b — fully-qualified inline path,
-                        // PRE-EXISTING-ADAPTATION as documented above.
+                        // Branch 3b — fully-qualified inline path resolved
+                        // through `HOST_ENV.import_module` + `module_get`;
+                        // the PRE-EXISTING-ADAPTATION is item `3b.` of this
+                        // arm's Layer 3 resolution-order list.
                         attr
                     } else if segments.len() == 2
                         && segments[0] == "simple_call"
@@ -2247,7 +2249,7 @@ pub fn translate_op(
                     {
                         // Branch 3c — PRE-EXISTING-ADAPTATION closure
                         // for `front::exc_from_raise::lower_exc_from_raise`
-                        // (~`exc_from_raise.rs:153`).  Upstream RPython
+                        // (~`exc_from_raise.rs`).  Upstream RPython
                         // `flowcontext.py:614/623` emits
                         // `op.simple_call(const(exc_class), *args)`
                         // with the class as `args[0]`; pyre stashes
@@ -2257,11 +2259,11 @@ pub fn translate_op(
                         // `Constant(HostObject(class))` alongside
                         // `Variable`s — holding it would require a
                         // `Vec<Variable>` → `Vec<LinkArg>` carrier (see the
-                        // module-level "PRE-EXISTING-ADAPTATION"
-                        // block in `front/exc_from_raise.rs:120-126` for the
-                        // detailed rationale).  The downstream
+                        // "TODO: `Constant` SSA carrier shape" section of
+                        // `front/exc_from_raise.rs`'s module preamble for
+                        // the three attempts that failed).  The downstream
                         // reconstruction is documented at
-                        // `exc_from_raise.rs:122-123`:
+                        // `exc_from_raise.rs`:
                         // > any downstream reader can reconstruct
                         // > `(op, const_class, args…)` from
                         // > `(path[0], path[1], op.args)`
@@ -2339,8 +2341,8 @@ pub fn translate_op(
                     // `HostObject::new_class(qualname, [])` routes through
                     // the existing `is_class()` arm in
                     // [`crate::annotator::bookkeeper::Bookkeeper::immutablevalue_hostobject`]
-                    // (`bookkeeper.rs:1984`) → `getdesc` → `ClassDesc::new`
-                    // (`classdesc.rs:708`) → `SomePBC([ClassDesc])`, instead
+                    // (`bookkeeper.rs`) → `getdesc` → `ClassDesc::new`
+                    // (`classdesc.rs`) → `SomePBC([ClassDesc])`, instead
                     // of falling through to the "Don't know how to represent"
                     // error that `HostObject::new_opaque` produces.  The
                     // resulting `SomeInstance(classdef)` projects to
@@ -2358,7 +2360,7 @@ pub fn translate_op(
                     // Intern the ctor class by its qualified qualname so
                     // every site shares one `HostObject` Arc — the
                     // singleton-class identity `getdesc` dedups on
-                    // (`bookkeeper.rs:1040`, keyed by `Arc::ptr_eq`).
+                    // (`bookkeeper.rs`, keyed by `Arc::ptr_eq`).
                     // Without interning each site mints a fresh Arc → a
                     // fresh `ClassDesc` per occurrence, so a class can
                     // never be numbered once (its `minid` would differ per
@@ -2531,7 +2533,7 @@ pub fn translate_op(
                 // `rpbc::lower_indirect_calls` (`VtableMethodPtr` +
                 // `IndirectCall`), but pyre has no IR vtable struct, so the
                 // funcptr projection cannot carry a `Ptr(Func)` lltype that
-                // `PtrRepr::rtype_simple_call` (rmodel.rs:2202) needs —
+                // `PtrRepr::rtype_simple_call` (rmodel.rs) needs —
                 // synthesising a `SomePtr(Func)` symbolically is not
                 // available in the two-phase annotate/rtype prepass.
                 //
@@ -2540,13 +2542,14 @@ pub fn translate_op(
                 // shape as `CallTarget::Method`.  The receiver `args[0]` is
                 // a `dyn Trait` call-result / deref TEMP annotated
                 // `SomeInstance(classdef=None)` — `dyn Trait` has no
-                // `class_root`, and `derive_subject_inputcells` (this file
-                // ~:2784, the #346 receiver seeder) only touches startblock
+                // `class_root`, and `derive_subject_inputcells` (this file,
+                // the #346 receiver seeder) only touches startblock
                 // inputargs, not temps — so the method getattr would block
                 // on the classdef-less shell.  Narrow the receiver first to
                 // the trait-family base `ClassDef` via the
-                // `__pyre_cast_instance` mechanism (same as slice A /
-                // `mir.rs:3725`, lowered at ~:1467 in this file): emit
+                // `__pyre_cast_instance` mechanism (same as the `mir.rs`
+                // path, lowered by `translate_op`'s `__pyre_cast_instance`
+                // arm): emit
                 // `simple_call(__pyre_cast_instance, receiver,
                 // Constant(byte_str(base_root)))` producing a narrowed
                 // receiver, then `getattr(narrowed, method_name)`.  The
@@ -2643,12 +2646,12 @@ pub fn translate_op(
         // The trailing `c_graphs` Constant must carry actual graph
         // identities — pyre's parity emits `ConstValue::Graphs(Vec<usize>)`
         // via `GraphKey::of(&g.graph).as_usize()` (see
-        // `translator/rtyper/rpbc.rs:1481-1490`). The flowspace adapter
+        // `translator/rtyper/rpbc.rs`). The flowspace adapter
         // doesn't have access to the graph registry that resolves
         // `CallPath` segments to `Rc<RefCell<FunctionGraph>>` references,
         // so it cannot construct a faithful `ConstValue::Graphs`. A
         // synthetic `ConstValue::List(byte_str(qualname))` would silently
-        // drop indirect-call analysis (`graphanalyze.rs:333` falls back
+        // drop indirect-call analysis (`graphanalyze.rs` falls back
         // to `top_result()` for any non-Graphs ConstValue), so fail-loud
         // is the parity-correct behaviour: `IndirectCall` must be lowered
         // by `rpbc.rs` (the rtyper-equivalent layer that owns the graph
@@ -2857,7 +2860,7 @@ pub struct FlowspaceAdapterOutput {
     pub value_to_var_candidates: LegacyToTypedCandidates,
     /// Const-define result `Variable` -> `Constant.concretetype`.
     /// Materialised at lift time from `OpKind::ConstInt` / `ConstFloat`
-    /// via `Constant::with_concretetype` (`flowspace_adapter.rs:518-527`),
+    /// via `Constant::with_concretetype`,
     /// matching RPython's `Constant.concretetype` ground truth.  The
     /// per-`Variable` `LowLevelType` is read directly so the projector
     /// does not have to reconstruct the kind from the reduced legacy
@@ -2962,7 +2965,7 @@ fn legacy_const_define_hlvalue(
         // literal as a bare `Constant('text')` SSA value (annotated
         // `SomeString` by `immutablevalue`); `front::mir` has no
         // ConstStr opkind and synthesises a 0-arg
-        // `Call(["__str_const", <text>])` instead (`mir.rs:1576`).
+        // `Call(["__str_const", <text>])` instead (`mir.rs`).
         // Re-fold that define-op to the upstream Constant shape here.
         // The stamped lltype is `Ptr(STR)` — fixed for every string
         // constant, same as the primitive arms above (the rtyper's
@@ -3155,7 +3158,7 @@ fn legacy_const_define_hlvalue(
 /// the role-bearing enrichment of `lookup_operand` (variant name +
 /// arg role).  The required substring `"undefined operand"`
 /// is preserved verbatim for `is_known_unported`
-/// (`cutover.rs:441`).
+/// (`cutover.rs`).
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -3248,7 +3251,7 @@ fn link_extravar_to_hlvalue(
 /// - `valuetype_to_someshell(ty)` returns `None` for the resolved
 ///   `ValueType` (only `ValueType::Unknown`) — the inputarg's type
 ///   is an annotation gap; the helper surfaces it the same way
-///   `seed_variable` does (`flowspace_adapter.rs:99-115`).
+///   `seed_variable` does.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -3306,10 +3309,10 @@ pub(crate) fn derive_subject_inputcells(
             // A `Ref` inputarg projects to the abstract `SomeInstance(None)`
             // shell from `valuetype_to_someshell`.  When the front-end
             // resolved the param's struct root (`OpKind::Input.class_root`,
-            // populated from `type_root_ident` at front/ast.rs:2107-2184)
+            // populated from `type_root_ident` at front/ast.rs)
             // and the struct-field registry knows that root, seed the
             // receiver with the *cached* `ClassDef` from
-            // `getuniqueclassdef_for_struct_root` (bookkeeper.rs:1522). The
+            // `getuniqueclassdef_for_struct_root` (bookkeeper.rs). The
             // cache makes the classdef identity-stable across repeated
             // lookups (`Rc::ptr_eq`), so the annotation fixpoint stays
             // independent of graph-processing order — unlike the earlier
@@ -3503,7 +3506,7 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
 ///    inputargs. Assemble the `flowspace::FunctionGraph` via
 ///    `FunctionGraph::with_return_var`, supplying the canonical
 ///    returnblock inputarg so the rtyper's `getreturnvar`
-///    (`rtyper.rs:1633-1638`) finds a real return `Variable`.
+///    (`rtyper.rs`) finds a real return `Variable`.
 /// 2. **Pass 2** — for each non-final block, translate `operations` via
 ///    [`translate_op`], translate `exits` (link args + targets +
 ///    exitcase) via [`link_arg_to_hlvalue`] / [`exitcase_to_hlvalue`],
@@ -3525,7 +3528,7 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
 /// `Variable.annotation` for every reachable inputarg and op result.
 /// Carrying the legacy pre-seed alongside flowin caused
 /// `setbinding: new value does not contain old` panics at
-/// `annrpython.rs:459` whenever flowin's `follow_link` computed a
+/// `annrpython.rs` whenever flowin's `follow_link` computed a
 /// narrower annotation (e.g., constant-tracking `SomeInteger{const,
 /// nonneg}`) than legacy_annotator's wider lift.
 ///
@@ -3609,7 +3612,7 @@ pub fn function_graph_to_flowspace(
     // `startblock`: upstream builds graphs by abstract interpretation,
     // so an unreachable block cannot exist, and every downstream
     // consumer (checkgraph / annotator / rtyper) walks `iterblocks()`
-    // — a reachability DFS (`flowspace/model.rs:4011`, model.py).  The
+    // — a reachability DFS (`flowspace/model.rs`, model.py).  The
     // legacy MIR graph, by contrast, keeps lowered-but-unreachable
     // blocks: every `on_unwind` edge is dropped at lowering while the
     // `UnwindResume`/`Abort` terminator still lowers via `set_raise`,
@@ -3685,7 +3688,7 @@ pub fn function_graph_to_flowspace(
     // is no fallback for an empty `inputargs` list, and a malformed
     // graph raises `IndexError` at this site rather than fabricating a
     // fresh Variable.  Pyre's `model::FunctionGraph::with_return_var`
-    // (`model.rs:983-988`) builds the returnblock with `inputargs:
+    // builds the returnblock with `inputargs:
     // vec![return_value]` by invariant, so the lookup is guaranteed to
     // succeed; surface the violation as a `TyperError` instead of
     // silently producing a `Variable::new()` placeholder.
@@ -3863,7 +3866,7 @@ pub fn function_graph_to_flowspace(
                         // not extended to carry `name`, or the
                         // predecessor link's args do not include the
                         // slot producer.  The dual-gate at
-                        // `cutover.rs:439 is_known_unported` matches
+                        // `cutover.rs`'s `is_known_unported` matches
                         // the substring `"adapter cross-block body
                         // Input"` and Skip-classifies the graph,
                         // routing it through `legacy_state` until
@@ -4018,7 +4021,7 @@ pub fn function_graph_to_flowspace(
                     // SpaceOperation). Required substring
                     // `"undefined operand"` is preserved
                     // verbatim for `is_known_unported`
-                    // (`cutover.rs:441`).
+                    // (`cutover.rs`).
                     TyperError::message(format!(
                         "translate_op: undefined operand {var:?} as block.exitswitch — \
                          adapter invariant broken (every referenced operand must be \
@@ -4203,7 +4206,7 @@ mod tests {
         // annotation-stage shell.  Returning `None` leaves
         // `Variable.annotation` empty so `bindingrepr` panics with
         // `KeyError: no binding for arg`
-        // (`annotator/annrpython.rs:418`), surfacing the producer-side
+        // (`annotator/annrpython.rs`), surfacing the producer-side
         // gap instead of silently bridging it to `GcRef` via a
         // fabricated `SomeInstance(None)` shell — that bridging
         // conflated the annotation-stage lattice node with the
@@ -4225,7 +4228,7 @@ mod tests {
         let var = seed_variable(&legacy_var);
 
         // Reference semantics: the annotation Rc-shares across clones
-        // (flowspace/model.rs:2010-2018), so a clone observes the same
+        // (flowspace/model.rs), so a clone observes the same
         // shell instance.
         let clone = var.clone();
         let clone_ann = clone.annotation.borrow();
@@ -4246,7 +4249,7 @@ mod tests {
         // annotation gap to GcRef via the resolver-stage backfill at
         // the wrong layer. Instead, leave Variable.annotation empty so
         // `bindingrepr` panics with `KeyError: no binding for arg`
-        // (annotator/annrpython.rs:418), surfacing the producer-side
+        // (annotator/annrpython.rs), surfacing the producer-side
         // gap as a fail-loud signal.
         let legacy_var = Variable::new();
         let var = seed_variable(&legacy_var);
@@ -4669,7 +4672,7 @@ mod tests {
         // GetSlice arm: the three `(list, start, stop)` operands route
         // through lookup_operand and the result via resolve_result_hlvalue,
         // producing a flowspace `getslice` SpaceOperation the annotator's
-        // list handler (unaryop.rs:1418) consumes.
+        // list handler (unaryop.rs) consumes.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_getslice_fixture");
         let vars = mint_vars(&mut graph, 11); // vars[0..11]
@@ -5280,7 +5283,7 @@ mod tests {
     #[test]
     fn translate_op_isinstance_lowers_to_flowspace_isinstance() {
         // OpKind::IsInstance arrives from the tuple-struct match
-        // cascade (`front/ast.rs:7467`).  Emit a single
+        // cascade (`front/ast.rs`).  Emit a single
         // `isinstance(obj, cls)` flowspace op so the rtyper dispatches
         // to `InstanceRepr::rtype_isinstance`.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -5516,12 +5519,12 @@ mod tests {
 
     #[test]
     fn translate_op_indirect_call_surfaces_rpbc_invariant() {
-        // OpKind::IndirectCall must be lowered by `rpbc.rs:1481-1490`
+        // OpKind::IndirectCall must be lowered by `rpbc.rs`
         // (the rtyper-equivalent layer that owns the graph registry
         // and can resolve CallPath → ConstValue::Graphs(Vec<usize>))
         // before reaching the flowspace adapter. Synthesising
         // `ConstValue::List(byte_str)` here would break
-        // `graphanalyze.rs:333` indirect-call analysis (any non-Graphs
+        // `graphanalyze.rs` indirect-call analysis (any non-Graphs
         // ConstValue falls back to `top_result()`); fail-loud is the
         // parity-correct behaviour.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -6096,7 +6099,7 @@ mod tests {
         // When the returnblock has an inputarg slot, the flowspace
         // graph's returnblock must use the SAME Variable identity (so
         // RPythonTyper.getreturnvar finds the right Variable —
-        // rtyper.rs:1633-1638).
+        // rtyper.rs).
         let mut graph = LegacyGraph::new("with_return_var");
         let vars = mint_vars(&mut graph, 3); // vars[0..3]
         let startblock = Block {

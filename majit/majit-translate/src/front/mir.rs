@@ -337,7 +337,7 @@ fn normalize_function_filter(function_names: &[&str]) -> Option<std::collections
 
 /// Build a [`SemanticProgram`] by lowering every local function
 /// declaration in `llbc`.  This is the production pipeline's
-/// program-build entry point (`lib.rs:134`).
+/// program-build entry point (`lib.rs`).
 ///
 /// **Whole-program metadata** (`known_struct_names`,
 /// `known_trait_names`, `struct_fields`) is populated from
@@ -893,7 +893,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
         .map(|(path, _)| path.clone())
         .collect();
-    // `#[majit_macros::elidable]` callees (`llbc_hints.rs:31` maps the
+    // `#[majit_macros::elidable]` callees (`llbc_hints.rs` maps the
     // `_elidable_function_` marker → `"elidable"`): the codewriter's
     // elidable effect already lowers the callsite to CALL_PURE and never
     // looks inside the body.  Harvest the elidable set from the same
@@ -925,7 +925,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // at the JIT level — skip them so they never surface as
         // call-registry entries the rest of the pipeline does not
         // model.  (Their unwind paths lower via `set_raise`,
-        // `model.rs:4149`; the flowspace adapter converts only the
+        // `model.rs`; the flowspace adapter converts only the
         // reachable block closure, so an unreachable unwind block's
         // orphan etype/evalue slots no longer reject the graph — this
         // skip is about call-target modelling, not adapter safety.)
@@ -933,9 +933,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             continue;
         }
         // Key each SemanticFunction by bare leaf name plus a separate
-        // `module_path` so `register_function_graph_alias` (lib.rs:444)
+        // `module_path` so `lib.rs`'s `register_function_graph_alias`
         // walks `{bare, crate::*, pyre_*::*}` correctly and the portal
-        // lookup at lib.rs:1043 (`["eval_loop_jit"]`) resolves.
+        // lookup in `register_configured_jitdrivers` (`["eval_loop_jit"]`)
+        // resolves.
         let stripped = strip_crate_prefix(&fd.item_meta.name_path());
         let (module_path, name) = match stripped.rsplit_once("::") {
             Some((module, leaf)) => (module.to_string(), leaf.to_string()),
@@ -998,7 +999,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // kind the legacy walker derives, so it is filled in even though
         // the general resolution gap remains open.
         // Surface the impl-method owner on the SemanticFunction so
-        // `lib.rs:868` / `lib.rs:1086` and the
+        // `lib.rs`'s `analyze_pipeline_from_module_paths` and the
         // `extract_inherent_impl_methods` / `extract_trait_impls`
         // consumers see the same `self_ty_root` the MIR driver records.
         // Without this, every impl method built by the MIR driver looks
@@ -1910,7 +1911,7 @@ fn derive_program_metadata(
 ///   mirroring `MirGraphLookup::insert_or_mark_ambiguous`.
 /// - `struct_origins`: the entry is emptied when the colliding
 ///   declarations live in different crate-stripped modules, which
-///   `canonical_struct_name` (descr.rs:342) already treats as
+///   `canonical_struct_name` (descr.rs) already treats as
 ///   unresolvable — the bare spelling passes through unchanged instead
 ///   of canonicalising to whichever module registered first.
 /// - variant-leaf aliases: an enum variant dual-publishes a bare
@@ -3070,13 +3071,13 @@ impl<'a> Lowering<'a> {
         // Each parameter is also emitted as a paired `OpKind::Input { name,
         // ty }` op into the startblock.  Downstream consumers
         // — `flowspace_adapter::derive_subject_inputcells`
-        // (`translator/rtyper/flowspace_adapter.rs:1464+`),
-        // `graph_non_void_arg_types` (`codewriter/call.rs:2748+`),
-        // `type_state` (`codewriter/type_state.rs:131`) — locate
+        // (`translator/rtyper/flowspace_adapter.rs`),
+        // `graph_non_void_arg_types` (`codewriter/call.rs`),
+        // `type_state` (`codewriter/type_state.rs`) — locate
         // each inputarg's declared `ValueType` by scanning the leading
         // `OpKind::Input` ops with `op.result == &arg`.  Without the
         // Input op, `derive_subject_inputcells` fails-loud at
-        // `flowspace_adapter.rs:1504` for any MIR-built graph that
+        // `flowspace_adapter.rs` for any MIR-built graph that
         // reaches the real-rtyper dual-gate.
         let mut startblock_args: Vec<Variable> = Vec::with_capacity(arg_count);
         let mut input_ops: Vec<SpaceOperation> = Vec::with_capacity(arg_count);
@@ -4950,7 +4951,7 @@ impl<'a> Lowering<'a> {
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                 // Emit the transparent ctor with empty args so the
                 // annotator's `ClassDesc::pycall` `args.fixedunpack(0)`
-                // check (`classdesc.rs:1247`, mirroring upstream
+                // check (`classdesc.rs`, mirroring upstream
                 // `classdesc.py:705`) succeeds for classes whose
                 // `__init__` is not registered with the bookkeeper —
                 // the operand values flow through the FieldWrite chain
@@ -5829,9 +5830,9 @@ impl<'a> Lowering<'a> {
                 // (`rpython/annotator/bookkeeper.py:339-345`
                 // `SomeInstance(self.getuniqueclassdef(x.__class__))`).
                 // pyre's whole `pytypes` bucket is declared `PyType`
-                // (`pyre-object/src/pyobject.rs:42`, and the
+                // (`pyre-object/src/pyobject.rs`, and the
                 // `#[pyre_class]`-minted statics at
-                // `pyre-macros/src/lib.rs:1330`), so it derives `"PyType"`
+                // `pyre-macros/src/lib.rs`), so it derives `"PyType"`
                 // exactly as the fixed name did; a host crate with its own
                 // class root (`charon-corpus` `CelClass`) derives that root
                 // instead of being stamped with pyre's.
@@ -6950,7 +6951,7 @@ impl<'a> Lowering<'a> {
         // `Return` lowers via `set_return(None)`, see [`is_unit_type`]),
         // so the call site must declare the result Void too — otherwise
         // `tyref_to_value_type`'s `Ref` projection for unit contradicts
-        // the callee's `FUNC.RESULT=Void` and trips `call.rs:4268`
+        // the callee's `FUNC.RESULT=Void` and trips `call.rs`
         // (e.g. `ExecutionContext.force_all_frames`).
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
@@ -8043,11 +8044,11 @@ impl<'a> Lowering<'a> {
                 // segment whose owner type is resolvable, emit
                 // `CallTarget::Method` instead of `FunctionPath` so the
                 // annotator's `MethodDesc.func_args`
-                // (`annotator/description.rs:2278`) prepends a
+                // (`annotator/description.rs`) prepends a
                 // classdef-bound `SomeInstance` for `self`.  Without it,
                 // the callee body's `self` lands with `classdef=None`
                 // and any `.field` projection on it panics at
-                // `unaryop.rs:3587` (lib test
+                // `unaryop.rs` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
                 // `<[T]>::to_vec(slice)` copies the slice into an owned Vec —
@@ -8471,7 +8472,7 @@ impl<'a> Lowering<'a> {
                         // functions (e.g. `RootScope::new()` — no `self` arg).
                         // Only the former actually has a receiver in `args[0]`;
                         // routing a 0-arg associated function through `Method`
-                        // panics at `flowspace_adapter.rs:1045` ("Call::Method
+                        // panics at `flowspace_adapter.rs` ("Call::Method
                         // has empty args").  Fall back to the `FunctionPath`
                         // segments when there is no receiver to thread.
                         match method_hint {
@@ -9703,7 +9704,7 @@ impl<'a> Lowering<'a> {
             // default-body and registers it under BOTH
             // `["<default methods of <Trait>>", <method>]` (the
             // selfclassdef-bound `register_trait_method` path) and the
-            // direct path `[<Trait>, <method>]` (lib.rs:957-969 —
+            // direct path `[<Trait>, <method>]` (lib.rs —
             // `register_function_graph(direct_path, …)`).  The direct
             // path is the call-site shape Rust code emits when calling
             // `<Trait>::<method>(receiver, …)` and the BFS-driven
@@ -10211,7 +10212,7 @@ impl<'a> Lowering<'a> {
     /// `<*const T>::cast_mut` / `<*mut T>::cast_const` — pointer casts that
     /// change only const/mut, never the pointee type.  The JIT does not
     /// model the mut/const distinction (`Ref` / `RawPtr` lower to a
-    /// same-Variable alias, mir.rs:50), so a `p.cast_mut()` callsite binds
+    /// same-Variable alias), so a `p.cast_mut()` callsite binds
     /// its destination straight to the pointer argument instead of
     /// emitting a call to core's raw-pointer method (which has no graph
     /// lowering and is not a registered callee).
@@ -10676,8 +10677,8 @@ impl<'a> Lowering<'a> {
     /// The pyre length-prefixed containers `FixedObjectArray` / `IntArray`
     /// / `FloatArray` expose the same pair of views, each spelled
     /// `from_raw_parts(self.base(), self.len)` over their own backing
-    /// block (`object_array.rs:853-859`, `int_array.rs:120-125`,
-    /// `float_array.rs:120-125`).  Their receivers are already list-modelled
+    /// block (`object_array.rs`, `int_array.rs`,
+    /// `float_array.rs`).  Their receivers are already list-modelled
     /// — [`Self::is_container_len`] carries the identical object/int/float
     /// trio — so the same receiver-alias applies, and entering the body
     /// instead dead-ends at the unregistered `core::slice::raw::from_raw_parts`.
@@ -11141,7 +11142,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Alias `Arg::<T>::get(self, arg: OpArg) -> T`
-    /// (`rustpython_compiler_core::bytecode::instruction`, instruction.rs:1286)
+    /// (`rustpython_compiler_core::bytecode::instruction`, instruction.rs)
     /// to its `OpArg` argument.  `Arg<T>` is the zero-sized oparg marker
     /// ([`tyref_is_bytecode_arg_marker`]) and `OpArg` is the transparent
     /// `struct OpArg(u32)` newtype, both modeled as a plain integer (the
@@ -14752,7 +14753,7 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
             // the crate name from the TypeDecl's full name_path so the
             // `self_ty_root` keys land on a `[module::Owner, method]` CallPath.
             // Without this qualification the canonical registration loop at
-            // `lib.rs:864-902` cannot find the graph keyed by
+            // `lib.rs` cannot find the graph keyed by
             // `[qualified_owner, method]`.
             strip_crate_prefix(&td.item_meta.name_path())
         }
@@ -14900,11 +14901,11 @@ pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
         // Both free functions and impl-owned functions are collected,
         // keyed on `name_path()` — the segment vector
         // `call_target_segments` emits for a `CallKind::Fun(Regular)`
-        // (mir.rs:2186).  An impl method usually lowers to
+        // in this file.  An impl method usually lowers to
         // `CallTarget::Method` (resolved via the receiver classdef), but a
         // receiver-less associated function (`Owner::new() -> ()/bool`) and
         // any impl method reached through an `FnDef` constant fall back to
-        // `CallTarget::FunctionPath { name_path }` (mir.rs:2082, 3995),
+        // `CallTarget::FunctionPath { name_path }`,
         // whose lookup is served only by this registry — skipping impl
         // owners would leave those call sites "not registered".
         let segments: Vec<String> = fd
@@ -15259,7 +15260,7 @@ fn trait_impl_trait_path_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
 ///
 /// Returns the trait leaf so `build_semantic_program_from_llbc` can
 /// populate `SemanticFunction.trait_root` and the canonical
-/// registration loop (`lib.rs:985-1141`) can find the body without
+/// registration loop (`lib.rs`) can find the body without
 /// going through `extract_trait_impls`'s `<default methods of <T>>`
 /// pseudo-impl-type detour.
 fn trait_default_owner_for_fundecl(
@@ -16119,7 +16120,7 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 /// reference wrappers (`&T` / `&mut T` → `T`, the same contract as
 /// [`tyref_to_ast_string`]).  This is the value `OpKind::Input.class_root`
 /// carries so `derive_subject_inputcells`
-/// (`flowspace_adapter.rs:1860-1885`) can seed a `Ref` parameter with
+/// (`flowspace_adapter.rs`) can seed a `Ref` parameter with
 /// its cached struct-root `ClassDef` instead of the classdef-less
 /// `SomeInstance` shell.
 ///
@@ -16128,7 +16129,7 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 /// value as a `&W_Foo` one (upstream `SomePtr(PTRTYPE)` carries the
 /// pointee type either way).  The pointer-method answer (`is_null`)
 /// stays intact — `SomeInstance.getattr` resolves it as a bound
-/// method BEFORE projecting the classdef (`unaryop.rs:3664`), so a
+/// method BEFORE projecting the classdef (`unaryop.rs`), so a
 /// seeded classdef no longer bypasses it.
 ///
 /// Returns `None` for:
@@ -16380,7 +16381,7 @@ fn link_transparent_scalar_types(llbcs: &[Llbc]) {
 
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
 /// the zero-sized oparg marker (`pub struct Arg<T: OpArgType>
-/// (PhantomData<T>)`, instruction.rs:1262).  The external decl is
+/// (PhantomData<T>)`, instruction.rs).  The external decl is
 /// Opaque in the LLBC, so a payload row spelled through it would
 /// project to an attr the annotator cannot type; the lifted model
 /// carries the marker as a plain integer instead.  Its consumer
@@ -16566,7 +16567,7 @@ fn is_object_ref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
 /// the upstream `cast_pointer(PTRTYPE, ptr)` op (lltype.py:964).  The
 /// target class travels in the path (same `Vec<Variable>`-carrier
 /// constraint as the `simple_call(<exc class>)` raise marker,
-/// `front/exc_from_raise.rs:120-126`); the flowspace adapter rebuilds the
+/// `front/exc_from_raise.rs`); the flowspace adapter rebuilds the
 /// 2-arg upstream shape, and jtransform re-aliases the call to its
 /// operand (`rewrite_op_cast_pointer` → `same_as`,
 /// jtransform.py:254-257) so the jitcode shape stays identical to the
@@ -16985,7 +16986,7 @@ fn tyref_checked_binop_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> 
 /// implicit `_0 = ()` unit aggregate lowers to a Ref-typed
 /// transparent ctor and colors the result kind 'r', contradicting the
 /// declared void kind and tripping the codewriter cross-check
-/// (`codewriter.rs:585`).
+/// (`codewriter.rs`).
 fn is_unit_type(ty: &TyRef, llbc: &Llbc) -> bool {
     let value = match ty {
         TyRef::Inline { value: (_, v) } => v,
@@ -17059,7 +17060,7 @@ fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
 /// True when `ty`'s top-level constructor — after the dedup /
 /// hash-cons / reference indirections [`strip_ty_wrappers`] follows —
 /// is a raw pointer (`*mut` / `*const`) onto `PyObject` (the
-/// `PyObjectRef` alias, `pyobject.rs:79`).
+/// `PyObjectRef` alias, `pyobject.rs`).
 ///
 /// This is the return shape of the `W_ListObject` / `W_TupleObject`
 /// constructors (`listobject.rs w_list_new`, `tupleobject.rs
@@ -17780,7 +17781,7 @@ fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> String {
 /// unary `map_or`/`and_then`/`map` closure receives, where `payload` is the
 /// receiver `Option<X>`'s Some payload.  The extracted `call_once` body reads
 /// this tuple's `.0` via a real Charon `Tuple<X>` container (owner derived at
-/// [`Lowering::resolve_place`] mir.rs:4269 through [`tyref_tuple_suffix`]); the
+/// [`Lowering::resolve_place`] through [`tyref_tuple_suffix`]); the
 /// synthesized WRITE must derive the identical leaf so the `__pos_0` write and
 /// read key under one classdef.  Both terminate in `render_adt_type_args` →
 /// `charon_type_value_to_ast_string` (which strips `&T → T`) on the SAME
@@ -17790,7 +17791,7 @@ fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> String {
 /// or a deferred arg yields "" (bare `Tuple`, unchanged).
 fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
     // 1. pull recv_ty.Adt.generics.types[0] exactly as
-    //    tyref_option_payload_value_type does (mir.rs:7743).
+    //    tyref_option_payload_value_type does.
     let body = match recv_ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
@@ -18074,7 +18075,7 @@ const NON_ADT_OWNER_METHOD_ALLOWLIST: &[(&str, &str)] =
 /// [`Lowering::call_target_segments`] to emit
 /// `CallTarget::FunctionPath { segments: [trait_leaf, method_leaf]
 /// }`, matching the direct-path key
-/// `register_function_graph(direct_path, …)` at `lib.rs:957-969`
+/// `register_function_graph(direct_path, …)` at `lib.rs`
 /// (`extract_trait_impls`'s `<default methods of <Trait>>` branch).
 fn trait_method_owner(fd: &FunDecl) -> Option<(String, String)> {
     let segs = &fd.item_meta.name;
@@ -18201,7 +18202,7 @@ fn trait_call_label(v: &serde_json::Value) -> String {
 /// (`pyre_interpreter::frame::eval_loop_jit`); functions are named
 /// relative to their module root instead (`frame::eval_loop_jit` for a
 /// non-empty `module_path`, or the bare leaf for `module_path == ""`)
-/// so `register_function_graph_alias` (lib.rs:444) can walk
+/// so `register_function_graph_alias` (lib.rs) can walk
 /// `{bare, crate::*, pyre_interpreter::*, pyre_object::*, pyre_jit::*}`
 /// aliases off the same `func.name`.
 fn strip_crate_prefix(path: &str) -> String {
@@ -20808,7 +20809,7 @@ struct DebugEnumFmtCollapse {
 /// `Discriminant` read is an identity with no `__discriminant` field read
 /// left to scavenge; the enum's variant-name table is keyed by the enum
 /// type carried on the param (`tyref_fieldless_enum_class_root`,
-/// mir.rs:2278).  Traces the value back through the single-predecessor
+/// in this file).  Traces the value back through the single-predecessor
 /// link-arg forwarding chain to its defining `Input` op so a
 /// framestate-renamed alias of the param still resolves.  `None` when the
 /// value does not originate at a fieldless-enum-typed input (the collapse
@@ -20832,7 +20833,7 @@ fn debug_enum_disc_owner(graph: &FunctionGraph, enum_value: &Variable) -> Option
 
 /// Build `(discriminant, variant_ident)` for the fieldless enum named
 /// `owner_root`, matching the `v.name` / `discriminant_i64()` pairing the
-/// program's `enum_variant_by_discriminant` table records (mir.rs:1303).
+/// program's `enum_variant_by_discriminant` table records.
 /// `None` unless the resolved type is a fieldless enum carrying at least
 /// one integer-discriminant variant.
 fn debug_enum_variants_by_discr(llbc: &Llbc, owner_root: &str) -> Option<Vec<(i64, String)>> {
@@ -23532,7 +23533,7 @@ mod tests {
             .collect();
         // `ConstIdx` is a `#[repr(transparent)] u32` oparg wrapper, so the
         // front-end types it `Unsigned` — whose register class *is* `'int'`
-        // (`getkind(Unsigned) == 'int'`, `model.rs:16-30`), signedness being an
+        // (`getkind(Unsigned) == 'int'`, `model.rs`), signedness being an
         // rtyper-level distinction only. `Int | Unsigned` is the pairing every
         // bank-blind consumer already uses; naming the input as well keeps this
         // from being satisfied by some unrelated integer argument.
@@ -24089,7 +24090,7 @@ mod tests {
         }
     }
 
-    /// The float range in `complex_pow` (`descroperation.rs:1459`,
+    /// The float range in `complex_pow` (`descroperation.rs`,
     /// `(-100.0..=100.0)`) is out of the int-only fold's scope: the
     /// element gate rejects the `F64` type, so BOTH residual range calls
     /// survive (the graph census-Skips as before — no regression, no
@@ -26072,7 +26073,7 @@ mod tests {
     /// `type_node_shared_ref_pointee` + `adt_node_def_id` must NOT accept it;
     /// while a shared ref to a nominal `{"Adt": {"id": {"Adt": N}}}` pointee
     /// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
-    /// (mir.rs:22218 `llbc_with_trait_impls`), no real corpus.
+    /// (`llbc_with_trait_impls` in this file), no real corpus.
     #[test]
     fn shared_ref_sized_gate_accepts_adt_rejects_slice() {
         // Minimal Llbc: `type_node_shared_ref_pointee` only walks the node it

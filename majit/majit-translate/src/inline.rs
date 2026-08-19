@@ -1331,7 +1331,7 @@ pub fn can_remove_op(kind: &OpKind) -> bool {
 ///   - `and` / `or` (no trailing underscore): Rust `&&` / `||`
 ///     short-circuit operators; `flowspace.operation` does not
 ///     register them as binary operators (they are control flow),
-///     and `translator/rtyper/flowspace_adapter.rs:392-400` requires
+///     and `translator/rtyper/flowspace_adapter.rs` requires
 ///     the frontend to desugar them before reaching the rtyper.  DCE
 ///     must keep dead occurrences alive so the rtyper surfaces the
 ///     fail-loud TyperError instead of silently dropping them.  The
@@ -1371,7 +1371,7 @@ fn is_pure_binop_opname(opname: &str) -> bool {
         | "rshift"
         // Canonical PyPy bitwise binops `and_`, `or_`, and `xor`. These are the
         // trailing-underscore forms that surface after
-        // `flowspace_adapter.rs:379-381 normalize_binop_name` rewrites
+        // `flowspace_adapter.rs`'s `normalize_binop_name` rewrites
         // pyre's `bitand`/`bitor`/`bitxor`; both forms are pure so the
         // DCE whitelist accepts pre- and post-normalize names.
         | "and_"

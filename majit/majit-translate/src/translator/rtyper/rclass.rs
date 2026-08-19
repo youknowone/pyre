@@ -81,8 +81,8 @@ use crate::translator::rtyper::rtyper::{
 /// RPython equivalent: `ClassRepr.getclsfield(vcls, attr, llops)`
 /// (`rclass.py:371-377`), which appends `cast_pointer + getfield(vtable,
 /// mangled_name)` to `llops`. The full `getclsfield` is ported on
-/// [`ClassRepr`] (`rclass.rs:1096`) and on the rooted [`RootClassRepr`]
-/// (`rclass.rs:1828`); this freestanding helper stays as a
+/// [`ClassRepr`] and on the rooted [`RootClassRepr`]; this
+/// freestanding helper stays as a
 /// TODO: bridge for the pyre IR representation of
 /// vtable method slots (see the `OpKind::VtableMethodPtr` comment
 /// block in `model.rs`).
@@ -3341,8 +3341,8 @@ impl Repr for InstanceRepr {
     /// which is also unported.  For `classdef=None` (the only
     /// `InstanceRepr` flavour reaching the rtyper today, per
     /// `valuetype_to_someshell(Ref) -> SomeInstance(classdef=None)` at
-    /// `flowspace_adapter.rs:1638-1659`), the Step 6 branch is
-    /// unreachable: `RootClassRepr._setup_repr` (rclass.rs:1902) keeps
+    /// `flowspace_adapter.rs`), the Step 6 branch is
+    /// unreachable: `RootClassRepr::_setup_repr` keeps
     /// `allmethods = {}`.
     fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
         use crate::annotator::model::{SomeObjectTrait, SomeValue};
@@ -3451,7 +3451,7 @@ impl Repr for InstanceRepr {
 
         // Recover `Arc<Self>` from the rtyper repr cache so we can call
         // the `&Arc<Self>`-receiver helpers (`getfield`).  Same pattern
-        // as `convert_const` (rclass.rs:2666) which routes back through
+        // as `InstanceRepr::convert_const` which routes back through
         // `getinstancerepr`.
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
             TyperError::message("InstanceRepr.rtype_getattr: rtyper weak ref expired")
@@ -3491,7 +3491,7 @@ impl Repr for InstanceRepr {
         })?;
         let has_method = match &rclass {
             ClassReprArc::Inst(c) => c.allmethods().contains_key(&attr),
-            // `RootClassRepr.allmethods` is always empty (rclass.rs:1902).
+            // `RootClassRepr.allmethods` is always empty (`RootClassRepr::_setup_repr`).
             ClassReprArc::Root(_) => false,
         };
         if has_method {
@@ -3504,8 +3504,8 @@ impl Repr for InstanceRepr {
             //
             // `hop.r_result` upstream is the `MethodsPBCRepr` for the
             // dispatched method.  Pyre stores it as `Arc<dyn Repr>`;
-            // downcast through `Repr: Any` (rmodel.rs:332) to reach the
-            // concrete `get_method_from_instance` (rpbc.rs:6363+).
+            // downcast through `Repr: Any` (rmodel.rs) to reach the
+            // concrete `get_method_from_instance` (rpbc.rs).
             use crate::translator::rtyper::rpbc::MethodsPBCRepr;
             let r_result_arc = hop.r_result.borrow().clone().ok_or_else(|| {
                 TyperError::message("InstanceRepr.rtype_getattr: r_result missing on method branch")

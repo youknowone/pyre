@@ -18,7 +18,7 @@
 //!   mirror upstream's dynamic `log.<subname>(text)` channel.
 //!
 //! The legacy `crate::model::FunctionGraph` carries an unrelated
-//! `find_backedges` in `codewriter/policy.rs:316` keyed on a
+//! `find_backedges` in `codewriter/policy.rs` keyed on a
 //! different IR (Rust-AST `usize` block indices, not the flowspace
 //! identity-keyed model). Both ports cite the same upstream line —
 //! this file consumes the flowspace-orthodox shape needed by
@@ -508,8 +508,8 @@ pub fn find_loop_blocks(graph: &FunctionGraph) -> HashMap<BlockKey, BlockRef> {
             };
             // Upstream `link.prevblock` — pyre's Link carries the
             // backref through a `Weak<RefCell<Block>>` slot
-            // populated by `closeblock` (`model.rs:3088`,
-            // `:3122`). Upgrade to a strong ref for the BFS body.
+            // populated by `flowspace/model.rs`'s `closeblock`.
+            // Upgrade to a strong ref for the BFS body.
             let end = match l.prevblock.as_ref().and_then(|w| w.upgrade()) {
                 Some(end) => end,
                 None => continue,

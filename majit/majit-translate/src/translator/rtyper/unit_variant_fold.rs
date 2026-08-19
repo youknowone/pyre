@@ -63,7 +63,7 @@ static UNIT_VARIANT_PREBUILT_INSTANCES: LazyLock<Mutex<Vec<(String, HostObject)>
 /// (every allowlisted path is a unit-variant enum with no fields,
 /// so `reusable_prebuilt_instance()` always materialises the
 /// `OnceLock` instance — see
-/// `majit-translate/src/flowspace/model.rs:394-406`).
+/// `majit-translate/src/flowspace/model.rs`).
 pub(crate) fn intern_unit_variant_prebuilt_instance(qualname: &str) -> Option<HostObject> {
     let mut cache = UNIT_VARIANT_PREBUILT_INSTANCES
         .lock()

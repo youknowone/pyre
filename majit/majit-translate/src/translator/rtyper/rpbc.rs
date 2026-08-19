@@ -1277,7 +1277,7 @@ impl FunctionReprBase {
     // All three depend on upstream `rpython/rtyper/callparse.py` and
     // `HighLevelOp.exception_is_here()` (ExceptionData). The row-
     // selection half of `call()` is already available as the free
-    // function `select_call_family_row` (rpbc.rs:260-306); the rest
+    // function `select_call_family_row`; the rest
     // lands with the ExceptionData + callparse ports.
 }
 
@@ -1640,7 +1640,7 @@ where
     // upstream: `args = hop.spaceop.build_args(hop.args_s[1:])`.
     //
     // Pyre's analogue is `build_args_for_op(opname, args_s)` —
-    // bookkeeper.rs:2110 — which mirrors the upstream
+    // bookkeeper.rs — which mirrors the upstream
     // `CallOp.build_args` polymorphic dispatch
     // (`flowspace/operation.py:678 simple_call`,
     // `:699 call_args`).
@@ -1664,7 +1664,7 @@ where
     //            row_of_graphs = self.callfamily.calltables[shape][index]
     //            anygraph = row_of_graphs.itervalues().next()`.
     //
-    // Reuses `select_call_family_row` (rpbc.rs:277) which mirrors the
+    // Reuses `select_call_family_row` which mirrors the
     // four lines above. `op_key` is `None` because `HighLevelOp` does
     // not carry its enclosing block/graph identity — upstream caches
     // `find_row` keyed on `hop.spaceop` Python identity. The cache
@@ -1738,7 +1738,7 @@ where
         // doc on `flowspace/model.rs`). Sorted so the constant is
         // deterministic across HashMap iteration orders — order has no
         // semantic meaning at the indirect_call protocol level
-        // (`lower_indirect_calls` at rpbc.rs:319 still recovers the
+        // (`lower_indirect_calls` in this file still recovers the
         // graphs from `OpKind::Call { CallTarget::Indirect, .. }`,
         // which is the authoritative channel).
         let mut graph_ids: Vec<usize> = row
@@ -1767,7 +1767,7 @@ where
     // upstream `r is impossible_repr` is a Python identity check;
     // pyre stores the singleton `Arc<VoidRepr>` so the underlying
     // `VoidRepr` address is stable — compare via raw pointer through
-    // `&dyn Repr` (matches the pattern at `rtyper.rs:5638`
+    // `&dyn Repr` (matches the pattern at `rtyper.rs`
     // `Arc::ptr_eq`).
     let imp = impossible_repr();
     let imp_ptr = (imp.as_ref() as *const _ as *const ()) as usize;
@@ -1990,7 +1990,7 @@ impl FunctionsPBCRepr {
     /// ```
     ///
     /// Each multi-row `uniquerow` carries a unique `variant{N}` attrname
-    /// stamped in [`get_concrete_calltable`] (rpbc.rs:174-176); we
+    /// stamped in [`get_concrete_calltable`]; we
     /// surface a `TyperError::message` if attrname is `None` to catch
     /// the impossible single-row-leaks-into-multi-row case.
     fn setup_specfunc(uniquerows: &[ConcreteCallTableRowRef]) -> Result<LowLevelType, TyperError> {
@@ -2250,7 +2250,7 @@ impl Repr for FunctionsPBCRepr {
                 //
                 // TODO: pyre's parity equivalent is
                 // a fresh `_ptr` carrying [`DelayedPointer`] as the
-                // `_obj0` slot. `_ptr`'s PartialEq (lltype.rs:1048-1051)
+                // `_obj0` slot. `_ptr`'s PartialEq (lltype.rs)
                 // falls back to `_identity` for any non-Ok(Some)
                 // `_obj0`, and each `_ptr::new` allocation gets a
                 // fresh identity. The result: never-NULL,
@@ -2888,7 +2888,7 @@ impl SmallFunctionSetPBCRepr {
             //           links[-1].llexitcase = chr(i)`.
             //
             // The `chr(i)` exitcase mirrors `convert_desc`'s Char-typed
-            // ByteStr-of-length-1 encoding (lltype.rs:223 enforces
+            // ByteStr-of-length-1 encoding (lltype.rs enforces
             // `LowLevelType::Char ⇔ ConstValue::ByteStr(s) if s.len()==1`).
             //
             // `i` resolves against `self.descriptions` (NOT the local
@@ -3246,7 +3246,7 @@ impl SmallFunctionSetPBCRepr {
                  (256) — small_cand invariant violated"
             )));
         }
-        // upstream `chr(i)` — Char-typed Constant. Pyre's lltype.rs:223
+        // upstream `chr(i)` — Char-typed Constant. Pyre's lltype.rs
         // enforces `LowLevelType::Char ⇔ ConstValue::ByteStr(s) if
         // s.len()==1`, so `chr` materialises as a single-byte ByteStr.
         Ok(Constant::with_concretetype(
@@ -5614,7 +5614,7 @@ impl MethodOfFrozenPBCRepr {
         // `hop2.args_v[0].value` is the host-side bound method object;
         // `.im_self` is the receiver instance. Pyre's
         // `HostObject::BoundMethod` carries the receiver as `self_obj`
-        // (model.rs:165), exposed via `bound_method_self()`. A
+        // (`flowspace/model.rs`), exposed via `bound_method_self()`. A
         // non-`HostObject` Constant or a `HostObject` that is not a
         // bound method surfaces as a structured TyperError — upstream
         // would AttributeError on `.im_self`.
@@ -5752,7 +5752,7 @@ impl Repr for MethodOfFrozenPBCRepr {
     ///         self.rtyper.annotator.bookkeeper.getdesc(method))
     /// ```
     ///
-    /// `bookkeeper.getdesc` (bookkeeper.rs:929) recognises
+    /// `bookkeeper.getdesc` (bookkeeper.rs) recognises
     /// `HostObject::BoundMethod` and returns a
     /// `DescEntry::MethodOfFrozen` when the bound `self` is a frozen PBC
     /// (the only kind this repr accepts) — `convert_desc` then
@@ -6026,7 +6026,7 @@ impl ClassesPBCRepr {
         // Shapes outside the ported single-class / Void / no-`__init__` /
         // fieldless / numbered / unit-ctor envelope return an
         // "unimplemented operation" error so the dual-gate classifies
-        // them as known-unported (`cutover.rs:577 is_known_unported`) and
+        // them as known-unported (`cutover.rs`'s `is_known_unported`) and
         // falls back to the legacy walker — exactly the graceful skip the
         // base `Repr::rtype_simple_call` produced before this override.
         let unported = |reason: &str| -> TyperError {
@@ -7113,7 +7113,7 @@ impl MethodsPBCRepr {
     ///
     /// Called from `InstanceRepr.rtype_getattr` (rclass.py:850-854) on
     /// the method-dispatch branch. Pyre's `convertvar` lives on the
-    /// active `LowLevelOpList` (`rtyper.rs:4705`); pass it through.
+    /// active `LowLevelOpList` (`rtyper.rs`); pass it through.
     pub fn get_method_from_instance(
         &self,
         r_inst: &dyn Repr,
@@ -7321,7 +7321,7 @@ pub fn somepbc_rtyper_makerepr(
             // rpbc.py:50-52 — `getRepr = ClassesPBCRepr`. Both
             // constant (lowleveltype = Void) and non-constant
             // (lowleveltype = CLASSTYPE) arms are ported in
-            // `ClassesPBCRepr::new` (rpbc.rs:5434-5453).
+            // `ClassesPBCRepr::new`.
             Ok(
                 std::sync::Arc::new(ClassesPBCRepr::new(rtyper, s_pbc.clone())?)
                     as std::sync::Arc<dyn Repr>,
@@ -7588,9 +7588,9 @@ mod pbc_repr_tests {
         // calls `setup_specfunc()` which builds
         // `Ptr(Struct('specfunc', (attr0, fntype0), (attr1, fntype1),
         // ..., hints={'immutable': True, 'static_immutable': True}))`.
-        // pyre's port (rpbc.rs:1732 setup_specfunc) emits the same
+        // pyre's port (`setup_specfunc` in this file) emits the same
         // shape; `build_concrete_calltable` stamps each uniquerow
-        // with `variant{N}` attrnames (rpbc.rs:174-176).
+        // with `variant{N}` attrnames.
         let (r, _fd_f, _fd_g, _rtyper) = build_multi_row_functions_pbc_repr();
         assert_eq!(
             r.uniquerows.len(),
@@ -7635,7 +7635,7 @@ mod pbc_repr_tests {
             );
         }
 
-        // hints from setup_specfunc (rpbc.rs:1748-1751).
+        // hints from setup_specfunc.
         use crate::flowspace::model::ConstValue;
         assert!(
             matches!(
@@ -7858,7 +7858,7 @@ mod pbc_repr_tests {
 
     // The "mixed funcdescs" rejection branch (rpbc.py:851-853 `assert
     // len(funcdescs) == 1`) is enforced one layer up: `SomePBC::new`
-    // (annotator/model.rs:1302-1306) panics with "AnnotatorError: You
+    // (annotator/model.rs) panics with "AnnotatorError: You
     // can't mix a set of methods on a frozen PBC in RPython that are
     // different underlying functions" before the rtyper repr ever
     // sees the SomePBC. The redundant `funcdesc_set.len() != 1`

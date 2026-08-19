@@ -4,7 +4,7 @@
 //!
 //! The authoritative reference implementation is
 //! `flowspace::flowcontext::FlowContext::exc_from_raise`
-//! (`majit-translate/src/flowspace/flowcontext.rs:1189`), which is a
+//! (`majit-translate/src/flowspace/flowcontext.rs`), which is a
 //! line-by-line port of upstream `rpython/flowspace/flowcontext.py:600`:
 //!
 //! ```python
@@ -50,7 +50,7 @@
 //! reaches a jitcode. `make_bytecode_block` hands the `exceptblock`'s
 //! `inputargs` to `make_return` (`flatten.py:106-108`), whose 2-arg arm emits
 //! `-live-` + `raise self.getcolor(args[1])` and never touches `args[0]`
-//! (`flatten.py:139-143`, mirrored at `flatten.rs:781-793`). So the slot the
+//! (`flatten.py:139-143`, mirrored at `flatten.rs`). So the slot the
 //! `etype` link arg feeds has no consumer in any emitted bytecode.
 //! `set_raise_values` therefore receives `evalue` for both slots instead of a
 //! synthesised `type(evalue)` call, which would be a residual with a dead

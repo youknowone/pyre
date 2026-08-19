@@ -134,12 +134,12 @@ impl PyreFunctionEntry {
     /// specializer with no `*args` (the lookup key
     /// `Specializer::Default + flatten_star_args(no vararg) ->
     /// GraphCacheKey::None` produced by `default_specialize` at
-    /// `description.rs:1304-1351`).
+    /// `description.rs`).
     ///
-    /// `cachedgraph` (`description.rs:1037-1039`) returns the cached
+    /// `cachedgraph` (`description.rs`) returns the cached
     /// `Rc<PyGraph>` immediately when the key hits, so the
     /// `buildgraph` path that requires a real `HostCode` body
-    /// (`description.rs:1147-1169`) is skipped — pyre's synthetic
+    /// (`description.rs`) is skipped — pyre's synthetic
     /// `GraphFunc` has no `HostCode` and would fail there.
     ///
     /// The producer (a later follow-on, or a test fixture) is
@@ -817,7 +817,7 @@ impl PyreCallRegistry {
             // shapes (canonical + crate-stripped + alias).  When all
             // matches point at the same `host_object` identity
             // (`HostObject`'s `PartialEq` is Arc-pointer equality at
-            // `flowspace/model.rs:208`), the alias cluster is
+            // `flowspace/model.rs`), the alias cluster is
             // unambiguous.
             let first_host = matches[0].1.host_object.clone();
             let all_same = matches
@@ -837,7 +837,7 @@ impl PyreCallRegistry {
     ///    "no globals attached" sentinel),
     /// 2. wraps it in `HostObject::new_user_function` so
     ///    `bookkeeper.getdesc` would dispatch through the
-    ///    `is_user_function()` arm (`bookkeeper.rs:955-956`),
+    ///    `is_user_function()` arm (`bookkeeper.rs`),
     /// 3. constructs `FunctionDesc::new(bookkeeper, Some(host),
     ///    name, signature, None, None)` with pyre's authoritative
     ///    parameter signature,
@@ -925,7 +925,7 @@ impl PyreCallRegistry {
     /// Bare `get_or_register` only inserts into `bookkeeper.descs`; a
     /// caller that forgets the matching `prefill_default_cache` would
     /// register the FunctionDesc but leave the `cachedgraph` lookup at
-    /// `description.rs:1037-1039` cold, causing `pair_simple_call` to
+    /// `description.rs` cold, causing `pair_simple_call` to
     /// invoke `buildgraph` on the synthetic GraphFunc.  Upstream's
     /// equivalent path (`Bookkeeper.getdesc(pyfunc) -> FunctionDesc`)
     /// guarantees the FunctionDesc is paired with a real Python

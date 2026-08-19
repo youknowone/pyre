@@ -4376,7 +4376,7 @@ mod tests {
     }
 
     /// Dependency anchor for the typed-ref-someptr-followup epic
-    /// (`annotation_state.rs:58-88` `valuetype_to_someshell::Ref` arm).
+    /// (`annotation_state.rs` `valuetype_to_someshell::Ref` arm).
     ///
     /// `SomeInstance(classdef=None)` is the projection currently used by
     /// `valuetype_to_someshell` for every `ValueType::Ref` operand;

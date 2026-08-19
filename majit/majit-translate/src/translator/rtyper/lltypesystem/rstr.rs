@@ -481,7 +481,7 @@ pub fn ll_getnextindex() -> Result<(), TyperError> {
 /// `Array(Char)` / `Array(UniChar)` inside the `STR`/`UNICODE`
 /// GcStruct, so RPython emits `getsubstruct` (returning an interior
 /// `Ptr(Array(...))`) rather than `getfield`. Compare
-/// `rmodel.rs:1290-1306`'s `is_container_type` branch for the same
+/// `rmodel.rs`'s `is_container_type` branch for the same
 /// dispatch on the rtyper side.
 fn emit_chars_length_ops(
     startblock: &crate::flowspace::model::BlockRef,
@@ -512,7 +512,7 @@ fn emit_chars_length_ops(
 /// `getsubstruct` op's result variable carries a valid
 /// `SomePtr`-shaped annotation (upstream `lltype.py:1530+`'s
 /// `SomePtr.__init__` rejects bare container types — see
-/// `llannotation.rs:159-167`).
+/// `llannotation.rs`).
 pub(crate) fn chars_array_ptr_lltype_from_strptr(
     ptr_lltype: &LowLevelType,
 ) -> Result<LowLevelType, TyperError> {
@@ -10285,7 +10285,7 @@ mod tests {
     /// `lltypesystem/rstr.py:351-352`:
     /// `def ll_strlen(s): return len(s.chars)`.
     /// `getsubstruct` (not `getfield`) is the correct lltype op for
-    /// the inline composite `chars` field — see `rmodel.rs:1290-1306`
+    /// the inline composite `chars` field — see `rmodel.rs`
     /// `is_container_type` branch.
     #[test]
     fn build_ll_strlen_emits_getsubstruct_chars_then_getarraysize() {

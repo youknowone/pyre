@@ -1177,7 +1177,7 @@ pub enum OpKind {
         kind_char: char,
     },
     /// RPython `flowspace` `isinstance(obj, cls)` (annotator/unaryop.py +
-    /// rtyper.rs:2035 dispatch — `Repr.rtype_isinstance`). The
+    /// `rtyper.rs`'s `translate_operation` dispatch — `Repr.rtype_isinstance`). The
     /// front-end emits this op at `match` cascade sites where the
     /// variant pattern carries a payload (`TupleStruct`) and a
     /// ptr_eq-against-singleton check would be insufficient.
@@ -5207,7 +5207,7 @@ pub struct FunctionGraph {
     /// reference): RPython lifts `self` as `SomeInstance(getuniqueclassdef(im_class))`
     /// at `description.py:283-305 FunctionDesc.pycall`, then the rtyper resolves
     /// `self.<field>` against that ClassDef.  Pyre's per-graph
-    /// `derive_subject_inputcells` (`flowspace_adapter.rs:1388`) uses this field
+    /// `derive_subject_inputcells` (`flowspace_adapter.rs`) uses this field
     /// to project the receiver inputarg as `SomeInstance(Some(classdef))` instead
     /// of the abstract `SomeInstance(None)` shell that `valuetype_to_someshell(Ref)`
     /// yields when no class hint is available.  `None` for free functions and
@@ -5774,7 +5774,7 @@ impl FunctionGraph {
         // unchanged through both arms of an `if`), `getoutputargs`
         // returns it as `LinkArg::Value(cond)` — but `block` may not
         // define `cond` locally, so the Link.args would reference an
-        // undefined operand (`flowspace_adapter.rs:1324`).  Walking
+        // undefined operand (`flowspace_adapter.rs`).  Walking
         // back through the predecessor chain to add `cond` as a
         // `block.inputargs` entry restores the
         // `flowspace/flowcontext.py:407-408 setstate(block.framestate)`
@@ -6033,7 +6033,7 @@ impl FunctionGraph {
     /// `block.exitswitch.concretetype == lltype.Bool`
     /// (`flatten.py:248`) — without the unconditional `bool` wrap, a
     /// composite-pattern `match` / `if let` scrutinee of `Ref` kind
-    /// reaches `FlatOp::GotoIfNot` (`assembler.rs:559-578`), the
+    /// reaches `FlatOp::GotoIfNot` (`assembler.rs`), the
     /// hard-coded `goto_if_not/iL` opname forces the walker into the
     /// wrong register bank, and every LoadAttr/StoreAttr arm aborts with
     /// `RegisterOutOfRange` (issue #115).  Routing the cond through a
@@ -6155,12 +6155,12 @@ impl FunctionGraph {
     /// `exc_cls` is the upstream `else: Exception` default and the
     /// instance message is the fixed `"implicit Exception shouldn't
     /// occur"`.  Constants are always resolvable by the cutover adapter
-    /// (`flowspace_adapter.rs:1686 LinkArg::Const`), unlike the fresh
+    /// (`flowspace_adapter.rs`'s `LinkArg::Const`), unlike the fresh
     /// `alloc_value_var()` placeholders this previously emitted: those
     /// had no producing operation and tripped the adapter's "undefined
     /// operand as Link.args" invariant on every reachable raise block.
     /// `last_exception` / `last_exc_value` extravars are not usable here:
-    /// `checkgraph` (`flowspace/model.rs:4693-4703`) permits them only
+    /// `checkgraph` (`flowspace/model.rs`) permits them only
     /// on the exception exits of a `canraise` block, not on this
     /// unconditional single exit.
     ///

@@ -705,8 +705,8 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
     let stop_evalue = graph.alloc_value_var();
     // Derive the low-level exit case for the typed `StopIteration` link in
     // the front, exactly as `SwitchInt` (`mir.rs`) and `set_branch`
-    // (`model.rs`) do for their model-`Link`s: `flatten.rs:1155
-    // GotoIfExceptionMismatch` reads `link.llexitcase`, and the legacy
+    // (`model.rs`) do for their model-`Link`s: `flatten.rs`'s
+    // `GotoIfExceptionMismatch` reads `link.llexitcase`, and the legacy
     // walker (unlike the rtyper's `_convert_link`) never populates it, so a
     // folded `next` diamond in a graph that falls to the legacy tier would
     // otherwise reach the codewriter with an unset case.  The

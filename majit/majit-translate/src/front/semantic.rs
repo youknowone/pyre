@@ -77,7 +77,7 @@ pub struct SemanticFunction {
     pub hints: Vec<String>,
     /// RPython `graph.access_directly` (flowspace attribute set by the
     /// annotator's `default_specialize` rewrite — see
-    /// `description.rs:1333-1335` + `pygraph.rs:53-56`). Carried into
+    /// `description.rs` + `pygraph.rs`). Carried into
     /// `SemanticFunction` so `policy::look_inside_graph` can port the
     /// `policy.py:71-83` virtualizable safety gate without reaching back
     /// into the PyGraph layer.
@@ -86,7 +86,7 @@ pub struct SemanticFunction {
     /// method, the trait's name when this is a trait default-body
     /// method, otherwise `None` (free function or inherent impl).
     ///
-    /// Lets the registration loop in `lib.rs:905-1019` walk
+    /// Lets the registration loop in `lib.rs` walk
     /// `program.functions` directly and distinguish trait-impl methods
     /// (which need `register_trait_method`) from inherent methods
     /// (which need `register_function_graph`).

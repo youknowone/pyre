@@ -35,7 +35,7 @@ use crate::model::{CallTarget, FunctionGraph, OpKind};
 /// the same WTF-8 validity requirement.
 ///
 /// The payload currently arrives as a JSON string through `Value::as_str` in
-/// `front/mir.rs:18091`, so it is always valid UTF-8 and this guard cannot fire.
+/// `front/mir.rs`, so it is always valid UTF-8 and this guard cannot fire.
 /// The guard stays so that a future byte-carrying representation leaves the
 /// call symbolic and aborts the descent instead of reaching the runtime panic.
 pub fn fold_str_consts(graph: &mut FunctionGraph) {

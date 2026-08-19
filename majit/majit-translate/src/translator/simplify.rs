@@ -706,7 +706,7 @@ pub fn transform_dead_op_vars_in_blocks(
         // upstream: `op is not block.raising_op`.
         //
         // `block.raising_op` is `block.operations[-1]` when
-        // `block.canraise()` (model.rs:2426-2433), so positional
+        // `block.canraise()` (`flowspace/model.rs`), so positional
         // identity (`idx == operations.len()-1`) reproduces upstream's
         // Python object-identity check. Value equality would
         // mis-classify a structurally-identical op earlier in the
@@ -844,7 +844,7 @@ pub fn transform_dead_op_vars_in_blocks(
                     // upstream: `op is not block.raising_op` —
                     // positional identity matches upstream object
                     // identity because `raising_op` is
-                    // `operations[-1]` (model.rs:2426-2433).
+                    // `operations[-1]` (`flowspace/model.rs`'s `canraise`).
                     let is_raising = {
                         let b = block.borrow();
                         b.canraise() && i + 1 == b.operations.len()

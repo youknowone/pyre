@@ -1547,7 +1547,7 @@ mod tests {
     /// `Bookkeeper.emulated_pbc_calls`. The downstream `pbc_call` may
     /// surface an error (annotator not driving any reflow), but
     /// `emulate_pbc_call` records the unique-key entry before the
-    /// `pbc_call` invocation (bookkeeper.rs:1618 vs :1628), so the
+    /// `pbc_call` invocation (both on `bookkeeper.rs`'s `Bookkeeper`), so the
     /// side-effect is observable regardless of dispatch outcome.
     #[test]
     fn marker_jit_merge_point_dispatches_annotate_hook() {

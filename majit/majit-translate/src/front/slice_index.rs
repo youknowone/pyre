@@ -53,7 +53,7 @@
 //! ```
 //!
 //! The `getslice` operand contract (`decompose_slice_args`,
-//! `rtyper.rs:2787-2846`) selects `SliceKind::StartOnly` when args[2] (`stop`)
+//! `rtyper.rs`) selects `SliceKind::StartOnly` when args[2] (`stop`)
 //! annotates as a constant `None`; `k` (a proven-nonneg / const start) becomes
 //! args[1]. The stop operand is a fresh [`OpKind::ConstNone`] — the annotator
 //! constant `None` (`Void` `concretetype`), which folds to `SomeValue::None_`
@@ -287,7 +287,7 @@ fn rewire_one_slice_index_site(
 
     // 3. Validate the selected bounds before mutating. Both bounds must be a
     // NON-NEGATIVE CONSTANT. `decompose_slice_args`
-    //     (rtyper.rs:2809-2816) raises "slice start must be proved
+    //     (rtyper.rs) raises "slice start must be proved
     //     non-negative" for a `nonneg==false` runtime `SomeInteger` start, and
     //     a `usize` literal decodes to a bare `OpKind::ConstInt(k)` with no
     //     `Unsigned`/nonneg annotation (only its value is ≥ 0). A runtime
@@ -304,7 +304,7 @@ fn rewire_one_slice_index_site(
     //     statically unsigned but not constant, so an unsigned-only gate would
     //     not decline them. A general RangeTo stop also lacks the primary
     //     `end <= slice.len()` proof: the StartStop helper clamps an oversized
-    //     stop (`rlist.rs:3563-3576`), whereas Rust indexing panics.
+    //     stop (`rlist.rs`), whereas Rust indexing panics.
     match bounds {
         SliceIndexBounds::RangeFrom { start } => {
             if !graph_defines(graph, start) {
@@ -978,7 +978,7 @@ fn rangeto_static_length_bound_matches(
 /// `end = sub(ArrayLen(slice), 1)` is the only RangeTo shape whose stop is
 /// proven against this receiver's length, and only its unsigned form has the
 /// required wraparound semantics. `ArrayLen` and plain `sub` are the measured
-/// post-lowering forms (`front/mir.rs:14603`).
+/// post-lowering forms (`front/mir.rs`).
 fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable) -> bool {
     let Some((lhs, rhs)) = graph
         .blocks

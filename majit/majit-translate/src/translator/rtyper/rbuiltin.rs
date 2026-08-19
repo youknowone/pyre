@@ -272,7 +272,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         // `rarithmetic.r_uint` dispatches via
         // `ExtRegistryEntry::ForType::specialize_call`
         // (rarithmetic.py:579-582), routed through
-        // `BuiltinFunctionRepr::findbltintyper` (`rbuiltin.rs:444-457`)
+        // `BuiltinFunctionRepr::findbltintyper`
         // when the qualname-keyed BUILTIN_TYPER misses.  No
         // module_entries row is needed here.
         // rbuiltin.py:643-648
@@ -3470,7 +3470,7 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     // (`InstanceRepr.lowleveltype` IS `Ptr(GcStruct(OBJECT))`,
     // rclass.py:166/477).  A low-level struct param whose annotation
     // already carries a `SomeValue::Ptr` lands as `PtrRepr` directly
-    // (`rmodel.rs:2545 SomeValue::Ptr → PtrRepr`); the swap is
+    // (`rmodel.rs`'s `SomeValue::Ptr → PtrRepr`); the swap is
     // load-bearing for low-level operands that reach the typer as
     // `InstanceRepr` instead.
     //
@@ -3558,7 +3558,7 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 /// graph (RPython has no `expr as T` syntax — pyre adds it as a Rust
 /// adaptation).  The
 /// `unsimplify::split_block` Void-variable recreation
-/// (unsimplify.rs:280) and the post-rtyper backendopt pipeline
+/// (unsimplify.rs) and the post-rtyper backendopt pipeline
 /// (constfold / removenoops / storesink / inline) also generate
 /// `same_as`.  Body parity verbatim: lift the operand's repr,
 /// inputargs through that repr, emit the low-level `same_as` with

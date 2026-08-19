@@ -2172,7 +2172,7 @@ impl HostEnv {
         // `core::ptr` / `std::ptr` — Rust standard pointer utilities
         // surfaced by Charon as `core::ptr::*` dotted paths.  Pyre
         // source uses `std::ptr::null_mut()` for `pub const PY_NULL`-
-        // style declarations (`parse.rs:1407`); MIR lowering normalises
+        // style declarations (`parse.rs`); MIR lowering normalises
         // the `std::` re-export to its canonical `core::` form, so the
         // FunctionPath that reaches the flowspace adapter is
         // `["core", "ptr", "null_mut"]`.  Registering both modules
@@ -5099,7 +5099,7 @@ pub fn checkgraph(graph: &FunctionGraph) {
         // `"link[2].args[1]"`) so per-graph diagnosis can locate the
         // dangling reference without re-traversing the graph. Required
         // substring `" used before definition"` is preserved verbatim
-        // for `cutover.rs:443-444 is_known_unported`.
+        // for `cutover.rs`'s `is_known_unported`.
         let usevar = |v: &Variable,
                       in_link: Option<usize>,
                       vars: &HashMap<Variable, Option<usize>>,

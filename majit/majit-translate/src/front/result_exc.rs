@@ -16,8 +16,8 @@
 //! `ovfcheck()` idiom into an op with an implicit exception link.
 //!
 //! The residual-call ABI already performs this erasure at every host
-//! boundary (`pyre-interpreter/src/opcode_ops.rs:265
-//! bh_execute_store_subscr`: `Ok` → value, `Err` →
+//! boundary (`pyre-interpreter/src/opcode_ops.rs`'s
+//! `bh_execute_store_subscr`: `Ok` → value, `Err` →
 //! `BH_LAST_EXC_VALUE`), so jitcode-inlined graphs were the only
 //! consumers still seeing `Result` shells — built by niladic
 //! `SyntheticTransparentCtor` residuals that can never execute (a
@@ -566,7 +566,7 @@ pub(crate) fn lower_result_exc_returns(
             // `graph.set_raise_values(block, etype, evalue)`. The `etype`
             // link arg is write-only: `make_return`'s 2-arg arm emits
             // `raise <args[1]>` and never reads `args[0]`
-            // (`flatten.rs:781-793`, `flatten.py:139-143`). Pass the evalue
+            // (`flatten.rs`, `flatten.py:139-143`). Pass the evalue
             // for it — see `front::exc_from_raise`'s "etype link arg" note.
             graph.set_raise_values(block_id, v_exc.clone(), v_exc);
         } else {
@@ -2101,7 +2101,7 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
 
     // R: `goto exceptblock [etype, vb]`, i.e. the drain's `return Err(e)`.
     // The `etype` slot is write-only (`make_return` emits `raise <args[1]>`
-    // and never reads `args[0]`, `flatten.rs:781-793`), so pass `vb` rather
+    // and never reads `args[0]`, `flatten.rs`), so pass `vb` rather
     // than the int-kinded `va` — the raise operand must be the ref-kinded
     // exception value, and a second ref-kinded producer would only add a dead
     // residual to the arm a guard-failure resume walks.

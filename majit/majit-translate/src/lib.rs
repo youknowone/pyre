@@ -974,19 +974,19 @@ fn analyze_pipeline_from_module_paths(
     });
     // The rtyper synthesises a resizable-list `GcStruct("list", ("length",
     // Signed), ("items", Ptr(GcArray(ITEM))), hints={'list': True})`
-    // (`translator/rtyper/rlist.rs:1112-1124`).  Because it is synthesised by
+    // (`translator/rtyper/rlist.rs`).  Because it is synthesised by
     // the rtyper — not a Rust source type Charon extracts — it never appears
     // in `program.struct_fields`, so `fielddescrof`/`compute_struct_size`
     // return None/0 for owner "list" and any `new(descr)` keyed on it would
     // trip the `bh_size_spec_from_callcontrol().unwrap_or_else(panic!)` in
-    // `codewriter/assembler.rs:1595`.  Register the {length, items} shape here,
-    // before both the `set_struct_fields` snapshot (:1076 below) and the
-    // `struct_layouts` loop (:1140 below), so both see it.  Offsets accumulate
+    // `codewriter/assembler.rs`.  Register the {length, items} shape here,
+    // before both the `set_struct_fields` snapshot and the
+    // `struct_layouts` loop below, so both see it.  Offsets accumulate
     // by field order via `get_type_flag`: `i64`→(Signed,8) and a leading-`&`
     // spelling→(Pointer,Ref,8), giving length@0, items@8, struct size 16 — the
     // natural word-sized GcStruct layout the backend's `build_ll_newlist`
     // malloc uses (length-first, items-second, both word-sized;
-    // `rlist.rs:3444-3479`).  `.entry().or_insert_with` leaves a real "list"
+    // `rlist.rs`).  `.entry().or_insert_with` leaves a real "list"
     // entry untouched if one ever exists.  The `items` type is a bare pointer
     // spelling: the field only has to classify as `(Pointer, Ref, word)`, and
     // the real element type is inert here — it lives on the op's `item_ty`
@@ -1055,7 +1055,7 @@ fn analyze_pipeline_from_module_paths(
     // MIR does not lower.  They carry no graph (so the BFS never
     // reaches them) and their `return_types` are redundant with the
     // CFG-scan result kind (`graph_result_kind` = `getkind(FUNC.RESULT)`,
-    // `codewriter.rs:656`) — the calldescr builder reads the declared
+    // `codewriter.rs`) — the calldescr builder reads the declared
     // type only as an `i↔r` tiebreak and `debug_assert`s it against the
     // CFG kind; no impl method diverges, so omitting the side-table
     // entries is a no-op for call-descriptor typing.
@@ -1423,8 +1423,8 @@ fn analyze_pipeline_from_module_paths(
             .unwrap_or(&impl_info.for_type);
         // RPython parity: `trait_root=Some(trait_name)` for real trait impls,
         // `None` for inherent impls (impl SomeType { ... } without `for Trait`).
-        // `parse.rs:237` always writes `trait_name`; a sentinel empty string
-        // from the inherent branch (see parse.rs:357-389) needs special-casing.
+        // `parse.rs` always writes `trait_name`; a sentinel empty string
+        // from the inherent branch (see parse.rs) needs special-casing.
         let trait_root = if impl_info.trait_name.is_empty() {
             None
         } else {
@@ -1503,8 +1503,8 @@ fn analyze_pipeline_from_module_paths(
                 // is therefore `[<Trait>, <method>]`. The pseudo-type
                 // path `[<default methods of Trait>, <method>]` set by
                 // `register_trait_method` is retained so the filter logic
-                // at `call.rs:1921,1970 resolve_method*` and
-                // `lib.rs:935 push_matching_trait_methods` can continue
+                // at `call.rs`'s `resolve_method*` and
+                // `lib.rs` `push_matching_trait_methods` can continue
                 // to distinguish "trait default" from "concrete impl".
                 if is_default {
                     let direct_path = crate::parse::CallPath::from_segments([

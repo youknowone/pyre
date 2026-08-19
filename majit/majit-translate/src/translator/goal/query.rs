@@ -78,7 +78,7 @@ pub fn short_binding(ann: &RPythonAnnotator, var: &Hlvalue) -> String {
     let name = some_value_class_name(&binding);
     // Upstream `:14`: `if binding.is_constant():`. The Rust port's
     // [`SomeObjectTrait::is_constant`] is implemented on every
-    // SomeXxx variant + on [`SomeValue`] itself (`model.rs:2176`).
+    // SomeXxx variant + on [`SomeValue`] itself (`annotator/model.rs`).
     if binding.is_constant() {
         format!("const {name}")
     } else {

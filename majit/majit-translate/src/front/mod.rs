@@ -48,7 +48,7 @@
 //! `SemanticFunction` signature directly.  `tyref_to_value_type` maps
 //! `Literal::{Int,UInt}` / atom `"Bool"` / atom `"Char"` so that
 //! `usize` / `isize` arguments classify as integer rather than `Ref`,
-//! satisfying `flatten.rs:1155 "switch exitswitch must be int"` for
+//! satisfying `flatten.rs`'s `"switch exitswitch must be int"` for
 //! graphs that switch on integer-typed arguments.
 //!
 //! ## dyn-Trait / impl-Trait classification

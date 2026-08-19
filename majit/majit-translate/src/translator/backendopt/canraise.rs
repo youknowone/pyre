@@ -111,7 +111,8 @@ impl<'t> GraphAnalyzer<bool, ()> for RaiseAnalyzer<'t> {
     /// The `analyze` dispatcher passes the unwrapped `funcobj` (`_func`),
     /// which upstream calls `fnobj`. Pyre's `_func` carrier holds the
     /// upstream attribute mirror in `_func.attrs`
-    /// (`lltype.rs:690 attrs: HashMap<String, ConstValue>`); the
+    /// (the `attrs: HashMap<String, ConstValue>` field on `lltype.rs`'s
+    /// `_func`); the
     /// `canraise` slot is set by `lltype.functionptr(canraise=...)`
     /// at the same upstream site that originates the attribute on
     /// the Python `_func`. `getattr(fnobj, 'canraise', True)` returns the
@@ -450,7 +451,7 @@ mod tests {
     /// A `direct_call` op whose callee descriptor
     /// (`lltype.functionptr(..., graph=...)`) carries `callee`'s
     /// `GraphKey`, so `framework_analyze_direct_call` resolves it
-    /// through `TranslationContext.graphs` (graphanalyze.rs:308-321).
+    /// through `TranslationContext.graphs` (graphanalyze.rs).
     fn direct_call_to(callee: &GraphRef) -> SpaceOperation {
         let graph_key = Some(GraphKey::of(callee).as_usize());
         let ptr = lltype::functionptr(
@@ -519,10 +520,10 @@ mod tests {
         // A caller whose only op is a `direct_call` to a SEPARATE callee
         // graph is resolved by `RaiseAnalyzer` through `funcobj.graph` ->
         // `TranslationContext.graphs` (`framework_analyze_direct_call`,
-        // graphanalyze.rs:308-321) to the callee's actual can-raise. With
+        // graphanalyze.rs) to the callee's actual can-raise. With
         // the callee absent from `translator.graphs` the lookup misses and
         // the framework returns `top_result()` — the conservative `true`
-        // (graphanalyze.rs:318-320, bool top is `true`).
+        // (`graphanalyze.rs`'s `top_result`, bool top is `true`).
         //
         // The callee's only op is `int_add` (canraise=[]), so when the
         // callee is registered the resolved verdict is non-raising; when it

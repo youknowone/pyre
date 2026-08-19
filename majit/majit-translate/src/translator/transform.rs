@@ -419,7 +419,7 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
     block.borrow_mut().operations.truncate(n + 1);
     // upstream: `self.setbinding(block.operations[n].result,
     // annmodel.s_ImpossibleValue)`. Same mutation pattern as
-    // annrpython.rs:1846-1850.
+    // annrpython.rs.
     {
         let mut blk = block.borrow_mut();
         if let Hlvalue::Variable(v) = &mut blk.operations[n].result {

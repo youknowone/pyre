@@ -130,8 +130,8 @@ pub use crate::codewriter::AllJitCodes;
 ///   freestanding `opcode_make_function`, `opcode_call`,
 ///   `opcode_build_{list,tuple,map}`, `opcode_store_subscr`,
 ///   `opcode_list_append`, `opcode_unpack_sequence`, `opcode_load_attr`,
-///   `opcode_store_attr`. These are imported at `pyopcode.rs:6` and
-///   called directly from default trait methods (pyopcode.rs:821).
+///   `opcode_store_attr`. These are imported at `pyopcode.rs` and
+///   called directly from default trait methods (pyopcode.rs).
 ///   Before their inclusion, `analyze_multiple_pipeline_with_modules` would report
 ///   them as unresolved `direct_call` targets.
 /// - `eval` (`pyre-jit/src/eval.rs`) — portal runner `eval_loop_jit`

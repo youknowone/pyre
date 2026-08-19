@@ -444,7 +444,7 @@ fn build_gen_hash_function_graph(
 /// Resolves a `LowLevelFunction` to its `Hlvalue::Constant` carrier
 /// suitable as the first argument of a `direct_call` SpaceOperation.
 /// Mirrors the carrier construction in
-/// [`LowLevelOpList::gendirectcall`] (rtyper.rs:4561-4564) but for
+/// [`LowLevelOpList::gendirectcall`] (rtyper.rs) but for
 /// builders that emit ops directly into a synthesized graph rather
 /// than via the `LowLevelOpList` API. The graph reference is taken
 /// from `helper.graph`, dereferenced through `rtyper.getcallable` to
@@ -3196,8 +3196,8 @@ mod tests {
     ///
     /// Verified via `LowLevelOpList.llop_raising_exceptions ==
     /// Some(Removed)`. When the hop has no IndexError exceptionlink
-    /// the call is a no-op (rtyper.rs:2220 returns false on empty
-    /// exceptionlinks).
+    /// the call is a no-op (`rtyper.rs`'s `HighLevelOp::has_implicit_exception`
+    /// returns false on empty exceptionlinks).
     #[test]
     fn pair_tuple_int_rtype_getitem_closes_implicit_indexerror_channel() {
         use crate::flowspace::model::SpaceOperation;
@@ -3227,7 +3227,7 @@ mod tests {
         );
         let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
         // Build an exceptionlink whose exitcase is IndexError. The
-        // catch-Exception construction in rtyper.rs:5329-5353 (test
+        // catch-Exception construction in rtyper.rs (test
         // has_implicit_exception_records_matching_exception_link) is
         // the parity reference.
         let index_error = crate::flowspace::model::HOST_ENV
@@ -3266,7 +3266,7 @@ mod tests {
     }
 
     /// When the hop has no exceptionlinks, `has_implicit_exception`
-    /// returns false (rtyper.rs:2220-2221) and the IndexError channel
+    /// returns false (rtyper.rs) and the IndexError channel
     /// closing is skipped — `llop_raising_exceptions` stays None.
     /// This pins the no-op path of the new `has_implicit_exception`
     /// wiring on `pair_tuple_int_rtype_getitem`.

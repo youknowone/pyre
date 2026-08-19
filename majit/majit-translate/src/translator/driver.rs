@@ -450,7 +450,7 @@ pub struct TranslationDriver {
     /// Rust port mirrors with `Vec<AnnotationSpec>` — the typed
     /// dispatch shape consumed by
     /// [`crate::annotator::annrpython::RPythonAnnotator::build_types`]
-    /// at `annrpython.rs:521`.
+    /// at `annrpython.rs`.
     pub inputtypes: RefCell<Option<Vec<crate::annotator::signature::AnnotationSpec>>>,
     /// Upstream `self.policy = policy` at `:188`.
     ///
@@ -487,7 +487,7 @@ pub struct TranslationDriver {
     /// strong Python attribute; CPython's cyclic GC unwinds the
     /// `translator → annotator → translator` cycle on session exit.
     /// The local `TranslationContext.annotator` is `Weak` to avoid
-    /// the cycle (translator.rs:166), so without a separate strong
+    /// the cycle (translator.rs), so without a separate strong
     /// holder the annotator drops between `task_annotate` returning
     /// and `task_rtype_lltype` running. This field is the strong
     /// holder; `task_annotate` writes it; later tasks that upstream-
@@ -1051,7 +1051,7 @@ impl TranslationDriver {
         let resolved_inputtypes: Vec<AnnotationSpec> = inputtypes.unwrap_or_else(|| {
             // upstream: standalone fall-back. `s_list_of_strings` is
             // a `SomeList`; wrap it in `AnnotationSpec::Already` so
-            // the build_types pipeline at `annrpython.rs:534`
+            // the build_types pipeline at `annrpython.rs`
             // (`typeannotation` short-circuit) accepts it.
             vec![AnnotationSpec::Already(Box::new(SomeValue::List(
                 crate::annotator::listdef::s_list_of_strings(),
@@ -1370,7 +1370,7 @@ impl TranslationDriver {
             let _ep: HostObject = entry_point;
             // `RPythonAnnotator::build_types` already populates
             // `translator.entry_point_graph` when `main_entry_point=true`
-            // (annrpython.rs:555-557), so the explicit assignment is
+            // (annrpython.rs), so the explicit assignment is
             // already done by the call above.
             result
         } else {
@@ -1456,9 +1456,9 @@ impl TranslationDriver {
     /// ```
     ///
     /// Activated: both `TranslationContext::buildrtyper`
-    /// (`translator.rs:294`) and
+    /// (`translator.rs`) and
     /// `RPythonTyper::specialize(dont_simplify_again=true)`
-    /// (`rtyper.rs:1299`) are ported. The `'annotate'` task dep
+    /// (`rtyper.rs`) are ported. The `'annotate'` task dep
     /// guarantees the annotator slot is populated before this body
     /// runs.
     pub fn task_rtype_lltype(&self) -> Result<TaskOutput, TaskError> {
@@ -1912,7 +1912,7 @@ impl TranslationDriver {
         // `getuniquegraph` is ported on
         // [`crate::annotator::description::FunctionDesc::getuniquegraph`]
         // and the c-backend driver already calls it
-        // (`translator/backend/genc.rs:453`). The placeholder below remains
+        // (`translator/backend/genc.rs`). The placeholder below remains
         // because the `LLInterpreter::eval_graph` consumer surface
         // expects an `Rc<dyn Any>` opaque graph handle until the
         // llinterp port narrows it to `Rc<PyGraph>`.
@@ -2073,7 +2073,7 @@ impl TranslationDriver {
             // Upstream `:614`: `fork_before = self.config.translation.fork_before`.
             //
             // `fork_before` is declared as a `ChoiceOption` in
-            // `translationoption.rs:400` (upstream `translationoption.py:146-150`),
+            // `translationoption.rs` (upstream `translationoption.py:146-150`),
             // so the stored value is `OptionValue::Choice` — not `Str`.
             // The `OptionValue::None` case (upstream's `None` default)
             // skips the body, matching `if fork_before:` at upstream

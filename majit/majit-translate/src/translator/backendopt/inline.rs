@@ -141,7 +141,7 @@ impl PartialEq for CalledThing {
 ///   calling_what`.
 ///
 /// `_callable` is `Option<String>` in pyre's `_func` carrier
-/// (`rtyper/lltypesystem/lltype.rs:689`); the port matches against
+/// (`rtyper/lltypesystem/lltype.rs`); the port matches against
 /// the upstream Python callable identity by storing the qualname
 /// string and comparing for equality. Production callers today only
 /// pass `Any` or `Graph(_)`; the `CallableName` arm is provided so
@@ -551,7 +551,7 @@ pub fn static_instruction_count(graph: &GraphRef) -> f64 {
 /// ```
 ///
 /// Reads `graph.func._always_inline_` (added at
-/// `model.rs:3185` alongside `_no_release_gil_` and the other
+/// `flowspace/model.rs`'s `GraphFunc` alongside `_no_release_gil_` and the other
 /// per-function backendopt flags). `false` mirrors upstream's
 /// `getattr(..., None)` for a function that has no `func`
 /// attribute or no `_always_inline_` attribute.
@@ -685,7 +685,8 @@ pub fn inlinable_static_callers(
 /// False)` at `inline.py:563-564`.
 ///
 /// Pyre routes the upstream `funcobj._callable` indirection through
-/// the resolved `graph.func` carrier (`model.rs:3196 _dont_inline_`).
+/// the resolved `graph.func` carrier (`flowspace/model.rs`'s
+/// `GraphFunc::_dont_inline_`).
 /// The `_callable` Python attribute is conceptually the same object
 /// as the `GraphFunc` here — both wrap the user-level Python
 /// function — so reading the flag off the GraphFunc matches upstream

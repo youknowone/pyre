@@ -3,10 +3,10 @@
 //! iteration lowering for constant-step ranges (`range(n)` / `range(a,
 //! b)` / `range(a, b, k)` for constant `k != 0`), the forms
 //! `builtin_range` mints for the common call shapes
-//! (`annotator/builtin.rs:523-528`).
+//! (`annotator/builtin.rs`).
 //!
 //! A `range()` result that is never mutated annotates as a `SomeList`
-//! carrying a non-`None` `range_step` (`annotator/listdef.rs:177`); its
+//! carrying a non-`None` `range_step` (`annotator/listdef.rs`); its
 //! repr is NOT array-backed (`FixedSizeListRepr`) but an immutable
 //! `GcStruct("range", start, stop)` (`lltypesystem/rrange.py:51-57`).
 //!

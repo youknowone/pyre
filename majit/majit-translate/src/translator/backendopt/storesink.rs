@@ -239,7 +239,7 @@ fn _translate_cache(cache: &Cache, link: &LinkRef) -> Cache {
 /// (`lltype.cast_pointer` on a Constant pointer) are intentionally
 /// not lifted here. They depend on `lltype._ptr` field access and
 /// `lltype.cast_pointer`'s `_parentable` chain — both of which are
-/// TODOs in `lltype.rs:1183-1185`.
+/// TODOs in `lltype.rs`.
 /// Upstream itself notes at `:118-119` that "constfold also handles
 /// the case", so the cache-side port is complete on its own:
 /// constfold catches the constant pointer reads, storesink catches
@@ -405,7 +405,7 @@ fn clear_cache_for(
 ///
 /// Upstream guard `:97 not isinstance(arg0.value._obj, int)` excludes
 /// tagged-int pointers. Pyre's [`_ptr_obj`] enum at
-/// `lltype.rs:758-763` enumerates `Func | Struct | Array | Opaque`
+/// `lltype.rs` enumerates `Func | Struct | Array | Opaque`
 /// only — there is no `Int` variant, so a `_ptr` whose `_obj` is an
 /// `int` is structurally inhabit-impossible. The upstream guard is
 /// therefore satisfied by Rust's exhaustive match; no runtime check
@@ -485,7 +485,7 @@ fn fold_constant_cast_pointer(
 /// * `Char(c)` → `ByteStr(vec![c as u8])`. Upstream `_ptr.field`
 ///   for a `Char`-typed slot returns a Python str of length 1; the
 ///   Rust port carries Char-typed Constants as `ByteStr` (see
-///   `opimpl.rs::op_cast_int_to_char` and `rstr.rs:196` setitem).
+///   `opimpl.rs::op_cast_int_to_char` and `rstr.rs` setitem).
 /// * `UniChar(c)` → `UniStr(c.to_string())`. UniChar-typed
 ///   Constants are `UniStr` everywhere else in the port.
 /// * `Ptr` / `Address` → corresponding `LL*` carriers.
@@ -517,7 +517,7 @@ fn lowlevel_value_to_const_value(v: &LowLevelValue) -> Option<ConstValue> {
             // Upstream `_ptr.field` for a Char-typed slot is a
             // Python str of length 1. The Rust port carries
             // Char-typed Constants as `ByteStr(vec![byte])` (see
-            // `opimpl.rs:812 op_cast_int_to_char`).
+            // `opimpl.rs`'s `op_cast_int_to_char`).
             Some(ConstValue::ByteStr(vec![*c as u8]))
         }
         LowLevelValue::UniChar(c) => {

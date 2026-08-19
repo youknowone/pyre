@@ -1537,7 +1537,7 @@ mod tests {
 
     #[test]
     fn build_ll_int2dec_executes_to_decimal_strings() {
-        // Slice C: run the synthesised `ll_int2dec` helper graph
+        // Run the synthesised `ll_int2dec` helper graph
         // (`lltypesystem/rstr.rs`) end-to-end through the interpreter and read
         // the decimal string back out of the returned STR pointer. This is the
         // executing correctness gate the hex builder's shape-only test lacks —
