@@ -2330,9 +2330,21 @@ impl MiniMarkGC {
     /// resumedata and needs the PyFrame owned-content fields it omits to read
     /// null for the destructor.
     ///
+    /// Only the fallback arms take it, never the nursery bump they fall back
+    /// from. `handle_new_fixedsize` (rewrite.py:537-544) reaches this variant
+    /// on one arm only — `gen_malloc_fixedsize`, whose callee is
+    /// `do_malloc_fixedsize_clear` (gc.py:481-489, 493-499). Its other arm,
+    /// `gen_malloc_nursery`, is an inline bump with no memclear at all. What
+    /// both arms share is the `clear_gc_fields` that follows, and that zeroes
+    /// the GC-pointer fields only (rewrite.py:498-504) — so a payload byte
+    /// outside those fields is the caller's to write on either arm.
+    ///
     /// [`alloc_with_type_no_collect`](Self::alloc_with_type_no_collect) and the
     /// spill stand in for the plain `malloc_fixedsize` instead, and take
-    /// [`alloc_in_oldgen`](Self::alloc_in_oldgen) directly.
+    /// [`alloc_in_oldgen`](Self::alloc_in_oldgen) directly. On the clearing
+    /// axis only: `gct_do_malloc_fixedsize` appends no memclear, which is what
+    /// those two want. They part from it on the collection axis, where its
+    /// nursery overflow collects (incminimark.py:676-680) and they spill.
     fn alloc_in_oldgen_clear(&mut self, type_id: u32, total_size: usize) -> GcRef {
         let obj = self.alloc_in_oldgen(type_id, total_size);
         Self::raw_memclear(obj, total_size);

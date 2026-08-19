@@ -157,6 +157,16 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
         // `GcArray(Signed)` / `GcArray(Float)` bodies: no finalizer, not a
         // WEAKREF, so `gct_fv_gc_malloc` (`framework.py:820-838`) reaches
         // `malloc_fast`.
+        //
+        // The twin taken here is the non-collecting one, and that is a
+        // deviation, not a spelling: `malloc_fast` is a copy of
+        // `malloc_fixedsize` (`framework.py:366-373`), whose nursery bump
+        // reaches `collect_and_reserve` on overflow
+        // (`incminimark.py:676-680`). Collecting here would move digit blocks
+        // out from under the unboxed `RBigInt` handles the arithmetic graphs
+        // hold across their allocations, and nothing roots those, so this
+        // spills to old-gen instead. `rbigint::gc::format_recursion_safepoint`
+        // records what that costs the one caller that has paid it.
         let raw = unsafe { majit_gc::alloc_fast_nursery_typed(tid, layout.size()) }.0 as *mut u8;
         if raw.is_null() {
             return None;
