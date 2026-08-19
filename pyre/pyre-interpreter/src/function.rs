@@ -188,17 +188,20 @@ pub struct Function {
     /// over-invalidate.
     ///
     /// Behind one lazily allocated block rather than nine inline slots, because
-    /// this word is the only part a fresh `Function` must have right and a null
-    /// pointer is a state the JIT can produce.  `emit_make_function_inline`
-    /// allocates with `NewWithVtable`, and `rewrite.py:498-504 clear_gc_fields`
-    /// writes only the census's GC-pointer slots — incminimark does not
-    /// zero-fill (`gc.rs malloc_zero_filled = false`), so anything else keeps
-    /// whatever the address last held.  Upstream is safe because its
-    /// `mutate_<field>` IS a GC pointer and `clear_gc_fields` therefore covers
-    /// it; pyre's is not, so the emit stores this one word explicitly the way it
-    /// already stores `can_change_code`.  Nine inline `QuasiImmutField`s could
-    /// not be expressed that way: each is `AtomicPtr` + `parking_lot::Mutex`,
-    /// 144 bytes with no descriptor.
+    /// this word is the only part a fresh `Function` must have right.
+    /// `emit_make_function_inline` allocates with `NewWithVtable`, and
+    /// `rewrite.py:498-504 clear_gc_fields` writes only the census's GC-pointer
+    /// slots — incminimark does not zero-fill (`gc.rs malloc_zero_filled =
+    /// false`), so anything else keeps whatever the address last held.  Upstream
+    /// is safe because its `mutate_<field>` IS a GC pointer and
+    /// `clear_gc_fields` therefore covers it, and one pointer-shaped word puts
+    /// pyre on that same footing: `FUNCTION_DESCR_GROUP` declares it
+    /// `Type::Ref`, so it joins `gc_fielddescrs` and the allocation clear NULLs
+    /// it.  [`FUNCTION_GC_PTR_OFFSETS`] deliberately omits it, so the collector
+    /// — whose census is that list, not the descriptor group — never follows
+    /// the `Box` behind it.  Nine inline `QuasiImmutField`s had no such shape:
+    /// each is `AtomicPtr` + `parking_lot::Mutex`, 144 bytes with no
+    /// descriptor, and nothing initialised them.
     ///
     /// Null means no read has been recorded against this function yet, which is
     /// exactly `quasiimmut.py`'s null `mutate_<name>`: nothing folded the field,
@@ -459,8 +462,9 @@ pub const FUNCTION_W_NEW_SELF_OFFSET: usize = std::mem::offset_of!(Function, w_n
 /// Field offset of PyPy `BuiltinFunction.w_moduleobj`.
 pub const FUNCTION_W_MODULEOBJ_OFFSET: usize = std::mem::offset_of!(Function, w_moduleobj);
 /// Field offset of the `mutate_<name>` block pointer within `Function`.
-/// Not a GC pointer, so `clear_gc_fields` never reaches it and every producer of
-/// a `Function` — including `emit_make_function_inline` — must write it.
+/// Declared `Type::Ref` on `FUNCTION_DESCR_GROUP` so `clear_gc_fields` NULLs it
+/// behind a JIT allocation; absent from [`FUNCTION_GC_PTR_OFFSETS`] so the
+/// collector never follows the `Box` it addresses.
 pub const FUNCTION_MUTATE_SLOTS_OFFSET: usize = std::mem::offset_of!(Function, mutate_slots);
 
 /// GC type id assigned to `Function` at JitDriver init time. Held as

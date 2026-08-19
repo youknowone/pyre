@@ -1352,21 +1352,15 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // needs the census entry that gets it NULLed behind the allocation.
             field("w_new_self", f::FUNCTION_W_NEW_SELF_OFFSET),
             field("w_moduleobj", f::FUNCTION_W_MODULEOBJ_OFFSET),
-            // The `mutate_<name>` block pointer.  Declared `Type::Int` on
-            // purpose: it addresses a plain `Box`, not a GC object, so it must
-            // stay out of `gc_fielddescrs` — the collector would follow it as a
-            // child reference.  That also keeps it outside `clear_gc_fields`,
-            // which is why `emit_make_function_inline` stores its NULL by hand,
-            // exactly as it does for `can_change_code`.
-            (
-                "mutate_slots",
-                f::FUNCTION_MUTATE_SLOTS_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
+            // The `mutate_<name>` block pointer.  `Type::Ref` puts it in
+            // `gc_fielddescrs`, which is what `rewrite.py:498-504
+            // clear_gc_fields` walks, so a JIT-allocated function gets its NULL
+            // from the allocation clear — the same footing upstream's
+            // `mutate_<field>` sits on, that one being a real GC pointer.  The
+            // collector does NOT follow it: its census is the hand-maintained
+            // `FUNCTION_GC_PTR_OFFSETS`, which this word is deliberately absent
+            // from, so the `Box` behind it is never traced as a child.
+            field("mutate_slots", f::FUNCTION_MUTATE_SLOTS_OFFSET),
             // The inline emit can escape a guard and be materialized, so the
             // inherited Python class is a proper virtual field of this group —
             // same reasoning as the `Method` / `W_ListObject` entries.  It sits
@@ -2751,13 +2745,6 @@ pub fn function_quasi_immut_slot(index: u32) -> Option<pyre_interpreter::functio
         .iter()
         .find(|(slot_index, _)| *slot_index == index)
         .map(|(_, slot)| *slot)
-}
-
-/// The `mutate_<name>` block pointer — null until a trace records a read of one
-/// of the nine `?` fields.  Not a GC pointer and not in `gc_fielddescrs`, so an
-/// emit must write its NULL for the same reason it writes `can_change_code`.
-pub fn function_mutate_slots_descr() -> DescrRef {
-    function_field_descr(pyre_interpreter::function::FUNCTION_MUTATE_SLOTS_OFFSET)
 }
 
 /// `function.py:33 can_change_code = True` — a plain byte, so a fresh
