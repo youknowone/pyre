@@ -296,15 +296,17 @@ pub unsafe fn w_property_reinit(
     let prop = obj as *mut W_Property;
     // `rclass.py:715-718 hook_setfield` emits `jit_force_quasi_immutable`
     // ahead of every store to a `?` field, so the accessors this replaces stop
-    // being trace constants before they stop being the live values.  Nothing
-    // else revokes them: re-initialising an installed descriptor changes no
-    // type's version tag, which is the only other pin a fold over `obj.name`
-    // holds.  The `is_installed` test is `pyjitpl.py:1112`'s
-    // `mutatebox.nonnull()` — a property no loop watches pays one load.
-    if (*prop).fget != fget && (*prop).fget_watchers.is_installed() {
+    // being trace constants before they stop being the live values.  The hook
+    // precedes the store and does not consult it, so re-initialising a slot
+    // with the value it already holds invalidates as well.  Nothing else
+    // revokes them: re-initialising an installed descriptor changes no type's
+    // version tag, which is the only other pin a fold over `obj.name` holds.
+    // The `is_installed` test is `pyjitpl.py:1112`'s `mutatebox.nonnull()` — a
+    // property no loop watches pays one load.
+    if (*prop).fget_watchers.is_installed() {
         crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fget_watchers);
     }
-    if (*prop).fset != fset && (*prop).fset_watchers.is_installed() {
+    if (*prop).fset_watchers.is_installed() {
         crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fset_watchers);
     }
     (*prop).fget = fget;

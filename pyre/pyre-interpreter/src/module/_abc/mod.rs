@@ -76,7 +76,7 @@ fn weak_cache_contains(
         return Ok(false);
     };
     let probe_slot = roots.publish(&[probe]);
-    let cache = cache_attr(roots.get(cls_slot), name);
+    let cache = cache_attr(roots.get(cls_slot), name)?;
     if cache.is_null() || !unsafe { is_set(cache) } {
         return Ok(false);
     }
@@ -100,7 +100,7 @@ fn weak_cache_add(cls: PyObjectRef, name: &str, item: PyObjectRef) -> Result<(),
         return Ok(());
     };
     let entry_slot = roots.publish(&[entry]);
-    let cache = cache_attr(roots.get(cls_slot), name);
+    let cache = cache_attr(roots.get(cls_slot), name)?;
     if cache.is_null() || !unsafe { is_set(cache) } {
         return Ok(());
     }
@@ -113,10 +113,15 @@ fn weak_cache_add(cls: PyObjectRef, name: &str, item: PyObjectRef) -> Result<(),
 /// The named cache attribute of `cls`, or null when it has none.  Read fresh
 /// at every use: the walks between two reads run arbitrary Python, which can
 /// rebind the attribute and can move the set.
-fn cache_attr(cls: PyObjectRef, name: &str) -> PyObjectRef {
+///
+/// `app_abc.py:110` reads the slot as a plain attribute, so only its absence
+/// is a miss.  A metaclass hook that raises something else raises out of the
+/// check rather than being read as a class with no cache.
+fn cache_attr(cls: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     match crate::baseobjspace::getattr_str(cls, name) {
-        Ok(cache) => cache,
-        Err(_) => std::ptr::null_mut(),
+        Ok(cache) => Ok(cache),
+        Err(err) if err.kind == crate::PyErrorKind::AttributeError => Ok(std::ptr::null_mut()),
+        Err(err) => Err(err),
     }
 }
 
@@ -125,12 +130,12 @@ fn cache_attr(cls: PyObjectRef, name: &str) -> PyObjectRef {
 /// `int`, reports generation 0, which is below every counter value a
 /// registration produces — so its negative cache is discarded rather than
 /// trusted.
-fn negative_cache_version(cls: PyObjectRef) -> u64 {
-    let version = cache_attr(cls, "_abc_negative_cache_version");
+fn negative_cache_version(cls: PyObjectRef) -> Result<u64, crate::PyError> {
+    let version = cache_attr(cls, "_abc_negative_cache_version")?;
     if version.is_null() || !unsafe { is_int(version) } {
-        return 0;
+        return Ok(0);
     }
-    unsafe { w_int_get_value(version) }.max(0) as u64
+    Ok(unsafe { w_int_get_value(version) }.max(0) as u64)
 }
 
 // `_py_abc.ABCMeta.__new__` (`_py_abc.py:48`) gives every ABC its OWN
@@ -329,7 +334,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     // recorded against, so a bumped counter discards the whole cache rather
     // than trusting any entry in it.
     let counter = INVALIDATION_COUNTER.load(Ordering::Relaxed);
-    if negative_cache_version(roots.get(cls_slot)) < counter {
+    if negative_cache_version(roots.get(cls_slot))? < counter {
         let fresh = w_set_new();
         crate::baseobjspace::setattr_str(roots.get(cls_slot), "_abc_negative_cache", fresh)?;
         let version = w_int_new(counter as i64);
@@ -501,7 +506,7 @@ fn reset_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn reset_caches(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if let Some(&cls) = args.first() {
         for name in ["_abc_cache", "_abc_negative_cache"] {
-            let cache = cache_attr(cls, name);
+            let cache = cache_attr(cls, name)?;
             if !cache.is_null() && unsafe { is_set(cache) } {
                 unsafe { w_set_clear(cache) };
             }
