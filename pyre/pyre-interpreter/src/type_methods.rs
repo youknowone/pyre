@@ -851,7 +851,18 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     } else {
         w_int_new(i64::MAX)
     };
+    // An `__index__` on start/stop allocates and may move the list or the
+    // search value across a minor collection.  `w_list_find_or_count` pins
+    // both for its own `eq_w` loop, but it pins whatever address it is
+    // handed, so that scope cannot cover this window — root them here and
+    // reload after the coercion.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(list);
+    pyre_object::gc_roots::pin_root(value);
     let (start, stop) = crate::sliceobject::unwrap_start_stop_not_none(size, w_start, w_stop)?;
+    let list = pyre_object::gc_roots::shadow_stack_get(sp);
+    let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
     match crate::listobject::w_list_find_or_count(list, value, start, stop, false)? {
         crate::listobject::FindOrCountResult::Index(i) => Ok(w_int_new(i)),
         crate::listobject::FindOrCountResult::NotFound => {

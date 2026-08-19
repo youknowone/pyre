@@ -265,7 +265,16 @@ pub fn match_sequence_value(subject: PyObjectRef) -> PyObjectRef {
 /// looked up directly without re-gating (`Python/ceval.c match_keys`).
 pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let key_items = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(keys) };
-    let mut values = Vec::with_capacity(key_items.len());
+    // Every round runs `subject.get`, which is application-level Python: it
+    // can relocate the subject and each value already looked up, and it can
+    // reach a collection while the fresh set and sentinel still have no heap
+    // edge.  Hold all of them on the shadow stack and read each back at its
+    // use; the results accumulate in slots rather than in a native `Vec`,
+    // which would keep pre-move addresses.  The keys themselves are hashable,
+    // so no kind that moves reaches `key_items`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let subject_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(subject);
     // pyopcode.py:1797-1818 — a key repeated in the pattern is rejected
     // before it binds anything; track keys already looked up and raise on
     // a duplicate. Each key is looked up with `map.get(key, sentinel)`
@@ -274,12 +283,17 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     // sentinel result means the key is absent.  The sentinel is a fresh
     // `object()` (match_keys `dummy = object()`), so a value present in the
     // subject can never be mistaken for the absent marker.
-    let w_seen = pyre_object::w_set_new();
-    let w_sentinel = pyre_object::w_instance_new(crate::typedef::gettypeobject(
-        &pyre_object::pyobject::INSTANCE_TYPE,
+    let seen_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::w_set_new());
+    let sentinel_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(
+        crate::typedef::gettypeobject(&pyre_object::pyobject::INSTANCE_TYPE),
     ));
+    let values_base = pyre_object::gc_roots::shadow_stack_len();
+    let mut value_count = 0usize;
     let mut all_match = true;
     for key in key_items {
+        let w_seen = pyre_object::gc_roots::shadow_stack_get(seen_slot);
         if crate::baseobjspace::contains(w_seen, key)? {
             let key_repr = unsafe { crate::display::py_repr_wtf8(key)? };
             return Err(PyError::value_error(crate::display::wtf8_format!(
@@ -288,19 +302,33 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
                 ")"
             )));
         }
-        unsafe { pyre_object::w_set_add(w_seen, key) };
-        let w_value = crate::baseobjspace::call_method(subject, "get", &[key, w_sentinel]);
+        unsafe {
+            pyre_object::w_set_add(pyre_object::gc_roots::shadow_stack_get(seen_slot), key)
+        };
+        let w_sentinel = pyre_object::gc_roots::shadow_stack_get(sentinel_slot);
+        let w_value = crate::baseobjspace::call_method(
+            pyre_object::gc_roots::shadow_stack_get(subject_slot),
+            "get",
+            &[key, w_sentinel],
+        );
         if w_value.is_null() {
             return Err(crate::call::take_call_error()
                 .unwrap_or_else(|| PyError::type_error("mapping pattern lookup failed")));
         }
-        if crate::baseobjspace::is_w(w_value, w_sentinel) {
+        if crate::baseobjspace::is_w(
+            w_value,
+            pyre_object::gc_roots::shadow_stack_get(sentinel_slot),
+        ) {
             all_match = false;
             break;
         }
-        values.push(w_value);
+        pyre_object::gc_roots::pin_root(w_value);
+        value_count += 1;
     }
     Ok(if all_match {
+        let values: Vec<PyObjectRef> = (0..value_count)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
+            .collect();
         pyre_object::w_tuple_new(values)
     } else {
         pyre_object::w_none()
