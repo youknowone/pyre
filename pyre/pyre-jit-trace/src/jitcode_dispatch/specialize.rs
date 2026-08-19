@@ -2155,7 +2155,7 @@ fn walker_guard_specialised_pair_class<Sym: WalkSym>(
 /// The `ff` arm currently has no producer to serve. Upstream builds `Cls_ff`
 /// from `makespecialisedtuple2` (`specialisedtupleobject.py:178`) and from
 /// `specialized_zip_2_lists` (`:230`); pyre does not port the latter, and
-/// `w_tuple_new` (tupleobject.rs:174-186) sends a plain-float pair to `Cls_oo`
+/// `w_tuple_new` (`tupleobject.rs`) sends a plain-float pair to `Cls_oo`
 /// instead so that `(x, x)` keeps the exact `x` object. It is kept because it
 /// is the layout upstream reads, not because a trace reaches it today.
 #[allow(clippy::too_many_arguments)]

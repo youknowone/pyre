@@ -1175,8 +1175,8 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // address, not the discarded snapshot's.
     sym.set_live_vable_frame_addr(live_frame_addr);
     // pyjitpl.py:65 MIFrame.__init__: sym fields populated once at frame
-    // construction. Callee (inline) frames are set up by perform_call
-    // (trace_opcode.rs) and don't call init_symbolic; this path
+    // construction. Callee (inline) frames are set up by `inline_call.rs`'s
+    // `setup_call` port and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
     if let Some(ref carrier) = carrier {
@@ -4122,7 +4122,10 @@ fn run_perfn_walk<Sym: WalkSym>(
         // `LoopBearingCalleeInlineUnsupported` and
         // `AbortPermanentMarkerReached` route to the gh#467 CALL-forward
         // carrier, which resumes the OUTER frame at its CALL rather than
-        // inside the discarded callee attempt.  The nested-residual variant
+        // inside the discarded callee attempt.  Only the first of those two is
+        // named below: `AbortPermanentMarkerReached` never reaches this leg
+        // because it is absent from `leaves_complete_image`'s allow-list, which
+        // gates the `matches!` entirely.  The nested-residual variant
         // marked `blackhole_required: true` owns a complete per-frame image
         // and so passes `leaves_complete_image`, but the image it hands the
         // blackhole is not a valid forward resume for every shape that reaches

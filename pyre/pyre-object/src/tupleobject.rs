@@ -226,6 +226,13 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
         // PyPy can use `_ff` here because its object space gives plain floats
         // value identity.  Pyre follows Python 3.14 pointer identity: `(x, x)`
         // must contain the exact `x` object, not two freshly boxed copies.
+        //
+        // This interception is also the ONLY reason the `_ff` layout has no
+        // producer.  `makespecialisedtuple2` below still builds one for a
+        // plain-float pair, and this is its sole non-test caller, so deleting
+        // the branch to restore the upstream shape does not merely change a
+        // tuple's layout — it makes the walker's `ff` specialisation arm live,
+        // which documents itself as unreachable.  Retire them together.
         if unsafe { is_plain_float_strict(items[0]) && is_plain_float_strict(items[1]) } {
             return w_specialised_tuple_oo_new(items[0], items[1]);
         }

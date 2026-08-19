@@ -6616,8 +6616,9 @@ impl PyreSym {
 
     /// Initialize symbolic tracking state. Called once when the owning
     /// MetaInterpFrame is pushed (trace.rs for root frame). Callee (inline)
-    /// frames set symbolic state manually in perform_call
-    /// (trace_opcode.rs) and do NOT call this.
+    /// frames set symbolic state manually — in the walker through
+    /// `inline_call.rs`'s `setup_call` port, in the metainterp through
+    /// `pyjitpl.rs` `perform_call` — and do NOT call this.
     pub(crate) fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
         self.is_function_entry_trace = ctx.header_pc == 0;
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
@@ -14621,9 +14622,14 @@ pub(crate) fn setup_reconstructed_callee_frame(
         w_globals_const,
         ec_const,
     );
-    // `perform_call` gives every MIFrame a real recording-time frame object
-    // before `setup_call` installs its argument boxes (`pyjitpl.py:2445-2476`),
-    // and the forward-inline callee mirrors that with a GC-managed `FrameBox`
+    // `perform_call` (`pyjitpl.py:2445-2449`) is three lines — `newframe` +
+    // `setup_call` + `raise ChangeFrame` — and `newframe` (`:2455-2476`)
+    // builds an `MIFrame` and nothing else: upstream has no recording-time
+    // app-level frame to hand out here, because the app-level frame appears
+    // only as ordinary traced code when PyPy traces the interpreter's own
+    // frame construction.  pyre does not trace that construction, so the
+    // concrete `PyFrame` an inlined callee needs has to be built explicitly.
+    // The forward-inline callee does so with a GC-managed `FrameBox`
     // whose pointer is stamped onto the emitted vable
     // (`inline_call.rs:3551-3569`).  The reconstructed carrier callee needs the
     // same object: its residual calls run through
@@ -14677,10 +14683,12 @@ pub(crate) fn setup_reconstructed_callee_frame(
         drop(frame);
     }
 
-    // pyjitpl.py:2445-2476 perform_call creates a concrete frame alongside
-    // the callee MIFrame before setup_call installs its boxes. A bridge resume
-    // does the same in resume.py:1042-1057: newframe(jitcode), then
-    // consume_boxes. The emitted `frame_vable` above is the runtime half; give
+    // `perform_call` (pyjitpl.py:2445-2449) and a bridge resume
+    // (resume.py:1042-1057) both allocate the callee MIFrame and then fill its
+    // boxes — `newframe(jitcode)` + `setup_call` / `consume_boxes`. Neither
+    // allocates an app-level frame; upstream never needs to, because there the
+    // app-level frame is built by traced interpreter code. pyre has to supply
+    // it. The emitted `frame_vable` above is the runtime half; give
     // it the matching recording-time PyFrame so residuals that consume the
     // frame red can execute while tracing. Without this value the very first
     // such residual sees a symbolic-only Ref and the carrier sub-walk aborts.

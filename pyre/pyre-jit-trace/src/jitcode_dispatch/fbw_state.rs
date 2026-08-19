@@ -27,9 +27,11 @@ use super::*;
 /// per-depth fixtures later consolidated into it, so re-measure before
 /// leaning on it.
 ///
-/// A callee that raises inline below an intermediate frame is capped separately,
-/// to the top inline level by `callee_body_contains_raise`: its unwind needs the
-/// cross-frame bridge (gh#343 / gh#467) the drain cannot yet build.
+/// A callee that raises inline is capped separately — at TWO multiframe levels,
+/// keyed off `callee_body_contains_raise` — because its unwind crosses the
+/// suspended intermediate frame through the cross-frame bridge (gh#343 /
+/// gh#467); a third level regresses.  See the measurement beside
+/// `effective_multiframe_depth` in `inline_call.rs`.
 ///
 /// A self-recursive callee is bounded instead by
 /// [`fbw_inline_recursion_count`] against `max_unroll_recursion`, mirroring

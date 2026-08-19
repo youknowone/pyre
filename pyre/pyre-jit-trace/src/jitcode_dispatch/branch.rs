@@ -79,10 +79,20 @@ pub(crate) fn resolve_branch_target_through_trampoline(code: &[u8], target: usiz
 /// `assert code[pc]==op_live`: a mispositioned orgpc (e.g. `live; ref_copy;
 /// goto_if_not`, orgpc one op early) FAILS loudly rather than being walked forward.
 ///
-/// The only conditional-branch opname reaching the walk dispatch is
-/// `goto_if_not` (`goto_if_not/iL`): pyre keeps COMPARE_OP and the branch as
-/// SEPARATE JitCode ops and never emits the jtransform-fused `n_<cmp>` form on
-/// the trace/walker path, so the goto opname set is the single `"goto_if_not"`.
+/// The only conditional-branch opname in a stream this decoder reads is
+/// `goto_if_not` (`goto_if_not/iL`), so the goto opname set is the single
+/// `"goto_if_not"`. That is a fact about the STREAM, not about the walker: the
+/// walk dispatch does carry arms for the jtransform-fused `goto_if_not_<cmp>`
+/// forms, and `majit-translate`'s jtransform does mint them (`ExitSwitch::Fused`
+/// in `codewriter/jtransform.rs`), for the LLBC-lowered helper graphs. But the
+/// sole caller — [`expand_branch_carried`] — passes a `PyJitCode`, which is
+/// built per Python CodeObject by pyre's own codewriter, and that path has no
+/// producer of a fused exitswitch: pyre keeps COMPARE_OP and the branch as
+/// SEPARATE JitCode ops, so `flatten`'s tuple-exitswitch arm is reached only
+/// from its own unit test. Were one to appear anyway, the failure is a declined
+/// capture rather than a mis-decode — the `Err("notgoto")` below propagates as
+/// `NO_JITCODE_PC`, and the encode self-cert refuses to tag a word whose
+/// reconstruction fails.
 /// The `L` label operand sits at index 1 (`iL`: 1B int reg, then 2B label) —
 /// the same index the `goto_if_not/iL` handler reads `target` from — re-read
 /// here from the re-derived `goto` so the arm-select is genuinely reconstructed
@@ -227,10 +237,12 @@ pub(crate) fn branch_resume_target_stack_depth(
     // the compile-time `depth_trivia` twin, retiring the
     // `containing_py_pc_for_jitcode_pc` + runtime `skip_python_trivia_forward`
     // + static-liveness read. The twin is built for
-    // every drained real-code jitcode (codewriter.rs), and the encode census
-    // (`PYRE_M73_ENCODE_AUDIT`) proved the empty-twin fallback is never reached
-    // here (0 fallback trips / 162 programs; this reader 1181 hits, all
-    // populated). The `debug_assert` re-certifies the invariant in test builds.
+    // every drained real-code jitcode (codewriter.rs). A one-off encode census
+    // measured the empty-twin fallback as never reached here (0 fallback trips
+    // / 162 programs; this reader 1181 hits, all populated), but the gate that
+    // produced it no longer exists in the tree, so that number cannot be
+    // re-derived — the `debug_assert` below is the invariant's only live
+    // enforcement.
     debug_assert!(
         pjc.depth_trivia_populated(),
         "branch_resume_target_stack_depth on an unpopulated depth-trivia twin at target={target}"

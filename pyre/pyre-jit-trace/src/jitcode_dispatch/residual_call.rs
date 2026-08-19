@@ -5084,9 +5084,13 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
 ///     that the converged walker would route through. Production reach
 ///     today is zero — `jtransform.rs jit.force_virtual` is the only
 ///     producer and pyre's interpreter does not emit it.
-///   - `vrefs_after_residual_call` is ported on `TraceCtx` but the walker
-///     never calls it; no `jit.virtual_ref` producers exist today, so the
-///     upstream loops are empty either way. Vable forces are detected by the
+///   - `vrefs_before_residual_call` / `vrefs_after_residual_call` ARE called
+///     by the walker, under the `is_may_force` gate that mirrors
+///     `do_residual_call`'s `assembler_call or effectinfo.check_forces_...`
+///     (`pyjitpl.py:2007`). Their loops are empty in practice because no
+///     `jit.virtual_ref` producers exist today, so the observable behaviour is
+///     still "nothing happens" — but that is a fact about the vref list, not
+///     about the call sites. Vable forces are detected separately, by the
 ///     residual-call execution path's heap-token bracket.
 ///   - `direct_libffi_call` (`pyjitpl.py`) — pyre's live
 ///     tracer also returns `None` from this helper unless a

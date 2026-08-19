@@ -234,8 +234,15 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// a fold reached only from another fold — the outer fold whose `fired` count
 /// already contains it.
 ///
-/// Declared beside the counters so a fold cannot be added to the tree and go
-/// unnamed here.  `site` is `"none"` for a fold with no call site at all.
+/// Declared beside the counters so that a fold added next to an existing gated
+/// one is hard to leave unnamed.  It is NOT a complete census, and cannot
+/// become one by adding rows: this table names a fold by its function, and two
+/// shapes have no name to give.  A fold whose emit is inlined into a `match`
+/// arm has no function (`bool_box_truth_lookup`'s arm), and a fold that
+/// dispatches through a registry grows by one entry with no new call site and
+/// no new function (`try_fold_registered_symbolic_residual`).  Treat a count
+/// taken from these rows as a lower bound on the fold population, not a total.
+/// `site` is `"none"` for a fold with no call site at all.
 ///
 /// `store_attr` occupies two rows because its single call site has two firing
 /// outcomes that must not be summed: `Direct` folds the store away, while
