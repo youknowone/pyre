@@ -3,6 +3,10 @@
  * Written by scripts/cpyext-abi.py generate; do not edit by hand.
  * A declaration here is CPython's own where CPython has one, so an
  * extension's prototypes and pyre's agree by construction.
+ *
+ * An export a hand-written header renames to an inline fast path is
+ * left out: that header declares it ahead of the rename, which a
+ * declaration here would come after.
  */
 #ifndef PYRE_DECL_H
 #define PYRE_DECL_H
@@ -172,9 +176,6 @@ PyAPI_FUNC(Py_ssize_t) PyList_Size(PyObject *);
 PyAPI_FUNC(int) PyList_Sort(PyObject *);
 
 /* cpyext/lock.rs */
-PyAPI_FUNC(int) PyMutex_IsLocked(PyMutex *);
-PyAPI_FUNC(void) PyMutex_Lock(PyMutex *);
-PyAPI_FUNC(void) PyMutex_Unlock(PyMutex *);
 PyAPI_FUNC(int) PyThread_acquire_lock(PyThread_type_lock, int);
 PyAPI_FUNC(PyLockStatus) PyThread_acquire_lock_timed(PyThread_type_lock, PY_TIMEOUT_T, int);
 PyAPI_FUNC(PyThread_type_lock) PyThread_allocate_lock(void);

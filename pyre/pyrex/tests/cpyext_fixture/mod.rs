@@ -81,7 +81,13 @@ impl Fixtures {
             .arg("-I")
             .arg(&include)
             .arg("-o")
-            .arg(&extension);
+            .arg(&extension)
+            // A fixture is written against these headers and nothing else, so
+            // a warning in one is either the fixture calling an entry point
+            // wrongly or the header declaring it wrongly. Both are what these
+            // tests are for, and a compiler that only mentions them writes to a
+            // stderr this harness reads only when the compile fails.
+            .arg("-Werror");
         if cfg!(target_os = "macos") {
             cc.args(["-bundle", "-undefined", "dynamic_lookup"]);
         } else {

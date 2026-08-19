@@ -28,6 +28,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 CPYEXT = ROOT / "pyre/pyre-interpreter/src/cpyext"
 HEADER_DIR = ROOT / "include/pyre3.14t"
 RECORD = pathlib.Path(__file__).resolve().parent / "cpython-abi.txt"
+GENERATED = HEADER_DIR / "pyre_decl.h"
 
 
 # ── reading C ──────────────────────────────────────────────────────────────
@@ -234,6 +235,31 @@ def read_header_inlines():
             params = [param_type(p) for p in split_commas(match.group("params"))]
             ret = tidy(match.group("ret") + " " + match.group("stars"))
             yield path.name, match.group("name"), params or ["void"], ret
+
+
+HAND_DECLARED = re.compile(r"^PyAPI_FUNC\([^)]*\)\s*(?P<name>[A-Za-z_]\w*)\s*\(", re.M)
+RENAME = re.compile(r"^[ \t]*#[ \t]*define[ \t]+(?P<name>[A-Za-z_]\w*)[ \t(]", re.M)
+
+
+def read_renamed_exports():
+    """The exports a hand-written header declares and then renames.
+
+    `lock.h` declares `PyMutex_Lock` and follows the inline fast path with
+    `#define PyMutex_Lock _PyMutex_Lock`, so that a caller reaches the export
+    only on the contended path.  The declaration has to come before that
+    rename, and one after it would name the inline function instead -- a second
+    declaration of a `static inline` already defined, carrying an attribute it
+    did not have.  So a renamed export is declared where it is renamed, and
+    left out of the generated declarations.
+    """
+    for path in sorted(HEADER_DIR.glob("*.h")):
+        if path.name == GENERATED.name:
+            continue
+        text = strip_comments(path.read_text(errors="replace"))
+        declared = {match.group("name") for match in HAND_DECLARED.finditer(text)}
+        for match in RENAME.finditer(text):
+            if match.group("name") in declared:
+                yield match.group("name")
 
 
 STATIC = re.compile(
@@ -466,8 +492,11 @@ def check_data(record, typedefs, misspelled):
 
 def command_generate(args):
     declarations, _, _ = load_record()
+    renamed = set(read_renamed_exports())
     by_module = {}
     for module, name, params, ret in read_exports():
+        if name in renamed:
+            continue
         # CPython's own spelling wherever it has one: `check` has already
         # established the two describe the same call, and the reference
         # spelling is the one an extension's own prototypes agree with.
@@ -482,6 +511,10 @@ def command_generate(args):
         " * Written by scripts/cpyext-abi.py generate; do not edit by hand.",
         " * A declaration here is CPython's own where CPython has one, so an",
         " * extension's prototypes and pyre's agree by construction.",
+        " *",
+        " * An export a hand-written header renames to an inline fast path is",
+        " * left out: that header declares it ahead of the rename, which a",
+        " * declaration here would come after.",
         " */",
         "#ifndef PYRE_DECL_H",
         "#define PYRE_DECL_H",
@@ -499,7 +532,7 @@ def command_generate(args):
     out += ["#ifdef __cplusplus", "}", "#endif", "", "#endif /* !PYRE_DECL_H */"]
 
     text = "\n".join(out) + "\n"
-    target = HEADER_DIR / "pyre_decl.h"
+    target = GENERATED
     if args.check:
         if not target.exists() or target.read_text() != text:
             print(f"{target} is not what `generate` produces; re-run without --check")

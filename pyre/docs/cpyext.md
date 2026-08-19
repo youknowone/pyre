@@ -44,13 +44,18 @@ per `cpyext` module. `pytypedefs.h` names the shared types once so no
 declaration waits on a definition, and `audit.h` carries the variadic
 `PySys_Audit` the way CPython's own `Include/audit.h` does.
 
-`pyre_decl.h` holds every exported entry point and **is generated** by
+`pyre_decl.h` holds the exported entry points and **is generated** by
 `scripts/cpyext-abi.py` from the `#[unsafe(no_mangle)] extern "C"` functions
 themselves, so a declaration cannot drift from its implementation. It is
 included after the headers that name the types it uses and before the ones
 defining `static inline` functions that call it. `refcount.h` is the first of
 those: `Py_INCREF` expands to the `Py_IncRef` it declares, and `Py_NewRef` is an
 inline function calling that macro.
+
+The exports it leaves out are the three a header renamed. `lock.h` declares
+`PyMutex_Lock` and then, past the inline fast path, `#define`s the name onto
+it; a declaration here would come after that rename and so name the inline
+function rather than the export.
 
 The generator does not spell the declaration from the Rust signature where
 CPython has one of its own. It emits **CPython's** declaration -- `PyLongObject
@@ -120,7 +125,10 @@ the header below. `pyrex/tests/cpyext_dict_subclass.rs`,
 `pyrex/tests/cpyext_type_statics.rs`, `pyrex/tests/cpyext_runtime.rs`,
 `pyrex/tests/cpyext_small.rs`, `pyrex/tests/cpyext_locks.rs` and
 `pyrex/tests/cpyext_writer.rs` take their expectations from CPython 3.14.6
-running the same script against the same fixture.
+running the same script against the same fixture. Every fixture is compiled
+with `-Werror`: it is written against these headers and nothing else, so a
+warning in one is either the fixture calling an entry point wrongly or the
+header declaring it wrongly.
 
 - a pyre-specific Python 3.14 ABI header and extension suffix;
 - `_imp.extension_suffixes()`, `_imp.create_dynamic()` and
