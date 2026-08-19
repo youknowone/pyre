@@ -405,6 +405,17 @@ static SYS_MODULES: LazyLock<Mutex<HashMap<String, usize>>> =
 static MODULE_DICT_ROOTS: LazyLock<Mutex<std::collections::HashSet<usize>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 static SYS_MODULES_DICT: AtomicUsize = AtomicUsize::new(0);
+/// `baseobjspace.py:730` — `self.w_default_importlib_import =
+/// frozen_importlib.w_import`: the interp-level `__import__` gateway, held on
+/// the object space rather than read back out of a namespace, so a later
+/// `builtins.__import__` rebind cannot reach the importer `_handle_fromlist`
+/// is handed.  `moduledef.py:78-87 startup` puts the same object in builtins,
+/// so this cell is filled where that copy is made.
+///
+/// The wrapper is allocated in the movable nursery like any other function
+/// object, so this raw copy is forwarded by `walk_process_import_roots` for
+/// the reason `SYS_MODULES_DICT` is.
+static DEFAULT_IMPORTLIB_IMPORT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "host_env")]
 static SYS_PATH: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 /// The directory prepended to `sys.path` at startup (`config->sys_path_0`):
@@ -2760,6 +2771,29 @@ unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     }
 }
 
+/// `baseobjspace.py:730` — record the interp-level `__import__` as the space's
+/// default importer.  Called where `builtins.__import__` is bound, which is
+/// what `moduledef.py:87 startup` copies from.
+///
+/// The space captures one importer while it is being set up, so a namespace
+/// built after that keeps the first one: `install_default_builtins` also runs
+/// for a fresh builtins dict, and the module that dict belongs to is not the
+/// one every frame resolves `__import__` through.
+pub fn set_default_importlib_import(w_import: PyObjectRef) {
+    let _ = DEFAULT_IMPORTLIB_IMPORT.compare_exchange(
+        0,
+        w_import as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// `space.w_default_importlib_import`, or `None` before builtins is bound.
+fn default_importlib_import() -> Option<PyObjectRef> {
+    let w_import = DEFAULT_IMPORTLIB_IMPORT.load(Ordering::Acquire) as PyObjectRef;
+    (!w_import.is_null()).then_some(w_import)
+}
+
 /// Forward the `sys.modules` dict pointer cached in `SYS_MODULES_DICT`.
 ///
 /// The same dict object is also reachable as `sys.__dict__["modules"]`
@@ -2816,6 +2850,11 @@ pub(crate) unsafe fn walk_process_import_roots(visitor: &mut dyn FnMut(&mut PyOb
     if !dict.is_null() {
         visitor(&mut dict);
         SYS_MODULES_DICT.store(dict as usize, Ordering::Release);
+    }
+    let mut w_import = DEFAULT_IMPORTLIB_IMPORT.load(Ordering::Acquire) as PyObjectRef;
+    if !w_import.is_null() {
+        visitor(&mut w_import);
+        DEFAULT_IMPORTLIB_IMPORT.store(w_import as usize, Ordering::Release);
     }
 }
 
@@ -4515,20 +4554,18 @@ fn handle_fromlist_fast(
     };
     let bootstrap_slot = shadow_stack_len();
     pin_root(w_bootstrap);
-    let Some(w_handle) = crate::baseobjspace::findattr_result(
-        shadow_stack_get(bootstrap_slot),
-        "_handle_fromlist",
-    )?
+    let Some(w_handle) =
+        crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "_handle_fromlist")?
     else {
         return Ok(None);
     };
     let handle_slot = shadow_stack_len();
     pin_root(w_handle);
     // `space.w_default_importlib_import` is the importer `_handle_fromlist`
-    // calls for a name the package does not already carry.
-    let Some(w_import) =
-        crate::baseobjspace::findattr_result(shadow_stack_get(bootstrap_slot), "__import__")?
-    else {
+    // calls for a name the package does not already carry.  It is the space's
+    // own captured copy, so rebinding `builtins.__import__` or
+    // `_bootstrap.__import__` cannot redirect it.
+    let Some(w_import) = default_importlib_import() else {
         return Ok(None);
     };
     let import_slot = shadow_stack_len();
@@ -4610,10 +4647,9 @@ pub fn dunder_import(
                 .is_none()
             {
                 return Ok(shadow_stack_get(mod_slot));
-            } else if let Some(w_handled) = handle_fromlist_fast(
-                shadow_stack_get(mod_slot),
-                shadow_stack_get(fromlist_slot),
-            )? {
+            } else if let Some(w_handled) =
+                handle_fromlist_fast(shadow_stack_get(mod_slot), shadow_stack_get(fromlist_slot))?
+            {
                 return Ok(w_handled);
             }
         }

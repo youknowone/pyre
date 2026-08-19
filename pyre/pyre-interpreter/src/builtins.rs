@@ -3693,7 +3693,12 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2)
     });
     crate::module_ns_get_or_insert_with(ns, "__import__", || {
-        make_module_builtin_function("__import__", builtin_dunder_import)
+        // `moduledef.py:78-87 startup` — "Copy our __import__ to builtins".
+        // `baseobjspace.py:730` keeps that same object as
+        // `space.w_default_importlib_import`.
+        let w_import = make_module_builtin_function("__import__", builtin_dunder_import);
+        crate::importing::set_default_importlib_import(w_import);
+        w_import
     });
 
     // Descriptor types
