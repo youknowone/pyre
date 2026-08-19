@@ -4753,21 +4753,35 @@ impl OpcodeStepExecutor for PyFrame {
             self.push(obj);
             return Ok(());
         }
+        // `__getattribute__` allocates: the receiver is popped, so nothing but
+        // this local still reaches it, and the same collection relocates a
+        // JIT-created frame.  Pin the receiver and push onto the forwarded
+        // live frame.
+        let roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = roots.base();
+        roots.pin_root(obj);
+        let anchor = FrameAnchor::new(self);
         let attr = crate::baseobjspace::getattr_str(obj, name)?;
+        let obj = roots.get(obj_slot);
         // LOOKUP_METHOD pushes (attr, null_or_self): the resolved attribute
         // first, then the bound receiver computed by the shared, side-effect
         // free binding decision (NULL when no self should be prepended).
         let bound = compute_load_method_bound(obj, attr, name);
-        self.push(attr);
-        self.push(bound);
+        let live = unsafe { &mut *anchor.live() };
+        live.push(attr);
+        live.push(bound);
         Ok(())
     }
 
     fn load_special(&mut self, name: &str) -> Result<(), PyError> {
         let obj = self.pop();
+        // The descriptor `__get__` allocates and can relocate a JIT-created
+        // frame; push onto the forwarded live frame.
+        let anchor = FrameAnchor::new(self);
         let bound = crate::baseobjspace::load_special_resolve(obj, name)?;
-        self.push(bound);
-        self.push(PY_NULL);
+        let live = unsafe { &mut *anchor.live() };
+        live.push(bound);
+        live.push(PY_NULL);
         Ok(())
     }
 
