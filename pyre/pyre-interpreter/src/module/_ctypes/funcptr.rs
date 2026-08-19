@@ -34,6 +34,7 @@ const PTR_KEY: &str = "_ptr";
 const RESTYPE_KEY: &str = "_restype";
 const ARGTYPES_KEY: &str = "_argtypes";
 pub(super) const CALLABLE_KEY: &str = "_callable";
+const ERRCHECK_KEY: &str = "_errcheck";
 const INTERNAL_CAST_ADDR: usize = 1;
 const INTERNAL_STRING_AT_ADDR: usize = 2;
 const INTERNAL_WSTRING_AT_ADDR: usize = 3;
@@ -85,6 +86,16 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
             crate::make_builtin_function_with_arity("argtypes", argtypes_setter, 3),
             pyre_object::PY_NULL,
             "argtypes",
+        ),
+    );
+    type_ns_store(
+        ns,
+        "errcheck",
+        crate::typedef::make_getset_property_named(
+            crate::make_builtin_function_with_arity("errcheck", errcheck_getter, 2),
+            crate::make_builtin_function_with_arity("errcheck", errcheck_setter, 3),
+            crate::make_builtin_function_with_arity("errcheck", errcheck_deleter, 2),
+            "errcheck",
         ),
     );
 }
@@ -300,6 +311,33 @@ fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(pyre_object::w_none())
 }
 
+fn errcheck_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Ok(instance_get(args[1], ERRCHECK_KEY).unwrap_or_else(pyre_object::w_none))
+}
+
+/// The only thing ever done with an errcheck is calling it, so anything that
+/// cannot be called is refused — `None` included, which is why clearing one is
+/// spelled `del`.
+fn errcheck_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let value = args[2];
+    if !crate::baseobjspace::callable_w(value) {
+        return Err(crate::PyError::type_error(
+            "the errcheck attribute must be callable",
+        ));
+    }
+    instance_set(args[1], ERRCHECK_KEY, value);
+    Ok(pyre_object::w_none())
+}
+
+fn errcheck_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let d = crate::baseobjspace::getdict_native(args[1]);
+    if !d.is_null() {
+        // Deleting one that was never set is not an error.
+        unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(d, ERRCHECK_KEY) };
+    }
+    Ok(pyre_object::w_none())
+}
+
 /// Reject keyword arguments: ctypes foreign calls and `_CFuncPtr(...)` take
 /// only positional arguments, so a stray `fn(x, foo=1)` is an error rather
 /// than a silently dropped `foo`.
@@ -355,6 +393,60 @@ pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, crate::PyError> {
             Ok(Ret::Code(tc))
         }
     }
+}
+
+/// `restype._check_retval_` — the callable a return value passes through
+/// before the caller sees it.  `HRESULT` declares one so that a failed status
+/// raises `OSError` rather than being handed back as a negative number.
+fn resolve_checker(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let rt = instance_get(obj, RESTYPE_KEY)
+        .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "_restype_") })?;
+    if !unsafe { pyre_object::is_type(rt) } {
+        return None;
+    }
+    unsafe { crate::baseobjspace::lookup_in_type(rt, "_check_retval_") }
+}
+
+/// `errcheck(result, self, arguments)` — the last word on what a call returns.
+/// Handing back the argument tuple unchanged means "nothing to say"; anything
+/// else replaces the result.
+fn apply_errcheck(
+    self_obj: PyObjectRef,
+    result: PyObjectRef,
+    inargs: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(errcheck) = instance_get(self_obj, ERRCHECK_KEY) else {
+        return Ok(result);
+    };
+    // Building the argument tuple allocates, so the three values the call still
+    // needs are read back out of root slots afterwards.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for value in [self_obj, result, errcheck] {
+        pyre_object::gc_roots::pin_root(value);
+    }
+    let arguments = pyre_object::w_tuple_new(inargs.to_vec());
+    let arguments_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(arguments);
+    let value = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(arguments_slot),
+        ],
+    )?;
+    Ok(
+        if std::ptr::eq(
+            value,
+            pyre_object::gc_roots::shadow_stack_get(arguments_slot),
+        ) {
+            pyre_object::gc_roots::shadow_stack_get(base + 1)
+        } else {
+            value
+        },
+    )
 }
 
 /// Wrap a returned pointer value `p` in a fresh instance of pointer type `rt`.
@@ -653,6 +745,19 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
     let result = result?.map_err(call_error)?;
+    let value = build_return_value(ret, result)?;
+    let value = match resolve_checker(self_obj) {
+        Some(checker) => crate::call::call_function_impl_result(checker, &[value])?,
+        None => value,
+    };
+    apply_errcheck(self_obj, value, call_args)
+}
+
+/// The Python value a returned `CallValue` becomes under return type `ret`.
+fn build_return_value(
+    ret: Ret,
+    result: host_ctypes::CallValue,
+) -> Result<PyObjectRef, crate::PyError> {
     match ret {
         Ret::Pointer(rt) => {
             let p = match result {
