@@ -311,11 +311,15 @@ struct AutoFlusher {
     handles: Vec<usize>,
     /// `rweaklist.py:19 self.free_list`.
     free_list: Vec<usize>,
+    /// Marks each `rweaklist.py:17-20 initialize` of the handle table so an
+    /// allocation can detect that shutdown discarded its reserved slot.
+    generation: u64,
 }
 
 impl AutoFlusher {
     /// `rweaklist.py:17-20 initialize`.
     fn initialize(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.handles = vec![0; AUTOFLUSHER_INITIAL_SIZE];
         self.free_list = (0..AUTOFLUSHER_INITIAL_SIZE).collect();
     }
@@ -388,20 +392,39 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
     if w_iobase.is_null() {
         return w_iobase;
     }
-    let index = AUTOFLUSHER.lock().unwrap().reserve_next_handle_index();
     let _roots = pyre_object::gc_roots::push_roots();
     let target_root = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_iobase);
-    // `rweaklist.py:51-52 store_handle` — reuse the slot's box when it already
-    // holds one, so a long-lived process bounds the immortal boxes by its peak
-    // number of open streams.
-    let handle = AUTOFLUSHER.lock().unwrap().handles[index] as PyObjectRef;
-    let stored = unsafe { pyre_object::weakref::w_gc_weakref_box_retarget(handle, w_iobase) };
-    if !stored {
-        let boxed = pyre_object::weakref::w_gc_weakref_box_new(
-            pyre_object::gc_roots::shadow_stack_get(target_root),
-        );
-        AUTOFLUSHER.lock().unwrap().handles[index] = boxed as usize;
+    loop {
+        let (index, generation, handle) = {
+            let mut flusher = AUTOFLUSHER.lock().unwrap();
+            let index = flusher.reserve_next_handle_index();
+            (index, flusher.generation, flusher.handles[index])
+        };
+        // `rweaklist.py:51-52 store_handle` — reuse the slot's box when it already
+        // holds one, so a long-lived process bounds the immortal boxes by its peak
+        // number of open streams.
+        let target = pyre_object::gc_roots::shadow_stack_get(target_root);
+        let stored = unsafe {
+            pyre_object::weakref::w_gc_weakref_box_retarget(handle as PyObjectRef, target)
+        };
+        let boxed = if stored {
+            std::ptr::null_mut()
+        } else {
+            pyre_object::weakref::w_gc_weakref_box_new(pyre_object::gc_roots::shadow_stack_get(
+                target_root,
+            ))
+        };
+        let mut flusher = AUTOFLUSHER.lock().unwrap();
+        // `rweaklist.py:17-20 initialize` replaces the table, invalidating an
+        // index reserved from the previous generation.
+        if flusher.generation != generation {
+            continue;
+        }
+        if !stored {
+            flusher.handles[index] = boxed as usize;
+        }
+        break;
     }
     pyre_object::gc_roots::shadow_stack_get(target_root)
 }
@@ -414,9 +437,10 @@ pub fn flush_all_streams() {
         let handles = {
             let mut flusher = AUTOFLUSHER.lock().unwrap();
             flusher.free_list.clear();
-            // `self.initialize()` — reset the state here, so a stream created
-            // while flushing is picked up by the next round instead of being
-            // flushed twice.
+            // `rweaklist.py:17-20 initialize` resets the state here, so a
+            // stream created while flushing is picked up by the next round
+            // instead of being flushed twice.
+            flusher.generation = flusher.generation.wrapping_add(1);
             std::mem::take(&mut flusher.handles)
         };
         // `initialize` has rebound the list the walker reads, so the detached
