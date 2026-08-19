@@ -146,12 +146,8 @@ fn negative_cache_version(cls: PyObjectRef) -> Result<u64, crate::PyError> {
     Ok(unsafe { w_int_get_value(version) }.max(0) as u64)
 }
 
-// `_py_abc.ABCMeta.__new__` (`_py_abc.py:48`) gives every ABC its OWN
-// `_abc_registry`. Create it here as a per-class list so the registry is not
-// inherited: without an own entry `register`/`subclass_of` would resolve
-// `_abc_registry` up the MRO and share one base class's list across every
-// descendant ABC (e.g. Complex/Real/Rational/Integral all collapsing to a
-// single registry).
+/// `app_abc.py _abc_init` — install the three collections and the
+/// negative-cache generation, then compute `__abstractmethods__`.
 fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if let Some(&cls) = args.first() {
         // `app_abc.py:74-77` — registry and both caches are per-class for the
@@ -591,7 +587,13 @@ fn get_dump(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
-    let mut items = Vec::with_capacity(4);
+    // `app_abc.py _get_dump` builds the four-tuple as a single expression, so
+    // every `.data` it reads stays a live variable that the later reads reload.
+    // Keep the slots rather than the raw pointers: `data` is whatever
+    // `cache.data` answers, so it can be a list or a dict — the two kinds a
+    // minor collection moves — and each further `cache_attr` / `getattr_str`
+    // runs the descriptor protocol.
+    let mut data_slots = Vec::with_capacity(3);
     for name in ["_abc_registry", "_abc_cache", "_abc_negative_cache"] {
         let cache = cache_attr(roots.get(cls_slot), name)?;
         // A class that never ran `_abc_init` has nothing to describe; an empty
@@ -602,12 +604,13 @@ fn get_dump(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let cache_slot = roots.publish(&[cache]);
             crate::baseobjspace::getattr_str(roots.get(cache_slot), "data")?
         };
-        roots.publish(&[data]);
-        items.push(data);
+        data_slots.push(roots.publish(&[data]));
     }
-    items.push(w_int_new(
-        negative_cache_version(roots.get(cls_slot))? as i64
-    ));
+    // The last read that can run Python; take it before the reloads below so
+    // they answer with final addresses.
+    let version = w_int_new(negative_cache_version(roots.get(cls_slot))? as i64);
+    let mut items: Vec<PyObjectRef> = data_slots.iter().map(|&slot| roots.get(slot)).collect();
+    items.push(version);
     Ok(w_tuple_new(items))
 }
 
