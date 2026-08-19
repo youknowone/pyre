@@ -655,7 +655,7 @@ where
     // (operand bytes that happen to equal `BC_JIT_MERGE_POINT(_C)`
     // cannot trigger a false-positive payload validation).  Pre-Merge-
     // Point body-local lets and other lowerer-emitted prefix opcodes
-    // (`bind_pre_merge_point_stmts` at `jitcode_lower.rs:8987`) are
+    // (`bind_pre_merge_point_stmts` in `jitcode_lower/api.rs`) are
     // therefore irrelevant to the validator's correctness.
     let merge_offset = jc.exec.jit_merge_point_offset.unwrap_or_else(|| {
         panic!(
@@ -1712,7 +1712,7 @@ impl<S: JitState> JitDriver<S> {
         // and `blackhole.py:1764`'s walk up a blackhole chain, which without it
         // runs off the bottom of a `#[jit_interp]` frontend's chain instead of
         // stopping at its root.  Translation-side jitcodes get it from
-        // `codewriter.rs:1036`; this is the macro frontend's equivalent.
+        // `codewriter.rs`'s `make_jitcodes`; this is the macro frontend's equivalent.
         dispatch_arc.set_jitdriver_sd(portal_jd_index);
         self.meta
             .jitdriver_sd_mut(portal_jd_index)
@@ -3575,7 +3575,7 @@ impl<S: JitState> JitDriver<S> {
                                         // compile.py:1079 calls it
                                         // unconditionally. majit calls it only
                                         // when `compile_bridge` produced an
-                                        // exported state (pyjitpl.rs:11823), so
+                                        // exported state (`pyjitpl.rs`), so
                                         // without the latch the gate would stay
                                         // open on the `exported == None` edge.
                                         self.bridge_attempt_declined = true;
@@ -3983,7 +3983,8 @@ impl<S: JitState> JitDriver<S> {
                     // the FINISH descr per `exit_with_exception`.  The
                     // TraceAction::Finish arm stays as a thin wrapper that
                     // routes the pyre-dispatch-layer finish emission
-                    // (dispatch.rs:298) into the same helper, matching the
+                    // (`pyjitpl/dispatch.rs`'s `run_one_step`) into the same
+                    // helper, matching the
                     // `except SwitchToBlackhole as stb: self.aborted_tracing`
                     // shape at pyjitpl.py:2491.
                     if let Err(stb) = self.meta.compile_finish_from_active_session(
@@ -4149,7 +4150,8 @@ impl<S: JitState> JitDriver<S> {
                         None
                     };
                     if let Some(source_descr) = setup_aborted_bridge_descr {
-                        // pyjitpl.rs:9527-9532 structural-decline contract:
+                        // `pyjitpl.rs`'s `record_declined_bridge_guard`
+                        // structural-decline contract:
                         // a bridge abort before bytecode-body ops is deterministic
                         // setup failure from the fixed guard resume shape, so it
                         // must not refire. The lone GetfieldRawI case is emitted
@@ -5855,7 +5857,7 @@ impl<S: JitState> JitDriver<S> {
         // `warmstate.py:188 cell.loop_token` is the single PyPy source of
         // truth for the entry-path inputarg shape; route through
         // `warm_state.get_compiled` so this site never consults pyre's
-        // `compiled_loops` side table (the F.7-orthodox retirement target).
+        // `compiled_loops` side table (the retirement target).
         let Some(compiled) = self.meta.warm_state_ref().get_compiled(green_key) else {
             return false;
         };
@@ -7255,17 +7257,17 @@ impl<S: JitState> JitDriver<S> {
         // virtualizable()`): the live PyFrame's vable static fields and
         // array items are written from the resume data by pyre's
         // separate guard-failure recovery path
-        // (`pyre-jit/src/eval.rs:5677 sync_virtualizable_after_guard_failure`
+        // (`pyre-jit/src/eval.rs`'s `sync_virtualizable_after_guard_failure`
         // selected via `ResumeVableMode::GuardFailureSync`), which fires
         // BEFORE bridge tracing starts. The trailing
         // `synchronize_virtualizable()` call inside `rebuild_state_after_
         // failure` is therefore already satisfied by the time
         // `setup_bridge_sym` runs.  An additional direct call to
         // `ctx.synchronize_virtualizable()` cannot be wired today because
-        // `trace_ctx.rs:1417` uses `value_to_raw_bits` while
+        // `trace_ctx.rs`'s `synchronize_virtualizable` uses `value_to_raw_bits` while
         // `sync_virtualizable_after_guard_failure` uses field-aware
         // `value_to_static_vable_bits` / `value_to_vable_array_item_bits`
-        // (pyre/pyre-jit/src/eval.rs:5626-5667) — the Ref-array-slot
+        // (pyre/pyre-jit/src/eval.rs) — the Ref-array-slot
         // auto-boxing of `Value::Int` / `Value::Float` via
         // `pyre_object::intobject::w_int_new` cannot move into
         // majit-metainterp without violating the majit ⊥ pyre crate
@@ -8022,8 +8024,8 @@ impl<S: JitState> JitDriver<S> {
                     //
                     // Seed vinfo + identity on the same walk for a state-field
                     // machine, so a mid-body vable-array op resolves during
-                    // resume (see the chain-resume path above for the full
-                    // rationale). Real heap virtualizables (`token_offset > 0`)
+                    // resume (`seed_deopt_vinfo_ptr` decides which deopts get
+                    // the seed). Real heap virtualizables (`token_offset > 0`)
                     // are left untouched.
                     let sf_layout = state.state_field_layout();
                     let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
@@ -8675,7 +8677,7 @@ mod tests {
         assert_eq!(stats.loops_aborted, 0);
 
         // Warm up and start tracing. Pass a single live value so that
-        // setup_tracing (pyjitpl.rs:1186) registers one inputarg via
+        // setup_tracing (pyjitpl.rs) registers one inputarg via
         // recorder.record_input_arg — this gives the trace a valid
         // `OpRef::input_arg_int(0)` inputarg that the GuardTrue below references.
         // Without the inputarg, TraceIterator (opencoder.py:257-266)
@@ -9065,7 +9067,7 @@ mod tests {
     /// present. Both trace-start doors (`on_back_edge`, `force_start_tracing`)
     /// refuse a key whose cell `is_compiled()`, which is
     /// `get_procedure_token().is_some()` filtered on `!is_invalidated()`
-    /// (warmstate.rs:868-871 / :894-897). Invalidating the procedure token
+    /// (`warmstate.rs`'s `BaseJitCell::is_compiled`). Invalidating the procedure token
     /// clears that predicate and touches no `compiled_loops` entry, so it
     /// re-opens tracing and leaves the entry to be displaced — the same
     /// desynchronisation quasi-immut invalidation produces in production.

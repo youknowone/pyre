@@ -8,12 +8,14 @@
 //!   must not break when observed from outside the metainterp crate.
 //!
 //! Infrastructure unit tests already exist at:
-//!  - `majit-metainterp/src/pyjitpl.rs:15126`
+//!  - `majit-metainterp/src/pyjitpl.rs`
 //!    `record_result_of_call_pure_all_const_args_truncates_and_returns_const`
-//!  - `majit-metainterp/src/optimizeopt/optimizer.rs:5207`
+//!  - `majit-metainterp/src/optimizeopt/optimizer.rs`
 //!    `test_call_pure_results`
-//!  - `majit-metainterp/src/optimizeopt/pure.rs:2317,2344` extra/known result
-//!  - `majit-macros/tests/driver_test.rs:60` `#[elidable_cannot_raise]` policy byte
+//!  - `majit-metainterp/src/optimizeopt/pure.rs` `test_extra_call_pure` /
+//!    `test_known_result_call_pure_lookup`
+//!  - `majit-macros/tests/macros.rs` `test_elidable_cannot_raise_function`
+//!    `#[elidable_cannot_raise]` policy byte
 //!
 //! This file verifies that the unit tests above keep working when
 //! bundled into the same compilation unit.
@@ -33,7 +35,7 @@ fn elidable_canary_mul(x: i64, y: i64) -> i64 {
 
 #[test]
 fn elidable_canary_macro_advertises_extern_c_trampoline() {
-    // `call_policy_byte.rs:96 INT_ELIDABLE_CANNOT_RAISE = 19`.
+    // `call_policy_byte.rs`'s `INT_ELIDABLE_CANNOT_RAISE = 19`.
     // Also confirms the 4-tuple's trace_target slot points at the
     // macro-emitted `extern "C" fn(i64, i64) -> i64` wrapper — PyPy
     // `getfunctionptr` (`call.py:174`) parity.
@@ -78,7 +80,7 @@ fn elidable_canary_traces_to_call_pure_i_when_args_not_all_const() {
     // (`fn(i64, i64) -> i64`) has a Rust-ABI raw function pointer with
     // no guarantee that its calling convention matches the C ABI the
     // JIT calls through.  Only the macro wrapper carries the exact C
-    // ABI signature (`majit-macros/src/lib.rs:233-251`).
+    // ABI signature (`majit-macros/src/lib.rs`'s `emit_helper_call_target_fn`).
     let trace_fn = __majit_call_target_elidable_canary_mul;
     let func_ptr = trace_fn as *const ();
     let concrete_result = trace_fn(live_x, const_y);

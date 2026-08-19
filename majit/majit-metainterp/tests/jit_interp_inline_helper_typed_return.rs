@@ -130,8 +130,8 @@ fn wrapped_int_identity(value: i64) -> i64 {
 // Ports of the same identity helpers under the explicit cannot-raise
 // opt-in.  The function bodies are pure pass-throughs that PyPy
 // `getcalldescr` would mark `EF_CANNOT_RAISE` (`call.py:303`); pyre's
-// analyzer (`majit-translate/src/codewriter/call.rs:3250
-// effectinfo_from_writeanalyze`) computes the equivalent in the
+// analyzer (`majit-translate/src/codewriter/call.rs`'s
+// `effectinfo_from_writeanalyze`) computes the equivalent in the
 // codewriter pipeline but is not yet plumbed to runtime trace
 // recording, so users opt in via
 // `#[dont_look_inside_cannot_raise]` until the wire-up lands.
@@ -541,9 +541,10 @@ fn wrapped_helpers_advertise_supported_inferred_policy_bytes() {
 
 #[test]
 fn dont_look_inside_cannot_raise_emits_dedicated_policy_bytes() {
-    // Item 4-5 fix: `#[dont_look_inside_cannot_raise]` opt-in maps to
+    // `#[dont_look_inside_cannot_raise]` opt-in maps to
     // distinct policy bytes per result kind so the inferred slot lookup
-    // (`jitcode_lower.rs:1711` via `byte 28u8|29u8|30u8 -> CannotRaise`)
+    // (`jitcode_lower/lowerer.rs`'s `call_target_registration_tokens`,
+    // via `byte 28u8|29u8|30u8 -> CannotRaise`)
     // can produce `cannot_raise_effect_info()` calldescrs and skip the
     // trailing `-live-` marker that the audit cited as parity-divergent
     // for `dont_look_inside` ref helpers.

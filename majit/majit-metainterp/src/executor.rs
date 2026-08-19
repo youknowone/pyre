@@ -21,10 +21,11 @@ use majit_ir::{OpCode, OpRef};
 /// / `dispatch::call_void_function` using the concrete values carried
 /// alongside each typed argbox.  The Float arm shares the i64-return
 /// ABI: helper concrete pointers built by `#[jit_module]` pre-pack the
-/// f64 result via `f64::to_bits` (majit-macros/src/lib.rs:194), and
+/// f64 result via `f64::to_bits` (majit-macros/src/lib.rs
+/// `helper_return_to_i64`), and
 /// callers recover the f64 with `f64::from_bits(resvalue as u64)`
-/// (pyjitpl.rs:8901-8902) — bit-identical to the BC_CALL_FLOAT
-/// family in blackhole.rs:2349-2371 which uses the same convention.
+/// (pyjitpl.rs `miframe_execute_varargs`) — bit-identical to the
+/// BC_CALL_FLOAT family in blackhole.rs which uses the same convention.
 /// `argboxes[0]` is the funcbox (carrying the function pointer in its
 /// `i64` slot) and the remaining slots are the typed call arguments.
 ///
@@ -251,7 +252,8 @@ pub fn execute_varargs<M: Clone>(
     // post-execute hook copies it).  Pyre has no separate cpu; we use
     // the `BH_LAST_EXC_VALUE` thread-local that production helpers
     // (`bh_call_fn_impl` etc.) publish on, mirroring the same convention
-    // every blackhole.rs CALL_* arm uses (blackhole.rs:2270-2392).
+    // every blackhole.rs CALL_* arm uses (its `handler_residual_call_*`
+    // family and their shared `check_residual_call_exception_after`).
     // Clear before dispatch so a stale value from a prior call cannot
     // bleed into this one.
     crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -327,12 +329,12 @@ pub fn execute_varargs<M: Clone>(
                 // Caller-contract: every path that reaches this arm carries
                 // `funcbox.2` as a hand-written or `#[jit_module]`-generated
                 // function pointer with i64-return ABI:
-                //   * `do_recursive_call` (mod.rs:11148-11152) sets funcbox.2
+                //   * `do_recursive_call` (`pyjitpl.rs`) sets funcbox.2
                 //     to `targetjitdriver_sd.portal_runner_adr`.  Pyre's
                 //     portal entry is `bh_portal_runner(all_i, all_r, all_f)
-                //     -> i64` (pyre-jit/src/call_jit.rs:467); it never
+                //     -> i64` (pyre-jit/src/call_jit.rs); it never
                 //     declares an f64 return.
-                //   * `#[jit_module]` (majit-macros/src/lib.rs:267) emits a
+                //   * `#[jit_module]` (majit-macros/src/lib.rs) emits a
                 //     Float helper's `concrete_ptr` as `extern "C" fn(...)
                 //     -> i64` with the f64 result pre-packed via
                 //     `f64::to_bits`; the f64-ABI `trace_ptr` is consumed
@@ -341,7 +343,7 @@ pub fn execute_varargs<M: Clone>(
                 //     this arm.
                 // Therefore route through `call_int_function` and let the
                 // caller recover the f64 via `f64::from_bits` when needed
-                // — bit-identical to blackhole.rs:2349-2371 BC_CALL_FLOAT
+                // — bit-identical to the blackhole.rs BC_CALL_FLOAT
                 // family which makes the same ABI choice for the same
                 // reason (`registers_f` is an i64-carrier mirroring
                 // RPython's `longlong.ZEROF` packing).
@@ -360,7 +362,7 @@ pub fn execute_varargs<M: Clone>(
     //      `handle_possible_exception` treat the new exception's
     //      class as constant (pyjitpl.py:2745-2755).
     //   2. Override the returned value with the type's neutral zero —
-    //      `make_result_of_lastop` (pyjitpl.rs:8893) snapshots the
+    //      `make_result_of_lastop` (`pyjitpl/frame.rs`) snapshots the
     //      concrete result *before* `handle_possible_exception` runs,
     //      so leaving the helper's return value in place can pin a
     //      garbage value into the resume snapshot.  `i64 == 0` covers
@@ -750,7 +752,7 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
             // lowers to `lltype.cast_float_to_int` (C `(long)f`) post-
             // translation. Skip fold on non-finite or out-of-range
             // floats: the runtime path's `as i64` saturates (lenient
-            // IEEE policy, see runtime arm at executor.rs:329) but
+            // IEEE policy, see `blackhole.rs`'s `bhimpl_cast_float_to_int`) but
             // trace-time fold would freeze that saturation as a
             // constant — emit the cast op instead so the runtime
             // computes consistently. The safe i64 window is
@@ -838,7 +840,7 @@ pub fn execute_pure_call(
         // executor.py:66-68 `if rettype == FLOAT: cpu.bh_call_f(...)`.  The
         // funcbox reaching this seam is always the callee's own address —
         // `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)`
-        // (`jitcode/assembler.rs:4633`), which is what pyre's codewriter
+        // (`jitcode/assembler.rs`), which is what pyre's codewriter
         // registers, and the LLBC path bakes a plain `ConstInt` fnaddr that
         // mints no `JitCallTarget` at all.  So the f64 comes back in the
         // floating-point return register, exactly as the blackhole
@@ -847,7 +849,7 @@ pub fn execute_pure_call(
         //
         // The `f64::to_bits`-packing `_concrete` wrapper the helper policy
         // attributes emit for a Float helper (`emit_helper_call_target_fn`,
-        // `majit-macros/src/lib.rs:605-614`) reaches a residual call only
+        // `majit-macros/src/lib.rs`) reaches a residual call only
         // through the explicit `*_float_wrapped` call policies, which no crate
         // declares.  The CALL_ASSEMBLER arms are a separate opcode family and
         // keep `call_int_function` for their own i64-returning `call_assembler`

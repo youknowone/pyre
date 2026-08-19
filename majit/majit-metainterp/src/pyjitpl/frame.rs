@@ -1216,7 +1216,7 @@ mod tests {
         assert_eq!(frame.float_values[0], Some(300));
     }
 
-    /// Step 1b: `MIFrame::get_list_of_active_boxes` (non-in_a_call
+    /// `MIFrame::get_list_of_active_boxes` (non-in_a_call
     /// path) pushes live int / ref / float registers onto the trace's
     /// `_snapshot_array_data` in declaration order, returning the
     /// `new_array` offset. Tests with `after_residual_call=true` so the

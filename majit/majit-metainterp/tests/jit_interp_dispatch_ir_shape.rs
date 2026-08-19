@@ -634,7 +634,8 @@ fn register_dispatch_jitcode_stores_singleton() {
     // (`warmspot.py:660-666 make_args_specification` parity), so the
     // schema must be declared first — same lifecycle as the macro-
     // generated install path (`#declare_schema_fn_name(driver)` runs
-    // before `ensure_descriptor_registered` in `codegen_state.rs:719`).
+    // before `ensure_descriptor_registered` in `codegen_state.rs`'s
+    // `generate_state_fields_jit_state`).
     __declare_jit_schema_dispatch_minimal(&mut driver);
 
     let dispatch_jc = build_dispatch_minimal();
@@ -733,12 +734,13 @@ mod oparg_minimal {
     /// Pyre's `#[majit_macros::dont_look_inside]` attribute lowers a
     /// statement-form free-fn call to `BC_RESIDUAL_CALL_R_V` with
     /// `DEFAULT_EFFECT_INFO` (saturated read/write descrs +
-    /// `EF_CAN_RAISE` per `assembler.rs:1652-1671 +
-    /// call_descr.rs::DEFAULT_EFFECT_INFO`), matching plan v1 codex
+    /// `EF_CAN_RAISE` per `assembler.rs`'s
+    /// `residual_call_void_canonical_via_target_with_effect_info` +
+    /// `call_descr.rs::DEFAULT_EFFECT_INFO`), matching plan v1 codex
     /// BLOCKER 2's required effect class for a side-effecting +
     /// can-raise hook.
     ///
-    /// No args → `assembler.rs:1748-1769` auto-selection picks the R
+    /// No args → `assembler.rs`'s `emit_canonical_call_void` auto-selection picks the R
     /// variant (no float / no int args → `BC_RESIDUAL_CALL_R_V`); the
     /// ref-list count byte is `0`. Pre-A.2.5 codex review BLOCKER 3
     /// (Ref-binding requirement) is satisfied by the no-args choice
@@ -758,7 +760,7 @@ mod oparg_minimal {
         let mut driver: JitDriver<OpargState> = JitDriver::new(threshold);
         let mut pc: usize = 0;
         // `can_enter_jit!()` rewrites to a runtime call that updates
-        // `stacksize` after a back_edge close (mod.rs:1531
+        // `stacksize` after a back_edge close (`mod.rs`'s `rewrite_body`
         // `#stacksize_expr = 0i32;`).  All examples that wire
         // `can_enter_jit!()` declare `let mut stacksize: i32 = 0;` in the
         // function scope; the OP_JUMP_BACK arm below requires the same.
@@ -802,7 +804,8 @@ mod oparg_minimal {
                 // `if jumpto >= next_instr: return jumpto` early-out
                 // mirror) is kept on the runtime-side path via
                 // `transform_function`'s `rewrite_body` substitution
-                // (`mod.rs:1535 driver.back_edge_structured(...)`); the
+                // (`mod.rs`'s `rewrite_body`, emitting
+                // `driver.back_edge_structured(...)`); the
                 // dispatch JitCode lowerer cannot yet lower `if`+`continue`
                 // inside arm bodies (lowerer not yet ported), so the
                 // fixture body is reduced to the macro call alone — that
@@ -924,8 +927,9 @@ mod oparg_minimal {
     /// lower to a single `BC_STORE_STATE_FIELD` op emitted in the
     /// prelude position — between the JIT merge-point markers and the
     /// opcode fetch. The existing `state_fields` macro lowering
-    /// (`majit-macros/src/jit_interp/jitcode_lower.rs:1429`,
-    /// `assembler.rs:345`, `dispatch.rs:1233`) already emits the op;
+    /// (`jitcode_lower/lower_vable.rs`'s `lower_state_field_write`,
+    /// `jitcode/assembler.rs`'s `store_state_field`, `pyjitpl/dispatch.rs`'s
+    /// `run_one_step`) already emits the op;
     /// This test pins position and
     /// count so a future refactor cannot silently drop the store or
     /// reorder it across the opcode fetch.
@@ -974,7 +978,8 @@ mod oparg_minimal {
 
     /// A.2.5.b: the `bytecode_only_trace_helper()` call (RPython
     /// `pyopcode.py:174 ec.bytecode_only_trace(self)` JIT branch) must
-    /// lower to `BC_RESIDUAL_CALL_R_V` per `assembler.rs:1748-1769`
+    /// lower to `BC_RESIDUAL_CALL_R_V` per `assembler.rs`'s
+    /// `emit_canonical_call_void`
     /// auto-selection (no float / no int args → R variant with
     /// `ref_count = 0`). Position: between the `BC_STORE_STATE_FIELD`
     /// for `state.last_instr` (L172) and the first `BC_GETARRAYITEM_GC_I`
@@ -1154,7 +1159,7 @@ mod oparg_minimal {
     /// path early-returns at `interp_jit.py:104 if jumpto >= next_instr:
     /// return jumpto`).  Pyre's parity is achieved by recognising
     /// `can_enter_jit!(...)` as a `Stmt::Macro` inside `Lowerer::lower_stmt`
-    /// (`jitcode_lower.rs:1970-2008`) and emitting the LH op INSIDE the
+    /// (`jitcode_lower/lower_stmt.rs`) and emitting the LH op INSIDE the
     /// arm body sub-JitCode at that exact stmt position.  No post-INLINE_CALL
     /// emission appears at the dispatch-JitCode level — that would over-emit
     /// on every arm execution including forward-progress arms.
@@ -2126,7 +2131,7 @@ mod oparg_with_body_local_method_call_green {
     }
 
     impl MockProgram {
-        /// Mirror of `ahsembler::Program::get_req_size` (`compiler.rs:28`)
+        /// Mirror of `ahsembler::Program::get_req_size` (`compiler.rs`)
         /// but without the `OP_REQSIZE` lookup table — the body is
         /// irrelevant for the shape test, only the registered
         /// `MockProgram::get_req_size` segment-form policy lookup matters.
@@ -2204,7 +2209,7 @@ mod oparg_with_body_local_method_call_green {
     /// size(pc) as i32 <= state.f1 as i32;` BEFORE the portal
     /// `BC_JIT_MERGE_POINT(_C)`, threading the elidable canonical call
     /// op (`BC_RESIDUAL_CALL_IR_I` — receiver Ref + pc Int → IR family
-    /// per `assembler.rs:1748-1769`) into `BC_INT_LE` and then A.3.5's
+    /// per `assembler.rs`'s `emit_canonical_call_void`) into `BC_INT_LE` and then A.3.5's
     /// `BC_INT_GUARD_VALUE`. The same reg byte must appear in the
     /// merge-point op's `greens_i` payload (A.3.2 layout).
     #[test]
@@ -2232,8 +2237,8 @@ mod oparg_with_body_local_method_call_green {
         // Canonical elidable call (`call_pure_int_canonical_via_target`)
         // for `program.get_req_size(pc)` must land BEFORE the merge
         // point. Receiver Ref + Int arg → IR-family opcode
-        // `BC_RESIDUAL_CALL_IR_I` per `assembler.rs:1748-1769` family
-        // selection.
+        // `BC_RESIDUAL_CALL_IR_I` per `assembler.rs`'s
+        // `emit_canonical_call_void` family selection.
         let call_pos = code[..mp_pos]
             .iter()
             .position(|&b| b == BC_RESIDUAL_CALL_IR_I)
@@ -2245,8 +2250,9 @@ mod oparg_with_body_local_method_call_green {
                  target with effect_info = ELIDABLE_EFFECT_INFO",
             );
 
-        // BC_RESIDUAL_CALL_IR_I encoding (`assembler.rs:1741-1820 +
-        // :1976-2006`) for arg classes "ri" + dst:
+        // BC_RESIDUAL_CALL_IR_I encoding (`assembler.rs`'s
+        // `emit_canonical_call_void` + `emit_canonical_call_typed`)
+        // for arg classes "ri" + dst:
         //   [0] opcode
         //   [1] funcptr_reg
         //   [2] int_count = 1

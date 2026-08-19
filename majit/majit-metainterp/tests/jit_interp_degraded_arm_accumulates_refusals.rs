@@ -157,8 +157,9 @@ fn classifying_the_head_requires_splitting_first() {
     );
 }
 
-/// The degraded arm runs interpreted. Liveness only — see the header: this is
-/// not an oracle for the refusal and must not be cited as one.
+/// The degraded arm runs interpreted. Liveness only — the refusal-order and
+/// classification assertions live in this file's other tests; this one is not
+/// an oracle for the refusal and must not be cited as one.
 #[test]
 fn the_degraded_arm_runs_without_panicking() {
     let _ = dispatch_accum(&program_for(3), 4);

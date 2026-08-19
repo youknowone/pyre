@@ -29,8 +29,9 @@ use super::{
 /// *bank*, whose values are `i64` (`majit_ir::value::Type` doc), and the
 /// storage a descr describes is the source declaration, not the bank: a
 /// `jit_interp` `[int; virt]` array is backed by the caller's `Vec<i64>`
-/// (`majit/examples/spcount/src/main.rs:96`) and an `int` struct field by an
-/// `i64` (`majit-metainterp/tests/jit_interp_inline_helper_typed_return.rs:57`).
+/// (`majit/examples/spcount/src/main.rs`'s `StackState`) and an `int` struct
+/// field by an `i64` (`majit-metainterp/tests/jit_interp_inline_helper_typed_return.rs`'s
+/// `InlineTypedNode`).
 /// Narrowing those to 4 on wasm32 strides past half of every item and
 /// truncates the value.  `Float` is `f64` on every target for the same
 /// reason.
@@ -142,7 +143,7 @@ pub struct JitCodeBuilder {
     /// `fielddescr.parent_descr = get_size_descr(...)`).  Keyed by the
     /// `path_hash` `type_id` the same way `LLType::Struct(type_id)` keys
     /// the runtime `DescrCache`.  Without it the optimizer's
-    /// `optimize_setfield_gc` (`optimizeopt/virtualize.rs:689`) panics on
+    /// `optimize_setfield_gc` (`optimizeopt/virtualize.rs`) panics on
     /// the `get_parent_descr()` of a virtualized struct field.
     struct_size_specs: std::collections::HashMap<u64, BhSizeSpec>,
     /// Pyre-only bridge for canonical `residual_call_*_v`: the bytecode
@@ -211,7 +212,7 @@ pub struct JitCodeBuilder {
     /// `num_regs_kind + pool_idx` must remain stable from the moment
     /// `add_const_*` returns through `finish()`'s constants-suffix
     /// placement (`init_register_files_from_runtime_jitcode`,
-    /// `blackhole.rs:1056-1075`). RPython's assembler is naturally in
+    /// `blackhole.rs`). RPython's assembler is naturally in
     /// this regime — `assembler.py` runs after regalloc has fixed
     /// `num_regs[kind]` — so freeze restores parity with the upstream
     /// invariant.
@@ -867,7 +868,7 @@ impl JitCodeBuilder {
     /// `descr.py:218-239 get_field_descr`: the descr carries
     /// `index_in_parent` (`descr.py:228`) and `parent_descr =
     /// get_size_descr(STRUCT)` (`descr.py:238`).  The optimizer's
-    /// `optimize_setfield_gc` (`optimizeopt/virtualize.rs:689`) requires
+    /// `optimize_setfield_gc` (`optimizeopt/virtualize.rs`) requires
     /// the parent SizeDescr to virtualize the field; a missing
     /// registration falls back to the placeholder builder (an escaping
     /// allocation that is never virtualized).
@@ -1728,8 +1729,9 @@ impl JitCodeBuilder {
     /// instead of the raw byte at `index`.
     ///
     /// The array is NOT GC-managed and carries no length word: a Rust slice
-    /// (`&[T]`) data pointer (`codegen_trace.rs:193 *const #env_type as
-    /// *const ()`) points directly at `items[0]`, and the length travels in the
+    /// (`&[T]`) data pointer (`codegen_trace.rs`'s `generate_trace_fn`, emitting
+    /// `*const #env_type as *const ()`) points directly at `items[0]`, and the
+    /// length travels in the
     /// fat pointer's other half, which never reaches the trace.  This is the
     /// `arraydescrof(rffi.CArray(T))` shape, so it is
     /// [`Self::add_raw_int_array_descr_signed`] — see the note there for what
@@ -1759,7 +1761,7 @@ impl JitCodeBuilder {
     /// field, even though those elements are read with `getarrayitem_gc_i`
     /// rather than `raw_load_i`: what the flag governs is the object header,
     /// and such a buffer has none.  `ArrayPtrInfo::make_guards`
-    /// (`optimizeopt/info.rs:668`, mirroring `info.py:632-639`) emits
+    /// (`optimizeopt/info.rs`'s `make_guards`, mirroring `info.py:632-639`) emits
     /// `GUARD_GC_TYPE` for a GC-managed array descr, reading a type-id word at
     /// `ptr - GcHeader::SIZE`; ahead of such a buffer that word belongs to
     /// whatever precedes the allocation, so once the base is red the guard
@@ -3166,7 +3168,7 @@ impl JitCodeBuilder {
     /// non-null.
     ///
     /// Blackhole: asserts the concrete ref is non-null
-    /// (`blackhole.rs:5690 handler_assert_not_none`) and advances past
+    /// (`blackhole.rs`'s `handler_assert_not_none`) and advances past
     /// the operand byte.  Tracing dispatcher routes
     /// through `TraceCtx::trace_assert_not_none(opref)` which gates on
     /// `heap_cache.is_nullity_known` and bumps `HEAPCACHED_OPS` on
@@ -3179,7 +3181,7 @@ impl JitCodeBuilder {
     /// pyjitpl.py:393-410 opimpl_record_exact_class: record that
     /// `src`'s class is exactly `cls` (vtable pointer in the int bank).
     ///
-    /// Blackhole: no-op (`blackhole.rs:5574 handler_record_exact_class`
+    /// Blackhole: no-op (`blackhole.rs`'s `handler_record_exact_class`
     /// advances past the two operand bytes).  Tracing dispatcher routes
     /// through `TraceCtx::trace_record_exact_class(opref, cls_const)`
     /// which gates on `heap_cache.is_class_known` and bumps
@@ -3462,7 +3464,7 @@ impl JitCodeBuilder {
         // end-of-instruction position.  Inline-call's typed result
         // (consumed by `MIFrame::make_result_of_lastop` at the caller
         // frame after the callee's `finishframe_*_return`,
-        // `pyjitpl.rs:9975`) is determined by which
+        // `pyjitpl.rs`) is determined by which
         // `return_{i,r,f}` slot the helper received.  At most one is
         // `Some` for a typed variant; all `None` for the void
         // variant (no record).
@@ -3558,7 +3560,7 @@ impl JitCodeBuilder {
     /// Emit a void residual call whose `void_word_abi` flag retains an ignored
     /// machine-word result. `descr.py:647` gives `lltype.Void` descriptors
     /// `result_size = 0`, so it has no counterpart for a semantically void
-    /// helper that physically returns a word. `pyre-jit/src/jit/codewriter.rs:5828-5836`
+    /// helper that physically returns a word. `pyre-jit/src/jit/codewriter.rs`
     /// (`CodeWriter::intern_call_descr_stub`) sets it for
     /// `PyreHelperKind::ListAppendValue`.
     pub fn residual_call_void_canonical_via_target_with_effect_info_and_word_abi(
@@ -3613,13 +3615,13 @@ impl JitCodeBuilder {
     /// `call_may_force`, `call_release_gil`, `call_loopinvariant`.
     ///
     /// `funcptr` is the raw concrete C-ABI pointer that
-    /// `cpu.bh_call_v` (cranelift `compiler.rs:13934`, dynasm
+    /// `cpu.bh_call_v` (cranelift `compiler.rs`, dynasm
     /// `runner.rs` override) will eventually transmute into a
     /// typed `extern "C" fn(...)`. The pointer is stashed in the int
     /// constants pool — RPython `assembler.py:127-138 emit_const`
     /// projects const-pool slot N into the post-regs window of
     /// `bh.registers_i` so the canonical handler at
-    /// `blackhole.rs:6534, 6580, 6621` can resolve `bh.registers_i[
+    /// `blackhole.rs`'s `handler_residual_call_*` family can resolve `bh.registers_i[
     /// code[pos]]` uniformly. `finish()` patches the placeholder byte
     /// to `num_regs_i + funcptr_const_idx` (1-byte ceiling enforced by
     /// `patch_const_u8_refs`).
@@ -3708,7 +3710,7 @@ impl JitCodeBuilder {
             }
         }
         // calldescr is encoded as a 2-byte runtime descrs index — read by
-        // `blackhole.rs:5853 read_descr`.
+        // `blackhole.rs`'s `read_descr`.
         self.push_u16(calldescr_idx);
         calldescr_idx
     }
@@ -3887,7 +3889,7 @@ impl JitCodeBuilder {
     /// `bhimpl_residual_call_{r,ir,irf}_{i,r,f}`. The encoding mirrors
     /// the void form with one trailing `dst:u8` byte appended after
     /// the calldescr operand (consumed by handlers
-    /// `handler_residual_call_*_{i,r,f}` at `blackhole.rs:6611-6660` via
+    /// `handler_residual_call_*_{i,r,f}` in `blackhole.rs` via
     /// `code[p]`).
     ///
     /// The `residual_call_*_canonical_*` wrappers below are its first
@@ -4072,7 +4074,7 @@ impl JitCodeBuilder {
     /// Float-result emission body.  `bhimpl_residual_call_irf_f` is the
     /// only float-result variant per `resoperation.py:1238-1248`, so
     /// the opcode is fixed — but the handler at
-    /// `handler_residual_call_irf_f` (`blackhole.rs:6644`) always reads
+    /// `handler_residual_call_irf_f` (`blackhole.rs`) always reads
     /// `read_list_f` after `read_list_r`, so the layout MUST emit an
     /// (empty-or-not) float list even when the call has no float args.
     /// This differs from `emit_canonical_call_void`, which skips the
@@ -4178,7 +4180,7 @@ impl JitCodeBuilder {
         // address — `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)` — and
         // wrong for a `_concrete` wrapper, which the helper policy attributes
         // give an `-> i64` signature carrying `f64::to_bits`
-        // (`emit_helper_call_target_fn`, `majit-macros/src/lib.rs:605-614`).
+        // (`emit_helper_call_target_fn`, `majit-macros/src/lib.rs`).
         // Only the `*_float_wrapped` call policies mint that divergence — for
         // `jit_release_gil` it arrives via `_call_aroundstate_target_<name>`,
         // whose first element is that same `_concrete` wrapper — and no crate
@@ -6144,11 +6146,11 @@ impl JitCodeBuilder {
 /// release target are intentionally distinct values.
 ///
 /// Pyre's `#[jit_interp]` macro `release_gil_*` policy declarations
-/// (`majit-macros/src/jit_interp/mod.rs:226-251`) carry no `saveerr`
+/// (`majit-macros/src/jit_interp/mod.rs`'s `CallPolicyKind`) carry no `saveerr`
 /// attribute and no separate wrapper-vs-real-address distinction —
 /// the macro emits a wrapper where `func_ptr` IS the C address.  The
 /// emit-side wrappers seed `call_release_gil_target: (1, 0)` purely
-/// to flip `EffectInfo::is_call_release_gil()` (`effectinfo.rs:292-295`,
+/// to flip `EffectInfo::is_call_release_gil()` (`majit-ir`'s `effectinfo.rs`,
 /// `effectinfo.py:255-257`) on while the real address is unknown until
 /// `descrs[fn_ptr_idx]` resolves.  This helper substitutes the
 /// resolved `target.concrete_ptr` into that sentinel slot so the
@@ -6159,8 +6161,8 @@ impl JitCodeBuilder {
 /// `1`) is left untouched, mirroring PyPy's "descr already carries
 /// `(tgt_func, saveerr)` from the analyzer" structure at
 /// `call.py:252-258`.  Today the only producer of explicit targets is
-/// `trace_ctx::call_release_gil_{int,float}_typed`
-/// (`trace_ctx.rs:3795, 3824`) which bypasses this resolver, but
+/// `TraceCtx::call_release_gil_{int,float}_typed`
+/// (`history.rs`) which bypasses this resolver, but
 /// keeping the override sentinel-conditional preserves the upstream
 /// invariant for any future analyzer-driven descr.
 ///
@@ -6183,7 +6185,7 @@ fn resolve_call_release_gil_target(
     realfuncaddr: *const (),
     save_err: i32,
 ) -> majit_ir::descr::EffectInfo {
-    // effectinfo.rs:292 is_call_release_gil checks `tgt_func != 0`, so
+    // `is_call_release_gil` checks `tgt_func != 0`, so
     // skip the substitution for non-release-gil callers (the slot
     // carries `_NO_CALL_RELEASE_GIL_TARGET = (0, 0)` for them).
     // Match the sentinel `1` exclusively so descrs with an already-
@@ -6280,7 +6282,8 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
 /// total_slots`.
 ///
 /// state-field JIT enforces `Type::Int` on every slot at macro
-/// expansion (`codegen_state.rs:30-43`), so `live_r` and `live_f` are
+/// expansion (`codegen_state.rs`'s `generate_state_fields_jit_state`), so
+/// `live_r` and `live_f` are
 /// empty.  `total_slots` matches `JitCodeSym::total_slots`:
 /// `num_scalars + sum(array_lens) + num_vable_identity_slots`, where the last
 /// term is 1 when the state has a virtualizable and 0 otherwise —
@@ -6719,8 +6722,8 @@ mod tests {
         // of — verify
         // that `add_call_descr` puts a `BhDescr::Call { calldescr }` at the
         // returned pool index so canonical `residual_call_*_v` handlers
-        // (`blackhole.rs:6886-6892`) can reach it via `read_descr` →
-        // `as_calldescr()` (`majit-translate/src/codewriter/jitcode.rs:1265`).
+        // (`blackhole.rs`) can reach it via `read_descr` →
+        // `as_calldescr()` (`majit-translate/src/codewriter/jitcode.rs`).
         let mut builder = JitCodeBuilder::new();
         let calldescr = majit_translate::codewriter::jitcode::BhCallDescr::from_signature(
             "i".to_string(),
@@ -6787,7 +6790,7 @@ mod tests {
     #[test]
     fn residual_call_void_canonical_emits_irf_for_mixed_kinds() {
         // — `residual_call_void_canonical_typed_args` writes the
-        // canonical byte layout that `blackhole.rs:6534 handler_residual_call_irf_v`
+        // canonical byte layout that `blackhole.rs`'s `handler_residual_call_irf_v`
         // reads: 1B funcptr_reg + (countI:1 + regI×N) + (countR:1 + regR×M)
         // + (countF:1 + regF×K) + descr:2.
         let mut builder = JitCodeBuilder::new();
@@ -6943,8 +6946,8 @@ mod tests {
         // only have an IRF form — the R / IR shapes are "no such thing".
         // `emit_canonical_call_typed_irf_f` therefore always emits all
         // three (count, regs) pairs, even when a list is empty, so the
-        // canonical handler at `blackhole.rs:6644
-        // handler_residual_call_irf_f` can read `read_list_i` /
+        // canonical handler `blackhole.rs`'s
+        // `handler_residual_call_irf_f` can read `read_list_i` /
         // `read_list_r` / `read_list_f` in sequence.
         let mut builder = JitCodeBuilder::new();
         builder.touch_call_arg(JitCallArg::int(2));

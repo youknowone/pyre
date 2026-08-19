@@ -175,7 +175,7 @@ pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval
 // state-field JIT setup (e.g. `__JitMeta_<fn>::install_canonical_liveness`)
 // can build a fresh Assembler without forcing each user crate to
 // declare a `majit-translate` dependency.  The same pattern is used
-// for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs:4`).
+// for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs`).
 pub use majit_translate::codewriter::assembler::Assembler;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 /// The walker's own `getfield_gc` / `setfield_gc` descr resolution
@@ -1447,17 +1447,19 @@ pub const MC_DIAG_SLOTS: usize = 79;
 ///   pyre-jit's `compile_and_run_once` above every early return, so a zero
 ///   means that call was never reached, not that it returned early. But the
 ///   CALL is unconditional while the SLOT is selected by the `start` arm
-///   (`BackEdge => 18`, `FunctionEntry => 19`, `eval.rs:8991-8994`), so 19
+///   (`BackEdge => 18`, `FunctionEntry => 19`, in `eval.rs`'s
+///   `compile_and_run_once` prologue), so 19
 ///   counts function-entry starts ONLY — a back-edge-only workload leaves 19
 ///   at 0 while 18 climbs. Read 19, never 18 + 19, and never "the arm was
 ///   entered".
 ///
 /// The two witnesses sit in one function and in this order:
-/// `try_function_entry_jit` calls the door at `eval.rs:9397` and reaches
-/// `compile_and_run_once(.., FunctionEntry)` 235 lines later at `:9632`. So in
+/// `try_function_entry_jit` calls the door (`should_trace_function_entry`) near
+/// its top and reaches `compile_and_run_once(.., FunctionEntry)` only at the
+/// end of the same function. So in
 /// the worked example above the door ran 2540 times and control never once
 /// reached the compile call — every probe declined at the door or between it
-/// and `:9632`. That is the mechanism behind "the probed set and the
+/// and the compile call. That is the mechanism behind "the probed set and the
 /// ever-traced set were disjoint", and it is also why 23 + 24 + 25 cannot
 /// stand in for 19: they are counted on the near side of that gap.
 ///
@@ -1479,7 +1481,8 @@ pub const MC_DIAG_SLOTS: usize = 79;
 /// bumps 19 will accept `18` (or `18 + 19`) as an arming witness, which it
 /// is not. **A witness's stated domain is part of the witness, and it is
 /// the part that gets applied.** (Found by sizes-2 against a census of
-/// production readouts; re-verified here at `eval.rs:8991-8994`.)
+/// production readouts; re-verified here against `eval.rs`'s
+/// `compile_and_run_once`.)
 ///
 /// And 64 is narrower than "a compiled callee was probed": the caller has
 /// already excluded `has_runnable_compiled_loop` (a driver-side meta table)

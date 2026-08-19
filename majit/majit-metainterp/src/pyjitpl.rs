@@ -547,9 +547,9 @@ fn snapshot_map_from_trace_snapshots(
     // (live deadframe slot) and Const (compile-time pool) payloads.
     // TAGVIRTUAL belongs to resume numbering (resume.py:_number_boxes)
     // and is synthesized later from PtrInfo::is_virtual on the live
-    // Box's OpRef. SnapshotTagged carries no `Virtual` variant (see
-    // recorder.rs:73 docstring) so this match is exhaustive over the
-    // two recorder-side cases.
+    // Box's OpRef. SnapshotTagged carries no `Virtual` variant (see the
+    // `SnapshotTagged` docstring in `recorder.rs`) so this match is
+    // exhaustive over the two recorder-side cases.
     let tagged_to_box = |t: &crate::recorder::SnapshotTagged| -> SnapshotBox {
         match t {
             crate::recorder::SnapshotTagged::Box(opref, fallback_tp) => {
@@ -968,17 +968,15 @@ fn densify_root_loop_inputargs(
     (inputargs, ops)
 }
 
-/// Slice T-final.F.0 survey probe.
-///
 pub(crate) struct CompiledEntry<M> {
     /// `Weak<JitCellToken>` so this compiled-loop index does not keep
     /// tokens alive after `MemoryManager.alive_loops` prunes them
-    /// (memmgr.py:73).  Slice X-G second cut: readers call `live_token()`
+    /// (memmgr.py:73).  Readers call `live_token()`
     /// for the upgrade-or-panic shape (most call sites assume the entry is
     /// alive); eviction paths use `token.upgrade()` directly to tolerate
     /// `None`.  Warmstate still owns a separate `Arc<JitCellToken>`
-    /// (`warmstate.rs:77`), so Pyre has not yet reached PyPy's "alive_loops
-    /// is the only long-lived strong owner" shape.
+    /// (`BaseJitCell::loop_token` in `warmstate.rs`), so Pyre has not yet
+    /// reached PyPy's "alive_loops is the only long-lived strong owner" shape.
     pub(crate) token: std::sync::Weak<JitCellToken>,
     /// Shared, never copied. `warmstate.py:398 get_procedure_token` hands the
     /// caller the cell's own `loop_token` object; the entry runner then reads
@@ -1037,7 +1035,7 @@ pub(crate) struct CompiledEntry<M> {
     /// In RPython, JitCellToken keeps all target_tokens' code alive.
     /// In majit, each retrace produces a new Cranelift function;
     /// previous functions are kept here so external target_token JUMPs
-    /// can redirect to them via runtime trampoline.  Slice X-G: stored
+    /// can redirect to them via runtime trampoline.  Stored
     /// as `Weak<JitCellToken>` so this metadata index does not extend token
     /// lifetime beyond `MemoryManager.alive_loops` (memmgr.py:73).
     /// `previous_tokens_upgraded` is the readers' entry point — it upgrades
@@ -1046,7 +1044,7 @@ pub(crate) struct CompiledEntry<M> {
     ///
     /// # `compile_bridge` use & weak-drop safety
     ///
-    /// Cranelift's `compile_bridge` (`compiler.rs:14248`) iterates
+    /// Cranelift's `compile_bridge` (`compiler.rs`) iterates
     /// `previous_tokens` to attach the freshly-compiled bridge to
     /// matching `(trace_id, fail_index_per_trace)` fail_descrs in
     /// retired predecessor tokens whose machine code may still be
@@ -1078,7 +1076,7 @@ pub(crate) struct CompiledEntry<M> {
     /// evicted `T_prev`" and "`T_prev`'s code freed": with `Arc` strong
     /// ownership previously held by `compiled_loops`, that gap was
     /// effectively zero because `compiled_loops` extended the lifetime
-    /// past alive_loops eviction.  After Slice X-G the gap is real but
+    /// past alive_loops eviction.  With the `Weak` index the gap is real but
     /// bounded — pyre's single-thread JIT means `T_prev`'s code can be
     /// "reachable" only while a frame is on the stack (case 4), and
     /// that frame's caller holds the Arc via the executor's
@@ -1103,7 +1101,7 @@ pub(crate) struct CompiledEntry<M> {
 }
 
 impl<M> CompiledEntry<M> {
-    /// Slice X-G: upgrade the `token` Weak to a strong `Arc<JitCellToken>`.
+    /// Upgrade the `token` Weak to a strong `Arc<JitCellToken>`.
     /// Returns `None` when the strong owner (`MemoryManager.alive_loops`)
     /// has already dropped it — `memmgr.py:73` parity means alive_loops
     /// pruning can run between trace insertions, so a `compiled_loops`
@@ -1478,7 +1476,8 @@ pub struct MetaInterp<M: Clone> {
     /// Upstream hides an `AllVirtuals` instance in the deadframe's
     /// `jf_savedata` GCREF slot and `ResumeGuardForcedDescr.handle_fail`
     /// fishes it back out. pyre cannot put a Rust value in that slot — the GC
-    /// traces it as a real object reference (`majit-backend/src/jitframe.rs:354`)
+    /// traces it as a real object reference (`jitframe_trace` in
+    /// `majit-backend/src/jitframe.rs`)
     /// — so the cache is held here, keyed by the virtualizable that was forced.
     /// One entry per frame, overwritten on re-force, exactly like the single
     /// `jf_savedata` word.
@@ -1616,7 +1615,8 @@ pub struct MetaInterp<M: Clone> {
     /// that decides whether `typeptr` is a subclass of `bounding_class`.
     /// Default: `Some(default_issubclass)` — active GC subclass-range
     /// lookup, matching `rclass.py:1133-1137 ll_issubclass`. Mirrors the
-    /// blackhole-side resolution at `blackhole.rs:7962-7966`.
+    /// blackhole-side resolution in `handler_goto_if_exception_mismatch`
+    /// (`blackhole.rs`).
     pub(crate) issubclass: Option<fn(i64, i64) -> bool>,
 
     /// pyjitpl.py:2179 `self.metainterp.staticdata` — per-process
@@ -2274,7 +2274,7 @@ impl<M: Clone> MetaInterp<M> {
     /// single walker covers all in-progress trace states.
     pub fn walk_active_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         // pyjitpl.py:2451 `self.framestack` — `MIFrame.copy_constants()`
-        // (frame.rs:404-407) stores `jitcode.constants_r` entries as
+        // (pyjitpl/frame.rs) stores `jitcode.constants_r` entries as
         // `OpRef::ConstPtr(GcRef)` in `ref_regs`. history.py:314
         // `ConstPtr.value` is an inline gcref field traced through the
         // Python object graph automatically; pyre's `Vec<Option<OpRef>>`
@@ -2371,7 +2371,8 @@ impl<M: Clone> MetaInterp<M> {
 
     /// GC walker for the forced-virtual caches held in
     /// `Self::forced_virtuals`, standing in for the trace `jf_savedata` gets
-    /// as a real GCREF field (`majit-backend/src/jitframe.rs:354`).
+    /// as a real GCREF field (`jitframe_trace` in
+    /// `majit-backend/src/jitframe.rs`).
     ///
     /// Only the ptr half is walked. The int half is `virtuals_int_cache` —
     /// unboxed integer field values — and handing those to the visitor would
@@ -2403,7 +2404,7 @@ impl<M: Clone> MetaInterp<M> {
                 // SAFETY: `GcRef` is a pointer-sized newtype over the same
                 // representation these slots hold, the same reinterpret
                 // `walk_resume_ref_roots` performs on `virtuals_ptr_cache`
-                // (`majit-gc/src/shadow_stack.rs:931`). Walked unconditionally
+                // (`majit-gc/src/shadow_stack.rs`). Walked unconditionally
                 // for both collection kinds: the minor forwards a
                 // nursery-resident virtual in place, the major seeds it as a
                 // mark root so the sweep does not free it.
@@ -2742,22 +2743,22 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(layout) = trace.exit_layouts.get(&fail_index) {
             return Some(layout.resolve_exit_types().to_vec());
         }
-        // F.5-orthodox.1: drop `guard_op_indices.get` shortcut. The
-        // producer (`compile.rs:248-991 build_guard_metadata`) inserts
-        // into both `exit_layouts` (line 971) and `guard_op_indices`
-        // (line 284) at the same per-trace `fail_index` counter, with
+        // Drop the `guard_op_indices.get` shortcut. The
+        // producer (`build_guard_metadata` in `compile.rs`) inserts
+        // into both `exit_layouts` and `guard_op_indices`
+        // at the same per-trace `fail_index` counter, with
         // `exit_layouts` a superset (also covers FINISH ops). Reaching
         // here means `exit_layouts` already returned None for this
         // fail_index, so the HashMap shortcut is structurally dead;
         // walk `trace.ops` via descr-side identity (matching RPython's
         // `compile.py:184 op.getdescr()` predicate) — this is the
-        // F.5-orthodox.1 canonical path that replaces the
+        // canonical path that replaces the
         // `guard_op_indices` HashMap entirely.
         //
         // Compare against `fail_index_per_trace()` (the per-trace
-        // counter the producer stamps at `compile.rs:301`), not
+        // counter the producer stamps in `build_guard_metadata`), not
         // `fail_index()` (which is the global `alloc_fail_index()` id
-        // at `descr.rs:1065`). The HashMap was keyed on the per-trace
+        // in `descr.rs`). The HashMap was keyed on the per-trace
         // counter, so descr-side identity must read the per-trace slot.
         let op_index = trace.ops.iter().position(|op| {
             op.with_fail_descr(|descr| descr.fail_index_per_trace() == fail_index)
@@ -2861,7 +2862,7 @@ impl<M: Clone> MetaInterp<M> {
                 // reassemble a `ResumeStorage` so downstream consumers
                 // (force_from_resumedata, blackhole) see the same
                 // shared pool the frontend-primed path provides.
-                // Mirrors compile.rs:917-924 inside merge_backend_exit_layouts.
+                // Mirrors `merge_backend_exit_layouts` in `compile.rs`.
                 let storage = layout.rd_numb.as_ref().map(|rd_numb| {
                     crate::resume::ResumeStorage::new(
                         rd_numb.clone(),
@@ -4117,7 +4118,8 @@ impl<M: Clone> MetaInterp<M> {
                 .push(crate::jitdriver::JitDriverStaticData::new(vec![], vec![]));
             // `pyjitpl.py:2273-2283` `finish_setup_descrs_for_jitdrivers`
             // — `register_jitdriver_sd` runs this tail step on every
-            // jitdriver insertion (mod.rs:14418).  The default driver
+            // jitdriver insertion (`register_jitdriver_sd` in this file).
+            // The default driver
             // pushed above bypasses `register_jitdriver_sd`, so wire up
             // `portal_finishtoken` / `propagate_exc_descr` /
             // `portal_calldescr` here for the assert in `_setup_once`
@@ -4984,8 +4986,8 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:1547-1556 `opimpl_jit_merge_point` auto-stamp
         // gate inputs.  Both `portal_call_depth` and
         // `has_compiled_targets(ptoken)` feed the primary-trace gate;
-        // mirror `start_bridge_tracing`'s install (jitdriver.rs:3714-
-        // 3717) at the primary path so the gate sees consistent state
+        // mirror `start_bridge_tracing`'s install (jitdriver.rs)
+        // at the primary path so the gate sees consistent state
         // regardless of which entry started this trace.  The
         // `has_compiled_targets_fn` presence is no longer overloaded
         // as a bridge marker — `TraceCtx::is_bridge_trace` carries
@@ -5029,7 +5031,7 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing.as_mut()
     }
 
-    /// Slice X-D production wire-up: split-borrow helper that lets a
+    /// Split-borrow helper that lets a
     /// caller (typically the macro-generated `__merge_*` wrapper) hold
     /// the active `TraceCtx` mutably while closures borrow disjoint
     /// MetaInterp fields immutably.  Hands the caller, in order:
@@ -5889,7 +5891,7 @@ impl<M: Clone> MetaInterp<M> {
         // concrete virtualizable heap object is the sole source of truth
         // for every array length. Read each array field directly via
         // `VirtualizableInfo::get_array_length(obj_ptr, i)`
-        // (virtualizable.rs:695-711). Any layout that cannot expose its
+        // (virtualizable.rs). Any layout that cannot expose its
         // length on the heap object must be fixed inside
         // `VirtualizableInfo` itself (to match `vinfo.get_array_length`'s
         // universal contract), not worked around in this helper.
@@ -6970,7 +6972,7 @@ impl<M: Clone> MetaInterp<M> {
         // than install it. Gated on the cross-loop-CUT marker so the FBW-off
         // production path is byte-identical. Read before
         // `normalize_closing_jump_args`, though that pass preserves `Const` args
-        // (`compile.rs:1682`) so the slot would survive it either way.
+        // (`compile.rs`) so the slot would survive it either way.
         if cut_inner_green_key.is_some()
             && let Some(slot) = cross_loop_cut_label_jump_null_guard_slot(&optimized_ops)
         {
@@ -7394,7 +7396,7 @@ impl<M: Clone> MetaInterp<M> {
                         loop_header_pc: carried_loop_header_pc,
                         traces,
                         previous_tokens,
-                        // Box Identity Phase E Step 1: record Phase 2's final
+                        // Box identity: record Phase 2's final
                         // OpRef high-water so later bridges can allocate in a
                         // disjoint namespace. RPython gets disjointness for
                         // free via fresh `InputArg` Python identities per
@@ -7738,10 +7740,11 @@ impl<M: Clone> MetaInterp<M> {
             // the `warmstate.py:191-196` invalidation filter, and hands that
             // same object to `compile_trace` — the loop a bridge closes onto
             // is the loop `has_compiled_targets` admitted. `has_compiled_targets`
-            // here (`:7564`) already answers from the token, so taking the
+            // here already answers from the token, so taking the
             // descr from the `compiled_loops` side table made one decision read
             // two sources: the side table applies no invalidation filter, and
-            // `jitdriver.rs:6288` keeps an invalidated loop's target tokens on
+            // `jitdriver.rs`'s `invalidate_loop` keeps an invalidated loop's
+            // target tokens on
             // purpose. Reading both halves off the token is what makes the
             // filter cover the target as well as the gate.
             //
@@ -8496,10 +8499,11 @@ impl<M: Clone> MetaInterp<M> {
         // `JMP(imm(target_token._ll_loop_code))`), and upstream still compiles
         // it: both `jump_to_preamble` sites return a full `UnrollInfo`, so
         // `compile.py:373-393` assembles the trace and attaches it.
-        // `unroll.rs:1831-1878` ports that retargeting, so this arm IS
+        // `unroll.rs`'s `optimize_trace_with_constants_and_inputs_vable_out`
+        // ports that retargeting, so this arm IS
         // reachable — the retrace limit, an `InvalidLoop` from
-        // `jump_to_existing_trace`, and the foreign-target fallback at
-        // `unroll.rs:1797-1810` all reach it.
+        // `jump_to_existing_trace`, and the foreign-target fallback in
+        // the same function all reach it.
         //
         // Both outcomes are compiled, as upstream does: `compile.py:341-394
         // compile_retrace` declines only on `InvalidLoop` (:368-371), and both
@@ -8508,9 +8512,9 @@ impl<M: Clone> MetaInterp<M> {
         // This used to decline the retargeted outcome for a single backend's sake.
         // All three now decide local-vs-external on the TOKEN, which is
         // `x86/assembler.py:2461-2467 closing_jump`'s own test
-        // (`target_token in self.target_tokens_currently_compiling`): dynasm at
-        // `aarch64/assembler.rs:3129` / `x86/assembler.rs:4126`, cranelift at
-        // `compiler.rs:13244-13310`, and wasm at `codegen.rs find_loop_label_index`
+        // (`target_token in self.target_tokens_currently_compiling`): dynasm in
+        // `aarch64/assembler.rs` / `x86/assembler.rs`, cranelift in
+        // `compiler.rs`, and wasm at `codegen.rs find_loop_label_index`
         // since the descr-strict dispatch landed.
 
         let num_combined_ops = combined_ops.len();
@@ -8763,7 +8767,8 @@ impl<M: Clone> MetaInterp<M> {
                         loop_header_pc: carried_loop_header_pc,
                         traces,
                         previous_tokens,
-                        // Box Identity Phase E Step 1: see main compile site.
+                        // Box identity: Phase 2's final OpRef high-water, as at
+                        // the main compile site.
                         next_global_opref,
                     },
                 );
@@ -9368,10 +9373,10 @@ impl<M: Clone> MetaInterp<M> {
         ]);
         // compile.py:92-96 SimpleCompileData.optimize → optimize_loop parity.
         // Wire snapshot data through to the optimizer so guard
-        // store_final_boxes_in_guard (mod.rs:2261) can properly populate
+        // store_final_boxes_in_guard (optimizeopt/mod.rs) can properly populate
         // rd_numb / rd_consts via _number_boxes (resume.py:200-205).
         // Without this, every guard from a function-entry trace is dropped
-        // by the no-snapshot fallback in mod.rs:2281, leaving rd_numb=None,
+        // by the no-snapshot fallback in optimizeopt/mod.rs, leaving rd_numb=None,
         // and the runtime guard-fail path immediately invalidates the loop
         // (because resume_in_blackhole has no resume_pc to walk to).
         optimizer.snapshot_boxes = snapshot_map;
@@ -9660,7 +9665,7 @@ impl<M: Clone> MetaInterp<M> {
                     // (`pyjitpl.py:3922-3923` = `bool(token.target_tokens)`) is
                     // false, while the trace stays enterable through
                     // `has_compiled_loop`
-                    // (`get_procedure_token().has_compiled_code()`, mod.rs:8273
+                    // (`get_procedure_token().has_compiled_code()`, in this file
                     // — `warmstate.py:482-511` gates entry on code presence,
                     // not on target_tokens).  A jumpable target token must own
                     // real `ll_loop_code`; synthesising a code-less one here let
@@ -10377,7 +10382,8 @@ impl<M: Clone> MetaInterp<M> {
 
         // Re-read the entry rather than holding the pre-run borrow across
         // `execute_token_raw`: compiled code re-enters the driver through
-        // residual calls (`eval.rs:4393` mints a second `&mut JitDriverPair`
+        // residual calls (`eval.rs`'s `jit_driver_pair_from_root_area`
+        // mints a second `&mut JitDriverPair`
         // from the `JIT_DRIVER` cell), and that re-entry can recompile or
         // drop this green key, so the pre-run `&CompiledEntry` is not
         // guaranteed to still point at a live entry.  A bridge compiled
@@ -10851,7 +10857,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Fresh lookup, and fallible: the run can re-enter the driver through
-        // a residual call and drop this green key (`jitdriver.rs:4361`
+        // a residual call and drop this green key (`jitdriver.rs`'s
         // `remove_compiled_loop` on the unrecoverable-resume path), in which
         // case the exit falls through to the `rd_loop_token` lookup and then
         // to the synthesized default layout below.
@@ -11011,7 +11017,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        // Slice X3-E: backend no longer caches a per-descr recovery layout;
+        // The backend no longer caches a per-descr recovery layout;
         // the metainterp's `StoredExitLayout.recovery_layout` (updated above)
         // is the single canonical store consumed via
         // `trace_layout_ref.recovery_layout` at deopt.
@@ -11401,7 +11407,7 @@ impl<M: Clone> MetaInterp<M> {
         // `warmstate.py:716-723`). Without this, `compile.py:187`
         // `original.record_jump_to(descr)` keepalive narrows to
         // already-compiled targets and silently drops tmp-callback ones,
-        // regressing main behavior. Removed by Slice X-D when
+        // regressing main behavior. Removable once
         // `CallAssemblerDescr` carries the owning `Arc<JitCellToken>`
         // directly (Codex parity recommendation #4).
         self.warm_state
@@ -11478,7 +11484,7 @@ impl<M: Clone> MetaInterp<M> {
             // `is_resume_guard_copied()` predicate pair on the FailDescr
             // trait; including both keeps the stamp aligned with the 7
             // metainterp descrs that override `set_rd_loop_token_clt`
-            // (mod.rs:632 audit).
+            // (`set_rd_loop_token_clt` overrides).
             if descr.is_resume_guard() || descr.is_resume_guard_copied() {
                 // Pyre-only owning-trace stamp.  RPython resolves descr
                 // identity by `id(descr)` (`history.py:125`); pyre's
@@ -11570,8 +11576,9 @@ impl<M: Clone> MetaInterp<M> {
             // `compile.py:197 if descr.original_jitcell_token is not
             //                  original_jitcell_token`. pyre stores the
             // owner's `number` in `LoopTargetDescr.original_jitcell_token_number`
-            // (set by `compile.py:237` / `compile.py:289` counterparts at
-            // `pyjitpl.rs:3886`/`5518`).  Empirically (probe
+            // (set by this file's `compile.py:237` / `compile.py:289`
+            // counterparts, which call `set_original_jitcell_token_number`).
+            // Empirically (probe
             // `MAJIT_PROBE_TARGETTOKEN_NONE` against the full pyre/check.py
             // suite, dynasm 14/14) every JUMP TargetToken reaching the
             // walker has the owner number backfilled, so the
@@ -11625,7 +11632,7 @@ impl<M: Clone> MetaInterp<M> {
         // TODO: crate-boundary: the registration walker
         // is ported in `pyre/pyre-jit/src/eval.rs::register_quasi_immutable_deps`
         // and called at the post-compile sites that follow `compile_loop`
-        // / `compile_bridge` in `eval.rs:2513` / `eval.rs:3059`.  It cannot
+        // / `compile_bridge` in `eval.rs`.  It cannot
         // live inside this method because the dependency target is a
         // `pyre_interpreter::DictStorage` slot watcher; majit-metainterp
         // sits below the pyre/* crates and may not import them
@@ -11634,7 +11641,7 @@ impl<M: Clone> MetaInterp<M> {
         // that the registration walker can execute here without the
         // pyre-interpreter import.  `last_quasi_immutable_deps` (the
         // pyre-side analog of `loop.quasi_immutable_deps`) is populated
-        // by the optimizer (`pyjitpl.rs:5407` / `:5774`) and drained
+        // in this file from `optimizer.quasi_immutable_deps` and drained
         // by the eval.rs walker at the same call-graph depth as
         // `compile.py:204-207`.
 
@@ -11650,9 +11657,8 @@ impl<M: Clone> MetaInterp<M> {
     /// `pyjitpl.py:2982` / `:3162` upstream pattern step 1
     /// `JitCell.get_procedure_token()` (`warmstate.py:191-196`) is the
     /// canonical green_key → token lookup; pyre routes through
-    /// `WarmEnterState::get_procedure_token` (warmstate.rs:862) which
-    /// reads `cell.loop_token.as_ref()` directly per F.1 audit
-    /// (`tfinal_f0_f1_landed_2026_05_07`).
+    /// `WarmEnterState::get_procedure_token` (warmstate.rs) which
+    /// reads `cell.loop_token.as_ref()` directly.
     ///
     /// `pyjitpl.py:3922-3923` `has_compiled_targets(token)` is
     /// `bool(token) and bool(token.target_tokens)`. pyre answers that
@@ -11664,7 +11670,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Invalidation in PyPy is `quasiimmut.py:99 looptoken.invalidated = True`
     /// — a single boolean flag, not a clear of `target_tokens`. Pyre
     /// routes the `bool(token)` half through `WarmEnterState::
-    /// get_procedure_token` (`warmstate.rs:174`), which filters on
+    /// get_procedure_token` (`warmstate.rs`), which filters on
     /// `is_invalidated()`, so the post-`GUARD_NOT_INVALIDATED` `False`
     /// PyPy reports falls out naturally without an extra
     /// `is_invalidated` AND here.
@@ -12027,12 +12033,11 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// `warmstate.py:398` `loop_token = jitcell.get_procedure_token()`
     /// is the upstream lookup; pyre routes through
-    /// `WarmEnterState::get_procedure_token` (warmstate.rs:862) which
-    /// reads `cell.loop_token.as_ref()` per F.1 audit
-    /// (`tfinal_f0_f1_landed_2026_05_07`). The Arc identity returned
+    /// `WarmEnterState::get_procedure_token` (warmstate.rs) which
+    /// reads `cell.loop_token.as_ref()`. The Arc identity returned
     /// here is the same `Arc<JitCellToken>` that `compiled_loops[gk].token`
     /// holds (both slots share
-    /// one Arc); convergence to a sole owner happens at F.6 when the
+    /// one Arc); convergence to a sole owner happens when the
     /// `compiled_loops` HashMap retires.
     ///
     /// Cells with no compiled entry (key not yet compiled, or already
@@ -12118,9 +12123,9 @@ impl<M: Clone> MetaInterp<M> {
         // bridge attachments. Upstream `JitCellToken.target_tokens`
         // (`history.py:501-540`) keeps every retraced loop's code alive
         // naturally; pyre stores it on the compiled_loops side until the
-        // F.3-orthodox slice migrates the field onto JitCellToken. The
-        // probe stays here so the residual compiled_loops touch surfaces in
-        // the F.0 audit.
+        // field migrates onto JitCellToken. The
+        // probe stays here so the residual compiled_loops touch stays
+        // visible.
         let Some(compiled) = self.compiled_loops.get(&green_key) else {
             return false;
         };
@@ -12388,7 +12393,7 @@ impl<M: Clone> MetaInterp<M> {
                 compiled.next_global_opref,
             )
         };
-        // Box Identity Phase E Step 2a: stage bridge_inputarg_base based
+        // Box identity: stage bridge_inputarg_base based
         // on the parent loop's recorded next_global_opref. See
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
@@ -12435,7 +12440,7 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         // bridge_inputargs already carry their type via the typed `InputArg`
         // variant + `OpRef::input_arg_typed(index, tp)` reconstruction;
-        // see optimizer.rs:5016 `opref_type` priority-0 variant-tag read.
+        // see `opref_type` in `optimizer.rs` (priority-0 variant-tag read).
         // The legacy `constant_types.insert(arg.index, arg.tp)` was redundant.
         optimizer.snapshot_boxes = prepared.snapshot_boxes;
         optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
@@ -13018,7 +13023,7 @@ impl<M: Clone> MetaInterp<M> {
                 "compile_bridge expects bridge origin descr.trace_id() to be a real allocated id, not the FINISH-singleton sentinel"
             );
             let pending = compiled.traces.get(&source_trace_id).and_then(|trace| {
-                // F.5-orthodox.1 site #3: route guard identity through
+                // Route guard identity through
                 // `exit_layouts.descr` instead of `guard_op_indices →
                 // trace.ops[idx]`. The descr Arc already carries
                 // `fail_arg_types` (resume.py:467 / history.py:307 parity),
@@ -13084,7 +13089,7 @@ impl<M: Clone> MetaInterp<M> {
                 pending,
             )
         };
-        // Box Identity Phase E Step 2a: stage bridge_inputarg_base based on
+        // Box identity: stage bridge_inputarg_base based on
         // the parent loop's recorded next_global_opref. See
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
@@ -13424,12 +13429,12 @@ impl<M: Clone> MetaInterp<M> {
             // `original_loop_token` is the *source descr's* owning JCT
             // (= `metainterp.resumekey_original_loop_token`), not the
             // current running loop's token.  Pass `source_jct` so backend
-            // stamping (`runner.rs:1670`, `compiler.rs:13352`) reaches the
+            // stamping (`runner.rs`, `compiler.rs`) reaches the
             // correct CLT for newly compiled bridge-internal guards.
             // `previous_tokens` lets cranelift attach the bridge to retired
             // predecessor descrs whose machine code is still running (it
             // cannot patch in place); see `compile_bridge` trait doc.
-            // Slice X-G: upgrade Weak refs to strong Arcs for the backend
+            // Upgrade Weak refs to strong Arcs for the backend
             // call; dead entries are filtered out.  The backend signature
             // continues to take `&[Arc<JitCellToken>]` until a follow-up
             // converts it to Weak.
@@ -13447,7 +13452,7 @@ impl<M: Clone> MetaInterp<M> {
                     optimized_ops.len()
                 );
             }
-            // Slice QQ-7: source guard's recovery_layout is read from
+            // The source guard's recovery_layout is read from
             // the metainterp's `StoredExitLayout` cache (per-trace,
             // keyed by per-trace fail_index) and passed to the backend
             // so the backend doesn't need a descr-side cache.
@@ -13713,7 +13718,7 @@ impl<M: Clone> MetaInterp<M> {
         // RPython's `isinstance(descr, ResumeGuardExcDescr)`).  The
         // `descr_arc` here is the same Arc identity that
         // `build_guard_metadata` cloned onto the originating guard op
-        // (compile.rs:984), so reading the subtype tag through it
+        // (compile.rs), so reading the subtype tag through it
         // matches the previous `op.descr.is_guard_exc()` walk.
         let is_exception_guard = descr_arc.is_guard_exc();
 
@@ -15039,7 +15044,7 @@ impl<M: Clone> MetaInterp<M> {
             //       last_exc_box = op           # op.setref_base(val)
             // The guard is recorded in both arms; only the box stored as
             // last_exc_box differs. Pyre's const_ref(val) is the orthodox
-            // ConstPtr equivalent (trace_ctx.rs:583).
+            // ConstPtr equivalent (`TraceCtx::const_ref`).
             let last_exc_box = if let Some(ctx) = self.tracing.as_mut() {
                 let exc_class_box = ctx.const_int(typeptr);
                 let guard_op = ctx.guard_exception(exc_class_box, 0);
@@ -15594,7 +15599,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `MetaInterp::compile_done_with_this_frame` (pyjitpl.py:3198).
     /// TODO: in pyre the `recorder.finish()` +
     /// `compile.compile_trace` work also happens at the
-    /// `TraceAction::Finish` dispatch point (jitdriver.rs:956 →
+    /// `TraceAction::Finish` dispatch point (jitdriver.rs →
     /// `MetaInterp::finish_and_compile`) because production function-
     /// return paths route through the trace-recorder pipeline rather
     /// than this method.  When `compile_done_with_this_frame` raises
@@ -15731,14 +15736,14 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// `self.history.record(rop.FINISH, ...)`
     /// + `compile.compile_trace` are also driven from the
-    /// `TraceAction::Finish` dispatch (jitdriver.rs:956 →
+    /// `TraceAction::Finish` dispatch (jitdriver.rs →
     /// `MetaInterp::finish_and_compile`) — pyre's recorder owns the
     /// finish/compile sequence and emits FINISH from there with the
     /// matching `make_fail_descr_typed(result_types)` descr (the
     /// `done_with_this_frame_descr_*` analog).  This method runs the
     /// upstream skeleton — `store_token_in_vable` (idempotent because
-    /// the frontend already records it before TraceAction::Finish at
-    /// mod.rs:3267), result_type/exits/token bookkeeping, and surfacing
+    /// the frontend already records it before TraceAction::Finish),
+    /// result_type/exits/token bookkeeping, and surfacing
     /// `SwitchToBlackhole` to the caller — without re-emitting the
     /// FINISH op.
     pub fn compile_done_with_this_frame(
@@ -15800,7 +15805,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `unwind_to_exception_handler` at BC_RAISE/BC_RERAISE: when the
     /// framestack drains with no `catch_exception`, dispatch returns
     /// `TraceAction::Finish { finish_args: [last_exc_box], finish_arg_types:
-    /// [Ref] }` directly (dispatch.rs:298), so the normal
+    /// [Ref] }` directly (pyjitpl/dispatch.rs), so the normal
     /// `finish_and_compile` path records FINISH + compiles — matching
     /// `pyjitpl.py:3238-3245`. This MetaInterp-side hook covers the
     /// rarer path where an exception surfaces during residual-call
@@ -15828,7 +15833,7 @@ impl<M: Clone> MetaInterp<M> {
         // Routes through the session-owned `compile_finish_from_active_session`
         // so both the MetaInterp-call-chain exception exit (this method)
         // and the pyre-dispatch-layer `unwind_to_exception_handler`
-        // (dispatch.rs:298, emits `TraceAction::Finish` with [Ref])
+        // (in `pyjitpl/dispatch.rs`, emits `TraceAction::Finish` with [Ref])
         // share a single compile path, matching upstream's single-owner
         // `compile.compile_trace` invocation for the FINISH.
         let exits: Vec<OpRef> = valuebox.into_iter().collect();
@@ -16950,7 +16955,8 @@ impl<M: Clone> MetaInterp<M> {
             }
             // pyjitpl.py:2074-2077: handle resbox void / make_result_of_lastop
             // — make_result_of_lastop's target_index plumbing is not
-            // wired here yet; documented above on miframe_execute_varargs.
+            // wired here yet; `miframe_execute_varargs` in this file carries
+            // the same gap and documents it.
             let resbox_pair = match resbox {
                 Some(opref) if descr_view.result_type() != majit_ir::Type::Void => {
                     Some((opref, c_result))
@@ -17559,7 +17565,7 @@ pub(crate) fn decide_recursive_inline(
 }
 
 /// pyjitpl.py:2493-2503 routes through `crate::jitexc::DoneWithThisFrame`
-/// (the single jitexc.py mirror — see jitexc.rs:39).  This alias lets
+/// (the single jitexc.py mirror — see `jitexc.rs`).  This alias lets
 /// the rest of this module refer to it as `DoneWithThisFrame` without a
 /// qualified path while keeping the one authoritative definition.
 pub use crate::jitexc::DoneWithThisFrame;
@@ -17769,7 +17775,7 @@ pub mod counters {
     /// routes this id to `cpu.tracker.total_compiled_loops`.  pyre has
     /// no global per-CPU tracker yet — [`crate::jitprof::JitProfiler::get_counter`]
     /// returns `None` for this id (see
-    /// `majit-backend/src/lib.rs:939-943` note).
+    /// the `majit-backend/src/lib.rs` note).
     pub const TOTAL_COMPILED_LOOPS: i32 = 22;
     /// jit.py:1439 `Counters.TOTAL_COMPILED_BRIDGES`.  See the
     /// [`TOTAL_COMPILED_LOOPS`] note for the adaptation status.
@@ -17800,7 +17806,8 @@ impl SwitchToBlackhole {
     /// raising_exception=True)` per pyjitpl.py:3691-3692 —
     /// `OS_NOT_IN_TRACE` call raised during tracing.  Mirrors the
     /// keyword argument upstream sets explicitly so the blackhole
-    /// resume path (blackhole.rs:3469-3487) re-raises the helper-side
+    /// resume path (`convert_and_run_from_pyjitpl` in `blackhole.rs`)
+    /// re-raises the helper-side
     /// exception instead of silently dropping it.
     pub fn abort_escape() -> Self {
         Self {
@@ -18044,7 +18051,7 @@ pub struct MetaInterpStaticData {
     /// resolved.  The cache must outlive a single trace so cross-trace
     /// / cross-bridge recorders receive the same `Arc<dyn Descr>`
     /// identity for the same lltype ARRAY — `descr_identity`
-    /// (`descr.rs:494`) is Arc-address-based, so without the
+    /// (`descr.rs`) is Arc-address-based, so without the
     /// translation-wide table, two traces compiled for the same loop
     /// would surface distinct array descrs from `Arc::ptr_eq`'s
     /// perspective and break optimizer/backend descr-keyed caches.
@@ -18064,7 +18071,7 @@ pub struct MetaInterpStaticData {
     /// happen to share `(base_size, itemsize, item_type,
     /// is_item_signed)` (e.g. one is an array-of-pointers, one is an
     /// array-of-structs with interior fields) get distinct cache slots.
-    /// `make_array_descr_from_lltype_shape` (`descr.rs:3761`) is the
+    /// `make_array_descr_from_lltype_shape` (`descr.rs`) is the
     /// constructor pyre's dispatch path uses.  It threads the
     /// `BhDescr::Array` discriminants `type_id`, the pointer/struct
     /// `flag` selection, `lendescr`, and `is_pure` so the materialised
@@ -18355,7 +18362,7 @@ impl MetaInterpStaticData {
     /// ```
     ///
     /// TODO: pyre's `CodeWriter`
-    /// (`majit-translate/src/codewriter/codewriter.rs:64-77`) does
+    /// (`majit-translate/src/codewriter/codewriter.rs`) does
     /// **not** own `callcontrol` — RPython's does
     /// (`codewriter.py:CodeWriter.__init__` keeps both).  The Rust
     /// borrow-checker constraint is documented at the CodeWriter
@@ -18379,7 +18386,7 @@ impl MetaInterpStaticData {
         // pyjitpl.py:2257-2258
         //     self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)
         // TODO: pyre's `BlackholeInterpBuilder`
-        // (`blackhole.rs:3088 setup_insns`) is wired piecewise from
+        // (`setup_insns` in `blackhole.rs`) is wired piecewise from
         // per-jitdriver bring-up rather than a single constructor call
         // — bringing the constructor-form back here cascades into a
         // refactor of `BlackholeInterpBuilder`'s allocator and
@@ -18417,7 +18424,7 @@ impl MetaInterpStaticData {
         // pyjitpl.py:2266 `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`
         // TODO: pyre populates `jitdrivers_sd`
         // incrementally via `register_jitdriver_sd`
-        // (`mod.rs:11576-11589`).  Wholesale assignment here would
+        // (in this file).  Wholesale assignment here would
         // clobber the incremental work; the convergence path is to
         // flip `register_jitdriver_sd` from "owner" to "validator"
         // once the codewriter pre-builds the full list at
@@ -18455,7 +18462,7 @@ impl MetaInterpStaticData {
         //     self.cpu.propagate_exception_descr = exc_descr
         // TODO: pyre runs the equivalent reattach
         // through `finish_setup_descrs_for_jitdrivers` from
-        // `register_jitdriver_sd` (`mod.rs:11588`).  Repeating the
+        // `register_jitdriver_sd` (in this file).  Repeating the
         // loop here would double-attach.
 
         // pyjitpl.py:2285 `self.globaldata = MetaInterpGlobalData(self)`
@@ -18653,7 +18660,7 @@ impl MetaInterpStaticData {
         // (`pyjitpl.py:2245-2253`) so the per-trace serialised stream
         // can recover the descr from a small integer instead of a raw
         // Python object pointer.  Pyre's lift writes through the
-        // existing trait-method `Descr::set_descr_index` (`descr.rs:1973`
+        // existing trait-method `Descr::set_descr_index` (`descr.rs`
         // and siblings); descrs without an override default to a no-op
         // and stay at -1 (the initial sentinel from
         // `BackendDescr.descr_index = -1`, `history.py:1092`).
@@ -20029,7 +20036,8 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:3691: raise SwitchToBlackhole(Counters.ABORT_ESCAPE,
         //                                          raising_exception=True)
         // — the `raising_exception=True` keyword argument is part of the
-        // contract; the blackhole resume path (blackhole.rs:3469-3487)
+        // contract; the blackhole resume path
+        // (`convert_and_run_from_pyjitpl` in `blackhole.rs`)
         // re-raises the helper-side exception only when it is set.
         assert_eq!(
             result,
@@ -20061,10 +20069,11 @@ mod metainterp_static_data_tests {
 
     extern "C" fn execute_varargs_float_concrete_helper(a: i64) -> i64 {
         // Mirrors the `concrete_ptr` shape `#[jit_module]` emits for a
-        // Float helper (majit-macros/src/lib.rs:267): the f64 result is
+        // Float helper (`helper_return_to_i64` in
+        // `majit-macros/src/lib.rs`): the f64 result is
         // pre-packed via `f64::to_bits` and the wrapper returns through
         // the integer return register.  Same ABI shape as
-        // `bh_portal_runner` (pyre-jit/src/call_jit.rs:467).
+        // `bh_portal_runner` (pyre-jit/src/call_jit.rs).
         let value = a as f64 * 0.5;
         value.to_bits() as i64
     }
@@ -20082,7 +20091,7 @@ mod metainterp_static_data_tests {
         // and never reaches this arm.  The executor routes through
         // `call_int_function` (i64-bits ABI), and callers recover the
         // f64 via `f64::from_bits` when the slot needs to be interpreted
-        // as a float (pyjitpl.rs:8901-8902).  This test pins that
+        // as a float (`miframe_execute_varargs` in this file).  This test pins that
         // contract so a regression that re-introduces the f64-ABI
         // transmute path is caught.
         use crate::executor;
@@ -20545,7 +20554,7 @@ mod metainterp_static_data_tests {
     /// `_opimpl_recursive_call` and `do_recursive_call` so the verify
     /// runs at `do_recursive_call` entry. A non-Const greens slot
     /// (Box leaking through) must trip the `is_constant()` panic from
-    /// `verify_green_args` (frame.rs:222-227).
+    /// `verify_green_args` (pyjitpl/frame.rs).
     #[test]
     #[should_panic(expected = "is not a Const")]
     fn do_recursive_call_panics_when_greens_contain_non_const() {
@@ -21098,7 +21107,7 @@ mod metainterp_static_data_tests {
         // pyjitpl.py:3386-3387 — when class_of_last_exc_is_const is set
         // before the call, last_exc_box is `ConstPtr(val)`, NOT the
         // guard op's box. Pyre uses `const_ref(val)` as the orthodox
-        // ConstPtr equivalent (trace_ctx.rs:583).
+        // ConstPtr equivalent (`TraceCtx::const_ref`).
         use crate::BackEdgeAction;
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
@@ -23294,7 +23303,7 @@ mod tests {
         rd_numb: Vec<u8>,
         rd_consts: Vec<majit_ir::Const>,
     ) {
-        // Slice X-G: `CompiledEntry.token` is now `Weak`; upgrade for the
+        // `CompiledEntry.token` is `Weak`; upgrade for the
         // duration of the patch.  Test-only: the strong ref is held by
         // `warm_state.attach_procedure_to_interp` registered earlier in
         // the fixture, so the upgrade is guaranteed to succeed here.

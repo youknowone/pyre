@@ -775,7 +775,7 @@ pub trait JitState: Sized {
     /// TODO (framestack-lift ):
     /// this is the JitState-level entry point for the framestack-lift
     /// epic.  It mirrors `JitCodeSym::populate_frame_int_regs`
-    /// (`pyjitpl/dispatch.rs:113-146`) but is reachable from
+    /// (`pyjitpl/dispatch.rs`) but is reachable from
     /// `merge_point` / `force_finish_trace` where the generic `S::Sym`
     /// is not constrained to implement `JitCodeSym`.  Once
     /// `JitState::Sym: JitCodeSym` becomes the universal contract
@@ -1471,7 +1471,7 @@ pub trait JitState: Sized {
             // optimizer/recorder failed to attach the descr and replaying
             // the write would corrupt memory.  Fail loud rather than
             // silently skipping (parity with the `expect` at
-            // `compile.rs:1029`).
+            // `compile.rs`'s `build_guard_metadata`).
             let descr = pending
                 .descr
                 .as_ref()

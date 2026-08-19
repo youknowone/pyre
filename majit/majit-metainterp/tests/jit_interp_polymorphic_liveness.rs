@@ -21,14 +21,15 @@
 //! 2. `__dispatch_jitcode_*` builder calls AFTER `install_canonical_liveness`
 //!    must not grow `asm.all_liveness()` — every per-marker triple (both
 //!    dispatch-body and per-arm sub-builder) must already be registered by
-//!    prebuild.  Mirrors the runtime assertion at `codegen_trace.rs:178-185`.
+//!    prebuild.  Mirrors the runtime assertion at `codegen_trace.rs`'s `generate_trace_fn`.
 //! 3. Every lowerable arm's sub-JitCode embedded under the dispatch
-//!    JitCode (`BC_INLINE_CALL` target, jitcode_lower/dispatch.rs:1860-1872)
+//!    JitCode (`BC_INLINE_CALL` target, `jitcode_lower/dispatch.rs`'s
+//!    `lower_dispatch_chain`)
 //!    must emit at least one per-pc BC_LIVE marker past the leading
 //!    canonical, and the union of those per-pc offsets across all lowerable
 //!    arms must contain at least two distinct values (the polymorphism
 //!    check).  An arm that fell to `__sub_builder.abort()` at
-//!    `jitcode_lower/dispatch.rs:1874` would produce a sub-JitCode with
+//!    `jitcode_lower/dispatch.rs`'s `lower_dispatch_chain` would produce a sub-JitCode with
 //!    zero BC_LIVE markers — the per-arm assertion catches that regression
 //!    even when the remaining arms still emit ≥2 distinct offsets between
 //!    them.
@@ -52,7 +53,8 @@ const OP_END: u8 = 0;
 pub type Bytecode = [u8];
 
 // `BytecodeExt::get_op` is consumed by the macro-emitted `__trace_*` fn
-// (codegen_trace.rs:61 `program.get_op(pc)`), but the integration tests
+// (`codegen_trace.rs`'s `generate_trace_fn`, which reproduces the fixture
+// body's `program.get_op(pc)`), but the integration tests
 // below drive only `__dispatch_jitcode_*` / `__prebuild_*`, so the compiler
 // flags the trait as dead code in this binary's reachability graph.
 #[allow(dead_code)]
@@ -195,7 +197,7 @@ fn prebuild_registers_more_than_canonical_entry() {
 
 #[test]
 fn factory_does_not_grow_asm_after_prebuild() {
-    // Mirror the runtime assertion at `codegen_trace.rs:178-185`: every
+    // Mirror the runtime assertion at `codegen_trace.rs`'s `generate_trace_fn`: every
     // per-marker triple emitted by the dispatch JitCode builder (and its
     // per-arm sub-builders embedded via `BC_INLINE_CALL`) must already be
     // in `asm.all_liveness` (prebuild hit), so `finalize_liveness` only
@@ -223,10 +225,10 @@ fn distinct_arms_emit_distinct_bc_live_offsets() {
     //
     // (1) Per-arm survival: every lowerable arm's sub-JitCode embedded
     //     under the dispatch JitCode (`BC_INLINE_CALL` target,
-    //     jitcode_lower/dispatch.rs:1860-1872) must emit at least one
+    //     `jitcode_lower/dispatch.rs`'s `lower_dispatch_chain`) must emit at least one
     //     per-pc BC_LIVE marker past the leading canonical.  If the
     //     dispatch arm lowerer fell to `__sub_builder.abort()` at
-    //     `jitcode_lower/dispatch.rs:1874` for one of the four
+    //     `jitcode_lower/dispatch.rs`'s `lower_dispatch_chain` for one of the four
     //     `SUM`/`GUARD_A` arms, the resulting sub-JitCode body is a
     //     single `BC_ABORT` byte with zero BC_LIVE markers — the
     //     per-arm assertion below catches that regression.  The
@@ -251,10 +253,11 @@ fn distinct_arms_emit_distinct_bc_live_offsets() {
         .expect("dispatch lower must succeed for fixture");
 
     // Identify lowerable arm sub-JitCodes by the leading
-    // `__sub_builder.live_placeholder()` (jitcode_lower/dispatch.rs:1863):
+    // `__sub_builder.live_placeholder()` (`jitcode_lower/dispatch.rs`'s
+    // `lower_dispatch_chain`):
     // a lowerable sub-JitCode body starts with BC_LIVE at offset 0.
     // Halt/Nop arms produce an empty body (no BC_LIVE); the
-    // abort-fallback path at :1874 produces a single BC_ABORT byte
+    // abort-fallback path in the same function produces a single BC_ABORT byte
     // (also no BC_LIVE) — both shapes collapse to "no BC_LIVE markers"
     // and are filtered out here.  An abort-fallback regression on a
     // *lowerable* arm therefore reduces the count of qualifying
@@ -287,7 +290,7 @@ fn distinct_arms_emit_distinct_bc_live_offsets() {
     // Polymorphic4State fixture: four lowerable arms (OP_GUARD_A /
     // OP_SUM_AB / OP_SUM_ABC / OP_SUM_ABCD).  Fewer than four
     // qualifying sub-JitCodes means at least one lowerable arm fell to
-    // the abort-fallback at jitcode_lower/dispatch.rs:1874.
+    // the abort-fallback in `jitcode_lower/dispatch.rs`'s `lower_dispatch_chain`.
     assert!(
         per_arm_offsets.len() >= 4,
         "expected at least 4 lowerable arm sub-JitCodes (one per \
@@ -346,7 +349,7 @@ fn install_canonical_liveness_registers_dispatch_jitcode_singleton() {
 /// JitCode descr table must be `RuntimeBhDescr::JitCode` (frame-chain
 /// interpreter path), never fnaddr handlers (which target native call
 /// wrappers). Production runtime enforcement at
-/// `pyjitpl/dispatch.rs:1690-1692` panics if `descrs[sub_idx].as_jitcode()`
+/// `pyjitpl/dispatch.rs`'s `run_one_step` panics if `descrs[sub_idx].as_jitcode()`
 /// is `None`; this build-time test pins the lowerer's emit invariant so
 /// accidental migration to a fnaddr emit path surfaces at compile + test
 /// time, not at first dispatch. RPython parity: `blackhole.py:150-157`
@@ -365,7 +368,8 @@ fn dispatch_inline_call_descrs_have_jitcode_entries() {
         if let majit_metainterp::jitcode::RuntimeBhDescr::JitCode(jc) = d {
             jitcode_count += 1;
             // Each sub-jitcode body is at least 1 byte. Cross-scope arms
-            // fall back to a single abort byte (`jitcode_lower.rs:5170-5202`),
+            // fall back to a single abort byte
+            // (`jitcode_lower/dispatch.rs`'s `lower_dispatch_chain`),
             // which is intentional — but a zero-byte body would mean the
             // build pipeline silently dropped the sub-jitcode entirely.
             assert!(

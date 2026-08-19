@@ -136,7 +136,7 @@ fn size_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> majit_ir::DescrR
 /// a struct-literal `setfield_gc`), rebuild the descr group so the
 /// FieldDescr carries `index_in_parent` (`descr.py:228`) + `parent_descr
 /// = get_size_descr(STRUCT)` (`descr.py:238`); `optimize_setfield_gc`
-/// (`optimizeopt/virtualize.rs:689`) requires the parent to virtualize
+/// (`optimizeopt/virtualize.rs`) requires the parent to virtualize
 /// the store.  A parentless field (getfield round-trip / non-virtualized
 /// store) keeps the placeholder builder.
 pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, majit_ir::DescrRef) {
@@ -832,7 +832,7 @@ pub trait JitCodeSym {
     /// because the macro emits per-opcode jitcodes that read state
     /// directly from the symbolic side-channel.  At guard-capture
     /// time `MIFrame::get_list_of_active_boxes`
-    /// (`pyjitpl/frame.rs:430-440`) still expects live state in
+    /// (`pyjitpl/frame.rs`) still expects live state in
     /// `int_regs` / `int_values`, so this hook copies the
     /// `__JitSym_<fn>` slots into the frame's banks at the canonical
     /// liveness indices defined by `live_slots_for_state_field_jit`
@@ -893,7 +893,7 @@ pub trait JitCodeSym {
 
     /// \[FR\] Snapshot the sym's WORKING scalar (and fixed-array) state before an
     /// inline recursive-portal callee overwrites it.  `BC_LOAD/STORE_STATE_FIELD`
-    /// read/write the single shared sym (dispatch.rs:2831), not a per-frame
+    /// read/write the single shared sym, not a per-frame
     /// register, so an inline callee mutates the caller's live scalar state in
     /// place; the caller's values must be saved here and restored on return.
     /// Virt-array elements live in the vable shadow (nested separately), so only
@@ -959,7 +959,7 @@ pub trait JitCodeSym {
 pub trait JitCodeRuntime {
     fn label_at(&self, pc: usize) -> usize;
 
-    /// Slice X-D: resolve a `JitCellToken.number` to the production
+    /// Resolve a `JitCellToken.number` to the production
     /// `Arc<JitCellToken>` that the warm cell / `CompiledEntry::token` /
     /// `alive_loops` already hold.  When the dispatcher sees a
     /// `BC_CALL_ASSEMBLER_*` opcode it asks the runtime for the real Arc
@@ -1038,7 +1038,7 @@ pub trait JitCodeRuntime {
     /// a positional C-ABI function, so it cannot be called through
     /// `call_int_function`.  The runtime drives `execute_token_raw(token,
     /// reds)` (mirroring `run_compiled_raw_detailed_with_values`
-    /// mod.rs:7312) and decodes the single int FINISH output.  `reds` are
+    /// in `pyjitpl.rs`) and decodes the single int FINISH output.  `reds` are
     /// the marshalled red call args (greens are baked into the loop the
     /// `token` already names).  Returns `None` when the loop did not finish
     /// with an int result or when the runtime has no backend (the default,
@@ -1127,7 +1127,7 @@ where
     }
 }
 
-/// Slice X-D-aware `JitCodeRuntime` carrying the `label_at` /
+/// `JitCodeRuntime` carrying the `label_at` /
 /// `jitcell_token_arc_for_number` closures plus the recursive-call recursive-call
 /// seams (inline decision, green-key target resolver, concrete loop
 /// executor).  Used by `MetaInterp::trace_jitcode_with_framestack` so the
@@ -1284,7 +1284,7 @@ pub struct JitCodeMachine<'mi, S, R> {
     cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
     issubclass: Option<fn(i64, i64) -> bool>,
     /// Outer interpreter pc captured BEFORE the
-    /// `MIFrame::setup_call` reset (frame.rs:946 sets `frame.pc = 0`),
+    /// `MIFrame::setup_call` reset (it sets `frame.pc = 0`),
     /// supplied by callers that walk through `setup_call` between
     /// `MIFrame::setup` and `run_to_end`.  When `Some(pc)`, `run_to_end`
     /// uses it for the `sym.begin_portal_op(pc)` hook and diagnostic
@@ -1449,7 +1449,8 @@ where
             //
             // `code_cursor` is post-call and already points at this residual
             // call's trailing `-live-` marker, which the `after_residual_call`
-            // snapshot reads directly (frame.rs:846-849); `MIFrame::pc` is
+            // snapshot reads directly (`MIFrame::get_list_of_active_snapshot_boxes`
+            // in `pyjitpl/frame.rs`); `MIFrame::pc` is
             // only the saved resume position and stays 0 in an inline
             // sub-frame.  Same source as
             // `finish_residual_call_exception_path`, which records the
@@ -1471,7 +1472,7 @@ where
     /// inline `op.fail_args` and attaches a snapshot built from the
     /// current `MIFrame`'s `int_regs` (populated from `__JitSym_<fn>` via
     /// `JitCodeSym::populate_frame_int_regs`).  The optimizer's
-    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:3200`) then
+    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs`) then
     /// derives `op.fail_args` from the snapshot via `_number_boxes`,
     /// matching RPython's `pyjitpl.MetaInterp.generate_guard`
     /// (`pyjitpl.py:2558-2602`) +
@@ -1513,9 +1514,9 @@ where
         }
         if let Some(fail_args) = sym.fail_args_with_ctx(ctx) {
             let fail_types = sym.fail_args_types();
-            // slice 3a: snapshot is the source of truth — the
+            // The snapshot is the source of truth — the
             // optimizer's `store_final_boxes_in_guard`
-            // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from
+            // (`optimizeopt/mod.rs`) overwrites `op.fail_args` from
             // the snapshot built below, so the inline `fail_args` copy
             // that the legacy
             // `record_guard_typed_with_fail_args` /
@@ -1670,14 +1671,14 @@ where
         // framestack walk. `resume_pc` here is `opcode_pc =
         // code_cursor - 1` (dispatch.rs ~2203), the guard op's JitCode
         // position, whose `opcode_pc - SIZE_LIVE_OP` points at the LIVE
-        // marker that `get_list_of_active_boxes` (frame.rs:628) reads.
+        // marker that `get_list_of_active_boxes` (frame.rs) reads.
         // The snapshot's liveness decode REQUIRES this to be a JitCode
         // PC; using an interpreter PC underflows `pc - SIZE_LIVE_OP`.
         // For an `after_residual_call` guard
         // (`finish_residual_call_exception_path`) `resume_pc` is instead
         // the post-call `code_cursor` itself: it already points AT that
         // residual call's trailing LIVE marker, so the snapshot reads it
-        // directly (frame.rs:846-849) WITHOUT the `- SIZE_LIVE_OP`
+        // directly (`get_list_of_active_snapshot_boxes`) WITHOUT the `- SIZE_LIVE_OP`
         // step-back. `MIFrame::pc` (the saved resume position) stays 0 in
         // an inline sub-frame, so it must not be used here.
         self.frames.frames[top_idx].pc = resume_pc;
@@ -1832,7 +1833,7 @@ where
     ///
     /// `replace_box` has no whole-metainterp equivalent here; writing the
     /// promoted constant back into the source register is the same stand-in
-    /// `BC_SWITCH` already uses for it (`dispatch.rs:4585`), and it is what
+    /// the `BC_SWITCH` arm in this file already uses for it, and it is what
     /// keeps a second read of the same register from emitting a redundant
     /// `GUARD_VALUE`.
     fn implement_guard_value(
@@ -2015,8 +2016,9 @@ where
     /// into a `DescrRef` suitable for `record_op_with_descr`.
     ///
     /// The dispatch JitCode body's opcode-fetch op (BC_GETARRAYITEM_GC_I)
-    /// stores the array shape in the canonical pool (`assembler.rs:771
-    /// add_gc_byte_array_descr` → `CanonicalBhDescr::Array`). The
+    /// stores the array shape in the canonical pool
+    /// (`jitcode/assembler.rs`'s `add_gc_byte_array_descr` →
+    /// `CanonicalBhDescr::Array`). The
     /// trace-side recorder needs an `Arc<dyn Descr>` reference; the
     /// translation-wide `MetaInterpStaticData::dispatch_array_descr_cache`
     /// memoises the `Arc<SimpleArrayDescr>` so repeated resolutions of
@@ -2232,7 +2234,7 @@ where
     /// path so the byte/short/word/long load picks the right size +
     /// sign extension matching the descriptor — matching the
     /// dynasm-side `bh_getarrayitem_gc_i` impl
-    /// (`runner.rs:2277`) and PyPy's `llmodel.py:591
+    /// (`runner.rs`) and PyPy's `llmodel.py:591
     /// unpack_arraydescr_size + read_int_at_mem(... size, sign)`.
     ///
     /// `debug_assert!` mirrors PyPy's `assert isinstance(arraydescr,
@@ -2294,7 +2296,7 @@ where
     /// Called by [`trace_jitcode`]-style entry points that go through
     /// `MIFrame::setup_call` between `MIFrame::setup` and
     /// `run_to_end`.  `setup_call` resets `frame.pc = 0`
-    /// (`frame.rs:946`) — preserving the new callee frame's "fresh"
+    /// (`pyjitpl/frame.rs`) — preserving the new callee frame's "fresh"
     /// pc-zero entry per RPython's `MIFrame.setup_call` shape — but
     /// that destroys the OUTER interpreter pc that `run_to_end` uses
     /// for `sym.begin_portal_op`.  Captures the pre-`setup_call` pc on
@@ -2335,8 +2337,9 @@ where
         self.cpu.cls_of_box(&const_box)
     }
 
-    /// rclass.ll_issubclass parity (mirrors blackhole-side
-    /// `blackhole.rs:7962-7966`).  `set_issubclass` wires the active
+    /// rclass.ll_issubclass parity (mirrors the blackhole-side
+    /// `handler_goto_if_exception_mismatch` in `blackhole.rs`).
+    /// `set_issubclass` wires the active
     /// backend/MetaInterp subclass-range resolver; the standalone fallback
     /// is exact-match only for fixtures without a GC descriptor.
     fn issubclass_of(&self, typeptr: i64, bounding_class: i64) -> bool {
@@ -2471,7 +2474,7 @@ where
         // `compile.compile_trace(...)`, `pyjitpl.py:3238-3245`).
         // `Abort` is only correct when there is no pending exception —
         // that happens when `BC_RERAISE` fires with no prior
-        // `last_exception_value` (dispatch.rs:1607-1609 already
+        // `last_exception_value` (the `BC_RERAISE` arm in this file already
         // shortcuts to Abort for that case, so here the exception slot
         // is guaranteed non-zero).
         if let Some(exc_box) = self.last_exception_box {
@@ -2561,7 +2564,8 @@ where
         // For GUARD_NO_EXCEPTION / GUARD_EXCEPTION (and GUARD_NOT_FORCED /
         // GUARD_ALWAYS_FAILS) `after_residual_call=True` so the snapshot
         // walks `frame.pc` directly instead of stepping back to the
-        // preceding LIVE marker (frame.rs:626-630 / pyjitpl.py:194-198).
+        // preceding LIVE marker (`MIFrame::get_list_of_active_boxes` in
+        // `pyjitpl/frame.rs` / pyjitpl.py:194-198).
         // `next_u*()` advances `code_cursor`; unlike RPython's single `pc`,
         // `MIFrame::pc` is only the saved resume position.  Capture the
         // post-call bytecode cursor so the snapshot reads the trailing
@@ -2739,7 +2743,7 @@ where
         // go through `MIFrame::setup_call` between `MIFrame::setup` and
         // `run_to_end` (e.g. the `trace_jitcode` / `trace_jitcode_with_args`
         // wrappers) capture the outer pc BEFORE the `setup_call` reset
-        // (`frame.rs:946 self.pc = 0`).  Without that, the portal-op
+        // (`MIFrame::setup_call` sets `self.pc = 0`).  Without that, the portal-op
         // bookkeeping and diagnostics would anchor on the freshly-zeroed
         // callee entry instead of the actual interpreter pc.  Falls back
         // to `frame.pc` for callers that skip `setup_call` (e.g. legacy
@@ -3005,7 +3009,8 @@ where
         if decision != crate::pyjitpl::InlineDecision::Inline {
             // `ResidualCall` here labels pyjitpl.py:1376's callee-not-compiled
             // case.  Under `warmrunnerstate.inlining` (pyjitpl.py:1381, always
-            // true here — warmstate.rs:471) that case takes
+            // true here — `WarmEnterState::inlining` in `warmstate.rs`
+            // defaults to `true`) that case takes
             // `assembler_call = True` (pyjitpl.py:1417) →
             // `direct_assembler_call` → `get_assembler_token`, which
             // synthesises the callee token on demand via `compile_tmp_callback`
@@ -3097,7 +3102,7 @@ where
     /// `CallAssembler`.  Runs the 8-step `do_residual_call` /
     /// CALL_ASSEMBLER protocol (force caller vable → concrete call →
     /// reload → record `CallAssembler*`), reusing the same vable helpers the
-    /// `BC_CALL_ASSEMBLER_INT` arm (dispatch.rs:5252) uses, but resolving
+    /// `BC_CALL_ASSEMBLER_INT` arm in this file uses, but resolving
     /// the callee loop token by GREEN KEY via the `JitCodeRuntime` seam
     /// (the portal is self-recursive and has no `fn_ptr_idx` slot) and
     /// driving the concrete leg through `execute_recursive_assembler_int`
@@ -3155,7 +3160,7 @@ where
 
         // Build the callee's red args.  A recursive portal call runs the
         // callee as its own compiled loop with a FRESH frame
-        // (`direct_assembler_call` mod.rs:12454 passes red args positionally;
+        // (`direct_assembler_call` in `pyjitpl.rs` passes red args positionally;
         // tl.py:76 `Stack(len(code))` is a fresh stack), so the reds are the
         // freshly-allocated callee state — not the caller's live registers.
         // Greens are baked into the callee loop's green key, not passed as
@@ -3235,7 +3240,7 @@ where
         }
 
         // 8-step `do_residual_call(assembler_call=True)` protocol, mirroring
-        // `BC_CALL_ASSEMBLER_INT` (dispatch.rs:5107-5133), except the
+        // the `BC_CALL_ASSEMBLER_INT` arm in this file, except the
         // concrete leg runs the callee's compiled loop through the
         // JITFRAME-ABI `execute_recursive_assembler_int` seam (which wraps
         // `execute_token_raw`) rather than a positional C-ABI call — a
@@ -3530,7 +3535,8 @@ where
                 // "no such cell" and "the cell holds the cleared sentinel" both
                 // arrive as a `Some`-shaped answer unless they are split here.
                 // The generated accessor is `self.#field.get(elem_idx).copied()`
-                // (`codegen_state.rs:329`): an in-range cell always answers
+                // (`codegen_state.rs`'s `generate_state_fields_jit_state`):
+                // an in-range cell always answers
                 // `Some(..)`, carrying `OpRef::NONE` when it was cleared.
                 match sym.state_array_ref(array_idx, elem_idx) {
                     // The cell was retired by `clear_sym_inputarg_bindings` and
@@ -3550,7 +3556,8 @@ where
                     // code; what has never occurred is the cleared cell.
                     //
                     // That zero is structural rather than untested. This opcode addresses
-                    // *fixed* arrays only -- `codegen_state.rs:323` builds its
+                    // *fixed* arrays only -- `generate_state_fields_jit_state`
+                    // (`codegen_state.rs`) builds its
                     // arms from `arrays` (`StateFieldKind::Array`), while
                     // `virt_arrays` is a separate collection reached through
                     // `BC_GETFIELD_VABLE_*`. A cell can hold the sentinel only
@@ -4186,17 +4193,18 @@ where
             //     return self.execute_with_descr(rop.GETARRAYITEM_GC_I,
             //                                    arraydescr, arraybox, indexbox)
             //
-            // Encoding (`assembler.rs:743-762`):
+            // Encoding (`jitcode/assembler.rs`'s `getarrayitem_gc_i`):
             //   [BC_GETARRAYITEM_GC_I][array_reg u8][index_reg u8]
             //   [descr_idx u16][dst u8]
             //
             // The dispatch JitCode body emits this op for `program[pc]`
             // opcode-fetch lowering (`jitcode_lower::lower_dispatch_body`).
-            // The Ref register holds the slice data pointer (codegen_trace.rs:193
+            // The Ref register holds the slice data pointer
+            // (`codegen_trace.rs`'s `generate_trace_fn` emits
             // `*const #env_type as *const () as usize`); the descr pool entry
             // is a `CanonicalBhDescr::Array { itemsize=1, base_size=0,
-            // is_item_signed=false, ... }` (`assembler.rs:771
-            // add_gc_byte_array_descr`).  Concrete eval reads byte at
+            // is_item_signed=false, ... }` (`jitcode/assembler.rs`'s
+            // `add_gc_byte_array_descr`).  Concrete eval reads byte at
             // `array_addr + index` and zero-extends to i64 (matching
             // CPython `ord()` 0..=255 semantics).
             jitcode::insns::BC_GETARRAYITEM_GC_I => {
@@ -4231,10 +4239,10 @@ where
                 // `llmodel.py:591 unpack_arraydescr_size + read_int_at_mem(
                 // gcref, ofs + index * size, size, sign)` and the
                 // dynasm-side `bh_getarrayitem_gc_i` impl
-                // (`runner.rs:2277`); previously this site hard-coded a
+                // (`runner.rs`); previously this site hard-coded a
                 // u8 zero-extend which only happened to work because the
                 // sole production caller (dispatch JitCode opcode-fetch)
-                // uses `add_gc_byte_array_descr` (`assembler.rs:771`,
+                // uses `add_gc_byte_array_descr` (`jitcode/assembler.rs`,
                 // itemsize=1, is_item_signed=false).  Generalising
                 // matches the descriptor-driven contract that
                 // BC_GETARRAYITEM_GC_I's name promises.
@@ -4242,7 +4250,8 @@ where
                 // SAFETY: `array_addr` is a GC-managed array pointer
                 // threaded through `Ref` register reads; `index_value`
                 // is bounded by the outer interpreter's array-length
-                // precondition (`codegen_trace.rs:193` narrows the fat
+                // precondition (`codegen_trace.rs`'s `generate_trace_fn`
+                // narrows the fat
                 // slice pointer to its data ptr; only emitted by
                 // `lower_dispatch_body` for slice-typed envs that the
                 // outer loop already bounds-checks).
@@ -5281,8 +5290,9 @@ where
                 //
                 // `cls_of_box` (model.py:199-201) reads the runtime
                 // typeptr; `issubclass_of` mirrors the blackhole-side
-                // resolution (`blackhole.rs:7962-7966
-                // cpu.bh_issubclass`) over RPython subclass ranges.
+                // resolution (`handler_goto_if_exception_mismatch` in
+                // `blackhole.rs` calls `cpu.bh_issubclass`) over RPython
+                // subclass ranges.
                 let exc_typeptr = self.read_typeptr_from_exception(exc_value);
                 if !self.issubclass_of(exc_typeptr, bounding_vtable) {
                     self.frames.current_mut().code_cursor = target;
@@ -5303,7 +5313,8 @@ where
                 //
                 // Payload shape mirrors upstream `@arguments("self", "i",
                 // "I", "R", "F", "I", "R", "F")` (blackhole.py:1066) and
-                // pyre's own `majit-metainterp/src/jitcode/assembler.rs:692`
+                // pyre's own `JitCodeBuilder::jit_merge_point`
+                // (`majit-metainterp/src/jitcode/assembler.rs`)
                 // — 1-byte jdindex (either a registers_i pool slot for the
                 // `i` form or a raw signed byte for the `c` form) + six
                 // typed register lists (`[len:u8][reg:u8 * N]`).
@@ -5312,10 +5323,11 @@ where
                 // jtransform.py:1693-1706 emits a `-live-` (op3) immediately
                 // BEFORE the `jit_merge_point` op; the GUARD_FUTURE_CONDITION
                 // recorded at loop close resumes through it
-                // (`dispatch.rs:2947 live_placeholder`).  Capture the
+                // (`JitCodeBuilder::live_placeholder` in
+                // `jitcode/assembler.rs`).  Capture the
                 // merge-point op position now, before `next_u8` advances the
                 // cursor, so `record_state_guard`'s `frame.pc = resume_pc`
-                // swap (dispatch.rs:850) finds that `-live-` at
+                // swap finds that `-live-` at
                 // `mp_opcode_pc - SIZE_LIVE_OP`.
                 let mp_opcode_pc = frame.code_cursor - 1;
                 let jdindex_byte = frame.next_reg();
@@ -5329,7 +5341,7 @@ where
                 // BC_JIT_MERGE_POINT is the `i` form: the byte indexes
                 // `registers_i` (which carries the constants suffix at
                 // `[num_regs_i, num_regs_i + constants_i.len())`, populated
-                // by `frame.rs:398-402 setup_call`).  BC_JIT_MERGE_POINT_C
+                // by `MIFrame::setup_call`).  BC_JIT_MERGE_POINT_C
                 // is the `c` form: the byte IS the signed jdindex.
                 let jdindex: usize = if opcode == jitcode::insns::BC_JIT_MERGE_POINT_C {
                     // signedord(byte) — byte interpreted as i8 then sign-extended.
@@ -5346,7 +5358,8 @@ where
                 };
                 // pyjitpl.py:1540 — `staticdata.jitdrivers_sd[jdindex]`
                 // selects the JitDriver this merge point belongs to.
-                // `codegen_state.rs:821` stamps `driver.index()` into
+                // `codegen_state.rs`'s `generate_state_fields_jit_state`
+                // stamps `driver.index()` into
                 // this byte at codegen time, so the value must always
                 // resolve to a registered slot — anything else
                 // indicates a `register_jitdriver_sd` lifecycle bug
@@ -5890,7 +5903,7 @@ where
                     // whose `rd_resume_position` it copies onto every extra
                     // virtual-state guard (unroll.py:333-337, resume.py:397).
                     // The source-level tracer emits this in `close_loop_args_at`
-                    // (trace_opcode.rs:3397); the state-field dispatch model
+                    // (trace_opcode.rs); the state-field dispatch model
                     // reaches the loop header here instead.  Emitted
                     // unconditionally at the top of the reached_loop_header
                     // equivalent, BEFORE the header-match/close/append branching,
@@ -6332,7 +6345,7 @@ where
                 //
                 // RPython `assembler.py:312-346` USE_C_FORM does NOT include
                 // `loop_header`, so the only valid argcode is `i` (constants-
-                // pool slot — `assembler.rs:1087 loop_header()` patches the
+                // pool slot — `jitcode/assembler.rs`'s `loop_header` patches the
                 // byte at finish() to `num_regs_i + const_idx`).  Decode the
                 // byte through `int_values` to recover the actual jdindex
                 // rather than reading the slot byte as the index directly,
@@ -6667,8 +6680,8 @@ where
                 }
                 if self.frames.is_empty() {
                     // pyjitpl.py:3202 compile_done_with_this_frame exits=[];
-                    // pyjitpl.rs:13136 maps empty finish_arg_types to
-                    // Type::Void.
+                    // `done_with_this_frame_descr_from_types` (`pyjitpl.rs`)
+                    // maps empty finish_arg_types to Type::Void.
                     return TraceAction::Finish {
                         finish_args: vec![],
                         finish_arg_types: vec![],
@@ -6681,7 +6694,8 @@ where
             // ── canonical *_v call family (Slices 1-2 of
             // pyre-call-family-canonical-migration.md) ──
             //
-            // Byte layout matches `blackhole.rs:6534, 6580, 6621`:
+            // Byte layout matches `blackhole.rs`'s
+            // `handler_residual_call_{r,ir,irf}_v`:
             //   funcptr_reg:u8 + (countI:u8 + regI×N) + (countR:u8 +
             //   regR×M) + (countF:u8 + regF×K, IRF only) + descr:u16.
             //
@@ -6777,14 +6791,13 @@ where
                 // raising_exception=True)` which `TraceAction::Abort`
                 // mirrors.
                 //
-                // `MetaInterp::do_not_in_trace_call` (`pyjitpl.rs:10220`)
+                // `MetaInterp::do_not_in_trace_call` (`pyjitpl.rs`)
                 // is the same logic on the `MetaInterp` side; the
                 // `JitCodeMachine` walker does not currently hold a
                 // `MetaInterp` reference, so the clear / dispatch /
                 // exception-check sequence is replicated inline using
                 // the shared `BH_LAST_EXC_VALUE` TLS already used by
-                // other dispatch sites (e.g. `blackhole.rs:1715, 2412,
-                // 2448`).
+                // other dispatch sites in `blackhole.rs`.
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     self.clear_exception();
                     if !concrete_ptr.is_null() {
@@ -6805,7 +6818,7 @@ where
                     // The exception value stays on `BH_LAST_EXC_VALUE`
                     // for the blackhole replay; do not clear it here.
                     // Mirror `finalize_standard_virtualizable_may_force`
-                    // (`dispatch.rs:637-639`) by stashing
+                    // (in this file) by stashing
                     // `SwitchToBlackhole::abort_escape()` on TraceCtx so
                     // the jitdriver-side `TraceAction::Abort` consumer
                     // fires `aborted_tracing(ABORT_ESCAPE)` instead of
@@ -6844,7 +6857,8 @@ where
                     // GUARD_NO_EXCEPTION and the catch path.
                     //
                     // 1. clear_exception (`pyjitpl.py:2757-2758` /
-                    //    `dispatch.rs:859`).  PyPy's `clear_exception()`
+                    //    `JitCodeMachine::clear_exception` in this file).
+                    //    PyPy's `clear_exception()`
                     //    nulls `self.last_exc_value`.  Pyre's parity
                     //    (Parity #10) clears `last_exception_value` and the
                     //    `BH_LAST_EXC_VALUE` TLS shim used by
@@ -6997,7 +7011,7 @@ where
             //     ("no such thing" `R_F` / `IR_F`), so the float arm
             //     reads all three (count, regs) pairs unconditionally —
             //     matching `emit_canonical_call_typed_irf_f`
-            //     (jitcode/assembler.rs:2100) which always emits them.
+            //     (jitcode/assembler.rs) which always emits them.
             //
             // These arms are dormant until the producer migration in
             // `pyre/pyre-jit/src/jit/assembler.rs::dispatch_residual_call`
@@ -7109,7 +7123,7 @@ where
                     //     if self.last_exc_value: raise SwitchToBlackhole(
                     //         Counters.ABORT_ESCAPE, raising_exception=True)
                     // Same stash pattern as the void OS_NOT_IN_TRACE arm
-                    // above (`dispatch.rs:3022-3025`).
+                    // above.
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
                         ctx.pending_switch_to_blackhole =
@@ -7132,7 +7146,9 @@ where
                     //         return res
                     // Hit on the loop-invariant cache returns the cached
                     // result WITHOUT executing the C call or recording a
-                    // trace op.  Pyre's helper (`trace_ctx.rs:4068`) does
+                    // trace op.  Pyre's helper
+                    // (`TraceCtx::call_loopinvariant_lookup_with_effect` in
+                    // `history.rs`) does
                     // the lookup internally on the record-side, but the
                     // concrete `bh_call_i_dispatch` below still ran first
                     // — splitting the lookup out matches upstream order.
@@ -7390,7 +7406,7 @@ where
                     //     if self.last_exc_value: raise SwitchToBlackhole(
                     //         Counters.ABORT_ESCAPE, raising_exception=True)
                     // Same stash pattern as the void OS_NOT_IN_TRACE arm
-                    // above (`dispatch.rs:3022-3025`).
+                    // above.
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
                         ctx.pending_switch_to_blackhole =
@@ -7402,7 +7418,8 @@ where
                     // ResKind::Ref intentionally rejects ReleaseGil per
                     // `resoperation.py:1243-1244 # no such thing`. The
                     // producer rejects this combination at
-                    // `pyre-jit/src/jit/assembler.rs:1596` so the
+                    // `pyre-jit/src/jit/assembler.rs`'s
+                    // `dispatch_residual_call` so the
                     // recorder treats it as an unreachable invariant.
                     if effectinfo.is_call_release_gil() {
                         panic!(
@@ -7541,7 +7558,7 @@ where
             // `BC_RESIDUAL_CALL_IRF_F` is the only float-result opcode
             // (`resoperation.py:1238-1248` # no such thing for `R_F` /
             // `IR_F`). The producer (`emit_canonical_call_typed_irf_f`
-            // at `jitcode/assembler.rs:2100`) always emits all three
+            // in `jitcode/assembler.rs`) always emits all three
             // (count, regs) pairs even when one is empty, so the
             // recorder reads them unconditionally.
             jitcode::insns::BC_RESIDUAL_CALL_IRF_F => {
@@ -7630,7 +7647,7 @@ where
                     //     if self.last_exc_value: raise SwitchToBlackhole(
                     //         Counters.ABORT_ESCAPE, raising_exception=True)
                     // Same stash pattern as the void OS_NOT_IN_TRACE arm
-                    // above (`dispatch.rs:3022-3025`).
+                    // above.
                     let exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     if exc != 0 {
                         ctx.pending_switch_to_blackhole =
@@ -8109,8 +8126,10 @@ where
                 let (value, concrete) = self.read_ref_reg(src);
                 self.set_ref_reg(dst, Some(value), Some(concrete));
             }
-            // The Pure half is retired — see the Int
-            // sibling above for the full rationale.
+            // The Pure half is retired — every Pure call site emits canonical
+            // `BC_RESIDUAL_CALL_*`, and the canonical walker reads the
+            // calldescr's `check_is_elidable()` and routes through
+            // `record_result_of_call_pure`.
             // pyjitpl.py:2007-2083 do_residual_call(assembler_call=True)
             // with tp == 'r'. See BC_CALL_ASSEMBLER_VOID for citation.
             jitcode::insns::BC_CALL_ASSEMBLER_REF => {
@@ -8182,8 +8201,10 @@ where
                 let (value, concrete) = self.read_float_reg(src);
                 self.set_float_reg(dst, Some(value), Some(concrete));
             }
-            // The Pure half is retired — see the Int
-            // sibling above for the full rationale.
+            // The Pure half is retired — every Pure call site emits canonical
+            // `BC_RESIDUAL_CALL_*`, and the canonical walker reads the
+            // calldescr's `check_is_elidable()` and routes through
+            // `record_result_of_call_pure`.
             // pyjitpl.py:2007-2083 do_residual_call(assembler_call=True)
             // with tp == 'f'. See BC_CALL_ASSEMBLER_VOID for citation.
             jitcode::insns::BC_CALL_ASSEMBLER_FLOAT => {
@@ -8225,7 +8246,8 @@ where
                 // float-result branch): pyre's `call_assembler` wrapper at
                 // `concrete_ptr` is an `extern "C" fn(...) -> i64` whose
                 // result carries the f64 pre-packed via `f64::to_bits()`.
-                // See `blackhole.rs:10163-10170` for the wrapper-ABI
+                // See `handler_call_assembler_float_pyre` in `blackhole.rs`
+                // for the wrapper-ABI
                 // analysis — calling through `call_float_function`
                 // (`extern "C" fn(...) -> f64`) here would transmute the
                 // i64-returning wrapper through a float-ABI signature and
@@ -8388,7 +8410,7 @@ where
                 // already knows the exception's class (heapcache.py:467-468
                 // is_class_known).  `cls_of_box` (model.py:199-201) reads
                 // the typeptr at offset 0; `default_cls_of_box`
-                // (`pyjitpl.rs:632`) implements the standalone fallback.
+                // (`pyjitpl.rs`) implements the standalone fallback.
                 // Recording the guard promotes the runtime class to a Const
                 // — that is what justifies the unconditional
                 // `class_of_last_exc_is_const = true` below.
@@ -9282,7 +9304,7 @@ where
     trace_jitcode_with_args_and_runtime(ctx, sym, jitcode, pc, &runtime, argboxes)
 }
 
-/// Slice X-D production wire-up: variant that takes a pre-built
+/// Production wire-up: variant that takes a pre-built
 /// `JitCodeRuntime` instance, so the caller can provide a
 /// `ClosureRuntimeWithResolver` carrying both `label_at` and the
 /// `jitcell_token_arc_for_number` callback — the second is what lets
@@ -9303,7 +9325,7 @@ where
     let jitcode_arc = Arc::new(jitcode.clone());
     let mut standalone = StandaloneFrameStack::new();
     let mut frame = MIFrame::setup(jitcode_arc, pc, None, Some(ctx));
-    // `setup_call` (`frame.rs:946`) resets `frame.pc = 0` on the
+    // `setup_call` (`pyjitpl/frame.rs`) resets `frame.pc = 0` on the
     // newly-constructed callee frame; preserve the outer interpreter
     // pc on the machine so `run_to_end`'s portal-pc anchor reflects
     // the actual outer pc rather than the post-reset zero.
@@ -10920,7 +10942,7 @@ mod tests {
         );
     }
 
-    /// #19 Step 3 (Ref) — a `BC_RECURSIVE_CALL_REF` whose runtime decides
+    /// Ref recursive call — a `BC_RECURSIVE_CALL_REF` whose runtime decides
     /// `CallAssembler` records a `CallAssemblerR` (+ GUARD_NOT_FORCED) carrying
     /// the fresh reds, and the ref result flows into the caller's ref return
     /// register.  The concrete leg still runs with the FRESH `stackpos = 0`.
@@ -10986,7 +11008,7 @@ mod tests {
         );
     }
 
-    /// #19 Step 3 (Float) — a `BC_RECURSIVE_CALL_FLOAT` records a
+    /// Float recursive call — a `BC_RECURSIVE_CALL_FLOAT` records a
     /// `CallAssemblerF` (+ GUARD_NOT_FORCED) and wires the float result into
     /// the caller's float return register.
     #[test]
@@ -11050,7 +11072,7 @@ mod tests {
         );
     }
 
-    /// #19 Step 3 (Void) — a `BC_RECURSIVE_CALL_VOID` records a
+    /// Void recursive call — a `BC_RECURSIVE_CALL_VOID` records a
     /// `CallAssemblerN` (+ GUARD_NOT_FORCED) with no result destination; the
     /// callee runs its concrete leg for side effects only (the fresh
     /// `stackpos = 0` reaches the executor) and the caller finishes void.
@@ -11114,7 +11136,7 @@ mod tests {
         assert!(call < gnf, "CALL_ASSEMBLER must precede GUARD_NOT_FORCED");
     }
 
-    /// #19 Step 1 — a `jit_merge_point` reached INSIDE an inlined recursive
+    /// A `jit_merge_point` reached INSIDE an inlined recursive
     /// portal callee (portal_call_depth > 0) must NOT be traced through the
     /// callee's return; it takes the `opimpl_jit_merge_point` else-branch
     /// (pyjitpl.py:1579-1602): finishframe(leave_portal_frame=False) pops the
@@ -11954,7 +11976,7 @@ mod tests {
         // pyjitpl.py:2074-2082 do_residual_call (forces case): record
         // CALL_MAY_FORCE_N, then GUARD_NOT_FORCED via
         // `vable_after_residual_call`, then GUARD_NO_EXCEPTION via
-        // `handle_possible_exception` (pyjitpl.py:2082 → mod.rs:10350).
+        // `handle_possible_exception` (pyjitpl.py:2082 → `pyjitpl.rs`).
         // Pyre's canonical may_force walker mirrors that 5-op shape.
         assert_eq!(recorder.num_ops(), 5);
         assert_eq!(
@@ -12862,7 +12884,7 @@ mod tests {
         // entire framestack without finding a `catch_exception`, the
         // trace closes with a FINISH carrying the exception value so
         // the normal `TraceAction::Finish` path runs `finish_and_compile`
-        // (jitdriver.rs:1031). Previously this returned `TraceAction::Abort`,
+        // (jitdriver.rs). Previously this returned `TraceAction::Abort`,
         // dropping the trace without closing / compiling.
         let exc_typeptr: &'static usize = Box::leak(std::boxed::Box::new(0xc1a55_usize));
         let exc_raw = exc_typeptr as *const usize as i64;
@@ -13023,7 +13045,7 @@ mod tests {
         //   (a) push a snapshot through `TraceCtx::capture_resumedata`,
         //   (b) patch the just-recorded guard's `rd_resume_position`
         //       to that snapshot's id (matching
-        //       `recorder.rs:228 set_last_op_resume_position`),
+        //       `recorder.rs`'s `set_last_op_resume_position`),
         //   (c) populate the snapshot's frame.boxes from the same
         //       slots `populate_frame_int_regs` writes.
         // This ensures a future regression

@@ -203,8 +203,7 @@ impl MemoryManager {
     /// looptoken kick out the *current* compiled token at the same
     /// green_key (the recompile case where `compiled_loops[gk].token`
     /// has already been replaced).  This adaptation is removed once
-    /// Slice X-G converts `compiled_loops` to `Weak`
-    /// (memmgr-line-by-line-parity.md ).
+    /// once `compiled_loops` holds `Weak` tokens.
     pub fn next_generation(&mut self) -> Vec<Arc<JitCellToken>> {
         self.current_generation += 1;
         if self.current_generation == self.next_check {

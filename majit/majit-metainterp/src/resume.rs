@@ -3606,8 +3606,8 @@ impl ResumeDataLoopMemo {
             // `_attrs_`) wraps the whole array in Option but the INNER
             // element type is not itself optional.  We use the
             // `RdVirtualInfo::Empty` sentinel variant to mark hole slots;
-            // downstream consumers (compile.rs:644, compiler.rs:10952,
-            // state.rs:3180, eval.rs:2680,
+            // downstream consumers (compile.rs, compiler.rs,
+            // state.rs, eval.rs,
             // `resume.rs::rd_virtual_to_virtual_info`) match `Empty`
             // and treat it as `None` equivalent.  Functional parity is
             // preserved; the structural divergence stays isolated to
@@ -3764,7 +3764,7 @@ impl ResumeDataLoopMemo {
     ///     return False
     /// ```
     ///
-    /// pyre uses the IR's compile-time FAILARGS_LIMIT (majit_ir:value.rs:201)
+    /// pyre uses the IR's compile-time `FAILARGS_LIMIT` (majit_ir `value.rs`)
     /// as the metainterp option isn't wired yet. Matches RPython semantics
     /// exactly: "lots of live boxes, many of them holes" → invalidate.
     fn _invalidation_needed(&self, nliveboxes: usize, nholes: usize) -> bool {
@@ -4255,7 +4255,7 @@ impl ResumeDataLoopMemo {
         // boxes — Const values are encoded inline via TAGCONST at numbering
         // time (`_number_boxes` classifies via `box.is_constant()` before
         // adding to liveboxes). Backend regalloc enforces the same upstream
-        // contract (`pyre/regalloc.rs:453 !arg.is_constant()` mirrors
+        // contract (the backend `regalloc.rs`'s `!arg.is_constant()` assert mirrors
         // `regalloc.py:1204 assert not isinstance(arg, Const)`).
         //
         // The numbering pass that produced this `liveboxes` list already
@@ -6496,11 +6496,11 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// time pendingfields reach this method:
     ///
     ///   * The single production constructor at
-    ///     `optimizeopt/optimizer.rs:3453` initializes both to
+    ///     `optimizeopt/optimizer.rs`'s `emit_guard_operation` initializes both to
     ///     `UNASSIGNED`, but the entries are immediately fed through
-    ///     `memo.finish()` (`optimizeopt/mod.rs:3390`) →
-    ///     `_add_pending_fields`, which writes the tags from
-    ///     `_gettagged`.
+    ///     `memo.finish()` (`optimizeopt/mod.rs`'s `store_final_boxes_in_guard`) →
+    ///     `_add_pending_fields` (this file), which writes
+    ///     the tags from `_gettagged`.
     ///   * The sharing path (`_copy_resume_data_from`) routes resume
     ///     reads through `ResumeGuardCopiedDescr.prev` (compile.py:849
     ///     `get_resumestorage(): return prev`); readers reach the
@@ -6517,7 +6517,8 @@ impl<'a> ResumeDataDirectReader<'a> {
             // resume.py:1000 PENDINGFIELDSTRUCT.lldescr parity:
             // derive (offset, size, type) from the descr (FieldDescr or
             // ArrayDescr) at consume time. RPython always carries
-            // lldescr — pyre's producer at optimizer.rs:3389 mirrors
+            // lldescr — pyre's producer in `optimizer.rs`'s
+            // `emit_guard_operation` mirrors
             // this by setting `pf.descr = pf_op.descr.clone()` for
             // every pending field (pf_op is always a Setfield_gc /
             // Setarrayitem_gc op with a descr).
@@ -6536,7 +6537,8 @@ impl<'a> ResumeDataDirectReader<'a> {
                 );
             };
             // resume.py:1002-1007 tagged path. UNASSIGNED tags must
-            // never reach this method; see doc comment above.
+            // never reach this method: `_add_pending_fields` writes the
+            // `_gettagged` tags before restore time.
             assert!(
                 pf.target_tagged != UNASSIGNED && pf.value_tagged != UNASSIGNED,
                 "GuardPendingFieldEntry reached prepare_guard_pendingfields with \
@@ -7087,7 +7089,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// FnMut closures cannot share `&mut bh` simultaneously (E0524),
     /// so the kind dispatch happens INSIDE the single closure rather
     /// than across three separate ones.  The on-demand cranelift
-    /// deopt callback (Slice QQ-2) uses a closure that appends each
+    /// deopt callback uses a closure that appends each
     /// value to a flat `Vec<i64>` mirroring the recovery_layout
     /// walker's `rebuilt` output.
     pub fn _prepare_next_section_with(
@@ -7166,7 +7168,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             let Some((jitcode, resolved_pc, op_live)) = resolve_jitcode(jitcode_pos, pc) else {
                 return false;
             };
-            // `blackhole.rs:1435 get_current_position_info` parity —
+            // `blackhole.rs`'s `get_current_position_info` parity —
             // `jitcode.get_live_vars_info(position, op_live)` is the
             // section info offset for the current PC.
             let info = jitcode.get_live_vars_info(resolved_pc, op_live);

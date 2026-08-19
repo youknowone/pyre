@@ -307,7 +307,7 @@ mod two_arrays_with_scalar {
 }
 
 /// Two virt arrays of the SAME item type, plus a scalar. `dualtape`
-/// (`majit/examples/dualtape/src/jit_interp.rs:28-33`) declares this shape
+/// (`majit/examples/dualtape/src/jit_interp.rs`'s `DualState`) declares this shape
 /// (`pa: int, a: [int; virt], pb: int, b: [int; virt]`) and its tests pass — but
 /// they assert result equality only, and `MAJIT_LOG=1 cargo test -p dualtape`
 /// emits no `[jit]` line at all, so that suite never reaches tracing and says

@@ -85,8 +85,8 @@ pub fn wire_clt_loop_token_wref(token: &Arc<JitCellToken>) {
 /// OpRef::NONE is a virtual slot placeholder (null GC ref).
 /// history.py:220/261/307 — the type is intrinsic on the Box itself
 /// (`Const{Int,Float,Ptr}.type`, `InputArg{Int,Float,Ref}.type`, and the
-/// `{Int,Float,Ref}Op` mixins), read off the OpRef variant tag (`ty()`,
-/// resoperation.rs:233). A fail_arg carries its own type regardless of
+/// `{Int,Float,Ref}Op` mixins), read off the OpRef variant tag
+/// (`OpRef::ty()` in `resoperation.rs`). A fail_arg carries its own type regardless of
 /// trace position, so no position-keyed side table is needed.
 fn fail_arg_type(opref: &OpRef) -> Type {
     if *opref == OpRef::NONE {
@@ -484,7 +484,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         }
 
         if is_guard {
-            // F.5-orthodox.1: drop the `guard_op_indices` HashMap.
+            // Drop the `guard_op_indices` HashMap.
             // Every reader is now routed through descr-side identity
             // (`op.descr.as_fail_descr().fail_index_per_trace()`
             // forward; op-position lookup
@@ -496,7 +496,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // The readers compare against `fail_index_per_trace()`
             // (this slot, set by `set_fail_index_per_trace` below),
             // not `fail_index()` (which is the global
-            // `alloc_fail_index()` id at `descr.rs:1065` — a separate
+            // `alloc_fail_index()` id — a separate
             // structural slot the readers do not consult).
             //
             // Pyre-only: stamp the per-trace `fail_index` onto the
@@ -528,7 +528,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         // (resume.py:520, optimizer.py:728). majit stores that snapshot on
         // the descr's `fail_arg_types()` (post-numbering, post-virtual-
         // materialization) and mirrors it to `op.fail_arg_types` for
-        // sharing-path guards (mod.rs:3068-3088). After the codex #3 fix
+        // sharing-path guards (`optimizeopt/mod.rs`'s `emit_guard_operation`).
+        // After the codex #3 fix
         // (tracer-stage descr=None -- that hash resolves nowhere in
         // this repository, so the mechanism named here is the
         // reference), every guard's descr is
@@ -1071,7 +1072,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                             // captured directly off the Setfield_gc /
                             // Setarrayitem_gc op that produced the pending
                             // field (heap.py force_lazy_sets_for_guard).
-                            // Pyre's producer at optimizer.rs:3389 mirrors
+                            // Pyre's producer in `optimizer.rs`'s
+                            // `emit_guard_operation` mirrors
                             // this: `pf.descr = pf_op.descr.clone()` where
                             // pf_op is always a descr-bearing setfield op.
                             let descr = pf
@@ -1115,9 +1117,10 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // fail_args → frame slots, with exit_types as slot_types.
             // `jitcode_index: 0` is a placeholder for the no-rd_numb
             // path — `patch_guard_recovery_layouts_for_trace`
-            // (compile.rs:1596) overwrites this with the resume_layout
+            // (`compile.rs`) overwrites this with the resume_layout
             // derived from `Snapshot::single_frame(jitcode_index, pc, ...)`.
-            // The outermost-frame rule at eval.rs:3938-3951 means a
+            // The outermost-frame rule in `pyre-jit/src/eval.rs`'s
+            // `rebuild_typed_from_rd_numb` means a
             // stale `jitcode_index: 0` is never consulted for code lookup
             // on the sole frame of a single-frame identity layout — code
             // comes from the vable instead.
@@ -1188,8 +1191,9 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         // so descr-side readers stay populated.  Branch on
         // `layout.is_finish` so a backend-only FINISH entry synthesizes
         // a `_DoneWithThisFrameDescr`-flavored handle (is_finish=true)
-        // — matching the terminal path at compile.rs:1305-1311.
-        // Without the branch, `pyjitpl.rs:262 descr.is_finish()`
+        // — matching the terminal path in `merge_backend_terminal_exit_layouts`.
+        // Without the branch, `pyjitpl.rs`'s `resolve_is_finish` reading
+        // `descr.is_finish()`
         // returns false on the synthesized guard descr and breaks
         // PyPy's `DoneWithThisFrameDescr` /
         // `ExitFrameWithExceptionDescrRef` identity check
@@ -1287,8 +1291,9 @@ pub(crate) fn validate_exit_layouts(exit_layouts: &indexmap::IndexMap<u32, Store
             // header_pc and slot_types are filled by both
             // build_guard_metadata (metainterp) and identity_recovery_layout
             // (backend). After backend merge, both must be present.
-            // Backend-provided layouts always have them (compiler.rs:4482,4488).
-            // Metainterp-provided layouts fill them since Step 1.
+            // Backend-provided layouts always have them
+            // (`compiler.rs`'s `identity_recovery_layout`).
+            // Metainterp-provided layouts always fill them.
             if frame.header_pc.is_none() || frame.slot_types.is_none() {
                 // Backend test mocks may omit these — not fatal in tests.
                 #[cfg(not(test))]
@@ -2019,7 +2024,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     let mut next_opref = max_runtime_ref + 1;
 
     // Allocate fresh const indices above the existing max.
-    // Index-keyed pool namespace probe (Slice P3 category E):
+    // Index-keyed pool namespace probe:
     // raw u32 keys carry the constant-namespace bit directly, so use
     // the bit-helpers rather than minting a typed `OpRef` solely
     // for the namespace test.
@@ -3303,7 +3308,7 @@ pub fn make_finish_fail_descr_typed(types: Vec<Type>, is_exception_exit: bool) -
 /// exactly.
 ///
 /// `payload` is initialized empty here; `store_final_boxes_in_guard`
-/// at optimizeopt/mod.rs:3508 fills `rd_numb / rd_consts / rd_virtuals
+/// in `optimizeopt/mod.rs` fills `rd_numb / rd_consts / rd_virtuals
 /// / rd_pendingfields` post-numbering through the descr-side
 /// `set_rd_*` setters (compile.py:855 `_attrs_`).  The legacy
 /// `ResumeData` field is kept only for tests that still mint synthetic
@@ -4588,7 +4593,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
         unsafe { *self.rd_loop_token_clt.get() = Some(typed) };
     }
     /// Per-emission `source_op_index` (see field comment).  Owned per
-    /// copied descr — each copy in `optimizeopt/mod.rs:4438-4470`
+    /// copied descr — each copy in `optimizeopt/mod.rs`'s `emit_guard_operation`
     /// records its own trace-op origin, matching how
     /// `assembler.py:279` writes `rd_locs` onto each emitted descr
     /// directly.
@@ -4680,14 +4685,14 @@ impl FailDescr for ResumeGuardCopiedDescr {
         self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel)
     }
 
-    /// Mirror `ResumeGuardDescr::is_external_jump` (-Tβ8 +
-    /// resume_guard_descr.rs:498): membership in the per-emission
+    /// Mirror `ResumeGuardDescr::is_external_jump`
+    /// (`resume_guard_descr.rs`): membership in the per-emission
     /// `external_jump_target` slot IS the cross-loop-JUMP predicate.
     fn is_external_jump(&self) -> bool {
         self.external_jump_target.get().is_some()
     }
 
-    /// Mirror `ResumeGuardDescr::target_descr` (resume_guard_descr.rs:506):
+    /// Mirror `ResumeGuardDescr::target_descr` (resume_guard_descr.rs):
     /// when this copied descr is the synthesised cross-loop JUMP exit,
     /// surface the target `DescrRef` the dispatcher re-enters via.
     fn target_descr(&self) -> Option<DescrRef> {
@@ -5118,7 +5123,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
     }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         // Hand out the inner ResumeGuardDescr — see ResumeAtPositionDescr
-        // (compile.rs:3028).  Uniform downcast across the subclass family.
+        // in this file.  Uniform downcast across the subclass family.
         Some(&self.inner)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {

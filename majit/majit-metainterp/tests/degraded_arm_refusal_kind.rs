@@ -66,22 +66,25 @@ const TLR_ALLOCATE: &str = "arm body writes a green this lowering path cannot \
                             arm body has a statement the lowerer cannot express: \
                             state.regs = vec! [0; n];";
 
-/// `lower_stmt.rs:249` — the sibling guard to `break`/`continue`.
+/// `lower_stmt.rs`'s `lower_return_stmt` — the sibling guard to `break`/`continue`.
 const SRC_ENCLOSED_RETURN: &str =
     "arm body encloses a `return` that cannot be lowered in place: return acc;";
 
-/// `api.rs:189` and `:271`. No `{what}: {spelling}` shape — a bare `Err`.
+/// `api.rs`'s `try_generate_jitcode_body_parts_with_caller_bindings` and
+/// `try_generate_jitcode_pc_return_body_with_caller_bindings`. No
+/// `{what}: {spelling}` shape — a bare `Err`.
 const SRC_EMPTY_BODY: &str = "arm body has no statements to lower";
 
-/// `api.rs:306`, on the pc-return path.
+/// `api.rs`'s `try_generate_jitcode_pc_return_body_with_caller_bindings`, on the
+/// pc-return path.
 const SRC_NO_PC_BINDING: &str = "arm body has no `pc` binding for the pc-return writeback";
 
-/// `dispatch.rs:2826` — the only family raised at INSTALL rather than by the
+/// `dispatch.rs`'s `lower_dispatch_chain` — the only family raised at INSTALL rather than by the
 /// statement lowerer, so it names no offending statement at all.
 const SRC_UNSUPPORTED_CALL_POLICY: &str =
     "arm body lowering resolved an unsupported call policy at install";
 
-/// `lowerer.rs:145`. Its own doc keeps this exact wording so unconverted refusal
+/// `lowerer.rs`'s `take_body_failure_reason`. Its own doc keeps this exact wording so unconverted refusal
 /// sites stay greppable, which is why it gets a variant instead of falling into
 /// `Unclassified`: reaching it means "a site is unconverted", not "majit grew a
 /// mechanism".
@@ -108,7 +111,7 @@ fn refusal_kind_covers_every_reachable_producer_string() {
 /// `UnsupportedCallPolicy` names no offending statement, and the others do.
 ///
 /// Seven of the eight families are minted by the statement lowerer and carry
-/// `arm body {what}: {spelling}` — `record_body_failure` at `lower_stmt.rs:417`
+/// `arm body {what}: {spelling}` — `record_body_failure` in `lower_stmt.rs`
 /// appends `: ` and a (possibly truncated) rendering of the statement. Two of
 /// those seven are bare `Err`s with no statement in hand, and the eighth is
 /// raised at INSTALL, before any statement is under consideration.

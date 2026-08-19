@@ -1,7 +1,7 @@
 //! Regression pin: `ExceptionState` clone/clear preserves pending state.
 //!
 //! Multi-frame guard-fail resume threads `&ExceptionState` through
-//! `restore_guard_failure_with_session_cache` (`jit_state.rs:885-991`)
+//! `restore_guard_failure_with_session_cache` (`jit_state.rs`)
 //! into `restore_reconstructed_frame_values_with_metadata`. The resume
 //! side cannot drain pending state from the live interpreter — the
 //! borrow is read-only via `&ExceptionState`. This test pins the

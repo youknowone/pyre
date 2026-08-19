@@ -286,7 +286,7 @@ pub fn token_tracing_rescall() -> *mut u8 {
 /// `make_vref_field_descr_typed(...)`) cache the Arc identity at
 /// module level so every read of these fields returns the same Arc
 /// that the optimizer-emit sites stamp into `op.descr`
-/// (`virtualize.rs:1520 / 1527`) — `Arc::ptr_eq` parity with
+/// (`optimizeopt/virtualize.rs`) — `Arc::ptr_eq` parity with
 /// `history.py:125 cpu.get_latest_descr() is op.getdescr()`.
 #[derive(Debug, Clone)]
 pub struct VirtualRefInfo {

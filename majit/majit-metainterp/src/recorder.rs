@@ -19,7 +19,7 @@ use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Va
 ///
 /// The byte-stream recorder (`TraceRecordBuffer`) fills in every field
 /// from its byte cursor / counter state.  The legacy `Vec<Op>` recorder
-/// (`recorder::Trace`, being migrated away in Step 2e.2b) maps `_pos` to
+/// (`recorder::Trace`, being migrated away) maps `_pos` to
 /// the ops-Vec cursor (number of ops currently stored). `_count` mirrors
 /// the total number of recorded ops, while `_index` mirrors the number of
 /// box-yielding positions (inputargs + non-void ops), matching
@@ -53,7 +53,7 @@ pub struct TracePosition {
 ///
 /// RPython stores snapshots inline in the trace byte stream
 /// (`_snapshot_data` / `_snapshot_array_data`).  Pyre owns them on
-/// `TraceCtx` as a `Vec<Snapshot>` side-table (Step 2e.2b will migrate
+/// `TraceCtx` as a `Vec<Snapshot>` side-table (the pending migration moves
 /// this to the byte-stream form already carried by `TraceRecordBuffer`).
 /// Each snapshot captures the live variables of each frame in the call
 /// stack at the guard point.

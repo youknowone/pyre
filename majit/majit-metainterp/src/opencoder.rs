@@ -1546,7 +1546,7 @@ impl Trace {
         (self._count - self.max_num_inputargs) as usize
     }
 
-    // ── M2 Step 2c · read API via ByteTraceIter ────────────────────────
+    // ── read API via ByteTraceIter ─────────────────────────────────────
     // RPython has no direct equivalent of these methods: opencoder.py
     // exposes only `get_iter()` and callers iterate. Pyre adds thin
     // walk-to-collect helpers so consumers migrating off
@@ -2542,7 +2542,7 @@ impl Trace {
         pos
     }
 
-    /// M2 Step 2b: encode a pyre `OpRef` into the wire `i64` tag.
+    /// Encode a pyre `OpRef` into the wire `i64` tag.
     ///
     /// Pyre inline-Const OpRefs carry their value directly; this helper
     /// resolves the constant (via `OpRef::inline_const_to_value`) and
@@ -2571,7 +2571,7 @@ impl Trace {
         self._encode(b)
     }
 
-    /// M2 Step 2b: OpRef-taking adapter over `record_op(&[Box], descr)`.
+    /// OpRef-taking adapter over `record_op(&[Box], descr)`.
     ///
     /// Mirrors opencoder.py:664-670 `record_op(opnum, argboxes, descr=None)`
     /// but accepts pyre's constant-tagged OpRefs. Inline constants resolve
@@ -2594,7 +2594,7 @@ impl Trace {
         pos
     }
 
-    // ── M2 Step 2d · close_loop / finish helpers ──────────────────────
+    // ── close_loop / finish helpers ────────────────────────────────────
     //
     // Thin wrappers over `record_op_oprefs` that mirror the
     // `recorder::Trace` surface (`close_loop`, `close_loop_with_descr`,
@@ -3305,7 +3305,7 @@ mod tests {
         assert_eq!(third.len(), second.len() + 1);
     }
 
-    /// Step 2a: `record_input_arg` returns a positional OpRef and appends
+    /// `record_input_arg` returns a positional OpRef and appends
     /// an `InputArg` whose `tp` field matches the passed type. `num_ops`
     /// stays at 0 because recording inputargs advances `_count` purely
     /// through `_start = max_num_inputargs`, not through ops.
@@ -3330,7 +3330,7 @@ mod tests {
         assert_eq!(buf.num_ops(), 0);
     }
 
-    /// Step 2a: `record_input_arg` panics when asked to exceed the
+    /// `record_input_arg` panics when asked to exceed the
     /// `max_num_inputargs` cap supplied to `Trace::new`.
     #[test]
     #[should_panic(expected = "exceeds max_num_inputargs")]
@@ -3962,9 +3962,9 @@ mod tests {
         assert_eq!(buf._count, void_start_count + 1);
     }
 
-    // ── M2 Step 2b · record_op_oprefs adapter tests ───────────────────
+    // ── record_op_oprefs adapter tests ─────────────────────────────────
 
-    /// Step 2b: `record_op_oprefs` with non-constant OpRef args must
+    /// `record_op_oprefs` with non-constant OpRef args must
     /// emit the same wire bytes as `record_op(&[Box::ResOp(...)])`.
     #[test]
     fn test_record_op_oprefs_resop_parity_2b() {
@@ -3978,7 +3978,7 @@ mod tests {
         assert_eq!(expected._index, actual._index);
     }
 
-    /// Step 2b: inline-Const OpRef (Int) must resolve to `Box::ConstInt`
+    /// Inline-Const OpRef (Int) must resolve to `Box::ConstInt`
     /// and produce the same bytes as passing `Box::ConstInt(v)` directly.
     #[test]
     fn test_record_op_oprefs_const_int_2b() {
@@ -3992,7 +3992,7 @@ mod tests {
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
 
-    /// Step 2b: inline-Const OpRef (Float) must resolve to `Box::ConstFloat`.
+    /// Inline-Const OpRef (Float) must resolve to `Box::ConstFloat`.
     #[test]
     fn test_record_op_oprefs_const_float_2b() {
         let raw = (3.25_f64).to_bits() as i64;
@@ -4012,7 +4012,7 @@ mod tests {
         assert_eq!(expected._floats, actual._floats);
     }
 
-    /// Step 2b: inline-Const OpRef (Ref) must resolve to `Box::ConstPtr`.
+    /// Inline-Const OpRef (Ref) must resolve to `Box::ConstPtr`.
     #[test]
     fn test_record_op_oprefs_const_ref_2b() {
         let addr = 0xdead_beef_u64;
@@ -4027,9 +4027,9 @@ mod tests {
         assert_eq!(expected._refs, actual._refs);
     }
 
-    // ── M2 Step 2c · ops / get_op_by_pos / last_op tests ──────────────
+    // ── ops / get_op_by_pos / last_op tests ────────────────────────────
 
-    /// Step 2c: `ops()` walks the byte stream and materializes every
+    /// `ops()` walks the byte stream and materializes every
     /// recorded op. Opcodes come back in record order.
     #[test]
     fn test_ops_materializer_2c() {
@@ -4044,7 +4044,7 @@ mod tests {
         assert_eq!(ops[1].opcode, OpCode::IntMul);
     }
 
-    /// Step 2c: `get_op_by_pos` returns the Op whose `.pos` equals the
+    /// `get_op_by_pos` returns the Op whose `.pos` equals the
     /// requested OpRef. `ByteTraceIter` seeds `_fresh` at
     /// `max_num_inputargs` and then bumps it once per inputarg before
     /// any op, so with 2 inputargs the first op has `op.pos == IntOp(4)`
@@ -4065,7 +4065,7 @@ mod tests {
         assert!(buf.get_op_by_pos(iop(99)).is_none());
     }
 
-    /// Step 2c: `last_op` returns the final recorded op.  On an empty
+    /// `last_op` returns the final recorded op.  On an empty
     /// buffer the result is `None`.
     #[test]
     fn test_last_op_2c() {
@@ -4081,7 +4081,7 @@ mod tests {
         assert_eq!(last.opcode, OpCode::GuardTrue);
     }
 
-    // ── M2 Step 2d · guard / close_loop / finish helpers tests ───────
+    // ── guard / close_loop / finish helpers tests ──────────────────────
 
     fn fixed_descr() -> majit_ir::DescrRef {
         use std::sync::Arc;
@@ -4098,7 +4098,7 @@ mod tests {
         Arc::new(D)
     }
 
-    /// Step 2d: `close_loop_oprefs` records a JUMP with no descr.
+    /// `close_loop_oprefs` records a JUMP with no descr.
     #[test]
     fn test_close_loop_oprefs_2d() {
         let mut expected = TraceRecordBuffer::new(2, empty_sd());
@@ -4113,7 +4113,7 @@ mod tests {
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
 
-    /// Step 2d: `close_loop_oprefs_with_descr` records a JUMP with the
+    /// `close_loop_oprefs_with_descr` records a JUMP with the
     /// given tentative descr.  Matches
     /// `record_op(Jump, args, Some(&descr))`.
     #[test]
@@ -4129,7 +4129,7 @@ mod tests {
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
 
-    /// Step 2d: `finish_oprefs` records a FINISH op with its terminal
+    /// `finish_oprefs` records a FINISH op with its terminal
     /// FailDescr.
     #[test]
     fn test_finish_oprefs_2d() {
@@ -4144,7 +4144,7 @@ mod tests {
         assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
     }
 
-    /// Step 2b: `record_op_oprefs` with a descr must encode the descr
+    /// `record_op_oprefs` with a descr must encode the descr
     /// exactly as `record_op(&[Box], Some(&descr))` would.
     #[test]
     fn test_record_op_oprefs_with_descr_2b() {
@@ -4179,7 +4179,7 @@ mod tests {
         // (they grow monotonically). Only _pos/_count/_index come back.
     }
 
-    /// Step 1 (SnapshotIterator): an empty top snapshot
+    /// `SnapshotIterator`: an empty top snapshot
     /// (`create_empty_top_snapshot`, jitcode_index == -1) has an empty
     /// framestack and `size == vable.total_length + vref.total_length + 3`.
     /// Mirrors opencoder.py:212-213 early-return branch.
@@ -4200,7 +4200,7 @@ mod tests {
         assert_eq!(it.iter_vref_array().total_length, 0);
     }
 
-    /// Step 1 (SnapshotIterator): `capture_resumedata` with a single
+    /// `SnapshotIterator`: `capture_resumedata` with a single
     /// frame produces a non-empty framestack in bottom-up order with
     /// outermost == innermost (length 1).
     #[test]
@@ -4225,7 +4225,7 @@ mod tests {
         assert_eq!(items.len(), 2);
     }
 
-    /// Step 1c: `capture_resumedata` on a framestack with a single
+    /// `capture_resumedata` on a framestack with a single
     /// frame drives `create_top_snapshot_from_frame` and returns a
     /// snapshot_index consistent with `get_snapshot_iter`.
     /// Parent chain is empty (n == 0 ⇒ is_last = true), so no
@@ -4283,7 +4283,7 @@ mod tests {
         );
     }
 
-    /// Step 1c: `capture_resumedata` with an empty framestack takes
+    /// `capture_resumedata` with an empty framestack takes
     /// the `create_empty_top_snapshot_from_boxes` branch. Snapshot's
     /// `jitcode_index == -1`, `framestack` empty.
     #[test]
@@ -4300,7 +4300,7 @@ mod tests {
         );
     }
 
-    /// Step 1 (SnapshotIterator): multi-frame chain produces a
+    /// `SnapshotIterator`: multi-frame chain produces a
     /// framestack ordered outermost-first. Simulates RPython's
     /// capture_resumedata + `_ensure_parent_resumedata` pattern by
     /// emitting one `create_top_snapshot` followed by

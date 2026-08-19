@@ -523,7 +523,7 @@ impl BlackholeInterpreter {
     }
 
     /// Copy the builder-shared context fields from `parent` onto `self`.
-    /// Mirrors `BlackholeInterpBuilder::acquire_interp` (blackhole.rs:3902)
+    /// Mirrors `BlackholeInterpBuilder::acquire_interp` in this file
     /// — the same 6 fields that builder→interp normally propagates.
     /// Used by `handler_inline_call_pyre_nested` to give the callee
     /// `BlackholeInterpreter` the same `dispatch_table` (so a nested
@@ -537,7 +537,7 @@ impl BlackholeInterpreter {
     /// dispatch table to keep recursive inline_call working.
     pub fn clone_context_from(&mut self, parent: &Self) {
         // Six builder-shared fields per `BlackholeInterpBuilder::acquire_interp`
-        // (`blackhole.rs:3825-3842`).
+        // in this file.
         self.cpu = parent.cpu;
         self.descrs = parent.descrs;
         self.op_catch_exception = parent.op_catch_exception;
@@ -1237,7 +1237,8 @@ impl BlackholeInterpreter {
         // Backward case (after-residual-call guard): pyre resumes the post-call
         // `GUARD_NO_EXCEPTION` at the next opcode's `-live-`
         // (`pc_map[fallthrough_pc]`, jitcode_dispatch.rs / capture_resumedata),
-        // because the raising op's vable-mirror stores (flatten.rs:1832-1857)
+        // because the raising op's vable-mirror stores
+        // (`pyre-jit`'s `flatten.rs` `insert_exits`)
         // sit between the call's own post-call `-live-` and its
         // `catch_exception` — there is no Python PC that resolves onto the
         // catch.  The catch therefore lies BEHIND `resume_live_pos`; scan op
@@ -4632,7 +4633,7 @@ mod tests {
         /// Tier 2.3: callee `abort_permanent/` propagates
         /// `aborted = true` to the caller via the handler's
         /// `if callee.aborted { bh.aborted = true; LeaveFrame }` arm.
-        /// `bhimpl_abort_permanent` (blackhole.rs:1714) sets aborted
+        /// `bhimpl_abort_permanent` sets aborted
         /// and returns LeaveFrame when no `BH_LAST_EXC_VALUE` is pending,
         /// which is the case for a clean callee spawned via
         /// `BlackholeInterpreter::for_inline_callee(parent)` (TLS reset
@@ -4930,7 +4931,7 @@ mod tests {
         fn wire_bhimpl_handlers_leaves_dead_v_access_aliases_unwired() {
             // Pyre-invented `_v` sentinel forms that no longer leave the
             // assembler (see majit-translate/src/codewriter/
-            // assembler.rs:2106-2130,2226-2250 negative asserts). Kept as
+            // assembler.rs negative asserts). Kept as
             // guard tests so any regression that reintroduces a `_v` key
             // surfaces at setup_insns time rather than at first dispatch.
             let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
@@ -5558,7 +5559,7 @@ fn handler_abort_result_marker_i(
 
 /// Register-slot layout for state-field JIT blackhole resume.
 ///
-/// Mirrors `live_slots_for_state_field_jit` (`jitcode/assembler.rs:4476`): the
+/// Mirrors `live_slots_for_state_field_jit` (`jitcode/assembler.rs`): the
 /// blackhole int register file holds, in flat order,
 /// `[scalars 0..num_scalars | flattened fixed-array elements |
 /// the virtualizable identity]`, seeded by the resume reader via `setarg_i`
@@ -5934,7 +5935,7 @@ bhhandler_ii_i!(handler_int_mul, bhimpl_int_mul);
 // jitcode emission, so RPython's `blackhole.py` has no
 // `bhimpl_int_floordiv` / `bhimpl_int_mod`.  pyre keeps the helper
 // functions ([`ll_int_py_div`] / [`ll_int_py_mod`] above) for the
-// translate-side residual call (`codegen.rs:980-1027` emits them as
+// translate-side residual call (`codegen.rs` emits them as
 // `CallI` with `INT_PY_DIV_EFFECT_INFO` / `INT_PY_MOD_EFFECT_INFO`)
 // but does not wire them into the bytecode dispatch table.
 bhhandler_ii_i!(handler_int_and, bhimpl_int_and);
@@ -7623,8 +7624,8 @@ fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>,
 /// `catch_exception` handler in the current frame (returning `Ok(target)`),
 /// or out of the frame as `LeaveFrame` so the outer `run()` propagates.
 ///
-/// Mirrors the legacy direct-dispatch arms (`blackhole.rs:2400-2470`,
-/// `2823-2925`) which already perform the same handshake; the wired
+/// Mirrors the legacy direct-dispatch arms in this file
+/// which already perform the same handshake; the wired
 /// `dispatch_table` handlers must do the same so the table path does not
 /// silently swallow exceptions raised by `cpu.bh_call_*`.
 ///
@@ -7653,7 +7654,8 @@ fn check_residual_call_exception_after(
     // points at this residual call's first operand byte.  Advance it to
     // `next_pos` — the post-call position the handler is about to return,
     // where the codewriter emitted the can-raise opcode's `-live-` /
-    // `catch_exception` adjacency (`codewriter.rs:9161-9188`).  Without this,
+    // `catch_exception` adjacency (`pyre-jit`'s `codewriter.rs`
+    // `transform_graph_to_jitcode`).  Without this,
     // `handle_exception_in_frame`'s forward case inspects an operand byte
     // (never a `catch_exception`) and the backward scan stops at the
     // *pre*-call `-live-`, so a residual call executed directly during the
@@ -8002,7 +8004,7 @@ fn handler_residual_call_r_v(
 /// `bh_getarrayitem_gc_{i,r,f}`, `bh_arraylen_gc`, `bh_new`,
 /// `bh_new_with_vtable`, `bh_new_array{,_clear}`, `bh_call_{i,r,f,v}`, and
 /// `clear_stored_exception`.  On dynasm each is descr-supplied offsets fed
-/// to `read_int_at_mem` / `write_int_at_mem` (`runner.rs:1386,1402`) or a
+/// to `read_int_at_mem` / `write_int_at_mem` (`runner.rs`) or a
 /// free function (`jit_exc_clear`, `call_stub::bh_call_*_dispatch`); none
 /// touches `&self`.  A method added to that list that *does* read backend
 /// state would make the blackhole observe a fresh, empty `BackendImpl`
@@ -8019,7 +8021,7 @@ fn handler_residual_call_r_v(
 #[cfg(any(feature = "dynasm", feature = "cranelift"))]
 pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
     // Per-thread leak: `BackendImpl` is not `Sync`, so we keep one
-    // instance per thread.  Mirrors `BH_BUILDER3` (`call_jit.rs:702`)
+    // instance per thread.  Mirrors `BH_BUILDER3` (`call_jit.rs`)
     // which is itself a `thread_local!` — production blackhole resume
     // already runs on the same thread that owns the trace's metainterp.
     thread_local! {
@@ -8054,28 +8056,27 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
 ///
 /// Initially registered:
 ///   - `inline_call_pyre_nested/P` at `BC_INLINE_CALL` ()
-///   - Sub-slice B byte-identical canonical: `live/`, `loop_header/i`,
+///   - byte-identical canonical: `live/`, `loop_header/i`,
 ///     `goto/L`, `catch_exception/L`, `jit_merge_point/cIRFIRF`
-///   - A1-A8 canonical-encoded: every `JitCodeBuilder`-emitted BC_*
+///   - canonical-encoded: every `JitCodeBuilder`-emitted BC_*
 ///     now pushes 1-byte register operands matching the canonical
 ///     RPython argcode contract; no `_pyre_u16` width adapters remain.
 ///     The pyre-jit production thread-locals (`BH_BUILDER3`,
 ///     `BH_BUILDER_RD`) and inline-call unit fixtures share this builder
 ///     shape.
 ///
-/// See `pyre-jit-trace/src/jitcode_dispatch.rs:5988-5996` for the
+/// See `pyre-jit-trace/src/jitcode_dispatch` for the
 /// `pipeline.insns` ↔ `wellknown_bh_insns` table-unification epic
 /// that this minimal install side-steps.
 pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     let mut builder = BlackholeInterpBuilder::new();
-    // Sub-slice C.2.0 (`subslice_c2_attempt_failure_cpu_prereq_2026_05_07.md`):
-    // wire the blackhole cpu BEFORE C.2.1 vable canonical routing.
+    // Wire the blackhole cpu BEFORE the vable canonical routing.
     // RPython `blackhole.py:286 self.cpu = builder.cpu` parity — the
     // production builder must carry a non-None cpu so canonical handlers
     // like `handler_getfield_vable_r` don't trip
-    // `bh.cpu.expect("cpu not set")` once their setup_insns entries land
-    // in C.2.1.  The leaked instance services only stateless GC reads;
-    // residual_call (`bh_call_*`, C.3-C.4) prereq audit pending.
+    // `bh.cpu.expect("cpu not set")` once their setup_insns entries land.
+    // The leaked instance services only stateless GC reads;
+    // the residual_call (`bh_call_*`) prereq audit is pending.
     #[cfg(any(feature = "dynasm", feature = "cranelift"))]
     {
         builder.cpu = Some(pyre_production_cpu());
@@ -8089,9 +8090,9 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // adapters.  The `_pyre/P` suffix matches the inline_call adapter
     // pattern so wire_bhimpl_handlers binds the right handler and
     // strict dispatch resolves the byte without panic.  Producers:
-    // `pyjitpl/dispatch.rs:3062-3354` (call_assembler), `majit-macros/
-    // src/jit_interp/jitcode_lower.rs:2166-2458` + `pyre/pyre-jit/src/
-    // jit/assembler.rs:1181` (cond_call / record_known_result).
+    // `pyjitpl/dispatch.rs` (call_assembler), `majit-macros/
+    // src/jit_interp/jitcode_lower` + `pyre/pyre-jit/src/
+    // jit/assembler.rs` (cond_call / record_known_result).
     for (key, byte) in [
         (
             "call_assembler_int_pyre/P",
@@ -8132,8 +8133,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // Sub-slice B (`pyre-bh-setup-insns-byte-identical-subset.md`):
-    // five canonical keys whose `JitCodeBuilder` emit-side payload
+    // Five canonical keys whose `JitCodeBuilder` emit-side payload
     // matches the wired `bhimpl_*` handler byte-for-byte.  The rest of
     // the builder registers audited pyre families below; any byte absent
     // from setup_insns is a strict-dispatch error.
@@ -8201,11 +8201,11 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "goto_if_not/iL".to_string(),
         majit_translate::insns::BC_GOTO_IF_NOT,
     );
-    // Sub-slice C.5: cover the BC_* set the inline_call-only test
+    // Cover the BC_* set the inline_call-only test
     // fixtures emit (`int_return`, `float_return`, `int_add`,
     // `float_copy`, `void_return`, `abort`, `abort_permanent`) so the
     // production builder is closed over every opname pyre's
-    // `JitCodeBuilder` can produce.  All A-slice migrations complete:
+    // `JitCodeBuilder` can produce.  The width migrations are complete:
     // every key here is canonical (1-byte register operands) and reuses
     // canonical `handler_*` decoders wired in `wire_bhimpl_handlers`.
     insns.insert(
@@ -8262,7 +8262,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     }
     // P5 — int unary + float arithmetic + ref/ptr family.
     // 14 keys covering record_unary_i/f, record_binop_f, record_binop_r,
-    // and ptr_iszero/nonzero (`assembler.rs:784,817,825,2956,2974,799`).
+    // and ptr_iszero/nonzero (`jitcode/assembler.rs`).
     for (key, byte) in [
         ("int_neg/i>i", majit_translate::insns::BC_INT_NEG),
         ("int_invert/i>i", majit_translate::insns::BC_INT_INVERT),
@@ -8542,9 +8542,8 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // Sub-slice C.3+C.4 (`subslice_c_register_width_axis_plan_2026_05_07.md`):
     // residual_call family — `JitCodeBuilder::emit_canonical_call_void` /
-    // `emit_canonical_call_typed` (assembler.rs:1688, 1923) emit each
+    // `emit_canonical_call_typed` (jitcode/assembler.rs) emit each
     // register operand via `push_reg_u8` (asserts `reg <= u8::MAX`) and
     // each list count as `push_u8` (asserts `len <= u8::MAX`); only the
     // trailing `calldescr_idx` is `push_u16`.  This matches the
@@ -8648,12 +8647,11 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // Sub-slice C.2.1 + Path 2/3 (`subslice_c2_attempt_failure_cpu_prereq_2026_05_07.md`):
     // vable family (full 14-key coverage).  Path 3 (single-indirection
     // `getfield_vable_*` / `setfield_vable_*` / `hint_force_virtualizable`)
     // routes through the canonical `cpu.bh_getfield_gc_*` /
-    // `bh_setfield_gc_*` chain — both `runner.rs:2244-2275` (dynasm) and
-    // `compiler.rs::bh_getfield_gc_*` (cranelift, this slice) implement
+    // `bh_setfield_gc_*` chain — both `runner.rs` (dynasm) and
+    // `compiler.rs::bh_getfield_gc_*` (cranelift) implement
     // the chain via direct `*(struct_ptr + descr.as_offset())` reads,
     // matching the old inline vinfo offset path.  Path 2
     // (2-level indirection `getarrayitem_vable_*` /
@@ -9018,7 +9016,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)`
     // before jitcode emission, so RPython's blackhole never sees the
     // bare op.  Pyre's runtime path mirrors this via
-    // `codegen.rs:980-1027` emitting `CallI(ll_int_py_div, ...)`
+    // `codegen.rs` emitting `CallI(ll_int_py_div, ...)`
     // directly.  Wiring `handler_int_floordiv` here would silently
     // re-introduce the upstream-absent bytecode dispatch path.
     builder.wire_handler("int_and/ii>i", handler_int_and);
@@ -9124,7 +9122,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     //   * `cast_bool_to_float` → `cast_int_to_float`
     //     (`jtransform.py:1592` rename pass).
     //   * `float_is_true` → `float_ne(x, 0.0)`
-    //     (`jtransform.py:1627`, mirrored at `jtransform.rs:947+`).
+    //     (`jtransform.py:1627`, mirrored in `jtransform.rs`'s `optimize_block`).
     // Adding backend opcodes for these would diverge from upstream's
     // "shrink the opcode table at jtransform" contract.
 
@@ -9191,8 +9189,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("setfield_gc_r/ird", handler_setfield_gc_r_intbase);
     builder.wire_handler("arraylen_gc/rd>i", handler_arraylen_gc);
 
-    // Array item operations (blackhole.py:1329-1365). Same tagged-int
-    // base rationale as above for the `/iid>i` variant.
+    // Array item operations (blackhole.py:1329-1365). The `/iid>i` variant
+    // carries a pyre tagged-int base in an int register — same backend
+    // primitive as the canonical `/rid>i` form, only the base's register
+    // class differs.
     builder.wire_handler("getarrayitem_gc_i/rid>i", handler_getarrayitem_gc_i);
     builder.wire_handler("getarrayitem_gc_r/rid>r", handler_getarrayitem_gc_r);
     builder.wire_handler("getarrayitem_gc_i/iid>i", handler_getarrayitem_gc_i_intbase);
@@ -9365,10 +9365,12 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // Vable field operations — canonical `/rd>X` / `/rXd` RPython shape
     // (blackhole.py:1446-1495). pyre tagged-int base adds `/id>X` /
-    // `/iXd` variants handled by the `*_intbase` helpers. See the
-    // Field operations comment above for the Void/State/Unknown
-    // rationale — emit now derives kind suffix from the value/result
-    // register's kind so the `_v` sentinel form is no longer produced.
+    // `/iXd` variants handled by the `*_intbase` helpers. The
+    // Void/State/Unknown kinds follow the same rule as the plain field
+    // ops: the emit side (`majit-translate/src/codewriter/assembler.rs`
+    // `OpKind::FieldRead`/`FieldWrite`) derives the opname kind suffix
+    // from the value/result register's kind, so the `_v` sentinel form
+    // is no longer produced.
     builder.wire_handler("getfield_vable_i/rd>i", handler_getfield_vable_i);
     builder.wire_handler("getfield_vable_r/rd>r", handler_getfield_vable_r);
     builder.wire_handler("getfield_vable_f/rd>f", handler_getfield_vable_f);
@@ -9454,7 +9456,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // the comment on `handler_inline_call_pyre_nested` for rationale.
     // The canonical `inline_call_{r,ir,irf}_*` keys above are now pinned
     // in `wellknown_bh_insns()` (`BC_INLINE_CALL_*`,
-    // `insns.rs:797-806`) so their handlers dispatch through
+    // `insns.rs`'s `wellknown_bh_insns`) so their handlers dispatch through
     // `setup_insns`-built `_insns` like every other canonical opcode.
     // Byte 17 (`BC_INLINE_CALL`) sits below the canonical range and is
     // exposed via the separate pyre-only `inline_call_pyre_nested/P`
@@ -9535,7 +9537,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // wire here.
     // A5 epic: int binop+cmp+uint family migrated to canonical 1-byte
     // encoding (`[lhs][rhs][dst]` argcode order via `bhhandler_ii_i!`);
-    // the per-opname wire_handler calls at blackhole.rs:7658-7723 above
+    // the per-opname wire_handler calls above
     // bind the canonical handlers directly.  `int_floordiv` /
     // `int_mod` have no `bhimpl_*` upstream: `jtransform.py:576-577`
     // rewrites both via `_do_builtin_call` to
@@ -10055,18 +10057,18 @@ fn handler_setfield_vable_f(
 //          return cpu.bh_getarrayitem_gc_*(array, index, arraydescr)
 //
 // TODO: pyre's W_ListObject `EmbeddedArray` storage
-// (`virtualizable.rs:104-113`) reaches the array data via two pointer
+// (`virtualizable.rs`'s `VableArrayInfo`) reaches the array data via two pointer
 // dereferences from the vable (vable→container→data + `ptr_offset`),
 // while `cpu.bh_getfield_gc_r + cpu.bh_setarrayitem_gc_*`
-// (`runner.rs:2244-2275`) only does a single indirection.  The chain
+// (`runner.rs`) only does a single indirection.  The chain
 // therefore cannot reach EmbeddedArray items.  Resolve `array_idx`
 // from the `BhDescr::VableArray` index and delegate to
 // `vable_read_array_item` / `vable_write_array_item` /
-// `bhimpl_arraylen_vable` (`virtualizable.rs:2454-2527`) — these
+// `bhimpl_arraylen_vable` (`virtualizable.rs`) — these
 // dispatch on `VableArrayStorage` and handle both EmbeddedArray and
 // DirectPointer modes.  This keeps the same direct vable-array helper
 // path under strict dispatch.
-// Convergence path (Sub-slice C.5+ epic): redesign W_ListObject to
+// Convergence path: redesign W_ListObject to
 // single-indirection storage so the canonical cpu chain works
 // directly.
 /// Resolve `bh.virtualizable_info` to a non-null reference and clear the
@@ -11079,7 +11081,7 @@ fn handler_inline_call_r_v(
 /// TODO: pyre `call_assembler_*` adapters.
 ///
 /// `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
-/// (`assembler.rs:3370,3429,3451,3489`) emits a pyre-only flat payload
+/// (`jitcode/assembler.rs`) emits a pyre-only flat payload
 /// for `BC_CALL_ASSEMBLER_{INT,REF,FLOAT,VOID}`:
 ///   typed: `[target_idx: u16, dst: u8, num_args: u16, (kind: u8, reg: u8) × num_args]`
 ///   void:  `[target_idx: u16, num_args: u16, (kind: u8, reg: u8) × num_args]`
@@ -11140,7 +11142,7 @@ fn handler_call_assembler_ref_pyre(
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     // RPython `blackhole.py:1244 bhimpl_residual_call_irf_r` →
     // `cpu.bh_call_r(...)`; pyre's ref ABI uses the same i64 carrier
-    // as int (`pyjitpl/dispatch.rs:4161 call_ref_function = call_int_function`),
+    // as int (`pyjitpl/dispatch.rs`'s `call_ref_function = call_int_function`),
     // so the alias is structural-parity only.  Picking the ref-named
     // helper here keeps the call site readable as `bh_call_r` and
     // gives a single switch point if the ref ABI ever diverges.
@@ -11233,13 +11235,13 @@ fn handler_call_assembler_void_pyre(
 /// adapters.
 ///
 /// `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
-/// (`assembler.rs:2642,2660`) emit a pyre-only flat payload:
+/// (`jitcode/assembler.rs`) emit a pyre-only flat payload:
 ///   `cond_call_*`:    `[first_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8]`
 ///   `cond_call_value`: `[value_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8, dst: u8]`
 ///   `record_known_result_*`: same shape as `cond_call_*` (no dst).
 ///
-/// Producers: `majit-macros/src/jit_interp/jitcode_lower.rs:2166-2458`,
-/// `pyre/pyre-jit/src/jit/assembler.rs:1181`.
+/// Producers: `majit-macros/src/jit_interp/jitcode_lower`,
+/// `pyre/pyre-jit/src/jit/assembler.rs`.
 ///
 /// Semantics mirror `blackhole.py:1257-1278 bhimpl_conditional_call_*`
 /// and `blackhole.py:620-628 bhimpl_record_known_result_*`:
@@ -11414,7 +11416,7 @@ fn handler_record_known_result_ref_pyre(
 /// Registered via the pyre-only opname `inline_call_pyre_nested/P`
 /// in `pyre_extension_insns()`.  Canonical `inline_call_{r,ir,irf}_*`
 /// keys are pinned in `wellknown_bh_insns()` (`BC_INLINE_CALL_*`,
-/// `insns.rs:797-806`) — this `_pyre_nested/P` shape is a separate
+/// `insns.rs`'s `wellknown_bh_insns`) — this `_pyre_nested/P` shape is a separate
 /// pyre-only adapter that carries the nested-bytecode payload layout
 /// described above, distinct from the canonical `dR`/`dIR`/`dIRF`
 /// arglist shapes the upstream walker dispatches.

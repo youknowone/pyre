@@ -11,10 +11,11 @@
 //! resoperation.py:2501), and folds to a `ConstPtr` (history.py:314)
 //! when every argument is constant — *not* a `ConstInt` of the same
 //! numeric value (history.py:220 ConstInt vs :307/:314 ConstPtr pin
-//! distinct Box types at construction; history.rs:3150 documents the
-//! aliasing hazard the OpRef enum prevents structurally).
+//! distinct Box types at construction; `history.rs`'s
+//! `cond_call_value_ref_typed` documents the aliasing hazard the OpRef
+//! enum prevents structurally).
 //!
-//! ── Policy-byte vs fold-path subtlety (STEP 5 go/no-go) ──────────────
+//! ── Policy-byte vs fold-path subtlety ───────────────────────────────
 //!
 //! Plain `#[elidable]` advertises a *can-raise* policy byte
 //! (`REF_ELIDABLE = 21`, `call.py:297 elif cr:`).  The fold machinery
@@ -23,12 +24,14 @@
 //! `_record_helper_pure` path, which `pyjitpl.py:1351-1352` reaches ONLY
 //! for `EF_ELIDABLE_CANNOT_RAISE`.  Both `call_typed_with_effect_pure`
 //! (`history.rs` debug_assert) and `execute_pure_call`
-//! (`executor.rs:943` `should_panic` guard) hard-reject
+//! (`executor.rs`'s `elidable_can_raise_panics_debug_assertion`
+//! `should_panic` guard) hard-reject
 //! `EF_ELIDABLE_CAN_RAISE` by design.  So the fold-path checks thread
 //! `ExtraEffect::ElidableCannotRaise`, exactly as the Int canary does;
 //! a `EF_ELIDABLE_CAN_RAISE` ref helper instead records
 //! `CALL_PURE_R + GUARD_NO_EXCEPTION` through the residual-call walker
-//! (`pyre-jit-trace/src/jitcode_dispatch.rs:3349-3352`), a distinct
+//! (`jitcode_dispatch/residual_call.rs`'s
+//! `select_residual_call_opcode`), a distinct
 //! mechanism not under test here.  Check 1 asserts the can-raise policy
 //! byte; checks 2-3 assert the cannot-raise fold — these are two
 //! separate facts about the same REF helper family.
@@ -39,9 +42,9 @@ use majit_metainterp::{BackEdgeAction, MetaInterp};
 
 /// Pointer-returning canary helper.  `*mut u8` return →
 /// `helper_call_kind_for_type` → `HelperCallKind::Ref`
-/// (`majit-macros/src/lib.rs:229-231`).  Plain `#[elidable]` →
+/// (`majit-macros/src/lib.rs`).  Plain `#[elidable]` →
 /// `EF_ELIDABLE_CAN_RAISE` → `REF_ELIDABLE = 21`
-/// (`call_policy_byte.rs:108`).
+/// (`call_policy_byte.rs`).
 #[elidable]
 fn elidable_ref_canary(x: i64) -> *mut u8 {
     (x as usize) as *mut u8
@@ -49,7 +52,7 @@ fn elidable_ref_canary(x: i64) -> *mut u8 {
 
 #[test]
 fn elidable_ref_canary_macro_advertises_ref_policy_byte_21() {
-    // `call_policy_byte.rs:108 REF_ELIDABLE = 21`.  Must NOT collapse to
+    // `call_policy_byte.rs`'s `REF_ELIDABLE = 21`.  Must NOT collapse to
     // `UNSUPPORTED` (0): the `*mut u8` return is classified as a Ref
     // helper (`HelperCallKind::Ref`), and plain `#[elidable]` is the
     // can-raise variant (`call.py:297`).  Also confirms the 6-tuple's
@@ -85,7 +88,8 @@ fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
     let action = meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(GcRef(live_p))]);
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-    // Fold path requires EF_ELIDABLE_CANNOT_RAISE (see file header).
+    // Fold path requires EF_ELIDABLE_CANNOT_RAISE: `_record_helper_pure`
+    // is reached only for that policy (pyjitpl.py:1351-1352).
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);
 
     // inputarg slot 0 = first live value, Ref-typed (resoperation.py:739
@@ -142,7 +146,7 @@ fn elidable_ref_canary_all_const_args_fold_to_const_ptr_not_const_int() {
     // returned (record_result_of_call_pure: `Value::Ref(r) =>
     // OpRef::const_ptr(r)`).  Critically the folded constant must be a
     // ConstPtr / `Value::Ref`, NOT a ConstInt / `Value::Int` of the same
-    // numeric value (history.rs:3150 aliasing hazard).
+    // numeric value (`history.rs`'s `cond_call_value_ref_typed` aliasing hazard).
 
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();

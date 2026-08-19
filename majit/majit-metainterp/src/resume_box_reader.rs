@@ -159,7 +159,8 @@ pub fn decode_fieldnum(
             // are the bridge's `InputArg{Int,Ref,Float}` slots, so we
             // mint the typed `OpRef::input_arg_typed` variant matching
             // `fail_arg_types[idx]` rather than a bare untyped raw
-            // OpRef — variant-aware Eq (resoperation.rs:290) requires
+            // OpRef — variant-aware Eq (`OpRef`'s `PartialEq` in
+            // `majit-ir/src/resoperation.rs`) requires
             // the optimizer/heap-cache key to be the same typed variant
             // the bridge inputarg list produces.
             let idx = if val < 0 {

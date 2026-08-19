@@ -714,7 +714,7 @@ impl JitProfiler {
         self.start_backend();
         // Rollback guard: the backend event is now open, but
         // `debug_start` may still panic on a nesting violation
-        // (`debug.rs:84-` strict-stop guard).  Without the guard, a
+        // (`majit-ir`'s `debug.rs` `debug_stop` strict-stop guard).  Without the guard, a
         // panic between the two opens would leave the profiler stack
         // dirty for later calls.  The local guard fires
         // `end_backend()` on unwind; `mem::forget` disarms it once

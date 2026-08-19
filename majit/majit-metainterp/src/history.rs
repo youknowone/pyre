@@ -108,7 +108,8 @@ impl TargetToken {
 struct LoopTargetDescrState {
     target_arglocs: Vec<majit_ir::TargetArgLoc>,
     /// `history.py:493 self.original_jitcell_token`. Backfilled once the
-    /// owning JitCellToken is created (`pyjitpl.rs:3853` etc., the
+    /// owning JitCellToken is created (`pyjitpl.rs`'s `compile_loop_body`
+    /// calling `set_original_jitcell_token_number`, the
     /// counterpart to `compile.py:237` / `compile.py:289`).
     original_jitcell_token_number: Option<u64>,
 }
@@ -2829,9 +2830,9 @@ impl TraceCtx {
     /// `frames` must be ordered **outermost-first** — `frames[0]` is the
     /// outermost (root) frame and the last element is the top (currently
     /// executing) frame.  This is the order `Snapshot.frames` requires
-    /// (`recorder.rs:54`) and is what the resume decoder consumes; the
+    /// (`recorder.rs`'s `Snapshot`) and is what the resume decoder consumes; the
     /// trait-leg encoder reaches it by building an innermost-first `lead`
-    /// and `lead.reverse()`-ing (`trace_opcode.rs:4254`).  `capture_resumedata`
+    /// and reversing it (`trace_opcode.rs`).  `capture_resumedata`
     /// (`opencoder.py:819-832`) iterates `framestack[-1] .. framestack[0]`,
     /// i.e. innermost-first, but the stored snapshot order is outermost-first.
     ///
@@ -2982,7 +2983,7 @@ impl TraceCtx {
 
     /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage guards
     /// carry `descr=None`. The optimizer's `store_final_boxes_in_guard`
-    /// (mod.rs:3417 with codex #1 fix) mints the descr via
+    /// (`optimizeopt/mod.rs`) mints the descr via
     /// `invent_fail_descr_for_op`-style dispatch. `num_live` was a
     /// placeholder used by the prior `make_resume_guard_descr(num_live)`
     /// stamping — kept on the signature for caller compatibility but
@@ -3021,7 +3022,7 @@ impl TraceCtx {
     /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage typed
     /// guards carry `descr=None`. The `fail_arg_types` are stamped onto
     /// `op.fail_arg_types` directly so the optimizer's
-    /// `store_final_boxes_in_guard` (mod.rs:3433) can mint a fresh
+    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs`) can mint a fresh
     /// `ResumeGuardDescr` carrying those types via the
     /// `op.descr.is_none()` branch (RPython
     /// `invent_fail_descr_for_op`-style fallthrough,
@@ -3053,14 +3054,14 @@ impl TraceCtx {
     // hold their value inline (history.py:227/268/314), so no constant
     // resolution is needed at record time.
     //
-    // Step 2e.2b swaps the `recorder` field type from `Trace` to
+    // The pending migration swaps the `recorder` field type from `Trace` to
     // `TraceRecordBuffer`. Contrary to an earlier note here, this is NOT
     // a simple helper-body replacement. TRB returns RPython-orthodox
     // `_index`-based positions (box-yielding count, opencoder.py:664-670
     // `record_op` returns `pos = self._index`), while
-    // `recorder::Trace::record_op` (recorder.rs:159-169) returns
+    // `recorder::Trace::record_op` (recorder.rs) returns
     // `OpRef::from_raw(op_count)` — every op (void or not) gets a unique index.
-    // TRB's `_untag` (opencoder.rs:717-770) resolves `TAGBOX(v)` via
+    // TRB's `_untag` (opencoder.rs) resolves `TAGBOX(v)` via
     // `_cache[v]`, and `_cache` is indexed by `_index`, so callers that
     // store an OpRef and later pass it as an arg must have stored an
     // `_index`-based value. Across pyre, `op.pos.raw()` is used as a HashMap
@@ -3069,9 +3070,8 @@ impl TraceCtx {
     // corrupt those maps. The swap therefore has to land together with
     // caller-side OpRef convention migration.
     //
-    // See `step2e_traceposition_parity_2026_04_22` memory +
-    // `rpython-trace-jitcode-hidden-candle.md` plan (Step 3–5) for the
-    // route.
+    // The route is the caller-side OpRef convention migration described
+    // above.
 
     pub(crate) fn do_record_op(recorder: &mut Trace, opcode: OpCode, args: &[OpRef]) -> OpRef {
         recorder.record_op(opcode, args)
@@ -3111,17 +3111,17 @@ impl TraceCtx {
         recorder.finish(finish_args, descr);
     }
 
-    // ── Step 2e.2b.glue: public TraceCtx wrappers over self.recorder ──
+    // ── Public TraceCtx wrappers over self.recorder ──
     //
     // These methods centralize every `ctx.recorder.X()` external call
     // pattern, so the eventual TRB swap can be threaded through the
     // `do_*` helpers above. TRB already has matching byte-stream entry
     // points (`record_op_oprefs` / `close_loop_oprefs` / `finish_oprefs`
-    // at opencoder.rs:2536-2642), but the `TreeLoop`-shaped result
+    // in opencoder.rs), but the `TreeLoop`-shaped result
     // produced by `recorder::Trace::get_trace()` has no RPython analogue
     // — upstream (opencoder.py:848) exposes `get_iter()` and the
     // optimizer walks the iterator directly, with no intermediate
-    // `Vec<Op>` materialization. Step 2e.2b must either port pyre's
+    // `Vec<Op>` materialization. The TRB swap must either port pyre's
     // consumers onto an iterator-walk shape or introduce a documented
     // pyre-ADAPTATION materializer (`TRB -> TreeLoop`) with a comment
     // pointing at the specific RPython call that it stands in for.
@@ -3164,9 +3164,9 @@ impl TraceCtx {
         &self.snapshots
     }
 
-    /// Op slice accessor — returns the raw recorded operations. After
-    /// Step 2e.2b this materializes via `ByteTraceIter::next` walking
-    /// the byte stream.
+    /// Op slice accessor — returns the raw recorded operations. After the
+    /// `TraceRecordBuffer` swap this materializes via `ByteTraceIter::next`
+    /// walking the byte stream.
     pub fn ops(&self) -> &[majit_ir::OpRc] {
         self.recorder.ops()
     }
@@ -3331,10 +3331,10 @@ impl TraceCtx {
 
     /// `pyjitpl.py:2548-2602 generate_guard` + `:2610 capture_resumedata`:
     /// record a guard AND attach a resume snapshot so the optimizer's
-    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:5897`) reads a
+    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs`) reads a
     /// valid `rd_resume_position >= 0` — `resume.py:396-397` asserts that,
     /// and the pyre port hard-panics a guard that reaches finish() with
-    /// neither a snapshot nor a patchguardop ancestor (`mod.rs:5938`). The
+    /// neither a snapshot nor a patchguardop ancestor (`optimizeopt/mod.rs`). The
     /// single-frame snapshot here is therefore **load-bearing**: removing
     /// it (reverting to a bare `record_guard`, as on main) panics the
     /// optimizer for these interpreter-side promotes.
@@ -3365,7 +3365,7 @@ impl TraceCtx {
     /// This doc used to claim the empty boxes were safe, on the grounds
     /// that every guard reaching here is constant-narrowed at optimization
     /// time — "the array index is a function of the already-promoted-constant
-    /// `stackpos`" — so `optimize_guard_value` removes it (`rewrite.rs:653`,
+    /// `stackpos`" — so `optimize_guard_value` removes it (`optimizeopt/rewrite.rs`,
     /// `actual == expected → Remove`) and it "never reaches the backend, so
     /// these empty boxes are never numbered or consumed". **That was false,
     /// and it is why the empty `vable_boxes` shipped as a defect.** It holds
@@ -3968,7 +3968,7 @@ impl TraceCtx {
     /// `jtransform.py:299-310 rewrite_op_jit_record_known_result` builds
     /// from `getcalldescr`.  `OptPure.optimize_record_known_result`
     /// (`optimizeopt/pure.py:211-220`, ported at
-    /// `optimizeopt/pure.rs:1028-1036`) keys its `known_result_call_pure`
+    /// `optimizeopt/pure.rs`'s `propagate_forward`) keys its `known_result_call_pure`
     /// table off `descr_identity`, so a missing descr would let two
     /// distinct elidable callees with matching argument shapes collide
     /// at the later `CALL_PURE_*` lookup.
@@ -3983,7 +3983,7 @@ impl TraceCtx {
     /// register.  The `GcCache._cache_call` key (`LLType::Func`) hashes
     /// `result_type` into the descr identity, so passing `Type::Void`
     /// here would never match the `Type::Int` / `Type::Ref` descr that
-    /// `getcalldescr` (`codewriter/call.rs:2799+`) builds for the
+    /// `getcalldescr` (`codewriter/call.rs`) builds for the
     /// matching `CALL_PURE_*` op.
     ///
     /// `slot` is the per-callee classification chosen at producer time
@@ -4326,7 +4326,7 @@ impl TraceCtx {
     /// EXCLUDES the `CALL_RELEASE_GIL_*` family — release-gil falls
     /// through to `reset_keep_likely_virtuals` because the optimizer
     /// cannot selectively invalidate across a GIL-release boundary.
-    /// Pyre's `clear_caches_varargs` (`heapcache.rs:1097`) mirrors
+    /// Pyre's `clear_caches_varargs` (`majit-trace`'s `heapcache.rs`) mirrors
     /// the upstream enumeration with an explicit
     /// `!is_call_release_gil()` guard.
     pub fn call_release_gil_void_typed_with_effect(
@@ -4363,7 +4363,7 @@ impl TraceCtx {
     /// the upstream `argboxes[1:]` shape. The trace op shape becomes
     /// `[savebox, realfuncaddr] + args`.
     ///
-    /// The Cranelift / Dynasm consumers (`compiler.rs:9807` etc.)
+    /// The Cranelift / Dynasm consumers (`compiler.rs`'s `do_compile` etc.)
     /// require this shape uniformly; emitting the legacy `[func, args]`
     /// shape for int/float typed release-gil silently mis-routes the
     /// first real arg as the function pointer.
@@ -4386,7 +4386,8 @@ impl TraceCtx {
         // sentinel-(1, 0) descrs emitted by the macro DSL wrappers
         // before the descr is materialized.  Caller-side
         // `trace_ctx::call_release_gil_*_typed` already populates the
-        // slot with `func_ptr` directly (`trace_ctx.rs:3852, 3874`).
+        // slot with `func_ptr` directly (`call_release_gil_{int,float}_typed`
+        // in this file).
         // Either way the descr carries a real C address by the time
         // we read it here.
         //
@@ -4558,7 +4559,7 @@ impl TraceCtx {
     // (jitcode/assembler.rs) which writes the upstream-shaped
     // `[savebox, funcbox]+args` operand layout directly. The legacy
     // `call_family_typed`-based void helper produced a `[func]+args`
-    // layout that did not match `cranelift::compiler.rs:9807`'s
+    // layout that did not match `cranelift::compiler.rs`'s `do_compile`
     // expectation, so it was removed once the only caller migrated.
     //
     // call_release_gil_ref / _typed intentionally absent:
@@ -4722,7 +4723,7 @@ impl TraceCtx {
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
         // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (mirror
-        // `call_typed` at trace_ctx.rs:3083). Routes
+        // `call_typed` in trace_ctx.rs). Routes
         // heapcache.invalidate_caches_varargs BEFORE the history record
         // for the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
         // paths run exactly once per recorded op (heapcache.py:211).
@@ -4963,7 +4964,7 @@ impl TraceCtx {
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
         // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (mirror
-        // `call_typed_with_effect` at trace_ctx.rs:3122). Routes
+        // `call_typed_with_effect` in trace_ctx.rs). Routes
         // heapcache.invalidate_caches_varargs BEFORE the history record
         // of the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
         // paths run exactly once per recorded op (heapcache.py:211).
@@ -5098,7 +5099,7 @@ impl TraceCtx {
         self.call_assembler_typed_by_number(target_number, args, arg_types, Type::Float)
     }
 
-    /// Slice X-D step: variant of `call_assembler_typed_by_number` that
+    /// Variant of `call_assembler_typed_by_number` that
     /// uses a pre-resolved `Arc<JitCellToken>` so the recorded descr
     /// carries production token identity (compile.py:187 parity).
     /// Skips the synth-Arc + `jitcell_token_by_number` keepalive fallback

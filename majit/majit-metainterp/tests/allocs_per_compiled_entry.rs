@@ -594,9 +594,9 @@ fn main() {
 ///
 /// | n | site |
 /// |---|------|
-/// | 2 | `CounterState::extract_live_into` — TWO separate `extract_live()` calls, one `Vec<i64>` each: `extract_live_values`'s default (`jit_state.rs:186-187`) calls it and then `live_value_types`, whose default (`jit_state.rs:194`) calls it AGAIN. A two-int-scalar state builds each Vec in one allocation (capacity 0→4, no regrowth); the 2 is a doubled traversal, not a regrowth |
-/// | 1 | `JitState::extract_live_values` default body, `jit_state.rs:190` — the `Vec<Value>` it collects into |
-/// | 1 | `JitState::live_value_types` default body, `jit_state.rs:194` — the `Vec<Type>` it collects into |
+/// | 2 | `CounterState::extract_live_into` — TWO separate `extract_live()` calls, one `Vec<i64>` each: `JitState::extract_live_values`'s default (`jit_state.rs`) calls it and then `live_value_types`, whose default calls it AGAIN. A two-int-scalar state builds each Vec in one allocation (capacity 0→4, no regrowth); the 2 is a doubled traversal, not a regrowth |
+/// | 1 | `JitState::extract_live_values` default body in `jit_state.rs` — the `Vec<Value>` it collects into |
+/// | 1 | `JitState::live_value_types` default body in `jit_state.rs` — the `Vec<Type>` it collects into |
 ///
 /// Four shared rows have gone since:
 ///
@@ -617,7 +617,8 @@ fn main() {
 ///   copy — so there is nothing to hand back.
 ///
 /// ⚠ ALL FOUR ARE A PROPERTY OF THIS FIXTURE'S STATE SHAPE, not of the
-/// entry path in general. `codegen_state.rs:1731` emits the non-allocating
+/// entry path in general. `codegen_state.rs`'s `generate_state_fields_jit_state`
+/// emits the non-allocating
 /// `extract_live_values_into` / `live_value_types_into` overrides only when the
 /// state has a ref scalar, a float scalar or a virt array; a state of int
 /// scalars only — which `CounterState` is — gets neither, and falls back to the
@@ -628,9 +629,9 @@ fn main() {
 /// | n | site |
 /// |---|------|
 /// | 1 | `majit_backend::jitframe::alloc_off_gc_jitframe` — the JITFRAME itself (`llmodel.py:298 malloc_jitframe`, the ONE allocation upstream makes per entry) |
-/// | 1 | `DynasmBackend::execute_token`, `runner.rs:3001` — the `Box<FrameData>` inside `DeadFrame`. `DeadFrame` erases its payload behind `Box<dyn Any>`, so this box is the cast `llmodel.py:240` spells with `cast_opaque_ptr`; it holds the frame POINTER, not a copy of the frame |
+/// | 1 | `DynasmBackend::execute_token` in `runner.rs` — the `Box<FrameData>` inside `DeadFrame`. `DeadFrame` erases its payload behind `Box<dyn Any>`, so this box is the cast `llmodel.py:240` spells with `cast_opaque_ptr`; it holds the frame POINTER, not a copy of the frame |
 ///
-/// It used to add three. The third was `raw_values` at `runner.rs:2990`, a copy
+/// It used to add three. The third was `raw_values` in `execute_token`, a copy
 /// of every jitframe slot taken because `execute_token` freed the frame before
 /// returning. `llmodel.py:240-250` reads those slots out of the frame itself,
 /// so the copy had no upstream counterpart; the frame now lives as long as the
@@ -642,7 +643,7 @@ fn main() {
 /// between the two backends. `run_compiled_code_inner` takes the JITFRAME from
 /// the nursery under its registered type id, which is `jitframe.py:48-52`
 /// `jitframe_allocate` — a bump of `nursery_free`, so the frame costs the
-/// process allocator nothing. dynasm's `execute_token` (`runner.rs:2871`)
+/// process allocator nothing. dynasm's `execute_token` (`runner.rs`)
 /// allocates its entry frame off the GC unconditionally, so it keeps paying
 /// for one; installing a GC does not move its figure.
 ///

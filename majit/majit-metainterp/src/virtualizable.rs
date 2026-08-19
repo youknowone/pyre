@@ -198,7 +198,9 @@ pub struct VirtualizableInfo {
     /// the vinfo descr when the parent has no field at that offset.
     _static_field_struct_descrs: Vec<DescrRef>,
     /// Parent-struct-layout counterparts of `_array_field_descrs` (the
-    /// array-pointer fields). Same rationale as `_static_field_struct_descrs`.
+    /// array-pointer fields). Like `_static_field_struct_descrs`, these carry
+    /// the parent `SizeDescr`'s `index_in_parent` so a vable op against a
+    /// force-materialized VIRTUAL frame pairs with its `NewWithVtable`.
     _array_field_struct_descrs: Vec<DescrRef>,
     /// virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to field index.
@@ -472,7 +474,7 @@ impl VirtualizableInfo {
         // `compile.py:425-461 patch_new_loop_to_load_virtualizable_fields`
         // to emit GETFIELD_GC at loop entry), while the codewriter emits
         // the `vable_static_field_descr(idx)` singleton in
-        // `BhDescr::VableField` (codewriter/assembler.rs:1626).  Both
+        // `BhDescr::VableField` (`codewriter/assembler.rs`'s `encode_op`).  Both
         // refer to the same logical (vable, field), so register BOTH
         // arc identities under the same idx — `vable_getfield_int`'s
         // identity lookup then resolves whichever descr the walker

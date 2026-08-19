@@ -514,7 +514,8 @@ pub enum HotResult {
     /// / `MetaInterp.create_history` live on `MetaInterp`, not on the
     /// warmstate (pyjitpl.py:2604-2610). Pyre's prior signal-and-factory
     /// pattern (`HotResult::StartTracing(Trace::new())`) forced warmstate
-    /// to depend on the `recorder::Trace` type; Step 2e.2b is removing
+    /// to depend on the `recorder::Trace` type; the `TraceRecordBuffer`
+    /// migration removes
     /// that coupling so the `Trace` factory moves to MetaInterp where
     /// `metainterp_sd` is available for `TraceRecordBuffer::new`.
     StartTracing,
@@ -1333,12 +1334,12 @@ impl WarmEnterState {
     /// RPython equivalent does not exist because upstream descrs hold
     /// the `JitCellToken` object directly (`compile.py:187 isinstance(descr,
     /// JitCellToken)`) — no number→token resolution is needed.  This
-    /// helper is removed by Slice X-D once `CallAssemblerDescr` /
+    /// helper is removed once `CallAssemblerDescr` /
     /// `LoopTargetDescr` carry the owning `Arc<JitCellToken>`.
     /// Walks each chain, not just its head — see `clear_all_loop_tokens`.
     /// A token living on a chained cell was previously unfindable here, and
     /// this is the fallback `with_trace_ctx_and_token_resolver` reaches when
-    /// no `compiled_loops` entry matches (`pyjitpl.rs:4663`).
+    /// no `compiled_loops` entry matches (`pyjitpl.rs`).
     pub fn find_token_by_number(&self, token_number: u64) -> Option<&Arc<JitCellToken>> {
         for head in self.cells.values() {
             let mut cur = Some(head);
@@ -4301,7 +4302,7 @@ mod tests {
     /// two distinct GreenKeys sharing one bucket must each resolve to
     /// their own cell via `comparekey` rather than aliasing. The test
     /// exploits `install_new_cell`'s `should_remove_jitcell` gate
-    /// (warmstate.rs:184-200, counter.py:246-256 parity): a cell with
+    /// (`BaseJitCell::should_remove_jitcell`, counter.py:246-256 parity): a cell with
     /// no `loop_token` / no flags is treated as dead and dropped on
     /// the next install. Setting `JC_TRACING` on the first-installed
     /// cell keeps it alive across the second install so both end up
@@ -4554,8 +4555,8 @@ mod tests {
     /// fixture shows the chain forms, this one shows what the chain costs.
     ///
     /// `disable_noninlinable_function` is reached in production from
-    /// `pyre-jit-trace/src/state.rs:3189` and `pyjitpl.rs:5256/5312`;
-    /// `maybe_compile_with_key` is the typed back-edge path (`pyjitpl.rs:4393`).
+    /// `pyre-jit-trace/src/state.rs` and `pyjitpl.rs`;
+    /// `maybe_compile_with_key` is the typed back-edge path (`pyjitpl.rs`).
     ///
     /// The state does not merely move — it SPLITS, and the two reader
     /// families see opposite halves. `DONT_TRACE_HERE` ends up on the head,
@@ -4853,7 +4854,7 @@ mod tests {
     /// The mechanism has no probabilistic step in it:
     /// 1. a hash-only writer installs a cell with `comparekey: None`;
     /// 2. `DONT_TRACE_HERE` with no token makes `should_remove_jitcell()`
-    ///    false (warmstate.rs:241-257), so the cell survives the next install;
+    ///    false (`BaseJitCell::should_remove_jitcell`), so the cell survives the next install;
     /// 3. `lookup_chain_with_key` cannot match a `None` comparekey — that is
     ///    asserted by `comparekey_matches_only_with_stored_key` — so
     ///    `ensure_cell_for_key` misses and calls `install_new_cell`;
@@ -5533,7 +5534,8 @@ mod tests {
         );
 
         // The two tokens each stamp their own cell key, which is what
-        // `compile.rs:2436 jitcell_token.green_key.set(green_key)` writes and
+        // `compile.rs`'s `compile_tmp_callback`
+        // (`jitcell_token.green_key.set(green_key)`) writes and
         // what `try_to_free_some_loops` reads back.
         let token_a = Arc::new(JitCellToken::new(ws.alloc_token_number()));
         let token_b = Arc::new(JitCellToken::new(ws.alloc_token_number()));

@@ -145,7 +145,9 @@ fn dispatch_lowers() {
 /// The post-loop expression must be applied exactly once.
 ///
 /// Each pair satisfies `n == threshold + 1`, the only relation under which the
-/// walk is still recording when the loop exits (see the header). The compile
+/// walk is still recording when the loop exits — the fixture gives the
+/// trailing expression an observable state mutation, so a halt routed through
+/// it during tracing would apply the epilogue twice. The compile
 /// assertion is not decoration: at any other `n` this program answers correctly
 /// even with the defect present, so a fixture that quietly stopped tracing
 /// would pass while testing nothing.

@@ -230,7 +230,7 @@ pub struct TraceCtx {
     /// `_encode_descr` can route global descriptors through
     /// `metainterp_sd.all_descrs`. Pyre tracks it on TraceCtx instead
     /// of `recorder::Trace` because the swap to `TraceRecordBuffer`
-    /// (Step 2e.2b) needs the Arc available at constructor time; wiring
+    /// needs the Arc available at constructor time; wiring
     /// it at the TraceCtx layer lets the eventual swap reuse this
     /// plumbing without threading more parameters through
     /// `MetaInterp::setup_tracing` etc.
@@ -2833,7 +2833,7 @@ impl TraceCtx {
     /// Field-aware variant of [`Self::synchronize_virtualizable`] for the bridge
     /// resume convergence path.  Differs from the generic-bits version in
     /// two ways that match `sync_virtualizable_after_guard_failure`
-    /// (`pyre-jit/src/eval.rs:5709`):
+    /// (`pyre-jit/src/eval.rs`):
     ///
     ///   1. Bit conversion is delegated to caller-supplied field-aware
     ///      callbacks (`static_bits` / `array_bits`) instead of the
@@ -4240,7 +4240,8 @@ impl TraceCtx {
     ///          self.metainterp.heapcache.nullity_now_known(box)
     /// ```
     ///
-    /// Mirrors RPython's `jit::record_exact_class` hint (rlib/jit.rs:1181).
+    /// Mirrors RPython's `jit::record_exact_class` hint (`majit-metainterp`'s
+    /// `jit.rs` `record_exact_class`).
     /// `cls_const` is the class-vtable ConstInt OpRef, matching
     /// backend/model.py:199-201 `cls_of_box()` and the `/ri` bytecode
     /// shape. Cache hit short-circuits and bumps
@@ -5398,8 +5399,8 @@ impl TraceCtx {
 
 #[cfg(test)]
 #[allow(deprecated)] // test fixtures rebuild Op streams via OpRef::from_raw; production
-// trace_ctx path has 0 OpRef::from_raw callers (Untyped OpRef Retirement
-// Epic, — narrow the P1.5 gate from crate-level to mod-level).
+// trace_ctx path has 0 OpRef::from_raw callers, so the deprecation gate
+// narrows from crate-level to mod-level.
 mod tests {
     use super::*;
     use crate::jit_state::JitState;
