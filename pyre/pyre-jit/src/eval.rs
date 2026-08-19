@@ -779,6 +779,14 @@ unsafe fn lsprof_profiler_destructor(obj_addr: usize) {
     };
 }
 
+unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_queue::w_simplequeue_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
@@ -893,6 +901,12 @@ unsafe fn zlib_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 unsafe fn lsprof_profiler_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
     unsafe { pyre_interpreter::module::_lsprof::w_profiler_custom_trace(obj_addr, f) };
+}
+
+/// `_queue.SimpleQueue` is subclassable and owns a FIFO of Python objects.
+unsafe fn queue_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe { object_object_custom_trace(obj_addr, f) };
+    unsafe { pyre_interpreter::module::_queue::w_simplequeue_custom_trace(obj_addr, f) };
 }
 
 /// `_ssl._SSLSocket` owns its context, transport endpoints, cached unbound
@@ -3860,6 +3874,30 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         <pyre_interpreter::module::_lsprof::W_StatsSubEntry
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+
+    // `_queue.SimpleQueue` is unconditional, so it registers ahead of the
+    // target-gated `posix` rclasses below and keeps one id on every target.
+    let simplequeue_descr = <pyre_interpreter::module::_queue::W_SimpleQueue
+        as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let simplequeue_tid = gc.register_type(
+        TypeInfo::object_subclass_with_custom_trace(
+            simplequeue_descr.object_size,
+            object_tid,
+            queue_simplequeue_custom_trace,
+        )
+        .with_destructor_fn(queue_simplequeue_destructor),
+    );
+    simplequeue_descr.gc_type_id.set(simplequeue_tid);
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        simplequeue_descr.pytype_ptr as usize,
+        simplequeue_tid,
+    );
+    pytype_to_tid.insert(simplequeue_descr.pytype_ptr as usize, simplequeue_tid);
+    pyre_object::gc_hook::register_pyre_class_offsets(
+        simplequeue_descr.pytype_ptr as usize,
+        simplequeue_descr.ptr_offsets,
     );
 
     // Register `posix.DirEntry`'s four inline GC edges and
