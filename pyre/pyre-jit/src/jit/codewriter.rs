@@ -13570,14 +13570,26 @@ impl CodeWriter {
                         // `liveness.rs`'s `Instruction::YieldValue` arm,
                         // assemble.py:1543.
                         //
-                        // Fundamentally unsound to port: YIELD_VALUE suspends the
-                        // frame (StepResult::Yield), resuming later in a different
-                        // stack context — a residual call cannot express that.
-                        // flowspace's `record_pure_op("yield")` is an analysis
-                        // artifact (flow purity, not runtime effect-freedom), not
-                        // a signal that a residual is possible.  A JIT traces one
-                        // continuous execution, so abort_permanent is the only
-                        // parity-correct choice.
+                        // YIELD_VALUE suspends the frame (StepResult::Yield) and
+                        // resumes it later in a different stack context, which no
+                        // residual this compiler can emit expresses; flowspace's
+                        // `record_pure_op("yield")` is an analysis artifact (flow
+                        // purity, not runtime effect-freedom), not a signal that a
+                        // residual is possible.
+                        //
+                        // Measured, though, the marker is unreachable, and the
+                        // reason sits one level up: a resumption runs
+                        // `PyFrame::execute_generator_frame`, which calls
+                        // `eval_frame_plain_with_resume` directly instead of the
+                        // registered eval override, so no frame of a generator is
+                        // ever offered to the tracer.  No loop in a generator body
+                        // compiles today — whether or not a yield is in it.
+                        // Upstream runs one eval loop, so the same resumption is
+                        // traceable there, and it gives the resumption a merge
+                        // point of its own on top (`generator.py:604`
+                        // `generatorentry_driver`, taken at `:63` when
+                        // `should_not_inline` (`:614`) counts two or more yields;
+                        // below that the body is inlined into the caller's trace).
                         Instruction::YieldValue { .. } => {
                             let _ = current_state.stack.pop();
                             push_fresh_ref(&mut current_state, &mut graph);
