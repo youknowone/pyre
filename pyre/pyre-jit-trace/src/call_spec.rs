@@ -20,7 +20,7 @@ pub enum CallEffectKind {
     /// has for it: a spelling-keyed table, not a source attribute.
     ///
     /// `#[allow(dead_code)]` because **no row uses this arm yet.** The rows
-    /// are blocked on callee census item 6: a census re-run on a fresh LLBC set names
+    /// are blocked on a callee census: a re-run on a fresh LLBC set names
     /// the callees and, decisively, their SEGMENTATION — and a
     /// `FunctionPath` override matches on the split, so a row written from a
     /// `::`-joined listing is a guess that fails silently. Delete the

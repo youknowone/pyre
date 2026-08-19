@@ -83,7 +83,7 @@ thread_local! {
     /// residual of the same opcode instance can follow one.
     static ESCAPE_OPCODE_WINDOW: std::cell::Cell<Option<(usize, bool)>> =
         const { std::cell::Cell::new(None) };
-    /// C3 S1 force-time image of the single live tracing frame.  The
+    /// Force-time image of the single live tracing frame.  The
     /// color-indexed concrete banks cease to exist when dispatch unwinds, so
     /// the MIFrame must be assembled beside `tracing_after_residual_call` and
     /// carried to the walk-end VableEscaped leg.
@@ -3568,7 +3568,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // takes over the continuation.
                 mark_escape_flush_undo_pending();
             }
-            // C3 S1: the writes-live-heap force shape cannot safely resume AT
+            // The writes-live-heap force shape cannot safely resume AT
             // this opcode, but a top-level one-frame walk can resume PAST it
             // through the existing blackhole when every live color has a
             // concrete value.  Build here, before WalkContext's concrete banks
@@ -5953,7 +5953,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // B3: a `raise Type(args)` of a canonical
+    // A `raise Type(args)` of a canonical
     // builtin exception class arrives as two residuals — a `CallFn` that
     // constructs the exception, and a `RaiseVarargs`
     // (`normalize_raise_varargs_jit`) that publishes it.  The construct fold
@@ -6012,7 +6012,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    // B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
+    // Lower the PUSH_EXC_INFO / POP_EXCEPT
     // exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
     // `sys_exc_value` slot, and consume the interpreter-only propagation-root
     // clear without recording a runtime CallN. Recognised by the
@@ -6601,7 +6601,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // SUCCESSFUL fold provably can't raise NameError and dropping that guard
     // for this load is sound — the handler can never be entered from it.  We
     // therefore attempt the fold even in handler-bearing bodies and keep the
-    // residual (with its guard) only when the fold DECLINES.  The `B3`/builtin
+    // residual (with its guard) only when the fold DECLINES.  The builtin
     // raise+catch path needs this so the
     // `raise ValueError`/`except ValueError` class loads fold to const.
     //
@@ -7155,7 +7155,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         specialized
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
-                    // B3: `op_tag == 10` is CHECK_EXC_MATCH
+                    // `op_tag == 10` is CHECK_EXC_MATCH
                     // (`bh_compare_fn(exc, match_type, 10)`,
                     // `call_jit.rs`).  Fold the match concretely to a
                     // const bool (the immortal TRUE/FALSE singleton) so the

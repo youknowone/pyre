@@ -301,7 +301,8 @@ impl LiveVars {
 
         // Entry-defined locals: positional + keyword-only + *args + **kwargs.
         // varnames layout matches CPython's localsplus: positional /
-        // kwonly / vararg / varkwarg in order, matching call.rs:180-214.
+        // kwonly / vararg / varkwarg in order, matching `pack_varargs` in
+        // `call.rs`.
         let entry_defined_count = {
             let mut c = code.arg_count as usize + code.kwonlyarg_count as usize;
             use pyre_interpreter::bytecode::CodeFlags;
@@ -458,9 +459,9 @@ impl LiveVars {
     }
 
     /// True iff the dataflow analysis reached `pc`. Unreachable pcs have
-    /// their `stack_depth_at` slot left at the `usize::MAX` sentinel
-    /// (liveness.rs:150) and must not be treated as having a real stack
-    /// height. Used by the codewriter to skip liveness emission for
+    /// their `stack_depth_at` slot left at the `usize::MAX` sentinel that
+    /// `LiveVars::compute` seeds and must not be treated as having a real
+    /// stack height. Used by the codewriter to skip liveness emission for
     /// unreachable bytecode (RPython parity: flatten_graph() emits only
     /// reachable blocks).
     pub fn is_reachable(&self, pc: usize) -> bool {
@@ -634,7 +635,7 @@ pub(crate) fn stack_effects(
         // PopExcept: codewriter pops the saved previous exception object
         // from the value stack and restores TLS from it. Net -1.
         Instruction::PopExcept => (d - 1, d - 1),
-        // No-op; pyre's end_for() is a no-op (pyopcode.rs:999). PopIter handles the pop.
+        // No-op; pyre's `end_for()` in `pyopcode.rs` is a no-op. PopIter handles the pop.
         Instruction::EndFor => (d, d),
         // Pop 0, push 0 (identity stack effect)
         Instruction::DeleteFast { .. }

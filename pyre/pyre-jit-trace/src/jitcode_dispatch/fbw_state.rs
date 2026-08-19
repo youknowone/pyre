@@ -329,7 +329,7 @@ pub fn capture_fbw_finish_concrete_root_area() -> *const () {
     FBW_FINISH_CONCRETE.with(|value| value as *const _ as *const ())
 }
 
-/// Record that `op` is a walker-built inline exception (B3 construct fold).
+/// Record that `op` is a walker-built inline exception (construction fold).
 pub(crate) fn fbw_built_exc_insert(op: OpRef) {
     FBW_BUILT_EXC.with(|s| {
         s.borrow_mut().insert(op);
@@ -392,12 +392,12 @@ pub(crate) fn fbw_store_journal_reset() {
     // clears the per-entry body-effect signal so a prior walk's committed
     // mutation cannot block this walk's delivery.
     FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
-    // B3: drop any inline-built-exception OpRef keys a
+    // Drop any inline-built-exception OpRef keys a
     // prior aborted walk recorded, so they cannot match a same-numbered
     // OpRef minted by this walk's recorder.
     FBW_BUILT_EXC.with(|s| s.borrow_mut().clear());
     FBW_CONTEXT_CHAINED.with(|s| s.borrow_mut().clear());
-    // B3: drop any unbalanced PUSH_EXC_INFO prev saves a
+    // Drop any unbalanced PUSH_EXC_INFO prev saves a
     // prior aborted walk left (an exception that propagated out without its
     // POP_EXCEPT restore), so a stale saved-prev cannot be popped by an
     // unrelated POP_EXCEPT in this walk.
@@ -1718,8 +1718,8 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 /// * **Loop-bearing** — a framestack callee whose `CodeObject` has a
 ///   `FOR_ITER`.  Its side-effecting `for` consume runs concretely in the
 ///   sub-walk, and a later kept-stack guard abort can REFUSE the Option-C item
-///   delivery (a `for..break` frame parked past the loop header,
-///   eval.rs:5445), so the re-run re-executes the consume and double-advances
+///   delivery (a `for..break` frame parked past the loop header, in
+///   `eval.rs`), so the re-run re-executes the consume and double-advances
 ///   the iterator (the two `foriter_exempt_*` witnesses).
 /// * **Self-recursive** — the callee calls itself.  A hot self-recursion
 ///   forms a `CALL_ASSEMBLER` bridge whose moving-nursery callee frame cannot
@@ -1732,8 +1732,8 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 ///   hazard at inline depth 1.
 ///
 /// The `w_code` field is the `jitcode_for` code key, resolved to the raw
-/// `CodeObject` via the jitcode index (the `current`-frame pattern,
-/// mod.rs:4664).
+/// `CodeObject` via `state::ensure_jitcode_index` followed by
+/// `state::raw_code_for_jitcode_index`.
 ///
 /// Returns the code key of the offending callee, which is the entity the
 /// decline is a property of and therefore the one to deny — the same

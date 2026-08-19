@@ -66,7 +66,7 @@ fn elidable_helper_traces_to_call_pure_i_when_args_not_all_const() {
     // `pub fn(i64) -> bool` signature may not share calling convention
     // with the C ABI, so feeding it straight into a `Type::Int` (i64)
     // target is unsafe.  Only the macro wrapper covers the bool→i64
-    // conversion (1/0) at `majit-macros/src/lib.rs:192`.
+    // conversion (1/0) in `majit-macros`'s `helper_return_to_i64`.
     let trace_fn = __majit_call_target_jit_int_in_small_cache_range;
     let func_ptr = trace_fn as *const ();
     let concrete_result = trace_fn(live_x);
@@ -245,23 +245,23 @@ fn elidable_helper_all_const_args_fold_to_const_and_cut_call() {
     );
 }
 
-// ── Epic G (getattr-inline) G0 canary ──────────────────────────────────
+// ── getattr-inline: synthetic-pointer canary ──────────────────────────
 //
 // Proves the PRODUCTION Ref emitter
 // `emit_trace_call_ref_typed_elidable_cannot_raise` records `CallPureR`
 // for the exact `(Ref, Ref, Int) -> Ref` argument shape of
-// `_pure_lookup_where_with_method_cache` (baseobjspace.rs:3631, `@elidable`
+// `_pure_lookup_where_with_method_cache` (baseobjspace.rs, `@elidable`
 // — parity with typeobject.py:516).  The metainterp-side
 // `elidable_ref_canary_test.rs` proved the generic Ref fold via
 // `call_typed_with_effect_pure` directly with a one-Int-arg helper; this
-// goes further and exercises the production wrapper G2 will call from
-// `trace_load_attr` / `MIFrame::load_method`, with the real two-Ref-args +
-// one-Int-arg shape.
+// goes further and exercises the production wrapper the getattr inline will
+// call from `trace_load_attr` / `MIFrame::load_method`, with the real
+// two-Ref-args + one-Int-arg shape.
 //
 // The recorder records but does not execute the call (pyjitpl.py:1941-1958
 // `MIFrame.execute_varargs`), using the supplied `concrete_result`, so a
 // synthetic same-shape `extern "C"` pointer stands in for the still-private
-// real lookup helper; G2 wires the real one.
+// real lookup helper; the recordable-wrapper canary below wires the real one.
 
 /// `(w_type, w_name, version_tag) -> w_descr`-shaped synthetic helper.
 extern "C" fn lookup_where_shape_canary(_w_type: i64, _w_name: i64, _version_tag: i64) -> i64 {
@@ -335,8 +335,9 @@ fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
     // Hot-loop shape: w_type promoted, w_name interned, version_tag guarded
     // -> all three args const -> the call is fully cut and the result folds
     // to a ConstPtr (Value::Ref), NOT a ConstInt of the same bits
-    // (history.rs:3150 aliasing hazard).  This is the cross-iteration fold
-    // STEP 5 / Epic G deliver.
+    // (a `ConstInt` slot aliases any int constant of the same raw value —
+    // the hazard `history.rs` pins on its typed-constant recorders).  This is
+    // the cross-iteration fold the getattr inline delivers.
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -389,14 +390,14 @@ fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
     );
 }
 
-// ── Epic G (getattr-inline) G1 — REAL lookup helper, recordable wrapper ──
+// ── getattr-inline: REAL lookup helper, recordable wrapper ────────────
 //
-// G0 (above) proved the fold mechanism for the `(Ref, Ref, Int) -> Ref`
-// shape with a synthetic same-shape pointer.  G1 wires the REAL recordable
+// The canary above proved the fold mechanism for the `(Ref, Ref, Int) -> Ref`
+// shape with a synthetic same-shape pointer.  This one wires the REAL recordable
 // surface for the lookup: `jit_lookup_where_with_method_cache`
 // (helpers.rs), a plain `extern "C"` i64-ABI wrapper — like
 // `jit_namespace_cell_lookup` — that calls the now-`pub`
-// `_pure_lookup_where_with_method_cache` (baseobjspace.rs:3631, `@elidable`,
+// `_pure_lookup_where_with_method_cache` (baseobjspace.rs, `@elidable`,
 // typeobject.py:516).
 //
 // The `#[elidable]` macro does NOT emit a usable trampoline for that helper:
@@ -405,8 +406,9 @@ fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
 // UNSUPPORTED.  As with every other pyre trace helper, the foldable surface
 // is therefore this i64 wrapper, recorded with an explicit
 // `ElidableCannotRaise` effect (the raw-ptr return genuinely cannot raise).
-// G2 records it from `trace_load_attr` / `MIFrame::load_method` behind a
-// promoted-`version_tag` guard, with `jit_getattr` as the deopt fallback.
+// The getattr inline records it from `trace_load_attr` /
+// `MIFrame::load_method` behind a promoted-`version_tag` guard, with
+// `jit_getattr` as the deopt fallback.
 //
 // The recorder records but does not execute the call (pyjitpl.py:1941-1958),
 // so a synthetic concrete result stands in — the real wrapper would
@@ -473,7 +475,7 @@ fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
 fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
     // Hot-loop shape: w_type promoted, w_name interned, version_tag guarded
     // -> all three args const -> the lookup call is fully cut and folds to a
-    // ConstPtr (Value::Ref), the cross-iteration fold STEP 5 / Epic G deliver.
+    // ConstPtr (Value::Ref), the cross-iteration fold the getattr inline delivers.
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
     let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -526,10 +528,10 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
     );
 }
 
-// ── Epic G (getattr-inline) G2a — instance-dict shadow read residual ─────
+// ── getattr-inline: instance-dict shadow read residual ────────────────
 //
 // `jit_instance_getdictvalue` (helpers.rs) wraps `instance_node_getdictvalue`
-// (mapdict.rs:361, `getdictvalue` mapdict.py:846-847).  The LOAD_METHOD fast
+// (mapdict.rs, `getdictvalue` mapdict.py:846-847).  The LOAD_METHOD fast
 // path (callmethod.py:66) reads it after the type lookup to confirm no
 // instance attribute shadows the class method.  Unlike the type lookup, it is
 // NOT pure — the instance dict mutates — so it is recorded as a normal

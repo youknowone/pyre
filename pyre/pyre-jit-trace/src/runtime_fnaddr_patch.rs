@@ -14,8 +14,9 @@
 //! whose addresses are invalidated by ASLR (per-process random slide) and by
 //! the divergent executable layouts (the build-script binary embeds a
 //! subset of the runtime's symbols).  A walker that follows
-//! `execute_residual_call`'s elidable-EI branch (`jitcode_dispatch.rs:3192-
-//! 3239`) into one of those stale addresses dereferences arbitrary memory →
+//! `execute_residual_call`'s elidable-EI branch
+//! (`jitcode_dispatch::residual_call`'s `try_fold_pure_call_via_executor`)
+//! into one of those stale addresses dereferences arbitrary memory →
 //! SEGV.
 //!
 //! This module bridges that gap.  At build time
@@ -59,10 +60,10 @@ fn build_time_fnaddr_bindings() -> Vec<(String, i64)> {
 /// consumer can clone it).
 ///
 /// `JitCode.fnaddr` carries the shell-level fnaddr the codewriter
-/// recorded in `CallControl::get_jitcode` (`call.rs:2647`); the per-
+/// recorded in `CallControl::get_jitcode` (`codewriter/call.rs`); the per-
 /// instruction funcptr operands the residual_call dispatcher reads
 /// land in `JitCodeBody.constants_i` via the assembler's
-/// `emit_const_i_from_const` path (`assembler.rs:2453-2473`).  Both
+/// `emit_const_i_from_const` path (`codewriter/assembler.rs`).  Both
 /// surfaces are patched so the walker sees the same address regardless
 /// of which lookup it routes through.
 pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {

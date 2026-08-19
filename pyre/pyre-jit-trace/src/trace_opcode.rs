@@ -90,7 +90,7 @@ pub(crate) extern "C" fn ccall_pow(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
 
-/// `sqrt_nonneg` (ll_math.rs:91) — `@jit.elidable`, `oopspec
+/// `sqrt_nonneg` (ll_math.rs) — `@jit.elidable`, `oopspec
 /// "math.sqrt_nonneg(x)"` (ll_math.py:72-75).  The trace records this as a
 /// pure `CALL_F(sqrt_nonneg_jit, x)` (EF_ELIDABLE_CANNOT_RAISE, no trailing
 /// guard) behind the domain-pinning guards emitted by
@@ -161,7 +161,7 @@ pub(crate) extern "C" fn raise_exception_jit(exc_obj: i64) {
 
 /// Runtime helper for traced `RAISE_VARARGS`.
 ///
-/// Mirrors `eval.rs:1035-1129` on the compiled path:
+/// Mirrors `eval.rs`'s `raise_varargs` on the compiled path:
 /// normalize the exception operand, normalize/attach the optional
 /// cause, and publish the final exception via `jit_exc_raise` so the
 /// following `GUARD_EXCEPTION` sees it.
@@ -247,7 +247,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
 
 /// Runtime helper for traced `PUSH_EXC_INFO`: read the per-thread
 /// `CURRENT_EXCEPTION` slot so the compiled bridge preserves
-/// `pyopcode.py:786` / `eval.rs:1220-1229` semantics (save the
+/// `pyopcode.py:786` / `eval.rs`'s `push_exc_info` semantics (save the
 /// previous sys_exc_info before `CURRENT_EXCEPTION` is overwritten).
 pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
     pyre_interpreter::eval::get_current_exception() as i64
@@ -255,7 +255,8 @@ pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
 
 /// Runtime helper for traced `PUSH_EXC_INFO` / `POP_EXCEPT`: write the
 /// per-thread `CURRENT_EXCEPTION` slot so the compiled bridge preserves
-/// `pyopcode.py:786/:778` / `eval.rs:1220-1229 / :1243-1249` semantics.
+/// `pyopcode.py:786/:778` / `eval.rs`'s `push_exc_info` / `pop_except`
+/// semantics.
 pub(crate) extern "C" fn trace_set_current_exception_jit(exc: i64) {
     pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
 }
@@ -613,7 +614,7 @@ pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
 /// Write a Ref-boxed value to the symbolic operand stack at depth
 /// offset `stack_idx`. Centralizes the dual-shadow update that
 /// `push_typed_value`, `finishframe_exception`'s exception/lasti push,
-/// the `caller_result_stack_idx` writeback (pyjitpl.rs:475+) and
+/// the `caller_result_stack_idx` writeback (pyjitpl.rs) and
 /// inline-call setup all duplicated:
 ///
 /// - `registers_r[reg_idx]` — the semantic frame mirror slot
@@ -722,7 +723,7 @@ pub(crate) fn write_stack_slot(
 /// the array descr describes — and stores the result in the mirror slot
 /// subsequent stack reads consult.
 ///
-/// `init_symbolic` (state.rs:2785) leaves
+/// `init_symbolic` (state.rs) leaves
 /// `locals_cells_stack_array_ref = OpRef::NONE` for active-owner
 /// traces because their locals come from `OpRef::input_arg_ref` and
 /// stack writes route through the vable shadow, so the lazy-fill
@@ -1604,7 +1605,7 @@ impl MIFrame {
 
     /// RPython Box.type parity: build fail_arg_types matching compact
     /// active_boxes length. Each box carries its own immutable type.
-    /// Header layout matches `virtualizable_gen.rs:33-35` (frame +
+    /// Header layout matches `virtualizable_gen.rs`'s `inputargs` (frame +
     /// `extra_reds` + `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`):
     /// `[frame:Ref, ec:Ref, last_instr:Int, pycode:Ref,
     ///   valuestackdepth:Int, debugdata:Ref, w_globals:Ref]` — line-by-line
@@ -1628,8 +1629,8 @@ impl MIFrame {
         // happens to occupy. `ctx.get_opref_type` resolves the type
         // from the OpRef's producing op (constant kind, recorded
         // result_type, or `Forwarded::Info(PtrInfo)` for virtualized
-        // See the PtrInfo fallback at
-        // optimizeopt/mod.rs:3995). Position-based scans of
+        // See the PtrInfo fallback at the end of
+        // `OptContext::opref_type`). Position-based scans of
         // `registers_r` / `virtualizable_boxes` were a pyre-only
         // adaptation that papered over earlier `get_opref_type` gaps;
         // those gaps are closed at the source now.
@@ -1721,7 +1722,7 @@ impl MIFrame {
                 s.registers_r[idx] = trace_array_getitem_value(ctx, array_ref, idx_const);
             } else {
                 // Active vable owner whose registers_r[idx] is NONE cannot
-                // exist: init_symbolic (state.rs:2618-2619) seeds
+                // exist: init_symbolic (state.rs) seeds
                 // registers_r[idx] = OpRef::from_raw(base + idx) for every i in
                 // 0..nlocals before any load_local_value runs. Reachability
                 // audit (`MAJIT_PROBE_VABLE_FALLBACK`) confirmed
@@ -2122,7 +2123,7 @@ impl MIFrame {
         // into the virtualizable_boxes shadow so the writeback below
         // emits the merge-target PC, not the orgpc placed by
         // flush_to_frame. virtualizable_boxes[0] = vable_last_instr per
-        // virtualizable_gen.rs:37-44 inputargs ordering.
+        // `virtualizable_gen.rs`'s `inputargs` ordering.
         if let Some(pc) = target_pc {
             let last_instr_value = pc as i64 - 1;
             let opref = ctx.const_int(last_instr_value);
@@ -2607,7 +2608,7 @@ impl MIFrame {
                             Some(majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)))
                         }
                         // ConcreteValue::Null is the "untracked" sentinel
-                        // (state.rs:1286); real frame nulls are preserved as
+                        // (`state.rs`); real frame nulls are preserved as
                         // ConcreteValue::Ref(PY_NULL). Do not stamp Null as
                         // a typed null ref — it means "no runtime value
                         // recorded for this slot".
@@ -2812,9 +2813,9 @@ impl MIFrame {
 
         // Snapshot is the source of truth — the
         // optimizer's `store_final_boxes_in_guard`
-        // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from the
+        // (`optimizeopt/mod.rs`) overwrites `op.fail_args` from the
         // snapshot built below via `op.store_final_boxes(liveboxes)`
-        // (mod.rs:3392), so the inline `fail_args` copy that the legacy
+        // (`resoperation.rs`), so the inline `fail_args` copy that the legacy
         // `record_guard_typed_with_fail_args` path used to write was
         // redundant.  Mirrors RPython
         // `pyjitpl.MetaInterp.generate_guard` (pyjitpl.py:2558-2602)

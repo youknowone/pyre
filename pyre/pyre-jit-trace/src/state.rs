@@ -556,7 +556,8 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
         // length inflated by a repeated index would read more bits than this
         // record holds, run into the next record's bytes, and desync every
         // record after it. The sibling producers get the invariant from their
-        // argument type (`assembler.rs:1060` counts a `VecSet`); this one
+        // argument type (`_register_liveness_offset` in
+        // `codewriter/assembler.rs` counts a `VecSet`); this one
         // takes plain slices, so it establishes the set here.
         let (len_i, len_r, len_f) = (key.0.len(), key.1.len(), key.2.len());
         let encoded_i = encode_liveness(&key.0);
@@ -1450,8 +1451,9 @@ pub fn pyjitcode_for_code(code: *const ()) -> Option<std::sync::Arc<crate::PyJit
 /// `MetaInterpStaticData.jitcodes` store (warmspot.py:282) and its bytecode /
 /// constant pools are immutable after build, so extending those slices to
 /// `'static` is sound — the same justification as the per-fn arm-entry borrow
-/// extension at `trace.rs:363` / `trace_opcode.rs`. Returns `None` when
-/// the code is null or the on-demand build did not install a payload.
+/// extension at `trace.rs`'s `dispatch_perfn_frame` / `trace_opcode.rs`.
+/// Returns `None` when the code is null or the on-demand build did not
+/// install a payload.
 pub(crate) fn sub_jitcode_body_for_code(
     code: *const (),
 ) -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
@@ -1508,8 +1510,9 @@ pub(crate) type SubDescrPool = (
 /// needs when inlined by full-body-walk call inlining: its OWN adapted
 /// `descr_refs` + raw `RuntimeBhDescr` slice (for `RawDescrPool::PerFn`) +
 /// `sub_jitcode_lookup`.  Mirror of the top-level diagnostic walk's per-fn
-/// descr-pool construction (`trace.rs:363-400`): a callee body's
-/// `d`/`j` descr operands index its OWN `exec.descrs`, not the caller's pool.
+/// descr-pool construction (`dispatch_perfn_frame` in `trace.rs`): a callee
+/// body's `d`/`j` descr operands index its OWN `exec.descrs`, not the
+/// caller's pool.
 ///
 /// The pool lives on `PyJitCodePayload.sub_descr_pool`, not in a side table
 /// keyed by object identity: RPython has no such table — the active MIFrame's
@@ -3034,7 +3037,7 @@ pub struct PyreSym {
     /// by handle_possible_exception after GUARD_EXCEPTION, then consumed
     /// by finishframe_exception for stack push.
     pub(crate) last_exc_box: OpRef,
-    /// E1: maps the OpRef of a trace-built (fresh `NewWithVtable`)
+    /// Maps the OpRef of a trace-built (fresh `NewWithVtable`)
     /// exception to its trace-time concrete instance.  `RAISE_VARARGS`
     /// reuses the instance to take the instance fast path — skip the
     /// residual `normalize_raise_varargs_jit` publish + `GUARD_EXCEPTION`
@@ -4408,7 +4411,7 @@ pub(crate) unsafe fn objspace_compare_floats(
 ///
 /// Cranelift backend status (MAJIT_PROBE_GETFIELD_GC_R=1):
 ///   - `OpCode::GetfieldGcR` lowering exists at
-///     `majit-backend-cranelift/src/compiler.rs:10691`.
+///     `majit-backend-cranelift`'s `do_compile` getfield arm.
 ///   - Direct swap on fib_recursive panics inside
 ///     `gc_alloc_nursery_shim` with non-unwinding abort.  The
 ///     post-getfield write-barrier path triggers a nursery
@@ -5000,7 +5003,7 @@ pub(crate) fn set_concrete_stack_depth(frame: usize, depth: usize) {
 /// Mirrors the `(callee_nlocals, callee_vsd)` pair the trace-side reads
 /// from `driver.get_compiled_meta(callee_key)` for CALL_ASSEMBLER
 /// emission (`trace_opcode.rs`). The second value is sized to
-/// match `pyframe.rs:1576` (`alloc_fixed_array_with_header(num_locals +
+/// match `PyFrame::__init__` (`alloc_fixed_array_with_header(num_locals +
 /// num_cells + max_stack, ...)`) — i.e. heap capacity rather than live
 /// depth. Used as the fallback shape when no `compiled_meta` exists yet
 /// (e.g. tmp_callback target where `compile_tmp_callback` produced a
@@ -5470,7 +5473,7 @@ fn flush_walk_end_state_to_frame_inner(
         pf.valuestackdepth = end_vsd;
         pf.last_instr = resume_py_pc as isize - 1;
     }
-    // #32 S2: deliver the in-flight FOR_ITER item.  The flush wrote the
+    // #32: deliver the in-flight FOR_ITER item.  The flush wrote the
     // FOR_ITER-header operand stack (the iterator on TOS) into slots
     // `0..end_vsd`; the continue arm keeps the iterator and pushes the
     // consumed item above it (codewriter FOR_ITER continue arm,
@@ -6370,12 +6373,12 @@ pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
 ///    encoder's pointer dedup at `opencoder.py:583-601
 ///    _cached_const_ptr` (over its `_refs_dict`). Pyre lacks the
 ///    per-instance cache: every `ctx.const_ref(val)` mints a fresh
-///    constant OpRef (`constant_pool.rs:57-103
-///    get_or_insert{,_typed}` — no HashMap-keyed dedup at this
+///    inline constant OpRef (`TraceCtx::const_ref` returns an
+///    `OpRef::const_ptr` — no HashMap-keyed dedup at this
 ///    layer). The two upstream dedup layers exist independently in
 ///    pyre:
 ///      - **Trace encoding** (port of `opencoder.py:583
-///        _cached_const_ptr`): `opencoder.rs:1873 _encode_ptr` dedups
+///        _cached_const_ptr`): `opencoder.rs`'s `_encode_ptr` dedups
 ///        by address via `_refs_dict: HashMap<u64, u32>`, mirroring
 ///        upstream's `_refs_dict` lookup. The
 ///        `ConstPtrJitCode.opencoder_index` cache that bypasses the
@@ -6463,8 +6466,8 @@ impl PyreSym {
     ///   - `registers_r[num_regs_r + i]` ← `ctx.const_ref(constants_r[i])`
     ///   - `registers_f[num_regs_f + i]` ← `ctx.const_float(constants_f[i])`
     /// `TraceCtx::const_int` / `const_ref` / `const_float` all mint a
-    /// fresh constant OpRef per call (`constant_pool.rs:57-103
-    /// get_or_insert{,_typed}`), matching RPython
+    /// fresh inline constant OpRef per call (`OpRef::const_int` /
+    /// `const_ptr` / `const_float`), matching RPython
     /// `ConstClass(constants[i])`'s fresh-Box allocation
     /// (`history.py:220/261/307`). Per-value dedup, where it exists
     /// upstream, lives in the resume memo
@@ -6635,8 +6638,9 @@ impl PyreSym {
         let valuestackdepth = if self.bridge_stack_oprefs.is_some() {
             // Bridge resumes keep the resume-decoded root depth. Multi-frame
             // deopt later rewrites the live frame's valuestackdepth to the
-            // innermost callee depth (eval.rs:7740-7766), while the resume
-            // payload still carries the root depth; heap state is rebuilt from
+            // innermost callee depth (`decode_and_restore_guard_failure` in
+            // pyre-jit's `eval.rs`), while the resume payload still carries the
+            // root depth; heap state is rebuilt from
             // resume boxes, never the reverse (rebuild_state_after_failure,
             // pyjitpl.py:3424-3461).
             self.valuestackdepth
@@ -6895,7 +6899,7 @@ impl PyreSym {
                 while values.len() < num_vable_scalars + array_len {
                     values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
                 }
-                // gap 10 slice 2b: bake the virtualizable identity against the
+                // Bake the virtualizable identity against the
                 // LIVE interpreter frame (the frame the compiled loop runs on),
                 // not the discarded `snapshot_for_tracing` copy.  At root entry
                 // the snapshot is a fresh copy so its field VALUES equal the
@@ -8461,7 +8465,7 @@ fn reconstruct_inline_recipe(
     // `operand_depth` is the logical stack height the codewriter's forward
     // dataflow computes for this pc (`LiveVars::stack_depth_at`). The portal
     // frame reads the equivalent figure from the encoded vable
-    // `valuestackdepth` scalar (state.rs:6382); an inline frame has no such
+    // `valuestackdepth` scalar (`state.rs`); an inline frame has no such
     // scalar, so derive it from the bytecode here. An unreachable resume pc
     // aborts the multi-frame path.
     let valuestackdepth = nlocals + stack_only;
@@ -9211,7 +9215,8 @@ fn materialize_concrete_virtual_ptr(
             }
             // Pyre adaptation: bh_new_with_vtable writes vtable at
             // vtable_offset but PyObject.w_class needs separate init
-            // (pyobject.rs:51). Matches materialize_virtual_object.
+            // (`PyObject.w_class` in pyobject.rs). Matches
+            // materialize_virtual_object.
             //
             // `w_class_obj()` — not `get_instantiate(vtable)` — is the source:
             // a vtable word is only a `PyType` pointer for a pyre object
@@ -9812,7 +9817,7 @@ impl JitState for PyreJitState {
             namespace_dependent: false,
             valuestackdepth: vsd,
             array_capacity: capacity,
-            // virtualizable_gen.rs:24-31 wires `extra_reds = { ec: Ref }` per
+            // `virtualizable_gen.rs` wires `extra_reds = { ec: Ref }` per
             // interp_jit.py:67 `reds = ['frame', 'ec']`, so the per-Sym
             // helpers (vable_collect_jump_args, NUM_EXTRA_REDS) already
             // thread the ec slot. The runtime flag here remains 0 because
@@ -9961,7 +9966,7 @@ impl JitState for PyreJitState {
     }
 
     fn initialize_sym(&self, sym: &mut Self::Sym, _meta: &Self::Meta) {
-        // jitdriver.rs:2947-2992 sequencing parity: `start_bridge_tracing`
+        // `JitDriver::merge_point` sequencing parity: `start_bridge_tracing`
         // calls `create_sym` → `initialize_sym` → `setup_bridge_sym` BEFORE
         // `trace_bytecode` (which is where `init_symbolic` would otherwise
         // populate `concrete_vable_ptr`). `setup_bridge_sym` reads
@@ -10007,10 +10012,10 @@ impl JitState for PyreJitState {
         //       expect the expanded shape) and panics on
         //       `live_values[index>1]` access without (b).
         //   (b) `initialize_virtualizable` short-live_values gate
-        //       (pyjitpl.rs:1744): allow the heap-read branch when
+        //       (`pyjitpl.rs`): allow the heap-read branch when
         //       `vable_ptr` is non-null. Required to consume (a)'s
         //       reds-only live_values.
-        //   (c1) `pending_frontend_boxes.clone()` (pyjitpl.rs:7338):
+        //   (c1) `pending_frontend_boxes.clone()` (`pyjitpl.rs`):
         //        the second `compile_bridge` call needs the same stash
         //        as the first; current `take()` empties on the first
         //        call and the second hits `frontend_boxes.len()=0 vs
@@ -10030,7 +10035,7 @@ impl JitState for PyreJitState {
         //       has no `SetfieldGc`/`SetarrayitemGc` to advance the
         //       heap. RPython's OptVirtualize emits these via its
         //       `force_at_end_of_preamble` pass; pyre's
-        //       `OptVirtualize::force_virtualizable` (virtualize.rs:348)
+        //       `OptVirtualize::force_virtualizable` (virtualize.rs)
         //       has the SETFIELD_RAW emission machinery but is not
         //       wired to fire at JUMP. An eager
         //       `gen_writeback_vable_to_heap` helper at
@@ -10767,7 +10772,7 @@ impl JitState for PyreJitState {
         // `flat_idx=21` and panicked. Fall back to the metadata-derived
         // size — `metadata.stack_base + metadata.max_stackdepth` is the
         // same `nlocals + ncells + max_stackdepth` the codewriter
-        // committed to and the runtime PyFrame allocates (pyframe.rs:1576).
+        // committed to and `PyFrame::__init__` allocates.
         let bridge_array_len = concrete_frame_array_len(sym.concrete_vable_ptr as usize)
             .or_else(|| {
                 METAINTERP_SD.with(|r| {
@@ -10927,7 +10932,7 @@ impl JitState for PyreJitState {
         // The parent guard already encoded the resumed pair sequence into
         // `rd_numb`'s vref section (resume.py:738-754 `consume_vref_and_vable`
         // → `consume_virtualref_info`), and `rebuild_from_numbering`
-        // (majit/majit-ir/src/resumedata.rs:402-416) decoded it into
+        // (majit/majit-ir/src/resumedata.rs) decoded it into
         // `resume_data.virtualref_values`. Materialize the OpRef + concrete
         // pointer for each pair through the same `resolve` / `decode_concrete`
         // callbacks used for `frames[0].values`, then hand the pairs to the
@@ -10944,7 +10949,7 @@ impl JitState for PyreJitState {
         // `virtual_token` for every still-active pair. The runtime
         // mutation lives on the live JitVirtualRef heap object, so the
         // call is gated on a non-null concrete `vref_ptr`. Pyre's
-        // `VirtualRefInfo::new()` (majit-metainterp/src/virtualref.rs:257)
+        // `VirtualRefInfo::new()` (majit-metainterp/src/virtualref.rs)
         // is a cheap struct-only constructor — instantiate once outside
         // the loop instead of per-pair.
         let vrefinfo = majit_metainterp::virtualref::VirtualRefInfo::new();
@@ -10989,7 +10994,7 @@ impl JitState for PyreJitState {
             // is_virtual_ref(vref) guard (virtualref.py:123) and the
             // `assert real_object` invariant (virtualref.py:125, ported as
             // debug_assert!) both live inside continue_tracing itself
-            // (virtualref.rs:419/424) — the outer virt_ptr guard masked
+            // (in `virtualref.rs`) — the outer virt_ptr guard masked
             // exactly the case RPython asserts on, so do not pre-gate here.
             unsafe {
                 vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
@@ -11063,9 +11068,10 @@ impl JitState for PyreJitState {
         // `sync_virtualizable_after_guard_failure` runs before bridge setup,
         // but on the multi-frame inlined-callee path its resume-decoded array
         // image is then clobbered by the vsd-correction `clear_stack_above`
-        // (eval.rs:7766-7774), which applies a callee-coordinate depth to the
-        // root frame before `setup_bridge_sym` reads it. The per-item write in
-        // the vvals loop above re-asserts that array image immediately after
+        // (`decode_and_restore_guard_failure` in pyre-jit's `eval.rs`), which
+        // applies a callee-coordinate depth to the root frame before
+        // `setup_bridge_sym` reads it. The per-item write in the vvals loop
+        // above re-asserts that array image immediately after
         // each decode; the statics retain the deliberate PR#569 override.
 
         // Multi-frame bridge. The body above reconstructed
@@ -13147,9 +13153,9 @@ mod tests {
 
         // virtualizable derive `init_vable_indices` mints typed
         // `OpRef::input_arg_*` variants per `#[vable(inputarg, type = ...)]`
-        // (state.rs:1428-1438). The expected slot variants must match those
-        // exact types so variant-aware OpRef Eq (resoperation.rs:290)
-        // compares correctly against later optimizer/heap-cache keys.
+        // (`virtualizable_gen.rs`'s `inputargs`). The expected slot variants
+        // must match those exact types so variant-aware OpRef Eq (`OpRef`'s
+        // `PartialEq`) compares correctly against later optimizer/heap-cache keys.
         assert_eq!(sym.frame, OpRef::input_arg_ref(0));
         assert_eq!(sym.execution_context, OpRef::input_arg_ref(1));
         assert_eq!(sym.vable_last_instr, OpRef::input_arg_int(2));
@@ -13879,9 +13885,9 @@ mod tests {
         let mut ctx = TraceCtx::for_test_types(&input_types);
         // Slots 0 (frame) and 1 (ec) are both Ref-typed per `input_types`
         // — production `init_vable_indices` mints typed `InputArgRef`
-        // variants here (resoperation.py:739, state.rs:1428-1438), so
-        // variant-aware Eq (resoperation.rs:290) requires the matching
-        // `OpRef::input_arg_ref` shape.
+        // variants here (resoperation.py:739, `virtualizable_gen.rs`'s
+        // `inputargs`), so variant-aware Eq (`OpRef`'s `PartialEq`) requires
+        // the matching `OpRef::input_arg_ref` shape.
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.frame = OpRef::input_arg_ref(0);
         sym.execution_context = OpRef::input_arg_ref(1);
@@ -13964,8 +13970,8 @@ mod tests {
 
         assert_eq!(sym.valuestackdepth, 3);
         // setup_bridge_sym now restores typed `InputArg*` OpRefs from
-        // `RebuiltValue::Box(idx, tp)` per state.rs:4647. The resolve
-        // closure produces `OpRef::input_arg_typed(idx, tp)`; expectations
+        // `RebuiltValue::Box(idx, tp)`. The resolve closure produces
+        // `OpRef::input_arg_typed(idx, tp)`; expectations
         // must match so variant-aware Eq lines up with the resolved
         // bridge inputarg list.
         assert_eq!(
@@ -14068,10 +14074,10 @@ mod tests {
         ];
         let mut ctx = TraceCtx::for_test_types(&input_types);
 
-        // The vable static-field types come from `state.rs:1428-1438`
-        // `#[vable(inputarg, type = ...)]` annotations: int/ref/int/ref/
-        // ref. Mint typed `OpRef::input_arg_*` variants matching
-        // those tags so variant-aware Eq (resoperation.rs:290) lines up
+        // The vable static-field types come from `virtualizable_gen.rs`'s
+        // `inputargs` annotations: int/ref/int/ref/ref.
+        // Mint typed `OpRef::input_arg_*` variants matching
+        // those tags so variant-aware Eq (`OpRef`'s `PartialEq`) lines up
         // with what the production `init_vable_indices` produces.
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.execution_context = OpRef::input_arg_ref(1);
@@ -14171,10 +14177,10 @@ mod tests {
         let mut ctx = TraceCtx::for_test_types(&input_types);
 
         // Mint typed `OpRef::input_arg_*` matching each `input_types`
-        // slot — production `init_vable_indices` (state.rs:1428-1438
-        // `#[vable(inputarg, type = ...)]`) always selects `InputArgInt`
+        // slot — production `init_vable_indices` (over
+        // `virtualizable_gen.rs`'s `inputargs`) always selects `InputArgInt`
         // / `InputArgRef` (resoperation.py:719/739) per the static-field
-        // tag, so variant-aware Eq (resoperation.rs:290) requires the
+        // tag, so variant-aware Eq (`OpRef`'s `PartialEq`) requires the
         // matching variant here too.
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
         sym.nlocals = 1;
@@ -14492,7 +14498,7 @@ pub(crate) fn assemble_bridge_inline_pending(
     // (reds=['frame','ec'], interp_jit.py:67), so the callee shares the
     // caller's ExecutionContext OpRef. Seed `sym.execution_context` from the
     // immediate parent's symbolic ec (the root caller's `setup_bridge_sym`
-    // resolved it from `portal_ec_reg`, state.rs:7399) so an in-callee
+    // resolved it from `portal_ec_reg`) so an in-callee
     // `ensure_execution_context` returns it directly. `sym.frame` is NONE for
     // a reconstructed inline frame, so without this seed the recovery path
     // would emit `GetfieldGcR(NONE)` (an unbacked VoidOp arg) and fail
@@ -14531,7 +14537,7 @@ pub(crate) fn assemble_bridge_inline_pending(
 }
 
 /// Build the per-frame setup for ONE reconstructed bridge-carrier callee so
-/// the full-body walker can drive it (issue #215 item 2, P2 drain):
+/// the full-body walker can drive it (issue #215 item 2):
 ///
 ///   - emit the frame vable seeded with the recipe's LOCALS (slots
 ///     `0..nlocals`); the live operand-stack temps stay in the abstract
@@ -14631,9 +14637,10 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // concrete `PyFrame` an inlined callee needs has to be built explicitly.
     // The forward-inline callee does so with a GC-managed `FrameBox`
     // whose pointer is stamped onto the emitted vable
-    // (`inline_call.rs:3551-3569`).  The reconstructed carrier callee needs the
-    // same object: its residual calls run through
-    // `execute_inline_residual_call(frame, nargs)`, and the abort image names
+    // (`try_walker_inline_resolved_user_call_inner` in `inline_call.rs`).  The
+    // reconstructed carrier callee needs the same object: its residual calls
+    // run through `execute_inline_residual_call(frame, nargs)`, and the abort
+    // image names
     // this framestack level by its frame pointer.  A vable with no concrete
     // makes both decline — the residual call on its frame argument, and the
     // blackhole preflight on the unset frame pointer — so the drain aborts
@@ -14869,7 +14876,7 @@ pub fn execute_inline_residual_call(
 
 // inline_trace_and_execute / trace_through_callee removed — the trait
 // meta-interpreter that replaced them (PyreMetaInterp.interpret() +
-// push_inline_frame) is itself retired (#203 gap 10); the FBW walker
+// push_inline_frame) is itself retired (#203); the FBW walker
 // handles both root and inline frames.
 
 /// `pypy/objspace/std/listobject.py:2390 is_plain_int1` parity.
@@ -14884,10 +14891,10 @@ pub fn execute_inline_residual_call(
 /// Delegates to the single `pyre_object::is_plain_int1` helper that
 /// already implements the full upstream predicate including the
 /// `w_class != get_instantiate(&INT_TYPE)` int-subclass rejection
-/// (`listobject.rs:235`); a previous in-place `py_type_check` shortcut
+/// (`listobject.rs`); a previous in-place `py_type_check` shortcut
 /// at this site was a deviation that mishandled int subclasses
 /// because pyre stores them with `ob_type == &INT_TYPE` and only
-/// distinguishes them via `w_class` (`typedef.rs:686 w_int_new_unique`).
+/// distinguishes them via `w_class` (`w_int_new_unique` in `intobject.rs`).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

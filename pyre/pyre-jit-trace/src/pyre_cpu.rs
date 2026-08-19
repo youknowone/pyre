@@ -213,7 +213,7 @@ impl Cpu for PyreCpu {
     fn bh_strgetitem(&self, string: GcRef, index: i64) -> Option<i64> {
         // RPython STR is `Array(Char)` byte string (`rstr.py:1226-1228`);
         // STRGETITEM returns `ord(char)` = byte value.
-        // `intbounds.rs:3109` narrows the result to `[0, 255]`
+        // `intbounds.rs`'s `propagate_postprocess` narrows the result to `[0, 255]`
         // (`vstring.py:393-400 IntBound.make_ge(0).make_lt(256)`).
         // `W_UnicodeObject.value: *mut Wtf8Buf` at `UNICODE_VALUE_OFFSET` —
         // follow the indirection and read the WTF-8 byte at `index`.

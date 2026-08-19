@@ -273,7 +273,7 @@ pub struct PyJitCodeMetadata {
     /// `co_stacksize`) for a compiled jitcode, `0` for non-compiled skeleton
     /// metadata. Carries the operand-stack dimension so the bridge
     /// frame-array sizing (`state.rs::setup_bridge_sym`) reconstructs the
-    /// full runtime PyFrame allocation (`pyframe.rs:1576`
+    /// full runtime PyFrame allocation (`PyFrame::__init__` allocates
     /// `nlocals + ncells + max_stackdepth`). Sized to the static peak, not
     /// `max(depth_at_pc)` — JIT-traced PCs may not reach `co_stacksize`.
     pub max_stackdepth: usize,

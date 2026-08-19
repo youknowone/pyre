@@ -106,7 +106,7 @@ pub(crate) fn trace_ctx_for_test(num_inputs: usize) -> majit_metainterp::TraceCt
 }
 
 // pyre-jit-trace local invariant: PyFrame's `_virtualizable_` declares
-// exactly one extra red (ec, see `virtualizable_gen.rs:29-31` and
+// exactly one extra red (ec, see `virtualizable_gen.rs`'s `extra_reds` and
 // `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`).
 // `majit-macros::virtualizable!` itself is generic over `extra_reds.len()`
 // (mod.rs), so this assertion is *pyre-local*. Tracing-time helpers

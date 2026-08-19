@@ -1710,7 +1710,8 @@ mod tests {
 
     /// Verifies that `#[elidable_cannot_raise]` emits the
     /// `INT_ELIDABLE_CANNOT_RAISE = 19` policy byte (`call.py:299`
-    /// parity / `call_policy_byte.rs:96`) and produces non-null
+    /// parity / `call_policy_byte.rs`'s `INT_ELIDABLE_CANNOT_RAISE`) and
+    /// produces non-null
     /// trace_target / concrete_target trampolines.  Lives in-crate
     /// because external integration tests cannot reach the macro's
     /// `pub(crate)` `__majit_call_policy_*` symbol from outside.
@@ -1726,7 +1727,7 @@ mod tests {
     /// Confirms the helper still runs correctly under the elidable
     /// attribute and preserves the elidable invariant (same input →
     /// same output).  With the `WITHPREBUILTINT=false` default
-    /// (`intobject.rs:44`) every input returns false.
+    /// (`intobject.rs`) every input returns false.
     #[test]
     fn elidable_helper_is_deterministic_and_matches_pyre_object() {
         for &value in &[0i64, 7, -3, 42, i64::MIN, i64::MAX] {

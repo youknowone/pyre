@@ -4741,14 +4741,14 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// B3: walker-native fold of the CHECK_EXC_MATCH
+/// Walker-native fold of the CHECK_EXC_MATCH
 /// residual (`bh_compare_fn(exc, match_type, op_tag=10)`,
 /// `call_jit.rs`). Computes the match concretely from
 /// `type(exc)` and `match_type` and emit a `const_ref` of the immortal
 /// TRUE/FALSE bool singleton, eliding the opaque may-force compare (and,
 /// via [`bool_box_truth_record`], the immediately-following `is_true`
 /// truth-extract residual).  With the exception's constructor + raise
-/// already virtualized (B3 pieces 1+2), folding the match to a constant
+/// already virtualized by their own folds, folding the match to a constant
 /// lets the whole exception de-escape and DCE.
 ///
 /// Soundness — the fold result depends only on `(type(exc), match_type)`:
@@ -6340,7 +6340,7 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
     );
 
     // Bounds length: arraylen_gc against the wrappeditems GcArray header
-    // (no inline length cache).  NON-pure (G2): an out-of-range index must
+    // (no inline length cache).  NON-pure: an out-of-range index must
     // still deopt.
     let lenbox = crate::state::opimpl_arraylen_gc(
         ctx.trace_ctx,
@@ -10822,7 +10822,7 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// B3: walker-native exception-construction fold.  A
+/// Walker-native exception-construction fold.  A
 /// `Type(args)` `CallFn` residual for a canonical builtin exception class or
 /// a heap subclass with the same `__new__` / `__init__` descriptors becomes a
 /// traced `NewWithVtable` + `SetfieldGc` (kind / w_class / args_w) the
@@ -11310,9 +11310,9 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// B3: walker-native RAISE_VARARGS E1 fast path. The `RaiseVarargs`
-/// residual is `normalize_raise_varargs_jit(frame, exc, cause)` —
-/// `r_args = [frame, exc, cause]`.  When `exc` was built inline by
+/// Walker-native RAISE_VARARGS inline-built-exception fast path. The
+/// `RaiseVarargs` residual is `normalize_raise_varargs_jit(frame, exc,
+/// cause)` — `r_args = [frame, exc, cause]`.  When `exc` was built inline by
 /// [`try_walker_trace_exception_new`] (∈ [`FBW_BUILT_EXC`]) and there is
 /// no explicit `from` cause (concrete `cause` is `PY_NULL`), skip the
 /// residual publish + its `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` and
@@ -11445,7 +11445,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// B3: walker-native fold for a bare-class `raise Type`
+/// Walker-native fold for a bare-class `raise Type`
 /// (no call parentheses).  Unlike `raise Type()`, a bare class has no
 /// preceding `CallFn` construct residual — `normalize_raise_varargs_jit`
 /// instantiates the class itself — so no virtualizable `NewWithVtable`
@@ -11678,7 +11678,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
 /// a rooted trace constant) in place of the residual + guards.  The
 /// raise then routes through the ordinary `SubRaise` path with a
 /// virtualizable exception OpRef, and a locally-caught `except` DCEs
-/// the whole allocation exactly as the explicit-`raise` B3 fold does.
+/// the whole allocation exactly as the explicit-`raise` fold does.
 ///
 /// Returns `None` (fall through to the generic residual) for any
 /// non-matching or unprovable shape.
@@ -12153,7 +12153,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     )))
 }
 
-/// B3 piece 3: lower the PUSH_EXC_INFO / POP_EXCEPT
+/// Lower the PUSH_EXC_INFO / POP_EXCEPT
 /// exc-info-stack residuals to GETFIELD_GC_R / SETFIELD_GC on the EC's
 /// `sys_exc_value` slot (`ec_sys_exc_value_descr`), and consume pyre's
 /// propagation-root clear without recording a runtime call.
@@ -13732,7 +13732,7 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     let name_idx = (namei as usize) >> 1;
     let name = unsafe {
         // The wrapper being non-null does not make its `code_ptr` non-null:
-        // `w_code_new_with_hidden_applevel` (pycode.rs:386) leaves the field
+        // `w_code_new_with_hidden_applevel` (pycode.rs) leaves the field
         // null for a gateway builtin or a test fixture, and every sibling
         // name lookup screens it the same way.
         let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
@@ -13764,7 +13764,8 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     // An INLINED callee has no materialised frame (`frame_ptr == 0`, its
     // `portal_frame_reg` unseeded); derive the builtin module from the concrete
     // globals' `__builtins__` cell instead — the same object `pick_builtin`
-    // resolves (baseobjspace.rs:9716) and the one the interpreter fallback would
+    // resolves (`pick_builtin_obj` in baseobjspace.rs) and the one the
+    // interpreter fallback would
     // rebuild for the resumed callee frame.  #670 keeps `__builtins__` in every
     // module dict, `ns_ptr` is the callee's own namespace field (so it is the
     // authoritative globals), and guard (a) below watches the globals `version`,

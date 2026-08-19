@@ -777,7 +777,7 @@ fn real_main() {
     // Without the enum declaration in the analyser source set the variant
     // arms surface as untyped, and the rtyper's exitswitch emission for
     // `match descr.kind { 0 => ..., 1 => ..., 2 => ..., }` falls back to
-    // 'r' (Ref), which `flatten.rs:385` rejects as
+    // 'r' (Ref), which `flatten.rs`'s `insert_exits` rejects as
     // `switch exitswitch must be int`.  Single-file inclusion mirrors the
     // `pyre-jit/src/eval.rs` carve-out above: only the resoperation enum
     // declarations belong in the analyser closure, not the rest of
@@ -881,7 +881,7 @@ fn real_main() {
     // warmspot.py:516 `vinfos[VTYPEPTR] = VirtualizableInfo(self, VTYPEPTR)` —
     // pyre's runtime `VirtualizableInfo` constructor lives in the
     // `majit-metainterp` crate (`__build_virtualizable_info`) and runs
-    // at `JitDriver::new` (jitdriver.rs:285) where the field offsets
+    // at `JitDriver::new` (jitdriver.rs) where the field offsets
     // resolved by `mem::offset_of!` are available.  build.rs cannot
     // import that crate (no metainterp build-dep, and the offsets are
     // a runtime fact), so the codewriter-side factory returns `None`
@@ -1183,7 +1183,7 @@ fn real_main() {
         // dict, populated by `write_insn` calls during graph flattening.
         // Pyre's analog is `pipeline.insns`, snapshotted from
         // `codewriter.assembler.insns()` after `make_jitcodes` finishes
-        // (`majit-translate/src/lib.rs:910`).  Each distinct key gets a
+        // (`make_jitcodes` in `majit-translate/src/lib.rs`).  Each distinct key gets a
         // fresh byte; the forward map is injective.  `blackhole.py:913`
         // aliases the bhimpl handler under two Python attribute names
         // (`bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`) but

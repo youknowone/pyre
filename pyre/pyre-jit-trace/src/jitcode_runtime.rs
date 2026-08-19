@@ -363,12 +363,13 @@ pub fn portal_jitcode_for_key(key: &str) -> Option<Arc<JitCode>> {
 // the list-op helper bodies carry no runtime marker — they are ordinary
 // `make_jitcodes` function entries
 // whose only stable handle is their `name`, which `get_jitcode` sets to
-// the graph's last path segment (call.rs:3071). The positional index
+// the graph's last path segment (`CallControl::get_jitcode` in
+// `codewriter/call.rs`). The positional index
 // shifts whenever the jitcode set changes, so it must be resolved by
 // name and never hardcoded.
 //
-// This by-name lookup is the foundation list-append P3 needs to descend the FBW
-// walker into the orthodox charon list-append body (issue #62/#23): the
+// This by-name lookup is the foundation the list-append inline needs to descend
+// the FBW walker into the orthodox charon list-append body (issue #62/#23): the
 // dynamic `lst.append` recognition arm resolves the body here, then
 // builds a by-index sub-walk from `get_jitcode_by_index`.
 thread_local! {
@@ -1660,8 +1661,8 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// contract.  Any emitted byte outside that setup surface now reaches
 /// `dispatch_step`'s unwired-opcode panic; there is no legacy fallback.
 /// `cond_call_*` / `record_known_result_*` bytes are now wired through
-/// `_pyre/P` adapter handlers (`insns.rs:674-678`,
-/// payload decoder at `pyre_p_payload_len` below).
+/// `_pyre/P` adapter handlers (registered by `insns.rs`'s
+/// `wellknown_bh_insns`, payload decoder at `pyre_p_payload_len` below).
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     majit_metainterp::blackhole::build_inline_call_only_bh_builder()
 }
@@ -2469,7 +2470,7 @@ mod tests {
 
     #[test]
     fn list_append_jitcode_resolves_charon_body() {
-        // list-append P3 foundation (deferred Route C): the orthodox charon
+        // list-append foundation (deferred): the orthodox charon
         // `w_list_append` body is present and reachable by name in the
         // build-time pipeline (the single-source descent the FBW walker would
         // enter once the prologue strategy-helper fnaddrs are registered).

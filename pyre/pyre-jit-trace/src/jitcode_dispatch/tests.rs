@@ -2483,7 +2483,7 @@ fn sub_jitcode_body_by_index_builds_w_list_append() {
 
 #[test]
 fn append_journal_rollback_rewinds_length() {
-    // #171 P3 journal infra: a walked eager `list.append` grows the
+    // #171 journal infra: a walked eager `list.append` grows the
     // concrete list at trace time (the fold records the array-op IR but
     // does not mutate), so a NON-commit walk must rewind the length,
     // exactly like the STORE_SUBSCR store journal restores its displaced

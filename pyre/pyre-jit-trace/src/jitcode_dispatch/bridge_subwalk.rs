@@ -704,7 +704,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
 }
 
 /// Build the paused root portal frame for a multi-frame bridge-carrier
-/// sub-walk (#215 item 2 / P2 drain).  The root resumes at `root_pc` once the
+/// sub-walk (#215 item 2).  The root resumes at `root_pc` once the
 /// reconstructed deepest callee returns; the callee's in-callee guards must
 /// snapshot this frame on the walk framestack so a guard-failure resume
 /// rebuilds both Python frames.  Mirror of [`compute_inline_caller_frame`], but
@@ -875,7 +875,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     })
 }
 
-/// Issue #215 item 2 (P2 drain, increment 2b): drive the reconstructed deepest
+/// Issue #215 item 2: drive the reconstructed deepest
 /// callee frame of a multi-frame bridge as an INLINE SUB-WALK
 /// (`is_top_level = false`) rooted on the caller-visible portal `root_sym`.
 ///
@@ -892,9 +892,9 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
 /// snapshots both the callee frame and the paused root
 /// (`walker_capture_multi_frame_inline_snapshot`).
 ///
-/// Increment 2b-i (diagnostic): returns the sub-walk outcome; the caller logs it
+/// Diagnostic today: returns the sub-walk outcome; the caller logs it
 /// and aborts (trace discarded).  Threading `SubReturn` into the root operand
-/// stack + the root top-level walk forward to a terminator is increment 2b-ii.
+/// stack + walking the root forward to a terminator is not wired yet.
 /// `None` signals a setup failure (terminal descrs unwired / no root frame).
 pub(crate) fn call_dst_reg_for_residual_return(code: &[u8], entry: usize) -> Option<usize> {
     for op in crate::jitcode_runtime::decoded_ops(code) {
@@ -1019,7 +1019,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     }
     if boxes.iter().any(|b| b.is_none()) {
         // Name which bank left the hole.  `ReconstructRecipe`'s bank vectors are
-        // SEMANTIC-slot indexed (`trace_ctx.rs:628`), and every semantic slot in
+        // SEMANTIC-slot indexed (`trace_ctx.rs`), and every semantic slot in
         // a `locals_cells_stack_w` array is a boxed ref — so the recipe decode
         // fills the ref bank only, and the two loops above read `OpRef::NONE`
         // for every live int/float COLOR.  A callee with any live unboxed

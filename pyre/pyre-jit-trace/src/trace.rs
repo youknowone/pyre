@@ -584,7 +584,7 @@ fn resolve_midbody_flush_words(
         payload.outer_jitcode_index as i32,
         payload.call_jitcode_pc as i32,
     ) as usize;
-    // #73 walker-as-tracer P1: the callee resume py is read from the scalar
+    // #73 walker-as-tracer: the callee resume py is read from the scalar
     // forward-carried on the MidBodyPayload (`callee_py_pc`, stamped at capture
     // from the same jitcode->py inversion this once performed). The `callee`
     // pjc lookup above stays for its null-code decline (`?`) and feeds the
@@ -848,7 +848,7 @@ fn try_commit_midbody_abort_inner(
         (words.call_py_pc as u32) * 2,
     );
     {
-        // E-G2: this specialization reconstructs only the exact empty
+        // This specialization reconstructs only the exact empty
         // operand-stack level used by statement-position calls. A handler
         // preserving any operand below the call remains on legacy replay.
         if let Some((_target, depth, _lasti)) = outer_handler {
@@ -863,7 +863,7 @@ fn try_commit_midbody_abort_inner(
                 ));
             }
         }
-        // G7: materialize every outer local before the rebuilt callee can run.
+        // Materialize every outer local before the rebuilt callee can run.
         // `can_flush_walk_end_state_after_outer_call` already proved all
         // shadow entries sourceable, so no post-effect decline remains.
         if !crate::state::write_back_outer_locals(ctx, cf_addr) {
@@ -1151,7 +1151,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     //
     // The former snapshot double-apply (inline-frame SHARED-heap STOREs
     // leaking during tracing and re-applying on the compiled loop's re-run)
-    // is resolved by gap 10: the concrete executor is deleted so STOREs are
+    // is resolved because the concrete executor is deleted so STOREs are
     // record-only, and `flush_walk_end_state_to_frame`
     // (`raise_continue_running_normally` parity) advances the real frame so
     // the interpreter resumes AFTER the walked region, not from its start.
@@ -1170,7 +1170,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // `live_vable_frame_addr` field doc (state.rs).  Set before the
     // full-body-walk leg below so the production tracer sees it.
     //
-    // gap 10 slice 2b: set this BEFORE `init_symbolic` so the root vable
+    // Set this BEFORE `init_symbolic` so the root vable
     // identity (seed_virtualizable_boxes) is baked against the live frame
     // address, not the discarded snapshot's.
     sym.set_live_vable_frame_addr(live_frame_addr);
@@ -1498,7 +1498,7 @@ fn pending_call_result_semantic_slot(nlocals: usize, post_call_depth: usize) -> 
         .and_then(|top| nlocals.checked_add(top))
 }
 
-/// Issue #215 item 2 (P2 drain): drive a multiframe bridge-carrier resume via
+/// Issue #215 item 2: drive a multiframe bridge-carrier resume via
 /// the full-body walker instead of aborting to a no-JIT re-interpret.
 ///
 /// The carrier reconstructs the in-flight callee framestack
@@ -1755,7 +1755,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
-        // Churn guard (Task 8): making this class transient retried the same
+        // Churn guard: making this class transient retried the same
         // guard 500 times in inline_chain_depth_typeflip.py and
         // p2_local_result_bridge.py (loops_aborted 6 -> 505), so keep only
         // this measured P2 class permanently declined.
@@ -3479,7 +3479,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // entry seeded as r0 (= `sym.frame`, and
     // `sym.frame == OpRef::input_arg_typed(SYM_FRAME_IDX, Ref)`).  A fresh
     // `const_ref(cf_addr)` would be a DIFFERENT OpRef than the identity box,
-    // so `concrete_of_opref`'s standard-vable resolution (trace_ctx.rs:1842,
+    // so `concrete_of_opref`'s standard-vable resolution (trace_ctx.rs,
     // keyed on `== standard_virtualizable_box()`) would miss and every vable
     // read would fall through to the nonstandard GETFIELD_GC leg.  Falls back
     // to `const_ref` only when no virtualizable is bound.
@@ -3533,7 +3533,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // not overwrite these (a kept temp never lives in a red-input color).
         let mut reserved_red_colors: Vec<u8> = Vec::new();
         if !is_bridge_trace {
-            // C1 marker entry starts at the static sidecar coordinate BEFORE
+            // The marker entry starts at the static sidecar coordinate BEFORE
             // the source marker.  Seed only the root JitCode's formal red
             // inputs at their per-JitCode metadata colors. The marker's Int
             // greens remain in the constant region; its Ref green is seeded
@@ -3709,7 +3709,8 @@ fn run_perfn_walk<Sym: WalkSym>(
                             // the portal EC color for a live operand at PCs where
                             // the trace has no live EC read (the same collision the
                             // guard-failure resume handles at
-                            // jitcode_dispatch.rs:6994 via `semantic_idx.is_none()`
+                            // `collect_outer_active_boxes` via
+                            // `semantic_idx.is_none()`
                             // — otherwise `fib(n-1) + fib(n-2)` resumes the left
                             // operand as the EC and SIGSEGVs).  When the bridge
                             // names a genuine operand here (an opref other than the
@@ -3914,7 +3915,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             entry,
         );
         if let Some((bank, color)) = uncovered {
-            // read_int_reg/read_float_reg (jitcode_dispatch/mod.rs:1907-1936)
+            // read_int_reg/read_float_reg (jitcode_dispatch/mod.rs)
             // only bounds-check. An uncovered color would record OpRef::NONE
             // into an operation and can become a SIGSEGV or miscompile; retain
             // this cold decline as the release airbag.
@@ -4647,7 +4648,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             }
         }
 
-        // #32 S2: a kept-stack branch guard whose not-taken arm cannot be
+        // #32: a kept-stack branch guard whose not-taken arm cannot be
         // restored for the COMPILED trace aborts (`AbortPermanent` for the
         // unrestorable-Ref shape, decline + `Abort` for the depth>1
         // invalid-mirror shape), but the authoritative walk's symbolic shadow
@@ -5380,7 +5381,7 @@ fn loop_inlines_abort_permanent_callee(
             return None;
         }
         // A FUNCTION_TYPE object can wrap a BuiltinCode, not a CodeObject:
-        // `make_builtin_function*` (gateway.rs:701) puts such a function into
+        // `make_builtin_function*` (gateway.rs) puts such a function into
         // module globals (e.g. `from sys import getsizeof`).  Feeding its
         // BuiltinCode to `sub_jitcode_body_for_code` / `w_code_get_ptr` casts it
         // as a PyCode and derefs garbage, so reject it before the scan — a
