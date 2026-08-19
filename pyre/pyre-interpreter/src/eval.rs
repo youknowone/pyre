@@ -1493,7 +1493,7 @@ pub fn get_sys_exception() -> PyObjectRef {
     if ec.is_null() {
         return PY_NULL;
     }
-    unsafe { (*ec).sys_exc_info(false) }
+    unsafe { (*ec).sys_exc_info() }
 }
 
 /// Flat TLS write of the per-thread `CURRENT_EXCEPTION` slot — same

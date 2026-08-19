@@ -591,9 +591,13 @@ impl ExecutionContext {
 
     pub fn enter(&mut self, frame: *mut PyFrame) {
         // pypy/interpreter/executioncontext.py:85-89 enter parity.
-        if !self.space.is_null() && self.is_tracing > 0 {
-            self._revdb_enter(frame);
-        }
+        //
+        // `if self.space.reverse_debugging: self._revdb_enter(frame)` folds
+        // away: the space carries `reverse_debugging = False`
+        // (baseobjspace.py:429) unless `config.translation.reverse_debugger`
+        // sets it (baseobjspace.py:444), and reverse debugging is not ported.
+        // Same fold `bytecode_only_trace` and `side_effects_ok` already carry.
+        //
         // `f_backref` is a traced `Type::Ref` field, so the store carries the
         // generational barrier the JIT's `SetfieldGc` lowering emits for it.
         // `frame` can be a non-moving old-generation frame while `topframeref`
@@ -650,7 +654,8 @@ impl ExecutionContext {
         // `jit.virtual_ref_finish(frame_vref, frame)` — keepalives only at
         // interp level (both operands are already live in Rust); the JIT
         // records VIRTUAL_REF_FINISH during tracing.
-        self._revdb_leave(got_exception);
+        // `if self.space.reverse_debugging: self._revdb_leave(got_exception)`
+        // (executioncontext.py:108-109) folds away with the arm in `enter`.
         trace_result
     }
 
@@ -1035,11 +1040,21 @@ impl ExecutionContext {
         Ok(())
     }
 
-    pub fn sys_exc_info(&self, _for_hidden: bool) -> PyObjectRef {
-        let _ = _for_hidden;
+    /// `executioncontext.py:219-232 sys_exc_info` — the topmost handled
+    /// exception, or PY_NULL when nothing is being handled.
+    pub fn sys_exc_info(&self) -> PyObjectRef {
         if !self.sys_exc_value.is_null() {
             return self.sys_exc_value;
         }
+        if !self.current_gen_or_coroutine.is_null() {
+            return self._get_topmost_exception();
+        }
+        pyre_object::PY_NULL
+    }
+
+    /// `executioncontext.py:278-284 _get_topmost_exception` — the first
+    /// exception parked on the suspended generator/coroutine chain.
+    pub fn _get_topmost_exception(&self) -> PyObjectRef {
         let mut generator = self.current_gen_or_coroutine;
         while !generator.is_null() {
             let saved =
