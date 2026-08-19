@@ -273,8 +273,8 @@ pub struct Bookkeeper {
     /// dropped. Inner map: kwarg name → merged annotation across all
     /// `jit_merge_point` / `can_enter_jit` call sites for that
     /// driver. Upstream merges via `annmodel.unionof`; the Rust port
-    /// uses [`super::model::union`] (model.rs:2568) with
-    /// [`super::model::s_impossible_value`] (model.rs:2436) as the
+    /// uses [`super::model::union`] with
+    /// [`super::model::s_impossible_value`] as the
     /// seed for the first hit.
     pub _jit_annotation_cache: RefCell<HashMap<HostObject, HashMap<String, SomeValue>>>,
     /// RPython `self.immutable_cache = {}` (bookkeeper.py:61), keyed by
@@ -358,7 +358,8 @@ pub struct Bookkeeper {
         RefCell<Option<Rc<HashMap<String, HashMap<i64, String>>>>>,
     /// TODO: no upstream equivalent.  Interning table mapping a struct
     /// type-root name to its canonical host class `HostObject`.  Because
-    /// `HostObject` equality is `Arc` pointer identity (`model.rs:233`),
+    /// `HostObject` equality is `Arc` pointer identity (`impl PartialEq for
+    /// HostObject` in `flowspace/model.rs`),
     /// two `HostObject::new_class(name, ...)` calls produce distinct
     /// descs/classdefs; interning resolves a type-root string to one
     /// class OBJECT exactly once so subsequent `getuniqueclassdef`
@@ -6622,7 +6623,7 @@ mod tests {
         // (b) getattr(instance_of_T, "shared") resolves to a MethodDesc PBC
         // family — NOT `SomeInstance(classdef=None)`, NOT "attribute not
         // found".  `s_getattr` on the base ClassDef is exactly what
-        // `SomeInstance.getattr` (unaryop.rs:4143) calls for an instance of
+        // `SomeInstance.getattr` (in `unaryop.rs`) calls for an instance of
         // that classdef; populate the attr across the tree first (the
         // fixpoint analog).
         ClassDef::check_missing_attribute_update(&base_cd, "shared")

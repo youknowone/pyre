@@ -4113,18 +4113,20 @@ fn init_someinstance_overrides(
                         // `__discriminant` — synthetic enum-tag pseudo-attribute
                         // the MIR front-end's `Rvalue::Discriminant` lowering
                         // emits as a `FieldRead("__discriminant", ty: Int)`
-                        // (front/mir.rs:1429).  No RPython analogue (RPython
+                        // (`front/mir.rs`'s `build_rvalue`).  No RPython analogue (RPython
                         // source has no Rust enums); the tag is a low-level
                         // non-negative integer, declared `ValueType::Int` at the
                         // producer and trusted as such by the legacy walker
-                        // (legacy_annotator.rs:273).  Resolve it here only for a
+                        // (`legacy_annotator.rs`'s `infer_op_type`).  Resolve it here only
+                        // for a
                         // classdef-less enum value (pyre's pointer erasure lifts
                         // an unseeded `Ref(_)` enum to a classdef-less
                         // `SomeInstance`); an enum receiver that carries its base
                         // `ClassDef` instead reads `__discriminant` through the
                         // ordinary `s_getattr` path below, where the Model A flat
                         // class projects the `i64` tag row to `SomeInteger`
-                        // (front/mir.rs:545).  Keeping the short-circuit out of
+                        // (`front/mir.rs`'s `derive_program_metadata`).  Keeping the
+                        // short-circuit out of
                         // the classdef-bearing path mirrors RPython
                         // `SomeInstance.getattr`, which special-cases only
                         // `__class__` (unaryop.py:838-839).

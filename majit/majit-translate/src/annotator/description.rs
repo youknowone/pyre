@@ -1238,8 +1238,8 @@ impl FunctionDesc {
             // mirroring `buildflowgraph`'s build-time append
             // (translator.py:61 `self.graphs.append(graph)`). This is NOT
             // a second append site: the MISS path below routes through
-            // `buildgraph` -> `buildflowgraph` (description.rs:1248,
-            // translator.rs:537), which already appends exactly like
+            // `buildgraph` -> `buildflowgraph` (in `description.rs` /
+            // `translator.rs`), which already appends exactly like
             // upstream. Only graphs prefilled by the Rust-source adapter
             // (`cutover::lift_callee_to_pygraph` -> `prefill_default_cache`)
             // reach a HIT without ever passing through `buildflowgraph`, so

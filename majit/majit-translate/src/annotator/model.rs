@@ -3539,8 +3539,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             // `SomeInstance` arm above names its classdefs: both sides
             // often render as the bare `<other>` `KnownType`, which makes
             // the skip-classified panic undiagnosable.  The classifier
-            // phrase is kept verbatim and first — `cutover.rs:1291` /
-            // `:2718` match it with `contains`.
+            // phrase is kept verbatim and first — `cutover.rs`'s `is_known_unported`
+            // and `classify_unported_reason` match it with `contains`.
             msg: format!(
                 "no upstream pair(s1, s2).union() handler in current subset: \
                  {} ∪ {}",

@@ -390,7 +390,7 @@ struct BlockAnnotationSnapshot {
 /// / `blocked_blocks` and prunes the matching `genpendingblocks` entries.
 /// Without this, a half-annotated leftover poisons every later subject's
 /// session-global `specialize_more_blocks` walk: a `None` (False)
-/// sentinel crashes `specialize_block` (rtyper.rs:1656), and a processed
+/// sentinel crashes `specialize_block` (in `rtyper.rs`), and a processed
 /// block carrying an unbound op result raises `KeyError: no binding for
 /// arg`.  `raise_if_subject_blocked` only covers the blocked-on-drain
 /// path; this covers the `compute_at_fixpoint` / late-step / panic-unwind
@@ -635,8 +635,8 @@ impl RPythonAnnotator {
     /// ```
     pub fn binding(&self, arg: &Hlvalue) -> SomeValue {
         // Required substring `"KeyError: no binding for arg"` is
-        // preserved verbatim for `cutover.rs:486
-        // is_known_unported`; the trailing `{arg:?}` adds the
+        // preserved verbatim for `cutover.rs`'s
+        // `is_known_unported`; the trailing `{arg:?}` adds the
         // failing Hlvalue (typically a Variable name like `v11` or a
         // Constant payload) so per-graph diagnosis can locate the
         // unbound operand without a separate verbose pass.
@@ -1588,7 +1588,7 @@ impl RPythonAnnotator {
     /// walker, then reuses the session-shared annotator for the next
     /// subject. The subject's blocks are therefore rolled back out of
     /// the shared maps — otherwise the surviving `None` sentinel crashes
-    /// a later `specialize_block` (rtyper.rs:1656), and a surviving
+    /// a later `specialize_block` (in `rtyper.rs`), and a surviving
     /// `Some` block could insert a link conversion against an evicted
     /// sentinel successor.
     pub(crate) fn raise_if_subject_blocked(
@@ -2345,7 +2345,7 @@ impl RPythonAnnotator {
                 // which is all of them here. Quote the block's operations
                 // instead — the same "show the offending block" role upstream's
                 // source-line range plays, rendered the way `gather_error`
-                // already renders an operation (`tool/error.rs:498`).
+                // already renders an operation (`tool/error.rs`'s `gather_error`).
                 let ops = {
                     let b = block.borrow();
                     if b.operations.is_empty() {
@@ -2932,7 +2932,7 @@ impl RPythonAnnotator {
                 // `knowntypedata.get(link.exitcase, {})` — key by the
                 // exitcase value. A bool exitswitch keys `True`/`False`;
                 // pyre's MIR also encodes a bool `SwitchInt` arm as
-                // `Int(0/1)` (mir.rs:6097), so a bool binding collapses
+                // `Int(0/1)` (in `front/mir.rs`), so a bool binding collapses
                 // the integer back to a truth value. An integer
                 // discriminant keys directly by the `Int` case constant.
                 let case_key: Option<ExitCaseKey> = match exitcase {

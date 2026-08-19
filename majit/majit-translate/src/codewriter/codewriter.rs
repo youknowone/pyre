@@ -165,7 +165,7 @@ impl CodeWriter {
         // `"not registered in PyreCallRegistry"`).  Unknown errors
         // panic immediately so parity bugs surface here rather than
         // silently shifting downstream behind a Skip mask.
-        // Z2.5 Path C — metadata-only stubs for `unsafe fn` callees that
+        // Metadata-only stubs for `unsafe fn` callees that
         // `populate_call_registry_from_call_graphs` could not see
         // (`build_flow.rs:215` rejects unsafe bodies, so they never enter
         // `callcontrol.function_graphs()`).  The specs are registered
@@ -203,7 +203,7 @@ impl CodeWriter {
         // exactly one annotator and one rtyper per Translator and assert
         // on re-entry.  Pyre mirrors that contract through
         // [`PyreCallRegistry::ensure_session`]
-        // (`pyre_call_registry.rs:210-234`), which lazily builds a single
+        // (in `pyre_call_registry.rs`), which lazily builds a single
         // `(RPythonAnnotator, RPythonTyper)` pair on first use and
         // returns the cached pair on every subsequent
         // `specialize_legacy_graph_with_registry_returning_value_to_var`
@@ -460,7 +460,7 @@ impl CodeWriter {
         // logic was lifted into the shared
         // [`Self::dual_gate_type_state`] helper so the parser-level
         // debug snapshot in `make_jitcodes`
-        // (lib.rs:898) can route through the same path.
+        // (in `lib.rs`) can route through the same path.
         let canonical_diag = path.canonical_key().to_string();
         // `dual_gate_publish_concretetypes` commits every resolved
         // kind to each backing `Variable.concretetype` cell in both
@@ -977,10 +977,10 @@ impl CodeWriter {
                 // RPython `enum_pending_graphs` (codewriter.py:79-84)
                 // never yields a jitcode whose graph is missing —
                 // `get_jitcode()` only allocates shells for paths that
-                // already live in `function_graphs`. Phase I3 restored
-                // this invariant for pyre by routing
+                // already live in `function_graphs`. Pyre keeps that
+                // invariant by routing
                 // `handle_regular_call` through the qualified
-                // `CallControl::target_to_path` (jtransform.rs:970).
+                // `CallControl::target_to_path` (in `jtransform.rs`).
                 // If this branch fires, a new producer has been added
                 // that bypasses `target_to_path` or inserts under an
                 // alias key. Producer-side bug, not an expected

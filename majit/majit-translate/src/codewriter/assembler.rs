@@ -747,7 +747,7 @@ impl Assembler {
             // `L` label code (e.g. `goto_if_not_int_lt/iiL`,
             // `goto_if_not_int_is_zero/iL`).  A Bool-producing compare's
             // operands carry the matching concretetype, so the kinds
-            // resolve to the keys registered in `insns.rs:780-796`.
+            // resolve to the keys registered in `insns.rs`'s `wellknown_bh_insns`.
             FlatOp::GotoIfNotOp {
                 opname,
                 args,
@@ -857,7 +857,7 @@ impl Assembler {
             // v, "->", w)` — argcodes `i>i` (typed src, result marker,
             // typed dst). The `>` bears no byte in the stream; it only
             // flags the result position in the key so the blackhole
-            // wire `int_copy/i>i` (blackhole.rs:5670) finds the handler
+            // wire `int_copy/i>i` (in `blackhole.rs`) finds the handler
             // and `Assembler.resulttypes[pc]` is populated correctly.
             //
             // Upstream's source operand (`v`) can be either a `Register`
@@ -2333,7 +2333,7 @@ impl Assembler {
             // byte register index (argcodes `i`). The bhimpl signature
             // (`blackhole.py:1062 @arguments("i")`) looks the byte up in
             // `registers_i`. The canonical runtime key is `loop_header/i`
-            // (`majit-metainterp/src/jitcode/mod.rs:293`); `emit_const_i`
+            // (`majit-metainterp/src/jitcode`); `emit_const_i`
             // returns `num_regs_i + pool_idx` which the runtime resolves
             // back to the constant via `registers_i[byte]`. Emitting via
             // the generic fallback would push zero operand bytes (because
@@ -2354,7 +2354,8 @@ impl Assembler {
             // (`blackhole.py:1066 @arguments("self","i","I","R","F",
             // "I","R","F")`) reads jdindex + six typed register lists, each
             // encoded as `[len:u8][reg:u8 * N]` (assembler.py:181-196 ListOfKind).
-            // pyre's runtime (`blackhole.rs:2012-2029`) consumes exactly this
+            // pyre's runtime (`blackhole.rs`'s `handler_jit_merge_point_c`)
+            // consumes exactly this
             // six-list shape. The canonical runtime key is
             // `jit_merge_point/cIRFIRF` for signed-byte jitdriver indices or
             // `jit_merge_point/iIRFIRF` for constant-pool jitdriver indices.
@@ -3619,7 +3620,7 @@ fn bh_size_spec_from_callcontrol(
         // the lltype STRUCT object identity.  Pyre's analogue is
         // `path_hash_for_gc_kind(owner, is_gc_managed)` per
         // `majit_ir::descr::path_hash_for_gc_kind` doc
-        // (`majit-ir/src/descr.rs:120-141`): the analyzer side hashes
+        // (in `majit-ir/src/descr.rs`): the analyzer side hashes
         // `field.owner_root`, the runtime macro hashes
         // `concat!(module_path!(), "::", stringify!(Struct))`.  The
         // analyzer hashes `owner` with the same raw-struct discriminator so
@@ -4302,7 +4303,7 @@ fn arraydescrof(
         // table as `writeanalyze` in `call.rs`; otherwise
         // every emit-time descr lands at `ei_index = 0` and aliases
         // distinct ARRAY identities at `force_from_effectinfo`
-        // (`heap.py:540-560`, `heap.rs:839 array_effect_index`).
+        // (`heap.py:540-560`, `heap.rs`'s `array_effect_index`).
         let descr = cc.arraydescrof_for_type(ty, array_type_id, ir_type, len_offset);
         let array_descr = descr
             .as_array_descr()
@@ -4534,7 +4535,7 @@ fn op_kind_to_opname_with_kinds(kind: &crate::model::OpKind, operand_kinds: &str
             // RPython `jtransform.py:1627 rewrite_op_float_is_true`
             // collapses both `bool/f` and `float_is_true/f` to
             // `float_ne(x, 0.0)` upstream of the assembler — pyre's
-            // jtransform mirror at `jtransform.rs:917-984` covers
+            // jtransform mirror in `rewrite_operation` covers
             // both surfaces, so an `f` operand reaching here means
             // the rewrite was skipped.  Fail loud rather than emit
             // a `float_is_true` opname the backend does not register
@@ -4600,7 +4601,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // `ConstNone` (Void `None`) is const-inlined by
         // `legacy_const_define_hlvalue`, and `decompose_slice_args` DROPS
         // the getslice `stop` operand for a `[start:]` slice
-        // (rtyper.rs:2841) — so it never reaches the assembler in a lifted
+        // (in `rtyper.rs`) — so it never reaches the assembler in a lifted
         // graph.  It only appears here if a graph that planted it dropped
         // to the legacy walker (the gate failed); the distinctive
         // handler-less `const_none` opname trips
@@ -4738,7 +4739,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::IsVirtual { kind_char, .. } => {
             format!("{}_isvirtual", kind_char_to_name(*kind_char))
         }
-        // The rtyper at rtyper.rs:2035 dispatches the flowspace
+        // The rtyper (in `rtyper.rs`) dispatches the flowspace
         // `"isinstance"` opname through `InstanceRepr::rtype_isinstance`,
         // which lowers it into a direct_call to the per-class
         // `ll_isinstance_const_*` or unspecialised `ll_isinstance`
@@ -5078,7 +5079,8 @@ impl EffectInfoStructuralKey {
 
 /// Which shape an `EffectInfo`'s `descr_set_keys` takes (descriptor census).
 ///
-/// `effectinfo.rs:149-161` states the rule and names its upstream source:
+/// `effectinfo.rs`'s `analyze_external_call` states the rule and names its
+/// upstream source:
 /// `effectinfo.py:149-162` makes the six raw sets `None` **iff** the EI is
 /// `EF_RANDOM_EFFECTS`. So the population partitions in two, and the third
 /// class below is unrepresentable rather than merely rare.

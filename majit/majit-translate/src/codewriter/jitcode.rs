@@ -1202,7 +1202,7 @@ pub struct BhSizeSpec {
     /// `descr.py:108-110 cache[STRUCT]` cache-key surrogate.
     /// Carries the full `path_hash(concat!(module_path!(), "::",
     /// stringify!(Struct)))` u64 that the runtime `jit_struct!` macro
-    /// emits as `__majit_type_id()` (`majit-macros/src/jit_struct.rs:92`).
+    /// emits as `__majit_type_id()` (`majit-macros/src/jit_struct.rs`).
     /// MUST be u64, not truncated to u32 — `path_hash` has 64-bit range
     /// and truncating yields collisions at ~2^32 structs that PyPy's
     /// per-object identity never has.  Analyzer side hashes
@@ -1813,7 +1813,7 @@ impl BhDescr {
     /// reach the load/store, matching `llmodel.py:693-696,718-721`.
     /// Panics on non-`Field` variants — vable scalars synthesize a
     /// fixed-size 8-byte signed-zero placeholder via
-    /// `read_descr_vable_field` (`blackhole.rs:5597`) and still go
+    /// `read_descr_vable_field` (in `blackhole.rs`) and still go
     /// through this method.
     pub fn unpack_fielddescr_size(&self) -> (usize, usize, bool) {
         match self {

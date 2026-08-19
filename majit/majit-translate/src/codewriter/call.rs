@@ -192,7 +192,7 @@ pub struct WriteAnalysis {
 /// `EffectInfo` and the cpu-level descr identity.  Upstream stores
 /// the funcptr separately as `op.args[0]`; pyre carries the funcptr
 /// identity on each `OpKind` variant's dedicated `funcptr` field
-/// (model.rs:247) so this struct holds only the calldescr-side data.
+/// (in `model.rs`) so this struct holds only the calldescr-side data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallDescriptor {
     /// RPython `CallDescr.arg_classes`: one char per non-void FUNC argument.
@@ -839,9 +839,10 @@ pub struct DeclaredExternalKey {
     pub leaf_candidates: usize,
     pub leaf_example: Option<String>,
     /// Marks carried by `leaf_example`'s own graph. This is what separates a
-    /// LOST mark from a harmless duplicate: the same hint is written twice,
-    /// once against the graph's path (`lib.rs:1705`) and once against the
-    /// 2-segment owner spelling (`lib.rs:1743-1748`). If the graph already
+    /// LOST mark from a harmless duplicate: `lib.rs`'s
+    /// `analyze_pipeline_from_module_paths` writes the same hint twice — once
+    /// against the graph's path and once against the 2-segment owner
+    /// spelling. If the graph already
     /// carries the mark, the `external_funcobjs` entry is redundant; if it
     /// does not, the assertion was lost.
     pub leaf_example_marks: Vec<String>,
@@ -1116,7 +1117,7 @@ pub struct CallControl {
     /// `owner_root.is_some()`).  Same rationale as
     /// `free_fn_leaf_index`: pyre-only acceleration for
     /// `target_to_path`'s `CallTarget::Method` receiver-leaf
-    /// fallback (line ~3273), which previously walked the whole
+    /// fallback, which previously walked the whole
     /// `function_graphs` HashMap looking for paths ending in
     /// `[receiver_leaf, method_name]`.
     impl_method_leaf_index: HashMap<String, Vec<CallPath>>,
@@ -1133,8 +1134,8 @@ pub struct CallControl {
 
     /// Trait bindings: `(trait_root, method_name)` → `Vec<impl_type>`.
     ///
-    /// Keyed by the *declaring trait* (impl's `trait_name` from
-    /// `parse.rs:237`), so two traits exposing the same method name do
+    /// Keyed by the *declaring trait* (impl's `TraitImplInfo::trait_name`),
+    /// so two traits exposing the same method name do
     /// not collide (RPython `call.py:94-114` indirect branch reads
     /// `op.args[-1].value` = exact candidate graph list, not a
     /// method-name global).  Inherent impls do not populate this map;
@@ -1299,11 +1300,11 @@ pub struct CallControl {
     /// (`effectinfo.py:465 compute_bitstrings`).  Lives on `CallControl`
     /// (not `AnalysisCache`) so the bytecode emit path
     /// (`assembler.rs::arraydescrof`) and the writeanalyze walker
-    /// (`call.rs:3614`/`:3633`) consult a single source of truth — two
+    /// (`collect_readwrite_effects`) consult a single source of truth — two
     /// independent registries would assign different indices to the
     /// same `(item_ty, array_type_id)` pair and alias distinct ARRAY
     /// identities onto each other at `force_from_effectinfo`
-    /// (`heap.py:540-560`, `heap.rs:839 array_effect_index`).
+    /// (`heap.py:540-560`, `heap.rs`'s `array_effect_index`).
     pub descr_indices: DescrIndexRegistry,
 
     /// RPython: known struct types for `get_type_flag(ARRAY.OF)` → FLAG_STRUCT.
@@ -1720,7 +1721,7 @@ impl StructLayout {
 #[derive(Default)]
 pub struct DescrIndexRegistry {
     /// Interior-mutable so that both the writeanalyze walker
-    /// (`call.rs:3614`/`:3633`) and the bytecode emit path
+    /// (`collect_readwrite_effects`) and the bytecode emit path
     /// (`assembler.rs::arraydescrof`) can publish ei_index through
     /// `&CallControl` without threading a `&mut` borrow through
     /// `getcalldescr(&self, …)` and `assemble_with_callcontrol`.
@@ -2239,15 +2240,15 @@ impl CallControl {
                 // does not yet port the layoutbuilder analog;
                 // analyzer-side `SimpleArrayDescr.type_id`
                 // stays at 0 (the `get_array_descr` cache-miss-mint
-                // default at `descr.rs:515`).  Runtime-registered
+                // default in `descr.rs`).  Runtime-registered
                 // `SimpleArrayDescr` carries a real GC tid stamped at
                 // module init (`LIST_TYPE_ID`, `DICT_TYPE_ID`, …) and
                 // wins the cache slot when both paths race.  The
                 // structural identity used for `_cache_array` lookups
                 // is `SimpleArrayDescr.cache_key` (= `path_hash(atid)`,
-                // stamped at descr.rs:526-528 inside `get_array_descr`),
+                // stamped inside `descr.rs`'s `get_array_descr`),
                 // kept fully separate from `type_id` per the trait doc
-                // at descr.rs:2120-2131.
+                // on `descr.rs`'s `ArrayDescr::cache_key`.
                 // `descr.py:364 is_pure = ARRAY_INSIDE._immutable_field(None)`
                 // parity: consult the array-type-keyed
                 // `immutable_array_types` set populated from `field[*]`
@@ -2374,7 +2375,7 @@ impl CallControl {
     /// PyPy's `descr.py:218-239 get_field_descr` caches by `(STRUCT,
     /// fieldname)`, so analyzer and runtime users reach one descriptor. Pyre
     /// uses `path_hash(STRUCT)` for that identity. Runtime publication hashes
-    /// the definition path through `__majit_type_id` (`jit_struct.rs:92`),
+    /// the definition path through `__majit_type_id` (in `jit_struct.rs`),
     /// while analyzer fields can initially carry a use-site-qualified owner.
     /// `canonical_struct_name` consults `STRUCT_ORIGIN_REGISTRY` to normalize
     /// that owner to its definition path before hashing. The same rule is used
@@ -3021,7 +3022,8 @@ impl CallControl {
     /// Impl methods are *not* registered through this entry point —
     /// their canonical CallPath (`[impl_type_joined, method]`) carries
     /// `impl_type_joined` as a single `::`-preserving segment
-    /// (parse.rs:702, lib.rs:406-433), which the simple `split("::")`
+    /// (`CallPath::for_impl_method`, and `lib.rs`'s
+    /// `analyze_pipeline_from_module_paths`), which the simple `split("::")`
     /// strip here cannot recover.  Use
     /// `register_macro_impl_helper_trace_fnaddr` instead, fed from the
     /// macro's sibling registry `__majit_helper_impl_trace_fnaddrs()`.
@@ -3073,8 +3075,9 @@ impl CallControl {
     /// Charon's `name_path()`.  Registers
     /// `[impl_type_joined, method]` as a 2-segment CallPath where
     /// `impl_type_joined` is stored verbatim as a single segment — same
-    /// shape `register_trait_method` / inherent method graphs use at
-    /// lib.rs:406-433, so `get_jitcode()` resolves through to this real
+    /// shape `register_trait_method` / inherent method graphs use in
+    /// `lib.rs`'s `analyze_pipeline_from_module_paths`, so `get_jitcode()`
+    /// resolves through to this real
     /// helper address instead of the symbolic hash fallback.  RPython
     /// `call.py:174-187 getfunctionptr(graph)` parity for `<Type>::method`
     /// and `<Type as Trait>::method`.
@@ -3359,7 +3362,7 @@ impl CallControl {
     /// the matching lifecycle phase.  This call covers the codewriter
     /// side; the metainterp side is wired through
     /// `MetaInterp::set_virtualizable_info` at `JitDriver::new`
-    /// (jitdriver.rs:285).
+    /// (in `jitdriver.rs`).
     ///
     /// `greenfield_info` is constructed in-place as a
     /// [`StaticGreenFieldInfoHandle`] (the codewriter-internal default;
@@ -3377,7 +3380,7 @@ impl CallControl {
     /// factory returns `None`, the slot stays empty until the host
     /// later overrides it with [`Self::set_jitdriver_virtualizable_info`]
     /// at runtime — matching pyre's
-    /// `MetaInterp::set_virtualizable_info` (jitdriver.rs:285) wiring.
+    /// `MetaInterp::set_virtualizable_info` (in `jitdriver.rs`) wiring.
     /// The factory receives `(jd_idx, vtypeptr_token)` where
     /// `vtypeptr_token` is the `red_types[index_of_virtualizable]`
     /// string the codewriter resolved.
@@ -4560,8 +4563,8 @@ impl CallControl {
                 if let Some(leaf) = segments.last() {
                     // Restrict leaf-match to FREE-FUNCTION graphs
                     // (`FunctionGraph.owner_root.is_none()`).  Impl-method
-                    // graphs registered via `lib.rs:747
-                    // for_impl_method(impl_type, name)` share the same
+                    // graphs registered via `CallPath::for_impl_method(impl_type,
+                    // name)` share the same
                     // `function_graphs` HashMap but their leaf
                     // (`copy`/`new`/etc.) collides with arbitrary
                     // free-function names — without this filter, a
@@ -4612,15 +4615,15 @@ impl CallControl {
                     // Multi-match: pyre's free-function registration
                     // dual-publishes each graph under `[module, name]`,
                     // `["crate", module, name]`, and `[crate_alias,
-                    // module, name]` aliases (`lib.rs:465-502
-                    // register_function_graph_alias` chain), so a bare
+                    // module, name]` aliases (`lib.rs`'s
+                    // `register_function_graph_alias` chain), so a bare
                     // callsite (`use crate::X; X();`) producing
                     // `[caller_module, X]` will leaf-match every alias
                     // simultaneously even though all aliases name the one
                     // shared source graph (`GraphStore` keys them to a single
                     // `FunctionGraph` by identity).  Disambiguate by
                     // FunctionGraph.name (the qualified source name set
-                    // by `lib.rs:1342 sf.name = format!("{prefix}::{name}")`,
+                    // when `front::mir` mints `sf.name` as `{module_path}::{name}`,
                     // identical across aliases).  PyPy parity:
                     // `bookkeeper.getdesc(callable)` keys on function-
                     // object identity, so multi-alias publications of
@@ -5377,7 +5380,7 @@ impl CallControl {
     /// `constants_i` slot for the funcbox.  When the walker observes
     /// `EF_ELIDABLE_CANNOT_RAISE` on the descr it routes through
     /// `try_fold_pure_call_via_executor`
-    /// (pyre-jit-trace/src/jitcode_dispatch.rs:3099) which dereferences
+    /// (`pyre-jit-trace/src/jitcode_dispatch/residual_call.rs`) which dereferences
     /// the constant_i as a C function pointer — SIGSEGV on the hash.
     /// Pyre's symbolic placeholder is a deviation vs RPython (where
     /// every callee has a real `MixLevelHelperAnnotator.constfunc(impl)`
@@ -5498,12 +5501,13 @@ impl CallControl {
     /// `(...)` pattern to `Index(n)` placeholders.  The list must
     /// match the function's actual parameter declaration order.
     ///
-    /// Populated by the walker (`lib.rs:600`) whenever
+    /// Populated by the walker (`lib.rs`'s
+    /// `analyze_pipeline_from_module_paths`) whenever
     /// `front::llbc_hints::harvest_hints_from_llbcs` emits the
     /// `"oopspec_argnames:..."` companion hint — i.e. when a function
     /// carries `#[oopspec(...)]` AND its signature is available at
     /// hint-collection time.  Programmatic `mark_oopspec` callers
-    /// (`lib.rs:707-741` jit.* bindings) leave this unset because
+    /// (the `lib.rs` jit.* bindings) leave this unset because
     /// their bare-name specs have no `(...)` pattern to resolve.
     pub fn mark_oopspec_argnames(&mut self, path: CallPath, argnames: Vec<String>) {
         self.func_effects_mut(&path).oopspec_argnames = argnames;
@@ -6352,7 +6356,7 @@ impl CallControl {
             method_name,
         } = target
         {
-            // Same fold as `rpbc.rs:404-421` and as `getcalldescr`'s
+            // Same fold as `rpbc.rs`'s `lower_indirect_calls` and as `getcalldescr`'s
             // `CallShape::Indirect` above: `all_impls_for_indirect` returns
             // an empty vector both when the family is genuinely empty and
             // when its impls live outside the analyzed sources, and this
@@ -6410,12 +6414,12 @@ impl CallControl {
             // silently asserts that a callee nobody enumerated has no
             // effects.  Nothing in this pipeline ever proves a family
             // closed and empty: `Some([])` is only ever the deferred
-            // `BuiltinWrapper` marker (`front/mir.rs:13056-13073`), and it
-            // survives to here exactly when the fill at `rpbc.rs:335-343`
+            // `FnPtrFamily::BuiltinWrapper` marker (in `front/mir.rs`), and it
+            // survives to here exactly when the fill in `lower_indirect_calls`
             // had no registered wrappers to fill it with.  "No members"
             // therefore means "unknown", which is `None`.
             //
-            // `rpbc.rs:404-421` already makes this fold at the other site
+            // `lower_indirect_calls` already makes this fold at the other site
             // that answers the same question, with the same reasoning.
             OpKind::IndirectCall { graphs, .. } => CallShape::Indirect(
                 graphs
@@ -6636,7 +6640,7 @@ impl CallControl {
                 // `#[majit_macros::elidable_or_memerror]` macros assert
                 // an `EF_ELIDABLE_*` shape the on-graph `_canraise`
                 // analyser cannot recover on its own — pyre's
-                // `analyze_external_call` defaults to `True` (call.rs:3631)
+                // `analyze_external_call` defaults to `True`
                 // so any callee that reaches Vec::len / pyframe_get_pycode
                 // / etc. propagates back as CanRaise::Yes.  Honour the
                 // assertion before consulting `_canraise` so the
@@ -8025,7 +8029,7 @@ fn all_interiorfielddescrs(
     // STRUCT, vtable)` — PyPy's `get_field_descr` calls
     // `get_size_descr` on cache miss so the freshly-minted FieldDescr
     // gets a non-None `parent_descr`.  Pyre's `gc_cache.get_field_descr`
-    // only READS `_cache_size[struct_key]` (descr.rs:418); ensure the
+    // only READS `_cache_size[struct_key]`; ensure the
     // slot is populated first by routing through `get_size_descr` here,
     // so the inner-FieldDescr loop below sees the parent.  Cache hit
     // is a no-op; cache miss mints the SizeDescr per `descr.py:108-118`.
@@ -8081,7 +8085,7 @@ fn all_interiorfielddescrs(
             // `PyreFieldDescr` inside `PyreSizeDescr.all_fielddescrs`
             // (build_object_descr_group), NOT into `_cache_field`; the
             // analyzer's direct interiorfielddescrof path
-            // (call.rs:1489) walks `sd.all_fielddescrs()` to find that
+            // (`interiorfielddescrof`) walks `sd.all_fielddescrs()` to find that
             // PyreFieldDescr.  Mirror that walk here so struct-array
             // population also reuses the runtime PyreFieldDescr Arc —
             // otherwise the two paths mint divergent FieldDescr Arcs and
@@ -10758,7 +10762,8 @@ mod tests {
     #[test]
     fn rtyper_synthesised_list_struct_resolves_its_field_descrs() {
         // The rtyper synthesises `GcStruct("list", ("length", Signed),
-        // ("items", Ptr(GcArray(ITEM))))` (`translator/rtyper/rlist.rs:1112`).
+        // ("items", Ptr(GcArray(ITEM))))` (`translator/rtyper/rlist.rs`'s
+        // `ListRepr::new`).
         // `lib.rs` registers the {length, items} shape into `struct_fields`
         // before `set_struct_fields`; mirror that injection here.  The
         // heuristic accumulation over two word-sized fields must land
@@ -11121,7 +11126,7 @@ mod tests {
     fn make_virtualizable_infos_factory_none_keeps_slot_empty() {
         // warmspot.py:540-545 with factory→None: the codewriter slot
         // stays empty so the runtime metainterp setter populates it
-        // later (jitdriver.rs:285).
+        // later (`MetaInterp::set_virtualizable_info` in `jitdriver.rs`).
         let mut cc = CallControl::new();
         cc.setup_jitdriver(
             CallPath::from_segments(["portal"]),
@@ -11383,7 +11388,8 @@ mod tests {
 
     /// A trait-default method (registered under the synthetic
     /// `"<default methods of Trait>"` impl-type produced by
-    /// `parse.rs:327-332`) must show up in the same indirect-call
+    /// `lib.rs`'s `analyze_pipeline_from_module_paths`) must show up in the
+    /// same indirect-call
     /// family as concrete overrides.  This keeps
     /// `lower_indirect_calls`'s `all_impls_for_indirect(...)` family
     /// correct when a `dyn Trait` receiver can route to either the

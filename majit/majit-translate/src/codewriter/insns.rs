@@ -320,7 +320,7 @@ pub const BC_GOTO_IF_NOT_PTR_ISZERO: u8 = 157;
 pub const BC_GOTO_IF_NOT_PTR_NONZERO: u8 = 158;
 // canonical residual_call_*_v opcodes — RPython `blackhole.py:1240-1255`
 // `bhimpl_residual_call_{r,ir,irf}_v`. Distinct opcodes per argcode shape so
-// `setup_insns` (`blackhole.rs:3241`) keeps its 1:1 opcode→key invariant.
+// `setup_insns` (in `blackhole.rs`) keeps its 1:1 opcode→key invariant.
 // These slots are reserved in the 159-255 free range from the
 // call-family canonical migration.
 pub const BC_RESIDUAL_CALL_R_V: u8 = 159;
@@ -446,7 +446,7 @@ pub const BC_SETFIELD_GC_F: u8 = 206;
 // keys to the same handler as the non-pure form, but the byte must
 // be distinct or `pyjitpl.py:2230 setup_insns`'s
 // `assert opcode_implementations[value] is None` and pyre's
-// `jitcode_runtime.rs:272` duplicate-byte assert would fire.
+// `jitcode_runtime.rs`'s `overlay_insns` duplicate-byte assert would fire.
 pub const BC_GETFIELD_GC_I_PURE: u8 = 207;
 pub const BC_GETFIELD_GC_R_PURE: u8 = 208;
 pub const BC_GETFIELD_GC_F_PURE: u8 = 209;
@@ -525,11 +525,12 @@ pub const BC_RAW_STORE_I: u8 = 228;
 pub const BC_ABORT_RESULT_R: u8 = 195;
 
 // pyre-only `vtable_method_ptr/rd>i` — emitted by `OpKind::
-// VtableMethodPtr` (assembler.rs:2762).  RPython has no counterpart
+// VtableMethodPtr` (`assembler.rs`'s `encode_op`).  RPython has no counterpart
 // because Python dispatch goes through `cpu.bh_call_*` resolved at
 // runtime; pyre's Rust port hits this only when a `dyn Trait` method
 // pointer must be reified into the bytecode stream (backend-epic
-// adaptation, see `blackhole.rs:8462-8474`).
+// adaptation, see `blackhole.rs`'s
+// `handler_vtable_method_ptr_unimplemented`).
 pub const BC_VTABLE_METHOD_PTR: u8 = 196;
 
 // `record_quasiimmut_field/rdd` — RPython `blackhole.py:1538-1545`
@@ -772,8 +773,8 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // RPython `blackhole.py:1240-1255` `bhimpl_residual_call_{r,ir,irf}_v`.
     // The call-family canonical migration retired the
     // legacy `BC_RESIDUAL_CALL_VOID` (=18) byte layout in favour of the
-    // canonical `iRd / iIRd / iIRFd` argcode triple; the freed slot is
-    // documented at the const-table site above.
+    // canonical `iRd / iIRd / iIRFd` argcode triple; byte 18 now houses
+    // the canonical `goto_if_not/iL` key as [`BC_GOTO_IF_NOT`].
     m.insert("residual_call_r_v/iRd", BC_RESIDUAL_CALL_R_V);
     m.insert("residual_call_ir_v/iIRd", BC_RESIDUAL_CALL_IR_V);
     m.insert("residual_call_irf_v/iIRFd", BC_RESIDUAL_CALL_IRF_V);
@@ -941,7 +942,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // = bhimpl_getfield_gc_{i,r,f}` — pure-getter shape on quasi-immutable
     // descrs.  Each `(opname, argcodes)` key gets its own byte per
     // `assembler.py:220 setdefault(key, len(self.insns))`; `pyjitpl.py:2230
-    // setup_insns` and pyre's `jitcode_runtime.rs:272` both assert no
+    // setup_insns` and pyre's `jitcode_runtime.rs` `overlay_insns` both assert no
     // duplicate bytes.  Walker dispatch routes `_pure` to the same handler.
     m.insert("getfield_gc_i_pure/rd>i", BC_GETFIELD_GC_I_PURE);
     m.insert("getfield_gc_r_pure/rd>r", BC_GETFIELD_GC_R_PURE);
@@ -1222,7 +1223,7 @@ pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
     // TODO: pyre `call_assembler_*` adapters.
     //
     // `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
-    // (`assembler.rs:3370,3429,3451,3489`) emits a pyre-only flat
+    // (`majit-metainterp/src/jitcode/assembler.rs`) emits a pyre-only flat
     // payload: typed `[target_idx u16, dst u16, num_args u16,
     // (kind u8, reg u16) × num_args]`; void omits `dst`.  RPython has
     // no `bhimpl_call_assembler_*`; pyre re-interprets the recorded
@@ -1238,22 +1239,23 @@ pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
     // adapters.
     //
     // `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
-    // (`assembler.rs:2642,2660`) emit a pyre-only flat payload that
+    // (`majit-metainterp/src/jitcode/assembler.rs`) emit a pyre-only flat payload that
     // does not match canonical `iiIRd` / `riIRd>r` argcodes.  The
     // `_pyre/P` handlers split semantically:
     //
-    //   * `cond_call_*_pyre` (`blackhole.rs:9965` onward) execute the
+    //   * `cond_call_*_pyre` (`blackhole.rs`'s `handler_cond_call_*_pyre`) execute the
     //     conditional call directly, mirroring upstream
     //     `bhimpl_conditional_call_ir_v` /
     //     `bhimpl_conditional_call_value_ir_{i,r}`
     //     (`blackhole.py:1257-1276`).
-    //   * `record_known_result_*_pyre` (`blackhole.rs:10068` onward)
+    //   * `record_known_result_*_pyre` (`blackhole.rs`'s
+    //     `handler_record_known_result_*_pyre`)
     //     are no-ops that skip the operand bytes, mirroring the
     //     `pass`-bodied `bhimpl_record_known_result_{i,r}_ir_v`
     //     (`blackhole.py:621-628`).
     //
-    // Producers: `majit-macros/src/jit_interp/jitcode_lower.rs:2166-2458`,
-    // `pyre/pyre-jit/src/jit/assembler.rs:1181`.
+    // Producers: `majit-macros/src/jit_interp/jitcode_lower/`,
+    // `pyre/pyre-jit/src/jit/assembler.rs`.
     m.insert("cond_call_void_pyre/P", BC_COND_CALL_VOID);
     m.insert("cond_call_value_int_pyre/P", BC_COND_CALL_VALUE_INT);
     m.insert("cond_call_value_ref_pyre/P", BC_COND_CALL_VALUE_REF);
@@ -1262,12 +1264,12 @@ pub fn pyre_extension_insns() -> IndexMap<&'static str, u8> {
     // pyre-only `abort/>r` — Ref-result variant of `abort/`.  Emitted by
     // `Assembler::encode_op`'s default branch when an `OpKind::Abort` with
     // `result_kind: Ref` reaches the assembler.  The blackhole-side
-    // handler `handler_abort_result_marker_r` (`blackhole.rs:6042`) is a
+    // handler `handler_abort_result_marker_r` (in `blackhole.rs`) is a
     // no-op that advances past the trailing destination register byte;
     // the abort signal proper goes through `abort/` (`BC_ABORT = 13`).
     m.insert("abort/>r", BC_ABORT_RESULT_R);
     // pyre-only `vtable_method_ptr/rd>i` — emitted by
-    // `OpKind::VtableMethodPtr` (`assembler.rs:2762`).  RPython's dispatch
+    // `OpKind::VtableMethodPtr` (`assembler.rs`'s `encode_op`).  RPython's dispatch
     // resolves dyn-method addresses through `cpu.bh_call_*` at runtime
     // and never needs to reify a method pointer into the bytecode stream;
     // pyre's Rust port hits this only on `dyn Trait` calls, where the

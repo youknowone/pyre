@@ -1818,7 +1818,7 @@ impl<'a> Transformer<'a> {
             // pyre's lighter rtyper leaves the generic `BinOp` in place
             // with one or both operands defaulting to `'r'` kind, so the
             // unconditional `int_<op>` prefix at
-            // `assembler.rs:3160` would emit `int_eq/ir>i` /
+            // `assembler.rs`'s `op_kind_to_opname_with_kinds` would emit `int_eq/ir>i` /
             // `int_le/ri>i` opnames that no RPython blackhole handler
             // registers (see
             // `default_bh_builder_unwired_set_matches_task_85_snapshot`).
@@ -2092,7 +2092,7 @@ impl<'a> Transformer<'a> {
             //
             // Pre-existing optimisation passes
             // (`optimize_call_int_py_mod` /
-            // `optimize_call_int_py_div` at `optimizeopt/rewrite.rs:1788,1848`)
+            // `optimize_call_int_py_div` in `optimizeopt/rewrite.rs`)
             // stay parked for the future route-(b) path: pyre has no
             // Python-bytecode emitter that produces `int.py_mod` /
             // `int.py_div` oopspec calls today, so those passes are
@@ -2101,8 +2101,8 @@ impl<'a> Transformer<'a> {
             // pass is ported on top of the C-trunc helper.
             //
             // Without this rewrite the assembler encoder
-            // (`codewriter/assembler.rs:2778-2789
-            // `format!("int_{op}")``) would emit the bare opname,
+            // (`codewriter/assembler.rs`'s `op_kind_to_opname_with_kinds`
+            // `format!("int_{op}")`) would emit the bare opname,
             // leaking `int_mod/ii>i` / `int_floordiv/ii>i` into
             // `pipeline.insns` where no blackhole handler exists.
             OpKind::BinOp {
@@ -2209,7 +2209,7 @@ impl<'a> Transformer<'a> {
             //      (RPython `op.bool` before the rtyper).
             //   2. The rtyper itself emits `OpKind::UnaryOp { op:
             //      "float_is_true", .. }` from `FloatRepr.rtype_bool`
-            //      (`rfloat.rs:191-198`, mirror of upstream
+            //      (in `rfloat.rs`, mirror of upstream
             //      `rfloat.py:rtype_bool`).
             //
             // Both shapes must be rewritten here.  If neither is
@@ -2218,11 +2218,11 @@ impl<'a> Transformer<'a> {
             // `float_ne` — RPython jtransform.py:1627 collapses both
             // surfaces to the same canonical shape.  Pyre's rewriter
             // does not chain back into `rewrite_operation` the way
-            // upstream does (the loop at `jtransform.rs:446-462`
+            // upstream does (the per-op loop in `optimize_block`
             // consumes `Replace(ops)` without re-dispatch), so emit
             // the canonical `float_ne` opname here rather than
             // leaving an intermediate op for the float-comparison
-            // arm at `jtransform.rs:827-854`.
+            // arm in `rewrite_operation`.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -4820,7 +4820,7 @@ impl<'a> Transformer<'a> {
         // `function_graphs[["PyFrame", "pop_top"]]` entry. The stateless
         // `target_to_call_path` fallback only yields the bare method name,
         // which never matches `CallControl::register_inherent_method`'s
-        // qualified key (`call.rs:941`) and leaves the shell body-less in
+        // qualified key (in `call.rs`) and leaves the shell body-less in
         // `drain_pending_graphs`.
         let jitcode = if let Some(cc) = self.callcontrol.as_mut() {
             let path = cc
@@ -6149,7 +6149,7 @@ impl<'a> Transformer<'a> {
 /// - `Constant(link.llexitcase, lltype.Bool)`: pyre's `link.llexitcase`
 ///   may be `None` pre-rtyper, but the bool branch value is reliably in
 ///   `link.exitcase` as [`ExitCase::Bool`] (the same source
-///   `with_llexitcase_from_exitcase` reads, `model.rs:1244-1252`); the
+///   `with_llexitcase_from_exitcase` reads, in `model.rs`); the
 ///   substituted constant is
 ///   `Constant::with_concretetype(ConstValue::Bool(b), lltype.Bool)`,
 ///   carrying the `lltype.Bool` concretetype upstream stamps.

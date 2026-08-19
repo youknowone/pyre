@@ -19,7 +19,7 @@ use crate::model::ValueType;
 
 /// RPython `SomeValue` lattice projection of the legacy `ValueType`.
 ///
-/// `RPythonTyper.bindingrepr` (`rtyper.rs:961`) dispatches purely on the
+/// `RPythonTyper.bindingrepr` (in `rtyper.rs`) dispatches purely on the
 /// `SomeValue` shape via `rtyper_makekey` / `rtyper_makerepr`.  `Int`
 /// and `Float` resolve cleanly through `rint::IntegerRepr` /
 /// `rfloat::FloatRepr`.
@@ -33,7 +33,7 @@ use crate::model::ValueType;
 /// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` | `model.py:438`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  This fallback projection keeps all Ref variants classdef-less → `GcRef` via `rclass.py:445-447`. |
 /// | `Void`             | `Impossible`           | `model.py:627` -> `SomeValue::Impossible` arm. |
 /// | `State`            | `Instance(SomeInstance{classdef:None,..})` | **TODO: no upstream equivalent**.  Pyre-only `State` carries the JIT state pointer (a struct pointer to interpreter state).  RPython has no analogue; the `SomeInstance(classdef=None)` projection is a temporary fallback that lets the rtyper proceed without a real bookkeeper-attached pyre `ClassDef`.  Projects to `GcRef` via the same chain as `Ref`. |
-/// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs:418`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell — that bridging conflated an *annotation-stage* lattice node with the **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown -> GcRef` resolver-stage backfill. |
+/// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs`'s `binding`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell — that bridging conflated an *annotation-stage* lattice node with the **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown -> GcRef` resolver-stage backfill. |
 ///
 /// Returns `None` only for `ValueType::Unknown`; every other variant
 /// projects to a definite `SomeValue` shell.
@@ -107,7 +107,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // RPython's annotator never produces an unknown lattice
             // node; pyre's `Unknown` is a coverage gap.  Returning
             // `None` leaves `Variable.annotation` empty so the rtyper
-            // panics at `bindingrepr` (annotator/annrpython.rs:418
+            // panics at `bindingrepr` (`annotator/annrpython.rs`'s `binding`,
             // "KeyError: no binding for arg") on the first attempt to
             // lower an Unknown Variable.  This surfaces the producer-
             // side gap rather than silently bridging it to `GcRef` via

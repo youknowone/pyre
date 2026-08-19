@@ -278,8 +278,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "sys.getdefaultencoding", conf);
     // Analyzer keys mirror the `HostObject::new_builtin_callable`
     // qualname that `flowspace/model.rs::bootstrap_std_modules`
-    // assigns ("rarithmetic.intmask" etc.) so the bookkeeper.rs:1913
-    // SomeBuiltin-branch gate matches — keying under the full dotted
+    // assigns ("rarithmetic.intmask" etc.) so the SomeBuiltin-branch gate
+    // in `bookkeeper.rs`'s `immutablevalue_hostobject` matches — keying under the full dotted
     // module path silently routes the value to the
     // extregistry / generic fallback path.  The doc-comment paths in
     // each analyser body still reference upstream `rbuiltin.py:221`
@@ -289,7 +289,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "rarithmetic.longlongmask", rarith_longlongmask);
     // `lltype.cast_pointer` (ann_cast_pointer, lltype.py:970-974) —
     // keyed under the `HostObject::new_builtin_callable` qualname the
-    // lltype HOST_ENV module assigns (`flowspace/model.rs:1795`).
+    // lltype HOST_ENV module assigns (`flowspace/model.rs`'s
+    // `bootstrap_std_modules`).
     analyzer_for(&mut reg, "lltype.cast_pointer", lltype_cast_pointer);
     // `pyre_object::lltype::malloc_typed` — the GC allocation intrinsic.
     // Keyed by the qualname the HOST_ENV `pyre_object.lltype` module assigns
@@ -313,7 +314,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "pyre_object.lltype.malloc_raw", malloc_raw_alloc);
     // Rust `std::ptr::eq(p, q) -> bool` — registered under the dotted
     // qualname that `HostEnv::bootstrap` assigns to the HOST_ENV stub
-    // (`flowspace/model.rs:1910`).  Lowers identity checks in
+    // (`flowspace/model.rs`'s `bootstrap_std_modules`).  Lowers identity
+    // checks in
     // `baseobjspace::is_w` / `baseobjspace::is_`.
     analyzer_for(&mut reg, "std.ptr.eq", std_ptr_eq);
     // Rust `std::ptr::null_mut::<T>()` / `null::<T>()` — the null
@@ -422,7 +424,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // analyzers when the cast surface lands in user code.  Keyed by the
     // `qualname` that
     // `HostObject::new_builtin_callable("lltype.cast_ptr_to_int")`
-    // produces (bookkeeper.rs:1939 reads `obj.qualname()` directly
+    // produces (`bookkeeper.rs`'s `immutablevalue_hostobject` reads
+    // `obj.qualname()` directly
     // for `SomeBuiltin.analyser_name`).
     analyzer_for(&mut reg, "lltype.cast_ptr_to_int", lltype_cast_ptr_to_int);
     analyzer_for(&mut reg, "lltype.cast_int_to_ptr", lltype_cast_int_to_ptr);
@@ -1301,7 +1304,7 @@ pub fn longlong2float_analyzer(
 /// Analyzer for `std::ptr::eq(p1, p2) -> bool` — Rust pointer identity
 /// check.  Registered against the `HostObject::new_builtin_callable
 /// ("std.ptr.eq")` stub published by [`HostEnv::bootstrap`]
-/// (`flowspace/model.rs:1910`) so `baseobjspace::is_w` /
+/// (`flowspace/model.rs`'s `bootstrap_std_modules`) so `baseobjspace::is_w` /
 /// `baseobjspace::is_` (which lower the Python identity check to
 /// `std::ptr::eq(w_one, w_two)`) annotate cleanly.  Mirrors PyPy's
 /// `ptr_eq(p, q)` annotator: pure identity comparison returning
@@ -1320,7 +1323,7 @@ fn std_ptr_eq(
 /// erased-pointer projection keeps pointee classes off the annotation
 /// (`annotation_state.rs` `Ref` table row), so the shell is the
 /// classdef-less `SomeInstance` with `can_be_none=true`: the
-/// `Instance(None) ∪ Instance(cd)` union arm (`model.rs:2863`) keeps
+/// `Instance(None) ∪ Instance(cd)` union arm (`model.rs`'s `union`) keeps
 /// it joinable with any typed receiver while preserving the
 /// nullability bit.
 fn ptr_null_constant(
@@ -1387,7 +1390,7 @@ fn std_mem_align_of(
 /// `SomeAddress`.  That keeps one annotation across both kinds of caller:
 /// the ones that erase a typed pointer, and the ones that pass an
 /// untyped `*mut u8` field straight through.  `SomeInstance` union takes
-/// the classdef-less side as the result (model.rs:3260), so every such
+/// the classdef-less side as the result (`model.rs`'s `union`), so every such
 /// slot merges cleanly.  `args[0]` is the pointer operand.
 ///
 /// The operand's own annotation is not constrained: `cast_ptr_to_adr`
@@ -1435,7 +1438,7 @@ fn pyre_cast_address(
 /// A root the bookkeeper deliberately models as a non-instance value —
 /// a `FixedObjectArray` projected to its `_items` element list, a
 /// `Wtf8Buf` to a byte string (`project_pyre_field_type`,
-/// bookkeeper.rs:2494/2620) — arrives with a `SomeList`/`SomeString`
+/// in `bookkeeper.rs`) — arrives with a `SomeList`/`SomeString`
 /// operand rather than a pointer.  Its access lowers through
 /// `getitem`/byte reads, not a named-field getattr, so the narrow is a
 /// no-op: the operand passes through unchanged, exactly as the erasure
@@ -1480,7 +1483,7 @@ fn pyre_cast_instance(
             // A root the bookkeeper models as a list or string (a
             // `FixedObjectArray` projected to its `_items` element list,
             // a `Wtf8Buf` projected to a byte string —
-            // `project_pyre_field_type`, bookkeeper.rs:2494/2620) reads
+            // `project_pyre_field_type` in `bookkeeper.rs`) reads
             // through `getitem`/byte access, never a named field, so the
             // pointer→instance narrow is a no-op for it: return the
             // operand unchanged when its variant matches the model, the
@@ -1650,7 +1653,7 @@ fn lltype_cast_ptr_to_int(
 /// `rtype_cast_int_to_ptr` recovers the caller-side concrete Ptr
 /// from `hop.r_result.lowleveltype()`.  The constant carrier already
 /// exists (`ConstValue::LowLevelType(Box<LowLevelType>)`, flowspace/
-/// model.rs:1958, supports `LowLevelType::Ptr`); the blocker is the
+/// model.rs, supports `LowLevelType::Ptr`); the blocker is the
 /// frontend not having the concrete Ptr available at `Expr::Cast`
 /// lowering time.  Graduating to the 2-arg form is blocked on
 /// threading the rtyper-side annotation back to the frontend (or a
@@ -1977,7 +1980,8 @@ fn r_dict_helper(
         .map_err(|e| AnnotatorError::new(e.msg))?;
     // upstream splits `SomeDict` / `SomeOrderedDict` classes; the Rust
     // port collapses them into a single `SomeDict` variant per CLAUDE.md
-    // parity rule #1 (see `model.rs:878-880`). `RDictKind` is retained
+    // parity rule #1 (see `model.rs`'s `SomeOrderedDict` alias). `RDictKind`
+    // is retained
     // in the call site to keep the upstream dispatch readable and to
     // ease re-splitting once the lattice grows `SomeOrderedDict`.
     let _ = kind;
@@ -2036,7 +2040,8 @@ pub fn analyze(
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
     // upstream returns `SomeOrderedDict(bk.getdictdef())`; the Rust port
-    // collapses `SomeDict`/`SomeOrderedDict` (see `model.rs:878-880`).
+    // collapses `SomeDict`/`SomeOrderedDict` (see `model.rs`'s
+    // `SomeOrderedDict` alias).
     let dd = bk.getdictdef(false, false, false);
     Ok(SomeValue::Dict(SomeDict::new(dd)))
 }
@@ -2251,8 +2256,8 @@ mod tests {
         // upstream `@analyzer_for(...)` decorations.  Each registry key
         // matches the qualname `HostObject::new_builtin_callable(...)`
         // assigns to its module attribute (see flowspace/model.rs
-        // bootstrap), so bookkeeper.rs:1913 `is_registered(qualname)`
-        // hits.
+        // bootstrap), so `immutablevalue_hostobject`'s
+        // `is_registered(qualname)` hits.
         assert!(is_registered("object.__init__"));
         assert!(is_registered("sys.getdefaultencoding"));
         assert!(is_registered("rarithmetic.intmask"));
@@ -2901,7 +2906,8 @@ mod tests {
     fn host_env_builtin_analyzer_keys_audit() {
         // Survey HOST_ENV-registered builtin callables and flag every
         // one whose qualname is NOT keyed in BUILTIN_ANALYZERS.
-        // bookkeeper.rs:1913 gates the SomeBuiltin branch on
+        // `bookkeeper.rs`'s `immutablevalue_hostobject` gates the SomeBuiltin
+        // branch on
         // `is_registered(obj.qualname())`; a False return silently
         // routes the value to the extregistry / generic fallback path
         // — the analyser is effectively dead code.
@@ -2911,8 +2917,8 @@ mod tests {
             ("rpython.rlib.rarithmetic", "intmask"),
             ("rpython.rlib.rarithmetic", "longlongmask"),
             // `rarithmetic.r_uint` is intentionally absent from
-            // BUILTIN_ANALYZERS — bookkeeper.rs:1913 misses, then
-            // falls through to the extregistry path at line 1960
+            // BUILTIN_ANALYZERS — `immutablevalue_hostobject` misses,
+            // then falls through to its own extregistry path
             // which finds `ExtRegistryEntry::ForType` and returns the
             // SomeBuiltin whose `compute_result_annotation` produces
             // `SomeInteger(unsigned=True, knowntype=Ruint)`.  See
@@ -2944,10 +2950,10 @@ mod tests {
 
     #[test]
     fn lltype_cast_analyzer_lookup_matches_host_qualname() {
-        // F2 followup: verify that the analyser registered for
+        // Verify that the analyser registered for
         // `lltype.cast_ptr_to_int` / `lltype.cast_int_to_ptr` is
-        // discoverable under the exact qualname that bookkeeper.rs:1939
-        // assigns as `SomeBuiltin.analyser_name` (i.e. what
+        // discoverable under the exact qualname that
+        // `immutablevalue_hostobject` assigns as `SomeBuiltin.analyser_name` (i.e. what
         // `call_builtin(analyser_name, ..)` will look up).
         use crate::flowspace::model::HOST_ENV;
         let lltype = HOST_ENV
@@ -2959,7 +2965,7 @@ mod tests {
         let cast_i2p = lltype
             .module_get("cast_int_to_ptr")
             .expect("F1 registered cast_int_to_ptr attr on lltype");
-        // What bookkeeper.rs:1939 will use as analyser_name.
+        // What `immutablevalue_hostobject` will use as analyser_name.
         let q_p2i = cast_p2i.qualname();
         let q_i2p = cast_i2p.qualname();
         assert!(

@@ -51,7 +51,8 @@
 //! pyre has no `_obj` analogue on a Rust function pointer, so the
 //! lookup goes through `CallControl::get_oopspec` — the registry
 //! populated at translation time from `#[oopspec(...)]` attributes
-//! and `lib.rs:707-741` static bindings.  The lookup is the structural
+//! and the static `jit.*` bindings `lib.rs`'s
+//! `analyze_pipeline_from_module_paths` registers.  The lookup is the structural
 //! mirror of upstream's `_obj.<callable>.oopspec` access: same
 //! information, different host vehicle.
 
@@ -98,7 +99,7 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
 /// metadata (`ll_func.oopspec`).  Pyre's `OpKind::Call` does not carry
 /// the funcptr as args[0]; the equivalent metadata lives on
 /// [`CallControl`] under [`CallControl::mark_oopspec`] (the registry
-/// `lib.rs:599` / `:707-741` populates from `#[oopspec(...)]`
+/// `lib.rs`'s `analyze_pipeline_from_module_paths` populates from `#[oopspec(...)]`
 /// attributes and static jit.* bindings).  The lookup goes through
 /// [`CallControl::get_oopspec`] — same information as
 /// `op.args[0].value._obj.oopspec`, different host vehicle.  The spec
@@ -115,7 +116,7 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
 /// Strict-parity port: when `CallControl::get_oopspec_argnames(target)`
 /// returns `Some(argnames)`, invoke the full [`parse_oopspec`] +
 /// [`normalize_opargs`] line-by-line port.  When `None`, fall back to
-/// bare-name extraction + positional forwarding — pyre's `lib.rs:707-741`
+/// bare-name extraction + positional forwarding — pyre's `lib.rs` jit.*
 /// bindings have no `(...)` pattern, so no argname lookup is needed.
 ///
 /// Return type is `Vec<NormalizedArg>` (not `Vec<Variable>`): a slot
@@ -174,7 +175,7 @@ pub fn decode_builtin_call(
             // registered (`CallControl::mark_oopspec_argnames`),
             // invoke the full [`parse_oopspec`] + [`normalize_opargs`]
             // pair.  When no argnames are registered (the dominant
-            // case today — `lib.rs:707-741` bindings are bare dotted
+            // case today — the `lib.rs` jit.* bindings are bare dotted
             // names with no `(...)` pattern, so argname info is not
             // needed), fall back to the bare-name split and forward
             // `args` positionally (wrapped in `NormalizedArg::Pass`).
@@ -327,7 +328,7 @@ pub enum NormalizedArg {
 /// The spec-has-no-`(` case (a structural divergence from upstream's
 /// `.split('(', 1)` which would raise ValueError) returns an empty
 /// `argtuple` with the bare spec as `operation_name`.  This handles
-/// pyre's `lib.rs:707-741` bare-name registrations gracefully.
+/// pyre's `lib.rs` jit.* bare-name registrations gracefully.
 pub fn parse_oopspec(spec: &str, argnames: &[&str]) -> (String, Vec<NormalizeSlot>) {
     // `support.py:707 operation_name, args = ll_func.oopspec.split('(', 1)`
     let (operation_name, args_part) = match spec.split_once('(') {
@@ -1113,7 +1114,7 @@ mod tests {
     #[test]
     fn decode_builtin_call_returns_registered_oopspec_and_positional_args() {
         // `support.py:707 operation_name, args = ll_func.oopspec.split('(', 1)`:
-        // bare-name spec entries (e.g. lib.rs:707-741 jit.* bindings)
+        // bare-name spec entries (e.g. the `lib.rs` jit.* bindings)
         // resolve to the spec value itself, no `(` stripping needed.
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["jit", "isconstant"]);
@@ -1205,7 +1206,7 @@ mod tests {
         // `support.py:707 ll_func.oopspec.split('(', 1)` raises
         // ValueError upstream when there's no `(`.  Pyre's port
         // gracefully handles the bare-name registrations at
-        // `lib.rs:707-741` (`"jit.isconstant"` etc.) by returning an
+        // `lib.rs` (`"jit.isconstant"` etc.) by returning an
         // empty argtuple.
         let (name, argtuple) = super::parse_oopspec("jit.isconstant", &["value"]);
         assert_eq!(name, "jit.isconstant");
