@@ -155,13 +155,17 @@ mod simplequeue_methods {
         }
 
         /// `block` and `timeout` are accepted and ignored: the queue is
-        /// unbounded, so a put never blocks.
+        /// unbounded, so a put never blocks.  They are named without a leading
+        /// underscore because the keyword a caller may bind is taken from the
+        /// parameter's own identifier, and `put(item, block=True,
+        /// timeout=None)` is the signature.
         fn put(
             &self,
             item: PyObjectRef,
-            #[default(true)] _block: bool,
-            #[default(w_none())] _timeout: PyObjectRef,
+            #[default(true)] block: bool,
+            #[default(w_none())] timeout: PyObjectRef,
         ) -> PyObjectRef {
+            let _ = (block, timeout);
             simplequeue_put(self, item)
         }
 
