@@ -7962,23 +7962,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     Some(w) => crate::baseobjspace::is_true(w)?,
                     None => true,
                 };
-                // `linkat` is reached only for what plain `link` cannot say:
-                // a name to resolve against a descriptor, or a source symlink
-                // to link rather than follow.
-                let ret = if src_dir_fd != libc::AT_FDCWD || dst_dir_fd != libc::AT_FDCWD || !follow
-                {
-                    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
-                    unsafe {
-                        libc::linkat(
-                            src_dir_fd,
-                            c_src.as_ptr(),
-                            dst_dir_fd,
-                            c_dst.as_ptr(),
-                            flags,
-                        )
-                    }
-                } else {
-                    unsafe { libc::link(c_src.as_ptr(), c_dst.as_ptr()) }
+                // Whether plain `link` follows a source symlink is left to the
+                // implementation and the hosts disagree, so both answers are
+                // spelled out through `linkat` rather than taken from it.
+                let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+                let ret = unsafe {
+                    libc::linkat(
+                        src_dir_fd,
+                        c_src.as_ptr(),
+                        dst_dir_fd,
+                        c_dst.as_ptr(),
+                        flags,
+                    )
                 };
                 if ret < 0 {
                     return Err(fs_err_with_filename2(
