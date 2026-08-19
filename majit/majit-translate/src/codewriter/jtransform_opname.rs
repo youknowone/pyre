@@ -918,6 +918,87 @@ mod tests {
         assert_eq!(jitcode.try_index(), Some(0));
     }
 
+    /// `ll_bool(builder)` drains end-to-end with NO struct layout registered:
+    /// its only opname is `ptr_ne(builder, NULL)`, which lowers to the unary
+    /// `ptr_nonzero` and assembles to an `int_is_true`-family bytecode with no
+    /// field/size descr — so the builder container never needs a layout.  This
+    /// is the layer-2 floor: the simplest builder accessor commits a body
+    /// without any layer-2a registration.
+    #[test]
+    fn ll_bool_drains_without_a_struct_layout() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
+        use crate::parse::CallPath;
+
+        let helper = build_ll_bool_helper_graph("ll_bool", STRINGBUILDERPTR.clone())
+            .expect("build_ll_bool_helper_graph");
+        let flow = std::rc::Rc::try_unwrap(helper.graph)
+            .expect("sole owner of the ll_bool helper graph")
+            .into_inner();
+        let path = CallPath::from_segments(["ll_bool"]);
+
+        let mut callcontrol = CallControl::new();
+        let jitcode = callcontrol.register_opname_helper_graph(path, flow);
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+
+        let body = jitcode
+            .try_body()
+            .expect("ll_bool drains to a jitcode body");
+        assert!(!body.code.is_empty(), "assembled bytecode is non-empty");
+    }
+
+    /// `ll_getlength(builder)`'s three `getfield`s become `getfield_gc_i`
+    /// bytecodes whose FieldDescr the assembler resolves through
+    /// `CallControl.struct_fields`; with the synthetic STRINGBUILDER layout
+    /// registered (mirroring the resizable `"list"` header registration), the
+    /// getfield-bearing graph survives the regalloc/flatten/assemble tail and
+    /// commits a body.  This test proves survival-through-assembly, not the
+    /// resolved offsets themselves — the offsets (buf@0/pos@8/end@16/total@24/
+    /// pieces@32) are verified directly against `fielddescrof` in
+    /// `call::tests::rtyper_synthesised_stringbuilder_struct_resolves_its_field_descrs`.
+    /// (`fielddescrof` falls back to slot 0 rather than panicking when the
+    /// owner is unregistered, so a body-nonempty assertion alone cannot
+    /// discriminate the layout — that is the descr test's job.)
+    #[test]
+    fn ll_getlength_drains_with_the_stringbuilder_layout() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jtransform::GraphTransformConfig;
+        use crate::parse::CallPath;
+
+        let helper = build_ll_getlength_helper_graph("ll_getlength", STRINGBUILDERPTR.clone())
+            .expect("build_ll_getlength_helper_graph");
+        let flow = std::rc::Rc::try_unwrap(helper.graph)
+            .expect("sole owner of the ll_getlength helper graph")
+            .into_inner();
+        let path = CallPath::from_segments(["ll_getlength"]);
+
+        let mut callcontrol = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            "stringbuilder".to_string(),
+            vec![
+                ("current_buf".to_string(), "&()".to_string()),
+                ("current_pos".to_string(), "i64".to_string()),
+                ("current_end".to_string(), "i64".to_string()),
+                ("total_size".to_string(), "i64".to_string()),
+                ("extra_pieces".to_string(), "&()".to_string()),
+            ],
+        );
+        callcontrol.set_struct_fields(registry);
+
+        let jitcode = callcontrol.register_opname_helper_graph(path, flow);
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut callcontrol, &GraphTransformConfig::default());
+
+        let body = jitcode
+            .try_body()
+            .expect("ll_getlength drains to a jitcode body");
+        assert!(!body.code.is_empty(), "assembled bytecode is non-empty");
+    }
+
     /// A `direct_call` to a registered opname helper must resolve as a
     /// *regular* callee (it owns a generated JitCode), not a residual call to
     /// a synthetic low-level helper.  Pre-fix the helper was visible only in
