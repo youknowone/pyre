@@ -555,17 +555,28 @@ fn sched_param_seq_type() -> PyObjectRef {
         pyre_object::gc_roots::pin_root(new_descr);
         let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let reduce = crate::make_builtin_function_with_arity("__reduce__", sched_param_reduce, 1);
+        pyre_object::gc_roots::pin_root(reduce);
+        let reduce_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
         unsafe {
-            let ty = pyre_object::gc_roots::shadow_stack_get(ty_slot);
-            let ns = pyre_object::w_type_get_dict_ptr(ty) as PyObjectRef;
+            // A store can resize the namespace and collect, which moves the
+            // type and the function objects, so every one of them is read back
+            // out of its slot and `ns` is re-derived per store.
+            let ns = || {
+                pyre_object::w_type_get_dict_ptr(pyre_object::gc_roots::shadow_stack_get(ty_slot))
+                    as PyObjectRef
+            };
             pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
+                ns(),
                 "__new__",
                 pyre_object::gc_roots::shadow_stack_get(new_slot),
             );
-            pyre_object::w_dict_setitem_str_no_proxy(ns, "__reduce__", reduce);
-            crate::baseobjspace::mutated(ty, None);
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns(),
+                "__reduce__",
+                pyre_object::gc_roots::shadow_stack_get(reduce_slot),
+            );
+            crate::baseobjspace::mutated(pyre_object::gc_roots::shadow_stack_get(ty_slot), None);
             pyre_object::gc_roots::shadow_stack_get(ty_slot) as usize
         }
     }) as PyObjectRef
@@ -591,8 +602,19 @@ fn sched_param_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let cls = unsafe { (*inst).w_class };
     let priority =
         unsafe { pyre_object::w_tuple_getitem(inst, 0) }.unwrap_or_else(pyre_object::w_none);
-    let inner = pyre_object::w_tuple_new(vec![priority]);
-    Ok(pyre_object::w_tuple_new(vec![cls, inner]))
+    // Both tuple allocations can collect, so the class and the element are
+    // published first and each one is read back out of its slot at the point
+    // it is stored.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(cls);
+    pyre_object::gc_roots::pin_root(priority);
+    let inner = pyre_object::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(base + 1)]);
+    pyre_object::gc_roots::pin_root(inner);
+    Ok(pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+    ]))
 }
 
 /// The `w_param` argument `sched_setparam` and `sched_setscheduler` share.
@@ -1823,8 +1845,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
         fn device_value_w(value: PyObjectRef) -> Result<libc::dev_t, crate::PyError> {
             let indexed = crate::baseobjspace::space_index(value)?;
+            // Reading the sentinel must not be fallible: a device number above
+            // `i64::MAX` has no machine-word form, so propagating `int_w`'s
+            // overflow here would refuse a value `uint_w` below accepts.
             #[cfg(all(target_os = "linux", not(target_env = "musl")))]
-            if crate::baseobjspace::int_w(indexed)? == -1 {
+            if matches!(crate::baseobjspace::int_w(indexed), Ok(-1)) {
                 return Ok(-1i64 as libc::dev_t);
             }
             let value = crate::baseobjspace::uint_w(indexed)?;
@@ -6096,7 +6121,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if filled < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            unsafe { groups.set_len(filled as usize) };
+            // A `gidsetsize` of 0 asks for the count instead of the list, so
+            // a process that was in no groups at the first call and is in
+            // some by the second gets back a count with nothing written.
+            let filled = (filled as usize).min(groups.capacity());
+            unsafe { groups.set_len(filled) };
             Ok(groups)
         }
 
@@ -9148,7 +9177,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // payload: the caller controls the tuple's contents, and an
                 // `int` subclass or a plain non-int would otherwise be
                 // reinterpreted as a descriptor, flag set or mode.
-                let field = |entry: PyObjectRef, index: i64| -> Result<i32, crate::PyError> {
+                //
+                // That conversion reaches `__index__`, and an OPEN path reaches
+                // `__fspath__`, so reading one field can collect and move the
+                // entries not yet read. The sequence is published once and each
+                // entry read back out of its slot at every use, the way
+                // `collect_cstring_seq` above does.
+                let field = |slot: usize, index: i64| -> Result<i32, crate::PyError> {
+                    let entry = pyre_object::gc_roots::shadow_stack_get(slot);
                     let value =
                         unsafe { pyre_object::w_tuple_getitem(entry, index) }.ok_or_else(|| {
                             crate::PyError::type_error(
@@ -9157,8 +9193,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         })?;
                     crate::baseobjspace::c_int_w(value)
                 };
+                let _seq_roots = pyre_object::gc_roots::push_roots();
+                let items_base = pyre_object::gc_roots::pin_roots(&items);
                 let mut out = Vec::with_capacity(items.len());
-                for entry in items {
+                for offset in 0..items.len() {
+                    let slot = items_base + offset;
+                    let entry = pyre_object::gc_roots::shadow_stack_get(slot);
                     let tlen = if unsafe { pyre_object::is_tuple(entry) } {
                         unsafe { pyre_object::w_tuple_len(entry) }
                     } else {
@@ -9171,7 +9211,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "Each file_actions element must be a non-empty tuple",
                         ));
                     }
-                    let op = field(entry, 0)?;
+                    let op = field(slot, 0)?;
                     match op {
                         0 => {
                             // POSIX_SPAWN_OPEN: (op, fd, path, flags, mode)
@@ -9180,17 +9220,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                     "A open file_action tuple must have 5 elements",
                                 ));
                             }
-                            let fd = field(entry, 1)?;
-                            let path_obj =
-                                unsafe { pyre_object::w_tuple_getitem(entry, 2).unwrap() };
+                            let fd = field(slot, 1)?;
+                            let path_obj = unsafe {
+                                pyre_object::w_tuple_getitem(
+                                    pyre_object::gc_roots::shadow_stack_get(slot),
+                                    2,
+                                )
+                                .unwrap()
+                            };
                             let path = extract_path(path_obj)?;
                             let cpath = std::ffi::CString::new(path).map_err(|_| {
                                 crate::PyError::value_error(
                                     "posix_spawn: embedded null in OPEN path",
                                 )
                             })?;
-                            let oflag = field(entry, 3)?;
-                            let mode = field(entry, 4)? as u32;
+                            let oflag = field(slot, 3)?;
+                            let mode = field(slot, 4)? as u32;
                             out.push(PosixSpawnFileAction::Open {
                                 fd,
                                 path: cpath,
@@ -9205,7 +9250,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                     "A close file_action tuple must have 2 elements",
                                 ));
                             }
-                            let fd = field(entry, 1)?;
+                            let fd = field(slot, 1)?;
                             out.push(PosixSpawnFileAction::Close { fd });
                         }
                         2 => {
@@ -9215,8 +9260,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                     "A dup2 file_action tuple must have 3 elements",
                                 ));
                             }
-                            let fd = field(entry, 1)?;
-                            let newfd = field(entry, 2)?;
+                            let fd = field(slot, 1)?;
+                            let newfd = field(slot, 2)?;
                             out.push(PosixSpawnFileAction::Dup2 { fd, newfd });
                         }
                         _ => {
@@ -9453,7 +9498,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 config: LocalPosixSpawnConfig<'_>,
             ) -> std::io::Result<libc::pid_t> {
                 let mut actions = build_spawn_file_actions(config.file_actions)?;
-                let mut attrs = build_spawn_attrs(&config)?;
+                // `actions` is initialized C state, not a Rust value a drop
+                // reclaims, so a later failure has to destroy it explicitly.
+                let mut attrs = match build_spawn_attrs(&config) {
+                    Ok(attrs) => attrs,
+                    Err(error) => {
+                        if let Some(actions) = actions.as_mut() {
+                            unsafe { libc::posix_spawn_file_actions_destroy(actions) };
+                        }
+                        return Err(error);
+                    }
+                };
                 let mut argv: Vec<*mut libc::c_char> = config
                     .args
                     .iter()
