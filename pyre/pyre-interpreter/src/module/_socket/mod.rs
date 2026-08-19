@@ -10,6 +10,6 @@
 //! nothing that would need a descriptor behind it.
 
 #[cfg(any(unix, windows))]
-mod rsocket_rffi;
+pub(crate) mod rsocket_rffi;
 
 crate::pyre_module_init!(interp_socket);

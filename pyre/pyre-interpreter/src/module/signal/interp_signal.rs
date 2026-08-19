@@ -643,7 +643,50 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         )));
                     }
                 }
-                #[cfg(not(unix))]
+                // `getsockopt` is how the descriptor is asked whether it is
+                // a socket (`signal_set_wakeup_fd_impl`).  WinSock answers
+                // every call with `WSANOTINITIALISED` until `WSAStartup` has
+                // run, which is why the import of `_socket` there is not just
+                // for the constants.
+                #[cfg(all(windows, not(feature = "sandbox")))]
+                {
+                    use crate::module::_socket::rsocket_rffi as rffi;
+                    rffi::init();
+                    let mut error: libc::c_int = 0;
+                    let mut len = size_of_val(&error) as rffi::SockLen;
+                    let queried = unsafe {
+                        rffi::getsockopt(
+                            rffi::socket_from_i64(i64::from(fd)),
+                            rffi::SOL_SOCKET,
+                            rffi::SO_ERROR,
+                            (&raw mut error).cast(),
+                            &raw mut len,
+                        )
+                    };
+                    if queried != 0 {
+                        let code = rffi::last_error_code();
+                        // `WSAENOTSOCK` is the descriptor answering that it
+                        // is not a socket, which is not a refusal: a file
+                        // descriptor is taken as well, and `_Py_fstat` is
+                        // what answers for that one — an unopened number
+                        // has no handle behind it.  A descriptor is always
+                        // blocking here, so there is nothing else to check.
+                        if code != rffi::WSAENOTSOCK {
+                            return Err(crate::PyError::os_error_win32_syscall2(
+                                code,
+                                pyre_object::PY_NULL,
+                                pyre_object::PY_NULL,
+                            ));
+                        }
+                        if crate::builtins::crt_call!(libc::get_osfhandle(fd)) == -1 {
+                            return Err(crate::PyError::os_error_syscall(
+                                libc::EBADF,
+                                pyre_object::PY_NULL,
+                            ));
+                        }
+                    }
+                }
+                #[cfg(all(not(unix), any(not(windows), feature = "sandbox")))]
                 if fd < -1 {
                     return Err(crate::PyError::value_error(
                         "set_wakeup_fd(): fd must be -1 or a valid file descriptor",

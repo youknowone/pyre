@@ -97,6 +97,9 @@ pub const SOL_SOCKET: libc::c_int = ws::SOL_SOCKET;
 pub const SO_TYPE: libc::c_int = ws::SO_TYPE;
 #[cfg(windows)]
 pub const SO_ERROR: libc::c_int = ws::SO_ERROR;
+/// The code a call about a descriptor that is not a socket comes back with.
+#[cfg(windows)]
+pub const WSAENOTSOCK: i32 = ws::WSAENOTSOCK;
 /// The code an expired wait reports, so a timeout this module times itself
 /// reads back the same as one the host produced.
 #[cfg(windows)]
