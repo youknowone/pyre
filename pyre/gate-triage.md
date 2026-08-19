@@ -917,11 +917,15 @@ longer re-enters the invalidated loop). So the reader and its OFF path are
 deleted and all three baselines re-recorded, which is what leaves pyre running
 `shortpreamble.py:272-281` the way upstream does.
 
-Read the wasm leg only off a run that rebuilt the module. The first gate-on
-sweep reported `wasm 424/424` and it meant nothing: setting the env var
-changes no source, so cargo reused the module built without the arm. The
-numbers above come from the run after the reader was deleted, where the wasm
-module was rebuilt and landed on the same delta as the other two.
+An env-gated experiment cannot reach the wasm guest at all. The first gate-on
+sweep reported `wasm 424/424` and it meant nothing: the module is built for
+`wasm32-unknown-unknown`, whose `std::env` is permanently empty, so the
+guest-side `var_os` that read this gate returned `None` no matter what the
+host set. `pyre-wasm-runner warn_inert_guest_env` names every such variable on
+stderr for exactly this reason, and `check.py` shows a run's stderr only when
+it fails — so a green sweep is where the warning goes unread. The wasm numbers
+above come from the run after the reader was deleted, which is the first one
+in which that backend executed the arm.
 
 ## §6 — The 66 gates the audits never listed (2026-08-07)
 
