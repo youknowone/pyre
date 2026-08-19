@@ -2703,7 +2703,12 @@ pub fn build_wasm_module(
         )));
     }
 
-    let entry_param_count = 1 + bridge_entry_arity.unwrap_or(0) as u32;
+    let label_param_entry = has_label_param_entry(inputargs, ops, *frame, *bridge_entry_arity);
+    let entry_param_count = 1 + if label_param_entry {
+        crate::FROZEN_LABEL_PARAM_ARITY
+    } else {
+        bridge_entry_arity.unwrap_or(0)
+    } as u32;
     if let Some(arity) = bridge_entry_arity
         && *arity != inputargs.len()
     {
@@ -2852,6 +2857,20 @@ pub fn build_wasm_module(
         );
         idx
     });
+    let label_param_entry_type_idx = label_param_entry.then(|| {
+        let idx = next_type_idx;
+        next_type_idx += 1;
+        types.ty().function(
+            std::iter::once(ValType::I32)
+                .chain(std::iter::repeat_n(
+                    ValType::I64,
+                    crate::FROZEN_LABEL_PARAM_ARITY,
+                ))
+                .collect::<Vec<_>>(),
+            vec![ValType::I32],
+        );
+        idx
+    });
     let mut bridge_param_type_indices = indexmap::IndexMap::new();
     if let (Some(arity), Some(idx)) = (*bridge_entry_arity, bridge_entry_type_idx) {
         bridge_param_type_indices.insert(arity, idx);
@@ -2970,7 +2989,12 @@ pub fn build_wasm_module(
 
     // Function section
     let mut functions = FunctionSection::new();
-    functions.function(bridge_entry_type_idx.unwrap_or(0));
+    if let Some(idx) = label_param_entry_type_idx {
+        functions.function(0);
+        functions.function(idx);
+    } else {
+        functions.function(bridge_entry_type_idx.unwrap_or(0));
+    }
     module.section(&functions);
 
     // Only armed modules carry this global. The runner reads it after
@@ -2993,6 +3017,9 @@ pub fn build_wasm_module(
     let trace_func_idx = if needs_call { 1 } else { 0 };
     let mut exports = ExportSection::new();
     exports.export("trace", ExportKind::Func, trace_func_idx);
+    if label_param_entry {
+        exports.export("trace_wide", ExportKind::Func, trace_func_idx + 1);
+    }
     if trace_entry_census.is_some() {
         exports.export("trace_entry_census_id", ExportKind::Global, 0);
     }
@@ -3036,11 +3063,33 @@ pub fn build_wasm_module(
         ca.clone(),
         ca_helper_type_idx,
         *trace_entry_census,
+        label_param_entry,
     )?;
+    if label_param_entry {
+        codes.function(&build_label_param_shim(trace_func_idx + 1));
+    }
     codes.function(&func);
     module.section(&codes);
 
     Ok((module.finish(), guards, num_ref_homes))
+}
+
+fn build_label_param_shim(wide_func_idx: u32) -> Function {
+    let mut func = Function::new(Vec::new());
+    let mut raw_sink = func.instructions();
+    let mut sink = PeepSink::new(&mut raw_sink);
+
+    sink.local_get(0);
+    for k in 0..crate::FROZEN_LABEL_PARAM_ARITY {
+        sink.local_get(0);
+        sink.i64_load(mem64(FRAME_SLOT_BASE + k as u64 * SLOT_SIZE));
+    }
+    sink.return_call(wide_func_idx);
+    sink.end();
+    sink.flush();
+    drop(sink);
+
+    func
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3098,6 +3147,7 @@ fn build_function(
     // `ca.deopt_helper_slot` for a deopted callee.
     ca_helper_type_idx: u32,
     trace_entry_census: Option<crate::TraceEntryCensusStorage>,
+    label_param_entry: bool,
 ) -> Result<Function, BackendError> {
     // The CA arm requires residual types (the setup above forces arity >= 2
     // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
@@ -3397,7 +3447,7 @@ fn build_function(
     // resume loader sets the live label-arg homes.
     for (k, ia) in entry_inputargs.iter().enumerate() {
         let local_idx = value_types.local(ia.index);
-        if bridge_entry_arity.is_some() {
+        if bridge_entry_arity.is_some() || label_param_entry {
             // Parameter entries carry raw i64 words after frame_ptr. Float
             // values use their IEEE bit pattern, matching the guard boundary.
             sink.local_get(k as u32 + 1);
@@ -3467,8 +3517,12 @@ fn build_function(
             // homes, mirroring the JUMP's ref-home refresh below. The
             // fall-through path skipped this via the `br 1` above.
             for (i, la) in all_label_args[labels_passed].iter().enumerate() {
-                sink.local_get(0);
-                sink.i64_load(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                if label_param_entry {
+                    sink.local_get(i as u32 + 1);
+                } else {
+                    sink.local_get(0);
+                    sink.i64_load(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                }
                 if value_types.ty(la.raw()) == ValType::F64 {
                     sink.f64_reinterpret_i64();
                 }
@@ -6416,6 +6470,25 @@ pub fn label_arg_counts(ops: &[Op]) -> Vec<usize> {
         .filter(|op| op.opcode == OpCode::Label)
         .map(|op| op.getarglist().len())
         .collect()
+}
+
+pub fn has_label_param_entry(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    frame: FrameGeometry,
+    bridge_entry_arity: Option<usize>,
+) -> bool {
+    if bridge_entry_arity.is_some() || !is_resumable_peeled(ops) {
+        return false;
+    }
+    let resumable = resumable_label_count(ops);
+    let labels_fit = label_arg_counts(ops)
+        .into_iter()
+        .take(resumable)
+        .all(|arity| arity <= crate::FROZEN_LABEL_PARAM_ARITY);
+    labels_fit
+        && inputargs.len() <= crate::FROZEN_LABEL_PARAM_ARITY
+        && frame.value_slots >= crate::FROZEN_LABEL_PARAM_ARITY
 }
 
 /// Per-label `(resume_safe, requires_own_frame)` metadata in ordinal order.

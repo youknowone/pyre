@@ -509,6 +509,11 @@ fn build_module_default(
     )
 }
 
+/// Locals of the module's FIRST code entry.
+///
+/// A trace that emits a label-parameter entry puts the narrow shim first and
+/// the real body second, and the shim declares no locals. Use this only for
+/// shapes `has_label_param_entry` rejects, or it reports the shim's zero.
 fn emitted_local_count(bytes: &[u8]) -> u32 {
     wasmparser::Parser::new(0)
         .parse_all(bytes)
@@ -523,6 +528,43 @@ fn emitted_local_count(bytes: &[u8]) -> u32 {
             _ => None,
         })
         .expect("generated module must contain its trace function")
+}
+
+/// `(type arities, defined-function type indices, exported name -> func index)`.
+///
+/// Each type is reduced to `(params, results)` because that is all the entry
+/// shape assertions need, and it keeps them readable next to the wasm text.
+fn module_shape(bytes: &[u8]) -> (Vec<(usize, usize)>, Vec<u32>, HashMap<String, u32>) {
+    let mut types = Vec::new();
+    let mut functions = Vec::new();
+    let mut exports = HashMap::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload.unwrap() {
+            wasmparser::Payload::TypeSection(reader) => {
+                for group in reader {
+                    for ty in group.unwrap().into_types() {
+                        let func = ty.unwrap_func();
+                        types.push((func.params().len(), func.results().len()));
+                    }
+                }
+            }
+            wasmparser::Payload::FunctionSection(reader) => {
+                for idx in reader {
+                    functions.push(idx.unwrap());
+                }
+            }
+            wasmparser::Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.unwrap();
+                    if export.kind == wasmparser::ExternalKind::Func {
+                        exports.insert(export.name.to_string(), export.index);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (types, functions, exports)
 }
 
 #[test]
@@ -2853,6 +2895,74 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(!guards[0].is_finish);
+}
+
+/// A resumable-peeled loop within the fixed arity emits two functions: the
+/// narrow `trace` shim the host and CALL_ASSEMBLER keep entering, and the
+/// `trace_wide` body a loop-closing JUMP can pass its arguments to.
+///
+/// `trace` must stay structurally `(i32) -> i32`: a loop's table slot is also
+/// what the CALL_ASSEMBLER path calls as type 0, so widening it in place would
+/// turn every such call into a trap rather than a decline.
+#[test]
+fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let const_1 = OpRef::const_int(1);
+    let const_100 = OpRef::const_int(100);
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(1),
+        ),
+        Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), const_1],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(2), const_100],
+            OpRef::int_op(3),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(3)], &[OpRef::int_op(2)]),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
+    ];
+
+    let frame = codegen::FrameGeometry::fixed();
+    assert!(
+        codegen::has_label_param_entry(&inputargs, &ops, frame, None),
+        "this shape is the one the wide entry exists for; if the gate stops \
+         accepting it the rest of these assertions prove nothing"
+    );
+
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+
+    let (types, functions, exports) = module_shape(&bytes);
+    let narrow = exports.get("trace").copied().expect("narrow entry export");
+    let wide = exports
+        .get("trace_wide")
+        .copied()
+        .expect("wide entry export");
+    assert_eq!(wide, narrow + 1, "the wide entry follows the shim");
+
+    // Exports index the whole function space, imports first; the type section
+    // is indexed by defined function only.
+    let imported = narrow;
+    assert_eq!(
+        types[functions[(narrow - imported) as usize] as usize],
+        (1, 1),
+        "trace must stay (i32) -> i32"
+    );
+    assert_eq!(
+        types[functions[(wide - imported) as usize] as usize],
+        (1 + majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY, 1),
+        "trace_wide takes frame_ptr plus one word per fixed label parameter"
+    );
 }
 
 #[test]

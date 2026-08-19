@@ -420,6 +420,12 @@ fn diag_bump(i: usize) {
 const FROZEN_CHAIN_VALUE_SLOTS: usize = 64;
 const FROZEN_CHAIN_REF_HOMES: usize = 128;
 const FROZEN_CHAIN_LABEL_REF_SLOTS: usize = 2;
+/// Words a label-parameter entry accepts after `frame_ptr`. One value for
+/// every such entry in the process: a loop-closing JUMP reaches its target
+/// with `return_call_indirect` on the shared table, and that type-checks the
+/// callee against the *calling* module's type index, so two modules cannot
+/// each pick their own width.
+pub const FROZEN_LABEL_PARAM_ARITY: usize = 16;
 
 /// An op whose result advances loop-carried state. A value produced inside the
 /// re-running region by arithmetic or by a heap load is fresh on each pass, so
@@ -580,6 +586,18 @@ fn stamp_and_publish_label_targets(
     // trace remainder.
     let label_num_args = codegen::label_arg_counts(ops);
     let label_resume_info = codegen::label_resume_info(inputargs, ops, frame);
+    // The wide entry occupies the slot the host appended right after this
+    // module's narrow one, so it exists only once a handle does. Where
+    // `func_handle` is 0 — a native build, which has no host at all —
+    // `func_handle + 1` would name slot 1, another trace's entry rather than
+    // an absent one, so both fields share the 0-means-absent encoding.
+    let wide_slot = if func_handle != 0
+        && codegen::has_label_param_entry(inputargs, ops, frame, bridge_entry_arity)
+    {
+        func_handle + 1
+    } else {
+        0
+    };
     let mut published_descrs = Vec::new();
     // A parameter entry with no fail values remains structurally `(i32) ->
     // i32`, so type-0 indirect calls may enter it. Only a nonzero parameter
@@ -612,6 +630,7 @@ fn stamp_and_publish_label_targets(
                     id,
                     LabelTarget {
                         func_handle,
+                        wide_slot,
                         key: j as u32 + 1,
                         num_args: label_num_args[j],
                         resume_safe: label_resume_info[j].0,
@@ -652,6 +671,7 @@ fn stamp_and_publish_label_targets(
                 id,
                 LabelTarget {
                     func_handle,
+                    wide_slot,
                     key: 0,
                     num_args: inputargs.len(),
                     resume_safe: true,

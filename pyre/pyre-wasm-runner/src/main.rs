@@ -1656,7 +1656,7 @@ fn jit_compile_trace(
     caller: &mut Caller<'_, Host>,
     bytes_ptr: u32,
     bytes_len: u32,
-) -> Result<(Table, Func)> {
+) -> Result<(Table, Func, Option<Func>)> {
     caller.data_mut().jit_compile_count += 1;
     let memory = caller
         .data()
@@ -1745,18 +1745,25 @@ fn jit_compile_trace(
     let trace = instance
         .get_func(&mut *caller, "trace")
         .context("trace module is missing its `trace` export")?;
+    let trace_wide = instance.get_func(&mut *caller, "trace_wide");
 
-    Ok((table, trace))
+    Ok((table, trace, trace_wide))
 }
 
 /// Compile and instantiate a trace, then append its export to the trace table.
 fn jit_compile(caller: &mut Caller<'_, Host>, bytes_ptr: u32, bytes_len: u32) -> Result<u32> {
-    let (table, trace) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
+    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
     // Register the trace into the shared indirect function table so it is
     // reachable by table index. `grow` returns the newly appended slot.
+    let entries = if trace_wide.is_some() { 2 } else { 1 };
     let slot = table
-        .grow(&mut *caller, 1, Ref::Func(Some(trace)))
+        .grow(&mut *caller, entries, Ref::Func(Some(trace)))
         .context("register trace into shared table")? as u32;
+    if let Some(wide) = trace_wide {
+        table
+            .set(&mut *caller, slot as u64 + 1, Ref::Func(Some(wide)))
+            .context("register wide trace entry into shared table")?;
+    }
     Ok(slot)
 }
 
@@ -1772,7 +1779,7 @@ fn jit_replace(
             "jit_replace_wasm: id {func_id} is not a trace slot"
         )));
     }
-    let (table, trace) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
+    let (table, trace, trace_wide) = jit_compile_trace(caller, bytes_ptr, bytes_len)?;
     if !matches!(
         table.get(&mut *caller, func_id as u64),
         Some(Ref::Func(Some(_)))
@@ -1787,6 +1794,11 @@ fn jit_replace(
     table
         .set(&mut *caller, func_id as u64, Ref::Func(Some(trace)))
         .context("replace trace in shared table")?;
+    if let Some(wide) = trace_wide {
+        table
+            .set(&mut *caller, func_id as u64 + 1, Ref::Func(Some(wide)))
+            .context("replace wide trace entry in shared table")?;
+    }
     Ok(func_id)
 }
 

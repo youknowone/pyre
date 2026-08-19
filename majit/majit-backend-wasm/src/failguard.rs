@@ -324,6 +324,8 @@ mod tests {
 pub struct LabelTarget {
     /// Table slot of the owning loop's compiled function.
     pub func_handle: u32,
+    /// Table slot of the fixed-arity label-parameter entry, or 0 when absent.
+    pub wide_slot: u32,
     /// Resume dispatch key (`label ordinal + 1`) the bridge's JUMP writes.
     pub key: u32,
     /// The label's arg count — the resume loader reads exactly this many
