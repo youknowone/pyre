@@ -3587,8 +3587,11 @@ impl Optimizer {
                 }
                 // Publish the preview's one evaluation as a single object: the
                 // forcing above (and its side effects) stays exactly where it
-                // is, only the publication is grouped, so the three vectors can
-                // no longer drift out of alignment.
+                // is, only the publication is grouped, so a reader can no
+                // longer see one vector from this evaluation next to another
+                // that was never written.  Alignment is narrower than that —
+                // `short_inputargs` / `short_inputarg_refs` share an index
+                // space, `short_boxes_exported` does not.
                 ctx.preview_short_state = Some(crate::optimizeopt::PreviewShortState {
                     short_inputargs,
                     short_inputarg_refs,

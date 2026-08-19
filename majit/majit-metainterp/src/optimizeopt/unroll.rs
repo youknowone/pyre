@@ -6164,6 +6164,17 @@ mod tests {
         short_inputarg_refs: Vec<majit_ir::InputArgRc>,
         short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
     ) {
+        // The production publisher gets this for free from
+        // `create_short_inputarg_refs`, which carries its own `debug_assert_eq!`
+        // against `self.short_inputargs`.  A fixture builds the two vectors by
+        // hand, so restate it here: a refs vector shorter than `short_inputargs`
+        // under-roots, and the unrooted renamed `InputArg`'s `Weak` then fails
+        // to upgrade past the peel boundary — silently, with no assert between.
+        debug_assert_eq!(
+            short_inputarg_refs.len(),
+            short_inputargs.len(),
+            "short_inputarg_refs must root every short_inputargs entry",
+        );
         ctx.preview_short_state = Some(crate::optimizeopt::PreviewShortState {
             short_inputargs,
             short_inputarg_refs,

@@ -551,8 +551,14 @@ fn describe_operand_for_assert(b: &Operand) -> String {
 /// Box forwarding, and a second, Rust-only recomputation at the export site is
 /// observably different.
 ///
-/// The whole struct is published at one site, so the three vectors below are
-/// always built together and index-aligned by construction.
+/// The whole struct is published at one site, so the vectors below are always
+/// built together from one evaluation of the preview.  That makes them mutually
+/// consistent — it does NOT make all three index-aligned: only
+/// `short_inputargs` and `short_inputarg_refs` share an index space (one entry
+/// per `add_short_input_arg`).  `short_boxes` is a different population
+/// entirely — the surviving *produced* short ops, after the export site drops
+/// every one whose result folded to a `Const` — so its length is unrelated and
+/// `short_boxes[i]` pairs with nothing.
 pub struct PreviewShortState {
     /// unroll.py:480 `short_inputargs = sb.create_short_inputargs(label_args
     /// + virtuals)` — the ShortBoxes-stored renamed inputarg positions
