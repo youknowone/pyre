@@ -1464,6 +1464,10 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
     // may still start threads; reject new starts only when module/finalizer
     // teardown is actually about to begin.
     pyre_interpreter::module::thread::set_finalizing();
+    // Past this point a handler would run against a half-torn-down module
+    // graph, so the teardown below reports signals instead of delivering
+    // them.  atexit ran above and may legitimately have used signals.
+    pyre_interpreter::module::signal::interp_signal::clear_handlers();
     // baseobjspace.py:498-501 `finish()` runs every started module's shutdown
     // hook; `_io`'s (moduledef.py:37-40) flushes the streams that are still
     // alive.  The per-global teardown below reaches only the ones `__main__`
