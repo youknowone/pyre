@@ -5026,9 +5026,9 @@ mod tests {
     /// Every layout's class word is the inherited `PyObject` header slot, and
     /// both accessors must name that one field.
     ///
-    /// `SimpleFieldDescr`'s legacy producer infers `is_w_class` from the field
+    /// `SimpleFieldDescr` falls back to inferring `is_w_class` from the field
     /// name (`class_word_inferred_from_name`: `== "w_class"` or
-    /// `ends_with(".w_class")`), and
+    /// `ends_with(".w_class")`) when nothing declared, and
     /// `build_object_descr_group_with_extra_gc_edges` qualifies every name
     /// with the group's simple name.  So a group that declares a payload field
     /// literally called `w_class` publishes *two* descrs reporting
@@ -5038,6 +5038,13 @@ mod tests {
     /// Both halves are asserted because the two accessors read different lists:
     /// `class_word_field` answers a byte offset off `gc_fielddescrs`, and
     /// `class_word_index_in_parent` a slot position off `all_fielddescrs`.
+    /// Each is asserted *per group*, `None` included, since a group that stops
+    /// answering is invisible to any check phrased over the groups that still
+    /// do.  The two lists differ in what an answer is owed for:
+    /// `gc_fielddescrs` carries the shared header edge for every group, so
+    /// `class_word_field` must always answer; `all_fielddescrs` holds the
+    /// header row only for the groups that list it, so
+    /// `class_word_index_in_parent` must answer exactly for those.
     #[test]
     fn every_groups_class_word_is_the_inherited_pyobject_header_slot() {
         let groups: &[(&str, DescrRef)] = &[
@@ -5065,29 +5072,58 @@ mod tests {
         // Violations are accumulated rather than asserted in place: a test that
         // stops at the first bad group reports which one comes *first*, not
         // which ones are wrong, and the population is the finding here.
+        // Every group is checked for an answer, not just for a wrong answer,
+        // because counting the groups that *did* answer cannot see a group
+        // that stopped: one answering group satisfies a population count while
+        // every other group is dark.  What "must answer" means differs per
+        // accessor and is spelled out at each one below.
         let mut violations: Vec<String> = Vec::new();
-        let mut positional_answers = 0usize;
         for (label, descr) in groups {
             let size = descr
                 .as_size_descr()
                 .unwrap_or_else(|| panic!("{label} must be a SizeDescr"));
 
             // (a) the byte-offset answer names the header slot
-            if let Some(fd) = size.class_word_field()
-                && fd.offset() != W_CLASS_OFFSET
-            {
-                violations.push(format!(
+            match size.class_word_field() {
+                None => violations.push(format!(
+                    "{label}: class_word_field() = None — a PyObject layout \
+                     whose header row declares nothing"
+                )),
+                Some(fd) if fd.offset() != W_CLASS_OFFSET => violations.push(format!(
                     "{label}: class_word_field() -> `{}` at offset {} (want the \
                      inherited PyObject header at {W_CLASS_OFFSET})",
                     fd.field_name(),
                     fd.offset(),
-                ));
+                )),
+                Some(_) => {}
             }
 
-            // (b) the positional answer indexes that same field
-            if let Some(idx) = size.class_word_index_in_parent() {
-                positional_answers += 1;
-                match size.all_fielddescrs().get(idx) {
+            // (b) the positional answer indexes that same field, and answers
+            // at all exactly when this group's own positional list holds the
+            // header row.  Ten of the groups below reach the header only as a
+            // gc-only edge, which `with_extra_gc_fielddescr` keeps out of
+            // `all_fielddescrs()` precisely so positional indexing is
+            // unaffected — for those `None` is the required answer, and a
+            // `Some` would mean some *payload* field claimed the class word.
+            let header_is_positional = size
+                .all_fielddescrs()
+                .iter()
+                .any(|fd| fd.offset() == W_CLASS_OFFSET);
+            match (size.class_word_index_in_parent(), header_is_positional) {
+                (None, true) => violations.push(format!(
+                    "{label}: class_word_index_in_parent() = None while \
+                     all_fielddescrs() does carry the header at \
+                     {W_CLASS_OFFSET} — the slot lost its declaration and \
+                     OptVirtualize's fold stops firing for this layout"
+                )),
+                (Some(idx), false) => violations.push(format!(
+                    "{label}: class_word_index_in_parent() = {idx} while \
+                     all_fielddescrs() carries no field at {W_CLASS_OFFSET} — \
+                     a payload field is claiming a header row this list does \
+                     not hold"
+                )),
+                (None, false) => {}
+                (Some(idx), true) => match size.all_fielddescrs().get(idx) {
                     None => violations.push(format!(
                         "{label}: class_word_index_in_parent() = {idx} is out of \
                          range for all_fielddescrs() (len {})",
@@ -5101,18 +5137,10 @@ mod tests {
                         fd.offset(),
                     )),
                     Some(_) => {}
-                }
+                },
             }
         }
 
-        // The accessor must not be able to degenerate to a constant `None`:
-        // that would silently disable OptVirtualize's class-word fold instead
-        // of correcting it, and every check above would still hold.
-        assert!(
-            positional_answers > 0,
-            "no group answered class_word_index_in_parent() — a fold that never \
-             fires is indistinguishable from a fold that is right"
-        );
         // This held two `Method` exceptions until the host gained a declaration
         // channel.  `Method` carries a payload field literally called `w_class`
         // — the class the bound function was found on, which
@@ -5124,7 +5152,11 @@ mod tests {
         //
         // Now `build_object_descr_group_with_extra_gc_edges` declares
         // `is_class_word: Some(offset == W_CLASS_OFFSET)`, a layout invariant a
-        // name rule cannot express, and the exceptions retired.
+        // name rule cannot express, and the exceptions retired.  The
+        // declaration also outranks the guess on a `get_field_descr` cache hit
+        // and rides `BhFieldSpec` through serialization, so neither a
+        // name-only producer arriving first nor a blackhole round trip can put
+        // the payload field back.
         assert!(
             violations.is_empty(),
             "{} of {} groups resolve a class word that is not the inherited \
