@@ -224,3 +224,48 @@ impl Drop for JitFrameDeadFrame {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jitframe::{alloc_off_gc_jitframe, free_off_gc_jitframe};
+
+    fn a_descr() -> DescrRef {
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 8, 0))
+    }
+
+    /// The deadframe a compiled run returns owns the map its exit established;
+    /// the one `force()` builds over a frame that is still executing does not.
+    #[test]
+    fn only_an_owning_deadframe_releases_the_frames_gcmap() {
+        let frame = alloc_off_gc_jitframe(JitFrame::alloc_size(8));
+        assert!(!frame.is_null());
+        let sentinel = 0x1234usize as *const u8;
+
+        unsafe { (*frame).jf_gcmap = sentinel };
+        drop(JitFrameDeadFrame::borrowing(
+            GcRef(frame as usize),
+            a_descr(),
+            None,
+        ));
+        assert_eq!(
+            unsafe { (*frame).jf_gcmap },
+            sentinel,
+            "a borrowed frame's map belongs to the call site that pushed it"
+        );
+
+        unsafe { (*frame).jf_gcmap = sentinel };
+        drop(JitFrameDeadFrame::new(
+            GcRef(frame as usize),
+            a_descr(),
+            None,
+            None,
+        ));
+        assert!(
+            unsafe { (*frame).jf_gcmap }.is_null(),
+            "an owning deadframe releases the map once its values are read out"
+        );
+
+        unsafe { free_off_gc_jitframe(frame) };
+    }
+}
