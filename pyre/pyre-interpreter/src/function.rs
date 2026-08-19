@@ -487,9 +487,10 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// Byte offsets of the inline `PyObjectRef`-shaped fields the GC must
 /// trace during minor collection. `code` is included because
 /// `BuiltinCode` is now allocated through `malloc_typed`
-/// (`gateway.rs:298`) and therefore lives in the GC heap; the PyCode
-/// path remains raw/immortal and the walker's `is_in_nursery` check
-/// (`majit-gc/src/collector.rs:764`) leaves those entries alone.
+/// (`gateway.rs`'s `builtin_code_new_full`) and therefore lives in the GC
+/// heap; the PyCode path remains raw/immortal and the walker's
+/// `is_in_nursery` check (`majit-gc/src/collector.rs`) leaves those
+/// entries alone.
 /// `function.py:47 _immutable_fields_ = ['code?', ...]` matches PyPy's
 /// Function.code? — an immutable GC reference traced as part of the
 /// closure / defs_w / w_kw_defs / w_module set.
@@ -686,9 +687,10 @@ pub(crate) fn function_new_impl(
     // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`) for
     // the `lltype::malloc_typed` call below. `closure`, `code`, and
     // `w_func_globals_obj` are PyObjectRef-shaped GC roots across the
-    // alloc — `BuiltinCode` lives in the GC heap (`gateway.rs:298
-    // malloc_typed`) and `PyCode` is currently raw/immortal; the
-    // walker's `is_in_nursery` filter (`majit-gc/src/collector.rs:764`)
+    // alloc — `BuiltinCode` lives in the GC heap (`gateway.rs`'s
+    // `builtin_code_new_full` malloc_typed) and `PyCode` is currently
+    // raw/immortal; the
+    // walker's `is_in_nursery` filter (`majit-gc/src/collector.rs`)
     // is what makes the heterogeneous case safe. `name_ptr` is allocated
     // below via `malloc_raw` (non-GC) and stored into the struct as
     // part of the same `malloc_typed` call, so it never spans a
@@ -807,7 +809,7 @@ pub(crate) fn function_new_impl(
     // other fields are null for a freshly-made builtin. Allocate it immortal so
     // a full mark-sweep can never reclaim it out of an off-GC builtin type dict
     // — the collector assumes no immortal object holds heap pointers and so does
-    // not trace such dicts (collector.rs:1803), which would otherwise free the
+    // not trace such dicts (collector.rs), which would otherwise free the
     // method functions of a builtin type built lazily at runtime (weakref, …)
     // after the GC hook is wired. Startup builtin functions are already immortal
     // (no hook installed yet); this extends that to runtime-created ones. User
@@ -1869,7 +1871,8 @@ pub unsafe fn setdict(obj: PyObjectRef, value: PyObjectRef) -> Result<(), crate:
 /// fallback (`function.py:455-457 fdel_func_doc`).
 ///
 /// `code.getdocstring(space)` has two shapes in pyre:
-///   - `BuiltinCode`: stores `docstring` directly (gateway.rs:581).
+///   - `BuiltinCode`: stores `docstring` directly (`gateway.rs`'s
+///     `BuiltinCode.docstring`).
 ///   - `PyCode`: docstring is the first const when `code.flags`
 ///     has `HAS_DOCSTRING` set, mirroring `pycode.py:230
 ///     PyCode.getdocstring`.

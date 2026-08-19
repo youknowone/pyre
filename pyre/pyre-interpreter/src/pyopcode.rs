@@ -1758,7 +1758,7 @@ fn u32_as_usize(x: u32) -> usize {
 /// Widen a raw [`OpArg`] to host-pointer-sized `usize`. Used at
 /// instruction sites that consume the oparg directly (no inner
 /// `Arg<T>::get` call) — currently `JumpForward` /
-/// `jump_target_forward` indirections at `pyopcode.rs:1809,1926`.
+/// `jump_target_forward` indirections in this module.
 /// Composes `u32::from(arg)` (trait-method call lowered as
 /// `simple_call(getattr(<u32>, "from"), arg)`) with
 /// `usize::try_from(...).expect(…)` to keep the body adapter-friendly

@@ -2613,7 +2613,8 @@ mod tests {
         assert!(yes);
     }
 
-    /// Same as above but for `__subclasscheck__`.
+    /// Same shape as `test_isinstance_user_instancecheck_override` but for
+    /// `__subclasscheck__`.
     #[test]
     fn test_issubclass_user_subclasscheck_override() {
         crate::typedef::init_typeobjects();

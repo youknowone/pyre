@@ -1093,10 +1093,10 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: i64) -> i64 {
 }
 
 /// C-ABI 3-arg `(obj, key, value) → i64` store_subscr helper bound by
-/// `pyre-jit::cpu.store_subscr_fn` (`pyre-jit/src/jit/cpu.rs:151`).
+/// `pyre-jit::cpu.store_subscr_fn` (`pyre-jit/src/jit/cpu.rs`).
 /// The codewriter emits a `residual_call_r_v(store_subscr_fn, obj,
-/// key, value)` (`codewriter.rs:7042
-/// build_store_subscr_fn_residual_call_r_v_insn`); the runtime
+/// key, value)` (`codewriter.rs`
+/// build_store_subscr_fn_residual_call_r_v_insn); the runtime
 /// dispatcher calls this thin wrapper to mutate the heap via
 /// `baseobjspace::setitem` — `baseobjspace.py` parity for
 /// `ObjSpace.setitem(w_obj, w_key, w_value) → space.descr_setitem(...)`.

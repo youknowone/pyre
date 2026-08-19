@@ -7717,7 +7717,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                 // returns `self.w_metaclass` (the metaclass).  pyre stamps
                 // each registered builtin type's `w_class` to the
                 // `type` typeobject in `init_typeobjects`'s post-loop
-                // (typedef.rs:489-499).  Return that directly; falling
+                // (`typedef.rs`).  Return that directly; falling
                 // through to `lookup_in_type_where` would hit the
                 // `__class__` getset descriptor on the metatype and
                 // recurse.  When `w_class` is null (bootstrap or a
@@ -8157,7 +8157,8 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                     // '__module__', x)`) take the cache path.  The
                     // generic `__module__` fallback at the end of
                     // `getattr` would otherwise return `None` for every
-                    // function (function.rs:48 init `w_module = PY_NULL`).
+                    // function (`function.rs`'s `function_new_impl` inits
+                    // `w_module = PY_NULL`).
                     return Ok(unsafe { crate::function::fget___module__(obj) });
                 }
                 "__annotations__" => {
@@ -9060,7 +9061,7 @@ pub unsafe fn type_lookup_is_data_descr(w_type: PyObjectRef, name: &str) -> bool
 ///
 /// PyPy reads `object_hash(self.space)` and `type_eq(self.space)` —
 /// static singletons resolved at translation time.  Pyre walks the
-/// MRO and stops at `w_object()` (`typedef.rs:734`); any class on
+/// MRO and stops at `w_object()` (`typedef.rs`); any class on
 /// the path that owns `__eq__` or `__hash__` short-circuits to
 /// `OVERRIDES_EQ_CMP_OR_HASH`.
 ///
@@ -11346,7 +11347,7 @@ pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult
             // objspace.py:721-723 — dispatch only to a non-default
             // `__setattr__`; the object default falls through to the
             // inlined `object_setattr` fast path (the default slot is
-            // `object.__setattr__` → `object_setattr`, typedef.rs:7030,
+            // `object.__setattr__` → `object_setattr` (wired from `typedef.rs`),
             // so skipping the descriptor call is equivalent).
             if let Some(sa) = setattr_if_not_from_object(w_type) {
                 let w_name = w_str_new(name);
@@ -14132,7 +14133,7 @@ fn _unpackiterable_known_length_jitlook(
 /// `user_overridden_class` (typeobject.py term for "type is exact
 /// dict, not a subclass") corresponds to pyre's `is_dict(w_dict)` —
 /// pyre dict subclasses live as `W_ObjectObject` with a backing
-/// dict (`typedef.rs:820 dict_descr_new`), so an exact-type check on
+/// dict (`typedef.rs`'s `dict_descr_new`), so an exact-type check on
 /// the wrapper rules out user subclasses.  Both tuple slots are
 /// `Option` so callers distinguish "no fast path" (None) from "fast
 /// path with zero entries" (Some(empty)).
@@ -14433,7 +14434,7 @@ pub(crate) fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
 /// ```
 ///
 /// PyPy's `space.lookup` walks the type's MRO without firing
-/// descriptors or `__getattr__`; pyre's `lookup` (`baseobjspace.rs:3945`)
+/// descriptors or `__getattr__`; pyre's `lookup` in this module
 /// has the same MRO-only semantics.  Using `findattr` here would run
 /// the descriptor protocol and could surface false positives or
 /// side effects in the *args error path, so we route through `lookup`
@@ -14447,8 +14448,7 @@ pub(crate) fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
 /// `flag_map_or_seq`.
 ///
 /// Builtin shortcuts list/tuple/str/bytes/dict/set/iter/generator/
-/// itertools mirror `iter()`'s direct-type arms at
-/// `baseobjspace.rs:5158-5208`.
+/// itertools mirror `iter()`'s direct-type arms.
 ///
 /// # Safety
 /// Callers may pass any `PyObjectRef`; the function dereferences via

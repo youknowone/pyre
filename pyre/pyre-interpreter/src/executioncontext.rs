@@ -1636,7 +1636,7 @@ impl AbstractActionFlag {
     /// straightforward `for action in self._periodic_actions: …`.
     ///
     /// Pyre's `action_dispatcher` (`ActionFlagOps` trait default,
-    /// `executioncontext.rs:1537`) iterates `_periodic_actions`
+    /// in this module) iterates `_periodic_actions`
     /// directly each call.  Rebuilding the closure would produce no
     /// observable change because (a) majit's loop optimizer subsumes
     /// the unroll role for hot dispatchers and (b) the periodic list

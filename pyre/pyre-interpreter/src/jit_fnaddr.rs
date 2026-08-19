@@ -604,8 +604,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     // Production walker's `Instruction::StoreSubscr` arm emits a
     // `residual_call_r_r` whose funcptr resolves at codewriter time
-    // through the bare path `["execute_store_subscr"]` (the dispatch-
-    // table entry at `pyopcode.rs:2909`).  Without a runtime fnaddr
+    // through the bare path `["execute_store_subscr"]` (`pyopcode.rs`'s
+    // `execute_store_subscr`).  Without a runtime fnaddr
     // entry the codewriter mints a `symbolic_fnaddr_for_path` hash
     // that the `runtime_fnaddr_patch` cannot rewrite; the walker rejects
     // the unresolved address and skips the heap mutation, leaving the next
@@ -623,7 +623,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::opcode_ops::bh_execute_store_subscr as *const (),
     );
 
-    // `cpu.store_subscr_fn` binding (`pyre-jit/src/jit/cpu.rs:151`)
+    // `cpu.store_subscr_fn` binding (`pyre-jit/src/jit/cpu.rs`)
     // bound via `pyre_interpreter::opcode_ops::bh_store_subscr_fn`.
     // Registered here so a consumer can recover the runtime address via
     // `jit_trace_fnaddrs()` lookup without a cross-crate dependency edge.
@@ -1271,7 +1271,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         set_in_flight_exception as *const (),
     );
     // `mmap_type` is `#[cfg(unix)]` inside `interp_mmap`, and the `mmap`
-    // module itself is gated at `module/mod.rs:80`; the row has to carry
+    // module itself is gated at `module/mod.rs`'s `pub mod mmap`; the row has to carry
     // both or a sandbox build on Linux satisfies `unix` with the module
     // configured out.
     #[cfg(all(
@@ -2347,18 +2347,18 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `@jit.elidable`-decorated inherent methods that show up as
     // `residual_call_*` in the codewriter (`call.py:181-187
     // getfunctionptr(graph)` parity).  Without an entry here
-    // `direct_funcptr_value` (`jtransform.rs:614-623`) falls back to
+    // `direct_funcptr_value` (`jtransform.rs`) falls back to
     // `symbolic_fnaddr_for_path`, which is a deterministic hash but NOT
     // a valid function address — invoking it at the walker's
-    // `execute_residual_call` (`jitcode_dispatch.rs:3192-3239`) is an
+    // `execute_residual_call` (`executor.rs`) is an
     // immediate SEGV.  Path shape matches
     // `target_to_path` for inherent method calls
-    // (`call.rs:3024-3028 CallPath::for_impl_method(impl_type_joined,
+    // (`parse.rs`'s `CallPath::for_impl_method(impl_type_joined,
     // method)`): the `register_macro_helper_trace_fnaddr` string-strip
     // drops the leading crate segment, leaving `[module, Type, method]`
     // which is the exact 3-segment shape `for_impl_method` produces.
     //
-    // PyFrame::nlocals — invoked by `eval.rs:840 pop_value` and is the
+    // PyFrame::nlocals — invoked by `eval.rs`'s `pop_value` and is the
     // funcptr the walker reaches when dispatching `PopTop`'s nested
     // `pop_value` sub-jitcode.  Same dual-shape binding as
     // `PyFrame::pop` below: the bare `self.nlocals()` spelling inside
@@ -2375,12 +2375,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
 
     // `PyFrame::pop` — invoked by `<PyFrame as SharedOpcodeHandler>::pop_value`
-    // at `eval.rs:844 Ok(self.pop())`.  Two CallPath shapes need binding:
+    // at its `Ok(self.pop())` tail (`eval.rs`).  Two CallPath shapes need binding:
     //
     // 1. The qualified `PyFrame::pop(self)` spelling resolves to the
     //    2-segment CallPath `["PyFrame", "pop"]` via `for_impl_method`.
     // 2. The bare `self.pop()` spelling goes through `target_to_path`'s
-    //    suffix-match fallback (call.rs:3069-3112), which returns the
+    //    suffix-match fallback (call.rs), which returns the
     //    3-segment module-qualified key `["pyframe", "PyFrame", "pop"]`
     //    that `function_graphs` actually stores inherent impl methods
     //    under (per `parse::extract_inherent_impl_methods`).
@@ -2590,9 +2590,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyframe_ncells_method as *const (),
     );
 
-    // B1 LoadFast/LoadFastBorrow/LoadFastCheck arm folding helpers.  Both
+    // LoadFast/LoadFastBorrow/LoadFastCheck arm folding helpers.  Both
     // carry `#[elidable_cannot_raise]` so `has_cannot_raise_assertion`
-    // requires the fnaddr registration to fire (`call.rs:3626-3631`
+    // requires the fnaddr registration to fire (`call.rs`
     // gates the assertion on `function_fnaddrs.contains_key(p)`).
     // Without these the chained `Arg::get` / `VarNum::as_usize` /
     // `Vec::len` third-party helpers reach the walker as unfolded
@@ -2874,7 +2874,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // The Rust-source graphs for the integer helpers are NOT
     // registered in `CallControl::function_graphs` (pyre has no
     // `MixLevelHelperAnnotator` to materialise a graph from a `pub
-    // extern "C"` function pointer), so `call.rs:1620-1670`
+    // extern "C"` function pointer), so `call.rs`'s
     // `find_all_graphs_bfs` finds the function pointer via
     // `function_fnaddrs` lookup but cannot seed the BFS through the
     // helper's body — the helpers stay opaque to the inliner,

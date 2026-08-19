@@ -498,8 +498,9 @@ pub(crate) fn capture_last_exec_ctx_cell() -> *const () {
 ///
 /// PyPy walks thread state and returns the live `ExecutionContext`,
 /// creating one on demand.  Pyre stores the active context in a TLS
-/// slot seeded at process boot by pyrex (`pyrex/src/lib.rs:185
-/// set_last_exec_ctx(Rc::as_ptr(&execution_context))`) and
+/// slot seeded at process boot by pyrex (`pyrex/src/lib.rs`'s
+/// `setup_exec_context`, which calls
+/// `set_last_exec_ctx(Rc::as_ptr(&execution_context))`) and
 /// re-stamped on every `eval_frame_plain` entry.  The slot stays
 /// pointing at the root EC for the lifetime of the process, so
 /// `sys.gettrace`/`settrace`/`getprofile`/`setprofile` and other
@@ -2279,7 +2280,7 @@ pub(crate) fn resolve_kwargs(
     // live across the packing is a raw copy: the parameters already bound into
     // `result`, the unmatched keyword pairs, and the two tail objects.  Each
     // allocation below — the tail objects, `w_dict_store`'s strategy promotion
-    // — leaves RUNNING before taking `gc_mutex` (`gc_sync.rs:22`), so a
+    // — leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`), so a
     // collector on another thread relocates whatever the shadow stack does not
     // name.  Pin them all, then read every one back out.
     //
@@ -2686,7 +2687,7 @@ fn call_with_kwargs_in_ctx_impl(
         // into named parameter slots and delete `__pyre_kw__`. Deferred: that is
         // a standalone multi-slice epic (no builtin-Signature machinery exists
         // yet) and the JIT inline-call path consumes the same flat tail
-        // (`pyre-jit/src/eval.rs:2319`), so it cannot land in one ≤12-file slice.
+        // (`pyre-jit/src/eval.rs`), so it cannot land in one ≤12-file slice.
         // Keep the marker here, in the one builtin kwargs packing site, so
         // CALL_KW and CALL_FUNCTION_EX have the same shape.
         if unsafe { crate::is_builtin_code(code as pyre_object::PyObjectRef) } {
@@ -2758,7 +2759,7 @@ fn call_with_kwargs_in_ctx_impl(
             // dict is a young object no root names, and every step that follows
             // allocates: the key strings, `w_dict_store`'s strategy promotion,
             // and the call this frame ends in.  An allocation leaves RUNNING
-            // before taking `gc_mutex` (`gc_sync.rs:22`), so a collector on
+            // before taking `gc_mutex` (`gc_sync.rs`), so a collector on
             // another thread runs there and relocates or reclaims anything the
             // shadow stack does not name.  The scope reaches every `return`
             // below, which is where the dict stops being a livevar.

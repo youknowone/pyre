@@ -1911,9 +1911,10 @@ pub(crate) unsafe fn obj_to_constant_data(
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(ConstantData::Frozenset { elements });
         }
-        // The inverse of `pyframe.rs:4510`, which realizes this constant as a
-        // slice object: a subscript with only literal bounds (`p[:0]`) folds to
-        // one, so a module that has any is unconvertible without this arm.
+        // The inverse of `pyframe.rs`'s `pyobject_from_constant`, which realizes
+        // this constant as a slice object: a subscript with only literal bounds
+        // (`p[:0]`) folds to one, so a module that has any is unconvertible
+        // without this arm.
         if pyre_object::is_slice(obj) {
             let start = obj_to_constant_data(pyre_object::w_slice_get_start(obj))?;
             let stop = obj_to_constant_data(pyre_object::w_slice_get_stop(obj))?;

@@ -793,7 +793,7 @@ unsafe fn chain_next_frame(f_backref: *mut PyFrame) -> *mut PyFrame {
 
 /// Forward the frame named by a `JitVirtualRef` stored in a frame-shaped slot.
 ///
-/// Frame backrefs and `executioncontext.rs:88-101` both allow such a slot to
+/// Frame backrefs and `executioncontext.rs`'s `vref_referent` both allow such a slot to
 /// hold a vref in place of a `*mut PyFrame`. Its leading word is the
 /// `JIT_VIRTUAL_REF_VTABLE` magic, not a PyObject `ob_type`, so callers must
 /// skip PyObject-shaped walks when this returns true. The vref is old-gen and
@@ -844,7 +844,7 @@ unsafe fn walk_frame_value_slot(
 /// How much of `locals_cells_stack_w` is reachable state.
 ///
 /// `valuestackdepth` is an absolute index that starts at `stack_base()`
-/// (`pyframe.rs:2136`) and `pop` refuses to go below it, so for a running
+/// (`pyframe.rs`) and `pop` refuses to go below it, so for a running
 /// frame it already covers the locals/cells prefix. `PyFrame::descr_clear`
 /// is the one writer that breaks that: it rebinds every cell slot to a fresh
 /// `w_cell_new` and then sets `valuestackdepth = 0`. Clamping to the raw
@@ -1426,8 +1426,10 @@ pub fn walk_suspended_generator_frame(
         let yielding_slot = &mut (*frame).w_yielding_from as *mut PyObjectRef;
         visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
 
-        // Forward the globals/builtin object pointers (their dict values
-        // are rooted elsewhere as noted above).
+        // Forward the globals/builtin object pointers; their dict VALUES are
+        // not walked here — a module dict is rooted globally by
+        // `walk_module_dicts_gc`, and a GC-managed `exec` globals dict is
+        // reached transitively through its own trace.
         let w_globals_obj_slot = &mut (*frame).w_globals as *mut PyObjectRef;
         visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
         let w_builtin_slot = &mut (*frame).w_builtin as *mut PyObjectRef;
@@ -1688,7 +1690,7 @@ pub fn check_exc_match_against(exc_value: PyObjectRef, exc_type: PyObjectRef) ->
     // whose `w_class` slot still holds the generic `EXCEPTION_TYPE`
     // stub (pre-registry-init internal `w_exception_new` callers, e.g.
     // `PyError::value_error`) by falling back to the `ExcKind`-tag
-    // registry per typedef.rs:176-197.
+    // registry (`lookup_exc_class_for_kind`).
     //
     // The validity gate (pyopcode.py:1034-1039) lives in
     // `validate_check_exc_match_class` and is invoked by the BC handler
@@ -1961,7 +1963,7 @@ pub fn handle_exception_with_context(
 /// `EVAL_OVERRIDE: OnceLock<EvalFn>` where `EvalFn = fn(&mut PyFrame) ->
 /// PyResult`) requires a `fn` pointer.  Rust methods cannot be cast to
 /// `fn` pointers, so the canonical body stays as a free function and the
-/// `EVAL_OVERRIDE.unwrap_or(eval_frame_plain)` fallback (call.rs:328 etc.)
+/// `EVAL_OVERRIDE.unwrap_or(eval_frame_plain)` fallback (`call.rs`'s `get_eval_fn`)
 /// continues to reference it directly.
 pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
     frame.execute_frame(None, None)
@@ -2583,7 +2585,7 @@ impl NamespaceOpcodeHandler for PyFrame {
         // whole `GlobalCache` chase is bypassed via `_load_global_fallback`
         // → `_load_global` (`pyopcode.py:958-967 space.finditem_str`), so
         // only the builtin `finditem_str` fallback below runs.  Positive
-        // form (`load_attr_cached` eval.rs:3586) keeps the annotator off
+        // form (`load_attr_cached`) keeps the annotator off
         // the bare-`!` hazard; `we_are_jitted()` folds to `ConstBool(true)`
         // so the cache arm and its `Arc<Mutex<GlobalCache>>` chase are
         // dead-code-eliminated on the lifted graph.
@@ -4781,7 +4783,7 @@ impl OpcodeStepExecutor for PyFrame {
         if majit_metainterp::jit::we_are_jitted() {
             return OpcodeStepExecutor::load_attr(self, name);
         }
-        // Graceful underflow (shared_opcode.rs:167 `opcode_load_attr` →
+        // Graceful underflow (`shared_opcode.rs`'s `opcode_load_attr` →
         // `pop_value()?`): a corrupted concrete-execution stack during
         // trace recording (e.g. a residual call the inline executor
         // could not perform) aborts the trace instead of panicking the
@@ -4819,7 +4821,7 @@ impl OpcodeStepExecutor for PyFrame {
             return OpcodeStepExecutor::store_attr(self, name);
         }
         // pyopcode.py:918-919 — obj is the top of stack, value below it.
-        // Graceful underflow like `opcode_store_attr` (shared_opcode.rs:176)
+        // Graceful underflow like `opcode_store_attr` (`shared_opcode.rs`)
         // so a corrupted trace-recording stack aborts the trace instead of
         // panicking the hard-asserting `pop()`.
         let obj = self.pop_value()?;

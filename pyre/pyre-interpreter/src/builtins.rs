@@ -7511,7 +7511,7 @@ pub(crate) fn exc_file_not_found_error_new(
 /// `_new` runs no per-arg validation — type checks live in
 /// `descr_init` (line 433-445) and only fire when `__init__` is
 /// invoked by the type-call protocol after `__new__`.  Pyre's
-/// type-call (call.rs:982-996) routes through that same `__new__` ⇒
+/// type-call (`call.rs`'s `type_descr_call_impl`) routes through that same `__new__` ⇒
 /// `__init__` sequence, so `__new__` here can stay validation-free.
 fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = pyre_object::interp_exceptions::w_exception_new(
@@ -14917,7 +14917,8 @@ pub(crate) fn sort_rooted_items(
     };
     let mut compare = sort_compare_for(base, item_len, key_fn_slot.is_some());
     let result = crate::listsort::sort_with(&mut order, &mut compare);
-    // Second half of the double-reverse (see above), which runs on the raising
+    // Second half of the reverse/ascending-sort/reverse pair `descr_sort` uses
+    // for `reverse=True`, which runs on the raising
     // path too — an interrupted `reverse=True` sort must not leave the list in
     // the opposite orientation from the one it was handed.  `descr_sort` puts
     // this reverse inside its `try` and so skips it; `list_sort_impl` does not,
@@ -14981,7 +14982,7 @@ impl crate::listsort::SortLt<usize> for SortCompare {
 /// same decision is one pass over the values.  What makes the specialization
 /// equivalent is that a subclass carrying its own `__lt__` must fail the test
 /// and take the generic path, exactly as it would keep an object-strategy list
-/// upstream — so the test has to be `is_exact_type` (pyobject.rs:179), which
+/// upstream — so the test has to be `is_exact_type` (pyobject.rs), which
 /// compares the instance's `w_class` against the builtin's type object and so
 /// rejects a subclass, which retags `w_class` to its own.  `is_int` / `is_str`
 /// / `is_float` are NOT usable here: they are `py_type_check`, an `ob_type`
@@ -16287,7 +16288,8 @@ pub(crate) fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
 /// errno.
 ///
 /// wasm32 has neither `libc::EINTR` nor the `signal` module
-/// (`module/mod.rs:100-101`), and no caller survives the same gate there.
+/// (`module/mod.rs`'s `pub mod signal` is `cfg`-gated off), and no caller
+/// survives the same gate there.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn eintr_retry_with(
     e: std::io::Error,

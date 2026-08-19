@@ -46,9 +46,10 @@ fn is_done_states(oldstate: u8, newstate: u8) -> bool {
 ///
 /// The atomic carries storage and visibility, not the state transition. The
 /// rgil is what serializes load -> collector step -> store: a mutator holds it
-/// across the whole builtin body (`rgil.rs:214` takes it with a single-owner
-/// CAS, and only an explicit release such as `call_external_function` gives it
-/// up), and nothing on this path releases it. So a second mutator cannot also
+/// across the whole builtin body (`rgil.rs`'s `acquire_fast_path` takes it with
+/// a single-owner CAS, and only an explicit release such as
+/// `call_external_function` gives it up), and nothing on this path releases it.
+/// So a second mutator cannot also
 /// observe `false` and start a major step.
 ///
 /// The USERDEL drain is the deliberate exception, and matches

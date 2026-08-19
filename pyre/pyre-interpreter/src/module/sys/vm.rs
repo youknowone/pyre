@@ -1196,7 +1196,7 @@ pub fn exc_info_direct() -> PyObjectRef {
             // subclass W_TypeObject (e.g. `ZeroDivisionError`), not
             // the generic `Exception` stub set in
             // `w_exception_new`.  Pyre routes the per-`ExcKind`
-            // lookup through `typedef::r#type` (`typedef.rs:186-197`)
+            // lookup through `typedef::r#type` (`typedef.rs`)
             // which `exception_getclass` delegates to, so go through
             // that instead of dereferencing the raw `w_class` slot
             // (which still points at the constructor-time

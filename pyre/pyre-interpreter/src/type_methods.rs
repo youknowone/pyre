@@ -48,7 +48,7 @@ pub(crate) fn args_given(args: &[PyObjectRef]) -> usize {
 /// yields an `Option<&T>` whose payload is valid on only one arm, and the front
 /// end has no lowering that can build one.  Its single `Option`-synthesizing
 /// path, `emit_tagged_pair_aggregate`, writes the payload unconditionally
-/// before the consumer's discriminant switch runs (`front/mir.rs:9936`), so an
+/// before the consumer's discriminant switch runs (`front/mir.rs`), so an
 /// out-of-bounds read would execute on the absent arm.  A plain index lowers to
 /// a native read plus an overflow `Assert` the front end strips.
 #[inline]
@@ -6798,7 +6798,7 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
 /// (uninitialised) strategy slot.
 ///
 /// `__pyre_kw__`-marked dict is the kwargs vehicle pyre's CALL_KW
-/// emits for builtin callees (`call.rs:727-744`).
+/// emits for builtin callees (`call.rs`'s `pack_pyre_kwargs`).
 pub fn dict_init_or_update(
     args: &[PyObjectRef],
     name: &str,

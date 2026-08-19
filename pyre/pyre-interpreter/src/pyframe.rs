@@ -820,7 +820,7 @@ impl FrameBox {
     /// GC object whose lifetime is its reachability.  When the GC hook is
     /// installed this allocates a non-moving old-gen `PYFRAME_GC_TYPE_ID`
     /// block (the same `try_gc_alloc_stable` path every `W_*` uses, e.g.
-    /// `function.rs:373`); the collector reclaims the frame and its
+    /// `function.rs`'s `function_new_impl`); the collector reclaims the frame and its
     /// GC-managed locals, debug data, and block stack once no root
     /// (`walk_pyframe_roots` over the `CURRENT_FRAME` / `f_backref` chain)
     /// reaches it, so `Drop` performs no manual free
@@ -909,8 +909,8 @@ impl FrameBox {
             }
             // The old-gen frame may hold pointers to freshly nursery-born
             // argument / locals objects; remember it for the next minor
-            // tracer, exactly as `generator.rs:72` does for a stable
-            // generator wrapping young frame contents.
+            // tracer, exactly as `generator.rs`'s `w_generator_or_coroutine_new`
+            // does for a stable generator wrapping young frame contents.
             pyre_object::gc_hook::try_gc_write_barrier_managed(raw);
             let owner_root =
                 majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(ptr as usize));
@@ -3081,7 +3081,7 @@ impl PyFrame {
     /// Asserts both lower and upper bounds: a valid stack write goes to
     /// `stack_base() <= index < locals_cells_stack_w.len()`. Pyre's
     /// `PyObjectArray` is allocated with `nlocals + ncells +
-    /// max_stackdepth` slots (pyframe.rs:1091), so writing at or past
+    /// max_stackdepth` slots (`alloc_frame_locals_array`), so writing at or past
     /// `array_len` overruns the heap buffer — catastrophic in release
     /// mode, where `PyObjectArray` indexing is unchecked. This guard
     /// converts the heap overrun into a debug-mode assertion failure
@@ -4683,15 +4683,15 @@ pub(crate) fn code_constants(code: &CodeObject) -> &[crate::bytecode::ConstantDa
 /// Materialise a single `ConstantData` into a `PyObjectRef`.
 ///
 /// Line-by-line port of the `ConstantOpcodeHandler for PyFrame` impl
-/// (`eval.rs:1300-1352`) routed through `load_const_value`
-/// (`pyopcode.rs:343-394`). The blackhole's `bh_load_const_fn` lacks a
+/// (`eval.rs`) routed through `load_const_value`
+/// (`pyopcode.rs`). The blackhole's `bh_load_const_fn` lacks a
 /// `&mut PyFrame` to dispatch through the trait, so this free function
 /// mirrors each `*_constant` body directly. Variant order matches
 /// `pyopcode.rs::load_const_value` so future additions stay in sync.
 pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObjectRef {
     use crate::bytecode::ConstantData;
     match constant {
-        // `pyopcode.rs:347-353` — promote bigints to W_LongObject just
+        // `pyopcode.rs` — promote bigints to W_LongObject just
         // like `load_const_value` does before invoking the trait.
         ConstantData::Integer { value } => {
             let value = crate::compiler_bigint_to_rbigint(value);
@@ -4700,26 +4700,27 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
                 Err(_) => pyre_object::longobject::w_long_new(value),
             }
         }
-        // `eval.rs:1309-1311 float_constant`.
+        // `eval.rs` `float_constant`.
         ConstantData::Float { value } => pyre_object::floatobject::w_float_new(*value),
-        // `eval.rs:1313-1315 bool_constant` — bools must surface as
+        // `eval.rs` `bool_constant` — bools must surface as
         // W_BoolObject (`is space.w_True/w_False`), not W_IntObject.
         ConstantData::Boolean { value } => pyre_object::w_bool_from(*value),
-        // `eval.rs:1317-1319 str_constant` — `box_str_constant` interns
+        // `eval.rs` `str_constant` — `box_str_constant` interns
         // matching `space.newtext` per `unicodeobject.py wrapunicode`.
         ConstantData::Str { value } => pyre_object::unicodeobject::box_str_constant(value),
-        // `eval.rs:1321-1323 bytes_constant`.
+        // `eval.rs` `bytes_constant`.
         ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes(value),
         // Reached only for a code constant nested inside a container constant;
         // top-level `LOAD_CONST` routes through `co_consts_w` in `bh_load_const_fn`
         // so the blackhole shares the interpreter's wrapper.
         ConstantData::Code { code } => crate::pycode::box_code_constant(code),
-        // `eval.rs:1333-1335 none_constant`.
+        // `eval.rs` `none_constant`.
         ConstantData::None => pyre_object::w_none(),
-        // `eval.rs:1337-1339 ellipsis_constant`.
+        // `eval.rs` `ellipsis_constant`.
         ConstantData::Ellipsis => pyre_object::special::w_ellipsis(),
-        // `pyopcode.rs:360-366` — recurse + delegate to the default
-        // `build_tuple` body (`eval.rs:767 build_tuple_from_refs`).
+        // `load_const_value`'s `Tuple` arm (`pyopcode.rs`) — recurse + delegate
+        // to the default `build_tuple` body (`eval.rs`, which calls
+        // `build_tuple_from_refs`).
         ConstantData::Tuple { elements } => {
             let mut items: Vec<PyObjectRef> = Vec::with_capacity(elements.len());
             for element in elements {
@@ -4727,16 +4728,16 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
             }
             crate::runtime_ops::build_tuple_from_refs(&items)
         }
-        // `pyopcode.rs:382-393` — recurse over `[start, stop, step]`
-        // before invoking `slice_constant` (`eval.rs:1341-1348`).
+        // `load_const_value`'s `Slice` arm (`pyopcode.rs`) — recurse over
+        // `[start, stop, step]` before invoking `slice_constant` (`eval.rs`).
         ConstantData::Slice { elements } => {
             let start = pyobject_from_constant(&elements[0]);
             let stop = pyobject_from_constant(&elements[1]);
             let step = pyobject_from_constant(&elements[2]);
             pyre_object::w_slice_new(start, stop, step)
         }
-        // `pyopcode.rs:375-381` — recurse + delegate to
-        // `frozenset_constant` (`eval.rs:1350-1352`).
+        // `load_const_value`'s `Frozenset` arm (`pyopcode.rs`) — recurse +
+        // delegate to `frozenset_constant` (`eval.rs`).
         ConstantData::Frozenset { elements } => {
             let mut items: Vec<PyObjectRef> = Vec::with_capacity(elements.len());
             for element in elements {
@@ -4865,8 +4866,8 @@ pub fn createframe_obj(
         w_globals,
     });
     // pyframe.py:119 — final step of __init__.  PY_NULL plays the role of
-    // Python `None` per the existing `initialize_frame_scopes` convention
-    // (pyframe.rs:664).  Top-level module / interactive / expression code
+    // Python `None` per the existing `initialize_frame_scopes` convention.
+    // Top-level module / interactive / expression code
     // arrives here without CO_NEWLOCALS — RustPython codegen emits empty
     // flags for the seed CodeInfo (`crates/codegen/src/compile.rs Compiler::new`)
     // so initialize_frame_scopes selects the `!OPTIMIZED && !NEWLOCALS`

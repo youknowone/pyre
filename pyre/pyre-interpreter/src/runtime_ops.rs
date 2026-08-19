@@ -210,7 +210,7 @@ pub fn register_jit_exc_raiser(raiser: JitExcRaiser) {
 /// llmodel.py:194-199 _store_exception: publish `exc_obj` into the
 /// backend's pos_exception/pos_exc_value cells so the residual call's
 /// GuardNoException sees it and side-exits into the handler. Mirrors
-/// `jit_call_user_function_from_frame` (call_jit.rs:362-379). MUST NOT use
+/// `jit_call_user_function_from_frame` (call_jit.rs). MUST NOT use
 /// a side-channel TLS slot — that path is drained before the guard
 /// machinery runs and would bypass try/except. The call helpers return
 /// garbage on Err; resume data hands control to the except block.

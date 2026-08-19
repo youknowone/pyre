@@ -1053,7 +1053,8 @@ pub fn all_immortal_w_class_only_descriptors()
     #[allow(unused_imports)]
     use pyre_object::lltype::PyreClassPyTypeOf;
     vec![
-        // `select` is compiled out of a sandbox build (`module/mod.rs:93`), so
+        // `select` is compiled out of a sandbox build (`module/mod.rs`'s
+        // `pub mod select`), so
         // its descriptors carry that gate too.
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         <crate::module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,

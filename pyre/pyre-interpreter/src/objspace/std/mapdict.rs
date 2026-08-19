@@ -1537,7 +1537,7 @@ unsafe fn classify_attr(
         Some(d) => {
             // mapdict.py:1511-1512 — a MutableCell can change without bumping the
             // version_tag, so give up. pyre type dicts store values directly, not
-            // wrapped in cells (celldict.rs:17-18 — the cell port has not landed),
+            // wrapped in cells (`celldict.rs` — the cell port has not landed),
             // so this never fires today; kept for structural parity.
             if unsafe { pyre_object::celldict::is_mutable_cell(d) } {
                 return (INVALID, false);
@@ -2796,7 +2796,7 @@ pub trait MapdictObject {
 /// `*const MapNode`; `storage` is a heap `Vec<PyObjectRef>` (null =
 /// `None`, the `_mapdict_init_empty` empty state, mapdict.py:910).
 /// Remember an instance that may now hold a young attribute value, mirroring
-/// `dict_write_barrier` (dictmultiobject.rs:421). RPython's GC inserts the
+/// `dict_write_barrier` (dictmultiobject.rs). RPython's GC inserts the
 /// barrier implicitly at `self.storage[index] = value` (mapdict.py:918-919);
 /// pyre's `storage` is an off-GC `*mut Vec<PyObjectRef>`, so the store bypasses
 /// the collector's remembered-set tracking and must call the barrier

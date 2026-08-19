@@ -54,7 +54,7 @@ struct StructSeqDescr {
 
 /// `class_ptr → StructSeqDescr`.  Pyre keys by the subclass type
 /// pointer because the GetSetProperty descriptor only carries a
-/// `name` slot (`typedef.rs:174`), not the owning class.
+/// `name` slot (`pyre-object`'s `GetSetProperty`), not the owning class.
 static STRUCTSEQ_REGISTRY: OnceLock<Mutex<IndexMap<usize, StructSeqDescr>>> = OnceLock::new();
 
 fn structseq_registry() -> &'static Mutex<IndexMap<usize, StructSeqDescr>> {

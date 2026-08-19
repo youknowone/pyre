@@ -4997,7 +4997,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *CELL.get_or_init(|| {
             // `interp_scandir.py:469` names the typedef `'posix.DirEntry'`.
-            // typedef.rs:2285-2291 turns the leading component of a qualified
+            // `typedef.rs`'s `new_typeobject_with_base_and_layout` turns the
+            // leading component of a qualified
             // builtin name into a `__module__` entry, so `type(e).__module__`
             // reports `posix` and every type-name-bearing error message is
             // spelled the way the typedef spells it.
@@ -5068,7 +5069,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // and `:487` sets `acceptable_as_base_class = False`; `typedef.py:55
             // acceptable_as_base_class = '__new__' in rawdict` is the rule, and
             // `typedef.py:754 assert not PyFrame.typedef.acceptable_as_base_class
-            // # no __new__` is the same shape typedef.rs:534-539 already ports.
+            // # no __new__` is the same shape `typedef.rs`'s `init_typeobjects`
+            // already ports for the `frame` and `traceback` types.
             // `scandir_fn` below allocates entries with `W_DirEntry::
             // allocate_stable`, which never enters `type.__call__`, so the
             // producer is untouched by the instantiation gate.
@@ -5686,8 +5688,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // os.getuid / geteuid / getgid / getegid — real syscalls (the sandbox
-    // build routes these through the controller instead, see below).
+    // os.getuid / geteuid / getgid / getegid — real syscalls (each builtin's
+    // `#[cfg(feature = "sandbox")]` arm routes through `host_seam::ops`
+    // instead).
     #[cfg(all(unix, not(feature = "sandbox")))]
     unsafe extern "C" {
         fn getuid() -> u32;

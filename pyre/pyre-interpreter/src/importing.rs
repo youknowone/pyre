@@ -4056,7 +4056,8 @@ fn install_importlib_bootstrap(
     // `sys.path_hooks.insert(0, zipimporter)` (zipimport moduledef startup /
     // pylifecycle.c init after the external importers) so zip archives on
     // `sys.path` are importable. `zipimport` is served from the frozen table
-    // and its body imports `_frozen_importlib`, hence after the alias above.
+    // and its body imports `_frozen_importlib`, hence after the
+    // `set_frozen_alias_metadata` call that registers that alias.
     // A failed import leaves the hook out — the tolerant `# can't import
     // zipimport` path — rather than failing the whole bootstrap.
     if let Ok(w_zipimport) = absolute_import("zipimport", pyre_object::PY_NULL, execution_context) {

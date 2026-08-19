@@ -509,7 +509,7 @@ pub extern "C" fn pyre_stack_too_big_slowpath(current: usize) -> u8 {
     // the pyre annotator; `Cell::get()` through a `thread_local!`
     // `.with` closure isn't resolved by the front-end, which would
     // otherwise default the binding to the GcRef Unknown sentinel
-    // (`jtransform.rs:1588 ConcreteType::Unknown => 'r'`) and emit a
+    // (`jtransform.rs`'s `ConcreteType::Unknown => 'r'` arms) and emit a
     // mixed-kind `int_ne/ri>i` at the `!= 0` compare below.
     let baseptr: usize = TL_STACK_END.with(|c| c.get());
 

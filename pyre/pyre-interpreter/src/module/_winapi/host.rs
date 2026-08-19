@@ -886,8 +886,9 @@ pub fn install(ns: PyObjectRef) {
             LCMapStringEx,
             OpenEventW,
             OpenMutexW,
-            // Positional-only upstream, but with an optional parameter — see
-            // the note above.
+            // Positional-only upstream, but with an optional parameter, so it
+            // keeps its `Signature` here instead of joining `positional`
+            // (`install!`'s doc gives the soundness rule).
             PeekNamedPipe,
             WaitForMultipleObjects,
             ReleaseMutex,

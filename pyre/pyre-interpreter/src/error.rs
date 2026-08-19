@@ -251,8 +251,8 @@ impl OperationError {
     /// ```
     ///
     /// Writes flow through the typed `w_context` slot on
-    /// `W_BaseException` (`pyre-object/src/interp_exceptions.rs:113-117
-    /// W_BaseException class defaults`).
+    /// `W_BaseException` (`pyre-object/src/interp_exceptions.rs`'s
+    /// `W_BaseException.w_context` class default).
     pub fn chain_exceptions(
         &mut self,
         space: PyObjectRef,

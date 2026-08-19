@@ -385,7 +385,7 @@ pub extern "C" fn jit_mark_traceback_escaped(w_traceback: i64) {
 ///
 /// Pyre stores the chain head on the materialised `W_BaseException`'s
 /// `w_traceback` slot (the same slot
-/// `interp_exceptions.rs:303 w_exception_set_traceback` writes to).  The
+/// `interp_exceptions.rs`'s `w_exception_set_traceback` writes to).  The
 /// operror-side `_application_traceback: Option<PyObjectRef>` cache
 /// mirrors the slot for `to_exc_object` callers that haven't allocated
 /// the exception yet.
@@ -394,7 +394,7 @@ pub extern "C" fn jit_mark_traceback_escaped(w_traceback: i64) {
 /// (`pyframe.py:72 self.last_instr`).  In RPython this is the
 /// instruction-unit index; pyre stores `last_instr` in bytes for now,
 /// matching `pyframe::PyFrame.last_instr` documentation
-/// (`pyframe.rs:55-77`).
+/// (`pyframe.rs`).
 ///
 /// # Safety
 /// `w_exc_object` must point to a valid `W_BaseException` (or
@@ -410,7 +410,7 @@ pub unsafe fn record_application_traceback(
     }
     unsafe {
         // `pycode.py:111 self.hidden_applevel` — pyre's
-        // `PyCode.hidden_applevel` flag (`pycode.rs:51`) skips
+        // `PyCode.hidden_applevel` flag (`pycode.rs`) skips
         // gateway / app_main bridge frames from the traceback.
         let pycode_ptr = (*frame).pycode as *const crate::pycode::PyCode;
         if !pycode_ptr.is_null() && (*pycode_ptr).hidden_applevel {

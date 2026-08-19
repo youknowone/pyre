@@ -934,7 +934,7 @@ pub fn init_typeobjects() {
         // `isinstance(x, type(x))`, and the descriptor protocol's
         // `space.type(w_obj)` invariants.  Without a registered
         // W_TypeObject the 1-arg `type(obj)` fallback at
-        // `builtins.rs:1003` would return the type's *name* as a
+        // `builtins.rs` would return the type's *name* as a
         // `str`, breaking every downstream identity check.
         //
         // Empty init body matches PyPy typedefs that expose only
@@ -10574,8 +10574,9 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
 }
 
 /// typedef.py:465-474 metadata getsets on `GetSetProperty.typedef`,
-/// installed in a post-init pass per the comment above
-/// `init_getset_descriptor_type`.
+/// installed in a post-init pass because `init_getset_descriptor_type` runs
+/// inside `getset_descriptor_type()`'s `OnceLock` init closure, and allocating
+/// the descriptors there would re-enter `OnceLock::get_or_init` and deadlock.
 ///
 /// ```python
 /// __name__ = interp_attrproperty('name', cls=GetSetProperty,
@@ -10652,7 +10653,7 @@ fn patch_getset_descriptor_metadata() {
                             // `getattr(w_type, '__qualname__')` resolves
                             // through the type-side __qualname__ getset that
                             // already mirrors PyPy's lookup-then-fallback
-                            // chain (`baseobjspace.rs:4004-4009`).
+                            // chain (`baseobjspace.rs`).
                             // PyPy's original only consults `reqcls`. During type
                             // materialisation `copy_for_type` deliberately leaves
                             // reqcls null and records the concrete owner in
@@ -12778,7 +12779,8 @@ fn init_function_type_common(ns: PyObjectRef) {
     // (`typedef.py:465-474`) fetches the attribute and substitutes
     // `space.w_None` when the slot is `None`.  pyre's
     // `function_get_globals_obj` returns `PY_NULL` for builtins
-    // allocated with a null storage pointer (gateway.rs:661-700);
+    // allocated with a null storage pointer (`gateway.rs`'s
+    // `builtin_code_new*` constructors);
     // route that through `w_None` so `BuiltinFunction.__globals__`
     // observes `None` rather than a raw null leak — the literal
     // `if w_value is None` arm of fget.

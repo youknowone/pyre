@@ -608,7 +608,7 @@ fn parse_acquire_args(
         ));
     }
     // `rarithmetic.ovfcheck_float_to_longlong` bounds, the ones `time.sleep`
-    // converts its own argument against (`interp_time.rs:122-126`).
+    // converts its own argument against (`interp_time.rs`'s `sleep`).
     const NS_MIN: f64 = -9223372036854776832.0;
     const NS_MAX: f64 = 9223372036854775296.0;
     if !(NS_MIN..NS_MAX).contains(&(timeout * 1e9).ceil()) {
@@ -641,8 +641,8 @@ fn parse_acquire_args(
 }
 
 /// `os_lock.py:49 space.getexecutioncontext().checksignals()`.  The signal
-/// module is not built for wasm32 (`module/mod.rs:94`), where no handler can
-/// be pending, so there the check has nothing to run.
+/// module is not built for wasm32 (`module/mod.rs`'s `pub mod signal`), where
+/// no handler can be pending, so there the check has nothing to run.
 fn checksignals() -> Result<(), crate::PyError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
