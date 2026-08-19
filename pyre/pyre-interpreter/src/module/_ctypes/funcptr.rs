@@ -997,14 +997,8 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // A COM method constructed with an interface id answers the plain status,
     // and asks the callee what went wrong when that status is a failure; the
     // restype never gets a look in.
-    let value = match com_error_iid(self_obj, com) {
-        Some((this_ptr, iid)) => {
-            let hresult = scalar_int_result(&result);
-            if hresult < 0 {
-                return Err(super::com::error(hresult, iid, this_ptr));
-            }
-            pyre_object::w_int_new(hresult as i64)
-        }
+    let value = match com_status(self_obj, com, &result) {
+        Some(status) => status?,
         None => {
             let value = build_return_value(ret, result)?;
             match resolve_checker(self_obj) {
@@ -1030,6 +1024,37 @@ fn scalar_int_result(result: &host_ctypes::CallValue) -> i32 {
     i32::from_ne_bytes(word)
 }
 
+/// The status a COM method constructed with an interface id answers, and the
+/// callee's own account of a failed one.  `None` for a method without an id
+/// and for every ordinary function, which go through the restype instead.
+///
+/// A COM method only exists on Windows — `_ctypes.c` builds the whole form
+/// under `MS_WIN32` — so off it there is no status to read and `com` is
+/// already `None` at every call.
+#[cfg(windows)]
+fn com_status(
+    obj: PyObjectRef,
+    com: Option<(usize, usize)>,
+    result: &host_ctypes::CallValue,
+) -> Option<Result<PyObjectRef, crate::PyError>> {
+    let (this_ptr, iid) = com_error_iid(obj, com)?;
+    let hresult = scalar_int_result(result);
+    Some(if hresult < 0 {
+        Err(super::com::error(hresult, iid, this_ptr))
+    } else {
+        Ok(pyre_object::w_int_new(hresult as i64))
+    })
+}
+
+#[cfg(not(windows))]
+fn com_status(
+    _obj: PyObjectRef,
+    _com: Option<(usize, usize)>,
+    _result: &host_ctypes::CallValue,
+) -> Option<Result<PyObjectRef, crate::PyError>> {
+    None
+}
+
 /// The `this` pointer and interface id a failed COM call reports through, when
 /// the method was constructed with an id at all.
 #[cfg(windows)]
@@ -1045,11 +1070,6 @@ fn com_error_iid(obj: PyObjectRef, com: Option<(usize, usize)>) -> Option<(usize
     // Anything that is not `GUID`-sized is not an interface id, and is passed
     // over the way an unrecognised one is.
     (len == 16).then_some((this_ptr, addr))
-}
-
-#[cfg(not(windows))]
-fn com_error_iid(_obj: PyObjectRef, _com: Option<(usize, usize)>) -> Option<(usize, usize)> {
-    None
 }
 
 /// The arguments a call is made with, and which of them the caller gets back.
