@@ -45,6 +45,25 @@ pub struct Finding {
     pub movable_use: Vec<String>,
 }
 
+/// What the scan could and could not account for.
+///
+/// A finding count means nothing without these: a body whose terminator the
+/// reader could not parse loses successors, which shrinks every live set
+/// computed from it, and a call sitting downstream of a `push_roots` is
+/// withheld rather than cleared.
+#[derive(Default)]
+pub struct ScanStats {
+    pub bodies_scanned: usize,
+    /// Bodies holding a terminator this reader could not classify.  Their
+    /// liveness is incomplete, so they are reported rather than counted clean.
+    pub unparsed_terminator_bodies: usize,
+    /// Collecting calls withheld because a `push_roots` dominates them.
+    /// Whether that scope is still alive at the call is a drop-placement
+    /// question this pass cannot answer, so they are neither reported nor
+    /// silently dropped.
+    pub withheld_under_a_bracket: usize,
+}
+
 /// Callee names that address a `list` or a `dict` through the pointer.
 fn addresses_movable(name: &str) -> bool {
     const MARKERS: &[&str] = &[
@@ -175,20 +194,24 @@ fn successors(t: &TermKind) -> Vec<u64> {
 
 /// Report every call that can collect and carries an unrooted live GC pointer.
 ///
-/// `bracketed` are the functions that already open a `push_roots` scope; they
-/// are skipped wholesale, because whether *that* scope covers *this* call is a
-/// question about pin/read-back placement, not about liveness.
+/// `push_roots` are the `gc_roots::push_roots` function ids.  Coverage is
+/// judged **per call**, not per function: a call is withheld only when every
+/// path to it runs through a `push_roots`, which is exactly "this block is
+/// unreachable from entry once the bracket blocks are removed".  A function
+/// that brackets one branch and leaves another bare is therefore still
+/// reported on the bare branch.
 pub fn scan(
     llbc: &majit_charon_reader::Llbc,
     cg: &super::framework::CallGraph,
     reach: &HashSet<u64>,
-    bracketed: &HashSet<u64>,
+    push_roots: &HashSet<u64>,
     gc_tys: &HashSet<u64>,
-) -> Vec<Finding> {
+) -> (Vec<Finding>, ScanStats) {
     let mut findings = Vec::new();
+    let mut stats = ScanStats::default();
     for fd in llbc.iter_local_fns() {
         let id = fd.def_id;
-        if bracketed.contains(&id) || !reach.contains(&id) {
+        if !reach.contains(&id) {
             continue;
         }
         let Some(body) = fd.unstructured() else {
@@ -211,8 +234,53 @@ pub fn scan(
             continue;
         }
 
+        stats.bodies_scanned += 1;
         let n = body.body.len();
         let terms: Vec<Option<TermKind>> = body.body.iter().map(|b| b.term().ok()).collect();
+        if terms
+            .iter()
+            .any(|t| t.is_none() || matches!(t, Some(TermKind::Unknown)))
+        {
+            // Successors are unknown for that block, so every live set derived
+            // from it is a lower bound.  Count the body; do not pretend it is
+            // clean.
+            stats.unparsed_terminator_bodies += 1;
+        }
+
+        // Blocks whose terminator opens a root scope, and the blocks that are
+        // still reachable from entry without them — those are the ones no
+        // bracket can dominate.
+        let bracket_blocks: HashSet<usize> = (0..n)
+            .filter(|&b| match &terms[b] {
+                Some(TermKind::Call { call, .. }) => match &call.func {
+                    CallFunc::Regular(reg) => matches!(
+                        &reg.kind,
+                        CallKind::Fun(FunId::Regular { id }) if push_roots.contains(id)
+                    ),
+                    _ => false,
+                },
+                _ => false,
+            })
+            .collect();
+        let unbracketed: HashSet<usize> = if bracket_blocks.is_empty() {
+            (0..n).collect()
+        } else {
+            let mut seen: HashSet<usize> = HashSet::new();
+            let mut work = vec![0usize];
+            while let Some(cur) = work.pop() {
+                if bracket_blocks.contains(&cur) || !seen.insert(cur) {
+                    continue;
+                }
+                if let Some(t) = &terms[cur] {
+                    for s in successors(t) {
+                        if (s as usize) < n {
+                            work.push(s as usize);
+                        }
+                    }
+                }
+            }
+            seen
+        };
         let mut live_in: Vec<HashSet<u64>> = vec![HashSet::new(); n];
         // Backward liveness to a fixed point.  The bodies are small; a plain
         // worklist over predecessors converges in a handful of rounds.
@@ -241,6 +309,27 @@ pub fn scan(
             }
         }
 
+        // Locals this body hands to a `list`/`dict`-addressing callee.  Built
+        // once: it does not depend on which collecting call is being judged.
+        let mut movable_args: HashSet<u64> = HashSet::new();
+        for other in &body.body {
+            let Ok(TermKind::Call { call: c2, .. }) = other.term() else {
+                continue;
+            };
+            let CallFunc::Regular(r2) = &c2.func else {
+                continue;
+            };
+            let CallKind::Fun(FunId::Regular { id: cid }) = &r2.kind else {
+                continue;
+            };
+            if !cg.names.get(cid).is_some_and(|n| addresses_movable(n)) {
+                continue;
+            }
+            for a in &c2.args {
+                use_operand(a, &mut movable_args);
+            }
+        }
+
         // Now re-walk, and at every collecting Call read the live-after set.
         for (b, bb) in body.body.iter().enumerate() {
             let Some(TermKind::Call {
@@ -258,6 +347,10 @@ pub fn scan(
                 continue;
             };
             if !reach.contains(callee) {
+                continue;
+            }
+            if !unbracketed.contains(&b) {
+                stats.withheld_under_a_bracket += 1;
                 continue;
             }
             let mut after: HashSet<u64> = HashSet::new();
@@ -289,34 +382,14 @@ pub fn scan(
                 .collect();
             non_arg.sort();
             in_arg.sort();
-            // Does any live pointer reach a list/dict-addressing callee later
-            // in this body?  Scanning the whole function rather than only the
-            // dominated successors keeps this a ranking signal, not a proof.
-            let mut movable_use: Vec<String> = Vec::new();
-            for other in &body.body {
-                let Ok(TermKind::Call { call: c2, .. }) = other.term() else {
-                    continue;
-                };
-                let CallFunc::Regular(r2) = &c2.func else {
-                    continue;
-                };
-                let CallKind::Fun(FunId::Regular { id: cid }) = &r2.kind else {
-                    continue;
-                };
-                if !cg.names.get(cid).is_some_and(|n| addresses_movable(n)) {
-                    continue;
-                }
-                let mut used = HashSet::new();
-                for a in &c2.args {
-                    use_operand(a, &mut used);
-                }
-                for l in after.iter().filter(|l| used.contains(l)) {
-                    let nm = gc_locals[l].clone();
-                    if !movable_use.contains(&nm) {
-                        movable_use.push(nm);
-                    }
-                }
-            }
+            // Does any live pointer reach a list/dict-addressing callee in this
+            // body?  Anywhere in the body, not only in the dominated
+            // successors — this is a ranking signal, not a proof.
+            let mut movable_use: Vec<String> = after
+                .iter()
+                .filter(|l| movable_args.contains(l))
+                .map(|l| gc_locals[l].clone())
+                .collect();
             movable_use.sort();
             findings.push(Finding {
                 func: id,
@@ -333,7 +406,7 @@ pub fn scan(
             });
         }
     }
-    findings
+    (findings, stats)
 }
 
 fn transfer_stmt(k: &StmtKind, live: &mut HashSet<u64>) {

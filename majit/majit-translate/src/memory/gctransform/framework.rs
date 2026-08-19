@@ -235,7 +235,11 @@ impl CallGraph {
         for pat in patterns {
             let mut any = false;
             for (&id, name) in &self.names {
-                if name.ends_with(pat) {
+                // Anchored on a path separator: an unanchored `ends_with`
+                // would let `fastcall::call_callable` answer for the
+                // `call::call_callable` seed, and an over-matched seed widens
+                // every verdict downstream of `reaching`.
+                if name == pat || name.ends_with(&format!("::{pat}")) {
                     ids.insert(id);
                     any = true;
                 }

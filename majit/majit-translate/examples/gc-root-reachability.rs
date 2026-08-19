@@ -80,8 +80,10 @@ fn main() {
             .map(|(&id, _)| id)
             .collect();
         if pin_ids.is_empty() {
+            // Not a reason to stop: an artefact that brackets nothing is the
+            // one most likely to hold defects, and the liveness scan below is
+            // exactly what answers for it.
             println!("   (no gc_roots::push_roots in this artefact's name table)");
-            continue;
         }
         let mut bracketed: Vec<u64> = cg
             .callees
@@ -169,8 +171,25 @@ fn main() {
             println!("   (no PyObjectRef type id found — liveness scan skipped)");
             continue;
         }
-        let bracket_set: std::collections::HashSet<u64> = bracketed.iter().copied().collect();
-        let found = liveness::scan(&llbc, &cg, &reach, &bracket_set, &gc_tys);
+        let push_root_ids: std::collections::HashSet<u64> = pin_ids.iter().copied().collect();
+        let (found, stats) = liveness::scan(&llbc, &cg, &reach, &push_root_ids, &gc_tys);
+        println!(
+            "   liveness scan: {} bodies; {} with a terminator this reader could not parse; \
+             {} call(s) withheld as dominated by a push_roots",
+            stats.bodies_scanned, stats.unparsed_terminator_bodies, stats.withheld_under_a_bracket
+        );
+        // The resolved graph is an *under*-approximation of what collects: a
+        // call whose dispatch edge is unresolved is excluded, so a clean
+        // resolved census is not a clean census.  Re-run with the opaque set
+        // folded in and report both, rather than let the difference go unsaid.
+        let mut conservative = reach.clone();
+        conservative.extend(opaque.iter().copied());
+        let (found_conservative, _) =
+            liveness::scan(&llbc, &cg, &conservative, &push_root_ids, &gc_tys);
+        let conservative_fns: std::collections::BTreeSet<&str> = found_conservative
+            .iter()
+            .map(|f| f.func_name.as_str())
+            .collect();
         let mut by_fn: std::collections::BTreeMap<&str, Vec<&liveness::Finding>> =
             Default::default();
         for f in &found {
@@ -185,6 +204,11 @@ fn main() {
             "   unbracketed calls that can collect with a live PyObjectRef: {} in {} fn(s)",
             found.len(),
             by_fn.len()
+        );
+        println!(
+            "       counting unresolved dispatch as collecting too: {} in {} fn(s)",
+            found_conservative.len(),
+            conservative_fns.len()
         );
         println!(
             "       of which hold a NON-ARGUMENT live pointer: {} fn(s)",
@@ -230,6 +254,13 @@ fn main() {
             "       tier 1.5 (live ptr later addressed as list/dict): {} call(s) in {} fn(s)",
             tier15.len(),
             t15_fns.len()
+        );
+        let t15_conservative = found_conservative
+            .iter()
+            .filter(|f| !seeds.contains(&f.callee_id) && !f.movable_use.is_empty())
+            .count();
+        println!(
+            "       tier 1.5 counting unresolved dispatch too: {t15_conservative} call(s)"
         );
         if std::env::var("GC_LIVENESS_TIER15").is_ok() {
             for f in &tier15 {
