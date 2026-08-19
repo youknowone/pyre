@@ -3363,7 +3363,7 @@ pub fn make_resume_guard_descr_range_foriter(green_key: u64) -> DescrRef {
 /// caller FOR_ITER key.  A guard-failure bridge uses the tag to keep the
 /// exception-to-exhaustion conversion on the generic residual path.
 ///
-/// `opcode` selects the subtype `compile.py:919-937 invent_fail_descr_for_op`
+/// `opcode` selects the subtype `compile.py:924-942 invent_fail_descr_for_op`
 /// would have minted.  Stamping this descr fills `op.getdescr()`, and
 /// `store_final_boxes_in_guard` only invents on the empty arm — so a marker
 /// minted as a plain `ResumeGuardDescr` would cost a `GUARD_NOT_FORCED` its
