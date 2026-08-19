@@ -10509,9 +10509,34 @@ impl CraneliftBackend {
                     // earlier LABEL. Re-materialize it from the forwarded root
                     // slot at this header so the fall-through transfer can pass
                     // it onward without restoring a loop phi.
+                    //
+                    // That later LABEL is the only reader of the SSA variable.
+                    // The loop body never `use_var`s a demoted ref — the reason
+                    // `spill_ref_roots` and `reload_ref_roots` both skip one —
+                    // a guard exit reaches the value through
+                    // `demoted_failarg_slots`, and a JUMP filters demoted
+                    // positions out of its args. With no later LABEL demoting
+                    // the same raw the load has no use, and a load is never
+                    // dead code to Cranelift: `MemFlags::trusted()` is not
+                    // `readonly`, so the egraph keeps it, and it would sit in
+                    // the header on every iteration of the loop.
                     if let Some(positions) = demoted_ref_positions_by_label.get(&op_idx) {
-                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
+                        let mut cur_jf = None;
                         for &(_, raw, ofs) in positions {
+                            let passed_on =
+                                demoted_ref_positions_by_label
+                                    .iter()
+                                    .any(|(&later_idx, later)| {
+                                        later_idx > op_idx
+                                            && later
+                                                .iter()
+                                                .any(|&(_, later_raw, _)| later_raw == raw)
+                                    });
+                            if !passed_on {
+                                continue;
+                            }
+                            let cur_jf = *cur_jf
+                                .get_or_insert_with(|| builder.ins().get_pinned_reg(ptr_type));
                             let value = builder.ins().load(
                                 cl_types::I64,
                                 MemFlagsData::trusted(),
