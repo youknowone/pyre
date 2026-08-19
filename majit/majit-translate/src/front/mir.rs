@@ -7335,8 +7335,9 @@ impl<'a> Lowering<'a> {
                 // mutable leaf is gated on the [`add_dest_used_only_as_single_deref`]
                 // escape guard (a failing shape stays residual — safe).  The
                 // read leaf (`index`, a value copy) needs no such guard.
+                let workspace_index = self.is_workspace_index_call(&reg);
                 if args.len() == 2
-                    && (self.is_workspace_index_call(&reg)
+                    && (workspace_index
                         || (self.is_vec_index_call(&reg)
                             && (!is_vec_index_mut_regular(&reg, self.llbc)
                                 || add_dest_used_only_as_single_deref(self.body, dest_local)))
@@ -7347,18 +7348,31 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    // `Index::index(_mut)` returns `&T`/`&mut T`, while
+                    // RPython's getarrayitem returns `T`.  Preserve that
+                    // pointee kind: treating the reference wrapper itself as
+                    // the item makes an integer Vec load flow into
+                    // `int_mul/ri>i`.
+                    let item_ty = tyref_deref_value_type(&call.dest.ty, self.llbc);
+                    // The `pyre_`-fenced workspace arm has exactly three
+                    // element banks — `FixedObjectArray` (Ref), `IntArray`,
+                    // `FloatArray` — so a Ref element there IS the
+                    // length-prefixed object block `set_ref` and the `swap`
+                    // decomposition name, and this read has to share their
+                    // descr or a cached element survives their store.  The
+                    // `Vec<T>` and slice legs reach Ref elements that are not
+                    // that block, and they keep the identity-less descr,
+                    // which `arraydescrof_concrete` mints locally without a
+                    // cache publish.
+                    let array_type_id = (workspace_index && matches!(item_ty, ValueType::Ref(_)))
+                        .then(|| PYOBJECT_GCARRAY_TYPE_ID.to_string());
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::ArrayRead {
                             base: args[0].clone(),
                             index: args[1].clone(),
-                            // `Index::index(_mut)` returns `&T`/`&mut T`,
-                            // while RPython's getarrayitem returns `T`.
-                            // Preserve that pointee kind: treating the
-                            // reference wrapper itself as the item makes an
-                            // integer Vec load flow into `int_mul/ri>i`.
-                            item_ty: tyref_deref_value_type(&call.dest.ty, self.llbc),
-                            array_type_id: None,
+                            item_ty,
+                            array_type_id: array_type_id.clone(),
                             nolength: false,
                             pure: false,
                         },
@@ -7370,7 +7384,7 @@ impl<'a> Lowering<'a> {
                             base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
-                            array_type_id: None,
+                            array_type_id,
                         },
                     );
                     self.local_var[dest_local] = Some(res);
@@ -7511,6 +7525,23 @@ impl<'a> Lowering<'a> {
                     let base = args[0].clone();
                     let idx_a = args[1].clone();
                     let idx_b = args[2].clone();
+                    // The four synthetic ops below name the SLICE's own item
+                    // kind and array identity.  `swap` is matched by name
+                    // alone, and the name reaches four element kinds: the
+                    // `i64` / `f64` / `usize` monomorphizations of
+                    // `listsort::sort_with`, the `array` module's `Vec<u8>`
+                    // byte buffer, and `FixedObjectArray::swap`'s
+                    // `&mut [PyObjectRef]`.  Only the last is the
+                    // length-prefixed object block, whose identity every
+                    // other devirtualized accessor arm spells explicitly;
+                    // leaving it unnamed keeps the swap out of that descr's
+                    // key, so a trace could cache an element through one arm
+                    // and miss the invalidation this store owes it.  The
+                    // unboxed banks must NOT borrow that identity, so the
+                    // name follows the element kind.
+                    let elem_ty = self.slice_swap_elem_value_type(&reg);
+                    let elem_array_type_id = matches!(elem_ty, ValueType::Ref(_))
+                        .then(|| PYOBJECT_GCARRAY_TYPE_ID.to_string());
                     let elem_a = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7522,8 +7553,8 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayRead {
                             base: base.clone(),
                             index: idx_a.clone(),
-                            item_ty: ValueType::Ref(None),
-                            array_type_id: None,
+                            item_ty: elem_ty.clone(),
+                            array_type_id: elem_array_type_id.clone(),
                             nolength: false,
                             pure: false,
                         },
@@ -7533,8 +7564,8 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayRead {
                             base: base.clone(),
                             index: idx_b.clone(),
-                            item_ty: ValueType::Ref(None),
-                            array_type_id: None,
+                            item_ty: elem_ty.clone(),
+                            array_type_id: elem_array_type_id.clone(),
                             nolength: false,
                             pure: false,
                         },
@@ -7545,8 +7576,8 @@ impl<'a> Lowering<'a> {
                             base: base.clone(),
                             index: idx_a,
                             value: LinkArg::Value(elem_b),
-                            item_ty: ValueType::Ref(None),
-                            array_type_id: None,
+                            item_ty: elem_ty.clone(),
+                            array_type_id: elem_array_type_id.clone(),
                             nolength: false,
                         },
                     });
@@ -7556,8 +7587,8 @@ impl<'a> Lowering<'a> {
                             base,
                             index: idx_b,
                             value: LinkArg::Value(elem_a),
-                            item_ty: ValueType::Ref(None),
-                            array_type_id: None,
+                            item_ty: elem_ty.clone(),
+                            array_type_id: elem_array_type_id.clone(),
                             nolength: false,
                         },
                     });
@@ -9981,6 +10012,25 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::swap")
+    }
+
+    /// Element type of a `core::slice::<Impl>::swap` call, read off the
+    /// call's own type arguments (`generics.types[0]`) the way
+    /// [`Self::tyref_adt_type_arg`] reads an ADT's.  The swap decomposition
+    /// synthesizes `ArrayRead`/`ArrayWrite` pairs the MIR never spells, and
+    /// both the item kind and the array identity have to be the SLICE's, not
+    /// a fixed guess: `swap` is matched by name alone, so it also reaches the
+    /// unboxed typed-strategy backings.  Falls back to `Ref(None)` when the
+    /// type argument cannot be read, which is the shape the decomposition
+    /// assumed unconditionally before.
+    fn slice_swap_elem_value_type(&self, reg: &RegularCall) -> ValueType {
+        reg.generics
+            .get("types")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+            .and_then(|node| serde_json::from_value::<TyRef>(node.clone()).ok())
+            .map(|ty| tyref_to_value_type(&ty, self.llbc))
+            .unwrap_or(ValueType::Ref(None))
     }
 
     /// `FixedObjectArray::set_ref(self, index, value)` — the GC-published
