@@ -7472,65 +7472,6 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
-    #[allow(dead_code)]
-    fn decode_descriptor_values(
-        descriptor: Option<&JitDriverStaticData>,
-        raw_values: &[i64],
-    ) -> Option<Vec<Value>> {
-        let descriptor = descriptor?;
-        let reds = descriptor.reds();
-        if reds.len() != raw_values.len() {
-            return None;
-        }
-        Some(
-            reds.iter()
-                .zip(raw_values.iter().copied())
-                .map(|(var, raw)| match var.tp {
-                    Type::Int => Value::Int(raw),
-                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                    Type::Void => Value::Void,
-                })
-                .collect(),
-        )
-    }
-
-    #[allow(dead_code)]
-    fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
-        layout
-            .exit_types
-            .iter()
-            .enumerate()
-            .map(|(index, tp)| {
-                let raw = raw_values.get(index).copied().unwrap_or(0);
-                match tp {
-                    Type::Int => Value::Int(raw),
-                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                    Type::Void => Value::Void,
-                }
-            })
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    fn resume_layout_with_descriptor_slot_types(
-        descriptor: Option<&JitDriverStaticData>,
-        resume_layout: &ResumeLayoutSummary,
-    ) -> Option<ResumeLayoutSummary> {
-        let descriptor = descriptor?;
-        let red_types: Vec<Type> = descriptor.reds().iter().map(|var| var.tp).collect();
-        let last = resume_layout.frame_layouts.last()?;
-        if last.slot_types.is_some() || last.slot_layouts.len() != red_types.len() {
-            return None;
-        }
-        let mut patched = resume_layout.clone();
-        if let Some(last) = patched.frame_layouts.last_mut() {
-            last.slot_types = Some(red_types);
-        }
-        Some(patched)
-    }
-
     /// Invalidate a compiled loop, forcing fallback to interpretation.
     pub fn invalidate_loop(&mut self, green_key: u64) {
         self.meta.invalidate_loop(green_key);
