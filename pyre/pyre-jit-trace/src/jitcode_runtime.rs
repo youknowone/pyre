@@ -580,12 +580,17 @@ struct DescrIndex {
     /// `0` for structural/dispatch descriptors, `1` for Call/JitCode.
     /// Mirrors the two groups consumed by `rehydrate_build_descr_raw_sets`.
     kinds: Box<[u8]>,
+    /// Dense reference into `descr_layouts.bin`, or `u32::MAX` for a
+    /// descriptor without a parent.  This is the frozen-image spelling of
+    /// PyPy's `FieldDescr.parent_descr` reference to the one SizeDescr owned
+    /// by `GcCache`; it is not a runtime semantic side table.
+    parent_layouts: Box<[u32]>,
 }
 
 fn load_descr_index() -> DescrIndex {
     const INDEX_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs_index.bin"));
     const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
-    let (offsets, kinds): (Vec<u32>, Vec<u8>) =
+    let (offsets, kinds, parent_layouts): (Vec<u32>, Vec<u8>, Vec<u32>) =
         bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
             panic!(
                 "pyre-jit-trace: failed to deserialize descrs_index.bin \
@@ -598,10 +603,12 @@ fn load_descr_index() -> DescrIndex {
     assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
     assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
     assert_eq!(kinds.len() + 1, offsets.len());
+    assert_eq!(parent_layouts.len(), kinds.len());
     assert!(kinds.iter().all(|kind| matches!(kind, 0 | 1)));
     DescrIndex {
         offsets: offsets.into_boxed_slice(),
         kinds: kinds.into_boxed_slice(),
+        parent_layouts: parent_layouts.into_boxed_slice(),
     }
 }
 
@@ -614,18 +621,86 @@ fn descr_count() -> usize {
     descrs_index().kinds.len()
 }
 
+fn descr_layout_offsets() -> &'static [u32] {
+    static OFFSETS: OnceLock<Box<[u32]>> = OnceLock::new();
+    OFFSETS.get_or_init(|| {
+        const INDEX_BYTES: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts_index.bin"));
+        const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+        let offsets: Vec<u32> = bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize descr_layouts_index.bin \
+                 ({} bytes): {e}",
+                INDEX_BYTES.len(),
+            )
+        });
+        assert!(!offsets.is_empty());
+        assert_eq!(offsets.first().copied(), Some(0));
+        assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        offsets.into_boxed_slice()
+    })
+}
+
+fn descr_layout_cells() -> &'static [OnceLock<std::sync::Arc<majit_translate::jitcode::BhSizeSpec>>]
+{
+    static CELLS: OnceLock<
+        &'static [OnceLock<std::sync::Arc<majit_translate::jitcode::BhSizeSpec>>],
+    > = OnceLock::new();
+    CELLS.get_or_init(|| {
+        Box::leak(
+            (0..descr_layout_offsets().len() - 1)
+                .map(|_| OnceLock::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    })
+}
+
+fn descr_layout_at(index: usize) -> std::sync::Arc<majit_translate::jitcode::BhSizeSpec> {
+    descr_layout_cells()[index]
+        .get_or_init(|| {
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+            let offsets = descr_layout_offsets();
+            let start = offsets[index] as usize;
+            let end = offsets[index + 1] as usize;
+            std::sync::Arc::new(
+                bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
+                    panic!(
+                        "pyre-jit-trace: failed to deserialize descr_layouts.bin entry \
+                         {index} ({start}..{end} of {} bytes): {e}",
+                        BYTES.len(),
+                    )
+                }),
+            )
+        })
+        .clone()
+}
+
 fn load_descr_uncached(index: usize) -> BhDescr {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
     let offsets = &descrs_index().offsets;
     let start = offsets[index] as usize;
     let end = offsets[index + 1] as usize;
-    bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
+    let mut descr: BhDescr = bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
         panic!(
             "pyre-jit-trace: failed to deserialize descrs.bin entry {index} \
              ({start}..{end} of {} bytes): {e}",
             BYTES.len(),
         )
-    })
+    });
+    let parent_layout = descrs_index().parent_layouts[index];
+    if parent_layout != u32::MAX {
+        let BhDescr::Field { parent, .. } = &mut descr else {
+            panic!("descriptor slot {index} carries a parent layout but is not a Field");
+        };
+        assert!(
+            parent.is_none(),
+            "wire Field unexpectedly embeds its parent layout"
+        );
+        *parent = Some(descr_layout_at(parent_layout as usize));
+    }
+    descr
 }
 
 fn descr_cells() -> &'static [OnceLock<&'static BhDescr>] {
@@ -2145,6 +2220,52 @@ mod tests {
             );
             assert_eq!(kind, u8::from(call_like), "descriptor index {i}");
         }
+    }
+
+    #[test]
+    fn frozen_field_parents_share_the_canonical_layout_object() {
+        let index = descrs_index();
+        let layout_count = descr_layout_offsets().len() - 1;
+        assert_eq!(index.parent_layouts.len(), descr_count());
+
+        let mut first_parent_by_layout: std::collections::BTreeMap<
+            u32,
+            std::sync::Arc<majit_translate::jitcode::BhSizeSpec>,
+        > = std::collections::BTreeMap::new();
+        let mut parent_references = 0usize;
+        for (slot, &layout_index) in index.parent_layouts.iter().enumerate() {
+            let descr = load_descr_uncached(slot);
+            if layout_index == u32::MAX {
+                if let BhDescr::Field { parent, .. } = descr {
+                    assert!(parent.is_none(), "parentless Field slot {slot}");
+                }
+                continue;
+            }
+
+            assert!((layout_index as usize) < layout_count);
+            let BhDescr::Field {
+                parent: Some(parent),
+                ..
+            } = descr
+            else {
+                panic!("layout-bearing descriptor slot {slot} is not a parented Field");
+            };
+            parent_references += 1;
+            if let Some(first) = first_parent_by_layout.get(&layout_index) {
+                assert!(
+                    std::sync::Arc::ptr_eq(first, &parent),
+                    "layout {layout_index} was decoded into more than one object"
+                );
+            } else {
+                first_parent_by_layout.insert(layout_index, parent);
+            }
+        }
+
+        assert_eq!(first_parent_by_layout.len(), layout_count);
+        assert!(
+            parent_references > layout_count,
+            "fixture must exercise shared parent layouts"
+        );
     }
 
     #[test]

@@ -5660,7 +5660,7 @@ mod tests {
             is_immutable: true,
             is_quasi_immutable: false,
             index_in_parent: Some(1),
-            parent: Some(parent),
+            parent: Some(std::sync::Arc::new(parent)),
             name: "value".into(),
             owner: "Cell".into(),
         });
@@ -5718,7 +5718,7 @@ mod tests {
             is_immutable: capacity.is_immutable,
             is_quasi_immutable: capacity.is_quasi_immutable,
             index_in_parent: Some(capacity.index_in_parent),
-            parent: Some(parent),
+            parent: Some(std::sync::Arc::new(parent)),
             name: "capacity".into(),
             owner: "ItemsBlock".into(),
         });
@@ -7019,7 +7019,11 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 is_class_word: None,
             };
             // The claim itself goes beside the spec, unflattened.
-            field_descr_from_bh_field(&field, parent.as_ref(), *index_in_parent)
+            field_descr_from_bh_field(
+                &field,
+                parent.as_ref().map(std::sync::Arc::as_ref),
+                *index_in_parent,
+            )
         }
         BhDescr::Array {
             base_size,

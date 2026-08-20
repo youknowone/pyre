@@ -10484,14 +10484,14 @@ mod tests {
             is_immutable: false,
             is_quasi_immutable: false,
             index_in_parent: Some(0),
-            parent: Some(majit_translate::jitcode::BhSizeSpec {
+            parent: Some(std::sync::Arc::new(majit_translate::jitcode::BhSizeSpec {
                 size,
                 type_id,
                 vtable,
                 is_gc_managed: true,
                 headerless: false,
                 all_fielddescrs: vec![spec],
-            }),
+            })),
             name: field.to_string(),
             owner: String::new(),
         }
@@ -10545,7 +10545,7 @@ mod tests {
                 parent: Some(p), ..
             } = &mut descr
             {
-                p.all_fielddescrs.clear();
+                std::sync::Arc::make_mut(p).all_fielddescrs.clear();
             }
             descr
         };
@@ -10594,6 +10594,7 @@ mod tests {
                 parent: Some(p), ..
             } = &mut descr
             {
+                let p = std::sync::Arc::make_mut(p);
                 p.is_gc_managed = false;
                 p.headerless = true;
                 if drop_fields {

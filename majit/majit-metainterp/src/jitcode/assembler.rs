@@ -955,7 +955,7 @@ impl JitCodeBuilder {
             is_immutable: false,
             is_quasi_immutable: false,
             index_in_parent,
-            parent,
+            parent: parent.map(std::sync::Arc::new),
             name,
             owner: String::new(),
         })
@@ -6009,7 +6009,7 @@ impl JitCodeBuilder {
             let Some(final_spec) = self.struct_size_specs.get(&p.type_id) else {
                 continue;
             };
-            *p = final_spec.clone();
+            *p = std::sync::Arc::new(final_spec.clone());
             let Some(idx) = field_slot_in(&p.all_fielddescrs, name, *offset) else {
                 continue;
             };

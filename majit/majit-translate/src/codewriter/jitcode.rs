@@ -13,7 +13,7 @@
 //! this type directly, eliminating the fork.
 
 use std::ops::Deref;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -1160,6 +1160,27 @@ impl BhFieldSpec {
         }
     }
 
+    /// Whether two serialized field rows describe the same PyPy
+    /// `FieldDescr` layout.  `GcCache.get_field_descr` keys the descriptor
+    /// by `(STRUCT, fieldname)`; its synthesized `name` is only the printable
+    /// `STRUCT._name + '.' + fieldname`.  Charon can spell the same Rust owner
+    /// through different import paths, so that printable prefix must not turn
+    /// one STRUCT's translated constant into several layouts.
+    pub fn same_descr_layout(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.field_key() == other.field_key()
+            && self.offset == other.offset
+            && self.field_size == other.field_size
+            && self.field_type == other.field_type
+            && self.field_flag == other.field_flag
+            && self.is_field_signed == other.is_field_signed
+            && self.is_immutable == other.is_immutable
+            && self.is_quasi_immutable == other.is_quasi_immutable
+            && self.index_in_parent == other.index_in_parent
+            && majit_ir::descr::class_word_inferred_from_name(&self.name)
+                == majit_ir::descr::class_word_inferred_from_name(&other.name)
+    }
+
     /// Mirror an `Arc<dyn FieldDescr>` into the serializable
     /// `BhFieldSpec` shape so producers outside the codewriter
     /// (e.g. blackhole-allocator dispatch in `pyre-jit`) can build
@@ -1254,6 +1275,24 @@ pub struct BhSizeSpec {
     #[serde(default)]
     pub headerless: bool,
     pub all_fielddescrs: Vec<BhFieldSpec>,
+}
+
+impl BhSizeSpec {
+    /// Layout equality for the one `SizeDescr` stored in
+    /// `GcCache._cache_size[STRUCT]` by `GcCache.get_size_descr`.
+    pub fn same_descr_layout(&self, other: &Self) -> bool {
+        self.size == other.size
+            && self.type_id == other.type_id
+            && self.vtable == other.vtable
+            && self.is_gc_managed == other.is_gc_managed
+            && self.headerless == other.headerless
+            && self.all_fielddescrs.len() == other.all_fielddescrs.len()
+            && self
+                .all_fielddescrs
+                .iter()
+                .zip(&other.all_fielddescrs)
+                .all(|(left, right)| left.same_descr_layout(right))
+    }
 }
 
 /// serde default for `is_gc_managed` — preserve the guard for specs
@@ -1356,7 +1395,14 @@ pub enum BhDescr {
         /// nonzero index, a state with no meaning, and nothing would stop a
         /// later edit from writing it.
         index_in_parent: Option<usize>,
-        parent: Option<BhSizeSpec>,
+        /// `GcCache.get_field_descr` stores a reference to the one
+        /// `GcCache._cache_size[STRUCT]` object here; it does not copy the
+        /// parent's `all_fielddescrs` list into every field descriptor.
+        /// Keep that ownership shape on this side as well.  The frozen wire
+        /// image serializes these shared objects through a separate dense
+        /// layout table, preserving the sharing across the build/runtime
+        /// process boundary.
+        parent: Option<Arc<BhSizeSpec>>,
         name: String,
         owner: String,
     },
@@ -2228,6 +2274,37 @@ impl BhDescr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_bh_field(name: &str) -> BhFieldSpec {
+        BhFieldSpec {
+            index: 7,
+            field_key: "value".to_string(),
+            name: name.to_string(),
+            offset: 8,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+        }
+    }
+
+    #[test]
+    fn bh_field_layout_ignores_only_the_printable_owner_spelling() {
+        let canonical = test_bh_field("core::option::Option.value");
+        let imported = test_bh_field("option::Option.value");
+        assert!(canonical.same_descr_layout(&imported));
+
+        let mut moved = imported.clone();
+        moved.offset += 8;
+        assert!(!canonical.same_descr_layout(&moved));
+
+        let mut renamed = imported;
+        renamed.field_key = "other".to_string();
+        assert!(!canonical.same_descr_layout(&renamed));
+    }
 
     #[test]
     fn switch_dict_descr_unattached_renders_question_mark() {

@@ -4182,7 +4182,7 @@ fn fielddescrof(
         // here is what made the split underivable at the reader, and this is
         // the last place that still knows the difference.
         index_in_parent,
-        parent,
+        parent: parent.map(std::sync::Arc::new),
         name: field_key,
         owner: canonical_owner.unwrap_or_default(),
     }
@@ -5275,7 +5275,7 @@ enum AssemblerDescrKey {
         /// descr, and collapsing them here would hand the runtime whichever
         /// provenance happened to be minted first.
         index_in_parent: Option<usize>,
-        parent: Option<crate::jitcode::BhSizeSpec>,
+        parent: Option<std::sync::Arc<crate::jitcode::BhSizeSpec>>,
         name: String,
         owner: String,
     },
