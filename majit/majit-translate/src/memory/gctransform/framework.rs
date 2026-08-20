@@ -322,62 +322,96 @@ impl CallGraph {
 /// program, and `collect_analyzer` closes over the whole call graph at once.
 /// So the artefacts are joined back into one graph here.
 ///
-/// The join key is `item_meta.name_path()`.  Two artefacts that both carry a
-/// body for the same name contribute the union of its edges; two genuinely
-/// different functions sharing a spelling would be merged into one node.  Both
-/// can only *widen* `reaching`, which is the safe direction for this question —
-/// `framework.py` errs towards bracketing an operation that cannot collect,
-/// never towards leaving one bare.
+/// # The join key does not always identify a function
+///
+/// `ItemMeta::name_path` renders an inherent `impl` block as the opaque segment
+/// `<Impl>`, so `PyFrame::new` and `FrameDebugData::new` are both spelled
+/// `pyframe::<Impl>::new`.  Joining on that spelling merges them into one node
+/// and invents an edge from every caller of one to every callee of the other —
+/// which is how a `getorcreatedebug` that only allocates came out reaching
+/// `call_user_function_with_args`.  Widening is not automatically safe here:
+/// `framework.py` over-brackets rather than under-brackets, but a fabricated
+/// path is not conservatism, it is a wrong answer with a citation.
+///
+/// So a name **one artefact carries more than once** is not a join key at all:
+/// each occurrence keeps its own node, exactly as it had before the join.  What
+/// is joined is the unambiguous majority — the free functions the JIT reaches
+/// the interpreter through (`finditem_str`, `call_function_impl_result`) — and
+/// [`Self::ambiguous_names`] reports what that rule held back.
 pub struct Joined {
-    /// The joined graph, over canonical ids: one per distinct name.
-    ///
-    /// `opaque` is left empty.  An opaque *count* is per-artefact accounting,
-    /// and summing two of them double-counts every body both artefacts carry;
-    /// `indirect` is joined, because that one is a per-function fact.
+    /// The joined graph.  Its `opaque` census is left empty: an opaque *count*
+    /// is per-artefact accounting, and summing two of them double-counts every
+    /// body both artefacts carry.  `indirect` is joined, being a per-function
+    /// fact.
     pub graph: CallGraph,
-    canonical: HashMap<String, u64>,
-    /// Names carried by more than one of the joined artefacts, or by one of
-    /// them more than once.  Reported rather than assumed away: this is the
-    /// count that says how much the join merged.
-    pub shared_names: usize,
+    /// `part index -> (that artefact's def id -> node id)`.
+    canonical: Vec<HashMap<u64, u64>>,
+    /// Unambiguous names carried by more than one artefact — what the join
+    /// actually merged.
+    pub joined_names: usize,
+    /// Names some artefact carries more than once, kept apart.
+    pub ambiguous_names: usize,
 }
 
 impl Joined {
     pub fn build(parts: &[&CallGraph]) -> Self {
-        let mut canonical: HashMap<String, u64> = HashMap::new();
-        let mut names: HashMap<u64, String> = HashMap::new();
-        let mut shared_names = 0usize;
+        let mut ambiguous: HashSet<&str> = HashSet::new();
         for part in parts {
-            // Sorted, so the canonical numbering does not depend on hash order
-            // and two runs over the same inputs print the same ids.
-            let mut sorted: Vec<&String> = part.names.values().collect();
-            sorted.sort_unstable();
-            for n in sorted {
-                if canonical.contains_key(n) {
-                    shared_names += 1;
-                    continue;
+            let mut seen: HashSet<&str> = HashSet::new();
+            for name in part.names.values() {
+                if !seen.insert(name.as_str()) {
+                    ambiguous.insert(name.as_str());
                 }
-                let id = canonical.len() as u64;
-                canonical.insert(n.clone(), id);
-                names.insert(id, n.clone());
             }
+        }
+        let mut shared: HashMap<&str, u64> = HashMap::new();
+        let mut names: HashMap<u64, String> = HashMap::new();
+        let mut canonical: Vec<HashMap<u64, u64>> = Vec::with_capacity(parts.len());
+        let mut next = 0u64;
+        let mut joined_names = 0usize;
+        for part in parts {
+            // Sorted, so the numbering does not depend on hash order and two
+            // runs over the same inputs print the same ids.
+            let mut sorted: Vec<(&u64, &String)> = part.names.iter().collect();
+            sorted.sort_unstable_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+            let mut mine: HashMap<u64, u64> = HashMap::new();
+            for (&def_id, name) in sorted {
+                let id = if ambiguous.contains(name.as_str()) {
+                    let id = next;
+                    next += 1;
+                    names.insert(id, name.clone());
+                    id
+                } else if let Some(&id) = shared.get(name.as_str()) {
+                    joined_names += 1;
+                    id
+                } else {
+                    let id = next;
+                    next += 1;
+                    names.insert(id, name.clone());
+                    shared.insert(name.as_str(), id);
+                    id
+                };
+                mine.insert(def_id, id);
+            }
+            canonical.push(mine);
         }
         let mut callees: HashMap<u64, HashSet<u64>> = HashMap::new();
         let mut callers: HashMap<u64, HashSet<u64>> = HashMap::new();
         let mut indirect: HashSet<u64> = HashSet::new();
-        for part in parts {
-            let canon = |id: &u64| part.names.get(id).and_then(|n| canonical.get(n)).copied();
+        for (part, map) in parts.iter().zip(&canonical) {
             for (caller, cs) in &part.callees {
-                let Some(from) = canon(caller) else { continue };
+                let Some(&from) = map.get(caller) else {
+                    continue;
+                };
                 let entry = callees.entry(from).or_default();
                 for callee in cs {
-                    if let Some(to) = canon(callee) {
+                    if let Some(&to) = map.get(callee) {
                         entry.insert(to);
                     }
                 }
             }
             for id in &part.indirect {
-                if let Some(c) = canon(id) {
+                if let Some(&c) = map.get(id) {
                     indirect.insert(c);
                 }
             }
@@ -396,18 +430,19 @@ impl Joined {
                 opaque: OpaqueCensus::default(),
             },
             canonical,
-            shared_names,
+            joined_names,
+            ambiguous_names: ambiguous.len(),
         }
     }
 
-    /// Project a set of joined ids back onto one artefact's local ids, so the
+    /// Project a set of joined nodes back onto one artefact's def ids, so the
     /// liveness scan — which walks that artefact's bodies — can be asked the
-    /// whole-program question.
-    pub fn project(&self, cg: &CallGraph, joined: &HashSet<u64>) -> HashSet<u64> {
-        cg.names
+    /// whole-program question.  `part` indexes the slice `build` was given.
+    pub fn project(&self, part: usize, joined: &HashSet<u64>) -> HashSet<u64> {
+        self.canonical[part]
             .iter()
-            .filter(|(_, n)| self.canonical.get(*n).is_some_and(|c| joined.contains(c)))
-            .map(|(&id, _)| id)
+            .filter(|(_, cid)| joined.contains(cid))
+            .map(|(&def_id, _)| def_id)
             .collect()
     }
 }

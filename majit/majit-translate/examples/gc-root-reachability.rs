@@ -94,9 +94,11 @@ fn main() {
         }
         if !donor_graphs.is_empty() {
             println!(
-                "   joined graph          : {} distinct names; {} name(s) carried by more than one artefact",
+                "   joined graph          : {} nodes; {} spelling(s) merged across artefacts, \
+                 {} held apart as ambiguous",
                 joined.graph.names.len(),
-                joined.shared_names
+                joined.joined_names,
+                joined.ambiguous_names
             );
         }
         // A seed that matches nothing empties half the closure silently, and
@@ -149,7 +151,7 @@ fn main() {
         let (jcol, _) = joined.graph.seeds_for(framework::COLLECTING_SEEDS);
         let mut joined_seeds = jpy;
         joined_seeds.extend(jcol);
-        let reach = joined.project(&cg, &joined.graph.reaching(&joined_seeds));
+        let reach = joined.project(0, &joined.graph.reaching(&joined_seeds));
         // The seeds as *this* artefact spells them.  The tiering below compares
         // a finding's `callee_id`, which is an id in this artefact, so it needs
         // the local set; the closure above needs the joined one.
@@ -208,7 +210,7 @@ fn main() {
         // dispatches through a `global_hook!` function pointer makes every one
         // of its callers undecidable too, not just itself.  Without this the
         // "cannot reach a collection" bucket silently absorbs them.
-        let opaque = joined.project(&cg, &joined.graph.reaching(&joined.graph.indirect));
+        let opaque = joined.project(0, &joined.graph.reaching(&joined.graph.indirect));
         let (mut justified, mut undecidable, mut unjustified) = (0usize, 0usize, Vec::new());
         for id in &bracketed {
             if reach.contains(id) {
