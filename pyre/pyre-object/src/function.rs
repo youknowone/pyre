@@ -186,8 +186,10 @@ pub struct StaticMethod {
     /// layout.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
     /// i.e. non-moving, which is [`crate::quasiimmut::QuasiImmutField`]'s
     /// stated precondition: the lock cannot be remapped out from under a
-    /// holder, and the compile-time watcher registration resolves this owner
-    /// by the address recording saw.
+    /// holder.  Recording binds the instance onto the marker descr as an
+    /// `Arc`, so the compiler never re-resolves this owner and a sweep
+    /// mid-compile is safe; the sweep hook is `{static,class}method_destructor`
+    /// in `pyre-jit/src/eval.rs`.
     pub w_function_watchers: crate::quasiimmut::QuasiImmutField,
 }
 
@@ -371,8 +373,10 @@ pub struct ClassMethod {
     /// layout.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
     /// i.e. non-moving, which is [`crate::quasiimmut::QuasiImmutField`]'s
     /// stated precondition: the lock cannot be remapped out from under a
-    /// holder, and the compile-time watcher registration resolves this owner
-    /// by the address recording saw.
+    /// holder.  Recording binds the instance onto the marker descr as an
+    /// `Arc`, so the compiler never re-resolves this owner and a sweep
+    /// mid-compile is safe; the sweep hook is `{static,class}method_destructor`
+    /// in `pyre-jit/src/eval.rs`.
     pub w_function_watchers: crate::quasiimmut::QuasiImmutField,
 }
 

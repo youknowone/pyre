@@ -186,14 +186,10 @@ pub struct W_Property {
     /// here.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
     /// i.e. non-moving, which is [`crate::quasiimmut::QuasiImmutField`]'s
     /// stated precondition: the lock cannot be remapped out from under a
-    /// holder.  A property the collector reclaims without a prior invalidation
-    /// leaks its instance box, because a GC object's `Drop` never runs — one
-    /// allocation per watched owner, so a program that keeps minting and
-    /// discarding traced descriptors keeps accumulating them rather than
-    /// settling at a fixed cost.  `W_TypeObject` and `Function::mutate_slots`
-    /// carry the same pattern; closing it needs a reclamation hook for a
-    /// collected object's off-heap side allocation, which the collector has
-    /// no notion of today.
+    /// holder.  A GC object's `Drop` never runs, so the field cannot reclaim
+    /// its own instance; `property_destructor` in `pyre-jit/src/eval.rs` takes
+    /// it back on sweep instead.  `W_TypeObject` and `Function::mutate_slots`
+    /// carry the same pattern.
     ///
     /// `w_fdel?` is declared upstream on the same line and gets no watcher
     /// here: no fold bakes `fdel`, so nothing would ever register on it.  A

@@ -478,6 +478,47 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     drop(unsafe { (*t).quasi_immut_watchers.take() });
 }
 
+/// Reclaim `W_Property`'s `w_fget?` / `w_fset?` instances on sweep.
+///
+/// The instances hang off an `AtomicPtr` that no descr row and no
+/// `gc_ptr_offsets` entry covers, so nothing traces them and a swept property
+/// strands one allocation per watched owner. Upstream needs no such hook: its
+/// `mutate_<name>` is itself a GC pointer.
+///
+/// [`pyre_object::quasiimmut::QuasiImmutField::take`] drops exactly one strong
+/// count, so an in-flight compile holding its own clone keeps the instance
+/// alive and reclaiming here cannot pull the ground out from under it.
+///
+/// # Safety
+///
+/// `obj_addr` must be a live `W_Property` payload the collector is sweeping,
+/// and the collector must call this exactly once.
+unsafe fn property_destructor(obj_addr: usize) {
+    let p = obj_addr as *const pyre_object::descriptor::W_Property;
+    drop(unsafe { (*p).fget_watchers.take() });
+    drop(unsafe { (*p).fset_watchers.take() });
+}
+
+/// The `w_function?` counterpart of [`property_destructor`] for `staticmethod`.
+///
+/// # Safety
+///
+/// As [`property_destructor`], for a `StaticMethod` payload.
+unsafe fn staticmethod_destructor(obj_addr: usize) {
+    let m = obj_addr as *const pyre_object::function::StaticMethod;
+    drop(unsafe { (*m).w_function_watchers.take() });
+}
+
+/// The `classmethod` twin of [`staticmethod_destructor`].
+///
+/// # Safety
+///
+/// As [`property_destructor`], for a `ClassMethod` payload.
+unsafe fn classmethod_destructor(obj_addr: usize) {
+    let m = obj_addr as *const pyre_object::function::ClassMethod;
+    drop(unsafe { (*m).w_function_watchers.take() });
+}
+
 /// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).
 ///
 /// The suspended frame is held behind an opaque `frame_ptr`
@@ -2020,21 +2061,27 @@ fn build_gc() -> Box<MiniMarkGC> {
     // field each: w_function) — typed payload via `#[pyre_class]`.
     // Pre-registered ahead of the foreign-pytype loop so the GC
     // walker reaches the inline descriptor refs.
-    register_pyre_class(
+    let property_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::descriptor::W_Property as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    register_pyre_class(
+    let staticmethod_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::function::StaticMethod as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    register_pyre_class(
+    let classmethod_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
         <pyre_object::function::ClassMethod as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // All three own `QuasiImmutField`s, which the type census does not reach.
+    gc.types.set_destructor(property_tid, property_destructor);
+    gc.types
+        .set_destructor(staticmethod_tid, staticmethod_destructor);
+    gc.types
+        .set_destructor(classmethod_tid, classmethod_destructor);
     // UnionType (PEP 604 `X | Y`) — typed payload via `#[pyre_class]`.
     // Pre-registered ahead of the foreign-pytype loop because that
     // loop's `size_of::<PyObject>()` approximation drops gc_ptr_offsets,

@@ -398,6 +398,40 @@ mod tests {
         assert_eq!(recorded.len(), 0, "a swept list must not grow again");
     }
 
+    /// The premise the sweep hooks rest on. `property_destructor` and its two
+    /// twins in `pyre-jit/src/eval.rs` run when the collector reclaims an owner,
+    /// which can happen while a compile that recorded a read of its field is
+    /// still in flight. Taking the field's reference back must not disturb that
+    /// compile's own.
+    ///
+    /// This is what carrying the instance rather than re-resolving `(owner,
+    /// field index)` bought: the older shape handed the compiler an address to
+    /// resolve later, so reclaiming here would have been a use-after-free.
+    #[test]
+    fn a_swept_owner_hands_back_only_its_own_reference() {
+        let field = QuasiImmutField::new();
+        // What recording bound onto the marker descr.
+        let recorded = field.get_current_qmut_instance();
+        assert_eq!(Arc::strong_count(&recorded), 2, "the field's and ours");
+
+        // The collector sweeps the owner and the destructor runs.
+        drop(field.take());
+        assert_eq!(
+            Arc::strong_count(&recorded),
+            1,
+            "only the compile's is left"
+        );
+
+        // The compile can still finish against it. Reclamation is not
+        // revocation: nothing invalidated the field, so the instance is current
+        // and the registration is recorded rather than born-invalid.
+        assert!(recorded.is_current());
+        let flag = Arc::new(AtomicBool::new(false));
+        recorded.register_loop_token(&flag);
+        assert!(!flag.load(Ordering::Acquire));
+        assert_eq!(recorded.len(), 1);
+    }
+
     /// Recording runs on one thread while any other Python thread can be
     /// mutating the same object. Upstream is safe here only because of the GIL;
     /// pyre has none, so the get-or-create, the push and the unlink have to be
