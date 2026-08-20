@@ -9833,12 +9833,6 @@ impl<M: Clone> MetaInterp<M> {
                         .get(&green_key)
                         .map(|c| c.front_target_tokens.clone())
                         .unwrap_or_default();
-                    let rc = self
-                        .compiled_loops
-                        .get(&green_key)
-                        .and_then(|c| c.live_token())
-                        .map(|tok| tok.get_retraced_count())
-                        .unwrap_or(0);
                     let _had_old = self.compiled_loops.contains_key(&green_key);
                     // Carried forward for the same reason as the compile_loop site.
                     let mut carried_loop_header_pc = None;
@@ -9851,7 +9845,15 @@ impl<M: Clone> MetaInterp<M> {
                         previous_tokens =
                             self.retire_compiled_entry(green_key, old_entry, &mut traces);
                     }
-                    token.set_retraced_count(rc);
+                    // The retired entry's count does not follow it here. The
+                    // token this compile installs came out of
+                    // `make_jitcell_token`, and upstream's `retraced_count`
+                    // starts at the `history.py:442` class default on every
+                    // token minted that way — see the fresh-token note in
+                    // `compile_loop`. Carrying it would hand the new loop a
+                    // spent retrace budget, and, since `unroll.py:272`'s
+                    // sentinel is odd, the predecessor's
+                    // `FORCE_BRIDGE_SEGMENTING` bit along with it.
                     // `compile.py:1079-1083` — a FINISH trace
                     // (`compile_done_with_this_frame` → `compile_trace` with
                     // `info.final()`) sets `target_token =
@@ -12959,12 +12961,6 @@ impl<M: Clone> MetaInterp<M> {
                 // leaves a key whose loop nothing can close into again, and every
                 // later trace reaching it declines for want of a front target.
                 let mut front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
-                let retraced_count = self
-                    .compiled_loops
-                    .get(&original_green_key)
-                    .and_then(|c| c.live_token())
-                    .map(|tok| tok.get_retraced_count())
-                    .unwrap_or(0);
                 let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 // Carried forward for the same reason as `front_target_tokens`
                 // just below: the replacement entry inherits the retired loop's
@@ -12987,7 +12983,12 @@ impl<M: Clone> MetaInterp<M> {
                         self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
-                token.set_retraced_count(retraced_count);
+                // The labels carry over, the retrace budget does not. `token`
+                // came out of `make_jitcell_token`, so its count is the
+                // `history.py:442` default — see the fresh-token note in
+                // `compile_loop`. The count read at the top of this function is
+                // the one `unroll.py:216-217` charges, and it stays on the
+                // token it was read from.
                 self.compiled_loops.insert(
                     original_green_key,
                     CompiledEntry {
@@ -25188,6 +25189,69 @@ mod tests {
         assert!(
             !std::sync::Arc::ptr_eq(&fresh, &stale),
             "and it is a new token, not the invalidated one"
+        );
+    }
+
+    /// The same rule on the FINISH path. `finish_and_compile` mints its token
+    /// through `make_jitcell_token` too, so the retired entry's count — and the
+    /// `FORCE_BRIDGE_SEGMENTING` bit riding in its low bit — stays behind.
+    #[test]
+    fn a_finish_compile_does_not_inherit_the_retrace_count() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let green_key = 43;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        assert!(meta.tracing.is_some());
+        if let Some(ctx) = meta.trace_ctx() {
+            let i0 = OpRef::input_arg_int(0);
+            let const_one = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+
+        let stale = std::sync::Arc::new(JitCellToken::new(4));
+        stale.set_retraced_count(u32::MAX);
+        assert_ne!(
+            stale.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+            "the sentinel arms bridge segmenting, which is what must not travel"
+        );
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&stale),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: Vec::new(),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 102,
+                traces: indexmap::IndexMap::new(),
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        let _ = meta.finish_and_compile(&[OpRef::input_arg_int(0)], vec![Type::Int], (), false);
+
+        let fresh = meta
+            .compiled_loops
+            .get(&green_key)
+            .and_then(|c| c.live_token())
+            .expect("the compile installed a live token");
+        assert!(
+            !std::sync::Arc::ptr_eq(&fresh, &stale),
+            "the FINISH compile installed a new token"
+        );
+        assert_eq!(
+            fresh.get_retraced_count(),
+            0,
+            "and it starts at zero, so its own bridges decide segmenting for themselves"
         );
     }
 
