@@ -14067,7 +14067,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     if dont_inherit == 0 {
         let caller_frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
         if !caller_frame.is_null() {
-            let ec = unsafe { (*caller_frame).execution_context };
+            let ec = crate::call::getexecutioncontext();
             if !ec.is_null() {
                 let top = unsafe { (*ec).gettopframe_nohidden() };
                 if !top.is_null() {
@@ -14540,11 +14540,7 @@ fn exec_or_eval(
     // module is picked -- every one of which can collect.  A frame a compiled
     // trace built moves there, so it is re-read out of the anchor at each.
     let caller_anchor = unsafe { crate::eval::FrameAnchor::from_raw(caller_frame) };
-    let exec_ctx = if caller_frame.is_null() {
-        std::ptr::null::<crate::PyExecutionContext>()
-    } else {
-        unsafe { (*caller_frame).execution_context }
-    };
+    let exec_ctx = crate::call::getexecutioncontext();
 
     // pyopcode.py ensure_ns — the globals object is the
     // user-supplied dict, else the caller frame's globals, else a fresh

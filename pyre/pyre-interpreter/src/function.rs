@@ -3888,7 +3888,7 @@ fn _flat_pycall(
             code,
             &[], // locals filled below directly from stack
             w_globals,
-            frame.execution_context,
+            crate::call::getexecutioncontext(),
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         ) {
@@ -3967,7 +3967,7 @@ fn _flat_pycall_defaults(
             code,
             &[], // locals filled below
             w_globals,
-            frame.execution_context,
+            crate::call::getexecutioncontext(),
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
         ) {

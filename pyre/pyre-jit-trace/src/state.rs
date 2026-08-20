@@ -2970,7 +2970,7 @@ use crate::descr::{
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET, PYFRAME_PYCODE_OFFSET,
-    PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
+    PYFRAME_VALUESTACKDEPTH_OFFSET,
 };
 use crate::helpers::emit_box_float_inline;
 
@@ -2988,6 +2988,9 @@ pub use crate::liveness::{LiveVars, liveness_for};
 pub struct PyreJitState {
     #[vable(frame)]
     pub frame: usize,
+    /// PyPy portal's second red (`interp_jit.py` `reds = ['frame', 'ec']`).
+    /// This belongs to the execution-context activation, not to `PyFrame`.
+    pub execution_context: usize,
 }
 
 /// Meta information for a trace — describes the shape of the code being traced.
@@ -3125,8 +3128,9 @@ pub struct PyreSym {
     pub(crate) vable_valuestackdepth: OpRef,
     #[vable(inputarg, type = ref)]
     pub(crate) vable_debugdata: OpRef,
-    #[vable(inputarg, type = ref)]
-    pub(crate) vable_w_globals: OpRef,
+    /// Semantic namespace for this MIFrame. PyPy derives it from the frame's
+    /// own pycode/debugdata; it is deliberately not a virtualizable scalar.
+    pub(crate) frame_w_globals: OpRef,
     #[vable(array_base)]
     pub(crate) vable_array_base: Option<u32>,
     /// True when this frame's `locals_cells_stack_w` array IS the active
@@ -3271,6 +3275,7 @@ pub trait WalkSym {
     fn vable_array_base(&self) -> Option<u32>;
     fn vable_last_instr(&self) -> OpRef;
     fn vable_valuestackdepth(&self) -> OpRef;
+    fn frame_w_globals(&self) -> OpRef;
     fn last_exc_value(&self) -> pyre_object::PyObjectRef;
     fn set_last_exc_value(&mut self, value: pyre_object::PyObjectRef);
     fn last_exc_box(&self) -> OpRef;
@@ -3440,6 +3445,11 @@ impl WalkSym for PyreSym {
     }
 
     #[inline]
+    fn frame_w_globals(&self) -> OpRef {
+        self.frame_w_globals
+    }
+
+    #[inline]
     fn last_exc_value(&self) -> pyre_object::PyObjectRef {
         self.last_exc_value
     }
@@ -3542,7 +3552,7 @@ pub struct TestSymState {
     pub vable_pycode: OpRef,
     pub vable_valuestackdepth: OpRef,
     pub vable_debugdata: OpRef,
-    pub vable_w_globals: OpRef,
+    pub frame_w_globals: OpRef,
 }
 
 /// Trace-time view over the virtualizable `PyFrame`.
@@ -5008,14 +5018,20 @@ pub(crate) fn trace_float_block_setitem_value(
     ctx.heapcache_setarrayitem(block, index, descr_idx, value);
 }
 
-/// pyframe.py `self.w_globals` — read the canonical dict object
-/// from the frame. Returns a PyObjectRef (W_DictObject or
-/// W_ModuleDictObject).
+/// `PyFrame.get_w_globals` common path: read the frame's own pycode, then its
+/// first-seen globals. Inline callers only use this after proving that the
+/// callee function globals is that code-global identity; the uncommon
+/// debugdata override stays on the residual path.
 pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    ctx.record_op_with_descr(
+    let pycode = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[frame],
-        crate::descr::pyframe_w_globals_obj_descr(),
+        crate::descr::pyframe_code_descr(),
+    );
+    ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[pycode],
+        crate::descr::pycode_w_globals_descr(),
     )
 }
 
@@ -6740,7 +6756,7 @@ impl PyreSym {
             vable_pycode: OpRef::NONE,
             vable_valuestackdepth: OpRef::NONE,
             vable_debugdata: OpRef::NONE,
-            vable_w_globals: OpRef::NONE,
+            frame_w_globals: OpRef::NONE,
             vable_array_base: None,
             is_active_vable_owner: false,
             concrete_locals: Vec::new(),
@@ -6868,10 +6884,11 @@ impl PyreSym {
     ///      repopulate the shadow from resume data. `is_active_vable_owner`
     ///      is cleared (`clear_active_vable`) because the bridge's
     ///      inputarg layout lacks the `[frame, last_instr, pycode,
-    ///      valuestackdepth, debugdata, w_globals]` scalar
+    ///      valuestackdepth, debugdata]` scalar
     ///      header that `init_vable_indices` assumes (see
     ///      `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS` for the
-    ///      canonical 5-scalar layout from `interp_jit.py:25-30`); the
+    ///      four concrete scalar fields selected from
+    ///      `interp_jit.py:25-30`); the
     ///      frame still owns the shadow
     ///      semantically though.
     ///
@@ -6905,8 +6922,8 @@ impl PyreSym {
     /// Demote this frame from active virtualizable owner. Used at bridge
     /// setup (`setup_bridge_sym`) where the bridge's inputarg layout
     /// does not have the `[frame, last_instr, pycode, valuestackdepth,
-    /// debugdata, w_globals]` scalar header that the loop-portal
-    /// `init_vable_indices` assumes (canonical 5-scalar
+    /// debugdata]` scalar header that the loop-portal
+    /// `init_vable_indices` assumes (canonical four-scalar
     /// layout in `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`);
     /// subsequent reads consult `bridge_local_oprefs` or fall through
     /// to the heap array via `locals_cells_stack_array_ref`.
@@ -6931,7 +6948,7 @@ impl PyreSym {
         sym.vable_pycode = state.vable_pycode;
         sym.vable_valuestackdepth = state.vable_valuestackdepth;
         sym.vable_debugdata = state.vable_debugdata;
-        sym.vable_w_globals = state.vable_w_globals;
+        sym.frame_w_globals = state.frame_w_globals;
         sym
     }
 
@@ -7126,8 +7143,12 @@ impl PyreSym {
         if concrete_frame != 0 {
             let frame = unsafe { &*(concrete_frame as *const pyre_interpreter::pyframe::PyFrame) };
             self.jitcode = jitcode_for(frame.pycode);
-            self.concrete_namespace = frame.w_globals;
-            self.concrete_execution_context = frame.execution_context;
+            self.concrete_namespace = frame.get_w_globals();
+            self.frame_w_globals = ctx.const_ref(self.concrete_namespace as usize as i64);
+            if self.concrete_execution_context.is_null() {
+                self.concrete_execution_context =
+                    pyre_interpreter::call::getexecutioncontext() as *const _;
+            }
             // `PyPyJitDriver.reds = ['frame', 'ec']`: an MIFrame register
             // contains a Box together with its recording-time value.  The
             // virtualizable seeding below supplies that value for `frame` and
@@ -7135,10 +7156,12 @@ impl PyreSym {
             // virtualizable layout.  Stamp it explicitly so blackhole.py's
             // `_copy_data_from_miframe` analogue can copy the symbolic red
             // without turning it back into a thread-specific ConstPtr.
-            if !self.execution_context.is_none() && !frame.execution_context.is_null() {
+            if !self.execution_context.is_none() && !self.concrete_execution_context.is_null() {
                 ctx.try_set_opref_concrete(
                     self.execution_context,
-                    majit_ir::Value::Ref(majit_ir::GcRef(frame.execution_context as usize)),
+                    majit_ir::Value::Ref(majit_ir::GcRef(
+                        self.concrete_execution_context as usize,
+                    )),
                 );
             }
             self.concrete_vable_ptr = concrete_frame as *mut u8;
@@ -7364,10 +7387,7 @@ impl PyreJitState {
     }
 
     fn execution_context_as_usize(&self) -> usize {
-        let Some(frame_ptr) = self.frame_ptr() else {
-            return 0;
-        };
-        unsafe { (*(frame_ptr as *const PyFrame)).execution_context as usize }
+        self.execution_context
     }
 
     fn expanded_virtualizable_live_values_with_extra_reds(
@@ -7382,7 +7402,6 @@ impl PyreJitState {
             self.pycode_as_usize(),
             self.valuestackdepth(),
             self.debugdata_as_usize(),
-            self.w_globals_as_usize(),
             meta.num_locals,
             meta.valuestackdepth,
             |i| self.local_at(i).unwrap_or(PY_NULL) as usize,
@@ -7630,9 +7649,8 @@ impl PyreJitState {
         let Some(frame_ptr) = self.frame_ptr() else {
             return None;
         };
-        let w_globals = unsafe {
-            *(frame_ptr.add(PYFRAME_W_GLOBALS_OFFSET) as *const pyre_object::PyObjectRef)
-        };
+        let w_globals =
+            unsafe { (&*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame)).get_w_globals() };
         if w_globals.is_null() {
             return None;
         }
@@ -7810,34 +7828,18 @@ impl PyreJitState {
             .expect("PyreJitState.frame must point to a valid PyFrame")
     }
 
-    /// Read the w_globals pointer from the heap frame.
-    pub fn w_globals_as_usize(&self) -> usize {
-        self.read_frame_usize(PYFRAME_W_GLOBALS_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
-    }
-
-    /// Read the execution context pointer from the heap frame.
+    /// Read the execution context red independently of the virtualizable frame.
     ///
     /// `interp_jit.py reds = ['frame', 'ec']`: ec is a non-vable red
-    /// inputarg in RPython. pyre's PyFrame carries it inline at
-    /// `execution_context`, so this accessor derefs the heap; from the
-    /// macro-generated layout's perspective ec sits at SYM_EC_IDX between
-    /// the frame pointer and the vable scalar block (`pyjitpl.py:2957
-    /// redboxes` then `:2964 + virtualizable_boxes`).
+    /// inputarg in RPython. It therefore lives on `PyreJitState`, beside the
+    /// frame red, and never in the `PyFrame` heap layout.
     pub fn ec_as_usize(&self) -> usize {
-        self.read_frame_usize(crate::frame_layout::PYFRAME_EXECUTION_CONTEXT_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
+        self.execution_context
     }
 
-    /// Write the execution context pointer into the heap frame.
-    ///
-    /// Called by `virt_restore_scalars` when reconstructing red inputargs
-    /// from a guard-failure resume vector.
+    /// Restore the independent execution-context red from resume data.
     pub fn set_ec(&mut self, value: usize) {
-        assert!(
-            self.write_frame_usize(crate::frame_layout::PYFRAME_EXECUTION_CONTEXT_OFFSET, value),
-            "PyreJitState.frame must point to a valid PyFrame"
-        );
+        self.execution_context = value;
     }
 
     /// Read the code pointer (pycode) from the heap frame.
@@ -7847,7 +7849,12 @@ impl PyreJitState {
 
     /// Read the namespace pointer from the heap frame.
     pub fn namespace_as_usize(&self) -> usize {
-        self.w_globals_as_usize()
+        let frame_ptr = self
+            .frame_ptr()
+            .expect("PyreJitState.frame must point to a valid PyFrame");
+        unsafe {
+            (&*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame)).get_w_globals() as usize
+        }
     }
 
     /// Write the pycode pointer to the heap frame.
@@ -7859,14 +7866,6 @@ impl PyreJitState {
         );
     }
 
-    /// Write the w_globals pointer to the heap frame.
-    pub fn set_w_globals(&mut self, value: usize) {
-        assert!(
-            self.write_frame_usize(PYFRAME_W_GLOBALS_OFFSET, value),
-            "PyreJitState.frame must point to a valid PyFrame"
-        );
-    }
-
     /// Compatibility wrapper for older callers that still speak in
     /// terms of `code` / `namespace`.
     pub fn set_code(&mut self, value: usize) {
@@ -7874,7 +7873,13 @@ impl PyreJitState {
     }
 
     pub fn set_namespace(&mut self, value: usize) {
-        self.set_w_globals(value);
+        let frame_ptr = self
+            .frame_ptr()
+            .expect("PyreJitState.frame must point to a valid PyFrame");
+        unsafe {
+            (&mut *(frame_ptr as *mut pyre_interpreter::pyframe::PyFrame))
+                .set_w_globals(value as pyre_object::PyObjectRef);
+        }
     }
 
     /// pyframe.py:82 debugdata — read from heap frame.
@@ -10366,6 +10371,8 @@ impl JitState for PyreJitState {
         // live frame pointer so the bridge seed sees the real
         // `locals_cells_stack_w` length.
         sym.concrete_vable_ptr = self.frame as *mut u8;
+        sym.concrete_execution_context =
+            self.execution_context as *const pyre_interpreter::PyExecutionContext;
     }
 
     fn driver_descriptor(&self, _meta: &Self::Meta) -> Option<JitDriverStaticData> {
@@ -10600,7 +10607,7 @@ impl JitState for PyreJitState {
             .collect();
         let bridge_valuestackdepth = concrete_values
             // virtualizable_values has no ec red: [vable, last_instr,
-            // pycode, valuestackdepth, debugdata, w_globals, ...].
+            // pycode, valuestackdepth, debugdata, ...].
             .get(first_vable_scalar_idx + 2)
             .map(value_to_usize)
             .unwrap_or(sym.valuestackdepth)
@@ -10773,6 +10780,29 @@ impl JitState for PyreJitState {
             sym.registers_f[reg_idx] = resolved;
             value_cursor += 1;
         }
+        // `interp_jit.py:67 reds = ['frame', 'ec']`: codewriter gives both
+        // portal reds dedicated Ref colors and force-keeps them live at every
+        // guard. `consume_boxes` above therefore rebuilt the bridge's own EC
+        // inputarg at `portal_ec_reg`; retain that OpRef before converting the
+        // color-indexed register bank into the semantic locals/stack mirror.
+        let (_, portal_ec_reg) = portal_red_regs_at(frame0.jitcode_index);
+        let bridge_execution_context = (portal_ec_reg != u16::MAX)
+            .then(|| {
+                bridge_registers_r
+                    .get(portal_ec_reg as usize)
+                    .copied()
+                    .unwrap_or(OpRef::NONE)
+            })
+            .unwrap_or(OpRef::NONE);
+        assert!(
+            !bridge_execution_context.is_none(),
+            "setup_bridge_sym: portal ec red missing at color {} for jitcode {} pc {}; \
+             live_refs={:?}",
+            portal_ec_reg,
+            frame0.jitcode_index,
+            frame0.pc,
+            reg_indices.ref_,
+        );
         // Reconstruct the slot-indexed semantic register file
         // (`[locals.., stack_tail..]`) from the color-indexed resume decode.
         // The decode just filled `bridge_registers_r` by abstract-register
@@ -11014,8 +11044,8 @@ impl JitState for PyreJitState {
         // pyre's start_bridge_tracing calls initialize_sym() (which runs
         // init_symbolic) BEFORE setup_bridge_sym, so init_symbolic sees
         // bridge_local_oprefs == None and falls into the vable_array_base
-        // branch (init_vable_indices hard-codes vable_array_base = 7 for
-        // pyre's 7-slot virtualizable header). That branch produces
+        // branch (init_vable_indices derives vable_array_base = 6 for
+        // pyre's `[frame, ec] + four scalars` portal header). That branch produces
         // OpRef::from_raw(base+i) values from the PARENT trace's namespace, leaving
         // stale parent OpRefs in registers_r after we set
         // bridge_local_oprefs here.
@@ -11116,29 +11146,21 @@ impl JitState for PyreJitState {
             types.resize(sym.nlocals, Type::Ref);
             types
         };
-        // The bridge inputs do NOT have the 7-slot scalar header that
+        // The bridge inputs do NOT have the six-slot portal header that
         // init_vable_indices assumes. Demote this frame from active
         // virtualizable owner so any later LOAD_FAST falling through to
         // the vable_array_base branch uses the heap-array path instead
         // of synthesizing parent OpRefs.
         sym.clear_active_vable();
-        // `PyPyJitDriver.reds = ['frame', 'ec']` +
         // `liveness.compute_liveness`: the explicit `-live-` args keep both
         // portal reds in every guard's frame-register section.  They are not
-        // semantic PyFrame slots, so the color→slot inversion above correctly
-        // leaves them out of `sym.registers_r`; restore `ec` separately from
-        // its dedicated red color, exactly as `rebuild_from_resumedata` fills
-        // the MIFrame register bank before bridge tracing starts.
-        let (_, portal_ec_reg) = crate::state::portal_red_regs_at(frame0.jitcode_index);
-        sym.execution_context = if portal_ec_reg == u16::MAX {
-            OpRef::NONE
-        } else {
-            bridge_registers_r
-                .get(portal_ec_reg as usize)
-                .copied()
-                .filter(|op| !op.is_none())
-                .unwrap_or(OpRef::NONE)
-        };
+        // semantic PyFrame slots, so the color->slot inversion above correctly
+        // leaves them out of `sym.registers_r`.  A bridge's inputargs come from
+        // the failing guard's failargs, so the root trace's historical
+        // `InputArgRef(1)` cannot be reused; `bridge_execution_context`, read
+        // off the dedicated red color before the inversion, is the correctly
+        // renumbered bridge input OpRef.
+        sym.execution_context = bridge_execution_context;
         // Both outcomes compile, so only the tally separates the bridge that
         // carries the live red from the one whose first `ec` consumer re-derives
         // it off the frame.
@@ -11147,7 +11169,7 @@ impl JitState for PyreJitState {
         } else {
             crate::trace::fbw_diag::BRIDGE_EC_FROM_PORTAL_RED
         });
-        // pyjitpl.py rebuild_state_after_failure parity: after
+        // pyjitpl.py `rebuild_state_after_failure` parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
         // must be rebuilt from the resume data so subsequent vable
         // ops see OpRefs drawn from the bridge's inputarg stream, not
@@ -11157,7 +11179,7 @@ impl JitState for PyreJitState {
         // Layout mirrors virtualizable.py read_boxes():
         //   boxes[0..NUM_SCALARS-1] = scalar fields 1..NUM_SCALARS
         //     (vable_last_instr, vable_pycode, vable_valuestackdepth,
-        //      vable_debugdata, vable_w_globals)
+        //      vable_debugdata)
         //   boxes[NUM_SCALARS-1..NUM_SCALARS-1+array_len] = array items
         //     (bridge_locals followed by reserved stack slots)
         //   boxes[-1] = vable identity (sym.frame)
@@ -11179,10 +11201,10 @@ impl JitState for PyreJitState {
         // setup_bridge_sym time), causing pushes past `nlocals`/the
         // local prefix to panic at `set_virtualizable_entry_at: index N
         // out of range for N slots`. A probe captured the
-        // mismatch directly: root portal sized `vable_boxes_len=25`
-        // (= 6 + 18 + 1) but a fannkuch bridge fell back to
-        // `bridge_array_len=14` → `vable_boxes_len=21`, then pushed
-        // `flat_idx=21` and panicked. Fall back to the metadata-derived
+        // mismatch directly. With the current four-scalar layout a root whose
+        // array has 18 slots needs `vable_boxes_len=23` (= 4 + 18 + 1);
+        // falling back to a shorter live prefix would make a later push run
+        // past that shadow. Fall back to the metadata-derived
         // size — `metadata.stack_base + metadata.max_stackdepth` is the
         // same `nlocals + ncells + max_stackdepth` the codewriter
         // committed to and `PyFrame::__init__` allocates.
@@ -11201,7 +11223,6 @@ impl JitState for PyreJitState {
             sym.vable_pycode,
             sym.vable_valuestackdepth,
             sym.vable_debugdata,
-            sym.vable_w_globals,
         ];
         // virtualizable.py load_list_of_boxes parity: the OpRef half of
         // virtualizable_boxes comes from the resume-data stream
@@ -11431,12 +11452,7 @@ impl JitState for PyreJitState {
             .last()
             .map(|&(_, vref_ptr)| vref_ptr)
             .unwrap_or(sym.concrete_vable_ptr as usize);
-        let live_ec = if sym.concrete_vable_ptr.is_null() {
-            std::ptr::null_mut()
-        } else {
-            let frame = sym.concrete_vable_ptr as *const pyre_interpreter::PyFrame;
-            unsafe { (*frame).execution_context as *mut pyre_interpreter::PyExecutionContext }
-        };
+        let live_ec = sym.concrete_execution_context as *mut pyre_interpreter::PyExecutionContext;
         if !live_ec.is_null() && restored_top != 0 {
             let published = unsafe { (*live_ec).topframeref };
             // A scope the guard still had open must be republished whatever the
@@ -13074,7 +13090,10 @@ mod tests {
     }
 
     fn empty_state() -> PyreJitState {
-        PyreJitState { frame: 0 }
+        PyreJitState {
+            frame: 0,
+            execution_context: 0,
+        }
     }
 
     fn compile_function_body(src: &str) -> CodeObject {
@@ -13449,6 +13468,7 @@ mod tests {
 
         let mut state = empty_state();
         state.frame = frame_ptr;
+        state.execution_context = pyre_interpreter::call::getexecutioncontext() as usize;
         let meta = state.build_meta(0, &PyreEnv);
         let with_ec = state.extract_live_values(&meta);
 
@@ -13456,7 +13476,7 @@ mod tests {
         assert_eq!(with_ec[0], Value::Ref(majit_ir::GcRef(frame_ptr)));
         assert_eq!(
             with_ec[1],
-            Value::Ref(majit_ir::GcRef(frame.execution_context as usize))
+            Value::Ref(majit_ir::GcRef(state.execution_context))
         );
     }
 
@@ -13500,7 +13520,7 @@ mod tests {
         sym.vable_pycode = code_ref;
         sym.vable_valuestackdepth = ctx.const_int(3);
         sym.vable_debugdata = ctx.const_ref(0);
-        sym.vable_w_globals = namespace_ref;
+        sym.frame_w_globals = namespace_ref;
         sym.execution_context = ec_ref;
         sym.registers_r = vec![local0, stack0, stack1];
         sym.symbolic_local_types = vec![Type::Ref];
@@ -13528,7 +13548,6 @@ mod tests {
         let live_pycode = ctx.const_ref(0x4000);
         let live_vsd = ctx.const_int(2);
         let live_debugdata = ctx.const_ref(0x5000);
-        let live_globals = ctx.const_ref(0x7000);
         let live_local = ctx.const_ref(0x8000);
         let live_stack = ctx.const_ref(0x9000);
 
@@ -13543,7 +13562,6 @@ mod tests {
             (live_pycode, Type::Ref),
             (live_vsd, Type::Int),
             (live_debugdata, Type::Ref),
-            (live_globals, Type::Ref),
             (live_local, Type::Ref),
             (live_stack, Type::Ref),
             (frame_ref, Type::Ref),
@@ -13560,7 +13578,6 @@ mod tests {
                 live_pycode,
                 live_vsd,
                 live_debugdata,
-                live_globals,
                 live_local,
                 live_stack,
             ]
@@ -13594,8 +13611,8 @@ mod tests {
         assert_eq!(sym.vable_pycode, OpRef::input_arg_ref(3));
         assert_eq!(sym.vable_valuestackdepth, OpRef::input_arg_int(4));
         assert_eq!(sym.vable_debugdata, OpRef::input_arg_ref(5));
-        assert_eq!(sym.vable_w_globals, OpRef::input_arg_ref(6));
-        assert_eq!(sym.vable_array_base, Some(7));
+        assert!(sym.frame_w_globals.is_none());
+        assert_eq!(sym.vable_array_base, Some(6));
         assert_eq!(sym.symbolic_local_types.len(), 2);
         assert_eq!(sym.symbolic_stack_types.len(), 2);
     }
@@ -13623,7 +13640,11 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
-        let mut state = PyreJitState { frame: frame_ptr };
+        let execution_context = pyre_interpreter::call::getexecutioncontext() as usize;
+        let mut state = PyreJitState {
+            frame: frame_ptr,
+            execution_context,
+        };
         state.set_next_instr(0);
         state.set_valuestackdepth(4);
         let meta = PyreMeta {
@@ -13637,17 +13658,16 @@ mod tests {
             slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
         };
         let values = vec![
-            Value::Ref(GcRef(frame_ptr)),                        // frame
-            Value::Ref(GcRef(frame.execution_context as usize)), // ec
-            Value::Int(8),                                       // last_instr
-            Value::Ref(GcRef(frame.pycode as usize)),            // pycode
-            Value::Int(4),                                       // valuestackdepth
-            Value::Ref(GcRef(0)),                                // debugdata
-            Value::Ref(GcRef(0)),                                // w_globals
-            Value::Ref(GcRef(w_int_new(1) as usize)),            // local a
-            Value::Ref(GcRef(w_int_new(2) as usize)),            // local b
-            Value::Ref(GcRef(w_int_new(3) as usize)),            // local c
-            Value::Int(7),                                       // local i
+            Value::Ref(GcRef(frame_ptr)),             // frame
+            Value::Ref(GcRef(execution_context)),     // ec
+            Value::Int(8),                            // last_instr
+            Value::Ref(GcRef(frame.pycode as usize)), // pycode
+            Value::Int(4),                            // valuestackdepth
+            Value::Ref(GcRef(0)),                     // debugdata
+            Value::Ref(GcRef(w_int_new(1) as usize)), // local a
+            Value::Ref(GcRef(w_int_new(2) as usize)), // local b
+            Value::Ref(GcRef(w_int_new(3) as usize)), // local c
+            Value::Int(7),                            // local i
         ];
 
         state.restore_expanded_virtualizable_values_with_extra_reds(&meta, &values, 1);
@@ -14311,7 +14331,6 @@ mod tests {
             Type::Ref, // pycode
             Type::Int, // valuestackdepth
             Type::Ref, // debugdata
-            Type::Ref, // w_globals
             Type::Ref, // local0
             Type::Ref, // stale cell
             Type::Ref, // stack0
@@ -14333,7 +14352,6 @@ mod tests {
         let local0 = w_int_new(41) as i64;
         let stale_cell = w_int_new(42) as i64;
         let stack0 = w_int_new(43) as i64;
-        let globals = w_int_new(44) as i64;
         let live_cell = w_int_new(45) as i64;
         let execution_context = w_int_new(40) as i64;
         let fail_values = [
@@ -14343,7 +14361,6 @@ mod tests {
             code_ref as i64,
             3,
             0,
-            globals,
             local0,
             stale_cell,
             stack0,
@@ -14360,7 +14377,6 @@ mod tests {
             Type::Ref,
             Type::Ref,
             Type::Ref,
-            Type::Ref,
         ];
         let resume_data = majit_metainterp::ResumeDataResult {
             frames: vec![RebuiltFrame {
@@ -14369,6 +14385,7 @@ mod tests {
                 py_pc: 0,
                 values: vec![
                     RebuiltValue::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
+                    RebuiltValue::Box(7, Type::Ref),
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),
                     RebuiltValue::Box(0, Type::Ref),
@@ -14387,9 +14404,8 @@ mod tests {
                 RebuiltValue::Box(4, Type::Int),
                 RebuiltValue::Box(5, Type::Ref),
                 RebuiltValue::Box(6, Type::Ref),
-                RebuiltValue::Box(7, Type::Ref),
-                RebuiltValue::Box(10, Type::Ref),
-                RebuiltValue::Box(7, Type::Ref),
+                RebuiltValue::Box(9, Type::Ref),
+                RebuiltValue::Box(6, Type::Ref),
             ],
             virtualref_values: Vec::new(),
             storage: None,
@@ -14416,9 +14432,9 @@ mod tests {
         assert_eq!(
             sym.registers_r,
             vec![
+                OpRef::input_arg_ref(6),
                 OpRef::input_arg_ref(7),
                 OpRef::input_arg_ref(8),
-                OpRef::input_arg_ref(9),
             ]
         );
         assert_eq!(sym.symbolic_local_types, vec![Type::Ref, Type::Ref]);
@@ -14426,7 +14442,7 @@ mod tests {
         assert_eq!(sym.execution_context, OpRef::input_arg_ref(1));
         assert_eq!(
             sym.bridge_local_oprefs,
-            Some(vec![OpRef::input_arg_ref(7), OpRef::input_arg_ref(8)])
+            Some(vec![OpRef::input_arg_ref(6), OpRef::input_arg_ref(7)])
         );
         assert_eq!(
             sym.concrete_locals,
@@ -14436,26 +14452,26 @@ mod tests {
         assert_eq!(
             ctx.virtualizable_entry_at(array_base),
             Some((
-                OpRef::input_arg_ref(7),
+                OpRef::input_arg_ref(6),
                 majit_ir::Value::Ref(majit_ir::GcRef(local0 as usize)),
             )),
         );
         assert_eq!(
             ctx.virtualizable_entry_at(array_base + 1),
             Some((
-                OpRef::input_arg_ref(10),
+                OpRef::input_arg_ref(9),
                 majit_ir::Value::Ref(majit_ir::GcRef(live_cell as usize)),
             )),
         );
         assert_eq!(
             ctx.virtualizable_entry_at(array_base + 2),
             Some((
-                OpRef::input_arg_ref(9),
+                OpRef::input_arg_ref(8),
                 majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize)),
             )),
         );
         assert_eq!(
-            ctx.box_value(OpRef::input_arg_ref(9)),
+            ctx.box_value(OpRef::input_arg_ref(8)),
             Some(majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize))),
         );
     }
@@ -14507,7 +14523,6 @@ mod tests {
             Type::Ref, // pycode
             Type::Int, // valuestackdepth
             Type::Ref, // debugdata
-            Type::Ref, // w_globals
             Type::Ref, // local0
             Type::Ref, // stack0
             Type::Ref, // stack1
@@ -14515,7 +14530,7 @@ mod tests {
         let mut ctx = TraceCtx::for_test_types(&input_types);
 
         // The vable static-field types come from `virtualizable_gen.rs`'s
-        // `inputargs` annotations: int/ref/int/ref/ref.
+        // `inputargs` annotations: int/ref/int/ref.
         // Mint typed `OpRef::input_arg_*` variants matching
         // those tags so variant-aware Eq (`OpRef`'s `PartialEq`) lines up
         // with what the production `init_vable_indices` produces.
@@ -14527,14 +14542,13 @@ mod tests {
         sym.vable_pycode = OpRef::input_arg_ref(3);
         sym.vable_valuestackdepth = OpRef::input_arg_int(4);
         sym.vable_debugdata = OpRef::input_arg_ref(5);
-        sym.vable_w_globals = OpRef::input_arg_ref(6);
         // local0 / stack0 / stack1 are Ref-typed per `symbolic_local_types`
         // / `symbolic_stack_types` below — the macro mints the matching
         // `InputArgRef` variant.
         sym.registers_r = vec![
+            OpRef::input_arg_ref(6),
             OpRef::input_arg_ref(7),
             OpRef::input_arg_ref(8),
-            OpRef::input_arg_ref(9),
         ];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = vec![Type::Ref, Type::Ref];
@@ -14568,15 +14582,15 @@ mod tests {
         let jump_args =
             state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, 0, None));
 
-        assert_eq!(jump_args.len(), 10);
+        assert_eq!(jump_args.len(), 9);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
         assert_eq!(jump_args[1], OpRef::input_arg_ref(1));
         assert_eq!(
-            &jump_args[7..],
+            &jump_args[6..],
             &[
+                OpRef::input_arg_ref(6),
                 OpRef::input_arg_ref(7),
-                OpRef::input_arg_ref(8),
-                OpRef::input_arg_ref(9)
+                OpRef::input_arg_ref(8)
             ]
         );
         assert_eq!(state.sym().execution_context, OpRef::input_arg_ref(1));
@@ -14607,11 +14621,11 @@ mod tests {
         let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let mut input_types = vec![
             Type::Ref, // frame
+            Type::Ref, // ec
             Type::Int, // next_instr
             Type::Ref, // pycode
             Type::Int, // valuestackdepth
             Type::Ref, // debugdata
-            Type::Ref, // w_globals
         ];
         input_types.extend(std::iter::repeat(Type::Ref).take(array_len));
         let mut ctx = TraceCtx::for_test_types(&input_types);
@@ -14623,13 +14637,14 @@ mod tests {
         // tag, so variant-aware Eq (`OpRef`'s `PartialEq`) requires the
         // matching variant here too.
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        sym.execution_context = OpRef::input_arg_ref(1);
         sym.nlocals = 1;
         sym.valuestackdepth = 1;
-        sym.vable_last_instr = OpRef::input_arg_int(1);
-        sym.vable_pycode = OpRef::input_arg_ref(2);
-        sym.vable_valuestackdepth = OpRef::input_arg_int(3);
-        sym.vable_debugdata = OpRef::input_arg_ref(4);
-        sym.vable_w_globals = OpRef::input_arg_ref(5);
+        sym.vable_last_instr = OpRef::input_arg_int(2);
+        sym.vable_pycode = OpRef::input_arg_ref(3);
+        sym.vable_valuestackdepth = OpRef::input_arg_int(4);
+        sym.vable_debugdata = OpRef::input_arg_ref(5);
+        sym.frame_w_globals = ctx.const_ref(frame.get_w_globals() as usize as i64);
         sym.registers_r = vec![OpRef::input_arg_ref(6)];
         sym.symbolic_local_types = vec![Type::Ref];
         sym.symbolic_stack_types = Vec::new();
@@ -14649,10 +14664,9 @@ mod tests {
             OpRef::input_arg_ref(0),
             majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)),
             &[
-                OpRef::input_arg_int(1),
-                OpRef::input_arg_ref(2),
-                OpRef::input_arg_int(3),
-                OpRef::input_arg_ref(4),
+                OpRef::input_arg_int(2),
+                OpRef::input_arg_ref(3),
+                OpRef::input_arg_int(4),
                 OpRef::input_arg_ref(5),
             ],
             &[OpRef::input_arg_ref(6)],
@@ -14934,6 +14948,7 @@ pub(crate) fn assemble_bridge_inline_pending(
         .map(|k| concrete_value_from_slot(recipe_slot_to_pyobj(recipe.concrete_r[k])))
         .collect();
     sym.concrete_namespace = w_globals;
+    sym.frame_w_globals = ctx.const_ref(w_globals as usize as i64);
     sym.concrete_execution_context = execution_context;
     // perform_call threads the caller's `ec` down to every inlined callee
     // (reds=['frame','ec'], interp_jit.py:67), so the callee shares the
@@ -15002,7 +15017,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
     recipe: &ReconstructRecipe,
     execution_context: *const pyre_interpreter::PyExecutionContext,
     ec_box: OpRef,
-    root_frame_box: OpRef,
     parent_frames: Vec<ResumeFrameState>,
 ) -> Option<(PendingInlineFrame, Vec<OpRef>)> {
     let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
@@ -15037,19 +15051,12 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // loop.
     //
     // A bridge whose resume data held no value at the portal `ec` color
-    // arrives with an empty `ec_box` (`bridge_ec_missing`). Read the red off
-    // the root frame instead, the way `MIFrame::ensure_execution_context` does
-    // for the opcode walker: a thread owns one ExecutionContext, so every live
-    // frame's field names the same object. The constant is left only for a
-    // root that carries no frame OpRef either.
+    // arrives with an empty `ec_box` (`bridge_ec_missing`) and falls back to
+    // the constant. There is no second live source to read it from: `ec` is a
+    // red in `PyPyJitDriver.reds`, not a `PyFrame` field, so a root frame
+    // OpRef names an object that does not carry one.
     let ec_seed = if !ec_box.is_none() {
         ec_box
-    } else if !root_frame_box.is_none() {
-        ctx.record_op_with_descr(
-            majit_ir::OpCode::GetfieldGcR,
-            &[root_frame_box],
-            crate::descr::pyframe_execution_context_descr(),
-        )
     } else {
         crate::jitcode_dispatch::census_record("ReconstructedCallee::EcConstFallback");
         ctx.const_ref(execution_context as i64)
@@ -15094,7 +15101,6 @@ pub(crate) fn setup_reconstructed_callee_frame(
         stack_base,
         pycode_const,
         w_globals_const,
-        ec_seed,
     );
     // `perform_call` (`pyjitpl.py`) is three lines — `newframe` +
     // `setup_call` + `raise ChangeFrame` — and `newframe` (`:2455-2476`)

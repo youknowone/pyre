@@ -590,11 +590,7 @@ pub(crate) fn is_contiguous(obj: PyObjectRef) -> Result<bool, PyError> {
 
 /// The `memoryview` builtin type via the live execution context.
 fn memoryview_type() -> Option<PyObjectRef> {
-    let frame = crate::eval::current_frame();
-    if frame.is_null() {
-        return None;
-    }
-    let ec = unsafe { (*frame).execution_context };
+    let ec = crate::call::getexecutioncontext();
     if ec.is_null() {
         return None;
     }

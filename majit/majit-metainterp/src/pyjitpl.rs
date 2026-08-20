@@ -4930,6 +4930,17 @@ impl<M: Clone> MetaInterp<M> {
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
+                // `force_start_tracing_for_key` set JC_TRACING on the cell
+                // selected by comparekey. Carry that cell's identity into the
+                // TraceCtx, compiled_loops/JitCellToken and the unconditional
+                // finally-clear instead of falling back to the bucket hash.
+                // This is the function-entry twin of on_back_edge_typed's
+                // resolve-once step below (warmstate.py:458-464/:483/:511).
+                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                    self.warm_state.cell_key_for(key)
+                })
+                .flatten()
+                .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
                 // `force_start_tracing_for_key` has just installed (or found)
                 // this key's cell, so resolving now names it. The number that
@@ -5059,7 +5070,26 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// RPython warmstate.py bound_reached parity.
+    /// warmstate.py:446-511 `maybe_compile_and_run` function-threshold half.
+    /// Resolve the portal greens through `comparekey` and run the whole warm
+    /// decision on that cell.  The returned boolean only says whether the
+    /// already-counted entry should call [`Self::force_start_tracing`]; that
+    /// call resolves the same typed key again without allocating on the common
+    /// unchained path.
+    pub fn should_trace_function_entry(
+        &mut self,
+        green_key: u64,
+        green_key_raw: (usize, usize),
+    ) -> bool {
+        match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            self.warm_state.should_trace_function_entry_for_key(key)
+        }) {
+            Some(should_trace) => should_trace,
+            None => self.warm_state.should_trace_function_entry(green_key),
+        }
+    }
+
+    /// RPython warmstate.py `bound_reached` parity.
     ///
     /// Like `on_back_edge_typed` but bypasses the counter tick — the
     /// caller (can_enter_jit_hook) already verified the counter fired.
@@ -5089,6 +5119,11 @@ impl<M: Clone> MetaInterp<M> {
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
+                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                    self.warm_state.cell_key_for(key)
+                })
+                .flatten()
+                .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
                 // Same re-resolve as the sibling `force_start_tracing` arm and
                 // as `on_back_edge_typed`: the incoming number is a bucket
@@ -26011,6 +26046,51 @@ mod tests {
         assert_eq!(
             stored.values[1], 1,
             "the profiled green must survive into the cell's comparekey"
+        );
+    }
+
+    #[test]
+    fn force_start_carries_the_typed_cells_minted_key_into_the_trace() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let code: usize = 0x5100;
+        let pc: usize = 17;
+        let bucket = crate::green_key_from_code_ptr(code, pc);
+        let key = majit_ir::GreenKey::with_types(
+            vec![pc as i64, 0, code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        assert_eq!(key.get_uhash(), bucket);
+
+        // A hash-only writer occupies the raw bucket first, forcing the typed
+        // cell to receive a minted identity. The tracing session must carry
+        // that identity; otherwise its finally-clear and compiled token attach
+        // are redirected to the comparator-less head.
+        meta.warm_state.disable_noninlinable_function(bucket);
+        assert!(matches!(
+            meta.force_start_tracing(bucket, (code, pc), None, &[Value::Int(0)]),
+            BackEdgeAction::StartedTracing
+        ));
+
+        let typed_cell_key = meta
+            .warm_state
+            .cell_key_for(&key)
+            .expect("force-start installed the typed cell");
+        assert_ne!(typed_cell_key, bucket, "typed cell must be minted");
+        assert_eq!(
+            meta.starting_green_key(),
+            Some(typed_cell_key),
+            "TraceCtx carries the resolved cell identity"
+        );
+
+        meta.warm_state.clear_tracing_flag(typed_cell_key);
+        assert!(
+            !meta
+                .warm_state
+                .lookup_chain_with_key(&key)
+                .expect("typed cell")
+                .is_tracing(),
+            "the identity carried by the trace clears the cell it started"
         );
     }
 

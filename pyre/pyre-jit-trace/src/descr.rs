@@ -2682,6 +2682,15 @@ static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
         0,
         &[
             (
+                "w_globals",
+                pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_GLOBALS_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
                 "w_locals",
                 pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_LOCALS_OFFSET,
                 std::mem::size_of::<usize>(),
@@ -2837,17 +2846,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // `pyframe.py self.w_globals` — the slot the inline
-            // new-PyFrame helper populates from the function's globals dict.
-            (
-                "PyFrame.w_globals",
-                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
-                8,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
             (
                 "PyFrame.debugdata",
                 crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
@@ -2860,19 +2858,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.lastblock",
                 crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
-                8,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            // Inline PyFrame 생성 시 새 frame 의
-            // execution_context 슬롯에 caller 의 ec 를 SetfieldGc 로 쓰기 위해
-            // 필요. RPython parity 는 interp_jit.py:67 reds=[frame, ec] 의 ec
-            // 슬롯과 동등 — pyre 는 ec 를 PyFrame 헤더에 inline 저장.
-            (
-                "PyFrame.execution_context",
-                crate::frame_layout::PYFRAME_EXECUTION_CONTEXT_OFFSET,
                 8,
                 Type::Ref,
                 false,
@@ -2931,7 +2916,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.failed_attr_cleanup",
                 crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
-                std::mem::size_of::<usize>(),
+                std::mem::size_of::<u8>(),
                 Type::Int,
                 false,
                 false,
@@ -4492,6 +4477,12 @@ pub fn rbigint_pair_item1_descr() -> DescrRef {
 /// `FrameDebugData.w_locals` — the mapping `getorcreatedebug().w_locals`
 /// reads at the head of `fast2locals` (pyframe.py).
 pub fn frame_debug_data_w_locals_descr() -> DescrRef {
+    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 1)
+}
+
+/// Rare per-frame globals override installed when one PyCode is executed in
+/// a namespace other than its first-seen globals.
+pub fn frame_debug_data_w_globals_descr() -> DescrRef {
     field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 0)
 }
 
@@ -4501,7 +4492,7 @@ pub fn frame_debug_data_w_locals_descr() -> DescrRef {
 /// `locals()` / `vars()` / `dir()` hand back, so a fold that rebuilds that
 /// mapping from fastlocals alone has to see it.
 pub fn frame_debug_data_w_extra_locals_descr() -> DescrRef {
-    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 1)
+    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 2)
 }
 
 /// `FrameDebugData.w_f_trace` — the frame's own trace function, the slot
@@ -4565,7 +4556,8 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
                  field_size: usize,
                  field_type: Type,
                  flag: ArrayFlag,
-                 is_immutable: bool| SimpleFieldDescrSpec {
+                 is_immutable: bool,
+                 is_quasi_immutable: bool| SimpleFieldDescrSpec {
         index: stable_field_index(offset, field_size, field_type, flag == ArrayFlag::Signed),
         field_key: field_key.to_string(),
         name: field_key.to_string(),
@@ -4573,7 +4565,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
         field_size,
         field_type,
         is_immutable,
-        is_quasi_immutable: false,
+        is_quasi_immutable,
         flag,
         virtualizable: false,
         // The group lists only the four read-only payload fields; the
@@ -4592,6 +4584,19 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             Type::Int,
             ArrayFlag::Unsigned,
             false,
+            false,
+        ),
+        // `pycode.py PyCode._immutable_fields_`: `w_globals?` is filled on
+        // first execution and then promoted. A shared-code frame using a
+        // different namespace keeps its override on FrameDebugData instead.
+        field(
+            "w_globals",
+            pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
+            std::mem::size_of::<pyre_object::PyObjectRef>(),
+            Type::Ref,
+            ArrayFlag::Pointer,
+            false,
+            true,
         ),
         // The slot is written once, by `box_code_object_with_firstlineno`,
         // onto the object `box_code_object` has just boxed out of a fresh
@@ -4604,6 +4609,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             Type::Int,
             ArrayFlag::Signed,
             true,
+            false,
         ),
         field(
             "hidden_applevel",
@@ -4611,6 +4617,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             std::mem::size_of::<bool>(),
             Type::Int,
             ArrayFlag::Unsigned,
+            false,
             false,
         ),
         // `co_name` is absent from `_immutable_fields_`, and this slot is
@@ -4622,6 +4629,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             std::mem::size_of::<pyre_object::PyObjectRef>(),
             Type::Ref,
             ArrayFlag::Pointer,
+            false,
             false,
         ),
     ];
@@ -4640,28 +4648,41 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
     )
 });
 
+fn pycode_field_descr_at(offset: usize) -> DescrRef {
+    let index = PYCODE_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == offset)
+        .expect("PyCode descr group has no field at requested offset");
+    field_descr_from_group(&*PYCODE_DESCR_GROUP, index)
+}
+
 pub fn pycode_code_ptr_descr() -> DescrRef {
-    field_descr_from_group(&*PYCODE_DESCR_GROUP, 0)
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_PTR_OFFSET)
+}
+
+pub fn pycode_w_globals_descr() -> DescrRef {
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET)
 }
 
 /// `PyCode.w_name` — the realized `co_name` string.  `w_code_name_obj` builds
 /// it on first demand and retains it, so the slot IS the getter's value once
 /// it is non-null; a null slot declines to the residual, which realizes it.
 pub fn pycode_w_name_descr() -> DescrRef {
-    field_descr_from_group(&*PYCODE_DESCR_GROUP, 3)
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_W_NAME_OFFSET)
 }
 
 /// `PyCode.co_firstlineno_raw` — a signed 32-bit slot, because 3.14's
 /// `CodeType` constructor accepts zero and negative first lines that
 /// `CodeObject.first_line_number` cannot hold.
 pub fn pycode_co_firstlineno_descr() -> DescrRef {
-    field_descr_from_group(&*PYCODE_DESCR_GROUP, 1)
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET)
 }
 
 /// `PyCode.hidden_applevel` — the frame-hidden flag read by
 /// `PyFrame.hide()`.
 pub fn pycode_hidden_applevel_descr() -> DescrRef {
-    field_descr_from_group(&*PYCODE_DESCR_GROUP, 2)
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET)
 }
 
 /// Size descriptor for W_IntObject allocation via NewWithVtable.
@@ -5555,39 +5576,22 @@ pub fn pyframe_code_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 3)
 }
 
-/// R3.3b prep: canonical `PyFrame.w_globals` slot
-/// (PYFRAME_W_GLOBALS_OFFSET).  Used by
-/// `emit_new_pyframe_inline_self_recursive` to populate the
-/// W_DictObject sibling so trace-time chases observe a non-null
-/// PyObjectRef.  `PyFrame.w_globals` is the single globals slot;
-/// the raw dict-storage accessor has been retired.
-pub fn pyframe_w_globals_obj_descr() -> DescrRef {
+/// rewrite.py `handle_call_assembler` scalar field read for the
+/// `debugdata` slot of the virtualizable expansion (Phase D-1 prereq).
+pub fn pyframe_debugdata_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
 }
 
-/// rewrite.py handle_call_assembler scalar field read for the
-/// `debugdata` slot of the virtualizable expansion (Phase D-1 prereq).
-pub fn pyframe_debugdata_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 5)
-}
-
-/// PyFrame.execution_context FieldDescr.
-/// inline PyFrame 생성 시 caller 의 ec 를 새 frame 으로 SetfieldGc 하기 위해.
-/// 호출 사이트는 `helpers.rs::emit_new_pyframe_inline*`.
-pub fn pyframe_execution_context_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
-}
-
 pub fn pyframe_f_generator_nowref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
 }
 
 pub fn pyframe_w_yielding_from_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 9)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
 }
 
 pub fn pyframe_f_backref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 10)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
 }
 
 /// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED`.  Read-or-written by the
@@ -5727,13 +5731,23 @@ mod tests {
                 true,
             ),
             (
+                pycode_w_globals_descr(),
+                "w_globals",
+                pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                2,
+                false,
+            ),
+            (
                 pycode_hidden_applevel_descr(),
                 "hidden_applevel",
                 pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
                 std::mem::size_of::<bool>(),
                 Type::Int,
                 false,
-                2,
+                3,
                 false,
             ),
             (
@@ -5743,7 +5757,7 @@ mod tests {
                 std::mem::size_of::<pyre_object::PyObjectRef>(),
                 Type::Ref,
                 false,
-                3,
+                4,
                 false,
             ),
         ];
@@ -5758,7 +5772,7 @@ mod tests {
             assert_eq!(field.field_type(), field_type);
             assert_eq!(field.is_field_signed(), signed);
             assert_eq!(descr.is_always_pure(), always_pure, "{name}");
-            assert!(!descr.is_quasi_immutable());
+            assert_eq!(descr.is_quasi_immutable(), name == "w_globals");
             assert_eq!(field.index_in_parent(), index_in_parent);
             let parent = field
                 .get_parent_descr()
@@ -5781,7 +5795,7 @@ mod tests {
         assert_eq!(size.type_id(), pyre_interpreter::pycode::W_CODE_GC_TYPE_ID);
         assert!(size.is_gc_managed());
         assert!(!size.headerless());
-        assert_eq!(size.all_fielddescrs().len(), 4);
+        assert_eq!(size.all_fielddescrs().len(), 5);
     }
 
     #[test]

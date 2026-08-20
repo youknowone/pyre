@@ -746,10 +746,6 @@ pub struct PyFrame {
     /// other `PyObject`-layout struct so `ob_type` reads land on the
     /// typeptr the JIT `GuardClass` / `type()` expect.
     pub ob_header: PyObject,
-    /// Raw pointer to the shared execution context.
-    /// The top-level frame leaks the Rc via `Rc::into_raw`.
-    /// Callee frames just copy the pointer (no atomic refcount ops).
-    pub execution_context: *const PyExecutionContext,
     /// Pointer to the Code object (PyCode).
     ///
     /// PyPy: pyframe.py `self.pycode = code` — stores the PyCode instance.
@@ -795,11 +791,13 @@ pub struct PyFrame {
     /// receiver consumed by a failing `LOAD_ATTR`.  PyPy's tracing GC does
     /// not need this state, but pyre must retain it on the owning red frame
     /// until the exception stack has discarded the receiver.  It is a
-    /// separate ordinary frame word rather than extra bits in `flags`. PyPy
-    /// leaves frame state that is not named by `_virtualizable_` on the
-    /// concrete red frame; traced accesses therefore remain ordinary
-    /// getfield/setfield operations on this frame's identity.
-    pub failed_attr_cleanup: usize,
+    /// separate ordinary byte beside `flags`.  PyPy represents the adjacent
+    /// frame-status booleans as byte fields; this CPython-only state has only
+    /// six values, so widening it to a machine word would make every hot call
+    /// frame pay for cold exception cleanup.  It remains a concrete red-frame
+    /// getfield/setfield, just with the narrow storage PyPy's rtyper would
+    /// select for the same finite state.
+    pub failed_attr_cleanup: u8,
     /// pyframe.py:82 debugdata — lazily allocated tracing/debug payload.
     /// Virtualizable static field (interp_jit.py:28).
     pub debugdata: *mut FrameDebugData,
@@ -830,16 +828,6 @@ pub struct PyFrame {
     /// `pyopcode.py:773-774`) see the picked Module, not the EC's
     /// default builtin.
     pub w_builtin: PyObjectRef,
-    /// `pypy/interpreter/pyframe.py:49 self.w_globals = w_globals`
-    /// — the canonical W_DictObject paired with this frame's globals.
-    ///
-    /// **Population**: threaded through directly by the object-taking
-    /// constructors; storage-only builders use `PY_NULL`.  Every reader after
-    /// construction observes the same value across the frame's lifetime.  This
-    /// is the source of truth: `get_w_globals()` and
-    /// `get_w_globals_storage()` both return it directly.  Synthetic test stubs
-    /// that hand-build PyFrame without a real globals leave it `PY_NULL`.
-    pub w_globals: PyObjectRef,
 }
 
 /// GC type id for `PyFrame`. Reserved ahead of any callsite that allocates
@@ -1107,7 +1095,6 @@ impl FrameBox {
             frame.w_yielding_from,
             frame.f_backref as pyre_object::PyObjectRef,
             frame.w_builtin,
-            frame.w_globals,
         ];
         let inputs = frame_root.publish(&live);
         frame_root.normalize(inputs, live.len());
@@ -1135,7 +1122,6 @@ impl FrameBox {
             frame.w_yielding_from = frame_root.get(inputs + 6);
             frame.f_backref = frame_root.get(inputs + 7) as *mut PyFrame;
             frame.w_builtin = frame_root.get(inputs + 8);
-            frame.w_globals = frame_root.get(inputs + 9);
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
                 frame.locals_cells_stack_w as *mut u8
             ));
@@ -1290,7 +1276,7 @@ impl FrameBox {
             slot
         });
         let coroutine_origin_slot = if is_coroutine {
-            let origin = capture_coroutine_origin(self.execution_context);
+            let origin = capture_coroutine_origin(crate::call::getexecutioncontext());
             let _ = pyre_object::gc_roots::pin_root(origin);
             Some(pyre_object::gc_roots::shadow_stack_len() - 1)
         } else {
@@ -1811,6 +1797,11 @@ pub fn frame_tracing_active(frame: &PyFrame) -> bool {
 #[repr(C)]
 #[derive(Clone)]
 pub struct FrameDebugData {
+    /// `FrameDebugData.__init__` / `PyFrame.get_w_globals`: the code object's
+    /// first globals lives on `PyCode`; only a frame running that same code in
+    /// another globals object stores the override here.  This is the one-field
+    /// frame-size optimization introduced by PyPy commit `bcd8653e5ec`.
+    pub w_globals: PyObjectRef,
     /// pyframe.py:44 — the frame's locals mapping (`self.w_locals`).
     /// At module scope it is the `w_globals` dict; in a class body it is
     /// the class namespace; for a function it is the dict lazily
@@ -1844,12 +1835,15 @@ pub struct FrameDebugData {
 }
 
 impl FrameDebugData {
-    // `_pycode` keeps the constructor shape of `pyframe.py:48
-    // FrameDebugData.__init__(self, pycode, init_lineno)`.  The frame's
-    // globals object now lives in `PyFrame.w_globals`, so debugdata no
-    // longer snapshots `pycode.w_globals`.
-    pub fn new(_pycode: *const (), init_lineno: isize) -> Self {
+    /// `pyframe.py FrameDebugData.__init__`: initialize the rare-frame
+    /// globals override from the code object's first-seen globals.
+    pub fn new(pycode: *const (), init_lineno: isize) -> Self {
         Self {
+            w_globals: if pycode.is_null() {
+                pyre_object::PY_NULL
+            } else {
+                unsafe { crate::w_code_get_w_globals(pycode as PyObjectRef) }
+            },
             w_locals: pyre_object::PY_NULL,
             w_extra_locals: pyre_object::PY_NULL,
             w_f_trace: pyre_object::PY_NULL,
@@ -1884,6 +1878,10 @@ pub const FRAME_DEBUG_DATA_W_EXTRA_LOCALS_OFFSET: usize =
 /// local tracing leaves compiled code instead of running the tail silent.
 pub const FRAME_DEBUG_DATA_W_F_TRACE_OFFSET: usize =
     std::mem::offset_of!(FrameDebugData, w_f_trace);
+
+/// Byte offset of the rare per-frame globals override.
+pub const FRAME_DEBUG_DATA_W_GLOBALS_OFFSET: usize =
+    std::mem::offset_of!(FrameDebugData, w_globals);
 
 /// Allocated size of a `FrameDebugData`.
 pub const FRAME_DEBUG_DATA_SIZE: usize = std::mem::size_of::<FrameDebugData>();
@@ -1995,13 +1993,6 @@ pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_back
 /// Read by the descr GC walker so a collection survives across the
 /// guard exit / re-entry edge.
 pub const PYFRAME_W_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, w_builtin);
-
-/// Byte offset of `w_globals` in `PyFrame` — the canonical
-/// W_DictObject paired with the storage in `w_globals`.  Registered
-/// as a GC-traceable slot so a minor collection forwards the pointer
-/// when the dict survives.  The slot is lazy: `PY_NULL` until
-/// `get_w_globals` resolves it.
-pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals);
 
 // Backward-compat aliases used by JIT code.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
@@ -3037,26 +3028,35 @@ impl PyFrame {
         self.code()
     }
 
-    /// pyframe.py:129-133 get_w_globals_storage — return the frame's canonical
-    /// W_DictObject.  `pyframe.py:49 self.w_globals = w_globals` keeps that
-    /// object as the single globals field.
+    /// PyPy `get_w_globals_storage` compatibility alias.
     #[inline]
     pub fn get_w_globals_storage(&self) -> PyObjectRef {
-        self.w_globals
+        self.get_w_globals()
     }
 
-    /// The canonical W_DictObject for this frame's globals
-    /// (`pyframe.py:49 self.w_globals = w_globals`).  Every frame
-    /// constructor seeds `w_globals` eagerly, so this is a plain
-    /// field read; callers wanting object identity
-    /// (`function.__globals__ is frame.f_globals`, `globals() is
-    /// module.__dict__`, etc.) read it directly.
-    ///
-    /// Returns `PY_NULL` when the frame has no globals (test stubs);
-    /// callers that expect a dict should null-check before dereferencing.
+    /// `pyframe.py PyFrame.get_w_globals`: the normal case reads the
+    /// promoted code object's first-seen globals. A frame executing a shared
+    /// code object in another namespace carries the override in debugdata.
     #[inline]
     pub fn get_w_globals(&self) -> PyObjectRef {
-        self.w_globals
+        if let Some(data) = self.getdebug_data() {
+            return data.w_globals;
+        }
+        if self.pycode.is_null() {
+            return pyre_object::PY_NULL;
+        }
+        unsafe { crate::w_code_get_w_globals(self.pycode as PyObjectRef) }
+    }
+
+    /// `pyframe.py PyFrame.set_w_globals`: force the rare globals override
+    /// into lazily-created debugdata. Root the value across that allocation;
+    /// RPython's shadow-stack transform does the same for the live argument.
+    pub fn set_w_globals(&mut self, w_globals: PyObjectRef) {
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = roots.base();
+        let _ = roots.pin_root(w_globals);
+        self.getorcreate_debug_data(-1).w_globals = roots.get(slot);
+        remember_frame_debug_data(self.debugdata);
     }
 
     /// pyframe.py get_w_f_trace
@@ -3129,21 +3129,14 @@ impl PyFrame {
             clear_debugdata_ptr(&mut self.debugdata);
             clear_block_chain(&mut self.lastblock);
         }
-        // `pyframe.py:114-115` — `self.builtin = space.builtin.pick_builtin(
-        // w_globals)`.  pyre keeps the picked builtin and the canonical
-        // `w_globals` W_DictObject (the `get_w_globals_storage` resolution of
-        // `pyframe.py:128-132`) in the adjacent `w_builtin` / `w_globals`
-        // slots.  This storage-only hook carries no globals object, so a
-        // frame built through this hook is left in the same state as one
-        // built by `createframe`.
+        // This storage-only hook carries no globals object.
         let w_globals = PY_NULL;
-        self.w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, self.execution_context);
-        self.w_globals = w_globals;
-        // pyframe.py — stamp `pycode.w_globals` (the first-globals cache
-        // the LOAD_GLOBAL fast path keys on); side effect only, since the
-        // gated debugdata snapshot retired in favour of `w_globals`.
-        unsafe {
-            crate::w_code_frame_stores_global(code as PyObjectRef, self.w_globals);
+        self.w_builtin =
+            crate::baseobjspace::frame_builtin_obj(w_globals, crate::call::getexecutioncontext());
+        // `pyframe.py PyFrame.__init__`: only a code/globals identity mismatch
+        // creates a per-frame debugdata override.
+        if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {
+            self.set_w_globals(w_globals);
         }
         // pyframe.py — final step of __init__.
         self.initialize_frame_scopes(outer_func, code).expect(
@@ -3463,7 +3456,9 @@ impl PyFrame {
     /// `createframe` (PyPy `baseobjspace.py`) so every heap-allocated
     /// `PyFrame` flows through the canonical entry point.
     pub fn new(code: CodeObject) -> FrameBox {
-        let frame = Self::new_with_context(code, Rc::new(PyExecutionContext::default()))
+        let execution_context = Rc::new(PyExecutionContext::default());
+        let ctx_ptr = Rc::as_ptr(&execution_context);
+        let frame = Self::new_with_context(code, execution_context)
             .expect("PyFrame::new: test entry code must not carry freevars");
         // `threadlocals.py:enter_thread` — the ExecutionContext slot belongs to
         // the OS-thread locals and is installed once at thread entry, not
@@ -3472,7 +3467,7 @@ impl PyFrame {
         // point this one must too, or `space.getexecutioncontext()` stays null
         // and every context reached through it — the class-body frame's
         // builtins among them — falls back to the empty default.
-        crate::call::set_last_exec_ctx(frame.execution_context);
+        crate::call::set_last_exec_ctx(ctx_ptr);
         frame
     }
 
@@ -3578,14 +3573,13 @@ impl PyFrame {
     /// the generator snapshot.  Frame-LOCAL state (`locals_cells_stack_w` /
     /// `valuestackdepth` / `last_instr`) is COPIED, so snapshot mutations to
     /// locals/stack are discarded — the abort-safety the snapshot exists
-    /// for.  `w_globals` is the SAME dict ptr, so a concrete shared-heap
+    /// for.  The code/debugdata-derived globals is the SAME dict ptr, so a concrete shared-heap
     /// write during recording would leak to the real heap and double-apply
     /// on the compiled loop's re-run; Gap 10 removed that path (inline-frame
     /// STORE_GLOBAL records as deferred IR, applied exactly once).
     fn build_snapshot_frame(&self, allocation: FrameLocalsArrayAllocation) -> PyFrame {
         PyFrame {
             ob_header: frame_ob_header(),
-            execution_context: self.execution_context,
             pycode: self.pycode,
             locals_cells_stack_w: unsafe {
                 let values = locals_w!(self).to_vec();
@@ -3607,7 +3601,6 @@ impl PyFrame {
             w_yielding_from: self.w_yielding_from,
             f_backref: self.f_backref,
             w_builtin: self.w_builtin,
-            w_globals: self.w_globals,
         }
     }
 
@@ -4207,9 +4200,9 @@ impl PyFrame {
     /// `frame_finished_execution` status bit.
     pub const FLAG_FRAME_FINISHED: u8 = 0b10;
     /// A failed LOAD_ATTR is waiting for this frame's POP_EXCEPT cleanup.
-    const FAILED_ATTR_AFTER_POP_EXCEPT: usize = 4;
+    const FAILED_ATTR_AFTER_POP_EXCEPT: u8 = 4;
     /// The next dispatch boundary must collect the failed LOAD_ATTR receiver.
-    const FAILED_ATTR_BEFORE_OPCODE: usize = usize::MAX;
+    const FAILED_ATTR_BEFORE_OPCODE: u8 = u8::MAX;
 
     /// pyframe.py:80 `escaped`.
     #[inline]
@@ -4297,10 +4290,11 @@ impl PyFrame {
         if !self.w_builtin.is_null() {
             return self.w_builtin;
         }
-        if self.execution_context.is_null() {
+        let execution_context = crate::call::getexecutioncontext();
+        if execution_context.is_null() {
             return pyre_object::PY_NULL;
         }
-        unsafe { (*self.execution_context).get_builtin() }
+        unsafe { (*execution_context).get_builtin() }
     }
 
     /// `frame.f_backref()` — force the caller vref.  `f_backref` holds a
@@ -5417,15 +5411,12 @@ impl PyFrame {
         // remember the completed array before the next allocating operation.
         remember_frame_locals_array(locals_cells_stack_w);
 
-        // pyframe.py — stamp `pycode.w_globals`; side effect only (the
-        // gated debugdata snapshot retired in favour of `w_globals`).
-        unsafe {
-            crate::w_code_frame_stores_global(_roots.get(root_base), _roots.get(root_base + 1));
-        }
+        let frame_stores_global = unsafe {
+            crate::w_code_frame_stores_global(_roots.get(root_base), _roots.get(root_base + 1))
+        };
 
         let mut frame = PyFrame {
             ob_header: frame_ob_header(),
-            execution_context,
             pycode: _roots.get(root_base) as *const (),
             locals_cells_stack_w,
             valuestackdepth: num_locals + num_cells,
@@ -5439,8 +5430,10 @@ impl PyFrame {
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
             w_builtin: _roots.get(root_base + 3),
-            w_globals: _roots.get(root_base + 1),
         };
+        if frame_stores_global {
+            frame.set_w_globals(_roots.get(root_base + 1));
+        }
         // This constructor bypasses `initialize_frame_scopes`, so apply the
         // scope binding it would have done.  `FunctionType(co, globals)` over
         // a module-level code object arrives here, and without the binding its
@@ -5697,7 +5690,7 @@ pub fn createframe(
 }
 
 /// `baseobjspace.py createframe` with the globals passed as the dict
-/// OBJECT (`pyframe.py:49 self.w_globals = w_globals` stores the object).
+/// object; `PyCode.frame_stores_global` chooses code storage or debugdata.
 pub fn createframe_obj(
     code: *const (),
     w_globals: PyObjectRef,
@@ -5717,26 +5710,20 @@ pub fn createframe_obj(
     //   ...
     //   self.initialize_frame_scopes(outer_func, code)
     //
-    // `pyframe.py:49 self.w_globals = w_globals`: preserve the exact object.
-    // This is observable for dict subclasses (notably annotationlib's
-    // `_StringifierDict`, whose `__missing__` creates ForwardRef values) and
-    // is the identity MAKE_FUNCTION must pass on to each callee frame.
+    // Preserve the exact object either on `PyCode.w_globals` (normal case) or
+    // the rare `FrameDebugData.w_globals` override.
     let raw = unsafe { crate::w_code_get_ptr(code as PyObjectRef) as *const CodeObject };
     let code_ref = unsafe { &*raw };
     let num_locals = code_ref.varnames.len();
     let num_cells = ncells(code_ref);
     let max_stack = code_ref.max_stackdepth as usize;
-    // pyframe.py — stamp `pycode.w_globals`; side effect only (the gated
-    // debugdata snapshot retired in favour of `w_globals`).
-    unsafe {
-        crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
-    }
+    let frame_stores_global =
+        unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) };
 
     let size = num_locals + num_cells + max_stack;
     let w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, execution_context);
     let mut frame = FrameBox::new(PyFrame {
         ob_header: frame_ob_header(),
-        execution_context,
         pycode: code,
         locals_cells_stack_w: unsafe {
             alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::OldGenGc)
@@ -5752,9 +5739,11 @@ pub fn createframe_obj(
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
         w_builtin,
-        w_globals,
     });
-    // pyframe.py — final step of __init__.  PY_NULL plays the role of
+    if frame_stores_global {
+        frame.set_w_globals(w_globals);
+    }
+    // pyframe.py `PyFrame.__init__` — final step. PY_NULL plays the role of
     // Python `None` per the existing `initialize_frame_scopes` convention.
     // Top-level module / interactive / expression code
     // arrives here without CO_NEWLOCALS — RustPython codegen emits empty
@@ -6072,6 +6061,46 @@ type_id={type_id} frame_forwarded={forwarded} track_young_ptrs={tracks_young}\n"
 #[cfg(test)]
 mod tests {
     use super::load_const_from_code;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn pyframe_common_layout_has_no_eager_globals_word() {
+        assert_eq!(std::mem::size_of::<super::PyFrame>(), 112);
+    }
+
+    #[test]
+    fn shared_code_stores_only_the_different_globals_on_debugdata() {
+        // Module code creates debugdata for `w_locals` even in PyPy.  Use an
+        // optimized function code object so this test isolates the uncommon
+        // globals override that `PyCode.frame_stores_global` controls.
+        let outer = crate::compile_exec("def f():\n    return 1\n").expect("compile");
+        let code = super::code_constants(&outer)
+            .iter()
+            .find_map(|constant| match constant {
+                crate::bytecode::ConstantData::Code { code } => Some(code.as_ref()),
+                _ => None,
+            })
+            .expect("nested function code");
+        let w_code = crate::pycode::box_code_constant(code);
+        let first_globals = pyre_object::w_dict_new();
+        let other_globals = pyre_object::w_dict_new();
+
+        let first =
+            super::createframe_obj(w_code as *const (), first_globals, std::ptr::null(), None)
+                .expect("first frame");
+        assert!(first.debugdata.is_null());
+        assert_eq!(first.get_w_globals(), first_globals);
+
+        let other =
+            super::createframe_obj(w_code as *const (), other_globals, std::ptr::null(), None)
+                .expect("shared-code frame");
+        assert!(!other.debugdata.is_null());
+        assert_eq!(other.get_w_globals(), other_globals);
+        assert_eq!(
+            unsafe { crate::w_code_get_w_globals(w_code) },
+            first_globals
+        );
+    }
 
     fn nested_code_yields_inside_try(source: &str) -> bool {
         let outer = crate::compile_exec(source).expect("compile");

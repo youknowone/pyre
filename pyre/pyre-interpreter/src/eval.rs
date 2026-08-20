@@ -149,7 +149,7 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     // can iterate all active frames. `eval_frame_plain` calls
     // `ExecutionContext::enter` before installing TLS-only state, but
     // the JIT portal path enters through this helper directly.
-    let ec = frame.execution_context as *mut PyExecutionContext;
+    let ec = crate::call::getexecutioncontext() as *mut PyExecutionContext;
     // `ExecutionContext::enter` refuses a frame that is already the top —
     // relinking it would make `f_backref` name the frame itself, and
     // `walk_pyframe_roots` follows `f_backref` with no cycle guard.  This door
@@ -953,20 +953,9 @@ pub unsafe fn walk_pyframe_roots_area(
         // and are forwarded by the GC's root walker; no extra visit here.
 
         let mut frame = cf.get();
-        let frame_ec = if frame.is_null() {
-            std::ptr::null_mut()
-        } else {
-            unsafe { (*frame).execution_context as *mut PyExecutionContext }
-        };
-        // Root the EC slots from the current frame's EC AND the ambient
-        // TLS EC (`getexecutioncontext`).  The ambient visit covers the
-        // spans where no frame is installed in `CURRENT_FRAME` yet the EC
-        // is live — between `ExecutionContext::enter` and `eval_loop`'s
-        // frame install, and around `return_trace`/`leave` after the
-        // frame guard drops — where `sys_exc_value` may already hold a
-        // nursery exception.  PyPy reaches the ExecutionContext
-        // unconditionally through `space.threadlocals`, independent of
-        // any frame.
+        // Root the EC slots from the ambient TLS EC.  PyPy reaches the
+        // ExecutionContext unconditionally through `space.threadlocals`,
+        // independent of whether a frame is currently installed.
         let ambient_ec = unsafe {
             (&*(area.last_exec_ctx as *const Cell<*const PyExecutionContext>)).get()
                 as *mut PyExecutionContext
@@ -1009,10 +998,7 @@ pub unsafe fn walk_pyframe_roots_area(
                 visitor(unsafe { &mut *(hook as *mut majit_ir::GcRef) });
             }
         };
-        visit_ec_slots(frame_ec);
-        if ambient_ec != frame_ec {
-            visit_ec_slots(ambient_ec);
-        }
+        visit_ec_slots(ambient_ec);
         while !frame.is_null() {
             // SAFETY: PyFrame pointers on the f_backref chain are valid
             // for the duration of the enclosing `eval_with_jit` call. A
@@ -1101,11 +1087,11 @@ pub unsafe fn walk_pyframe_roots_area(
                         as *mut PyObjectRef;
                     visitor(&mut *(w_dict_slot as *mut majit_ir::GcRef));
                 }
-                // pyframe.py `self.w_globals` is the dict OBJECT. Forward
-                // the field before following the dict's own storage.
-                let w_globals_obj_slot = &mut (*frame).w_globals as *mut PyObjectRef;
-                visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
-                // pyframe.py `debugdata.w_locals` (the frame's locals
+                // pyframe.py `FrameDebugData.w_globals` / `w_locals`: only a
+                // code/globals identity mismatch stores globals on the frame.
+                // The common globals edge is reached through `pycode` above.
+                // Both debug mappings must be forwarded before use.
+                // `debugdata.w_locals` (the frame's locals
                 // mapping object) and `w_f_trace` carry GCREFs that survive
                 // the frame; forward both slots.  The locals mapping holds its
                 // own bindings (module globals, class namespace, function
@@ -1118,6 +1104,8 @@ pub unsafe fn walk_pyframe_roots_area(
                         visitor(&mut *(debugdata_slot as *mut majit_ir::GcRef));
                     }
                     let d = &mut *(*frame).debugdata;
+                    let w_globals_slot = &mut d.w_globals as *mut PyObjectRef;
+                    visitor(&mut *(w_globals_slot as *mut majit_ir::GcRef));
                     let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
                     visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
                     let w_extra_locals_slot = &mut d.w_extra_locals as *mut PyObjectRef;
@@ -1134,7 +1122,7 @@ pub unsafe fn walk_pyframe_roots_area(
                         &mut (*frame).lastblock as *mut *mut crate::pyframe::FrameBlock;
                     visitor(&mut *(lastblock_slot as *mut majit_ir::GcRef));
                 }
-                let live_obj = (*frame).w_globals;
+                let live_obj = (*frame).get_w_globals();
                 // For a W_ModuleDictObject the LOAD_GLOBAL read path consults the
                 // authoritative `dstorage` cell map / `object_storage` /
                 // strategy caches. Forward those movable
@@ -1454,12 +1442,8 @@ pub fn walk_suspended_generator_frame(
         let yielding_slot = &mut (*frame).w_yielding_from as *mut PyObjectRef;
         visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
 
-        // Forward the globals/builtin object pointers; their dict VALUES are
-        // not walked here — a module dict is rooted globally by
-        // `walk_module_dicts_gc`, and a GC-managed `exec` globals dict is
-        // reached transitively through its own trace.
-        let w_globals_obj_slot = &mut (*frame).w_globals as *mut PyObjectRef;
-        visitor(&mut *(w_globals_obj_slot as *mut majit_ir::GcRef));
+        // Forward the builtin object pointer. The common globals object is
+        // reached through `pycode`; the rare override is in debugdata below.
         let w_builtin_slot = &mut (*frame).w_builtin as *mut PyObjectRef;
         visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
         let w_builtin = (*frame).w_builtin;
@@ -1476,6 +1460,8 @@ pub fn walk_suspended_generator_frame(
                 visitor(&mut *(debugdata_slot as *mut majit_ir::GcRef));
             }
             let d = &mut *(*frame).debugdata;
+            let w_globals_slot = &mut d.w_globals as *mut PyObjectRef;
+            visitor(&mut *(w_globals_slot as *mut majit_ir::GcRef));
             let w_locals_slot = &mut d.w_locals as *mut PyObjectRef;
             visitor(&mut *(w_locals_slot as *mut majit_ir::GcRef));
             let w_extra_locals_slot = &mut d.w_extra_locals as *mut PyObjectRef;
@@ -1855,7 +1841,7 @@ pub fn handle_exception_with_context(
     // which routes through the `attach_tb=False` branch, so all three
     // tracing hooks are skipped per `:91-94`.  Pyre carries the same
     // intent via `PyError.attach_tb` set by `eval.rs::reraise`.
-    let ec = frame.execution_context as *mut crate::PyExecutionContext;
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     // Everything below allocates before it touches the frame again:
     // `to_exc_object` materialises the exception, `chain_context` builds the
     // `__context__` link, the trace hooks run arbitrary Python and
@@ -2169,14 +2155,14 @@ pub(crate) fn eval_frame_plain_with_resume(
         operr,
         throw_args,
     };
-    if frame.execution_context.is_null() {
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
         if let Some(value) = prepare_frame_resume_for_dispatch(frame, &mut resume)? {
             return Ok(value);
         }
-        return eval_loop(frame);
+        return eval_loop(frame, ec);
     }
-    let execution_context =
-        unsafe { &mut *(frame.execution_context as *mut crate::PyExecutionContext) };
+    let execution_context = unsafe { &mut *ec };
     // executioncontext.py / threadlocals.py parity: the current
     // ExecutionContext is owned by the OS-thread locals and is installed by
     // thread bootstrap.  Entering an (including inlined) frame must not
@@ -2209,7 +2195,7 @@ pub(crate) fn eval_frame_plain_with_resume(
                 w_exitvalue = value;
                 return Ok(value);
             }
-            let result = eval_loop(frame)?;
+            let result = eval_loop(frame, ec)?;
             w_exitvalue = result;
             Ok(result)
         })();
@@ -2242,10 +2228,11 @@ pub(crate) fn eval_frame_plain_with_resume(
 
 /// Resume interpretation after compiled code guard failure.
 pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
-    eval_loop(frame)
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    eval_loop(frame, ec)
 }
 
-fn eval_loop(frame: &mut PyFrame) -> PyResult {
+fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResult {
     // Bump the monotonic frame eval-loop entry odometer: a user Python frame
     // is about to run bytecode.  The FBW FOR_ITER Option-C guard snapshots
     // this around a residual call to detect a body effect that ran through
@@ -2264,7 +2251,7 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // this bit out.
         majit_ir::eval_breaker_word::set_gc_interp();
     }
-    let _current_frame_guard = if frame.execution_context.is_null() {
+    let _current_frame_guard = if ec.is_null() {
         install_current_frame(frame)
     } else {
         install_current_frame_tls_only(frame)
@@ -2351,7 +2338,6 @@ fn eval_loop(frame: &mut PyFrame) -> PyResult {
         // — bytecode_trace fires bytecode_only_trace then decrements
         // the ticker. Gated upstream on `w_tracefunc.is_null()` so the
         // no-tracer hot path is a single null-check + ticker decrement.
-        let ec = frame.execution_context as *mut crate::PyExecutionContext;
         if !ec.is_null() {
             if frame.take_failed_attr_before_opcode() {
                 unsafe { (*ec).run_failed_attr_finalizers() };
@@ -3145,7 +3131,7 @@ impl PyFrame {
         if !generator && !operr.has_any_traceback() {
             return Ok(());
         }
-        let ec = self.execution_context as *mut crate::PyExecutionContext;
+        let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
         if ec.is_null() {
             return Ok(());
         }
@@ -4131,7 +4117,7 @@ impl OpcodeStepExecutor for PyFrame {
             self.get_w_globals(),
             pyre_object::w_none(),
             0,
-            self.execution_context,
+            crate::call::getexecutioncontext(),
         )
     }
 
@@ -4188,7 +4174,7 @@ impl OpcodeStepExecutor for PyFrame {
     // Stack: [module] → peek module, push getattr(module, name)
     fn import_from(&mut self, name: &str) -> Result<(), PyError> {
         let module = self.peek();
-        let ec = self.execution_context;
+        let ec = crate::call::getexecutioncontext();
         let anchor = FrameAnchor::new(self);
         let attr = crate::importing::import_from(module, name, ec)?;
         Self::push_anchored(&anchor, attr)
@@ -5758,7 +5744,7 @@ except AttributeError as exc:
         let (res, frame) = run_exec_frame(source);
         res.expect("member slot AttributeError regression");
         unsafe {
-            let value = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            let value = w_dict_getitem_str(frame.get_w_globals(), "result").unwrap();
             assert_eq!(
                 w_str_get_wtf8(value).as_str(),
                 Ok("'__main__.make_type.<locals>.X' object has no attribute 'a'")
@@ -5874,7 +5860,7 @@ result = (
         let (res, frame) = run_exec_frame(source);
         res.expect("CPython list allocation metadata failed");
         unsafe {
-            let result = w_dict_getitem_str(frame.w_globals, "result").unwrap();
+            let result = w_dict_getitem_str(frame.get_w_globals(), "result").unwrap();
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
     }

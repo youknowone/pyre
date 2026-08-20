@@ -521,15 +521,14 @@ pub(crate) fn capture_last_exec_ctx_cell() -> *const () {
 /// slot seeded at process boot by pyrex (`pyrex/src/lib.rs`'s
 /// `setup_exec_context`, which calls
 /// `set_last_exec_ctx(Rc::as_ptr(&execution_context))`) and
-/// re-stamped on every `eval_frame_plain` entry.  The slot stays
-/// pointing at the root EC for the lifetime of the process, so
+/// re-stamped on every `eval_frame_plain` entry. The slot stays
+/// pointing at that thread's EC for the lifetime of its activation, so
 /// `sys.gettrace`/`settrace`/`getprofile`/`setprofile` and other
 /// `space.getexecutioncontext()` callers see the live EC even when
 /// no eval frame is currently on the stack.
 ///
-/// TODO: pyre is single-threaded today so the TLS
-/// slot is effectively a global.  PyPy's per-thread `threadlocals`
-/// dispatch lands when pyre adds its own thread state container.
+/// The slot is per OS thread: `module::thread` installs the thread's own EC at
+/// bootstrap and clears it at teardown, matching PyPy's threadlocals owner.
 pub fn getexecutioncontext() -> *const crate::PyExecutionContext {
     take_last_exec_ctx()
 }
@@ -891,7 +890,7 @@ fn call_user_function_with_eval(
     args: &[PyObjectRef],
     eval_fn: EvalFn,
 ) -> PyResult {
-    let mut func_frame = match prepare_user_call(frame.execution_context, callable, args)? {
+    let mut func_frame = match prepare_user_call(getexecutioncontext(), callable, args)? {
         PreparedUserCall::Frame(func_frame) => func_frame,
         PreparedUserCall::Generator(generator) => return Ok(generator),
     };
@@ -1140,7 +1139,7 @@ enum CallMode {
 /// root is installed here and held across the whole dispatch.
 pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
     let profile_frame = frame as *mut PyFrame;
-    let execution_context = frame.execution_context;
+    let execution_context = getexecutioncontext();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     call_callable_with_mode(
         execution_context,
@@ -1164,7 +1163,7 @@ pub fn call_args_in_frame(
     args: &[PyObjectRef],
 ) -> PyResult {
     let _caller_locals_root = FrameLocalsRoot::new(frame);
-    call_callable_in_ctx(frame.execution_context, callable, args)
+    call_callable_in_ctx(getexecutioncontext(), callable, args)
 }
 
 /// `descroperation.py call_args(space, w_obj, args)` — the generic callable
@@ -1279,7 +1278,7 @@ pub fn call_function_ex(
     kwargs_or_null: PyObjectRef,
 ) -> PyResult {
     let profile_frame = frame as *mut PyFrame;
-    let execution_context = frame.execution_context;
+    let execution_context = getexecutioncontext();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     call_function_ex_impl(
         execution_context,
@@ -1439,7 +1438,7 @@ pub fn call_kw(
     kwarg_names: PyObjectRef,
 ) -> PyResult {
     let profile_frame = frame as *mut PyFrame;
-    let execution_context = frame.execution_context;
+    let execution_context = getexecutioncontext();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     call_kw_in_ctx_impl(
         execution_context,
@@ -2146,7 +2145,7 @@ pub fn call_callable_inline_residual(
     args: &[PyObjectRef],
 ) -> PyResult {
     let profile_frame = frame as *mut PyFrame;
-    let execution_context = frame.execution_context;
+    let execution_context = getexecutioncontext();
     let _caller_locals_root = FrameLocalsRoot::new(frame);
     call_callable_with_mode(
         execution_context,
@@ -2753,7 +2752,7 @@ pub fn call_with_kwargs(
     kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> PyResult {
     let _caller_locals_root = FrameLocalsRoot::new(frame);
-    call_with_kwargs_in_ctx(frame.execution_context, callable, pos_args, kwargs)
+    call_with_kwargs_in_ctx(getexecutioncontext(), callable, pos_args, kwargs)
 }
 
 /// Call a user function with positional args + keyword args from a dict.

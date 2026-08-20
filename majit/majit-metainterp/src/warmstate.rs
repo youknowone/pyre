@@ -1293,7 +1293,16 @@ impl WarmEnterState {
             if cell.is_tracing() {
                 return HotResult::AlreadyTracing;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
+            // warmstate.py:473-481 handles JC_TEMPORARY before it consults
+            // JC_DONT_TRACE_HERE: a compile_tmp_callback is only the residual
+            // CALL_ASSEMBLER fallback, so it must keep counting toward the
+            // callee's real standalone trace even when that callee was marked
+            // non-inlinable.  Refusing the combination here strands the
+            // JC_FORCE_FINISH retry installed after a trace-too-long abort.
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0
+                && cell.flags & jc_flags::TEMPORARY == 0
+                && cell.has_seen_a_procedure_token()
+            {
                 return HotResult::NotHot;
             }
             // Give up after too many failed trace attempts to prevent
@@ -1320,7 +1329,10 @@ impl WarmEnterState {
             if cell.is_tracing() {
                 return HotResult::AlreadyTracing;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 && cell.has_seen_a_procedure_token() {
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0
+                && cell.flags & jc_flags::TEMPORARY == 0
+                && cell.has_seen_a_procedure_token()
+            {
                 return HotResult::NotHot;
             }
             if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
@@ -2288,13 +2300,30 @@ impl WarmEnterState {
                 crate::mc_diag_bump(81); // abort_ceiling_refused
                 return FunctionEntryStep::NotHot;
             }
+            // warmstate.py:473-481: JC_TEMPORARY is tested alongside
+            // JC_TRACING and, unlike JC_TRACING, counts normally.  This branch
+            // must precede JC_DONT_TRACE_HERE below: the temporary token is the
+            // interpreter callback used until the non-inlinable callee gets
+            // its own real trace, not evidence that the callee was already
+            // compiled separately.
+            if cell.flags & jc_flags::TEMPORARY != 0 {
+                crate::mc_diag_bump(25);
+                return if self
+                    .counter
+                    .tick(self.bucket_of(cell_key), self.increment_function_threshold)
+                {
+                    FunctionEntryStep::Proceed
+                } else {
+                    FunctionEntryStep::NotHot
+                };
+            }
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
                 if cell.has_seen_a_procedure_token() {
-                    // A live TEMPORARY token still declines; a token that was
-                    // once seen but has since been invalidated falls through to
-                    // the cleanup gate below (`WarmEnterState.maybe_compile_and_run`)
-                    // rather than
-                    // re-entering the never-traced retry.
+                    // A non-temporary token that was once seen but has since
+                    // been invalidated falls through to the cleanup gate below
+                    // (`WarmEnterState.maybe_compile_and_run`) rather than
+                    // re-entering the never-traced retry. A live real token
+                    // returned through the compiled branch above.
                     if cell.get_procedure_token().is_some() {
                         return FunctionEntryStep::NotHot;
                     }
@@ -2328,6 +2357,60 @@ impl WarmEnterState {
         } else {
             FunctionEntryStep::NotHot
         }
+    }
+
+    /// Typed-key form of [`Self::should_trace_function_entry`].
+    ///
+    /// `maybe_compile_and_run` in warmstate.py:458-464 walks the bucket chain
+    /// with `comparekey` once and keeps that exact `JitCell` through the
+    /// JC_TEMPORARY / procedure-token / JC_DONT_TRACE_HERE decision.  A raw
+    /// hash names only the bucket in pyre, so using the hash form for this
+    /// first half and [`Self::force_start_tracing_for_key`] for the second can
+    /// inspect two different cells in a chained bucket.  Keep the whole
+    /// function-entry decision on the matching typed cell instead.
+    pub fn should_trace_function_entry_for_key(&mut self, key: &GreenKey) -> bool {
+        let bucket = key.get_uhash();
+        let mut cleanup_dead_token_cell = false;
+        if let Some(cell) = self.lookup_chain_with_key(key) {
+            let compiled = cell.is_compiled();
+            let tracing = cell.is_tracing();
+            if compiled || tracing {
+                crate::mc_diag_bump(23);
+                if compiled {
+                    crate::mc_diag_bump(64);
+                }
+                if tracing {
+                    crate::mc_diag_bump(65);
+                    if cell.tracing_generation < self.tracing_generation {
+                        crate::mc_diag_bump(66);
+                    }
+                }
+                return false;
+            }
+            if cell.flags & jc_flags::TEMPORARY != 0 {
+                crate::mc_diag_bump(25);
+                return self.counter.tick(bucket, self.increment_function_threshold);
+            }
+            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+                if cell.has_seen_a_procedure_token() {
+                    if cell.get_procedure_token().is_some() {
+                        return false;
+                    }
+                } else if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
+                    return true;
+                }
+            }
+            if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+                cleanup_dead_token_cell = true;
+            }
+        }
+        if cleanup_dead_token_cell {
+            crate::mc_diag_bump(24);
+            self.cleanup_chain(bucket);
+            return false;
+        }
+        crate::mc_diag_bump(25);
+        self.counter.tick(bucket, self.increment_function_threshold)
     }
 
     /// Check if inlining is allowed at the given depth.
@@ -5534,6 +5617,58 @@ mod tests {
         assert!(
             cell.flags & jc_flags::TEMPORARY != 0,
             "tmp token must set JC_TEMPORARY"
+        );
+    }
+
+    /// warmstate.py:473-481 checks JC_TEMPORARY before
+    /// JC_DONT_TRACE_HERE.  A callee blamed for a trace-too-long abort can
+    /// carry all of TEMPORARY (its residual CALL_ASSEMBLER callback),
+    /// DONT_TRACE_HERE (do not inline it again), and FORCE_FINISH (segment its
+    /// standalone trace).  That combination must count and then start tracing
+    /// the matching typed cell; otherwise the callee can never replace its
+    /// temporary callback with a real loop.
+    #[test]
+    fn temporary_noninlinable_function_entry_traces_its_typed_cell() {
+        let mut ws = WarmEnterState::new(100);
+        ws.set_function_threshold(1);
+        let key = GreenKey::new(vec![30, 40]);
+        let bucket = key.get_uhash();
+
+        // Put a comparator-less cell at the bucket head first. This is the
+        // production migration shape in which a raw-hash precheck and a typed
+        // force-start used to inspect different cells for one green key.
+        ws.disable_noninlinable_function(bucket);
+        let token = std::sync::Arc::new(JitCellToken::new(0xcafe));
+        ws.get_assembler_token_with_key::<(), _>(&key, || Ok(token.clone()))
+            .expect("temporary token install");
+        ws.disable_noninlinable_function_for_key(&key);
+        ws.mark_force_finish_tracing_for_key(&key);
+
+        let typed = ws.lookup_chain_with_key(&key).expect("typed callee cell");
+        assert_ne!(typed.cell_key, Some(bucket), "typed cell is chained/minted");
+        assert_ne!(typed.flags & jc_flags::TEMPORARY, 0);
+        assert_ne!(typed.flags & jc_flags::DONT_TRACE_HERE, 0);
+        assert_ne!(typed.flags & jc_flags::FORCE_FINISH, 0);
+
+        assert!(
+            ws.should_trace_function_entry_for_key(&key),
+            "JC_TEMPORARY counts normally despite DONT_TRACE_HERE"
+        );
+        assert!(matches!(
+            ws.force_start_tracing_for_key(&key),
+            HotResult::StartTracing
+        ));
+
+        let typed = ws.lookup_chain_with_key(&key).expect("typed callee cell");
+        assert!(typed.is_tracing(), "the matching typed cell starts tracing");
+        assert_ne!(
+            typed.flags & jc_flags::FORCE_FINISH,
+            0,
+            "the standalone retry retains its segmenting request"
+        );
+        assert!(
+            !ws.cell_by_key(bucket).expect("hash-only head").is_tracing(),
+            "the comparator-less bucket head is not mistaken for the callee"
         );
     }
 

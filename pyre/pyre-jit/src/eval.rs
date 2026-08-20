@@ -1535,7 +1535,6 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
 
     f(&mut frame.w_yielding_from as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.w_builtin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut frame.w_globals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 
     if !frame.debugdata.is_null() {
         let debugdata = frame.debugdata;
@@ -1556,6 +1555,7 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
         // phase-agnostic jitframe.py `jitframe_trace` contract.
         if walk_fields {
             let d = unsafe { &mut *frame.debugdata };
+            f(&mut d.w_globals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             f(&mut d.w_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             f(&mut d.w_extra_locals as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
             f(&mut d.w_f_trace as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -3361,12 +3361,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         vec![majit_rlib::rbigint::RBIGINT_DIGITS_OFFSET],
     ));
     pyre_object::longobject::set_bigint_gc_type_id(bigint_tid);
-    // PyPy's FrameDebugData is a plain GC object. It owns three PyObjectRef
-    // fields; once the frame custom trace greys the payload, the ordinary
-    // offset walker finds all of them during a major mark.
+    // PyPy's FrameDebugData is a plain GC object. Once the frame custom trace
+    // greys a nursery payload, the ordinary offset walker must find every
+    // PyObjectRef field, including the uncommon per-frame globals override.
     let frame_debug_data_tid = gc.register_type(TypeInfo::with_gc_ptrs(
         std::mem::size_of::<pyre_interpreter::pyframe::FrameDebugData>(),
         vec![
+            std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_globals),
             std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_locals),
             std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_extra_locals),
             std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, w_f_trace),
@@ -5028,7 +5029,6 @@ fn install_pyre_object_hooks() {
         const T: u32 = pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
         majit_gc::bh_probe_set_field_names(&[
             (T, 0, "ob_type"),
-            (T, fl::PYFRAME_EXECUTION_CONTEXT_OFFSET, "execution_context"),
             (T, fl::PYFRAME_PYCODE_OFFSET, "pycode"),
             (
                 T,
@@ -5054,7 +5054,6 @@ fn install_pyre_object_hooks() {
             (T, fl::PYFRAME_W_YIELDING_FROM_OFFSET, "w_yielding_from"),
             (T, fl::PYFRAME_F_BACKREF_OFFSET, "f_backref"),
             (T, fl::PYFRAME_W_BUILTIN_OFFSET, "w_builtin"),
-            (T, fl::PYFRAME_W_GLOBALS_OFFSET, "w_globals"),
         ]);
         majit_gc::bh_probe_set_type_namer(|addr| {
             let obj = addr as pyre_object::PyObjectRef;
@@ -6074,8 +6073,7 @@ impl __extend__ {
     ///   except ExitFrame: ...
     ///
     /// In pyre, the JIT-instrumented dispatch loop is eval_loop_jit().
-    /// pycode and ec are stored on the frame; eval_loop_jit reads them
-    /// from frame.pycode and frame.execution_context respectively.
+    /// `pycode` belongs to the frame while `ec` is the separate portal red.
     pub fn dispatch(
         frame: &mut PyFrame,
         _pycode: pyre_object::PyObjectRef,
@@ -6220,13 +6218,15 @@ fn green_key_from_pycode(
     is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) -> Option<u64> {
-    // Safety: this follows existing wrappers that treat `PyCode`
-    // as an owned pointer to a `CodeObject`.
-    let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
-    if code_ptr.is_null() {
+    // `PyFrame.pycode`, `interp_jit.PyPyJitDriver.greens`, and
+    // `JitCell.comparekey` all carry the PyCode object itself.  Unwrapping it
+    // to the host-side CodeObject creates a second warm cell for the same
+    // Python function: function-entry dispatch uses `frame.pycode`, while
+    // marker dispatch would otherwise use `PyCode.code_ptr`.
+    if w_pycode.is_null() {
         return None;
     }
-    Some(make_green_key(code_ptr, next_instr, is_being_profiled))
+    Some(make_green_key(w_pycode.cast(), next_instr, is_being_profiled))
 }
 
 /// The typed `GreenKey` behind [`green_key_from_pycode`]'s `u64`.
@@ -6248,16 +6248,15 @@ fn green_key_typed_from_pycode(
     is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) -> Option<majit_ir::GreenKey> {
-    // Safety: as `green_key_from_pycode` — `PyCode` is an owned pointer to a
-    // `CodeObject`.
-    let code_ptr = unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) };
-    if code_ptr.is_null() {
+    // Keep the compare key on the same PyCode identity as
+    // `green_key_from_pycode`; the typed and hash paths must name one cell.
+    if w_pycode.is_null() {
         return None;
     }
     Some(majit_ir::pypyjit_greenkey(
         next_instr,
         is_being_profiled,
-        code_ptr as u64,
+        w_pycode as u64,
     ))
 }
 
@@ -8848,20 +8847,25 @@ pub(crate) fn pyre_portal_runner(
     }
     let frame = unsafe { &mut *frame_ptr };
     // warmspot.py:976 forwards the CRN values to `portal_ptr`; it does not
-    // rewrite the red frame's identity.  Pyre's portal dispatch is frame-only,
-    // so retain the activation's own pycode / execution context rather than
-    // replacing them from a potentially stale green snapshot.
+    // rewrite the red frame's identity. Retain the activation's own pycode
+    // and carry `ec` independently as the second red.
     if majit_metainterp::majit_log_enabled()
-        && ((!pycode.is_null() && frame.pycode != pycode as *const ())
-            || (!ec.is_null() && frame.execution_context != ec))
+        && !pycode.is_null()
+        && frame.pycode != pycode as *const ()
     {
         eprintln!(
-            "[blackhole-resume] portal CRN/frame identity mismatch: green_pycode={pycode:p} frame_pycode={:p} red_ec={ec:p} frame_ec={:p}",
-            frame.pycode, frame.execution_context,
+            "[blackhole-resume] portal CRN/frame identity mismatch: green_pycode={pycode:p} frame_pycode={:p} red_ec={ec:p}",
+            frame.pycode,
         );
     }
     frame.set_last_instr_from_next_instr(next_instr);
-    match portal_body_result(frame) {
+    let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    if !ec.is_null() {
+        pyre_interpreter::call::set_last_exec_ctx(ec);
+    }
+    let result = portal_body_result(frame);
+    pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+    match result {
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
         Err(mut err) => Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
             err.to_exc_object() as usize,
@@ -9320,7 +9324,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // untranslated body is a no-op; source translation
         // recognizes this method call and lowers it to JitCode
         // `jit_merge_point` rather than leaving a residual call.
-        let marker_ec = unsafe { &*f }.execution_context as *const PyExecutionContext;
+        let marker_ec = pyre_interpreter::call::getexecutioncontext();
         let marker_pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
         let marker_profiled = unsafe { &*f }.get_is_being_profiled();
         pypyjitdriver.jit_merge_point(
@@ -9377,7 +9381,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // constant upstream's translator sees, so splitting on it would strip
         // the ticker from nested interpreted frames rather than from traced
         // ones.
-        let ec_ptr = unsafe { &*f }.execution_context as *mut PyExecutionContext;
+        let ec_ptr = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
         if !ec_ptr.is_null() {
             // Keep the JIT portal's concrete dispatch in lockstep with
             // `pyre_interpreter::eval::eval_loop`'s opcode boundary.  The
@@ -9515,7 +9519,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py:446
-                let marker_ec = unsafe { &*f }.execution_context as *const PyExecutionContext;
+                let marker_ec = pyre_interpreter::call::getexecutioncontext();
                 let marker_pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
                 let marker_profiled = unsafe { &*f }.get_is_being_profiled();
                 pypyjitdriver.can_enter_jit(
@@ -10574,7 +10578,7 @@ fn execute_assembler(
     // died.  Bracket the assembler run the way `install_current_frame` /
     // `CurrentFrameGuard` bracket a frame: a balanced run restores the same
     // value it saved, an unbalanced exit restores the caller.
-    let ec_for_topframeref = frame_root.frame().execution_context as *mut PyExecutionContext;
+    let ec_for_topframeref = jit_state.execution_context as *mut PyExecutionContext;
     // Held for the rest of the activation, not just the run: a guard failure is
     // resumed below, and the resume re-enters the same walker-recorded frames
     // it abandoned.  The chain this portal activation hands back has to be the
@@ -11300,6 +11304,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `force_start_tracing_for_key` -- which does walk the chain -- answered
     // `RunCompiled` and refused. Neither side moved, the compiled code was
     // never entered, and every call paid a full trace-start attempt.
+    //
+    // `code_ptr` is the PyCode object `frame.pycode` holds, which is the green
+    // `interp_jit.PyPyJitDriver` carries, so the typed key built here names the
+    // cell `green_key_hash` hashes.
     let green_key = driver.resolve_cell_key(green_key_hash, || {
         pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
     });
@@ -11361,7 +11369,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // the actions at a bytecode boundary and delivers what they raise
         // through `handle_exception`.
         if pyre_interpreter::module::thread::gil::threads_initialized() {
-            let ec = frame_root.frame().execution_context as *mut PyExecutionContext;
+            let ec = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
             if !ec.is_null() {
                 let ticker = unsafe {
                     (*ec).actionflag.decrement_ticker(
@@ -11608,7 +11616,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let next_instr = frame_root.frame().next_instr();
     match compile_and_run_once(
         frame_root.frame(),
-        green_key,
+        green_key_hash,
         next_instr,
         CompileOnceStart::FunctionEntry,
         driver,
@@ -13430,12 +13438,10 @@ fn build_resumed_frames(
     let ni_idx = pyre_jit_trace::virtualizable_gen::SYM_LAST_INSTR_IDX as usize - extra;
     let code_idx = pyre_jit_trace::virtualizable_gen::SYM_PYCODE_IDX as usize - extra;
     let vsd_idx = pyre_jit_trace::virtualizable_gen::SYM_VALUESTACKDEPTH_IDX as usize - extra;
-    let ns_idx = pyre_jit_trace::virtualizable_gen::SYM_W_GLOBALS_IDX as usize - extra;
 
     // Resolve ALL vable fields from resume data.
     // vable_values = [frame_ptr(0), last_instr(1), pycode(2),
-    //                  valuestackdepth(3), debugdata(4),
-    //                  w_globals(5), array...]
+    //                  valuestackdepth(3), debugdata(4), array...]
     // RPython reader.load_next_value_of_type reads ALL values sequentially.
     let resolved_vable: Vec<Value> = (0..vable_values.len())
         .map(|i| {
@@ -13488,16 +13494,7 @@ fn build_resumed_frames(
         })
         .unwrap_or(std::ptr::null());
 
-    let vable_ns: *const () = resolved_vable
-        .get(ns_idx)
-        .map(|v| match v {
-            Value::Ref(r) => r.as_usize() as *const (),
-            Value::Int(v) => *v as *const (),
-            _ => std::ptr::null(),
-        })
-        .unwrap_or(std::ptr::null());
-
-    // pyjitpl.py synchronize_virtualizable on guard-failure
+    // pyjitpl.py `synchronize_virtualizable` on guard-failure
     // bridge entry: stores `self.virtualizable_boxes`, resets the token,
     // then calls `self.synchronize_virtualizable()` which ends at
     // virtualizable.py `write_boxes`. `ResumeVableMode::GuardFailureSync`
@@ -13532,7 +13529,7 @@ fn build_resumed_frames(
                     f.next_instr(),
                     f.valuestackdepth,
                     f.pycode,
-                    f.w_globals,
+                    f.get_w_globals(),
                     f.debugdata,
                     f.vable_token,
                     locals_w!(f).len(),
@@ -13608,12 +13605,11 @@ fn build_resumed_frames(
         } else {
             values.len()
         };
-        // virtualizable.py:86-99: namespace from resume data.
+        // PyFrame.get_w_globals: namespace comes from this frame's restored
+        // pycode/debugdata pair; it is not a physical virtualizable scalar.
         let namespace = if is_outermost {
-            if !vable_ns.is_null() {
-                vable_ns
-            } else if !vable_frame_ptr.is_null() {
-                unsafe { (*vable_frame_ptr).w_globals as *const () }
+            if !vable_frame_ptr.is_null() {
+                unsafe { (*vable_frame_ptr).get_w_globals() as *const () }
             } else {
                 std::ptr::null()
             }
@@ -13630,10 +13626,10 @@ fn build_resumed_frames(
             if !callee_ns.is_null() {
                 callee_ns
             } else {
-                vable_ns
+                std::ptr::null()
             }
         } else {
-            vable_ns
+            std::ptr::null()
         };
         result.push(crate::call_jit::ResumedFrame {
             code: w_code,
@@ -13843,6 +13839,7 @@ pub(crate) fn build_jit_state(
 ) -> PyreJitState {
     let mut jit_state = PyreJitState {
         frame: frame as *const PyFrame as usize,
+        execution_context: pyre_interpreter::call::getexecutioncontext() as usize,
     };
     assert!(
         jit_state.sync_from_virtualizable(virtualizable_info),
@@ -14277,6 +14274,24 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `interp_jit.PyPyJitDriver.greens` carries the PyCode object, not the
+    /// host CodeObject hidden behind pyre's wrapper.  The hash-only marker
+    /// path and typed `JitCell.comparekey` path must therefore agree with
+    /// function-entry dispatch even when the wrapper's internal pointer is
+    /// absent (the supported test-stub representation).
+    #[test]
+    fn pycode_green_keys_preserve_wrapper_identity() {
+        let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::null());
+        assert!(!w_code.is_null());
+
+        let hash = green_key_from_pycode(17, w_code).expect("nonnull PyCode has a green key");
+        let typed =
+            green_key_typed_from_pycode(17, w_code).expect("nonnull PyCode has a typed green key");
+
+        assert_eq!(hash, make_green_key(w_code.cast(), 17));
+        assert_eq!(typed.get_uhash(), hash);
+    }
 
     /// Read a global by name from the frame's canonical `w_globals` object.
     #[allow(dead_code)]
@@ -15290,12 +15305,12 @@ mod tests {
             symbolic_stack_types: vec![],
             registers_r: vec![local],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.get_w_globals(),
             vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(1),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+            frame_w_globals: ctx.const_ref(frame.get_w_globals() as usize as i64),
         }
     }
 
@@ -15375,7 +15390,11 @@ mod tests {
             "frame-value count must come from the same compiled jitcode liveness block"
         );
 
-        let mut state = PyreJitState { frame: frame_ptr };
+        let ec_value = pyre_interpreter::call::getexecutioncontext() as usize;
+        let mut state = PyreJitState {
+            frame: frame_ptr,
+            execution_context: ec_value,
+        };
         state.set_next_instr(0);
         state.set_valuestackdepth(4);
         let meta = PyreMeta {
@@ -15391,15 +15410,14 @@ mod tests {
             slot_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
         };
 
-        let ec_value = unsafe { (*(frame_ptr as *const PyFrame)).execution_context as usize };
         let mut values = vec![
-            Value::Ref(GcRef(frame_ptr)),                // frame
-            Value::Ref(GcRef(ec_value)),                 // ec extra red
-            Value::Int(8),                               // last_instr
-            Value::Ref(GcRef(frame.pycode as usize)),    // pycode
-            Value::Int(4),                               // valuestackdepth
-            Value::Ref(GcRef(0)),                        // debugdata
-            Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
+            Value::Ref(GcRef(frame_ptr)),                      // frame
+            Value::Ref(GcRef(ec_value)),                       // ec extra red
+            Value::Int(8),                                     // last_instr
+            Value::Ref(GcRef(frame.pycode as usize)),          // pycode
+            Value::Int(4),                                     // valuestackdepth
+            Value::Ref(GcRef(0)),                              // debugdata
+            Value::Ref(GcRef(frame.get_w_globals() as usize)), // w_globals
         ];
         for reg in live_regs.iter() {
             match *reg {
@@ -15486,14 +15504,14 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE; max_color + 1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.get_w_globals(),
             vable_last_instr: ctx.const_int(999),
             vable_pycode: ctx.const_ref(0xdead),
             vable_valuestackdepth: ctx.const_int(111),
             vable_debugdata: ctx.const_ref(0xbeef),
-            vable_w_globals: ctx.const_ref(0xfeed),
+            frame_w_globals: ctx.const_ref(0xfeed),
         });
-        let ec_ref = ctx.const_ref(frame.execution_context as usize as i64);
+        let ec_ref = ctx.const_ref(pyre_interpreter::call::getexecutioncontext() as usize as i64);
         sym.set_test_execution_context(ec_ref);
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
         state.set_resume_marker_for_test(resume_pc);
@@ -15520,8 +15538,10 @@ mod tests {
             ctx.constants_get_value(fail_args[4]),
             Some(majit_ir::Value::Int(4)),
         );
-        // pycode / debugdata / w_globals stay bound to the trace-start
-        // inputarg OpRefs the fixture seeded above.
+        // pycode / debugdata stay bound to the trace-start inputarg OpRefs
+        // the fixture seeded above.  `w_globals` is not a virtualizable
+        // scalar: PyPy's `PyFrame.get_w_globals` derives it from the live
+        // frame's pycode/debugdata pair.
         assert_eq!(
             ctx.constants_get_value(fail_args[3]),
             Some(majit_ir::Value::Ref(majit_ir::GcRef(0xdead))),
@@ -15529,10 +15549,6 @@ mod tests {
         assert_eq!(
             ctx.constants_get_value(fail_args[5]),
             Some(majit_ir::Value::Ref(majit_ir::GcRef(0xbeef))),
-        );
-        assert_eq!(
-            ctx.constants_get_value(fail_args[6]),
-            Some(majit_ir::Value::Ref(majit_ir::GcRef(0xfeed))),
         );
     }
 
@@ -15594,14 +15610,14 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r,
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.get_w_globals(),
             vable_last_instr: ctx.const_int(0),
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
             vable_debugdata: ctx.const_ref(0),
-            vable_w_globals: ctx.const_ref(0),
+            frame_w_globals: ctx.const_ref(0),
         });
-        let ec_ref = ctx.const_ref(frame.execution_context as usize as i64);
+        let ec_ref = ctx.const_ref(pyre_interpreter::call::getexecutioncontext() as usize as i64);
         sym.set_test_execution_context(ec_ref);
         trace_state::seed_compiled_trace_jitcode_test_state(
             &mut sym,
@@ -15689,13 +15705,15 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE; max_color + 1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.get_w_globals(),
             vable_last_instr: ctx.const_int(0),
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
             vable_debugdata: ctx.const_ref(0),
-            vable_w_globals: ctx.const_ref(0),
+            frame_w_globals: ctx.const_ref(0),
         });
+        let ec_ref = ctx.const_ref(pyre_interpreter::call::getexecutioncontext() as usize as i64);
+        sym.set_test_execution_context(ec_ref);
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
         state.set_resume_marker_for_test(resume_pc);
 
@@ -15754,13 +15772,15 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Int],
             registers_r: vec![OpRef::NONE; max_color + 1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.get_w_globals(),
             vable_last_instr: ctx.const_int(0),
             vable_pycode: ctx.const_ref(0),
             vable_valuestackdepth: ctx.const_int(0),
             vable_debugdata: ctx.const_ref(0),
-            vable_w_globals: ctx.const_ref(0),
+            frame_w_globals: ctx.const_ref(0),
         });
+        let ec_ref = ctx.const_ref(pyre_interpreter::call::getexecutioncontext() as usize as i64);
+        sym.set_test_execution_context(ec_ref);
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, resume_pc, resume_pc);
         state.set_resume_marker_for_test(resume_pc);
 
@@ -15871,13 +15891,16 @@ mod tests {
                 symbolic_stack_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
                 registers_r: vec![OpRef::NONE; 8],
                 concrete_stack: vec![],
-                concrete_namespace: frame.w_globals,
+                concrete_namespace: frame.get_w_globals(),
                 vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
                 vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
                 vable_valuestackdepth: ctx.const_int(7),
                 vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-                vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+                frame_w_globals: ctx.const_ref(frame.get_w_globals() as usize as i64),
             });
+            let ec_ref =
+                ctx.const_ref(pyre_interpreter::call::getexecutioncontext() as usize as i64);
+            sym.set_test_execution_context(ec_ref);
             trace_state::seed_compiled_trace_jitcode_test_state(
                 &mut sym,
                 &mut ctx,
@@ -16019,13 +16042,15 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref],
             registers_r: vec![OpRef::NONE; 8],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.get_w_globals(),
             vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(7),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+            frame_w_globals: ctx.const_ref(frame.get_w_globals() as usize as i64),
         });
+        let ec_ref = ctx.const_ref(pyre_interpreter::call::getexecutioncontext() as usize as i64);
+        sym.set_test_execution_context(ec_ref);
         trace_state::seed_compiled_trace_jitcode_test_state(
             &mut sym,
             &mut ctx,
@@ -16135,13 +16160,15 @@ mod tests {
             symbolic_stack_types: vec![Type::Ref, Type::Ref],
             registers_r: vec![local0, stack0, stack1],
             concrete_stack: vec![],
-            concrete_namespace: frame.w_globals,
+            concrete_namespace: frame.get_w_globals(),
             vable_last_instr: ctx.const_int(target_pc as i64 - 1),
             vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
             vable_valuestackdepth: ctx.const_int(3),
             vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-            vable_w_globals: ctx.const_ref(frame.w_globals as usize as i64),
+            frame_w_globals: ctx.const_ref(frame.get_w_globals() as usize as i64),
         });
+        let ec_ref = ctx.const_ref(pyre_interpreter::call::getexecutioncontext() as usize as i64);
+        sym.set_test_execution_context(ec_ref);
         let mut state = MIFrame::from_sym(&mut ctx, &mut sym, frame_ptr, target_pc, target_pc);
 
         let jump_args = state.capture_close_loop_args_at(Some(target_pc), None);

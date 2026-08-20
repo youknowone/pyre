@@ -2577,7 +2577,7 @@ fn regalloc_color(
 /// is exactly `calldescr_canraise` = `effect_info.check_can_raise(false)`
 /// (`call.py calldescr_canraise` -> `effectinfo.py:232
 /// check_can_raise`), read off the trailing `CallDescrStub` operand.
-fn insn_needs_trailing_live(insn: &Insn) -> bool {
+pub(super) fn insn_needs_trailing_live(insn: &Insn) -> bool {
     let Insn::Op { opname, args, .. } = insn else {
         return false;
     };

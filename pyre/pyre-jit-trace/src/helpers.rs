@@ -1487,7 +1487,7 @@ pub fn emit_box_float_inline(
 ///    so `handle_new` skips the vtable setfield (rewrite.py:925-933
 ///    `gen_new_with_vtable` early-out for `vtable == 0`).
 /// 5. `SetfieldGc` ops for the constructor-visible fields. The non-zero
-///    fields (`execution_context`, `pycode`, `w_globals`,
+///    fields (`pycode`,
 ///    `locals_cells_stack_w`, `valuestackdepth`, `last_instr=-1`) mirror
 ///    `new_for_call_with_closure`; the nullable GC fields
 ///    (`f_generator_nowref`, `w_yielding_from`, `f_backref`) are written
@@ -1521,13 +1521,11 @@ pub fn emit_new_pyframe_inline_with_params(
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
-    w_globals: OpRef,
-    ec: OpRef,
+    _w_globals: OpRef,
 ) -> OpRef {
     use crate::descr::{
-        pyframe_code_descr, pyframe_execution_context_descr, pyframe_flags_descr,
-        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
-        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr,
+        pyframe_code_descr, pyframe_flags_descr, pyframe_locals_cells_stack_descr,
+        pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1586,24 +1584,10 @@ pub fn emit_new_pyframe_inline_with_params(
     let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());
     ctx.heap_cache_mut().new_object(new_frame);
 
-    let ec_descr = pyframe_execution_context_descr();
-    let ec_idx = ec_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, ec], ec_descr);
-    ctx.heapcache_setfield_cached(new_frame, ec_idx, ec);
-
     let code_descr = pyframe_code_descr();
     let code_idx = code_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
     ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
-
-    let globals_obj_descr = pyframe_w_globals_obj_descr();
-    let globals_obj_idx = globals_obj_descr.index();
-    ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_frame, w_globals],
-        globals_obj_descr,
-    );
-    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals);
 
     let locals_descr = pyframe_locals_cells_stack_descr();
     let locals_idx = locals_descr.index();
@@ -1651,13 +1635,11 @@ pub fn emit_new_pyframe_inline_self_recursive(
     array_size: usize,
     valuestackdepth: usize,
     pycode: OpRef,
-    w_globals: OpRef,
-    ec: OpRef,
+    _w_globals: OpRef,
 ) -> OpRef {
     use crate::descr::{
-        pyframe_code_descr, pyframe_execution_context_descr, pyframe_flags_descr,
-        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
-        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr,
+        pyframe_code_descr, pyframe_flags_descr, pyframe_locals_cells_stack_descr,
+        pyframe_next_instr_descr, pyframe_size_descr, pyframe_stack_depth_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1699,26 +1681,11 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // the explicit assignments inside `new_for_call_with_closure`.
     // Order matches the field declaration so the optimizer's lazy-set
     // replace logic groups them together.
-    let ec_descr = pyframe_execution_context_descr();
-    let ec_idx = ec_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, ec], ec_descr);
-    ctx.heapcache_setfield_cached(new_frame, ec_idx, ec);
-
     // `pycode` arrives as a trace-time Ref Const (the bound `PyCode`).
     let code_descr = pyframe_code_descr();
     let code_idx = code_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
     ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
-
-    // pyframe.py:49 `self.w_globals = w_globals` — store the canonical dict.
-    let globals_obj_descr = pyframe_w_globals_obj_descr();
-    let globals_obj_idx = globals_obj_descr.index();
-    ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_frame, w_globals],
-        globals_obj_descr,
-    );
-    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals);
 
     // `locals_array` is a fresh `NewArrayClear` op result.  PyPy's
     // executor-while-trace model would have `Box.value` carry the

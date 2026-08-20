@@ -225,13 +225,9 @@ unsafe fn kwonly_defaults_for_inline(
 
 /// Path-1 (#68): resolve a scalar `getfield_vable_r` read off an inlined
 /// callee's OWN (unseeded) portal frame to the callee's compile-time
-/// constant.  This is the walk-time mirror of the codewriter's non-portal
-/// branch (`codewriter.rs` LOAD_CONST/LOAD_GLOBAL):
-/// a non-portal callee's `pycode`/`w_globals` are constants fed as
-/// `ConstRef`, never read off the portal frame reg (which, when inlined,
-/// aliases the caller's frame and would read the wrong field).  Only the
-/// Ref-typed `pycode` (field 1) and `w_globals` (field 5) carry a
-/// compile-time constant; Int frame state (`last_instr`, `valuestackdepth`)
+/// constant. Only the Ref-typed `pycode` (field 1) remains a concrete
+/// virtualizable field; globals is derived through PyFrame.get_w_globals.
+/// Int frame state (`last_instr`, `valuestackdepth`)
 /// does not.  Returns `None` when not an inline sub-walk, the field is not
 /// resolvable, or the layout is absent — callers fall through to the
 /// `VableBoxNotSeeded` error (such callees are declined up-front by
@@ -259,7 +255,6 @@ pub(crate) fn try_resolve_inline_callee_static_field<Sym: WalkSym>(
         }
     };
     let const_ptr = match field_idx {
-        VABLE_NAMESPACE_FIELD_IDX => consts.w_globals,
         VABLE_CODE_FIELD_IDX => consts.w_code,
         _ => return Ok(None),
     };
@@ -440,7 +435,7 @@ pub(crate) fn inline_resolvable_static_vable_read<Sym: WalkSym>(
     };
     matches!(
         info.static_field_by_descr(descr),
-        Some(VABLE_CODE_FIELD_IDX) | Some(VABLE_NAMESPACE_FIELD_IDX)
+        Some(VABLE_CODE_FIELD_IDX)
     )
 }
 
@@ -1650,7 +1645,8 @@ fn foreign_callee_admits_call_assembler(w_code: *const ()) -> bool {
 /// #62: full-body-walk direct `CALL_ASSEMBLER` for a self-recursive call
 /// at the inline recursion-bound boundary.
 ///
-/// When the FBW inline depth for a callee reaches `FBW_MAX_INLINE_RECURSION`
+/// When the FBW inline depth for a callee reaches the warmstate's live
+/// `max_unroll_recursion`
 /// the call would otherwise degrade to a generic may-force residual, which
 /// re-enters the callee through the func-entry residency door — one
 /// heavyweight frame build + entry-bridge per recursive call (the
@@ -1896,9 +1892,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     } {
         return Ok(None);
     }
-    // Resolve the callee's own loop or trace-in-progress marker with
-    // `make_green_key` at `(w_callee_code, 0)` (`pc = 0` = function entry). A
-    // pending token only proves the callee is
+    // Resolve the callee's own loop or trace-in-progress marker with the live
+    // W_Code object used by `PyFrame.pycode`, the portal greens, and
+    // `JitCell.comparekey`, at `pc = 0` (function entry).  A pending token
+    // only proves the callee is
     // being traced; emission below resolves compiled-or-tmp so the descr never
     // carries a bodyless token.
     let (driver, _) = crate::driver::driver_pair();
@@ -1947,22 +1944,17 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         param_boxes.push(crate::state::wrapint(ctx.trace_ctx, raw_arg));
     }
 
-    // Execution-context red: recover it fresh off the materialized caller
-    // portal frame via `GETFIELD_GC_R(frame, execution_context_descr)` rather
-    // than trusting the seeded `sym.execution_context` OpRef.  The seeded OpRef
-    // is a bridge-decode color-bank value (`setup_bridge_sym`) that is
-    // concrete-correct at forward-compile but rebinds to the callee's own
-    // `pycode` when this compiled self-recursive trace re-enters as a NESTED
-    // bridge, building the callee frame with `ec == pycode` and faulting later
-    // in `frame_builtin`.  The outer portal frame's `execution_context` field
-    // is always the true ec (single ExecutionContext, boot-pinned), so reading
-    // it off `caller_frame` is the nested-resume-safe source — the same
-    // recovery `ensure_execution_context` (`trace_opcode.rs`) performs.
-    let ec = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[caller_frame],
-        crate::descr::pyframe_execution_context_descr(),
-    );
+    // `ec` is the portal's second red (`interp_jit.py reds=['frame', 'ec']`).
+    // It is shared by every recursive MIFrame and never recovered from the
+    // app-level frame object.
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    let ec = unsafe { &*sym_ptr }.execution_context();
+    if ec.is_none() {
+        return Ok(None);
+    }
 
     // Build the callee PyFrame inline (Branch A): a single positional
     // local, no cells, constant code / globals.
@@ -1977,7 +1969,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         nlocals,
         pycode_const,
         w_globals_obj_const,
-        ec,
     );
 
     // `pyframe.py execute_frame`'s `ec.enter(self)`, which upstream records
@@ -2379,13 +2370,13 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // The `ec` red is seeded with no concrete shadow — nothing in the callee
     // body reads it, so the seed leaves it `Null` — and the residual executor
     // refuses to run a call whose argument has no value.  Read the live one
-    // off the frame this resume runs, the same source `walker_ec_enter` /
+    // from the running activation, the same source `walker_ec_enter` /
     // `walker_ec_leave` take theirs from, and hand THAT to the execution; the
     // `CALL_ASSEMBLER` recorded below keeps the `callee_ec` red itself, which
     // is what the compiled entry needs.
     let ec_box = ctx
         .trace_ctx
-        .const_ref(unsafe { (*concrete_callee_frame).execution_context } as i64);
+        .const_ref(pyre_interpreter::call::getexecutioncontext() as i64);
     // `_build_allboxes` order for the portal ABI, which
     // `build_portal_calldescr` lays out in `vars` declaration order:
     // `[funcbox] + greens[next_instr, is_being_profiled, pycode] +
@@ -4662,7 +4653,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     {
         return resolved_inline_decline(op.pc, line!());
     }
-    if fbw_inline_recursion_count(ctx, callee_code_key) >= FBW_MAX_INLINE_RECURSION {
+    // `_opimpl_recursive_call` (`pyjitpl.py`) reads
+    // `memory_manager.max_unroll_recursion` at this decision. Do not bake the
+    // RPython default here: `pypyjit.set_param(max_unroll_recursion=...)`
+    // mutates the live warmstate and must steer the production FBW path too.
+    // A skeleton walk has no installed driver, so only that diagnostic path
+    // falls back to the upstream default.
+    let max_unroll_recursion = crate::driver::try_driver_pair()
+        .map(|(driver, _)| {
+            driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .max_unroll_recursion() as usize
+        })
+        .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
+    let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
+    if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
                 .meta_interp_mut()
@@ -4817,40 +4823,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         && args_all_builtin_integer
         && fbw_callee_body_has_binary_op_residual(body.code, callee_descr_refs)
     {
-        // A depth-1 carrier-resume sub-walk (`drive_bridge_frame_subwalk`) drives
-        // its reconstructed frame as the sub-walk root with an empty framestack,
-        // so it is uniform with a plain root bridge for the multiframe seed —
-        // admit it too so a rare guard-bridge continuation inlines its nested
-        // int-arith calls instead of residualizing them (the gh#343 branchy-callee
-        // cost).
-        // The nested levels are admitted on the same terms.
-        // `opimpl_recursive_call` (`pyjitpl.py:1390-1416`) makes the inline
-        // decision from the portal-frame count alone — already applied above via
-        // `fbw_inline_recursion_count` — and asks nothing about how deep the
-        // framestack is or whether a bridge or a primary trace is walking.
-        //
-        // An inline sub-walk is the exception, and it is one with no upstream
-        // counterpart: `perform_call` pushes onto `MetaInterp.framestack` and
-        // returns to the single `interpret()` loop, so upstream is never inside
-        // one walk while starting another and can never seed a multiframe
-        // snapshot from a sub-walk. Seeding one here makes the wasm bridge
-        // replay re-execute the sub-walk's body — wrong output from
-        // `synth/ca_bridge_multiframe_resume_double_call` and
-        // `synth/recursion_memo_branch`, and a `fib_recursive` timeout, all
-        // while dynasm and cranelift stay green.
-        let root_bridge = !ctx.fbw_mode.carrier_resume
-            && !ctx.fbw_mode.inline_subwalk
-            && !ctx.fbw_mode.snapshot_sym.is_null();
-        // A carrier-resume sub-walk (`drive_bridge_frame_subwalk`) drives its
-        // reconstructed frame(s) forward through the same metainterp the initial
-        // trace uses, so its inline of a nested int-arith call is the SAME as a
-        // primary trace's — admit it (any inline depth) so the rare guard-bridge
-        // continuation inlines instead of residualizing.
-        let subwalk_admit = ctx.fbw_mode.carrier_resume && !ctx.fbw_mode.snapshot_sym.is_null();
-        let safe_root_bridge = root_bridge || subwalk_admit;
-        if !safe_root_bridge {
-            return resolved_inline_decline(op.pc, line!());
-        }
+        // `_opimpl_recursive_call` runs in the one `MetaInterp.interpret`
+        // loop after `perform_call` pushes each MIFrame; it has no separate
+        // "root bridge may inline, nested bridge sub-walk may not" gate.  FBW
+        // now carries the same frame chain explicitly: `InlineFrameGuard`
+        // keeps this callee and its `parent_frame` live while the nested walk
+        // runs, and multiframe guard snapshots encode that chain.  Refusing a
+        // nested root-bridge call here dropped the parent's continuation from
+        // the compiled shape and capped fib one unroll short of PyPy.
         bridge_rec_root_selfrec = unsafe {
             let raw = pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
                 as *const pyre_interpreter::CodeObject;
@@ -4960,11 +4940,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `guard_failures` from 937 to 7408 — because the unwind then crosses two
     // suspended copies of the same frame, the shape `fbw_max_rec_unroll_depth`
     // bounds above.
-    let effective_multiframe_depth = if contains_raise {
-        2
-    } else {
-        fbw_max_multiframe_depth()
-    };
+    let effective_multiframe_depth =
+        fbw_effective_multiframe_depth(contains_raise, inline_recursion_count);
     // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
     // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
     // conversion, so neither replay safety nor an unseeded caller-boundary
@@ -5359,14 +5336,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         callable_guard_value = bound.function;
     }
 
-    // Path-1 (#68): the inlined callee's compile-time-constant frame fields,
-    // so a scalar `getfield_vable_r` off its own (unseeded) portal frame —
-    // the `w_globals` namespace for a LOAD_GLOBAL, the promote-to-const
-    // `pycode` — resolves to the constant via
-    // `try_resolve_inline_callee_static_field` instead of aborting
-    // `VableBoxNotSeeded`.  Mirror of the codewriter non-portal branch.
+    // `PyCode.frame_stores_global`: the common globals identity lives on the
+    // code object and needs no frame field.  A shared code object rebound to a
+    // different namespace creates `FrameDebugData.w_globals` in PyPy.  This
+    // custom inline-frame encoder does not yet put that rare debugdata object
+    // into resume data, so keep the call residual instead of compiling a
+    // frame whose `get_w_globals()` would silently read the first namespace.
+    let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
+    if unsafe {
+        pyre_interpreter::w_code_frame_stores_global(
+            w_code as pyre_object::PyObjectRef,
+            callee_globals_obj,
+        )
+    } {
+        return resolved_inline_decline(op.pc, line!());
+    }
+
+    // Path-1 (#68): the inlined callee's promoted `pycode` static field and
+    // its code-derived globals semantic constant.  The latter is no longer a
+    // physical virtualizable scalar; LOAD_GLOBAL derives it through the
+    // callee frame's pycode.
     let inline_consts = InlineCalleeConsts {
-        w_globals: unsafe { pyre_interpreter::function_get_globals_obj(callable) } as usize,
+        w_globals: callee_globals_obj as usize,
         w_code: callee_code_key,
         jitcode_index: crate::state::ensure_jitcode_index(callee_code_key as *const ())
             .map_or(-1, |index| index as i32),
@@ -6069,13 +6060,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 break 'seed;
             }
 
-            // ec red: the shared ExecutionContext (perform_call threads the
-            // caller's ec down).  Recover it off the materialized caller portal
-            // frame via `GETFIELD_GC_R` rather than the seeded
-            // `sym.execution_context` OpRef — the seeded OpRef rebinds to the
-            // callee's own `pycode` when this compiled trace re-enters as a nested
-            // bridge (see `try_walker_call_assembler_self_recursive`).  The outer
-            // portal frame's `execution_context` field is the single true ec.
+            // ec red: `perform_call` threads the caller's second portal red
+            // down unchanged, just as PyPy shares `ec` between MIFrames.
             let sym_ptr = ctx.fbw_mode.snapshot_sym;
             if sym_ptr.is_null() {
                 if try_multiframe {
@@ -6085,11 +6071,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 break 'seed;
             }
             let sym = unsafe { &*sym_ptr };
-            let callee_ec = ctx.trace_ctx.record_op_with_descr(
-                OpCode::GetfieldGcR,
-                &[sym.frame()],
-                crate::descr::pyframe_execution_context_descr(),
-            );
+            let callee_ec = sym.execution_context();
+            if callee_ec.is_none() {
+                if try_multiframe {
+                    return resolved_inline_decline(op.pc, line!());
+                }
+                seed_break_reason = "Collapse::NoExecutionContextRed";
+                break 'seed;
+            }
 
             let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
             let w_globals_obj_const = ctx.trace_ctx.const_ref(inline_consts.w_globals as i64);
@@ -6103,7 +6092,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 nlocals + ncells,
                 pycode_const,
                 w_globals_obj_const,
-                callee_ec,
             );
 
             callee_regs_r[frame_reg as usize] = callee_frame;
@@ -6155,7 +6143,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // host handle; the frontend op above keeps the frame reachable.
             drop(frame);
             callee_regs_r[ec_reg as usize] = callee_ec;
-            callee_concrete_r[ec_reg as usize] = ConcreteValue::Null;
+            // `perform_call` threads the same concrete ExecutionContext into
+            // every MIFrame.  The symbolic second red above and its concrete
+            // shadow are one value; leaving only the shadow unknown makes
+            // `build_single_frame_miframe` reject an otherwise complete
+            // callee image during an escape, after which the legacy caller
+            // replay resumes past CALL without its result.
+            callee_concrete_r[ec_reg as usize] =
+                ConcreteValue::Ref(concrete_ec as pyre_object::PyObjectRef);
 
             // Retain for a possible `SubLoopCalleeCallAssembler` emit.
             ca_callee_frame = callee_frame;
@@ -6419,7 +6414,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `newframe` pushes (`pyjitpl.py, 1862-1874`) is the tracer's
     // `MIFrame` instead, and is not what `enter` takes its vref of.
     let entered_ec = callee_frame_seeded && !ca_concrete_frame.is_null() && {
-        let concrete_ec = unsafe { (*ca_concrete_frame).execution_context }
+        let concrete_ec = pyre_interpreter::call::getexecutioncontext()
             as *mut pyre_interpreter::PyExecutionContext;
         if concrete_ec.is_null() {
             false
@@ -6917,7 +6912,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // resume-side leave, or the exception path recording its own — not a
     // reorder.
     if entered_ec {
-        let concrete_ec = unsafe { (*ca_concrete_frame).execution_context }
+        let concrete_ec = pyre_interpreter::call::getexecutioncontext()
             as *mut pyre_interpreter::PyExecutionContext;
         // `leave(frame, w_exitvalue, got_exception)` — the caller passes true
         // only when the frame is unwinding an exception, which for an inlined

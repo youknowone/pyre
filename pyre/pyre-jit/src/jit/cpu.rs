@@ -377,8 +377,8 @@ pub struct Cpu {
     /// `bhimpl_build_slice` — (argc, start, stop, step) → new slice.
     pub build_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `RAISE_VARARGS` normalization helper used before `raise/r`.
-    /// `(frame: Ref, exc: Ref, cause: Ref) → Ref` — the explicit frame
-    /// pointer feeds `frame.execution_context` directly.
+    /// `(frame: Ref, exc: Ref, cause: Ref) → Ref` — normalization reads the
+    /// current activation's execution context, as `space.getexecutioncontext()`.
     pub normalize_raise_varargs_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// Read per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`.
     pub get_current_exception_fn: extern "C" fn() -> i64,

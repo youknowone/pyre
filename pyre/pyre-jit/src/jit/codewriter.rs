@@ -1067,18 +1067,20 @@ fn derive_pc_live_indices_from_sparse(
         .collect()
 }
 
-/// Derive the pre-merge `-live-` anchor that immediately precedes each
-/// `catch_exception` in the canonical SSA representation. The anchor is keyed
-/// by the Python PC whose `pc_first_insn_pos` range owns it, then
+/// Derive every pre-merge trailing `-live-` anchor emitted after a call in the
+/// canonical SSA representation. The anchor is keyed by the Python PC whose
+/// `pc_first_insn_pos` range owns it, then
 /// `compute_liveness_with_pc_anchors` remaps it into the spliced instruction
-/// stream used by the runtime's post-call catch marker.
+/// stream used by the runtime's post-call resume marker.
 ///
 /// `derive_after_call_indices_from_sparse` stores one anchor per Python PC.
-/// Multiple `catch_exception` sites owned by one PC would overwrite that entry.
-/// The representation is sound because `catch_exception` is emitted
-/// once for each can-raise block exit, while additional catch links from a
-/// multi-exit block lower through `make_exception_link`, which emits no
-/// `catch_exception`.
+/// The representation is sound because one lowered Python opcode emits at most
+/// one call requiring a trailing marker. Do not infer these anchors from
+/// `catch_exception`: `jtransform.py::handle_residual_call` also appends the
+/// marker for a can-raise call with no local exception handler. Reuse the same
+/// `insn_needs_trailing_live` predicate that emits the marker so the producer
+/// and consumer cannot disagree about which call sites need a post-call resume
+/// coordinate.
 fn derive_after_call_indices_from_sparse(
     ssarepr: &super::flatten::SSARepr,
     n_pcs: usize,
@@ -1086,19 +1088,19 @@ fn derive_after_call_indices_from_sparse(
     let mut out: Vec<Option<usize>> = vec![None; n_pcs];
     let pc_pos = sparse_pc_owner_table(ssarepr);
     for (q, insn) in ssarepr.insns.iter().enumerate() {
-        let is_catch = matches!(
-            insn,
-            super::flatten::Insn::Op { opname, .. } if opname == "catch_exception"
-        );
-        if !is_catch {
+        if !insn.is_live() {
             continue;
         }
-        let Some(live_pos) = q.checked_sub(1).filter(|&i| ssarepr.insns[i].is_live()) else {
+        let Some(call_pos) = q
+            .checked_sub(1)
+            .filter(|&i| super::flatten::insn_needs_trailing_live(&ssarepr.insns[i]))
+        else {
             continue;
         };
-        if let Some(pc) = sparse_owner_pc(&pc_pos, live_pos) {
+        debug_assert_eq!(call_pos + 1, q);
+        if let Some(pc) = sparse_owner_pc(&pc_pos, q) {
             if pc < n_pcs {
-                out[pc] = Some(live_pos);
+                out[pc] = Some(q);
             }
         }
     }
@@ -5314,7 +5316,6 @@ fn filter_liveness_in_place(
         if any_reachable && let Some(extra) = catch_extra_refs.get(&insn_idx) {
             union_r.extend(extra.iter().copied());
         }
-
         // #348 Part (2): the marker's Ref colors are now final in `union_r`.
         // Collect the group's `(color, slot)` entries (union of member PCs'
         // per-PC maps) restricted to those colors, then publish to every
@@ -6040,13 +6041,12 @@ impl CodeWriter {
         // through `VABLEINFO.static_field_descrs` since each backend may
         // reorder fields. Pyre's `_virtualizable_` order matches PyPy
         // `interp_jit.py:25-30` line by line:
-        // [last_instr, pycode, valuestackdepth, debugdata, w_globals],
+        // [last_instr, pycode, valuestackdepth, debugdata],
         // so the literals match
         // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`.
         const VABLE_LAST_INSTR_FIELD_IDX: u16 = 0;
         const VABLE_CODE_FIELD_IDX: u16 = 1;
         const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
-        const VABLE_NAMESPACE_FIELD_IDX: u16 = 4;
 
         // regalloc.py: compile-time stack depth counter — tracks which
         // stack register (stack_base + depth) is the current TOS.
@@ -9541,17 +9541,16 @@ impl CodeWriter {
                             // const-folded loads into five residual calls and
                             // takes `guard_failures` from 1803 to 63769.
                             let result_value: super::flow::FlowValue = if is_true_portal {
-                                let ns_var = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "getfield_vable_r",
-                                    vable_getfield_ref_graph_args(
-                                        frame_var.into(),
-                                        VABLE_NAMESPACE_FIELD_IDX,
-                                    ),
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                );
+                                // `bh_load_global_fn` derives globals from the
+                                // live frame; the namespace operand is only a
+                                // trace-time cell-fold hint. The walker replaces
+                                // this null placeholder with this MIFrame's
+                                // `get_w_globals()` result before recording.
+                                let ns_var: super::flow::FlowValue = super::flow::Constant::new(
+                                    super::flow::ConstantValue::Signed(0),
+                                    Some(Kind::Ref),
+                                )
+                                .into();
                                 let code_const: super::flow::FlowValue =
                                     super::flow::Constant::new(
                                         super::flow::ConstantValue::Signed(w_code as i64),
@@ -16269,8 +16268,8 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 ///     `PyFrame::call`).
 ///   * `bh_normalize_raise_varargs_with_frame(frame_ptr, exc, cause)` —
 ///     `frame_ptr` non-null asserted; pins
-///     `(*parent_frame_ptr).execution_context` for the normalization
-///     path.  Same migration shape as `bh_call_fn_*`.  Not yet migrated.
+///     the current activation's execution context for normalization.
+///     Same migration shape as `bh_call_fn_*`. Not yet migrated.
 ///
 /// Today the un-migrated emit sites are latent for non-portal callees:
 /// production tracing records IR ops symbolically. The full-body-walk
@@ -17480,6 +17479,33 @@ mod tests {
         // Absent variable: None.
         let v_absent = Variable::new(VariableId(99), Kind::Ref);
         assert_eq!(state.variable_slot(&v_absent), None);
+    }
+
+    /// `jtransform.py::handle_residual_call` emits a trailing `-live-` for a
+    /// can-raise residual call even when the graph has no local exception
+    /// handler. The after-call anchor census must therefore follow the call
+    /// predicate, not look for a following `catch_exception`.
+    #[test]
+    fn after_call_anchor_includes_canraise_call_without_catch_exception() {
+        let mut ssarepr = SSARepr::new("canraise_without_catch");
+        ssarepr.pc_first_insn_pos.push((0, 0));
+        ssarepr
+            .insns
+            .push(super::super::flatten::build_binary_op_residual_call_ir_r_insn(11, 0, 0, 1, 2));
+        ssarepr.insns.push(Insn::live(Vec::new()));
+
+        assert!(
+            !ssarepr.insns.iter().any(|insn| matches!(
+                insn,
+                Insn::Op { opname, .. } if opname == "catch_exception"
+            )),
+            "fixture must exercise a call with no local exception handler",
+        );
+        assert_eq!(
+            derive_after_call_indices_from_sparse(&ssarepr, 1),
+            vec![Some(1)],
+            "the structural trailing-live marker must be the PC's after-call anchor",
+        );
     }
 
     /// `liveness.py:5-12` expands a `-live-` marker to "all values that are

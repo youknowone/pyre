@@ -1334,7 +1334,8 @@ impl ResidualFrameChainGuard {
         if frame.is_null() {
             return None;
         }
-        let ec = unsafe { (*frame).execution_context } as *mut pyre_interpreter::PyExecutionContext;
+        let ec = pyre_interpreter::call::getexecutioncontext()
+            as *mut pyre_interpreter::PyExecutionContext;
         if ec.is_null() {
             return None;
         }
@@ -6249,6 +6250,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     let ei = call_descr.get_extra_info();
     repair_carrier_call_ref_args(ctx, op.pc, ei.runtime_helper, &mut r_args);
+    // Resolve LOAD_GLOBAL's semantic namespace before any specialization reads
+    // the ref args and before `_build_allboxes` copies them.  PyPy's
+    // `LOAD_GLOBAL` asks the live MIFrame for `get_w_globals()`; keeping that
+    // one OpRef in both representations prevents the cell fold from seeing the
+    // codewriter's null trace-time placeholder while the surviving residual
+    // sees the later replacement.
+    replace_movable_load_global_namespace_with_frame_globals(ctx, ei.runtime_helper, &mut r_args);
 
     // A profiled frame owes `c_call` / `c_return` around every builtin call
     // its bytecode makes -- `baseobjspace.py call_valuestack`, `pyopcode.py`
@@ -6432,8 +6440,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
-    let mut allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
-    replace_movable_load_global_namespace_with_frame_globals(ctx, ei, &mut allboxes);
+    let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
     if let Err(e) = ensure_residual_call_args_bound(&allboxes, op.pc) {
         if fbw_debug_abort_enabled() {
             let len_pc = op.pc + 1 + 1;
@@ -7695,6 +7702,12 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // otherwise forbid (E0506).
     let runtime_helper_kind = original_call_descr.get_extra_info().runtime_helper;
     repair_carrier_call_ref_args(ctx, op.pc, runtime_helper_kind, &mut r_args);
+    // Do this before the fold block below and before `_build_allboxes`: both
+    // consumers must observe the same per-MIFrame namespace.  In particular,
+    // the portal codewriter deliberately supplies NULL as a hint placeholder;
+    // delaying replacement until the generic residual path makes the
+    // LoadGlobal cell fold decline on that stale value.
+    replace_movable_load_global_namespace_with_frame_globals(ctx, runtime_helper_kind, &mut r_args);
     // Void shape `_ir_v/iIRd` (`pyjitpl.py opimpl_residual_call_ir_v =
     // _opimpl_residual_call2`) has no `>X` dst byte; see
     // `dispatch_residual_call_iRd_kind` for the void operand-layout note.
@@ -8483,8 +8496,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             }
         }
     }
-
-    replace_movable_load_global_namespace_with_frame_globals(ctx, ei, &mut allboxes);
 
     // Defer the arg-bound check past the short-circuiting LoadConst /
     // LoadGlobal folds above: each resolves the call to a constant from

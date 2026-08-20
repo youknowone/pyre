@@ -1623,7 +1623,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if current.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            // `w_globals` is one of the six fields `interp_jit.py`
+            // `get_w_globals` reads `pycode`, which `interp_jit.py`
             // declares virtualizable, so the frame it is read off has to be
             // materialized first.  The force belongs HERE, at the consumer, and
             // not at the walk that reached the frame — see [`force_frame`]:
@@ -1631,7 +1631,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
             let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
             crate::executioncontext::force_frame(current);
-            let w_globals = unsafe { (*anchor.live()).w_globals };
+            let w_globals = unsafe { (*anchor.live()).get_w_globals() };
             if w_globals.is_null() {
                 return Ok(pyre_object::w_none());
             }
