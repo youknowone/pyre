@@ -12,20 +12,27 @@ class Derived(Heap):
     pass
 
 
-# Py_TPFLAGS_IMMUTABLETYPE.  pyre publishes it on every type that is not a
-# heap type and `get_flags` publishes no such bit, so it is the one bit of this
-# word that follows 3.14 rather than PyPy — which makes it the one bit this
-# fixture cannot compare against its oracle.  Masked out below rather than
-# dropped: what it names is asserted directly in
-# `check_exception_group_immutable`, by making the store and failing if it
-# succeeds.
-PYPY_FLAGS = ~(1 << 8)
+# The bits `W_TypeObject.get_flags` publishes, and only those: `_CPYTYPE` (1,
+# cpyext-defined static types, which have no owner here), PATMA_SEQUENCE
+# (1 << 5), PATMA_MAPPING (1 << 6), `_HEAPTYPE` (1 << 9),
+# Py_TPFLAGS_METHOD_DESCRIPTOR (1 << 17) and `_ABSTRACT` (1 << 20).
+#
+# Comparing against a positive mask rather than the whole word is what keeps
+# this an oracle comparison.  pyre also publishes a 3.14 `tp_flags` surface —
+# IMMUTABLETYPE, BASETYPE, HAVE_GC, READY, DISALLOW_INSTANTIATION, the managed
+# dict/weakref pair, the fast-subclass family — and every one of those bits
+# falls outside this mask precisely because `get_flags` has no opinion to
+# compare it to.  Each carries its own justification where it is published; a
+# bit with no oracle does not belong in a fixture whose oracle is PyPy.
+#
+# What the masked-out bits name is still asserted where it is observable:
+# IMMUTABLETYPE by `check_exception_group_immutable`, which makes the store and
+# fails if it succeeds.
+PYPY_FLAGS = 1 | (1 << 5) | (1 << 6) | (1 << 9) | (1 << 17) | (1 << 20)
 
 
 def check_flags():
-    # `get_flags`: _HEAPTYPE 1<<9, PATMA_SEQUENCE 1<<5, PATMA_MAPPING 1<<6,
-    # _ABSTRACT 1<<20, Py_TPFLAGS_METHOD_DESCRIPTOR 1<<17.  _CPYTYPE marks
-    # cpyext-defined static types and has no owner here.
+    # 0x20 is PATMA_SEQUENCE, 0x40 PATMA_MAPPING, 0x200 `_HEAPTYPE`.
     expected = {
         object: 0x0,
         type: 0x0,
