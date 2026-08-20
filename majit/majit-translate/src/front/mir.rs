@@ -7356,15 +7356,24 @@ impl<'a> Lowering<'a> {
                     // `int_mul/ri>i`.
                     let item_ty = tyref_deref_value_type(&call.dest.ty, self.llbc);
                     // The `pyre_`-fenced workspace arm has exactly three
-                    // element banks — `FixedObjectArray` (Ref), `IntArray`,
-                    // `FloatArray` — so a Ref element there IS the
-                    // length-prefixed object block `set_ref` and the `swap`
-                    // decomposition name, and this read has to share their
-                    // descr or a cached element survives their store.  The
-                    // `Vec<T>` and slice legs reach Ref elements that are not
-                    // that block, and they keep the identity-less descr,
-                    // which `arraydescrof_concrete` mints locally without a
-                    // cache publish.
+                    // element banks — `FixedObjectArray`, `IntArray`,
+                    // `FloatArray` — so a `*mut PyObject` element there IS
+                    // the length-prefixed object block that `set_ref` and the
+                    // `swap` decomposition name, and this read has to share
+                    // their descr or a cached element survives their store.
+                    // The `Vec<T>` and slice legs reach object pointers that
+                    // are not that block, and they keep the identity-less
+                    // descr, which `arraydescrof_concrete` mints locally
+                    // without a cache publish.
+                    //
+                    // Unlike the `swap` arm, the item kind is sound evidence
+                    // here.  The `Ref(None)` fallback that forced `swap` onto
+                    // a positive `output_type_is_objectptr` proof is reached
+                    // when `monomorphize:false` leaves a `TypeVar` at the call
+                    // site; the impls behind this arm are non-generic
+                    // inherent/trait impls on three concrete types, so
+                    // `call.dest.ty` is a resolved associated `Output` at
+                    // every one and never lands on that fallback.
                     let array_type_id = (workspace_index && matches!(item_ty, ValueType::Ref(_)))
                         .then(|| PYOBJECT_GCARRAY_TYPE_ID.to_string());
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -7528,20 +7537,30 @@ impl<'a> Lowering<'a> {
                     let idx_b = args[2].clone();
                     // The four synthetic ops below name the SLICE's own item
                     // kind and array identity.  `swap` is matched by name
-                    // alone, and the name reaches four element kinds: the
-                    // `i64` / `f64` / `usize` monomorphizations of
-                    // `listsort::sort_with`, the `array` module's `Vec<u8>`
-                    // byte buffer, and `FixedObjectArray::swap`'s
+                    // alone, and the name reaches three call sites: the
+                    // generic `listsort::sort_with<T>` (through
+                    // `reverse_slice`), the `array` module's `Vec<u8>` byte
+                    // buffer, and `FixedObjectArray::swap`'s
                     // `&mut [PyObjectRef]`.  Only the last is the
                     // length-prefixed object block, whose identity every
                     // other devirtualized accessor arm spells explicitly;
                     // leaving it unnamed keeps the swap out of that descr's
                     // key, so a trace could cache an element through one arm
-                    // and miss the invalidation this store owes it.  The
-                    // unboxed banks must NOT borrow that identity, so the
-                    // name follows the element kind.
-                    let elem_ty = self.slice_swap_elem_value_type(&reg);
-                    let elem_array_type_id = matches!(elem_ty, ValueType::Ref(_))
+                    // and miss the invalidation this store owes it.
+                    //
+                    // The identity is gated on `output_type_is_objectptr`, a
+                    // POSITIVE proof that the element is `*mut PyObject`, not
+                    // on the item kind coming out `Ref` — see
+                    // [`Self::slice_swap_elem_tyref`] for why the `Ref(None)`
+                    // fallback cannot stand in for that proof.
+                    let elem_tyref = self.slice_swap_elem_tyref(&reg);
+                    let elem_ty = elem_tyref
+                        .as_ref()
+                        .map(|ty| tyref_to_value_type(ty, self.llbc))
+                        .unwrap_or(ValueType::Ref(None));
+                    let elem_array_type_id = elem_tyref
+                        .as_ref()
+                        .is_some_and(|ty| output_type_is_objectptr(ty, self.llbc))
                         .then(|| PYOBJECT_GCARRAY_TYPE_ID.to_string());
                     let elem_a = self
                         .graph
@@ -10019,19 +10038,28 @@ impl<'a> Lowering<'a> {
     /// call's own type arguments (`generics.types[0]`) the way
     /// [`Self::tyref_adt_type_arg`] reads an ADT's.  The swap decomposition
     /// synthesizes `ArrayRead`/`ArrayWrite` pairs the MIR never spells, and
-    /// both the item kind and the array identity have to be the SLICE's, not
-    /// a fixed guess: `swap` is matched by name alone, so it also reaches the
-    /// unboxed typed-strategy backings.  Falls back to `Ref(None)` when the
-    /// type argument cannot be read, which is the shape the decomposition
-    /// assumed unconditionally before.
-    fn slice_swap_elem_value_type(&self, reg: &RegularCall) -> ValueType {
+    /// `swap` is matched by name alone, so the element kind has to be the
+    /// SLICE's rather than a fixed guess.
+    ///
+    /// Returns the `TyRef` itself, not a [`ValueType`], because the two
+    /// consumers need different strengths of answer.  The item kind may use
+    /// `tyref_to_value_type`'s `Ref(None)` fallback — that is what the
+    /// decomposition assumed unconditionally before, so an unresolved
+    /// element is no worse than the old behaviour.  The array identity may
+    /// NOT: Charon runs `monomorphize:false`, so a call inside a generic
+    /// body (`listsort::sort_with<T>` reaching `swap` through
+    /// `reverse_slice`) carries a `TypeVar` here, and every unresolved shape
+    /// lands on that same `Ref(None)`.  Reading the fallback as "this is the
+    /// object block" would stamp the object-array descr onto the `i64` /
+    /// `f64` / `usize` sort paths, aliasing them onto the real object array
+    /// and giving them a pointer itemsize — 4 bytes on wasm32, where the
+    /// scalar banks stride 8.
+    fn slice_swap_elem_tyref(&self, reg: &RegularCall) -> Option<TyRef> {
         reg.generics
             .get("types")
             .and_then(serde_json::Value::as_array)
             .and_then(|types| types.first())
             .and_then(|node| serde_json::from_value::<TyRef>(node.clone()).ok())
-            .map(|ty| tyref_to_value_type(&ty, self.llbc))
-            .unwrap_or(ValueType::Ref(None))
     }
 
     /// `FixedObjectArray::set_ref(self, index, value)` — the GC-published
