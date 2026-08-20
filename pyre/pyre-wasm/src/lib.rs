@@ -1189,6 +1189,14 @@ mod host_abi {
         majit_backend_wasm::inline_bridge_disable();
     }
 
+    /// Admit an inlined region that closes at a non-header LABEL. Opt-in: the
+    /// shape is emitted and unit-tested but miscompiles on real IR, so only a
+    /// host debugging that arm turns it on.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_inline_nonheader_enable() {
+        majit_backend_wasm::inline_nonheader_enable();
+    }
+
     /// Disable the default guard-to-bridge parameter entries. The host owns
     /// the environment, so this call carries its explicit opt-out into the
     /// guest before tracing begins.

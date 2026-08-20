@@ -560,6 +560,16 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
+    // In-module resume at a non-header LABEL is opt-IN, not opt-out: the shape
+    // is emitted and unit-tested but miscompiles on real IR. This export exists
+    // so the arm can be A/B'd on one binary while that is chased down.
+    if std::env::var_os("PYRE_WASM_INLINE_NONHEADER")
+        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("1" | "true" | "on")))
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_inline_nonheader_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
     // Parameter bridge entries are the default. The guest has no environment,
     // so an explicit host-side opt-out must travel through this export before
     // tracing begins.
@@ -744,6 +754,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "inline_decl_label_resume_layout",
                 "inline_decl_call_assembler",
                 "inline_decl_owner_invalidated",
+                "inline_decl_foreign_label",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

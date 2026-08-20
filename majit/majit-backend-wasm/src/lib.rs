@@ -86,8 +86,9 @@ use std::sync::{Arc, Mutex};
 /// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
 /// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
 /// the owner is already invalidated, so a merged region would inherit its set
-/// flag instead of starting valid.
-pub static BRIDGE_DIAG: [AtomicU64; 51] = [const { AtomicU64::new(0) }; 51];
+/// flag instead of starting valid; 51 = the region's closing JUMP names a LABEL
+/// published by another module, which no in-module `br` can reach.
+pub static BRIDGE_DIAG: [AtomicU64; 52] = [const { AtomicU64::new(0) }; 52];
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -217,6 +218,8 @@ fn classify_inline_install_error(error: &BackendError) {
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Off until the miscompile below is root-caused. See `inline_nonheader_enable`.
+static INLINE_NONHEADER_ENABLED: AtomicBool = AtomicBool::new(false);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
 
@@ -335,6 +338,25 @@ pub fn inline_bridge_disable() {
 
 fn inline_bridge_enabled() -> bool {
     INLINE_BRIDGE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Admit a region whose closing JUMP names a resumable LABEL that is not the
+/// loop header. `codegen` emits these by wrapping the entry dispatch in a
+/// `loop` the region branches back into, re-entering past that label's resume
+/// loader with the values already in locals — on fannkuch that is 16.3M of the
+/// 20.6M surviving cross-module crossings.
+///
+/// ⛔ Off by default: the emitted shape is structurally valid and correct on the
+/// unit-test traces (`region_closing_at_a_non_header_label_*`), but on real IR
+/// it miscompiles — 47 `check.py` fixtures die identically with a corrupted Ref
+/// (`TypeError: '' object is not an iterator`). Not yet root-caused, so the
+/// accept condition below keeps declining unless a host opts in to debug it.
+pub fn inline_nonheader_enable() {
+    INLINE_NONHEADER_ENABLED.store(true, Ordering::Relaxed);
+}
+
+fn inline_nonheader_enabled() -> bool {
+    INLINE_NONHEADER_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Disable guard-to-bridge value parameters from the host before guest
@@ -3401,7 +3423,20 @@ impl majit_backend::Backend for WasmBackend {
             } else if !bridge_is_loop_closing {
                 diag_bump(34);
                 decline("not_loop_closing");
-            } else if !resumes_at_loop_header {
+            } else if external_jump_slot != source_func_handle {
+                // The emitter turns a region's closing JUMP into a `br`, and a
+                // `br` cannot leave the module, so the JUMP must name a LABEL of
+                // the loop the region merges into. A JUMP naming another
+                // module's published label resolves to no LABEL in the merged
+                // stream, and the in-module arm would then branch to the
+                // owner's loop instead of the loop the bridge meant.
+                diag_bump(51);
+                decline("foreign_label");
+            } else if !resumes_at_loop_header && !inline_nonheader_enabled() {
+                // Resuming at the header lets the region `br` straight to the
+                // `loop`. Resuming at an earlier LABEL needs the
+                // `loop`-wrapped dispatch, which is opt-in until its
+                // miscompile is root-caused (`inline_nonheader_enable`).
                 diag_bump(38);
                 decline("not_header");
             } else if let Some(mut candidate) = original_token

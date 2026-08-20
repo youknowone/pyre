@@ -3090,6 +3090,37 @@ fn build_function(
     // branches are retained solely for the direct-family-disabled baseline.
     debug_assert!(!ca.emit_ca || residual_type_base.is_some());
     let value_locals_end = value_types.end_local();
+    // Resume-at-LABEL shape, needed here because `resume_dispatch` costs a
+    // local. A peeled loop wraps its preamble in a dispatch so a loop-closing
+    // bridge can re-enter AT any LABEL up to the header; labels after the
+    // header sit inside the `loop` and get no resume arm
+    // (`resumable_label_count`).
+    let key_dispatch = is_resumable_peeled(ops);
+    let num_labels = if key_dispatch {
+        resumable_label_count(ops)
+    } else {
+        0
+    };
+    let bridge_op_count = inlined_bridges
+        .iter()
+        .map(|bridge| bridge.ops.len())
+        .sum::<usize>();
+    let bridge_start = ops.len().checked_sub(bridge_op_count).ok_or_else(|| {
+        BackendError::Unsupported(
+            "wasm backend: inlined bridge operations are not contained in the merged stream".into(),
+        )
+    })?;
+    // A region whose closing JUMP names a resumable LABEL other than the header
+    // cannot `br` to the `loop`. Wrap the dispatch in a `loop` such a region
+    // re-enters through instead, and give the entry `br_table` a second bucket
+    // per label: key `num_labels + 1 + j` lands PAST label j's resume loader,
+    // so the region hands its values over in locals rather than through the
+    // frame slots the loader reads.
+    let resume_dispatch = key_dispatch
+        && ops[bridge_start..].iter().any(|op| {
+            op.opcode == OpCode::Jump && jump_resume_ordinal(ops, op, num_labels).is_some()
+        });
+
     // Value locals occupy the dense local range beginning at 1; reserve
     // `UMULHI_SCRATCH` i64 locals past them for the `UintMulHigh`
     // 32-bit-split expansion, plus one i64 local for the pending overflow flag.
@@ -3122,6 +3153,10 @@ fn build_function(
             0
         };
     let trace_entry_needs_key_local = trace_entry_census.is_some() && is_resumable_peeled(ops);
+    // `resume_dispatch` keeps the entry key in a local so a region can rewrite
+    // it and branch back into the dispatch; without it the key is consumed
+    // straight off the frame load.
+    let resume_key_local = trace_entry_key_local + u32::from(trace_entry_needs_key_local);
     debug_assert_eq!(bridge_slot_local, ovf_flag_local + 1);
     debug_assert_eq!(ca_cfp_local, bridge_slot_local + 1);
     debug_assert_eq!(ca_fi_local, ca_cfp_local + 1);
@@ -3172,7 +3207,8 @@ fn build_function(
             } else {
                 0
             }
-            + u32::from(trace_entry_needs_key_local),
+            + u32::from(trace_entry_needs_key_local)
+            + u32::from(resume_dispatch),
         ValType::I32,
     ));
     let mut func = Function::new(locals);
@@ -3197,15 +3233,6 @@ fn build_function(
     // re-execute the complete loop body.
     let loop_label_idx = find_loop_label_index(ops);
     let has_loop = loop_label_idx.is_some();
-    let bridge_op_count = inlined_bridges
-        .iter()
-        .map(|bridge| bridge.ops.len())
-        .sum::<usize>();
-    let bridge_start = ops.len().checked_sub(bridge_op_count).ok_or_else(|| {
-        BackendError::Unsupported(
-            "wasm backend: inlined bridge operations are not contained in the merged stream".into(),
-        )
-    })?;
 
     // Def / last-use positions for the post-collection Ref reload filter. The
     // spans must match the ones `RefHomes` was built from, or a home would be
@@ -3222,15 +3249,7 @@ fn build_function(
     // pair; the entry `br_table` jumps to the keyed label's resume loader,
     // and the fall-through path `br`s over each loader. Key 0 (and any
     // out-of-range key) runs the function from its entry (the preamble).
-    let key_dispatch = is_resumable_peeled(ops);
-    // Labels after the loop header sit inside the `loop` and get no block pair
-    // (`resumable_label_count`); every count below is over the resumable
-    // prefix, which is exactly labels 0..=header in ops order.
-    let num_labels = if key_dispatch {
-        resumable_label_count(ops)
-    } else {
-        0
-    };
+    // Every count below is over the resumable prefix — labels 0..=header.
     let all_label_args: Vec<Vec<OpRef>> = ops
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
@@ -3241,6 +3260,20 @@ fn build_function(
     // The enclosing exit block gives each guard and Finish a direct path to
     // the bridge-dispatch epilogue after it has spilled its fail arguments.
     sink.block(BlockType::Empty); // A $hot_exit
+    if resume_dispatch {
+        // The key must survive into the `loop` a region branches back to, so
+        // read it once here, outside that loop. The census stays outside too:
+        // it counts entries into the module, and an in-module re-dispatch is
+        // not one.
+        sink.local_get(0);
+        sink.i64_load(mem64(frame.dispatch_key_ofs));
+        sink.i32_wrap_i64();
+        sink.local_set(resume_key_local);
+        if let Some(census) = trace_entry_census {
+            emit_trace_entry_census(&mut sink, census, bridge_slot_local, Some(resume_key_local));
+        }
+        sink.loop_(BlockType::Empty); // R $resume
+    }
     if key_dispatch {
         // Per resumable label j (opened outermost = the loop header):
         //   block $past_loader_j (B_j) — the fall-through path br's over the
@@ -3253,32 +3286,46 @@ fn build_function(
             sink.block(BlockType::Empty); // C_j
         }
         sink.block(BlockType::Empty); // D $dispatch
-        sink.local_get(0);
-        sink.i64_load(mem64(frame.dispatch_key_ofs));
-        sink.i32_wrap_i64();
-        // Without a census the key is already where `br_table` wants it. Only
-        // the census needs it a second time, so only the census pays to keep a
-        // copy: a `tee`/`get` pair here costs every entry into a peeled module.
-        if let Some(census) = trace_entry_census {
-            let dispatch_key_local = if trace_entry_needs_key_local {
-                trace_entry_key_local
-            } else {
-                bridge_slot_local
-            };
-            sink.local_tee(dispatch_key_local);
-            emit_trace_entry_census(
-                &mut sink,
-                census,
-                bridge_slot_local,
-                Some(dispatch_key_local),
-            );
-            sink.local_get(dispatch_key_local);
+        if resume_dispatch {
+            sink.local_get(resume_key_local);
+        } else {
+            sink.local_get(0);
+            sink.i64_load(mem64(frame.dispatch_key_ofs));
+            sink.i32_wrap_i64();
+            // Without a census the key is already where `br_table` wants it.
+            // Only the census needs it a second time, so only the census pays
+            // to keep a copy: a `tee`/`get` pair here costs every entry into a
+            // peeled module.
+            if let Some(census) = trace_entry_census {
+                let dispatch_key_local = if trace_entry_needs_key_local {
+                    trace_entry_key_local
+                } else {
+                    bridge_slot_local
+                };
+                sink.local_tee(dispatch_key_local);
+                emit_trace_entry_census(
+                    &mut sink,
+                    census,
+                    bridge_slot_local,
+                    Some(dispatch_key_local),
+                );
+                sink.local_get(dispatch_key_local);
+            }
         }
         // Depths at this point, innermost first: D=0, then (C_j, B_j) pairs
-        // with C_j at 2j+1. Entry j+1 of the table targets C_j; entry 0 and
-        // the default target D (the entry path).
+        // with C_j at 2j+1 and B_j at 2j+2. Entry j+1 of the table targets
+        // C_j — label j's resume loader; entry 0 and the default target D (the
+        // entry path). Under `resume_dispatch` a second bucket per label,
+        // `num_labels + 1 + j`, targets B_j: past that loader, for a region
+        // that has already put the label args in their locals.
         let br_targets: Vec<u32> = std::iter::once(0)
             .chain((0..num_labels as u32).map(|j| 2 * j + 1))
+            .chain(
+                resume_dispatch
+                    .then(|| (0..num_labels as u32).map(|j| 2 * j + 2))
+                    .into_iter()
+                    .flatten(),
+            )
             .collect();
         sink.br_table(br_targets, 0);
         sink.end(); // end D $dispatch — key-0 entry path continues here
@@ -3419,24 +3466,14 @@ fn build_function(
                 }
             }
             // Restore backend-only live-ins after the semantic LABEL args.
-            // Ref restores also refresh the ordinary home used by the normal
-            // collecting-call reload path in the resumed loop body.
-            for &r in &label_resume.per_label[labels_passed] {
-                let storage = label_resume
-                    .storage(r)
-                    .expect("LABEL live-in has assigned capture storage");
-                sink.local_get(0);
-                sink.i64_load(mem64(label_resume.frame_offset(storage, frame)));
-                if value_types.ty(r.raw()) == ValType::F64 {
-                    sink.f64_reinterpret_i64();
-                }
-                sink.local_set(value_types.local(r.raw()));
-                if let Some(h) = ref_homes.home(r) {
-                    sink.local_get(0);
-                    sink.local_get(value_types.local(r.raw()));
-                    sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
-                }
-            }
+            emit_label_capture_restore(
+                &mut sink,
+                label_resume,
+                value_types,
+                ref_homes,
+                frame,
+                labels_passed,
+            );
             sink.end(); // end B_j $past_loader
             labels_passed += 1;
         }
@@ -3509,12 +3546,12 @@ fn build_function(
                     ));
                 }
                 if key_dispatch {
-                    2 * (num_labels - labels_passed) as u32
+                    2 * (num_labels - labels_passed) as u32 + u32::from(resume_dispatch)
                 } else {
                     0u32
                 }
             }
-            (true, true) => 1u32 + open_bridge_blocks,
+            (true, true) => 1u32 + open_bridge_blocks + u32::from(resume_dispatch),
         };
         // The guard whose condition the previous op already pushed and tested.
         // `block_exit_depth` is unchanged across the pair: only a LABEL moves
@@ -3672,7 +3709,32 @@ fn build_function(
                         sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
                     }
                 }
-                sink.br(open_bridge_blocks);
+                match resume_dispatch
+                    .then(|| jump_resume_ordinal(ops, op, num_labels))
+                    .flatten()
+                {
+                    // A region closing at a non-header LABEL re-enters the
+                    // dispatch at the key that lands past that label's resume
+                    // loader: the parallel move above already left the label
+                    // args in their locals, so none of them goes through a
+                    // frame slot. The captures still take the loader's restore.
+                    Some(j) => {
+                        emit_label_capture_restore(
+                            &mut sink,
+                            label_resume,
+                            value_types,
+                            ref_homes,
+                            frame,
+                            j,
+                        );
+                        sink.i32_const((num_labels + 1 + j) as i32);
+                        sink.local_set(resume_key_local);
+                        sink.br(open_bridge_blocks + 1);
+                    }
+                    None => {
+                        sink.br(open_bridge_blocks);
+                    }
+                }
             }
 
             OpCode::Finish => {
@@ -6195,6 +6257,9 @@ fn build_function(
     if has_loop {
         sink.end(); // end loop
     }
+    if resume_dispatch {
+        sink.end(); // end R $resume
+    }
     // A well-formed trace exits through a guard or Finish. Preserve the old
     // malformed/natural-fallthrough behavior without reaching bridge dispatch
     // with a stale frame fail index.
@@ -6372,7 +6437,11 @@ fn find_jump_target_label_index(ops: &[Op], jump: &Op) -> Option<usize> {
 }
 
 pub(crate) fn find_loop_label_index(ops: &[Op]) -> Option<usize> {
-    match ops.iter().rev().find(|op| op.opcode == OpCode::Jump) {
+    // The FIRST JUMP, not the last: a merged stream appends each inlined region
+    // after the owner's ops, so the owner's terminal JUMP — the one that
+    // defines the loop — precedes every region's. Reading the last would let a
+    // region closing at an earlier LABEL move the `loop` onto that label.
+    match ops.iter().find(|op| op.opcode == OpCode::Jump) {
         // x86/assembler.py:2463 `if target_token in
         // self.target_tokens_currently_compiling` — the TOKEN decides. A JUMP
         // that names a token this compilation does not define is upstream's
@@ -6388,6 +6457,20 @@ pub(crate) fn find_loop_label_index(ops: &[Op]) -> Option<usize> {
         // JUMP at all: keep the historical last-LABEL answer.
         _ => ops.iter().rposition(|op| op.opcode == OpCode::Label),
     }
+}
+
+/// Ordinal of the resumable LABEL a JUMP names, when that label is not the loop
+/// header. `None` for the header, for a label past the resumable prefix, and
+/// for a JUMP naming no local label. An inlined region with `Some(j)` has no
+/// `br` target: the `loop` opens at the header, so branching there would skip
+/// the segment between label `j` and the header.
+fn jump_resume_ordinal(ops: &[Op], jump: &Op, num_labels: usize) -> Option<usize> {
+    let label_idx = find_jump_target_label_index(ops, jump)?;
+    let ordinal = ops[..label_idx]
+        .iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .count();
+    (ordinal + 1 < num_labels).then_some(ordinal)
 }
 
 fn find_label_args(ops: &[Op], jump: &Op) -> Vec<OpRef> {
@@ -6456,6 +6539,38 @@ fn resolve_const_bits(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) ->
             .copied()
             .unwrap_or_else(|| missing_emit_const(opref))
     })
+}
+
+/// Reload the backend-only live-ins captured at `label` into their locals and
+/// refresh their Ref homes, the ordinary homes the resumed body's
+/// collecting-call reload path reads. Both resume paths need it: the entry
+/// `br_table` arrives with every local zero-initialised, and an inlined region
+/// arrives after the loop's own back edge may have rebound one of these locals
+/// since the peeled pass wrote it.
+fn emit_label_capture_restore(
+    sink: &mut PeepSink<'_, '_>,
+    label_resume: &LabelResumeData,
+    value_types: &ValueLocals,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
+    label: usize,
+) {
+    for &r in &label_resume.per_label[label] {
+        let storage = label_resume
+            .storage(r)
+            .expect("LABEL live-in has assigned capture storage");
+        sink.local_get(0);
+        sink.i64_load(mem64(label_resume.frame_offset(storage, frame)));
+        if value_types.ty(r.raw()) == ValType::F64 {
+            sink.f64_reinterpret_i64();
+        }
+        sink.local_set(value_types.local(r.raw()));
+        if let Some(h) = ref_homes.home(r) {
+            sink.local_get(0);
+            sink.local_get(value_types.local(r.raw()));
+            sink.i64_store(mem64(frame.home_slot_base + h as u64 * SLOT_SIZE));
+        }
+    }
 }
 
 fn emit_resolve(

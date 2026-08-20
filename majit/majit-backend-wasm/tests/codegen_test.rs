@@ -371,7 +371,10 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
     // (`inline_ok`). Inlining is the default and takes `exception_oserror_fields`,
     // so only the pair is a stable statement of "not declined".
     for (bench, compiled_counters) in [
-        ("exception_oserror_fields.py", &["BRIDGE_OK", "inline_ok"][..]),
+        (
+            "exception_oserror_fields.py",
+            &["BRIDGE_OK", "inline_ok"][..],
+        ),
         ("generator_tree_recursion.py", &["accepted_ca"][..]),
     ] {
         let script = root.join("pyre/bench/synth").join(bench);
@@ -2924,6 +2927,353 @@ fn test_registration_loop_stamps_label_block_id() {
         .getdescr()
         .and_then(|d| d.as_loop_target_descr().map(|t| t.label_block_id()));
     assert_eq!(recovered, Some(1));
+}
+
+/// Emitted `loop` count and entry-`br_table` arm count, the two things that say
+/// whether a module took the resume-`loop` shape.
+fn loop_and_br_table_shape(bytes: &[u8]) -> (usize, Vec<usize>) {
+    let mut loops = 0usize;
+    let mut tables = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                match operators.read().unwrap() {
+                    wasmparser::Operator::Loop { .. } => loops += 1,
+                    wasmparser::Operator::BrTable { targets } => {
+                        tables.push(targets.len() as usize)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (loops, tables)
+}
+
+/// A two-label peeled owner (`preamble; LABEL0; segment; LABEL1(header); body;
+/// JUMP->LABEL1`) with one inlined region, whose closing JUMP names `which`.
+fn build_owner_with_region_closing_at(
+    which: usize,
+) -> Result<Vec<u8>, majit_backend::BackendError> {
+    let descr0 = majit_ir::make_loop_target_descr(10, false);
+    let descr1 = majit_ir::make_loop_target_descr(11, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1.clone());
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(100)],
+            OpRef::int_op(4),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(4)], &[OpRef::int_op(3)]),
+        jump,
+    ];
+    // Both LABELs precede the header, so both are resume points.
+    assert!(codegen::is_resumable_peeled(&ops));
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+
+    let region_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_jump.setdescr(if which == 0 { descr0 } else { descr1 });
+    let region_ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(10), OpRef::const_int(1)],
+            OpRef::int_op(11),
+        ),
+        region_jump,
+    ];
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            trace_id: 1,
+            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            ops: region_ops,
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    codegen::build_wasm_module(&inputs).map(|(bytes, _, _)| bytes)
+}
+
+/// A region closing at the loop HEADER `br`s to the `loop`, the long-standing
+/// shape: one `loop`, and the entry `br_table` keeps its one arm per label plus
+/// the fresh-entry bucket.
+#[test]
+fn region_closing_at_the_header_keeps_the_single_loop_shape() {
+    let bytes = build_owner_with_region_closing_at(1).expect("header-closing region merges");
+    validate_wasm(&bytes);
+    let (loops, tables) = loop_and_br_table_shape(&bytes);
+    assert_eq!(loops, 1, "only the loop header opens a `loop`");
+    assert_eq!(
+        tables,
+        vec![3],
+        "entry br_table: key 0 plus one arm per label"
+    );
+}
+
+/// A region closing at a NON-header LABEL cannot `br` to the `loop` — that
+/// would skip the segment between its label and the header. It re-enters the
+/// entry dispatch instead, so the module grows a second `loop` around that
+/// dispatch and a second `br_table` bucket per label (`num_labels + 1 + j`,
+/// landing past label j's resume loader with the args already in locals).
+#[test]
+fn region_closing_at_a_non_header_label_wraps_the_dispatch_in_a_loop() {
+    let bytes = build_owner_with_region_closing_at(0).expect("non-header region merges");
+    validate_wasm(&bytes);
+    let (loops, tables) = loop_and_br_table_shape(&bytes);
+    assert_eq!(loops, 2, "the resume `loop` wraps the entry dispatch");
+    assert_eq!(
+        tables,
+        vec![5],
+        "entry br_table: key 0, one loader arm per label, one past-loader arm per label"
+    );
+}
+
+/// Execute a two-label peeled loop whose inlined region closes at the NON-header
+/// LABEL, and report the three values the exit guard spills. The region's
+/// re-entry must land at label 0 and then run the segment between label 0 and
+/// the header, exactly as an out-of-line bridge resuming at key 1 would.
+///
+///   preamble  v1 = v0 + 1
+///   LABEL0    [v1]
+///   segment   v2 = v1 + 1
+///   LABEL1    [v2]                     <- header, the `loop`
+///   body      v3 = v2 + 1
+///             guard v3 > 10            <- fail 0, the region
+///             guard v3 < 1000          <- fail 1, exits with [v3, v2, v1]
+///             JUMP -> LABEL1 [v3]
+///   region    v11 = v10 + 5000; JUMP -> LABEL0 [v11]
+///
+/// v0 = 0 makes v3 = 3, so the first guard fails into the region, which
+/// re-enters at LABEL0 with 5003. The segment then makes v2 = 5004 and the body
+/// v3 = 5005, which passes the first guard and fails the second.
+#[test]
+fn region_closing_at_a_non_header_label_reenters_and_runs_the_segment() {
+    assert_eq!(run_non_header_region_repro(false), (5005, 5004, 5003));
+}
+
+/// The same trace with a Ref label arg carried through both LABELs and rebound
+/// by the region's JUMP, so the region's back edge has to refresh a Ref home
+/// exactly as the resume loader does.
+#[test]
+fn region_closing_at_a_non_header_label_carries_a_ref_label_arg() {
+    assert_eq!(run_non_header_region_repro(true), (5005, 5004, 5003));
+}
+
+fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
+    let descr0 = majit_ir::make_loop_target_descr(20, false);
+    let descr1 = majit_ir::make_loop_target_descr(21, false);
+
+    // v6 is a Ref inputarg threaded through both LABELs unchanged.
+    let (label0_args, label1_args, jump_args, region_jump_args) = if with_ref {
+        (
+            vec![rb(OpRef::int_op(1)), rb(OpRef::ref_op(6))],
+            vec![rb(OpRef::int_op(2)), rb(OpRef::ref_op(6))],
+            vec![rb(OpRef::int_op(3)), rb(OpRef::ref_op(6))],
+            vec![rb(OpRef::int_op(11)), rb(OpRef::ref_op(12))],
+        )
+    } else {
+        (
+            vec![rb(OpRef::int_op(1))],
+            vec![rb(OpRef::int_op(2))],
+            vec![rb(OpRef::int_op(3))],
+            vec![rb(OpRef::int_op(11))],
+        )
+    };
+    let label0 = Op::new(OpCode::Label, &label0_args);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &label1_args);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &jump_args);
+    jump.setdescr(descr1);
+
+    let region_failargs: Vec<_> = if with_ref {
+        vec![OpRef::int_op(3), OpRef::ref_op(6)]
+    } else {
+        vec![OpRef::int_op(3)]
+    };
+    let guard_to_region = make_guard(OpCode::GuardTrue, &[OpRef::int_op(4)], &region_failargs);
+    let guard_exit = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(5)],
+        &[OpRef::int_op(3), OpRef::int_op(2), OpRef::int_op(1)],
+    );
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(3), OpRef::const_int(10)],
+            OpRef::int_op(4),
+        ),
+        guard_to_region,
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(1000)],
+            OpRef::int_op(5),
+        ),
+        guard_exit,
+        jump,
+    ];
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+
+    let region_jump = Op::new(OpCode::Jump, &region_jump_args);
+    region_jump.setdescr(descr0);
+    let mut region_ops = vec![make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+        OpRef::int_op(11),
+    )];
+    if with_ref {
+        // The region rebinds the Ref label arg to its own live-in copy, so the
+        // back edge must move it AND refresh its home.
+        region_ops.push(make_op(
+            OpCode::SameAsR,
+            &[OpRef::ref_op(13)],
+            OpRef::ref_op(12),
+        ));
+    }
+    region_ops.push(region_jump);
+
+    let mut inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    if with_ref {
+        inputargs.push(InputArg::from_type(Type::Ref, 6));
+    }
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            trace_id: 1,
+            inputargs: if with_ref {
+                vec![
+                    InputArg::from_type(Type::Int, 10),
+                    InputArg::from_type(Type::Ref, 13),
+                ]
+            } else {
+                vec![InputArg::from_type(Type::Int, 10)]
+            },
+            ops: region_ops,
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("non-header region merges");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let read = |off: u64| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, off as usize, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    assert_eq!(read(0), 1, "the second guard is the one that exits");
+    (
+        read(codegen::FRAME_SLOT_BASE),
+        read(codegen::FRAME_SLOT_BASE + 8),
+        read(codegen::FRAME_SLOT_BASE + 16),
+    )
 }
 
 /// Collect every `i32.const` / `i64.const` immediate in the emitted body, so a
