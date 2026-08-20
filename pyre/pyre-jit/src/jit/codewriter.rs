@@ -1142,11 +1142,9 @@ fn fresh_variable_for_state(
 /// `for i, v in enumerate(link.args): self._try_coalesce(v,
 /// link.target.inputargs[i])`).  Returns Variable pairs directly,
 /// matching upstream's `_try_coalesce(v1, v2)` Variable-direct
-/// shape.  Slot projection (where required by pyre's u16-keyed
-/// SSARepr regalloc) happens at the consumer.
+/// shape.
 ///
-/// Filter: only Ref-kind pairs are emitted, matching the per-kind
-/// gate inside `allocate_registers` (`regalloc.rs`).  Every
+/// Filter: only Ref-kind pairs are emitted.  Every
 /// `FrameState.mergeable()` position in pyre holds a Ref-kind
 /// Variable (locals, stack, last_exc pair), so Int / Float kinds
 /// never produce CFG pairs in practice.
@@ -5760,11 +5758,10 @@ fn decode_exception_catch_sites(
 // `Option<Vec<u8>>` to flag the 256-register cap is gone. The cap is
 // now enforced by `majit_translate::liveness::encode_liveness`'s
 // `assert!(char_ < 256)` (RPython `liveness.py:147-166` parity), and
-// the post-pass register allocator
-// (`super::regalloc::allocate_registers`) compresses the indices so
-// the cap fires only on pathological functions whose `nlocals` alone
-// exceeds 256 — the same condition that crashes the RPython
-// translator.
+// the chordal coloring (`super::regalloc::perform_register_allocation`)
+// compresses the indices so the cap fires only on pathological functions
+// whose `nlocals` alone exceeds 256 — the same condition that crashes
+// the RPython translator.
 
 // ---------------------------------------------------------------------------
 // RPython: codewriter/codewriter.py — class CodeWriter
@@ -6016,15 +6013,15 @@ impl CodeWriter {
         // (flatten.rs:`SSARepr::fresh_var`) to claim a unique pre-regalloc
         // slot above `scratch_int_base`. Non-overlapping arm Variables
         // coalesce into the same post-coloring color via the chordal
-        // allocator (`regalloc::allocate_registers`); overlapping ranges
-        // get distinct colors. The single SSARepr counter replaces the
+        // allocator (`regalloc::perform_register_allocation`); overlapping
+        // ranges get distinct colors. The single SSARepr counter replaces the
         // earlier `next_scratch_int_slot` local — fresh_var is now the
         // sole int-bank scratch source.
         let scratch_int_base: u16 = 1;
         // `interp_jit.py:64` portal red `(frame, ec)` registers — pre-regalloc
         // placeholder slots in the conflated Ref index space. Their final
-        // post-regalloc colors are looked up from `alloc_result.rename` after
-        // `apply_rename` runs. Slot `+10` was the dedicated
+        // post-regalloc colors are read from the splice coloring of the
+        // `frame`/`ec` Variables further down. Slot `+10` was the dedicated
         // `null_ref_reg` PY_NULL holder before null_ref_reg retirement retired it; the
         // portal red regs keep their numerical positions so layout-sensitive
         // tests stay stable.
@@ -6035,8 +6032,8 @@ impl CodeWriter {
         // from this counter instead of sharing the historical
         // `obj_tmp0`/`obj_tmp1` fixed slots.  Non-overlapping handler-arm
         // live ranges let the chordal coloring in
-        // `regalloc::allocate_registers` (`regalloc.py:8-15`) coalesce
-        // distinct allocations into the same post-coloring color, while
+        // `regalloc::perform_register_allocation` (`regalloc.py:8-15`)
+        // coalesce distinct allocations into the same post-coloring color, while
         // killing the cross-arm conflated Variable that previously caused
         // scratch slots to appear "alive" at unrelated `-live-` markers.
         let scratch_ref_base: u16 = portal_ec_reg + 1;
@@ -14645,14 +14642,14 @@ impl CodeWriter {
 
         // The spliced body is ALREADY final-colored by `splice_regallocs`
         // (canonical graph-lifetime colors, post `enforce_input_args`).  A
-        // second SSA-side `allocate_registers` would impose a coloring whose
-        // `enforce_ssarepr_input_args` color-monotonicity invariant the
-        // canonical coloring need not satisfy, and whose recolor would desync
-        // the body from the resume maps and the live-marker kind split
-        // (`materialize_virtual_int` mismatch).  Adopt `splice_regallocs` as
-        // the sole authority: an identity rename (so `rename_lookup` below
-        // returns each slot's canonical color unchanged) and `num_regs` from
-        // `splice_regallocs.num_colors`.  The same-slot coalescing in the
+        // second, SSARepr-keyed coloring pass would impose a color-ordering
+        // invariant the canonical coloring need not satisfy, and its recolor
+        // would desync the body from the resume maps and the live-marker kind
+        // split (`materialize_virtual_int` mismatch); the pass that did that
+        // is retired.  `splice_regallocs` is the sole authority: an identity
+        // rename (so `rename_lookup` below returns each slot's canonical
+        // color unchanged) and `num_regs` from `splice_regallocs.num_colors`.
+        // The same-slot coalescing in the
         // splice regalloc guarantees the dense per-slot resume maps built from
         // these colors are unambiguous.
         let alloc_result = super::regalloc::AllocationResult {

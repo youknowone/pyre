@@ -170,7 +170,7 @@ impl SSAReprEmitter {
     /// when the single-byte register/constant namespace cannot encode it.
     ///
     /// `num_regs` is the post-regalloc per-kind ceiling computed by
-    /// `super::regalloc::allocate_registers` from `max(color)+1`
+    /// `RegAllocator::find_num_colors` from `max(color)+1`
     /// (`codewriter.py:62-67`). Passing pre-regalloc builder values
     /// would over-allocate the `JitCode.num_regs_*` slots that
     /// `Assembler::emit_reg`'s 256-bound assertion (`assembler.py:73`)
