@@ -2915,10 +2915,9 @@ impl MiniMarkGC {
         self.nursery_surviving_size = 0;
         // `IncrementalMiniMarkGC._minor_collection`: pinning does not keep an
         // object alive. Rebuild the AddressStack and count from traced edges.
-        // pyre currently walks the complete root stacks on every minor, so the
-        // saved stopper decision is conservatively unused; keep the state with
-        // the collector, where upstream owns it.
-        let _any_pinned_object_from_earlier = self.any_pinned_object_kept;
+        // The flag sampled here is the previous minor's, which
+        // `collect_roots_in_nursery` turns into `use_jit_frame_stoppers`.
+        let any_pinned_object_from_earlier = self.any_pinned_object_kept;
         self.surviving_pinned_objects.clear();
         self.pinned_objects_in_nursery = 0;
         self.any_pinned_object_kept = false;
@@ -3069,9 +3068,18 @@ impl MiniMarkGC {
         // a minor collection (incminimark.py:339-344
         // `old_objects_pointing_to_young`); restored to the conservative
         // Major default right after.
-        crate::shadow_stack::set_extra_root_walk_kind(
-            crate::shadow_stack::ExtraRootWalkKind::Minor,
-        );
+        //
+        // `collect_roots_in_nursery` computes
+        // `use_jit_frame_stoppers = not any_pinned_object_from_earlier` and
+        // passes it as `is_minor`: a pinned object created before the previous
+        // minor is still in the nursery and was never promoted, so the skip
+        // would drop the only edge reaching it. Announce a full walk instead.
+        let extra_root_walk_kind = if any_pinned_object_from_earlier {
+            crate::shadow_stack::ExtraRootWalkKind::Major
+        } else {
+            crate::shadow_stack::ExtraRootWalkKind::Minor
+        };
+        crate::shadow_stack::set_extra_root_walk_kind(extra_root_walk_kind);
         let mut visit_extra_area = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
         };
