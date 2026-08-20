@@ -1042,36 +1042,20 @@ impl ExecutionContext {
     ///
     /// ```python
     /// def exception_trace(self, frame, operationerr):
-    ///     if self.w_tracefunc is not None:
-    ///         self._trace(frame, 'exception',
-    ///                     operationerr.get_w_value(self.space), operationerr)
+    ///     if self.gettrace() is not None:
+    ///         self._trace(frame, 'exception', None, operationerr)
     /// ```
     ///
-    /// `_trace` consumes the live `OperationError` (executioncontext.py:
-    /// 359-363) and mutates it in place via `normalize_exception`.
-    /// Pyre's pyopcode call site does not yet hand the live operr to
-    /// `exception_trace` — it forwards a `(w_type, w_value, w_traceback)`
-    /// triple — so this wrapper fabricates a temporary `OperationError`
-    /// whose lifetime spans the `_trace` call.  PyPy's `pyopcode.py:148
-    /// ec.exception_trace(self, operr)` passes the live caller-held
-    /// `operr`, but the post-call mutation is unobserved in pyre because
-    /// the temp falls out of scope here.  The OperationError
-    /// port (caller threads its live operr through) will close that gap.
+    /// `_trace` normalizes that same live carrier in place, so a tracing
+    /// callback and the subsequent handler search observe one exception value
+    /// rather than a reconstructed `(type, value, traceback)` snapshot.
     pub fn exception_trace(
         &mut self,
         frame: *mut PyFrame,
-        w_type: PyObjectRef,
-        w_value: PyObjectRef,
-        w_traceback: PyObjectRef,
+        operr: &mut crate::error::OperationError,
     ) -> Result<(), crate::PyError> {
         if !self.gettrace().is_null() {
-            let mut operr = crate::error::OperationError::new(w_type, w_value);
-            operr._application_traceback = if w_traceback.is_null() {
-                None
-            } else {
-                Some(w_traceback)
-            };
-            self._trace(frame, "exception", w_value, Some(&mut operr))?;
+            self._trace(frame, "exception", pyre_object::PY_NULL, Some(operr))?;
         }
         Ok(())
     }
@@ -1251,16 +1235,12 @@ impl ExecutionContext {
     /// `profilefunc` low-level trampoline (`app_profile_call` for
     /// `setprofile`-installed callbacks).
     ///
-    /// `operr` carries the live `OperationError` instance that
-    /// `executioncontext.py` reads via `operr.w_type`,
-    /// `operr.normalize_exception(space)`, and
-    /// `operr.get_w_traceback(space)`.  Pyre's `error::OperationError`
-    /// is the line-by-line port of `error.OperationError` (the same
-    /// `w_type` / `w_value` / `_application_traceback` shape).
-    /// Reading the fields here mirrors PyPy 1:1 — `operr.w_type` for
-    /// the type, `get_w_value(space)` for the (possibly-normalized)
-    /// value, `_application_traceback` for the traceback (or
-    /// `space.w_None` when absent).
+    /// `operr` is the live interpreter-level exception carrier — the argument
+    /// `executioncontext.py _trace` reads through `operr.w_type`,
+    /// `operr.normalize_exception(space)` and `operr.get_w_traceback(space)`.
+    /// The normalization below memoizes the application exception on that same
+    /// value; the class and traceback are then read from the normalized
+    /// `W_BaseException`, where pyre stores their authoritative state.
     pub fn _trace(
         &mut self,
         frame: *mut PyFrame,
@@ -1298,27 +1278,27 @@ impl ExecutionContext {
         };
 
         if !w_callback.is_null() && event != "leaveframe" {
-            // executioncontext.py:359-363:
+            // PyPy's `ExecutionContext._trace` exception-event branch:
             //   if operr is not None:
             //       w_value = operr.normalize_exception(space)
             //       w_arg = space.newtuple([operr.w_type, w_value,
             //                               operr.get_w_traceback(space)])
             //
-            // PyPy `normalize_exception` mutates the caller's operr in
-            // place (error.py:247 `self.w_type = w_type`); after the
-            // call `operr.w_type` is the normalized class.  Pyre takes
-            // `&mut OperationError` here so the same mutation reaches
-            // the caller's instance instead of a throw-away clone.
+            // Normalization mutates the caller's live carrier in place.
+            // Pyre's normalized value owns the authoritative class and
+            // traceback slots, so read both from it instead of rebuilding a
+            // second interpreter-level exception object.
             let w_arg = if let Some(operr) = operr {
                 let w_value = operr.normalize_exception(space)?;
-                let w_type = if operr.w_type.is_null() {
-                    crate::typedef::r#type(w_value).map_or_else(pyre_object::w_none, |p| p.as_ptr())
+                let w_type = crate::typedef::r#type(w_value)
+                    .map_or_else(pyre_object::w_none, |p| p.as_ptr());
+                let mut w_traceback =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(w_value) };
+                if w_traceback.is_null() {
+                    w_traceback = pyre_object::w_none();
                 } else {
-                    operr.w_type
-                };
-                let w_traceback = operr
-                    ._application_traceback
-                    .unwrap_or_else(pyre_object::w_none);
+                    unsafe { crate::pytraceback::mark_traceback_escaped(w_traceback) };
+                }
                 pyre_object::tupleobject::w_tuple_new(vec![w_type, w_value, w_traceback])
             } else {
                 w_arg

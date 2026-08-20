@@ -1920,27 +1920,18 @@ pub fn handle_exception_with_context(
         }
     }
     if err.attach_tb && !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
-        // `exception_trace` fabricates an `OperationError` whose
-        // `normalize_exception` follows the `raise inst` shape
-        // (error.py:238-245): the raised instance must sit in the
-        // `w_type` slot with a null value so the `(inst, None)` path
-        // derives the class.  Passing the instance as `w_value` with a
-        // null `w_type` makes `normalize_exception` take `w_inst = w_type`
-        // (null) and raise "exceptions must derive from BaseException".
-        let operr_obj = err.to_exc_object();
-        // `executioncontext.py:362` hands the tracer
-        // `operr.get_w_traceback(space)` — the slot read with its mark.
-        let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(operr_obj) };
-        unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
+        // `record_application_traceback` above allocates, so the frame address
+        // is re-read from the anchor rather than reused.
         let frame = unsafe { &mut *frame_anchor.live() };
-        if let Err(trace_err) = unsafe {
-            (*ec).exception_trace(frame as *mut PyFrame, operr_obj, pyre_object::PY_NULL, w_tb)
-        } {
-            // pyopcode.py `ec.exception_trace(self, operr)` is
-            // outside the except-block; a raise here propagates past
-            // unrollstack. Replace err and return `false` so the
-            // caller's `return Err(err)` surfaces the tracer error
-            // without searching for a handler for the original.
+        // `pyopcode.py handle_operation_error` calls
+        // `ec.exception_trace(self, operr)` with the live carrier, and
+        // `executioncontext.py exception_trace` normalizes it in place to
+        // build the `(w_type, w_value, w_traceback)` argument — including the
+        // traceback read, so the caller does not assemble one.
+        if let Err(trace_err) = unsafe { (*ec).exception_trace(frame as *mut PyFrame, err) } {
+            // The call sits outside the trace-ticker recovery block, so a tracer
+            // exception replaces the original error and propagates without
+            // searching this frame for a handler for the original.
             *err = trace_err;
             return false;
         }

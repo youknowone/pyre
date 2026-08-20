@@ -18304,7 +18304,7 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
         ));
     }
 
-    let mut operr = crate::error::OperationError::new(w_type, w_val);
+    let mut operr = crate::error::ExceptionNormalization::new(w_type, w_val);
     operr._application_traceback = traceback;
     let err = match operr.normalize_exception(w_none()) {
         Ok(w_value) => unsafe { PyError::from_exc_object(w_value) },

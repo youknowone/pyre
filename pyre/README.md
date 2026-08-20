@@ -30,7 +30,7 @@ Measured on Apple M-series, single core:
 | fib_recursive | 1.48s | 0.22s | 0.67s | 6.7x slower | 2.2x slower |
 | nbody | 0.31s | 0.15s | 1.50s | 2.1x slower | 4.8x faster |
 | fannkuch | 0.67s | 0.24s | 1.27s | 2.8x slower | 1.9x faster |
-| raise_catch | 0.11s | 0.12s | 3.32s | parity | 30.2x faster |
+| raise_catch | 0.79s | 0.71s | 35.26s | 1.1x slower | 44.6x faster |
 | spectral_norm | 0.05s | 0.04s | 1.12s | 1.3x slower | 22.4x faster |
 
 The JIT now fires on integer-, float-, and exception-heavy loops alike: nbody, fannkuch, spectral_norm, and raise_catch all JIT-compile (disabling the JIT makes nbody ~70x and spectral_norm ~500x slower). Most benchmarks land within ~1.5–3x of PyPy and several times faster than CPython. The clearest remaining gap is fib_recursive, where recursive call frames still cost more than in PyPy. Sub-0.2s timings carry significant run-to-run variance and are approximate.

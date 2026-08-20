@@ -9,8 +9,14 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::sync::OnceLock;
 
+/// Short-lived normalizer for the three-argument generator `throw` surface.
+///
+/// This is not an interpreter exception carrier: it only converts the legacy
+/// `(type, value, traceback)` input spelling into one application exception
+/// before evaluation resumes.  Live exception propagation uses
+/// [`OperationError`] below.
 #[derive(Debug, Clone)]
-pub struct OperationError {
+pub(crate) struct ExceptionNormalization {
     pub w_type: PyObjectRef,
     pub w_value: PyObjectRef,
     pub _application_traceback: Option<PyObjectRef>,
@@ -57,7 +63,7 @@ pub fn exception_object_matches_stop_async_iteration(exc_object: PyObjectRef) ->
     crate::eval::check_exc_match_against(exc_object, stop_async_iteration)
 }
 
-impl OperationError {
+impl ExceptionNormalization {
     pub fn new(w_type: PyObjectRef, w_value: PyObjectRef) -> Self {
         Self {
             w_type,
@@ -69,10 +75,6 @@ impl OperationError {
     pub fn get_w_value(&self, _space: PyObjectRef) -> PyObjectRef {
         let _ = _space;
         self.w_value
-    }
-
-    pub fn match_(&self, _space: PyObjectRef, _check: PyObjectRef) -> bool {
-        false
     }
 
     /// pypy/interpreter/error.py `normalize_exception`.
@@ -235,49 +237,6 @@ impl OperationError {
         }
         Ok(w_type)
     }
-
-    /// `pypy/interpreter/error.py chain_exceptions` parity:
-    ///
-    /// ```python
-    /// def chain_exceptions(self, space, context):
-    ///     w_value = self.normalize_exception(space)
-    ///     w_context = context.normalize_exception(space)
-    ///     if not space.is_w(w_value, w_context):
-    ///         if not isinstance(w_value, W_BaseException):
-    ///             raise oefmt(space.w_SystemError, "not an instance of Exception: %T", w_value)
-    ///         if w_value.w_context is None:
-    ///             _break_context_cycle(space, w_value, w_context)
-    ///             w_value.descr_setcontext(space, w_context)
-    /// ```
-    ///
-    /// Writes flow through the typed `w_context` slot on
-    /// `W_BaseException` (`pyre-object/src/interp_exceptions.rs`'s
-    /// `W_BaseException.w_context` class default).
-    pub fn chain_exceptions(
-        &mut self,
-        space: PyObjectRef,
-        context: &mut OperationError,
-    ) -> Result<(), PyError> {
-        let w_value = self.normalize_exception(space)?;
-        let w_context = context.normalize_exception(space)?;
-        if std::ptr::eq(w_value, w_context) {
-            return Ok(());
-        }
-        if !unsafe { pyre_object::is_exception(w_value) } {
-            return Err(PyError::new(
-                crate::PyErrorKind::SystemError,
-                "not an instance of Exception".to_string(),
-            ));
-        }
-        // `:432-434` — only set __context__ when it isn't already
-        // stamped; mirrors CPython's `_PyErr_ChainExceptions` precedent.
-        let existing = unsafe { pyre_object::interp_exceptions::w_exception_get_context(w_value) };
-        if existing.is_null() {
-            _break_context_cycle(w_value, w_context)?;
-            unsafe { pyre_object::interp_exceptions::w_exception_set_context(w_value, w_context) };
-        }
-        Ok(())
-    }
 }
 
 /// The TypeError raised when instantiating a raised exception class yields
@@ -382,26 +341,6 @@ pub fn chain_context(exc: PyObjectRef, active: PyObjectRef) {
     }
 }
 
-impl From<OperationError> for PyError {
-    fn from(value: OperationError) -> Self {
-        let message = if value.w_value.is_null() {
-            Wtf8Buf::new()
-        } else {
-            Wtf8Buf::from_string("operation error".to_string())
-        };
-        PyError {
-            kind: PyErrorKind::RuntimeError,
-            message,
-            exc_object: value.w_value,
-            attach_tb: true,
-            context_recorded: false,
-            reraise_lasti: -1,
-            w_name_context: std::ptr::null_mut(),
-            w_obj_context: std::ptr::null_mut(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ClearedOpErr;
 
@@ -476,6 +415,15 @@ pub struct PyError {
     /// Carried and applied alongside `w_name_context`; `PY_NULL` = unset.
     pub w_obj_context: PyObjectRef,
 }
+
+/// The one interpreter-level exception carrier, corresponding to
+/// `pypy.interpreter.error.OperationError`.
+///
+/// `PyError` remains the Rust-facing compatibility name used by existing
+/// `Result<T, PyError>` signatures and by the source translator; both names
+/// denote this same value and therefore cannot diverge in type, value,
+/// traceback, or context state.
+pub type OperationError = PyError;
 
 impl PyError {
     /// Forward the up-to-three GC-managed references a `PyError` holds — the
@@ -3340,7 +3288,7 @@ pub fn system_exit_code(err: &PyError) -> i32 {
 
 pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {
     let _ = _space;
-    OperationError::new(std::ptr::null_mut(), std::ptr::null_mut())
+    PyError::runtime_error("")
 }
 
 pub fn get_converted_unexpected_exception(
@@ -3348,7 +3296,7 @@ pub fn get_converted_unexpected_exception(
     _error: &dyn std::error::Error,
 ) -> OperationError {
     let _ = (_space, _error);
-    OperationError::new(std::ptr::null_mut(), std::ptr::null_mut())
+    PyError::runtime_error("")
 }
 
 pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
@@ -3390,9 +3338,9 @@ pub fn get_operr_class(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
 }
 
 pub fn oefmt(w_type: PyObjectRef, valuefmt: &str, _args: impl std::fmt::Display) -> OperationError {
-    let _ = valuefmt;
+    let _ = w_type;
     let _ = format!("{}", _args);
-    OperationError::new(w_type, std::ptr::null_mut())
+    PyError::runtime_error(valuefmt)
 }
 
 pub fn debug_print(text: &str, file: Option<&mut dyn Write>, _newline: bool) {
@@ -3406,13 +3354,13 @@ pub fn exception_from_errno(
     w_type: PyObjectRef,
     _errno: i32,
 ) -> OperationError {
-    let _ = _space;
-    OperationError::new(w_type, std::ptr::null_mut())
+    let _ = (_space, w_type);
+    PyError::os_error_with_errno(_errno, "")
 }
 
 pub fn exception_from_saved_errno(_space: PyObjectRef, w_type: PyObjectRef) -> OperationError {
-    let _ = _space;
-    OperationError::new(w_type, std::ptr::null_mut())
+    let _ = (_space, w_type);
+    PyError::os_error("")
 }
 
 pub fn new_exception_class(
@@ -3433,7 +3381,7 @@ pub fn wrap_oserror2(
 ) -> OperationError {
     let _ = (_filename, _exception_class, _error);
     let _ = _space;
-    OperationError::new(std::ptr::null_mut(), std::ptr::null_mut())
+    PyError::os_error("")
 }
 
 pub fn wrap_oserror(
