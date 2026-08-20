@@ -4726,13 +4726,34 @@ fn build_function(
                 );
                 guard_idx += 1;
             }
-            OpCode::GuardFutureCondition | OpCode::GuardAlwaysFails => {
-                // GuardAlwaysFails always exits. This arm writes neither the
-                // fail args nor `frame[0]`, so it keeps branching to the shared
-                // epilogue — giving it the ordinary guard spill would change
-                // what the exit reports, not just how it gets there. The
-                // epilogue takes a cell address when bridge dispatch is on;
-                // otherwise retain the unused index write unchanged.
+            OpCode::GuardAlwaysFails => {
+                // This guard always exits, and what it exits INTO is the
+                // interpreter: it is the cut a segmented trace ends with
+                // (`rewrite.py:419-426` lowers it to `GUARD_VALUE(SAME_AS_I(0),
+                // 1)` for the backends that run the GC rewrite, so those reach
+                // the ordinary GUARD_VALUE path). This backend does not run
+                // that rewrite, so the raw opcode arrives here and has to
+                // publish its own fail args — the resume rebuilds the frame
+                // from them, and an exit that writes none leaves the
+                // interpreter reading whatever the slots last held.
+                emit_guard_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                    guard_dispatch,
+                );
+                guard_idx += 1;
+            }
+            OpCode::GuardFutureCondition => {
+                // This arm writes neither the fail args nor `frame[0]`, so it
+                // keeps branching to the shared epilogue — giving it the
+                // ordinary guard spill would change what the exit reports, not
+                // just how it gets there. The epilogue takes a cell address
+                // when bridge dispatch is on; otherwise retain the unused index
+                // write unchanged.
                 if !guard_dispatch.param_type_indices.is_empty() {
                     emit_guard_param_tail_call(
                         &mut sink,
