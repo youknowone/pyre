@@ -1775,6 +1775,14 @@ pub fn handle_exception_with_context(
     // tracing hooks are skipped per `:91-94`.  Pyre carries the same
     // intent via `PyError.attach_tb` set by `eval.rs::reraise`.
     let ec = frame.execution_context as *mut crate::PyExecutionContext;
+    // Everything below allocates before it touches the frame again:
+    // `to_exc_object` materialises the exception, `chain_context` builds the
+    // `__context__` link, the trace hooks run arbitrary Python and
+    // `record_application_traceback` allocates a `PyTraceback`.  A frame the
+    // JIT built is a nursery object (`emit_new_pyframe_inline_with_params`),
+    // so `frame` names the abandoned copy after any of them collect.  Anchor it
+    // once and re-read at each point the frame is next used.
+    let frame_anchor = FrameAnchor::new(frame);
     let exc_obj = err.to_exc_object();
     if err.exc_object.is_null() {
         err.exc_object = exc_obj;
@@ -1797,6 +1805,7 @@ pub fn handle_exception_with_context(
         crate::error::chain_context(err.exc_object, active);
         err.context_recorded = true;
     }
+    let frame = unsafe { &mut *frame_anchor.live() };
     if err.attach_tb {
         if !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
             // The materialized exception is old-gen managed but lives only in the
@@ -1811,6 +1820,9 @@ pub fn handle_exception_with_context(
             }
             let after_exc_result =
                 unsafe { (*ec).bytecode_trace_after_exception(frame as *mut PyFrame) };
+            // The hook ran application code; restore the slot on the frame that
+            // survived it.
+            let frame = unsafe { &mut *frame_anchor.live() };
             if !saved_trace.is_null() {
                 frame.getorcreatedebug(-1).w_f_trace = saved_trace;
             }
@@ -1832,6 +1844,9 @@ pub fn handle_exception_with_context(
         // `pyopcode.py:147-148 pytraceback.record_application_traceback`
         // — prepends a `PyTraceback` wrapping the current frame onto
         // the exception's `w_traceback` chain.
+        // `w_pytraceback_new` copies this pointer into the node it allocates,
+        // so it has to be the address the frame has now.
+        let frame = unsafe { &mut *frame_anchor.live() };
         unsafe {
             crate::pytraceback::record_application_traceback(
                 operr_obj,
@@ -1853,6 +1868,7 @@ pub fn handle_exception_with_context(
         // `operr.get_w_traceback(space)` — the slot read with its mark.
         let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(operr_obj) };
         unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
+        let frame = unsafe { &mut *frame_anchor.live() };
         if let Err(trace_err) = unsafe {
             (*ec).exception_trace(frame as *mut PyFrame, operr_obj, pyre_object::PY_NULL, w_tb)
         } {
@@ -1872,6 +1888,10 @@ pub fn handle_exception_with_context(
     // records its own traceback entry — mirroring the special-exception being
     // unwrapped to a plain OperationError after one frame.
     err.attach_tb = true;
+    // `record_application_traceback` and `exception_trace` above both allocate;
+    // `pycode` is read off the frame, so a stale frame yields a stale code
+    // object as well as a stale value stack.
+    let frame = unsafe { &mut *frame_anchor.live() };
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
     // pyre's `last_instr` is a rustpython code-unit index; the PyPy-shaped
     // `lookup_exceptiontable` lookup takes byte offsets, so multiply by 2.
@@ -1928,6 +1948,9 @@ pub fn handle_exception_with_context(
         // here so a re-thrown PyError does not double-consume.
         err.reraise_lasti = -1;
         let exc_obj = err.to_exc_object();
+        // Same shape as `opcode_build_list`: materialise, then push. The push
+        // has to land on the frame the materialisation left live.
+        let frame = unsafe { &mut *frame_anchor.live() };
         frame.push(exc_obj);
         // The decoded `target` is a byte offset; pyre's `next_instr` is a
         // code-unit index, so divide by 2.
@@ -3508,13 +3531,13 @@ impl OpcodeStepExecutor for PyFrame {
         let val = locals_w!(self)[i_val];
         let exit_self = locals_w!(self)[i_self];
         let exit_func = locals_w!(self)[i_func];
+        let anchor = FrameAnchor::new(self);
         let res = with_except_start_values(exit_func, exit_self, val);
         if res.is_null() {
             return Err(crate::call::take_call_error()
                 .unwrap_or_else(|| crate::PyError::type_error("__exit__ failed")));
         }
-        self.push(res);
-        Ok(())
+        Self::push_anchored(&anchor, res)
     }
 
     // ── LoadCommonConstant ──
@@ -3777,11 +3800,11 @@ impl OpcodeStepExecutor for PyFrame {
         // Stack: [strings, interpolations] (two tuples the compiler split).
         let interpolations = self.pop();
         let strings = self.pop();
+        let anchor = FrameAnchor::new(self);
         let module = self.import_module("_template")?;
         let func = getattr_str(module, "_build_template")?;
         let result = call_callable(self, func, &[strings, interpolations])?;
-        self.push(result);
-        Ok(())
+        Self::push_anchored(&anchor, result)
     }
 
     fn build_interpolation_op(
@@ -3799,6 +3822,7 @@ impl OpcodeStepExecutor for PyFrame {
         let expression = self.pop();
         let value = self.pop();
         let conversion_obj = pyre_object::w_int_new(conversion as i64);
+        let anchor = FrameAnchor::new(self);
         let module = self.import_module("_template")?;
         let func = getattr_str(module, "_build_interpolation")?;
         let result = call_callable(
@@ -3806,25 +3830,25 @@ impl OpcodeStepExecutor for PyFrame {
             func,
             &[value, expression, conversion_obj, format_spec],
         )?;
-        self.push(result);
-        Ok(())
+        Self::push_anchored(&anchor, result)
     }
 
     fn import_name(&mut self, name: &str) -> Result<(), PyError> {
         let w_fromlist = self.pop();
         let w_flag = self.pop();
+        let anchor = FrameAnchor::new(self);
         let w_obj = crate::importing::import_name(self, name, w_fromlist, w_flag)?;
-        self.push(w_obj);
-        Ok(())
+        Self::push_anchored(&anchor, w_obj)
     }
 
     // PyPy: pyopcode.py IMPORT_FROM
     // Stack: [module] → peek module, push getattr(module, name)
     fn import_from(&mut self, name: &str) -> Result<(), PyError> {
         let module = self.peek();
-        let attr = crate::importing::import_from(module, name, self.execution_context)?;
-        self.push(attr);
-        Ok(())
+        let ec = self.execution_context;
+        let anchor = FrameAnchor::new(self);
+        let attr = crate::importing::import_from(module, name, ec)?;
+        Self::push_anchored(&anchor, attr)
     }
 
     // ── ContainsOp (in / not in) ──
@@ -3834,13 +3858,13 @@ impl OpcodeStepExecutor for PyFrame {
         // CPython 3.13: TOS = container, TOS1 = item
         let haystack = self.pop();
         let needle = self.pop();
+        let anchor = FrameAnchor::new(self);
         let result = crate::baseobjspace::contains(haystack, needle)?;
         let inverted = match invert {
             crate::bytecode::Invert::No => result,
             crate::bytecode::Invert::Yes => !result,
         };
-        self.push(pyre_object::w_bool_from(inverted));
-        Ok(())
+        Self::push_anchored(&anchor, pyre_object::w_bool_from(inverted))
     }
 
     // ── IsOp (is / is not) ──
@@ -3866,9 +3890,9 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn to_bool(&mut self) -> Result<(), PyError> {
         let val = self.pop();
+        let anchor = FrameAnchor::new(self);
         let truth = crate::baseobjspace::is_true(val)?;
-        self.push(pyre_object::w_bool_from(truth));
-        Ok(())
+        Self::push_anchored(&anchor, pyre_object::w_bool_from(truth))
     }
 
     // ── DeleteSubscr ──
@@ -3903,9 +3927,9 @@ impl OpcodeStepExecutor for PyFrame {
         let val = self.pop();
         // `f'{x}'` → `PyObject_Format(x, NULL)`; a user `__format__` is
         // invoked with an empty spec, otherwise this is `str(value)`.
+        let anchor = FrameAnchor::new(self);
         let s = crate::runtime_ops::format_value(val, pyre_object::PY_NULL)?;
-        self.push(s);
-        Ok(())
+        Self::push_anchored(&anchor, s)
     }
 
     // ── FormatWithSpec (format(TOS1, TOS)) ──
@@ -3917,9 +3941,9 @@ impl OpcodeStepExecutor for PyFrame {
         // (empty spec → `str(value)`).  `runtime_ops::format_value` keeps
         // f-string `{n:08.3f}` and `"{:08.3f}".format(n)` identical, and
         // reads a non-`str`/non-UTF-8 spec as empty rather than panicking.
+        let anchor = FrameAnchor::new(self);
         let s = crate::runtime_ops::format_value(val, spec)?;
-        self.push(s);
-        Ok(())
+        Self::push_anchored(&anchor, s)
     }
 
     // ── ConvertValue (repr/str/ascii conversion) ──
@@ -3931,8 +3955,9 @@ impl OpcodeStepExecutor for PyFrame {
         // the path the `'%s' % x` → CONVERT_VALUE/FORMAT_SIMPLE compile
         // rewrite takes.
         let code = crate::runtime_ops::convert_value_code(conv);
-        self.push(crate::runtime_ops::convert_value(val, code)?);
-        Ok(())
+        let anchor = FrameAnchor::new(self);
+        let converted = crate::runtime_ops::convert_value(val, code)?;
+        Self::push_anchored(&anchor, converted)
     }
 
     // ── CopyFreeVars ──
@@ -4071,13 +4096,14 @@ impl OpcodeStepExecutor for PyFrame {
         let exc_type = self.pop();
         validate_check_eg_match_class(exc_type)?;
         let exc_value = self.pop();
+        let anchor = FrameAnchor::new(self);
         let (matching, rest) = if unsafe { pyre_object::is_none(exc_value) } {
             (pyre_object::w_none(), pyre_object::w_none())
         } else {
             crate::builtins::exception_group_match(exc_value, exc_type)?
         };
-        self.push(rest);
-        self.push(matching);
+        Self::push_anchored(&anchor, rest)?;
+        Self::push_anchored(&anchor, matching)?;
         if !unsafe { pyre_object::is_none(matching) } {
             set_current_exception(matching);
         }
@@ -4157,18 +4183,17 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_from_dict_or_globals(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
         let mapping = self.pop();
         let key = pyre_object::w_str_new(name);
+        let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(mapping, key) {
             Ok(value) => {
-                self.push(value);
-                return Ok(());
+                return Self::push_anchored(&anchor, value);
             }
             Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {}
             Err(err) => return Err(err),
         }
 
-        let value = self.load_global_value(name, nameindex)?;
-        self.push(value);
-        Ok(())
+        let value = unsafe { &mut *anchor.live() }.load_global_value(name, nameindex)?;
+        Self::push_anchored(&anchor, value)
     }
 
     // ── LoadFromDictOrDeref ──
@@ -4178,44 +4203,45 @@ impl OpcodeStepExecutor for PyFrame {
     fn load_from_dict_or_deref(&mut self, idx: usize, name: &str) -> Result<(), PyError> {
         let mapping = self.pop();
         let key = pyre_object::w_str_new(name);
+        let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(mapping, key) {
             Ok(value) => {
-                self.push(value);
-                return Ok(());
+                return Self::push_anchored(&anchor, value);
             }
             Err(err) if matches!(err.kind, PyErrorKind::KeyError) => {}
             Err(err) => return Err(err),
         }
+        // `getitem` may have run a `__getitem__`; everything below reads the
+        // frame's own code object, globals and cells.
+        let self_ = unsafe { &mut *anchor.live() };
         // CPython 3.14 addresses the outer `__class__` freevar in the
         // class-cell collision. The pinned compiler encodes the implicit
         // method cell instead; if no outer cell exists, it emits this opcode
         // where CPython uses LOAD_NAME, so preserve globals/builtins fallback.
-        let deref_idx = if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            match crate::pyframe::class_scope_outer_class_freevar(self.code()) {
+        let deref_idx = if crate::pyframe::class_scope_class_deref_is_name(self_.code(), idx) {
+            match crate::pyframe::class_scope_outer_class_freevar(self_.code()) {
                 Some(free_idx) => free_idx,
                 None => {
                     // This deref name has no `co_names` index, so do the
                     // uncached LOAD_NAME fallback directly rather than
                     // corrupting an unrelated per-code LOAD_GLOBAL cache slot.
-                    let w_globals = self.get_w_globals();
+                    let w_globals = self_.get_w_globals();
                     if !w_globals.is_null()
                         && let Some(value) = unsafe {
                             pyre_object::dictmultiobject::w_dict_getitem_str(w_globals, name)
                         }
                     {
-                        self.push(value);
-                        return Ok(());
+                        return Self::push_anchored(&anchor, value);
                     }
                     // `self.get_builtin()`, not the `builtin` field — see
                     // `load_global_value`.
-                    let w_builtin = self.get_builtin();
+                    let w_builtin = self_.get_builtin();
                     if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
                         let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
                         if !w_dict.is_null()
                             && let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)?
                         {
-                            self.push(value);
-                            return Ok(());
+                            return Self::push_anchored(&anchor, value);
                         }
                     }
                     return Err(PyError::name_error_with_name(
@@ -4227,17 +4253,17 @@ impl OpcodeStepExecutor for PyFrame {
         } else {
             idx
         };
-        let slot = locals_w!(self)[deref_idx];
+        let self_ = unsafe { &mut *anchor.live() };
+        let slot = locals_w!(self_)[deref_idx];
         let value = if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
             unsafe { pyre_object::w_cell_get(slot) }
         } else {
             slot
         };
         if value == PY_NULL {
-            return Err(crate::pyframe::deref_unbound_error(self.code(), deref_idx));
+            return Err(crate::pyframe::deref_unbound_error(self_.code(), deref_idx));
         }
-        self.push(value);
-        Ok(())
+        Self::push_anchored(&anchor, value)
     }
 
     // ── GetLen ──
@@ -4265,9 +4291,9 @@ impl OpcodeStepExecutor for PyFrame {
     fn match_keys(&mut self) -> Result<(), PyError> {
         let keys = PyFrame::peek_at(self, 0);
         let subject = PyFrame::peek_at(self, 1);
+        let anchor = FrameAnchor::new(self);
         let result = crate::opcode_ops::match_keys_value(subject, keys)?;
-        self.push(result);
-        Ok(())
+        Self::push_anchored(&anchor, result)
     }
 
     // MATCH_CLASS count: STACK[-1] = keyword attr-name tuple, STACK[-2] = class,
@@ -4277,9 +4303,9 @@ impl OpcodeStepExecutor for PyFrame {
         let kwd_attrs = self.pop();
         let cls = self.pop();
         let subject = self.pop();
+        let anchor = FrameAnchor::new(self);
         let result = crate::opcode_ops::match_class_value(subject, cls, kwd_attrs, count)?;
-        self.push(result);
-        Ok(())
+        Self::push_anchored(&anchor, result)
     }
 
     // ── LoadFastAndClear (comprehension scope) ──
@@ -4298,9 +4324,9 @@ impl OpcodeStepExecutor for PyFrame {
             items.push(self.pop());
         }
         items.reverse();
+        let anchor = FrameAnchor::new(self);
         let set_obj = crate::builtins::builtin_set_from_items(&items)?;
-        self.push(set_obj);
-        Ok(())
+        Self::push_anchored(&anchor, set_obj)
     }
 
     // ── DictUpdate ──
@@ -4457,9 +4483,9 @@ impl OpcodeStepExecutor for PyFrame {
     // `self.get_builtin().getdictvalue('__build_class__')`.  Python 3.14
     // reports a NameError when the selected builtin mapping has no entry.
     fn load_build_class(&mut self) -> Result<(), PyError> {
+        let anchor = FrameAnchor::new(self);
         let bc = self.load_build_class_value()?;
-        self.push(bc);
-        Ok(())
+        Self::push_anchored(&anchor, bc)
     }
 
     fn load_build_class_value(&mut self) -> Result<PyObjectRef, PyError> {
@@ -4486,6 +4512,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── yield from / send ──
     fn get_yield_from_iter(&mut self) -> Result<(), PyError> {
         let iterable = self.pop();
+        let anchor = FrameAnchor::new(self);
         // CPython 3.14 `GET_YIELD_FROM_ITER` / PyPy's coroutine-aware
         // `YIELD_FROM`: exact generators already are their iterator.  A
         // native coroutine is also sent to directly, but only when the
@@ -4510,13 +4537,13 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::baseobjspace::iter(iterable)?
             }
         };
-        self.push(iter);
-        Ok(())
+        Self::push_anchored(&anchor, iter)
     }
 
     fn send_value(&mut self, target: usize) -> Result<(), PyError> {
         let value = self.pop();
         let iter = self.peek();
+        let anchor = FrameAnchor::new(self);
         let result = if unsafe { pyre_object::is_none(value) } {
             // generator.py / pyopcode.py `next_yield_from`: coroutine
             // objects are not public iterators, but the interpreter's SEND
@@ -4533,16 +4560,17 @@ impl OpcodeStepExecutor for PyFrame {
         };
         match result {
             Ok(result) => {
-                self.w_yielding_from = iter;
-                if pyre_object::gc_hook::try_gc_owns_object(self as *mut PyFrame as *mut u8) {
-                    pyre_object::gc_hook::try_gc_write_barrier(self as *mut PyFrame as *mut u8);
+                let frame = unsafe { &mut *anchor.live() };
+                frame.w_yielding_from = iter;
+                if pyre_object::gc_hook::try_gc_owns_object(frame as *mut PyFrame as *mut u8) {
+                    pyre_object::gc_hook::try_gc_write_barrier(frame as *mut PyFrame as *mut u8);
                 }
-                self.push(result);
-                Ok(())
+                Self::push_anchored(&anchor, result)
             }
             Err(e) if e.matches_stop_iteration() => {
-                if std::ptr::eq(self.w_yielding_from, iter) {
-                    self.w_yielding_from = pyre_object::PY_NULL;
+                let frame = unsafe { &mut *anchor.live() };
+                if std::ptr::eq(frame.w_yielding_from, iter) {
+                    frame.w_yielding_from = pyre_object::PY_NULL;
                 }
                 // `pypy/interpreter/pyopcode.py:1158-1166 next_yield_from`:
                 //     try:
@@ -4566,8 +4594,8 @@ impl OpcodeStepExecutor for PyFrame {
                 } else {
                     pyre_object::w_none()
                 };
-                self.push(value);
-                self.set_last_instr_from_next_instr(target);
+                Self::push_anchored(&anchor, value)?;
+                unsafe { &mut *anchor.live() }.set_last_instr_from_next_instr(target);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -4584,18 +4612,19 @@ impl OpcodeStepExecutor for PyFrame {
     fn get_awaitable(&mut self, context: u32) -> Result<(), PyError> {
         // pyopcode.py:1599 GET_AWAITABLE.
         let w_iterable = self.pop();
+        let anchor = FrameAnchor::new(self);
         let w_iter = crate::baseobjspace::get_awaitable_iter(w_iterable, context)?;
         // pyopcode.py:1604 guards a coroutine that is already being awaited
         // (`w_iter.get_delegate() is not None`) with RuntimeError.  pyre's
         // generator object has no delegate / `w_yielded_from` field, so the
         // reentrant-await case is instead caught at SEND by the generator
         // `running` flag.
-        self.push(w_iter);
-        Ok(())
+        Self::push_anchored(&anchor, w_iter)
     }
 
     fn get_aiter(&mut self) -> Result<(), PyError> {
         let obj = self.pop();
+        let anchor = FrameAnchor::new(self);
         let method =
             unsafe { crate::baseobjspace::lookup_special(obj, "__aiter__")? }.ok_or_else(|| {
                 crate::PyError::type_error(format!(
@@ -4610,12 +4639,12 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::type_methods::arg_type_name(iter)
             )));
         }
-        self.push(iter);
-        Ok(())
+        Self::push_anchored(&anchor, iter)
     }
 
     fn get_anext(&mut self) -> Result<(), PyError> {
         let iter = self.peek();
+        let anchor = FrameAnchor::new(self);
         let method = unsafe { crate::baseobjspace::lookup_special(iter, "__anext__")? }
             .ok_or_else(|| {
                 crate::PyError::type_error(format!(
@@ -4649,8 +4678,7 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::PyError::from_exc_object(error_obj)
             }
         })?;
-        self.push(awaitable);
-        Ok(())
+        Self::push_anchored(&anchor, awaitable)
     }
 
     fn end_async_for(&mut self) -> Result<(), PyError> {
@@ -4695,6 +4723,7 @@ impl OpcodeStepExecutor for PyFrame {
         let self_obj = self.pop();
         let cls = self.pop();
         let global_super = self.pop();
+        let anchor = FrameAnchor::new(self);
 
         // CPython 3.14 `LOAD_SUPER_ATTR`: the callable loaded from globals is
         // authoritative (it may shadow builtins.super).  Bit 1 distinguishes
@@ -4717,16 +4746,16 @@ impl OpcodeStepExecutor for PyFrame {
             if unsafe { pyre_object::is_method(result) } {
                 let func = unsafe { pyre_object::w_method_get_func(result) };
                 let recv = unsafe { pyre_object::w_method_get_self(result) };
-                self.push(func);
-                self.push(recv);
+                Self::push_anchored(&anchor, func)?;
+                Self::push_anchored(&anchor, recv)?;
             } else {
                 // staticmethod or classmethod — no self binding
-                self.push(result);
-                self.push(PY_NULL);
+                Self::push_anchored(&anchor, result)?;
+                Self::push_anchored(&anchor, PY_NULL)?;
             }
         } else {
             // is_method=false: getattr already returned a bound method.
-            self.push(result);
+            Self::push_anchored(&anchor, result)?;
         }
         Ok(())
     }
@@ -4802,22 +4831,18 @@ impl OpcodeStepExecutor for PyFrame {
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
         roots.pin_root(obj);
+        let pycode = self.pycode as PyObjectRef;
+        let anchor = FrameAnchor::new(self);
         let w_value = unsafe {
-            crate::objspace::std::mapdict::load_attr_caching(
-                self.pycode as PyObjectRef,
-                obj,
-                nameindex,
-                name,
-            )
+            crate::objspace::std::mapdict::load_attr_caching(pycode, obj, nameindex, name)
         }
         .map_err(|error| {
             if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
-                self.defer_failed_attr_until_pop_except();
+                unsafe { &mut *anchor.live() }.defer_failed_attr_until_pop_except();
             }
             error
         })?;
-        self.push(w_value);
-        Ok(())
+        Self::push_anchored(&anchor, w_value)
     }
 
     /// pyopcode.py:917-926 `STORE_ATTR` — consults the mapdict attribute cache
@@ -5010,9 +5035,9 @@ impl OpcodeStepExecutor for PyFrame {
         // treating a dict subclass as a non-dict can also accidentally copy
         // globals into the class namespace and make LOAD_FROM_DICT_OR_DEREF
         // select a global over its closure cell.
+        let anchor = FrameAnchor::new(self);
         let w_locals = self.get_or_create_w_locals();
-        self.push(w_locals);
-        Ok(())
+        Self::push_anchored(&anchor, w_locals)
     }
 
     // ── unpack_ex ──
@@ -5025,9 +5050,10 @@ impl OpcodeStepExecutor for PyFrame {
         // `unpack_ex_slots` returns the `before + 1 + after` slots in TOS
         // order (head items, starred list, tail items); push bottom-first so
         // the first head item ends on top.
+        let anchor = FrameAnchor::new(self);
         let slots = crate::runtime_ops::unpack_ex_slots(before, after, value)?;
         for item in slots.into_iter().rev() {
-            self.push(item);
+            Self::push_anchored(&anchor, item)?;
         }
         Ok(())
     }
@@ -5068,9 +5094,9 @@ impl OpcodeStepExecutor for PyFrame {
         let stop = self.pop();
         let start = self.pop();
         let obj = self.pop();
+        let anchor = FrameAnchor::new(self);
         let result = crate::runtime_ops::binary_slice_values(obj, start, stop)?;
-        self.push(result);
-        Ok(())
+        Self::push_anchored(&anchor, result)
     }
 
     // ── StoreSlice (a[b:c] = d) ──
