@@ -2711,6 +2711,11 @@ fn call_with_kwargs_in_ctx_impl(
                 // below rather than invoking the builtin directly.
                 let frame_ptr = c_profile_frame(execution_context);
                 if !frame_ptr.is_null() {
+                    // The argument marshalling below allocates before the frame
+                    // is handed to the profiling call, so the profiled frame is
+                    // read back out of the anchor rather than from this local.
+                    let frame_anchor =
+                        unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
                     let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
                         .iter()
                         .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
@@ -2723,7 +2728,7 @@ fn call_with_kwargs_in_ctx_impl(
                         &keywords_w,
                     );
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
-                        unsafe { &mut *frame_ptr },
+                        unsafe { &mut *frame_anchor.live() },
                         callable,
                         &mut arguments,
                         &bound,
@@ -2813,6 +2818,11 @@ fn call_with_kwargs_in_ctx_impl(
                 // when positional count is zero, not the kwargs dict).
                 let frame_ptr = c_profile_frame(execution_context);
                 if !frame_ptr.is_null() {
+                    // The argument marshalling below allocates before the frame
+                    // is handed to the profiling call, so the profiled frame is
+                    // read back out of the anchor rather than from this local.
+                    let frame_anchor =
+                        unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
                     let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
                         .iter()
                         .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
@@ -2836,7 +2846,7 @@ fn call_with_kwargs_in_ctx_impl(
                         .chain(std::iter::once(kw_roots.get(kw_slot)))
                         .collect();
                     let w_res = crate::baseobjspace::call_args_and_c_profile_args(
-                        unsafe { &mut *frame_ptr },
+                        unsafe { &mut *frame_anchor.live() },
                         callable,
                         &mut arguments,
                         &full_args,

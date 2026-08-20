@@ -486,9 +486,13 @@ pub(crate) fn current_frames() -> PyObjectRef {
             if !frame.is_null() {
                 unsafe { (*frame).mark_as_escaped() };
                 // The frame becomes a user-visible value; materialize the
-                // virtualizable fields the JIT may still be holding.
+                // virtualizable fields the JIT may still be holding.  The force
+                // runs through a backend hook whose callee this crate cannot
+                // follow, so what gets pinned is read back out of the anchor
+                // rather than taken from the pre-force local.
+                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
                 crate::executioncontext::force_frame(frame);
-                pyre_object::gc_roots::pin_root(frame as PyObjectRef);
+                pyre_object::gc_roots::pin_root(anchor.live() as PyObjectRef);
                 entries.push(ident);
             }
         }

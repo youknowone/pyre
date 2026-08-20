@@ -812,7 +812,12 @@ pub fn getframe(depth: i64) -> crate::PyResult {
         current = crate::executioncontext::ExecutionContext::getnextframe_nohidden(current);
     }
     unsafe { (*current).mark_as_escaped() };
+    // The force reaches the JIT's virtualizable writeback through a backend
+    // hook whose callee this crate cannot follow, and the audit hook below is
+    // handed this frame.
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
     crate::executioncontext::force_frame(current);
+    current = anchor.live();
     // `vm.py:51 audit(space, "sys._getframe", [f])`.  Ordered after the force
     // because a hook is app code that reads the frame it is handed, and the
     // force is what makes those reads see the JIT's live virtualizable fields —
@@ -1483,8 +1488,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // not at the walk that reached the frame — see [`force_frame`]:
             // forcing a walk escapes the traced virtualizable and
             // `vable_after_residual_call` aborts the trace with ABORT_ESCAPE.
+            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
             crate::executioncontext::force_frame(current);
-            let w_globals = unsafe { (*current).w_globals };
+            let w_globals = unsafe { (*anchor.live()).w_globals };
             if w_globals.is_null() {
                 return Ok(pyre_object::w_none());
             }

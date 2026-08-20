@@ -1304,12 +1304,17 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
             break;
         }
         // `fget_f_lineno` below reads `last_instr`, a virtualizable field.
+        // The force and the filename object both sit between the reads of this
+        // frame, so it is read back out of the anchor at each of them.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         crate::executioncontext::force_frame(frame);
-        let w_code = unsafe { (*frame).fget_f_code() };
+        let w_code = unsafe { (*anchor.live()).fget_f_code() };
         let filename_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(unsafe { crate::pycode::w_code_filename_obj(w_code) });
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(w_int_new(unsafe { (*frame).fget_f_lineno() } as i64));
+        pyre_object::gc_roots::pin_root(w_int_new(
+            unsafe { (*anchor.live()).fget_f_lineno() } as i64
+        ));
         let funcname_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(unsafe { crate::pycode::w_code_name_obj(w_code) });
         let summary = w_tuple_new(vec![
@@ -1319,7 +1324,7 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
         ]);
         pyre_object::gc_roots::pin_root(summary);
         summary_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
-        frame = crate::executioncontext::ExecutionContext::getnextframe_nohidden(frame);
+        frame = crate::executioncontext::ExecutionContext::getnextframe_nohidden(anchor.live());
     }
     w_tuple_new(
         summary_slots

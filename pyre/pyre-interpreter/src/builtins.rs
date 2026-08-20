@@ -12972,6 +12972,12 @@ fn exec_or_eval(
     }
 
     let caller_frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
+    // The caller's frame is read once here and consulted again after
+    // `ensure_*_builtins` (a dict subclass's `setdefault` / `__setitem__`),
+    // after the frame object and function are built, and after the builtin
+    // module is picked -- every one of which can collect.  A frame a compiled
+    // trace built moves there, so it is re-read out of the anchor at each.
+    let caller_anchor = unsafe { crate::eval::FrameAnchor::from_raw(caller_frame) };
     let exec_ctx = if caller_frame.is_null() {
         std::ptr::null::<crate::PyExecutionContext>()
     } else {
@@ -13022,6 +13028,7 @@ fn exec_or_eval(
     // globals_arg is supplied but locals_arg is None, PyPy collapses
     // locals=globals and pyre's existing same-dict path handles it.
     let mut implicit_caller_locals: pyre_object::PyObjectRef = std::ptr::null_mut();
+    let caller_frame = caller_anchor.live();
     if is_none_or_null(globals_arg) && is_none_or_null(locals_arg) && !caller_frame.is_null() {
         // The caller's locals as `locals()` reports them: its real namespace
         // for a module or class frame, an independent snapshot for an
@@ -13123,7 +13130,7 @@ fn exec_or_eval(
         // resolved object is the caller's globals (module-level exec
         // collapses to locals=globals — same-dict shape kept by the
         // module-frame's initialize_frame_scopes binding).
-        let caller_globals_obj = unsafe { (*caller_frame).get_w_globals() };
+        let caller_globals_obj = unsafe { (*caller_anchor.live()).get_w_globals() };
         let same_as_globals = !caller_globals_obj.is_null()
             && std::ptr::eq(implicit_caller_locals, caller_globals_obj);
         if !same_as_globals {
@@ -13196,8 +13203,11 @@ fn topframe_for_locals() -> *mut crate::PyFrame {
         return std::ptr::null_mut();
     }
     let frame = unsafe { (*ec).gettopframe_nohidden() };
+    // The force materializes the fastlocals through a backend hook whose callee
+    // this crate cannot follow, so it is judged as able to collect.
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
     crate::executioncontext::force_frame_before_locals_read(frame);
-    frame
+    anchor.live()
 }
 
 fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

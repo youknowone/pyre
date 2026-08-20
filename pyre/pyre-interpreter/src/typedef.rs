@@ -7848,8 +7848,11 @@ fn init_frame_type(ns: PyObjectRef) {
             // side effect of the walk: `gettopframe_nohidden` forces only the
             // VREF of the frame it starts from, which is not enough.  A frame
             // reached through a traceback's `tb_frame` gets neither.
+            // The force materializes the fastlocals through a backend hook
+            // whose callee this crate cannot follow, so the frame is read back.
+            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
             crate::executioncontext::force_frame_before_locals_read(f);
-            let frame = unsafe { &mut *f };
+            let frame = unsafe { &mut *anchor.live() };
             if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED)
                 || frame.has_active_hidden_locals()
             {
@@ -8021,9 +8024,11 @@ fn init_frame_type(ns: PyObjectRef) {
             if f.is_null() {
                 return Ok(pyre_object::w_none());
             }
+            // `int_w` reaches `__index__`, which is application-level Python.
+            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
             let new_lineno = crate::baseobjspace::int_w(args[2])
                 .map_err(|_| crate::PyError::value_error("lineno must be an integer"))?;
-            unsafe { &mut *f }.fset_f_lineno(new_lineno as isize)?;
+            unsafe { &mut *anchor.live() }.fset_f_lineno(new_lineno as isize)?;
             Ok(pyre_object::w_none())
         },
         3,
@@ -8107,8 +8112,10 @@ fn init_frame_type(ns: PyObjectRef) {
         |args| {
             let f = frame_ptr(args[1]);
             if !f.is_null() {
+                // `is_true` reaches `__bool__` / `__len__`.
+                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
                 let v = crate::baseobjspace::is_true(args[2])?;
-                unsafe { &mut *f }.fset_f_trace_lines(v);
+                unsafe { &mut *anchor.live() }.fset_f_trace_lines(v);
             }
             Ok(pyre_object::w_none())
         },
@@ -8146,8 +8153,10 @@ fn init_frame_type(ns: PyObjectRef) {
         |args| {
             let f = frame_ptr(args[1]);
             if !f.is_null() {
+                // `is_true` reaches `__bool__` / `__len__`.
+                let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
                 let v = crate::baseobjspace::is_true(args[2])?;
-                unsafe { &mut *f }.fset_f_trace_opcodes(v);
+                unsafe { &mut *anchor.live() }.fset_f_trace_opcodes(v);
             }
             Ok(pyre_object::w_none())
         },

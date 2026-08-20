@@ -531,8 +531,12 @@ impl ExecutionContext {
         // `executioncontext.py:_gettopframe` → `self.topframeref()` (vref
         // force), then the virtualizable force materializes the fastlocals.
         let frame = force_vref(self.topframeref);
+        // The force reaches the JIT's virtualizable writeback through a backend
+        // hook whose callee this crate cannot follow, so it is judged as able to
+        // collect and the frame is handed back out of the anchor.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         force_frame(frame);
-        frame
+        anchor.live()
     }
 
     /// `self.topframeref()` without the virtualizable force that
@@ -629,11 +633,15 @@ impl ExecutionContext {
         // the topframeref restore and the vref dance always run.  We
         // capture the trace result and propagate it after the cleanup
         // block below.
+        // `_trace` runs the profile callback, which is application-level
+        // Python; the chain surgery below reads the frame's own fields.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         let trace_result = if self.profilefunc.is_some() {
             self._trace(frame, "leaveframe", w_exitvalue, None)
         } else {
             Ok(())
         };
+        let frame = anchor.live();
         let frame_vref = self.topframeref;
         unsafe {
             // `self.topframeref = frame.f_backref` (no parens — move the raw
@@ -741,7 +749,11 @@ impl ExecutionContext {
 
     pub fn call_trace(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
         if !self.gettrace().is_null() || self.profilefunc.is_some() {
+            // The callback is Python, and the profiling flag below is a write
+            // into the frame's own debug block.
+            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
             self._trace(frame, "call", pyre_object::w_none(), None)?;
+            let frame = anchor.live();
             if self.profilefunc.is_some() && !frame.is_null() {
                 unsafe {
                     (*frame).getorcreatedebug(-1).is_being_profiled = true;
@@ -766,11 +778,16 @@ impl ExecutionContext {
     #[inline(always)]
     pub fn bytecode_trace(
         &mut self,
-        frame: *mut PyFrame,
+        mut frame: *mut PyFrame,
         decr_by: usize,
     ) -> Result<(), crate::PyError> {
+        // This runs on the per-tick path, so neither anchor is taken
+        // unconditionally: each rides the same test that decides whether the
+        // call below it can run Python at all.
         if !crate::module::thread::all_thread_hooks_current(self) {
+            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
             crate::module::thread::apply_all_thread_hooks(self)?;
+            frame = anchor.live();
         }
         if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
             let w_async_exception_type =
@@ -795,7 +812,14 @@ impl ExecutionContext {
         // callback exception), the ticker decrement + slow-path
         // action_dispatcher do NOT run.  Use `?` so a tracer error
         // short-circuits before touching actionflag.
+        // `bytecode_only_trace` returns without touching anything when no
+        // tracer is installed, so that is the test the anchor rides.
+        let trace_anchor =
+            (!self.w_tracefunc.is_null()).then(|| unsafe { crate::eval::FrameAnchor::from_raw(frame) });
         self.bytecode_only_trace(frame)?;
+        if let Some(anchor) = &trace_anchor {
+            frame = anchor.live();
+        }
         if self.actionflag.decrement_ticker(decr_by as isize) < 0 {
             // executioncontext.py:165 — `actionflag.action_dispatcher`.
             // Routed through a residual (dont_look_inside) boundary so the
@@ -948,12 +972,17 @@ impl ExecutionContext {
             (lastline, want_line, want_opcode)
         };
         let _ = lastline;
+        // Reached only with a tracer installed, so the anchor is already on the
+        // slow path; both events run Python and the sentinel write below is a
+        // store into the frame's debug block.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         if want_line {
             self._trace(frame, "line", pyre_object::w_none(), None)?;
         }
         if want_opcode {
-            self._trace(frame, "opcode", pyre_object::w_none(), None)?;
+            self._trace(anchor.live(), "opcode", pyre_object::w_none(), None)?;
         }
+        let frame = anchor.live();
         // executioncontext.py:200 — record the next-PC sentinel so
         // backward jumps re-fire the line event even when staying on
         // the same source line.
@@ -983,7 +1012,10 @@ impl ExecutionContext {
         &mut self,
         frame: *mut PyFrame,
     ) -> Result<(), crate::PyError> {
+        // The tracer runs Python and the dispatcher below is handed the frame.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         self.bytecode_only_trace(frame)?;
+        let frame = anchor.live();
         if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
             self.actionflag.sync_async_ticker();
         }
@@ -1186,7 +1218,9 @@ impl ExecutionContext {
     pub fn force_all_frames(&mut self, is_being_profiled: bool) {
         let mut frame = self.gettopframe_nohidden();
         while !frame.is_null() {
+            let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
             force_frame(frame);
+            frame = anchor.live();
             if is_being_profiled {
                 unsafe {
                     (*frame).getorcreatedebug(-1).is_being_profiled = true;
@@ -1241,6 +1275,15 @@ impl ExecutionContext {
             return Ok(());
         }
 
+        // Everything below this point can collect: `normalize_exception`
+        // materialises the exception, `fast2locals` builds the locals mapping,
+        // `wrap_trace_frame` allocates the frame object handed out, and the
+        // callback is application-level Python.  A frame a compiled trace built
+        // is a nursery allocation, so `frame` names the abandoned copy after any
+        // of them and the `getorcreatedebug` / `locals2fast` writes below would
+        // land there.  Anchor once and re-read where the frame is next used.
+        let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+
         let space = self.space;
 
         // executioncontext.py:353-356 Tracing cases
@@ -1277,6 +1320,7 @@ impl ExecutionContext {
                 w_arg
             };
 
+            let frame = frame_anchor.live();
             let lineno = unsafe { (*frame).get_last_lineno() };
             let init_lineno = if unsafe { (*frame).last_instr } >= 1 {
                 lineno
@@ -1290,6 +1334,7 @@ impl ExecutionContext {
             if had_locals {
                 unsafe { (*frame).fast2locals()? };
             }
+            let frame = frame_anchor.live();
             let (prev_line_tracing, old_lineno) = unsafe {
                 let d = (*frame).getorcreatedebug(init_lineno);
                 (d.is_in_line_tracing, d.f_lineno)
@@ -1316,6 +1361,7 @@ impl ExecutionContext {
                 // `frame.f_trace = local` / `frame.f_lineno = N` setattrs
                 // already landed on the frame's getsets — no writeback pass.
                 let w_result = call_result?;
+                let frame = frame_anchor.live();
                 if w_result != pyre_object::w_none() {
                     unsafe {
                         (*frame).getorcreatedebug(init_lineno).w_f_trace = w_result;
@@ -1324,6 +1370,7 @@ impl ExecutionContext {
                 Ok::<(), crate::PyError>(())
             })();
 
+            let frame = frame_anchor.live();
             if call_result.is_err() {
                 self.settrace(pyre_object::w_none());
                 unsafe {
@@ -1388,7 +1435,13 @@ impl ExecutionContext {
             self.is_tracing += 1;
             // executioncontext.py:420-425 self.profilefunc(...), clearing
             // profile slots on exceptions.
-            let profile_result = profilefunc(space, self.w_profilefuncarg, frame, event, w_arg);
+            let profile_result = profilefunc(
+                space,
+                self.w_profilefuncarg,
+                frame_anchor.live(),
+                event,
+                w_arg,
+            );
             if let Err(err) = profile_result {
                 // executioncontext.py:421-425 — clear profile slots and
                 // re-raise so the caller observes the failure (matches
@@ -1836,6 +1889,9 @@ pub trait ActionFlagOps {
         ec: *mut ExecutionContext,
         frame: *mut PyFrame,
     ) -> Result<(), crate::PyError> {
+        // Each `perform` may deliver a signal, which runs the handler at
+        // app level; the next action in the loop is handed the same frame.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         // executioncontext.py:538 — `self.reset_ticker(self.checkinterval_scaled)`.
         let interval = self.abstract_flag().checkinterval_scaled as isize;
         self.reset_ticker(interval);
@@ -1848,7 +1904,7 @@ pub trait ActionFlagOps {
                 continue;
             }
             unsafe {
-                perform_async_action(action_ptr, ec, frame)?;
+                perform_async_action(action_ptr, ec, anchor.live())?;
             }
         }
         // executioncontext.py:543-556 — nonperiodic bit-mask scan.
@@ -1863,7 +1919,7 @@ pub trait ActionFlagOps {
                     self.abstract_flag_mut()._fired_bitmask &= !mask;
                     if !action_ptr.is_null() && !ec.is_null() {
                         unsafe {
-                            perform_async_action(action_ptr, ec, frame)?;
+                            perform_async_action(action_ptr, ec, anchor.live())?;
                         }
                     }
                 }

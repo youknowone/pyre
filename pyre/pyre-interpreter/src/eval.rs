@@ -215,7 +215,21 @@ pub struct FrameAnchor {
 
 impl FrameAnchor {
     pub fn new(frame: &mut PyFrame) -> Self {
-        let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as *mut PyFrame as usize));
+        unsafe { Self::from_raw(frame as *mut PyFrame) }
+    }
+
+    /// Anchor a frame the caller holds as a raw pointer.
+    ///
+    /// `executioncontext`, the frame typedef and the introspection builtins
+    /// carry `*mut PyFrame` rather than a reference, because the same frame
+    /// stays reachable through the `f_backref` chain it was read off.  Minting
+    /// a `&mut` for the length of the anchor would claim an exclusivity none of
+    /// them has.
+    ///
+    /// # Safety
+    /// `frame` must name a live `PyFrame`.
+    pub unsafe fn from_raw(frame: *mut PyFrame) -> Self {
+        let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as usize));
         Self {
             depth,
             _not_send: std::marker::PhantomData,
