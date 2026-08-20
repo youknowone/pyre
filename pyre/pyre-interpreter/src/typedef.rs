@@ -1686,6 +1686,9 @@ pub fn init_typeobjects() {
             &pyre_object::pyobject::NOTIMPLEMENTED_TYPE,
             &pyre_object::ELLIPSIS_TYPE,
             &pyre_object::functional::RANGE_TYPE,
+            &crate::pycode::CODE_TYPE,
+            &pyre_object::functional::RANGE_ITER_TYPE,
+            &pyre_object::functional::LONG_RANGE_ITER_TYPE,
         ] {
             let w_typeobject = *reg
                 .get(&(pytype as *const PyType as usize))
@@ -11049,13 +11052,8 @@ fn make_getset_property_full(
 /// GC ownership instead answers a different question — pyre's nursery owns
 /// `object()` and `b""`, which `object` and `bytes` never declare.
 ///
-/// Nothing consumes it at present. `sys.getsizeof` used to, for the
-/// `PyGC_Head` that `_PyType_PreHeaderSize` charges a tracked instance, but a
-/// build without a global interpreter lock keeps the collector's bits in the
-/// object header and so charges none. The flag itself remains the answer
-/// `type.__flags__` owes for `Py_TPFLAGS_HAVE_GC`, which it does not yet
-/// report.
-#[allow(dead_code)]
+/// `gc.is_tracked` consumes it here, and `type.__flags__` publishes the same
+/// canonical field as `Py_TPFLAGS_HAVE_GC`.
 pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
     let Some(tp) = r#type(w_obj) else {
         return false;
@@ -11072,52 +11070,11 @@ pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
     true
 }
 
-/// Whether `w_type` declares `Py_TPFLAGS_HAVE_GC`.
-///
-/// A type carries the flag when its instances can hold a reference that joins
-/// a cycle, which is nearly all of them, so what is enumerated here is the
-/// complement: the scalars, the buffers and the singletons. `type_new` sets
-/// the flag on every heap type.
-///
-/// Two matches are needed because a builtin only gets its own Layout when it
-/// has a payload of its own. `int` and `bytes` do, so their layout identifies
-/// them; `NoneType` and `code` do not, and share the base instance layout with
-/// `function`, `generator`, the iterators and the dict views — all of which do
-/// declare the flag. Those are matched on the type object instead.
-#[allow(dead_code)]
+/// Whether `w_type` declares `Py_TPFLAGS_HAVE_GC`. Registration initializes
+/// the canonical field once; all readers, including `type.__flags__`, must
+/// consult that field rather than rebuilding a parallel type census.
 fn cpython_type_has_gc_flag(w_type: PyObjectRef) -> bool {
-    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
-        return false;
-    }
-    if unsafe { pyre_object::w_type_is_heaptype(w_type) } {
-        return true;
-    }
-    let same_type = |tp: &PyType| std::ptr::eq(w_type, gettypeobject(tp));
-    // `object` holds nothing; the singletons are one instance each; a code
-    // object's references are all reachable from the function that owns it;
-    // and both range iterators count, one in machine words and one in ints
-    // that cannot themselves reference anything.
-    if std::ptr::eq(w_type, w_object())
-        || same_type(&pyre_object::NONE_TYPE)
-        || same_type(&pyre_object::NOTIMPLEMENTED_TYPE)
-        || same_type(&pyre_object::ELLIPSIS_TYPE)
-        || same_type(&crate::pycode::CODE_TYPE)
-        || same_type(&pyre_object::functional::RANGE_ITER_TYPE)
-        || same_type(&pyre_object::functional::LONG_RANGE_ITER_TYPE)
-    {
-        return false;
-    }
-    let layout = unsafe { pyre_object::w_type_get_layout(w_type) };
-    let is = |candidate: *const PyType| std::ptr::eq(layout, candidate);
-    !(is(&pyre_object::INT_TYPE)
-        || is(&pyre_object::LONG_TYPE)
-        || is(&pyre_object::BOOL_TYPE)
-        || is(&pyre_object::FLOAT_TYPE)
-        || is(&pyre_object::COMPLEX_TYPE)
-        || is(&pyre_object::STR_TYPE)
-        || is(&pyre_object::bytesobject::BYTES_TYPE)
-        || is(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)
-        || is(&pyre_object::functional::RANGE_TYPE))
+    unsafe { pyre_object::w_type_get_have_gc(w_type) }
 }
 
 /// Logical CPython 3.14 `tp_basicsize` / `tp_itemsize` values ported so far.
@@ -31053,6 +31010,67 @@ mod tests {
             crate::module::_weakref::interp__weakref::callable_proxy_type(),
         ] {
             assert_eq!(super::cpython_type_layout(w_type), Some((11 * word, 0)));
+        }
+    }
+
+    #[test]
+    fn type_flags_publish_cpython_314_have_gc_from_the_canonical_field() {
+        crate::typedef::init_typeobjects();
+        const HAVE_GC: i64 = 1 << 14;
+        let cases = [
+            ("object", crate::typedef::w_object(), false),
+            ("type", crate::typedef::w_type(), true),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
+                false,
+            ),
+            (
+                "bytearray",
+                crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+                false,
+            ),
+            (
+                "tuple",
+                crate::typedef::gettypeobject(&pyre_object::TUPLE_TYPE),
+                true,
+            ),
+            (
+                "dict",
+                crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+                true,
+            ),
+            (
+                "function",
+                crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
+                true,
+            ),
+            (
+                "code",
+                crate::typedef::gettypeobject(&crate::pycode::CODE_TYPE),
+                false,
+            ),
+            (
+                "range_iterator",
+                crate::typedef::gettypeobject(&pyre_object::functional::RANGE_ITER_TYPE),
+                false,
+            ),
+            (
+                "longrange_iterator",
+                crate::typedef::gettypeobject(&pyre_object::functional::LONG_RANGE_ITER_TYPE),
+                false,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let w_flags = crate::baseobjspace::getattr_str(w_type, "__flags__")
+                .unwrap_or_else(|err| panic!("{name}.__flags__ lookup failed: {err:?}"));
+            let flags = unsafe { pyre_object::w_int_get_value(w_flags) };
+            assert_eq!(flags & HAVE_GC != 0, expected, "{name}.__flags__");
+            assert_eq!(
+                unsafe { pyre_object::w_type_get_have_gc(w_type) },
+                expected,
+                "{name}.flag_have_gc"
+            );
         }
     }
 

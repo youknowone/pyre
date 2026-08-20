@@ -1336,6 +1336,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
     const IMMUTABLETYPE: i64 = 1 << 8;
     const ABSTRACT: i64 = 1 << 20;
+    const HAVE_GC: i64 = 1 << 14;
     const PATMA_SEQUENCE: i64 = 1 << 5;
     const PATMA_MAPPING: i64 = 1 << 6;
     const METHOD_DESCRIPTOR: i64 = 1 << 17;
@@ -1361,6 +1362,15 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     // no equivalent type owner, so its bit is always absent.
     if t.flag_abstract.load(std::sync::atomic::Ordering::Acquire) {
         flags |= ABSTRACT;
+    }
+    if t.flag_have_gc {
+        // [3.14-spec] CPython v3.14.6 exposes the complete `tp_flags` word
+        // through `Objects/typeobject.c:1407`, and
+        // `Include/object.h:567` assigns this bit to `Py_TPFLAGS_HAVE_GC`.
+        // PyPy `typeobject.py:990-1004` computes a deliberately smaller
+        // public subset. Keep its field-by-field `descr__flags__` shape, but
+        // publish pyre's canonical per-type GC flag for the 3.14 surface.
+        flags |= HAVE_GC;
     }
     if t.flag_method_descriptor {
         flags |= METHOD_DESCRIPTOR;
