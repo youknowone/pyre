@@ -6811,6 +6811,8 @@ fn drive_unpack_iterable_trace(
                 | crate::call_jit::BlackholeResult::DoneWithThisFrameInt(_)
                 | crate::call_jit::BlackholeResult::DoneWithThisFrameRef(_)
                 | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_) => break,
+                // Clean bail: the frame already carries the stamped resume pc.
+                crate::call_jit::BlackholeResult::BailToInterpreter => break,
                 // Blackhole could not resume; leave the rest to `ln`.
                 crate::call_jit::BlackholeResult::Failed => break,
             }
@@ -9102,6 +9104,42 @@ fn maybe_compile_and_run(
     // counter tick below instead of entering `execute_assembler` with no meta
     // to interpret its exit (which aborts). The tmp cell then re-ticks until
     // the real loop compiles.
+    // Why a compiled loop for this green key is or is not enterable, per
+    // back-edge.  `has_runnable_compiled_loop` is the conjunction of an entry
+    // procedure token and a frontend `compiled_loops` entry, and the two fail
+    // for different reasons: a pruned cell reads `cell_present=false
+    // state=NotHot` while its meta survives, an invalidated token reads
+    // `seen_token=true has_token=false`.  Separating them is what distinguishes
+    // a cell the warmstate dropped from a token something revoked.
+    static GEN_ENTRY_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *GEN_ENTRY_DIAG.get_or_init(|| std::env::var_os("PYRE_GEN_ENTRY_DIAG").is_some()) {
+        let runnable = driver.has_runnable_compiled_loop(green_key);
+        let meta = driver.get_compiled_meta(green_key).is_some();
+        let last = driver.last_compiled_key();
+        let ws = driver.meta_interp_mut().warm_state_mut();
+        let state = ws.get_cell_state(green_key);
+        let (present, seen_token, has_token) = match ws.get_cell(green_key) {
+            Some(cell) => (
+                true,
+                cell.has_seen_a_procedure_token(),
+                cell.get_procedure_token().is_some(),
+            ),
+            None => (false, false, false),
+        };
+        eprintln!(
+            "[gen-entry] code={} pc={} key={} runnable={} meta={} last_compiled={:?} cell_present={} state={:?} seen_token={} has_token={}",
+            code.obj_name.as_str(),
+            loop_header_pc,
+            green_key,
+            runnable,
+            meta,
+            last,
+            present,
+            state,
+            seen_token,
+            has_token,
+        );
+    }
     if driver.has_runnable_compiled_loop(green_key) {
         return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
     }
@@ -9476,6 +9514,7 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
         R::DoneWithThisFrameRef(_) => "DoneWithThisFrameRef",
         R::DoneWithThisFrameFloat(_) => "DoneWithThisFrameFloat",
         R::ExitFrameWithExceptionRef(_) => "ExitFrameWithExceptionRef",
+        R::BailToInterpreter => "BailToInterpreter",
         R::Failed => "Failed",
     }
 }
@@ -9947,6 +9986,7 @@ fn execute_assembler(
                             // propagate the Python exception, don't swallow it.
                             Some(LoopResult::Done(Err(exc.clone())))
                         }
+                        crate::call_jit::BlackholeResult::BailToInterpreter => None,
                         crate::call_jit::BlackholeResult::Failed => {
                             // RPython: blackhole resume never fails — rd_numb
                             // is always complete (`blackhole.py:1679` raises
@@ -10319,6 +10359,7 @@ fn bound_reached(
                             apply_blackhole_crn_handoff(frame_root.frame(), green_int);
                             return Some(LoopResult::ContinueRunningNormally);
                         }
+                        crate::call_jit::BlackholeResult::BailToInterpreter => {}
                         crate::call_jit::BlackholeResult::Failed => {}
                         _ => {
                             if let Some(r) = bh_result.to_pyresult() {
@@ -10589,6 +10630,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             apply_blackhole_crn_handoff(frame_root.frame(), green_int);
                             // Fall through to eval_loop_jit
                         }
+                        crate::call_jit::BlackholeResult::BailToInterpreter => {}
                         crate::call_jit::BlackholeResult::Failed => {
                             // RPython blackhole resume cannot fail
                             // (`blackhole.py:1679` raises

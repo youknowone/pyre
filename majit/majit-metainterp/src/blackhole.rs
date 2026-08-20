@@ -234,6 +234,10 @@ pub struct BlackholeInterpreter {
     /// must not treat abort as DoneWithThisFrame — side effects from
     /// partial execution have corrupted state.
     pub aborted: bool,
+    /// True when the abort came from pyre's `abort_permanent` marker.  That
+    /// marker is a clean bail to the interpreter after the codewriter has
+    /// already materialized the frame's resume coordinate.
+    pub abort_permanent_bail: bool,
     /// RPython blackhole.py handle_exception_in_frame parity:
     /// True when a residual call raised an exception (returned NULL ref).
     /// Unlike `aborted`, this indicates a Python-level exception that
@@ -402,6 +406,7 @@ impl Default for BlackholeInterpreter {
             nextblackholeinterp: None,
             return_type: BhReturnType::Void,
             aborted: false,
+            abort_permanent_bail: false,
             got_exception: false,
             last_opcode_position: 0,
             entry_position: 0,
@@ -421,6 +426,7 @@ impl BlackholeInterpreter {
     fn reset_position_state(&mut self, position: usize) {
         self.position = position;
         self.aborted = false;
+        self.abort_permanent_bail = false;
         self.got_exception = false;
         self.last_opcode_position = position;
         self.entry_position = position;
@@ -1203,6 +1209,7 @@ impl BlackholeInterpreter {
             return Err(DispatchError::RaiseException(exc));
         }
         self.aborted = true;
+        self.abort_permanent_bail = true;
         Err(DispatchError::LeaveFrame)
     }
 
@@ -2437,6 +2444,7 @@ impl BlackholeInterpBuilder {
         // Pool management (RPython uses linked-list via .back; Rust uses Vec)
         interp.nextblackholeinterp = None;
         interp.aborted = false;
+        interp.abort_permanent_bail = false;
         interp.got_exception = false;
         // The virtualizable handle is frame identity, not builder state, and
         // `acquire_interp` refreshes only the six builder-shared fields.  A
@@ -11671,6 +11679,7 @@ fn handler_inline_call_pyre_nested(
     if callee.aborted {
         bh.position = p;
         bh.aborted = true;
+        bh.abort_permanent_bail = callee.abort_permanent_bail;
         return Err(DispatchError::LeaveFrame);
     }
     if callee.got_exception {

@@ -1265,7 +1265,12 @@ pub enum BlackholeResult {
     DoneWithThisFrameFloat(f64),
     /// jitexc.py:44 ExitFrameWithExceptionRef(value: GCREF)
     ExitFrameWithExceptionRef(pyre_interpreter::error::PyError),
-    /// pyre-only: resume couldn't run (bad resume data, BC_ABORT, etc).
+    /// pyre-only: the blackhole stopped on a pyre `abort_permanent` marker.
+    /// This is a designed bail whose resume coordinate the codewriter already
+    /// stamped into the frame; the frame is resumable as-is and the compiled
+    /// loop must not be invalidated.
+    BailToInterpreter,
+    /// pyre-only: resume couldn't run because the resume data was invalid.
     Failed,
 }
 
@@ -2853,6 +2858,10 @@ pub fn blackhole_resume_via_rd_numb(
             };
         }
         if !bh.got_exception && bh.aborted {
+            if bh.abort_permanent_bail {
+                release_bh_rd(bh);
+                return BlackholeResult::BailToInterpreter;
+            }
             if nbody_debug {
                 eprintln!(
                     "[nbody-debug] blackhole_resume_via_rd_numb failed: bh.aborted position={} last_opcode_position={}",
@@ -3191,6 +3200,12 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
         BlackholeResult::Failed => {
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[blackhole-resume] Failed");
+            }
+            None
+        }
+        BlackholeResult::BailToInterpreter => {
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!("[blackhole-resume] BailToInterpreter");
             }
             None
         }
