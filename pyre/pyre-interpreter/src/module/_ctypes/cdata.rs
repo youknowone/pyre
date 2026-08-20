@@ -505,11 +505,13 @@ fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(value);
-    release_bstr_slot(&tc, cdata_addr(obj).unwrap_or(0));
     let mut bytes = encode_value_into(&tc, value, obj, "0")?;
     if unsafe { crate::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some() {
         bytes.reverse();
     }
+    // `BSTR_set` frees what the slot held only once the new string exists, so
+    // a conversion that refuses its value leaves the previous one readable.
+    release_bstr_slot(&tc, cdata_addr(obj).unwrap_or(0));
     cdata_write(obj, 0, &bytes);
     if matches!(tc.as_str(), "z" | "Z" | "O") {
         let d = crate::baseobjspace::getdict_native(obj);
@@ -1299,6 +1301,10 @@ pub(super) fn decode_slot(tc: &str, bytes: &[u8]) -> PyObjectRef {
 /// every caller has — the object's buffer for a `value` store, that buffer
 /// plus the field offset for a struct or array slot, and the item address for
 /// a pointer store.
+///
+/// Call it only once the replacement bytes exist: `X_set` allocates first and
+/// frees the previous contents immediately before the store, so a value it
+/// refuses leaves the slot as it was.
 #[cfg(windows)]
 pub(super) fn release_bstr_slot(tc: &str, addr: usize) {
     if tc != "X" || addr == 0 {
@@ -1468,6 +1474,9 @@ pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate:
                 let bstr = unsafe {
                     windows_sys::Win32::Foundation::SysAllocStringLen(units.as_ptr(), len)
                 };
+                if bstr.is_null() {
+                    return Err(crate::PyError::memory_error(""));
+                }
                 bstr as usize
             } else {
                 return Err(crate::PyError::type_error(format!(

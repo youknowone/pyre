@@ -218,7 +218,14 @@ fn semlock_acquire(
         (false, _) => Some(0),
         (true, None) => None,
         (true, Some(seconds)) => {
-            Some((seconds * 1000.0).ceil().clamp(0.0, f64::from(u32::MAX)) as u32)
+            // `interp_semaphore.py:268-275` — a negative timeout is a poll,
+            // and one at half of `INFINITE` (about 25 days) is refused rather
+            // than saturated, so no wait silently becomes a different one.
+            let msecs = (seconds * 1000.0).max(0.0);
+            if msecs >= 0.5 * f64::from(u32::MAX) {
+                return Err(crate::PyError::overflow_error("timeout is too large"));
+            }
+            Some((msecs + 0.5) as u32)
         }
     };
     loop {
@@ -227,8 +234,11 @@ fn semlock_acquire(
             let _blocked = crate::module::thread::before_external_block();
             host_mp::wait_for_single_object(handle, slice)
         };
+        // `interp_semaphore.py:311-315` — the wait has taken the count, so it
+        // is reported before anything that can raise.  A signal pending at
+        // this moment is delivered at the next checkpoint like any other;
+        // raising here would consume the semaphore without handing it over.
         if status == host_mp::wait_object_0() {
-            crate::module::signal::interp_signal::checksignals_now()?;
             return Ok(true);
         }
         if status != host_mp::wait_timeout() {

@@ -114,5 +114,6 @@ CLAUDE.md
 
 # The scratch files `lib-python/3/test` writes into the working directory
 # (`test.support.TESTFN` is `@test_<pid>_tmp<suffix>`), left behind whenever a
-# run dies before its `tearDown`.
-/@test_*_tmp*
+# run dies before its `tearDown`.  Unanchored: the working directory is
+# wherever the run was started from, not necessarily the repo root.
+@test_*_tmp*

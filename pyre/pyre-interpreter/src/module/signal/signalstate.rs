@@ -40,6 +40,15 @@ static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 /// `signal.set_wakeup_fd(fd, warn_on_full_buffer=...)`; defaults to true.
 static WAKEUP_WARN_ON_FULL: AtomicBool = AtomicBool::new(true);
 
+/// `signals.c:42 PYPYSIG_USE_SEND` — whether the wakeup descriptor is a
+/// WinSock socket, which takes `send` rather than the runtime's `write` and
+/// reports through `WSAGetLastError` rather than errno.  Decided by the
+/// `getsockopt` probe of `signals.c:250-267`, which lives at the
+/// `set_wakeup_fd` call site because that is where WinSock has been started
+/// up.
+#[cfg(windows)]
+static WAKEUP_USE_SEND: AtomicBool = AtomicBool::new(false);
+
 /// `signals.c:132 pypysig_wakeup_fd_write_errno` — errno of a failed
 /// wakeup-fd write, stashed by the async handler (which cannot report it)
 /// and surfaced at the next interpreter checkpoint.  0 means none pending.
@@ -121,9 +130,15 @@ pub(crate) fn has_pending_signals() -> bool {
 /// `PYPYSIG_WITH_NUL_BYTE` default only matters before any fd is set,
 /// during which `WAKEUP_FD` is -1 and nothing is written anyway).
 /// `warn_on_full` records whether a later full-pipe write should stash
-/// its errno (`PYPYSIG_NO_WARN_FULL` cleared) or be dropped silently.
-pub fn set_wakeup_fd(fd: i32, warn_on_full: bool) -> i32 {
+/// its errno (`PYPYSIG_NO_WARN_FULL` cleared) or be dropped silently, and
+/// `use_send` whether the descriptor answered the socket probe
+/// (`PYPYSIG_USE_SEND`).
+pub fn set_wakeup_fd(fd: i32, warn_on_full: bool, use_send: bool) -> i32 {
     WAKEUP_WARN_ON_FULL.store(warn_on_full, Ordering::SeqCst);
+    #[cfg(windows)]
+    WAKEUP_USE_SEND.store(use_send, Ordering::SeqCst);
+    #[cfg(not(windows))]
+    let _ = use_send;
     WAKEUP_FD.swap(fd, Ordering::SeqCst)
 }
 
@@ -416,15 +431,104 @@ fn install_handler(signum: i32, handler: libc::sighandler_t) -> bool {
     previous != libc::SIG_ERR as libc::sighandler_t
 }
 
-/// The OS signal handler.  It flags the signal for the next checkpoint and
-/// puts itself back: the runtime resets a handler to the default before
-/// running it, so a second delivery would otherwise end the process.
-///
-/// The wakeup descriptor the POSIX handler also writes to is a socket here,
-/// which this context cannot write to, so `set_wakeup_fd` stays a record.
+/// The wakeup byte on a descriptor that answered the socket probe
+/// (`signals.c:156-157`).  WinSock reports through `WSAGetLastError`, which
+/// is the code returned alongside the result.
+#[cfg(all(windows, not(feature = "sandbox")))]
+fn wakeup_send(fd: i32, byte: &u8) -> (isize, i32) {
+    use crate::module::_socket::rsocket_rffi as rffi;
+    let res = unsafe {
+        rffi::send(
+            rffi::socket_from_i64(i64::from(fd)),
+            (byte as *const u8).cast(),
+            1,
+            0,
+        )
+    };
+    (res, rffi::last_error_code())
+}
+
+/// Unreachable under `sandbox`: the `getsockopt` probe that sets
+/// `WAKEUP_USE_SEND` is compiled out there, so no descriptor is ever a socket.
+#[cfg(all(windows, feature = "sandbox"))]
+fn wakeup_send(_fd: i32, _byte: &u8) -> (isize, i32) {
+    (-1, 0)
+}
+
+/// `signals.c:145-167` — the signal-number byte the handler puts on the
+/// wakeup descriptor, so a `select`/`poll` loop blocked elsewhere wakes up.
+/// A socket takes `send`; anything else is a descriptor the C runtime's
+/// `write` and errno answer for.  The caller's errno is restored either way,
+/// so the interrupted code sees no change.
+#[cfg(windows)]
+fn write_wakeup_byte(signum: libc::c_int) {
+    let fd = WAKEUP_FD.load(Ordering::SeqCst);
+    if fd == -1 {
+        return;
+    }
+    let use_send = WAKEUP_USE_SEND.load(Ordering::SeqCst);
+    let byte = signum as u8;
+    let saved = crate::builtins::crt_errno();
+    loop {
+        let (res, code) = if use_send {
+            wakeup_send(fd, &byte)
+        } else {
+            let res = crate::builtins::crt_call!(libc::write(
+                fd,
+                (&byte as *const u8).cast::<libc::c_void>(),
+                1
+            ));
+            (res as isize, crate::builtins::crt_errno())
+        };
+        if res < 0 {
+            if wakeup_error_is_interrupted(code, use_send) {
+                continue;
+            }
+            // `signals.c:160-166` — a full-buffer write is dropped silently
+            // when warn_on_full_buffer is false; any other error is always
+            // stashed for the next checkpoint to report.
+            let warn = WAKEUP_WARN_ON_FULL.load(Ordering::SeqCst);
+            if warn || !wakeup_error_is_full(code, use_send) {
+                WAKEUP_FD_WRITE_ERRNO.store(code, Ordering::SeqCst);
+            }
+        }
+        break;
+    }
+    crate::builtins::set_crt_errno(saved);
+}
+
+/// `EINTR`, spelled `WSAEINTR` on the socket path.
+#[cfg(windows)]
+fn wakeup_error_is_interrupted(code: i32, use_send: bool) -> bool {
+    match use_send {
+        #[cfg(not(feature = "sandbox"))]
+        true => crate::module::_socket::rsocket_rffi::error_is_interrupted(code),
+        #[cfg(feature = "sandbox")]
+        true => false,
+        false => code == libc::EINTR,
+    }
+}
+
+/// A buffer with no room left, spelled `WSAEWOULDBLOCK` on the socket path.
+#[cfg(windows)]
+fn wakeup_error_is_full(code: i32, use_send: bool) -> bool {
+    match use_send {
+        #[cfg(not(feature = "sandbox"))]
+        true => code == crate::module::_socket::rsocket_rffi::WSAEWOULDBLOCK,
+        #[cfg(feature = "sandbox")]
+        true => false,
+        false => code == libc::EAGAIN || code == libc::EWOULDBLOCK,
+    }
+}
+
+/// The OS signal handler.  It flags the signal for the next checkpoint,
+/// writes the wakeup byte and puts itself back: the runtime resets a handler
+/// to the default before running it, so a second delivery would otherwise end
+/// the process.
 #[cfg(windows)]
 extern "C" fn signal_setflag_handler(signum: libc::c_int) {
     signal_pushback(signum);
+    write_wakeup_byte(signum);
     install_handler(signum, signal_setflag_handler as *const () as usize);
 }
 

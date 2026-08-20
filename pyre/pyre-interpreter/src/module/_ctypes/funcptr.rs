@@ -1109,6 +1109,11 @@ fn build_callargs(
         return Ok(plain(passed.to_vec()));
     }
     let mut out = plain(Vec::with_capacity(argtypes.len()));
+    // `out_parameter` instantiates the argtype, which is arbitrary Python, so
+    // every value already collected lives in a root slot across it; the list
+    // is read back out of those slots once the loop is done.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
     let mut index = 0;
     for (i, &at) in argtypes.iter().enumerate() {
         let malformed =
@@ -1135,7 +1140,7 @@ fn build_callargs(
             // A locale id never comes from the call.
             PARAMFLAG_FIN_FLCID => defval.unwrap_or_else(|| pyre_object::w_int_new(0)),
             PARAMFLAG_FOUT => {
-                out.outmask |= 1 << i;
+                out.outmask |= param_bit(i);
                 out.numretvals += 1;
                 match defval {
                     Some(defval) => defval,
@@ -1144,15 +1149,26 @@ fn build_callargs(
             }
             direction => {
                 if direction == PARAMFLAG_FIN_FOUT {
-                    out.inoutmask |= 1 << i;
+                    out.inoutmask |= param_bit(i);
                     out.numretvals += 1;
                 }
                 get_arg(&mut index, name.as_deref(), defval, passed, kwargs)?
             }
         };
+        pyre_object::gc_roots::pin_root(value);
         out.args.push(value);
     }
+    for (i, arg) in out.args.iter_mut().enumerate() {
+        *arg = pyre_object::gc_roots::shadow_stack_get(base + i);
+    }
     Ok(out)
+}
+
+/// The `1 << i` bit `_build_callargs` sets in its two `int` masks.  A
+/// parameter past the width of that word has no bit of its own, which is the
+/// range [`build_result`] reads back.
+fn param_bit(i: usize) -> u32 {
+    1u32.checked_shl(i as u32).unwrap_or(0)
 }
 
 /// `_get_arg` — the next positional argument, else the keyword of that name,
@@ -1457,9 +1473,17 @@ fn internal_pybytes_fromstringandsize(args: &[PyObjectRef]) -> Result<PyObjectRe
 /// `Windows Error 0x<code>`, which is what `test_windows_message` reads.
 #[cfg(windows)]
 fn internal_pyerr_setfromwindowserr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `PyErr_SetExcFromWindowsErrWithFilenameObjects` reads `GetLastError()`
+    // when the code it is handed is 0, so an explicit zero says the same
+    // thing as no argument at all rather than naming `ERROR_SUCCESS`.
     let code = match args.first() {
         Some(&arg) => crate::baseobjspace::int_w(arg)? as i32,
-        None => std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        None => 0,
+    };
+    let code = if code == 0 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    } else {
+        code
     };
     Err(crate::PyError::os_error_win32_syscall2(
         code,

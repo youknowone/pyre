@@ -217,11 +217,14 @@ fn check_signum_in_range(signum: i64) -> Result<(), crate::PyError> {
     }
 }
 
+/// The runtime's own signal, absent from the libc crate.
+#[cfg(windows)]
+const SIGBREAK: i32 = 21;
+
 /// Whether the runtime has a signal under this number at all.  `SIGBREAK` is
 /// its own, so the set is spelled out rather than taken from `libc`.
 #[cfg(windows)]
 fn windows_handles_signal(signum: i32) -> bool {
-    const SIGBREAK: i32 = 21;
     matches!(
         signum,
         libc::SIGINT
@@ -642,6 +645,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "set_wakeup_fd() requires an argument",
                 ));
             };
+            // `PYPYSIG_USE_SEND` — set by the Windows probe below, which is
+            // the only place a descriptor is asked whether it is a socket.
+            #[cfg_attr(
+                not(all(windows, not(feature = "sandbox"))),
+                expect(unused_mut)
+            )]
+            let mut use_send = false;
             // interp_signal.py:343-360 — a real fd is validated with
             // `os.fstat` then `get_status_flags`: a bad fd is a ValueError
             // and the fd must already be in non-blocking mode.
@@ -691,6 +701,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             &raw mut len,
                         )
                     };
+                    use_send = queried == 0;
                     if queried != 0 {
                         let code = rffi::last_error_code();
                         // `WSAENOTSOCK` is the descriptor answering that it
@@ -724,7 +735,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // interp_signal.py:376 — `pypysig_set_wakeup_fd`.  The OS
             // handler writes the signal-number byte to this fd so a
             // select/poll loop blocked elsewhere wakes up.
-            let prev = signalstate::set_wakeup_fd(fd, warn_on_full_buffer);
+            let prev = signalstate::set_wakeup_fd(fd, warn_on_full_buffer, use_send);
             Ok(pyre_object::w_int_new(prev as i64))
         }),
     );
@@ -1439,14 +1450,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `Signals(2)` answer from here.
     #[cfg(windows)]
     {
-        // `SIGBREAK` is the runtime's own, absent from the libc crate.
-        const SIGBREAK: i64 = 21;
         crate::module_ns_store(ns, "SIGINT", pyre_object::w_int_new(libc::SIGINT as i64));
         crate::module_ns_store(ns, "SIGILL", pyre_object::w_int_new(libc::SIGILL as i64));
         crate::module_ns_store(ns, "SIGFPE", pyre_object::w_int_new(libc::SIGFPE as i64));
         crate::module_ns_store(ns, "SIGSEGV", pyre_object::w_int_new(libc::SIGSEGV as i64));
         crate::module_ns_store(ns, "SIGTERM", pyre_object::w_int_new(libc::SIGTERM as i64));
-        crate::module_ns_store(ns, "SIGBREAK", pyre_object::w_int_new(SIGBREAK));
+        crate::module_ns_store(ns, "SIGBREAK", pyre_object::w_int_new(SIGBREAK.into()));
         crate::module_ns_store(ns, "SIGABRT", pyre_object::w_int_new(libc::SIGABRT as i64));
         crate::module_ns_store(ns, "CTRL_C_EVENT", pyre_object::w_int_new(0));
         crate::module_ns_store(ns, "CTRL_BREAK_EVENT", pyre_object::w_int_new(1));

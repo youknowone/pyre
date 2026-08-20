@@ -1316,11 +1316,11 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 cdata::cdata_write(obj, offset, &bytes);
                 return Ok(pyre_object::w_none());
             }
-            cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             let mut bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
             if field_needs_swap(obj, proto, size) {
                 bytes.reverse();
             }
+            cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             cdata::cdata_write(obj, offset, &bytes);
             if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &index.to_string(), value);
@@ -1953,8 +1953,8 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
         "simple" => {
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
-            cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             let bytes = cdata::encode_instance_or_value(&tc, value, obj, &idx.to_string())?;
+            cdata::release_bstr_slot(&tc, cdata::cdata_addr(obj).unwrap_or(0) + offset);
             cdata::cdata_write(obj, offset, &bytes);
             if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &idx.to_string(), value);
@@ -2442,8 +2442,8 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
         "simple" => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
-            cdata::release_bstr_slot(&tc, addr);
             let bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;
+            cdata::release_bstr_slot(&tc, addr);
             unsafe { host_ctypes::copy_bytes_to_address(addr, &bytes, element_size) };
             if cdata::is_cdata_instance(value) {
                 cdata::keep_ref(obj, &index.to_string(), value);

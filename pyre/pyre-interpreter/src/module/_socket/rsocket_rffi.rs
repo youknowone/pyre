@@ -100,6 +100,10 @@ pub const SO_ERROR: libc::c_int = ws::SO_ERROR;
 /// The code a call about a descriptor that is not a socket comes back with.
 #[cfg(windows)]
 pub const WSAENOTSOCK: i32 = ws::WSAENOTSOCK;
+/// The code a send that would have blocked comes back with — a buffer with no
+/// room left, which is the one failure a caller may choose to drop.
+#[cfg(windows)]
+pub const WSAEWOULDBLOCK: i32 = ws::WSAEWOULDBLOCK;
 /// The code an expired wait reports, so a timeout this module times itself
 /// reads back the same as one the host produced.
 #[cfg(windows)]

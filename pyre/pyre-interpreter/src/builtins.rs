@@ -6871,6 +6871,21 @@ pub(crate) fn clear_crt_errno() {
     }
 }
 
+/// Put back an errno read earlier, so a call made in between leaves the cell
+/// as the surrounding code left it.  Windows-only for the same reason
+/// [`clear_crt_errno`] is.
+#[cfg(windows)]
+pub(crate) fn set_crt_errno(value: i32) {
+    #[cfg(feature = "host_env")]
+    {
+        rustpython_host_env::os::set_errno(value);
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let _ = value;
+    }
+}
+
 /// The errno the last C runtime call reported.
 pub(crate) fn crt_errno() -> i32 {
     #[cfg(all(windows, feature = "host_env"))]

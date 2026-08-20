@@ -1980,7 +1980,18 @@ fn interrupt_main(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                         err
                     }
                 })?;
-            i32::try_from(value).map_err(|_| c_long_overflow())?
+            // `PyLong_AsLong` reports the width of the platform's C `long`
+            // first — 32 bits under MSVC, so everything out of range is that
+            // one message there — and `getargs.c`'s `'i'` then range-checks
+            // the result against a C `int` with two messages of its own.
+            let value = std::ffi::c_long::try_from(value).map_err(|_| c_long_overflow())?;
+            i32::try_from(value).map_err(|_| {
+                crate::PyError::overflow_error(if value > 0 {
+                    "signed integer is greater than maximum"
+                } else {
+                    "signed integer is less than minimum"
+                })
+            })?
         }
         #[cfg(not(target_arch = "wasm32"))]
         None => libc::SIGINT,
