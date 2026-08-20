@@ -1521,6 +1521,35 @@ impl UnrollOptimizer {
                 }
                 {
                     let mut visited_force: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+                    // `shortpreamble.py:250` keeps the produced short boxes in a
+                    // DICT and looks them up by box (`:284`, `:312`, `:338`,
+                    // `:347`). pyre held a list and rescanned it per argument,
+                    // and every probe called `get_replacement_opref`, which
+                    // walks the producer maps and then the forwarding chain --
+                    // so the scan is quadratic in the entry count with an
+                    // expensive comparison.
+                    //
+                    // A virtualizable array contributes one entry per DECLARED
+                    // element whether or not the loop reads it, so the
+                    // quadratic term is paid in the square of the declared
+                    // length: the one-time compile cost of the same machine
+                    // goes 0.20 ms at 8 slots to 364 ms at 1792.
+                    //
+                    // The scan asked for `resolved(source) == arg && source !=
+                    // arg`. Keying by `resolved(source)` makes `arg` the key,
+                    // and since the key IS `resolved(source)`, `source != arg`
+                    // is just `source != resolved(source)` -- decidable once,
+                    // here. `or_insert` keeps the FIRST entry per key, which is
+                    // what `find` returned.
+                    let mut produced_by_resolved = std::collections::HashMap::new();
+                    for (_, produced) in exported_short_boxes_produced.iter() {
+                        let source = produced.res.to_opref();
+                        let resolved_source = final_ctx.get_replacement_opref(source);
+                        if resolved_source == source {
+                            continue;
+                        }
+                        produced_by_resolved.entry(resolved_source).or_insert(produced);
+                    }
                     for op in p2_ops.iter() {
                         if op.opcode == OpCode::Jump {
                             continue;
@@ -1541,12 +1570,7 @@ impl UnrollOptimizer {
                             let needs_force = final_ctx.potential_extra_ops.contains_key(&arg)
                                 || final_ctx.potential_extra_ops.contains_key(&resolved);
                             if !needs_force
-                                && let Some((_, produced)) =
-                                    exported_short_boxes_produced.iter().find(|(_, produced)| {
-                                        let source = produced.res.to_opref();
-                                        source != arg
-                                            && final_ctx.get_replacement_opref(source) == arg
-                                    })
+                                && let Some(produced) = produced_by_resolved.get(&arg).copied()
                             {
                                 let preamble_op = crate::optimizeopt::info::PreambleOp {
                                     op: produced.res.clone(),
