@@ -727,8 +727,7 @@ pub struct OptContext {
     /// `Rc::ptr_eq` key would silent-miss the pop. Re-keying to box identity
     /// is gated on the same short-preamble / InputArg identity unification
     /// that defers `resolve_box_box`'s InputArg arm (#9).
-    pub(crate) potential_extra_ops:
-        indexmap::IndexMap<OpRef, crate::optimizeopt::info::PreambleOp>,
+    pub(crate) potential_extra_ops: indexmap::IndexMap<OpRef, crate::optimizeopt::info::PreambleOp>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
     active_short_preamble_producer:

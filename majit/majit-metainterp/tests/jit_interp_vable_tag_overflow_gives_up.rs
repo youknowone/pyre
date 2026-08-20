@@ -116,9 +116,7 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32) -> i64 {
 /// losing iterations is not.
 #[test]
 fn a_virtualizable_too_large_to_number_still_interprets_correctly() {
-    let program = vec![
-        OP_PUSH1, OP_PUSH2, OP_ADD, OP_DRAIN, OP_BACK, OP_RET,
-    ];
+    let program = vec![OP_PUSH1, OP_PUSH2, OP_ADD, OP_DRAIN, OP_BACK, OP_RET];
     // Kept small on purpose: every compile attempt at this declared length pays
     // the numbering cost, and the trace is re-attempted after each giveup, so the
     // iteration count is what sets the test's runtime. The unfixed tree loses all
@@ -132,7 +130,8 @@ fn a_virtualizable_too_large_to_number_still_interprets_correctly() {
 
     let warm = mainloop(&program, ITERATIONS, 3);
     assert_eq!(
-        warm, cold,
+        warm,
+        cold,
         "a virtualizable that cannot be numbered must abandon the compile and \
          keep interpreting; instead {} of {ITERATIONS} iterations survived",
         warm / 3

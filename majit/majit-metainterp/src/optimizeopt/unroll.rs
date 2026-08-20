@@ -1548,7 +1548,9 @@ impl UnrollOptimizer {
                         if resolved_source == source {
                             continue;
                         }
-                        produced_by_resolved.entry(resolved_source).or_insert(produced);
+                        produced_by_resolved
+                            .entry(resolved_source)
+                            .or_insert(produced);
                     }
                     for op in p2_ops.iter() {
                         if op.opcode == OpCode::Jump {
