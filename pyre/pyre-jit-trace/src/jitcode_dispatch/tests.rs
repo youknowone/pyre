@@ -904,6 +904,101 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
     }
 }
 
+/// A seeded vable whose index register carries no concrete value must abort
+/// to `VableArrayIndexNotConcrete`.
+///
+/// `pyjitpl.py _get_arrayitem_vable_index` reaches the slot through
+/// `indexbox.getint()` after `implement_guard_value(indexbox, pc)`, so the
+/// index is a constant by the time the slot is chosen.  pyre promotes the same
+/// way (`walker_promote_vable_array_index`) but has to read the concrete value
+/// out of the walker first, and an `OpRef` with no recorded concrete cannot
+/// supply one — the array slot would otherwise be picked from a value the
+/// trace never pinned.
+///
+/// The abort itself never fires on the synth corpus (measured: 0 across the
+/// 374 fixtures that trace, where `VableEscapedDuringResidualCall` takes 123).
+/// That is the reason to pin it rather than not: nothing else would notice if
+/// a refactor made this path unreachable, or made it fire where the promote
+/// should have carried the index.
+#[test]
+fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
+    // operand 0 (the box) at code[pc+1], operand 1 (the index) at code[pc+2].
+    let code = [0u8, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00];
+    for (key, opname, argcodes) in [
+        (
+            "getarrayitem_vable_i/riXdd>i",
+            "getarrayitem_vable_i",
+            "riXdd>i",
+        ),
+        (
+            "setarrayitem_vable_i/riXdd",
+            "setarrayitem_vable_i",
+            "riXdd",
+        ),
+    ] {
+        let descr_pool: Vec<DescrRef> = Vec::new();
+        let mut tc = fresh_trace_ctx();
+        // Ref reg 0 is seeded, so the `VableBoxNotSeeded` guard above lets this
+        // through; int reg 1 holds an `OpRef` the walker never gave a concrete.
+        let mut regs_r = vec![OpRef::input_arg_ref(0)];
+        let mut regs_i = vec![OpRef::NONE, OpRef::NONE];
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let mut wc = WalkContext {
+            callee_shadow: None,
+            inline_callee_consts: None,
+            fbw_mode: test_fbw_mode(),
+            session: &session,
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            concrete_registers_i: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            raw_descrs: RawDescrPool::Global,
+            is_authoritative_executor: false,
+            outer_active_boxes: Vec::new(),
+            pending_guard_snapshot_error: None,
+            vstack_boxes: Vec::new(),
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_reorder_saved: None,
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        let op = DecodedOp {
+            key,
+            opname,
+            argcodes,
+            pc: 0,
+            next_pc: code.len(),
+        };
+        let result = match opname {
+            "getarrayitem_vable_i" => getarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'i'),
+            "setarrayitem_vable_i" => setarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'i'),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(
+                result,
+                Err(DispatchError::VableArrayIndexNotConcrete { pc: 0, .. })
+            ),
+            "{opname} must abort VableArrayIndexNotConcrete on an unpinned index, got {result:?}",
+        );
+    }
+}
+
 /// `_opimpl_getarrayitem_vable` (pyjitpl.py:1218-1230) and
 /// `_opimpl_setarrayitem_vable` (:1236-1247) take the
 /// `_nonstandard_virtualizable` decision FIRST, and their non-standard branch

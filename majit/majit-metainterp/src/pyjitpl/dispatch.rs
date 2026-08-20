@@ -13462,4 +13462,21 @@ mod tests {
             )]
         );
     }
+
+    /// The two panics `TraceCtx::vable_snapshot_buildable` exists to keep
+    /// unreachable.  Its caller reports a false answer as
+    /// `GuardSnapshotVableUntyped` and aborts to interpretation; these pin
+    /// what that abort is worth, one per untyped position, since the
+    /// identity slot and the rest are read by separate arms above.
+    #[test]
+    #[should_panic(expected = "virtualizable identity must be typed")]
+    fn build_vable_snapshot_boxes_panics_on_an_untyped_identity() {
+        build_vable_snapshot_boxes(&[majit_ir::OpRef::int_op(3), majit_ir::OpRef::NONE]);
+    }
+
+    #[test]
+    #[should_panic(expected = "virtualizable_boxes entry must be typed")]
+    fn build_vable_snapshot_boxes_panics_on_an_untyped_entry() {
+        build_vable_snapshot_boxes(&[majit_ir::OpRef::NONE, majit_ir::OpRef::ref_op(7)]);
+    }
 }
