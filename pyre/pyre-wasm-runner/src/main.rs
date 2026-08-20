@@ -743,6 +743,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "bridge_param_label_suppressed",
                 "inline_decl_label_resume_layout",
                 "inline_decl_call_assembler",
+                "inline_decl_owner_invalidated",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

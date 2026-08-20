@@ -3023,3 +3023,203 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
         "non_moving descrs must not reach the nursery helpers"
     );
 }
+
+/// Minimal `FailDescr` for driving `Backend::compile_bridge` from the host.
+/// `trace_id` defaults to 0, which is also a freshly compiled loop's, so the
+/// bridge reads as a direct guard of the source loop.
+#[derive(Debug)]
+struct HostFailDescr {
+    fail_index: u32,
+    arg_types: Vec<Type>,
+}
+
+impl majit_ir::Descr for HostFailDescr {}
+
+impl majit_ir::descr::FailDescr for HostFailDescr {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.arg_types
+    }
+}
+
+/// A two-input loop whose single LABEL sits at the entry, so
+/// `stamp_and_publish_label_targets` publishes it as a re-enterable target and
+/// a bridge closing onto `label_descr` resolves in-module.
+fn host_loop_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::rc::Rc<Op>> {
+    let label = std::rc::Rc::new(Op::new(
+        OpCode::Label,
+        &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+    ));
+    label.setdescr(label_descr.clone());
+    let advance = std::rc::Rc::new(make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+        OpRef::int_op(2),
+    ));
+    let guard = std::rc::Rc::new(make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::int_op(2)],
+        &[OpRef::int_op(2), OpRef::input_arg_int(1)],
+    ));
+    // Bind the JUMP to the real producer, not to a synthetic stand-in: the
+    // loop-carried advance is read off the arg's producing opcode.
+    let jump = std::rc::Rc::new(Op::new(
+        OpCode::Jump,
+        &[
+            Operand::from_bound_op(&advance),
+            rb(OpRef::input_arg_int(1)),
+        ],
+    ));
+    jump.setdescr(label_descr.clone());
+    vec![label, advance, guard, jump]
+}
+
+/// A loop-closing bridge for the loop above: it advances one loop-carried
+/// value and jumps back onto the owner's published label.
+fn host_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<std::rc::Rc<Op>> {
+    let advance = std::rc::Rc::new(make_op(
+        OpCode::IntAdd,
+        &[OpRef::input_arg_int(40), OpRef::const_int(1)],
+        OpRef::int_op(42),
+    ));
+    let jump = std::rc::Rc::new(Op::new(
+        OpCode::Jump,
+        &[
+            Operand::from_bound_op(&advance),
+            rb(OpRef::input_arg_int(41)),
+        ],
+    ));
+    jump.setdescr(label_descr.clone());
+    vec![advance, jump]
+}
+
+fn host_bridge_inputargs() -> Vec<InputArg> {
+    vec![
+        InputArg::from_type(Type::Int, 40),
+        InputArg::from_type(Type::Int, 41),
+    ]
+}
+
+/// The global fail-descr space is appended to under the assumption that no
+/// other compile interleaves (`failguard.rs register_fail_descrs`), which the
+/// single-threaded wasm host guarantees and a parallel test runner does not.
+static HOST_COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn host_loop_inputargs() -> Vec<InputArg> {
+    vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ]
+}
+
+/// The complement of the decline below. With the same owner, guard and bridge
+/// but no invalidation, nothing short-circuits the inline arm: the trial runs
+/// every accept precondition and reaches the merged install. On the host that
+/// install cannot complete — there is no wasm host, so the owner's module was
+/// never materialized and the rebuild refuses — which is what `bridge_diag(37)`
+/// records. So this does not assert an accepted inline (only a wasm host can
+/// produce one); it pins that the invalidation decline is the ONLY thing
+/// separating the two tests.
+#[test]
+fn a_valid_owner_reaches_the_inline_trial() {
+    use majit_backend::Backend;
+
+    let _serialized = HOST_COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    let token = majit_backend::JitCellToken::new(1);
+    let label_descr = majit_ir::make_loop_target_descr(70, false);
+
+    backend
+        .compile_loop(&host_loop_inputargs(), &host_loop_ops(&label_descr), &token)
+        .expect("the owner loop compiles");
+    assert!(!token.is_invalidated());
+
+    let fail_descr = HostFailDescr {
+        fail_index: 0,
+        arg_types: vec![Type::Int, Type::Int],
+    };
+    let declines_before = majit_backend_wasm::bridge_diag(50);
+    let trials_before = majit_backend_wasm::bridge_diag(37);
+    backend
+        .compile_bridge(
+            &fail_descr,
+            &host_bridge_inputargs(),
+            &host_bridge_ops(&label_descr),
+            &token,
+            &[],
+            None,
+        )
+        .expect("the loop-closing bridge compiles");
+
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(50),
+        declines_before,
+        "a valid owner is not declined by the invalidation arm"
+    );
+    assert!(
+        majit_backend_wasm::bridge_diag(37) > trials_before,
+        "the inline trial reached the merged install"
+    );
+}
+
+/// `model.py:145-152`, pinned upstream by `runner_test.py
+/// test_guard_not_invalidated` steps 3 and 4: a bridge compiled AFTER
+/// `invalidate_loop` starts valid, and only a LATER invalidation activates its
+/// GUARD_NOT_INVALIDATED.
+///
+/// A merged region cannot honour that. It runs from the owner's module, whose
+/// `invalidated_flag_addr` is the owner's root flag — already set once the
+/// owner is invalidated — so the region would be dead the moment it is
+/// installed. The inline arm therefore declines on an invalidated owner and
+/// leaves the out-of-line path to mint the fresh, clear generation.
+#[test]
+fn a_bridge_compiled_after_the_owner_was_invalidated_starts_valid() {
+    use majit_backend::Backend;
+
+    let _serialized = HOST_COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    let token = majit_backend::JitCellToken::new(1);
+    let label_descr = majit_ir::make_loop_target_descr(71, false);
+
+    backend
+        .compile_loop(&host_loop_inputargs(), &host_loop_ops(&label_descr), &token)
+        .expect("the owner loop compiles");
+    assert!(
+        token.latest_bridge_invalidation_flag().is_none(),
+        "no bridge generation exists before any bridge is compiled"
+    );
+
+    token.invalidate();
+    assert!(token.is_invalidated());
+
+    let fail_descr = HostFailDescr {
+        fail_index: 0,
+        arg_types: vec![Type::Int, Type::Int],
+    };
+    let declines_before = majit_backend_wasm::bridge_diag(50);
+    backend
+        .compile_bridge(
+            &fail_descr,
+            &host_bridge_inputargs(),
+            &host_bridge_ops(&label_descr),
+            &token,
+            &[],
+            None,
+        )
+        .expect("the loop-closing bridge compiles out of line");
+
+    assert!(
+        majit_backend_wasm::bridge_diag(50) > declines_before,
+        "the inline arm must decline an invalidated owner"
+    );
+    let generation = token
+        .latest_bridge_invalidation_flag()
+        .expect("the out-of-line path mints a generation for this bridge");
+    assert!(
+        !generation.load(std::sync::atomic::Ordering::Acquire),
+        "a bridge compiled after invalidate_loop starts valid"
+    );
+}

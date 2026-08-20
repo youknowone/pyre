@@ -84,8 +84,10 @@ use std::sync::{Arc, Mutex};
 /// declined because the source guard and bridge input arities disagree; 47 =
 /// LABEL publication suppressed because the bridge entry has nonzero parameters.
 /// 48 = an inline trial's LABEL-resume storage exceeds the frozen frame; 49 =
-/// the region carries a CALL_ASSEMBLER the owner build emits no arm for.
-pub static BRIDGE_DIAG: [AtomicU64; 50] = [const { AtomicU64::new(0) }; 50];
+/// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
+/// the owner is already invalidated, so a merged region would inherit its set
+/// flag instead of starting valid.
+pub static BRIDGE_DIAG: [AtomicU64; 51] = [const { AtomicU64::new(0) }; 51];
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -3357,7 +3359,15 @@ impl majit_backend::Backend for WasmBackend {
         }
 
         if inline_bridge_enabled() {
-            if !is_direct {
+            // `model.py:145-152`: a bridge compiled after `invalidate_loop`
+            // starts valid, and only a later invalidation activates its
+            // GUARD_NOT_INVALIDATED (`runner_test.py test_guard_not_invalidated`
+            // steps 3-4). A merged region reads the owner's root flag, which is
+            // already set here, so it would be dead on arrival. Decline, and let
+            // the out-of-line path mint the fresh flag that keeps the contract.
+            if original_token.is_invalidated() {
+                diag_bump(50);
+            } else if !is_direct {
                 diag_bump(33);
             } else if !bridge_is_loop_closing {
                 diag_bump(34);

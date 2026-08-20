@@ -3965,6 +3965,26 @@ mod tests {
         token.invalidate();
         assert!(bridge_flag.load(std::sync::atomic::Ordering::Acquire));
         assert!(token.is_invalidated());
+
+        // And this is why a merged region may not be installed into an
+        // invalidated owner: recording the root hands back a flag that is
+        // ALREADY set, where `model.py:145-152` says a bridge compiled after an
+        // invalidation starts valid and only a later one activates its guard
+        // (`runner_test.py test_guard_not_invalidated`, steps 3-4). Minting
+        // still obeys that; recording cannot, so the wasm inline arm declines
+        // on `is_invalidated()` and lets the out-of-line path mint.
+        token.record_bridge_invalidation_flag(token.invalidation_flag());
+        assert!(
+            token
+                .latest_bridge_invalidation_flag()
+                .unwrap()
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            !token
+                .mint_bridge_invalidation_flag()
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
     }
 
     #[test]
