@@ -540,15 +540,6 @@ impl GuardStrengthenOpt {
         }
     }
 
-    #[allow(dead_code)]
-    fn set_guard(
-        guards: &mut indexmap::IndexMap<usize, Option<Guard>>,
-        idx: usize,
-        val: Option<Guard>,
-    ) {
-        guards.insert(idx, val);
-    }
-
     /// guard.py: eliminate_guards(loop)
     pub fn eliminate_guards(&mut self, ops: &[Op]) -> Vec<Op> {
         // guard.py:222: self.renamer = Renamer()

@@ -641,18 +641,6 @@ impl ResumeStorage {
         self.rd_consts.as_slice()
     }
 
-    /// Internal accessor for the GC root walker. SAFETY: caller must
-    /// ensure exclusive access — only the minor-collection walker in
-    /// `MetaInterp::walk_rd_consts_refs` uses this.
-    #[expect(
-        clippy::mut_from_ref,
-        reason = "The stop-the-world GC root walker is the sole writer and ResumeDataStorage owns an UnsafeCell-backed root vector; this unsafe accessor makes that externally enforced exclusivity explicit"
-    )]
-    #[allow(dead_code)]
-    pub(crate) unsafe fn rd_consts_mut_for_gc(&self) -> &mut Vec<Const> {
-        unsafe { self.rd_consts.as_mut_vec_for_gc() }
-    }
-
     pub fn with_shared_consts(
         rd_numb: Vec<u8>,
         rd_consts: Arc<majit_ir::SharedConstPool>,

@@ -377,11 +377,6 @@ impl OptString {
         }
     }
 
-    #[allow(dead_code)]
-    fn is_virtual_concat(&self, op: &Operand, ctx: &OptContext) -> bool {
-        self.get_concat_info(op, ctx).is_some()
-    }
-
     fn get_slice_info(&self, op: &Operand, ctx: &OptContext) -> Option<VStringSliceInfo> {
         match ctx.peek_ptr_info(op) {
             Some(PtrInfo::Str(sinfo)) => match sinfo.variant {
@@ -390,11 +385,6 @@ impl OptString {
             },
             _ => None,
         }
-    }
-
-    #[allow(dead_code)]
-    fn is_virtual_slice(&self, op: &Operand, ctx: &OptContext) -> bool {
-        self.get_slice_info(op, ctx).is_some()
     }
 
     /// vstring.py: read the string mode (0 = byte string, 1 = unicode) from

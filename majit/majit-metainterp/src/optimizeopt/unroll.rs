@@ -2564,13 +2564,6 @@ impl ExportedState {
             }
         }
 
-        #[allow(dead_code)]
-        fn visit_value(value: &mut Value, visitor: &mut dyn FnMut(&mut GcRef)) {
-            if let Value::Ref(gcref) = value {
-                visitor(gcref);
-            }
-        }
-
         fn visit_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
             let mut pos = op.pos.get();
             visit_opref(&mut pos, visitor);
