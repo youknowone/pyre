@@ -54,6 +54,12 @@ pub struct TargetToken {
     /// Short preamble: ops to replay when entering from a bridge.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     jump_target_descr: Arc<LoopTargetDescr>,
+    /// `IncrementalMiniMarkGC.old_objects_pointing_to_young` state for the
+    /// off-GC `TargetToken.virtual_state` / `short_preamble` graph.  Upstream
+    /// stores both fields on the GC-managed `history.TargetToken`: publishing
+    /// or mutating that object puts it in the remembered set for one minor,
+    /// and `collect_oldrefs_to_nursery` makes it clean after tracing it.
+    minor_scan_pending: bool,
 }
 
 impl Default for TargetToken {
@@ -70,6 +76,7 @@ impl TargetToken {
             virtual_state: None,
             short_preamble: None,
             jump_target_descr: Arc::new(LoopTargetDescr::new(0, false)),
+            minor_scan_pending: true,
         }
     }
 
@@ -90,6 +97,16 @@ impl TargetToken {
 
     pub fn as_jump_target_descr(&self) -> majit_ir::DescrRef {
         self.jump_target_descr.clone()
+    }
+
+    /// Consume this token's remembered-set membership for a minor walk.
+    pub(crate) fn take_minor_scan_pending(&mut self) -> bool {
+        std::mem::take(&mut self.minor_scan_pending)
+    }
+
+    /// Mirror MiniMark's write barrier after replacing a traced field.
+    pub(crate) fn mark_minor_scan_pending(&mut self) {
+        self.minor_scan_pending = true;
     }
 
     /// `compile.py:237` / `compile.py:289` — bind the freshly-made
@@ -1265,6 +1282,29 @@ mod tests {
 
     fn iop_box(pos: u32) -> Operand {
         rooted_resop_operand(Type::Int, pos)
+    }
+
+    #[test]
+    fn target_token_minor_scan_follows_minimark_remembered_set_lifetime() {
+        let mut token = TargetToken::new_loop(1);
+        assert!(token.take_minor_scan_pending());
+        assert!(!token.take_minor_scan_pending());
+
+        token.mark_minor_scan_pending();
+        assert!(token.take_minor_scan_pending());
+        assert!(!token.take_minor_scan_pending());
+    }
+
+    #[test]
+    fn target_token_clone_preserves_pending_or_clean_slots() {
+        let pending = TargetToken::new_loop(1);
+        let mut pending_clone = pending.clone();
+        assert!(pending_clone.take_minor_scan_pending());
+
+        let mut clean = TargetToken::new_loop(2);
+        assert!(clean.take_minor_scan_pending());
+        let mut clean_clone = clean.clone();
+        assert!(!clean_clone.take_minor_scan_pending());
     }
 
     #[test]

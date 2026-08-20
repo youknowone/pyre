@@ -3829,6 +3829,10 @@ impl OptUnroll {
                         && let Some(builder) = optimizer.short_preamble_producer.as_ref()
                     {
                         target_token.short_preamble = Some(builder.build_short_preamble_struct());
+                        // `history.TargetToken.short_preamble` is a traced GC
+                        // field upstream, so this replacement invokes the
+                        // normal MiniMark write barrier.
+                        target_token.mark_minor_scan_pending();
                     }
                 } else {
                     extra = Self::inline_short_preamble(

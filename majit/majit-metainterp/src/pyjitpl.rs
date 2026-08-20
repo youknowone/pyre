@@ -2234,11 +2234,18 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             for tt in entry.front_target_tokens.iter_mut() {
-                if let Some(virtual_state) = tt.virtual_state.as_mut() {
-                    virtual_state.walk_const_ptr_refs_mut(&mut visitor);
-                }
-                if let Some(sp) = tt.short_preamble.as_mut() {
-                    sp.walk_const_ptr_refs_mut(&mut visitor);
+                // `history.TargetToken` is a GC object upstream.  MiniMark
+                // visits it in a minor only while its write barrier is dirty;
+                // after forwarding its graph, clean tokens stay out of later
+                // minor walks until another traced-field store.  A major must
+                // still see every token graph.
+                if !is_minor || tt.take_minor_scan_pending() {
+                    if let Some(virtual_state) = tt.virtual_state.as_mut() {
+                        virtual_state.walk_const_ptr_refs_mut(&mut visitor);
+                    }
+                    if let Some(sp) = tt.short_preamble.as_mut() {
+                        sp.walk_const_ptr_refs_mut(&mut visitor);
+                    }
                 }
             }
         }
