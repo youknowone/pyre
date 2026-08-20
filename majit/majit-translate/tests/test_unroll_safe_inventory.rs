@@ -73,6 +73,24 @@ fn harvested_unroll_safe() -> Option<Vec<String>> {
         .map(|(path, _)| path.clone())
         .collect();
     paths.sort();
+    // `REVIEWED_UNROLL_SAFE` and the subset check below both match on the
+    // leaf, on the stated assumption that leaves are unambiguous across the
+    // interpreter.  Nothing else verifies that.  If an unreviewed function
+    // elsewhere later takes an already-reviewed leaf name and is hinted, the
+    // subset check would pass on the strength of the other function's review
+    // — the one outcome this file exists to prevent.
+    let mut leaves: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for path in &paths {
+        if let Some(previous) = leaves.insert(leaf(path), path.as_str()) {
+            panic!(
+                "leaf `{}` is ambiguous between {previous} and {path}. \
+                 REVIEWED_UNROLL_SAFE matches by leaf, so it cannot tell them \
+                 apart and one would ride on the other's review; key the \
+                 inventory by full path before adding either.",
+                leaf(path),
+            );
+        }
+    }
     if !paths.iter().any(|p| leaf(p) == CONTROL) {
         eprintln!(
             "skipping: {INTERPRETER_LLBC} carries no `unroll_safe` on {CONTROL}, \

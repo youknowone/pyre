@@ -6960,6 +6960,121 @@ mod tests {
         }
     }
 
+    /// `arraylen_vable` is a cross-layer contract: the codewriter picks the
+    /// key, `insns.rs` assigns its byte, and `MIFrame::read_vable_arraylen`
+    /// decodes `1B vable_reg + 2B fdescr + 2B adescr + 1B dest` and asserts
+    /// the descr pair is `(VableArray, Array)`.  Three files have to agree on
+    /// one wire shape, so pin the whole shape here rather than the opname
+    /// alone.
+    #[test]
+    fn assemble_vable_arraylen_emits_the_rdd_to_i_wire_shape() {
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer, VirtualizableFieldDescriptor};
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("vable_arraylen");
+        let base_var = push_input_var(&mut graph, "frame", ValueType::Ref(None));
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new("locals_stack_w", Some("Frame".into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let len_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayLen {
+                    base: array_var,
+                    array_type_id: None,
+                    nolength: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(len_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        // The driver that normally supplies this is
+        // `type_state::authoritative_result_types`, which answers `Signed` for
+        // `VableArrayLen`; this test drives `Transformer` directly, so state
+        // it here rather than depend on a pass it does not run.
+        FunctionGraph::set_concretetype_of_inline(
+            &len_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                crate::layout::target_word_size(),
+                false,
+            )],
+            ..Default::default()
+        };
+        let mut rewritten = Transformer::new(&config).transform(&graph).graph;
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        assert!(
+            asm.insns.contains_key("arraylen_vable/rdd>i"),
+            "a vable array length must assemble to `arraylen_vable/rdd>i`, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("arraylen_gc")),
+            "the raw `arraylen_gc` must be gone, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+
+        // The two descrs, in the order the decoder reads them.
+        let ready: Vec<&crate::jitcode::BhDescr> = asm
+            .descrs
+            .iter()
+            .filter_map(|d| match d {
+                AssemblerDescr::Ready(b) => Some(&**b),
+                _ => None,
+            })
+            .collect();
+        let vable_at = ready
+            .iter()
+            .position(|d| matches!(d, crate::jitcode::BhDescr::VableArray { index: 0 }))
+            .unwrap_or_else(|| panic!("no VableArray descr minted, got {ready:?}"));
+        let array_at = ready
+            .iter()
+            .position(|d| matches!(d, crate::jitcode::BhDescr::Array { .. }))
+            .unwrap_or_else(|| panic!("no Array descr minted, got {ready:?}"));
+        assert!(
+            vable_at < array_at,
+            "the vable-array descr must precede the array descr, got {ready:?}"
+        );
+        let crate::jitcode::BhDescr::Array {
+            base_size,
+            itemsize,
+            len_offset,
+            is_array_of_pointers,
+            ..
+        } = ready[array_at]
+        else {
+            unreachable!("checked by the position above");
+        };
+        let word = crate::layout::target_word_size();
+        assert_eq!((*base_size, *itemsize, *len_offset), (word, word, Some(0)));
+        assert!(is_array_of_pointers);
+    }
+
     #[test]
     fn assemble_typed_reads_use_canonical_non_v_opnames() {
         use crate::flatten::flatten_graph;

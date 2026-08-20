@@ -321,12 +321,24 @@ impl VirtualizableTracker {
             // relies on its caller to patch the lengths in, so name the
             // unpatched config here rather than letting it read as "this
             // trace had no array elements".
+            // The zip below pairs `array_field_offsets` with `array_lengths`,
+            // so a short `array_lengths` does not fail — it silently drops the
+            // tail, seeding some arrays and leaving the rest untracked.  An
+            // empty vector is only the loudest case of that, so require the
+            // whole invariant rather than non-emptiness.
             debug_assert!(
                 !self.config.track_array_elements
-                    || self.config.array_field_offsets.is_empty()
-                    || !self.config.array_lengths.is_empty(),
-                "array-tracking config reached the optimizer with unseeded array_lengths; \
-                 see MetaInterp::current_virtualizable_optimizer_config",
+                    || self.config.array_lengths.len() == self.config.array_field_offsets.len(),
+                "array-tracking config reached the optimizer with {} array_lengths for {} \
+                 array fields; the zip below would pair only {} of them and leave the rest \
+                 unseeded, so `tracked_array_element` can never hit for those — see \
+                 MetaInterp::current_virtualizable_optimizer_config",
+                self.config.array_lengths.len(),
+                self.config.array_field_offsets.len(),
+                self.config
+                    .array_lengths
+                    .len()
+                    .min(self.config.array_field_offsets.len()),
             );
             if self.config.track_array_elements {
                 for (array_idx, (&_offset, &length)) in self
@@ -3752,7 +3764,7 @@ mod tests {
     /// absorb it silently, leaving every `tracked_array_element` a miss that
     /// reads as "this trace had no array elements".
     #[test]
-    #[should_panic(expected = "unseeded array_lengths")]
+    #[should_panic(expected = "array_lengths for")]
     fn array_tracking_config_without_lengths_is_named_not_absorbed() {
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
@@ -3763,6 +3775,33 @@ mod tests {
             array_item_types: vec![Type::Ref],
             array_field_descrs: vec![],
             array_lengths: vec![],
+            vable_input_offset: 0,
+            identity_input_index: Some(0),
+            track_array_elements: true,
+        });
+        pass.setup();
+        if let Some(ref mut vt) = pass.vable {
+            vt.ensure_setup(&mut ctx);
+        }
+    }
+
+    /// A length vector shorter than the field list is the case a
+    /// non-emptiness check cannot see: `zip` pairs what it can and drops the
+    /// rest, so the first array is seeded, the second is not, and
+    /// `tracked_array_element` misses for it exactly as if no config had
+    /// arrived at all.
+    #[test]
+    #[should_panic(expected = "array_lengths for")]
+    fn a_partial_array_lengths_vector_is_named_not_truncated() {
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![],
+            static_field_types: vec![],
+            static_field_descrs: vec![],
+            array_field_offsets: vec![48, 56],
+            array_item_types: vec![Type::Ref, Type::Ref],
+            array_field_descrs: vec![],
+            array_lengths: vec![4],
             vable_input_offset: 0,
             identity_input_index: Some(0),
             track_array_elements: true,

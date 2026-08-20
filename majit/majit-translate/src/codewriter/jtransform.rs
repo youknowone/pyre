@@ -3036,13 +3036,23 @@ impl<'a> Transformer<'a> {
         // of the field at all; tracking it would drop the op and leave the
         // address's consumer with an undefined operand.
         let fresh_virtualizable = fresh_virtualizable || field.suppresses_virtualizable();
+        // `lower_virtualizable` guards the four sibling dispatch arms —
+        // `rewrite_op_setfield`, `rewrite_op_getarrayitem`,
+        // `rewrite_op_setarrayitem`, `rewrite_op_getarraysize`.  This function
+        // runs whether or not the flag is set, because the quasi-immutable
+        // tail below is independent of virtualizable lowering; the two
+        // virtualizable arms here are not.  With the flag off, the array arm
+        // would register a base no consumer will ever read and drop a read
+        // those consumers still reference, leaving regalloc an undefined
+        // variable.  The field's own doc covers "field/array accesses" — both.
+        let lower_vable = self.config.lower_virtualizable && !fresh_virtualizable;
         // Track virtualizable array field reads
         if let Some(array_field) = self
             .config
             .vable_arrays
             .iter()
             .find(|c| c.matches(field))
-            .filter(|_| !fresh_virtualizable)
+            .filter(|_| lower_vable)
             && let Some(result) = op.result.clone()
         {
             // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
@@ -3076,7 +3086,7 @@ impl<'a> Transformer<'a> {
             .vable_fields
             .iter()
             .find(|c| c.matches(field))
-            .filter(|_| !fresh_virtualizable)
+            .filter(|_| lower_vable)
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -8563,6 +8573,69 @@ mod tests {
         };
         assert_eq!(*array_index, 0);
         assert_eq!(rewritten_base, &base_var_held);
+    }
+
+    /// With `lower_virtualizable` off, the array field read stays: the four
+    /// consumer arms are gated on that flag, so dropping the read would leave
+    /// them referencing a variable nothing defines.
+    ///
+    /// `rewrite_op_getfield` is the one member of the family that runs
+    /// ungated — the quasi-immutable tail below it does not depend on
+    /// virtualizable lowering — which is exactly why its two virtualizable
+    /// arms need the check the dispatch would otherwise have made.
+    #[test]
+    fn a_vable_array_read_is_kept_when_virtualizable_lowering_is_off() {
+        let mut graph = FunctionGraph::new("test");
+        let base_var = graph.alloc_value_var();
+        let index_var = graph.alloc_value_var();
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base: array_var.clone(),
+                index: index_var,
+                item_ty: ValueType::Int,
+                array_type_id: None,
+                nolength: false,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            lower_virtualizable: false,
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
+        assert_eq!(result.vable_rewrites, 0);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| op.result.as_ref() == Some(&array_var)),
+            "with lowering off the array read must still be defined, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+        );
     }
 
     /// `jtransform.py:808-817 rewrite_op_getarraysize` — the third

@@ -9210,20 +9210,21 @@ impl<'a> Lowering<'a> {
             && crate::front::iter_next::is_iterator_next_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
         {
-            // A slice iterator yields `Option<&T>`; peel the `&` so the
+            // A slice iterator yields `Option<&T>`; peel that one `&` so the
             // recorded kind is the item's own, the way `ll_listnext` hands
-            // back the list's item repr rather than a pointer to it.  An
-            // unreadable shape records `Ref(None)` — the answer the fold
-            // assumed unconditionally before this was carried, so an
-            // unreadable type keeps today's behaviour instead of inventing
-            // a new one.
+            // back the list's item repr rather than a pointer to it — and
+            // only that one, so an element that is itself a reference stays
+            // reference-typed.  An unreadable shape records `Ref(None)` — the
+            // answer the fold assumed unconditionally before this was
+            // carried, so an unreadable type keeps today's behaviour instead
+            // of inventing a new one.
             let item_ty = crate::front::result_exc::tyref_option_payload(&call.dest.ty, self.llbc)
                 .and_then(|payload| {
                     let body = match &payload {
                         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
                         TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
                     };
-                    let item = strip_ty_wrappers(body, self.llbc)?;
+                    let item = iterator_payload_element(body, self.llbc)?;
                     serde_json::from_value::<TyRef>(item.clone()).ok()
                 })
                 .map(|ty| tyref_to_value_type(&ty, self.llbc))
@@ -16801,6 +16802,58 @@ fn strip_ty_wrappers<'l>(
         return Some(node);
     }
     None
+}
+
+/// Strip only the indirection wrappers — `{"Deduplicated": id}` and
+/// `{"HashConsedValue": [id, ty]}` — leaving any `Ref` in place.
+///
+/// [`strip_ty_wrappers`] peels `Ref` too, and peels it repeatedly.  A caller
+/// that must account for exactly one reference level cannot use it: over
+/// `&&i64` it answers `i64`, which is the item type of neither.
+fn strip_ty_indirections<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return Some(node);
+    }
+    None
+}
+
+/// The element type behind an iterator's `next()` payload.
+///
+/// A slice iterator yields `Option<&T>`, so exactly one reference level
+/// belongs to the iterator and the rest belongs to the element: over
+/// `&[i64]` the payload is `&i64` and the element is `i64`, but over
+/// `&[&i64]` it is `&&i64` and the element is `&i64` — a pointer, which
+/// belongs in the Ref bank.  Peeling every `Ref` would put that pointer in
+/// the integer bank.
+///
+/// A by-value iterator (`[i64; N]`, `Vec<i64>`) hands back the item itself
+/// with no reference to peel, so a payload that is not a `Ref` is already
+/// the element.
+fn iterator_payload_element<'l>(
+    payload: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let node = strip_ty_indirections(payload, llbc)?;
+    let Some(arr) = node.get("Ref").and_then(serde_json::Value::as_array) else {
+        return Some(node);
+    };
+    strip_ty_indirections(arr.get(1)?, llbc)
 }
 
 /// De Bruijn *index* of a `{"TypeVar": {"Bound": [depth, index]}}` node.
