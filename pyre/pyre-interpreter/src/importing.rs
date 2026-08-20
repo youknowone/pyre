@@ -1737,6 +1737,7 @@ fn extension_module_spec(name: &str, pathname: &Path) -> PyObjectRef {
     spec
 }
 
+#[allow(dead_code)]
 fn set_extension_module_spec(
     name: &str,
     pathname: &Path,

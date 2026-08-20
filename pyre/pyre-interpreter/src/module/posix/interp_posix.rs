@@ -8980,7 +8980,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ))]
         {
             struct SpawnScheduler {
+                #[allow(dead_code)]
                 policy: Option<libc::c_int>,
+                #[allow(dead_code)]
                 param: libc::sched_param,
             }
 

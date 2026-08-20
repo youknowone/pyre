@@ -725,6 +725,7 @@ pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationRes
 ///   produced by `RegisterLayout::compute`; `enforce_input_args` pins
 ///   their colors as well.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub(super) struct ExternalInputs {
     pub portal_frame_reg: u16,
     pub portal_ec_reg: u16,
@@ -777,6 +778,7 @@ pub(super) fn rename_lookup(rename: &[Vec<u16>; 3], kind: Kind, pre: u16) -> u16
 /// Ref-kind Variable (locals, stack, last_exc pair).
 ///
 /// RPython parity: `codewriter.py:45-47, 62-67`.
+#[allow(dead_code)]
 pub(super) fn allocate_registers(
     ssarepr: &SSARepr,
     nlocals: usize,
@@ -883,6 +885,7 @@ pub(super) fn allocate_registers(
 /// at `enforce_input_args` (free function) above and retires this
 /// variant when the walker defers SSARepr emission to
 /// `codewriter.py:53 flatten_graph(graph, regallocs, cpu)`.
+#[allow(dead_code)]
 fn enforce_ssarepr_input_args(
     allocators: &mut [SSAReprRegAllocator; 3],
     nlocals: usize,
@@ -957,6 +960,7 @@ fn enforce_ssarepr_input_args(
 ///      dst so the chordal coloring reuses one color.  Runs after
 ///      the CFG pass so the pyre-only source defers to upstream's
 ///      link-driven priority on conflict.
+#[allow(dead_code)]
 fn perform_ssarepr_register_allocation(
     ssarepr: &SSARepr,
     kind: Kind,
@@ -1008,6 +1012,7 @@ fn perform_ssarepr_register_allocation(
 ///     def getcolor(self, v): ...
 ///     def swapcolors(self, col1, col2): ...
 /// ```
+#[allow(dead_code)]
 struct SSAReprRegAllocator {
     depgraph: DependencyGraph<u16>,
     /// Union-find over register indices (RPython
@@ -1020,6 +1025,7 @@ struct SSAReprRegAllocator {
 }
 
 impl SSAReprRegAllocator {
+    #[allow(dead_code)]
     fn new() -> Self {
         Self {
             depgraph: DependencyGraph::new(),
@@ -1030,6 +1036,7 @@ impl SSAReprRegAllocator {
     }
 
     /// `unionfind.find_rep` with path compression.
+    #[allow(dead_code)]
     fn find_rep(&mut self, v: u16) -> u16 {
         if !self.unionfind.contains_key(&v) {
             self.unionfind.insert(v, v);
@@ -1051,6 +1058,7 @@ impl SSAReprRegAllocator {
 
     /// `unionfind.union` — weighted union, matching
     /// `rpython/tool/algo/unionfind.py:67-91`.
+    #[allow(dead_code)]
     fn union(&mut self, v0: u16, w0: u16) -> u16 {
         let r1 = self.find_rep(v0);
         let r2 = self.find_rep(w0);
@@ -1075,6 +1083,7 @@ impl SSAReprRegAllocator {
     /// `SSARepr`, so the equivalent live-set computation is done in
     /// a backward sweep with a fixpoint over labels (analogous to
     /// `liveness.py`'s alive-set propagation).
+    #[allow(dead_code)]
     fn make_dependencies(&mut self, ssarepr: &SSARepr, kind: Kind, external_inputs: &[u16]) {
         // regalloc.py:54-60 `for i, v in enumerate(livevars):
         //   ... for j in range(i): dg.add_edge(livevars[j], v)`.
@@ -1186,6 +1195,7 @@ impl SSAReprRegAllocator {
     /// of FunctionGraph-level link.args coalescing. The effect is a
     /// strict subset of RPython's because pyre still does not see the
     /// original cross-block link representation.
+    #[allow(dead_code)]
     fn coalesce_variables(&mut self, ssarepr: &SSARepr, kind: Kind) {
         let copy_op = match kind {
             Kind::Int => "int_copy",
@@ -1216,6 +1226,7 @@ impl SSAReprRegAllocator {
     }
 
     /// `regalloc.py:98-112` `RegAllocator._try_coalesce`.
+    #[allow(dead_code)]
     fn try_coalesce(&mut self, v: u16, w: u16) {
         let v0 = self.find_rep(v);
         let w0 = self.find_rep(w);
@@ -1234,6 +1245,7 @@ impl SSAReprRegAllocator {
     }
 
     /// `regalloc.py:114-120` `RegAllocator.find_node_coloring`.
+    #[allow(dead_code)]
     fn find_node_coloring(&mut self) {
         let coloring = self.depgraph.find_node_coloring();
         // RPython stores coloring keyed by union-find rep; pyre
@@ -1258,6 +1270,7 @@ impl SSAReprRegAllocator {
     }
 
     /// `regalloc.py:129-130` `RegAllocator.getcolor`.
+    #[allow(dead_code)]
     fn getcolor(&mut self, v: u16) -> Option<u16> {
         let rep = self.find_rep(v);
         // The expanded coloring always carries per-register entries
@@ -1269,6 +1282,7 @@ impl SSAReprRegAllocator {
     }
 
     /// `regalloc.py:138-143` `RegAllocator.swapcolors`.
+    #[allow(dead_code)]
     fn swapcolors(&mut self, col1: u16, col2: u16) {
         for color in self.coloring.values_mut() {
             if *color == col1 {
@@ -1281,12 +1295,14 @@ impl SSAReprRegAllocator {
 
     /// `rpython/tool/algo/regalloc.py:122-127` `RegAllocator.find_num_colors`:
     /// `max(self._coloring.values())+1 if self._coloring else 0`.
+    #[allow(dead_code)]
     fn find_num_colors(&self) -> u16 {
         self.coloring.values().copied().max().map_or(0, |m| m + 1)
     }
 }
 
 #[inline]
+#[allow(dead_code)]
 fn follow_label(
     alive: &mut HashSet<u16>,
     label2alive: &HashMap<String, HashSet<u16>>,
@@ -1311,6 +1327,7 @@ fn follow_label(
 /// but the handling is order-agnostic: if a `-live-` marker ever
 /// arrives here with registers, they'd be remapped consistently with
 /// the surrounding ops.
+#[allow(dead_code)]
 pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &[Vec<u16>; 3]) {
     if rename.iter().all(|v| v.is_empty()) {
         return;
@@ -1330,6 +1347,7 @@ pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &[Vec<u16>; 3]) {
     }
 }
 
+#[allow(dead_code)]
 fn rename_operand(op: &mut Operand, rename: &[Vec<u16>; 3]) {
     match op {
         Operand::Register(reg) => rename_register(reg, rename),
@@ -1343,6 +1361,7 @@ fn rename_operand(op: &mut Operand, rename: &[Vec<u16>; 3]) {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn rename_register(reg: &mut Register, rename: &[Vec<u16>; 3]) {
     reg.index = rename_lookup(rename, reg.kind, reg.index);
 }

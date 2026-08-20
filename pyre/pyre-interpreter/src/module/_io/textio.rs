@@ -813,6 +813,7 @@ impl W_TextIOWrapper {
         }
     }
 
+    #[allow(dead_code)]
     fn size_args(w_size: PyObjectRef) -> Vec<PyObjectRef> {
         if unsafe { pyre_object::is_none(w_size) } {
             Vec::new()

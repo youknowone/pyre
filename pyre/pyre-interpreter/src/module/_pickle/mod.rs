@@ -194,6 +194,7 @@ pub(crate) fn pickling_error(msg: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyErro
     pickle_exc("_pickle.PicklingError", msg.into())
 }
 
+#[allow(dead_code)]
 pub(crate) fn eof_error(msg: &str) -> PyError {
     pickle_exc("EOFError", msg.into())
 }
@@ -508,6 +509,7 @@ pub(crate) fn getattribute_dotted_obj(
 /// component, like `_getattribute`; when clear (the unpickler at protocol < 4)
 /// the name is a single `getattr`, so a dotted name resolves as one literal
 /// attribute and fails, as in CPython.
+#[allow(dead_code)]
 pub(crate) fn try_resolve_global(
     module_name: &str,
     name: &str,

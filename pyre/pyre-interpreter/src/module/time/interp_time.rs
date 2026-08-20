@@ -1330,6 +1330,7 @@ fn _checktm(tm: &c_tm) -> Result<(), crate::PyError> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn decode_strftime_output(
     bytes: &[u8],
     passthrough: bool,
@@ -1342,6 +1343,7 @@ fn decode_strftime_output(
 }
 
 #[cfg(all(unix, not(feature = "sandbox")))]
+#[allow(dead_code)]
 fn strftime_one(
     format: &[u8],
     tm: &c_tm,

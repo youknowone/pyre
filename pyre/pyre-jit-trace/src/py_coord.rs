@@ -8,6 +8,7 @@
 //! only Python-coordinate sources; runtime consumers never project a JitCode
 //! PC through a Python-keyed map.
 
+#[allow(dead_code)]
 pub(crate) fn floor_boundary_at_or_after(
     metadata: &crate::PyJitCodeMetadata,
     jit_pc: usize,

@@ -1929,6 +1929,7 @@ fn expect_vable_field_read_args(args: &[Operand]) -> (u16, u16) {
     (vable_reg, field_idx)
 }
 
+#[allow(dead_code)]
 fn expect_vable_field_write_args(args: &[Operand], value_kind: Kind) -> (u16, u16, u16) {
     assert_eq!(
         args.len(),
@@ -1952,6 +1953,7 @@ fn expect_matching_vable_array_descrs(field: &Operand, array: &Operand, opname: 
     array_idx
 }
 
+#[allow(dead_code)]
 fn expect_vable_array_read_args(args: &[Operand]) -> (u16, u16, u16) {
     assert_eq!(
         args.len(),
@@ -1978,6 +1980,7 @@ fn expect_vable_array_read_prefix(args: &[Operand]) -> (u16, u16) {
     (vable_reg, array_idx)
 }
 
+#[allow(dead_code)]
 fn expect_vable_array_write_prefix(args: &[Operand]) -> (u16, u16, u16) {
     assert_eq!(
         args.len(),
@@ -2106,6 +2109,7 @@ fn expect_float_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
     }
 }
 
+#[allow(dead_code)]
 fn expect_list_regs(op: &Operand, expected: Kind) -> Vec<u8> {
     match op {
         Operand::ListOfKind(ListOfKind { kind, content }) if *kind == expected => content

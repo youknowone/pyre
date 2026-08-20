@@ -3033,6 +3033,7 @@ pub fn find(_identifier: &str) -> PyObjectRef {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn is_builtin_code(obj: PyObjectRef) -> bool {
     unsafe { crate::gateway::is_builtin_code(obj) }
 }
@@ -3516,6 +3517,7 @@ pub fn function_call_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
 
 /// PyPy-compatible `call_obj_args` instance method.
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn function_call_obj_args(
     func: PyObjectRef,
     obj: PyObjectRef,

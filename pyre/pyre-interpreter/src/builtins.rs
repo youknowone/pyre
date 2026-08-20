@@ -768,6 +768,7 @@ pub(crate) unsafe fn memoryview_check_released(mv: PyObjectRef) -> Result<(), cr
 /// Raw logical bytes of a memoryview, or `None` when `obj` is not one.
 /// `bytes(memoryview)` / `bytearray(memoryview)` copy the view per the
 /// buffer protocol rather than iterating element values.
+#[allow(dead_code)]
 pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
     unsafe { pyre_object::memoryview::is_w_memoryview(obj).then(|| memoryview_gather_bytes(obj)) }
 }
@@ -14039,6 +14040,7 @@ fn _hash_bytes_with_key(bytes: &[u8], secret: &[u8; 16]) -> i64 {
 
 /// The `bytes` hash over a caller's buffer, which is what `Py_HashBuffer`
 /// answers with.
+#[allow(dead_code)]
 pub(crate) fn hash_buffer(bytes: &[u8]) -> i64 {
     _hash_bytes(bytes)
 }

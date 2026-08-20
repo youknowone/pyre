@@ -1483,6 +1483,7 @@ pub(crate) enum EntryPyPc {
 }
 
 impl EntryPyPc {
+    #[allow(dead_code)]
     fn audit_variant(self) -> &'static str {
         match self {
             Self::Py(_) => "py",
@@ -5408,6 +5409,7 @@ enum OuterActiveBoxesEntryTwin {
 }
 
 impl OuterActiveBoxesEntryTwin {
+    #[allow(dead_code)]
     fn name(self) -> &'static str {
         match self {
             Self::Plain => "plain",
@@ -7339,6 +7341,7 @@ impl ActiveResumeFrame {
     /// closure callees whose code identity matches the live root frame;
     /// exception-bearing callees still use the established path until their
     /// cross-frame handler resume is complete.
+    #[allow(dead_code)]
     fn is_handler_free_closure(&self) -> bool {
         let code = self.0.code_ptr;
         if code.is_null() {

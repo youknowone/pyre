@@ -1358,6 +1358,7 @@ pub(crate) unsafe fn base_exception_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf
 ///
 /// # Safety
 /// `obj` must be a live `W_BaseException`.
+#[allow(dead_code)]
 pub(crate) unsafe fn exception_kind_str(
     obj: PyObjectRef,
 ) -> Result<Option<String>, crate::PyError> {

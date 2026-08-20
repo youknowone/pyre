@@ -36,7 +36,6 @@
     clippy::unneeded_struct_pattern,
     clippy::unwrap_or_default,
     clippy::useless_conversion,
-    dead_code,
     unsafe_op_in_unsafe_fn,
     unused_assignments,
     unused_doc_comments,

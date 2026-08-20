@@ -241,6 +241,7 @@ fn set_jit_pending_exception(obj: pyre_object::PyObjectRef) {
 /// Test/runtime helper that clears only the current thread's pending
 /// JIT exception slot.
 #[inline]
+#[allow(dead_code)]
 fn clear_jit_pending_exception() {
     TL_JIT_PENDING_EXCEPTION.with(|slot| slot.set(0));
 }
@@ -423,6 +424,7 @@ pub extern "C" fn pyre_stack_get_length_adr() -> usize {
 /// path, but `test.support.infinite_recursion()` toggles the recursion
 /// limit in a loop, so caching keeps repeated calls free.
 #[cfg(not(any(windows, target_arch = "wasm32")))]
+#[allow(dead_code)]
 fn stack_os_limit() -> usize {
     static CACHED: AtomicUsize = AtomicUsize::new(usize::MAX);
     let cached = CACHED.load(Ordering::Relaxed);

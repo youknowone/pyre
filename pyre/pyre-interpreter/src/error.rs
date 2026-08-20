@@ -2356,12 +2356,14 @@ fn emit_exception_text<W: Write>(
 /// walk `__cause__` (or `__context__` when `__suppress_context__` is
 /// False) chains and emit each older exception with the appropriate
 /// bridging banner before the current one.
+#[allow(dead_code)]
 fn write_chained_context<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
     let mut seen = HashSet::new();
     seen.insert(exc as usize);
     write_chained_context_inner(writer, exc, &mut seen)
 }
 
+#[allow(dead_code)]
 fn write_chained_context_inner<W: Write>(
     writer: &mut W,
     exc: PyObjectRef,
@@ -2407,6 +2409,7 @@ fn write_chained_context_inner<W: Write>(
 /// Print one W_BaseException as `Traceback ...\n<frames>\n<header>`.
 /// Used by `write_chained_context` when recursing through chained
 /// __cause__ / __context__ predecessors.
+#[allow(dead_code)]
 fn write_single_exception<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
     writeln!(writer, "Traceback (most recent call last):")?;
     write_traceback_chain_from_exc(writer, exc)?;
@@ -2562,6 +2565,7 @@ fn render_rooted_exc_object_wtf8(exc_slot: usize) -> Wtf8Buf {
     rendered
 }
 
+#[allow(dead_code)]
 fn render_exc_object_wtf8(exc: PyObjectRef) -> Wtf8Buf {
     if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
         return Wtf8Buf::from_string("<no exception>".to_string());

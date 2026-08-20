@@ -271,6 +271,7 @@ impl AppExecCache {
 /// The full object-space API is implemented as free functions in this module.
 #[derive(Debug, Default)]
 pub struct ObjSpace {
+    #[allow(dead_code)]
     fromcache: Option<PyObjectRef>,
 }
 

@@ -21,6 +21,7 @@ fn pyre_nbody_debug_enabled() -> bool {
 }
 
 /// Whether `MAJIT_PROBE_LIVENESS` is set, cached at first access.
+#[allow(dead_code)]
 fn majit_probe_liveness_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_PROBE_LIVENESS").is_some());
@@ -28,6 +29,7 @@ fn majit_probe_liveness_enabled() -> bool {
 }
 
 /// Whether `PYRE_PROBE_BH_STARTUP=1` is set, cached at first access.
+#[allow(dead_code)]
 fn pyre_probe_bh_startup_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("PYRE_PROBE_BH_STARTUP").ok().as_deref() == Some("1")
@@ -1081,6 +1083,7 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
 /// RPython: FieldDescr.offset is resolved at rtyper time. In pyre, Rust struct
 /// layout determines field offsets. This resolver maps (owner_type, field_name)
 /// to byte offsets for BhDescr::Field resolution in the blackhole.
+#[allow(dead_code)]
 fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
     use pyre_interpreter::pyframe::PyFrame;
     match field_name {
@@ -1372,6 +1375,7 @@ pub struct ResumedFrame {
 /// on TAGVIRTUAL/TAGCONST/TAGBOX/TAGSMALLINT; pyre's deadframe
 /// already contains typed Values, so we just box Int/Float to
 /// W_IntObject/W_FloatObject.
+#[allow(dead_code)]
 fn materialize_virtual(val: &majit_ir::Value) -> i64 {
     use majit_ir::Value;
     match val {
@@ -1384,6 +1388,7 @@ fn materialize_virtual(val: &majit_ir::Value) -> i64 {
 
 /// resume.py:1028 _callback_i → next_int() → write_an_int.
 /// RPython trusts type discipline — no cross-type coercion.
+#[allow(dead_code)]
 fn materialize_virtual_int(val: &majit_ir::Value) -> i64 {
     match val {
         majit_ir::Value::Int(v) => *v,
@@ -1393,6 +1398,7 @@ fn materialize_virtual_int(val: &majit_ir::Value) -> i64 {
 
 /// resume.py:1036 _callback_f → next_float() → write_a_float.
 /// RPython trusts type discipline — no cross-type coercion.
+#[allow(dead_code)]
 fn materialize_virtual_float(val: &majit_ir::Value) -> i64 {
     match val {
         majit_ir::Value::Float(v) => v.to_bits() as i64,
@@ -1624,6 +1630,7 @@ fn unbox_int_for_force(raw: i64) -> i64 {
 /// unicode variants). Registered into Cranelift's guard-exit recovery
 /// path so `rebuild_state_after_failure` hands bridge-input refs a real
 /// string pointer instead of NULL (compiler.rs).
+#[allow(dead_code)]
 fn materialize_str_plain_for_cranelift(is_unicode: bool, chars: &[i64]) -> i64 {
     use majit_backend::Backend;
     let (driver, _) = crate::eval::driver_pair();
@@ -1647,6 +1654,7 @@ fn materialize_str_plain_for_cranelift(is_unicode: bool, chars: &[i64]) -> i64 {
 /// resume.py:1143-1188 string_concat / slice_string and the unicode
 /// counterparts — materialize Concat / Slice string virtuals via
 /// cpu.bh_call_r(funcptr, args_i, args_r, args_f, calldescr).
+#[allow(dead_code)]
 fn materialize_str_call_for_cranelift(
     _is_unicode: bool,
     func: i64,
@@ -4187,10 +4195,12 @@ fn jit_ca_handle_guard_failure(
 /// The caller has already recovered the live descriptor and exit values; the
 /// rest is the same must-compile/bridge attachment sequence used by the native
 /// CALL_ASSEMBLER guard callback above.
+#[allow(dead_code)]
 struct CaBridgeAttempt {
     terminal_declined: bool,
 }
 
+#[allow(dead_code)]
 fn try_compile_ca_bridge(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     raw_values: &[i64],

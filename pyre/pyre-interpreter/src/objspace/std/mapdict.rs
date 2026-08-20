@@ -3528,6 +3528,7 @@ pub unsafe fn plain_direct_write<O: MapdictObject>(
 ///
 /// # Safety
 /// `term` must point to a live Terminator map node.
+#[allow(dead_code)]
 unsafe fn terminator_read<O: MapdictObject>(
     term: MapRef,
     obj: &O,

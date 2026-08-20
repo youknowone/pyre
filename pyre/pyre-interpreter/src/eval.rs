@@ -1254,6 +1254,7 @@ pub fn set_in_flight_exception(exc: PyObjectRef) {
     IN_FLIGHT_EXCEPTION.with(|c| c.set(exc));
 }
 
+#[allow(dead_code)]
 fn walk_in_flight_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     IN_FLIGHT_EXCEPTION.with(|c| {
         unsafe { walk_in_flight_exception_area(c as *const _, visitor) };
@@ -1973,6 +1974,7 @@ pub(crate) fn eval_frame_plain(frame: &mut PyFrame) -> PyResult {
 /// return_trace/leave wrapping. When `operr` is Some, the generator's
 /// throw() path routes it through handle_operation_error and sets
 /// last_instr = next_instr - 1 before resuming (pyframe.py:273-277).
+#[allow(dead_code)]
 pub(crate) fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) -> PyResult {
     frame.execute_frame(None, operr)
 }

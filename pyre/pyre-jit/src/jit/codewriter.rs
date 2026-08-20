@@ -102,6 +102,7 @@ fn portal_graph_inputvars(code: &CodeObject) -> (super::flow::Variable, super::f
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FrameInputs {
     /// No frame, no ec — test-only shadow graphs.
+    #[allow(dead_code)]
     None,
     /// Portal graph: frame + ec.
     Portal,
@@ -364,6 +365,7 @@ impl FrameState {
     ///
     /// Match identity is by `VariableId` (Python object identity in
     /// RPython); constants and other FlowValue shapes are ignored.
+    #[allow(dead_code)]
     fn mergeable_index_of(&self, var: &super::flow::Variable) -> Option<usize> {
         self.mergeable().iter().position(
             |value| matches!(value, Some(super::flow::FlowValue::Variable(v)) if v.id == var.id),
@@ -395,6 +397,7 @@ impl FrameState {
     /// runtime offset) vs `stack_base = nlocals` (the register-space
     /// offset).  Consumers that need the absolute PyFrame slot for a
     /// virtualizable access compute it separately.
+    #[allow(dead_code)]
     fn mergeable_index_to_slot(&self, merge_idx: usize) -> Option<u16> {
         let regular_len = self.locals_w.len() + self.stack.len();
         if merge_idx < regular_len {
@@ -408,6 +411,7 @@ impl FrameState {
     /// SSARepr register slot in one call.  Returns `None` if the
     /// Variable does not appear in this FrameState or appears only in
     /// the `last_exception` pair.
+    #[allow(dead_code)]
     fn variable_slot(&self, var: &super::flow::Variable) -> Option<u16> {
         self.mergeable_index_of(var)
             .and_then(|idx| self.mergeable_index_to_slot(idx))
@@ -1691,6 +1695,7 @@ fn handler_entry_has_explicit_raise_source(
     })
 }
 
+#[allow(dead_code)]
 fn initialize_spam_block(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -2481,6 +2486,7 @@ fn emit_frontend_delsubscr(
     );
 }
 
+#[allow(dead_code)]
 fn emit_frontend_setattr(
     _graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3277,6 +3283,7 @@ fn new_shadow_graph_with_portal_inputs(
     )
 }
 
+#[allow(dead_code)]
 fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
     new_shadow_graph_with_portal_inputs(code, FrameInputs::None)
 }

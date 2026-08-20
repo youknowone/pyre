@@ -32,7 +32,6 @@
     clippy::unnecessary_cast,
     clippy::vec_box,
     clippy::while_let_loop,
-    dead_code,
     non_snake_case,
     unconditional_recursion,
     unsafe_op_in_unsafe_fn,
@@ -300,6 +299,7 @@ macro_rules! py_module {
         $(, extra_init: |$ns:ident| $body:block)?
         $(,)?
     ) => {
+        #[allow(dead_code)]
         pub fn init(ns: ::pyre_object::PyObjectRef) {
             let _name = $name;
             $($(

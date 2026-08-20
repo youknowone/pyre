@@ -37,15 +37,18 @@ fn eval_breaker_word_descr() -> DescrRef {
         .clone()
 }
 
+#[allow(dead_code)]
 extern "C" fn trace_function_get_defaults(func: i64) -> i64 {
     unsafe { function_get_defaults(func as PyObjectRef) as i64 }
 }
 
+#[allow(dead_code)]
 extern "C" fn trace_function_get_kwdefaults(func: i64) -> i64 {
     let kwdefaults = unsafe { pyre_interpreter::function_get_kwdefaults(func as PyObjectRef) };
     kwdefaults as i64
 }
 
+#[allow(dead_code)]
 extern "C" fn trace_dict_lookup_jit(dict: i64, key: i64) -> i64 {
     unsafe {
         pyre_object::w_dict_lookup(dict as PyObjectRef, key as PyObjectRef).unwrap_or(PY_NULL)
@@ -149,6 +152,7 @@ use pyre_interpreter::eval::{get_current_exception, set_current_exception};
 /// helper the compiled bridge contains only the constructor call plus
 /// `GuardException`, so the guard sees no pending exception and incorrectly
 /// resumes down the normal path.
+#[allow(dead_code)]
 pub(crate) extern "C" fn raise_exception_jit(exc_obj: i64) {
     #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
     majit_backend_cranelift::jit_exc_raise(exc_obj);
@@ -165,6 +169,7 @@ pub(crate) extern "C" fn raise_exception_jit(exc_obj: i64) {
 /// normalize the exception operand, normalize/attach the optional
 /// cause, and publish the final exception via `jit_exc_raise` so the
 /// following `GUARD_EXCEPTION` sees it.
+#[allow(dead_code)]
 pub(crate) extern "C" fn normalize_raise_varargs_jit(
     frame_ptr: i64,
     exc_obj: i64,
@@ -249,6 +254,7 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
 /// `CURRENT_EXCEPTION` slot so the compiled bridge preserves
 /// `pyopcode.py:786` / `eval.rs`'s `push_exc_info` semantics (save the
 /// previous sys_exc_info before `CURRENT_EXCEPTION` is overwritten).
+#[allow(dead_code)]
 pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
     pyre_interpreter::eval::get_current_exception() as i64
 }
@@ -257,6 +263,7 @@ pub(crate) extern "C" fn trace_get_current_exception_jit() -> i64 {
 /// per-thread `CURRENT_EXCEPTION` slot so the compiled bridge preserves
 /// `pyopcode.py:786/:778` / `eval.rs`'s `push_exc_info` / `pop_except`
 /// semantics.
+#[allow(dead_code)]
 pub(crate) extern "C" fn trace_set_current_exception_jit(exc: i64) {
     pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
 }
@@ -284,6 +291,7 @@ use pyre_object::{
     w_list_uses_object_storage, w_tuple_len,
 };
 
+#[allow(dead_code)]
 fn trace_abort_error(reason: &'static str) -> PyError {
     PyError::internal_trace_abort(reason)
 }
@@ -374,6 +382,7 @@ pub(crate) fn long_binop_raw_helper(op: BinaryOperator) -> Option<LongBinopSpec>
 /// collapse a boxed subclass to `Null`), never a subclass pointer. Reading
 /// `w_class` off such a value would force the box that OptVirtualize is
 /// meant to remove, so skip the guard there.
+#[allow(dead_code)]
 fn trace_guard_exact_w_class(
     frame: &mut MIFrame,
     ctx: &mut TraceCtx,
@@ -393,6 +402,7 @@ fn trace_guard_exact_w_class(
     frame.generate_guard(ctx, OpCode::GuardTrue, &[eq]);
 }
 
+#[allow(dead_code)]
 fn positional_defaults_to_load(
     callable: PyObjectRef,
     code: &CodeObject,
@@ -432,6 +442,7 @@ fn positional_defaults_to_load(
     Some(loaded)
 }
 
+#[allow(dead_code)]
 fn fill_positional_defaults_for_trace_call<'a>(
     callable: PyObjectRef,
     code: &CodeObject,
@@ -446,6 +457,7 @@ fn fill_positional_defaults_for_trace_call<'a>(
     Cow::Owned(full)
 }
 
+#[allow(dead_code)]
 fn const_step_one_slice_bounds(
     concrete_obj: PyObjectRef,
     concrete_key: PyObjectRef,
@@ -497,6 +509,7 @@ fn const_step_one_slice_bounds(
     }
 }
 
+#[allow(dead_code)]
 fn concrete_list_strategy_id(concrete: PyObjectRef) -> Option<i64> {
     unsafe {
         if w_list_uses_object_storage(concrete) {
@@ -636,6 +649,7 @@ pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
 /// - Emitting the separate `_opimpl_setfield_vable_i(vsd, depth±1)`
 ///   IR op via `mirror_vable_static_to_boxes` when the operation
 ///   logically advances the frame's vsd field (push / pop).
+#[allow(dead_code)]
 pub(crate) fn write_stack_slot(
     sym: &mut PyreSym,
     ctx: &mut TraceCtx,
@@ -734,6 +748,7 @@ pub(crate) fn write_stack_slot(
 /// sym so subsequent fills reuse the same op.  Without this guard,
 /// `trace_array_getitem_value(NONE, idx)` would record a malformed
 /// `GetarrayitemGcR` with a NONE base operand.
+#[allow(dead_code)]
 pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: usize) -> OpRef {
     let semantic_idx = sym.nlocals + stack_idx;
     // For portal frames, read the stack slot
@@ -780,6 +795,7 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
 /// pair-read+pair-write.
 ///
 /// `reg_top` / `reg_other` are semantic frame-mirror indices.
+#[allow(dead_code)]
 pub(crate) fn swap_stack_slots(
     sym: &mut PyreSym,
     ctx: &mut TraceCtx,
@@ -957,6 +973,7 @@ impl MIFrame {
         self.value_type(opref)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn ctx(&mut self) -> &mut TraceCtx {
         unsafe { &mut *self.ctx }
     }
@@ -1741,6 +1758,7 @@ impl MIFrame {
         Ok(s.registers_r[idx])
     }
 
+    #[allow(dead_code)]
     pub(crate) fn set_next_instr(&mut self, _ctx: &mut TraceCtx, target: usize) {
         self.sym_mut().pending_next_instr = Some(target);
     }
@@ -3362,6 +3380,7 @@ impl MIFrame {
 
     /// pyjitpl.py:1916-1927 implement_guard_value parity.
     /// executor.py:544-551 constant_from_op(box): dispatches on box.type.
+    #[allow(dead_code)]
     pub(crate) fn implement_guard_value(
         &mut self,
         ctx: &mut TraceCtx,
@@ -3470,6 +3489,7 @@ impl MIFrame {
 /// between the int and float fast paths in the retired compare helper,
 /// but reads the ConcreteValue variant directly so the check does not
 /// have to allocate an intermediate w_int/w_float box.
+#[allow(dead_code)]
 fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
     match cv {
         ConcreteValue::Int(_) => (true, false),

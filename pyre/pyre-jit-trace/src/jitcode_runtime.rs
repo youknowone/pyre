@@ -410,6 +410,7 @@ fn compute_named_jitcode_index(name: &str) -> Option<usize> {
 /// Resolve an ordinary portal-closure JitCode by its unique graph leaf name.
 /// Prefer stable graph paths at build time; this runtime helper exists for
 /// diagnostics and tests whose serialized artifact stores names only.
+#[allow(dead_code)]
 pub(crate) fn named_jitcode(name: &str) -> Option<Arc<JitCode>> {
     get_jitcode_by_index(compute_named_jitcode_index(name)?)
 }

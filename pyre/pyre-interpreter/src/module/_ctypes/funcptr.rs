@@ -1015,6 +1015,7 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// The status word a returned scalar carries.  A COM method answers an
 /// `HRESULT` whatever its declared restype would otherwise make of the bytes.
+#[allow(dead_code)]
 fn scalar_int_result(result: &host_ctypes::CallValue) -> i32 {
     let mut word = [0u8; 4];
     if let host_ctypes::CallValue::Scalar(bytes) = result {

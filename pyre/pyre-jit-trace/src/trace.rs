@@ -500,6 +500,7 @@ pub fn instance_next_foriter_bridge_demote_once(green_key: u64) -> bool {
     INSTANCE_NEXT_FORITER_BRIDGE_DEMOTED.with(|s| s.borrow_mut().insert(green_key))
 }
 
+#[allow(dead_code)]
 fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> bool {
     (start_pc..code.instructions.len()).all(|pc| {
         let Some((instruction, _)) = pyre_interpreter::decode_instruction_at(code, pc) else {

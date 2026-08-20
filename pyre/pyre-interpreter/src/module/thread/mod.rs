@@ -1563,6 +1563,7 @@ fn new_lock(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(W_Lock::allocate_stable(W_Lock::default()))
 }
 
+#[allow(dead_code)]
 fn new_handle(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(W_ThreadHandle::allocate_stable(W_ThreadHandle::default()))
 }

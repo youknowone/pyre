@@ -48,6 +48,7 @@ impl MappedObj {
         }
     }
 
+    #[allow(dead_code)]
     fn flush_range(&self, offset: usize, size: usize) -> std::io::Result<()> {
         match self {
             Self::Mapped(m) => m.flush_range(offset, size),
@@ -84,6 +85,7 @@ struct NativeMMap {
     /// writable resolves to the same `AccessMode::Read` as a shared one.
     /// `resize` needs the bit to reject expanding a shared anonymous mapping.
     #[cfg(unix)]
+    #[allow(dead_code)]
     flags: libc::c_int,
     /// `rmmap.py:953-970` — the file handle the object duplicated at
     /// construction, or `INVALID_HANDLE` for a mapping backed by no file of
@@ -1577,6 +1579,7 @@ fn mmap_resize_mapping(
 /// mapping as an `AccessMode` rather than the raw `flProtect` /
 /// `dwDesiredAccess` pair `rmmap.py:904-914` derives.
 #[cfg(any(unix, windows))]
+#[allow(dead_code)]
 fn mmap_access_mode(access: i64) -> host_mmap::AccessMode {
     match access {
         x if x == MMAP_ACCESS_READ => host_mmap::AccessMode::Read,

@@ -214,6 +214,7 @@ pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
 /// cell pointer; the live `cell.w_value` read is emitted separately as a
 /// `GetfieldGcR`.  Null on a non-module dict, missing slot, or after
 /// `switch_to_object_strategy`.
+#[allow(dead_code)]
 pub(crate) extern "C" fn jit_namespace_cell_lookup(namespace_ptr: i64, slot: i64) -> i64 {
     let w_globals = namespace_ptr as pyre_object::PyObjectRef;
     if w_globals.is_null() || slot < 0 {
@@ -224,6 +225,7 @@ pub(crate) extern "C" fn jit_namespace_cell_lookup(namespace_ptr: i64, slot: i64
     cell.unwrap_or(PY_NULL) as i64
 }
 
+#[allow(dead_code)]
 pub(crate) fn namespace_slot_lookup_values(
     func_ptr: *const (),
     w_globals: pyre_object::PyObjectRef,
@@ -236,6 +238,7 @@ pub(crate) fn namespace_slot_lookup_values(
     ]
 }
 
+#[allow(dead_code)]
 pub(crate) fn namespace_slot_lookup_result(result: PyObjectRef) -> Value {
     Value::Ref(GcRef(result as usize))
 }

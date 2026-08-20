@@ -1532,6 +1532,7 @@ fn register_leaf_storage_box<T: 'static>(
 /// As with [`register_leaf_storage_box`], callers must add registrations only
 /// at the absolute tail of [`build_gc`], after all fixed-const type ids. S0 has
 /// no caller so the existing registration order remains unchanged.
+#[allow(dead_code)]
 fn register_traced_storage_box<T: 'static>(
     gc: &mut dyn majit_gc::GcAllocator,
     custom_trace: majit_gc::trace::CustomTraceFn,
@@ -5374,6 +5375,7 @@ unsafe fn jit_driver_pair_from_root_area(data: *const ()) -> Option<&'static mut
 /// `&mut GcRef` visitor. Both types are pointer-sized:
 /// `PyObjectRef = *mut PyObject` and `GcRef` is
 /// `#[repr(transparent)]` over `usize`, so the cast is layout-safe.
+#[allow(dead_code)]
 fn pyre_object_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_object::gc_roots::walk_shadow_stack(|slot: &mut pyre_object::PyObjectRef| {
         // SAFETY: `PyObjectRef` and `GcRef` are both pointer-sized
@@ -5520,6 +5522,7 @@ fn visit_pyobject_root(
     visitor(gcref);
 }
 
+#[allow(dead_code)]
 fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots(|slot| {
         visit_pyobject_root(slot, visitor);
@@ -5527,6 +5530,7 @@ fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
 fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
         visit_pyobject_root(slot, visitor);
@@ -13579,14 +13583,17 @@ mod tests {
     use super::*;
 
     /// Read a global by name from the frame's canonical `w_globals` object.
+    #[allow(dead_code)]
     fn frame_global(frame: &PyFrame, name: &str) -> pyre_object::PyObjectRef {
         unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), name) }
             .unwrap_or_else(|| panic!("namespace should contain {name}"))
     }
 
+    #[allow(dead_code)]
     struct TestJitParamsGuard;
 
     impl TestJitParamsGuard {
+        #[allow(dead_code)]
         fn low_threshold() -> Self {
             let (driver, _) = driver_pair();
             driver
@@ -14240,6 +14247,7 @@ mod tests {
             })
     }
 
+    #[allow(dead_code)]
     fn live_pc_containing_all(
         jitcode_index: i32,
         _code: &pyre_interpreter::CodeObject,
@@ -14273,6 +14281,7 @@ mod tests {
             })
     }
 
+    #[allow(dead_code)]
     fn compiled_trace_fixture(
         source: &str,
         function_name: &str,
@@ -14348,6 +14357,7 @@ mod tests {
         (frame, jitcode_ptr, resume_pc)
     }
 
+    #[allow(dead_code)]
     fn single_local_test_state(
         ctx: &mut majit_metainterp::TraceCtx,
         frame: &PyFrame,

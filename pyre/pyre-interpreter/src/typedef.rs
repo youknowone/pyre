@@ -10888,6 +10888,7 @@ fn make_getset_property_full(
 /// object header and so charges none. The flag itself remains the answer
 /// `type.__flags__` owes for `Py_TPFLAGS_HAVE_GC`, which it does not yet
 /// report.
+#[allow(dead_code)]
 pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
     let Some(tp) = r#type(w_obj) else {
         return false;
@@ -10916,6 +10917,7 @@ pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
 /// them; `NoneType` and `code` do not, and share the base instance layout with
 /// `function`, `generator`, the iterators and the dict views — all of which do
 /// declare the flag. Those are matched on the type object instead.
+#[allow(dead_code)]
 fn cpython_type_has_gc_flag(w_type: PyObjectRef) -> bool {
     if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
         return false;
@@ -19641,6 +19643,7 @@ fn float_hex_repr(x: f64) -> String {
 
 /// IEEE 754 double decomposition into (mantissa, exponent, sign).
 /// PyPy: Lib/fractions.py _decimal_to_ratio uses a similar approach.
+#[allow(dead_code)]
 fn integer_decode(v: f64) -> (u64, i16, i8) {
     let bits = v.to_bits();
     let sign: i8 = if bits >> 63 == 0 { 1 } else { -1 };
@@ -30350,6 +30353,7 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
 /// `cls` is stored as `reqcls` exactly like PyPy. `use_closure` is
 /// unused at runtime (pyre has no closure-passing distinction) but
 /// still kept on the struct for parity.
+#[allow(dead_code)]
 fn getset_property_init(
     new: pyre_object::PyObjectRef,
     fget: pyre_object::PyObjectRef,
