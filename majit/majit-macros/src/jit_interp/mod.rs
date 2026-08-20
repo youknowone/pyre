@@ -1884,6 +1884,10 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
         // The JIT lowerer consults the maps themselves; this walk only needs
         // to know whether a struct declares a field, not what it declared.
         declared_field_keys: std::collections::HashSet<String>,
+        // `array_fields` entries: `"StructLast::field"` -> element type. The
+        // field holds the buffer BASE POINTER, so an indexed access derefs
+        // through it instead of reading the field itself.
+        array_field_elems: std::collections::HashMap<String, syn::Path>,
     }
     impl RefFieldRewriter {
         // For `e == state.<ref_scalar>`, return the `ref(T)` struct path.
@@ -1933,6 +1937,14 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
             )
         }
 
+        // Whether `struct_path::field_name` is an array base, and if so the
+        // element type.
+        fn array_field_elem(&self, struct_path: &syn::Path, field_name: &str) -> Option<syn::Path> {
+            let struct_last = struct_path.segments.last()?.ident.to_string();
+            let key = format!("{}::{}", struct_last, field_name);
+            self.array_field_elems.get(&key).cloned()
+        }
+
         // Record a local binding as pointing to a struct type.
         fn record_local_ref(&mut self, name: &str, struct_type: syn::Path) {
             self.local_ref_types.insert(name.to_string(), struct_type);
@@ -1952,6 +1964,76 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     }
     impl VisitMut for RefFieldRewriter {
         fn visit_expr_mut(&mut self, expr: &mut Expr) {
+            // Array element WRITE: `<base>.<array_field>[<idx>] = <rhs>`.
+            //
+            // Must precede the plain-field arms below: the field holds the
+            // buffer BASE POINTER, so letting them rewrite `<base>.<field>` on
+            // its own leaves a raw pointer being indexed with `[]`, which does
+            // not compile. `jit_inline` intercepts the same shape in the same
+            // order.
+            if let Expr::Assign(assign) = expr
+                && let Expr::Index(index_expr) = &*assign.left
+                && let Expr::Field(field) = &*index_expr.expr
+                && let Some(struct_path) = self
+                    .ref_struct_of_base(&field.base)
+                    .or_else(|| self.local_ref_struct_of_base(&field.base))
+                && let syn::Member::Named(member_id) = &field.member
+                && self
+                    .array_field_elem(&struct_path, &member_id.to_string())
+                    .is_some()
+            {
+                let base = (*field.base).clone();
+                let member = field.member.clone();
+                let struct_path = self.declaring_struct(&struct_path, &member_id.to_string());
+                let mut idx = (*index_expr.index).clone();
+                let mut rhs = (*assign.right).clone();
+                self.visit_expr_mut(&mut idx);
+                self.visit_expr_mut(&mut rhs);
+                *expr = syn::parse_quote! {
+                    {
+                        let __majit_arr_obj = #base;
+                        let __majit_arr_idx = #idx;
+                        let __majit_arr_val = #rhs;
+                        unsafe {
+                            *((*(__majit_arr_obj as *mut #struct_path))
+                                .#member
+                                .add(__majit_arr_idx as usize)) = __majit_arr_val;
+                        }
+                    }
+                };
+                return;
+            }
+
+            // Array element READ: `<base>.<array_field>[<idx>]`.
+            if let Expr::Index(index_expr) = expr
+                && let Expr::Field(field) = &*index_expr.expr
+                && let Some(struct_path) = self
+                    .ref_struct_of_base(&field.base)
+                    .or_else(|| self.local_ref_struct_of_base(&field.base))
+                && let syn::Member::Named(member_id) = &field.member
+                && self
+                    .array_field_elem(&struct_path, &member_id.to_string())
+                    .is_some()
+            {
+                let base = (*field.base).clone();
+                let member = field.member.clone();
+                let struct_path = self.declaring_struct(&struct_path, &member_id.to_string());
+                let mut idx = (*index_expr.index).clone();
+                self.visit_expr_mut(&mut idx);
+                *expr = syn::parse_quote! {
+                    {
+                        let __majit_arr_obj = #base;
+                        let __majit_arr_idx = #idx;
+                        unsafe {
+                            *((*(__majit_arr_obj as *const #struct_path))
+                                .#member
+                                .add(__majit_arr_idx as usize))
+                        }
+                    }
+                };
+                return;
+            }
+
             // Write-through: `state.<ref>.<member> = <rhs>` ->
             // `unsafe { (*(state.<ref> as *mut T)).<member> = <rhs> }`.
             if let Expr::Assign(assign) = expr
@@ -2217,6 +2299,14 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
                     &config.int_fields,
                     &config.array_fields,
                 ),
+                array_field_elems: config
+                    .array_fields
+                    .iter()
+                    .filter_map(|e| {
+                        let last = e.struct_type.segments.last()?.ident.to_string();
+                        Some((format!("{}::{}", last, e.field), e.element_type.clone()))
+                    })
+                    .collect(),
                 field_pointees,
                 local_ref_types: std::collections::HashMap::new(),
                 call_returns: call_returns_map,

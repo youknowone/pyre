@@ -209,10 +209,24 @@ fn pool_array_layout_tokens(
     )
 }
 
-/// A `<local ref binding>.<field>` access that `array_fields` declares, resolved
-/// but not yet emitted.  See [`JitCodeLowerer::match_array_field_base`].
+/// Where the object holding the array base pointer comes from.
+///
+/// A local `ref_params` binding is already in a register, but a `ref(T)` state
+/// scalar still has to be read out of the state frame, and that read emits.
+/// Keeping the two apart is what lets [`JitCodeLowerer::match_array_field_base`]
+/// stay non-emitting for both.
+enum ArrayFieldHolder {
+    /// An already-materialized ref binding.
+    Reg(u16),
+    /// `state.<ref_scalar>`, to be read at emit time.
+    StateRef(Expr),
+}
+
+/// A `<ref binding or state ref scalar>.<field>` access that `array_fields`
+/// declares, resolved but not yet emitted.  See
+/// [`JitCodeLowerer::match_array_field_base`].
 struct ArrayFieldBase {
-    base_reg: u16,
+    holder: ArrayFieldHolder,
     struct_path: syn::Path,
     member: syn::Member,
     element_type: syn::Path,
@@ -1357,15 +1371,32 @@ impl<'c> Lowerer<'c> {
     /// interpreter.
     fn match_array_field_base(&self, field: &syn::ExprField) -> Option<ArrayFieldBase> {
         let config = self.config?;
-        let Expr::Path(path) = &*field.base else {
-            return None;
+        // Either a local ref binding (`jit_inline`'s `ref_params`) or a
+        // `ref(T)` state scalar (`jit_interp`'s `state_fields`). Both name an
+        // object whose field holds the buffer base; only where the object
+        // pointer comes from differs.
+        let (holder, struct_path) = match &*field.base {
+            Expr::Path(path) => {
+                let ident = path.path.get_ident()?;
+                let binding = self.bindings.get(&ident.to_string())?.clone();
+                if !matches!(binding.kind, BindingKind::Ref) {
+                    return None;
+                }
+                (
+                    ArrayFieldHolder::Reg(binding.reg),
+                    binding.struct_type.as_ref()?.clone(),
+                )
+            }
+            Expr::Field(base_field) if expr_matches_local_name(&base_field.base, "state") => {
+                let base_name = named_member(&base_field.member)?;
+                let (_, struct_path) = config.state_ref_scalars.get(&base_name).cloned()?;
+                (
+                    ArrayFieldHolder::StateRef((*field.base).clone()),
+                    struct_path,
+                )
+            }
+            _ => return None,
         };
-        let ident = path.path.get_ident()?;
-        let binding = self.bindings.get(&ident.to_string())?.clone();
-        if !matches!(binding.kind, BindingKind::Ref) {
-            return None;
-        }
-        let struct_path = binding.struct_type.as_ref()?.clone();
         let member = field.member.clone();
         let member_name = named_member(&field.member)?;
         // Resolve the access against the struct that DECLARES this field.
@@ -1387,7 +1418,7 @@ impl<'c> Lowerer<'c> {
         let key = format!("{}::{}", struct_last, member_name);
         let element_type = config.array_fields.get(&key)?.2.clone();
         Some(ArrayFieldBase {
-            base_reg: binding.reg,
+            holder,
             struct_path,
             member,
             element_type,
@@ -1401,19 +1432,27 @@ impl<'c> Lowerer<'c> {
     /// buffer pointer through the SAME interned field descr — a store to the
     /// base (a realloc on growth) then invalidates the load the heapcache
     /// served, instead of leaving a stale buffer pointer live in the trace.
-    fn emit_array_field_base(&mut self, shape: &ArrayFieldBase) -> u16 {
+    fn emit_array_field_base(&mut self, shape: &ArrayFieldBase) -> Option<u16> {
         let ArrayFieldBase {
-            base_reg,
+            holder,
             struct_path,
             member,
             element_type,
         } = shape;
-        let (base_reg, struct_path, member, element_type) = (
-            *base_reg,
-            struct_path.clone(),
-            member.clone(),
-            element_type.clone(),
-        );
+        let (struct_path, member, element_type) =
+            (struct_path.clone(), member.clone(), element_type.clone());
+        // A state scalar is read here rather than in the matcher, so nothing is
+        // emitted until the caller has committed to this shape.
+        let base_reg = match holder {
+            ArrayFieldHolder::Reg(reg) => *reg,
+            ArrayFieldHolder::StateRef(base_expr) => {
+                let base = self.lower_state_field_read(&base_expr.clone())?;
+                if !matches!(base.kind, BindingKind::Ref) {
+                    return None;
+                }
+                base.reg
+            }
+        };
         // No config means nothing was declared gc-managed or headerless,
         // which is the same answer the raw default gave before.
         let gc_managed = self
@@ -1490,7 +1529,7 @@ impl<'c> Lowerer<'c> {
                 );
             },
         );
-        buffer_reg
+        Some(buffer_reg)
     }
 
     /// Recognizes an array element READ on a local ref binding:
@@ -1517,7 +1556,7 @@ impl<'c> Lowerer<'c> {
         // before its index, which is the order emitted here.
         let shape = self.match_array_field_base(field)?;
         let element_type = shape.element_type.clone();
-        let buffer_reg = self.emit_array_field_base(&shape);
+        let buffer_reg = self.emit_array_field_base(&shape)?;
         let index = self.lower_value_expr(&index_expr.index)?;
         if !matches!(index.kind, BindingKind::Int) {
             return None;
@@ -1584,7 +1623,7 @@ impl<'c> Lowerer<'c> {
         if !matches!(value.kind, BindingKind::Int) {
             return None;
         }
-        let buffer_reg = self.emit_array_field_base(&shape);
+        let buffer_reg = self.emit_array_field_base(&shape)?;
         let index = self.lower_value_expr(&index_expr.index)?;
         if !matches!(index.kind, BindingKind::Int) {
             return None;
