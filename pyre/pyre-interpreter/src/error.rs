@@ -2960,7 +2960,7 @@ fn write_traceback_chain_from_tb<W: Write>(
                 let code = unsafe { &*code_obj };
                 let location = usize::try_from(lasti)
                     .ok()
-                    .and_then(|index| code.locations.get(index))
+                    .and_then(|index| crate::pycode::code_locations(code).get(index))
                     .map(|(start, end)| {
                         (
                             start.line.get(),

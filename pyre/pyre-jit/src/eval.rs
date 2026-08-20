@@ -5966,8 +5966,7 @@ pub fn get_location(
                         }
                         None => ("<eof>".to_string(), "<eof>".to_string()),
                     };
-                let line = code
-                    .locations
+                let line = pyre_interpreter::pycode::code_locations(code)
                     .get(next_instr)
                     .and_then(|(start, _)| Some(start.line.get() as usize))
                     .unwrap_or_else(|| {

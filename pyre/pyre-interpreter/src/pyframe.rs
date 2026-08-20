@@ -1906,7 +1906,7 @@ pub fn offset2lineno(code: &CodeObject, stopat: isize) -> usize {
     if stopat < 0 {
         return lineno;
     }
-    code.locations
+    crate::pycode::code_locations(code)
         .get(stopat as usize)
         .map(|(start, _)| start.line.get())
         .unwrap_or(lineno)
@@ -2091,11 +2091,11 @@ fn mark_explain_incompatible_stack(target_stack: i64) -> &'static str {
 fn mark_lines(code: &CodeObject, len: usize) -> Vec<i32> {
     let mut lines = vec![-1i32; len];
     let first = code.first_line_number.map(|n| n.get() as i32).unwrap_or(1);
+    let locations = crate::pycode::code_locations(code);
     let mut last_line = -1i32;
     for i in 0..len {
         // `locations[i].0` is the start SourceLocation of unit `i`.
-        let line = code
-            .locations
+        let line = locations
             .get(i)
             .map(|(start, _)| start.line.get() as i32)
             .unwrap_or(first);
@@ -4022,7 +4022,7 @@ impl PyFrame {
         // marshal reader as repeated zero-width positions on the first line.
         // CPython reports ``frame.f_lineno is None`` for that table rather
         // than manufacturing the code object's first line number.
-        let locations = &self.code().locations;
+        let locations = crate::pycode::code_locations(self.code());
         if !locations.is_empty()
             && locations.iter().all(|(start, end)| {
                 start.character_offset.get() == 1 && end.character_offset.get() == 1

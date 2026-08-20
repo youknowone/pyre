@@ -8,6 +8,7 @@ use pyre_object::pyobject::*;
 use pyre_object::{
     w_bool_from, w_bool_get_value, w_int_new, w_list_new, w_seq_iter_new, w_str_new, w_tuple_new,
 };
+use rustpython_compiler_core::SourceLocation;
 
 const YIELDS_INSIDE_TRY_BIT: u16 = 0x8000;
 
@@ -292,10 +293,12 @@ pub struct PyCode {
     /// lazily at the same wrapped/unwrapped compiler boundary `co_consts_w`
     /// uses, so a name that never executes costs nothing.
     ///
-    /// Slots hold `w_str_new` results — `malloc_typed`-immortal, so a published
-    /// pointer is fixed and the table needs no walking: there is nothing to
-    /// forward and nothing whose liveness a trace could decide.  That is also
-    /// why a lost publish race can simply abandon its candidate.
+    /// Slots hold `intern_str_value` results — `malloc_typed`-immortal, so a
+    /// published pointer is fixed and the table needs no walking: there is
+    /// nothing to forward and nothing whose liveness a trace could decide.
+    /// Interning is also what keeps the immortality affordable: the canonical
+    /// object is shared by every code object naming the same value, so a lost
+    /// publish race abandons nothing — both racers hold the same object.
     ///
     /// Owned via `Box::into_raw`, sized to `code.names.len()` at construction,
     /// never resized; a `null` slot is unrealized.  The whole pointer is `null`
@@ -602,6 +605,18 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     // by every field initializer below.
     let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
     let code_ptr_aligned = !code_ptr.is_null() && (code_ptr as i64) & align_mask == 0;
+    if code_ptr_aligned {
+        // The expanded `locations` array is redundant with `linetable`; hand it
+        // to [`code_locations`] to rebuild on the first reader that wants it.
+        // `first_line_number` is the value the array was decoded against here;
+        // a `co_firstlineno_raw` stamp that cannot be spelled as `OneIndexed`
+        // corrects the record in `box_code_constant_with_firstlineno`.
+        let firstlineno_raw = unsafe { &*(code_ptr as *const crate::CodeObject) }
+            .first_line_number
+            .map(|line| line.get() as i32)
+            .unwrap_or(1);
+        release_code_locations(code_ptr as *mut crate::CodeObject, firstlineno_raw);
+    }
     let mut fast_natural_arity = if !code_ptr_aligned {
         crate::gateway::HOPELESS
     } else {
@@ -818,6 +833,13 @@ fn box_code_constant_with_firstlineno(code: &crate::CodeObject, firstlineno: i32
     unsafe {
         (*(obj as *mut PyCode)).co_firstlineno_raw = firstlineno;
     }
+    // `w_code_new` recorded `first_line_number`, which drops the zero and
+    // negative values this stamp carries; re-record the exact one so the
+    // released rows decode against what the array was built from.
+    let code_ptr = unsafe { w_code_get_ptr(obj) } as *mut crate::CodeObject;
+    if !code_ptr.is_null() {
+        record_deferred_locations_firstlineno(code_ptr, firstlineno);
+    }
     obj
 }
 
@@ -1000,8 +1022,18 @@ unsafe fn require_code(
     Ok(unsafe { &*ptr })
 }
 
+/// The `co_names` / `co_varnames` / `co_freevars` / `co_cellvars` getters.
+///
+/// Interned for `pycode.py:127-129 space.new_interned_str(aname)`' reason: the
+/// entries name values, so every code object spelling one must hand back the
+/// same object rather than a fresh immortal string per read.
 fn names_tuple(names: &[String]) -> PyObjectRef {
-    w_tuple_new(names.iter().map(|name| w_str_new(name)).collect())
+    w_tuple_new(
+        names
+            .iter()
+            .map(|name| pyre_object::unicodeobject::intern_str_value(name))
+            .collect(),
+    )
 }
 
 fn constants_tuple(obj: PyObjectRef, code: &crate::CodeObject) -> PyObjectRef {
@@ -1039,7 +1071,7 @@ fn legacy_lnotab(code: &crate::CodeObject, firstlineno: i64) -> Vec<u8> {
     let mut out = Vec::new();
     let mut line = firstlineno;
     let mut start_offset = 0usize;
-    for (index, (start, _)) in code.locations.iter().enumerate() {
+    for (index, (start, _)) in code_locations(code).iter().enumerate() {
         let next_line = start.line.get() as i64;
         if next_line != line {
             let offset = index * 2;
@@ -1423,8 +1455,7 @@ pub unsafe fn code_varname_from_oparg(
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "co_positions")? };
-    let rows = code
-        .locations
+    let rows = code_locations(code)
         .iter()
         .map(|(start, end)| {
             w_tuple_new(vec![
@@ -1444,12 +1475,13 @@ pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyE
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_lines(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let code = unsafe { require_code(obj, "co_lines")? };
+    let locations = code_locations(code);
     let mut rows = Vec::new();
     let mut start = 0usize;
-    while start < code.locations.len() {
-        let line = code.locations[start].0.line.get();
+    while start < locations.len() {
+        let line = locations[start].0.line.get();
         let mut end = start + 1;
-        while end < code.locations.len() && code.locations[end].0.line.get() == line {
+        while end < locations.len() && locations[end].0.line.get() == line {
             end += 1;
         }
         rows.push(w_tuple_new(vec![
@@ -2091,7 +2123,9 @@ pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectR
     let Some(name) = code.names.get(idx) else {
         return pyre_object::pyobject::PY_NULL;
     };
-    let realized = w_str_new(name);
+    // `pycode.py:127-129 space.new_interned_str(aname)` — one canonical object
+    // per name value, not one per code object that names it.
+    let realized = pyre_object::unicodeobject::intern_str_value(name);
     match slot.compare_exchange(
         std::ptr::null_mut(),
         realized,
@@ -2116,7 +2150,10 @@ pub unsafe fn w_code_getname_w_or_new(
 ) -> PyObjectRef {
     let w_name = unsafe { w_code_getname_w(w_code_obj, idx) };
     if w_name.is_null() {
-        return w_str_new(name);
+        // No slot to realize into, so nothing bounds how often this runs;
+        // interning is what keeps an immortal string per execution from being
+        // an immortal string per execution.
+        return pyre_object::unicodeobject::intern_str_value(name);
     }
     w_name
 }
@@ -2309,6 +2346,124 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
         return false;
     }
     !std::ptr::eq(code.w_globals, w_globals)
+}
+
+/// The state of a code object's `co_positions` rows once its own `locations`
+/// array has been released.
+///
+/// `Deferred` carries the first line number the rows must be decoded against.
+/// `CodeObject.first_line_number` cannot stand in for it: it is an
+/// `Option<OneIndexed>`, which cannot spell the zero and negative values
+/// `CodeType(...)` accepts and `co_firstlineno_raw` preserves.
+#[derive(Clone, Copy)]
+enum CodeLocations {
+    Deferred(i32),
+    Decoded(&'static [(SourceLocation, SourceLocation)]),
+}
+
+/// Rows released from `CodeObject.locations`, keyed by code object address.
+///
+/// `locations` is not serialized: `marshal.rs:265,951` expand it out of
+/// `linetable` while reading a code object, so a loaded code object carries the
+/// same line information twice — compressed at about 1.5 bytes per instruction
+/// and expanded at 32, since `SourceLocation` is a pair of `NonZeroUsize`.
+/// Nothing but a traceback, a debugger line jump and the `co_positions` /
+/// `co_lines` getters ever reads the expanded form, so [`w_code_new`] releases
+/// it and [`code_locations`] rebuilds it on the first reader — the
+/// realize-once treatment `co_consts_w` and `co_names_w` already get.
+///
+/// Decoded rows are leaked because the `CodeObject` describing them is itself
+/// never released: `pycode_destructor` frees the side tables and leaves
+/// `code_ptr` standing, so an entry can never outlive its key's validity and
+/// never has to be revisited.
+///
+/// Process-global and keyed by `usize` for `LIVE_CODE_WRAPPERS`' reasons: the
+/// rows belong to the shared code object, and a raw `PyObjectRef` is not
+/// `Send`.
+static CODE_LOCATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, CodeLocations>>,
+> = std::sync::OnceLock::new();
+
+fn code_locations_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<usize, CodeLocations>> {
+    CODE_LOCATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Release a freshly constructed code object's expanded `locations` array,
+/// recording the first line number [`code_locations`] must decode it back
+/// against.
+///
+/// Called before the wrapper is published, so no reader can be holding the
+/// array that is dropped here, and a later call for the same code object (the
+/// `co_firstlineno_raw` stamp that follows `CodeType(...)` and `code.replace`)
+/// simply corrects the recorded line number.
+fn release_code_locations(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32) {
+    // A code object with no instructions has no rows to decode, and a second
+    // wrapper over one already released must keep the record the first made —
+    // re-deferring would abandon rows a reader has since decoded.
+    let code = unsafe { &mut *code_ptr };
+    if code.instructions.is_empty() || code.locations.is_empty() {
+        return;
+    }
+    code.locations = Vec::new().into_boxed_slice();
+    code_locations_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(code_ptr as usize, CodeLocations::Deferred(firstlineno_raw));
+}
+
+/// Correct the first line number a released array is decoded against, leaving a
+/// code object that still holds its own array alone.
+fn record_deferred_locations_firstlineno(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32) {
+    let mut cache = code_locations_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(slot @ CodeLocations::Deferred(_)) = cache.get_mut(&(code_ptr as usize)) {
+        *slot = CodeLocations::Deferred(firstlineno_raw);
+    }
+}
+
+/// The `co_positions` rows of `code`, decoding them out of `linetable` on the
+/// first reader when [`release_code_locations`] has taken the array away.
+///
+/// Returns the code object's own array untouched when it still holds one, so a
+/// code object built outside [`w_code_new`] reads exactly as it always did.
+///
+/// An empty array on a code object that has instructions always means the rows
+/// were released: every construction path fills `locations` through
+/// `linetable_to_locations`, which returns one row per instruction. Decoding is
+/// therefore the right answer whether or not the map still knows the object.
+pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLocation)] {
+    if !code.locations.is_empty() || code.instructions.is_empty() {
+        return &code.locations;
+    }
+    let key = code as *const crate::CodeObject as usize;
+    let mut cache = code_locations_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let firstlineno_raw = match cache.get(&key) {
+        Some(CodeLocations::Decoded(rows)) => return *rows,
+        Some(CodeLocations::Deferred(firstlineno_raw)) => *firstlineno_raw,
+        // A copy of a released code object: `w_code_fill_consts_from_tuple`
+        // serializes a wrapped constant back into `ConstantData` by copying the
+        // `CodeObject`, so the empty array travels to an address this map has
+        // never seen. `linetable` is the serialized form and travels with it,
+        // which is why it — not the map — is what makes the rows recoverable;
+        // the record only exists to carry a first line number
+        // `Option<OneIndexed>` cannot spell.
+        None => code
+            .first_line_number
+            .map(|line| line.get() as i32)
+            .unwrap_or(1),
+    };
+    let rows: &'static [(SourceLocation, SourceLocation)] =
+        Box::leak(rustpython_compiler_core::marshal::linetable_to_locations(
+            &code.linetable,
+            firstlineno_raw,
+            code.instructions.len(),
+        ));
+    cache.insert(key, CodeLocations::Decoded(rows));
+    rows
 }
 
 /// Registry mapping a raw CodeObject pointer (`PyCode.code_ptr`) to the

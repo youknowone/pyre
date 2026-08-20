@@ -578,6 +578,37 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     obj
 }
 
+/// `objspace.new_interned_str(s)` — the process-wide canonical exact `str` for
+/// `value`, built only when the value is not interned yet.
+///
+/// [`intern_exact_str`] answers the same question for a caller that already
+/// holds an object, and must be handed one even when the table already has the
+/// canonical instance.  A caller that holds only the characters — a code
+/// object realizing `co_names_w` (`pycode.py:127-129`), an attribute name —
+/// would have to build a [`w_str_new`] result to ask, and that result is
+/// `malloc_typed`-immortal: abandoning it on a hit retains it for the process
+/// lifetime.  Interning from the value instead builds nothing on a hit.
+#[majit_macros::dont_look_inside]
+pub fn intern_str_value(value: &str) -> PyObjectRef {
+    let mut table = STRING_INTERN_TABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(slot) = table.get(Wtf8::new(value)) {
+        return **slot as PyObjectRef;
+    }
+    let obj = w_str_new(value);
+    let mut slot = Box::new(obj as usize);
+    let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
+    // `w_str_new` is immortal, so this root only has to keep the collector from
+    // rewriting a slot it never owns; the registration matches
+    // [`intern_exact_str`] so both entry points present the table identically.
+    unsafe {
+        crate::gc_hook::try_gc_add_root(root_slot);
+    }
+    table.insert(Wtf8Buf::from_string(value.to_string()), slot);
+    obj
+}
+
 /// CPython 3.14 `PyUnicode_CHECK_INTERNED`: true only when `obj` itself is the
 /// canonical value stored in the process-wide intern table.
 ///
