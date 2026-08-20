@@ -193,6 +193,16 @@ fn reg_position_in_jitframe(reg: crate::regloc::RegLoc) -> Option<usize> {
     }
 }
 
+fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
+    match loc {
+        Loc::Reg(reg) => Some(
+            reg_position_in_jitframe(*reg).expect("deadframe slot: register is not managed") as u16,
+        ),
+        Loc::Frame(frame) => Some((frame.position + JITFRAME_FIXED_SIZE) as u16),
+        Loc::Immed(_) | Loc::Ebp(_) | Loc::Addr(_) => None,
+    }
+}
+
 // ── Abstract condition codes ──
 // Architecture-independent CC values used throughout the assembler.
 // Converted to arch-specific encoding at emission time.
@@ -3374,13 +3384,20 @@ impl<'a> AssemblerARM64<'a> {
         faillocs: &[Option<Loc>],
         fail_index: u32,
     ) {
+        let guard_argloc = arglocs.first().copied();
         match op.opcode {
             OpCode::GuardTrue | OpCode::VecGuardTrue | OpCode::GuardNonnull => {
                 // arglocs[0] = condition location
                 if let Some(loc) = arglocs.first() {
                     self.load_condition_into_cc(loc);
                 }
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             // `assembler.py genop_guard_guard_false` inverts the
             // published cc, then implements: a folded IntLt that published
@@ -3390,49 +3407,91 @@ impl<'a> AssemblerARM64<'a> {
                     self.load_condition_into_cc(loc);
                 }
                 self.guard_success_cc = self.guard_success_cc.map(invert_cc);
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardValue => {
                 if arglocs.len() >= 2 {
                     self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
                     self.guard_success_cc = Some(CC_E);
                 }
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardClass => {
                 if arglocs.len() >= 2 {
                     self._cmp_guard_class(&arglocs[0], &arglocs[1]);
                     self.guard_success_cc = Some(CC_E);
                 }
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardGcType => {
                 if arglocs.len() >= 2 {
                     self._cmp_guard_gc_type(&arglocs[0], &arglocs[1]);
                     self.guard_success_cc = Some(CC_E);
                 }
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardIsObject => {
                 if let Some(obj_loc) = arglocs.first() {
                     self.emit_guard_is_object(obj_loc);
                     self.guard_success_cc = Some(CC_NE);
                 }
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardSubclass => {
                 if arglocs.len() >= 2 {
                     self.emit_guard_subclass(&arglocs[0], &arglocs[1]);
                     self.guard_success_cc = Some(CC_B);
                 }
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardException => {
                 if let Some(expected_loc) = arglocs.first() {
                     self.emit_guard_exception(expected_loc);
                     self.guard_success_cc = Some(CC_E);
                 }
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
                 self.emit_store_and_reset_exception(result_loc);
             }
             OpCode::GuardNonnullClass => {
@@ -3442,16 +3501,33 @@ impl<'a> AssemblerARM64<'a> {
                     self._cmp_guard_class(&arglocs[0], &arglocs[1]);
                     self.emit_jcc_to_label(CC_NE, fail_label);
                     self.append_guard_token_with_faillocs(
-                        op, op_index, fail_index, fail_label, faillocs,
+                        op,
+                        op_index,
+                        fail_index,
+                        fail_label,
+                        guard_argloc,
+                        faillocs,
                     );
                 }
             }
             OpCode::GuardNoException => {
                 self.emit_guard_no_exception_check();
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardNoOverflow => {
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardOverflow => {
                 // aarch64/opassembler.py:547-551 aliases GUARD_NO_OVERFLOW to
@@ -3464,23 +3540,51 @@ impl<'a> AssemblerARM64<'a> {
                     .take()
                     .expect("GuardOverflow requires a preceding overflow operation");
                 self.guard_success_cc = Some(invert_cc(no_overflow_cc));
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
                 dynasm!(self.mc ; .arch aarch64 ; ldr X(16), [x29, JF_DESCR_OFS as u32] ; cmp X(16), xzr);
                 self.guard_success_cc = Some(CC_E);
-                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             OpCode::GuardNotInvalidated => {
                 self.implement_guard_not_invalidated_with_faillocs(
-                    op, op_index, fail_index, faillocs,
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
                 );
             }
             OpCode::GuardAlwaysFails => {
-                self.implement_guard_always_fails_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_always_fails_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
             _ => {
-                self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
+                self.implement_guard_nojump_with_faillocs(
+                    op,
+                    op_index,
+                    fail_index,
+                    guard_argloc,
+                    faillocs,
+                );
             }
         }
         // Every arm emits its own flag-setting code, so a comparison record
@@ -3828,6 +3932,7 @@ impl<'a> AssemblerARM64<'a> {
         op: &Op,
         op_index: usize,
         fail_index: u32,
+        guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
         let cc = self
@@ -3836,7 +3941,14 @@ impl<'a> AssemblerARM64<'a> {
             .expect("implement_guard_with_faillocs: guard_success_cc not set");
         let fail_cc = invert_cc(cc);
         let fail_label = self.emit_guard_jcc(fail_cc);
-        self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
+        self.append_guard_token_with_faillocs(
+            op,
+            op_index,
+            fail_index,
+            fail_label,
+            guard_argloc,
+            faillocs,
+        );
     }
 
     /// Guard no-jump with faillocs.
@@ -3845,10 +3957,18 @@ impl<'a> AssemblerARM64<'a> {
         op: &Op,
         op_index: usize,
         fail_index: u32,
+        guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
         let fail_label = self.mc.new_dynamic_label();
-        self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
+        self.append_guard_token_with_faillocs(
+            op,
+            op_index,
+            fail_index,
+            fail_label,
+            guard_argloc,
+            faillocs,
+        );
     }
 
     fn implement_guard_always_fails_with_faillocs(
@@ -3856,11 +3976,19 @@ impl<'a> AssemblerARM64<'a> {
         op: &Op,
         op_index: usize,
         fail_index: u32,
+        guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
         let fail_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b =>fail_label);
-        self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
+        self.append_guard_token_with_faillocs(
+            op,
+            op_index,
+            fail_index,
+            fail_label,
+            guard_argloc,
+            faillocs,
+        );
     }
 
     /// `GUARD_NOT_INVALIDATED`: load the owning token's `invalidated` byte
@@ -3874,6 +4002,7 @@ impl<'a> AssemblerARM64<'a> {
         op: &Op,
         op_index: usize,
         fail_index: u32,
+        guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
         let fail_label = self.mc.new_dynamic_label();
@@ -3886,7 +4015,14 @@ impl<'a> AssemblerARM64<'a> {
             // `emit_bcond_to_label`.
             self.emit_cbnz_w_to_label(17, fail_label);
         }
-        self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
+        self.append_guard_token_with_faillocs(
+            op,
+            op_index,
+            fail_index,
+            fail_label,
+            guard_argloc,
+            faillocs,
+        );
     }
 
     /// Append guard token with regalloc faillocs instead of opref_to_slot snapshot.
@@ -3896,6 +4032,7 @@ impl<'a> AssemblerARM64<'a> {
         op_index: usize,
         fail_index: u32,
         fail_label: DynamicLabel,
+        guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
     ) {
         let fail_arg_types = self.infer_fail_arg_types(op, Some(op_index));
@@ -3964,33 +4101,17 @@ impl<'a> AssemblerARM64<'a> {
         // the slot into rd_locs so the deopt path reads it via PyPy's
         // stack-position decode (`llmodel.py:422-424`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
-        let gpr_regs = all_gen_regs();
-        let float_regs = all_float_regs();
         let rd_locs: Vec<u16> = faillocs
             .iter()
             .map(|fl| match fl {
                 None => 0xFFFF,
-                Some(Loc::Frame(f)) => (f.position + JITFRAME_FIXED_SIZE) as u16,
-                Some(Loc::Reg(r)) if r.is_xmm => {
-                    (gpr_regs.len()
-                        + float_regs
-                            .iter()
-                            .position(|reg| *reg == *r)
-                            .expect("rd_locs: float register not in float_regs"))
-                        as u16
-                }
-                Some(Loc::Reg(r)) => gpr_regs
-                    .iter()
-                    .position(|reg| *reg == *r)
-                    .expect("rd_locs: register not in gen_regs")
-                    as u16,
                 Some(Loc::Immed(i)) => {
                     let slot = self.frame_depth;
                     self.frame_depth += 1;
                     const_stores.push((slot, i.value));
                     slot as u16
                 }
-                Some(Loc::Ebp(_)) | Some(Loc::Addr(_)) => 0xFFFF,
+                Some(loc) => deadframe_slot_for_loc(loc).unwrap_or(0xFFFF),
             })
             .collect();
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
@@ -4010,27 +4131,26 @@ impl<'a> AssemblerARM64<'a> {
         // canonical copy when present.  Must follow the `meta_descr`
         // stamp above for the forward to reach the meta side.
         descr_fd.set_rd_locs(rd_locs);
-        // `regalloc.py consider_guard_value` — every upstream backend
-        // stamps the per-value counter while laying the guard out, so
-        // `store_hash` (`compile.py`, gated on `status == 0`) leaves it
+        // `regalloc.py:495-500 consider_guard_value` records
+        // `all_reg_indexes[x.value]`, a deadframe slot; `llmodel.py:427-435
+        // get_value_direct` reads the raw jitframe word at that slot. The
+        // shared failure stub saves every managed register into the jitframe
+        // before recovery runs, so the operand remains readable even when it
+        // is not a fail-arg. Stamping while laying the guard out means
+        // `store_hash` (`compile.py:826-829`, gated on `status == 0`) leaves it
         // alone and `must_compile` hashes the (guard, failing value) pair
         // instead of the guard alone.  Without it a guard whose failing value
         // never repeats still accumulates in one bucket and compiles another
-        // bridge every `trace_eagerness` failures, without bound.  The index is
-        // a fail-arg position because `must_compile_with_values` reads the value
-        // back out of `fail_values`.
+        // bridge every `trace_eagerness` failures, without bound.
         if op.opcode == majit_ir::OpCode::GuardValue
-            && let Some(fa) = op.getfailargs()
+            && let Some(slot) = guard_argloc.as_ref().and_then(deadframe_slot_for_loc)
         {
-            let arg0 = op.arg(0).to_opref();
-            if let Some(idx) = fa.iter().position(|r| r.to_opref() == arg0) {
-                let type_tag = match descr_fd.fail_arg_types().get(idx) {
-                    Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
-                    Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
-                    _ => majit_backend::STATUS_TY_INT,
-                };
-                descr_fd.make_a_counter_per_value(idx as u32, type_tag);
-            }
+            let type_tag = match op.arg(0).to_opref().ty() {
+                Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
+                Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
+                _ => majit_backend::STATUS_TY_INT,
+            };
+            descr_fd.make_a_counter_per_value(slot as u32, type_tag);
         }
         if crate::majit_log_enabled() {
             eprintln!(

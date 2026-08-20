@@ -2991,6 +2991,15 @@ impl Backend for DynasmBackend {
             );
         }
 
+        // `compile.py must_compile` reads the failing GUARD_VALUE operand off
+        // the deadframe.  This is the one point on the top-level guard-failure
+        // path that still holds the jitframe: the driver decodes fail arguments
+        // out of the returned deadframe and hands `must_compile_with_values`
+        // that dense vector, in which a non-fail-arg operand has no position.
+        if !descr_fd.is_finish() {
+            unsafe { majit_backend::park_guard_value_operand(descr_fd, result_jf) };
+        }
+
         // `llmodel.py return ll_frame` — the deadframe IS the frame the
         // run returned. `result_jf` is the tip of `jf_ptr`'s `jf_forward`
         // chain whenever `_check_frame_depth` realloc'd; the whole chain is

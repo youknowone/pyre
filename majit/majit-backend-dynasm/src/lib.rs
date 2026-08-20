@@ -709,6 +709,10 @@ fn handle_fail_resume_guard(
         raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
     }
 
+    // compile.py:753-771 `must_compile` reads the failing GUARD_VALUE operand
+    // out of the deadframe; this is the CALL_ASSEMBLER callee's deadframe.
+    unsafe { majit_backend::park_guard_value_operand(descr, frame_ptr) };
+
     // pyjitpl.py:2921-2923 parity: recover the owning Arc<JitCellToken>
     // identity from the descr.  When the weakref is dead (memmgr-evicted
     // JCT — "should be rare" per upstream), `compile.giveup()` raises

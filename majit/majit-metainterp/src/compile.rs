@@ -15,7 +15,9 @@
 use indexmap::{IndexMap, IndexSet};
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, OnceLock};
 
 use smallvec::smallvec;
@@ -3279,9 +3281,9 @@ fn alloc_fail_index() -> u32 {
 //   - bits 1..3      : `ST_TYPE_MASK` — `TY_NONE` / `TY_INT` / `TY_REF` /
 //                      `TY_FLOAT`, set by `make_a_counter_per_value` to
 //                      distinguish guard_value-by-int / -by-ref / -by-float.
-//   - bits 3..end    : jitcounter hash (when TY_NONE) or guard_value
-//                      failarg index (when TY_INT/REF/FLOAT), accessed via
-//                      `>> ST_SHIFT` with `STATUS_SHIFT_MASK`.
+//   - bits 3..end    : jitcounter hash (when TY_NONE) or backend value-slot
+//                      index (when TY_INT/REF/FLOAT), accessed via `>>
+//                      ST_SHIFT` with `STATUS_SHIFT_MASK`.
 pub(crate) const STATUS_BUSY_FLAG: u64 = 0x01;
 #[allow(dead_code)]
 pub(crate) const STATUS_TYPE_MASK: u64 = 0x06;
@@ -3343,6 +3345,8 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
         status: AtomicU64::new(0),
+        pending_counter_value: AtomicI64::new(0),
+        pending_counter_value_present: AtomicBool::new(false),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
@@ -3436,6 +3440,8 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
         status: AtomicU64::new(0),
+        pending_counter_value: AtomicI64::new(0),
+        pending_counter_value_present: AtomicBool::new(false),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
@@ -3684,6 +3690,12 @@ impl FailDescr for ResumeAtPositionDescr {
         let value = type_tag | ((index as u64) << STATUS_SHIFT);
         self.inner.status.store(value, Ordering::Release);
     }
+    fn set_pending_counter_value(&self, value: i64) {
+        FailDescr::set_pending_counter_value(&self.inner, value);
+    }
+    fn take_pending_counter_value(&self) -> Option<i64> {
+        FailDescr::take_pending_counter_value(&self.inner)
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -3757,6 +3769,8 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             adr_jump_offset: UnsafeCell::new(0),
             rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
+            pending_counter_value: AtomicI64::new(0),
+            pending_counter_value_present: AtomicBool::new(false),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -3958,6 +3972,12 @@ impl FailDescr for ResumeGuardForcedDescr {
         let value = type_tag | ((index as u64) << STATUS_SHIFT);
         self.inner.status.store(value, Ordering::Release);
     }
+    fn set_pending_counter_value(&self, value: i64) {
+        FailDescr::set_pending_counter_value(&self.inner, value);
+    }
+    fn take_pending_counter_value(&self) -> Option<i64> {
+        FailDescr::take_pending_counter_value(&self.inner)
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -4031,6 +4051,8 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             adr_jump_offset: UnsafeCell::new(0),
             rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
+            pending_counter_value: AtomicI64::new(0),
+            pending_counter_value_present: AtomicBool::new(false),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -4213,6 +4235,12 @@ impl FailDescr for ResumeGuardExcDescr {
         let value = type_tag | ((index as u64) << STATUS_SHIFT);
         self.inner.status.store(value, Ordering::Release);
     }
+    fn set_pending_counter_value(&self, value: i64) {
+        FailDescr::set_pending_counter_value(&self.inner, value);
+    }
+    fn take_pending_counter_value(&self) -> Option<i64> {
+        FailDescr::take_pending_counter_value(&self.inner)
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -4286,6 +4314,8 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             adr_jump_offset: UnsafeCell::new(0),
             rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
+            pending_counter_value: AtomicI64::new(0),
+            pending_counter_value_present: AtomicBool::new(false),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -4352,6 +4382,12 @@ pub struct ResumeGuardCopiedDescr {
     /// each copied descr carries its own status (the copied receiver is
     /// retraced independently of the donor).
     status: AtomicU64,
+    /// Failing GUARD_VALUE word parked by a backend that owns the deadframe.
+    /// A `Ref` is only a hash input here and is never dereferenced, so this
+    /// slot is not a GC root.
+    pending_counter_value: AtomicI64,
+    /// Whether `pending_counter_value` contains an unread word.
+    pending_counter_value_present: AtomicBool,
     /// `compile.py` `descr.rd_loop_token = clt`.  Copied descrs are
     /// stamped per-guard by the same `record_loop_or_bridge` walker
     /// (`compile.py isinstance(descr, ResumeDescr)` covers
@@ -4527,6 +4563,8 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             adr_jump_offset: UnsafeCell::new(0),
             rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
+            pending_counter_value: AtomicI64::new(0),
+            pending_counter_value_present: AtomicBool::new(false),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -4689,6 +4727,16 @@ impl FailDescr for ResumeGuardCopiedDescr {
         let value = type_tag | ((index as u64) << STATUS_SHIFT);
         self.status.store(value, Ordering::Release);
     }
+    fn set_pending_counter_value(&self, value: i64) {
+        self.pending_counter_value.store(value, Ordering::Relaxed);
+        self.pending_counter_value_present
+            .store(true, Ordering::Release);
+    }
+    fn take_pending_counter_value(&self) -> Option<i64> {
+        self.pending_counter_value_present
+            .swap(false, Ordering::AcqRel)
+            .then(|| self.pending_counter_value.load(Ordering::Relaxed))
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -4850,6 +4898,8 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 adr_jump_offset: UnsafeCell::new(0),
                 rd_locs: UnsafeCell::new(Vec::new()),
                 status: AtomicU64::new(0),
+                pending_counter_value: AtomicI64::new(0),
+                pending_counter_value_present: AtomicBool::new(false),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
@@ -4964,6 +5014,12 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
         self.inner.make_a_counter_per_value(index, type_tag);
     }
+    fn set_pending_counter_value(&self, value: i64) {
+        self.inner.set_pending_counter_value(value);
+    }
+    fn take_pending_counter_value(&self) -> Option<i64> {
+        self.inner.take_pending_counter_value()
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         self.inner.rd_loop_token_clt()
     }
@@ -5054,6 +5110,8 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
         status: AtomicU64::new(0),
+        pending_counter_value: AtomicI64::new(0),
+        pending_counter_value_present: AtomicBool::new(false),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
@@ -5094,6 +5152,8 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             adr_jump_offset: UnsafeCell::new(0),
             rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
+            pending_counter_value: AtomicI64::new(0),
+            pending_counter_value_present: AtomicBool::new(false),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -5258,6 +5318,8 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 adr_jump_offset: UnsafeCell::new(0),
                 rd_locs: UnsafeCell::new(Vec::new()),
                 status: AtomicU64::new(0),
+                pending_counter_value: AtomicI64::new(0),
+                pending_counter_value_present: AtomicBool::new(false),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
@@ -5402,6 +5464,12 @@ impl FailDescr for CompileLoopVersionDescr {
         let value = type_tag | ((index as u64) << STATUS_SHIFT);
         self.inner.status.store(value, Ordering::Release);
     }
+    fn set_pending_counter_value(&self, value: i64) {
+        FailDescr::set_pending_counter_value(&self.inner, value);
+    }
+    fn take_pending_counter_value(&self) -> Option<i64> {
+        FailDescr::take_pending_counter_value(&self.inner)
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -5473,6 +5541,8 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             adr_jump_offset: UnsafeCell::new(0),
             rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
+            pending_counter_value: AtomicI64::new(0),
+            pending_counter_value_present: AtomicBool::new(false),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -6045,6 +6115,8 @@ mod fail_descr_tests {
                 adr_jump_offset: UnsafeCell::new(0),
                 rd_locs: UnsafeCell::new(Vec::new()),
                 status: AtomicU64::new(0),
+                pending_counter_value: AtomicI64::new(0),
+                pending_counter_value_present: AtomicBool::new(false),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),

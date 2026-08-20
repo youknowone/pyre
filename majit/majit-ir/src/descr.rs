@@ -4338,6 +4338,17 @@ pub trait FailDescr: Descr {
     /// pack `type_tag | (index << ST_SHIFT)` into status.
     fn make_a_counter_per_value(&self, _index: u32, _type_tag: u64) {}
 
+    /// The failing GUARD_VALUE operand, read out of the deadframe by the
+    /// backend's guard-failure entry. `compile.py:761-771 must_compile` makes
+    /// that read itself via `metainterp_sd.cpu.get_value_direct(deadframe, tp,
+    /// index)`; pyre's metainterp never sees the deadframe, so the backend that
+    /// owns it parks the word on the descr the decision is about.
+    fn set_pending_counter_value(&self, _value: i64) {}
+
+    fn take_pending_counter_value(&self) -> Option<i64> {
+        None
+    }
+
     /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
     /// to a guard descriptor. Non-guard fail descriptors ignore this.
     ///

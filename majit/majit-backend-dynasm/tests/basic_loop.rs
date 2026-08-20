@@ -10,7 +10,9 @@
 use std::rc::Rc;
 use std::sync::{LazyLock, Mutex};
 
-use majit_backend::{Backend, JitCellToken};
+use majit_backend::{
+    Backend, JitCellToken, STATUS_SHIFT, STATUS_TYPE_MASK, make_resume_guard_descr_typed,
+};
 use majit_ir::{
     GcRef, InputArg, Op, OpCode, OpRef, Type, Value, make_array_descr, make_loop_target_descr,
 };
@@ -313,6 +315,65 @@ fn test_guard_and_loop() {
     // fail_args = [OpRef::int_op(1)], so fail_arg index 0 = the IntAdd result.
     let result_val = backend.get_int_value(&frame, 0);
     assert_eq!(result_val, 5, "loop should stop at 5, fail_arg[0]");
+}
+
+/// `regalloc.py:495-500 consider_guard_value`: the counter index names the
+/// guard operand's deadframe slot, independent of the guard's fail arguments.
+#[test]
+fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(2);
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let value = inputargs[0].opref();
+    let loop_descr = make_loop_target_descr(token.number, false);
+
+    let label_op = Op::new(OpCode::Label, &[rb(value)]);
+    label_op.pos.set(OpRef::void_op(0));
+    label_op.setdescr(loop_descr.clone());
+
+    let guard_descr = make_resume_guard_descr_typed(vec![]);
+    let guard_op = Op::new(OpCode::GuardValue, &[rb(value), rb(OpRef::const_int(7))]);
+    guard_op.pos.set(OpRef::void_op(1));
+    guard_op.set_fail_arg_types(vec![]);
+    guard_op.setfailargs(vec![].into());
+    guard_op.setdescr(guard_descr.clone());
+
+    let jump_op = Op::new(OpCode::Jump, &[rb(value)]);
+    jump_op.pos.set(OpRef::void_op(2));
+    jump_op.setdescr(loop_descr);
+
+    let ops_rc: Vec<Rc<Op>> = vec![Rc::new(label_op), Rc::new(guard_op), Rc::new(jump_op)];
+    let result = backend.compile_loop(&inputargs, &ops_rc, &token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let guard_fd = guard_descr
+        .as_fail_descr()
+        .expect("guard descr is FailDescr");
+    let status = guard_fd.get_status();
+    assert_ne!(
+        status & STATUS_TYPE_MASK,
+        0,
+        "GUARD_VALUE must have a per-value counter when arg0 is not a failarg"
+    );
+    let slot = status >> STATUS_SHIFT;
+    assert!(
+        slot < 64,
+        "GUARD_VALUE deadframe slot is implausible: {slot}"
+    );
+
+    // 99 != 7, so the guard fails on the first check.  `compile.py:753-771`
+    // hashes the failing operand, so the recorded slot has to name the word
+    // that holds it — here a register the guard carries no fail argument for.
+    let frame = backend.execute_token(&token, &[Value::Int(99)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert!(!descr.is_finish(), "should be guard failure, not finish");
+    assert_eq!(
+        guard_fd.take_pending_counter_value(),
+        Some(99),
+        "the deadframe slot recorded for the GUARD_VALUE must hold its operand"
+    );
 }
 
 #[test]

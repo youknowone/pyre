@@ -12184,9 +12184,13 @@ impl<M: Clone> MetaInterp<M> {
             // `cast_ptr_to_int` for TY_REF, and `longlong.gethash_fast` for
             // TY_FLOAT, which is `longlong2float.float2longlong` on a 64-bit
             // host (codewriter/longlong.py:28) — the double's raw bit pattern.
-            // `fail_values` already holds every slot as that raw word, so all
-            // three tags hash the stored value unchanged.
-            let intval: i64 = fail_values.get(index as usize).copied().unwrap_or(0);
+            // A backend that parks the word has already performed
+            // `get_value_direct` against its own deadframe. Backends whose
+            // slot space is the dense fail-arg vector (cranelift and wasm)
+            // still resolve the recorded index from `fail_values` here.
+            let intval: i64 = descr_fd
+                .take_pending_counter_value()
+                .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
             // compile.py:780-781: current_object_addr_as_int(self) * 777767777
             //   + intval * 1442968193
             (descr_addr as u64)
