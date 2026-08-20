@@ -457,12 +457,18 @@ pub unsafe fn dict_entries_pop_last(entries: &mut indexmap::IndexMap<ObjectKey, 
 /// allocating `object_key_for(w_str_new(key))` path when no str hash hook is
 /// installed (pyre-object lib tests without the str hook, pre-init snapshot
 /// tools), preserving today's behavior there.
+///
+/// `hash` is `key`'s digest when the caller already holds it —
+/// [`crate::unicodeobject::w_str_hash_memoized`] on the string object `key` was
+/// borrowed from (`rstr.py:402-412 ll_strhash`).  Zero means the caller has
+/// none and the bytes are hashed here.
 #[inline]
 unsafe fn dict_entries_get_str(
     entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
     key: &str,
+    hash: i64,
 ) -> Option<PyObjectRef> {
-    match crate::dict_eq_hook::try_hash_str(key.as_bytes()) {
+    match memoized_or_hashed(key, hash) {
         Some(hash) => {
             // Clear any stale eq flag so a str-subclass comparison in the probe
             // starts clean, matching `object_key_for`'s pre-probe reset (:125).
@@ -473,6 +479,18 @@ unsafe fn dict_entries_get_str(
     }
 }
 
+/// `key`'s digest: the one the caller memoized on the string object it borrowed
+/// `key` from, or — when it holds none — a fresh hash of the borrowed bytes.
+/// `None` when no str hash hook is installed, which puts the caller on its
+/// allocating owned-key arm.
+#[inline]
+fn memoized_or_hashed(key: &str, hash: i64) -> Option<i64> {
+    if hash != 0 {
+        return Some(hash);
+    }
+    crate::dict_eq_hook::try_hash_str(key.as_bytes())
+}
+
 /// Borrow-key membership probe returning the entry index, for str-keyed
 /// `setitem_str`: a re-store to an existing name updates in place and reuses
 /// the stored key, so only a genuinely new key allocates a persistent
@@ -480,12 +498,15 @@ unsafe fn dict_entries_get_str(
 /// inserted key, not an overwrite — `dictmultiobject.py:1220-1221`).  Falls
 /// back to the allocating `object_key_for(w_str_new(key))` probe when no str
 /// hash hook is installed.
+///
+/// `hash` carries a caller-held digest, as in [`dict_entries_get_str`].
 #[inline]
 unsafe fn dict_entries_index_of_str(
     entries: &indexmap::IndexMap<ObjectKey, PyObjectRef>,
     key: &str,
+    hash: i64,
 ) -> Option<usize> {
-    match crate::dict_eq_hook::try_hash_str(key.as_bytes()) {
+    match memoized_or_hashed(key, hash) {
         Some(hash) => {
             crate::dict_eq_hook::take_eq_error();
             dict_entries_index_of_str_hashed(entries, hash, key)
@@ -2126,7 +2147,7 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
         let value_slot = roots.base();
         roots.pin_root(w_value);
         let entries = w_module_dict_object_storage_mut(obj);
-        match dict_entries_index_of_str(entries, key) {
+        match dict_entries_index_of_str(entries, key, 0) {
             Some(idx) => {
                 dict_entries_value_set_at(entries, idx, roots.get(value_slot));
             }
@@ -2166,7 +2187,7 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
         // overridden `__eq__`/`__hash__` are reachable from the
         // str-fast-path lookup.  A borrowed `&str` probe avoids the
         // per-lookup throwaway `W_UnicodeObject` (`getitem_str` parity).
-        return dict_entries_get_str(entries, key);
+        return dict_entries_get_str(entries, key, 0);
     }
     {
         let strategy = &*(*(obj as *const W_ModuleDictObject)).mstrategy;
@@ -3483,8 +3504,23 @@ pub unsafe fn w_dict_setitem(obj: PyObjectRef, key: i64, value: PyObjectRef) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    w_dict_getitem_str_hashed(obj, key, 0)
+}
+
+/// [`w_dict_getitem_str`] for a caller that already holds `key`'s digest —
+/// [`crate::unicodeobject::w_str_hash_memoized`] on the string object `key` was
+/// borrowed from (`rstr.py:402-412 ll_strhash`).  Zero leaves the strategy to
+/// hash the borrowed bytes, which is what every other caller gets.
+///
+/// # Safety
+/// Same as [`w_dict_getitem_str`].
+pub unsafe fn w_dict_getitem_str_hashed(
+    obj: PyObjectRef,
+    key: &str,
+    hash: i64,
+) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj);
-    w_dict_get_strategy(obj).getitem_str(obj, key)
+    w_dict_get_strategy(obj).getitem_str_hashed(obj, key, hash)
 }
 
 /// Error-propagating sibling of [`w_dict_getitem_str`], the str-keyed
@@ -3503,7 +3539,20 @@ pub unsafe fn w_dict_getitem_str_checked(
     obj: PyObjectRef,
     key: &str,
 ) -> Result<Option<PyObjectRef>, DictKeyError> {
-    let hit = w_dict_getitem_str(obj, key);
+    w_dict_getitem_str_checked_hashed(obj, key, 0)
+}
+
+/// [`w_dict_getitem_str_checked`] for a caller that already holds `key`'s
+/// digest, as [`w_dict_getitem_str_hashed`] takes it.
+///
+/// # Safety
+/// `obj` must point to a valid dict.
+pub unsafe fn w_dict_getitem_str_checked_hashed(
+    obj: PyObjectRef,
+    key: &str,
+    hash: i64,
+) -> Result<Option<PyObjectRef>, DictKeyError> {
+    let hit = w_dict_getitem_str_hashed(obj, key, hash);
     if take_dict_key_error() {
         return Err(DictKeyError);
     }
@@ -3523,12 +3572,25 @@ pub unsafe fn w_dict_getitem_str_object_strategy(
     obj: PyObjectRef,
     key: &str,
 ) -> Option<PyObjectRef> {
+    w_dict_getitem_str_object_strategy_hashed(obj, key, 0)
+}
+
+/// [`w_dict_getitem_str_object_strategy`] for a caller that already holds
+/// `key`'s digest (`rstr.py:402-412 ll_strhash`).
+///
+/// # Safety
+/// Same as [`w_dict_getitem_str_object_strategy`].
+pub unsafe fn w_dict_getitem_str_object_strategy_hashed(
+    obj: PyObjectRef,
+    key: &str,
+    hash: i64,
+) -> Option<PyObjectRef> {
     let dict = &*(obj as *const W_DictObject);
     let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
     // Under the `dict_keys_equal` hash/eq pair, str-keyed lookups hash on the
     // str hash and compare on WTF-8 byte equality.  A borrowed `&str` probe
     // avoids the per-lookup throwaway `W_UnicodeObject` (`getitem_str` parity).
-    dict_entries_get_str(entries, key)
+    dict_entries_get_str(entries, key, hash)
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:111-112 W_DictMultiObject.setitem_str`
@@ -3545,8 +3607,24 @@ pub unsafe fn w_dict_getitem_str_object_strategy(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_setitem_str(obj: PyObjectRef, key: &str, value: PyObjectRef) {
+    w_dict_setitem_str_hashed(obj, key, 0, value)
+}
+
+/// [`w_dict_setitem_str`] for a caller that already holds `key`'s digest, as
+/// [`w_dict_getitem_str_hashed`] takes it.
+///
+/// Residualised for [`w_dict_setitem_str`]'s reason.
+#[majit_macros::dont_look_inside]
+/// # Safety
+/// Same as [`w_dict_setitem_str`].
+pub unsafe fn w_dict_setitem_str_hashed(
+    obj: PyObjectRef,
+    key: &str,
+    hash: i64,
+    value: PyObjectRef,
+) {
     lock_dict_refs!(_dict_guard, obj, value);
-    w_dict_get_strategy(obj).setitem_str(obj, key, value)
+    w_dict_get_strategy(obj).setitem_str_hashed(obj, key, hash, value)
 }
 
 /// Compatibility spelling retained until the remaining callers are collapsed.
@@ -5691,6 +5769,25 @@ pub trait DictStrategy {
         self.getitem(w_dict, w_key)
     }
 
+    /// [`getitem_str`](Self::getitem_str) told `key`'s digest, so a strategy
+    /// whose table is keyed on `space.hash_w` can probe without re-hashing the
+    /// bytes.  The digest is the memo `rstr.py:402-412 ll_strhash` keeps in the
+    /// string object the caller borrowed `key` from; zero means it holds none.
+    /// Only the strategies backed by that table override this — the default
+    /// discards the digest and re-hashes.
+    ///
+    /// # Safety
+    /// `w_dict` must be a valid PyObjectRef.
+    unsafe fn getitem_str_hashed(
+        &self,
+        w_dict: PyObjectRef,
+        key: &str,
+        hash: i64,
+    ) -> Option<PyObjectRef> {
+        let _ = hash;
+        self.getitem_str(w_dict, key)
+    }
+
     /// `dictmultiobject.py:475-476 setitem` — required.
     ///
     /// # Safety
@@ -5705,6 +5802,23 @@ pub trait DictStrategy {
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
         let w_key = crate::w_str_new(key);
         self.setitem(w_dict, w_key, w_value);
+    }
+
+    /// [`setitem_str`](Self::setitem_str)'s counterpart to
+    /// [`getitem_str_hashed`](Self::getitem_str_hashed), taking `key`'s digest
+    /// the same way.
+    ///
+    /// # Safety
+    /// `w_dict` and `w_value` must be valid PyObjectRef.
+    unsafe fn setitem_str_hashed(
+        &self,
+        w_dict: PyObjectRef,
+        key: &str,
+        hash: i64,
+        w_value: PyObjectRef,
+    ) {
+        let _ = hash;
+        self.setitem_str(w_dict, key, w_value);
     }
 
     /// `dictmultiobject.py:481-482 delitem` — required.
@@ -6642,7 +6756,16 @@ impl DictStrategy for ObjectDictStrategy {
     /// `dictmultiobject.py:1216-1218 ObjectDictStrategy.getitem_str` —
     /// upstream just delegates to `getitem` after wrapping the key.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-        crate::dictmultiobject::w_dict_getitem_str_object_strategy(w_dict, key)
+        self.getitem_str_hashed(w_dict, key, 0)
+    }
+
+    unsafe fn getitem_str_hashed(
+        &self,
+        w_dict: PyObjectRef,
+        key: &str,
+        hash: i64,
+    ) -> Option<PyObjectRef> {
+        crate::dictmultiobject::w_dict_getitem_str_object_strategy_hashed(w_dict, key, hash)
     }
 
     /// `dictmultiobject.py:1220-1221 setitem_str` — `ObjectDictStrategy`
@@ -7012,6 +7135,16 @@ impl DictStrategy for UnicodeDictStrategy {
     /// key then dispatches to `setitem`.  UnicodeDictStrategy keeps
     /// str keys on the fast path; no promotion.
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
+        self.setitem_str_hashed(w_dict, key, 0, w_value);
+    }
+
+    unsafe fn setitem_str_hashed(
+        &self,
+        w_dict: PyObjectRef,
+        key: &str,
+        hash: i64,
+        w_value: PyObjectRef,
+    ) {
         // This is the one `setitem_str` that both collects and stores itself:
         // the membership probe can run a str-subclass `__eq__` (and its no-hook
         // arm wraps the key), and a miss mints the persistent key.  A dict
@@ -7022,7 +7155,7 @@ impl DictStrategy for UnicodeDictStrategy {
         let roots = crate::gc_roots::push_roots();
         let dict_slot = roots.publish(&[w_dict, w_value]);
         let value_slot = dict_slot + 1;
-        let found = dict_entries_index_of_str(w_dict_object_storage(w_dict), key);
+        let found = dict_entries_index_of_str(w_dict_object_storage(w_dict), key, hash);
         match found {
             Some(idx) => {
                 let w_value = roots.get(value_slot);
@@ -7047,7 +7180,16 @@ impl DictStrategy for UnicodeDictStrategy {
 
     /// `dictmultiobject.py:1315-1318 getitem_str` override.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-        crate::dictmultiobject::w_dict_getitem_str_object_strategy(w_dict, key)
+        self.getitem_str_hashed(w_dict, key, 0)
+    }
+
+    unsafe fn getitem_str_hashed(
+        &self,
+        w_dict: PyObjectRef,
+        key: &str,
+        hash: i64,
+    ) -> Option<PyObjectRef> {
+        crate::dictmultiobject::w_dict_getitem_str_object_strategy_hashed(w_dict, key, hash)
     }
 
     /// `dictmultiobject.py:1061-1067 AbstractTypedStrategy.setitem`.

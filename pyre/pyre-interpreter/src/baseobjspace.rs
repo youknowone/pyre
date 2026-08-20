@@ -4357,8 +4357,11 @@ pub fn finditem_str_named(
     nameindex: usize,
 ) -> Result<Option<PyObjectRef>, PyError> {
     if is_shortcut_dict(obj) {
-        return unsafe { pyre_object::dictmultiobject::w_dict_getitem_str_checked(obj, key) }
-            .map_err(|_| take_pending_dict_key_error(wrapped_key(key, pycode, nameindex)));
+        let hash = named_key_hash(key, pycode, nameindex);
+        return unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(obj, key, hash)
+        }
+        .map_err(|_| take_pending_dict_key_error(wrapped_key(key, pycode, nameindex)));
     }
     finditem(obj, wrapped_key(key, pycode, nameindex))
 }
@@ -4367,6 +4370,31 @@ pub fn finditem_str_named(
 /// one, otherwise a freshly minted `w_str`.
 fn wrapped_key(key: &str, pycode: PyObjectRef, nameindex: usize) -> PyObjectRef {
     unsafe { crate::pycode::w_code_getname_w_or_new(pycode, nameindex, key) }
+}
+
+/// `rstr.py:402-412 ll_strhash` for a key the caller named through a
+/// `co_names_w` slot (`pycode.py:127-129`): the digest is memoized in that
+/// shared name string, so each name is hashed once per string rather than once
+/// per opcode that reads it.  Zero when the caller named no slot — the probe
+/// then hashes the borrowed bytes itself, as it always has.
+///
+/// Unlike [`wrapped_key`] this never mints: a slot that has not been realized
+/// yet is realized (one interned string per name value), and a caller holding
+/// no code object gets zero.
+pub(crate) fn named_key_hash(key: &str, pycode: PyObjectRef, nameindex: usize) -> i64 {
+    let w_name = unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) };
+    if w_name.is_null() {
+        return 0;
+    }
+    // The digest answers for `key`'s bytes, so the slot must be the name the
+    // caller borrowed `key` from — the same pairing [`wrapped_key`] already
+    // stores under.  A mismatch would probe a bucket the key is not in.
+    debug_assert_eq!(
+        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) },
+        key,
+        "co_names_w slot names a different key than the opcode borrowed"
+    );
+    unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) }
 }
 
 /// PyPy-compatible identity check returning a raw boolean value.

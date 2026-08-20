@@ -754,6 +754,39 @@ pub unsafe fn w_str_set_hash(obj: PyObjectRef, hash: i64) {
     unsafe { (*(obj as *mut W_UnicodeObject)).hash = hash }
 }
 
+/// `rstr.py:402-412 ll_strhash` — read the memo, and compute the digest only
+/// while the slot still reads zero:
+///
+/// ```python
+/// def ll_strhash(s):
+///     if not s:
+///         return 0
+///     x = s.hash
+///     if x == 0:
+///         x = LLHelpers._ll_strhash(s)
+///     return x
+/// ```
+///
+/// The digest is the one [`crate::dict_eq_hook::try_hash_str`] produces, so a
+/// key hashed here lands in the bucket a borrowed-`&str` probe would have
+/// found.  Answers zero when no str-hash hook is installed — callers read that
+/// as "no memo", not as a digest, and hash the borrowed bytes themselves.
+///
+/// # Safety
+/// `obj` must be a `W_UnicodeObject`.
+pub unsafe fn w_str_hash_memoized(obj: PyObjectRef) -> i64 {
+    let cached = unsafe { w_str_get_hash(obj) };
+    if cached != 0 {
+        return cached;
+    }
+    let bytes = unsafe { w_str_get_wtf8(obj) }.as_bytes();
+    let Some(hash) = crate::dict_eq_hook::try_hash_str(bytes) else {
+        return 0;
+    };
+    unsafe { w_str_set_hash(obj, hash) };
+    hash
+}
+
 /// Borrow a known W_UnicodeObject as `&str`, or `None` when it carries a lone
 /// surrogate (so the backing is not valid UTF-8).
 ///

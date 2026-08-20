@@ -2564,7 +2564,8 @@ impl NamespaceOpcodeHandler for PyFrame {
         value: Self::Value,
     ) -> Result<(), PyError> {
         let w_locals = self.get_or_create_w_locals();
-        if store_name_into_dict(w_locals, name, value) {
+        let hash = crate::baseobjspace::named_key_hash(name, self.pycode as PyObjectRef, nameindex);
+        if store_name_into_dict(w_locals, name, hash, value) {
             return Ok(());
         }
         let key = unsafe {
@@ -2587,7 +2588,8 @@ impl NamespaceOpcodeHandler for PyFrame {
         value: Self::Value,
     ) -> Result<(), PyError> {
         let w_globals = self.get_w_globals();
-        if !w_globals.is_null() && !store_name_into_dict(w_globals, name, value) {
+        let hash = crate::baseobjspace::named_key_hash(name, self.pycode as PyObjectRef, nameindex);
+        if !w_globals.is_null() && !store_name_into_dict(w_globals, name, hash, value) {
             let key = unsafe {
                 crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
             };
@@ -2769,12 +2771,18 @@ pub unsafe fn load_global_via_cache_extern(
 /// object-keyed path: a dict subclass is an ordinary instance in pyre and must
 /// keep its mapping identity and any `__setitem__` override, and a non-dict
 /// mapping (`exec(src, g, mapping)`) has no strategy to store into.
-fn store_name_into_dict(w_ns: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+///
+/// `hash` is `name`'s digest when the caller holds it — the memo
+/// `rstr.py:402-412 ll_strhash` keeps in the shared `co_names_w` string
+/// (`crate::baseobjspace::named_key_hash`), so a stored name is hashed once per
+/// string rather than once per opcode.  Zero leaves the strategy to hash the
+/// borrowed bytes.
+fn store_name_into_dict(w_ns: PyObjectRef, name: &str, hash: i64, value: PyObjectRef) -> bool {
     if !unsafe { pyre_object::is_dict(w_ns) } {
         return false;
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str(w_ns, name, value);
+        pyre_object::dictmultiobject::w_dict_setitem_str_hashed(w_ns, name, hash, value);
     }
     true
 }
@@ -2795,8 +2803,12 @@ pub unsafe fn store_name_value_w(
     value: PyObjectRef,
 ) -> Result<(), PyError> {
     let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
+    // The trace's own `box_str_constant` names the key, so it is the same
+    // string object on every execution — `rstr.py:402-412 ll_strhash`'s memo
+    // makes it hashed once rather than once per store.
+    let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
     let w_locals = frame.get_or_create_w_locals();
-    if store_name_into_dict(w_locals, name, value) {
+    if store_name_into_dict(w_locals, name, hash, value) {
         return Ok(());
     }
     crate::baseobjspace::setitem(w_locals, w_name, value)?;
@@ -2814,8 +2826,9 @@ pub unsafe fn store_global_value_w(
     value: PyObjectRef,
 ) -> Result<(), PyError> {
     let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
+    let hash = unsafe { pyre_object::unicodeobject::w_str_hash_memoized(w_name) };
     let w_globals = frame.get_w_globals();
-    if !w_globals.is_null() && !store_name_into_dict(w_globals, name, value) {
+    if !w_globals.is_null() && !store_name_into_dict(w_globals, name, hash, value) {
         crate::baseobjspace::setitem(w_globals, w_name, value)?;
     }
     Ok(())
