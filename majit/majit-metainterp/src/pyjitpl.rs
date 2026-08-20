@@ -24736,6 +24736,78 @@ mod tests {
 
     // ── JitIface hook/callback parity tests (rpython/jit/metainterp/test/test_jitiface.py) ──
 
+    /// `compile.py:266` mints the loop's token with `make_jitcell_token`, so a
+    /// loop compiled here starts its retrace budget at zero however far the
+    /// previous occupant of the green key had run its own down.
+    ///
+    /// The state under test is the one `compile_loop` actually reaches: past
+    /// the `has_compiled_targets` give-up, which needs `front_target_tokens`
+    /// empty, while the entry's own `Weak` still upgrades. The seeded token
+    /// carries the `unroll.py:272 disable_retracing_if_max_retrace_guards`
+    /// sentinel, which is the value whose transfer costs the replacement loop
+    /// every later retrace.
+    #[test]
+    fn a_replacement_loop_does_not_inherit_the_retrace_count() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let green_key = 42;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        assert!(meta.tracing.is_some());
+        if let Some(ctx) = meta.trace_ctx() {
+            let i0 = OpRef::input_arg_int(0);
+            let const_one = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+
+        // Held for the whole test so the entry's `Weak` upgrades; an entry
+        // whose token is already gone reads as absent and proves nothing.
+        let stale = std::sync::Arc::new(JitCellToken::new(3));
+        stale.set_retraced_count(u32::MAX);
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&stale),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: Vec::new(),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 101,
+                traces: indexmap::IndexMap::new(),
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+        assert!(
+            !meta.has_compiled_targets(green_key),
+            "no front target tokens, so this key is one compile_loop proceeds from"
+        );
+
+        meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+
+        let fresh = meta
+            .compiled_loops
+            .get(&green_key)
+            .and_then(|c| c.live_token())
+            .expect("the compile installed a live token");
+        assert_eq!(
+            fresh.get_retraced_count(),
+            0,
+            "the replacement token starts at zero; carrying the sentinel forward \
+             leaves it unable to retrace"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&fresh, &stale),
+            "and it is a new token, not the invalidated one"
+        );
+    }
+
     #[test]
     fn test_on_compile_loop_fires_with_correct_metadata() {
         // Parity with test_on_compile: after_compile hook fires with green_key,
