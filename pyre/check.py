@@ -1965,6 +1965,74 @@ def default_binary(backend):
     return f"./target/release/{name}{EXE}"
 
 
+# Suffixes of the files a release artefact is actually built from. Bench
+# fixtures and their baselines are read at run time, not linked in, so an edit
+# to one does not make a binary stale.
+BUILD_INPUT_SUFFIXES = (".rs", ".toml", ".lock", ".ullbc")
+
+
+def newest_build_input():
+    """`(mtime, path)` of the newest file a release artefact is built from.
+
+    `None` when the tree cannot be enumerated, which makes the freshness gate
+    below fail open rather than block a checkout that has no git.
+    """
+    try:
+        listing = subprocess.run(
+            ["git", "ls-files", "-z"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return None
+    if listing.returncode != 0:
+        return None
+    paths = [p for p in listing.stdout.split("\0") if p.endswith(BUILD_INPUT_SUFFIXES)]
+    # The extracted LLBC is a build input the fingerprint gate already tracks by
+    # content, but it lives under build/ and so is not tracked by git.
+    paths += [str(p) for p in Path("build/llbc").glob("*.ullbc")]
+    newest = None
+    for path in paths:
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            continue
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, path)
+    return newest
+
+
+def require_fresh_artefacts(backend, artefacts):
+    """Refuse to measure an artefact older than the sources it was built from.
+
+    `--no-build` skips every artefact of a backend, and wasm has two: the
+    native runner and the wasm module the runner loads. A module left behind by
+    an earlier build produces a fully green run — and a set of recorded
+    baselines — for code that is not in it, with nothing in the output saying
+    so. The only honest tell is the mtime, so read it here rather than leaving
+    it to whoever remembers.
+    """
+    newest = newest_build_input()
+    if newest is None:
+        return
+    source_mtime, source_path = newest
+    for artefact in artefacts:
+        try:
+            artefact_mtime = os.stat(artefact).st_mtime
+        except OSError:
+            continue
+        if artefact_mtime >= source_mtime:
+            continue
+        gap = (source_mtime - artefact_mtime) / 60.0
+        print(
+            f"ERROR: --no-build requested for backend '{backend}', but "
+            f"{artefact}\n"
+            f"       is {gap:.0f} min older than {source_path}, so it does not "
+            f"contain the current tree.\n"
+            f"       Re-run without --no-build, or rebuild that artefact."
+        )
+        sys.exit(1)
+
+
 # Relative tolerance for wasm float outputs ONLY (see `wasm_outputs_match`).
 WASM_FLOAT_RTOL = 1e-9
 
@@ -2697,13 +2765,18 @@ class Check:
             sys.exit(1)
         # Snapshot the wasm-host build to a stable path so a later `web` build of
         # the same crate cannot overwrite the module the runner loads. Copy when
-        # the bytes actually changed: rewriting an identical file would bump its
-        # mtime, and the runner's `<module>.cwasm` compiled cache is keyed by
-        # the module's content hash, so an identical rewrite buys nothing.
+        # the bytes actually changed: rewriting an identical file would discard
+        # the runner's `<module>.cwasm` compiled cache, which is keyed by the
+        # module's content hash. Stamp the mtime either way — it is what
+        # `require_fresh_artefacts` reads to decide whether a `--no-build` run
+        # would measure a module from an earlier tree, and a rebuild that
+        # reproduced identical bytes did confirm the module is current.
         src_bytes = Path(WASM_BUILD_OUTPUT).read_bytes()
         dst = Path(WASM_MODULE_PATH)
         if not dst.exists() or dst.read_bytes() != src_bytes:
             dst.write_bytes(src_bytes)
+        else:
+            os.utime(dst)
 
         if WASM_ENGINE == "wasmtime":
             self._warm_wasm_cache()
@@ -4126,6 +4199,13 @@ def main():
                 f"wasm-host module is missing: {WASM_MODULE_PATH}"
             )
             sys.exit(1)
+        # `--pyre-path` names a binary from outside this tree, so its age says
+        # nothing about these sources.
+        if args.no_build and not args.pyre_path:
+            artefacts = [pyre_bin]
+            if backend == "wasm":
+                artefacts.append(WASM_MODULE_PATH)
+            require_fresh_artefacts(backend, artefacts)
         chk._set_pyre(backend, pyre_bin)
 
     print()
