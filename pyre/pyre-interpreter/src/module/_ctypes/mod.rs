@@ -17,6 +17,27 @@ fn type_ns_store(ns: pyre_object::PyObjectRef, name: &str, value: pyre_object::P
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) }
 }
 
+/// CPython 3.14 constructs the native `_ctypes` type family from immutable
+/// `PyType_Spec`s (`Modules/_ctypes/_ctypes.c:6270-6318` and
+/// `callproc.c:carg_spec`).  PyPy implements the same family as ordinary
+/// classes rooted at `_CDataMeta`; pyre preserves that common-metaclass owner
+/// while projecting CPython's observable heap owner, immutability, and module.
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+fn finish_cpython_type(
+    tp: pyre_object::PyObjectRef,
+    module: &str,
+    immutable: bool,
+) -> pyre_object::PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    roots.pin_root(tp);
+    let slot = roots.base();
+    let w_module = pyre_object::w_str_new(module);
+    let tp = roots.get(slot);
+    crate::type_dict_store(tp, "__module__", w_module);
+    crate::typedef::mark_cpython_heap_type(tp, immutable);
+    tp
+}
+
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 pub mod callbacks;
 #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -31,3 +52,73 @@ pub mod metaclass;
 mod seh;
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 pub mod stginfo;
+
+#[cfg(all(test, any(unix, windows), feature = "host_env"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_type_family_has_common_meta_and_cpython_314_owner() {
+        crate::typedef::init_typeobjects();
+        const IMMUTABLETYPE: i64 = 1 << 8;
+        const HEAPTYPE: i64 = 1 << 9;
+        const MASK: i64 = IMMUTABLETYPE | HEAPTYPE;
+
+        let ctype = metaclass::ctype_type();
+        let metas = [
+            metaclass::pycsimpletype_type(),
+            metaclass::pycstructtype_type(),
+            metaclass::pycuniontype_type(),
+            metaclass::pycarraytype_type(),
+            metaclass::pycpointertype_type(),
+            metaclass::pycfuncptrtype_type(),
+        ];
+        for meta in metas {
+            assert_eq!(
+                crate::baseobjspace::getattr_str(meta, "__base__").unwrap(),
+                ctype
+            );
+            assert!(crate::baseobjspace::getattr_str(meta, "from_address").is_ok());
+        }
+
+        let simple = cdata::simplecdata_type();
+        let funcptr = funcptr::cfuncptr_type();
+        assert_eq!(crate::typedef::r#type(simple).unwrap().as_ptr(), metas[0]);
+        assert_eq!(crate::typedef::r#type(funcptr).unwrap().as_ptr(), metas[5]);
+
+        for (name, ty, module) in [
+            ("CType_Type", ctype, "_ctypes"),
+            ("PyCSimpleType", metas[0], "_ctypes"),
+            ("PyCStructType", metas[1], "_ctypes"),
+            ("UnionType", metas[2], "_ctypes"),
+            ("PyCArrayType", metas[3], "_ctypes"),
+            ("PyCPointerType", metas[4], "_ctypes"),
+            ("PyCFuncPtrType", metas[5], "_ctypes"),
+            ("_CData", cdata::cdata_type(), "_ctypes"),
+            ("_SimpleCData", simple, "_ctypes"),
+            ("CFuncPtr", funcptr, "_ctypes"),
+            ("Structure", metaclass::structure_type(), "_ctypes"),
+            ("Union", metaclass::union_type(), "_ctypes"),
+            ("Array", metaclass::array_type(), "_ctypes"),
+            ("_Pointer", metaclass::pointer_base_type(), "_ctypes"),
+            ("CField", metaclass::cfield_type(), "ctypes"),
+            ("CArgObject", interp_ctypes::carg_type(), "_ctypes"),
+        ] {
+            assert_eq!(
+                unsafe { pyre_object::w_type_get_flags(ty) } & MASK,
+                MASK,
+                "{name}.__flags__"
+            );
+            let w_module = crate::baseobjspace::getattr_str(ty, "__module__").unwrap();
+            assert_eq!(
+                unsafe { pyre_object::w_str_get_value(w_module) },
+                module,
+                "{name}.__module__"
+            );
+            assert!(
+                !unsafe { pyre_object::w_type_is_heaptype(ty) },
+                "{name} must keep the PyPy builtin storage owner"
+            );
+        }
+    }
+}

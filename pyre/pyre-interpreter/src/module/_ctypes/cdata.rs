@@ -42,7 +42,7 @@ pub(super) fn cdata_type() -> PyObjectRef {
     *CDATA_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_CData", init_cdata_type);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
+        super::finish_cpython_type(tp, "_ctypes", true) as usize
     }) as PyObjectRef
 }
 
@@ -253,8 +253,13 @@ pub(super) fn simplecdata_type() -> PyObjectRef {
             init_simplecdata_type,
             cdata_type(),
         );
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
+        unsafe {
+            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            // PyPy `primitive.py:SimpleType(_CDataMeta)` / CPython 3.14
+            // `CREATE_TYPE(... PyCSimpleType_Type ...)`.
+            (*tp).w_class = super::metaclass::pycsimpletype_type();
+        }
+        super::finish_cpython_type(tp, "_ctypes", true) as usize
     }) as PyObjectRef
 }
 

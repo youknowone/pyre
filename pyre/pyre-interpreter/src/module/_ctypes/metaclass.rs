@@ -34,12 +34,13 @@ type PyResult = Result<PyObjectRef, crate::PyError>;
 /// its ctypes metaclasses are app-level (`class _CDataMeta(type)`,
 /// basics.py:48) and inherit `type`'s instance layout from their base.
 fn make_ctypes_metatype(name: &str, init: impl FnOnce(PyObjectRef)) -> PyObjectRef {
-    crate::typedef::make_builtin_type_with_layout(
+    let tp = crate::typedef::make_builtin_type_with_layout(
         name,
         init,
-        crate::typedef::w_type(),
+        ctype_type(),
         &pyre_object::pyobject::TYPE_TYPE as *const pyre_object::PyType,
-    )
+    );
+    super::finish_cpython_type(tp, "_ctypes", true)
 }
 
 // ── cached type objects ────────────────────────────────────────────────
@@ -53,11 +54,23 @@ macro_rules! cached_type {
     };
 }
 
+// CPython 3.14 `_ctypes.CType_Type` and PyPy `_CDataMeta` are the common
+// metaclass owner for every concrete ctypes metaclass.  Keeping the shared
+// methods here avoids the former pyre-only duplication on every child.
+cached_type!(CTYPE_TYPE, ctype_type, || {
+    let tp = crate::typedef::make_builtin_type_with_layout(
+        "CType_Type",
+        install_shared_meta,
+        crate::typedef::w_type(),
+        &pyre_object::pyobject::TYPE_TYPE as *const pyre_object::PyType,
+    );
+    super::finish_cpython_type(tp, "_ctypes", true)
+});
+
 cached_type!(PYCSIMPLETYPE, pycsimpletype_type, || {
     make_ctypes_metatype("PyCSimpleType", |ns| {
         install_new(ns, csimpletype_new);
         install_init(ns, csimpletype_init);
-        install_shared_meta(ns);
     })
 });
 
@@ -65,7 +78,6 @@ cached_type!(PYCSTRUCTTYPE, pycstructtype_type, || {
     make_ctypes_metatype("PyCStructType", |ns| {
         install_new(ns, cstructtype_new);
         install_init(ns, cstructtype_init);
-        install_shared_meta(ns);
         install_fields_getset(ns);
     })
 });
@@ -76,9 +88,12 @@ cached_type!(PYCUNIONTYPE, pycuniontype_type, || {
     make_ctypes_metatype("UnionType", |ns| {
         install_new(ns, cuniontype_new);
         install_init(ns, cuniontype_init);
-        install_shared_meta(ns);
         install_fields_getset(ns);
     })
+});
+
+cached_type!(PYCFUNCPTRTYPE, pycfuncptrtype_type, || {
+    make_ctypes_metatype("PyCFuncPtrType", |_| {})
 });
 
 cached_type!(STRUCTURE, structure_type, || {
@@ -88,7 +103,7 @@ cached_type!(STRUCTURE, structure_type, || {
         cdata::cdata_type(),
     );
     finish_aggregate_base(tp, pycstructtype_type(), "struct");
-    tp
+    super::finish_cpython_type(tp, "_ctypes", true)
 });
 
 cached_type!(UNION, union_type, || {
@@ -98,7 +113,7 @@ cached_type!(UNION, union_type, || {
         cdata::cdata_type(),
     );
     finish_aggregate_base(tp, pycuniontype_type(), "union");
-    tp
+    super::finish_cpython_type(tp, "_ctypes", true)
 });
 
 cached_type!(CFIELD, cfield_type, || {
@@ -141,14 +156,13 @@ cached_type!(CFIELD, cfield_type, || {
         );
     });
     unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-    tp
+    super::finish_cpython_type(tp, "ctypes", true)
 });
 
 cached_type!(PYCARRAYTYPE, pycarraytype_type, || {
     make_ctypes_metatype("PyCArrayType", |ns| {
         install_new(ns, carraytype_new);
         install_init(ns, carraytype_init);
-        install_shared_meta(ns);
     })
 });
 
@@ -156,7 +170,6 @@ cached_type!(PYCPOINTERTYPE, pycpointertype_type, || {
     make_ctypes_metatype("PyCPointerType", |ns| {
         install_new(ns, cpointertype_new);
         install_init(ns, cpointertype_init);
-        install_shared_meta(ns);
     })
 });
 
@@ -164,7 +177,7 @@ cached_type!(ARRAY, array_type, || {
     let tp =
         crate::typedef::make_builtin_type_with_base("Array", init_array_base, cdata::cdata_type());
     finish_element_base(tp, pycarraytype_type());
-    tp
+    super::finish_cpython_type(tp, "_ctypes", true)
 });
 
 cached_type!(POINTER_BASE, pointer_base_type, || {
@@ -174,7 +187,7 @@ cached_type!(POINTER_BASE, pointer_base_type, || {
         cdata::cdata_type(),
     );
     finish_element_base(tp, pycpointertype_type());
-    tp
+    super::finish_cpython_type(tp, "_ctypes", true)
 });
 
 fn install_new(ns: PyObjectRef, f: crate::gateway::BuiltinCodeFn) {

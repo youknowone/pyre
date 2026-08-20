@@ -356,15 +356,15 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     // ── ArgumentError — a real Exception subclass ──
     let w_exception = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _ctypes init");
-    crate::module_ns_store(
-        ns,
+    let argument_error = crate::builtins::make_exc_type(
         "ArgumentError",
-        crate::builtins::make_exc_type(
-            "ArgumentError",
-            crate::builtins::exc_exception_new,
-            w_exception,
-        ),
+        crate::builtins::exc_exception_new,
+        w_exception,
     );
+    // Both CPython's module exception and PyPy's app-level ArgumentError are
+    // mutable heap classes, unlike the immutable native `_ctypes` types.
+    let argument_error = super::finish_cpython_type(argument_error, "ctypes", false);
+    crate::module_ns_store(ns, "ArgumentError", argument_error);
 
     // ── aggregate + array/pointer types: real `Structure`/`Union`/`Array`/
     //    `_Pointer`/`CField` ──
@@ -381,9 +381,6 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
 
     // ── the functional scalar + foreign-function types ──
     let simplecdata_tp = super::cdata::simplecdata_type();
-    // `_SimpleCData`'s metaclass routes `class c_int(_SimpleCData): _type_="i"`
-    // through `PyCSimpleType.__new__` (validation + StgInfo).
-    unsafe { (*simplecdata_tp).w_class = metaclass::pycsimpletype_type() };
     crate::module_ns_store(ns, "_SimpleCData", simplecdata_tp);
     let cfuncptr_tp = super::funcptr::cfuncptr_type();
     crate::module_ns_store(ns, "CFuncPtr", cfuncptr_tp);
@@ -975,7 +972,7 @@ static CARG_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 /// (the referenced instance, kept alive).  Foreign-call consumption of the
 /// carrier (the CArgObject P-tag path) is a later slice.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn carg_type() -> pyre_object::PyObjectRef {
+pub(super) fn carg_type() -> pyre_object::PyObjectRef {
     let raw = *CARG_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("CArgObject", |ns| {
             super::type_ns_store(
@@ -991,7 +988,7 @@ fn carg_type() -> pyre_object::PyObjectRef {
             );
         });
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
+        super::finish_cpython_type(tp, "_ctypes", true) as usize
     });
     raw as pyre_object::PyObjectRef
 }
