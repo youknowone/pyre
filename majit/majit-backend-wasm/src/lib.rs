@@ -1936,17 +1936,21 @@ impl WasmBackend {
         }
 
         inputs.fail_index_base = fail_descr_base();
-        let merged_guard_count = codegen::guard_exit_count(&inputs.inputargs, &inputs.ops)
-            + inputs
-                .inlined_bridges
-                .iter()
-                .map(|region| codegen::guard_exit_count(&region.inputargs, &region.ops))
-                .sum::<usize>();
+        // `guard_exit_count` walks the whole op list it is handed, so each
+        // count is taken once here: the exit loop below needs the per-region
+        // counts for every one of its exits, and re-deriving them there would
+        // walk every appended region once per guard.
+        let own_guard_count = codegen::guard_exit_count(&inputs.inputargs, &inputs.ops);
+        let region_guard_counts: Vec<usize> = inputs
+            .inlined_bridges
+            .iter()
+            .map(|region| codegen::guard_exit_count(&region.inputargs, &region.ops))
+            .collect();
+        let merged_guard_count = own_guard_count + region_guard_counts.iter().sum::<usize>();
         let (new_cells_base, new_cells_owner) = codegen::alloc_bridge_cells(merged_guard_count);
         inputs.bridge_cells_base = new_cells_base;
         let (wasm_bytes, guard_exits, _) = codegen::build_wasm_module(&inputs)?;
         let code_size = wasm_bytes.len();
-        let own_guard_count = codegen::guard_exit_count(&inputs.inputargs, &inputs.ops);
         let descrs: Vec<Arc<WasmFailDescr>> = guard_exits
             .iter()
             .enumerate()
@@ -1955,8 +1959,8 @@ impl WasmBackend {
                 let trace_id = inputs
                     .inlined_bridges
                     .iter()
-                    .find_map(|region| {
-                        let count = codegen::guard_exit_count(&region.inputargs, &region.ops);
+                    .zip(&region_guard_counts)
+                    .find_map(|(region, &count)| {
                         let contains = (region_start..region_start + count).contains(&index);
                         region_start += count;
                         contains.then_some(region.trace_id)
