@@ -9702,6 +9702,18 @@ impl<M: Clone> MetaInterp<M> {
                 self.stats.loops_compiled += 1;
                 // `cpu.tracker.total_compiled_loops` is bumped inside
                 // `CompiledLoopToken::new` (model.py:297 parity).
+                //
+                // Counted as a LOOP even though nothing here closes one: this
+                // arm is root-only (`compile_finish_from_active_session` routes
+                // `bridge.is_some()` to `compile_trace_finish`), and a root
+                // trace that ends in FINISH with no LABEL attaches upstream
+                // through `ResumeFromInterpDescr.compile_and_attach`
+                // (compile.py:1006-1017), which mints its own JitCellToken and
+                // calls `send_loop_to_backend(.., "entry bridge", ..)`.  So a
+                // portal function that always raises legitimately reads
+                // `loops_compiled=2` with only one `compiled loop at key=`
+                // line -- that line is logged by `compile_loop_body` alone, and
+                // its absence here is not a double count.
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-summary",
