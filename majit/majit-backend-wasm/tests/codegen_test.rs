@@ -365,9 +365,14 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
     }
 
     let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
-    for (bench, expected_counter) in [
-        ("exception_oserror_fields.py", "BRIDGE_OK"),
-        ("generator_tree_recursion.py", "accepted_ca"),
+    // A region that is no longer declined reaches compiled steady state through
+    // one of two counters: an out-of-line bridge of its own (`BRIDGE_OK`), or,
+    // when it closes back onto its owner's loop, a merge into the owner
+    // (`inline_ok`). Inlining is the default and takes `exception_oserror_fields`,
+    // so only the pair is a stable statement of "not declined".
+    for (bench, compiled_counters) in [
+        ("exception_oserror_fields.py", &["BRIDGE_OK", "inline_ok"][..]),
+        ("generator_tree_recursion.py", &["accepted_ca"][..]),
     ] {
         let script = root.join("pyre/bench/synth").join(bench);
         let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
@@ -384,9 +389,14 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
         let stderr = String::from_utf8_lossy(&wasm_run.stderr);
         assert_ran_ok(&format!("wasm {bench}"), &wasm_run);
         assert_same_stdout(&format!("wasm {bench}"), &wasm_run, &dynasm_run);
+        let compiled: u64 = compiled_counters
+            .iter()
+            .map(|counter| stat_value(&stderr, counter))
+            .sum();
         assert!(
-            stat_value(&stderr, expected_counter) > 0,
-            "{bench} did not compile its formerly-declined bridge:\n{stderr}"
+            compiled > 0,
+            "{bench} did not compile its formerly-declined bridge \
+             (none of {compiled_counters:?} moved):\n{stderr}"
         );
         assert_eq!(
             stat_value(&stderr, "ml_unsafe_label"),
