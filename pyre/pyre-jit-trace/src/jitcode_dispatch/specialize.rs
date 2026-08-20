@@ -7135,13 +7135,38 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `isinstance(obj, cls)` in the quick exact-type case from
-/// `abstractinst.py` `abstract_isinstance_w`: before tuple/union recursion or
-/// `__instancecheck__` lookup, `type(obj) is cls` returns `True`.
+fn walker_isinstance_exact_type_hit(
+    obj: pyre_object::PyObjectRef,
+    cls: pyre_object::PyObjectRef,
+) -> Option<(i64, Option<pyre_object::PyObjectRef>)> {
+    let obj_type = pyre_interpreter::typedef::r#type(obj)?;
+    if !std::ptr::eq(obj_type.as_ptr(), cls) {
+        return None;
+    }
+    let physical_type = unsafe { (*obj).ob_type as i64 };
+    let stored_w_class = unsafe { (*obj).w_class };
+    if stored_w_class.is_null() {
+        Some((physical_type, None))
+    } else if std::ptr::eq(stored_w_class, cls) {
+        Some((physical_type, Some(stored_w_class)))
+    } else {
+        None
+    }
+}
+
+fn walker_isinstance_tuple_element_can_precede_hit(item: pyre_object::PyObjectRef) -> bool {
+    pyre_interpreter::typedef::r#type(item)
+        .is_some_and(|meta| std::ptr::eq(meta.as_ptr(), pyre_interpreter::typedef::w_type()))
+}
+
+/// `isinstance(obj, cls)` in the quick exact-type cases from
+/// `abstractinst.py` `abstract_isinstance_w`: before union recursion or
+/// `__instancecheck__` lookup, `type(obj) is cls` returns `True`; for tuple
+/// classinfo the interpreter loops the tuple and recurses into that same test.
 ///
-/// Every other shape declines to the residual call, including tuple classinfo,
-/// unions, subclass-but-not-exact matches, mismatches, and cases whose class
-/// identity cannot be pinned with the existing object-class guards.
+/// Every other shape declines to the residual call, including unions,
+/// subclass-but-not-exact matches, mismatches, nested tuples, and cases whose
+/// class identity cannot be pinned with the existing object-class guards.
 pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -7179,21 +7204,48 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         return Ok(None);
     }
-    let Some(obj_type) = pyre_interpreter::typedef::r#type(obj) else {
-        return Ok(None);
-    };
-    if !std::ptr::eq(obj_type.as_ptr(), cls) {
-        return Ok(None);
-    }
-    let (physical_type, exact_w_class) = unsafe {
-        let physical_type = (*obj).ob_type as i64;
-        let stored_w_class = (*obj).w_class;
-        if stored_w_class.is_null() {
-            (physical_type, None)
-        } else if std::ptr::eq(stored_w_class, cls) {
-            (physical_type, Some(stored_w_class))
-        } else {
+    let (physical_type, exact_w_class, exact_cls) = unsafe {
+        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(cls) {
             return Ok(None);
+        }
+        if std::ptr::eq((*cls).ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
+            let tuple_class =
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE);
+            if !std::ptr::eq((*cls).w_class, tuple_class) {
+                return Ok(None);
+            }
+            let n = pyre_object::w_tuple_len(cls);
+            for i in 0..n {
+                let Some(item) = pyre_object::w_tuple_getitem(cls, i as i64) else {
+                    return Ok(None);
+                };
+                if pyre_object::is_tuple(item) {
+                    return Ok(None);
+                }
+            }
+            let mut hit = None;
+            for i in 0..n {
+                let Some(item) = pyre_object::w_tuple_getitem(cls, i as i64) else {
+                    return Ok(None);
+                };
+                if let Some(proof) = walker_isinstance_exact_type_hit(obj, item) {
+                    hit = Some(proof);
+                    break;
+                }
+                if !walker_isinstance_tuple_element_can_precede_hit(item) {
+                    return Ok(None);
+                }
+            }
+            let Some((physical_type, exact_w_class)) = hit else {
+                return Ok(None);
+            };
+            (physical_type, exact_w_class, cls)
+        } else {
+            let Some((physical_type, exact_w_class)) = walker_isinstance_exact_type_hit(obj, cls)
+            else {
+                return Ok(None);
+            };
+            (physical_type, exact_w_class, cls)
         }
     };
 
@@ -7217,7 +7269,7 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     }
     let cls_op = r_args[3];
     if !cls_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(cls as i64);
+        let expected = ctx.trace_ctx.const_ref(exact_cls as i64);
         ctx.trace_ctx
             .record_guard(OpCode::GuardValue, &[cls_op, expected], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
