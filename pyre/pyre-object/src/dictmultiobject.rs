@@ -4640,6 +4640,20 @@ pub unsafe fn w_dict_lookup_int_strategy(
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_index_of_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> Option<usize> {
     lock_dict_refs!(_dict_guard, obj, key);
+    w_dict_index_of_int_locked(obj, key)
+}
+
+/// [`w_dict_index_of_int_strategy`]'s body for a caller that already holds the
+/// dict guard.
+///
+/// The probe unwraps a machine int and compares it — nothing here allocates, so
+/// no collection can run between the caller's `lock_dict_refs!` and the answer,
+/// and a second guard would republish the roots the caller is already holding.
+///
+/// # Safety
+/// Same as [`w_dict_index_of_int_strategy`], and the caller holds a
+/// `DictOperationGuard` over `obj` from which `obj` and `key` were read.
+unsafe fn w_dict_index_of_int_locked(obj: PyObjectRef, key: PyObjectRef) -> Option<usize> {
     w_dict_int_storage(obj).get_index_of(&crate::listobject::plain_int_w(key))
 }
 
@@ -4648,7 +4662,8 @@ pub unsafe fn w_dict_index_of_int_strategy(obj: PyObjectRef, key: PyObjectRef) -
 /// Residualise the native table probe for the same reason as
 /// [`w_dict_lookup_int_strategy`] (`rdict.py:576`). The index lookup and value
 /// read share one dict lock so the insertion-order index cannot be invalidated
-/// between the two operations.
+/// between the two operations — this guard is that lock, and both steps run
+/// under it directly rather than through helpers that take one each.
 ///
 /// # Safety
 /// Same as [`w_dict_lookup_int_strategy`].
@@ -4658,8 +4673,10 @@ pub unsafe fn w_dict_lookup_or_null_int_strategy(
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj, key);
-    let index = w_dict_index_of_int_strategy(obj, key)?;
-    w_dict_nth_value(obj, index)
+    let index = w_dict_index_of_int_locked(obj, key)?;
+    w_dict_int_storage(obj)
+        .get_index(index)
+        .map(|(_, &value)| value)
 }
 
 /// Return the insertion-order index selected by a Unicode-strategy lookup.
@@ -4678,22 +4695,62 @@ pub unsafe fn w_dict_index_of_unicode_strategy(
     key: PyObjectRef,
 ) -> Option<usize> {
     lock_dict_refs!(_dict_guard, obj, key);
+    w_dict_index_of_unicode_locked(obj, key)
+}
+
+/// [`w_dict_index_of_unicode_strategy`]'s body for a caller that already holds
+/// the dict guard.
+///
+/// The type test, the borrow of the key's bytes, the digest and the
+/// `StrLookupKey` probe (a byte compare, never an app-level `__eq__`) all run
+/// without allocating, so no collection can run between the caller's
+/// `lock_dict_refs!` and the answer, and a second guard would republish the
+/// roots the caller is already holding.
+///
+/// # Safety
+/// Same as [`w_dict_index_of_unicode_strategy`], and the caller holds a
+/// `DictOperationGuard` over `obj` from which `obj` and `key` were read.
+unsafe fn w_dict_index_of_unicode_locked(obj: PyObjectRef, key: PyObjectRef) -> Option<usize> {
     if !crate::is_exact_type(key, &crate::STR_TYPE) {
         return None;
     }
-    let key = crate::w_str_get_value_opt(key)?;
-    let hash = crate::dict_eq_hook::try_hash_str(key.as_bytes())?;
+    let key_str = crate::w_str_get_value_opt(key)?;
+    let hash = w_str_memoized_hash(key, key_str)?;
     crate::dict_eq_hook::take_eq_error();
     let dict = &*(obj as *const W_DictObject);
     let entries = &*(dict.dstorage as *const ObjectDictStorage);
-    dict_entries_index_of_str_hashed(entries, hash, key)
+    dict_entries_index_of_str_hashed(entries, hash, key_str)
+}
+
+/// `rstr.py:395-412 ll_strhash` — answer from the digest memoized on the string
+/// and compute it only while the slot still reads zero, which upstream spells
+/// as `jit.conditional_call_elidable(s.hash, ...)`.
+///
+/// The `HASH_STR_HOOK` trampoline takes `(ptr, len)` and so cannot reach the
+/// memo, which left every str-keyed probe re-digesting the same bytes through
+/// two thread-local reads and an indirect call.  The value is the one
+/// `builtins::hash_value` publishes for the same string, so a memo written here
+/// and a memo written there are interchangeable.
+///
+/// # Safety
+/// `key` must be an exact `W_UnicodeObject` and `key_str` its own storage.
+unsafe fn w_str_memoized_hash(key: PyObjectRef, key_str: &str) -> Option<i64> {
+    let memo = crate::w_str_get_hash(key);
+    if memo != 0 {
+        return Some(memo);
+    }
+    let hash = crate::dict_eq_hook::try_hash_str(key_str.as_bytes())?;
+    crate::w_str_set_hash(key, hash);
+    Some(hash)
 }
 
 /// Return the live value selected by a Unicode-strategy lookup.
 ///
 /// `dictmultiobject.py:1315-1318` routes exact-str keys through the raw
 /// string probe. The index lookup and value read share one dict lock so the
-/// insertion-order index cannot be invalidated between the two operations.
+/// insertion-order index cannot be invalidated between the two operations —
+/// this guard is that lock, and both steps run under it directly rather than
+/// through helpers that take one each.
 ///
 /// # Safety
 /// Same as [`w_dict_index_of_unicode_strategy`].
@@ -4703,8 +4760,12 @@ pub unsafe fn w_dict_lookup_or_null_unicode_strategy(
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj, key);
-    let index = w_dict_index_of_unicode_strategy(obj, key)?;
-    w_dict_nth_value(obj, index)
+    let index = w_dict_index_of_unicode_locked(obj, key)?;
+    // The Unicode and Object strategies share the `IndexMap<ObjectKey, _>`
+    // representation, so the value comes out of the same table the index names.
+    w_dict_object_storage(obj)
+        .get_index(index)
+        .map(|(_, &value)| value)
 }
 
 /// Internal helper: `IntDictStrategy::delitem` body —

@@ -110,20 +110,17 @@ pub fn emit_trace_call_ref_typed(
 ///
 /// A contended stripe acquire enters `before_external_block`, which is a GC
 /// safepoint, so `dict` and `key` arrive as raw arguments that must be
-/// shadow-rooted across the lock and re-read afterwards — `DictOperationGuard`
-/// is that bracket.  The stripe is reentrant, so the nested acquire inside the
-/// lookup neither blocks nor releases this guard.  A miss returns `PY_NULL` for
-/// the caller's `guard_nonnull` to side-exit on.
+/// shadow-rooted across the lock.  `lookup` opens the `DictOperationGuard` that
+/// does it: the guard publishes both refs *before* it touches the stripe, so a
+/// second one here would root the same two objects a second time and acquire
+/// the same reentrant stripe again.  A miss returns `PY_NULL` for the caller's
+/// `guard_nonnull` to side-exit on.
 unsafe fn jit_dict_exact_lookup_or_null(
     dict: i64,
     key: i64,
     lookup: unsafe fn(PyObjectRef, PyObjectRef) -> Option<PyObjectRef>,
 ) -> i64 {
-    let guard = pyre_object::dictmultiobject::DictOperationGuard::new(
-        dict as PyObjectRef,
-        &[key as PyObjectRef],
-    );
-    lookup(guard.root(0), guard.root(1)).map_or(PY_NULL as i64, |value| value as i64)
+    lookup(dict as PyObjectRef, key as PyObjectRef).map_or(PY_NULL as i64, |value| value as i64)
 }
 
 pub extern "C" fn jit_dict_exact_int_lookup_or_null(dict: i64, key: i64) -> i64 {
