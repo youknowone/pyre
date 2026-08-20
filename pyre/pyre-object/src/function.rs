@@ -175,6 +175,20 @@ pub struct StaticMethod {
     /// `StaticMethod.getdict`, then populated by `descr_init` with the
     /// wrapped function's presentation attributes.
     pub w_dict: PyObjectRef,
+    /// The hidden `mutate_w_function` field for `function.py:673
+    /// _immutable_fields_ = ['w_function?']` — see [`crate::quasiimmut`].
+    ///
+    /// Holds no GC pointers, so the derived `W_STATICMETHOD_GC_PTR_OFFSETS` has
+    /// nothing to walk here, and it is deliberately absent from the descr
+    /// census: it is an `AtomicPtr` plus a lock rather than one pointer-shaped
+    /// word, so a `Type::Ref` row would misdescribe it, and no emit allocates
+    /// either wrapper, so `rewrite.py clear_gc_fields` never runs over this
+    /// layout.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
+    /// i.e. non-moving, which is [`crate::quasiimmut::QuasiImmutField`]'s
+    /// stated precondition: the lock cannot be remapped out from under a
+    /// holder, and the compile-time watcher registration resolves this owner
+    /// by the address recording saw.
+    pub w_function_watchers: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Field offsets of the inline `PyObjectRef` slots within `StaticMethod`,
@@ -207,6 +221,7 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
                     ob: header,
                     w_function: func,
                     w_dict: PY_NULL,
+                    w_function_watchers: crate::quasiimmut::QuasiImmutField::new(),
                 },
             );
         }
@@ -217,6 +232,7 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob: header,
         w_function: func,
         w_dict: PY_NULL,
+        w_function_watchers: crate::quasiimmut::QuasiImmutField::new(),
     })
 }
 
@@ -234,9 +250,59 @@ pub unsafe fn w_staticmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
     unsafe {
+        // `rclass.py hook_setfield` emits `jit_force_quasi_immutable` ahead of
+        // every store to a `?` field, so the wrapped callable stops being a
+        // trace constant before it stops being the live value.  The hook
+        // precedes the store and does not consult it, so re-initialising the
+        // slot with the value it already holds invalidates as well.  Nothing
+        // else revokes a fold over this wrapper: re-initialising an installed
+        // descriptor changes no type's version tag, which is the only other pin
+        // the folds that unwrap `w_function` hold.  The `is_installed` test is
+        // `pyjitpl.py:1112`'s `mutatebox.nonnull()` — a wrapper no loop watches
+        // pays one load.
+        if (*(obj as *const StaticMethod))
+            .w_function_watchers
+            .is_installed()
+        {
+            crate::quasiimmut::sweep_quasi_immut_field(
+                &(*(obj as *const StaticMethod)).w_function_watchers,
+            );
+        }
         (*(obj as *mut StaticMethod)).w_function = func;
         crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
+}
+
+/// `quasiimmut.py get_current_qmut_instance` for `function.py`'s
+/// `w_function?` — install the instance at RECORD time so a write reached
+/// later in the same trace sees it.
+///
+/// # Safety
+/// `obj` must point to a live [`StaticMethod`].
+pub unsafe fn w_staticmethod_install_w_function_watcher(obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
+    (*(obj as *const StaticMethod))
+        .w_function_watchers
+        .ensure_installed();
+}
+
+/// Attach a compiled loop's invalidation flag to this wrapper's `w_function?`
+/// watcher, the `quasiimmut.py QuasiImmut.register_loop_token` half.
+///
+/// # Safety
+/// `obj` must point to a live [`StaticMethod`].
+pub unsafe fn w_staticmethod_register_w_function_watcher(
+    obj: PyObjectRef,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if obj.is_null() {
+        return;
+    }
+    (*(obj as *const StaticMethod))
+        .w_function_watchers
+        .register_loop_token(flag);
 }
 
 /// function.py:678-681 `StaticMethod.getdict` — allocate the instance
@@ -306,6 +372,20 @@ pub struct ClassMethod {
     /// function.py:724 `self.w_dict = None` — a real per-wrapper field,
     /// allocated lazily by `ClassMethod.getdict`.
     pub w_dict: PyObjectRef,
+    /// The hidden `mutate_w_function` field for `function.py:720
+    /// _immutable_fields_ = ['w_function?']` — see [`crate::quasiimmut`].
+    ///
+    /// Holds no GC pointers, so the derived `W_CLASSMETHOD_GC_PTR_OFFSETS` has
+    /// nothing to walk here, and it is deliberately absent from the descr
+    /// census: it is an `AtomicPtr` plus a lock rather than one pointer-shaped
+    /// word, so a `Type::Ref` row would misdescribe it, and no emit allocates
+    /// either wrapper, so `rewrite.py clear_gc_fields` never runs over this
+    /// layout.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
+    /// i.e. non-moving, which is [`crate::quasiimmut::QuasiImmutField`]'s
+    /// stated precondition: the lock cannot be remapped out from under a
+    /// holder, and the compile-time watcher registration resolves this owner
+    /// by the address recording saw.
+    pub w_function_watchers: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Field offsets of the inline `PyObjectRef` slots within `ClassMethod`, the
@@ -337,6 +417,7 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
                     ob: header,
                     w_function: func,
                     w_dict: PY_NULL,
+                    w_function_watchers: crate::quasiimmut::QuasiImmutField::new(),
                 },
             );
         }
@@ -347,6 +428,7 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob: header,
         w_function: func,
         w_dict: PY_NULL,
+        w_function_watchers: crate::quasiimmut::QuasiImmutField::new(),
     })
 }
 
@@ -364,9 +446,59 @@ pub unsafe fn w_classmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
     unsafe {
+        // `rclass.py hook_setfield` emits `jit_force_quasi_immutable` ahead of
+        // every store to a `?` field, so the wrapped callable stops being a
+        // trace constant before it stops being the live value.  The hook
+        // precedes the store and does not consult it, so re-initialising the
+        // slot with the value it already holds invalidates as well.  Nothing
+        // else revokes a fold over this wrapper: re-initialising an installed
+        // descriptor changes no type's version tag, which is the only other pin
+        // the folds that unwrap `w_function` hold.  The `is_installed` test is
+        // `pyjitpl.py:1112`'s `mutatebox.nonnull()` — a wrapper no loop watches
+        // pays one load.
+        if (*(obj as *const ClassMethod))
+            .w_function_watchers
+            .is_installed()
+        {
+            crate::quasiimmut::sweep_quasi_immut_field(
+                &(*(obj as *const ClassMethod)).w_function_watchers,
+            );
+        }
         (*(obj as *mut ClassMethod)).w_function = func;
         crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
     }
+}
+
+/// `quasiimmut.py get_current_qmut_instance` for `function.py`'s
+/// `w_function?` — install the instance at RECORD time so a write reached
+/// later in the same trace sees it.
+///
+/// # Safety
+/// `obj` must point to a live [`ClassMethod`].
+pub unsafe fn w_classmethod_install_w_function_watcher(obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
+    (*(obj as *const ClassMethod))
+        .w_function_watchers
+        .ensure_installed();
+}
+
+/// Attach a compiled loop's invalidation flag to this wrapper's `w_function?`
+/// watcher, the `quasiimmut.py QuasiImmut.register_loop_token` half.
+///
+/// # Safety
+/// `obj` must point to a live [`ClassMethod`].
+pub unsafe fn w_classmethod_register_w_function_watcher(
+    obj: PyObjectRef,
+    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    if obj.is_null() {
+        return;
+    }
+    (*(obj as *const ClassMethod))
+        .w_function_watchers
+        .register_loop_token(flag);
 }
 
 /// function.py:726-729 `ClassMethod.getdict`.

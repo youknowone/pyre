@@ -6315,7 +6315,7 @@ pub(crate) fn try_walker_inline_property_get<Sym: WalkSym>(
     // own past this point, so keep a rewind point the way the type-call fold
     // does.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    walker_pin_property_accessor(ctx, op.pc, w_descr, crate::descr::property_fget_descr())?;
+    walker_pin_descriptor_slot(ctx, op.pc, w_descr, crate::descr::property_fget_descr())?;
     let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -6403,10 +6403,10 @@ enum WrapperField {
 }
 
 impl WrapperField {
-    fn descr(&self) -> majit_ir::DescrRef {
+    fn quasi_descr(&self) -> majit_ir::DescrRef {
         match self {
-            Self::ClassMethod => crate::descr::classmethod_w_function_descr(),
-            Self::StaticMethod => crate::descr::staticmethod_w_function_descr(),
+            Self::ClassMethod => crate::descr::classmethod_w_function_quasi_descr(),
+            Self::StaticMethod => crate::descr::staticmethod_w_function_quasi_descr(),
         }
     }
 }
@@ -6499,12 +6499,13 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     // The pins above make the DESCRIPTOR a constant; they say nothing about the
     // callable inside it.  Re-initialising an installed wrapper swaps
     // `w_function` without touching the owner type's version tag, which is the
-    // only thing those pins hold, so read the slot live and pin the value this
-    // fold unwrapped — the stand-in [`walker_guard_function_field`] already
-    // makes for a quasi-immutable field pyre's setters do not invalidate.
+    // only thing those pins hold, so the unwrapped callable needs a pin of its
+    // own.  `function.py:673`/`:720` declares that slot `w_function?`, and
+    // `w_*_set_func` now forces the invalidation, so this is the declared
+    // marker rather than the `GuardValue` that stood in for it — the fold bakes
+    // `w_func` below and never reads the slot back.
     if let Some(field) = wrapper_field {
-        let wrapper = ctx.trace_ctx.const_ref(w_getattr as i64);
-        walker_guard_function_field(ctx, op.pc, wrapper, field.descr(), w_func as i64)?;
+        walker_pin_descriptor_slot(ctx, op.pc, w_getattr, field.quasi_descr())?;
     }
 
     let name_obj =
@@ -6644,7 +6645,7 @@ pub(crate) fn try_walker_inline_property_set<Sym: WalkSym>(
     let fset_const = ctx.trace_ctx.const_ref(fset as i64);
     // Rewind point for the same reason as the getter twin.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    walker_pin_property_accessor(ctx, op.pc, w_descr, crate::descr::property_fset_descr())?;
+    walker_pin_descriptor_slot(ctx, op.pc, w_descr, crate::descr::property_fset_descr())?;
     let inlined = try_walker_inline_resolved_user_call(
         ctx,
         op,

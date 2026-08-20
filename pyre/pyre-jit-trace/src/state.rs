@@ -5115,7 +5115,7 @@ fn install_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
     // one must fail loudly rather than reinterpret a headerless map-node
     // allocation as a `W_TypeObject`.  Dropping the old implicit `W_TypeObject`
     // fallback is safe: the arms below are every quasi-immutable descr this
-    // binary can mint — the nine hand-minted singletons, plus the nine
+    // binary can mint — the eleven hand-minted singletons, plus the nine
     // `Function` fields `function.py:34-42` declares, which
     // `function_quasi_immut_slot` resolves as a group.  No analyzer-derived
     // descr reaches here: a `#[jit_immutable_fields]` entry would need the
@@ -5156,6 +5156,14 @@ fn install_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
             );
         } else if index == crate::descr::property_fset_descr().index() {
             pyre_object::descriptor::w_property_install_fset_watcher(
+                struct_ptr as pyre_object::PyObjectRef,
+            );
+        } else if index == crate::descr::staticmethod_w_function_quasi_descr().index() {
+            pyre_object::function::w_staticmethod_install_w_function_watcher(
+                struct_ptr as pyre_object::PyObjectRef,
+            );
+        } else if index == crate::descr::classmethod_w_function_quasi_descr().index() {
+            pyre_object::function::w_classmethod_install_w_function_watcher(
                 struct_ptr as pyre_object::PyObjectRef,
             );
         } else if let Some(slot) = crate::descr::function_quasi_immut_slot(index) {

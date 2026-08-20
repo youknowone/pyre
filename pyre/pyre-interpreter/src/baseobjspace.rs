@@ -9908,7 +9908,7 @@ pub unsafe fn load_method_fast_path(
 pub unsafe fn classmethod_on_type_fast_path(
     w_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
         return None;
     }
@@ -9943,7 +9943,11 @@ pub unsafe fn classmethod_on_type_fast_path(
     if w_func.is_null() {
         return None;
     }
-    Some((w_type, version_tag, w_func))
+    // The wrapper itself, not only what it wraps: `function.py:720
+    // _immutable_fields_ = ['w_function?']`, and re-initialising an installed
+    // `classmethod` swaps that slot without touching any type's version tag, so
+    // a caller that bakes `w_func` needs the descriptor to pin it against.
+    Some((w_type, version_tag, w_descr, w_func))
 }
 
 /// `Cls.__name__` read fast path: when `w_obj` is a class whose metaclass is

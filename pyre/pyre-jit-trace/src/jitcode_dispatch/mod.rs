@@ -8698,8 +8698,10 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
 }
 
 /// The `descriptor.py:175 _immutable_fields_ = ["w_fget?", "w_fset?",
-/// "w_fdel?"]` twin of [`walker_pin_type_version_tag`]: pin the accessor slot
-/// a property fold is about to bake.
+/// "w_fdel?"]` / `function.py:673 ['w_function?']` twin of
+/// [`walker_pin_type_version_tag`]: pin the slot a descriptor fold is about to
+/// bake, whether that is a property's accessor or a `staticmethod` /
+/// `classmethod`'s wrapped callable.
 ///
 /// The receiver pins the folds already hold — class, `w_class`, and the type's
 /// `_version_tag?` — make the DESCRIPTOR a compile-time answer, and stop
@@ -8714,7 +8716,7 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
 /// dereferences the owner only at record and compile time, and a property is
 /// allocated non-moving, so both reads see the object where the constant says
 /// it is.
-fn walker_pin_property_accessor<Sym: WalkSym>(
+fn walker_pin_descriptor_slot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     w_descr: pyre_object::PyObjectRef,
@@ -8726,7 +8728,7 @@ fn walker_pin_property_accessor<Sym: WalkSym>(
 }
 
 /// The `function.py:47 _immutable_fields_ = ['code?', 'w_func_globals?',
-/// 'closure?[*]', 'defs_w?[*]']` twin of [`walker_pin_property_accessor`]: pin
+/// 'closure?[*]', 'defs_w?[*]']` twin of [`walker_pin_descriptor_slot`]: pin
 /// the callee's code slot when the inline lever cannot re-prove it per
 /// iteration.
 ///

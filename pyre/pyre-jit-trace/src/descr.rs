@@ -83,6 +83,19 @@ const PROPERTY_DESCR_TAG: u32 = 0x5100_0000;
 const PROPERTY_FGET_INDEX: u32 = PROPERTY_DESCR_TAG;
 const PROPERTY_FSET_INDEX: u32 = PROPERTY_DESCR_TAG | 1;
 
+// `StaticMethod.w_function` and `ClassMethod.w_function` sit at the same
+// coordinate as each other and as every other `W_*` class's first reference
+// field, and the two wrappers have byte-identical layouts, so
+// `stable_field_index` cannot even tell THEM apart — it names a layout, not an
+// owner, and the index is what selects the pointer cast in
+// `install_quasiimmut_field` / `register_quasi_immutable_deps`.  Reserved for
+// the same reason as the property block above, in a tag of its own.  Disjoint
+// from FIELD (0x10xx_xxxx), ARRAY, SIZE, CELL, MAPDICT, PROPERTY,
+// `object.typeptr` (0x6000_0000), the native mapdict block, and the GC tid.
+const WRAPPER_DESCR_TAG: u32 = 0x5200_0000;
+const STATICMETHOD_W_FUNCTION_INDEX: u32 = WRAPPER_DESCR_TAG;
+const CLASSMETHOD_W_FUNCTION_INDEX: u32 = WRAPPER_DESCR_TAG | 1;
+
 // The generated native user layouts append mapdict fields at different base
 // sizes. HeapCache keys by descriptor index; give each translated STRUCT field
 // the distinct identity provided by descr.py's per-STRUCT cache.
@@ -1552,11 +1565,10 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 
 /// `pypy/interpreter/function.py:673` / `:720`
 /// `_immutable_fields_ = ['w_function?']` for `StaticMethod` and `ClassMethod`.
-/// The `?` is what makes the wrapped callable a constant, and it registers the
-/// invalidation an assignment owes; pyre's setters do not force that yet, so
-/// the field stays LIVE/MUTABLE here and the read is paired with a
-/// `GuardValue`, the same pre-invalidation stand-in
-/// [`FUNCTION_DESCR_GROUP`] documents for `code?`.
+/// The `?` lives on [`STATICMETHOD_W_FUNCTION_QUASI_DESCR`] and its twin rather
+/// than on this row: those two carry an owner-reserved index the layout cannot
+/// supply, and `w_*_set_func` forces the invalidation.  This row stays LIVE and
+/// describes the same word for an ordinary read of the slot.
 ///
 /// Both censuses are COMPLETE — `w_dict` is listed even though nothing reads
 /// it, because a field the struct declares but a group omits has no
@@ -2750,17 +2762,54 @@ pub fn method_w_function_descr() -> DescrRef {
     field_descr_from_group(&W_METHOD_DESCR_GROUP, 0)
 }
 
-/// Live `StaticMethod.w_function` — the callable a descriptor fold unwraps in
-/// place of invoking `__get__`.  Read live and pinned by a `GuardValue`; see
-/// [`W_STATICMETHOD_DESCR_GROUP`] for why it is not a constant.
-pub fn staticmethod_w_function_descr() -> DescrRef {
-    field_descr_from_group(&W_STATICMETHOD_DESCR_GROUP, 0)
+/// `function.py:673 StaticMethod._immutable_fields_ = ['w_function?']` — the
+/// callable a descriptor fold unwraps in place of invoking `__get__`.
+///
+/// Minted standalone rather than read out of [`W_STATICMETHOD_DESCR_GROUP`],
+/// the way the `w_fget?` / `w_fset?` twins are: the group's own row derives its
+/// index from the layout, and this owner needs an index of its own for the
+/// reason [`WRAPPER_DESCR_TAG`] records.  The group keeps its census row for
+/// the field's ordinary reads.
+static STATICMETHOD_W_FUNCTION_QUASI_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            STATICMETHOD_W_FUNCTION_INDEX,
+            pyre_object::function::STATICMETHOD_W_FUNCTION_OFFSET,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "StaticMethod.w_function".to_string(),
+            "w_function".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn staticmethod_w_function_quasi_descr() -> DescrRef {
+    STATICMETHOD_W_FUNCTION_QUASI_DESCR.clone()
 }
 
-/// Live `ClassMethod.w_function` — the `classmethod` twin of
-/// [`staticmethod_w_function_descr`].
-pub fn classmethod_w_function_descr() -> DescrRef {
-    field_descr_from_group(&W_CLASSMETHOD_DESCR_GROUP, 0)
+/// The `function.py:720 ClassMethod` twin of
+/// [`STATICMETHOD_W_FUNCTION_QUASI_DESCR`].
+static CLASSMETHOD_W_FUNCTION_QUASI_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new_with_name(
+            CLASSMETHOD_W_FUNCTION_INDEX,
+            pyre_object::function::CLASSMETHOD_W_FUNCTION_OFFSET,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "ClassMethod.w_function".to_string(),
+            "w_function".to_string(),
+        )
+        .with_quasi_immutable(true),
+    )
+});
+
+pub fn classmethod_w_function_quasi_descr() -> DescrRef {
+    CLASSMETHOD_W_FUNCTION_QUASI_DESCR.clone()
 }
 
 /// Resolve one [`FUNCTION_DESCR_GROUP`] field by byte offset, so the accessors

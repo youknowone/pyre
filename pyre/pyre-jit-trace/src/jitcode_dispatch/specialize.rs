@@ -3292,8 +3292,8 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 /// The safety oracle is [`pyre_interpreter::classmethod_on_type_fast_path`]: it
 /// declines a custom metaclass, a metatype-defined name, an uncacheable type,
 /// and any non-`classmethod` descriptor.  On success the walker pins the exact
-/// type and its version tag, then writes the classmethod's `__func__` as a
-/// green constant.  Because the method-load result is the plain `__func__` (not
+/// type, its version tag, and the descriptor's `w_function?` slot, then writes
+/// the classmethod's `__func__` as a green constant.  Because the method-load result is the plain `__func__` (not
 /// a bound `Method`), the paired [`try_walker_fold_load_method_self`] runs
 /// `compute_load_method_bound`, whose `is_type` + `is_classmethod` arm binds the
 /// type as `cls`, and the following `CALL` inlines `__func__(cls, ...)` — the
@@ -3329,7 +3329,7 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     if name.contains("__") {
         return Ok(None);
     }
-    let Some((w_type, version_tag, w_func)) =
+    let Some((w_type, version_tag, w_descr, w_func)) =
         (unsafe { pyre_interpreter::classmethod_on_type_fast_path(concrete_obj, &name) })
     else {
         return Ok(None);
@@ -3347,10 +3347,22 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
         .heap_cache_mut()
         .replace_box(obj, w_type_const);
 
-    // typeobject.py `promote(self.version_tag())`: class mutation or classmethod
-    // reassignment in the class or any base bumps `_version_tag`, so the pinned
-    // `__func__` side-exits.
+    // typeobject.py `promote(self.version_tag())`: class mutation or rebinding
+    // the attribute to a different descriptor in the class or any base bumps
+    // `_version_tag`, so the pinned `__func__` side-exits.
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+
+    // What the version tag does NOT reach: re-initialising the classmethod in
+    // place leaves the class dict, the descriptor's address, and every version
+    // tag alone while replacing the callable this fold is about to bake.
+    // `function.py:720` declares that slot `w_function?` for exactly this, and
+    // `w_classmethod_set_func` forces the invalidation.
+    walker_pin_descriptor_slot(
+        ctx,
+        op_pc,
+        w_descr,
+        crate::descr::classmethod_w_function_quasi_descr(),
+    )?;
 
     let func_const = ctx.trace_ctx.const_ref(w_func as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, func_const)?;
