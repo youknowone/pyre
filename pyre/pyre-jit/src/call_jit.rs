@@ -5177,24 +5177,22 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     // rewrite these copied native parameters.  Root them immediately and
     // dispatch only values reloaded from the forwarded slots.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(callable);
-    pyre_object::gc_roots::pin_root(null_or_self);
+    let root_base = _roots.base();
+    _roots.pin_root(callable);
+    _roots.pin_root(null_or_self);
     for &arg in args {
-        pyre_object::gc_roots::pin_root(arg);
+        _roots.pin_root(arg);
     }
     // `eval.rs`'s `PyFrame::call` — a non-null null_or_self is the method receiver
     // (load_method_fast_path pushes `[w_descr, w_obj]`); the call proceeds
     // as `callable(null_or_self, *args)`.
     let reload_args = || {
-        let null_or_self = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let null_or_self = _roots.get(root_base + 1);
         let mut values = Vec::with_capacity(args.len() + usize::from(!null_or_self.is_null()));
         if !null_or_self.is_null() {
             values.push(null_or_self);
         }
-        values.extend(
-            (0..args.len()).map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i)),
-        );
+        values.extend((0..args.len()).map(|i| _roots.get(root_base + 2 + i)));
         values
     };
     // `space.getexecutioncontext()` (`call.rs`'s `getexecutioncontext` →
@@ -5212,7 +5210,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
          getexecutioncontext(); the eval loop must pin the execution context \
          before any residual call"
     );
-    if pyre_object::gc_roots::shadow_stack_get(root_base).is_null() {
+    if _roots.get(root_base).is_null() {
         let mut err = pyre_interpreter::PyError::new(
             pyre_interpreter::PyErrorKind::TypeError,
             "call on null callable".to_string(),
@@ -5238,9 +5236,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             unsafe { pyre_interpreter::eval::FrameAnchor::from_raw((*ec).gettopframe_raw()) };
         for i in 0..args.len() {
             let parent_frame_ptr = frame_anchor.live();
-            if !parent_frame_ptr.is_null()
-                && pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i).is_null()
-            {
+            if !parent_frame_ptr.is_null() && _roots.get(root_base + 2 + i).is_null() {
                 let frame = unsafe { &*parent_frame_ptr };
                 // A NULL here with a live fastlocal is an unbound blackhole
                 // register (the resume never seeded the slot); a NULL fastlocal
@@ -5270,8 +5266,8 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     // take the same gateway call directly.  Keep every signature-dependent
     // shape on the generic path: only a natural arity in the fixed range with
     // an exact argument count is equivalent to the positional fast path.
-    let rooted_callable = pyre_object::gc_roots::shadow_stack_get(root_base);
-    let rooted_null_or_self = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let rooted_callable = _roots.get(root_base);
+    let rooted_null_or_self = _roots.get(root_base + 1);
     let bound_builtin = unsafe {
         if !rooted_null_or_self.is_null() && pyre_interpreter::is_function(rooted_callable) {
             Some((rooted_callable, rooted_null_or_self))
@@ -5292,16 +5288,16 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             && unsafe { pyre_interpreter::builtin_code_get_fast_natural_arity(code) as usize }
                 == positional_count;
         if exact_fixed_arity {
-            pyre_object::gc_roots::pin_root(code);
-            pyre_object::gc_roots::pin_root(receiver);
+            _roots.pin_root(code);
+            _roots.pin_root(receiver);
             let code_slot = root_base + 2 + args.len();
             let receiver_slot = code_slot + 1;
             let mut call_args = [pyre_object::PY_NULL; 4];
-            call_args[0] = pyre_object::gc_roots::shadow_stack_get(receiver_slot);
+            call_args[0] = _roots.get(receiver_slot);
             for (index, slot) in call_args[1..positional_count].iter_mut().enumerate() {
-                *slot = pyre_object::gc_roots::shadow_stack_get(root_base + 2 + index);
+                *slot = _roots.get(root_base + 2 + index);
             }
-            let code = pyre_object::gc_roots::shadow_stack_get(code_slot);
+            let code = _roots.get(code_slot);
             return match unsafe {
                 pyre_interpreter::builtin_code_call(code, &call_args[..positional_count])
             } {
@@ -5321,7 +5317,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     // Cold path: type/method/staticmethod/classmethod/callable-instance are
     // delegated to call_function_impl_result under ForcePlainEvalGuard, which
     // mirrors baseobjspace.py:1155 dispatch without re-entering the JIT.
-    let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let callable = _roots.get(root_base);
     if unsafe { is_function(callable) } {
         let code = unsafe { pyre_interpreter::getcode(callable) };
         if unsafe { pyre_interpreter::is_builtin_code(code as pyre_object::PyObjectRef) } {
@@ -5333,17 +5329,16 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             // is unchanged.
             let mut inline_args = [pyre_object::PY_NULL; 4];
             let spilled_args;
-            let call_args: &[pyre_object::PyObjectRef] = if args.len() <= inline_args.len()
-                && pyre_object::gc_roots::shadow_stack_get(root_base + 1).is_null()
-            {
-                for (index, slot) in inline_args[..args.len()].iter_mut().enumerate() {
-                    *slot = pyre_object::gc_roots::shadow_stack_get(root_base + 2 + index);
-                }
-                &inline_args[..args.len()]
-            } else {
-                spilled_args = reload_args();
-                &spilled_args
-            };
+            let call_args: &[pyre_object::PyObjectRef] =
+                if args.len() <= inline_args.len() && _roots.get(root_base + 1).is_null() {
+                    for (index, slot) in inline_args[..args.len()].iter_mut().enumerate() {
+                        *slot = _roots.get(root_base + 2 + index);
+                    }
+                    &inline_args[..args.len()]
+                } else {
+                    spilled_args = reload_args();
+                    &spilled_args
+                };
             // `call_args` are raw positionals; a HOPELESS-arity Signature
             // (`*args`, optional positional) needs `_match_signature` binding
             // before the body reads its slots.  `builtin_code_call` never binds,
@@ -5419,7 +5414,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     pyre_interpreter::call::set_last_exec_ctx(ec);
     let _plain_guard = pyre_interpreter::call::force_plain_eval();
-    let callable = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let callable = _roots.get(root_base);
     let call_args = reload_args();
     let result = pyre_interpreter::call::call_function_impl_result(callable, &call_args);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
