@@ -860,6 +860,50 @@ fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit
 /// `finish_setup_descrs`. `finish_setup_done` is per-thread, but the
 /// rehydrated raw sets live in the process-global `GcCache`, so this guard is
 /// process-global.
+///
+/// # Why this stays eager, and what is actually known about its cost
+///
+/// It is the obvious candidate for "make the first JIT stop rebuilding the
+/// whole descriptor universe", and it decodes a lot: 2,364 non-call slots,
+/// 6,884 mint specs, 185 EffectInfos and 2,534 call slots — 11,967 bincode
+/// decodes off 2.6 MB of embedded records.  Two things to know before taking
+/// that on.
+///
+/// **It is a first-JIT cost, not a startup one.**  This function is reachable
+/// only through `ensure_finish_setup`, and every caller of that sits on a JIT
+/// path — [`crate::state::intern_liveness`],
+/// [`crate::state::liveness_info_snapshot`], [`crate::state::op_live`],
+/// [`crate::state::blackhole_control_opcodes`],
+/// [`crate::state::setup_indirectcalltargets`],
+/// [`crate::state::bytecode_for_address`].  An interpreter that never traces
+/// never runs it.  (Descriptor *minting* does happen at startup, which is easy
+/// to mistake for this pass when reading an allocation census.)
+///
+/// **Its size is not currently measured, and two obvious instruments cannot
+/// measure it.**  Allocation here is mmap-backed, so `malloc_history` / `heap`
+/// attribution does not see the object heap at all; and subtracting two peak
+/// RSS readings does not isolate it either, because the JIT changes what the
+/// workload itself allocates.  Measured on darwin arm64 against a 63.9 MB
+/// never-traced baseline, a 200,000-iteration integer loop grows peak RSS by
+/// 5.8 MB with the JIT on and 23.8 MB with `PYRE_JIT=off` — the JIT arm nets
+/// activation against the boxing the interpreter avoided.  Sizing this needs
+/// an instrument that attributes the arena.
+///
+/// What settles the question is soundness rather than size, and the dense-index
+/// halves of the lazy plan already ship: `descrs_index.bin` /
+/// `ei_descr_mints_index.bin` / `effect_infos_index.bin` give per-index
+/// locatability, [`descr_cells`] / [`descr_ref_cells`] are the `OnceLock`
+/// arrays, and `descr::force_declared_group` is the on-demand container-group
+/// publish.
+///
+/// What is left eager here is eager because it must be.
+/// `descr::descr_from_set_member` is lookup-only by construction, and
+/// `descr::prepare_frozen_effect_info` resolves each EffectInfo's six raw sets
+/// exactly once and degrades the whole EffectInfo to `RandomEffects` when any
+/// member is unresolvable — a container published afterwards cannot repair it.
+/// Deferring pass 2 or pass 3 therefore buys an unmeasured amount of memory
+/// against a silent optimizer downgrade that surfaces only as
+/// `descr_set_absent` rising off zero.
 pub fn rehydrate_build_descr_raw_sets() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
