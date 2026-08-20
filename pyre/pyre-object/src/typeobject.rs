@@ -1335,6 +1335,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     }
     const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
     const IMMUTABLETYPE: i64 = 1 << 8;
+    const DISALLOW_INSTANTIATION: i64 = 1 << 7;
     const ABSTRACT: i64 = 1 << 20;
     const HAVE_GC: i64 = 1 << 14;
     const PATMA_SEQUENCE: i64 = 1 << 5;
@@ -1362,6 +1363,17 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     // no equivalent type owner, so its bit is always absent.
     if t.flag_abstract.load(std::sync::atomic::Ordering::Acquire) {
         flags |= ABSTRACT;
+    }
+    if t.flag_disallow_instantiation
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        // [3.14-spec] CPython v3.14.6 `Include/object.h:540` assigns bit 7
+        // to `Py_TPFLAGS_DISALLOW_INSTANTIATION`, and
+        // `Objects/typeobject.c:1407` exposes the complete `tp_flags` word.
+        // PyPy `typeobject.py:990-1004` publishes a smaller computed subset.
+        // Preserve that field-by-field shape while exposing the canonical
+        // flag that pyre's `type.__call__` already enforces.
+        flags |= DISALLOW_INSTANTIATION;
     }
     if t.flag_have_gc {
         // [3.14-spec] CPython v3.14.6 exposes the complete `tp_flags` word
