@@ -624,15 +624,9 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     // licence to read its field offsets, it is the absence of the check that
     // would grant one.
     let mut unknown: Vec<(&str, &'static str)> = Vec::new();
-    // `platform=` records the machine that ran the extraction -- `platform_info`
-    // reads `platform.system()` and `platform.machine()` -- so it is compared
-    // against the machine running this build script, which is what
-    // `std::env::consts` names here.  Not `CARGO_CFG_TARGET_*`: those name what
-    // is being built FOR, and a cross-compile or a `wasm32-unknown-unknown`
-    // build legitimately reads this host's artefacts.  There is one native
-    // extraction per host and the wasm layouts ride its `layout_targets=`
-    // sidecars, so no second extraction exists for a target to be matched
-    // against.
+    // The machine that ran the extraction, so this is the machine running the
+    // build script -- not `CARGO_CFG_TARGET_*`, which names what is being built
+    // FOR: a wasm or cross build legitimately reads this host's artefacts.
     let host_platform = platform_key(std::env::consts::OS, std::env::consts::ARCH);
     for &crate_name in LLBC_CRATES {
         // An absent artefact is the bootstrap case, already reported by the
@@ -661,21 +655,11 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
             unknown.push((crate_name, "stamp carries no external= line"));
             continue;
         };
-        // The stamp records which host the artefact was extracted for, and
-        // nothing else in it does: `source=`, `closure=` and `external=` are
-        // all computed from the tracked tree, so they agree exactly across
-        // hosts.  The engine's own `check` compares every key in its
-        // `STAMP_KEYS`, `platform` among them; this read a strict subset, so a
-        // build that followed an extraction for another host was told the
-        // artefacts were fresh and then failed somewhere downstream, naming
-        // neither the cause nor the fix.
         let Some(recorded_platform) = stamp_field(&stamp, "platform=") else {
             unknown.push((crate_name, "stamp carries no platform= line"));
             continue;
         };
-        // `None` is a host the engine refuses to extract on, so it cannot have
-        // written this stamp -- but the source and external comparisons below
-        // still can, and declining to compare one field must not cost them.
+        // Declining to compare this field must not cost the comparisons below.
         if let Some(host_platform) = host_platform
             && recorded_platform != host_platform
         {
@@ -737,9 +721,7 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
         "cargo::warning"
     };
     for (crate_name, field, recorded, current) in &stale {
-        // The other fields are hashes of the tree, so "the tree now has" is
-        // what moved.  `platform` is a fact about what is being built, and the
-        // tree is the same tree either way.
+        // The other fields are hashes of the tree; `platform` is not.
         let subject = if *field == "platform" {
             "this build is"
         } else {

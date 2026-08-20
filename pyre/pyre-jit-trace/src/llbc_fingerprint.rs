@@ -8,19 +8,15 @@
 //! from the Python side, and a reader that models the format loosely goes
 //! quiet instead of failing when a field is added.
 
-/// The extraction engine's spelling of the host it extracted for, as
-/// `platform_info` in `scripts/llbc_extract.py` writes it into `platform=`.
+/// The host spelling `platform_info` in `scripts/llbc_extract.py` writes into
+/// `platform=`. It is the only stamp field that separates hosts -- the rest
+/// hash the tracked tree -- and it has to, because `cfg` gates which sources
+/// charon walks, so artefacts from another host describe different types at
+/// different offsets.
 ///
-/// `cfg` gates which sources charon walks -- one host reads `kqueue` where
-/// another reads `epoll` -- so artefacts extracted elsewhere describe a
-/// different set of types, and their field offsets name different bytes.
-/// Every other field in the stamp is computed from the tracked tree and
-/// agrees across hosts, so this is the only one that separates them.
-///
-/// Windows collapses to a single key on the producing side regardless of
-/// architecture; collapsing it differently here would read every Windows
-/// stamp as a mismatch. `None` is a host the engine refuses to extract on,
-/// so no stamp it wrote can be describing this build.
+/// Windows collapses to one key on the producing side regardless of
+/// architecture, and must collapse the same way here. `None` is a host the
+/// engine refuses to extract on.
 pub fn platform_key(target_os: &str, target_arch: &str) -> Option<&'static str> {
     Some(match (target_os, target_arch) {
         ("windows", _) => "windows",
