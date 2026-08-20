@@ -468,7 +468,7 @@ impl<'c> Lowerer<'c> {
         // `tlc_roll(...)` and `state.regs = vec![0; n]` — so each degrades to
         // an abort stub on its own and its dropped advance never runs.
         // Confirmed at runtime, not inferred from the census: `MAJIT_LOG=1
-        // cargo test -p tl|tlc|tlr` records exactly `TlState::ROLL`,
+        // cargo test -p tl|tlc|tlr --features cranelift` records exactly `TlState::ROLL`,
         // `TlcState::ROLL` and `TlrState::ALLOCATE` as degraded.
         //
         // So this guard is defensive, like the `break` one above — but it

@@ -309,7 +309,8 @@ mod two_arrays_with_scalar {
 /// Two virt arrays of the SAME item type, plus a scalar. `dualtape`
 /// (`majit/examples/dualtape/src/jit_interp.rs`'s `DualState`) declares this shape
 /// (`pa: int, a: [int; virt], pb: int, b: [int; virt]`) and its tests pass — but
-/// they assert result equality only, and `MAJIT_LOG=1 cargo test -p dualtape`
+/// they assert result equality only, and
+/// `MAJIT_LOG=1 cargo test -p dualtape --features cranelift`
 /// emits no `[jit]` line at all, so that suite never reaches tracing and says
 /// nothing about whether the shape compiles. This machine asks the question it
 /// leaves open, and separates "two arrays" from "two arrays of mixed types".

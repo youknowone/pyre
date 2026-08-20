@@ -8,8 +8,8 @@
 //! Because the `#[jit_interp]` macro emits module-level items that collide
 //! within a single module, every machine lives in its own module.
 //!
-//!   Run all probes:  cargo run -p cel --release
-//!   Run one probe:   cargo run -p cel --release -- <probe>
+//!   Run all probes:  cargo run -p cel --release --features cranelift
+//!   Run one probe:   cargo run -p cel --release --features cranelift -- <probe>
 //!   <probe> ∈ { probe, policy, column, colscalar, float }
 //!
 //!   * probe     — straight-line arithmetic batch (foundational >=3x kill-test)

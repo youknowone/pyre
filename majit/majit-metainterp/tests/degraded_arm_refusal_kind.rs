@@ -6,7 +6,8 @@
 //! itself, so no probe edit is needed to re-take them:
 //!
 //! ```text
-//! MAJIT_LOG=1 cargo test --manifest-path majit/examples/<crate>/Cargo.toml -- --nocapture
+//! MAJIT_LOG=1 cargo test --manifest-path majit/examples/<crate>/Cargo.toml \
+//!     --features cranelift -- --nocapture
 //! ```
 //!
 //! When a family is added, add it HERE as well as in `refusal_kind`. This file
