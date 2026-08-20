@@ -77,17 +77,16 @@ before any test, a denied resource, or a suite whose every case was skipped).
   with **JIT on** (`MAJIT_STRICT=1`), on `ubuntu-24.04` (x86_64). The baseline is recorded on linux-x86_64 and the JIT
   codegen is architecture-specific, so local baseline comparisons must use the
   same host.
-- `.github/workflows/pyre-cpython-nightly.yml` — non-gating `--full` across
-  three lanes (dynasm JIT-on, dynasm JIT-off, cranelift) with reports uploaded
-  as artifacts. A module that passes JIT-off but not JIT-on is a JIT
-  correctness divergence. Only the dynasm JIT-on lane runs nightly; the other
-  two run weekly, and a manual dispatch runs all three. It runs on the gate's
-  own host and repeats the gate's
-  `--jobs` and `--timeout`, so a lane's verdict for a module means the same
-  thing the baseline means by it; a report measured under a tighter per-module
-  budget calls a module TIMEOUT for reasons that have nothing to do with the
-  module. Because the non-`PASS` modules are only ever run here, this is also
-  where a recorded verdict that has since gone stale becomes visible.
+- `.github/workflows/pyre-cpython-weekly.yml` — non-gating `--full` across
+  three lanes (dynasm JIT-on, dynasm JIT-off, cranelift), weekly or on manual
+  dispatch, with reports uploaded as artifacts. A module that passes JIT-off
+  but not JIT-on is a JIT correctness divergence. It runs on the gate's own
+  host and repeats the gate's `--jobs` and `--timeout`, so a lane's verdict for
+  a module means the same thing the baseline means by it; a report measured
+  under a tighter per-module budget calls a module TIMEOUT for reasons that
+  have nothing to do with the module. Because the non-`PASS` modules are only
+  ever run here, this is also where a recorded verdict that has since gone
+  stale becomes visible.
 
 ## Current state and backlog (Phase 0)
 

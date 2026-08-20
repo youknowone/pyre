@@ -950,7 +950,7 @@ def main() -> int:
         print(f"\n── REGRESSIONS ({len(regressions)}) ──")
         for line in regressions:
             print(f"  - {line}")
-        # `--full` is report-only (the nightly exploratory lanes rely on it);
+        # `--full` is report-only (the weekly exploratory lanes rely on it);
         # never let a current PASS regression fail an exploratory run.
         if not args.full:
             return 1

@@ -1,35 +1,20 @@
-name: pyre CPython suite (nightly)
+name: pyre CPython suite (weekly)
 
-# Non-gating exploratory run of the FULL CPython regression suite (every
-# module, including ones that fail today) across three lanes:
-#   * dynasm, JIT on   — the gating backend, full picture.  DAILY.
-#   * dynasm, JIT off  — interpreter baseline; a module that passes here but
-#     not under JIT is a JIT correctness divergence.  WEEKLY.
-#   * cranelift, JIT on.  WEEKLY.
-# Only the first runs every night: it is the one that answers whether a
-# recorded verdict has gone stale, and 434 modules three times a day buys
-# little the week does not.  A manual dispatch runs all three.
-# Reports are uploaded as artifacts so coverage growth and JIT divergence can
-# be tracked over time. This never gates a PR: `--full` reports a regression
-# against the baseline instead of failing on it. It is not the same as always
-# exiting 0 -- a run whose buckets do not account for every module it selected
-# still fails, and withholds its report, because that summary is short of a
-# result rather than carrying a bad one.
+# Non-gating exploratory run of the FULL CPython suite -- every module,
+# including the ones that fail today -- to catch a recorded verdict going
+# stale. Three lanes: dynasm JIT-on, dynasm JIT-off, cranelift JIT-on. A module
+# that passes JIT-off but not JIT-on is a JIT correctness divergence.
+# `--full` reports a regression against the baseline instead of failing on it,
+# but still exits nonzero, and withholds its report, when its buckets do not
+# account for every module it selected.
 
 on:
   schedule:
-    # Daily, the gating configuration alone. That one lane is what answers
-    # "has a recorded verdict gone stale", which is the question the
-    # non-`PASS` rows can only be asked here.
-    - cron: "0 7 * * *"
-    # Weekly, all three. The JIT-divergence comparison and the cranelift
-    # picture are worth a full run, not worth 434 modules three times every
-    # night.
     - cron: "0 8 * * 0"
   workflow_dispatch:
 
 concurrency:
-  group: pyre-cpython-nightly-${{ github.ref }}
+  group: pyre-cpython-weekly-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -38,21 +23,12 @@ permissions:
 jobs:
   full-suite:
     name: full CPython suite (linux)
-    # The gate runs on ubuntu-24.04 and the baseline records its verdicts, so
-    # the exploratory lanes run there too: a report from another host measures
-    # host divergence on top of the coverage it is meant to show, and the JIT
-    # codegen is arch-specific besides. Each lane is spelled with the gate's
-    # own `--jobs` and `--timeout` for the same reason -- a module the report
-    # calls TIMEOUT under a tighter budget than the baseline was recorded with
-    # is not a finding about the module.
+    # The baseline records the gate's verdicts, so the lanes run on the gate's
+    # host with its own `--jobs`/`--timeout`: a report from another host, or a
+    # TIMEOUT under a tighter budget than the baseline was recorded with, is
+    # not a finding about the module.
     runs-on: ubuntu-24.04
-    # A ceiling, not a cost: the daily run is one lane and ends well inside
-    # it. It has to cover the weekly worst case -- the LLBC extract, both
-    # backend builds, and three full 434-module lanes -- because the 120 this
-    # job carried before covered none of it. Over the eight nights preceding
-    # this change not one run finished all three lanes: three were cut off
-    # inside the cranelift lane, three inside the lane before it, and two
-    # never got past the first.
+    # Covers the extract, both builds and three full 434-module lanes.
     timeout-minutes: 300
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
@@ -96,13 +72,9 @@ jobs:
       with:
         path: build/llbc
         key: llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
-        # The exact key misses whenever any of the four crates moved, which is
-        # most nights, and without a prefix to fall back on a miss restores
-        # nothing at all -- so the whole extract ran from scratch every time,
-        # ~23 minutes of a budget that had none to give. The key only chooses
-        # what gets offered: `extract-llbc.py` re-adjudicates each crate
-        # against the current tree and re-extracts the ones that moved, so a
-        # loose restore cannot hand the build a stale artefact.
+        # A miss with no prefix to fall back on restores nothing and re-extracts
+        # all four crates. A loose restore is safe: `extract-llbc.py` re-judges
+        # each crate against the tree and re-extracts the ones that moved.
         restore-keys: |
           llbc-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
     - name: Extract LLBC
@@ -114,46 +86,21 @@ jobs:
       run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
     - name: Build the cranelift backend
       id: build-cranelift
-      # Carries the same schedule predicate as the lane that uses it: the daily
-      # run never invokes this binary, so building it there spends the time for
-      # nothing.
-      #
-      # `!cancelled()` for the same reason the lanes carry it. The two backends
-      # share the sources but not the feature set, so one can break while the
-      # other builds -- and under the implicit `success()` a dynasm-only break
-      # skipped this build, which skipped the cranelift lane after it, costing
-      # the night a backend report it could have had. What it gives up is that
-      # a failed step in the setup above no longer stops this build from
-      # starting; it fails on its own, on a run that was already red.
-      if: ${{ !cancelled() && github.event.schedule != '0 7 * * *' }}
+      # `!cancelled()` so a dynasm-only break does not also cost the run its
+      # cranelift report: the two share the sources but not the feature set.
+      # The price is that a failed setup step no longer stops this build.
+      if: ${{ !cancelled() }}
       run: cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift
-    # Each lane names the build whose binary it runs and nothing else, so no
-    # lane depends on where the other builds and lanes sit in the list. The
-    # implicit `success()` this replaces did depend on it: it skipped this
-    # lane, the one that runs every night, whenever the cranelift build above
-    # it failed -- even though the binary this lane runs had built fine.
+    # Each lane names the build whose binary it runs, so no lane depends on
+    # where the other builds and lanes sit in the list.
     - name: dynasm (JIT on)
       if: ${{ !cancelled() && steps.build-dynasm.outcome == 'success' }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --jobs 3 --timeout 300 --report reports/dynasm-jit.json
-    # These two run on the weekly schedule and on a manual dispatch, not every
-    # night. The condition names the DAILY cron and excludes it, rather than
-    # naming the weekly one and requiring it: a dispatch has no
-    # `github.event.schedule` at all, so a positive test would skip these on
-    # exactly the run a human asked for -- and would do it silently.
-    #
-    # `!cancelled()` rather than the implicit `success()` is the other half: a
-    # lane exits nonzero on more than a regression -- `--full` gates none of
-    # those, but a summary short of the modules it selected still returns 1 --
-    # and without it the JIT-divergence comparison this pair exists to produce
-    # is lost to whichever lane happened to run first. What that must not also
-    # buy is a lane running without the binary it needs -- hence the build
-    # outcome beside it: dropping `success()` is about the lane before, not
-    # about the build.
+    # `!cancelled()` because a lane exits nonzero on more than a regression, and
+    # without it the JIT comparison is lost to whichever lane ran first.
     - name: dynasm (JIT off)
-      if: ${{ !cancelled() && steps.build-dynasm.outcome == 'success' && github.event.schedule != '0 7 * * *' }}
+      if: ${{ !cancelled() && steps.build-dynasm.outcome == 'success' }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --no-jit --jobs 3 --timeout 300 --report reports/dynasm-nojit.json
-    # A skipped step's outcome is `skipped`, not `success`, so requiring the
-    # build to have succeeded already carries the schedule predicate with it.
     - name: cranelift (JIT on)
       if: ${{ !cancelled() && steps.build-cranelift.outcome == 'success' }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend cranelift --jobs 3 --timeout 300 --report reports/cranelift-jit.json
