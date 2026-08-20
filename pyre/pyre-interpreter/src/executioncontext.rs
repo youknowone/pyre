@@ -643,6 +643,10 @@ impl ExecutionContext {
         };
         let frame = anchor.live();
         let frame_vref = self.topframeref;
+        // At interp level a vref in the chain *is* the frame pointer, so the
+        // slot `force_vref` is about to be handed goes stale across the force
+        // `get_f_back` performs just above it.
+        let vref_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_vref) };
         unsafe {
             // `self.topframeref = frame.f_backref` (no parens — move the raw
             // caller vref back, do not force it).
@@ -656,7 +660,7 @@ impl ExecutionContext {
                 // `frame_vref()` — force the leaving frame's own vref so it
                 // stays reachable after the JIT frame is gone (identity at
                 // interp level).
-                force_vref(frame_vref);
+                force_vref(vref_anchor.live());
             }
         }
         // `jit.virtual_ref_finish(frame_vref, frame)` — keepalives only at
@@ -812,14 +816,7 @@ impl ExecutionContext {
         // callback exception), the ticker decrement + slow-path
         // action_dispatcher do NOT run.  Use `?` so a tracer error
         // short-circuits before touching actionflag.
-        // `bytecode_only_trace` returns without touching anything when no
-        // tracer is installed, so that is the test the anchor rides.
-        let trace_anchor =
-            (!self.w_tracefunc.is_null()).then(|| unsafe { crate::eval::FrameAnchor::from_raw(frame) });
-        self.bytecode_only_trace(frame)?;
-        if let Some(anchor) = &trace_anchor {
-            frame = anchor.live();
-        }
+        frame = self.bytecode_only_trace(frame)?;
         if self.actionflag.decrement_ticker(decr_by as isize) < 0 {
             // executioncontext.py:165 — `actionflag.action_dispatcher`.
             // Routed through a residual (dont_look_inside) boundary so the
@@ -869,19 +866,29 @@ impl ExecutionContext {
     /// observes the unmodified instr_prev_plus_one and can fire its
     /// first `line` event correctly).
     #[inline(always)]
-    pub fn bytecode_only_trace(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
+    /// Answers the frame, because the tracer arm below runs Python and a frame
+    /// a compiled trace built moves there.  Returning it puts the reload on the
+    /// arm that can collect instead of on every caller: this is the per-opcode
+    /// path, and an anchor taken before the early-outs would be a shadow-stack
+    /// push and pop for every bytecode with no tracer installed.
+    pub fn bytecode_only_trace(
+        &mut self,
+        frame: *mut PyFrame,
+    ) -> Result<*mut PyFrame, crate::PyError> {
         // PyPy has no object-space-null guard here: `space` is the interpreter
         // owner, not an optional tracing flag. Pyre represents that owner with
         // PY_NULL in this runtime, so testing it suppressed every line event
         // while still allowing call/return events through `_trace`.
         if frame.is_null() {
-            return Ok(());
+            return Ok(frame);
         }
         let f_trace_is_none = unsafe { (*frame).get_w_f_trace().is_null() };
         if f_trace_is_none || self.is_tracing != 0 || self.w_tracefunc.is_null() {
-            return Ok(());
+            return Ok(frame);
         }
-        self.run_trace_func(frame)
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        self.run_trace_func(frame)?;
+        Ok(anchor.live())
     }
 
     pub fn _run_finalizers_now(&mut self) {
@@ -1012,10 +1019,7 @@ impl ExecutionContext {
         &mut self,
         frame: *mut PyFrame,
     ) -> Result<(), crate::PyError> {
-        // The tracer runs Python and the dispatcher below is handed the frame.
-        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-        self.bytecode_only_trace(frame)?;
-        let frame = anchor.live();
+        let frame = self.bytecode_only_trace(frame)?;
         if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::EB_ASYNC != 0 {
             self.actionflag.sync_async_ticker();
         }
@@ -1370,13 +1374,14 @@ impl ExecutionContext {
                 Ok::<(), crate::PyError>(())
             })();
 
-            let frame = frame_anchor.live();
             if call_result.is_err() {
                 self.settrace(pyre_object::w_none());
                 unsafe {
-                    (*frame).getorcreatedebug(init_lineno).w_f_trace = pyre_object::PY_NULL;
+                    (*frame_anchor.live()).getorcreatedebug(init_lineno).w_f_trace =
+                        pyre_object::PY_NULL;
                 }
             }
+            let frame = frame_anchor.live();
 
             unsafe {
                 let d = (*frame).getorcreatedebug(init_lineno);
