@@ -89,9 +89,9 @@ before any test, a denied resource, or a suite whose every case was skipped).
 
 ## Current state and backlog (Phase 0)
 
-The baseline records **210 `PASS`**, 148 `IMPORTERROR`, 34 `SKIP`, 27 `FAIL`,
-8 `CRASH`, and 7 `TIMEOUT` (434 modules, stdlib 3.14.6). These are a snapshot
-counted from `baseline.json`, which is the authority when they disagree. The
+The baseline records **223 `PASS`**, 138 `IMPORTERROR`, 34 `SKIP`,
+25 `FAIL`, 7 `CRASH`, and 7 `TIMEOUT` (434 modules, stdlib 3.14.6). These are a
+snapshot counted from `baseline.json`, which is the authority when they disagree. The
 `PASS` set grows as the gaps below are closed; non-passing modules include both
 import/stdlib gaps and tests that reach semantic failures, crashes, or timeouts.
 (It was 0 `PASS` / 414 `IMPORTERROR` before the

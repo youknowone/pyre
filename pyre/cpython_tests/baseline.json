@@ -380,7 +380,7 @@
       "dynasm": "PASS"
     },
     "test.test_eintr": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_email": {
       "dynasm": "IMPORTERROR"
@@ -463,7 +463,7 @@
       "dynasm": "CRASH"
     },
     "test.test_float": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_flufl": {
       "dynasm": "FAIL"
@@ -533,7 +533,7 @@
       "dynasm": "PASS"
     },
     "test.test_genericpath": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_genexps": {
       "dynasm": "IMPORTERROR"
@@ -593,7 +593,7 @@
       "dynasm": "PASS"
     },
     "test.test_http_cookies": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_httplib": {
       "dynasm": "IMPORTERROR"
@@ -710,7 +710,7 @@
       "dynasm": "FAIL"
     },
     "test.test_mailbox": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_marshal": {
       "dynasm": "IMPORTERROR"
@@ -777,7 +777,7 @@
       "dynasm": "PASS"
     },
     "test.test_ntpath": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_nturl2path": {
       "dynasm": "PASS"
@@ -791,7 +791,7 @@
       "reason": "implementation detail"
     },
     "test.test_opcodes": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_openpty": {
       "cranelift": "PASS",
@@ -887,7 +887,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_posixpath": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pow": {
       "cranelift": "PASS",
@@ -907,7 +907,7 @@
       "dynasm": "PASS"
     },
     "test.test_pstats": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_pty": {
       "dynasm": "TIMEOUT"
@@ -1054,7 +1054,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_ssl": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_stable_abi_ctypes": {
       "dynasm": "SKIP",
@@ -1255,7 +1255,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_typing": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_ucn": {
       "dynasm": "IMPORTERROR"
@@ -1430,7 +1430,7 @@
       "dynasm": "PASS"
     },
     "test.test_zlib": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_zoneinfo": {
       "cranelift": "FAIL",
