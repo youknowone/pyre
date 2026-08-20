@@ -6335,18 +6335,19 @@ pub extern "C" fn bh_store_global_fn(frame_ptr: i64, w_name: i64, value: i64) ->
 
 /// DELETE_NAME residual using the frame receiver and interned-name ABI.
 /// pyopcode.py DELETE_NAME deletes from `w_locals` and raises `NameError`
-/// when the binding is absent.
+/// when the binding is absent.  The trace carries no `co_names` index, so it
+/// enters through `delete_name_w`, which deletes through the key object the
+/// trace already holds.
 pub extern "C" fn bh_delete_name_fn(frame_ptr: i64, w_name: i64) -> i64 {
-    use pyre_interpreter::pyopcode::OpcodeStepExecutor;
     assert!(
         frame_ptr != 0,
         "bh_delete_name_fn requires a non-null PyFrame; every DELETE_NAME emit \
          site must thread portal_frame_reg as the leading ref operand"
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let name =
-        unsafe { pyre_object::unicodeobject::w_str_get_value(w_name as pyre_object::PyObjectRef) };
-    match frame.delete_name(name) {
+    match unsafe {
+        pyre_interpreter::eval::delete_name_w(frame, w_name as pyre_object::PyObjectRef)
+    } {
         Ok(()) => 1,
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object() as i64);

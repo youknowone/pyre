@@ -2815,6 +2815,24 @@ pub unsafe fn store_name_value_w(
     Ok(())
 }
 
+/// DELETE_NAME counterpart of [`store_name_value_w`], for the JIT's
+/// `bh_delete_name_fn`.  The trace already holds the key object, so it deletes
+/// through that rather than naming the key again.
+///
+/// # Safety
+/// `w_name` must point to a valid `str` object.
+pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<(), PyError> {
+    let w_locals = frame.get_or_create_w_locals();
+    crate::baseobjspace::delitem(w_locals, w_name).map_err(|err| {
+        if matches!(err.kind, PyErrorKind::KeyError) {
+            let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
+            PyError::name_error_with_name(format!("name '{name}' is not defined"), name)
+        } else {
+            err
+        }
+    })
+}
+
 /// STORE_GLOBAL counterpart of [`store_name_value_w`], for the JIT's
 /// `bh_store_global_fn`.  `pyopcode.py:567` writes straight into `w_globals`.
 ///
@@ -3764,7 +3782,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn delete_deref(&mut self, idx: usize) -> Result<(), PyError> {
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            return self.delete_name("__class__");
+            return self.delete_name("__class__", crate::pyopcode::NO_NAMEINDEX);
         }
         // `pyopcode.py:580 DELETE_DEREF`: fetch the cell, raise if empty, then
         // `cell.set(None)` — clear the cell *contents* (PY_NULL is the empty
@@ -4317,7 +4335,10 @@ impl OpcodeStepExecutor for PyFrame {
     // back to the cell / free variable at `idx`.
     fn load_from_dict_or_deref(&mut self, idx: usize, name: &str) -> Result<(), PyError> {
         let mapping = self.pop();
-        let key = pyre_object::w_str_new(name);
+        // A localsplus name has no `co_names_w` slot to realize into, so nothing
+        // bounds how often this runs; interning is what keeps an immortal
+        // string per execution from being an immortal string per execution.
+        let key = pyre_object::unicodeobject::intern_str_value(name);
         let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(mapping, key) {
             Ok(value) => {
@@ -4542,12 +4563,14 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── delete_name ──
     // pypy/interpreter/pyopcode.py:821 DELETE_NAME — delete from w_locals; KeyError → NameError.
-    fn delete_name(&mut self, name: &str) -> Result<(), PyError> {
+    fn delete_name(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
         // `space.delitem(w_locals, w_name)`; at module scope `w_locals` is the
         // globals dict, so a module DELETE_NAME routes through the canonical
         // W_DictObject too.  KeyError → NameError.
         let w_locals = self.get_or_create_w_locals();
-        let key = unsafe { pyre_object::w_str_new(name) };
+        let key = unsafe {
+            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+        };
         crate::baseobjspace::delitem(w_locals, key).map_err(|err| {
             if matches!(err.kind, PyErrorKind::KeyError) {
                 PyError::name_error_with_name(format!("name '{name}' is not defined"), name)

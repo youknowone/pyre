@@ -1282,7 +1282,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn delete_attr(&mut self, _name: &str) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_attr not implemented"))
     }
-    fn delete_name(&mut self, _name: &str) -> Result<(), PyError> {
+    fn delete_name(&mut self, _name: &str, _nameindex: usize) -> Result<(), PyError> {
         Err(crate::PyError::type_error("delete_name not implemented"))
     }
     fn delete_global(&mut self, _name: &str) -> Result<(), PyError> {
@@ -3327,7 +3327,8 @@ pub fn execute_delete_name<E: OpcodeStepExecutor>(
     let Instruction::DeleteName { namei } = instruction else {
         unreachable!()
     };
-    executor.delete_name(code.names[u32_as_usize(namei.get(op_arg))].as_ref())?;
+    let nameindex = u32_as_usize(namei.get(op_arg));
+    executor.delete_name(code.names[nameindex].as_ref(), nameindex)?;
     Ok(StepResult::Continue)
 }
 
