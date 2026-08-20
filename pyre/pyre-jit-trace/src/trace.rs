@@ -5093,9 +5093,20 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
 /// ops after that merge point and before the loop's final back-edge, so neither
 /// a prologue-only marker (e.g. `COPY_FREE_VARS` ahead of a clean hot loop) nor
 /// a post-loop marker over-declines the loop.  A loop covered by an exception
-/// handler keeps the full-tail scan so a post-loop `abort_permanent` still
-/// declines it, because compiled-loop delivery of an uncaught raise to the
-/// handler is not yet supported.
+/// handler additionally keeps every marker from that handler's entry onward,
+/// because compiled-loop delivery of an uncaught raise to the handler is not
+/// yet supported.
+///
+/// That bound has no upper limit, and the missing limit is deliberate rather
+/// than an oversight.  Narrowing it to the PCs reachable from the loop's own
+/// handler is unsound: a walk that leaves the loop concretely executes the
+/// post-loop tail, and a raise there is delivered by
+/// `vstack_enter_exception_handler` into the TAIL's handler, which the loop's
+/// own reachability set does not contain.  The walk then records that handler
+/// inline and keeps going, so a marker in it is reached after non-journaled
+/// effects have already run — the case the paragraph above describes.  A sound
+/// narrowing would have to seed every handler the walk can reach, which for
+/// these shapes is the whole tail again.
 ///
 /// The scan exempts one marker class: `LOAD_FAST_CHECK`'s null arm.  The
 /// decline above is a refusal over an *unported* opcode, whose arm bails
