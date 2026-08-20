@@ -6063,9 +6063,8 @@ impl<M: Clone> MetaInterp<M> {
         // next `begin_trace_session` sees a clean slate, and fire the
         // `pyjitpl.py:2897 finally: profiler.end_tracing()` pairing for
         // the `start_tracing` opened by `prepare_trace_start_runtime`.
-        // Cancelled paths that kept `self.tracing` alive (e.g.
-        // `prior_retraced_count == MAX` above) fall through harmlessly
-        // and keep tracing running.
+        // Cancelled paths that kept `self.tracing` alive fall through
+        // harmlessly and keep tracing running.
         if self.tracing.is_none() {
             self.clear_trace_session();
         }
@@ -6322,12 +6321,14 @@ impl<M: Clone> MetaInterp<M> {
         // `abort_tracing(green_key, permanent = true)`, i.e. `DONT_TRACE_HERE`
         // forever, where the ordinary abort path escalates only after
         // `MAX_TRACE_ABORT_COUNT` aborts.
-        let prior_retraced_count_early = self
-            .compiled_loops
-            .get(&green_key)
-            .and_then(|compiled| compiled.live_token())
-            .map(|token| token.get_retraced_count())
-            .unwrap_or(0);
+        //
+        // Carrying the count forward is wrong for the same reason. That token
+        // is the one the cell no longer offers; the loop this compile builds
+        // gets a fresh `JitCellToken` (`compile.py:220` and `:266` both call
+        // `make_jitcell_token`), whose count starts at zero. Only
+        // `compile_retrace` reuses a token, and it reuses the live one
+        // (`compile.py:355 get_procedure_token`), so that is where a retrace
+        // budget legitimately persists.
 
         // compile.py:269-270 `jitcell_token = cross_loop.jitcell_token`: mark
         // the key this loop is about to be stored under as cut-owned, before
@@ -6525,10 +6526,9 @@ impl<M: Clone> MetaInterp<M> {
         // (`optimizeopt/unroll.rs`) inserts that one element, so an empty list
         // here is `[start_descr]`, not an absent label.
         //
-        // The drain stays: the `prior_retraced_count == u32::MAX` early
-        // Cancelled path returns above, so reaching this point means a
-        // recompile is under way and the tokens a previous InvalidLoop attempt
-        // parked for this green key are spent either way.
+        // The drain stays: reaching this point means a recompile is under way,
+        // so the tokens a previous InvalidLoop attempt parked for this green
+        // key are spent either way.
         self.pending_preamble_tokens.swap_remove(&green_key);
         let prior_front_target_tokens: Vec<crate::history::TargetToken> = Vec::new();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
@@ -6540,7 +6540,12 @@ impl<M: Clone> MetaInterp<M> {
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
-        unroll_opt.retraced_count = prior_retraced_count_early;
+        // Zero, not the previous entry's count — see the fresh-token note above.
+        // The field still has to be stored back after the unroll runs, because
+        // that is where it is written: `unroll.py:217` increments it and
+        // `unroll.py:272 disable_retracing_if_max_retrace_guards` sets
+        // `sys.maxint`, both on the token this compile is creating.
+        unroll_opt.retraced_count = 0;
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
