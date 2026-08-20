@@ -1541,6 +1541,28 @@ impl JitCellToken {
         flag
     }
 
+    /// Record an existing flag as the generation the artifact just compiled
+    /// for this token watches, instead of minting a fresh one.
+    ///
+    /// A loop-closing bridge merged into its owner's module has no code of its
+    /// own: it executes from the owner's module, whose `GUARD_NOT_INVALIDATED`
+    /// reads the root flag. The quasi-immutable dependencies collected while
+    /// tracing it are registered against whatever
+    /// `latest_bridge_invalidation_flag` answers, so without this they would
+    /// land on an earlier bridge's generation — or, when the token has none,
+    /// be dropped entirely — while the code that must stop running watches the
+    /// root.
+    ///
+    /// Pushing a flag already at the end is skipped so a loop that accepts
+    /// many regions does not grow the list without bound.
+    pub fn record_bridge_invalidation_flag(&self, flag: Arc<AtomicBool>) {
+        let mut flags = self.bridge_invalidation_flags.lock();
+        if flags.last().is_some_and(|last| Arc::ptr_eq(last, &flag)) {
+            return;
+        }
+        flags.push(flag);
+    }
+
     /// Return the root and all bridge-generation invalidation flags.
     pub fn all_invalidation_flags(&self) -> Vec<Arc<AtomicBool>> {
         let bridge_flags = self.bridge_invalidation_flags.lock();
@@ -3904,6 +3926,45 @@ mod tests {
             &token.latest_bridge_invalidation_flag().unwrap(),
             &bridge_flag
         ));
+    }
+
+    #[test]
+    fn a_recorded_root_flag_answers_as_the_latest_bridge_generation() {
+        let token = JitCellToken::new(42);
+        // Nothing compiled yet: the dependencies of a merged region would be
+        // dropped outright, because the registration site returns on `None`.
+        assert!(token.latest_bridge_invalidation_flag().is_none());
+
+        // A region merged into the owner's module runs from the owner's code,
+        // which reads the root flag, so that is the generation to report.
+        token.record_bridge_invalidation_flag(token.invalidation_flag());
+        assert!(Arc::ptr_eq(
+            &token.latest_bridge_invalidation_flag().unwrap(),
+            &token.invalidation_flag()
+        ));
+
+        // A second region on the same token reports the same flag without
+        // growing the list.
+        token.record_bridge_invalidation_flag(token.invalidation_flag());
+        assert_eq!(token.all_invalidation_flags().len(), 2);
+
+        // An out-of-line bridge after it still gets its own generation, and a
+        // region merged after that one reports the root again.
+        let bridge_flag = token.mint_bridge_invalidation_flag();
+        assert!(Arc::ptr_eq(
+            &token.latest_bridge_invalidation_flag().unwrap(),
+            &bridge_flag
+        ));
+        token.record_bridge_invalidation_flag(token.invalidation_flag());
+        assert!(Arc::ptr_eq(
+            &token.latest_bridge_invalidation_flag().unwrap(),
+            &token.invalidation_flag()
+        ));
+
+        // Invalidating the loop still reaches every recorded generation.
+        token.invalidate();
+        assert!(bridge_flag.load(std::sync::atomic::Ordering::Acquire));
+        assert!(token.is_invalidated());
     }
 
     #[test]

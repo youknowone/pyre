@@ -3425,6 +3425,16 @@ impl majit_backend::Backend for WasmBackend {
                             }
                             diag_bump(31);
                             diag_bump(32);
+                            // The region runs from the owner's module, so its
+                            // `GUARD_NOT_INVALIDATED` reads the owner's root
+                            // flag. Name that as this compile's generation, or
+                            // the quasi-immutable dependencies registered
+                            // afterwards attach to a flag the merged code never
+                            // loads and a mutated field leaves the fold in
+                            // place.
+                            original_token.record_bridge_invalidation_flag(
+                                original_token.invalidation_flag(),
+                            );
                             return Ok(AsmInfo {
                                 code_addr: 0,
                                 code_size: 0,
