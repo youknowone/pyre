@@ -2165,9 +2165,19 @@ impl<M: Clone> MetaInterp<M> {
         fn visit_pool(
             pool: Option<&Arc<majit_ir::SharedConstPool>>,
             generation: u64,
+            is_minor: bool,
             visitor: &mut dyn FnMut(&mut GcRef),
         ) {
             let Some(pool) = pool else { return };
+            // `compile.py:ResumeGuardDescr._attrs_` makes `rd_consts` an
+            // ordinary GC-traced field upstream.  Its write barrier puts the
+            // newly assigned list in MiniMark's remembered set for one minor;
+            // survivors are promoted directly to oldgen, so clean pools do
+            // not participate in later minor root walks.  Major marking still
+            // visits every pool below.
+            if is_minor && !pool.take_minor_scan_pending() {
+                return;
+            }
             // Each pool records the generation of the walk that last visited
             // it, so a pool reached twice in one walk is visited once without
             // a visit set.  The counter is process-global because
@@ -2190,12 +2200,15 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let generation = RD_CONSTS_WALK_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
+            == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
         for entry in self.compiled_loops.values_mut() {
             for trace in entry.traces.values_mut() {
                 for layout in trace.exit_layouts.values_mut() {
                     visit_pool(
                         layout.storage.as_ref().map(|storage| &storage.rd_consts),
                         generation,
+                        is_minor,
                         &mut visitor,
                     );
                     let descr_pool = layout
@@ -2203,12 +2216,13 @@ impl<M: Clone> MetaInterp<M> {
                         .as_ref()
                         .and_then(|descr| descr.as_fail_descr())
                         .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), generation, &mut visitor);
+                    visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
                 }
                 for layout in trace.terminal_exit_layouts.values_mut() {
                     visit_pool(
                         layout.storage.as_ref().map(|storage| &storage.rd_consts),
                         generation,
+                        is_minor,
                         &mut visitor,
                     );
                     let descr_pool = layout
@@ -2216,7 +2230,7 @@ impl<M: Clone> MetaInterp<M> {
                         .as_ref()
                         .and_then(|descr| descr.as_fail_descr())
                         .and_then(|fd| fd.rd_consts_arc());
-                    visit_pool(descr_pool.as_ref(), generation, &mut visitor);
+                    visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
                 }
             }
             for tt in entry.front_target_tokens.iter_mut() {

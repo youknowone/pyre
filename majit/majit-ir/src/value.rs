@@ -204,6 +204,12 @@ impl Eq for Const {}
 pub struct SharedConstPool {
     values: std::cell::UnsafeCell<Vec<Const>>,
     visited_generation: std::sync::atomic::AtomicU64,
+    /// `incminimark.py:old_objects_pointing_to_young` for this off-GC
+    /// equivalent of `ResumeGuardDescr.rd_consts`.  Upstream's list is a GC
+    /// object, so assigning the freshly built pool takes the normal write
+    /// barrier.  Our immutable `Arc` needs the same one-minor remembered bit:
+    /// after that walk, every nursery referent has been promoted to oldgen.
+    minor_scan_pending: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for SharedConstPool {}
@@ -214,7 +220,17 @@ impl SharedConstPool {
         std::sync::Arc::new(Self {
             values: std::cell::UnsafeCell::new(values),
             visited_generation: std::sync::atomic::AtomicU64::new(0),
+            minor_scan_pending: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// Consume the write-barrier state for a minor root walk.
+    ///
+    /// `SharedConstPool` is immutable after publication except for GC
+    /// forwarding, so no later store can create another old-to-young edge.
+    pub fn take_minor_scan_pending(&self) -> bool {
+        self.minor_scan_pending
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn mark_visited_generation(&self, generation: u64) -> bool {
@@ -1300,6 +1316,18 @@ impl<T: ?Sized> GreenAsI64 for &mut T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_const_pool_minor_scan_is_a_one_shot_write_barrier() {
+        let pool = SharedConstPool::new(vec![Const::Ref(GcRef(0x1234))]);
+        assert!(pool.take_minor_scan_pending());
+        assert!(!pool.take_minor_scan_pending());
+
+        // A replacement pool represents a new `rd_consts` assignment and
+        // therefore starts with its own remembered young-edge state.
+        let replacement = SharedConstPool::new(Vec::new());
+        assert!(replacement.take_minor_scan_pending());
+    }
 
     #[test]
     fn test_type_roundtrip() {
