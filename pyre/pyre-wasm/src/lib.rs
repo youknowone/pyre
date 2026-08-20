@@ -1179,11 +1179,14 @@ mod host_abi {
         majit_backend_wasm::reemit_enable();
     }
 
-    /// Arm loop-closing bridge inlining. This also arms module replacement,
-    /// because an accepted region is installed by rebuilding its owner.
+    /// Disable the default loop-closing bridge inlining. The host owns the
+    /// environment, so this call carries its explicit opt-out into the guest
+    /// before tracing begins. Inlining installs an accepted region by
+    /// rebuilding its owner, so leaving it on also leaves module replacement
+    /// reachable without `pyre_jit_reemit_enable`.
     #[unsafe(no_mangle)]
-    pub extern "C" fn pyre_jit_inline_bridge_enable() {
-        majit_backend_wasm::inline_bridge_enable();
+    pub extern "C" fn pyre_jit_inline_bridge_disable() {
+        majit_backend_wasm::inline_bridge_disable();
     }
 
     /// Disable the default guard-to-bridge parameter entries. The host owns

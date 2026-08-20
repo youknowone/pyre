@@ -196,7 +196,7 @@ fn classify_inline_install_error(error: &BackendError) {
 }
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
-static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(false);
+static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 static BRIDGE_PARAMS_ENABLED: AtomicBool = AtomicBool::new(true);
 static TRACE_ENTRY_CENSUS_FORCED: AtomicBool = AtomicBool::new(false);
 
@@ -304,9 +304,13 @@ fn reemit_enabled() -> bool {
     REEMIT_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Arm loop-closing bridge inlining from the host before guest execution starts.
-pub fn inline_bridge_enable() {
-    INLINE_BRIDGE_ENABLED.store(true, Ordering::Relaxed);
+/// Disable loop-closing bridge inlining from the host before guest execution
+/// starts. A bridge that closes back onto its owner's loop is merged into the
+/// owner's module by default, so the guard reaching it becomes a branch inside
+/// one module instead of a call out to another; this carries the host's
+/// explicit opt-out into the backend.
+pub fn inline_bridge_disable() {
+    INLINE_BRIDGE_ENABLED.store(false, Ordering::Relaxed);
 }
 
 fn inline_bridge_enabled() -> bool {
