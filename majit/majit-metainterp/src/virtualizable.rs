@@ -919,23 +919,6 @@ impl VirtualizableInfo {
     /// non-vable reds (e.g. `interp_jit.py:67 reds = ['frame', 'ec']`)
     /// should patch the field after construction — see
     /// `MetaInterp::current_virtualizable_optimizer_config`.
-    /// Whether array elements reach the loop JUMP through the tracer's live
-    /// `virtualizable_boxes` shadow (`collect_jump_args_with_boxes`,
-    /// pyjitpl.py:2982-2989) instead of being re-seeded from the trace-entry
-    /// input args by the optimizer's stopgap `VirtualizableTracker`.
-    ///
-    /// True for the macro state-field JIT: no static extra boxes and a green
-    /// ref kept ahead of the identity (so `identity_ref_bank_index` is set).
-    /// PyFrame (a heap-object virtualizable, `identity_ref_bank_index == None`)
-    /// returns false and keeps the legacy optimizer seeding. When true,
-    /// `to_optimizer_config` clears `track_array_elements` so the optimizer
-    /// does not double-count the array at the loop boundary. The discriminator
-    /// is structural — the banked-identity layout, not the field name — so it
-    /// holds for any state-field driver regardless of what it names its state.
-    pub fn elements_carried_via_shadow(&self) -> bool {
-        self.num_static_extra_boxes == 0 && self.identity_ref_bank_index.is_some()
-    }
-
     pub(crate) fn to_optimizer_config(
         &self,
     ) -> crate::optimizeopt::virtualize::VirtualizableConfig {
@@ -946,18 +929,6 @@ impl VirtualizableInfo {
             array_field_offsets: self.array_fields.iter().map(|a| a.field_offset).collect(),
             array_item_types: self.array_fields.iter().map(|a| a.item_type).collect(),
             array_field_descrs: self.array_field_descrs().to_vec(),
-            // Placeholder, like `vable_input_offset` below, and patched by the
-            // same caller. A length is not a property of the shape: upstream
-            // reads `len(lst)` off the live object every time it needs one
-            // (`virtualizable.py` `read_boxes`, `get_array_length`), and stores
-            // it nowhere. `MetaInterp::current_virtualizable_optimizer_config`
-            // fills this from `TraceCtx::virtualizable_array_lengths`, which
-            // both writers of `virtualizable_boxes` populate in the same
-            // statement. Leaving it empty while `array_field_offsets` is not
-            // makes `VirtualizableTracker::init`'s zip run zero times, so no
-            // element state is seeded and `tracked_array_element` can never
-            // hit — a debug assertion there names that state.
-            array_lengths: vec![],
             vable_input_offset: 0,
             // Same declaration the resume path reads
             // (`MetaInterp::identity_live_position`): the loop's inputargs are
@@ -965,8 +936,8 @@ impl VirtualizableInfo {
             // input-arg slot.
             //
             // `identity_live_index == None` is overloaded, so the layout
-            // decides what it means. `identity_ref_bank_index` is the same
-            // structural discriminator `elements_carried_via_shadow` uses:
+            // decides what it means. `identity_ref_bank_index` is the
+            // structural discriminator:
             //
             // - `None` — the legacy frame-first (PyFrame) layout, whose reds are
             //   `[frame, extra_reds.., vable_scalars.., array_items..]`. The
@@ -989,7 +960,6 @@ impl VirtualizableInfo {
                 None => Some(0),
                 Some(_) => self.identity_live_index,
             },
-            track_array_elements: !self.elements_carried_via_shadow(),
         }
     }
 
@@ -2458,7 +2428,6 @@ mod tests {
         );
         assert_eq!(config.array_field_offsets, vec![48, 56]);
         assert_eq!(config.array_item_types, vec![Type::Ref, Type::Int]);
-        assert!(config.array_lengths.is_empty());
     }
 
     /// `identity_live_index == None` means two different things, and the layout

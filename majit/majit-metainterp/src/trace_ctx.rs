@@ -3041,6 +3041,24 @@ impl TraceCtx {
     /// That null is a pyre-upstream parity gap, not a shadow bug — the
     /// shadow faithfully reflects the caller's Box.
     pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) {
+        // The precondition above, checked rather than only stated.  A
+        // `Value::Int` in a Ref slot is not a wrong number — it is a pointer
+        // the shadow will hand to `value_as_ref_bits`, which decodes it as 0,
+        // so a later `BC_GETARRAYITEM_VABLE_R` reads NULL out of a slot that
+        // holds a live object.  `Value::Void` is the absence of a live
+        // concrete and is legal in every slot; a slot whose type is not
+        // declared (no `virtualizable_info`, or an index past the layout)
+        // yields `None` and is left to the range assert below.
+        debug_assert!(
+            matches!(value, Value::Void)
+                || self
+                    .virtualizable_slot_type(index)
+                    .is_none_or(|declared| declared == value.get_type()),
+            "set_virtualizable_entry_at: slot {index} is declared {:?} but the caller wrote a \
+             {:?}; a mismatched Ref slot decodes to NULL through `value_as_ref_bits`",
+            self.virtualizable_slot_type(index),
+            value.get_type(),
+        );
         let (boxes_opt, values_opt) = (
             &mut self.virtualizable_boxes,
             &mut self.virtualizable_values,

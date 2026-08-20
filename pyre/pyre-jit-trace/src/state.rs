@@ -11556,6 +11556,16 @@ impl JitState for PyreJitState {
         //   live_arg_boxes += self.virtualizable_boxes
         //   live_arg_boxes.pop()
         //
+        // Not reached in production, and the reason matters to anyone
+        // reading this as PyFrame's close: this hook is called from the
+        // metainterp's `TraceAction::CloseLoop` arm, and nothing under
+        // `pyre/` ever produces that action — the portal closes through
+        // `CloseLoopWithArgs`, whose args the tracer builds itself in
+        // `jitcode_dispatch::append_virtualizable_boxes`. That function
+        // splices the same shadow by the same formula, so the two agree;
+        // this one exists so the metainterp arm is also correct for PyFrame
+        // rather than falling back to the register mirror.
+        //
         // PyFrame's reds are [frame, ec].  The TraceCtx shadow is the
         // authoritative `virtualizable_boxes` list in upstream order
         // [static fields..., locals_cells_stack_w..., frame], with the

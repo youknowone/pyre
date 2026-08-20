@@ -46,13 +46,6 @@ pub(crate) struct VirtualizableConfig {
     /// Same role as `static_field_descrs`, but for the array-pointer
     /// fields on the virtualizable object.
     pub array_field_descrs: Vec<DescrRef>,
-    /// Trace-entry lengths of array fields, parallel to `array_field_offsets`.
-    ///
-    /// Standard virtualizable traces carry array elements in the input box
-    /// layout; the optimizer needs the concrete lengths to map those input
-    /// args back into VirtualizableFieldState without falling back to raw
-    /// heap reads.
-    pub array_lengths: Vec<usize>,
     /// Number of input slots between `OpRef::input_arg_ref(0)` (frame) and the first vable
     /// scalar slot. Equals `JitDriverStaticData::num_reds() - 1` after the
     /// frame is excluded — typically `NUM_EXTRA_REDS` from the
@@ -99,24 +92,6 @@ pub(crate) struct VirtualizableConfig {
     /// before it consults this field at all, so a tracker is still installed
     /// there with this set to `None`.
     pub identity_input_index: Option<usize>,
-    /// Whether the tracker seeds array-element state from the trace-entry
-    /// input args (`init`'s array loop).
-    ///
-    /// `true` (PyFrame and the optimizer unit tests) keeps the legacy
-    /// stopgap behavior: array elements are mapped from input args into
-    /// `VirtualizableFieldState.arrays`, and the loop boundary expands the
-    /// virtualizable back into those element slots.
-    ///
-    /// `false` (the macro state-field JIT) suppresses that seeding. The
-    /// state-field tracer carries `[int; virt]` elements through the live
-    /// `virtualizable_boxes` shadow and splices the symbolically-updated
-    /// boxes straight into the loop JUMP (`collect_jump_args_with_boxes`,
-    /// pyjitpl.py:2982-2989). Re-seeding from the trace-entry input args
-    /// would thread stale loop-entry boxes alongside the fresh shadow boxes,
-    /// double-counting the array at the loop boundary. The identity
-    /// `PtrInfo::Virtualizable` is still installed (so the base is not
-    /// forced); only the per-element seeding is skipped.
-    pub track_array_elements: bool,
 }
 
 /// JitVirtualRef field slot indices.
@@ -130,20 +105,31 @@ pub(crate) const VREF_FORCED_FIELD_INDEX: u32 = 1;
 /// Size descriptor index for the JitVirtualRef struct.
 const VREF_SIZE_DESCR_INDEX: u32 = 0x7F10;
 
-/// TODO: Virtualizable field tracking in the optimizer.
+/// TODO: Virtualizable field tracking in the optimizer — pyre-only, being
+/// retired.
 ///
 /// RPython does NOT track virtualizable field values in the optimizer.
 /// Field tracking happens during tracing (`pyjitpl.py:virtualizable_boxes`),
 /// not in the optimization pipeline. The optimizer only removes
 /// `COND_CALL(OS_JIT_FORCE_VIRTUALIZABLE)` when the target is virtual.
 ///
-/// Pyre's tracing model carries virtualizable fields as trace input args
-/// (`OpRef::input_arg_ref`), and the optimizer maps them via
-/// `VirtualizableFieldState`. This exists because pyre doesn't yet have
-/// RPython's `virtualizable_boxes` model in the metainterp.
+/// The tracing layer now has that model — `TraceCtx::virtualizable_boxes` is
+/// the live shadow, and both loop-close arms carry it into the JUMP — so the
+/// array-element half of this tracker is gone: `init` no longer seeds element
+/// state from the trace-entry input args, because the standard-path read
+/// answers from the shadow and records no op for a fold to match.
 ///
-/// If pyre's tracing layer grows RPython's `virtualizable_boxes` model, this
-/// optimizer-side tracker should no longer be needed.
+/// What is still here, and what retiring the rest costs:
+///
+/// - the identity `PtrInfo::Virtualizable` install. Not a deviation to
+///   remove — it is what keeps the base from being forced, which is the one
+///   virtualizable job upstream's optimizer does have.
+/// - the STATIC field map (`VirtualizableFieldState.fields`), still seeded
+///   from input args. Retiring it needs the same argument the array half
+///   got: that no recorded op reads a static vable field on the standard
+///   path. That has not been established.
+/// - `is_standard_ref` / `mirror_setarrayitem` / `invalidate_array`, which
+///   exist to keep the static map honest and follow it.
 pub(crate) struct VirtualizableTracker {
     config: VirtualizableConfig,
     needs_setup: bool,
@@ -308,76 +294,19 @@ impl VirtualizableTracker {
                 flat_input_idx += 1;
             }
 
-            // The state-field JIT carries array elements through the live
-            // `virtualizable_boxes` shadow into the loop JUMP, so seeding element
-            // state from the trace-entry input args here would double-count them
-            // at the loop boundary. Skip the per-element loop in that mode; the
-            // empty `PtrInfo::Virtualizable` installed below still keeps the
-            // identity base from being forced.
-            // The zip below is silent about a config that declares array
-            // fields but carries no lengths: it runs zero times, leaves
-            // `state.arrays` empty, and every later `tracked_array_element`
-            // misses. `to_optimizer_config` builds exactly that state and
-            // relies on its caller to patch the lengths in, so name the
-            // unpatched config here rather than letting it read as "this
-            // trace had no array elements".
-            // The zip below pairs `array_field_offsets` with `array_lengths`,
-            // so a short `array_lengths` does not fail — it silently drops the
-            // tail, seeding some arrays and leaving the rest untracked.  An
-            // empty vector is only the loudest case of that, so require the
-            // whole invariant rather than non-emptiness.
-            debug_assert!(
-                !self.config.track_array_elements
-                    || self.config.array_lengths.len() == self.config.array_field_offsets.len(),
-                "array-tracking config reached the optimizer with {} array_lengths for {} \
-                 array fields; the zip below would pair only {} of them and leave the rest \
-                 unseeded, so `tracked_array_element` can never hit for those — see \
-                 MetaInterp::current_virtualizable_optimizer_config",
-                self.config.array_lengths.len(),
-                self.config.array_field_offsets.len(),
-                self.config
-                    .array_lengths
-                    .len()
-                    .min(self.config.array_field_offsets.len()),
-            );
-            if self.config.track_array_elements {
-                for (array_idx, (&_offset, &length)) in self
-                    .config
-                    .array_field_offsets
-                    .iter()
-                    .zip(self.config.array_lengths.iter())
-                    .enumerate()
-                {
-                    let descr_for_slot = self.config.array_field_descrs.get(array_idx).cloned();
-                    let field_idx = descr_for_slot
-                        .as_ref()
-                        .and_then(|d| d.as_field_descr())
-                        .map(|fd| fd.index_in_parent() as u32)
-                        .unwrap_or((1 + num_static + array_idx) as u32);
-                    if let Some(descr) = descr_for_slot {
-                        set_field_descr(&mut state.field_descrs, field_idx, descr);
-                    }
-
-                    let mut elements = Vec::with_capacity(length);
-                    for _ in 0..length {
-                        if flat_input_idx >= ctx.num_inputs() {
-                            break;
-                        }
-                        let slot_tp = ctx
-                            .inputarg_type_at(flat_input_idx)
-                            .unwrap_or(majit_ir::Type::Ref);
-                        elements.push(OpRef::input_arg_typed(flat_input_idx as u32, slot_tp));
-                        flat_input_idx += 1;
-                    }
-                    if !elements.is_empty() {
-                        let elements: Vec<Operand> = elements
-                            .into_iter()
-                            .map(|r| ctx.materialize_operand_at(r))
-                            .collect();
-                        state.arrays.push((array_idx as u32, elements));
-                    }
-                }
-            }
+            // Array elements are deliberately not seeded. Every layout carries
+            // them into the loop JUMP through the tracer's live
+            // `virtualizable_boxes` shadow — the macro state-field JIT via
+            // `JitState::collect_jump_args_with_boxes`, PyFrame via
+            // `jitcode_dispatch::append_virtualizable_boxes` — and the tracer
+            // updates that shadow through `set_virtualizable_entry_at` without
+            // recording an op, so a seeded entry box is invisible to
+            // `mirror_setarrayitem` and goes stale. The standard-path read
+            // records no op either (`TraceCtx::vable_getarrayitem_*_checked`
+            // answers from the shadow, pyjitpl.py:1170-1184), so there is
+            // nothing for a seeded element to fold against in the first place.
+            // Measured before removal: check.py dynasm 434/434 with zero
+            // jit-stats counters moved.
         }
 
         let b = ctx.materialize_operand_at(identity_ref);
@@ -3521,10 +3450,8 @@ mod tests {
                 array_field_offsets: vec![8],
                 array_item_types: vec![Type::Ref],
                 array_field_descrs: vec![],
-                array_lengths: vec![1],
                 vable_input_offset: 0,
                 identity_input_index: Some(0),
-                track_array_elements: true,
             },
         )));
         let forced = opt.force_box(OpRef::input_arg_ref(0), &mut ctx);
@@ -3553,10 +3480,8 @@ mod tests {
             array_field_offsets: vec![8],
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
-            array_lengths: vec![1],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         pass.setup();
 
@@ -3654,10 +3579,8 @@ mod tests {
             array_field_offsets: vec![],
             array_item_types: vec![],
             array_field_descrs: vec![],
-            array_lengths: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         pass.setup();
 
@@ -3704,10 +3627,8 @@ mod tests {
             array_field_offsets: vec![],
             array_item_types: vec![],
             array_field_descrs: vec![],
-            array_lengths: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         pass.setup();
 
@@ -3736,10 +3657,8 @@ mod tests {
             array_field_offsets: vec![],
             array_item_types: vec![],
             array_field_descrs: vec![],
-            array_lengths: vec![],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         pass.setup();
 
@@ -3756,43 +3675,13 @@ mod tests {
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
-    /// A config that declares an array field but no length is the state
-    /// `to_optimizer_config` hands out before its caller patches the lengths
-    /// in. It has to be built by hand — no production path produces it,
-    /// because both writers of `TraceCtx::virtualizable_boxes` set the
-    /// lengths in the same statement — and the seeding loop would otherwise
-    /// absorb it silently, leaving every `tracked_array_element` a miss that
-    /// reads as "this trace had no array elements".
+    /// A config that declares an array field carries no lengths at all now:
+    /// the element seeding that needed them is gone, so the shape that used
+    /// to trip the length assertion is just an ordinary config. It still has
+    /// to install the identity `PtrInfo::Virtualizable`, which is the only
+    /// thing `ensure_setup` still owes a virtualizable with arrays.
     #[test]
-    #[should_panic(expected = "array_lengths for")]
-    fn array_tracking_config_without_lengths_is_named_not_absorbed() {
-        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
-        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
-            static_field_offsets: vec![],
-            static_field_types: vec![],
-            static_field_descrs: vec![],
-            array_field_offsets: vec![48],
-            array_item_types: vec![Type::Ref],
-            array_field_descrs: vec![],
-            array_lengths: vec![],
-            vable_input_offset: 0,
-            identity_input_index: Some(0),
-            track_array_elements: true,
-        });
-        pass.setup();
-        if let Some(ref mut vt) = pass.vable {
-            vt.ensure_setup(&mut ctx);
-        }
-    }
-
-    /// A length vector shorter than the field list is the case a
-    /// non-emptiness check cannot see: `zip` pairs what it can and drops the
-    /// rest, so the first array is seeded, the second is not, and
-    /// `tracked_array_element` misses for it exactly as if no config had
-    /// arrived at all.
-    #[test]
-    #[should_panic(expected = "array_lengths for")]
-    fn a_partial_array_lengths_vector_is_named_not_truncated() {
+    fn an_array_declaring_config_needs_no_lengths_and_still_installs_the_identity() {
         let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
@@ -3801,45 +3690,20 @@ mod tests {
             array_field_offsets: vec![48, 56],
             array_item_types: vec![Type::Ref, Type::Ref],
             array_field_descrs: vec![],
-            array_lengths: vec![4],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         pass.setup();
         if let Some(ref mut vt) = pass.vable {
             vt.ensure_setup(&mut ctx);
         }
-    }
-
-    /// The same shape with `track_array_elements` off is the state-field
-    /// macro JIT's, which carries elements through the live
-    /// `virtualizable_boxes` shadow instead; and a config with no array field
-    /// at all has nothing to seed. Neither is the unpatched config, so
-    /// neither may trip the assertion above.
-    #[test]
-    fn a_shadow_carried_or_arrayless_config_without_lengths_is_accepted() {
-        for (array_field_offsets, array_item_types, track_array_elements) in
-            [(vec![48], vec![Type::Ref], false), (vec![], vec![], true)]
-        {
-            let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
-            let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
-                static_field_offsets: vec![],
-                static_field_types: vec![],
-                static_field_descrs: vec![],
-                array_field_offsets,
-                array_item_types,
-                array_field_descrs: vec![],
-                array_lengths: vec![],
-                vable_input_offset: 0,
-                identity_input_index: Some(0),
-                track_array_elements,
-            });
-            pass.setup();
-            if let Some(ref mut vt) = pass.vable {
-                vt.ensure_setup(&mut ctx);
-            }
-        }
+        let identity = ctx
+            .get_box_replacement_operand_opt(OpRef::input_arg_ref(0))
+            .expect("the identity inputarg must materialize");
+        assert!(
+            ctx.is_virtualizable(&identity),
+            "ensure_setup must still mark the identity virtualizable so the base is not forced",
+        );
     }
 
     #[test]
@@ -3901,10 +3765,8 @@ mod tests {
             array_field_offsets: vec![24],
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
-            array_lengths: vec![1],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         pass.setup();
 
@@ -3948,10 +3810,8 @@ mod tests {
             array_field_offsets: vec![24],
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
-            array_lengths: vec![1],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         pass.setup();
 
@@ -4000,10 +3860,8 @@ mod tests {
             array_field_offsets: vec![8],
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
-            array_lengths: vec![1],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         pass.setup();
 
@@ -4109,10 +3967,8 @@ mod tests {
             array_field_offsets: vec![8],
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
-            array_lengths: vec![1],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         pass.setup();
 
@@ -4224,10 +4080,8 @@ mod tests {
             array_field_offsets: vec![24],
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
-            array_lengths: vec![1],
             vable_input_offset: 0,
             identity_input_index: Some(0),
-            track_array_elements: true,
         });
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
         let mut ops = vec![

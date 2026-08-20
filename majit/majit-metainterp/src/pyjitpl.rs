@@ -4338,7 +4338,6 @@ impl<M: Clone> MetaInterp<M> {
             }
             self.virtualizable_info().map(|info| {
                 let mut config = info.to_optimizer_config();
-                config.array_lengths = ctx.virtualizable_array_lengths().unwrap_or(&[]).to_vec();
                 // virtualizable.py:90 read_boxes input layout = [frame,
                 // extra_reds..., vable_scalars..., array_items...]. The
                 // canonical source of `vable_input_offset` is the active
@@ -24743,7 +24742,6 @@ mod tests {
             config.array_item_types,
             info.to_optimizer_config().array_item_types
         );
-        assert_eq!(config.array_lengths, vec![2]);
     }
 
     // ── JitIface hook/callback parity tests (rpython/jit/metainterp/test/test_jitiface.py) ──
