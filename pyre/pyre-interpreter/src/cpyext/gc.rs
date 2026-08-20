@@ -33,8 +33,36 @@ type TrackedSet =
 static TRACKED: super::ForkMutex<TrackedSet> =
     super::ForkMutex::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
+/// The blocks whose `tp_finalize` has already run.
+///
+/// A collected type's finalizer runs at most once over the object's life, and
+/// nothing in the block records that: `ob_pyre_link` is the interpreter
+/// object and the header carries no spare bit here, so the answer is kept
+/// beside the tracked set. An entry is cleared where the block is released
+/// rather than in `dealloc`, which runs before `tp_dealloc` -- that is the
+/// moment a second deallocation still has to read it -- and clearing at
+/// release is also what keeps a recycled address from inheriting a stale one.
+static FINALIZED: super::ForkMutex<TrackedSet> =
+    super::ForkMutex::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
+
 pub(super) unsafe fn after_fork_child() {
     unsafe { TRACKED.reinit_after_fork() };
+    unsafe { FINALIZED.reinit_after_fork() };
+}
+
+/// Whether `tp_finalize` has already run for the block at `raw`.
+pub(super) fn is_finalized(raw: usize) -> bool {
+    FINALIZED.lock().contains(&raw)
+}
+
+/// Record that `tp_finalize` has run for the block at `raw`.
+pub(super) fn mark_finalized(raw: usize) {
+    FINALIZED.lock().insert(raw);
+}
+
+/// Drop the finalized flag for a block that is being released.
+pub(super) fn forget_finalized(raw: usize) {
+    FINALIZED.lock().remove(&raw);
 }
 
 /// `true` when `tp` declares the cyclic-collection protocol.

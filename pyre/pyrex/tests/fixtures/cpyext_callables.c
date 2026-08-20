@@ -160,6 +160,43 @@ static PyObject *report_unraisable_msg(PyObject *self, PyObject *unused)
     Py_RETURN_NONE;
 }
 
+/* No message at all, which is what a NULL format states. */
+static PyObject *report_unraisable_null(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    PyErr_SetString(PyExc_ValueError, "boom");
+    PyErr_FormatUnraisable(NULL);
+    Py_RETURN_NONE;
+}
+
+/* A format the engine refuses.  What gets reported is the caller's exception,
+   not the one building the message raised. */
+static PyObject *report_unraisable_bad_format(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    PyErr_SetString(PyExc_ValueError, "boom");
+    PyErr_FormatUnraisable("undecodable \xff");
+    Py_RETURN_NONE;
+}
+
+/* The defining class a callable carries, which is none for a module-level
+   function: `PyCFunction_GET_CLASS` answers NULL without an error for one. */
+static PyObject *defining_class(PyObject *self, PyObject *arg)
+{
+    PyTypeObject *owner;
+    (void)self;
+    owner = PyCFunction_GET_CLASS(arg);
+    if (owner == NULL) {
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+        Py_RETURN_NONE;
+    }
+    return Py_NewRef((PyObject *)owner);
+}
+
 /* The version the extension is running against, and the interpreter it is in. */
 static PyObject *runtime_identity(PyObject *self, PyObject *unused)
 {
@@ -189,6 +226,9 @@ static PyMethodDef methods[] = {
     {"call_with_dict", call_with_dict, METH_VARARGS, NULL},
     {"report_unraisable", report_unraisable, METH_O, NULL},
     {"report_unraisable_msg", report_unraisable_msg, METH_NOARGS, NULL},
+    {"report_unraisable_null", report_unraisable_null, METH_NOARGS, NULL},
+    {"report_unraisable_bad_format", report_unraisable_bad_format, METH_NOARGS, NULL},
+    {"defining_class", defining_class, METH_O, NULL},
     {"runtime_identity", runtime_identity, METH_NOARGS, NULL},
     {"is_traceback", is_traceback, METH_O, NULL},
     {NULL, NULL, 0, NULL}};

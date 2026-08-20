@@ -376,6 +376,7 @@ type_mirrors! {
     // `PyCFunction_Check` answers no for it; `methodobject`'s
     // `pycfunction_type` says why that is the safe half of the gap.
     PyCFunction_Type => super::methodobject::pycfunction_type(),
+    PyCMethod_Type => super::methodobject::pycmethod_type(),
     PyClassMethodDescr_Type => builtin_type(&crate::function::CLASSMETHOD_DESCRIPTOR_TYPE),
     PyClassMethod_Type => builtin_type(&pyre_object::function::CLASSMETHOD_TYPE),
     PyFunction_Type => builtin_type(&crate::function::FUNCTION_TYPE),
@@ -626,7 +627,10 @@ fn descriptor_type(
     init: fn(PyObjectRef),
 ) -> PyObjectRef {
     *cell.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type(name, init);
+        let tp = crate::typedef::make_builtin_type(name, |ns| {
+            init(ns);
+            super::methodobject::install_attribute_fence(ns);
+        });
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         tp as usize
     }) as PyObjectRef

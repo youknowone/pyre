@@ -255,6 +255,8 @@ PyAPI_FUNC(PyCFunction) PyCFunction_GetFunction(PyObject *);
 PyAPI_FUNC(PyObject *) PyCFunction_GetSelf(PyObject *);
 PyAPI_FUNC(PyObject *) PyCFunction_New(PyMethodDef *, PyObject *);
 PyAPI_FUNC(PyObject *) PyCFunction_NewEx(PyMethodDef *, PyObject *, PyObject *);
+PyAPI_FUNC(PyTypeObject *) PyCMethod_GetClass(PyObject *);
+PyAPI_FUNC(PyObject *) PyCMethod_New(PyMethodDef *, PyObject *, PyObject *, PyTypeObject *);
 
 /* cpyext/modsupport.rs */
 PyAPI_FUNC(PyObject *) PyModuleDef_Init(PyModuleDef *);
@@ -325,6 +327,7 @@ PyAPI_FUNC(PyObject *) PyObject_ASCII(PyObject *);
 PyAPI_FUNC(int) PyObject_AsFileDescriptor(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_Bytes(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_Call(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(void) PyObject_CallFinalizer(PyObject *);
 PyAPI_FUNC(int) PyObject_CallFinalizerFromDealloc(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_CallNoArgs(PyObject *);
 PyAPI_FUNC(PyObject *) PyObject_CallObject(PyObject *, PyObject *);

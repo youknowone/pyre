@@ -24,6 +24,7 @@ pub const METH_CLASS: c_int = 0x0010;
 pub const METH_STATIC: c_int = 0x0020;
 pub const METH_COEXIST: c_int = 0x0040;
 pub const METH_FASTCALL: c_int = 0x0080;
+pub const METH_METHOD: c_int = 0x0200;
 
 /// One row of a `PyMethodDef` table.
 #[repr(C)]
@@ -42,6 +43,30 @@ const NAME_KEY: &str = "__name__";
 const QUALNAME_KEY: &str = "__qualname__";
 const DOC_KEY: &str = "__doc__";
 const MODULE_KEY: &str = "__module__";
+/// The defining class a `METH_METHOD` row is handed beside its receiver.
+const CLASS_KEY: &str = "__pyre_mm_class__";
+
+/// The carrier keys a store from Python must not reach.
+///
+/// Everything the carrier knows lives in its instance namespace, which is a
+/// mapping like any other; a store into one of these would retarget the
+/// receiver a C callable casts to its own struct, or name a different
+/// `PyMethodDef` row for it to call.  `__module__` is left writable, which is
+/// the one the reference type allows as well.
+/// The `tp_methods` / `tp_getset` / `tp_members` descriptor carriers in
+/// `typeobject` share this fence and these keys; `__pyre_def__` there holds a
+/// definition's address outright, so a store into it is the same hole in a
+/// straighter line.
+const RESERVED_KEYS: &[&str] = &[
+    ML_KEY,
+    SELF_KEY,
+    NAME_KEY,
+    QUALNAME_KEY,
+    DOC_KEY,
+    CLASS_KEY,
+    "__pyre_def__",
+    "__objclass__",
+];
 
 /// Every `PyMethodDef` row a carrier may name.
 ///
@@ -90,6 +115,75 @@ fn method_def_at(index: i64) -> Option<*mut CPyMethodDef> {
 }
 
 static PYCFUNCTION_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static PYCMETHOD_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+
+/// `__setattr__` / `__delattr__` for a carrier type.
+///
+/// `value` is `None` for the delete spelling.
+fn store_attribute(
+    carrier: PyObjectRef,
+    name: PyObjectRef,
+    value: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    if !unsafe { pyre_object::unicodeobject::is_str(name) } {
+        return Err(crate::PyError::type_error("attribute name must be string"));
+    }
+    let attribute = unsafe { pyre_object::w_str_get_wtf8(name) }.to_string();
+    if attribute != MODULE_KEY {
+        let type_name = unsafe { pyre_object::w_type_get_name((*carrier).w_class) };
+        let message = if RESERVED_KEYS.contains(&attribute.as_str()) {
+            format!("attribute '{attribute}' of '{type_name}' objects is not writable")
+        } else {
+            format!("'{type_name}' object has no attribute '{attribute}'")
+        };
+        return Err(crate::PyError::attribute_error(message));
+    }
+    let dict = crate::baseobjspace::getdict_native(carrier);
+    if !dict.is_null() {
+        match value {
+            Some(value) => unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(dict, MODULE_KEY, value)
+            },
+            None => {
+                unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(dict, MODULE_KEY) };
+            }
+        }
+    }
+    Ok(pyre_object::w_none())
+}
+
+fn descr_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 3 {
+        return Err(crate::PyError::type_error(
+            "__setattr__ requires name and value",
+        ));
+    }
+    store_attribute(args[0], args[1], Some(args[2]))
+}
+
+fn descr_delattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() < 2 {
+        return Err(crate::PyError::type_error("__delattr__ requires a name"));
+    }
+    store_attribute(args[0], args[1], None)
+}
+
+/// Install the stores every carrier type refuses, so nothing but
+/// `__module__` can be written into its namespace from Python.
+pub(super) fn install_attribute_fence(ns: PyObjectRef) {
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__setattr__",
+            crate::make_builtin_function_with_arity("__setattr__", descr_setattr, 3),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__delattr__",
+            crate::make_builtin_function_with_arity("__delattr__", descr_delattr, 2),
+        );
+    }
+}
 
 /// The carrier type, named as upstream names its typedef.
 ///
@@ -114,17 +208,48 @@ pub fn pycfunction_type() -> PyObjectRef {
                     crate::make_builtin_function_with_arity("__repr__", descr_repr, 1),
                 );
             };
+            install_attribute_fence(ns);
         });
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         tp as usize
     }) as PyObjectRef
 }
 
+/// `methodobject.py:264 W_PyCMethodObject` — the carrier a `METH_METHOD` row
+/// gets, which is everything `pycfunction_type` carries plus the class the
+/// definition was declared in.
+///
+/// This is what `PyCMethod_Type` names, and it derives from
+/// `PyCFunction_Type`, so `PyCFunction_Check` answers yes for one.
+pub fn pycmethod_type() -> PyObjectRef {
+    *PYCMETHOD_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_base(
+            "builtin_method",
+            |_ns| {},
+            pycfunction_type(),
+        );
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
+}
+
+/// Whether `carrier` is one of this module's own, rather than something that
+/// merely has the reserved keys in its namespace.
+fn is_carrier(carrier: PyObjectRef) -> bool {
+    !carrier.is_null()
+        && unsafe { crate::baseobjspace::issubtype_w((*carrier).w_class, pycfunction_type()) }
+}
+
 /// The `PyMethodDef` behind `object`, or NULL with a `SystemError` when
 /// nothing is.
+///
+/// The type is checked before the namespace is read: `space.interp_w(
+/// W_PyCFunctionObject, w_obj)` is what upstream's accessors open with, and
+/// without it any object carrying a plausible `__pyre_ml__` would hand a
+/// caller a C function pointer.
 fn checked_method_def(object: *mut CPyObject) -> Option<*mut CPyMethodDef> {
     let object = unsafe { pyobject::from_ref(object) };
-    let definition = (!object.is_null()).then(|| method_def(object)).flatten();
+    let definition = is_carrier(object).then(|| method_def(object)).flatten();
     if definition.is_none() {
         super::pyerrors::set_pending_error(crate::PyError::new(
             crate::PyErrorKind::SystemError,
@@ -191,15 +316,77 @@ pub unsafe extern "C" fn PyCFunction_NewEx(
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
-    super::object::realize_all([receiver, module]);
+    unsafe { PyCMethod_New(method, receiver, module, std::ptr::null_mut()) }
+}
+
+/// `methodobject.py:544 PyCMethod_New(ml, self, module, cls)` — the same,
+/// naming the class a `METH_METHOD` definition was declared in.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyCMethod_New(
+    method: *mut CPyMethodDef,
+    receiver: *mut CPyObject,
+    module: *mut CPyObject,
+    class: *mut super::typeobject::CPyTypeObject,
+) -> *mut CPyObject {
+    if method.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let flags = unsafe { (*method).ml_flags };
+    let message = match (flags & METH_METHOD != 0, class.is_null()) {
+        (true, true) => Some("attempting to create PyCMethod with a METH_METHOD flag but no class"),
+        (false, false) => {
+            Some("attempting to create PyCFunction with class but no METH_METHOD flag")
+        }
+        _ => None,
+    };
+    if let Some(message) = message {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            message,
+        ));
+        return std::ptr::null_mut();
+    }
+    let class = class as *mut CPyObject;
+    super::object::realize_all([receiver, module, class]);
     let receiver = unsafe { pyobject::from_ref(receiver) };
     let module = unsafe { pyobject::from_ref(module) };
+    let class = unsafe { pyobject::from_ref(class) };
+    if !class.is_null() && !unsafe { pyre_object::is_type(class) } {
+        super::pyerrors::set_pending_error(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "bad argument to PyCMethod_New",
+        ));
+        return std::ptr::null_mut();
+    }
     let module = if module.is_null() {
         pyre_object::w_none()
     } else {
         module
     };
-    super::object::result(new_pycfunction(method, receiver, module))
+    let class = (!class.is_null()).then_some(class);
+    super::object::result(new_pycfunction_in_class(method, receiver, module, class))
+}
+
+/// `methodobject.py:155 PyCMethod_GetClass(op)` — the class a `METH_METHOD`
+/// definition was declared in, borrowed, and NULL for one that is not.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyCMethod_GetClass(
+    object: *mut CPyObject,
+) -> *mut super::typeobject::CPyTypeObject {
+    let Some(definition) = checked_method_def(object) else {
+        return std::ptr::null_mut();
+    };
+    if unsafe { (*definition).ml_flags } & METH_METHOD == 0 {
+        return std::ptr::null_mut();
+    }
+    let carrier = unsafe { pyobject::from_ref(object) };
+    match carrier_get(carrier, CLASS_KEY) {
+        Some(class) => {
+            pyobject::borrow_from(object, class) as *mut super::typeobject::CPyTypeObject
+        }
+        None => std::ptr::null_mut(),
+    }
 }
 
 fn carrier_get(carrier: PyObjectRef, key: &str) -> Option<PyObjectRef> {
@@ -242,12 +429,31 @@ pub fn new_pycfunction(
     w_self: PyObjectRef,
     w_module: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    new_pycfunction_in_class(method, w_self, w_module, None)
+}
+
+/// [`new_pycfunction`] naming the class a `METH_METHOD` definition was
+/// declared in, whose carrier is `pycmethod_type` rather than
+/// `pycfunction_type`.
+pub fn new_pycfunction_in_class(
+    method: *mut CPyMethodDef,
+    w_self: PyObjectRef,
+    w_module: PyObjectRef,
+    w_class: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(w_self);
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(w_module);
-    let carrier = pyre_object::w_instance_new(pycfunction_type());
+    let class_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_class.unwrap_or_else(pyre_object::w_none));
+    let carrier_type = if w_class.is_some() {
+        pycmethod_type()
+    } else {
+        pycfunction_type()
+    };
+    let carrier = pyre_object::w_instance_new(carrier_type);
     let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(carrier);
 
@@ -289,6 +495,13 @@ pub fn new_pycfunction(
         ML_KEY,
         ml,
     );
+    if w_class.is_some() {
+        carrier_set(
+            pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+            CLASS_KEY,
+            pyre_object::gc_roots::shadow_stack_get(class_slot),
+        );
+    }
     Ok(pyre_object::gc_roots::shadow_stack_get(carrier_slot))
 }
 
@@ -328,8 +541,19 @@ fn descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "cpyext function carrier lost its method definition",
         ));
     };
-    let w_self = carrier_get(carrier, SELF_KEY).unwrap_or_else(pyre_object::w_none);
-    call_method_def(method, w_self, positional, kwargs)
+    let Some(w_self) = carrier_get(carrier, SELF_KEY) else {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "cpyext function carrier lost its receiver",
+        ));
+    };
+    call_method_def_in_class(
+        method,
+        w_self,
+        carrier_get(carrier, CLASS_KEY),
+        positional,
+        kwargs,
+    )
 }
 
 /// Validate one call against its `ml_flags` and hand it to the bridge.
@@ -339,6 +563,18 @@ fn descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 pub(super) fn call_method_def(
     method: *mut CPyMethodDef,
     w_self: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    call_method_def_in_class(method, w_self, None, positional, kwargs)
+}
+
+/// [`call_method_def`] naming the class the definition was declared in, which
+/// a `METH_METHOD` row is handed beside its receiver.
+pub(super) fn call_method_def_in_class(
+    method: *mut CPyMethodDef,
+    w_self: PyObjectRef,
+    defining_class: Option<PyObjectRef>,
     positional: &[PyObjectRef],
     kwargs: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -379,10 +615,33 @@ pub(super) fn call_method_def(
             "{name}() uses an unknown calling convention"
         )));
     }
-    super::call_cfunction(
+    // `METH_METHOD` widens the fastcall-with-keywords signature by one
+    // argument rather than naming a signature of its own, so it is the only
+    // combination it may appear in; in any other it would select a transmute
+    // whose arity the callee does not have.
+    if flags & METH_METHOD != 0
+        && flags & (METH_FASTCALL | METH_KEYWORDS) != (METH_FASTCALL | METH_KEYWORDS)
+    {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            format!("{name}() method: bad call flags"),
+        ));
+    }
+    let defining_class = match (flags & METH_METHOD != 0, defining_class) {
+        (false, _) => None,
+        (true, Some(class)) => Some(class),
+        (true, None) => {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                format!("{name}() method: no defining class"),
+            ));
+        }
+    };
+    super::call_cfunction_in_class(
         unsafe { (*method).ml_meth },
         flags,
         w_self,
+        defining_class,
         positional,
         &keywords,
     )

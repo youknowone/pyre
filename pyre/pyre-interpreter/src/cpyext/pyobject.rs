@@ -440,7 +440,11 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     // reference this block owns in its type is released at the end.
     let ob_type = unsafe { (*raw).ob_type };
     // object.c:77, the same thing as `rawrefcount.mark_deallocating()`: the
-    // link is dead but `tp_dealloc` may still ask for it.
+    // link is dead but `tp_dealloc` may still ask for it.  The link itself is
+    // kept, because a `tp_finalize` run from the deallocator may hand `self`
+    // out and leave the object alive; the marker is only in force for the
+    // duration of the deallocator.
+    let link = unsafe { (*raw).ob_pyre_link };
     majit_gc::gc_rawrefcount_mark_deallocating(deallocating_marker(), address);
     // Everything this layer holds on the mirror's behalf goes before
     // `tp_dealloc` can free the block out from under it.  A borrow it owns may
@@ -466,6 +470,17 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     } else {
         false
     };
+    // A count above zero here is a resurrection: `tp_finalize`, run from the
+    // deallocator through `PyObject_CallFinalizerFromDealloc`, handed `self`
+    // to something that kept it, and that deallocator answered by returning
+    // without freeing.  The block is live again, so it is neither freed nor
+    // left wearing the deallocating marker, and a collected type goes back
+    // into the tracked set the teardown above dropped it from.
+    if !returned && unsafe { (*raw).ob_refcnt } != 0 {
+        unsafe { (*raw).ob_pyre_link = link };
+        super::gc::track(raw);
+        return;
+    }
     if !returned {
         unsafe { free_block(raw) };
     }
@@ -551,6 +566,7 @@ pub(super) unsafe fn reallocate_raw(
 /// # Safety
 /// `raw` must be a block this module entered, and must not be used afterwards.
 pub(super) unsafe fn free_block(raw: *mut CPyObject) {
+    super::gc::forget_finalized(raw as usize);
     let Some(block) = BLOCK_SIZES.lock().remove(&(raw as usize)) else {
         return;
     };

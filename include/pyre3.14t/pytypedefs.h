@@ -17,6 +17,8 @@ typedef PyObject *(*PyCFunctionWithKeywords)(PyObject *, PyObject *, PyObject *)
 typedef PyObject *(*_PyCFunctionFast)(PyObject *, PyObject *const *, Py_ssize_t);
 typedef PyObject *(*_PyCFunctionFastWithKeywords)(PyObject *, PyObject *const *,
                                                   Py_ssize_t, PyObject *);
+typedef PyObject *(*PyCMethod)(PyObject *, PyTypeObject *, PyObject *const *,
+                               Py_ssize_t, PyObject *);
 typedef int (*visitproc)(PyObject *, void *);
 typedef int (*traverseproc)(PyObject *, visitproc, void *);
 typedef int (*inquiry)(PyObject *);

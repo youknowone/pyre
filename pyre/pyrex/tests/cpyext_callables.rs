@@ -103,20 +103,38 @@ sys.unraisablehook = reports.append
 try:
     m.report_unraisable(subject)
     m.report_unraisable_msg()
+    m.report_unraisable_null()
+    m.report_unraisable_bad_format()
 finally:
     sys.unraisablehook = previous
 
-eq('two reports', len(reports), 2)
+eq('four reports', len(reports), 4)
 eq('named object', reports[0].object is subject, True)
-eq('named exception', type(reports[0].exc_type), type)
+eq('named exception', reports[0].exc_type, ValueError)
 eq('named exception value', str(reports[0].exc_value), 'boom')
+# Naming an object states no message.
+eq('named report has no message', reports[0].err_msg, None)
 eq('stated message', reports[1].err_msg,
    'Exception ignored while doing the thing')
 eq('stated object', reports[1].object, None)
+eq('stated exception', reports[1].exc_type, ValueError)
+eq('stated exception value', str(reports[1].exc_value), 'boom')
+# A NULL format is the spelling for "no message"; the exception is still
+# reported, and building nothing cannot crash.
+eq('no message', reports[2].err_msg, None)
+eq('no message object', reports[2].object, None)
+eq('no message exception', str(reports[2].exc_value), 'boom')
+# A format the engine refuses must not become what gets reported.
+eq('refused format keeps the exception', reports[3].exc_type, ValueError)
+eq('refused format keeps the value', str(reports[3].exc_value), 'boom')
+eq('refused format states nothing', reports[3].err_msg, None)
 # Reporting clears the indicator, so nothing is pending afterwards.
 eq('nothing pending', m.probe('still working'), 'still working')
 
 # ── the runtime it is running against ──────────────────────────────────
+
+# A module-level function was declared with no class, so it carries none.
+eq('no defining class', m.defining_class(m.probe), None)
 
 version, interpreter = m.runtime_identity()
 eq('version', version, sys.hexversion)

@@ -59,6 +59,10 @@ typedef struct {
    `PyCFunction_GetFunction` would have nothing to hand back. */
 PyAPI_DATA(PyTypeObject) PyCFunction_Type;
 
+/* The `METH_METHOD` carrier, which holds the defining class beside everything
+   `PyCFunction_Type` holds and so derives from it. */
+PyAPI_DATA(PyTypeObject) PyCMethod_Type;
+
 #define PyCFunction_Check(op) PyObject_TypeCheck((op), &PyCFunction_Type)
 #define PyCFunction_CheckExact(op) Py_IS_TYPE((op), &PyCFunction_Type)
 #define PyCMethod_CheckExact(op) Py_IS_TYPE((op), &PyCMethod_Type)
@@ -67,7 +71,10 @@ PyAPI_DATA(PyTypeObject) PyCFunction_Type;
 #define PyCFunction_GET_FUNCTION(func) PyCFunction_GetFunction((PyObject *)(func))
 #define PyCFunction_GET_SELF(func) PyCFunction_GetSelf((PyObject *)(func))
 #define PyCFunction_GET_FLAGS(func) PyCFunction_GetFlags((PyObject *)(func))
-#define PyCFunction_GET_CLASS(func) PyCFunction_GetClass((PyObject *)(func))
+/* `PyCMethod_GetClass` is the name the entry point carries; the reference
+   header reaches the same answer by reading `mm_class` behind a `METH_METHOD`
+   test, which a mirror has no field to do. */
+#define PyCFunction_GET_CLASS(func) PyCMethod_GetClass((PyObject *)(func))
 
 #ifdef __cplusplus
 }

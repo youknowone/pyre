@@ -160,11 +160,21 @@ pub unsafe extern "C" fn PyGILState_GetThisThreadState() -> *mut CPyThreadState 
     }
 }
 
-/// `pystate.py:51 PyEval_InitThreads` — threads are always available, so
-/// upstream's `setup_threads` has nothing left to do here.
 /// `PyInterpreterState_Get()` — the interpreter the calling thread runs in.
+///
+/// There is no interpreter to answer with while this thread's state is not
+/// current, and no way to say so, so this ends the process where
+/// [`PyThreadState_Get`] does and for the same reason.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyInterpreterState_Get() -> *mut CPyInterpreterState {
+    if !STATE_IS_CURRENT.with(|current| current.get()) {
+        super::pyerrors::fatal_error(
+            Some("PyInterpreterState_Get"),
+            "the function must be called with the GIL held, after Python \
+             initialization and before Python finalization, but the GIL is \
+             released (the current Python thread state is NULL)",
+        );
+    }
     &INTERPRETER as *const CPyInterpreterState as *mut CPyInterpreterState
 }
 
@@ -179,6 +189,8 @@ pub unsafe extern "C" fn PyInterpreterState_GetID(interp: *mut CPyInterpreterSta
     0
 }
 
+/// `pystate.py:51 PyEval_InitThreads` — threads are always available, so
+/// upstream's `setup_threads` has nothing left to do here.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyEval_InitThreads() {}
 
@@ -198,6 +210,8 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyThreadState_Swap as *const ());
     std::hint::black_box(PyGILState_Check as *const ());
     std::hint::black_box(PyGILState_GetThisThreadState as *const ());
+    std::hint::black_box(PyInterpreterState_Get as *const ());
+    std::hint::black_box(PyInterpreterState_GetID as *const ());
     std::hint::black_box(PyEval_InitThreads as *const ());
     std::hint::black_box(PyEval_ThreadsInitialized as *const ());
 }

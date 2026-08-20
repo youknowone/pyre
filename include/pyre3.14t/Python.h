@@ -66,6 +66,7 @@
 #include "pycapsule.h"
 #include "code.h"
 #include "funcobject.h"
+#include "frameobject.h"
 #include "traceback.h"
 #include "import.h"
 #include "modsupport.h"

@@ -1002,11 +1002,11 @@ pub unsafe extern "C" fn PyObject_GC_IsTracked(_object: *mut CPyObject) -> c_int
     1
 }
 
-/// `PyObject_GC_IsFinalized(object)` — nothing runs `tp_finalize`, so nothing
-/// has been finalized (`object.py:501-504`).
+/// `PyObject_GC_IsFinalized(object)` — whether `tp_finalize` has already run
+/// for this object (`object.py:501-504`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn PyObject_GC_IsFinalized(_object: *mut CPyObject) -> c_int {
-    0
+pub unsafe extern "C" fn PyObject_GC_IsFinalized(object: *mut CPyObject) -> c_int {
+    (!object.is_null() && super::gc::is_finalized(object as usize)) as c_int
 }
 
 /// `PyObject_CallFinalizerFromDealloc(object)` — run the type's
@@ -1029,14 +1029,52 @@ pub unsafe extern "C" fn PyObject_CallFinalizerFromDealloc(object: *mut CPyObjec
     if finalize.is_null() {
         return 0;
     }
-    let finalize: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(finalize) };
     unsafe { (*object).ob_refcnt = 1 };
-    unsafe { finalize(object) };
-    if unsafe { (*object).ob_refcnt } > 1 {
-        return -1;
+    unsafe { PyObject_CallFinalizer(object) };
+    debug_assert!(
+        unsafe { (*object).ob_refcnt } > 0,
+        "a finalizer dropped the reference the caller was holding for it"
+    );
+    // Undo the temporary reference by hand rather than through `decref`,
+    // which at zero would re-enter the deallocator this is called from.
+    // Whatever is left above zero is something the finalizer handed `self`
+    // to, and the caller is told to leave the block alone.
+    unsafe { (*object).ob_refcnt -= 1 };
+    if unsafe { (*object).ob_refcnt } != 0 {
+        -1
+    } else {
+        0
     }
-    unsafe { (*object).ob_refcnt = 0 };
-    0
+}
+
+/// `object.py:501 PyObject_CallFinalizer(object)` — run the type's
+/// `tp_finalize`, once.
+///
+/// A collected type's finalizer runs at most once over the object's life: a
+/// deallocator chain reaches this from every level that defines one, and a
+/// second call would release the same resources twice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyObject_CallFinalizer(object: *mut CPyObject) {
+    if object.is_null() {
+        return;
+    }
+    let tp = unsafe { (*object).ob_type };
+    if tp.is_null() {
+        return;
+    }
+    let finalize = unsafe { (*tp).tp_finalize };
+    if finalize.is_null() {
+        return;
+    }
+    let collected = super::gc::has_gc(tp);
+    if collected && super::gc::is_finalized(object as usize) {
+        return;
+    }
+    let finalize: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(finalize) };
+    unsafe { finalize(object) };
+    if collected {
+        super::gc::mark_finalized(object as usize);
+    }
 }
 
 /// `PyObject_VisitManagedDict(object, visit, arg)` — nothing to visit.
@@ -1097,6 +1135,18 @@ unsafe fn PyTuple_from_vector(args: *const *mut CPyObject, count: usize) -> *mut
     }
     for index in 0..count {
         let item = unsafe { *args.add(index) };
+        // A NULL here would be stored as an empty slot -- `PyTuple_New` fills
+        // the block with those already, so nothing downstream would notice --
+        // and the hole reaches the interpreter as a value.  The vectorcall
+        // path refuses it, and this is the same vector.
+        if item.is_null() {
+            unsafe { pyobject::decref(tuple) };
+            super::pyerrors::set_pending_error(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                "vectorcall argument vector holds a NULL",
+            ));
+            return std::ptr::null_mut();
+        }
         unsafe { pyobject::incref(item) };
         if unsafe { super::tupleobject::PyTuple_SetItem(tuple, index as isize, item) } != 0 {
             unsafe { pyobject::decref(tuple) };

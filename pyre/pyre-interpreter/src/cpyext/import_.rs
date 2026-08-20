@@ -138,6 +138,15 @@ pub unsafe extern "C" fn PyImport_ImportModuleLevelObject(
     level: std::ffi::c_int,
 ) -> *mut CPyObject {
     super::object::realize_all([name, globals, locals, fromlist]);
+    // Answered before the conversion and before `level`, which is the order
+    // `import.c` asks in: a NULL name is the empty-name case rather than a
+    // bad internal call, and the message says so.
+    if name.is_null() {
+        super::pyerrors::set_pending_error(crate::PyError::value_error(
+            "Empty module name".to_owned(),
+        ));
+        return std::ptr::null_mut();
+    }
     let Some(name) = argument(name) else {
         return std::ptr::null_mut();
     };

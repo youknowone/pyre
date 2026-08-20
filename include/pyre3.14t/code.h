@@ -26,6 +26,23 @@ extern "C" {
 #define CO_HAS_DOCSTRING        0x4000000
 #define CO_METHOD               0x8000000
 
+/* The `__future__` bits and the monitoring opt-out share `co_flags` with the
+   set above but are not published by `inspect`: a compiler flag names them,
+   and an extension composing one for a compile call needs the value.  They
+   start at 0x20000 so that the `PyCF_` compiler flags can have the range
+   below them. */
+#define CO_FUTURE_DIVISION          0x20000
+#define CO_FUTURE_ABSOLUTE_IMPORT   0x40000
+#define CO_FUTURE_WITH_STATEMENT    0x80000
+#define CO_FUTURE_PRINT_FUNCTION    0x100000
+#define CO_FUTURE_UNICODE_LITERALS  0x200000
+#define CO_FUTURE_BARRY_AS_BDFL     0x400000
+#define CO_FUTURE_GENERATOR_STOP    0x800000
+#define CO_FUTURE_ANNOTATIONS       0x1000000
+#define CO_NO_MONITORING_EVENTS     0x2000000
+
+#define PyCode_Check(op) Py_IS_TYPE((op), &PyCode_Type)
+
 #ifdef __cplusplus
 }
 #endif

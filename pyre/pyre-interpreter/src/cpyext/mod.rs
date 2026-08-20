@@ -568,6 +568,20 @@ pub(super) fn call_cfunction(
     positional: &[PyObjectRef],
     keywords: &[(String, PyObjectRef)],
 ) -> Result<PyObjectRef, crate::PyError> {
+    call_cfunction_in_class(function, flags, w_self, None, positional, keywords)
+}
+
+/// [`call_cfunction`] naming the class a `METH_METHOD` definition was
+/// declared in, which its signature takes between the receiver and the
+/// arguments.
+pub(super) fn call_cfunction_in_class(
+    function: *const std::ffi::c_void,
+    flags: c_int,
+    w_self: PyObjectRef,
+    defining_class: Option<PyObjectRef>,
+    positional: &[PyObjectRef],
+    keywords: &[(String, PyObjectRef)],
+) -> Result<PyObjectRef, crate::PyError> {
     use methodobject::{METH_FASTCALL, METH_KEYWORDS, METH_NOARGS, METH_O};
 
     if function.is_null() {
@@ -630,8 +644,30 @@ pub(super) fn call_cfunction(
     }
 
     let receiver = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(base));
+    let class = match defining_class {
+        Some(class) => pyobject::make_ref(class),
+        None => std::ptr::null_mut(),
+    };
     let result = unsafe {
-        if fastcall && flags & METH_KEYWORDS != 0 {
+        if !class.is_null() {
+            // `METH_METHOD | METH_FASTCALL | METH_KEYWORDS`, the only
+            // combination the flag rides in: the fastcall-with-keywords
+            // signature widened by the defining class.
+            let call: unsafe extern "C" fn(
+                *mut CPyObject,
+                *mut CPyObject,
+                *const *mut CPyObject,
+                isize,
+                *mut CPyObject,
+            ) -> *mut CPyObject = std::mem::transmute(function);
+            call(
+                receiver,
+                class,
+                fastcall_slots.as_ptr(),
+                positional.len() as isize,
+                keywords_arg,
+            )
+        } else if fastcall && flags & METH_KEYWORDS != 0 {
             let call: unsafe extern "C" fn(
                 *mut CPyObject,
                 *const *mut CPyObject,
@@ -666,6 +702,7 @@ pub(super) fn call_cfunction(
     };
     unsafe {
         pyobject::decref(receiver);
+        pyobject::decref(class);
         pyobject::decref(arguments);
         pyobject::decref(keywords_arg);
         for slot in fastcall_slots {

@@ -1,7 +1,8 @@
 /* Frames.
  *
- * An extension includes this by name rather than through `Python.h`, which is
- * where the reference header set puts it too.
+ * One of the headers `Python.h` includes -- `PyFrame_Check` is reachable from
+ * `Python.h` alone in both reference header sets -- and an extension may also
+ * include it by name, which is the spelling most of them use.
  */
 #ifndef PYRE_FRAMEOBJECT_H
 #define PYRE_FRAMEOBJECT_H
