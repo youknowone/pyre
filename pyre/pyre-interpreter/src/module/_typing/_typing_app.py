@@ -44,7 +44,15 @@ def _immutable_type_error(cls, name):
 
 
 class _ImmutableTypeMeta(type):
-    """CPython's ``Py_TPFLAGS_IMMUTABLETYPE`` for app-level typing types."""
+    """``Py_TPFLAGS_IMMUTABLETYPE`` for app-level typing types.
+
+    The guard is the metaclass hook, so it answers ``setattr``/``delattr`` but
+    not an explicit ``type.__setattr__(TypeVar, ...)``, which reaches the base
+    implementation and still mutates the class.  Closing that would need an
+    immutability bit separate from heaptype, and ``W_TypeObject`` declares
+    ``flag_heaptype`` in ``_immutable_fields_`` unqualified -- a JIT hint
+    governs the value, so the split stays PyPy's to make.
+    """
 
     def __new__(mcls, name, bases, namespace):
         for base in bases:
@@ -70,6 +78,13 @@ class _Immutable:
     and TypeVarTuple, but does not expose it as ``__dict__``.  Their native
     struct members and getsets stay read-only while unrelated user attributes
     remain writable.  ``None`` means the instance has no user dictionary.
+
+    The readonly guard is ``__setattr__``/``__getattribute__``, so
+    ``object.__setattr__(t, '__name__', ...)`` and
+    ``object.__getattribute__(t, '__dict__')`` still reach the real instance
+    dict.  Native per-field storage would close both, but it moves the storage
+    owner and clears ``hasdict``, which ``W_TypeObject`` also declares in
+    ``_immutable_fields_``.
     """
 
     __slots__ = ()
