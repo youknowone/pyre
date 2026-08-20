@@ -946,6 +946,17 @@ impl VirtualizableInfo {
             array_field_offsets: self.array_fields.iter().map(|a| a.field_offset).collect(),
             array_item_types: self.array_fields.iter().map(|a| a.item_type).collect(),
             array_field_descrs: self.array_field_descrs().to_vec(),
+            // Placeholder, like `vable_input_offset` below, and patched by the
+            // same caller. A length is not a property of the shape: upstream
+            // reads `len(lst)` off the live object every time it needs one
+            // (`virtualizable.py` `read_boxes`, `get_array_length`), and stores
+            // it nowhere. `MetaInterp::current_virtualizable_optimizer_config`
+            // fills this from `TraceCtx::virtualizable_array_lengths`, which
+            // both writers of `virtualizable_boxes` populate in the same
+            // statement. Leaving it empty while `array_field_offsets` is not
+            // makes `VirtualizableTracker::init`'s zip run zero times, so no
+            // element state is seeded and `tracked_array_element` can never
+            // hit — a debug assertion there names that state.
             array_lengths: vec![],
             vable_input_offset: 0,
             // Same declaration the resume path reads

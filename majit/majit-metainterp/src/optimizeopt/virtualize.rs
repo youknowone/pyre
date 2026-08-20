@@ -314,6 +314,20 @@ impl VirtualizableTracker {
             // at the loop boundary. Skip the per-element loop in that mode; the
             // empty `PtrInfo::Virtualizable` installed below still keeps the
             // identity base from being forced.
+            // The zip below is silent about a config that declares array
+            // fields but carries no lengths: it runs zero times, leaves
+            // `state.arrays` empty, and every later `tracked_array_element`
+            // misses. `to_optimizer_config` builds exactly that state and
+            // relies on its caller to patch the lengths in, so name the
+            // unpatched config here rather than letting it read as "this
+            // trace had no array elements".
+            debug_assert!(
+                !self.config.track_array_elements
+                    || self.config.array_field_offsets.is_empty()
+                    || !self.config.array_lengths.is_empty(),
+                "array-tracking config reached the optimizer with unseeded array_lengths; \
+                 see MetaInterp::current_virtualizable_optimizer_config",
+            );
             if self.config.track_array_elements {
                 for (array_idx, (&_offset, &length)) in self
                     .config
@@ -3728,6 +3742,65 @@ mod tests {
 
         let result = pass.propagate_forward(&set, &std::rc::Rc::new(set.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
+    }
+
+    /// A config that declares an array field but no length is the state
+    /// `to_optimizer_config` hands out before its caller patches the lengths
+    /// in. It has to be built by hand — no production path produces it,
+    /// because both writers of `TraceCtx::virtualizable_boxes` set the
+    /// lengths in the same statement — and the seeding loop would otherwise
+    /// absorb it silently, leaving every `tracked_array_element` a miss that
+    /// reads as "this trace had no array elements".
+    #[test]
+    #[should_panic(expected = "unseeded array_lengths")]
+    fn array_tracking_config_without_lengths_is_named_not_absorbed() {
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![],
+            static_field_types: vec![],
+            static_field_descrs: vec![],
+            array_field_offsets: vec![48],
+            array_item_types: vec![Type::Ref],
+            array_field_descrs: vec![],
+            array_lengths: vec![],
+            vable_input_offset: 0,
+            identity_input_index: Some(0),
+            track_array_elements: true,
+        });
+        pass.setup();
+        if let Some(ref mut vt) = pass.vable {
+            vt.ensure_setup(&mut ctx);
+        }
+    }
+
+    /// The same shape with `track_array_elements` off is the state-field
+    /// macro JIT's, which carries elements through the live
+    /// `virtualizable_boxes` shadow instead; and a config with no array field
+    /// at all has nothing to seed. Neither is the unpatched config, so
+    /// neither may trip the assertion above.
+    #[test]
+    fn a_shadow_carried_or_arrayless_config_without_lengths_is_accepted() {
+        for (array_field_offsets, array_item_types, track_array_elements) in
+            [(vec![48], vec![Type::Ref], false), (vec![], vec![], true)]
+        {
+            let mut ctx = OptContext::with_inputarg_types(8, &[Type::Ref, Type::Int]);
+            let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+                static_field_offsets: vec![],
+                static_field_types: vec![],
+                static_field_descrs: vec![],
+                array_field_offsets,
+                array_item_types,
+                array_field_descrs: vec![],
+                array_lengths: vec![],
+                vable_input_offset: 0,
+                identity_input_index: Some(0),
+                track_array_elements,
+            });
+            pass.setup();
+            if let Some(ref mut vt) = pass.vable {
+                vt.ensure_setup(&mut ctx);
+            }
+        }
     }
 
     #[test]
