@@ -687,7 +687,7 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_code(&self, code: CodeObject<ConstantData>) -> Result<Rooted, wire::MarshalError> {
-        Ok(Rooted::new(crate::pycode::box_code_constant(&code)))
+        Ok(Rooted::new(crate::pycode::box_code_object(code)))
     }
 
     fn make_stop_iter(&self) -> Result<Rooted, wire::MarshalError> {
@@ -833,8 +833,8 @@ impl wire::MarshalBag for PyreMarshalBag {
         code: CodeObject<ConstantData>,
         constants: Vec<Rooted>,
     ) -> Result<Rooted, wire::MarshalError> {
-        let code = Rooted::new(crate::pycode::box_code_constant(&code));
-        // `box_code_constant` allocates, so read each constant out of its
+        let code = Rooted::new(crate::pycode::box_code_object(code));
+        // `box_code_object` allocates, so read each constant out of its
         // shadow-stack slot only now.  Only the slots the compiler
         // representation cannot reproduce are stored; the rest realize
         // lazily like a fresh compile's.

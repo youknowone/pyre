@@ -3876,8 +3876,8 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             ArrayFlag::Unsigned,
             false,
         ),
-        // The slot is written once, by `box_code_constant_with_firstlineno`,
-        // onto the object `box_code_constant` has just boxed out of a fresh
+        // The slot is written once, by `box_code_object_with_firstlineno`,
+        // onto the object `box_code_object` has just boxed out of a fresh
         // `Box` — no caching, so nothing can have read it first. `code.replace`
         // reads it and builds a new code object rather than writing this one.
         field(

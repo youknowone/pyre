@@ -610,7 +610,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         // to [`code_locations`] to rebuild on the first reader that wants it.
         // `first_line_number` is the value the array was decoded against here;
         // a `co_firstlineno_raw` stamp that cannot be spelled as `OneIndexed`
-        // corrects the record in `box_code_constant_with_firstlineno`.
+        // corrects the record in `box_code_object_with_firstlineno`.
         let firstlineno_raw = unsafe { &*(code_ptr as *const crate::CodeObject) }
             .first_line_number
             .map(|line| line.get() as i32)
@@ -749,25 +749,35 @@ pub unsafe fn w_code_yields_inside_try(w_code: PyObjectRef) -> bool {
     unsafe { (*(w_code as *const PyCode)).fast_natural_arity & YIELDS_INSIDE_TRY_BIT != 0 }
 }
 
-/// Box a cloned compiler code object into a heap Python code wrapper.
+/// Box a compiler code object the caller owns into a heap Python code wrapper.
 ///
 /// PyPy's compiler constructs `PyCode` directly (`pycode.py:115-126`) and
-/// therefore has no foreign compiler-object clone in the translated graph.
-/// Pyre's compiler-core `CodeObject` is a dependency ADT whose derived `Clone`
-/// recursively owns boxed slices and nested constants; it is solely the
-/// serialization/API seam used to reach the interpreter-level `PyCode`.
-/// Residualize that foreign seam so the translated graph retains PyPy's direct
-/// `PyCode` value shape instead of inventing an RPython layout for the opaque
-/// Rust clone. Keep clone, Box ownership transfer, and wrapper publication in
-/// the one boundary.
+/// therefore has no foreign compiler-object in the translated graph. Pyre's
+/// compiler-core `CodeObject` is a dependency ADT that recursively owns boxed
+/// slices and nested constants; it is solely the serialization/API seam used
+/// to reach the interpreter-level `PyCode`. Residualize that foreign seam so
+/// the translated graph retains PyPy's direct `PyCode` value shape instead of
+/// inventing an RPython layout for the opaque Rust value. Keep Box ownership
+/// transfer and wrapper publication in the one boundary.
+///
+/// The object is leaked on purpose: code wrappers are immortal and
+/// `pycode_destructor` never frees `code_ptr`.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
-/// `Box::into_raw`s a cloned `CodeObject` (unlifted raw allocation) before
-/// forwarding to the residualised `w_code_new`.
+/// `Box::into_raw`s a `CodeObject` (unlifted raw allocation) before forwarding
+/// to the residualised `w_code_new`.
+#[majit_macros::dont_look_inside]
+pub fn box_code_object(code: crate::CodeObject) -> PyObjectRef {
+    let code_ptr = Box::into_raw(Box::new(code)) as *const ();
+    w_code_new(code_ptr)
+}
+
+/// [`box_code_object`] for a caller that only has a borrow, which has to copy.
+/// A caller that owns its `CodeObject` should hand it over instead — the copy
+/// is a whole recursive duplicate of the constants graph.
 #[majit_macros::dont_look_inside]
 pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
-    let code_ptr = Box::into_raw(Box::new(code.clone())) as *const ();
-    w_code_new(code_ptr)
+    box_code_object(code.clone())
 }
 
 /// Publish a code wrapper over a `CodeObject` the caller keeps alive, rather
@@ -852,8 +862,8 @@ pub(crate) unsafe fn code_filename_bytes(w_code: PyObjectRef) -> Vec<u8> {
     }
 }
 
-fn box_code_constant_with_firstlineno(code: &crate::CodeObject, firstlineno: i32) -> PyObjectRef {
-    let obj = box_code_constant(code);
+fn box_code_object_with_firstlineno(code: crate::CodeObject, firstlineno: i32) -> PyObjectRef {
+    let obj = box_code_object(code);
     unsafe {
         (*(obj as *mut PyCode)).co_firstlineno_raw = firstlineno;
     }
@@ -1256,8 +1266,8 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         linetable,
         exceptiontable,
     };
-    let result = box_code_constant_with_firstlineno(
-        &code,
+    let result = box_code_object_with_firstlineno(
+        code,
         first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
     );
     unsafe { set_filename_bytes(result, filename_bytes) };
@@ -1765,7 +1775,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         code.instructions.len(),
     );
 
-    let result = box_code_constant_with_firstlineno(&code, firstlineno_raw);
+    let result = box_code_object_with_firstlineno(code, firstlineno_raw);
     unsafe { set_filename_bytes(result, filename_bytes) };
     unsafe {
         (*(result as *mut PyCode)).filename_inherits_to_nested = filename_inherits_to_nested;
