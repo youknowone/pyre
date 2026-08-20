@@ -312,6 +312,106 @@ impl CallGraph {
     }
 }
 
+/// Several artefacts' call graphs, joined on fully qualified name.
+///
+/// A charon artefact carries only what rustc monomorphised into that crate, so
+/// `pyre-jit.ullbc` holds the portal and the blackhole and almost none of the
+/// interpreter they call into: its own closure comes out at 1%, and a scan over
+/// it reports nothing because nothing in it reaches a seed — not because the
+/// crate is clean.  Upstream never meets this: RPython analyses one translated
+/// program, and `collect_analyzer` closes over the whole call graph at once.
+/// So the artefacts are joined back into one graph here.
+///
+/// The join key is `item_meta.name_path()`.  Two artefacts that both carry a
+/// body for the same name contribute the union of its edges; two genuinely
+/// different functions sharing a spelling would be merged into one node.  Both
+/// can only *widen* `reaching`, which is the safe direction for this question —
+/// `framework.py` errs towards bracketing an operation that cannot collect,
+/// never towards leaving one bare.
+pub struct Joined {
+    /// The joined graph, over canonical ids: one per distinct name.
+    ///
+    /// `opaque` is left empty.  An opaque *count* is per-artefact accounting,
+    /// and summing two of them double-counts every body both artefacts carry;
+    /// `indirect` is joined, because that one is a per-function fact.
+    pub graph: CallGraph,
+    canonical: HashMap<String, u64>,
+    /// Names carried by more than one of the joined artefacts, or by one of
+    /// them more than once.  Reported rather than assumed away: this is the
+    /// count that says how much the join merged.
+    pub shared_names: usize,
+}
+
+impl Joined {
+    pub fn build(parts: &[&CallGraph]) -> Self {
+        let mut canonical: HashMap<String, u64> = HashMap::new();
+        let mut names: HashMap<u64, String> = HashMap::new();
+        let mut shared_names = 0usize;
+        for part in parts {
+            // Sorted, so the canonical numbering does not depend on hash order
+            // and two runs over the same inputs print the same ids.
+            let mut sorted: Vec<&String> = part.names.values().collect();
+            sorted.sort_unstable();
+            for n in sorted {
+                if canonical.contains_key(n) {
+                    shared_names += 1;
+                    continue;
+                }
+                let id = canonical.len() as u64;
+                canonical.insert(n.clone(), id);
+                names.insert(id, n.clone());
+            }
+        }
+        let mut callees: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut callers: HashMap<u64, HashSet<u64>> = HashMap::new();
+        let mut indirect: HashSet<u64> = HashSet::new();
+        for part in parts {
+            let canon = |id: &u64| part.names.get(id).and_then(|n| canonical.get(n)).copied();
+            for (caller, cs) in &part.callees {
+                let Some(from) = canon(caller) else { continue };
+                let entry = callees.entry(from).or_default();
+                for callee in cs {
+                    if let Some(to) = canon(callee) {
+                        entry.insert(to);
+                    }
+                }
+            }
+            for id in &part.indirect {
+                if let Some(c) = canon(id) {
+                    indirect.insert(c);
+                }
+            }
+        }
+        for (&caller, cs) in &callees {
+            for &c in cs {
+                callers.entry(c).or_default().insert(caller);
+            }
+        }
+        Self {
+            graph: CallGraph {
+                names,
+                callees,
+                callers,
+                indirect,
+                opaque: OpaqueCensus::default(),
+            },
+            canonical,
+            shared_names,
+        }
+    }
+
+    /// Project a set of joined ids back onto one artefact's local ids, so the
+    /// liveness scan — which walks that artefact's bodies — can be asked the
+    /// whole-program question.
+    pub fn project(&self, cg: &CallGraph, joined: &HashSet<u64>) -> HashSet<u64> {
+        cg.names
+            .iter()
+            .filter(|(_, n)| self.canonical.get(*n).is_some_and(|c| joined.contains(c)))
+            .map(|(&id, _)| id)
+            .collect()
+    }
+}
+
 /// Where each function-pointer call gets its callee from, counted by source.
 ///
 /// A count of unresolved calls says how much is opaque; this says *what* is

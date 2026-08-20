@@ -13,6 +13,37 @@ fn main() {
         eprintln!("usage: gc-root-reachability <file.ullbc>...");
         std::process::exit(2);
     }
+    // Artefacts whose call graph is joined in but whose bodies are not scanned.
+    // One artefact is not one program: `pyre-jit.ullbc` carries the portal and
+    // the blackhole but hardly any of the interpreter they hand control to, so
+    // asked alone it answers that nothing reaches a collection.  Naming
+    // `pyre-interpreter.ullbc` here is what makes that answer mean anything.
+    // Donors are loaded once and their `Llbc` dropped: only the graph is kept,
+    // because holding two multi-hundred-megabyte artefacts open at once is what
+    // the memory goes to.
+    let donors: Vec<String> = std::env::var("GC_JOIN_WITH")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let donor_graphs: Vec<(String, framework::CallGraph)> = donors
+        .iter()
+        .map(|path| {
+            let llbc = match majit_charon_reader::Llbc::load(path) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("{path}: {e:?}");
+                    std::process::exit(1);
+                }
+            };
+            (path.clone(), framework::build(&llbc))
+        })
+        .collect();
+
     for path in &args {
         let llbc = match majit_charon_reader::Llbc::load(path) {
             Ok(l) => l,
@@ -47,12 +78,37 @@ fn main() {
             shown.join(" "),
             if per_crate.len() > 6 { " …" } else { "" }
         );
+        // Every question below — the seeds, the closure, the opaque taint — is
+        // asked of the joined graph and the answer projected back onto this
+        // artefact's ids, because the liveness scan walks *these* bodies.  With
+        // no donors the join is a renumbering of `cg` and nothing changes.
+        let mut parts: Vec<&framework::CallGraph> = vec![&cg];
+        parts.extend(donor_graphs.iter().map(|(_, g)| g));
+        let joined = framework::Joined::build(&parts);
+        for (donor, g) in &donor_graphs {
+            println!(
+                "   joined with          : {} ({} fun_decls)",
+                donor,
+                g.names.len()
+            );
+        }
+        if !donor_graphs.is_empty() {
+            println!(
+                "   joined graph          : {} distinct names; {} name(s) carried by more than one artefact",
+                joined.graph.names.len(),
+                joined.shared_names
+            );
+        }
         // A seed that matches nothing empties half the closure silently, and
         // the name table is the only place to see why.  Substring, not the
         // anchored form the seeds use, so a near-miss spelling still shows up.
         if let Ok(pat) = std::env::var("GC_NAME_GREP") {
-            let mut hits: Vec<&String> =
-                cg.names.values().filter(|n| n.contains(&pat)).collect();
+            let mut hits: Vec<&String> = joined
+                .graph
+                .names
+                .values()
+                .filter(|n| n.contains(&pat))
+                .collect();
             hits.sort();
             println!("   names containing {pat:?}: {}", hits.len());
             for n in hits.iter().take(60) {
@@ -63,18 +119,19 @@ fn main() {
         // adjudication of an opaque finding turns on, and a reachability bit
         // is worthless without the chain behind it.
         if let Ok(pat) = std::env::var("GC_PATH_FROM") {
-            let (py0, _) = cg.seeds_for(PYTHON_DISPATCH_SEEDS_REF);
-            let (col0, _) = cg.seeds_for(framework::COLLECTING_SEEDS);
+            let (py0, _) = joined.graph.seeds_for(PYTHON_DISPATCH_SEEDS_REF);
+            let (col0, _) = joined.graph.seeds_for(framework::COLLECTING_SEEDS);
             let mut sd = py0;
             sd.extend(col0);
-            let mut hits: Vec<(&u64, &String)> = cg
+            let mut hits: Vec<(&u64, &String)> = joined
+                .graph
                 .names
                 .iter()
                 .filter(|(_, n)| n.contains(&pat))
                 .collect();
             hits.sort_by_key(|(_, n)| n.as_str());
             for (id, n) in hits.iter().take(20) {
-                match cg.path_to(**id, &sd) {
+                match joined.graph.path_to(**id, &sd) {
                     Some(chain) => println!("   {n}\n       REACHES: {}", chain.join(" -> ")),
                     None => println!("   {n}\n       reaches no seed"),
                 }
@@ -82,17 +139,24 @@ fn main() {
         }
         println!(
             "   python-dispatch seeds : {}",
-            cg.seed_report(framework::PYTHON_DISPATCH_SEEDS)
+            joined.graph.seed_report(framework::PYTHON_DISPATCH_SEEDS)
         );
         println!(
             "   collecting-alloc seeds: {}",
-            cg.seed_report(framework::COLLECTING_SEEDS)
+            joined.graph.seed_report(framework::COLLECTING_SEEDS)
         );
+        let (jpy, _) = joined.graph.seeds_for(framework::PYTHON_DISPATCH_SEEDS);
+        let (jcol, _) = joined.graph.seeds_for(framework::COLLECTING_SEEDS);
+        let mut joined_seeds = jpy;
+        joined_seeds.extend(jcol);
+        let reach = joined.project(&cg, &joined.graph.reaching(&joined_seeds));
+        // The seeds as *this* artefact spells them.  The tiering below compares
+        // a finding's `callee_id`, which is an id in this artefact, so it needs
+        // the local set; the closure above needs the joined one.
         let (py, _) = cg.seeds_for(framework::PYTHON_DISPATCH_SEEDS);
         let (col, _) = cg.seeds_for(framework::COLLECTING_SEEDS);
         let mut seeds = py;
         seeds.extend(col);
-        let reach = cg.reaching(&seeds);
         println!(
             "   can reach a collection: {} / {} ({}%)",
             reach.len(),
@@ -103,6 +167,15 @@ fn main() {
                 reach.len() * 100 / total
             }
         );
+        // What the join bought, so a run without donors is never mistaken for
+        // the whole-program answer this one is.
+        if !donor_graphs.is_empty() {
+            let alone = cg.reaching(&seeds).len();
+            println!(
+                "       without the join  : {alone} / {total} — the join admits {} more",
+                reach.len().saturating_sub(alone)
+            );
+        }
         println!(
             "   unresolved-callee fns : {} (call through fn-ptr / dyn / unresolved trait)",
             cg.indirect.len()
@@ -135,7 +208,7 @@ fn main() {
         // dispatches through a `global_hook!` function pointer makes every one
         // of its callers undecidable too, not just itself.  Without this the
         // "cannot reach a collection" bucket silently absorbs them.
-        let opaque = cg.reaching(&cg.indirect);
+        let opaque = joined.project(&cg, &joined.graph.reaching(&joined.graph.indirect));
         let (mut justified, mut undecidable, mut unjustified) = (0usize, 0usize, Vec::new());
         for id in &bracketed {
             if reach.contains(id) {
@@ -237,8 +310,7 @@ fn main() {
         // folded in and report both, rather than let the difference go unsaid.
         let mut conservative = reach.clone();
         conservative.extend(opaque.iter().copied());
-        let (found_conservative, stats_conservative) =
-            liveness::scan(
+        let (found_conservative, stats_conservative) = liveness::scan(
             &llbc,
             &cg,
             &conservative,
@@ -352,15 +424,19 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         for name in non_arg_fns.iter().take(show) {
-            let v = &by_fn[**name];
-            let f = v.iter().find(|f| !f.live_non_arg.is_empty()).unwrap();
-            println!(
-                "           {}:{}  across {}  live: {:?}",
-                name,
-                f.line,
-                f.callee_name.rsplit("::").next().unwrap_or(""),
-                f.live_non_arg
-            );
+            // Every such call in the body, not the first one found.  A single
+            // row per function hides a second unrooted use further down the
+            // same body — and that is precisely the one a repair pass, working
+            // from this list, then leaves behind.
+            for f in by_fn[**name].iter().filter(|f| !f.live_non_arg.is_empty()) {
+                println!(
+                    "           {}:{}  across {}  live: {:?}",
+                    name,
+                    f.line,
+                    f.callee_name.rsplit("::").next().unwrap_or(""),
+                    f.live_non_arg
+                );
+            }
         }
 
         // The same question asked of the running frame.  A `PyObjectRef` has a
@@ -421,8 +497,10 @@ fn main() {
             // scan finds — a body whose dispatch this reader cannot follow —
             // are adjudicated as the weaker claim they are rather than read
             // beside the others.
-            let resolved: std::collections::HashSet<(u64, u64, u64)> =
-                frames.iter().map(|f| (f.func, f.line, f.callee_id)).collect();
+            let resolved: std::collections::HashSet<(u64, u64, u64)> = frames
+                .iter()
+                .map(|f| (f.func, f.line, f.callee_id))
+                .collect();
             for f in &frames_conservative {
                 if !filter.is_empty() && !f.func_name.contains(&filter) {
                     continue;
