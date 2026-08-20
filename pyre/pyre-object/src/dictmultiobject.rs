@@ -5191,6 +5191,18 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
 /// halves are `IndexMap`s, so this reads that entry rather than building the
 /// whole list. Only the one name is wrapped.
 ///
+/// `celldict.py:188-192 getiterkeys`/`getitervalues` are lazy iterators
+/// upstream; the cursor stands in for them here because the GC-object layout
+/// cannot hold a live iterator ([`DictStrategy::nth_item`]).  Serving that
+/// cursor from the default `nth_item` — `self.items(w_dict).into_iter()
+/// .nth(index)` — makes the stand-in quadratic: [`w_module_dict_items_inner`]
+/// wraps EVERY name with [`crate::w_str_new`], so an `n`-entry dict costs `n`
+/// wraps per step.  Those strings are also the immortal flavour (`w_str_new`
+/// allocates through `malloc_raw`), so nothing reclaims them: measured, a
+/// 350-name module dict walked ten times grew peak RSS by 156.8 MB where
+/// CPython grew none, and removing it took 10.3 MB off interpreter startup —
+/// `dir(module)` inside `importlib._bootstrap` pays this walk.
+///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
 pub unsafe fn w_module_dict_nth_item_inner(
@@ -5212,7 +5224,9 @@ pub unsafe fn w_module_dict_nth_item_inner(
     Some((roots.get(key_slot), value))
 }
 
-/// [`w_module_dict_nth_item_inner`]'s value half, which wraps no name.
+/// [`w_module_dict_nth_item_inner`]'s value half, which wraps no name —
+/// `dictmultiobject.py:1095-1098` reads the typed storage value without
+/// wrapping its key, and here that skips the whole allocation.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
