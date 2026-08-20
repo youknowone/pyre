@@ -7,6 +7,28 @@ fn op_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     unsafe { Ok(range_bigint_to_obj(range_obj_to_bigint(indexed))) }
 }
 
+/// `index` as it is installed in the module namespace, arity check included.
+///
+/// Registered through `interpleveldefs` rather than the `functions:` shorthand
+/// because that shorthand wraps the body in an anonymous per-expansion closure:
+/// the pointer the `BuiltinCode` then carries has no name any caller can write
+/// down, and [`is_operator_index_function`] needs one to pin.
+fn op_index_entry(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::gateway::check_declared_positional_arity("index", 1, args)?;
+    op_index(args)
+}
+
+/// True iff `callable` is the canonical `_operator.index` function object.
+///
+/// `space_index` answers an `int` (or `long`) by returning the argument
+/// itself, before any `__index__` lookup, so that call runs no user code and
+/// writes nothing.  The JIT's replay-safety classification uses this identity
+/// plus an observed int argument to say so; a rebound `operator.index` is a
+/// different object and keeps the conservative treatment.
+pub fn is_operator_index_function(callable: PyObjectRef) -> bool {
+    crate::builtins::is_builtin_code_function(callable, op_index_entry)
+}
+
 /// Shared body for the binary-arithmetic thunks (`add`/`sub`/`mul`).  The
 /// operand error propagates, matching the `truediv`/`floordiv` thunks.
 fn op_binary<F>(args: &[PyObjectRef], f: F) -> Result<PyObjectRef, crate::PyError>
@@ -160,13 +182,20 @@ crate::py_module! {
     // likewise delegates to `space.sequence_index` (`interp_operator.py`);
     // `concat` (`op_concat`, `interp_operator.py`) guards both operands for
     // `__getitem__`.
+    interpleveldefs: {
+        // Named registration, so the installed `BuiltinCode` carries a pointer
+        // `is_operator_index_function` can compare against.  Same shape as the
+        // `functions:` entries otherwise: declared arity 1, own arity check.
+        "index" => crate::gateway::make_module_builtin_function_with_arity(
+            "index", op_index_entry, 1,
+        ),
+    },
     appleveldefs: {
         "app_operator.py" => [
             "itemgetter", "attrgetter", "methodcaller",
         ],
     },
     functions: {
-        "index"    / 1 = op_index,
         "add"      / 2 = |args| op_binary(args, add),
         "sub"      / 2 = |args| op_binary(args, sub),
         "mul"      / 2 = |args| op_binary(args, mul),

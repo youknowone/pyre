@@ -4462,7 +4462,7 @@ pub fn is_builtin_dir_function(callable: PyObjectRef) -> bool {
 /// Shared identity test behind the `is_builtin_*_function` predicates: the
 /// callable is a function whose code is the builtin-code wrapper around
 /// `expected`.
-fn is_builtin_code_function(
+pub(crate) fn is_builtin_code_function(
     callable: PyObjectRef,
     expected: crate::gateway::BuiltinCodeFn,
 ) -> bool {
