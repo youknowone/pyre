@@ -5866,6 +5866,19 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // compiles nor aborts this session again.
                 TraceAction::CompileTrace
             }
+            crate::jitcode_dispatch::DispatchOutcome::SegmentTrace {
+                is_loop,
+                exception_box,
+            } => {
+                // pyjitpl.py:1639-1668: the walk cut itself at a merge point
+                // and recorded the always-failing guard; the compile half is
+                // the driver's, in the arm upstream branches to.
+                if is_loop {
+                    TraceAction::SegmentedLoop
+                } else {
+                    TraceAction::SegmentedBridge { exception_box }
+                }
+            }
             other => {
                 crate::jitcode_dispatch::census_record("Outcome::Other");
                 if crate::jitcode_dispatch::fbw_debug_abort_enabled() {

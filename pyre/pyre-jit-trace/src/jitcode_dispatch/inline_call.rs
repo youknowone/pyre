@@ -2953,7 +2953,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         ))),
         DispatchOutcome::CloseLoop { .. }
         | DispatchOutcome::CompileTracePending { .. }
-        | DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+        | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
+        | DispatchOutcome::SegmentTrace { .. } => {
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
         DispatchOutcome::Continue => {
@@ -7953,6 +7954,12 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             // breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
+        DispatchOutcome::SegmentTrace { .. } => {
+            // The segmenting cut is gated on `is_top_level` for the same
+            // reason as the compile_trace attempt above: its compile half
+            // lives in the driver, which a callee body has no route to.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
         DispatchOutcome::Continue => {
             unreachable!(
                 "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
@@ -8150,6 +8157,12 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             // breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
+        DispatchOutcome::SegmentTrace { .. } => {
+            // The segmenting cut is gated on `is_top_level` for the same
+            // reason as the compile_trace attempt above: its compile half
+            // lives in the driver, which a callee body has no route to.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
         DispatchOutcome::Continue => {
             unreachable!(
                 "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
@@ -8326,6 +8339,12 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
             // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
             // jitcode-op path. Fail loud (safe decline) if that invariant ever
             // breaks.
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
+        DispatchOutcome::SegmentTrace { .. } => {
+            // The segmenting cut is gated on `is_top_level` for the same
+            // reason as the compile_trace attempt above: its compile half
+            // lives in the driver, which a callee body has no route to.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
         DispatchOutcome::Continue => {

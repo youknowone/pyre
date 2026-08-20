@@ -3035,13 +3035,16 @@ impl<S: JitState> JitDriver<S> {
             // pyjitpl.py:1617-1620 places the `force_finish_trace` segmenting
             // check INSIDE the tracing loop, in `MIFrame.debug_merge_point`, so
             // a JC_FORCE_FINISH key segments before the 1.0x too-long check can
-            // abort it.  Pyre's counterpart lives at the same place — the
-            // walker's `BC_JIT_MERGE_POINT` handler
-            // (`pyjitpl/dispatch.rs::create_segmented_trace`) — and reaches this
-            // driver as `TraceAction::SegmentedLoop`.  A check here instead
-            // would be unreachable: the walk returns `Continue` only once its
-            // framestack drains, and an over-budget walk returns `Abort` from
-            // inside its own loop.
+            // abort it.  Pyre's counterpart lives at the same place, in the
+            // production tracer's `jit_merge_point` arm
+            // (`jitcode_dispatch/mod.rs`, whose `create_segmented_trace` the
+            // walk returns `DispatchOutcome::SegmentTrace` from); `trace.rs`
+            // maps it onto the `TraceAction::SegmentedLoop` /
+            // `SegmentedBridge` arm below.  `pyjitpl/dispatch.rs` carries a
+            // second copy on `MIFrame::run_one_step`, which production tracing
+            // does not go through.  A check here instead would be unreachable:
+            // the walk returns `Continue` only once its framestack drains, and
+            // an over-budget walk returns `Abort` from inside its own loop.
 
             // Phase 2: handle trace result with full access to self
             match action {

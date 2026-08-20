@@ -1965,6 +1965,83 @@ pub enum DispatchOutcome {
         token: std::sync::Arc<majit_backend::JitCellToken>,
         target_pc: usize,
     },
+    /// `jit_merge_point` was crossed by a trace that already carries
+    /// `force_finish_trace` and has passed 0.8x the trace limit
+    /// (`pyjitpl.py:1617-1620`, the tail of `MIFrame.debug_merge_point`).
+    /// The trace is close enough to the limit that aborting it would waste
+    /// the whole recording, so it is terminated here instead: the walker has
+    /// already recorded a `GUARD_ALWAYS_FAILS` at this merge point, which
+    /// takes every execution back to the interpreter.
+    ///
+    /// The compile half needs the `MetaInterp` the walker does not hold, so
+    /// it runs in the driver, in one of the two arms upstream branches to at
+    /// `pyjitpl.py:1639`: `is_loop` selects
+    /// [`majit_metainterp::TraceAction::SegmentedLoop`] (`compile_simple_loop`
+    /// plus `attach_procedure_to_interp`) over
+    /// [`majit_metainterp::TraceAction::SegmentedBridge`] (`compile_trace`
+    /// with the resumekey). `exception_box` is the operand of the unreachable
+    /// FINISH behind the guard; the loop arm's FINISH is already recorded, the
+    /// bridge arm's is built by `compile_finish_from_active_session`.
+    SegmentTrace { is_loop: bool, exception_box: OpRef },
+}
+
+/// `pyjitpl.py:1622-1673 _create_segmented_trace_and_blackhole`.
+///
+/// The trace is close enough to `trace_limit` that aborting it would waste the
+/// whole recording, so it is terminated here instead: an always-failing guard
+/// takes every execution back to the interpreter, and the FINISH behind it
+/// exists only to give the segment a terminator.
+///
+/// `mp_opcode_pc` is the merge-point op's jitcode pc (the guard's resume
+/// coordinate); `mp_green_pc` is the Python pc it names.
+fn create_segmented_trace<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    mp_opcode_pc: usize,
+    mp_green_pc: usize,
+) -> Result<DispatchOutcome, DispatchError> {
+    // pyjitpl.py:1626 `generate_guard(rop.GUARD_ALWAYS_FAILS)`. The resume
+    // position is the merge-point op, whose preceding `-live-` marker names the
+    // boxes the blackhole resumes with.
+    ctx.trace_ctx.record_guard(OpCode::GuardAlwaysFails, &[], 0);
+    walker_capture_snapshot_for_last_guard(ctx, mp_opcode_pc)?;
+    // pyjitpl.py:1633-1636 `exception_box = ConstInt(ptr2int(
+    // llexception.typeptr))` — the AssertionError type pointer the unreachable
+    // FINISH escapes with. The op sits behind a guard that always fails, so the
+    // placeholder `ConstInt(0)` stands in for a value nothing reads. Both arms
+    // below take this same box, as upstream does.
+    let exception_box = ctx.trace_ctx.const_int(0);
+    // pyjitpl.py:1639-1640 `if (metainterp.current_merge_points and
+    // isinstance(metainterp.resumekey, compile.ResumeFromInterpDescr)):` — a
+    // trace that owns a merge point and entered from the interpreter becomes a
+    // segmented loop; anything else (a guard-origin bridge) takes the else-arm.
+    let is_loop = ctx
+        .trace_ctx
+        .current_merge_points_first_greenkey()
+        .is_some()
+        && ctx.trace_ctx.resumekey_original_loop_token().is_none();
+    // pyjitpl.py:1637 `history.record1(rop.FINISH, exception_box, None,
+    // descr=token)`. The loop arm keeps it here; the bridge arm leaves it to
+    // `compile_finish_from_active_session`, the port of pyjitpl.py:1666
+    // `compile_trace(metainterp, resumekey, [exception_box])`, which records the
+    // same FINISH carrying `exit_frame_with_exception_descr_ref`. Recording it
+    // here as well would give that trace two terminators.
+    if is_loop {
+        ctx.trace_ctx.record_finish(exception_box, Type::Int);
+    }
+    // pyjitpl.py:1671-1673: "we now need to blackhole back to the interpreter
+    // instead of jumping to some existing code, because we are at a really
+    // arbitrary place here." Under single-pass tracing the walk already RAN
+    // everything it recorded, so the interpreter must resume at this merge
+    // point's own green pc rather than at the one it was left holding —
+    // the same handoff the abort path publishes. Without it the walked
+    // iterations are executed a second time.
+    ctx.trace_ctx.walk_final_pc = Some(mp_green_pc);
+    ctx.trace_ctx.walk_final_reds = Vec::new();
+    // pyjitpl.py:1673 `raise SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`.
+    Ok(DispatchOutcome::SegmentTrace {
+        is_loop,
+        exception_box,
+    })
 }
 
 impl PartialEq for DispatchOutcome {
@@ -2015,6 +2092,16 @@ impl PartialEq for DispatchOutcome {
                     && a_back_edge_pc == b_back_edge_pc
                     && a_back_edge_marker == b_back_edge_marker
             }
+            (
+                Self::SegmentTrace {
+                    is_loop: a_is_loop,
+                    exception_box: a_exc,
+                },
+                Self::SegmentTrace {
+                    is_loop: b_is_loop,
+                    exception_box: b_exc,
+                },
+            ) => a_is_loop == b_is_loop && a_exc == b_exc,
             (
                 Self::CompileTracePending {
                     loop_header_pc: a_pc,
@@ -3256,6 +3343,17 @@ pub fn walk<Sym: WalkSym>(
         // helper — so re-measure it rather than inheriting the numbers.
         // `helper_descent_defers_the_limit_check_to_the_enclosing_frame` pins
         // both halves.
+        // pyjitpl.py:1617-1620 raises out of `debug_merge_point`, i.e. from
+        // INSIDE the step, so `blackhole_if_trace_too_long` (pyjitpl.py:2812)
+        // never sees a segmented trace. When a walk crosses a merge point
+        // already past 1.0x the limit both conditions hold, and upstream
+        // segments rather than aborts because its cut raises first. Return
+        // ahead of the too-long check for the same reason — turning the cut
+        // back into `TraceTooLong` here would re-abort exactly the key the
+        // segmenting signal was set to stop aborting.
+        if let DispatchOutcome::SegmentTrace { .. } = outcome {
+            return Ok((outcome, pc));
+        }
         if !ctx.fbw_mode.transparent_helper_subwalk && ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
@@ -3292,7 +3390,10 @@ pub fn walk<Sym: WalkSym>(
             // A multi-frame inlined callee reached its own loop
             // header; propagate up to `try_walker_inline_user_call`, which
             // emits the recursive CALL_ASSEMBLER at the call boundary.
-            | DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+            | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
+            // Returned above, ahead of the too-long check; covered here so the
+            // match stays exhaustive.
+            | DispatchOutcome::SegmentTrace { .. } => {
                 return Ok((outcome, pc));
             }
             DispatchOutcome::SubRaise { exc, exc_concrete } => {
@@ -11805,6 +11906,41 @@ fn handle<Sym: WalkSym>(
                 Some(Value::Int(v)) => v as usize,
                 _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
+
+            // pyjitpl.py:1617-1620, the tail of `MIFrame.debug_merge_point`,
+            // which `opimpl_jit_merge_point` calls at :1542 — ahead of every
+            // early return the loop-header protocol below makes, so this check
+            // sits at the same place:
+            //
+            //     if (metainterp.force_finish_trace and
+            //             (metainterp.history.length() >
+            //              warmrunnerstate.trace_limit * 0.8)):
+            //         self._create_segmented_trace_and_blackhole()
+            //
+            // A key that already overflowed once carries the segmenting signal
+            // — `JC_FORCE_FINISH` on the cell for a loop, `FORCE_BRIDGE_SEGMENTING`
+            // on the source token for a bridge — and both reach the walk as
+            // `TraceCtx::force_finish`. Cutting the trace here, strictly before
+            // the 1.0x `blackhole_if_trace_too_long` check the step loop runs
+            // (`pyjitpl.py:2812-2830`), is what stops that key from overflowing
+            // and aborting forever.
+            //
+            // The cut belongs at a merge point and nowhere else: the guard it
+            // records resumes through the `-live-` marker that precedes every
+            // `jit_merge_point` op, which an arbitrary mid-walk position has no
+            // counterpart for.
+            //
+            // Top-level only. Upstream reaches this from an inlined frame too,
+            // but a sub-walk's outcome is consumed by
+            // `try_walker_inline_user_call`, which has no route to the driver
+            // arm that owns the compile half — surfacing it from there would
+            // abort the enclosing trace instead of segmenting it.
+            if ctx.is_top_level
+                && ctx.trace_ctx.force_finish_trace()
+                && ctx.trace_ctx.num_ops() > ctx.trace_ctx.trace_limit() * 4 / 5
+            {
+                return create_segmented_trace(ctx, op.pc, next_instr).map(|o| (o, op.next_pc));
+            }
             // An inlined callee's own loop
             // header routes to a `CALL_ASSEMBLER` into its already-compiled loop
             // token EVEN WHEN its pycode green resolves.  nbody's `advance` has a
