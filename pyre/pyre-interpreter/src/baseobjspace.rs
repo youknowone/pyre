@@ -1331,8 +1331,51 @@ pub(crate) unsafe fn get_and_call_function(
         full.extend_from_slice(args_w);
         return crate::call::call_function_impl_result(w_descr, full.as_slice());
     }
-    let w_impl = unsafe { get(w_descr, w_obj, w_type) }?.unwrap_or(w_descr);
-    crate::call::call_function_impl_result(w_impl, args_w)
+    // `get` dispatches `__get__`: a `property` getter and a user descriptor are
+    // application-level Python, so a collection can land between the descriptor
+    // lookup and the call below.  `w_obj` and `args_w` are raw addresses — the
+    // latter a slice into the caller's Rust stack, which no root reaches — so
+    // both would name pre-collection copies afterwards.  Pin the three
+    // descriptor operands and every argument across the lookup, then rebuild the
+    // argument list from the shadow stack.  Both slices are published before the
+    // first `normalize_roots` so nothing is still invisible to a foreign
+    // collector once this mutator starts entering safepoints.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::publish_roots(&[w_descr, w_obj, w_type]);
+    let args_base = pyre_object::gc_roots::publish_roots(args_w);
+    pyre_object::gc_roots::normalize_roots(base, 3);
+    pyre_object::gc_roots::normalize_roots(args_base, args_w.len());
+    use pyre_object::gc_roots::shadow_stack_get;
+    let w_impl = unsafe {
+        get(
+            shadow_stack_get(base),
+            shadow_stack_get(base + 1),
+            shadow_stack_get(base + 2),
+        )
+    }?
+    .unwrap_or_else(|| shadow_stack_get(base));
+    // The same stack-array-or-`Vec` split as the fast path above, and for the
+    // same reason: a `Vec::with_capacity` on the common arity is an opaque
+    // residual the walker cannot descend through.
+    const INLINE_ARGS: usize = 8;
+    let mut inline_args = [pyre_object::PY_NULL; INLINE_ARGS];
+    let mut wide_args;
+    let reloaded: &[PyObjectRef] = if args_w.len() <= INLINE_ARGS {
+        // The index loop lowers to `setarrayitem`; iterator adapters are
+        // residual calls.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..args_w.len() {
+            inline_args[i] = shadow_stack_get(args_base + i);
+        }
+        &inline_args[..args_w.len()]
+    } else {
+        wide_args = Vec::with_capacity(args_w.len());
+        for i in 0..args_w.len() {
+            wide_args.push(shadow_stack_get(args_base + i));
+        }
+        &wide_args
+    };
+    crate::call::call_function_impl_result(w_impl, reloaded)
 }
 
 /// `isinstance(w_obj, Coroutine) or gen_is_coroutine(w_obj)` from PyPy
