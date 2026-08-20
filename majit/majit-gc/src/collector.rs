@@ -13209,6 +13209,56 @@ cache size\t: 8192 kB\n";
         gc.roots.clear();
     }
 
+    /// `collect_roots_in_nursery` computes
+    /// `use_jit_frame_stoppers = not any_pinned_object_from_earlier` and passes
+    /// it to `walk_roots` as `is_minor`. A pin that survived the previous minor
+    /// was never promoted and still sits at its nursery address, so the walkers
+    /// that skip a clean area on a minor have to be told to walk everything.
+    #[test]
+    fn a_surviving_pin_makes_the_next_minor_announce_a_full_extra_root_walk() {
+        // The walker registry has no removal and every test binary thread
+        // shares it, so record on the collecting thread only.
+        thread_local! {
+            static SEEN: std::cell::RefCell<Vec<crate::shadow_stack::ExtraRootWalkKind>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn record(_visit: &mut dyn FnMut(&mut GcRef)) {
+            SEEN.with(|seen| {
+                seen.borrow_mut()
+                    .push(crate::shadow_stack::extra_root_walk_kind())
+            });
+        }
+
+        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        crate::shadow_stack::clear();
+        crate::shadow_stack::register_extra_root_walker(record);
+        SEEN.with(|seen| seen.borrow_mut().clear());
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let mut obj = gc.alloc_with_type(tid, 16);
+        assert!(gc.pin(obj));
+        unsafe { gc.roots.add(&mut obj) };
+
+        // Nothing was pinned before this one, so the first minor still
+        // announces the skip; it discovers the pin and leaves it in place.
+        gc.do_collect_nursery();
+        assert!(gc.is_pinned(obj));
+
+        // The pin now predates the previous minor: it is "from earlier".
+        gc.do_collect_nursery();
+        assert!(gc.is_pinned(obj));
+
+        gc.roots.clear();
+        assert_eq!(
+            SEEN.with(|seen| seen.borrow().clone()),
+            vec![
+                crate::shadow_stack::ExtraRootWalkKind::Minor,
+                crate::shadow_stack::ExtraRootWalkKind::Major,
+            ]
+        );
+    }
+
     /// The sibling above only ever discovers the parent *after* the list is
     /// swapped out. Phase 1c traces an old-generation jitframe directly, with
     /// itself as the holder, and that runs earlier — so a parent found there
