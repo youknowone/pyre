@@ -1253,25 +1253,34 @@ pub struct JitCellToken {
     pub generation: Cell<i64>,
     /// `history.py JitCellToken.retraced_count` parity slot.
     ///
-    /// RPython packs two pieces of state into this u-int:
-    ///   * bit 0 = `FORCE_BRIDGE_SEGMENTING` flag.
-    ///     `compile.py _trace_and_compile_from_bridge` checks
+    /// `history.py:438 FORCE_BRIDGE_SEGMENTING = 1 # stored in
+    /// retraced_count` says the field is packed, and `history.py:471-475`
+    /// offers a shifting `get_retraced_count` / `set_retraced_count` pair
+    /// to hold that packing.  Neither accessor has a caller in the
+    /// vendored tree: every live read and write is on the raw field.
+    ///   * `unroll.py:216-218` compares `cell_token.retraced_count`
+    ///     itself against `retrace_limit` and `+= 1`s it.
+    ///   * `unroll.py:272 disable_retracing_if_max_retrace_guards`
+    ///     assigns it `sys.maxint` whole.
+    ///   * `compile.py:728-730 _trace_and_compile_from_bridge` reads
     ///     `loop_token.retraced_count & FORCE_BRIDGE_SEGMENTING` to
     ///     decide whether the next bridge from this loop should
-    ///     segment trace at the guard.  Set at `pyjitpl.py:2833`.
-    ///   * bits 1+ = retrace count (`history.py:464-468
-    ///     get_retraced_count() = retraced_count >> 1` /
-    ///     `set_retraced_count(value) = (value << 1) | (current & 1)`),
-    ///     compared by `unroll.py` against `retrace_limit`
-    ///     to disable repeated retracing of the same loop.
+    ///     segment trace at the guard; `pyjitpl.py:2857` ORs it in.
     ///
-    /// Pyre's flow is RPython-orthodox: the retrace count rides on
-    /// `JitCellToken.retraced_count` (read via `get_retraced_count`,
-    /// updated via `set_retraced_count` at unroll-pass boundaries —
-    /// `pyjitpl.rs:7978` etc.); `FORCE_BRIDGE_SEGMENTING` is set
-    /// in `MetaInterp::blackhole_trace_too_long_slow` and read by
-    /// `MetaInterp::start_retrace_from_guard` (`pyjitpl.rs:8772-
-    /// 8784`), mirroring `pyjitpl.py:2833` / `compile.py:729`.
+    /// So bit 0 is at once the flag and the count's low bit, and two
+    /// consequences of that are load-bearing.  `sys.maxint` is odd, so
+    /// disabling retracing on a guard-heavy loop also turns
+    /// `FORCE_BRIDGE_SEGMENTING` on and every later bridge off that loop
+    /// traces with `force_finish_trace`.  The `+= 1` consumes the flag
+    /// bit rather than stepping over it, clearing it again.
+    ///
+    /// Pyre keeps the count on `JitCellToken.retraced_count` (read via
+    /// `get_retraced_count`, updated via `set_retraced_count` at
+    /// unroll-pass boundaries), and both accessors are the raw field so
+    /// those two consequences carry over.  `FORCE_BRIDGE_SEGMENTING` is
+    /// set in `MetaInterp::blackhole_trace_too_long_slow` and read by
+    /// `MetaInterp::start_retrace_from_guard`, mirroring
+    /// `pyjitpl.py:2857` / `compile.py:729`.
     ///
     /// The complementary `BaseJitCell.flags & FORCE_FINISH` flag in
     /// `warmstate.rs` is NOT a duplicate of this bit — it mirrors
@@ -1290,9 +1299,7 @@ pub struct JitCellToken {
     ///
     /// Interior mutability via `Cell<u32>` mirrors RPython's
     /// attribute writes through `&JitCellToken`; the same
-    /// `unsafe impl Sync` covers it as `generation`.  Callers must
-    /// use the accessors (not `.get()` / `.set()` directly) to keep
-    /// the bit-packing invariant.
+    /// `unsafe impl Sync` covers it as `generation`.
     pub retraced_count: Cell<u32>,
     /// `history.py` `JitCellToken.target_tokens = None`, the class
     /// default, assigned a `list[TargetToken]` at exactly two sites:
@@ -1322,29 +1329,37 @@ pub struct JitCellToken {
 }
 
 impl JitCellToken {
-    /// `history.py` `FORCE_BRIDGE_SEGMENTING = 1` — bit packed
-    /// into `retraced_count`.  Set at `pyjitpl.py` (pyre:
-    /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge
-    /// trace aborts without an inlinable function; read at
-    /// `compile.py:729` (pyre: `MetaInterp::start_retrace_from_guard`)
-    /// to decide whether the next bridge from this loop should
-    /// `force_finish_trace`.
+    /// `history.py:438` `FORCE_BRIDGE_SEGMENTING = 1` — bit 0 of
+    /// `retraced_count`.  Two writers set it: `pyjitpl.py:2857` (pyre:
+    /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge trace
+    /// aborts without an inlinable function, and `unroll.py:272`, whose
+    /// odd `sys.maxint` sentinel sets it as a side effect of disabling
+    /// retracing.  Read at `compile.py:729` (pyre:
+    /// `MetaInterp::start_retrace_from_guard`) to decide whether the
+    /// next bridge from this loop should `force_finish_trace`.
     pub const FORCE_BRIDGE_SEGMENTING: u32 = 1;
 
-    /// `history.py` `def get_retraced_count(self): return
-    /// self.retraced_count >> 1`.
+    /// The raw field, which is what `unroll.py:216-218` reads: it
+    /// compares `cell_token.retraced_count` against `retrace_limit` and
+    /// increments it, never going through `history.py:471`'s
+    /// `get_retraced_count() = retraced_count >> 1`, which no caller in
+    /// the vendored tree uses.  The count is therefore unshifted and
+    /// shares bit 0 with `FORCE_BRIDGE_SEGMENTING`.
     #[inline]
     pub fn get_retraced_count(&self) -> u32 {
-        self.retraced_count.get() >> 1
+        self.retraced_count.get()
     }
 
-    /// `history.py` `def set_retraced_count(self, value):
-    /// self.retraced_count = (value << 1) | (self.retraced_count & 1)`.
-    /// Preserves the FORCE_BRIDGE_SEGMENTING bit.
+    /// The raw field, matching the two upstream writes:
+    /// `unroll.py:217 cell_token.retraced_count += 1` and
+    /// `unroll.py:272 targeting_jitcell_token.retraced_count =
+    /// sys.maxint`.  Both assign the whole word rather than going
+    /// through `history.py:474`'s flag-preserving `set_retraced_count`,
+    /// so writing the disable sentinel — odd, like `sys.maxint` — sets
+    /// `FORCE_BRIDGE_SEGMENTING`, and incrementing clears it.
     #[inline]
     pub fn set_retraced_count(&self, value: u32) {
-        let flag = self.retraced_count.get() & Self::FORCE_BRIDGE_SEGMENTING;
-        self.retraced_count.set((value << 1) | flag);
+        self.retraced_count.set(value);
     }
     pub fn new(number: u64) -> Self {
         JitCellToken {
@@ -3813,6 +3828,53 @@ impl Drop for JittedGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `unroll.py:272 disable_retracing_if_max_retrace_guards` writes the raw
+    /// field — `targeting_jitcell_token.retraced_count = sys.maxint` — and
+    /// `sys.maxint` is odd, so a loop that carries more guards than
+    /// `max_retrace_guards` also comes out with `FORCE_BRIDGE_SEGMENTING` set.
+    /// That is the bit `compile.py:729` reads to force-finish the loop's
+    /// bridges.
+    #[test]
+    fn disabling_retracing_also_arms_bridge_segmenting() {
+        let token = JitCellToken::new(1);
+        assert_eq!(
+            token.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+            "a fresh token starts with the segmenting bit clear",
+        );
+
+        token.set_retraced_count(u32::MAX);
+
+        assert_ne!(
+            token.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+            "the disable sentinel arms bridge segmenting, as sys.maxint does",
+        );
+        assert_eq!(
+            token.get_retraced_count(),
+            u32::MAX,
+            "and the sentinel reads back whole, so retracing stays disabled",
+        );
+    }
+
+    /// `unroll.py:216-217` reads and increments the same raw word, so the
+    /// increment walks over bit 0 instead of stepping past it.
+    #[test]
+    fn incrementing_the_retrace_count_consumes_the_segmenting_bit() {
+        let token = JitCellToken::new(2);
+        token
+            .retraced_count
+            .set(JitCellToken::FORCE_BRIDGE_SEGMENTING);
+
+        token.set_retraced_count(token.get_retraced_count() + 1);
+
+        assert_eq!(token.get_retraced_count(), 2);
+        assert_eq!(
+            token.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+        );
+    }
 
     #[test]
     fn loop_version_info_add_and_track() {
