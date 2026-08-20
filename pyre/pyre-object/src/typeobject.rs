@@ -1342,6 +1342,14 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     const PATMA_SEQUENCE: i64 = 1 << 5;
     const PATMA_MAPPING: i64 = 1 << 6;
     const METHOD_DESCRIPTOR: i64 = 1 << 17;
+    const LONG_SUBCLASS: i64 = 1 << 24;
+    const LIST_SUBCLASS: i64 = 1 << 25;
+    const TUPLE_SUBCLASS: i64 = 1 << 26;
+    const BYTES_SUBCLASS: i64 = 1 << 27;
+    const UNICODE_SUBCLASS: i64 = 1 << 28;
+    const DICT_SUBCLASS: i64 = 1 << 29;
+    const BASE_EXC_SUBCLASS: i64 = 1 << 30;
+    const TYPE_SUBCLASS: i64 = 1 << 31;
 
     let t = &*(obj as *const W_TypeObject);
     let mut flags = 0;
@@ -1402,6 +1410,34 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         b'M' => flags |= PATMA_MAPPING,
         b'S' => flags |= PATMA_SEQUENCE,
         _ => {}
+    }
+    // [3.14-spec] CPython v3.14.6 `Objects/typeobject.c:8175-8200`
+    // computes these mutually exclusive fast-subclass flags from the base
+    // MRO in this exact order. PyPy does not publish them from
+    // `descr__flags`, but its canonical classification is the MRO membership
+    // scan in `typeobject.py:603/1640`, ported as `w_type_issubtype`.
+    for (base, bit) in [
+        (
+            crate::interp_exceptions::lookup_exc_class_for_kind(
+                crate::interp_exceptions::ExcKind::BaseException,
+            ),
+            BASE_EXC_SUBCLASS,
+        ),
+        (get_instantiate(&TYPE_TYPE), TYPE_SUBCLASS),
+        (get_instantiate(&INT_TYPE), LONG_SUBCLASS),
+        (
+            get_instantiate(&crate::bytesobject::BYTES_TYPE),
+            BYTES_SUBCLASS,
+        ),
+        (get_instantiate(&STR_TYPE), UNICODE_SUBCLASS),
+        (get_instantiate(&TUPLE_TYPE), TUPLE_SUBCLASS),
+        (get_instantiate(&LIST_TYPE), LIST_SUBCLASS),
+        (get_instantiate(&DICT_TYPE), DICT_SUBCLASS),
+    ] {
+        if !base.is_null() && w_type_issubtype(obj, base) {
+            flags |= bit;
+            break;
+        }
     }
     flags
 }
