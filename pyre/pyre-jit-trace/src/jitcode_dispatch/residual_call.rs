@@ -5826,18 +5826,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // Virtualize PyPy's exact `zip(tuple0, tuple1, strict=True)` shape.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::CallKw
-        && spec_gate("builtin_zip", || {
-            try_walker_specialize_builtin_zip(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
     // frame: model `fast2locals`' fastlocals reads as `getarrayitem_vable_r`
     // plus a non-forcing dict-build chain — the shape the meta-tracer produces
@@ -5898,26 +5886,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
         && spec_gate("math_log_trig", || {
             try_walker_specialize_math_log_trig(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && spec_gate("math_frexp", || {
-            try_walker_specialize_math_frexp(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && ei.pyre_helper == majit_ir::PyreHelperKind::CallFn
-        && spec_gate("math_ldexp", || {
-            try_walker_specialize_math_ldexp(ctx, code, op, &r_args, dst)
         })?
         .is_some()
     {
@@ -7102,19 +7070,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             )
                         })?;
                         if specialized.is_none() {
-                            // `_make_descr_binop` gives shifts with an Int
-                            // count their own `_int_lshift` / `_int_rshift`
-                            // path before Long/Long.
-                            if let Some(outcome) = spec_gate("binary_op_long_int_shift", || {
-                                try_walker_specialize_binary_op_long_int_shift(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })? {
-                                return Ok((outcome, op.next_pc));
-                            }
-                        }
-                        if specialized.is_none() {
                             // `_int_floordiv` / `_int_mod` are the same family:
                             // an Int divisor keeps its machine word instead of
                             // being widened to a bigint, and `_int_mod`'s
@@ -7129,32 +7084,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             }
                         }
                         if specialized.is_none() {
-                            // `descr_pow` keeps a `W_IntObject` exponent
-                            // unwrapped and calls `rbigint.int_pow`; only a
-                            // long exponent reaches `rbigint.pow`.
-                            specialized = spec_gate("binary_op_long_int_pow", || {
-                                try_walker_specialize_binary_op_long_int_pow(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?;
-                        }
-                        if specialized.is_none() {
                             // W_LongObject operands take the long fast path
                             // before float so bigint arithmetic retains its
                             // payload representation.
                             specialized = spec_gate("binary_op_long", || {
                                 try_walker_specialize_binary_op_long(
-                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                    dst_bank,
-                                )
-                            })?;
-                        }
-                        if specialized.is_none() {
-                            // Two-long true-divide → float fast path
-                            // (CallPureF + wrapfloat).
-                            specialized = spec_gate("truediv_op_long", || {
-                                try_walker_specialize_truediv_op_long(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
                                 )
@@ -7211,26 +7145,18 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         )
                     })? {
                         Some(()) => Some(()),
-                        None => match spec_gate("compare_op_long_int", || {
-                            try_walker_specialize_compare_op_long_int(
+                        None => match spec_gate("compare_op_long", || {
+                            try_walker_specialize_compare_op_long(
                                 ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
                             )
                         })? {
                             Some(()) => Some(()),
-                            None => match spec_gate("compare_op_long", || {
-                                try_walker_specialize_compare_op_long(
+                            None => spec_gate("compare_op_float", || {
+                                try_walker_specialize_compare_op_float(
                                     ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                     dst_bank,
                                 )
-                            })? {
-                                Some(()) => Some(()),
-                                None => spec_gate("compare_op_float", || {
-                                    try_walker_specialize_compare_op_float(
-                                        ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
-                                        dst_bank,
-                                    )
-                                })?,
-                            },
+                            })?,
                         },
                     }
                 };
