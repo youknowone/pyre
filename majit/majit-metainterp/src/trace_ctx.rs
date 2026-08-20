@@ -1898,6 +1898,38 @@ impl TraceCtx {
     /// silently substituting `Value::Void` would conflate "unstamped"
     /// with "stamped Void", which the `set_value` type-check
     /// already forbids.
+    ///
+    /// A stamped `Value::Ref(GcRef::NO_CONCRETE)` comes back as a value, not
+    /// as `None`: `heapcache_ops`' materialized-array walk writes that
+    /// sentinel over a load it could not replay, and this table hands back
+    /// what it holds.  [`Self::recover_ref_value`] rejects the sentinel; this
+    /// method deliberately does not, because "never stamped" and "stamped
+    /// unresolved" are different states and only the caller knows which one
+    /// it can act on.
+    ///
+    /// Three sites pair the two in the order `lookup_opref_concrete(..)
+    /// .or_else(|| recover_ref_value(..))` — `vable_value_concrete` and
+    /// `current_inline_vable_target` in `jitcode_dispatch/vable_ops.rs`, and
+    /// `fill_trace_too_long_register_banks` in
+    /// `jitcode_dispatch/residual_call.rs`.  `Some(_).or_else(f)` never calls
+    /// `f`, so a stamped sentinel short-circuits ahead of the guard in
+    /// `recover_ref_value` and reaches the consumer.  Two more accept it
+    /// through a bare `value.0 != 0` arm, which excludes NULL but not
+    /// `usize::MAX - 1`: the snapshot live-root reads in the same file.
+    ///
+    /// Filtering the sentinel at those sites is NOT the one-line fix it looks
+    /// like, and the reading that says so is worth keeping.  Each of them
+    /// ends in a fallback tail — `.or(from_register)`, `.or(from_shadow)`,
+    /// `_ => sym.live_vable_frame_addr()` — so rejecting the sentinel does
+    /// not decline the image, it PROMOTES the next fallback, and that is a
+    /// different concrete address landing in a blackhole frame's ref bank or,
+    /// through `store_live_frame_array_slot`, in a live frame's locals array
+    /// behind a write barrier.  `vable_ops.rs` records of the shadow it would
+    /// promote that re-reading that color "can return a stale concrete value
+    /// from a prior loop iteration".  That is wrong data, not a refusal.  A
+    /// fix has to decide what each site should answer for an unresolved box,
+    /// which is a per-site question; dropping the sentinel here or there is
+    /// not it.
     pub fn lookup_opref_concrete(&self, opref: OpRef) -> Option<Value> {
         if opref.is_constant() {
             return opref.inline_const_to_value();
