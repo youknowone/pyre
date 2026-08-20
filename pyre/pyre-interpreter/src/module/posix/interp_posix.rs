@@ -6183,8 +6183,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // iterable and each element read with `c_uid_t_w`, which is
                     // what lets -1 name `(gid_t)-1` instead of being refused.
                     let items = crate::builtins::collect_iterable(w_list)?;
+                    // `c_uid_t_w` reaches `__index__` for a non-int entry, so
+                    // converting one entry can collect and move the entries not
+                    // yet converted -- `collect_iterable` hands back a plain
+                    // vector, its own roots already dropped.  Publish the
+                    // sequence once and read each entry back per iteration.
+                    let _seq_roots = pyre_object::gc_roots::push_roots();
+                    let items_base = pyre_object::gc_roots::pin_roots(&items);
                     let mut groups: Vec<libc::gid_t> = Vec::with_capacity(items.len());
-                    for w_gid in items {
+                    for offset in 0..items.len() {
+                        let w_gid = pyre_object::gc_roots::shadow_stack_get(items_base + offset);
                         groups.push(crate::baseobjspace::c_uid_t_w(w_gid)?);
                     }
                     host_setgroups(&groups).map_err(|e| io_err(e, ""))?;
@@ -9017,21 +9025,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         "scheduler",
                     ],
                 )?;
-                let positional = [
+                // Every conversion below reaches app-level code -- `__fspath__`,
+                // a mapping's `keys()`, `__index__` -- and each one can collect
+                // and move the arguments that are still unread, including the
+                // keyword dictionary the remaining options are looked up in.
+                // Publish them once and read each back at its use.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let positional_base = pyre_object::gc_roots::pin_roots(&[
                     bound[0].expect("path is required"),
                     bound[1].expect("argv is required"),
                     bound[2].expect("env is required"),
-                ];
-                let path = crate::gateway::fsencode_path_named_w(positional[0], func, "path")?;
+                ]);
+                let kwargs_slot = kwargs.map(|kwargs| {
+                    let slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(kwargs);
+                    slot
+                });
+                let positional =
+                    |index: usize| pyre_object::gc_roots::shadow_stack_get(positional_base + index);
+                let kwargs = || kwargs_slot.map(pyre_object::gc_roots::shadow_stack_get);
+                let path = crate::gateway::fsencode_path_named_w(positional(0), func, "path")?;
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice()).map_err(|_| {
                     crate::PyError::value_error("posix_spawn: embedded null in path")
                 })?;
-                let argv = collect_cstring_seq(positional[1], func, "argv")?;
+                let argv = collect_cstring_seq(positional(1), func, "argv")?;
                 // posixmodule.c parses `env` through the same keys/values
                 // snapshot used by execve, then filesystem-encodes paired
                 // elements into `key=value`.
-                let env = collect_spawn_env(positional[2])?;
-                let setpgroup = match crate::builtins::kwarg_get(kwargs, "setpgroup") {
+                let env = collect_spawn_env(positional(2))?;
+                let setpgroup = match crate::builtins::kwarg_get(kwargs(), "setpgroup") {
                     Some(value) if !unsafe { pyre_object::is_none(value) } => {
                         let value = crate::baseobjspace::space_index(value)?;
                         let value = crate::baseobjspace::int_w(value)?;
@@ -9043,27 +9065,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     _ => None,
                 };
-                let resetids = crate::builtins::kwarg_get(kwargs, "resetids")
+                let resetids = crate::builtins::kwarg_get(kwargs(), "resetids")
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
                     .unwrap_or(false);
-                let setsid = crate::builtins::kwarg_get(kwargs, "setsid")
+                let setsid = crate::builtins::kwarg_get(kwargs(), "setsid")
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
                     .unwrap_or(false);
                 if setsid && POSIX_SPAWN_SETSID.is_none() {
                     return Err(argument_unavailable(func, "setsid"));
                 }
-                let setsigmask = match crate::builtins::kwarg_get(kwargs, "setsigmask") {
+                let setsigmask = match crate::builtins::kwarg_get(kwargs(), "setsigmask") {
                     Some(value) => Some(sigset_arg(value)?),
                     None => None,
                 };
-                let setsigdef = match crate::builtins::kwarg_get(kwargs, "setsigdef") {
+                let setsigdef = match crate::builtins::kwarg_get(kwargs(), "setsigdef") {
                     Some(value) => Some(sigset_arg(value)?),
                     None => None,
                 };
-                let scheduler = parse_spawn_scheduler(func, kwargs)?;
-                let file_actions_obj = crate::builtins::kwarg_get(kwargs, "file_actions");
+                let scheduler = parse_spawn_scheduler(func, kwargs())?;
+                let file_actions_obj = crate::builtins::kwarg_get(kwargs(), "file_actions");
                 let actions: Vec<rustpython_host_env::posix::PosixSpawnFileAction> =
                     if let Some(fa) = file_actions_obj {
                         if unsafe { pyre_object::is_none(fa) } {
@@ -9276,8 +9298,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
             fn sigset_arg(value: PyObjectRef) -> Result<Vec<i32>, crate::PyError> {
                 let items = crate::builtins::collect_iterable(value)?;
+                // `space_index` runs `__index__`, so reading one element can
+                // collect and move the elements not yet read.  Publish the
+                // sequence once and read each element back per iteration.
+                let _seq_roots = pyre_object::gc_roots::push_roots();
+                let items_base = pyre_object::gc_roots::pin_roots(&items);
                 let mut sigs = Vec::with_capacity(items.len());
-                for item in items {
+                for offset in 0..items.len() {
+                    let item = pyre_object::gc_roots::shadow_stack_get(items_base + offset);
                     let item = crate::baseobjspace::space_index(item)?;
                     let signum = crate::baseobjspace::int_w(item)?;
                     if !(1..crate::module::signal::signalstate::NSIG as i64).contains(&signum) {
@@ -9314,9 +9342,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
                 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
                 {
-                    let policy_obj = unsafe { pyre_object::w_tuple_getitem(value, 0).unwrap() };
+                    // `sched_priority_w` reaches `__index__`, so the collection
+                    // it can trigger forwards the tuple's own slots while a raw
+                    // element read before it goes stale.  Root the tuple and
+                    // take the policy out of it afterwards.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+                    pyre_object::gc_roots::pin_root(value);
                     let param_obj = unsafe { pyre_object::w_tuple_getitem(value, 1).unwrap() };
                     let priority = sched_priority_w(param_obj)?;
+                    let value = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
+                    let policy_obj = unsafe { pyre_object::w_tuple_getitem(value, 0).unwrap() };
                     let mut param: libc::sched_param =
                         unsafe { core::mem::zeroed::<libc::sched_param>() };
                     param.sched_priority = priority;
