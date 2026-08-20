@@ -120,22 +120,35 @@ pub mod frame_locals_proxy {
         }
 
         fn fast_local_index(&self, key: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
-            // Every candidate name allocates its own string and `eq_w` can run
-            // a Python `__eq__`, so the caller's key is a pre-allocation copy
-            // from the first comparison onward.  Publish it and reload it for
-            // each compare; the candidate reuses one slot rather than growing
-            // the stack once per local.
+            // Every candidate name allocates its own string and both
+            // `__hash__` and `__eq__` can run a Python method, so the caller's
+            // key is a pre-allocation copy from the first of them onward.
+            // Publish it and reload it for each compare; the candidate reuses
+            // one slot rather than growing the stack once per local.
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             roots.pin_root(key);
             let candidate_slot = key_slot + 1;
             roots.pin_root(pyre_object::PY_NULL);
+            // The scan hashes the key first whether it was reached to write or
+            // to read, so an unhashable key is a `TypeError` here rather than
+            // whatever the extras dict would go on to say about it.
+            let key_hash = crate::baseobjspace::hash_w_strict(roots.get(key_slot))?;
             // `code` addresses the compiler code object, which lives outside
             // the GC heap and so stays valid across those collections.
             let code = self.frame().code();
             let matches = |name: &str| -> Result<bool, crate::PyError> {
                 roots.set(candidate_slot, pyre_object::w_str_new(name));
-                crate::baseobjspace::eq_w(roots.get(candidate_slot), roots.get(key_slot))
+                // A name whose hash differs is never compared, so a key that
+                // claims equality with a name it does not hash like does not
+                // reach that name's slot.
+                Ok(
+                    crate::baseobjspace::hash_w_strict(roots.get(candidate_slot))? == key_hash
+                        && crate::baseobjspace::eq_w(
+                            roots.get(candidate_slot),
+                            roots.get(key_slot),
+                        )?,
+                )
             };
             for (index, name) in code.varnames.iter().enumerate() {
                 if hidden_local(code, index) {
@@ -198,7 +211,7 @@ pub mod frame_locals_proxy {
 
         /// `framelocalsproxy_getkeyindex` with `read == true`, followed by
         /// `framelocalsproxy_getval`: the value of the first locals-plus slot
-        /// whose name equals `key` and which is bound.
+        /// whose name hashes and compares equal to `key` and which is bound.
         ///
         /// A name that matches only unbound slots reads as absent, which is
         /// what sends `__getitem__` on to `f_extra_locals`.  The write
@@ -210,32 +223,44 @@ pub mod frame_locals_proxy {
             &self,
             key: PyObjectRef,
         ) -> Result<Option<PyObjectRef>, crate::PyError> {
-            // `PyObject_Hash` runs before the scan, so an unhashable key is a
-            // `TypeError` even for a frame with no locals to compare against.
-            crate::baseobjspace::hash_w_strict(key)?;
-            // A candidate name allocates its own string and `eq_w` can run a
-            // Python `__eq__`, so the caller's key is a pre-allocation copy
-            // from the first comparison onward.  An exact `str` key skips both
-            // by comparing WTF-8 bytes, which is what makes the common lookup
-            // allocation-free.
+            // A candidate name allocates its own string and both `__hash__`
+            // and `__eq__` can run Python, so the key is rooted before the
+            // first of them and read back from that root afterwards.
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             roots.pin_root(key);
             let candidate_slot = key_slot + 1;
             roots.pin_root(pyre_object::PY_NULL);
+            // Hashing runs before the scan, so an unhashable key is a
+            // `TypeError` even for a frame with no locals to compare against.
+            let key_hash = crate::baseobjspace::hash_w_strict(roots.get(key_slot))?;
             let exact_str_key = unsafe {
-                pyre_object::pyobject::is_exact_type(key, &pyre_object::pyobject::STR_TYPE)
+                pyre_object::pyobject::is_exact_type(
+                    roots.get(key_slot),
+                    &pyre_object::pyobject::STR_TYPE,
+                )
             };
             // `code` addresses the compiler code object, which lives outside
             // the GC heap and so stays valid across those collections.
             let code = self.frame().code();
             for (index, name, cell_slot) in locals_plus_names(code) {
                 let same = if exact_str_key {
+                    // The interned-name pointer comparison the scan opens
+                    // with, widened to every equal `str`: comparing WTF-8
+                    // bytes decides an exact `str` key outright, so it needs
+                    // neither the hash nor a candidate allocation.
                     unsafe { pyre_object::w_str_get_wtf8(roots.get(key_slot)) }.as_bytes()
                         == name.as_bytes()
                 } else {
                     roots.set(candidate_slot, pyre_object::w_str_new(name));
-                    crate::baseobjspace::eq_w(roots.get(candidate_slot), roots.get(key_slot))?
+                    // A name whose hash differs is never compared: a key that
+                    // claims equality with a name it does not hash like reads
+                    // as absent rather than as that name's slot.
+                    crate::baseobjspace::hash_w_strict(roots.get(candidate_slot))? == key_hash
+                        && crate::baseobjspace::eq_w(
+                            roots.get(candidate_slot),
+                            roots.get(key_slot),
+                        )?
                 };
                 if !same {
                     continue;
