@@ -333,11 +333,22 @@ impl CallGraph {
 /// `framework.py` over-brackets rather than under-brackets, but a fabricated
 /// path is not conservatism, it is a wrong answer with a citation.
 ///
-/// So a name **one artefact carries more than once** is not a join key at all:
-/// each occurrence keeps its own node, exactly as it had before the join.  What
-/// is joined is the unambiguous majority — the free functions the JIT reaches
-/// the interpreter through (`finditem_str`, `call_function_impl_result`) — and
-/// [`Self::ambiguous_names`] reports what that rule held back.
+/// A name **one artefact carries more than once** is therefore not a join key:
+/// each occurrence keeps its own node, exactly as it had before the join.  That
+/// test alone is not enough, because it can only see a collision an artefact
+/// already contains: two artefacts may each carry `pyframe::<Impl>::new`
+/// exactly once, for two different functions, and the join would merge them
+/// with nothing to warn on.  So **any name carrying an opaque `<…>` segment**
+/// is held apart as well — the rendering has already discarded what
+/// distinguished it, and a spelling that cannot fail to collide is not an
+/// identity.
+///
+/// What is joined is what stays fully spelled — the free functions the JIT
+/// reaches the interpreter through (`finditem_str`,
+/// `call_function_impl_result`) — and [`Self::ambiguous_names`] reports what
+/// the two rules held back.  Measured on `pyre-jit` joined with
+/// `pyre-interpreter`, holding the opaque names apart costs 48 nodes of closure
+/// (240 → 192, against 77 unjoined) and no finding at all.
 pub struct Joined {
     /// The joined graph.  Its `opaque` census is left empty: an opaque *count*
     /// is per-artefact accounting, and summing two of them double-counts every
@@ -349,7 +360,8 @@ pub struct Joined {
     /// Unambiguous names carried by more than one artefact — what the join
     /// actually merged.
     pub joined_names: usize,
-    /// Names some artefact carries more than once, kept apart.
+    /// Names held apart: carried more than once by some artefact, or spelled
+    /// with an opaque `<…>` segment that cannot identify a function.
     pub ambiguous_names: usize,
 }
 
@@ -359,7 +371,15 @@ impl Joined {
         for part in parts {
             let mut seen: HashSet<&str> = HashSet::new();
             for name in part.names.values() {
-                if !seen.insert(name.as_str()) {
+                // A repeat inside one artefact is the visible half of the
+                // problem.  The other half is invisible to it: `name_path`
+                // renders a non-ident segment as the opaque `<Variant>`
+                // (`majit-charon-reader/src/ullbc.rs`), so two artefacts can
+                // each carry `pyframe::<Impl>::new` exactly once for two
+                // different functions, and the repeat test would merge them.
+                // A spelling that has already lost the part that distinguished
+                // it is not an identity in either direction.
+                if name.contains('<') || !seen.insert(name.as_str()) {
                     ambiguous.insert(name.as_str());
                 }
             }
