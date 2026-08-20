@@ -5,6 +5,8 @@
 
 use majit_translate::memory::gctransform::{framework, liveness};
 
+const PYTHON_DISPATCH_SEEDS_REF: &[&str] = framework::PYTHON_DISPATCH_SEEDS;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -45,6 +47,39 @@ fn main() {
             shown.join(" "),
             if per_crate.len() > 6 { " …" } else { "" }
         );
+        // A seed that matches nothing empties half the closure silently, and
+        // the name table is the only place to see why.  Substring, not the
+        // anchored form the seeds use, so a near-miss spelling still shows up.
+        if let Ok(pat) = std::env::var("GC_NAME_GREP") {
+            let mut hits: Vec<&String> =
+                cg.names.values().filter(|n| n.contains(&pat)).collect();
+            hits.sort();
+            println!("   names containing {pat:?}: {}", hits.len());
+            for n in hits.iter().take(60) {
+                println!("       {n}");
+            }
+        }
+        // "Can this particular helper collect?" is the question every
+        // adjudication of an opaque finding turns on, and a reachability bit
+        // is worthless without the chain behind it.
+        if let Ok(pat) = std::env::var("GC_PATH_FROM") {
+            let (py0, _) = cg.seeds_for(PYTHON_DISPATCH_SEEDS_REF);
+            let (col0, _) = cg.seeds_for(framework::COLLECTING_SEEDS);
+            let mut sd = py0;
+            sd.extend(col0);
+            let mut hits: Vec<(&u64, &String)> = cg
+                .names
+                .iter()
+                .filter(|(_, n)| n.contains(&pat))
+                .collect();
+            hits.sort_by_key(|(_, n)| n.as_str());
+            for (id, n) in hits.iter().take(20) {
+                match cg.path_to(**id, &sd) {
+                    Some(chain) => println!("   {n}\n       REACHES: {}", chain.join(" -> ")),
+                    None => println!("   {n}\n       reaches no seed"),
+                }
+            }
+        }
         println!(
             "   python-dispatch seeds : {}",
             cg.seed_report(framework::PYTHON_DISPATCH_SEEDS)
@@ -179,7 +214,14 @@ fn main() {
             continue;
         }
         let push_root_ids: std::collections::HashSet<u64> = pin_ids.iter().copied().collect();
-        let (found, stats) = liveness::scan(&llbc, &cg, &reach, &push_root_ids, &gc_tys);
+        let (found, stats) = liveness::scan(
+            &llbc,
+            &cg,
+            &reach,
+            &push_root_ids,
+            &gc_tys,
+            liveness::MOVABLE_GC_MARKERS,
+        );
         println!(
             "   liveness scan: {} bodies; {} with a terminator this reader could not parse; \
              {} call(s) withheld as dominated by a push_roots",
@@ -196,7 +238,14 @@ fn main() {
         let mut conservative = reach.clone();
         conservative.extend(opaque.iter().copied());
         let (found_conservative, stats_conservative) =
-            liveness::scan(&llbc, &cg, &conservative, &push_root_ids, &gc_tys);
+            liveness::scan(
+            &llbc,
+            &cg,
+            &conservative,
+            &push_root_ids,
+            &gc_tys,
+            liveness::MOVABLE_GC_MARKERS,
+        );
         let conservative_fns: std::collections::BTreeSet<&str> = found_conservative
             .iter()
             .map(|f| f.func_name.as_str())
@@ -312,6 +361,86 @@ fn main() {
                 f.callee_name.rsplit("::").next().unwrap_or(""),
                 f.live_non_arg
             );
+        }
+
+        // The same question asked of the running frame.  A `PyObjectRef` has a
+        // root stack to be pinned on; the frame is carried as a bare
+        // `&mut PyFrame` no walker reaches, so the only repair is to re-read it
+        // out of a `FrameAnchor` after the call.  That reload kills the stale
+        // local at the call, so no bracket set is passed — a body that reloads
+        // correctly simply has nothing live across the call to report.
+        let frame_tys = liveness::frame_ptr_type_ids(&llbc);
+        if frame_tys.is_empty() {
+            println!("   (no PyFrame pointer type id found — frame scan skipped)");
+            continue;
+        }
+        let no_bracket: std::collections::HashSet<u64> = Default::default();
+        let (frames, frame_stats) =
+            liveness::scan(&llbc, &cg, &reach, &no_bracket, &frame_tys, &[]);
+        let (frames_conservative, _) =
+            liveness::scan(&llbc, &cg, &conservative, &no_bracket, &frame_tys, &[]);
+        let frame_fns: std::collections::BTreeSet<&str> =
+            frames.iter().map(|f| f.func_name.as_str()).collect();
+        println!(
+            "   frame carried across a call that can collect: {} in {} fn(s)",
+            frames.len(),
+            frame_fns.len()
+        );
+        println!(
+            "       counting unresolved dispatch as collecting too: {} call(s)",
+            frames_conservative.len()
+        );
+        println!(
+            "           over {} bodies; {} with an unparsable terminator, {} with an \
+             unparsable statement",
+            frame_stats.bodies_scanned,
+            frame_stats.unparsed_terminator_bodies,
+            frame_stats.unparsed_statement_bodies
+        );
+        // The frame reaches the callee as an argument in most of these, and an
+        // argument goes just as stale as any other local here (the module
+        // header records why upstream can drop them and pyre cannot).  Both
+        // columns are therefore hazards; they are split only because a frame
+        // the call does not even see is the more obviously wrong shape.
+        let mut frame_tier1: Vec<&liveness::Finding> = frames
+            .iter()
+            .filter(|f| seeds.contains(&f.callee_id))
+            .collect();
+        frame_tier1.sort_by(|a, b| a.func_name.cmp(&b.func_name).then(a.line.cmp(&b.line)));
+        let ft1_fns: std::collections::BTreeSet<&str> =
+            frame_tier1.iter().map(|f| f.func_name.as_str()).collect();
+        println!(
+            "       tier 1 (callee IS a dispatch seed): {} call(s) in {} fn(s)",
+            frame_tier1.len(),
+            ft1_fns.len()
+        );
+        if let Ok(filter) = std::env::var("GC_FRAME_SCAN") {
+            // A whole-crate list is not a work item; the filter is how a
+            // surface (`OpcodeStepExecutor`, say) is cut out of it and read.
+            // The resolved rows are marked, so the ones only the conservative
+            // scan finds — a body whose dispatch this reader cannot follow —
+            // are adjudicated as the weaker claim they are rather than read
+            // beside the others.
+            let resolved: std::collections::HashSet<(u64, u64, u64)> =
+                frames.iter().map(|f| (f.func, f.line, f.callee_id)).collect();
+            for f in &frames_conservative {
+                if !filter.is_empty() && !f.func_name.contains(&filter) {
+                    continue;
+                }
+                let mark = if resolved.contains(&(f.func, f.line, f.callee_id)) {
+                    "resolved"
+                } else {
+                    "opaque  "
+                };
+                println!(
+                    "           [{mark}] {}:{}  across {}  live: {:?} arg: {:?}",
+                    f.func_name,
+                    f.line,
+                    f.callee_name.rsplit("::").next().unwrap_or(""),
+                    f.live_non_arg,
+                    f.live_arg
+                );
+            }
         }
     }
 }

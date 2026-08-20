@@ -150,12 +150,15 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     "call::call_builtin_code_positional",
     // The gateway's indirect call into a builtin's Rust body.
     "gateway::builtin_code_call",
-    // The frame executors.
+    // The frame executors.  `execute_frame` and its resumed twin are inherent
+    // methods, so the `impl` block sits in the path as an opaque segment and
+    // the bare `pyframe::execute_frame` spelling can never match.
     "eval::eval_frame_plain",
     "eval::eval_frame_plain_with_operr",
     "eval::eval_frame_plain_with_resume",
     "eval::eval_loop",
-    "pyframe::execute_frame",
+    "pyframe::<Impl>::execute_frame",
+    "pyframe::<Impl>::resume_execute_frame",
     // The space-level helpers most builtins reach Python through.
     "baseobjspace::call_function",
     "baseobjspace::call_method",
@@ -173,6 +176,17 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
 /// to be named, or every direct caller (`pyre_object_gc_alloc_collecting_trampoline`
 /// in `pyre-jit/src/eval.rs`, say) is classified non-collecting and so is
 /// everything above it.
+///
+/// ⛔ The plain host allocator is deliberately **not** here.  `try_gc_alloc`
+/// routes to `alloc_nursery_typed` and on through the backend's
+/// `dynasm_alloc_nursery_typed`, which falls back to old-gen rather than
+/// collect precisely because its caller holds an unregistered raw pointer; so
+/// no host-side `w_*_new` is a collection point, and seeding one would report
+/// every allocating body in the interpreter.  A minor runs from compiled code
+/// allocating inline in the nursery, from the elidable bigint payload helpers,
+/// and from a requested collection — which is why an artefact carrying only
+/// interpreter bodies legitimately matches none of the allocator entries and
+/// takes its whole closure from [`PYTHON_DISPATCH_SEEDS`].
 pub const COLLECTING_SEEDS: &[&str] = &[
     "majit_gc::alloc_nursery_collecting_typed",
     "majit_gc::alloc_nursery_collecting_typed_rooted",
@@ -184,6 +198,11 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     "majit_gc::collect_oldgen_nonmoving",
     // The host hook the interpreter reaches them through.
     "gc_hook::try_gc_alloc_collecting_rooted",
+    // A requested collection, which is the one collection point an interpreter
+    // body reaches without running Python at all (`gc.collect()`).
+    "gc_hook::try_gc_collect",
+    "gc_hook::try_gc_collect_step",
+    "gc_hook::try_gc_collect_oldgen",
 ];
 
 impl CallGraph {

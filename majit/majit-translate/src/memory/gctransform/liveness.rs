@@ -69,20 +69,25 @@ pub struct ScanStats {
     pub withheld_under_a_bracket: usize,
 }
 
-/// Callee names that address a `list` or a `dict` through the pointer.
-fn addresses_movable(name: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "w_list_",
-        "w_dict_",
-        "list_concat",
-        "list_repeat",
-        "sequence_repeat",
-        "require_list",
-        "require_dict",
-        "dict_method_",
-        "list_method_",
-    ];
-    MARKERS.iter().any(|m| name.contains(m))
+/// Callee names that say the pointer is addressed as a movable object.
+///
+/// `list` and `dict` are the only two kinds whose header a minor collection
+/// relocates, so a stale `PyObjectRef` handed to one of these is dereferenced
+/// as a corpse rather than merely stored or returned.
+pub const MOVABLE_GC_MARKERS: &[&str] = &[
+    "w_list_",
+    "w_dict_",
+    "list_concat",
+    "list_repeat",
+    "sequence_repeat",
+    "require_list",
+    "require_dict",
+    "dict_method_",
+    "list_method_",
+];
+
+fn addresses_movable(markers: &[&str], name: &str) -> bool {
+    markers.iter().any(|m| name.contains(m))
 }
 
 fn ty_id(t: &TyRef) -> Option<u64> {
@@ -109,6 +114,44 @@ pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
             }
         } else if name.ends_with("gc_roots::shadow_stack_get") {
             if let Some(t) = ty_id(&fd.signature.output) {
+                out.insert(t);
+            }
+        }
+    }
+    out
+}
+
+/// The type ids a `PyFrame` pointer is spelled with in *this* artefact.
+///
+/// The frame is the second thing a minor collection can leave a body holding a
+/// corpse of, and it is the harder one: a `PyObjectRef` at least has a root
+/// stack it can be pinned on, whereas the running frame is carried as a bare
+/// `&mut PyFrame` that no walker reaches.  `eval::FrameAnchor` is the reload
+/// point, and a body that takes one and re-reads `live()` kills its stale local
+/// at the call, so [`scan`] needs no bracket set for this kind — the liveness
+/// answer already distinguishes a reloaded frame from a carried one.
+///
+/// The interpreter spells the pointer three ways and all three go stale, so
+/// each is read off a signature pyre already declares in those terms rather
+/// than hard-coded: a dedup id is artefact-local.  An empty result means the
+/// scan would silently find nothing, so callers must report it.
+pub fn frame_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
+    // Free functions, so the name is the whole match: an inherent method
+    // carries its `impl` block as an opaque segment and cannot be named here.
+    const FIRST_INPUT: &[&str] = &[
+        "eval::install_current_frame",   // &mut PyFrame
+        "eval::handle_exception",        // &mut PyFrame
+        "executioncontext::force_frame", // *mut PyFrame
+        "call::enter_recursive_frame",   // *const PyFrame
+    ];
+    let mut out = HashSet::new();
+    for fd in llbc.iter_local_fns() {
+        let name = fd.item_meta.name_path();
+        if FIRST_INPUT
+            .iter()
+            .any(|p| name == *p || name.ends_with(&format!("::{p}")))
+        {
+            if let Some(t) = fd.signature.inputs.first().and_then(ty_id) {
                 out.insert(t);
             }
         }
@@ -205,12 +248,18 @@ fn successors(t: &TermKind) -> Vec<u64> {
 /// unreachable from entry once the bracket blocks are removed".  A function
 /// that brackets one branch and leaves another bare is therefore still
 /// reported on the bare branch.
+///
+/// `gc_tys` selects which pointer kind is being judged — [`gc_ptr_type_ids`]
+/// for a managed reference, [`frame_ptr_type_ids`] for the running frame — and
+/// `movable_markers` ranks the findings for that kind ([`MOVABLE_GC_MARKERS`],
+/// or empty where the kind has no such call).
 pub fn scan(
     llbc: &majit_charon_reader::Llbc,
     cg: &super::framework::CallGraph,
     reach: &HashSet<u64>,
     push_roots: &HashSet<u64>,
     gc_tys: &HashSet<u64>,
+    movable_markers: &[&str],
 ) -> (Vec<Finding>, ScanStats) {
     let mut findings = Vec::new();
     let mut stats = ScanStats::default();
@@ -336,7 +385,11 @@ pub fn scan(
             let CallKind::Fun(FunId::Regular { id: cid }) = &r2.kind else {
                 continue;
             };
-            if !cg.names.get(cid).is_some_and(|n| addresses_movable(n)) {
+            if !cg
+                .names
+                .get(cid)
+                .is_some_and(|n| addresses_movable(movable_markers, n))
+            {
                 continue;
             }
             for a in &c2.args {
