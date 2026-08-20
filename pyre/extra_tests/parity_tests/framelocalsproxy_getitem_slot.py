@@ -10,6 +10,10 @@
 # as the mapping's key-flavoured `TypeError` rather than the one the hash
 # raises before any slot is examined.
 #
+# The same scan answers a write, and it hashes the key before it looks at any
+# name: a key that hashes like nothing the frame carries names no slot, however
+# it compares.
+#
 # parity-tests reason: the value a hit returns is identical either way, so a
 # snippet that reads a bound local cannot see the difference.  What separates
 # the two shapes is exception text, which is only worth anything next to the
@@ -38,6 +42,64 @@ def scalar_slots():
     print("extra", proxy["extra"])
 
 
+class SameHash:
+    """A non-`str` key that both hashes and compares like the name it holds."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return other == self.name
+
+    def __repr__(self):
+        # The miss below reports the key with `%R`, so the default repr would
+        # put this object's address in the message.
+        return f"<key {self.name}>"
+
+
+class OtherHash(SameHash):
+    """The same key, hashing like nothing the frame carries."""
+
+    def __hash__(self):
+        return hash(self.name) ^ 1
+
+
+def non_str_keys():
+    bound = 1  # noqa: F841 - read through the proxy below
+    proxy = sys._getframe(0).f_locals
+    print("same-hash", proxy[SameHash("bound")])
+    # The scan compares a name only when its hash matches the key's, so a key
+    # that claims equality with a name it does not hash like never reaches the
+    # comparison and reads as absent.
+    key = OtherHash("bound")
+    print("hashes differ", hash(key) != hash(key.name))
+    try:
+        proxy[key]
+    except KeyError as exc:
+        print("other-hash", "KeyError", exc.args)
+
+
+def non_str_key_writes():
+    bound = 1
+    proxy = sys._getframe(0).f_locals
+    # The scan hashes the key before looking at any name, so the key never
+    # reaches the extras dict to be reported in its terms.
+    try:
+        proxy[["unhashable"]] = 1
+    except TypeError as exc:
+        print("write unhashable", "TypeError", exc)
+    proxy[SameHash("bound")] = 2
+    print("same-hash write", bound, proxy["bound"])
+    # This one is filtered out by the hash before the comparison, so it names
+    # no slot and is stored in the extras dict under the key object itself.
+    proxy[OtherHash("bound")] = 3
+    print("other-hash write", bound, proxy["bound"])
+    print("extras keys", sorted(repr(key) for key in proxy if not isinstance(key, str)))
+
+
 def cell_and_free_slots():
     captured = "cell"
 
@@ -58,5 +120,7 @@ def cell_and_free_slots():
 
 
 scalar_slots()
+non_str_keys()
+non_str_key_writes()
 cell_and_free_slots()
 print("OK")
