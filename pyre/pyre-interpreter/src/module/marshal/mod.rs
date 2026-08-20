@@ -670,9 +670,9 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_tuple_placeholder(&self, len: usize) -> Result<Option<Rooted>, wire::MarshalError> {
-        Ok(Some(Rooted::new(
-            tupleobject::w_tuple_new_array_backed(vec![PY_NULL; len]),
-        )))
+        Ok(Some(Rooted::new(tupleobject::w_tuple_new_array_backed(
+            vec![PY_NULL; len],
+        ))))
     }
 
     fn set_tuple_item(
