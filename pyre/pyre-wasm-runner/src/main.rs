@@ -1216,6 +1216,25 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             );
         }
     }
+    // The per-decline inline-bridge log rides the same string export shape.
+    // `bridge_diag` already counts the reasons; this says which crossings they
+    // left behind, so it is printed only with the rest of the stats.
+    if std::env::var_os("PYRE_WASM_JIT_STATS").is_some()
+        && let Ok(declines) =
+            instance.get_typed_func::<(), u64>(&mut store, "pyre_jit_inline_declines")
+        && let Ok(packed) = declines.call(&mut store, ())
+    {
+        let (ptr, len) = ((packed >> 32) as u32, packed as u32);
+        if len != 0 {
+            let mut bytes = vec![0u8; len as usize];
+            memory.read(&store, ptr as usize, &mut bytes)?;
+            dealloc.call(&mut store, (ptr, len))?;
+            eprintln!(
+                "[jit-stats] inline_declines {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
     // `PYRE_FBW_DEBUG_ABORT` cannot select the walker's decline census in the
     // guest, and its `eprintln!` would reach nothing anyway, so the census
     // comes back through its own export and is printed here. Absent on a

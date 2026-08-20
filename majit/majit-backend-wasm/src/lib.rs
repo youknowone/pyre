@@ -125,6 +125,13 @@ static INLINE_GEOMETRY_COUNT: AtomicU64 = AtomicU64::new(0);
 /// by string; the errors themselves come from the install itself, which is the
 /// only build there is.
 static INLINE_TRIAL_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Why each loop-closing bridge was refused a merge into its owner, capped so
+/// a long run cannot grow the log without bound. `bridge_diag`'s counters say
+/// how many declines each reason took; these records carry the keys that say
+/// which ones matter — `(slot, key)` joins a record against the trace-entry
+/// census, whose `entries` count is how often that crossing actually ran.
+static INLINE_DECLINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+const INLINE_DECLINE_LOG_CAP: usize = 64;
 
 pub(crate) fn record_inline_geometry(kind: FrameShortageKind, needed: usize, available: usize) {
     const FIELD_MASK: u64 = (1 << 24) - 1;
@@ -155,6 +162,17 @@ pub fn inline_geometry_count() -> u64 {
 
 pub fn inline_trial_errors() -> String {
     INLINE_TRIAL_ERRORS.lock().unwrap().join(" | ")
+}
+
+pub(crate) fn record_inline_decline(record: String) {
+    let mut log = INLINE_DECLINES.lock().unwrap();
+    if log.len() < INLINE_DECLINE_LOG_CAP {
+        log.push(record);
+    }
+}
+
+pub fn inline_declines() -> String {
+    INLINE_DECLINES.lock().unwrap().join(" | ")
 }
 
 fn record_inline_trial_error(error: &BackendError) {
@@ -3365,14 +3383,27 @@ impl majit_backend::Backend for WasmBackend {
             // steps 3-4). A merged region reads the owner's root flag, which is
             // already set here, so it would be dead on arrival. Decline, and let
             // the out-of-line path mint the fresh flag that keeps the contract.
+            // `(slot, key)` names the crossing this decline leaves in place,
+            // which is what the trace-entry census counts.
+            let decline = |reason: &str| {
+                record_inline_decline(format!(
+                    "bridge={} src={source_trace_id} fi={source_fail_index} \
+                     slot={external_jump_slot} key={external_jump_key} reason={reason}",
+                    self.trace_counter,
+                ));
+            };
             if original_token.is_invalidated() {
                 diag_bump(50);
+                decline("owner_invalidated");
             } else if !is_direct {
                 diag_bump(33);
+                decline("not_direct");
             } else if !bridge_is_loop_closing {
                 diag_bump(34);
+                decline("not_loop_closing");
             } else if !resumes_at_loop_header {
                 diag_bump(38);
+                decline("not_header");
             } else if let Some(mut candidate) = original_token
                 .compiled
                 .get()
@@ -3385,8 +3416,10 @@ impl majit_backend::Backend for WasmBackend {
                     .any(|r| r.source_fail_index == source_fail_index)
                 {
                     diag_bump(36);
+                    decline("already_owned");
                 } else if !codegen::merged_stream_has_loop_label(&candidate) {
                     diag_bump(39);
+                    decline("no_loop_label");
                 } else {
                     self.collect_constants_from_ops(ops);
                     candidate.inlined_bridges.push(codegen::InlinedBridge {
@@ -3484,6 +3517,7 @@ impl majit_backend::Backend for WasmBackend {
                 }
             } else {
                 diag_bump(35);
+                decline("not_reemittable");
             }
         }
 

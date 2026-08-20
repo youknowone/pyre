@@ -1219,6 +1219,13 @@ mod host_abi {
         pack_into_guest(majit_backend_wasm::inline_trial_errors().into_bytes())
     }
 
+    /// Why each loop-closing bridge was refused a merge into its owner, with
+    /// the `(slot, key)` that joins each record against the trace-entry census.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_inline_declines() -> u64 {
+        pack_into_guest(majit_backend_wasm::inline_declines().into_bytes())
+    }
+
     /// Status the last `pyre_run_python` ended with: `SystemExit`'s code, 1 for
     /// an uncaught exception or a `SyntaxError`, else 0. The host exits with
     /// it, as `pyrex` does with `targetpypystandalone.py:37 entry_point`'s
