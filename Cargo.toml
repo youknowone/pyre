@@ -66,20 +66,20 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
 # Pinned to upstream main after the pyre compatibility fixes from #8390 and
 # #8506, the memoryview fixes from #8553, the runtime marshal code-byte hook
-# from #8552, and the `Constants` mutable-access impls from #8557 were merged.
-# `fix_code_filenames` needs `IndexMut` to edit nested code constants in place,
-# and `loads` relies on the #8552 hook to preserve invalid code bytes, so this
-# pin must not move below either.
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
+# from #8552, the `Constants` mutable-access impls from #8557, and the compiler
+# parity fixes from #8550 were merged.  `fix_code_filenames` needs `IndexMut`
+# to edit nested code constants in place, and `loads` relies on the #8552 hook
+# to preserve invalid code bytes, so this pin must not move below either.
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "dd2cc4d77a625661e5ca189f1cf9be199ecaa434" }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "dd2cc4d77a625661e5ca189f1cf9be199ecaa434" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "dd2cc4d77a625661e5ca189f1cf9be199ecaa434" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "dd2cc4d77a625661e5ca189f1cf9be199ecaa434" }
 ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "dd2cc4d77a625661e5ca189f1cf9be199ecaa434" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "dd2cc4d77a625661e5ca189f1cf9be199ecaa434" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "dd2cc4d77a625661e5ca189f1cf9be199ecaa434" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "dd2cc4d77a625661e5ca189f1cf9be199ecaa434" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
