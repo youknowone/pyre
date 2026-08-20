@@ -111,6 +111,75 @@ assert m.Point.__dict__['norm'].__objclass__ is m.Point
 # An unbound descriptor takes the receiver as its first argument.
 assert m.Point.__dict__['norm'](p) == 4 * 4 + 5 * 5
 
+
+def raises(kind, message, call):
+    try:
+        call()
+    except kind as error:
+        assert str(error) == message, '%r != %r' % (str(error), message)
+    else:
+        raise AssertionError('%s was not raised: %s' % (kind.__name__, message))
+
+
+# A descriptor only applies to an instance of the type that declared it: the
+# definition it carries names an offset into that type's block, or a function
+# that casts the receiver to it.
+class Foreign:
+    pass
+
+
+foreign = Foreign()
+for kind, spelling, call in [
+    ('method', 'unbound', lambda: m.Point.__dict__['translate'](foreign, 1, 1)),
+    ('method', '__get__', lambda: m.Point.__dict__['norm'].__get__(foreign)),
+    ('member', '__get__', lambda: m.Point.__dict__['x'].__get__(foreign)),
+    ('member', '__set__', lambda: m.Point.__dict__['x'].__set__(foreign, 7)),
+    ('attribute', '__get__', lambda: m.Point.__dict__['total'].__get__(foreign)),
+    ('attribute', '__set__', lambda: m.Point.__dict__['total'].__set__(foreign, 7)),
+]:
+    name = {'method': 'norm', 'member': 'x', 'attribute': 'total'}[kind]
+    if kind == 'method' and spelling == 'unbound':
+        name = 'translate'
+    raises(
+        TypeError,
+        "descriptor '%s' for 'cpyext_types.Point' objects "
+        "doesn't apply to a 'Foreign' object" % name,
+        call,
+    )
+
+# A subclass is an instance of the declaring type, so it passes.
+assert m.Point.__dict__['norm'](m.Point3(1, 2)) == 1 * 1 + 2 * 2
+
+raises(
+    TypeError,
+    'unbound method Point.norm() needs an argument',
+    lambda: m.Point.__dict__['norm'](),
+)
+
+# ── METH_METHOD ────────────────────────────────────────────────────────
+# The row is handed the class it was declared in, and its bound carrier is
+# `builtin_method` where every other row's is `builtin_function_or_method`.
+p = m.Point(3, 4)
+assert p.declared_in(1, 2) == ('cpyext_types.Point', 3, 2, 0)
+assert p.declared_in(1, k=2) == ('cpyext_types.Point', 3, 1, 1)
+assert m.Point.declared_in(p, 1, 2) == ('cpyext_types.Point', 3, 2, 0)
+assert type(p.declared_in).__name__ == 'builtin_method'
+assert type(p.norm).__name__ == 'builtin_function_or_method'
+assert type(p.translate).__name__ == 'builtin_function_or_method'
+assert p.declared_in.__self__ is p
+# Binding names no module of its own.
+assert p.declared_in.__module__ is None
+assert p.norm.__module__ is None
+assert repr(m.Point.__dict__['declared_in']) == (
+    "<method 'declared_in' of 'cpyext_types.Point' objects>"
+)
+raises(
+    TypeError,
+    "descriptor 'declared_in' for 'cpyext_types.Point' objects "
+    "doesn't apply to a 'Foreign' object",
+    lambda: m.Point.declared_in(foreign, 1),
+)
+
 # ── tp_repr, tp_str, tp_hash, tp_call ──────────────────────────────────
 p = m.Point(3, 4)
 assert repr(p) == 'Point(3, 4)'

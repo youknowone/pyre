@@ -40,6 +40,40 @@ assert m.bump.__self__ is m
 assert m.bump.__module__ == 'cpyext_methods'
 assert callable(m.bump)
 
+
+def refuses(kind, message, call):
+    try:
+        call()
+    except kind as error:
+        assert str(error) == message, '%r != %r' % (str(error), message)
+    else:
+        raise AssertionError('%s was not raised: %s' % (kind.__name__, message))
+
+
+# `__module__` is the one member of the carrier a store may reach; deleting it
+# leaves the slot reading `None` rather than removing it, so the delete is
+# repeatable and the name never falls through to anything else.
+m.bump.__module__ = 'renamed'
+assert m.bump.__module__ == 'renamed'
+del m.bump.__module__
+assert m.bump.__module__ is None
+del m.bump.__module__
+assert m.bump.__module__ is None
+m.bump.__module__ = 'cpyext_methods'
+assert m.bump.__module__ == 'cpyext_methods'
+
+refuses(
+    AttributeError,
+    "attribute '__name__' of 'builtin_function_or_method' objects is not writable",
+    lambda: setattr(m.bump, '__name__', 'nope'),
+)
+refuses(
+    AttributeError,
+    "'builtin_function_or_method' object has no attribute 'spam' "
+    'and no __dict__ for setting new attributes',
+    lambda: setattr(m.bump, 'spam', 1),
+)
+
 def rejects(call, *args, **kwargs):
     try:
         call(*args, **kwargs)

@@ -725,12 +725,39 @@ fn descriptor_name(carrier: PyObjectRef) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
+/// The owner's `_PyType_Name` and the descriptor's own name, which is how a
+/// message naming the unbound method spells it.
+fn descriptor_qualname(carrier: PyObjectRef) -> String {
+    let name = descriptor_name(carrier);
+    let Some(owner) = carrier_objclass(carrier) else {
+        return name;
+    };
+    let owner = unsafe { pyre_object::w_type_get_name(owner) };
+    let owner = owner.rsplit('.').next().unwrap_or(owner);
+    format!("{owner}.{name}")
+}
+
+/// The class to hand a `METH_METHOD` definition, which is the type the
+/// descriptor was declared in.
+///
+/// A row without the flag takes none: the carrier a class is handed derives
+/// from `PyCMethod_Type`, and `method_get` binds every other row as a plain
+/// `PyCFunction`.
+fn defining_class(
+    carrier: PyObjectRef,
+    method: *mut super::methodobject::CPyMethodDef,
+) -> Option<PyObjectRef> {
+    if unsafe { (*method).ml_flags } & super::methodobject::METH_METHOD == 0 {
+        return None;
+    }
+    carrier_objclass(carrier)
+}
+
 /// `descrobject.c` spells each kind differently: `method`, `member` and
 /// `attribute` for the getset.
 fn descr_repr(args: &[PyObjectRef], kind: &str) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
-    let owner = carrier_get(carrier, OBJCLASS_KEY)
-        .filter(|&owner| !owner.is_null())
+    let owner = carrier_objclass(carrier)
         .map(|owner| unsafe { pyre_object::typeobject::w_type_get_name(owner) }.to_string())
         .unwrap_or_else(|| "?".to_string());
     Ok(pyre_object::w_str_new(&format!(
@@ -751,6 +778,41 @@ fn getset_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     descr_repr(args, "attribute")
 }
 
+/// The type a descriptor was declared in, when one was stamped on it.
+///
+/// `new_carrier` seeds the key with whatever class it was handed, and
+/// `stamp_objclass` replaces it once the type is ready, so a carrier reached
+/// before that answers `None`.
+fn carrier_objclass(carrier: PyObjectRef) -> Option<PyObjectRef> {
+    carrier_get(carrier, OBJCLASS_KEY)
+        .filter(|&owner| !owner.is_null() && unsafe { pyre_object::is_type(owner) })
+}
+
+/// `descrobject.c descr_check` — a descriptor only applies to an instance of
+/// the type it was declared in.
+///
+/// The definition it carries is an offset into that type's block, or a
+/// function that casts the receiver to it, so a receiver of any other type
+/// would be read and written at addresses that belong to something else.
+fn descr_check(carrier: PyObjectRef, instance: PyObjectRef) -> Result<(), crate::PyError> {
+    let Some(owner) = carrier_objclass(carrier) else {
+        debug_assert!(
+            false,
+            "a cpyext descriptor reached a call without an __objclass__"
+        );
+        return Ok(());
+    };
+    if unsafe { crate::baseobjspace::issubtype_w((*instance).w_class, owner) } {
+        return Ok(());
+    }
+    let received = unsafe { pyre_object::w_type_get_name((*instance).w_class) };
+    Err(crate::PyError::type_error(format!(
+        "descriptor '{}' for '{}' objects doesn't apply to a '{received}' object",
+        descriptor_name(carrier),
+        unsafe { pyre_object::w_type_get_name(owner) },
+    )))
+}
+
 /// The receiver a `__get__(self, instance, owner)` call names, or `None` when
 /// the attribute was read off the class.
 fn bound_instance(args: &[PyObjectRef]) -> Option<PyObjectRef> {
@@ -766,6 +828,7 @@ fn method_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let Some(instance) = bound_instance(args) else {
         return Ok(carrier);
     };
+    descr_check(carrier, instance)?;
     let method = carrier_def(carrier) as *mut super::methodobject::CPyMethodDef;
     if method.is_null() {
         return Err(crate::PyError::new(
@@ -773,10 +836,13 @@ fn method_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             "cpyext method descriptor lost its definition",
         ));
     }
-    super::methodobject::new_pycfunction(
+    // `method_get` binds with no module, so a bound method answers
+    // `__module__` with `None`.
+    super::methodobject::new_pycfunction_in_class(
         method,
         instance,
-        carrier_get(carrier, OBJCLASS_KEY).unwrap_or_else(pyre_object::w_none),
+        pyre_object::w_none(),
+        defining_class(carrier, method),
     )
 }
 
@@ -786,10 +852,11 @@ fn method_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
     let Some(&instance) = positional.first() else {
         return Err(crate::PyError::type_error(format!(
-            "descriptor '{}' of a cpyext type needs an argument",
-            descriptor_name(carrier)
+            "unbound method {}() needs an argument",
+            descriptor_qualname(carrier)
         )));
     };
+    descr_check(carrier, instance)?;
     let method = carrier_def(carrier) as *mut super::methodobject::CPyMethodDef;
     if method.is_null() {
         return Err(crate::PyError::new(
@@ -797,7 +864,13 @@ fn method_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             "cpyext method descriptor lost its definition",
         ));
     }
-    super::methodobject::call_method_def(method, instance, &positional[1..], kwargs)
+    super::methodobject::call_method_def_in_class(
+        method,
+        instance,
+        defining_class(carrier, method),
+        &positional[1..],
+        kwargs,
+    )
 }
 
 // ── `tp_members` ────────────────────────────────────────────────────────
@@ -1008,6 +1081,7 @@ fn member_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let Some(instance) = bound_instance(args) else {
         return Ok(carrier);
     };
+    descr_check(carrier, instance)?;
     let member = carrier_def(carrier) as *mut CPyMemberDef;
     if member.is_null() {
         return Err(crate::PyError::new(
@@ -1020,6 +1094,7 @@ fn member_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 fn member_descr_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
+    descr_check(carrier, args[1])?;
     let member = carrier_def(carrier) as *mut CPyMemberDef;
     if member.is_null() {
         return Err(crate::PyError::new(
@@ -1041,6 +1116,7 @@ fn getset_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let Some(instance) = bound_instance(args) else {
         return Ok(carrier);
     };
+    descr_check(carrier, instance)?;
     let getset = carrier_def(carrier) as *mut CPyGetSetDef;
     if getset.is_null() || unsafe { (*getset).get.is_null() } {
         return Err(crate::PyError::attribute_error(format!(
@@ -1059,6 +1135,7 @@ fn getset_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 fn getset_descr_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
+    descr_check(carrier, args[1])?;
     let getset = carrier_def(carrier) as *mut CPyGetSetDef;
     if getset.is_null() || unsafe { (*getset).set.is_null() } {
         return Err(crate::PyError::attribute_error(format!(

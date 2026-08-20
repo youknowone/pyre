@@ -148,11 +148,25 @@ static PyObject *point_named(PyObject *self, PyObject *args, PyObject *kwds)
     return PyUnicode_FromString(buffer);
 }
 
+/* A METH_METHOD row: the call is handed the class the definition was
+   declared in, on top of the receiver and the argument vector. */
+static PyObject *point_declared_in(PyObject *self, PyTypeObject *cls,
+                                   PyObject *const *args, Py_ssize_t nargs,
+                                   PyObject *kwnames)
+{
+    PointObject *point = (PointObject *)self;
+    Py_ssize_t named = kwnames == NULL ? 0 : PyTuple_GET_SIZE(kwnames);
+    (void)args;
+    return Py_BuildValue("sinn", cls->tp_name, point->x, nargs, named);
+}
+
 static PyMethodDef point_methods[] = {
     {"translate", (PyCFunction)point_translate, METH_VARARGS, "shift in place"},
     {"norm", (PyCFunction)point_norm, METH_NOARGS, "squared length"},
     {"named", (PyCFunction)(void (*)(void))point_named, METH_VARARGS | METH_KEYWORDS,
      "prefixed name"},
+    {"declared_in", (PyCFunction)(void (*)(void))point_declared_in,
+     METH_METHOD | METH_FASTCALL | METH_KEYWORDS, "the class this row belongs to"},
     {NULL, NULL, 0, NULL},
 };
 
