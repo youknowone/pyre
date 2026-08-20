@@ -9890,7 +9890,7 @@ pub unsafe fn load_method_fast_path(
 /// follow `type.__getattribute__`).  A name the metatype defines as a DATA
 /// DESCRIPTOR is declined too, since that is the one entry `descr_getattribute`
 /// selects ahead of the class's own MRO.  An uncacheable type and any
-/// non-`classmethod` descriptor also decline.
+/// descriptor that is not an EXACT `classmethod` also decline.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
@@ -9925,7 +9925,10 @@ pub unsafe fn classmethod_on_type_fast_path(
         return None;
     }
     let w_descr = lookup_in_type(w_type, name)?;
-    if !pyre_object::is_classmethod(w_descr) {
+    // EXACT, for the reason the `__getattr__`-hook arm records: a `classmethod`
+    // subclass overriding `__get__` binds through that override, so unwrapping
+    // `w_function` in its place calls the wrong callable.
+    if !unsafe { pyre_object::function::is_exact_classmethod(w_descr) } {
         return None;
     }
     let w_func = pyre_object::function::w_classmethod_get_func(w_descr);
