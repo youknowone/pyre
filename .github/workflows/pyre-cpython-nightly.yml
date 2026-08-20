@@ -109,10 +109,18 @@ jobs:
       if: steps.llbc-cache.outputs.cache-hit != 'true'
       shell: bash
       run: scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-jit
-    - name: Build backends
-      run: |
-        cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
-        cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift
+    - name: Build the dynasm backend
+      id: build-dynasm
+      run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
+    - name: Build the cranelift backend
+      id: build-cranelift
+      # Carries the same schedule predicate as the lane that uses it. The daily
+      # run never invokes this binary, so building it there spends the time for
+      # nothing -- and a step that fails skips every later step which does not
+      # say otherwise, so a cranelift-only break would take the daily dynasm
+      # lane with it and leave the night with no report at all.
+      if: ${{ github.event.schedule != '0 7 * * *' }}
+      run: cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift
     - name: dynasm (JIT on)
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --jobs 3 --timeout 300 --report reports/dynasm-jit.json
     # These two run on the weekly schedule and on a manual dispatch, not every
@@ -121,16 +129,21 @@ jobs:
     # `github.event.schedule` at all, so a positive test would skip these on
     # exactly the run a human asked for -- and would do it silently.
     #
-    # `!cancelled()` rather than `success()` is the other half: a lane exits
-    # nonzero on more than a regression -- `--full` gates none of those, but a
-    # summary short of the modules it selected still returns 1 -- and without
-    # it the JIT-divergence comparison this pair exists to produce is lost to
-    # whichever lane happened to run first.
+    # `!cancelled()` rather than the implicit `success()` is the other half: a
+    # lane exits nonzero on more than a regression -- `--full` gates none of
+    # those, but a summary short of the modules it selected still returns 1 --
+    # and without it the JIT-divergence comparison this pair exists to produce
+    # is lost to whichever lane happened to run first. What that must not also
+    # buy is a lane running without the binary it needs, which is what the
+    # explicit build outcome restores: dropping `success()` is about the lane
+    # before, not about the build.
     - name: dynasm (JIT off)
-      if: ${{ !cancelled() && github.event.schedule != '0 7 * * *' }}
+      if: ${{ !cancelled() && steps.build-dynasm.outcome == 'success' && github.event.schedule != '0 7 * * *' }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --no-jit --jobs 3 --timeout 300 --report reports/dynasm-nojit.json
+    # A skipped step's outcome is `skipped`, not `success`, so requiring the
+    # build to have succeeded already carries the schedule predicate with it.
     - name: cranelift (JIT on)
-      if: ${{ !cancelled() && github.event.schedule != '0 7 * * *' }}
+      if: ${{ !cancelled() && steps.build-cranelift.outcome == 'success' }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend cranelift --jobs 3 --timeout 300 --report reports/cranelift-jit.json
     - name: Upload reports
       if: ${{ always() }}
