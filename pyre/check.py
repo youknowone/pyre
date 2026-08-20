@@ -7,7 +7,6 @@ Cross-platform Python translation of pyre/check.sh.
 import argparse
 import difflib
 import hashlib
-import itertools
 import math
 import os
 import re
@@ -1977,50 +1976,58 @@ def workspace_member_dirs():
     A source file only reaches a compiler if it belongs to a member crate, so
     this is what separates a build input from a bench fixture or a baseline
     sitting elsewhere in the tree. `pyre/pyrex/tests/gate_triage_complete.rs`
-    derives its own search roots the same way, for the same reason.
+    derives its own search roots the same way, for the same reason — including
+    the line anchor, which is what keeps `default-members = [` above from
+    being read as this array.
     """
     manifest = Path("Cargo.toml").read_text(encoding="utf-8")
-    after = manifest.split("\nmembers = [", 1)
-    if len(after) != 2:
+    listing = re.search(r"^\s*members\s*=\s*\[(.*?)\]", manifest, re.S | re.M)
+    if not listing:
         return []
-    listing = after[1].split("]", 1)[0]
-    # Quoted entries only: the array carries `# majit` / `# pyre` comment lines.
-    return re.findall(r'"([^"]+)"', listing)
+    members = []
+    for member in re.findall(r'"([^"]+)"', listing.group(1)):
+        # Cargo accepts a glob member. There is none today; expanding here
+        # keeps a future one from being read as a literal directory name that
+        # matches nothing and silently narrows the input set.
+        if any(char in member for char in "*?["):
+            members.extend(sorted(str(path) for path in Path().glob(member)))
+        else:
+            members.append(member)
+    return members
 
 
-def declared_rerun_inputs():
-    """Paths the build scripts declared with `cargo:rerun-if-changed=`.
+def llbc_input_paths():
+    """The LLBC artefacts the JIT front end will actually read.
 
-    Build scripts consume inputs that live outside any crate directory —
-    `pyre-interpreter/build.rs` embeds a closure of `lib-python/3` stdlib
-    modules — and each one names them here. Reading the declarations back is
-    what keeps this check from carrying a second, drifting copy of that list.
-    The files exist only once something has been built, which is the only case
-    `--no-build` applies to anyway.
+    `majit-translate/src/lib.rs:185` resolves them from `PYRE_MIR_FRONTEND_LLBC`
+    (an OS path-list) before falling back to the workspace `build/llbc`, so a
+    run under that override is built against different bytes than the default
+    glob names.
     """
-    paths = []
-    # `target/<profile>/build/…` for a host build, `target/<triple>/<profile>/…`
-    # for the wasm one.
-    outputs = itertools.chain(
-        Path("target").glob("*/build/*/output"),
-        Path("target").glob("*/*/build/*/output"),
-    )
-    for output in outputs:
-        try:
-            text = output.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            _, sep, value = line.partition("cargo:rerun-if-changed=")
-            if sep and value:
-                paths.append(value)
-    return paths
+    override = os.environ.get("PYRE_MIR_FRONTEND_LLBC")
+    if override:
+        return [entry for entry in override.split(os.pathsep) if entry]
+    return [str(path) for path in Path("build/llbc").glob("*.ullbc")]
 
 
 def build_input_paths():
     """Every file a release artefact is built from, or `None` when the tree
     cannot be enumerated — which makes the freshness gate below fail open
     rather than block a checkout that has no git.
+
+    Deliberately derived from the tree alone, never from `target/`. Reading the
+    build scripts' own `cargo:rerun-if-changed=` declarations back out of
+    `target/*/build/*/output` was tried and removed: the paths there are
+    written relative to each crate's own directory, so all but one of the 57
+    failed to resolve from the repository root and the whole mechanism
+    contributed nothing but a dependence on which profiles and targets happened
+    to have been built.
+
+    One class is knowingly outside the set: an input a build script reads from
+    outside its crate. The only one in the tree is the `lib-python/3` closure
+    `pyre-interpreter/build.rs` embeds, and it is guarded by `wasm_vfs`, a
+    feature no artefact this script measures is built with. Enabling it for the
+    wasm-host build would mean adding that closure here.
     """
     try:
         listing = subprocess.run(
@@ -2039,14 +2046,17 @@ def build_input_paths():
     # codec `.c`/`.h` sources and the app-level `.py` bodies reach the binary
     # exactly as the `.rs` files do.
     paths = [p for p in tracked if p.startswith(members) or p in ROOT_BUILD_INPUTS]
-    # The extracted LLBC is a build input the fingerprint gate already tracks
-    # by content, but it lives under build/ and so is not tracked by git.
-    paths += [str(p) for p in Path("build/llbc").glob("*.ullbc")]
-    paths += declared_rerun_inputs()
+    # The LLBC is a build input the fingerprint gate already tracks by content,
+    # but it is generated rather than tracked by git.
+    paths += llbc_input_paths()
     return sorted(set(paths))
 
 
-_BUILD_INPUTS_FINGERPRINT = None
+# Sentinel distinguishing "not computed yet" from "computed, and there is no
+# answer": a `None` result must be cached too, or one unenumerable call would
+# leave a later call free to answer differently within the same run.
+_FINGERPRINT_UNSET = object()
+_BUILD_INPUTS_FINGERPRINT = _FINGERPRINT_UNSET
 
 
 def build_inputs_fingerprint():
@@ -2056,23 +2066,34 @@ def build_inputs_fingerprint():
     switch, or an editor rewriting a file it did not change re-stamps whole
     subtrees, and a gate reading mtimes then blocks a build that is in fact
     current. Hashing the roughly one thousand inputs (about 1GB, most of it
-    the LLBC) costs ~0.6s, against the multi-minute build `--no-build` exists
-    to skip.
+    the LLBC) costs under a second, against the multi-minute build
+    `--no-build` exists to skip.
+
+    Computed after a build rather than before it: `cargo` may rewrite
+    `Cargo.lock`, which is itself an input, so the state that produced the
+    artefact is the state that exists once the build has finished. Nothing
+    else a build writes is in the set — that is what keeps the two orders
+    equivalent for every other input.
     """
     global _BUILD_INPUTS_FINGERPRINT
-    if _BUILD_INPUTS_FINGERPRINT is not None:
+    if _BUILD_INPUTS_FINGERPRINT is not _FINGERPRINT_UNSET:
         return _BUILD_INPUTS_FINGERPRINT
     paths = build_input_paths()
     if paths is None:
+        _BUILD_INPUTS_FINGERPRINT = None
         return None
     digest = hashlib.sha256()
     for path in paths:
+        # The name goes in before the bytes are read, so a file that is
+        # tracked but unreadable is distinguishable both from one that is
+        # absent from the list and from one that is empty.
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
         try:
             handle = open(path, "rb")
         except OSError:
+            digest.update(b"<unreadable>\0")
             continue
-        digest.update(path.encode("utf-8"))
-        digest.update(b"\0")
         with handle:
             while chunk := handle.read(1 << 20):
                 digest.update(chunk)
@@ -2085,14 +2106,20 @@ def artefact_fingerprint_path(artefact):
 
 
 def stamp_artefact_inputs(artefact):
-    """Record the inputs an artefact was just built from, beside it."""
+    """Record the inputs an artefact was just built from, beside it.
+
+    A failure here is not worth losing a finished build over, but it is worth
+    saying: the next `--no-build` run would otherwise report the artefact as
+    unstamped with no trace of why.
+    """
     fingerprint = build_inputs_fingerprint()
     if fingerprint is None:
         return
+    stamp = artefact_fingerprint_path(artefact)
     try:
-        artefact_fingerprint_path(artefact).write_text(fingerprint, encoding="utf-8")
-    except OSError:
-        pass
+        stamp.write_text(fingerprint, encoding="utf-8")
+    except OSError as exc:
+        print(f"  warning: could not write the build-input stamp {stamp}: {exc}")
 
 
 def require_fresh_artefacts(backend, artefacts):
