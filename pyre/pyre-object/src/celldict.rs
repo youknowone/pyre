@@ -1083,6 +1083,27 @@ impl ModuleDictStrategy {
         storage.entries.values().map(|v| unsafe { unwrap_cell(*v) })
     }
 
+    /// The name at iteration position `index`, or `None` past the end.
+    ///
+    /// `getiterkeys` walks the whole map; a dict view's integer cursor wants
+    /// one entry, and the storage is an `IndexMap`, so ask it directly.
+    pub fn nth_key<'a>(&self, storage: &'a ModuleDictStorage, index: usize) -> Option<&'a str> {
+        storage.entries.get_index(index).map(|(k, _)| k.as_str())
+    }
+
+    /// [`Self::nth_key`]'s value half, unwrapped the way `getitervalues`
+    /// unwraps (`celldict.py:152-154 values`).
+    pub fn nth_unwrapped_value(
+        &self,
+        storage: &ModuleDictStorage,
+        index: usize,
+    ) -> Option<PyObjectRef> {
+        storage
+            .entries
+            .get_index(index)
+            .map(|(_, v)| unsafe { unwrap_cell(*v) })
+    }
+
     /// GC root walk over every live `GlobalCache.cell` reachable through
     /// this strategy's `caches` registry (`celldict.py:214
     /// get_global_cache`), forwarding the movable value each cell holds.
@@ -1178,12 +1199,11 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             .collect()
     }
 
-    /// `celldict.py:144-149 values`.
+    /// `celldict.py:144-149 values` — reads the cells and nothing else.
+    /// Routing this through `items` wrapped every name into a
+    /// `W_UnicodeObject` only to drop it.
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        crate::dictmultiobject::w_dict_items(w_dict)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect()
+        crate::dictmultiobject::w_module_dict_values_inner(w_dict)
     }
 
     /// `celldict.py:151-155 items` — branches on `is_object_strategy`
@@ -1191,6 +1211,24 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// via `w_str_new`.
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
         crate::dictmultiobject::w_module_dict_items_inner(w_dict)
+    }
+
+    /// A module dict is not one of the tiny strategies the `nth_item`
+    /// default was written for. Taking one entry by materialising `items`
+    /// wrapped every name in the dict — and `w_str_new` never frees — so a
+    /// single walk of a module dict left one immortal `W_UnicodeObject` per
+    /// name per step behind it.
+    unsafe fn nth_item(
+        &self,
+        w_dict: PyObjectRef,
+        index: usize,
+    ) -> Option<(PyObjectRef, PyObjectRef)> {
+        crate::dictmultiobject::w_module_dict_nth_item_inner(w_dict, index)
+    }
+
+    /// The value half of [`Self::nth_item`], which wraps no name at all.
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+        crate::dictmultiobject::w_module_dict_nth_value_inner(w_dict, index)
     }
 
     /// `celldict.py:157-159 clear`.  Branches on

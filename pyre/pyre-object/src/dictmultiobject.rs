@@ -5098,6 +5098,61 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
     }
 }
 
+/// [`w_module_dict_items_inner`] for one iteration position.
+///
+/// The dict view's integer cursor asks for a single entry, and both storage
+/// halves are `IndexMap`s, so this reads that entry rather than building the
+/// whole list. Only the one name is wrapped.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_nth_item_inner(
+    obj: PyObjectRef,
+    index: usize,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    lock_dict_refs!(_module_guard, obj);
+    if let Some(entries) = w_module_dict_object_storage(obj) {
+        return entries.get_index(index).map(|(k, &v)| (k.obj, v));
+    }
+    let strategy = &*w_module_dict_get_strategy(obj);
+    let key = strategy.nth_key(&*w_module_dict_get_storage(obj), index)?;
+    // Wrapping the name allocates, so root the wrapper and read the value
+    // back afterwards — the cell storage keeps it traced.
+    let roots = crate::gc_roots::push_roots();
+    let key_slot = roots.base();
+    roots.pin_root(crate::w_str_new(key));
+    let value = strategy.nth_unwrapped_value(&*w_module_dict_get_storage(obj), index)?;
+    Some((roots.get(key_slot), value))
+}
+
+/// [`w_module_dict_nth_item_inner`]'s value half, which wraps no name.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_nth_value_inner(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    lock_dict_refs!(_module_guard, obj);
+    if let Some(entries) = w_module_dict_object_storage(obj) {
+        return entries.get_index(index).map(|(_, &v)| v);
+    }
+    let strategy = &*w_module_dict_get_strategy(obj);
+    strategy.nth_unwrapped_value(&*w_module_dict_get_storage(obj), index)
+}
+
+/// `celldict.py:144-149 values` — the cells, with no name wrapped.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ModuleDictObject`.
+pub unsafe fn w_module_dict_values_inner(obj: PyObjectRef) -> Vec<PyObjectRef> {
+    lock_dict_refs!(_module_guard, obj);
+    if let Some(entries) = w_module_dict_object_storage(obj) {
+        return entries.values().copied().collect();
+    }
+    let strategy = &*w_module_dict_get_strategy(obj);
+    strategy
+        .getitervalues(&*w_module_dict_get_storage(obj))
+        .collect()
+}
+
 /// Iterate over (key_str, value) pairs. Keys must be str objects.
 ///
 /// Pyre-only convenience wrapper around `w_dict_items` that drops
