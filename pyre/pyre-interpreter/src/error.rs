@@ -1457,12 +1457,18 @@ impl PyError {
         // Reload the deferred context refs after the exception / args
         // allocations: the pins keep them alive, but a minor collection may
         // have relocated the young objects, leaving the stored fields stale.
+        // Store each reloaded address back on the error as well. The pins
+        // above pop when this scope ends, and `walk_gc_refs` keeps forwarding
+        // both fields afterwards, so leaving the pre-move address here would
+        // hand the collector a moved-from slot.
         if !self.w_name_context.is_null() {
             let w_name_context = pyre_object::gc_roots::shadow_stack_get(name_ctx_slot);
+            self.w_name_context = w_name_context;
             unsafe { pyre_object::interp_exceptions::w_exception_set_name(exc, w_name_context) };
         }
         if !self.w_obj_context.is_null() {
             let w_obj_context = pyre_object::gc_roots::shadow_stack_get(obj_ctx_slot);
+            self.w_obj_context = w_obj_context;
             unsafe { pyre_object::interp_exceptions::w_exception_set_attr_obj(exc, w_obj_context) };
         }
         // Write-once memo (`get_w_value` self.w_value): cache the materialised
