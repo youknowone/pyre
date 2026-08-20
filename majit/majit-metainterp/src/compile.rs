@@ -199,12 +199,16 @@ pub struct CompiledExitLayout {
 impl CompiledExitLayout {
     /// Whether the collector traces exit slot `slot`.
     ///
-    /// The rule `llsupport/assembler.py compute_gcmap` applies: every
-    /// `REF`-typed failarg is marked, and nothing narrows it further.  A
-    /// force token is included, because `resoperation.py FORCE_TOKEN/0/r`
-    /// is REF upstream as well — it returns the jitframe, itself a GC
-    /// object that moves — and both emitted gcmaps
+    /// The rule `llsupport/assembler.py compute_gcmap` applies: it skips the
+    /// hole a virtual leaves (`if arg is None: continue`), marks every
+    /// remaining `REF`-typed failarg, and narrows nothing else.  A force
+    /// token is marked like any other, because `resoperation.py
+    /// FORCE_TOKEN/0/r` is REF upstream as well — it returns the jitframe,
+    /// itself a GC object that moves — and both emitted gcmaps
     /// (`guard_gcmap_from_faillocs`, `collect_guards`) mark it.
+    ///
+    /// The skip has nothing to do here: an exit layout reaches this point
+    /// with every fail arg bound, so the type test is the whole rule.
     ///
     /// Do not narrow it by force-token position: that would stop rooting a
     /// live jitframe pointer.
@@ -2717,7 +2721,8 @@ mod tests {
     /// The deadframe rooting in `handle_fail` reaches the layout, not the
     /// descr it came from, so the layout answers from its own types.  A
     /// force-token slot is traced like any other ref — `compute_gcmap`
-    /// marks every REF failarg.
+    /// marks every REF failarg it does not skip, and it skips only the hole a
+    /// virtual leaves.
     #[test]
     fn exit_layout_traces_every_ref_slot_including_force_tokens() {
         let layout = CompiledExitLayout {

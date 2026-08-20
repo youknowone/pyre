@@ -2237,10 +2237,15 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// `llsupport/assembler.py:46-64 GuardToken.compute_gcmap`: every
-    /// `REF`-typed failarg is marked and nothing narrows it further.  That
-    /// includes a force token — `resoperation.py FORCE_TOKEN/0/r` returns
-    /// the jitframe, itself a moving GC object.
+    /// `llsupport/assembler.py:46-64 GuardToken.compute_gcmap`: skip the hole
+    /// a virtual leaves (`if arg is None: continue`), mark every remaining
+    /// `REF`-typed failarg, narrow nothing else.  A force token is marked like
+    /// any other — `resoperation.py FORCE_TOKEN/0/r` returns the jitframe,
+    /// itself a moving GC object.
+    ///
+    /// The skip is carried by the location rather than the type: only a
+    /// `Reg` or `Frame` location names a slot, so a fail arg that has neither
+    /// contributes no bit.
     fn guard_gcmap_from_faillocs(
         &self,
         fail_arg_types: &[Type],

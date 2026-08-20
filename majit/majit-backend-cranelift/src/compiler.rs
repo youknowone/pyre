@@ -16091,9 +16091,14 @@ fn collect_guards(
         //     also contain Const (handled by regalloc.py:1192-1193 in the same
         //     loop). majit groups external JUMP with FINISH for fail_args
         //     bookkeeping; treat their gcmap the same way.
-        // `compute_gcmap` marks every REF failarg and narrows nothing: a
-        // force token is REF too (`FORCE_TOKEN/0/r` returns the jitframe, a
-        // moving GC object), so its slot is marked like any other.
+        // `compute_gcmap` skips the hole a virtual leaves (`if arg is None:
+        // continue`), marks every remaining REF failarg, and narrows nothing
+        // else. No hole reaches this map: `spill_guard_fail_args` resolves
+        // every fail arg through `resolve_opref`, which refuses `OpRef::NONE`
+        // rather than substituting a zero, so a guard carrying one fails to
+        // compile before a gcmap exists. A force token is REF too
+        // (`FORCE_TOKEN/0/r` returns the jitframe, a moving GC object), so its
+        // slot is marked like any other.
         let failarg_ref_slots = {
             let mut slots = Vec::new();
             for (i, tp) in fail_arg_types.iter().enumerate() {
