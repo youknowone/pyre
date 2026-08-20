@@ -24372,12 +24372,6 @@ mod tests {
         VALUES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
-    #[allow(dead_code)]
-    fn may_force_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     #[cfg(feature = "cranelift")]
     fn with_forced_deadframe(force_token: i64, f: impl FnOnce(DeadFrame)) {
         f(force_token_to_dead_frame(GcRef(force_token as usize)));
@@ -24912,7 +24906,7 @@ mod tests {
             .collect()
     }
 
-    #[allow(dead_code)]
+    #[test]
     fn finish_trace_for_parity_preserves_captured_snapshots() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();

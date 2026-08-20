@@ -6765,8 +6765,6 @@ mod tests {
     /// — the offset is only a stand-in for the mint sites that carry no name.
     #[test]
     fn a_named_field_resolves_by_name_through_an_ambiguous_offset() {
-        #[allow(dead_code)]
-        const TID: u64 = 0x4E41_4D45_4B59;
         let fields = [
             (0, false, "head", 8, false),
             (8, false, "agg", 8, true),
