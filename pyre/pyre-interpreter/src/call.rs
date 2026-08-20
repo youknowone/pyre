@@ -2714,8 +2714,7 @@ fn call_with_kwargs_in_ctx_impl(
                     // The argument marshalling below allocates before the frame
                     // is handed to the profiling call, so the profiled frame is
                     // read back out of the anchor rather than from this local.
-                    let frame_anchor =
-                        unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
+                    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
                     let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
                         .iter()
                         .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))
@@ -2821,8 +2820,7 @@ fn call_with_kwargs_in_ctx_impl(
                     // The argument marshalling below allocates before the frame
                     // is handed to the profiling call, so the profiled frame is
                     // read back out of the anchor rather than from this local.
-                    let frame_anchor =
-                        unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
+                    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
                     let keyword_names_w: Vec<pyre_object::PyObjectRef> = kwargs
                         .iter()
                         .map(|(k, _)| pyre_object::w_str_from_wtf8(k.clone()))

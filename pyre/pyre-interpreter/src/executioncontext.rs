@@ -1377,8 +1377,9 @@ impl ExecutionContext {
             if call_result.is_err() {
                 self.settrace(pyre_object::w_none());
                 unsafe {
-                    (*frame_anchor.live()).getorcreatedebug(init_lineno).w_f_trace =
-                        pyre_object::PY_NULL;
+                    (*frame_anchor.live())
+                        .getorcreatedebug(init_lineno)
+                        .w_f_trace = pyre_object::PY_NULL;
                 }
             }
             let frame = frame_anchor.live();
