@@ -81,7 +81,7 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
 
     // An uncaught `assert` in the program surfaces here as `Err`, so a
     // successful return means every read-back assertion held.
-    eval_with_jit(&mut frame).map_err(|e| format!("execution error: {}", e.message))?;
+    eval_with_jit(&mut frame, None).map_err(|e| format!("execution error: {}", e.message))?;
 
     // Non-vacuity: the stable instance allocator hook is installed by the
     // `JIT_DRIVER` initializer (`driver_pair` -> `init_gc_subsystem` ->
