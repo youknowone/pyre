@@ -791,15 +791,9 @@ pub unsafe fn instance_node_getdictvalue_checked(
     ensure_mapdict_initialized(obj);
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
-    let w = unsafe { node_read_checked(map, &inst, name, DICT) }?;
-    // mapdict.py:846-847 getdictvalue → read → _direct_read (592-598): lazily
-    // migrate to boxed storage when the read attribute is unboxed and its class
-    // has frozen unboxing.  A raise in `read` unwinds before the migration tail
-    // (846-847 → 58 → 312-313 returns None on the miss path, never reaching
-    // _direct_read), so migration is skipped whenever the read raised;
-    // propagating the read error here mirrors that — and `maybe_migrate_to_boxed`
-    // re-derives the None on the raising path, so it is a no-op there regardless.
-    unsafe { maybe_migrate_to_boxed(map, &mut inst, name, DICT) };
+    // mapdict.py:846-847 getdictvalue → read → _direct_read (592-598): the read
+    // and its lazy migrate-to-boxed tail, off one resolved node.
+    let w = unsafe { node_read_converting(map, &mut inst, name, DICT) }?;
     Ok(w)
 }
 
@@ -942,11 +936,10 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
-    let w_res = unsafe { node_read(map, &inst, Wtf8::new("slot"), attrkind) };
     // read → _direct_read (mapdict.py:592-598) lazily migrates an unboxed
-    // attribute to boxed storage, as in `instance_node_getdictvalue`.
-    unsafe { maybe_migrate_to_boxed(map, &mut inst, Wtf8::new("slot"), attrkind) };
-    w_res
+    // attribute to boxed storage, as in `instance_node_getdictvalue`; both come
+    // off the one node `node_read_converting` resolves.
+    unsafe { node_read_converting(map, &mut inst, Wtf8::new("slot"), attrkind) }.unwrap_or(None)
 }
 
 /// mapdict.py:770-772 `MapdictSlotsSupport.setslotvalue` —
@@ -1291,10 +1284,12 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &Wtf8, attrkind: u16) -> Op
     let attr_hash = ((product ^ (product << SHIFT1)) >> SHIFT2) as usize;
 
     let mut cache = MAP_ATTR_CACHE.lock().unwrap();
-    if cache.attrs[attr_hash] == self_node
-        && cache.names[attr_hash].as_deref() == Some(name)
-        && cache.indexes[attr_hash] == attrkind
-    {
+    // mapdict.py:104 keeps the name by reference; pyre's slot owns its bytes,
+    // so a fill that lands on a bucket already naming this attribute keeps the
+    // buffer rather than reallocating it.  Which name a bucket holds is fixed
+    // by the hash, so this is the ordinary case for a re-filled bucket.
+    let name_matches = cache.names[attr_hash].as_deref() == Some(name);
+    if name_matches && cache.attrs[attr_hash] == self_node && cache.indexes[attr_hash] == attrkind {
         let cached = cache.cached_attrs[attr_hash];
         return if cached.is_null() { None } else { Some(cached) };
     }
@@ -1306,7 +1301,9 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &Wtf8, attrkind: u16) -> Op
     // `find_map_attr_chain` directly.
     if crate::baseobjspace::side_effects_ok() {
         cache.attrs[attr_hash] = self_node;
-        cache.names[attr_hash] = Some(name.to_owned());
+        if !name_matches {
+            cache.names[attr_hash] = Some(name.to_owned());
+        }
         cache.indexes[attr_hash] = attrkind;
         cache.cached_attrs[attr_hash] = attr.unwrap_or(std::ptr::null());
     }
@@ -1427,24 +1424,48 @@ unsafe fn mapdict_map_or_null(w_obj: PyObjectRef) -> MapRef {
 /// attribute), then for an unboxed attribute whose class has frozen unboxing
 /// (`terminator.allow_unboxing == False`) migrate the instance off unboxed
 /// storage so the class stops minting unboxed map variants. (Same migration
-/// condition as `maybe_migrate_to_boxed`, evaluated here on the already-resolved
-/// node rather than re-walking the chain.)
+/// condition as `attr_migrates_to_boxed`, on the already-resolved node.)
 ///
 /// # Safety
 /// `attr` must point to a live `PlainAttribute`; `obj` to its live carrier.
 unsafe fn direct_read<O: MapdictObject>(attr: MapRef, obj: &mut O) -> PyObjectRef {
     // mapdict.py:592/600-601 `_prim_direct_read`.
     let w_res = unsafe { plain_direct_read(attr, &*obj) };
+    if !unsafe { attr_migrates_to_boxed(attr) } {
+        return w_res;
+    }
+    // mapdict.py:594-596 `_convert_to_boxed(obj)`.  It rebuilds the carrier
+    // through `node_copy`, which allocates, and the value read above is named
+    // by nothing else — publish it and take it back from the slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::pin_roots(&[w_res]);
+    unsafe { convert_to_boxed(obj) };
+    pyre_object::gc_roots::shadow_stack_get(value_slot)
+}
+
+/// mapdict.py:593-596 — the migration test of `_direct_read`, on an
+/// already-resolved node: an unboxed attribute whose class has stopped allowing
+/// unboxing migrates the whole instance off unboxed storage.
+///
+/// # Safety
+/// `attr` must point to a live `PlainAttribute`.
+unsafe fn attr_migrates_to_boxed(attr: MapRef) -> bool {
     let p = unsafe { (*attr).as_plain() };
-    if p.unboxed.is_some()
+    p.unboxed.is_some()
         && !unsafe { (*p.terminator).as_terminator() }
             .allow_unboxing
             .get()
-    {
-        // mapdict.py:594-596 `_convert_to_boxed(obj)`.
+}
+
+/// [`direct_read`]'s migration half alone, for a caller that has already taken
+/// the value through `plain_direct_read` off the same node.
+///
+/// # Safety
+/// `attr` must point to a live `PlainAttribute`; `obj` to its live carrier.
+unsafe fn migrate_to_boxed_if_frozen<O: MapdictObject>(attr: MapRef, obj: &mut O) {
+    if unsafe { attr_migrates_to_boxed(attr) } {
         unsafe { convert_to_boxed(obj) };
     }
-    w_res
 }
 
 /// mapdict.py:1461-1477 `_fill_cache`. Store the resolved `(map, attr,
@@ -3429,7 +3450,7 @@ unsafe fn value_has_unbox_type(typ: UnboxType, w_value: PyObjectRef) -> bool {
 /// `_pure_direct_read` variant is applied when the read is JIT-wired.
 /// `unerase_item` is identity. For an `UnboxedPlainAttribute`,
 /// mapdict.py:592-612 gives `_direct_read` the allow-unboxing conversion tail;
-/// pyre places that tail in `maybe_migrate_to_boxed`.
+/// pyre places that tail in `direct_read`.
 ///
 /// # Safety
 /// `attr` must point to a live `PlainAttribute` map node.
@@ -3448,8 +3469,8 @@ pub unsafe fn plain_direct_read<O: MapdictObject>(attr: MapRef, obj: &O) -> PyOb
             // read shared by node_read / copy_attr / reorder_and_add /
             // materialize. `_direct_read`'s lazy migrate-to-boxed side effect
             // (mapdict.py:592-598, when the class has frozen unboxing) lives at
-            // the getattr boundary in `maybe_migrate_to_boxed`, which `&mut`
-            // access permits there; here `&obj` stays pure.
+            // the getattr boundary in `direct_read`, which `&mut` access permits
+            // there; here `&obj` stays pure.
             w_res
         }
     }
@@ -3558,6 +3579,32 @@ pub unsafe fn node_read<O: MapdictObject>(
     unsafe { node_read_checked(self_node, obj, name, attrkind) }.unwrap_or(None)
 }
 
+/// [`node_read_checked`] plus `_direct_read`'s migration tail
+/// (mapdict.py:592-598), both taken off the node this resolves once — the read
+/// the getattr and slot boundaries owe.
+///
+/// Splitting them costs a second `find_map_attr` for the same
+/// `(map, name, attrkind)`, and `find_map_attr`'s cache probe holds a
+/// process-wide lock, so the re-lookup is not the free cache hit it reads as.
+///
+/// A raising terminator probe unwinds before the tail, which is also what
+/// upstream does (`:846-847` → `:58` → `:312-313` returns on the miss path and
+/// never reaches `_direct_read`).
+///
+/// # Safety
+/// `self_node` and its chain must point to live map nodes.
+pub unsafe fn node_read_converting<O: MapdictObject>(
+    self_node: MapRef,
+    obj: &mut O,
+    name: &Wtf8,
+    attrkind: u16,
+) -> Result<Option<PyObjectRef>, PyError> {
+    match unsafe { find_map_attr(self_node, name, attrkind) } {
+        Some(attr) => Ok(Some(unsafe { direct_read(attr, obj) })),
+        None => unsafe { terminator_read_checked((*self_node).terminator(), obj, name, attrkind) },
+    }
+}
+
 /// Fallible [`node_read`], for the callers that can propagate the raising
 /// `__eq__` a devolved terminator's dict probe may reach.
 ///
@@ -3574,47 +3621,9 @@ pub unsafe fn node_read_checked<O: MapdictObject>(
         // attr.ever_mutated` guard selects `_pure_direct_read`
         // (mapdict.py:60-65). The PlainAttribute variants have the same body;
         // UnboxedPlainAttribute._direct_read's conversion tail lives in
-        // `maybe_migrate_to_boxed`.
+        // `direct_read`.
         Some(attr) => Ok(Some(unsafe { plain_direct_read(attr, obj) })),
         None => unsafe { terminator_read_checked((*self_node).terminator(), obj, name, attrkind) },
-    }
-}
-
-/// mapdict.py:592-598 `UnboxedPlainAttribute._direct_read` migration tail.
-/// `node_read` is the shared pure value read (`_prim_direct_read` based, also
-/// used by `copy_attr`/`node_materialize_dict`/`node_set_terminator`); the
-/// getattr `read` path (`getdictvalue`, mapdict.py:846-847 → 55-66) additionally
-/// runs `_direct_read`, which lazily migrates `obj` to boxed storage once the
-/// read attribute is unboxed and its class has frozen unboxing
-/// (`terminator.allow_unboxing` False). A boxed attribute's `_direct_read` is
-/// `_prim_direct_read` (no migration), so this is a no-op for them. The
-/// `find_map_attr` re-lookup hits the per-VM transition cache.
-///
-/// # Safety
-/// `self_node`/its chain must point to live map nodes; `obj` to a live carrier.
-unsafe fn maybe_migrate_to_boxed<O: MapdictObject>(
-    self_node: MapRef,
-    obj: &mut O,
-    name: &Wtf8,
-    attrkind: u16,
-) {
-    let attr = match unsafe { find_map_attr(self_node, name, attrkind) } {
-        Some(a) => a,
-        None => return,
-    };
-    let p = unsafe { (*attr).as_plain() };
-    let migrate = match &p.unboxed {
-        Some(_) => match unsafe { (*p.terminator).as_terminator() }
-            .allow_unboxing
-            .get()
-        {
-            true => false,
-            false => true,
-        },
-        None => false,
-    };
-    if migrate {
-        unsafe { convert_to_boxed(obj) };
     }
 }
 
@@ -5180,7 +5189,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         // converts the whole instance to boxed storage. `getdictvalue` pairs
         // the two the same way.
         let mut inst = mapdict_carrier(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-        maybe_migrate_to_boxed(map, &mut inst, key, DICT);
+        migrate_to_boxed_if_frozen(curr, &mut inst);
         self.delitem(
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
             pyre_object::gc_roots::shadow_stack_get(key_slot),
@@ -7137,7 +7146,8 @@ mod tests {
             (*term).as_terminator().set_allow_unboxing(false);
             // mapdict.py:592-598 — a read now lazily migrates obj to boxed storage.
             let m = obj._get_mapdict_map();
-            maybe_migrate_to_boxed(m, &mut obj, wn("x"), DICT);
+            let attr = find_map_attr(m, wn("x"), DICT).unwrap();
+            migrate_to_boxed_if_frozen(attr, &mut obj);
             // the rebuilt map's attribute is boxed; the value is preserved.
             assert!((*obj.map).as_plain().unboxed.is_none());
             let m = obj._get_mapdict_map();
