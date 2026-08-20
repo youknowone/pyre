@@ -1974,26 +1974,38 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
             if let Expr::Assign(assign) = expr
                 && let Expr::Index(index_expr) = &*assign.left
                 && let Expr::Field(field) = &*index_expr.expr
-                && let Some(struct_path) = self
+                && let Some(base_path) = self
                     .ref_struct_of_base(&field.base)
                     .or_else(|| self.local_ref_struct_of_base(&field.base))
                 && let syn::Member::Named(member_id) = &field.member
+                // Resolve against the struct that DECLARES the field, the way
+                // `match_array_field_base` does on the JIT side. Looking the
+                // element type up under the base's own spelling misses a field
+                // an embedded base declares, and the plain-field arm below then
+                // rewrites `<base>.<field>` to the buffer pointer and leaves the
+                // `[]` on it, which does not compile.
+                && let struct_path = self.declaring_struct(&base_path, &member_id.to_string())
                 && self
                     .array_field_elem(&struct_path, &member_id.to_string())
                     .is_some()
             {
                 let base = (*field.base).clone();
                 let member = field.member.clone();
-                let struct_path = self.declaring_struct(&struct_path, &member_id.to_string());
                 let mut idx = (*index_expr.index).clone();
                 let mut rhs = (*assign.right).clone();
                 self.visit_expr_mut(&mut idx);
                 self.visit_expr_mut(&mut rhs);
+                // The assigned value is evaluated before the assignee place, so
+                // an index or RHS with side effects must not be reordered:
+                // `base.data[next_index()] = compute_value()` runs
+                // `compute_value()` first. The JIT side lowers the right-hand
+                // side first for the same reason, and the two paths have to
+                // agree or a warm run observes a different order from a cold one.
                 *expr = syn::parse_quote! {
                     {
+                        let __majit_arr_val = #rhs;
                         let __majit_arr_obj = #base;
                         let __majit_arr_idx = #idx;
-                        let __majit_arr_val = #rhs;
                         unsafe {
                             *((*(__majit_arr_obj as *mut #struct_path))
                                 .#member
@@ -2007,17 +2019,17 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
             // Array element READ: `<base>.<array_field>[<idx>]`.
             if let Expr::Index(index_expr) = expr
                 && let Expr::Field(field) = &*index_expr.expr
-                && let Some(struct_path) = self
+                && let Some(base_path) = self
                     .ref_struct_of_base(&field.base)
                     .or_else(|| self.local_ref_struct_of_base(&field.base))
                 && let syn::Member::Named(member_id) = &field.member
+                && let struct_path = self.declaring_struct(&base_path, &member_id.to_string())
                 && self
                     .array_field_elem(&struct_path, &member_id.to_string())
                     .is_some()
             {
                 let base = (*field.base).clone();
                 let member = field.member.clone();
-                let struct_path = self.declaring_struct(&struct_path, &member_id.to_string());
                 let mut idx = (*index_expr.index).clone();
                 self.visit_expr_mut(&mut idx);
                 *expr = syn::parse_quote! {

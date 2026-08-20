@@ -260,3 +260,133 @@ fn the_compiled_trace_lowers_both_element_accesses_to_array_ops() {
          to an abort stub leaves none. Loop was {loop_ops:?}",
     );
 }
+
+/// The same access, but the array field is declared on an EMBEDDED base.
+///
+/// `array_fields` names the struct that declares the field. A `ref(T)` state
+/// scalar names the OUTER struct, so looking the element type up under the
+/// scalar's own spelling misses a field an `inlined_prefix` base declares. The
+/// JIT matcher resolves the declaring struct before its lookup; the concrete
+/// rewriter has to do the same, or its guard does not fire, the plain-field arm
+/// rewrites `<base>.<field>` to the buffer pointer on its own, and the `[]` is
+/// left applied to a raw pointer — which does not compile.
+///
+/// So this fixture's assertion is that the crate builds at all. It runs the
+/// machine anyway, because a shape that compiles but reads the wrong slot would
+/// otherwise go unnoticed.
+mod embedded_base {
+    use super::{OP_HALT, OP_LOAD, OP_STEP, OP_STORE, OP_TICK, SLOTS, TICKS};
+    use majit_metainterp::JitDriver;
+
+    /// Declares the array field. Must sit at offset 0 of the outer struct: an
+    /// inlined base is required to start there, which is what makes the base
+    /// register the same for both spellings.
+    #[repr(C)]
+    struct PrefixBase {
+        data: *mut i64,
+    }
+
+    #[repr(C)]
+    struct PrefixStack {
+        base: PrefixBase,
+        /// Behind the base, so the struct is genuinely an outer type rather
+        /// than a rename of the one that declares the field.
+        touched: i64,
+    }
+
+    struct PrefixState {
+        stack: usize,
+        sp: i64,
+        acc: i64,
+        ticks: i64,
+    }
+
+    pub type Bytecode = [u8];
+
+    #[majit_macros::jit_interp(
+        state = PrefixState,
+        env = Bytecode,
+        greens = [pc, program],
+        state_fields = {
+            stack: ref(PrefixStack),
+            sp: int,
+            acc: int,
+            ticks: int,
+        },
+        int_fields = { PrefixStack::touched => i64 },
+        inlined_prefix = { PrefixStack::base => PrefixBase },
+        array_fields = { PrefixBase::data => i64 },
+    )]
+    #[allow(unused_assignments, unused_variables)]
+    fn dispatch_prefix(program: &Bytecode, threshold: u32, stack: usize, ticks: i64) -> i64 {
+        let mut driver: JitDriver<PrefixState> = JitDriver::new(threshold);
+        let mut pc: usize = 0;
+        let mut state = PrefixState {
+            stack,
+            sp: 0i64,
+            acc: 0i64,
+            ticks,
+        };
+        {
+            use majit_metainterp::JitState as _;
+            state
+                .build_meta(0, program)
+                .install_canonical_liveness(&mut driver);
+        }
+
+        while pc < program.len() {
+            jit_merge_point!(driver, program, pc; state);
+            let opcode = program[pc];
+            pc += 1;
+            match opcode {
+                OP_LOAD => {
+                    state.acc = state.acc + state.stack.data[state.sp];
+                }
+                OP_STORE => {
+                    state.stack.data[state.sp] = state.ticks;
+                }
+                OP_STEP => {
+                    state.sp = state.sp + 1i64;
+                }
+                OP_TICK => {
+                    state.ticks = state.ticks - 1i64;
+                    if state.ticks != 0 {
+                        can_enter_jit!(driver, 0usize, &mut state, program, || {});
+                        pc = 0;
+                        continue;
+                    }
+                }
+                OP_HALT => break,
+                _ => break,
+            }
+        }
+        state.acc
+    }
+
+    const PROGRAM: [u8; 5] = [OP_LOAD, OP_STORE, OP_STEP, OP_TICK, OP_HALT];
+
+    #[test]
+    fn an_array_field_declared_on_an_inlined_base_resolves_from_the_outer_scalar() {
+        let mut buf: Vec<i64> = (0..SLOTS as i64).map(|i| i + 1).collect();
+        let mut holder = Box::new(PrefixStack {
+            base: PrefixBase {
+                data: buf.as_mut_ptr(),
+            },
+            touched: 0,
+        });
+        let addr = &mut *holder as *mut PrefixStack as usize;
+        let acc = dispatch_prefix(&PROGRAM, 8, addr, TICKS);
+
+        assert_eq!(
+            acc,
+            (1..=TICKS).sum::<i64>(),
+            "the element read must reach the buffer the embedded base points at",
+        );
+        let touched: Vec<i64> = (0..TICKS).map(|i| TICKS - i).collect();
+        assert_eq!(
+            &buf[..TICKS as usize],
+            touched.as_slice(),
+            "each visited slot must hold the tick written to it",
+        );
+    }
+}
