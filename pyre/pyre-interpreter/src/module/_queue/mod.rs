@@ -42,6 +42,12 @@ fn queue_lock<'a>(
 /// `_queue_SimpleQueue_get_impl` reads `timeout` only on the blocking path:
 /// `block=False` is answered from the queue immediately, so the argument is
 /// neither converted nor range-checked there.
+///
+/// `_PyTime_FromSecondsObject` runs before the sign check, so a value it cannot
+/// represent as a nanosecond timestamp is refused rather than turned into a
+/// wait: an infinity would otherwise block forever and a NaN would poll once.
+/// The conversion is the one `_thread.lock.acquire` already performs
+/// (`module/thread/mod.rs parse_acquire_args`).
 fn parse_timeout(block: bool, timeout: PyObjectRef) -> Result<Option<f64>, crate::PyError> {
     if !block {
         return Ok(None);
@@ -50,6 +56,19 @@ fn parse_timeout(block: bool, timeout: PyObjectRef) -> Result<Option<f64>, crate
         return Ok(None);
     }
     let seconds = crate::baseobjspace::float_w(timeout)?;
+    if seconds.is_nan() {
+        return Err(crate::PyError::value_error(
+            "Invalid value NaN (not a number)",
+        ));
+    }
+    // `rarithmetic.ovfcheck_float_to_longlong` bounds, as in `parse_acquire_args`.
+    const NS_MIN: f64 = -9223372036854776832.0;
+    const NS_MAX: f64 = 9223372036854775296.0;
+    if !(NS_MIN..NS_MAX).contains(&(seconds * 1e9).ceil()) {
+        return Err(crate::PyError::overflow_error(
+            "timestamp out of range for platform time_t",
+        ));
+    }
     if seconds < 0.0 {
         return Err(crate::PyError::value_error(
             "'timeout' must be a non-negative number",
@@ -58,17 +77,10 @@ fn parse_timeout(block: bool, timeout: PyObjectRef) -> Result<Option<f64>, crate
     Ok(Some(seconds))
 }
 
+/// `parse_timeout` accepted only a finite, non-negative number of seconds, so
+/// the deadline is always representable and `None` means "wait forever".
 fn deadline_from_timeout(timeout: Option<f64>) -> Option<Instant> {
-    timeout.and_then(|seconds| {
-        if seconds.is_infinite() && seconds.is_sign_positive() {
-            None
-        } else if seconds <= 0.0 || seconds.is_nan() {
-            Some(Instant::now())
-        } else {
-            let capped = seconds.min((i64::MAX / 1_000_000_000) as f64);
-            Some(Instant::now() + Duration::from_secs_f64(capped))
-        }
-    })
+    timeout.map(|seconds| Instant::now() + Duration::from_secs_f64(seconds))
 }
 
 fn empty_error() -> crate::PyError {
