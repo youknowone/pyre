@@ -4279,6 +4279,42 @@ mod tests {
     }
 
     #[test]
+    fn descrless_const_heap_short_box_is_skipped_not_panicked() {
+        // The sibling above builds the heap op through `Op::with_descr`, so the
+        // field descr the const channel needs is always there. A heap short box
+        // can reach this point without one, and the channel has to drop it
+        // rather than unwrap: without a descr there is nothing to re-emit the
+        // load from, and a produced entry would name a field the import cannot
+        // resolve.
+        let mut ctx = crate::optimizeopt::OptContext::with_inputarg_types(16, &[Type::Ref]);
+        let struct_arg = OpRef::input_arg_ref(0);
+        let constant = OpRef::const_int(7);
+        let mut sb = ShortBoxes::with_label_args(&[struct_arg]);
+        sb.add_short_input_arg(&mut ctx, struct_arg, Type::Ref);
+
+        let heap = Op::new(
+            OpCode::GetfieldGcI,
+            &[ctx.materialize_operand_at(struct_arg)],
+        );
+        heap.pos.set(constant);
+        sb.add_heap_op(&mut ctx, heap);
+
+        let produced = sb.produced_ops(&mut ctx);
+        let produced_const = sb.produced_const_ops(&mut ctx);
+
+        assert!(
+            produced
+                .iter()
+                .all(|(_, produced)| produced.res.to_opref() != constant),
+            "produced_ops must not carry the const result"
+        );
+        assert!(
+            produced_const.is_empty(),
+            "a descr-less const heap short box is skipped, not produced"
+        );
+    }
+
+    #[test]
     fn test_compound_pure_loser_to_short_inputarg_clears_label_arg_idx() {
         // shortpreamble.py:326-333 — when a Pure alternative loses the compound
         // tie to the ShortInputArg, its result is rebound to a fresh SameAs box
