@@ -270,6 +270,33 @@ pub(crate) fn tyref_result_ok(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     result_ok_slot(ty, llbc).and_then(|slot| serde_json::from_value(slot.clone()).ok())
 }
 
+/// The `T` payload slot of an `Option<T>` type value, or `None` when `ty` is
+/// not an `Option`.  Sibling of [`result_ok_slot`].
+fn option_payload_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    let body = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    if adt_path_of(body, llbc).as_deref() != Some("core::option::Option") {
+        return None;
+    }
+    body.get("Adt")
+        .and_then(|a| a.get("generics"))
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.get(0))
+}
+
+/// The `T` of an `Option<T>` as its own [`TyRef`] — for an
+/// `Iterator::next()` return, the element the iterator yields.  Sibling of
+/// [`tyref_result_ok`].
+///
+/// A slice iterator yields `Option<&T>`, so the answer still carries the
+/// `&`; callers that want the item's own shape peel it (`strip_ty_wrappers`).
+pub(crate) fn tyref_option_payload(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    option_payload_slot(ty, llbc).and_then(|slot| serde_json::from_value(slot.clone()).ok())
+}
+
 /// Collapse a scoped callee's returnblock to a genuine void return.
 ///
 /// A `Result<(), PyError>` callee carries the unit `Ok` payload as a

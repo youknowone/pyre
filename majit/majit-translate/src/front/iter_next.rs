@@ -192,33 +192,52 @@ fn walk_back_to_source<T>(
 /// list's item repr, while `RangeIteratorRepr::rtype_next`
 /// (`rrange.py ll_rangenext_*`) hands back a `Signed`.
 ///
-/// The `Ref` answer is the fold's assumption about every other container,
-/// not a decision: [`is_iter_op_segments`] admits any `core::slice::…::iter`,
-/// including a slice whose items are not GC references (`&[usize]`,
-/// `&[u8]`).  Such a loop would type raw integers into the ref register
-/// bank.  No graph the codewriter looks inside iterates one today — the two
-/// production `#[unroll_safe]` sites iterate a `range` and a
-/// `&[PyObjectRef]` — so closing it needs the container's element type,
-/// which the fold does not consult.  `front::range_iter` reroutes an exclusive int `Range`
-/// for-loop onto the `range()` builtin plus the same `iter` bridge, so both
-/// reprs arrive here behind one `iter` op and only the container that op was
-/// given tells them apart.
+/// Two reprs arrive here behind one `iter` op, and the op does not tell
+/// them apart.  [`is_iter_op_segments`] admits any `core::slice::…::iter`,
+/// and `front::range_iter` deliberately reroutes an exclusive int `Range`
+/// for-loop onto the `range()` builtin plus that same bridge, so the
+/// container the op was given is what separates them — hence the backward
+/// walk rather than a test on the op.
 ///
-/// Answering `Ref` for a range is not inert.  The legacy type walker reads
-/// `result_ty` straight off the op (`legacy_annotator`'s `Call` arm returns
-/// it whenever it is not `Unknown`), so the loop's induction variable lands
-/// in the ref register bank, and every `array[i]` in the loop body then
-/// assembles as a `getarrayitem_gc` whose index is ref-kind — which
-/// `assembler.rs` rejects outright.  Graphs containing a loop are normally
-/// residualized rather than looked inside, so this surfaces only on a graph
-/// carrying `@jit.unroll_safe`.
-fn iter_next_item_type(graph: &FunctionGraph, iterator: &Variable) -> ValueType {
+/// Getting this wrong is not inert.  `result_ty` is read straight off the
+/// op: `resolve_call_result_kind` (`codewriter/jtransform.rs`) consults the
+/// rtyper's `concretetype` *only* when `result_ty` is `Unknown`, and
+/// `authoritative_result_types` (`codewriter/type_state.rs`) then stamps the
+/// derived kind back over it.  So a wrong answer here outranks the real
+/// rtyper for every graph that gets a JitCode, not just the legacy tier: the
+/// induction variable lands in the wrong register bank, and an `array[i]` in
+/// the loop body assembles as a `getarrayitem_gc` with a ref-kind index,
+/// which `assembler.rs` asserts on.
+///
+/// And the container alone was never enough, because a slice of non-GC
+/// items is spelled exactly like a slice of references — the same
+/// `core::slice::…::iter` that `is_concrete_iter_constructor` collapses
+/// `Vec<T>` / `[T; N]` / `Box<[T]>` onto.  `charon-corpus`'s
+/// `branch_loop_sum(slice: &[i64], ..)` folds `for &v in slice` today, and
+/// answering `Ref` for every non-range container typed its `i64` element as
+/// a GC reference.  Hence `recorded`: the element type read off the
+/// `Option<T>` at the recording site, which is the only place it survives.
+fn iter_next_item_type(
+    graph: &FunctionGraph,
+    iterator: &Variable,
+    recorded: &ValueType,
+) -> ValueType {
+    // `rrange.py ll_rangenext_*` hands back a `Signed` whatever the Rust
+    // range's own spelling is, so the range arm answers before the recorded
+    // element type is consulted — a `0..n` over `usize` records `Unsigned`.
     let over_a_range = iter_op_container(graph, iterator)
         .is_some_and(|container| produced_by_range_builtin(graph, &container));
     if over_a_range {
-        ValueType::Int
-    } else {
-        ValueType::Ref(None)
+        return ValueType::Int;
+    }
+    match recorded {
+        // `rlist.py ll_listnext` hands back the list's item repr.  The
+        // classdef is dropped: a `Ref(Some(root))` would seed a different
+        // `SomeInstance` shell in `valuetype_to_someshell`, so keeping the
+        // bare `Ref` is what leaves every GC-element graph that folds today
+        // stamping a byte-identical `result_ty`.
+        ValueType::Ref(_) => ValueType::Ref(None),
+        other => other.clone(),
     }
 }
 
@@ -322,10 +341,13 @@ fn int_const(i: i64) -> LinkArg {
 /// `Option` match does not fit the for-loop shape is left as the residual
 /// call (Skip), so a mismatch never regresses a graph the legacy walker
 /// already handled.  Returns the number of sites rewritten.
-pub(crate) fn rewire_next_call_sites(graph: &mut FunctionGraph, sites: &[Variable]) -> usize {
+pub(crate) fn rewire_next_call_sites(
+    graph: &mut FunctionGraph,
+    sites: &[(Variable, ValueType)],
+) -> usize {
     let mut rewritten = 0;
-    for opt in sites {
-        match rewire_one_next_site(graph, opt) {
+    for (opt, recorded_item_ty) in sites {
+        match rewire_one_next_site(graph, opt, recorded_item_ty) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
                 // Leave the residual `next` call; the unregistered callee
@@ -429,7 +451,11 @@ pub(crate) fn peel_recast_chain(
     Ok(cur)
 }
 
-fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(), String> {
+fn rewire_one_next_site(
+    graph: &mut FunctionGraph,
+    opt: &Variable,
+    recorded_item_ty: &ValueType,
+) -> Result<(), String> {
     let name = graph.name.clone();
     // Block A: the block whose op produces `opt` — the residual `next()`
     // call, closed by lower_call with a single forwarding exit.
@@ -458,6 +484,12 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
             ));
         }
     };
+
+    // Read the element type off the still-unmutated graph: the backward
+    // walk to the `iter` op's container has to see the block structure the
+    // recording site saw, and the dead forwarded-slot removal below rewrites
+    // exactly that.
+    let item_ty = iter_next_item_type(graph, &iter_arg, recorded_item_ty);
 
     // `lower_call` closes the block right after the raising call, so the
     // `next()` call is normally A's last op.  An UNREGISTERED `next()`
@@ -675,7 +707,6 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
     // call (peeled above) are dropped so the native `next` op — which
     // produces the scrutinised `opt` directly — is A's last op and thus the
     // block's `raising_op` under the `LastException` exitswitch below.
-    let item_ty = iter_next_item_type(graph, &iter_arg);
     graph.blocks[a].operations.truncate(next_idx + 1);
     graph.blocks[a].operations[next_idx] = SpaceOperation {
         result: Some(opt.clone()),
@@ -724,4 +755,94 @@ fn rewire_one_next_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(),
         stopiter_link,
     ];
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A graph holding just the `iter` op the fold anchors on, over a
+    /// container that is either the `range()` builtin's result or an
+    /// unrelated call's.  Returns the iterator variable.
+    fn graph_with_iter(over_a_range: bool) -> (FunctionGraph, Variable) {
+        let mut g = FunctionGraph::new("test_iter_next_item_type");
+        let n = g.startblock;
+        let container_segments = if over_a_range {
+            vec!["__pyre_range".to_string()]
+        } else {
+            vec![
+                "some".to_string(),
+                "container".to_string(),
+                "make".to_string(),
+            ]
+        };
+        let container = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: container_segments,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                    },
+                    args: vec![container],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        (g, it)
+    }
+
+    /// `ll_rangenext_up` returns `Signed` whatever the Rust range spells,
+    /// so the range arm answers before the recorded element type — a
+    /// `for i in 0..n` over `usize` records `Unsigned` and must still come
+    /// back `Int`.  This is the guard against "just use the recorded type".
+    #[test]
+    fn a_range_container_answers_int_over_its_recorded_element() {
+        let (g, it) = graph_with_iter(true);
+        assert_eq!(
+            iter_next_item_type(&g, &it, &ValueType::Unsigned),
+            ValueType::Int,
+        );
+    }
+
+    /// A GC-reference element keeps the bare `Ref`: the classdef is dropped
+    /// so every graph that folded before this element type was carried
+    /// still stamps the identical `result_ty`.
+    #[test]
+    fn a_gc_reference_element_answers_a_classdefless_ref() {
+        let (g, it) = graph_with_iter(false);
+        assert_eq!(
+            iter_next_item_type(&g, &it, &ValueType::Ref(Some("PyObject".into()))),
+            ValueType::Ref(None),
+        );
+    }
+
+    /// The arm this element type was carried for.  `charon-corpus`'s
+    /// `branch_loop_sum(slice: &[i64], ..)` folds `for &v in slice` today and
+    /// stamped `Ref` on an `i64`; a non-GC element must come back as itself
+    /// so it lands in the int register bank.
+    #[test]
+    fn a_non_gc_slice_element_keeps_its_own_kind() {
+        let (g, it) = graph_with_iter(false);
+        for recorded in [ValueType::Int, ValueType::Unsigned, ValueType::Float] {
+            assert_eq!(
+                iter_next_item_type(&g, &it, &recorded),
+                recorded,
+                "{recorded:?} element must not be retyped as a GC reference",
+            );
+        }
+    }
 }

@@ -2252,10 +2252,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // simplified graph; fail-safe — an unpaired / multi-consumer range
         // aggregate stays the ordinary ADT ctor (census Skip).
         if !lo.range_iter_new_sites.is_empty() && !lo.next_call_results.is_empty() {
+            // The range rewrite only locates the `next()` producer; the
+            // element kind recorded beside it belongs to the diamond fold.
+            let next_vars: Vec<Variable> = lo
+                .next_call_results
+                .iter()
+                .map(|(var, _)| var.clone())
+                .collect();
             crate::front::range_iter::rewire_range_iter_sites(
                 &mut lo.graph,
                 &lo.range_iter_new_sites,
-                &lo.next_call_results,
+                &next_vars,
             );
         }
         let next_rewritten = if lo.next_call_results.is_empty() {
@@ -2945,8 +2952,11 @@ struct Lowering<'a> {
     result_exc_call_results: Vec<(Variable, Option<String>, ValueType)>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
-    /// after the body lowering completes.
-    next_call_results: Vec<Variable>,
+    /// after the body lowering completes.  The paired [`ValueType`] is the
+    /// element `T` with the `&` a slice iterator adds peeled off — the only
+    /// place the element's kind is still readable, since the fold's op
+    /// carries the iterator and not the container's item type.
+    next_call_results: Vec<(Variable, ValueType)>,
     /// `i64::checked_{add,sub,mul}()` call results (`Option<i64>`-typed)
     /// recorded for the checked-arith rewiring pass
     /// (`front::checked_arith`) that runs after the body lowering
@@ -9200,7 +9210,25 @@ impl<'a> Lowering<'a> {
             && crate::front::iter_next::is_iterator_next_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
         {
-            self.next_call_results.push(result_var.clone());
+            // A slice iterator yields `Option<&T>`; peel the `&` so the
+            // recorded kind is the item's own, the way `ll_listnext` hands
+            // back the list's item repr rather than a pointer to it.  An
+            // unreadable shape records `Ref(None)` — the answer the fold
+            // assumed unconditionally before this was carried, so an
+            // unreadable type keeps today's behaviour instead of inventing
+            // a new one.
+            let item_ty = crate::front::result_exc::tyref_option_payload(&call.dest.ty, self.llbc)
+                .and_then(|payload| {
+                    let body = match &payload {
+                        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+                        TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
+                    };
+                    let item = strip_ty_wrappers(body, self.llbc)?;
+                    serde_json::from_value::<TyRef>(item.clone()).ok()
+                })
+                .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                .unwrap_or(ValueType::Ref(None));
+            self.next_call_results.push((result_var.clone(), item_ty));
         }
         // Capture `i64::checked_{add,sub,mul}()` results (`Option<i64>`-
         // typed) for the checked-arith rewiring pass
