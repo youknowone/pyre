@@ -48,8 +48,14 @@ nightly; it only needs the `.llbc` JSON.
 # 0. install Charon (once)
 ../../scripts/install-charon.py
 
-# 1. extract corpus (run from this directory)
-../../scripts/extract-llbc.py corpus
+# 1. regenerate the checked-in fixture, in place (run from this directory).
+#    <charon> is ../../../.pyre-build/charon/<platform>/charon by default —
+#    the location `install-charon.py` writes to.
+<charon> cargo --ullbc --dest-file "$PWD/corpus.ullbc"
+
+# (`../../scripts/extract-llbc.py corpus` runs the same extraction through the
+#  fingerprinting driver, but its artefact lands in `build/llbc/corpus.ullbc`,
+#  not here; the checked-in fixture is only updated by writing this path.)
 
 # 2. inspect
 python3 inspect_llbc.py corpus.ullbc                  # summary
