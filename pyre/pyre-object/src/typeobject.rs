@@ -1362,6 +1362,8 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         return 0;
     }
     const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
+    const INLINE_VALUES: i64 = 1 << 2;
+    const MANAGED_DICT: i64 = 1 << 4;
     const IMMUTABLETYPE: i64 = 1 << 8;
     const DISALLOW_INSTANTIATION: i64 = 1 << 7;
     const BASETYPE: i64 = 1 << 10;
@@ -1386,6 +1388,25 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     let mut flags = 0;
     if t.flag_heaptype {
         flags |= HEAPTYPE;
+
+        // [3.14-spec] `type_new_descriptors` represents a dict slot added by
+        // a heap type with MANAGED_DICT (`typeobject.c`, read at v3.14.6).
+        // PyPy records the same ownership boundary as
+        // `self.hasdict and not self.layout.typedef.hasdict` when choosing a
+        // DictTerminator (typeobject.py:255-257). Project those canonical
+        // fields; do not infer ownership merely from the public capability,
+        // since module instances own their dict in the builtin layout.
+        let layout = t.layout;
+        let typedef_hasdict = !layout.is_null() && (*layout).typedef_hasdict;
+        if t.hasdict && !typedef_hasdict {
+            flags |= MANAGED_DICT;
+            // CPython's `type_ready_managed_dict` adds INLINE_VALUES only to
+            // fixed-size managed-dict types.  This projection shares the
+            // layout typedef used by `type.__itemsize__`.
+            if !w_type_cpython_has_variable_items(obj) {
+                flags |= INLINE_VALUES;
+            }
+        }
     } else {
         // `Py_TPFLAGS_IMMUTABLETYPE` (`object.h`, read at v3.14.6): a type
         // whose attributes cannot be set.  `get_flags` publishes no such bit
@@ -1530,6 +1551,20 @@ pub unsafe fn w_type_get_typedef_hasdict(obj: PyObjectRef) -> bool {
     } else {
         (*layout).typedef_hasdict
     }
+}
+
+/// Whether CPython 3.14 projects a non-zero `tp_itemsize` for this PyPy
+/// instance layout.  The exact byte count remains in the interpreter's
+/// `cpython_type_layout`; `type.__flags__` only needs the zero/non-zero split
+/// used by `type_ready_managed_dict` to decide INLINE_VALUES.
+unsafe fn w_type_cpython_has_variable_items(obj: PyObjectRef) -> bool {
+    let typedef = w_type_get_layout(obj);
+    std::ptr::eq(typedef, &TYPE_TYPE)
+        || std::ptr::eq(typedef, &INT_TYPE)
+        || std::ptr::eq(typedef, &LONG_TYPE)
+        || std::ptr::eq(typedef, &TUPLE_TYPE)
+        || std::ptr::eq(typedef, &crate::bytesobject::BYTES_TYPE)
+        || std::ptr::eq(typedef, &crate::memoryview::MEMORYVIEW_TYPE)
 }
 /// Override acceptable_as_base_class by cloning the Layout.
 /// typedef.py:742,765,664 explicit overrides after initial creation.
@@ -1850,6 +1885,48 @@ mod tests {
         assert!(Layout::expands_equal(root, true, true, root, true, true));
         // Different hasdict → not equal
         assert!(!Layout::expands_equal(root, true, true, root, false, true));
+    }
+
+    #[test]
+    fn type_flags_project_managed_dict_and_inline_values_from_layout_owner() {
+        const INLINE_VALUES: i64 = 1 << 2;
+        const MANAGED_DICT: i64 = 1 << 4;
+        const MASK: i64 = INLINE_VALUES | MANAGED_DICT;
+
+        unsafe fn heap_type_with_layout(
+            typedef: *const PyType,
+            typedef_hasdict: bool,
+        ) -> PyObjectRef {
+            let w_type = w_type_new("C", PY_NULL, std::ptr::null_mut());
+            let layout = leak_layout(Layout {
+                typedef,
+                nslots: 0,
+                newslotnames: vec![],
+                base_layout: std::ptr::null(),
+                acceptable_as_base_class: true,
+                typedef_hasdict,
+            });
+            w_type_set_layout(w_type, layout);
+            w_type_set_hasdict(w_type, true);
+            w_type
+        }
+
+        unsafe {
+            // A normal heap instance uses PyPy's DictTerminator and CPython's
+            // fixed-size inline-values representation.
+            let plain = heap_type_with_layout(&INSTANCE_TYPE, false);
+            assert_eq!(w_type_get_flags(plain) & MASK, MASK);
+
+            // A tuple subtype still owns a managed dict, but a non-zero
+            // CPython tp_itemsize excludes INLINE_VALUES.
+            let tuple_subclass = heap_type_with_layout(&TUPLE_TYPE, false);
+            assert_eq!(w_type_get_flags(tuple_subclass) & MASK, MANAGED_DICT);
+
+            // A builtin typedef such as module owns its dict directly, so a
+            // heap subtype sharing that layout has neither managed bit.
+            let native_dict = heap_type_with_layout(&MODULE_TYPE, true);
+            assert_eq!(w_type_get_flags(native_dict) & MASK, 0);
+        }
     }
 
     #[test]

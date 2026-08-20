@@ -2625,7 +2625,7 @@ pub fn make_builtin_type_with_bases(
                 newslotnames: vec![],
                 base_layout: parent_layout,
                 acceptable_as_base_class: has_new,
-                typedef_hasdict: false,
+                typedef_hasdict: has_dict,
             })
         };
         pyre_object::w_type_set_layout(type_obj, layout);
