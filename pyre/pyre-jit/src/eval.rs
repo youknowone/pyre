@@ -8527,14 +8527,24 @@ fn deliver_exit_frame_exception(
     frame: &mut PyFrame,
     mut err: pyre_interpreter::PyError,
 ) -> PyResult {
-    let mut handler_instr = frame.next_instr();
-    if exit_frame_handler_needs_unwritten_stack(frame) {
+    // `handle_exception` normalizes the exception, records a traceback and can
+    // run a trace function, all of which allocate.  The frame reaching this
+    // entry is the movable kind — `ll_portal_runner_shim` carries the nursery
+    // `PyFrame` a trace built — so the argument names the abandoned copy once a
+    // minor collection has run.  Read it back out of the root for the handler
+    // pc write and for the resumed interpretation, which would otherwise pin
+    // the dead address into `handle_jitexception`'s own root.
+    let mut frame_root = FrameRoot::new(frame);
+    let mut handler_instr = frame_root.frame().next_instr();
+    if exit_frame_handler_needs_unwritten_stack(frame_root.frame()) {
         return Err(err);
     }
-    screen_frame_already_recorded(frame as *const PyFrame, &mut err);
-    if pyre_interpreter::eval::handle_exception(frame, &mut err, &mut handler_instr) {
-        frame.set_last_instr_from_next_instr(handler_instr);
-        handle_jitexception(frame)
+    screen_frame_already_recorded(frame_root.frame() as *const PyFrame, &mut err);
+    if pyre_interpreter::eval::handle_exception(frame_root.frame(), &mut err, &mut handler_instr) {
+        frame_root
+            .frame()
+            .set_last_instr_from_next_instr(handler_instr);
+        handle_jitexception(frame_root.frame())
     } else {
         Err(err)
     }

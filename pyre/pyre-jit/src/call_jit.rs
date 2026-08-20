@@ -3736,7 +3736,6 @@ pub fn trace_and_compile_from_bridge(
     // point rather than mid-body or past a dropped loop iteration (a
     // value-stack underflow / off-by-one-iteration result otherwise).
     let resume_state = frame.snapshot_for_tracing();
-    let live_frame_addr = frame as *const PyFrame as usize;
     let mut adopted_walk_end_state = false;
     // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
     // epilogue (`run_perfn_walk` in trace.rs) reads this flag: only when armed
@@ -3784,6 +3783,14 @@ pub fn trace_and_compile_from_bridge(
                 // here rather than once outside — `FrameBox` owns a shadow
                 // stack root guard and cannot be cloned.
                 let trace_frame = bridge_frame_root.frame().snapshot_for_tracing();
+                // `sym.set_live_vable_frame_addr` records this word as the
+                // virtualizable the walk writes back through, so it has to be
+                // the frame's address as of this entry: the driver re-enters
+                // the closure per merge point and `snapshot_for_tracing`
+                // allocates, either of which can have moved the frame since the
+                // root was taken.  Read it back out of the root, the same way
+                // `trace_frame` above is.
+                let live_frame_addr = bridge_frame_root.frame() as *const PyFrame as usize;
                 let (action, executed) = trace_bytecode(
                     meta,
                     sym,
