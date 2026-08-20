@@ -429,6 +429,15 @@ fn default_enable_opts() -> Vec<String> {
 /// mark the green key `DONT_TRACE_HERE`.  Pyre walker aborts are structural
 /// and recur identically on retrace; without a ceiling the same body would
 /// retrace forever, each attempt executing its residual calls concretely.
+///
+/// The ban is permanent, and permanent in a way upstream cannot express: the
+/// flag it sets is the one `should_remove_jitcell` keeps forever on a cell that
+/// never saw a procedure token, and `abort_count` is never reset.  It is
+/// load-bearing rather than defensive — 17 of 24 sampled fixtures reach it, and
+/// removing it buys no compiled loop on any of them while multiplying
+/// `loops_aborted` by 4-6x (see [`WarmEnterState::maybe_compile_decision`] for
+/// why the upstream cell lifecycle that would retire these cells first cannot
+/// be ported as written).  `mc_diag` slots 79/80 measure it.
 const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
 /// rlib/jit.py:599 disable_unrolling = 200
@@ -823,6 +832,38 @@ impl WarmEnterState {
         self.counter.tick(bucket, self.increment_threshold)
     }
 
+    /// The `dead_token` gate below is narrower than warmstate.py:497-500, and
+    /// deliberately so. Upstream drops EVERY tokenless cell there — "it was an
+    /// aborted compilation, or maybe a weakref that has been freed" — because
+    /// upstream has exactly one way to make a cell: `bound_reached` builds it
+    /// and immediately stamps `JC_TRACING | JC_TRACING_OCCURRED`
+    /// (warmstate.py:434-440), so tokenless really does mean the trace it
+    /// started never compiled.
+    ///
+    /// That inference does not survive the port, because one pyre green key can
+    /// own two cells: a hash-only entry point installs a cell that can carry no
+    /// `comparekey`, and the typed path then chains its own behind it (proven
+    /// by `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`).
+    /// A key whose trace compiled has its token on one of the two; the other is
+    /// tokenless with `JC_TRACING_OCCURRED` set and is indistinguishable here
+    /// from an aborted cell. Dropping it also resets the bucket counter its
+    /// sibling was climbing, since `cleanup_chain` is `reset` + a sweep of the
+    /// whole bucket.
+    ///
+    /// Measured, both ways: taking the upstream arm costs `loops_compiled`
+    /// 7 -> 6 on `synth/loops_comprehension`, whose baseline aborts nothing at
+    /// all — the loss is entirely twin cells being read as aborted ones — and
+    /// narrowing it to `JC_TRACING_OCCURRED` cells does not recover the loop,
+    /// because the twin carries that flag too. On the fixtures where the arm
+    /// does what it is meant to (it retires the cell before pyre's
+    /// `MAX_TRACE_ABORT_COUNT` ceiling can ban the green key, 17 of 24 sampled
+    /// fixtures reach that ban today) it buys nothing: `loops_compiled` is
+    /// unchanged on every one of them and `loops_aborted` rises 4-6x, e.g.
+    /// 5 -> 28 on `synth/handler_tb_frame_locals_after_declined_flush`.
+    ///
+    /// So the arm stays narrow until one green key owns one cell. `mc_diag`
+    /// slots 80/81 (`abort_ceiling_banned` / `abort_ceiling_refused`) are the
+    /// standing measure of what the narrowing costs.
     pub fn maybe_compile_decision(&mut self, cell_key: u64) -> HotResult {
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cell_by_key(cell_key) {
@@ -1062,11 +1103,13 @@ impl WarmEnterState {
         if let Some(cell) = self.lookup_chain_with_key_mut(key) {
             cell.flags &= !jc_flags::TRACING;
             cell.abort_count += 1;
-            if disable_noninlinable_function
-                || (cell.flags & jc_flags::DONT_TRACE_HERE != 0)
-                || cell.abort_count >= MAX_TRACE_ABORT_COUNT
-            {
+            let already_banned = cell.flags & jc_flags::DONT_TRACE_HERE != 0;
+            let ceiling_reached = cell.abort_count >= MAX_TRACE_ABORT_COUNT;
+            if disable_noninlinable_function || already_banned || ceiling_reached {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
+            }
+            if ceiling_reached && !already_banned && !disable_noninlinable_function {
+                crate::mc_diag_bump(80); // abort_ceiling_banned
             }
             cell.state = BaseJitCellState::NotHot;
         }
@@ -1122,6 +1165,7 @@ impl WarmEnterState {
             // Give up after too many failed trace attempts to prevent
             // infinite retrace loops (e.g. InvalidLoop every time).
             if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
                 return HotResult::NotHot;
             }
         }
@@ -1146,6 +1190,7 @@ impl WarmEnterState {
                 return HotResult::NotHot;
             }
             if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
                 return HotResult::NotHot;
             }
         }
@@ -1186,11 +1231,13 @@ impl WarmEnterState {
             cell.abort_count += 1;
             // The last disjunct is pyre's abort ceiling: too many failed
             // attempts permanently disable tracing here.
-            if disable_noninlinable_function
-                || (cell.flags & jc_flags::DONT_TRACE_HERE != 0)
-                || cell.abort_count >= MAX_TRACE_ABORT_COUNT
-            {
+            let already_banned = cell.flags & jc_flags::DONT_TRACE_HERE != 0;
+            let ceiling_reached = cell.abort_count >= MAX_TRACE_ABORT_COUNT;
+            if disable_noninlinable_function || already_banned || ceiling_reached {
                 cell.flags |= jc_flags::DONT_TRACE_HERE;
+            }
+            if ceiling_reached && !already_banned && !disable_noninlinable_function {
+                crate::mc_diag_bump(80); // abort_ceiling_banned
             }
             cell.state = BaseJitCellState::NotHot;
         }

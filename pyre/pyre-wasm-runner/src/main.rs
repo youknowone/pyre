@@ -933,6 +933,8 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "qmut_deps_blackhole_arm",
                 "retrace_close_resumed",
                 "guard_resume_bridge_no_handoff",
+                "abort_ceiling_banned",
+                "abort_ceiling_refused",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

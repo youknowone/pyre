@@ -1288,7 +1288,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 80;
+pub const MC_DIAG_SLOTS: usize = 82;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -1641,6 +1641,19 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     // conversion answered. The fallback re-executes the opcodes between the
     // loop header and the guard, so a non-zero here is a defect, not a cost.
     "guard_resume_bridge_no_handoff",
+    // `MAX_TRACE_ABORT_COUNT` is a pyre-local ceiling with no upstream
+    // analogue: upstream sets `JC_DONT_TRACE_HERE` only from
+    // `blackhole_if_trace_too_long` / `prepare_trace_segmenting`, never from a
+    // count of aborts. `abort_count` is never reset and the banned cell is
+    // exempt from `should_remove_jitcell` until it has seen a procedure token,
+    // so the ban outlives the condition that caused it. 80 counts the ban
+    // event (once per cell, where the ceiling is what sets the flag); 81 counts
+    // every later trace request the ceiling refuses, which is what the ban
+    // costs. A zero in 80 says the ceiling is inert on this workload; a
+    // nonzero 81 with a small 80 says one banned key is being asked for
+    // repeatedly.
+    "abort_ceiling_banned",
+    "abort_ceiling_refused",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.
