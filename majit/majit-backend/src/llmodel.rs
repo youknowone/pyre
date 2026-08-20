@@ -18,6 +18,8 @@
 //! declares the abstract contract for these accessors; all entries
 //! below match those signatures.
 
+use majit_ir::FailDescr;
+
 use crate::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
 
 /// llmodel.py:412-420 — get_latest_descr.
@@ -46,6 +48,26 @@ pub unsafe fn set_latest_descr(ptr: *mut JitFrame, descr: usize) {
     }
 }
 
+/// llmodel.py:422-424 — `_decode_pos(deadframe, index)`.
+///
+/// Translate one `rd_locs[index]` entry into the jitframe slot
+/// `get_int_value_direct(jf, slot)` consumes.  Returns `None` for
+/// 0xFFFF (unmapped — the resume system handles those through the
+/// `rd_numb` TAGCONST/TAGVIRTUAL encoding) or for out-of-range indices.
+///
+/// Upstream `_decode_pos` is a method on `AbstractLLCPU` and fetches the
+/// descr itself through `get_latest_descr(deadframe)`; here the descr is
+/// passed in, because the deadframe types that hold one are the callers.
+#[inline]
+pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> {
+    let pos = *descr.rd_locs().get(index)?;
+    if pos == 0xFFFF {
+        None
+    } else {
+        Some(pos as usize)
+    }
+}
+
 /// llmodel.py:440-444 — `get_int_value_direct(deadframe, pos)`.
 ///
 /// Read the `Signed` slot at pre-decoded position `slot` from
@@ -58,10 +80,11 @@ pub unsafe fn set_latest_descr(ptr: *mut JitFrame, descr: usize) {
 ///
 /// The logical `get_int_value(deadframe, index)` entry point —
 /// which first calls `_decode_pos(deadframe, index)` to translate
-/// `index` through `rd_locs[]` — belongs at the dynasm/cranelift
-/// layer that owns the `FailDescr` type hierarchy (majit-backend
-/// is descr-agnostic, so it cannot fetch `get_latest_descr` into
-/// a concrete subclass here).
+/// `index` through `rd_locs[]` — is a method on the deadframe
+/// types instead ([`crate::deadframe`], [`crate::libc_deadframe`]),
+/// because it needs the descr that `_decode_pos` reaches through
+/// `get_latest_descr(deadframe)` and a free function keyed on a
+/// bare frame pointer has no way to get one.
 ///
 /// # Safety
 /// `ptr` must point to a valid JitFrame with at least `slot + 1`

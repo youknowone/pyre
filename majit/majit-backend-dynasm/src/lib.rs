@@ -19,7 +19,6 @@ use std::cell::RefCell;
 pub mod arch;
 pub mod callbuilder;
 pub mod codebuf;
-pub mod frame;
 pub mod gcmap;
 pub mod guard;
 pub(crate) mod j2plan;

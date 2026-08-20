@@ -1,6 +1,6 @@
 //! The deadframe a jitframe-backed backend returns from a compiled run.
 //!
-//! `llmodel.py:323 return ll_frame` — the deadframe IS the JitFrame. Values
+//! `llmodel.py:328 return ll_frame` — the deadframe IS the JitFrame. Values
 //! stay in `jf_frame[]` and are never copied out: `get_int_value(deadframe,
 //! index)` (`llmodel.py:437-451`) casts the opaque deadframe back to a
 //! JITFRAMEPTR and reads `jf_frame[index]` in place, and `get_latest_descr`

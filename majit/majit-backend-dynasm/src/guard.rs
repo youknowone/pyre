@@ -25,23 +25,8 @@ use majit_ir::FailDescr;
 // FAIL_ARG_LOCS_TABLE removed: duplicates `rd_locs`
 // (`history.py:132 _attrs_`).  All readers (`lib.rs:handle_fail_*` and
 // `runner.rs::execute_token`) now decode `descr.rd_locs()` directly
-// via `decode_rd_loc_slot` below, matching PyPy's
+// via `decode_rd_loc_slot`, matching PyPy's
 // `llmodel.py:422-424 _decode_pos`.
-
-/// PyPy `llmodel.py:422-424 _decode_pos` parity.  Translate one
-/// `rd_locs[index]` entry into the jitframe slot pyre's
-/// `get_int_value_direct(jf, slot)` consumes.  Returns `None` for
-/// 0xFFFF (unmapped — resume system handles via `rd_numb`
-/// TAGCONST/TAGVIRTUAL encoding) or for out-of-range indices.
-#[inline]
-pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> {
-    let pos = *descr.rd_locs().get(index)?;
-    if pos == 0xFFFF {
-        None
-    } else {
-        Some(pos as usize)
-    }
-}
 
 /// Re-export the shared per-cpu descr attachment types so existing
 /// `crate::guard::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle}`
@@ -53,6 +38,12 @@ pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> 
 /// make_and_attach_done_descrs` binds them on each `cpu` instance
 /// regardless of backend.
 pub use majit_backend::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle};
+
+/// Re-export the slot decoder for the same reason: `_decode_pos` is a method
+/// on `AbstractLLCPU` (`llmodel.py:422-424`), not a per-arch entry, so its
+/// definition sits in `majit-backend`'s `llmodel` beside the direct readers it
+/// feeds, and `crate::guard::decode_rd_loc_slot` keeps resolving here.
+pub use majit_backend::llmodel::decode_rd_loc_slot;
 
 // `DynasmFailDescr` removed.  PyPy's dynasm-equivalent
 // `assembler.py` carries no per-emission descr wrapper — every guard

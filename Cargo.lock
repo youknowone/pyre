@@ -1916,6 +1916,7 @@ dependencies = [
 name = "majit-backend"
 version = "0.0.2"
 dependencies = [
+ "indexmap",
  "majit-gc",
  "majit-ir",
  "majit-translate",

@@ -71,6 +71,7 @@ pub mod call_stub;
 pub mod deadframe;
 pub mod finish_descrs;
 pub mod jitframe;
+pub mod libc_deadframe;
 pub mod llmodel;
 pub mod model;
 pub mod rd_payload;
@@ -97,10 +98,17 @@ pub use resume_value::{
     resume_value_layout_summary_from_exit_value_source,
 };
 
-/// Lightweight execution result that avoids DeadFrame boxing.
+/// A compiled-code exit rendered as plain data: the failargs already decoded
+/// out of the frame, beside the exit metadata the descr carries.
 ///
-/// Used by `execute_token_ints_raw` to return guard failure data
-/// without heap-allocating a DeadFrame.
+/// What this buys is the SHAPE, not the cost. A caller holding one of these
+/// needs no [`DeadFrame`] and makes no per-value trip through the [`Backend`]
+/// accessors — but producing it is not the cheaper route to the same answer.
+/// `Backend::execute_token_raw` builds a deadframe and runs exactly that
+/// accessor loop before copying the results into the owned buffers below, so
+/// the default route costs strictly more than reading the deadframe directly.
+/// Only a backend that overrides `execute_token_ints_raw` decodes its exit
+/// without minting a deadframe at all.
 pub struct RawExecResult {
     /// Output values from the guard exit, truncated to `exit_arity`.
     pub outputs: Vec<i64>,
@@ -1615,15 +1623,21 @@ unsafe impl Sync for JitCellToken {}
 ///
 /// The backend stores register/stack values here so the frontend can read them.
 ///
-/// A backend whose frames are jitframes puts its frame in [`DeadFrame::JitFrame`]
-/// BY VALUE. `llmodel.py:323` hands back the JITFRAMEPTR the run returned and
-/// nothing wraps it, so an erased payload behind a per-exit heap allocation had
-/// no upstream counterpart; it existed only to give the frame pointer a fixed
-/// address to be registered at, which addressing the root by POSITION removes
-/// the need for (see [`deadframe::JitFrameDeadFrame`]).
+/// A backend whose frames are jitframes puts its frame in a jitframe variant
+/// BY VALUE. `llmodel.py:323` takes the JITFRAMEPTR the run returned and
+/// `:328` hands it back unwrapped, so an erased payload behind a per-exit heap
+/// allocation had no upstream counterpart; it existed only to give the frame
+/// pointer a fixed address to be registered at, which addressing the root by
+/// POSITION removes the need for (see [`deadframe::JitFrameDeadFrame`]).
+/// Which of the two jitframe variants applies is an ownership question, not a
+/// representation one: [`DeadFrame::JitFrame`] for frames the GC owns and moves,
+/// [`DeadFrame::LibcJitFrame`] for frames allocated outside the GC heap.
 ///
-/// [`DeadFrame::Boxed`] keeps the erasure for backends whose deadframe is not a
-/// jitframe, or is a jitframe held under a different ownership discipline.
+/// [`DeadFrame::Boxed`] keeps the erasure for backends that have no
+/// host-visible jitframe to hand back at all and must describe the exit with a
+/// structure of their own — `llgraph/runner.py:1042-1052 LLDeadFrame`, which
+/// carries `_latest_descr` / `_values` / `_last_exception` because it
+/// interprets the operations instead of running compiled code.
 ///
 /// **A deadframe is thread-confined**: it must be created and dropped on the
 /// same thread. The root slot [`DeadFrame::JitFrame`] holds names a position in
@@ -1632,8 +1646,14 @@ unsafe impl Sync for JitCellToken {}
 /// enforces, and it is the rule for the enum as a whole — the erased variant
 /// states no weaker one, so its payload carries no `Send` bound either.
 pub enum DeadFrame {
-    /// `llmodel.py:323` — the deadframe IS the jitframe the run returned.
+    /// `llmodel.py:328` — the deadframe IS the jitframe the run returned,
+    /// held in a GC root slot because the collector may move it.
     JitFrame(deadframe::JitFrameDeadFrame),
+    /// `llmodel.py:328` as well, for frames `llmodel.py:298 malloc_jitframe`
+    /// answered from outside the GC heap: the deadframe is still the jitframe,
+    /// but it never moves, takes no root slot, and owns the `jf_forward` chain
+    /// it was handed until it drops.
+    LibcJitFrame(libc_deadframe::LibcJitFrameDeadFrame),
     /// Backend-specific frame data.
     Boxed(Box<dyn std::any::Any>),
 }
@@ -1649,7 +1669,7 @@ impl DeadFrame {
     pub fn as_jitframe(&self) -> Option<&deadframe::JitFrameDeadFrame> {
         match self {
             DeadFrame::JitFrame(jf) => Some(jf),
-            DeadFrame::Boxed(_) => None,
+            DeadFrame::LibcJitFrame(_) | DeadFrame::Boxed(_) => None,
         }
     }
 
@@ -1658,7 +1678,19 @@ impl DeadFrame {
     pub fn as_jitframe_mut(&mut self) -> Option<&mut deadframe::JitFrameDeadFrame> {
         match self {
             DeadFrame::JitFrame(jf) => Some(jf),
-            DeadFrame::Boxed(_) => None,
+            DeadFrame::LibcJitFrame(_) | DeadFrame::Boxed(_) => None,
+        }
+    }
+
+    /// The off-GC-heap jitframe this deadframe reads through, if it has one.
+    ///
+    /// Shared-borrow only: every reader takes the frame by `&`, and the frame
+    /// itself is the mutable state, reached through the raw pointer it holds.
+    #[inline]
+    pub fn as_libc_jitframe(&self) -> Option<&libc_deadframe::LibcJitFrameDeadFrame> {
+        match self {
+            DeadFrame::LibcJitFrame(jf) => Some(jf),
+            DeadFrame::JitFrame(_) | DeadFrame::Boxed(_) => None,
         }
     }
 
@@ -1667,7 +1699,7 @@ impl DeadFrame {
     pub fn boxed_data(&self) -> Option<&dyn std::any::Any> {
         match self {
             DeadFrame::Boxed(data) => Some(&**data),
-            DeadFrame::JitFrame(_) => None,
+            DeadFrame::JitFrame(_) | DeadFrame::LibcJitFrame(_) => None,
         }
     }
 }
@@ -2532,8 +2564,12 @@ pub trait Backend: Send {
 
     /// Execute compiled code with integer-only arguments.
     ///
-    /// Avoids the `Value::Int` wrapping/unwrapping overhead when all
-    /// arguments are known to be integers (the common case for loop entry).
+    /// The integer-only signature is what a backend needs in order to hand the
+    /// caller's slice straight to compiled code, but this default does not do
+    /// that: it wraps every argument in `Value::Int` and calls `execute_token`,
+    /// which is the work the narrower signature exists to make skippable. It is
+    /// here so every backend answers the call; the wrapping is actually avoided
+    /// only by the backends that override this and read `args` directly.
     fn execute_token_ints(&self, token: &JitCellToken, args: &[i64]) -> DeadFrame {
         let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
         self.execute_token(token, &values)
@@ -2593,11 +2629,16 @@ pub trait Backend: Send {
         }
     }
 
-    /// Execute compiled code and return a lightweight result without
-    /// DeadFrame boxing.
+    /// Execute compiled code with integer arguments and return the exit as
+    /// plain data.
     ///
-    /// Returns the output values directly, avoiding the intermediate
-    /// DeadFrame heap allocation and the per-value downcast extraction loop.
+    /// This default is not a shortcut past anything: it wraps `args` in an
+    /// owned `Vec<Value>`, and `execute_token_raw` then runs `execute_token`,
+    /// mints the deadframe, walks the exit with the same per-value accessor
+    /// calls a direct reader would make, and copies the results into
+    /// [`RawExecResult`]'s owned buffers. It exists so every backend answers
+    /// the call; the work is skipped only by backends that override it and
+    /// read their exit slots out of the frame themselves.
     fn execute_token_ints_raw(&self, token: &JitCellToken, args: &[i64]) -> RawExecResult {
         let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
         self.execute_token_raw(token, &values)

@@ -7,6 +7,7 @@ use std::sync::Arc;
 /// rpython/jit/backend/x86/runner.py AbstractX86CPU.
 use std::sync::atomic::Ordering;
 
+use majit_backend::libc_deadframe::LibcJitFrameDeadFrame;
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 // `gc_sync` hands out the concrete collector; the trait must be in scope for
 // its methods to resolve on that type.
@@ -20,7 +21,6 @@ use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
 use crate::aarch64::cpu_ext::Aarch64CpuExt as ArchCpuExt;
 use crate::arch;
 use crate::codebuf;
-use crate::frame::FrameData;
 use crate::jitframe::JitFrame;
 #[cfg(target_arch = "x86_64")]
 use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
@@ -311,9 +311,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     // The jitframe a compiled run returns stays alive as the deadframe until
     // the frontend has finished reading it, and is off the JF shadow stack for
     // that whole window. Publishing the set is what keeps its interior refs
-    // rooted; see `frame::LIVE_DEADFRAMES`.
+    // rooted; see `libc_deadframe::LIVE_DEADFRAMES`.
     majit_gc::set_active_gc_deadframe_hooks(majit_gc::ActiveGcDeadFrameHooks {
-        walk_live_deadframes: Some(crate::frame::walk_live_deadframes),
+        walk_live_deadframes: Some(majit_backend::libc_deadframe::walk_live_deadframes),
     });
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
@@ -2031,33 +2031,6 @@ impl DynasmBackend {
         arch::JITFRAME_FIXED_SIZE + position
     }
 
-    /// Free a libc-allocated jitframe and every frame it forwards to.
-    ///
-    /// jitframe.py:139-145 — when `_check_frame_depth`'s realloc slowpath
-    /// fires, the outgrown frame's `jf_forward` is linked to its
-    /// replacement (`dynasm_realloc_frame`), and every node in that chain
-    /// was `register_libc_jitframe`'d (the head in `execute_token`, each
-    /// replacement in `dynasm_realloc_frame`).  Walk the chain, reading
-    /// `jf_forward` before freeing each node, so every frame is
-    /// unregistered + freed exactly once.  In the common no-realloc case
-    /// the chain is a single node (`jf_forward == null`).
-    ///
-    /// # Safety
-    /// `head` must be a live, `register_libc_jitframe`-tracked
-    /// `*mut JitFrame`, and the compiled epilogue must have popped every
-    /// chain frame off the shadow stack (gen_footer_shadowstack) before
-    /// this runs, so no freed frame is still a GC root.
-    unsafe fn free_jitframe_chain(head: *mut JitFrame) {
-        let mut cur = head;
-        while !cur.is_null() {
-            let next = unsafe { (*cur).jf_forward };
-            majit_gc::shadow_stack::unregister_libc_jitframe(cur as usize);
-            // Frees the block base, which sits one header word behind `cur`.
-            unsafe { majit_backend::jitframe::free_off_gc_jitframe(cur) };
-            cur = next;
-        }
-    }
-
     /// Parity with `BaseRegalloc._set_initial_bindings`:
     /// `_ll_initial_locs` stores `loc.value - base_ofs`, measured in bytes
     /// from `FIRST_ITEM_OFFSET`, not input-order slot numbers.
@@ -3018,14 +2991,18 @@ impl Backend for DynasmBackend {
             );
         }
 
-        // `llmodel.py:323 return ll_frame` — the deadframe IS the frame the
+        // `llmodel.py:328 return ll_frame` — the deadframe IS the frame the
         // run returned. `result_jf` is the tip of `jf_ptr`'s `jf_forward`
         // chain whenever `_check_frame_depth` realloc'd; the whole chain is
-        // handed to the deadframe, which frees it (jitframe.py:139-145) when
-        // it drops rather than here. Every slot read, and `grab_exc_value`,
-        // then goes straight into the frame the way `llmodel.py:240-250` does
-        // — nothing is decoded eagerly and no copy of the frame is made.
-        DeadFrame::boxed(unsafe { FrameData::owning(jf_ptr, result_jf, num_slots, descr, None) })
+        // handed to the deadframe, which frees it when it drops rather than
+        // here (frames allocated off the GC heap have no upstream free
+        // counterpart — upstream's JITFRAME is a `GcStruct`). Every slot read,
+        // and `grab_exc_value`, then goes straight into the frame the way
+        // `llmodel.py:240-250` does — nothing is decoded eagerly and no copy
+        // of the frame is made.
+        DeadFrame::LibcJitFrame(unsafe {
+            LibcJitFrameDeadFrame::owning(jf_ptr, result_jf, num_slots, descr, None)
+        })
     }
 
     /// Override execute_token_ints_raw to return the FULL jitframe
@@ -3136,8 +3113,9 @@ impl Backend for DynasmBackend {
         // tip before the libc jitframe chain is freed (same as execute_token).
         let exception_value = GcRef(unsafe { (*result_jf).jf_guard_exc });
 
-        // Free the whole `jf_forward` realloc chain (jitframe.py:139-145).
-        unsafe { Self::free_jitframe_chain(jf_ptr) };
+        // No deadframe is built on this path, so nothing else takes ownership
+        // of the chain — free it here.
+        unsafe { majit_backend::libc_deadframe::free_jitframe_chain(jf_ptr) };
 
         let descr_arc: majit_ir::DescrRef = descr.clone();
         majit_backend::RawExecResult {
@@ -3157,12 +3135,11 @@ impl Backend for DynasmBackend {
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         let data = frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<FrameData>())
-            .unwrap();
+            .as_libc_jitframe()
+            .expect("dynasm deadframe is a libc jitframe");
         data.fail_descr
             .as_fail_descr()
-            .expect("FrameData::fail_descr must implement FailDescr")
+            .expect("LibcJitFrameDeadFrame::fail_descr must implement FailDescr")
     }
 
     fn force(&self, force_token: GcRef) -> Option<DeadFrame> {
@@ -3180,12 +3157,12 @@ impl Backend for DynasmBackend {
             .expect("force descriptor must implement FailDescr")
             .fail_arg_types()
             .len();
-        // `llmodel.py:280-284 force` casts the resolved frame to a GCREF and
+        // `llmodel.py:270-274 force` casts the resolved frame to a GCREF and
         // returns it — the forced frame IS the deadframe, and it belongs to
         // the compiled run that is still executing, so this deadframe borrows
         // it rather than taking the chain over.
-        Some(DeadFrame::boxed(unsafe {
-            FrameData::borrowing(frame, num_slots, descr, None)
+        Some(DeadFrame::LibcJitFrame(unsafe {
+            LibcJitFrameDeadFrame::borrowing(frame, num_slots, descr, None)
         }))
     }
 
@@ -3200,14 +3177,13 @@ impl Backend for DynasmBackend {
     fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
         // `history.py:125` `cpu.get_latest_descr(deadframe)` returns the
         // metainterp `AbstractFailDescr` object op.descr stamped.  After
-        // the FrameData::fail_descr type cascade to `DescrRef`, `fail_descr`
+        // the LibcJitFrameDeadFrame::fail_descr type cascade to `DescrRef`, `fail_descr`
         // *is* the metainterp Arc (production codegen + synthetic exits
         // both stamp it via DescrRef directly), so we just clone the
         // shared identity.
         let data = frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<FrameData>())
-            .unwrap();
+            .as_libc_jitframe()
+            .expect("dynasm deadframe is a libc jitframe");
         Arc::clone(&data.fail_descr)
     }
 
@@ -3218,9 +3194,8 @@ impl Backend for DynasmBackend {
     /// GUARD_NOT_FORCED); other guards leave it NULL.
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
         frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<FrameData>())
-            .unwrap()
+            .as_libc_jitframe()
+            .expect("dynasm deadframe is a libc jitframe")
             .exc_value()
     }
 
@@ -3259,25 +3234,22 @@ impl Backend for DynasmBackend {
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
         frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<FrameData>())
-            .unwrap()
+            .as_libc_jitframe()
+            .expect("dynasm deadframe is a libc jitframe")
             .get_int(index)
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
         frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<FrameData>())
-            .unwrap()
+            .as_libc_jitframe()
+            .expect("dynasm deadframe is a libc jitframe")
             .get_float(index)
     }
 
     fn get_ref_value(&self, frame: &DeadFrame, index: usize) -> GcRef {
         frame
-            .boxed_data()
-            .and_then(|d| d.downcast_ref::<FrameData>())
-            .unwrap()
+            .as_libc_jitframe()
+            .expect("dynasm deadframe is a libc jitframe")
             .get_ref(index)
     }
 

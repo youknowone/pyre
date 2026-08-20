@@ -624,18 +624,28 @@ fn main() {
 /// scalars only — which `CounterState` is — gets neither, and falls back to the
 /// allocating `JitState` defaults. A state that clears that gate pays 4 fewer.
 ///
-/// `dynasm` adds two, for 6:
+/// `dynasm` adds one, for 5:
 ///
 /// | n | site |
 /// |---|------|
 /// | 1 | `majit_backend::jitframe::alloc_off_gc_jitframe` — the JITFRAME itself (`llmodel.py:298 malloc_jitframe`, the ONE allocation upstream makes per entry) |
-/// | 1 | `DynasmBackend::execute_token` in `runner.rs` — the `Box<FrameData>` inside `DeadFrame`. `DeadFrame` erases its payload behind `Box<dyn Any>`, so this box is the cast `llmodel.py:240` spells with `cast_opaque_ptr`; it holds the frame POINTER, not a copy of the frame |
 ///
-/// It used to add three. The third was `raw_values` in `execute_token`, a copy
-/// of every jitframe slot taken because `execute_token` freed the frame before
-/// returning. `llmodel.py:240-250` reads those slots out of the frame itself,
-/// so the copy had no upstream counterpart; the frame now lives as long as the
-/// deadframe does and the accessors read it in place.
+/// It used to add three. The two that went:
+///
+/// - `raw_values`, a copy of every jitframe slot taken because
+///   `DynasmBackend::execute_token` freed the frame before returning.
+///   `llmodel.py:240-250` reads those slots out of the frame itself, so the
+///   copy had no upstream counterpart; the frame now lives as long as the
+///   deadframe does and the accessors read it in place.
+/// - the `Box` inside `DeadFrame::Boxed` holding the deadframe
+///   `DynasmBackend::execute_token` returns. It held the frame POINTER, not a
+///   copy of the frame, and what it bought was type erasure across a crate
+///   boundary: `majit-backend` could not name a type declared in
+///   `majit-backend-dynasm`. That constraint has no upstream counterpart —
+///   `llsupport/jitframe.py` sits below every machine backend and
+///   `llmodel.py:271` names `jitframe.JITFRAMEPTR` directly — so the deadframe
+///   type moved down into `majit-backend` and `DeadFrame` holds it by value in
+///   a variant of its own.
 ///
 /// `cranelift` adds NOTHING, and its four are the four shared rows above.
 ///
@@ -674,4 +684,4 @@ fn main() {
 ///   `run_compiled_code_inner`, reached because this fixture had no GC at all;
 ///   see [`install_gc`]. The branch itself remains for a backend running
 ///   without a collector.
-const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 4 } else { 6 };
+const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 4 } else { 5 };

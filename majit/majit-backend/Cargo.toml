@@ -10,6 +10,7 @@ description = "Backend trait for majit JIT compiler"
 majit-ir = { workspace = true }
 majit-translate = { workspace = true }
 majit-gc = { workspace = true }
+indexmap = { workspace = true }
 parking_lot = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

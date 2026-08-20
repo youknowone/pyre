@@ -159,10 +159,10 @@ pub(crate) unsafe fn drop_bridge_payload(ptr: *mut ()) {
     }
 }
 
-// ── JitFrameDeadFrame (llmodel.py deadframe-as-jitframe parity) ─────
+// JitFrameDeadFrame (llmodel.py deadframe-as-jitframe parity).
 //
 // The type itself lives in `majit-backend` because `DeadFrame` holds it by
-// value: `llmodel.py:323` returns the JITFRAMEPTR as the deadframe, so the
+// value: `llmodel.py:328` returns the JITFRAMEPTR as the deadframe, so the
 // jitframe-shaped deadframe is the shared shape and not this backend's private
 // one. Re-exported here because every use site in this crate names it through
 // `crate::guard`.
