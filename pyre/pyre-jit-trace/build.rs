@@ -445,7 +445,8 @@ fn preflight_llbc_or_fail() {
 // rather than once per reader here.  `tests/llbc_fingerprint_format_test.rs`
 // pins that module against the driver's real output.
 use llbc_fingerprint::{
-    FingerprintFields, FreshnessMode, freshness_policy, parse_fingerprint_fields, stamp_field,
+    FingerprintFields, FreshnessMode, freshness_policy, parse_fingerprint_fields, platform_key,
+    stamp_field,
 };
 
 /// Wait for the fingerprint oracle with a deadline.
@@ -623,6 +624,15 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     // licence to read its field offsets, it is the absence of the check that
     // would grant one.
     let mut unknown: Vec<(&str, &'static str)> = Vec::new();
+    // Read from the target rather than the machine running this script: the
+    // artefacts describe the source set `cfg` selects for what is being built.
+    let host_platform = match (
+        std::env::var("CARGO_CFG_TARGET_OS"),
+        std::env::var("CARGO_CFG_TARGET_ARCH"),
+    ) {
+        (Ok(os), Ok(arch)) => platform_key(&os, &arch),
+        _ => None,
+    };
     for &crate_name in LLBC_CRATES {
         // An absent artefact is the bootstrap case, already reported by the
         // prepass; only an artefact that EXISTS can be silently trusted, so
@@ -650,6 +660,31 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
             unknown.push((crate_name, "stamp carries no external= line"));
             continue;
         };
+        // The stamp records which host the artefact was extracted for, and
+        // nothing else in it does: `source=`, `closure=` and `external=` are
+        // all computed from the tracked tree, so they agree exactly across
+        // hosts.  The engine's own `check` compares every key in its
+        // `STAMP_KEYS`, `platform` among them; this read a strict subset, so a
+        // build that followed an extraction for another host was told the
+        // artefacts were fresh and then failed somewhere downstream, naming
+        // neither the cause nor the fix.
+        let Some(recorded_platform) = stamp_field(&stamp, "platform=") else {
+            unknown.push((crate_name, "stamp carries no platform= line"));
+            continue;
+        };
+        let Some(host_platform) = host_platform else {
+            unknown.push((crate_name, "this target has no platform= spelling"));
+            continue;
+        };
+        if recorded_platform != host_platform {
+            stale.push((
+                crate_name,
+                "platform",
+                recorded_platform,
+                host_platform.to_string(),
+            ));
+            continue;
+        }
         let features = stamp_field(&stamp, "features=").unwrap_or_default();
         let layout_targets = stamp_field(&stamp, "layout_targets=").unwrap_or_default();
         let current =
@@ -700,9 +735,17 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
         "cargo::warning"
     };
     for (crate_name, field, recorded, current) in &stale {
+        // The other fields are hashes of the tree, so "the tree now has" is
+        // what moved.  `platform` is a fact about what is being built, and the
+        // tree is the same tree either way.
+        let subject = if *field == "platform" {
+            "this build is"
+        } else {
+            "the tree now has"
+        };
         println!(
             "{directive}=LLBC STALE: {crate_name}.ullbc was extracted at {field}={recorded}, \
-             the tree now has {field}={current}"
+             {subject} {field}={current}"
         );
     }
     // Deduplicated: a crate stale on both fields contributed two lines above,

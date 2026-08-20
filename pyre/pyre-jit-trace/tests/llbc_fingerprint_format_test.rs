@@ -16,7 +16,7 @@
 //! because it asks the producer instead of assuming.
 
 use pyre_jit_trace::llbc_fingerprint::{
-    parse_fingerprint_fields, parse_fingerprint_stdout, stamp_field,
+    parse_fingerprint_fields, parse_fingerprint_stdout, platform_key, stamp_field,
 };
 
 const HASH: &str = "d9b2992606c82b29c531f4f4d6a42e43808564620ab63d781eba135f9307c584";
@@ -30,6 +30,17 @@ fn repo_root() -> Option<std::path::PathBuf> {
     let mut dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     loop {
         if dir.join("scripts").join("extract-llbc.py").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Walk up from this crate until the neutral extraction engine is found.
+fn engine_root() -> Option<std::path::PathBuf> {
+    let mut dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        if dir.join("scripts").join("llbc_extract.py").is_file() {
             return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;
@@ -154,4 +165,69 @@ fn stamp_field_reads_one_key() {
     assert_eq!(stamp_field(&stamp, "closure=").as_deref(), Some(HASH));
     assert_eq!(stamp_field(&stamp, "external=").as_deref(), Some(""));
     assert_eq!(stamp_field(&stamp, "absent="), None);
+}
+
+/// The other pair test: `platform_key` against the producer's own table.
+///
+/// `platform=` is written by `platform_info` in `scripts/llbc_extract.py` and
+/// read by `fail_if_llbc_stale` to refuse artefacts extracted for another
+/// host.  The two spellings are hand-written in different languages, so the
+/// failure that matters is not a wrong answer for some exotic host -- it is
+/// the two tables disagreeing about the host doing the build, which turns the
+/// check into either a permanent false alarm or a permanent no-op.
+#[test]
+#[ignore = "shells out to python3 + scripts/llbc_extract.py; run in CI via --ignored"]
+fn platform_key_agrees_with_the_producer() {
+    // Not `repo_root`: that stops at the nearest ancestor holding a
+    // `scripts/extract-llbc.py`, and pyre's own driver is one -- the neutral
+    // engine it delegates to lives a level further up.
+    let root = engine_root().expect(
+        "scripts/llbc_extract.py not found above CARGO_MANIFEST_DIR — \
+         this test was asked to run, so an absent engine is a failure, not a skip",
+    );
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sys; sys.path.insert(0, 'scripts'); \
+             from llbc_extract import platform_info; print(platform_info()[0])",
+        )
+        .current_dir(&root)
+        .output()
+        .expect("failed to spawn python3");
+
+    assert!(
+        out.status.success(),
+        "producer exited {:?}; stderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let theirs = String::from_utf8(out.stdout).expect("stdout is not UTF-8");
+    let theirs = theirs.trim();
+    // Built for the machine running the test, so the target this crate is
+    // compiled for is the host the producer just described.
+    let ours = platform_key(std::env::consts::OS, std::env::consts::ARCH);
+    assert_eq!(
+        ours,
+        Some(theirs),
+        "`platform_key` and `platform_info` disagree about this host. \
+         The stamp records the producer's spelling, so a check built on \
+         the consumer's would compare two names for the same machine."
+    );
+}
+
+#[test]
+fn every_host_the_producer_extracts_on_has_a_spelling() {
+    // `platform_info`'s table, which is what a stamp can carry.
+    assert_eq!(platform_key("macos", "aarch64"), Some("darwin-arm64"));
+    assert_eq!(platform_key("macos", "x86_64"), Some("darwin-x86_64"));
+    assert_eq!(platform_key("linux", "aarch64"), Some("linux-aarch64"));
+    assert_eq!(platform_key("linux", "x86_64"), Some("linux-x86_64"));
+    // Collapsed on the producing side, so it collapses here: spelling it
+    // per-architecture would read every Windows stamp as a mismatch.
+    assert_eq!(platform_key("windows", "x86_64"), Some("windows"));
+    assert_eq!(platform_key("windows", "aarch64"), Some("windows"));
+    // A host the producer refuses to extract on cannot have written a stamp,
+    // and answering for it would compare against a name nothing writes.
+    assert_eq!(platform_key("freebsd", "x86_64"), None);
 }

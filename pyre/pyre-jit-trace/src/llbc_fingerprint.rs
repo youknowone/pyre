@@ -8,6 +8,30 @@
 //! from the Python side, and a reader that models the format loosely goes
 //! quiet instead of failing when a field is added.
 
+/// The extraction engine's spelling of the host it extracted for, as
+/// `platform_info` in `scripts/llbc_extract.py` writes it into `platform=`.
+///
+/// `cfg` gates which sources charon walks -- one host reads `kqueue` where
+/// another reads `epoll` -- so artefacts extracted elsewhere describe a
+/// different set of types, and their field offsets name different bytes.
+/// Every other field in the stamp is computed from the tracked tree and
+/// agrees across hosts, so this is the only one that separates them.
+///
+/// Windows collapses to a single key on the producing side regardless of
+/// architecture; collapsing it differently here would read every Windows
+/// stamp as a mismatch. `None` is a host the engine refuses to extract on,
+/// so no stamp it wrote can be describing this build.
+pub fn platform_key(target_os: &str, target_arch: &str) -> Option<&'static str> {
+    Some(match (target_os, target_arch) {
+        ("windows", _) => "windows",
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("linux", "x86_64") => "linux-x86_64",
+        _ => return None,
+    })
+}
+
 /// Read one `key=value` line out of a `key=value`-per-line block.
 ///
 /// `key` includes the `=`.  A prefix match is the whole parse.
