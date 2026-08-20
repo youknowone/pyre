@@ -31423,6 +31423,91 @@ mod tests {
     }
 
     #[test]
+    fn type_flags_publish_cpython_314_ready_match_self_and_collection_bits() {
+        crate::typedef::init_typeobjects();
+        const SEQUENCE: i64 = 1 << 5;
+        const MAPPING: i64 = 1 << 6;
+        const READY: i64 = 1 << 12;
+        const MATCH_SELF: i64 = 1 << 22;
+        const MASK: i64 = SEQUENCE | MAPPING | READY | MATCH_SELF;
+        let cases = [
+            ("object", crate::typedef::w_object(), READY),
+            ("type", crate::typedef::w_type(), READY),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "float",
+                crate::typedef::gettypeobject(&pyre_object::FLOAT_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "str",
+                crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "bytes",
+                crate::typedef::gettypeobject(&pyre_object::BYTES_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "bytearray",
+                crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "list",
+                crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
+                READY | MATCH_SELF | SEQUENCE,
+            ),
+            (
+                "tuple",
+                crate::typedef::gettypeobject(&pyre_object::TUPLE_TYPE),
+                READY | MATCH_SELF | SEQUENCE,
+            ),
+            (
+                "dict",
+                crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+                READY | MATCH_SELF | MAPPING,
+            ),
+            (
+                "set",
+                crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "frozenset",
+                crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE),
+                READY | MATCH_SELF,
+            ),
+            (
+                "range",
+                crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE),
+                READY | SEQUENCE,
+            ),
+            (
+                "memoryview",
+                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+                READY | SEQUENCE,
+            ),
+            (
+                "mappingproxy",
+                crate::typedef::gettypeobject(&pyre_object::MAPPING_PROXY_TYPE),
+                READY | MAPPING,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let w_flags = crate::baseobjspace::getattr_str(w_type, "__flags__")
+                .unwrap_or_else(|err| panic!("{name}.__flags__ lookup failed: {err:?}"));
+            let flags = unsafe { pyre_object::w_int_get_value(w_flags) };
+            assert_eq!(flags & MASK, expected, "{name}.__flags__");
+        }
+    }
+
+    #[test]
     fn test_ellipsis_has_registered_typeobject() {
         crate::typedef::init_typeobjects();
         let w_type = crate::typedef::r#type(pyre_object::special::w_ellipsis())

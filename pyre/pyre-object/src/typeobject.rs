@@ -1211,6 +1211,34 @@ pub unsafe fn w_type_issubtype(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     (*mro_ptr).as_slice().iter().any(|&t| std::ptr::eq(t, cls))
 }
 
+/// Whether a class pattern with one positional sub-pattern receives the
+/// subject itself. CPython stores this as `_Py_TPFLAGS_MATCH_SELF`; PyPy's
+/// pattern opcode recognizes the same builtin atomic families. Membership in
+/// any family's MRO makes the property inherit exactly as CPython's
+/// `inherit_special` does.
+pub unsafe fn w_type_has_match_self(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !is_type(w_type) {
+        return false;
+    }
+    for base in [
+        get_instantiate(&INT_TYPE),
+        get_instantiate(&FLOAT_TYPE),
+        get_instantiate(&STR_TYPE),
+        get_instantiate(&LIST_TYPE),
+        get_instantiate(&TUPLE_TYPE),
+        get_instantiate(&DICT_TYPE),
+        get_instantiate(&crate::bytesobject::BYTES_TYPE),
+        get_instantiate(&crate::bytearrayobject::BYTEARRAY_TYPE),
+        get_instantiate(&crate::setobject::SET_TYPE),
+        get_instantiate(&crate::setobject::FROZENSET_TYPE),
+    ] {
+        if !base.is_null() && w_type_issubtype(w_type, base) {
+            return true;
+        }
+    }
+    false
+}
+
 /// typeobject.py find_best_base — the type base whose instance
 /// layout a subtype extends (most-derived layout among the type bases).
 /// Non-raising variant for the null-mro subtype fallback.
@@ -1337,7 +1365,10 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     const IMMUTABLETYPE: i64 = 1 << 8;
     const DISALLOW_INSTANTIATION: i64 = 1 << 7;
     const BASETYPE: i64 = 1 << 10;
+    const READY: i64 = 1 << 12;
+    const READYING: i64 = 1 << 13;
     const ABSTRACT: i64 = 1 << 20;
+    const MATCH_SELF: i64 = 1 << 22;
     const HAVE_GC: i64 = 1 << 14;
     const PATMA_SEQUENCE: i64 = 1 << 5;
     const PATMA_MAPPING: i64 = 1 << 6;
@@ -1372,6 +1403,16 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     // no equivalent type owner, so its bit is always absent.
     if t.flag_abstract.load(std::sync::atomic::Ordering::Acquire) {
         flags |= ABSTRACT;
+    }
+    // [3.14-spec] CPython `type_ready` exposes READYING while a custom
+    // metaclass's `mro()` is running, then replaces it with READY when the MRO
+    // is installed (`Objects/typeobject.c:450-466, 8986-8991`). PyPy's
+    // partially initialized `W_TypeObject` likewise has `mro_w is None`
+    // (`typeobject.py:1080-1084`), which is pyre's canonical readiness state.
+    if t.mro_w.is_null() {
+        flags |= READYING;
+    } else {
+        flags |= READY;
     }
     if t.flag_disallow_instantiation
         .load(std::sync::atomic::Ordering::Acquire)
@@ -1408,8 +1449,29 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     }
     match t.flag_map_or_seq.load(std::sync::atomic::Ordering::Acquire) {
         b'M' => flags |= PATMA_MAPPING,
-        b'S' => flags |= PATMA_SEQUENCE,
+        // CPython deliberately omits the sequence-pattern flag from str,
+        // bytes and bytearray (`unicodeobject.c:15805`,
+        // `bytesobject.c:3118`, `bytearrayobject.c:2867`). Pyre keeps PyPy's
+        // internal S marker on these types for `issequence_w`; MATCH_SEQUENCE
+        // applies the same exclusion, so only the public bit is masked here.
+        b'S' if !w_type_issubtype(obj, get_instantiate(&STR_TYPE))
+            && !w_type_issubtype(obj, get_instantiate(&crate::bytesobject::BYTES_TYPE))
+            && !w_type_issubtype(
+                obj,
+                get_instantiate(&crate::bytearrayobject::BYTEARRAY_TYPE),
+            ) =>
+        {
+            flags |= PATMA_SEQUENCE
+        }
         _ => {}
+    }
+    if w_type_has_match_self(obj) {
+        // [3.14-spec] CPython `inherit_special` inherits MATCH_SELF from the
+        // dominant base (`typeobject.c:8204-8206`). PyPy implements the same
+        // observable class-pattern rule with its builtin atomic-type test;
+        // `w_type_has_match_self` centralizes that MRO classification for the
+        // opcode and this public flag.
+        flags |= MATCH_SELF;
     }
     // [3.14-spec] CPython v3.14.6 `Objects/typeobject.c:8175-8200`
     // computes these mutually exclusive fast-subclass flags from the base

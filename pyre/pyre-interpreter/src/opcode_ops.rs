@@ -441,30 +441,7 @@ pub fn match_class_value(
             // No `__match_args__`: the builtin "atomic" types (int, str,
             // bytes, ...) match the subject itself as their single
             // positional sub-pattern (Py_TPFLAGS_MATCH_SELF).
-            let is_self = {
-                use pyre_object::pyobject::get_instantiate;
-                let atomics: [PyObjectRef; 11] = [
-                    get_instantiate(&pyre_object::pyobject::INT_TYPE),
-                    get_instantiate(&pyre_object::pyobject::BOOL_TYPE),
-                    get_instantiate(&pyre_object::pyobject::FLOAT_TYPE),
-                    get_instantiate(&pyre_object::pyobject::STR_TYPE),
-                    get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-                    get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
-                    get_instantiate(&pyre_object::pyobject::DICT_TYPE),
-                    get_instantiate(&pyre_object::bytesobject::BYTES_TYPE),
-                    get_instantiate(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
-                    get_instantiate(&pyre_object::setobject::SET_TYPE),
-                    get_instantiate(&pyre_object::setobject::FROZENSET_TYPE),
-                ];
-                let mut found = false;
-                for ty_obj in atomics {
-                    if crate::baseobjspace::issubclass(cls, ty_obj)? {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            };
+            let is_self = unsafe { pyre_object::typeobject::w_type_has_match_self(cls) };
             if is_self {
                 if count == 1 {
                     extracted.push(subject_slot);
