@@ -8581,14 +8581,26 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
-    portal_runner_dispatch(frame_root.frame())
+    portal_runner_dispatch(&mut frame_root)
 }
 
-fn portal_runner_dispatch(frame: &mut PyFrame) -> PyResult {
-    if let Some(result) = try_function_entry_jit(frame) {
+/// The dispatch half of `portal_runner_result`, taking the caller's
+/// [`FrameRoot`] rather than a raw frame.
+///
+/// `try_function_entry_jit` runs compiled code, and it roots the frame only for
+/// its own body: the root is gone by the time it hands back `None`.  The frame
+/// reaching this entry is the one kind that moves — `ll_portal_runner_shim`
+/// receives the nursery `PyFrame` `emit_new_pyframe_inline_with_params` built,
+/// not an interpreter frame allocated old-gen and stationary — so a collection
+/// inside that compiled run leaves the address passed in naming a corpse whose
+/// `locals_cells_stack_w` is a pre-collection array.  Read the frame back out
+/// of the root, the way `eval_with_jit_inner` already does at its own
+/// `try_function_entry_jit` / `handle_jitexception` pair.
+fn portal_runner_dispatch(frame_root: &mut FrameRoot) -> PyResult {
+    if let Some(result) = try_function_entry_jit(frame_root.frame()) {
         result
     } else {
-        handle_jitexception(frame)
+        handle_jitexception(frame_root.frame())
     }
 }
 

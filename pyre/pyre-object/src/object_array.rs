@@ -994,6 +994,15 @@ fn stale_array_abort(array_addr: usize, index: usize) -> ! {
         "STALE ARRAY: FixedObjectArray::set_ref(index={index}) reached {array_addr:#x}, \
          already moved to {moved_to:#x}"
     );
+    // The holder is not on the live frame chain in any observed occurrence, so
+    // the walk below cannot name it.  Capture the Rust stack here instead: this
+    // arm is `#[cold]` and ends the process, so the cost is irrelevant and the
+    // return addresses are the only thing that names the caller that kept the
+    // pre-collection pointer.
+    eprintln!(
+        "STALE ARRAY backtrace:\n{}",
+        std::backtrace::Backtrace::force_capture()
+    );
     let named = crate::gc_hook::report_stale_array_holder(array_addr);
     panic!(
         "FixedObjectArray::set_ref on {array_addr:#x}: a minor collection moved this \
