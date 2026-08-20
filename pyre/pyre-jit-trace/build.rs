@@ -624,15 +624,16 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
     // licence to read its field offsets, it is the absence of the check that
     // would grant one.
     let mut unknown: Vec<(&str, &'static str)> = Vec::new();
-    // Read from the target rather than the machine running this script: the
-    // artefacts describe the source set `cfg` selects for what is being built.
-    let host_platform = match (
-        std::env::var("CARGO_CFG_TARGET_OS"),
-        std::env::var("CARGO_CFG_TARGET_ARCH"),
-    ) {
-        (Ok(os), Ok(arch)) => platform_key(&os, &arch),
-        _ => None,
-    };
+    // `platform=` records the machine that ran the extraction -- `platform_info`
+    // reads `platform.system()` and `platform.machine()` -- so it is compared
+    // against the machine running this build script, which is what
+    // `std::env::consts` names here.  Not `CARGO_CFG_TARGET_*`: those name what
+    // is being built FOR, and a cross-compile or a `wasm32-unknown-unknown`
+    // build legitimately reads this host's artefacts.  There is one native
+    // extraction per host and the wasm layouts ride its `layout_targets=`
+    // sidecars, so no second extraction exists for a target to be matched
+    // against.
+    let host_platform = platform_key(std::env::consts::OS, std::env::consts::ARCH);
     for &crate_name in LLBC_CRATES {
         // An absent artefact is the bootstrap case, already reported by the
         // prepass; only an artefact that EXISTS can be silently trusted, so
@@ -672,11 +673,12 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
             unknown.push((crate_name, "stamp carries no platform= line"));
             continue;
         };
-        let Some(host_platform) = host_platform else {
-            unknown.push((crate_name, "this target has no platform= spelling"));
-            continue;
-        };
-        if recorded_platform != host_platform {
+        // `None` is a host the engine refuses to extract on, so it cannot have
+        // written this stamp -- but the source and external comparisons below
+        // still can, and declining to compare one field must not cost them.
+        if let Some(host_platform) = host_platform
+            && recorded_platform != host_platform
+        {
             stale.push((
                 crate_name,
                 "platform",

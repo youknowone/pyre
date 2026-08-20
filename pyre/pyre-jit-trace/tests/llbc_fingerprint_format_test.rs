@@ -204,8 +204,9 @@ fn platform_key_agrees_with_the_producer() {
 
     let theirs = String::from_utf8(out.stdout).expect("stdout is not UTF-8");
     let theirs = theirs.trim();
-    // Built for the machine running the test, so the target this crate is
-    // compiled for is the host the producer just described.
+    // `std::env::consts` names the machine this test binary runs on, which is
+    // the machine the producer just described -- the same pairing
+    // `fail_if_llbc_stale` makes from its build script.
     let ours = platform_key(std::env::consts::OS, std::env::consts::ARCH);
     assert_eq!(
         ours,
