@@ -3486,6 +3486,12 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn as_loop_target_descr(&self) -> Option<&dyn LoopTargetDescr> {
         None
     }
+    /// `heap.py:814` `assert isinstance(qmutdescr, QuasiImmutDescr)` — the
+    /// descr a recorded `QUASIIMMUT_FIELD` carries.  Default `None`; only
+    /// [`QuasiImmutDescr`] overrides.
+    fn as_quasi_immut_descr(&self) -> Option<&QuasiImmutDescr> {
+        None
+    }
 
     /// Whether the field/array described is always pure (immutable).
     fn is_always_pure(&self) -> bool {
@@ -3616,6 +3622,117 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         } else {
             (0, false)
         }
+    }
+}
+
+/// `quasiimmut.py:54-110 QuasiImmut` seen from the JIT side — one object
+/// gathering the loops that folded a single quasi-immutable field.
+///
+/// The instance itself belongs to the interpreter, which owns the hidden
+/// `mutate_<name>` field it hangs off; majit only ever asks it the two
+/// questions upstream asks: whether it is still the field's current instance
+/// (`quasiimmut.py:152`), and to record a finished loop (`:72-75`).
+pub trait QuasiImmutHandle: Send + Sync + std::fmt::Debug {
+    /// `quasiimmut.py:151-153` — the `qmut is not self.qmut` test, answered by
+    /// the recorded instance rather than by re-reading the field.
+    fn is_current(&self) -> bool;
+
+    /// `quasiimmut.py:72-75 register_loop_token`, reached from
+    /// `compile.py:204-207`.
+    fn register_loop_token(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>);
+}
+
+/// `quasiimmut.py:113-158 QuasiImmutDescr` — the descr a recorded
+/// `QUASIIMMUT_FIELD` carries, minted fresh per read so it can hold what that
+/// read resolved: the struct, the field, and the `QuasiImmut` instance
+/// `get_current_qmut_instance` handed back.
+///
+/// Everything else about it is the wrapped field descr, so the whole `Descr`
+/// surface delegates and the op stays indistinguishable from one carrying the
+/// field descr directly — including `index()`, which the heap cache and the
+/// tracer key on.
+///
+/// `constantfieldbox` (`quasiimmut.py:125`) is the one member that stays off
+/// this descr: it is a Box, and pyre records it as the op's second operand
+/// instead.
+#[derive(Debug)]
+pub struct QuasiImmutDescr {
+    fielddescr: DescrRef,
+    /// `quasiimmut.py:121 self.struct = struct` — compared, never dereferenced.
+    struct_ptr: u64,
+    qmut: std::sync::Arc<dyn QuasiImmutHandle>,
+}
+
+impl QuasiImmutDescr {
+    /// `quasiimmut.py:119-125 QuasiImmutDescr.__init__`, minus the field read
+    /// the caller keeps as an operand.
+    pub fn new(
+        fielddescr: DescrRef,
+        struct_ptr: u64,
+        qmut: std::sync::Arc<dyn QuasiImmutHandle>,
+    ) -> Self {
+        Self {
+            fielddescr,
+            struct_ptr,
+            qmut,
+        }
+    }
+
+    /// `quasiimmut.py:122 self.fielddescr = fielddescr`.
+    pub fn fielddescr(&self) -> &DescrRef {
+        &self.fielddescr
+    }
+
+    /// `quasiimmut.py:121 self.struct = struct`.
+    pub fn struct_ptr(&self) -> u64 {
+        self.struct_ptr
+    }
+
+    /// `quasiimmut.py:124 self.qmut = get_current_qmut_instance(...)`.
+    pub fn qmut(&self) -> &std::sync::Arc<dyn QuasiImmutHandle> {
+        &self.qmut
+    }
+}
+
+impl Descr for QuasiImmutDescr {
+    fn as_quasi_immut_descr(&self) -> Option<&QuasiImmutDescr> {
+        Some(self)
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+    fn index(&self) -> u32 {
+        self.fielddescr.index()
+    }
+    fn set_index(&self, index: u32) {
+        self.fielddescr.set_index(index);
+    }
+    fn get_descr_index(&self) -> i32 {
+        self.fielddescr.get_descr_index()
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.fielddescr.set_descr_index(index);
+    }
+    fn get_ei_index(&self) -> u32 {
+        self.fielddescr.get_ei_index()
+    }
+    fn set_ei_index(&self, ei_index: u32) {
+        self.fielddescr.set_ei_index(ei_index);
+    }
+    fn is_always_pure(&self) -> bool {
+        self.fielddescr.is_always_pure()
+    }
+    fn is_quasi_immutable(&self) -> bool {
+        self.fielddescr.is_quasi_immutable()
+    }
+    fn is_virtualizable(&self) -> bool {
+        self.fielddescr.is_virtualizable()
+    }
+    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+        self.fielddescr.as_field_descr()
+    }
+    fn repr(&self) -> String {
+        self.fielddescr.repr()
     }
 }
 

@@ -4880,7 +4880,7 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
     // (`end=ForceQuasiImmutable committed=false effects=4`).
     //
     // Declining is sound, not a hole: without the abort the trace keeps
-    // recording and the optimizer's revalidation (heap.py:798-804
+    // recording and the optimizer's revalidation (heap.py:818-819
     // `is_still_valid_for`) discards any loop whose recorded `?` value moved,
     // so the only cost is a wasted trace attempt.
     if !ctx.vstack_valid || ctx.fbw_mode.inline_subwalk || ctx.trace_ctx.is_bridge_trace {

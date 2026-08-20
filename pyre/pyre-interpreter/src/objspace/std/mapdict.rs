@@ -225,12 +225,10 @@ impl Terminator {
         self.allow_unboxing.set(v);
     }
 
-    pub fn register_allow_unboxing_watcher(&self, flag: &Arc<AtomicBool>) {
-        self.allow_unboxing_watchers.register_loop_token(flag);
-    }
-
-    pub fn install_allow_unboxing_watcher(&self) {
-        self.allow_unboxing_watchers.ensure_installed();
+    pub fn current_allow_unboxing_qmut(
+        &self,
+    ) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
+        self.allow_unboxing_watchers.get_current_qmut_instance()
     }
 
     pub fn allow_unboxing_qmut_installed(&self) -> bool {
@@ -242,29 +240,17 @@ impl Terminator {
     }
 }
 
-/// Register a loop against a Terminator's `allow_unboxing?` field.
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for a Terminator's `allow_unboxing?` field.
 ///
 /// # Safety
 /// `terminator` must be null or point at a live owner.
-pub unsafe fn terminator_register_allow_unboxing_watcher(
+pub unsafe fn terminator_current_allow_unboxing_qmut(
     terminator: *const Terminator,
-    flag: &Arc<AtomicBool>,
-) {
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
     if terminator.is_null() {
-        return;
+        return None;
     }
-    unsafe { (*terminator).register_allow_unboxing_watcher(flag) };
-}
-
-/// Install a Terminator's `allow_unboxing?` watcher without registering a loop.
-///
-/// # Safety
-/// `terminator` must be null or point at a live owner.
-pub unsafe fn terminator_install_allow_unboxing_watcher(terminator: *const Terminator) {
-    if terminator.is_null() {
-        return;
-    }
-    unsafe { (*terminator).install_allow_unboxing_watcher() };
+    Some(unsafe { (*terminator).current_allow_unboxing_qmut() })
 }
 
 /// Whether a Terminator's `allow_unboxing?` watcher is installed.
@@ -368,12 +354,8 @@ impl PlainAttribute {
         self.ever_mutated.set(v);
     }
 
-    pub fn register_ever_mutated_watcher(&self, flag: &Arc<AtomicBool>) {
-        self.ever_mutated_watchers.register_loop_token(flag);
-    }
-
-    pub fn install_ever_mutated_watcher(&self) {
-        self.ever_mutated_watchers.ensure_installed();
+    pub fn current_ever_mutated_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
+        self.ever_mutated_watchers.get_current_qmut_instance()
     }
 
     pub fn ever_mutated_qmut_installed(&self) -> bool {
@@ -385,29 +367,17 @@ impl PlainAttribute {
     }
 }
 
-/// Register a loop against a PlainAttribute's `ever_mutated?` field.
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for a PlainAttribute's `ever_mutated?` field.
 ///
 /// # Safety
 /// `attribute` must be null or point at a live owner.
-pub unsafe fn plain_attribute_register_ever_mutated_watcher(
+pub unsafe fn plain_attribute_current_ever_mutated_qmut(
     attribute: *const PlainAttribute,
-    flag: &Arc<AtomicBool>,
-) {
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
     if attribute.is_null() {
-        return;
+        return None;
     }
-    unsafe { (*attribute).register_ever_mutated_watcher(flag) };
-}
-
-/// Install a PlainAttribute's `ever_mutated?` watcher without registering a loop.
-///
-/// # Safety
-/// `attribute` must be null or point at a live owner.
-pub unsafe fn plain_attribute_install_ever_mutated_watcher(attribute: *const PlainAttribute) {
-    if attribute.is_null() {
-        return;
-    }
-    unsafe { (*attribute).install_ever_mutated_watcher() };
+    Some(unsafe { (*attribute).current_ever_mutated_qmut() })
 }
 
 /// Whether a PlainAttribute's `ever_mutated?` watcher is installed.
@@ -4000,12 +3970,8 @@ impl CachedAttributeHolder {
         self.typ.set(t);
     }
 
-    pub fn register_attr_watcher(&self, flag: &Arc<AtomicBool>) {
-        self.attr_watchers.register_loop_token(flag);
-    }
-
-    pub fn install_attr_watcher(&self) {
-        self.attr_watchers.ensure_installed();
+    pub fn current_attr_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
+        self.attr_watchers.get_current_qmut_instance()
     }
 
     pub fn attr_qmut_installed(&self) -> bool {
@@ -4016,12 +3982,8 @@ impl CachedAttributeHolder {
         self.attr_watchers.invalidate();
     }
 
-    pub fn register_typ_watcher(&self, flag: &Arc<AtomicBool>) {
-        self.typ_watchers.register_loop_token(flag);
-    }
-
-    pub fn install_typ_watcher(&self) {
-        self.typ_watchers.ensure_installed();
+    pub fn current_typ_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
+        self.typ_watchers.get_current_qmut_instance()
     }
 
     pub fn typ_qmut_installed(&self) -> bool {
@@ -4033,29 +3995,17 @@ impl CachedAttributeHolder {
     }
 }
 
-/// Register a loop against a CachedAttributeHolder's `attr?` field.
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for a CachedAttributeHolder's `attr?` field.
 ///
 /// # Safety
 /// `holder` must be null or point at a live owner.
-pub unsafe fn holder_register_attr_watcher(
+pub unsafe fn holder_current_attr_qmut(
     holder: *const CachedAttributeHolder,
-    flag: &Arc<AtomicBool>,
-) {
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
     if holder.is_null() {
-        return;
+        return None;
     }
-    unsafe { (*holder).register_attr_watcher(flag) };
-}
-
-/// Install a CachedAttributeHolder's `attr?` watcher without registering a loop.
-///
-/// # Safety
-/// `holder` must be null or point at a live owner.
-pub unsafe fn holder_install_attr_watcher(holder: *const CachedAttributeHolder) {
-    if holder.is_null() {
-        return;
-    }
-    unsafe { (*holder).install_attr_watcher() };
+    Some(unsafe { (*holder).current_attr_qmut() })
 }
 
 /// Whether a CachedAttributeHolder's `attr?` watcher is installed.
@@ -4079,29 +4029,17 @@ pub unsafe fn holder_force_attr_qmut(holder: *const CachedAttributeHolder) {
     unsafe { (*holder).force_attr_qmut() };
 }
 
-/// Register a loop against a CachedAttributeHolder's `typ?` field.
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for a CachedAttributeHolder's `typ?` field.
 ///
 /// # Safety
 /// `holder` must be null or point at a live owner.
-pub unsafe fn holder_register_typ_watcher(
+pub unsafe fn holder_current_typ_qmut(
     holder: *const CachedAttributeHolder,
-    flag: &Arc<AtomicBool>,
-) {
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
     if holder.is_null() {
-        return;
+        return None;
     }
-    unsafe { (*holder).register_typ_watcher(flag) };
-}
-
-/// Install a CachedAttributeHolder's `typ?` watcher without registering a loop.
-///
-/// # Safety
-/// `holder` must be null or point at a live owner.
-pub unsafe fn holder_install_typ_watcher(holder: *const CachedAttributeHolder) {
-    if holder.is_null() {
-        return;
-    }
-    unsafe { (*holder).install_typ_watcher() };
+    Some(unsafe { (*holder).current_typ_qmut() })
 }
 
 /// Whether a CachedAttributeHolder's `typ?` watcher is installed.
@@ -4384,7 +4322,7 @@ pub unsafe fn setattr_would_force_quasi_immut(
 /// re-add chain (mapdict.py:461-470) is deliberately not modelled: simulating
 /// that rebuild side-effect-free is not tractable against the current
 /// `node_copy` / `add_attr` shape. The optimizer's
-/// `quasiimmut_field_still_valid` revalidation (heap.py:798-804, ported in
+/// `quasiimmut_field_still_valid` revalidation (heap.py:818-819, ported in
 /// majit-metainterp's `optimizeopt/heap.rs`) discards a loop whose recorded `?`
 /// value moved during tracing, so a missed force costs a wasted trace, never
 /// correctness. Watcher installation belongs to the tracer; this predicate

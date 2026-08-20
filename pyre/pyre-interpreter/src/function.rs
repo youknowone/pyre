@@ -261,9 +261,9 @@ impl QuasiImmutSlot {
 /// is not (`quasiimmut.py:85-110`).
 ///
 /// Answers `None` while [`Function::mutate_slots`] is still null, which is the
-/// null `mutate_<name>` of `quasiimmut.py:130`: nothing has folded the field, so
-/// there is nothing to revoke. Only [`function_install_quasi_immut`] creates the
-/// block.
+/// null `mutate_<name>` of `quasiimmut.py:41`: nothing has folded the field, so
+/// there is nothing to revoke. Only [`function_current_qmut_instance`] creates
+/// the block.
 ///
 /// # Safety
 /// `obj` must be null or point at a live `PyObject`.
@@ -282,9 +282,10 @@ pub unsafe fn function_quasi_immut_field<'a>(
     Some(unsafe { &(*slots).0[slot.index()] })
 }
 
-/// `quasiimmut.py:116-126 get_current_qmut_instance` — install the instance
+/// `quasiimmut.py:17-27 get_current_qmut_instance` — resolve the instance
 /// while the read is still being recorded, so a write reached later in the same
-/// trace sees a non-null mutate field and aborts the attempt.
+/// trace sees a non-null mutate field and aborts the attempt, and the recording
+/// can carry the instance to `compile.py:204-207`.
 ///
 /// Creates the slot block on first use. The losing racer frees its own
 /// allocation rather than the published one, so the winner's block is the only
@@ -292,9 +293,12 @@ pub unsafe fn function_quasi_immut_field<'a>(
 ///
 /// # Safety
 /// `obj` must be null or point at a live `PyObject`.
-pub unsafe fn function_install_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlot) {
+pub unsafe fn function_current_qmut_instance(
+    obj: PyObjectRef,
+    slot: QuasiImmutSlot,
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
     if obj.is_null() || !unsafe { is_function_carrier(obj) } {
-        return;
+        return None;
     }
     let f = obj as *const Function;
     let cell = unsafe { &(*f).mutate_slots };
@@ -316,25 +320,10 @@ pub unsafe fn function_install_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlo
             }
         }
     }
-    unsafe { &(*slots).0[slot.index()] }.ensure_installed();
+    Some(unsafe { &(*slots).0[slot.index()] }.get_current_qmut_instance())
 }
 
-/// `quasiimmut.py:72-75 register_loop_token` — record a compiled loop's
-/// invalidation flag against one `?` field.
-///
-/// # Safety
-/// `obj` must be null or point at a live `PyObject`.
-pub unsafe fn function_register_quasi_immut_watcher(
-    obj: PyObjectRef,
-    slot: QuasiImmutSlot,
-    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    if let Some(field) = unsafe { function_quasi_immut_field(obj, slot) } {
-        field.register_loop_token(flag);
-    }
-}
-
-/// `quasiimmut.py:129-134 make_invalidation_function._invalidate_now` — revoke
+/// `quasiimmut.py:33-38 make_invalidation_function._invalidate_now` — revoke
 /// every loop that folded this field. Runs BEFORE the store, the way
 /// `typeobject.rs w_type_set_version_tag` calls its notify first.
 ///
@@ -799,7 +788,7 @@ pub(crate) fn function_new_impl(
         w_text_signature: PY_NULL,
         w_new_self: PY_NULL,
         w_moduleobj: PY_NULL,
-        // `quasiimmut.py:116-126` — null until the first loop registers.
+        // `quasiimmut.py:17-27` — null until the first read is recorded.
         mutate_slots: AtomicPtr::new(std::ptr::null_mut()),
     };
 

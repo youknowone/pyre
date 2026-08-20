@@ -466,7 +466,7 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     if !weak_subclasses.is_null() {
         drop(unsafe { Box::from_raw(weak_subclasses) });
     }
-    // The `mutate__version_tag` instance (`quasiimmut.py:116-126
+    // The `mutate__version_tag` instance (`quasiimmut.py:17-27
     // get_current_qmut_instance`) is Rust-owned and off-GC too. A type that was
     // compiled against and never mutated afterwards still holds one, so without
     // this the box outlives the only pointer to it.
@@ -6379,139 +6379,27 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 ///          qmut.register_loop_token(wref)
 /// ```
 ///
-/// Upstream's set holds the `QuasiImmut` instances the optimizer already
-/// resolved through each `QuasiImmutDescr`. Pyre records the pair that
-/// identifies one — the owning object and the registry index of the
-/// quasi-immutable field — and resolves the instance here, which is why the
-/// field index has to select the registrar: a `ModuleDictStrategy` box carries
-/// no `PyObject` header, so offering it to the type-keyed registrar would read
-/// one that is not there.
+/// The set holds the `QuasiImmut` instances the recording resolved and the
+/// optimizer collected (`heap.py:821-823`), so this is the whole of upstream's
+/// loop. Registering on the recorded instance rather than on whatever the field
+/// publishes now is what makes the window between the optimizer's
+/// `is_still_valid_for` and this call safe without a GIL: an instance swept in
+/// that window reports the loop invalid instead of accepting a registration
+/// nothing will ever sweep again.
 ///
-/// The declared `?` fields:
-///
-/// `celldict.py:34 _immutable_fields_ = ["version?"]` — the global cell fast
-/// path bakes a slot's stored cell as a `ConstPtr` under a
-/// `QUASIIMMUT_FIELD(strategy, version)`. `mutated()` (new key, `del`,
-/// `switch_to_object_strategy`, and every write that replaces the stored
-/// pointer) flips the flag; a same-key reassign mutates the cell in place
-/// without bumping the version and is observed by the live `cell.w_value` read
-/// instead.
-///
-/// `typeobject.py:177 _immutable_fields_ = ['_version_tag?']` — the
-/// LOAD_METHOD / LOAD_ATTR method-cache fold bakes a type's `version_tag` as a
-/// constant under a `QUASIIMMUT_FIELD(w_type, _version_tag)`. `mutated()`
-/// (typeobject.py:285-291) bumps the tag and walks subclasses, and the setter
-/// revokes each level's loops.
-///
-/// `function.py:34-42 _immutable_fields_ = ['code?', 'w_func_globals?',
-/// 'closure?[*]', 'defs_w?[*]', 'name?', 'qualname?', 'w_objclass?',
-/// 'w_text_signature?', 'w_kw_defs?']` — the inline-call path reads these off
-/// the live callee, and `f.__defaults__ = ...` / `f.__code__ = ...` retires
-/// every loop that folded one.  All nine share `function_register_quasi_immut_watcher`,
-/// which the slot the index resolves to picks apart.
+/// Lives here rather than in `record_loop_or_bridge` only because the
+/// invalidation flag is the compiling driver's, not the metainterp's.
 pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
     let (driver, _) = driver_pair();
-    let deps: Vec<(u64, u32)> =
-        std::mem::take(&mut driver.meta_interp_mut().last_quasi_immutable_deps);
+    let deps = std::mem::take(&mut driver.meta_interp_mut().last_quasi_immutable_deps);
     if deps.is_empty() {
         return;
     }
     let Some(flag) = driver.last_compiled_artifact_invalidation_flag() else {
         return;
     };
-    let module_dict_version = pyre_jit_trace::descr::module_dict_version_descr().index();
-    let type_version_tag = pyre_jit_trace::descr::type_version_tag_descr().index();
-    let terminator_allow_unboxing =
-        pyre_jit_trace::descr::terminator_allow_unboxing_descr().index();
-    let plain_attribute_ever_mutated =
-        pyre_jit_trace::descr::plain_attribute_ever_mutated_descr().index();
-    let holder_attr = pyre_jit_trace::descr::holder_attr_descr().index();
-    let holder_typ = pyre_jit_trace::descr::holder_typ_descr().index();
-    let audit_holder_hooks = pyre_jit_trace::descr::audit_holder_hooks_descr().index();
-    let property_fget = pyre_jit_trace::descr::property_fget_descr().index();
-    let property_fset = pyre_jit_trace::descr::property_fset_descr().index();
-    let staticmethod_w_function =
-        pyre_jit_trace::descr::staticmethod_w_function_quasi_descr().index();
-    let classmethod_w_function =
-        pyre_jit_trace::descr::classmethod_w_function_quasi_descr().index();
-    // Hoisted because each accessor clones a `LazyLock` descr; the index also
-    // decides which type `dep_ptr` is cast to, so the chain below ends in a
-    // fail-loud default rather than reinterpreting a headerless map node as a
-    // `W_TypeObject`.  These eleven plus the nine `Function` fields
-    // `function_quasi_immut_slot` resolves are every quasi-immutable descr this
-    // binary mints — see the same reasoning on `state.rs
-    // install_quasiimmut_field`.
-    for (dep_ptr, field_index) in deps {
-        unsafe {
-            if field_index == module_dict_version {
-                pyre_object::dictmultiobject::module_dict_strategy_register_version_watcher(
-                    dep_ptr as *mut pyre_object::celldict::ModuleDictStrategy,
-                    &flag,
-                );
-            } else if field_index == type_version_tag {
-                pyre_object::typeobject::w_type_register_quasi_immut_watcher(
-                    dep_ptr as pyre_object::PyObjectRef,
-                    &flag,
-                );
-            } else if field_index == terminator_allow_unboxing {
-                pyre_interpreter::objspace::std::mapdict::terminator_register_allow_unboxing_watcher(
-                    dep_ptr as *const _,
-                    &flag,
-                );
-            } else if field_index == plain_attribute_ever_mutated {
-                pyre_interpreter::objspace::std::mapdict::plain_attribute_register_ever_mutated_watcher(
-                    dep_ptr as *const _,
-                    &flag,
-                );
-            } else if field_index == holder_attr {
-                pyre_interpreter::objspace::std::mapdict::holder_register_attr_watcher(
-                    dep_ptr as *const _,
-                    &flag,
-                );
-            } else if field_index == holder_typ {
-                pyre_interpreter::objspace::std::mapdict::holder_register_typ_watcher(
-                    dep_ptr as *const _,
-                    &flag,
-                );
-            } else if field_index == audit_holder_hooks {
-                pyre_interpreter::module::sys::vm::audit_holder_register_hooks_watcher(
-                    dep_ptr as *const _,
-                    &flag,
-                );
-            } else if field_index == property_fget {
-                pyre_object::descriptor::w_property_register_fget_watcher(
-                    dep_ptr as pyre_object::PyObjectRef,
-                    &flag,
-                );
-            } else if field_index == property_fset {
-                pyre_object::descriptor::w_property_register_fset_watcher(
-                    dep_ptr as pyre_object::PyObjectRef,
-                    &flag,
-                );
-            } else if field_index == staticmethod_w_function {
-                pyre_object::function::w_staticmethod_register_w_function_watcher(
-                    dep_ptr as pyre_object::PyObjectRef,
-                    &flag,
-                );
-            } else if field_index == classmethod_w_function {
-                pyre_object::function::w_classmethod_register_w_function_watcher(
-                    dep_ptr as pyre_object::PyObjectRef,
-                    &flag,
-                );
-            } else if let Some(slot) = pyre_jit_trace::descr::function_quasi_immut_slot(field_index)
-            {
-                pyre_interpreter::function::function_register_quasi_immut_watcher(
-                    dep_ptr as pyre_object::PyObjectRef,
-                    slot,
-                    &flag,
-                );
-            } else {
-                debug_assert!(
-                    false,
-                    "unrecognised quasi-immutable field descr index {field_index:#x}"
-                );
-            }
-        }
+    for qmut in deps {
+        qmut.register_loop_token(&flag);
     }
 }
 
@@ -9494,7 +9382,7 @@ fn handle_fail(
     // the key through `get_procedure_token`, which skips invalidated tokens —
     // so an unscoped revoke kills the *replacement* loop instead, on every
     // guard failure that still reports through the old trace.  `QuasiImmut.
-    // invalidate` (quasiimmut.py:84-109) marks only the looptokens registered
+    // invalidate` (quasiimmut.py:84-110) marks only the looptokens registered
     // on that instance and then drops the list, so a retired token never
     // revokes a later compile upstream.
     if let Some(owner) = descr_arc

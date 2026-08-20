@@ -58,7 +58,7 @@ const INT_MUTABLE_CELL_VALUE_INDEX: u32 = CELL_DESCR_TAG;
 // `Terminator.allow_unboxing` and `PlainAttribute.ever_mutated` are both
 // `Cell<bool>`, so `stable_field_index(offset, field_size, field_type, signed)`
 // could collide whenever their `repr(Rust)` offsets coincide. Because the
-// index selects the pointer cast in `install_quasiimmut_field`, that collision
+// index selects the pointer cast in `quasi_immut_descr`, that collision
 // would be type confusion rather than merely a shared `HeapCache` key.
 const MAPDICT_DESCR_TAG: u32 = 0x5000_0000;
 const TERMINATOR_ALLOW_UNBOXING_INDEX: u32 = MAPDICT_DESCR_TAG;
@@ -78,7 +78,7 @@ const AUDIT_HOLDER_HOOKS_INDEX: u32 = MAPDICT_DESCR_TAG | 4;
 // every `W_*` class's first reference field lands there.  A
 // `stable_field_index(offset, size, type, signed)` would therefore name a
 // layout, not an owner, and the index is what selects the pointer cast in
-// `install_quasiimmut_field` / `register_quasi_immutable_deps`.  Reserved for
+// `quasi_immut_descr`.  Reserved for
 // the same reason as the map-node block above, in a tag of its own because the
 // owner here IS a `PyObject` and the reasoning that groups those four does not
 // apply.  Disjoint from FIELD (0x10xx_xxxx), ARRAY, SIZE, CELL, MAPDICT,
@@ -92,7 +92,7 @@ const PROPERTY_FSET_INDEX: u32 = PROPERTY_DESCR_TAG | 1;
 // field, and the two wrappers have byte-identical layouts, so
 // `stable_field_index` cannot even tell THEM apart — it names a layout, not an
 // owner, and the index is what selects the pointer cast in
-// `install_quasiimmut_field` / `register_quasi_immutable_deps`.  Reserved for
+// `quasi_immut_descr`.  Reserved for
 // the same reason as the property block above, in a tag of its own.  Disjoint
 // from FIELD (0x10xx_xxxx), ARRAY, SIZE, CELL, MAPDICT, PROPERTY,
 // `object.typeptr` (0x6000_0000), the native mapdict block, and the GC tid.
@@ -2890,7 +2890,7 @@ pub fn function_w_text_signature_descr() -> DescrRef {
 /// Resolve a field-descr index to the `Function` watcher slot it names, or
 /// `None` when the index is not one of the nine `function.py:34-42` fields.
 ///
-/// `quasiimmut.py:116-126 get_current_qmut_instance` reaches the hidden
+/// `quasiimmut.py:17-27 get_current_qmut_instance` reaches the hidden
 /// `mutate_<name>` field through a `mutatefielddescr` the rtyper minted next to
 /// the field's own descr.  Pyre carries the same pairing as this table: both
 /// the record-time install (`state.rs`) and the compile-time watcher

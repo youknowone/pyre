@@ -323,67 +323,44 @@ pub unsafe fn w_property_reinit(
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// `quasiimmut.py:116-126 get_current_qmut_instance` for
-/// `descriptor.py:175`'s `w_fget?` — install the instance at RECORD time so a
-/// write reached later in the same trace sees it.  The
-/// [`w_type_install_quasi_immut`](crate::typeobject::w_type_install_quasi_immut)
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for
+/// `descriptor.py:175`'s `w_fget?` — resolved at RECORD time so a write
+/// reached later in the same trace sees it, and handed back so the loop
+/// compiled from that trace registers on it and `property.__init__` revokes
+/// it.  The
+/// [`w_type_current_qmut_instance`](crate::typeobject::w_type_current_qmut_instance)
 /// shape.
 ///
 /// # Safety
 /// `obj` must point to a live [`W_Property`].
-pub unsafe fn w_property_install_fget_watcher(obj: PyObjectRef) {
-    if obj.is_null() {
-        return;
-    }
-    (*(obj as *const W_Property))
-        .fget_watchers
-        .ensure_installed();
-}
-
-/// The `w_fset?` twin of [`w_property_install_fget_watcher`].
-///
-/// # Safety
-/// `obj` must point to a live [`W_Property`].
-pub unsafe fn w_property_install_fset_watcher(obj: PyObjectRef) {
-    if obj.is_null() {
-        return;
-    }
-    (*(obj as *const W_Property))
-        .fset_watchers
-        .ensure_installed();
-}
-
-/// `quasiimmut.py:72-75 register_loop_token` for `w_fget?` — record a compiled
-/// loop's invalidation flag so `property.__init__` revokes it.
-///
-/// # Safety
-/// `obj` must point to a live [`W_Property`].
-pub unsafe fn w_property_register_fget_watcher(
+pub unsafe fn w_property_current_fget_qmut(
     obj: PyObjectRef,
-    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> Option<std::sync::Arc<crate::quasiimmut::QuasiImmut>> {
     if obj.is_null() {
-        return;
+        return None;
     }
-    (*(obj as *const W_Property))
-        .fget_watchers
-        .register_loop_token(flag);
+    Some(
+        (*(obj as *const W_Property))
+            .fget_watchers
+            .get_current_qmut_instance(),
+    )
 }
 
-/// The `w_fset?` twin of [`w_property_register_fget_watcher`].
+/// The `w_fset?` twin of [`w_property_current_fget_qmut`].
 ///
 /// # Safety
 /// `obj` must point to a live [`W_Property`].
-pub unsafe fn w_property_register_fset_watcher(
+pub unsafe fn w_property_current_fset_qmut(
     obj: PyObjectRef,
-    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> Option<std::sync::Arc<crate::quasiimmut::QuasiImmut>> {
     if obj.is_null() {
-        return;
+        return None;
     }
-    (*(obj as *const W_Property))
-        .fset_watchers
-        .register_loop_token(flag);
+    Some(
+        (*(obj as *const W_Property))
+            .fset_watchers
+            .get_current_qmut_instance(),
+    )
 }
 
 /// `descriptor.py:249-250 W_Property.get_doc` — returns the raw slot

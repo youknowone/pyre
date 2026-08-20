@@ -1552,11 +1552,11 @@ pub struct MetaInterp<M: Clone> {
     /// becomes the retracing_from position.
     pub(crate) potential_retrace_position: Option<crate::recorder::TracePosition>,
     /// RPython compile.py:204-207 (record_loop_or_bridge) parity:
-    /// quasi-immutable dependencies from the last compilation.
-    /// Raw pointers to namespace/quasi-immutable objects that the compiled
-    /// loop depends on. After compilation, the caller registers the loop's
-    /// invalidation flag on each dep. Cleared on each compile attempt.
-    pub last_quasi_immutable_deps: Vec<(u64, u32)>,
+    /// quasi-immutable dependencies from the last compilation — the
+    /// `QuasiImmut` instances the recording resolved. After compilation, the
+    /// caller registers the loop's invalidation flag on each. Cleared on each
+    /// compile attempt.
+    pub last_quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     /// Addresses of live `SnapshotBox.opref` slots holding an inline
     /// `ConstPtr` reference during compilation. RPython traces the
     /// `ConstPtr.value` field in place; pyre's root walker follows these
@@ -8841,7 +8841,7 @@ impl<M: Clone> MetaInterp<M> {
         constants: majit_ir::ConstMap<majit_ir::Value>,
         unroll_opt: &mut crate::optimizeopt::unroll::UnrollOptimizer,
         num_combined_ops: usize,
-        quasi_immutable_deps: Vec<(u64, u32)>,
+        quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     ) -> bool {
         let Some(fail_descr) = bridge.source_descr.as_fail_descr() else {
             crate::debug::log_one(
@@ -11646,21 +11646,17 @@ impl<M: Clone> MetaInterp<M> {
 
         // `compile.py:204-207` quasi-immutable_deps register_loop_token.
         //
-        // TODO: crate-boundary: the registration walker
-        // is ported in `pyre/pyre-jit/src/eval.rs::register_quasi_immutable_deps`
-        // and called at the post-compile sites that follow `compile_loop`
-        // / `compile_bridge` in `eval.rs`.  It cannot
-        // live inside this method because the dependency target is a
-        // `pyre_interpreter::DictStorage` slot watcher; majit-metainterp
-        // sits below the pyre/* crates and may not import them
-        // (`/parity` crate boundary invariant).  Convergence requires a
-        // backend-resident watcher trait plumbed through `MetaInterp` so
-        // that the registration walker can execute here without the
-        // pyre-interpreter import.  `last_quasi_immutable_deps` (the
-        // pyre-side analog of `loop.quasi_immutable_deps`) is populated
-        // in this file from `optimizer.quasi_immutable_deps` and drained
-        // by the eval.rs walker at the same call-graph depth as
-        // `compile.py:204-207`.
+        // The walk itself is `pyre/pyre-jit/src/eval.rs::
+        // register_quasi_immutable_deps`, called at the post-compile sites that
+        // follow `compile_loop` / `compile_bridge` — the same call-graph depth
+        // as `compile.py:204-207`.  What keeps it out of this method is no
+        // longer the dependency type (each entry is a
+        // `majit_ir::QuasiImmutHandle`, which this crate can name) but
+        // upstream's `wref`: pyre's stand-in for the loop token is the
+        // artifact's invalidation flag, and the compiling driver owns it, not
+        // the metainterp.  `last_quasi_immutable_deps` is the pyre-side analog
+        // of `loop.quasi_immutable_deps`, populated in this file from
+        // `optimizer.quasi_immutable_deps` and drained by that walk.
 
         // `compile.py:210` `loop.original_jitcell_token = None`.
         //

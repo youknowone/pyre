@@ -271,7 +271,7 @@ pub trait LoopInfo {
 #[derive(Clone, Debug)]
 pub struct BasicLoopInfo {
     pub inputargs: Vec<OpRef>,
-    pub quasi_immutable_deps: Vec<(u64, u32)>,
+    pub quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     pub jump_op: Option<Op>,
     pub extra_same_as: Vec<Op>,
     pub extra_before_label: Vec<Op>,
@@ -281,7 +281,7 @@ pub struct BasicLoopInfo {
 impl BasicLoopInfo {
     pub fn new(
         inputargs: Vec<OpRef>,
-        quasi_immutable_deps: Vec<(u64, u32)>,
+        quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
         jump_op: Option<Op>,
     ) -> Self {
         Self {
@@ -367,12 +367,11 @@ pub struct Optimizer {
     pendingfields: Vec<Op>,
     /// optimizer.py: `can_replace_guards` — flag to enable/disable guard sharing.
     can_replace_guards: bool,
-    /// optimizer.py: `quasi_immutable_deps` — quasi-immutable field dependencies.
-    /// RPython: dict[QuasiImmut → None]. We store (object_ptr, field_index)
-    /// pairs identifying the specific quasi-immutable slot that compiled
-    /// code depends on. After compilation, each dependency gets the loop's
-    /// invalidation flag registered as a per-slot watcher.
-    pub quasi_immutable_deps: Vec<(u64, u32)>,
+    /// optimizer.py: `quasi_immutable_deps` — quasi-immutable field
+    /// dependencies, `dict[QuasiImmut -> None]` upstream. Each entry is the
+    /// instance the recording resolved; after compilation each one gets the
+    /// loop's invalidation flag registered on it.
+    pub quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     /// RPython unroll.py: import_state — virtual structures to inject at Phase 2 start.
     /// Maps the original loop-carried input slot to a recursive abstract
     /// description of the virtual's field values.
@@ -1736,11 +1735,15 @@ impl Optimizer {
         ctx.can_replace_guards = guard.oldval;
     }
 
-    /// `optimizer.py:243` + `heap.py:807-808`
+    /// `optimizer.py:243` + `heap.py:821-823`
     /// `self.quasi_immutable_deps[qmutdescr.qmut] = None`. Vec-backed
     /// set with linear-scan dedup.
-    pub fn add_quasi_immutable_dep(&mut self, dep: (u64, u32)) {
-        if !self.quasi_immutable_deps.contains(&dep) {
+    pub fn add_quasi_immutable_dep(&mut self, dep: std::sync::Arc<dyn majit_ir::QuasiImmutHandle>) {
+        if !self
+            .quasi_immutable_deps
+            .iter()
+            .any(|seen| std::sync::Arc::ptr_eq(seen, &dep))
+        {
             self.quasi_immutable_deps.push(dep);
         }
     }

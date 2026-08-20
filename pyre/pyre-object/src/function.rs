@@ -273,36 +273,24 @@ pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
     }
 }
 
-/// `quasiimmut.py get_current_qmut_instance` for `function.py`'s
-/// `w_function?` — install the instance at RECORD time so a write reached
-/// later in the same trace sees it.
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for `function.py`'s
+/// `w_function?` — resolved at RECORD time so a write reached later in the same
+/// trace sees it, and handed back so the loop compiled from that trace
+/// registers on it.
 ///
 /// # Safety
 /// `obj` must point to a live [`StaticMethod`].
-pub unsafe fn w_staticmethod_install_w_function_watcher(obj: PyObjectRef) {
-    if obj.is_null() {
-        return;
-    }
-    (*(obj as *const StaticMethod))
-        .w_function_watchers
-        .ensure_installed();
-}
-
-/// Attach a compiled loop's invalidation flag to this wrapper's `w_function?`
-/// watcher, the `quasiimmut.py QuasiImmut.register_loop_token` half.
-///
-/// # Safety
-/// `obj` must point to a live [`StaticMethod`].
-pub unsafe fn w_staticmethod_register_w_function_watcher(
+pub unsafe fn w_staticmethod_current_w_function_qmut(
     obj: PyObjectRef,
-    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> Option<std::sync::Arc<crate::quasiimmut::QuasiImmut>> {
     if obj.is_null() {
-        return;
+        return None;
     }
-    (*(obj as *const StaticMethod))
-        .w_function_watchers
-        .register_loop_token(flag);
+    Some(
+        (*(obj as *const StaticMethod))
+            .w_function_watchers
+            .get_current_qmut_instance(),
+    )
 }
 
 /// function.py:678-681 `StaticMethod.getdict` — allocate the instance
@@ -469,36 +457,24 @@ pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
     }
 }
 
-/// `quasiimmut.py get_current_qmut_instance` for `function.py`'s
-/// `w_function?` — install the instance at RECORD time so a write reached
-/// later in the same trace sees it.
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for `function.py`'s
+/// `w_function?` — resolved at RECORD time so a write reached later in the same
+/// trace sees it, and handed back so the loop compiled from that trace
+/// registers on it.
 ///
 /// # Safety
 /// `obj` must point to a live [`ClassMethod`].
-pub unsafe fn w_classmethod_install_w_function_watcher(obj: PyObjectRef) {
-    if obj.is_null() {
-        return;
-    }
-    (*(obj as *const ClassMethod))
-        .w_function_watchers
-        .ensure_installed();
-}
-
-/// Attach a compiled loop's invalidation flag to this wrapper's `w_function?`
-/// watcher, the `quasiimmut.py QuasiImmut.register_loop_token` half.
-///
-/// # Safety
-/// `obj` must point to a live [`ClassMethod`].
-pub unsafe fn w_classmethod_register_w_function_watcher(
+pub unsafe fn w_classmethod_current_w_function_qmut(
     obj: PyObjectRef,
-    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> Option<std::sync::Arc<crate::quasiimmut::QuasiImmut>> {
     if obj.is_null() {
-        return;
+        return None;
     }
-    (*(obj as *const ClassMethod))
-        .w_function_watchers
-        .register_loop_token(flag);
+    Some(
+        (*(obj as *const ClassMethod))
+            .w_function_watchers
+            .get_current_qmut_instance(),
+    )
 }
 
 /// function.py:726-729 `ClassMethod.getdict`.

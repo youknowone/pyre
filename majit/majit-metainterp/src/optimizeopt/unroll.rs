@@ -326,9 +326,9 @@ pub struct UnrollOptimizer {
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     /// Threaded through inner Optimizer instances for inline registration.
     pub all_descrs: std::sync::Arc<Vec<majit_ir::descr::DescrRef>>,
-    /// compile.py:204-207 / heap.py:807-808 quasi-immutable deps collected
+    /// compile.py:204-207 / heap.py:821-823 quasi-immutable deps collected
     /// by the phase optimizers for post-compile watcher registration.
-    pub quasi_immutable_deps: Vec<(u64, u32)>,
+    pub quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     /// RPython Box type parity: trace inputarg types from recorder.
     /// Each RPython Box carries its type; in majit OpRef is untyped u32.
     /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputargs
@@ -2189,10 +2189,13 @@ impl Default for UnrollOptimizer {
     }
 }
 
-pub(crate) fn merge_quasi_immutable_deps(dst: &mut Vec<(u64, u32)>, src: &[(u64, u32)]) {
+pub(crate) fn merge_quasi_immutable_deps(
+    dst: &mut Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
+    src: &[std::sync::Arc<dyn majit_ir::QuasiImmutHandle>],
+) {
     for dep in src {
-        if !dst.contains(dep) {
-            dst.push(*dep);
+        if !dst.iter().any(|seen| std::sync::Arc::ptr_eq(seen, dep)) {
+            dst.push(dep.clone());
         }
     }
 }
@@ -2275,7 +2278,7 @@ pub struct ExportedState {
     /// unroll.py:234 `exported_state.quasi_immutable_deps` — deps collected
     /// while optimizing the preamble, merged into retrace deps at
     /// compile.py:384-390.
-    pub quasi_immutable_deps: Vec<(u64, u32)>,
+    pub quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     /// `OptContext::next_pos` at end of Phase 1 — strict upper bound of
     /// every OpRef Phase 1 allocated, including intermediates folded /
     /// forwarded away. `reserve_pos_typed` skips `materialize_operand_at` on the
@@ -2943,9 +2946,9 @@ pub struct UnrollInfo {
     /// Extra same_as ops added during finalization.
     pub extra_same_as: Vec<Op>,
     /// Quasi-immutable dependencies discovered during optimization
-    /// (`optimizer.py:243` + `heap.py:807-808`). Vec-backed set with
-    /// linear-scan dedup.
-    pub quasi_immutable_deps: Vec<(u64, u32)>,
+    /// (`optimizer.py:243` + `heap.py:821-823`). Vec-backed set with
+    /// linear-scan dedup on instance identity.
+    pub quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     /// Extra ops to insert before the label (from bridge inlining).
     pub extra_before_label: Vec<Op>,
 }

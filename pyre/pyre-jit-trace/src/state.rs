@@ -4091,9 +4091,13 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                 majit_metainterp::counters::HEAPCACHED_OPS,
             );
         } else {
-            install_quasiimmut_field(ctx, obj, &descr);
+            let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
             ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
-            ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
+            ctx.record_op_with_descr(
+                OpCode::QuasiimmutField,
+                &[obj],
+                qmutdescr.unwrap_or_else(|| descr.clone()),
+            );
             if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
                 ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
             }
@@ -4187,9 +4191,13 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                 majit_metainterp::counters::HEAPCACHED_OPS,
             );
         } else {
-            install_quasiimmut_field(ctx, obj, &descr);
+            let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
             ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
-            ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
+            ctx.record_op_with_descr(
+                OpCode::QuasiimmutField,
+                &[obj],
+                qmutdescr.unwrap_or_else(|| descr.clone()),
+            );
             if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
                 ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
             }
@@ -5067,20 +5075,18 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     // installed, so nothing invalidates and nothing bumps the force counter,
     // and the trace keeps a value that is already stale.  Without a GIL that
     // window is a real interleaving, not a theoretical one.
-    install_quasiimmut_field(ctx, obj, &descr);
+    let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
     // quasiimmut.py:125 `self.constantfieldbox =
     // self.get_current_constant_fieldvalue()` — the field's value at the moment
-    // the trace baked it.  `heap.py:803 is_still_valid_for` compares it against
+    // the trace baked it.  `heap.py:818 is_still_valid_for` compares it against
     // the live value and abandons the loop when they disagree, so it has to be
     // captured here; by the time the optimizer runs, the change it is looking
     // for has already happened.
     let constantfieldbox = current_quasiimmut_field_value(ctx, obj, &descr);
     ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
-    // Upstream carries the captured value on the per-op `QuasiImmutDescr`
-    // (quasiimmut.py:113-159), a descr minted fresh for every recorded
-    // QUASIIMMUT_FIELD.  Pyre's descrs are registry-indexed singletons, so a
-    // fresh one per op would mint a fresh registry entry per read; the value
-    // rides on the op instead.
+    // The captured value is the one `QuasiImmutDescr` member that stays off the
+    // descr: it is a Box, so it rides as the op's second operand.
+    let descr = qmutdescr.unwrap_or(descr);
     match constantfieldbox {
         Some(value) => ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj, value], descr),
         None => ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr),
@@ -5090,28 +5096,52 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     }
 }
 
-/// `quasiimmut.py:116-126 get_current_qmut_instance`, reached from
-/// `pyjitpl.py:1081 QuasiImmutDescr(...)` — install the qmut instance at RECORD
-/// time.
+/// `quasiimmut.py:54-110 QuasiImmut` published to the optimizer and the
+/// compiler as a [`majit_ir::QuasiImmutHandle`].
 ///
-/// Upstream builds a `QuasiImmutDescr` for every recorded `QUASIIMMUT_FIELD`,
-/// and its `__init__` installs the instance. It therefore exists for the rest of
-/// the recording, which is what arms `opimpl_jit_force_quasi_immutable`'s
-/// `mutatebox.nonnull()` (`pyjitpl.py:1112`) for a write reached later in that
-/// same trace.
+/// The interpreter's own type cannot carry the impl: `pyre-object` does not
+/// depend on `majit-ir`, and which JIT questions an instance answers is not a
+/// property of the object model.
+struct RecordedQuasiImmut(std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>);
+
+impl std::fmt::Debug for RecordedQuasiImmut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QuasiImmut({:p})", std::sync::Arc::as_ptr(&self.0))
+    }
+}
+
+impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
+    fn is_current(&self) -> bool {
+        self.0.is_current()
+    }
+
+    fn register_loop_token(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.0.register_loop_token(flag);
+    }
+}
+
+/// `pyjitpl.py:1081 QuasiImmutDescr(cpu, structbox.getref_base(), fielddescr,
+/// mutatefielddescr)` — the descr a recorded `QUASIIMMUT_FIELD` carries.
 ///
-/// Pyre installed only from `register_quasi_immutable_deps`
-/// (`pyre-jit/src/eval.rs`), which runs at COMPILE time, and every invalidation
-/// uninstalls — so through a whole recording the field stayed null and no
-/// write-side test could ever fire. This is the read dual of that function and
-/// resolves `(object, field_index)` → owner the same way it does.
-fn install_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
+/// Building it is what resolves the instance (`quasiimmut.py:124
+/// get_current_qmut_instance`), so it exists for the rest of the recording,
+/// which is what arms `opimpl_jit_force_quasi_immutable`'s `mutatebox.nonnull()`
+/// (`pyjitpl.py:1112`) for a write reached later in that same trace. The
+/// instance rides on the descr from here to `heap.py:818 is_still_valid_for`
+/// and `compile.py:204-207 register_loop_token`, so neither has to walk from
+/// the struct back to the hidden `mutate_*` slot a second time.
+///
+/// `None` where upstream cannot fail: an operand that is not a concrete
+/// pointer, or a descr index no arm claims. The caller records the plain field
+/// descr, and the optimizer then refuses the loop rather than standing a fold
+/// with no watcher behind it — `heap.py:814`'s assert, read as a verdict.
+fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option<DescrRef> {
     let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) else {
-        return;
+        return None;
     };
     let struct_ptr = struct_ref.0 as i64;
     if struct_ptr == 0 || struct_ptr == usize::MAX as i64 {
-        return;
+        return None;
     }
     let index = descr.index();
     // The index decides which type `struct_ptr` is cast to, so an unrecognised
@@ -5124,63 +5154,69 @@ fn install_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
     // descr reaches here: a `#[jit_immutable_fields]` entry would need the
     // `_immutable_fields_` `?` suffix and no declaration in the tree carries
     // one, and `record_quasiimmut_field` is absent from the emitted-opname set.
-    unsafe {
+    let qmut = unsafe {
         if index == crate::descr::module_dict_version_descr().index() {
-            pyre_object::dictmultiobject::module_dict_strategy_install_version_watcher(
+            pyre_object::dictmultiobject::module_dict_strategy_current_version_qmut(
                 struct_ptr as *mut pyre_object::celldict::ModuleDictStrategy,
-            );
+            )
         } else if index == crate::descr::type_version_tag_descr().index() {
-            pyre_object::typeobject::w_type_install_quasi_immut(
+            pyre_object::typeobject::w_type_current_qmut_instance(
                 struct_ptr as pyre_object::PyObjectRef,
-            );
+            )
         } else if index == crate::descr::terminator_allow_unboxing_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::terminator_install_allow_unboxing_watcher(
+            pyre_interpreter::objspace::std::mapdict::terminator_current_allow_unboxing_qmut(
                 struct_ptr as *const _,
-            );
+            )
         } else if index == crate::descr::plain_attribute_ever_mutated_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::plain_attribute_install_ever_mutated_watcher(
+            pyre_interpreter::objspace::std::mapdict::plain_attribute_current_ever_mutated_qmut(
                 struct_ptr as *const _,
-            );
+            )
         } else if index == crate::descr::holder_attr_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::holder_install_attr_watcher(
+            pyre_interpreter::objspace::std::mapdict::holder_current_attr_qmut(
                 struct_ptr as *const _,
-            );
+            )
         } else if index == crate::descr::holder_typ_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::holder_install_typ_watcher(
+            pyre_interpreter::objspace::std::mapdict::holder_current_typ_qmut(
                 struct_ptr as *const _,
-            );
+            )
         } else if index == crate::descr::audit_holder_hooks_descr().index() {
-            pyre_interpreter::module::sys::vm::audit_holder_install_hooks_watcher(
+            pyre_interpreter::module::sys::vm::audit_holder_current_hooks_qmut(
                 struct_ptr as *const _,
-            );
+            )
         } else if index == crate::descr::property_fget_descr().index() {
-            pyre_object::descriptor::w_property_install_fget_watcher(
+            pyre_object::descriptor::w_property_current_fget_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
-            );
+            )
         } else if index == crate::descr::property_fset_descr().index() {
-            pyre_object::descriptor::w_property_install_fset_watcher(
+            pyre_object::descriptor::w_property_current_fset_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
-            );
+            )
         } else if index == crate::descr::staticmethod_w_function_quasi_descr().index() {
-            pyre_object::function::w_staticmethod_install_w_function_watcher(
+            pyre_object::function::w_staticmethod_current_w_function_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
-            );
+            )
         } else if index == crate::descr::classmethod_w_function_quasi_descr().index() {
-            pyre_object::function::w_classmethod_install_w_function_watcher(
+            pyre_object::function::w_classmethod_current_w_function_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
-            );
+            )
         } else if let Some(slot) = crate::descr::function_quasi_immut_slot(index) {
-            pyre_interpreter::function::function_install_quasi_immut(
+            pyre_interpreter::function::function_current_qmut_instance(
                 struct_ptr as pyre_object::PyObjectRef,
                 slot,
-            );
+            )
         } else {
             debug_assert!(
                 false,
                 "unrecognised quasi-immutable field descr index {index:#x}"
             );
+            None
         }
-    }
+    }?;
+    Some(std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+        descr.clone(),
+        struct_ptr as u64,
+        std::sync::Arc::new(RecordedQuasiImmut(qmut)),
+    )))
 }
 
 /// quasiimmut.py:135-143 `QuasiImmutDescr.get_current_constant_fieldvalue`.
@@ -5200,7 +5236,7 @@ fn install_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
 /// `field_sanity_load` is the `cpu.bh_getfield_gc_*` triple behind one
 /// `field_type()` dispatch.  `None` when the receiver is not a concrete
 /// pointer or the descr is not a field descr — the optimizer then skips the
-/// revalidation, matching heap.py:794-796, which ignores a QUASIIMMUT_FIELD
+/// revalidation, matching heap.py:808-810, which ignores a QUASIIMMUT_FIELD
 /// whose struct did not fold to a constant.
 fn current_quasiimmut_field_value(
     ctx: &mut TraceCtx,

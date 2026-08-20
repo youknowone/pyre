@@ -8906,7 +8906,7 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
 }
 
 /// Pin mapdict's quasi-immutable fields with `const_ref`, never `const_int`:
-/// `install_quasiimmut_field`, `current_quasiimmut_field_value`, and optimizer
+/// `quasi_immut_descr`, `current_quasiimmut_field_value`, and optimizer
 /// dependency collection require `Value::Ref`. The raw non-GC pointer cannot
 /// reach the gcref table because `OptHeap` consumes `QUASIIMMUT_FIELD` before
 /// the GC rewriter runs, exactly as `walker_pin_namespace_version` relies on.

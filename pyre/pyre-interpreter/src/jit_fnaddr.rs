@@ -2178,7 +2178,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::next_version_tag_serial",
         next_version_tag_serial as *const (),
     );
-    // `quasiimmut.py:129-134 _invalidate_now`, shared by both `?` fields.
+    // `quasiimmut.py:33-38 _invalidate_now`, shared by both `?` fields.
     push_alias_pair(
         &mut entries,
         "pyre_object::quasiimmut::sweep_quasi_immut_field",

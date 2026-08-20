@@ -1173,43 +1173,26 @@ pub unsafe fn module_dict_storage_len(obj: PyObjectRef) -> Option<usize> {
     Some((*md.dstorage).len())
 }
 
-/// Register a compiled loop's invalidation `flag` against a module dict
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for a module dict
 /// strategy's `version?` quasi-immutable field (`celldict.py:34
-/// _immutable_fields_ = ["version?"]`).  The compile-time glue calls this once
-/// per version-keyed module-global dependency so a later `mutated()` (new key,
-/// `del`, `switch_to_object_strategy`, or a write that replaces a stored cell)
-/// flips the flag and fails the loop's `GUARD_NOT_INVALIDATED`.
+/// _immutable_fields_ = ["version?"]`).  The recording binds the returned
+/// instance, and the loop compiled from it registers there, so a later
+/// `mutated()` (new key, `del`, `switch_to_object_strategy`, or a write that
+/// replaces a stored cell) flips the flag and fails the loop's
+/// `GUARD_NOT_INVALIDATED`.
 ///
 /// Takes the strategy rather than the dict because that is what the trace pins:
 /// `version` lives on the strategy, so the `QUASIIMMUT_FIELD` names it directly.
 ///
 /// # Safety
 /// `strategy` must be null or point at a valid `ModuleDictStrategy`.
-pub unsafe fn module_dict_strategy_register_version_watcher(
+pub unsafe fn module_dict_strategy_current_version_qmut(
     strategy: *mut crate::celldict::ModuleDictStrategy,
-    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> Option<std::sync::Arc<crate::quasiimmut::QuasiImmut>> {
     if strategy.is_null() {
-        return;
+        return None;
     }
-    (*strategy).register_version_watcher(flag);
-}
-
-/// Install this strategy's `version?` qmut instance without registering a loop
-/// (`quasiimmut.py:116-126 get_current_qmut_instance`).
-///
-/// The recording-time half, for the reason spelled out on
-/// [`crate::typeobject::w_type_install_quasi_immut`].
-///
-/// # Safety
-/// `strategy` must be null or point at a valid `ModuleDictStrategy`.
-pub unsafe fn module_dict_strategy_install_version_watcher(
-    strategy: *mut crate::celldict::ModuleDictStrategy,
-) {
-    if strategy.is_null() {
-        return;
-    }
-    (*strategy).install_version_watcher();
+    Some((*strategy).current_version_qmut())
 }
 
 /// `pyjitpl.py:1112 mutatebox.nonnull()` for this strategy's `version?`.

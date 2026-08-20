@@ -921,8 +921,8 @@ impl OptHeap {
         descr_identity(descr)
     }
 
-    /// `quasiimmut.py:147-159 QuasiImmutDescr.is_still_valid_for`, the check
-    /// `heap.py:802-804` turns into `InvalidLoop('quasi immutable field changed
+    /// `quasiimmut.py:146-158 QuasiImmutDescr.is_still_valid_for`, the check
+    /// `heap.py:818-819` turns into `InvalidLoop('quasi immutable field changed
     /// during tracing')`.
     ///
     /// ```text
@@ -940,41 +940,42 @@ impl OptHeap {
     ///          return True
     /// ```
     ///
-    /// Upstream detects the change through the `qmut` object's identity —
-    /// invalidation nulls the hidden `mutate_*` field, so
-    /// `get_current_qmut_instance` hands back a fresh instance and the `is not`
-    /// test fires; the field-value comparison is the assert that backs it up.
-    /// Pyre has no per-read `QuasiImmutDescr` to hang that identity on, so the
-    /// value comparison is the test itself: the tracer captured the field on
-    /// `arg(1)` (`state::current_quasiimmut_field_value`) and a live re-read
-    /// through `get_runtime_field` is `get_current_constant_fieldvalue`.
+    /// `struct_ptr` is `structconst.getref_base()`, already resolved by the
+    /// caller's `heap.py:809 is_constant()` gate.
     ///
-    /// Returns `true` — keep the loop — whenever the comparison cannot be made:
-    /// a struct that did not fold to a constant is the case heap.py:794-796
-    /// ignores outright, and an op without the captured value is the namespace
-    /// twin, which carries a slot index there instead.
+    /// The identity test asks the recorded instance whether it is still the
+    /// field's own, instead of re-reading the field to compare: the two answers
+    /// coincide, because a fresh instance is only ever minted into a field the
+    /// sweep has nulled, and the recorded one needs no second walk from the
+    /// struct to the hidden `mutate_*` slot.
+    ///
+    /// The value comparison is upstream's closing assert: the recording
+    /// captured the field on `arg(1)` (`state::current_quasiimmut_field_value`)
+    /// and a live re-read through `get_runtime_field` is
+    /// `get_current_constant_fieldvalue`. It is answered as a verdict rather
+    /// than an assert, and skipped for an op that carries no captured value —
+    /// the namespace twin, which records a slot index there instead.
     fn quasiimmut_field_still_valid(
         op: &Op,
         obj: OpRef,
-        descr: &DescrRef,
+        struct_ptr: u64,
+        qmutdescr: &majit_ir::QuasiImmutDescr,
         ctx: &mut OptContext,
     ) -> bool {
+        if struct_ptr != qmutdescr.struct_ptr() {
+            return false;
+        }
+        if !qmutdescr.qmut().is_current() {
+            return false;
+        }
         if op.num_args() < 2 {
             return true;
         }
         let Some(constantfieldbox) = op.arg(1).const_value() else {
             return true;
         };
-        // heap.py:794-796 `if not structvalue.is_constant(): return`.
-        if ctx
-            .get_box_replacement_operand_opt(obj)
-            .and_then(|b| ctx.get_constant_ptr_box(&b))
-            .is_none()
-        {
-            return true;
-        }
         let Some(currentbox) = ctx
-            .get_runtime_field(obj, descr)
+            .get_runtime_field(obj, qmutdescr.fielddescr())
             .and_then(|r| r.inline_const_to_value())
         else {
             return true;
@@ -3302,7 +3303,7 @@ impl OptHeap {
                 }
             }
 
-            // heap.py:810-825 optimize_GUARD_NOT_INVALIDATED
+            // heap.py:825-840 optimize_GUARD_NOT_INVALIDATED
             OpCode::GuardNotInvalidated => {
                 if self.seen_guard_not_invalidated {
                     OptimizationResult::Remove
@@ -3317,52 +3318,58 @@ impl OptHeap {
             // The optimizer replaces the field read with the cached value and
             // emits GUARD_NOT_INVALIDATED to ensure validity.
             OpCode::QuasiimmutField => {
-                // RPython optimize_QUASIIMMUT_FIELD (heap.py:781):
+                // RPython optimize_QUASIIMMUT_FIELD (heap.py:798):
                 // Does NOT create a new GUARD_NOT_INVALIDATED — the tracer
                 // already emitted one via generate_guard (pyjitpl.py:1087).
                 // Records quasi_immutable_deps for invalidation tracking.
                 let obj = op.arg(0).to_opref();
-                // heap.py:798-804 — the field can have changed between the
-                // tracer reading it and this pass running.  Abandon the loop
-                // when it has; the traced value is baked in as a constant and
-                // nothing downstream will re-prove it.
-                if let Some(descr) = op.getdescr()
-                    && !Self::quasiimmut_field_still_valid(op, obj, &descr, ctx)
+                let descr = op.getdescr();
+                // heap.py:808-810 `structvalue = self.ensure_ptr_info_arg0(op)`
+                // / `if not structvalue.is_constant(): return`.  The dependency
+                // object is baked as a `ConstPtr`, so its pointer lives in
+                // `Value::Ref`, not `Value::Int`.
+                let struct_ptr = ctx
+                    .get_box_replacement_operand_opt(obj)
+                    .and_then(|b| ctx.get_constant_ptr_box(&b));
+                if let Some(struct_ptr) = struct_ptr
+                    && struct_ptr != 0
                 {
-                    return OptimizationResult::InvalidLoop(
-                        "quasi immutable field changed during tracing",
-                    );
-                }
-                // heap.py:807-809 `self.optimizer.quasi_immutable_deps[
-                // qmutdescr.qmut] = None`.  Upstream keys the set on the
-                // `QuasiImmut` instance the descr already resolved; pyre records
-                // the pair that identifies it — the owning object and which of
-                // its quasi-immutable fields — and `register_quasi_immutable_deps`
-                // resolves the instance after compilation.
-                let (dep_field_idx, cache_field_key) = match op.getdescr() {
-                    Some(descr) => (
-                        Some(descr.index()),
-                        Some(Self::field_cache_identity(&descr)),
-                    ),
-                    None => (None, None),
-                };
-                if let Some(idx) = dep_field_idx {
-                    // The quasi-immutable dependency object (namespace dict /
-                    // struct) is baked as a `ConstPtr`, so its pointer lives in
-                    // `Value::Ref`, not `Value::Int`.  Reading it as an int
-                    // yielded `None` and silently dropped the dependency, so a
-                    // later `mutated()` never flipped the loop's invalidation
-                    // flag.
-                    if let Some(dep_ptr) = ctx
-                        .get_box_replacement_operand_opt(obj)
-                        .and_then(|b| ctx.get_constant_ptr_box(&b))
-                    {
-                        ctx.add_quasi_immutable_dep((dep_ptr, idx));
+                    // heap.py:812-814 `assert isinstance(qmutdescr,
+                    // QuasiImmutDescr)`, answered as a verdict.  A marker whose
+                    // recording resolved no instance has nobody to register the
+                    // finished loop with, and a loop that folded the field with
+                    // no watcher behind it would never be revoked.
+                    let Some(qmutdescr) = descr.as_ref().and_then(|d| d.as_quasi_immut_descr())
+                    else {
+                        return OptimizationResult::InvalidLoop(
+                            "quasi immutable field marker carries no QuasiImmut instance",
+                        );
+                    };
+                    // heap.py:818-819 — the field can have changed between the
+                    // tracer reading it and this pass running.  Abandon the loop
+                    // when it has; the traced value is baked in as a constant
+                    // and nothing downstream will re-prove it.
+                    if !Self::quasiimmut_field_still_valid(op, obj, struct_ptr, qmutdescr, ctx) {
+                        return OptimizationResult::InvalidLoop(
+                            "quasi immutable field changed during tracing",
+                        );
                     }
+                    // heap.py:821-823 `self.optimizer.quasi_immutable_deps[
+                    // qmutdescr.qmut] = None`.
+                    ctx.add_quasi_immutable_dep(qmutdescr.qmut().clone());
                 }
-                if let Some(key) = cache_field_key
+                if let Some(descr) = descr.as_ref()
                     && let Some(obj_box) = ctx.get_box_replacement_operand_opt(obj)
                 {
+                    // The cache is keyed on the field, so it reads through the
+                    // per-read `QuasiImmutDescr` to the registry singleton it
+                    // wraps — a fresh wrapper per read would key each entry to
+                    // itself and never hit.
+                    let key = Self::field_cache_identity(
+                        descr
+                            .as_quasi_immut_descr()
+                            .map_or(descr, |q| q.fielddescr()),
+                    );
                     self.quasi_immut_cache.insert((obj_box, key), OpRef::NONE);
                 }
                 OptimizationResult::Remove

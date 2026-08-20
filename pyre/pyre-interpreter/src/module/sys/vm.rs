@@ -2856,29 +2856,18 @@ pub fn audit_holder_ptr() -> *const AuditHolder {
     AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Register a loop against the holder's `hooks_w?` field.
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for the holder's
+/// `hooks_w?` field.
 ///
 /// # Safety
 /// `holder` must be null or a live [`AuditHolder`].
-pub unsafe fn audit_holder_register_hooks_watcher(
+pub unsafe fn audit_holder_current_hooks_qmut(
     holder: *const AuditHolder,
-    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
     if holder.is_null() {
-        return;
+        return None;
     }
-    unsafe { (*holder).hooks_watchers.register_loop_token(flag) };
-}
-
-/// Install the holder's `hooks_w?` watcher without registering a loop.
-///
-/// # Safety
-/// `holder` must be null or a live [`AuditHolder`].
-pub unsafe fn audit_holder_install_hooks_watcher(holder: *const AuditHolder) {
-    if holder.is_null() {
-        return;
-    }
-    unsafe { (*holder).hooks_watchers.ensure_installed() };
+    Some(unsafe { (*holder).hooks_watchers.get_current_qmut_instance() })
 }
 
 /// Forward the installed hooks.  Upstream reaches them through the space's

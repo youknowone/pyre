@@ -740,21 +740,12 @@ impl ModuleDictStrategy {
         }
     }
 
-    /// Register a JIT loop's invalidation flag against the `version?`
-    /// quasi-immutable field (`quasiimmut.py:116-126
-    /// get_current_qmut_instance` + `:72-75 register_loop_token`).  The
-    /// compile-time glue (`register_quasi_immutable_deps`) calls this once per
-    /// version-keyed module-global dependency, passing the
-    /// `JitCellToken.invalidation_flag()`.
-    pub fn register_version_watcher(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        self.version_watchers.register_loop_token(flag);
-    }
-
-    /// `quasiimmut.py:116-126 get_current_qmut_instance` alone — install the
-    /// instance while the trace is still recording, so a `mutated()` reached
-    /// later in the same trace finds the field non-null.
-    pub fn install_version_watcher(&self) {
-        self.version_watchers.ensure_installed();
+    /// `quasiimmut.py:17-27 get_current_qmut_instance` for the `version?`
+    /// field — resolve the instance while the trace is still recording, so a
+    /// `mutated()` reached later in the same trace finds the field non-null and
+    /// the recording can carry the instance to `compile.py:204-207`.
+    pub fn current_version_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
+        self.version_watchers.get_current_qmut_instance()
     }
 
     /// `pyjitpl.py:1112 mutatebox.nonnull()` — whether some trace or loop is
@@ -772,7 +763,7 @@ impl ModuleDictStrategy {
     }
 
     /// Invalidate every loop watching `version`
-    /// (`quasiimmut.py:129-134 _invalidate_now`).  Sets each live flag to
+    /// (`quasiimmut.py:33-38 _invalidate_now`).  Sets each live flag to
     /// `true`, the polarity `GuardNotInvalidated` tests.
     ///
     /// The installed check stays traced and the sweep is residual, for the
@@ -1348,7 +1339,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let mut strategy = ModuleDictStrategy::new();
         let flag = Arc::new(AtomicBool::new(false));
-        strategy.register_version_watcher(&flag);
+        strategy.current_version_qmut().register_loop_token(&flag);
         // Before a structural change the watching loop is still valid.
         assert!(!flag.load(Ordering::Acquire));
         // `mutated()` reassigns `version` and must invalidate the loop.
@@ -1362,7 +1353,7 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         let mut strategy = ModuleDictStrategy::new();
         let flag = Arc::new(AtomicBool::new(false));
-        strategy.register_version_watcher(&flag);
+        strategy.current_version_qmut().register_loop_token(&flag);
         // Drop the only strong ref: the weak watcher can no longer upgrade.
         drop(flag);
         // notify (via mutated) must not panic, and `_invalidate_now` unlinks

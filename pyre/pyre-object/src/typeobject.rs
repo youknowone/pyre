@@ -230,8 +230,8 @@ pub struct W_TypeObject {
     /// _immutable_fields_ = ['_version_tag?']` — see [`QuasiImmut`].
     ///
     /// Allocated on the first registration (`get_current_qmut_instance`,
-    /// quasiimmut.py:116-126), null until then, and unlinked + freed on
-    /// invalidation (`_invalidate_now`, quasiimmut.py:129-134), so a type nobody
+    /// quasiimmut.py:17-27), null until then, and unlinked + freed on
+    /// invalidation (`_invalidate_now`, quasiimmut.py:33-38), so a type nobody
     /// has mutated since its last compile is the only one holding a box. Holds
     /// no GC pointers, so the `W_TYPE_GC_TYPE_ID` custom trace has nothing to
     /// walk here.
@@ -853,52 +853,34 @@ pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
         .store(v, std::sync::atomic::Ordering::Release);
 }
 
-/// Register a compiled loop's invalidation flag against this type's
-/// `_version_tag?` (`quasiimmut.py:72-74 QuasiImmut.register_loop_token`),
-/// creating the instance on demand exactly like `get_current_qmut_instance`
-/// (quasiimmut.py:116-126).
+/// `quasiimmut.py:17-27 get_current_qmut_instance` for this type's
+/// `_version_tag?`.
 ///
-/// The compile-time glue (`register_quasi_immutable_deps`) calls this once per
-/// type-keyed dependency the optimizer collected from a `QUASIIMMUT_FIELD`, so
-/// [`w_type_notify_quasi_immut_watchers`] can revoke the loop when the tag is
-/// bumped.
+/// Called while the trace is still being recorded, exactly where
+/// `QuasiImmutDescr.__init__` (`pyjitpl.py:1081`) calls it: a write reached
+/// later in that same trace then sees a non-null `mutate_*` field and aborts
+/// the attempt. The instance is handed back so the recording can carry it to
+/// `heap.py:818 is_still_valid_for` and `compile.py:204-207
+/// register_loop_token`, after which [`w_type_notify_quasi_immut_watchers`]
+/// revokes the loop when the tag is bumped.
 ///
 /// # Safety
 /// `obj` must be null or point at a valid `W_TypeObject`.
-pub unsafe fn w_type_register_quasi_immut_watcher(
+pub unsafe fn w_type_current_qmut_instance(
     obj: PyObjectRef,
-    flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> Option<std::sync::Arc<crate::quasiimmut::QuasiImmut>> {
     if obj.is_null() || !is_type(obj) {
-        return;
+        return None;
     }
-    (*(obj as *const W_TypeObject))
-        .quasi_immut_watchers
-        .register_loop_token(flag);
-}
-
-/// Install this type's `_version_tag?` qmut instance without registering a
-/// loop (`quasiimmut.py:116-126 get_current_qmut_instance`).
-///
-/// The recording half of the protocol: upstream's `QuasiImmutDescr.__init__`
-/// (`pyjitpl.py:1081`) installs while the trace is still being recorded, so a
-/// write reached later in that same trace sees a non-null `mutate_*` field and
-/// aborts the attempt. [`w_type_register_quasi_immut_watcher`] is the compile-
-/// time half and runs far too late to arm that test.
-///
-/// # Safety
-/// `obj` must be null or point at a valid `W_TypeObject`.
-pub unsafe fn w_type_install_quasi_immut(obj: PyObjectRef) {
-    if obj.is_null() || !is_type(obj) {
-        return;
-    }
-    (*(obj as *const W_TypeObject))
-        .quasi_immut_watchers
-        .ensure_installed();
+    Some(
+        (*(obj as *const W_TypeObject))
+            .quasi_immut_watchers
+            .get_current_qmut_instance(),
+    )
 }
 
 /// Revoke every loop that baked this type's `version_tag` as a constant
-/// (`quasiimmut.py:129-134 make_invalidation_function._invalidate_now`).
+/// (`quasiimmut.py:33-38 make_invalidation_function._invalidate_now`).
 ///
 /// ```text
 ///  def _invalidate_now(p):
@@ -1753,7 +1735,7 @@ mod tests {
     }
 
     /// The `_version_tag?` wiring: publishing a new tag runs the invalidation
-    /// function (`quasiimmut.py:129-134 _invalidate_now`), so the loops that
+    /// function (`quasiimmut.py:33-38 _invalidate_now`), so the loops that
     /// baked the old tag are revoked and the field is left uninstalled.
     /// `quasiimmut::tests` covers the field itself.
     #[test]
@@ -1769,7 +1751,9 @@ mod tests {
         );
 
         let flag = Arc::new(AtomicBool::new(false));
-        unsafe { w_type_register_quasi_immut_watcher(obj, &flag) };
+        unsafe { w_type_current_qmut_instance(obj) }
+            .expect("a type resolves an instance")
+            .register_loop_token(&flag);
         assert!(w_type.quasi_immut_watchers.is_installed());
 
         unsafe { w_type_set_version_tag(obj, new_version_tag()) };
@@ -1786,12 +1770,8 @@ mod tests {
     /// A non-type pointer must not be walked as one.
     #[test]
     fn quasi_immut_watcher_helpers_ignore_non_types() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-
-        let flag = Arc::new(AtomicBool::new(false));
         unsafe {
-            w_type_register_quasi_immut_watcher(PY_NULL, &flag);
+            assert!(w_type_current_qmut_instance(PY_NULL).is_none());
             w_type_notify_quasi_immut_watchers(PY_NULL);
         }
     }

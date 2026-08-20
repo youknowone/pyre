@@ -687,13 +687,14 @@ pub struct OptContext {
     pub imported_short_preamble_builder:
         Option<crate::optimizeopt::shortpreamble::ShortPreambleBuilder>,
     /// `optimizer.py:243` `self.quasi_immutable_deps = None` (initialized
-    /// lazily as a dict in `heap.py:806-808`). Each entry pairs an
-    /// `(object_ptr, field_index)` quasi-immutable slot the trace
-    /// depends on; PyPy uses `dict[k] = None` for set semantics, but the
-    /// HashMap house rule forbids that — pyre uses a Vec with
-    /// linear-scan dedup. Typical size is small (< a few dozen entries
-    /// per trace), so O(n) inserts are acceptable.
-    pub quasi_immutable_deps: Vec<(u64, u32)>,
+    /// lazily as a dict in `heap.py:821-823`). Each entry is one `QuasiImmut`
+    /// instance the trace folded a field of, exactly as upstream keys the dict
+    /// (`heap.py:821-823 quasi_immutable_deps[qmutdescr.qmut] = None`); PyPy
+    /// uses `dict[k] = None` for set semantics, but the HashMap house rule
+    /// forbids that — pyre uses a Vec with linear-scan dedup on instance
+    /// identity. Typical size is small (< a few dozen entries per trace), so
+    /// O(n) inserts are acceptable.
+    pub quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     /// `info.py:722` `optheap.const_infos.get(ref, None)` /
     /// `info.py:725` `optheap.const_infos[ref] = info`. Stores
     /// `StructPtrInfo` / `ArrayPtrInfo` for constant GC objects keyed
@@ -1699,11 +1700,16 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
 
 impl OptContext {
     /// `optimizer.py:243` quasi-immutable dep registration with
-    /// dict-as-set semantics (`heap.py:807-808`
+    /// dict-as-set semantics (`heap.py:821-823`
     /// `self.optimizer.quasi_immutable_deps[qmutdescr.qmut] = None`).
-    /// Vec-backed set with linear-scan dedup.
-    pub fn add_quasi_immutable_dep(&mut self, dep: (u64, u32)) {
-        if !self.quasi_immutable_deps.contains(&dep) {
+    /// Vec-backed set keyed on instance identity, the way a Python dict keys
+    /// on the object.
+    pub fn add_quasi_immutable_dep(&mut self, dep: std::sync::Arc<dyn majit_ir::QuasiImmutHandle>) {
+        if !self
+            .quasi_immutable_deps
+            .iter()
+            .any(|seen| std::sync::Arc::ptr_eq(seen, &dep))
+        {
             self.quasi_immutable_deps.push(dep);
         }
     }
