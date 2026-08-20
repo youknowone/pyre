@@ -723,6 +723,12 @@ impl WarmEnterState {
             if is_tracing {
                 return HotResult::AlreadyTracing;
             }
+            // An invalidated procedure token — one the cell saw and no longer
+            // holds — has to reach `cleanup_chain` below rather than take any
+            // early return (`warmstate.py:483-491`).  A dead entry left in the
+            // chain stalls its bucket's counter re-arm, so every return above
+            // that point yields to it.
+            let dead_token = has_seen_a_procedure_token && !has_procedure_token;
             // pyre's abort ceiling decides here rather than inside the trace
             // start.  `warmstate.py:425-444 bound_reached` traces
             // unconditionally once entered, so upstream never reaches it with a
@@ -733,18 +739,17 @@ impl WarmEnterState {
             // loop's counter once per back edge and hold them below threshold.
             // The answer for this cell is unchanged — `force_start_tracing*`
             // returns `NotHot` for the same condition — only its timing is.
-            if abort_count >= MAX_TRACE_ABORT_COUNT {
+            // A latched cell that is ALSO dead takes the cleanup path instead:
+            // leaving it in the chain is the same starvation in another form.
+            if !dead_token && abort_count >= MAX_TRACE_ABORT_COUNT {
                 return HotResult::NotHot;
             }
             if self.should_start_dont_trace_here_trace(cell_key, flags, has_seen_a_procedure_token)
             {
                 return HotResult::StartTracing;
             }
-            // A JC_DONT_TRACE_HERE cell declines here, except when it once saw a
-            // procedure token that has since been invalidated — that dead entry
-            // must fall through to cleanup_chain below (warmstate.py:483-491),
-            // not linger and stall the counter re-arm.
-            let dead_token = has_seen_a_procedure_token && !has_procedure_token;
+            // A JC_DONT_TRACE_HERE cell declines here, except when its token
+            // is dead — that entry belongs to the cleanup path above.
             if flags & jc_flags::DONT_TRACE_HERE != 0 && !dead_token {
                 return HotResult::NotHot;
             }
@@ -828,6 +833,12 @@ impl WarmEnterState {
             if is_tracing {
                 return HotResult::AlreadyTracing;
             }
+            // An invalidated procedure token — one the cell saw and no longer
+            // holds — has to reach `cleanup_chain` below rather than take any
+            // early return (`warmstate.py:483-491`).  A dead entry left in the
+            // chain stalls its bucket's counter re-arm, so every return above
+            // that point yields to it.
+            let dead_token = has_seen_a_procedure_token && !has_procedure_token;
             // pyre's abort ceiling decides here rather than inside the trace
             // start.  `warmstate.py:425-444 bound_reached` traces
             // unconditionally once entered, so upstream never reaches it with a
@@ -838,17 +849,16 @@ impl WarmEnterState {
             // loop's counter once per back edge and hold them below threshold.
             // The answer for this cell is unchanged — `force_start_tracing*`
             // returns `NotHot` for the same condition — only its timing is.
-            if abort_count >= MAX_TRACE_ABORT_COUNT {
+            // A latched cell that is ALSO dead takes the cleanup path instead:
+            // leaving it in the chain is the same starvation in another form.
+            if !dead_token && abort_count >= MAX_TRACE_ABORT_COUNT {
                 return HotResult::NotHot;
             }
             if self.should_start_dont_trace_here_trace(hash, flags, has_seen_a_procedure_token) {
                 return self.start_tracing_cell_for_key(key);
             }
-            // A JC_DONT_TRACE_HERE cell declines here, except when it once saw a
-            // procedure token that has since been invalidated — that dead entry
-            // must fall through to cleanup_chain below (warmstate.py:483-491),
-            // not linger and stall the counter re-arm.
-            let dead_token = has_seen_a_procedure_token && !has_procedure_token;
+            // A JC_DONT_TRACE_HERE cell declines here, except when its token
+            // is dead — that entry belongs to the cleanup path above.
             if flags & jc_flags::DONT_TRACE_HERE != 0 && !dead_token {
                 return HotResult::NotHot;
             }
@@ -5741,6 +5751,75 @@ mod tests {
             b_cell.is_tracing(),
             "B's TRACING flag set by start_tracing_cell_for_key — \
              chain-walk write must reach the tail, not just the head",
+        );
+    }
+
+    /// `abort_tracing` latches `DONT_TRACE_HERE` at `MAX_TRACE_ABORT_COUNT`
+    /// without touching `loop_token`, so a cell can be both latched and
+    /// holding a token that is invalidated afterwards. The abort ceiling must
+    /// not answer for that cell before `cleanup_chain` has had it: a dead
+    /// entry left in the bucket never re-arms its counter, which is the
+    /// starvation the ceiling was moved here to remove, in another form.
+    #[test]
+    fn a_latched_cell_whose_token_died_is_still_removed_from_the_chain() {
+        let mut ws = WarmEnterState::new(2);
+        let token_num = ws.alloc_token_number();
+        ws.attach_procedure_to_interp(42, JitCellToken::new(token_num));
+        // Seen once, held no longer: `token` is a historical record and is
+        // never cleared, so `has_seen_a_procedure_token` stays true.
+        ws.clear_loop_token(42);
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            ws.abort_tracing(42, false);
+        }
+        let cell = ws.get_cell(42).expect("fixture: the cell is still there");
+        assert!(
+            cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none(),
+            "fixture: the token must be dead, not merely absent",
+        );
+        assert!(
+            cell.abort_count >= MAX_TRACE_ABORT_COUNT,
+            "fixture: the ceiling must be latched",
+        );
+
+        assert!(matches!(ws.maybe_compile_decision(42), HotResult::NotHot));
+        assert!(
+            ws.get_cell(42).is_none(),
+            "the dead cell must be gone: the ceiling returned before \
+             cleanup_chain and left it in the bucket",
+        );
+    }
+
+    /// Typed-key half of
+    /// `a_latched_cell_whose_token_died_is_still_removed_from_the_chain`.
+    /// `maybe_compile_with_key` is a parallel implementation, so an ordering
+    /// fixed in one says nothing about the other.
+    #[test]
+    fn a_latched_typed_cell_whose_token_died_is_still_removed_from_the_chain() {
+        let mut ws = WarmEnterState::new(2);
+        let key = GreenKey::new(vec![7, 11]);
+        let token_num = ws.alloc_token_number();
+        ws.attach_procedure_to_interp_for_key(&key, JitCellToken::new(token_num));
+        ws.clear_loop_token_for_key(&key);
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            ws.abort_tracing_for_key(&key, false);
+        }
+        let cell = ws
+            .get_cell_for_key(&key)
+            .expect("fixture: the cell is still there");
+        assert!(
+            cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none(),
+            "fixture: the token must be dead, not merely absent",
+        );
+        assert!(
+            cell.abort_count >= MAX_TRACE_ABORT_COUNT,
+            "fixture: the ceiling must be latched",
+        );
+
+        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(
+            ws.get_cell_for_key(&key).is_none(),
+            "the dead cell must be gone: the ceiling returned before \
+             cleanup_chain and left it in the bucket",
         );
     }
 }
