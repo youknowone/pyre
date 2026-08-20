@@ -1,6 +1,6 @@
 # pyre-check: max-pypy-ratio=106
 # The ceiling is twice the slowest ratio observed (52.7x on the linux runner),
-# rounded up; the gate it replaces was fitted to no measurement.
+# rounded up.
 # Star-unpack of an iterator of unknown length: `f(*it)` is the consumer that
 # routes through `_unpackiterable_unknown_length`, the drain loop jd1
 # (`unpackiterable_driver`) traces and compiles. `a, b, c = it` does NOT reach

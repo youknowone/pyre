@@ -9,11 +9,11 @@
 # pypy spends 0.10s, clearing the floor even on the platform with the
 # coarsest timer.
 #
-# `main` used to run interpreted end to end. The `try: range(0, 3, 0)` below
-# puts an out-of-line handler after the trailing comprehension, and the loop
-# region that gates the back edge grew across the gap between them and picked
-# up that comprehension's call-bearing `FOR_ITER` -- an opcode this loop never
-# reaches. With the region built from the exception table instead, the while
+# The `try: range(0, 3, 0)` below puts an out-of-line handler after the
+# trailing comprehension. A loop region that gates the back edge by spanning
+# the gap between them picks up that comprehension's call-bearing `FOR_ITER`
+# -- an opcode this loop never reaches -- and `main` then runs interpreted end
+# to end. With the region built from the exception table instead, the while
 # loop and the three `for` loops compile, and this gate's own metric falls
 # from 122x to 23.2x dynasm / 30.2x cranelift / 24.7x wasm. A separate
 # min-of-five interleaved harness reads the same move as 158x to 35.2x /

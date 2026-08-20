@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=33
-# The ceiling is twice the slowest ratio observed, 16.1x on the linux runner;
-# the gate it replaces sat inside the run-to-run spread.
+# The ceiling is twice the slowest ratio observed, 16.1x on the linux runner.
 # A conditional expression selects one of two loop locals as the receiver
 # (`q = o if cond else p`) whose attribute is then read/written inside a hot
 # `for i in range(...)` loop.  The two arms of the conditional are distinct

@@ -5,9 +5,8 @@
 # `helper` is admitted into the surrounding FOR_ITER body.  The trailing
 # opaque `id` call makes the first inline sub-walk abort and replay `helper`.
 # The property returns `int`, so the same loop also pins the observable
-# `isinstance` semantics formerly covered by a separate, lower-priority parity
-# test: the MRO miss must consult the property, use its result, and invoke it on
-# every call.  If the call is incorrectly marked replay-safe, the first replay
+# `isinstance` semantics: the MRO miss must consult the property, use its
+# result, and invoke it on every call.  If the call is incorrectly marked replay-safe, the first replay
 # invokes the getter twice (N + 1 hits).
 
 N = 5000

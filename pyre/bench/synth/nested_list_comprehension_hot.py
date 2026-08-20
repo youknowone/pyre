@@ -2,10 +2,9 @@
 # An inlined list comprehension whose LIST_APPEND element is a non-empty nested
 # list (`[[i] …]` / `[[i, i + 1] …]`). The #171 fold virtualizes the inner list,
 # whose separately allocated backing block (NewArray / NewArrayClear) carries no
-# jitcode-liveness color. Once the trace-time single-executor forks were retired
-# the append body no longer runs under a speculative-replay sub-walk, so the
-# backing block is bound at every guard-exit deopt without an extra resume-data
-# root.
+# jitcode-liveness color. The append body does not run under a
+# speculative-replay sub-walk, so the backing block is bound at every
+# guard-exit deopt without an extra resume-data root.
 #
 # Acceptance repro for that fold: it must print the same total on all three
 # backends (dynasm / cranelift / wasm).

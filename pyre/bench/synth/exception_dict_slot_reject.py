@@ -2,7 +2,6 @@
 # `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
 # rather than any generated code, and reads whatever the host's process
 # spawn cost happens to be that run. The jitstats baselines gate it.
-# rounded up; the gate it replaces was fitted to no measurement.
 # A subclass whose base already carries an instance dict rejects a second
 # `__dict__` slot. BaseException subclasses carry the dict through the native
 # exception slot, so they must reject it too.

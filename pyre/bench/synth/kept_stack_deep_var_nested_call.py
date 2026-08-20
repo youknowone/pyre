@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=28
-# The ceiling is twice the slowest ratio observed, 13.9x on the macos runner;
-# the gate it replaces sat inside the run-to-run spread.
+# The ceiling is twice the slowest ratio observed, 13.9x on the macos runner.
 # Deep operand-stack Variables across a nested-call deopt guard.
 # Several computed Variables (x, y, z) sit deep on the stack as arguments being
 # marshalled for `acc(...)` while `mul(i, i)` (a residual call that can guard /

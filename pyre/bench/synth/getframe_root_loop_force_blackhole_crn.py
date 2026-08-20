@@ -25,18 +25,18 @@
 # frame, so the drive read locals one Python iteration stale and accumulated
 # total += 1039 where i was already 1040.
 #
-# All of it is now moot for the reason that matters: the CRN handoff no longer
-# rebuilds the frame from the terminal register banks at all, so there is no
-# NULL to write and nothing left to decline.
+# None of that is reachable here: the CRN handoff does not rebuild the frame
+# from the terminal register banks, so there is no NULL to write and nothing
+# to decline.
 #
-# This file no longer reaches the blackhole at all. The constant-depth
+# This file does not reach the blackhole at all. The constant-depth
 # `sys._getframe` fold (#1096) answers the `_getframe(0)` below out of the portal
 # virtualizable, so nothing escapes, nothing aborts, and the loop simply
 # compiles: the committed baselines record
 # `fbw_blackhole_adopted_single_frame=0`, `loops_aborted=0`, `loops_compiled=1`
-# on all three backends (they read 5 / 5 / 0 before the fold). What it still
-# guards is the output. The pre-fold counters, and with them the CRN machinery
-# described above, are carried by the `_declined` sibling
+# on all three backends. What it guards is the output. The unfolded counters,
+# and with them the CRN machinery described above, are carried by the
+# `_declined` sibling
 # (`getframe_root_loop_force_blackhole_crn_declined`), which repeats this shape
 # at a force the fold declines and records 5 adopts / 5 aborts.
 #

@@ -1,11 +1,10 @@
 # pyre-check: max-pypy-ratio=29
-# The ceiling is twice the slowest ratio observed, 14.2x on the macos runner;
-# the gate it replaces sat inside the run-to-run spread.
+# The ceiling is twice the slowest ratio observed, 14.2x on the macos runner.
 # A function-entry trace records only the early-return arm.  The first true
 # call then fails that guard and blackhole-replays the previously unvisited
 # `with` arm.  WITH_EXCEPT_START must read the live handler stack and call
-# `__exit__`; a disconnected graph result used to treat the caught TypeError
-# as the exit callable and leak another TypeError instead.
+# `__exit__`; a disconnected graph result treats the caught TypeError as the
+# exit callable and leaks another TypeError instead.
 try:
     import pypyjit
 

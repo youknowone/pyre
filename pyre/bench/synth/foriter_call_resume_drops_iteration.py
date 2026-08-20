@@ -5,9 +5,9 @@
 # (`LoopBearingCalleeInlineUnsupported`) and resumes the caller forward at the
 # CALL. That resume rebuilds the caller's operand stack from the overrides
 # collected at the CALL, and the `null_or_self` slot a `PUSH_NULL` leaves under
-# it has no box in the walk and no distinguishable shadow value — so it used to
-# be missing, the resume declined, and the legacy rollback+replay refused
-# in-flight FOR_ITER delivery, DROPPING that iteration. The loss is silent: one
+# it has no box in the walk and no distinguishable shadow value.  When that
+# slot goes missing the resume declines, and the legacy rollback+replay
+# refuses in-flight FOR_ITER delivery, DROPPING that iteration. The loss is silent: one
 # iteration's accumulation never happens and the answer is simply too small.
 #
 # All three ingredients are required — with one callee, without the branch

@@ -2,15 +2,8 @@
 # The ceiling is a function of N, so raising N refits it. pypy's execution here
 # is almost all fixed cost -- doubling N moved it 0.035s to 0.039s -- while this
 # backend pays roughly 27us per iteration, so the ratio tracks N nearly one for
-# one. Going from 32176 to 64000 moved the local cranelift ratio 25.8x to 44.9x,
-# and 49 scaled by that same measured 1.74 is 86: the gate keeps exactly the
-# slack it had before, re-expressed at the new size, rather than being loosened.
-#
-# The 49 it replaces was twice the slowest ratio observed once pypy's side
-# became a measurement. The 25 before that was fitted while pypy's execution was
-# pinned to the startup-subtraction floor, and a pinned denominator
-# over-estimates the work pypy actually did, so every ratio read against it was
-# a lower bound -- this loop was always this far behind, the clamp just hid it.
+# one. At N = 64000 the local cranelift ratio reads 44.9x, and the ceiling sits
+# just under twice it.
 # An inlined closure keeps its freevar cells in MIFrame.registers_r across a
 # may-force call.  The `Fraction` arithmetic in `forward` is that may-force
 # call and invalidates heap-cache facts; the following LOAD_DEREF must recover
@@ -23,8 +16,8 @@
 # failed decode leaves two guards failing on nearly every iteration, while
 # guarding the callee namespace through the portal/root frame compiles an
 # endless chain of equally failing bridges.  With both frame properties
-# preserved, guard failures fall from 16898 to 471 and local native ratios are
-# 10.3x dynasm / 15.9x cranelift versus PyPy (formerly 22-29x on macOS).
+# preserved, guard failures stay at 471 and local native ratios are 10.3x
+# dynasm / 15.9x cranelift versus PyPy.
 from fractions import Fraction
 
 

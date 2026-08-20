@@ -1,6 +1,6 @@
 # pyre-check: max-pypy-ratio=36
 # The ceiling is twice the slowest ratio observed (17.8x on the linux runner),
-# rounded up; the gate it replaces was fitted to no measurement.
+# rounded up.
 # `__defaults__` replaced part-way through a compiled loop, in the two shapes
 # that break differently from a same-length replacement.
 #

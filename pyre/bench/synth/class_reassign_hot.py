@@ -4,11 +4,11 @@
 # fitted it to a single run's numbers.
 # Reassigning obj.__class__ inside a hot loop must actually re-root the
 # instance's type, so method lookup and type() follow the new class.  The
-# STORE_ATTR mapdict inline cache (store_attr_slowpath) used to classify
+# STORE_ATTR mapdict inline cache (store_attr_slowpath) must not classify
 # `__class__` as an ordinary instance-dict attribute (its data-descriptor role
 # is modelled by object_setattr's special-case, not a getset, so it never
-# surfaces for classify_attr) and stored it into the instance dict, leaving the
-# real type unchanged: obj.kind() kept dispatching through the old class.  The
+# surfaces for classify_attr): storing it into the instance dict leaves the
+# real type unchanged and obj.kind() keeps dispatching through the old class.  The
 # exact aggregate over the loop makes that silent miscompile observable.
 N = 200000
 

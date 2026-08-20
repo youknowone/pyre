@@ -1,8 +1,8 @@
 # pyre-check: max-pypy-ratio=18
 # CALL_KW and CALL_FUNCTION_EX inside a callee that is inlined into the hot
-# loop.  Both opcodes used to emit abort_permanent and decline the callee's
-# jitcode; the residual port lets them compile.  Guards output correctness and
-# the demonstrable inline (loops_aborted drops to 0).
+# loop.  The residual port compiles both opcodes rather than emitting
+# abort_permanent and declining the callee's jitcode.  Guards output
+# correctness and the demonstrable inline (loops_aborted is 0).
 #
 # `call_kw_hot_loop.py` is the contrasting shape: a CALL_KW directly in the
 # hot loop body rather than nested inside an inlined callee.

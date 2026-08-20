@@ -8,8 +8,8 @@
 # exception state so POP_EXCEPT can pop the state and leave the value at
 # TOS).  The try/except is reached only after the loop's exit guard fails,
 # so the blackhole walks forward through the SWAP on the resume path.
-# Previously the codewriter emitted `abort_permanent` for SWAP, so the
-# resume walk failed ("call failed" / uncaught escape).  This bench pins
+# An `abort_permanent` for SWAP fails the resume walk ("call failed" /
+# uncaught escape).  This bench pins
 # that the SWAP-bearing handler tail resumes byte-identically.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.

@@ -44,10 +44,9 @@
 # frame, so the drive read locals one Python iteration stale and accumulated
 # total += 1039 where i was already 1040.
 #
-# All of it is now moot for the reason that matters: the CRN handoff no longer
-# rebuilds the frame from the terminal register banks at all, so there is no
-# NULL to write and nothing left to decline. The drive runs and this file
-# adopts it five times. Its effects are idempotent, though, which is exactly
+# None of that is reachable here: the CRN handoff does not rebuild the frame
+# from the terminal register banks, so there is no NULL to write and nothing
+# to decline. The drive runs and this file adopts it five times. Its effects are idempotent, though, which is exactly
 # what hid the residual heap half of a post-drive decline — see the
 # `_nonidempotent` sibling.
 import sys

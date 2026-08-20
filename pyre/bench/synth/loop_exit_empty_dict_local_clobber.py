@@ -1,11 +1,10 @@
 # pyre-check: max-pypy-ratio=19
-# The ceiling is twice the slowest ratio observed, 9.3x on the macos runner;
-# the gate it replaces sat inside the run-to-run spread.
+# The ceiling is twice the slowest ratio observed, 9.3x on the macos runner.
 # A local must not read back as the `for` loop's iterator after the loop.
 #
-# An empty dict literal used to decline in the codewriter, and the decline
-# emitted `abort_permanent`, which closes its block: everything after it -
-# the whole loop - stopped being lowered. The loop header still resolved to a
+# An empty dict literal must not decline in the codewriter: the decline
+# emits `abort_permanent`, which closes its block, so everything after it -
+# the whole loop - stops being lowered. The loop header still resolved to a
 # walk entry, because the resume-marker tables carry an unlowered PC forward
 # onto the last marker that WAS emitted, so the walk entered the prologue
 # instead. Entry seeding fills a region's registers from the live frame by

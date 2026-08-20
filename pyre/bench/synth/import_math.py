@@ -4,13 +4,10 @@
 # reference timeout leaves pypy back on the floor, so cpython is dropped
 # deliberately rather than by spending the whole timeout to discover the same
 # drop.
-# The 291 this replaces was never fitted to an observation: pypy's execution
-# sat on the startup-subtraction floor, so the ratio it bounded was pyre's time
-# divided by a constant. With pypy's side now a measurement the loop reads
-# 1.3-1.9x, and 8 is twice the slowest reading from either size. Keeping a
-# ceiling at or above PERF_GATE_FLOOR_DIVISOR would also pin the derived floor
-# to parity, which a fixture running this close to pypy cannot clear on a host
-# where pyre happens to land faster.
+# pypy's side is a measurement at this count and the loop reads 1.3-1.9x, so 8
+# is twice the slowest reading. A ceiling at or above PERF_GATE_FLOOR_DIVISOR
+# would pin the derived floor to parity, which a fixture running this close to
+# pypy cannot clear on a host where pyre happens to land faster.
 import math
 
 # Sized so pypy's own execution clears the measurement floor: below it the

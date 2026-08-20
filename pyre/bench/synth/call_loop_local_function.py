@@ -19,19 +19,17 @@
 # in the committed `.jitstats` baseline is the signal: it is 1 with the field
 # guards and 9480 with an identity guard, which also compiled 47 bridges here
 # (2497 at N=1000000) before `make_a_counter_per_value` (regalloc.py:496-499)
-# reached the dynasm and wasm backends.  With the identity guard gone this
-# fixture no longer exercises that bucketing — `bridges_compiled` stays 0.
+# reached the dynasm and wasm backends.  Without the identity guard this
+# fixture does not exercise that bucketing — `bridges_compiled` stays 0.
 #
 # `N` is sized by the GATE, not by the loop.  The gate compares
 # startup-subtracted times with the baseline floored at 5ms, so below ~11M
-# iterations pypy lands on that floor.  That used to be the regime this
-# fixture chose deliberately, because a clamped baseline still produced a
-# comparison — a fixed ~45ms budget for pyre.  It no longer does: a clamped
-# baseline now disarms the ratio gate entirely, ceiling and derived floor
-# both, so staying under the floor means being ungated rather than being
-# stably gated.  The trip count is therefore set above it.  The other bound
-# is unchanged — ~195ns/iteration here against pypy's fraction of one, and
-# this fixture must not become the slowest baseline run in the suite.
+# iterations pypy lands on that floor.  A clamped baseline disarms the ratio
+# gate entirely, ceiling and derived floor both, so staying under the floor
+# means being ungated rather than being stably gated: the trip count is set
+# above it.  The other bound is ~195ns/iteration here against pypy's fraction
+# of one, and this fixture must not become the slowest baseline run in the
+# suite.
 N = 72000000
 
 

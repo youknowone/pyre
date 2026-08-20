@@ -7,18 +7,18 @@
 # fails, so the blackhole walks forward and executes the residual call
 # concretely on the resume path.  When that call raises, the exception
 # must be routed to the in-frame `catch_exception` adjacency the
-# codewriter emitted right after the call; previously the catch search
-# started at the call's operand byte (the dispatch loop advances the
-# position only after the handler returns) so the catch was never found
-# and the exception escaped the handler.  This bench pins that a
+# codewriter emitted right after the call.  A catch search that starts at
+# the call's operand byte (the dispatch loop advances the position only
+# after the handler returns) never finds the catch, and the exception
+# escapes the handler.  This bench pins that a
 # residual-call raise caught on the resume path returns byte-identically.
 #
 # `list_extend_resume` additionally builds a heap-local list via
 # LIST_EXTEND (`[*base]`) *after* the loop, so the loop-exit guard
 # failure resumes through the LIST_EXTEND: the walk must execute the
-# `list_extend` residual.  Previously LIST_EXTEND had no walker handler
-# and emitted an abort that, reached on the resume walk, invalidated the
-# live frame and crashed (SIGSEGV) — the residual port fixes that.
+# `list_extend` residual.  Without a walker handler LIST_EXTEND emits an
+# abort that, reached on the resume walk, invalidates the live frame and
+# crashes (SIGSEGV).
 #
 # N is sized so PyPy's startup-subtracted user-CPU stays well clear of its own
 # empty-program startup. The gate divides by that difference, so a workload

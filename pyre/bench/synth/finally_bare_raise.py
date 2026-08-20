@@ -5,11 +5,11 @@
 # bare `raise` (RAISE_VARARGS argc==0).  When such a bare re-raise is
 # reached by normal fall-through — no `PUSH_EXC_INFO` seeded the handler
 # exception — the RAISE_VARARGS(0) PC is uncovered and the FrameState
-# carries no `last_exception` pair.  The codewriter previously routed this
-# unconditionally to `emit_reraise!`, whose `exception_edge_extravars`
-# asserts a materialized pair, so `transform_graph_to_jitcode` panicked
-# ("exception edge state missing last_exception pair") while building the
-# jitcode for any hot function shaped like this.  The parity-correct coding
+# carries no `last_exception` pair.  Routing this unconditionally to
+# `emit_reraise!`, whose `exception_edge_extravars` asserts a materialized
+# pair, makes `transform_graph_to_jitcode` panic ("exception edge state
+# missing last_exception pair") while building the jitcode for any hot
+# function shaped like this.  The parity-correct coding
 # is the explicit `raise/r` of the current exception
 # (`get_current_exception()` + raise), as the `Reraise` no-catch arm
 # already does.  This bench pins that such functions compile and run

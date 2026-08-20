@@ -10,7 +10,7 @@
 # `fib_recursive` and `selfrec_bridge_nontail_promote` do not cover this. There
 # the recursion is itself the hot thing, so the callee owns a compiled loop
 # before any non-inline decision is taken. Here the hot thing is the caller's
-# loop, and the recursion is a callee it reaches; that ordering is what used to
+# loop, and the recursion is a callee it reaches; that ordering is what can
 # leave the call as an interpreter residual for the rest of the run, one frame
 # build and one entry bridge per recursive call. `recursive_call_frame_relocation`
 # holds the neighbouring case, a recursion under a `FOR_ITER` iterator, which

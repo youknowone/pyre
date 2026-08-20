@@ -6,8 +6,8 @@
 #    (`type(self).__dict__[name]`), never a bound method, so `c.f(i)` calls
 #    `f(i)` (a single positional, no implicit self).  `compute_load_method_bound`
 #    (shared by the interpreter `load_method` and the blackhole
-#    `bh_load_method_self_fn`) used to infer the binding from MRO shape alone
-#    and wrongly prepend self, making `len(args)` 2 instead of 1.
+#    `bh_load_method_self_fn`) must not infer the binding from MRO shape
+#    alone: that prepends self and makes `len(args)` 2 instead of 1.
 #
 # 2. GC: `type.__dict__` caches its canonical `W_DictObject` in the type
 #    namespace's off-GC `DictStorage.mirror_target`.  The moving collector did

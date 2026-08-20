@@ -1,22 +1,11 @@
 # pyre-check: max-pypy-ratio=8
 # The trip count puts pypy's execution above the startup-subtraction floor, so
-# this ratio is a measurement. It reads higher than the clamped one it replaces
-# rather than lower: a baseline pinned to the floor over-states pypy's work,
-# so every ratio built on it was an under-estimate. The ceiling is twice the
-# slowest of the backends observed.
-#
-# 220 came from a 109.5x cranelift reading; the loop now runs at parity, so the
-# derived floor is the bound that noticed. A ceiling that far above its
-# measurement is not a loose bound but a disabled one at BOTH ends: the floor is
-# `min(1, ceiling / PERF_GATE_FLOOR_DIVISOR)`, so 220 pinned it at parity, and
-# cranelift reading 0.5x on macos failed it from below.
-#
-# Observations behind 8 -- ubuntu 1.7x / 1.7x / 1.6x (dynasm / cranelift /
-# wasm), macos 1.1x / 0.6x, windows 1.2x / 1.5x, and 2.5x / 3.9x on a loaded
-# dev box where pypy's own execution lands in the thin band and inflates every
-# ratio built on it. Twice the slowest of those puts the floor at 0.2x, which
-# is 2.5x under the fastest reading -- both bounds keep room, which is the
-# whole point of deriving one from the other.
+# this ratio is a measurement. The loop runs at parity: ubuntu 1.7x / 1.7x /
+# 1.6x (dynasm / cranelift / wasm), macos 1.1x / 0.6x, windows 1.2x / 1.5x.
+# The ceiling is twice the slowest of those, which puts the derived floor
+# `min(1, ceiling / PERF_GATE_FLOOR_DIVISOR)` at 0.2x -- 2.5x under the fastest
+# reading, so both bounds keep room. A ceiling far above the measurement would
+# disable the gate at BOTH ends, the floor included.
 N = 38000000
 
 

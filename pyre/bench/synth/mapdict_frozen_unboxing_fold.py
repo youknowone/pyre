@@ -1,7 +1,5 @@
 # pyre-check: max-pypy-ratio=63
-# The ceiling is twice the slowest ratio observed once pypy's side became a
-# measurement; the previous 58 was fitted against a floored denominator, which
-# over-estimates pypy's work and so understated the ratio.
+# The ceiling is twice the slowest ratio observed.
 # A type change on one instance freezes unboxing for the whole class
 # (mapdict.py:623). Instances created before the freeze keep an unboxed slot
 # until something reads it: `_direct_read` migrates them off unboxed storage

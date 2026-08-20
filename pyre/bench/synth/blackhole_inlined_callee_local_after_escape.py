@@ -1,12 +1,9 @@
 # Output guard for an inlined callee whose local is read back after the frame
-# escapes.  This file no longer reaches an adopt of any kind: since the
-# constant-depth `sys._getframe` fold (#1096) its committed baselines read
+# escapes.  This file reaches no adopt of any kind: with the constant-depth
+# `sys._getframe` fold (#1096) its committed baselines read
 # `fbw_blackhole_adopted_single_frame=0`, `loops_aborted=0`, `loops_compiled=2`
-# on all three backends.  Before the fold they read 5 / 5 / 1 -- five
-# SINGLE-frame adopts.  `fbw_blackhole_adopted_multi_frame` is 0 here today and
-# was 0 before the fold too, so despite the wording this file carried for a
-# while, it has never taken the multi-frame arm.  That arm is pinned elsewhere,
-# by `getframe_inline_subwalk_multiframe` and
+# on all three backends.  It does not take the multi-frame arm either; that
+# arm is pinned by `getframe_inline_subwalk_multiframe` and
 # `getframe_while_inlined_callee_subwalk` among others, all recording a nonzero
 # `fbw_blackhole_adopted_multi_frame` on all three backends.
 #

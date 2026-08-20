@@ -9,8 +9,9 @@
 # Each shape lives in its own minimal loop so the kept-stack guard is the
 # whole trace and a miscompile is not diluted by a multi-shape loop.  Pure
 # arithmetic -> deterministic checksum.  Regression guard for the depth > 1
-# decline removal (`0 < a < b < 9` previously miscompiled 749949 vs 375000,
-# `total + (a + ((i & 1) or 5))` 1837502750500 vs 1275003750000).
+# decline removal: `0 < a < b < 9` must read 375000 (a miscompile gives
+# 749949) and `total + (a + ((i & 1) or 5))` 1275003750000 (miscompile:
+# 1837502750500).
 N = 1500000
 
 

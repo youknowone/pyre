@@ -6,8 +6,8 @@
 # `record_or_fold_fused_guard` mirrors `opimpl_goto_if_not_<cmp>`
 # (pyjitpl.py:547): `if <not float> and b1 is b2:` skips both the compare op
 # and the guard because `x <cmp> x` is statically determined
-# (FASTPATHS_SAME_BOXES: eq/le/ge => True, ne/lt/gt => False). Previously the
-# Rust path recorded an extra always-passing guard for these self-compares.
+# (FASTPATHS_SAME_BOXES: eq/le/ge => True, ne/lt/gt => False). The Rust path
+# must not record an extra always-passing guard for these self-compares.
 #
 # A self-compare reaches the fused branch when both operands colour to the same
 # register (`i == i`, `obj is obj`). The fast path must follow the branch in

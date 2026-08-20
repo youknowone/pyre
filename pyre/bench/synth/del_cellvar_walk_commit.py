@@ -3,11 +3,11 @@
 # sentinel `bh_store_deref_value_fn` hands straight to `w_cell_set` without
 # ever reading it.
 #
-# The walker's NULL-Ref-arg refusal used to decline that residual, which marks
-# the walk as carrying a recorded-but-unexecuted effect.  Every walk over this
-# loop then failed the walk-end flush ("unjournaled effect — legacy replay
-# kept") and handed the region back to a replay that re-ran the residuals the
-# walk had already executed concretely.  `bump` is one of them, so `log` grew
+# The walker's NULL-Ref-arg refusal must not decline that residual: a decline
+# marks the walk as carrying a recorded-but-unexecuted effect, so every walk
+# over this loop fails the walk-end flush ("unjournaled effect — legacy replay
+# kept") and hands the region back to a replay that re-runs the residuals the
+# walk already executed concretely.  `bump` is one of them, so `log` grew
 # by exactly one entry per walk: 20048 instead of 20000, on both backends and
 # at stock thresholds.
 #

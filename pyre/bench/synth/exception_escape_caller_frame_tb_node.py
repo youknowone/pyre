@@ -1,9 +1,9 @@
 # pyre-check: max-pypy-ratio=116
 # An exception escaping a compiled frame that holds a try block it does NOT
-# match used to lose the CALLER's traceback node:
+# match must keep the CALLER's traceback node:
 #
-#   before:  ('d_nonmatching_except', 'mid', 'leaf')
-#   after:   ('<module>', 'd_nonmatching_except', 'mid', 'leaf')
+#   correct:            ('<module>', 'd_nonmatching_except', 'mid', 'leaf')
+#   caller node lost:   ('d_nonmatching_except', 'mid', 'leaf')
 #
 # The non-matching clause falls through to the except-cleanup RERAISE, so the
 # blackhole classified the exiting frame as a bare reraise and cleared
