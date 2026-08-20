@@ -4405,12 +4405,18 @@ mod tests {
                 ),
                 "the caller must return the portal runner's result, got {outcome:?}",
             );
-            // The caller is bottommost: it leaves through
-            // `handle_jitexception`'s propagating arm, not through this hook.
+            // One entry per level, in the order each was left.  The inner
+            // level leaves through `run_forever_with_portal`'s post-return
+            // store; the caller carries no `jitdriver_sd`, so it is not the
+            // portal level `handle_jitexception` stops at but one of the
+            // levels its walk releases, and it leaves there.  Two entries for
+            // two levels is the contract — a repeat of either would be the
+            // double store that retires a still-running caller's recursion
+            // unit.
             assert_eq!(
                 left.into_inner(),
-                vec![INNER_VABLE],
-                "one leave per level that returns to its caller",
+                vec![INNER_VABLE, CALLER_VABLE],
+                "one leave per level, none twice",
             );
         }
 
