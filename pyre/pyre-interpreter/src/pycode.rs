@@ -2589,6 +2589,7 @@ pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
 /// `importing.py update_code_filenames`: set `source_path` on `code` and,
 /// recursively, on every nested code constant whose filename still matches the
 /// root's *original* name (leaving unrelated inlined filenames untouched).
+<<<<<<< HEAD
 ///
 /// The table is edited through `Constants`' `DerefMut`, so every constant keeps
 /// its address. Nested constants are wrapped in place by
@@ -2596,6 +2597,8 @@ pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
 /// reads the new name out of the object it already points at — which is what
 /// `update_code_filenames` mutating already-wrapped nested `PyCode` constants
 /// amounts to.
+=======
+>>>>>>> 4d430889006 (deps: update the RustPython pin)
 fn fix_code_filenames(code: &mut crate::CodeObject, oldname: &str, newname: &str) {
     code.source_path = newname.to_owned();
     for constant in code.constants.iter_mut() {

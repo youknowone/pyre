@@ -64,11 +64,12 @@ pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace" }
 pyre-wasm = { version = "0.0.2", path = "pyre/pyre-wasm" }
 pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 
-# Pinned to upstream main after the `Constants` mutable-access impls from
-# #8557 merged; `fix_code_filenames` needs `IndexMut` to edit nested code
-# constants in place.  This pin also carries the runtime marshal code-byte
-# hook from #8552, which `loads` relies on to preserve invalid code bytes, so
-# it must not move below that.
+# Pinned to upstream main after the pyre compatibility fixes from #8390 and
+# #8506, the memoryview fixes from #8553, the runtime marshal code-byte hook
+# from #8552, and the `Constants` mutable-access impls from #8557 were merged.
+# `fix_code_filenames` needs `IndexMut` to edit nested code constants in place,
+# and `loads` relies on the #8552 hook to preserve invalid code bytes, so this
+# pin must not move below either.
 rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
 rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
 rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "91a725fe833dbc06912a2619e0c39fffa0c61232" }
