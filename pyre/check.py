@@ -1441,11 +1441,20 @@ def _header_directive(path, prefix):
 
 
 def _positive_float(raw, line, path, kind):
-    """A directive value that has to parse as a number above zero."""
+    """A directive value that has to parse as a finite number above zero.
+
+    `float()` accepts `inf` and `nan`, and neither is a threshold: a reading
+    compares below `inf` forever, and every comparison against `nan` is False,
+    so either one disarms the gate it configures while still looking like a
+    number in the header. `<= 0` does not catch them — `nan <= 0` is False —
+    so the finiteness test is separate.
+    """
     try:
         value = float(raw)
     except ValueError as e:
         raise ValueError(f"invalid {kind} in {path}: {line.strip()}") from e
+    if not math.isfinite(value):
+        raise ValueError(f"{kind} must be finite in {path}: {line.strip()}")
     if value <= 0:
         raise ValueError(f"{kind} must be positive in {path}")
     return value
