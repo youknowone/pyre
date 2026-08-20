@@ -2556,7 +2556,7 @@ pub fn make_array_descr_with_full_id(
     )
 }
 
-// ── Range iterator field descriptors ─────────────────────────────────
+// Range iterator field descriptors.
 
 use pyre_object::floatobject::{
     FLOAT_FLOATVAL_OFFSET, FLOAT_W_DICT_OFFSET, FLOAT_W_SLOTS_OFFSET, W_FloatObject,
@@ -3825,7 +3825,7 @@ pub fn str_len_descr() -> DescrRef {
     field_descr_from_group(&W_UNICODE_DESCR_GROUP, 2)
 }
 
-// ── Object header & allocation descriptors ──────────────────────────
+// Object header and allocation descriptors.
 
 /// `PyCode.code_ptr` — the host `CodeObject` every code-field getter resolves
 /// through (`code_get_field` -> `require_code`).  Read only to prove it is

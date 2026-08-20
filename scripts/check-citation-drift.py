@@ -105,9 +105,6 @@ def scan_tree(root: Path, search_roots):
         ["rg", "-n", "--no-heading", "--type", "rust", RG_PREFILTER, *search_roots],
         cwd=root, capture_output=True, text=True,
     )
-    # rg exits 1 for "no matches", which for this tool is itself a red flag: the
-    # tree is known to carry tens of thousands of citations, so an empty result
-    # means the search was misconfigured, not that the tree is clean.
     if proc.returncode not in (0, 1):
         sys.exit(f"error: rg failed ({proc.returncode}): {proc.stderr.strip()}")
     rows = []
@@ -117,6 +114,20 @@ def scan_tree(root: Path, search_roots):
         except ValueError:
             continue
         rows.append((path, lno, text))
+    # An empty scan -- rg exit 1 for "no matches", or output no line here could
+    # parse -- is a hard error, not a clean tree: the searched trees carry tens
+    # of thousands of citations, so finding none means the search was
+    # misconfigured. Every number in the report is derived from these rows, and
+    # both invariants in `main` compare two derived counts, so on empty input
+    # they read 0 == 0 and the tool prints a clean report of nothing.
+    if not rows:
+        sys.exit(
+            f"error: scanning {', '.join(search_roots)} under {root} found no "
+            f"citations at all.\nThat is a misconfigured search, not a clean "
+            f"tree: check --root and --search-root, and that `rg --type rust` "
+            f"still selects Rust files. Refusing to report on an empty "
+            f"population, which every count below would certify as clean."
+        )
     return rows
 
 
@@ -134,8 +145,13 @@ def classify(rows, index, by_path):
                 continue
             if "/" in pyfile:
                 # the citation NAMES its corpus -- resolve by path suffix, never
-                # by basename, or a same-named file in another corpus wins.
-                hits = [v for k, v in by_path.items() if k.endswith(pyfile)]
+                # by basename, or a same-named file in another corpus wins. The
+                # suffix must start at a directory boundary: a bare `endswith`
+                # cuts mid-component, so `pypy/somefoo/bar.py` would answer a
+                # citation of `foo/bar.py` and the spurious second hit would
+                # push a resolvable citation into `ambiguous_path`.
+                hits = [v for k, v in by_path.items()
+                        if k == pyfile or k.endswith("/" + pyfile)]
                 if len(hits) > 1:
                     stats["ambiguous_path"] += 1
                     continue
@@ -258,7 +274,8 @@ def main():
     ap.add_argument("--claims", type=int, default=25, metavar="N",
                     help="distinct drifted claims to list in detail (default: 25, 0 for all)")
     ap.add_argument("--summary", action="store_true",
-                    help="print the headline and partition only")
+                    help="print the count sections only, omitting the per-site "
+                         "claim listings")
     ap.add_argument("--self-test", action="store_true",
                     help="prove the population guard is live, then exit")
     args = ap.parse_args()
@@ -342,6 +359,10 @@ def main():
         print(f"  {TIER_LABEL[t]:24s} {tiers[t]:,}")
     print("  D is mostly an adjacent def and is not listed below.")
 
+    # Everything above is counts; everything below enumerates the individual
+    # citation sites behind them. `--summary` cuts exactly there, and no
+    # population is lost by the cut: the drifted and out-of-range counts are
+    # both printed in the headline and again in the partition.
     if args.summary:
         return 0
 
