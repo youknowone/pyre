@@ -196,9 +196,10 @@ struct TimingState {
 /// `opimpl_jit_force_quasi_immutable` (`pyjitpl.py:1094-1118`) carries on the
 /// `SwitchToBlackhole` instance it raises.
 ///
-/// The mapdict producer is gated behind `PYRE_QMUT_MAPDICT_FORCE` and ships off,
-/// so a default run reaches this tally only through the namespace one; that path
-/// is live, and `MAJIT_STATS=1 PYRE_MC_DIAG=1` on
+/// The mapdict producer runs only when `PYRE_QMUT_MAPDICT_FORCE` is set, which
+/// no build sets, so a default run reaches this tally only through
+/// `try_walker_force_quasi_immut_namespace_write`; that path is live, and
+/// `MAJIT_STATS=1 PYRE_MC_DIAG=1` on
 /// `bench/synth/trace_too_long_effect_replay.py` prints `abrt_force_qmut=1`.
 pub const ABORT_COUNTER_KINDS: &[(i32, &str)] = &[
     (counters::ABORT_TOO_LONG, "too_long"),
