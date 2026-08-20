@@ -174,7 +174,20 @@ assert isinstance(public_stats.total_gc_memory, str)
 assert isinstance(public_stats.total_gc_time, int)
 assert repr(public_stats).startswith("Total memory consumed:\n")
 public_copy = type(public_stats)(raw_stats)
-assert public_copy.total_gc_memory == public_stats.total_gc_memory
+# Compare the copy against the snapshot it was built from.  `public_stats`
+# carries a `get_stats()` snapshot taken forty-odd lines earlier and
+# `total_gc_memory` is a formatted size, so comparing the two asserts that no
+# collection ran in between rather than that the constructor converts -- which
+# is false whenever the nursery is small enough to collect there.
+# `app_referents.py:72-76 _format` is the conversion under test.
+raw_total = raw_stats.total_gc_memory
+assert public_copy.total_gc_memory == (
+    "%.1fkB" % (raw_total / 1024.0)
+    if raw_total < 1000000
+    else "%.1fMB" % (raw_total / 1024.0 / 1024.0)
+)
+# `total_gc_time` is the one field the wrapper passes through unformatted.
+assert public_copy.total_gc_time == raw_stats.total_gc_time
 
 # `jit_hooks.stats_asmmemmgr_*` reads the active CPU's assembler memory
 # manager. A hot loop must therefore make both native-code counters visible;
