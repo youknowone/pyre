@@ -31,6 +31,31 @@ pub fn branch_loop_sum(slice: &[i64], threshold: i64) -> i64 {
     acc
 }
 
+// 2b. Iterator element kinds.  `next()`'s payload carries one reference for
+// a slice iterator (`core::slice::iter::Iter` yields `Option<&T>`) and none
+// for a by-value one (`core::array::iter::IntoIter` yields `Option<T>`), so
+// the two spell the same `Option<&i64>` payload for different reasons: here
+// the element is `&i64` both times, and only the first has a reference the
+// iterator added.  A frontend that peels unconditionally, or never, types one
+// of the two into the wrong register bank.
+#[inline(never)]
+pub fn slice_of_refs_sum(slice: &[&i64]) -> i64 {
+    let mut acc: i64 = 0;
+    for r in slice {
+        acc += **r;
+    }
+    acc
+}
+
+#[inline(never)]
+pub fn array_of_refs_sum(refs: [&i64; 3]) -> i64 {
+    let mut acc: i64 = 0;
+    for r in refs {
+        acc += *r;
+    }
+    acc
+}
+
 // 3. Strategy dispatch (dict-strategy stand-in)
 pub enum Strategy {
     Empty,

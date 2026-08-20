@@ -990,6 +990,25 @@ impl<'a> Transformer<'a> {
                     "link argument",
                 );
             }
+            // The catch-all behind the four positional routes.  Registering a
+            // variable in `vable_array_vars` drops the `getfield` that defined
+            // it, so an operand the block kept and no rewrite replaced is a
+            // variable used and never defined; regalloc reports that against a
+            // register kind, not against the read that went missing.
+            //
+            // Nothing between here and regalloc prunes dead operations —
+            // `finalize_rewritten_graph_to_jitcode` goes straight to regalloc,
+            // flatten, assemble — so a surviving operand always reaches it.
+            // That is what makes this safe to assert rather than merely warn:
+            // it cannot fire on a graph that would otherwise have compiled.
+            for op in &block.operations {
+                let operands = crate::inline::op_variable_refs(&op.kind);
+                self.check_no_vable_array(
+                    operands.iter(),
+                    graph_name,
+                    "surviving operation operand",
+                );
+            }
         }
 
         // Upstream `rpython/translator/backendopt/canraise.py:25-47
@@ -1115,21 +1134,30 @@ impl<'a> Transformer<'a> {
     /// pass a green test while escaping by the one route that test did not
     /// look at.
     ///
-    /// `route` names which of the four the escape took.  Upstream's
+    /// `route` names which of the five the escape took.  Upstream's
     /// message does not carry it, and the extra line is a deliberate pyre
-    /// addition: the four call sites below share one panic body, this
+    /// addition: the five call sites below share one panic body, this
     /// function is small enough to be inlined into all of them in an
     /// optimised build, and the resulting backtrace then names whichever
     /// site the optimiser happened to keep.  A misread frame sent a whole
     /// diagnosis round after a residual call for what was a link argument.
     /// Keep the upstream block verbatim above and add the route last.
     ///
-    /// The four routes are closed — the call sites are the only ones —
-    /// and each passes its own literal: `"link argument"`,
-    /// `"fused exitswitch operand"`, `"call argument"`,
-    /// `"setfield operand"` (`jtransform.py:912`, the base or the stored
-    /// value of a `setfield`; there is no `setarrayitem` site, because
-    /// that one is the array access the protocol exists to allow).
+    /// Four of the routes name a specific operand position, each passing
+    /// its own literal: `"link argument"`, `"fused exitswitch operand"`,
+    /// `"call argument"`, `"setfield operand"` (`jtransform.py:912`, the
+    /// base or the stored value of a `setfield`; there is no
+    /// `setarrayitem` site, because that one is the array access the
+    /// protocol exists to allow).
+    ///
+    /// The fifth, `"surviving operation operand"`, is the catch-all behind
+    /// them: every operand of every operation the block kept, whatever its
+    /// kind.  It reports last and least precisely, and it is here because
+    /// an enumerated list of routes is the shape that let `_check_stack_index`
+    /// escape by the one route its test did not look at — the same reason
+    /// the paragraph above prefers a whole-graph assertion to a list of
+    /// escape hatches.  A route the four do not name (a `getfield` on the
+    /// array pointer, say) reaches it.
     fn check_no_vable_array<'v>(
         &self,
         list: impl IntoIterator<Item = &'v crate::flowspace::model::Variable>,
@@ -4387,6 +4415,17 @@ impl<'a> Transformer<'a> {
     /// Returns `None` for any oopspec spelling this does not handle, so
     /// the caller falls through to the residual path
     /// (`jtransform.py:1796` raises `NotSupported`).
+    ///
+    /// No arm here checks `vable_array_vars`, and none is owed.  Upstream
+    /// splits on `resizable`: the `do_fixed_list_len/getitem/setitem` arms
+    /// take a `lltype.GcArray` receiver — which is what a virtualizable array
+    /// field holds — and so open with that check, while the
+    /// `do_resizable_list_*` arms take a `GcStruct` and do not.  Every
+    /// spelling below is of the resizable family, its receiver a
+    /// `W_ListObject`.  pyre reaches a fixed array through
+    /// `getarrayitem` / `setarrayitem` / `getarraysize` instead, which carry
+    /// the check in their own dispatch arms and emit the same three
+    /// instructions the fixed arms do.
     fn _handle_list_call(
         &mut self,
         oopspec_name: &str,
@@ -8634,6 +8673,122 @@ mod tests {
         assert!(
             ops.iter().any(|op| op.result.as_ref() == Some(&array_var)),
             "with lowering off the array read must still be defined, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+        );
+    }
+
+    /// An escape by a route the four positional checks do not name must
+    /// still be caught, and named, before regalloc sees it.
+    ///
+    /// The array pointer's defining read is dropped at registration, so the
+    /// three rewriting consumers are the only ones that may follow it.  A
+    /// `getfield` on the pointer itself is none of them and is none of the
+    /// four enumerated escapes either — it is not a call argument, a setfield
+    /// operand, a link argument or a fused exitswitch operand.  It reaches
+    /// the catch-all, which is the whole point of having one: the four
+    /// positional checks are an enumeration, and an enumeration is what an
+    /// unforeseen route walks past.
+    ///
+    /// Without it the symptom is one variable used and never defined,
+    /// surfacing in regalloc against a register kind rather than against the
+    /// read that went missing.
+    #[test]
+    #[should_panic(expected = "Escaped via: surviving operation operand")]
+    fn a_vable_array_escape_by_an_unenumerated_route_is_named() {
+        let mut graph = FunctionGraph::new("test");
+        let base_var = graph.alloc_value_var();
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: array_var,
+                field: crate::model::FieldDescriptor::new("header", Some("SomeArray".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        transform_graph(&graph, &config);
+    }
+
+    /// The scalar-field half of the same gate.  Both virtualizable arms of
+    /// `rewrite_op_getfield` are gated, so the flag has to be exercised on
+    /// both: [`a_vable_array_read_is_kept_when_virtualizable_lowering_is_off`]
+    /// covers the array arm, and this one the field arm.
+    ///
+    /// The stakes differ.  The array arm drops the read outright, so an
+    /// ungated drop leaves regalloc an undefined variable.  The field arm
+    /// only rewrites in place, so the flag decides whether the graph carries
+    /// a `VableFieldRead` no lowering will consume — quieter, and pinned here
+    /// so the two arms cannot drift apart.
+    #[test]
+    fn a_vable_field_read_is_kept_when_virtualizable_lowering_is_off() {
+        let mut graph = FunctionGraph::new("test");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        let field_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: frame_var,
+                    field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            lower_virtualizable: false,
+            vable_fields: vec![VirtualizableFieldDescriptor::new(
+                "next_instr",
+                Some("Frame".into()),
+                0,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
+        assert_eq!(result.vable_rewrites, 0);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::VableFieldRead { .. })),
+            "with lowering off the read must stay a plain FieldRead, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::FieldRead { .. })
+                    && op.result.as_ref() == Some(&field_var)),
+            "with lowering off the field read must still be defined, got {:?}",
             ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
         );
     }

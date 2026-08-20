@@ -73,6 +73,15 @@ fn harvested_unroll_safe() -> Option<Vec<String>> {
         .map(|(path, _)| path.clone())
         .collect();
     paths.sort();
+    if !paths.iter().any(|p| leaf(p) == CONTROL) {
+        eprintln!(
+            "skipping: {INTERPRETER_LLBC} carries no `unroll_safe` on {CONTROL}, \
+             so it predates the hint inventory entirely; re-extract to exercise \
+             this test (harvested: {paths:?})"
+        );
+        return None;
+    }
+
     // `REVIEWED_UNROLL_SAFE` and the subset check below both match on the
     // leaf, on the stated assumption that leaves are unambiguous across the
     // interpreter.  Nothing else verifies that.  If an unreviewed function
@@ -90,14 +99,6 @@ fn harvested_unroll_safe() -> Option<Vec<String>> {
                 leaf(path),
             );
         }
-    }
-    if !paths.iter().any(|p| leaf(p) == CONTROL) {
-        eprintln!(
-            "skipping: {INTERPRETER_LLBC} carries no `unroll_safe` on {CONTROL}, \
-             so it predates the hint inventory entirely; re-extract to exercise \
-             this test (harvested: {paths:?})"
-        );
-        return None;
     }
     Some(paths)
 }

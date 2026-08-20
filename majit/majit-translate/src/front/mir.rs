@@ -9214,17 +9214,25 @@ impl<'a> Lowering<'a> {
             // recorded kind is the item's own, the way `ll_listnext` hands
             // back the list's item repr rather than a pointer to it — and
             // only that one, so an element that is itself a reference stays
-            // reference-typed.  An unreadable shape records `Ref(None)` — the
-            // answer the fold assumed unconditionally before this was
-            // carried, so an unreadable type keeps today's behaviour instead
-            // of inventing a new one.
+            // reference-typed.  Which iterator this is decides whether there
+            // is a reference to peel at all: the receiver names the iterator
+            // ADT, and a by-value one yields the element directly.  An
+            // unreadable shape records `Ref(None)` — the answer the fold
+            // assumed unconditionally before this was carried, so an
+            // unreadable type keeps today's behaviour instead of inventing a
+            // new one.
+            let iterator_added_a_reference = first_arg_ty
+                .as_ref()
+                .and_then(|receiver| self.tyref_ref_adt_path(receiver))
+                .is_some_and(|path| iterator_adds_a_reference(&path));
             let item_ty = crate::front::result_exc::tyref_option_payload(&call.dest.ty, self.llbc)
                 .and_then(|payload| {
                     let body = match &payload {
                         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
                         TyRef::Dedup { id } => self.llbc.dedup_body(*id)?,
                     };
-                    let item = iterator_payload_element(body, self.llbc)?;
+                    let item =
+                        iterator_payload_element(body, self.llbc, iterator_added_a_reference)?;
                     serde_json::from_value::<TyRef>(item.clone()).ok()
                 })
                 .map(|ty| tyref_to_value_type(&ty, self.llbc))
@@ -11426,6 +11434,15 @@ impl<'a> Lowering<'a> {
             }
             return inline_adt_def_id(v);
         }
+    }
+
+    /// The full name path of the ADT behind a signature [`TyRef`], peeling
+    /// the same wrappers [`Self::tyref_ref_adt_def_id`] does — a desugared
+    /// `it.next()` passes its iterator as `&mut Iter<'_, T>`, so the receiver
+    /// reaches [`iterator_adds_a_reference`] behind one reference.
+    fn tyref_ref_adt_path(&self, ty: &TyRef) -> Option<String> {
+        let id = self.tyref_ref_adt_def_id(ty)?;
+        Some(self.llbc.type_by_id(id)?.item_meta.name_path())
     }
 
     /// Peel `Ref` / `RawPtr` wrappers (through dedup / hash-cons
@@ -16833,23 +16850,48 @@ fn strip_ty_indirections<'l>(
     None
 }
 
+/// Does the iterator ADT named by `path` hand back a reference *it* added,
+/// rather than the element itself?
+///
+/// `core::slice::iter::Iter<'a, T>` yields `Option<&'a T>`: that `&` is the
+/// iterator's, and peeling it is what leaves `&[i64]`'s element an `i64`.
+/// The by-value iterators [`Lowering::is_concrete_iter_constructor`] admits
+/// alongside it — `alloc::vec::into_iter::IntoIter<T>` for `Vec<T>` and
+/// `core::array::iter::IntoIter<T, N>` for `[T; N]` — yield `Option<T>`
+/// instead, so their payload is already the element and the same peel would
+/// strip a reference the element owns.
+///
+/// Recognition is positive-only: an unlisted or unreadable receiver does not
+/// peel, which leaves a `&T` payload typed `Ref` — the answer the fold
+/// assumed unconditionally before any element type was carried.
+fn iterator_adds_a_reference(path: &str) -> bool {
+    matches!(
+        path,
+        "core::slice::iter::Iter" | "core::slice::iter::IterMut"
+    )
+}
+
 /// The element type behind an iterator's `next()` payload.
 ///
-/// A slice iterator yields `Option<&T>`, so exactly one reference level
-/// belongs to the iterator and the rest belongs to the element: over
-/// `&[i64]` the payload is `&i64` and the element is `i64`, but over
-/// `&[&i64]` it is `&&i64` and the element is `&i64` — a pointer, which
-/// belongs in the Ref bank.  Peeling every `Ref` would put that pointer in
-/// the integer bank.
+/// When the iterator added a reference ([`iterator_adds_a_reference`]),
+/// exactly one reference level belongs to it and the rest belongs to the
+/// element: over `&[i64]` the payload is `&i64` and the element is `i64`,
+/// but over `&[&i64]` it is `&&i64` and the element is `&i64` — a pointer,
+/// which belongs in the Ref bank.  Peeling every `Ref` would put that
+/// pointer in the integer bank.
 ///
-/// A by-value iterator (`[i64; N]`, `Vec<i64>`) hands back the item itself
-/// with no reference to peel, so a payload that is not a `Ref` is already
-/// the element.
+/// When it did not, the payload is the element already, and peeling would
+/// commit the mirror-image error: `Vec<&i64>::into_iter()` yields
+/// `Option<&i64>`, whose `&i64` is the element itself.
 fn iterator_payload_element<'l>(
     payload: &'l serde_json::Value,
     llbc: &'l Llbc,
+    iterator_adds_a_reference: bool,
 ) -> Option<&'l serde_json::Value> {
     let node = strip_ty_indirections(payload, llbc)?;
+    if !iterator_adds_a_reference {
+        return Some(node);
+    }
     let Some(arr) = node.get("Ref").and_then(serde_json::Value::as_array) else {
         return Some(node);
     };

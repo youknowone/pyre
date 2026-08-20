@@ -29,7 +29,10 @@ fn loads_fixture_corpus() {
     // + 2 for the host-registered callback table: `host_registry_dispatch`
     // and `host_registry_dispatch_optional`. `HostCallback` is a type alias,
     // not an item, so it contributes no body.
-    assert_eq!(local_count, 14, "14 local fns expected");
+    //
+    // + 2 for the iterator element-kind pair, `slice_of_refs_sum` and
+    // `array_of_refs_sum`.
+    assert_eq!(local_count, 16, "16 local fns expected");
 }
 
 #[test]

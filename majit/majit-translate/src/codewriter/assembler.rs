@@ -6968,7 +6968,7 @@ mod tests {
     /// alone.
     #[test]
     fn assemble_vable_arraylen_emits_the_rdd_to_i_wire_shape() {
-        use crate::flatten::flatten_graph;
+        use crate::flatten::{FlatOp, flatten_graph};
         use crate::jtransform::{GraphTransformConfig, Transformer, VirtualizableFieldDescriptor};
         use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
 
@@ -7026,7 +7026,7 @@ mod tests {
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
         let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
+        let body = asm.assemble(&mut flat, &regallocs);
 
         assert!(
             asm.insns.contains_key("arraylen_vable/rdd>i"),
@@ -7073,6 +7073,37 @@ mod tests {
         let word = crate::layout::target_word_size();
         assert_eq!((*base_size, *itemsize, *len_offset), (word, word, Some(0)));
         assert!(is_array_of_pointers);
+
+        // The pool order above only says which descr was minted first.  What
+        // the decoder follows is the pair of indexes in the instruction's own
+        // operand bytes, so read them: `1B opcode + 1B vable_reg + 2B fdescr +
+        // 2B adescr + 1B dest`, each index little-endian.  A swapped emission
+        // would still leave the pool in this order and still key
+        // `arraylen_vable/rdd>i`.
+        let op_index = flat
+            .insns
+            .iter()
+            .position(|flat_op| {
+                matches!(flat_op, FlatOp::Op(inner)
+                    if matches!(inner.kind, OpKind::VableArrayLen { .. }))
+            })
+            .expect("the flattened graph must carry the VableArrayLen");
+        let offset = flat.insns_pos.as_ref().expect("assemble records insns_pos")[op_index];
+        let wire = &body.code[offset..offset + 7];
+        assert_eq!(
+            wire[0], asm.insns["arraylen_vable/rdd>i"],
+            "the instruction at its recorded position must be the vable arraylen"
+        );
+        assert_eq!(
+            u16::from_le_bytes([wire[2], wire[3]]) as usize,
+            vable_at,
+            "the first descr operand must be the vable-array descr"
+        );
+        assert_eq!(
+            u16::from_le_bytes([wire[4], wire[5]]) as usize,
+            array_at,
+            "the second descr operand must be the array descr"
+        );
     }
 
     #[test]
