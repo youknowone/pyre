@@ -317,6 +317,9 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::VableFieldWrite { .. } => ValueType::Void,
         OpKind::VableArrayRead { item_ty, .. } => item_ty.clone(),
         OpKind::VableArrayWrite { .. } => ValueType::Void,
+// `arraylen_vable/rdd>i` — a length is a `Signed`, never the
+// element kind.
+OpKind::VableArrayLen { .. } => ValueType::Int,
         OpKind::UnaryOp {
             op,
             operand,

@@ -760,6 +760,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         OpKind::VableArrayRead {
             base, elem_index, ..
         } => vec![base.clone(), elem_index.clone()],
+        OpKind::VableArrayLen { base, .. } => vec![base.clone()],
         OpKind::VableArrayWrite {
             base,
             elem_index,

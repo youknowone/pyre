@@ -1014,6 +1014,30 @@ pub enum OpKind {
         /// RPython: arraydescr.is_item_signed() from VirtualizableInfo.array_descrs.
         array_is_signed: bool,
     },
+    /// Virtualizable array length → reads the length off the boxes.
+    /// RPython: `arraylen_vable`.
+    ///
+    /// Emitted by `jtransform.py:808-817 rewrite_op_getarraysize`, the third
+    /// consumer of `vable_array_vars` alongside [`OpKind::VableArrayRead`]
+    /// and [`OpKind::VableArrayWrite`].  Without it a `len()` over a
+    /// virtualizable array is the one route that still reads the raw array
+    /// pointer, so the field read producing that pointer cannot be dropped
+    /// the way `rewrite_op_getfield`'s `except VirtualizableArrayField:`
+    /// handler drops it.
+    ///
+    /// Carries the two descrs its siblings do even though only the
+    /// vable-array one is read at run time: the bytecode key is
+    /// `arraylen_vable/rdd>i` (`insns.rs`), and
+    /// `expect_matching_vable_array_descrs` cross-checks the pair.
+    VableArrayLen {
+        base: crate::flowspace::model::Variable,
+        array_index: usize,
+        item_ty: ValueType,
+        /// RPython: arraydescr.itemsize from VirtualizableInfo.array_descrs.
+        array_itemsize: usize,
+        /// RPython: arraydescr.is_item_signed() from VirtualizableInfo.array_descrs.
+        array_is_signed: bool,
+    },
     /// Binary arithmetic/comparison operation.
     /// RPython: `int_add`, `int_lt`, etc.
     BinOp {

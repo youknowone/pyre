@@ -8589,7 +8589,8 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         OpKind::VableFieldRead { .. }
         | OpKind::VableFieldWrite { .. }
         | OpKind::VableArrayRead { .. }
-        | OpKind::VableArrayWrite { .. } => RaiseClass::No,
+        | OpKind::VableArrayWrite { .. }
+| OpKind::VableArrayLen { .. } => RaiseClass::No,
         // Post-jtransform call ops: raise is determined by their descriptor,
         // not by op_can_raise. These are not "simple operations" in RPython
         // terms — they're handled by analyze() → analyze_direct_call.

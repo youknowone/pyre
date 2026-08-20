@@ -644,6 +644,19 @@ pub(crate) fn remap_op_kind(
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
         },
+        OpKind::VableArrayLen {
+            base,
+            array_index,
+            item_ty,
+            array_itemsize,
+            array_is_signed,
+        } => OpKind::VableArrayLen {
+            base: remap_var(base),
+            array_index: *array_index,
+            item_ty: item_ty.clone(),
+            array_itemsize: *array_itemsize,
+            array_is_signed: *array_is_signed,
+        },
         OpKind::VableArrayWrite {
             base,
             array_index,
@@ -1019,6 +1032,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::VableArrayRead {
             base, elem_index, ..
         } => vec![clone_var(base), clone_var(elem_index)],
+        OpKind::VableArrayLen { base, .. } => vec![clone_var(base)],
         OpKind::VableArrayWrite {
             base,
             elem_index,
@@ -1196,6 +1210,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // Pure virtualizable reads — no heap mutation.
         | OpKind::VableFieldRead { .. }
         | OpKind::VableArrayRead { .. }
+        | OpKind::VableArrayLen { .. }
         // Pure vtable slot read — `cast_pointer + getfield` chain
         // collapsed into one op (see `OpKind::VtableMethodPtr` doc).
         | OpKind::VtableMethodPtr { .. }

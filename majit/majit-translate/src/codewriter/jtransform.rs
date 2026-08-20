@@ -1447,6 +1447,10 @@ impl<'a> Transformer<'a> {
             } if self.config.lower_virtualizable => {
                 self.rewrite_op_setarrayitem(op, base, index, value, item_ty, graph_name)
             }
+            // ── rewrite_op_getarraysize ──
+            OpKind::ArrayLen { base, .. } if self.config.lower_virtualizable => {
+                self.rewrite_op_getarraysize(op, base, graph_name)
+            }
             // ── rewrite_op_direct_call ──
             OpKind::Call {
                 target,
@@ -3360,6 +3364,66 @@ impl<'a> Transformer<'a> {
             }]);
         }
         RewriteResult::Keep
+    }
+
+    /// `jtransform.py:808-817 rewrite_op_getarraysize` — the third and last
+    /// consumer of `vable_array_vars`.
+    ///
+    /// Without it a `len()` on a virtualizable array is the one route that
+    /// still reads the raw array pointer, so the field read that produced it
+    /// cannot be dropped the way `rewrite_op_getfield`'s
+    /// `except VirtualizableArrayField:` handler drops it (`return []`).
+    /// The other two consumers, `rewrite_op_getarrayitem` and
+    /// `rewrite_op_setarrayitem`, have answered against the vable base since
+    /// they were ported.
+    ///
+    /// The macro lowering has emitted this instruction all along
+    /// (`majit-macros` `lower_vable_array_len`), and the whole run-time side
+    /// — the `arraylen_vable/rdd>i` key, the assembler, `opimpl_arraylen_vable`,
+    /// `bhimpl_arraylen_vable` — was already in place; only the codewriter
+    /// path never reached it.
+    fn rewrite_op_getarraysize(
+        &mut self,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        graph_name: &str,
+    ) -> RewriteResult {
+        let Some((vable_base, arr_idx, itemsize, is_signed)) =
+            self.vable_array_vars.get(base).cloned()
+        else {
+            return RewriteResult::Keep;
+        };
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("rewrite: len(array) → VableArrayLen[{arr_idx}]"),
+        });
+        self.vable_rewrites += 1;
+        // `jtransform.py:814` — `-live-` leads the virtualizable array
+        // length read, as it leads its read and write siblings.
+        RewriteResult::Replace(vec![
+            SpaceOperation {
+                result: None,
+                kind: OpKind::Live,
+            },
+            SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::VableArrayLen {
+                    base: vable_base,
+                    array_index: arr_idx,
+                    // Upstream passes the `arraydescr` off `vinfo`
+                    // (`jtransform.py:816`), not one derived at the access —
+                    // an `arraylen_gc` carries no element type to derive one
+                    // from.  `vable_arraydescrof` asserts the block behind a
+                    // virtualizable array is a `FixedObjectArray` of
+                    // word-wide `PyObjectRef`s, which is the one shape this
+                    // mint accepts, so the element type is that and the pair
+                    // `expect_matching_vable_array_descrs` cross-checks holds.
+                    item_ty: ValueType::Ref(None),
+                    array_itemsize: itemsize,
+                    array_is_signed: is_signed,
+                },
+            },
+        ])
     }
 
     /// RPython: rewrite_op_setarrayitem
@@ -6912,6 +6976,19 @@ fn remap_op(
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
         },
+        OpKind::VableArrayLen {
+            base,
+            array_index,
+            item_ty,
+            array_itemsize,
+            array_is_signed,
+        } => OpKind::VableArrayLen {
+            base: remap_value(base, aliases),
+            array_index: *array_index,
+            item_ty: item_ty.clone(),
+            array_itemsize: *array_itemsize,
+            array_is_signed: *array_is_signed,
+        },
         OpKind::VableArrayWrite {
             base,
             array_index,
@@ -8464,6 +8541,80 @@ mod tests {
                 "expected VableArrayRead with explicit base, got {:?}",
                 rewritten_op.kind
             );
+        };
+        assert_eq!(*array_index, 0);
+        assert_eq!(rewritten_base, &base_var_held);
+    }
+
+    /// `jtransform.py:808-817 rewrite_op_getarraysize` — the third
+    /// consumer of `vable_array_vars`.
+    ///
+    /// A `len()` over a virtualizable array answers against the frame, not
+    /// the array pointer, so the field read that produced the pointer has
+    /// no consumer left and is dropped with the other two.
+    #[test]
+    fn transform_graph_rewrites_a_vable_array_len_against_the_frame() {
+        let mut graph = FunctionGraph::new("test");
+        let base_var = graph.alloc_value_var();
+        let base_var_held = base_var.clone();
+        let array_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var,
+                    field: crate::model::FieldDescriptor::new(
+                        "locals_stack_w",
+                        Some("Frame".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayLen {
+                base: array_var,
+                array_type_id: None,
+                nolength: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig {
+            vable_arrays: vec![VirtualizableFieldDescriptor::new_with_arraydescr(
+                "locals_stack_w",
+                Some("Frame".into()),
+                0,
+                8,
+                true,
+            )],
+            ..Default::default()
+        };
+        let result = transform_graph(&graph, &config);
+        assert_eq!(result.vable_rewrites, 1);
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayLen { .. })),
+            "the raw arraylen must be gone, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+        );
+        // `jtransform.py:814` — `-live-` leads the vable array length read.
+        assert!(
+            matches!(ops[1].kind, OpKind::Live),
+            "vable array length must be led by -live-, got {:?}",
+            ops[1].kind
+        );
+        let OpKind::VableArrayLen {
+            base: rewritten_base,
+            array_index,
+            ..
+        } = &ops[2].kind
+        else {
+            panic!("expected VableArrayLen, got {:?}", ops[1].kind);
         };
         assert_eq!(*array_index, 0);
         assert_eq!(rewritten_base, &base_var_held);

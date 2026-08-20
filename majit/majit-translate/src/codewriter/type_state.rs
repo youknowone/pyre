@@ -144,6 +144,8 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
             concrete_if_known(kind_char_to_concrete(*result_kind))
         }
         OpKind::VtableMethodPtr { .. } => Some(ConcreteType::Signed),
+        // `arraylen_vable/rdd>i` answers a length, never the element kind.
+        OpKind::VableArrayLen { .. } => Some(ConcreteType::Signed),
         _ => None,
     }
 }

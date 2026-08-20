@@ -2317,6 +2317,45 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::VableArrayLen {
+                base,
+                array_index,
+                item_ty,
+                array_itemsize,
+                array_is_signed,
+            } => {
+                let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
+                state.code.push(reg);
+                argcodes.push(kc);
+                // The same descr pair its read and write siblings carry, in
+                // the same order: fielddescr (vable array field) + arraydescr.
+                // `arraylen_vable/rdd>i` reads only the first at run time,
+                // but `expect_matching_vable_array_descrs` checks the pair.
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableArray {
+                    index: *array_index,
+                });
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let descr_idx2 = self.emit_ready_descr(vable_arraydescrof(
+                    item_ty,
+                    *array_itemsize,
+                    *array_is_signed,
+                ));
+                state.code.push((descr_idx2 & 0xFF) as u8);
+                state.code.push((descr_idx2 >> 8) as u8);
+                argcodes.push('d');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::VableForce { base } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 assert_eq!(kc, 'r', "hint_force_virtualizable expects a Ref base");
@@ -2788,6 +2827,7 @@ impl Assembler {
                 OpKind::VableFieldWrite { .. } => "VableFieldWrite",
                 OpKind::VableArrayRead { .. } => "VableArrayRead",
                 OpKind::VableArrayWrite { .. } => "VableArrayWrite",
+                OpKind::VableArrayLen { .. } => "VableArrayLen",
                 OpKind::BinOp { .. } => "BinOp",
                 OpKind::UnaryOp { .. } => "UnaryOp",
                 OpKind::VableForce { .. } => "VableForce",
@@ -4673,6 +4713,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::VableArrayWrite { item_ty, .. } => {
             format!("setarrayitem_vable_{}", value_type_to_kind(item_ty))
         }
+        // `jtransform.py:814-817` — one opname with no kind suffix: a
+        // length is a `Signed` whatever the element kind is.
+        OpKind::VableArrayLen { .. } => "arraylen_vable".into(),
         // RPython `blackhole.py:500` canonical opnames for bitwise ints are
         // `int_and` / `int_or` / `int_xor`. When an `OpKind::BinOp.op`
         // arrives spelled with Rust's `syn::BinOp` trait names
