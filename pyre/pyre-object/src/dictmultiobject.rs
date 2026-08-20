@@ -560,16 +560,25 @@ pub unsafe fn dict_entries_index_of_object(
 /// required while bootstrapping `str.__hash__` itself: its defining type dict
 /// is already a W_DictObject, so `hash_w(w_str)` would recursively look up
 /// `str.__hash__` in the dict currently being filled.
+///
+/// `hash` is the caller's digest for `key`, or 0 when it holds none.  The
+/// digest is memoized on the new string (`rstr.py:402-412 ll_strhash`), so the
+/// key this dict now owns never hashes its bytes again.
 #[inline]
-unsafe fn object_key_for_new_str(key: &str) -> ObjectKey {
+unsafe fn object_key_for_new_str(key: &str, hash: i64) -> ObjectKey {
     let obj = crate::w_str_new(key);
-    match crate::dict_eq_hook::try_hash_str(key.as_bytes()) {
-        Some(hash) => {
-            crate::dict_eq_hook::take_eq_error();
-            ObjectKey { hash, obj }
-        }
-        None => object_key_for(obj),
-    }
+    let hash = match hash {
+        0 => match crate::dict_eq_hook::try_hash_str(key.as_bytes()) {
+            Some(hash) => {
+                crate::dict_eq_hook::take_eq_error();
+                hash
+            }
+            None => return object_key_for(obj),
+        },
+        memoized => memoized,
+    };
+    unsafe { crate::unicodeobject::w_str_set_hash(obj, hash) };
+    ObjectKey { hash, obj }
 }
 
 /// Fallible variant of [`object_key_for`].  When the `hash_w` hook
@@ -7166,7 +7175,7 @@ impl DictStrategy for UnicodeDictStrategy {
                 // Mint before reading either slot: call arguments evaluate left
                 // to right, so a slot read written inline with the mint would be
                 // taken before the collection that invalidates it.
-                let stored_key = object_key_for_new_str(key);
+                let stored_key = object_key_for_new_str(key, hash);
                 let w_value = roots.get(value_slot);
                 let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
                 let entries =
