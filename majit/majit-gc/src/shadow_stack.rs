@@ -899,9 +899,10 @@ pub fn jf_depth() -> usize {
 /// the first minor collection after a thread switch
 /// (`can_look_at_partial_stack`, `shadowstack.py:112-126`) and whenever the
 /// nursery holds objects pinned before the previous minor collection
-/// (`any_pinned_object_from_earlier`, `incminimark.py:1996-2006`). Neither
-/// condition has a counterpart here — `Collector::pinned_objects` does not
-/// distinguish pins carried over from an earlier cycle.
+/// (`IncrementalMiniMarkGC.collect_roots_in_nursery`'s
+/// `any_pinned_object_from_earlier`). The collector now keeps that state with
+/// the pin headers, but this split stack still conservatively ignores every
+/// stopper until interpreter and jitframe roots share one ordered stack.
 ///
 /// The marker is still written, by every backend, because the two-word entry
 /// is the layout the merge converges on; `test_jf_flat_array_layout` is what

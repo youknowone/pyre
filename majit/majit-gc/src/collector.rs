@@ -6,7 +6,6 @@
 /// - Write barrier with remembered set for old-to-young pointers
 ///
 /// Modeled after incminimark's minor/major collection.
-use indexmap::IndexSet;
 use majit_ir::GcRef;
 use std::collections::VecDeque;
 use std::sync::RwLock;
@@ -1042,12 +1041,19 @@ pub struct MiniMarkGC {
     /// traces at least twice this many bytes so a high-survival nursery cannot
     /// make the gray frontier grow faster than it is consumed.
     nursery_surviving_size: usize,
-    /// Pinned nursery objects that must not be moved during minor collection.
-    pinned_objects: IndexSet<usize>,
-    /// incminimark.py:426-440 pin-liveness state. Each minor collection
-    /// rebuilds `surviving_pinned_objects` from actual traced edges; old
-    /// parents found along those edges are revisited by the next minor.
-    surviving_pinned_objects: IndexSet<usize>,
+    /// `IncrementalMiniMarkGC.setup`: sorted addresses of pinned-object
+    /// headers, followed by the nursery end.  The current header is held in
+    /// `nursery_top`; `collect_and_reserve` consumes this deque to enter the
+    /// next free gap without collecting.
+    nursery_barriers: VecDeque<usize>,
+    /// `IncrementalMiniMarkGC._minor_collection`: AddressStack of header
+    /// addresses for pinned objects reached by this minor.  VISITED on the
+    /// object header prevents duplicates, exactly as upstream does; pin state
+    /// itself also lives in the header, never in an address side table.
+    surviving_pinned_objects: Vec<usize>,
+    /// `IncrementalMiniMarkGC.any_pinned_object_kept`: whether the preceding
+    /// minor left at least one pinned object in the nursery.
+    any_pinned_object_kept: bool,
     old_objects_pointing_to_pinned: Vec<usize>,
     /// incminimark.py:311,430 `max_number_of_pinned_objects` and
     /// `pinned_objects_in_nursery`.
@@ -1189,8 +1195,9 @@ impl MiniMarkGC {
             bytes_made_old_since_cycle: 0,
             threshold_bytes_made_old: 0,
             nursery_surviving_size: 0,
-            pinned_objects: IndexSet::new(),
-            surviving_pinned_objects: IndexSet::new(),
+            nursery_barriers: VecDeque::new(),
+            surviving_pinned_objects: Vec::new(),
+            any_pinned_object_kept: false,
             old_objects_pointing_to_pinned: Vec::new(),
             max_number_of_pinned_objects,
             pinned_objects_in_nursery: 0,
@@ -1445,8 +1452,16 @@ impl MiniMarkGC {
             return self.alloc_in_oldgen_clear(type_id, total_size);
         }
 
-        // Nursery full: trigger minor collection and retry.
-        // minimark.py:1282 collect_and_reserve parity. Carry the triggering
+        // `IncrementalMiniMarkGC.collect_and_reserve`: a failed bump may have
+        // stopped at a pinned object rather than at the nursery end.  Consume
+        // the already-built barrier deque before deciding to collect.
+        let ptr = self.reserve_nursery_gap(total_size);
+        if !ptr.is_null() {
+            self.apply_debug_tiny_nursery();
+            return self.finish_nursery_object(ptr, type_id);
+        }
+
+        // Nursery full: trigger minor collection and retry. Carry the triggering
         // allocation size so a bounded major collection applies the
         // PYPY_GC_MAX out-of-memory policy against it (threshold_reached).
         self.pending_reserving_size = total_size;
@@ -1598,6 +1613,15 @@ impl MiniMarkGC {
         if total_size > self.config.large_object_threshold {
             unsafe { *needs_write_barrier = true };
             return self.alloc_in_oldgen_clear(type_id, total_size);
+        }
+
+        // `IncrementalMiniMarkGC.collect_and_reserve`: crossing a pinned
+        // barrier does not collect, so the exceptional native-stack root does
+        // not need registering for this branch.
+        let ptr = self.reserve_nursery_gap(total_size);
+        if !ptr.is_null() {
+            self.apply_debug_tiny_nursery();
+            return self.finish_nursery_object(ptr, type_id);
         }
 
         self.pending_reserving_size = total_size;
@@ -1762,41 +1786,34 @@ impl MiniMarkGC {
     }
 
     fn reserve_nursery_gap(&mut self, total_size: usize) -> *mut u8 {
-        if self.pinned_objects.is_empty() {
-            return std::ptr::null_mut();
-        }
-
-        let aligned_size = Self::nursery_allocation_size(total_size);
-        let nursery_start = self.nursery.start_ptr() as usize;
-        let nursery_end = nursery_start + self.nursery.size();
-        let mut barriers = Vec::with_capacity(self.pinned_objects.len());
-        for &obj_addr in &self.pinned_objects {
-            let type_id = unsafe { (*header_of(obj_addr)).type_id() };
-            let payload_size = self.size_for_typeid(obj_addr, type_id, "pinned_barriers");
+        // `IncrementalMiniMarkGC.collect_and_reserve`: `nursery_top` is the
+        // pinned header immediately in front of the failed bump, and the deque
+        // contains the following pinned headers plus the nursery end.  Jump
+        // over one object at a time and try the next gap.  There is deliberately
+        // no pin lookup or barrier reconstruction on this path.
+        while let Some(next_top) = self.nursery_barriers.pop_front() {
+            let pinned_header = self.nursery.top_ptr() as usize;
+            let pinned_obj = pinned_header + GcHeader::SIZE;
+            debug_assert!(self.nursery.contains(pinned_obj));
+            // The object may have been unpinned since the minor built this
+            // deque. Upstream still consumes the stale barrier until the next
+            // minor; skipping its bytes is harmless and avoids rebuilding the
+            // deque on `unpin`.
+            let type_id = unsafe { (*header_of(pinned_obj)).type_id() };
+            let payload_size = self.size_for_typeid(pinned_obj, type_id, "pinned_barriers");
             let object_size = Self::nursery_allocation_size(GcHeader::SIZE + payload_size);
-            barriers.push((obj_addr - GcHeader::SIZE, object_size));
-        }
-        barriers.sort_unstable_by_key(|&(header_start, _)| header_start);
-
-        let mut gap_start = nursery_start;
-        for (header_start, object_size) in barriers {
-            if header_start.saturating_sub(gap_start) >= aligned_size {
-                unsafe {
-                    self.nursery.set_free_ptr(gap_start as *mut u8);
-                    self.nursery.set_top_ptr(header_start as *const u8);
-                }
-                self.refresh_published_nursery_top();
-                return self.nursery.alloc(total_size);
-            }
-            gap_start = gap_start.max(header_start.saturating_add(object_size));
-        }
-        if nursery_end.saturating_sub(gap_start) >= aligned_size {
+            let next_free = pinned_header + object_size;
             unsafe {
-                self.nursery.set_free_ptr(gap_start as *mut u8);
-                self.nursery.set_top_ptr(nursery_end as *const u8);
+                // Set the wider bound first so Nursery's pointer invariant is
+                // maintained while free crosses the old (pinned) top.
+                self.nursery.set_top_ptr(next_top as *const u8);
+                self.nursery.set_free_ptr(next_free as *mut u8);
             }
             self.refresh_published_nursery_top();
-            return self.nursery.alloc(total_size);
+            let ptr = self.nursery.alloc(total_size);
+            if !ptr.is_null() {
+                return ptr;
+            }
         }
         std::ptr::null_mut()
     }
@@ -2036,7 +2053,7 @@ impl MiniMarkGC {
                 if value == 0 {
                     return;
                 }
-                if self.nursery.contains(value) && !self.pinned_objects.contains(&value) {
+                if self.nursery.contains(value) && !self.is_pinned(GcRef(value)) {
                     stale.push((here, slot as usize - here, value, parent));
                     return;
                 }
@@ -2097,7 +2114,7 @@ impl MiniMarkGC {
                     && !remembered
                     && !parent_remembered
                     && self.nursery.contains(value)
-                    && !self.pinned_objects.contains(&value);
+                    && !self.is_pinned(GcRef(value));
                 if bad_target || unbarriered {
                     let tid = unsafe { (*header_of(here)).type_id() };
                     let parent_tid = parent.map(|p| unsafe { (*header_of(p)).type_id() });
@@ -2499,6 +2516,10 @@ impl MiniMarkGC {
         }
         self.minor_collections += 1;
         self.bh_probe_check_barriers_before_minor();
+        // `IncrementalMiniMarkGC._minor_collection`: barriers describe the
+        // allocation gaps from the preceding minor and are rebuilt from the
+        // live pinned objects found by this one.
+        self.nursery_barriers.clear();
         // `bytes_made_old_since_cycle` is the running sum of every
         // `copy_nursery_object` payload, so its delta across this collection is
         // exactly what was promoted out of the nursery. The major-collection
@@ -2508,10 +2529,15 @@ impl MiniMarkGC {
         // incminimark.py:1816: this is the survivor count for this minor only;
         // every promotion below adds its allocator-sized object extent.
         self.nursery_surviving_size = 0;
-        // incminimark.py:1779-1785: pinning does not keep an object alive.
-        // Rebuild both the survivor set and count from traced edges below.
+        // `IncrementalMiniMarkGC._minor_collection`: pinning does not keep an
+        // object alive. Rebuild the AddressStack and count from traced edges.
+        // pyre currently walks the complete root stacks on every minor, so the
+        // saved stopper decision is conservatively unused; keep the state with
+        // the collector, where upstream owns it.
+        let _any_pinned_object_from_earlier = self.any_pinned_object_kept;
         self.surviving_pinned_objects.clear();
         self.pinned_objects_in_nursery = 0;
+        self.any_pinned_object_kept = false;
         // incminimark.py:1800-1807: a black old parent may expose an unpinned
         // child that will move during this minor, so make the parent gray
         // again before the active major marking cycle can sweep that child.
@@ -2776,21 +2802,23 @@ impl MiniMarkGC {
         // the next allocation, which would then answer to the dead owner's
         // entry.  Ask the same survival question `invalidate_young_weakrefs`
         // just answered, while the forwarding headers still read.
-        // The trace above rebuilt the live pin set in
-        // `surviving_pinned_objects`; `pinned_objects` is the previous
-        // collection's snapshot until the swap below.  A pin that died this
-        // cycle must not keep an address-keyed owner table entry alive.
-        let pinned = &self.surviving_pinned_objects;
+        // The trace above marked each live pin VISITED and appended its header
+        // to `surviving_pinned_objects`. A pin that died this cycle must not
+        // keep an address-keyed owner table entry alive.
         let nursery = &self.nursery;
         let mut classify_young_owner = |owner: usize| -> Option<usize> {
             if owner == 0 || !nursery.contains(owner) {
                 return Some(owner);
             }
             // A pinned object is alive and stayed put, so it never forwarded.
-            if pinned.contains(&owner) {
+            let hdr = (owner - GcHeader::SIZE) as *const GcHeader;
+            if unsafe {
+                !(*hdr).is_forwarded()
+                    && (*hdr).has_flag(flags::PINNED)
+                    && (*hdr).has_flag(flags::VISITED)
+            } {
                 return Some(owner);
             }
-            let hdr = (owner - GcHeader::SIZE) as *const GcHeader;
             if unsafe { (*hdr).is_forwarded() } {
                 Some(unsafe { GcHeader::forwarding_address(hdr) })
             } else {
@@ -2799,45 +2827,32 @@ impl MiniMarkGC {
         };
         crate::shadow_stack::reconcile_young_owner_tables(&mut classify_young_owner);
 
-        // incminimark.py:1876-1882,1900-1944: replace the pin set with exactly
-        // the objects reached this collection, then preserve identity shadows
-        // and nursery barriers only for those survivors. Clear their temporary
-        // VISITED bit while the addresses are still valid.
-        self.pinned_objects = std::mem::take(&mut self.surviving_pinned_objects);
-        debug_assert_eq!(self.pinned_objects_in_nursery, self.pinned_objects.len());
-        for &obj_addr in &self.pinned_objects {
-            unsafe { (*header_of(obj_addr)).clear_flag(flags::VISITED) };
-        }
-
-        // Clear this mapping now that every unpinned nursery object was
-        // forwarded (or died). Upstream rebuilds it from the same surviving
-        // pinned collection via `record_pinned_object_with_shadow`.
+        // `IncrementalMiniMarkGC.record_pinned_object_with_shadow`: clear this
+        // mapping now that every unpinned nursery object was forwarded (or
+        // died), rebuilding it only from the surviving-pin AddressStack.
         // A pinned object's shadow is its stable identity address and MUST
         // survive the clear, else the next `id_or_identityhash`
         // re-allocates a fresh shadow and the identity hash changes.
         if !self.nursery_objects_shadows.is_empty() {
-            if self.pinned_objects.is_empty() {
+            if self.surviving_pinned_objects.is_empty() {
                 self.nursery_objects_shadows.clear();
             } else {
-                let pinned = &self.pinned_objects;
+                let mut new_shadows = AddressMap::default();
                 let marking = self.gc_state == GcState::Marking;
-                self.nursery_objects_shadows
-                    .retain(|obj_addr, shadow_addr| {
-                        let keep = pinned.contains(obj_addr);
-                        if keep && marking {
-                            // incminimark.py:1738-1752
-                            // record_pinned_object_with_shadow: during the
-                            // marking phase keep the retained shadow black so
-                            // the in-progress sweep does not reclaim the
-                            // pinned object's reserved identity address.  Safe
-                            // because pinned objects hold no gcptrs, so the
-                            // shadow needs no further tracing.
-                            unsafe {
-                                (*header_of(*shadow_addr)).set_flag(flags::VISITED);
-                            }
-                        }
-                        keep
-                    });
+                for &header_addr in &self.surviving_pinned_objects {
+                    let obj_addr = header_addr + GcHeader::SIZE;
+                    let Some(&shadow_addr) = self.nursery_objects_shadows.get(&obj_addr) else {
+                        continue;
+                    };
+                    if marking {
+                        // Safe because `pin` rejects types carrying GC
+                        // pointers, as `record_pinned_object_with_shadow`
+                        // requires before keeping the shadow black.
+                        unsafe { (*header_of(shadow_addr)).set_flag(flags::VISITED) };
+                    }
+                    new_shadows.insert(obj_addr, shadow_addr);
+                }
+                self.nursery_objects_shadows = new_shadows;
             }
         }
 
@@ -2854,18 +2869,15 @@ impl MiniMarkGC {
                 used_before,
                 self.bytes_made_old_since_cycle
                     .saturating_sub(promoted_before),
-                self.pinned_objects.len(),
+                self.surviving_pinned_objects.len(),
                 self.nursery.size(),
             );
         }
         self.bh_probe_check_no_young_refs();
 
-        // Reset nursery for new allocations, preserving pinned objects.
-        if self.pinned_objects.is_empty() {
-            self.nursery.reset();
-        } else {
-            self.reset_nursery_with_pinned();
-        }
+        // `IncrementalMiniMarkGC._minor_collection`: reset only free gaps,
+        // clear survivor VISITED bits, and build the sorted barrier deque.
+        self.reset_nursery_with_pinned();
         // incminimark.py:1949-1951: the PINNED bit is reused on old objects as
         // PINNED_OBJECT_PARENT_KNOWN only within one minor collection.
         for &obj_addr in &self.old_objects_pointing_to_pinned {
@@ -3120,9 +3132,17 @@ impl MiniMarkGC {
     /// Whether a minor has decided `obj` lives.
     ///
     /// Only a nursery object can die here, and it is exactly
-    /// [`Self::_rrc_minor_free`]'s test — read before the pin sets are
-    /// swapped, so this collection's survivors are the ones still being
-    /// collected into.
+    /// [`Self::_rrc_minor_free`]'s test — read before survivor VISITED bits are
+    /// cleared, so the header identifies this collection's surviving pins.
+    #[inline]
+    fn is_surviving_pinned(&self, obj: usize) -> bool {
+        if !self.is_nursery_object_start(obj) {
+            return false;
+        }
+        let hdr = unsafe { &*header_of(obj) };
+        !hdr.is_forwarded() && hdr.has_flag(flags::PINNED) && hdr.has_flag(flags::VISITED)
+    }
+
     fn rrc_young_object_alive(&self, obj: usize) -> bool {
         if obj == 0 {
             return false;
@@ -3130,7 +3150,7 @@ impl MiniMarkGC {
         if !self.is_nursery_object_start(obj) {
             return true;
         }
-        if self.surviving_pinned_objects.contains(&obj) {
+        if self.is_surviving_pinned(obj) {
             return true;
         }
         unsafe { (*header_of(obj)).is_forwarded() }
@@ -3336,7 +3356,7 @@ impl MiniMarkGC {
                 }
                 RrcList::O => self.rrc.o_list_old.push(pyobject),
             }
-        } else if self.pinned_objects.contains(&obj) {
+        } else if self.is_surviving_pinned(obj) {
             // A pinned object that was reached survives *in place*
             // (`copy_nursery_object` records it and returns the same address),
             // so there is no forwarding pointer and the link already names its
@@ -3348,9 +3368,8 @@ impl MiniMarkGC {
             // type carrying GC pointers, which is why the combination is rare
             // rather than impossible: a pinned byte buffer with a mirror is
             // exactly what `PyBytes_AsString` over a pinned buffer produces.
-            // `pinned_objects` holds this collection's survivors by this point
-            // (it was swapped from `surviving_pinned_objects` above), so an
-            // unreached pinned object still falls through to the free below.
+            // VISITED is still set on this collection's surviving pins here,
+            // so an unreached pinned object still falls through to the free.
             if list == RrcList::P {
                 self.rrc.p_dict_nurs.insert(obj, pyobject);
             }
@@ -3755,10 +3774,22 @@ impl MiniMarkGC {
         holder_addr: usize,
         slot_addr: usize,
     ) -> GcRef {
-        // incminimark.py:2188-2210: a pinned object stays in the nursery, but
-        // pinning is not a root. Record it only when a real traced edge reaches
-        // it, and remember an old parent so that edge is revisited next minor.
-        if self.pinned_objects.contains(&obj_addr) {
+        // Keep the header access as a raw pointer rather than `&mut GcHeader`.
+        // The later `alloc_and_copy` performs a raw read over this same byte
+        // range, so re-materialize references only for scoped accesses.
+        let hdr_ptr = (obj_addr - GcHeader::SIZE) as *mut GcHeader;
+
+        // `_trace_drag_out` tests forwarding before PINNED: the forwarding
+        // marker has every flag bit set and must not be mistaken for a pin.
+        if unsafe { (*hdr_ptr).is_forwarded() } {
+            let fwd_addr = unsafe { GcHeader::forwarding_address(hdr_ptr) };
+            return GcRef(fwd_addr);
+        }
+
+        // `IncrementalMiniMarkGC._trace_drag_out`: pin state lives on the
+        // object header. Pinning is not a root; append the header address to
+        // the survivor AddressStack only when a real traced edge reaches it.
+        if unsafe { (*hdr_ptr).has_flag(flags::PINNED) } {
             // incminimark.py:2194-2199 records an old parent. The list outlives
             // the nursery reset at the end of this minor and is dereferenced in
             // the next one, so a nursery holder would become a read of recycled
@@ -3773,24 +3804,15 @@ impl MiniMarkGC {
                     unsafe { (*holder_hdr).set_flag(flags::PINNED) };
                 }
             }
-            if self.surviving_pinned_objects.insert(obj_addr) {
-                unsafe { (*header_of(obj_addr)).set_flag(flags::VISITED) };
-                self.pinned_objects_in_nursery += 1;
+            if unsafe { (*hdr_ptr).has_flag(flags::VISITED) } {
+                return GcRef(obj_addr);
             }
+            unsafe { (*hdr_ptr).set_flag(flags::VISITED) };
+            self.surviving_pinned_objects
+                .push(obj_addr - GcHeader::SIZE);
+            self.pinned_objects_in_nursery += 1;
+            self.any_pinned_object_kept = true;
             return GcRef(obj_addr);
-        }
-
-        // Keep the header access as a raw pointer rather than `&mut GcHeader`.
-        // The subsequent `alloc_and_copy` performs a raw read over this same
-        // byte range, which would invalidate a long-lived `&mut` under Rust's
-        // aliasing rules; re-materialize the reference only for each scoped
-        // read/write.
-        let hdr_ptr = (obj_addr - GcHeader::SIZE) as *mut GcHeader;
-
-        // Already forwarded?
-        if unsafe { (*hdr_ptr).is_forwarded() } {
-            let fwd_addr = unsafe { GcHeader::forwarding_address(hdr_ptr) };
-            return GcRef(fwd_addr);
         }
 
         let type_id = unsafe { (*hdr_ptr).type_id() };
@@ -4016,13 +4038,13 @@ impl MiniMarkGC {
             *gcref =
                 self.copy_nursery_object(gcref.0, "minor_root_target", "minor_root", 0, slot_addr);
         }
-        let pinned = self.pinned_objects.contains(&gcref.0);
-        // incminimark.py:2140-2143: append iff (VISITED | PINNED) == 0. pyre's
-        // marking convention sets VISITED at push time (see `seed_major_root`
-        // / `mark_object`), so set it here rather than at pop.
-        if self.gc_state == GcState::Marking && !pinned && self.is_managed_heap_object(gcref.0) {
+        // `_trace_drag_out1_marking_phase`: inspect the live object's header
+        // only while major marking is active, and append iff neither VISITED
+        // nor PINNED is set.  In particular, the common scanning-state root
+        // walk performs no address-table lookup at all.
+        if self.gc_state == GcState::Marking && self.is_managed_heap_object(gcref.0) {
             let hdr = unsafe { header_of(gcref.0) };
-            if unsafe { !(*hdr).has_flag(flags::VISITED) } {
+            if unsafe { !(*hdr).has_flag(flags::VISITED) && !(*hdr).has_flag(flags::PINNED) } {
                 unsafe { (*hdr).set_flag(flags::VISITED) };
                 self.incr_state.more_gray_stack.push(gcref.0);
                 self.note_nonmoving_nursery_mark(gcref.0);
@@ -4750,12 +4772,12 @@ impl MiniMarkGC {
         self.next_major_collection_threshold -=
             (size as f64) + (2 * std::mem::size_of::<usize>()) as f64;
         if self.next_major_collection_threshold < 0.0 {
-            // incminimark.py:1107-1110: make the next nursery allocation take
-            // collect_and_reserve. Both the runtime and JIT read these same
-            // published free/top words.
-            let free = self.nursery.free_ptr();
-            unsafe { self.nursery.set_top_ptr(free.cast_const()) };
-            self.refresh_published_nursery_top();
+            // `IncrementalMiniMarkGC.raw_malloc_memory_pressure`: make the
+            // next nursery allocation take `collect_and_reserve` by advancing
+            // free to top.  The direction matters when top is a pinned-object
+            // barrier: moving top backwards would discard that barrier.
+            let top = self.nursery.top_ptr();
+            unsafe { self.nursery.set_free_ptr(top.cast_mut()) };
         }
     }
 
@@ -6642,56 +6664,49 @@ impl MiniMarkGC {
         true
     }
 
-    /// Reset the nursery while preserving pinned objects.
+    /// `IncrementalMiniMarkGC._minor_collection` nursery-barrier rebuild.
     ///
-    /// Saves pinned object data, zeroes the nursery, restores pinned objects,
-    /// and sets the free pointer past the highest pinned object.
+    /// The surviving AddressStack contains header addresses. Sort it, reset
+    /// only the free ranges between those headers, and leave `nursery_top` at
+    /// the first pin while the deque owns the remaining pins plus nursery end.
     fn reset_nursery_with_pinned(&mut self) {
         let nursery_start = self.nursery.start_ptr() as usize;
         let nursery_end = nursery_start + self.nursery.size();
+        let mut surviving_pinned_objects = std::mem::take(&mut self.surviving_pinned_objects);
+        surviving_pinned_objects.sort_unstable();
+        debug_assert_eq!(
+            self.pinned_objects_in_nursery,
+            surviving_pinned_objects.len()
+        );
 
-        // Collect (header_start, total_size, data) for each pinned object.
-        let mut saved: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-        for &obj_addr in &self.pinned_objects {
+        let mut barriers = VecDeque::with_capacity(surviving_pinned_objects.len() + 1);
+        let mut previous_end = nursery_start;
+        for header_addr in surviving_pinned_objects {
+            assert!(
+                header_addr >= previous_end,
+                "pinned objects encountered in backwards order"
+            );
+            self.nursery.reset_range(previous_end, header_addr);
+
+            let obj_addr = header_addr + GcHeader::SIZE;
             let type_id = unsafe { (*header_of(obj_addr)).type_id() };
-            let payload_size = self.size_for_typeid(obj_addr, type_id, "pinned_snapshot");
-            let total_size = (GcHeader::SIZE + payload_size).max(GcHeader::MIN_NURSERY_OBJ_SIZE);
-            let total_size = (total_size + 7) & !7;
-            let header_start = obj_addr - GcHeader::SIZE;
-            let data = unsafe {
-                std::slice::from_raw_parts(header_start as *const u8, total_size).to_vec()
-            };
-            saved.push((header_start, total_size, data));
+            let payload_size = self.size_for_typeid(obj_addr, type_id, "pinned_barriers");
+            let object_size = Self::nursery_allocation_size(GcHeader::SIZE + payload_size);
+            unsafe { (*header_of(obj_addr)).clear_flag(flags::VISITED) };
+            barriers.push_back(header_addr);
+            previous_end = header_addr + object_size;
         }
+        self.nursery.reset_range(previous_end, nursery_end);
+        barriers.push_back(nursery_end);
+        self.nursery_barriers = barriers;
 
-        // Rebuild the barrier range from the whole arena. A preceding
-        // `reserve_nursery_gap` may have shortened `nursery_top` to the next
-        // pinned object, exactly as upstream does while consuming one gap.
+        let first_top = self
+            .nursery_barriers
+            .pop_front()
+            .expect("nursery end is always a barrier");
         unsafe {
-            self.nursery.set_top_ptr(nursery_end as *const u8);
-        }
-
-        // Zero-fill the entire nursery.
-        self.nursery.reset();
-
-        // Restore pinned objects and compute the highest end.
-        let mut max_end = nursery_start;
-        for (header_start, total_size, data) in &saved {
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), *header_start as *mut u8, *total_size);
-            }
-            let end = header_start + total_size;
-            if end > max_end {
-                max_end = end;
-            }
-        }
-
-        // Set free pointer past the highest pinned object so new allocations
-        // don't overwrite it.
-        if max_end > nursery_start {
-            unsafe {
-                self.nursery.set_free_ptr(max_end as *mut u8);
-            }
+            self.nursery.set_top_ptr(first_top as *const u8);
+            self.nursery.set_free_ptr(nursery_start as *mut u8);
         }
     }
 
@@ -6724,7 +6739,6 @@ impl MiniMarkGC {
         unsafe {
             (*header_of(obj.0)).set_flag(flags::PINNED);
         }
-        self.pinned_objects.insert(obj.0);
         self.pinned_objects_in_nursery += 1;
         true
     }
@@ -6735,13 +6749,16 @@ impl MiniMarkGC {
         unsafe {
             (*header_of(obj.0)).clear_flag(flags::PINNED);
         }
-        self.pinned_objects.swap_remove(&obj.0);
         self.pinned_objects_in_nursery -= 1;
     }
 
     /// Check if an object is currently pinned.
     pub fn is_pinned(&self, obj: GcRef) -> bool {
-        self.pinned_objects.contains(&obj.0)
+        if obj.is_null() || !self.is_in_nursery(obj.0) {
+            return false;
+        }
+        let hdr = unsafe { &*header_of(obj.0) };
+        !hdr.is_forwarded() && hdr.has_flag(flags::PINNED)
     }
 
     /// Free memory associated with invalidated JIT compiled code.
@@ -7694,12 +7711,12 @@ mod tests {
         // Upstream forces the next nursery slow path once pressure drives the
         // threshold below zero.
         gc.next_major_collection_threshold = 0.0;
-        let free = gc.nursery.free_ptr();
+        let top = gc.nursery.top_ptr();
         gc.do_add_memory_pressure(1, GcRef::NULL);
-        assert_eq!(gc.nursery.top_ptr(), free.cast_const());
+        assert_eq!(gc.nursery.free_ptr().cast_const(), top);
         assert_eq!(
             gc.published_nursery_top.load(Ordering::Acquire),
-            free as usize
+            top as usize
         );
         gc.roots.clear();
     }
@@ -8133,6 +8150,43 @@ mod tests {
         assert!(gc.is_in_nursery(result.0));
         assert!(result.0 < pinned.0);
         assert!(!needs_write_barrier);
+        gc.roots.clear();
+    }
+
+    #[test]
+    fn collect_and_reserve_consumes_minor_built_barriers_in_order() {
+        let mut gc = test_gc(2048);
+        gc.max_number_of_pinned_objects = 2;
+        let pinned_tid = gc.register_type(TypeInfo::simple(440));
+        let result_tid = gc.register_type(TypeInfo::simple(400));
+        let _dead_prefix = gc.alloc_with_type(pinned_tid, 440);
+        let mut first_pin = gc.alloc_with_type(pinned_tid, 440);
+        let _dead_middle = gc.alloc_with_type(pinned_tid, 440);
+        let mut second_pin = gc.alloc_with_type(pinned_tid, 440);
+        assert!(gc.pin(first_pin));
+        assert!(gc.pin(second_pin));
+        unsafe {
+            gc.roots.add(&mut first_pin);
+            gc.roots.add(&mut second_pin);
+        }
+
+        // The tail cannot satisfy this request, so one minor rebuilds barriers
+        // and serves the free prefix before the first pin.
+        let before = gc.minor_collections;
+        let prefix = gc.alloc_with_type(result_tid, 400);
+        assert_eq!(gc.minor_collections, before + 1);
+        assert!(prefix.0 < first_pin.0);
+
+        // `unpin` does not rebuild `nursery_barriers`. Just like upstream,
+        // collect_and_reserve consumes that now-stale first barrier, skips the
+        // intact object bytes, and enters the gap before the second pin without
+        // running another minor collection.
+        gc.unpin(first_pin);
+        let between = gc.alloc_with_type(result_tid, 400);
+        assert_eq!(gc.minor_collections, before + 1);
+        assert!(between.0 > first_pin.0);
+        assert!(between.0 < second_pin.0);
+
         gc.roots.clear();
     }
 
@@ -11379,8 +11433,12 @@ cache size\t: 8192 kB\n";
         // incminimark.py:1777-1785: the survivor stack is populated only by
         // traced references. With no such reference, the pinned object dies.
         gc.do_collect_nursery();
-        assert!(!gc.is_pinned(obj));
+        // `obj` is now a dangling GC address. Upstream's mode-0 arena reset
+        // deliberately leaves recycled bytes untouched, so asking `_is_pinned`
+        // about that dead address has no defined answer; the live-pin counter
+        // and absence of a barrier are the observable collector state.
         assert_eq!(gc.pinned_objects_in_nursery, 0);
+        assert!(gc.nursery_barriers.is_empty());
     }
 
     #[test]
@@ -11412,8 +11470,10 @@ cache size\t: 8192 kB\n";
         // child and pinning alone no longer preserves it.
         unsafe { *(parent.0 as *mut GcRef) = GcRef::NULL };
         gc.do_collect_nursery();
-        assert!(!gc.is_pinned(child));
+        // `child` is no longer a valid GC reference; mode-0 arena reset does
+        // not promise to rewrite its stale header bytes.
         assert_eq!(gc.pinned_objects_in_nursery, 0);
+        assert!(gc.nursery_barriers.is_empty());
         assert!(gc.old_objects_pointing_to_pinned.is_empty());
         gc.roots.clear();
     }

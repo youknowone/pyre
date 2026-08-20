@@ -135,19 +135,36 @@ impl Nursery {
     /// be zero-filled.  Delete this target branch once wasm runs the rewrite
     /// or its inline allocation paths explicitly initialize GC fields.
     pub fn reset(&mut self) {
+        self.reset_range(self.start as usize, self.start as usize + self.size);
+        self.ptrs.free = self.start;
+    }
+
+    /// Reset one free range while leaving pinned-object bytes intact.
+    ///
+    /// `IncrementalMiniMarkGC._minor_collection` calls `arena_reset` once for
+    /// every gap between surviving pinned objects.  Keeping the range operation
+    /// here gives wasm the same zero-fill adaptation as [`Self::reset`] without
+    /// destroying the pinned objects that delimit those gaps.
+    pub fn reset_range(&mut self, start: usize, end: usize) {
+        debug_assert!(start >= self.start as usize);
+        debug_assert!(start <= end);
+        debug_assert!(end <= self.start as usize + self.size);
+        let len = end - start;
+        if len == 0 {
+            return;
+        }
         #[cfg(target_arch = "wasm32")]
         unsafe {
-            ptr::write_bytes(self.start, 0, self.size);
+            ptr::write_bytes(start as *mut u8, 0, len);
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
             if self.poison_on_reset {
                 unsafe {
-                    ptr::write_bytes(self.start, 0xAA, self.size);
+                    ptr::write_bytes(start as *mut u8, 0xAA, len);
                 }
             }
         }
-        self.ptrs.free = self.start;
     }
 
     /// incminimark.py:676: current nursery_free.
