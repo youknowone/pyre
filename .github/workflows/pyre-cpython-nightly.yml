@@ -2,10 +2,13 @@ name: pyre CPython suite (nightly)
 
 # Non-gating exploratory run of the FULL CPython regression suite (every
 # module, including ones that fail today) across three lanes:
-#   * dynasm, JIT on   — the gating backend, full picture
+#   * dynasm, JIT on   — the gating backend, full picture.  DAILY.
 #   * dynasm, JIT off  — interpreter baseline; a module that passes here but
-#     not under JIT is a JIT correctness divergence
-#   * cranelift, JIT on
+#     not under JIT is a JIT correctness divergence.  WEEKLY.
+#   * cranelift, JIT on.  WEEKLY.
+# Only the first runs every night: it is the one that answers whether a
+# recorded verdict has gone stale, and 434 modules three times a day buys
+# little the week does not.  A manual dispatch runs all three.
 # Reports are uploaded as artifacts so coverage growth and JIT divergence can
 # be tracked over time. This never gates a PR: `--full` reports a regression
 # against the baseline instead of failing on it. It is not the same as always
@@ -15,7 +18,14 @@ name: pyre CPython suite (nightly)
 
 on:
   schedule:
-    - cron: "0 7 * * *"  # 07:00 UTC daily
+    # Daily, the gating configuration alone. That one lane is what answers
+    # "has a recorded verdict gone stale", which is the question the
+    # non-`PASS` rows can only be asked here.
+    - cron: "0 7 * * *"
+    # Weekly, all three. The JIT-divergence comparison and the cranelift
+    # picture are worth a full run, not worth 434 modules three times every
+    # night.
+    - cron: "0 8 * * 0"
   workflow_dispatch:
 
 concurrency:
@@ -36,12 +46,14 @@ jobs:
     # calls TIMEOUT under a tighter budget than the baseline was recorded with
     # is not a finding about the module.
     runs-on: ubuntu-24.04
-    # Three full 434-module lanes, plus the LLBC extract and both backend
-    # builds ahead of them, do not fit the 120 this job carried before: over
-    # the eight nights preceding this change not one run finished all three
-    # lanes -- three were cut off inside the cranelift lane, three inside the
-    # lane before it, and two never got past the first.
-    timeout-minutes: 330
+    # A ceiling, not a cost: the daily run is one lane and ends well inside
+    # it. It has to cover the weekly worst case -- the LLBC extract, both
+    # backend builds, and three full 434-module lanes -- because the 120 this
+    # job carried before covered none of it. Over the eight nights preceding
+    # this change not one run finished all three lanes: three were cut off
+    # inside the cranelift lane, three inside the lane before it, and two
+    # never got past the first.
+    timeout-minutes: 300
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
@@ -103,15 +115,22 @@ jobs:
         cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift
     - name: dynasm (JIT on)
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --jobs 3 --timeout 300 --report reports/dynasm-jit.json
-    # A lane exits nonzero on more than a regression -- `--full` gates none of
-    # those, but a summary short of the modules it selected still returns 1 --
-    # and without this the JIT-divergence comparison these three lanes exist to
-    # produce is lost to whichever lane happened to run first.
+    # These two run on the weekly schedule and on a manual dispatch, not every
+    # night. The condition names the DAILY cron and excludes it, rather than
+    # naming the weekly one and requiring it: a dispatch has no
+    # `github.event.schedule` at all, so a positive test would skip these on
+    # exactly the run a human asked for -- and would do it silently.
+    #
+    # `!cancelled()` rather than `success()` is the other half: a lane exits
+    # nonzero on more than a regression -- `--full` gates none of those, but a
+    # summary short of the modules it selected still returns 1 -- and without
+    # it the JIT-divergence comparison this pair exists to produce is lost to
+    # whichever lane happened to run first.
     - name: dynasm (JIT off)
-      if: ${{ !cancelled() }}
+      if: ${{ !cancelled() && github.event.schedule != '0 7 * * *' }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --no-jit --jobs 3 --timeout 300 --report reports/dynasm-nojit.json
     - name: cranelift (JIT on)
-      if: ${{ !cancelled() }}
+      if: ${{ !cancelled() && github.event.schedule != '0 7 * * *' }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend cranelift --jobs 3 --timeout 300 --report reports/cranelift-jit.json
     - name: Upload reports
       if: ${{ always() }}
