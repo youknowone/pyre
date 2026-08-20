@@ -3198,8 +3198,21 @@ impl TraceCtx {
     /// sub-walk records the load before its outer-frame input acquires a concrete
     /// resume value. `depth` bounds recursive field chains; unsupported
     /// producers, null objects, and exhausted depth return `None`.
+    ///
+    /// `GcRef::NO_CONCRETE` is the stamp for "no runtime value is known for
+    /// this box", not a value: `heapcache_ops` writes it over a load the walk
+    /// could not replay. Returning it hands the sentinel address on as if it
+    /// were an object — the caller-image ref fill in
+    /// `jitcode_dispatch/resume_snapshot.rs` and the innermost-frame fill in
+    /// `jitcode_dispatch/residual_call.rs` both write whatever `Value::Ref`
+    /// arrives here into a blackhole frame's ref bank, and resuming through
+    /// that frame dereferences it. Answer unresolved instead, so those sites
+    /// decline the image the way they already do for a color with no box.
     pub fn recover_ref_value(&self, opref: OpRef, depth: u32) -> Option<Value> {
         if let Some(v) = self.concrete_of_opref(opref) {
+            if matches!(v, Value::Ref(r) if r == majit_ir::GcRef::NO_CONCRETE) {
+                return None;
+            }
             return Some(v);
         }
         if depth == 0 {
@@ -3214,10 +3227,10 @@ impl TraceCtx {
         let Value::Ref(obj_ref) = self.recover_ref_value(obj, depth - 1)? else {
             return None;
         };
-        let obj_ptr = obj_ref.0 as i64;
-        if obj_ptr == 0 || obj_ptr == usize::MAX as i64 {
-            return None;
-        }
+        // The receiver is about to be loaded through, so it is judged by
+        // [`live_gc_ptr`] — the one place that names all three addresses no
+        // object model owns — rather than by a local copy of two of them.
+        let obj_ptr = live_gc_ptr(obj_ref)?;
         self.field_sanity_load(obj_ptr, &descr, Type::Ref)
     }
 
@@ -5532,6 +5545,32 @@ mod tests {
             }
             other => panic!("expected ConstFloat, got {:?}", other),
         }
+    }
+
+    /// `recover_ref_value` answers unresolved for a box stamped with the
+    /// `NO_CONCRETE` sentinel, and still answers a real address.
+    ///
+    /// The sentinel is what `heapcache_ops` writes over a load it could not
+    /// replay, so handing it back as a `Value::Ref` puts `usize::MAX - 1`
+    /// into every consumer that only matches on the variant — including the
+    /// two blackhole-frame ref fills, which then seed a frame that resumption
+    /// dereferences.
+    #[test]
+    fn recover_ref_value_rejects_the_no_concrete_sentinel() {
+        let mut ctx = TraceCtx::for_test(0);
+        let unknown = ctx.record_op(OpCode::NewWithVtable, &[]);
+        assert!(ctx.try_set_opref_concrete(unknown, Value::Ref(majit_ir::GcRef::NO_CONCRETE)));
+        assert_eq!(ctx.recover_ref_value(unknown, 8), None);
+
+        // Positive control: an ordinary stamped address still comes back, so
+        // the assertion above is about the sentinel and not about the stamp
+        // failing to land.
+        let known = ctx.record_op(OpCode::NewWithVtable, &[]);
+        assert!(ctx.try_set_opref_concrete(known, Value::Ref(majit_ir::GcRef(0x1000))));
+        assert_eq!(
+            ctx.recover_ref_value(known, 8),
+            Some(Value::Ref(majit_ir::GcRef(0x1000)))
+        );
     }
 
     /// With no cpu wired, `field_sanity_load` returns `None` —
