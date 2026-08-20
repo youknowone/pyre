@@ -3208,6 +3208,11 @@ fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::
     {
         return Some(w_value);
     }
+    // That lookup reaches a user `__getitem__` on a non-dict mapping, and a
+    // dict is one of the two kinds a minor collection relocates.  Re-read the
+    // globals off the code object, whose field the collector forwards, rather
+    // than reuse the pointer from before the call.
+    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
     let w_builtin = pyre_interpreter::baseobjspace::finditem_str(w_globals, "__builtins__")
         .ok()
         .flatten()?;

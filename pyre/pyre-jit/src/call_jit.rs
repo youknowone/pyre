@@ -4522,12 +4522,16 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     let w_globals = caller.w_globals;
     let execution_context = caller.execution_context;
 
+    // Read before the call: `alloc_callee_frame` resolves `__builtins__`, which
+    // can run a user `__getitem__` and so collect.  What this line reports is
+    // the operand the trace passed; `locals` below is the frame's own.
+    let passed_arg = boxed_arg as usize;
     let frame_ptr = alloc_callee_frame(func_code, &[boxed_arg], w_globals, execution_context);
     if majit_metainterp::majit_log_enabled() {
         let f = unsafe { &*frame_ptr };
         eprintln!(
-            "[jit][ca-frame] ptr={frame_ptr:p} locals=0x{:x} vsd={} boxed_arg=0x{:x}",
-            f.locals_cells_stack_w as usize, f.valuestackdepth, boxed_arg as usize,
+            "[jit][ca-frame] ptr={frame_ptr:p} locals=0x{:x} vsd={} boxed_arg=0x{passed_arg:x}",
+            f.locals_cells_stack_w as usize, f.valuestackdepth,
         );
     }
     frame_ptr as i64
@@ -5159,8 +5163,14 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         // The Python coordinate comes off the caller frame, which the dispatch
         // itself never resolves — force it here, inside the diagnostic, so an
         // unarmed run leaves the frame virtual.
-        let parent_frame_ptr = unsafe { (*ec).gettopframe_raw() as *const PyFrame };
+        // `descr_repr` fsdecodes the code filename, and a filename that fails
+        // to decode reaches a registered decode error handler — Python, and so
+        // a collection.  The next iteration reads the frame again, so hold it
+        // on the shadow stack and re-read rather than carry the pointer.
+        let frame_anchor =
+            unsafe { pyre_interpreter::eval::FrameAnchor::from_raw((*ec).gettopframe_raw()) };
         for i in 0..args.len() {
+            let parent_frame_ptr = frame_anchor.live();
             if !parent_frame_ptr.is_null()
                 && pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i).is_null()
             {
@@ -5413,7 +5423,13 @@ pub extern "C" fn bh_load_global_fn(
 
     let varname = code.names[idx].as_ref();
     let _ = namespace_ptr;
-    let parent_frame_ptr = frame_ptr as *const PyFrame;
+    // The builtins leg reads the frame again after the globals lookup, and
+    // `finditem_str` reaches a user `__getitem__` on a non-dict mapping.  A
+    // frame the JIT built lives in the nursery, so hold it on the shadow stack
+    // and re-read at each use instead of carrying the operand across.
+    let frame_anchor =
+        unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame_ptr as *mut PyFrame) };
+    let parent_frame_ptr = frame_anchor.live();
     // pypy/interpreter/pyopcode.py:958-969 `_load_global`:
     //   w_value = self.space.finditem_str(self.get_w_globals_storage(), varname)
     //   if w_value is None:
@@ -5458,6 +5474,7 @@ pub extern "C" fn bh_load_global_fn(
     // Residual helper adaptation: `self` is the live portal frame passed as
     // an explicit Ref argument, so `self.get_builtin()` maps to
     // PyFrame::get_builtin() without relying on blackhole-only TLS.
+    let parent_frame_ptr = frame_anchor.live();
     if !parent_frame_ptr.is_null() {
         let w_builtin = unsafe { (*parent_frame_ptr).get_builtin() };
         if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
@@ -5529,14 +5546,23 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
 
     // Fall back to the live frame's globals (GC-safe when the frame owns
     // this w_code; else the promoted w_code's own globals).
-    let parent_frame_ptr = frame_ptr as *const PyFrame;
-    let w_globals = if !parent_frame_ptr.is_null()
-        && unsafe { (*parent_frame_ptr).pycode } as usize == w_code_ptr as usize
-    {
-        unsafe { (*parent_frame_ptr).get_w_globals() }
-    } else {
-        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
+    //
+    // The globals lookup below reaches a user `__getitem__` on a non-dict
+    // mapping, and the builtins leg after it reads both the frame and the
+    // globals again.  The frame is held on the shadow stack and the globals
+    // re-derived from it — a dict is one of the two kinds a minor collection
+    // relocates, and the promoted `w_code` it otherwise comes off does not
+    // move — so neither is carried across the lookup.
+    let frame_anchor =
+        unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame_ptr as *mut PyFrame) };
+    let live_globals = |frame: *mut PyFrame| unsafe {
+        if !frame.is_null() && (*frame).pycode as usize == w_code_ptr as usize {
+            (*frame).get_w_globals()
+        } else {
+            pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef)
+        }
     };
+    let w_globals = live_globals(frame_anchor.live());
     if !w_globals.is_null() {
         match pyre_interpreter::baseobjspace::finditem_str(w_globals, varname) {
             Ok(Some(val)) => return val as i64,
@@ -5564,11 +5590,12 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
     // name seen by a function created under an exec'd namespace.
     // `try_walker_load_global_cell_fold` declines the fold in that case and
     // leaves the name to this residual, so the handling has to live here.
+    let parent_frame_ptr = frame_anchor.live();
     let w_builtin = if !parent_frame_ptr.is_null() {
         unsafe { (*parent_frame_ptr).get_builtin() }
     } else {
         match pyre_interpreter::baseobjspace::pick_builtin_obj_checked(
-            w_globals,
+            live_globals(parent_frame_ptr),
             pyre_interpreter::call::take_last_exec_ctx(),
         ) {
             Ok(w_builtin) => w_builtin,
@@ -6412,7 +6439,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
          PyFrame; every RAISE_VARARGS emit site must thread portal_frame_reg \
          as the leading ref operand"
     );
-    let exc = exc as PyObjectRef;
+    let mut exc = exc as PyObjectRef;
     let raw_cause = cause as PyObjectRef;
 
     // pyopcode.py:704-722 — cause and exc normalization share
@@ -6425,17 +6452,26 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
         pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
     }
 
-    let cause = if raw_cause.is_null() {
+    let mut cause = if raw_cause.is_null() {
         None
     } else {
         // pyopcode.py:706-707 — cause class-call must mirror the exc
         // class-call (pyopcode.py:711-713) on blackhole re-entry.
         // Force both onto the plain interpreter path so the constructor
         // cannot re-enter the tracer.
+        //
+        // That class call runs Python.  `exc` arrives as a bare operand out of
+        // compiled code and holds no root of its own, so bracket the call the
+        // way `framework.py:1501 get_livevars_for_roots` does — around the
+        // operation, not the function — and read the forwarded value back.
+        let roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = roots.publish(&[exc]);
+        roots.normalize(exc_slot, 1);
         let result = {
             let _plain_guard = pyre_interpreter::call::force_plain_eval();
             pyre_interpreter::eval::normalize_raise_cause(raw_cause)
         };
+        exc = roots.get(exc_slot);
         match result {
             Ok(cause) => Some(cause),
             Err(mut err) => {
@@ -6452,10 +6488,19 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
             // pyopcode.py:711-713 — `space.call_function(w_type)` does
             // not depend on `frame.execution_context`; if the field is
             // null on a valid frame the class-call still proceeds.
+            //
+            // It runs the exception's `__init__`.  `exc` is still unrooted and
+            // the cause normalized above is a fresh nursery object, so both
+            // ride the bracket across the call.
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.publish(&[exc, cause.unwrap_or(std::ptr::null_mut())]);
+            roots.normalize(base, 2);
             let result = {
                 let _plain_guard = pyre_interpreter::call::force_plain_eval();
                 pyre_interpreter::call::call_function_impl_result(exc, &[])
             };
+            exc = roots.get(base);
+            cause = cause.map(|_| roots.get(base + 1));
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,
                 Ok(obj) => pyre_interpreter::error::exception_from_call_type_error(exc, obj)

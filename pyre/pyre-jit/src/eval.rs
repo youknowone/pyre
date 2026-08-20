@@ -335,6 +335,9 @@ unsafe fn pyre_object_eq_w_trampoline(
         Ok(v) => v,
         Err(e) => {
             pyre_interpreter::baseobjspace::set_pending_hash_error(e);
+            // `a` outlived a user `__eq__` and so may name the pre-collection
+            // copy.  It is stored as a presence token — `take_eq_error` only
+            // tests the slot for null — and never followed.
             pyre_object::dict_eq_hook::signal_eq_error(a);
             false
         }
@@ -355,6 +358,8 @@ unsafe fn pyre_object_hash_w_trampoline(obj: pyre_object::PyObjectRef) -> i64 {
         Ok(h) => h,
         Err(e) => {
             pyre_interpreter::baseobjspace::set_pending_dict_hash_error(e);
+            // A presence token, as in `pyre_object_eq_w_trampoline`: stale
+            // after a user `__hash__`, and only ever tested for null.
             pyre_object::dict_eq_hook::signal_hash_error(obj);
             0
         }

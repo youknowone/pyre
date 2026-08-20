@@ -227,7 +227,11 @@ impl FrameAnchor {
     /// them has.
     ///
     /// # Safety
-    /// `frame` must name a live `PyFrame`.
+    /// `frame` must be null or name a live `PyFrame`.  A null is an
+    /// anticipated input for the residual helpers, which take the caller frame
+    /// as a raw operand the emit site may not have; the root walker skips a
+    /// null slot, so anchoring one costs a push and answers null from
+    /// [`Self::live`].
     pub unsafe fn from_raw(frame: *mut PyFrame) -> Self {
         let depth = majit_gc::shadow_stack::push(majit_ir::GcRef(frame as usize));
         Self {
