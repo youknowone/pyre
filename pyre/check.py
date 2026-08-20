@@ -6,6 +6,8 @@ Cross-platform Python translation of pyre/check.sh.
 
 import argparse
 import difflib
+import hashlib
+import itertools
 import math
 import os
 import re
@@ -1965,17 +1967,60 @@ def default_binary(backend):
     return f"./target/release/{name}{EXE}"
 
 
-# Suffixes of the files a release artefact is actually built from. Bench
-# fixtures and their baselines are read at run time, not linked in, so an edit
-# to one does not make a binary stale.
-BUILD_INPUT_SUFFIXES = (".rs", ".toml", ".lock", ".ullbc")
+# Repository-root files every crate is built against.
+ROOT_BUILD_INPUTS = ("Cargo.toml", "Cargo.lock", ".cargo/config.toml", "rust-toolchain.toml")
 
 
-def newest_build_input():
-    """`(mtime, path)` of the newest file a release artefact is built from.
+def workspace_member_dirs():
+    """Directories listed in the root `Cargo.toml` `members` array.
 
-    `None` when the tree cannot be enumerated, which makes the freshness gate
-    below fail open rather than block a checkout that has no git.
+    A source file only reaches a compiler if it belongs to a member crate, so
+    this is what separates a build input from a bench fixture or a baseline
+    sitting elsewhere in the tree. `pyre/pyrex/tests/gate_triage_complete.rs`
+    derives its own search roots the same way, for the same reason.
+    """
+    manifest = Path("Cargo.toml").read_text(encoding="utf-8")
+    after = manifest.split("\nmembers = [", 1)
+    if len(after) != 2:
+        return []
+    listing = after[1].split("]", 1)[0]
+    # Quoted entries only: the array carries `# majit` / `# pyre` comment lines.
+    return re.findall(r'"([^"]+)"', listing)
+
+
+def declared_rerun_inputs():
+    """Paths the build scripts declared with `cargo:rerun-if-changed=`.
+
+    Build scripts consume inputs that live outside any crate directory —
+    `pyre-interpreter/build.rs` embeds a closure of `lib-python/3` stdlib
+    modules — and each one names them here. Reading the declarations back is
+    what keeps this check from carrying a second, drifting copy of that list.
+    The files exist only once something has been built, which is the only case
+    `--no-build` applies to anyway.
+    """
+    paths = []
+    # `target/<profile>/build/…` for a host build, `target/<triple>/<profile>/…`
+    # for the wasm one.
+    outputs = itertools.chain(
+        Path("target").glob("*/build/*/output"),
+        Path("target").glob("*/*/build/*/output"),
+    )
+    for output in outputs:
+        try:
+            text = output.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            _, sep, value = line.partition("cargo:rerun-if-changed=")
+            if sep and value:
+                paths.append(value)
+    return paths
+
+
+def build_input_paths():
+    """Every file a release artefact is built from, or `None` when the tree
+    cannot be enumerated — which makes the freshness gate below fail open
+    rather than block a checkout that has no git.
     """
     try:
         listing = subprocess.run(
@@ -1986,49 +2031,104 @@ def newest_build_input():
         return None
     if listing.returncode != 0:
         return None
-    paths = [p for p in listing.stdout.split("\0") if p.endswith(BUILD_INPUT_SUFFIXES)]
-    # The extracted LLBC is a build input the fingerprint gate already tracks by
-    # content, but it lives under build/ and so is not tracked by git.
+    members = tuple(member + "/" for member in workspace_member_dirs())
+    if not members:
+        return None
+    tracked = listing.stdout.split("\0")
+    # Every tracked file under a member crate, whatever its suffix: the CJK
+    # codec `.c`/`.h` sources and the app-level `.py` bodies reach the binary
+    # exactly as the `.rs` files do.
+    paths = [p for p in tracked if p.startswith(members) or p in ROOT_BUILD_INPUTS]
+    # The extracted LLBC is a build input the fingerprint gate already tracks
+    # by content, but it lives under build/ and so is not tracked by git.
     paths += [str(p) for p in Path("build/llbc").glob("*.ullbc")]
-    newest = None
+    paths += declared_rerun_inputs()
+    return sorted(set(paths))
+
+
+_BUILD_INPUTS_FINGERPRINT = None
+
+
+def build_inputs_fingerprint():
+    """A digest of every build input's *content*, computed once per run.
+
+    Content and not mtime: a concurrent `git checkout <ref> -- .`, a branch
+    switch, or an editor rewriting a file it did not change re-stamps whole
+    subtrees, and a gate reading mtimes then blocks a build that is in fact
+    current. Hashing the roughly one thousand inputs (about 1GB, most of it
+    the LLBC) costs ~0.6s, against the multi-minute build `--no-build` exists
+    to skip.
+    """
+    global _BUILD_INPUTS_FINGERPRINT
+    if _BUILD_INPUTS_FINGERPRINT is not None:
+        return _BUILD_INPUTS_FINGERPRINT
+    paths = build_input_paths()
+    if paths is None:
+        return None
+    digest = hashlib.sha256()
     for path in paths:
         try:
-            mtime = os.stat(path).st_mtime
+            handle = open(path, "rb")
         except OSError:
             continue
-        if newest is None or mtime > newest[0]:
-            newest = (mtime, path)
-    return newest
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        with handle:
+            while chunk := handle.read(1 << 20):
+                digest.update(chunk)
+    _BUILD_INPUTS_FINGERPRINT = digest.hexdigest()
+    return _BUILD_INPUTS_FINGERPRINT
+
+
+def artefact_fingerprint_path(artefact):
+    return Path(str(artefact) + ".inputs")
+
+
+def stamp_artefact_inputs(artefact):
+    """Record the inputs an artefact was just built from, beside it."""
+    fingerprint = build_inputs_fingerprint()
+    if fingerprint is None:
+        return
+    try:
+        artefact_fingerprint_path(artefact).write_text(fingerprint, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def require_fresh_artefacts(backend, artefacts):
-    """Refuse to measure an artefact older than the sources it was built from.
+    """Refuse to measure an artefact that was built from different sources.
 
     `--no-build` skips every artefact of a backend, and wasm has two: the
     native runner and the wasm module the runner loads. A module left behind by
     an earlier build produces a fully green run — and a set of recorded
     baselines — for code that is not in it, with nothing in the output saying
-    so. The only honest tell is the mtime, so read it here rather than leaving
-    it to whoever remembers.
+    so.
+
+    Each build stamps its artefact with `build_inputs_fingerprint`; an artefact
+    carrying no stamp was built outside this script, so its inputs are unknown
+    and the run continues with a note rather than a refusal.
     """
-    newest = newest_build_input()
-    if newest is None:
+    fingerprint = build_inputs_fingerprint()
+    if fingerprint is None:
         return
-    source_mtime, source_path = newest
     for artefact in artefacts:
+        stamp = artefact_fingerprint_path(artefact)
         try:
-            artefact_mtime = os.stat(artefact).st_mtime
+            recorded = stamp.read_text(encoding="utf-8").strip()
         except OSError:
+            print(
+                f"  note: {artefact} carries no build-input stamp; "
+                "its freshness is unchecked"
+            )
             continue
-        if artefact_mtime >= source_mtime:
+        if recorded == fingerprint:
             continue
-        gap = (source_mtime - artefact_mtime) / 60.0
         print(
             f"ERROR: --no-build requested for backend '{backend}', but "
             f"{artefact}\n"
-            f"       is {gap:.0f} min older than {source_path}, so it does not "
-            f"contain the current tree.\n"
-            f"       Re-run without --no-build, or rebuild that artefact."
+            f"       was built from different sources, so it does not contain "
+            f"the current tree.\n"
+            f"       Re-run without --no-build to rebuild it."
         )
         sys.exit(1)
 
@@ -2708,6 +2808,7 @@ class Check:
         # The wall clock beside cargo's own figure is what makes a build that
         # recompiled the world distinguishable from a cache hit.
         print(f"  {cargo_finished_line(proc)} — {elapsed:.1f}s wall", flush=True)
+        stamp_artefact_inputs(default_binary(backend))
 
     def build_wasm_backend(self):
         """Build the wasm32 `pyre-wasm` module and the native `pyre-wasm-runner`.
@@ -2765,18 +2866,15 @@ class Check:
             sys.exit(1)
         # Snapshot the wasm-host build to a stable path so a later `web` build of
         # the same crate cannot overwrite the module the runner loads. Copy when
-        # the bytes actually changed: rewriting an identical file would discard
-        # the runner's `<module>.cwasm` compiled cache, which is keyed by the
-        # module's content hash. Stamp the mtime either way — it is what
-        # `require_fresh_artefacts` reads to decide whether a `--no-build` run
-        # would measure a module from an earlier tree, and a rebuild that
-        # reproduced identical bytes did confirm the module is current.
+        # the bytes actually changed: rewriting an identical file would bump its
+        # mtime, and the runner's `<module>.cwasm` compiled cache is keyed by
+        # the module's content hash, so an identical rewrite buys nothing.
         src_bytes = Path(WASM_BUILD_OUTPUT).read_bytes()
         dst = Path(WASM_MODULE_PATH)
         if not dst.exists() or dst.read_bytes() != src_bytes:
             dst.write_bytes(src_bytes)
-        else:
-            os.utime(dst)
+        stamp_artefact_inputs(WASM_MODULE_PATH)
+        stamp_artefact_inputs(default_binary("wasm"))
 
         if WASM_ENGINE == "wasmtime":
             self._warm_wasm_cache()
