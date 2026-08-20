@@ -5271,9 +5271,12 @@ pub fn report_stale_locals_array_holder(stale_addr: usize) -> bool {
         let frame_addr = frame as usize;
         let owned = pyre_object::gc_hook::try_gc_owns_object(frame_addr as *mut u8);
         if depth > 0 && !owned {
-            eprintln!(
-                "STALE ARRAY holder scan: depth={depth} frame={frame_addr:#x} is not GC-owned; \
-stopping rather than dereferencing an unvalidated f_backref"
+            crate::host_seam::emit_stderr(
+                format!(
+                    "STALE ARRAY holder scan: depth={depth} frame={frame_addr:#x} is not \
+GC-owned; stopping rather than dereferencing an unvalidated f_backref\n"
+                )
+                .as_bytes(),
             );
             break;
         }
@@ -5291,10 +5294,13 @@ stopping rather than dereferencing an unvalidated f_backref"
         };
         let holds = array == stale_addr;
         found |= holds;
-        eprintln!(
-            "STALE ARRAY holder scan: depth={depth} frame={frame_addr:#x} \
+        crate::host_seam::emit_stderr(
+            format!(
+                "STALE ARRAY holder scan: depth={depth} frame={frame_addr:#x} \
 locals={array:#x} holds_stale={holds} gc_owned={owned} nursery={nursery} \
-type_id={type_id} frame_forwarded={forwarded} track_young_ptrs={tracks_young}"
+type_id={type_id} frame_forwarded={forwarded} track_young_ptrs={tracks_young}\n"
+            )
+            .as_bytes(),
         );
         frame = unsafe { (*frame).f_backref };
         depth += 1;

@@ -1520,15 +1520,6 @@ pub fn set_current_exception(exc: PyObjectRef) {
     }
 }
 
-pub fn normalize_raise_value(value: PyObjectRef) -> PyObjectRef {
-    unsafe {
-        if crate::baseobjspace::exception_is_valid_obj_as_class_w(value) {
-            return crate::call_function(value, &[]);
-        }
-    }
-    value
-}
-
 /// `pyopcode.py:764-766` — `raise Class` instantiates the class, and
 /// `normalize_exception` then validates the result.  `space.call_function`
 /// propagates the constructor's own error in RPython; pyre's returns
@@ -1550,23 +1541,27 @@ unsafe fn instantiate_raised_class(w_type: PyObjectRef) -> Result<PyObjectRef, P
     Ok(result)
 }
 
-/// Normalize the `from` cause of a `raise X from Y` statement: instantiate
-/// the cause if it is an exception class, validate that the result is
-/// `None` / a `BaseException` instance, and return a `PyError::type_error`
-/// otherwise.
+/// Instantiate the `from` cause of a `raise X from Y` when it is an exception
+/// class, and answer it unchanged otherwise.
+///
+/// Whether the result derives from `BaseException` is deliberately not asked
+/// here.  `pyopcode.py:757-760` instantiates and does nothing else; the check
+/// is `error.py:376-385 set_cause`, which runs after the raised value has been
+/// popped and normalized.  Asking it early lets `raise Cls from 42` answer the
+/// cause's TypeError without ever running `Cls()`, and lets it pre-empt the
+/// raised value's own "exceptions must derive from BaseException".
+/// [`attach_raise_cause`] is where it is asked.
 ///
 /// # TODO: inline back into RAISE_VARARGS
 ///
-/// **Deviation.** RPython performs this validation inline inside
-/// `RAISE_VARARGS` (`pypy/interpreter/pyopcode.py:704-707`,
-/// `space.call_function(w_cause)` when `w_cause` is an exception class)
-/// without a named helper, deferring the BaseException check to
-/// `OperationError.set_cause` (`pypy/interpreter/error.py`). Pyre
-/// extracts this pre-step into a standalone helper so the JIT raise/r
-/// BH path (`pyre-jit/src/call_jit.rs::bh_normalize_raise_varargs_fn`)
-/// and the interpreter raise path can share the same validation.
+/// **Deviation.** RPython performs this inline inside `RAISE_VARARGS`
+/// (`pypy/interpreter/pyopcode.py:757-760`, `space.call_function(w_cause)`
+/// when `w_cause` is an exception class) without a named helper. Pyre
+/// extracts the step into a standalone helper so the JIT raise BH path
+/// (`pyre-jit/src/call_jit.rs`), the tracer (`pyre-jit-trace`) and the
+/// interpreter raise path share one instantiation.
 ///
-/// **When to fix.** When `bh_normalize_raise_varargs_fn` is removed or
+/// **When to fix.** When `bh_normalize_raise_varargs_with_frame` is removed or
 /// rewritten — e.g. when the JIT BH path can dispatch the same inlined
 /// `RAISE_VARARGS` sequence directly without a shared helper.
 ///
@@ -1576,18 +1571,20 @@ unsafe fn instantiate_raised_class(w_type: PyObjectRef) -> Result<PyObjectRef, P
 /// the BH path through the inlined sequence or rewrite it to match
 /// RPython's inline shape.
 pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let cause = normalize_raise_value(cause);
-    unsafe {
-        if cause.is_null() || pyre_object::is_none(cause) || pyre_object::is_exception(cause) {
-            return Ok(cause);
-        }
+    if !unsafe { crate::baseobjspace::exception_is_valid_obj_as_class_w(cause) } {
+        return Ok(cause);
     }
-    // `error.py:376-385 set_cause` validates through
-    // `_exception_getclass(space, w_cause, "exception causes")`, whose wording
-    // is not the one `descr_setcause` uses for `e.__cause__ = x`.
-    Err(PyError::type_error(
-        "exception causes must derive from BaseException",
-    ))
+    // `space.call_function(w_cause)` propagates the constructor's own error;
+    // pyre's answers `PY_NULL` with the error parked in the pending-call slot,
+    // so an unchecked null would lose it and report the raise as having no
+    // cause at all.
+    let result = unsafe { crate::call_function(cause, &[]) };
+    if result.is_null() {
+        return Err(crate::call::take_call_error().unwrap_or_else(|| {
+            PyError::type_error("exception causes must derive from BaseException")
+        }));
+    }
+    Ok(result)
 }
 
 pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Result<(), PyError> {
@@ -1610,14 +1607,28 @@ pub fn attach_raise_cause(exc: PyObjectRef, cause: Option<PyObjectRef>) -> Resul
     crate::error::chain_context(exc, get_sys_exception());
     if let Some(cause_obj) = cause
         && !cause_obj.is_null()
-        && unsafe { pyre_object::is_exception(exc) }
     {
-        // `interp_exceptions.py:166-174 descr_setcause` — writes
-        // `w_cause` and flips `suppress_context` to True.
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_cause(exc, cause_obj);
-            pyre_object::interp_exceptions::w_exception_set_suppress_context(exc, true);
-        };
+        // `error.py:376-385 set_cause` checks the cause here, after the raised
+        // value has been normalized: `raise Cls from 42` therefore runs `Cls()`
+        // first, and a raised value that is not an exception answers its own
+        // TypeError rather than this one.  The wording is
+        // `_exception_getclass(space, w_cause, "exception causes")`, not the one
+        // `descr_setcause` uses for `e.__cause__ = x`.
+        let valid =
+            unsafe { pyre_object::is_none(cause_obj) || pyre_object::is_exception(cause_obj) };
+        if !valid {
+            return Err(PyError::type_error(
+                "exception causes must derive from BaseException",
+            ));
+        }
+        if unsafe { pyre_object::is_exception(exc) } {
+            // `interp_exceptions.py:166-174 descr_setcause` — writes
+            // `w_cause` and flips `suppress_context` to True.
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_cause(exc, cause_obj);
+                pyre_object::interp_exceptions::w_exception_set_suppress_context(exc, true);
+            };
+        }
     }
     Ok(())
 }
