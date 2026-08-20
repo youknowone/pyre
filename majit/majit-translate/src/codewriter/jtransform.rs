@@ -3059,6 +3059,16 @@ impl<'a> Transformer<'a> {
             let is_signed = array_field.array_is_signed.unwrap_or(false);
             self.vable_array_vars
                 .insert(result, (base_var, array_field.index, itemsize, is_signed));
+            // `rewrite_op_getfield`'s `except VirtualizableArrayField:` handler
+            // ends in `return []` — registering the base is the whole rewrite
+            // and the read itself is dropped.  `rewrite_op_getarrayitem` emits
+            // `VableArrayRead` against the *frame* variable, never against this
+            // result, and `check_no_vable_array` rejects every other consumer
+            // route, so the op is dead the moment its uses are rewritten.
+            // Keeping it left a `getfield_gc_r` of the array pointer in the
+            // jitcode and exposed it to the immutability-rank rewrite below,
+            // neither of which upstream reaches.
+            return RewriteResult::Replace(Vec::new());
         }
         // Virtualizable scalar field → VableFieldRead
         if let Some(vable_field) = self
@@ -8523,14 +8533,23 @@ mod tests {
         };
         let result = transform_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 1);
-        // `jtransform.py:764-767` — `-live-` leads the vable array read.
+        // The field read that produced the array is gone: registering the
+        // base is the whole rewrite, and `rewrite_op_getfield`'s
+        // `except VirtualizableArrayField:` handler ends in `return []`.
         let ops = &result.graph.block(graph.startblock).operations;
         assert!(
-            matches!(ops[1].kind, OpKind::Live),
-            "virtualizable array read must be led by -live-, got {:?}",
-            ops[1].kind
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::FieldRead { .. })),
+            "the virtualizable array field read must be dropped, got {:?}",
+            ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
         );
-        let rewritten_op = &ops[2];
+        // `jtransform.py:764-767` — `-live-` leads the vable array read.
+        assert!(
+            matches!(ops[0].kind, OpKind::Live),
+            "virtualizable array read must be led by -live-, got {:?}",
+            ops[0].kind
+        );
+        let rewritten_op = &ops[1];
         let OpKind::VableArrayRead {
             base: rewritten_base,
             array_index,
@@ -8598,21 +8617,21 @@ mod tests {
         let ops = &result.graph.block(graph.startblock).operations;
         assert!(
             !ops.iter()
-                .any(|op| matches!(op.kind, OpKind::ArrayLen { .. })),
-            "the raw arraylen must be gone, got {:?}",
+                .any(|op| matches!(op.kind, OpKind::FieldRead { .. } | OpKind::ArrayLen { .. })),
+            "the array field read and the raw arraylen must both be gone, got {:?}",
             ops.iter().map(|op| &op.kind).collect::<Vec<_>>(),
         );
         // `jtransform.py:814` — `-live-` leads the vable array length read.
         assert!(
-            matches!(ops[1].kind, OpKind::Live),
+            matches!(ops[0].kind, OpKind::Live),
             "vable array length must be led by -live-, got {:?}",
-            ops[1].kind
+            ops[0].kind
         );
         let OpKind::VableArrayLen {
             base: rewritten_base,
             array_index,
             ..
-        } = &ops[2].kind
+        } = &ops[1].kind
         else {
             panic!("expected VableArrayLen, got {:?}", ops[1].kind);
         };
