@@ -1121,6 +1121,29 @@ pub struct ClosureRuntime<FLabel> {
     label_at: FLabel,
 }
 
+/// Refuse a residual call whose target is still a `symbolic_fnaddr_for_path`
+/// placeholder.
+///
+/// A placeholder means the host never bound that callee's path, so the address
+/// is a hash of the path rather than code. Jumping to it faults somewhere with
+/// no trace of which callee was missing, and answering 0 (the null-target arm
+/// below) would quietly substitute a wrong result. `blackhole.rs` already
+/// declines the same shape on its own residual-call handlers; this is the
+/// tracing side of that check.
+fn reject_symbolic_residual_call_target(func: usize, arg_classes: &str) -> ! {
+    // Aborts rather than panics: the unwind would cross the metainterp frames the
+    // trace is being recorded through, and the report is already complete here.
+    // A symbolic target is a host configuration error, not a runtime condition.
+    eprintln!(
+        "residual call target {func:#x} is a symbolic path hash, not a code address \
+         (arg classes {arg_classes:?}). The host did not bind this callee's path — add \
+         it to the fnaddr bindings passed to \
+         `EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs`, and look the hash up \
+         in the host's symbolic-path table to see which path it names."
+    );
+    std::process::abort();
+}
+
 impl<FLabel> ClosureRuntime<FLabel> {
     pub fn new(label_at: FLabel) -> Self {
         Self { label_at }
@@ -6856,6 +6879,12 @@ where
                 // other dispatch sites in `blackhole.rs`.
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     self.clear_exception();
+                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                        reject_symbolic_residual_call_target(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                        );
+                    }
                     if !concrete_ptr.is_null() {
                         unsafe {
                             majit_backend::call_stub::bh_call_v_by_classes(
@@ -6948,6 +6977,12 @@ where
                     //    `bh_call_i_dispatch` (which transmutes to
                     //    `extern "C" fn(...) -> i64` and reads garbage from
                     //    rax/x0).
+                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                        reject_symbolic_residual_call_target(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                        );
+                    }
                     if !concrete_ptr.is_null() {
                         unsafe {
                             majit_backend::call_stub::bh_call_v_by_classes(
@@ -7164,6 +7199,12 @@ where
                     // through `bh_call_v_dispatch`, do not write back the
                     // int destination register, and abort on exception.
                     self.clear_exception();
+                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                        reject_symbolic_residual_call_target(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                        );
+                    }
                     if !concrete_ptr.is_null() {
                         unsafe {
                             majit_backend::call_stub::bh_call_v_by_classes(
@@ -7235,6 +7276,12 @@ where
                     // Concrete execute via `bh_call_i_dispatch` (i64
                     // return) — RPython `executor.execute_varargs` →
                     // `cpu.bh_call_i`.
+                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                        reject_symbolic_residual_call_target(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                        );
+                    }
                     let concrete = if concrete_ptr.is_null() {
                         0
                     } else {
@@ -7447,6 +7494,12 @@ where
                     // the int sibling at the corresponding NotInTrace
                     // branch for the full citation.
                     self.clear_exception();
+                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                        reject_symbolic_residual_call_target(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                        );
+                    }
                     if !concrete_ptr.is_null() {
                         unsafe {
                             majit_backend::call_stub::bh_call_v_by_classes(
@@ -7514,6 +7567,12 @@ where
                     } else {
                         None
                     };
+                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                        reject_symbolic_residual_call_target(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                        );
+                    }
                     let concrete = if concrete_ptr.is_null() {
                         0
                     } else {
@@ -7688,6 +7747,12 @@ where
                     // the int sibling at the corresponding NotInTrace
                     // branch for the full citation.
                     self.clear_exception();
+                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                        reject_symbolic_residual_call_target(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                        );
+                    }
                     if !concrete_ptr.is_null() {
                         unsafe {
                             majit_backend::call_stub::bh_call_v_by_classes(
@@ -7744,6 +7809,12 @@ where
                     } else {
                         None
                     };
+                    if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
+                        reject_symbolic_residual_call_target(
+                            concrete_ptr as usize,
+                            &calldescr.arg_classes,
+                        );
+                    }
                     let concrete = if concrete_ptr.is_null() {
                         0.0f64
                     } else {
