@@ -1907,7 +1907,7 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "bool" => pyre_object::is_bool,
         "float" => pyre_object::is_float,
         "complex" => pyre_object::is_complex,
-        // A dict subclass keeps its entries in a `__dict_data__` backing
+        // A dict subclass keeps its entries in a reserved-slot backing
         // rather than the dict layout, and the dict methods already read
         // through to it, so "has a dict backing" is the receiver test.
         "dict" => crate::type_methods::has_dict_backing,
@@ -3607,12 +3607,11 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
     // PyPy `W_DictMultiObject.allocate_and_init_instance` initializes the
     // mapping payload directly, before any Python-level `__setattr__` can
-    // run.  `__dict_data__` is pyre's reserved layout-slot equivalent, so
-    // write it through object.__setattr__'s terminal path rather than
-    // dispatching a subclass override.
+    // run.  The reserved layout slot is pyre's equivalent, so write it as a
+    // slot rather than dispatching attribute assignment.
     //
     // Nothing references the instance until the backing mapping is installed,
-    // and both that allocation and the attribute store are collection points.
+    // and both that allocation and the slot store are collection points.
     // Its allocation is stable, so the word never moves and needs no read
     // back — the pin is what keeps a major collection from reclaiming it.
     // The mapping is a `dict` and does move, so it is pinned at the mint and
@@ -3622,11 +3621,10 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     pyre_object::gc_roots::pin_root(instance);
     let backing_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
-    crate::baseobjspace::object_setattr(
+    crate::type_methods::set_dict_backing(
         instance,
-        "__dict_data__",
         pyre_object::gc_roots::shadow_stack_get(backing_slot),
-    )?;
+    );
     Ok(instance)
 }
 /// boolobject.py descr_new — bool.__new__(cls, obj=False)
@@ -6884,7 +6882,7 @@ fn init_dict_type(ns: PyObjectRef) {
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
                     // A dict subclass is instance-represented (the mapping lives in
-                    // the `__dict_data__` backing), so `compare` would not see it as
+                    // the reserved-slot backing), so `compare` would not see it as
                     // a dict and would re-dispatch to this `__eq__`, recursing.
                     // Resolve each operand to its backing dict first; exact dicts
                     // and non-dict operands are left unchanged for `compare`.
@@ -11048,10 +11046,10 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
     // per user slot to that same prefix.
     let mut slots = unsafe { pyre_object::w_type_get_nslots(w_type) } as i64;
     // Some composed instances own private Layout slots for a builtin's
-    // intrinsic fields: a dict subclass keeps its mapping payload in
-    // `__dict_data__`, a slotted `weakref.ref` subclass its three
-    // `W_WeakrefBase` fields. CPython keeps both in the fixed struct prefix,
-    // so neither contributes to the public `tp_basicsize` projection.
+    // intrinsic fields: a dict subclass its mapping payload, a slotted
+    // `weakref.ref` subclass its three `W_WeakrefBase` fields. CPython keeps
+    // both in the fixed struct prefix, so neither contributes to the public
+    // `tp_basicsize` projection.
     let mut current = unsafe { pyre_object::w_type_get_layout_ptr(w_type) };
     while !current.is_null() {
         slots -= unsafe { &(*current).newslotnames }
@@ -11066,7 +11064,7 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
 /// Whether `name` is a Layout slot pyre reserves for a builtin's intrinsic
 /// fields rather than for an attribute the class declared.
 fn is_reserved_payload_slot(name: &str) -> bool {
-    name == "__dict_data__"
+    name == crate::type_methods::DICT_DATA_SLOT
         || crate::module::_weakref::interp__weakref::RESERVED_FIELD_SLOTS.contains(&name)
 }
 

@@ -123,16 +123,6 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(d);
         if crate::baseobjspace::len_w(pyre_object::gc_roots::shadow_stack_get(dict_slot))? > 0 {
-            // Copy `__dict__`. For a dict subclass, drop the internal
-            // `__dict_data__` key it keeps its mapping payload under: that
-            // payload is reconstructed through `dictitems`, not the instance
-            // state, so an attribute-less dict subclass yields `None` here
-            // (matching the empty instance `__dict__` of a built-in subclass).
-            // A non-dict instance keeps a user attribute of that name.
-            let is_dict_inst = {
-                let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-                unsafe { crate::baseobjspace::isinstance_w(current_obj(), w_dict_type) }
-            };
             let copy_slot = pyre_object::gc_roots::shadow_stack_len();
             pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
             let items = unsafe {
@@ -147,12 +137,6 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
             for index in 0..items.len() {
                 let k = pyre_object::gc_roots::shadow_stack_get(items_slot + 2 * index);
                 let v = pyre_object::gc_roots::shadow_stack_get(items_slot + 2 * index + 1);
-                if is_dict_inst
-                    && unsafe { pyre_object::is_str(k) }
-                    && unsafe { pyre_object::w_str_get_value(k) } == "__dict_data__"
-                {
-                    continue;
-                }
                 unsafe {
                     pyre_object::w_dict_store(
                         pyre_object::gc_roots::shadow_stack_get(copy_slot),

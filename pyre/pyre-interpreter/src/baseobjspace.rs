@@ -5182,7 +5182,7 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
 /// `getdict` result.  Upstream dict-subclass instances are dict-layout
 /// `W_DictMultiObject`, so `finditem_str`/`setitem_str` strategy
 /// dispatch works on them directly; pyre dict-subclass instances are
-/// `__dict_data__`-composed W_ObjectObject (typedef.rs
+/// slot-composed W_ObjectObject (typedef.rs
 /// dict_descr_new), so the `w_dict_*` layout accessors must target the
 /// backing dict.  Plain dicts, module dicts and mapdict views pass
 /// through unchanged.  The `__dict__` getter keeps returning the

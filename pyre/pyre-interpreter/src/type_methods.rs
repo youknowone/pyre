@@ -6253,16 +6253,21 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 // ── Dict methods ─────────────────────────────────────────────────────
 
-/// Resolve the actual backing W_DictObject for either a plain dict or
-/// a dict subclass instance (which stores data in `__dict_data__`).
+/// Layout-slot name reserved for a dict subclass's mapping payload, pyre's
+/// object-resident stand-in for the intrinsic `W_DictMultiObject` field a
+/// PyPy dict subclass carries.
 ///
-/// PyPy: W_DictMultiObject subclass instances ARE dicts, so no indirection
-/// is needed. In pyre, dict subclass instances are W_ObjectObject with a
-/// backing dict stored as an attribute.
+/// The name holds a space so no class can declare it: `__slots__` entries are
+/// rejected unless they are identifiers. A spellable name would collide — the
+/// user's member is installed first and the reserved name appended after it,
+/// so `dict_data_slot` would answer with the user's index and the mapping
+/// payload would overwrite their slot.
+pub const DICT_DATA_SLOT: &str = "dict subclass w_dict_data";
+
 /// True when `obj` can be read as a dict — an exact dict, a dict subclass
-/// carrying a `__dict_data__` backing, or a mapping proxy wrapping one.  This
-/// is the receiver test a `dict` method descriptor applies, so an object that
-/// merely claims `__class__ is dict` never reaches the backing lookup.
+/// carrying a mapping payload, or a mapping proxy wrapping one.  This is the
+/// receiver test a `dict` method descriptor applies, so an object that merely
+/// claims `__class__ is dict` never reaches the backing lookup.
 ///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
@@ -6270,11 +6275,7 @@ pub unsafe fn has_dict_backing(obj: PyObjectRef) -> bool {
     !resolve_dict_backing(obj).is_null()
 }
 
-/// Write pyre's object-resident stand-in for a dict subclass's intrinsic
-/// `W_DictMultiObject` payload.  This is a layout-slot operation, not Python
-/// attribute assignment: a subclass may override `__setattr__` with a dict
-/// method before its mapping payload exists.
-/// Absolute layout-slot index of the reserved `__dict_data__` payload for
+/// Absolute layout-slot index of the reserved [`DICT_DATA_SLOT`] payload for
 /// `obj`, walking the layout chain from the object's type toward its base.
 /// `None` when no layout in the chain reserves the slot.
 ///
@@ -6295,7 +6296,7 @@ unsafe fn dict_data_slot(obj: PyObjectRef) -> Option<u32> {
             if let Some(offset) = current
                 .newslotnames
                 .iter()
-                .position(|name| name == "__dict_data__")
+                .position(|name| name == DICT_DATA_SLOT)
             {
                 return Some(first_slot + offset as u32);
             }
@@ -6305,6 +6306,9 @@ unsafe fn dict_data_slot(obj: PyObjectRef) -> Option<u32> {
     }
 }
 
+/// Write the mapping payload of a dict subclass instance.  This is a
+/// layout-slot operation, not Python attribute assignment: a subclass may
+/// override `__setattr__` with a dict method before its payload exists.
 pub fn set_dict_backing(obj: PyObjectRef, backing: PyObjectRef) -> bool {
     unsafe {
         if !is_instance(obj) || !is_dict(backing) {
@@ -6343,9 +6347,7 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
             }
         }
         if is_instance(obj) {
-            // `__dict_data__` is pyre's object-resident stand-in for the
-            // intrinsic W_DictMultiObject payload of a PyPy dict subclass.
-            // Read that reserved layout slot directly: going through
+            // Read the reserved layout slot directly: going through
             // `getattr_str` would incorrectly expose internal dict operations
             // to a subclass's Python-level `__getattribute__` hook.
             if let Some(slot) = dict_data_slot(obj)
