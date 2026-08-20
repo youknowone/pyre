@@ -716,11 +716,25 @@ impl WarmEnterState {
             let is_tracing = cell.is_tracing();
             let flags = cell.flags;
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
+            let abort_count = cell.abort_count;
             if is_compiled {
                 return HotResult::RunCompiled;
             }
             if is_tracing {
                 return HotResult::AlreadyTracing;
+            }
+            // pyre's abort ceiling decides here rather than inside the trace
+            // start.  `warmstate.py:425-444 bound_reached` traces
+            // unconditionally once entered, so upstream never reaches it with a
+            // cell that will then refuse; `MAX_TRACE_ABORT_COUNT` creates
+            // exactly that state.  `bound_reached`'s first act is
+            // `jitcounter.decay_all_counters()` (`warmstate.py:429`), so a cell
+            // that can never trace again would otherwise decay every OTHER
+            // loop's counter once per back edge and hold them below threshold.
+            // The answer for this cell is unchanged — `force_start_tracing*`
+            // returns `NotHot` for the same condition — only its timing is.
+            if abort_count >= MAX_TRACE_ABORT_COUNT {
+                return HotResult::NotHot;
             }
             if self.should_start_dont_trace_here_trace(cell_key, flags, has_seen_a_procedure_token)
             {
@@ -807,11 +821,25 @@ impl WarmEnterState {
             let is_tracing = cell.is_tracing();
             let flags = cell.flags;
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
+            let abort_count = cell.abort_count;
             if is_compiled {
                 return HotResult::RunCompiled;
             }
             if is_tracing {
                 return HotResult::AlreadyTracing;
+            }
+            // pyre's abort ceiling decides here rather than inside the trace
+            // start.  `warmstate.py:425-444 bound_reached` traces
+            // unconditionally once entered, so upstream never reaches it with a
+            // cell that will then refuse; `MAX_TRACE_ABORT_COUNT` creates
+            // exactly that state.  `bound_reached`'s first act is
+            // `jitcounter.decay_all_counters()` (`warmstate.py:429`), so a cell
+            // that can never trace again would otherwise decay every OTHER
+            // loop's counter once per back edge and hold them below threshold.
+            // The answer for this cell is unchanged — `force_start_tracing*`
+            // returns `NotHot` for the same condition — only its timing is.
+            if abort_count >= MAX_TRACE_ABORT_COUNT {
+                return HotResult::NotHot;
             }
             if self.should_start_dont_trace_here_trace(hash, flags, has_seen_a_procedure_token) {
                 return self.start_tracing_cell_for_key(key);
