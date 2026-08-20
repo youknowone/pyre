@@ -1327,21 +1327,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // belongs with these two rather than behind the gate below.
         crate::module::_codecs::walk_codec_state_gc(&mut fwd);
     }
-    // `space.fromcache(MethodCache)` is a live interpreter-global GC root,
-    // not a write-once prebuilt object, and one cache serves every mutator.
-    // A cached young function may survive one minor collection and move again
-    // at the next; a single dirty bit cannot model minimark's remembered-set
-    // lifetime. Forward every cache slot on every collection, as RPython's
-    // traced MethodCache object does.
-    unsafe {
-        let mut forward_cache = |slot: &mut PyObjectRef| {
-            visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
-            walk_raw_function_roots(*slot, visitor);
-            walk_raw_getset_roots(*slot, visitor);
-            walk_raw_wrapped_function_roots(*slot, visitor);
-        };
-        crate::baseobjspace::walk_method_cache_gc(&mut forward_cache);
-    }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor
@@ -1362,6 +1347,13 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             walk_raw_wrapped_function_roots(*slot, visitor);
         };
         walk_builtin_type_dicts_gc(&mut forward);
+        // `typeobject.py:76-101 MethodCache` is an ordinary GC-managed
+        // old/prebuilt object upstream.  A cache fill takes the write barrier;
+        // pyre's off-GC equivalent calls `mark_prebuilt_roots_dirty`, so scan
+        // it with the same remembered prebuilt family.  MiniMark promotes a
+        // nursery survivor directly to oldgen in this minor, so no clean-minor
+        // rescan is needed after the dirty bit is cleared.
+        crate::baseobjspace::walk_method_cache_gc(&mut forward);
         // interp_posix.ApplevelForkCallbacks is another object-space cache.
         #[cfg(not(target_arch = "wasm32"))]
         crate::module::posix::interp_posix::walk_fork_callback_roots(&mut forward);
