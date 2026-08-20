@@ -1,4 +1,3 @@
-# pyre-check: selfcheck
 # A loop that lives inside a generator body and never crosses the yield.
 # The suspension is the only part of the frame the tracer has to refuse; the
 # loop before it is an ordinary counted loop and compiles like one. This
@@ -34,6 +33,5 @@ def run(rounds, m):
 
 
 total = run(ROUNDS, N)
-print("total:", total)
 assert total == 287280600, total
-print("PASS")
+print(total)

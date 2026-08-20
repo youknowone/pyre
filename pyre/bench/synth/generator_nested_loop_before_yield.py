@@ -1,4 +1,3 @@
-# pyre-check: selfcheck
 # A loop nested inside a yield-bearing loop. The inner loop's body holds no
 # suspension — it runs to completion between two yields — so it is an ordinary
 # counted loop and compiles like one. The enclosing loop is a different matter
@@ -32,6 +31,5 @@ def run(rounds, m):
 
 
 total = run(ROUNDS, INNER)
-print("total:", total)
 assert total == 71820000, total
-print("PASS")
+print(total)
