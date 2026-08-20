@@ -731,8 +731,10 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
 /// surfaces flip the flag to `True`.
 ///
 /// # Safety
-/// `code_ptr` must be a valid pointer to a `CodeObject` obtained
-/// via `Box::into_raw`.
+/// `code_ptr` must be a valid pointer to a `CodeObject` that is never freed
+/// and never moved. `pycode_destructor` releases the wrapper's side tables
+/// but never `code_ptr`, so a leaked box and a constant reached through one
+/// both qualify.
 pub fn w_code_new(code_ptr: *const ()) -> PyObjectRef {
     w_code_new_with_hidden_applevel(code_ptr, false)
 }
@@ -768,13 +770,35 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
     w_code_new(code_ptr)
 }
 
-/// Box a nested compiler constant and inherit the enclosing `PyCode`'s raw
+/// Publish a code wrapper over a `CodeObject` the caller keeps alive, rather
+/// than over a copy of it.
+///
+/// [`box_code_constant`] copies because most callers hold a `CodeObject` on
+/// the stack. A nested compiler constant is not one of those: it sits in its
+/// enclosing `CodeObject`'s constants table behind its own `Box`, that table
+/// is only ever edited in place, and the enclosing object is itself leaked.
+/// So the constant already outlives every wrapper published for it.
+///
+/// # Safety
+/// `code` must point to a `CodeObject` that is never freed and never moved.
+unsafe fn box_code_constant_in_place(code: *const crate::CodeObject) -> PyObjectRef {
+    w_code_new(code as *const ())
+}
+
+/// Wrap a nested compiler constant and inherit the enclosing `PyCode`'s raw
 /// filename when it belongs to the set selected by
 /// `importing.py:379-391 update_code_filenames`' `oldname` guard.
-fn box_code_constant_inheriting_filename(code: &crate::CodeObject, parent: &PyCode) -> PyObjectRef {
-    let obj = box_code_constant(code);
+///
+/// # Safety
+/// `code` must satisfy [`box_code_constant_in_place`], and `parent` must be
+/// the `PyCode` whose constants table holds it.
+unsafe fn box_code_constant_inheriting_filename(
+    code: *const crate::CodeObject,
+    parent: &PyCode,
+) -> PyObjectRef {
+    let obj = unsafe { box_code_constant_in_place(code) };
     if parent.filename_inherits_to_nested
-        && code.source_path
+        && unsafe { &*code }.source_path
             == unsafe { &*(parent.code_ptr as *const crate::CodeObject) }.source_path
         && !parent.filename_bytes.is_null()
     {
@@ -2052,9 +2076,9 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     }
 
     let mut realized = match &constants[idx] {
-        crate::bytecode::ConstantData::Code { code } => {
-            box_code_constant_inheriting_filename(code, w_code)
-        }
+        crate::bytecode::ConstantData::Code { code } => unsafe {
+            box_code_constant_inheriting_filename(&**code as *const crate::CodeObject, w_code)
+        },
         constant => crate::pyframe::pyobject_from_constant(constant),
     };
     // Keep the losing or winning candidate live until the CAS has either
@@ -2190,26 +2214,22 @@ pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
 /// `importing.py:379 update_code_filenames`: set `source_path` on `code` and,
 /// recursively, on every nested code constant whose filename still matches the
 /// root's *original* name (leaving unrelated inlined filenames untouched).
-/// `Constants` exposes no in-place mutation, so the table is rebuilt.
+///
+/// The table is edited through `Constants`' `DerefMut`, so every constant keeps
+/// its address. Nested constants are wrapped in place by
+/// [`box_code_constant_in_place`], and a wrapper published before this runs
+/// reads the new name out of the object it already points at — which is what
+/// `update_code_filenames` mutating already-wrapped nested `PyCode` constants
+/// amounts to.
 fn fix_code_filenames(code: &mut crate::CodeObject, oldname: &str, newname: &str) {
     code.source_path = newname.to_owned();
-    let new_consts: crate::bytecode::Constants<crate::bytecode::ConstantData> = code
-        .constants
-        .iter()
-        .map(|c| match c {
-            crate::bytecode::ConstantData::Code { code: nested }
-                if nested.source_path == oldname =>
-            {
-                let mut nested = (**nested).clone();
-                fix_code_filenames(&mut nested, oldname, newname);
-                crate::bytecode::ConstantData::Code {
-                    code: Box::new(nested),
-                }
-            }
-            other => other.clone(),
-        })
-        .collect();
-    code.constants = new_consts;
+    for constant in code.constants.iter_mut() {
+        if let crate::bytecode::ConstantData::Code { code: nested } = constant
+            && nested.source_path == oldname
+        {
+            fix_code_filenames(nested, oldname, newname);
+        }
+    }
 }
 
 /// `_imp._fix_co_filename(code, path)` (importing.py:158 fix_co_filename):
@@ -2398,18 +2418,28 @@ fn code_locations_cache()
 /// `co_firstlineno_raw` stamp that follows `CodeType(...)` and `code.replace`)
 /// simply corrects the recorded line number.
 fn release_code_locations(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32) {
-    // A code object with no instructions has no rows to decode, and a second
-    // wrapper over one already released must keep the record the first made —
-    // re-deferring would abandon rows a reader has since decoded.
+    // A code object with no instructions has no rows to decode.
     let code = unsafe { &mut *code_ptr };
-    if code.instructions.is_empty() || code.locations.is_empty() {
+    if code.instructions.is_empty() {
         return;
     }
-    code.locations = Vec::new().into_boxed_slice();
-    code_locations_cache()
+    // Nested constants are wrapped in place, so two threads realizing one
+    // `co_consts_w` slot reach the same `CodeObject`. Whoever creates the
+    // record owns the drop; the array is read and written only under this
+    // lock. A second wrapper over an already-released object must keep the
+    // record the first made — re-deferring would abandon rows a reader has
+    // since decoded.
+    let mut cache = code_locations_cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(code_ptr as usize, CodeLocations::Deferred(firstlineno_raw));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(code_ptr as usize) else {
+        return;
+    };
+    if code.locations.is_empty() {
+        return;
+    }
+    entry.insert(CodeLocations::Deferred(firstlineno_raw));
+    code.locations = Vec::new().into_boxed_slice();
 }
 
 /// Correct the first line number a released array is decoded against, leaving a
