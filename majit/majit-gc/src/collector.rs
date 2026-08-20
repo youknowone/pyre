@@ -1932,7 +1932,11 @@ impl MiniMarkGC {
             let type_id = unsafe { (*header_of(pinned_obj)).type_id() };
             let payload_size = self.size_for_typeid(pinned_obj, type_id, "pinned_barriers");
             let object_size = Self::nursery_allocation_size(GcHeader::SIZE + payload_size);
-            let next_free = pinned_header + object_size;
+            // `size_for_typeid` decodes the pinned object's extent from its
+            // header. A decode that overstates it would push free past the
+            // barrier we are about to publish, and `Nursery::alloc` would then
+            // hand out bytes beyond the gap. The barrier is the hard bound.
+            let next_free = (pinned_header + object_size).min(next_top);
             unsafe {
                 // Set the wider bound first so Nursery's pointer invariant is
                 // maintained while free crosses the old (pinned) top.

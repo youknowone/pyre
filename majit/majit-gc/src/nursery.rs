@@ -293,10 +293,17 @@ impl Nursery {
         debug_assert!(start >= self.start as usize);
         debug_assert!(start <= end);
         debug_assert!(end <= self.start as usize + self.size);
-        let len = end - start;
-        if len == 0 {
+        // This is a safe fn that writes raw bytes at caller-supplied
+        // addresses, so the bounds have to hold in release too: an
+        // out-of-range end would write outside the arena, and `start > end`
+        // would wrap the length into a near-`usize::MAX` fill. Intersect with
+        // the arena instead of trusting the caller.
+        let lo = start.max(self.start as usize);
+        let hi = end.min(self.start as usize + self.size);
+        if lo >= hi {
             return;
         }
+        let (start, len) = (lo, hi - lo);
         #[cfg(target_arch = "wasm32")]
         unsafe {
             ptr::write_bytes(start as *mut u8, 0, len);
