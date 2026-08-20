@@ -7931,9 +7931,12 @@ impl CodeWriter {
                 // interfere structurally and the ordinary
                 // dependency/coalesce/color pass keeps them on distinct
                 // colors without a side-table interference oracle.  The
-                // portal reds (`interp_jit.py:67 reds = ['frame', 'ec']`)
-                // are excluded — they keep their dedicated colors above the
-                // allocator range via the post-color pin.
+                // portal reds (`PyPyJitDriver.reds = ['frame', 'ec']`) are
+                // excluded here: `filter_liveness_in_place` force-alives their
+                // dedicated post-color registers at each reachable marker.
+                // Injecting them into this earlier SSA liveness computation
+                // changes inline/cut decisions instead of merely preserving
+                // the jitdriver reds.
                 // A closed block accepts no further operations; the next
                 // boundary (mergeblock / catch landing) opens the block the
                 // resume point belongs to.

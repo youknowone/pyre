@@ -6813,6 +6813,19 @@ impl PyreSym {
             self.jitcode = jitcode_for(frame.pycode);
             self.concrete_namespace = frame.w_globals;
             self.concrete_execution_context = frame.execution_context;
+            // `PyPyJitDriver.reds = ['frame', 'ec']`: an MIFrame register
+            // contains a Box together with its recording-time value.  The
+            // virtualizable seeding below supplies that value for `frame` and
+            // every vable field, but `ec` is the one extra red outside the
+            // virtualizable layout.  Stamp it explicitly so blackhole.py's
+            // `_copy_data_from_miframe` analogue can copy the symbolic red
+            // without turning it back into a thread-specific ConstPtr.
+            if !self.execution_context.is_none() && !frame.execution_context.is_null() {
+                ctx.try_set_opref_concrete(
+                    self.execution_context,
+                    majit_ir::Value::Ref(majit_ir::GcRef(frame.execution_context as usize)),
+                );
+            }
             self.concrete_vable_ptr = concrete_frame as *mut u8;
             // pyjitpl.py:74-90 MIFrame.setup parity for the per-kind banks
             // (including pyjitpl.py:97-119 copy_constants).
@@ -10729,19 +10742,23 @@ impl JitState for PyreJitState {
         // the vable_array_base branch uses the heap-array path instead
         // of synthesizing parent OpRefs.
         sym.clear_active_vable();
-        // `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`:
-        // `ec` is a root red, not a PyFrame semantic register, so it is not
-        // recovered from `bridge_registers_r` — that bank is sized and
-        // populated from the current MIFrame liveness and has no slot for a
-        // distinct root-red color.
-        //
-        // The root binding `create_sym` left behind (`OpRef::input_arg_ref(1)`)
-        // does not survive here either: a bridge's inputargs come from the
-        // failing guard's failargs, so index 1 addresses nothing in its own
-        // dense stream and closing the trace rejects it. Clear the slot and let
-        // `ensure_execution_context` re-derive ec from this frame, the same
-        // recovery every other adapter path takes.
-        sym.execution_context = OpRef::NONE;
+        // `PyPyJitDriver.reds = ['frame', 'ec']` +
+        // `liveness.compute_liveness`: the explicit `-live-` args keep both
+        // portal reds in every guard's frame-register section.  They are not
+        // semantic PyFrame slots, so the color→slot inversion above correctly
+        // leaves them out of `sym.registers_r`; restore `ec` separately from
+        // its dedicated red color, exactly as `rebuild_from_resumedata` fills
+        // the MIFrame register bank before bridge tracing starts.
+        let (_, portal_ec_reg) = crate::state::portal_red_regs_at(frame0.jitcode_index);
+        sym.execution_context = if portal_ec_reg == u16::MAX {
+            OpRef::NONE
+        } else {
+            bridge_registers_r
+                .get(portal_ec_reg as usize)
+                .copied()
+                .filter(|op| !op.is_none())
+                .unwrap_or(OpRef::NONE)
+        };
         // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
         // must be rebuilt from the resume data so subsequent vable
@@ -13819,7 +13836,10 @@ mod tests {
             );
             crate::assembler::publish_state(&insns, &[], 0, 0);
         }
-        let live_off = crate::state::intern_liveness(&[], &[0, 1, 2], &[])
+        // Three semantic frame colors followed by the two dedicated portal
+        // reds. `PyPyJitDriver.reds = ['frame', 'ec']` keeps the latter in
+        // the frame-register resume section even though they are not locals.
+        let live_off = crate::state::intern_liveness(&[], &[0, 1, 2, 3, 4], &[])
             .expect("bridge liveness must fit in the shared buffer");
         let mut builder = JitCodeBuilder::new();
         let patch = builder.live_placeholder();
@@ -13861,8 +13881,8 @@ mod tests {
                 after_residual_fallthrough_py_pc_marker_by_jit_pc: Vec::new(),
                 after_residual_fallthrough_py_pc_pred_by_jit_pc: Vec::new(),
                 has_color_map: false,
-                portal_frame_reg: 0,
-                portal_ec_reg: 0,
+                portal_frame_reg: 3,
+                portal_ec_reg: 4,
                 built_as_portal: true,
                 stack_base: 1,
                 max_stackdepth: 0,
@@ -13908,9 +13928,10 @@ mod tests {
         let stack0 = w_int_new(43) as i64;
         let globals = w_int_new(44) as i64;
         let live_cell = w_int_new(45) as i64;
+        let execution_context = w_int_new(40) as i64;
         let fail_values = [
             frame_ptr as i64,
-            0,
+            execution_context,
             77,
             code_ref as i64,
             3,
@@ -13943,6 +13964,8 @@ mod tests {
                     RebuiltValue::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(9, Type::Ref),
+                    RebuiltValue::Box(0, Type::Ref),
+                    RebuiltValue::Box(1, Type::Ref),
                 ],
             }],
             // Exercise both authorities in one bridge setup.  The first local's
@@ -13992,6 +14015,7 @@ mod tests {
         );
         assert_eq!(sym.symbolic_local_types, vec![Type::Ref, Type::Ref]);
         assert_eq!(sym.symbolic_stack_types, vec![Type::Ref]);
+        assert_eq!(sym.execution_context, OpRef::input_arg_ref(1));
         assert_eq!(
             sym.bridge_local_oprefs,
             Some(vec![OpRef::input_arg_ref(7), OpRef::input_arg_ref(8)])

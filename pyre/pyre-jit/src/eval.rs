@@ -1749,10 +1749,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // with the wrong TypeInfo (24-byte float payload instead of
     // the real 64 + 8*depth layout), silently truncating every
     // ref root slot past the first three bytes.
-    #[cfg(feature = "cranelift")]
-    majit_backend_cranelift::set_jitframe_gc_type_id(jitframe_tid);
-    #[cfg(feature = "dynasm")]
-    majit_backend_dynasm::set_jitframe_gc_type_id(jitframe_tid);
+    #[cfg(not(target_arch = "wasm32"))]
+    majit_metainterp::set_active_backend_jitframe_gc_type_id(jitframe_tid);
     // The orthodox (PYRE_WASM_CA) frame path allocates host-entry frames as
     // GC-managed JitFrames of this type so the collector forwards their Ref
     // item slots via the jf_gcmap custom trace.
@@ -4383,17 +4381,9 @@ fn build_gc() -> Box<MiniMarkGC> {
 fn install_gc_into_backend() {
     majit_backend_wasm::install_gc_standalone();
 }
-#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn install_gc_into_backend() {
-    majit_backend_cranelift::install_gc_standalone();
-}
-#[cfg(all(
-    feature = "dynasm",
-    not(feature = "cranelift"),
-    not(target_arch = "wasm32")
-))]
-fn install_gc_into_backend() {
-    majit_backend_dynasm::runner::install_gc_standalone();
+    majit_metainterp::install_active_backend_gc_standalone();
 }
 
 /// Non-destructive read of the active backend's `JIT_EXC_VALUE` cell for the
@@ -4403,17 +4393,9 @@ fn install_gc_into_backend() {
 pub(crate) fn jit_exc_value_peek_backend() -> i64 {
     majit_backend_wasm::jit_exc_value_peek()
 }
-#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn jit_exc_value_peek_backend() -> i64 {
-    majit_backend_cranelift::jit_exc_value_peek()
-}
-#[cfg(all(
-    feature = "dynasm",
-    not(feature = "cranelift"),
-    not(target_arch = "wasm32")
-))]
-pub(crate) fn jit_exc_value_peek_backend() -> i64 {
-    majit_backend_dynasm::jit_exc_value_peek()
+    majit_metainterp::active_backend_jit_exc_value_peek()
 }
 #[cfg(not(any(target_arch = "wasm32", feature = "cranelift", feature = "dynasm")))]
 pub(crate) fn jit_exc_value_peek_backend() -> i64 {

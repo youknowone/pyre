@@ -3508,9 +3508,14 @@ fn run_perfn_walk<Sym: WalkSym>(
     // in the int CONSTANT region and are seeded by `copy_constants` inside
     // `dispatch_via_miframe`, so they need no entry seed.  `frame` is the
     // standard-vable identity box (so the body's vable reads hit the
-    // standard fast path); `pycode`/`ec` are const-refs to the live
-    // pointers.  `argboxes_r[i] -> top_regs_r[i]` is the seed channel.
-    let ec_box = ctx.const_ref(sym.concrete_execution_context() as i64);
+    // standard fast path); `pycode` is a const-ref because it is green, while
+    // `ec` must remain the second live red box.  PyPy's
+    // `PyPyJitDriver.reds` names `ec`, and `MIFrame.get_list_of_active_boxes`
+    // snapshots the register Box itself; replacing that Box with the current
+    // concrete address would bake one thread's execution context into every
+    // bridge compiled from this loop.  `argboxes_r[i] -> top_regs_r[i]` is
+    // the seed channel.
+    let ec_box = sym.execution_context();
     let pycode_box = ctx.const_ref(w_code as i64);
     let static_entry_green_ref_regs = if is_bridge_trace {
         None

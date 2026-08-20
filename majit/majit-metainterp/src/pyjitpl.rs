@@ -36,6 +36,57 @@ pub(crate) use majit_backend_dynasm::runner::DynasmBackend as BackendImpl;
 pub(crate) use majit_backend_wasm::WasmBackend as BackendImpl;
 use majit_ir::operand::Operand;
 
+/// Publish the native JITFRAME type id to the CPU selected by this
+/// metainterpreter build.
+///
+/// `MetaInterpStaticData.cpu` is the single backend authority in PyPy.  Keep
+/// that ownership at this crate boundary too: a workspace build may unify
+/// dependency features differently from an interpreter crate's own features,
+/// so the caller cannot reliably repeat the `BackendImpl` cfg decision.
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+pub fn set_active_backend_jitframe_gc_type_id(id: u32) {
+    majit_backend_cranelift::set_jitframe_gc_type_id(id);
+}
+
+#[cfg(all(
+    feature = "dynasm",
+    not(feature = "cranelift"),
+    not(target_arch = "wasm32")
+))]
+pub fn set_active_backend_jitframe_gc_type_id(id: u32) {
+    majit_backend_dynasm::set_jitframe_gc_type_id(id);
+}
+
+/// Install the process-global collector into the native CPU selected above.
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+pub fn install_active_backend_gc_standalone() {
+    majit_backend_cranelift::install_gc_standalone();
+}
+
+#[cfg(all(
+    feature = "dynasm",
+    not(feature = "cranelift"),
+    not(target_arch = "wasm32")
+))]
+pub fn install_active_backend_gc_standalone() {
+    majit_backend_dynasm::runner::install_gc_standalone();
+}
+
+/// Read the pending exception root from the native CPU selected above.
+#[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
+pub fn active_backend_jit_exc_value_peek() -> i64 {
+    majit_backend_cranelift::jit_exc_value_peek()
+}
+
+#[cfg(all(
+    feature = "dynasm",
+    not(feature = "cranelift"),
+    not(target_arch = "wasm32")
+))]
+pub fn active_backend_jit_exc_value_peek() -> i64 {
+    majit_backend_dynasm::jit_exc_value_peek()
+}
+
 static RD_CONSTS_WALK_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(not(any(feature = "cranelift", feature = "dynasm", target_arch = "wasm32")))]
