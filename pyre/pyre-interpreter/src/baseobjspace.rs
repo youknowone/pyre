@@ -14049,6 +14049,35 @@ fn build_default_pick_builtin_module() -> PyObjectRef {
 ///                     expected_length, idx)
 ///     return items
 /// ```
+///
+/// The quoted `@jit.unroll_safe` is deliberately **not** carried on this
+/// function, and porting it alone would invert upstream's decision rather
+/// than match it.  Upstream reaches this body from two directions and hints
+/// only one of them:
+///
+/// * `unpackiterable` goes through `_unpackiterable_known_length`, which is
+///   `@jit.dont_look_inside` — "the JIT stopped looking inside already".
+/// * `unpackiterable_unroll` calls this body directly.  That is the caller
+///   the hint exists for, and its `expected_length` is an UNPACK_SEQUENCE
+///   oparg, so the unroll is bounded by a constant.
+///
+/// pyre has neither `unpackiterable_unroll` nor `fixedview_unroll`, so
+/// [`unpackiterable`] is this body's only caller — the one upstream fences
+/// off.  Being loopy and unhinted, the graph is rejected by
+/// `look_inside_graph` (`majit-translate` `codewriter/policy.rs`) and stays a
+/// residual call, which is the same boundary the shim buys upstream.  Adding
+/// the attribute here would open the fenced path and make `expected_length`
+/// — a plain red argument on a graph ~40 callers share — the unroll bound.
+///
+/// Restoring the split is the orthodox fix, but it is a larger change than
+/// the attribute: `#[majit_macros::dont_look_inside]` registers a helper
+/// call descriptor, and `helper_call_kind_for_type` answers `Unsupported`
+/// for this signature's `Result<Vec<PyObjectRef>, PyError>` (>16 bytes, so
+/// an sret aggregate).  The shim needs an ABI-correct `extern "C" fn(..) ->
+/// i64` publication first, the way `next` is published as
+/// `runtime_ops::bh_next`.  Port `_unpackiterable_known_length` and
+/// `unpackiterable_unroll` together with that publication, and only then the
+/// attribute.
 fn _unpackiterable_known_length_jitlook(
     w_iterator: PyObjectRef,
     expected_length: usize,
