@@ -2329,8 +2329,9 @@ impl Assembler {
                 argcodes.push(kc);
                 // The same descr pair its read and write siblings carry, in
                 // the same order: fielddescr (vable array field) + arraydescr.
-                // `arraylen_vable/rdd>i` reads only the first at run time,
-                // but `expect_matching_vable_array_descrs` checks the pair.
+                // `arraylen_vable/rdd>i` takes the length off the first at
+                // run time, but `vable_array_index_pair_at` reads both and
+                // rejects anything that is not `(VableArray, Array)`.
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableArray {
                     index: *array_index,
                 });

@@ -806,8 +806,9 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         OpKind::ArrayRead { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
         | OpKind::VableArrayRead { item_ty, .. } => value_type_kind(item_ty),
-        OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => RegKind::Int,
-        OpKind::VableArrayLen { .. } => RegKind::Int,
+        OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } | OpKind::VableArrayLen { .. } => {
+            RegKind::Int
+        }
         // Result-less or pyre-only debug variants — `op_args_repr`
         // only reaches this fall-through when `op.result.is_some()`,
         // so any miss surfaces as a real coverage gap to extend.

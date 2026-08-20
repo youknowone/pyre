@@ -3427,7 +3427,7 @@ impl<'a> Transformer<'a> {
                     // virtualizable array is a `FixedObjectArray` of
                     // word-wide `PyObjectRef`s, which is the one shape this
                     // mint accepts, so the element type is that and the pair
-                    // `expect_matching_vable_array_descrs` cross-checks holds.
+                    // `vable_array_index_pair_at` checks holds.
                     item_ty: ValueType::Ref(None),
                     array_itemsize: itemsize,
                     array_is_signed: is_signed,

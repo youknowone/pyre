@@ -1025,10 +1025,10 @@ pub enum OpKind {
     /// the way `rewrite_op_getfield`'s `except VirtualizableArrayField:`
     /// handler drops it.
     ///
-    /// Carries the two descrs its siblings do even though only the
-    /// vable-array one is read at run time: the bytecode key is
-    /// `arraylen_vable/rdd>i` (`insns.rs`), and
-    /// `expect_matching_vable_array_descrs` cross-checks the pair.
+    /// Carries the two descrs its siblings do even though the length comes
+    /// off the vable-array one alone: the bytecode key is
+    /// `arraylen_vable/rdd>i` (`insns.rs`), and `vable_array_index_pair_at`
+    /// rejects a pair that is not `(VableArray, Array)`.
     VableArrayLen {
         base: crate::flowspace::model::Variable,
         array_index: usize,
