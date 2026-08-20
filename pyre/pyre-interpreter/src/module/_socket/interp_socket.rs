@@ -564,19 +564,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IPPROTO_SCTP", ws::IPPROTO_SCTP);
         cst!("IPPROTO_RAW", ws::IPPROTO_RAW);
         cst!("IPPROTO_MAX", ws::IPPROTO_MAX);
-        // `_rsocket_rffi.py constants_w_defaults` — SOL_IP/TCP/UDP
-        // kept for PyPy compatibility.
-        cst!("SOL_IP", 0);
+        // `_rsocket_rffi.py constants_w_defaults` — SOL_TCP/UDP kept for
+        // PyPy compatibility.  `SOL_IP` is the platform's own here:
+        // `ws2def.h` defines it, so the zero placeholder the other arm uses
+        // would name `IPPROTO_IP` instead of the level.
+        cst!("SOL_IP", ws::SOL_IP);
         cst!("SOL_TCP", 6);
         cst!("SOL_UDP", 17);
         // ── INADDR_* (host byte order) ──
-        cst!("INADDR_ANY", ws::INADDR_ANY);
-        cst!("INADDR_LOOPBACK", ws::INADDR_LOOPBACK);
-        cst!("INADDR_BROADCAST", ws::INADDR_BROADCAST);
-        cst!("INADDR_NONE", ws::INADDR_NONE);
-        cst!("INADDR_ALLHOSTS_GROUP", 0xe0000001u32);
-        cst!("INADDR_UNSPEC_GROUP", 0xe0000000u32);
-        cst!("INADDR_MAX_LOCAL_GROUP", 0xe00000ffu32);
+        //
+        // `PyModule_AddIntConstant` takes a C `long`, which is 32 bits here, so
+        // every one of these with the top bit set is published as the negative
+        // number that word spells rather than as its unsigned reading.
+        cst!("INADDR_ANY", ws::INADDR_ANY as i32);
+        cst!("INADDR_LOOPBACK", ws::INADDR_LOOPBACK as i32);
+        cst!("INADDR_BROADCAST", ws::INADDR_BROADCAST as i32);
+        cst!("INADDR_NONE", ws::INADDR_NONE as i32);
+        cst!("INADDR_ALLHOSTS_GROUP", 0xe0000001u32 as i32);
+        cst!("INADDR_UNSPEC_GROUP", 0xe0000000u32 as i32);
+        cst!("INADDR_MAX_LOCAL_GROUP", 0xe00000ffu32 as i32);
         cst!("IPPORT_RESERVED", ws::IPPORT_RESERVED);
         cst!("IPPORT_USERRESERVED", 5000);
         // ── SOL_* / SO_* (socket level) ──
@@ -667,7 +673,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("EAI_FAIL", ws::WSANO_RECOVERY);
         cst!("EAI_FAMILY", ws::WSAEAFNOSUPPORT);
         cst!("EAI_MEMORY", ws::WSA_NOT_ENOUGH_MEMORY);
-        cst!("EAI_NODATA", ws::WSANO_DATA);
+        // `ws2tcpip.h` spells `EAI_NODATA` as `EAI_NONAME`, the RFC 3493
+        // deprecation, so both name `WSAHOST_NOT_FOUND` and not `WSANO_DATA`.
+        cst!("EAI_NODATA", ws::WSAHOST_NOT_FOUND);
         cst!("EAI_NONAME", ws::WSAHOST_NOT_FOUND);
         cst!("EAI_SERVICE", ws::WSATYPE_NOT_FOUND);
         cst!("EAI_SOCKTYPE", ws::WSAESOCKTNOSUPPORT);

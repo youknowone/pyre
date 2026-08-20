@@ -68,8 +68,11 @@ crate::py_module! {
         "REG_NOTIFY_CHANGE_ATTRIBUTES" => 2,
         "REG_NOTIFY_CHANGE_LAST_SET" => 4,
         "REG_NOTIFY_CHANGE_SECURITY" => 8,
-        "REG_LEGAL_CHANGE_FILTER" => 0x000F,
-        "REG_LEGAL_OPTION" => 0x000F,
+        // Both masks carry a bit whose own name `winreg` does not publish:
+        // `REG_NOTIFY_THREAD_AGNOSTIC` in the filter, `REG_OPTION_DONT_VIRTUALIZE`
+        // in the option word.
+        "REG_LEGAL_CHANGE_FILTER" => 0x1000_000F,
+        "REG_LEGAL_OPTION" => 0x001F,
     },
     extra_init: |ns| {
         #[cfg(feature = "host_env")]
