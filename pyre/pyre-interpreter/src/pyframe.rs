@@ -360,22 +360,29 @@ pub mod frame_locals_proxy {
         }
 
         fn __delitem__(&mut self, key: PyObjectRef) -> Result<(), crate::PyError> {
-            // The snapshot, the lookup, the fast-local scan and the extras dict
-            // all allocate, so reload the key between them.
+            // `framelocalsproxy_setitem` with no value: the scan decides, and
+            // only a key it places nowhere goes on to the extras dict.  Probing
+            // the snapshot first instead built a whole mapping to reject one
+            // name, and reported an unhashable key in that dict's terms rather
+            // than as the hash's own `TypeError`.
+            //
+            // The extras lookup allocates, so reload the key from its root.
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             roots.pin_root(key);
-            let mapping = self.mapping()?;
-            // Perform the lookup first so absent/unhashable keys retain the
-            // underlying mapping's KeyError/TypeError.
-            crate::baseobjspace::getitem(mapping, roots.get(key_slot))?;
             if self.key_is_fast_local(roots.get(key_slot))? {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            let extra = self.frame().get_or_create_extra_locals();
-            crate::baseobjspace::delitem(extra, roots.get(key_slot))
+            // A delete does not create the extras dict that a store would.
+            let extra = self.frame().get_extra_locals();
+            if extra.is_null() {
+                return Err(crate::PyError::key_error_with_key(roots.get(key_slot)));
+            }
+            let extra_slot = key_slot + 1;
+            roots.pin_root(extra);
+            crate::baseobjspace::delitem(roots.get(extra_slot), roots.get(key_slot))
         }
 
         fn __len__(&self) -> Result<i64, crate::PyError> {
@@ -523,25 +530,39 @@ pub mod frame_locals_proxy {
             if args.len() < 2 || args.len() > 3 {
                 return Err(crate::PyError::type_error("pop expected 1 or 2 arguments"));
             }
-            // The snapshot, the lookup, the fast-local scan and the extras dict
-            // all allocate, so publish the incoming arguments and rebuild the
-            // slice for the delegated call.
+            // `framelocalsproxy_pop`: the scan decides, and only a key it
+            // places nowhere reaches the extras dict.  Probing the snapshot
+            // first discarded the lookup's error, so an unhashable key came
+            // back as a `KeyError` naming that key instead of the `TypeError`
+            // the hash raises.
+            //
+            // The extras lookup allocates, so publish the incoming arguments
+            // and rebuild the slice for the delegated call.
             let roots = pyre_object::gc_roots::push_roots();
             let args_base = roots.publish(&args[1..]);
             let nargs = args.len() - 1;
             roots.normalize(args_base, nargs);
-            let mapping = self.mapping()?;
-            if crate::baseobjspace::getitem(mapping, roots.get(args_base)).is_ok()
-                && self.key_is_fast_local(roots.get(args_base))?
-            {
+            if self.key_is_fast_local(roots.get(args_base))? {
                 return Err(crate::PyError::value_error(
                     "cannot remove local variables from FrameLocalsProxy",
                 ));
             }
-            let extra = self.frame().get_or_create_extra_locals();
+            let extra = self.frame().get_extra_locals();
+            if extra.is_null() {
+                // A frame with no extras dict answers the default if one was
+                // passed and reports the key itself otherwise; it does not
+                // gain a dict from a pop that finds nothing.
+                return if nargs == 2 {
+                    Ok(roots.get(args_base + 1))
+                } else {
+                    Err(crate::PyError::key_error_with_key(roots.get(args_base)))
+                };
+            }
+            let extra_slot = args_base + nargs;
+            roots.pin_root(extra);
             let call_args: Vec<PyObjectRef> =
                 (0..nargs).map(|i| roots.get(args_base + i)).collect();
-            let result = crate::baseobjspace::call_method(extra, "pop", &call_args);
+            let result = crate::baseobjspace::call_method(roots.get(extra_slot), "pop", &call_args);
             if result.is_null() {
                 Err(crate::call::take_call_error()
                     .unwrap_or_else(|| crate::PyError::runtime_error("pop failed")))
