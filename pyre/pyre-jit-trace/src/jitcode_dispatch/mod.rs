@@ -12347,13 +12347,18 @@ fn handle<Sym: WalkSym>(
                         // replayed short-preamble guard (unroll.py:409).
                         //
                         // Emitted on this leg only, so the own-loop leg is not
-                        // double-guarded. `next_instr` is the merge point being
-                        // crossed — the loop header the synthesized JUMP goes
-                        // to, matching `close_loop_args_at`'s `orgpc =
-                        // target_pc` rather than the back edge that got here.
+                        // double-guarded. The capture coordinate is the
+                        // `jit_merge_point` op's OWN JitCode pc — the walk is
+                        // standing on the loop header, so "where we are" and
+                        // "where the synthesized JUMP goes" are the same
+                        // program point. `next_instr` is the green Python pc
+                        // (`make_green_key` above); feeding it to a parameter
+                        // read as a JitCode offset resolves an unrelated
+                        // `-live-` marker, and the snapshot then describes a
+                        // program point the walk registers hold nothing for.
                         ctx.trace_ctx
                             .record_guard(OpCode::GuardFutureCondition, &[], 0);
-                        walker_capture_snapshot_for_last_guard(ctx, next_instr)?;
+                        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
                         // `JitDriver::merge_point` states the rule the latch runs
                         // under: only latch what an attempt actually rejected.
                         // The give-up below returns without calling into
