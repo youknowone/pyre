@@ -4520,7 +4520,19 @@ pub fn is_builtin_ord_function(callable: PyObjectRef) -> bool {
 /// paths through `abstractinst.py`; a rebound global must not inherit that
 /// classification merely because it is still named `isinstance`.
 pub fn is_builtin_isinstance_function(callable: PyObjectRef) -> bool {
-    is_builtin_code_function(callable, __pyre_wrap_builtin_isinstance)
+    unsafe {
+        if callable.is_null() || !crate::is_function(callable) {
+            return false;
+        }
+        let code = crate::function_get_code(callable) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(
+            crate::gateway::builtin_code_get(code),
+            __pyre_wrap_builtin_isinstance as crate::gateway::BuiltinCodeFn,
+        )
+    }
 }
 
 /// `len(obj)` — return the length of an object.

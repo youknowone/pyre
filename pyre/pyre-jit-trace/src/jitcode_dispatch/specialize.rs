@@ -7135,6 +7135,98 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `isinstance(obj, cls)` in the quick exact-type case from
+/// `abstractinst.py` `abstract_isinstance_w`: before tuple/union recursion or
+/// `__instancecheck__` lookup, `type(obj) is cls` returns `True`.
+///
+/// Every other shape declines to the residual call, including tuple classinfo,
+/// unions, subclass-but-not-exact matches, mismatches, and cases whose class
+/// identity cannot be pinned with the existing object-class guards.
+pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, obj, cls)` shape only.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(obj),
+        ConcreteValue::Ref(cls),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
+    // prepends as arg0, not a plain `isinstance(obj, cls)` call.
+    if concrete_callable.is_null() || !null_or_self.is_null() || obj.is_null() || cls.is_null() {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_isinstance_function(concrete_callable) {
+        return Ok(None);
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return Ok(None);
+    }
+    let Some(obj_type) = pyre_interpreter::typedef::r#type(obj) else {
+        return Ok(None);
+    };
+    if !std::ptr::eq(obj_type.as_ptr(), cls) {
+        return Ok(None);
+    }
+    let (physical_type, exact_w_class) = unsafe {
+        let physical_type = (*obj).ob_type as i64;
+        let stored_w_class = (*obj).w_class;
+        if stored_w_class.is_null() {
+            (physical_type, None)
+        } else if std::ptr::eq(stored_w_class, cls) {
+            (physical_type, Some(stored_w_class))
+        } else {
+            return Ok(None);
+        }
+    };
+
+    // --- emit the specialized IR (walker-native) ---
+    // Pin the callable identity (LOAD_GLOBAL `isinstance` is usually already
+    // constant via the namespace cell fold).
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let obj_op = r_args[2];
+    walker_guard_class(ctx, op.pc, obj_op, physical_type)?;
+    if let Some(exact_w_class) = exact_w_class {
+        walker_guard_exact_w_class(ctx, op.pc, obj_op, exact_w_class)?;
+    }
+    let cls_op = r_args[3];
+    if !cls_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(cls as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[cls_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(cls_op, expected);
+    }
+    walker_write_const_bool_result(ctx, op.pc, true, dst, 'r')?;
+    Ok(Some(()))
+}
+
 /// Fold plain `getattr(type, name)` when
 /// [`pyre_interpreter::type_attr_value_fast_path`] proves that
 /// `typeobject.py:811-828` returns the class-MRO value unchanged.  The exact
