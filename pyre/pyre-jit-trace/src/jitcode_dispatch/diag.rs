@@ -360,6 +360,7 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 72] = [
     ("zip_two_tuple_iters",       "specialize",    "for_iter_next"),
     ("instance_next",             "residual_call", "-"),
     ("frame_lasti",               "specialize",    "load_attr"),
+    ("load_deref",                "residual_call", "-"),
 ];
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();

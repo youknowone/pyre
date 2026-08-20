@@ -5,20 +5,106 @@
 //! inner functions.
 
 use crate::pyobject::*;
+use crate::quasiimmut::QuasiImmutField;
 use pyre_macros::pyre_class;
+use std::sync::Arc;
+
+/// nestedscope.py:134-139 `class CellFamily` — one per cellvar name of a code
+/// object (`pycode.py:190`).
+///
+/// Every cell a frame creates for that cellvar shares this object, so
+/// `ever_mutated` accumulates across frame instantiations: a binding that is
+/// only ever filled once leaves it false, and that is what lets a cell the
+/// trace has as a constant fold its contents.
+pub struct CellFamily {
+    /// nestedscope.py:138 `name` — the cellvar this family belongs to.
+    pub name: String,
+    /// nestedscope.py:139 `ever_mutated`, declared quasi-immutable by
+    /// nestedscope.py:135 `_immutable_fields_ = ['ever_mutated?']`.  Recorded
+    /// on a bound-to-bound transition ([`w_cell_set`]) and by
+    /// [`w_cell_delete`]; [`Self::set_ever_mutated`] invalidates watchers
+    /// before changing it.
+    pub ever_mutated: std::cell::Cell<bool>,
+    /// The hidden watcher field for that `?` declaration, written out because
+    /// pyre has no rtyper to synthesise it.  Mirrors
+    /// `PlainAttribute::ever_mutated_watchers`: the owner is a
+    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
+    /// `Drop` is unreachable and its inner box is reclaimed only through
+    /// [`QuasiImmutField::invalidate`].
+    pub ever_mutated_watchers: QuasiImmutField,
+}
+
+impl CellFamily {
+    /// nestedscope.py:137-139 `CellFamily.__init__`.
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            ever_mutated: std::cell::Cell::new(false),
+            ever_mutated_watchers: QuasiImmutField::new(),
+        }
+    }
+
+    /// Change nestedscope.py:139 `ever_mutated` using the ordering, fast path,
+    /// and repeated-value guard `PlainAttribute::set_ever_mutated` documents.
+    pub fn set_ever_mutated(&self, v: bool) {
+        if self.ever_mutated.get() == v {
+            return;
+        }
+        if self.ever_mutated_watchers.is_installed() {
+            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.ever_mutated_watchers) };
+        }
+        self.ever_mutated.set(v);
+    }
+
+    pub fn current_ever_mutated_qmut(&self) -> Arc<crate::quasiimmut::QuasiImmut> {
+        self.ever_mutated_watchers.get_current_qmut_instance()
+    }
+
+    pub fn ever_mutated_qmut_installed(&self) -> bool {
+        self.ever_mutated_watchers.is_installed()
+    }
+
+    pub fn force_ever_mutated_qmut(&self) {
+        self.ever_mutated_watchers.invalidate();
+    }
+}
+
+/// nestedscope.py:141-142 `DUMMY_FAMILY` — the family a cell built by hand
+/// carries (`descr_new_cell`, and any cell whose code object has no family
+/// table).  Its `ever_mutated` starts true, so such a cell never folds.
+///
+/// Held as a leaked address rather than a `OnceLock<CellFamily>` because the
+/// `std::cell::Cell<bool>` inside makes the family non-`Sync`, and the
+/// allocation must outlive every cell pointing at it anyway.
+pub fn dummy_family() -> *const CellFamily {
+    static DUMMY_FAMILY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DUMMY_FAMILY.get_or_init(|| {
+        let family = CellFamily::new("<dummy>".to_string());
+        family.ever_mutated.set(true);
+        Box::into_raw(Box::new(family)) as usize
+    }) as *const CellFamily
+}
 
 /// Python cell object.
 ///
-/// Layout: `[ob_type: *const PyType | contents: PyObjectRef]`
+/// Layout: `[ob_type: *const PyType | contents: PyObjectRef | family]`
 /// `contents` is `PY_NULL` when the cell is empty.
 #[pyre_class("cell", type_id = 15, static_name = "CELL")]
 pub struct Cell {
     pub contents: PyObjectRef,
+    /// nestedscope.py:25/29 `_immutable_fields_ = ['family']` — the
+    /// [`CellFamily`] shared with every other cell of the same cellvar.  Never
+    /// null.  The families are leaked, not managed, so this word is absent
+    /// from the traced pointer offsets and outlives the code object that
+    /// created it — a closure keeps its cells alive long after the enclosing
+    /// code object is collected.
+    pub family: *const CellFamily,
 }
 
-/// Allocate a new cell wrapping `value`.
-/// Pass `PY_NULL` for an empty cell.
-pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
+/// Allocate a new cell wrapping `value` (`nestedscope.py` `Cell.__init__`).
+/// Pass `PY_NULL` for an empty cell, and [`dummy_family`] when no code object
+/// owns the binding.
+pub fn w_cell_new(value: PyObjectRef, family: *const CellFamily) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`): `value`
     // is a live GC pointer that must survive — and be relocated by — the
     // collection the GC malloc below may trigger. `pin_root` records it in
@@ -45,6 +131,7 @@ pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
                 Cell {
                     ob: header,
                     contents: value,
+                    family,
                 },
             );
         }
@@ -58,6 +145,7 @@ pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
     Cell::allocate(Cell {
         ob: header,
         contents: value,
+        family,
     })
 }
 
@@ -79,13 +167,32 @@ pub unsafe fn w_cell_get(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const Cell)).contents }
 }
 
-/// Set the value stored in a cell.
+/// The [`CellFamily`] shared by every cell of this cell's cellvar.
+///
+/// # Safety
+/// `obj` must point to a valid `Cell`.
+#[inline]
+pub unsafe fn w_cell_family(obj: PyObjectRef) -> *const CellFamily {
+    unsafe { (*(obj as *const Cell)).family }
+}
+
+/// Set the value stored in a cell (nestedscope.py:53-56 `Cell.set`).
 ///
 /// # Safety
 /// `obj` must point to a valid `Cell`.
 #[inline]
 pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
-    unsafe { (*(obj as *mut Cell)).contents = value }
+    // nestedscope.py:54-55: only a bound-to-bound transition counts as a
+    // mutation.  The first binding of a cellvar does not, which is what keeps
+    // the ordinary write-once closure variable foldable.
+    let cell = obj as *mut Cell;
+    if !unsafe { (*cell).contents }.is_null() {
+        let family = unsafe { (*cell).family };
+        if !family.is_null() {
+            unsafe { (*family).set_ever_mutated(true) };
+        }
+    }
+    unsafe { (*cell).contents = value }
     // The cell is an old-gen (`try_gc_alloc_stable`) object; storing a
     // possibly-nursery `value` into it needs the incminimark write barrier
     // (incminimark.py:1495) so the next minor collection scans the cell and
@@ -93,13 +200,40 @@ pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
+/// Clear a cell (nestedscope.py:58-63 `Cell.delete`).  Records the mutation
+/// whatever the cell held, then clears it; returns false instead of raising
+/// upstream's `ValueError` when the cell was already empty.
+///
+/// # Safety
+/// `obj` must point to a valid `Cell`.
+#[inline]
+pub unsafe fn w_cell_delete(obj: PyObjectRef) -> bool {
+    let cell = obj as *mut Cell;
+    let family = unsafe { (*cell).family };
+    if !family.is_null() {
+        unsafe { (*family).set_ever_mutated(true) };
+    }
+    if unsafe { (*cell).contents }.is_null() {
+        return false;
+    }
+    unsafe { (*cell).contents = PY_NULL }
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A family that lives as long as the test, standing in for the one a code
+    /// object owns.
+    fn leak_family() -> *const CellFamily {
+        Box::into_raw(Box::new(CellFamily::new("x".to_string()))) as *const CellFamily
+    }
+
     #[test]
     fn test_cell_create_empty() {
-        let cell = w_cell_new(PY_NULL);
+        let cell = w_cell_new(PY_NULL, leak_family());
         unsafe {
             assert!(is_cell(cell));
             assert!(w_cell_get(cell).is_null());
@@ -109,7 +243,7 @@ mod tests {
     #[test]
     fn test_cell_create_with_value() {
         let value = 0xDEAD as PyObjectRef;
-        let cell = w_cell_new(value);
+        let cell = w_cell_new(value, leak_family());
         unsafe {
             assert!(is_cell(cell));
             assert_eq!(w_cell_get(cell), value);
@@ -118,12 +252,69 @@ mod tests {
 
     #[test]
     fn test_cell_set() {
-        let cell = w_cell_new(PY_NULL);
+        let cell = w_cell_new(PY_NULL, leak_family());
         let value = 0xBEEF as PyObjectRef;
         unsafe {
             w_cell_set(cell, value);
             assert_eq!(w_cell_get(cell), value);
         }
+    }
+
+    /// nestedscope.py:54-55 — the first binding of an empty cell is not a
+    /// mutation; a second write to a bound cell is.
+    #[test]
+    fn first_binding_is_not_a_mutation() {
+        let family = leak_family();
+        let cell = w_cell_new(PY_NULL, family);
+        unsafe {
+            w_cell_set(cell, 0xBEEF as PyObjectRef);
+            assert!(!(*family).ever_mutated.get());
+            w_cell_set(cell, 0xCAFE as PyObjectRef);
+            assert!((*family).ever_mutated.get());
+        }
+    }
+
+    /// The family is shared, so one cell's rebinding closes folding for every
+    /// other cell of the same cellvar — the accumulation across frame
+    /// instantiations `pycode.py:190` exists for.
+    #[test]
+    fn mutation_is_recorded_on_the_shared_family() {
+        let family = leak_family();
+        let first = w_cell_new(PY_NULL, family);
+        let second = w_cell_new(PY_NULL, family);
+        unsafe {
+            w_cell_set(first, 0xBEEF as PyObjectRef);
+            w_cell_set(first, 0xCAFE as PyObjectRef);
+            assert!((*w_cell_family(second)).ever_mutated.get());
+        }
+    }
+
+    /// nestedscope.py:58-60 — `delete` records the mutation whatever the cell
+    /// held, unlike `set`, and reports the already-empty case instead of
+    /// raising.
+    #[test]
+    fn delete_always_records_the_mutation() {
+        let family = leak_family();
+        let cell = w_cell_new(PY_NULL, family);
+        unsafe {
+            assert!(!w_cell_delete(cell));
+            assert!((*family).ever_mutated.get());
+
+            let bound = leak_family();
+            let cell = w_cell_new(0xBEEF as PyObjectRef, bound);
+            assert!(w_cell_delete(cell));
+            assert!(w_cell_get(cell).is_null());
+            assert!((*bound).ever_mutated.get());
+        }
+    }
+
+    /// nestedscope.py:141-142 — a hand-built cell can never fold.
+    #[test]
+    fn dummy_family_starts_mutated() {
+        unsafe {
+            assert!((*dummy_family()).ever_mutated.get());
+        }
+        assert_eq!(dummy_family(), dummy_family());
     }
 
     /// Guard against drift between the constant colocated with

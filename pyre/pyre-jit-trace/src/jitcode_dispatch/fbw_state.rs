@@ -2879,13 +2879,14 @@ pub(crate) fn fbw_callee_body_replay_safety(
             // replay reads the same value again.  Its writing twin
             // `SetCurrentException` is not here — it is journalled, and so
             // reaches the `deferred_call` arm below instead.
-            // `load_deref` reads the same shape once more — `bh_load_deref_value_fn`
-            // dereferences a cell and returns its contents, writing nothing —
-            // but it is absent from this list because it reaches it untagged:
-            // the `load_deref_value` emit in `codewriter.rs` passes no
-            // `PyreHelperKind`, so `ei.pyre_helper` is `None` and every closure
-            // body that reads a free variable declines here.  Admitting it is a
-            // tag away, not a proof away.
+            // `load_deref` reads the same shape once more —
+            // `bh_load_deref_value_fn` dereferences a cell and returns its
+            // contents, writing nothing.  Its unbound `NameError` is the same
+            // shape as `load_global`'s and commits nothing either, so replaying
+            // it raises the same error again.  It reached this scan untagged
+            // until `load_deref_value` started carrying `PyreHelperKind::LoadDeref`
+            // for the `Cell.get` fold, and every closure body that read a free
+            // variable declined here for want of that tag alone.
             // `load_import` is `load_global`'s narrower half: both resolve a
             // name through `finditem_str`, but that one reads the frame's
             // globals first -- which may be an arbitrary mapping, so it can
@@ -2908,6 +2909,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 ei.pyre_helper,
                 majit_ir::PyreHelperKind::LoadConst
                     | majit_ir::PyreHelperKind::LoadGlobal
+                    | majit_ir::PyreHelperKind::LoadDeref
                     | majit_ir::PyreHelperKind::LoadImport
                     | majit_ir::PyreHelperKind::LoadImportLocals
                     | majit_ir::PyreHelperKind::BoxInt

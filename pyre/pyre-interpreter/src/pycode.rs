@@ -4,6 +4,7 @@
 //! be placed on the value stack as a PyObjectRef during `LoadConst`.
 //! MakeFunction then extracts this pointer to build a function object.
 
+use pyre_object::nestedscope::CellFamily;
 use pyre_object::pyobject::*;
 use pyre_object::{
     w_bool_from, w_bool_get_value, w_int_new, w_list_new, w_seq_iter_new, w_str_new, w_tuple_new,
@@ -412,6 +413,24 @@ pub struct PyCode {
     /// `PyFrame::ncells()` / stack-base query (a per-`pop_value` hot path).
     /// `u32::MAX` sentinel when `code_ptr` is null/unaligned (test stubs).
     pub npure_cellvars: u32,
+    /// `pycode.py self.cell_families = [CellFamily(name) for name in
+    /// cellvars]` — one [`CellFamily`] per cellvar, shared by every cell any
+    /// frame of this code creates for that cellvar.
+    ///
+    /// Indexed by localsplus slot rather than by cellvar position: pyre
+    /// follows the 3.11 unified slot layout, where a cellvar that also names a
+    /// parameter shares that parameter's slot and the rest occupy the
+    /// pure-cellvar band, so both creation sites
+    /// ([`crate::pyframe::PyFrame::initialize_frame_scopes`] and `MAKE_CELL`)
+    /// index in O(1).  Slots naming no cellvar hold null; `null` table when
+    /// `code_ptr` is invalid or the code has no cellvars
+    /// (pycode.py `PyCode._initialize`).
+    ///
+    /// The `Vec` is owned via `Box::into_raw` and dropped with the wrapper, but
+    /// the families it points at are leaked: a cell outlives the code object
+    /// that made it whenever a closure survives its enclosing function, and
+    /// `Cell.family` is a raw, untraced pointer.
+    pub cell_families: *mut Vec<*const CellFamily>,
     /// `pycode.py self._globals_caches = [None] * len(self.co_names_w)`.
     ///
     /// Per-name slot for `LOAD_GLOBAL_cached` / `STORE_GLOBAL_cached`
@@ -887,6 +906,39 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
         crate::pyframe::npure_cellvars(code_ref) as u32
     };
+    // `pycode.py:190 self.cell_families = [CellFamily(name) for name in
+    // cellvars]`, laid out by localsplus slot — see the field's doc.
+    // pycode.py:191-193 leaves the list empty when the code has no cellvars.
+    let cell_families = if !code_ptr_aligned {
+        std::ptr::null_mut()
+    } else {
+        let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        if code_ref.cellvars.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            let nvarnames = code_ref.varnames.len();
+            let mut slots: Vec<*const CellFamily> =
+                vec![std::ptr::null(); nvarnames + npure_cellvars as usize];
+            let mut pure = 0usize;
+            for cellvar in code_ref.cellvars.iter() {
+                let cellname: &str = cellvar.as_ref();
+                let family = Box::into_raw(Box::new(CellFamily::new(cellname.to_string())))
+                    as *const CellFamily;
+                let shared = code_ref.varnames.iter().position(|varname| {
+                    let varname: &str = varname.as_ref();
+                    varname == cellname
+                });
+                match shared {
+                    Some(slot) => slots[slot] = family,
+                    None => {
+                        slots[nvarnames + pure] = family;
+                        pure += 1;
+                    }
+                }
+            }
+            Box::into_raw(Box::new(slots))
+        }
+    };
     let co_firstlineno_raw = if code_ptr.is_null() || (code_ptr as i64) & align_mask != 0 {
         1
     } else {
@@ -909,6 +961,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         hidden_applevel,
         fast_natural_arity,
         npure_cellvars,
+        cell_families,
         globals_caches,
         mapdict_caches,
         co_consts_w,
@@ -3080,6 +3133,13 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&obj_addr);
+    if !code.cell_families.is_null() {
+        // Only the slot table. The families themselves stay allocated: cells
+        // created from this code may still be alive in a surviving closure,
+        // and each holds an untraced `Cell.family` pointer into them.
+        drop(unsafe { Box::from_raw(code.cell_families) });
+        code.cell_families = std::ptr::null_mut();
+    }
     if !code.globals_caches.is_null() {
         drop(unsafe { Box::from_raw(code.globals_caches) });
         code.globals_caches = std::ptr::null_mut();
@@ -3216,6 +3276,30 @@ pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
     }
     let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     code.exceptiontable.to_vec()
+}
+
+/// `pycode.py:190 cell_families[...]` for the cellvar occupying localsplus
+/// slot `slot` (`pyframe.py:239-240`).
+///
+/// Falls back to `nestedscope.py:141 DUMMY_FAMILY` — never null — when the
+/// slot names no cellvar or the code carries no family table, so a cell is
+/// always constructible and one built without a family simply never folds.
+///
+/// # Safety
+/// `obj` must point to a valid `PyCode` (or be null).
+#[inline]
+pub unsafe fn w_code_cell_family(obj: PyObjectRef, slot: usize) -> *const CellFamily {
+    if obj.is_null() {
+        return pyre_object::nestedscope::dummy_family();
+    }
+    let code = unsafe { &*(obj as *const PyCode) };
+    if code.cell_families.is_null() {
+        return pyre_object::nestedscope::dummy_family();
+    }
+    match unsafe { &*code.cell_families }.get(slot) {
+        Some(family) if !family.is_null() => *family,
+        _ => pyre_object::nestedscope::dummy_family(),
+    }
 }
 
 /// `celldict.py:292 cache_wref = pycode._globals_caches[nameindex]` —

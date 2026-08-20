@@ -1032,6 +1032,15 @@ pub enum PyreHelperKind {
     /// (Finding #1) so an aborting FOR_ITER walk refuses delivery rather than
     /// re-running the body and doubling the cell write.
     StoreDeref,
+    /// `load_deref_value(cell, code, deref_idx)` — the LOAD_DEREF read residual
+    /// (`bh_load_deref_value_fn` via `cpu.load_deref_value_fn`).  The full-body
+    /// walker recognises this tag to reproduce `nestedscope.py:31-44 Cell.get`:
+    /// a cell the trace holds as a constant whose family has never seen a
+    /// bound-to-bound rebinding folds to its contents under a
+    /// `QUASIIMMUT_FIELD(family, ever_mutated)`, and every other shape keeps the
+    /// residual.  Recognition only — this tag confers no replay-safety
+    /// standing, so an unfolded read still classifies the enclosing body dirty.
+    LoadDeref,
     /// `jit_list_append(list, value)` — the LIST_APPEND residual the
     /// codewriter emits for a comprehension append (`[f(x) for x in xs]`
     /// inlines LIST_APPEND into the enclosing function).  The two Ref

@@ -53,7 +53,14 @@
 # GetarrayitemGcR and aborting at the result branch.
 #
 # The abort is what this fixture guards, and check.py's regression floor gates
-# `loops_aborted` at 0 independently of the ratio below.  Bridge resume must
+# `loops_aborted` at 0 independently of the ratio below.  `forward` reaches that
+# floor through the admitted path, not around it: `load_deref_value` carries
+# `PyreHelperKind::LoadDeref`, so the body classifies `DeferredCall` rather than
+# `Dirty` and is admitted on its first attempt, and the `adjust(scaled)` call it
+# then reaches leaves its `Fraction.__add__` residual standing without breaking
+# the admission -- `fbw_abort_nested_unjournaled_residual` declines only the
+# hazardous self-recursive callee shape.  An abort at the LOAD_DEREF result
+# branch is the regression this guards.  Bridge resume must
 # retain the callee frame's own globals identity: treating its valid pc=0 as a
 # failed decode leaves two guards failing on nearly every iteration, while
 # guarding the callee namespace through the portal/root frame compiles an

@@ -16323,7 +16323,12 @@ fn cell_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             )));
         }
     };
-    Ok(pyre_object::w_cell_new(contents))
+    // `nestedscope.py:131 return Cell(w_obj, DUMMY_FAMILY)` — no code object
+    // owns this binding, so the cell can never fold.
+    Ok(pyre_object::w_cell_new(
+        contents,
+        pyre_object::nestedscope::dummy_family(),
+    ))
 }
 
 /// `nestedscope.py make_cell_cmp` / CPython 3.14
@@ -16526,8 +16531,8 @@ fn init_cell_type(ns: PyObjectRef) {
     //             pass # CPython ignores it
     //
     // Pyre clears the cell to PY_NULL so a subsequent read raises the
-    // same `Cell is empty` message; the `ValueError` from
-    // `Cell.delete()` is swallowed per the upstream comment.
+    // same `Cell is empty` message; `w_cell_delete` reports the empty case
+    // the upstream comment says to swallow instead of raising it.
     let cell_contents_deleter = make_builtin_function_with_arity(
         "cell_contents",
         |args| {
@@ -16537,7 +16542,7 @@ fn init_cell_type(ns: PyObjectRef) {
                     "descriptor 'cell_contents' for 'cell' objects doesn't apply",
                 ));
             }
-            unsafe { pyre_object::w_cell_set(cell, pyre_object::PY_NULL) };
+            unsafe { pyre_object::w_cell_delete(cell) };
             Ok(pyre_object::w_none())
         },
         2,
@@ -31883,10 +31888,12 @@ mod tests {
 
     fn check_cell_comparison_repr_and_hash() {
         crate::typedef::init_typeobjects();
-        let empty = pyre_object::w_cell_new(pyre_object::PY_NULL);
-        let one = pyre_object::w_cell_new(pyre_object::w_int_new(1));
-        let one_again = pyre_object::w_cell_new(pyre_object::w_int_new(1));
-        let two = pyre_object::w_cell_new(pyre_object::w_int_new(2));
+        // Hand-built like `descr_new_cell`, so `nestedscope.py:141 DUMMY_FAMILY`.
+        let family = pyre_object::nestedscope::dummy_family();
+        let empty = pyre_object::w_cell_new(pyre_object::PY_NULL, family);
+        let one = pyre_object::w_cell_new(pyre_object::w_int_new(1), family);
+        let one_again = pyre_object::w_cell_new(pyre_object::w_int_new(1), family);
+        let two = pyre_object::w_cell_new(pyre_object::w_int_new(2), family);
 
         assert!(
             crate::baseobjspace::is_true(super::cell_descr_lt(&[empty, one]).unwrap()).unwrap()

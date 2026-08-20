@@ -7012,7 +7012,7 @@ pub extern "C" fn bh_store_deref_value_fn(cell: i64, value: i64) -> i64 {
     }
 }
 
-/// MAKE_CELL residual (`make_cell_value` HLOp → `residual_call_r_r`).
+/// MAKE_CELL residual (`make_cell_value` HLOp → `residual_call_ir_r`).
 /// `current` is the slot read from `locals_cells_stack_w`.  Mirrors
 /// `make_cell`: wrap the value in a fresh cell when the slot does not
 /// already hold one (`initialize_frame_scopes` installs cells for pure
@@ -7020,12 +7020,20 @@ pub extern "C" fn bh_store_deref_value_fn(cell: i64, value: i64) -> i64 {
 /// raw value here), and return the cell the caller stores back into the
 /// slot.  A slot already holding a cell is returned unchanged so a
 /// never-reassigned cellvar does not become a cell wrapping a cell.
+/// `code` + `slot` name the `pycode.py:190` cell family the new cell joins
+/// (`pyframe.py:239-240`).
 /// Allocates (may trigger a minor GC) but runs no user code and never
 /// raises (`CallFlavor::Plain`).
-pub extern "C" fn bh_make_cell_fn(current: i64) -> i64 {
+pub extern "C" fn bh_make_cell_fn(current: i64, code: i64, slot: i64) -> i64 {
     let cur = current as pyre_object::PyObjectRef;
     if cur.is_null() || !unsafe { pyre_object::is_cell(cur) } {
-        pyre_object::w_cell_new(cur) as i64
+        let family = unsafe {
+            pyre_interpreter::pycode::w_code_cell_family(
+                code as pyre_object::PyObjectRef,
+                slot as usize,
+            )
+        };
+        pyre_object::w_cell_new(cur, family) as i64
     } else {
         current
     }

@@ -5053,6 +5053,72 @@ fn mapdict_qmut_force_enabled() -> bool {
     std::env::var_os("PYRE_QMUT_MAPDICT_FORCE").is_some()
 }
 
+/// `nestedscope.py:31-44 Cell.get` for the LOAD_DEREF residual.
+///
+/// ```python
+/// def get(self):
+///     if jit.isconstant(self):
+///         if not self.family.ever_mutated:
+///             w_res = self._elidable_get()
+///             if w_res is not None:
+///                 return w_res
+///     ...
+///     return self.w_value
+/// ```
+///
+/// A cell the trace already holds as a constant — the ordinary freevar read,
+/// whose cell reaches the callee through the pinned callable's quasi-immutable
+/// `closure` — folds to its contents under a
+/// `QUASIIMMUT_FIELD(family, ever_mutated)`, so the read leaves no residual at
+/// all.  Every other shape declines and keeps the residual.
+///
+/// The `w_res is not None` re-check is load-bearing, not defensive: with
+/// `ever_mutated` false, the elidable read may hand back a stale unbound `None`
+/// for a cell that has since been bound for the first time (that first binding
+/// is deliberately not a mutation).  Dropping the check would fold a wrong
+/// answer, so a null falls through to the live residual read.
+fn try_walker_specialize_load_deref<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+) -> Result<Option<OpRef>, DispatchError> {
+    // nestedscope.py:32 `if jit.isconstant(self)`.
+    let Some(&cell_op) = r_args.first() else {
+        return Ok(None);
+    };
+    if !cell_op.is_constant() {
+        return Ok(None);
+    }
+    let Some(majit_ir::Value::Ref(cell_ref)) = ctx.trace_ctx.box_value(cell_op) else {
+        return Ok(None);
+    };
+    let cell = cell_ref.0 as pyre_object::PyObjectRef;
+    if cell.is_null() || !unsafe { pyre_object::is_cell(cell) } {
+        return Ok(None);
+    }
+    let family = unsafe { pyre_object::w_cell_family(cell) };
+    if family.is_null() {
+        return Ok(None);
+    }
+    // nestedscope.py:38 `if not self.family.ever_mutated`.
+    if unsafe { (*family).ever_mutated.get() } {
+        return Ok(None);
+    }
+    // nestedscope.py:39-41 `w_res = self._elidable_get(); if w_res is not None`.
+    let contents = unsafe { pyre_object::w_cell_get(cell) };
+    if contents.is_null() {
+        return Ok(None);
+    }
+    let owner = ctx.trace_ctx.const_ref(family as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::cell_family_ever_mutated_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    Ok(Some(ctx.trace_ctx.const_ref(contents as i64)))
+}
+
 fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -6812,6 +6878,28 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // LOAD_DEREF on a constant cell whose binding was only ever filled once:
+    // fold to the contents under a `QUASIIMMUT_FIELD(family, ever_mutated)`
+    // instead of the opaque read residual, the shape upstream gets for free
+    // from `nestedscope.py:31-44 Cell.get`.  Read-only, and every unrecognised
+    // shape falls through to the residual (SAFE).
+    //
+    // This is the shape that decides whether a closure callee inlines at all:
+    // the sub-walk's `DeferredCall` admission promises it commits nothing, and
+    // a `load_deref_value` that stays residual is a nested residual the lever
+    // could not inline, so the admission is revoked and the callee denied.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && pyre_helper_kind == majit_ir::PyreHelperKind::LoadDeref
+    {
+        if let Some(value) = spec_gate("load_deref", || {
+            try_walker_specialize_load_deref(ctx, op.pc, &r_args)
+        })? {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, value)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
     }
 
     // STORE_ATTR fold (mapdict.py): recognize an existing unboxed

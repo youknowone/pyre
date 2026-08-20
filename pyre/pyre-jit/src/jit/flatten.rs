@@ -6100,7 +6100,10 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    // Recognition tag for the walker's `Cell.get` fold; carries no replay-safety
+    // standing of its own.
+    effect_info.pyre_helper = majit_ir::PyreHelperKind::LoadDeref;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -6173,12 +6176,14 @@ where
     ))
 }
 
-/// Lower the MAKE_CELL pyre HLOp `make_cell_value(current)` → `result: Ref`
-/// to `residual_call_r_r(ConstInt(make_cell_fn_idx), ListR([current]),
-/// Descr) → reg`, the single-Ref shape.  `current` is the slot read from
-/// `locals_cells_stack_w`; the result is the cell the codewriter stores via
-/// `setarrayitem_vable_r`.  Allocates a fresh cell but runs no user code and
-/// never raises → `Plain`.
+/// Lower the MAKE_CELL pyre HLOp `make_cell_value(current, code, slot)` →
+/// `result: Ref` to `residual_call_ir_r(ConstInt(make_cell_fn_idx),
+/// ListI([slot]), ListR([current, code]), Descr) → reg`, the two-Ref-plus-one-
+/// Int [`lower_load_deref_value_hlop_to_insn`] shape.  `current` is the slot
+/// read from `locals_cells_stack_w`; the result is the cell the codewriter
+/// stores via `setarrayitem_vable_r`, and `code` + `slot` name the
+/// `pycode.py:190` cell family it joins.  Allocates a fresh cell but runs no
+/// user code and never raises → `Plain`.
 ///
 /// Returns `None` for a non-`make_cell_value` opname or unexpected arity so
 /// the caller can fall through to other lowering arms.
@@ -6192,19 +6197,31 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "make_cell_value" || op.args.len() != 1 {
+    if op.opname != "make_cell_value" || op.args.len() != 3 {
         return None;
     }
     let current = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let code = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+    let slot = const_int_for_value_arg(&op.args[2])?;
     let dst_reg = match &op.result {
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    Some(build_residual_call_r_r_insn_from_operands(
-        ctx.make_cell_fn_idx,
-        vec![current],
-        CallFlavor::Plain,
-        majit_ir::PyreHelperKind::None,
+    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
+        result_kind: Some(Kind::Ref),
+        void_word_abi: false,
+    }));
+    Some(Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(ctx.make_cell_fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(slot)])),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![current, code])),
+            descr_operand,
+        ],
         dst_reg,
     ))
 }
@@ -12835,16 +12852,17 @@ mod tests {
 
     #[test]
     fn lower_make_cell_hlop_emits_make_cell_fn_residual() {
-        // `make_cell_value(current)` →
-        // `residual_call_r_r(ConstInt(make_cell_fn_idx), ListR([current]),
-        // Descr) → reg` (Plain — allocates a fresh cell, runs no user code,
-        // never raises).
+        // `make_cell_value(current, code, slot)` →
+        // `residual_call_ir_r(ConstInt(make_cell_fn_idx), ListI([slot]),
+        // ListR([current, code]), Descr) → reg` (Plain — allocates a fresh cell
+        // of the `code` + `slot` cell family, runs no user code, never raises).
         let current_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
-        let (ctx, _, _) = load_attr_lowering_fixture();
+        let (ctx, code_const, _) = load_attr_lowering_fixture();
+        let slot_const = Constant::signed(3);
         let op = super::super::flow::SpaceOperation::new(
             "make_cell_value",
-            vec![current_var.into()],
+            vec![current_var.into(), code_const.into(), slot_const.into()],
             Some(result_var.into()),
             0,
         );
@@ -12862,14 +12880,14 @@ mod tests {
         let mut lower_constant = super::flatten_constant_operand_for_test;
         let insn =
             super::lower_make_cell_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
-                .expect("1-arg make_cell_value lowering must succeed");
+                .expect("3-arg make_cell_value lowering must succeed");
         match insn {
             Insn::Op {
                 opname,
                 args,
                 result,
             } => {
-                assert_eq!(opname, "residual_call_r_r");
+                assert_eq!(opname, "residual_call_ir_r");
                 assert!(
                     matches!(args[0], Operand::ConstInt(115)),
                     "make_cell_fn pool index, got {:?}",
@@ -12877,12 +12895,25 @@ mod tests {
                 );
                 match &args[1] {
                     Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.kind, Kind::Int);
                         assert!(
-                            matches!(&list.content[..], [Operand::Register(r)] if r.index == 101),
-                            "ListR = [current], got {:?}",
+                            matches!(&list.content[..], [Operand::ConstInt(3)]),
+                            "ListI = [slot], got {:?}",
                             list.content
                         );
+                    }
+                    other => panic!("expected ListI, got {other:?}"),
+                }
+                match &args[2] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        match &list.content[..] {
+                            [Operand::Register(c), Operand::ConstRef(0x2000)] => {
+                                assert_eq!(c.kind, Kind::Ref);
+                                assert_eq!(c.index, 101, "leading Ref operand must be current");
+                            }
+                            other => panic!("ListR must be [current, code], got {other:?}"),
+                        }
                     }
                     other => panic!("expected ListR, got {other:?}"),
                 }

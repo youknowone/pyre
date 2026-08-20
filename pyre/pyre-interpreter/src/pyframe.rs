@@ -2885,7 +2885,11 @@ impl PyFrame {
         // `new_for_call_with_closure` for the call-site mirror.
         let mut index = code.varnames.len();
         for _ in 0..npure {
-            let cell = pyre_object::w_cell_new(PY_NULL);
+            // pyframe.py:239-240 `Cell(None, self.pycode.cell_families[i])`.
+            let family = unsafe {
+                crate::pycode::w_code_cell_family(self.pycode as pyre_object::PyObjectRef, index)
+            };
+            let cell = pyre_object::w_cell_new(PY_NULL, family);
             self.set_locals_w(index, cell);
             index += 1;
         }
@@ -4105,7 +4109,12 @@ impl PyFrame {
             let w_oldvalue = locals_w!(self)[i];
             let w_newvalue = if !w_oldvalue.is_null() && unsafe { pyre_object::is_cell(w_oldvalue) }
             {
-                pyre_object::w_cell_new(pyre_object::PY_NULL)
+                // pyframe.py:834-835 `Cell(None, w_oldvalue.family)` — the
+                // replacement stands for the same binding, so it keeps the
+                // family the cleared cell shared with its siblings.
+                pyre_object::w_cell_new(pyre_object::PY_NULL, unsafe {
+                    pyre_object::w_cell_family(w_oldvalue)
+                })
             } else {
                 pyre_object::PY_NULL
             };
@@ -4904,7 +4913,11 @@ impl PyFrame {
             // wrap(fn): def inner(): return (n, fn)` style closures.
             let npure = npure_cellvars(code_ref);
             for i in 0..npure {
-                arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL);
+                // pyframe.py:239-240 `Cell(None, self.pycode.cell_families[i])`.
+                let family = unsafe {
+                    crate::pycode::w_code_cell_family(_roots.get(root_base), num_locals + i)
+                };
+                arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL, family);
             }
             let closure = _roots.get(root_base + 2);
             if !closure.is_null() {

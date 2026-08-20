@@ -231,9 +231,10 @@ pub struct Cpu {
     /// the cell's contents (returning the unchanged cell) or return the raw
     /// `value` for a non-cell slot; infallible.
     pub store_deref_value_fn: extern "C" fn(i64, i64) -> i64,
-    /// `bh_make_cell_fn(current)` — MAKE_CELL residual: wrap a raw slot value
-    /// in a fresh cell (or return an existing cell unchanged); infallible.
-    pub make_cell_fn: extern "C" fn(i64) -> i64,
+    /// `bh_make_cell_fn(current, code, slot)` — MAKE_CELL residual: wrap a raw
+    /// slot value in a fresh cell of the `code` + `slot` cell family (or return
+    /// an existing cell unchanged); infallible.
+    pub make_cell_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `jit_make_function_from_globals(globals, code)` — MAKE_FUNCTION residual:
     /// wrap a code object into a function using the given globals object;
     /// allocates but runs no user code and never raises.
