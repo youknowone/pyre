@@ -6697,7 +6697,21 @@ fn drive_unpack_iterable_trace(
         pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
     descriptor.index = Some(2);
 
-    let action = meta.force_start_tracing(green_key, (0, 0), Some(descriptor), &live_values);
+    // The `(code_ptr, pc)` pair `green_key` was hashed from, not `(0, 0)`: a
+    // zero `code_ptr` is the sentinel for "no raw pair available", and a
+    // force-start that trips it mints its cell through the bare-hash door,
+    // which stores no `comparekey`. A cell without one answers no typed lookup
+    // (`JitCell.comparekey` is what selects a cell within its bucket,
+    // warmstate.py:575-582 `def comparekey(self, *greenargs2)`), so the same
+    // green key can go on to own a second cell in the same bucket, with its own
+    // token and flags. `green_key` is `make_green_key(greenkey_raw, 0)` (above),
+    // so the pair reconstructs the identical hash.
+    let action = meta.force_start_tracing(
+        green_key,
+        (greenkey_raw as usize, 0),
+        Some(descriptor),
+        &live_values,
+    );
     if dbg {
         let name = match action {
             BackEdgeAction::Interpret => "Interpret",

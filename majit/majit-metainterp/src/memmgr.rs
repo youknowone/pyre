@@ -16,14 +16,17 @@
 //! `model.py:289 cpu.free_loop_and_bridges` parity) frees the backend
 //! resources.
 //!
-//! Pyre currently has additional strong references in `BaseJitCell.
-//! loop_token` and embedded `JitCellToken` values inside
-//! `pyjitpl::compiled_loops`. Achieving "alive_loops is the SOLE
-//! strong owner" requires further slicing whose tail is blocked on an
-//! Arc lift of `CompiledEntry.token`.
-//! Today `alive_loops` is a *third* strong owner; eviction tracking
-//! works for the warmstate side, but actual token frees only happen
-//! once Slices 3.5–3.6 prune the other strong owners.
+//! Both long-lived handles on a compiled token are now weak —
+//! `BaseJitCell::loop_token` (`warmstate.py:188`) and
+//! `CompiledEntry::token` — so `alive_loops` is the sole long-lived strong
+//! owner and removing an entry here is what actually frees the token.
+//!
+//! The corollary every producer owes: a token must be registered HERE before
+//! any cell or table is given a handle to it, or it dies with the producer's
+//! own temporary and the cell it was installed on reads back as "never
+//! compiled" rather than failing loudly. `compile.py:566-567`
+//! (`send_loop_to_backend`) and `compile.py:1148-1149`
+//! (`compile_tmp_callback`) are the two places upstream discharges it.
 
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -186,14 +189,14 @@ impl MemoryManager {
     ///         self.next_check = self.current_generation + self.check_frequency
     /// ```
     ///
-    /// TODO: returns `Vec<Arc<JitCellToken>>` of the
-    /// evicted token objects.  Upstream returns `None` because
+    /// Returns the evicted token objects, where upstream returns `None`:
     /// `LoopToken.__del__` (`memmgr.py:13`) dispatches
-    /// `cpu.free_loop_and_bridges` automatically when the only strong
-    /// owner (`alive_loops`) drops the token.  Pyre still has a second
-    /// strong owner — `MetaInterp::compiled_loops` keyed by green_key
-    /// — so the caller (`pyjitpl::try_to_free_some_loops`) must drop
-    /// the matching entry to actually free backend resources.
+    /// `cpu.free_loop_and_bridges` by itself once the only strong owner
+    /// (`alive_loops`) drops the token, and pyre has no destructor hook at
+    /// that point.  Both other long-lived handles are weak now, so the drop
+    /// here IS the last one; the list lets `pyjitpl::try_to_free_some_loops`
+    /// retire the matching `compiled_loops` entries, whose `Weak` would
+    /// otherwise linger as a dead key.
     ///
     /// The return value is a `Vec<Arc<JitCellToken>>` rather than
     /// `Vec<u64>` (green_keys) so the caller can match by **token-object
@@ -202,8 +205,7 @@ impl MemoryManager {
     /// itself.  Returning green_keys would let an evicted stale
     /// looptoken kick out the *current* compiled token at the same
     /// green_key (the recompile case where `compiled_loops[gk].token`
-    /// has already been replaced).  This adaptation is removed once
-    /// once `compiled_loops` holds `Weak` tokens.
+    /// has already been replaced).
     pub fn next_generation(&mut self) -> Vec<Arc<JitCellToken>> {
         self.current_generation += 1;
         if self.current_generation == self.next_check {

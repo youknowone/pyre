@@ -5054,7 +5054,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // key is the callee's function-entry key, the one
         // `disable_noninlinable_function` is applied to.
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
-            crate::driver::make_green_key(raw_callee_code as *const (), 0),
+            (
+                crate::driver::make_green_key(raw_callee_code as *const (), 0),
+                // The callee's greens are in scope here, so the log carries
+                // them: `disable_noninlinable_function` applies to this key,
+                // and it reaches a cell.
+                Some(crate::driver::make_green_key_typed(
+                    raw_callee_code as *const (),
+                    0,
+                )),
+            ),
             sub_wc.trace_ctx.get_trace_position(),
         );
         let result = {

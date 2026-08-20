@@ -3743,7 +3743,7 @@ pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
 ///   for a bridge would leave the real culprit untouched and let the same
 ///   oversized bridge re-record on each failure of that guard.
 pub(crate) fn note_root_trace_too_long(
-    merge_key: Option<u64>,
+    merge_key: Option<majit_metainterp::PortalGreenKey>,
     source_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
 ) {
     // `try_driver_pair`, not `driver_pair`: a skeleton walk drives
@@ -3759,28 +3759,52 @@ pub(crate) fn note_root_trace_too_long(
         // pyjitpl.py:2823 `self.portal_trace_positions = None` — the log's `_pos`
         // cursors index the recorder this abort is discarding.
         meta.portal_trace_positions = None;
-        if let Some((jd_no, huge_key)) = huge_fn {
-            // pyjitpl.py:2825-2826.
-            meta.warm_state_mut()
-                .disable_noninlinable_function(huge_key);
-            // pyjitpl.py:2827-2828, read by `aborted_tracing`'s `on_trace_abort`.
+        if let Some((jd_no, huge_key)) = huge_fn.clone() {
+            // pyjitpl.py:2821-2822 `jd_sd.warmstate.disable_noninlinable_function(
+            // greenkey_of_huge_function)`. Upstream's `dont_trace_here`
+            // (warmstate.py:679-687) is handed the greens and reaches its cell
+            // through `ensure_jit_cell_at_key`, so take the typed door when
+            // the log carried one — the hash form files a comparekey-less cell
+            // that no later typed lookup can match.
+            match huge_key.1.as_ref() {
+                Some(key) => meta
+                    .warm_state_mut()
+                    .disable_noninlinable_function_for_key(key),
+                None => meta
+                    .warm_state_mut()
+                    .disable_noninlinable_function(huge_key.0),
+            }
+            // pyjitpl.py:2823-2824, read by `aborted_tracing`'s `on_trace_abort`.
             meta.aborted_tracing_jitdriver = Some(jd_no);
             meta.aborted_tracing_greenkey = Some(huge_key);
-            // pyjitpl.py:2829-2831 — the root is asked to retrace and nothing else.
-            if let Some(merge_key) = merge_key {
-                meta.warm_state_mut().trace_next_iteration(merge_key);
+            // pyjitpl.py:2825-2828 — the root is asked to retrace and nothing
+            // else. `trace_next_iteration` moves a counter and creates no cell
+            // (warmstate.py:622-623 `def trace_next_iteration_hash(hash)`), so
+            // the hash is the whole identity it needs.
+            if let Some((merge_key, _)) = merge_key.as_ref() {
+                meta.warm_state_mut().trace_next_iteration(*merge_key);
             }
-        } else if let Some(merge_key) = merge_key {
+        } else if let Some((merge_key, merge_key_typed)) = merge_key.as_ref() {
             let warm_state = meta.warm_state_mut();
-            // pyjitpl.py:2843-2844.
-            warm_state.trace_next_iteration(merge_key);
-            warm_state.mark_force_finish_tracing(merge_key);
+            // pyjitpl.py:2843 `warmrunnerstate.JitCell.trace_next_iteration(
+            // greenkey)`, again counter-only.
+            warm_state.trace_next_iteration(*merge_key);
+            // pyjitpl.py:2844 `jd_sd.warmstate.mark_force_finish_tracing(
+            // greenkey)`. `JC_FORCE_FINISH` is never cleared, so setting it on
+            // the wrong cell of a bucket is permanent.
+            match merge_key_typed.as_ref() {
+                Some(key) => warm_state.mark_force_finish_tracing_for_key(key),
+                None => warm_state.mark_force_finish_tracing(*merge_key),
+            }
             // pyjitpl.py:2846 `warmstate.dont_trace_here(greenkey)`, the third
             // call of the same arm.  Without it the two above ask for the loop
             // to be re-traced and force-finished while its callers may still
             // inline it, so the next attempt can rebuild the very trace that
             // overflowed.
-            warm_state.disable_noninlinable_function(merge_key);
+            match merge_key_typed.as_ref() {
+                Some(key) => warm_state.disable_noninlinable_function_for_key(key),
+                None => warm_state.disable_noninlinable_function(*merge_key),
+            }
         }
         huge_fn
     });
@@ -3821,7 +3845,7 @@ pub(crate) fn note_root_trace_too_long(
 /// [`note_inline_subwalk_end`] if and only if it did, or the start/end walk
 /// goes out of step.
 pub(crate) fn note_inline_subwalk_start(
-    green_key: u64,
+    green_key: majit_metainterp::PortalGreenKey,
     pos: majit_metainterp::recorder::TracePosition,
 ) -> Option<usize> {
     let (driver, _) = crate::driver::try_driver_pair()?;

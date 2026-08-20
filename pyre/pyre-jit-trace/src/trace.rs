@@ -5756,7 +5756,12 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 majit_metainterp::GreenBox::new(majit_ir::OpRef::input_arg_typed(i as u32, tp), tp)
             })
             .collect();
-        ctx.add_merge_point(start_key, input_args, start_pc);
+        ctx.add_merge_point_with_key(
+            start_key,
+            Some(crate::driver::make_green_key_typed(w_code, start_pc)),
+            input_args,
+            start_pc,
+        );
     }
     let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, true);
     // A guard snapshot emitted during the walk may have hit a resume

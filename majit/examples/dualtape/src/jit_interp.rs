@@ -17,6 +17,11 @@ pub static LAST_OPS_AFTER: AtomicUsize = AtomicUsize::new(0);
 /// The op count cannot tell an empty dispatch from a segmented runaway (see
 /// that gate). These two can: they are `LoopBodyShape`'s fields, recorded off
 /// the same hook.
+///
+/// One integer represents at least three states: `1` is an empty dispatch whose
+/// whole body is `Finish()`, `5` is a segmented runaway, and a useful loop has
+/// some other count. The count therefore reports a body's size, while these
+/// flags report its shape; `COMPILES > 0` alone proves neither.
 pub static LAST_HAS_JUMP: AtomicBool = AtomicBool::new(false);
 pub static LAST_ALWAYS_FAILS: AtomicBool = AtomicBool::new(false);
 

@@ -2038,7 +2038,10 @@ impl<S: JitState> JitDriver<S> {
 
     /// PyPy warmstate.py get_assembler_token(greenkey).
     /// Returns the JitCellToken for the compiled loop at this green key.
-    pub fn get_loop_token(&self, green_key: u64) -> Option<&majit_backend::JitCellToken> {
+    pub fn get_loop_token(
+        &self,
+        green_key: u64,
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
         self.meta.get_loop_token(green_key)
     }
 
@@ -6337,7 +6340,7 @@ impl<S: JitState> JitDriver<S> {
     /// run compiled code, distinguish normal JUMP from guard failure, and
     /// allow the caller to rebuild interpreter state and start bridge tracing
     /// from the recovered resume pc.
-    /// warmstate.py:398-422 execute_assembler: run compiled code and return
+    /// `warmstate.py` `execute_assembler`: run compiled code and return
     /// the outcome. For guard failures, returns raw exit data without any
     /// state restoration — the caller processes it via handle_fail().
     pub fn run_compiled_detailed_with_bridge_keyed(
@@ -6852,7 +6855,7 @@ impl<S: JitState> JitDriver<S> {
         &self,
         green_key: u64,
     ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        self.meta.get_loop_token_arc(green_key).cloned()
+        self.meta.get_loop_token_arc(green_key)
     }
 
     /// Get the pre-allocated token number for the trace being recorded.
@@ -9605,6 +9608,15 @@ mod tests {
             driver.meta.warm_state_mut().alloc_token_number(),
         ));
         token.set_compiled(Box::new(()));
+        // `compile.py:1148-1149` — `compile_tmp_callback` registers the token
+        // with `MemoryManager` before `get_assembler_token` installs it. The
+        // cell keeps only a weak handle (`warmstate.py:188`), so without this
+        // the token dies here and the cell reads back as "never compiled".
+        driver
+            .meta
+            .warm_state_mut()
+            .memory_manager
+            .keep_loop_alive(&token);
         driver
             .meta
             .warm_state_mut()
@@ -9669,6 +9681,13 @@ mod tests {
             driver.meta.warm_state_mut().alloc_token_number(),
         ));
         token.set_compiled(Box::new(()));
+        // See `attach_tmp_callback_cell`: `alive_loops` is the token's only
+        // strong owner (`memmgr.py:9-14`).
+        driver
+            .meta
+            .warm_state_mut()
+            .memory_manager
+            .keep_loop_alive(&token);
         driver
             .meta
             .warm_state_mut()

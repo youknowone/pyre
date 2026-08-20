@@ -6050,7 +6050,15 @@ where
                                 .close_green_key_hash()
                                 .zip(ctx.has_compiled_targets_fn.as_ref())
                                 .is_some_and(|(key, f)| f(key));
-                            let close_key = ctx.close_green_key_hash().unwrap_or(ctx.green_key);
+                            // Take the structured key and derive the hash from
+                            // it, rather than taking the hash and leaving the
+                            // key behind: the merge point this registers is
+                            // later read by consumers that install cell flags,
+                            // and a hash alone reaches a cell only by bucket.
+                            let (close_key, close_key_typed) = match ctx.close_green_key() {
+                                Some(k) => (k.get_uhash(), Some(k)),
+                                None => (ctx.green_key, ctx.green_key_values().cloned()),
+                            };
                             if !already_compiled_here
                                 && !ctx.has_merge_point_at(close_key, ctx.header_pc)
                             {
@@ -6073,7 +6081,12 @@ where
                                         ctx.num_ops(),
                                     );
                                 }
-                                ctx.add_merge_point(close_key, original_boxes, ctx.header_pc);
+                                ctx.add_merge_point_with_key(
+                                    close_key,
+                                    close_key_typed,
+                                    original_boxes,
+                                    ctx.header_pc,
+                                );
                                 return TraceAction::Continue;
                             }
                         }
@@ -6194,9 +6207,15 @@ where
                             mp_green_refs.clone(),
                             mp_green_floats.clone(),
                         );
-                        let Some(inner_key) = ctx.merge_point_green_key_hash(pc, &mp_greens) else {
+                        // The structured key first, hash second: this merge
+                        // point is registered below and later read by the
+                        // segmenting consumers, which install cell flags and
+                        // so need a key a chain walk can match, not a bucket.
+                        let Some(inner_key_typed) = ctx.merge_point_green_key(pc, &mp_greens)
+                        else {
                             return TraceAction::Continue;
                         };
+                        let inner_key = inner_key_typed.get_uhash();
                         let already_compiled_here = ctx
                             .has_compiled_targets_fn
                             .as_ref()
@@ -6358,7 +6377,12 @@ where
                                     ctx.num_ops(),
                                 );
                             }
-                            ctx.add_merge_point(inner_key, original_boxes, header_pc);
+                            ctx.add_merge_point_with_key(
+                                inner_key,
+                                Some(inner_key_typed),
+                                original_boxes,
+                                header_pc,
+                            );
                         }
                     }
                 }

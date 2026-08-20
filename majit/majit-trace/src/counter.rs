@@ -55,7 +55,6 @@ impl Default for Entry {
 /// counter.py:16 JitCounter
 pub struct JitCounter {
     /// counter.py:86 size
-    #[allow(dead_code)]
     size: usize,
     /// counter.py:87 shift
     shift: u32,
@@ -97,9 +96,29 @@ impl JitCounter {
         1.0_f64 / (threshold as f64 - 0.001)
     }
 
-    /// counter.py:128-136 _get_index
+    /// counter.py:86 `self.size = size` — the entry count both tables are
+    /// indexed with. `counter.py:97,103` size the timetable and the celltable
+    /// from this one number, so a table living outside this struct has to read
+    /// it from here rather than pick its own.
     #[inline(always)]
-    fn _get_index(&self, hash: u64) -> usize {
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// counter.py:128-136 _get_index
+    ///
+    /// ```text
+    ///  def _get_index(self, hash):
+    ///      hash32 = r_uint(r_uint32(hash))  # mask off the bits higher than 32
+    ///      index = hash32 >> self.shift     # shift, resulting in a value < size
+    ///      return index                     # return the result as a r_uint
+    /// ```
+    ///
+    /// Public because the timetable is not the only table this indexes:
+    /// `counter.py:239-240` reads the celltable through the same call, and the
+    /// two tables must agree about which entry a hash names.
+    #[inline(always)]
+    pub fn _get_index(&self, hash: u64) -> usize {
         let hash32 = hash as u32 as u64;
         (hash32 >> self.shift) as usize
     }

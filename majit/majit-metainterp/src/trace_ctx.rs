@@ -192,6 +192,24 @@ impl GreenBox {
 pub struct MergePoint {
     /// Green key of the loop header.
     pub green_key: u64,
+    /// The typed green key `green_key` is the `JitCell.get_uhash` of
+    /// (warmstate.py:585-593 `def get_uhash(*greenargs)`).
+    ///
+    /// `green_key` alone names a BUCKET, not a cell: `_get_index` truncates it
+    /// (counter.py:128-135), so several cells share one chain and
+    /// `JitCell.comparekey` is what picks this one out of it
+    /// (warmstate.py:575-582 `def comparekey(self, *greenargs2)`). A consumer
+    /// that reaches a cell through the hash alone installs one carrying no
+    /// comparekey, which no later typed lookup can match — so the same loop
+    /// header ends up owning a second cell with its own token and flags.
+    /// Upstream never creates a cell from a hash: `_ensure_jit_cell_at_key`
+    /// (warmstate.py:631-641) is handed the greens themselves, and the one
+    /// bare-hash entry point, `trace_next_iteration_hash`
+    /// (warmstate.py:622-623), only moves a counter.
+    ///
+    /// `None` only where a fixture builds a merge point from a bare number;
+    /// every production producer has the key it hashed.
+    pub green_key_typed: Option<majit_ir::GreenKey>,
     /// Trace position when this loop header was first visited.
     pub position: crate::recorder::TracePosition,
     /// pyjitpl.py:2989: `original_boxes` — live variable boxes (OpRef +
@@ -1636,6 +1654,9 @@ impl TraceCtx {
             recursive_call_assembler_pending: None,
             current_merge_points: vec![MergePoint {
                 green_key,
+                // This constructor is handed a bare `green_key` number and no
+                // greens, so there is no key to carry.
+                green_key_typed: None,
                 position: initial_position,
                 green_boxes: initial_boxes
                     .iter()
@@ -1694,6 +1715,9 @@ impl TraceCtx {
         metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     ) -> Self {
         let initial_position = recorder.get_position();
+        // Taken before `green_key_values` is moved into the struct literal
+        // below; the seeded merge point needs the same key.
+        let header_green_key = green_key_values.clone();
         // RPython pyjitpl.py:2878: initial merge point types come from
         // live_arg_boxes which carry actual types (INT/REF/FLOAT).
         let initial_input_types = recorder.inputarg_types();
@@ -1724,6 +1748,10 @@ impl TraceCtx {
             recursive_call_assembler_pending: None,
             current_merge_points: vec![MergePoint {
                 green_key,
+                // The structured key this constructor is named for: the header
+                // it seeds is the trace's own, so the entry carries the same
+                // greens `green_key` was hashed from.
+                green_key_typed: Some(header_green_key),
                 position: initial_position,
                 green_boxes: initial_boxes
                     .iter()

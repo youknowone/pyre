@@ -222,8 +222,8 @@ pub struct CompileResult<M> {
     pub values: ExitRawValues,
     pub typed_values: ExitValues,
     /// Snapshot of the compiled entry's metadata taken *before*
-    /// `execute_token`, mirroring `warmstate.py:398`'s hold on the
-    /// `loop_token` object across the run: the exit values being unpacked
+    /// `execute_token`, mirroring `warmstate.py` `execute_assembler`'s hold on
+    /// the `loop_token` object across the run: the exit values being unpacked
     /// were produced by the code this metadata describes.  A re-lookup
     /// after the run would read whatever the compiled-loop index holds by
     /// then, and compiled code re-enters the driver through residual calls,
@@ -2509,6 +2509,12 @@ impl DescrContainer for dyn Backend + '_ {
 /// first three are set by `warmspot.py:1010-1017`; the last two by
 /// `pyjitpl.py:2279-2281` (see
 /// `MetaInterpStaticData::finish_setup_descrs_for_jitdrivers`).
+///
+/// `memory_manager` is `compile.py:1101-1102`'s `memory_manager=None`
+/// parameter and carries the same "for tests" meaning: pass `Some` from every
+/// production path, because the warm cell that receives this token keeps only
+/// a weak handle to it and `alive_loops` is the sole strong owner
+/// (`memmgr.py:9-14`).
 pub fn compile_tmp_callback(
     backend: &mut dyn Backend,
     jitdriver_sd: &crate::jitdriver::JitDriverStaticData,
@@ -2516,6 +2522,7 @@ pub fn compile_tmp_callback(
     green_key: u64,
     greenboxes: &[Value],
     red_arg_types: &[Type],
+    memory_manager: Option<&mut crate::memmgr::MemoryManager>,
 ) -> Result<Arc<JitCellToken>, BackendError> {
     // Invariant: every `JitDriverStaticData` reaching
     // `compile_tmp_callback` must have `portal_runner_adr` AND `portal_calldescr`
@@ -2724,9 +2731,17 @@ pub fn compile_tmp_callback(
     wire_clt_loop_token_wref(&jitcell_token);
     //
     // `compile.py:1148-1149` `if memory_manager is not None:
-    //   memory_manager.keep_loop_alive(jitcell_token)` — pyre's
-    // `BaseJitCell` holds the `Arc<JitCellToken>` once
-    // `set_procedure_token(token, tmp=true)` runs in `warmstate.rs`.
+    //   memory_manager.keep_loop_alive(jitcell_token)`.  The cell this token
+    // is about to be installed on holds a WEAK handle
+    // (`warmstate.py:188/:208-210`), so `alive_loops` is the only strong owner
+    // there will ever be: skipping this call leaves the token with no owner at
+    // all past the caller's temporary, and the cell answers
+    // `get_procedure_token() == None` — "never compiled" — instead of failing
+    // loudly.  `Option` mirrors upstream's `memory_manager=None  # for tests`
+    // default.
+    if let Some(memory_manager) = memory_manager {
+        memory_manager.keep_loop_alive(&jitcell_token);
+    }
     //
     // `compile.py:1150` `return jitcell_token`.
     // `compile.py:179-180` record_loop_or_bridge: the tmp-callback loop is a
@@ -5624,9 +5639,39 @@ impl TraceCtx {
     /// RPython allows multiple merge points with the same green key
     /// (representing different loop iterations or inlining depths).
     /// Always appends; has_merge_point checks if any match exists.
+    /// Hash-only form of [`Self::add_merge_point_with_key`], for a producer
+    /// that has not yet been migrated to pass the green key it hashed.
+    ///
+    /// The entry it appends carries no typed key, so the trace-segmenting
+    /// consumers fall back to their hash-form warmstate calls — see
+    /// [`crate::trace_ctx::MergePoint::green_key_typed`] for what that costs.
     pub fn add_merge_point(
         &mut self,
         key: u64,
+        green_boxes: Vec<crate::trace_ctx::GreenBox>,
+        header_pc: usize,
+    ) {
+        self.add_merge_point_with_key(key, None, green_boxes, header_pc);
+    }
+
+    /// `key_typed` is the green key `key` is the `JitCell.get_uhash` of
+    /// (warmstate.py:585-593 `def get_uhash(*greenargs)`). It travels with the
+    /// hash because the trace-segmenting consumers of this entry
+    /// (`mark_force_finish_tracing`, `disable_noninlinable_function`) reach a
+    /// cell to write flags on, and a cell reached by hash alone is installed
+    /// without a `comparekey` — invisible to every later typed lookup, so the
+    /// header can end up owning a second cell in the same bucket.
+    ///
+    /// `key` and `key_typed.get_uhash()` are NOT required to be equal. `key` is
+    /// a cell key, which is the bucket hash only while that hash is unclaimed;
+    /// once a second cell chains into the bucket the later one is minted a
+    /// distinct number. The invariant is that `bucket_of(key)` equals
+    /// `key_typed.get_uhash()`, and that is a warmstate question this type
+    /// cannot ask.
+    pub fn add_merge_point_with_key(
+        &mut self,
+        key: u64,
+        key_typed: Option<majit_ir::GreenKey>,
         green_boxes: Vec<crate::trace_ctx::GreenBox>,
         header_pc: usize,
     ) {
@@ -5644,6 +5689,7 @@ impl TraceCtx {
         let vable_ptr = self.standard_virtualizable_ptr().unwrap_or(0);
         self.current_merge_points.push(MergePoint {
             green_key: key,
+            green_key_typed: key_typed,
             position,
             green_boxes,
             header_pc,
@@ -5656,11 +5702,31 @@ impl TraceCtx {
         self.current_merge_points.clear();
     }
 
-    /// pyjitpl.py:2801 / 2803 / 2818 / 7985 — `current_merge_points[0]`
-    /// is the outermost loop header's greenkey.  Used by
-    /// `blackhole_if_trace_too_long` / `prepare_trace_segmenting` /
-    /// `aborted_tracing` to distinguish "tracing a loop body" from
-    /// "tracing a bridge" (empty merge-points list).
+    /// `current_merge_points[0]` is the outermost loop header's greenkey —
+    /// pyjitpl.py:2791, :2827 and :2842 all spell it
+    /// `self.current_merge_points[0][0][:jd_sd.num_green_args]`, in
+    /// `aborted_tracing` / `blackhole_if_trace_too_long` /
+    /// `prepare_trace_segmenting` respectively.  `None` distinguishes "tracing
+    /// a bridge" (empty merge-points list) from "tracing a loop body".
+    ///
+    /// Returns the key in both forms it is carried in, together rather than
+    /// through two accessors: the callers that only move a counter
+    /// (`trace_next_iteration`) need the hash, the callers that install flags
+    /// on a cell (`mark_force_finish_tracing`, `disable_noninlinable_function`)
+    /// need the typed key, and reading one without the other is what puts a
+    /// comparekey-less cell in the chain.
+    pub fn current_merge_points_first_green_key_pair(
+        &self,
+    ) -> Option<(u64, Option<majit_ir::GreenKey>)> {
+        self.current_merge_points
+            .first()
+            .map(|mp| (mp.green_key, mp.green_key_typed.clone()))
+    }
+
+    /// Hash-only form of [`Self::current_merge_points_first_green_key_pair`],
+    /// for a caller that only tests whether a loop header exists or feeds a
+    /// counter-only consumer. A caller that installs cell flags must take the
+    /// pair instead.
     pub fn current_merge_points_first_greenkey(&self) -> Option<u64> {
         self.current_merge_points.first().map(|mp| mp.green_key)
     }

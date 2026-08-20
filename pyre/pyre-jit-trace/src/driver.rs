@@ -19,6 +19,18 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
     majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64)
 }
 
+/// The typed form of [`make_green_key`]: the greens themselves, not a fold of
+/// them.
+///
+/// A warmstate call that reaches a CELL needs this — `JitCell.comparekey`
+/// (warmstate.py:575-582 `def comparekey(self, *greenargs2)`) is what picks one
+/// cell out of a bucket, and a cell created from the fold alone is filed
+/// without a comparekey, where no later typed lookup can find it. The u64 form
+/// stays correct for calls that only move a counter.
+pub fn make_green_key_typed(code_ptr: *const (), pc: usize) -> majit_ir::GreenKey {
+    majit_ir::pypyjit_greenkey(pc, false, code_ptr as u64)
+}
+
 /// Type alias for the JIT driver pair. Must match pyre-jit/eval.rs JitDriverPair.
 pub type JitDriverPair = (
     majit_metainterp::JitDriver<PyreJitState>,

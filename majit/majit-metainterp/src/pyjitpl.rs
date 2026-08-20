@@ -1026,13 +1026,14 @@ pub(crate) struct CompiledEntry<M> {
     /// (memmgr.py:73).  Readers call `live_token()`
     /// for the upgrade-or-panic shape (most call sites assume the entry is
     /// alive); eviction paths use `token.upgrade()` directly to tolerate
-    /// `None`.  Warmstate still owns a separate `Arc<JitCellToken>`
-    /// (`BaseJitCell::loop_token` in `warmstate.rs`), so Pyre has not yet
-    /// reached PyPy's "alive_loops is the only long-lived strong owner" shape.
+    /// `None`.  `BaseJitCell::loop_token` is a `Weak` too
+    /// (`warmstate.py:188`), so between them these two hold no ownership and
+    /// `alive_loops` is the sole long-lived strong owner (`memmgr.py:9-14`).
     pub(crate) token: std::sync::Weak<JitCellToken>,
-    /// Shared, never copied. `warmstate.py:398 get_procedure_token` hands the
-    /// caller the cell's own `loop_token` object; the entry runner then reads
-    /// its fields in place and passes the same object to the exit handling.
+    /// Shared, never copied. `warmstate.py` `execute_assembler` is handed the
+    /// `loop_token` OBJECT and keeps it across the run — it passes the same one
+    /// to `func_execute_token` and then to `keep_loop_alive` — rather than
+    /// re-deriving it from a key between the two.
     /// Behind an `Arc` the pyre entry path matches that: a warm entry clones a
     /// refcount where it used to clone the whole struct, on every call.
     pub(crate) meta: std::sync::Arc<M>,
@@ -1347,6 +1348,26 @@ pub struct BridgeTraceInfo {
     /// the source Arc directly.
     pub source_descr: std::sync::Arc<dyn majit_ir::Descr>,
 }
+
+/// A green key in the two forms pyre carries it: the `u64` that every
+/// hash-form `WarmEnterState` entry point takes, and the typed key a cell
+/// stores as its `comparekey` (warmstate.py:575-582
+/// `def comparekey(self, *greenargs2)`).
+///
+/// They travel as a pair because a hash alone cannot name a cell. `_get_index`
+/// truncates it (counter.py:128-135), so one bucket holds a chain, and a cell
+/// created from a hash is filed without a comparekey — no later typed lookup
+/// can match it, so the same green key can end up owning a second cell with
+/// its own token and flags. Upstream mints no cell from a number: the creation
+/// path is `_ensure_jit_cell_at_key` (warmstate.py:631-641), handed the greens
+/// themselves, and the one bare-hash entry point,
+/// `trace_next_iteration_hash` (warmstate.py:622-623), only moves a counter.
+///
+/// The typed half is `None` where a producer holds only the number. Note the
+/// two are not required to be equal-and-hashed: the `u64` is a cell key, which
+/// coincides with the bucket hash only until a second cell chains in and is
+/// minted a distinct number.
+pub type PortalGreenKey = (u64, Option<majit_ir::GreenKey>);
 
 /// pyjitpl.py `MetaInterp` tracing-session context.
 ///
@@ -1733,7 +1754,13 @@ pub struct MetaInterp<M: Clone> {
     ///
     /// `arm_portal_trace_positions` re-arms it per trace; upstream instead
     /// builds one `MetaInterp` per tracing attempt.
-    pub portal_trace_positions: Option<Vec<(usize, Option<u64>, crate::recorder::TracePosition)>>,
+    pub portal_trace_positions: Option<
+        Vec<(
+            usize,
+            Option<PortalGreenKey>,
+            crate::recorder::TracePosition,
+        )>,
+    >,
 
     /// pyjitpl.py:2401 `self.current_call_id = 0`.
     ///
@@ -1779,7 +1806,7 @@ pub struct MetaInterp<M: Clone> {
 
     /// pyjitpl.py:2406 `self.aborted_tracing_greenkey = None`.  See
     /// `aborted_tracing_jitdriver`.
-    pub aborted_tracing_greenkey: Option<u64>,
+    pub aborted_tracing_greenkey: Option<PortalGreenKey>,
 
     /// Stash for `abort_trace_live` → `aborted_tracing` handoff.
     /// RPython's exception unwind carries green_key/permanent implicitly
@@ -4672,6 +4699,23 @@ impl<M: Clone> MetaInterp<M> {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
+                // `force_start_tracing_for_key` has just installed (or found)
+                // this key's cell, so resolving now names it. The number that
+                // arrived is a bucket hash, and a bucket holds a chain: if any
+                // other cell already claimed that hash, the cell just marked
+                // TRACING was minted a different key. The trace, its
+                // `compiled_loops` entry, its `JitCellToken::green_key` and
+                // every `rd_loop_token` stamped off it must inherit the CELL
+                // key, or they name a cell the typed door never returns.
+                // `warmstate.py:511 raise EnterJitAssembler(procedure_token,
+                // *execute_args)` carries the token read off the resolved cell
+                // onward for the same reason, rather than a number to re-derive
+                // it from.
+                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                    self.warm_state.cell_key_for(key)
+                })
+                .flatten()
+                .unwrap_or(green_key);
                 // RPython pyjitpl.py:2604 create_empty_history(inputargs): the
                 // MetaInterp owns the history/Trace factory, not warmstate.
                 let mut recorder = crate::recorder::Trace::new();
@@ -4814,6 +4858,15 @@ impl<M: Clone> MetaInterp<M> {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
                 self.prepare_trace_start_runtime();
+                // Same re-resolve as the sibling `force_start_tracing` arm and
+                // as `on_back_edge_typed`: the incoming number is a bucket
+                // hash, and the cell the typed arm just marked owns a minted
+                // key whenever that hash was already claimed.
+                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                    self.warm_state.cell_key_for(key)
+                })
+                .flatten()
+                .unwrap_or(green_key);
                 self.setup_tracing(
                     green_key,
                     green_key_raw,
@@ -4869,8 +4922,9 @@ impl<M: Clone> MetaInterp<M> {
                 // `compiled_loops` entry, its `JitCellToken::green_key` and
                 // every `rd_loop_token` stamped off that token all inherit the
                 // CELL key rather than a bucket hash they would each have to
-                // re-resolve. `warmstate.py:483/:511` carries the resolved
-                // artifact on for the same reason.
+                // re-resolve. `warmstate.py:511 raise
+                // EnterJitAssembler(procedure_token, *execute_args)` carries
+                // the resolved artifact on for the same reason.
                 let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
                     self.warm_state.cell_key_for(key)
                 })
@@ -5165,7 +5219,7 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 }
             }
-            warm_state.find_token_by_number(n).map(Arc::clone)
+            warm_state.find_token_by_number(n)
         };
         // recursive-call green-key → token resolver (pyjitpl.py:3593-3599
         // `get_assembler_token`).  Resolves only already-compiled callees
@@ -5186,7 +5240,7 @@ impl<M: Clone> MetaInterp<M> {
                     });
                 warm_state
                     .get_compiled(green_key)
-                    .map(|arc| (Arc::clone(arc), green_key))
+                    .map(|arc| (arc, green_key))
             };
         // recursive-call recursive-portal inline decision, sharing
         // `decide_recursive_inline` with `should_inline_core` so the
@@ -5750,23 +5804,35 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2801 `if self.current_merge_points:` — outermost
         // loop's greenkey, used only when one exists (never for bridges).
         let outermost_merge_key = ctx.current_merge_points_first_greenkey();
-        // pyjitpl.py:2793: find_biggest_function — if an inlined function
-        // caused the bloat, disable just that function.
+        // pyjitpl.py:2817 `jd_sd, greenkey_of_huge_function =
+        // self.find_biggest_function()` — if an inlined function caused the
+        // bloat, disable just that function.
         let huge_fn = self.find_biggest_function();
         // pyjitpl.py:2795: `self.portal_trace_positions = None` marks the
         // abort boundary so post-abort consumers (e.g. test inspections
         // at pyjitpl.py:3547) can detect a terminated trace session.
         self.portal_trace_positions = None;
         if let Some((huge_fn_jd_no, huge_fn_key)) = huge_fn {
-            // pyjitpl.py:2822 disables through `jd_sd.warmstate`, the warmstate
-            // of the driver that owns the oversized frame.  Pyre keeps one
-            // `WarmEnterState` on the MetaInterp rather than one per
+            // pyjitpl.py:2821-2822 `jd_sd.warmstate.disable_noninlinable_function(
+            // greenkey_of_huge_function)` disables through `jd_sd.warmstate`,
+            // the warmstate of the driver that owns the oversized frame.  Pyre
+            // keeps one `WarmEnterState` on the MetaInterp rather than one per
             // `JitDriverStaticData`, so the disable lands on that single state;
             // the owning index is still carried through below.
-            self.warm_state.disable_noninlinable_function(huge_fn_key);
-            // pyjitpl.py:2799-2800: stash the aborted jd_sd + greenkey so
-            // `aborted_tracing(reason)` can fire `on_trace_too_long` when
-            // the hook is ported.
+            //
+            // Upstream reaches the cell through `dont_trace_here(greenkey)`
+            // (warmstate.py:679-687), which is `ensure_jit_cell_at_key` on the
+            // greens; take the typed form when the log carried one, so the
+            // flag lands on the frame's own cell rather than on whatever heads
+            // its bucket.
+            match huge_fn_key.1.as_ref() {
+                Some(key) => self.warm_state.disable_noninlinable_function_for_key(key),
+                None => self.warm_state.disable_noninlinable_function(huge_fn_key.0),
+            }
+            // pyjitpl.py:2823-2824 `self.aborted_tracing_jitdriver = jd_sd` /
+            // `self.aborted_tracing_greenkey = greenkey_of_huge_function` —
+            // stashed so `aborted_tracing(reason)` can fire `on_trace_too_long`
+            // when the hook is ported.
             self.aborted_tracing_jitdriver = Some(huge_fn_jd_no);
             self.aborted_tracing_greenkey = Some(huge_fn_key);
             // pyjitpl.py:2801-2804: only boost retrace for the outermost
@@ -5811,14 +5877,31 @@ impl<M: Clone> MetaInterp<M> {
         let outermost_merge_key = self
             .tracing
             .as_ref()
-            .and_then(|c| c.current_merge_points_first_greenkey());
-        if let Some(outer_key) = outermost_merge_key {
-            // pyjitpl.py:2819 `JitCell.trace_next_iteration(greenkey)`.
+            .and_then(|c| c.current_merge_points_first_green_key_pair());
+        if let Some((outer_key, outer_key_typed)) = outermost_merge_key {
+            // pyjitpl.py:2843 `warmrunnerstate.JitCell.trace_next_iteration(
+            // greenkey)` — a counter move, no cell, so the hash is the whole
+            // identity it needs (warmstate.py:622-623
+            // `def trace_next_iteration_hash(hash)`).
             self.warm_state.trace_next_iteration(outer_key);
-            // pyjitpl.py:2844 `warmstate.mark_force_finish_tracing(greenkey)`.
-            self.warm_state.mark_force_finish_tracing(outer_key);
-            // pyjitpl.py:2822 `warmstate.dont_trace_here(greenkey)`.
-            self.warm_state.disable_noninlinable_function(outer_key);
+            // pyjitpl.py:2844 `jd_sd.warmstate.mark_force_finish_tracing(
+            // greenkey)` and :2846 `jd_sd.warmstate.dont_trace_here(greenkey)`.
+            // Both reach their cell through `_ensure_jit_cell_at_key`
+            // (warmstate.py:631-641), which is handed the greens — so take the
+            // typed form whenever the merge point carried one. The hash forms
+            // create a cell with no comparekey, which the next typed lookup
+            // cannot see, and `JC_FORCE_FINISH` is never cleared: set on the
+            // wrong cell of a bucket it is permanent.
+            match outer_key_typed.as_ref() {
+                Some(key) => {
+                    self.warm_state.mark_force_finish_tracing_for_key(key);
+                    self.warm_state.disable_noninlinable_function_for_key(key);
+                }
+                None => {
+                    self.warm_state.mark_force_finish_tracing(outer_key);
+                    self.warm_state.disable_noninlinable_function(outer_key);
+                }
+            }
         }
         // pyjitpl.py:2825 `if not isinstance(self.resumekey, ResumeFromInterpDescr):`
         // — pyre carries the source token directly via
@@ -7680,7 +7763,11 @@ impl<M: Clone> MetaInterp<M> {
         // compares against. Register under those greens' header so the next
         // visit's scan can find this entry.
         let header_pc = ctx.close_header_pc();
-        ctx.add_merge_point(key, green_boxes, header_pc);
+        // `key` is `ctx.green_key`, so the trace's own structured key is the
+        // one it was hashed from; carrying it lets the segmenting consumers
+        // reach this header's cell by comparekey instead of by bucket.
+        let key_typed = ctx.green_key_values().cloned();
+        ctx.add_merge_point_with_key(key, key_typed, green_boxes, header_pc);
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit] retrace merge point registered: key={} header_pc={} position={:?} retracing_from={:?}",
@@ -10476,7 +10563,8 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> Option<RawCompileResult<M>> {
         let meta = self.compiled_loops.get(&green_key)?.meta.clone();
-        // warmstate.py:398 `loop_token = cell.get_procedure_token()`:
+        // `warmstate.py` `maybe_compile_and_run` reads
+        // `procedure_token = cell.get_procedure_token()` and enters on THAT:
         // execution must use the cell's current, invalidation-filtered token.
         // `compiled_loops` is a metadata index and can still retain a weak
         // predecessor while a recompile/redirect has installed a newer token
@@ -10619,8 +10707,9 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[i64],
     ) -> Option<CompileResult<M>> {
         let meta = self.compiled_loops.get(&green_key)?.meta.clone();
-        // warmstate.py:398: the JitCell is the canonical current-token
-        // owner and filters invalidated predecessors.
+        // `warmstate.py` `maybe_compile_and_run`: the JitCell is the
+        // canonical current-token owner and `get_procedure_token` filters
+        // invalidated predecessors.
         let token = self.warm_state.get_procedure_token(green_key)?;
 
         Self::prepare_compiled_run_io();
@@ -10794,8 +10883,9 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
         dispatch_key: u32,
     ) -> Option<CompileResult<M>> {
-        // warmstate.py:398: execute the token returned by the JitCell, not
-        // the compiled-metadata index's possibly retired predecessor.
+        // `warmstate.py` `maybe_compile_and_run`: execute the token returned
+        // by the JitCell, not the compiled-metadata index's possibly retired
+        // predecessor.
         //
         // This is the resolving form, for callers that reach the run without
         // having decided anything about the cell first. A caller that already
@@ -11400,10 +11490,11 @@ impl<M: Clone> MetaInterp<M> {
     /// In RPython, `call_assembler` allows JIT code for one function
     /// to directly call JIT code for another function. The caller needs
     /// the target's JitCellToken to set up the call.
-    pub fn get_loop_token(&self, green_key: u64) -> Option<&JitCellToken> {
-        self.warm_state
-            .get_compiled(green_key)
-            .map(|arc| arc.as_ref())
+    ///
+    /// Owned: the warm cell holds a `Weak` (`warmstate.py:188`), so the caller
+    /// has to hold the `Arc` for as long as it reads through it.
+    pub fn get_loop_token(&self, green_key: u64) -> Option<Arc<JitCellToken>> {
+        self.warm_state.get_compiled(green_key)
     }
 
     /// Return the owning `Arc<JitCellToken>` for the compiled loop at
@@ -11412,7 +11503,7 @@ impl<M: Clone> MetaInterp<M> {
     /// through `make_call_assembler_descr` so the keepalive walker
     /// (`record_loop_or_bridge`) recovers the production token directly
     /// from the descr without a side-table lookup.
-    pub fn get_loop_token_arc(&self, green_key: u64) -> Option<&std::sync::Arc<JitCellToken>> {
+    pub fn get_loop_token_arc(&self, green_key: u64) -> Option<std::sync::Arc<JitCellToken>> {
         self.warm_state.get_compiled(green_key)
     }
 
@@ -11493,7 +11584,7 @@ impl<M: Clone> MetaInterp<M> {
         let old_token = self.warm_state.get_compiled(old_key);
         let new_token = self.warm_state.get_compiled(new_key);
         if let (Some(old), Some(new)) = (old_token, new_token) {
-            let _ = self.backend.redirect_call_assembler(old, new);
+            let _ = self.backend.redirect_call_assembler(&old, &new);
         }
     }
 
@@ -11521,9 +11612,7 @@ impl<M: Clone> MetaInterp<M> {
         // regressing main behavior. Removable once
         // `CallAssemblerDescr` carries the owning `Arc<JitCellToken>`
         // directly (Codex parity recommendation #4).
-        self.warm_state
-            .find_token_by_number(token_number)
-            .map(std::sync::Arc::clone)
+        self.warm_state.find_token_by_number(token_number)
     }
 
     /// Port of `rpython/jit/metainterp/compile.py:171-211
@@ -11762,10 +11851,10 @@ impl<M: Clone> MetaInterp<M> {
     /// Check whether a compiled loop exists for a given green key.
     ///
     /// `pyjitpl.py:2982` / `:3162` upstream pattern step 1
-    /// `JitCell.get_procedure_token()` (`warmstate.py:191-196`) is the
-    /// canonical green_key → token lookup; pyre routes through
-    /// `WarmEnterState::get_procedure_token` (warmstate.rs) which
-    /// reads `cell.loop_token.as_ref()` directly.
+    /// `warmstate.py` `JitCell.get_procedure_token` is the canonical
+    /// green_key → token lookup; pyre routes through
+    /// `WarmEnterState::get_procedure_token`, which upgrades the cell's weak
+    /// handle and rejects an invalidated token.
     ///
     /// `pyjitpl.py:3922-3923` `has_compiled_targets(token)` is
     /// `bool(token) and bool(token.target_tokens)`. pyre answers that
@@ -12135,17 +12224,16 @@ impl<M: Clone> MetaInterp<M> {
             .insert((descr.trace_id(), descr.fail_index_per_trace()));
     }
 
-    /// memmgr.py:58-61: keep_loop_alive(looptoken).
-    /// warmstate.py:402: warmrunnerdesc.memory_manager.keep_loop_alive(loop_token)
+    /// `memmgr.py` `MemoryManager.keep_loop_alive`, which
+    /// `warmstate.py` `execute_assembler` calls on every run.
     ///
-    /// `warmstate.py:398` `loop_token = jitcell.get_procedure_token()`
-    /// is the upstream lookup; pyre routes through
-    /// `WarmEnterState::get_procedure_token` (warmstate.rs) which
-    /// reads `cell.loop_token.as_ref()`. The Arc identity returned
-    /// here is the same `Arc<JitCellToken>` that `compiled_loops[gk].token`
-    /// holds (both slots share
-    /// one Arc); convergence to a sole owner happens when the
-    /// `compiled_loops` HashMap retires.
+    /// `warmstate.py` `maybe_compile_and_run` reads the token off the cell
+    /// (`procedure_token = cell.get_procedure_token()`); pyre routes through
+    /// `WarmEnterState::get_procedure_token`, which upgrades the cell's weak
+    /// handle. The `Arc` handed back here and the one
+    /// `compiled_loops[gk].token` upgrades to are the same object, and neither
+    /// slot owns it: both are `Weak`, so `alive_loops` is the sole long-lived
+    /// strong owner.
     ///
     /// Cells with no compiled entry (key not yet compiled, or already
     /// evicted) silently no-op — RPython's `keep_loop_alive` is likewise
@@ -12220,7 +12308,7 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(token) = self.warm_state.get_compiled(green_key)
             && self
                 .backend
-                .compiled_bridge_fail_descr_layouts(token, trace_id, fail_index)
+                .compiled_bridge_fail_descr_layouts(&token, trace_id, fail_index)
                 .is_some()
         {
             return true;
@@ -14448,7 +14536,7 @@ impl<M: Clone> MetaInterp<M> {
             .tracing
             .as_ref()
             .map(|ctx| (ctx.inline_depth(), ctx.recursive_depth(callee_raw)));
-        self.should_inline_core(callee_key, ctx_info)
+        self.should_inline_core(callee_key, callee_raw, ctx_info)
     }
 
     pub fn should_inline_with_ctx(
@@ -14458,7 +14546,7 @@ impl<M: Clone> MetaInterp<M> {
         ctx: &crate::trace_ctx::TraceCtx,
     ) -> InlineDecision {
         let ctx_info = Some((ctx.inline_depth(), ctx.recursive_depth(callee_raw)));
-        self.should_inline_core(callee_key, ctx_info)
+        self.should_inline_core(callee_key, callee_raw, ctx_info)
     }
 
     /// Core inline decision logic — RPython `_opimpl_recursive_call`
@@ -14482,6 +14570,7 @@ impl<M: Clone> MetaInterp<M> {
     fn should_inline_core(
         &mut self,
         callee_key: u64,
+        callee_raw: (usize, usize),
         ctx_info: Option<(usize, usize)>,
     ) -> InlineDecision {
         // pyre adaptation: `pending_token` covers the window between
@@ -14541,7 +14630,19 @@ impl<M: Clone> MetaInterp<M> {
         // transition on both tracing paths prevents sibling branches from
         // restarting recursive unrolling after the first bound hit.
         if should_disable {
-            self.warm_state.disable_noninlinable_function(callee_key);
+            // pyjitpl.py:1413 `warmrunnerstate.dont_trace_here(greenboxes)` —
+            // upstream is handed the greens, and `dont_trace_here`
+            // (warmstate.py:679-687) reaches its cell through
+            // `ensure_jit_cell_at_key`. The callee's raw key is in scope here,
+            // so take the typed door: the hash form would file a cell with no
+            // comparekey, and `JC_DONT_TRACE_HERE` set on the wrong cell of a
+            // bucket stops the wrong function from being inlined.
+            match Self::with_typed_decision_key(callee_key, callee_raw, |key| {
+                self.warm_state.disable_noninlinable_function_for_key(key);
+            }) {
+                Some(()) => {}
+                None => self.warm_state.disable_noninlinable_function(callee_key),
+            }
         }
         decision
     }
@@ -15412,12 +15513,12 @@ impl<M: Clone> MetaInterp<M> {
     /// `initialize_state_from_start` without a greenkey and never enters the
     /// log, so a trace that inlined nothing answers `None` and the caller
     /// falls through to `prepare_trace_segmenting`.
-    pub fn find_biggest_function(&self) -> Option<(usize, u64)> {
+    pub fn find_biggest_function(&self) -> Option<(usize, PortalGreenKey)> {
         let positions = self.portal_trace_positions.as_ref()?;
-        let mut start_stack: Vec<(usize, u64, usize)> = Vec::new();
+        let mut start_stack: Vec<(usize, PortalGreenKey, usize)> = Vec::new();
         let mut max_size = 0usize;
         let mut max_key = None;
-        for &(jd_no, key, pos) in positions {
+        for (jd_no, key, pos) in positions.iter().cloned() {
             match key {
                 // pyjitpl.py:3547-3548 `if key is not None: start_stack.append`.
                 Some(key) => start_stack.push((jd_no, key, pos._pos)),
@@ -15442,7 +15543,7 @@ impl<M: Clone> MetaInterp<M> {
         // and a `?` on it would return `None` for the whole function and throw
         // away a `max_key` the closed frames above already produced.  Only the
         // open frame is unmeasurable without a recorder, so only it is skipped.
-        if let Some(&(jd_no, green_key, start_pos)) = start_stack.first()
+        if let Some((jd_no, green_key, start_pos)) = start_stack.first().cloned()
             && let Some(tracing) = self.tracing.as_ref()
         {
             let current = tracing.get_trace_position()._pos;
@@ -15521,7 +15622,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn push_portal_trace_position(
         &mut self,
         jd_no: usize,
-        green_key: Option<u64>,
+        green_key: Option<PortalGreenKey>,
         pos: crate::recorder::TracePosition,
     ) {
         let Some(positions) = self.portal_trace_positions.as_mut() else {
@@ -15582,7 +15683,11 @@ impl<M: Clone> MetaInterp<M> {
             && let (Some(positions), Some(ctx)) =
                 (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
         {
-            positions.push((jd_no, Some(gk), ctx.get_trace_position()));
+            // This entry point is reached with a bare `u64` greenkey — it
+            // predates the raw `(code_ptr, pc)` key and operates on
+            // sub-jitcodes — so the typed half is unavailable here. A caller
+            // that holds the greens should use `push_portal_trace_position`.
+            positions.push((jd_no, Some((gk, None)), ctx.get_trace_position()));
         }
         // Bump the existing TraceCtx inline-depth counter so trace
         // recorder bookkeeping (already wired through pyre's tracer)
@@ -16526,7 +16631,7 @@ impl<M: Clone> MetaInterp<M> {
         let target_token: std::sync::Arc<JitCellToken> = if let Some(arc) =
             self.get_loop_token_arc(green_key)
         {
-            std::sync::Arc::clone(arc)
+            arc
         } else if !self.backend.supports_tmp_callback_call_assembler() {
             // A backend whose CALL_ASSEMBLER admission rejects tmp-callback
             // bodies (wasm: the body reaches the portal runner through a host
@@ -16555,7 +16660,7 @@ impl<M: Clone> MetaInterp<M> {
                 .collect();
             let token_number = self.warm_state.alloc_token_number();
             let backend = &mut self.backend;
-            match self.warm_state.get_assembler_token(green_key, || {
+            match self.warm_state.get_assembler_token(green_key, |memmgr| {
                 compile::compile_tmp_callback(
                     backend,
                     &target_sd,
@@ -16563,6 +16668,7 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     &greenboxes,
                     &arg_types,
+                    Some(memmgr),
                 )
             }) {
                 Ok(token) => token,
@@ -16623,7 +16729,7 @@ impl<M: Clone> MetaInterp<M> {
         // Resolved before the portal-driver lookup — an installed token does
         // not need the portal staticdata.
         if let Some(arc) = self.get_loop_token_arc(green_key) {
-            return Some(Arc::clone(arc));
+            return Some(arc);
         }
         // A backend that cannot enter tmp-callback bodies (wasm: CA admission
         // rejects trampoline-calling targets) keeps the pending token — its
@@ -16646,7 +16752,7 @@ impl<M: Clone> MetaInterp<M> {
         // 1150`).
         let token_number = self.warm_state.alloc_token_number();
         let backend = &mut self.backend;
-        match self.warm_state.get_assembler_token(green_key, || {
+        match self.warm_state.get_assembler_token(green_key, |memmgr| {
             compile::compile_tmp_callback(
                 backend,
                 &target_sd,
@@ -16654,6 +16760,7 @@ impl<M: Clone> MetaInterp<M> {
                 green_key,
                 greenboxes,
                 red_arg_types,
+                Some(memmgr),
             )
         }) {
             Ok(token) => Some(token),
@@ -19401,6 +19508,62 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn force_start_tracing_names_the_cell_it_marked_not_the_bucket_hash() {
+        use crate::BackEdgeAction;
+        // A hash-form consumer files a cell first, and `install_new_cell`
+        // gives it the raw hash as its `cell_key` because nothing holds that
+        // number yet. The typed force-start that follows finds no cell by
+        // comparekey — a hash-filed cell carries none — so it installs its
+        // OWN, which must take a minted key because the raw hash is occupied.
+        //
+        // The trace then has to be keyed on the cell that was actually marked
+        // TRACING. Keyed on the bucket hash it names the first cell instead,
+        // and everything stamped off the trace (`compiled_loops`,
+        // `JitCellToken::green_key`, every `rd_loop_token`) points at a cell
+        // the typed door will never return — compiled and never entered.
+        // Upstream cannot reach this state: `maybe_compile_and_run` reads the
+        // token off the cell it matched and raises with it (warmstate.py:511
+        // `raise EnterJitAssembler(procedure_token, *execute_args)`), never
+        // re-deriving a cell from a number.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let code_ptr = 0x5eed_0000_usize;
+        let pc = 7_usize;
+        let green_key = majit_ir::pypyjit_greenkey_uhash(pc, false, code_ptr as u64);
+        let typed = majit_ir::pypyjit_greenkey(pc, false, code_ptr as u64);
+        assert_eq!(
+            typed.get_uhash(),
+            green_key,
+            "the two forms must name one bucket",
+        );
+
+        // `disable_noninlinable_function` is one of the two hash-form entry
+        // points that create a cell, and it is what the portal-trace log and
+        // the merge-point record feed on a too-long abort.
+        meta.warm_state.disable_noninlinable_function(green_key);
+
+        let action = meta.force_start_tracing(green_key, (code_ptr, pc), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let marked = meta
+            .warm_state
+            .cell_key_for(&typed)
+            .expect("the typed force-start installed a cell for this key");
+        assert_ne!(
+            marked, green_key,
+            "precondition: the raw hash was already claimed, so the new cell \
+             must have been minted a different key",
+        );
+        assert_eq!(
+            meta.starting_green_key(),
+            Some(marked),
+            "the trace must be keyed on the cell force_start_tracing marked, \
+             not on the bucket hash an earlier cell already claimed",
+        );
+    }
+
+    #[test]
     fn do_residual_or_indirect_call_invokes_perform_call_on_hit() {
         // After registering an indirect-call target, the method must
         // route into perform_call (which raises ChangeFrame) instead of
@@ -20493,7 +20656,7 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.aborted_tracing_jitdriver = Some(7);
-        meta.aborted_tracing_greenkey = Some(0xfeed);
+        meta.aborted_tracing_greenkey = Some((0xfeed, None));
         meta.aborted_tracing(0);
         assert!(meta.aborted_tracing_jitdriver.is_none());
         assert!(meta.aborted_tracing_greenkey.is_none());
@@ -20623,6 +20786,68 @@ mod metainterp_static_data_tests {
 
     extern "C" fn portal_runner_helper() -> i64 {
         0xc0ffee
+    }
+
+    /// `compile.py:1148-1149` `if memory_manager is not None:
+    /// memory_manager.keep_loop_alive(jitcell_token)` — the fresh tmp-callback
+    /// token is registered with the memory manager BEFORE it is returned.
+    ///
+    /// Nothing else owns it: `get_assembler_token` (`warmstate.py:714-723`)
+    /// installs it on a cell that keeps a WEAK handle (`warmstate.py:188`),
+    /// and the caller drops its own handle once the CALL_ASSEMBLER descr is
+    /// built. Deleting the registration therefore does not crash — the cell
+    /// silently starts answering "never compiled", which is the failure mode
+    /// this pins.
+    #[test]
+    fn compile_tmp_callback_registers_its_token_with_the_memory_manager() {
+        let mut meta = MetaInterp::<()>::new(0);
+        // `warmspot.py:1010-1017` populates `portal_runner_adr`;
+        // `pyjitpl.py:2274-2281` (`finish_setup_descrs_for_jitdrivers`) the
+        // three descrs `compile_tmp_callback` reads off the driver.
+        let mut driver = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        driver.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx = meta.register_jitdriver_sd(driver);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let jd = meta.staticdata.jitdrivers_sd[idx].clone();
+        let red_arg_types: Vec<majit_ir::Type> = Vec::new();
+        assert_eq!(
+            jd.num_red_args(),
+            red_arg_types.len(),
+            "fixture: compile.py:1113 asserts the red-arg count",
+        );
+
+        let token_number = meta.warm_state.alloc_token_number();
+        let token = {
+            let MetaInterp {
+                backend,
+                warm_state,
+                ..
+            } = &mut meta;
+            compile::compile_tmp_callback(
+                backend,
+                &jd,
+                token_number,
+                0x00C0_FFEE,
+                &[],
+                &red_arg_types,
+                Some(&mut warm_state.memory_manager),
+            )
+            .expect("compile_tmp_callback")
+        };
+
+        assert!(
+            meta.warm_state.memory_manager.contains(&token),
+            "memmgr.py:9-14 — `alive_loops` is the token's only long-lived \
+             strong owner, so `compile_tmp_callback` has to put it there",
+        );
+        // And that ownership is what survives the caller letting go.
+        let weak = std::sync::Arc::downgrade(&token);
+        drop(token);
+        assert!(
+            weak.upgrade().is_some(),
+            "the registration outlives the caller's handle — which is exactly \
+             what the warm cell's weak handle depends on",
+        );
     }
 
     /// Invariant: `do_recursive_call` requires
@@ -21665,16 +21890,16 @@ mod metainterp_static_data_tests {
         start_tracing(&mut meta);
         let jd_no = meta.main_jitdriver_index().expect("recursive portal");
         let start = meta.trace_ctx().expect("tracing").get_trace_position();
-        meta.push_portal_trace_position(jd_no, Some(0xBEEF), start);
+        meta.push_portal_trace_position(jd_no, Some((0xBEEF, None)), start);
         record_ops(&mut meta, 5);
         let end = meta.trace_ctx().expect("tracing").get_trace_position();
         meta.push_portal_trace_position(jd_no, None, end);
-        assert_eq!(meta.find_biggest_function(), Some((jd_no, 0xBEEF)));
+        assert_eq!(meta.find_biggest_function(), Some((jd_no, (0xBEEF, None))));
 
         // pyjitpl.py:2823 `self.portal_trace_positions = None` — after the
         // abort boundary nothing is logged and nothing is found.
         meta.portal_trace_positions = None;
-        meta.push_portal_trace_position(jd_no, Some(0xF00D), end);
+        meta.push_portal_trace_position(jd_no, Some((0xF00D, None)), end);
         assert_eq!(meta.find_biggest_function(), None);
     }
 
@@ -21823,7 +22048,7 @@ mod metainterp_static_data_tests {
         );
         let entry = &meta.portal_trace_positions.as_ref().unwrap()[0];
         assert_eq!(entry.0, idx);
-        assert_eq!(entry.1, Some(0xcafe));
+        assert_eq!(entry.1, Some((0xcafe, None)));
 
         meta.popframe(true);
         let positions = meta
@@ -21969,7 +22194,7 @@ mod metainterp_static_data_tests {
 
         assert_eq!(
             meta.find_biggest_function(),
-            Some((0, 0xa11)),
+            Some((0, (0xa11, None))),
             "the larger frame wins even though both have returned"
         );
     }
@@ -21989,7 +22214,7 @@ mod metainterp_static_data_tests {
         meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
         record_ops(&mut meta, 5);
 
-        assert_eq!(meta.find_biggest_function(), Some((0, 0xb22)));
+        assert_eq!(meta.find_biggest_function(), Some((0, (0xb22, None))));
     }
 
     #[test]
@@ -22012,7 +22237,7 @@ mod metainterp_static_data_tests {
 
         assert_eq!(
             meta.find_biggest_function(),
-            Some((0, 0xa11)),
+            Some((0, (0xa11, None))),
             "the closed frame's size survives a missing recorder"
         );
     }
@@ -22890,6 +23115,11 @@ mod tests {
                 terminal_exit_layouts: indexmap::IndexMap::new(),
             },
         );
+        // `compile.py:566-567` — `send_loop_to_backend` registers the token
+        // with `MemoryManager` BEFORE any cell sees it. The cell keeps only a
+        // weak handle (`warmstate.py:188`), so `alive_loops` is what keeps
+        // `token` alive past this fixture's own local.
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
         meta.warm_state_mut()
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
         meta.compiled_loops.insert(
@@ -22956,6 +23186,11 @@ mod tests {
                 terminal_exit_layouts: indexmap::IndexMap::new(),
             },
         );
+        // `compile.py:566-567` — `send_loop_to_backend` registers the token
+        // with `MemoryManager` BEFORE any cell sees it. The cell keeps only a
+        // weak handle (`warmstate.py:188`), so `alive_loops` is what keeps
+        // `token` alive past this fixture's own local.
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
         meta.warm_state_mut()
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
         meta.compiled_loops.insert(
@@ -23277,6 +23512,11 @@ mod tests {
         );
 
         let token = std::sync::Arc::new(JitCellToken::new(3));
+        // `compile.py:566-567` — `send_loop_to_backend` registers the token
+        // with `MemoryManager` BEFORE any cell sees it. The cell keeps only a
+        // weak handle (`warmstate.py:188`), so `alive_loops` is what keeps
+        // `token` alive past this fixture's own local.
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
         meta.warm_state_mut()
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
         meta.compiled_loops.insert(
@@ -23371,6 +23611,11 @@ mod tests {
         );
 
         let token = std::sync::Arc::new(JitCellToken::new(3));
+        // `compile.py:566-567` — `send_loop_to_backend` registers the token
+        // with `MemoryManager` BEFORE any cell sees it. The cell keeps only a
+        // weak handle (`warmstate.py:188`), so `alive_loops` is what keeps
+        // `token` alive past this fixture's own local.
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
         meta.warm_state_mut()
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
         meta.compiled_loops.insert(
@@ -23685,6 +23930,13 @@ mod tests {
         // HashMap.  Without this, `has_compiled_loop` (now routed
         // through `warm_state.get_procedure_token`) returns `false` for
         // entries created via this test fixture.
+        // `compile.py:566-567` — `send_loop_to_backend` registers the token
+        // with `MemoryManager` BEFORE any cell sees it. The cell keeps only a
+        // weak handle (`warmstate.py:188`), so `alive_loops` is what keeps
+        // `token_arc` alive past this fixture's own local.
+        meta.warm_state_mut()
+            .memory_manager
+            .keep_loop_alive(&token_arc);
         meta.warm_state_mut()
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token_arc));
         meta.compiled_loops.insert(
@@ -24516,6 +24768,11 @@ mod tests {
         let mut token = majit_backend::JitCellToken::new(4242);
         token.virtualizable_arg_index = std::cell::Cell::new(None);
         let token = std::sync::Arc::new(token);
+        // `compile.py:566-567` — `send_loop_to_backend` registers the token
+        // with `MemoryManager` BEFORE any cell sees it. The cell keeps only a
+        // weak handle (`warmstate.py:188`), so `alive_loops` is what keeps
+        // `token` alive past this fixture's own local.
+        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
         meta.warm_state_mut()
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
         meta.compiled_loops.insert(

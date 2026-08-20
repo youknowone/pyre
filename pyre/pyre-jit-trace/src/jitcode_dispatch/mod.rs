@@ -3381,7 +3381,7 @@ pub fn walk<Sym: WalkSym>(
             if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
-                    ctx.trace_ctx.current_merge_points_first_greenkey(),
+                    ctx.trace_ctx.current_merge_points_first_green_key_pair(),
                     ctx.trace_ctx.resumekey_original_loop_token().cloned(),
                 );
                 return Err(DispatchError::TraceTooLong {
@@ -12538,7 +12538,12 @@ fn handle<Sym: WalkSym>(
                         majit_metainterp::GreenBox::new(*opref, ty)
                     })
                     .collect();
-                ctx.trace_ctx.add_merge_point(key, green_boxes, next_instr);
+                ctx.trace_ctx.add_merge_point_with_key(
+                    key,
+                    Some(crate::driver::make_green_key_typed(code_ptr, next_instr)),
+                    green_boxes,
+                    next_instr,
+                );
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
         }
