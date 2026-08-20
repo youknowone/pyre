@@ -421,6 +421,24 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
     issubtype_slow_and_wrong(w_type, cls)
 }
 
+/// JIT walker accessor for `issubtype_w` without exposing the internal helper
+/// as a general cross-crate API.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn jit_issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
+    unsafe { issubtype_w(w_type, cls) }
+}
+
+/// JIT walker accessor for abstractinst.py's `space.isinstance_w(obj, type)`
+/// class test.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn jit_is_type_like_w(obj: PyObjectRef) -> bool {
+    unsafe { is_type_like_w(obj) }
+}
+
 /// `typeobject.py _issubtype_slow_and_wrong` — the subtype test
 /// for a partially-initialised `w_type` whose MRO is not yet installed
 /// (reached only from a custom `MetaCls.mro()`).  Walks the best-base chain

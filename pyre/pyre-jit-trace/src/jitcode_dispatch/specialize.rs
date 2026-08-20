@@ -7143,11 +7143,18 @@ fn walker_isinstance_exact_type_hit(
     if !std::ptr::eq(obj_type.as_ptr(), cls) {
         return None;
     }
+    walker_isinstance_obj_type_guard_info(obj, cls)
+}
+
+fn walker_isinstance_obj_type_guard_info(
+    obj: pyre_object::PyObjectRef,
+    obj_type: pyre_object::PyObjectRef,
+) -> Option<(i64, Option<pyre_object::PyObjectRef>)> {
     let physical_type = unsafe { (*obj).ob_type as i64 };
     let stored_w_class = unsafe { (*obj).w_class };
     if stored_w_class.is_null() {
         Some((physical_type, None))
-    } else if std::ptr::eq(stored_w_class, cls) {
+    } else if std::ptr::eq(stored_w_class, obj_type) {
         Some((physical_type, Some(stored_w_class)))
     } else {
         None
@@ -7159,14 +7166,40 @@ fn walker_isinstance_tuple_element_can_precede_hit(item: pyre_object::PyObjectRe
         .is_some_and(|meta| std::ptr::eq(meta.as_ptr(), pyre_interpreter::typedef::w_type()))
 }
 
+fn walker_guard_ref_value<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    opref: OpRef,
+    expected_obj: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    if !opref.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(expected_obj as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[opref, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(opref, expected);
+    }
+    Ok(())
+}
+
+struct WalkerIsinstanceFold {
+    physical_type: i64,
+    exact_w_class: Option<pyre_object::PyObjectRef>,
+    guarded_cls: pyre_object::PyObjectRef,
+    pinned_obj_type: Option<pyre_object::PyObjectRef>,
+    result: bool,
+}
+
 /// `isinstance(obj, cls)` in the quick exact-type cases from
 /// `abstractinst.py` `abstract_isinstance_w`: before union recursion or
 /// `__instancecheck__` lookup, `type(obj) is cls` returns `True`; for tuple
 /// classinfo the interpreter loops the tuple and recurses into that same test.
 ///
-/// Every other shape declines to the residual call, including unions,
-/// subclass-but-not-exact matches, mismatches, nested tuples, and cases whose
-/// class identity cannot be pinned with the existing object-class guards.
+/// A scalar miss where `type(cls) is type` can also fold through
+/// `p_recursive_isinstance_type_w`: a positive `issubtype_w(type(obj), cls)`
+/// never reads `obj.__class__`; a negative answer is folded only when the
+/// receiver type resolves `__class__` to the stock `object.__class__`
+/// descriptor.
 pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -7204,7 +7237,7 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         return Ok(None);
     }
-    let (physical_type, exact_w_class, exact_cls) = unsafe {
+    let fold = unsafe {
         if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(cls) {
             return Ok(None);
         }
@@ -7239,13 +7272,65 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
             let Some((physical_type, exact_w_class)) = hit else {
                 return Ok(None);
             };
-            (physical_type, exact_w_class, cls)
+            WalkerIsinstanceFold {
+                physical_type,
+                exact_w_class,
+                guarded_cls: cls,
+                pinned_obj_type: None,
+                result: true,
+            }
         } else {
-            let Some((physical_type, exact_w_class)) = walker_isinstance_exact_type_hit(obj, cls)
-            else {
-                return Ok(None);
-            };
-            (physical_type, exact_w_class, cls)
+            if let Some((physical_type, exact_w_class)) = walker_isinstance_exact_type_hit(obj, cls)
+            {
+                WalkerIsinstanceFold {
+                    physical_type,
+                    exact_w_class,
+                    guarded_cls: cls,
+                    pinned_obj_type: None,
+                    result: true,
+                }
+            } else {
+                if !pyre_object::is_type(cls) {
+                    return Ok(None);
+                }
+                let Some(cls_type) = pyre_interpreter::typedef::r#type(cls) else {
+                    return Ok(None);
+                };
+                if !std::ptr::eq(cls_type.as_ptr(), pyre_interpreter::typedef::w_type()) {
+                    return Ok(None);
+                }
+                let Some(obj_type) = pyre_interpreter::typedef::r#type(obj) else {
+                    return Ok(None);
+                };
+                let obj_type = obj_type.as_ptr();
+                if !pyre_object::is_type(obj_type) {
+                    return Ok(None);
+                }
+                let version_tag = pyre_object::typeobject::w_type_get_version_tag(obj_type);
+                if version_tag == 0 {
+                    return Ok(None);
+                }
+                let Some((physical_type, exact_w_class)) =
+                    walker_isinstance_obj_type_guard_info(obj, obj_type)
+                else {
+                    return Ok(None);
+                };
+                let result = pyre_interpreter::baseobjspace::jit_issubtype_w(obj_type, cls);
+                if !result
+                    && !pyre_interpreter::baseobjspace::isinstance_miss_class_lookup_is_pure(
+                        obj_type,
+                    )
+                {
+                    return Ok(None);
+                }
+                WalkerIsinstanceFold {
+                    physical_type,
+                    exact_w_class,
+                    guarded_cls: cls,
+                    pinned_obj_type: Some(obj_type),
+                    result,
+                }
+            }
         }
     };
 
@@ -7253,29 +7338,84 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     // Pin the callable identity (LOAD_GLOBAL `isinstance` is usually already
     // constant via the namespace cell fold).
     let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_ref_value(ctx, op.pc, callable_op, concrete_callable)?;
     let obj_op = r_args[2];
-    walker_guard_class(ctx, op.pc, obj_op, physical_type)?;
-    if let Some(exact_w_class) = exact_w_class {
+    walker_guard_class(ctx, op.pc, obj_op, fold.physical_type)?;
+    if let Some(exact_w_class) = fold.exact_w_class {
         walker_guard_exact_w_class(ctx, op.pc, obj_op, exact_w_class)?;
     }
     let cls_op = r_args[3];
-    if !cls_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(exact_cls as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[cls_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(cls_op, expected);
+    walker_guard_ref_value(ctx, op.pc, cls_op, fold.guarded_cls)?;
+    if let Some(obj_type) = fold.pinned_obj_type {
+        let obj_type_const = ctx.trace_ctx.const_ref(obj_type as i64);
+        walker_pin_type_version_tag(ctx, op.pc, obj_type_const)?;
     }
-    walker_write_const_bool_result(ctx, op.pc, true, dst, 'r')?;
+    walker_write_const_bool_result(ctx, op.pc, fold.result, dst, 'r')?;
+    Ok(Some(()))
+}
+
+pub(crate) fn try_walker_specialize_builtin_issubclass<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, derived, cls)` shape only.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(derived),
+        ConcreteValue::Ref(cls),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null() || !null_or_self.is_null() || derived.is_null() || cls.is_null()
+    {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_issubclass_function(concrete_callable) {
+        return Ok(None);
+    }
+
+    let result = unsafe {
+        if pyre_object::is_generic_alias(derived)
+            || !pyre_object::is_type(derived)
+            || !pyre_object::is_type(cls)
+            || !pyre_interpreter::baseobjspace::jit_is_type_like_w(derived)
+            || !pyre_interpreter::baseobjspace::jit_is_type_like_w(cls)
+        {
+            return Ok(None);
+        }
+        let Some(cls_type) = pyre_interpreter::typedef::r#type(cls) else {
+            return Ok(None);
+        };
+        if !std::ptr::eq(cls_type.as_ptr(), pyre_interpreter::typedef::w_type()) {
+            return Ok(None);
+        }
+        let version_tag = pyre_object::typeobject::w_type_get_version_tag(derived);
+        if version_tag == 0 {
+            return Ok(None);
+        }
+        pyre_interpreter::baseobjspace::jit_issubtype_w(derived, cls)
+    };
+
+    walker_guard_ref_value(ctx, op.pc, r_args[0], concrete_callable)?;
+    walker_guard_ref_value(ctx, op.pc, r_args[2], derived)?;
+    walker_guard_ref_value(ctx, op.pc, r_args[3], cls)?;
+    let derived_const = ctx.trace_ctx.const_ref(derived as i64);
+    walker_pin_type_version_tag(ctx, op.pc, derived_const)?;
+    walker_write_const_bool_result(ctx, op.pc, result, dst, 'r')?;
     Ok(Some(()))
 }
 

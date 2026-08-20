@@ -4535,6 +4535,15 @@ pub fn is_builtin_isinstance_function(callable: PyObjectRef) -> bool {
     }
 }
 
+/// True iff `callable` is the canonical builtin `issubclass` function object.
+///
+/// The JIT walker uses this together with abstractinst.py's non-overridable
+/// `type.__subclasscheck__` path; a rebound global named `issubclass` must not
+/// inherit that fold.
+pub fn is_builtin_issubclass_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, builtin_issubclass)
+}
+
 /// `len(obj)` — return the length of an object.
 /// `len(obj)` — PyPy: operation.py len → space.len_w
 fn builtin_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -19254,6 +19263,19 @@ mod tests {
         assert!(is_builtin_isinstance_function(isinstance));
         assert!(!is_builtin_isinstance_function(renamed_isinstance));
         assert!(!is_builtin_isinstance_function(std::ptr::null_mut()));
+    }
+
+    #[test]
+    fn builtin_issubclass_identity_uses_wrapped_code() {
+        crate::typedef::init_typeobjects();
+        let issubclass =
+            make_module_builtin_function_with_arity("issubclass", builtin_issubclass, 2);
+        let renamed_issubclass =
+            make_module_builtin_function_with_arity("issubclass", builtin_repr, 2);
+
+        assert!(is_builtin_issubclass_function(issubclass));
+        assert!(!is_builtin_issubclass_function(renamed_issubclass));
+        assert!(!is_builtin_issubclass_function(std::ptr::null_mut()));
     }
 
     #[test]
