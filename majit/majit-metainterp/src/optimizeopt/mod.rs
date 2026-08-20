@@ -1726,7 +1726,7 @@ impl OptContext {
         if !self
             .quasi_immutable_deps
             .iter()
-            .any(|seen| std::sync::Arc::ptr_eq(seen, &dep))
+            .any(|seen| seen.instance_identity() == dep.instance_identity())
         {
             self.quasi_immutable_deps.push(dep);
         }

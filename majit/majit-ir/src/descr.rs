@@ -3640,6 +3640,14 @@ pub trait QuasiImmutHandle: Send + Sync + std::fmt::Debug {
     /// `quasiimmut.py:72-75 register_loop_token`, reached from
     /// `compile.py:204-207`.
     fn register_loop_token(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    /// Identity of the instance behind the handle.
+    ///
+    /// `heap.py:821-823` keys `quasi_immutable_deps` by the `QuasiImmut`
+    /// itself, so one instance is one entry however many reads found it. A
+    /// handle is minted per read, so comparing handles would let repeated
+    /// markers for one instance each register the loop again.
+    fn instance_identity(&self) -> usize;
 }
 
 /// `quasiimmut.py:113-158 QuasiImmutDescr` — the descr a recorded

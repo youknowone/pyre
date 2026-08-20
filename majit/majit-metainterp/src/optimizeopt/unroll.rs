@@ -2213,12 +2213,59 @@ impl Default for UnrollOptimizer {
     }
 }
 
+#[cfg(test)]
+mod quasi_immutable_dep_tests {
+    #[derive(Debug)]
+    struct FakeHandle(std::sync::Arc<()>);
+
+    impl majit_ir::QuasiImmutHandle for FakeHandle {
+        fn is_current(&self) -> bool {
+            true
+        }
+
+        fn register_loop_token(&self, _flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+
+        fn instance_identity(&self) -> usize {
+            std::sync::Arc::as_ptr(&self.0) as usize
+        }
+    }
+
+    fn handle(instance: &std::sync::Arc<()>) -> std::sync::Arc<dyn majit_ir::QuasiImmutHandle> {
+        std::sync::Arc::new(FakeHandle(instance.clone()))
+    }
+
+    /// `heap.py:821-823` keys `quasi_immutable_deps` by the `QuasiImmut`, so an
+    /// instance is one entry however many reads found it. A handle is minted per
+    /// read, so deduping on the handle instead lets two markers for one instance
+    /// each register the loop again.
+    #[test]
+    fn two_handles_for_one_instance_merge_to_one_dep() {
+        let instance = std::sync::Arc::new(());
+        let first = handle(&instance);
+        let second = handle(&instance);
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &second),
+            "the two reads must mint distinct handles or this proves nothing",
+        );
+
+        let mut deps = vec![first];
+        super::merge_quasi_immutable_deps(&mut deps, &[second]);
+        assert_eq!(deps.len(), 1);
+
+        super::merge_quasi_immutable_deps(&mut deps, &[handle(&std::sync::Arc::new(()))]);
+        assert_eq!(deps.len(), 2, "a different instance is a different dep");
+    }
+}
+
 pub(crate) fn merge_quasi_immutable_deps(
     dst: &mut Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     src: &[std::sync::Arc<dyn majit_ir::QuasiImmutHandle>],
 ) {
     for dep in src {
-        if !dst.iter().any(|seen| std::sync::Arc::ptr_eq(seen, dep)) {
+        if !dst
+            .iter()
+            .any(|seen| seen.instance_identity() == dep.instance_identity())
+        {
             dst.push(dep.clone());
         }
     }

@@ -5144,6 +5144,10 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
     fn register_loop_token(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.0.register_loop_token(flag);
     }
+
+    fn instance_identity(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0) as usize
+    }
 }
 
 /// `pyjitpl.py:1081 QuasiImmutDescr(cpu, structbox.getref_base(), fielddescr,
