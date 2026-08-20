@@ -1363,6 +1363,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     }
     const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
     const INLINE_VALUES: i64 = 1 << 2;
+    const MANAGED_WEAKREF: i64 = 1 << 3;
     const MANAGED_DICT: i64 = 1 << 4;
     const IMMUTABLETYPE: i64 = 1 << 8;
     const DISALLOW_INSTANTIATION: i64 = 1 << 7;
@@ -1406,6 +1407,9 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
             if !w_type_cpython_has_variable_items(obj) {
                 flags |= INLINE_VALUES;
             }
+        }
+        if w_type_has_cpython_managed_weakref(obj) {
+            flags |= MANAGED_WEAKREF;
         }
     } else {
         // `Py_TPFLAGS_IMMUTABLETYPE` (`object.h`, read at v3.14.6): a type
@@ -1565,6 +1569,35 @@ unsafe fn w_type_cpython_has_variable_items(obj: PyObjectRef) -> bool {
         || std::ptr::eq(typedef, &TUPLE_TYPE)
         || std::ptr::eq(typedef, &crate::bytesobject::BYTES_TYPE)
         || std::ptr::eq(typedef, &crate::memoryview::MEMORYVIEW_TYPE)
+}
+
+/// CPython 3.14 `Py_TPFLAGS_MANAGED_WEAKREF`, projected through PyPy's
+/// `weakrefable` inheritance and `find_best_base` layout owner.
+///
+/// A heap type whose best base is not weakrefable introduced the managed
+/// weakref slot itself.  Otherwise the storage kind follows the best base:
+/// another heap type propagates the managed flag, while a builtin owner such
+/// as `type`, `set`, or `module` terminates the walk with an intrinsic slot.
+/// `copy_flags_from_bases` may also obtain the capability from a compatible
+/// secondary base; when the best base itself lacks it, CPython creates the
+/// managed slot on the new type, which is the first arm below.
+///
+/// This deliberately follows the owner chain instead of testing whether the
+/// `__weakref__` descriptor is still present: deleting a descriptor cannot
+/// rewrite the immutable type-layout flag.
+unsafe fn w_type_has_cpython_managed_weakref(obj: PyObjectRef) -> bool {
+    if obj.is_null() || !is_type(obj) {
+        return false;
+    }
+    let t = &*(obj as *const W_TypeObject);
+    if !t.flag_heaptype || !t.weakrefable {
+        return false;
+    }
+    let bestbase = find_best_base(obj);
+    if bestbase.is_null() || !w_type_get_weakrefable(bestbase) {
+        return true;
+    }
+    w_type_has_cpython_managed_weakref(bestbase)
 }
 /// Override acceptable_as_base_class by cloning the Layout.
 /// typedef.py:742,765,664 explicit overrides after initial creation.
@@ -1926,6 +1959,53 @@ mod tests {
             // heap subtype sharing that layout has neither managed bit.
             let native_dict = heap_type_with_layout(&MODULE_TYPE, true);
             assert_eq!(w_type_get_flags(native_dict) & MASK, 0);
+        }
+    }
+
+    #[test]
+    fn type_flags_project_managed_weakref_through_the_best_base_owner() {
+        const MANAGED_WEAKREF: i64 = 1 << 3;
+        let layout = leak_layout(Layout {
+            typedef: &INSTANCE_TYPE,
+            nslots: 0,
+            newslotnames: vec![],
+            base_layout: std::ptr::null(),
+            acceptable_as_base_class: true,
+            typedef_hasdict: false,
+        });
+
+        unsafe fn builtin_with_layout(name: &str, layout: *const Layout) -> PyObjectRef {
+            let w_type = w_type_new_builtin(name, PY_NULL, std::ptr::null_mut(), &INSTANCE_TYPE);
+            w_type_set_layout(w_type, layout);
+            w_type
+        }
+
+        unsafe fn heap_with_base(
+            name: &str,
+            base: PyObjectRef,
+            layout: *const Layout,
+        ) -> PyObjectRef {
+            let bases = crate::w_tuple_new(vec![base]);
+            let w_type = w_type_new(name, bases, std::ptr::null_mut());
+            w_type_set_layout(w_type, layout);
+            w_type
+        }
+
+        unsafe {
+            let object = builtin_with_layout("object", layout);
+            let plain = heap_with_base("Plain", object, layout);
+            w_type_set_weakrefable(plain, true);
+            assert_ne!(w_type_get_flags(plain) & MANAGED_WEAKREF, 0);
+
+            let derived = heap_with_base("Derived", plain, layout);
+            w_type_set_weakrefable(derived, true);
+            assert_ne!(w_type_get_flags(derived) & MANAGED_WEAKREF, 0);
+
+            let intrinsic = builtin_with_layout("intrinsic", layout);
+            w_type_set_weakrefable(intrinsic, true);
+            let intrinsic_subclass = heap_with_base("IntrinsicChild", intrinsic, layout);
+            w_type_set_weakrefable(intrinsic_subclass, true);
+            assert_eq!(w_type_get_flags(intrinsic_subclass) & MANAGED_WEAKREF, 0);
         }
     }
 
