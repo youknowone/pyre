@@ -966,11 +966,22 @@ impl FrameBox {
     /// Rust has no such pass, and a running opcode holds a `&mut PyFrame`
     /// across its own allocations, so this allocation standing still is what
     /// takes the place of that rewrite.  It is not a rule about every frame —
-    /// a compiled trace's inlined-callee frame is a nursery allocation, and
-    /// making that uniform times `fib_recursive` out of its gate — so the
-    /// crossing into raw-pointer territory is guarded at the seams instead
-    /// (`gate-triage.md`, which also records why the ratio that experiment is
-    /// often quoted with is not reproducible).
+    /// a compiled trace's inlined-callee frame is a nursery allocation
+    /// (`emit_new_pyframe_inline_with_params` -> `NewWithVtable`), so the
+    /// crossing into raw-pointer territory is guarded at the seams instead,
+    /// by `crate::eval::FrameAnchor` and the JIT layer's `FrameRoot`.
+    ///
+    /// Making it uniform is one line —
+    /// `PYFRAME_DESCR_GROUP.size_descr.set_non_moving(true)` sends
+    /// `NewWithVtable` down `gen_malloc_fixedsize` to the old generation —
+    /// and it costs 3.6x on `bench/fib_recursive.py`: 0.39s against 1.43s,
+    /// user CPU, five samples per arm, arm64 darwin, 2026-08-20.  An old-gen
+    /// frame holding young argument boxes joins the remembered set and is
+    /// re-traced every minor collection, and each returned frame is old-gen
+    /// garbage only a major reclaims.  Pinning is not an alternative:
+    /// `GcAllocator::pin` ports `gctypelayout.py:88-92 q_cannot_pin` and
+    /// refuses any type carrying GC pointers or a custom trace, which a
+    /// `PyFrame` does both.
     ///
     /// Before the hook is wired (bootstrap, tests) `try_gc_alloc_stable`
     /// returns `None`; fall back to the `std::alloc` `GcFramePrefix` box,
