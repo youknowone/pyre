@@ -2032,6 +2032,7 @@ impl TraceCtx {
     ///
     /// Panics when a constant OpRef is not inline-resolvable — that is a
     /// genuine invariant break.
+    #[allow(dead_code)]
     pub(crate) fn opref_to_box(&self, opref: OpRef) -> OcBox {
         if opref.is_constant() {
             let value = opref.inline_const_to_value().unwrap_or_else(|| {
@@ -5407,6 +5408,7 @@ mod tests {
     use majit_backend::JitCellToken;
     use majit_ir::Type;
 
+    #[allow(dead_code)]
     extern "C" fn dummy_call_target() {}
 
     /// Test-side `self.metainterp.cpu` analog: implements the cache-hit

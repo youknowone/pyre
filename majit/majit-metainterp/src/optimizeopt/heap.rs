@@ -293,6 +293,7 @@ impl CachedField {
 
     /// heap.py:103-120 AbstractCachedEntry.getfield_from_cache
     /// heap.py:103-120 AbstractCachedEntry.getfield_from_cache
+    #[allow(dead_code)]
     fn getfield_from_cache(
         &self,
         struct_opref: OpRef,
@@ -379,6 +380,7 @@ impl CachedField {
     }
 
     /// heap.py:172-175 CachedField.put_field_back_to_info
+    #[allow(dead_code)]
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
         // info.py:203-211 opinfo.setfield(descr, struct, op, optheap, cf=self)
         // PyPy: `setfield(..., cf=cf)` calls `cf.register_info(struct, self)`
@@ -633,6 +635,7 @@ impl ArrayCachedItem {
     }
 
     /// heap.py:103-120 AbstractCachedEntry.getfield_from_cache
+    #[allow(dead_code)]
     fn getfield_from_cache(
         &self,
         array_opref: OpRef,
@@ -651,6 +654,7 @@ impl ArrayCachedItem {
     }
 
     /// heap.py:252-255 ArrayCachedItem.put_field_back_to_info
+    #[allow(dead_code)]
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
         let arg = ctx.resolve_operand_operand(&op.arg(2)).to_opref();
         let struct_box = ctx.resolve_operand_operand(&op.arg(0));
@@ -1063,6 +1067,7 @@ impl OptHeap {
     /// (`effectinfo.py:307-311 add_array` writes `ei_index` onto the
     /// array descr; `compute_bitstrings` re-stamps in-place per
     /// `effectinfo.py:526 descr.ei_index = …`).
+    #[allow(dead_code)]
     fn array_effect_index(descr: &DescrRef) -> u32 {
         descr.get_ei_index()
     }
@@ -1219,6 +1224,7 @@ impl OptHeap {
         Some(&mut self.cached_arrayitems[pos].2)
     }
 
+    #[allow(dead_code)]
     fn get_cached_array_descr(&self, descr_idx: usize) -> Option<DescrRef> {
         self.cached_array_pos_for_index(descr_idx)
             .map(|pos| self.cached_arrayitems[pos].1.clone())
@@ -1980,6 +1986,7 @@ impl OptHeap {
     }
 
     /// heap.py: check if a call forces virtual/virtualizable objects.
+    #[allow(dead_code)]
     fn call_forces_virtual(op: &Op) -> bool {
         op.with_call_descr(|cd| cd.get_extra_info().check_forces_virtual_or_virtualizable())
             .unwrap_or(false)

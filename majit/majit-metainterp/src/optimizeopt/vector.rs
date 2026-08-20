@@ -1750,6 +1750,7 @@ impl VectorizingOptimizer {
     }
 
     /// vector.py:515-521: schedule — run the scheduler on the given state.
+    #[allow(dead_code)]
     fn schedule_state(_state: &mut VecScheduleState, _graph: &DependencyGraph) {
         // vector.py:516: state.prepare() — handled by caller
         // vector.py:517-518: scheduler.walk_and_emit(state) — scheduling

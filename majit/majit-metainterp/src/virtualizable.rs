@@ -1616,6 +1616,7 @@ unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
+#[allow(dead_code)]
 unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool {
     unsafe {
         let token_ptr = obj_ptr.add(info.token_offset) as *const usize;
@@ -1664,6 +1665,7 @@ unsafe fn read_array_lengths(info: &VirtualizableInfo, obj_ptr: *const u8) -> Ve
 /// # Safety
 /// The caller must ensure `obj_ptr` is valid and the array has at least `length` elements.
 #[cfg(test)]
+#[allow(dead_code)]
 unsafe fn read_virtualizable_array(
     array_info: &VableArrayInfo,
     obj_ptr: *const u8,

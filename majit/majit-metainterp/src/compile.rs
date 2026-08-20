@@ -344,8 +344,10 @@ impl<'a> CompileData<'a> {
 /// `compile.py:62` `class PreambleCompileData(CompileData)`.
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
+    #[allow(dead_code)]
     pub runtime_boxes: &'a [OpRef],
     pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
 
@@ -368,8 +370,10 @@ impl<'a> PreambleCompileData<'a> {
 /// `compile.py:81` `class SimpleCompileData(CompileData)`.
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
+    #[allow(dead_code)]
     pub resumestorage: Option<&'a ResumeStorage>,
     pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
 
@@ -391,11 +395,14 @@ impl<'a> SimpleCompileData<'a> {
 
 /// `compile.py:98` `class BridgeCompileData(CompileData)`.
 pub struct BridgeCompileData<'a> {
+    #[allow(dead_code)]
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
+    #[allow(dead_code)]
     pub resumestorage: Option<&'a ResumeStorage>,
     pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
     pub inline_short_preamble: bool,
+    #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
 
@@ -422,9 +429,13 @@ impl<'a> BridgeCompileData<'a> {
 /// `compile.py:122` `class UnrolledLoopData(CompileData)`.
 pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
+    #[allow(dead_code)]
     pub celltoken: &'a Arc<JitCellToken>,
+    #[allow(dead_code)]
     pub state: &'a crate::optimizeopt::unroll::ExportedState,
+    #[allow(dead_code)]
     pub call_pure_results: &'a indexmap::IndexMap<Vec<Value>, Value>,
+    #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
 
@@ -1705,6 +1716,7 @@ pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
     layouts
 }
 
+#[allow(dead_code)]
 pub(crate) fn terminal_exit_layout_for_trace(
     trace: &CompiledTrace,
     owning_key: u64,
@@ -1726,6 +1738,7 @@ pub(crate) fn terminal_exit_layout_for_trace(
     infer_terminal_exit_layout(&trace.inputargs, &trace.ops, owning_key, trace_id, op_index)
 }
 
+#[allow(dead_code)]
 pub(crate) fn decode_values_with_layout(
     raw_values: &[i64],
     layout: &CompiledExitLayout,
@@ -3186,12 +3199,17 @@ fn alloc_fail_index() -> u32 {
 //                      failarg index (when TY_INT/REF/FLOAT), accessed via
 //                      `>> ST_SHIFT` with `STATUS_SHIFT_MASK`.
 pub(crate) const STATUS_BUSY_FLAG: u64 = 0x01;
+#[allow(dead_code)]
 pub(crate) const STATUS_TYPE_MASK: u64 = 0x06;
 pub(crate) const STATUS_SHIFT: u32 = 3;
 pub(crate) const STATUS_SHIFT_MASK: u64 = !((1u64 << STATUS_SHIFT) - 1);
+#[allow(dead_code)]
 pub(crate) const STATUS_TY_NONE: u64 = 0x00;
+#[allow(dead_code)]
 pub(crate) const STATUS_TY_INT: u64 = 0x02;
+#[allow(dead_code)]
 pub(crate) const STATUS_TY_REF: u64 = 0x04;
+#[allow(dead_code)]
 pub(crate) const STATUS_TY_FLOAT: u64 = 0x06;
 
 // MetaFailDescr removed: pyre-introduced placeholder for non-resume

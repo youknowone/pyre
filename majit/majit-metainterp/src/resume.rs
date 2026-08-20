@@ -648,6 +648,7 @@ impl ResumeStorage {
         clippy::mut_from_ref,
         reason = "The stop-the-world GC root walker is the sole writer and ResumeDataStorage owns an UnsafeCell-backed root vector; this unsafe accessor makes that externally enforced exclusivity explicit"
     )]
+    #[allow(dead_code)]
     pub(crate) unsafe fn rd_consts_mut_for_gc(&self) -> &mut Vec<Const> {
         unsafe { self.rd_consts.as_mut_vec_for_gc() }
     }

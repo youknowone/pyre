@@ -6550,6 +6550,7 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    #[allow(dead_code)]
     fn decode_descriptor_values(
         descriptor: Option<&JitDriverStaticData>,
         raw_values: &[i64],
@@ -6572,6 +6573,7 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
+    #[allow(dead_code)]
     fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
         layout
             .exit_types
@@ -6589,6 +6591,7 @@ impl<S: JitState> JitDriver<S> {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn resume_layout_with_descriptor_slot_types(
         descriptor: Option<&JitDriverStaticData>,
         resume_layout: &ResumeLayoutSummary,
@@ -8145,6 +8148,7 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[allow(dead_code)]
     struct FrameMetadataState {
         seen_trace_id: Option<u64>,
         seen_header_pc: Option<u64>,

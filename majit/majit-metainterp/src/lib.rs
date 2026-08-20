@@ -1,5 +1,7 @@
+// `dead_code` is deliberately absent here. The ports that run ahead of their
+// consumers carry the attribute per item instead, so the lint still reports
+// anything that newly stops being reached.
 #![allow(
-    dead_code,
     unpredictable_function_pointer_comparisons,
     unused_imports,
     unused_mut,
@@ -128,6 +130,12 @@ pub mod recorder;
 pub mod resoperation;
 pub mod resume;
 pub mod resume_box_reader;
+// The rule DSL is an offline generator: `real.rules` is compiled to the
+// checked-in `optimizeopt/autogenintrules.rs`, so nothing in a normal build
+// calls the parser, prover or codegen. It is a file-for-file port of
+// `rpython/jit/metainterp/ruleopt/`, so the unreached surface is kept whole
+// rather than trimmed to whatever the last regeneration happened to touch.
+#[allow(dead_code)]
 pub(crate) mod ruleopt;
 pub mod support;
 mod trace_ctx;

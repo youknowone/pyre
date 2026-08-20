@@ -1025,6 +1025,7 @@ pub struct OptContext {
 /// Uses FieldDescr.is_typeptr() which checks `field_name() == "typeptr"`,
 /// matching RPython's name-based filtering.
 #[inline(always)]
+#[allow(dead_code)]
 pub(crate) fn is_typeptr_field(
     field_idx: u32,
     field_descrs: &[majit_ir::DescrRef],
@@ -3822,6 +3823,7 @@ impl OptContext {
         struct ArgEntry {
             arg: OpRef,
             info: ForwardedInfo,
+            #[allow(dead_code)]
             is_input: bool,
         }
         let mut arg_entries: Vec<ArgEntry> = Vec::new();
@@ -5411,6 +5413,7 @@ impl OptContext {
     /// `box._forwarded` without materializing an unbounded one on first
     /// access. Returns `None` for boxes that have no IntBound forwarding.
     /// Used by exporters that take `&OptContext` and cannot mutate.
+    #[allow(dead_code)]
     pub(crate) fn peek_intbound(
         &self,
         opref: OpRef,

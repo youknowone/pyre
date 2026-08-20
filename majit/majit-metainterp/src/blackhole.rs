@@ -965,6 +965,7 @@ impl BlackholeInterpreter {
         self.next_u8()
     }
 
+    #[allow(dead_code)]
     fn next_u16(&mut self) -> u16 {
         jitcode::read_u16(&self.jitcode.code, &mut self.position)
     }
@@ -989,6 +990,7 @@ impl BlackholeInterpreter {
     /// `BhDescr::VableField` — Stage 3c-3 collapses the dual-mode
     /// auto-detect, so callers must already be on the canonical layout
     /// (`assembler.py:165-167` + `:197-207`).
+    #[allow(dead_code)]
     fn vable_field_index_at(&self, pos: usize) -> usize {
         let idx = self
             .peek_u16_at(pos)
@@ -1005,6 +1007,7 @@ impl BlackholeInterpreter {
     /// (`VableArray`, `Array`) descr pool pair at `field_pos` /
     /// `array_pos`. Panics if either entry is missing or the wrong
     /// variant — see [`Self::vable_field_index_at`].
+    #[allow(dead_code)]
     fn vable_array_index_pair_at(&self, field_pos: usize, array_pos: usize) -> usize {
         let field_idx = self
             .peek_u16_at(field_pos)
@@ -1678,6 +1681,7 @@ impl BlackholeInterpreter {
     }
 
     /// Read call arguments from bytecode (kind:u8, reg:u8 per arg).
+    #[allow(dead_code)]
     fn read_call_args(&mut self, num_args: usize) -> Vec<i64> {
         let mut args = Vec::with_capacity(num_args);
         let mut metas: Vec<(u8, u8)> = Vec::with_capacity(num_args);
@@ -7077,6 +7081,7 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
 /// RPython: fielddescr carries byte offset for the array pointer field.
 /// pyre: VableArray.index → vinfo.array_fields[index].field_offset.
 #[inline]
+#[allow(dead_code)]
 fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let array_index = descr.as_vable_array_index();

@@ -377,6 +377,7 @@ impl OptString {
         }
     }
 
+    #[allow(dead_code)]
     fn is_virtual_concat(&self, op: &Operand, ctx: &OptContext) -> bool {
         self.get_concat_info(op, ctx).is_some()
     }
@@ -391,6 +392,7 @@ impl OptString {
         }
     }
 
+    #[allow(dead_code)]
     fn is_virtual_slice(&self, op: &Operand, ctx: &OptContext) -> bool {
         self.get_slice_info(op, ctx).is_some()
     }
@@ -399,6 +401,7 @@ impl OptString {
     /// the installed `StrPtrInfo`. Returns 0 when no PtrInfo is set — callers
     /// inside the pass only hit this path for constant/forwarded refs where
     /// the mode is not observable and defaulting to string is harmless.
+    #[allow(dead_code)]
     fn get_mode(&self, op: &Operand, ctx: &OptContext) -> u8 {
         let resolved_box = ctx.resolve_operand_operand_opt(op);
         match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
@@ -439,6 +442,7 @@ impl OptString {
     /// vstring.py:110-119 StrPtrInfo.getstrlen — delegates to
     /// OptContext::getstrlen_opref which handles per-variant dispatch
     /// and lgtop caching (box identity reuse).
+    #[allow(dead_code)]
     fn getstrlen(&self, op: &Operand, ctx: &mut OptContext) -> OpRef {
         let mode = self.get_mode(op, ctx);
         ctx.getstrlen_opref(op.to_opref(), mode)
@@ -447,6 +451,7 @@ impl OptString {
     /// vstring.py:112-114 — get the strlen OpRef if already known,
     /// without emitting a new op. Checks lgtop first (RPython parity),
     /// then structurally-known constant length on the virtual variant.
+    #[allow(dead_code)]
     fn getstrlen_if_known(&self, op: &Operand, ctx: &mut OptContext) -> Option<OpRef> {
         let resolved_box = ctx.resolve_operand_operand_opt(op);
         // vstring.py:112: if self.lgtop is not None: return self.lgtop
@@ -631,6 +636,7 @@ impl OptString {
     /// Get the known length of a virtual string as a constant, if available.
     /// Delegates to `PtrInfo::Str::getstrlen` which walks Plain/Slice/Concat
     /// variants. Matches vstring.py:171/251/281 `getstrlen()` per-variant.
+    #[allow(dead_code)]
     fn get_known_length(&self, op: &Operand, ctx: &OptContext) -> Option<i64> {
         let resolved_box = ctx.resolve_operand_operand_opt(op);
         let info = resolved_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
@@ -1023,6 +1029,7 @@ impl OptString {
 
     /// vstring.py: postprocess — after STRLEN on a known-length string,
     /// record as pure (for CSE with OptPure).
+    #[allow(dead_code)]
     fn postprocess_strlen(&self, op: &Op, ctx: &mut OptContext) {
         // vstring.py: postprocess_STRLEN → make_nonnull_str
         let mode = if op.opcode == OpCode::Strlen {

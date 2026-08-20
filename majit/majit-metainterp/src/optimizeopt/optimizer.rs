@@ -5757,6 +5757,7 @@ mod tests {
     }
 
     /// A trivial pass that removes INT_ADD(x, 0) -> x
+    #[allow(dead_code)]
     struct AddZeroElimination;
 
     impl Optimization for AddZeroElimination {
@@ -5857,6 +5858,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     struct RemoveAsTypedConstant {
         target: OpRef,
         value: majit_ir::Value,

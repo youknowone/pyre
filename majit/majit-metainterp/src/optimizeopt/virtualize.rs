@@ -27,6 +27,7 @@ pub(crate) struct VirtualizableConfig {
     /// Byte offsets of static (scalar) frame fields (e.g. next_instr, stack_depth).
     pub static_field_offsets: Vec<usize>,
     /// Types of static (scalar) frame fields, parallel to `static_field_offsets`.
+    #[allow(dead_code)]
     pub static_field_types: Vec<Type>,
     /// virtualizable.py:71-72 `static_field_descrs`.
     ///
@@ -40,6 +41,7 @@ pub(crate) struct VirtualizableConfig {
     /// Byte offsets of array pointer frame fields (e.g. locals_w, value_stack_w).
     pub array_field_offsets: Vec<usize>,
     /// Item types of array fields, parallel to `array_field_offsets`.
+    #[allow(dead_code)]
     pub array_item_types: Vec<Type>,
     /// virtualizable.py:73-74 `array_field_descrs`.
     ///
@@ -2770,6 +2772,7 @@ static VREF_DESCR_FORCED: std::sync::LazyLock<Arc<VRefFieldDescr>> =
 static VREF_SIZE_DESCR: std::sync::LazyLock<Arc<VRefSizeDescr>> =
     std::sync::LazyLock::new(|| Arc::new(VRefSizeDescr));
 
+#[allow(dead_code)]
 fn make_vref_field_descr(index: u32) -> DescrRef {
     make_vref_field_descr_typed(index)
 }
@@ -2961,6 +2964,7 @@ mod tests {
     #[derive(Debug)]
     struct TestParentSizeDescr {
         idx: u32,
+        #[allow(dead_code)]
         field_type: majit_ir::Type,
         all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     }

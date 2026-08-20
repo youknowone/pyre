@@ -540,6 +540,7 @@ impl GuardStrengthenOpt {
         }
     }
 
+    #[allow(dead_code)]
     fn set_guard(
         guards: &mut indexmap::IndexMap<usize, Option<Guard>>,
         idx: usize,

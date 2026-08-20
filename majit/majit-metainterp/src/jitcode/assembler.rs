@@ -5582,6 +5582,7 @@ impl JitCodeBuilder {
         }
     }
 
+    #[allow(dead_code)]
     fn call_int_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.touch_reg(dst);
         for &arg in arg_regs {
@@ -5747,6 +5748,7 @@ impl JitCodeBuilder {
         self.num_regs_f = max(self.num_regs_f, reg.saturating_add(1));
     }
 
+    #[allow(dead_code)]
     fn call_ref_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.touch_ref_reg(dst);
         for &arg in arg_regs {
@@ -5807,6 +5809,7 @@ impl JitCodeBuilder {
         self.record_resulttype('r');
     }
 
+    #[allow(dead_code)]
     fn call_float_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
         self.touch_float_reg(dst);
         for &arg in arg_regs {
@@ -6543,6 +6546,7 @@ mod tests {
     /// — the offset is only a stand-in for the mint sites that carry no name.
     #[test]
     fn a_named_field_resolves_by_name_through_an_ambiguous_offset() {
+        #[allow(dead_code)]
         const TID: u64 = 0x4E41_4D45_4B59;
         let fields = [
             (0, false, "head", 8, false),
