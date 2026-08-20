@@ -100,6 +100,24 @@ def non_str_key_writes():
     print("extras keys", sorted(repr(key) for key in proxy if not isinstance(key, str)))
 
 
+def hidden_slot():
+    # PEP 709 inlines a comprehension into its enclosing scope, and in a class
+    # body the iteration variable becomes a hidden slot.  Hidden is a property
+    # of the write direction only: the scan skips such a slot when it is
+    # looking for somewhere to store, so the assignment below goes to the
+    # extras dict, but the read that follows still reports the live slot.
+    def probe():
+        proxy = sys._getframe(1).f_locals
+        before = proxy["i"]
+        proxy["i"] = 99
+        return before, proxy["i"]
+
+    class Body:
+        seen = [probe() for i in range(2)]
+
+    print("hidden", Body.seen, "leaked" if "i" in Body.__dict__ else "not leaked")
+
+
 def cell_and_free_slots():
     captured = "cell"
 
@@ -122,5 +140,6 @@ def cell_and_free_slots():
 scalar_slots()
 non_str_keys()
 non_str_key_writes()
+hidden_slot()
 cell_and_free_slots()
 print("OK")
