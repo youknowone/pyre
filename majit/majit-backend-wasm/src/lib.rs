@@ -3449,6 +3449,14 @@ impl majit_backend::Backend for WasmBackend {
                             original_token.record_bridge_invalidation_flag(
                                 original_token.invalidation_flag(),
                             );
+                            // The region has no code of its own: it was
+                            // installed by rebuilding the owner, so there is no
+                            // address to report. `model.py:67 compile_bridge`
+                            // permits `None` here, and the consumers treat the
+                            // result as debug data — `interp_resop.py:253-255`
+                            // defaults `asmaddr`/`asmlen` to 0 when it is
+                            // absent — so a zero-address artifact says exactly
+                            // "installed, but not as a block of its own".
                             return Ok(AsmInfo {
                                 code_addr: 0,
                                 code_size: 0,
