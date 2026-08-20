@@ -82,7 +82,6 @@ mod imp {
     use majit_rlib::rbigint::RBigInt as BigInt;
     use pyre_object::*;
     use rustpython_host_env::winreg::{self as host_reg, HKEY};
-    use std::ffi::OsStr;
     use widestring::WideCString;
 
     /// A raw handle/pointer value → a Python int (`PyLong_FromVoidPtr`).  The
@@ -475,7 +474,8 @@ mod imp {
         use rustpython_host_env::winreg::QueryStringError;
         let key = key_arg(args, 0)?;
         let sub_key = opt_str(args, 1)?;
-        match host_reg::query_default_value(key, sub_key.as_deref().map(OsStr::new)) {
+        let wide_sub = sub_key.as_deref().map(WideCString::from_str_truncate);
+        match host_reg::query_default_value(key, wide_sub.as_deref()) {
             Ok(value) => Ok(w_str_new(&value)),
             Err(QueryStringError::Code(code)) => Err(win_err(code)),
             Err(QueryStringError::Utf16(_)) => Err(crate::PyError::value_error(
@@ -487,7 +487,7 @@ mod imp {
     fn query_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let key = key_arg(args, 0)?;
         let name = opt_str(args, 1)?.unwrap_or_default();
-        match host_reg::query_value_bytes(key, OsStr::new(&name)) {
+        match host_reg::query_value_bytes(key, &WideCString::from_str_truncate(&name)) {
             Ok((data, typ)) => Ok(w_tuple_new(vec![reg2py(&data, typ), w_int_new(typ as i64)])),
             Err(code) => Err(win_err(code)),
         }
@@ -595,9 +595,9 @@ mod imp {
         let value = req_str(args, 3)?;
         check(host_reg::set_default_value(
             key,
-            OsStr::new(&sub_key),
+            &WideCString::from_str_truncate(&sub_key),
             typ,
-            OsStr::new(&value),
+            &widestring::WideString::from_str(&value),
         ))
     }
 
@@ -653,7 +653,7 @@ mod imp {
     fn expand_environment_strings(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         use rustpython_host_env::winreg::ExpandEnvironmentStringsError;
         let input = req_str(args, 0)?;
-        match host_reg::expand_environment_strings(OsStr::new(&input)) {
+        match host_reg::expand_environment_strings(&WideCString::from_str_truncate(&input)) {
             Ok(value) => Ok(w_str_new(&value)),
             Err(ExpandEnvironmentStringsError::Os) => Err(win_err(
                 std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32,

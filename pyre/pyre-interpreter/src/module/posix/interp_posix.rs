@@ -821,7 +821,6 @@ fn split_root(path: &rustpython_wtf8::Wtf8) -> (&rustpython_wtf8::Wtf8, &rustpyt
 mod win_nt {
     use pyre_object::PyObjectRef;
     use rustpython_host_env::nt as host_nt;
-    use std::path::Path;
 
     /// Wrap a host-layer `io::Error` as an OSError carrying the offending path.
     /// These calls are Win32 APIs, so the code they report is a Win32 error and
@@ -857,8 +856,7 @@ mod win_nt {
     fn arg_path(
         args: &[PyObjectRef],
         func: &str,
-    ) -> Result<(std::ffi::OsString, bool, crate::gateway::FsEncodedPath), crate::PyError> {
-        use std::os::windows::ffi::OsStringExt;
+    ) -> Result<(widestring::WideCString, bool, crate::gateway::FsEncodedPath), crate::PyError> {
         let Some(&arg) = args.first() else {
             return Err(crate::PyError::type_error(format!(
                 "{func}() missing required argument 'path'"
@@ -875,7 +873,9 @@ mod win_nt {
         let wide: Vec<u16> = crate::gateway::fsdecode_filename_wtf8(&resolved.as_bytes)
             .encode_wide()
             .collect();
-        Ok((std::ffi::OsString::from_wide(&wide), as_bytes, resolved))
+        let path = widestring::WideCString::from_vec(wide)
+            .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+        Ok((path, as_bytes, resolved))
     }
 
     fn wrap_path(s: &std::ffi::OsStr, as_bytes: bool) -> PyObjectRef {
@@ -893,7 +893,7 @@ mod win_nt {
     /// requiring the path to exist.
     pub fn _getfullpathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, as_bytes, resolved) = arg_path(args, "_getfullpathname")?;
-        match host_nt::getfullpathname(Path::new(&path)) {
+        match host_nt::getfullpathname(&path) {
             Ok(result) => Ok(wrap_path(&result, as_bytes)),
             Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
@@ -903,10 +903,7 @@ mod win_nt {
     /// backup-semantics handle so directories open too.
     pub fn _getfinalpathname(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, as_bytes, resolved) = arg_path(args, "_getfinalpathname")?;
-        if path.as_encoded_bytes().contains(&0) {
-            return Err(crate::PyError::value_error("embedded null character"));
-        }
-        match host_nt::getfinalpathname(Path::new(&path)) {
+        match host_nt::getfinalpathname(&path) {
             Ok(result) => Ok(wrap_path(&result, as_bytes)),
             Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
@@ -921,10 +918,7 @@ mod win_nt {
     /// parent off itself.
     pub fn _findfirstfile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, as_bytes, resolved) = arg_path(args, "_findfirstfile")?;
-        if path.as_encoded_bytes().contains(&0) {
-            return Err(crate::PyError::value_error("embedded null character"));
-        }
-        match host_nt::find_first_file_name(Path::new(&path)) {
+        match host_nt::find_first_file_name(&path) {
             Ok(name) => Ok(wrap_path(&name, as_bytes)),
             Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
         }
@@ -960,10 +954,7 @@ mod win_nt {
     /// (ERROR_DIRECTORY).
     pub fn _getdiskusage(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let (path, _, resolved) = arg_path(args, "_getdiskusage")?;
-        if path.as_encoded_bytes().contains(&0) {
-            return Err(crate::PyError::value_error("embedded null character"));
-        }
-        match host_nt::getdiskusage(Path::new(&path)) {
+        match host_nt::getdiskusage(&path) {
             Ok((total, free)) => Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::w_int_new(total as i64),
                 pyre_object::w_int_new(free as i64),
@@ -1007,14 +998,12 @@ mod win_nt {
     /// DLL_DIRECTORY_COOKIE pointer is returned as an int instead. host_env has
     /// no AddDllDirectory wrapper, so call windows-sys directly.
     pub fn _add_dll_directory(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::System::LibraryLoader::AddDllDirectory;
         let (path, _, resolved) = arg_path(args, "_add_dll_directory")?;
-        // `encode_wide` re-emits the code units `arg_path` decoded the path
-        // into; going back through a `str` would have no spelling for a lone
-        // surrogate and would address a different directory.
-        let wide: Vec<u16> = path.encode_wide().chain(std::iter::once(0)).collect();
-        let cookie = unsafe { AddDllDirectory(wide.as_ptr()) };
+        // `arg_path` keeps the code units it decoded the path into; going back
+        // through a `str` would have no spelling for a lone surrogate and would
+        // address a different directory.
+        let cookie = unsafe { AddDllDirectory(path.as_ptr()) };
         if cookie.is_null() {
             return Err(io_err_with_filename(
                 &std::io::Error::last_os_error(),
@@ -2907,7 +2896,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // `DeleteFileW`, except on a directory symlink, which `RemoveDirectoryW`
         // unlinks without following (`os_unlink_impl`).
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        rustpython_host_env::nt::remove(path_from_bytes(&path.as_bytes).as_ref())
+        rustpython_host_env::nt::remove(&wide_path(&path.as_bytes)?)
             .map_err(|e| fs_err_with_filename(e, path.w_path()))?;
         #[cfg(all(not(all(windows, feature = "host_env")), not(feature = "sandbox")))]
         {
@@ -4397,8 +4386,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `entry.inode()` and `os.stat(entry.path).st_ino` disagreeing.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     fn win_stat_fields(path: &[u8], follow_symlinks: bool) -> std::io::Result<StatFields> {
-        let os_path = os_str_from_bytes(path);
-        rustpython_host_env::nt::win32_xstat(&os_path, follow_symlinks)
+        let wide = widestring::WideCString::from_os_str(&*os_str_from_bytes(path)).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "embedded null character in path",
+            )
+        })?;
+        rustpython_host_env::nt::win32_xstat(&wide, follow_symlinks)
             .map(|st| stat_fields_from_statstruct(&st))
     }
 
@@ -10632,14 +10626,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     Some(w) => crate::baseobjspace::is_true(w)?,
                     None => true,
                 };
+                let wide = wide_path(&path.as_bytes)?;
                 let result = if follow_symlinks {
-                    host_nt::chmod_follow(&wide_path(&path.as_bytes)?, mode, S_IWRITE)
+                    host_nt::chmod_follow(&wide, mode, S_IWRITE)
                 } else {
                     // `SetFileAttributesW` on the name itself, which is what
                     // "modify the link rather than its target" means where the
                     // mode is one attribute bit.
-                    let name = os_str_from_bytes(&path.as_bytes);
-                    host_nt::win32_lchmod(&name, mode, S_IWRITE)
+                    host_nt::win32_lchmod(&wide, mode, S_IWRITE)
                 };
                 result.map_err(|e| fs_err_with_filename(e, path.w_path()))?;
                 Ok(pyre_object::w_none())
@@ -11097,9 +11091,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let volume = crate::gateway::fsencode_path_w(args[0])?;
-                    name_list(host_nt::listmounts(
-                        path_from_bytes(&volume.as_bytes).as_ref(),
-                    ))
+                    name_list(host_nt::listmounts(&wide_path(&volume.as_bytes)?))
                 },
                 1,
             ),
