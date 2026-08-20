@@ -1409,6 +1409,78 @@ def fmt_time(t):
         return t
 
 
+HEADER_SCAN_LINES = 20
+
+
+def _header_lines(path):
+    """The window a `# pyre-check:` directive has to sit in to be honored.
+
+    Every reader below scans these lines and no further. A directive past the
+    window is not read at all, which is the safe direction for all of them:
+    the fixture keeps the ungated, unexempted behaviour instead of quietly
+    acquiring an allowance nobody reviewed. Every directive that carves out an
+    allowance also has to be followed by a comment saying why, so the reason
+    is reviewable next to the workload.
+    """
+    with open(path, encoding="utf-8") as source:
+        for _ in range(HEADER_SCAN_LINES):
+            line = source.readline()
+            if not line:
+                return
+            yield line
+
+
+def _header_directive(path, prefix):
+    """The first header line carrying `prefix`, as `(value, line)`, else None.
+
+    First one wins: a second copy of the same directive is not an error for
+    the readers that use this, it is simply not read.
+    """
+    for line in _header_lines(path):
+        if line.startswith(prefix):
+            return line[len(prefix):].strip(), line
+    return None
+
+
+def _positive_float(raw, line, path, kind):
+    """A directive value that has to parse as a number above zero."""
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ValueError(f"invalid {kind} in {path}: {line.strip()}") from e
+    if value <= 0:
+        raise ValueError(f"{kind} must be positive in {path}")
+    return value
+
+
+def _header_name_list(path, prefix, allowed, noun, exemption, reject=(), reject_noun=""):
+    """A comma-separated directive value, every name checked against `allowed`.
+
+    An unknown name is an error rather than a silent no-op: a typo would
+    otherwise read as "exempted", which is the one failure mode an exemption
+    directive must not have. `reject` names members of `allowed` that this
+    particular directive still may not exempt.
+    """
+    found = _header_directive(path, prefix)
+    if found is None:
+        return ()
+    raw, line = found
+    names = [name for name in (part.strip() for part in raw.split(",")) if name]
+    if not names:
+        raise ValueError(f"empty {exemption} in {path}: {line.strip()}")
+    unknown = [name for name in names if name not in allowed]
+    if unknown:
+        raise ValueError(
+            f"unknown {noun}(s) {unknown} in {exemption} in {path}: {line.strip()}"
+        )
+    banned = [name for name in names if name in reject]
+    if banned:
+        raise ValueError(
+            f"{reject_noun}(s) {banned} cannot be exempted in {path}: {line.strip()}"
+        )
+    return tuple(names)
+
+
 def synth_perf_gate(path):
     """Read an optional per-fixture performance limit from its header.
 
@@ -1427,24 +1499,16 @@ def synth_perf_gate(path):
     prefix = "# pyre-check: max-pypy-ratio="
     retired = "# pyre-check: min-pypy-ratio="
     ratio = None
-    with open(path, encoding="utf-8") as source:
-        for _ in range(20):
-            line = source.readline()
-            if not line:
-                break
-            if line.startswith(retired):
-                raise ValueError(
-                    f"{path} states a pypy floor: {line.strip()}\n"
-                    "the floor is derived from max-pypy-ratio; delete the line"
-                )
-            if not line.startswith(prefix) or ratio is not None:
-                continue
-            try:
-                ratio = float(line[len(prefix):].strip())
-            except ValueError as e:
-                raise ValueError(f"invalid synthetic performance gate in {path}: {line.strip()}") from e
-            if ratio <= 0:
-                raise ValueError(f"synthetic performance gate must be positive in {path}")
+    for line in _header_lines(path):
+        if line.startswith(retired):
+            raise ValueError(
+                f"{path} states a pypy floor: {line.strip()}\n"
+                "the floor is derived from max-pypy-ratio; delete the line"
+            )
+        if line.startswith(prefix) and ratio is None:
+            ratio = _positive_float(
+                line[len(prefix):].strip(), line, path, "synthetic performance gate"
+            )
     return ratio
 
 
@@ -1476,22 +1540,10 @@ def wasm_ratio_gate(path):
     machine under a load average of 41. An allowance fitted to an idle reading
     would be a gate that fails on a busy runner.
     """
-    prefix = "# pyre-check: max-wasm-ratio="
-    ratio = None
-    with open(path, encoding="utf-8") as source:
-        for _ in range(20):
-            line = source.readline()
-            if not line:
-                break
-            if not line.startswith(prefix) or ratio is not None:
-                continue
-            try:
-                ratio = float(line[len(prefix):].strip())
-            except ValueError as e:
-                raise ValueError(f"invalid wasm ratio gate in {path}: {line.strip()}") from e
-            if ratio <= 0:
-                raise ValueError(f"wasm ratio gate must be positive in {path}")
-    return ratio
+    found = _header_directive(path, "# pyre-check: max-wasm-ratio=")
+    if found is None:
+        return None
+    return _positive_float(*found, path, "wasm ratio gate")
 
 
 def perf_gate_floor(ceiling):
@@ -1518,22 +1570,10 @@ def synth_rss_gate(path):
     fixture that does not opt in. Read against native backends only, like
     the ratio gate.
     """
-    prefix = "# pyre-check: max-rss-mb="
-    with open(path, encoding="utf-8") as source:
-        for _ in range(20):
-            line = source.readline()
-            if not line:
-                break
-            if not line.startswith(prefix):
-                continue
-            try:
-                limit = float(line[len(prefix):].strip())
-            except ValueError as e:
-                raise ValueError(f"invalid synthetic memory gate in {path}: {line.strip()}") from e
-            if limit <= 0:
-                raise ValueError(f"synthetic memory gate must be positive in {path}")
-            return limit
-    return None
+    found = _header_directive(path, "# pyre-check: max-rss-mb=")
+    if found is None:
+        return None
+    return _positive_float(*found, path, "synthetic memory gate")
 
 
 def synth_skip_backends(path):
@@ -1546,11 +1586,7 @@ def synth_skip_backends(path):
     `run_bench(skip_backends=...)` already does.
 
     This is not a way to park a failure: the header line must be followed by
-    a comment saying which mechanism is missing, so the exemption is
-    reviewable next to the workload. Unknown backend names are an error, not
-    a silent no-op — a typo would otherwise read as "exempted". A directive
-    below the 20-line window is likewise not silently honored: the fixture
-    simply runs everywhere and goes red, which is the safe direction.
+    a comment saying which mechanism is missing.
 
     The exemption covers a backend's *execution* only. It deliberately does
     NOT cover the three baseline-failure paths below (cpython crash, pypy
@@ -1558,26 +1594,13 @@ def synth_skip_backends(path):
     broken, and that must stay loud on every backend rather than be hidden
     behind an exemption written for a different reason.
     """
-    prefix = "# pyre-check: skip-backends="
-    with open(path, encoding="utf-8") as source:
-        for _ in range(20):
-            line = source.readline()
-            if not line:
-                break
-            if not line.startswith(prefix):
-                continue
-            names = [n.strip() for n in line[len(prefix):].split(",")]
-            names = [n for n in names if n]
-            if not names:
-                raise ValueError(f"empty synthetic backend exemption in {path}: {line.strip()}")
-            unknown = [n for n in names if n not in ALL_BACKENDS]
-            if unknown:
-                raise ValueError(
-                    f"unknown backend(s) {unknown} in synthetic backend exemption in {path}: "
-                    f"{line.strip()}"
-                )
-            return tuple(names)
-    return ()
+    return _header_name_list(
+        path,
+        "# pyre-check: skip-backends=",
+        ALL_BACKENDS,
+        "backend",
+        "synthetic backend exemption",
+    )
 
 
 def synth_jitstats_bands(path):
@@ -1590,73 +1613,55 @@ def synth_jitstats_bands(path):
     allowance is visible whenever it is used and not only in the fixture
     header. It is only for schedule-sensitive counters; badness counters must
     remain exactly zero. The directive must be followed by a comment describing
-    the measured variance, so the allowance is reviewable next to the workload.
-    Unknown or duplicate fields, repeated directives, and non-positive or
-    non-integer widths are errors rather than silent no-ops. A directive below
-    the 20-line window is simply not read, so the fixture gates normally in
-    that case.
+    the measured variance. A repeated directive, and a duplicate, unknown or
+    non-positive field, are errors.
     """
     prefix = "# pyre-check: jitstats-band="
     bands = None
-    with open(path, encoding="utf-8") as source:
-        for _ in range(20):
-            line = source.readline()
-            if not line:
-                break
-            if not line.startswith(prefix):
-                continue
-            if bands is not None:
-                raise ValueError(f"duplicate jit-stats band directive in {path}: {line.strip()}")
-            bands = {}
-            entries = line[len(prefix):].strip().split(",")
-            for entry in entries:
-                parts = entry.split("=")
-                if len(parts) != 2 or not all(part.strip() for part in parts):
-                    raise ValueError(f"invalid jit-stats band in {path}: {line.strip()}")
-                field, raw_width = (part.strip() for part in parts)
-                if field not in JITSTATS_SNAPSHOT_FIELDS:
-                    raise ValueError(
-                        f"unknown jit-stats band field {field!r} in {path}: {line.strip()}"
-                    )
-                if field in JITSTATS_BADNESS_FIELDS:
-                    raise ValueError(
-                        f"badness counter cannot be banded in {path}: {line.strip()}"
-                    )
-                if field in bands:
-                    raise ValueError(
-                        f"duplicate jit-stats band field {field!r} in {path}: {line.strip()}"
-                    )
-                try:
-                    width = int(raw_width)
-                except ValueError as e:
-                    raise ValueError(
-                        f"invalid jit-stats band width in {path}: {line.strip()}"
-                    ) from e
-                if width <= 0:
-                    raise ValueError(
-                        f"jit-stats band width must be positive in {path}: {line.strip()}"
-                    )
-                bands[field] = width
+    for line in _header_lines(path):
+        if not line.startswith(prefix):
+            continue
+        if bands is not None:
+            raise ValueError(f"duplicate jit-stats band directive in {path}: {line.strip()}")
+        bands = {}
+        for entry in line[len(prefix):].strip().split(","):
+            parts = entry.split("=")
+            if len(parts) != 2 or not all(part.strip() for part in parts):
+                raise ValueError(f"invalid jit-stats band in {path}: {line.strip()}")
+            field, raw_width = (part.strip() for part in parts)
+            if field not in JITSTATS_SNAPSHOT_FIELDS:
+                raise ValueError(
+                    f"unknown jit-stats band field {field!r} in {path}: {line.strip()}"
+                )
+            if field in JITSTATS_BADNESS_FIELDS:
+                raise ValueError(f"badness counter cannot be banded in {path}: {line.strip()}")
+            if field in bands:
+                raise ValueError(
+                    f"duplicate jit-stats band field {field!r} in {path}: {line.strip()}"
+                )
+            try:
+                width = int(raw_width)
+            except ValueError as e:
+                raise ValueError(f"invalid jit-stats band width in {path}: {line.strip()}") from e
+            if width <= 0:
+                raise ValueError(
+                    f"jit-stats band width must be positive in {path}: {line.strip()}"
+                )
+            bands[field] = width
     return bands if bands is not None else {}
 
 
 def _synth_header_flag(path, directive, malformed):
-    """Read a valueless per-fixture header flag from the first 20 lines.
+    """Read a valueless per-fixture header flag.
 
-    Shared by the two cpython opt-outs below, which differ only in the
-    directive they spell and what a malformed spelling is called. Not honored
-    below the 20-line window, which is the safe direction: the fixture simply
-    runs cpython too.
+    Shared by the cpython opt-outs below, which differ only in the directive
+    they spell and in what a malformed spelling is called.
     """
-    with open(path, encoding="utf-8") as source:
-        for _ in range(20):
-            line = source.readline()
-            if not line:
-                break
-            if line.strip() == directive:
-                return True
-            if line.startswith(directive):
-                raise ValueError(f"{malformed} in {path}: {line.strip()}")
+    for line in _header_lines(path):
+        if line.strip() == directive:
+            return True
+        if line.startswith(directive):
+            raise ValueError(f"{malformed} in {path}: {line.strip()}")
     return False
 
 
@@ -1676,9 +1681,6 @@ def synth_skip_cpython(path):
     line must be followed by a comment saying why the size is what it is,
     the way `skip-backends` does, and a fixture cpython can still run has no
     business carrying it.
-
-    Not honored below the 20-line window, which is the safe direction: the
-    fixture simply runs cpython too.
     """
     return _synth_header_flag(
         path,
@@ -1706,7 +1708,7 @@ def synth_no_cpython(path):
     a fixture whose whole subject IS such a divergence; anything else wants
     both references, and the disagreement it would otherwise report is the
     point of that check. Follow the header with a comment naming the
-    divergence, so the exemption is reviewable next to the workload.
+    divergence.
     """
     return _synth_header_flag(
         path,
@@ -1746,12 +1748,9 @@ def synth_ungated_jitstats(path):
     internal compile bug, the descr-universe counters are invariants upstream
     spells as `assert`), and a run that reaches one has a defect no
     per-run input excuses, so naming one here is an error rather than an
-    exemption. An unknown name is an error too — a typo would otherwise read
-    as "exempted".
+    exemption.
 
-    Like the other directives, one below the 20-line window is not honored:
-    the fixture simply stays gated, which is the safe direction. The header
-    must also carry what was measured, so the next reader can check the claim
+    The header must carry what was measured, so the next reader can check the claim
     rather than take it.
 
     Read from `_apply_snapshot_gate`, so unlike the rest of this family it
@@ -1759,32 +1758,15 @@ def synth_ungated_jitstats(path):
     share, and a counter that will not reproduce is not a synthetic-only
     condition.
     """
-    prefix = "# pyre-check: ungated-jitstats="
-    with open(path, encoding="utf-8") as source:
-        for _ in range(20):
-            line = source.readline()
-            if not line:
-                break
-            if not line.startswith(prefix):
-                continue
-            names = [n.strip() for n in line[len(prefix):].split(",")]
-            names = [n for n in names if n]
-            if not names:
-                raise ValueError(f"empty jit-stats exemption in {path}: {line.strip()}")
-            unknown = [n for n in names if n not in JITSTATS_SNAPSHOT_FIELDS]
-            if unknown:
-                raise ValueError(
-                    f"unknown counter(s) {unknown} in jit-stats exemption in {path}: "
-                    f"{line.strip()}"
-                )
-            badness = [n for n in names if n in JITSTATS_BADNESS_FIELDS]
-            if badness:
-                raise ValueError(
-                    f"badness counter(s) {badness} cannot be exempted in {path}: "
-                    f"{line.strip()}"
-                )
-            return tuple(names)
-    return ()
+    return _header_name_list(
+        path,
+        "# pyre-check: ungated-jitstats=",
+        JITSTATS_SNAPSHOT_FIELDS,
+        "counter",
+        "jit-stats exemption",
+        reject=JITSTATS_BADNESS_FIELDS,
+        reject_noun="badness counter",
+    )
 
 
 def default_binary(backend):
