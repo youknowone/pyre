@@ -40,10 +40,6 @@ fn new_simple_weak_set() -> Result<PyObjectRef, crate::PyError> {
 /// protocol, which is where the weakref probe and the `TypeError` fallback
 /// live.
 ///
-/// A missing collection reads as "not cached" rather than raising:
-/// `_abc_init` installs all three, but an ABC built before this module (a
-/// pickled class, a hand-rolled `ABCMeta` subclass that skips `_abc_init`)
-/// has none, and such a class must still answer subclass checks.
 fn weak_cache_contains(
     cls: PyObjectRef,
     name: &str,
@@ -53,9 +49,6 @@ fn weak_cache_contains(
     let cls_slot = roots.publish(&[cls]);
     let item_slot = roots.publish(&[item]);
     let cache = cache_attr(roots.get(cls_slot), name)?;
-    if cache.is_null() {
-        return Ok(false);
-    }
     let cache_slot = roots.publish(&[cache]);
     crate::baseobjspace::contains(roots.get(cache_slot), roots.get(item_slot))
 }
@@ -65,8 +58,7 @@ fn weak_cache_contains(
 /// discards it once the referent dies; a bare `ref` would leave a spent one
 /// behind for every class the check ever saw.
 ///
-/// Silently declines a class with no collection, for the same reason
-/// [`weak_cache_contains`] reads one as a miss.  Every item reaching here is a
+/// Every item reaching here is a
 /// class — `register` and `subclass_of` each reject a non-type argument — and a
 /// class is weak-referenceable, so `add` needs no test of its own, which is
 /// also why `app_abc.py add` has none.
@@ -75,9 +67,6 @@ fn weak_cache_add(cls: PyObjectRef, name: &str, item: PyObjectRef) -> Result<(),
     let cls_slot = roots.publish(&[cls]);
     let item_slot = roots.publish(&[item]);
     let cache = cache_attr(roots.get(cls_slot), name)?;
-    if cache.is_null() {
-        return Ok(());
-    }
     let cache_slot = roots.publish(&[cache]);
     let add = crate::baseobjspace::getattr_str(roots.get(cache_slot), "add")?;
     let add_slot = roots.publish(&[add]);
@@ -91,9 +80,6 @@ fn weak_cache_clear(cls: PyObjectRef, name: &str) -> Result<(), crate::PyError> 
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
     let cache = cache_attr(roots.get(cls_slot), name)?;
-    if cache.is_null() {
-        return Ok(());
-    }
     let cache_slot = roots.publish(&[cache]);
     let clear = crate::baseobjspace::getattr_str(roots.get(cache_slot), "clear")?;
     let clear_slot = roots.publish(&[clear]);
@@ -105,15 +91,12 @@ fn weak_cache_clear(cls: PyObjectRef, name: &str) -> Result<(), crate::PyError> 
 /// fresh at every use: the walks between two reads run arbitrary Python, which
 /// can rebind the attribute and can move the object.
 ///
-/// `app_abc.py:110` reads the slot as a plain attribute, so only its absence
-/// is a miss.  A metaclass hook that raises something else raises out of the
-/// check rather than being read as a class with no cache.
+/// `app_abc.py:110` reads the slot as a plain attribute, so a class that never
+/// ran `_abc_init` raises `AttributeError` out of the check rather than being
+/// answered as a class with an empty cache.  A metaclass hook that raises
+/// something else propagates unchanged.
 fn cache_attr(cls: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
-    match crate::baseobjspace::getattr_str(cls, name) {
-        Ok(cache) => Ok(cache),
-        Err(err) if err.kind == crate::PyErrorKind::AttributeError => Ok(std::ptr::null_mut()),
-        Err(err) => Err(err),
-    }
+    crate::baseobjspace::getattr_str(cls, name)
 }
 
 /// Compare `cls._abc_negative_cache_version` against the invalidation counter
@@ -129,13 +112,6 @@ fn negative_cache_version_compare(
     let roots = pyre_object::gc_roots::push_roots();
     let cls_slot = roots.publish(&[cls]);
     let version = cache_attr(roots.get(cls_slot), "_abc_negative_cache_version")?;
-    if version.is_null() {
-        // A class that never ran `_abc_init` records no generation.  Upstream
-        // raises `AttributeError` reading it; the collections are tolerated the
-        // same way here, and the answer that goes with an absent one is "older
-        // than any counter" — rebuild on `<`, refuse to trust on `==`.
-        return Ok(matches!(op, crate::objspace::descroperation::CompareOp::Lt));
-    }
     let version_slot = roots.publish(&[version]);
     let counter_slot = roots.publish(&[w_int_new(
         INVALIDATION_COUNTER.load(Ordering::Relaxed) as i64
@@ -237,13 +213,7 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "Refusing to create an inheritance cycle",
         ));
     }
-    // `app_abc.py:99 cls._abc_registry.add(subclass)`.  An ABC that never ran
-    // `_abc_init` has no collection to add to; it gets one here rather than
-    // dropping the registration.
-    if cache_attr(cls, "_abc_registry")?.is_null() {
-        let fresh = new_simple_weak_set()?;
-        crate::baseobjspace::setattr_str(cls, "_abc_registry", fresh)?;
-    }
+    // `app_abc.py:99 cls._abc_registry.add(subclass)`.
     weak_cache_add(cls, "_abc_registry", subclass)?;
     // `app_abc.py:100-101` — invalidate every negative cache.  A class this
     // registration now makes a subclass may already be recorded as a non-match
@@ -387,7 +357,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
         // walk survives a collection that fires the discard callback partway
         // through it.
         let registry = cache_attr(roots.get(cls_slot), "_abc_registry")?;
-        if !registry.is_null() {
+        {
             let registry_roots = pyre_object::gc_roots::push_roots();
             let registry_slot = registry_roots.base();
             registry_roots.pin_root(registry);
@@ -589,27 +559,14 @@ fn get_dump(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut data_slots = Vec::with_capacity(3);
     for name in ["_abc_registry", "_abc_cache", "_abc_negative_cache"] {
         let cache = cache_attr(roots.get(cls_slot), name)?;
-        // A class that never ran `_abc_init` has nothing to describe; an empty
-        // set keeps the tuple's shape rather than raising at a debug helper.
-        let data = if cache.is_null() {
-            w_set_new()
-        } else {
-            let cache_slot = roots.publish(&[cache]);
-            crate::baseobjspace::getattr_str(roots.get(cache_slot), "data")?
-        };
+        let cache_slot = roots.publish(&[cache]);
+        let data = crate::baseobjspace::getattr_str(roots.get(cache_slot), "data")?;
         data_slots.push(roots.publish(&[data]));
     }
     // `_get_dump` reports the generation attribute itself, not a number derived
     // from it.  The last read that can run Python; take it before the reloads
     // below so they answer with final addresses.
     let version = cache_attr(roots.get(cls_slot), "_abc_negative_cache_version")?;
-    // Same tolerance as the collections above: a class that never ran
-    // `_abc_init` reports generation 0 rather than raising at a debug helper.
-    let version = if version.is_null() {
-        w_int_new(0)
-    } else {
-        version
-    };
     let mut items: Vec<PyObjectRef> = data_slots.iter().map(|&slot| roots.get(slot)).collect();
     items.push(version);
     Ok(w_tuple_new(items))
