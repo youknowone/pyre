@@ -433,8 +433,10 @@ pub(super) fn forget_type_name(mirror: usize) {
 
 /// Fill a synthesized mirror for an interpreter type.
 ///
-/// `tp_basicsize` stays 0 on purpose: an instance of a pyre type is exactly a
-/// `PyObject` mirror, and `make_ref` reads this field to size the block.
+/// `tp_basicsize` stays 0 for all but one type: an instance of a pyre type is
+/// exactly a `PyObject` mirror, and `make_ref` reads this field to size the
+/// block.  The frame is the exception, and says so itself
+/// (`super::frameobject::basicsize`).
 ///
 /// The refcount is left as [`pyobject::attach`] set it: a synthesized mirror
 /// carries the ordinary link share and is released with the type it stands for,
@@ -459,6 +461,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     };
     unsafe {
         (*mirror).tp_name = pointer;
+        (*mirror).tp_basicsize = super::frameobject::basicsize(w_type);
         (*mirror).tp_flags = PY_TPFLAGS_DEFAULT
             | PY_TPFLAGS_READY
             | PY_TPFLAGS_BASETYPE

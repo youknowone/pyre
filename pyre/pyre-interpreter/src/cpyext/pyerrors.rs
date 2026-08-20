@@ -60,6 +60,16 @@ pub fn has_pending_error() -> bool {
     !pending_raw().is_null()
 }
 
+/// `State.get_exception` — the pending exception instance, borrowed, without
+/// taking the indicator back.
+pub(super) fn pending_exception() -> Option<PyObjectRef> {
+    let raw = pending_raw();
+    match raw.is_null() {
+        true => None,
+        false => Some(unsafe { pyobject::from_ref(raw) }),
+    }
+}
+
 /// Record an interpreter-level failure and report it to C as `None`.
 ///
 /// Every C entry point that can fail funnels through this, which is what

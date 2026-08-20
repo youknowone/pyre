@@ -166,7 +166,11 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
         return mirror as *mut CPyObject;
     }
     let ob_type = type_mirror(w_obj);
-    attach(w_obj, REFCNT_FROM_PYRE, ob_type, mirror_size(ob_type))
+    let raw = attach(w_obj, REFCNT_FROM_PYRE, ob_type, mirror_size(ob_type));
+    // The one type whose mirror carries fields of its own; every other block
+    // this runtime hands out is exactly its header.
+    super::frameobject::attach(raw, w_obj);
+    raw
 }
 
 /// `pyobject.py:91-93` — a block references its type's mirror only when that
@@ -348,6 +352,7 @@ pub(super) unsafe fn realize(raw: *mut CPyObject) {
     }
     super::unicodeobject::realize_pending(raw);
     super::bytesobject::realize_pending(raw);
+    super::frameobject::realize_pending(raw);
 }
 
 /// `pyobject.py:from_ref` — the interpreter object a mirror links to,
@@ -455,6 +460,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::modsupport::forget_module_fields(address);
     super::unicodeobject::forget_block(address);
     super::bytesobject::forget_pending(address);
+    super::frameobject::forget_block(raw);
     super::typeobject::forget_type_name(address);
     super::gc::forget(address);
     let block = block_at(address);

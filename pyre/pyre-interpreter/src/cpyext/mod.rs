@@ -23,6 +23,7 @@ pub mod complexobject;
 pub mod dictobject;
 pub mod exception;
 pub mod floatobject;
+pub mod frameobject;
 pub mod funcobject;
 pub mod gc;
 pub mod genericaliasobject;
@@ -205,6 +206,7 @@ pub fn after_fork_child() {
         methodobject::after_fork_child();
         unicodeobject::after_fork_child();
         bytesobject::after_fork_child();
+        frameobject::after_fork_child();
         gc::after_fork_child();
     }
     // `PyInit_*` cannot have been mid-flight in the child, and the parent's

@@ -132,6 +132,10 @@ PyAPI_FUNC(int) PyFloat_Check(PyObject *);
 PyAPI_FUNC(int) PyFloat_CheckExact(PyObject *);
 PyAPI_FUNC(PyObject *) PyFloat_FromDouble(double);
 
+/* cpyext/frameobject.rs */
+PyAPI_FUNC(PyFrameObject *) PyFrame_New(PyThreadState *, PyCodeObject *, PyObject *, PyObject *);
+PyAPI_FUNC(int) PyTraceBack_Here(PyFrameObject *);
+
 /* cpyext/funcobject.rs */
 PyAPI_FUNC(PyCodeObject *) PyCode_NewEmpty(const char *, const char *, int);
 PyAPI_FUNC(PyObject *) PyMethod_Function(PyObject *);

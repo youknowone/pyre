@@ -48,6 +48,9 @@ typedef struct PyUnicodeWriter PyUnicodeWriter;
 /* A code object.  Opaque: nothing outside this runtime reads a field of one,
    and an extension only ever holds a pointer. */
 typedef struct PyCodeObject PyCodeObject;
+/* A frame.  Named here rather than in `frameobject.h` because the generated
+   declarations come first; the fields are declared there. */
+typedef struct _frame PyFrameObject;
 
 #ifdef __cplusplus
 }

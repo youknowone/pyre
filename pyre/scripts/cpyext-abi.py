@@ -156,6 +156,7 @@ STRUCTS = {
     "CPyMethodDef": "PyMethodDef", "CPyMemberDef": "PyMemberDef",
     "CPyGetSetDef": "PyGetSetDef", "c_void": "void",
     "CPyThreadState": "PyThreadState", "CPyComplex": "Py_complex",
+    "CPyFrameObject": "PyFrameObject",
     "CPyInterpreterState": "PyInterpreterState",
     "CPyMutex": "PyMutex",
     "CPyUnicodeWriter": "PyUnicodeWriter",
