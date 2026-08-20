@@ -185,13 +185,17 @@ fn main() {
              {} call(s) withheld as dominated by a push_roots",
             stats.bodies_scanned, stats.unparsed_terminator_bodies, stats.withheld_under_a_bracket
         );
+        println!(
+            "       and {} body/bodies with a statement this reader could not parse",
+            stats.unparsed_statement_bodies
+        );
         // The resolved graph is an *under*-approximation of what collects: a
         // call whose dispatch edge is unresolved is excluded, so a clean
         // resolved census is not a clean census.  Re-run with the opaque set
         // folded in and report both, rather than let the difference go unsaid.
         let mut conservative = reach.clone();
         conservative.extend(opaque.iter().copied());
-        let (found_conservative, _) =
+        let (found_conservative, stats_conservative) =
             liveness::scan(&llbc, &cg, &conservative, &push_root_ids, &gc_tys);
         let conservative_fns: std::collections::BTreeSet<&str> = found_conservative
             .iter()
@@ -216,6 +220,18 @@ fn main() {
             "       counting unresolved dispatch as collecting too: {} in {} fn(s)",
             found_conservative.len(),
             conservative_fns.len()
+        );
+        // The conservative scan covers a superset of bodies, so its own
+        // withheld and unparsed figures are the ones its finding count has to
+        // be read against; quoting the resolved scan's line next to it would
+        // pair a count with another scan's accounting.
+        println!(
+            "           over {} bodies; {} with an unparsable terminator, {} with an \
+             unparsable statement; {} call(s) withheld under a push_roots",
+            stats_conservative.bodies_scanned,
+            stats_conservative.unparsed_terminator_bodies,
+            stats_conservative.unparsed_statement_bodies,
+            stats_conservative.withheld_under_a_bracket
         );
         println!(
             "       of which hold a NON-ARGUMENT live pointer: {} fn(s)",

@@ -57,6 +57,11 @@ pub struct ScanStats {
     /// Bodies holding a terminator this reader could not classify.  Their
     /// liveness is incomplete, so they are reported rather than counted clean.
     pub unparsed_terminator_bodies: usize,
+    /// Bodies holding a statement this reader could not classify.  A statement
+    /// that does not parse, and one that parses as `StmtKind::Unknown`, both
+    /// contribute no uses, so the live set computed over such a body is a lower
+    /// bound and a clean result over it is one too.
+    pub unparsed_statement_bodies: usize,
     /// Collecting calls withheld because a `push_roots` dominates them.
     /// Whether that scope is still alive at the call is a drop-placement
     /// question this pass cannot answer, so they are neither reported nor
@@ -245,6 +250,15 @@ pub fn scan(
             // from it is a lower bound.  Count the body; do not pretend it is
             // clean.
             stats.unparsed_terminator_bodies += 1;
+        }
+        if body.body.iter().any(|blk| {
+            blk.statements
+                .iter()
+                .any(|st| matches!(st.stmt_kind(), Err(_) | Ok(StmtKind::Unknown)))
+        }) {
+            // `transfer_stmt` reads no uses out of either shape, so the live
+            // sets below can only be smaller than the truth.
+            stats.unparsed_statement_bodies += 1;
         }
 
         // Blocks whose terminator opens a root scope, and the blocks that are

@@ -163,9 +163,26 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     "descroperation::try_call_special",
 ];
 
-/// Explicit collection entry points and the one collecting host allocator.
+/// Explicit collection entry points and the collecting host allocator.
+///
+/// These are the same external symbols `majit-translate`'s call control marks
+/// `canmallocgc` (`lib.rs`, the `mark_canmallocgc` loop): the `*_collecting_*`
+/// allocators run a minor collection when the nursery cannot satisfy the
+/// request, and the `collect_*` entries are requested collections outright.
+/// They carry no lowered body, so nothing reaches them transitively — they have
+/// to be named, or every direct caller (`pyre_object_gc_alloc_collecting_trampoline`
+/// in `pyre-jit/src/eval.rs`, say) is classified non-collecting and so is
+/// everything above it.
 pub const COLLECTING_SEEDS: &[&str] = &[
-    "gc_hook::try_gc_alloc_collecting",
+    "majit_gc::alloc_nursery_collecting_typed",
+    "majit_gc::alloc_nursery_collecting_typed_rooted",
+    "majit_gc::alloc_fast_nursery_collecting_typed_rooted",
+    "majit_gc::standalone_alloc_nursery_collecting_typed_rooted",
+    "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
+    "majit_gc::collect_full",
+    "majit_gc::collect_step",
+    "majit_gc::collect_oldgen_nonmoving",
+    // The host hook the interpreter reaches them through.
     "gc_hook::try_gc_alloc_collecting_rooted",
 ];
 
