@@ -669,11 +669,10 @@ impl wire::MarshalBag for PyreMarshalBag {
         Rooted::new(w_tuple_new(elements.map(Rooted::get).collect()))
     }
 
-    fn make_tuple_placeholder(&self, len: usize) -> Option<Rooted> {
-        Some(Rooted::new(tupleobject::w_tuple_new_array_backed(vec![
-            PY_NULL;
-            len
-        ])))
+    fn make_tuple_placeholder(&self, len: usize) -> Result<Option<Rooted>, wire::MarshalError> {
+        Ok(Some(Rooted::new(
+            tupleobject::w_tuple_new_array_backed(vec![PY_NULL; len]),
+        )))
     }
 
     fn set_tuple_item(
@@ -687,8 +686,8 @@ impl wire::MarshalBag for PyreMarshalBag {
             .ok_or(wire::MarshalError::BadType)
     }
 
-    fn make_code(&self, code: CodeObject<ConstantData>) -> Rooted {
-        Rooted::new(crate::pycode::box_code_constant(&code))
+    fn make_code(&self, code: CodeObject<ConstantData>) -> Result<Rooted, wire::MarshalError> {
+        Ok(Rooted::new(crate::pycode::box_code_constant(&code)))
     }
 
     fn make_stop_iter(&self) -> Result<Rooted, wire::MarshalError> {
@@ -704,11 +703,11 @@ impl wire::MarshalBag for PyreMarshalBag {
         Ok(Rooted::new(w_list_new(elements.map(Rooted::get).collect())))
     }
 
-    fn make_list_placeholder(&self, len: usize) -> Option<Rooted> {
-        Some(Rooted::new(listobject::w_list_new_object(vec![
+    fn make_list_placeholder(&self, len: usize) -> Result<Option<Rooted>, wire::MarshalError> {
+        Ok(Some(Rooted::new(listobject::w_list_new_object(vec![
             PY_NULL;
             len
-        ])))
+        ]))))
     }
 
     fn set_list_item(
@@ -833,7 +832,7 @@ impl wire::MarshalBag for PyreMarshalBag {
         &self,
         code: CodeObject<ConstantData>,
         constants: Vec<Rooted>,
-    ) -> Rooted {
+    ) -> Result<Rooted, wire::MarshalError> {
         let code = Rooted::new(crate::pycode::box_code_constant(&code));
         // `box_code_constant` allocates, so read each constant out of its
         // shadow-stack slot only now.  Only the slots the compiler
@@ -841,7 +840,7 @@ impl wire::MarshalBag for PyreMarshalBag {
         // lazily like a fresh compile's.
         let constants: Vec<_> = constants.into_iter().map(Rooted::get).collect();
         unsafe { crate::pycode::w_code_fill_wrapped_consts(code.get(), &constants) };
-        code
+        Ok(code)
     }
 
     // `deserialize_code_value_inner` reads a code object's fields as bag

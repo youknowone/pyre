@@ -1510,7 +1510,7 @@ pub(super) fn encode_value_into(
     if tc == "z" && unsafe { pyre_object::is_bytes(value) } {
         let raw = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
         let copy =
-            pyre_object::bytesobject::w_bytes_from_bytes(&host_ctypes::null_terminated_bytes(raw));
+            pyre_object::bytesobject::w_bytes_from_bytes(&host_ctypes::clone_as_null_terminated(raw));
         // Retain the copy before reading its address, so a GC triggered while
         // inserting the keepalive cannot leave the stored pointer stale.  Until
         // `keep_alive` links it into the root, only this frame holds the copy and
@@ -1530,7 +1530,7 @@ pub(super) fn encode_value_into(
     if tc == "Z" && unsafe { pyre_object::is_str(value) } {
         let raw = unsafe { pyre_object::w_str_get_wtf8(value) };
         let copy =
-            pyre_object::w_bytearray_from_bytes(&host_ctypes::wchar_null_terminated_bytes(raw));
+            pyre_object::w_bytearray_from_bytes(&host_ctypes::clone_wchar_null_terminated(raw));
         let _roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(copy);
         keep_ref(dest, key, value);

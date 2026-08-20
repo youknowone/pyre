@@ -1907,7 +1907,7 @@ pub(super) fn resolve_pointer_addr(
 /// address of the copy.
 fn bytes_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
     let raw = unsafe { pyre_object::bytesobject::w_bytes_data(arg) };
-    keepalive.push(host_ctypes::null_terminated_bytes(raw));
+    keepalive.push(host_ctypes::clone_as_null_terminated(raw));
     // The inner Vec's heap buffer is stable even if `keepalive` reallocates.
     keepalive.last().unwrap().as_ptr() as usize
 }
@@ -1920,6 +1920,6 @@ fn bytes_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
 /// `Z` arm) spells the copy the same way.
 fn wstr_pointer_addr(arg: PyObjectRef, keepalive: &mut Vec<Vec<u8>>) -> usize {
     let raw = unsafe { pyre_object::w_str_get_wtf8(arg) };
-    keepalive.push(host_ctypes::wchar_null_terminated_bytes(raw));
+    keepalive.push(host_ctypes::clone_wchar_null_terminated(raw));
     keepalive.last().unwrap().as_ptr() as usize
 }
