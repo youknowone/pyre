@@ -4599,18 +4599,72 @@ impl Optimizer {
         _start_pass: usize,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        let end_pass = self.extra_operation_end_pass();
         let mut pending = std::collections::VecDeque::new();
         while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
             pending.push_back((start, op));
         }
-        while let Some((from_pass, op)) = pending.pop_front() {
+        // The level is parked on the context so `flush_queued_producer` can
+        // pull one entry out of it; this function runs nested inside itself
+        // (`propagate_from_pass_range` drains after every pass), and only the
+        // innermost level may absorb what the current propagate queues.
+        ctx.extra_pending.push(pending);
+        let result = self.drain_innermost_pending(ctx);
+        ctx.extra_pending.pop();
+        result
+    }
+
+    fn drain_innermost_pending(
+        &mut self,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        let end_pass = self.extra_operation_end_pass();
+        let level = ctx.extra_pending.len() - 1;
+        while let Some((from_pass, op)) = ctx.extra_pending[level].pop_front() {
             self.propagate_from_pass_range(from_pass, end_pass, &op, ctx)?;
             while let Some((start, op)) = ctx.extra_operations_after.pop_front() {
-                pending.push_front((start, op));
+                ctx.extra_pending[level].push_front((start, op));
             }
         }
         Ok(())
+    }
+
+    /// `optimizer.py:623-625` forces every argument before the operation is
+    /// appended, and `info.py:146-152 force_box` emits the allocation as it
+    /// clears the virtual flag — so a forced box's definition is always already
+    /// in `_newoperations`. Pyre's `force_box` only *queues* the allocation
+    /// when it runs from a pass rather than from final emission, which leaves a
+    /// window where the box reads as non-virtual (so `force_box` is a no-op on
+    /// it) while its `NEW_WITH_VTABLE` is still parked. Emitting a store in that
+    /// window puts the use ahead of the definition.
+    ///
+    /// Close the window by propagating that one parked definition here, ahead
+    /// of the operation that reads it. Everything else keeps its queued order.
+    fn flush_queued_producer(
+        &mut self,
+        opref: OpRef,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        if opref.is_none() || opref.is_constant() {
+            return Ok(());
+        }
+        let queued = ctx
+            .extra_operations_after
+            .iter()
+            .position(|(_, op)| op.pos.get() == opref)
+            .and_then(|at| ctx.extra_operations_after.remove(at))
+            .or_else(|| {
+                ctx.extra_pending.iter_mut().rev().find_map(|level| {
+                    level
+                        .iter()
+                        .position(|(_, op)| op.pos.get() == opref)
+                        .and_then(|at| level.remove(at))
+                })
+            });
+        let Some((from_pass, op)) = queued else {
+            return Ok(());
+        };
+        let end_pass = self.extra_operation_end_pass();
+        self.propagate_from_pass_range(from_pass, end_pass, &op, ctx)
     }
 
     fn propagate_from_pass(
@@ -4906,6 +4960,7 @@ impl Optimizer {
         // the same canonicalization the pass-entry resolver applies.
         for i in 0..op.num_args() {
             let forced = self.force_box(op.arg(i).to_opref(), ctx);
+            self.flush_queued_producer(forced, ctx)?;
             let resolved = match ctx.get_box_replacement_operand_opt(forced) {
                 Some(b) => b,
                 None => ctx.materialize_operand_at(forced),

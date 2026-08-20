@@ -642,6 +642,18 @@ pub struct OptContext {
     /// Held as `OpRc` (resoperation.py: emit_extra appends a ResOperation
     /// object) so the queued op carries object identity into the drain.
     pub(crate) extra_operations_after: VecDeque<(usize, majit_ir::OpRc)>,
+    /// The queues `Optimizer::drain_extra_operations_from` is working through,
+    /// innermost last. The drain moves `extra_operations_after` aside before it
+    /// starts so that a nested drain only sees what was queued after it began —
+    /// that is what keeps `emit_extra`'d ops ahead of the op being propagated
+    /// (`optimizer.py:594-596`) instead of ahead of everything still parked.
+    ///
+    /// Parked here rather than in a local so `flush_queued_producer` can still
+    /// reach one entry: `info.py:146-152 force_box` clears the virtual flag and
+    /// emits the allocation as one step, while pyre's `emit_op` only queues the
+    /// allocation when the force runs from a pass, so a store can be emitted
+    /// while the `NEW_WITH_VTABLE` that defines it is still parked.
+    pub(crate) extra_pending: Vec<VecDeque<(usize, majit_ir::OpRc)>>,
     /// optimizer.py:47-54: deferred postprocess for GUARD_CLASS.
     /// Set by rewrite pass, executed by emit_operation after the guard
     /// is added to new_operations (matching RPython's callback pattern).
@@ -1748,6 +1760,7 @@ impl OptContext {
             inputarg_base: 0,
             next_pos: 0,
             extra_operations_after: VecDeque::new(),
+            extra_pending: Vec::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
             pending_finish_guard_postprocess: None,
@@ -2372,6 +2385,7 @@ impl OptContext {
             inputarg_base,
             next_pos: start_next_pos,
             extra_operations_after: VecDeque::new(),
+            extra_pending: Vec::new(),
             pending_guard_class_postprocess: None,
             pending_mark_last_guard: None,
             pending_finish_guard_postprocess: None,
