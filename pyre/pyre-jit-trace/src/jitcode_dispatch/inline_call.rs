@@ -2162,16 +2162,37 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         None
     };
     let resolved_callable = bound_method.map_or(callable, |bound| bound.function);
-    let Some((w_code, nparams, has_closure)) =
-        (unsafe { resolve_inlinable_callee(resolved_callable) })
-    else {
-        // The callable's type is the whole answer here: `resolve_inlinable_callee`
-        // takes plain `function` only, so a `builtin_function_or_method` or a
-        // `method` reads as "not inlinable" for a reason no pc can convey.
-        decline!(format_args!(
-            "callee not inlinable (callable type {})",
-            unsafe { pyre_object::type_name_of(callable) }
-        ));
+    // `descroperation.py:189-199 DescrOperation.call_args` has three arms, and
+    // the two above are its `Function` and `Method` fast paths.  Anything else
+    // resolves `space.lookup(w_obj, '__call__')` and calls that with the object
+    // as the receiver.  `__call__` is an ordinary function in the class dict, so
+    // the call inlines like a bound method whose receiver is the callable
+    // itself — pinned on the callable's class version, which is what
+    // `space.lookup` promotes, instead of read off a `Method`'s immutable
+    // fields.
+    let mut instance_call_pin = None;
+    let (resolved_callable, w_code, nparams, has_closure) = match unsafe {
+        resolve_inlinable_callee(resolved_callable)
+    } {
+        Some((w_code, nparams, has_closure)) => (resolved_callable, w_code, nparams, has_closure),
+        None => {
+            let Some((method, w_class, version_tag, w_code, nparams, has_closure)) = (!method_form)
+                .then(|| unsafe { resolve_instance_dunder_call(callable) })
+                .flatten()
+            else {
+                // The callable's type is the whole answer here:
+                // `resolve_inlinable_callee` takes plain `function` only, so a
+                // `builtin_function_or_method` or a `method` reads as "not
+                // inlinable" for a reason no pc can convey.
+                decline!(format_args!(
+                    "callee not inlinable (callable type {})",
+                    unsafe { pyre_object::type_name_of(callable) }
+                ));
+            };
+            method_form = true;
+            instance_call_pin = Some((r_args[0], callable, w_class, version_tag));
+            (method, w_code, nparams, has_closure)
+        }
     };
     if fbw_inline_diag_enabled() {
         // Name the callee: a pc alone does not say which function a decline
@@ -2199,6 +2220,10 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         let receiver = if let Some(bound) = bound_method {
             // Placeholder until the resolved half reads Method.w_self live.
             Some((bound.method_op, ConcreteValue::Ref(bound.receiver)))
+        } else if instance_call_pin.is_some() {
+            // `get_and_call_args(w_descr, w_obj, args)` binds the object the
+            // lookup ran on, and that object is the CALL's own callable operand.
+            Some((r_args[0], ConcreteValue::Ref(callable)))
         } else if method_form {
             Some((r_args[1], arg_concretes[1]))
         } else {
@@ -2236,6 +2261,11 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
             // the resolved half replaces it with GetfieldGcR(Method.w_self).
             callee_args.push(bound.method_op);
             callee_arg_concretes.push(ConcreteValue::Ref(bound.receiver));
+        } else if instance_call_pin.is_some() {
+            // `get_and_call_args(w_descr, w_obj, args)` binds the object the
+            // lookup ran on, and that object is the CALL's own callable operand.
+            callee_args.push(r_args[0]);
+            callee_arg_concretes.push(ConcreteValue::Ref(callable));
         } else if method_form {
             callee_args.push(r_args[1]);
             callee_arg_concretes.push(arg_concretes[1]);
@@ -2255,7 +2285,16 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         dst,
         resolved_callable,
         r_args[0],
-        resolved_callable,
+        // The operand this call dispatched on is the callable itself, and for
+        // the `__call__` arm that is not the resolved callee: reading
+        // `Function.code` off it would be a type-confused load, so the resolved
+        // half must see the instance and pin the callee's `code?` marker
+        // instead.
+        if instance_call_pin.is_some() {
+            callable
+        } else {
+            resolved_callable
+        },
         arg_concretes,
         callee_args,
         callee_arg_concretes,
@@ -2264,7 +2303,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         w_code,
         nparams,
         has_closure,
-        None,
+        instance_call_pin,
         None,
         true,
         false,

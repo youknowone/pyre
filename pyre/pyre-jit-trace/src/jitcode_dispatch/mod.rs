@@ -7697,6 +7697,53 @@ pub(crate) unsafe fn resolve_inlinable_callee(
     }
 }
 
+/// `space.lookup(w_obj, '__call__')` for a callable that is neither a
+/// `Function` nor a `Method` — `descroperation.py:194-199
+/// DescrOperation.call_args`'s third arm.
+///
+/// Returns the resolved `__call__` alongside the class it was found through and
+/// that class's version tag, which is what pins the lookup: the walker's
+/// counterpart of `space.lookup` promoting the type.  A `__call__` that is not
+/// a plain inlinable function — a builtin slot, a `classmethod`, another
+/// callable object — has no body to walk and declines here, exactly as
+/// `resolve_inlinable_callee` declines a non-`Function` callee.
+///
+/// # Safety
+/// `callable` must be a valid object.
+unsafe fn resolve_instance_dunder_call(
+    callable: pyre_object::PyObjectRef,
+) -> Option<(
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+    u64,
+    *const (),
+    usize,
+    bool,
+)> {
+    if callable.is_null() {
+        return None;
+    }
+    // A class reaches `type.__call__`, which instantiates rather than calls a
+    // `__call__` found on the metaclass; `try_walker_inline_type_call` owns
+    // that shape and resolves `__new__` / `__init__` for it.
+    if unsafe { pyre_object::is_type(callable) } {
+        return None;
+    }
+    let w_class = unsafe { (*callable).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        return None;
+    }
+    // A version tag of 0 is a type whose dict changes are not tracked, so the
+    // `__call__` answer below cannot be pinned.
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        return None;
+    }
+    let method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__call__") }?;
+    let (w_code, nparams, has_closure) = unsafe { resolve_inlinable_callee(method) }?;
+    Some((method, w_class, version_tag, w_code, nparams, has_closure))
+}
+
 type ExceptionInlineReceiverGuard = (
     OpRef,
     pyre_object::PyObjectRef,
