@@ -10610,6 +10610,203 @@ fn fold_finite_float_result(boxed_result: pyre_object::PyObjectRef) -> Option<f6
     }
 }
 
+/// The machine int a folded builtin's authentic boxed result carries, or
+/// `None` when that result is not an exact `int` at all.  `True`/`False` are
+/// excluded: a raw helper reporting `1` must not be accepted for a builtin
+/// that returned the bool, because the trace boxes it with `wrapint`.
+fn fold_boxed_int_value(boxed_result: pyre_object::PyObjectRef) -> Option<i64> {
+    unsafe {
+        if boxed_result.is_null()
+            || !pyre_object::is_exact_builtin_instance(boxed_result)
+            || !pyre_object::is_int(boxed_result)
+            || pyre_object::is_bool(boxed_result)
+        {
+            return None;
+        }
+        Some(pyre_object::w_int_get_value(boxed_result))
+    }
+}
+
+/// Guard an int-channel helper's result against its decline sentinel, so every
+/// operand the helper does not answer for resumes in the builtin.
+fn walker_guard_int_result_not_declined<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    raw: OpRef,
+) -> Result<(), DispatchError> {
+    let sentinel = ctx
+        .trace_ctx
+        .const_int(pyre_interpreter::jit_builtin_folds::INT_FOLD_DECLINE);
+    let answered = ctx.trace_ctx.record_op(OpCode::IntNe, &[raw, sentinel]);
+    ctx.trace_ctx
+        .set_opref_concrete(answered, majit_ir::Value::Int(1));
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardTrue, &[answered])
+}
+
+/// The generic builtin fold, one argument.
+///
+/// Every builtin that is not hand-specialized reaches the interpreter as
+/// `bh_call_fn(builtin, NULL, x)`, and that residual costs the same regardless
+/// of what the builtin does: the frame force, the argument rooting, the
+/// execution-context resolution and the gateway signature binding all run
+/// before the body does.  Measured against pypy 7.3.20 the floor is an order
+/// of magnitude on its own — `hash`, `ord` and `abs` all sit within a few
+/// percent of each other because none of them is paying for its own work.
+///
+/// `jit_builtin_folds` names, per builtin, a raw helper that is the body of
+/// that builtin restricted to the operands it can answer without running
+/// app-level code and without allocating.  Emit a direct call into it, guard
+/// the channel's decline sentinel, and box the result inline so the optimizer
+/// can keep it virtual.  A declined operand — a subclass instance, a shape the
+/// helper does not implement, the argument that would have raised — resumes in
+/// the builtin, which re-executes the call from scratch, so the fold needs no
+/// per-builtin domain knowledge and adding a table row is all it takes to
+/// cover another one.  Rebound callables keep the residual (SAFE).
+pub(crate) fn try_walker_specialize_builtin_fold1<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    use pyre_interpreter::jit_builtin_folds::{BuiltinFoldRaw, INT_FOLD_DECLINE};
+
+    let Some((concrete_callable, operands)) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
+    else {
+        return Ok(None);
+    };
+    let mut rows =
+        pyre_interpreter::jit_builtin_folds::builtin_folds_for(concrete_callable, 1).peekable();
+    if rows.peek().is_none() {
+        return Ok(None);
+    }
+    // Authentic boxed result, produced on the plain eval loop exactly as the
+    // skipped residual would.  Every row cross-checks its helper against this,
+    // so a helper that disagrees with the builtin it stands for declines here
+    // rather than compiling the disagreement into the loop.
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &operands[..1])
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    for fold in rows {
+        match fold.raw {
+            BuiltinFoldRaw::Int1(raw_fn) => {
+                let value = raw_fn(operands[0] as i64);
+                if value == INT_FOLD_DECLINE || fold_boxed_int_value(boxed_result) != Some(value) {
+                    continue;
+                }
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+                let raw = ctx.trace_ctx.call_int_typed_with_effect(
+                    raw_fn as *const (),
+                    &[r_args[2]],
+                    &[majit_ir::Type::Ref],
+                    majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                );
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Int(value));
+                walker_guard_int_result_not_declined(ctx, op.pc, raw)?;
+                let boxed = walker_box_int(ctx, op.pc, raw, value)?;
+                ctx.trace_ctx
+                    .set_opref_concrete(boxed, box_int_concrete(value, boxed_result as i64));
+                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+                return Ok(Some(()));
+            }
+            BuiltinFoldRaw::Float1(raw_fn) => {
+                let Some(result_value) = fold_finite_float_result(boxed_result) else {
+                    continue;
+                };
+                let value = raw_fn(operands[0] as i64);
+                if value != result_value {
+                    continue;
+                }
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+                let raw = ctx.trace_ctx.call_float_typed_with_effect(
+                    raw_fn as *const (),
+                    &[r_args[2]],
+                    &[majit_ir::Type::Ref],
+                    majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                );
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Float(value));
+                walker_guard_float_result_finite(ctx, op.pc, raw)?;
+                let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
+                ctx.trace_ctx.set_opref_concrete(
+                    boxed,
+                    majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+                );
+                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+                return Ok(Some(()));
+            }
+            BuiltinFoldRaw::Ref2(_) => continue,
+        }
+    }
+    Ok(None)
+}
+
+/// The two-argument half of the generic builtin fold — `min(a, b)` and
+/// `max(a, b)`, whose helpers return one of their own arguments rather than
+/// building anything.  Same shape and same soundness argument as
+/// [`try_walker_specialize_builtin_fold1`]; a `PY_NULL` is the decline the
+/// trailing non-null guard carries back to the builtin.
+pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    use pyre_interpreter::jit_builtin_folds::BuiltinFoldRaw;
+
+    let Some((concrete_callable, operands)) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
+    else {
+        return Ok(None);
+    };
+    let mut rows =
+        pyre_interpreter::jit_builtin_folds::builtin_folds_for(concrete_callable, 2).peekable();
+    if rows.peek().is_none() {
+        return Ok(None);
+    }
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &operands)
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+
+    for fold in rows {
+        let BuiltinFoldRaw::Ref2(raw_fn) = fold.raw else {
+            continue;
+        };
+        let value = raw_fn(operands[0] as i64, operands[1] as i64) as pyre_object::PyObjectRef;
+        if value.is_null() || value != boxed_result {
+            continue;
+        }
+        walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+        let raw = ctx.trace_ctx.call_ref_typed_with_effect(
+            raw_fn as *const (),
+            &[r_args[2], r_args[3]],
+            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CannotRaise,
+                majit_ir::OopSpecIndex::None,
+            ),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[raw])?;
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Ref(majit_ir::GcRef(value as usize)));
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
+        return Ok(Some(()));
+    }
+    Ok(None)
+}
+
 /// `float(x)` on an exact int/float argument: inline the conversion
 /// (`W_IntObject.descr_float` → `space.newfloat`, or the identity
 /// `float(f) is f` for an exact float) instead of the opaque

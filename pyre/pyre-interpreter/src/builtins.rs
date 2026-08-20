@@ -5167,12 +5167,12 @@ pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
 ///   - reject any kwargs other than `key` / `default`
 ///   - reject `default=` paired with multiple positional args
 ///   - require ≥1 positional arg
-fn builtin_min(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_min(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     min_max_dispatch(args, /* want_max= */ false, "min")
 }
 
 /// `max(a, b)` / `max(iterable)` — return the largest of two values or an iterable.
-fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_max(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     min_max_dispatch(args, /* want_max= */ true, "max")
 }
 
@@ -14397,7 +14397,7 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
 
 /// `ord(c)` — PyPy: operation.py ord (dispatches to space.ord);
 /// `unicodeobject.py:155-160` raises TypeError on multi-char strings.
-fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub(crate) fn builtin_ord(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return Err(crate::PyError::type_error(
             "ord() takes exactly one argument",
