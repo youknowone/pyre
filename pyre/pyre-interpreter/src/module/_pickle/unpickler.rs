@@ -56,7 +56,9 @@ impl Drop for RunningGuard {
     }
 }
 
-#[crate::pyre_class("_pickle.Unpickler")]
+// CPython 3.14 Modules/_pickle.c:pickle_exec CREATE_TYPEs
+// unpickler_type_spec; the spec is an immutable heap type.
+#[crate::pyre_class("_pickle.Unpickler", cpython_heaptype)]
 pub struct W_Unpickler {
     w_file_read: PyObjectRef,
     w_file_readline: PyObjectRef,
@@ -588,7 +590,8 @@ pub use memo_proxy::UnpicklerMemoProxy;
 mod memo_proxy {
     use super::*;
 
-    #[crate::pyre_class("_pickle.UnpicklerMemoProxy")]
+    // Modules/_pickle.c:pickle_exec CREATE_TYPEs unpickler_memoproxy_spec too.
+    #[crate::pyre_class("_pickle.UnpicklerMemoProxy", cpython_heaptype)]
     pub struct UnpicklerMemoProxy {
         pub(super) w_unpickler: PyObjectRef,
     }

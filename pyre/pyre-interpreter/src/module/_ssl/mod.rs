@@ -17,7 +17,9 @@ const CERT_REQUIRED: i32 = 2;
 /// The mapdict prefix is required because `ssl.SSLContext` is an app-level
 /// subclass of this native type.  PyPy composes `MapdictStorageMixin` into
 /// that allocation; pyre preserves the same native prefix.
-#[crate::pyre_class("_ssl._SSLContext")]
+// CPython 3.14 Modules/_ssl.c:_ssl_exec uses PyType_FromModuleAndSpec;
+// the SSLContext spec is immutable.
+#[crate::pyre_class("_ssl._SSLContext", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_SSLContext {
     pub map: usize,
@@ -33,7 +35,8 @@ pub struct W_SSLContext {
 
 /// `ssl.MemoryBIO` is subclassable in CPython, so it uses the same mapdict
 /// prefix rather than relying on a side table for subclass attributes.
-#[crate::pyre_class("_ssl.MemoryBIO")]
+// `_ssl_exec` creates the immutable MemoryBIO module heap type.
+#[crate::pyre_class("_ssl.MemoryBIO", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_MemoryBIO {
     pub map: usize,
@@ -62,7 +65,8 @@ const _: () = assert!(
     "W_MemoryBIO must keep W_ObjectObject's storage offset"
 );
 
-#[crate::pyre_class("_ssl.SSLSession")]
+// `_ssl_exec` creates the immutable SSLSession module heap type.
+#[crate::pyre_class("_ssl.SSLSession", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_SSLSession {
     pub backend: *mut pyre_native::ssl::NativeSession,
@@ -71,7 +75,8 @@ pub struct W_SSLSession {
 /// One TLS state machine plus its Python-owned transport endpoints.  Rustls
 /// remains opaque in `pyre-native`; these references preserve the same
 /// per-object ownership shape as PyPy's `W_SSLObject`.
-#[crate::pyre_class("_ssl._SSLSocket")]
+// `_ssl_exec` creates the immutable SSLSocket module heap type.
+#[crate::pyre_class("_ssl._SSLSocket", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_SSLSocket {
     pub backend: *mut pyre_native::ssl::TlsConnection,
@@ -88,7 +93,8 @@ pub struct W_SSLSocket {
     pub requested_session: *mut pyre_native::ssl::NativeSession,
 }
 
-#[crate::pyre_class("_ssl.Certificate")]
+// `_ssl_exec` creates the immutable Certificate module heap type.
+#[crate::pyre_class("_ssl.Certificate", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_Certificate {
     pub der: PyObjectRef,

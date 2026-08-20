@@ -16,7 +16,9 @@ use pyre_object::PyObjectRef;
 /// marshals a changelist of `kevent`s into the syscall and returns the
 /// triggered events as fresh `kevent` instances.
 #[cfg(all(target_os = "macos", feature = "host_env"))]
-#[crate::pyre_class("select.kqueue")]
+// CPython 3.14 Modules/selectmodule.c:select_exec creates
+// kqueue_queue_Type_spec as a mutable module heap type.
+#[crate::pyre_class("select.kqueue", cpython_mutable)]
 pub struct W_Kqueue {
     kqfd: i32,
 }

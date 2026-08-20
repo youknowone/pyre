@@ -369,14 +369,18 @@ pub fn init_typeobjects() {
         );
 
         // array.array — interp_array.py, bases=(object,)
+        let array_type = new_typeobject_with_base_and_layout(
+            "array.array",
+            crate::module::array::init_array_type,
+            object_type,
+            &pyre_object::interp_array::ARRAY_TYPE as *const PyType,
+        );
+        // CPython 3.14 Modules/arraymodule.c:array_modexec uses
+        // PyType_FromModuleAndSpec; array_spec carries IMMUTABLETYPE.
+        mark_cpython_heap_type(array_type, true);
         reg.insert(
             &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize,
-            new_typeobject_with_base_and_layout(
-                "array.array",
-                crate::module::array::init_array_type,
-                object_type,
-                &pyre_object::interp_array::ARRAY_TYPE as *const PyType,
-            ) as usize,
+            array_type as usize,
         );
 
         // bool — boolobject.py, bases=(int,)
@@ -853,6 +857,9 @@ pub fn init_typeobjects() {
             crate::module::_sre::interp_sre::init_sre_pattern_type,
             object_type,
         );
+        // CPython 3.14 Modules/_sre/sre.c:sre_exec creates the Pattern spec
+        // with PyType_FromModuleAndSpec and IMMUTABLETYPE.
+        mark_cpython_heap_type(sre_pattern_type, true);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_pattern_type, false) };
         reg.insert(
             &pyre_object::interp_sre::SRE_PATTERN_TYPE as *const PyType as usize,
@@ -863,6 +870,8 @@ pub fn init_typeobjects() {
             crate::module::_sre::interp_sre::init_sre_match_type,
             object_type,
         );
+        // Same `sre_exec` immutable heap owner as Pattern.
+        mark_cpython_heap_type(sre_match_type, true);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_match_type, false) };
         reg.insert(
             &pyre_object::interp_sre::SRE_MATCH_TYPE as *const PyType as usize,
@@ -877,6 +886,8 @@ pub fn init_typeobjects() {
             crate::module::_sre::interp_sre::init_sre_scanner_type,
             object_type,
         );
+        // Same `sre_exec` immutable heap owner as Pattern.
+        mark_cpython_heap_type(sre_scanner_type, true);
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_scanner_type, false) };
         reg.insert(
             &pyre_object::interp_sre::SRE_SCANNER_TYPE as *const PyType as usize,
@@ -1161,6 +1172,14 @@ pub fn init_typeobjects() {
             ),
         ] {
             let iterator_type = new_typeobject_with_base(name, init, object_type);
+            if std::ptr::eq(
+                pytype,
+                &pyre_object::iterobject::ARRAY_ITER_TYPE as *const PyType,
+            ) {
+                // CPython 3.14 Modules/arraymodule.c creates arrayiter_spec
+                // through PyType_FromModuleAndSpec with IMMUTABLETYPE.
+                mark_cpython_heap_type(iterator_type, true);
+            }
             unsafe {
                 pyre_object::w_type_set_disallow_instantiation(iterator_type);
                 pyre_object::w_type_set_acceptable_as_base_class(iterator_type, false);
@@ -1504,6 +1523,40 @@ pub fn init_typeobjects() {
                 &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType,
             ) as usize,
         );
+        // [3.14-spec] CPython 3.14 Modules/itertoolsmodule.c:itertools_exec
+        // creates every spec in `typelist` through PyType_FromModuleAndSpec.
+        // Each spec includes IMMUTABLETYPE.  PyPy keeps the same classes as
+        // builtin TypeDefs; publish the CPython owner on those exact registry
+        // rows without changing their internal `flag_heaptype`.
+        for pytype in [
+            &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
+            &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType,
+            &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType,
+            &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType,
+            &pyre_object::interp_itertools::COMBINATIONS_TYPE as *const PyType,
+            &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE
+                as *const PyType,
+            &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType,
+            &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType,
+            &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType,
+            &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType,
+            &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType,
+            &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType,
+            &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType,
+            &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType,
+            &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType,
+        ] {
+            if let Some(&type_obj) = reg.get(&(pytype as usize)) {
+                mark_cpython_heap_type(type_obj as PyObjectRef, true);
+            }
+        }
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
         // variants share the public `tuple` PyType name, so all three
         // foreign statics map to a "tuple" typedef.  `gettypefor` keys
@@ -2682,6 +2735,24 @@ pub fn make_builtin_type_with_layout(
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
     new_typeobject_with_base_and_layout(name, init, base, layout_pytype)
+}
+
+/// [3.14-spec] Project a CPython `PyType_From*Spec` owner onto a PyPy builtin
+/// `TypeDef`.  The latter remains `flag_heaptype = False`; only the public
+/// HEAPTYPE / STATIC_BUILTIN / IMMUTABLETYPE axes change.  Each caller cites
+/// the CPython 3.14 construction site that requires this adaptation.
+pub fn mark_cpython_heap_type(type_obj: PyObjectRef, immutable: bool) {
+    unsafe {
+        pyre_object::w_type_set_cpython_type_flags(type_obj, true, false, immutable);
+    }
+}
+
+/// The public `PyType_Ready` legacy-extension shape: neither a CPython core
+/// STATIC_BUILTIN nor a heap allocation, but necessarily immutable in 3.14.
+pub fn mark_cpython_static_extension_type(type_obj: PyObjectRef) {
+    unsafe {
+        pyre_object::w_type_set_cpython_type_flags(type_obj, false, false, true);
+    }
 }
 
 /// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
@@ -11065,7 +11136,7 @@ pub(crate) fn cpython_object_is_gc(w_obj: PyObjectRef) -> bool {
     // with `Py_TPFLAGS_HEAPTYPE`: a statically allocated type object is never
     // collected, while one built by `type_new` is.
     if unsafe { pyre_object::is_type(w_obj) } {
-        return unsafe { pyre_object::w_type_is_heaptype(w_obj) };
+        return unsafe { pyre_object::w_type_is_cpython_heaptype(w_obj) };
     }
     true
 }
@@ -11199,7 +11270,7 @@ fn cpython_type_offsets(w_type: PyObjectRef) -> Option<(i64, i64)> {
     // Without the lock that pre-header is the managed dict pair alone — the
     // collector keeps its bits in the object header instead of a `PyGC_Head`
     // ahead of it — so the weakref word sits two words back, not four.
-    if unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+    if unsafe { pyre_object::w_type_is_cpython_heaptype(w_type) } {
         if dict == 0 && unsafe { pyre_object::w_type_get_hasdict(w_type) } {
             dict = -1;
         }
@@ -11256,7 +11327,7 @@ fn init_type_type(ns: PyObjectRef) {
                 |args| {
                     crate::type_methods::arity_no_args(args, "__sizeof__")?;
                     let word = std::mem::size_of::<usize>() as i64;
-                    let size = if pyre_object::w_type_is_heaptype(args[0]) {
+                    let size = if pyre_object::w_type_is_cpython_heaptype(args[0]) {
                         // CPython 3.14 typeobject.c:type___sizeof___impl:
                         // PyHeapTypeObject plus the cached-keys table carried
                         // by a managed instance dictionary. The struct sizes
@@ -11650,7 +11721,7 @@ fn init_type_type(ns: PyObjectRef) {
                     "descriptor '__abstractmethods__' for 'type' objects doesn't apply",
                 ));
             }
-            if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+            if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
                 return Err(crate::PyError::type_error(format!(
                     "cannot set '__abstractmethods__' attribute of immutable type '{}'",
                     unsafe { pyre_object::w_type_get_name(w_type) },
@@ -11688,7 +11759,7 @@ fn init_type_type(ns: PyObjectRef) {
                     "descriptor '__abstractmethods__' for 'type' objects doesn't apply",
                 ));
             }
-            if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+            if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
                 return Err(crate::PyError::type_error(format!(
                     "cannot delete '__abstractmethods__' attribute of immutable type '{}'",
                     unsafe { pyre_object::w_type_get_name(w_type) },
@@ -12052,7 +12123,7 @@ fn init_type_type(ns: PyObjectRef) {
             // type derives it from the qualified name.  `lookup_in_type`
             // filters out null entries but preserves `w_none()`, matching
             // PyPy's "value present even if it's None" semantic.
-            if unsafe { pyre_object::w_type_is_heaptype(cls) }
+            if unsafe { pyre_object::w_type_is_cpython_heaptype(cls) }
                 && let Some(v) = crate::type_dict_lookup(cls, "__module__")
                 && !v.is_null()
             {
@@ -12081,7 +12152,7 @@ fn init_type_type(ns: PyObjectRef) {
             check_set_special_type_attr(cls, value, "__module__")?;
             unsafe {
                 if pyre_object::is_type(cls) {
-                    if !pyre_object::w_type_is_heaptype(cls) {
+                    if pyre_object::w_type_is_cpython_immutabletype(cls) {
                         let name = pyre_object::w_type_get_name(cls);
                         return Err(crate::PyError::type_error(format!(
                             "cannot set '__module__' attribute of immutable type '{name}'"
@@ -12383,7 +12454,7 @@ fn check_set_special_type_attr(
     w_value: PyObjectRef,
     name: &str,
 ) -> Result<(), crate::PyError> {
-    let immutable = !unsafe { pyre_object::w_type_is_heaptype(w_type) };
+    let immutable = unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) };
     if !immutable && !w_value.is_null() {
         return Ok(());
     }
@@ -31504,6 +31575,46 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{name}.__flags__ lookup failed: {err:?}"));
             let flags = unsafe { pyre_object::w_int_get_value(w_flags) };
             assert_eq!(flags & MASK, expected, "{name}.__flags__");
+        }
+    }
+
+    #[test]
+    fn type_flags_keep_pypy_storage_and_cpython_owner_axes_orthogonal() {
+        crate::typedef::init_typeobjects();
+        const STATIC_BUILTIN: i64 = 1 << 1;
+        const IMMUTABLETYPE: i64 = 1 << 8;
+        const HEAPTYPE: i64 = 1 << 9;
+        const OWNER_MASK: i64 = STATIC_BUILTIN | IMMUTABLETYPE | HEAPTYPE;
+
+        let cases = [
+            (
+                "object",
+                crate::typedef::w_object(),
+                STATIC_BUILTIN | IMMUTABLETYPE,
+            ),
+            (
+                "array.array",
+                crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
+                HEAPTYPE | IMMUTABLETYPE,
+            ),
+            (
+                "itertools.count",
+                crate::typedef::gettypeobject(&pyre_object::interp_itertools::COUNT_TYPE),
+                HEAPTYPE | IMMUTABLETYPE,
+            ),
+            (
+                "_random.Random",
+                crate::module::_random::type_object(),
+                HEAPTYPE,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let flags = unsafe { pyre_object::w_type_get_flags(w_type) };
+            assert_eq!(flags & OWNER_MASK, expected, "{name}.__flags__");
+            assert!(
+                !unsafe { pyre_object::w_type_is_heaptype(w_type) },
+                "{name} must remain a PyPy builtin TypeDef internally"
+            );
         }
     }
 

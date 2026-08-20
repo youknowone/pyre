@@ -2322,6 +2322,9 @@ fn socket_type() -> pyre_object::PyObjectRef {
     static SOCKET_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SOCKET_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("socket", init_socket_type);
+        // CPython 3.14 Modules/socketmodule.c:sock_exec creates sock_type from
+        // a mutable module heap spec.
+        crate::typedef::mark_cpython_heap_type(tp, false);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         unsafe { pyre_object::w_type_set_hasuserdel(tp, true) };
         tp as usize

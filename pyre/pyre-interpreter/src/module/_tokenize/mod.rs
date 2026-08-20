@@ -72,7 +72,9 @@ enum TokenizerPhase {
     Done,
 }
 
-#[crate::pyre_class("_tokenize.TokenizerIter")]
+// CPython 3.14 Python/Python-tokenize.c:tokenizemodule_exec uses
+// PyType_FromModuleAndSpec; tokenizeriter_spec is immutable.
+#[crate::pyre_class("_tokenize.TokenizerIter", cpython_heaptype)]
 pub struct W_TokenizerIter {
     readline: PyObjectRef,
     extra_tokens: bool,

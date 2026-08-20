@@ -1181,6 +1181,14 @@ struct PyreClassAttrs {
     /// Specifying this lets the GC consts retain one prefix while the
     /// PyType keeps its historical name.
     pytype_static: Option<syn::LitStr>,
+    /// CPython 3.14 constructs this module type with `PyType_From*Spec`.
+    /// This is a public flag projection only; the PyPy TypeDef remains a
+    /// builtin internally.
+    cpython_heaptype: bool,
+    /// CPython permits mutation of this heap type's namespace.  Implies
+    /// `cpython_heaptype`; absent this marker, heap extension types default to
+    /// IMMUTABLETYPE, matching the dominant 3.14 shape.
+    cpython_mutable: bool,
 }
 
 impl syn::parse::Parse for PyreClassAttrs {
@@ -1190,12 +1198,26 @@ impl syn::parse::Parse for PyreClassAttrs {
         let mut type_id: Option<syn::LitInt> = None;
         let mut static_name: Option<syn::LitStr> = None;
         let mut pytype_static: Option<syn::LitStr> = None;
+        let mut cpython_heaptype = false;
+        let mut cpython_mutable = false;
         while !input.is_empty() {
             input.parse::<syn::Token![,]>()?;
             if input.is_empty() {
                 break;
             }
             let key: syn::Ident = input.parse()?;
+            match key.to_string().as_str() {
+                "cpython_heaptype" => {
+                    cpython_heaptype = true;
+                    continue;
+                }
+                "cpython_mutable" => {
+                    cpython_heaptype = true;
+                    cpython_mutable = true;
+                    continue;
+                }
+                _ => {}
+            }
             input.parse::<syn::Token![=]>()?;
             match key.to_string().as_str() {
                 "type_id" => type_id = Some(input.parse()?),
@@ -1206,7 +1228,8 @@ impl syn::parse::Parse for PyreClassAttrs {
                         key.span(),
                         format!(
                             "unknown `#[pyre_class]` key `{other}` — \
-                             expected `type_id` / `static_name` / `pytype_static`",
+                             expected `type_id` / `static_name` / `pytype_static` / \
+                             `cpython_heaptype` / `cpython_mutable`",
                         ),
                     ));
                 }
@@ -1217,6 +1240,8 @@ impl syn::parse::Parse for PyreClassAttrs {
             type_id,
             static_name,
             pytype_static,
+            cpython_heaptype,
+            cpython_mutable,
         })
     }
 }
@@ -1228,6 +1253,8 @@ fn expand_pyre_class(
     let st_name = st.ident.clone();
     let st_vis = st.vis.clone();
     let name_lit = attrs.name;
+    let cpython_heaptype = attrs.cpython_heaptype;
+    let cpython_immutabletype = !attrs.cpython_mutable;
 
     // Derive static names from the struct name.
     //   W_Random          -> RANDOM_TYPE, W_RANDOM_GC_TYPE_ID,
@@ -1388,6 +1415,8 @@ fn expand_pyre_class(
             const DESCRIPTOR: &'static ::pyre_object::lltype::PyreClassDescriptor =
                 &#descriptor_static;
             const PYNAME: &'static str = #name_lit;
+            const CPYTHON_HEAPTYPE: bool = #cpython_heaptype;
+            const CPYTHON_IMMUTABLETYPE: bool = #cpython_immutabletype;
         }
 
         impl #st_name {
@@ -2430,6 +2459,17 @@ fn expand_pyre_methods(
                         #base_expr,
                         <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
                     );
+                    // [3.14-spec] The declaration records CPython's public
+                    // owner/mutability axes while the PyPy TypeDef produced
+                    // above remains structurally builtin.
+                    unsafe {
+                        ::pyre_object::w_type_set_cpython_type_flags(
+                            tp,
+                            <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::CPYTHON_HEAPTYPE,
+                            !<#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::CPYTHON_HEAPTYPE,
+                            <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::CPYTHON_IMMUTABLETYPE,
+                        );
+                    }
                     ::pyre_object::pyobject::set_instantiate(
                         unsafe {
                             &*<#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE

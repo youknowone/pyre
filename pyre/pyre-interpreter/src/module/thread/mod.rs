@@ -759,7 +759,9 @@ mod lock_class {
     // would swallow exactly the wakeup that carries the interrupt.
     use std::sync::{Condvar, Mutex};
 
-    #[crate::pyre_class("_thread.lock")]
+    // CPython 3.14 Modules/_threadmodule.c builds lock_type_spec as an
+    // immutable module heap type.
+    #[crate::pyre_class("_thread.lock", cpython_heaptype)]
     #[derive(Default)]
     pub struct W_Lock {
         locked: Mutex<bool>,
@@ -904,7 +906,8 @@ mod rlock_class {
         owner: i64,
     }
 
-    #[crate::pyre_class("_thread.RLock")]
+    // Modules/_threadmodule.c builds rlock_type_spec as immutable heap type.
+    #[crate::pyre_class("_thread.RLock", cpython_heaptype)]
     #[derive(Default)]
     pub struct W_RLock {
         state: Mutex<RLockState>,
@@ -1134,7 +1137,8 @@ mod handle_class {
         pub(super) daemon: bool,
     }
 
-    #[crate::pyre_class("_thread._ThreadHandle")]
+    // Modules/_threadmodule.c builds ThreadHandle_Type_spec as immutable heap.
+    #[crate::pyre_class("_thread._ThreadHandle", cpython_heaptype)]
     #[derive(Default)]
     pub struct W_ThreadHandle {
         pub(super) state: Mutex<HandleState>,
@@ -1278,7 +1282,8 @@ mod local_class {
     /// takes the positional and keyword halves separately, so they are stored as
     /// the positional tuple and the construction call's keyword mapping (null
     /// when it had none), and `create_new_dict` replays the call from both.
-    #[crate::pyre_class("_thread._local")]
+    // Modules/_threadmodule.c builds local_type_spec as immutable module heap.
+    #[crate::pyre_class("_thread._local", cpython_heaptype)]
     pub struct W_Local {
         dicts: PyObjectRef,
         initargs: PyObjectRef,

@@ -15203,6 +15203,10 @@ pub fn file_wrapper_type() -> PyObjectRef {
     static FILE_WRAPPER_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *FILE_WRAPPER_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
+        // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
+        // TextIOWrapper heap spec.  This legacy wrapper accessor must publish
+        // the same owner as `_io::textio::type_object`.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         tp as usize
     }) as PyObjectRef

@@ -17,7 +17,9 @@ use std::sync::Mutex;
 
 /// `Compressor`: the liblzma stream and its lock belong to the object, and
 /// there is no process-global side table.
-#[crate::pyre_class("_lzma.LZMACompressor")]
+// CPython 3.14 Modules/_lzmamodule.c:lzma_exec creates this spec with
+// PyType_FromModuleAndSpec; its spec includes IMMUTABLETYPE.
+#[crate::pyre_class("_lzma.LZMACompressor", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_LZMACompressor {
     backend: *mut Mutex<backend::Compressor>,
@@ -25,7 +27,8 @@ pub struct W_LZMACompressor {
 
 /// `Decompressor`, object-owned the same way.  The unconsumed input and the
 /// `unused_data` tail live with the stream rather than as Python attributes.
-#[crate::pyre_class("_lzma.LZMADecompressor")]
+// Same `lzma_exec` owner and flags as LZMACompressor.
+#[crate::pyre_class("_lzma.LZMADecompressor", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_LZMADecompressor {
     backend: *mut Mutex<backend::Decompressor>,

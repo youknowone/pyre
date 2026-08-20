@@ -569,6 +569,9 @@ mod dialect_class {
                     };
                 }
             });
+            // CPython 3.14 Modules/_csv.c:csv_exec uses
+            // PyType_FromModuleAndSpec; Dialect_Type_spec is immutable.
+            crate::typedef::mark_cpython_heap_type(tp, true);
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
             tp as usize
         }) as PyObjectRef

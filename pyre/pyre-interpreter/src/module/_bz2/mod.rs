@@ -14,14 +14,17 @@ use std::sync::Mutex;
 
 /// `interp_bz2.py W_BZ2Compressor`: the stream and its lock belong to
 /// the wrapper object; there is no process-global side table.
-#[crate::pyre_class("_bz2.BZ2Compressor")]
+// CPython 3.14 Modules/_bz2module.c:bz2_exec uses
+// PyType_FromModuleAndSpec with IMMUTABLETYPE.
+#[crate::pyre_class("_bz2.BZ2Compressor", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_BZ2Compressor {
     backend: *mut Mutex<backend::Compressor>,
 }
 
 /// `interp_bz2.py W_BZ2Decompressor`, object-owned the same way.
-#[crate::pyre_class("_bz2.BZ2Decompressor")]
+// Same `bz2_exec` owner and flags as BZ2Compressor.
+#[crate::pyre_class("_bz2.BZ2Decompressor", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_BZ2Decompressor {
     backend: *mut Mutex<backend::Decompressor>,

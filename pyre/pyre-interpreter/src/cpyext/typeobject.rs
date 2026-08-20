@@ -181,6 +181,7 @@ pub struct CPyTypeObject {
 }
 
 pub const PY_TPFLAGS_DEFAULT: std::ffi::c_ulong = 0;
+pub const PY_TPFLAGS_STATIC_BUILTIN: std::ffi::c_ulong = 1 << 1;
 pub const PY_TPFLAGS_HEAPTYPE: std::ffi::c_ulong = 1 << 9;
 pub const PY_TPFLAGS_BASETYPE: std::ffi::c_ulong = 1 << 10;
 pub const PY_TPFLAGS_READY: std::ffi::c_ulong = 1 << 12;
@@ -444,13 +445,26 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     // The bytes are boxed, so moving the `CString` into the table below leaves
     // this pointer valid.
     let pointer = name.as_ptr();
-    let heaptype = match unsafe { pyre_object::typeobject::w_type_is_heaptype(w_type) } {
+    let heaptype = match unsafe { pyre_object::w_type_is_cpython_heaptype(w_type) } {
         true => PY_TPFLAGS_HEAPTYPE,
+        false => 0,
+    };
+    let static_builtin = match unsafe { pyre_object::w_type_is_cpython_static_builtin(w_type) } {
+        true => PY_TPFLAGS_STATIC_BUILTIN,
+        false => 0,
+    };
+    let immutabletype = match unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
+        true => PY_TPFLAGS_IMMUTABLETYPE,
         false => 0,
     };
     unsafe {
         (*mirror).tp_name = pointer;
-        (*mirror).tp_flags = PY_TPFLAGS_DEFAULT | PY_TPFLAGS_READY | PY_TPFLAGS_BASETYPE | heaptype;
+        (*mirror).tp_flags = PY_TPFLAGS_DEFAULT
+            | PY_TPFLAGS_READY
+            | PY_TPFLAGS_BASETYPE
+            | heaptype
+            | static_builtin
+            | immutabletype;
     }
     TYPE_NAMES.lock().insert(mirror as usize, name);
 }
@@ -2528,6 +2542,12 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
         ));
     }
     unsafe { (*tp).tp_flags |= PY_TPFLAGS_READYING };
+    // CPython 3.14 `PyType_Ready`: legacy non-heap extension statics are
+    // immutable, but do not receive the private STATIC_BUILTIN bit reserved
+    // for interpreter-core `_PyStaticType_InitBuiltin` owners.
+    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
+        unsafe { (*tp).tp_flags |= PY_TPFLAGS_IMMUTABLETYPE };
+    }
 
     let base = unsafe { (*tp).tp_base };
     if !base.is_null() {
@@ -2583,6 +2603,14 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
         |ns| install_namespace(ns, tp),
         pyre_object::gc_roots::shadow_stack_get(base_slot),
     );
+    unsafe {
+        pyre_object::w_type_set_cpython_type_flags(
+            w_type,
+            (*tp).tp_flags & PY_TPFLAGS_HEAPTYPE != 0,
+            false,
+            (*tp).tp_flags & PY_TPFLAGS_IMMUTABLETYPE != 0,
+        );
+    }
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(w_type);
     unsafe {
@@ -3537,7 +3565,7 @@ pub unsafe extern "C" fn PyType_Freeze(tp: *mut CPyTypeObject) -> c_int {
     // The type itself is the head of its own MRO and is the one being frozen,
     // so only what it inherits from has to be immutable already.
     for &w_base in unsafe { (*mro).as_slice() }.iter().skip(1) {
-        if unsafe { pyre_object::w_type_is_heaptype(w_base) } {
+        if !unsafe { pyre_object::w_type_is_cpython_immutabletype(w_base) } {
             super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
                 "Creating immutable type {} from mutable base {}",
                 type_name_of(tp),
@@ -3548,6 +3576,8 @@ pub unsafe extern "C" fn PyType_Freeze(tp: *mut CPyTypeObject) -> c_int {
     }
     unsafe {
         pyre_object::typeobject::w_type_set_heaptype(w_type, false);
+        // Freezing changes CPython's immutable axis but not its HEAPTYPE owner.
+        pyre_object::w_type_set_cpython_immutabletype(w_type, true);
         if !tp.is_null() {
             (*tp).tp_flags |= PY_TPFLAGS_IMMUTABLETYPE;
         }

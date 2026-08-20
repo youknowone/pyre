@@ -47,7 +47,9 @@ pub(super) fn input_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     }
 }
 
-#[crate::pyre_class("_io.BufferedWriter")]
+// CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE uses
+// PyType_FromModuleAndSpec; the BufferedWriter spec is immutable.
+#[crate::pyre_class("_io.BufferedWriter", cpython_heaptype)]
 pub struct W_BufferedWriter {
     state: i64,
     w_raw: PyObjectRef,

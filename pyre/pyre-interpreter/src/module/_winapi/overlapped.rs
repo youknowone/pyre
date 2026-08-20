@@ -68,7 +68,9 @@ impl Drop for NativeOverlapped {
     }
 }
 
-#[crate::pyre_class("_winapi.Overlapped")]
+// CPython 3.14 Modules/_winapi.c creates winapi_overlapped_type_spec through
+// PyType_FromModuleAndSpec; its spec is immutable.
+#[crate::pyre_class("_winapi.Overlapped", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_Overlapped {
     backend: *mut Mutex<NativeOverlapped>,
@@ -284,6 +286,7 @@ pub fn overlapped_type() -> PyObjectRef {
             crate::typedef::w_object(),
             <W_Overlapped as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
+        crate::typedef::mark_cpython_heap_type(tp, true);
         pyre_object::pyobject::set_instantiate(
             unsafe { &*<W_Overlapped as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,

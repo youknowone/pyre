@@ -298,7 +298,9 @@ fn is_normalized(args: &[PyObjectRef]) -> PyResult {
 
 /// PyPy `interp_ucd.py:UCD` — a Unicode database view whose methods are
 /// descriptors on the type, rather than entries in an instance dictionary.
-#[crate::pyre_class("unicodedata.UCD")]
+// CPython 3.14 Modules/unicodedata.c:PyInit_unicodedata uses PyType_FromSpec;
+// ucd_type_spec carries IMMUTABLETYPE.
+#[crate::pyre_class("unicodedata.UCD", cpython_heaptype)]
 pub struct W_UCD {
     legacy: bool,
 }

@@ -8,7 +8,9 @@ const STATE_ZERO: i64 = 0;
 const STATE_OK: i64 = 1;
 const STATE_DETACHED: i64 = 2;
 
-#[crate::pyre_class("_io.BufferedRandom")]
+// CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
+// BufferedRandom heap spec.
+#[crate::pyre_class("_io.BufferedRandom", cpython_heaptype)]
 pub struct W_BufferedRandom {
     state: i64,
     w_raw: PyObjectRef,

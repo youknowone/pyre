@@ -131,6 +131,27 @@ pub struct W_TypeObject {
     pub mro_w: *mut crate::object_array::FixedObjectArray,
     /// typeobject.py:184 `flag_heaptype` — immutable after creation.
     pub flag_heaptype: bool,
+    /// [3.14-spec] CPython's public `Py_TPFLAGS_HEAPTYPE` ownership axis.
+    ///
+    /// PyPy deliberately collapses every interpreter `TypeDef` to
+    /// `flag_heaptype = False` (`TypeDef.heaptype`, `typeobject.py`).
+    /// CPython 3.14 instead builds many extension-module types through
+    /// `PyType_FromModuleAndSpec`, so they publish HEAPTYPE while remaining
+    /// PyPy-style builtin TypeDefs internally.  Keep that observable owner
+    /// bit separate rather than changing the load-bearing PyPy field above.
+    pub flag_cpython_heaptype: bool,
+    /// CPython-internal `_Py_TPFLAGS_STATIC_BUILTIN` (bit 1).  This is not the
+    /// inverse of HEAPTYPE: a legacy extension type readied through the public
+    /// `PyType_Ready` API has neither bit, whereas an interpreter-owned core
+    /// type initialized by `_PyStaticType_InitBuiltin` carries this one.
+    pub flag_cpython_static_builtin: bool,
+    /// [3.14-spec] CPython's orthogonal `Py_TPFLAGS_IMMUTABLETYPE` axis.
+    ///
+    /// A CPython heap type may still be immutable (the common extension-type
+    /// shape), and `PyType_Freeze` can make an existing heap type immutable.
+    /// PyPy uses `not flag_heaptype` for this question, so the 3.14 projection
+    /// needs its own field instead of overloading the PyPy owner bit.
+    pub flag_cpython_immutabletype: std::sync::atomic::AtomicBool,
     /// typeobject.py `layout` — pointer to shared Layout object.
     pub layout: *const Layout,
     /// typeobject.py:179 `hasdict` — True when instances have __dict__.
@@ -403,6 +424,9 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         bases,
         dict: dict_ptr,
         flag_heaptype: true,
+        flag_cpython_heaptype: true,
+        flag_cpython_static_builtin: false,
+        flag_cpython_immutabletype: std::sync::atomic::AtomicBool::new(false),
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
@@ -526,6 +550,9 @@ pub fn w_type_new_builtin(
         bases,
         dict: dict_ptr,
         flag_heaptype: false,
+        flag_cpython_heaptype: false,
+        flag_cpython_static_builtin: true,
+        flag_cpython_immutabletype: std::sync::atomic::AtomicBool::new(true),
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
@@ -1352,6 +1379,63 @@ pub unsafe fn w_type_set_heaptype(obj: PyObjectRef, value: bool) {
     (*(obj as *mut W_TypeObject)).flag_heaptype = value;
 }
 
+/// Publish the CPython 3.14 owner and mutability axes for a type whose PyPy
+/// storage owner remains unchanged.  Construction sites call this once after
+/// creating an interpreter builtin TypeDef; `PyType_Freeze` only changes the
+/// immutable half through [`w_type_set_cpython_immutabletype`].
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_set_cpython_type_flags(
+    obj: PyObjectRef,
+    heaptype: bool,
+    static_builtin: bool,
+    immutabletype: bool,
+) {
+    let t = &mut *(obj as *mut W_TypeObject);
+    t.flag_cpython_heaptype = heaptype;
+    t.flag_cpython_static_builtin = static_builtin;
+    t.flag_cpython_immutabletype
+        .store(immutabletype, std::sync::atomic::Ordering::Release);
+}
+
+/// CPython 3.14 public HEAPTYPE ownership, distinct from PyPy's
+/// [`w_type_is_heaptype`] implementation classification.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_is_cpython_heaptype(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).flag_cpython_heaptype
+}
+
+/// Read CPython's internal STATIC_BUILTIN owner bit.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_is_cpython_static_builtin(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).flag_cpython_static_builtin
+}
+
+/// Set only CPython's public IMMUTABLETYPE axis (used by `PyType_Freeze`).
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_set_cpython_immutabletype(obj: PyObjectRef, value: bool) {
+    (*(obj as *const W_TypeObject))
+        .flag_cpython_immutabletype
+        .store(value, std::sync::atomic::Ordering::Release);
+}
+
+/// Read CPython's public IMMUTABLETYPE axis.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_is_cpython_immutabletype(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject))
+        .flag_cpython_immutabletype
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// typeobject.py `W_TypeObject.get_flags` — compute PyPy's public type flags
 /// from their canonical fields on `W_TypeObject`.
 /// # Safety
@@ -1361,6 +1445,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     if obj.is_null() || !is_type(obj) {
         return 0;
     }
+    const STATIC_BUILTIN: i64 = 1 << 1;
     const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
     const INLINE_VALUES: i64 = 1 << 2;
     const MANAGED_WEAKREF: i64 = 1 << 3;
@@ -1387,9 +1472,14 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
 
     let t = &*(obj as *const W_TypeObject);
     let mut flags = 0;
-    if t.flag_heaptype {
+    if t.flag_cpython_static_builtin {
+        flags |= STATIC_BUILTIN;
+    }
+    if t.flag_cpython_heaptype {
         flags |= HEAPTYPE;
+    }
 
+    if t.flag_heaptype {
         // [3.14-spec] `type_new_descriptors` represents a dict slot added by
         // a heap type with MANAGED_DICT (`typeobject.c`, read at v3.14.6).
         // PyPy records the same ownership boundary as
@@ -1411,21 +1501,17 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         if w_type_has_cpython_managed_weakref(obj) {
             flags |= MANAGED_WEAKREF;
         }
-    } else {
-        // `Py_TPFLAGS_IMMUTABLETYPE` (`object.h`, read at v3.14.6): a type
-        // whose attributes cannot be set.  `get_flags` publishes no such bit
-        // — it reports the heap flag and stops — while every type pyre builds
-        // itself already answers "cannot set 'x' attribute of immutable type"
-        // to a store, so the flag names something already true here rather
-        // than changing what any of them does.  Measured over 39 builtins on
-        // 3.14: the bit is set on exactly the types that are not heap types,
-        // and those are exactly the ones that refuse the store, in both
-        // interpreters.  `test_ctypes/_support.py` spells the constant and
-        // `test_win32.py:81` reads it back off `COMError`.
+    }
+    if t.flag_cpython_immutabletype
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        // `Py_TPFLAGS_IMMUTABLETYPE` (`object.h`, read at v3.14.6) is
+        // orthogonal to HEAPTYPE: modern extension types commonly carry both.
+        // PyPy's `descr__flags__` reports neither axis for builtin TypeDefs;
+        // this field publishes CPython's observable split without changing
+        // PyPy's internal type ownership.
         flags |= IMMUTABLETYPE;
     }
-    // typeobject.py `flag_cpytype` marks cpyext-defined static types; pyre has
-    // no equivalent type owner, so its bit is always absent.
     if t.flag_abstract.load(std::sync::atomic::Ordering::Acquire) {
         flags |= ABSTRACT;
     }
@@ -2006,6 +2092,40 @@ mod tests {
             let intrinsic_subclass = heap_with_base("IntrinsicChild", intrinsic, layout);
             w_type_set_weakrefable(intrinsic_subclass, true);
             assert_eq!(w_type_get_flags(intrinsic_subclass) & MANAGED_WEAKREF, 0);
+        }
+    }
+
+    #[test]
+    fn type_flags_keep_cpython_owner_and_immutability_orthogonal() {
+        const STATIC_BUILTIN: i64 = 1 << 1;
+        const IMMUTABLETYPE: i64 = 1 << 8;
+        const HEAPTYPE: i64 = 1 << 9;
+        const MASK: i64 = STATIC_BUILTIN | IMMUTABLETYPE | HEAPTYPE;
+
+        unsafe {
+            // `_PyStaticType_InitBuiltin`: interpreter-owned static builtin.
+            let core = w_type_new_builtin("core", PY_NULL, std::ptr::null_mut(), &INSTANCE_TYPE);
+            assert_eq!(
+                w_type_get_flags(core) & MASK,
+                STATIC_BUILTIN | IMMUTABLETYPE
+            );
+
+            // `PyType_FromModuleAndSpec`: a heap-owned but immutable extension
+            // type.  Its PyPy implementation owner remains a builtin TypeDef.
+            let extension =
+                w_type_new_builtin("extension", PY_NULL, std::ptr::null_mut(), &INSTANCE_TYPE);
+            w_type_set_cpython_type_flags(extension, true, false, true);
+            assert!(!w_type_is_heaptype(extension));
+            assert_eq!(w_type_get_flags(extension) & MASK, HEAPTYPE | IMMUTABLETYPE);
+
+            // A legacy static extension readied through public PyType_Ready is
+            // neither a core static builtin nor a heap type, but is immutable.
+            w_type_set_cpython_type_flags(extension, false, false, true);
+            assert_eq!(w_type_get_flags(extension) & MASK, IMMUTABLETYPE);
+
+            // An app-level class remains mutable and heap-owned.
+            let user = w_type_new("User", PY_NULL, std::ptr::null_mut());
+            assert_eq!(w_type_get_flags(user) & MASK, HEAPTYPE);
         }
     }
 

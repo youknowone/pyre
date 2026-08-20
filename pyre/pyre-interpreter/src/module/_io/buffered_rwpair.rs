@@ -4,7 +4,9 @@ use pyre_object::*;
 
 use super::DEFAULT_BUFFER_SIZE;
 
-#[crate::pyre_class("_io.BufferedRWPair")]
+// CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
+// BufferedRWPair heap spec.
+#[crate::pyre_class("_io.BufferedRWPair", cpython_heaptype)]
 pub struct W_BufferedRWPair {
     w_reader: PyObjectRef,
     w_writer: PyObjectRef,

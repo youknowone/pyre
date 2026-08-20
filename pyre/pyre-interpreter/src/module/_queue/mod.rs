@@ -5,7 +5,9 @@ use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-#[crate::pyre_class("_queue.SimpleQueue")]
+// CPython 3.14 Modules/_queuemodule.c:_queue_exec uses
+// PyType_FromModuleAndSpec with IMMUTABLETYPE.
+#[crate::pyre_class("_queue.SimpleQueue", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_SimpleQueue {
     pub map: *const u8,

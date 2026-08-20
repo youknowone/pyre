@@ -6748,7 +6748,7 @@ pub(crate) unsafe fn object_setattr_surrogate(
         // (correct: a surrogate can never name `__eq__`/`__hash__`).
         if is_type(obj) {
             // typeobject.py — only heap types may have their dict mutated.
-            if !pyre_object::w_type_is_heaptype(obj) {
+            if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
                     "cannot set {} attribute of immutable type '{}'",
                     crate::display::format_wtf8_repr(name),
@@ -6837,7 +6837,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
         }
         if is_type(obj) {
             // typeobject.py:437 — only heap types may have attributes deleted.
-            if !pyre_object::w_type_is_heaptype(obj) {
+            if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
                     "cannot delete attributes on immutable type object '{}'",
                     w_type_get_name(obj)
@@ -7226,7 +7226,7 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
     // Static builtin types cannot acquire annotations, so reject them before
     // consulting their namespace.  Heap types below may have an explicit
     // class-body entry with this name.
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj) } {
         return Err(PyError::attribute_error(format!(
             "type object '{}' has no attribute '__annotations__'",
             unsafe { w_type_get_name(obj) },
@@ -7265,7 +7265,7 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__annotations__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -7290,7 +7290,7 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
 /// own-type slot, never inherited, and replacing it invalidates the result
 /// cached by `type_get_annotations`.
 pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__annotate__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -7319,7 +7319,7 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
 /// None.  A class-body `__annotate__` entry is an ordinary own-class value
 /// and takes precedence over the compiler-facing slot.
 pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj) } {
         return Err(PyError::attribute_error(format!(
             "type object '{}' has no attribute '__annotate__'",
             unsafe { w_type_get_name(obj) },
@@ -7336,7 +7336,7 @@ pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
 /// the empty tuple.  Unlike function type parameters, the class slot accepts
 /// any object; the compiler normally stores a tuple.
 pub(crate) fn type_get_type_params(obj: PyObjectRef) -> PyResult {
-    if unsafe { pyre_object::w_type_is_heaptype(obj) }
+    if unsafe { pyre_object::w_type_is_cpython_heaptype(obj) }
         && let Some(value) = crate::type_dict_lookup(obj, "__type_params__")
     {
         return Ok(value);
@@ -7345,7 +7345,7 @@ pub(crate) fn type_get_type_params(obj: PyObjectRef) -> PyResult {
 }
 
 pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__type_params__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -7358,7 +7358,7 @@ pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyRe
 }
 
 pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
-    if !unsafe { pyre_object::w_type_is_heaptype(obj) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot delete '__annotations__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -7406,7 +7406,7 @@ pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
         let Some(value) = crate::type_dict_lookup(obj, "__doc__") else {
             return Ok(w_none());
         };
-        if w_type_is_heaptype(obj) {
+        if w_type_is_cpython_heaptype(obj) {
             return match get(value, PY_NULL, obj)? {
                 Some(result) => Ok(result),
                 None => Ok(value),
@@ -7418,7 +7418,7 @@ pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
 
 /// PyPy `typeobject.py descr_set__doc`.
 pub(crate) fn type_set_doc(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
-    if !unsafe { w_type_is_heaptype(obj) } {
+    if unsafe { w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__doc__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
@@ -9700,7 +9700,7 @@ pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
 #[inline]
 pub(crate) unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
     if majit_metainterp::jit::we_are_jitted() {
-        if pyre_object::typeobject::w_type_is_heaptype(w_type) {
+        if !pyre_object::w_type_is_cpython_immutabletype(w_type) {
             // Heap types can still be mutated; read the live field (the
             // caller promotes the result).
             return pyre_object::typeobject::w_type_get_version_tag(w_type);
@@ -9974,7 +9974,7 @@ pub unsafe fn getfulltypename(w_obj: PyObjectRef) -> String {
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
-    if !pyre_object::w_type_is_heaptype(w_type) {
+    if !pyre_object::w_type_is_cpython_heaptype(w_type) {
         return w_type_get_name(w_type).to_string();
     }
     let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
@@ -9995,7 +9995,7 @@ pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> String {
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> String {
     let name = w_type_get_name(w_type).to_string();
-    if !pyre_object::w_type_is_heaptype(w_type) {
+    if !pyre_object::w_type_is_cpython_heaptype(w_type) {
         return name;
     }
     let module = lookup_in_type_where(w_type, "__module__")
@@ -10066,7 +10066,7 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
 pub unsafe fn type_fully_qualified_name(w_type: PyObjectRef) -> String {
-    if !pyre_object::w_type_is_heaptype(w_type) {
+    if !pyre_object::w_type_is_cpython_heaptype(w_type) {
         return w_type_get_name(w_type).to_string();
     }
     let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
@@ -10648,7 +10648,7 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     }
     let default_mro =
         |index: usize| pyre_object::gc_roots::shadow_stack_get(default_mro_start + index);
-    if pyre_object::w_type_is_heaptype(w_self) {
+    if pyre_object::w_type_is_cpython_heaptype(w_self) {
         let w_metaclass = (*w_self).w_class;
         if !w_metaclass.is_null()
             && let Some((w_where, w_mro_func)) = lookup_where_with_method_cache(w_metaclass, "mro")
@@ -11517,9 +11517,10 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         let w_module_type =
             crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
                 .map_or(PY_NULL, |p| p.as_ptr());
-        let old_supported =
-            w_type_is_heaptype(w_oldcls.as_ptr()) || std::ptr::eq(w_oldcls.as_ptr(), w_module_type);
-        let new_supported = w_type_is_heaptype(w_newcls) || std::ptr::eq(w_newcls, w_module_type);
+        let old_supported = w_type_is_cpython_heaptype(w_oldcls.as_ptr())
+            || std::ptr::eq(w_oldcls.as_ptr(), w_module_type);
+        let new_supported =
+            w_type_is_cpython_heaptype(w_newcls) || std::ptr::eq(w_newcls, w_module_type);
         if !old_supported || !new_supported {
             return Err(crate::PyError::type_error(
                 "__class__ assignment only supported for heap types or ModuleType subclasses"
@@ -11623,7 +11624,7 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
     unsafe {
         if obj.is_null()
             || !pyre_object::typeobject::is_type(obj)
-            || pyre_object::w_type_is_heaptype(obj)
+            || pyre_object::w_type_is_cpython_heaptype(obj)
         {
             return false;
         }
@@ -12112,7 +12113,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyRes
     unsafe {
         if is_type(obj) {
             // typeobject.py — only heap types may have their dict mutated.
-            if !pyre_object::w_type_is_heaptype(obj) {
+            if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
                     "cannot set '{}' attribute of immutable type '{}'",
                     name,
@@ -12947,7 +12948,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if is_type(obj) {
             // typeobject.py:437 — only heap types may have attributes deleted.
-            if !pyre_object::w_type_is_heaptype(obj) {
+            if pyre_object::w_type_is_cpython_immutabletype(obj) {
                 return Err(PyError::type_error(format!(
                     "cannot delete attributes on immutable type object '{}'",
                     w_type_get_name(obj)

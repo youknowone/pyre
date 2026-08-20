@@ -17,7 +17,9 @@ use std::sync::Mutex;
 /// PyPy `interp_zlib.py Compress`: the stream and lock belong to the
 /// wrapper object.  The mapdict prefix preserves PyPy's ability to subclass
 /// the type without moving its native payload into a side table.
-#[crate::pyre_class("zlib.Compress")]
+// CPython 3.14 Modules/zlibmodule.c:zlib_exec creates this heap spec without
+// IMMUTABLETYPE, so its type namespace remains mutable.
+#[crate::pyre_class("zlib.Compress", cpython_mutable)]
 #[derive(Default)]
 pub struct W_Compress {
     pub map: usize,
@@ -26,7 +28,8 @@ pub struct W_Compress {
 }
 
 /// PyPy `interp_zlib.py Decompress` object-owned stream state.
-#[crate::pyre_class("zlib.Decompress")]
+// Same `zlib_exec` mutable heap owner as Compress.
+#[crate::pyre_class("zlib.Decompress", cpython_mutable)]
 #[derive(Default)]
 pub struct W_Decompress {
     pub map: usize,
@@ -35,7 +38,9 @@ pub struct W_Decompress {
 }
 
 /// PyPy `interp_zlib.py:419 ZlibDecompressor` object-owned buffered stream.
-#[crate::pyre_class("zlib._ZlibDecompressor")]
+// CPython 3.14's ZlibDecompressorType spec adds IMMUTABLETYPE, unlike the two
+// public stream types above.
+#[crate::pyre_class("zlib._ZlibDecompressor", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_ZlibDecompressor {
     pub map: usize,
@@ -191,6 +196,23 @@ static COMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::
 static DECOMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static ZDECOMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// [3.14-spec] CPython's zlib specs publish `__module__ = "zlib"`; PyPy's
+/// unqualified `TypeDef('Compress')` / `TypeDef('Decompress')` do not.  Keep
+/// those PyPy type names and add only the observable namespace entry.
+fn publish_cpython_module(ns: PyObjectRef) {
+    let roots = pyre_object::gc_roots::push_roots();
+    roots.pin_root(ns);
+    let slot = roots.base();
+    let module = pyre_object::w_str_new("zlib");
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            roots.get(slot),
+            "__module__",
+            module,
+        );
+    }
+}
+
 fn compress_type() -> PyObjectRef {
     *COMPRESS_RUNTIME_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
@@ -199,6 +221,9 @@ fn compress_type() -> PyObjectRef {
             crate::typedef::w_object(),
             <W_Compress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
+        // CPython 3.14 Modules/zlibmodule.c:zlib_exec creates Comptype from a
+        // mutable heap spec.
+        crate::typedef::mark_cpython_heap_type(tp, false);
         pyre_object::pyobject::set_instantiate(
             unsafe { &*<W_Compress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
@@ -208,6 +233,7 @@ fn compress_type() -> PyObjectRef {
 }
 
 fn init_compress_type(ns: PyObjectRef) {
+    publish_cpython_module(ns);
     let new_sig = {
         let mut b = crate::SignatureBuilder::default();
         b.append("cls");
@@ -403,6 +429,8 @@ fn decompress_type() -> PyObjectRef {
             crate::typedef::w_object(),
             <W_Decompress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
+        // `zlib_exec` creates Decomptype from a mutable heap spec.
+        crate::typedef::mark_cpython_heap_type(tp, false);
         pyre_object::pyobject::set_instantiate(
             unsafe { &*<W_Decompress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
@@ -460,6 +488,7 @@ fn decompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 }
 
 fn init_decompress_type(ns: PyObjectRef) {
+    publish_cpython_module(ns);
     let new_sig = {
         let mut b = crate::SignatureBuilder::default();
         b.append("cls");
@@ -658,6 +687,9 @@ fn zdecompress_type() -> PyObjectRef {
             crate::typedef::w_object(),
             <W_ZlibDecompressor as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
+        // `zlib_exec` creates ZlibDecompressorType from an immutable heap
+        // spec, unlike Compress and Decompress.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         pyre_object::pyobject::set_instantiate(
             unsafe { &*<W_ZlibDecompressor as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
@@ -747,6 +779,7 @@ fn zdecompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn init_zdecompress_type(ns: PyObjectRef) {
+    publish_cpython_module(ns);
     let new_sig = {
         let mut b = crate::SignatureBuilder::default();
         b.append("cls");
@@ -932,4 +965,41 @@ crate::py_module! {
             Ok(w_int_new(adler32_compute(&data, start) as i64))
         },
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_type_owner_flags_and_module_match_cpython_314() {
+        crate::typedef::init_typeobjects();
+        const IMMUTABLETYPE: i64 = 1 << 8;
+        const HEAPTYPE: i64 = 1 << 9;
+        const MASK: i64 = IMMUTABLETYPE | HEAPTYPE;
+        for (name, ty, expected) in [
+            ("Compress", compress_type(), HEAPTYPE),
+            ("Decompress", decompress_type(), HEAPTYPE),
+            (
+                "_ZlibDecompressor",
+                zdecompress_type(),
+                HEAPTYPE | IMMUTABLETYPE,
+            ),
+        ] {
+            assert_eq!(
+                unsafe { pyre_object::w_type_get_flags(ty) } & MASK,
+                expected
+            );
+            assert_eq!(
+                unsafe {
+                    pyre_object::w_str_get_value(
+                        crate::baseobjspace::getattr_str(ty, "__module__").unwrap(),
+                    )
+                },
+                "zlib",
+                "{name}.__module__"
+            );
+            assert!(!unsafe { pyre_object::w_type_is_heaptype(ty) });
+        }
+    }
 }

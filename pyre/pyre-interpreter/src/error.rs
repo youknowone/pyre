@@ -1954,7 +1954,7 @@ fn exc_object_class_name(exc: PyObjectRef) -> Option<String> {
     }
     crate::typedef::r#type(exc).map(|tp| unsafe {
         let w_type = tp.as_ptr();
-        if !pyre_object::w_type_is_heaptype(w_type) {
+        if !pyre_object::w_type_is_cpython_heaptype(w_type) {
             return pyre_object::w_type_get_name(w_type).to_string();
         }
         let qualname = pyre_object::w_type_get_qualname(w_type).to_string();

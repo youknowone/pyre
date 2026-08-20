@@ -16,7 +16,9 @@ use pyre_object::PyObjectRef;
 /// 16-bit `filter`, 16-bit `flags`, 32-bit `fflags`, signed 64-bit
 /// `data`, and an opaque pointer-sized `udata`.
 #[cfg(all(target_os = "macos", feature = "host_env"))]
-#[crate::pyre_class("select.kevent")]
+// CPython 3.14 Modules/selectmodule.c:select_exec creates
+// kqueue_event_Type_spec as a mutable module heap type.
+#[crate::pyre_class("select.kevent", cpython_mutable)]
 #[derive(Default)]
 pub struct W_Kevent {
     pub ident: u64,

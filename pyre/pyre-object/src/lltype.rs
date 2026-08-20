@@ -248,6 +248,15 @@ pub trait PyreClassPyTypeOf {
     /// verbatim from `#[pyre_class("…", type_id = N)]`.  Consumed by
     /// `#[pyre_methods]` so the impl block doesn't restate it.
     const PYNAME: &'static str;
+    /// CPython 3.14 exposes many module-native types as HEAPTYPE even though
+    /// their PyPy implementation remains a builtin `TypeDef`.  The class
+    /// declaration records that public owner independently of the `PyType`
+    /// storage descriptor.
+    const CPYTHON_HEAPTYPE: bool;
+    /// CPython's IMMUTABLETYPE axis is independent of HEAPTYPE.  Most modern
+    /// extension heap types carry both; a few (for example `_random.Random`)
+    /// are mutable.
+    const CPYTHON_IMMUTABLETYPE: bool;
 }
 
 /// `lltype.malloc(T, flavor='gc')` parity, *untyped* (no `GcType` bound).

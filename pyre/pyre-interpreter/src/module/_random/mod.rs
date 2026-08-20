@@ -131,7 +131,9 @@ impl Random {
     }
 }
 
-#[crate::pyre_class("_random.Random")]
+// CPython 3.14 Modules/_randommodule.c:_random_exec uses
+// PyType_FromModuleAndSpec and does not request IMMUTABLETYPE.
+#[crate::pyre_class("_random.Random", cpython_mutable)]
 #[derive(Default)]
 pub struct W_Random {
     /// PyPy composes `MapdictStorageMixin` into a native-layout object when

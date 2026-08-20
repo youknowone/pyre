@@ -1096,7 +1096,9 @@ pub(crate) fn unpack_half(bits: u16) -> f64 {
 
 /// `interp_struct.py W_Struct` — a compiled struct object holding its
 /// format string and precomputed size.
-#[crate::pyre_class("_struct.Struct")]
+// CPython 3.14 Modules/_struct.c:_struct_exec uses
+// PyType_FromModuleAndSpec; PyStructType carries IMMUTABLETYPE.
+#[crate::pyre_class("_struct.Struct", cpython_heaptype)]
 pub struct W_Struct {
     /// Format string object (`text_or_bytes_w` of the constructor arg),
     /// promoted by value before each pack/unpack.  `_immutable_fields_ =
@@ -1359,7 +1361,8 @@ pub mod unpack_iter {
         crate::baseobjspace::object_getattribute(args[0], name)
     }
 
-    #[crate::pyre_class("_struct.unpack_iterator")]
+    // `_struct_exec` creates unpackiter_type from its immutable heap spec.
+    #[crate::pyre_class("_struct.unpack_iterator", cpython_heaptype)]
     pub struct W_UnpackIter {
         format: PyObjectRef,
         buffer: PyObjectRef,

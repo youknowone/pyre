@@ -114,7 +114,7 @@ impl Drop for NativeMMap {
 /// on the object and the low-level `rmmap.MMap` is owned by that same object.
 /// The mapdict prefix is required because mmap is an acceptable base class.
 #[cfg(any(unix, windows))]
-#[crate::pyre_class("mmap.mmap")]
+#[crate::pyre_class("mmap.mmap", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_MMap {
     pub map: usize,
@@ -246,6 +246,9 @@ pub(crate) fn mmap_type() -> pyre_object::PyObjectRef {
             crate::typedef::w_object(),
             <W_MMap as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
+        // CPython 3.14 Modules/mmapmodule.c:mmap_exec uses
+        // PyType_FromModuleAndSpec; mmap_object_type_spec is immutable.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         pyre_object::pyobject::set_instantiate(
             unsafe { &*<W_MMap as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,

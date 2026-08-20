@@ -12,7 +12,9 @@ use std::time::Instant;
 /// `interp_lsprof.py W_Profiler`.  The entry trees and the context stack
 /// belong to the wrapper object.  The mapdict prefix is required because
 /// `cProfile.Profile` subclasses the type.
-#[crate::pyre_class("_lsprof.Profiler")]
+// CPython 3.14 Modules/_lsprof.c:_lsprof_exec uses
+// PyType_FromModuleAndSpec with IMMUTABLETYPE.
+#[crate::pyre_class("_lsprof.Profiler", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_Profiler {
     pub map: usize,
@@ -43,7 +45,9 @@ const _: () = assert!(
 /// `interp_lsprof.py W_StatsEntry`.  Its typedef publishes no `__new__`, so
 /// no subclass of it can be instantiated and it carries no mapdict prefix; the
 /// two references below are ordinary inline `gc_ptr_offsets` edges.
-#[crate::pyre_class("_lsprof.profiler_entry")]
+// CPython 3.14 Modules/_lsprof.c creates this with PyStructSequence_NewType;
+// the resulting struct-sequence type is a mutable heap type.
+#[crate::pyre_class("_lsprof.profiler_entry", cpython_mutable)]
 pub struct W_StatsEntry {
     frame: PyObjectRef,
     callcount: i64,
@@ -55,7 +59,8 @@ pub struct W_StatsEntry {
 
 /// `interp_lsprof.py W_StatsSubEntry`, likewise not instantiable and
 /// therefore prefix-free.
-#[crate::pyre_class("_lsprof.profiler_subentry")]
+// Same PyStructSequence_NewType mutable heap owner as profiler_entry.
+#[crate::pyre_class("_lsprof.profiler_subentry", cpython_mutable)]
 pub struct W_StatsSubEntry {
     frame: PyObjectRef,
     callcount: i64,

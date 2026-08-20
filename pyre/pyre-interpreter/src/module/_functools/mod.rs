@@ -18,7 +18,9 @@ use pyre_object::*;
 /// mirrors `keyobject.cmp` / `keyobject.object` and, unlike an app-level
 /// function, leaves the module callable descriptor-neutral when a user stores
 /// it on a class.
-#[crate::pyre_class("functools.KeyWrapper")]
+// CPython 3.14 Modules/_functoolsmodule.c:functools_exec creates
+// keyobject_type_spec as an immutable module heap type.
+#[crate::pyre_class("functools.KeyWrapper", cpython_heaptype)]
 pub struct W_KeyWrapper {
     cmp: PyObjectRef,
     object: PyObjectRef,

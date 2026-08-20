@@ -42,7 +42,7 @@ struct ApplevelForkCallbacks {
 /// type — which falls through to the stat.
 /// The layout carries no instance dict; `name`/`path` are read-only getset
 /// descriptors, so the type is not instantiable and not acceptable as a base.
-#[crate::pyre_class("posix.DirEntry")]
+#[crate::pyre_class("posix.DirEntry", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_DirEntry {
     pub w_name: PyObjectRef,
@@ -57,7 +57,7 @@ pub struct W_DirEntry {
 /// Native owner for `posix.ScandirIterator` entries and enumeration state.
 /// PyPy's `interp_scandir.W_ScandirIterator` keeps the equivalent state on
 /// `dirp`; its typedef exposes operations rather than these fields.
-#[crate::pyre_class("posix.ScandirIterator")]
+#[crate::pyre_class("posix.ScandirIterator", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_ScandirIterator {
     pub entries: PyObjectRef,
@@ -5077,6 +5077,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 crate::typedef::w_object(),
                 <W_DirEntry as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
             );
+            // CPython 3.14 Modules/posixmodule.c creates DirEntryType from an
+            // immutable module type spec.
+            crate::typedef::mark_cpython_heap_type(tp, true);
             pyre_object::pyobject::set_instantiate(
                 unsafe { &*<W_DirEntry as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
                 tp,
@@ -5276,6 +5279,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 crate::typedef::w_object(),
                 <W_ScandirIterator as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
             );
+            // CPython 3.14 Modules/posixmodule.c creates ScandirIteratorType
+            // from an immutable module type spec.
+            crate::typedef::mark_cpython_heap_type(tp, true);
             pyre_object::pyobject::set_instantiate(
                 unsafe {
                     &*<W_ScandirIterator as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE

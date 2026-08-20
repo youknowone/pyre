@@ -1219,6 +1219,9 @@ fn io_base_type() -> PyObjectRef {
             init_iobase_type,
             crate::typedef::w_object(),
         );
+        // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
+        // iobase_spec through PyType_FromModuleAndSpec.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);
@@ -1236,6 +1239,8 @@ pub(super) fn raw_iobase_type() -> PyObjectRef {
             init_rawiobase_type,
             io_base_type(),
         );
+        // `_iomodule.c:ADD_TYPE` creates rawiobase_spec as immutable heap.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);
@@ -1265,6 +1270,8 @@ pub(crate) fn fileio_type() -> PyObjectRef {
             },
             raw_iobase_type(),
         );
+        // `_iomodule.c:ADD_TYPE` creates fileio_spec as immutable heap.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);
@@ -1299,6 +1306,8 @@ pub(super) fn buffered_iobase_type() -> PyObjectRef {
             init_buffered_iobase_type,
             io_base_type(),
         );
+        // `_iomodule.c:ADD_TYPE` creates bufferediobase_spec as immutable heap.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);
@@ -1316,6 +1325,8 @@ fn text_iobase_type() -> PyObjectRef {
             init_text_iobase_type,
             io_base_type(),
         );
+        // `_iomodule.c:ADD_TYPE` creates textiobase_spec as immutable heap.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);

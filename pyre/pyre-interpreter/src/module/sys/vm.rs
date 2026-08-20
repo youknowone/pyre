@@ -3577,7 +3577,7 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
             "_clear_type_descriptors() argument must be a type",
         ));
     }
-    if !unsafe { pyre_object::w_type_is_heaptype(w_type) } {
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
         return Err(crate::PyError::type_error("argument is immutable"));
     }
 

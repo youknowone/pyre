@@ -52,7 +52,9 @@ use deque_block::W_DequeBlock;
 /// (append / appendleft / pop / popleft / clear / extend / extendleft /
 /// rotate / count / remove / reverse / index / copy + container and repr
 /// protocols, with `maxlen` bounding).
-#[crate::pyre_class("collections.deque")]
+// CPython 3.14 Modules/_collectionsmodule.c:collections_exec ADD_TYPEs
+// deque_spec through a module heap type; the spec is immutable.
+#[crate::pyre_class("collections.deque", cpython_heaptype)]
 pub struct W_Deque {
     leftblock: PyObjectRef,
     rightblock: PyObjectRef,
@@ -282,7 +284,8 @@ pub mod deque_iter {
     use super::{BLOCKLEN, W_Deque, block, block_get, checklock, getlock};
     use pyre_object::*;
 
-    #[crate::pyre_class("_collections._deque_iterator")]
+    // `collections_exec` ADD_TYPEs dequeiter_spec as an immutable heap type.
+    #[crate::pyre_class("_collections._deque_iterator", cpython_heaptype)]
     pub struct W_DequeIter {
         deque: PyObjectRef,
         block: PyObjectRef,
@@ -409,7 +412,8 @@ pub mod deque_rev_iter {
     use super::{BLOCKLEN, W_Deque, block, block_get, checklock, getlock};
     use pyre_object::*;
 
-    #[crate::pyre_class("_collections._deque_reverse_iterator")]
+    // `collections_exec` ADD_TYPEs dequereviter_spec as an immutable heap type.
+    #[crate::pyre_class("_collections._deque_reverse_iterator", cpython_heaptype)]
     pub struct W_DequeRevIter {
         deque: PyObjectRef,
         block: PyObjectRef,

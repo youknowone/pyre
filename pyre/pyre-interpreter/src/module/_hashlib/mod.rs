@@ -78,7 +78,9 @@ impl HashStateStorage {
 /// The fixed-size native digest context embedded directly in its Python
 /// owner. CPython stores an `EVP_MD_CTX *` on `EVPobject`; this inline opaque
 /// buffer is pyre-native's allocation-free equivalent.
-#[crate::pyre_class("_hashlib.HASH")]
+// CPython 3.14 Modules/_hashopenssl.c creates HASH from a heap type spec;
+// HASH_spec carries IMMUTABLETYPE.
+#[crate::pyre_class("_hashlib.HASH", cpython_heaptype)]
 pub struct W_HashState {
     name: PyObjectRef,
     digest_size: i64,
@@ -324,7 +326,7 @@ mod hash_state_class {
 fn hash_xof_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
-        crate::typedef::make_builtin_type_with_layout(
+        let tp = crate::typedef::make_builtin_type_with_layout(
             "_hashlib.HASHXOF",
             |ns| unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -339,7 +341,11 @@ fn hash_xof_type() -> PyObjectRef {
             },
             hash_state_class::type_object(),
             <W_HashState as crate::PyreClassPyTypeOf>::PYTYPE,
-        ) as usize
+        );
+        // CPython 3.14 Modules/_hashopenssl.c creates HASHXOF from the same
+        // immutable module heap family as HASH.
+        crate::typedef::mark_cpython_heap_type(tp, true);
+        tp as usize
     }) as PyObjectRef
 }
 
@@ -409,7 +415,8 @@ impl HmacStateStorage {
     }
 }
 
-#[crate::pyre_class("_hashlib.HMAC")]
+// CPython 3.14 `_hashlib.HMAC` is the same immutable heap-spec family.
+#[crate::pyre_class("_hashlib.HMAC", cpython_heaptype)]
 pub struct W_Hmac {
     name: PyObjectRef,
     digest_size: i64,

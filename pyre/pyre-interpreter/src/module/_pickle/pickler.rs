@@ -71,7 +71,9 @@ fn pickler_write_barrier(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-#[crate::pyre_class("_pickle.Pickler")]
+// CPython 3.14 Modules/_pickle.c:pickle_exec CREATE_TYPEs pickler_type_spec;
+// the spec is an immutable heap type.
+#[crate::pyre_class("_pickle.Pickler", cpython_heaptype)]
 pub struct W_Pickler {
     /// Output file (has a `write` method).
     w_file: PyObjectRef,
@@ -877,7 +879,8 @@ pub use memo_proxy::PicklerMemoProxy;
 mod memo_proxy {
     use super::*;
 
-    #[crate::pyre_class("_pickle.PicklerMemoProxy")]
+    // Modules/_pickle.c:pickle_exec CREATE_TYPEs memoproxy_spec too.
+    #[crate::pyre_class("_pickle.PicklerMemoProxy", cpython_heaptype)]
     pub struct PicklerMemoProxy {
         pub(super) w_pickler: PyObjectRef,
     }

@@ -11,7 +11,9 @@ use pyre_object::PyObjectRef;
 /// Instances are created only through the module-level `select.poll()`
 /// factory (`interp_select.py:18`); the type has no public constructor.
 #[cfg(all(unix, feature = "host_env"))]
-#[crate::pyre_class("select.poll")]
+// CPython 3.14 Modules/selectmodule.c:select_exec uses
+// PyType_FromModuleAndSpec; poll_Type_spec is a mutable heap type.
+#[crate::pyre_class("select.poll", cpython_mutable)]
 #[derive(Default)]
 pub struct Poll {
     fddict: std::collections::HashMap<i32, i16>,

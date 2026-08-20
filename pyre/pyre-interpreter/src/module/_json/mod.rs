@@ -616,7 +616,9 @@ fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyR
     ]))
 }
 
-#[crate::pyre_class("_json.Scanner")]
+// CPython 3.14 Modules/_json.c:PyInit__json uses PyType_FromSpec;
+// PyScannerType_spec is mutable.
+#[crate::pyre_class("_json.Scanner", cpython_mutable)]
 pub struct W_Scanner {
     strict: bool,
     parse_float: PyObjectRef,
@@ -662,7 +664,8 @@ mod scanner_class {
     }
 }
 
-#[crate::pyre_class("_json.Encoder")]
+// CPython 3.14 Modules/_json.c:PyInit__json creates the mutable encoder spec.
+#[crate::pyre_class("_json.Encoder", cpython_mutable)]
 pub struct W_Encoder {
     markers: PyObjectRef,
     default: PyObjectRef,

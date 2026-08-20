@@ -4,7 +4,9 @@ use pyre_object::*;
 
 const AT_END: i64 = -1;
 
-#[crate::pyre_class("_io.BytesIO")]
+// CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
+// BytesIO heap spec.
+#[crate::pyre_class("_io.BytesIO", cpython_heaptype)]
 pub struct W_BytesIO {
     // rpython/rlib/rStringIO.py:16-23 splits immutable strings between an
     // append-optimized builder and a mutable character list. A bytearray is
