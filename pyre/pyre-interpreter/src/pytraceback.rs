@@ -139,43 +139,23 @@ pub fn w_pytraceback_new(
     lineno: i64,
     w_code: PyObjectRef,
 ) -> PyObjectRef {
-    let _roots = pyre_object::gc_roots::push_roots();
-    pyre_object::gc_roots::pin_root(w_next);
-    pyre_object::gc_roots::pin_root(w_code);
+    // `frame` is pinned alongside the two managed fields, because the
+    // allocation below can safepoint and a raw `*mut PyFrame` held only in
+    // this function's locals is reachable from no root walker.  Most frames
+    // are allocated non-moving (`FrameBox::new`), which is what lets raw
+    // copies exist elsewhere at all — `FrameBox::deref` reads its raw field
+    // while holding a forwarding-capable `owner_root` it never reads back,
+    // `eval_loop` runs behind a `&mut PyFrame` across a safepoint, and the
+    // blackhole keeps the virtualizable as a bare integer.  It is not every
+    // frame: a compiled trace's inlined-callee frame is a nursery
+    // allocation, so a minor collection triggered by this very allocation
+    // recycles it and any slot built from a pre-allocation copy names freed
+    // bytes for the rest of the node's life.  Upstream needs no bracket
+    // here — a minor relocates the frame and rewrites the slot
+    // (`incminimark.py:2237` / `:2252`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef]);
 
-    let value = PyTraceback {
-        ob_header: PyObject {
-            ob_type: &PYTRACEBACK_TYPE as *const PyType,
-            w_class: get_instantiate(&PYTRACEBACK_TYPE),
-        },
-        frame,
-        lasti,
-        w_next,
-        lineno,
-        w_code,
-    };
-
-    // The rule below cannot be spelled as a `debug_assert!` here: this crate
-    // is extracted to LLBC, so an assertion lands in the JIT's view of this
-    // function and its probe becomes a real call on every traceback the
-    // traced code builds — measurably, on the `getattr_*` gates.  It stays a
-    // stated obligation.
-    //
-    // `frame` was copied into `value` above and is not among the roots
-    // pinned here, so the allocation below — which can safepoint — must
-    // not be able to move it.  Upstream has no such rule: a minor
-    // collection would relocate the frame and rewrite the slot
-    // (`incminimark.py:2237` / `:2252`).  Pyre cannot, because raw
-    // `*mut PyFrame` copies exist that no root walker reaches —
-    // `FrameBox::deref` reads its raw field while holding a
-    // forwarding-capable `owner_root` it never reads back, `eval_loop`
-    // runs behind a `&mut PyFrame` across a safepoint, and the
-    // blackhole keeps the virtualizable as a bare integer.  Frames are
-    // therefore allocated non-moving (`FrameBox::new`), and callers of
-    // `record_application_traceback` owe this function a frame that
-    // stays reachable across the allocation: on the `CURRENT_FRAME` /
-    // `f_backref` chain, or pinned by hand.
-    //
     // This host-side constructor allocates the traceback itself into oldgen:
     // its Rust caller can hold the returned pointer outside a translated
     // GC-map slot before publishing it. JIT-emitted traceback nodes do not
@@ -189,18 +169,41 @@ pub fn w_pytraceback_new(
         PYTRACEBACK_OBJECT_SIZE,
     );
     if !raw.is_null() {
-        let ptr = raw as *mut PyTraceback;
-        unsafe {
-            std::ptr::write(ptr, value);
-        }
-        // The oldgen traceback references the freshly-born `w_next` /
-        // `w_code` (and, once GC-owned, the frame); remember it for the
-        // next minor tracer.
-        pyre_object::gc_hook::try_gc_write_barrier(raw);
-        return ptr as PyObjectRef;
+        // The fresh block is a root before `get_instantiate` below can enter
+        // an allocation of its own, matching `FrameBox::new`'s pin of its own
+        // result.  The block is non-moving, so `raw` stays the address.
+        pyre_object::gc_roots::pin_root(raw as PyObjectRef);
     }
 
-    pyre_object::lltype::malloc_typed(value) as PyObjectRef
+    // Every input is read back through the bracket's own cell rather than
+    // reused from the argument: the allocation above may have moved any of
+    // them.  Before the GC hook is wired nothing moves and each read answers
+    // the address it was given.
+    let value = PyTraceback {
+        ob_header: PyObject {
+            ob_type: &PYTRACEBACK_TYPE as *const PyType,
+            w_class: get_instantiate(&PYTRACEBACK_TYPE),
+        },
+        frame: roots.get(inputs + 2) as *mut crate::pyframe::PyFrame,
+        lasti,
+        w_next: roots.get(inputs),
+        lineno,
+        w_code: roots.get(inputs + 1),
+    };
+
+    if raw.is_null() {
+        return pyre_object::lltype::malloc_typed(value) as PyObjectRef;
+    }
+
+    let ptr = raw as *mut PyTraceback;
+    unsafe {
+        std::ptr::write(ptr, value);
+    }
+    // The oldgen traceback references the freshly-born `w_next` /
+    // `w_code` (and, once GC-owned, the frame); remember it for the
+    // next minor tracer.
+    pyre_object::gc_hook::try_gc_write_barrier(raw);
+    ptr as PyObjectRef
 }
 
 /// # Safety
