@@ -5141,7 +5141,7 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         return None;
     };
 
-    let mut back_edge_end: Option<usize> = None;
+    let mut back_edges: Vec<(usize, usize)> = Vec::new();
     let mut abort_permanent_pcs: Vec<usize> = Vec::new();
     for op in crate::jitcode_runtime::decoded_ops(code).filter(|op| op.pc > merge_point) {
         if op.opname == "abort_permanent" {
@@ -5150,10 +5150,31 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
             let target = u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
             if target <= merge_point {
-                back_edge_end = Some(back_edge_end.map_or(op.pc, |end| end.max(op.pc)));
+                back_edges.push((target, op.pc));
             }
         }
     }
+
+    // A backward goto closes the loop headed at `merge_point` only when it
+    // jumps to that header.  One that jumps further back closes an ENCLOSING
+    // loop, and letting it set the end here stretches this loop's body across
+    // the enclosing one: for a loop nested inside a yield-bearing loop that
+    // sweeps the `YIELD_VALUE` marker in and declines a body that never goes
+    // near it.  Take the nearest header first, then its last back edge, so a
+    // `continue` earlier in the body cannot truncate the region either.  With
+    // no candidate at all the region stays open to the end of the code, the
+    // conservative direction.
+    let back_edge_end = back_edges
+        .iter()
+        .map(|&(target, _)| target)
+        .max()
+        .and_then(|nearest| {
+            back_edges
+                .iter()
+                .filter(|&&(target, _)| target == nearest)
+                .map(|&(_, pc)| pc)
+                .max()
+        });
 
     // `start_pc` is a code-unit index; the exception table lookup takes byte offsets (×2).
     let loop_handler = unsafe {
