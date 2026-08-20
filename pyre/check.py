@@ -936,10 +936,16 @@ def _jit_panic_reason(stderr):
                 # actionable detail (e.g. a GC 'invalid type_id ... site=...'
                 # diagnostic); the location line alone is not enough to triage
                 # a flaky crash from CI logs, so append the first message line.
+                #
+                # The width has to reach `site=`, which the GC prints last. At
+                # 200 the varsize-length diagnostic was cut mid-`nursery_start`,
+                # dropping both `forwarded=` and `site=` — the two fields that
+                # name which path reached the object — and leaving a CI-only
+                # crash with no way to attribute it.
                 for follow in lines[idx + 1 :]:
                     follow = follow.strip()
                     if follow:
-                        reason += f" | {follow[:200]}"
+                        reason += f" | {follow[:400]}"
                         break
                 return reason
         return "rust panic"
