@@ -26,10 +26,26 @@ fn capsule_type() -> PyObjectRef {
     not(feature = "sandbox"),
     any(target_os = "macos", target_os = "linux")
 )))]
+/// The build carries no capsules at all, so the name answers with a type that
+/// can produce none: `PyCapsule_Type` has no `tp_new` and no
+/// `Py_TPFLAGS_BASETYPE`, and a capsule only ever comes from `PyCapsule_New`.
 fn capsule_type() -> PyObjectRef {
     static CAPSULE_TYPE: OnceLock<usize> = OnceLock::new();
-    *CAPSULE_TYPE.get_or_init(|| crate::typedef::make_builtin_type("PyCapsule", |_| {}) as usize)
-        as PyObjectRef
+    *CAPSULE_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("PyCapsule", |ns| unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__new__",
+                crate::typedef::make_new_descr(|_| {
+                    Err(crate::PyError::type_error(
+                        "cannot create 'PyCapsule' instances",
+                    ))
+                }),
+            );
+        });
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
+        tp as usize
+    }) as PyObjectRef
 }
 
 pub fn init(ns: PyObjectRef) {

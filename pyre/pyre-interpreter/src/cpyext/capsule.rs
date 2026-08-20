@@ -30,8 +30,22 @@ pub(crate) fn capsule_type() -> PyObjectRef {
                 "__repr__",
                 crate::make_builtin_function_with_arity("__repr__", capsule_repr, 1),
             );
+            // `PyCapsule_Type` carries no `tp_new`: every capsule comes from
+            // `PyCapsule_New`, which allocates the carrier directly.
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                "__new__",
+                crate::typedef::make_new_descr(|_| {
+                    Err(crate::PyError::type_error(
+                        "cannot create 'PyCapsule' instances",
+                    ))
+                }),
+            );
         });
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        // No `Py_TPFLAGS_BASETYPE` either -- a subclass would carry the name
+        // without the payload `is_capsule` reads.
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
         tp as usize
     }) as PyObjectRef
 }
