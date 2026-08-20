@@ -114,18 +114,24 @@ jobs:
       run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm
     - name: Build the cranelift backend
       id: build-cranelift
-      # Carries the same schedule predicate as the lane that uses it. The daily
+      # Carries the same schedule predicate as the lane that uses it: the daily
       # run never invokes this binary, so building it there spends the time for
-      # nothing -- and a step that fails skips every later step which does not
-      # say otherwise, so a cranelift-only break would take the daily dynasm
-      # lane with it and leave the night with no report at all.
-      if: ${{ github.event.schedule != '0 7 * * *' }}
+      # nothing.
+      #
+      # `!cancelled()` for the same reason the lanes carry it. The two backends
+      # share the sources but not the feature set, so one can break while the
+      # other builds -- and under the implicit `success()` a dynasm-only break
+      # skipped this build, which skipped the cranelift lane after it, costing
+      # the night a backend report it could have had. What it gives up is that
+      # a failed step in the setup above no longer stops this build from
+      # starting; it fails on its own, on a run that was already red.
+      if: ${{ !cancelled() && github.event.schedule != '0 7 * * *' }}
       run: cargo build --release -p pyrex --bin pyre-cranelift --no-default-features --features cranelift
-    # Every lane names the build it needs and nothing else, so none of them
-    # depends on where the other builds and lanes sit in the list. The implicit
-    # `success()` this replaces did depend on it: it skipped this lane, the one
-    # that runs every night, whenever the cranelift build above it failed --
-    # even though the binary this lane runs had built fine.
+    # Each lane names the build whose binary it runs and nothing else, so no
+    # lane depends on where the other builds and lanes sit in the list. The
+    # implicit `success()` this replaces did depend on it: it skipped this
+    # lane, the one that runs every night, whenever the cranelift build above
+    # it failed -- even though the binary this lane runs had built fine.
     - name: dynasm (JIT on)
       if: ${{ !cancelled() && steps.build-dynasm.outcome == 'success' }}
       run: ${{ steps.cpython.outputs.python-path }} pyre/cpython_tests/run.py --full --backend dynasm --jobs 3 --timeout 300 --report reports/dynasm-jit.json
