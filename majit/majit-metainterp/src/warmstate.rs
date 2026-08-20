@@ -903,6 +903,7 @@ impl WarmEnterState {
             // A latched cell that is ALSO dead takes the cleanup path instead:
             // leaving it in the chain is the same starvation in another form.
             if !dead_token && abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
                 return HotResult::NotHot;
             }
             if self.should_start_dont_trace_here_trace(cell_key, flags, has_seen_a_procedure_token)
@@ -1018,6 +1019,7 @@ impl WarmEnterState {
             // A latched cell that is ALSO dead takes the cleanup path instead:
             // leaving it in the chain is the same starvation in another form.
             if !dead_token && abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
                 return HotResult::NotHot;
             }
             if self.should_start_dont_trace_here_trace(hash, flags, has_seen_a_procedure_token) {
@@ -4222,6 +4224,65 @@ mod tests {
         // DONT_TRACE_HERE flag should be cleared
         let cell = ws.get_cell(key).unwrap();
         assert!(cell.flags & jc_flags::DONT_TRACE_HERE == 0);
+    }
+
+    /// `warmstate.py:425-444 bound_reached` traces unconditionally once
+    /// entered, and its first act is `jitcounter.decay_all_counters()`
+    /// (`warmstate.py:429`), so upstream never pays a decay for a trace that
+    /// then refuses to start. A cell latched by `MAX_TRACE_ABORT_COUNT` must
+    /// therefore be turned down at the decision, not several frames down in
+    /// `force_start_tracing*` — otherwise every back edge over a location that
+    /// can never trace again decays every OTHER location's counter.
+    ///
+    /// `StartTracing` here is the defect: it is the answer that sends the
+    /// caller into `bound_reached`.
+    #[test]
+    fn a_ceiling_latched_cell_is_turned_down_at_the_decision() {
+        // Each door is driven through itself: a cell installed by the hash door
+        // carries no `comparekey`, so the typed door would never find it.
+        for use_typed_key in [false, true] {
+            let mut ws = WarmEnterState::new(2);
+            let green = GreenKey::new(vec![0xCE, 0x11]);
+            let key = green.get_uhash();
+            let mut ask = |ws: &mut WarmEnterState| {
+                if use_typed_key {
+                    ws.maybe_compile_with_key(&green)
+                } else {
+                    ws.maybe_compile(key)
+                }
+            };
+
+            // Latch the ceiling: every attempt aborts without
+            // disable_noninlinable_function.
+            for _ in 0..MAX_TRACE_ABORT_COUNT {
+                let mut started = false;
+                for _ in 0..64 {
+                    match ask(&mut ws) {
+                        HotResult::StartTracing => {
+                            started = true;
+                            break;
+                        }
+                        HotResult::NotHot => {}
+                        _ => panic!("the door answered for a live token"),
+                    }
+                }
+                assert!(started, "the location never became hot");
+                if use_typed_key {
+                    ws.abort_tracing_for_key(&green, false);
+                } else {
+                    ws.abort_tracing(key, false);
+                }
+            }
+
+            // From here the decision must never send the caller into
+            // `bound_reached`, however many back edges arrive.
+            for _ in 0..64 {
+                assert!(
+                    matches!(ask(&mut ws), HotResult::NotHot),
+                    "a ceiling-latched cell reached bound_reached (typed={use_typed_key})",
+                );
+            }
+        }
     }
 
     #[test]
