@@ -2055,6 +2055,16 @@ impl WarmEnterState {
                 }
                 return false;
             }
+            // The function-entry door owns the same decision the back-edge
+            // doors do, and its caller runs `decay_all_counters()`
+            // (`warmstate.py:429`) on the way to `force_start_tracing*`. So the
+            // ceiling answers here too, or a latched location decays every
+            // OTHER location's counter once per function entry. See
+            // [`Self::maybe_compile_decision`].
+            if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
+                return false;
+            }
             if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
                 if cell.has_seen_a_procedure_token() {
                     // A live TEMPORARY token still declines; a token that was
@@ -4280,6 +4290,19 @@ mod tests {
                 assert!(
                     matches!(ask(&mut ws), HotResult::NotHot),
                     "a ceiling-latched cell reached bound_reached (typed={use_typed_key})",
+                );
+            }
+
+            // The function-entry door decides for the same cell and its caller
+            // decays on the way to the tracer, so it answers the same way. Its
+            // own threshold has to be low enough that the counter underneath
+            // would fire, or a `false` here proves nothing.
+            ws.set_function_threshold(2);
+            for _ in 0..64 {
+                assert!(
+                    !ws.should_trace_function_entry(key),
+                    "a ceiling-latched cell reached bound_reached through the \
+                     function-entry door (typed={use_typed_key})",
                 );
             }
         }
