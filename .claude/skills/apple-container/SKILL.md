@@ -170,11 +170,11 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
   different target does not work, the path is baked into the `.git` file. This
   is not a `safe.directory` problem; that error is a different one and needs the
   `git config` calls above as well.
-- **A Linux red is not automatically the branch's.** Check main's own CI at your
-  merge-base first. The `CPython suite (gate)` job has been red on main by
-  construction since it moved to ubuntu while `pyre/check.py`'s
-  `CPYTHON_SUITE_BASELINE_HOST` stayed darwin-arm64 — diff your branch's row
-  list against main's before attributing anything.
+- **A Linux red is not automatically the branch's.** Check main's own CI at
+  your merge-base first, and diff your branch's row list against main's before
+  attributing anything. The suite gate rides `cargo-test-linux` on
+  `ubuntu-24.04`, which is also where the baseline's verdicts are enforced, so
+  a row the container disagrees about is a finding rather than a known skew.
 - **`target-linux/` must not be committed.** Confirm it is ignored before
   building, or the worktree fills with Linux objects.
 - **Timing measured in the container is not a measurement.** It is a VM sharing
@@ -182,4 +182,15 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
   crashes, assertions, and wrong answers — never to judge a perf ratio.
 - **The container sees your uncommitted edits**, because the worktree is
   bind-mounted. That is the point, but it also means a rebase or a sibling
-  session's edit changes what the container is building mid-run.
+  session's edit changes what the container is building mid-run. It cuts the
+  other way too: `source=` is a hash of the tree, so editing anything after an
+  extraction marks the artefacts stale — do the extract last and leave the tree
+  alone until whatever you are measuring has finished.
+- **The container's extraction overwrites the host's `build/llbc`.** The
+  driver's `out_dir` is a fixed `<repo-root>/build/llbc` with no override, and
+  the worktree is bind-mounted, so `extract-llbc.py` inside the container
+  replaces the artefacts your macOS build reads. Budget a full host re-extract
+  (~25 min) before building on the host again. Every field the freshness check
+  compares is computed from the tracked tree and so agrees across hosts;
+  `platform=` is the one that does not, and `fail_if_llbc_stale` now refuses on
+  it rather than letting the build fail somewhere downstream.
