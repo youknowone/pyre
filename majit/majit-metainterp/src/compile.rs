@@ -1747,11 +1747,11 @@ pub(crate) fn normalize_closing_jump_args(
     constants: &majit_ir::ConstMap<majit_ir::Value>,
     num_inputs: usize,
 ) -> Vec<majit_ir::OpRc> {
-    let Some(label_args) = ops
+    let Some((label_args, label_descr_index)) = ops
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label)
-        .map(|op| op.getarglist())
+        .map(|op| (op.getarglist(), op.getdescr().map(|descr| descr.index())))
     else {
         return ops;
     };
@@ -1765,6 +1765,20 @@ pub(crate) fn normalize_closing_jump_args(
     let Some(jump) = ops.iter().rfind(|op| op.opcode == OpCode::Jump) else {
         return ops;
     };
+
+    // The substitution below is positional — jump slot `idx` is repaired from
+    // label slot `idx` — so it holds only while the JUMP closes onto THIS
+    // LABEL. `compile_retrace` also reaches here with a JUMP retargeted at
+    // another TargetToken (`unroll.py:156/171 jump_to_preamble`), and that
+    // JUMP already carries the argument order the target token's virtual
+    // state produced (`unroll.py:346-357`, which
+    // `assemble_peeled_trace_with_jump_args` passes through untouched for
+    // exactly this reason). Slot `idx` then names a different live value in
+    // each list, and rewriting it lands the trailing label's value in an
+    // unrelated target slot.
+    if jump.getdescr().map(|descr| descr.index()) != label_descr_index {
+        return ops;
+    }
 
     // optimizer.py:651-652 setarg loop parity.
     for idx in 0..jump.num_args() {
@@ -2713,6 +2727,61 @@ mod tests {
     use crate::history::test_support::rooted_inputarg_operand;
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRef};
+
+    /// `normalize_closing_jump_args` repairs a JUMP slot from the LABEL slot
+    /// at the same index, which only names the same live value while the JUMP
+    /// closes onto that LABEL. `compile_retrace` also feeds it a trace whose
+    /// JUMP was retargeted at another TargetToken, and there the two lists are
+    /// ordered by two different virtual states.
+    #[test]
+    fn closing_jump_to_a_foreign_target_token_keeps_its_own_args() {
+        use crate::history::test_support::rooted_resop_operand;
+        use majit_ir::OpRc;
+
+        let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let build = |label_descr_index: u64, jump_descr_index: u64| {
+            let mut label = Op::new(
+                OpCode::Label,
+                &[
+                    rooted_resop_operand(Type::Ref, 20),
+                    rooted_resop_operand(Type::Ref, 21),
+                    rooted_resop_operand(Type::Ref, 22),
+                ],
+            );
+            label.setdescr(majit_ir::make_loop_target_descr(label_descr_index, false));
+            let mut jump = Op::new(
+                OpCode::Jump,
+                &[
+                    rooted_resop_operand(Type::Ref, 50),
+                    rooted_resop_operand(Type::Ref, 51),
+                    rooted_resop_operand(Type::Ref, 52),
+                ],
+            );
+            jump.setdescr(majit_ir::make_loop_target_descr(jump_descr_index, false));
+            vec![OpRc::new(label), OpRc::new(jump)]
+        };
+        let jump_args = |ops: &[OpRc]| -> Vec<OpRef> {
+            ops.iter()
+                .rfind(|op| op.opcode == OpCode::Jump)
+                .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+                .unwrap()
+        };
+
+        // Same token: the JUMP feeds this LABEL slot for slot, so an arg with
+        // no definition in the trace is repaired from it.
+        let same = normalize_closing_jump_args(build(2, 2), &constants, 8);
+        assert_eq!(
+            jump_args(&same),
+            vec![OpRef::ref_op(20), OpRef::ref_op(21), OpRef::ref_op(22)]
+        );
+
+        // Foreign token: the JUMP already carries that token's argument order.
+        let foreign = normalize_closing_jump_args(build(2, 1), &constants, 8);
+        assert_eq!(
+            jump_args(&foreign),
+            vec![OpRef::ref_op(50), OpRef::ref_op(51), OpRef::ref_op(52)]
+        );
+    }
 
     /// The deadframe rooting in `handle_fail` reaches the layout, not the
     /// descr it came from, so the layout answers from its own types.  A
