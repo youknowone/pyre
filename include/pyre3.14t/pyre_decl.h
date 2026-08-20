@@ -133,9 +133,12 @@ PyAPI_FUNC(int) PyFloat_CheckExact(PyObject *);
 PyAPI_FUNC(PyObject *) PyFloat_FromDouble(double);
 
 /* cpyext/funcobject.rs */
+PyAPI_FUNC(PyCodeObject *) PyCode_NewEmpty(const char *, const char *, int);
 PyAPI_FUNC(PyObject *) PyMethod_Function(PyObject *);
 PyAPI_FUNC(PyObject *) PyMethod_New(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyMethod_Self(PyObject *);
+PyAPI_FUNC(PyCodeObject *) PyUnstable_Code_New(int, int, int, int, int, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, int, PyObject *, PyObject *);
+PyAPI_FUNC(PyCodeObject *) PyUnstable_Code_NewWithPosOnlyArgs(int, int, int, int, int, int, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, int, PyObject *, PyObject *);
 
 /* cpyext/gc.rs */
 PyAPI_FUNC(void) PyObject_GC_Track(void *);

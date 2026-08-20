@@ -19,6 +19,12 @@ extern "C" {
 
 #define PyObject_GC_Del(ob) PyObject_Del(ob)
 
+/* Whether the collector tracks instances of a type.  A type this runtime
+   defines does not set the flag, so this answers no for one, which is what
+   decides whether an extension routes an object through `PyObject_GC_Track`
+   and `PyObject_GC_UnTrack`. */
+#define PyType_IS_GC(t) PyType_HasFeature((t), Py_TPFLAGS_HAVE_GC)
+
 /* The body of a `tp_traverse`: report one field, and stop at the first
    visitor that answers non-zero.  `visit` and `arg` are the names
    `traverseproc` gives its own parameters, which is what lets the macro read

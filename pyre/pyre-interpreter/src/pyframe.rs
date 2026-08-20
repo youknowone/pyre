@@ -1900,6 +1900,20 @@ pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_glob
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
 pub const PYFRAME_LOCALS_OFFSET: usize = PYFRAME_LOCALS_CELLS_STACK_OFFSET;
 
+/// Whether a line table records no position for any instruction.
+///
+/// A `None`-kind entry is the spelling for "this instruction has no line",
+/// which `co_positions()` reports as `None`; every other kind carries one,
+/// `NoColumns` included, which drops the columns and keeps the line.  A
+/// `None` entry has no payload, so a table made only of them can be walked a
+/// byte at a time and any other kind ends the walk at its first byte.
+fn linetable_records_no_position(linetable: &[u8]) -> bool {
+    linetable.iter().all(|&byte| {
+        byte & 0x80 != 0
+            && (byte >> 3) & 0x0f == crate::bytecode::PyCodeLocationInfoKind::None as u8
+    })
+}
+
 /// pytraceback.py offset2lineno(c, stopat) — convert instruction index to line number.
 /// Matches RPython: negative `stopat` means "frame not yet started", returns
 /// first-line.
@@ -4130,16 +4144,13 @@ impl PyFrame {
     /// pyframe.py get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
-        // A malformed replacement linetable is decoded by the compiler-core
-        // marshal reader as repeated zero-width positions on the first line.
-        // CPython reports ``frame.f_lineno is None`` for that table rather
-        // than manufacturing the code object's first line number.
-        let locations = crate::pycode::code_locations(self.code());
-        if !locations.is_empty()
-            && locations.iter().all(|(start, end)| {
-                start.character_offset.get() == 1 && end.character_offset.get() == 1
-            })
-        {
+        // A line table that records no position at all reports ``f_lineno is
+        // None`` rather than the code object's first line number.  The decoded
+        // `locations` cannot answer this: a `SourceLocation` always carries a
+        // line, so an entry that records none is padded out to the same value
+        // an entry that records a line without columns produces.  The raw
+        // table separates them.
+        if linetable_records_no_position(&self.code().linetable) {
             return -1;
         }
         // CPython exposes ``None`` when a code object's line table has no
