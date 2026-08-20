@@ -31201,6 +31201,137 @@ mod tests {
     }
 
     #[test]
+    fn type_flags_publish_cpython_314_basetype_from_the_canonical_field() {
+        crate::typedef::init_typeobjects();
+        const BASETYPE: i64 = 1 << 10;
+        let cases = [
+            ("object", crate::typedef::w_object(), true),
+            ("type", crate::typedef::w_type(), true),
+            (
+                "int",
+                crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
+                true,
+            ),
+            (
+                "str",
+                crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
+                true,
+            ),
+            (
+                "bytes",
+                crate::typedef::gettypeobject(&pyre_object::BYTES_TYPE),
+                true,
+            ),
+            (
+                "bytearray",
+                crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
+                true,
+            ),
+            (
+                "tuple",
+                crate::typedef::gettypeobject(&pyre_object::TUPLE_TYPE),
+                true,
+            ),
+            (
+                "list",
+                crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
+                true,
+            ),
+            (
+                "dict",
+                crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+                true,
+            ),
+            (
+                "set",
+                crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE),
+                true,
+            ),
+            (
+                "property",
+                crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE),
+                true,
+            ),
+            (
+                "classmethod",
+                crate::typedef::gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE),
+                true,
+            ),
+            (
+                "staticmethod",
+                crate::typedef::gettypeobject(&pyre_object::function::STATICMETHOD_TYPE),
+                true,
+            ),
+            (
+                "super",
+                crate::typedef::gettypeobject(&pyre_object::descriptor::SUPER_TYPE),
+                true,
+            ),
+            (
+                "types.GenericAlias",
+                crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE),
+                true,
+            ),
+            (
+                "bool",
+                crate::typedef::gettypeobject(&pyre_object::BOOL_TYPE),
+                false,
+            ),
+            (
+                "mappingproxy",
+                crate::typedef::gettypeobject(&pyre_object::MAPPING_PROXY_TYPE),
+                false,
+            ),
+            (
+                "function",
+                crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
+                false,
+            ),
+            (
+                "code",
+                crate::typedef::gettypeobject(&crate::pycode::CODE_TYPE),
+                false,
+            ),
+            (
+                "dict_keys",
+                crate::typedef::gettypeobject(&pyre_object::dictmultiobject::DICT_KEYS_TYPE),
+                false,
+            ),
+            (
+                "slice",
+                crate::typedef::gettypeobject(&pyre_object::SLICE_TYPE),
+                false,
+            ),
+            (
+                "typing.Union",
+                crate::typedef::gettypeobject(&pyre_object::UNION_TYPE),
+                false,
+            ),
+            (
+                "range",
+                crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE),
+                false,
+            ),
+            (
+                "memoryview",
+                crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
+                false,
+            ),
+        ];
+        for (name, w_type, expected) in cases {
+            let w_flags = crate::baseobjspace::getattr_str(w_type, "__flags__")
+                .unwrap_or_else(|err| panic!("{name}.__flags__ lookup failed: {err:?}"));
+            let flags = unsafe { pyre_object::w_int_get_value(w_flags) };
+            assert_eq!(flags & BASETYPE != 0, expected, "{name}.__flags__");
+            assert_eq!(
+                unsafe { pyre_object::w_type_get_acceptable_as_base_class(w_type) },
+                expected,
+                "{name}.acceptable_as_base_class"
+            );
+        }
+    }
+
+    #[test]
     fn test_ellipsis_has_registered_typeobject() {
         crate::typedef::init_typeobjects();
         let w_type = crate::typedef::r#type(pyre_object::special::w_ellipsis())

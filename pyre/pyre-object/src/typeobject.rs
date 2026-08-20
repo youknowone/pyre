@@ -1336,6 +1336,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     const HEAPTYPE: i64 = 1 << 9; // copy_reg._HEAPTYPE
     const IMMUTABLETYPE: i64 = 1 << 8;
     const DISALLOW_INSTANTIATION: i64 = 1 << 7;
+    const BASETYPE: i64 = 1 << 10;
     const ABSTRACT: i64 = 1 << 20;
     const HAVE_GC: i64 = 1 << 14;
     const PATMA_SEQUENCE: i64 = 1 << 5;
@@ -1374,6 +1375,16 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         // Preserve that field-by-field shape while exposing the canonical
         // flag that pyre's `type.__call__` already enforces.
         flags |= DISALLOW_INSTANTIATION;
+    }
+    if w_type_get_acceptable_as_base_class(obj) {
+        // [3.14-spec] CPython v3.14.6 `Include/object.h:549` assigns bit 10
+        // to `Py_TPFLAGS_BASETYPE`, and `Objects/typeobject.c:3638` uses that
+        // same bit to accept or reject a base class. PyPy
+        // `typeobject.py:990-1004` omits it from the public subset while
+        // `typeobject.py:1116-1118` enforces the canonical
+        // `layout.typedef.acceptable_as_base_class` value. Keep PyPy's
+        // field-by-field shape and publish that existing value.
+        flags |= BASETYPE;
     }
     if t.flag_have_gc {
         // [3.14-spec] CPython v3.14.6 exposes the complete `tp_flags` word
