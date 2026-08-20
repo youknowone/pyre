@@ -1213,7 +1213,15 @@ crate::py_module! {
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
             run_finalizers_now();
-            Ok(w_none())
+            // The generation is bound and ignored, but the return value is a
+            // spec axis, and there the caller-observable answer is an int
+            // engineered the way upstream would.  `interp_gc.py:48` still
+            // carries the `return space.newint(0)` that closed `collect` until
+            // `_run_finalizers` was split out of it (`b5632df5b6e0`) and
+            // neither caller of the helper reads its result: the constant is
+            // upstream's own answer for a collector that never counts
+            // unreachable objects.
+            Ok(w_int_new(0))
         }
 
         fn collect_step() -> Result<PyObjectRef, crate::PyError> {

@@ -10,16 +10,16 @@ class Index:
 
 
 # The generation argument is bound and integer-unwrapped, and every value is
-# accepted -- `interp_gc.py:7-26 collect` ignores it.  What that argument then
-# means, and what `collect` answers, is where pyre follows pypy rather than the
-# reference; `bench/synth/gc_pypy_frontend.py` pins both against the pypy
-# oracle.  This file asserts only what every implementation agrees on.
-gc.collect()
-gc.collect(0)
-gc.collect(2)
-gc.collect(generation=2)
-gc.collect(True)
-gc.collect(Index())
+# accepted -- `interp_gc.py:7-26 collect` ignores it.  Which generation an
+# integer selects is an engineering choice and follows upstream, so no value is
+# rejected and `bench/synth/gc_pypy_frontend.py` pins that against the pypy
+# oracle.  The return value is a spec axis and is an int.
+assert isinstance(gc.collect(), int)
+assert isinstance(gc.collect(0), int)
+assert isinstance(gc.collect(2), int)
+assert isinstance(gc.collect(generation=2), int)
+assert isinstance(gc.collect(True), int)
+assert isinstance(gc.collect(Index()), int)
 
 for generation in (None, 1.25, "0"):
     with assert_raises(TypeError):
