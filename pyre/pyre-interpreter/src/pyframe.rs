@@ -3045,7 +3045,12 @@ impl PyFrame {
         if self.pycode.is_null() {
             return pyre_object::PY_NULL;
         }
-        unsafe { crate::w_code_get_w_globals(self.pycode as PyObjectRef) }
+        // `pyframe.py:132 return jit.promote(self.pycode).w_globals`.  Without
+        // the promote the code object stays a varying value on the trace and
+        // the globals read is a load the optimizer cannot fold; `w_globals` is
+        // not a virtualizable field, so nothing else pins it to a constant.
+        let pycode = majit_metainterp::jit::promote(self.pycode);
+        unsafe { crate::w_code_get_w_globals(pycode as PyObjectRef) }
     }
 
     /// `pyframe.py PyFrame.set_w_globals`: force the rare globals override

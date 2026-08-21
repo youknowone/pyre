@@ -7159,9 +7159,7 @@ impl PyreSym {
             if !self.execution_context.is_none() && !self.concrete_execution_context.is_null() {
                 ctx.try_set_opref_concrete(
                     self.execution_context,
-                    majit_ir::Value::Ref(majit_ir::GcRef(
-                        self.concrete_execution_context as usize,
-                    )),
+                    majit_ir::Value::Ref(majit_ir::GcRef(self.concrete_execution_context as usize)),
                 );
             }
             self.concrete_vable_ptr = concrete_frame as *mut u8;
