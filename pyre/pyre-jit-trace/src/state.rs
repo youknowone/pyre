@@ -14773,6 +14773,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     ctx: &mut TraceCtx,
     recipe: &ReconstructRecipe,
     execution_context: *const pyre_interpreter::PyExecutionContext,
+    ec_box: OpRef,
     parent_frames: Vec<ResumeFrameState>,
 ) -> Option<(PendingInlineFrame, Vec<OpRef>)> {
     let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
@@ -14799,7 +14800,17 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let w_globals = recover_inline_callee_globals(recipe.code_ptr);
     let pycode_const = ctx.const_ref(w_code as i64);
     let w_globals_const = ctx.const_ref(w_globals as i64);
-    let ec_const = ctx.const_ref(execution_context as i64);
+    // `PyPyJitDriver.reds = ['frame', 'ec']`: `perform_call` gives an inlined
+    // callee the caller's own `ec` Box, so the reconstructed frame is seeded
+    // from the caller's live red. The concrete pointer stays the frame's
+    // constructor argument, but a ConstPtr built from it would bake the
+    // recording thread's ExecutionContext into every bridge compiled from this
+    // loop. It remains the seed only where no live red reached here.
+    let ec_seed = if ec_box.is_none() {
+        ctx.const_ref(execution_context as i64)
+    } else {
+        ec_box
+    };
 
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
     // This reconstruction path admits freevars but still rejects fresh
@@ -14840,7 +14851,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
         stack_base,
         pycode_const,
         w_globals_const,
-        ec_const,
+        ec_seed,
     );
     // `perform_call` (`pyjitpl.py`) is three lines — `newframe` +
     // `setup_call` + `raise ChangeFrame` — and `newframe` (`:2455-2476`)
@@ -14993,7 +15004,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // walker-driven callee (an unset ec surfaces as a liveness-active NONE
     // panic at the first in-callee guard).
     if pending.sym.execution_context.is_none() {
-        pending.sym.execution_context = ec_const;
+        pending.sym.execution_context = ec_seed;
     }
 
     let max_reg = valuestackdepth
@@ -15001,7 +15012,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
         .max(ec_reg as usize + 1);
     let mut argboxes_r: Vec<OpRef> = vec![OpRef::NONE; max_reg];
     argboxes_r[frame_reg as usize] = frame_vable;
-    argboxes_r[ec_reg as usize] = ec_const;
+    argboxes_r[ec_reg as usize] = ec_seed;
     // The recipe's `registers_r` is SEMANTIC-slot-indexed (filled from the
     // frame vable's `locals_cells_stack_w` array), but the re-executed callee
     // reads its registers by post-rename COLOR. After stack-slot-pinning

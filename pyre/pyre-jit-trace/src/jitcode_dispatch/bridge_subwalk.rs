@@ -911,6 +911,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     ctx: &mut TraceCtx,
     recipe: &majit_metainterp::ReconstructRecipe,
     root_ec: *const pyre_interpreter::PyExecutionContext,
+    root_ec_box: majit_ir::OpRef,
 ) -> Option<InlineParentFrame> {
     let pjc = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)?;
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
@@ -936,8 +937,13 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     // `pending.sym.frame` / `pending.sym.execution_context` are consumed here;
     // the `argboxes_r` register seeding is for the forward drive, not the
     // snapshot.
-    let (pending, _argboxes_r) =
-        crate::state::setup_reconstructed_callee_frame(ctx, recipe, root_ec, Vec::new())?;
+    let (pending, _argboxes_r) = crate::state::setup_reconstructed_callee_frame(
+        ctx,
+        recipe,
+        root_ec,
+        root_ec_box,
+        Vec::new(),
+    )?;
     let frame_box = pending.sym.frame();
     let ec_box = pending.sym.execution_context();
 
@@ -1280,6 +1286,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             ctx,
             parent_recipe,
             root_sym.concrete_execution_context(),
+            root_sym.execution_context(),
         )?;
     }
 

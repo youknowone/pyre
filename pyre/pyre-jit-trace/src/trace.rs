@@ -1753,6 +1753,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let effects_at_entry = crate::jitcode_dispatch::fbw_executed_effect_count();
 
     let root_ec = sym.concrete_execution_context();
+    let root_ec_box = sym.execution_context();
     if crate::jitcode_dispatch::p2_diag_enabled() {
         let pcs: Vec<usize> = carrier
             .recipes
@@ -1783,9 +1784,13 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     // operand-stack temps; the `_pending` callee sym is unused on the sub-walk
     // path (the sub-walk drives the callee body off `argboxes_r` + the emitted
     // frame vable, not a callee MIFrame).
-    let Some((pending, argboxes_r)) =
-        crate::state::setup_reconstructed_callee_frame(ctx, recipe, root_ec, Vec::new())
-    else {
+    let Some((pending, argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
+        ctx,
+        recipe,
+        root_ec,
+        root_ec_box,
+        Vec::new(),
+    ) else {
         discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
         crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
         return p2_drain_abort();
@@ -1894,6 +1899,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                     sym,
                     root_pc,
                     root_ec,
+                    root_ec_box,
                     &carrier.recipes[i],
                     &carrier.recipes[..i],
                     result,
@@ -2178,6 +2184,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     sym: &mut Sym,
     root_pc: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
+    root_ec_box: majit_ir::OpRef,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
     child_result: majit_ir::OpRef,
@@ -2211,9 +2218,13 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::CtorTailSubstitute");
         return Some(instance);
     }
-    let Some((pending, middle_argboxes_r)) =
-        crate::state::setup_reconstructed_callee_frame(ctx, middle, root_ec, Vec::new())
-    else {
+    let Some((pending, middle_argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
+        ctx,
+        middle,
+        root_ec,
+        root_ec_box,
+        Vec::new(),
+    ) else {
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
         return None;
     };
