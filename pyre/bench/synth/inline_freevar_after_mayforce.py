@@ -1,4 +1,11 @@
 # pyre-check: max-pypy-ratio=86
+# pyre-check: jitstats-band=guard_failures=1
+# One tree, three runners, one CI run (`1d212895c6b`): macOS and ubuntu read
+# 1003 dynasm / 1008 cranelift, windows 1004 / 1009. The loop and bridge counts
+# agreed at six and five everywhere, so the split is carried entirely by this
+# counter and is not a function of the tree. The baseline holds the pair the two
+# agreeing runners read; the band is exactly the measured width, so anything
+# wider than the split still gates.
 # The ceiling is a function of N, so raising N refits it. pypy's execution here
 # is almost all fixed cost -- doubling N moved it 0.035s to 0.039s -- while this
 # backend pays roughly 27us per iteration, so the ratio tracks N nearly one for
