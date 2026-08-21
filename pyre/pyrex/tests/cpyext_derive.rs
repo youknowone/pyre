@@ -347,6 +347,74 @@ eq('the power slot with a modulus', m.call_slot('nb_power', Boxed(2), 3, 5), (2,
 eq('an int answers the power slot', m.call_slot('nb_power', 2, 10), 1024)
 
 
+# ── the slots handed a call's own arguments ────────────────────────────
+
+class Adder:
+    def __init__(self, base=0):
+        self.base = base
+
+    def __call__(self, *args, **kwds):
+        return (self.base, args, sorted(kwds.items()))
+
+
+eq('the call slot', m.call_with_args('tp_call', Adder(1), (2, 3)), (1, (2, 3), []))
+eq('the call slot with keywords',
+   m.call_with_args('tp_call', Adder(1), (), {'k': 4}), (1, (), [('k', 4)]))
+
+# `__call__` is not handed down, so a class that defines none carries no slot
+# to read even though its base does.
+class Quietly(Adder):
+    pass
+
+
+eq('a subclass that defines no __call__', m.call_with_args('tp_call', Quietly(), ()), 'none')
+
+started = Adder(0)
+m.call_with_args('tp_init', started, (7,))
+eq('the init slot ran', started.base, 7)
+eq('the constructor slot', type(m.call_with_args('tp_new', Adder, ())), Adder)
+
+# Attribute reads go through the type's own `__getattribute__`, not past it.
+class Watched:
+    def __getattribute__(self, name):
+        return 'saw ' + name
+
+
+eq('the attribute slot', m.call_slot('tp_getattro', Watched(), 'anything'), 'saw anything')
+eq('a plain object still reads its attributes',
+   m.call_slot('tp_getattro', Adder(5), 'base'), 5)
+
+
+# ── the descriptor slots ───────────────────────────────────────────────
+
+class Described:
+    def __get__(self, obj, of_type):
+        return ('got', obj is None, of_type is None)
+
+    def __set__(self, obj, value):
+        obj.stored = value
+
+    def __delete__(self, obj):
+        obj.stored = 'gone'
+
+
+class Holder:
+    pass
+
+
+d = Described()
+eq('the descriptor read slot', m.call_slot('tp_descr_get', d, Holder(), Holder),
+   ('got', False, False))
+eq('and a class access hands it no receiver',
+   m.call_slot('tp_descr_get', d, None, Holder), ('got', True, False))
+
+holder = Holder()
+m.call_slot('tp_descr_set', d, holder, 'value')
+eq('the descriptor write slot', holder.stored, 'value')
+m.call_slot('tp_descr_set', d, holder)
+eq('and the deletion the same slot answers for', holder.stored, 'gone')
+
+
 # The suites a heap type names are the blocks its own layout declares, so the
 # two ways an extension reaches one land on the same words.
 eq('a class names its own suites', m.suites_are_embedded(Counted), (1, 1, 1, 1, 1))

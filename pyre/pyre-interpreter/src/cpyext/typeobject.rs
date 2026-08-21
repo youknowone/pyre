@@ -714,6 +714,19 @@ macro_rules! table_of {
 // below resolve the same name on the receiver's own type instead, so an
 // override reaches a slot its base filled.
 
+/// `w_type.lookup(method)` for the receiver's own type.
+fn slot_method(w_self: PyObjectRef, method: &str) -> Result<PyObjectRef, crate::PyError> {
+    let Some(w_type) = crate::typedef::r#type(w_self) else {
+        return Err(crate::PyError::type_error(format!(
+            "a receiver with no type reached {method}"
+        )));
+    };
+    // The fill installs a slot only for a name the type has, so a miss here
+    // is the type having lost it since.
+    unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), method) }
+        .ok_or_else(|| crate::PyError::type_error(format!("the type no longer defines {method}")))
+}
+
 /// `space.call_function(w_type.lookup(method), w_self, *arguments)`.
 ///
 /// A type lookup, not an attribute one: an instance dict entry of the same
@@ -730,19 +743,7 @@ fn call_slot_method(
         roots.pin_root(argument);
     }
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
-    let Some(w_type) = crate::typedef::r#type(reload(0)) else {
-        return Err(crate::PyError::type_error(format!(
-            "a receiver with no type reached {method}"
-        )));
-    };
-    let Some(function) = (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), method) })
-    else {
-        // The fill installs a slot only for a name the type has, so reaching
-        // this is the type having lost it since.
-        return Err(crate::PyError::type_error(format!(
-            "the type no longer defines {method}"
-        )));
-    };
+    let function = slot_method(reload(0), method)?;
     let function_slot = pyre_object::gc_roots::shadow_stack_len();
     roots.pin_root(function);
     let mut call = Vec::with_capacity(arguments.len() + 1);
@@ -843,6 +844,7 @@ binary_slots! {
     (interp_sq_concat, "__add__"),
     (interp_sq_inplace_concat, "__iadd__"),
     (interp_mp_subscript, "__getitem__"),
+    (interp_tp_getattro, "__getattribute__"),
 }
 
 /// `slotdefs.py make_binary_slot_int` — the count the slot was handed,
@@ -977,6 +979,151 @@ fn fills_number_suite(w_type: PyObjectRef) -> bool {
         && !derived(&pyre_object::pyobject::STR_TYPE)
 }
 
+/// `space.call_args(callable, Arguments([w_self], *args, **kwds))` — the shape
+/// the slots handed a call's own arguments share.
+///
+/// A NULL `args` is the empty tuple a caller with no positional arguments
+/// would have passed; a NULL `kwds` is no keywords at all.
+fn call_slot_arguments(
+    callable: PyObjectRef,
+    w_self: PyObjectRef,
+    args: *mut CPyObject,
+    kwds: *mut CPyObject,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(callable);
+    roots.pin_root(w_self);
+    roots.pin_root(unsafe { pyobject::from_ref(kwds) });
+    let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+    // Minted last, so nothing pinned above it is a pre-move address.
+    let starargs = match args.is_null() {
+        true => pyre_object::tupleobject::w_tuple_new(Vec::new()),
+        false => unsafe { pyobject::from_ref(args) },
+    };
+    let starargs_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(starargs);
+    crate::eval::CURRENT_FRAME.with(|current| {
+        let frame = current.get();
+        if frame.is_null() {
+            return Err(crate::PyError::runtime_error(
+                "a cpyext slot forwarded a call with no current frame",
+            ));
+        }
+        crate::call::call_function_ex(
+            unsafe { &mut *frame },
+            reload(0),
+            reload(1),
+            pyre_object::gc_roots::shadow_stack_get(starargs_slot),
+            reload(2),
+        )
+    })
+}
+
+/// `slotdefs.py make_tp_call` — `self(*args, **kwds)`.
+unsafe extern "C" fn interp_tp_call(
+    raw: *mut CPyObject,
+    args: *mut CPyObject,
+    kwds: *mut CPyObject,
+) -> *mut CPyObject {
+    unsafe { pyobject::realize(args) };
+    unsafe { pyobject::realize(kwds) };
+    let Some(w_self) = super::object::argument(raw) else {
+        return std::ptr::null_mut();
+    };
+    let called = slot_method(w_self, "__call__")
+        .and_then(|callable| call_slot_arguments(callable, w_self, args, kwds));
+    super::object::result(called)
+}
+
+/// `slotdefs.py make_tp_init` — what `__init__` answers is discarded, as the
+/// slot has no room for it.
+unsafe extern "C" fn interp_tp_init(
+    raw: *mut CPyObject,
+    args: *mut CPyObject,
+    kwds: *mut CPyObject,
+) -> c_int {
+    unsafe { pyobject::realize(args) };
+    unsafe { pyobject::realize(kwds) };
+    let Some(w_self) = super::object::argument(raw) else {
+        return -1;
+    };
+    let started = slot_method(w_self, "__init__")
+        .and_then(|callable| call_slot_arguments(callable, w_self, args, kwds));
+    match super::pyerrors::trap(started) {
+        Some(_) => 0,
+        None => -1,
+    }
+}
+
+/// `slotdefs.py make_tp_new` — `cls.__new__(cls, *args, **kwds)`.
+///
+/// The receiver is the class being built, so the constructor is read off it
+/// rather than off its type; the attribute read is what unwraps the static
+/// method `__new__` is stored as.
+unsafe extern "C" fn interp_tp_new(
+    raw: *mut CPyTypeObject,
+    args: *mut CPyObject,
+    kwds: *mut CPyObject,
+) -> *mut CPyObject {
+    unsafe { pyobject::realize(args) };
+    unsafe { pyobject::realize(kwds) };
+    let Some(w_class) = super::object::argument(raw as *mut CPyObject) else {
+        return std::ptr::null_mut();
+    };
+    let made = crate::baseobjspace::getattr_str(w_class, "__new__")
+        .and_then(|callable| call_slot_arguments(callable, w_class, args, kwds));
+    super::object::result(made)
+}
+
+/// `slotdefs.py make_tp_descr_get` — a NULL receiver is the class access,
+/// which reaches `__get__` as `None`.
+unsafe extern "C" fn interp_tp_descr_get(
+    raw: *mut CPyObject,
+    object: *mut CPyObject,
+    of_type: *mut CPyObject,
+) -> *mut CPyObject {
+    unsafe { pyobject::realize(object) };
+    unsafe { pyobject::realize(of_type) };
+    let Some(w_self) = super::object::argument(raw) else {
+        return std::ptr::null_mut();
+    };
+    let or_none = |raw: *mut CPyObject| match raw.is_null() {
+        true => pyre_object::w_none(),
+        false => unsafe { pyobject::from_ref(raw) },
+    };
+    let got = call_slot_method(w_self, "__get__", &[or_none(object), or_none(of_type)]);
+    super::object::result(got)
+}
+
+/// `slotdefs.py make_tp_descr_set` — one slot for the assignment and the
+/// deletion both, told apart by the value being NULL.
+unsafe extern "C" fn interp_tp_descr_set(
+    raw: *mut CPyObject,
+    object: *mut CPyObject,
+    value: *mut CPyObject,
+) -> c_int {
+    unsafe { pyobject::realize(object) };
+    unsafe { pyobject::realize(value) };
+    let (Some(w_self), Some(w_object)) = (
+        super::object::argument(raw),
+        super::object::argument(object),
+    ) else {
+        return -1;
+    };
+    let assigned = match value.is_null() {
+        true => call_slot_method(w_self, "__delete__", &[w_object]),
+        false => match super::object::argument(value) {
+            Some(w_value) => call_slot_method(w_self, "__set__", &[w_object, w_value]),
+            None => return -1,
+        },
+    };
+    match super::pyerrors::trap(assigned) {
+        Some(_) => 0,
+        None => -1,
+    }
+}
+
 /// The two halves of reaching one slot: what it holds, and how it is written.
 ///
 /// The read is what lets an inherited slot be taken from a base as it stands;
@@ -1100,7 +1247,7 @@ const BINARY_SLOTS: [(
     &str,
     unsafe extern "C" fn(*mut CPyObject, *mut CPyObject) -> *mut CPyObject,
     SlotAccess,
-); 13] = [
+); 14] = [
     ("__add__", interp_nb_add, number_entry!(nb_add)),
     ("__sub__", interp_nb_subtract, number_entry!(nb_subtract)),
     ("__mul__", interp_nb_multiply, number_entry!(nb_multiply)),
@@ -1121,6 +1268,11 @@ const BINARY_SLOTS: [(
         "__getitem__",
         interp_mp_subscript,
         mapping_entry!(mp_subscript),
+    ),
+    (
+        "__getattribute__",
+        interp_tp_getattro,
+        scalar_entry!(tp_getattro),
     ),
 ];
 
@@ -1153,6 +1305,14 @@ fn is_interpreter_slot(slot: *const c_void) -> bool {
         || LENGTH_SLOTS
             .iter()
             .any(|&(_, function, _)| named(function as *const c_void))
+        || BINARY_SLOTS
+            .iter()
+            .any(|&(_, function, _)| named(function as *const c_void))
+        || named(interp_tp_call as *const c_void)
+        || named(interp_tp_init as *const c_void)
+        || named(interp_tp_new as *const c_void)
+        || named(interp_tp_descr_get as *const c_void)
+        || named(interp_tp_descr_set as *const c_void)
 }
 
 /// Install one slot — the body `typeobject.py update_all_slots` and
@@ -1179,7 +1339,10 @@ fn install_slot(
         false => found.is_some(),
     };
     let base = unsafe { (*mirror).tp_base };
-    let inherited = match owned || base.is_null() {
+    // `update_all_slots`'s one exception: `__call__` is not handed down, so a
+    // heap type that does not define one carries no `tp_call` either.
+    let inherits = method != "__call__";
+    let inherited = match owned || base.is_null() || !inherits {
         true => std::ptr::null(),
         false => (access.read)(base),
     };
@@ -1224,6 +1387,45 @@ fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
         number_entry!(nb_power),
         interp_nb_power as *const c_void,
     );
+    for (method, function, access) in [
+        (
+            "__call__",
+            interp_tp_call as *const c_void,
+            scalar_entry!(tp_call),
+        ),
+        (
+            "__init__",
+            interp_tp_init as *const c_void,
+            scalar_entry!(tp_init),
+        ),
+        (
+            "__new__",
+            interp_tp_new as *const c_void,
+            scalar_entry!(tp_new),
+        ),
+        (
+            "__get__",
+            interp_tp_descr_get as *const c_void,
+            scalar_entry!(tp_descr_get),
+        ),
+    ] {
+        install_slot(mirror, w_type, heaptype, method, access, function);
+    }
+    // Either name earns the slot, because one answers for the assignment and
+    // the deletion both and a type may define only one of them.
+    if defines("__set__") || defines("__delete__") {
+        install_slot(
+            mirror,
+            w_type,
+            heaptype,
+            match defines("__set__") {
+                true => "__set__",
+                false => "__delete__",
+            },
+            scalar_entry!(tp_descr_set),
+            interp_tp_descr_set as *const c_void,
+        );
+    }
     // Both names, because one slot answers for the assignment and the
     // deletion and there is no spelling for having only one of them.
     if defines("__setitem__") && defines("__delitem__") {
@@ -3221,14 +3423,14 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     // `type.__new__` for a metatype, which is the whole of what one is for.
     // `type_ready_set_new` and `add_operators` publish a wrapper for a slot
     // the type has and leave an inherited one to the base that declared it.
-    if unsafe { !(*tp).tp_new.is_null() } {
+    if unsafe { !(*tp).tp_new.is_null() } && !is_interpreter_slot(unsafe { (*tp).tp_new }) {
         store(
             ns,
             "__new__",
             crate::make_builtin_function("__new__", slot_new),
         );
     }
-    if unsafe { !(*tp).tp_init.is_null() } {
+    if unsafe { !(*tp).tp_init.is_null() } && !is_interpreter_slot(unsafe { (*tp).tp_init }) {
         store(
             ns,
             "__init__",
@@ -3261,7 +3463,7 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
             crate::make_builtin_function_with_arity("__hash__", slot_hash, 1),
         );
     }
-    if unsafe { !(*tp).tp_call.is_null() } {
+    if unsafe { !(*tp).tp_call.is_null() } && !is_interpreter_slot(unsafe { (*tp).tp_call }) {
         store(
             ns,
             "__call__",
@@ -3271,7 +3473,8 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     if unsafe { !(*tp).tp_richcompare.is_null() } {
         install_comparisons(ns);
     }
-    if unsafe { !(*tp).tp_getattro.is_null() } {
+    if unsafe { !(*tp).tp_getattro.is_null() } && !is_interpreter_slot(unsafe { (*tp).tp_getattro })
+    {
         store(
             ns,
             "__getattribute__",
@@ -3290,14 +3493,18 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
             crate::make_builtin_function_with_arity("__delattr__", slot_delattro, 2),
         );
     }
-    if unsafe { !(*tp).tp_descr_get.is_null() } {
+    if unsafe { !(*tp).tp_descr_get.is_null() }
+        && !is_interpreter_slot(unsafe { (*tp).tp_descr_get })
+    {
         store(
             ns,
             "__get__",
             crate::make_builtin_function_with_arity("__get__", slot_descr_get, 3),
         );
     }
-    if unsafe { !(*tp).tp_descr_set.is_null() } {
+    if unsafe { !(*tp).tp_descr_set.is_null() }
+        && !is_interpreter_slot(unsafe { (*tp).tp_descr_set })
+    {
         store(
             ns,
             "__set__",

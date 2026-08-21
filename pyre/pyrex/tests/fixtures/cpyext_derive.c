@@ -263,8 +263,9 @@ static PyObject *call_slot(PyObject *self, PyObject *args)
        shape is what decides how a failure is told from an answer, so it is
        settled from the name alone -- a NULL field is still reported as the
        absent slot it is. */
-    enum { NONE, UNARY, LENGTH, HASH, BINARY, COUNTED, POWER, ASSIGN, ASSIGN_AT } shape =
-        NONE;
+    enum {
+        NONE, UNARY, LENGTH, HASH, BINARY, COUNTED, POWER, DESCR, ASSIGN, ASSIGN_AT
+    } shape = NONE;
     void *slot = NULL;
 #define PICK(name, kind, field)                                              \
     if (strcmp(which, name) == 0) {                                          \
@@ -294,6 +295,9 @@ static PyObject *call_slot(PyObject *self, PyObject *args)
     PICK("sq_item", COUNTED, SUITE(sq, sq_item))
     PICK("sq_repeat", COUNTED, SUITE(sq, sq_repeat))
     PICK("nb_power", POWER, SUITE(nb, nb_power))
+    PICK("tp_getattro", BINARY, t->tp_getattro)
+    PICK("tp_descr_get", DESCR, t->tp_descr_get)
+    PICK("tp_descr_set", ASSIGN, t->tp_descr_set)
     PICK("mp_ass_subscript", ASSIGN, SUITE(mp, mp_ass_subscript))
     PICK("sq_ass_item", ASSIGN_AT, SUITE(sq, sq_ass_item))
     {
@@ -328,6 +332,12 @@ static PyObject *call_slot(PyObject *self, PyObject *args)
         /* The modulus a caller without one of its own passes. */
         return ((ternaryfunc)slot)(o, operand, value == NULL ? Py_None : value);
     }
+    if (shape == DESCR) {
+        /* NULL is what a class access hands the receiver slot, and it is not
+           the same as `None` -- the slot is what has to tell them apart. */
+        return ((descrgetfunc)slot)(o, operand == Py_None ? NULL : operand,
+                                    value == Py_None ? NULL : value);
+    }
     if (shape == COUNTED || shape == ASSIGN_AT) {
         Py_ssize_t index = PyNumber_AsSsize_t(operand, PyExc_IndexError);
         if (index == -1 && PyErr_Occurred()) {
@@ -347,6 +357,52 @@ static PyObject *call_slot(PyObject *self, PyObject *args)
         return NULL;
     }
     Py_RETURN_NONE;
+}
+
+/* Call one of the slots handed a call's own arguments.  These take a tuple
+   and a dict rather than a Python-level argument list, which is the shape a
+   compiled module builds before it reaches them. */
+static PyObject *call_with_args(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *which;
+    PyObject *o;
+    PyObject *pos;
+    PyObject *kwds = NULL;
+    if (!PyArg_ParseTuple(args, "sOO!|O!", &which, &o, &PyTuple_Type, &pos,
+                          &PyDict_Type, &kwds)) {
+        return NULL;
+    }
+    if (strcmp(which, "tp_call") == 0) {
+        ternaryfunc call = Py_TYPE(o)->tp_call;
+        if (call == NULL) {
+            return PyUnicode_FromString("none");
+        }
+        return call(o, pos, kwds);
+    }
+    if (strcmp(which, "tp_init") == 0) {
+        initproc start = Py_TYPE(o)->tp_init;
+        if (start == NULL) {
+            return PyUnicode_FromString("none");
+        }
+        if (start(o, pos, kwds) < 0) {
+            return NULL;
+        }
+        Py_RETURN_NONE;
+    }
+    if (strcmp(which, "tp_new") == 0) {
+        if (!PyType_Check(o)) {
+            PyErr_SetString(PyExc_TypeError, "tp_new takes a type");
+            return NULL;
+        }
+        newfunc make = ((PyTypeObject *)o)->tp_new;
+        if (make == NULL) {
+            return PyUnicode_FromString("none");
+        }
+        return make((PyTypeObject *)o, pos, kwds);
+    }
+    PyErr_Format(PyExc_ValueError, "the fixture does not offer %s", which);
+    return NULL;
 }
 
 /* Whether the suite a type names is the block its own `PyHeapTypeObject`
@@ -379,6 +435,7 @@ static PyMethodDef methods[] = {
     {"slots_of", slots_of, METH_O, NULL},
     {"walk_slots", walk_slots, METH_O, NULL},
     {"call_slot", call_slot, METH_VARARGS, NULL},
+    {"call_with_args", call_with_args, METH_VARARGS, NULL},
     {"suites_are_embedded", suites_are_embedded, METH_O, NULL},
     {"shares_new", shares_new, METH_VARARGS, NULL},
     {"undisturbed", undisturbed, METH_NOARGS, NULL},
