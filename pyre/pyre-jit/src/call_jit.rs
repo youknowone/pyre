@@ -783,7 +783,7 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     }
     m73_lastinstr_audit("caught", Some(jitcode_index), opcode_position, frame_ptr);
     // `dispatch_bytecode` (pyopcode.py) stamps `self.last_instr` before every
-    // opcode, so `pyopcode.py:147-148 handle_operation_error` always records its
+    // opcode, so `pyopcode.py handle_operation_error` always records its
     // node while the frame holds the instruction that raised, and every later
     // `tb_frame.f_lasti` / `f_lineno` read answers for that instruction.  Two
     // pyre paths already reproduce the store — the recording walk before its own
