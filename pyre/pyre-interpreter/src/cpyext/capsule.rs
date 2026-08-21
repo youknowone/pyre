@@ -42,10 +42,13 @@ pub(crate) fn capsule_type() -> PyObjectRef {
                 }),
             );
         });
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        // No `Py_TPFLAGS_BASETYPE` either -- a subclass would carry the name
-        // without the payload `is_capsule` reads.
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
+        unsafe {
+            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            pyre_object::w_type_set_disallow_instantiation(tp);
+            // No `Py_TPFLAGS_BASETYPE` either -- a subclass would carry the name
+            // without the payload `is_capsule` reads.
+            pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+        }
         tp as usize
     }) as PyObjectRef
 }

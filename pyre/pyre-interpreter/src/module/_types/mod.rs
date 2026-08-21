@@ -43,7 +43,10 @@ fn capsule_type() -> PyObjectRef {
                 }),
             );
         });
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(tp);
+            pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+        }
         tp as usize
     }) as PyObjectRef
 }
@@ -173,4 +176,18 @@ pub fn init(ns: PyObjectRef) {
         "WrapperDescriptorType",
         crate::typedef::gettypeobject(&crate::function::SLOT_WRAPPER_TYPE),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn capsule_type_publishes_null_tp_new() {
+        crate::typedef::init_typeobjects();
+        let capsule_type = super::capsule_type();
+        assert!(unsafe { pyre_object::w_type_disallows_instantiation(capsule_type) });
+
+        let flags = crate::baseobjspace::getattr_str(capsule_type, "__flags__")
+            .expect("PyCapsule.__flags__ lookup failed");
+        assert_ne!(unsafe { pyre_object::w_int_get_value(flags) } & (1 << 7), 0);
+    }
 }
