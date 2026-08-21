@@ -160,6 +160,7 @@ STRUCTS = {
     "CPyInterpreterState": "PyInterpreterState",
     "CPyMutex": "PyMutex",
     "CPyUnicodeWriter": "PyUnicodeWriter",
+    "CPyDateTimeCAPI": "PyDateTime_CAPI",
 }
 
 

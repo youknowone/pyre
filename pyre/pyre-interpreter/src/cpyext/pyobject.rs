@@ -175,6 +175,7 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     // this runtime hands out is exactly its header.
     super::frameobject::attach(raw, w_obj);
     super::pyerrors::attach(raw, w_obj);
+    super::cdatetime::attach(raw, w_obj);
     raw
 }
 
@@ -467,6 +468,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::bytesobject::forget_pending(address);
     super::frameobject::forget_block(raw);
     super::pyerrors::forget_block(raw);
+    super::cdatetime::forget_block(raw);
     unsafe { super::typeobject::forget_type_mirror(raw) };
     super::gc::forget(address);
     let block = block_at(address);

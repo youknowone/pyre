@@ -494,6 +494,7 @@ fn mirror_basicsize(w_type: PyObjectRef) -> isize {
     [
         super::frameobject::basicsize(w_type),
         super::pyerrors::basicsize(w_type),
+        super::cdatetime::basicsize(w_type),
     ]
     .into_iter()
     .find(|&size| size != 0)

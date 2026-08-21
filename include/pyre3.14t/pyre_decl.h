@@ -74,6 +74,48 @@ PyAPI_FUNC(int) PyCapsule_SetDestructor(PyObject *, PyCapsule_Destructor);
 PyAPI_FUNC(int) PyCapsule_SetName(PyObject *, const char *);
 PyAPI_FUNC(int) PyCapsule_SetPointer(PyObject *, void *);
 
+/* cpyext/cdatetime.rs */
+PyAPI_FUNC(int) PyDateTime_Check(PyObject *);
+PyAPI_FUNC(int) PyDateTime_CheckExact(PyObject *);
+PyAPI_FUNC(int) PyDateTime_DATE_GET_HOUR(void *);
+PyAPI_FUNC(int) PyDateTime_DATE_GET_MICROSECOND(void *);
+PyAPI_FUNC(int) PyDateTime_DATE_GET_MINUTE(void *);
+PyAPI_FUNC(int) PyDateTime_DATE_GET_SECOND(void *);
+PyAPI_FUNC(PyObject *) PyDateTime_DATE_GET_TZINFO(void *);
+PyAPI_FUNC(int) PyDateTime_DELTA_GET_DAYS(void *);
+PyAPI_FUNC(int) PyDateTime_DELTA_GET_MICROSECONDS(void *);
+PyAPI_FUNC(int) PyDateTime_DELTA_GET_SECONDS(void *);
+PyAPI_FUNC(PyObject *) PyDateTime_FromTimestamp(PyObject *);
+PyAPI_FUNC(int) PyDateTime_GET_DAY(void *);
+PyAPI_FUNC(int) PyDateTime_GET_FOLD(void *);
+PyAPI_FUNC(int) PyDateTime_GET_MONTH(void *);
+PyAPI_FUNC(int) PyDateTime_GET_YEAR(void *);
+PyAPI_FUNC(int) PyDateTime_TIME_GET_FOLD(void *);
+PyAPI_FUNC(int) PyDateTime_TIME_GET_HOUR(void *);
+PyAPI_FUNC(int) PyDateTime_TIME_GET_MICROSECOND(void *);
+PyAPI_FUNC(int) PyDateTime_TIME_GET_MINUTE(void *);
+PyAPI_FUNC(int) PyDateTime_TIME_GET_SECOND(void *);
+PyAPI_FUNC(PyObject *) PyDateTime_TIME_GET_TZINFO(void *);
+PyAPI_FUNC(int) PyDate_Check(PyObject *);
+PyAPI_FUNC(int) PyDate_CheckExact(PyObject *);
+PyAPI_FUNC(PyObject *) PyDate_FromTimestamp(PyObject *);
+PyAPI_FUNC(int) PyDelta_Check(PyObject *);
+PyAPI_FUNC(int) PyDelta_CheckExact(PyObject *);
+PyAPI_FUNC(int) PyTZInfo_Check(PyObject *);
+PyAPI_FUNC(int) PyTZInfo_CheckExact(PyObject *);
+PyAPI_FUNC(int) PyTime_Check(PyObject *);
+PyAPI_FUNC(int) PyTime_CheckExact(PyObject *);
+PyAPI_FUNC(PyObject *) _PyDateTime_FromDateAndTime(int, int, int, int, int, int, int, PyObject *, PyTypeObject *);
+PyAPI_FUNC(PyObject *) _PyDateTime_FromDateAndTimeAndFold(int, int, int, int, int, int, int, PyObject *, int, PyTypeObject *);
+PyAPI_FUNC(PyObject *) _PyDateTime_FromTimestamp(PyObject *, PyObject *, PyObject *);
+PyAPI_FUNC(PyDateTime_CAPI *) _PyDateTime_Import(void);
+PyAPI_FUNC(PyObject *) _PyDate_FromDate(int, int, int, PyTypeObject *);
+PyAPI_FUNC(PyObject *) _PyDate_FromTimestamp(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) _PyDelta_FromDelta(int, int, int, int, PyTypeObject *);
+PyAPI_FUNC(PyObject *) _PyTimeZone_FromTimeZone(PyObject *, PyObject *);
+PyAPI_FUNC(PyObject *) _PyTime_FromTime(int, int, int, int, PyObject *, PyTypeObject *);
+PyAPI_FUNC(PyObject *) _PyTime_FromTimeAndFold(int, int, int, int, PyObject *, int, PyTypeObject *);
+
 /* cpyext/complexobject.rs */
 PyAPI_FUNC(Py_complex) PyComplex_AsCComplex(PyObject *);
 PyAPI_FUNC(int) PyComplex_Check(PyObject *);

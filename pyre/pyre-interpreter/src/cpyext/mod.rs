@@ -19,6 +19,7 @@ pub mod buffer;
 pub mod bytearrayobject;
 pub mod bytesobject;
 pub mod capsule;
+pub mod cdatetime;
 pub mod complexobject;
 pub mod dictobject;
 pub mod exception;
@@ -208,6 +209,7 @@ pub fn after_fork_child() {
         bytesobject::after_fork_child();
         frameobject::after_fork_child();
         pyerrors::after_fork_child();
+        cdatetime::after_fork_child();
         gc::after_fork_child();
     }
     // `PyInit_*` cannot have been mid-flight in the child, and the parent's
@@ -786,6 +788,7 @@ pub fn ensure_linked() {
     pystate::ensure_linked();
     bytearrayobject::ensure_linked();
     complexobject::ensure_linked();
+    cdatetime::ensure_linked();
     osmodule::ensure_linked();
     warnings::ensure_linked();
     exception::ensure_linked();
