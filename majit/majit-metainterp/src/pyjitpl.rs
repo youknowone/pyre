@@ -880,7 +880,8 @@ fn prepare_bridge_trace_for_optimizer(
         .map(|(arg, ia)| {
             let reminted = InputArg::from_type(arg.tp, ia.opref().raw());
             // The inputarg half carries its value for the same reason as the op
-            // loop above: pyjitpl.py:3213 keeps original InputArg and Op boxes alike.
+            // loop above: `pyjitpl.py compile_trace` keeps original InputArg and Op
+            // boxes alike.
             if let Some(value) = arg.get_value() {
                 reminted.set_value(value);
             }
@@ -9858,10 +9859,11 @@ impl<M: Clone> MetaInterp<M> {
                     // The retired entry's count does not follow it here. The
                     // token this compile installs came out of
                     // `make_jitcell_token`, and upstream's `retraced_count`
-                    // starts at the `history.py:442` class default on every
+                    // starts at the `history.py JitCellToken` class default on every
                     // token minted that way — see the fresh-token note in
                     // `compile_loop`. Carrying it would hand the new loop a
-                    // spent retrace budget, and, since `unroll.py:272`'s
+                    // spent retrace budget, and, since
+                    // `unroll.py disable_retracing_if_max_retrace_guards`'s
                     // sentinel is odd, the predecessor's
                     // `FORCE_BRIDGE_SEGMENTING` bit along with it.
                     // `compile.py:1079-1083` — a FINISH trace
@@ -10754,7 +10756,7 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
-        // compile.py:186 `descr.rd_loop_token` — owning loop's clt,
+        // compile.py `descr.rd_loop_token` — owning loop's clt,
         // stamped at compile time.  Walk the chain
         // `descr.rd_loop_token_clt() → clt.upgrade_loop_token()` to
         // recover the owning `Arc<JitCellToken>` (pyjitpl.py:2897
@@ -10921,7 +10923,7 @@ impl<M: Clone> MetaInterp<M> {
         self.execute_assembler_at_dispatch_key(&token, green_key, live_values, dispatch_key)
     }
 
-    /// `compile.py:753-771` reads the failing GUARD_VALUE's operand off the
+    /// `compile.py must_compile` reads the failing GUARD_VALUE's operand off the
     /// deadframe while it is still alive; `must_compile` runs after the frame
     /// is gone. Both compiled-entry hand-back points therefore take the read
     /// here and pass the value forward. `None` covers the arms `must_compile`
@@ -10936,7 +10938,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|slot| self.backend.get_value_direct(frame, slot))
     }
 
-    /// `compile.py:658-672 _DoneWithThisFrameDescr.get_result` and
+    /// `compile.py _DoneWithThisFrameDescr.get_result` and
     /// `handle_fail`'s exit read: decode a returned frame's exit slots into the
     /// raw and typed lists every consumer of a compiled run reads.
     ///
@@ -11087,7 +11089,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
-        // compile.py:186 `descr.rd_loop_token` — see `run_compiled_detailed`.
+        // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
         let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
         Self::finish_compiled_run_io();
 
@@ -12652,7 +12654,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
         // Bridge inputarg `InputArg*.value` stamp.
         //
-        // bridgeopt.py:124 `deserialize_optimizer_knowledge` receives
+        // bridgeopt.py `deserialize_optimizer_knowledge` receives
         // `frontend_boxes` (the source guard's live boxes) alongside
         // `liveboxes` (the bridge inputargs). It reads class knowledge
         // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` at :145
@@ -12664,7 +12666,7 @@ impl<M: Clone> MetaInterp<M> {
         // The stamp must precede `closing_jump_runtime_boxes`, which folds a
         // valued inputarg JUMP arg into an inline Const.
         if let Some(frontend_boxes) = self.pending_frontend_boxes.as_deref() {
-            // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)` —
+            // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)` —
             // failed source-guard `fail_args` must be paired 1:1 with
             // the bridge's `liveboxes` (== `bridge_inputargs` here).  A
             // length mismatch is a fail_args-vs-liveboxes plumbing bug,
@@ -12680,7 +12682,7 @@ impl<M: Clone> MetaInterp<M> {
             for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
                 let value = heap_value_for(ia.tp, raw);
                 // Stamp the concrete value on the canonical bridge `InputArg`
-                // identity (`history.py:803 *FrontendOp(pos, value)`).
+                // identity (`history.py *FrontendOp(pos, value)`).
                 ia.set_value(value);
             }
         }
@@ -13029,9 +13031,9 @@ impl<M: Clone> MetaInterp<M> {
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 // The labels carry over, the retrace budget does not. `token`
                 // came out of `make_jitcell_token`, so its count is the
-                // `history.py:442` default — see the fresh-token note in
+                // `history.py JitCellToken` default — see the fresh-token note in
                 // `compile_loop`. The count read at the top of this function is
-                // the one `unroll.py:216-217` charges, and it stays on the
+                // the one `unroll.py optimize_bridge` charges, and it stays on the
                 // token it was read from.
                 self.compiled_loops.insert(
                     original_green_key,
@@ -13348,7 +13350,7 @@ impl<M: Clone> MetaInterp<M> {
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
         if let Some(prd) = pending_bridge_rd.as_ref() {
-            // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)`.
+            // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)`.
             // The concrete values belong on the pre-iterator bridge InputArg
             // objects themselves, mirroring `FrontendOp(pos, value)` rather
             // than a side table keyed by OpRef.
@@ -13365,7 +13367,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        // compile.py:1056-1060: BridgeCompileData is built from the original
+        // compile.py: BridgeCompileData is built from the original
         // history trace/runtime boxes. The explicit Rust TraceIterator
         // preparation below mirrors unroll.py:187 `trace = trace.get_iter()`
         // and must happen after this payload is formed.
@@ -23133,7 +23135,8 @@ mod tests {
         );
     }
 
-    /// pyjitpl.py:3213 + unroll.py:187: original inputarg boxes retain their
+    /// `pyjitpl.py compile_trace` + `unroll.py optimize_bridge`: original
+    /// inputarg boxes retain their
     /// observed runtime values across the fresh trace iterator.
     #[test]
     fn prepare_bridge_trace_carries_inputarg_runtime_values() {
@@ -25323,9 +25326,9 @@ mod tests {
         );
     }
 
-    /// The third minting site. `compile.py:1006-1023
+    /// The third minting site. `compile.py
     /// ResumeFromInterpDescr.compile_and_attach` gives the entry bridge a token
-    /// from `make_jitcell_token`, so it starts at the `history.py:442` default
+    /// from `make_jitcell_token`, so it starts at the `history.py JitCellToken` default
     /// however far the entry it replaces had run its own budget down — and the
     /// `FORCE_BRIDGE_SEGMENTING` bit riding in bit 0 stays behind with it.
     #[test]

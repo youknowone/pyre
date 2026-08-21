@@ -832,12 +832,13 @@ impl WarmEnterState {
         self.counter.tick(bucket, self.increment_threshold)
     }
 
-    /// The `dead_token` gate below is narrower than warmstate.py:497-500, and
+    /// The `dead_token` gate below is narrower than
+    /// `warmstate.py maybe_compile_and_run`'s tokenless arm, and
     /// deliberately so. Upstream drops EVERY tokenless cell there — "it was an
     /// aborted compilation, or maybe a weakref that has been freed" — because
     /// upstream has exactly one way to make a cell: `bound_reached` builds it
     /// and immediately stamps `JC_TRACING | JC_TRACING_OCCURRED`
-    /// (warmstate.py:434-440), so tokenless really does mean the trace it
+    /// (`warmstate.py bound_reached`), so tokenless really does mean the trace it
     /// started never compiled.
     ///
     /// That inference does not survive the port, because one pyre green key can
@@ -2057,12 +2058,12 @@ impl WarmEnterState {
             }
             // An invalidated procedure token — one the cell saw and no longer
             // holds — has to reach `cleanup_chain` below rather than take any
-            // early return (`warmstate.py:483-491`).
+            // early return (`warmstate.py maybe_compile_and_run`).
             let dead_token =
                 cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
             // The function-entry door owns the same decision the back-edge
             // doors do, and its caller runs `decay_all_counters()`
-            // (`warmstate.py:429`) on the way to `force_start_tracing*`. So the
+            // (`warmstate.py bound_reached`) on the way to `force_start_tracing*`. So the
             // ceiling answers here too, or a latched location decays every
             // OTHER location's counter once per function entry. See
             // [`Self::maybe_compile_decision`].
@@ -4245,9 +4246,10 @@ mod tests {
         assert!(cell.flags & jc_flags::DONT_TRACE_HERE == 0);
     }
 
-    /// `warmstate.py:425-444 bound_reached` traces unconditionally once
+    /// `warmstate.py bound_reached` traces unconditionally once
     /// entered, and its first act is `jitcounter.decay_all_counters()`
-    /// (`warmstate.py:429`), so upstream never pays a decay for a trace that
+    /// (`warmstate.py bound_reached`), so upstream never pays a decay for a trace
+    /// that
     /// then refuses to start. A cell latched by `MAX_TRACE_ABORT_COUNT` must
     /// therefore be turned down at the decision, not several frames down in
     /// `force_start_tracing*` — otherwise every back edge over a location that
@@ -4697,7 +4699,8 @@ mod tests {
 
     /// A cell that has latched the pyre-local abort ceiling AND holds a
     /// procedure token that was since invalidated must still be removed from
-    /// the chain: `warmstate.py:483-500` re-counts such a location from cold,
+    /// the chain: `warmstate.py maybe_compile_and_run` re-counts such a location
+    /// from cold,
     /// and both back-edge doors already exempt a dead token from the ceiling.
     /// Refusing at the ceiling first leaves the stale entry in place for every
     /// later call, so its bucket's counter never re-arms.

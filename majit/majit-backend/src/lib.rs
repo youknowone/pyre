@@ -1255,19 +1255,19 @@ pub struct JitCellToken {
     pub generation: Cell<i64>,
     /// `history.py JitCellToken.retraced_count` parity slot.
     ///
-    /// `history.py:438 FORCE_BRIDGE_SEGMENTING = 1 # stored in
-    /// retraced_count` says the field is packed, and `history.py:471-475`
+    /// `history.py JitCellToken.FORCE_BRIDGE_SEGMENTING = 1 # stored in
+    /// retraced_count` says the field is packed, and `history.py`
     /// offers a shifting `get_retraced_count` / `set_retraced_count` pair
     /// to hold that packing.  Neither accessor has a caller in the
     /// vendored tree: every live read and write is on the raw field.
-    ///   * `unroll.py:216-218` compares `cell_token.retraced_count`
+    ///   * `unroll.py optimize_bridge` compares `cell_token.retraced_count`
     ///     itself against `retrace_limit` and `+= 1`s it.
-    ///   * `unroll.py:272 disable_retracing_if_max_retrace_guards`
+    ///   * `unroll.py disable_retracing_if_max_retrace_guards`
     ///     assigns it `sys.maxint` whole.
-    ///   * `compile.py:728-730 _trace_and_compile_from_bridge` reads
+    ///   * `compile.py _trace_and_compile_from_bridge` reads
     ///     `loop_token.retraced_count & FORCE_BRIDGE_SEGMENTING` to
     ///     decide whether the next bridge from this loop should
-    ///     segment trace at the guard; `pyjitpl.py:2857` ORs it in.
+    ///     segment trace at the guard; `pyjitpl.py prepare_trace_segmenting` ORs it in.
     ///
     /// So bit 0 is at once the flag and the count's low bit, and two
     /// consequences of that are load-bearing.  `sys.maxint` is odd, so
@@ -1282,7 +1282,8 @@ pub struct JitCellToken {
     /// those two consequences carry over.  `FORCE_BRIDGE_SEGMENTING` is
     /// set in `MetaInterp::blackhole_trace_too_long_slow` and read by
     /// `MetaInterp::start_retrace_from_guard`, mirroring
-    /// `pyjitpl.py:2857` / `compile.py:729`.
+    /// `pyjitpl.py prepare_trace_segmenting` /
+    /// `compile.py _trace_and_compile_from_bridge`.
     ///
     /// The complementary `BaseJitCell.flags & FORCE_FINISH` flag in
     /// `warmstate.rs` is NOT a duplicate of this bit — it mirrors
@@ -1331,19 +1332,20 @@ pub struct JitCellToken {
 }
 
 impl JitCellToken {
-    /// `history.py:438` `FORCE_BRIDGE_SEGMENTING = 1` — bit 0 of
-    /// `retraced_count`.  Two writers set it: `pyjitpl.py:2857` (pyre:
+    /// `history.py` `FORCE_BRIDGE_SEGMENTING = 1` — bit 0 of
+    /// `retraced_count`.  Two writers set it: `pyjitpl.py` (pyre:
     /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge trace
-    /// aborts without an inlinable function, and `unroll.py:272`, whose
+    /// aborts without an inlinable function, and
+    /// `unroll.py disable_retracing_if_max_retrace_guards`, whose
     /// odd `sys.maxint` sentinel sets it as a side effect of disabling
-    /// retracing.  Read at `compile.py:729` (pyre:
+    /// retracing.  Read at `compile.py _trace_and_compile_from_bridge` (pyre:
     /// `MetaInterp::start_retrace_from_guard`) to decide whether the
     /// next bridge from this loop should `force_finish_trace`.
     pub const FORCE_BRIDGE_SEGMENTING: u32 = 1;
 
-    /// The raw field, which is what `unroll.py:216-218` reads: it
+    /// The raw field, which is what `unroll.py optimize_bridge` reads: it
     /// compares `cell_token.retraced_count` against `retrace_limit` and
-    /// increments it, never going through `history.py:471`'s
+    /// increments it, never going through `history.py`'s
     /// `get_retraced_count() = retraced_count >> 1`, which no caller in
     /// the vendored tree uses.  The count is therefore unshifted and
     /// shares bit 0 with `FORCE_BRIDGE_SEGMENTING`.
@@ -1353,10 +1355,10 @@ impl JitCellToken {
     }
 
     /// The raw field, matching the two upstream writes:
-    /// `unroll.py:217 cell_token.retraced_count += 1` and
-    /// `unroll.py:272 targeting_jitcell_token.retraced_count =
-    /// sys.maxint`.  Both assign the whole word rather than going
-    /// through `history.py:474`'s flag-preserving `set_retraced_count`,
+    /// `optimize_bridge`'s `cell_token.retraced_count += 1` and
+    /// `disable_retracing_if_max_retrace_guards`'s
+    /// `targeting_jitcell_token.retraced_count = sys.maxint` (`unroll.py`).  Both assign the whole word rather than going
+    /// through `history.py`'s flag-preserving `set_retraced_count`,
     /// so writing the disable sentinel — odd, like `sys.maxint` — sets
     /// `FORCE_BRIDGE_SEGMENTING`, and incrementing clears it.
     #[inline]
@@ -2882,11 +2884,11 @@ pub trait Backend: Send {
     /// Read an integer value from a dead frame at the given index.
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64;
 
-    /// `llmodel.py:246-250 get_value_direct` — read the raw frame word at a
+    /// `llmodel.py get_value_direct` — read the raw frame word at a
     /// DEADFRAME SLOT, not at a fail-argument position. `get_int_value` maps
-    /// its index through `rd_locs` (`llmodel.py:422-424 _decode_pos`); the
+    /// its index through `rd_locs` (`llmodel.py _decode_pos`); the
     /// GUARD_VALUE counter slot `make_a_counter_per_value` records
-    /// (`regalloc.py:495-500`) is a register/frame position of the trace that
+    /// (`regalloc.py consider_guard_value`) is a register/frame position of the
     /// failed and generally has no fail-argument position at all.
     fn get_value_direct(&self, frame: &DeadFrame, slot: usize) -> i64;
 
@@ -3842,11 +3844,12 @@ impl Drop for JittedGuard {
 mod tests {
     use super::*;
 
-    /// `unroll.py:272 disable_retracing_if_max_retrace_guards` writes the raw
+    /// `unroll.py disable_retracing_if_max_retrace_guards` writes the raw
     /// field — `targeting_jitcell_token.retraced_count = sys.maxint` — and
     /// `sys.maxint` is odd, so a loop that carries more guards than
     /// `max_retrace_guards` also comes out with `FORCE_BRIDGE_SEGMENTING` set.
-    /// That is the bit `compile.py:729` reads to force-finish the loop's
+    /// That is the bit `compile.py _trace_and_compile_from_bridge` reads to
+    /// force-finish the loop's
     /// bridges.
     #[test]
     fn disabling_retracing_also_arms_bridge_segmenting() {
@@ -3871,7 +3874,7 @@ mod tests {
         );
     }
 
-    /// `unroll.py:216-217` reads and increments the same raw word, so the
+    /// `unroll.py optimize_bridge` reads and increments the same raw word, so the
     /// increment walks over bit 0 instead of stepping past it.
     #[test]
     fn incrementing_the_retrace_count_consumes_the_segmenting_bit() {

@@ -315,7 +315,7 @@ fn test_guard_and_loop() {
     assert_eq!(result_val, 5, "loop should stop at 5, fail_arg[0]");
 }
 
-/// `regalloc.py:495-500 consider_guard_value`: the counter index names the
+/// `regalloc.py consider_guard_value`: the counter index names the
 /// guard operand's deadframe slot, independent of the guard's fail arguments.
 #[test]
 fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
@@ -362,7 +362,7 @@ fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
         "GUARD_VALUE deadframe slot is implausible: {slot}"
     );
 
-    // 99 != 7, so the guard fails on the first check.  `compile.py:753-771`
+    // 99 != 7, so the guard fails on the first check.  `compile.py must_compile`
     // hashes the failing operand, so the recorded slot has to name the word
     // that holds it — here a register the guard carries no fail argument for.
     let frame = backend.execute_token(&token, &[Value::Int(99)]);

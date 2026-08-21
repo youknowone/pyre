@@ -254,7 +254,7 @@ pub struct CompileResult<M> {
     pub exception: ExceptionState,
     /// compile.py: ResumeGuardDescr.status read at guard failure.
     pub status: u64,
-    /// `compile.py:753-771` reads the failing GUARD_VALUE operand off the
+    /// `compile.py must_compile` reads the failing GUARD_VALUE operand off the
     /// deadframe with `cpu.get_value_direct(deadframe, tp, index)`. The
     /// deadframe's live range ends inside the run, so the read happens where
     /// `status` is read and the word travels out on this result, keeping it
@@ -3289,7 +3289,8 @@ fn alloc_fail_index() -> u32 {
 //                      distinguish guard_value-by-int / -by-ref / -by-float.
 //   - bits 3..end    : jitcounter hash (when TY_NONE) or backend value-slot
 //                      index (when TY_INT/REF/FLOAT), accessed via `>>
-//                      ST_SHIFT` with `ST_SHIFT_MASK` (compile.py:692).
+//                      ST_SHIFT` with `ST_SHIFT_MASK`
+//                      (`compile.py AbstractResumeGuardDescr`).
 //
 // What the value-slot index NAMES is backend-specific — see the same note on
 // `guard_value_counter_slot` in majit-backend's `resume_guard_descr.rs`, which
@@ -4364,7 +4365,7 @@ pub struct ResumeGuardCopiedDescr {
     /// each copied descr carries its own status (the copied receiver is
     /// retraced independently of the donor).
     status: AtomicU64,
-    /// `compile.py:186` `descr.rd_loop_token = clt`.  Copied descrs are
+    /// `compile.py` `descr.rd_loop_token = clt`.  Copied descrs are
     /// stamped per-guard by the same `record_loop_or_bridge` walker
     /// (`compile.py isinstance(descr, ResumeDescr)` covers
     /// `ResumeGuardCopiedDescr` — `_attrs_` lists `rd_loop_token`

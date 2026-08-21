@@ -244,13 +244,14 @@ fn refresh_forwarded_const_ref(
     }
 }
 
-/// pyjitpl.py:3213 `live_arg_boxes[num_green_args:]` - `runtime_boxes` are
+/// `pyjitpl.py compile_trace`'s `live_arg_boxes[num_green_args:]` -
+/// `runtime_boxes` are
 /// the original boxes, InputArg and Op alike. Phase 2 recovers an Op arg's
 /// observed value through its producing op, but `find_producer_op` has
 /// nothing to return for an InputArg arg, so materialize the entry box's
 /// value as an inline Const, which carries it namespace-independently.
 /// `runtime_boxes` are only ever READ by `generate_guards`
-/// (virtualstate.py:646-652); the guard it emits carries the target
+/// (`virtualstate.py generate_guards`); the guard it emits carries the target
 /// state's own constant, never this one.
 fn fold_recorded_jump_args(
     args: Vec<OpRef>,
@@ -370,11 +371,12 @@ pub struct UnrollOptimizer {
     /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputargs
     /// so value_types covers inputarg OpRefs.
     pub trace_inputargs: Vec<majit_ir::OpRef>,
-    /// compile.py:275 `PreambleCompileData(trace, jumpargs, ...)` - the
+    /// compile.py `PreambleCompileData(trace, jumpargs, ...)` - the
     /// ORIGINAL history boxes behind `runtime_boxes`. `trace_inputargs`
     /// carries only each entry slot's position and type; these are the boxes
-    /// themselves, whose observed value virtualstate.py:400-405/:493-498/:579
-    /// /:601-620 read un-forwarded off `runtime_boxes[i]`.
+    /// themselves, whose observed value `virtualstate.py`'s `_generate_guards`
+    /// / `_generate_guards_unkown` / `_generate_guards_nonnull` /
+    /// `_generate_guards_knownclass` read un-forwarded off `runtime_boxes[i]`.
     pub trace_inputarg_boxes: Vec<majit_ir::InputArgRc>,
     /// Phase 1 emit ops (filtered to non-NONE pos, non-Void type) carried
     /// into Phase 2 so that `OptContext::op_at` resolves Phase 1 OpRefs

@@ -1862,7 +1862,7 @@ impl Optimization for OptRewrite {
                         return raise_invalid_loop("GUARD_ISNULL proven to always fail", op, ctx);
                     }
                 }
-                // rewrite.py:197-198 `postprocess_GUARD_ISNULL` runs its
+                // rewrite.py `postprocess_GUARD_ISNULL` runs its
                 // `make_constant(op.getarg(0), CONST_NULL)` in
                 // `propagate_postprocess` below, for the same reason
                 // postprocess_GUARD_VALUE does: pre-emit it installs the Const
@@ -2380,7 +2380,7 @@ impl Optimization for OptRewrite {
                     ctx.make_constant_arg(&op.arg(0), val);
                 }
             }
-            // rewrite.py:197-198 postprocess_GUARD_ISNULL
+            // rewrite.py postprocess_GUARD_ISNULL
             //     self.make_constant(op.getarg(0), CONST_NULL)
             // Ref-typed → Value::Ref(NULL); Int-typed → Value::Int(0).
             OpCode::GuardIsnull => {
@@ -3089,7 +3089,7 @@ mod tests {
         );
     }
 
-    /// `rewrite.py:186-198` splits GUARD_ISNULL in two: `optimize_` emits the
+    /// `rewrite.py` splits GUARD_ISNULL in two: `optimize_GUARD_ISNULL` emits the
     /// guard, `postprocess_` runs `make_constant(op.getarg(0), CONST_NULL)`.
     /// Running that `make_constant` in the forward half installs the Const
     /// forwarding before `emit_operation` resolves the guard's own arg 0, and

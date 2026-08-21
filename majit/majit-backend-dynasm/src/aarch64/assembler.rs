@@ -4131,13 +4131,13 @@ impl<'a> AssemblerARM64<'a> {
         // canonical copy when present.  Must follow the `meta_descr`
         // stamp above for the forward to reach the meta side.
         descr_fd.set_rd_locs(rd_locs);
-        // `regalloc.py:495-500 consider_guard_value` records
-        // `all_reg_indexes[x.value]`, a deadframe slot; `llmodel.py:427-435
+        // `regalloc.py consider_guard_value` records
+        // `all_reg_indexes[x.value]`, a deadframe slot; `llmodel.py
         // get_value_direct` reads the raw jitframe word at that slot. The
         // shared failure stub saves every managed register into the jitframe
         // before recovery runs, so the operand remains readable even when it
         // is not a fail-arg. Stamping while laying the guard out means
-        // `store_hash` (`compile.py:826-829`, gated on `status == 0`) leaves it
+        // `store_hash` (`compile.py`, gated on `status == 0`) leaves it
         // alone and `must_compile` hashes the (guard, failing value) pair
         // instead of the guard alone.  Without it a guard whose failing value
         // never repeats still accumulates in one bucket and compiles another

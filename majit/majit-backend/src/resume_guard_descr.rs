@@ -60,10 +60,12 @@ use crate::resume_value::ResumeData;
 //                      distinguish guard_value-by-int / -by-ref / -by-float.
 //   - bits 3..end    : jitcounter hash (when TY_NONE) or backend value-slot
 //                      index (when TY_INT/REF/FLOAT), accessed via `>>
-//                      ST_SHIFT` with `ST_SHIFT_MASK` (compile.py:692).
+//                      ST_SHIFT` with `ST_SHIFT_MASK`
+//                      (`compile.py AbstractResumeGuardDescr`).
 //
 // What the value-slot index NAMES is backend-specific, because
-// `make_a_counter_per_value` (`regalloc.py:495-500`) records a register or
+// `make_a_counter_per_value` (`regalloc.py consider_guard_value`) records a
+// register or
 // frame position of the trace that failed. On dynasm that is a deadframe
 // slot, read with `Backend::get_value_direct`; on the backends whose slot
 // space IS the dense fail-argument vector it coincides with a fail-argument
@@ -77,10 +79,10 @@ pub const STATUS_TY_INT: u64 = 0x02;
 pub const STATUS_TY_REF: u64 = 0x04;
 pub const STATUS_TY_FLOAT: u64 = 0x06;
 
-/// The deadframe slot `compile.py:753-771` reads the failing GUARD_VALUE
+/// The deadframe slot `compile.py must_compile` reads the failing GUARD_VALUE
 /// operand from, or `None` when this failure does not take that arm:
 /// TY_NONE is the per-guard hash and a busy status is `must_compile`'s
-/// early `return False` (`compile.py:750-751`).
+/// early `return False` (`compile.py must_compile`).
 ///
 /// The slot is only meaningful to the backend that recorded it — see the
 /// status-layout note above for which backends read it as a deadframe slot

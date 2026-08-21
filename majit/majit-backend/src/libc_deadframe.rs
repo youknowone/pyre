@@ -148,9 +148,9 @@ impl LibcJitFrameDeadFrame {
         }
     }
 
-    /// `llmodel.py:246-250 get_value_direct` — the raw frame word at a
+    /// `llmodel.py get_value_direct` — the raw frame word at a
     /// deadframe SLOT. `get_int` maps its argument through `slot_of`'s
-    /// `rd_locs` decode (`llmodel.py:422-424 _decode_pos`); this does not,
+    /// `rd_locs` decode (`llmodel.py _decode_pos`); this does not,
     /// because the slot a GUARD_VALUE counter records is a register or frame
     /// position of the failing trace, not a fail-argument index.
     pub fn get_int_at_slot(&self, slot: usize) -> i64 {

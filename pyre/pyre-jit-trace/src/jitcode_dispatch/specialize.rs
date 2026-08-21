@@ -2460,10 +2460,10 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     }
     let raw_value = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
     let value = if stored.is_null() {
-        // End of the chain.  A nullity test is `pyjitpl.py:558-574
+        // End of the chain.  A nullity test is `pyjitpl.py
         // _establish_nullity`'s GUARD_ISNULL plus a `replace_box` onto the null
         // constant `constant_from_op` gives it — not a promote.  The
-        // distinction is load-bearing: `compile.py:813-824
+        // distinction is load-bearing: `compile.py
         // make_a_counter_per_value` keys a GUARD_VALUE's jitcounter on the
         // *failing value*, and this slot holds a different PyTraceback on every
         // walk, so no one value here ever reaches `trace_eagerness` and the
@@ -3276,10 +3276,10 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
             ctx.trace_ctx.const_int(map as i64),
             OpCode::GuardValue,
         ),
-        // Pinning `w_dict` at null is a nullity test, and `pyjitpl.py:558-574
+        // Pinning `w_dict` at null is a nullity test, and `pyjitpl.py
         // _establish_nullity` proves one with GUARD_ISNULL.  As a GUARD_VALUE
         // the guard's jitcounter keys on the *failing* value
-        // (`compile.py:813-824 make_a_counter_per_value`), which here is
+        // (`compile.py make_a_counter_per_value`), which here is
         // whatever dictionary the assignment just allocated — a fresh address
         // every time, so no one value reaches `trace_eagerness` and the
         // has-a-dictionary continuation never gets a bridge.

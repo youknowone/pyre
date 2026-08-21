@@ -5259,7 +5259,7 @@ impl<S: JitState> JitDriver<S> {
             let raw_values = result.values.clone();
             let descr_arc = std::sync::Arc::clone(&result.descr_arc);
             let guard_value_operand = result.guard_value_operand;
-            // blackhole.py:1794 `_prepare_resume_from_failure(deadframe)`:
+            // blackhole.py `_prepare_resume_from_failure(deadframe)`:
             // the pending exception grabbed at guard failure
             // (cpu.grab_exc_value) must seed the blackhole resume so an
             // exception guard unwinds into its handler instead of resuming
@@ -5313,7 +5313,7 @@ impl<S: JitState> JitDriver<S> {
                 guard_value_operand,
                 fallback_green_key,
             );
-            // compile.py:702-703: must_compile() and not stack_almost_full().
+            // compile.py: must_compile() and not stack_almost_full().
             // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
             // guard failure resumes via blackhole — isolates bridge-record
             // resume defects from the blackhole path.
@@ -6802,7 +6802,7 @@ impl<S: JitState> JitDriver<S> {
         let typed_values = std::mem::take(&mut result.typed_values).into_vec();
         let raw_values = std::mem::take(&mut result.values).into_vec();
         let guard_value_operand = result.guard_value_operand;
-        // llmodel.py:240 grab_exc_value: the pending exception captured at
+        // llmodel.py grab_exc_value: the pending exception captured at
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).
         let guard_exc = result.exception.exc_value;
@@ -6843,7 +6843,7 @@ impl<S: JitState> JitDriver<S> {
             guard_value_operand,
             fallback_green_key,
         );
-        // compile.py:702-703: must_compile() and not stack_almost_full().
+        // compile.py: must_compile() and not stack_almost_full().
         // `no_bridge_enabled()` is the same opt-out the two sibling loops
         // apply; this is the loop pyre actually runs, so leaving it out made
         // `MAJIT_NO_BRIDGE=1` report a bridge-free run while still compiling
