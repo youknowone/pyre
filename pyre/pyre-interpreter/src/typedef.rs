@@ -19761,7 +19761,7 @@ pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef
         FloatToIntMode::Floor => v.floor(),
         FloatToIntMode::Ceil => v.ceil(),
     };
-    // `floatobject.py:151-158 newint_from_float` reaches for
+    // `floatobject.py`'s `newint_from_float` reaches for
     // `ovfcheck_float_to_int` first and only materialises a long when that
     // overflows.  `2**63` is exactly representable while `i64::MAX` is not, so
     // the upper bound is strict — the same pair the `int(x)` walker

@@ -10025,7 +10025,7 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `math.fabs(x)` on an exact int/float argument.  `interp_math.py:386` is
+/// `math.fabs(x)` on an exact int/float argument.  `interp_math.py`'s `fabs` is
 /// `math1(space, math.fabs, w_x)`, and RPython lowers `ll_math_fabs` to a sign
 /// mask, so the whole builtin is one `FloatAbs` once the operand is unboxed.
 /// `fabs` is total — it raises for no input and needs no domain guard — so the
@@ -10124,7 +10124,7 @@ pub(crate) enum MathRoundMode {
 
 /// `math.floor(x)` / `math.ceil(x)` / `math.trunc(x)` on an exact float.
 ///
-/// `interp_math.py:393`/`:496`/`:59` look the dunder up on the type and call
+/// `floor`/`ceil`/`trunc` look the dunder up on the type and call
 /// it; for an exact float that resolves to `W_FloatObject`'s own reduction
 /// followed by `newint_from_float`, whose `ovfcheck_float_to_int` arm is a
 /// machine cast.  Recreate that shape: unbox, guard the operand into the

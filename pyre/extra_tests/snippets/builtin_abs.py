@@ -4,7 +4,8 @@ assert abs(-3.21) == 3.21
 assert abs(6.25) == 6.25
 
 
-# `abs()` reaches `__abs__` through the type (operation.py:14 -> `space.abs`),
+# `abs()` reaches `__abs__` through the type (`operation.py`'s `abs` hands the
+# operand to `space.abs`),
 # so a subtype that replaced the builtin one is dispatched to.
 class AbsInt(int):
     def __abs__(self):

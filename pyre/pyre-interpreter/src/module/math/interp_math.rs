@@ -732,7 +732,7 @@ fn math_unary_int(
             "{fname}() takes exactly 1 argument",
         )));
     }
-    // `interp_math.py:393 floor` / `:496 ceil` / `:59 trunc`:
+    // `interp_math.py`'s `floor` / `ceil` / `trunc`:
     //
     //     w_descr = space.lookup(w_x, '__floor__')
     //     if w_descr is not None:
@@ -993,7 +993,7 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     }
     // `rel_tol` and `abs_tol` are the only (keyword-only) parameters.
     crate::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
-    // `interp_math.py:698-701` — all four operands are converted, in this
+    // `interp_math.py`'s `isclose` — all four operands are converted, in this
     // order, before anything about them is checked, so a non-numeric `a` is
     // reported even when a tolerance is negative.  An omitted tolerance
     // arrives upstream as an already-wrapped float, so converting it can
@@ -1009,7 +1009,7 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     };
     let rel_tol = read("rel_tol")?;
     let abs_tol = read("abs_tol")?;
-    // `interp_math.py:703-705` — the sanity check on the tolerances runs
+    // `isclose` — the sanity check on the tolerances runs
     // after those conversions and before the comparison, and names them.
     // `pymath` reports the same rejection as EDOM, which `map_int_err`
     // relabels "math domain error".
@@ -1154,7 +1154,7 @@ fn get_bigint(obj: PyObjectRef) -> Result<BigInt, crate::PyError> {
 }
 
 /// `space.abs(space.index(w))` in the machine-word domain.  `None` is
-/// `interp_math.py:753`'s `except OverflowError` direction, which replays the
+/// `gcd_two`'s `except OverflowError` direction, which replays the
 /// pair in the rbigint domain: `is_long` values never fit, and `i64::MIN` is
 /// the one machine int whose absolute value leaves the range.
 fn index_abs_machine_word(obj: PyObjectRef) -> Option<i64> {
@@ -1166,7 +1166,7 @@ fn index_abs_machine_word(obj: PyObjectRef) -> Option<i64> {
 
 pub fn gcd(args: &[PyObjectRef]) -> PyResult {
     let args = no_keywords(args, "gcd")?;
-    // `interp_math.py:747 gcd_two` reads both operands as Signed and only
+    // `interp_math.py`'s `gcd_two` reads both operands as Signed and only
     // falls back to rbigint when one overflows.  Taking the pair through
     // `get_bigint` unconditionally allocates five digit blocks and runs a
     // divmod to reduce two machine words.
