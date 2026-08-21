@@ -2430,14 +2430,32 @@ pub(crate) enum CalleeReplaySafety {
 /// guard inside an inlined `__init__` therefore resumes inside `__init__`;
 /// `__new__` is not re-run and no store can be doubled.
 ///
-/// Convergence path: seed the callee frame for the constructor route, which is
-/// what the keyed instance-`__next__` route already does
-/// (`inline_call.rs try_walker_inline_resolved_user_call_inner`, the
-/// `instance_next_seeded_route` arm).  Constructors are excluded from it today
-/// only by being pinned to the strict straight-line path
-/// (`constructor_result.is_some() && !strict_inlinable` declines, and
-/// `multiframe_eligible = !strict_inlinable`).  Seeding it deletes this field,
-/// `CalleeReplaySafety`, and [`fbw_callee_body_replay_safety`] outright.
+/// Convergence path.  Seeding the callee frame is necessary but NOT
+/// sufficient.  A blackhole level's return kind is decided by the `*_return`
+/// op the callee itself executes, so a seeded `__init__` level returns Ref and
+/// `_setup_return_value_r` (`blackhole.py`) writes its None into the caller's
+/// call-result register — the register that has to hold the instance.
+/// Upstream never meets this, because `descr_call` (`typeobject.py`) is a
+/// level of its own: the discard, the "should return None" TypeError and the
+/// `return w_newobject` all live in ITS jitcode, and
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) chains it between the
+/// caller and `__init__`.
+///
+/// Pyre can hold that shape without inventing a channel, because
+/// `blackhole_from_resumedata` (`majit-metainterp/src/resume.rs`) builds the
+/// level chain out of the recorded resume SECTIONS.  One section keyed to a
+/// synthetic jitcode carrying `descr_call`'s JIT-visible tail is the whole
+/// mechanism: a resume anchor immediately after an `inline_call_*_r` whose
+/// result register takes `__init__`'s value, then the None check, then
+/// `ref_return` of the instance.  A jitcode with a null `code_ptr` already
+/// exists — the jd1 drain portal, see `state.rs raw_code_for_jitcode_index` —
+/// so a level with no Python code object is already tolerated.
+///
+/// Landing that section is what retires this field, `CalleeReplaySafety` and
+/// [`fbw_callee_body_replay_safety`], together with the two constructor
+/// exclusions in `inline_call.rs try_walker_inline_resolved_user_call_inner`
+/// (`constructor_result.is_some() && !strict_inlinable`, and the
+/// `constructor_result.is_none()` term on `strict_seed`).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CalleeArgFact {
     pub(crate) numeric: bool,
