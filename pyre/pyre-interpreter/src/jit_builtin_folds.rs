@@ -184,7 +184,16 @@ extern "C" fn jit_builtin_abs_float(obj: i64) -> f64 {
 fn compare_pair(a: PyObjectRef, b: PyObjectRef, want_second_wins: bool) -> Option<bool> {
     unsafe {
         let exact = |obj, tp| pyre_object::is_exact_type(obj, tp);
-        if exact(a, &pyre_object::INT_TYPE) && exact(b, &pyre_object::INT_TYPE) {
+        // `is_exact_type` answers on `w_class`, and `w_long_from_raw` wires a
+        // bigint's `w_class` to `int`'s so that `type(x) is int` holds for one
+        // — so the exact-`int` gate alone admits a `W_LongObject`, whose
+        // `value: *mut BigInt` sits exactly where `W_IntObject` keeps
+        // `intval`.  Reading one as the other would compare heap addresses
+        // instead of numbers.  `is_int` reads `ob_type`, which still separates
+        // the two layouts; this is the conjunct the dict's builtin-key test
+        // uses for the same reason.
+        let machine_int = |obj| exact(obj, &pyre_object::INT_TYPE) && pyre_object::is_int(obj);
+        if machine_int(a) && machine_int(b) {
             let (a, b) = (
                 pyre_object::w_int_get_value(a),
                 pyre_object::w_int_get_value(b),
