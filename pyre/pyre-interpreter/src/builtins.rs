@@ -2593,6 +2593,11 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         "__new__",
         crate::typedef::make_new_descr(memoryview_descr_new),
     );
+    // PyPy 45c580c1aa (`W_MemoryView.typedef`) installs
+    // `make_weakref_descr(W_MemoryView)`.  The native payload already owns
+    // the corresponding `_lifeline_`; publish the descriptor from the same
+    // TypeDef namespace instead of representing only the capability flag.
+    type_ns_store(ns_slot, "__weakref__", crate::typedef::weakref_descr());
     for (name, f, arity) in [
         ("__getitem__", memoryview_getitem as MvFn, 2u16),
         ("__setitem__", memoryview_setitem, 3),

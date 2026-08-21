@@ -11310,6 +11310,17 @@ fn type_weakrefoffset_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 fn init_type_type(ns: PyObjectRef) {
+    // typeobject.py:1074 W_TypeObject.typedef installs the canonical
+    // weakref descriptor.  W_TypeObject owns its lifeline directly
+    // (typeobject.py:691-701); exposing only the weakrefable flag loses the
+    // TypeDef surface and makes `type.__dict__['__weakref__']` disappear.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__weakref__",
+            weakref_descr(),
+        )
+    };
     // type.__new__(metatype, name, bases, dict) — creates new type
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(

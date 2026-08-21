@@ -1,4 +1,5 @@
 import types
+import weakref
 
 from testutils import assert_raises
 
@@ -69,6 +70,11 @@ assert type.__module__ == "builtins"
 assert type.__qualname__ == "type"
 assert type.__name__ == "type"
 assert isinstance(type.__doc__, str)
+assert "__weakref__" in type.__dict__
+assert type.__dict__["__weakref__"].__name__ == "__weakref__"
+assert type.__weakref__ is None
+type_ref = weakref.ref(type)
+assert type.__weakref__ is type_ref
 assert object.__qualname__ == "object"
 assert int.__qualname__ == "int"
 
