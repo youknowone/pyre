@@ -37,7 +37,7 @@ Copied from the `pyre/check.py (ubuntu-24.04)` job of [CI run 32465640260](https
 
 `dynasm` is the default backend of the `pyre` binary; `cranelift` and `wasm` are the other two MaJIT code generators.
 
-Reading the table: the printed times are wall clock and include interpreter startup, which on that runner was 0.010s for CPython, 0.013s for PyPy, 0.109s for dynasm, 0.106s for cranelift and 0.046s for wasm. The ratios divide execution-only times, so they are not the quotient of the printed columns — that startup difference is why `int_loop` prints a third more than PyPy's time yet ratios at 1.0x. A `–` in the CPython column means check.py ran no CPython reference for that benchmark, not that it timed out: it measures one only where a vs-CPython gate is configured, and `--full` measures it everywhere. Absolute times are runner-dependent and only comparable within one table; the ratios are the part that carries across runs.
+Reading the table: the printed times are user CPU time — `check.py`'s `run_timed` reports `ru_utime` on Unix and `TotalUserTime` on Windows — and include interpreter startup, which on that runner was 0.010s for CPython, 0.013s for PyPy, 0.109s for dynasm, 0.106s for cranelift and 0.046s for wasm. The ratios divide execution-only times, so they are not the quotient of the printed columns — that startup difference is why `int_loop` prints a third more than PyPy's time yet ratios at 1.0x. A `–` in the CPython column means check.py ran no CPython reference for that benchmark, not that it timed out: it measures one only where a vs-CPython gate is configured, and `--full` measures it everywhere. Absolute times are runner-dependent and only comparable within one table; the ratios are the part that carries across runs.
 
 On execution-only time the default backend is at 2.0x of PyPy or better on nine of the ten. `float_loop` beats PyPy on all three backends, and `int_loop` and `raise_catch` reach parity on dynasm. `fannkuch` is the widest gap. Cranelift trails dynasm on eight of the ten — widest on `fannkuch` (~2.0x) and `raise_catch` (~1.9x) — and matches it only on `fib_loop` and `inline_helper`. Where CPython was measured, pyre runs `fannkuch` ~3.3x and `fib_recursive` ~3.1x faster than it, and `fib_loop` ~1.2x.
 
@@ -83,7 +83,7 @@ pyre follows PyPy's meta-tracing approach:
 1. The **interpreter** (`pyre-interpreter`) executes Python bytecodes normally.
 2. When a loop or function becomes hot, **MaJIT** records the interpreter's execution as a linear trace of IR operations.
 3. The trace passes through an **8-pass optimizer** — the same pipeline as PyPy: IntBounds, Rewrite, Virtualize, String, Pure, Guard, Simplify, Heap.
-4. The optimized IR is compiled to **native machine code** by one of three MaJIT backends: `dynasm` (the default; x86-64 and aarch64), Cranelift, or WebAssembly.
+4. The optimized IR is compiled by one of three MaJIT backends: `dynasm` (the default; x86-64 and aarch64) and Cranelift emit **native machine code**; the third emits **WebAssembly**, which `pyre-wasm-runner` executes under wasmtime.
 5. Subsequent executions of that path run the compiled code directly. Guard failures fall back to the interpreter.
 
 ### Function inlining
