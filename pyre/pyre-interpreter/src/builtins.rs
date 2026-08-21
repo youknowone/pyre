@@ -15124,9 +15124,12 @@ impl crate::listsort::SortLt<usize> for SortCompare {
 /// upstream — so the test has to be `is_exact_type` (pyobject.rs), which
 /// compares the instance's `w_class` against the builtin's type object and so
 /// rejects a subclass, which retags `w_class` to its own.  `is_int` / `is_str`
-/// / `is_float` are NOT usable here: they are `py_type_check`, an `ob_type`
-/// layout test a subclass instance also passes because it shares the builtin
-/// vtable.  A `key=` sort is `CustomKeySort`, generic upstream as well.
+/// / `is_float` are NOT usable here ON THEIR OWN: they are `py_type_check`, an
+/// `ob_type` layout test a subclass instance also passes because it shares the
+/// builtin vtable.  The int arm needs both tests, which is what
+/// `is_plain_int1` is -- the exact-class test alone would let a bigint into a
+/// comparator that reads a machine word.  A `key=` sort is `CustomKeySort`,
+/// generic upstream as well.
 fn sort_compare_for(base: usize, len: usize, keyed: bool) -> SortCompare {
     if keyed {
         return SortCompare::Generic(base);
@@ -15138,7 +15141,15 @@ fn sort_compare_for(base: usize, len: usize, keyed: bool) -> SortCompare {
             // `bool` is admitted alongside `int` because it cannot be
             // subclassed, so it can never carry an overriding `__lt__`, and
             // `int_value` reads it the same way.
-            all_int &= pyre_object::is_exact_type(item, &pyre_object::INT_TYPE)
+            // `is_exact_type` answers on `w_class`, and a bigint's is wired
+            // to `int`'s so that `type(x) is int` holds for one -- so it alone
+            // admits a `W_LongObject`, whose `*mut BigInt` sits where
+            // `W_IntObject` keeps `intval`, and the `Int` arm's `int_value`
+            // would order the list by payload address.  `is_plain_int1` is the
+            // strategy's own `is_correct_type`, which carries both halves;
+            // using it here is what makes this scan the strategy decision it
+            // stands in for.
+            all_int &= pyre_object::listobject::is_plain_int1(item)
                 || pyre_object::is_exact_type(item, &pyre_object::BOOL_TYPE);
             all_float &= pyre_object::is_exact_type(item, &pyre_object::FLOAT_TYPE);
             all_str &= pyre_object::is_exact_type(item, &pyre_object::STR_TYPE);
