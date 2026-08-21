@@ -73,7 +73,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             false, false,
         ))),
         // RPython `StringBuilder()` binds to `SomeStringBuilder` at the
-        // annotator (`rlib/rstring.py:890`); the rtyper then resolves it
+        // annotator (`rlib/rstring.py`); the rtyper then resolves it
         // to `StringBuilderRepr`.  Carries no payload — the method call
         // surface (`append` / `build` / `getlength`) lives on
         // `SomeStringBuilder` itself.

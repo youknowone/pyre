@@ -430,7 +430,7 @@ fn transduce_op(
         }
         // `cast_int_to_uint` / `cast_uint_to_int` — identity at LL level
         // (`getkind(Signed) == getkind(Unsigned) == 'int'`).  RPython
-        // `jtransform.py:336-337 rewrite_op_cast_*` are explicit no-ops; the
+        // `jtransform.py rewrite_op_cast_*` are explicit no-ops; the
         // rich-`OpKind` `UnaryOp` carries the cast name so the shared
         // jtransform tail drops it and aliases the result to the operand.
         name @ ("cast_int_to_uint" | "cast_uint_to_int") => {

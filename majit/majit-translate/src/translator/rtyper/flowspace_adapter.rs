@@ -1873,7 +1873,7 @@ pub fn translate_op(
                     // `__pyre_stringbuilder_append(recv, piece)` →
                     // `getattr(recv, "append") + simple_call(bound, piece)`,
                     // reaching `StringBuilderRepr::rtype_method("append")`
-                    // (rstring.py:891-894) — identical to the `Vec::push` arm.
+                    // (rstring.py) — identical to the `Vec::push` arm.
                     if segments.len() == 1 && segments[0] == "__pyre_stringbuilder_append" {
                         if arg_hls.len() != 2 {
                             return Err(TyperError::message(format!(
@@ -1911,7 +1911,7 @@ pub fn translate_op(
                     // `__pyre_stringbuilder_build(recv)` →
                     // `getattr(recv, "build") + simple_call(bound)`, reaching
                     // `StringBuilderRepr::rtype_method("build")`
-                    // (rstring.py:916-917) → `SomeString` — identical to the
+                    // (rstring.py) → `SomeString` — identical to the
                     // `slice.reverse` arm (no extra args on the bound method).
                     if segments.len() == 1 && segments[0] == "__pyre_stringbuilder_build" {
                         if arg_hls.len() != 1 {

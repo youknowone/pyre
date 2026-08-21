@@ -1999,7 +1999,7 @@ fn analyze_pipeline_from_module_paths(
         );
     }
 
-    // rbuilder.py:114 `ll_shrink_final` calls `rgc.ll_shrink_array(buf, size)`,
+    // rbuilder.py `ll_shrink_final` calls `rgc.ll_shrink_array(buf, size)`,
     // whose `@jit.oopspec("rgc.ll_shrink_array")` is minted by the rtyper
     // (`rtype_builder_build`'s nested `ll_shrink_array` helper) with a stub
     // body, so there is no source-level `#[oopspec]` for the walker to

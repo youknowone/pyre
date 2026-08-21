@@ -618,7 +618,7 @@ pub fn build_ll_new_helper_graph(
 
 /// Stub `ll_shrink_array(buf, smallerlength) -> buf` — an identity the
 /// codewriter never executes.  `rgc.ll_shrink_array` is an `@jit.oopspec`
-/// (`rgc.py:471`), so the `direct_call` naming this helper lowers to a
+/// (`rgc.py`), so the `direct_call` naming this helper lowers to a
 /// `ShrinkArray` residual (`jtransform._handle_rgc_call`), which does the real
 /// shrink at runtime (`eval.rs ll_shrink_array` / `opt_call_shrink_array`).
 /// The body exists only so [`functionptr_const`] has a graph to name; it
@@ -5761,7 +5761,7 @@ fn rtype_builder_getlength(
 }
 
 /// RPython `AbstractStringBuilderRepr.rtype_method_append(self, hop)`
-/// (`rbuilder.py:15-19`):
+/// (`rbuilder.py`):
 ///
 /// ```python
 /// def rtype_method_append(self, hop):
@@ -5965,7 +5965,7 @@ fn rtype_builder_append(
 }
 
 /// RPython `AbstractStringBuilderRepr.rtype_method_build(self, hop)`
-/// (`rbuilder.py:47-50`):
+/// (`rbuilder.py`):
 ///
 /// ```python
 /// def rtype_method_build(self, hop):

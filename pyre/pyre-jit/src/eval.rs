@@ -13548,7 +13548,7 @@ mod rbuilder_runtime {
         pyre_object::gc_storage::gc_alloc_storage_box::<StringPieceBox>(value, tid) as i64
     }
 
-    /// `StringBuilderRepr.ll_new(init_size)` (`rbuilder.py:445-455`).
+    /// `StringBuilderRepr.ll_new(init_size)` (`rbuilder.py`).
     pub fn ll_new(init_size: i64, item_size: usize) -> i64 {
         // `intmask(min(r_uint(init_size), r_uint(1280)))` — negatives (huge as
         // unsigned) and anything over 1280 clamp to 1280.
@@ -13571,7 +13571,7 @@ mod rbuilder_runtime {
         })
     }
 
-    /// `rbuilder.py:96-115 ll_grow_by`: round the growth up to a multiple of 64,
+    /// `rbuilder.py ll_grow_by`: round the growth up to a multiple of 64,
     /// chain the filled `current_buf` into a fresh STRINGPIECE, install a new
     /// empty `current_buf`. (Overflow → MemoryError is deferred; builder sizes
     /// here are small.)
@@ -13597,7 +13597,7 @@ mod rbuilder_runtime {
         b.extra_pieces = old_piece;
     }
 
-    /// `rbuilder.py:117-150 ll_grow_and_append`: split the append across the
+    /// `rbuilder.py ll_grow_and_append`: split the append across the
     /// current buffer's remaining room and a freshly grown buffer.
     ///
     /// The upstream `size > 1280` single-big-string fast path *aliases* `ll_str`
@@ -13630,7 +13630,7 @@ mod rbuilder_runtime {
         copy_string_contents(ll_str, new_buf, start as usize, 0, size as usize, item_size);
     }
 
-    /// `rbuilder.py:80-89 _ll_append`.
+    /// `rbuilder.py _ll_append`.
     pub fn ll_append(builder: i64, ll_str: i64, start: i64, size: i64, item_size: usize) {
         let (pos, end, cur_buf) = {
             let b = unsafe { &*(builder as *const StringBuilderBox) };
@@ -13652,7 +13652,7 @@ mod rbuilder_runtime {
         }
     }
 
-    /// `rbuilder.py:178-184 ll_append_char`.
+    /// `rbuilder.py ll_append_char`.
     pub fn ll_append_char(builder: i64, char: i64, item_size: usize) {
         let full = {
             let b = unsafe { &*(builder as *const StringBuilderBox) };
@@ -13667,13 +13667,13 @@ mod rbuilder_runtime {
         bh_write_lowlevel_char(b.current_buf, pos as usize, char, item_size);
     }
 
-    /// `rbuilder.py:346-350 ll_getlength`.
+    /// `rbuilder.py ll_getlength`.
     pub fn ll_getlength(builder: i64) -> i64 {
         let b = unsafe { &*(builder as *const StringBuilderBox) };
         b.total_size - (b.current_end - b.current_pos)
     }
 
-    /// `rbuilder.py:365-372 ll_shrink_final`.
+    /// `rbuilder.py ll_shrink_final`.
     fn ll_shrink_final(builder: i64, item_size: usize) {
         let b = unsafe { &mut *(builder as *mut StringBuilderBox) };
         let final_size = b.current_pos;
@@ -13683,7 +13683,7 @@ mod rbuilder_runtime {
         b.total_size = final_size;
     }
 
-    /// `rbuilder.py:374-412 ll_fold_pieces`: concatenate `current_buf` and the
+    /// `rbuilder.py ll_fold_pieces`: concatenate `current_buf` and the
     /// `extra_pieces` chain (newest-first ⇒ filled back-to-front) into one buffer.
     ///
     /// B1 reclamation: nulling `extra_pieces` makes the detached STRINGPIECE
@@ -13757,7 +13757,7 @@ mod rbuilder_runtime {
         bh_free_lowlevel_string(current_buf, base, item_size);
     }
 
-    /// `rbuilder.py:355-363 ll_build`: consolidate to a single buffer and return
+    /// `rbuilder.py ll_build`: consolidate to a single buffer and return
     /// it. The builder keeps owning the returned `current_buf` (its drop glue
     /// frees it) — the caller must copy or take ownership before the builder dies
     /// (task #48c/#49 handoff).

@@ -2643,7 +2643,7 @@ fn char_method_isupper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValu
     SomeValue::Bool(SomeBool::new())
 }
 
-/// `StringBuilder.append(self, s_str)` (rstring.py:891-894) — void; the
+/// `StringBuilder.append(self, s_str)` (rstring.py) — void; the
 /// model asserts the arg is str/char and the call binds Impossible.
 fn stringbuilder_method_append(
     _ann: &RPythonAnnotator,
@@ -2654,7 +2654,7 @@ fn stringbuilder_method_append(
     None
 }
 
-/// `StringBuilder.build(self)` (rstring.py:916-917) → `SomeString`.
+/// `StringBuilder.build(self)` (rstring.py) → `SomeString`.
 fn stringbuilder_method_build(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeStringBuilder,
@@ -2662,7 +2662,7 @@ fn stringbuilder_method_build(
     s_self.method_build()
 }
 
-/// `StringBuilder.getlength(self)` (rstring.py:913-914) → `SomeInteger`.
+/// `StringBuilder.getlength(self)` (rstring.py) → `SomeInteger`.
 fn stringbuilder_method_getlength(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeStringBuilder,
@@ -2670,7 +2670,7 @@ fn stringbuilder_method_getlength(
     s_self.method_getlength()
 }
 
-/// `UnicodeBuilder.getlength(self)` (rstring.py:953-954) → `SomeInteger`.
+/// `UnicodeBuilder.getlength(self)` (rstring.py) → `SomeInteger`.
 fn unicodebuilder_method_getlength(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeUnicodeBuilder,
@@ -2789,7 +2789,7 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "isalnum" => "str_method_isalnum",
             _ => return None,
         },
-        // rstring.py:891-917 — the `StringBuilder` call surface.  Only the
+        // rstring.py — the `StringBuilder` call surface.  Only the
         // methods the rtyper lowers (`StringBuilderRepr::rtype_method`) are
         // exposed here: append/build/getlength.
         SomeValue::StringBuilder(_) => match name {
@@ -2798,7 +2798,7 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "getlength" => "stringbuilder_method_getlength",
             _ => return None,
         },
-        // rstring.py:953-954 — the `UnicodeBuilder` surface the rtyper
+        // rstring.py — the `UnicodeBuilder` surface the rtyper
         // lowers so far (`UnicodeBuilderRepr::rtype_method`): getlength.
         SomeValue::UnicodeBuilder(_) => match name {
             "getlength" => "unicodebuilder_method_getlength",
