@@ -1742,6 +1742,14 @@ impl DictOperationGuard {
         }
     }
 
+    /// Re-read a rooted operand.
+    ///
+    /// The collector rewrites this scope's slots in place, so calling this
+    /// again after a step that can collect is what keeps a raw local naming
+    /// the dictionary's current address — a `W_DictObject` header comes from
+    /// the movable `try_gc_alloc` hook.  Two steps in this file collect: a
+    /// strategy promotion, which re-stores every key through a fresh box, and
+    /// `object_key_for_checked`, which runs the key's own `__hash__`.
     #[inline]
     pub fn root(&self, index: usize) -> PyObjectRef {
         self.roots.get(self.root_base + index)
@@ -1756,6 +1764,13 @@ macro_rules! lock_dict_refs {
     ($guard:ident, $obj:ident, $one:ident) => {
         let $guard = unsafe { DictOperationGuard::new($obj, &[$one]) };
         let $obj = $guard.root(0);
+        let $one = $guard.root(1);
+    };
+    // Receiver deliberately left unbound: a body whose first touch of the
+    // dictionary follows a step that collects reads it off `root(0)` there,
+    // and a binding here would only offer the pre-collection word.
+    (defer $guard:ident, $obj:ident, $one:ident) => {
+        let $guard = unsafe { DictOperationGuard::new($obj, &[$one]) };
         let $one = $guard.root(1);
     };
     ($guard:ident, $obj:ident, $one:ident, $two:ident) => {
@@ -2531,6 +2546,7 @@ pub unsafe fn w_dict_lookup_checked(
             return Ok(None);
         }
         strategy.switch_to_object_strategy(obj);
+        let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
@@ -2551,6 +2567,7 @@ pub unsafe fn w_dict_lookup_checked(
             return Ok(None);
         }
         strategy.switch_to_object_strategy(obj);
+        let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::identitydict::IDENTITY_DICT_STRATEGY) {
@@ -2558,6 +2575,7 @@ pub unsafe fn w_dict_lookup_checked(
             return Ok(strategy.getitem(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
+        let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
@@ -2565,6 +2583,7 @@ pub unsafe fn w_dict_lookup_checked(
             return Ok(strategy.getitem(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
+        let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     let result = strategy.getitem(obj, key);
@@ -2600,6 +2619,34 @@ macro_rules! callback_free_dict_op {
         } else {
             Some(Ok(result))
         }
+    }};
+}
+
+/// Evaluate `$body` with `$obj` published, then rebind `$obj` to the address
+/// it has afterwards and yield the body's value.
+///
+/// The re-read [`DictOperationGuard::root`] documents, for the helpers that
+/// run below a caller's guard and so cannot reach its slots.
+///
+/// A macro rather than a helper taking `impl FnOnce`, for the reason
+/// `callback_free_dict_op!` gives: a closure has no lifted counterpart, so
+/// every dict graph that reached one would stop there.
+macro_rules! with_dict_rooted {
+    ($obj:ident, $value:ident, $body:expr) => {{
+        let _scope = crate::gc_roots::push_roots();
+        let base = crate::gc_roots::pin_roots(&[$obj, $value]);
+        let result = $body;
+        $obj = crate::gc_roots::shadow_stack_get(base);
+        $value = crate::gc_roots::shadow_stack_get(base + 1);
+        result
+    }};
+    ($obj:ident, $body:expr) => {{
+        let _scope = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::shadow_stack_len();
+        crate::gc_roots::pin_root($obj);
+        let result = $body;
+        $obj = crate::gc_roots::shadow_stack_get(slot);
+        result
     }};
 }
 
@@ -2752,8 +2799,13 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, DictKeyError> {
-    lock_dict_refs!(_dict_guard, obj, key);
+    lock_dict_refs!(defer _dict_guard, obj, key);
     let object_key = object_key_for_checked(key)?;
+    // `object_key_for_checked` runs the key's own `__hash__`, so the
+    // dictionary read below is the first use after a collection point: a
+    // `W_DictObject` header comes from the movable `try_gc_alloc` hook, and
+    // the guard's slot is what the collector rewrites.
+    let obj = _dict_guard.root(0);
     if let Some(result) = callback_free_dict_op!({
         let dict = &*(obj as *const W_DictObject);
         let entries = &*(dict.dstorage as *const indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -2797,6 +2849,7 @@ pub unsafe fn w_module_dict_lookup_inner(
         return None;
     }
     w_module_dict_switch_to_object_strategy(obj);
+    let obj = _module_guard.root(0);
     w_module_dict_lookup_object_entries(obj, key)
 }
 
@@ -2834,8 +2887,11 @@ pub unsafe fn w_module_dict_lookup_inner_checked(
     key: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, DictKeyError> {
     lock_dict_refs!(_module_guard, obj, key);
-    if let Some(entries) = w_module_dict_object_storage(obj) {
+    if w_module_dict_object_storage(obj).is_some() {
         let object_key = object_key_for_checked(key)?;
+        // The storage is interior to the dictionary, so it is derived from the
+        // reloaded receiver rather than carried across the hash above.
+        let entries = w_module_dict_object_storage(_module_guard.root(0)).ok_or(DictKeyError)?;
         let hit = dict_entries_probe_hashed(entries, object_key.hash, object_key.obj);
         if take_dict_key_error() {
             return Err(DictKeyError);
@@ -2849,8 +2905,9 @@ pub unsafe fn w_module_dict_lookup_inner_checked(
         return Ok(None);
     }
     w_module_dict_switch_to_object_strategy(obj);
-    let entries = w_module_dict_object_storage(obj).ok_or(DictKeyError)?;
     let object_key = object_key_for_checked(key)?;
+    // Derived after the hash, for the reason the branch above gives.
+    let entries = w_module_dict_object_storage(_module_guard.root(0)).ok_or(DictKeyError)?;
     let hit = dict_entries_probe_hashed(entries, object_key.hash, object_key.obj);
     if take_dict_key_error() {
         return Err(DictKeyError);
@@ -2914,9 +2971,9 @@ pub unsafe fn w_dict_store_hashed_checked(
 }
 
 unsafe fn w_dict_store_checked_inner(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
     key: PyObjectRef,
-    value: PyObjectRef,
+    mut value: PyObjectRef,
     hash: Option<i64>,
 ) -> Result<(), DictKeyError> {
     debug_assert!(!value.is_null(), "w_dict_store_checked: null value");
@@ -2943,7 +3000,7 @@ unsafe fn w_dict_store_checked_inner(
             w_dict_store_bytes_strategy(obj, key, value);
             return Ok(());
         }
-        strategy.switch_to_object_strategy(obj);
+        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
@@ -2957,7 +3014,7 @@ unsafe fn w_dict_store_checked_inner(
             w_dict_store_int_strategy(obj, key, value);
             return Ok(());
         }
-        strategy.switch_to_object_strategy(obj);
+        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::identitydict::IDENTITY_DICT_STRATEGY) {
@@ -2965,7 +3022,7 @@ unsafe fn w_dict_store_checked_inner(
             strategy.setitem(obj, key, value);
             return Ok(());
         }
-        strategy.switch_to_object_strategy(obj);
+        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
@@ -2973,7 +3030,7 @@ unsafe fn w_dict_store_checked_inner(
             strategy.setitem(obj, key, value);
             return Ok(());
         }
-        strategy.switch_to_object_strategy(obj);
+        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy.strategy_kind() == StrategyKind::Map {
@@ -2988,7 +3045,7 @@ unsafe fn w_dict_store_checked_inner(
             strategy.setitem(obj, key, value);
             return Ok(());
         }
-        strategy.switch_to_object_strategy(obj);
+        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     strategy.setitem(obj, key, value);
@@ -3060,6 +3117,8 @@ pub unsafe fn w_dict_setdefault_checked(
         // comparison the builtin ladder cannot settle withholds the insert and
         // re-runs the probe over `scan_dict_key_reentrant`.
         let object_key = object_key_for_checked(key)?;
+        let obj = _dict_guard.root(0);
+        let value = _dict_guard.root(2);
         if let Some(result) = callback_free_dict_op!({
             let dict = &mut *(obj as *mut W_DictObject);
             let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -3119,6 +3178,7 @@ pub unsafe fn w_dict_setdefault_checked(
             return Ok(strategy.setdefault(obj, key, value));
         }
         strategy.switch_to_object_strategy(obj);
+        let obj = _dict_guard.root(0);
         return w_dict_setdefault_checked(obj, key, value);
     }
     // `dictmultiobject.py DictStrategy.setdefault` is `getitem`
@@ -3211,6 +3271,7 @@ pub unsafe fn w_dict_pop_checked(
             // withholds the removal and re-runs it over
             // `scan_dict_key_reentrant`.
             let object_key = object_key_for_checked(key)?;
+            let obj = _dict_guard.root(0);
             if let Some(result) = callback_free_dict_op!({
                 let dict = &mut *(obj as *mut W_DictObject);
                 let entries =
@@ -3383,6 +3444,8 @@ pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, valu
     if !w_module_dict_is_object_strategy(obj) {
         w_module_dict_switch_to_object_strategy(obj);
     }
+    let obj = _module_guard.root(0);
+    let value = _module_guard.root(2);
     let entries = w_module_dict_object_storage_mut(obj);
     let object_key = object_key_for(key);
     let inserted =
@@ -3414,6 +3477,8 @@ pub unsafe fn w_module_dict_store_inner_checked(
         w_module_dict_switch_to_object_strategy(obj);
     }
     let object_key = object_key_for_checked(key)?;
+    let obj = _module_guard.root(0);
+    let value = _module_guard.root(2);
     let entries = w_module_dict_object_storage_mut(obj);
     // Single setitem probe; on an `__eq__` raise mid-probe `insert` appends
     // a spurious entry, so drop it with `pop` and leave the dict unchanged
@@ -3793,6 +3858,7 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
         if !w_module_dict_is_object_strategy(obj) {
             w_module_dict_switch_to_object_strategy(obj);
         }
+        let obj = _dict_guard.root(0);
         let entries = w_module_dict_object_storage_mut(obj);
         let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
         let removed = entries.shift_remove(&object_key_for(w_key)).is_some();
@@ -3892,6 +3958,7 @@ pub unsafe fn w_dict_delitem_checked(
             return Ok(w_dict_delitem_bytes_strategy(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
+        let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
@@ -3906,6 +3973,7 @@ pub unsafe fn w_dict_delitem_checked(
             return Ok(w_dict_delitem_int_strategy(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
+        let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::identitydict::IDENTITY_DICT_STRATEGY) {
@@ -3913,10 +3981,12 @@ pub unsafe fn w_dict_delitem_checked(
             return Ok(strategy.delitem(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
+        let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
         strategy.switch_to_object_strategy(obj);
+        let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
     let removed = strategy.delitem(obj, key);
@@ -3934,15 +4004,15 @@ pub unsafe fn w_dict_delitem_checked(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_delitem_if_value_is_checked(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
     key: PyObjectRef,
-    value: PyObjectRef,
+    mut value: PyObjectRef,
 ) -> Result<bool, DictKeyError> {
     if is_module_dict(obj) {
         if !w_module_dict_is_object_strategy(obj) {
-            w_module_dict_switch_to_object_strategy(obj);
+            with_dict_rooted!(obj, value, w_module_dict_switch_to_object_strategy(obj));
         }
-        let object_key = object_key_for_checked(key)?;
+        let object_key = with_dict_rooted!(obj, value, object_key_for_checked(key)?);
         if let Some(result) = callback_free_dict_op!({
             let entries = w_module_dict_object_storage_mut(obj);
             match entries.get_index_of(&object_key) {
@@ -3992,9 +4062,9 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
 
     let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     if strategy.strategy_kind() != StrategyKind::Object {
-        strategy.switch_to_object_strategy(obj);
+        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
     }
-    let object_key = object_key_for_checked(key)?;
+    let object_key = with_dict_rooted!(obj, value, object_key_for_checked(key)?);
     if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -4098,6 +4168,7 @@ pub unsafe fn w_dict_move_to_end_checked(
             w_module_dict_switch_to_object_strategy(obj);
         }
         let object_key = object_key_for_checked(key)?;
+        let obj = _dict_guard.root(0);
         if let Some(result) = callback_free_dict_op!({
             let entries = w_module_dict_object_storage_mut(obj);
             match entries.get_index_of(&object_key) {
@@ -4183,6 +4254,7 @@ pub unsafe fn w_dict_move_to_end_checked(
         strategy.switch_to_object_strategy(obj);
     }
     let object_key = object_key_for_checked(key)?;
+    let obj = _dict_guard.root(0);
     if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut indexmap::IndexMap<ObjectKey, PyObjectRef>);
@@ -4234,8 +4306,9 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Result<bool, DictKeyError> {
-    lock_dict_refs!(_dict_guard, obj, key);
+    lock_dict_refs!(defer _dict_guard, obj, key);
     let object_key = object_key_for_checked(key)?;
+    let obj = _dict_guard.root(0);
     // Single delitem probe, run callback-free so no user `__eq__` mutates the
     // dict while the `IndexMap` borrow is live.  A comparison the builtin
     // ladder cannot settle withholds the removal and re-runs the probe over
@@ -4301,6 +4374,7 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
         return false;
     }
     w_module_dict_switch_to_object_strategy(obj);
+    let obj = _module_guard.root(0);
     let entries = w_module_dict_object_storage_mut(obj);
     if dict_entries_remove_object(entries, key) {
         let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
@@ -4321,6 +4395,7 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
     lock_dict_refs!(_module_guard, obj, key);
     if w_module_dict_is_object_strategy(obj) {
         let object_key = object_key_for_checked(key)?;
+        let obj = _module_guard.root(0);
         let entries = w_module_dict_object_storage_mut(obj);
         let removed = entries.shift_remove(&object_key).is_some();
         if take_dict_key_error() {
@@ -4342,6 +4417,7 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
     }
     w_module_dict_switch_to_object_strategy(obj);
     let object_key = object_key_for_checked(key)?;
+    let obj = _module_guard.root(0);
     let entries = w_module_dict_object_storage_mut(obj);
     let removed = entries.shift_remove(&object_key).is_some();
     if take_dict_key_error() {
