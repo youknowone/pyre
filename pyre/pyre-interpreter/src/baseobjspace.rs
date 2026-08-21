@@ -6426,6 +6426,14 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
             crate::type_methods::arg_type_name(w_name)
         )));
     }
+    // A user-defined `__getattribute__` / `__getattr__` runs below and can
+    // allocate enough to move both operands.  The collector rewrites roots,
+    // not this frame's Rust locals, and the enrichment stores the operands on
+    // the exception itself, so hold them on the shadow stack across the lookup
+    // and read them back from their slots rather than from the addresses
+    // captured here.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let operands = pyre_object::gc_roots::pin_roots(&[obj, w_name]);
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     let result = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
         // `getattr_str_impl` rather than `getattr_str`: this entry point already
@@ -6442,7 +6450,10 @@ pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
         unsafe { getattr_surrogate(obj, w_name, name) }
     };
     result.map_err(|mut err| {
-        err.enrich_attribute_error(obj, w_name);
+        err.enrich_attribute_error(
+            pyre_object::gc_roots::shadow_stack_get(operands),
+            pyre_object::gc_roots::shadow_stack_get(operands + 1),
+        );
         err
     })
 }

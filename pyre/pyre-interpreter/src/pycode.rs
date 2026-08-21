@@ -53,10 +53,11 @@ impl<'a> PyCodeAddressRange<'a> {
         let Some(first_byte) = self.reader.read_byte() else {
             return false;
         };
-        if first_byte & 0x80 == 0 {
-            return false;
-        }
-
+        // A byte in header position is decoded as one, bit 7 or not: the
+        // marker separates a header from the payload bytes the skip below
+        // consumes, and is not consulted here. `code.replace()` stores an
+        // arbitrary `co_linetable`, and stopping on the marker made
+        // `co_linetable=b"\0"` report no ranges where one entry is decoded.
         let code = (first_byte >> 3) & 0x0f;
         let length = ((first_byte & 0x07) + 1) as i32;
         self.computed_line += self.get_line_delta(code);
@@ -1743,10 +1744,8 @@ pub unsafe fn code_positions(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyE
         let Some(first_byte) = reader.read_byte() else {
             break;
         };
-        if first_byte & 0x80 == 0 {
-            break;
-        }
-
+        // Decoded as a header regardless of bit 7, for the reason given on
+        // `PyCodeAddressRange::advance`.
         let code = (first_byte >> 3) & 0x0f;
         let length = ((first_byte & 0x07) + 1) as usize;
         let Some(kind) = PyCodeLocationInfoKind::from_code(code) else {

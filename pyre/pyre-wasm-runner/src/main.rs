@@ -1526,10 +1526,18 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
             // Only a trace slot may be cleared; nulling a main-module slot
             // (`id < trace_base`) would corrupt the shared dispatch table.
             if (func_id as u64) >= caller.data().trace_base {
-                // Release the table's hold on the trace function; the slot
-                // itself stays (wasm tables cannot shrink).
+                // Release the table's hold on the trace function; the slots
+                // themselves stay (wasm tables cannot shrink).  `jit_compile`
+                // appends the entry as a pair, so `func_id + 1` holds this
+                // same trace — the wide entry where one was published, the
+                // spare copy of the narrow function otherwise.  Clearing only
+                // the first half leaves the freed trace reachable through
+                // `call_indirect func_id + 1` and rooted for the store's
+                // lifetime, so both halves and the wide record go together.
+                caller.data_mut().wide_slots.remove(&func_id);
                 if let Some(table) = caller.data().table {
                     let _ = table.set(&mut caller, func_id as u64, Ref::Func(None));
+                    let _ = table.set(&mut caller, func_id as u64 + 1, Ref::Func(None));
                 }
             }
         },

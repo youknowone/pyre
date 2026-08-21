@@ -71,6 +71,24 @@ class _ImmutableTypeMeta(type):
         raise _immutable_type_error(cls, name)
 
 
+def _readonly_member(slot):
+    """Expose a private slot as a `Py_READONLY` struct member.
+
+    A slot named for the public attribute installs a writable member
+    descriptor, which `object.__setattr__` reaches past the `__setattr__`
+    guard below.  A property is a data descriptor, so it answers every path,
+    and `member_set` phrases both the write and the delete the same way.
+    """
+
+    def get(self):
+        return object.__getattribute__(self, slot)
+
+    def refuse(self, *_value):
+        raise AttributeError("readonly attribute")
+
+    return property(get, refuse, refuse)
+
+
 class _Immutable:
     """PyPy's per-instance readonly-field mixin.
 
@@ -91,6 +109,10 @@ class _Immutable:
 
     _readonly_attrs = None
     _readonly_members = frozenset()
+    # Slots that carry a member's storage under a private name because the
+    # public one is a read-only descriptor.  The native types have no such
+    # attribute, so `dir()` must not report it either.
+    _hidden_slots = frozenset()
 
     def __getattribute__(self, name):
         if name == "__dict__":
@@ -101,10 +123,8 @@ class _Immutable:
         return object.__getattribute__(self, name)
 
     def __dir__(self):
-        return [
-            name for name in object.__dir__(self)
-            if name not in {"__dict__", "__weakref__"}
-        ]
+        hidden = {"__dict__", "__weakref__"} | set(type(self)._hidden_slots)
+        return [name for name in object.__dir__(self) if name not in hidden]
 
     def __setattr__(self, name, value):
         readonly = type(self)._readonly_attrs
@@ -580,11 +600,19 @@ class ParamSpec(
 class ParamSpecArgs(_Immutable, metaclass=_ImmutableTypeMeta):
     """The args of a ParamSpec, e.g. P.args."""
 
-    __slots__ = ("__origin__", "__weakref__")
+    # `paramspecargs` stores the origin in a `Py_READONLY` member, so a slot
+    # named `__origin__` would be writable through `object.__setattr__` where
+    # the native view is not.  The storage takes a private name and the public
+    # one is a read-only property, which is a data descriptor and so refuses
+    # the write on both paths.
+    __slots__ = ("_origin", "__weakref__")
     _readonly_members = frozenset(("__origin__",))
+    _hidden_slots = frozenset(("_origin",))
 
     def __init__(self, origin):
-        object.__setattr__(self, "__origin__", origin)
+        object.__setattr__(self, "_origin", origin)
+
+    __origin__ = _readonly_member("_origin")
 
     def __repr__(self):
         if type(self.__origin__) is ParamSpec:
@@ -611,11 +639,16 @@ class ParamSpecArgs(_Immutable, metaclass=_ImmutableTypeMeta):
 class ParamSpecKwargs(_Immutable, metaclass=_ImmutableTypeMeta):
     """The kwargs of a ParamSpec, e.g. P.kwargs."""
 
-    __slots__ = ("__origin__", "__weakref__")
+    # Read-only through a private slot, for the reason given on
+    # `ParamSpecArgs`.
+    __slots__ = ("_origin", "__weakref__")
     _readonly_members = frozenset(("__origin__",))
+    _hidden_slots = frozenset(("_origin",))
 
     def __init__(self, origin):
-        object.__setattr__(self, "__origin__", origin)
+        object.__setattr__(self, "_origin", origin)
+
+    __origin__ = _readonly_member("_origin")
 
     def __repr__(self):
         if type(self.__origin__) is ParamSpec:

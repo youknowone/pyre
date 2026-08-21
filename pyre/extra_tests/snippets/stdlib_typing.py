@@ -310,6 +310,28 @@ assert TypeVar("T", bound=None).__bound__ is None
 assert ParamSpec("P").__bound__ is type(None)
 assert ParamSpec("P", bound=None).__bound__ is type(None)
 
+# `paramspecargs` / `paramspeckwargs` keep the origin in a `Py_READONLY`
+# member, so neither the ordinary write nor the one that steps around a
+# `__setattr__` guard reaches it, and the private storage stays out of `dir()`.
+_P = ParamSpec("P")
+for _view in (_P.args, _P.kwargs):
+    assert _view.__origin__ is _P
+    for _write in (
+        lambda: setattr(_view, "__origin__", 1),
+        lambda: object.__setattr__(_view, "__origin__", 1),
+        lambda: delattr(_view, "__origin__"),
+        lambda: object.__delattr__(_view, "__origin__"),
+    ):
+        try:
+            _write()
+        except AttributeError as exc:
+            assert str(exc) == "readonly attribute", str(exc)
+        else:
+            raise AssertionError("__origin__ accepted a write")
+    assert _view.__origin__ is _P
+    assert "__origin__" in dir(_view)
+    assert not [name for name in dir(_view) if name == "_origin"]
+
 # A compiler-created parameter is allocated with no module of its own, so it
 # reports the class attribute rather than the module that declares it.
 def _identity[T](x: T) -> T:
