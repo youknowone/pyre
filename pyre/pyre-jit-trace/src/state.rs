@@ -14774,6 +14774,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     recipe: &ReconstructRecipe,
     execution_context: *const pyre_interpreter::PyExecutionContext,
     ec_box: OpRef,
+    root_frame_box: OpRef,
     parent_frames: Vec<ResumeFrameState>,
 ) -> Option<(PendingInlineFrame, Vec<OpRef>)> {
     let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
@@ -14805,11 +14806,25 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // from the caller's live red. The concrete pointer stays the frame's
     // constructor argument, but a ConstPtr built from it would bake the
     // recording thread's ExecutionContext into every bridge compiled from this
-    // loop. It remains the seed only where no live red reached here.
-    let ec_seed = if ec_box.is_none() {
-        ctx.const_ref(execution_context as i64)
-    } else {
+    // loop.
+    //
+    // A bridge whose resume data held no value at the portal `ec` color
+    // arrives with an empty `ec_box` (`bridge_ec_missing`). Read the red off
+    // the root frame instead, the way `MIFrame::ensure_execution_context` does
+    // for the opcode walker: a thread owns one ExecutionContext, so every live
+    // frame's field names the same object. The constant is left only for a
+    // root that carries no frame OpRef either.
+    let ec_seed = if !ec_box.is_none() {
         ec_box
+    } else if !root_frame_box.is_none() {
+        ctx.record_op_with_descr(
+            majit_ir::OpCode::GetfieldGcR,
+            &[root_frame_box],
+            crate::descr::pyframe_execution_context_descr(),
+        )
+    } else {
+        crate::jitcode_dispatch::census_record("ReconstructedCallee::EcConstFallback");
+        ctx.const_ref(execution_context as i64)
     };
 
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();

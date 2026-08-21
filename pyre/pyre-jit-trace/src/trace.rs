@@ -1754,6 +1754,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
 
     let root_ec = sym.concrete_execution_context();
     let root_ec_box = sym.execution_context();
+    let root_frame_box = sym.frame();
     if crate::jitcode_dispatch::p2_diag_enabled() {
         let pcs: Vec<usize> = carrier
             .recipes
@@ -1789,6 +1790,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         recipe,
         root_ec,
         root_ec_box,
+        root_frame_box,
         Vec::new(),
     ) else {
         discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
@@ -1900,6 +1902,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                     root_pc,
                     root_ec,
                     root_ec_box,
+                    root_frame_box,
                     &carrier.recipes[i],
                     &carrier.recipes[..i],
                     result,
@@ -2185,6 +2188,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     root_pc: usize,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
+    root_frame_box: majit_ir::OpRef,
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
     child_result: majit_ir::OpRef,
@@ -2223,6 +2227,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         middle,
         root_ec,
         root_ec_box,
+        root_frame_box,
         Vec::new(),
     ) else {
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");

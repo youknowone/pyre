@@ -912,6 +912,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     recipe: &majit_metainterp::ReconstructRecipe,
     root_ec: *const pyre_interpreter::PyExecutionContext,
     root_ec_box: majit_ir::OpRef,
+    root_frame_box: majit_ir::OpRef,
 ) -> Option<InlineParentFrame> {
     let pjc = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)?;
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
@@ -942,6 +943,7 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         recipe,
         root_ec,
         root_ec_box,
+        root_frame_box,
         Vec::new(),
     )?;
     let frame_box = pending.sym.frame();
@@ -1287,6 +1289,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             parent_recipe,
             root_sym.concrete_execution_context(),
             root_sym.execution_context(),
+            root_sym.frame(),
         )?;
     }
 
