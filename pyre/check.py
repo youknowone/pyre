@@ -2023,6 +2023,16 @@ def build_input_paths():
     contributed nothing but a dependence on which profiles and targets happened
     to have been built.
 
+    Untracked files count, which is why the enumeration is not just
+    `git ls-files`: a new `.rs` under a member crate compiles into the artefact
+    before it is ever staged. Left out, it would contribute nothing to the
+    digest, so editing it would not move the fingerprint and a later
+    `--no-build` run would accept an artefact built from code the digest never
+    saw. Worse, deleting it again would return the digest to its earlier value
+    while the artefact still held its code. `--others --exclude-standard` adds
+    exactly the untracked-and-not-ignored files, so `target/` and the rest of
+    `.gitignore` stay out.
+
     One class is knowingly outside the set: an input a build script reads from
     outside its crate. The only one in the tree is the `lib-python/3` closure
     `pyre-interpreter/build.rs` embeds, and it is guarded by `wasm_vfs`, a
@@ -2031,7 +2041,7 @@ def build_input_paths():
     """
     try:
         listing = subprocess.run(
-            ["git", "ls-files", "-z"],
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
     except OSError:
@@ -2041,11 +2051,11 @@ def build_input_paths():
     members = tuple(member + "/" for member in workspace_member_dirs())
     if not members:
         return None
-    tracked = listing.stdout.split("\0")
-    # Every tracked file under a member crate, whatever its suffix: the CJK
-    # codec `.c`/`.h` sources and the app-level `.py` bodies reach the binary
-    # exactly as the `.rs` files do.
-    paths = [p for p in tracked if p.startswith(members) or p in ROOT_BUILD_INPUTS]
+    listed = listing.stdout.split("\0")
+    # Every file under a member crate, whatever its suffix: the CJK codec
+    # `.c`/`.h` sources and the app-level `.py` bodies reach the binary exactly
+    # as the `.rs` files do.
+    paths = [p for p in listed if p.startswith(members) or p in ROOT_BUILD_INPUTS]
     # The LLBC is a build input the fingerprint gate already tracks by content,
     # but it is generated rather than tracked by git.
     paths += llbc_input_paths()
@@ -2074,6 +2084,14 @@ def build_inputs_fingerprint():
     artefact is the state that exists once the build has finished. Nothing
     else a build writes is in the set — that is what keeps the two orders
     equivalent for every other input.
+
+    "Once per run" therefore holds only between builds, and
+    [`invalidate_build_inputs_fingerprint`] is what ends a memoised value's
+    life. Without that call the rule above would bind the FIRST stamped
+    artefact alone: a run that builds several backends stamps after each one,
+    and every stamp past the first would carry a digest read before the build
+    that produced it. A later `--no-build` run then reads the tree as it
+    actually is and rejects artefacts that are in fact current.
     """
     global _BUILD_INPUTS_FINGERPRINT
     if _BUILD_INPUTS_FINGERPRINT is not _FINGERPRINT_UNSET:
@@ -2101,12 +2119,46 @@ def build_inputs_fingerprint():
     return _BUILD_INPUTS_FINGERPRINT
 
 
+def invalidate_build_inputs_fingerprint():
+    """Drop the memoised digest so the next read enumerates the tree again.
+
+    Called once per completed build, before its artefacts are stamped. The
+    memoisation that survives is the one it exists for: the read-only
+    `--no-build` path, where nothing writes to the tree between reads.
+    """
+    global _BUILD_INPUTS_FINGERPRINT
+    _BUILD_INPUTS_FINGERPRINT = _FINGERPRINT_UNSET
+
+
 def artefact_fingerprint_path(artefact):
     return Path(str(artefact) + ".inputs")
 
 
+def artefact_content_digest(artefact):
+    """The artefact's own bytes, or `None` if it cannot be read.
+
+    35MB of binary hashes in about a tenth of a second, against the
+    multi-minute build the stamp exists to skip.
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(artefact, "rb") as handle:
+            while chunk := handle.read(1 << 20):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
 def stamp_artefact_inputs(artefact):
     """Record the inputs an artefact was just built from, beside it.
+
+    The artefact's own digest goes in beside the input digest, because the
+    sidecar cannot otherwise tell which binary it is vouching for. A `cargo
+    build` outside this script overwrites the executable and leaves the
+    sidecar alone; restoring the tree to the state the sidecar names would
+    then make the input digests agree while the executable holds different
+    code, and `--no-build` would record baselines against it.
 
     A failure here is not worth losing a finished build over, but it is worth
     saying: the next `--no-build` run would otherwise report the artefact as
@@ -2115,11 +2167,38 @@ def stamp_artefact_inputs(artefact):
     fingerprint = build_inputs_fingerprint()
     if fingerprint is None:
         return
+    content = artefact_content_digest(artefact)
+    if content is None:
+        print(f"  warning: could not read {artefact} to stamp it")
+        return
     stamp = artefact_fingerprint_path(artefact)
     try:
-        stamp.write_text(fingerprint, encoding="utf-8")
+        stamp.write_text(
+            f"inputs {fingerprint}\nartefact {content}\n", encoding="utf-8"
+        )
     except OSError as exc:
         print(f"  warning: could not write the build-input stamp {stamp}: {exc}")
+
+
+def read_artefact_stamp(stamp):
+    """The `(inputs, artefact)` digests a stamp records, or `None`.
+
+    `None` covers both an unreadable stamp and one written in an older format
+    — either way this script did not write it in a shape it can check, which
+    is the "built outside this script" case the caller already reports.
+    """
+    try:
+        text = stamp.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    fields = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if value:
+            fields[key] = value.strip()
+    if "inputs" not in fields or "artefact" not in fields:
+        return None
+    return fields["inputs"], fields["artefact"]
 
 
 def require_fresh_artefacts(backend, artefacts):
@@ -2131,24 +2210,35 @@ def require_fresh_artefacts(backend, artefacts):
     baselines — for code that is not in it, with nothing in the output saying
     so.
 
-    Each build stamps its artefact with `build_inputs_fingerprint`; an artefact
-    carrying no stamp was built outside this script, so its inputs are unknown
-    and the run continues with a note rather than a refusal.
+    Each build stamps its artefact with `build_inputs_fingerprint` and with the
+    artefact's own content digest; an artefact carrying no stamp was built
+    outside this script, so its inputs are unknown and the run continues with a
+    note rather than a refusal. An artefact whose bytes no longer match the
+    stamp was rebuilt outside this script since, which puts it in the same
+    unknown-inputs class however well the input digest agrees.
     """
     fingerprint = build_inputs_fingerprint()
     if fingerprint is None:
         return
     for artefact in artefacts:
-        stamp = artefact_fingerprint_path(artefact)
-        try:
-            recorded = stamp.read_text(encoding="utf-8").strip()
-        except OSError:
+        recorded = read_artefact_stamp(artefact_fingerprint_path(artefact))
+        if recorded is None:
             print(
                 f"  note: {artefact} carries no build-input stamp; "
                 "its freshness is unchecked"
             )
             continue
-        if recorded == fingerprint:
+        recorded_inputs, recorded_content = recorded
+        if recorded_content != artefact_content_digest(artefact):
+            print(
+                f"ERROR: --no-build requested for backend '{backend}', but "
+                f"{artefact}\n"
+                f"       has been rebuilt since it was stamped, so what it "
+                f"contains is unknown.\n"
+                f"       Re-run without --no-build to rebuild it."
+            )
+            sys.exit(1)
+        if recorded_inputs == fingerprint:
             continue
         print(
             f"ERROR: --no-build requested for backend '{backend}', but "
@@ -2835,6 +2925,9 @@ class Check:
         # The wall clock beside cargo's own figure is what makes a build that
         # recompiled the world distinguishable from a cache hit.
         print(f"  {cargo_finished_line(proc)} — {elapsed:.1f}s wall", flush=True)
+        # The digest has to be read back after this build, not carried over
+        # from an earlier one in the same run.
+        invalidate_build_inputs_fingerprint()
         stamp_artefact_inputs(default_binary(backend))
 
     def build_wasm_backend(self):
@@ -2900,6 +2993,10 @@ class Check:
         dst = Path(WASM_MODULE_PATH)
         if not dst.exists() or dst.read_bytes() != src_bytes:
             dst.write_bytes(src_bytes)
+        # As in `build_backend`: this build resolves target-specific
+        # dependencies, so `Cargo.lock` may differ from the state the native
+        # backends were stamped against.
+        invalidate_build_inputs_fingerprint()
         stamp_artefact_inputs(WASM_MODULE_PATH)
         stamp_artefact_inputs(default_binary("wasm"))
 
