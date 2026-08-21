@@ -101,6 +101,46 @@ mod tests {
 
     use crate::runner::DynasmBackend;
 
+    /// x86/regalloc.py `consider_call_malloc_nursery` binds the result with
+    /// `force_allocate_reg(op, selected_reg=ecx)`; only FrameManager may spill
+    /// it later.  Storing it into a slot here as well grew every recursive
+    /// loop's JitFrame by one slot per allocation, which changes how much the
+    /// process allocates and so shifts the minor-collection schedule the
+    /// jitcounter decay is driven by.
+    #[test]
+    fn malloc_nursery_result_does_not_grow_frame_depth() {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+
+        let malloc = Rc::new(Op::new(
+            OpCode::CallMallocNursery,
+            &[Operand::from_opref(OpRef::const_int(32))],
+        ));
+        malloc.pos.set(OpRef::ref_op(0));
+
+        let finish = Op::new(OpCode::Finish, &[Operand::from_bound_op(&malloc)]);
+        finish.pos.set(OpRef::void_op(1));
+        finish.set_fail_arg_types(vec![Type::Ref]);
+        finish.setfailargs(vec![].into());
+
+        let token = JitCellToken::new(517);
+        backend
+            .compile_loop(&[], &[malloc, Rc::new(finish)], &token)
+            .expect("compile register-resident nursery result trace");
+
+        let compiled = token
+            .compiled
+            .get()
+            .expect("compiled code")
+            .downcast_ref::<super::CompiledCode>()
+            .expect("dynasm compiled code");
+        assert_eq!(
+            compiled.frame_depth.load(Ordering::Acquire),
+            super::JITFRAME_FIXED_SIZE,
+            "a register-resident nursery result must not allocate a shadow frame slot",
+        );
+    }
+
     fn compile_eval_breaker_poll_trace(
         trace_id: u64,
         word_addr: usize,
@@ -4190,7 +4230,7 @@ impl<'a> Assembler386<'a> {
                 // store next GUARD_NOT_FORCED's descr ptr to jf_force_descr
                 // BEFORE the call, so forcing code knows which guard to resume.
                 self._store_force_index_if_next_guard(ops, op_index, fail_index);
-                self.genop_call_assembler(op, arglocs);
+                self.genop_call_assembler(op, arglocs, result_loc);
             }
             OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
@@ -4315,20 +4355,10 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
                 }
                 dynasm!(self.mc ; .arch x64 ; =>done);
-                // Spill the result to the regalloc-assigned jitframe slot
-                // directly from `result_reg`.  The malloc-nursery clobber
-                // set is only ECX/EDX (SAVE_DEFAULT_REGS), so RAX may hold
-                // a live Box the regalloc bound to it across this op;
-                // routing the spill through RAX (`mov rax, result_reg`)
-                // silently destroyed that value — this mirrors the
-                // fixed-size `genop_call_malloc_nursery` final block, which
-                // was already corrected for the same reason.
-                let pos = op.pos.get();
-                if !pos.is_none() {
-                    let slot = self.allocate_slot(pos);
-                    let offset = Self::slot_offset(slot);
-                    dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));
-                }
+                // The payload already sits in `result_reg` on both paths, and
+                // that register is the delivery contract (see
+                // `genop_call_malloc_nursery`); an extra store grew
+                // `frame_depth` by one slot per allocation.
             }
             // x86/assembler.py malloc_cond_varsize parity
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
@@ -4392,8 +4422,20 @@ impl<'a> Assembler386<'a> {
                 // result slot.
                 self.emit_propagate_exception_if_zero(0);
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
-                if !op.pos.get().is_none() {
-                    self.store_rax_to_result(op.pos.get());
+                // Unlike the other three nursery paths, this one leaves the
+                // helper's return in RAX rather than in the regalloc result
+                // register, so the move is emitted here instead of the store
+                // that used to grow `frame_depth` by a slot per allocation.
+                // `consider_call_malloc_nursery_varsize` forces the result to
+                // `MALLOC_NURSERY_RESULT`, so this is never a no-op.
+                let Some(Loc::Reg(r)) = result_loc else {
+                    panic!(
+                        "CallMallocNurseryVarsize result_loc must be a register; got {result_loc:?}"
+                    );
+                };
+                if r.value != crate::regloc::EAX.value {
+                    let rv = r.value;
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
                 }
             }
             // x86/assembler.py `genop_discard_check_memory_error`
@@ -6999,7 +7041,7 @@ impl<'a> Assembler386<'a> {
     /// `reload_frame_if_necessary` because a minor GC during the callee
     /// may have moved the caller jitframe; the popped rbp is the
     /// pre-GC address while the shadow stack carries the updated one.
-    fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
+    fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc], result_loc: Option<&Loc>) {
         // handle_call_assembler (rewrite.py) always pre-builds the
         // callee jitframe — storing every inputarg, and for a virtualizable
         // passing the forced vable object as the second arg — so the backend
@@ -7042,9 +7084,7 @@ impl<'a> Assembler386<'a> {
             } else {
                 dynasm!(self.mc ; .arch x64 ; xor eax, eax);
             }
-            if !op.pos.get().is_none() {
-                self.store_rax_to_result(op.pos.get());
-            }
+            self.move_call_assembler_result(result_type, result_loc);
             return;
         }
 
@@ -7119,8 +7159,36 @@ impl<'a> Assembler386<'a> {
                 ; =>merge
             );
         }
-        if !op.pos.get().is_none() {
-            self.store_rax_to_result(op.pos.get());
+        self.move_call_assembler_result(result_type, result_loc);
+    }
+
+    /// Materialize a CALL_ASSEMBLER result from the raw bits both paths leave
+    /// in RAX into the regalloc-assigned location.
+    ///
+    /// The previous shape spilled RAX to a fresh JitFrame slot, which grew
+    /// `frame_depth` by one slot per call and left a `Float` result taking the
+    /// helper path in RAX while the regalloc expected XMM0.  Only the fast path
+    /// happened to leave it in XMM0 as a side effect of its `movq rax, xmm0`
+    /// normalisation.
+    ///
+    /// x86/regalloc.py `_consider_call_assembler` binds the result through
+    /// `after_call`, so it is `eax` for an int or ref and `xmm0` for a float;
+    /// the move is elided when the value already sits there.
+    fn move_call_assembler_result(&mut self, result_type: Type, result_loc: Option<&Loc>) {
+        match (result_type, result_loc) {
+            (Type::Void, None) => {}
+            (Type::Float, Some(Loc::Reg(r))) if r.is_xmm => {
+                dynasm!(self.mc ; .arch x64 ; movq Rx(r.value), rax);
+            }
+            (_, Some(Loc::Reg(r))) if !r.is_xmm => {
+                if r.value != crate::regloc::EAX.value {
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), rax);
+                }
+            }
+            _ => panic!(
+                "CALL_ASSEMBLER result must use its regalloc result register: \
+                 type={result_type:?} loc={result_loc:?}"
+            ),
         }
     }
 
@@ -7495,25 +7563,11 @@ impl<'a> Assembler386<'a> {
         let _ = gcmap_ofs;
 
         dynasm!(self.mc ; .arch x64 ; =>done);
-        // Spill the result to the regalloc-assigned jitframe slot.  Stage
-        // it directly from `result_reg`; routing through RAX (the previous
-        // shape) silently clobbered any live Box the regalloc bound to
-        // RAX across this op, since the malloc-nursery clobber set is
-        // only ECX/EDX.
-        let pos = op.pos.get();
-        if !pos.is_none() {
-            let slot = self.allocate_slot(pos);
-            let offset = Self::slot_offset(slot);
-            // malloc_cond / malloc_cond_varsize (assembler.py:2556,2604) keep
-            // the allocated pointer in ecx and route it through the regalloc-
-            // assigned `result_reg`.  Anything else here would spill a stale
-            // RAX (now caller-live) instead of the object pointer.
-            let Some(Loc::Reg(r)) = result_loc else {
-                panic!("CallMallocNursery result_loc must be a register; got {result_loc:?}");
-            };
-            let rv = r.value;
-            dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));
-        }
+        // x86/regalloc.py `consider_call_malloc_nursery` binds the result with
+        // `force_allocate_reg(op, selected_reg=ecx)`, so the register IS the
+        // delivery contract; FrameManager emits a spill only where a later
+        // lifetime boundary needs one.  Storing it here as well grew
+        // `frame_depth` by one slot for every allocation.
     }
 
     /// Headerless fixed-size nursery allocation.  `size` excludes any GC
@@ -7599,18 +7653,9 @@ impl<'a> Assembler386<'a> {
         let _ = gcmap_ofs;
 
         dynasm!(self.mc ; .arch x64 ; =>done);
-        let pos = op.pos.get();
-        if !pos.is_none() {
-            let slot = self.allocate_slot(pos);
-            let offset = Self::slot_offset(slot);
-            let Some(Loc::Reg(r)) = result_loc else {
-                panic!(
-                    "CallMallocNurseryHeaderless result_loc must be a register; got {result_loc:?}"
-                );
-            };
-            let rv = r.value;
-            dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));
-        }
+        // The result register is the delivery contract (see
+        // `genop_call_malloc_nursery`); an extra store here grew `frame_depth`
+        // by one slot per allocation.
     }
 
     /// NEW: allocate a fixed-size object. Requires GC runtime.
