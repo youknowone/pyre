@@ -3288,11 +3288,17 @@ fn alloc_fail_index() -> u32 {
 //                      `TY_FLOAT`, set by `make_a_counter_per_value` to
 //                      distinguish guard_value-by-int / -by-ref / -by-float.
 //   - bits 3..end    : jitcounter hash (when TY_NONE) or backend value-slot
-//                      index (when TY_INT/REF/FLOAT), accessed via `>>
-//                      ST_SHIFT` with `ST_SHIFT_MASK`
-//                      (`compile.py AbstractResumeGuardDescr`).
+//                      index (when TY_INT/REF/FLOAT), read as
+//                      `status >> STATUS_SHIFT` masked with
+//                      `STATUS_SHIFT_MASK` (`compile.py
+//                      AbstractResumeGuardDescr.ST_SHIFT` /
+//                      `ST_SHIFT_MASK`).
 //
-// What the value-slot index NAMES is backend-specific — see the same note on
+// What the value-slot index NAMES is backend-specific: dynasm records a
+// deadframe slot, which only a caller still holding the deadframe can read, so
+// it arrives at `must_compile_with_values` as `guard_value_operand`; cranelift
+// and wasm record a fail-argument position and supply no operand, leaving that
+// function to index `fail_values`. See the same note on
 // `guard_value_counter_slot` in majit-backend's `resume_guard_descr.rs`, which
 // this block mirrors.
 pub(crate) const STATUS_BUSY_FLAG: u64 = 0x01;

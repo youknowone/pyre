@@ -12092,10 +12092,11 @@ impl<M: Clone> MetaInterp<M> {
     //
     // `status >> ST_SHIFT` is a jitcounter hash under TY_NONE and a backend
     // value-slot index under TY_INT/REF/FLOAT. That index is only meaningful
-    // to the backend that recorded it, which is why `must_compile_with_values`
-    // prefers the `guard_value_operand` its caller read off the live deadframe
-    // and falls back to `fail_values[index]` for the backends whose slot space
-    // is the dense fail-argument vector.
+    // to the backend that recorded it: dynasm records a deadframe slot, so
+    // `must_compile_with_values` takes the `guard_value_operand` its caller
+    // read off the live deadframe as authoritative; cranelift and wasm record
+    // a fail-argument position and supply no operand, so the same index is
+    // resolved out of `fail_values` instead.
     const ST_BUSY_FLAG: u64 = 0x01;
     const ST_TYPE_MASK: u64 = 0x06;
     const ST_SHIFT: u32 = 3;
