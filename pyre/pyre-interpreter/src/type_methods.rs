@@ -854,9 +854,10 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let list = args[0];
     let value = args[1];
     // listobject.py:799 unwrap_spec defaults: w_start=0 / w_stop=sys.maxint.
-    // listobject.py:803 `unwrap_start_stop` folds the negative bounds against
-    // the length it was handed; the two halves are called separately below so
-    // the length can be read after the coercion instead.
+    // `W_ListObject.descr_index` hands `unwrap_start_stop` the length it read
+    // first, and that call is what folds the negative bounds; the two halves
+    // are called separately below so the length can be read after the
+    // coercion instead.
     let w_start = if args.len() >= 3 {
         args[2]
     } else {
