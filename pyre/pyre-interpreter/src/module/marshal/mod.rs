@@ -678,8 +678,13 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_interned_str(&self, value: &Wtf8) -> Rooted {
-        let value = Rooted::new(w_str_from_wtf8(value.to_owned()));
-        Rooted::new(unsafe { unicodeobject::intern_exact_str(value.get()) })
+        // The reader holds only the characters, so ask the intern table with
+        // them.  Building a `str` first and handing it to `intern_exact_str`
+        // would allocate a `malloc_typed`-immortal object per occurrence and
+        // abandon it whenever the value is already interned, retaining it for
+        // the process lifetime; interned names repeat heavily across a
+        // module's code objects, so nearly every occurrence is such a hit.
+        Rooted::new(unicodeobject::intern_wtf8_value(value))
     }
 
     fn make_bytes(&self, value: &[u8]) -> Rooted {
@@ -898,10 +903,18 @@ impl wire::MarshalBag for PyreMarshalBag {
 
     fn str_from_value(&self, value: &Rooted) -> Option<String> {
         let obj = value.get();
-        unsafe { unicodeobject::is_str(obj) }.then(|| {
-            unsafe { unicodeobject::w_str_get_wtf8(obj) }
+        if !unsafe { unicodeobject::is_str(obj) } {
+            return None;
+        }
+        // A code object's names are overwhelmingly ascii, and an ascii payload
+        // is one byte per code point, so the cached counts behind this
+        // accessor decide it carries no surrogate without reading the bytes.
+        // `to_string_lossy` has no such shortcut and rescans every name.
+        Some(match unsafe { unicodeobject::w_str_get_value_opt(obj) } {
+            Some(value) => value.to_owned(),
+            None => unsafe { unicodeobject::w_str_get_wtf8(obj) }
                 .to_string_lossy()
-                .into_owned()
+                .into_owned(),
         })
     }
 

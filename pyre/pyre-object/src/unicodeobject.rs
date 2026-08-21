@@ -584,29 +584,37 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
 /// [`intern_exact_str`] answers the same question for a caller that already
 /// holds an object, and must be handed one even when the table already has the
 /// canonical instance.  A caller that holds only the characters — a code
-/// object realizing `co_names_w` (`pycode.py:127-129`), an attribute name —
-/// would have to build a [`w_str_new`] result to ask, and that result is
+/// object realizing `co_names_w` (`pycode.py` `PyCode._initialize`), an
+/// attribute name, a name the marshal reader has just read off the wire —
+/// would have to build a [`w_str_from_wtf8`] result to ask, and that result is
 /// `malloc_typed`-immortal: abandoning it on a hit retains it for the process
 /// lifetime.  Interning from the value instead builds nothing on a hit.
 #[majit_macros::dont_look_inside]
-pub fn intern_str_value(value: &str) -> PyObjectRef {
+pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
     let mut table = STRING_INTERN_TABLE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(slot) = table.get(Wtf8::new(value)) {
+    if let Some(slot) = table.get(value) {
         return **slot as PyObjectRef;
     }
-    let obj = w_str_new(value);
+    let value = value.to_owned();
+    let obj = w_str_from_wtf8(value.clone());
     let mut slot = Box::new(obj as usize);
     let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
-    // `w_str_new` is immortal, so this root only has to keep the collector from
-    // rewriting a slot it never owns; the registration matches
+    // `w_str_from_wtf8` is immortal, so this root only has to keep the
+    // collector from rewriting a slot it never owns; the registration matches
     // [`intern_exact_str`] so both entry points present the table identically.
     unsafe {
         crate::gc_hook::try_gc_add_root(root_slot);
     }
-    table.insert(Wtf8Buf::from_string(value.to_string()), slot);
+    table.insert(value, slot);
     obj
+}
+
+/// [`intern_wtf8_value`] for a caller whose characters are already UTF-8.
+#[majit_macros::dont_look_inside]
+pub fn intern_str_value(value: &str) -> PyObjectRef {
+    intern_wtf8_value(Wtf8::new(value))
 }
 
 /// CPython 3.14 `PyUnicode_CHECK_INTERNED`: true only when `obj` itself is the
