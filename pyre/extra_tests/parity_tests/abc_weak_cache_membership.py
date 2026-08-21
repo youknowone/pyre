@@ -1,21 +1,22 @@
 # CPython-suite gap: `test_abc` asks membership only through classes whose
-# caches it never inspects, so it covers neither the empty-collection answer
-# nor an item that cannot carry a weakref, and it cannot cover a replaced
-# collection at all -- the reference build keeps the three collections in the
-# type's own struct, so there is no attribute there to rebind.
+# caches it never inspects, so it covers neither the empty-collection answer,
+# nor an item that cannot carry a weakref, nor a class whose hash raises, and
+# it cannot cover a replaced collection at all -- the reference build keeps the
+# three collections in the type's own struct, so there is no attribute there to
+# rebind.
 #
 # `_abc_instancecheck` answers membership without entering
 # `SimpleWeakSet.__contains__`, which is sound only while the receiver really
-# is the collection `_abc_init` installed.  A rebound cache, or one whose
-# `data` is no longer a set, must take the membership protocol and answer
-# whatever the replacement spells.
+# is the collection `_abc_init` installed and its `data` really is a `set`.
+# Anything else must take the membership protocol and answer whatever the
+# replacement spells -- including a subclass whose `__contains__` lies.
 #
-# parity-tests reason: every arm is a silent wrong answer rather than a crash.
-# An empty collection that answered "present", or a replaced one read as if it
-# were still the original, reports a class as registered when it is not, and
-# nothing downstream would notice.
+# parity-tests reason: every arm is a silent wrong answer or a doubled side
+# effect rather than a crash.  A collection read past its own override reports
+# a class as registered when it is not, and a probe that answers and then
+# re-asks evaluates an observable `__hash__` twice.
 #
-# The last two arms name a collection this implementation spells as a class
+# The last three arms name a collection this implementation spells as a class
 # attribute; where it is not spellable there is nothing to replace and the arm
 # does not apply.
 import _abc
@@ -26,6 +27,9 @@ from abc import ABCMeta
 
 class Plain:
     pass
+
+
+calls = []
 
 
 def empty_collection_answers_then_fills():
@@ -65,6 +69,42 @@ def unweakreferenceable_class_reaches_the_subclass_check():
         else:
             raise AssertionError('a non-class __class__ must reach the check')
         assert isinstance(Impl(), Target) is True
+
+
+def a_raising_hash_runs_once():
+    class Boom(type):
+        def __hash__(cls):
+            calls.append(cls)
+            raise ValueError('boom')
+
+    class Fused(ABCMeta, Boom):
+        pass
+
+    class Warm(metaclass=ABCMeta):
+        pass
+
+    class Member(Warm):
+        pass
+
+    class Unhashable(metaclass=Fused):
+        pass
+
+    class Claims:
+        __class__ = Unhashable
+
+    # A populated collection, so the probe is really built and really hashed.
+    assert isinstance(Member(), Warm) is True
+    del calls[:]
+    try:
+        isinstance(Claims(), Warm)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('the raising hash was swallowed')
+    # The membership expression evaluates the hash once.  Answering the probe
+    # and then re-asking through the protocol would evaluate it twice, which is
+    # observable here and in any hash carrying a side effect.
+    assert len(calls) == 1, 'hash ran %d times' % (len(calls),)
 
 
 def a_collected_entry_stops_matching():
@@ -120,10 +160,28 @@ def replaced_data_is_consulted():
     assert isinstance(obj, Swapped) is True, 'a replaced data must still answer'
 
 
+def a_data_subclass_keeps_its_override():
+    class Shadowed(metaclass=ABCMeta):
+        pass
+
+    class Lying(set):
+        def __contains__(self, item):
+            return True
+
+    # An empty table whose `__contains__` claims every member.  Reading the
+    # table would answer False; the override answers True, and the override is
+    # what the membership protocol reaches -- a subclass keeps the base layout,
+    # so a layout test alone does not tell the two apart.
+    Shadowed._abc_cache.data = Lying()
+    assert isinstance(Plain(), Shadowed) is True, 'a data subclass was read past'
+
+
 empty_collection_answers_then_fills()
 unweakreferenceable_class_reaches_the_subclass_check()
+a_raising_hash_runs_once()
 a_collected_entry_stops_matching()
 if hasattr(ABCMeta('_Probe', (), {}), '_abc_cache'):
     rebound_collection_is_consulted()
     replaced_data_is_consulted()
+    a_data_subclass_keeps_its_override()
 print('OK')

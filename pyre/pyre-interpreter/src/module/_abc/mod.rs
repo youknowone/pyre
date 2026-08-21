@@ -79,7 +79,11 @@ fn simple_weak_set_contains(
     let cache_slot = roots.publish(&[cache]);
     let item_slot = roots.publish(&[item]);
     let data = crate::baseobjspace::getattr_str(roots.get(cache_slot), "data")?;
-    if !unsafe { pyre_object::is_set(data) } {
+    // Exactly a `set`, not merely one by layout: a subclass keeps the base
+    // layout in `ob_type` and retags `w_class`, and `contains` dispatches such
+    // a subclass's `__contains__` override through `subclass_special_override`.
+    // Reading the table directly would answer past the override.
+    if !unsafe { pyre_object::is_exact_type(data, &pyre_object::setobject::SET_TYPE) } {
         return Ok(None);
     }
     let data_slot = roots.publish(&[data]);
@@ -109,9 +113,14 @@ fn simple_weak_set_contains(
         pyre_object::w_set_contains_checked(roots.get(data_slot), roots.get(probe_slot))
     } {
         Ok(found) => Ok(Some(found)),
-        // A weakref is hashable, so this is unreachable; leave the faithful
-        // error to the membership protocol rather than inventing one here.
-        Err(_) => Ok(None),
+        // The probe hashes by its referent, so a metaclass `__hash__` that
+        // raises arrives here.  Recover that exception rather than declining:
+        // the protocol would build a second probe and run the same observable
+        // `__hash__` again before raising, and the expression it stands in for
+        // runs it once.
+        Err(_) => Err(crate::baseobjspace::take_pending_dict_key_error(
+            roots.get(probe_slot),
+        )),
     }
 }
 

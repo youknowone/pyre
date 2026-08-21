@@ -5957,7 +5957,16 @@ fn try_walker_inline_type_call_via_new<Sym: WalkSym>(
         return type_call_decline("__new__ overridden but unresolvable");
     };
     // Type creation wraps a class's own `__new__` in `staticmethod`; `descr_call`'s
-    // `space.get` unwraps it before calling, and so must this.
+    // `space.get` unwraps it before calling, and so must this.  Only an exact
+    // one may be unwrapped in place of that `space.get`: a subclass keeps the
+    // base layout in `ob_type`, so it answers the same layout test, and its
+    // `__get__` may bind something other than the function it wraps.
+    if unsafe {
+        pyre_object::function::is_staticmethod(tp_new)
+            && !pyre_object::function::is_exact_staticmethod(tp_new)
+    } {
+        return type_call_decline("__new__ wrapped in a staticmethod subclass");
+    }
     let w_new = unsafe {
         if pyre_object::function::is_staticmethod(tp_new) {
             pyre_object::function::w_staticmethod_get_func(tp_new)
