@@ -2178,9 +2178,15 @@ pub(crate) fn eval_frame_plain_with_resume(
         // Python finally: a finally-block exception replaces any
         // pending exception from the try-body. Only the all-OK path
         // advances to `got_exception = false`.
+        // Both hooks hand the exit value back at its live address, and both
+        // the local and `inner_result` carry the word taken before the
+        // callback ran, so each result is rebuilt from what came back.
         let combined = match return_trace_result {
             Err(rt_err) => Err(rt_err),
-            Ok(()) => inner_result,
+            Ok(live) => {
+                w_exitvalue = live;
+                inner_result.map(|_| live)
+            }
         };
         if combined.is_ok() {
             got_exception = false;
@@ -2190,7 +2196,7 @@ pub(crate) fn eval_frame_plain_with_resume(
     let leave_result = execution_context.leave(frame as *mut PyFrame, w_exitvalue, got_exception);
     match leave_result {
         Err(leave_err) => Err(leave_err),
-        Ok(()) => outer_result,
+        Ok(live) => outer_result.map(|_| live),
     }
 }
 

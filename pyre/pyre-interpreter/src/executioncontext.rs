@@ -622,12 +622,14 @@ impl ExecutionContext {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Hands back the exit value at its live address: the profile callback is
+    /// application-level Python, so a movable value moves under it.
     pub fn leave(
         &mut self,
         frame: *mut PyFrame,
         w_exitvalue: PyObjectRef,
         got_exception: bool,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<PyObjectRef, crate::PyError> {
         // pypy/interpreter/executioncontext.py leave parity.
         // The original wraps `_trace('leaveframe', …)` in try/finally so
         // the topframeref restore and the vref dance always run.  We
@@ -636,8 +638,17 @@ impl ExecutionContext {
         // `_trace` runs the profile callback, which is application-level
         // Python; the chain surgery below reads the frame's own fields.
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        let mut w_exitvalue = w_exitvalue;
         let trace_result = if self.profilefunc.is_some() {
-            self._trace(frame, "leaveframe", w_exitvalue, None)
+            // The exit value rides a root slot for the callback's duration.
+            // Nothing runs Python without a profiler installed, so the slot is
+            // taken on this arm rather than for every frame that leaves.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let exit_slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(w_exitvalue);
+            let result = self._trace(frame, "leaveframe", w_exitvalue, None);
+            w_exitvalue = pyre_object::gc_roots::shadow_stack_get(exit_slot);
+            result
         } else {
             Ok(())
         };
@@ -668,7 +679,7 @@ impl ExecutionContext {
         // records VIRTUAL_REF_FINISH during tracing.
         // `if self.space.reverse_debugging: self._revdb_leave(got_exception)`
         // (executioncontext.py) folds away with the arm in `enter`.
-        trace_result
+        trace_result.map(|()| w_exitvalue)
     }
 
     /// executioncontext.py — `c_call_trace(self, frame, w_func, args=None)`.
@@ -767,16 +778,21 @@ impl ExecutionContext {
         Ok(())
     }
 
+    /// Hands back the returned value at its live address: the callback is
+    /// application-level Python, so a movable value moves under it.
     pub fn return_trace(
         &mut self,
         frame: *mut PyFrame,
         w_retval: PyObjectRef,
-    ) -> Result<(), crate::PyError> {
-        let _ = (frame, w_retval);
-        if !self.gettrace().is_null() {
-            self._trace(frame, "return", w_retval, None)?;
+    ) -> Result<PyObjectRef, crate::PyError> {
+        if self.gettrace().is_null() {
+            return Ok(w_retval);
         }
-        Ok(())
+        let _roots = pyre_object::gc_roots::push_roots();
+        let retval_slot = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::pin_root(w_retval);
+        self._trace(frame, "return", w_retval, None)?;
+        Ok(pyre_object::gc_roots::shadow_stack_get(retval_slot))
     }
 
     #[inline(always)]
