@@ -765,19 +765,41 @@ pub unsafe fn w_str_get_wtf8(obj: PyObjectRef) -> &'static Wtf8 {
 /// `obj` must be a `W_UnicodeObject`.
 #[inline]
 pub unsafe fn w_str_get_hash(obj: PyObjectRef) -> i64 {
-    unsafe { (*(obj as *const W_UnicodeObject)).hash }
+    unsafe { hash_slot(obj) }.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Publish a computed digest into the memo slot, `rstr.py:411-412`.  Racing
-/// writers store the same value, so no ordering is required; upstream
+/// The memo slot, reached as an atomic.
+///
+/// One interned string now answers every thread that names it, so the read in
+/// [`w_str_hash_memoized`] and the write below genuinely run concurrently. The
+/// field stays a plain `i64` — an `AtomicI64` would nest a by-value struct in
+/// `W_UnicodeObject` and renumber the field descrs the JIT addresses it by —
+/// and [`std::sync::atomic::AtomicI64::from_ptr`] is what makes those accesses
+/// well defined; every read and write of `hash` goes through this helper.
+///
+/// `Relaxed` carries the whole ordering requirement: racing writers store the
+/// identical digest, and nothing is published through the slot, so a reader
+/// either sees zero and recomputes or sees the one value anyone would write.
+///
+/// # Safety
+/// `obj` must be a `W_UnicodeObject`.
+#[inline]
+unsafe fn hash_slot<'a>(obj: PyObjectRef) -> &'a std::sync::atomic::AtomicI64 {
+    unsafe {
+        std::sync::atomic::AtomicI64::from_ptr(&raw mut (*(obj as *mut W_UnicodeObject)).hash)
+    }
+}
+
+/// Publish a computed digest into the memo slot, `rstr.py:411-412`.  Upstream
 /// reaches the field through `conditional_call_elidable`, which likewise
-/// tolerates a repeated computation.
+/// tolerates a repeated computation; [`hash_slot`] carries why a racing
+/// repeat is harmless here.
 ///
 /// # Safety
 /// `obj` must be a `W_UnicodeObject`.
 #[inline]
 pub unsafe fn w_str_set_hash(obj: PyObjectRef, hash: i64) {
-    unsafe { (*(obj as *mut W_UnicodeObject)).hash = hash }
+    unsafe { hash_slot(obj) }.store(hash, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `rstr.py ll_strhash` — read the memo, and compute the digest only
