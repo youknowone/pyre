@@ -80,6 +80,12 @@ pub fn enter_external_callback_from_foreign_thread() -> majit_gc::gc_sync::Callb
     if first_entry {
         majit_gc::shadow_stack::register_mutator();
         RUNTIME_THREAD.with(|_| {});
+        // The per-thread half of the runtime: the dict `eq_w`/`hash_w`
+        // trampolines and this thread's GC root walkers, both thread-local
+        // cells that a thread pyre never started has none of.  A spawned
+        // Python thread runs this from its own entry; without it here, the
+        // first dict a callback builds panics for want of the hash hook.
+        crate::call::enter_runtime_thread();
     }
     guard
 }
