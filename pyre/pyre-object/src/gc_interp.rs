@@ -298,9 +298,11 @@ pub fn would_collect() -> bool {
 /// Dispatches to the installed threshold and collection hooks, neither a
 /// build-time constant, so the JIT residualizes the call instead of tracing
 /// into it (`@dont_look_inside`, the [`enabled`] sibling). A `()` return has no
-/// discriminant to erase and it cannot raise. On the cold interpreter dispatch
-/// loop its first act is already the non-inlined `enabled()` early-return; the
-/// residual adds no hot-path cost the un-residualized form did not already pay.
+/// discriminant to erase and it cannot raise. A dispatch with nothing pending
+/// reaches only the two request flags and the two cached feature switches
+/// before returning. The flags are read ahead of the switches on purpose — an
+/// explicit request has to be serviced even with the routing feature off,
+/// which is why [`note_eval_activation_exit`] tracks nesting unconditionally.
 #[majit_macros::dont_look_inside]
 pub fn safepoint() {
     // Take any request the old-gen allocator armed, and take it before the
