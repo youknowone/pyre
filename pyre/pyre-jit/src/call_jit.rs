@@ -4108,7 +4108,16 @@ fn jit_ca_handle_guard_failure(
     guard_value_operand: i64,
     guard_value_operand_present: bool,
 ) -> bool {
-    if raw_values_ptr.is_null() || num_values == 0 {
+    // `compile.py AbstractResumeGuardDescr.handle_fail` has no live-value
+    // precondition: it runs `must_compile` for every reported failure. A
+    // GUARD_VALUE whose fail-argument vector is empty still has everything the
+    // hotness decision needs, because the operand it hashes travels separately
+    // in `guard_value_operand` (`compile.py make_a_counter_per_value` keys the
+    // counter on the failing value, not on a fail argument). Bailing on
+    // `num_values == 0` would leave such a guard without a counter tick, and so
+    // without a bridge, forever. Only a null pointer with a non-zero length is
+    // unusable — that pairing cannot be turned into a slice at all.
+    if raw_values_ptr.is_null() && num_values != 0 {
         return false;
     }
     // `enter_profiler_tracing` is not re-entrant (pyjitpl.py:2914 — RPython's
@@ -4129,7 +4138,13 @@ fn jit_ca_handle_guard_failure(
             return false;
         }
     }
-    let raw_values_input = unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) };
+    // `from_raw_parts` requires a non-null, aligned pointer even for a zero
+    // length, and a backend with nothing to report may pass null.
+    let raw_values_input: &[i64] = if num_values == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) }
+    };
     let mut raw_values_vec = raw_values_input.to_vec();
 
     // compile.py _trace_and_compile_from_bridge.  Native CA code
