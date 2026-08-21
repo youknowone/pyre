@@ -53,8 +53,16 @@ if hasattr(mmap, "mmap"):
     managed("mmap closed repr", mmap.mmap.__repr__(mapping))
 
 
-objects = gc.get_objects()
+# The census names only tracked types and a string is never one, so it can no
+# longer report a result directly.  It does name `results`, and the collector's
+# own edge walk goes the rest of the way: one hop reaches the entry tuples and
+# a second reaches the strings.  A value the native path handed back without
+# giving it a managed identity would be missing from that walk.
+assert any(obj is results for obj in gc.get_objects())
+reached = []
+for entry in gc.get_referents(results):
+    reached.extend(gc.get_referents(entry))
 for label, value in results:
-    assert any(obj is value for obj in objects), label
+    assert any(ref is value for ref in reached), label
 
 print("native runtime string results are collectable")
