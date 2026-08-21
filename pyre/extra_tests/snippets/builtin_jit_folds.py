@@ -127,7 +127,10 @@ for _pair in [(1, 2), (2, 1), (1, 1), (-3, 3), (2**62, 2**62 + 1),
 # compare the payload's address instead of its value.  An address is always
 # a large positive number, which is why (2**70, 1) above agrees by accident:
 # the answer only diverges once the bigint is the operand that should lose.
+# `(2**62, 2**62 + 1)` above reaches none of this: both fit a machine word.
+# An address sits far below 2**62, so `(2**70, 2**62)` diverges too.
 for _pair in [(-(2**70), 5), (5, -(2**70)), (-(2**70), -1),
+              (2**70, 2**62), (2**62, 2**70),
               (2**70, 2**71), (-(2**70), -(2**71))]:
     _stable(min, _pair)
     _stable(max, _pair)
