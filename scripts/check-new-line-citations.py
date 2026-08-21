@@ -62,9 +62,14 @@ def main():
     args = ap.parse_args()
 
     bad = []
+    added = rust_added = 0
+    files = set()
     for path, lineno, text in added_lines(args.base):
+        added += 1
         if not path or not path.endswith(".rs"):
             continue
+        files.add(path)
+        rust_added += 1
         comment = text.find("//")
         if comment < 0 or ESCAPE in text[comment:]:
             continue
@@ -72,7 +77,14 @@ def main():
             if m.start() > comment:
                 bad.append((path, lineno, m.group(0), text.strip()))
 
+    # Printed whichever way this ends. A gate whose pass is indistinguishable
+    # from a gate that read an empty range is a gate nobody can trust: the
+    # population belongs in the log next to the verdict.
+    scanned = (f"scanned {rust_added} added Rust line(s) in {len(files)} file(s), "
+               f"of {added} added line(s) in range")
+
     if not bad:
+        print(f"{scanned}; no new line-number citations.")
         return 0
 
     if args.annotate:
@@ -83,7 +95,8 @@ def main():
                   f"title=Cite upstream by symbol::`{cite}` names a line number. "
                   "Drop the `:LINE` and name the symbol, or add "
                   f"`{ESCAPE}` to record that the number was deliberate.")
-        print(f"{len(bad)} new line-number citation(s); see the annotations above.")
+        print(f"{scanned}; {len(bad)} new line-number citation(s), "
+              "see the annotations above.")
         return 0
 
     print("Upstream citations must name a symbol, not a line number "
@@ -91,7 +104,8 @@ def main():
     for path, lineno, cite, text in bad:
         print(f"  {path}:{lineno}: {cite}")
         print(f"      {text[:100]}")
-    print(f"\n{len(bad)} new line-number citation(s).")
+    print(f"\n{scanned}.")
+    print(f"{len(bad)} new line-number citation(s).")
     print("Drop the `:LINE` and name the symbol instead — the enclosing "
           "`def`/`class` when the claim is about a statement inside one.")
     print(f"Where no symbol pins the claim, keep the number and add `{ESCAPE}` "
