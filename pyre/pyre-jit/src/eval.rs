@@ -9723,6 +9723,41 @@ fn untag_tagged_frame_locals(frame_root: &mut FrameRoot) {
     }
 }
 
+/// Publish `PyFrame.frame_finished_execution = True` after a single-frame
+/// blackhole resume that ran this frame to its return.
+///
+/// `jitexc.py:16-40 DoneWithThisFrame*` is the blackhole reporting that the
+/// frame is done.  `pyopcode.py:239-241 RETURN_VALUE` performs the store
+/// there, and upstream carries it in the jitcode, so pyjitpl, the blackhole
+/// and compiled code all replay it.  Pyre lowers the return into the
+/// `*_return` operation instead, so every executor publishes the transition by
+/// hand: the interpreter in `finish_value`, the walker in
+/// `finish_current_frame_execution`, the multi-frame drive per level in
+/// `finish_blackhole_level_frame`, and the single-frame resume here.
+///
+/// `generator.py:94` reads exactly this bit to tell a RETURN from a YIELD, so
+/// a frame that skips it makes a generator or coroutine hand its return value
+/// back as one more yielded value.
+///
+/// `ExitFrameWithExceptionRef` is deliberately not covered: pyre offers that
+/// exception to the frame's own exception table first, so the frame may resume
+/// at a handler rather than be finished.
+fn publish_blackhole_frame_finished(
+    result: &crate::call_jit::BlackholeResult,
+    frame: &mut PyFrame,
+) {
+    use crate::call_jit::BlackholeResult;
+    if matches!(
+        result,
+        BlackholeResult::DoneWithThisFrameVoid
+            | BlackholeResult::DoneWithThisFrameInt(_)
+            | BlackholeResult::DoneWithThisFrameRef(_)
+            | BlackholeResult::DoneWithThisFrameFloat(_)
+    ) {
+        frame.set_frame_finished_execution(true);
+    }
+}
+
 /// RPython warmstate.py:387-423 execute_assembler.
 ///
 /// Run compiled machine code for a given green_key. Handles the
@@ -9924,6 +9959,18 @@ fn execute_assembler(
                     )));
                 }
             };
+            // `pyopcode.py:239-241` stores `frame_finished_execution = True`
+            // in the RETURN_VALUE handler itself, so upstream records an
+            // ordinary field store into the trace and compiled code replays
+            // it for free.  Pyre lowers the return into the `*_return`
+            // operation, so every executor has to publish the store by hand:
+            // the interpreter does it in `finish_value`, the walker in
+            // `finish_current_frame_execution`, the blackhole through its
+            // frame-finished hook, and compiled code here.  `generator.py:94`
+            // reads exactly this bit to tell a RETURN from a YIELD, so a
+            // frame that skips it makes a generator or coroutine hand its
+            // return value back as one more yielded value.
+            frame_root.frame().set_frame_finished_execution(true);
             Some(LoopResult::Done(Ok(result)))
         }
         // warmstate.py:416-422 general: handle_fail
@@ -9964,6 +10011,7 @@ fn execute_assembler(
                         forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                     );
+                    publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -10351,6 +10399,7 @@ fn bound_reached(
                         forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                     );
+                    publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -10622,6 +10671,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                         forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                     );
+                    publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
                         crate::call_jit::BlackholeResult::ContinueRunningNormally {
                             green_int,
@@ -10860,6 +10910,18 @@ fn handle_jit_outcome(
             // must not escape into a blackhole caller and turn this successful
             // return into a raise.
             crate::call_jit::clear_residual_call_exception();
+            // `pyopcode.py:239-241` stores `frame_finished_execution = True`
+            // in the RETURN_VALUE handler itself, so upstream records an
+            // ordinary field store into the trace and compiled code replays
+            // it for free.  Pyre lowers the return into the `*_return`
+            // operation, so every executor has to publish the store by hand:
+            // the interpreter does it in `finish_value`, the walker in
+            // `finish_current_frame_execution`, the blackhole through its
+            // frame-finished hook, and compiled code here.  `generator.py:94`
+            // reads exactly this bit to tell a RETURN from a YIELD, so a
+            // frame that skips it makes a generator or coroutine hand its
+            // return value back as one more yielded value.
+            frame.set_frame_finished_execution(true);
             JitAction::Return(Ok(value))
         }
         DetailedDriverRunOutcome::Jump {
