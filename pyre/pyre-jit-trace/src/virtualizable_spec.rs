@@ -48,6 +48,12 @@ pub const LOCALS_CELLS_STACK_W_VABLE_ARRAY_INDEX: usize = 0;
 /// `virtualizable_entry_at` index a reader of `getorcreatedebug()` uses.
 pub const DEBUGDATA_VABLE_FIELD_INDEX: usize = 3;
 
+/// Canonical vable-field index for `last_instr`.
+///
+/// The standard-frame shadow carries the portal frame's symbolic Python
+/// coordinate while an inlined callee is running.
+pub const LAST_INSTR_VABLE_FIELD_INDEX: usize = 0;
+
 const _: () = {
     assert!(
         !PYFRAME_VABLE_ARRAYS.is_empty(),
@@ -80,6 +86,26 @@ const _: () = {
         PYFRAME_VABLE_FIELDS[DEBUGDATA_VABLE_FIELD_INDEX].1 == DEBUGDATA_VABLE_FIELD_INDEX,
         "debugdata must be registered at the expected vable field index"
     );
+    assert!(
+        PYFRAME_VABLE_FIELDS[LAST_INSTR_VABLE_FIELD_INDEX].1 == LAST_INSTR_VABLE_FIELD_INDEX,
+        "last_instr must be registered at the expected vable field index"
+    );
+    let name = PYFRAME_VABLE_FIELDS[LAST_INSTR_VABLE_FIELD_INDEX]
+        .0
+        .as_bytes();
+    let expected = b"last_instr";
+    assert!(
+        name.len() == expected.len(),
+        "PYFRAME_VABLE_FIELDS[0] name mismatch"
+    );
+    let mut i = 0;
+    while i < expected.len() {
+        assert!(
+            name[i] == expected[i],
+            "PYFRAME_VABLE_FIELDS[0] name mismatch"
+        );
+        i += 1;
+    }
     let name = PYFRAME_VABLE_FIELDS[DEBUGDATA_VABLE_FIELD_INDEX]
         .0
         .as_bytes();

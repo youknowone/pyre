@@ -1362,6 +1362,41 @@ impl TraceCtx {
         self.virtualref_boxes.last().copied()
     }
 
+    /// Resolve a live tracing-time vref back to its `[virtualbox, vrefbox]`
+    /// pair.  This is the paired walk `vrefs_after_residual_call` makes over
+    /// `MetaInterp.virtualref_boxes` (`pyjitpl.py`): callers that execute
+    /// `jit_force_virtual(vref)` need the paired virtual box that
+    /// `stop_tracking_virtualref` publishes through `VIRTUAL_REF_FINISH`.
+    ///
+    /// Search from the innermost pair because frame-chain vrefs are nested in
+    /// the same order as `virtualref_boxes`.  A stopped pair has had its vref
+    /// entry replaced by `CONST_NULL`, exactly as upstream, so it cannot match.
+    pub fn live_virtualref_pair_for_ptr(&self, vref_ptr: usize) -> Option<(OpRef, OpRef)> {
+        if vref_ptr == 0 {
+            return None;
+        }
+        self.virtualref_boxes
+            .chunks_exact(2)
+            .rev()
+            .find(|pair| pair[1].1 == vref_ptr)
+            .map(|pair| (pair[0].0, pair[1].0))
+    }
+
+    /// Find the virtual box for a concrete object named by either a live or an
+    /// already-stopped vref pair. `stop_tracking_virtualref` replaces only
+    /// `virtualref_boxes[i + 1]` with `CONST_NULL`; the adjacent virtual box
+    /// remains in the upstream list until `virtual_ref_finish` pops the scope.
+    pub fn virtualref_virtual_for_object_ptr(&self, object_ptr: usize) -> Option<OpRef> {
+        if object_ptr == 0 {
+            return None;
+        }
+        self.virtualref_boxes
+            .chunks_exact(2)
+            .rev()
+            .find(|pair| pair[0].1 == object_ptr)
+            .map(|pair| pair[0].0)
+    }
+
     /// `pyjitpl.py rebuild_state_after_failure`'s
     /// `self.virtualref_boxes = virtualref_boxes`.  A bridge resumes into its
     /// parent's still-open `virtual_ref` scopes, so the pairs the parent guard
