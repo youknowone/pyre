@@ -170,7 +170,9 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
         return mirror as *mut CPyObject;
     }
     let ob_type = type_mirror(w_obj);
-    let raw = attach(w_obj, REFCNT_FROM_PYRE, ob_type, mirror_size(ob_type));
+    let size = mirror_size(ob_type);
+    let raw = attach(w_obj, REFCNT_FROM_PYRE, ob_type, size);
+    unsafe { super::typeobject::stamp_ob_size(raw, w_obj, size) };
     // The types whose blocks carry fields past the header; every other block
     // this runtime hands out is exactly its header.
     super::frameobject::attach(raw, w_obj);

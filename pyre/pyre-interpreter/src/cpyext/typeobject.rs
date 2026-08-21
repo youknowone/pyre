@@ -520,6 +520,84 @@ fn heap_type_basicsize(w_type: PyObjectRef) -> isize {
     }
 }
 
+/// What `tp_itemsize` a synthesized mirror of `w_type` carries --
+/// `typeobject.py type_attach`.
+///
+/// It is the number a caller sizing an allocation of its own multiplies by,
+/// not a statement about where the items are: a block this runtime hands out
+/// carries none of them, and no header here spells a struct that could reach
+/// past the fields it declares.
+fn mirror_itemsize(w_type: PyObjectRef) -> isize {
+    if w_type.is_null() {
+        return 0;
+    }
+    let derived = |builtin: &'static pyre_object::pyobject::PyType| {
+        let class = crate::typedef::gettypefor(builtin);
+        class.is_some_and(|class| unsafe {
+            crate::baseobjspace::issubtype_w(w_type, class.as_ptr())
+        })
+    };
+    if derived(&pyre_object::bytesobject::BYTES_TYPE) {
+        return 1;
+    }
+    if derived(&pyre_object::pyobject::TUPLE_TYPE) {
+        return size_of::<CPyObject>() as isize;
+    }
+    // `type` itself and no metaclass: the members follow the block a heap type
+    // declared, and only a type declared in C has any.
+    let is_type = crate::typedef::gettypefor(&pyre_object::pyobject::TYPE_TYPE)
+        .is_some_and(|class| std::ptr::eq(w_type, class.as_ptr()));
+    match is_type {
+        true => size_of::<CPyMemberDef>() as isize,
+        false => 0,
+    }
+}
+
+/// Whether a mirror of an instance of `w_type` carries an `ob_size` --
+/// `pyobject.py allocate`'s `if itemsize or issubtype_w(w_type, w_list)`.
+///
+/// A list has no item size of its own and is counted all the same, because
+/// `Py_SIZE` reads the length off one.
+fn counts_items(w_type: PyObjectRef) -> bool {
+    if mirror_itemsize(w_type) != 0 {
+        return true;
+    }
+    crate::typedef::gettypefor(&pyre_object::pyobject::LIST_TYPE)
+        .is_some_and(|class| unsafe { crate::baseobjspace::issubtype_w(w_type, class.as_ptr()) })
+}
+
+/// Fill a fresh mirror's `ob_size` -- `pyobject.py create_ref`'s item count.
+///
+/// The count comes off the object's own layout rather than from `len()`:
+/// this runs before the mirror is linked, and a `__len__` written in Python
+/// would come back through here for the same object.
+///
+/// # Safety
+/// `raw` must be a live mirror of `w_obj` whose block is `size` bytes.
+pub(super) unsafe fn stamp_ob_size(raw: *mut CPyObject, w_obj: PyObjectRef, size: usize) {
+    if size < size_of::<CPyVarObject>() {
+        return;
+    }
+    let Some(w_type) = crate::typedef::r#type(w_obj) else {
+        return;
+    };
+    if !counts_items(w_type.as_ptr()) {
+        return;
+    }
+    let count = unsafe {
+        if pyre_object::is_list(w_obj) {
+            pyre_object::listobject::w_list_len(w_obj)
+        } else if pyre_object::is_tuple(w_obj) {
+            pyre_object::tupleobject::w_tuple_len(w_obj)
+        } else if pyre_object::bytesobject::is_bytes(w_obj) {
+            pyre_object::bytesobject::w_bytes_len(w_obj)
+        } else {
+            0
+        }
+    };
+    unsafe { (*(raw as *mut CPyVarObject)).ob_size = count as isize };
+}
+
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries.
 ///
 /// The modules whose mirrors have fields of their own each answer for their
@@ -529,7 +607,7 @@ fn heap_type_basicsize(w_type: PyObjectRef) -> isize {
 /// `__Pyx_ImportType` refuses to import a class whose basicsize is under the
 /// struct it declared.
 fn mirror_basicsize(w_type: PyObjectRef) -> isize {
-    [
+    let size = [
         heap_type_basicsize(w_type),
         super::frameobject::basicsize(w_type),
         super::pyerrors::basicsize(w_type),
@@ -538,7 +616,13 @@ fn mirror_basicsize(w_type: PyObjectRef) -> isize {
     ]
     .into_iter()
     .find(|&size| size != 0)
-    .unwrap_or(size_of::<CPyObject>() as isize)
+    .unwrap_or(size_of::<CPyObject>() as isize);
+    // `type_attach`, "Make sure Py_SIZE() can cast to PyVarObject": a block
+    // whose length is read has to have room for the word that holds it.
+    match counts_items(w_type) {
+        true => size.max(size_of::<CPyVarObject>() as isize),
+        false => size,
+    }
 }
 
 pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
@@ -562,6 +646,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     unsafe {
         (*mirror).tp_name = pointer;
         (*mirror).tp_basicsize = mirror_basicsize(w_type);
+        (*mirror).tp_itemsize = mirror_itemsize(w_type);
         (*mirror).tp_flags = PY_TPFLAGS_DEFAULT
             | PY_TPFLAGS_READY
             | PY_TPFLAGS_BASETYPE

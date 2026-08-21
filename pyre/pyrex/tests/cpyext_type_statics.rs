@@ -147,6 +147,43 @@ for name, klass in [('type', type), ('a metaclass', Meta)]:
 eq('an ordinary class is not sized as a type',
    m.heap_type_sizes(int)[0] < m.heap_type_sizes(type)[0], True)
 
+
+# ── the length a block carries ─────────────────────────────────────────
+
+# `Py_SIZE` reads a field rather than calling anything, so a class whose
+# instances are counted has to have made room for the word and filled it.
+
+
+class L2(list):
+    pass
+
+
+class T2(tuple):
+    pass
+
+
+class B2(bytes):
+    pass
+
+
+for name, made in [('an empty list', []), ('a list', [1, 2, 3]),
+                   ('an empty tuple', ()), ('a tuple', (1, 2, 3)),
+                   ('empty bytes', b''), ('bytes', b'abc'),
+                   ('a list subclass', L2([1, 2])),
+                   ('a tuple subclass', T2((1, 2))),
+                   ('a bytes subclass', B2(b'ab'))]:
+    size, basic, item = m.block_size(made)
+    eq('the length of %s' % name, size, len(made))
+    # The word sits past the header, so the block has to be wider than one.
+    eq('the block of %s holds the word' % name, basic >= 32, True)
+
+# The item size is what a caller sizing an allocation of its own multiplies
+# by; a list has none and is counted all the same.
+eq('the item size of bytes', m.block_size(b'abc')[2], 1)
+eq('the item size of a tuple', m.block_size((1,))[2] > 0, True)
+eq('the item size of a list', m.block_size([1])[2], 0)
+eq('a class with nothing to count', m.block_size(object())[2], 0)
+
 # ── the address as a converter argument ────────────────────────────────
 
 eq('O! list', m.parse_typed('list', [1, 2]), (1, 'list', None))
