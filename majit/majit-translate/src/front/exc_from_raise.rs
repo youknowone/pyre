@@ -48,7 +48,7 @@
 //!
 //! Upstream's tail line is `w_type = op.type(w_value)`, but that value never
 //! reaches a jitcode. `make_bytecode_block` hands the `exceptblock`'s
-//! `inputargs` to `make_return` (`flatten.py:106-108`), whose 2-arg arm emits
+//! `inputargs` to `make_return` (`flatten.py`), whose 2-arg arm emits
 //! `-live-` + `raise self.getcolor(args[1])` and never touches `args[0]`
 //! (`flatten.py:139-143`, mirrored at `flatten.rs`). So the slot the
 //! `etype` link arg feeds has no consumer in any emitted bytecode.
@@ -60,8 +60,8 @@
 //!
 //! Upstream RPython encodes the exception class operand as a
 //! `Constant(class_obj)` SSA value living directly inside
-//! `SpaceOperation.args` — `flowspace/model.py:354` defines
-//! `Constant(value)`, `flowspace/model.py:436` makes `args` a mixed
+//! `SpaceOperation.args` — `flowspace/model.py` defines
+//! `Constant(value)`, `flowspace/model.py` makes `args` a mixed
 //! `Variable | Constant` list, and `flowspace/operation.py:666
 //! SimpleCall.eval` reads `w_callable, args_w = self.args[0],
 //! self.args[1:]` — that is, `args[0]` is *itself* the Constant
@@ -115,7 +115,7 @@
 //!
 //! `simple_call`'s *non-class* args (the message values) are real
 //! Variables and live at `args[1..]`, matching upstream
-//! `flowspace/operation.py:666 SimpleCall.eval` reading
+//! `flowspace/operation.py SimpleCall.eval` reading
 //! `args_w = self.args[1:]`.  This part is already orthodox — only
 //! the operand-0 class slot is the deviation noted above.
 //!
@@ -186,10 +186,10 @@ pub fn lower_exc_from_raise(
             true,
         )
         .expect("op.simple_call(exc_class, ...) must produce a Ref exception instance");
-    // `flowspace/flowcontext.py:1253 Raise.nomoreblocks` — close the block
+    // `flowspace/flowcontext.py Raise.nomoreblocks` — close the block
     // with the `(etype, evalue)` Link to the graph's `exceptblock`.
     //
-    // Upstream's `w_type = op.type(w_value)` (`flowcontext.py:634`) lives at
+    // Upstream's `w_type = op.type(w_value)` (`flowcontext.py`) lives at
     // flow-space level only — see the module-level "etype link arg" note: the
     // 2-arg `make_return` arm emits `raise <args[1]>` and never reads
     // `args[0]`, and `make_exception_link` drops both for a direct `reraise`.

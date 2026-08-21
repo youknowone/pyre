@@ -8,7 +8,7 @@
 //! `pypyjit.set_param(...)` call configures the warmstate on every backend
 //! including the wasm guest (which sees no environment).
 
-/// interp_jit.py:138-167 — `set_param(space, __args__)`.
+/// interp_jit.py — `set_param(space, __args__)`.
 ///
 /// Accepts the PyPy calling conventions:
 ///   * `set_param("name=value,name=value")` / `set_param("off")` /
@@ -47,7 +47,7 @@ fn set_param(
     // pair into one parameter string so the JIT-side parser stays the single
     // source of truth. `enable_opts` carries a string value; every other
     // parameter is an integer (`space.int_w` rejects a non-int value here) whose
-    // name is looked up in `unroll_parameters` (rlib/jit.py:606) before it is
+    // name is looked up in `unroll_parameters` (rlib/jit.py) before it is
     // accepted.
     if let Some(kw_dict) = kwds {
         let mut parts: Vec<String> = Vec::new();

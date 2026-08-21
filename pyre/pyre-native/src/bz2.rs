@@ -17,7 +17,7 @@ use bzip2::{Action, Compress, Compression, Decompress, Error, Status};
 const INITIAL_BUFFER_SIZE: usize = 8192;
 const BIGCHUNK: usize = 512 * 1024;
 
-/// `interp_bz2.py:179 _new_buffer_size`: keep doubling until BIGCHUNK, then
+/// `interp_bz2.py _new_buffer_size`: keep doubling until BIGCHUNK, then
 /// the buffer size is no longer increased.
 const fn new_buffer_size(current_size: usize) -> usize {
     if current_size < BIGCHUNK {
@@ -27,7 +27,7 @@ const fn new_buffer_size(current_size: usize) -> usize {
     }
 }
 
-/// The `bzerror` values `interp_bz2.py:158 _catch_bz2_error` separates.  The
+/// The `bzerror` values `interp_bz2.py _catch_bz2_error` separates.  The
 /// interpreter module owns the exception mapping, as it owns the object
 /// space this backend deliberately knows nothing about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -54,7 +54,7 @@ impl From<Error> for Bz2Error {
 
 // ── streaming compressor (_bz2.BZ2Compressor) ───────────────────────────
 
-/// `interp_bz2.py:266 W_BZ2Compressor` — the compress stream plus the
+/// `interp_bz2.py W_BZ2Compressor` — the compress stream plus the
 /// `running` flag the object reads back as "already flushed".
 pub struct Compressor {
     compress: Compress,
@@ -62,7 +62,7 @@ pub struct Compressor {
 }
 
 impl Compressor {
-    /// `interp_bz2.py:293 _init_bz2comp` — `BZ2_bzCompressInit(bzs,
+    /// `interp_bz2.py _init_bz2comp` — `BZ2_bzCompressInit(bzs,
     /// compresslevel, 0, 0)`.  `None` for a level outside 1..=9, which the
     /// caller reports as the ValueError upstream raises before init.
     #[inline(never)]
@@ -81,13 +81,13 @@ impl Compressor {
         self.flushed
     }
 
-    /// `interp_bz2.py:315 compress`.
+    /// `interp_bz2.py compress`.
     #[inline(never)]
     pub fn compress(&mut self, data: &[u8]) -> Result<Vec<u8>, Bz2Error> {
         self.run(data, Action::Run)
     }
 
-    /// `interp_bz2.py:358 flush` — the stream ends here and the object may
+    /// `interp_bz2.py flush` — the stream ends here and the object may
     /// not be used again.
     #[inline(never)]
     pub fn flush(&mut self) -> Result<Vec<u8>, Bz2Error> {
@@ -127,7 +127,7 @@ impl Compressor {
 
 // ── streaming decompressor (_bz2.BZ2Decompressor) ───────────────────────
 
-/// `interp_bz2.py:396 W_BZ2Decompressor` — the decompress stream and the
+/// `interp_bz2.py W_BZ2Decompressor` — the decompress stream and the
 /// unconsumed-input bookkeeping `decompress` reports back through
 /// `needs_input` and `unused_data`.
 pub struct Decompressor {
@@ -143,7 +143,7 @@ pub struct Decompressor {
 }
 
 impl Decompressor {
-    /// `interp_bz2.py:429 _init_bz2decomp` — `BZ2_bzDecompressInit(bzs, 0, 0)`,
+    /// `interp_bz2.py _init_bz2decomp` — `BZ2_bzDecompressInit(bzs, 0, 0)`,
     /// i.e. the fast (non-`small`) algorithm.
     #[inline(never)]
     pub fn new() -> Self {
@@ -173,7 +173,7 @@ impl Decompressor {
         &self.unused_data
     }
 
-    /// `interp_bz2.py:491 decompress` — `max_length` of `None` is upstream's
+    /// `interp_bz2.py decompress` — `max_length` of `None` is upstream's
     /// negative value, meaning unlimited output.
     #[inline(never)]
     pub fn decompress(

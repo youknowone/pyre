@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn getentrypointptr_empty_functions_returns_empty_list() {
-        // Upstream `dlltool.py:16-22`: starts with `entrypoints = []`
+        // Upstream `dlltool.py`: starts with `entrypoints = []`
         // and appends once per `(f, _)`; an empty `functions` list returns
         // an empty list without touching the bookkeeper.
         let (translator, config) = fixture_translator_and_config();

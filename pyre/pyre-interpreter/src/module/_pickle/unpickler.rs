@@ -374,7 +374,7 @@ impl W_Unpickler {
         } else {
             (module, name)
         };
-        // `interp_pickle.py:2620-2627`: after importing, read the live module
+        // `interp_pickle.py`: after importing, read the live module
         // and let its actual getattr failure propagate.  In particular,
         // protocol < 4 treats a dotted name as one literal attribute and
         // reports the module's normal AttributeError; protocol >= 4 walks the
@@ -1672,7 +1672,7 @@ fn call_find_class(
     )
 }
 
-/// Emit the `pickle.find_class` audit event. `interp_pickle.py:2601` calls
+/// Emit the `pickle.find_class` audit event. `interp_pickle.py` calls
 /// `space.audit(...)` and lets a blocking audit hook's error propagate.
 fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
     if let Ok(sys) = import_module("sys")
@@ -1960,7 +1960,7 @@ fn new_instance_star(
     pyre_object::gc_roots::pin_root(w_new);
     let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-    // interp_pickle.py:2518-2524 `load_newobj`: an empty star-argument
+    // interp_pickle.py `load_newobj`: an empty star-argument
     // container is not iterated.  This is observable for a custom object whose
     // `__len__` returns zero while `__iter__` has effects or yields values.
     if kwargs_slot.is_none()

@@ -14,18 +14,18 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, Ordering};
 /// Each built-in type has a single static `PyType` instance.
 /// The JIT uses `GuardClass` on the `ob_type` pointer to specialize code paths,
 /// and `GuardSubclass` via `int_between(cls.min, subcls.min, cls.max)`
-/// (rclass.py:1133-1137 `ll_issubclass`).
+/// (rclass.py `ll_issubclass`).
 ///
 /// Fields match OBJECT_VTABLE layout order:
 ///   subclassrange_min, subclassrange_max, (rtti omitted), name, (instantiate omitted)
 ///
 /// `AtomicI64`/`AtomicPtr` provide interior mutability for static instances:
 /// ranges and instantiate are assigned once at init time,
-/// mirroring `assign_inheritance_ids` (normalizecalls.py:373-389).
+/// mirroring `assign_inheritance_ids` (normalizecalls.py).
 /// The JIT backend reads them at raw offsets — atomics are layout-
 /// compatible with their inner types (same size and alignment).
-/// `rclass.py:173-174` gives OBJECT_VTABLE `hints={'immutable': True,
-/// 'static_immutable': True}`, and `lltype.py:372-374 _immutable_field`
+/// `rclass.py` gives OBJECT_VTABLE `hints={'immutable': True,
+/// 'static_immutable': True}`, and `lltype.py _immutable_field`
 /// answers `True` for *every* field of a struct carrying that hint, so
 /// each vtable slot reaches `descr.py:231 is_pure = STRUCT.
 /// _immutable_field(fieldname) != False` as a pure field.  Pyre's
@@ -43,7 +43,7 @@ pub struct PyType {
     pub subclassrange_min: AtomicI64,
     pub subclassrange_max: AtomicI64,
     pub name: &'static str,
-    /// rclass.py:172 `('instantiate', Ptr(FuncType([], OBJECTPTR)))`.
+    /// rclass.py `('instantiate', Ptr(FuncType([], OBJECTPTR)))`.
     ///
     /// RPython stores an instantiate function pointer; pyre caches
     /// the W_TypeObject pointer here instead. rclass.py:739-743
@@ -243,20 +243,20 @@ pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
 pub const W_CLASS_OFFSET: usize = std::mem::offset_of!(PyObject, w_class);
 
 /// Field offset of `subclassrange_min` within PyType (OBJECT_VTABLE).
-/// rclass.py:168 — first field in OBJECT_VTABLE.
+/// rclass.py — first field in OBJECT_VTABLE.
 pub const SUBCLASSRANGE_MIN_OFFSET: usize = std::mem::offset_of!(PyType, subclassrange_min);
 
 /// Field offset of `subclassrange_max` within PyType (OBJECT_VTABLE).
-/// rclass.py:169 — second field in OBJECT_VTABLE.
+/// rclass.py — second field in OBJECT_VTABLE.
 pub const SUBCLASSRANGE_MAX_OFFSET: usize = std::mem::offset_of!(PyType, subclassrange_max);
 
 /// Field offset of `instantiate` within PyType (OBJECT_VTABLE).
-/// rclass.py:172 — `('instantiate', Ptr(FuncType([], OBJECTPTR)))`.
+/// rclass.py — `('instantiate', Ptr(FuncType([], OBJECTPTR)))`.
 /// 32 on a 64-bit host (`name` is a 16-byte fat pointer); 24 on 32-bit
 /// targets where `&str` is 8 bytes.
 pub const INSTANTIATE_OFFSET: usize = std::mem::offset_of!(PyType, instantiate);
 
-/// rclass.py:1126-1127 `ll_cast_to_object(obj)`.
+/// rclass.py `ll_cast_to_object(obj)`.
 ///
 /// In RPython this casts a typed pointer to `OBJECTPTR`. In pyre all
 /// objects are already `PyObjectRef`, so this is an identity function
@@ -266,7 +266,7 @@ pub fn ll_cast_to_object(obj: PyObjectRef) -> PyObjectRef {
     obj
 }
 
-/// rclass.py:1130-1131 `ll_type(obj)`.
+/// rclass.py `ll_type(obj)`.
 ///
 /// Extract the type pointer (CLASSTYPE) from an object.
 ///
@@ -284,7 +284,7 @@ pub unsafe fn ll_type(obj: PyObjectRef) -> *const PyType {
     unsafe { (*obj).ob_type }
 }
 
-/// rclass.py:1133-1137 `ll_issubclass(subcls, cls)`.
+/// rclass.py `ll_issubclass(subcls, cls)`.
 ///
 /// O(1) subclass check via preorder numbering:
 ///   `int_between(cls.subclassrange_min, subcls.subclassrange_min, cls.subclassrange_max)`
@@ -311,7 +311,7 @@ pub unsafe fn ll_issubclass(subcls: *const PyType, cls: *const PyType) -> bool {
     })
 }
 
-/// rclass.py:1139-1140 `ll_issubclass_const(subcls, minid, maxid)`.
+/// rclass.py `ll_issubclass_const(subcls, minid, maxid)`.
 ///
 /// Variant of `ll_issubclass` where the class bounds are already known
 /// constants. Used by the JIT when the target class is constant-folded.
@@ -326,7 +326,7 @@ pub fn ll_issubclass_const(subcls: &PyType, minid: i64, maxid: i64) -> bool {
     })
 }
 
-/// rclass.py:1143-1147 `ll_isinstance(obj, cls)`.
+/// rclass.py `ll_isinstance(obj, cls)`.
 ///
 /// RPython-level type check: reads `obj.typeptr` (= `ob_type`) and checks
 /// subclass ranges. This checks the **RPython class** (W_IntObject,
@@ -354,7 +354,7 @@ pub unsafe fn ll_isinstance(obj: PyObjectRef, cls: &PyType) -> bool {
     unsafe { ll_issubclass(obj_cls, cls) }
 }
 
-/// rclass.py:1173-1178 `ll_inst_type(obj)`.
+/// rclass.py `ll_inst_type(obj)`.
 ///
 /// Return the typeptr if obj is non-null, null otherwise.
 ///
@@ -379,7 +379,7 @@ pub unsafe fn ll_inst_type(obj: PyObjectRef) -> *const PyType {
 
 /// Write subclass ranges to a `PyType` instance.
 ///
-/// Mirrors `assign_inheritance_ids` (normalizecalls.py:373-389) which
+/// Mirrors `assign_inheritance_ids` (normalizecalls.py) which
 /// assigns `classdef.minid` / `classdef.maxid` to each vtable entry.
 ///
 /// Uses `Relaxed` ordering: ranges are written once at init time
@@ -860,14 +860,14 @@ pub fn mark_subclass_ranges_initialized() {
 /// `rclass.OBJECT` layout), paired with its parent class.
 ///
 /// Modelled on RPython's `assign_inheritance_ids`
-/// (normalizecalls.py:373-389) which walks `classdef.getmro()` to build
+/// (normalizecalls.py) which walks `classdef.getmro()` to build
 /// the reversed-MRO witness for each class. The JIT registers each
 /// `(type, parent)` pair with the GC via `register_vtable_for_type`,
 /// using the parent typeid as `TypeInfo::object_subclass`'s `parent`
 /// argument so the resulting `subclassrange_{min,max}` faithfully
 /// represents the `rclass.OBJECT` hierarchy. `GUARD_SUBCLASS` then
 /// resolves to `int_between(cls.min, subcls.min, cls.max)` per
-/// rclass.py:1133-1137 `ll_issubclass`.
+/// rclass.py `ll_issubclass`.
 ///
 /// `INSTANCE_TYPE` (the `name = "object"` root) is intentionally
 /// absent: it is registered separately as the `rclass.OBJECT` root
@@ -947,7 +947,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         ),
         // UnicodeError is the intermediate parent of UnicodeDecodeError
         // and UnicodeEncodeError per `pypy/module/exceptions/
-        // interp_exceptions.py:418 W_UnicodeError = _new_exception(
+        // interp_exceptions.py W_UnicodeError = _new_exception(
         // 'UnicodeError', W_ValueError, ...)`.  Register before its
         // subclasses so the topological-order constraint of the
         // foreign-pytype loop in pyre-jit's eval init holds.
@@ -1073,7 +1073,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::dictmultiobject::DICT_KEYS_TYPE, &INSTANCE_TYPE),
         (&crate::dictmultiobject::DICT_VALUES_TYPE, &INSTANCE_TYPE),
         (&crate::dictmultiobject::DICT_ITEMS_TYPE, &INSTANCE_TYPE),
-        // `pypy/interpreter/typedef.py:444 GetSetProperty.typedef`.
+        // `pypy/interpreter/typedef.py GetSetProperty.typedef`.
         // Registered in the foreign-pytype loop so the `instantiate`
         // back-pointer is set before the first GetSetProperty
         // allocation runs (typedef.rs::getset_descriptor_type forces

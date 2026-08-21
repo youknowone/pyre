@@ -314,7 +314,7 @@ pub unsafe extern "C" fn PyUnicode_New(size: isize, maxchar: Py_UCS4) -> *mut CP
 }
 
 /// Give a mirror [`PyUnicode_New`] handed out the `str` its contents now
-/// describe, and link the two — `unicodeobject.py:118 unicode_realize`.
+/// describe, and link the two — `unicodeobject.py unicode_realize`.
 ///
 /// Reached from [`super::pyobject::realize`], so the string is built the first
 /// time the mirror is read as a value.  What C wrote up to that point is what
@@ -483,7 +483,7 @@ fn must_be_str(name: &str) -> String {
     format!("must be str, not {name}")
 }
 
-/// `unicodeobject.py:961 PyUnicode_FromOrdinal` — `chr(ordinal)`.
+/// `unicodeobject.py PyUnicode_FromOrdinal` — `chr(ordinal)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_FromOrdinal(ordinal: c_int) -> *mut CPyObject {
     if !(0..=0x10ffff).contains(&(ordinal as i64)) {
@@ -1101,7 +1101,7 @@ pub unsafe extern "C" fn PyUnicode_FSDecoder(
     CLEANUP_SUPPORTED
 }
 
-/// `unicodeobject.py:716 PyUnicode_FromObject` — an exact `str`, so a subclass
+/// `unicodeobject.py PyUnicode_FromObject` — an exact `str`, so a subclass
 /// instance is copied and anything else is refused.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_FromObject(object: *mut CPyObject) -> *mut CPyObject {
@@ -1119,7 +1119,7 @@ pub unsafe extern "C" fn PyUnicode_FromObject(object: *mut CPyObject) -> *mut CP
     pyobject::make_ref(copy)
 }
 
-/// `unicodeobject.py:937 PyUnicode_InternFromString`.
+/// `unicodeobject.py PyUnicode_InternFromString`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_InternFromString(text: *const c_char) -> *mut CPyObject {
     let created = unsafe { PyUnicode_FromString(text) };
@@ -1157,7 +1157,7 @@ pub unsafe extern "C" fn PyUnicode_InternInPlace(pointer: *mut *mut CPyObject) {
     }
 }
 
-/// `unicodeobject.py:1229 PyUnicode_Concat` — `left + right`.
+/// `unicodeobject.py PyUnicode_Concat` — `left + right`.
 ///
 /// Both operands are checked here rather than left to `+`, whose own message
 /// names the operator instead of the two types.
@@ -1207,7 +1207,7 @@ pub unsafe extern "C" fn PyUnicode_AppendAndDel(left: *mut *mut CPyObject, right
     }
 }
 
-/// `unicodeobject.py:1404 PyUnicode_Substring` — `str[start:end]`.
+/// `unicodeobject.py PyUnicode_Substring` — `str[start:end]`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_Substring(
     object: *mut CPyObject,
@@ -1275,7 +1275,7 @@ pub unsafe extern "C" fn PyUnicode_FindChar(
     found.unwrap_or(-1)
 }
 
-/// `unicodeobject.py:1369 PyUnicode_Contains` — `element in container`.
+/// `unicodeobject.py PyUnicode_Contains` — `element in container`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_Contains(
     container: *mut CPyObject,
@@ -1295,7 +1295,7 @@ pub unsafe extern "C" fn PyUnicode_Contains(
     }
 }
 
-/// `unicodeobject.py:1219 PyUnicode_Compare` — -1, 0 or 1, and -1 with an error
+/// `unicodeobject.py PyUnicode_Compare` — -1, 0 or 1, and -1 with an error
 /// recorded for an argument that is not a `str`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_Compare(left: *mut CPyObject, right: *mut CPyObject) -> c_int {
@@ -1340,7 +1340,7 @@ fn compare_with_bytes(text: PyObjectRef, right: &[u8]) -> std::cmp::Ordering {
     }
 }
 
-/// `unicodeobject.py:1272 PyUnicode_CompareWithASCIIString`.
+/// `unicodeobject.py PyUnicode_CompareWithASCIIString`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_CompareWithASCIIString(
     left: *mut CPyObject,

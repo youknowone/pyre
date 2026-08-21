@@ -272,7 +272,7 @@ fn build_semantic_program_via_active_frontend(
             // read back here into the field the layout provider and
             // `CallControl::field_immutability` consume — the analog of
             // RPython reading `cls._immutable_fields_` off the class
-            // (`rclass.py:644-678 _parse_field_list`).
+            // (`rclass.py _parse_field_list`).
             program.immutable_fields =
                 front::llbc_hints::harvest_immutable_fields_from_llbcs(&llbcs);
             // Re-source the unsafe-fn stub carrier from Charon: walk the
@@ -500,7 +500,7 @@ fn merge_hints_from_llbcs(
 }
 
 /// `make_virtualizable_infos` constructor closure type — mirrors the
-/// upstream `VirtualizableInfo(self, VTYPEPTR)` call (warmspot.py:543).
+/// upstream `VirtualizableInfo(self, VTYPEPTR)` call (warmspot.py).
 /// `(jd_idx, vtypeptr_token) -> Option<handle>`.  Hosts that own a
 /// runtime `VirtualizableInfo` impl supply the constructor here.
 pub type VirtualizableInfoFactory<'a> =
@@ -821,7 +821,7 @@ fn live_rss_bytes() -> u64 {
 /// Give every `struct_fields` spelling of a declared struct the same
 /// `_immutable_fields_` entry list.
 ///
-/// `rclass.py:644-678 _parse_field_list` reads the declaration off the class
+/// `rclass.py _parse_field_list` reads the declaration off the class
 /// object, which has one identity. Pyre's registry keys layouts by name and
 /// carries several names for one struct — the bare leaf (`PyType`) and the
 /// crate-qualified path (`pyre_object::pyobject::PyType`) — while the harvester
@@ -896,7 +896,7 @@ fn analyze_pipeline_from_module_paths(
     // `FORCE_ATTRIBUTES_INTO_CLASSES` is seeded from the LLBC-sourced
     // `program.struct_field_attrs` further below, once `program` is
     // built.
-    // RPython `translator/translator.py:55 buildflowgraph` — FlowingError
+    // RPython `translator/translator.py buildflowgraph` — FlowingError
     // propagates out and translation halts.  Pyre's top-level analyzer
     // requires a complete program; a FlowingError here means a user-
     // facing source file contains a construct we cannot yet lower, and
@@ -929,7 +929,7 @@ fn analyze_pipeline_from_module_paths(
     // hold a string (`llmemory::FieldOffset`'s `st._name`, a nested
     // field's rendered type) can reach the identity-keyed layout maps.
     majit_ir::descr::register_struct_ids(program.struct_ids.clone());
-    // Tier-3: seed `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961)
+    // Tier-3: seed `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py)
     // from the LLBC-sourced `program.struct_field_attrs` so
     // `ClassDesc::_init_classdef` pre-fills `ClassDef.attrs` before the
     // annotator's `attrs_populated` narrowing gate
@@ -1021,7 +1021,7 @@ fn analyze_pipeline_from_module_paths(
         crate::model::FunctionGraph,
     )> = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
-    // `bookkeeper.py:353-409 getdesc` / `newfuncdesc` keys on the host
+    // `bookkeeper.py getdesc` / `newfuncdesc` keys on the host
     // function-object identity, so two unrelated `crate_a::helper` and
     // `crate_b::helper` resolve to distinct `FunctionDesc` instances.
     // Pyre's call registry is keyed on `CallPath` segment strings, and
@@ -1063,7 +1063,7 @@ fn analyze_pipeline_from_module_paths(
     // `mir_graph_lookup` is consulted by the registration loops below
     // (trait-default vs concrete-impl graph fetch).
     let mir_graph_lookup = front::semantic::MirGraphLookup::from_program(&program);
-    // `classdesc.py:749 lookup` MRO walk for generic trait dispatch:
+    // `classdesc.py lookup` MRO walk for generic trait dispatch:
     // a concrete override shadows the trait default.  `front::mir`
     // lowers `CallKind::Trait` (a call through a generic `<E: Trait>`
     // receiver) to the direct path `[<Trait>, <method>]`, and the
@@ -1432,7 +1432,7 @@ fn analyze_pipeline_from_module_paths(
         };
         let is_default = impl_info.for_type.starts_with("<default methods of ");
         for method in &impl_info.methods {
-            // `classdesc.py:749 lookup` MRO: on the generic-dispatch
+            // `classdesc.py lookup` MRO: on the generic-dispatch
             // direct path `[<Trait>, <method>]`, the unique concrete
             // override shadows the trait default body (pre-pass
             // above).  `None` for concrete-impl entries, defaults
@@ -1613,7 +1613,7 @@ fn analyze_pipeline_from_module_paths(
     // unregistered, so the registry lift failed with "not registered
     // in PyreCallRegistry" and poisoned every caller.  RPython
     // resolves the call on the receiver's class
-    // (`classdesc.py:749 lookup` MRO walk); when exactly one class
+    // (`classdesc.py lookup` MRO walk); when exactly one class
     // implements the method in the closed LLBC world, that walk has a
     // single possible answer — bind the direct path to it.  Two or
     // more impls (or a default body, already covered) stay off this
@@ -1903,7 +1903,7 @@ fn analyze_pipeline_from_module_paths(
         };
         for hint in &func.hints {
             for p in &paths {
-                // rlib/jit.py:250 — `@oopspec(spec)` registers func.oopspec = spec.
+                // rlib/jit.py — `@oopspec(spec)` registers func.oopspec = spec.
                 if let Some(spec) = hint.strip_prefix("oopspec:") {
                     call_control.mark_oopspec(p.clone(), spec.to_string());
                     continue;
@@ -1934,7 +1934,7 @@ fn analyze_pipeline_from_module_paths(
                     "loopinvariant" => call_control.mark_loopinvariant(p.clone()),
                     "close_stack" => call_control.mark_close_stack(p.clone()),
                     "cannot_collect" => call_control.mark_cannot_collect(p.clone()),
-                    // rlib/jit.py:260 — @not_in_trace sets func.oopspec = "jit.not_in_trace()"
+                    // rlib/jit.py — @not_in_trace sets func.oopspec = "jit.not_in_trace()"
                     "not_in_trace" => {
                         call_control.mark_oopspec(p.clone(), "jit.not_in_trace".to_string());
                     }
@@ -1953,7 +1953,7 @@ fn analyze_pipeline_from_module_paths(
     // portal and its green/red layout. Portal binding and graph discovery
     // are independent of any interpreter dispatch representation.
     register_configured_jitdrivers(&mut call_control, &config.pipeline.jit_drivers);
-    // warmspot.py:515-545 WarmRunnerDesc.make_virtualizable_infos —
+    // warmspot.py WarmRunnerDesc.make_virtualizable_infos —
     // assigns each registered driver's virtualizable metadata only after the
     // complete driver set exists.
     call_control
@@ -1962,7 +1962,7 @@ fn analyze_pipeline_from_module_paths(
     // rlib/jit.py: these functions carry @oopspec("jit.*") decorators;
     // the codewriter converts calls to them into dedicated opcodes.
     for (func_name, spec) in &[
-        // rlib/jit.py:269-292 — @oopspec("jit.*") decorated functions
+        // rlib/jit.py — @oopspec("jit.*") decorated functions
         ("isconstant", "jit.isconstant"),
         ("isvirtual", "jit.isvirtual"),
         ("current_trace_length", "jit.current_trace_length"),
@@ -1981,7 +1981,7 @@ fn analyze_pipeline_from_module_paths(
             call_control.mark_oopspec(path, spec.to_string());
         }
     }
-    // rlist.py:522 — `@jit.oopspec("newlist_clear(count)")` on
+    // rlist.py — `@jit.oopspec("newlist_clear(count)")` on
     // `_ll_alloc_and_clear`.  The helper graph is minted by the rtyper
     // (`rtype_alloc_and_set`), so there is no source-level `#[oopspec]`
     // attribute for the walker above to harvest.  Attach the spec here,
@@ -1999,7 +1999,7 @@ fn analyze_pipeline_from_module_paths(
         );
     }
 
-    // `collectanalyze.py:27-33 analyze_simple_operation` answers True for the
+    // `collectanalyze.py analyze_simple_operation` answers True for the
     // allocation operations — `malloc` / `malloc_varsize` with `flavor='gc'`,
     // and any LLOp declared `canmallocgc=True`.  Upstream sees them because
     // they are operations in a graph it lowered.  `majit_gc` is not among the
@@ -2113,7 +2113,7 @@ fn analyze_pipeline_from_module_paths(
     pipeline.jitcodes = jitcodes;
     pipeline.symbolic_fnaddr_paths = call::symbolic_fnaddr_paths_snapshot();
     pipeline.indirectcalltarget_indices = indirectcalltarget_indices;
-    // Mirror of `CallControl::jitcodes` (RPython `call.py:87 self.jitcodes`)
+    // Mirror of `CallControl::jitcodes` (RPython `call.py self.jitcodes`)
     // captured before `call_control` is dropped. Needed because consumers
     // that look up a JitCode by graph identity cannot reconstruct the key
     // from the alloc-ordered `pipeline.jitcodes` vector alone.
@@ -2127,7 +2127,7 @@ fn analyze_pipeline_from_module_paths(
     pipeline.all_liveness = all_liveness;
     // Taken after `make_jitcodes`, when every `EffectInfo` has been built and
     // so every raw-set member has passed through its `get_*_descr` mint site.
-    // The equivalent of what `descr.py:25-47 setup_descrs` would have picked up
+    // The equivalent of what `descr.py setup_descrs` would have picked up
     // for free had the analyzer and the runtime shared one gccache.
     pipeline.ei_descr_mints = majit_ir::descr::ei_descr_mints_snapshot();
 
@@ -2189,7 +2189,7 @@ fn register_configured_jitdrivers(
 
 /// Produce JitCodes for the graph closure reachable from configured portals.
 ///
-/// RPython parity (`rpython/jit/codewriter/codewriter.py:74-89` `make_jitcodes`):
+/// RPython parity (`rpython/jit/codewriter/codewriter.py` `make_jitcodes`):
 ///
 /// ```python
 /// def make_jitcodes(self, verbose=False):
@@ -2216,7 +2216,7 @@ fn make_jitcodes(
     Vec<jitcode::BhDescr>,
     Vec<u8>,
 ) {
-    // RPython codewriter.py:74-89: make_jitcodes().
+    // RPython codewriter.py: make_jitcodes().
     //
     // `Arc<JitCode>` shells live in `CallControl::jitcodes`; the drain loop
     // commits each shell's body via `JitCode::set_body`. After all phases,
@@ -2297,7 +2297,7 @@ fn make_jitcodes(
     // opnames — the key consumed by `BlackholeInterpBuilder::setup_insns`.
     let insns = codewriter.assembler.insns().clone();
 
-    // RPython blackhole.py:59 `self.setup_descrs(asm.descrs)` — the
+    // RPython blackhole.py `self.setup_descrs(asm.descrs)` — the
     // shared descr table every 'd'/'j' argcode indexes into at runtime.
     // Snapshotted here so the build artifact carries it alongside
     // `insns`, mirroring RPython's single-store model.

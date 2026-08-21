@@ -163,7 +163,7 @@ impl ObjectConverter {
         unsafe { crate::display::py_repr_wtf8(object) }
     }
 
-    /// `obj_to_int` (ast.py:36) — an integer field takes an `int`, or an
+    /// `obj_to_int` (ast.py) — an integer field takes an `int`, or an
     /// instance of a subclass of one.  Nothing else is asked for `__index__`.
     fn obj_to_int(&self, value: PyObjectRef) -> AstResult<i64> {
         if !unsafe { crate::baseobjspace::isinstance_int_w(value) } {
@@ -190,7 +190,7 @@ impl ObjectConverter {
         Ok(())
     }
 
-    /// `Module.type_ignores` (ast.py:229) holds the `# type: ignore` comments
+    /// `Module.type_ignores` (ast.py) holds the `# type: ignore` comments
     /// a `type_comments=True` parse collected.  The compiler AST has nowhere
     /// to keep them and never reads them back, but the field is still walked
     /// so that a list holding something else is reported here.
@@ -1009,7 +1009,7 @@ impl ObjectConverter {
         }
     }
 
-    /// `_validate_stmts` / `_validate_exprs` (validate.py:132, :151) reject a
+    /// `_validate_stmts` / `_validate_exprs` (validate.py, :151) reject a
     /// missing element of a statement or expression list.  The compiler AST
     /// has nowhere to hold one, so unlike the rest of the validation this runs
     /// during the conversion, where it is still visible.  Lists of the other
@@ -1430,7 +1430,7 @@ impl ObjectConverter {
                 debug_text: None,
                 conversion,
                 // A spec is an expression that gets compiled like any other
-                // (`visit_FormattedValue`, codegen.py:2371). The compiler AST
+                // (`visit_FormattedValue`, codegen.py). The compiler AST
                 // instead keeps the elements the parser found between the
                 // braces, which an object does not carry, so the spec rides
                 // the field below and the parsed shape stays empty.
@@ -1442,7 +1442,7 @@ impl ObjectConverter {
         ))
     }
 
-    /// `visit_FormattedValue` (codegen.py:2364) matches `s`, `r` and `a` and
+    /// `visit_FormattedValue` (codegen.py) matches `s`, `r` and `a` and
     /// leaves anything else at no conversion at all; 3.14 stops instead, so a
     /// character it does not know is an error here.
     fn conversion(&self, object: PyObjectRef) -> AstResult<ast::ConversionFlag> {
@@ -1588,7 +1588,7 @@ impl ObjectConverter {
     }
 
     /// `Constant.kind` — the `u` a string literal may have been written with.
-    /// `check_string` (ast.py:18) takes bytes here as well, and the prefix is
+    /// `check_string` (ast.py) takes bytes here as well, and the prefix is
     /// only ever read back as text, so bytes leave the field unset.
     fn constant_kind(&self, object: PyObjectRef) -> AstResult<Option<Box<str>>> {
         let Some(value) = self.optional_field(object, "kind")? else {
@@ -2753,7 +2753,7 @@ impl Converter<'_> {
             ast::ConstantValue::Str(value) => self.string(value),
             ast::ConstantValue::Bytes(value) => self.pin(pyre_object::w_bytes_from_bytes(value)),
             ast::ConstantValue::Integer(value) => {
-                // PyPy astbuilder.py:4-67 `parse_number` sends integer
+                // PyPy astbuilder.py `parse_number` sends integer
                 // tokens to `_string_to_int_or_long` with the literal's
                 // radix. RustPython's ConstantValue retains the original
                 // spelling, so let the same internal parser infer that radix
@@ -3099,7 +3099,7 @@ fn class_name(object: PyObjectRef) -> &'static str {
 /// A value of a `JoinedStr` under construction.  `add_constant_string`
 /// (fstring.py:23) folds a piece into the `Constant` before it, keeping that
 /// node's start and taking the new end, and an empty piece is dropped
-/// (`f_string_to_ast_node`, fstring.py:449); what the parser kept apart -- an
+/// (`f_string_to_ast_node`, fstring.py); what the parser kept apart -- an
 /// implicit concatenation, the text an `=` conversion echoes -- therefore
 /// reaches the tree as one node, not one per piece.
 enum JoinedPart {

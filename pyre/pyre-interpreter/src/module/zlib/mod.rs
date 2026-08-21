@@ -14,7 +14,7 @@ use pyre_object::*;
 
 use std::sync::Mutex;
 
-/// PyPy `interp_zlib.py:134 Compress`: the stream and lock belong to the
+/// PyPy `interp_zlib.py Compress`: the stream and lock belong to the
 /// wrapper object.  The mapdict prefix preserves PyPy's ability to subclass
 /// the type without moving its native payload into a side table.
 #[crate::pyre_class("zlib.Compress")]
@@ -25,7 +25,7 @@ pub struct W_Compress {
     backend: *mut Mutex<backend::Compressor>,
 }
 
-/// PyPy `interp_zlib.py:268 Decompress` object-owned stream state.
+/// PyPy `interp_zlib.py Decompress` object-owned stream state.
 #[crate::pyre_class("zlib.Decompress")]
 #[derive(Default)]
 pub struct W_Decompress {
@@ -274,7 +274,7 @@ fn init_compress_type(ns: PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("flush() missing self"));
                 }
-                // interp_zlib.py:196 `@unwrap_spec(mode="c_int")` — the
+                // interp_zlib.py `@unwrap_spec(mode="c_int")` — the
                 // converter reports a value outside the C `int` range rather
                 // than truncating it into a different flush mode.
                 let mode = match args.get(1).copied() {
@@ -351,7 +351,7 @@ fn make_compress_for(
     allocate_compress(cls, c)
 }
 
-/// `interp_zlib.py:171 Compress.copy` and `descr_deepcopy`: copy the live
+/// `interp_zlib.py Compress.copy` and `descr_deepcopy`: copy the live
 /// deflate stream while holding the source object's lock, then construct the
 /// base `Compress` type (PyPy deliberately does not preserve a subclass).
 fn compress_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -424,7 +424,7 @@ fn decompress_getset(ns: PyObjectRef, name: &'static str, f: crate::gateway::Bui
     };
 }
 
-// interp_zlib.py:308 `decompress(self, data, __posonly__=None,
+// interp_zlib.py `decompress(self, data, __posonly__=None,
 // max_length=0)`, exposed as `($self, data, /, max_length=0)`.  The signature
 // binder is essential here: pip's wheel reader passes max_length by keyword,
 // and an unbound native callable otherwise sees the kwargs transport object as
@@ -607,7 +607,7 @@ fn make_decompress_for(
     allocate_decompress(cls, d)
 }
 
-/// `interp_zlib.py:343 Decompress.copy`: clone both inflate state and its
+/// `interp_zlib.py Decompress.copy`: clone both inflate state and its
 /// visible tails/dictionary under the per-object lock, returning the base type.
 fn decompress_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let obj = args.first().copied().unwrap_or(PY_NULL);
@@ -854,7 +854,7 @@ crate::py_module! {
         "error" => crate::builtins::lookup_exc_class("Exception").expect("Exception installed"),
     },
     inline_functions: {
-        // interp_zlib.py:66 `compress(data, __posonly__=None, level, wbits)` —
+        // interp_zlib.py `compress(data, __posonly__=None, level, wbits)` —
         // `data` positional-only, `level`/`wbits` positional-or-keyword.
         fn compress(
             data: PyBufferStr,
@@ -869,7 +869,7 @@ crate::py_module! {
             let out = backend::compress(&data, level, wbits).map_err(zlib_error)?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
-        // interp_zlib.py:92 `decompress(string, __posonly__=None, wbits, bufsize)`.
+        // interp_zlib.py `decompress(string, __posonly__=None, wbits, bufsize)`.
         fn decompress(
             data: PyBufferStr,
             #[posonly]
@@ -886,7 +886,7 @@ crate::py_module! {
             let out = backend::decompress(&data, wbits, bufsize as usize).map_err(zlib_error)?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
-        // interp_zlib.py:228 `Compress___new__(level, method, wbits, memLevel,
+        // interp_zlib.py `Compress___new__(level, method, wbits, memLevel,
         // strategy, w_zdict)` — all six positional-or-keyword and all native
         // initialization options are passed through to deflateInit2.
         fn compressobj(
@@ -911,7 +911,7 @@ crate::py_module! {
                 zdict_or_none(zdict)?,
             )
         }
-        // interp_zlib.py:400 `Decompress___new__(wbits, w_zdict)`.
+        // interp_zlib.py `Decompress___new__(wbits, w_zdict)`.
         fn decompressobj(
             #[default(w_none())] wbits: PyObjectRef,
             #[default(w_none())] zdict: PyObjectRef,

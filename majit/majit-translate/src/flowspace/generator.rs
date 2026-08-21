@@ -20,7 +20,7 @@ use super::pygraph::PyGraph;
 /// `Entry` / `Resume<n>` subclasses.
 pub trait AbstractPosition: core::fmt::Debug {}
 
-/// RPython `generator.py:86-95` — `get_variable_names(variables)`.
+/// RPython `generator.py` — `get_variable_names(variables)`.
 pub fn get_variable_names(variables: &[&str]) -> Vec<String> {
     use std::collections::HashSet;
 
@@ -409,7 +409,7 @@ pub fn tweak_generator_body_graph(
     }
 
     let blocks = graph.iterblocks();
-    // upstream generator.py:114 — `mappings = [Entry]`.
+    // upstream generator.py — `mappings = [Entry]`.
     // Each entry pairs the Resume-class HostObject with the target
     // block the dispatcher will jump to when `isinstance(entry, Resume)`
     // is true. The Entry mapping's target is the graph's startblock
@@ -455,7 +455,7 @@ pub fn tweak_generator_body_graph(
                 vec![],
                 IndexMap::from([("_attrs_".to_string(), tuple_of_strings(&resume_varnames))]),
             );
-            // upstream generator.py:140-142 — `Resume.block = newblock;
+            // upstream generator.py — `Resume.block = newblock;
             // mappings.append(Resume)`. Carry both into our list so the
             // regular-entry dispatcher below can route each branch to
             // the matching resume block.
@@ -556,7 +556,7 @@ pub fn tweak_generator_body_graph(
     Ok(())
 }
 
-/// RPython `generator.py:18-34` — `make_generator_entry_graph(func)`.
+/// RPython `generator.py` — `make_generator_entry_graph(func)`.
 pub fn make_generator_entry_graph(func: GraphFunc) -> Result<FunctionGraph, FlowContextError> {
     let code = func.code.as_ref().ok_or_else(|| {
         FlowContextError::Flowing(FlowingError::new(
@@ -582,7 +582,7 @@ pub fn make_generator_entry_graph(func: GraphFunc) -> Result<FunctionGraph, Flow
         .into_inner())
 }
 
-/// RPython `generator.py:36-39` — `tweak_generator_graph(graph)`.
+/// RPython `generator.py` — `tweak_generator_graph(graph)`.
 pub fn tweak_generator_graph(graph: &mut FunctionGraph) -> Result<(), FlowContextError> {
     let generator_iterator = graph
         .func

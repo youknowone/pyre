@@ -5,7 +5,7 @@
 //! `register_module` so moduledef::init can call a single name.
 
 
-/// `interp_termios.py:13-19 convert_error` — every termios syscall
+/// `interp_termios.py convert_error` — every termios syscall
 /// failure is raised as the cached module exception `termios.error`
 /// (`wrap_oserror(space, e, w_exception_class=w_error)`), not a bare
 /// `OSError`, so `except termios.error` catches it.  Mirrors

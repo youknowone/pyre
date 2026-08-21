@@ -35,12 +35,12 @@ pub fn free(p: &_ptr, flavor: MallocFlavor, _track_allocation: bool) -> Result<(
     Ok(())
 }
 
-/// RPython `setfield = setattr` (`llheap.py:6`).
+/// RPython `setfield = setattr` (`llheap.py`).
 pub fn setfield(p: &mut _ptr, field_name: &str, newvalue: LowLevelValue) -> Result<(), String> {
     p.setattr(field_name, newvalue)
 }
 
-/// RPython `setinterior(...)` (`llheap.py:10-14`).
+/// RPython `setinterior(...)` (`llheap.py`).
 ///
 /// Upstream receives an address whose `ref()` is indexable and writes
 /// `inneraddr.ref()[0] = newvalue`. The Rust lltype model represents
@@ -68,7 +68,7 @@ pub fn setinterior(
     }
 }
 
-/// RPython `weakref_create_getlazy(objgetter)` (`llheap.py:15-16`).
+/// RPython `weakref_create_getlazy(objgetter)` (`llheap.py`).
 pub fn weakref_create_getlazy<F>(objgetter: F) -> Result<_ptr, String>
 where
     F: FnOnce() -> _ptr,
@@ -77,31 +77,31 @@ where
     weakref_create(&obj)
 }
 
-/// RPython `shrink_array(p, smallersize)` (`llheap.py:19-20`).
+/// RPython `shrink_array(p, smallersize)` (`llheap.py`).
 pub fn shrink_array(_p: &_ptr, _smallersize: usize) -> bool {
     false
 }
 
-/// RPython `thread_run()` (`llheap.py:23-24`).
+/// RPython `thread_run()` (`llheap.py`).
 pub fn thread_run() {}
 
-/// RPython `thread_start()` (`llheap.py:26-27`).
+/// RPython `thread_start()` (`llheap.py`).
 pub fn thread_start() {}
 
-/// RPython `thread_die()` (`llheap.py:29-30`).
+/// RPython `thread_die()` (`llheap.py`).
 pub fn thread_die() {}
 
-/// RPython `pin(obj)` (`llheap.py:32-33`).
+/// RPython `pin(obj)` (`llheap.py`).
 pub fn pin<T>(_obj: &T) -> bool {
     false
 }
 
-/// RPython `unpin(obj)` (`llheap.py:35-37`).
+/// RPython `unpin(obj)` (`llheap.py`).
 pub fn unpin<T>(_obj: &T) {
     panic!("pin() always returns False, so unpin() should not be called");
 }
 
-/// RPython `_is_pinned(obj)` (`llheap.py:39-40`).
+/// RPython `_is_pinned(obj)` (`llheap.py`).
 pub fn _is_pinned<T>(_obj: &T) -> bool {
     false
 }

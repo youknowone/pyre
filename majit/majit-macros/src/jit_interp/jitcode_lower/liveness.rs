@@ -5,7 +5,7 @@ use super::*;
 /// `op_metadata`. Each entry is a single `BTreeSet<Register>` matching
 /// RPython `liveness.py`'s `set()` of `Register` objects — bank info
 /// rides on `Register.kind` and the encoder splits at emit time per
-/// `assembler.py:225-232 get_liveness_info(args, kind)`.
+/// `assembler.py get_liveness_info(args, kind)`.
 #[allow(dead_code)]
 type LiveMarkerLiveSets = Vec<BTreeSet<Register>>;
 /// Compute the live register set captured at every `LiveMarker` op in
@@ -77,7 +77,7 @@ pub(super) fn compute_per_marker_liveness(op_metadata: &[OpMeta]) -> LiveMarkerL
                     }
                 }
                 ControlFlowClass::UnconditionalJump => {
-                    // RPython follow_label (liveness.py:29-31) — `alive`
+                    // RPython follow_label (liveness.py) — `alive`
                     // becomes the label's accumulated set (overwrite,
                     // not union, since fall-through past `jump` is
                     // unreachable).
@@ -150,7 +150,7 @@ pub(super) fn compute_per_marker_liveness(op_metadata: &[OpMeta]) -> LiveMarkerL
 }
 
 /// Encode-time bank split, mirroring RPython
-/// `rpython/jit/codewriter/assembler.py:225-232 get_liveness_info(args,
+/// `rpython/jit/codewriter/assembler.py get_liveness_info(args,
 /// kind)`. Walks a marker's accumulated alive set and projects out the
 /// indices belonging to a single bank, producing the per-bank u8 vector
 /// the BC_LIVE encoder consumes (`assembler.py:147-157` writes the
@@ -187,7 +187,7 @@ pub(super) fn liveness_triple(set: &BTreeSet<Register>) -> (Vec<u8>, Vec<u8>, Ve
 
 /// Same as [`liveness_triple`] but consuming a typed register slice
 /// (post-`annotate_live_markers_with_liveness` `LiveMarker.reads`).
-/// Mirrors RPython `assembler.py:225-232 get_liveness_info(args, kind)`
+/// Mirrors RPython `assembler.py get_liveness_info(args, kind)`
 /// applied to the marker's args directly, which by then are the full
 /// alive set per `liveness.py:52`.
 #[allow(dead_code)]
@@ -232,7 +232,7 @@ pub(super) fn annotate_live_markers_with_liveness(op_metadata: &mut [OpMeta]) {
 /// `__prebuild_jitcode_liveness_*` (codegen_trace.rs) replays into the
 /// driver-shared `Assembler` at install time. Each `LiveMarker` op
 /// emits an `__asm._register_liveness_offset(&[live_i], &[live_r],
-/// &[live_f])` call so RPython `pyjitpl.py:2255 finish_setup` order is
+/// &[live_f])` call so RPython `pyjitpl.py finish_setup` order is
 /// preserved: every per-marker triple lands in `asm.all_liveness`
 /// before `metainterp_sd.liveness_info` snapshots it. Trace-time
 /// `JitCodeBuilder::finalize_liveness` then only dedups against the
@@ -243,7 +243,7 @@ pub(super) fn annotate_live_markers_with_liveness(op_metadata: &mut [OpMeta]) {
 /// `-live-` triples first, then nested helper prebuilds: RPython
 /// `codewriter.py:74-80` assembles the caller graph that discovered
 /// an inline callee before draining the pending callee graph queued by
-/// `call.py:155-172 get_jitcode`.
+/// `call.py get_jitcode`.
 pub(super) fn liveness_prebuild_tokens(
     op_metadata: &[OpMeta],
     inline_prebuild: &[TokenStream],
@@ -279,7 +279,7 @@ pub(super) fn liveness_prebuild_tokens(
 
 /// Collapse runs of consecutive `LiveMarker` ops (and any intervening
 /// `LabelDef` ops) into a single `LiveMarker`, mirroring RPython
-/// `rpython/jit/codewriter/liveness.py:82-117 remove_repeated_live`.
+/// `rpython/jit/codewriter/liveness.py remove_repeated_live`.
 ///
 /// The lowerer currently never emits markers in succession (each
 /// `live_placeholder()` site sits in front of a guard / call op so a
@@ -335,7 +335,7 @@ pub(super) fn remove_repeated_live(
             }
             continue;
         }
-        // TODO: `liveness.py:82-116 remove_repeated_live`
+        // TODO: `liveness.py remove_repeated_live`
         // unions the `reads` of every marker in the run because every
         // upstream marker actually fires (RPython has no conditional
         // emission).  pyre's `live_marker_if` markers exist or not at
@@ -404,7 +404,7 @@ pub(super) fn remove_repeated_live(
 /// `live_placeholder_with_triple(&[live_i...], &[live_r...], &[live_f...])`
 /// shape, sourcing the per-marker triples from
 /// [`compute_per_marker_liveness`] split per bank by [`liveness_triple`]
-/// (mirrors `assembler.py:225-232 get_liveness_info(args, kind)`).
+/// (mirrors `assembler.py get_liveness_info(args, kind)`).
 ///
 /// Runs after [`remove_repeated_live`] so the marker count seen by the
 /// walker matches the number of statements that actually survive into

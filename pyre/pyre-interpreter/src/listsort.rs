@@ -3,7 +3,7 @@
 //!
 //! Two properties of the upstream algorithm are the reason for the port:
 //!
-//! * `lt` is THE comparison primitive (`listsort.py:97`: `le` is
+//! * `lt` is THE comparison primitive (`listsort.py`: `le` is
 //!   `not self.lt(b, a)`), so a user `__lt__` runs **exactly once** per
 //!   comparison.  A three-way `Ordering` comparator cannot express that — it
 //!   needs both directions — so the sort driver itself has to be the one that
@@ -19,12 +19,12 @@
 
 use crate::PyError;
 
-/// `listsort.py:93-97` — `lt` is the single comparison primitive and `le` is
+/// `listsort.py` — `lt` is the single comparison primitive and `le` is
 /// derived from it.  Implementors must not override `le`.
 ///
 /// `T` is what `make_timsort_class`'s `lt` receives: the list's element type.
 /// For an object list that is an index into a rooted area; for the unwrapped
-/// strategies (`listobject.py:1963` `IntegerListStrategy.sort`, `:2067`
+/// strategies (`listobject.py` `IntegerListStrategy.sort`, `:2067`
 /// `FloatListStrategy.sort`) it is the scalar itself.
 pub(crate) trait SortLt<T> {
     fn lt(&mut self, a: T, b: T) -> Result<bool, PyError>;
@@ -34,7 +34,7 @@ pub(crate) trait SortLt<T> {
     }
 }
 
-/// `listsort.py:12` `merge_compute_minrun`.
+/// `listsort.py` `merge_compute_minrun`.
 fn merge_compute_minrun(mut n: usize) -> usize {
     // Becomes 1 if any 1 bits are shifted off.
     let mut r = 0;
@@ -45,7 +45,7 @@ fn merge_compute_minrun(mut n: usize) -> usize {
     n + r
 }
 
-/// `listsort.py:28` `powerloop` — the "power" (depth in the conceptual binary
+/// `listsort.py` `powerloop` — the "power" (depth in the conceptual binary
 /// merge tree) of the run of length `n1` starting at `s1`, followed by a run of
 /// length `n2`, in a list of length `n`.
 fn powerloop(s1: usize, n1: usize, n2: usize, n: usize) -> usize {
@@ -68,7 +68,7 @@ fn powerloop(s1: usize, n1: usize, n2: usize, n: usize) -> usize {
     result
 }
 
-/// `listsort.py:604` `ListSlice` — a sublist of the array being sorted.
+/// `listsort.py` `ListSlice` — a sublist of the array being sorted.
 ///
 /// `ListSlice.list` is either the array itself or, after `copyitems`, the
 /// sorter's scratch copy; `scratch` is that discriminator.
@@ -113,7 +113,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         }
     }
 
-    /// `listsort.py:198-201` — `gallop`'s `lower`: `le` searches for the
+    /// `listsort.py` — `gallop`'s `lower`: `le` searches for the
     /// largest `k` with `a[k] <= key`, `lt` for the largest with `a[k] < key`.
     fn lower(&mut self, a: T, b: T, rightmost: bool) -> Result<bool, PyError> {
         if rightmost {
@@ -123,7 +123,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         }
     }
 
-    /// `listsort.py:669` `ListSlice.reverse`.
+    /// `listsort.py` `ListSlice.reverse`.
     fn reverse_slice(&mut self, slice: &ListSlice) {
         debug_assert!(!slice.scratch);
         if slice.len == 0 {
@@ -138,7 +138,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         }
     }
 
-    /// `listsort.py:651` `ListSlice.popleft`.
+    /// `listsort.py` `ListSlice.popleft`.
     fn popleft(&mut self, slice: &mut ListSlice) -> T {
         let result = self.slice_get(slice, slice.base);
         slice.base += 1;
@@ -146,13 +146,13 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         result
     }
 
-    /// `listsort.py:657` `ListSlice.popright`.
+    /// `listsort.py` `ListSlice.popright`.
     fn popright(&mut self, slice: &mut ListSlice) -> T {
         slice.len -= 1;
         self.slice_get(slice, slice.base + slice.len)
     }
 
-    /// `listsort.py:622` `ListSlice.copyitems` — move the slice into the
+    /// `listsort.py` `ListSlice.copyitems` — move the slice into the
     /// sorter's scratch store, growing it when the run does not fit.
     fn copyitems(&mut self, slice: &mut ListSlice) {
         debug_assert!(!slice.scratch);
@@ -175,7 +175,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         slice.base = 0;
     }
 
-    /// `listsort.py:104` `binarysort` — binary insertion sort of the slice,
+    /// `listsort.py` `binarysort` — binary insertion sort of the slice,
     /// whose first `sorted` elements are already in order.  Stable.
     fn binarysort(&mut self, a: &ListSlice, sorted: usize) -> Result<(), PyError> {
         debug_assert!(!a.scratch);
@@ -206,7 +206,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         Ok(())
     }
 
-    /// `listsort.py:151` `count_run` — length of the longest ascending
+    /// `listsort.py` `count_run` — length of the longest ascending
     /// (`a[0] <= a[1] <= …`) or strictly descending (`a[0] > a[1] > …`) prefix
     /// of `a`, written to `run.len`.  Returns whether it was descending; the
     /// strictness of "descending" is what lets the caller reverse it without
@@ -248,14 +248,14 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         Ok(descending)
     }
 
-    /// `listsort.py:186` `gallop` — locate where `key` belongs in the sorted
+    /// `listsort.py` `gallop` — locate where `key` belongs in the sorted
     /// slice `a`, starting the search at `hint`.  With `rightmost`, return the
     /// index right of the rightmost equal element, otherwise left of the
     /// leftmost one.
     ///
     /// The offsets are signed because the left-gallop's `hint - ofs` reaches
     /// `-1` before the closing binary search bumps it back to `0`
-    /// (`listsort.py:305` asserts `-1 <= lastofs`).
+    /// (`listsort.py` asserts `-1 <= lastofs`).
     fn gallop(
         &mut self,
         key: T,
@@ -324,7 +324,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         Ok(ofs as usize)
     }
 
-    /// `listsort.py:290` `merge_lo` — stable in-place merge of adjacent slices
+    /// `listsort.py` `merge_lo` — stable in-place merge of adjacent slices
     /// with `a.len <= b.len`, holding `a` in the scratch store.
     fn merge_lo(&mut self, a: &mut ListSlice, b: &mut ListSlice) -> Result<(), PyError> {
         debug_assert!(a.len > 0 && b.len > 0 && a.base + a.len == b.base);
@@ -457,7 +457,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         }
     }
 
-    /// `listsort.py:400` `merge_hi` — the `a.len >= b.len` mirror of
+    /// `listsort.py` `merge_hi` — the `a.len >= b.len` mirror of
     /// [`Self::merge_lo`], holding `b` in the scratch store and filling from
     /// the right.
     fn merge_hi(&mut self, a: &mut ListSlice, b: &mut ListSlice) -> Result<(), PyError> {
@@ -583,7 +583,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         }
     }
 
-    /// `listsort.py:504` `merge_at` — merge the two runs at pending indices
+    /// `listsort.py` `merge_at` — merge the two runs at pending indices
     /// `i` and `i+1`.
     fn merge_at(&mut self, i: usize) -> Result<(), PyError> {
         let mut a = self.pending[i];
@@ -618,7 +618,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         }
     }
 
-    /// `listsort.py:534` `found_new_run` — the powersort merge policy: merge
+    /// `listsort.py` `found_new_run` — the powersort merge policy: merge
     /// the pending runs whose power exceeds the newly identified run's.
     fn found_new_run(&mut self, run: &ListSlice) -> Result<(), PyError> {
         let Some(last) = self.pending.last() else {
@@ -633,7 +633,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         Ok(())
     }
 
-    /// `listsort.py:553` `merge_force_collapse`.
+    /// `listsort.py` `merge_force_collapse`.
     fn merge_force_collapse(&mut self) -> Result<(), PyError> {
         while self.pending.len() > 1 {
             let n = self.pending.len();
@@ -647,7 +647,7 @@ impl<T: Copy, L: SortLt<T>> TimSort<'_, T, L> {
         Ok(())
     }
 
-    /// `listsort.py:566` `sort` — march over the array once left to right
+    /// `listsort.py` `sort` — march over the array once left to right
     /// finding natural runs, extending short ones to `minrun`, merging as the
     /// powersort policy dictates.
     fn sort(&mut self) -> Result<(), PyError> {

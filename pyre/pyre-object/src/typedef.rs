@@ -18,14 +18,14 @@
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
-/// `pypy/interpreter/typedef.py:312-346 class GetSetProperty(W_Root)`.
+/// `pypy/interpreter/typedef.py class GetSetProperty(W_Root)`.
 ///
 /// All `PyObjectRef`-shaped slots default to `PY_NULL` to mark
 /// "absent" (PyPy uses `None`); `use_closure` is a `bool` mirroring
 /// the eponymous PyPy field.
 ///
 /// `pytype_static = "GETSET_DESCRIPTOR_TYPE"` keeps the PyType under
-/// its existing public name (`typedef.py:444 GetSetProperty.typedef =
+/// its existing public name (`typedef.py GetSetProperty.typedef =
 /// TypeDef("getset_descriptor", ...)`) while the GC consts stay on
 /// the `W_GETSET_PROPERTY_*` convention.
 #[pyre_class(
@@ -35,7 +35,7 @@ use pyre_macros::pyre_class;
     pytype_static = "GETSET_DESCRIPTOR_TYPE"
 )]
 pub struct GetSetProperty {
-    /// `typedef.py:339 self.fget` — getter callable.
+    /// `typedef.py self.fget` — getter callable.
     pub fget: PyObjectRef,
     /// `typedef.py:340 self.fset` — setter callable.
     pub fset: PyObjectRef,
@@ -50,12 +50,12 @@ pub struct GetSetProperty {
     /// `'<generic property>'` when the caller passes None).
     pub name: PyObjectRef,
     /// `typedef.py:320 w_objclass = None` class default + per-instance
-    /// override stamped by `copy_for_type` (typedef.py:353).  Read by
-    /// `descr_get_objclass` (typedef.py:414-418) before falling back
+    /// override stamped by `copy_for_type` (typedef.py).  Read by
+    /// `descr_get_objclass` (typedef.py) before falling back
     /// to `space.gettypeobject(self.reqcls.typedef)`.
     pub w_objclass: PyObjectRef,
     /// `typedef.py:344 self.w_qualname = None` — lazy cache for
-    /// `descr_get_qualname` (typedef.py:420-433); first reader stamps
+    /// `descr_get_qualname` (typedef.py); first reader stamps
     /// `"<class>.<name>"` (or `"?.<name>"` when `reqcls is None`).
     pub w_qualname: PyObjectRef,
     /// `typedef.py:345 self.use_closure` — passes `(self, space, obj)`
@@ -64,7 +64,7 @@ pub struct GetSetProperty {
 }
 
 /// Allocate a `GetSetProperty` bound to `GETSET_DESCRIPTOR_TYPE`.
-/// Mirrors `typedef.py:327-336 _init` — every slot is set in one shot
+/// Mirrors `typedef.py _init` — every slot is set in one shot
 /// so the descriptor is fully initialised before the first reader.
 ///
 /// `name` may be `PY_NULL`, in which case the caller is responsible
@@ -142,7 +142,7 @@ pub unsafe fn w_getset_get_name(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GetSetProperty)).name }
 }
 
-/// `typedef.py:58 add_entries` parity — overwrite the descriptor's
+/// `typedef.py add_entries` parity — overwrite the descriptor's
 /// `name` slot with the dict-key it was registered under.  Used by
 /// the post-init namespace walker so descriptors built without an
 /// explicit name (most `make_getset_descriptor` callers) carry the
@@ -175,7 +175,7 @@ pub unsafe fn w_getset_get_doc(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const GetSetProperty)).doc }
 }
 
-/// `typedef.py:320 / 348-356 copy_for_type` writes `new.w_objclass`.
+/// `typedef.py / 348-356 copy_for_type` writes `new.w_objclass`.
 /// Pyre keeps the slot directly on the struct so the descriptor's
 /// `descr_get_objclass` reads it without any side-table.
 ///
@@ -197,7 +197,7 @@ pub unsafe fn w_getset_set_objclass(obj: PyObjectRef, value: PyObjectRef) {
 }
 
 /// `typedef.py:344 self.w_qualname = None` — lazy cache slot for
-/// `descr_get_qualname` (typedef.py:420-433).
+/// `descr_get_qualname` (typedef.py).
 ///
 /// # Safety
 /// `obj` must point to a valid `GetSetProperty`.
@@ -225,7 +225,7 @@ pub unsafe fn w_getset_get_use_closure(obj: PyObjectRef) -> bool {
     unsafe { (*(obj as *const GetSetProperty)).use_closure }
 }
 
-/// `pypy/interpreter/typedef.py:443-500 Member` — slot descriptor
+/// `pypy/interpreter/typedef.py Member` — slot descriptor
 /// for `__slots__`.
 ///
 /// A Member descriptor provides attribute access to a specific
@@ -384,7 +384,7 @@ pub fn w_member_new_with_doc(
     doc: Option<String>,
     w_cls: PyObjectRef,
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(w_cls);
@@ -486,7 +486,7 @@ pub unsafe fn w_member_set_cls(obj: PyObjectRef, w_cls: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// `typedef.py:446 Member.index` — the slot index (`base_nslots + position`),
+/// `typedef.py Member.index` — the slot index (`base_nslots + position`),
 /// used by the LOAD_ATTR/STORE_ATTR cache to form the `SLOTS_STARTING_FROM +
 /// index` attrkind (mapdict.py:1520).
 /// # Safety

@@ -8,7 +8,7 @@
 //! invariant by exercising the underlying `ExceptionState` API: a
 //! clone of a pending exception remains pending; clearing the clone
 //! does not affect the original. Mirrors the value-semantics
-//! guarantee that `pyjitpl.py:2479-2538 finishframe_exception` relies
+//! guarantee that `pyjitpl.py finishframe_exception` relies
 //! on across frame boundaries.
 use majit_metainterp::blackhole::ExceptionState;
 

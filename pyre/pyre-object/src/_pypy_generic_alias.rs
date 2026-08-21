@@ -43,7 +43,7 @@ pub fn w_generic_alias_new(
     args: PyObjectRef,
     parameters: PyObjectRef,
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(origin);
@@ -203,7 +203,7 @@ pub fn w_union_from_parts(
     unhashable_args: PyObjectRef,
     parameters: PyObjectRef,
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(hashable_args);

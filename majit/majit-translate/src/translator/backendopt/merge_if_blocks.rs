@@ -11,7 +11,7 @@ use crate::flowspace::model::{
     LinkRef, Variable, mkentrymap,
 };
 
-/// RPython `is_chain_block(block, first=False)` (`merge_if_blocks.py:7-31`).
+/// RPython `is_chain_block(block, first=False)` (`merge_if_blocks.py`).
 fn is_chain_block(block: &BlockRef, first: bool) -> bool {
     let b = block.borrow();
     if b.operations.is_empty() {
@@ -79,7 +79,7 @@ fn is_hashable_const(value: &ConstValue) -> bool {
 
 /// Mirror of Python `bool(value) is False` for the `ConstValue`
 /// carriers that can appear as `Link.exitcase`. Upstream uses
-/// `assert not falseexit.exitcase` (`merge_if_blocks.py:95`) which
+/// `assert not falseexit.exitcase` (`merge_if_blocks.py`) which
 /// folds through Python's truthiness rules: `None`, `False`, `0`,
 /// `0.0`, `""`, `b""`, `()`, `[]`, `{}` are all falsy. Anything
 /// else is truthy.
@@ -201,7 +201,7 @@ fn merge_chain(
     firstblock.recloseblock(links);
 }
 
-/// RPython `merge_if_blocks_once(graph)` (`merge_if_blocks.py:63-122`).
+/// RPython `merge_if_blocks_once(graph)` (`merge_if_blocks.py`).
 ///
 /// Returns `true` when a chain was merged (caller should retry).
 #[expect(
@@ -390,7 +390,7 @@ fn merge_if_blocks_once(graph: &FunctionGraph) -> bool {
     false
 }
 
-/// Mirror of upstream's nested `add_to_varmap` (`merge_if_blocks.py:79-83`).
+/// Mirror of upstream's nested `add_to_varmap` (`merge_if_blocks.py`).
 ///
 /// Upstream:
 ///

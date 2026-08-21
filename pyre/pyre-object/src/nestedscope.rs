@@ -19,7 +19,7 @@ pub struct Cell {
 /// Allocate a new cell wrapping `value`.
 /// Pass `PY_NULL` for an empty cell.
 pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): `value`
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): `value`
     // is a live GC pointer that must survive — and be relocated by — the
     // collection the GC malloc below may trigger. `pin_root` records it in
     // the shadow stack so the moving collector keeps it alive and rewrites
@@ -51,7 +51,7 @@ pub fn w_cell_new(value: PyObjectRef) -> PyObjectRef {
         }
         // The cell lives in old-gen (`try_gc_alloc_stable`); `contents` may
         // still be a nursery object. Register the cell so the next minor
-        // collection scans it (incminimark.py:1495 write_barrier) and
+        // collection scans it (incminimark.py write_barrier) and
         // relocates a young value held only by `contents`.
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;

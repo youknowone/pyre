@@ -17,7 +17,7 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
 enum LoopInvariantEntry {
     /// Regular result (already forced or body-computed).
     Direct(OpRef),
-    /// shortpreamble.py:148-159: LoopInvariantOp.produce_op stores
+    /// shortpreamble.py: LoopInvariantOp.produce_op stores
     /// PreambleOp(op, preamble_op, invented_name) in the dict.
     Preamble(PreambleOp),
 }
@@ -54,8 +54,8 @@ fn raise_invalid_loop(msg: &'static str, op: &Op, ctx: &OptContext) -> Optimizat
     OptimizationResult::InvalidLoop(msg)
 }
 
-/// info.py:16-18: INFO_NULL / INFO_NONNULL / INFO_UNKNOWN
-/// optimizer.py:127-135: getnullness()
+/// info.py: INFO_NULL / INFO_NONNULL / INFO_UNKNOWN
+/// optimizer.py: getnullness()
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Nullness {
     Null,
@@ -79,7 +79,7 @@ enum Nullness {
 pub struct OptRewrite {
     /// pyre-only side-cache: (opcode, arg0, arg1) → result OpRef, populated by
     /// optimize_comparison. Upstream has no bool_result_cache; find_rewritable_bool
-    /// / try_boolinvers (rewrite.py:54-93) build a synthetic ResOperation and look
+    /// / try_boolinvers (rewrite.py) build a synthetic ResOperation and look
     /// it up via get_pure_result against the shared _pure_operations table.
     /// Convergence: retire this cache and route the bool lookups through the pure
     /// optimizer's get_pure_result / pure_from_args2 (both already present at
@@ -92,7 +92,7 @@ pub struct OptRewrite {
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
     loop_invariant_results: indexmap::IndexMap<i64, LoopInvariantEntry>,
     /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
-    /// Used by produce_potential_short_preamble_ops (rewrite.py:45-47).
+    /// Used by produce_potential_short_preamble_ops (rewrite.py).
     loop_invariant_producer: indexmap::IndexMap<i64, Op>,
 }
 
@@ -397,13 +397,13 @@ impl OptRewrite {
     // ── Unary operations ──
 
     /// Constant fold INT_IS_ZERO.
-    /// rewrite.py:522-523 `optimize_INT_IS_ZERO`:
+    /// rewrite.py `optimize_INT_IS_ZERO`:
     ///     return self._optimize_nullness(op, op.getarg(0), False)
     fn optimize_int_is_zero(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         self.optimize_nullness(op, op.arg(0).to_opref(), false, ctx)
     }
 
-    /// rewrite.py:515-520 `optimize_INT_IS_TRUE`:
+    /// rewrite.py `optimize_INT_IS_TRUE`:
     ///     if (not self.is_raw_ptr(op.getarg(0)) and
     ///         self.getintbound(op.getarg(0)).is_bool()):
     ///         self.make_equal_to(op, op.getarg(0))
@@ -417,14 +417,14 @@ impl OptRewrite {
     ) -> OptimizationResult {
         let arg0 = op.arg(0);
 
-        // rewrite.py:505-510 optimize_INT_IS_TRUE:
+        // rewrite.py optimize_INT_IS_TRUE:
         //     if (not self.is_raw_ptr(op.getarg(0)) and
         //         self.getintbound(op.getarg(0)).is_bool()):
         //         self.make_equal_to(op, op.getarg(0))
         //         return
         //     return self._optimize_nullness(op, op.getarg(0), True)
         //
-        // is_raw_ptr (optimizer.py:154-158) checks for an
+        // is_raw_ptr (optimizer.py) checks for an
         // AbstractRawPtrInfo on the box's forwarded slot — NOT a
         // Ref-typed Box check. A raw-pointer 'i'-typed Box (i.e. one
         // pointing into a virtual raw buffer) skips the is_bool
@@ -461,7 +461,7 @@ impl OptRewrite {
         self.optimize_nullness(op, arg0.to_opref(), true, ctx)
     }
 
-    /// rewrite.py:515-554: _optimize_oois_ooisnot(op, expect_isnot, instance)
+    /// rewrite.py: _optimize_oois_ooisnot(op, expect_isnot, instance)
     ///
     /// Pointer equality optimization using virtual/null/class information.
     fn optimize_oois_ooisnot(
@@ -471,7 +471,7 @@ impl OptRewrite {
         instance: bool,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        // rewrite.py:515-554 _optimize_oois_ooisnot:
+        // rewrite.py _optimize_oois_ooisnot:
         //     arg0 = get_box_replacement(op.getarg(0))
         //     arg1 = get_box_replacement(op.getarg(1))
         //     info0 = getptrinfo(arg0)
@@ -485,8 +485,8 @@ impl OptRewrite {
         // rewrite.py:530-535: virtual objects
         if is_virtual0 {
             let intres = if is_virtual1 {
-                // rewrite.py:532: `intres = (info0 is info1) ^ expect_isnot`
-                // — PtrInfo identity (info.py:71-72 `same_info` is `self is
+                // rewrite.py: `intres = (info0 is info1) ^ expect_isnot`
+                // — PtrInfo identity (info.py `same_info` is `self is
                 // other` for non-Const infos), via getptrinfo_handle which
                 // preserves the `_forwarded` cell identity.
                 let same = match (
@@ -520,8 +520,8 @@ impl OptRewrite {
             return self.optimize_nullness(op, arg1, expect_isnot, ctx);
         }
 
-        // rewrite.py:542-543: `elif arg0 is arg1:` — box identity
-        // (resoperation.py:38 `same_box` base = `self is other`).
+        // rewrite.py: `elif arg0 is arg1:` — box identity
+        // (resoperation.py `same_box` base = `self is other`).
         if ctx.box_is(arg0, arg1) {
             let b = ctx.materialize_operand_at(op.pos.get());
             ctx.make_constant_box(&b, Value::Int(!expect_isnot as i64));
@@ -561,7 +561,7 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// rewrite.py:496-503 `_optimize_nullness(op, box, expect_nonnull)`:
+    /// rewrite.py `_optimize_nullness(op, box, expect_nonnull)`:
     ///     info = self.getnullness(box)
     ///     if info == INFO_NONNULL: self.make_constant_int(op, expect_nonnull)
     ///     elif info == INFO_NULL: self.make_constant_int(op, not expect_nonnull)
@@ -714,7 +714,7 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// rewrite.py:284-347: optimize_GUARD_VALUE + replace_old_guard_with_guard_value
+    /// rewrite.py: optimize_GUARD_VALUE + replace_old_guard_with_guard_value
     ///
     /// If both args are constants and equal, the guard is redundant → remove.
     /// If arg0 is Ref-typed with a prior guard_nonnull/guard_class, replace
@@ -727,12 +727,12 @@ impl OptRewrite {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
 
-        // rewrite.py:163-184 optimize_guard(op, constbox) — base contradiction
+        // rewrite.py optimize_guard(op, constbox) — base contradiction
         // check called from optimize_GUARD_VALUE at line 301. `arg1` is the
         // asserted Const. For box.type=='i' (rewrite.py:165-168) the check is
         // intbound.is_constant()/get_constant_int(), catching values narrowed
         // by bounds analysis, not just the constant pool. For 'r'
-        // (rewrite.py:174-182) it is get_box_replacement(box).is_constant()/
+        // (rewrite.py) it is get_box_replacement(box).is_constant()/
         // same_constant. For 'f', rewrite.py:295-298 returns silently when
         // arg0 is constant without checking equality, so we mirror that by
         // removing on equality but never raising on mismatch.
@@ -769,7 +769,7 @@ impl OptRewrite {
             }
         }
 
-        // rewrite.py:284-301: optimize_GUARD_VALUE for Ref args.
+        // rewrite.py: optimize_GUARD_VALUE for Ref args.
         // getptrinfo synthesizes ConstPtrInfo for constant Refs, matching
         // `if info:` in RPython (which is True for ConstPtrInfo too).
         let obj_box = ctx.resolve_operand_operand_opt(&arg0);
@@ -778,7 +778,7 @@ impl OptRewrite {
             if info.is_virtual() {
                 return raise_invalid_loop("promote of a virtual", op, ctx);
             }
-            // rewrite.py:307-347: replace_old_guard_with_guard_value
+            // rewrite.py: replace_old_guard_with_guard_value
             if let Some(old_guard) = obj_box
                 .as_ref()
                 .and_then(|b| ctx.get_last_guard(b))
@@ -811,7 +811,7 @@ impl OptRewrite {
                     // rewrite.py:324-332: previous_classbox = info.get_known_class(cpu)
                     // expected_classbox = cpu.cls_of_box(c_value)
                     // get_known_class on the c_value side dispatches through
-                    // getptrinfo → ConstPtrInfo.get_known_class (info.py:763-772)
+                    // getptrinfo → ConstPtrInfo.get_known_class (info.py)
                     // which is exactly cls_of_box for constant pointers.
                     if let Some(prev_cls) = info.get_known_class(ctx.cpu.as_ref())
                         && let Some(arg1_box) = ctx.resolve_operand_operand_opt(&arg1)
@@ -875,7 +875,7 @@ impl OptRewrite {
                         if let Some(b) = obj_box.as_ref() {
                             ctx.with_ptr_info_mut(b, |info_mut| info_mut.reset_last_guard_pos());
                         }
-                        // postprocess_GUARD_VALUE (rewrite.py:303-305): make_constant
+                        // postprocess_GUARD_VALUE (rewrite.py): make_constant
                         // with the actual c_value (preserving Int vs Ref typing).
                         ctx.make_constant_arg(&arg0, c_value);
                         return OptimizationResult::Remove;
@@ -884,7 +884,7 @@ impl OptRewrite {
             }
         }
 
-        // rewrite.py:303-305 postprocess_GUARD_VALUE `make_constant(box,
+        // rewrite.py postprocess_GUARD_VALUE `make_constant(box,
         // op.getarg(1))` runs in `propagate_postprocess` below, AFTER the
         // guard has been emitted with its argument resolved. Calling it
         // here (pre-emit) installs the Const forwarding before
@@ -895,10 +895,10 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// rewrite.py:397-436 optimize_GUARD_CLASS / postprocess_GUARD_CLASS.
+    /// rewrite.py optimize_GUARD_CLASS / postprocess_GUARD_CLASS.
     ///
     /// Shared by GuardClass and GuardNonnullClass — RPython
-    /// `optimize_GUARD_NONNULL_CLASS` (rewrite.py:438-444) delegates to
+    /// `optimize_GUARD_NONNULL_CLASS` (rewrite.py) delegates to
     /// `optimize_GUARD_CLASS` after the null check, so both opcodes go
     /// through the same known-class / strengthening / postprocess logic.
     fn optimize_guard_class(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
@@ -908,10 +908,10 @@ impl OptRewrite {
         // `getptrinfo` / `get_ptr_info` against the resolved OpRef.
         let _ = ctx.ensure_ptr_info_arg0(op);
         let obj = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
-        // rewrite.py:397-407: ensure_ptr_info_arg0 → info.py:880 getptrinfo.
+        // rewrite.py:397-407: ensure_ptr_info_arg0 → info.py getptrinfo.
         // `getptrinfo(ConstPtr)` returns a synthesized ConstPtrInfo, so a
         // constant Ref arg0 is handled uniformly with virtual / instance
-        // info: ConstPtrInfo.get_known_class(cpu) (info.py:763-772) reads
+        // info: ConstPtrInfo.get_known_class(cpu) (info.py) reads
         // the typeptr at offset 0 via cls_of_box and compares against
         // expectedclassbox. Mismatch → proven-fail guard → InvalidLoop.
         let obj_info_for_class = ctx.getptrinfo(&op.arg(0).get_box_replacement(false));
@@ -970,7 +970,7 @@ impl OptRewrite {
                     Some(Some(new_descr)),
                 );
                 ctx.replace_new_operation(old_idx, std::rc::Rc::new(combined));
-                // rewrite.py:430-436 postprocess_GUARD_CLASS parity
+                // rewrite.py postprocess_GUARD_CLASS parity
                 // (invoked inline here because the replacement path
                 // rewrites `new_operations[old_idx]` directly instead
                 // of going through `emit_operation`, which would have
@@ -996,7 +996,7 @@ impl OptRewrite {
                 return OptimizationResult::Remove;
             }
         }
-        // rewrite.py:430-436 postprocess_GUARD_CLASS: runs AFTER emit.
+        // rewrite.py postprocess_GUARD_CLASS: runs AFTER emit.
         // Register deferred postprocess — executed by emit_operation
         // after the guard is added to new_operations.  Upstream
         // `postprocess_GUARD_CLASS` runs unconditionally (no
@@ -1016,13 +1016,13 @@ impl OptRewrite {
 
     // ── SAME_AS identity ──
 
-    /// optimizer.py:127-135 `getnullness(op)` wrapper. Delegates to
+    /// optimizer.py `getnullness(op)` wrapper. Delegates to
     /// `OptContext::getnullness`, which implements the upstream
     /// `op.type == 'r' or is_raw_ptr(op)` dispatch line-by-line, then
     /// converts the upstream `INFO_NULL` / `INFO_NONNULL` /
     /// `INFO_UNKNOWN` integer return into the local `Nullness` enum.
     fn getnullness(&self, opref: OpRef, ctx: &mut OptContext) -> Nullness {
-        // optimizer.py:127-135 `getnullness` has no missing-Box branch —
+        // optimizer.py `getnullness` has no missing-Box branch —
         // every `op` has a backing `AbstractValue` per
         // `resoperation.py:233-248`. `get_box_replacement_box` resolves
         // the opref to its bound host; the read-only `getnullness` below
@@ -1064,7 +1064,7 @@ impl OptRewrite {
             .is_some_and(|b| ctx.has_ptr_info(b))
     }
 
-    /// rewrite.py:95-101: _optimize_CALL_INT_UDIV
+    /// rewrite.py: _optimize_CALL_INT_UDIV
     /// x / 1 → x
     fn optimize_call_int_udiv(
         &mut self,
@@ -1089,7 +1089,7 @@ impl OptRewrite {
         false
     }
 
-    /// rewrite.py:768-805: _optimize_CALL_INT_PY_MOD
+    /// rewrite.py: _optimize_CALL_INT_PY_MOD
     fn optimize_call_int_py_mod(
         &mut self,
         op: &Op,
@@ -1162,7 +1162,7 @@ impl OptRewrite {
         Some(OptimizationResult::Remove)
     }
 
-    /// rewrite.py:713-766: _optimize_CALL_INT_PY_DIV
+    /// rewrite.py: _optimize_CALL_INT_PY_DIV
     fn optimize_call_int_py_div(
         &mut self,
         op: &Op,
@@ -1266,7 +1266,7 @@ impl OptRewrite {
         Some(OptimizationResult::Remove)
     }
 
-    /// rewrite.py:599-670: _optimize_call_arrayop
+    /// rewrite.py: _optimize_call_arrayop
     ///
     /// Element-by-element unrolling for small constant-length array
     /// copy/move operations. Handles both virtual and non-virtual arrays.
@@ -1520,7 +1520,7 @@ impl OptRewrite {
     /// rewrite.py: find_rewritable_bool(op)
     /// If we see INT_LT(a, b) and previously computed INT_GE(a, b) = K,
     /// then INT_LT(a, b) = 1 - K (boolean inverse).
-    /// rewrite.py:56-66 try_boolinvers — check if the inverse operation has
+    /// rewrite.py try_boolinvers — check if the inverse operation has
     /// a cached boolean result and negate it.
     ///
     /// RPython uses get_pure_result(targs) + getintbound(oldop).known_eq_const()
@@ -1618,7 +1618,7 @@ impl OptRewrite {
     // rewrite.py:103-161 — only FLOAT_MUL, FLOAT_TRUEDIV, FLOAT_NEG, FLOAT_ABS.
     // Constant folding for all float ops is handled by execute_nonspec_const.
 
-    /// rewrite.py:103-120 optimize_FLOAT_MUL
+    /// rewrite.py optimize_FLOAT_MUL
     fn optimize_float_mul(
         &self,
         op: &Op,
@@ -1653,7 +1653,7 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// rewrite.py:126-145 optimize_FLOAT_TRUEDIV
+    /// rewrite.py optimize_FLOAT_TRUEDIV
     fn optimize_float_truediv(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = op.arg(0);
         let arg1 = op.arg(1);
@@ -1682,7 +1682,7 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// rewrite.py:135: `math.frexp(divisor)[0]` == ±0.5 iff exact power of 2.
+    /// rewrite.py: `math.frexp(divisor)[0]` == ±0.5 iff exact power of 2.
     fn is_exact_power_of_two(v: f64) -> bool {
         let bits = v.to_bits();
         let mantissa = bits & 0x000F_FFFF_FFFF_FFFF;
@@ -1690,7 +1690,7 @@ impl OptRewrite {
         mantissa == 0 && exponent > 0 && exponent < 0x7FF
     }
 
-    /// rewrite.py:147-153 optimize_FLOAT_NEG
+    /// rewrite.py optimize_FLOAT_NEG
     fn optimize_float_neg(
         &self,
         op: &Op,
@@ -1711,7 +1711,7 @@ impl OptRewrite {
         OptimizationResult::PassOn
     }
 
-    /// rewrite.py:155-161 optimize_FLOAT_ABS
+    /// rewrite.py optimize_FLOAT_ABS
     fn optimize_float_abs(
         &self,
         op: &Op,
@@ -1818,7 +1818,7 @@ impl Optimization for OptRewrite {
             // If the guarded condition is already known to be true (constant),
             // the guard can be removed entirely.
             OpCode::GuardNonnull => {
-                // rewrite.py:269-278 optimize_GUARD_NONNULL
+                // rewrite.py optimize_GUARD_NONNULL
                 //     opinfo = getptrinfo(op.getarg(0))
                 //     if opinfo is not None:
                 //         if opinfo.is_nonnull(): return
@@ -1834,7 +1834,7 @@ impl Optimization for OptRewrite {
                         return raise_invalid_loop("GUARD_NONNULL proven to always fail", op, ctx);
                     }
                 }
-                // rewrite.py:280-282 postprocess_GUARD_NONNULL:
+                // rewrite.py postprocess_GUARD_NONNULL:
                 // make_nonnull runs immediately; mark_last_guard deferred
                 // until emit adds the guard to new_operations.
                 let has_info = ctx.has_ptr_info(&obj_box);
@@ -1846,7 +1846,7 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
             OpCode::GuardIsnull => {
-                // rewrite.py:186-195 optimize_GUARD_ISNULL
+                // rewrite.py optimize_GUARD_ISNULL
                 //     info = getptrinfo(op.getarg(0))
                 //     if info is not None:
                 //         if info.is_null(): return
@@ -1862,7 +1862,7 @@ impl Optimization for OptRewrite {
                         return raise_invalid_loop("GUARD_ISNULL proven to always fail", op, ctx);
                     }
                 }
-                // rewrite.py:197-198 postprocess_GUARD_ISNULL:
+                // rewrite.py postprocess_GUARD_ISNULL:
                 //     self.make_constant(op.getarg(0), CONST_NULL)
                 // Ref-typed → Value::Ref(NULL); Int-typed → Value::Int(0).
                 if self.is_ref_typed(obj, ctx) {
@@ -1874,7 +1874,7 @@ impl Optimization for OptRewrite {
             }
             OpCode::GuardClass => self.optimize_guard_class(op, ctx),
             OpCode::GuardNonnullClass => {
-                // rewrite.py:438-444 optimize_GUARD_NONNULL_CLASS:
+                // rewrite.py optimize_GUARD_NONNULL_CLASS:
                 //     info = getptrinfo(op.getarg(0))
                 //     if info and info.is_null():
                 //         raise InvalidLoop(...)
@@ -1956,7 +1956,7 @@ impl Optimization for OptRewrite {
                 ctx.last_op_removed = false;
                 OptimizationResult::PassOn
             }
-            // rewrite.py:483-494: optimize_COND_CALL_VALUE_I/R
+            // rewrite.py: optimize_COND_CALL_VALUE_I/R
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
                 let nullness = self.getnullness(op.arg(0).to_opref(), ctx);
                 // rewrite.py:486-489: INFO_NONNULL → result is arg(0)
@@ -1993,7 +1993,7 @@ impl Optimization for OptRewrite {
             OpCode::PtrEq | OpCode::InstancePtrEq => {
                 let instance = matches!(op.opcode, OpCode::InstancePtrEq);
                 if instance {
-                    // rewrite.py:563-565 optimize_INSTANCE_PTR_EQ:
+                    // rewrite.py optimize_INSTANCE_PTR_EQ:
                     //     arg0 = get_box_replacement(op.getarg(0))
                     //     arg1 = get_box_replacement(op.getarg(1))
                     //     self.pure_from_args2(rop.INSTANCE_PTR_EQ, arg1, arg0, op)
@@ -2006,7 +2006,7 @@ impl Optimization for OptRewrite {
             OpCode::PtrNe | OpCode::InstancePtrNe => {
                 let instance = matches!(op.opcode, OpCode::InstancePtrNe);
                 if instance {
-                    // rewrite.py:568-571 optimize_INSTANCE_PTR_NE: same swap.
+                    // rewrite.py optimize_INSTANCE_PTR_NE: same swap.
                     let arg0 = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
                     let arg1 = ctx.resolve_operand_operand(&op.arg(1)).to_opref();
                     ctx.register_pure_from_args2(OpCode::InstancePtrNe, op.pos.get(), arg1, arg0);
@@ -2063,7 +2063,7 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
 
-            // rewrite.py:712-718 optimize_GUARD_NO_EXCEPTION:
+            // rewrite.py optimize_GUARD_NO_EXCEPTION:
             //
             //     def optimize_GUARD_NO_EXCEPTION(self, op):
             //         if self.last_emitted_operation is REMOVED:
@@ -2097,7 +2097,7 @@ impl Optimization for OptRewrite {
             // strict subset of intbounds's removals. Removed for
             // line-by-line dispatch-shape parity.
 
-            // rewrite.py:676-698: optimize_CALL_PURE_I
+            // rewrite.py: optimize_CALL_PURE_I
             // Dispatch based on oopspecindex to specialized handlers.
             // Constant-fold and CSE are handled by pure.rs; here we
             // only do oopspec-specific simplifications.
@@ -2132,7 +2132,7 @@ impl Optimization for OptRewrite {
                 OptimizationResult::PassOn
             }
 
-            // rewrite.py:448-470: optimize_CALL_LOOPINVARIANT_I
+            // rewrite.py: optimize_CALL_LOOPINVARIANT_I
             OpCode::CallLoopinvariantI
             | OpCode::CallLoopinvariantR
             | OpCode::CallLoopinvariantF
@@ -2181,7 +2181,7 @@ impl Optimization for OptRewrite {
                     if let Some(entry) = self.loop_invariant_results.get(&func_val).cloned() {
                         let cached_result = match entry {
                             LoopInvariantEntry::Preamble(ref pop) => {
-                                // unroll.py:26: force_op_from_preamble(preamble_op)
+                                // unroll.py: force_op_from_preamble(preamble_op)
                                 let forced = ctx.force_op_from_preamble_op(pop);
                                 self.loop_invariant_results
                                     .insert(func_val, LoopInvariantEntry::Direct(forced));
@@ -2198,7 +2198,7 @@ impl Optimization for OptRewrite {
                     // Cache miss: demote and record result
                     self.loop_invariant_results
                         .insert(func_val, LoopInvariantEntry::Direct(op.pos.get()));
-                    // rewrite.py:30-31: _callback records producer op
+                    // rewrite.py: _callback records producer op
                     let call_opcode = OpCode::call_for_type(op.result_type());
                     let producer = op.copy_and_change(call_opcode, None, None);
                     producer.pos.set(op.pos.get());
@@ -2211,7 +2211,7 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Emit(new_op)
             }
 
-            // ── rewrite.py:373-374: optimize_ASSERT_NOT_NONE ──
+            // ── rewrite.py: optimize_ASSERT_NOT_NONE ──
             OpCode::AssertNotNone => {
                 // RPython: self.make_nonnull(op.getarg(0))
                 let obj_box = op.arg(0).get_box_replacement(false);
@@ -2222,7 +2222,7 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Remove
             }
 
-            // rewrite.py:376-386 optimize_RECORD_EXACT_CLASS:
+            // rewrite.py optimize_RECORD_EXACT_CLASS:
             //     opinfo = getptrinfo(op.getarg(0))
             //     expectedclassbox = op.getarg(1)
             //     if opinfo is not None:
@@ -2259,14 +2259,14 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Remove
             }
 
-            // rewrite.py:397-401: optimize_record_exact_value
+            // rewrite.py: optimize_record_exact_value
             //   box = op.getarg(0)
             //   expectedconstbox = op.getarg(1)
             //   assert isinstance(expectedconstbox, Const)
             //   self.make_constant(box, expectedconstbox)
             //
             // `make_constant` walks the forwarding chain internally
-            // (optimizer.py:412 `box = get_box_replacement(box)`), so
+            // (optimizer.py `box = get_box_replacement(box)`), so
             // upstream passes `op.getarg(0)` raw without a prior
             // `get_box_replacement` resolution. Pyre matches.
             OpCode::RecordExactValueI | OpCode::RecordExactValueR => {
@@ -2278,7 +2278,7 @@ impl Optimization for OptRewrite {
                 OptimizationResult::Remove
             }
 
-            // rewrite.py:574-584: optimize_CALL_N — dispatch on oopspecindex
+            // rewrite.py: optimize_CALL_N — dispatch on oopspecindex
             OpCode::CallN | OpCode::CallI | OpCode::CallR => {
                 let __descr_arc_descr = op.getdescr();
                 if let Some(descr) = __descr_arc_descr.as_ref()
@@ -2345,11 +2345,11 @@ impl Optimization for OptRewrite {
         true
     }
 
-    /// rewrite.py:303-305 postprocess_GUARD_VALUE,
-    /// rewrite.py:352-371 postprocess_GUARD_TRUE / postprocess_GUARD_FALSE.
+    /// rewrite.py postprocess_GUARD_VALUE,
+    /// rewrite.py postprocess_GUARD_TRUE / postprocess_GUARD_FALSE.
     ///
     /// The `make_constant(box, CONST_*)` call is the second half of PyPy's
-    /// `optimize_guard` (rewrite.py:163-184). PyPy emits the guard, then
+    /// `optimize_guard` (rewrite.py). PyPy emits the guard, then
     /// records that the guard's input box is now known constant. The Rust
     /// port keeps the same split that `have_postprocess` requires — the
     /// emit happens via `optimize_guard_true/false/value` and the
@@ -2384,7 +2384,7 @@ impl Optimization for OptRewrite {
         }
     }
 
-    /// rewrite.py:45-47: produce_potential_short_preamble_ops
+    /// rewrite.py: produce_potential_short_preamble_ops
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
@@ -2395,7 +2395,7 @@ impl Optimization for OptRewrite {
         }
     }
 
-    /// rewrite.py:828-834 serialize_optrewrite
+    /// rewrite.py serialize_optrewrite
     fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
         self.loop_invariant_results
             .iter()
@@ -2406,7 +2406,7 @@ impl Optimization for OptRewrite {
             .collect()
     }
 
-    /// rewrite.py:836-838 deserialize_optrewrite
+    /// rewrite.py deserialize_optrewrite
     fn deserialize_optrewrite(&mut self, entries: &[(i64, OpRef)]) {
         for &(func_ptr, result) in entries {
             self.loop_invariant_results
@@ -2534,7 +2534,7 @@ mod tests {
 
     /// The int-rewrite slice of the production pipeline: integer rule
     /// rewrites live in OptIntBounds (autogenintrules.py), all-constant
-    /// pure folding in OptPure (pure.py:131), with OptRewrite between
+    /// pure folding in OptPure (pure.py), with OptRewrite between
     /// them as in default_pipeline. Tests in this module assert the
     /// chain's observable result, wherever the individual rule lives.
     fn test_pass_chain() -> Vec<Box<dyn crate::optimizeopt::Optimization>> {
@@ -2924,7 +2924,7 @@ mod tests {
         }
     }
 
-    /// `rewrite.py:797-805` / `:758-766` reach `intdiv.modulo_operations` /
+    /// `rewrite.py` / `:758-766` reach `intdiv.modulo_operations` /
     /// `division_operations` with no capability test of any kind, so the
     /// residual call goes away and the expansion is the same one on every
     /// backend.  A backend that has to emulate `UintMulHigh` pays for it in
@@ -3534,7 +3534,7 @@ mod tests {
     #[test]
     fn test_ptr_eq_same_opref() {
         // PtrEq(x, x) -> 1
-        // resoperation.py:739 InputArgRef / 615 RefOp `type = 'r'`: ptr
+        // resoperation.py InputArgRef / 615 RefOp `type = 'r'`: ptr
         // boxes carry the Ref variant tag, not Int.
         let (result, ctx) = run_one(vec![same_r(), bin_r(OpCode::PtrEq, 0, 0)], 1, &[]);
         assert_remove(&result);
@@ -3568,12 +3568,12 @@ mod tests {
     #[test]
     fn test_ptr_eq_distinct_constants_not_folded_in_rewrite() {
         // PtrEq(const 100, const 200): two distinct non-null ConstPtr.
-        // rewrite.py:525-564 _optimize_oois_ooisnot has no value-compare
+        // rewrite.py _optimize_oois_ooisnot has no value-compare
         // branch — `arg0 is arg1` (line 542) is object identity, which is
         // False for distinct ConstPtr, so it falls through to `emit(op)`
         // (line 564). The actual constant fold lives in the pure pass
         // (pure.py:126-136 → execute_ptr_compare_const), not rewrite.
-        // history.py:307 ConstPtr — Value::Ref must land on a Ref-tagged
+        // history.py ConstPtr — Value::Ref must land on a Ref-tagged
         // OpRef so the box class identity matches the resoperation.py:615
         // RefOp mixin of the producer SameAsR.
         // OptRewrite alone: this asserts the REWRITE pass's behavior; the
@@ -3587,7 +3587,7 @@ mod tests {
                 (OpRef::ref_op(1), Value::Ref(GcRef(200))),
             ],
         );
-        // rewrite.py:564 `return self.emit(op)` — rewrite passes the op on
+        // rewrite.py `return self.emit(op)` — rewrite passes the op on
         // unchanged; it does not fold distinct constants.
         assert_pass_on(&result);
         assert_eq!(
@@ -3602,7 +3602,7 @@ mod tests {
     #[test]
     fn test_cast_ptr_to_int_passes_through() {
         // rewrite.py:807-809: CastPtrToInt registers pure inverse, emits.
-        // arg0 is a Ref box (resoperation.py:615 RefOp `type = 'r'`).
+        // arg0 is a Ref box (resoperation.py RefOp `type = 'r'`).
         let (result, _) = run_one(vec![same_r(), unary_r(OpCode::CastPtrToInt, 0)], 1, &[]);
         assert_pass_on(&result);
     }
@@ -3722,10 +3722,10 @@ mod tests {
     #[test]
     fn test_guard_value_to_guard_false() {
         // GUARD_VALUE(v, 0) on a bool-bounded v → GUARD_FALSE(v)
-        // (_maybe_replace_guard_value, optimizer.py:755-776). The [0,1]
+        // (_maybe_replace_guard_value, optimizer.py). The [0,1]
         // bound on v comes from the `int_gt` producer the intbounds pass
         // analyzed; the guard's own make_constant runs in
-        // postprocess_GUARD_VALUE (rewrite.py:313-315), after emit, so it
+        // postprocess_GUARD_VALUE (rewrite.py), after emit, so it
         // does not bound v at emit time.
         // Bound oparser graph: i0/i1 are header InputArgs, v = IntGt(i0, i1)
         // a live producer, and GUARD_VALUE's expected operand is the literal

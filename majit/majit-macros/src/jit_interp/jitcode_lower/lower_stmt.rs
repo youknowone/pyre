@@ -253,9 +253,9 @@ impl<'c> Lowerer<'c> {
                 self.lower_stmt_fallback(stmt, "expr")
             }
             Stmt::Macro(stmt_macro) => {
-                // jtransform.py:1714-1723 handle_jit_marker__loop_header —
+                // jtransform.py handle_jit_marker__loop_header —
                 // a `can_enter_jit!()` call at the user's source-level
-                // back-edge (interp_jit.py:118 inside `jump_absolute`'s
+                // back-edge (interp_jit.py inside `jump_absolute`'s
                 // backward-jump branch) lowers to `loop_header(jd.index)`
                 // at the SAME source position.  Per-arm emission at the
                 // dispatch JitCode level (post-INLINE_CALL) would over-
@@ -881,7 +881,7 @@ impl<'c> Lowerer<'c> {
             panic!("conditional_call! requires a void-return helper policy, got {policy:?}");
         }
         let slot = self.cond_call_slot_for_policy(policy, "conditional_call!");
-        // `call.py:249-251 getcalldescr`:
+        // `call.py getcalldescr`:
         //   if loopinvariant:
         //       assert not NON_VOID_ARGS, ("arguments not supported for "
         //                                  "loop-invariant function!")
@@ -944,7 +944,7 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
-    /// RPython jtransform.py:1687 — `rewrite_op_jit_conditional_call_value`.
+    /// RPython jtransform.py — `rewrite_op_jit_conditional_call_value`.
     ///
     /// Recognizes `conditional_call_elidable!(value, func, args...)` and emits
     /// the canonical `conditional_call_value_ir_{i,r}` builder entrypoint.
@@ -1008,7 +1008,7 @@ impl<'c> Lowerer<'c> {
             },
         };
         // `conditional_call_elidable!` is the elidable cache helper; per
-        // `rlib/jit.py:1334-1336` the callee need not be `@elidable` but
+        // `rlib/jit.py` the callee need not be `@elidable` but
         // the cond_call_value op itself caches the result.  Default to
         // `Elidable*Wrapped` based on the leading value-kind so an
         // inferred policy still classifies as elidable.
@@ -1033,7 +1033,7 @@ impl<'c> Lowerer<'c> {
             );
         }
         let slot = self.cond_call_slot_for_policy(policy, "conditional_call_elidable!");
-        // `call.py:249-251 getcalldescr`'s loop-invariant non-void-args
+        // `call.py getcalldescr`'s loop-invariant non-void-args
         // assert (see plain `conditional_call!` lowerer for the citation).
         // `conditional_call_elidable!` accepts non-elidable cache-computing
         // helpers per `rlib/jit.py:1334-1336`, so a `LoopInvariant` slot is
@@ -1106,7 +1106,7 @@ impl<'c> Lowerer<'c> {
         })
     }
 
-    /// RPython jtransform.py:522 `handle_recursive_call` — recognises
+    /// RPython jtransform.py `handle_recursive_call` — recognises
     /// `recursive_portal_call!(driver, green0, green1, ...)` and emits the
     /// `recursive_call_int` opcode (pyjitpl.py:1376 `opimpl_recursive_call`
     /// → BC_RECURSIVE_CALL_INT).
@@ -1119,7 +1119,7 @@ impl<'c> Lowerer<'c> {
     /// dispatcher from `recursive_fresh_entry_reds`, so no caller→callee
     /// argument moves are recorded here (`args = &[]`).  `jd_index` is the
     /// runtime `__jdindex` parameter of `__dispatch_jitcode_*`
-    /// (jtransform.py:1704 `portal_jd.index`, threaded exactly like
+    /// (jtransform.py `portal_jd.index`, threaded exactly like
     /// `jit_merge_point` / `loop_header`), not a literal 0: when a consumer
     /// also installs the propagate-descr placeholder driver via
     /// `ensure_default_driver_sd`, the real portal driver registers at slot
@@ -1182,7 +1182,7 @@ impl<'c> Lowerer<'c> {
         })
     }
 
-    /// RPython jtransform.py:292-313 — `rewrite_op_jit_record_known_result`.
+    /// RPython jtransform.py — `rewrite_op_jit_record_known_result`.
     ///
     /// Recognizes `record_known_result!(result, func, args...)` and emits
     /// the canonical `record_known_result_{i,r}_ir_v` builder entrypoint.
@@ -1323,7 +1323,7 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_pc_pinned_write(expr) {
             return Some(());
         }
-        // jtransform.py:596 rewrite_op_hint — `hint(x, promote=True)` in
+        // jtransform.py rewrite_op_hint — `hint(x, promote=True)` in
         // statement context.  Routes both `x = promote(arg)` (plain local
         // re-assignment, no state-write to trigger
         // `lower_state_field_write`'s RHS recursion) and bare
@@ -1335,12 +1335,12 @@ impl<'c> Lowerer<'c> {
         if let Some(()) = self.lower_promote_stmt(expr) {
             return Some(());
         }
-        // pyjitpl.py:385-391 opimpl_assert_not_none — statement-form
+        // pyjitpl.py opimpl_assert_not_none — statement-form
         // `jit::assert_not_none(x);` (discard return value).
         if let Some(()) = self.lower_assert_not_none_stmt(expr) {
             return Some(());
         }
-        // pyjitpl.py:393-410 opimpl_record_exact_class — statement-form
+        // pyjitpl.py opimpl_record_exact_class — statement-form
         // `jit::record_exact_class(value, cls);` (no return value).
         if let Some(()) = self.lower_record_exact_class_stmt(expr) {
             return Some(());
@@ -1372,7 +1372,7 @@ impl<'c> Lowerer<'c> {
         }
         // Raw native-memory store: `majit_raw_store_{i,u}{8,16,32,64}(base,
         // ea, val);` →
-        // raw_store_i (jtransform.py:1156-1163 rewrite_op_raw_store).  Runs
+        // raw_store_i (jtransform.py rewrite_op_raw_store).  Runs
         // before the residual-call path so the store lowers to an inline
         // side-effecting IR op instead of an opaque helper call.
         if let Some(()) = self.lower_raw_store_stmt(expr) {
@@ -1703,7 +1703,7 @@ impl<'c> Lowerer<'c> {
                 // code).
                 // Allocate a throwaway destination register; never read it.
                 //
-                // RPython jtransform.py:456 `handle_residual_call` lowers
+                // RPython jtransform.py `handle_residual_call` lowers
                 // every direct_call to a residual_call regardless of result
                 // usage; majit's CallPolicyKind enum captures the effect
                 // distinction (Residual / MayForce / ReleaseGil /
@@ -1802,7 +1802,7 @@ impl<'c> Lowerer<'c> {
                         );
                     }
                 }
-                // `call.py:303 getcalldescr` non-elidable EF_CANNOT_RAISE
+                // `call.py getcalldescr` non-elidable EF_CANNOT_RAISE
                 // for int residuals.  Dispatches via the
                 // `_with_effect_info(cannot_raise_effect_info())` builder
                 // method so the recorded calldescr's `EffectInfo`
@@ -1834,7 +1834,7 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::ElidableIntOrMemerror => {
                     // Pure flows through
                     // the canonical `BC_RESIDUAL_CALL_*_I` family with the
-                    // calldescr's `extra_info` set per `call.py:292-299
+                    // calldescr's `extra_info` set per `call.py
                     // _canraise(op)`'s 3-way pick.  The walker
                     // (`pyjitpl/dispatch.rs`) reads
                     // `effectinfo.check_is_elidable()` and routes through
@@ -1878,7 +1878,7 @@ impl<'c> Lowerer<'c> {
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
                     let __slot_tokens = CondCallEffectSlot::for_wrapped_kind(kind);
-                    // `call.py:301-303 getcalldescr`: descr's `EffectInfo`
+                    // `call.py getcalldescr`: descr's `EffectInfo`
                     // differs by the analyzer's `_canraise` result, but the
                     // residual_call dispatch family is the same.
                     let call_stmt = if matches!(
@@ -2291,7 +2291,7 @@ impl<'c> Lowerer<'c> {
     ///
     /// RPython parity: an `rffi.raw_storage_setitem(base, offset, value)`
     /// in the interpreter source is rewritten by
-    /// `jtransform.py:1156-1163 rewrite_op_raw_store` to
+    /// `jtransform.py rewrite_op_raw_store` to
     /// `raw_store_i(base, offset, value, arraydescrof(CArray(T)))`, where `T`
     /// is the STORED VALUE's own type — so the access width and signedness
     /// come off the descr and any width upstream can store, this can.  The

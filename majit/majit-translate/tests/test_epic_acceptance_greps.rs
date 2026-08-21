@@ -302,7 +302,7 @@ fn scan_forbidden(label: &str, patterns: &[&str]) -> Vec<String> {
 
 // Acceptance gates
 
-/// Anchor: `rpython/jit/codewriter/call.py:87` keeps `self.jitcodes = {}`
+/// Anchor: `rpython/jit/codewriter/call.py` keeps `self.jitcodes = {}`
 /// keyed by graph identity; there is no per-opcode-variant JitCode map
 /// anywhere in upstream. pyre's canonical key is `CallPath` (the graph
 /// identity surrogate), matching upstream.
@@ -318,7 +318,7 @@ fn no_variant_keyed_jitcode_map() {
     );
 }
 
-/// Anchor: `rpython/jit/codewriter/jtransform.py:456 rewrite_op_direct_call`
+/// Anchor: `rpython/jit/codewriter/jtransform.py rewrite_op_direct_call`
 /// handles raising calls through the existing `residual_call_{r,v,f}_*`
 /// family; `rpython/translator/exceptiontransform.py` lowers exception edges
 /// to additional successors on the existing `Terminator`. No new opname
@@ -339,7 +339,7 @@ fn no_new_opname_family_for_exceptions() {
 }
 
 /// The legacy `compile_pyre_interpreter` entry point must not re-emerge. It
-/// is replaced with `CodeWriter::make_jitcodes` (upstream `codewriter.py:74`).
+/// is replaced with `CodeWriter::make_jitcodes` (upstream `codewriter.py`).
 /// A surviving definition means the pyre-bytecode-walking path lives in
 /// parallel with the graph-keyed one.
 #[test]

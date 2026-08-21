@@ -76,7 +76,7 @@ pub(crate) fn walk_codec_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     }
 }
 
-// PyPy `interp_codecs.py:166-190 normalize`.
+// PyPy `interp_codecs.py normalize`.
 fn normalize(encoding: &str) -> String {
     let mut chars = String::new();
     let mut punct = false;
@@ -462,7 +462,7 @@ fn register_builtin_error_handlers(state: &mut CodecState) {
     }
 }
 
-/// `interp_codecs.py:602-610 lookup_error`.  The direct codec loops implement
+/// `interp_codecs.py lookup_error`.  The direct codec loops implement
 /// the eight built-ins themselves; custom handlers live in the same registry
 /// dict PyPy uses and are returned verbatim.
 pub(crate) fn validate_error_handler(errors: &str) -> Result<(), crate::PyError> {
@@ -540,7 +540,7 @@ fn register_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !is_callable(w_search_function) {
         return Err(crate::PyError::type_error("argument must be callable"));
     }
-    // PyPy `interp_codecs.py:143-155 register_codec`.
+    // PyPy `interp_codecs.py register_codec`.
     with_codec_state(|state| unsafe {
         pyre_object::listobject::w_list_append(state.codec_search_path, w_search_function);
     });
@@ -551,7 +551,7 @@ fn unregister(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let Some(w_search_function) = args.first().copied() else {
         return Err(crate::PyError::type_error("unregister() missing argument"));
     };
-    // PyPy `interp_codecs.py:157-164 unregister`: remove and clear cache;
+    // PyPy `interp_codecs.py unregister`: remove and clear cache;
     // return -1 when the search function was not present.
     with_codec_state(|state| {
         match crate::listobject::w_list_remove(state.codec_search_path, w_search_function) {
@@ -671,7 +671,7 @@ fn call_codec(
     action: &str,
     errors: Option<&str>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // PyPy `interp_codecs.py:577-595 _call_codec`.
+    // PyPy `interp_codecs.py _call_codec`.
     let w_res = if let Some(errors) = errors {
         crate::call::call_function_impl_result(w_coder, &[w_obj, w_str_new(errors)])?
     } else {
@@ -1721,7 +1721,7 @@ fn unicode_escape_decode_impl(
     ]))
 }
 
-/// `interp_codecs.py:1101 escape_decode` / `_PyString_DecodeEscape` — the
+/// `interp_codecs.py escape_decode` / `_PyString_DecodeEscape` — the
 /// bytes-to-bytes Python string-literal escape transform used by protocol-0
 /// pickle.
 fn escape_decode_impl(
@@ -1841,7 +1841,7 @@ fn escape_decode_impl(
     ]))
 }
 
-/// `interp_codecs.py:1092 escape_encode` / `string_escape_encode(data,
+/// `interp_codecs.py escape_encode` / `string_escape_encode(data,
 /// quote=False)` — the inverse bytes transform.
 fn escape_encode_impl(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_bytes(w_obj) } {
@@ -1880,7 +1880,7 @@ fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
 
-    // PyPy `interp_codecs.py:1006-1016 charmap_build`: build a dict mapping
+    // PyPy `interp_codecs.py charmap_build`: build a dict mapping
     // each Unicode codepoint in `chars` to its ordinal position.
     let w_charmap = w_dict_new();
     for (num, cp) in unsafe { w_str_get_wtf8(chars) }.code_points().enumerate() {

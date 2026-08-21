@@ -22,7 +22,7 @@ use crate::rmarshal::{
 };
 use crate::vfs::{self, FsNode, GID, ReadSeek, StatResult, UID};
 
-// sandlib.py:401 `virtual_fd_range = range(3, 50)`.
+// sandlib.py `virtual_fd_range = range(3, 50)`.
 const FD_RANGE_START: i32 = 3;
 const FD_RANGE_END: i32 = 50;
 
@@ -80,12 +80,12 @@ pub struct SandboxPolicy {
     pub virtual_env: Vec<(Vec<u8>, Vec<u8>)>,
     pub virtual_console_isatty: bool,
     open_fds: HashMap<i32, OpenFd>,
-    /// Opt-in `tcp://host:port` mediation (`VirtualizedSocketProc`, sandlib.py:546).
+    /// Opt-in `tcp://host:port` mediation (`VirtualizedSocketProc`, sandlib.py).
     /// Off by default so the standard policy stays network-closed; the controller
     /// flips it on with `set_allow_net` when `--allow-net` is passed.
     allow_net: bool,
     /// Fds returned by a `tcp://` open, sharing the `open_fds` fd space
-    /// (`VirtualizedSocketProc.sockets`, sandlib.py:552). read/write route these
+    /// (`VirtualizedSocketProc.sockets`, sandlib.py). read/write route these
     /// to the connected stream instead of a virtual file.
     sockets: HashMap<i32, TcpStream>,
     /// Append-mode log of the guest's stdin (`inputlogfile`, sandlib.py:294),
@@ -130,7 +130,7 @@ impl SandboxPolicy {
         self.allow_net = allow;
     }
 
-    /// Log the guest's stdin to `file` (`setlogfile`, sandlib.py:334). The
+    /// Log the guest's stdin to `file` (`setlogfile`, sandlib.py). The
     /// controller opens the file in append mode before the request loop.
     pub fn set_input_log(&mut self, file: std::fs::File) {
         self.input_log = Some(file);
@@ -138,7 +138,7 @@ impl SandboxPolicy {
 
     // ── path resolution (sandlib.py:417-437) ─────────────────────────────────
 
-    // sandlib.py:417 `translate_path`.
+    // sandlib.py `translate_path`.
     fn translate_path(&self, vpath: &str) -> SandboxResult<(FsNode, String)> {
         let joined = posix_join(&self.virtual_cwd, vpath);
         let norm = posix_normpath(&joined);
@@ -158,7 +158,7 @@ impl SandboxPolicy {
         Ok((dirnode, (*last).to_owned()))
     }
 
-    // sandlib.py:429 `get_node`.
+    // sandlib.py `get_node`.
     fn get_node(&self, vpath: &str) -> SandboxResult<FsNode> {
         let (dirnode, name) = self.translate_path(vpath)?;
         if name.is_empty() {
@@ -168,7 +168,7 @@ impl SandboxPolicy {
         }
     }
 
-    // sandlib.py:458 `allocate_fd`. Files and `tcp://` sockets share one fd
+    // sandlib.py `allocate_fd`. Files and `tcp://` sockets share one fd
     // space, so both tables are consulted for a free slot.
     fn allocate_fd(&mut self, handle: Box<dyn ReadSeek>, node: FsNode) -> SandboxResult<i32> {
         let fd = self.next_free_fd()?;
@@ -176,7 +176,7 @@ impl SandboxPolicy {
         Ok(fd)
     }
 
-    // Socket variant of `allocate_fd` (`VirtualizedSocketProc`, sandlib.py:562).
+    // Socket variant of `allocate_fd` (`VirtualizedSocketProc`, sandlib.py).
     fn allocate_socket_fd(&mut self, stream: TcpStream) -> SandboxResult<i32> {
         let fd = self.next_free_fd()?;
         self.sockets.insert(fd, stream);
@@ -242,7 +242,7 @@ impl SandboxPolicy {
 
     // ── VirtualizedSandboxedProc handlers ────────────────────────────────────
 
-    // sandlib.py:485 `do_ll_os__ll_os_open`, with the `VirtualizedSocketProc`
+    // sandlib.py `do_ll_os__ll_os_open`, with the `VirtualizedSocketProc`
     // `tcp://` override (sandlib.py:554) folded in when `allow_net` is set.
     fn do_open(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let vpath = arg_path(args, 0)?;
@@ -263,7 +263,7 @@ impl SandboxPolicy {
         Ok(Reply::Value(MarshalValue::Int(fd as i64)))
     }
 
-    // sandlib.py:558-564: `host, port = name[6:].split(":")`, connect a real
+    // sandlib.py: `host, port = name[6:].split(":")`, connect a real
     // AF_INET/SOCK_STREAM socket on the trusted side, and hand the child an fd.
     fn do_open_socket(&mut self, target: &str) -> SandboxResult<Reply> {
         let (host, port) = target
@@ -276,7 +276,7 @@ impl SandboxPolicy {
         Ok(Reply::Value(MarshalValue::Int(fd as i64)))
     }
 
-    // sandlib.py:493 `do_ll_os__ll_os_close`.
+    // sandlib.py `do_ll_os__ll_os_close`.
     fn do_close(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let fd = arg_int(args, 0)? as i32;
         // A `tcp://` fd closes by dropping the stream (sandlib.py:495-496).
@@ -286,7 +286,7 @@ impl SandboxPolicy {
         Ok(Reply::Value(MarshalValue::None))
     }
 
-    // sandlib.py:498 `do_ll_os__ll_os_read` (+ SimpleIO fallback for fd 0).
+    // sandlib.py `do_ll_os__ll_os_read` (+ SimpleIO fallback for fd 0).
     fn do_read(&mut self, args: &[MarshalValue], console: &mut Console) -> SandboxResult<Reply> {
         let fd = arg_int(args, 0)? as i32;
         let size = arg_int(args, 1)?;
@@ -314,7 +314,7 @@ impl SandboxPolicy {
                 read_upto(&mut entry.handle, want).map_err(|_| SandboxError::Os(libc::EIO))?;
             Ok(Reply::Value(MarshalValue::Str(data)))
         } else if fd == 0 {
-            // SimpleIOSandboxedProc.do_ll_os__ll_os_read (sandlib.py:337).
+            // SimpleIOSandboxedProc.do_ll_os__ll_os_read (sandlib.py).
             if size < 0 {
                 return Err(SandboxError::Os(libc::EINVAL));
             }
@@ -324,7 +324,7 @@ impl SandboxPolicy {
             let data = if self.virtual_console_isatty || console.input_isatty {
                 // Waiting at the interactive prompt is idle time: flag it so the
                 // watchdog keeps the activity clock fresh and does not charge the
-                // wait against --timeout (sandlib.py:348 enter_idle/leave_idle).
+                // wait against --timeout (sandlib.py enter_idle/leave_idle).
                 self.timeout_control.idle.store(true, Ordering::Relaxed);
                 let r = read_line(console.input, want);
                 self.timeout_control.idle.store(false, Ordering::Relaxed);
@@ -346,7 +346,7 @@ impl SandboxPolicy {
         }
     }
 
-    // sandlib.py:360 `do_ll_os__ll_os_write` (SimpleIO: fd 1/2 only).
+    // sandlib.py `do_ll_os__ll_os_write` (SimpleIO: fd 1/2 only).
     fn do_write(&mut self, args: &[MarshalValue], console: &mut Console) -> SandboxResult<Reply> {
         let fd = arg_int(args, 0)? as i32;
         let data = arg_bytes(args, 1)?;
@@ -388,14 +388,14 @@ impl SandboxPolicy {
         Ok(Reply::Value(MarshalValue::Str(buf)))
     }
 
-    // sandlib.py:439 `do_ll_os__ll_os_stat` (and lstat alias).
+    // sandlib.py `do_ll_os__ll_os_stat` (and lstat alias).
     fn do_stat(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let vpath = arg_path(args, 0)?;
         let node = self.get_node(&vpath)?;
         Ok(Reply::Stat(node.stat().map_err(vfs_err)?))
     }
 
-    // sandlib.py:509 `do_ll_os__ll_os_fstat`.
+    // sandlib.py `do_ll_os__ll_os_fstat`.
     fn do_fstat(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let fd = arg_int(args, 0)? as i32;
         let entry = self
@@ -405,7 +405,7 @@ impl SandboxPolicy {
         Ok(Reply::Stat(entry.node.stat().map_err(vfs_err)?))
     }
 
-    // sandlib.py:514 `do_ll_os__ll_os_lseek`.
+    // sandlib.py `do_ll_os__ll_os_lseek`.
     fn do_lseek(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let fd = arg_int(args, 0)? as i32;
         let pos = arg_int(args, 1)?;
@@ -431,7 +431,7 @@ impl SandboxPolicy {
         Ok(Reply::LongLong(newpos as i64))
     }
 
-    // sandlib.py:446 `do_ll_os__ll_os_access`.
+    // sandlib.py `do_ll_os__ll_os_access`.
     fn do_access(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let vpath = arg_path(args, 0)?;
         let mode = arg_int(args, 1)? as u32;
@@ -446,27 +446,27 @@ impl SandboxPolicy {
         }
     }
 
-    // sandlib.py:455 `do_ll_os__ll_os_isatty`.
+    // sandlib.py `do_ll_os__ll_os_isatty`.
     fn do_isatty(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let fd = arg_int(args, 0)?;
         let isatty = self.virtual_console_isatty && (fd == 0 || fd == 1 || fd == 2);
         Ok(Reply::Value(MarshalValue::Bool(isatty)))
     }
 
-    // sandlib.py:520 `do_ll_os__ll_os_getcwd`.
+    // sandlib.py `do_ll_os__ll_os_getcwd`.
     fn do_getcwd(&mut self) -> SandboxResult<Reply> {
         Ok(Reply::Value(MarshalValue::Str(
             self.virtual_cwd.as_bytes().to_vec(),
         )))
     }
 
-    // sandlib.py:523 `do_ll_os__ll_os_strerror`.
+    // sandlib.py `do_ll_os__ll_os_strerror`.
     fn do_strerror(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let errnum = arg_int(args, 0)? as i32;
         Ok(Reply::Value(MarshalValue::Str(strerror(errnum))))
     }
 
-    // sandlib.py:527 `do_ll_os__ll_os_listdir`.
+    // sandlib.py `do_ll_os__ll_os_listdir`.
     fn do_listdir(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let vpath = arg_path(args, 0)?;
         let node = self.get_node(&vpath)?;
@@ -479,7 +479,7 @@ impl SandboxPolicy {
         )))
     }
 
-    // sandlib.py:414 `do_ll_os__ll_os_getenv`.
+    // sandlib.py `do_ll_os__ll_os_getenv`.
     fn do_getenv(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let name = arg_bytes(args, 0)?;
         let value = self
@@ -491,7 +491,7 @@ impl SandboxPolicy {
         Ok(Reply::Value(value))
     }
 
-    // sandlib.py:411 `do_ll_os__ll_os_envitems`.
+    // sandlib.py `do_ll_os__ll_os_envitems`.
     fn do_envitems(&mut self) -> SandboxResult<Reply> {
         let items = self
             .virtual_env
@@ -508,7 +508,7 @@ impl SandboxPolicy {
 
     // ── SimpleIOSandboxedProc time handlers ──────────────────────────────────
 
-    // sandlib.py:380 `do_ll_time__ll_time_time`.
+    // sandlib.py `do_ll_time__ll_time_time`.
     fn do_time(&mut self) -> SandboxResult<Reply> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -517,7 +517,7 @@ impl SandboxPolicy {
         Ok(Reply::Value(MarshalValue::Float(now)))
     }
 
-    // sandlib.py:383 `do_ll_time__ll_time_clock`.
+    // sandlib.py `do_ll_time__ll_time_clock`.
     fn do_clock(&mut self) -> SandboxResult<Reply> {
         let start = *self.clock_start.get_or_insert_with(Instant::now);
         Ok(Reply::Value(MarshalValue::Float(
@@ -525,7 +525,7 @@ impl SandboxPolicy {
         )))
     }
 
-    // sandlib.py:370 `do_ll_time__ll_time_sleep`.
+    // sandlib.py `do_ll_time__ll_time_sleep`.
     fn do_sleep(&mut self, args: &[MarshalValue]) -> SandboxResult<Reply> {
         let mut seconds = arg_float(args, 0)?;
         // Reject a non-finite request (NaN/±inf) rather than looping forever or
@@ -534,7 +534,7 @@ impl SandboxPolicy {
             return Err(SandboxError::Os(libc::EINVAL));
         }
         // Sleep in 5-second chunks and poll the cancellation flag between them
-        // (sandlib.py:373's self.poll()), so a child SIGKILLed mid-sleep does
+        // (sandlib.py's self.poll()), so a child SIGKILLed mid-sleep does
         // not keep the controller parked for the full requested duration.
         while seconds > 5.0 {
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -639,7 +639,7 @@ fn encode_reply(out: &mut Vec<u8>, reply: &Reply) {
     }
 }
 
-// sandlib.py:81-94 `write_exception`.
+// sandlib.py `write_exception`.
 fn encode_exception(out: &mut Vec<u8>, exc: &SandboxError) {
     dump_int(out, code_for_error(exc), IntFlavor::Marshal);
     if let SandboxError::Os(errno) = exc {
@@ -1128,7 +1128,7 @@ mod tests {
 
     #[test]
     fn tcp_open_read_write_roundtrip() {
-        // VirtualizedSocketProc (sandlib.py:546): with allow_net on, opening
+        // VirtualizedSocketProc (sandlib.py): with allow_net on, opening
         // `tcp://host:port` connects a real socket and routes read/write to it.
         use std::net::TcpListener;
 
@@ -1186,7 +1186,7 @@ mod tests {
 
     #[test]
     fn input_log_records_guest_stdin() {
-        // setlogfile/inputlogfile (sandlib.py:334, 355-356): an fd-0 read
+        // setlogfile/inputlogfile (sandlib.py, 355-356): an fd-0 read
         // appends the bytes handed to the child into the log file.
         let mut path = std::env::temp_dir();
         path.push(format!("pyre_sandbox_inputlog_{}.log", std::process::id()));

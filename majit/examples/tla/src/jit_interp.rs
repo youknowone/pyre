@@ -53,7 +53,7 @@ impl BytecodeExt for [u8] {
     }
 }
 
-/// tla.py:101 `self.stack = [None] * 8`.
+/// tla.py `self.stack = [None] * 8`.
 const STACK_SIZE: usize = 8;
 
 struct TlaState {

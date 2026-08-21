@@ -75,7 +75,7 @@ impl OperationError {
         false
     }
 
-    /// pypy/interpreter/error.py:180-249 `normalize_exception`.
+    /// pypy/interpreter/error.py `normalize_exception`.
     ///
     /// ```python
     /// def normalize_exception(self, space):
@@ -122,7 +122,7 @@ impl OperationError {
     /// Mutates `self` to install the normalized `(w_type, w_value)` and
     /// returns the new `w_value`.
     ///
-    /// `pypy/interpreter/error.py:225-236 normalize_exception` traceback
+    /// `pypy/interpreter/error.py normalize_exception` traceback
     /// attach: the W_BaseException-typed fast path writes
     /// `w_value.w_traceback = tb` directly; the generic fallback is
     /// `space.setattr(w_value, "__traceback__", tb)`.  Pyre's
@@ -184,7 +184,7 @@ impl OperationError {
                     }
                 }
             } else {
-                // error.py:238-245 (inst, None) — `raise inst`
+                // error.py (inst, None) — `raise inst`
                 let w_inst = w_type;
                 let w_instclass = self._exception_getclass(w_inst)?;
                 if !w_value.is_null() && w_value != pyre_object::w_none() {
@@ -201,7 +201,7 @@ impl OperationError {
         Ok(w_value)
     }
 
-    /// pypy/interpreter/error.py:251-257 `_exception_getclass(space, w_inst, what="exceptions")`.
+    /// pypy/interpreter/error.py `_exception_getclass(space, w_inst, what="exceptions")`.
     ///
     /// ```python
     /// def _exception_getclass(self, space, w_inst, what="exceptions"):
@@ -236,7 +236,7 @@ impl OperationError {
         Ok(w_type)
     }
 
-    /// `pypy/interpreter/error.py:422-434 chain_exceptions` parity:
+    /// `pypy/interpreter/error.py chain_exceptions` parity:
     ///
     /// ```python
     /// def chain_exceptions(self, space, context):
@@ -307,7 +307,7 @@ pub fn exception_from_call_type_error(w_constructor: PyObjectRef, w_inst: PyObje
     ))
 }
 
-/// `pypy/interpreter/error.py:478-509 _break_context_cycle` parity —
+/// `pypy/interpreter/error.py _break_context_cycle` parity —
 /// Floyd cycle-detection over the `__context__` chain, breaking the
 /// loop by writing `None` into the offending link before the new
 /// `w_context` is attached.
@@ -419,8 +419,8 @@ pub struct PyError {
     /// Cached W_BaseException pointer — reused by to_exc_object()
     /// to avoid re-allocating an exception object that already exists.
     pub exc_object: PyObjectRef,
-    /// `pypy/interpreter/pyopcode.py:122 handle_operation_error(..., attach_tb=True)`
-    /// parity.  RERAISE opcode (`pyopcode.py:1348-1376 RERAISE`)
+    /// `pypy/interpreter/pyopcode.py handle_operation_error(..., attach_tb=True)`
+    /// parity.  RERAISE opcode (`pyopcode.py RERAISE`)
     /// surfaces the operror as `RaiseWithExplicitTraceback` which
     /// PyPy's bytecode dispatcher routes through
     /// `handle_operation_error(attach_tb=False)` to avoid stamping a
@@ -431,7 +431,7 @@ pub struct PyError {
     /// `record_application_traceback`.  Default `true` for any
     /// normally-constructed PyError; reraise flips it off.
     pub attach_tb: bool,
-    /// `pypy/interpreter/error.py:410-420 record_context` parity — the
+    /// `pypy/interpreter/error.py record_context` parity — the
     /// once-only latch for implicit `__context__` chaining:
     ///
     /// ```python
@@ -453,7 +453,7 @@ pub struct PyError {
     /// merely unwinding through.  Set on the first dispatch regardless of
     /// whether an active exception was found, mirroring the `finally`.
     pub context_recorded: bool,
-    /// `pypy/interpreter/pyopcode.py:122 handle_operation_error(..., reraise_lasti=-1)`
+    /// `pypy/interpreter/pyopcode.py handle_operation_error(..., reraise_lasti=-1)`
     /// parity.  RERAISE N reads the original raise-site lasti from the
     /// value stack and carries it through `RaiseWithExplicitTraceback`
     /// so the next exception-table dispatch can push the original
@@ -542,7 +542,7 @@ pub enum PyErrorKind {
     OSError,
     /// Subclass of OSError raised when a file or directory is not found.
     FileNotFoundError,
-    /// pypy/interpreter/baseobjspace.py:419-420 DescrMismatch.
+    /// pypy/interpreter/baseobjspace.py DescrMismatch.
     ///
     /// ```python
     /// class DescrMismatch(Exception):
@@ -556,7 +556,7 @@ pub enum PyErrorKind {
     DescrMismatch,
     /// Raised by sys.exit(). Not a subclass of Exception.
     SystemExit,
-    /// rpython/jit/metainterp/compile.py:1090 `memory_error = MemoryError()`
+    /// rpython/jit/metainterp/compile.py `memory_error = MemoryError()`
     /// — raised by `PropagateExceptionDescr.handle_fail` when a JIT
     /// malloc helper returns NULL (true OOM).  Not raised by user code
     /// in pyre; the runtime allocator never returns NULL except on
@@ -570,14 +570,14 @@ pub enum PyErrorKind {
     /// Internal JIT trace-abort signal. This is not a Python exception
     /// class and must be intercepted before user-visible error handling.
     TraceAbort,
-    /// `pypy/module/exceptions/interp_exceptions.py:474 W_LookupError`
+    /// `pypy/module/exceptions/interp_exceptions.py W_LookupError`
     /// — intermediate parent of IndexError / KeyError.  Distinct
     /// PyErrorKind variant so `from_exc_object(LookupError)` /
     /// `to_exc_object()` / `render_exception` round-trip preserves
     /// the exact class rather than collapsing it onto IndexError or
     /// Exception.
     LookupError,
-    /// `pypy/module/exceptions/interp_exceptions.py:418 W_UnicodeError`
+    /// `pypy/module/exceptions/interp_exceptions.py W_UnicodeError`
     /// — intermediate parent of UnicodeDecodeError / UnicodeEncodeError,
     /// itself a subclass of ValueError.
     UnicodeError,
@@ -704,7 +704,7 @@ impl PyError {
     /// `e.end_lineno` / `e.end_offset` read back once the instance is
     /// materialised.  `args` becomes `(msg, (filename, lineno, offset,
     /// text, end_lineno, end_offset))`, the shape
-    /// `interp_exceptions.py:836 W_SyntaxError.descr_init` stores and
+    /// `interp_exceptions.py W_SyntaxError.descr_init` stores and
     /// the dedicated `W_SyntaxError` slots and `args_w` both receive. `text` is the
     /// offending source line (`None` → `text` reads back as `None`).
     #[allow(clippy::too_many_arguments)]
@@ -954,7 +954,7 @@ impl PyError {
         Self::new(PyErrorKind::KeyError, msg)
     }
 
-    /// `baseobjspace.py:1284 raise_key_error(w_key)` parity — builds
+    /// `baseobjspace.py raise_key_error(w_key)` parity — builds
     /// `KeyError(w_key)` with the key itself (not a stringified copy)
     /// as args[0], so callers reading `e.args[0]` get back the missing
     /// key object.  The display message is the key's repr, matching
@@ -1357,7 +1357,7 @@ impl PyError {
         }
     }
 
-    /// pypy/module/_weakref/interp__weakref.py:347 — raised by `force()`
+    /// pypy/module/_weakref/interp__weakref.py — raised by `force()`
     /// when the referent of a proxy is no longer alive.
     pub fn reference_error(msg: impl Into<Wtf8Buf>) -> Self {
         Self::new(PyErrorKind::ReferenceError, msg)
@@ -1367,7 +1367,7 @@ impl PyError {
         Self::new(PyErrorKind::RecursionError, msg)
     }
 
-    /// rpython/jit/metainterp/compile.py:1090 `memory_error = MemoryError()`
+    /// rpython/jit/metainterp/compile.py `memory_error = MemoryError()`
     /// — module-level singleton instance the JIT raises through
     /// `PropagateExceptionDescr.handle_fail` when a malloc helper
     /// returns NULL.
@@ -1491,7 +1491,7 @@ impl PyError {
         Ok(w_value)
     }
 
-    /// pypy/interpreter/error.py:263-317 `write_unraisable`, with the
+    /// pypy/interpreter/error.py `write_unraisable`, with the
     /// `with_traceback=False` first-line shape.
     pub fn write_unraisable(
         &mut self,
@@ -1506,7 +1506,7 @@ impl PyError {
         if w_type.is_null() {
             w_type = pyre_object::w_none();
         }
-        // `error.py:271` — `w_tb = self.get_w_traceback(space)`, the slot
+        // `error.py` — `w_tb = self.get_w_traceback(space)`, the slot
         // read with its escape mark.
         let mut w_tb = if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
             unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(w_value) }
@@ -1566,7 +1566,7 @@ impl PyError {
                     if w_type.is_null() {
                         w_type = pyre_object::w_none();
                     }
-                    // `error.py:312` — same `get_w_traceback` read
+                    // `error.py` — same `get_w_traceback` read
                     // for the exception the hook itself raised.
                     w_tb = if !hook_value.is_null()
                         && unsafe { pyre_object::is_exception(hook_value) }
@@ -1621,7 +1621,7 @@ impl PyError {
         true
     }
 
-    /// pypy/interpreter/error.py:318-347 `write_unraisable_default`.
+    /// pypy/interpreter/error.py `write_unraisable_default`.
     pub fn write_unraisable_default(
         space: PyObjectRef,
         w_type: PyObjectRef,
@@ -1837,7 +1837,7 @@ impl PyError {
     }
 }
 
-/// `error.py:4-7 wrap_pos` — a zero position means "unknown" and reads back as
+/// `error.py wrap_pos` — a zero position means "unknown" and reads back as
 /// `None`; every other value keeps its integer.  `lineno` deliberately skips
 /// this: a location-less parser error still reports line 0.
 fn wrap_pos(num: i64) -> PyObjectRef {
@@ -1973,7 +1973,7 @@ pub fn write_exception_from_parts<W: Write>(
         }
     }
 
-    // `lib-python/3/traceback.py:1047-1188 TracebackException.__init__`
+    // `lib-python/3/traceback.py TracebackException.__init__`
     // records every visited exception before following cause/context edges.
     // Keep the same set for the complete structured render so cycles terminate
     // and ExceptionGroup leaves share the chain census.
@@ -2088,7 +2088,7 @@ pub fn eprint_syntax_error(err: &PyError) {
     emit_report_to_host_stderr(&buf);
 }
 
-/// `lib-python/3/traceback.py:980-1000 _ExceptionPrintContext` and
+/// `lib-python/3/traceback.py _ExceptionPrintContext` and
 /// `:1468-1565 TracebackException.format` state.  CPython shares one visited
 /// set across the complete cause/context/ExceptionGroup tree.
 struct ExceptionPrintContext {
@@ -2439,7 +2439,7 @@ fn write_exception_notes<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io:
         Ok(_) => return Ok(()),
         Err(err) if err.kind == PyErrorKind::AttributeError => return Ok(()),
         Err(mut err) => {
-            // `traceback.py:1068-1072 TracebackException.__init__` preserves
+            // `traceback.py TracebackException.__init__` preserves
             // failures raised by a custom `__notes__` descriptor as a
             // synthetic note instead of silently discarding the diagnostic.
             let err_obj = err.to_exc_object();
@@ -2889,7 +2889,7 @@ fn exception_suggestion(exc_slot: usize) -> Option<String> {
     suffix
 }
 
-/// `pypy/interpreter/error.py:125-158 print_app_tb_only` parity —
+/// `pypy/interpreter/error.py print_app_tb_only` parity —
 /// walk the chained `PyTraceback` head→tail (outermost → innermost)
 /// and print each frame as `File "<path>", line N, in <name>` plus the
 /// source line.  Silently no-ops when `err.exc_object` is null, the
@@ -3205,7 +3205,7 @@ fn traceback_anchors(raw_line: &str, start_col: usize, end_col: usize) -> Option
 
 /// Open `filename` and return its `lineno`-th line (1-indexed).  Returns
 /// `None` for synthetic / unreadable sources — matches PyPy's silent
-/// `linecache.getline` fallback at `error.py:150`.
+/// `linecache.getline` fallback at `error.py`.
 ///
 /// The name arrives as the filesystem bytes the code object carries, because
 /// `linecache.getline` is handed `co_filename` itself: a path spelling a byte
@@ -3299,7 +3299,7 @@ pub fn eprint_exception(err: &PyError, include_traceback: bool) {
     emit_report_to_host_stderr(&buf);
 }
 
-/// `app_main.py:114-129 handle_sys_exit` — `exitcode = e.code`; `None` exits
+/// `app_main.py handle_sys_exit` — `exitcode = e.code`; `None` exits
 /// 0; otherwise `int(exitcode)`, and a value `int()` rejects is printed to
 /// stderr with exit status 1. `e.code` itself is `args[0]` for a 1-arg raise
 /// and the whole args tuple otherwise (`interp_exceptions.py:993-998

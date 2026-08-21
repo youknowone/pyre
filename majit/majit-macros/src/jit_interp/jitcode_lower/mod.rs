@@ -256,7 +256,7 @@ pub struct LowererConfig {
     /// path segments, value = IR opcode name (e.g. "IntAdd").  When
     /// `lower_native_int_binop_call` encounters a call whose path matches a
     /// key, it emits the named IR opcode directly — bypassing the call-policy
-    /// machinery.  jtransform.py:2030 `_handle_int_special()` parity.
+    /// machinery.  jtransform.py `_handle_int_special()` parity.
     pub(super) native_int_binops: Vec<(Vec<String>, String)>,
     /// Pure unary tag-small helpers.  Key = canonical func path segments.
     /// `lower_native_tag_small_call` emits `(x << 1) | 1` directly.
@@ -362,7 +362,7 @@ pub(crate) struct InlineHelperJitCode {
     pub return_kind: InlineReturnKind,
     /// Helper-side per-marker liveness prebuild tokens. Threaded into the
     /// parent's `__prebuild_jitcode_liveness_*` so RPython
-    /// `pyjitpl.py:2255 finish_setup`'s "all `-live-` entries land in
+    /// `pyjitpl.py finish_setup`'s "all `-live-` entries land in
     /// `asm.all_liveness` before the snapshot" invariant is preserved
     /// when the helper is invoked at trace time. Without this thread, the
     /// helper's `JitCodeBuilder::finalize_liveness(asm)` at trace time
@@ -402,7 +402,7 @@ pub(super) enum ValueKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CondCallEffectSlot {
     CanRaise,
-    /// `EF_CANNOT_RAISE` — `call.py:303 getcalldescr`'s non-elidable
+    /// `EF_CANNOT_RAISE` — `call.py getcalldescr`'s non-elidable
     /// `else` branch.  Selected by a `residual_*_cannot_raise` policy
     /// when the producer statically knows the callee cannot raise.
     CannotRaise,
@@ -445,7 +445,7 @@ impl CondCallEffectSlot {
     /// Emit the `EffectInfoSlot` token for a statically-known wrapped
     /// `CallPolicyKind`.  Used by the `*Wrapped` lowering arms so the
     /// registered call-target descr carries the real effect classification
-    /// (`call.py:282-303 getcalldescr`) rather than a blanket `CanRaise`.
+    /// (`call.py getcalldescr`) rather than a blanket `CanRaise`.
     /// Falls back to `CanRaise` for `MayForce` / `ReleaseGil` / `Inline*`
     /// kinds whose conditional-call slot is `None` in
     /// `call_policy_effect_slot`; the actual call surface dispatches them
@@ -460,7 +460,7 @@ impl CondCallEffectSlot {
     /// Emit a runtime `match __policy { ... }` expression that resolves the
     /// `EffectInfoSlot` from the helper's `_jit_helper_policy` byte.  Used
     /// by the `Infer` lowering paths where the policy kind is only known at
-    /// runtime (`call.py:282-303 getcalldescr` analyzer chain executed on
+    /// runtime (`call.py getcalldescr` analyzer chain executed on
     /// the live byte).
     pub(super) fn slot_from_policy_tokens() -> TokenStream {
         quote! {
@@ -1356,7 +1356,7 @@ impl LowererConfig {
     /// The struct that DECLARES `field`, following inlined leading
     /// substructures outward-in.
     ///
-    /// `rclass.py:987-1001 InstanceRepr.getfield` resolves a field against the
+    /// `rclass.py InstanceRepr.getfield` resolves a field against the
     /// repr that owns it: `if attr in self.fields` … else recurse into
     /// `self.rbase` with `force_cast=True`. The cast is why
     /// `jtransform.py:881` always reads the descr off the declaring struct,
@@ -1614,7 +1614,7 @@ pub(super) struct Binding {
 /// Mirror of RPython `rpython/jit/codewriter/flatten.py:Register(kind, index)`.
 /// Each emitted register carries its bank with it; the liveness walker
 /// (`liveness.py:33-79`) keeps a single `set()` of `Register` objects per
-/// marker, and `assembler.py:225-232 get_liveness_info(args, kind)` filters
+/// marker, and `assembler.py get_liveness_info(args, kind)` filters
 /// by `reg.kind == kind` at encode time to split into the per-bank bitsets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(super) struct Register {
@@ -1690,7 +1690,7 @@ impl Register {
 //
 // `op_metadata[i]` describes the i-th emitted op so a downstream backward
 // walker can produce per-marker live sets matching RPython
-// `liveness.py:33-79 _compute_liveness_must_continue`. Currently only the
+// `liveness.py _compute_liveness_must_continue`. Currently only the
 // `LiveMarker` sites are populated.
 //
 // `kind` and `control` are split because future op categories (binop,
@@ -1736,29 +1736,29 @@ pub(super) enum OpKind {
     SetfieldGc,
     /// `raw_store_i` — store an int into raw native memory at a byte
     /// offset. `reads` carries `[base_reg, ea_reg, value_reg]` (all int);
-    /// no writes. jtransform.py:1156-1163 `rewrite_op_raw_store`.
+    /// no writes. jtransform.py `rewrite_op_raw_store`.
     RawStore,
     /// `raw_load_i` — load an int from raw native memory at a byte offset.
     /// `reads` carries `[base_reg, ea_reg]` (int); `writes` carries the
-    /// result reg. jtransform.py:1165-1171 `rewrite_op_raw_load`.
+    /// result reg. jtransform.py `rewrite_op_raw_load`.
     RawLoad,
     /// `load_state_*` / `store_state_*` family.
     StateField,
     /// `int_guard_value` / `float_guard_value` / `ref_guard_value`.
     GuardValue,
     /// `assert_not_none` — record that a ref operand is non-null
-    /// (pyjitpl.py:385-391 opimpl_assert_not_none).
+    /// (pyjitpl.py opimpl_assert_not_none).
     AssertNotNone,
     /// `record_exact_class` — record that a ref operand's class is a
-    /// known constant (pyjitpl.py:393-410 opimpl_record_exact_class).
+    /// known constant (pyjitpl.py opimpl_record_exact_class).
     RecordExactClass,
     /// `record_known_result_*` — pure-call result hint, no real call.
     RecordKnownResult,
     /// `jit_merge_point` portal merge-point marker.
-    /// interp_jit.py:88-90 pypyjitdriver.jit_merge_point(...).
+    /// interp_jit.py pypyjitdriver.jit_merge_point(...).
     JitMergePoint,
     /// `loop_header` loop-header marker before the dispatch body.
-    /// jtransform.py:1714-1718 handle_jit_marker__loop_header.
+    /// jtransform.py handle_jit_marker__loop_header.
     LoopHeader,
     /// Builder-side auxiliary statement that emits no BC_* op. Examples:
     /// `let #label = __builder.new_label();` (label allocation), Rust
@@ -1789,7 +1789,7 @@ pub(super) enum ControlFlowClass {
     /// `*_return` family — terminal op with no fall-through and no
     /// successor. Walker resets `alive` to empty; the op's own register
     /// reads are still added as uses so the source value stays live.
-    /// blackhole.py:841-862 bhimpl_int_return / ref_return / float_return /
+    /// blackhole.py bhimpl_int_return / ref_return / float_return /
     /// void_return.
     Terminal,
 }
@@ -1928,7 +1928,7 @@ impl OpMeta {
     }
 
     /// Two-register conditional guard for `goto_if_not_int_eq(a, b, target)`.
-    /// jtransform.py:196-225 `optimize_goto_if_not` fuses `int_eq + goto_if_not`
+    /// jtransform.py `optimize_goto_if_not` fuses `int_eq + goto_if_not`
     /// into `goto_if_not_int_eq/iiL`. Both `a_reg` and `b_reg` are read uses.
     pub(super) fn conditional_guard_int_eq(
         a_reg: Register,
@@ -2275,7 +2275,7 @@ mod tests {
     fn remove_repeated_live_keeps_conditional_only_runs_unmerged() {
         // A run consisting entirely of conditional markers stays
         // unmerged: unioning their reads would over-capture vs PyPy's
-        // per-site `liveness.py:111-115` `liveset.update(live[1:])`
+        // per-site `liveness.py` `liveset.update(live[1:])`
         // (which only ever sees `-live-`s that actually exist).  Each
         // marker's BC_LIVE fires (or not) on its own condition and
         // captures only its own alive set.
@@ -2388,7 +2388,7 @@ mod tests {
 
     #[test]
     fn get_liveness_info_filters_by_kind() {
-        // RPython `assembler.py:225-232 get_liveness_info(args, kind)` parity:
+        // RPython `assembler.py get_liveness_info(args, kind)` parity:
         // a single set of typed Registers projected per bank yields the same
         // sorted u8 indices RPython would emit into the BC_LIVE bitset.
         let set: BTreeSet<Register> = [
@@ -2409,7 +2409,7 @@ mod tests {
     fn liveness_triple_keeps_per_bank_sort_order() {
         // BTreeSet<Register> orders by (kind, index); `liveness_triple` must
         // surface that ordering as three independent sorted Vec<u8> slices,
-        // matching `assembler.py:147-157 _encode_liveness` which encodes each
+        // matching `assembler.py _encode_liveness` which encodes each
         // bank as a sorted bitset.
         let set: BTreeSet<Register> = [
             Register::float(9),
@@ -2653,7 +2653,7 @@ mod tests {
 
     #[test]
     fn conditional_call_loopinvariant_omits_live_marker() {
-        // `call.py:249-251 getcalldescr` forbids non-void args for
+        // `call.py getcalldescr` forbids non-void args for
         // loop-invariant direct_call, so the cond_call shape must
         // also have no func args when the slot is `LoopInvariant`.
         let mut lowerer = lowerer_with_call_policy(
@@ -2684,7 +2684,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "arguments not supported for loop-invariant function")]
     fn conditional_call_loopinvariant_rejects_func_args() {
-        // `call.py:249-251 getcalldescr` asserts `not NON_VOID_ARGS`
+        // `call.py getcalldescr` asserts `not NON_VOID_ARGS`
         // for loop-invariant direct_call.  The cond_call macro path
         // mirrors that assert at expansion time.
         let mut lowerer = lowerer_with_call_policy(

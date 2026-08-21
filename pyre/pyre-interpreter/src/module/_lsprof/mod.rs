@@ -9,7 +9,7 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// `interp_lsprof.py:305 W_Profiler`.  The entry trees and the context stack
+/// `interp_lsprof.py W_Profiler`.  The entry trees and the context stack
 /// belong to the wrapper object.  The mapdict prefix is required because
 /// `cProfile.Profile` subclasses the type.
 #[crate::pyre_class("_lsprof.Profiler")]
@@ -40,7 +40,7 @@ const _: () = assert!(
     "W_Profiler must keep W_ObjectObject's storage offset"
 );
 
-/// `interp_lsprof.py:44 W_StatsEntry`.  Its typedef publishes no `__new__`, so
+/// `interp_lsprof.py W_StatsEntry`.  Its typedef publishes no `__new__`, so
 /// no subclass of it can be instantiated and it carries no mapdict prefix; the
 /// two references below are ordinary inline `gc_ptr_offsets` edges.
 #[crate::pyre_class("_lsprof.profiler_entry")]
@@ -53,7 +53,7 @@ pub struct W_StatsEntry {
     w_calls: PyObjectRef,
 }
 
-/// `interp_lsprof.py:78 W_StatsSubEntry`, likewise not instantiable and
+/// `interp_lsprof.py W_StatsSubEntry`, likewise not instantiable and
 /// therefore prefix-free.
 #[crate::pyre_class("_lsprof.profiler_subentry")]
 pub struct W_StatsSubEntry {

@@ -21,7 +21,7 @@ pub enum FindOrCountResult {
     NotFound,
 }
 
-/// `listobject.py:417` `W_ListObject.find_or_count`.
+/// `listobject.py` `W_ListObject.find_or_count`.
 ///
 /// Dispatches to the current strategy's typed fast path via
 /// `w_list_find_or_count_fast`; when that signals `NeedsGeneric`, runs
@@ -42,7 +42,7 @@ pub fn w_list_find_or_count(
         ListFindFast::NotFound => return Ok(FindOrCountResult::NotFound),
         ListFindFast::NeedsGeneric => {}
     }
-    // listobject.py:941-957 ListStrategy.find_or_count:
+    // listobject.py ListStrategy.find_or_count:
     //     while i < stop and i < w_list.length():
     //         if space.eq_w(w_list.getitem(i), w_item):
     //             ...
@@ -83,7 +83,7 @@ pub fn w_list_find_or_count(
     }
 }
 
-/// `listobject.py:782` `W_ListObject.descr_remove`.
+/// `listobject.py` `W_ListObject.descr_remove`.
 ///
 /// Runs `find_or_count(value, 0, sys.maxint)`, pops at the returned
 /// index when still within bounds (listobject.py:791 guard against
@@ -99,7 +99,7 @@ pub fn w_list_remove(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyErr
         }
         FindOrCountResult::Count(_) => unreachable!("find_or_count with count=false returns Count"),
     };
-    // listobject.py:791: `if i < self.length():  # otherwise list was mutated`
+    // listobject.py: `if i < self.length():  # otherwise list was mutated`
     let length = unsafe { pyre_object::w_list_len(obj) } as i64;
     if i < length {
         unsafe {

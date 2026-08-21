@@ -14,7 +14,7 @@
 //! layout — so the accessors are free functions keyed on a raw
 //! `*const JitFrame` or on a base address.
 //!
-//! The `AbstractCPU` base class (rpython/jit/backend/model.py:95-133)
+//! The `AbstractCPU` base class (rpython/jit/backend/model.py)
 //! declares the abstract contract for these accessors; all entries
 //! below match those signatures.
 
@@ -22,7 +22,7 @@ use majit_ir::FailDescr;
 
 use crate::jitframe::{FIRST_ITEM_OFFSET, JitFrame};
 
-/// llmodel.py:412-420 — get_latest_descr.
+/// llmodel.py — get_latest_descr.
 ///
 /// Returns the `jf_descr` field, which holds the descr pointer of
 /// the last GUARD or FINISH operation executed.
@@ -48,7 +48,7 @@ pub unsafe fn set_latest_descr(ptr: *mut JitFrame, descr: usize) {
     }
 }
 
-/// llmodel.py:422-424 — `_decode_pos(deadframe, index)`.
+/// llmodel.py — `_decode_pos(deadframe, index)`.
 ///
 /// Translate one `rd_locs[index]` entry into the jitframe slot
 /// `get_int_value_direct(jf, slot)` consumes.  Returns `None` for
@@ -68,7 +68,7 @@ pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> 
     }
 }
 
-/// llmodel.py:440-444 — `get_int_value_direct(deadframe, pos)`.
+/// llmodel.py — `get_int_value_direct(deadframe, pos)`.
 ///
 /// Read the `Signed` slot at pre-decoded position `slot` from
 /// `jf_frame`.  `slot` is a post-`rd_locs[i]` slot index (i.e.
@@ -108,7 +108,7 @@ pub unsafe fn set_int_value(ptr: *mut JitFrame, slot: usize, value: isize) {
     }
 }
 
-/// llmodel.py:449-453 — `get_ref_value_direct(deadframe, pos)`.
+/// llmodel.py — `get_ref_value_direct(deadframe, pos)`.
 ///
 /// Read the slot at pre-decoded position `slot` as a reference
 /// (pointer-sized).  See `get_int_value_direct` for the slot/index
@@ -124,7 +124,7 @@ pub unsafe fn get_ref_value_direct(ptr: *const JitFrame, slot: usize) -> usize {
     }
 }
 
-/// llmodel.py:458-462 — `get_float_value_direct(deadframe, pos)`.
+/// llmodel.py — `get_float_value_direct(deadframe, pos)`.
 ///
 /// # Safety
 /// `ptr` must point to a valid JitFrame with at least `slot + 1`
@@ -136,7 +136,7 @@ pub unsafe fn get_float_value_direct(ptr: *const JitFrame, slot: usize) -> u64 {
     }
 }
 
-/// llmodel.py:481-488 — `write_int_at_mem(gcref, ofs, size, newvalue)`.
+/// llmodel.py — `write_int_at_mem(gcref, ofs, size, newvalue)`.
 ///
 /// Stores the low `size` bytes of `newvalue` at `base + ofs`.
 ///
@@ -144,7 +144,7 @@ pub unsafe fn get_float_value_direct(ptr: *const JitFrame, slot: usize) -> u64 {
 /// field narrower than a word is a real field, and a store that ignores
 /// `size` writes over whatever follows it in the struct.
 ///
-/// Upstream walks `unroll_basic_sizes` (symbolic.py:73-77 — word, char,
+/// Upstream walks `unroll_basic_sizes` (symbolic.py — word, char,
 /// short, int) and falls through to
 /// `raise NotImplementedError("size = %d" % size)` when nothing
 /// matches. A size not in that set means the descriptor disagrees with
@@ -177,10 +177,10 @@ pub unsafe fn write_int_at_mem(base: usize, ofs: usize, size: usize, newvalue: i
     }
 }
 
-/// llmodel.py:495-497 — `write_ref_at_mem(gcref, ofs, newvalue)`.
+/// llmodel.py — `write_ref_at_mem(gcref, ofs, newvalue)`.
 ///
 /// Pointer-width store. Upstream takes no `size` here: pointer fields
-/// have one width, which is why `bh_setfield_gc_r` (llmodel.py:723-725)
+/// have one width, which is why `bh_setfield_gc_r` (llmodel.py)
 /// unpacks only the offset while `bh_setfield_gc_i` unpacks the size
 /// too.
 ///
@@ -196,11 +196,11 @@ pub unsafe fn write_ref_at_mem(base: usize, ofs: usize, newvalue: usize) {
     unsafe { (base.wrapping_add(ofs) as *mut usize).write_unaligned(newvalue) }
 }
 
-/// llmodel.py:504-506 — `write_float_at_mem(gcref, ofs, newvalue)`.
+/// llmodel.py — `write_float_at_mem(gcref, ofs, newvalue)`.
 ///
 /// `FLOATSTORAGE`-width store. Like the ref store this takes no `size`:
-/// floats are excluded from `unroll_basic_sizes` (symbolic.py:78) and
-/// `bh_setfield_gc_f` (llmodel.py:730-734) unpacks only the offset.
+/// floats are excluded from `unroll_basic_sizes` (symbolic.py) and
+/// `bh_setfield_gc_f` (llmodel.py) unpacks only the offset.
 ///
 /// # Safety
 /// `base + ofs` must be a writable float-width field.
@@ -208,7 +208,7 @@ pub unsafe fn write_float_at_mem(base: usize, ofs: usize, newvalue: f64) {
     unsafe { (base.wrapping_add(ofs) as *mut f64).write_unaligned(newvalue) }
 }
 
-/// llmodel.py:248-251 — get_savedata_ref.
+/// llmodel.py — get_savedata_ref.
 ///
 /// # Safety
 /// `ptr` must point to a valid JitFrame payload.
@@ -216,7 +216,7 @@ pub unsafe fn get_savedata_ref(ptr: *const JitFrame) -> usize {
     unsafe { (*ptr).jf_savedata }
 }
 
-/// llmodel.py:244-246 — set_savedata_ref.
+/// llmodel.py — set_savedata_ref.
 ///
 /// # Safety
 /// `ptr` must point to a valid JitFrame payload.

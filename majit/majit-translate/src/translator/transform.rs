@@ -13,18 +13,18 @@
 //! ```
 //!
 //! Port coverage:
-//!   - `checkgraphs` (transform.py:13-19)
-//!   - `fully_annotated_blocks` (transform.py:21-25)
-//!   - `transform_allocate` (transform.py:36-50)
-//!   - `transform_extend_with_str_slice` (transform.py:59-75)
-//!   - `transform_extend_with_char_count` (transform.py:84-106)
-//!   - `transform_list_contains` (transform.py:115-134)
-//!   - `transform_dead_op_vars` (transform.py:137-143) — forwards to
+//!   - `checkgraphs` (transform.py)
+//!   - `fully_annotated_blocks` (transform.py)
+//!   - `transform_allocate` (transform.py)
+//!   - `transform_extend_with_str_slice` (transform.py)
+//!   - `transform_extend_with_char_count` (transform.py)
+//!   - `transform_list_contains` (transform.py)
+//!   - `transform_dead_op_vars` (transform.py) — forwards to
 //!     [`crate::translator::simplify::transform_dead_op_vars_in_blocks`].
 //!   - `transform_dead_code` + `cutoff_alwaysraising_block`.
 //!   - `default_extra_passes` + `transform_graph`.
 //!
-//! `insert_ll_stackcheck` (transform.py:200-243) is rtyper-phase and
+//! `insert_ll_stackcheck` (transform.py) is rtyper-phase and
 //! therefore out of scope for the annotator-phase port.
 
 use std::collections::{HashMap, HashSet};
@@ -39,7 +39,7 @@ use crate::flowspace::model::{
     HostObject, Link, LinkKey, LinkRef, SpaceOperation, Variable, checkgraph,
 };
 
-/// RPython `transform.py:13-19` — `checkgraphs(self, blocks)`.
+/// RPython `transform.py` — `checkgraphs(self, blocks)`.
 ///
 /// ```python
 /// def checkgraphs(self, blocks):
@@ -75,7 +75,7 @@ pub fn checkgraphs(ann: &RPythonAnnotator, blocks: &[BlockRef]) {
     }
 }
 
-/// RPython `transform.py:21-25` — `fully_annotated_blocks(self)`.
+/// RPython `transform.py` — `fully_annotated_blocks(self)`.
 ///
 /// ```python
 /// def fully_annotated_blocks(self):
@@ -113,7 +113,7 @@ pub fn fully_annotated_blocks(ann: &RPythonAnnotator) -> Vec<BlockRef> {
 /// lookups downstream).
 pub(crate) type TransformPass = fn(&RPythonAnnotator, &[BlockRef]);
 
-/// RPython `transform.py:246-251` — `default_extra_passes = [...]`.
+/// RPython `transform.py` — `default_extra_passes = [...]`.
 ///
 /// ```python
 /// default_extra_passes = [
@@ -198,7 +198,7 @@ pub fn transform_graph(
 }
 
 /// Collapse duplicates by block identity, mirroring upstream's
-/// `dict.fromkeys(block_subset)` de-duplication step (transform.py:262).
+/// `dict.fromkeys(block_subset)` de-duplication step (transform.py).
 fn dedupe_blocks(blocks: &[BlockRef]) -> Vec<BlockRef> {
     let mut seen: HashSet<BlockKey> = HashSet::new();
     let mut out = Vec::with_capacity(blocks.len());
@@ -360,7 +360,7 @@ pub(crate) fn cutoff_block_trace(ann: &RPythonAnnotator, block: &BlockRef) -> Cu
     cutoff_block_trace_with_counts(ann, block, n, total)
 }
 
-/// RPython `transform.py:167-198` — `cutoff_alwaysraising_block(self, block)`.
+/// RPython `transform.py` — `cutoff_alwaysraising_block(self, block)`.
 ///
 /// ```python
 /// def cutoff_alwaysraising_block(self, block):
@@ -523,7 +523,7 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
     let _ = ann.bookkeeper.getuniqueclassdef(&assert_err_class);
 }
 
-/// RPython `transform.py:137-143` — `transform_dead_op_vars(ann, blocks)`.
+/// RPython `transform.py` — `transform_dead_op_vars(ann, blocks)`.
 ///
 /// ```python
 /// def transform_dead_op_vars(ann, block_subset):
@@ -557,7 +557,7 @@ pub fn transform_dead_op_vars(ann: &RPythonAnnotator, block_subset: &[BlockRef])
     );
 }
 
-/// RPython `transform.py:36-50` — `transform_allocate(self, block_subset)`.
+/// RPython `transform.py` — `transform_allocate(self, block_subset)`.
 ///
 /// ```python
 /// def transform_allocate(self, block_subset):
@@ -616,7 +616,7 @@ pub fn transform_allocate(_ann: &RPythonAnnotator, block_subset: &[BlockRef]) {
     }
 }
 
-/// RPython `transform.py:59-75` — `transform_extend_with_str_slice(self, block_subset)`.
+/// RPython `transform.py` — `transform_extend_with_str_slice(self, block_subset)`.
 ///
 /// ```python
 /// def transform_extend_with_str_slice(self, block_subset):
@@ -692,7 +692,7 @@ pub fn transform_extend_with_str_slice(ann: &RPythonAnnotator, block_subset: &[B
     }
 }
 
-/// RPython `transform.py:84-106` — `transform_extend_with_char_count(self, block_subset)`.
+/// RPython `transform.py` — `transform_extend_with_char_count(self, block_subset)`.
 ///
 /// ```python
 /// def transform_extend_with_char_count(self, block_subset):
@@ -776,7 +776,7 @@ pub fn transform_extend_with_char_count(ann: &RPythonAnnotator, block_subset: &[
     }
 }
 
-/// RPython `transform.py:115-134` — `transform_list_contains(self, block_subset)`.
+/// RPython `transform.py` — `transform_list_contains(self, block_subset)`.
 ///
 /// ```python
 /// def transform_list_contains(self, block_subset):

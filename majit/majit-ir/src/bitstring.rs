@@ -6,7 +6,7 @@
 //! sequence from a list of indices; `bitcheck` queries one bit; `num_bits`
 //! returns the total bit width.
 
-/// `bitstring.py:3-13` `make_bitstring(lst)`.
+/// `bitstring.py` `make_bitstring(lst)`.
 ///
 /// Returns an empty byte vector for an empty index list (matching
 /// upstream's `''` empty-string return). Otherwise allocates
@@ -24,7 +24,7 @@ pub fn make_bitstring(lst: &[u32]) -> Vec<u8> {
     entries
 }
 
-/// `bitstring.py:15-20` `bitcheck(bitstring, n)`.
+/// `bitstring.py` `bitcheck(bitstring, n)`.
 ///
 /// Returns `false` when `n`'s byte index is outside the bitstring's
 /// length, mirroring upstream's `byte_number >= len(bitstring)` short
@@ -38,7 +38,7 @@ pub fn bitcheck(bitstring: &[u8], n: u32) -> bool {
     (bitstring[byte_number] & (1u8 << (n & 7))) != 0
 }
 
-/// `bitstring.py:22-23` `num_bits(bitstring)`.
+/// `bitstring.py` `num_bits(bitstring)`.
 pub fn num_bits(bitstring: &[u8]) -> usize {
     bitstring.len() << 3
 }

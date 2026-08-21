@@ -4,7 +4,7 @@
 //! of a virtualizable are "green" (loop-invariant) and can be promoted
 //! to constants during tracing.
 
-/// greenfield.py:1-21 `class GreenFieldInfo(object)`.
+/// greenfield.py `class GreenFieldInfo(object)`.
 ///
 /// ```python
 /// class GreenFieldInfo(object):
@@ -32,11 +32,11 @@
 /// without a back-pointer to the runtime jitdriver record.
 #[derive(Debug, Clone)]
 pub struct GreenFieldInfo {
-    /// greenfield.py:14 `self.red_index = jd.jitdriver.reds.index(objname)`
+    /// greenfield.py `self.red_index = jd.jitdriver.reds.index(objname)`
     /// — slot in `jitdriver.reds` that holds the unique green-field
     /// owning object instance.
     pub red_index: usize,
-    /// greenfield.py:18 `self.green_fields = jd.jitdriver.ll_greenfields.values()`.
+    /// greenfield.py `self.green_fields = jd.jitdriver.ll_greenfields.values()`.
     pub green_fields: Vec<(String, String)>,
     /// greenfield.py:19-20 `self.green_field_descrs = [cpu.fielddescrof(...)]`.
     pub green_field_descrs: Vec<u32>,

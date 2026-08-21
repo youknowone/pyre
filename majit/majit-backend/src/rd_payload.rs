@@ -1,4 +1,4 @@
-//! `compile.py:855` `AbstractResumeGuardDescr._attrs_ = ('rd_numb',
+//! `compile.py` `AbstractResumeGuardDescr._attrs_ = ('rd_numb',
 //! 'rd_consts', 'rd_virtuals', 'rd_pendingfields', 'status')`.
 //!
 //! Resume-payload backing store shared between metainterp and backend
@@ -11,14 +11,14 @@ use std::sync::Arc;
 
 use majit_ir::{Const, GuardPendingFieldEntry, RdVirtualInfo, SharedConstPool};
 
-/// Resume-payload backing store for ResumeGuardDescr (`compile.py:855`).
+/// Resume-payload backing store for ResumeGuardDescr (`compile.py`).
 ///
 /// Mutated through `set_rd_*` setters — the optimizer's
 /// `store_final_boxes_in_guard` (compile.py:869) replaces the whole
 /// slot post-numbering.  In-place modification of the inner slice
 /// never happens; sharing is observably identical to RPython's
 /// `self.rd_consts = other.rd_consts` reference-share semantics
-/// (compile.py:861-867 `copy_all_attributes_from`).
+/// (compile.py `copy_all_attributes_from`).
 ///
 /// Each field stores `Arc<[T]>` so the donor-share path in
 /// `copy_all_attributes_from` can mirror RPython's reference-share
@@ -51,7 +51,7 @@ impl RdPayload {
         }
     }
 
-    /// `compile.py:861-872` `copy_all_attributes_from` — construct an
+    /// `compile.py` `copy_all_attributes_from` — construct an
     /// `RdPayload` whose four slots share `Arc<[T]>` refcounts with a
     /// donor descr, matching RPython's reference-share semantics.
     pub fn from_arcs(
@@ -69,9 +69,9 @@ impl RdPayload {
     }
 
     /// `clone()` shares every field — used by `clone_descr()`, which
-    /// mirrors RPython's `ResumeGuardDescr.clone()` (compile.py:844-846).
+    /// mirrors RPython's `ResumeGuardDescr.clone()` (compile.py).
     ///
-    /// RPython `copy_all_attributes_from` (compile.py:861-867) does
+    /// RPython `copy_all_attributes_from` (compile.py) does
     /// `self.rd_consts = other.rd_consts` etc. — list reference share.
     /// `Arc<[T]>` provides the equivalent: `Arc::clone()` only bumps a
     /// refcount.  In-place mutation never happens (the only writer is

@@ -1,9 +1,9 @@
 //! RPython `rpython/tool/error.py` — annotator error formatting.
 //!
 //! Upstream:
-//! * `SHOW_TRACEBACK = False` (error.py:13)
-//! * `SHOW_ANNOTATIONS = True` (error.py:14)
-//! * `SHOW_DEFAULT_LINES_OF_CODE = 0` (error.py:15)
+//! * `SHOW_TRACEBACK = False` (error.py)
+//! * `SHOW_ANNOTATIONS = True` (error.py)
+//! * `SHOW_DEFAULT_LINES_OF_CODE = 0` (error.py)
 //! * `source_lines1`, `source_lines`, `gather_error`, `format_annotations`,
 //!   `format_blocked_annotation_error`, `format_simple_call`, `offset2lineno`.
 
@@ -13,10 +13,10 @@ use std::rc::Rc;
 use crate::flowspace::bytecode::HostCode;
 use crate::flowspace::model::{Block, BlockRef, FunctionGraph, GraphRef, Hlvalue};
 
-/// Upstream `SHOW_ANNOTATIONS = True` (error.py:14).
+/// Upstream `SHOW_ANNOTATIONS = True` (error.py).
 pub const SHOW_ANNOTATIONS: bool = true;
 
-/// Upstream `SHOW_DEFAULT_LINES_OF_CODE = 0` (error.py:15).
+/// Upstream `SHOW_DEFAULT_LINES_OF_CODE = 0` (error.py).
 pub const SHOW_DEFAULT_LINES_OF_CODE: usize = 0;
 
 fn py_bool(value: bool) -> &'static str {
@@ -215,7 +215,7 @@ fn graph_repr(graph: &GraphRef) -> String {
     )
 }
 
-/// RPython `offset2lineno(c, stopat)` (error.py:160-171).
+/// RPython `offset2lineno(c, stopat)` (error.py).
 ///
 /// ```python
 /// @jit.elidable
@@ -449,7 +449,7 @@ pub fn source_lines1(
     lines
 }
 
-/// RPython `source_lines(graph, *args, **kwds)` (error.py:63-65).
+/// RPython `source_lines(graph, *args, **kwds)` (error.py).
 ///
 /// ```python
 /// def source_lines(graph, *args, **kwds):
@@ -476,7 +476,7 @@ pub fn source_lines(
     out
 }
 
-/// RPython `format_annotations(annotator, oper)` (error.py:84-93).
+/// RPython `format_annotations(annotator, oper)` (error.py).
 ///
 /// ```python
 /// def format_annotations(annotator, oper):
@@ -576,7 +576,7 @@ pub fn gather_error(
     msg.join("\n")
 }
 
-/// RPython `format_simple_call(annotator, oper, msg)` (error.py:102-112).
+/// RPython `format_simple_call(annotator, oper, msg)` (error.py).
 ///
 /// ```python
 /// def format_simple_call(annotator, oper, msg):

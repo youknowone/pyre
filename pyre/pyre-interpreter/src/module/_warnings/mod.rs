@@ -407,7 +407,7 @@ fn update_registry(
     )
 }
 
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the
 /// line is assembled in a `Wtf8Buf`, which has no counterpart in the
 /// immutable lifted string model, and the whole body is a write to
 /// `sys.stderr` — an opaque host action with nothing for a trace to reuse.

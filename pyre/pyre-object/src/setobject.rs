@@ -118,7 +118,7 @@ pub struct W_SetObject {
     pub ob_header: PyObject,
     pub items: *mut SetItemsStorage,
     pub len: usize,
-    /// setobject.py:584 `W_FrozensetObject.hash = DEFAULT_HASH`.
+    /// setobject.py `W_FrozensetObject.hash = DEFAULT_HASH`.
     pub hash: i64,
 }
 
@@ -265,7 +265,7 @@ fn set_write_barrier(obj: PyObjectRef) {
 
 /// Allocate an empty `set`.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// `w_dict_new` twin: the body builds the host `SetItemsStorage`
 /// (`IndexMap<ObjectKey, ()>`) box before the object is allocated, so the
 /// foreign `IndexMap::new` construction is an unported host container op.
@@ -679,7 +679,7 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///
 /// `setobject.py:875` assigns a fresh storage table to the GC pointer field
 /// (`w_set.sstorage = w_other.get_storage_copy()`), while
-/// `ObjectSetStrategy.get_storage_copy` (`setobject.py:963`) creates that table
+/// `ObjectSetStrategy.get_storage_copy` (`setobject.py`) creates that table
 /// with `self.erase(d.copy())`. PyPy's underlying table is the GC-managed
 /// `rdict.py:210` `GcStruct("dicttable")`. Do the same field reassignment here,
 /// rather than overwriting the old table's pointee. Copying the buckets is
@@ -690,7 +690,7 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// non-collecting stable old-generation allocator, so there is no collection
 /// point between reading `src`'s table and installing the new field value.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// `w_set_new` twin: cloning `src`'s `SetItemsStorage` (`IndexMap<ObjectKey,
 /// ()>`) and boxing it into `d.items` is a foreign `IndexMap::clone` +
 /// storage-box write. Tracing into it carries that host container op into the
@@ -814,8 +814,8 @@ pub unsafe fn w_set_update_from_set(
         return Ok(());
     }
     // Both tables are captured once for the whole merge — `update` unerases
-    // `d_obj` up front (`setobject.py:1396`) and `d_obj.update(d_other)` runs
-    // `ll_dict_update(dic1, dic2)` on those two tables (`rordereddict.py:1379`).
+    // `d_obj` up front (`setobject.py`) and `d_obj.update(d_other)` runs
+    // `ll_dict_update(dic1, dic2)` on those two tables (`rordereddict.py`).
     // A callback that clears either set swaps its live storage; the merge keeps
     // reading the captured source and inserting into the captured destination,
     // both now orphaned snapshots.

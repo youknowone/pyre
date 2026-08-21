@@ -13,9 +13,9 @@ use crate::optimizeopt::schedule::Pack;
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRef};
 
-// ── dependency.py:15-50: LOAD/MODIFY_COMPLEX_OBJ tables ─────────
+// ── dependency.py: LOAD/MODIFY_COMPLEX_OBJ tables ─────────
 
-/// dependency.py:30-48: LOAD_COMPLEX_OBJ — returns (complex_obj_arg_idx, index_arg_idx).
+/// dependency.py: LOAD_COMPLEX_OBJ — returns (complex_obj_arg_idx, index_arg_idx).
 /// index_arg_idx == -1 means no index argument (field access, not array).
 fn load_complex_obj_args(opcode: OpCode) -> (usize, i32) {
     match opcode {
@@ -44,7 +44,7 @@ fn load_complex_obj_args(opcode: OpCode) -> (usize, i32) {
     }
 }
 
-/// dependency.py:15-26: MODIFY_COMPLEX_OBJ — returns (complex_obj_arg_idx, cell_arg_idx).
+/// dependency.py: MODIFY_COMPLEX_OBJ — returns (complex_obj_arg_idx, cell_arg_idx).
 /// cell_arg_idx == -1 means no cell argument (field store, not array).
 fn modify_complex_obj_args(opcode: OpCode) -> Option<(usize, i32)> {
     match opcode {
@@ -63,7 +63,7 @@ fn modify_complex_obj_args(opcode: OpCode) -> Option<(usize, i32)> {
     }
 }
 
-/// dependency.py:213-241: side_effect_arguments — determine which args are
+/// dependency.py: side_effect_arguments — determine which args are
 /// destroyed (modified) by the operation. Returns Vec<(arg, argcell, destroyed)>.
 /// `arg_type_of` resolves an OpRef to its result type for the float check.
 fn side_effect_arguments(
@@ -106,7 +106,7 @@ fn side_effect_arguments(
     result
 }
 
-/// dependency.py:52-129 `Path`.
+/// dependency.py `Path`.
 ///
 /// RPython stores `Node` objects directly. The Rust dependency graph uses
 /// stable node indices in `DependencyGraph.nodes` — including imaginary
@@ -122,7 +122,7 @@ impl Path {
         Self { path }
     }
 
-    /// dependency.py:56-59 `second`.
+    /// dependency.py `second`.
     pub fn second(&self) -> Option<usize> {
         if self.path.len() <= 1 {
             return None;
@@ -130,7 +130,7 @@ impl Path {
         self.node_at(1)
     }
 
-    /// dependency.py:61-64 `last_but_one`.
+    /// dependency.py `last_but_one`.
     pub fn last_but_one(&self) -> Option<usize> {
         if self.path.len() < 2 {
             return None;
@@ -138,7 +138,7 @@ impl Path {
         self.node_at(self.path.len() - 2)
     }
 
-    /// dependency.py:66-69 `last`.
+    /// dependency.py `last`.
     pub fn last(&self) -> Option<usize> {
         if self.path.is_empty() {
             return None;
@@ -146,7 +146,7 @@ impl Path {
         self.node_at(self.path.len() - 1)
     }
 
-    /// dependency.py:71-72 `first`.
+    /// dependency.py `first`.
     pub fn first(&self) -> Option<usize> {
         self.node_at(0)
     }
@@ -156,7 +156,7 @@ impl Path {
         self.path.get(index).copied()
     }
 
-    /// dependency.py:74-98 `is_always_pure`.
+    /// dependency.py `is_always_pure`.
     pub fn is_always_pure(&self, nodes: &[Node], exclude_first: bool, exclude_last: bool) -> bool {
         let mut i = usize::from(exclude_first);
         let mut count = self.path.len();
@@ -186,7 +186,7 @@ impl Path {
         true
     }
 
-    /// dependency.py:100-102 `set_schedule_priority` — sets the priority on
+    /// dependency.py `set_schedule_priority` — sets the priority on
     /// every segment, imaginary nodes included.
     pub fn set_schedule_priority(&self, nodes: &mut [Node], priority: i32) {
         for &index in &self.path {
@@ -196,17 +196,17 @@ impl Path {
         }
     }
 
-    /// dependency.py:104-105 `walk`.
+    /// dependency.py `walk`.
     pub fn walk_node(&mut self, node: usize) {
         self.path.push(node);
     }
 
-    /// dependency.py:107-108 `cut_off_at`.
+    /// dependency.py `cut_off_at`.
     pub fn cut_off_at(&mut self, index: usize) {
         self.path.truncate(index);
     }
 
-    /// dependency.py:110-122 `check_acyclic`.
+    /// dependency.py `check_acyclic`.
     pub fn check_acyclic(&self) -> bool {
         for (index, item) in self.path.iter().enumerate() {
             if self.path[..index].iter().any(|previous| previous == item) {
@@ -216,12 +216,12 @@ impl Path {
         true
     }
 
-    /// dependency.py:124-125 `clone`.
+    /// dependency.py `clone`.
     pub fn clone_path(&self) -> Self {
         self.clone()
     }
 
-    /// dependency.py:127-129 `as_str`.
+    /// dependency.py `as_str`.
     pub fn as_str(&self, nodes: &[Node]) -> String {
         self.path
             .iter()
@@ -246,7 +246,7 @@ pub struct Node {
     /// Index in the ops list (dependency.py:134: opidx).
     pub idx: usize,
     /// The operation (dependency.py:133: op). `None` for an imaginary node —
-    /// `ImaginaryNode.__init__` passes `op=None` (dependency.py:395-403).
+    /// `ImaginaryNode.__init__` passes `op=None` (dependency.py).
     pub op: Option<Op>,
     /// dependency.py:400 `dotlabel` — debug label carried only by imaginary
     /// nodes; `None` for real nodes.
@@ -255,7 +255,7 @@ pub struct Node {
     pub adjacent_list: Vec<Dependency>,
     /// dependency.py:136: adjacent_list_back — backward dependency edges (source → this).
     pub adjacent_list_back: Vec<Dependency>,
-    /// dependency.py:137: memory_ref — MemoryRef for array access ops.
+    /// dependency.py: memory_ref — MemoryRef for array access ops.
     pub memory_ref: Option<MemoryRef>,
     /// dependency.py:138: pack — which Pack this node belongs to.
     pub pack: Option<usize>,
@@ -292,7 +292,7 @@ impl Node {
         }
     }
 
-    /// dependency.py:395-403 `ImaginaryNode(label)` — a synthetic dependency
+    /// dependency.py `ImaginaryNode(label)` — a synthetic dependency
     /// vertex with `op=None`. Untranslated it carries a `dotlabel` and a fake
     /// index drawn from a big monotonic counter.
     pub fn new_imaginary(label: impl Into<String>) -> Self {
@@ -320,7 +320,7 @@ impl Node {
         }
     }
 
-    /// dependency.py:149-150 `getoperation` — `self.op`, `None` when imaginary.
+    /// dependency.py `getoperation` — `self.op`, `None` when imaginary.
     pub fn getoperation(&self) -> Option<&Op> {
         self.op.as_ref()
     }
@@ -333,58 +333,58 @@ impl Node {
             .expect("Node::op called on an imaginary node (op=None)")
     }
 
-    /// dependency.py:146-147 / 405-406 `is_imaginary` — true iff `op is None`.
+    /// dependency.py / 405-406 `is_imaginary` — true iff `op is None`.
     pub fn is_imaginary(&self) -> bool {
         self.op.is_none()
     }
 
-    /// dependency.py:161: setpriority
+    /// dependency.py: setpriority
     pub fn setpriority(&mut self, value: i32) {
         self.priority = value;
     }
 
-    /// dependency.py:243: provides_count
+    /// dependency.py: provides_count
     pub fn provides_count(&self) -> usize {
         self.adjacent_list.len()
     }
 
-    /// dependency.py:249: depends_count
+    /// dependency.py: depends_count
     pub fn depends_count(&self) -> usize {
         self.adjacent_list_back.len()
     }
 
-    /// dependency.py:246-247 `provides` — forward dependency edges
+    /// dependency.py `provides` — forward dependency edges
     /// (this node → target). Each edge's `target_node()` is the successor.
     pub fn provides(&self) -> &[Dependency] {
         &self.adjacent_list
     }
 
-    /// dependency.py:252-253 `depends` — backward dependency edges. These are
+    /// dependency.py `depends` — backward dependency edges. These are
     /// the reversed back-edges built by `add_edge`, so each edge's
     /// `target_node()` is the predecessor.
     pub fn depends(&self) -> &[Dependency] {
         &self.adjacent_list_back
     }
 
-    /// dependency.py:268: is_after
+    /// dependency.py: is_after
     pub fn is_after(&self, other_idx: usize) -> bool {
         self.idx > other_idx
     }
 
-    /// dependency.py:271: is_before
+    /// dependency.py: is_before
     pub fn is_before(&self, other_idx: usize) -> bool {
         self.idx < other_idx
     }
 
-    /// dependency.py:167: is_pure
+    /// dependency.py: is_pure
     pub fn is_pure(&self) -> bool {
         self.op().opcode.is_always_pure()
     }
 
-    /// dependency.py:201-205: exits_early
+    /// dependency.py: exits_early
     pub fn exits_early(&self) -> bool {
         if self.op().opcode.is_guard() {
-            // dependency.py:203: descr = self.op.getdescr(); return descr.exits_early()
+            // dependency.py: descr = self.op.getdescr(); return descr.exits_early()
             self.op()
                 .with_fail_descr(|fd| fd.exits_early())
                 .unwrap_or(false)
@@ -393,24 +393,24 @@ impl Node {
         }
     }
 
-    /// dependency.py:207-208: loads_from_complex_object
+    /// dependency.py: loads_from_complex_object
     pub fn loads_from_complex_object(&self) -> bool {
         self.op().opcode.is_complex_load()
     }
 
-    /// dependency.py:210-211: modifies_complex_object
+    /// dependency.py: modifies_complex_object
     pub fn modifies_complex_object(&self) -> bool {
         self.op().opcode.is_complex_modify()
     }
 }
 
-/// dependency.py:537: DependencyGraph — dependency graph for a loop body.
+/// dependency.py: DependencyGraph — dependency graph for a loop body.
 #[derive(Clone, Debug)]
 pub struct DependencyGraph {
     pub nodes: Vec<Node>,
-    /// dependency.py:567: memory_refs — node index → MemoryRef
+    /// dependency.py: memory_refs — node index → MemoryRef
     pub memory_refs: indexmap::IndexMap<usize, MemoryRef>,
-    /// dependency.py:569: index_vars — OpRef → IndexVar
+    /// dependency.py: index_vars — OpRef → IndexVar
     pub index_vars: indexmap::IndexMap<OpRef, IndexVar>,
     /// dependency.py:571: guards — guard node indices
     pub guards: Vec<usize>,
@@ -440,7 +440,7 @@ impl DependencyGraph {
         graph
     }
 
-    /// dependency.py:578 — append an imaginary node (`op=None`) and return its
+    /// dependency.py — append an imaginary node (`op=None`) and return its
     /// index so it can be walked into a `Path` alongside real node indices.
     pub fn add_imaginary_node(&mut self, label: impl Into<String>) -> usize {
         let index = self.nodes.len();
@@ -448,7 +448,7 @@ impl DependencyGraph {
         index
     }
 
-    /// dependency.py:303-352 `Node.iterate_paths(to, backwards, path_max_len,
+    /// dependency.py `Node.iterate_paths(to, backwards, path_max_len,
     /// blacklist)`. Enumerates every path from `from_idx` toward `to`
     /// (`None` = all maximal paths). Upstream is a generator on `Node`; the
     /// Rust graph is index-addressed, so this lives on `DependencyGraph` (it
@@ -481,7 +481,7 @@ impl DependencyGraph {
             };
             let iterdir_len = iterdir.len();
             if index >= iterdir_len {
-                // dependency.py:322-324: a leaf reached on its first visit is a
+                // dependency.py: a leaf reached on its first visit is a
                 // maximal path when no explicit destination was requested.
                 if to.is_none() && index == 0 {
                     paths.push(path.clone_path());
@@ -517,7 +517,7 @@ impl DependencyGraph {
         paths
     }
 
-    /// dependency.py:170-195 `Node.edge_to(to, arg, failarg, label)` — add a
+    /// dependency.py `Node.edge_to(to, arg, failarg, label)` — add a
     /// dependency edge `from_idx → to_idx` (and its reversed back-edge). The
     /// Rust graph is index-addressed, so this is a graph-level method taking
     /// the two node indices; `add_edge` is the shared implementation and also
@@ -526,7 +526,7 @@ impl DependencyGraph {
         Self::add_edge(&mut self.nodes, from_idx, to_idx, arg, failarg);
     }
 
-    /// dependency.py:354-368 `Node.remove_edge_to(node)` — delete the forward
+    /// dependency.py `Node.remove_edge_to(node)` — delete the forward
     /// edge `from_idx → to_idx` from `from_idx.adjacent_list` and the matching
     /// reversed back-edge (whose `to` is `from_idx`) from
     /// `to_idx.adjacent_list_back`. The `deps`/`users` side-vectors, which
@@ -556,7 +556,7 @@ impl DependencyGraph {
         }
     }
 
-    /// dependency.py:596-644: build_dependencies — construct def-use chains
+    /// dependency.py: build_dependencies — construct def-use chains
     /// with DefTracker and IntegralForwardModification.
     fn build_dependencies(&mut self, ops: &[Op], constant_of: &dyn Fn(OpRef) -> Option<i64>) {
         let mut tracker = DefTracker::new(self);
@@ -583,7 +583,7 @@ impl DependencyGraph {
                 self.memory_refs.insert(i, mref.clone());
             }
 
-            // dependency.py:622-624: define result variable
+            // dependency.py: define result variable
             if op.opcode.result_type() != majit_ir::Type::Void {
                 tracker.define(op.pos.get(), i);
             }
@@ -596,7 +596,7 @@ impl DependencyGraph {
                     Self::depends_on_arg_static(&tracker, *arg, i, &mut self.nodes);
                 }
             } else if op.opcode.is_guard() {
-                // dependency.py:630-642: guard dependencies
+                // dependency.py: guard dependencies
                 if !self.nodes[i].exits_early() {
                     // dependency.py:635-640: guard ordering + non-pure deps
                     if !self.guards.is_empty() {
@@ -609,7 +609,7 @@ impl DependencyGraph {
                     tracker.non_pure.clear();
                 }
                 self.guards.push(i);
-                // dependency.py:642: build_guard_dependencies
+                // dependency.py: build_guard_dependencies
                 self.build_guard_dependencies(i, &mut tracker, ops);
             } else {
                 // dependency.py:644: non-pure (memory side effects)
@@ -621,7 +621,7 @@ impl DependencyGraph {
         self.index_vars = intformod.index_vars;
     }
 
-    /// dependency.py:708-735: build_guard_dependencies
+    /// dependency.py: build_guard_dependencies
     fn build_guard_dependencies(
         &mut self,
         guard_idx: usize,
@@ -636,17 +636,17 @@ impl DependencyGraph {
         ) {
             return;
         }
-        // dependency.py:714-715: true dependencies on args
+        // dependency.py: true dependencies on args
         for arg in op.getarglist().iter() {
             Self::depends_on_arg_static(tracker, arg.to_opref(), guard_idx, &mut self.nodes);
         }
-        // dependency.py:717: guard_argument_protection
+        // dependency.py: guard_argument_protection
         self.guard_argument_protection(guard_idx, tracker);
-        // dependency.py:719-721: descr.exits_early() check
+        // dependency.py: descr.exits_early() check
         if self.nodes[guard_idx].exits_early() {
             return;
         }
-        // dependency.py:723-735: fail_args dependencies — iterate ALL redefinitions
+        // dependency.py: fail_args dependencies — iterate ALL redefinitions
         if let Some(fail_args) = op.getfailargs() {
             let fa = fail_args.to_vec();
             for arg in &fa {
@@ -656,7 +656,7 @@ impl DependencyGraph {
                 if !tracker.is_defined(arg.to_opref()) {
                     continue;
                 }
-                // dependency.py:730-733: for at in tracker.redefinitions(arg)
+                // dependency.py: for at in tracker.redefinitions(arg)
                 let redefs = tracker.redefinitions(arg.to_opref());
                 for at_idx in redefs {
                     if self.nodes[at_idx].is_before(guard_idx) {
@@ -673,7 +673,7 @@ impl DependencyGraph {
         }
     }
 
-    /// dependency.py:646-698: guard_argument_protection
+    /// dependency.py: guard_argument_protection
     fn guard_argument_protection(&mut self, guard_idx: usize, tracker: &mut DefTracker) {
         let op = self.nodes[guard_idx].op().clone();
         // dependency.py:657-664: redefine non-constant, non-int, non-float args (pointers)
@@ -725,7 +725,7 @@ impl DependencyGraph {
         }
     }
 
-    /// dependency.py:737-784: build_non_pure_dependencies
+    /// dependency.py: build_non_pure_dependencies
     fn build_non_pure_dependencies(
         &mut self,
         node_idx: usize,
@@ -735,13 +735,13 @@ impl DependencyGraph {
         let op = self.nodes[node_idx].op().clone();
 
         if self.nodes[node_idx].loads_from_complex_object() {
-            // dependency.py:742-751: LOAD_COMPLEX_OBJ dispatch
+            // dependency.py: LOAD_COMPLEX_OBJ dispatch
             // (opnum, complex_obj_arg_idx, index_arg_idx)
             let (cobj_idx, index_idx) = load_complex_obj_args(op.opcode);
             if cobj_idx < op.num_args() {
                 let cobj = op.arg(cobj_idx).to_opref();
                 if index_idx >= 0 && (index_idx as usize) < op.num_args() {
-                    // dependency.py:747-748: argcell-aware depends_on
+                    // dependency.py: argcell-aware depends_on
                     let index_var = op.arg(index_idx as usize).to_opref();
                     Self::depends_on_arg_static(tracker, cobj, node_idx, &mut self.nodes);
                     Self::depends_on_arg_static(tracker, index_var, node_idx, &mut self.nodes);
@@ -751,7 +751,7 @@ impl DependencyGraph {
                 }
             }
         } else {
-            // dependency.py:752-777: side_effect_arguments processing
+            // dependency.py: side_effect_arguments processing
             let nodes_ref = &self.nodes;
             let arg_type_of = |opref: OpRef| -> majit_ir::Type {
                 // Look up the defining op's result type
@@ -769,7 +769,7 @@ impl DependencyGraph {
                     Self::depends_on_arg_static(tracker, *arg, node_idx, &mut self.nodes);
                     Self::depends_on_arg_static(tracker, *cell, node_idx, &mut self.nodes);
                 } else if *destroyed {
-                    // dependency.py:759-772: WAR/WAW dependencies
+                    // dependency.py: WAR/WAW dependencies
                     if let Some(def_idx) = tracker.definition(*arg) {
                         // dependency.py:767-769: war edges from def's users
                         let provides: Vec<usize> = self.nodes[def_idx]
@@ -782,7 +782,7 @@ impl DependencyGraph {
                                 Self::add_edge(&mut self.nodes, to, node_idx, *argcell, false);
                             }
                         }
-                        // dependency.py:770: def_node.edge_to(node)
+                        // dependency.py: def_node.edge_to(node)
                         Self::add_edge(&mut self.nodes, def_idx, node_idx, *argcell, false);
                     }
                 } else {
@@ -795,7 +795,7 @@ impl DependencyGraph {
                 }
             }
 
-            // dependency.py:780-782: non-pure must follow last guard
+            // dependency.py: non-pure must follow last guard
             if !self.guards.is_empty() {
                 let last_guard = *self.guards.last().unwrap();
                 Self::add_edge(&mut self.nodes, last_guard, node_idx, None, false);
@@ -805,7 +805,7 @@ impl DependencyGraph {
         }
     }
 
-    /// Helper: add a dependency edge between two nodes (dependency.py:170-195 Node.edge_to).
+    /// Helper: add a dependency edge between two nodes (dependency.py Node.edge_to).
     fn add_edge(
         nodes: &mut [Node],
         from_idx: usize,
@@ -1043,7 +1043,7 @@ pub(crate) fn schedule_operations(graph: &DependencyGraph) -> Vec<usize> {
     schedule
 }
 
-// ── dependency.py:981-1138: IndexVar ──────────────────────────
+// ── dependency.py: IndexVar ──────────────────────────
 
 /// dependency.py:981-1093: Linear combination of an index variable.
 /// Represents `var * (coefficient_mul / coefficient_div) + constant`.
@@ -1142,7 +1142,7 @@ impl IndexVar {
         self.coefficient_mul == 1 && self.coefficient_div == 1 && self.constant == 0
     }
 
-    /// dependency.py:1095-1121: compare(other)
+    /// dependency.py: compare(other)
     ///
     /// Returns `(valid, ordering)` where `ordering` is the signed constant
     /// difference between self and other when the linear coefficients match.
@@ -1163,7 +1163,7 @@ impl IndexVar {
         (false, 0)
     }
 
-    /// dependency.py:1123-1130: getvariable()
+    /// dependency.py: getvariable()
     pub fn getvariable(&self) -> OpRef {
         self.var
     }
@@ -1180,7 +1180,7 @@ impl IndexVar {
         }
     }
 
-    /// dependency.py:1065-1083: get_operations()
+    /// dependency.py: get_operations()
     ///
     /// Materialize the linear combination as IR operations:
     ///   var * coefficient_mul / coefficient_div + constant
@@ -1278,7 +1278,7 @@ impl IndexVar {
         tolist
     }
 
-    /// dependency.py:1085-1093: emit_operations(opt, result_box)
+    /// dependency.py: emit_operations(opt, result_box)
     ///
     /// Emit the linear operations into the output list.
     /// Returns the result OpRef (last emitted op, or var if identity).
@@ -1302,7 +1302,7 @@ impl IndexVar {
     }
 }
 
-// ── dependency.py:1140-1220: MemoryRef ────────────────────────
+// ── dependency.py: MemoryRef ────────────────────────
 
 /// dependency.py:1140-1220: A memory reference to an array object.
 /// Tracks the array pointer, descriptor, and index variable (linear
@@ -1363,7 +1363,7 @@ impl MemoryRef {
         other.index_var.constant_diff(&self.index_var) == stride
     }
 
-    /// dependency.py:1180-1194: alias check
+    /// dependency.py: alias check
     pub fn alias(&self, other: &MemoryRef) -> bool {
         if !self.same_array(other) {
             return false;
@@ -1377,7 +1377,7 @@ impl MemoryRef {
         self.index_var.constant_diff(&other.index_var).abs() < self.stride()
     }
 
-    /// dependency.py:1196-1197: same_array — array identity + descriptor equality.
+    /// dependency.py: same_array — array identity + descriptor equality.
     /// RPython uses `self.descr == other.descr` (value equality).
     /// In majit, Descr is a trait object; we compare by index() for value equality,
     /// falling back to Arc::ptr_eq for descriptors without assigned indices.
@@ -1394,7 +1394,7 @@ impl MemoryRef {
         }
     }
 
-    /// dependency.py:1213-1217: stride in elements (1) or bytes (for raw)
+    /// dependency.py: stride in elements (1) or bytes (for raw)
     pub fn stride(&self) -> i64 {
         if !self.raw_access {
             1
@@ -1407,7 +1407,7 @@ impl MemoryRef {
     }
 }
 
-// ── dependency.py:412-471: Dependency (rich edge) ─────────────
+// ── dependency.py: Dependency (rich edge) ─────────────
 
 /// dependency.py:412-471: A dependency edge in the graph.
 /// Carries which args caused the dependency and whether it's a failarg dep.
@@ -1424,7 +1424,7 @@ pub struct Dependency {
 }
 
 impl Dependency {
-    /// dependency.py:415-421 `Dependency.__init__(at, to, arg, failarg=False)`.
+    /// dependency.py `Dependency.__init__(at, to, arg, failarg=False)`.
     pub fn new(at_idx: usize, to_idx: usize, arg: Option<OpRef>, failarg: bool) -> Self {
         let mut d = Dependency {
             at_idx,
@@ -1438,30 +1438,30 @@ impl Dependency {
         d
     }
 
-    /// dependency.py:423-427: because_of
+    /// dependency.py: because_of
     pub fn because_of(&self, var: OpRef) -> bool {
         self.args.iter().any(|(_, a)| *a == var)
     }
 
-    /// dependency.py:429-430 `target_node` — the `to` endpoint index. For a
+    /// dependency.py `target_node` — the `to` endpoint index. For a
     /// forward (`provides`) edge this is the successor; for a reversed
     /// `depends` back-edge it is the predecessor.
     pub fn target_node(&self) -> usize {
         self.to_idx
     }
 
-    /// dependency.py:432-433 `origin_node` — the `at` endpoint index.
+    /// dependency.py `origin_node` — the `at` endpoint index.
     pub fn origin_node(&self) -> usize {
         self.at_idx
     }
 
-    /// dependency.py:460-461 `is_failarg`.
+    /// dependency.py `is_failarg`.
     pub fn is_failarg(&self) -> bool {
         self.failarg
     }
 }
 
-// ── dependency.py:473-535: DefTracker ─────────────────────────
+// ── dependency.py: DefTracker ─────────────────────────
 
 /// dependency.py:473-535: Tracks definitions of OpRefs during
 /// dependency graph construction. Maps each OpRef to the node(s)
@@ -1486,7 +1486,7 @@ impl DefTracker {
         self.non_pure.push(node_idx);
     }
 
-    /// dependency.py:482-488: define — register that node_idx defines arg.
+    /// dependency.py: define — register that node_idx defines arg.
     pub fn define(&mut self, arg: OpRef, node_idx: usize) {
         // dependency.py:483-484: skip constants.
         if arg.is_constant() {
@@ -1495,7 +1495,7 @@ impl DefTracker {
         self.defs.entry(arg).or_default().push((node_idx, None));
     }
 
-    /// dependency.py:490-492: redefinitions — yield all nodes defining arg.
+    /// dependency.py: redefinitions — yield all nodes defining arg.
     pub fn redefinitions(&self, arg: OpRef) -> Vec<usize> {
         self.defs
             .get(&arg)
@@ -1508,7 +1508,7 @@ impl DefTracker {
         self.defs.contains_key(&arg)
     }
 
-    /// dependency.py:497-523: definition — find the defining node for arg.
+    /// dependency.py: definition — find the defining node for arg.
     pub fn definition(&self, arg: OpRef) -> Option<usize> {
         if arg.is_constant() {
             return None;
@@ -1520,7 +1520,7 @@ impl DefTracker {
         Some(chain.last()?.0)
     }
 
-    /// dependency.py:525-534: depends_on_arg — add edge from definition to `to_idx`.
+    /// dependency.py: depends_on_arg — add edge from definition to `to_idx`.
     pub fn depends_on_arg(&self, arg: OpRef, to_idx: usize, graph: &mut [Vec<usize>]) {
         if let Some(at_idx) = self.definition(arg)
             && at_idx != to_idx
@@ -1531,7 +1531,7 @@ impl DefTracker {
     }
 }
 
-// ── dependency.py:877-978: IntegralForwardModification ────────
+// ── dependency.py: IntegralForwardModification ────────
 
 /// dependency.py:877-978: Calculates integral modifications on integer
 /// boxes. Propagates INT_ADD/INT_SUB/INT_MUL through IndexVar linear
@@ -1542,7 +1542,7 @@ pub struct IntegralForwardModification<'a> {
     /// Node index → MemoryRef mapping
     pub memory_refs: indexmap::IndexMap<usize, MemoryRef>,
     /// Callback to resolve constant OpRef → i64 value.
-    /// dependency.py:885-888: is_const_integral + box.getint()
+    /// dependency.py: is_const_integral + box.getint()
     constant_of: &'a dyn Fn(OpRef) -> Option<i64>,
 }
 
@@ -1660,7 +1660,7 @@ impl<'a> IntegralForwardModification<'a> {
     }
 
     /// dependency.py:950-975: inspect array access ops.
-    /// Only creates MemoryRef for primitive array accesses (dependency.py:954).
+    /// Only creates MemoryRef for primitive array accesses (dependency.py).
     fn inspect_array_access(&mut self, op: &Op, node_idx: usize, raw_access: bool) {
         if op.num_args() < 2 {
             return;
@@ -1688,7 +1688,7 @@ impl<'a> IntegralForwardModification<'a> {
         }
     }
 
-    /// dependency.py:977: inspect_operation dispatcher (integral_dispatch_opt)
+    /// dependency.py: inspect_operation dispatcher (integral_dispatch_opt)
     pub fn inspect_operation(&mut self, op: &Op, node_idx: usize) {
         match op.opcode {
             OpCode::IntAdd => self.inspect_additive(op, false),

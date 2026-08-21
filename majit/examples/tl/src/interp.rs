@@ -30,7 +30,7 @@ pub fn interpret(code: &[u8], inputarg: i64) -> i64 {
 }
 
 /// Recursive portal re-entry — the concrete fallback for the `CALL` opcode's
-/// `recursive_portal_call!`.  tl.py:177 `res = interp(code, pc + offset)`
+/// `recursive_portal_call!`.  tl.py `res = interp(code, pc + offset)`
 /// re-enters the portal with a fresh stack and `inputarg` defaulting to 0,
 /// returning the sub-program's top-of-stack.  The argument order is the
 /// jitdriver green declaration order `[pc, program]` so the `recursive_entry`

@@ -80,7 +80,7 @@ pub trait WalkerFrameOps {
         self.ctx().get_opref_type(value).unwrap_or(Type::Ref)
     }
 
-    /// `pyjitpl.py:2558-2602` `generate_guard` parity — flush a pending
+    /// `pyjitpl.py` `generate_guard` parity — flush a pending
     /// quasi-immut guard, capture multi-frame resume snapshot, then
     /// record the guard op with its snapshot.  The single load-bearing
     /// method; impls diverge between `MIFrame` register state and
@@ -88,7 +88,7 @@ pub trait WalkerFrameOps {
     /// snapshot helper).
     fn generate_guard(&mut self, opcode: OpCode, args: &[OpRef]);
 
-    /// `pyjitpl.py:3508-3514` `implement_guard_value` parity — pick the
+    /// `pyjitpl.py` `implement_guard_value` parity — pick the
     /// const factory (`const_ref` for Type::Ref, `const_int`
     /// otherwise), record `GUARD_VALUE`, then update the heapcache's
     /// box replacement so downstream reads see the proved constant.
@@ -99,20 +99,20 @@ pub trait WalkerFrameOps {
             _ => self.ctx_mut().const_int(expected),
         };
         self.generate_guard(OpCode::GuardValue, &[value, expected_ref]);
-        // pyjitpl.py:3512 `replace_box` parity.
+        // pyjitpl.py `replace_box` parity.
         self.ctx_mut()
             .heap_cache_mut()
             .replace_box(value, expected_ref);
     }
 
-    /// `pyjitpl.py:1518-1523` `opimpl_guard_class` parity.  Skips the
+    /// `pyjitpl.py` `opimpl_guard_class` parity.  Skips the
     /// guard when the heapcache already knows the class or the OpRef
     /// is constant (the runtime type is already pinned).  Otherwise
     /// records `GUARD_CLASS` with `expected_type_const` and updates the
     /// heapcache's class+nullity record.  The obj is non-null by
     /// construction (a value-stack operand, the same invariant under
     /// which the codewriter emits guard_class at
-    /// jtransform.py:1004-1010 handle_getfield_typeptr); the optimizer
+    /// jtransform.py handle_getfield_typeptr); the optimizer
     /// strengthens a preceding `GUARD_NONNULL` into `GUARD_NONNULL_CLASS`
     /// (rewrite.py:408-444).
     fn guard_class(&mut self, obj: OpRef, expected_type: *const PyType) {
@@ -134,7 +134,7 @@ pub trait WalkerFrameOps {
         }
         let expected_type_const = self.ctx_mut().const_int(expected_type as usize as i64);
         self.generate_guard(OpCode::GuardClass, &[obj, expected_type_const]);
-        // heapcache.py:470-473 `class_now_known` parity.
+        // heapcache.py `class_now_known` parity.
         self.ctx_mut()
             .heap_cache_mut()
             .class_now_known(obj, expected_type as usize as i64);
@@ -219,7 +219,7 @@ pub trait WalkerFrameOps {
 // The `ctx_mut` / `ctx` accessors materialise the
 // borrow from `self.ctx: *mut TraceCtx` via unsafe deref.  The deref is
 // sound because `MIFrame`'s lifetime invariant
-// (`pyjitpl.py:177 MIFrame.metainterp`) guarantees `self.ctx` always
+// (`pyjitpl.py MIFrame.metainterp`) guarantees `self.ctx` always
 // points at the live `TraceCtx` owned by the enclosing dispatch frame.
 impl WalkerFrameOps for crate::state::MIFrame {
     fn ctx_mut(&mut self) -> &mut TraceCtx {
@@ -262,7 +262,7 @@ impl<'frame, 'static_a: 'frame, Sym: crate::state::WalkSym> WalkerFrameOps
     }
 
     fn generate_guard(&mut self, opcode: OpCode, args: &[OpRef]) {
-        // `pyjitpl.py:2558-2560 generate_guard` const-skip parity.
+        // `pyjitpl.py generate_guard` const-skip parity.
         if let Some(&first) = args.first() {
             if first.is_constant() {
                 return;

@@ -306,7 +306,7 @@ pub fn is_pyframe_operand_stack_accessor(addr: usize) -> bool {
 /// set (`rpython/jit/metainterp/executor.py:446`), is neither can-raise nor a
 /// call (`resoperation.py:1124-1125`, outside those ranges), and is inserted
 /// only by the backend GC rewrite pass after optimization
-/// (`backend/llsupport/rewrite.py:948`). pyre has no separate backend rewrite
+/// (`backend/llsupport/rewrite.py`). pyre has no separate backend rewrite
 /// pass, so the barrier surfaces as a residual during the walk; exempting it
 /// from the FBW body-effect gate restores the parity RPython gets for free.
 ///
@@ -696,7 +696,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         crate::opcode_ops::bh_w_type_set_uses_object_getattribute as *const (),
     );
     // `w_type_issubtype` is the MRO membership scan (`_issubtype`,
-    // typeobject.py:1640), run under the JIT inside `_pure_issubtype`
+    // typeobject.py), run under the JIT inside `_pure_issubtype`
     // (`@elidable_promote`, typeobject.py:1657).  Its `#[dont_look_inside]`
     // residualises the call; bind the `-> bool` Rust `fn` directly by
     // qualified path (2-pointer args, JIT-representable, no C-ABI bridge).
@@ -1092,7 +1092,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `memoryview_gather_bytes` deliberately remains unpublished: its
     // multiword `Vec<u8>` return has no one-word residual-call ABI.
     // #346: the `not hasmro` subtype fallback for a partially-initialised type
-    // (`_issubtype_slow_and_wrong`, typeobject.py:1646).  Its cold best-base
+    // (`_issubtype_slow_and_wrong`, typeobject.py).  Its cold best-base
     // walk bottoms out in an opaque `Vec` iteration and returns a single-word
     // `bool`, so it is `#[dont_look_inside]` — keeping the hot cached-MRO
     // branch of `issubtype_w` a pure typed-slice iteration.  Bind its `fn` by
@@ -2178,7 +2178,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::next_version_tag_serial",
         next_version_tag_serial as *const (),
     );
-    // `quasiimmut.py:33-38 _invalidate_now`, shared by both `?` fields.
+    // `quasiimmut.py _invalidate_now`, shared by both `?` fields.
     push_alias_pair(
         &mut entries,
         "pyre_object::quasiimmut::sweep_quasi_immut_field",
@@ -2860,7 +2860,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `CallTarget::function_path(["_ll_2_int_floordiv"])` per
     // `jtransform.py:576-577 rewrite_op_int_floordiv =
     // _do_builtin_call` (which resolves the helper through
-    // `support.py:266` `_ll_2_int_mod` / `:255` `_ll_2_int_floordiv`).
+    // `support.py` `_ll_2_int_mod` / `:255` `_ll_2_int_floordiv`).
     // The C-trunc residual call below is what the trace path sees;
     // the Python-floor `ll_int_py_*` helpers stay available for the
     // future route-(b) emitter (Python-bytecode `int.py_mod` /
@@ -2893,7 +2893,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     //     so the binding is omitted until the rtyper-equivalent
     //     can synthesise the body graph.
     //   * `_ll_1_ll_math_ll_math_sqrt` — `rpython/rtyper/lltypesystem/
-    //     module/ll_math.py:317-322 ll_math_sqrt` raises
+    //     module/ll_math.py ll_math_sqrt` raises
     //     `ValueError("math domain error")` on negative input, and
     //     Rust's `f64::sqrt()` returns NaN; making the fnaddr
     //     reachable would be a silent semantic regression.
@@ -2910,10 +2910,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         majit_metainterp::blackhole::_ll_2_int_mod as *const (),
     );
 
-    // `support.py:274 _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
+    // `support.py _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
     // residual-call targets emitted by
     // `codewriter/jtransform.rs:cast_*_to_*` (mirroring
-    // `jtransform.py:587-588 _do_builtin_call`).  Without these the
+    // `jtransform.py _do_builtin_call`).  Without these the
     // codewriter falls back to `symbolic_fnaddr_for_path`, which
     // produces a deterministic but unbound hash — fine for source
     // analysis but unreachable at runtime.  The 1-segment root_path
@@ -2933,7 +2933,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         majit_metainterp::blackhole::cast_float_to_uint as *const (),
     );
 
-    // `_ll_2_str_eq_nonnull` (`rpython/jit/codewriter/support.py:526-
+    // `_ll_2_str_eq_nonnull` (`rpython/jit/codewriter/support.py-
     // 538`) is the helper canonically registered by `jtransform.py:
     // 620-624 _register_extra_helper(OS_STREQ_NONNULL, "str.eq_nonnull",
     // ...)` and `:637-641 _register_extra_helper(OS_UNIEQ_NONNULL,

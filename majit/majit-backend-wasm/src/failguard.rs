@@ -25,7 +25,7 @@ pub struct WasmFailDescr {
     pub meta_descr: Option<DescrRef>,
 }
 
-/// `compile.py:658-662` ExitFrameWithExceptionDescrRef parity: whether a FINISH
+/// `compile.py` ExitFrameWithExceptionDescrRef parity: whether a FINISH
 /// exit is an ExitFrameWithException (the callee raised; slot 0 holds the
 /// exception) rather than a DoneWithThisFrame. `is_finish` alone is true for
 /// both, so the self-recursive CALL_ASSEMBLER arm must exclude the exception
@@ -84,7 +84,7 @@ pub struct WasmFrameData {
 }
 
 impl WasmFrameData {
-    /// `llmodel.py:225-238` reads `get_ref_value` straight out of the JITFRAME,
+    /// `llmodel.py` reads `get_ref_value` straight out of the JITFRAME,
     /// which stays a GC root (its `jf_gcmap` covers the exit slots) for as long
     /// as the deadframe lives. wasm has no host-visible JITFRAME to hand back:
     /// `execute_token` copies the exit values into `raw_values` and drops the

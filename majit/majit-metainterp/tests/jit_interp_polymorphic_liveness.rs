@@ -148,7 +148,7 @@ fn collect_bc_live_offsets(jitcode: &JitCode) -> Vec<u16> {
     while i < code.len() {
         if code[i] == BC_LIVE {
             // BC_LIVE is followed by a 2-byte little-endian offset into
-            // `Assembler::all_liveness` (assembler.py:248 `encode_offset`).
+            // `Assembler::all_liveness` (assembler.py `encode_offset`).
             assert!(
                 i + 2 < code.len(),
                 "BC_LIVE at end of code without 2-byte offset payload"

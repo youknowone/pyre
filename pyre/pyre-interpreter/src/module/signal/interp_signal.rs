@@ -12,7 +12,7 @@ use pyre_object::PyObjectRef;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-/// executioncontext.py:436-441 `space.getexecutioncontext().checksignals()`
+/// executioncontext.py `space.getexecutioncontext().checksignals()`
 /// — deliver a signal that may have arrived during a syscall.  Resolves
 /// the live EC from the thread-local slot (`getexecutioncontext`).
 ///
@@ -28,7 +28,7 @@ pub fn checksignals_now() -> Result<(), crate::PyError> {
     unsafe { (*ec).checksignals() }
 }
 
-/// interp_signal.py:485-497 `SignalMask.__enter__` — unpack a list / tuple
+/// interp_signal.py `SignalMask.__enter__` — unpack a list / tuple
 /// / set of signal numbers, the argument shape `sigwait` / `sigpending`
 /// share with `pthread_sigmask`.
 #[cfg(feature = "host_env")]
@@ -80,7 +80,7 @@ fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
     err
 }
 
-/// interp_signal.py:157-167 `Handlers.handlers_w` — the single `Handlers`
+/// interp_signal.py `Handlers.handlers_w` — the single `Handlers`
 /// instance returned by `space.fromcache(Handlers)`.  Pyre has one interpreter
 /// per process, so this is process-global just like that object-space cache.
 /// It must not be TLS: a signal received by a worker is dispatched later by
@@ -105,14 +105,14 @@ fn handlers_dict() -> PyObjectRef {
     d
 }
 
-/// interp_signal.py:196-209 `handlers_w[n]` lookup.  Returns `PY_NULL`
+/// interp_signal.py `handlers_w[n]` lookup.  Returns `PY_NULL`
 /// for a signum with no registered handler (the KeyError → ignore arm).
 pub fn get_handler(signum: i32) -> PyObjectRef {
     let d = handlers_dict();
     unsafe { pyre_object::w_dict_getitem(d, signum as i64).unwrap_or(pyre_object::PY_NULL) }
 }
 
-/// interp_signal.py:323-325 `handlers_w[signum] = w_handler`.
+/// interp_signal.py `handlers_w[signum] = w_handler`.
 pub fn set_handler(signum: i32, handler: PyObjectRef) {
     let d = handlers_dict();
     unsafe { pyre_object::w_dict_setitem(d, signum as i64, handler) };
@@ -208,7 +208,7 @@ fn c_int_overflow() -> crate::PyError {
     crate::PyError::overflow_error("Python int too large to convert to C int")
 }
 
-/// interp_signal.py:285-288 `check_signum_in_range`.
+/// interp_signal.py `check_signum_in_range`.
 fn check_signum_in_range(signum: i64) -> Result<(), crate::PyError> {
     if (1..signalstate::NSIG as i64).contains(&signum) {
         Ok(())
@@ -237,13 +237,13 @@ fn windows_handles_signal(signum: i32) -> bool {
     )
 }
 
-/// interp_signal.py:291-326 `signal(signum, handler) -> previous`.
+/// interp_signal.py `signal(signum, handler) -> previous`.
 fn signal_signal(
     w_signum: PyObjectRef,
     w_handler: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     let signum = signum_arg(w_signum)?;
-    // interp_signal.py:307-310 — only the main/signal-enabled execution
+    // interp_signal.py — only the main/signal-enabled execution
     // context may install process signal handlers.
     let ec = crate::call::getexecutioncontext() as *const ExecutionContext;
     if ec.is_null() || unsafe { (*ec).signals_enabled == 0 } {
@@ -296,7 +296,7 @@ fn signal_signal(
     Ok(old)
 }
 
-/// interp_signal.py:238-251 `getsignal(signum) -> action`.
+/// interp_signal.py `getsignal(signum) -> action`.
 fn signal_getsignal(w_signum: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let signum = signum_arg(w_signum)?;
     check_signum_in_range(signum)?;
@@ -316,7 +316,7 @@ fn signal_getsignal(w_signum: PyObjectRef) -> Result<PyObjectRef, crate::PyError
     })
 }
 
-/// interp_signal.py:254-262 `default_int_handler` — `raise
+/// interp_signal.py `default_int_handler` — `raise
 /// KeyboardInterrupt`.  Cached so the module attribute and the SIGINT
 /// handler-dict entry share one identity.
 pub fn default_int_handler_obj() -> PyObjectRef {
@@ -347,16 +347,16 @@ pub fn default_int_handler_obj() -> PyObjectRef {
     h
 }
 
-/// interp_signal.py:54-152 `CheckSignalAction` — a periodic action run
+/// interp_signal.py `CheckSignalAction` — a periodic action run
 /// whenever the C-level ticker goes negative.  It polls the pending-signal
 /// bitmask and invokes the registered app-level handler for each signal,
 /// which for SIGINT (default) raises `KeyboardInterrupt`.
 pub struct CheckSignalAction {
     base: PeriodicAsyncAction,
-    /// interp_signal.py:65 — a signal seen on a worker but not yet reported by
+    /// interp_signal.py — a signal seen on a worker but not yet reported by
     /// the signal-enabled main execution context.
     pending_signal: i32,
-    /// interp_signal.py:66/82-91 — a worker found a pending signal and left it
+    /// interp_signal.py/82-91 — a worker found a pending signal and left it
     /// for the signal-enabled main execution context.
     fire_in_another_thread: bool,
     /// interp_signal.py:66/103 — re-entrancy guard so a handler that
@@ -365,7 +365,7 @@ pub struct CheckSignalAction {
 }
 
 impl CheckSignalAction {
-    /// interp_signal.py:62-86 `CheckSignalAction.__init__`.
+    /// interp_signal.py `CheckSignalAction.__init__`.
     pub fn new(space: PyObjectRef) -> Box<Self> {
         Box::new(Self {
             base: PeriodicAsyncAction {
@@ -377,7 +377,7 @@ impl CheckSignalAction {
         })
     }
 
-    /// interp_signal.py:101-109 `_poll_for_signals` — the re-entrancy
+    /// interp_signal.py `_poll_for_signals` — the re-entrancy
     /// guard around the unlocked poll.
     fn poll_for_signals(&mut self, ec: &mut ExecutionContext) -> Result<(), crate::PyError> {
         if self.in_poll {
@@ -389,7 +389,7 @@ impl CheckSignalAction {
         result
     }
 
-    /// interp_signal.py:111-141 `_poll_for_signals_unlocked`; the
+    /// interp_signal.py `_poll_for_signals_unlocked`; the
     /// remote-debugger arm is not surfaced.
     fn poll_for_signals_unlocked(
         &mut self,
@@ -416,7 +416,7 @@ impl CheckSignalAction {
                     n = signalstate::signal_poll();
                 }
             } else {
-                // interp_signal.py:135-140 — do not consume a process signal
+                // interp_signal.py — do not consume a process signal
                 // on a worker.  Keep it on the shared CheckSignalAction and
                 // arm the main EC's registered ticker for prompt delivery.
                 self.pending_signal = n;
@@ -429,7 +429,7 @@ impl CheckSignalAction {
     }
 }
 
-/// interp_signal.py:196-209 `report_signal`.
+/// interp_signal.py `report_signal`.
 fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError> {
     let w_handler = get_handler(n);
     if w_handler.is_null() {
@@ -456,7 +456,7 @@ fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError
     Ok(())
 }
 
-/// interp_signal.py:169-193 `_report_wakeup_fd_error` — surface the errno
+/// interp_signal.py `_report_wakeup_fd_error` — surface the errno
 /// of a failed wakeup-fd write.  PyPy reports it through
 /// `write_unraisable_default`; pyre has no unraisable hook, so it writes
 /// the equivalent `OSError` line to stderr directly.
@@ -479,7 +479,7 @@ fn report_wakeup_fd_error(errno_val: i32) {
 }
 
 impl AsyncActionOps for CheckSignalAction {
-    /// interp_signal.py:94-99 `perform`.  The
+    /// interp_signal.py `perform`.  The
     /// `w_async_exception_type` arm only fires across threads, which pyre
     /// does not have, so it stays a no-op guard and we proceed straight
     /// to polling.
@@ -503,7 +503,7 @@ impl AsyncActionOps for CheckSignalAction {
 
 impl PeriodicAsyncActionOps for CheckSignalAction {}
 
-// `moduledef.py:64-66` stores one `CheckSignalAction` on the object space.
+// `moduledef.py` stores one `CheckSignalAction` on the object space.
 // Pyre's typed Rust object space is still process-owned, so keep the same
 // singleton shape here rather than leaking and registering a new action for
 // every top-level ExecutionContext created by an embedding.
@@ -581,7 +581,7 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
 /// macOS-flavoured hard-coded list disagreed with Linux for
 /// SIGUSR1/SIGUSR2/SIGCHLD).
 pub fn register_module(ns: pyre_object::PyObjectRef) {
-    // interp_signal.py:291-326 `signal(signum, handler) -> previous`.
+    // interp_signal.py `signal(signum, handler) -> previous`.
     crate::module_ns_store(
         ns,
         "signal",
@@ -594,7 +594,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             2,
         ),
     );
-    // interp_signal.py:238-251 `getsignal(signum) -> action`.
+    // interp_signal.py `getsignal(signum) -> action`.
     crate::module_ns_store(
         ns,
         "getsignal",
@@ -614,7 +614,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ns,
         "set_wakeup_fd",
         crate::make_builtin_function("set_wakeup_fd", |args| {
-            // interp_signal.py:330-331 — `set_wakeup_fd(fd, *,
+            // interp_signal.py — `set_wakeup_fd(fd, *,
             // warn_on_full_buffer=True)`: the flag is keyword-only, so a
             // second positional argument is rejected.
             let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -732,7 +732,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ));
                 }
             }
-            // interp_signal.py:376 — `pypysig_set_wakeup_fd`.  The OS
+            // interp_signal.py — `pypysig_set_wakeup_fd`.  The OS
             // handler writes the signal-number byte to this fd so a
             // select/poll loop blocked elsewhere wakes up.
             let prev = signalstate::set_wakeup_fd(fd, warn_on_full_buffer, use_send);
@@ -780,7 +780,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let raised = rustpython_host_env::signal::raise_signal(signum);
                     match raised {
                         Ok(()) => {
-                            // interp_signal.py:583-584 — the signal may
+                            // interp_signal.py — the signal may
                             // have been delivered to this thread; run the
                             // pending handler now (may raise).
                             checksignals_now()?;
@@ -849,7 +849,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             |_| {
                 #[cfg(feature = "host_env")]
                 {
-                    // `interp_signal.py:550-574 valid_signals` returns
+                    // `interp_signal.py valid_signals` returns
                     // `set(...)` via `_sigset_to_signals` (line 513),
                     // not a frozenset.  PyPy passes NSIG (64) here.
                     let sigs = rustpython_host_env::signal::valid_signals(64).unwrap_or_default();
@@ -1055,7 +1055,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                 "siginterrupt() requires 2 arguments",
                             ));
                         }
-                        // interp_signal.py:388 — `check_signum_in_range` runs
+                        // interp_signal.py — `check_signum_in_range` runs
                         // before the argument reaches `c_siginterrupt`, so the
                         // narrowing below is exact.
                         let sig = unsafe { pyre_object::w_int_get_value(args[0]) };
@@ -1097,7 +1097,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "ITIMER_PROF",
             pyre_object::w_int_new(libc::ITIMER_PROF as i64),
         );
-        // sigwait(sigset) -> signum — interp_signal.py:515-524
+        // sigwait(sigset) -> signum — interp_signal.py
         crate::module_ns_store(
             ns,
             "sigwait",
@@ -1122,7 +1122,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             // Range-check before narrowing, or a number that
                             // aliases a valid signal in its low 32 bits passes.
                             let signum = unsafe { pyre_object::w_int_get_value(it) };
-                            // interp_signal.py:285-288 check_signum_in_range
+                            // interp_signal.py check_signum_in_range
                             check_signum_in_range(signum)?;
                             let signum = signum as i32;
                             rustpython_host_env::signal::sigaddset(&mut set, signum).map_err(
@@ -1156,7 +1156,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 1,
             ),
         );
-        // sigpending() -> set of pending signals — interp_signal.py:526-535
+        // sigpending() -> set of pending signals — interp_signal.py
         crate::module_ns_store(
             ns,
             "sigpending",
@@ -1171,7 +1171,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                             return Err(errno_exception("OSError", errno));
                         }
-                        // interp_signal.py:502-513 _sigset_to_signals
+                        // interp_signal.py _sigset_to_signals
                         let items: Vec<pyre_object::PyObjectRef> = (1..signalstate::NSIG)
                             .filter(|s| {
                                 rustpython_host_env::signal::sigset_contains(mask, *s)
@@ -1188,7 +1188,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 0,
             ),
         );
-        // pthread_kill(tid, signum) -> None — interp_signal.py:466-474
+        // pthread_kill(tid, signum) -> None — interp_signal.py
         crate::module_ns_store(
             ns,
             "pthread_kill",
@@ -1216,7 +1216,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         if ret != 0 {
                             return Err(errno_exception("OSError", ret));
                         }
-                        // interp_signal.py:473-474 — the signal may have been
+                        // interp_signal.py — the signal may have been
                         // sent to the current thread.
                         checksignals_now()?;
                         Ok(pyre_object::w_none())
@@ -1282,7 +1282,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             )
                         })?;
                         for it in items {
-                            // interp_signal.py:492 — `SignalMask.__enter__` is
+                            // interp_signal.py — `SignalMask.__enter__` is
                             // shared with `sigwait` and range-checks every
                             // element before `c_sigaddset`.
                             let signum = unsafe { pyre_object::w_int_get_value(it) };

@@ -186,7 +186,7 @@ enum AbiArgPlacement {
     Stack(i32),
 }
 
-/// `x86/assembler.py:254 _push_all_regs_to_frame` parity — free-fn
+/// `x86/assembler.py _push_all_regs_to_frame` parity — free-fn
 /// variant that emits into an arbitrary `dynasmrt::x64::Assembler`,
 /// for use by helper-buffer builders that operate outside of an
 /// `Assembler386` instance (e.g. `_build_malloc_slowpath`,
@@ -215,7 +215,7 @@ pub(crate) fn push_all_regs_to_jitframe_raw(
     }
 }
 
-/// `x86/assembler.py:283 _pop_all_regs_from_frame` parity — free-fn
+/// `x86/assembler.py _pop_all_regs_from_frame` parity — free-fn
 /// variant; see `push_all_regs_to_jitframe_raw` for usage notes.
 pub(crate) fn pop_all_regs_from_jitframe_raw(
     asm: &mut Assembler,
@@ -239,7 +239,7 @@ pub(crate) fn pop_all_regs_from_jitframe_raw(
     }
 }
 
-/// `x86/assembler.py:1130 _call_footer_shadowstack` parity (free-fn
+/// `x86/assembler.py _call_footer_shadowstack` parity (free-fn
 /// variant for use outside of an `Assembler386` borrow — used by
 /// `emit_call_footer_raw`, which the standalone propagate / malloc
 /// slowpath trampolines reach for).  Subtracts `2 * WORD` from the
@@ -254,7 +254,7 @@ pub(crate) fn emit_footer_shadowstack_raw(asm: &mut Assembler) {
     );
 }
 
-/// `x86/assembler.py:1093 _call_footer` parity (free-fn variant).
+/// `x86/assembler.py _call_footer` parity (free-fn variant).
 /// Restores the callee-save set established by `_call_header` and
 /// returns the jitframe pointer in `rax`.  Must be entered with `rsp`
 /// at trace-body alignment (i.e. the same value the trace's
@@ -392,7 +392,7 @@ pub(crate) fn build_propagate_exception_path(
 ///
 /// `ecx` and `edx` are the only registers excluded from
 /// push_all_regs / pop_all_regs: `ecx` carries the return value
-/// (assembler.py:247 `_push_all_regs_to_frame(mc, [ecx, edx], floats)`),
+/// (assembler.py `_push_all_regs_to_frame(mc, [ecx, edx], floats)`),
 /// `edx` is the runtime size carrier and the caller's regalloc has
 /// already spilled any live value out of both before the call via
 /// `MALLOC_NURSERY_CLOBBER` (regalloc.rs).
@@ -471,7 +471,7 @@ pub(crate) fn build_malloc_slowpath_headerless(
 fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_path: usize) {
     let ignored = [crate::regloc::ECX, crate::regloc::EDX];
 
-    // assembler.py:247 `_push_all_regs_to_frame(mc, [ecx, edx], floats)`.
+    // assembler.py `_push_all_regs_to_frame(mc, [ecx, edx], floats)`.
     // Saves every managed GPR/XMM except ECX/EDX so the inner CALL's
     // caller-clobber set is contained.  EAX is included in the save
     // set (unlike pyre's prior `[EAX, EDX]` mask), preserving any
@@ -479,7 +479,7 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
     // promises ECX/EDX clobber to the caller.
     push_all_regs_to_jitframe_raw(asm, &ignored, true);
 
-    // assembler.py:258-261 `add_to_esp = 16 - WORD` plus Win64 shadow
+    // assembler.py `add_to_esp = 16 - WORD` plus Win64 shadow
     // space.  pyre's JIT body is 0-mod-16 (per `_call_header`'s
     // padding-slot SUB) and the outer `call rax` pushes the return
     // address, leaving rsp 8-mod-16 inside the trampoline.  The SUB
@@ -581,7 +581,7 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
     // pop rax`.
     dynasm!(asm ; .arch x64 ; mov rcx, rax);
 
-    // assembler.py:307 `_pop_all_regs_from_frame(mc, [ecx, edx], floats)`.
+    // assembler.py `_pop_all_regs_from_frame(mc, [ecx, edx], floats)`.
     pop_all_regs_from_jitframe_raw(asm, &ignored, true);
     // assembler.py:308 `self.pop_gcmap(mc)` — clear `JF_GCMAP_OFS`
     // before RET so the caller's regalloc layout (which never sees the
@@ -747,7 +747,7 @@ fn invert_cc(cc: u8) -> u8 {
     }
 }
 
-/// assembler.py:47 Assembler386.
+/// assembler.py Assembler386.
 /// In Rust, this is a transient builder — created per compilation,
 /// not a long-lived object like RPython's.
 ///
@@ -769,7 +769,7 @@ pub struct Assembler386<'a> {
     frame_depth: usize,
     /// Fail descriptors built during assembly — wrapped in `FailDescrCell`
     /// so `Arc::as_ptr` is a thin pointer suitable for direct
-    /// `Arc::from_raw` recovery (`history.py:113 AbstractDescr.show`).
+    /// `Arc::from_raw` recovery (`history.py AbstractDescr.show`).
     fail_descrs: Vec<std::sync::Arc<majit_ir::FailDescrCell>>,
     /// trace_id for this compilation.
     trace_id: u64,
@@ -777,7 +777,7 @@ pub struct Assembler386<'a> {
     header_pc: u64,
     /// Input argument types.
     input_types: Vec<Type>,
-    /// assembler.py:641 rebuild_faillocs_from_descr parity:
+    /// assembler.py rebuild_faillocs_from_descr parity:
     /// bridge input locations recovered from the source guard descr.
     bridge_input_locs: Option<Vec<Loc>>,
 
@@ -837,7 +837,7 @@ pub struct Assembler386<'a> {
     finish_gcmap: Option<*mut usize>,
     /// opassembler.py:1215 gcmap_for_finish.
     gcmap_for_finish: *mut usize,
-    /// assembler.py:2207 _store_force_index parity:
+    /// assembler.py _store_force_index parity:
     /// Pre-allocated fail descr for the next GUARD_NOT_FORCED, created
     /// at CALL_ASSEMBLER emission time so we can store its pointer to
     /// jf_force_descr before the call. Consumed by the subsequent
@@ -897,7 +897,7 @@ pub struct Assembler386<'a> {
     malloc_slowpath_fixed: usize,
     /// Headerless fixed-size nursery malloc slowpath trampoline.
     malloc_slowpath_headerless: usize,
-    /// `assembler.py:1545` `genop_load_from_gc_table`: base address of
+    /// `assembler.py` `genop_load_from_gc_table`: base address of
     /// this loop's per-loop `GcTable` slot array. Baked as a 64-bit
     /// immediate by the `LoadFromGcTable` genop; 0 when the trace
     /// references no reference constants. Set before `assemble_loop` /
@@ -934,7 +934,7 @@ struct GuardToken {
     const_stores: Vec<(usize, i64)>,
     /// opassembler.py:515 GuardToken.gcmap.
     gcmap: *mut usize,
-    /// llsupport/assembler.py:40-44 must_save_exception: true for
+    /// llsupport/assembler.py must_save_exception: true for
     /// GUARD_EXCEPTION / GUARD_NO_EXCEPTION / GUARD_NOT_FORCED.  Selects the
     /// exc=True failure-recovery variant that stages pos_exc_value into
     /// jf_guard_exc (store_info_on_descr:236) so grab_exc_value can read it.
@@ -949,13 +949,13 @@ pub struct CompiledCode {
     pub entry_offset: AssemblyOffset,
     /// Fail descriptors for guards + FINISH ops.
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
-    /// contract (compile.py:183-203 record_loop_or_bridge). Position
+    /// contract (compile.py record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at conversion
     /// from the in-progress `Assembler386.fail_descrs` Vec.
     pub fail_descrs: Box<[std::sync::Arc<majit_ir::FailDescrCell>]>,
     /// Input argument types.
     pub input_types: Vec<Type>,
-    /// `compile.py:665-674` parity: `Arc` clone of the owning cpu's
+    /// `compile.py` parity: `Arc` clone of the owning cpu's
     /// attachment handle.  Keeps the heap pointee alive for the whole
     /// lifetime of this compiled trace so the `cpu_handle` immediate
     /// baked into the CALL_ASSEMBLER helper call site never dangles,
@@ -1124,7 +1124,7 @@ impl<'a> Assembler386<'a> {
             .exit_frame_with_exception_descr_ref as i64
     }
 
-    /// `pyjitpl.py:2283` parity: `self.cpu.propagate_exception_descr`.
+    /// `pyjitpl.py` parity: `self.cpu.propagate_exception_descr`.
     /// Stamped into `jf_descr` by the inline propagate path emitted at
     /// `OpCode::CheckMemoryError` (assembler.py:1630-1641
     /// `genop_discard_check_memory_error`).
@@ -1154,14 +1154,14 @@ impl<'a> Assembler386<'a> {
         if let Some(&slot) = self.opref_to_slot.get(&opref) {
             return ResolvedArg::Slot(Self::slot_offset(slot));
         }
-        // history.py:227/268/314 — inline-Const variants carry value inline.
+        // history.py/268/314 — inline-Const variants carry value inline.
         if let Some(val) = opref
             .inline_const_bits()
             .or_else(|| self.constants.get(&opref.raw()).map(|c| c.as_raw_i64()))
         {
             return ResolvedArg::Const(val);
         }
-        // history.py:227/268/314 — Const always carries a value, so a
+        // history.py/268/314 — Const always carries a value, so a
         // constant OpRef with no resolvable value is an invariant break,
         // not a `#0`.
         if opref.is_constant() {
@@ -1457,7 +1457,7 @@ impl<'a> Assembler386<'a> {
     ///   ; fallthrough = real overflow → return rbp as jf_ptr
     /// ```
     fn _call_header(&mut self, inputargs: &[InputArg]) {
-        // x86/assembler.py:1052 _call_header parity. PyPy reserves the
+        // x86/assembler.py _call_header parity. PyPy reserves the
         // whole frame in a single `SUB esp, FRAME_FIXED_SIZE * WORD` and
         // stores `CALLEE_SAVE_REGISTERS` plus `ebp` at fixed offsets.
         // The Pyre variant uses the same shape (single SUB + offset
@@ -1548,7 +1548,7 @@ impl<'a> Assembler386<'a> {
                     ; .arch x64
                     ; test al, al
                     ; jz =>continue_label
-                    // x86/assembler.py:347-390 `_build_stack_check_slowpath`:
+                    // x86/assembler.py `_build_stack_check_slowpath`:
                     // the slowpath raised into pos_exception(); merge with the
                     // propagate-exception path by moving that value into
                     // jf_guard_exc and publishing propagate_exception_descr.
@@ -1998,14 +1998,14 @@ impl<'a> Assembler386<'a> {
         let cmp_imm_ofs = self.mc.offset().0 - 4;
         self.frame_depth_to_patch.push(cmp_imm_ofs);
 
-        // assembler.py:921 — sp = IncreaseStackSlowPath(mc, 'L').
+        // assembler.py — sp = IncreaseStackSlowPath(mc, 'L').
         // PyPy uses condition 'L' (signed less than) for the slowpath
         // entry; the fast-path fall-through is the JGE-skip equivalent.
         let continue_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; jge =>continue_label);
 
         // ── inlined IncreaseStackSlowPath + _frame_realloc_slowpath ──
-        // assembler.py:145 _push_all_regs_to_frame(mc, [], supports_floats)
+        // assembler.py _push_all_regs_to_frame(mc, [], supports_floats)
         self.push_all_regs_to_jitframe(&[], true);
         // assembler.py:907 push_gcmap(store=True) — pyre writes to
         // [rbp + JF_GCMAP_OFS] rather than a stack slot, matching the
@@ -2125,7 +2125,7 @@ impl<'a> Assembler386<'a> {
         );
     }
 
-    /// x86/assembler.py:1130 `_call_footer_shadowstack` parity:
+    /// x86/assembler.py `_call_footer_shadowstack` parity:
     ///
     /// ```python
     /// if rx86.fits_in_32bits(rst):
@@ -2179,7 +2179,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// x86/assembler.py:1369-1383 `_reload_frame_if_necessary` parity:
+    /// x86/assembler.py `_reload_frame_if_necessary` parity:
     ///
     /// ```python
     ///   MOV ecx, [rootstacktop]   // shadow stack top pointer
@@ -2237,7 +2237,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// `llsupport/assembler.py:46-64 GuardToken.compute_gcmap`: skip the hole
+    /// `llsupport/assembler.py GuardToken.compute_gcmap`: skip the hole
     /// a virtual leaves (`if arg is None: continue`), mark every remaining
     /// `REF`-typed failarg, narrow nothing else.  A force token is marked like
     /// any other — `resoperation.py FORCE_TOKEN/0/r` returns the jitframe,
@@ -2272,7 +2272,7 @@ impl<'a> Assembler386<'a> {
         gcmap
     }
 
-    /// `x86/assembler.py:990 fixup_target_tokens`.
+    /// `x86/assembler.py fixup_target_tokens`.
     /// A LABEL assembled inside a bridge is a jump target for later traces exactly like a loop's.
     fn fixup_target_tokens(tokens: Vec<majit_ir::DescrRef>, frame_depth: usize, rawstart: usize) {
         for descr in tokens {
@@ -2416,7 +2416,7 @@ impl<'a> Assembler386<'a> {
         CallAssemblerTargetAddr { immediate: None }
     }
 
-    /// llsupport/assembler.py:201 rebuild_faillocs_from_descr — reconstruct
+    /// llsupport/assembler.py rebuild_faillocs_from_descr — reconstruct
     /// the locations of bridge inputargs from the guard's recovery layout.
     ///
     /// patch_jump_for_descr overwrites the recovery stub with a direct
@@ -2773,7 +2773,7 @@ impl<'a> Assembler386<'a> {
             }
             // ── Integer binary (result_loc == arglocs[0], guaranteed by regalloc) ──
             // x86/assembler.py:1881 genop_int_add uses LEA, not ADD, because
-            // regalloc.py:566 consider_int_add routes 32-bit constants through
+            // regalloc.py consider_int_add routes 32-bit constants through
             // `_consider_lea`, which force-allocates a fresh result register
             // (independent of arg0). Emitting `add dst, src` here would
             // operate on whatever stale value Rq(dst) still held — for the
@@ -2815,7 +2815,7 @@ impl<'a> Assembler386<'a> {
                     }
                 }
             }
-            // x86/assembler.py:1268-1284 `_binaryop_or_lea(asmop='SUB',
+            // x86/assembler.py `_binaryop_or_lea(asmop='SUB',
             // is_add=False)`: when `result_loc is arglocs[0]` emit
             // `SUB dst, src` in place; otherwise the regalloc routed
             // through `_consider_lea` (consider_int_sub at
@@ -2838,7 +2838,7 @@ impl<'a> Assembler386<'a> {
                     } else {
                         match (a0, src) {
                             (Loc::Reg(a), Loc::Immed(i)) => {
-                                // regalloc.py:577 — `_consider_lea` is guarded
+                                // regalloc.py — `_consider_lea` is guarded
                                 // by `rx86.fits_in_32bits(-y.value)`. The
                                 // wrapping negate matches PyPy `-y.value`;
                                 // `y.value = 2147483648` is valid because
@@ -2926,7 +2926,7 @@ impl<'a> Assembler386<'a> {
                 }
             }
             // ── Integer comparisons ──
-            // x86/assembler.py:1301 `_cmpop` + 1286 `flush_cc` parity.
+            // x86/assembler.py `_cmpop` + 1286 `flush_cc` parity.
             // When the regalloc picks `frame_reg` (rbp) as the result
             // sentinel, the comparison's outcome lives in the condition
             // flags and the following guard consumes it directly —
@@ -3109,7 +3109,7 @@ impl<'a> Assembler386<'a> {
                         self.regalloc_mov(b_loc, &Loc::Reg(scratch));
                         scratch
                     };
-                    // `assembler.py:1322 _cmpop_float`: UCOMISD sets
+                    // `assembler.py _cmpop_float`: UCOMISD sets
                     // ZF = PF = CF = 1 when either operand is NaN, so only the
                     // `A` / `AE` forms are already false on an unordered
                     // compare.  FLOAT_LT / FLOAT_LE reach them by comparing in
@@ -3198,7 +3198,7 @@ impl<'a> Assembler386<'a> {
                     ; mov Rq(dst.value), [Rq(dst.value)]
                 );
             }
-            // `assembler.py:1528 genop_cast_ptr_to_int = _genop_same_as`
+            // `assembler.py genop_cast_ptr_to_int = _genop_same_as`
             // / `:1529 genop_cast_int_to_ptr = _genop_same_as`.  PyPy's
             // x86 backend treats both casts as plain `mov` — the
             // AddressAsInt low-bit tag is a `blackhole.py:603-610`
@@ -3223,7 +3223,7 @@ impl<'a> Assembler386<'a> {
             | OpCode::ArraylenGc
             | OpCode::Strlen
             | OpCode::Unicodelen => {
-                // regalloc.py:1154-1167 `_consider_gc_load` parity: both
+                // regalloc.py `_consider_gc_load` parity: both
                 // `base_loc = self.rm.make_sure_var_in_reg(op.getarg(0), args)`
                 // and `result_loc = self.force_allocate_reg(op)` force
                 // register materialisation — pyre's
@@ -3361,7 +3361,7 @@ impl<'a> Assembler386<'a> {
             // `base_loc` may be Loc::Immed when the load is from a
             // constant pointer (e.g. `GcLoadI(jfi_descr_ptr, 8, 8)` for
             // the JITFRAME size in CallMallocNurseryVarsizeFrame).
-            // llsupport/regalloc.py:625 return_constant returns the
+            // llsupport/regalloc.py return_constant returns the
             // bare Loc::Immed in that case and the assembler is
             // responsible for materializing it. Mirror aarch64 by
             // staging the constant through the scratch register (R11);
@@ -3420,7 +3420,7 @@ impl<'a> Assembler386<'a> {
             // ── GC store / raw store: opassembler.rs emit_op_gcstore_regalloc ──
             // arglocs = [value_loc, base_loc, ofs_loc, size_loc].
             // value_loc may be Loc::Immed when the source is a Const
-            // (llsupport/regalloc.py:625 return_constant), so the emitter
+            // (llsupport/regalloc.py return_constant), so the emitter
             // must materialize it before the store — silently dropping
             // such writes left newly-allocated objects without vtables
             // and triggered downstream GuardClass failures.
@@ -3456,7 +3456,7 @@ impl<'a> Assembler386<'a> {
                     }
                 }
             }
-            // ── x86/assembler.py:1753 genop_discard_gc_store_indexed ──
+            // ── x86/assembler.py genop_discard_gc_store_indexed ──
             // `base_loc, ofs_loc, value_loc, factor_loc, offset_loc, size_loc = arglocs`.
             // `dest_addr = AddressLoc(base_loc, ofs_loc, scale=get_scale(factor_loc.value), disp=offset_loc.value)`
             // emits `[base + ofs * 2**scale + disp]`. `load_supported_factors =
@@ -3581,7 +3581,7 @@ impl<'a> Assembler386<'a> {
                     }
                 }
             }
-            // ── x86/assembler.py:1701 _genop_gc_load_indexed ──
+            // ── x86/assembler.py _genop_gc_load_indexed ──
             // Line-by-line port:
             //   base_loc, ofs_loc, scale_loc, offset_loc, size_loc, sign_loc = arglocs
             //   scale = get_scale(scale_loc.value)
@@ -3649,7 +3649,7 @@ impl<'a> Assembler386<'a> {
                     other => panic!("GcLoadIndexed result_loc must be Loc::Reg, got {other:?}",),
                 };
 
-                // assembler.py:1645 `load_from_mem`: dispatch by (resloc.is_xmm,
+                // assembler.py `load_from_mem`: dispatch by (resloc.is_xmm,
                 // size, sign). PyPy's `addr_add` returns `AddressLoc(base,
                 // ofs, scale, disp)` which the encoder materializes as a
                 // SIB scaled-index addressing mode straight on the MOV
@@ -3660,7 +3660,7 @@ impl<'a> Assembler386<'a> {
                 // factor is bound. xmm targets always use MOVSD per
                 // load_from_mem:1649; integer targets pick MOV /
                 // MOVZX{8,16} / MOVSX{8,16,32} based on size+sign.
-                // assembler.py:1645 load_from_mem allows WORD, 1, 2, and
+                // assembler.py load_from_mem allows WORD, 1, 2, and
                 // (x86_64) 4; any other size is `not_implemented`.
                 macro_rules! emit_load_scaled {
                     ($scale:tt) => {{
@@ -3885,7 +3885,7 @@ impl<'a> Assembler386<'a> {
                     //
                     // `ebp_loc_pat!` rather than `Loc::Frame` alone because a
                     // frame-pointer location has two spellings and both carry
-                    // `is_float` (`regloc.py:113 class FrameLoc(RawEbpLoc)`);
+                    // `is_float` (`regloc.py class FrameLoc(RawEbpLoc)`);
                     // naming one sent the other to the integer set.
                     let is_float = match src_loc {
                         Loc::Reg(r) => r.is_xmm,
@@ -3948,7 +3948,7 @@ impl<'a> Assembler386<'a> {
                     let target = descr.ll_loop_code();
                     // External JUMP: direct JMP to target loop code.
                     // assembler.py:2461 mc.JMP(imm(target)) — PyPy's
-                    // `LocationCodeBuilder._addr_as_reg_offset` (regloc.py:204)
+                    // `LocationCodeBuilder._addr_as_reg_offset` (regloc.py)
                     // stages a 64-bit absolute target through
                     // `X86_64_SCRATCH_REG = r11`, never RAX.  Using RAX
                     // here clobbers the loop-carried Ref that the
@@ -3985,10 +3985,10 @@ impl<'a> Assembler386<'a> {
                 } else {
                     fail_arg_types[0]
                 };
-                // `compile.py:658` ExitFrameWithExceptionDescrRef identity:
+                // `compile.py` ExitFrameWithExceptionDescrRef identity:
                 // route to the metainterp `exit_frame_with_exception_descr_ref`
                 // when the FINISH was emitted for
-                // `pyjitpl.py:3238 compile_exit_frame_with_exception`.  The
+                // `pyjitpl.py compile_exit_frame_with_exception`.  The
                 // runtime classifier (`runner.rs::find_descr_by_ptr`) then
                 // dispatches into `jitexc.ExitFrameWithExceptionRef` rather
                 // than `jitexc.DoneWithThisFrame*`.
@@ -4001,8 +4001,8 @@ impl<'a> Assembler386<'a> {
                     self.done_with_this_frame_descr_ptr_for_type(result_type)
                 };
                 // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
-                // `compile.py:185` skips these — not a `ResumeDescr`.
-                // `genop_finish` (assembler.py:2114-2156) stamps the
+                // `compile.py` skips these — not a `ResumeDescr`.
+                // `genop_finish` (assembler.py) stamps the
                 // metainterp singleton directly into `jf_descr` via the GC
                 // table index; pyre's runtime classifier (`runner.rs::
                 // find_descr_by_ptr` lines 1115-1151) short-circuits the
@@ -4011,7 +4011,7 @@ impl<'a> Assembler386<'a> {
                 // wrapper has no jf_descr role.  Push the singleton Arc
                 // directly.  Test scaffolds must attach singletons (via
                 // `attach_default_test_descrs` or `MetaInterp::new` per
-                // `pyjitpl.py:2222 finish_setup`) before emitting FINISH.
+                // `pyjitpl.py finish_setup`) before emitting FINISH.
                 let descr: majit_ir::DescrRef = if is_exit_exc {
                     self.cpu_handle
                         .read()
@@ -4111,7 +4111,7 @@ impl<'a> Assembler386<'a> {
             // by the time the emitter sees it. Which registers that saved is the
             // `SAVE_ALL_REGS / SAVE_GCREF_REGS / SAVE_DEFAULT_REGS` choice made
             // there, not a blanket spill: `spill_or_move_registers_before_call`
-            // (`regalloc.py:714`) drops values that die at the call, leaves
+            // (`regalloc.py`) drops values that die at the call, leaves
             // callee-saved ones where they are, and prefers moving the rest to a
             // free callee-saved register over spilling them.
             //
@@ -4161,7 +4161,7 @@ impl<'a> Assembler386<'a> {
             | OpCode::CallAssemblerR
             | OpCode::CallAssemblerF
             | OpCode::CallAssemblerN => {
-                // assembler.py:2207 _store_force_index parity:
+                // assembler.py _store_force_index parity:
                 // store next GUARD_NOT_FORCED's descr ptr to jf_force_descr
                 // BEFORE the call, so forcing code knows which guard to resume.
                 self._store_force_index_if_next_guard(ops, op_index, fail_index);
@@ -4305,7 +4305,7 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; mov [rbp + offset], Rq(rv));
                 }
             }
-            // x86/assembler.py:2567 malloc_cond_varsize parity
+            // x86/assembler.py malloc_cond_varsize parity
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
             OpCode::CallMallocNurseryVarsize => {
                 let base_size = op.with_array_descr(|ad| ad.base_size()).unwrap_or(16) as i64;
@@ -4371,7 +4371,7 @@ impl<'a> Assembler386<'a> {
                     self.store_rax_to_result(op.pos.get());
                 }
             }
-            // x86/assembler.py:1630-1641 `genop_discard_check_memory_error`
+            // x86/assembler.py `genop_discard_check_memory_error`
             // — emit `TEST reg, reg` + `JNZ skip` and inline the
             // propagate path (`_build_propagate_exception_path`,
             // assembler.py:328-345) so a NULL return from a malloc
@@ -4394,7 +4394,7 @@ impl<'a> Assembler386<'a> {
             //   2. mov [jf_guard_exc], eax
             //      — transfer the saved value into the deadframe so
             //      `cpu.grab_exc_value(deadframe)` can read it back in
-            //      `PropagateExceptionDescr.handle_fail` (compile.py:1095).
+            //      `PropagateExceptionDescr.handle_fail` (compile.py).
             //   3. mov [jf_descr], propagate_exception_descr
             //   4. _call_footer
             OpCode::CheckMemoryError => {
@@ -4404,11 +4404,11 @@ impl<'a> Assembler386<'a> {
                 };
                 self.emit_propagate_exception_if_zero(reg);
             }
-            // x86/assembler.py:2438 genop_discard_cond_call_gc_wb
+            // x86/assembler.py genop_discard_cond_call_gc_wb
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.emit_write_barrier_fastpath(op, &arglocs);
             }
-            // x86/assembler.py:2694 genop_discard_zero_array.  The GC
+            // x86/assembler.py genop_discard_zero_array.  The GC
             // rewriter leaves ZERO_ARRAY in the stream and mutates its range
             // after observing following SETARRAYITEM_GC stores; it must reach
             // codegen even though it has no result.
@@ -4419,7 +4419,7 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), rbp);
                 }
             }
-            // assembler.py:1820-1821 genop_save_exception IS
+            // assembler.py genop_save_exception IS
             // `_store_and_reset_exception(resloc)` — reuse the shared helper.
             OpCode::SaveException => self.emit_store_and_reset_exception(result_loc),
             OpCode::SaveExcClass => self.genop_save_exc_class(result_loc),
@@ -4449,7 +4449,7 @@ impl<'a> Assembler386<'a> {
         fail_index: u32,
     ) {
         match op.opcode {
-            // x86/assembler.py:1773 `genop_guard_guard_true` is a bare
+            // x86/assembler.py `genop_guard_guard_true` is a bare
             // `implement_guard(guard_token)` — the regalloc routed the
             // condition through `load_condition_into_cc`, which either
             // reuses the cc from the prior CompOp (CC fusion) or emits
@@ -4460,7 +4460,7 @@ impl<'a> Assembler386<'a> {
                 }
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
-            // x86/assembler.py:1777 `genop_guard_guard_false` inverts
+            // x86/assembler.py `genop_guard_guard_false` inverts
             // the published cc, then implements. So a fused IntLt that
             // set CC_L turns into a CC_GE failure jump under GuardFalse.
             OpCode::GuardFalse | OpCode::VecGuardFalse | OpCode::GuardIsnull => {
@@ -4579,7 +4579,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// Helper: guard class comparison.
-    /// x86/assembler.py:1880 `_cmp_guard_class` emits a single
+    /// x86/assembler.py `_cmp_guard_class` emits a single
     /// `CMP [obj + vtable_offset], classptr` so the object register is
     /// never touched. Mirror that: for register and 32-bit-fitting
     /// immediate classptrs we emit the memory-operand CMP directly; for
@@ -4654,7 +4654,7 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64 ; mov Rd(dst_reg), [Rq(obj_reg) + tid_ofs]);
     }
 
-    /// x86/assembler.py:1893-1901 `_cmp_guard_gc_type`, adjusted for
+    /// x86/assembler.py `_cmp_guard_gc_type`, adjusted for
     /// majit's object pointer: the GC header word lives at
     /// `obj - GcHeader::SIZE`, and a 32-bit load zero-extends the type id.
     fn _cmp_guard_gc_type(&mut self, obj_loc: &Loc, expected_typeid_loc: &Loc) {
@@ -4684,7 +4684,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// x86/assembler.py:1924-1943 `genop_guard_guard_is_object`.
+    /// x86/assembler.py `genop_guard_guard_is_object`.
     fn emit_guard_is_object(&mut self, obj_loc: &Loc, typeid_loc: &Loc) {
         let info = self.require_guard_gc_type_info("GUARD_IS_OBJECT");
         let (Loc::Reg(obj), Loc::Reg(typeid)) = (obj_loc, typeid_loc) else {
@@ -4706,7 +4706,7 @@ impl<'a> Assembler386<'a> {
         );
     }
 
-    /// x86/assembler.py:1945-1980 `genop_guard_guard_subclass`.
+    /// x86/assembler.py `genop_guard_guard_subclass`.
     fn emit_guard_subclass(&mut self, obj_loc: &Loc, class_loc: &Loc, tmp_loc: &Loc) {
         let info = self.require_guard_gc_type_info("GUARD_SUBCLASS");
         let (Loc::Reg(obj), Loc::Immed(classptr), Loc::Reg(tmp)) = (obj_loc, class_loc, tmp_loc)
@@ -4788,7 +4788,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// x86/assembler.py:1808-1815 `genop_guard_guard_exception`.
+    /// x86/assembler.py `genop_guard_guard_exception`.
     fn emit_guard_exception(&mut self, expected_loc: &Loc, tmp_loc: &Loc) {
         let Loc::Reg(tmp) = tmp_loc else {
             return;
@@ -4804,7 +4804,7 @@ impl<'a> Assembler386<'a> {
     /// `assembler.py:328-345 _build_propagate_exception_path` inline.
     /// Emits `TEST reg, reg; JNZ skip; <propagate body>; skip:` —
     /// the per-site propagate sequence used by both `CheckMemoryError`
-    /// (assembler.py:1630 `genop_discard_check_memory_error`) and the
+    /// (assembler.py `genop_discard_check_memory_error`) and the
     /// caller-side `CallMallocNursery` OOM check (`assembler.py:300-322`,
     /// which PyPy emits inside the shared `_build_malloc_slowpath`).
     ///
@@ -4812,7 +4812,7 @@ impl<'a> Assembler386<'a> {
     /// `rax` is freely clobberable on the propagate path.  No-op when
     /// `propagate_exception_descr` is unattached (test harnesses that
     /// bypass `MetaInterp::finish_setup`); production
-    /// (`pyjitpl.py:2283`) always sets it before `compile_loop` runs.
+    /// (`pyjitpl.py`) always sets it before `compile_loop` runs.
     fn emit_propagate_exception_if_zero(&mut self, reg: u8) {
         let propagate_descr = self.propagate_exception_descr_ptr();
         if propagate_descr == 0 {
@@ -4924,7 +4924,7 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64 ; movzx Rd(dst_reg), Rb(dst_reg));
     }
 
-    /// `assembler.py:1314 _if_parity_clear_zero_and_carry`.
+    /// `assembler.py _if_parity_clear_zero_and_carry`.
     ///
     /// UCOMISD sets PF on an unordered compare, together with ZF and CF, so
     /// `sete` / `setb` / `setbe` would report NaN as equal / less-than and
@@ -4940,7 +4940,7 @@ impl<'a> Assembler386<'a> {
         );
     }
 
-    /// x86/assembler.py:1286 `flush_cc` parity.
+    /// x86/assembler.py `flush_cc` parity.
     ///
     /// After emitting a CMP/TEST that leaves a boolean in the
     /// condition flags, call this. If the regalloc picked `frame_reg`
@@ -4976,7 +4976,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// x86/regalloc.py:429 `load_condition_into_cc` parity for the
+    /// x86/regalloc.py `load_condition_into_cc` parity for the
     /// emit side. If the previous op already published a cond in
     /// `guard_success_cc`, the guard reads it directly. Otherwise the
     /// guard arg is a materialised boolean and we re-issue
@@ -5058,12 +5058,12 @@ impl<'a> Assembler386<'a> {
         faillocs: &[Option<Loc>],
     ) {
         let fail_arg_types = self.infer_fail_arg_types(op, Some(op_index));
-        // assembler.py:2207 _store_force_index parity:
+        // assembler.py _store_force_index parity:
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
         // (stored in pending_force_descr), reuse it — same Arc, same ptr
         // that was written to jf_force_descr.
         // Stamp the per-trace fail_index and trace_id onto the metainterp
-        // ResumeGuardDescr (`op.descr`).  `compile.py:185` reserves these
+        // ResumeGuardDescr (`op.descr`).  `compile.py` reserves these
         // slots for the `ResumeDescr` family; gate the writes accordingly
         // so non-resume meta descrs (Done* / Exit* / Propagate) take the
         // default panic path.  The metainterp's `build_guard_metadata`
@@ -5082,7 +5082,7 @@ impl<'a> Assembler386<'a> {
         let descr: majit_ir::DescrRef = if let Some(pre) = self.pending_force_descr.take() {
             pre
         } else if let Some(d) = descr_arc {
-            // Guard exit — `compile.py:185` ResumeGuardDescr family.
+            // Guard exit — `compile.py` ResumeGuardDescr family.
             // Use the metainterp `AbstractFailDescr` Arc from `op.descr`
             // directly; per-trace fail_index / trace_id were stamped above.
             let _unused = fail_arg_types; // already stored on op.descr's types slot
@@ -5111,7 +5111,7 @@ impl<'a> Assembler386<'a> {
             );
         }
 
-        // `llsupport/assembler.py:248-276 store_info_on_descr` parity:
+        // `llsupport/assembler.py store_info_on_descr` parity:
         // encode each fail-arg location as a USHORT.  PyPy's encoding —
         //   None              → 0xFFFF
         //   GPR register      → position in `cpu.gen_regs`
@@ -5122,7 +5122,7 @@ impl<'a> Assembler386<'a> {
         // returns the immediate inline.  Pyre allocates a const-store
         // slot for `Loc::Immed` at codegen time and encodes the slot
         // into `rd_locs` so the deopt path treats it as a normal stack
-        // position (`_decode_pos` in `llmodel.py:422-424`).
+        // position (`_decode_pos` in `llmodel.py`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
         let gpr_regs = crate::x86::regalloc::ALL_CORE_REGS;
         let float_regs = crate::x86::regalloc::ALL_FLOAT_REGS;
@@ -5165,12 +5165,12 @@ impl<'a> Assembler386<'a> {
         }
         // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`
         // — write through the trait accessor so the metainterp
-        // `AbstractFailDescr` (`history.py:132 _attrs_`) receives the
+        // `AbstractFailDescr` (`history.py _attrs_`) receives the
         // canonical copy.  Must follow the `meta_descr` stamp above.
         descr_fd.set_rd_locs(rd_locs);
-        // `regalloc.py:496-499 consider_guard_value` — every upstream backend
+        // `regalloc.py consider_guard_value` — every upstream backend
         // stamps the per-value counter while laying the guard out, so
-        // `store_hash` (`compile.py:826-829`, gated on `status == 0`) leaves it
+        // `store_hash` (`compile.py`, gated on `status == 0`) leaves it
         // alone and `must_compile` hashes the (guard, failing value) pair
         // instead of the guard alone.  Without it a guard whose failing value
         // never repeats still accumulates in one bucket and compiles another
@@ -5247,7 +5247,7 @@ impl<'a> Assembler386<'a> {
 
         dynasm!(self.mc ; .arch x64 ; call =>save_regs_label);
 
-        // llsupport/assembler.py:236 store_info_on_descr — must_save_exception
+        // llsupport/assembler.py store_info_on_descr — must_save_exception
         // guards run the exc=True failure-recovery variant: stage pos_exc_value
         // into jf_guard_exc and clear both globals so grab_exc_value reads the
         // value off the deadframe (assembler.py:2089-2096 _build_failure_recovery).
@@ -5579,7 +5579,7 @@ impl<'a> Assembler386<'a> {
 
     // genop_* — overflow arithmetic (assembler.py:1413-1425)
 
-    /// assembler.py:1856 genop_int_add_ovf — delegates to genop_int_add,
+    /// assembler.py genop_int_add_ovf — delegates to genop_int_add,
     /// then sets guard_success_cc = 'NO'. On x86, ADD always sets OF.
     #[allow(dead_code)]
     fn genop_int_add_ovf(&mut self, op: &Op) {
@@ -5587,14 +5587,14 @@ impl<'a> Assembler386<'a> {
         self.guard_success_cc = Some(CC_NO);
     }
 
-    /// assembler.py:1860 genop_int_sub_ovf.
+    /// assembler.py genop_int_sub_ovf.
     #[allow(dead_code)]
     fn genop_int_sub_ovf(&mut self, op: &Op) {
         self.genop_int_sub(op);
         self.guard_success_cc = Some(CC_NO);
     }
 
-    /// assembler.py:1864 genop_int_mul_ovf.
+    /// assembler.py genop_int_mul_ovf.
     #[allow(dead_code)]
     fn genop_int_mul_ovf(&mut self, op: &Op) {
         self.genop_int_mul(op); // IMUL sets OF on x86
@@ -5660,7 +5660,7 @@ impl<'a> Assembler386<'a> {
 
     // genop_* — guards
 
-    /// llsupport/gc.py:563 GcLLDescr_framework
+    /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Looks up the materialized table populated by the runner from
     /// the active gc_ll_descr. RPython resolves the same value via
@@ -5768,7 +5768,7 @@ impl<'a> Assembler386<'a> {
                 fa.iter()
                     .map(|opref| {
                         if opref.is_none() {
-                            // resume.py:411-417 parity: TAGCONST/TAGVIRTUAL
+                            // resume.py parity: TAGCONST/TAGVIRTUAL
                             // slots are kept as OpRef::NONE in fail_args
                             // (PyPy filters them out; pyre keeps positional).
                             // `Type::Void` is the "hole" sentinel — value
@@ -5843,7 +5843,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// assembler.py:1794 generate_guard_no_exception:
+    /// assembler.py generate_guard_no_exception:
     /// `CMP heap(self.cpu.pos_exception()), imm0` with success on zero.
     fn emit_guard_no_exception_check(&mut self) {
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
@@ -5855,11 +5855,11 @@ impl<'a> Assembler386<'a> {
         self.guard_success_cc = Some(CC_E);
     }
 
-    /// assembler.py:2207-2222 _store_force_index: before a call that may force,
+    /// assembler.py _store_force_index: before a call that may force,
     /// store the next GUARD_NOT_FORCED's fail descr ptr to jf_force_descr,
     /// and zero jf_descr so GUARD_NOT_FORCED's CMP [jf_descr], 0 starts clean.
     fn _store_force_index_if_next_guard(&mut self, ops: &[Op], op_idx: usize, fail_index: u32) {
-        // assembler.py:2224-2226 _find_nearby_operation(+1)
+        // assembler.py _find_nearby_operation(+1)
         let next_idx = op_idx + 1;
         if next_idx >= ops.len() {
             return;
@@ -5946,7 +5946,7 @@ impl<'a> Assembler386<'a> {
                 .map(|opref| self.opref_type_at(*opref, None).unwrap_or(Type::Int))
                 .collect()
         };
-        // compile.py:618-669 parity: use type-specific global singleton.
+        // compile.py parity: use type-specific global singleton.
         // FINISH op exit (DoneWithThisFrame*) — `compile.py:185` skips these.
         // Finish ops write the type-appropriate singleton pointer to jf_descr
         // so CALL_ASSEMBLER's fast path CMP matches the correct variant.
@@ -6215,7 +6215,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// x86/assembler.py:1691 _genop_gc_load — sized load via regalloc.
+    /// x86/assembler.py _genop_gc_load — sized load via regalloc.
     /// `size`: byte size (1/2/4/8). Negative = signed load.
     fn emit_op_gcload_regalloc(
         &mut self,
@@ -6305,7 +6305,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// x86/assembler.py:1746 genop_discard_gc_store — sized store via regalloc.
+    /// x86/assembler.py genop_discard_gc_store — sized store via regalloc.
     fn emit_op_gcstore_regalloc(
         &mut self,
         base: &crate::regloc::RegLoc,
@@ -6326,7 +6326,7 @@ impl<'a> Assembler386<'a> {
     }
 
     /// Immediate-value variant of `emit_op_gcstore_regalloc`.
-    /// `llsupport/regalloc.py:625 return_constant` may return a bare
+    /// `llsupport/regalloc.py return_constant` may return a bare
     /// `Loc::Immed` for a Const value, so GcStore reaches the emitter
     /// with the literal already in hand. x86 can write the immediate
     /// directly into memory when it fits in `imm32` (sign-extended for
@@ -6424,7 +6424,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// Sized store: `[base + ofs]` or `[base + ofs_reg]` — assembler.py:1671 save_into_mem.
+    /// Sized store: `[base + ofs]` or `[base + ofs_reg]` — assembler.py save_into_mem.
     fn emit_gcstore_sized(
         &mut self,
         base: &crate::regloc::RegLoc,
@@ -6498,7 +6498,7 @@ impl<'a> Assembler386<'a> {
     }
 
     // genop_* — calls
-    // x86/assembler.py:2230 _genop_call
+    // x86/assembler.py _genop_call
 
     fn argloc_imm(arglocs: &[Loc], index: usize) -> i64 {
         match arglocs.get(index) {
@@ -6562,7 +6562,7 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64 ; pop rbp);
     }
 
-    /// aarch64/opassembler.py:1036 _emit_call.
+    /// aarch64/opassembler.py _emit_call.
     /// arglocs = [resloc, size, sign, func, args...] for normal CALLs and
     /// [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
     ///
@@ -6702,7 +6702,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// assembler.py:2176 _genop_call — internal call implementation.
+    /// assembler.py _genop_call — internal call implementation.
     fn _genop_call(&mut self, op: &Op) {
         self.emit_call(op, 0);
     }
@@ -6716,7 +6716,7 @@ impl<'a> Assembler386<'a> {
     }
 
     fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
-        // llsupport/callbuilder.py:36 emit order — prepare_arguments() then
+        // llsupport/callbuilder.py emit order — prepare_arguments() then
         // push_gcmap(); emit_raw_call(); ...; pop_gcmap() — collecting calls
         // must publish the regalloc gcmap before the raw call so live `Ref`
         // roots survive the slow path, and clear it after reloading a
@@ -6840,7 +6840,7 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64 ; =>done);
     }
 
-    /// assembler.py:295-360 call_assembler: invoke a compiled JIT loop.
+    /// assembler.py call_assembler: invoke a compiled JIT loop.
     ///
     /// RPython fast path (assembler.py:295-360):
     ///   1. _call_assembler_emit_call — call the target trace
@@ -6849,7 +6849,7 @@ impl<'a> Assembler386<'a> {
     ///   4. Path B (fast): MOV result, [frame + ofs]
     ///   5. join paths
     ///
-    /// llsupport/assembler.py:295 `call_assembler` + x86/assembler.py:2267
+    /// llsupport/assembler.py `call_assembler` + x86/assembler.py:2267
     /// `_call_assembler_emit_call` parity. Line-by-line port:
     /// 1. simple_call(target, [jf, threadlocal_loc])
     /// 2. CMP [eax + jf_descr_ofs], done_descr_imm
@@ -6865,7 +6865,7 @@ impl<'a> Assembler386<'a> {
     /// may have moved the caller jitframe; the popped rbp is the
     /// pre-GC address while the shadow stack carries the updated one.
     fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
-        // handle_call_assembler (rewrite.py:665-695) always pre-builds the
+        // handle_call_assembler (rewrite.py) always pre-builds the
         // callee jitframe — storing every inputarg, and for a virtualizable
         // passing the forced vable object as the second arg — so the backend
         // only loads arglocs[0] (the rewritten frame) and invokes the target.
@@ -6913,7 +6913,7 @@ impl<'a> Assembler386<'a> {
             return;
         }
 
-        // ── x86/assembler.py:2267 _call_assembler_emit_call ──
+        // ── x86/assembler.py _call_assembler_emit_call ──
         // simple_call(target, [argloc]).  Branch directly to the
         // resolved callee entry — skip the Rust trampoline, which
         // would otherwise add an extra indirect call and (when
@@ -6937,7 +6937,7 @@ impl<'a> Assembler386<'a> {
         // frame-relative ops hit the moved jitframe.
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
 
-        // ── x86/assembler.py:2274 _call_assembler_check_descr ──
+        // ── x86/assembler.py _call_assembler_check_descr ──
         // CMP [eax + jf_descr_ofs], imm(done_descr).
         // x86 has no 64-bit-immediate compare-with-memory, so
         // stage the pointer through R11 (LARGE_IMM_SCRATCH) — one
@@ -6953,7 +6953,7 @@ impl<'a> Assembler386<'a> {
             ; je =>fast_path
         );
 
-        // ── Path A: x86/assembler.py:2271 _call_assembler_emit_helper_call ──
+        // ── Path A: x86/assembler.py _call_assembler_emit_helper_call ──
         // simple_call(asm_helper, [tmploc=rax, vloc], result_loc).
         // pyre's helper signature is (cpu_handle, callee_jf,
         // green_key) — see compile.py:665.
@@ -6970,7 +6970,7 @@ impl<'a> Assembler386<'a> {
             ; =>fast_path
         );
 
-        // ── Path B: x86/assembler.py:2291 _call_assembler_load_result ──
+        // ── Path B: x86/assembler.py _call_assembler_load_result ──
         // MOV result, [eax + first_item_ofs].
         if result_type == Type::Float {
             dynasm!(self.mc ; .arch x64
@@ -6993,7 +6993,7 @@ impl<'a> Assembler386<'a> {
     // x86/assembler.py:2338 genop_new etc.
     // These require GC runtime support. Emit trap for now.
 
-    /// rewrite.py:936-942 `handle_write_barrier_setarrayitem` value gate.
+    /// rewrite.py `handle_write_barrier_setarrayitem` value gate.
     ///
     /// PyPy emits a barrier only for Ref-typed values, and `rgc.needs_write_barrier`
     /// returns false for NULL constants and true for non-NULL constants
@@ -7003,7 +7003,7 @@ impl<'a> Assembler386<'a> {
         if matches!(value_loc, Loc::Reg(val) if val.is_xmm) {
             return false;
         }
-        // history.py:227/268/314 — inline-Const variants carry value
+        // history.py/268/314 — inline-Const variants carry value
         // inline; the variant tag IS the box type.
         if let Some(val) = value.inline_const_bits() {
             if !matches!(value, OpRef::ConstPtr(_)) {
@@ -7022,7 +7022,7 @@ impl<'a> Assembler386<'a> {
         !matches!(value_loc, Loc::Immed(i) if i.value == 0)
     }
 
-    /// rewrite.py:955-973 `gen_write_barrier_array` for the direct
+    /// rewrite.py `gen_write_barrier_array` for the direct
     /// SETARRAYITEM_GC fallback.  This assembler-only path has no
     /// `RewriteState.known_lengths`, so it mirrors PyPy's
     /// `known_length(v_base, LARGE)` default: unknown length selects the array
@@ -7034,7 +7034,7 @@ impl<'a> Assembler386<'a> {
         self.emit_write_barrier_fastpath_kind(arglocs, use_array_barrier, false);
     }
 
-    /// x86/assembler.py:2438 _write_barrier_fastpath parity.
+    /// x86/assembler.py _write_barrier_fastpath parity.
     fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
         let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
         self.emit_write_barrier_fastpath_kind(arglocs, is_array, false);
@@ -7052,8 +7052,8 @@ impl<'a> Assembler386<'a> {
         // disagree; returning would drop the barrier without a trace.
         let wb = crate::runner::dynasm_write_barrier_descr()
             .expect("COND_CALL_GC_WB emitted without a write barrier descriptor");
-        // x86/assembler.py:2415-2420 feeds `loc_base = arglocs[0]` into
-        // `addr_add_const`, and `AddressLoc` (x86/regloc.py:213) accepts an
+        // x86/assembler.py feeds `loc_base = arglocs[0]` into
+        // `addr_add_const`, and `AddressLoc` (x86/regloc.py) accepts an
         // immediate base, so upstream needs no assertion here. This backend
         // addresses the flag byte only through a core register, and the paired
         // lowered `GcStore` already contracts for one, so state the contract
@@ -7100,7 +7100,7 @@ impl<'a> Assembler386<'a> {
                 ; jz =>done
             );
 
-            // Inline card bit set (x86/assembler.py:2398 WriteBarrierSlowPath parity)
+            // Inline card bit set (x86/assembler.py WriteBarrierSlowPath parity)
             dynasm!(self.mc ; .arch x64 ; =>card_mark);
             match arglocs.get(1) {
                 Some(Loc::Reg(loc_index)) => {
@@ -7166,7 +7166,7 @@ impl<'a> Assembler386<'a> {
         } else {
             // x86/assembler.py:2432-2436: non-array slow path.  The frame takes
             // the guarded entry; an ordinary store takes the one
-            // `gc.py:295-299 get_write_barrier_fn` names.
+            // `gc.py get_write_barrier_fn` names.
             let helper = if is_frame {
                 crate::runner::dynasm_write_barrier as *const () as i64
             } else {
@@ -7246,10 +7246,10 @@ impl<'a> Assembler386<'a> {
         );
     }
 
-    /// x86/assembler.py:2556 malloc_cond parity.
+    /// x86/assembler.py malloc_cond parity.
     fn genop_call_malloc_nursery(&mut self, op: &Op, result_loc: Option<&Loc>) {
         let size_ref = op.arg(0).to_opref();
-        // history.py:227 ConstInt.value carried inline — prefer the inline
+        // history.py ConstInt.value carried inline — prefer the inline
         // payload before falling through to the legacy pool / raw u32.
         let total_size = size_ref.inline_const_bits().unwrap_or_else(|| {
             self.constants
@@ -7570,9 +7570,9 @@ impl<'a> Assembler386<'a> {
 
     // genop_* — misc
 
-    // assembler.py:1817 genop_save_exc_class / genop_save_exception
+    // assembler.py genop_save_exc_class / genop_save_exception
 
-    /// assembler.py:1817-1818 genop_save_exc_class:
+    /// assembler.py genop_save_exc_class:
     /// `MOV resloc, [pos_exception]`.  The regalloc always assigns the
     /// result a register (`consider_no_arg_result`).
     fn genop_save_exc_class(&mut self, result_loc: Option<&Loc>) {
@@ -7777,7 +7777,7 @@ impl<'a> Assembler386<'a> {
 
     /// COND_CALL_N: if arg(0) != 0, call function at arg(1).
     ///
-    /// `x86/assembler.py:2526 cond_call` parity: the regalloc may fuse
+    /// `x86/assembler.py cond_call` parity: the regalloc may fuse
     /// a preceding CompOp's result into `guard_success_cc` rather than
     /// materialising the boolean (see `next_op_can_accept_cc`). When
     /// that's the case, `op.arg(0)` lives in the condition flags, not

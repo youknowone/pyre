@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-/// `quasiimmut.py:54-110 QuasiImmut` — the loops that baked one quasi-immutable
+/// `quasiimmut.py QuasiImmut` — the loops that baked one quasi-immutable
 /// field's value as a constant, and must be revoked when it changes.
 ///
 /// The flag stands in for upstream's `looptoken` + `cpu.invalidate_loop`: the
@@ -36,7 +36,7 @@ pub struct QuasiImmut {
     unlinked: AtomicBool,
 }
 
-/// The list `quasiimmut.py:59-63 __init__` sets up, behind the lock that keeps
+/// The list `quasiimmut.py __init__` sets up, behind the lock that keeps
 /// a registration and a sweep from interleaving.
 struct LoopTokens {
     /// `quasiimmut.py:61-63` — weak so a retired loop drops out instead of
@@ -47,7 +47,7 @@ struct LoopTokens {
 }
 
 impl LoopTokens {
-    /// `quasiimmut.py:77-82 compress_looptokens_list` — drop the entries whose
+    /// `quasiimmut.py compress_looptokens_list` — drop the entries whose
     /// loop is gone and re-derive the limit from what is left, so an object that
     /// is recompiled against many times and never mutated cannot grow an
     /// unbounded list.
@@ -68,7 +68,7 @@ impl Default for QuasiImmut {
 }
 
 impl QuasiImmut {
-    /// `quasiimmut.py:59-63 __init__`. The initial limit is the growth formula
+    /// `quasiimmut.py __init__`. The initial limit is the growth formula
     /// in [`LoopTokens::compress`] evaluated at length zero.
     pub fn new() -> Self {
         Self {
@@ -87,7 +87,7 @@ impl QuasiImmut {
         !self.unlinked.load(Ordering::Acquire)
     }
 
-    /// `quasiimmut.py:72-75 register_loop_token`.
+    /// `quasiimmut.py register_loop_token`.
     ///
     /// A caller holding a recorded instance can reach here after the sweep:
     /// upstream cannot, because the GIL spans its optimize-and-compile, but
@@ -107,7 +107,7 @@ impl QuasiImmut {
         tokens.looptokens_wrefs.push(Arc::downgrade(flag));
     }
 
-    /// `quasiimmut.py:84-110 invalidate` — every loop recorded here becomes
+    /// `quasiimmut.py invalidate` — every loop recorded here becomes
     /// invalid, so each `GUARD_NOT_INVALIDATED` in it (and in its bridges) must
     /// now fail. The list is emptied like upstream's `self.looptokens_wrefs =
     /// []`, and the instance is marked unlinked under the same lock so a
@@ -152,8 +152,8 @@ impl QuasiImmut {
 /// pyre has no rtyper to synthesise it.
 ///
 /// Null until the first read is recorded (`get_current_qmut_instance`,
-/// quasiimmut.py:17-27); nulled by the invalidation function
-/// (`make_invalidation_function._invalidate_now`, quasiimmut.py:33-38), so
+/// quasiimmut.py); nulled by the invalidation function
+/// (`make_invalidation_function._invalidate_now`, quasiimmut.py), so
 /// the next recording starts from a fresh instance and the identity a
 /// revalidation compares really did change. The stored pointer is one strong
 /// [`Arc`] reference, so an instance a trace is still holding survives being
@@ -200,7 +200,7 @@ impl QuasiImmutField {
         !self.ptr.load(Ordering::Acquire).is_null()
     }
 
-    /// `quasiimmut.py:17-27 get_current_qmut_instance` — the field's instance,
+    /// `quasiimmut.py get_current_qmut_instance` — the field's instance,
     /// created when it is still null, handed back so the caller can hold it.
     ///
     /// Upstream calls this while RECORDING the read: `pyjitpl.py:1081` builds a
@@ -228,7 +228,7 @@ impl QuasiImmutField {
         }
     }
 
-    /// `quasiimmut.py:33-38 make_invalidation_function._invalidate_now` —
+    /// `quasiimmut.py make_invalidation_function._invalidate_now` —
     /// unlink the instance, then flip every loop flag it recorded.
     ///
     /// Re-reads the pointer under the lock rather than trusting an earlier
@@ -274,7 +274,7 @@ impl Drop for QuasiImmutField {
 /// The residual half of an invalidation: unlink the instance and flip every
 /// loop flag it recorded.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`) for the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`) for the
 /// reason upstream's own walk is out of line — it hangs off the residual
 /// `jit_force_quasi_immutable` path and never appears in a trace — and because
 /// the lock and the `Vec` walk have no lowering. A free function taking a raw
@@ -293,7 +293,7 @@ pub unsafe fn sweep_quasi_immut_field(field: *const QuasiImmutField) {
 mod tests {
     use super::*;
 
-    /// `quasiimmut.py:84-110 invalidate` flips every registered flag and empties
+    /// `quasiimmut.py invalidate` flips every registered flag and empties
     /// the list, and a flag whose loop is gone is simply skipped.
     #[test]
     fn invalidate_flips_live_flags_and_clears() {

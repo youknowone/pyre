@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use majit_translate::config::config::{Config, ConfigError, ConfigValue, OptionValue};
 
-/// gc.py:5-7 `GcDescription`.
+/// gc.py `GcDescription`.
 #[derive(Clone)]
 pub struct GcDescription {
     pub config: Rc<Config>,
@@ -85,7 +85,7 @@ gc_class!(GC_hybrid, "hybrid", true);
 gc_class!(GC_minimark, "minimark", true);
 gc_class!(GC_incminimark, "incminimark", false);
 
-/// gc.py:25-31 `get_description`.
+/// gc.py `get_description`.
 pub fn get_description(config: &Rc<Config>) -> Result<GcDescription, GcDescriptionError> {
     let name = match config.get("translation.gc")? {
         ConfigValue::Value(OptionValue::Choice(name))

@@ -418,7 +418,7 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
         // Authoritative-executor eager store, the same posture as the
         // module-global cell fold in `mod.rs`: `_opimpl_setfield_gc_any`
         // reaches `executor.execute` → `cpu.bh_setfield_gc_*` through
-        // `execute_and_record` (`pyjitpl.py:979`), so the store really
+        // `execute_and_record` (`pyjitpl.py`), so the store really
         // happens while the op is recorded.  Recording alone leaves the
         // concrete object holding its pre-store bytes while the trace
         // heapcache carries `valuebox`, and the next `getfield_gc_*` on the

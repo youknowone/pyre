@@ -202,7 +202,7 @@ fn decode_impl(
         };
         let start = unsafe { pypy_cjk_dec_inbuf_consumed(state.0) }.max(0) as usize;
         let end = start.saturating_add(error_size).min(input.len());
-        // `c_codecs.py:149-159 multibytecodec_decerror`: the three built-in
+        // `c_codecs.py multibytecodec_decerror`: the three built-in
         // modes answer inline, anything else goes to the registered handler,
         // which also names the position decoding resumes at.
         let (replacement, resume_end): (Vec<CjkWchar>, usize) = match errors {
@@ -320,7 +320,7 @@ fn encode_impl(
         let start = wchar_consumed_to_codepoints(&boundaries, start_units);
         let end = wchar_codepoints_covering(&boundaries, error_units_end);
         let end_units = boundaries[end];
-        // `c_codecs.py:280-297 multibytecodec_encerror`: `ignore` splices in
+        // `c_codecs.py multibytecodec_encerror`: `ignore` splices in
         // nothing (rettype 'b'), `replace` and a str from a registered handler
         // are re-encoded through the same codec first (rettype 'u'), and bytes
         // from a handler are spliced in verbatim.  A handler also names the

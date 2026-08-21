@@ -2,7 +2,7 @@
 
 use crate::arch::WORD;
 
-/// llsupport/gcmap.py:7 allocate_gcmap.
+/// llsupport/gcmap.py allocate_gcmap.
 pub fn allocate_gcmap(frame_depth: usize, fixed_size: usize) -> *mut usize {
     let size = frame_depth + fixed_size;
     let malloc_size = (size / WORD / 8 + 1) + 1;

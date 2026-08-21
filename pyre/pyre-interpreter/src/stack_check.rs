@@ -1,6 +1,6 @@
 //! Stack overflow protection — RPython rstack parity.
 //!
-//! Port of `rpython/rlib/rstack.py:42 stack_check()` +
+//! Port of `rpython/rlib/rstack.py stack_check()` +
 //! `rpython/translator/c/src/stack.c:25 LL_stack_too_big_slowpath`. The
 //! four primary entrypoints match RPython's `LL_stack_*` C ABI so the
 //! JIT backends can call them from emitted code:
@@ -403,7 +403,7 @@ pub extern "C" fn pyre_stack_get_length() -> usize {
 /// rpython/translator/c/src/stack.h:39 `LL_stack_get_end_adr` parity.
 /// Returns the stable address of `PYRE_STACKTOOBIG.stack_end` for the
 /// JIT backend to emit inline `MOV reg, [endaddr]` loads. Mirrors
-/// `rpython/rlib/rstack.py:32 _stack_get_end_adr`.
+/// `rpython/rlib/rstack.py _stack_get_end_adr`.
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_stack_get_end_adr() -> usize {
     &raw const PYRE_STACKTOOBIG.stack_end as usize
@@ -412,7 +412,7 @@ pub extern "C" fn pyre_stack_get_end_adr() -> usize {
 /// rpython/translator/c/src/stack.h:40 `LL_stack_get_length_adr` parity.
 /// Returns the stable address of `PYRE_STACKTOOBIG.stack_length` for
 /// the JIT backend to emit inline `CMP reg, [lengthaddr]` compares.
-/// Mirrors `rpython/rlib/rstack.py:33 _stack_get_length_adr`.
+/// Mirrors `rpython/rlib/rstack.py _stack_get_length_adr`.
 #[unsafe(no_mangle)]
 pub extern "C" fn pyre_stack_get_length_adr() -> usize {
     &raw const PYRE_STACKTOOBIG.stack_length as usize
@@ -555,7 +555,7 @@ pub extern "C" fn pyre_stack_too_big_slowpath(current: usize) -> u8 {
 /// is constructed atomically with the backend's decision to exit the
 /// prologue with the initial jf_ptr.
 ///
-/// Matches `rpython/rlib/rstack.py:68-73 stack_check_slowpath`, which
+/// Matches `rpython/rlib/rstack.py stack_check_slowpath`, which
 /// constructs `_StackOverflow` and raises it into `pos_exception()`
 /// so the assembler's `_build_stack_check_slowpath` wrapper can route
 /// to `propagate_exception_path`. In pyre the "propagate" half is
@@ -682,7 +682,7 @@ pub fn walk_jit_pending_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef))
 
 /// Address of this thread's pending-exception cell, for registration in the
 /// per-mutator `PyFrameRootArea` alongside the other thread-local exception
-/// carriers. `rthread.py:429-437 _trace_tlref` traces a GC-pointer thread
+/// carriers. `rthread.py _trace_tlref` traces a GC-pointer thread
 /// local by enumerating *every* thread's block
 /// (`threadlocal.c:86-93 _RPython_ThreadLocals_Enum`); resolving the TLS on
 /// whichever thread happened to start the collection would miss a stopped
@@ -711,7 +711,7 @@ pub extern "C" fn pyre_stack_criticalcode_stop() {
 /// budget is reserved from it, never from a lowered limit.
 static NATIVE_STACK_RESERVE: AtomicI32 = AtomicI32::new(DEFAULT_RECURSION_LIMIT);
 
-/// pypy/module/sys/vm.py:63 `setrecursionlimit`, with Python 3.14's
+/// pypy/module/sys/vm.py `setrecursionlimit`, with Python 3.14's
 /// logical-depth rejection before PyPy's byte-budget update.  The check must
 /// use Python frame depth: native Rust frame size is unrelated to the Python
 /// recursion budget and cannot decide whether a limit is below the current
@@ -761,7 +761,7 @@ pub fn set_recursion_limit(new_limit: i32) -> Result<(), PyError> {
     Ok(())
 }
 
-/// pypy/module/sys/vm.py:72 `getrecursionlimit` parity. Reads
+/// pypy/module/sys/vm.py `getrecursionlimit` parity. Reads
 /// `space.sys.recursionlimit` via `module::sys::state`.
 ///
 /// `#[dont_look_inside]`: reads the runtime-mutable `recursion_limit` global
@@ -773,7 +773,7 @@ pub fn get_recursion_limit() -> i32 {
     crate::module::sys::state::recursion_limit()
 }
 
-/// rpython/rlib/rstack.py:42 `stack_check()` parity.
+/// rpython/rlib/rstack.py `stack_check()` parity.
 ///
 /// Fast path: `ofs = r_uint(end - current); if ofs <= r_uint(length):
 /// return`. On miss, dispatch to [`pyre_stack_too_big_slowpath`] which
@@ -796,7 +796,7 @@ pub fn stack_check() -> Result<(), PyError> {
     if ofs <= length {
         return Ok(());
     }
-    // rstack.py:63 stack_check_slowpath(current)
+    // rstack.py stack_check_slowpath(current)
     if pyre_stack_too_big_slowpath(current) != 0 {
         return Err(PyError::recursion_error("maximum recursion depth exceeded"));
     }
@@ -811,7 +811,7 @@ pub extern "C" fn stack_check_jit_abi() -> i64 {
     }
 }
 
-/// rpython/rlib/rstack.py:75-90 `stack_almost_full` parity.
+/// rpython/rlib/rstack.py `stack_almost_full` parity.
 ///
 /// ```python
 /// def stack_almost_full():
@@ -835,15 +835,15 @@ pub extern "C" fn stack_check_jit_abi() -> i64 {
 /// (`warmstate.py:430`). The slowpath is invoked when the cached
 /// `stack_end` is stale so it can refresh, matching the two-step
 /// check/slowpath/re-check pattern upstream.
-// rstack.py:92 `stack_almost_full._jit_look_inside_ = False` — the
+// rstack.py `stack_almost_full._jit_look_inside_ = False` — the
 // JIT never traces the budget arithmetic; calls residualize.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn stack_almost_full() -> bool {
     // rstack.py:80 current = llop.stack_current(Signed)
     let current = current_sp();
-    // rstack.py:81 end = _stack_get_end()
+    // rstack.py end = _stack_get_end()
     let end = PYRE_STACKTOOBIG.stack_end.load(Ordering::Relaxed);
-    // rstack.py:82 length = 15 * (r_uint(_stack_get_length()) >> 4)
+    // rstack.py length = 15 * (r_uint(_stack_get_length()) >> 4)
     let length_full = PYRE_STACKTOOBIG.stack_length.load(Ordering::Relaxed);
     let length = 15 * (length_full >> 4);
     // rstack.py:83-84 ofs = r_uint(end - current); if ofs <= length: return False
@@ -1236,7 +1236,7 @@ mod tests {
     #[test]
     fn end_and_length_addresses_are_stable() {
         let _g = lock_tests();
-        // rstack.py:32-33 `_stack_get_end_adr` / `_stack_get_length_adr`
+        // rstack.py `_stack_get_end_adr` / `_stack_get_length_adr`
         // parity: addresses must be stable across calls (so the JIT
         // backend can embed them as imm64 operands).
         let end_adr_1 = pyre_stack_get_end_adr();

@@ -11,7 +11,7 @@
 use super::flatten::Kind;
 use super::flow::{Constant, ConstantValue};
 
-/// `rpython/rtyper/exceptiondata.py:7 class UnknownException(Exception)`.
+/// `rpython/rtyper/exceptiondata.py class UnknownException(Exception)`.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct UnknownException(pub String);
 
@@ -38,7 +38,7 @@ const STANDARD_EXCEPTIONS: &[&str] = &[
     "_StackOverflow",
 ];
 
-/// `rpython/rtyper/exceptiondata.py:11 class ExceptionData(object)`.
+/// `rpython/rtyper/exceptiondata.py class ExceptionData(object)`.
 ///
 /// Storage layout mirrors RPython's "pre-allocated standard exception
 /// instances on the rtyper" — each entry in `STANDARD_EXCEPTIONS` has
@@ -107,7 +107,7 @@ impl Default for ExceptionData {
 }
 
 impl ExceptionData {
-    /// `exceptiondata.py:16 def __init__(self, rtyper)`.  Pyre's rtyper
+    /// `exceptiondata.py def __init__(self, rtyper)`.  Pyre's rtyper
     /// shim carries no state, so `rtyper` is implicit here; the fields
     /// upstream populates (`r_exception_type`, `r_exception_value`,
     /// `lltype_of_exception_type`, `lltype_of_exception_value`) all
@@ -161,7 +161,7 @@ impl ExceptionData {
         }
     }
 
-    /// `exceptiondata.py:40-45 def get_standard_ll_exc_instance_by_class(self, exceptionclass)`.
+    /// `exceptiondata.py def get_standard_ll_exc_instance_by_class(self, exceptionclass)`.
     ///
     /// Upstream walks the bookkeeper to obtain `clsdef` then calls
     /// `get_standard_ll_exc_instance(rtyper, clsdef)` which returns the
@@ -217,7 +217,7 @@ impl ExceptionData {
     }
 }
 
-/// `rpython/rtyper/rtyper.py:33 class RPythonTyper(object)`.
+/// `rpython/rtyper/rtyper.py class RPythonTyper(object)`.
 ///
 /// Pyre-jit operates on the flowspace graph directly without a typed
 /// low-level rewrite; the rtyper shim exists only to satisfy the

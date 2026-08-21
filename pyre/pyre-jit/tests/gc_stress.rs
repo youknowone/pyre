@@ -17,7 +17,7 @@
 //! program allocates. Each program's module body and functions use `while`
 //! loops (no `FOR_ITER`), so eval reaches a JIT-eligible frame. `gc.collect()`
 //! then forces deterministic collections through the collect hook
-//! (`interp_gc.py:7-26 collect`).
+//! (`interp_gc.py collect`).
 //!
 //! Non-vacuity is asserted AFTER eval: the stable instance allocator hook
 //! must be live, proving the program's objects routed through the real managed
@@ -1417,7 +1417,7 @@ assert hits == 60, hits
     );
 }
 
-/// `contains`'s iterable fallback (`descroperation.py:514 sequence_contains`
+/// `contains`'s iterable fallback (`descroperation.py sequence_contains`
 /// analogue) holds the iterator and needle in Rust locals while `next` and
 /// `eq_w` run Python and collect. The sibling `sequence_contains` pins both;
 /// this duplicate on the generic-iterable path must too.
@@ -1714,7 +1714,7 @@ while i < 40:
     );
 }
 
-/// `virtualizable.py:326-330` makes `TOKEN_TRACING_RESCALL` the address of a
+/// `virtualizable.py` makes `TOKEN_TRACING_RESCALL` the address of a
 /// prebuilt GC object, so the sentinel has to belong to the heap that is
 /// current when a traced slot holds it. `reset_gc_fresh_for_test` builds a
 /// second heap and leaks the first, which leaves any sentinel minted in the

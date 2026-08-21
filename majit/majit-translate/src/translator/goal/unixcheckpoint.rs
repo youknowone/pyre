@@ -1,7 +1,7 @@
 //! Port of `rpython/translator/goal/unixcheckpoint.py`.
 //!
 //! The upstream module exposes:
-//! * `restart_process()` (`unixcheckpoint.py:3-5`) — replace the current
+//! * `restart_process()` (`unixcheckpoint.py`) — replace the current
 //!   process with `os.execv(sys.executable, [sys.executable] + sys.argv)`.
 //! * `restartable_point_fork(auto=None, extra_msg=None)` (`:7-66`) — prompt
 //!   for `run` / `cont` / `quit` / `pdb` / `restart-it-all`, then fork.  The
@@ -18,7 +18,7 @@ use std::io::{self, BufRead, Write};
 
 use crate::translator::tool::taskengine::TaskError;
 
-/// Port of upstream `restart_process()` (`unixcheckpoint.py:3-5`).
+/// Port of upstream `restart_process()` (`unixcheckpoint.py`).
 ///
 /// On Unix this calls `execv`, so a successful call never returns.  On
 /// non-Unix targets it surfaces a `TaskError` because Rust has no direct
@@ -62,7 +62,7 @@ pub fn restartable_point_fork(
 
 /// Port of upstream `restartable_point_nofork(auto=None)` (`:69-73`).
 pub fn restartable_point_nofork(auto: Option<&str>) -> Result<(), TaskError> {
-    // Upstream `unixcheckpoint.py:69-73`: forwards into `restartable_point_fork`
+    // Upstream `unixcheckpoint.py`: forwards into `restartable_point_fork`
     // with `auto=None` and a fixed extra message.  No tty check is
     // present; mirror that behaviour exactly.
     let stdin = io::stdin();
@@ -148,7 +148,7 @@ impl CheckpointRuntime for RealRuntime {
     fn fork(&self) -> Result<ForkResult, TaskError> {
         #[cfg(unix)]
         {
-            // Upstream `unixcheckpoint.py:38`: `pid = os.fork()`.
+            // Upstream `unixcheckpoint.py`: `pid = os.fork()`.
             //
             // SAFETY: this intentionally mirrors Python's process boundary.
             // The child returns immediately to the caller and must avoid
@@ -176,7 +176,7 @@ impl CheckpointRuntime for RealRuntime {
         #[cfg(unix)]
         {
             let mut status = 0;
-            // Upstream `unixcheckpoint.py:45`: `os.waitpid(pid, 0)`.
+            // Upstream `unixcheckpoint.py`: `os.waitpid(pid, 0)`.
             let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
             if waited < 0 {
                 let code = io::Error::last_os_error().raw_os_error().unwrap_or(-1);

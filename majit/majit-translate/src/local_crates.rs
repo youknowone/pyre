@@ -1,7 +1,7 @@
 //! Local-crate alias roots for symbolic `CallPath` resolution.
 //!
 //! RPython needs nothing like this: `Bookkeeper.getdesc`
-//! (`bookkeeper.py:353-409`) keys `FunctionDesc`s by function-object
+//! (`bookkeeper.py`) keys `FunctionDesc`s by function-object
 //! identity, so a callable has one identity regardless of the import
 //! spelling. pyre resolves symbolic paths extracted from LLBC, where a
 //! cross-crate callsite spells the callee with its crate name

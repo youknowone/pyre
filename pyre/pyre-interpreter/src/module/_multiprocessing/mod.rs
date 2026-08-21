@@ -7,7 +7,7 @@
 //! other platforms get an empty module and `import _multiprocessing`
 //! still succeeds.
 //!
-//! `W_SemLock`'s fields (`interp_semaphore.py:458-466`) live in the instance
+//! `W_SemLock`'s fields (`interp_semaphore.py`) live in the instance
 //! dict rather than a typed payload: `handle`, `kind`, `maxvalue` and `name`
 //! are the values behind the `GetSetProperty`s of
 //! `interp_semaphore.py:593-599`, and `count`/`last_tid` are the recursion
@@ -101,7 +101,7 @@ fn semlock_set_i64(obj: PyObjectRef, key: &str, value: i64) {
     };
 }
 
-/// `interp_semaphore.py:486-487 W_SemLock._ismine`.
+/// `interp_semaphore.py W_SemLock._ismine`.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn semlock_ismine(obj: PyObjectRef) -> bool {
     semlock_get_i64(obj, "count") > 0
@@ -119,9 +119,9 @@ fn semlock_post(handle: SemRaw) -> Result<(), crate::PyError> {
     Ok(())
 }
 
-/// `interp_semaphore.py:431-441 semlock_getvalue`.  Not built on darwin, where
+/// `interp_semaphore.py semlock_getvalue`.  Not built on darwin, where
 /// `sem_getvalue` always fails (`HAVE_BROKEN_SEM_GETVALUE`,
-/// `interp_semaphore.py:86-89`) and the `sem_trywait` fallbacks run instead.
+/// `interp_semaphore.py`) and the `sem_trywait` fallbacks run instead.
 #[cfg(all(unix, feature = "host_env", not(target_vendor = "apple")))]
 fn semlock_getvalue(handle: SemRaw) -> Result<i64, crate::PyError> {
     let mut val: libc::c_int = 0;
@@ -136,7 +136,7 @@ fn semlock_getvalue(handle: SemRaw) -> Result<i64, crate::PyError> {
     Ok(if val < 0 { 0 } else { val as i64 })
 }
 
-/// `interp_semaphore.py:443-455 semlock_iszero`.
+/// `interp_semaphore.py semlock_iszero`.
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_iszero(handle: SemRaw) -> Result<bool, crate::PyError> {
     #[cfg(target_vendor = "apple")]
@@ -332,7 +332,7 @@ fn semlock_rebuild_raw(
             core::mem::forget(handle);
             Ok(raw)
         }
-        // interp_semaphore.py:557 `handle = handle_w(space, w_handle)`
+        // interp_semaphore.py `handle = handle_w(space, w_handle)`
         // (`:223-224`).
         None => Ok(crate::baseobjspace::int_w(w_handle)? as usize as SemRaw),
     }
@@ -349,7 +349,7 @@ fn semlock_rebuild_raw(
     Ok(crate::baseobjspace::int_w(w_handle)? as usize as SemRaw)
 }
 
-/// `interp_semaphore.py:357-400 semlock_acquire` — the platform wait alone.
+/// `interp_semaphore.py semlock_acquire` — the platform wait alone.
 /// Upstream bumps `self.last_tid`/`self.count` here (`:395-396`); the receiver
 /// stays with the caller instead, which does it on the success return.
 #[cfg(all(unix, feature = "host_env"))]
@@ -362,7 +362,7 @@ fn semlock_acquire(
     // EAGAIN (only meaningful for trywait) yields False and the
     // remaining errnos propagate as OSError instead of being
     // silently mapped to False.
-    // `interp_semaphore.py:378-397 semlock_acquire` — on EINTR deliver
+    // `interp_semaphore.py semlock_acquire` — on EINTR deliver
     // a pending signal then retry; on success deliver one too before
     // returning (`_check_signals(space)`).
     if block && timeout.is_none() {
@@ -455,7 +455,7 @@ fn semlock_acquire(
     }
 }
 
-/// `interp_semaphore.py:403-429 semlock_release`.
+/// `interp_semaphore.py semlock_release`.
 #[cfg(all(unix, feature = "host_env"))]
 fn semlock_release(handle: SemRaw, kind: i64, maxvalue: i64) -> Result<(), crate::PyError> {
     if kind == RECURSIVE_MUTEX {
@@ -494,7 +494,7 @@ fn semlock_release(handle: SemRaw, kind: i64, maxvalue: i64) -> Result<(), crate
     semlock_post(handle)
 }
 
-/// `interp_semaphore.py:506-523 W_SemLock.acquire` — shared by `acquire` and
+/// `interp_semaphore.py W_SemLock.acquire` — shared by `acquire` and
 /// `__enter__`, which the class methods cannot reach through each other.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn w_semlock_acquire(
@@ -532,7 +532,7 @@ fn w_semlock_acquire(
     Ok(got)
 }
 
-/// `interp_semaphore.py:525-541 W_SemLock.release` — shared by `release` and
+/// `interp_semaphore.py W_SemLock.release` — shared by `release` and
 /// `__exit__`.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn w_semlock_release(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
@@ -607,7 +607,7 @@ fn semlock_instance(
         "name",
         kept_name.map_or_else(w_none, |name| w_str_new(&name))
     );
-    // interp_semaphore.py:462,465 `self.count = 0`, `self.last_tid = -1`.
+    // interp_semaphore.py `self.count = 0`, `self.last_tid = -1`.
     store!("count", w_int_new(0));
     store!("last_tid", w_int_new(-1));
     Ok(pyre_object::gc_roots::shadow_stack_get(root_base))
@@ -658,7 +658,7 @@ fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     semlock_instance(w_subtype, raw, kind, maxvalue, kept_name)
 }
 
-/// `interp_semaphore.py:547-561 W_SemLock.rebuild`, registered as a
+/// `interp_semaphore.py W_SemLock.rebuild`, registered as a
 /// classmethod (`:606`), so `args[0]` is the bound class.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn semlock_rebuild(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -706,19 +706,19 @@ crate::py_class! {
         fn release(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
             w_semlock_release(self_obj)
         }
-        // interp_semaphore.py:483-484 W_SemLock.get_count
+        // interp_semaphore.py W_SemLock.get_count
         fn _count(self_obj: PyObjectRef) -> i64 {
             semlock_get_i64(self_obj, "count")
         }
-        // interp_semaphore.py:489-490 W_SemLock.is_mine
+        // interp_semaphore.py W_SemLock.is_mine
         fn _is_mine(self_obj: PyObjectRef) -> bool {
             semlock_ismine(self_obj)
         }
-        // interp_semaphore.py:544-545 W_SemLock.after_fork
+        // interp_semaphore.py W_SemLock.after_fork
         fn _after_fork(self_obj: PyObjectRef) {
             semlock_set_i64(self_obj, "count", 0);
         }
-        // interp_semaphore.py:492-497 W_SemLock.is_zero
+        // interp_semaphore.py W_SemLock.is_zero
         fn _is_zero(self_obj: PyObjectRef) -> Result<bool, crate::PyError> {
             let handle = semlock_get_handle(self_obj);
             if handle.is_null() {
@@ -726,7 +726,7 @@ crate::py_class! {
             }
             semlock_iszero(handle)
         }
-        // interp_semaphore.py:499-504 W_SemLock.get_value
+        // interp_semaphore.py W_SemLock.get_value
         fn _get_value(self_obj: PyObjectRef) -> Result<i64, crate::PyError> {
             let handle = semlock_get_handle(self_obj);
             if handle.is_null() {
@@ -734,11 +734,11 @@ crate::py_class! {
             }
             semlock_value(handle)
         }
-        // interp_semaphore.py:563-564 W_SemLock.enter
+        // interp_semaphore.py W_SemLock.enter
         fn __enter__(self_obj: PyObjectRef) -> Result<bool, crate::PyError> {
             w_semlock_acquire(self_obj, true, None)
         }
-        // interp_semaphore.py:566-567 W_SemLock.exit
+        // interp_semaphore.py W_SemLock.exit
         fn __exit__(
             self_obj: PyObjectRef,
             exc_type: Option<PyObjectRef>,
@@ -804,7 +804,7 @@ crate::py_module! {
         {
             let semlock_type = type_object();
             crate::module_ns_store(ns, "SemLock", semlock_type);
-            // interp_semaphore.py:593-610 W_SemLock.typedef publishes this
+            // interp_semaphore.py W_SemLock.typedef publishes this
             // constant on the class (the module also exports its own copy).
             // `SEM_VALUE_MAX` is what the platform will count to: the
             // POSIX limit, or `LONG_MAX` where `CreateSemaphoreW` takes the
@@ -845,7 +845,7 @@ crate::py_module! {
                         ),
                     ),
                 );
-                // interp_semaphore.py:606 `as_classmethod=True` — `_rebuild`
+                // interp_semaphore.py `as_classmethod=True` — `_rebuild`
                 // allocates on the class it is called through.
                 pyre_object::w_dict_setitem_str_no_proxy(
                     semlock_ns,

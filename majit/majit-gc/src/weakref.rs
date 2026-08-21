@@ -1,6 +1,6 @@
 //! Weak reference primitive.
 //!
-//! Mirrors `rpython/memory/gctypelayout.py:587-602` — the WEAKREF
+//! Mirrors `rpython/memory/gctypelayout.py` — the WEAKREF
 //! GcStruct that the framework GC special-cases at minor and major
 //! collection time. RPython:
 //!
@@ -38,7 +38,7 @@ pub struct Weakref {
     pub weakptr: GcRef,
 }
 
-/// `sizeof_weakref = llmemory.sizeof(WEAKREF)` (gctypelayout.py:589).
+/// `sizeof_weakref = llmemory.sizeof(WEAKREF)` (gctypelayout.py).
 pub const SIZEOF_WEAKREF: usize = std::mem::size_of::<Weakref>();
 
 /// `weakptr_offset = llmemory.offsetof(WEAKREF, "weakptr")`
@@ -47,7 +47,7 @@ pub const SIZEOF_WEAKREF: usize = std::mem::size_of::<Weakref>();
 /// lowering of `weakref_deref` emits a single load at this offset.
 pub const WEAKPTR_OFFSET: usize = std::mem::offset_of!(Weakref, weakptr);
 
-/// `ll_weakref_deref(wref)` (gctypelayout.py:594-596).
+/// `ll_weakref_deref(wref)` (gctypelayout.py).
 ///
 /// Reads the `weakptr` slot of a WEAKREF struct. Returns the target
 /// `GcRef`, or a null `GcRef` if the target has been invalidated by

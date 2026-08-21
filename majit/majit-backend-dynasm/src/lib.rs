@@ -101,7 +101,7 @@ static JITFRAME_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 static DUMMY_THREADLOCAL_SLOT: i64 = 0;
 
 thread_local! {
-    /// llmodel.py:276-285 / :317-323 `threadlocalref_addr` parity: compiled
+    /// llmodel.py / :317-323 `threadlocalref_addr` parity: compiled
     /// entries take the thread-local slot-array base as their second argument.
     /// The aarch64 prologue spills it to `SAVED_THREADLOCAL_OFS` and the
     /// CALL_ASSEMBLER path reloads it into x1 before invoking the callee trace,
@@ -110,7 +110,7 @@ thread_local! {
     static JIT_THREADLOCAL_SLOTS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
 }
 
-/// llmodel.py:194-199 _store_exception parity: set JIT exception state.
+/// llmodel.py _store_exception parity: set JIT exception state.
 /// `value` is a valid OBJECTPTR (or 0). Exception class derived from
 /// value.typeptr (offset 0), matching RPython's invariant.
 pub fn jit_exc_raise(value: i64) {
@@ -133,7 +133,7 @@ pub fn jit_exc_class_raw() -> i64 {
     JIT_EXC_TYPE.load(Ordering::Relaxed)
 }
 
-/// `_store_and_reset_exception` (x86/assembler.py:1838, 1847-1848) parity:
+/// `_store_and_reset_exception` (x86/assembler.py, 1847-1848) parity:
 /// read `pos_exc_value` and zero the global.  Not `grab_exc_value`, which
 /// reads `jf_guard_exc` off the deadframe and does not write.
 pub fn jit_exc_value_raw() -> i64 {
@@ -153,7 +153,7 @@ pub fn jit_exc_clear() {
 }
 
 /// Address of `JIT_EXC_VALUE` for direct memory load/store from JIT-emitted
-/// code (`_store_and_reset_exception` parity, `x86/assembler.py:1826-1843`).
+/// code (`_store_and_reset_exception` parity, `x86/assembler.py`).
 pub fn jit_exc_value_addr() -> usize {
     &JIT_EXC_VALUE as *const _ as usize
 }
@@ -227,7 +227,7 @@ use std::sync::OnceLock;
 /// the descr is the sole identity carrier.  No surrogate triple
 /// crosses the C-ABI.
 ///
-/// `guard_exc` is `cpu.grab_exc_value(deadframe)` (`llmodel.py:240-242`):
+/// `guard_exc` is `cpu.grab_exc_value(deadframe)` (`llmodel.py`):
 /// the pending exception the `must_save_exception` failure-recovery
 /// stub staged into `jf_guard_exc`, read off the jitframe before it is
 /// freed.  The grab itself does not write the slot upstream — clearing
@@ -245,7 +245,7 @@ pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> O
 /// `cpu.get_latest_descr` parity) and derives the bridge source
 /// identity (`jct.green_key` / `descr.trace_id()` /
 /// `descr.fail_index_per_trace()`) from that Arc, mirroring
-/// `pyjitpl.py:2914 handle_guard_failure(self, resumedescr,
+/// `pyjitpl.py handle_guard_failure(self, resumedescr,
 /// deadframe)`.  No surrogate triple crosses the C-ABI.
 pub type BridgeFn = fn(*const i64, usize, usize) -> bool;
 
@@ -261,7 +261,7 @@ static CA_FORCE_FN: OnceLock<ForceFn> = OnceLock::new();
 static CA_UNBOX_INT_FN: OnceLock<UnboxIntFn> = OnceLock::new();
 
 /// JitFrame field descriptors supplied by the interpreter crate so the
-/// GC rewriter's `handle_call_assembler` pass (rewrite.py:665-695) can
+/// GC rewriter's `handle_call_assembler` pass (rewrite.py) can
 /// emit the correct GC_LOAD / GC_STORE sequence for callee jitframes.
 #[derive(Clone)]
 pub struct JitFrameLayoutInfo {
@@ -328,7 +328,7 @@ pub fn register_call_assembler_unbox_int(f: UnboxIntFn) {
     CA_UNBOX_INT_FN.set(f).ok();
 }
 
-/// rpython/jit/backend/llsupport/llmodel.py:229-234 `insert_stack_check`
+/// rpython/jit/backend/llsupport/llmodel.py `insert_stack_check`
 /// parity. The interpreter registers the three addresses the JIT
 /// prologue needs to emit the inline stack-overflow probe matching
 /// `rpython/jit/backend/x86/assembler.py:1085-1091`:
@@ -353,7 +353,7 @@ static STACK_CHECK_ADDRS: OnceLock<StackCheckAddresses> = OnceLock::new();
 
 /// Register the three addresses the JIT prologue needs for the inline
 /// stack-overflow probe. Called once at startup from pyre-jit; matches
-/// `rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check`.
+/// `rpython/jit/backend/llsupport/llmodel.py insert_stack_check`.
 pub fn register_stack_check_addresses(end_adr: usize, length_adr: usize, slowpath_addr: usize) {
     let _ = STACK_CHECK_ADDRS.set(StackCheckAddresses {
         end_adr,
@@ -371,7 +371,7 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
     STACK_CHECK_ADDRS.get().copied()
 }
 
-/// warmspot.py:1021-1028 `assembler_call_helper` parity —
+/// warmspot.py `assembler_call_helper` parity —
 /// C-callable trampoline for the CALL_ASSEMBLER slow path.
 ///
 /// Upstream:
@@ -474,9 +474,9 @@ pub extern "C" fn call_assembler_helper_trampoline(
     };
     // warmspot.py:1023-1028 `fail_descr.handle_fail(deadframe, ...)`.
     // Callee jitframe is GC-managed by the rewriter's
-    // `handle_call_assembler` path (rewrite.py:665 `gen_malloc_frame`),
+    // `handle_call_assembler` path (rewrite.py `gen_malloc_frame`),
     // so this helper must not free it here — upstream
-    // `assembler_call_helper` (warmspot.py:1022-1028) likewise does not
+    // `assembler_call_helper` (warmspot.py) likewise does not
     // free `deadframe`.
     handle_fail_dispatch(&attached, descr_raw, frame_ptr, green_key)
 }
@@ -506,12 +506,12 @@ fn handle_fail_dispatch(
         || descr_raw == attached.done_with_this_frame_descr_ref
         || descr_raw == attached.done_with_this_frame_descr_float
     {
-        // compile.py:626-656 `_DoneWithThisFrameDescr` subclasses
+        // compile.py `_DoneWithThisFrameDescr` subclasses
         // (Void/Int/Ref/Float) — the four finish singletons.
         return handle_fail_done_with_this_frame(attached, descr_raw, frame_ptr);
     }
     if descr_raw == attached.exit_frame_with_exception_descr_ref {
-        // compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`:
+        // compile.py `ExitFrameWithExceptionDescrRef.handle_fail`:
         //   value = cpu.get_ref_value(deadframe, 0)
         //   raise jitexc.ExitFrameWithExceptionRef(value)
         // pyre returns the raw slot-0 payload here; the caller stub
@@ -520,7 +520,7 @@ fn handle_fail_dispatch(
         return handle_fail_exit_frame_with_exception(frame_ptr);
     }
     if descr_raw != 0 && descr_raw == attached.propagate_exception_descr {
-        // compile.py:1085-1098 `PropagateExceptionDescr.handle_fail`:
+        // compile.py `PropagateExceptionDescr.handle_fail`:
         //     exception = cpu.grab_exc_value(deadframe)
         //     if not exception:
         //         exception = cast_instance_to_gcref(memory_error)
@@ -531,8 +531,8 @@ fn handle_fail_dispatch(
         // — read jf_guard_exc, fall back to memory_error, re-raise.
         return handle_fail_propagate_exception(frame_ptr);
     }
-    // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
-    // `history.py:109-114 AbstractDescr.show(cpu, descr_gcref)` parity:
+    // compile.py `AbstractResumeGuardDescr.handle_fail`.
+    // `history.py AbstractDescr.show(cpu, descr_gcref)` parity:
     // `descr_raw` is the thin pointer of the `FailDescrCell` baked at
     // codegen time; reconstruct the cell via `Arc::from_raw` and read
     // the wrapped descr.  No global lookup — the cell's strong refcount
@@ -549,7 +549,7 @@ fn handle_fail_dispatch(
     handle_fail_resume_guard(descr_fd, descr_raw, frame_ptr, green_key)
 }
 
-/// compile.py:626-656 `DoneWithThisFrameDescr{Void,Int,Ref,Float}.handle_fail`.
+/// compile.py `DoneWithThisFrameDescr{Void,Int,Ref,Float}.handle_fail`.
 ///
 /// Upstream raises `jitexc.DoneWithThisFrame*(slot-0)` and
 /// `handle_jitexception` shape-casts the payload to the portal's
@@ -594,7 +594,7 @@ fn handle_fail_done_with_this_frame(
     0
 }
 
-/// compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`.
+/// compile.py `ExitFrameWithExceptionDescrRef.handle_fail`.
 ///
 /// Upstream reads slot 0 as a gcref and raises
 /// `jitexc.ExitFrameWithExceptionRef(value)`.  Pyre hands the raw int
@@ -604,7 +604,7 @@ fn handle_fail_done_with_this_frame(
 /// carries `is_exit_frame_with_exception = true`.
 ///
 /// Also publishes the exception via `jit_exc_raise` so a future
-/// `genop_guard_guard_no_exception` (assembler.py:1782) emitted by
+/// `genop_guard_guard_no_exception` (assembler.py) emitted by
 /// the caller sees the pending exception — symmetric with cranelift's
 /// CALL_ASSEMBLER trampoline path.  PyPy's
 /// `generate_guard_no_exception` checks `cpu.pos_exception()` (the
@@ -621,7 +621,7 @@ fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> 
     value
 }
 
-/// compile.py:1085-1098 `PropagateExceptionDescr.handle_fail`.
+/// compile.py `PropagateExceptionDescr.handle_fail`.
 ///
 /// Reads `jf_guard_exc` (set by Layer 3's emitted
 /// `_store_and_reset_exception` in `OpCode::CheckMemoryError`),
@@ -651,7 +651,7 @@ fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
     value
 }
 
-/// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
+/// compile.py `AbstractResumeGuardDescr.handle_fail`.
 ///
 /// Upstream:
 ///     if must_compile(...) and not rstack.stack_almost_full():
@@ -671,8 +671,8 @@ fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
 /// flow IS modeled, just one layer down.
 ///
 /// **Why the outer dispatch shape differs**: PyPy's
-/// `_trace_and_compile_from_bridge` (compile.py:719-733) raises
-/// `EnterJitAssembler` (warmstate.py:513) at success to non-locally
+/// `_trace_and_compile_from_bridge` (compile.py) raises
+/// `EnterJitAssembler` (warmstate.py) at success to non-locally
 /// unwind back to the JIT entry point and re-enter the newly-attached
 /// bridge.  Pyre uses Rust returns where PyPy uses Python exceptions:
 /// `jit_ca_handle_guard_failure` returns `bool` after attaching, and
@@ -701,7 +701,7 @@ fn handle_fail_resume_guard(
     let n_fail_args = descr.fail_arg_types().len();
     let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
     for i in 0..n_fail_args {
-        // PyPy `llmodel.py:422-424 _decode_pos` parity: read the slot
+        // PyPy `llmodel.py _decode_pos` parity: read the slot
         // from `descr.rd_locs[i]`.  Synthetic descrs without `rd_locs`
         // fall back to identity slot indexing — same shape as the
         // pre-Slice-MM table-miss path.
@@ -724,7 +724,7 @@ fn handle_fail_resume_guard(
     // `debug_assert_eq!(source_jct.green_key, green_key)` (pyjitpl.rs).
     let owning_jct = majit_backend::descr_owning_jct(descr);
 
-    // llmodel.py:240-242 `grab_exc_value(deadframe)`: read `jf_guard_exc`
+    // llmodel.py `grab_exc_value(deadframe)`: read `jf_guard_exc`
     // while the jitframe is still alive.  The `must_save_exception`
     // failure-recovery stub (GUARD_EXCEPTION / GUARD_NO_EXCEPTION /
     // GUARD_NOT_FORCED) staged `pos_exc_value` here; non-exception guards
@@ -799,7 +799,7 @@ fn handle_fail_resume_guard(
         }
     }
 
-    // compile.py:704-709 `_trace_and_compile_from_bridge`.
+    // compile.py `_trace_and_compile_from_bridge`.
     // The hook compiles+attaches; it does NOT re-enter the bridge.
     // Skipped on giveup (None).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
@@ -814,7 +814,7 @@ fn handle_fail_resume_guard(
     // slot before handing it off, then drop the root — the blackhole receiver
     // re-roots it through the resumed interpreter.
     // The value is seeded as the resume exception (`blackhole.py:1647`
-    // `_prepare_resume_from_failure`, consumed at `blackhole.py:1794`);
+    // `_prepare_resume_from_failure`, consumed at `blackhole.py`);
     // re-reading `jf_guard_exc` here would observe the post-`grab_exc_value`
     // null and drop the exception.
     let bh_result = CA_BLACKHOLE_FN.get().and_then(|blackhole| {
@@ -1046,7 +1046,7 @@ mod tests {
         let ref_: majit_ir::DescrRef = Arc::new(TestMarker(Type::Ref));
         let float: majit_ir::DescrRef = Arc::new(TestMarker(Type::Float));
 
-        // `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])`
+        // `pyjitpl.py` `make_and_attach_done_descrs([self, cpu])`
         // parity: the four `DoneWithThisFrameDescr*` singletons live on
         // the owning cpu instance.  Construct a per-test backend, attach
         // the descrs through the Backend trait, and read pointers out of

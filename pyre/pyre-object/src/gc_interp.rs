@@ -250,9 +250,9 @@ pub fn would_collect() -> bool {
 /// A no-op when the flag is off or no collection hook is installed.
 ///
 /// The decision is entirely the collector's. `threshold_reached`
-/// (incminimark.py:1288-1290) compares `get_total_memory_used()` — every byte
+/// (incminimark.py) compares `get_total_memory_used()` — every byte
 /// the collector is responsible for, headers included, whatever allocated them
-/// — against the threshold `set_major_threshold_from` (incminimark.py:575-594)
+/// — against the threshold `set_major_threshold_from` (incminimark.py)
 /// derived from the last major's survivors under `major_collection_threshold`,
 /// `growth_rate_max`, `max_delta`, `min_heap_size` and `max_heap_size`. Running
 /// the collection re-derives it, because `do_collect_oldgen_nonmoving` drives

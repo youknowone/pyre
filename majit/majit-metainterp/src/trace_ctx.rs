@@ -193,12 +193,12 @@ pub struct MergePoint {
     /// Green key of the loop header.
     pub green_key: u64,
     /// The typed green key `green_key` is the `JitCell.get_uhash` of
-    /// (warmstate.py:585-593 `def get_uhash(*greenargs)`).
+    /// (warmstate.py `def get_uhash(*greenargs)`).
     ///
     /// `green_key` alone names a BUCKET, not a cell: `_get_index` truncates it
     /// (counter.py:128-135), so several cells share one chain and
     /// `JitCell.comparekey` is what picks this one out of it
-    /// (warmstate.py:575-582 `def comparekey(self, *greenargs2)`). A consumer
+    /// (warmstate.py `def comparekey(self, *greenargs2)`). A consumer
     /// that reaches a cell through the hash alone installs one carrying no
     /// comparekey, which no later typed lookup can match — so the same loop
     /// header ends up owning a second cell with its own token and flags.
@@ -302,7 +302,7 @@ pub struct TraceCtx {
     /// Mirrored from `MetaInterp::vable_ptr` at trace/bridge-entry.  Used by
     /// `synchronize_virtualizable` to write `virtualizable_values` back to
     /// the live PyFrame after every standard vable setfield / setarrayitem
-    /// (virtualizable.py:101 write_boxes parity). `None` disables the
+    /// (virtualizable.py write_boxes parity). `None` disables the
     /// write — unit-test or init-before-run path.
     virtualizable_heap_ptr: Option<*const u8>,
     /// Header PC at which this trace started (0 = function entry).
@@ -321,7 +321,7 @@ pub struct TraceCtx {
     /// compiled code, so the metainterp pops the inline frame and records
     /// a CALL_ASSEMBLER into the loop token from the parent
     /// (opimpl_jit_merge_point portal_call_depth>0 → finishframe +
-    /// do_recursive_call(assembler_call=True), pyjitpl.py:1579-1602).
+    /// do_recursive_call(assembler_call=True), pyjitpl.py).
     /// `(green_key, target_pc)` of the callee loop header. See
     /// `request_recursive_call_assembler`.
     pub(crate) recursive_call_assembler_pending: Option<(u64, usize)>,
@@ -329,7 +329,7 @@ pub struct TraceCtx {
     /// tracing with their trace positions. First visit records the key +
     /// position; second visit closes the loop.
     pub(crate) current_merge_points: Vec<MergePoint>,
-    /// pyjitpl.py:3912 `same_greenkey` reference — the trace-start loop
+    /// pyjitpl.py `same_greenkey` reference — the trace-start loop
     /// header's concrete green constants, grouped by IR register slot
     /// (`(ints, refs, floats)`).  Captured on the first merge-point visit of a
     /// primary trace (the header), then compared element-wise against every
@@ -353,17 +353,17 @@ pub struct TraceCtx {
     /// greens, so reconstructing the interpreter-entered key for a close needs
     /// this target in addition to the merge-point green tuple.
     pub(crate) close_green_pc: Option<i64>,
-    /// pyjitpl.py:3005-3007 `compile_trace(live_arg_boxes, ptoken)`: the procedure
+    /// pyjitpl.py `compile_trace(live_arg_boxes, ptoken)`: the procedure
     /// token key of the merge point the trace just reached, set when that merge point
     /// already has compiled targets.  A close carrying this JUMPs into the existing
     /// loop instead of compiling a new one, and is read-and-cleared by the driver.
     pub(crate) close_jump_into_key: Option<u64>,
-    /// pyjitpl.py:2979 reached_loop_header parity: callback to check
+    /// pyjitpl.py reached_loop_header parity: callback to check
     /// has_compiled_targets(ptoken) for a given green key. Bridge traces
     /// skip loop headers without compiled targets. Live lookup (not snapshot)
     /// matches RPython's get_procedure_token(greenboxes) + has_compiled_targets.
     pub has_compiled_targets_fn: Option<Box<dyn Fn(u64) -> bool>>,
-    /// pyjitpl.py:3005 `ptoken = self.get_procedure_token(greenboxes)` for the
+    /// pyjitpl.py `ptoken = self.get_procedure_token(greenboxes)` for the
     /// greens of the merge point just reached, in the same `(ints, refs,
     /// floats)` slot grouping as `Self::close_greens`. `Some(key)` iff a
     /// compiled loop with jumpable targets already lives at those greens
@@ -388,7 +388,7 @@ pub struct TraceCtx {
     /// primary entries.
     ///
     /// This is NOT `self.partial_trace`. That flag is set only by
-    /// `retrace_needed` (pyjitpl.py:2438-2439) and means "this is a
+    /// `retrace_needed` (pyjitpl.py) and means "this is a
     /// RETRACE"; a bridge from a guard failure has `partial_trace = None`
     /// and takes every `if not self.partial_trace:` branch. Pyre has no
     /// retrace counterpart, so those branches are unconditional here —
@@ -410,7 +410,7 @@ pub struct TraceCtx {
     /// Green keys whose cross-loop close this recording walk already attempted
     /// and did not get compiled.
     ///
-    /// `reached_loop_header` (pyjitpl.py:3020-3050) answers a cancelled close by
+    /// `reached_loop_header` (pyjitpl.py) answers a cancelled close by
     /// `cancel_count += 1` and, once `cancelled_too_many_times()` holds
     /// (`max_unroll_loops` defaults to 0, `rlib/jit.py:598`), by
     /// `SwitchToBlackhole(ABORT_BAD_LOOP)` — so upstream re-attempts a close at
@@ -439,7 +439,7 @@ pub struct TraceCtx {
     /// the cross-component flow at dispatch time) can sample the
     /// metainterp's depth counter without holding a back-reference.
     pub portal_call_depth_fn: Option<Box<dyn Fn() -> i32>>,
-    /// pyjitpl.py:1527 `MetaInterp.seen_loop_header_for_jdindex` parity for
+    /// pyjitpl.py `MetaInterp.seen_loop_header_for_jdindex` parity for
     /// walkers that drive dispatch through `TraceCtx` (the pyre full-body
     /// walker has no dispatcher struct of its own, so the per-trace flag
     /// lives here; majit's own `pyjitpl::dispatch` keeps an equivalent
@@ -458,7 +458,7 @@ pub struct TraceCtx {
     pub seen_loop_header_jit_pc: Option<usize>,
     /// pyjitpl.py:2941-2942 `if isinstance(key, compile.ResumeAtPositionDescr):
     /// self.seen_loop_header_for_jdindex = self.jitdriver_sd.index` — a bridge
-    /// grown from a guard `inline_short_preamble` replayed (unroll.py:337 /
+    /// grown from a guard `inline_short_preamble` replayed (unroll.py /
     /// :409) starts with the loop header already counted as seen, so its first
     /// merge point closes instead of running the auto-stamp ladder.
     ///
@@ -468,7 +468,7 @@ pub struct TraceCtx {
     /// merge point asserts the flag equals its own `jdindex`. Consumed
     /// (`take`) by the first merge point, which then stamps that `jdindex`.
     pub bridge_resume_at_position: bool,
-    /// pyjitpl.py:1571/1574 `saved_pc = self.pc` / `self.pc = saved_pc`, the
+    /// pyjitpl.py/1574 `saved_pc = self.pc` / `self.pc = saved_pc`, the
     /// "do not re-consult the merge point" half. [`Self::walk_resume_pc`] is
     /// the position half.
     ///
@@ -502,7 +502,7 @@ pub struct TraceCtx {
     pub walk_resume_pc: Option<usize>,
     /// pyjitpl.py: `metainterp.staticdata.callinfocollection`. Needed by
     /// `ResumeDataBoxReader.concat_strings` / `slice_string` / `concat_unicodes`
-    /// / `slice_unicode` (resume.py:1143-1188) which look up the
+    /// / `slice_unicode` (resume.py) which look up the
     /// `OS_STR_CONCAT` / `OS_STR_SLICE` / `OS_UNI_CONCAT` / `OS_UNI_SLICE`
     /// calldescr + func pointers while rematerializing virtual strings
     /// during bridge-virtual reconstruction.
@@ -519,7 +519,7 @@ pub struct TraceCtx {
     pub last_traced_pc: usize,
     /// GC-safe constant value snapshot for each initial inputarg at trace
     /// start. Each entry is an inline-const `OpRef` mirroring
-    /// history.py:227/268/314 (`Const*.value` lives on the box); the inline
+    /// history.py/268/314 (`Const*.value` lives on the box); the inline
     /// gcref of a `ConstPtr` entry is forwarded in place by
     /// `MetaInterp::walk_active_trace_refs`. Used by cut_trace_from to
     /// remap escaped original inputargs to their stable Const value.
@@ -549,13 +549,13 @@ pub struct TraceCtx {
     /// rather than a decision the walk took.  The unwind can leave the frame's
     /// `code_cursor` anywhere inside the panicking instruction, so the frames
     /// name no position a blackhole could resume at — the abort consumer must
-    /// not convert them (`blackhole.py:1799` assumes `frame.pc` is an
+    /// not convert them (`blackhole.py` assumes `frame.pc` is an
     /// instruction boundary).  RPython has no counterpart: it has no panic arm
     /// here.
     pub abort_after_panic: bool,
-    /// `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` needs
+    /// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` needs
     /// `metainterp.framestack` to still exist when it calls
-    /// `blackhole.py:1799 convert_and_run_from_pyjitpl(self, ...)`.  RPython
+    /// `blackhole.py convert_and_run_from_pyjitpl(self, ...)`.  RPython
     /// keeps the stack on the MetaInterp for the whole trace; pyre's walk owns
     /// it locally (`trace_jitcode_with_args_and_runtime` allocates a
     /// `StandaloneFrameStack` and drops it on return), so an aborting walk
@@ -575,7 +575,7 @@ pub struct TraceCtx {
     /// GUARD_NOT_INVALIDATED with full snapshot at the field read's orgpc.
     /// Stores Some(orgpc) when pending.
     pending_guard_not_invalidated_pc: Option<usize>,
-    /// pyjitpl.py:2394 `MetaInterp.forced_virtualizable` parity. Tracks the
+    /// pyjitpl.py `MetaInterp.forced_virtualizable` parity. Tracks the
     /// vbox handed to `gen_store_back_in_vable` so the second
     /// `opimpl_hint_force_virtualizable` of the same trace can be skipped.
     /// RPython resets this in `MetaInterp.__init__`; pyre keeps it on
@@ -605,7 +605,7 @@ pub struct TraceCtx {
     /// `start_retrace_from_guard` from the failed guard descr's
     /// `rd_loop_token`.  `None` for loop-entry traces (RPython
     /// `isinstance(self.resumekey, compile.ResumeFromInterpDescr)` is
-    /// True).  Used by `prepare_trace_segmenting` (pyjitpl.py:2825-
+    /// True).  Used by `prepare_trace_segmenting` (pyjitpl.py-
     /// 2834) to set the `FORCE_BRIDGE_SEGMENTING` bit on the loop
     /// token when bridge tracing aborts without an inlinable function.
     pub(crate) resumekey_original_loop_token: Option<std::sync::Arc<JitCellToken>>,
@@ -633,7 +633,7 @@ pub struct TraceCtx {
     // `opref_concrete: HashMap<u32, Value>` retired — the concrete
     // value now lives intrinsically on each frontend object's
     // `value: Cell<Option<Value>>` field (`Op` / `InputArg`), matching
-    // RPython `history.py:803-807` *FrontendOp(pos, value) where the
+    // RPython `history.py` *FrontendOp(pos, value) where the
     // per-position concrete is an object field, not an external side
     // table.  `set_opref_concrete` / `lookup_opref_concrete` now route
     // through `recorder.set_concrete_at` / `recorder.concrete_at`, which
@@ -643,7 +643,7 @@ pub struct TraceCtx {
     /// the `raising_exception` flag as a real Python exception that
     /// propagates out of `interpret()` to `_compile_and_run_once`
     /// (`pyjitpl.py:2907-2916`), where the catch site invokes
-    /// `run_blackhole_interp_to_cancel_tracing(stb)` (`pyjitpl.py:2949`).
+    /// `run_blackhole_interp_to_cancel_tracing(stb)` (`pyjitpl.py`).
     /// That helper does TWO things: (1) `aborted_tracing(stb.reason)`
     /// accounting, (2) `convert_and_run_from_pyjitpl(self,
     /// stb.raising_exception)` — converting the framestack into
@@ -655,7 +655,7 @@ pub struct TraceCtx {
     /// payload, so the dispatch site (`finalize_standard_virtualizable_may_force`)
     /// stashes the full `SwitchToBlackhole` here and the jitdriver-side
     /// consumer drains it.  Currently only `stb.reason` is consumed —
-    /// the consumer mirrors only `pyjitpl.py:2491` `aborted_tracing(reason)`
+    /// the consumer mirrors only `pyjitpl.py` `aborted_tracing(reason)`
     /// accounting.  `stb.raising_exception` is preserved on this struct
     /// but the `convert_and_run_from_pyjitpl` invocation
     /// (in `blackhole.rs`, ported from `blackhole.py:1799`) is NOT yet
@@ -671,7 +671,7 @@ pub struct TraceCtx {
     /// and the jitdriver-side drain.
     pub(crate) pending_switch_to_blackhole: Option<crate::pyjitpl::SwitchToBlackhole>,
 
-    /// `pyjitpl.py:3317 MetaInterp.virtualref_boxes`: pairs of `[virtualbox,
+    /// `pyjitpl.py MetaInterp.virtualref_boxes`: pairs of `[virtualbox,
     /// vrefbox]` for every `opimpl_virtual_ref` ↔ `opimpl_virtual_ref_finish`
     /// LIFO scope.  Pyre stores `(OpRef, usize)` so the symbolic SSA value
     /// and the concrete `JitVirtualRef*` pointer both live in one slot:
@@ -705,7 +705,7 @@ pub struct TraceCtx {
     /// []` before `rebuild_from_resumedata` (pyjitpl.py:3427). This makes a
     /// stale carrier leaking across bridges structurally impossible.
     pub(crate) bridge_inline_carrier: Option<BridgeInlineCarrier>,
-    /// resume.py:1054 consume_boxes parity: per-bank live register indices
+    /// resume.py consume_boxes parity: per-bank live register indices
     /// of the bridge's guard resume frame, stashed by `start_bridge_tracing`
     /// (which has the dispatch JitCode) so a JitDriver `setup_bridge_sym`
     /// (a static trait method with no metainterp access) can map each
@@ -760,7 +760,7 @@ pub struct ReconstructRecipe {
 /// bridge, plus the outermost (`frames[0]`) resume pc. `trace_bytecode`
 /// builds the caller-visible root frame at `root_pc` and pushes each
 /// recipe on top (innermost last), so the framestack matches the inline
-/// depth the guard fired at (`rebuild_from_resumedata` resume.py:1049-1056).
+/// depth the guard fired at (`rebuild_from_resumedata` resume.py).
 pub struct BridgeInlineCarrier {
     /// `resume_data.frames[0].pc` — where the outermost (portal/root) frame
     /// resumes once the reconstructed callees return. The bridge's returned
@@ -778,7 +778,7 @@ pub struct BridgeInlineCarrier {
 /// The virtualizable shadow slot a `vable_set*` standard leg overwrote, and
 /// the Box it held before.
 ///
-/// `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` (pyjitpl.py:1188,
+/// `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` (pyjitpl.py,
 /// :1236) reach `virtualizable_boxes[index] = valuebox` only AFTER
 /// `_nonstandard_virtualizable` / `_get_arrayitem_vable_index` have promoted,
 /// and each promote captures its guard's resume data inside
@@ -879,7 +879,7 @@ impl TraceCtx {
         });
     }
 
-    /// pyjitpl.py:934 `executor.execute(cpu, mi, opnum, fielddescr, box)`
+    /// pyjitpl.py `executor.execute(cpu, mi, opnum, fielddescr, box)`
     /// line-by-line dispatch for the GETFIELD_GC_{I,R,F} subset.
     ///
     /// Returns `Some(value)` when `self.cpu` is wired and the descr
@@ -924,7 +924,7 @@ impl TraceCtx {
         }
     }
 
-    /// `executor.py:215-222 do_setfield_gc(cpu, _, structbox, itembox,
+    /// `executor.py do_setfield_gc(cpu, _, structbox, itembox,
     /// fielddescr)` analog — the store half of [`Self::field_sanity_load`].
     /// `_opimpl_setfield_gc_any` reaches it through `execute_and_record`
     /// (`pyjitpl.py:979`), so upstream really performs the field store while
@@ -951,7 +951,7 @@ impl TraceCtx {
         crate::executor::do_setfield_gc(cpu, (), struct_ptr, value, &bh_descr, field_type)
     }
 
-    /// `blackhole.py:1370 bhimpl_arraylen_gc(cpu, array, arraydescr)`
+    /// `blackhole.py bhimpl_arraylen_gc(cpu, array, arraydescr)`
     /// analog — read the GC array's length through
     /// `cpu.bh_arraylen_gc(array_ptr, &arraydescr)`.  RPython has no
     /// explicit `do_arraylen_gc` in `executor.py`; the dispatch path
@@ -995,7 +995,7 @@ impl TraceCtx {
             || majit_gc::is_registered_type_id(type_id)
     }
 
-    /// `pyjitpl.py:624-629 execute_new[_with_vtable]` concrete execution.
+    /// `pyjitpl.py execute_new[_with_vtable]` concrete execution.
     /// RPython executes the allocation before recording the matching trace op,
     /// so later residual calls and field operations observe a real pointer
     /// while the optimizer remains free to virtualize the recorded allocation.
@@ -1005,7 +1005,7 @@ impl TraceCtx {
     /// (`set_opref_concrete`) before performing any GC allocation.  That stamp
     /// is what makes the object a root — `MetaInterp::walk_active_trace_refs`
     /// forwards every recorder `Op`/`InputArg` `value` cell holding a
-    /// `Value::Ref`, which is the `history.py:803-807` `*FrontendOp(pos,
+    /// `Value::Ref`, which is the `history.py` `*FrontendOp(pos,
     /// value)` slot upstream reaches through the object graph.  Between the
     /// `bh_new` here and that stamp there is no root at all, so the caller's
     /// window must contain no GC allocation; recording the op and populating
@@ -1150,13 +1150,13 @@ impl TraceCtx {
         }
     }
 
-    /// heapcache.py:542-553 `getarrayitem(box, indexbox, descr)` parity.
+    /// heapcache.py `getarrayitem(box, indexbox, descr)` parity.
     /// Extracts the index ConstInt's `getint()` value (returns `None`
     /// on non-ConstInt operands, matching the upstream early-out at
     /// `heapcache.py:543`) and routes the lookup through the indexcache
     /// (`heap_array_cache[descr][index_value]`).  Inside the indexcache,
     /// `array` is canonicalised by `_unique_const_heuristic` against
-    /// the per-CacheEntry `last_const_box` (heapcache.py:96-104) so two
+    /// the per-CacheEntry `last_const_box` (heapcache.py) so two
     /// distinct ConstPtr OpRefs for the same gcref share the same
     /// cache slot.
     pub fn heapcache_getarrayitem(
@@ -1174,7 +1174,7 @@ impl TraceCtx {
             .getarrayitem_cache(array, index_value, descr, oracle)
     }
 
-    /// heapcache.py:573-585 `setarrayitem` parity.  `None` index_value
+    /// heapcache.py `setarrayitem` parity.  `None` index_value
     /// (non-ConstInt operand) clears the entire `descr` submap;
     /// otherwise the write goes through the indexcache with `array`
     /// canonicalised by `_unique_const_heuristic`.
@@ -1188,7 +1188,7 @@ impl TraceCtx {
             .setarrayitem_cache(array, index_value, descr, value, oracle)
     }
 
-    /// heapcache.py:565-568 `getarrayitem_now_known` parity.
+    /// heapcache.py `getarrayitem_now_known` parity.
     pub fn heapcache_getarrayitem_now_known(
         &mut self,
         array: OpRef,
@@ -1205,7 +1205,7 @@ impl TraceCtx {
             .getarrayitem_now_known(array, index_value, descr, value, oracle)
     }
 
-    /// heapcache.py:518-522 `getfield` parity.  Routes `obj` through
+    /// heapcache.py `getfield` parity.  Routes `obj` through
     /// `_unique_const_heuristic` so two distinct ConstPtr OpRefs for
     /// the same gcref share the same `(obj, field_index)` cache slot.
     ///
@@ -1215,14 +1215,14 @@ impl TraceCtx {
     /// the intrinsic value via `box_value(cached)` (which composes
     /// the const pool, standard-virtualizable shadow, and the frontend
     /// object's `value: Cell<Option<Value>>` field — PyPy `history.py:680
-    /// AbstractValue.getXXX()` / `history.py:803-807 *FrontendOp(pos,
+    /// AbstractValue.getXXX()` / `history.py *FrontendOp(pos,
     /// value)` parity).
     pub fn heapcache_getfield_cached(&mut self, obj: OpRef, field_index: u32) -> Option<OpRef> {
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache.getfield_cached(obj, field_index, oracle)
     }
 
-    /// heapcache.py:538-540 `setfield` parity.  Same canonicalisation
+    /// heapcache.py `setfield` parity.  Same canonicalisation
     /// as `heapcache_getfield_cached` plus alias-clearing semantics
     /// when `obj` is not known-unescaped.
     ///
@@ -1237,7 +1237,7 @@ impl TraceCtx {
             .setfield_cached(obj, field_index, value, oracle)
     }
 
-    /// heapcache.py:534-536 `getfield_now_known` parity (no aliasing).
+    /// heapcache.py `getfield_now_known` parity (no aliasing).
     /// `value` is the loaded Box identity (OpRef); the frontend value slot
     /// carries the intrinsic `executor.execute(...)`-produced value
     /// the cache-hit sanity check resolves later via
@@ -1248,11 +1248,11 @@ impl TraceCtx {
             .getfield_now_known(obj, field_index, value, oracle)
     }
 
-    /// heapcache.py:211-216 `invalidate_caches_varargs` parity.
+    /// heapcache.py `invalidate_caches_varargs` parity.
     /// Routes through `clear_caches_varargs` → `_clear_caches_arraycopy` /
     /// `_clear_caches_arraymove` → `_clear_caches_arrayop_with_consts`
     /// where ConstPtr source/dest boxes are canonicalised by
-    /// `_unique_const_heuristic` (heapcache.py:96-104) via the
+    /// `_unique_const_heuristic` (heapcache.py) via the
     /// `SameConstantOracle` (`history::ConstOprefOracle`, value-compares
     /// inline Const OpRefs).  ConstPtr values are carried inline on the
     /// OpRef (history.py:314), and the active-trace GC walker
@@ -1354,7 +1354,7 @@ impl TraceCtx {
         self.virtualref_boxes.last().copied()
     }
 
-    /// `pyjitpl.py:3433 rebuild_state_after_failure`'s
+    /// `pyjitpl.py rebuild_state_after_failure`'s
     /// `self.virtualref_boxes = virtualref_boxes`.  A bridge resumes into its
     /// parent's still-open `virtual_ref` scopes, so the pairs the parent guard
     /// encoded are re-tracked before the bridge trace records anything —
@@ -1363,8 +1363,8 @@ impl TraceCtx {
         self.virtualref_boxes = boxes;
     }
 
-    /// `pyjitpl.py:1789-1814 opimpl_virtual_ref` — `ExecutionContext.enter`'s
-    /// `jit.virtual_ref(frame)` (`executioncontext.py:89`) as the tracer sees
+    /// `pyjitpl.py opimpl_virtual_ref` — `ExecutionContext.enter`'s
+    /// `jit.virtual_ref(frame)` (`executioncontext.py`) as the tracer sees
     /// it.  Creates the concrete vref, records `VIRTUAL_REF(box, cindex)`, and
     /// pushes the `[virtualbox, vrefbox]` pair.
     ///
@@ -1397,7 +1397,7 @@ impl TraceCtx {
         (vref, vref_ptr)
     }
 
-    /// `pyjitpl.py:1819-1832 opimpl_virtual_ref_finish(box)` —
+    /// `pyjitpl.py opimpl_virtual_ref_finish(box)` —
     /// `ExecutionContext.leave`'s `jit.virtual_ref_finish`
     /// (`executioncontext.py:107`).  The vrefbox is reconstituted by popping,
     /// not passed in, so the stack discipline is checked rather than assumed.
@@ -1414,7 +1414,7 @@ impl TraceCtx {
             .virtualref_boxes
             .pop()
             .expect("opimpl_virtual_ref_finish: vrefbox without its virtualbox");
-        // pyjitpl.py:1823 `assert box.getref_base() == lastbox.getref_base()`
+        // pyjitpl.py `assert box.getref_base() == lastbox.getref_base()`
         // — compare the concrete ref base, not the SSA OpRef.  PyPy permits
         // alias boxes that share `getref_base()` but differ in box identity;
         // an `OpRef`-identity assert would reject those.
@@ -1470,7 +1470,7 @@ impl TraceCtx {
         true
     }
 
-    /// `pyjitpl.py:3317-3324 MetaInterp.vable_and_vrefs_before_residual_call`
+    /// `pyjitpl.py MetaInterp.vable_and_vrefs_before_residual_call`
     /// — the vrefs half (the virtualizable-info half lives on
     /// `JitCodeMachine::prepare_standard_virtualizable_before_residual_call`).
     ///
@@ -1504,7 +1504,7 @@ impl TraceCtx {
         }
     }
 
-    /// `pyjitpl.py:3358-3367 MetaInterp.vrefs_after_residual_call`.
+    /// `pyjitpl.py MetaInterp.vrefs_after_residual_call`.
     ///
     /// ```python
     /// def vrefs_after_residual_call(self):
@@ -1538,7 +1538,7 @@ impl TraceCtx {
         }
     }
 
-    /// `pyjitpl.py:3395-3402 MetaInterp.stop_tracking_virtualref(i)`.
+    /// `pyjitpl.py MetaInterp.stop_tracking_virtualref(i)`.
     ///
     /// ```python
     /// def stop_tracking_virtualref(self, i):
@@ -1843,14 +1843,14 @@ impl TraceCtx {
 
     /// Get or create a constant OpRef for a given i64 value.
     ///
-    /// history.py:227 `ConstInt(value).value` is inline on the Box;
+    /// history.py `ConstInt(value).value` is inline on the Box;
     /// pyre mirrors this with `OpRef::ConstInt` — no pool allocation.
     pub fn const_int(&mut self, value: i64) -> OpRef {
         OpRef::const_int(value)
     }
 
-    /// executor.py:544 constant_from_op(op) parity: get typed Value for OpRef.
-    /// history.py:227/268/314 — inline-Const carries the value directly.
+    /// executor.py constant_from_op(op) parity: get typed Value for OpRef.
+    /// history.py/268/314 — inline-Const carries the value directly.
     pub fn constants_get_value(&self, opref: OpRef) -> Option<Value> {
         opref.inline_const_to_value()
     }
@@ -1864,7 +1864,7 @@ impl TraceCtx {
     /// object itself.  Const OpRefs carry their value inline, so the
     /// call is a no-op for them.
     ///
-    /// **Invariant** (`history.py:803 *FrontendOp(pos, value)` parity):
+    /// **Invariant** (`history.py *FrontendOp(pos, value)` parity):
     /// the recorded position for `opref.raw()` must already exist — Pyre
     /// allocates it at every `record_op*` / `record_input_arg` site,
     /// mirroring RPython where instantiating `IntFrontendOp(pos, value)`
@@ -1879,7 +1879,7 @@ impl TraceCtx {
             return;
         }
         // Stamp the concrete value on the canonical `InputArg`/`Op` identity
-        // (`history.py:803 *FrontendOp(pos, value)` — the value lives on the
+        // (`history.py *FrontendOp(pos, value)` — the value lives on the
         // op object, not a side pool). A missing slot means a synthetic /
         // stale OpRef is trying to stamp a value before the op was recorded —
         // an invariant violation; panic rather than silently swallow it.
@@ -1910,7 +1910,7 @@ impl TraceCtx {
     }
 
     /// `get_value` reader — the concrete value stamped onto
-    /// this OpRef's frontend value slot (`history.py:803 *FrontendOp(pos,
+    /// this OpRef's frontend value slot (`history.py *FrontendOp(pos,
     /// value)` analog).  Const variants delegate to
     /// `Forwarded::Const { value, .. }` directly.
     ///
@@ -1969,7 +1969,7 @@ impl TraceCtx {
     /// `concrete_of_opref` uses (Const pool + standard-virtualizable
     /// shadow + the frontend object's `value` field) but returns
     /// `Option<Value>` instead of the `Ref(usize::MAX)` sentinel.
-    /// history.py:680 `AbstractValue.getint()/getref_base()/
+    /// history.py `AbstractValue.getint()/getref_base()/
     /// getfloat_storage()` analog: `Const.getint()` for constants,
     /// `*FrontendOp.getint()` for the `_resint/_resfloat/_resref`
     /// fields (history.py:680,696). The standard-virtualizable shadow
@@ -2001,14 +2001,14 @@ impl TraceCtx {
 
     /// RPython parity: Ref constants preserve their type so guard
     /// fail_args are correctly typed during guard failure recovery.
-    /// history.py:314 `ConstPtr.value` is inline on the Box; pyre
+    /// history.py `ConstPtr.value` is inline on the Box; pyre
     /// mirrors with `OpRef::ConstPtr(GcRef)`. The op-graph walker
     /// forwards these slots across minor collection.
     pub fn const_ref(&mut self, value: i64) -> OpRef {
         OpRef::const_ptr(majit_ir::GcRef(value as usize))
     }
 
-    /// history.py:361 CONST_NULL = ConstPtr(ConstPtr.value).
+    /// history.py CONST_NULL = ConstPtr(ConstPtr.value).
     /// Ref-typed null pointer constant.
     pub fn const_null(&mut self) -> OpRef {
         self.const_ref(0)
@@ -2016,7 +2016,7 @@ impl TraceCtx {
 
     /// Get or create a Float-typed constant OpRef.
     ///
-    /// history.py:268 `ConstFloat(valuestorage).value` is inline on the
+    /// history.py `ConstFloat(valuestorage).value` is inline on the
     /// Box; pyre mirrors with `OpRef::ConstFloat`. The incoming
     /// `value: i64` is the longlong float-storage form (raw bits) per
     /// RPython `longlong.FLOATSTORAGE`; convert to `f64` for the inline
@@ -2026,13 +2026,13 @@ impl TraceCtx {
     }
 
     /// Return the type of a constant OpRef, if recorded.
-    /// history.py:227/268/314 — inline-Const carries type intrinsically.
+    /// history.py/268/314 — inline-Const carries type intrinsically.
     pub fn const_type(&self, opref: OpRef) -> Option<majit_ir::Type> {
         opref.ty()
     }
 
     /// Return the concrete value for a constant OpRef as raw i64 bits.
-    /// history.py:227/268/314 — inline-Const carries the value directly.
+    /// history.py/268/314 — inline-Const carries the value directly.
     pub fn const_value(&self, opref: OpRef) -> Option<i64> {
         opref.inline_const_bits()
     }
@@ -2119,7 +2119,7 @@ impl TraceCtx {
     pub fn initial_inputarg_argbox(&self, index: usize) -> Option<(JitArgKind, OpRef, i64)> {
         let tp = self.recorder.inputarg_types().get(index).copied()?;
         let const_ref = self.initial_inputarg_consts.get(index)?;
-        // history.py:227/268/314 — Const{Int,Float,Ptr}.value lives inline
+        // history.py/268/314 — Const{Int,Float,Ptr}.value lives inline
         // on the Box; read it and resolve the raw bits (Int→value,
         // Float→bit pattern, Ref→gcref address).
         let bits = match const_ref.inline_const_to_value()? {
@@ -2144,7 +2144,7 @@ impl TraceCtx {
     /// JitCode setup argbox for the standard virtualizable.
     ///
     /// This is the walk's counterpart of
-    /// `pyjitpl.py:3271 f.setup_call(original_boxes)`: prefer the exact
+    /// `pyjitpl.py f.setup_call(original_boxes)`: prefer the exact
     /// trace-entry red inputarg named by `jd.index_of_virtualizable`, and
     /// fall back to `virtualizable_boxes[-1]` only for legacy pyre traces that
     /// initialized the standard virtualizable before descriptor metadata was
@@ -2301,7 +2301,7 @@ impl TraceCtx {
         self.green_key_values.as_ref()
     }
 
-    /// pyjitpl.py:3183-3189: `compile_loop` keys the JitCell by
+    /// pyjitpl.py: `compile_loop` keys the JitCell by
     /// `original_boxes[:num_green_args]`, i.e. the greens captured at the
     /// merge point that closed the trace.
     pub fn close_green_key_hash(&self) -> Option<u64> {
@@ -2322,10 +2322,10 @@ impl TraceCtx {
         self.merge_point_green_key(pc, greens)
     }
 
-    /// pyjitpl.py:1553 / :3005 `get_procedure_token(greenboxes)` analog: the
+    /// pyjitpl.py / :3005 `get_procedure_token(greenboxes)` analog: the
     /// jitcell key the INTERPRETER would enter by for these greens.  The
     /// grouping is per JitCode register bank; rebuild the declared green order
-    /// before hashing so this matches warmstate.py:584-593 `JitCell.get_uhash`.
+    /// before hashing so this matches warmstate.py `JitCell.get_uhash`.
     pub fn merge_point_green_key_hash(
         &self,
         pc: i64,
@@ -2458,7 +2458,7 @@ impl TraceCtx {
         self.virtualizable_boxes.clone()
     }
 
-    /// history.py:809-816 `record_same_as`:
+    /// history.py `record_same_as`:
     ///
     /// ```python
     /// def record_same_as(self, box):
@@ -2492,7 +2492,7 @@ impl TraceCtx {
         self.virtualizable_entry_at(index).map(|(_, value)| value)
     }
 
-    /// pyjitpl.py:2958-2964 `remove_consts_and_duplicates`:
+    /// pyjitpl.py `remove_consts_and_duplicates`:
     ///
     /// ```python
     /// for i in range(endindex):
@@ -2649,7 +2649,7 @@ impl TraceCtx {
     /// Mirror of `MetaInterp::vable_ptr` used by `synchronize_virtualizable`.
     /// Callers set this at trace/bridge-entry so writes to
     /// `virtualizable_values` can propagate to the live PyFrame without
-    /// routing back through MetaInterp (pyjitpl.py:3446 write_boxes target).
+    /// routing back through MetaInterp (pyjitpl.py write_boxes target).
     pub fn set_virtualizable_heap_ptr(&mut self, ptr: *const u8) {
         self.virtualizable_heap_ptr = if ptr.is_null() { None } else { Some(ptr) };
     }
@@ -2733,7 +2733,7 @@ impl TraceCtx {
         }
     }
 
-    /// pyjitpl.py:3446-3450 `synchronize_virtualizable()`.
+    /// pyjitpl.py `synchronize_virtualizable()`.
     ///
     /// Writes the concrete half of `virtualizable_boxes` (the
     /// `virtualizable_values` shadow) back to the live virtualizable via
@@ -2801,8 +2801,8 @@ impl TraceCtx {
         }
     }
 
-    /// pyjitpl.py:3463-3468 `check_synchronized_virtualizable()`, whose body is
-    /// `virtualizable.py:157-170 check_boxes`.
+    /// pyjitpl.py `check_synchronized_virtualizable()`, whose body is
+    /// `virtualizable.py check_boxes`.
     ///
     /// ```text
     /// def check_synchronized_virtualizable(self):
@@ -3191,7 +3191,7 @@ impl TraceCtx {
         self.virtualizable_boxes.as_ref().map(|boxes| boxes.len())
     }
 
-    /// `opencoder.py:767-784 create_top_snapshot` parity for callers that
+    /// `opencoder.py create_top_snapshot` parity for callers that
     /// need to feed `vable_boxes` / `vref_boxes` into
     /// `capture_snapshot_for_last_guard_with_vable_vref`.  Returns the
     /// pre-shaped `(vable_boxes, vref_boxes)` ready to attach to a top
@@ -3374,7 +3374,7 @@ impl TraceCtx {
 
     /// Set virtualizable_boxes with VirtualizableInfo and array lengths.
     /// Used by bridge tracing where the boxes are reconstructed from
-    /// resume data (pyjitpl.py:3400 rebuild_state_after_failure parity).
+    /// resume data (pyjitpl.py rebuild_state_after_failure parity).
     ///
     /// `values` carries the concrete shadow that parallels `boxes`. Callers
     /// must pass the matching live values recovered from the guard's fail
@@ -3407,7 +3407,7 @@ impl TraceCtx {
 
     /// Reload the tracing-time `virtualizable_boxes` cache from the heap
     /// object — the `TraceCtx`-level body of
-    /// `MetaInterp::load_fields_from_virtualizable` (pyjitpl.py:3452-3464).
+    /// `MetaInterp::load_fields_from_virtualizable` (pyjitpl.py).
     ///
     /// ```text
     /// def load_fields_from_virtualizable(self):
@@ -3421,7 +3421,7 @@ impl TraceCtx {
     ///
     /// It lives here rather than only on `MetaInterp` because the second
     /// upstream caller of this reload — the escape path of
-    /// `vable_after_residual_call` (pyjitpl.py:3377) — is reached from the
+    /// `vable_after_residual_call` (pyjitpl.py) — is reached from the
     /// state-field dispatcher, which holds no `MetaInterp` reference.
     #[expect(
         clippy::not_unsafe_ptr_arg_deref,
@@ -3544,7 +3544,7 @@ impl TraceCtx {
         // GuardValue(token, 0) at loop entry for freshly created frames.
     }
 
-    /// pyjitpl.py:3222-3236 `MetaInterp.store_token_in_vable()`.
+    /// pyjitpl.py `MetaInterp.store_token_in_vable()`.
     ///
     /// ```text
     /// def store_token_in_vable(self):
@@ -3578,7 +3578,7 @@ impl TraceCtx {
         let force_token = Self::do_record_op(&mut self.recorder, OpCode::ForceToken, &[]);
         let token_descr = info.token_field_descr();
         self.vable_setfield_descr(vbox, force_token, token_descr);
-        // pyjitpl.py:3236 self.generate_guard(rop.GUARD_NOT_FORCED_2)
+        // pyjitpl.py self.generate_guard(rop.GUARD_NOT_FORCED_2)
         // is recorded by the caller via the proper guard generation
         // path (`MIFrame::generate_guard` in the pyre frontend) so the
         // guard captures fresh resumedata at the current framestack
@@ -3586,7 +3586,7 @@ impl TraceCtx {
         true
     }
 
-    /// pyjitpl.py:3465-3497 `MetaInterp.gen_store_back_in_vable(box)`.
+    /// pyjitpl.py `MetaInterp.gen_store_back_in_vable(box)`.
     ///
     /// ```text
     /// def gen_store_back_in_vable(self, box):
@@ -3633,7 +3633,7 @@ impl TraceCtx {
         for field_index in 0..info.static_fields.len() {
             if let Some(&value) = boxes.get(field_index) {
                 let descr = info.static_field_descr(field_index);
-                // pyjitpl.py:3489-3521 `gen_store_back_in_vable`.
+                // pyjitpl.py `gen_store_back_in_vable`.
                 self.profiler()
                     .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
                 self.profiler()
@@ -3676,7 +3676,7 @@ impl TraceCtx {
         );
     }
 
-    /// `compile.py:425-461 patch_new_loop_to_load_virtualizable_fields`
+    /// `compile.py patch_new_loop_to_load_virtualizable_fields`
     /// mirrored at the call site instead of the callee preamble.
     ///
     /// Emits `GETFIELD_GC` for every static field and `GETFIELD_GC_R`
@@ -3747,7 +3747,7 @@ impl TraceCtx {
         expanded
     }
 
-    /// pyjitpl.py:1148-1158 `MIFrame.emit_force_virtualizable(fielddescr, box)`.
+    /// pyjitpl.py `MIFrame.emit_force_virtualizable(fielddescr, box)`.
     ///
     /// ```text
     /// def emit_force_virtualizable(self, fielddescr, box):
@@ -3799,7 +3799,7 @@ impl TraceCtx {
             (token_descr, clear_ptr, clear_descr)
         };
         //     tokenbox = mi.execute_and_record(rop.GETFIELD_GC_R, token_descr, box)
-        // pyjitpl.py:1148-1158 `emit_force_virtualizable`.
+        // pyjitpl.py `emit_force_virtualizable`.
         self.profiler()
             .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
         self.profiler()
@@ -3827,7 +3827,7 @@ impl TraceCtx {
         );
     }
 
-    /// pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`.
+    /// pyjitpl.py `_nonstandard_virtualizable(pc, box, fielddescr)`.
     ///
     /// ```text
     ///  def _nonstandard_virtualizable(self, pc, box, fielddescr):
@@ -3943,7 +3943,7 @@ impl TraceCtx {
         };
         if descriptor_has_matching_vinfo {
             let standard_concrete = self.standard_virtualizable_concrete();
-            // pyjitpl.py:1135-1138 `eqbox = self.metainterp.execute_and_record(
+            // pyjitpl.py `eqbox = self.metainterp.execute_and_record(
             //     rop.PTR_EQ, None, box, standard_box);
             //     eqbox = self.implement_guard_value(eqbox, pc);
             //     isstandard = eqbox.getint()`.
@@ -3957,7 +3957,7 @@ impl TraceCtx {
             // guard descr via `num_live` (live-var count), not pc, so the
             // parameter is documented here but not consumed at this layer.
             let _ = pc;
-            // pyjitpl.py:1135-1138 `_nonstandard_virtualizable` execute leg.
+            // pyjitpl.py `_nonstandard_virtualizable` execute leg.
             self.profiler()
                 .count_ops(OpCode::PtrEq, crate::counters::OPS);
             self.profiler()
@@ -4010,11 +4010,11 @@ impl TraceCtx {
         true
     }
 
-    /// pyjitpl.py:1120-1146 `_nonstandard_virtualizable(pc, box, fielddescr)`
+    /// pyjitpl.py `_nonstandard_virtualizable(pc, box, fielddescr)`
     /// as a standalone decision, for callers that must act between the check
     /// and the branch it selects.
     ///
-    /// `_opimpl_getarrayitem_vable` (pyjitpl.py:1220) and
+    /// `_opimpl_getarrayitem_vable` (pyjitpl.py) and
     /// `_opimpl_setarrayitem_vable` (:1239) take this decision FIRST and reach
     /// `implement_guard_value` on the index only through
     /// `_get_arrayitem_vable_index` (:1205), i.e. only on the standard branch.
@@ -4144,7 +4144,7 @@ impl TraceCtx {
         op
     }
 
-    /// pyjitpl.py:1167-1172 `opimpl_getfield_vable_i(box, fielddescr, pc)`.
+    /// pyjitpl.py `opimpl_getfield_vable_i(box, fielddescr, pc)`.
     ///
     /// ```text
     ///  def opimpl_getfield_vable_i(self, box, fielddescr, pc):
@@ -4164,7 +4164,7 @@ impl TraceCtx {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_i(box, fielddescr) →
-            // _opimpl_getfield_gc_any_pureornot (pyjitpl.py:928-950).
+            // _opimpl_getfield_gc_any_pureornot (pyjitpl.py).
             let field_index = fielddescr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:934-945 sanity check: run the live field
@@ -4254,7 +4254,7 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], descr)
     }
 
-    /// pyjitpl.py:385-391 `opimpl_assert_not_none`:
+    /// pyjitpl.py `opimpl_assert_not_none`:
     ///
     /// ```text
     ///  def opimpl_assert_not_none(self, box):
@@ -4267,14 +4267,14 @@ impl TraceCtx {
     /// ```
     ///
     /// Mirrors RPython's `jit::assert_not_none` hint (rlib/jit.rs +
-    /// rtyper/debug.py:23 `ll_assert_not_none`). Cache hit short-circuits
+    /// rtyper/debug.py `ll_assert_not_none`). Cache hit short-circuits
     /// the record and bumps `HEAPCACHED_OPS`; cache miss records
     /// `AssertNotNone` and stamps `nullity_now_known(true)` so subsequent
     /// nullity-aware sites (`_establish_nullity`, KnownClass guards) can
     /// skip their own checks.
     pub fn trace_assert_not_none(&mut self, opref: OpRef, concrete: i64) {
-        // pyjitpl.py:387 `if self.metainterp.heapcache.is_nullity_known(box):`
-        // — RPython's `is_nullity_known` (heapcache.py:475-478) returns
+        // pyjitpl.py `if self.metainterp.heapcache.is_nullity_known(box):`
+        // — RPython's `is_nullity_known` (heapcache.py) returns
         // `bool(box.getref_base())` for `Const` and `_check_flag(...
         // HF_KNOWN_NULLITY)` otherwise.  `class_now_known` sets
         // `HF_KNOWN_NULLITY` alongside `HF_KNOWN_CLASS` (line 470-473),
@@ -4300,15 +4300,15 @@ impl TraceCtx {
             );
             return;
         }
-        // pyjitpl.py:390 `self.execute(rop.ASSERT_NOT_NONE, box)` →
-        // executor.py:344-346 `do_assert_not_none(cpu, _, box)`:
+        // pyjitpl.py `self.execute(rop.ASSERT_NOT_NONE, box)` →
+        // executor.py `do_assert_not_none(cpu, _, box)`:
         //     if not box.getref_base():
         //         fatalerror("found during JITting: ll_assert_not_none() failed")
         assert!(
             concrete != 0,
             "do_assert_not_none: ref operand {opref:?} is null at trace time"
         );
-        // pyjitpl.py:390 `execute(ASSERT_NOT_NONE, ...)`.
+        // pyjitpl.py `execute(ASSERT_NOT_NONE, ...)`.
         self.profiler()
             .count_ops(OpCode::AssertNotNone, crate::counters::OPS);
         self.profiler()
@@ -4318,7 +4318,7 @@ impl TraceCtx {
         self.heap_cache.nullity_now_known(opref, true);
     }
 
-    /// pyjitpl.py:393-410 `opimpl_record_exact_class`:
+    /// pyjitpl.py `opimpl_record_exact_class`:
     ///
     /// ```text
     ///  def opimpl_record_exact_class(self, box, clsbox):
@@ -4335,7 +4335,7 @@ impl TraceCtx {
     /// Mirrors RPython's `jit::record_exact_class` hint (`majit-metainterp`'s
     /// `jit.rs` `record_exact_class`).
     /// `cls_const` is the class-vtable ConstInt OpRef, matching
-    /// backend/model.py:199-201 `cls_of_box()` and the `/ri` bytecode
+    /// backend/model.py `cls_of_box()` and the `/ri` bytecode
     /// shape. Cache hit short-circuits and bumps
     /// `HEAPCACHED_OPS`; miss records `RecordExactClass` and stamps
     /// both `class_now_known` and `nullity_now_known(true)` per
@@ -4350,11 +4350,11 @@ impl TraceCtx {
             return;
         }
         if !cls_const.is_constant() {
-            // pyjitpl.py:399 `if isinstance(clsbox, Const):` — non-Const
+            // pyjitpl.py `if isinstance(clsbox, Const):` — non-Const
             // class argument silently skips the record in RPython.
             return;
         }
-        // pyjitpl.py:399-402 `execute(RECORD_EXACT_CLASS, ...)`.
+        // pyjitpl.py `execute(RECORD_EXACT_CLASS, ...)`.
         self.profiler()
             .count_ops(OpCode::RecordExactClass, crate::counters::OPS);
         self.profiler()
@@ -4372,7 +4372,7 @@ impl TraceCtx {
         self.heap_cache.nullity_now_known(opref, true);
     }
 
-    /// pyjitpl.py:1188-1199 `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
+    /// pyjitpl.py `_opimpl_setfield_vable(box, valuebox, fielddescr, pc)`.
     ///
     /// ```text
     ///  def _opimpl_setfield_vable(self, box, valuebox, fielddescr, pc):
@@ -4478,7 +4478,7 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], descr);
     }
 
-    /// pyjitpl.py:1173-1179 `opimpl_getfield_vable_r(box, fielddescr, pc)`.
+    /// pyjitpl.py `opimpl_getfield_vable_r(box, fielddescr, pc)`.
     ///
     /// ```text
     ///  def opimpl_getfield_vable_r(self, box, fielddescr, pc):
@@ -4498,7 +4498,7 @@ impl TraceCtx {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_r(box, fielddescr) →
-            // _opimpl_getfield_gc_any_pureornot (pyjitpl.py:928-950).
+            // _opimpl_getfield_gc_any_pureornot (pyjitpl.py).
             let field_index = fielddescr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:934-945 + :938-939 sanity check (ref arm):
@@ -4576,7 +4576,7 @@ impl TraceCtx {
 
     /// Record a virtualizable ref field read with an explicit field descriptor.
     pub fn vable_getfield_ref_descr(&mut self, vable_opref: OpRef, descr: DescrRef) -> OpRef {
-        // pyjitpl.py:3489-3521 `gen_store_back_in_vable`.
+        // pyjitpl.py `gen_store_back_in_vable`.
         self.profiler()
             .count_ops(OpCode::GetfieldGcR, crate::counters::OPS);
         self.profiler()
@@ -4584,7 +4584,7 @@ impl TraceCtx {
         self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], descr)
     }
 
-    /// pyjitpl.py:1180-1186 `opimpl_getfield_vable_f(box, fielddescr, pc)`.
+    /// pyjitpl.py `opimpl_getfield_vable_f(box, fielddescr, pc)`.
     ///
     /// ```text
     ///  def opimpl_getfield_vable_f(self, box, fielddescr, pc):
@@ -4604,7 +4604,7 @@ impl TraceCtx {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_f(box, fielddescr) →
-            // _opimpl_getfield_gc_any_pureornot (pyjitpl.py:928-950).
+            // _opimpl_getfield_gc_any_pureornot (pyjitpl.py).
             let field_index = fielddescr.index();
             if let Some(cached) = self.heapcache_getfield_cached(vable_opref, field_index) {
                 // pyjitpl.py:941-945 sanity check (float arm):
@@ -4712,7 +4712,7 @@ impl TraceCtx {
         (op, value)
     }
 
-    /// pyjitpl.py:1201-1216 `_get_arrayitem_vable_index(pc, arrayfielddescr, indexbox)`.
+    /// pyjitpl.py `_get_arrayitem_vable_index(pc, arrayfielddescr, indexbox)`.
     ///
     /// ```text
     ///  def _get_arrayitem_vable_index(self, pc, arrayfielddescr, indexbox):
@@ -4779,7 +4779,7 @@ impl TraceCtx {
         self.vable_array_flat_index(fdescr, item_index)
     }
 
-    /// pyjitpl.py:1218-1230 `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)`
+    /// pyjitpl.py `_opimpl_getarrayitem_vable(box, indexbox, fdescr, adescr, pc)`
     /// (int variant via `opimpl_getarrayitem_vable_i = _opimpl_getarrayitem_vable`).
     ///
     /// ```text
@@ -4870,7 +4870,7 @@ impl TraceCtx {
     }
 
     /// Stamp the array-base box a `_opimpl_getarrayitem_vable` fallback reads
-    /// through. pyjitpl.py:1221 reaches the array with `opimpl_getfield_gc_r`,
+    /// through. pyjitpl.py reaches the array with `opimpl_getfield_gc_r`,
     /// which executes the load before recording it, so the box it hands on
     /// carries the loaded pointer. A base left symbolic propagates "no
     /// concrete" into every element read taken through it.
@@ -4890,7 +4890,7 @@ impl TraceCtx {
     ///
     /// pyjitpl.py:1223-1227 reaches the element with `opimpl_getarrayitem_gc_*`,
     /// which executes the load and attaches the result to the box it returns
-    /// (`history.py:803 *FrontendOp(pos, value)`). The fallback legs below
+    /// (`history.py *FrontendOp(pos, value)`). The fallback legs below
     /// record the op directly and must execute it the same way: an element box
     /// left symbolic reaches a residual call as an unbound argument, and the
     /// trace aborts there with the walk's heap effects already live.
@@ -4938,7 +4938,7 @@ impl TraceCtx {
         (op, value)
     }
 
-    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant.
+    /// pyjitpl.py `_opimpl_getarrayitem_vable` — ref variant.
     pub fn vable_getarrayitem_ref_indexed(
         &mut self,
         pc: usize,
@@ -5044,7 +5044,7 @@ impl TraceCtx {
         (op, value)
     }
 
-    /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant.
+    /// pyjitpl.py `_opimpl_getarrayitem_vable` — float variant.
     pub fn vable_getarrayitem_float_indexed(
         &mut self,
         pc: usize,
@@ -5130,7 +5130,7 @@ impl TraceCtx {
         self.synchronize_virtualizable();
     }
 
-    /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)`.
+    /// pyjitpl.py `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)`.
     ///
     /// `VableArrayStore::OutOfVable` means the promoted index did not resolve
     /// to a standard virtualizable slot: it was negative, or `fdescr` is not
@@ -5227,7 +5227,7 @@ impl TraceCtx {
         VableArrayStore::Stored(overwritten)
     }
 
-    /// pyjitpl.py:754-763 `opimpl_arraylen_gc(arraybox, arraydescr)`.
+    /// pyjitpl.py `opimpl_arraylen_gc(arraybox, arraydescr)`.
     ///
     /// ```text
     ///  def opimpl_arraylen_gc(self, arraybox, arraydescr):
@@ -5257,7 +5257,7 @@ impl TraceCtx {
                 .count_ops(OpCode::ArraylenGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
             return cached_len;
         }
-        // pyjitpl.py:754-763 `opimpl_arraylen_gc` miss.
+        // pyjitpl.py `opimpl_arraylen_gc` miss.
         self.profiler()
             .count_ops(OpCode::ArraylenGc, crate::counters::OPS);
         self.profiler()
@@ -5271,7 +5271,7 @@ impl TraceCtx {
         len
     }
 
-    /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
+    /// pyjitpl.py `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
     ///
     /// ```text
     ///  def opimpl_arraylen_vable(self, box, fdescr, adescr, pc):
@@ -5693,7 +5693,7 @@ mod tests {
     }
 
     /// vable_getfield_int cache-hit with Const Int cached and wired cpu:
-    /// pyjitpl.py:937 `assert resvalue == upd.currfieldbox.getint()` panics
+    /// pyjitpl.py `assert resvalue == upd.currfieldbox.getint()` panics
     /// on mismatch.
     #[test]
     #[should_panic(expected = "sanity")]
@@ -5718,7 +5718,7 @@ mod tests {
         ctx.vable_getfield_int(0, vable, 0xCAFE_BABE, fd);
     }
 
-    /// `test_pyjitpl.py:74-95 test_remove_consts_and_duplicates` — the upstream
+    /// `test_pyjitpl.py test_remove_consts_and_duplicates` — the upstream
     /// vector, verbatim: `[b1, b2, b1, c3]` leaves the first sighting of each
     /// box alone and replaces the repeat AND the constant with fresh `SAME_AS`
     /// results, recording one `SAME_AS` op per replacement.
@@ -5769,7 +5769,7 @@ mod tests {
         assert_eq!(ctx.num_ops(), ops_after, "and records nothing");
     }
 
-    /// history.py:809-816 `record_same_as` carries the source box's value on
+    /// history.py `record_same_as` carries the source box's value on
     /// the freshly recorded `SAME_AS` result.
     #[test]
     fn remove_consts_and_duplicates_carries_the_source_box_value() {
@@ -5804,7 +5804,7 @@ mod tests {
         );
     }
 
-    /// history.py:809-816 `record_same_as` also carries a standard
+    /// history.py `record_same_as` also carries a standard
     /// virtualizable payload box's value from its concrete shadow.
     #[test]
     fn remove_consts_and_duplicates_carries_virtualizable_payload_value() {
@@ -6533,7 +6533,7 @@ mod tests {
 
     #[test]
     fn emit_vable_field_reads_emits_compile_py_shape() {
-        // compile.py:425-461 patch_new_loop_to_load_virtualizable_fields shape:
+        // compile.py patch_new_loop_to_load_virtualizable_fields shape:
         //   [GETFIELD_GC_I(vable, pc_descr),
         //    GETFIELD_GC_R(vable, locals_array_descr),
         //    GETARRAYITEM_GC_I(arr, 0, item_descr),

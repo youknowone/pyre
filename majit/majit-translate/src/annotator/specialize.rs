@@ -4,7 +4,7 @@
 //! `FunctionDesc.specialize` dispatches into. The `memo` family
 //! (`MemoTable`, `memo`, `all_values`, `cartesian_product`) lands here
 //! incrementally; this first slice ports the two pure helpers
-//! `all_values` (specialize.py:250-273) and `cartesian_product`
+//! `all_values` (specialize.py) and `cartesian_product`
 //! (specialize.py:314-320), which carry no bookkeeper back-references
 //! and are exercised directly by unit tests.
 
@@ -25,11 +25,11 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::tool::algo::unionfind::{UnionFind, UnionFindInfo};
 
-/// RPython `MemoTable.fieldnamecounter` (specialize.py:122) — a process-
+/// RPython `MemoTable.fieldnamecounter` (specialize.py) — a process-
 /// wide counter feeding `getuniquefieldname`.
 static MEMO_FIELDNAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// RPython `all_values(s)` (specialize.py:250-273).
+/// RPython `all_values(s)` (specialize.py).
 ///
 /// ```python
 /// def all_values(s):
@@ -103,7 +103,7 @@ pub fn all_values(s: &SomeValue) -> Result<Vec<ConstValue>, AnnotatorError> {
     }
 }
 
-/// RPython `cartesian_product(lstlst)` (specialize.py:314-320).
+/// RPython `cartesian_product(lstlst)` (specialize.py).
 ///
 /// ```python
 /// def cartesian_product(lstlst):
@@ -140,7 +140,7 @@ pub fn cartesian_product<T: Clone>(lstlst: &[Vec<T>]) -> Vec<Vec<T>> {
     out
 }
 
-/// RPython `flatten_star_args(funcdesc, args_s)` (specialize.py:14-58).
+/// RPython `flatten_star_args(funcdesc, args_s)` (specialize.py).
 ///
 /// The Rust implementation lives on [`FunctionDesc`] because it needs direct
 /// access to the descriptor's signature, defaults, graph builder, and cache-key
@@ -165,7 +165,7 @@ pub fn flatten_star_args<'a>(
     funcdesc.flatten_star_args(args_s)
 }
 
-/// RPython `default_specialize(funcdesc, args_s)` (specialize.py:60-85).
+/// RPython `default_specialize(funcdesc, args_s)` (specialize.py).
 pub fn default_specialize(
     funcdesc: &FunctionDesc,
     args_s: &mut Vec<Option<SomeValue>>,
@@ -173,13 +173,13 @@ pub fn default_specialize(
     funcdesc.default_specialize(args_s)
 }
 
-/// RPython `getuniquenondirectgraph(desc)` (specialize.py:91-99).
+/// RPython `getuniquenondirectgraph(desc)` (specialize.py).
 #[allow(dead_code)] // RPython module-level port surface; implementation lives on FunctionDesc.
 pub fn getuniquenondirectgraph(desc: &FunctionDesc) -> Result<Rc<PyGraph>, AnnotatorError> {
     desc.getuniquenondirectgraph()
 }
 
-/// RPython `maybe_star_args(funcdesc, key, args_s)` (specialize.py:323-327).
+/// RPython `maybe_star_args(funcdesc, key, args_s)` (specialize.py).
 #[allow(dead_code)] // RPython module-level port surface; implementation lives on FunctionDesc.
 pub fn maybe_star_args(
     funcdesc: &FunctionDesc,
@@ -239,7 +239,7 @@ pub fn specialize_call_location(
     funcdesc.specialize_call_location(args_s, op)
 }
 
-/// RPython `class MemoTable(object)` (specialize.py:104-248).
+/// RPython `class MemoTable(object)` (specialize.py).
 ///
 /// One table accumulates `{args_tuple: result}` for a family of memo
 /// calls; families merge via the `UnionFind` in
@@ -259,12 +259,12 @@ pub struct MemoTable {
     pub funcdesc_defaults: Vec<Constant>,
     /// Back-reference to the owning bookkeeper for `register_finish`.
     pub bookkeeper: Weak<Bookkeeper>,
-    /// RPython `self.table = {args: value}` (specialize.py:107).
+    /// RPython `self.table = {args: value}` (specialize.py).
     pub table: HashMap<Vec<ConstValue>, ConstValue>,
-    /// RPython `self.graph = None` (specialize.py:108). Stays `None`
+    /// RPython `self.graph = None` (specialize.py). Stays `None`
     /// until `finish` synthesises the dispatch graph (deferred).
     pub graph: Option<Rc<PyGraph>>,
-    /// RPython `self.do_not_process = False` (specialize.py:109).
+    /// RPython `self.do_not_process = False` (specialize.py).
     pub do_not_process: bool,
 }
 
@@ -291,7 +291,7 @@ impl MemoTable {
         }
     }
 
-    /// RPython `MemoTable.register_finish(self)` (specialize.py:111-113):
+    /// RPython `MemoTable.register_finish(self)` (specialize.py):
     /// `bookkeeper.pending_specializations.append(self.finish)`.
     ///
     /// Takes the `Rc` so the scheduled closure can hold the table; the
@@ -313,7 +313,7 @@ impl MemoTable {
             .push(Box::new(move || MemoTable::finish(&this)));
     }
 
-    /// RPython `MemoTable.getuniquefieldname(self)` (specialize.py:121-126):
+    /// RPython `MemoTable.getuniquefieldname(self)` (specialize.py):
     /// `'$memofield_%s_%d' % (self.funcdesc.name, MemoTable.fieldnamecounter)`
     /// with a process-wide post-increment of the counter.
     fn getuniquefieldname(name: &str) -> String {
@@ -321,7 +321,7 @@ impl MemoTable {
         format!("$memofield_{name}_{counter}")
     }
 
-    /// RPython `MemoTable.finish(self)` (specialize.py:129-248).
+    /// RPython `MemoTable.finish(self)` (specialize.py).
     ///
     /// Synthesises the dispatch graph that, at run time, maps each
     /// argument tuple to its precomputed memo result, then schedules it
@@ -440,7 +440,7 @@ impl MemoTable {
         });
         this.borrow_mut().graph = Some(pygraph.clone());
         // `buildflowgraph` stores every graph it builds in the translator's
-        // graph list (`self.graphs.append(graph)`, translator.py:60). The
+        // graph list (`self.graphs.append(graph)`, translator.py). The
         // direct block-tree synthesis bypasses `buildflowgraph`, so register
         // the synthesised graph here to keep the translator's graph list
         // complete.
@@ -485,7 +485,7 @@ struct MemoSynth<'a> {
 
 impl MemoSynth<'_> {
     /// The `fn.constant_result` of the subhelper for `args_so_far`
-    /// (specialize.py:158-160, `make_constant_subhelper`): a subtree
+    /// (specialize.py, `make_constant_subhelper`): a subtree
     /// folds to a constant only through a chain of leaves and
     /// single-valued positions; a bool or PBC-set position makes
     /// `make_helper` (no `constant_result`), so it returns `None`.
@@ -511,7 +511,7 @@ impl MemoSynth<'_> {
         }
     }
 
-    /// RPython `make_subhelper(args_so_far)` (specialize.py:165-247),
+    /// RPython `make_subhelper(args_so_far)` (specialize.py),
     /// emitting one dispatch block instead of a helper function.
     fn build_subhelper(&self, args_so_far: &[ConstValue]) -> Result<BlockRef, AnnotatorError> {
         let firstarg = args_so_far.len();
@@ -754,7 +754,7 @@ impl MemoSynth<'_> {
             .bookkeeper
             .try_annotator()
             .ok_or_else(|| AnnotatorError::new("memo finish: annotator not attached"))?;
-        // translator.py:50-52: `buildflowgraph` returns a prebuilt graph
+        // translator.py: `buildflowgraph` returns a prebuilt graph
         // as-is; translator.py:60 would otherwise append it to the graph
         // list, so register it there here too.
         annotator
@@ -808,7 +808,7 @@ fn normalize_bool_order(values: &[ConstValue]) -> Vec<ConstValue> {
     values.to_vec()
 }
 
-/// RPython `nextargvalues == [False, True]` (specialize.py:189) — the
+/// RPython `nextargvalues == [False, True]` (specialize.py) — the
 /// bool-arg discriminator after [`normalize_bool_order`].
 fn is_false_true(values: &[ConstValue]) -> bool {
     values.len() == 2
@@ -817,7 +817,7 @@ fn is_false_true(values: &[ConstValue]) -> bool {
 }
 
 impl UnionFindInfo for Rc<RefCell<MemoTable>> {
-    /// RPython `MemoTable.absorb(self, other)` (specialize.py:115-119):
+    /// RPython `MemoTable.absorb(self, other)` (specialize.py):
     /// `self.table.update(other.table); assert self.graph is None;
     /// other.do_not_process = True`.
     fn absorb(&mut self, other: Self) {
@@ -854,7 +854,7 @@ pub struct MemoFamily {
     pub host_err: Rc<RefCell<Option<AnnotatorError>>>,
 }
 
-/// RPython `memo(funcdesc, args_s)` (specialize.py:275-312).
+/// RPython `memo(funcdesc, args_s)` (specialize.py).
 ///
 /// Calls the memo function now for every combination of possible
 /// argument values, accumulates the results into the per-funcdesc

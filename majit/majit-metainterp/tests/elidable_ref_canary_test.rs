@@ -2,15 +2,15 @@
 //! pointer-returning `#[elidable]` → `CallPureR` → constant-fold path is
 //! live, end-to-end, observed from outside the metainterp crate.
 //!
-//! `resoperation.py:638 RefOp.type = 'r'` — the result Box and the
+//! `resoperation.py RefOp.type = 'r'` — the result Box and the
 //! function-pointer arg of a `CALL_PURE_R` are Ref-typed.  This file is
 //! the Ref counterpart to the Int canary's `CALL_PURE_I` checks.
 //!
-//! `pyjitpl.py:3553-3579 record_result_of_call_pure` patches a CALL into
+//! `pyjitpl.py record_result_of_call_pure` patches a CALL into
 //! a CALL_PURE (`call_pure_for_type(Type::Ref) == CallPureR`,
-//! resoperation.py:2501), and folds to a `ConstPtr` (history.py:314)
+//! resoperation.py), and folds to a `ConstPtr` (history.py)
 //! when every argument is constant — *not* a `ConstInt` of the same
-//! numeric value (history.py:220 ConstInt vs :307/:314 ConstPtr pin
+//! numeric value (history.py ConstInt vs :307/:314 ConstPtr pin
 //! distinct Box types at construction; `history.rs`'s
 //! `cond_call_value_ref_typed` documents the aliasing hazard the OpRef
 //! enum prevents structurally).
@@ -75,7 +75,7 @@ fn elidable_ref_canary_macro_advertises_ref_policy_byte_21() {
 fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
     // pyjitpl.py:3570-3579 — one inputarg (Ref) + the funcbox → the
     // user-arg is non-const → all_const=false → CALL_R cut, re-emit as
-    // CALL_PURE_R (resoperation.py:2501 call_pure_for_type(Ref)).
+    // CALL_PURE_R (resoperation.py call_pure_for_type(Ref)).
 
     let mut meta = MetaInterp::<()>::new(0);
     // pyjitpl.py:2273-2283 — seed propagate_exception_descr before the
@@ -110,7 +110,7 @@ fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
         &[Type::Ref],
         Type::Ref,
         effect,
-        // _build_allboxes (pyjitpl.py:1960-1993): funcbox concrete value
+        // _build_allboxes (pyjitpl.py): funcbox concrete value
         // first (always Int — the raw fn pointer), then per-arg concrete
         // values.  The user arg is Ref-typed.
         &[
@@ -160,7 +160,7 @@ fn elidable_ref_canary_all_const_args_fold_to_const_ptr_not_const_int() {
     let concrete_result = trace_fn(const_x) as usize;
 
     // A const Ref arg — `const_ref(value)` builds `OpRef::const_ptr(...)`
-    // (history.py:314 ConstPtr), distinct from a ConstInt of the same
+    // (history.py ConstPtr), distinct from a ConstInt of the same
     // bits.
     let const_ref_arg = meta.trace_ctx().expect("active trace").const_ref(const_x);
 

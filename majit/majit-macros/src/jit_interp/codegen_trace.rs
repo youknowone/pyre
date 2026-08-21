@@ -230,7 +230,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         /// Returns `Option<JitCode>`: `Some(jc)` when `lower_dispatch_body`
         /// succeeded at proc-macro time, `None` when the body shape was
         /// rejected (e.g. unrecognised inner control flow).  PyPy's
-        /// `make_jitcodes()` / `pyjitpl.py:2255 finish_setup()` only
+        /// `make_jitcodes()` / `pyjitpl.py finish_setup()` only
         /// install completed jitcodes — there is no "empty body installed
         /// as success" path.  The install pipeline at
         /// `codegen_state.rs` `if let Some(jc) = ... { register }`
@@ -250,7 +250,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 return None;
             }
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
-            // `jitcode.py:15 self.name = name`.  This is the root JitCode of
+            // `jitcode.py self.name = name`.  This is the root JitCode of
             // the machine, so it names the dispatch function itself; its arms'
             // sub-JitCodes name the arm they came from.
             __builder.set_name(#dispatch_jitcode_name);
@@ -262,7 +262,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
 
         /// Pre-register the dispatch JitCode's per-marker liveness
         /// triples into the driver-shared `Assembler`, mirroring RPython
-        /// `pyjitpl.py:2255 finish_setup`'s "all `-live-` entries land
+        /// `pyjitpl.py finish_setup`'s "all `-live-` entries land
         /// in `asm.all_liveness` before the snapshot" invariant.
         /// Invoked from `__JitMeta_<fn>::install_canonical_liveness` exactly
         /// once at install time, before
@@ -464,7 +464,7 @@ pub(crate) fn is_promote_call_path(func: &syn::Expr) -> bool {
 ///
 /// Matches: `assert_not_none`, `jit::assert_not_none`,
 /// `majit_metainterp::jit::assert_not_none`.  Mirrors RPython
-/// `rtyper/debug.py:23 ll_assert_not_none` recognition.
+/// `rtyper/debug.py ll_assert_not_none` recognition.
 pub(crate) fn is_assert_not_none_call_path(func: &syn::Expr) -> bool {
     let syn::Expr::Path(func_path) = func else {
         return false;
@@ -488,7 +488,7 @@ pub(crate) fn is_assert_not_none_call_path(func: &syn::Expr) -> bool {
 ///
 /// Matches: `record_exact_class`, `jit::record_exact_class`,
 /// `majit_metainterp::jit::record_exact_class`.  Mirrors RPython
-/// `rlib/jit.py:1181 jit.record_exact_class` recognition.
+/// `rlib/jit.py jit.record_exact_class` recognition.
 pub(crate) fn is_record_exact_class_call_path(func: &syn::Expr) -> bool {
     let syn::Expr::Path(func_path) = func else {
         return false;

@@ -28,7 +28,7 @@ fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
     Op::with_descr(opcode, args, descr)
 }
 
-/// rewrite.py:106-116 `emit_op`'s reference-constant loop, run on its own.
+/// rewrite.py `emit_op`'s reference-constant loop, run on its own.
 ///
 /// The full rewrite ([`GcRewriterImpl`]) also lowers mallocs, GC
 /// loads/stores and write barriers. A backend that lowers those itself —
@@ -67,20 +67,20 @@ pub fn remove_ref_constants(ops: &[Op], mut next_pos: u32) -> (Vec<Op>, Vec<GcRe
         // rewrite.py:105 `keep` — JIT_DEBUG keeps its constants inline.
         if op.opcode != OpCode::JitDebug {
             for i in 0..op.num_args() {
-                // rewrite.py:109 `bool(arg.value)` — null stays inline.
+                // rewrite.py `bool(arg.value)` — null stays inline.
                 let Some(Value::Ref(gcref)) = op.arg(i).const_value() else {
                     continue;
                 };
                 if gcref.is_null() {
                     continue;
                 }
-                // rewrite.py:1033-1043 `_gcref_index`.
+                // rewrite.py `_gcref_index`.
                 let index = *gcrefs_map.entry(gcref.0).or_insert_with(|| {
                     let index = gcrefs.len() as u32;
                     gcrefs.push(gcref);
                     index
                 });
-                // rewrite.py:1100-1115 `remove_constptr`.
+                // rewrite.py `remove_constptr`.
                 let load = match recently_loaded.get(&index) {
                     Some(load) => load.clone(),
                     None => {
@@ -136,7 +136,7 @@ fn strgetsetitem_token(op: &Op, is_str: bool) -> (i64, i64) {
     (itemsize, basesize)
 }
 
-/// resoperation.py:1524-1531 `OpHelpers.get_gc_load`.
+/// resoperation.py `OpHelpers.get_gc_load`.
 /// Select GC_LOAD_I / GC_LOAD_R / GC_LOAD_F by result type.
 fn get_gc_load(tp: Type) -> OpCode {
     match tp {
@@ -147,7 +147,7 @@ fn get_gc_load(tp: Type) -> OpCode {
     }
 }
 
-/// resoperation.py:1533-1541 `OpHelpers.get_gc_load_indexed`.
+/// resoperation.py `OpHelpers.get_gc_load_indexed`.
 /// Select GC_LOAD_INDEXED_I / GC_LOAD_INDEXED_R / GC_LOAD_INDEXED_F by
 /// result type.
 fn get_gc_load_indexed(tp: Type) -> OpCode {
@@ -191,30 +191,30 @@ pub struct GcRewriterImpl {
     pub nursery_top_addr: usize,
     /// Maximum object size for nursery allocation.
     pub max_nursery_size: usize,
-    /// `gc.py:401 self.write_barrier_descr = WriteBarrierDescr(self)` — `None`
+    /// `gc.py self.write_barrier_descr = WriteBarrierDescr(self)` — `None`
     /// for a collector that needs no write barrier, exactly as
-    /// `gc.py:156 GcLLDescr_boehm.write_barrier_descr` is.
+    /// `gc.py GcLLDescr_boehm.write_barrier_descr` is.
     /// `rewrite.py:393` gates the whole barrier section on this being set,
     /// so a `None` here means no `COND_CALL_GC_WB*` is ever emitted; the
     /// backend asserts the same agreement when it assembles one.
     pub wb_descr: Option<WriteBarrierDescr>,
     /// JitFrame info for call_assembler rewriting.
-    /// rewrite.py:665 — handle_call_assembler needs frame layout info.
+    /// rewrite.py — handle_call_assembler needs frame layout info.
     pub jitframe_info: Option<JitFrameDescrs>,
     /// rewrite.py:673 — lookup compiled_loop_token._ll_initial_locs
     /// by target token number. Provided by the backend.
     pub call_assembler_callee_locs:
         Option<Box<dyn Fn(u64) -> Option<CallAssemblerCalleeLocs> + Send>>,
-    /// llmodel.py:39 `load_supported_factors = (1,)` — the default for
+    /// llmodel.py `load_supported_factors = (1,)` — the default for
     /// CPUs whose addressing mode only scales by one. x86 overrides this
     /// at `rpython/jit/backend/x86/runner.py:31` with `(1, 2, 4, 8)`.
-    /// Consumed by `cpu_simplify_scale` (rewrite.py:1124) to decide
+    /// Consumed by `cpu_simplify_scale` (rewrite.py) to decide
     /// whether a non-constant index's factor can be folded into the
     /// backend's addressing mode or must be pre-scaled in IR.
     pub load_supported_factors: &'static [i64],
-    /// model.py:22 `supports_load_effective_address = False` (base) /
+    /// model.py `supports_load_effective_address = False` (base) /
     /// x86/runner.py:22 + arm/runner.py:26 override to `True`.
-    /// Consumed by `emit_load_effective_address` (rewrite.py:1083): when
+    /// Consumed by `emit_load_effective_address` (rewrite.py): when
     /// `True` the helper emits a single `LOAD_EFFECTIVE_ADDRESS`; when
     /// `False` it expands to `(INT_LSHIFT?) + INT_ADD + INT_ADD`.
     pub supports_load_effective_address: bool,
@@ -224,11 +224,11 @@ pub struct GcRewriterImpl {
     /// payload bytes. Production backends set this to `false` whenever a
     /// real collector is installed and to `true` for the Boehm/raw-calloc
     /// fallback (both backends' `gc_rewriter`). Gates
-    /// `clear_gc_fields` per rewrite.py:499-500; the non-zero-fill path
+    /// `clear_gc_fields` per rewrite.py; the non-zero-fill path
     /// emits explicit NULL-pointer stores at flush time
     /// (rewrite.py:761-766).
     pub malloc_zero_filled: bool,
-    /// llsupport/gc.py:39 `self.memcpy_fn = memcpy_fn` cast to a Signed
+    /// llsupport/gc.py `self.memcpy_fn = memcpy_fn` cast to a Signed
     /// integer via `cast_ptr_to_adr` + `cast_adr_to_int`
     /// (rewrite.py:1046-1047). Embedded as a ConstInt into the lowered
     /// `CALL_N(memcpy_fn, dst, src, n)` emitted by
@@ -246,7 +246,7 @@ pub struct GcRewriterImpl {
     /// skip the `extra_item_after_alloc=True` null terminator
     /// (rstr.py:1226; rewrite.py:1051-1053).
     pub str_descr: DescrRef,
-    /// llsupport/gc.py:47 `self.unicode_descr = get_array_descr(self, rstr.UNICODE)`.
+    /// llsupport/gc.py `self.unicode_descr = get_array_descr(self, rstr.UNICODE)`.
     /// Provides `basesize` / `itemsize` (2 or 4 bytes per UCS) for
     /// `rewrite_copy_str_content` COPYUNICODECONTENT lowering;
     /// `itemscale = log2(itemsize)` (rewrite.py:1057-1063).
@@ -257,7 +257,7 @@ pub struct GcRewriterImpl {
     /// `malloc_zero_filled=false` (rewrite.py:529-530), where upstream
     /// emits `emit_setfield(result, ConstInt(0), descr=hash_descr)`.
     pub str_hash_descr: DescrRef,
-    /// llsupport/gc.py:49 `self.unicode_hash_descr = get_field_descr(self, rstr.UNICODE, 'hash')`.
+    /// llsupport/gc.py `self.unicode_hash_descr = get_field_descr(self, rstr.UNICODE, 'hash')`.
     /// Same role as `str_hash_descr` for NEWUNICODE
     /// (rewrite.py:531-535).
     pub unicode_hash_descr: DescrRef,
@@ -272,7 +272,7 @@ pub struct GcRewriterImpl {
     /// llsupport/gc.py:157 `fielddescr_tid = None` (Boehm) /
     /// llsupport/gc.py:394 `self.fielddescr_tid = get_field_descr(self,
     /// self.GCClass.HDR, 'tid')` (framework GC).  Consumed by
-    /// `rewrite.py:914-918` `gen_initialize_tid` to stamp the type id
+    /// `rewrite.py` `gen_initialize_tid` to stamp the type id
     /// onto the freshly-allocated object's header word.  `None` makes
     /// `gen_initialize_tid` a no-op (Boehm path).
     ///
@@ -280,9 +280,9 @@ pub struct GcRewriterImpl {
     /// the object pointer); `gen_initialize_tid` translates the descr's
     /// offset by `-HDR_SIZE` so the GC_STORE addresses the header word.
     pub fielddescr_tid: Option<DescrRef>,
-    /// gc.py:422-431 `generate_function('malloc_array', ...)` function addr.
+    /// gc.py `generate_function('malloc_array', ...)` function addr.
     pub malloc_array_fn: i64,
-    /// gc.py:433-444 `generate_function('malloc_array_nonstandard', ...)`
+    /// gc.py `generate_function('malloc_array_nonstandard', ...)`
     /// function addr.
     pub malloc_array_nonstandard_fn: i64,
     /// Old-generation twin of [`Self::malloc_array_fn`], selected by
@@ -293,12 +293,12 @@ pub struct GcRewriterImpl {
     /// Old-generation twin of [`Self::malloc_array_nonstandard_fn`], and
     /// shares `malloc_array_nonstandard_descr` for the same reason.
     pub malloc_array_nonstandard_oldgen_fn: i64,
-    /// gc.py:453-458 `generate_function('malloc_str', ...)` function addr.
+    /// gc.py `generate_function('malloc_str', ...)` function addr.
     pub malloc_str_fn: i64,
-    /// gc.py:460-465 `generate_function('malloc_unicode', ...)` function addr.
+    /// gc.py `generate_function('malloc_unicode', ...)` function addr.
     pub malloc_unicode_fn: i64,
-    /// gc.py:481-490 `generate_function('malloc_big_fixedsize', ...)` function addr.
-    /// Consumed by `rewrite.py:778-796 gen_malloc_fixedsize` framework-GC arm
+    /// gc.py `generate_function('malloc_big_fixedsize', ...)` function addr.
+    /// Consumed by `rewrite.py gen_malloc_fixedsize` framework-GC arm
     /// when a fixed-size NEW exceeds the nursery threshold.
     pub malloc_big_fixedsize_fn: i64,
     /// gc.py:45 `self.malloc_array_descr = get_call_descr(...)`.
@@ -369,7 +369,7 @@ impl JitFrameDescrs {
     }
 }
 
-/// rewrite.py:1117-1132 `cpu_simplify_scale` return value.
+/// rewrite.py `cpu_simplify_scale` return value.
 ///
 /// Encodes the three semantic outcomes that upstream signals via the
 /// `(index_box, emit)` tuple:
@@ -456,7 +456,7 @@ struct RewriteState {
     // ── Array length tracking (rewrite.py:59 _known_lengths) ──
     /// Maps array OpRef → known length. Populated when NEW_ARRAY has a
     /// constant length operand (rewrite.py:551). Cleared on LABEL
-    /// (rewrite.py:1005) and emitting_an_operation_that_can_collect.
+    /// (rewrite.py) and emitting_an_operation_that_can_collect.
     known_lengths: IndexMap<OpRef, usize>,
 
     // ── Pending zero tracking ──
@@ -466,12 +466,12 @@ struct RewriteState {
     /// Tracks which array indices have been explicitly SET since the
     /// pending zero was recorded. Keyed by array OpRef index.
     initialized_indices: IndexMap<OpRef, IndexSet<usize>>,
-    /// rewrite.py:61 `_delayed_zero_setfields = {}`.
+    /// rewrite.py `_delayed_zero_setfields = {}`.
     ///
     /// Map from base OpRef → set of byte-offsets of zero-init SETFIELD_GC
     /// stores deferred by `clear_gc_fields`.  An explicit SETFIELD_GC
     /// that overwrites the same offset removes the entry via
-    /// `consider_setfield_gc` (rewrite.py:506-512); anything still
+    /// `consider_setfield_gc` (rewrite.py); anything still
     /// pending at the next can-collect / flush point is emitted as
     /// `GC_STORE(ptr, ofs, 0, WORD)` by `emit_pending_zeros`
     /// (rewrite.py:761-766).
@@ -481,7 +481,7 @@ struct RewriteState {
     /// `_constant_additions[box]` = `(older_box, constant_add)` for an
     /// int_add/int_sub whose constant operand can be folded into a
     /// downstream GC_STORE_INDEXED / GC_LOAD_INDEXED offset.  See
-    /// rewrite.py:1008 record_int_add_or_sub and rewrite.py:173
+    /// rewrite.py record_int_add_or_sub and rewrite.py
     /// _try_use_older_box.
     ///
     /// pyre's emit_setarrayitem path does not currently lower to
@@ -508,7 +508,7 @@ struct RewriteState {
     /// original (rewrite.py:366-367).
     changed_ops: IndexMap<usize, Op>,
 
-    /// rewrite.py:96-99 `get_box_replacement` — source→replacement mapping
+    /// rewrite.py `get_box_replacement` — source→replacement mapping
     /// for ops that `transform_to_gc_load` has forwarded to a lowered
     /// form (GC_LOAD / GC_LOAD_INDEXED / GC_STORE / GC_STORE_INDEXED).
     /// Upstream sets this via `op.set_forwarded(newload)` and
@@ -588,14 +588,14 @@ impl RewriteState {
 
     /// Resolve a constant value from the box (RPython parity: caller
     /// passes the Box; `isinstance(box, ConstInt) and box.getint()`).
-    /// history.py:227/268/314 — inline-Const variants carry their value
+    /// history.py/268/314 — inline-Const variants carry their value
     /// directly; legacy pool-indexed variants look up via the snapshot.
     fn resolve_constant(&self, b: &Operand) -> Option<i64> {
         // rewrite.py:548/590/1013 gate these reads on `isinstance(arg,
         // ConstInt)` → `getint()`. ConstFloat/ConstPtr have
-        // no `getint` (history.py:268/314), so a Float/Ptr constant is
+        // no `getint` (history.py/314), so a Float/Ptr constant is
         // rejected outright. ConstInt carries its value inline
-        // (history.py:227). A non-Const box that the backend proved
+        // (history.py). A non-Const box that the backend proved
         // constant resolves through the index-keyed `constants` snapshot
         // by raw OpRef key; production pools are keyed in the constant
         // namespace (CONST_BIT set) so a genuine box position never
@@ -613,15 +613,15 @@ impl RewriteState {
     /// Emit a fresh constant OpRef for `value`.
     ///
     /// rewrite.py:149/671/682 parity: RPython constructs a new
-    /// `ConstInt(value)` at each call site. history.py:227
+    /// `ConstInt(value)` at each call site. history.py
     /// `ConstInt.value` is inline on the Box; pyre mints
     /// `OpRef::ConstInt(value)` with the value carried inline
-    /// per history.py:220 `ConstInt.type = 'i'`.
+    /// per history.py `ConstInt.type = 'i'`.
     fn const_int(&mut self, value: i64) -> Operand {
         Operand::const_from_value(Value::Int(value))
     }
 
-    /// rewrite.py:1033-1043 `_gcref_index` — dedup a reference constant
+    /// rewrite.py `_gcref_index` — dedup a reference constant
     /// into `gcrefs_output_list`, returning its stable index.
     fn gcref_index(&mut self, gcref: GcRef) -> u32 {
         if let Some(&index) = self.gcrefs_map.get(&gcref.0) {
@@ -633,7 +633,7 @@ impl RewriteState {
         index
     }
 
-    /// rewrite.py:1100-1115 `remove_constptr` — replace a reference
+    /// rewrite.py `remove_constptr` — replace a reference
     /// constant with the result of a `LoadFromGcTable(index)` load,
     /// reusing one already emitted in this basic block (CSE) when
     /// possible.
@@ -648,11 +648,11 @@ impl RewriteState {
         load
     }
 
-    /// rewrite.py:106-116 `emit_op` arg loop — substitute each non-null
+    /// rewrite.py `emit_op` arg loop — substitute each non-null
     /// reference-constant argument with a `LoadFromGcTable` result so no
     /// raw `GcRef` is baked into the backend. JIT_DEBUG keeps its
     /// constants inline (rewrite.py:105 `keep`). Null pointers stay inline
-    /// (rewrite.py:109 `bool(arg.value)`). Failargs are NOT processed —
+    /// (rewrite.py `bool(arg.value)`). Failargs are NOT processed —
     /// they are resolved as plain constants in `rewrite_op` (rewrite.py:121
     /// `get_box_replacement`), matching upstream.
     ///
@@ -730,7 +730,7 @@ impl RewriteState {
         Operand::from_bound_op(&rc)
     }
 
-    /// rewrite.py:699-711 emitting_an_operation_that_can_collect
+    /// rewrite.py emitting_an_operation_that_can_collect
     fn emitting_an_operation_that_can_collect(&mut self) {
         self.pending_malloc_idx = None;
         self.wb_applied.clear();
@@ -741,7 +741,7 @@ impl RewriteState {
         self._constant_additions.clear();
     }
 
-    /// rewrite.py:1008 record_int_add_or_sub.
+    /// rewrite.py record_int_add_or_sub.
     ///
     /// When `op` is `INT_ADD/INT_ADD_OVF/INT_SUB/INT_SUB_OVF` whose
     /// non-result operand is a `ConstInt`, remember the (older box,
@@ -779,7 +779,7 @@ impl RewriteState {
             .insert(op.pos.get(), (box_arg, constant));
     }
 
-    /// rewrite.py:173-182 _try_use_older_box.
+    /// rewrite.py _try_use_older_box.
     ///
     /// If `index_box` is a recorded `_constant_additions` entry, replace
     /// it with the older box and add `factor * extra_offset` to
@@ -795,12 +795,12 @@ impl RewriteState {
         self.wb_applied.insert(r.to_opref());
     }
 
-    /// rewrite.py:66-67: remember_known_length
+    /// rewrite.py: remember_known_length
     fn remember_known_length(&mut self, op: &Operand, length: usize) {
         self.known_lengths.insert(op.to_opref(), length);
     }
 
-    /// rewrite.py:81-82: known_length(op, default)
+    /// rewrite.py: known_length(op, default)
     fn known_length(&self, op: &Operand, default: usize) -> usize {
         self.known_lengths
             .get(&op.to_opref())
@@ -808,7 +808,7 @@ impl RewriteState {
             .unwrap_or(default)
     }
 
-    /// rewrite.py:714: write_barrier_applied(op)
+    /// rewrite.py: write_barrier_applied(op)
     fn wb_already_applied(&self, r: &Operand) -> bool {
         self.wb_applied.contains(&r.to_opref())
     }
@@ -825,7 +825,7 @@ impl RewriteState {
     /// rewrite.py:930 parity: `isinstance(v, ConstPtr) and not needs_write_barrier(v.value)`.
     /// A null ConstPtr never needs a write barrier.
     fn is_null_constant(&self, b: &Operand) -> bool {
-        // history.py:314 ConstPtr.value inline — null sentinel directly readable.
+        // history.py ConstPtr.value inline — null sentinel directly readable.
         match b.const_value() {
             Some(Value::Ref(r)) => r.0 == 0,
             Some(Value::Int(v)) => v == 0,
@@ -842,7 +842,7 @@ impl RewriteState {
 
     fn rewrite_op(&self, op: &Op) -> Op {
         let mut rewritten = op.clone();
-        // optimizer.py:651-652 force_box loop parity:
+        // optimizer.py force_box loop parity:
         //   for i in range(op.numargs()): op.setarg(i, ...)
         for i in 0..rewritten.num_args() {
             rewritten.setarg(i, self.resolve(rewritten.arg(i)));
@@ -876,7 +876,7 @@ impl RewriteState {
         result
     }
 
-    /// rewrite.py:128-130 `replace_op_with(op, newop)` — stash `lowered`
+    /// rewrite.py `replace_op_with(op, newop)` — stash `lowered`
     /// as the replacement for the op at the current main-loop iteration.
     /// A subsequent `emit_maybe_forwarded` call for the same iteration
     /// will emit the stashed replacement.
@@ -884,7 +884,7 @@ impl RewriteState {
         self.forwarded_ops.insert(self.current_i, lowered);
     }
 
-    /// rewrite.py:100-126 `emit_op` — emits either the replacement
+    /// rewrite.py `emit_op` — emits either the replacement
     /// previously stashed via `set_forwarded` (if any) or the rewritten
     /// original.  Preserves the original's position mapping so downstream
     /// uses of the original's `OpRef` resolve to the lowered op's result.
@@ -905,7 +905,7 @@ impl RewriteState {
         }
     }
 
-    /// rewrite.py:84-91 `delayed_zero_setfields(op)` — get-or-create the
+    /// rewrite.py `delayed_zero_setfields(op)` — get-or-create the
     /// per-base byte-offset set, resolving `r` through the forwarding
     /// map first (RPython calls `get_box_replacement(op)` here).
     fn delayed_zero_setfields(&mut self, r: &Operand) -> &mut IndexSet<i64> {
@@ -925,7 +925,7 @@ impl RewriteState {
         }
     }
 
-    /// rewrite.py:719-758 emit_pending_zeros.
+    /// rewrite.py emit_pending_zeros.
     ///
     /// Mutates each previously-emitted ZERO_ARRAY in place: trim from
     /// both ends past any indices that subsequent SETARRAYITEM writes
@@ -955,7 +955,7 @@ impl RewriteState {
             let one = self.const_int(1);
 
             let op = &self.out[pz.out_index];
-            // resoperation.py:290 AbstractResOp.setarg parity.
+            // resoperation.py AbstractResOp.setarg parity.
             op.setarg(1, scaled_start);
             op.setarg(2, scaled_len);
             op.setarg(3, one.clone());
@@ -965,7 +965,7 @@ impl RewriteState {
         // rewrite.py:760-766 — NULL-pointer writes still pending for
         // any zero-init fields not covered by a subsequent explicit
         // SETFIELD_GC.  The store width is `WORD`, the target's pointer
-        // size (`symbolic.py:12 WORD = sizeof(lltype.Signed)`) — 4 on the
+        // size (`symbolic.py WORD = sizeof(lltype.Signed)`) — 4 on the
         // wasm32 target, where an 8-byte zero would run past the field
         // and null the neighbouring one.
         //
@@ -1008,7 +1008,7 @@ impl GcRewriterImpl {
         size <= self.max_nursery_size
     }
 
-    /// rewrite.py:431-448 `could_merge_with_next_guard` parity.
+    /// rewrite.py `could_merge_with_next_guard` parity.
     ///
     /// Returns true when `op` should be kept adjacent to the next guard,
     /// triggering a `emit_pending_zeros` flush at the top of the iteration
@@ -1044,7 +1044,7 @@ impl GcRewriterImpl {
         ) {
             return false;
         }
-        // rewrite.py:445 `next_op.getarg(0) is not op` — in pyre OpRef
+        // rewrite.py `next_op.getarg(0) is not op` — in pyre OpRef
         // carries the same identity role as RPython's box object.
         if next_op.arg(0).to_opref() != op.pos.get() {
             return false;
@@ -1053,7 +1053,7 @@ impl GcRewriterImpl {
         true
     }
 
-    /// rewrite.py:450-471 `remove_tested_failarg` parity.
+    /// rewrite.py `remove_tested_failarg` parity.
     ///
     /// When a GUARD_TRUE/GUARD_FALSE's tested value is also present in the
     /// guard's failargs, emit a `SAME_AS_I(value)` (where `value = 0` for
@@ -1078,13 +1078,13 @@ impl GcRewriterImpl {
         let Some(idx) = fail_args.iter().position(|a| a.to_opref() == target) else {
             return;
         };
-        // rewrite.py:463 `value = int(opnum == rop.GUARD_FALSE)`
+        // rewrite.py `value = int(opnum == rop.GUARD_FALSE)`
         let value: i64 = i64::from(op.opcode == OpCode::GuardFalse);
         let const_ref = st.const_int(value);
         let same = mk_op(OpCode::SameAsI, &[const_ref]);
         let same_pos = st.emit_result(same, OpRef::NONE);
 
-        // rewrite.py:466-469 — rewrite failargs + stash the copy-and-changed
+        // rewrite.py — rewrite failargs + stash the copy-and-changed
         // guard for the next iteration to pick up.
         let mut new_guard = op.clone();
         if let Some(fa) = new_guard.fail_args_mut() {
@@ -1141,7 +1141,7 @@ impl GcRewriterImpl {
             return;
         }
 
-        // rewrite.py:474-484 handle_malloc_operation parity:
+        // rewrite.py handle_malloc_operation parity:
         // descr.size in RPython already includes the GC header (the
         // OBJECT type is built with `size = sizeof(header) + sizeof(fields)`).
         // pyre's PyreSizeDescr reports `obj_size` as the bare struct size
@@ -1153,7 +1153,7 @@ impl GcRewriterImpl {
         let size = round_up(descr.size() + crate::header::GcHeader::SIZE);
         let type_id = descr.type_id();
 
-        // rewrite.py:540-543 — `if gen_malloc_nursery(size, op):
+        // rewrite.py — `if gen_malloc_nursery(size, op):
         //                          gen_initialize_tid(op, descr.tid)
         //                       else:
         //                          gen_malloc_fixedsize(size, descr.tid, op)`.
@@ -1178,7 +1178,7 @@ impl GcRewriterImpl {
         };
         st.record_result_mapping(op.pos.get(), obj_ref.clone());
 
-        // rewrite.py:479-484 handle_malloc_operation parity:
+        // rewrite.py handle_malloc_operation parity:
         //   elif opnum == rop.NEW_WITH_VTABLE:
         //       ...
         //       if self.gc_ll_descr.fielddescr_vtable is not None:
@@ -1194,7 +1194,7 @@ impl GcRewriterImpl {
         // ob_type=NULL eventually crashed the blackhole's binary_op_fn
         // path (memory: phase5_super_lift_bisect_2026_04_17.md).
         if op.opcode == OpCode::NewWithVtable {
-            // rewrite.py:482 `if self.gc_ll_descr.fielddescr_vtable is not None`.
+            // rewrite.py `if self.gc_ll_descr.fielddescr_vtable is not None`.
             if let Some(vtable_fd_ref) = self.fielddescr_vtable.as_ref() {
                 let vtable = descr.vtable();
                 // Defensive — pyre's NEW_WITH_VTABLE descrs in production
@@ -1220,7 +1220,7 @@ impl GcRewriterImpl {
             self.gen_initialize_w_class(obj_ref.clone(), w_class, w_class_fd.as_ref(), st);
         }
 
-        // rewrite.py:544 `self.clear_gc_fields(descr, op)` — record every
+        // rewrite.py `self.clear_gc_fields(descr, op)` — record every
         // GC-pointer field's byte offset so a pending NULL store is
         // emitted at the next flush point, unless cleared first by an
         // explicit SETFIELD_GC (rewrite.py:506-512).  No-op under pyre's
@@ -1228,7 +1228,7 @@ impl GcRewriterImpl {
         self.clear_gc_fields(descr, obj_ref, st);
     }
 
-    /// rewrite.py:498-504 `clear_gc_fields`.
+    /// rewrite.py `clear_gc_fields`.
     ///
     /// For every GC-pointer field on the fresh allocation, remember
     /// that a NULL-pointer store is needed unless a subsequent
@@ -1239,7 +1239,7 @@ impl GcRewriterImpl {
         if self.malloc_zero_filled {
             return;
         }
-        // rewrite.py:501-504 — populate `delayed_zero_setfields[result][ofs] = None`
+        // rewrite.py — populate `delayed_zero_setfields[result][ofs] = None`
         // per GC-pointer field (`descr.gc_fielddescrs` / unpack_fielddescr).
         let entries = st.delayed_zero_setfields(&result);
         for fd in descr.gc_fielddescrs() {
@@ -1262,7 +1262,7 @@ impl GcRewriterImpl {
     // NEW_ARRAY / NEW_ARRAY_CLEAR  → CALL_MALLOC_NURSERY_VARSIZE / CALL_R
     // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:546-586 handle_new_array parity.
+    /// rewrite.py handle_new_array parity.
     ///
     /// kind: FLAG_ARRAY=0, FLAG_STR=1, FLAG_UNICODE=2.
     ///
@@ -1385,7 +1385,7 @@ impl GcRewriterImpl {
             r
         };
 
-        // rewrite.py:566-567 (path #1 inline) / rewrite.py:585-586
+        // rewrite.py (path #1 inline) / rewrite.py
         // (paths #2/#3/#4 tail) clear_varsize_gc_fields.  Emits
         // ZERO_ARRAY for NEW_ARRAY_CLEAR and a hash-field zeroing
         // store for NEWSTR / NEWUNICODE, gated on !malloc_zero_filled.
@@ -1409,7 +1409,7 @@ impl GcRewriterImpl {
         }
     }
 
-    /// rewrite.py:520-535 `clear_varsize_gc_fields`.
+    /// rewrite.py `clear_varsize_gc_fields`.
     ///
     /// Short-circuits on `malloc_zero_filled=true` — pyre's production
     /// nursery zero-fills payload bytes, so callers already observe a
@@ -1438,14 +1438,14 @@ impl GcRewriterImpl {
         if self.malloc_zero_filled {
             return;
         }
-        // rewrite.py:523-528 FLAG_ARRAY path.
+        // rewrite.py FLAG_ARRAY path.
         if kind == 0 {
             if opnum == OpCode::NewArrayClear {
                 self.handle_clear_array_contents(arraydescr, ad_itemsize, result, v_length, st);
             }
             return;
         }
-        // rewrite.py:529-535 FLAG_STR / FLAG_UNICODE: zero the hash
+        // rewrite.py FLAG_STR / FLAG_UNICODE: zero the hash
         // field via emit_setfield(result, ConstInt(0), descr=hash_descr).
         // Offset / size come from gc_ll_descr.{str,unicode}_hash_descr
         // (gc.py:48-49) — both rstr.STR and rstr.UNICODE keep `hash` at
@@ -1465,7 +1465,7 @@ impl GcRewriterImpl {
         }
     }
 
-    /// rewrite.py:588-611 `handle_clear_array_contents`.
+    /// rewrite.py `handle_clear_array_contents`.
     ///
     /// Emits a `ZERO_ARRAY` covering the entire array, registering the
     /// op in `pending_zeros` when `v_length` is a constant so
@@ -1532,7 +1532,7 @@ impl GcRewriterImpl {
     // CALL_MALLOC_NURSERY_VARSIZE / slow malloc helpers
     // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:848-866 `gen_malloc_nursery_varsize`.
+    /// rewrite.py `gen_malloc_nursery_varsize`.
     ///
     /// Returns `Some(opref)` when the nursery fast path emits the
     /// CALL_MALLOC_NURSERY_VARSIZE op, `None` when the upstream
@@ -1551,7 +1551,7 @@ impl GcRewriterImpl {
         let ad = arraydescr
             .as_array_descr()
             .expect("gen_malloc_nursery_varsize descr must be ArrayDescr");
-        // rewrite.py:853-856 — standard-shape gate: only `FLAG_ARRAY`
+        // rewrite.py — standard-shape gate: only `FLAG_ARRAY`
         // (kind == 0) is constrained; `FLAG_STR` (1) / `FLAG_UNICODE`
         // (2) always proceed because their descrs are by definition
         // non-standard-shaped but the nursery layout still accepts
@@ -1578,7 +1578,7 @@ impl GcRewriterImpl {
         Some(st.emit_result(varsize_op, result_pos))
     }
 
-    /// rewrite.py:768-776 `_gen_call_malloc_gc`.
+    /// rewrite.py `_gen_call_malloc_gc`.
     fn gen_call_malloc_gc(
         &self,
         args: &[Operand],
@@ -1597,7 +1597,7 @@ impl GcRewriterImpl {
         result
     }
 
-    /// rewrite.py:809-834 `gen_malloc_array`.
+    /// rewrite.py `gen_malloc_array`.
     fn gen_malloc_array(
         &self,
         arraydescr: DescrRef,
@@ -1655,12 +1655,12 @@ impl GcRewriterImpl {
         }
     }
 
-    /// rewrite.py:778-796 `gen_malloc_fixedsize` (framework GC arm).
+    /// rewrite.py `gen_malloc_fixedsize` (framework GC arm).
     ///
     /// Emits `CALL_R(malloc_big_fixedsize_fn, size, typeid)` followed
     /// by `CHECK_MEMORY_ERROR` (via `gen_call_malloc_gc`).
     ///
-    /// rewrite.py:794-796 stamps `remember_write_barrier` on the result
+    /// rewrite.py stamps `remember_write_barrier` on the result
     /// there, sound because upstream's `malloc_big_fixedsize` hands back a
     /// *young* raw-malloced object: a young object needs no barrier for a
     /// young pointer stored into it.  pyre's helper allocates in the old
@@ -1673,7 +1673,7 @@ impl GcRewriterImpl {
     /// pyre is framework-GC only; the Boehm `else` arm
     /// (`malloc_fixedsize_fn`) is intentionally not ported.  The
     /// helper itself stamps the tid into the GC header (matching
-    /// upstream `malloc_big_fixedsize` at gc.py:481-490 which goes
+    /// upstream `malloc_big_fixedsize` at gc.py which goes
     /// through `do_malloc_fixedsize_clear` with type_id), so callers
     /// MUST NOT emit a separate `gen_initialize_tid`.
     fn gen_malloc_fixedsize(
@@ -1699,7 +1699,7 @@ impl GcRewriterImpl {
         )
     }
 
-    /// rewrite.py:836-840 `gen_malloc_str`.
+    /// rewrite.py `gen_malloc_str`.
     ///
     /// Upstream's `malloc_str` helper closure
     /// captures `str_type_id = self.str_descr.tid` (gc.py:451) at
@@ -1728,7 +1728,7 @@ impl GcRewriterImpl {
         )
     }
 
-    /// rewrite.py:842-846 `gen_malloc_unicode`.
+    /// rewrite.py `gen_malloc_unicode`.
     ///
     /// See `gen_malloc_str`.  Type id sourced
     /// from `gc_ll_descr.unicode_descr.type_id()` (gc.py:455
@@ -1758,7 +1758,7 @@ impl GcRewriterImpl {
     // COPYSTRCONTENT / COPYUNICODECONTENT → memcpy CALL_N
     // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:1045-1080 `rewrite_copy_str_content`.
+    /// rewrite.py `rewrite_copy_str_content`.
     ///
     /// Lowers `COPYSTRCONTENT(src, dst, src_start, dst_start, length)` (and
     /// the UNICODE variant) to:
@@ -1788,7 +1788,7 @@ impl GcRewriterImpl {
                 .str_descr
                 .as_array_descr()
                 .expect("gc_ll_descr.str_descr must be an ArrayDescr");
-            // rewrite.py:1054 `assert self.gc_ll_descr.str_descr.itemsize == 1`.
+            // rewrite.py `assert self.gc_ll_descr.str_descr.itemsize == 1`.
             assert_eq!(
                 ad.item_size(),
                 1,
@@ -1853,7 +1853,7 @@ impl GcRewriterImpl {
         st.emit(call_op);
     }
 
-    /// rewrite.py:1082-1098 `emit_load_effective_address`.
+    /// rewrite.py `emit_load_effective_address`.
     ///
     /// CPUs with `supports_load_effective_address = True` (x86, aarch64)
     /// emit a single LEA op; CPUs without it (model.py:22 base default)
@@ -1902,7 +1902,7 @@ impl GcRewriterImpl {
     // SETFIELD_GC  → maybe COND_CALL_GC_WB + SETFIELD_GC
     // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:926-934 `handle_write_barrier_setfield`.
+    /// rewrite.py `handle_write_barrier_setfield`.
     /// Emits a write barrier before the store when the stored value is a
     /// non-null reference into a pointer-bearing field AND the base has
     /// not already been WB'd.  Does *not* emit the store itself — the
@@ -1947,14 +1947,14 @@ impl GcRewriterImpl {
         self.gen_write_barrier(obj, st);
     }
 
-    /// rewrite.py:948-953 `gen_write_barrier`.
+    /// rewrite.py `gen_write_barrier`.
     fn gen_write_barrier(&self, v_base: Operand, st: &mut RewriteState) {
         let wb_op = mk_op(OpCode::CondCallGcWb, std::slice::from_ref(&v_base));
         st.emit(wb_op);
         st.remember_wb(&v_base);
     }
 
-    /// rewrite.py:506-512 `consider_setfield_gc`.
+    /// rewrite.py `consider_setfield_gc`.
     ///
     /// Drops the `(base, offset)` entry from `_delayed_zero_setfields`
     /// so the pending-zero flush at `emit_pending_zeros`
@@ -1980,10 +1980,10 @@ impl GcRewriterImpl {
 
     // ────────────────────────────────────────────────────────
     // SETARRAYITEM_GC  → maybe COND_CALL_GC_WB{_ARRAY} + SETARRAYITEM_GC
-    // rewrite.py:936-946 handle_write_barrier_setarrayitem
+    // rewrite.py handle_write_barrier_setarrayitem
     // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:514-518 consider_setarrayitem_gc: record the constant
+    /// rewrite.py consider_setarrayitem_gc: record the constant
     /// index so emit_pending_zeros can skip this slot.
     ///
     /// ```text
@@ -2002,10 +2002,10 @@ impl GcRewriterImpl {
         st.record_setarrayitem_index(&array_ref, idx_val as usize);
     }
 
-    /// rewrite.py:936-944: handle_write_barrier_setarrayitem.
+    /// rewrite.py: handle_write_barrier_setarrayitem.
     /// Emits CondCallGcWb / CondCallGcWbArray as needed; the SETARRAYITEM
     /// op itself is NOT emitted here — RPython forwards the op to
-    /// GC_STORE_INDEXED inside transform_to_gc_load (rewrite.py:220-221)
+    /// GC_STORE_INDEXED inside transform_to_gc_load (rewrite.py)
     /// and then `self.emit_op(op)` follows the forwarding. We do the
     /// equivalent in the caller by invoking handle_setarrayitem after WB.
     fn handle_write_barrier_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
@@ -2029,7 +2029,7 @@ impl GcRewriterImpl {
         }
     }
 
-    /// rewrite.py:132-138 handle_setarrayitem.
+    /// rewrite.py handle_setarrayitem.
     /// Lowers SETARRAYITEM_GC / SETARRAYITEM_RAW into GC_STORE /
     /// GC_STORE_INDEXED via `emit_gc_store_or_indexed`, which forwards
     /// the original op to the lowered form (the emission happens later
@@ -2057,7 +2057,7 @@ impl GcRewriterImpl {
         );
     }
 
-    /// rewrite.py:140-158 emit_gc_store_or_indexed (with cpu_simplify_scale
+    /// rewrite.py emit_gc_store_or_indexed (with cpu_simplify_scale
     /// inlined). `load_supported_factors` drives the non-constant branch:
     /// factors outside that set are pre-scaled in IR, factors inside it pass
     /// through to the backend's native addressing mode.
@@ -2117,7 +2117,7 @@ impl GcRewriterImpl {
         }
     }
 
-    /// rewrite.py:166-171 `_emit_mul_if_factor_offset_not_supported`.
+    /// rewrite.py `_emit_mul_if_factor_offset_not_supported`.
     ///
     /// Wrapper around `cpu_simplify_scale` that emits the constructed
     /// pre-scale op (when one was needed) and folds the result into the
@@ -2143,7 +2143,7 @@ impl GcRewriterImpl {
         (factor, offset, index_opt)
     }
 
-    /// rewrite.py:1117-1132 `cpu_simplify_scale`.
+    /// rewrite.py `cpu_simplify_scale`.
     ///
     /// Pure decision function: given the raw `(index, factor, offset)`
     /// triple supplied by an indexed GC load/store builder, decide
@@ -2184,7 +2184,7 @@ impl GcRewriterImpl {
         (factor, offset, ScaledIndex::Passthrough(index_box.clone()))
     }
 
-    /// rewrite.py:160-164 handle_getarrayitem.
+    /// rewrite.py handle_getarrayitem.
     /// Lowers GETARRAYITEM_{GC,RAW}_{I,R,F} (including the PURE variants,
     /// per rewrite.py:216-219) into GC_LOAD / GC_LOAD_INDEXED by
     /// forwarding the op through `emit_gc_load_or_indexed`.
@@ -2201,7 +2201,7 @@ impl GcRewriterImpl {
         self.emit_gc_load_or_indexed(op, ptr, index, itemsize, itemsize, ofs, sign, st);
     }
 
-    /// rewrite.py:184-210 emit_gc_load_or_indexed (with cpu_simplify_scale
+    /// rewrite.py emit_gc_load_or_indexed (with cpu_simplify_scale
     /// inlined). Forwards `original` to either GC_LOAD_{I,R,F} (when the
     /// index resolves to a constant) or GC_LOAD_INDEXED_{I,R,F}.
     ///
@@ -2266,7 +2266,7 @@ impl GcRewriterImpl {
         st.set_forwarded(newload);
     }
 
-    /// rewrite.py:660-663 `emit_setfield`.
+    /// rewrite.py `emit_setfield`.
     ///
     /// Synthetic field store helper: emits `GC_STORE(ptr, ConstInt(0),
     /// value, ConstInt(size))` via `emit_gc_store_or_indexed` (which
@@ -2287,7 +2287,7 @@ impl GcRewriterImpl {
     ///
     /// pyre's `JitFrameDescrs` carries raw `i32` offsets and
     /// `sign_size: usize` rather than upstream's per-field `FieldDescr`
-    /// objects (see rewrite.py:641-650 `emit_setfield(frame, c_null,
+    /// objects (see rewrite.py `emit_setfield(frame, c_null,
     /// descr=descrs.jf_*)`).  `handle_call_assembler` consumes those
     /// raw offsets directly; this helper deduplicates the
     /// `Op::new(GcStore, ...) + st.emit` boilerplate so the lowering
@@ -2308,7 +2308,7 @@ impl GcRewriterImpl {
         self.emit_gc_store_or_indexed(None, ptr, zero, value, size, 1, ofs, st);
     }
 
-    /// rewrite.py:212-342 `transform_to_gc_load`.
+    /// rewrite.py `transform_to_gc_load`.
     ///
     /// Central dispatcher that lowers high-level memory accessors to
     /// GC_LOAD / GC_LOAD_INDEXED / GC_STORE / GC_STORE_INDEXED. Each arm
@@ -2533,7 +2533,7 @@ impl GcRewriterImpl {
         }
         // rewrite.py:295-301 STRGETITEM — `basesize -= 1` skips the
         // `extra_item_after_alloc` null terminator carried by
-        // `rstr.STR.chars` (`rstr.py:1226-1228`).  `itemsize == 1` is
+        // `rstr.STR.chars` (`rstr.py`).  `itemsize == 1` is
         // asserted upstream at rewrite.py:298.
         if matches!(opnum, OpCode::Strgetitem) {
             let (itemsize, basesize) = strgetsetitem_token(op, /*is_str=*/ true);
@@ -2642,7 +2642,7 @@ impl GcRewriterImpl {
     }
 
     // ────────────────────────────────────────────────────────
-    // rewrite.py:955-973 gen_write_barrier_array
+    // rewrite.py gen_write_barrier_array
     // ────────────────────────────────────────────────────────
 
     fn gen_write_barrier_array(&self, v_base: Operand, v_index: Operand, st: &mut RewriteState) {
@@ -2678,7 +2678,7 @@ impl GcRewriterImpl {
     // gen_malloc_nursery: batched bump-pointer allocation
     // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:879-912 `gen_malloc_nursery` parity.
+    /// rewrite.py `gen_malloc_nursery` parity.
     ///
     /// Try to emit (or extend) a CALL_MALLOC_NURSERY for `size` bytes.
     /// Returns `Some(result)` on success; you still need to write the
@@ -2758,7 +2758,7 @@ impl GcRewriterImpl {
     // Helpers for header initialisation
     // ────────────────────────────────────────────────────────
 
-    /// rewrite.py:914-918 gen_initialize_tid parity.
+    /// rewrite.py gen_initialize_tid parity.
     ///
     /// RPython:
     /// ```python
@@ -2834,11 +2834,11 @@ impl GcRewriterImpl {
         self.emit_setfield(obj, w_class_ref, w_class_fd, st);
     }
 
-    /// rewrite.py:920-922 gen_initialize_len parity.
+    /// rewrite.py gen_initialize_len parity.
     ///
     /// RPython: `emit_setfield(v_newgcobj, v_length, descr=arraylen_descr)`.
     /// Routes through the local `emit_setfield` helper so the lowered
-    /// store passes through `cpu_simplify_scale` (rewrite.py:1118-1122)
+    /// store passes through `cpu_simplify_scale` (rewrite.py)
     /// for the ConstInt(0) index fold, matching upstream's emission
     /// path.
     fn gen_initialize_len(
@@ -2851,7 +2851,7 @@ impl GcRewriterImpl {
         self.emit_setfield(obj, length, len_descr, st);
     }
 
-    /// rewrite.py:665-695 handle_call_assembler:
+    /// rewrite.py handle_call_assembler:
     ///   1. gen_malloc_frame — allocate callee jitframe from nursery
     ///   2. gen_initialize_tid + zero GC fields
     ///   3. store each arg at _ll_initial_locs[i] offset
@@ -2890,13 +2890,13 @@ impl GcRewriterImpl {
             );
         }
 
-        // rewrite.py:627-653 — gen_malloc_frame(llfi)
+        // rewrite.py — gen_malloc_frame(llfi)
         // RPython reads jfi_frame_size from frame_info AT RUNTIME so
         // the allocation size is correct even for self-recursive calls
         // (where frame_info is pre-allocated with [0,0] and updated
         // after compilation).
         let llfi = st.const_int(callee_locs.frame_info_ptr as i64);
-        // jitframe.py:30-36 — JITFRAMEINFO.jfi_frame_depth and
+        // jitframe.py — JITFRAMEINFO.jfi_frame_depth and
         // jfi_frame_size are both lltype.Signed, so the unpack_fielddescr
         // size read by emit_getfield is sign_size (the Signed word width).
         let signed_size = st.const_int(descrs.sign_size as i64);
@@ -2909,16 +2909,16 @@ impl GcRewriterImpl {
             OpCode::GcLoadI,
             &[llfi.clone(), jfi_frame_size_ofs, signed_size.clone()],
         ));
-        // rewrite.py:634 — gen_malloc_nursery_varsize_frame(size)
+        // rewrite.py — gen_malloc_nursery_varsize_frame(size)
         st.emitting_an_operation_that_can_collect();
         let malloc_op = mk_op(OpCode::CallMallocNurseryVarsizeFrame, &[size]);
         let frame = st.emit_result(malloc_op, OpRef::NONE);
         st.remember_wb(&frame);
 
-        // rewrite.py:635 — gen_initialize_tid(frame, descrs.arraydescr.tid)
+        // rewrite.py — gen_initialize_tid(frame, descrs.arraydescr.tid)
         self.gen_initialize_tid(frame.clone(), descrs.jitframe_tid, st);
 
-        // rewrite.py:641-650 — emit_setfield(frame, c_null, descr=jf_*)
+        // rewrite.py — emit_setfield(frame, c_null, descr=jf_*)
         // with (_, size, _) = unpack_fielddescr(descr). jitframe.py:63-81
         // every zeroed field (jf_descr / jf_force_descr / jf_savedata /
         // jf_guard_exc / jf_forward) is a GCREF or Ptr, i.e. pointer-
@@ -2937,8 +2937,8 @@ impl GcRewriterImpl {
             self.emit_setfield_raw(frame.clone(), zero.clone(), ofs as i64, signed_size_val, st);
         }
 
-        // rewrite.py:639-640 — emit_getfield(frame_info, descrs.jfi_frame_depth),
-        // rewrite.py:651-652 — gen_initialize_len(frame, length, ...).
+        // rewrite.py — emit_getfield(frame_info, descrs.jfi_frame_depth),
+        // rewrite.py — gen_initialize_len(frame, length, ...).
         // Both read/write lltype.Signed values (jfi_frame_depth and the
         // jf_frame length field).
         let jfi_frame_depth_ofs = st.const_int(0);
@@ -2954,7 +2954,7 @@ impl GcRewriterImpl {
             st,
         );
 
-        // rewrite.py:671 — emit_setfield(frame, ConstInt(llfi),
+        // rewrite.py — emit_setfield(frame, ConstInt(llfi),
         // descr=descrs.jf_frame_info). jf_frame_info is Ptr(JITFRAMEINFO)
         // (jitframe.py:63) so the field size is the pointer width, which
         // in majit's layout coincides with sign_size.
@@ -3018,7 +3018,7 @@ impl GcRewriterImpl {
 }
 
 impl GcRewriterImpl {
-    /// rewrite.py:988-1001 remove_bridge_exception: check a common
+    /// rewrite.py remove_bridge_exception: check a common
     /// case where SaveExcClass + SaveException + RestoreException
     /// appear at the start of a bridge and are unused. Strip them.
     ///
@@ -3087,7 +3087,7 @@ impl GcRewriter for GcRewriterImpl {
         ops: &[Op],
         constants: &ConstMap<Const>,
     ) -> (Vec<Op>, ConstMap<Const>, Vec<GcRef>) {
-        // rewrite.py:988-1001 remove_bridge_exception: strip a
+        // rewrite.py remove_bridge_exception: strip a
         // SaveExcClass+SaveException+RestoreException prefix that is
         // a no-op (common in bridges).
         let ops = Self::remove_bridge_exception(ops);
@@ -3146,13 +3146,13 @@ impl GcRewriter for GcRewriterImpl {
         let next_pos = max_raw_pos.map_or(0, |max_pos| max_pos.saturating_add(1));
         let mut st = RewriteState::with_constants(ops.len(), next_pos, constants.clone());
         for (i, orig_op) in ops.iter().enumerate() {
-            // rewrite.py:366-367 — if `remove_tested_failarg` rewrote this
+            // rewrite.py — if `remove_tested_failarg` rewrote this
             // op on a previous iteration, use the stashed replacement.
             let owned = st.changed_ops.swap_remove(&i);
             let op: &Op = owned.as_ref().unwrap_or(orig_op);
             st.current_i = i;
 
-            // rewrite.py:376-378 — is_guard OR could_merge_with_next_guard
+            // rewrite.py — is_guard OR could_merge_with_next_guard
             // triggers emit_pending_zeros at the top of the iteration.
             // could_merge_with_next_guard may also emit a SAME_AS_I and
             // stash a rewritten guard via remove_tested_failarg, so it
@@ -3164,7 +3164,7 @@ impl GcRewriter for GcRewriterImpl {
                 st.emit_pending_zeros();
             }
 
-            // rewrite.py:368-370 — transform_to_gc_load forwards memory
+            // rewrite.py — transform_to_gc_load forwards memory
             // accessors to GC_LOAD / GC_STORE forms.  Returns true only
             // for the GETFIELD_GC fast-path, which also emits the
             // forwarded op itself.
@@ -3176,11 +3176,11 @@ impl GcRewriter for GcRewriterImpl {
                 // Skip debug merge points (they carry no semantics).
                 OpCode::DebugMergePoint => continue,
 
-                // rewrite.py:1003-1006 emit_label
+                // rewrite.py emit_label
                 OpCode::Label => {
                     st.emitting_an_operation_that_can_collect();
                     st.known_lengths.clear();
-                    // rewrite.py:1005 emit_label resets the per-block load CSE.
+                    // rewrite.py emit_label resets the per-block load CSE.
                     st.gcrefs_recently_loaded.clear();
                     let rewritten = st.rewrite_op(op);
                     st.emit_rewritten_from(op, rewritten);
@@ -3198,16 +3198,16 @@ impl GcRewriter for GcRewriterImpl {
                     self.handle_new_array(descr_ref, op, &mut st, 0); // FLAG_ARRAY
                 }
                 OpCode::Newstr => {
-                    // rewrite.py:489-491 `handle_new_array(self.gc_ll_descr.str_descr, op, FLAG_STR)`.
+                    // rewrite.py `handle_new_array(self.gc_ll_descr.str_descr, op, FLAG_STR)`.
                     self.handle_new_array(self.str_descr.clone(), op, &mut st, 1);
                 }
                 OpCode::Newunicode => {
-                    // rewrite.py:492-494 `handle_new_array(self.gc_ll_descr.unicode_descr, op, FLAG_UNICODE)`.
+                    // rewrite.py `handle_new_array(self.gc_ll_descr.unicode_descr, op, FLAG_UNICODE)`.
                     self.handle_new_array(self.unicode_descr.clone(), op, &mut st, 2);
                 }
 
                 // ── COPYSTRCONTENT / COPYUNICODECONTENT → memcpy CALL_N ──
-                // rewrite.py:388-391 `rewrite_copy_str_content` replaces
+                // rewrite.py `rewrite_copy_str_content` replaces
                 // the copy op with LOAD_EFFECTIVE_ADDRESS × 2 + CALL_N.
                 OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
                     self.rewrite_copy_str_content(op, &mut st);
@@ -3221,10 +3221,10 @@ impl GcRewriter for GcRewriterImpl {
                 // follows the forward and emits the lowered op.
                 // rewrite.py:393 `if self.gc_ll_descr.write_barrier_descr is
                 // not None:` — a collector that needs no write barrier
-                // (`gc.py:156 GcLLDescr_boehm.write_barrier_descr = None`)
+                // (`gc.py GcLLDescr_boehm.write_barrier_descr = None`)
                 // must not have `COND_CALL_GC_WB*` emitted for it at all.
                 OpCode::SetfieldGc if self.wb_descr.is_some() => {
-                    // rewrite.py:393-395 — consider_setfield_gc clears the
+                    // rewrite.py — consider_setfield_gc clears the
                     // pending zero-init entry before WB emission.
                     self.consider_setfield_gc(op, &mut st);
                     self.handle_write_barrier_setfield(op, &mut st);
@@ -3264,7 +3264,7 @@ impl GcRewriter for GcRewriterImpl {
                     continue;
                 }
 
-                // ── call_assembler: rewrite.py:414 handle_call_assembler ──
+                // ── call_assembler: rewrite.py handle_call_assembler ──
                 OpCode::CallAssemblerI
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
@@ -3275,7 +3275,7 @@ impl GcRewriter for GcRewriterImpl {
 
                 // ── Operations that can trigger GC ──
                 _ if op.opcode.can_malloc() => {
-                    // rewrite.py:379-380 — emitting_an_operation_that_can_collect
+                    // rewrite.py — emitting_an_operation_that_can_collect
                     // already flushes pending zeros (rewrite.py:707).
                     st.emitting_an_operation_that_can_collect();
                     let rewritten = st.rewrite_op(op);
@@ -3373,7 +3373,7 @@ impl GcRewriter for GcRewriterImpl {
         // to `Vec<OpRc>` and removes this clone.
         let out: Vec<Op> = st.out.iter().map(|rc| (**rc).clone()).collect();
 
-        // rewrite.py:106-116 post-condition: `remove_constptr` replaced
+        // rewrite.py post-condition: `remove_constptr` replaced
         // every non-null reference-constant *operand* with a
         // `LoadFromGcTable` result, so no raw non-null `GcRef` is left for
         // a backend to bake as an immortal immediate. Failargs are NOT
@@ -4066,7 +4066,7 @@ mod tests {
 
     #[test]
     fn test_setfield_gc_ref_needs_wb() {
-        // rewrite.py:262-266 + 401-404: transform_to_gc_load forwards
+        // rewrite.py + 401-404: transform_to_gc_load forwards
         // SETFIELD_GC to GC_STORE; the write-barrier arm emits WB then
         // emit_maybe_forwarded follows the forward.
         let rw = make_rewriter();
@@ -4091,7 +4091,7 @@ mod tests {
     fn test_no_write_barrier_descr_emits_no_barrier_but_keeps_the_store() {
         // rewrite.py:393 `if self.gc_ll_descr.write_barrier_descr is not
         // None:` — a collector that needs no write barrier reports `None`
-        // (`gc.py:156 GcLLDescr_boehm.write_barrier_descr`), and the whole
+        // (`gc.py GcLLDescr_boehm.write_barrier_descr`), and the whole
         // barrier section is skipped for it.  rewrite.py:405-412's `else`
         // still lowers the store; only the barrier goes away.
         //
@@ -4123,7 +4123,7 @@ mod tests {
 
     #[test]
     fn test_no_write_barrier_descr_still_lowers_setarrayitem() {
-        // rewrite.py:411-412 — the `else` arm calls `consider_setarrayitem_gc`
+        // rewrite.py — the `else` arm calls `consider_setarrayitem_gc`
         // and leaves the store to the ordinary lowering.
         let mut rw = make_rewriter();
         rw.wb_descr = None;
@@ -4202,7 +4202,7 @@ mod tests {
         assert_eq!(result[0].opcode, OpCode::GcStore);
     }
 
-    // ── Tests 4a-c: delayed_zero_setfields (rewrite.py:498-512, 761-766) ──
+    // ── Tests 4a-c: delayed_zero_setfields (rewrite.py, 761-766) ──
 
     fn ref_field_descr_at(offset: usize) -> Arc<dyn FieldDescr> {
         Arc::new(TestFieldDescr {
@@ -4224,7 +4224,7 @@ mod tests {
         Arc::new(TestWClassFieldDescr { offset })
     }
 
-    /// rewrite.py:499-500 + rewrite.py:761-766 — malloc_zero_filled=true
+    /// rewrite.py + rewrite.py — malloc_zero_filled=true
     /// short-circuits `clear_gc_fields`, so NEW emits no pending NULL
     /// stores at the next flush point.  Mirrors pyre's production
     /// nursery (which `alloc_zeroed`s).
@@ -4255,7 +4255,7 @@ mod tests {
         );
     }
 
-    /// rewrite.py:498-504 + rewrite.py:761-766 — when the allocator does
+    /// rewrite.py + rewrite.py — when the allocator does
     /// not zero-fill, every GC field's byte offset is remembered and
     /// flushed as `GC_STORE(ptr, ofs, 0, 8)` at the next can-collect /
     /// flush point.
@@ -4709,7 +4709,7 @@ mod tests {
     #[test]
     fn test_setarrayitem_gc_ref_wb() {
         // make_rewriter() has jit_wb_cards_set = 0 (card marking disabled).
-        // rewrite.py:955-973: without card marking, gen_write_barrier_array
+        // rewrite.py: without card marking, gen_write_barrier_array
         // falls back to gen_write_barrier → COND_CALL_GC_WB.
         // rewrite.py:132 + 1124-1130: non-constant index, itemsize=8 is
         // power-of-2 and not in load_supported_factors=[1] → pre-scale
@@ -4805,7 +4805,7 @@ mod tests {
     /// only thing keeping a minted position off a live input arg.
     /// `OpRef::raw()` folds `InputArgRef(0)` and `IntOp(0)` onto one payload
     /// and the backends key their SSA values by it, so a mark left at 0 hands
-    /// the pre-scale `INT_LSHIFT` (rewrite.py:1127-1131) the array base
+    /// the pre-scale `INT_LSHIFT` (rewrite.py) the array base
     /// pointer's slot and the store loses its base.
     #[test]
     fn test_result_less_trace_reserves_input_arg_positions() {
@@ -4859,7 +4859,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_preserves_incoming_wb_and_adds_its_own() {
-        // rewrite.py:955-973 gen_write_barrier_array does NOT call
+        // rewrite.py gen_write_barrier_array does NOT call
         // remember_wb(), so consecutive SETARRAYITEM_GC with Ref values
         // each emit their own WB. Running the rewriter over a trace that
         // already contains a COND_CALL_GC_WB_ARRAY + SETARRAYITEM pair
@@ -5069,7 +5069,7 @@ mod tests {
     fn test_pending_zero_fully_initialized() {
         // NEW_ARRAY_CLEAR(3) + SET[0] + SET[1] + SET[2] → ZERO_ARRAY emitted
         // with length=0 (RPython rewrite.py:754 "may be ConstInt(0)").
-        // rewrite.py:514-518 consider_setarrayitem_gc requires the index
+        // rewrite.py consider_setarrayitem_gc requires the index
         // to be `ConstInt` (`index_box.is_constant()` / `getint()`); the
         // pyre equivalent is an entry in the constant pool. OpRefs 10/11/12
         // hold the literal indices 0/1/2 so `resolve_constant` returns the
@@ -5431,9 +5431,9 @@ mod tests {
 
     #[test]
     fn test_setarrayitem_gc_after_const_alloc_no_wb() {
-        // rewrite.py:910-911 — gen_malloc_nursery's tail
+        // rewrite.py — gen_malloc_nursery's tail
         // `remember_write_barrier(op)` records the fresh nursery alloc
-        // in wb_applied; rewrite.py:937-938 `if not write_barrier_applied
+        // in wb_applied; rewrite.py `if not write_barrier_applied
         // (val): ...` then short-circuits the WB on the immediate
         // SETARRAYITEM_GC.  Both length=10 (< LARGE) and length=200
         // (>= LARGE) take handle_new_array path #2 (constant-size
@@ -5904,8 +5904,8 @@ mod tests {
     }
 
     // ── gc_table: remove_constptr / gcref dedup / load CSE ──
-    // rewrite.py:106-116 emit_op ConstPtr branch, rewrite.py:1100-1115
-    // remove_constptr, rewrite.py:1033-1043 _gcref_index, rewrite.py:1005
+    // rewrite.py emit_op ConstPtr branch, rewrite.py
+    // remove_constptr, rewrite.py _gcref_index, rewrite.py
     // emit_label CSE reset.
 
     #[test]
@@ -6008,7 +6008,7 @@ mod tests {
 
         let (result, _consts, gcrefs) = rw.rewrite_for_gc_with_constants(&ops, &ConstMap::new());
 
-        // rewrite.py:109 `bool(arg.value)` — a null ConstPtr stays inline.
+        // rewrite.py `bool(arg.value)` — a null ConstPtr stays inline.
         assert!(
             gcrefs.is_empty(),
             "null ConstPtr must not enter the gc_table"

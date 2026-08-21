@@ -68,7 +68,7 @@ pub fn numb_next_item(buf: &[u8], index: usize) -> (i32, usize) {
     decode_varint(buf, index)
 }
 
-/// resumecode.py:70-73 numb_next_n_items — skip `size` items without
+/// resumecode.py numb_next_n_items — skip `size` items without
 /// returning values. Used by decoders that advance over a subsection.
 pub fn numb_next_n_items(buf: &[u8], size: usize, mut index: usize) -> usize {
     for _ in 0..size {
@@ -78,7 +78,7 @@ pub fn numb_next_n_items(buf: &[u8], size: usize, mut index: usize) -> usize {
     index
 }
 
-/// resumecode.py:110-114 create_numbering(l) — module-level helper:
+/// resumecode.py create_numbering(l) — module-level helper:
 /// build a single Writer from the list and return its encoded buffer.
 pub fn create_numbering(items: &[i32]) -> Vec<u8> {
     let mut w = Writer::new(items.len());
@@ -122,7 +122,7 @@ impl Writer {
         self.current.push(item);
     }
 
-    /// resumecode.py:90-93 append_int — `short = rffi.cast(rffi.SHORT, item);
+    /// resumecode.py append_int — `short = rffi.cast(rffi.SHORT, item);
     /// assert rffi.cast(lltype.Signed, short) == item`. The upstream
     /// signature is "any int" (RPython `Signed` ≈ machine word); accepting
     /// `i64` here lets the range check apply to the *original* caller value

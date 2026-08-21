@@ -1,6 +1,6 @@
 //! RPython `rpython/translator/simplify.py` — graph-level transformations
-//! invoked from `RPythonAnnotator.simplify()` (annrpython.py:336-371)
-//! and `simplify_graph` (simplify.py:1075+).
+//! invoked from `RPythonAnnotator.simplify()` (annrpython.py)
+//! and `simplify_graph` (simplify.py+).
 //!
 //! Only the subset reachable from the annotator port lands here
 //! initially; downstream simplification passes arrive with the
@@ -16,7 +16,7 @@ use crate::translator::backendopt::ssa::DataFlowFamilyBuilder;
 use crate::translator::rtyper::lltypesystem::{lloperation, lltype};
 use crate::translator::translator::TranslationContext;
 
-/// RPython `eliminate_empty_blocks(graph)` (simplify.py:52-69).
+/// RPython `eliminate_empty_blocks(graph)` (simplify.py).
 ///
 /// ```python
 /// def eliminate_empty_blocks(graph):
@@ -267,7 +267,7 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
     newexits
 }
 
-/// RPython `CanRemove = {...}` (simplify.py:405-417).
+/// RPython `CanRemove = {...}` (simplify.py).
 ///
 /// ```python
 /// CanRemove = {}
@@ -353,7 +353,7 @@ fn can_remove_opnames() -> &'static HashSet<&'static str> {
     })
 }
 
-/// RPython `CanRemoveBuiltins = {hasattr: True}` (simplify.py:418-420).
+/// RPython `CanRemoveBuiltins = {hasattr: True}` (simplify.py).
 ///
 /// Compared by HostObject identity against `HOST_ENV.lookup_builtin("hasattr")`.
 fn can_remove_builtins() -> Vec<HostObject> {
@@ -364,7 +364,7 @@ fn can_remove_builtins() -> Vec<HostObject> {
     v
 }
 
-/// RPython `get_graph(arg, translator)` (simplify.py:20-33).
+/// RPython `get_graph(arg, translator)` (simplify.py).
 ///
 /// ```python
 /// def get_graph(arg, translator):
@@ -415,7 +415,7 @@ pub fn get_graph(arg: &Hlvalue, translator: &TranslationContext) -> Option<Graph
         .cloned()
 }
 
-/// RPython `op_has_side_effects(op)` (simplify.py:352-353).
+/// RPython `op_has_side_effects(op)` (simplify.py).
 ///
 /// ```python
 /// def op_has_side_effects(op):
@@ -900,7 +900,7 @@ pub fn transform_dead_op_vars_in_blocks(
     }
 }
 
-/// RPython `class Representative` (simplify.py:526-531).
+/// RPython `class Representative` (simplify.py).
 ///
 /// Info payload attached to each UF partition in
 /// `remove_identical_vars_SSA`. Stores the per-partition
@@ -915,7 +915,7 @@ impl crate::tool::algo::unionfind::UnionFindInfo for Representative {
     fn absorb(&mut self, _other: Self) {}
 }
 
-/// RPython `all_equal(lst)` (simplify.py:533-535).
+/// RPython `all_equal(lst)` (simplify.py).
 pub fn all_equal(lst: &[Hlvalue]) -> bool {
     match lst.first() {
         None => true,
@@ -923,7 +923,7 @@ pub fn all_equal(lst: &[Hlvalue]) -> bool {
     }
 }
 
-/// RPython `isspecialvar(v)` (simplify.py:537-538).
+/// RPython `isspecialvar(v)` (simplify.py).
 pub fn isspecialvar(v: &Hlvalue) -> bool {
     match v {
         Hlvalue::Variable(var) => {
@@ -981,7 +981,7 @@ fn renamevariables_hl(block: &BlockRef, mapping: &HashMap<Variable, Hlvalue>) {
     }
 }
 
-/// RPython `remove_identical_vars_SSA(graph)` (simplify.py:540-595).
+/// RPython `remove_identical_vars_SSA(graph)` (simplify.py).
 ///
 /// Upstream variant that uses its own `UnionFind(Representative)`
 /// instead of `DataFlowFamilyBuilder`, inlining the phi-node collapse
@@ -1145,7 +1145,7 @@ fn simplify_phis_inner(
     !to_remove.is_empty()
 }
 
-/// RPython `remove_identical_vars(graph)` (simplify.py:597-653).
+/// RPython `remove_identical_vars(graph)` (simplify.py).
 ///
 /// ```python
 /// def remove_identical_vars(graph):
@@ -1243,7 +1243,7 @@ pub fn remove_identical_vars(graph: &FunctionGraph) {
     }
 }
 
-/// RPython `simplify_exceptions(graph)` (simplify.py:110-170).
+/// RPython `simplify_exceptions(graph)` (simplify.py).
 ///
 /// Collapses the `except Exception:` chain-of-is_/issubtype tests
 /// produced by the flowspace into a single list of `exitcase=cls`
@@ -1477,7 +1477,7 @@ pub fn simplify_exceptions(graph: &FunctionGraph) {
     }
 }
 
-/// RPython `coalesce_bool(graph)` (simplify.py:656-699).
+/// RPython `coalesce_bool(graph)` (simplify.py).
 ///
 /// Collapses the two-step pattern
 /// ```text
@@ -1572,7 +1572,7 @@ pub fn coalesce_bool(graph: &FunctionGraph) {
 }
 
 /// Helper for `coalesce_bool` — mirrors upstream's nested
-/// `has_bool_exitpath(block)` closure (simplify.py:663-677).
+/// `has_bool_exitpath(block)` closure (simplify.py).
 fn has_bool_exitpath(block: &BlockRef) -> Vec<(bool, BlockRef)> {
     let mut tgts: Vec<(bool, BlockRef)> = Vec::new();
     let b = block.borrow();
@@ -1634,7 +1634,7 @@ fn has_bool_exitpath(block: &BlockRef) -> Vec<(bool, BlockRef)> {
     tgts
 }
 
-/// RPython `transform_xxxitem(graph)` (simplify.py:172-186).
+/// RPython `transform_xxxitem(graph)` (simplify.py).
 ///
 /// ```python
 /// def transform_xxxitem(graph):
@@ -1700,7 +1700,7 @@ pub fn transform_xxxitem(graph: &FunctionGraph) {
     }
 }
 
-/// RPython `remove_dead_exceptions(graph)` (simplify.py:189-216).
+/// RPython `remove_dead_exceptions(graph)` (simplify.py).
 ///
 /// ```python
 /// def remove_dead_exceptions(graph):
@@ -1811,7 +1811,7 @@ fn is_exitcase_subclass(cls: &Hlvalue, other: &Hlvalue) -> bool {
     }
 }
 
-/// RPython `remove_assertion_errors(graph)` (simplify.py:321-346).
+/// RPython `remove_assertion_errors(graph)` (simplify.py).
 ///
 /// ```python
 /// def remove_assertion_errors(graph):
@@ -1918,7 +1918,7 @@ pub fn remove_assertion_errors(graph: &FunctionGraph) {
     }
 }
 
-/// RPython `transform_ovfcheck(graph)` (simplify.py:71-108).
+/// RPython `transform_ovfcheck(graph)` (simplify.py).
 ///
 /// Rewrites `simple_call(ovfcheck, result_of_prev_op)` into the
 /// `_ovf` variant of the previous operation. When `ovfcheck` sits at
@@ -2053,7 +2053,7 @@ fn is_stop_iteration_exitcase(exitcase: Option<&Hlvalue>) -> bool {
     )
 }
 
-/// RPython `class DetectorFailed` (simplify.py:788).
+/// RPython `class DetectorFailed` (simplify.py).
 ///
 /// The Rust detector routes failure through `Option`/early returns, but the
 /// upstream exception name is part of the public parity surface for this
@@ -2463,7 +2463,7 @@ impl<'a> ListComprehensionDetector<'a> {
     }
 }
 
-/// RPython `detect_list_comprehension(graph)` (simplify.py:703-780).
+/// RPython `detect_list_comprehension(graph)` (simplify.py).
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -2578,7 +2578,7 @@ pub fn detect_list_comprehension(graph: &FunctionGraph) {
     }
 }
 
-/// RPython `all_passes = [...]` (simplify.py:1060-1073) + `simplify_graph`
+/// RPython `all_passes = [...]` (simplify.py) + `simplify_graph`
 /// (simplify.py:1075-1081).
 ///
 /// `all_passes` upstream is a list of callables; the Rust port uses a
@@ -2611,7 +2611,7 @@ fn ssa_to_ssi_shim(graph: &FunctionGraph) {
     crate::translator::backendopt::ssa::ssa_to_ssi(graph, None);
 }
 
-/// RPython `simplify_graph(graph, passes=True)` (simplify.py:1075-1081).
+/// RPython `simplify_graph(graph, passes=True)` (simplify.py).
 ///
 /// ```python
 /// def simplify_graph(graph, passes=True):
@@ -2630,7 +2630,7 @@ pub fn simplify_graph(graph: &FunctionGraph, passes: Option<&[fn(&FunctionGraph)
     checkgraph(graph);
 }
 
-/// RPython `cleanup_graph(graph)` (simplify.py:1083-1088).
+/// RPython `cleanup_graph(graph)` (simplify.py).
 ///
 /// ```python
 /// def cleanup_graph(graph):
@@ -2648,7 +2648,7 @@ pub fn cleanup_graph(graph: &FunctionGraph) {
     checkgraph(graph);
 }
 
-/// RPython `constfold_exitswitch(graph)` (simplify.py:218-239).
+/// RPython `constfold_exitswitch(graph)` (simplify.py).
 ///
 /// ```python
 /// def constfold_exitswitch(graph):
@@ -2713,7 +2713,7 @@ pub fn constfold_exitswitch(graph: &FunctionGraph) {
     }
 }
 
-/// RPython `remove_trivial_links(graph)` (simplify.py:242-268).
+/// RPython `remove_trivial_links(graph)` (simplify.py).
 ///
 /// ```python
 /// def remove_trivial_links(graph):
@@ -2806,7 +2806,7 @@ pub fn remove_trivial_links(graph: &FunctionGraph) {
     }
 }
 
-/// RPython `join_blocks(graph)` (simplify.py:271-319).
+/// RPython `join_blocks(graph)` (simplify.py).
 ///
 /// ```python
 /// def join_blocks(graph):

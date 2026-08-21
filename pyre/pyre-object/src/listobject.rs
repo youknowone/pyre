@@ -85,11 +85,11 @@ pub enum ListStrategy {
     Object = 0,
     Integer = 1,
     Float = 2,
-    /// listobject.py:1092 EmptyListStrategy — newly created or cleared list
+    /// listobject.py EmptyListStrategy — newly created or cleared list
     /// without any storage yet. First append picks a typed strategy via
     /// switch_to_correct_strategy.
     Empty = 3,
-    /// listobject.py:2193 IntOrFloatListStrategy.  Entries share the
+    /// listobject.py IntOrFloatListStrategy.  Entries share the
     /// `int_items` signed-longlong array: int32 values use RPython's
     /// 0xfffffffe NaN payload and floats keep their raw IEEE-754 bits.
     IntOrFloat = 4,
@@ -212,7 +212,7 @@ impl W_ListObject {
     }
 
     /// Grow `items` to accommodate at least `min_cap` slots. Upstream
-    /// `_ll_list_resize_really` (rlist.py:262-267) — allocate fresh,
+    /// `_ll_list_resize_really` (rlist.py) — allocate fresh,
     /// copy, swap, free.
     unsafe fn object_grow(obj: PyObjectRef, min_cap: usize) -> PyObjectRef {
         let _roots = crate::gc_roots::push_roots();
@@ -251,7 +251,7 @@ impl W_ListObject {
     }
 
     /// Upstream list.append equivalent for the object strategy.
-    /// (listobject.py:1695 `AbstractUnwrappedStrategy.append` for the
+    /// (listobject.py `AbstractUnwrappedStrategy.append` for the
     /// Object case: no unwrap, just append.)
     /// `pub` because the blackhole calls it by address: the #171 fold descends
     /// `w_list_append`, so a guard exit inside that body resumes in its jitcode
@@ -487,7 +487,7 @@ impl W_ListObject {
 /// caller, outside this boundary, so the spare-capacity fold still lowers
 /// it to `setarrayitem` + `set_len`.
 ///
-/// `_ll_list_resize_ge`'s realloc case (rlist.py:285): `value` is pinned
+/// `_ll_list_resize_ge`'s realloc case (rlist.py): `value` is pinned
 /// across the (collecting) grow and read back from its relocated
 /// shadow-stack slot — `grow_list_items_block_gc` may move it during its
 /// collection, so the returned pointer, not the stale argument, is what the
@@ -508,11 +508,11 @@ pub unsafe fn w_list_grow_items_block(obj: PyObjectRef, value: PyObjectRef) -> P
     crate::gc_roots::shadow_stack_get(save + 1)
 }
 
-/// listobject.py:2390-2392 is_plain_int1(w_obj)
+/// listobject.py is_plain_int1(w_obj)
 ///
 /// Accepts exact W_IntObject (not bool, not int subclass) or W_LongObject
 /// whose value fits in a machine-word integer. Shared with
-/// `specialisedtupleobject.py:172-175 makespecialisedtuple2` and the
+/// `specialisedtupleobject.py makespecialisedtuple2` and the
 /// `IntegerListStrategy.is_correct_type` strategy gate
 /// (`listobject.py:1957-1958`).
 #[inline]
@@ -559,7 +559,7 @@ pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     false
 }
 
-/// listobject.py:2394-2398 `plain_int_w(space, w_obj)`. Unwraps a plain
+/// listobject.py `plain_int_w(space, w_obj)`. Unwraps a plain
 /// int value from W_IntObject or W_LongObject. Caller must ensure
 /// `is_plain_int1(item)` returned true (which for `W_LongObject`
 /// implies `_fits_int()`). RPython routes through `w_obj._int_w(space)`
@@ -672,7 +672,7 @@ fn boxed_from_int_or_float(values: &[i64]) -> Vec<PyObjectRef> {
         .collect()
 }
 
-/// listobject.py:2034 IntegerListStrategy.switch_to_int_or_float_strategy.
+/// listobject.py IntegerListStrategy.switch_to_int_or_float_strategy.
 unsafe fn integer_to_int_or_float(list: &mut W_ListObject) -> bool {
     let Some(values) = list
         .int_items
@@ -688,7 +688,7 @@ unsafe fn integer_to_int_or_float(list: &mut W_ListObject) -> bool {
     true
 }
 
-/// listobject.py:2156 FloatListStrategy.switch_to_int_or_float_strategy.
+/// listobject.py FloatListStrategy.switch_to_int_or_float_strategy.
 unsafe fn float_to_int_or_float(list: &mut W_ListObject) -> bool {
     let Some(values) = list
         .float_items
@@ -782,7 +782,7 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
-/// listobject.py:1154-1168 EmptyListStrategy.switch_to_correct_strategy.
+/// listobject.py EmptyListStrategy.switch_to_correct_strategy.
 ///
 /// First append on an empty list picks the typed strategy that matches
 /// the appended item, then installs an empty typed storage. Caller is
@@ -822,7 +822,7 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
 
 /// The strategy `w_list_new` picks for a given item set.
 ///
-/// listobject.py:1092 EmptyListStrategy: a freshly created list with no
+/// listobject.py EmptyListStrategy: a freshly created list with no
 /// items uses Empty until first append picks a typed strategy.
 pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
     if items.is_empty() {
@@ -840,7 +840,7 @@ pub fn list_strategy_for(items: &[PyObjectRef]) -> ListStrategy {
 
 /// Fire the GC write barrier for an Object-strategy list whose `items`
 /// block just gained a possibly-young element. RPython's GC transform
-/// emits `ll_writebarrier` (rgc.py:1196) automatically after a pointer
+/// emits `ll_writebarrier` (rgc.py) automatically after a pointer
 /// store into a structure behind a custom tracer; pyre has no transform
 /// pass, so the barrier runs here by hand. `list_object_custom_trace`
 /// only forwards the off-GC `ItemsBlock` slots when the list is reached by
@@ -1070,7 +1070,7 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         },
         "list items do not support the requested storage strategy",
     );
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`):
     // pin every PyObjectRef in `items` before the GC malloc paths
     // below (`alloc_list_items_block_gc`, the collecting header allocation) so the
     // shadow stack walker sees them if a collection fires inside the
@@ -1257,7 +1257,7 @@ pub unsafe fn w_list_slot_del(obj: PyObjectRef, index: usize) -> bool {
 // negative indices and checks the bound, as `ll_getitem`/`ll_setitem` wrap
 // `ll_getitem_fast`/`ll_setitem_fast` in rlist.py.
 
-/// `ll_length` for the Integer strategy (rlist.py:367 `'list.len(l)'`).
+/// `ll_length` for the Integer strategy (rlist.py `'list.len(l)'`).
 #[majit_macros::oopspec("list.int_len(l)")]
 pub fn ll_list_int_length(l: &W_ListObject) -> usize {
     l.int_items.len()
@@ -1270,7 +1270,7 @@ pub fn ll_list_int_getitem_fast(l: &W_ListObject, index: usize) -> i64 {
     l.int_items.as_slice()[index]
 }
 
-/// `ll_setitem_fast` for the Integer strategy (rlist.py:380
+/// `ll_setitem_fast` for the Integer strategy (rlist.py
 /// `'list.setitem(l, index, item)'`): raw unboxed write at a known-in-bounds
 /// index.
 #[majit_macros::oopspec("list.int_setitem(l, index, item)")]
@@ -1300,13 +1300,13 @@ pub fn ll_list_int_set_len(l: &mut W_ListObject, n: usize) {
 // `GetfieldGcR(float_items.block) → GetarrayitemGcF` / `SetarrayitemGcF` /
 // `GetfieldGcI(float_items.len)` (see float_array.rs).
 
-/// `ll_length` for the Float strategy (rlist.py:367 `'list.len(l)'`).
+/// `ll_length` for the Float strategy (rlist.py `'list.len(l)'`).
 #[majit_macros::oopspec("list.float_len(l)")]
 pub fn ll_list_float_length(l: &W_ListObject) -> usize {
     l.float_items.len()
 }
 
-/// `ll_setitem_fast` for the Float strategy (rlist.py:380
+/// `ll_setitem_fast` for the Float strategy (rlist.py
 /// `'list.setitem(l, index, item)'`): raw unboxed write at a known-in-bounds
 /// index.
 #[majit_macros::oopspec("list.float_setitem(l, index, item)")]
@@ -1388,7 +1388,7 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
-        // listobject.py:1134 EmptyListStrategy.getitem raises IndexError.
+        // listobject.py EmptyListStrategy.getitem raises IndexError.
         ListStrategy::Empty => None,
         ListStrategy::Object => {
             let items = list.object_items_slice();
@@ -1450,7 +1450,7 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
     let value = crate::gc_roots::shadow_stack_get(root_base + 1);
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
-        // listobject.py:1185 EmptyListStrategy.setitem raises IndexError.
+        // listobject.py EmptyListStrategy.setitem raises IndexError.
         ListStrategy::Empty => false,
         ListStrategy::Object => {
             let len = list.length as i64;
@@ -1471,7 +1471,7 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             if idx < 0 || idx >= len {
                 return false;
             }
-            // AbstractUnwrappedStrategy.setitem (listobject.py:1737): plain_int_w (unwrap)
+            // AbstractUnwrappedStrategy.setitem (listobject.py): plain_int_w (unwrap)
             if is_plain_int1(value) {
                 ll_list_int_setitem_fast(list, idx as usize, plain_int_w(value));
                 true
@@ -1616,18 +1616,18 @@ pub unsafe fn w_list_append_preallocated(obj: PyObjectRef, value: PyObjectRef) {
 pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
-        // listobject.py:1170 EmptyListStrategy.append: pick the matching
+        // listobject.py EmptyListStrategy.append: pick the matching
         // typed strategy first, then fall through to its append.
         ListStrategy::Empty => {
             let obj = switch_to_correct_strategy(list, value);
             let value = current_gc_ref(value);
             w_list_append_inner(obj, value);
         }
-        // AbstractUnwrappedStrategy.append (listobject.py:1695):
+        // AbstractUnwrappedStrategy.append (listobject.py):
         //   if self.is_correct_type(w_item): l.append(self.unwrap(w_item)); return
         //   self.switch_to_next_strategy(w_list, w_item); w_list.append(w_item)
         ListStrategy::Object => {
-            // ll_append (rlist.py:588) resize-ge fast case (rlist.py:285):
+            // ll_append (rlist.py) resize-ge fast case (rlist.py):
             // store in place while there is spare capacity (bump the length
             // and write the GC ref); otherwise fall back to the resizing
             // push. The element is a GC pointer, so the in-place store runs
@@ -1647,7 +1647,7 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         }
         ListStrategy::Integer => {
             if is_plain_int1(value) {
-                // ll_append (rtyper/rlist.py:588): length = ll_length();
+                // ll_append (rtyper/rlist.py): length = ll_length();
                 // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
                 // The resize-ge fast case (rlist.py:285) inlines only while
                 // there is spare capacity; bump the length and store in
@@ -1672,14 +1672,14 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
             }
         }
         ListStrategy::Float => {
-            // `FloatListStrategy.is_correct_type` (listobject.py:2061) is
+            // `FloatListStrategy.is_correct_type` (listobject.py) is
             // `type(w_obj) is W_FloatObject` — a strict identity check that
             // rejects float subclasses (which share `ob_type == &FLOAT_TYPE`
             // but overwrite `w_class`), matching the Integer arm's
             // `is_plain_int1`.  A subclass de-specialises to Object storage
             // rather than being stored unboxed (which would lose its identity).
             if is_float_strategy_item(value) {
-                // ll_append (rtyper/rlist.py:588): length = ll_length();
+                // ll_append (rtyper/rlist.py): length = ll_length();
                 // _ll_resize_ge(length+1); ll_setitem_fast(length, item). The
                 // resize-ge fast case (rlist.py:285) inlines only while there
                 // is spare capacity; bump the length and store in place.
@@ -1782,7 +1782,7 @@ pub unsafe fn w_list_int_set_len(obj: PyObjectRef, n: usize) {
 
 /// JIT rollback leaves for IntOrFloatListStrategy's signed-longlong storage.
 /// These mirror the Integer leaves but encode the restored boxed value using
-/// listobject.py:2193 `IntOrFloatListStrategy.unwrap`.
+/// listobject.py `IntOrFloatListStrategy.unwrap`.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -1822,7 +1822,7 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
-        // listobject.py:1131 EmptyListStrategy.length returns 0.
+        // listobject.py EmptyListStrategy.length returns 0.
         ListStrategy::Empty => 0,
         ListStrategy::Object => list.length,
         ListStrategy::Integer => ll_list_int_length(list),
@@ -2061,14 +2061,14 @@ pub unsafe fn w_list_object_items_ptr_len(obj: PyObjectRef) -> Option<(*const Py
     }
 }
 
-/// listobject.py:363-371 _temporarily_as_objects()
+/// listobject.py _temporarily_as_objects()
 ///
 /// Returns wrapped object items without mutating the source list's strategy.
 /// PyPy creates a temporary W_ListObject with ObjectListStrategy; Rust
 /// returns a Vec<PyObjectRef> copy instead.
 unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
     match list.strategy {
-        // listobject.py:1142 EmptyListStrategy.getitems returns [].
+        // listobject.py EmptyListStrategy.getitems returns [].
         ListStrategy::Empty => Vec::new(),
         ListStrategy::Object => list.object_to_vec(),
         ListStrategy::Integer => {
@@ -2105,7 +2105,7 @@ fn normalize_insert_index(index: i64, len: usize) -> usize {
     }
 }
 
-/// listobject.py:1712-1720 IntegerListStrategy.insert
+/// listobject.py IntegerListStrategy.insert
 /// Strategy-preserving: inserts on typed storage when type matches,
 /// switches to Object only when incompatible.
 /// # Safety
@@ -2122,7 +2122,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
     let old_size = list.live_len();
     match list.strategy {
         // EmptyListStrategy doesn't override insert, so it falls through
-        // ListStrategy.insert (listobject.py:983) → switches to typed strategy
+        // ListStrategy.insert (listobject.py) → switches to typed strategy
         // via append. Mirror by switching first then re-dispatching.
         ListStrategy::Empty => {
             switch_to_correct_strategy(list, value);
@@ -2205,7 +2205,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
     }
 }
 
-/// listobject.py:1850-1862 IntegerListStrategy.pop
+/// listobject.py IntegerListStrategy.pop
 /// Strategy-preserving: pops from typed storage, wraps result.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -2220,7 +2220,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let list = &mut *(obj as *mut W_ListObject);
     let old_size = list.live_len();
     let result = match list.strategy {
-        // listobject.py:1180 EmptyListStrategy.pop raises IndexError.
+        // listobject.py EmptyListStrategy.pop raises IndexError.
         ListStrategy::Empty => None,
         ListStrategy::Integer => {
             let len = list.int_items.len() as i64;
@@ -2373,7 +2373,7 @@ pub unsafe fn w_list_int_items_raw(obj: PyObjectRef) -> Option<(*mut i64, usize)
 }
 
 /// The Float-strategy counterpart of [`w_list_int_items_raw`]
-/// (`FloatListStrategy.sort`, listobject.py:2067).
+/// (`FloatListStrategy.sort`, listobject.py).
 ///
 /// # Safety
 /// As [`w_list_int_items_raw`].
@@ -2386,8 +2386,8 @@ pub unsafe fn w_list_float_items_raw(obj: PyObjectRef) -> Option<(*mut f64, usiz
     Some((items.as_mut_ptr(), items.len()))
 }
 
-/// listobject.py:2234 IntOrFloatListStrategy.sort and
-/// listobject.py:2449 IntOrFloatSort.lt.  Unlike the homogeneous raw-array
+/// listobject.py IntOrFloatListStrategy.sort and
+/// listobject.py IntOrFloatSort.lt.  Unlike the homogeneous raw-array
 /// accessors above, the encoded `i64` values must be ordered after decoding.
 /// Reverse follows PyPy's reverse/stable-sort/reverse sequence so equal
 /// int/float values retain reverse-sort stability.
@@ -2416,7 +2416,7 @@ pub unsafe fn w_list_sort_int_or_float(obj: PyObjectRef, reverse: bool) -> bool 
 
 /// Whether the list still holds the EmptyListStrategy.
 ///
-/// `descr_sort` (listobject.py:873) uses this to tell whether the user mucked
+/// `descr_sort` (listobject.py) uses this to tell whether the user mucked
 /// with the receiver while it was emptied for the sort: any mutation switches
 /// the list off the Empty strategy and a list never switches back, so an
 /// append followed by a pop is caught even though the length is 0 again.
@@ -2427,9 +2427,9 @@ pub unsafe fn w_list_is_empty_strategy(obj: PyObjectRef) -> bool {
     (*(obj as *const W_ListObject)).strategy == ListStrategy::Empty
 }
 
-/// listobject.py:52 `W_ListObject.__init__` applied to an existing list:
+/// listobject.py `W_ListObject.__init__` applied to an existing list:
 /// re-pick the strategy for `items` and install fresh storage, dropping
-/// whatever the list held.  This is how `descr_sort` (listobject.py:879) puts
+/// whatever the list held.  This is how `descr_sort` (listobject.py) puts
 /// the sorted items back — one bulk install, not an append loop, so the
 /// storage is sized once and the strategy is decided from the whole item set.
 ///
@@ -2487,7 +2487,7 @@ pub unsafe fn w_list_init_items(obj: PyObjectRef, items: Vec<PyObjectRef>) {
     }
 }
 
-/// listobject.py:391 W_ListObject.clear — switches to EmptyListStrategy.
+/// listobject.py W_ListObject.clear — switches to EmptyListStrategy.
 ///
 /// Drops any typed storage and resets the list to the EmptyListStrategy
 /// state, exactly like PyPy. The next append will pick a fresh typed
@@ -2518,7 +2518,7 @@ pub unsafe fn w_list_clear(obj: PyObjectRef) {
     list.allocated = 0;
 }
 
-/// listobject.py:1154-1168 EmptyListStrategy.switch_to_correct_strategy —
+/// listobject.py EmptyListStrategy.switch_to_correct_strategy —
 /// public entry for the JIT's empty-append promotion. Installs empty typed
 /// storage (capacity-1 block, length 0) matching `value`'s type, WITHOUT
 /// appending. The caller performs the append afterward (the typed spare-
@@ -2531,7 +2531,7 @@ pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef
     switch_to_correct_strategy(list, value);
 }
 
-/// listobject.py:1873-1874 IntegerListStrategy.reverse
+/// listobject.py IntegerListStrategy.reverse
 /// Strategy-preserving: reverses typed storage in place.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -2549,7 +2549,7 @@ pub unsafe fn w_list_reverse(obj: PyObjectRef) {
     }
 }
 
-/// listobject.py:1814-1844 deleteslice (step=1 simple case)
+/// listobject.py deleteslice (step=1 simple case)
 /// Strategy-preserving: drains from typed storage.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -2559,7 +2559,7 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     let old_size = list.live_len();
     let mut changed = false;
     match list.strategy {
-        // listobject.py:1177 EmptyListStrategy.deleteslice is a no-op (pass).
+        // listobject.py EmptyListStrategy.deleteslice is a no-op (pass).
         ListStrategy::Empty => {}
         ListStrategy::Integer => {
             let len = list.int_items.len();
@@ -2603,7 +2603,7 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
     }
 }
 
-/// listobject.py:1613-1631 IntegerListStrategy._safe_find_or_count
+/// listobject.py IntegerListStrategy._safe_find_or_count
 /// Fast path for integer lists: unwrapped comparison.
 unsafe fn int_find(items: &[i64], value: i64) -> Option<usize> {
     items.iter().position(|&v| v == value)
@@ -2629,7 +2629,7 @@ fn int_eq_float(ival: i64, fval: f64) -> bool {
 
 /// Outcome of `W_ListObject.find_or_count` fast path. Mirrors the
 /// short-circuit return in `IntegerListStrategy.find_or_count`
-/// (listobject.py:1613) and `FloatListStrategy.find_or_count` — when the
+/// (listobject.py) and `FloatListStrategy.find_or_count` — when the
 /// strategy + needle type match, the typed pool is scanned in place.
 /// Otherwise `NeedsGeneric` signals that the caller (pyre-interpreter)
 /// must run `ListStrategy.find_or_count`'s generic `space.eq_w` loop.
@@ -2645,8 +2645,8 @@ pub enum ListFindFast {
 }
 
 /// Typed fast-path for `W_ListObject.find_or_count`. Handles
-/// `IntegerListStrategy.find_or_count` (listobject.py:1613) and
-/// `FloatListStrategy.find_or_count` (listobject.py:1928) fast paths
+/// `IntegerListStrategy.find_or_count` (listobject.py) and
+/// `FloatListStrategy.find_or_count` (listobject.py) fast paths
 /// only. Callers must handle `NeedsGeneric` via the interpreter-level
 /// `ListStrategy.find_or_count` which runs the `space.eq_w` loop.
 /// # Safety
@@ -2661,7 +2661,7 @@ pub unsafe fn w_list_find_or_count_fast(
 ) -> ListFindFast {
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
-        // listobject.py:1126 EmptyListStrategy.find_or_count: returns
+        // listobject.py EmptyListStrategy.find_or_count: returns
         // `0` in count mode and raises ValueError otherwise. Map the
         // ValueError to NotFound for the find case.
         ListStrategy::Empty => {
@@ -2671,7 +2671,7 @@ pub unsafe fn w_list_find_or_count_fast(
                 ListFindFast::NotFound
             }
         }
-        // listobject.py:1613 IntegerListStrategy.find_or_count: fast path
+        // listobject.py IntegerListStrategy.find_or_count: fast path
         // when `is_plain_int1(w_obj)`, else fall back to generic.
         ListStrategy::Integer if is_plain_int1(w_item) => {
             let target = if is_int(w_item) {
@@ -2699,7 +2699,7 @@ pub unsafe fn w_list_find_or_count_fast(
                 ListFindFast::NotFound
             }
         }
-        // listobject.py:1928 FloatListStrategy.find_or_count → base.
+        // listobject.py FloatListStrategy.find_or_count → base.
         ListStrategy::Float if is_float_strategy_item(w_item) => {
             let target = w_float_get_value(w_item);
             let items = list.float_items.as_slice();
@@ -2732,7 +2732,7 @@ pub unsafe fn w_list_find_or_count_fast(
                 ListFindFast::NotFound
             }
         }
-        // listobject.py:2280 IntOrFloatListStrategy._safe_find_or_count:
+        // listobject.py IntOrFloatListStrategy._safe_find_or_count:
         // compare raw longlongs first (same NaN payload), then decoded
         // numeric values (0 == -0.0 and 42 == 42.0).
         ListStrategy::IntOrFloat => {
@@ -2765,7 +2765,7 @@ pub unsafe fn w_list_find_or_count_fast(
     }
 }
 
-/// listobject.py:1746-1758 setslice — strategy-preserving.
+/// listobject.py setslice — strategy-preserving.
 ///
 /// When replacement is a list with the same strategy, operates on typed
 /// storage directly. Otherwise falls back to Object strategy.
@@ -2815,7 +2815,7 @@ unsafe fn w_list_setslice_inner(
     let end = end.max(start);
     if is_list(w_other) {
         let other = &*(w_other as *const W_ListObject);
-        // listobject.py:1188 EmptyListStrategy.setslice: adopt donor's
+        // listobject.py EmptyListStrategy.setslice: adopt donor's
         // strategy and storage wholesale. start/end are 0 because list
         // is empty, so this is just "become a copy of w_other".
         if list.strategy == ListStrategy::Empty {
@@ -2849,7 +2849,7 @@ unsafe fn w_list_setslice_inner(
                 }
             }
         }
-        // listobject.py:1998/2013 IntegerListStrategy and :2096/2110
+        // listobject.py/2013 IntegerListStrategy and :2096/2110
         // FloatListStrategy first generalize themselves when the donor is a
         // compatible numeric strategy, then re-dispatch the same setslice.
         if list.strategy == ListStrategy::Integer
@@ -2870,7 +2870,7 @@ unsafe fn w_list_setslice_inner(
         {
             return w_list_setslice_inner(obj, start, end, w_other);
         }
-        // listobject.py:2254 IntOrFloatListStrategy.setslice converts an
+        // listobject.py IntOrFloatListStrategy.setslice converts an
         // Integer/Float donor to temporary signed-longlong storage without
         // de-specialising the receiver.
         if list.strategy == ListStrategy::IntOrFloat
@@ -2898,7 +2898,7 @@ unsafe fn w_list_setslice_inner(
                 return Ok(());
             }
         }
-        // listobject.py:1752: not self.list_is_correct_type(w_other) and w_other.length() != 0
+        // listobject.py: not self.list_is_correct_type(w_other) and w_other.length() != 0
         // Only switch strategy when donor is non-empty AND has different type.
         // Empty donor → pure deletion, strategy preserved.
         let other_len = w_list_len(w_other);
@@ -3422,7 +3422,7 @@ mod tests {
 
     #[test]
     fn test_int_list_pop_stays_integer_strategy() {
-        // AbstractUnwrappedStrategy.pop (listobject.py:1855)
+        // AbstractUnwrappedStrategy.pop (listobject.py)
         let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
@@ -3446,7 +3446,7 @@ mod tests {
 
     #[test]
     fn test_int_list_pop_end_stays_integer_strategy() {
-        // AbstractUnwrappedStrategy.pop_end (listobject.py:1848)
+        // AbstractUnwrappedStrategy.pop_end (listobject.py)
         let list = w_list_new(vec![w_int_new(10), w_int_new(20)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
@@ -3462,7 +3462,7 @@ mod tests {
 
     #[test]
     fn test_int_list_insert_stays_integer_strategy() {
-        // AbstractUnwrappedStrategy.insert (listobject.py:1714)
+        // AbstractUnwrappedStrategy.insert (listobject.py)
         let list = w_list_new(vec![w_int_new(1), w_int_new(3)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
@@ -3481,7 +3481,7 @@ mod tests {
 
     #[test]
     fn test_int_list_insert_float_switches_to_int_or_float() {
-        // AbstractUnwrappedStrategy.switch_to_next_strategy (listobject.py:1720)
+        // AbstractUnwrappedStrategy.switch_to_next_strategy (listobject.py)
         let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
         let fv = crate::floatobject::w_float_new(9.0);
         unsafe {
@@ -3494,7 +3494,7 @@ mod tests {
 
     #[test]
     fn test_int_list_reverse_stays_integer_strategy() {
-        // AbstractUnwrappedStrategy.reverse (listobject.py:1880)
+        // AbstractUnwrappedStrategy.reverse (listobject.py)
         let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
@@ -3516,7 +3516,7 @@ mod tests {
 
     #[test]
     fn test_new_empty_uses_empty_strategy() {
-        // listobject.py:1092 fresh empty list uses EmptyListStrategy.
+        // listobject.py fresh empty list uses EmptyListStrategy.
         let list = w_list_new(Vec::new());
         unsafe {
             assert!(w_list_uses_empty_storage(list));
@@ -3526,7 +3526,7 @@ mod tests {
 
     #[test]
     fn test_clear_resets_to_empty_strategy() {
-        // listobject.py:391 W_ListObject.clear → EmptyListStrategy.
+        // listobject.py W_ListObject.clear → EmptyListStrategy.
         let list = w_list_new(vec![w_int_new(1), w_int_new(2)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
@@ -3541,7 +3541,7 @@ mod tests {
 
     #[test]
     fn test_empty_first_int_append_switches_to_int_strategy() {
-        // listobject.py:1170 EmptyListStrategy.append picks the typed strategy
+        // listobject.py EmptyListStrategy.append picks the typed strategy
         // matching the first item.
         let list = w_list_new(Vec::new());
         unsafe {
@@ -3569,7 +3569,7 @@ mod tests {
 
     #[test]
     fn test_int_list_delslice_stays_integer_strategy() {
-        // AbstractUnwrappedStrategy.deleteslice (listobject.py:1815)
+        // AbstractUnwrappedStrategy.deleteslice (listobject.py)
         let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3), w_int_new(4)]);
         unsafe {
             assert!(w_list_uses_int_storage(list));
@@ -3592,7 +3592,7 @@ mod tests {
 
     #[test]
     fn test_float_list_pop_stays_float_strategy() {
-        // AbstractUnwrappedStrategy.pop (listobject.py:1855)
+        // AbstractUnwrappedStrategy.pop (listobject.py)
         let list = w_list_new(vec![
             crate::floatobject::w_float_new(1.0),
             crate::floatobject::w_float_new(2.0),
@@ -3612,7 +3612,7 @@ mod tests {
 
     #[test]
     fn test_float_list_reverse_stays_float_strategy() {
-        // AbstractUnwrappedStrategy.reverse (listobject.py:1880)
+        // AbstractUnwrappedStrategy.reverse (listobject.py)
         let list = w_list_new(vec![
             crate::floatobject::w_float_new(1.0),
             crate::floatobject::w_float_new(2.0),

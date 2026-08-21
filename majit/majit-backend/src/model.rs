@@ -1,8 +1,8 @@
 //! Backend CPU abstraction per `rpython/jit/backend/model.py`.
 //!
-//! RPython's `AbstractCPU` (model.py:39+) hosts the services every
+//! RPython's `AbstractCPU` (model.py+) hosts the services every
 //! `Optimization` sub-class reaches via `self.optimizer.cpu.<method>()`:
-//! `cls_of_box(box)` (model.py:199-201), `bh_*` runtime calls
+//! `cls_of_box(box)` (model.py), `bh_*` runtime calls
 //! (model.py:209+), GC type-info accessors, and so on.  Pyre currently
 //! exposes only `cls_of_box` here; future expansion ports the rest of
 //! the AbstractCPU surface onto the same trait so the carrier chain
@@ -17,10 +17,10 @@ use majit_ir::{ArrayDescr, FieldDescr, GcRef, Value};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpeculativeError;
 
-/// `model.py:39 AbstractCPU` (subset) — services hosted on
+/// `model.py AbstractCPU` (subset) — services hosted on
 /// `optimizer.cpu` and reached from any `Optimization` sub-class.
 pub trait Cpu: Send + Sync {
-    /// `model.py:199-201 cpu.cls_of_box(box)`:
+    /// `model.py cpu.cls_of_box(box)`:
     ///
     /// ```python
     /// def cls_of_box(self, box):
@@ -36,7 +36,7 @@ pub trait Cpu: Send + Sync {
     /// override this method to consult the GC header instead.
     fn cls_of_box(&self, box_: &Operand) -> i64;
 
-    /// `model.py:199-201 cpu.cls_of_box` lowered to the raw `getref_base`
+    /// `model.py cpu.cls_of_box` lowered to the raw `getref_base`
     /// payload — the `lltype.cast_opaque_ptr(OBJECTPTR, base).typeptr`
     /// step.  Callers that already hold a `GcRef` (e.g. `ConstPtrInfo`
     /// which stores the const ref directly) reach the typeptr read
@@ -44,8 +44,8 @@ pub trait Cpu: Send + Sync {
     /// const operand.  The default `cls_of_box` delegates here.
     fn cls_of_gcref(&self, gcref: GcRef) -> i64;
 
-    /// `model.py:209+ cpu.bh_getfield_gc_i / _r / _f`:
-    /// `llmodel.py:467-478 read_int_at_mem / read_ref_at_mem / read_float_at_mem`.
+    /// `model.py+ cpu.bh_getfield_gc_i / _r / _f`:
+    /// `llmodel.py read_int_at_mem / read_ref_at_mem / read_float_at_mem`.
     /// Read the field at `struct_ptr + fielddescr.offset()` honoring
     /// `field_size` + `is_field_signed`. The pure-getfield constant
     /// folder (`executor::execute_nonspec_const`) calls these after
@@ -55,7 +55,7 @@ pub trait Cpu: Send + Sync {
     fn bh_getfield_gc_r(&self, struct_ptr: usize, fielddescr: &dyn FieldDescr) -> GcRef;
     fn bh_getfield_gc_f(&self, struct_ptr: usize, fielddescr: &dyn FieldDescr) -> f64;
 
-    /// `llmodel.py:555-567 protect_speculative_field`. Line-by-line:
+    /// `llmodel.py protect_speculative_field`. Line-by-line:
     ///
     /// ```python
     /// def protect_speculative_field(self, gcptr, fielddescr):
@@ -73,7 +73,7 @@ pub trait Cpu: Send + Sync {
     ///                 raise SpeculativeError
     /// ```
     ///
-    /// `is_valid_class_for(gcptr)` (`descr.py:217-229`) compares the
+    /// `is_valid_class_for(gcptr)` (`descr.py`) compares the
     /// runtime typeptr's `subclassrange_min` against the descr's
     /// vtable's `[subclassrange_min, subclassrange_max]` inclusive
     /// interval.  Pyre routes both lookups through
@@ -112,7 +112,7 @@ pub trait Cpu: Send + Sync {
             if !majit_gc::check_is_object(gcptr) {
                 return Err("protect_speculative_field: gcptr is not an object");
             }
-            // descr.py:217-229 is_valid_class_for — subclassrange
+            // descr.py is_valid_class_for — subclassrange
             // containment of gcref's typeptr inside sizedescr.vtable's
             // range.
             let (expected_min, expected_max) = majit_gc::subclass_range(sizedescr.vtable())
@@ -136,7 +136,7 @@ pub trait Cpu: Send + Sync {
         Ok(())
     }
 
-    /// `llmodel.py:569-575 protect_speculative_array`. Line-by-line:
+    /// `llmodel.py protect_speculative_array`. Line-by-line:
     ///
     /// ```python
     /// def protect_speculative_array(self, gcptr, arraydescr):
@@ -171,7 +171,7 @@ pub trait Cpu: Send + Sync {
         Ok(())
     }
 
-    /// `llmodel.py:577-578 protect_speculative_string`:
+    /// `llmodel.py protect_speculative_string`:
     ///
     /// ```python
     /// def protect_speculative_string(self, gcptr):
@@ -201,7 +201,7 @@ pub trait Cpu: Send + Sync {
         }
     }
 
-    /// `llmodel.py:580-581 protect_speculative_unicode`.  Mirror of
+    /// `llmodel.py protect_speculative_unicode`.  Mirror of
     /// `protect_speculative_string` for unicode storage; routes
     /// through `unicode_descr()` when registered.
     fn protect_speculative_unicode(&self, gcptr: GcRef) -> Result<(), SpeculativeError> {
@@ -241,8 +241,8 @@ pub trait Cpu: Send + Sync {
         None
     }
 
-    /// `model.py:209+ cpu.bh_arraylen_gc` /
-    /// `llmodel.py:585-588 read_int_at_mem(array, lendescr.offset, WORD, 1)`.
+    /// `model.py+ cpu.bh_arraylen_gc` /
+    /// `llmodel.py read_int_at_mem(array, lendescr.offset, WORD, 1)`.
     /// Default impl reads i64 at `arraydescr.len_descr().offset()`.
     /// Returns `None` when no `len_descr` is registered (matches the
     /// `assert isinstance(arraydescr, ArrayDescr)` failure mode upstream
@@ -259,8 +259,8 @@ pub trait Cpu: Send + Sync {
         Some(unsafe { *(addr as *const usize) as i64 })
     }
 
-    /// `model.py:209+ cpu.bh_strlen` /
-    /// `llmodel.py:594-595 read_int_at_mem(string, str_descr.lendescr.offset, WORD, 1)`.
+    /// `model.py+ cpu.bh_strlen` /
+    /// `llmodel.py read_int_at_mem(string, str_descr.lendescr.offset, WORD, 1)`.
     /// Routes through `str_descr()` → `bh_arraylen_gc` so any backend
     /// that registered a typed string layout reaches the same length
     /// read as the rest of the array family.  Backends without a
@@ -277,8 +277,8 @@ pub trait Cpu: Send + Sync {
         self.bh_arraylen_gc(unicode, descr)
     }
 
-    /// `model.py:209+ cpu.bh_strgetitem` /
-    /// `llmodel.py:609-612 read_int_at_mem(string, basesize + index, 1, 0)`.
+    /// `model.py+ cpu.bh_strgetitem` /
+    /// `llmodel.py read_int_at_mem(string, basesize + index, 1, 0)`.
     /// Routes through `str_descr()` → `bh_getarrayitem_gc_i` so any
     /// backend that registered a typed string layout reaches the same
     /// per-character read as the rest of the array family.  Backends
@@ -299,8 +299,8 @@ pub trait Cpu: Send + Sync {
         self.bh_getarrayitem_gc_i(unicode, index, descr)
     }
 
-    /// `model.py:209+ cpu.bh_getarrayitem_gc_i` /
-    /// `llmodel.py:591-594 read_int_at_mem(gcref, ofs + index * size, size, sign)`.
+    /// `model.py+ cpu.bh_getarrayitem_gc_i` /
+    /// `llmodel.py read_int_at_mem(gcref, ofs + index * size, size, sign)`.
     /// Default impl reads the int item at
     /// `array + ad.base_size() + index * ad.item_size()`, dispatching on
     /// `item_size` × `is_item_signed`.  `index` is assumed to be in
@@ -323,15 +323,15 @@ pub trait Cpu: Send + Sync {
         }
     }
 
-    /// `model.py:209+ cpu.bh_getarrayitem_gc_r` /
-    /// `llmodel.py:596-598 read_ref_at_mem(gcref, index * WORD + ofs)`.
+    /// `model.py+ cpu.bh_getarrayitem_gc_r` /
+    /// `llmodel.py read_ref_at_mem(gcref, index * WORD + ofs)`.
     fn bh_getarrayitem_gc_r(&self, array: GcRef, index: i64, ad: &dyn ArrayDescr) -> GcRef {
         let addr = array.0 + ad.base_size() + (index as usize) * ad.item_size();
         GcRef(unsafe { *(addr as *const usize) })
     }
 
-    /// `model.py:209+ cpu.bh_getarrayitem_gc_f` /
-    /// `llmodel.py:600-604 read_float_at_mem(gcref, index * FLOATSTORAGE + ofs)`.
+    /// `model.py+ cpu.bh_getarrayitem_gc_f` /
+    /// `llmodel.py read_float_at_mem(gcref, index * FLOATSTORAGE + ofs)`.
     fn bh_getarrayitem_gc_f(&self, array: GcRef, index: i64, ad: &dyn ArrayDescr) -> f64 {
         let addr = array.0 + ad.base_size() + (index as usize) * ad.item_size();
         let bits = unsafe { *(addr as *const u64) };
@@ -340,7 +340,7 @@ pub trait Cpu: Send + Sync {
 }
 
 /// Default `Cpu` implementing `cls_of_box` against the lltype-typeptr-
-/// at-offset-0 layout (model.py:199-201).  Production paths that did
+/// at-offset-0 layout (model.py).  Production paths that did
 /// not install a custom backend hook fall through to this.
 pub struct DefaultCpu;
 
@@ -369,12 +369,12 @@ impl Cpu for DefaultCpu {
         }
         // SAFETY: caller has guaranteed `gcref` is a valid OBJECTPTR
         // payload pointer; the lltype OBJECTPTR layout has the typeptr
-        // at offset 0 (model.py:200 `box.getref_base().typeptr`).
+        // at offset 0 (model.py `box.getref_base().typeptr`).
         unsafe { *(gcref.0 as *const usize) as i64 }
     }
 
     fn bh_getfield_gc_i(&self, struct_ptr: usize, fd: &dyn FieldDescr) -> i64 {
-        // llmodel.py:467-478 read_int_at_mem signed/unsigned width
+        // llmodel.py read_int_at_mem signed/unsigned width
         // dispatch. RPython's loop falls through to `else: raise
         // NotImplementedError("size = %d" % size)` when no `itemsize`
         // matches; mirror that with a panic. Callers that may receive
@@ -452,7 +452,7 @@ pub fn cpu_from_cls_of_box_fn(f: fn(i64) -> i64) -> Arc<dyn Cpu> {
 }
 
 /// `Arc<dyn Cpu>` to the default lltype backend, for production paths
-/// + tests that want the model.py:199-201 typeptr-at-offset-0 read.
+/// + tests that want the model.py typeptr-at-offset-0 read.
 pub fn default_cpu() -> Arc<dyn Cpu> {
     Arc::new(DefaultCpu)
 }

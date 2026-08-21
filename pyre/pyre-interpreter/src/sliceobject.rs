@@ -6,7 +6,7 @@
 
 use pyre_object::{PyObjectRef, pyobject::is_none};
 
-/// sliceobject.py:221 `_eval_slice_index(space, w_int)`.
+/// sliceobject.py `_eval_slice_index(space, w_int)`.
 ///
 /// Returns `w_int.__index__()` as an `i64`, converting to `TypeError`
 /// when the object has no `__index__` method.
@@ -28,7 +28,7 @@ pub(crate) fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError
     }
 }
 
-/// sliceobject.py:233 `adapt_lower_bound(space, size, w_index)`.
+/// sliceobject.py `adapt_lower_bound(space, size, w_index)`.
 ///
 /// Converts `w_index` via `__index__`, normalizes negatives against
 /// `size`, and clamps at zero.
@@ -81,7 +81,7 @@ fn adapt_bound(size: i64, index: i64) -> i64 {
     index.saturating_add(size).max(0)
 }
 
-/// sliceobject.py:242 `unwrap_start_stop(space, size, w_start, w_end)`.
+/// sliceobject.py `unwrap_start_stop(space, size, w_start, w_end)`.
 ///
 /// Returns `(start, end)` after negative-index normalization. `None`
 /// maps to `(0, size)`.
@@ -104,7 +104,7 @@ pub fn unwrap_start_stop(
     Ok((start, end))
 }
 
-/// sliceobject.py:130 `W_SliceObject.unpack(space)`.
+/// sliceobject.py `W_SliceObject.unpack(space)`.
 ///
 /// Evaluates `start`/`stop`/`step` through `__index__` **without** reading
 /// the container length: an `__index__` method may mutate the container, so
@@ -152,7 +152,7 @@ pub(crate) fn slice_unpack(
     Ok((start, stop, step))
 }
 
-/// sliceobject.py:139 `W_SliceObject.adjust_indices(start, stop, step, length)`.
+/// sliceobject.py `W_SliceObject.adjust_indices(start, stop, step, length)`.
 ///
 /// Pure arithmetic: clamps the unpacked `(start, stop, step)` against
 /// `length`, clipping out-of-bounds endpoints consistently with
@@ -190,7 +190,7 @@ pub(crate) fn slice_adjust_indices(
     (start, stop, step, slicelength)
 }
 
-/// sliceobject.py:170 `W_SliceObject.indices3(space, length)`.
+/// sliceobject.py `W_SliceObject.indices3(space, length)`.
 ///
 /// Computes the `(start, stop, step)` triple for a slice over a sequence
 /// of `length` items — [`slice_unpack`] then [`slice_adjust_indices`]. A

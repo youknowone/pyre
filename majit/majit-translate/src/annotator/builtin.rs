@@ -135,7 +135,7 @@ pub(crate) fn arg_at<'a>(
 
 /// Process-wide `BUILTIN_ANALYZERS` table, lazily populated on first
 /// access by [`register_builtins`]. Mirrors upstream's module-level
-/// `BUILTIN_ANALYZERS = {}` dict (bookkeeper.py:32).
+/// `BUILTIN_ANALYZERS = {}` dict (bookkeeper.py).
 static BUILTIN_ANALYZERS: OnceLock<HashMap<String, BuiltinAnalyzer>> = OnceLock::new();
 
 /// Lazy accessor for the analyser table. Calls [`register_builtins`]
@@ -234,7 +234,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     use super::bookkeeper::analyzer_for;
 
     let mut reg: HashMap<String, BuiltinAnalyzer> = HashMap::new();
-    // builtin.py:49-84 — `builtin_range` + `builtin_xrange` alias.
+    // builtin.py — `builtin_range` + `builtin_xrange` alias.
     analyzer_for(&mut reg, "range", builtin_range);
     analyzer_for(&mut reg, "xrange", builtin_range);
     // builtin.py:89-99 — enumerate / reversed.
@@ -287,7 +287,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // semantics.
     analyzer_for(&mut reg, "rarithmetic.intmask", rarith_intmask);
     analyzer_for(&mut reg, "rarithmetic.longlongmask", rarith_longlongmask);
-    // `lltype.cast_pointer` (ann_cast_pointer, lltype.py:970-974) —
+    // `lltype.cast_pointer` (ann_cast_pointer, lltype.py) —
     // keyed under the `HostObject::new_builtin_callable` qualname the
     // lltype HOST_ENV module assigns (`flowspace/model.rs`'s
     // `bootstrap_std_modules`).
@@ -412,12 +412,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "Wtf8Buf.new", string_constructor);
     analyzer_for(&mut reg, "Wtf8Buf.with_capacity", string_constructor);
     // `rarithmetic.r_uint` is routed via
-    // `ExtRegistryEntry::ForType` (rarithmetic.py:572-582 `ForTypeEntry`):
+    // `ExtRegistryEntry::ForType` (rarithmetic.py `ForTypeEntry`):
     // bookkeeper's BUILTIN_ANALYZERS miss falls through to
     // `extregistry.lookup`, which returns the SomeBuiltin whose
     // `compute_result_annotation` produces
     // `SomeInteger(knowntype=Ruint, unsigned=True)`.
-    // lltype.py:2367-2382 — `@analyzer_for(cast_ptr_to_int)` and
+    // lltype.py — `@analyzer_for(cast_ptr_to_int)` and
     // `@analyzer_for(cast_int_to_ptr)`.  `front::mir` lowers a
     // `Ref ↔ Int` cast to a `simple_call` against the matching
     // `lltype.*` HostObject, so the annotation pass routes through these
@@ -477,7 +477,7 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// Upstream `constpropagate(func, args_s, s_result)` (builtin.py:22-45).
+/// Upstream `constpropagate(func, args_s, s_result)` (builtin.py).
 ///
 /// ```python
 /// def constpropagate(func, args_s, s_result):
@@ -557,7 +557,7 @@ fn is_str_annotation(s: &SomeValue) -> bool {
 // `builtin_*` analysers (mass-registered via the `builtin_` prefix scan).
 // ---------------------------------------------------------------------------
 
-/// Upstream `builtin_range(*args)` (builtin.py:49-84).
+/// Upstream `builtin_range(*args)` (builtin.py).
 pub fn builtin_range(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -652,7 +652,7 @@ pub fn builtin_range(
     Ok(SomeValue::List(s_list))
 }
 
-/// Upstream `builtin_enumerate(s_obj, s_start=None)` (builtin.py:89-95).
+/// Upstream `builtin_enumerate(s_obj, s_start=None)` (builtin.py).
 pub fn builtin_enumerate(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -701,7 +701,7 @@ pub fn builtin_enumerate(
     )))
 }
 
-/// Upstream `builtin_reversed(s_obj)` (builtin.py:98-99).
+/// Upstream `builtin_reversed(s_obj)` (builtin.py).
 pub fn builtin_reversed(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -717,7 +717,7 @@ pub fn builtin_reversed(
     )))
 }
 
-/// Upstream `builtin_bool(s_obj)` (builtin.py:102-103).
+/// Upstream `builtin_bool(s_obj)` (builtin.py).
 ///
 /// Upstream dispatches `s_obj.bool()` which is registered per-`Some*`
 /// in `unaryop.py`. The annotator-phase subset used by `builtin_bool`
@@ -744,7 +744,7 @@ pub fn builtin_bool(
     let s_obj = arg_at(args_s, 0, "builtin_bool");
     let mut r = SomeBool::new();
 
-    // upstream `SomeTuple.bool` (unaryop.py:347-351): empty tuple is
+    // upstream `SomeTuple.bool` (unaryop.py): empty tuple is
     // always falsy.
     if let SomeValue::Tuple(t) = s_obj
         && t.items.is_empty()
@@ -799,7 +799,7 @@ pub fn builtin_bool(
     Ok(SomeValue::Bool(r))
 }
 
-/// Upstream `builtin_int(s_obj, s_base=None)` (builtin.py:105-115).
+/// Upstream `builtin_int(s_obj, s_base=None)` (builtin.py).
 pub fn builtin_int(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -890,7 +890,7 @@ pub fn builtin_int(
     })
 }
 
-/// Upstream `builtin_float(s_obj)` (builtin.py:117-118).
+/// Upstream `builtin_float(s_obj)` (builtin.py).
 pub fn builtin_float(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -917,7 +917,7 @@ pub fn builtin_float(
     )
 }
 
-/// Upstream `builtin_chr(s_int)` (builtin.py:120-121).
+/// Upstream `builtin_chr(s_int)` (builtin.py).
 pub fn builtin_chr(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -944,7 +944,7 @@ pub fn builtin_chr(
     )
 }
 
-/// Upstream `builtin_unichr(s_int)` (builtin.py:123-124).
+/// Upstream `builtin_unichr(s_int)` (builtin.py).
 ///
 /// Fold the constant case directly, mirroring upstream
 /// `constpropagate(unichr, ...)` semantics while pinning the result's
@@ -971,7 +971,7 @@ pub fn builtin_unichr(
     Ok(SomeValue::UnicodeCodePoint(result))
 }
 
-/// Upstream `builtin_unicode(s_unicode)` (builtin.py:126-127).
+/// Upstream `builtin_unicode(s_unicode)` (builtin.py).
 ///
 /// Mirrors upstream `unicode(x)` while preserving the explicit
 /// `ConstValue::UniStr` type tag.
@@ -995,14 +995,14 @@ pub fn builtin_unicode(
     Ok(SomeValue::UnicodeString(result))
 }
 
-/// Upstream `builtin_bytearray(s_str)` (builtin.py:129-130).
+/// Upstream `builtin_bytearray(s_str)` (builtin.py).
 pub fn builtin_bytearray(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    // `builtin.py:129` `def builtin_bytearray(s_str):` — Python's
-    // call binding (`unaryop.py:940 simple_call_SomeBuiltin` →
+    // `builtin.py` `def builtin_bytearray(s_str):` — Python's
+    // call binding (`unaryop.py simple_call_SomeBuiltin` →
     // `signature(builtin_bytearray).bind(...)`) raises `TypeError`
     // when arity disagrees.  Mirror the bind-time check; analyser
     // body still ignores the argument shape and returns
@@ -1016,7 +1016,7 @@ pub fn builtin_bytearray(
     Ok(SomeValue::ByteArray(SomeByteArray::new(false)))
 }
 
-/// Upstream `builtin_hasattr(s_obj, s_attr)` (builtin.py:133-148).
+/// Upstream `builtin_hasattr(s_obj, s_attr)` (builtin.py).
 pub fn builtin_hasattr(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1097,7 +1097,7 @@ pub fn builtin_hasattr(
     Ok(SomeValue::Bool(r))
 }
 
-/// Upstream `builtin_tuple(s_iterable)` (builtin.py:151-154).
+/// Upstream `builtin_tuple(s_iterable)` (builtin.py).
 pub fn builtin_tuple(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1115,7 +1115,7 @@ pub fn builtin_tuple(
     ))
 }
 
-/// Upstream `builtin_list(s_iterable)` (builtin.py:156-161).
+/// Upstream `builtin_list(s_iterable)` (builtin.py).
 pub fn builtin_list(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1135,7 +1135,7 @@ pub fn builtin_list(
     Ok(SomeValue::List(bk.newlist(&[s_item], None)?))
 }
 
-/// Upstream `builtin_zip(s_iterable1, s_iterable2)` (builtin.py:163-167).
+/// Upstream `builtin_zip(s_iterable1, s_iterable2)` (builtin.py).
 pub fn builtin_zip(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1153,7 +1153,7 @@ pub fn builtin_zip(
     Ok(SomeValue::List(bk.newlist(&[s_tup], None)?))
 }
 
-/// Upstream `builtin_min(*s_values)` (builtin.py:169-174).
+/// Upstream `builtin_min(*s_values)` (builtin.py).
 pub fn builtin_min(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1171,7 +1171,7 @@ pub fn builtin_min(
     union_many(args_s, "builtin_min")
 }
 
-/// Upstream `builtin_max(*s_values)` (builtin.py:176-188).
+/// Upstream `builtin_max(*s_values)` (builtin.py).
 pub fn builtin_max(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1216,7 +1216,7 @@ pub fn builtin_max(
 // `@analyzer_for(...)` analysers.
 // ---------------------------------------------------------------------------
 
-/// Upstream `object_init(s_self, *args)` (builtin.py:198-201).
+/// Upstream `object_init(s_self, *args)` (builtin.py).
 pub fn object_init(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -1226,7 +1226,7 @@ pub fn object_init(
     Ok(s_none())
 }
 
-/// Upstream `EnvironmentError_init(s_self, *args)` (builtin.py:203-205).
+/// Upstream `EnvironmentError_init(s_self, *args)` (builtin.py).
 #[allow(non_snake_case)]
 pub fn EnvironmentError_init(
     _bk: &Rc<Bookkeeper>,
@@ -1236,7 +1236,7 @@ pub fn EnvironmentError_init(
     Ok(s_none())
 }
 
-/// Upstream `WindowsError_init(s_self, *args)` (builtin.py:212-214).
+/// Upstream `WindowsError_init(s_self, *args)` (builtin.py).
 #[allow(non_snake_case)]
 pub fn WindowsError_init(
     _bk: &Rc<Bookkeeper>,
@@ -1246,7 +1246,7 @@ pub fn WindowsError_init(
     Ok(s_none())
 }
 
-/// Upstream `conf()` (builtin.py:217-219).
+/// Upstream `conf()` (builtin.py).
 pub fn conf(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -1255,7 +1255,7 @@ pub fn conf(
     Ok(SomeValue::String(SomeString::new(false, false)))
 }
 
-/// Upstream `rarith_intmask(s_obj)` (builtin.py:221-223).
+/// Upstream `rarith_intmask(s_obj)` (builtin.py).
 pub fn rarith_intmask(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -1264,7 +1264,7 @@ pub fn rarith_intmask(
     Ok(SomeValue::Integer(SomeInteger::default()))
 }
 
-/// Upstream `rarith_longlongmask(s_obj)` (builtin.py:225-227).
+/// Upstream `rarith_longlongmask(s_obj)` (builtin.py).
 pub fn rarith_longlongmask(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -1645,7 +1645,7 @@ fn lltype_cast_ptr_to_int(
 /// cast_int_to_ptr, v_int)` instead of upstream's 2-arg `simple_call\
 /// (lltype.cast_int_to_ptr, PTRTYPE, oddint)`.  Upstream's
 /// `ann_cast_int_to_ptr` asserts `PtrT.is_constant()` and returns
-/// `SomePtr(ll_ptrtype=PtrT.const)` (lltype.py:2379-2382), reading
+/// `SomePtr(ll_ptrtype=PtrT.const)` (lltype.py), reading
 /// the concrete Ptr type from the first argument.  Pyre's analyzer
 /// cannot recover that concrete Ptr from `args_s[0]` because it
 /// isn't there.  We return `SomePtr` with a Gc-Opaque placeholder
@@ -1722,7 +1722,7 @@ pub fn robjmodel_instantiate(
     )))
 }
 
-/// `ann_cast_pointer(PtrT, s_p)` (lltype.py:970-974): the result of
+/// `ann_cast_pointer(PtrT, s_p)` (lltype.py): the result of
 /// `cast_pointer(PTRTYPE, ptr)` is annotated from the constant target
 /// type, independent of the operand's annotation.  Pyre's
 /// instance-classed world resolves the constant target class to its
@@ -1755,7 +1755,7 @@ fn lltype_cast_pointer(
         ));
     };
     let cdef = ClassDesc::getuniqueclassdef(class_desc)?;
-    // `assert isinstance(s_p, SomePtr)` (lltype.py:971) — the operand
+    // `assert isinstance(s_p, SomePtr)` (lltype.py) — the operand
     // must be a pointer carrier.  Pyre's carriers are `SomePtr` and
     // `SomeInstance` (classed cast targets and classdef-less erased
     // pointers); anything else is a non-pointer cast.
@@ -1763,7 +1763,7 @@ fn lltype_cast_pointer(
         SomeValue::Instance(inst) => inst.can_be_none,
         SomeValue::Ptr(_) => false,
         // A constant-None operand is a null pointer.  Upstream null
-        // constants annotate as SomePtr and pass the lltype.py:971
+        // constants annotate as SomePtr and pass the lltype.py
         // assert; pyre carries them as SomeNone, and the downcast of
         // a null pointer stays null.
         SomeValue::None_(_) => true,
@@ -1803,7 +1803,7 @@ fn malloc_typed_alloc(
     }
     match arg_at(args_s, 0, "malloc_typed") {
         SomeValue::Instance(inst) => {
-            // lltype.py:2202-2209 `malloc(T)`: only `isinstance(T, Struct)`
+            // lltype.py `malloc(T)`: only `isinstance(T, Struct)`
             // is mallocable; everything else falls to
             // `raise TypeError("malloc: unmallocable type")`. A classdef-less
             // `SomeInstance` (object-only; `SomeInstance(classdef=None)`)
@@ -1868,7 +1868,7 @@ fn malloc_raw_alloc(
     }
 }
 
-/// Upstream `robjmodel_r_dict(...)` (builtin.py:244-246).
+/// Upstream `robjmodel_r_dict(...)` (builtin.py).
 pub fn robjmodel_r_dict(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1877,7 +1877,7 @@ pub fn robjmodel_r_dict(
     r_dict_helper(bk, args_s, kwds, RDictKind::Regular, "robjmodel_r_dict")
 }
 
-/// Upstream `robjmodel_r_ordereddict(...)` (builtin.py:248-251).
+/// Upstream `robjmodel_r_ordereddict(...)` (builtin.py).
 pub fn robjmodel_r_ordereddict(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1988,7 +1988,7 @@ fn r_dict_helper(
     Ok(SomeValue::Dict(SomeDict::new(dictdef)))
 }
 
-/// Upstream `robjmodel_hlinvoke(...)` (builtin.py:270-288).
+/// Upstream `robjmodel_hlinvoke(...)` (builtin.py).
 ///
 /// rtyper-phase only — consumes `rmodel.Repr`, `TyperError`,
 /// `lltype_to_annotation`. Returns a clear `AnnotatorError` until the
@@ -2003,7 +2003,7 @@ pub fn robjmodel_hlinvoke(
     ))
 }
 
-/// Upstream `robjmodel_keepalive_until_here(*args_s)` (builtin.py:291-293).
+/// Upstream `robjmodel_keepalive_until_here(*args_s)` (builtin.py).
 pub fn robjmodel_keepalive_until_here(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -2012,7 +2012,7 @@ pub fn robjmodel_keepalive_until_here(
     Ok(s_none())
 }
 
-/// Upstream `robjmodel_free_non_gc_object(obj)` (builtin.py:326-328).
+/// Upstream `robjmodel_free_non_gc_object(obj)` (builtin.py).
 pub fn robjmodel_free_non_gc_object(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -2022,7 +2022,7 @@ pub fn robjmodel_free_non_gc_object(
     Ok(s_none())
 }
 
-/// Upstream `unicodedata_decimal(s_uchr)` (builtin.py:300-303).
+/// Upstream `unicodedata_decimal(s_uchr)` (builtin.py).
 pub fn unicodedata_decimal(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -2033,7 +2033,7 @@ pub fn unicodedata_decimal(
     ))
 }
 
-/// Upstream `analyze()` registered for `OrderedDict` (builtin.py:305-307).
+/// Upstream `analyze()` registered for `OrderedDict` (builtin.py).
 pub fn analyze(
     bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -2046,7 +2046,7 @@ pub fn analyze(
     Ok(SomeValue::Dict(SomeDict::new(dd)))
 }
 
-/// Upstream `weakref_ref(s_obj)` (builtin.py:314-321).
+/// Upstream `weakref_ref(s_obj)` (builtin.py).
 pub fn weakref_ref(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -2071,7 +2071,7 @@ pub fn weakref_ref(
     Ok(SomeValue::WeakRef(SomeWeakRef::new(inst.classdef.clone())))
 }
 
-/// Upstream `pdb_set_trace(*args_s)` (builtin.py:335-339).
+/// Upstream `pdb_set_trace(*args_s)` (builtin.py).
 pub fn pdb_set_trace(
     _bk: &Rc<Bookkeeper>,
     _args_s: &[Option<SomeValue>],
@@ -2137,7 +2137,7 @@ fn host_hasattr(host: &crate::flowspace::model::HostObject, name: &str) -> bool 
     host.class_get(name).is_some()
 }
 
-/// Upstream `union(*s_values)` (model.py:763-766).
+/// Upstream `union(*s_values)` (model.py).
 ///
 /// n-ary fold with `SomeImpossibleValue` as the identity element,
 /// mirroring `annmodel.union(*s_values)` being called with the unpacked
@@ -2167,7 +2167,7 @@ fn union_many(s_values: &[Option<SomeValue>], analyser: &str) -> Result<SomeValu
 /// `RPythonAnnotator` reference.
 ///
 /// When the iterator wraps another `SomeIterator` (upstream `xs.iter()`
-/// then `.iter()` again — returns self via `unaryop.py:808-810`), we
+/// then `.iter()` again — returns self via `unaryop.py`), we
 /// recurse on the inner iterator so the element annotation still
 /// surfaces correctly.
 fn someiterator_next_stub(bk: &Rc<Bookkeeper>, it: &SomeIterator) -> SomeValue {
@@ -2193,7 +2193,7 @@ fn someiterator_next_stub(bk: &Rc<Bookkeeper>, it: &SomeIterator) -> SomeValue {
         it.variant.first().map(String::as_str)
     };
     // When the container is itself a `SomeIterator`, unwrap once — upstream
-    // `SomeIterator.iter()` returns self (unaryop.py:808-810), so chaining
+    // `SomeIterator.iter()` returns self (unaryop.py), so chaining
     // `.iter().next()` reaches the underlying container. The direct
     // `container_getanyitem` dispatch does not recognise Iterator inputs, so
     // we route them through another `someiterator_next_stub` hop first.
@@ -2222,7 +2222,7 @@ mod tests {
 
     #[test]
     fn malloc_typed_rejects_classdef_less_instance() {
-        // lltype.py:2202-2209 `malloc(T)`: only `isinstance(T, Struct)` is
+        // lltype.py `malloc(T)`: only `isinstance(T, Struct)` is
         // mallocable. A classdef-less `SomeInstance` (object-only) carries
         // no concrete struct, so it takes the `else: raise
         // TypeError("malloc: unmallocable type")` arm.
@@ -2274,7 +2274,7 @@ mod tests {
 
     #[test]
     fn lltype_cast_pointer_types_result_from_constant_target_class() {
-        // `ann_cast_pointer` (lltype.py:970-974): result annotated from
+        // `ann_cast_pointer` (lltype.py): result annotated from
         // the constant target class; operand nullability survives.
         let bk = bk();
         let host = bk.intern_class_by_qualname("W_CastTarget");
@@ -2314,7 +2314,7 @@ mod tests {
 
     #[test]
     fn lltype_cast_pointer_rejects_non_pointer_operand() {
-        // `assert isinstance(s_p, SomePtr)` (lltype.py:971) — a
+        // `assert isinstance(s_p, SomePtr)` (lltype.py) — a
         // non-pointer second argument is rejected, not silently
         // annotated as the target class.
         let bk = bk();
@@ -2333,7 +2333,7 @@ mod tests {
     #[test]
     fn lltype_cast_pointer_accepts_constant_none_as_null() {
         // A constant-None operand is a null pointer (upstream null
-        // constants are SomePtr and pass the lltype.py:971 assert);
+        // constants are SomePtr and pass the lltype.py assert);
         // the result is the target class, can_be_none=true.
         let bk = bk();
         let host = bk.intern_class_by_qualname("W_CastTarget");
@@ -2501,7 +2501,7 @@ mod tests {
         // End-to-end wiring check: SomeBuiltin("range") carried inside
         // `SomeValue::call` reaches `call_builtin("range", ...)` and the
         // registered analyser runs. Mirrors upstream's
-        // `SomeBuiltin.call(args)` path at unaryop.py:940-946.
+        // `SomeBuiltin.call(args)` path at unaryop.py.
         use crate::annotator::argument::{ArgumentsForTranslation, simple_args};
         use crate::annotator::model::{SomeBuiltin, SomeValue};
 
@@ -2621,7 +2621,7 @@ mod tests {
         // are `HostObjectKind::Class` in HOST_ENV but still register
         // analysers. `immutablevalue` must route them to `SomeBuiltin`
         // so that `SomeBuiltin.call()` reaches the analyser, matching
-        // upstream bookkeeper.py:309-311's BUILTIN_ANALYZERS check
+        // upstream bookkeeper.py's BUILTIN_ANALYZERS check
         // firing before the `tp is type` branch.
         use crate::flowspace::model::HOST_ENV;
         let bk = bk();

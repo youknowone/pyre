@@ -5,7 +5,7 @@ use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 #[crate::pyre_class("_io.StringIO")]
 pub struct W_StringIO {
-    // interp_stringio.py:27-50 stores UnicodeIO.data as a list of r_int32.
+    // interp_stringio.py stores UnicodeIO.data as a list of r_int32.
     // `array('w')` is the existing GC object whose raw payload is a mutable
     // sequence of 32-bit code points: it preserves O(1) indexing/overwrite,
     // and keeps the dropping Vec out of this GC-allocated class header.
@@ -89,7 +89,7 @@ impl W_StringIO {
     }
 
     fn string_from_range(&self, start: usize, end: usize) -> PyObjectRef {
-        // interp_stringio.py:40-44 `UnicodeIO.getdata_slice`.
+        // interp_stringio.py `UnicodeIO.getdata_slice`.
         let mut result = Wtf8Buf::new();
         for index in start..end {
             if let Some(cp) = CodePoint::from_u32(self.codepoint(index)) {
@@ -204,7 +204,7 @@ impl W_StringIO {
     }
 
     fn write_codepoints(&mut self, codepoints: &[u32]) -> Result<(), crate::PyError> {
-        // interp_stringio.py:104-111 `UnicodeIO.write`.
+        // interp_stringio.py `UnicodeIO.write`.
         let start = usize::try_from(self.pos)
             .map_err(|_| crate::PyError::overflow_error("new position too large"))?;
         let end = start

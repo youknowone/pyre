@@ -36,14 +36,14 @@
 //!    callers.
 //!
 //! 2. **No translated/untranslated split.**  RPython's
-//!    `_log_capture` versus `_log` distinction (`rlib/debug.py:24-30`,
+//!    `_log_capture` versus `_log` distinction (`rlib/debug.py`,
 //!    `60-67`) lets untranslated tests assert against captured
 //!    sections without writing to stderr.  Pyre always writes to
 //!    `stderr` via `eprintln!` — tests that need to assert on log
 //!    output redirect `stderr` at the OS level.
 //!
 //! 3. **Strict `debug_stop` nesting.**  RPython's
-//!    `DebugLog.debug_stop` (`rpython/rlib/debug.py:30`) raises on
+//!    `DebugLog.debug_stop` (`rpython/rlib/debug.py`) raises on
 //!    mismatch; Pyre [`debug_stop`] panics with the same intent.  This
 //!    is intentional, but it does mean a mid-stack panic propagates
 //!    through any `debug_start`/`debug_stop` pair that was already
@@ -86,19 +86,19 @@ fn read_timestamp() -> u128 {
 
 thread_local! {
     /// Per-thread category stack mirroring PyPy's `_log` debug log
-    /// (`rlib/debug.py:24-30`).  Push on `debug_start`, pop on
+    /// (`rlib/debug.py`).  Push on `debug_start`, pop on
     /// `debug_stop`.  The stack is only consulted by `have_debug_prints_for`;
     /// the on-wire output works without it.
     static CATEGORY_STACK: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
 }
 
-/// `rlib/debug.py:163-166 have_debug_prints()` — true when log output
+/// `rlib/debug.py have_debug_prints()` — true when log output
 /// is enabled at all.  Pyre keys this off `MAJIT_LOG`.
 pub fn have_debug_prints() -> bool {
     majit_log_enabled()
 }
 
-/// `rlib/debug.py:168-172 have_debug_prints_for(prefix)` — true when
+/// `rlib/debug.py have_debug_prints_for(prefix)` — true when
 /// the active log filter accepts `prefix` (RPython queries the
 /// `PYPYLOG=cat1,cat2:filename` filter spec, not the currently-open
 /// `debug_start` stack).  Pyre has no category-level filter — `MAJIT_LOG`
@@ -109,7 +109,7 @@ pub fn have_debug_prints_for(_prefix: &str) -> bool {
     have_debug_prints()
 }
 
-/// `rlib/debug.py:101-108 debug_start(category)` — open a logging
+/// `rlib/debug.py debug_start(category)` — open a logging
 /// section.  Emits `[<ts>] {<category>` on stderr when the log is
 /// enabled and pushes `category` onto the thread-local stack.  No-op
 /// when [`have_debug_prints`] is false (the stack is also untouched,
@@ -122,10 +122,10 @@ pub fn debug_start(category: &'static str) {
     CATEGORY_STACK.with(|stack| stack.borrow_mut().push(category));
 }
 
-/// `rlib/debug.py:111-116 debug_stop(category)` — close the matching
+/// `rlib/debug.py debug_stop(category)` — close the matching
 /// section opened by [`debug_start`].  Emits `[<ts>] <category>}` and
 /// pops the stack top.  Mismatched stops panic, mirroring RPython's
-/// `DebugLog.debug_stop` (`rpython/rlib/debug.py:30`), which raises a
+/// `DebugLog.debug_stop` (`rpython/rlib/debug.py`), which raises a
 /// nesting error so unbalanced calls surface immediately instead of
 /// being absorbed.
 pub fn debug_stop(category: &'static str) {
@@ -147,7 +147,7 @@ pub fn debug_stop(category: &'static str) {
     eprintln!("[{:x}] {}}}", read_timestamp(), category);
 }
 
-/// `rlib/debug.py:69-74 debug_print(*args)` — emit a single line inside
+/// `rlib/debug.py debug_print(*args)` — emit a single line inside
 /// the currently-open section.  No-op when the log is disabled.  Pyre
 /// callers format the message themselves and pass the result here.
 pub fn debug_print(msg: &str) {

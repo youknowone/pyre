@@ -12,7 +12,7 @@ use crate::{Const, Type};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Global frame_value_count callback for RPython-parity multi-frame decode.
-/// resume.py:1049: consume_boxes(f.get_current_position_info(), ...) uses
+/// resume.py: consume_boxes(f.get_current_position_info(), ...) uses
 /// per-jitcode liveness at the decode site. pyre registers this callback
 /// from pyre-jit-trace::state so that all callers of rebuild_from_numbering
 /// (including those in majit-metainterp and majit-backend-cranelift) can
@@ -36,7 +36,7 @@ pub fn get_frame_value_count_fn() -> Option<fn(i32, i32) -> usize> {
     }
 }
 
-// resume.py:123-132 — tag constants
+// resume.py — tag constants
 pub const TAGCONST: u8 = 0;
 pub const TAGINT: u8 = 1;
 pub const TAGBOX: u8 = 2;
@@ -45,7 +45,7 @@ pub const TAGVIRTUAL: u8 = 3;
 /// Snapshot frame pc words now carry the published resume coordinate directly.
 ///
 /// RPython stores the JitCode pc in `frame.pc`
-/// (`pyjitpl.py:2610-2624 capture_resumedata(resumepc=-1)`).  Pyre now matches
+/// (`pyjitpl.py capture_resumedata(resumepc=-1)`).  Pyre now matches
 /// that shape for published resume data: the pc word is a genuine JitCode byte
 /// offset, and after-residual-call guards carry their post-call
 /// `-live-`/`catch_exception` coordinate through the companion `jitcode_pc`
@@ -137,17 +137,17 @@ pub enum ResumeVirtualKind {
     Array,
     ArrayStruct,
     RawBuffer,
-    /// resume.py:763 VStrPlainInfo — virtual plain string.
+    /// resume.py VStrPlainInfo — virtual plain string.
     StrPlain,
-    /// resume.py:781 VStrConcatInfo — virtual concatenated string.
+    /// resume.py VStrConcatInfo — virtual concatenated string.
     StrConcat,
-    /// resume.py:801 VStrSliceInfo — virtual string slice.
+    /// resume.py VStrSliceInfo — virtual string slice.
     StrSlice,
-    /// resume.py:817 VUniPlainInfo — virtual plain unicode string.
+    /// resume.py VUniPlainInfo — virtual plain unicode string.
     UniPlain,
-    /// resume.py:836 VUniConcatInfo — virtual concatenated unicode.
+    /// resume.py VUniConcatInfo — virtual concatenated unicode.
     UniConcat,
-    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
+    /// resume.py VUniSliceInfo — virtual unicode slice.
     UniSlice,
 }
 
@@ -238,15 +238,15 @@ pub enum ResumeVirtualLayoutSummary {
         fielddescrs: Vec<crate::FieldDescrInfo>,
         descr_size: usize,
     },
-    /// resume.py:643-684 AbstractVArrayInfo
+    /// resume.py AbstractVArrayInfo
     Array {
         /// resume.py:646: self.arraydescr
         arraydescr: Option<crate::DescrRef>,
-        /// resume.py:680-683: VArrayInfoClear.clear=True / VArrayInfoNotClear.clear=False
+        /// resume.py: VArrayInfoClear.clear=True / VArrayInfoNotClear.clear=False
         clear: bool,
         items: Vec<ResumeValueLayoutSummary>,
     },
-    /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
+    /// resume.py VArrayStructInfo(arraydescr, size, fielddescrs)
     ArrayStruct {
         /// resume.py:739: self.arraydescr
         arraydescr: Option<crate::DescrRef>,
@@ -270,11 +270,11 @@ pub enum ResumeVirtualLayoutSummary {
         offset: i64,
         parent: ResumeValueLayoutSummary,
     },
-    /// `resume.py:763 VStrPlainInfo` — virtual string (known characters).
+    /// `resume.py VStrPlainInfo` — virtual string (known characters).
     StrPlain {
         chars: Vec<ResumeValueLayoutSummary>,
     },
-    /// `resume.py:781 VStrConcatInfo` — virtual string concat. OS_STR_CONCAT
+    /// `resume.py VStrConcatInfo` — virtual string concat. OS_STR_CONCAT
     /// funcptr is resolved at materialization via
     /// `callinfocollection.funcptr_for_oopspec(...)` (resume.py:1467-1468),
     /// not stored on the summary.
@@ -282,7 +282,7 @@ pub enum ResumeVirtualLayoutSummary {
         left: ResumeValueLayoutSummary,
         right: ResumeValueLayoutSummary,
     },
-    /// `resume.py:801 VStrSliceInfo` — virtual slice of a larger string.
+    /// `resume.py VStrSliceInfo` — virtual slice of a larger string.
     /// OS_STR_SLICE funcptr resolved via callinfocollection at
     /// materialization (resume.py:1477-1478).
     StrSlice {
@@ -290,18 +290,18 @@ pub enum ResumeVirtualLayoutSummary {
         start: ResumeValueLayoutSummary,
         length: ResumeValueLayoutSummary,
     },
-    /// `resume.py:817 VUniPlainInfo` — unicode counterpart.
+    /// `resume.py VUniPlainInfo` — unicode counterpart.
     UniPlain {
         chars: Vec<ResumeValueLayoutSummary>,
     },
-    /// `resume.py:836 VUniConcatInfo` — unicode counterpart.
+    /// `resume.py VUniConcatInfo` — unicode counterpart.
     /// OS_UNI_CONCAT funcptr resolved via callinfocollection
     /// (resume.py:1494-1495).
     UniConcat {
         left: ResumeValueLayoutSummary,
         right: ResumeValueLayoutSummary,
     },
-    /// `resume.py:856 VUniSliceInfo` — unicode counterpart.
+    /// `resume.py VUniSliceInfo` — unicode counterpart.
     /// OS_UNI_SLICE funcptr resolved via callinfocollection
     /// (resume.py:1504-1505).
     UniSlice {
@@ -331,7 +331,7 @@ pub fn untag(value: i16) -> (i32, u8) {
 pub enum RebuiltValue {
     /// TAGBOX(n, kind): value from deadframe slot n with the kind that
     /// the parent guard's `fail_arg_types[n]` recorded at numbering time.
-    /// resume.py:1245 `decode_box(num, kind)` parity — RPython resolves
+    /// resume.py `decode_box(num, kind)` parity — RPython resolves
     /// the kind at decode time from the callback (i/r/f) that the encoder
     /// dispatched through `enumerate_vars(info, liveness_info, ...)`. The
     /// box's `.type` matches that kind. majit stores the kind on the
@@ -376,17 +376,17 @@ pub fn decode_tagged_value(
 ) -> RebuiltValue {
     let (val, tagbits) = untag(tagged);
     match tagbits {
-        // resume.py:1257 ConstInt(num) — TAGINT always produces an int box.
+        // resume.py ConstInt(num) — TAGINT always produces an int box.
         TAGINT => RebuiltValue::Const(crate::Const::Int(val as i64)),
         TAGCONST => {
             if tagged == NULLREF {
-                // history.py:361 CONST_NULL = ConstPtr(null).
+                // history.py CONST_NULL = ConstPtr(null).
                 RebuiltValue::Const(crate::Const::Ref(crate::GcRef::NULL))
             } else if tagged == UNINITIALIZED_TAG {
                 RebuiltValue::Unassigned
             } else {
                 let idx = (val - TAG_CONST_OFFSET) as usize;
-                // resume.py:1555/1571/1583 self.consts[num - TAG_CONST_OFFSET]
+                // resume.py/1571/1583 self.consts[num - TAG_CONST_OFFSET]
                 // — the Const carries its type with it.
                 let c = rd_consts.get(idx).copied().unwrap_or(Const::Int(0));
                 RebuiltValue::Const(c)
@@ -398,7 +398,7 @@ pub fn decode_tagged_value(
             } else {
                 val as usize
             };
-            // resume.py:1245 decode_box(num, kind) parity — pull the
+            // resume.py decode_box(num, kind) parity — pull the
             // box's `.type` from the parent guard's fail_arg_types,
             // which `_number_boxes` populated when encoding via
             // `env.get_type(opref)`. resume.py:1264 asserts
@@ -416,8 +416,8 @@ pub fn decode_tagged_value(
             RebuiltValue::Box(index, kind)
         }
         TAGVIRTUAL => {
-            // resume.py:278-284 assign_number_to_virtual numbers nested
-            // virtuals negatively; resume.py:951-954 getvirtual_ptr resolves
+            // resume.py assign_number_to_virtual numbers nested
+            // virtuals negatively; resume.py getvirtual_ptr resolves
             // them via Python negative list indexing into rd_virtuals.
             let index = if val < 0 {
                 (num_virtuals as i32 + val) as usize
@@ -459,7 +459,7 @@ pub fn rebuild_from_numbering(
     let total_size = reader.next_item();
     let num_failargs = reader.next_item();
 
-    // resume.py:1045: consume_vref_and_vable_boxes — virtualizable array.
+    // resume.py: consume_vref_and_vable_boxes — virtualizable array.
     let vable_len = reader.next_item();
     let mut vable_values = Vec::new();
     for _ in 0..vable_len {

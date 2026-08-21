@@ -28,9 +28,9 @@ use crate::model::ValueType;
 ///
 /// | legacy `ValueType` | `SomeValue` shell      | RPython source / status |
 /// |--------------------|------------------------|--------------------------|
-/// | `Int`              | `Integer(SomeInteger)` | `model.py:206-224` -> `SomeValue::Integer` arm. |
-/// | `Float`            | `Float(SomeFloat)`     | `model.py:164-183` -> `SomeValue::Float` arm. |
-/// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` | `model.py:438`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  This fallback projection keeps all Ref variants classdef-less → `GcRef` via `rclass.py:445-447`. |
+/// | `Int`              | `Integer(SomeInteger)` | `model.py` -> `SomeValue::Integer` arm. |
+/// | `Float`            | `Float(SomeFloat)`     | `model.py` -> `SomeValue::Float` arm. |
+/// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` | `model.py`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  This fallback projection keeps all Ref variants classdef-less → `GcRef` via `rclass.py:445-447`. |
 /// | `Void`             | `Impossible`           | `model.py:627` -> `SomeValue::Impossible` arm. |
 /// | `State`            | `Instance(SomeInstance{classdef:None,..})` | **TODO: no upstream equivalent**.  Pyre-only `State` carries the JIT state pointer (a struct pointer to interpreter state).  RPython has no analogue; the `SomeInstance(classdef=None)` projection is a temporary fallback that lets the rtyper proceed without a real bookkeeper-attached pyre `ClassDef`.  Projects to `GcRef` via the same chain as `Ref`. |
 /// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs`'s `binding`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell — that bridging conflated an *annotation-stage* lattice node with the **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown -> GcRef` resolver-stage backfill. |
@@ -55,7 +55,7 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             true,
             KnownType::ULongLongLong,
         ))),
-        // RPython `SomeBool` (`annotator/model.py:185-198`) is a
+        // RPython `SomeBool` (`annotator/model.py`) is a
         // distinct lattice node from `SomeInteger`; the rtyper picks
         // `BoolRepr` (`rmodel.rs::BoolRepr`) which lowers to LL `Bool`
         // (integer-compatible).  Until a richer Bool annotation lands
@@ -144,7 +144,7 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         },
         SomeValue::Bool(_) => ValueType::Bool,
         SomeValue::Float(_) | SomeValue::LongFloat(_) => ValueType::Float,
-        // `getkind(SingleFloat) == 'int'` (history.py:53): singlefloats
+        // `getkind(SingleFloat) == 'int'` (history.py): singlefloats
         // are stored in an int register, not the float bank.
         SomeValue::SingleFloat(_) => ValueType::Int,
         SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref(None),

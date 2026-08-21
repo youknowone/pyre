@@ -24,7 +24,7 @@ pub struct Return;
 
 pub struct Yield;
 
-/// pypy/interpreter/pyopcode.py:91-94 — `RaiseWithExplicitTraceback(operr, lasti)`.
+/// pypy/interpreter/pyopcode.py — `RaiseWithExplicitTraceback(operr, lasti)`.
 ///
 /// Carries the original raise-site `lasti` (instruction byte offset) from a
 /// `RERAISE N` so the next exception-table dispatch can push that offset as
@@ -197,7 +197,7 @@ pub fn code_is_self_recursive(code: &CodeObject) -> bool {
     false
 }
 
-/// pypy/interpreter/pyopcode.py:187-193 dispatch_bytecode parity.
+/// pypy/interpreter/pyopcode.py dispatch_bytecode parity.
 ///
 /// Returns the semantic opcode to execute for a dispatch step starting at
 /// `pc`. If `pc` points at one or more `EXTENDED_ARG` prefixes, this walks
@@ -223,7 +223,7 @@ pub fn decode_instruction_for_dispatch(
     Ok((opcode_pc, instruction, op_arg))
 }
 
-/// pypy/interpreter/pyopcode.py:213-237 dispatch loop forward decode.
+/// pypy/interpreter/pyopcode.py dispatch loop forward decode.
 ///
 /// Single-pass decode for the hot dispatch path: returns the real opcode's
 /// `(pc, instruction, op_arg)` for a `pc` that names either a logical
@@ -296,7 +296,7 @@ pub trait LocalOpcodeHandler: SharedOpcodeHandler {
 }
 
 pub trait NamespaceOpcodeHandler: SharedOpcodeHandler {
-    /// `pyopcode.py:559 LOAD_NAME` / `:561 LOAD_GLOBAL` — `nameindex`
+    /// `pyopcode.py LOAD_NAME` / `:561 LOAD_GLOBAL` — `nameindex`
     /// is the `co_names` index decoded from the bytecode operand,
     /// passed through so `pycode._globals_caches[nameindex]`
     /// (`celldict.py:292`) can be consulted without re-resolving from
@@ -317,7 +317,7 @@ pub trait NamespaceOpcodeHandler: SharedOpcodeHandler {
         nameindex: usize,
         value: Self::Value,
     ) -> Result<(), PyError>;
-    /// PyPy STORE_GLOBAL writes to `w_globals` (`pyopcode.py:567 STORE_GLOBAL`).
+    /// PyPy STORE_GLOBAL writes to `w_globals` (`pyopcode.py STORE_GLOBAL`).
     /// Default mirrors STORE_NAME so implementations that conflate the two
     /// namespaces (e.g. JIT trace `MIFrame`) keep their existing behaviour;
     /// PyFrame overrides to bypass `w_locals` and write directly to globals.
@@ -329,7 +329,7 @@ pub trait NamespaceOpcodeHandler: SharedOpcodeHandler {
     ) -> Result<(), PyError> {
         self.store_name_value(name, nameindex, value)
     }
-    /// PyPy LOAD_GLOBAL skips `w_locals` (`pyopcode.py:558 LOAD_GLOBAL`).
+    /// PyPy LOAD_GLOBAL skips `w_locals` (`pyopcode.py LOAD_GLOBAL`).
     /// Default mirrors LOAD_NAME for the conflating implementations;
     /// PyFrame overrides to read from `w_globals` only.
     fn load_global_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
@@ -357,7 +357,7 @@ pub trait IterOpcodeHandler: SharedOpcodeHandler {
     /// Legacy in-place conversion hook retained while out-of-tree opcode
     /// executors migrate to `iter_value`; the shared opcode no longer calls it.
     fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError>;
-    // FOR_ITER drives a single space.next (pyopcode.py:1288).
+    // FOR_ITER drives a single space.next (pyopcode.py).
     // Ok(Some(v)) = next value; Ok(None) = StopIteration (exhausted);
     // Err(e) = a non-StopIteration exception (propagate).
     fn iter_next(&mut self, iter: Self::Value) -> Result<Option<Self::Value>, PyError>;
@@ -476,7 +476,7 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     /// on call sites that need true immutability to make a copy.
     fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError>;
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError>;
-    /// `getconstant_w(index) -> co_consts_w[index]` (`pyopcode.py:498-499`).
+    /// `getconstant_w(index) -> co_consts_w[index]` (`pyopcode.py`).
     /// The default realizes from the compiler constant; `PyFrame` overrides it
     /// to return the object owned by `self.pycode.co_consts_w[index]`.
     fn constant_at(
@@ -663,7 +663,7 @@ pub fn opcode_store_name<H: NamespaceOpcodeHandler + ?Sized>(
     handler.store_name_value(name, nameindex, value)
 }
 
-/// pypy/interpreter/pyopcode.py:567 STORE_GLOBAL — writes the TOS into
+/// pypy/interpreter/pyopcode.py STORE_GLOBAL — writes the TOS into
 /// `w_globals` regardless of `w_locals`.
 pub fn opcode_store_global<H: NamespaceOpcodeHandler + ?Sized>(
     handler: &mut H,
@@ -1312,7 +1312,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn check_eg_match(&mut self) -> Result<(), PyError> {
         Err(crate::PyError::type_error("check_eg_match not implemented"))
     }
-    /// `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
+    /// `pypy/interpreter/pyopcode.py RERAISE`.
     ///
     /// `oparg` is the depth (0..) at which the original raise-site lasti
     /// integer sits on the value stack.  When `oparg > 0` the handler
@@ -1739,7 +1739,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
 
 /// Widen a `u32`-typed oparg to `i64`. Adapter-friendly stand-in for
 /// a bare `x as i64` cast. Upstream parity: RPython source uses
-/// `r_longlong(x)` / `widen(x)` (`rlib/rarithmetic.py:303`) —
+/// `r_longlong(x)` / `widen(x)` (`rlib/rarithmetic.py`) —
 /// class/function calls, never `as` syntax. The body uses
 /// `i64::from(x)` (lossless `From<u32>` impl) so the front-end lowers
 /// it as a function call (`<i64 as From<u32>>::from`) rather than a
@@ -3240,7 +3240,7 @@ where
         unreachable!()
     };
     let const_idx = consti.get(op_arg);
-    // `pyopcode.py:533 LOAD_CONST` reads `getconstant_w(index)`
+    // `pyopcode.py LOAD_CONST` reads `getconstant_w(index)`
     // (`pyopcode.py:498-499 co_consts_w[index]`): every constant, not just a
     // nested code object, comes from the enclosing PyCode's shared slot.
     let value = executor.constant_at(const_idx, code)?;

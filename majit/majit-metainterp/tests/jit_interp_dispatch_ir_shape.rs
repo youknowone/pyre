@@ -475,7 +475,7 @@ fn dispatch_jitcode_lowers_opcode_fetch() {
 /// per non-default arm (OP_NOP, OP_INC_A → ≥ 2 checks).
 ///
 /// pyopcode.py:183+ if/elif chain over opcode constants.
-/// jtransform.py:196-225 optimize_goto_if_not fuses int_eq + goto_if_not
+/// jtransform.py optimize_goto_if_not fuses int_eq + goto_if_not
 /// into goto_if_not_int_eq/iiL (BC_GOTO_IF_NOT_INT_EQ).
 #[test]
 fn dispatch_jitcode_emits_chain_of_int_eq_dispatch() {
@@ -631,7 +631,7 @@ fn register_dispatch_jitcode_stores_singleton() {
     );
     // `register_dispatch_jitcode` validates the dispatch JitCode's
     // `BC_JIT_MERGE_POINT` payload against the driver descriptor
-    // (`warmspot.py:660-666 make_args_specification` parity), so the
+    // (`warmspot.py make_args_specification` parity), so the
     // schema must be declared first — same lifecycle as the macro-
     // generated install path (`#declare_schema_fn_name(driver)` runs
     // before `ensure_descriptor_registered` in `codegen_state.rs`'s
@@ -717,8 +717,8 @@ mod oparg_minimal {
     const OP_NOP: u8 = 0;
     const OP_ADD_I: u8 = 1;
     /// Backward-jump opcode whose arm contains `can_enter_jit!()` to mirror
-    /// RPython's `interp_jit.py:118 pypyjitdriver.can_enter_jit(...)` inside
-    /// `jump_absolute()`'s backward-branch path (`interp_jit.py:104 if jumpto
+    /// RPython's `interp_jit.py pypyjitdriver.can_enter_jit(...)` inside
+    /// `jump_absolute()`'s backward-branch path (`interp_jit.py if jumpto
     /// >= next_instr: return jumpto` early-out).  The arm exists so the
     /// dispatch JitCode lowerer emits a `BC_LOOP_HEADER` for at least one
     /// arm — `lower_dispatch_chain`'s per-arm gating suppresses
@@ -729,7 +729,7 @@ mod oparg_minimal {
     const OP_JUMP_BACK: u8 = 2;
 
     /// A.2.5 helper: stand-in for RPython
-    /// `executioncontext.py:174 ec.bytecode_only_trace(self)` — the
+    /// `executioncontext.py ec.bytecode_only_trace(self)` — the
     /// JIT-branch hook fired between `last_instr` store and opcode fetch.
     /// Pyre's `#[majit_macros::dont_look_inside]` attribute lowers a
     /// statement-form free-fn call to `BC_RESIDUAL_CALL_R_V` with
@@ -797,7 +797,7 @@ mod oparg_minimal {
                 // Backward-jump arm — `can_enter_jit!()` at the call
                 // site so `Lowerer::lower_stmt`'s `Stmt::Macro` arm
                 // emits `BC_LOOP_HEADER` INSIDE this arm's sub-JitCode
-                // (jtransform.py:1714-1723 handle_jit_marker__loop_header
+                // (jtransform.py handle_jit_marker__loop_header
                 // at the source-level can_enter_jit position).  The
                 // `if target < pc { ... }` conditional + `continue` shape
                 // used by production consumers (interp_jit.py:104
@@ -1151,10 +1151,10 @@ mod oparg_minimal {
     /// A.3.4: `BC_LOOP_HEADER` jdindex wire — call-site emission inside
     /// the OP_JUMP_BACK arm sub-JitCode.
     ///
-    /// `jtransform.py:1714-1723` `handle_jit_marker__loop_header` emits
+    /// `jtransform.py` `handle_jit_marker__loop_header` emits
     /// `SpaceOperation('loop_header', [c_index], None)` with `c_index =
     /// Constant(jd.index, lltype.Signed)` AT THE SOURCE-LEVEL CALL SITE —
-    /// in PyPy that is `interp_jit.py:118 pypyjitdriver.can_enter_jit(...)`
+    /// in PyPy that is `interp_jit.py pypyjitdriver.can_enter_jit(...)`
     /// inside `jump_absolute()`'s BACKWARD-JUMP BRANCH ONLY (the forward
     /// path early-returns at `interp_jit.py:104 if jumpto >= next_instr:
     /// return jumpto`).  Pyre's parity is achieved by recognising
@@ -1282,7 +1282,7 @@ mod oparg_minimal {
     /// A.3.5 (negative): with `greens = []`, NO `BC_*_GUARD_VALUE` op must
     /// appear in the prefix before `BC_JIT_MERGE_POINT`.
     ///
-    /// Mirrors `jtransform.py:1693-1714 promote_greens`: the loop over
+    /// Mirrors `jtransform.py promote_greens`: the loop over
     /// `args[:num_green_args]` is empty when `num_green_args == 0`, so no
     /// guard ops are emitted.
     #[test]
@@ -1714,7 +1714,7 @@ mod oparg_with_pc_green {
     /// A.3.5: with `greens = [pc]`, a `-live-` + `BC_INT_GUARD_VALUE` pair
     /// must appear BEFORE `BC_JIT_MERGE_POINT(_C)` in the dispatch JitCode.
     ///
-    /// Mirrors `jtransform.py:1693-1714 promote_greens`: for each green
+    /// Mirrors `jtransform.py promote_greens`: for each green
     /// Variable, emit SpaceOperation('-live-', ...) then
     /// SpaceOperation('int_guard_value', [v], None).  `pc` is Int kind →
     /// int_guard_value.  The `-live-` byte is 1 opcode + 2-byte offset
@@ -2111,7 +2111,7 @@ mod oparg_with_body_local_state_le_green {
 /// + greens_i payload byte, so future refactors of
 ///   `lower_method_call_value` (A.3.6.2) cannot silently regress the chain.
 ///
-/// RPython parity: `jtransform.py:456 handle_residual_call`
+/// RPython parity: `jtransform.py handle_residual_call`
 /// (graph-identity-keyed; pyre keys on canonical path so
 /// `<MockProgram>::get_req_size` is the segment-form lookup that mirrors
 /// the upstream identity match).
@@ -2489,7 +2489,7 @@ mod oparg_with_full_4_green_parity {
             .position(|&b| b == BC_JIT_MERGE_POINT || b == BC_JIT_MERGE_POINT_C)
             .expect("A.3.7: BC_JIT_MERGE_POINT(_C) must be present");
 
-        // Layout (jtransform.py:1700 make_three_lists):
+        // Layout (jtransform.py make_three_lists):
         //   greens_base + 0: greens_i_len   = 3
         //   greens_base + 1..3: greens_i bytes (pc, stackok, is_queue regs)
         //   greens_base + 4: greens_r_len   = 1

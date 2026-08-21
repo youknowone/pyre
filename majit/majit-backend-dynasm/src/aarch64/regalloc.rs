@@ -14,14 +14,14 @@ use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::{Loc, RegLoc};
 use majit_ir::{OpRef, Type};
 
-/// aarch64/regalloc.py:159 `DEFAULT_IMM_SIZE = 4096`.
+/// aarch64/regalloc.py `DEFAULT_IMM_SIZE = 4096`.
 const DEFAULT_IMM_SIZE: i64 = 4096;
 
-/// aarch64/regalloc.py:169 `check_imm_box`. PyPy accepts only
+/// aarch64/regalloc.py `check_imm_box`. PyPy accepts only
 /// `ConstInt` values in the AArch64 immediate range; non-Int
 /// constants (ConstFloat/ConstPtr) and box references fall through
 /// to the register form. PyPy reads `arg.getint()` directly because
-/// the int is inlined on `ConstInt` (history.py:227 `ConstInt.value`);
+/// the int is inlined on `ConstInt` (history.py `ConstInt.value`);
 /// pyre's inline-Const variant `OpRef::ConstInt` carries the i64
 /// on the OpRef itself (`arg.getint()` never fails).
 fn check_imm_box(arg: OpRef) -> bool {
@@ -53,7 +53,7 @@ pub fn all_float_regs() -> Vec<RegLoc> {
     registers::ALL_VFP_REGS.to_vec()
 }
 
-/// aarch64/registers.py:18 `fp = x29`.  RPython's frame-pointer
+/// aarch64/registers.py `fp = x29`.  RPython's frame-pointer
 /// register on AAPCS64.
 pub fn frame_reg() -> RegLoc {
     registers::FP
@@ -111,11 +111,11 @@ pub const MALLOC_NURSERY_RESULT: RegLoc = RegLoc {
 /// AAPCS64's `ADD/SUB/MUL/AND/ORR/EOR/LSL/ASR/LSR Rd, Rn, Rm` accepts
 /// three distinct registers, so the result is always allocated via
 /// `force_allocate_reg` independently of the inputs.  RPython parity:
-/// `rpython/jit/backend/aarch64/regalloc.py:341 prepare_op_int_add`
+/// `rpython/jit/backend/aarch64/regalloc.py prepare_op_int_add`
 /// and `:362 prepare_op_int_mul` (the latter is reused for
 /// `and/or/xor/lshift/rshift/urshift/uint_mul_high`).
 impl<'a> RegAlloc<'a> {
-    /// aarch64/regalloc.py:362 `prepare_op_int_mul`. 3-operand form:
+    /// aarch64/regalloc.py `prepare_op_int_mul`. 3-operand form:
     /// both operands in registers, result allocated separately.
     /// PyPy passes the full `boxes = op.getarglist()` as
     /// `forbidden_vars` for both `make_sure_var_in_reg` calls
@@ -141,7 +141,7 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![lhs_loc, rhs_loc], Some(res_loc), output);
     }
 
-    /// aarch64/regalloc.py:362 — `prepare_op_int_mul` is reused for
+    /// aarch64/regalloc.py — `prepare_op_int_mul` is reused for
     /// symmetric binops too; no x86-style swap optimisation is needed
     /// because 3-operand encoding already lets `res` be distinct.
     pub(crate) fn consider_binop_symm_j2(
@@ -155,7 +155,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_binop_j2(dst, lhs, rhs, i, output);
     }
 
-    /// aarch64/regalloc.py:341 `prepare_op_int_add` → `prepare_int_ri`:
+    /// aarch64/regalloc.py `prepare_op_int_add` → `prepare_int_ri`:
     /// allows either operand to be an immediate that fits the AArch64
     /// `add Rd, Rn, #imm12` (or shifted) encoding.  For non-immediate
     /// or out-of-range constants, fall through to the register form.
@@ -170,7 +170,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_int_ri_j2(dst, lhs, rhs, i, output);
     }
 
-    /// aarch64/regalloc.py:344 `prepare_op_int_sub`. `lhs` always
+    /// aarch64/regalloc.py `prepare_op_int_sub`. `lhs` always
     /// becomes Rn; `rhs` accepts the `sub Rd, Rn, #imm12` immediate
     /// form only when it is a `ConstInt` in `[0, 4096)`
     /// (`check_imm_box`). Other constants (ConstFloat/ConstPtr) and
@@ -184,7 +184,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        // history.py:227 — inline-Const carries its value directly.
+        // history.py — inline-Const carries its value directly.
         let imm_rhs = check_imm_box(rhs);
         let lhs_loc = self.make_sure_var_in_reg(lhs, Type::Int, &boxes, None, false);
         let rhs_loc = if imm_rhs {
@@ -212,7 +212,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_int_ri_j2(dst, lhs, rhs, i, output);
     }
 
-    /// aarch64/regalloc.py:358 `prepare_comp_op_int_sub_ovf =
+    /// aarch64/regalloc.py `prepare_comp_op_int_sub_ovf =
     /// prepare_op_int_sub`. Shares preparation with `int_sub` since
     /// `subs Rd, Rn, #imm12` accepts an immediate `rhs`.
     pub(crate) fn consider_int_sub_ovf_j2(
@@ -226,7 +226,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_int_sub_j2(dst, lhs, rhs, i, output);
     }
 
-    /// aarch64/regalloc.py:362 — shifts piggy-back on `prepare_op_int_mul`.
+    /// aarch64/regalloc.py — shifts piggy-back on `prepare_op_int_mul`.
     pub(crate) fn consider_int_lshift_j2(
         &mut self,
         dst: OpRef,
@@ -238,7 +238,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_binop_j2(dst, lhs, rhs, i, output);
     }
 
-    /// aarch64/regalloc.py:456 `prepare_unary` covers `int_neg`,
+    /// aarch64/regalloc.py `prepare_unary` covers `int_neg`,
     /// `int_invert`, `int_is_true`, `int_is_zero`. `neg X(d), X(s)`
     /// and `mvn X(d), X(s)` are 3-operand: result independent of
     /// source. PyPy asserts `not isinstance(a0, Const)`
@@ -266,9 +266,9 @@ impl<'a> RegAlloc<'a> {
     /// shape from regalloc.py:456 since `cmp Xn, #0 ; cset Wd, ne` keeps
     /// the input register live while writing a fresh destination.
     ///
-    /// When the next op consumes the flags, `regalloc.py:469
+    /// When the next op consumes the flags, `regalloc.py
     /// prepare_comp_unary` allocates no destination at all and
-    /// `opassembler.py:210 emit_comp_op_int_is_true` emits the `cmp` alone,
+    /// `opassembler.py emit_comp_op_int_is_true` emits the `cmp` alone,
     /// returning the condition.  `force_allocate_reg_or_cc` spells that as
     /// the frame-register sentinel, which the `IntIsTrue` / `IntIsZero` emit
     /// arms recognise through `flush_cc`.
@@ -290,7 +290,7 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![arg_loc], Some(res), output);
     }
 
-    /// aarch64/regalloc.py:397 `prepare_op_uint_mul_high = prepare_op_int_mul`.
+    /// aarch64/regalloc.py `prepare_op_uint_mul_high = prepare_op_int_mul`.
     /// `umulh Rd, Rn, Rm` is 3-operand; no scratch-pair constraints
     /// (unlike x86 which forces EAX/EDX).
     pub(crate) fn consider_uint_mul_high_j2(
@@ -304,7 +304,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_binop_j2(dst, lhs, rhs, i, output);
     }
 
-    /// aarch64/regalloc.py:321 `prepare_int_ri`. Either operand may
+    /// aarch64/regalloc.py `prepare_int_ri`. Either operand may
     /// take the `add Rd, Rn, #imm12` immediate form when it is a
     /// `ConstInt` in `[0, 4096)` (`check_imm_box`). Non-Int constants
     /// (ConstFloat/ConstPtr) and out-of-range ints fall through to
@@ -318,7 +318,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let boxes = [lhs, rhs];
-        // history.py:227 — inline-Const variants carry the value on the OpRef.
+        // history.py — inline-Const variants carry the value on the OpRef.
         let imm_lhs = check_imm_box(lhs);
         let imm_rhs = check_imm_box(rhs);
         let (l0, l1) = if !imm_lhs && imm_rhs {

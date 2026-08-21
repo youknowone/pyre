@@ -13,7 +13,7 @@ use crate::translator::driver::{ProceedGoals, TranslationDriver};
 use crate::translator::tool::taskengine::{TaskError, TaskOutput};
 use crate::translator::translator::{FlowingFlags, TranslationConfig, TranslationContext};
 
-/// Upstream `DEFAULTS` (interactive.py:6-10).
+/// Upstream `DEFAULTS` (interactive.py).
 pub const DEFAULTS: [(&str, OptionValue); 3] = [
     ("translation.backend", OptionValue::None),
     ("translation.type_system", OptionValue::None),

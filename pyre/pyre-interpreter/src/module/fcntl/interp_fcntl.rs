@@ -36,7 +36,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[2]) };
                     let mut buf = data.to_vec();
                     buf.push(0);
-                    // `interp_fcntl.py:118-138 fcntl` tries the string-buffer
+                    // `interp_fcntl.py fcntl` tries the string-buffer
                     // path before falling back to the integer path, and
                     // returns exactly the original buffer length.
                     loop {
@@ -275,7 +275,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
         }),
     );
-    // `interp_fcntl.py:25-37 constant_names` — POSIX subset always
+    // `interp_fcntl.py constant_names` — POSIX subset always
     // exposed; Linux-specific block gated below.  I_* (System V
     // STREAMS) are listed by PyPy but `if value is not None` filters
     // them out at platform.configure time on every supported platform;

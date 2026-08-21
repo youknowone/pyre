@@ -110,7 +110,7 @@ pub fn set_gc_interp() {
 
 /// Request a major collection at the next root-complete point.
 ///
-/// `external_malloc` (incminimark.py:987-994) tests `threshold_reached` in the
+/// `external_malloc` (incminimark.py) tests `threshold_reached` in the
 /// allocator and drives `minor_collection_with_major_progress` there. pyre
 /// cannot collect at an arbitrary allocation site — a Rust caller's locals are
 /// not roots — so the check stays in the allocator and only the action is

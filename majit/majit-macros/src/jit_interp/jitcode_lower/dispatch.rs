@@ -675,10 +675,10 @@ fn block_contains_can_enter_jit(block: &syn::Block) -> bool {
 /// A.2.5.a: lower a free-function call statement whose callee has a
 /// resolvable helper policy (e.g. `#[majit_macros::dont_look_inside]`
 /// under `auto_calls = true` or an explicit `calls = { ... }` entry).
-/// Mirrors the dispatch-body equivalent of RPython `pyopcode.py:174`
+/// Mirrors the dispatch-body equivalent of RPython `pyopcode.py`
 /// `ec.bytecode_only_trace(self)`, whose effect class is at minimum
 /// `DEFAULT_EFFECT_INFO` (EF_CAN_RAISE + saturated read/write descrs)
-/// per Pre-A.2.5 codex review (`call.py:282-324 getcalldescr` for the
+/// per Pre-A.2.5 codex review (`call.py getcalldescr` for the
 /// upstream analyzer-trio classification; pyre's per-callsite hatch
 /// before the analyzer outputs are plumbed).
 ///
@@ -708,7 +708,7 @@ fn try_lower_pre_dispatch_policy_call_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -
 
 /// Return the inner `ExprWhile` if `stmt` is `Stmt::Expr(Expr::While(_), _)`.
 /// Used by `lower_pre_dispatch_stmts` to detect EXTENDED_ARG inner loops in
-/// the dispatch body (RPython `pyopcode.py:187-193`).
+/// the dispatch body (RPython `pyopcode.py`).
 fn stmt_as_inner_while(stmt: &Stmt) -> Option<&syn::ExprWhile> {
     let Stmt::Expr(Expr::While(while_expr), _) = stmt else {
         return None;
@@ -1042,7 +1042,7 @@ fn try_lower_have_argument_guard(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
     let Some(rhs_name) = expr_single_ident(&bin.right) else {
         return false;
     };
-    // pyopcode.py:190 `if opcode < HAVE_ARGUMENT` — LHS must be the
+    // pyopcode.py `if opcode < HAVE_ARGUMENT` — LHS must be the
     // local (in bindings), RHS the const (out of bindings). Rejecting
     // the reversed form keeps the guard polarity unambiguous.
     let Some(local) = lowerer.bindings.get(&lhs_name).cloned() else {
@@ -1859,7 +1859,7 @@ mod dispatch_arm_inline_call_tokens_tests {
 /// default label.
 ///
 /// pyopcode.py:183+ if/elif chain over opcode constants.
-/// jtransform.py:196-225 optimize_goto_if_not fuses `int_eq + goto_if_not`
+/// jtransform.py optimize_goto_if_not fuses `int_eq + goto_if_not`
 /// into `goto_if_not_int_eq/iiL`.
 ///
 /// `default_label` is bound at the typed-return emission site in
@@ -2607,7 +2607,7 @@ pub(super) fn lower_dispatch_chain(
                 };
                 // RPython flatten.py:258-260 emits `-live-` UNCONDITIONALLY ahead
                 // of every goto_if_not / goto_if_not_<cmp>; optimize_goto_if_not
-                // (jtransform.py:225) tags the fused compare `-live-before`. The
+                // (jtransform.py) tags the fused compare `-live-before`. The
                 // tracer records this guard through record_state_guard →
                 // build_state_field_snapshot, which reads the LIVE marker at
                 // `guard_pc - SIZE_LIVE_OP`. Without a preceding `-live-` the
@@ -2727,7 +2727,7 @@ pub(super) fn lower_dispatch_chain(
                 majit_metainterp::record_degraded_dispatch_arm(#interp, #arm_name, #reason);
             }
         };
-        // `jitcode.py:15 self.name = name` — the name every sub-JitCode built
+        // `jitcode.py self.name = name` — the name every sub-JitCode built
         // for this arm carries.  The same spelling the degraded-arm record
         // uses, so a log line and a `degraded_dispatch_arms()` entry for one
         // arm can be matched by eye.
@@ -2821,7 +2821,7 @@ pub(super) fn lower_dispatch_chain(
                             // Carry the parent-side caller regs into the
                             // BC_INLINE_CALL OpMeta so the liveness walker
                             // accounts for them as live at the call site
-                            // (assembler.py:225 get_liveness_info reads).
+                            // (assembler.py get_liveness_info reads).
                             for entry in &layout {
                                 arm_inline_call_reads
                                     .push(Register::new(entry.kind, entry.parent_reg));
@@ -3007,10 +3007,10 @@ pub(super) fn lower_dispatch_chain(
                 quote::quote! { let _ = __builder.live_placeholder(); },
             );
         }
-        // jtransform.py:1714-1723 `handle_jit_marker__loop_header`:
+        // jtransform.py `handle_jit_marker__loop_header`:
         // RPython lowers `can_enter_jit()` at the user's source-code
-        // back-edge (interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)`
-        // inside `jump_absolute`'s BACKWARD branch only — `interp_jit.py:104
+        // back-edge (interp_jit.py `pypyjitdriver.can_enter_jit(...)`
+        // inside `jump_absolute`'s BACKWARD branch only — `interp_jit.py
         // if jumpto >= next_instr: return jumpto` early-out skips the
         // forward path) into a `loop_header(jd.index)` op AT the same
         // source position.  Pyre's `can_enter_jit!()` recognition lives
@@ -3114,7 +3114,7 @@ fn pat_contains_range(pat: &Pat) -> bool {
 
 /// A.3.5 — emit a `-live-` + `<kind>_guard_value` pair for each declared green.
 ///
-/// Mirrors `jtransform.py:1693-1714 promote_greens`: for every green Variable
+/// Mirrors `jtransform.py promote_greens`: for every green Variable
 /// (constants are already promoted and skipped at the RPython level; pyre
 /// has no compile-time green constants so every entry is promoted), emit a
 /// `-live-` marker followed by `<kind>_guard_value(reg)`.  The guard forces
@@ -3187,7 +3187,7 @@ pub(super) fn emit_promote_greens(lowerer: &mut Lowerer, config: &LowererConfig)
 
 /// A.3.2 — resolve green variable names to register-byte lists.
 ///
-/// Mirrors `jtransform.py:1700 make_three_lists(op.args[2:2+num_green_args])`:
+/// Mirrors `jtransform.py make_three_lists(op.args[2:2+num_green_args])`:
 /// each green expression is expected to be a single-segment ident.  Dotted
 /// paths (e.g. `state.pc`) are explicitly out of scope — task A.7.
 ///
@@ -3274,7 +3274,7 @@ pub(super) fn resolve_greens(
 
 /// A.3.3 — resolve red variable names to register-byte lists.
 ///
-/// Mirrors `jtransform.py:1700 make_three_lists(op.args[2+num_green_args:])`:
+/// Mirrors `jtransform.py make_three_lists(op.args[2+num_green_args:])`:
 /// pyre's portal inputs are `program` (Ref/r0), `pc` (Int/i0), and optionally
 /// `vable_var` (Ref/r1).  The reds = portal-inputs minus declared greens.
 ///
@@ -3297,7 +3297,7 @@ pub(super) fn resolve_reds(
     // Slice (audit Issue #6) — when the consumer declares
     // `#[jit_interp(reds = [...])]` explicitly, use that list as the
     // canonical reds source matching RPython
-    // `jtransform.py:1700 make_three_lists(op.args[2+num_green_args:])`
+    // `jtransform.py make_three_lists(op.args[2+num_green_args:])`
     // — the marker's tail args are the reds.  Pyre's marker is
     // stateless (no tail args), so the `reds` config slot replaces
     // them.  When `config.reds` is empty, fall back to the legacy
@@ -3399,7 +3399,7 @@ pub(super) fn resolve_reds(
 /// real lltype subtype instead of collapsing STR/UNICODE to `Ref`.
 ///
 /// Output preserves declaration order.  RPython
-/// `decode_hp_hint_args` (support.py:135-150) does not silently reorder
+/// `decode_hp_hint_args` (support.py) does not silently reorder
 /// the JitDriver declaration; it computes `sort_vars(lst)` and asserts
 /// `lst == lst2`, telling the user to reorder the greens/reds if needed.
 /// Pyre mirrors that shape here: validate `int → ref → float` order, then
@@ -3413,7 +3413,7 @@ pub(super) fn green_schema(
     use crate::jit_interp::green_type_tag::GreenTypeTag;
     let mut out: Vec<(u8, String, TokenStream)> = Vec::new();
     for (i, green) in config.greens.iter().enumerate() {
-        // RPython `support.py:135-150 decode_hp_hint_args` strictly
+        // RPython `support.py decode_hp_hint_args` strictly
         // validates greens/reds count + ordering — it never silently
         // drops a malformed marker arg.  Pyre mirrors that strength
         // here: bare-ident is the only supported form (matching
@@ -3480,7 +3480,7 @@ pub(super) fn green_schema(
 /// `pc` (Int) before `program` (Ref), so the implicit path is already
 /// in RPython-accepted order.
 pub(super) fn red_schema(lowerer: &Lowerer, config: &LowererConfig) -> Vec<(String, TokenStream)> {
-    // RPython `support.py:135-150 decode_hp_hint_args` parity: malformed
+    // RPython `support.py decode_hp_hint_args` parity: malformed
     // marker args panic instead of silently shrinking the schema (see
     // `green_schema` for the full rationale).
     let explicit: Vec<String> = config
@@ -3566,7 +3566,7 @@ pub(super) fn red_schema(lowerer: &Lowerer, config: &LowererConfig) -> Vec<(Stri
             }
             None => {
                 if explicit_was_provided {
-                    // RPython `support.py:135-150 decode_hp_hint_args`:
+                    // RPython `support.py decode_hp_hint_args`:
                     // every declared red name must appear in the
                     // function's local bindings; an unknown name is a
                     // declaration-vs-body mismatch that upstream
@@ -3617,13 +3617,13 @@ fn assert_kind_sorted(label: &str, vars: &[(u8, String, TokenStream)]) {
 /// Lowers a `#[jit_interp]` function's `while { jit_merge_point!(); ...
 /// match opcode { ... } }` dispatch loop into a single dispatch JitCode
 /// body. Mirrors RPython `pypy/module/pypyjit/interp_jit.py:82-94`
-/// portal + `pypy/interpreter/pyopcode.py:168-181` dispatch_bytecode.
+/// portal + `pypy/interpreter/pyopcode.py` dispatch_bytecode.
 ///
 /// Output IR shape:
 /// 1. `BC_LIVE` (canonical entry)
 /// 2. `BC_JIT_MERGE_POINT(_C)` (interp_jit.py:88-90 jit_merge_point hook)
 /// 3. `BC_LOOP_HEADER`
-/// 4. pre-dispatch ops, source-order (interp_jit.py:91-93)
+/// 4. pre-dispatch ops, source-order (interp_jit.py)
 /// 5. opcode/oparg fetch + pc advance (pyopcode.py:171-181)
 /// 6. dispatch chain via existing `BC_GOTO_IF_NOT_*` ops
 ///    (jtransform.py:196-225 conditional fusion)
@@ -3744,7 +3744,7 @@ pub(crate) fn lower_dispatch_body(
     // are constants when the merge point is reached.
     emit_promote_greens(&mut lowerer, config);
 
-    // jtransform.py:1707-1712 returns `[op3, op1, op2]` from
+    // jtransform.py returns `[op3, op1, op2]` from
     // `handle_jit_marker__jit_merge_point`:
     //
     //     op1 = SpaceOperation('jit_merge_point', args, None)
@@ -3764,7 +3764,7 @@ pub(crate) fn lower_dispatch_body(
         quote::quote! { __builder.live_placeholder(); },
     );
 
-    // interp_jit.py:88-90 — pypyjitdriver.jit_merge_point(...) at the
+    // interp_jit.py — pypyjitdriver.jit_merge_point(...) at the
     // portal entry. A.3.2 fills greens; A.3.3 fills reds;
     // jdindex is the `__jdindex: i64` runtime parameter of
     // `__dispatch_jitcode_*` (jtransform.py:1704 portal_jd.index).
@@ -3802,9 +3802,9 @@ pub(crate) fn lower_dispatch_body(
         quote::quote! { __builder.live_placeholder(); },
     );
 
-    // jtransform.py:1714-1723 `handle_jit_marker__loop_header` emits the
+    // jtransform.py `handle_jit_marker__loop_header` emits the
     // `loop_header` op at the source-code `can_enter_jit()` call site
-    // (interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` inside
+    // (interp_jit.py `pypyjitdriver.can_enter_jit(...)` inside
     // `jump_absolute`).  In the lowered bytecode this lands at each
     // back-edge — NOT immediately after `jit_merge_point` at the top of
     // the dispatch loop.  pyre's `lower_dispatch_chain` emits one
@@ -3874,7 +3874,7 @@ pub(crate) fn lower_dispatch_body(
 
     // Task 1.5: emit dispatch chain.
     // pyopcode.py:183+ if/elif chain over opcode value.
-    // jtransform.py:196-225 optimize_goto_if_not fuses int_eq + goto_if_not
+    // jtransform.py optimize_goto_if_not fuses int_eq + goto_if_not
     // into goto_if_not_int_eq/iiL (BC_GOTO_IF_NOT_INT_EQ).
     let default_label =
         lower_dispatch_chain(&mut lowerer, classified_arms, config, &loop_start_label);

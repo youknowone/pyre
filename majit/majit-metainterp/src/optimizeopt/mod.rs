@@ -80,7 +80,7 @@ pub(crate) fn next_snapshot_pos<T>(store: &[Option<T>]) -> i32 {
 
 pub(crate) use crate::majit_log_enabled;
 
-/// info.py:865-894 `getrawptrinfo` / `getptrinfo` return shape, with
+/// info.py `getrawptrinfo` / `getptrinfo` return shape, with
 /// RPython `_forwarded` object identity preserved.
 ///
 /// Two variants mirror upstream's two return paths:
@@ -115,7 +115,7 @@ pub enum PtrInfoHandle {
 }
 
 impl PtrInfoHandle {
-    /// Wrap a freshly synthesized `ConstPtrInfo` (info.py:870-871 /
+    /// Wrap a freshly synthesized `ConstPtrInfo` (info.py /
     /// 888-889 return path).
     pub fn const_(info: PtrInfo) -> Self {
         PtrInfoHandle::Const(info)
@@ -132,7 +132,7 @@ impl PtrInfoHandle {
     /// Base `PtrInfo.same_info` is object identity (`self is other`,
     /// info.py:71-72), so non-constant live infos must share the same
     /// `_forwarded` cell. `ConstPtrInfo` overrides this and compares
-    /// the wrapped constant value (`_const.same_constant`, info.py:774-777),
+    /// the wrapped constant value (`_const.same_constant`, info.py),
     /// so two independently synthesized ConstPtrInfo handles for the
     /// same pointer are `same_info`.
     pub fn same_info(&self, other: &PtrInfoHandle) -> bool {
@@ -237,7 +237,7 @@ impl std::ops::Deref for PtrInfoHandleRef<'_> {
 
 /// IntBound counterpart to [`PtrInfoHandle`].
 ///
-/// `optimizer.py:99-113 getintbound(op)` returns the live `IntBound`
+/// `optimizer.py getintbound(op)` returns the live `IntBound`
 /// object stored on `box._forwarded`; downstream code calling
 /// `getintbound(box).intersect(b)` mutates that same object so any
 /// other holder observes the change.  In pyre, `OpInfo::IntBound`
@@ -365,7 +365,7 @@ impl std::ops::Deref for IntBoundHandleRef<'_> {
     }
 }
 
-/// info.py:13-15 INFO_NULL / INFO_NONNULL / INFO_UNKNOWN constants.
+/// info.py INFO_NULL / INFO_NONNULL / INFO_UNKNOWN constants.
 ///
 /// Re-exported from `majit_ir::optimize` so the bound / info types
 /// that reference them can be hosted there without a circular dep.
@@ -441,7 +441,7 @@ impl ImportedShortPureOp {
             .map(|a| ctx.materialize_operand_at(*a))
             .collect();
         let mut replay = majit_ir::Op::new(opcode, &replay_arg_boxes);
-        // shortpreamble.py:112-126 PureOp.produce_op constructs TWO distinct
+        // shortpreamble.py PureOp.produce_op constructs TWO distinct
         // RPython Op objects:
         //
         //   * `op` — the alt identifier. For invented_name it is
@@ -449,7 +449,7 @@ impl ImportedShortPureOp {
         //     a freshly-allocated Op with its own `_forwarded` slot.
         //   * `preamble_op` — the replay Op passed in from `add_op_to_short`.
         //     Its `_forwarded` slot is seeded with the exported info by
-        //     `ShortPreambleBuilder.__init__` (shortpreamble.py:425).
+        //     `ShortPreambleBuilder.__init__` (shortpreamble.py).
         //
         // The two `_forwarded` slots live on two different RPython Op
         // objects, so `op.set_forwarded(self.res)` and
@@ -459,7 +459,7 @@ impl ImportedShortPureOp {
         // RPython Box objects for every PureOp, not only invented aliases.
         // Keep their OpRef identities distinct as well: `source` names
         // self.res, while `result` names the replay operation — including
-        // the non-invented arm, where `add_op_to_short` (shortpreamble.py:140
+        // the non-invented arm, where `add_op_to_short` (shortpreamble.py
         // `op.copy_and_change(opnum, args=arglist)`) still hands
         // `ProducedShortOp` a freshly allocated replay op rather than
         // `self.res` itself.
@@ -507,7 +507,7 @@ pub struct ImportedShortAlias {
     pub same_as_opcode: OpCode,
 }
 
-/// optimizer.py:787-789: constant_fold — allocate an immutable object at
+/// optimizer.py: constant_fold — allocate an immutable object at
 /// compile time when all fields are constants. The callback receives the
 /// SizeDescr size_bytes, and returns a raw pointer (GcRef) to freshly
 /// allocated memory. The optimizer writes field values directly.
@@ -607,10 +607,10 @@ pub struct OptContext {
     /// last-occurrence semantics); rebuilt by `rebuild_new_operations_index`
     /// after the rare structural mutations, and cleared with the context.
     pub(crate) new_operations_index: FxHashMap<OpRef, majit_ir::OpRc>,
-    /// optimizer.py:246 `self._emittedoperations = {}` — the result boxes
+    /// optimizer.py `self._emittedoperations = {}` — the result boxes
     /// of ops emitted by THIS optimizer run, keyed by box identity
     /// (`Rc::ptr_eq`) to mirror the upstream dict keyed by the `op` object.
-    /// `as_operation` (optimizer.py:369-377) only treats a box as a producer
+    /// `as_operation` (optimizer.py) only treats a box as a producer
     /// when `op in self._emittedoperations`, so pattern-matching rewrites
     /// (e.g. autogenintrules.py int_add chain reassociation) never reach
     /// across an optimization-run boundary into a previous phase's ops.
@@ -649,7 +649,7 @@ pub struct OptContext {
     /// (`optimizer.py:594-596`) instead of ahead of everything still parked.
     ///
     /// Parked here rather than in a local so `flush_queued_producer` can still
-    /// reach one entry: `info.py:146-152 force_box` clears the virtual flag and
+    /// reach one entry: `info.py force_box` clears the virtual flag and
     /// emits the allocation as one step, while pyre's `emit_op` only queues the
     /// allocation when the force runs from a pass, so a store can be emitted
     /// while the `NEW_WITH_VTABLE` that defines it is still parked.
@@ -658,13 +658,13 @@ pub struct OptContext {
     /// Set by rewrite pass, executed by emit_operation after the guard
     /// is added to new_operations (matching RPython's callback pattern).
     pub(crate) pending_guard_class_postprocess: Option<PendingGuardClassPostprocess>,
-    /// virtualize.py:84-90 postprocess_FINISH queues the stashed
+    /// virtualize.py postprocess_FINISH queues the stashed
     /// GUARD_NOT_FORCED_2 here so the outer optimizer can insert it at
     /// `new_operations.len() - 1` with full `store_final_boxes_in_guard`
     /// semantics — the pass that stashes it holds no Optimizer, and both the
     /// finalization and the knowledge collection are Optimizer-side.
     pub(crate) pending_finish_guard_postprocess: Option<Op>,
-    /// rewrite.py:282: postprocess_GUARD_NONNULL → mark_last_guard.
+    /// rewrite.py: postprocess_GUARD_NONNULL → mark_last_guard.
     /// Deferred until emit adds the guard to new_operations.
     pub(crate) pending_mark_last_guard: Option<OpRef>,
     // ptr_info merged into forwarded (Forwarded::Info variant)
@@ -682,7 +682,7 @@ pub struct OptContext {
     /// (base_len, short_args): virtual field values start at base_len
     /// within short_args. Used by install_imported_virtuals.
     pub imported_virtual_args: Option<(usize, Vec<OpRef>)>,
-    /// `rewrite.py:39` `self.loop_invariant_results = {}` — keyed by
+    /// `rewrite.py` `self.loop_invariant_results = {}` — keyed by
     /// constant function pointer. PyPy uses a dict; pyre replaces it
     /// with a Vec of `(func_ptr, source_opref)` pairs and linear-scan
     /// dedup. CALL_LOOPINVARIANT is rare and the live set per trace is
@@ -698,7 +698,7 @@ pub struct OptContext {
     /// Tracks which imported short facts are actually consumed by the body.
     pub imported_short_preamble_builder:
         Option<crate::optimizeopt::shortpreamble::ShortPreambleBuilder>,
-    /// `optimizer.py:243` `self.quasi_immutable_deps = None` (initialized
+    /// `optimizer.py` `self.quasi_immutable_deps = None` (initialized
     /// lazily as a dict in `heap.py:821-823`). Each entry is one `QuasiImmut`
     /// instance the trace folded a field of, exactly as upstream keys the dict
     /// (`heap.py:821-823 quasi_immutable_deps[qmutdescr.qmut] = None`); PyPy
@@ -718,8 +718,8 @@ pub struct OptContext {
     /// order. PyPy uses dict-as-set; pyre uses a Vec with linear-scan
     /// dedup (small per trace).
     imported_short_preamble_used: Vec<OpRef>,
-    /// `unroll.py:37` `self.optunroll.potential_extra_ops[op] = preamble_op` /
-    /// `optimizer.py:354` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
+    /// `unroll.py` `self.optunroll.potential_extra_ops[op] = preamble_op` /
+    /// `optimizer.py` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
     /// A keyed map, like the dict upstream keeps: insert, pop and `in` are
     /// each one lookup, where the `Vec<(OpRef, PreambleOp)>` this replaced
     /// scanned the whole pool for all three.
@@ -753,7 +753,7 @@ pub struct OptContext {
     /// shortpreamble.py:251-253: a way to produce const boxes, e.g.
     /// `setfield_gc(p0, Const)`. We need to remember those, but they don't
     /// produce any new boxes. This list is consumed only by import-side
-    /// `produce_op` replay, never by `used_boxes`: unroll.py:33-36 never
+    /// `produce_op` replay, never by `used_boxes`: unroll.py never
     /// registers a const PreambleOp in `potential_extra_ops`. It carries no
     /// index alignment to the `PreviewShortState` vectors, so it stays on its
     /// own channel.
@@ -809,22 +809,22 @@ pub struct OptContext {
     /// by OptPure. Each entry: (opcode, arg0, arg1, result) meaning
     /// pure(opcode, arg0, arg1) = result.
     pub pending_pure_from_args2: Vec<(OpCode, OpRef, OpRef, OpRef)>,
-    /// optimizer.py:787: constant_fold allocator callback.
+    /// optimizer.py: constant_fold allocator callback.
     /// When set, the optimizer can fold immutable virtuals filled with
     /// constants into compile-time constant pointers (info.py:140-145).
     pub constant_fold_alloc: Option<ConstantFoldAllocFn>,
-    /// info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` — runtime hook for
+    /// info.py `ConstPtrInfo.getstrlen1(mode)` — runtime hook for
     /// constant byte-string / unicode-string length lookup. Set by the
     /// host runtime (pyre etc.) at OptContext construction time. When
     /// `None`, `EnsuredPtrInfo::getlenbound(Some(_))` falls back to
     /// `IntBound::nonnegative()`.
     pub string_length_resolver: Option<StringLengthResolver>,
-    /// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` — runtime hook for
+    /// info.py `ConstPtrInfo._unpack_str(mode)` — runtime hook for
     /// extracting character data from a constant string GcRef.
     pub string_content_resolver: Option<StringContentResolver>,
-    /// history.py:384 `get_const_ptr_for_string(s)` — runtime hook for
+    /// history.py `get_const_ptr_for_string(s)` — runtime hook for
     /// creating a constant string GcRef from char values (used by
-    /// force_box constant-folding path, vstring.py:79-90).
+    /// force_box constant-folding path, vstring.py).
     pub string_constant_alloc: Option<StringConstantAllocator>,
     /// True while optimizer.py:_emit_operation equivalent is forcing args
     /// just before final emission. In this phase, virtual forcing must emit
@@ -839,7 +839,7 @@ pub struct OptContext {
     /// calls this during optimization, not post-assembly).
     pub snapshot_boxes: SnapshotBoxes,
     /// Per-frame box counts for multi-frame snapshots.
-    /// opencoder.py:819 capture_resumedata encodes multiple frames;
+    /// opencoder.py capture_resumedata encodes multiple frames;
     /// this tracks the boundary between callee and caller sections.
     pub snapshot_frame_sizes: SnapshotFrameSizes,
     /// Per-guard virtualizable boxes from tracing-time snapshots.
@@ -851,12 +851,12 @@ pub struct OptContext {
     /// `default_pipeline_with_virtualizable` derives from the vable config.
     pub minimum_virtualizable_size: i64,
     /// Per-guard virtualref boxes from tracing-time snapshots.
-    /// resume.py:243-247 _number_boxes consumes vref_array as a section
+    /// resume.py _number_boxes consumes vref_array as a section
     /// after vable_array. opencoder.py:767 records vref_boxes here.
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc, py_pc) from tracing-time snapshots.
     pub snapshot_frame_pcs: SnapshotFramePcs,
-    /// optimizer.py:34 `self.inputargs = inputargs` parity.
+    /// optimizer.py `self.inputargs = inputargs` parity.
     /// Typed InputArg OpRefs; slot `i` is `OpRef::input_arg_typed(i, tp)`.
     pub inputargs: Vec<majit_ir::OpRef>,
     /// Strong `InputArgRc` ownership for the inputargs seeded by
@@ -988,7 +988,7 @@ pub struct OptContext {
     /// resume.py parity: RPython guards always get a snapshot via
     /// capture_resumedata; pyre tracks the nearest valid position.
     pub last_seen_snapshot_pos: Option<i32>,
-    /// `optimizer.cpu` (`model.py:39 AbstractCPU`) backref — the
+    /// `optimizer.cpu` (`model.py AbstractCPU`) backref — the
     /// shared backend services entry point Optimization sub-classes
     /// reach via `self.optimizer.cpu.<method>()` in RPython.  Pyre's
     /// OptContext (the shared state holder Optimization sub-classes
@@ -1008,12 +1008,12 @@ pub struct OptContext {
     /// header — `GUARD_IS_OBJECT` reads `obj - GcHeader::SIZE` and
     /// SIGBUSes on them. The pyre default matches the `True` branch
     /// (skip GUARD_IS_OBJECT, emit GUARD_NONNULL_CLASS as a single
-    /// op). Consumed by `info.py:338/:348 InstancePtrInfo.make_guards`.
+    /// op). Consumed by `info.py/:348 InstancePtrInfo.make_guards`.
     pub remove_gctypeptr: bool,
-    /// optimizer.py:84-92 `Optimization.last_emitted_operation` — set
+    /// optimizer.py `Optimization.last_emitted_operation` — set
     /// to the just-emitted op (or `REMOVED` sentinel) by the base
     /// class's `_emit_operation`, read by callers like
-    /// `optimize_GUARD_NO_EXCEPTION` (rewrite.py:712-718) to check
+    /// `optimize_GUARD_NO_EXCEPTION` (rewrite.py) to check
     /// whether the preceding op was dropped. The slot is updated on
     /// every emit across all passes, so a remove in pass N is visible
     /// to pass N+1.
@@ -1156,7 +1156,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_virtual_ref(&self, opref: OpRef) -> bool {
-        // info.py:880-886 getptrinfo(op) first applies get_box_replacement(op)
+        // info.py getptrinfo(op) first applies get_box_replacement(op)
         // before reading PtrInfo. Guard resume numbering walks ORIGINAL
         // snapshot boxes, so virtual classification must follow the same
         // replacement chain or forwarded virtual boxes get mis-tagged as
@@ -1169,7 +1169,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_virtual_raw(&self, opref: OpRef) -> bool {
-        // info.py:865 `RawBufferPtrInfo` / RawSlicePtrInfo — Int-typed
+        // info.py `RawBufferPtrInfo` / RawSlicePtrInfo — Int-typed
         // virtuals.  `get_type()` already classifies these as Int; mirror
         // the classification here so resume encoding
         // (`ResumeDataLoopMemo::_number_boxes`, whose `Type::Int` arm calls
@@ -1207,7 +1207,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
             PtrInfo::Virtual(vi) => Some(majit_ir::VirtualFieldsInfo {
                 descr: Some(vi.descr.clone()),
                 known_class: vi.known_class,
-                // info.py:243-247 `_visitor_walk_recursive` registers the
+                // info.py `_visitor_walk_recursive` registers the
                 // full `_fields` list in descriptor order, leaving unfilled
                 // slots as `None`. Preserve that shape so `fieldnums` aligns
                 // 1:1 with `descr.get_all_fielddescrs()` for `_cached_vinfo`
@@ -1274,7 +1274,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     .map(|vref| self.ctx.get_replacement_opref(*vref))
                     .collect(),
             }),
-            // `info.py:478-482` `RawSlicePtrInfo._visitor_walk_recursive`:
+            // `info.py` `RawSlicePtrInfo._visitor_walk_recursive`:
             //
             // ```python
             // def _visitor_walk_recursive(self, op, visitor):
@@ -1301,14 +1301,14 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
                     field_oprefs: vec![self.ctx.get_replacement_opref(vi.parent.to_opref())],
                 })
             }
-            // vstring.py:207-208 VStringPlainInfo._visitor_walk_recursive:
+            // vstring.py VStringPlainInfo._visitor_walk_recursive:
             //   `visitor.register_virtual_fields(instbox, self._chars)`
             //
-            // vstring.py:255-260 VStringSliceInfo._visitor_walk_recursive:
+            // vstring.py VStringSliceInfo._visitor_walk_recursive:
             //   `visitor.register_virtual_fields(instbox, [self.s, self.start, self.lgtop])`
             //   (then recurses into the parent string if it is itself virtual).
             //
-            // vstring.py:319-325 VStringConcatInfo._visitor_walk_recursive:
+            // vstring.py VStringConcatInfo._visitor_walk_recursive:
             //   `visitor.register_virtual_fields(instbox, [self.vleft, self.vright])`
             //
             // Only virtual StrPtrInfo variants register fields; a non-virtual
@@ -1364,7 +1364,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         let info = resolved_box
             .as_ref()
             .and_then(|b| self.ctx.peek_ptr_info(b))?;
-        // resume.py:307-315 `ResumeDataVirtualAdder.make_virtual_info`:
+        // resume.py `ResumeDataVirtualAdder.make_virtual_info`:
         //
         //     vinfo = info._cached_vinfo
         //     if vinfo is not None and vinfo.equals(fieldnums):
@@ -1388,7 +1388,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         }
         let mut builder = RdVirtualInfoBuilder;
         let mut vinfo = info.visitor_dispatch_virtual_type(&mut builder)??;
-        // resume.py:313: vinfo.set_content(fieldnums)
+        // resume.py: vinfo.set_content(fieldnums)
         vinfo.set_content(fieldnums);
         let shared = std::rc::Rc::new(vinfo);
         // resume.py:314: info._cached_vinfo = vinfo — store the shared handle
@@ -1432,7 +1432,7 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 }
 
-/// resume.py:298-357 `ResumeDataVirtualAdder` in its role as a
+/// resume.py `ResumeDataVirtualAdder` in its role as a
 /// `VirtualVisitor` — each `visit_*` builds a fresh `RdVirtualInfo`
 /// subclass without fieldnums (the caller attaches those via
 /// `set_content`). In pyre, `make_virtual_info` lives on the
@@ -1446,12 +1446,12 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
     type VInfo = Option<majit_ir::RdVirtualInfo>;
 
     fn visit_not_virtual(&mut self, _value: OpRef) -> Self::VInfo {
-        // resume.py:317-318 `visit_not_virtual` asserts unreachable.
+        // resume.py `visit_not_virtual` asserts unreachable.
         debug_assert!(false, "visit_not_virtual reached via virtual dispatch");
         None
     }
 
-    // resume.py:320-321 visit_virtual → VirtualInfo(descr, fielddescrs)
+    // resume.py visit_virtual → VirtualInfo(descr, fielddescrs)
     fn visit_virtual(
         &mut self,
         descr: &majit_ir::DescrRef,
@@ -1484,7 +1484,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         Some(majit_ir::RdVirtualInfo::VirtualInfo {
             descr: Some(descr.clone()),
             type_id: sd.map(|s| s.type_id()).unwrap_or(0),
-            // resume.py:619 allocate_with_vtable(descr=self.descr) — the
+            // resume.py allocate_with_vtable(descr=self.descr) — the
             // vtable is derived from descr; majit mirrors by reading it
             // off the SizeDescr when the descr carries class info.
             known_class: sd.map(|s| s.vtable() as i64).filter(|&v| v != 0),
@@ -1494,7 +1494,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         })
     }
 
-    // resume.py:323-324 visit_vstruct → VStructInfo(typedescr, fielddescrs)
+    // resume.py visit_vstruct → VStructInfo(typedescr, fielddescrs)
     fn visit_vstruct(
         &mut self,
         typedescr: &majit_ir::DescrRef,
@@ -1530,7 +1530,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         })
     }
 
-    // resume.py:326-330 visit_varray → VArrayInfoClear / VArrayInfoNotClear
+    // resume.py visit_varray → VArrayInfoClear / VArrayInfoNotClear
     fn visit_varray(&mut self, arraydescr: &majit_ir::DescrRef, clear: bool) -> Self::VInfo {
         let kind = arraydescr
             .as_array_descr()
@@ -1556,7 +1556,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         })
     }
 
-    // resume.py:332-333 visit_varraystruct → VArrayStructInfo
+    // resume.py visit_varraystruct → VArrayStructInfo
     fn visit_varraystruct(
         &mut self,
         arraydescr: &majit_ir::DescrRef,
@@ -1564,7 +1564,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         _fielddescr_indices: &[u32],
         fielddescrs: &[majit_ir::DescrRef],
     ) -> Self::VInfo {
-        // info.py:701-704: visitor_dispatch_virtual_type always hands
+        // info.py: visitor_dispatch_virtual_type always hands
         // down the canonical get_all_interiorfielddescrs() list; fall
         // back to the variant's cached fielddescrs when descr lacks it.
         let canonical_fielddescrs: Vec<majit_ir::DescrRef> = arraydescr
@@ -1610,7 +1610,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         })
     }
 
-    // resume.py:335-336 visit_vrawbuffer → VRawBufferInfo
+    // resume.py visit_vrawbuffer → VRawBufferInfo
     fn visit_vrawbuffer(
         &mut self,
         func: i64,
@@ -1626,7 +1626,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
                     index: d.index(),
                     base_size: ad.map_or(0, |a| a.base_size()),
                     item_size: ad.map_or(8, |a| a.item_size()),
-                    // descr.py:277 ArrayDescr.lendescr.offset — preserved
+                    // descr.py ArrayDescr.lendescr.offset — preserved
                     // across the resume summary so the materialize path
                     // sees the same length word offset the producer used.
                     len_offset: ad.and_then(|a| a.len_descr().map(|fd| fd.offset())),
@@ -1652,7 +1652,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         })
     }
 
-    // resume.py:338-339 visit_vrawslice → VRawSliceInfo
+    // resume.py visit_vrawslice → VRawSliceInfo
     fn visit_vrawslice(&mut self, offset: i64) -> Self::VInfo {
         Some(majit_ir::RdVirtualInfo::VRawSliceInfo {
             offset,
@@ -1660,7 +1660,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         })
     }
 
-    // resume.py:341-345 visit_vstrplain → VStrPlainInfo / VUniPlainInfo
+    // resume.py visit_vstrplain → VStrPlainInfo / VUniPlainInfo
     fn visit_vstrplain(&mut self, is_unicode: bool) -> Self::VInfo {
         Some(if is_unicode {
             majit_ir::RdVirtualInfo::VUniPlainInfo {
@@ -1673,7 +1673,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         })
     }
 
-    // resume.py:347-351 visit_vstrconcat → VStrConcatInfo / VUniConcatInfo
+    // resume.py visit_vstrconcat → VStrConcatInfo / VUniConcatInfo
     fn visit_vstrconcat(&mut self, is_unicode: bool) -> Self::VInfo {
         // resume.py:347-351 — visitor constructs the shell variant with
         // no funcptr; the decoder looks up OS_STR_CONCAT / OS_UNI_CONCAT
@@ -1690,7 +1690,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
         })
     }
 
-    // resume.py:353-357 visit_vstrslice → VStrSliceInfo / VUniSliceInfo
+    // resume.py visit_vstrslice → VStrSliceInfo / VUniSliceInfo
     fn visit_vstrslice(&mut self, is_unicode: bool) -> Self::VInfo {
         Some(if is_unicode {
             majit_ir::RdVirtualInfo::VUniSliceInfo {
@@ -1710,7 +1710,7 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
     }
 
     fn already_seen_virtual(&mut self, _virtualbox: OpRef) -> bool {
-        // resume.py:380-386 — same split as register_virtual_fields; the
+        // resume.py — same split as register_virtual_fields; the
         // pyre worklist tracks visited boxes directly.
         false
     }
@@ -1900,13 +1900,13 @@ impl OptContext {
     /// `Weak<InputArg>` owners (the previous OptContext's `inputarg_refs`)
     /// were dropped, leaving them dangling. Re-binding here restores
     /// `Forwarded::InputArg(_)` reachability for every InputArg operand the
-    /// optimizer will hand to `make_equal_to` (`optimizer.py:394
+    /// optimizer will hand to `make_equal_to` (`optimizer.py
     /// op.set_forwarded(newop)`, unroll.py:497). Idempotent — re-running
     /// re-mirrors each slot to the same `InputArgRc`.
     pub(crate) fn ensure_inputarg_bindings(&mut self) {
         // Derive the materialized InputArg positions from `ctx` state.
         // The InputArg positions are exactly the
-        // canonical/inherited set (`self.inputargs` = `optimizer.py:34
+        // canonical/inherited set (`self.inputargs` = `optimizer.py
         // self.inputargs`, positions `[0, num_inputs)` carried across Phase 1 →
         // Phase 2 by `opt_p2.trace_inputargs = self.trace_inputargs`) UNION the
         // fresh per-iteration label set at `[inputarg_base, inputarg_base +
@@ -2026,7 +2026,7 @@ impl OptContext {
     /// The producer of `opref` among the ops emitted so far by this optimizer
     /// run, or `None` when nothing at that position has been emitted.
     /// Unlike [`Self::find_producer_op`] this consults only `new_operations`,
-    /// which is what optimizer.py:369-377 `as_operation` tests
+    /// which is what optimizer.py `as_operation` tests
     /// (`op in self._emittedoperations`).
     pub(crate) fn producer_in_new_operations(&self, opref: OpRef) -> Option<majit_ir::OpRc> {
         if opref.is_none() || opref.is_constant() {
@@ -2137,7 +2137,7 @@ impl OptContext {
     /// Make `op` the sole registered producer at its result position,
     /// inheriting any superseded stand-in's accumulated `_forwarded`.
     ///
-    /// optimizer.py:403-411 `replace_op_with`: after `newop =
+    /// optimizer.py `replace_op_with`: after `newop =
     /// op.copy_and_change(..)` it carries the prior host's info forward —
     /// `opinfo = get_box_replacement(op).get_forwarded(); if opinfo is not
     /// None: newop.set_forwarded(opinfo)` — and only then `op.set_forwarded(
@@ -2172,7 +2172,7 @@ impl OptContext {
         {
             let carried = superseded.forwarded.borrow().clone();
             *op.forwarded.borrow_mut() = carried;
-            // replace_op_with parity (optimizer.py:403-411): forward the
+            // replace_op_with parity (optimizer.py): forward the
             // superseded stand-in to `op`. A consumer dispatched before
             // this supersession bound its operand to `superseded` (the
             // producer registered at its dispatch-entry rebind); without
@@ -2270,7 +2270,7 @@ impl OptContext {
     }
 
     /// Write `Forwarded::None` to the canonical host for
-    /// `opref` (`resoperation.py:240` `set_forwarded(None)` /
+    /// `opref` (`resoperation.py` `set_forwarded(None)` /
     /// `:50` clear semantics). No-op for sentinel `OpRef::none()`,
     /// constants (whose `_forwarded` is permanently `None`), and
     /// positions without a canonical Op/InputArg.
@@ -2516,7 +2516,7 @@ impl OptContext {
         OpRef::op_typed(pos, value.get_type())
     }
 
-    /// info.py:148,226 emit during force_box: routes through emit_extra
+    /// info.py emit during force_box: routes through emit_extra
     /// normally, or direct emit when in_final_emission is true.
     pub fn emit_for_force(&mut self, op: Op) -> OpRef {
         if self.in_final_emission {
@@ -2578,7 +2578,7 @@ impl OptContext {
         opref
     }
 
-    /// optimizer.py:509-515 new_const_item(arraydescr) — default value for
+    /// optimizer.py new_const_item(arraydescr) — default value for
     /// the given item type. Uses emit_extra (downstream-only) so this is
     /// safe to call during force_box / force_virtual.
     pub fn new_const_item(&mut self, item_type: Type) -> OpRef {
@@ -2589,7 +2589,7 @@ impl OptContext {
         }
     }
 
-    /// optimizer.py:528-534 new_const(fielddescr) — default value for an
+    /// optimizer.py new_const(fielddescr) — default value for an
     /// unset field of a freshly allocated virtual struct.  GC allocations are
     /// zero-filled, so optimizeopt can answer the read without materialising
     /// the virtual.
@@ -2611,7 +2611,7 @@ impl OptContext {
         self.getstrlen_for(opref, opref, mode)
     }
 
-    /// vstring.py:110-119 StrPtrInfo.getstrlen(op, optstring, mode)
+    /// vstring.py StrPtrInfo.getstrlen(op, optstring, mode)
     ///
     /// Matches RPython's method dispatch where `self` (info) and `op` may
     /// differ: info lookup comes from `info_opref`, but the fallback STRLEN
@@ -2641,7 +2641,7 @@ impl OptContext {
             }
             return len_opref;
         }
-        // vstring.py:281-295: VStringConcatInfo.getstrlen — recursive
+        // vstring.py: VStringConcatInfo.getstrlen — recursive
         // dispatch: getstrlen on each child, then _int_add.
         // Borrow-checker adaptation: extract vleft/vright before &mut self calls.
         let concat_children = resolved_box
@@ -2664,13 +2664,13 @@ impl OptContext {
             let right_len = self.materialize_operand_at(right_len);
             let result =
                 crate::optimizeopt::vstring::_int_add(&left_len, &right_len, self).to_opref();
-            // vstring.py:293: self.lgtop = _int_add(optstring, len1box, len2box)
+            // vstring.py: self.lgtop = _int_add(optstring, len1box, len2box)
             if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
                 self.set_str_lgtop(&b, result);
             }
             return result;
         }
-        // vstring.py:115-118: base StrPtrInfo — emit STRLEN/UNICODELEN
+        // vstring.py: base StrPtrInfo — emit STRLEN/UNICODELEN
         // RPython: lengthop = ResOperation(mode.STRLEN, [op])
         // `op` comes from op_opref (the first arg to getstrlen in RPython).
         let op_resolved = self.get_replacement_opref(op_opref);
@@ -2682,7 +2682,7 @@ impl OptContext {
         let arg1 = self.materialize_operand_at(op_resolved);
         let strlen_op = majit_ir::Op::new(strlen_opcode, &[arg1]);
         let result = self.emit_extra(self.current_pass_idx, strlen_op);
-        // vstring.py:116: lengthop.set_forwarded(self.getlenbound(mode))
+        // vstring.py: lengthop.set_forwarded(self.getlenbound(mode))
         // `set_forwarded` writes the bound unconditionally; route through
         // `materialize_operand_at` so the new STRLEN/UNICODELEN box materializes for
         // the IntBound install ("Box always exists" per resoperation.py:233-248).
@@ -2728,7 +2728,7 @@ impl OptContext {
         });
     }
 
-    /// `vstring.py:62-70 StrPtrInfo.getlenbound(mode)` — get lenbound
+    /// `vstring.py StrPtrInfo.getlenbound(mode)` — get lenbound
     /// from StrPtrInfo, lazily initializing it from self.length:
     /// ```python
     /// def getlenbound(self, mode):
@@ -2767,7 +2767,7 @@ impl OptContext {
     }
 
     /// Typed `reserve_pos`. Tags the resulting OpRef with the producer's
-    /// result type so `AbstractValue.type` parity (resoperation.py:29)
+    /// result type so `AbstractValue.type` parity (resoperation.py)
     /// is set at allocation time. Readers consult
     /// `opref.ty()` at priority 0 in `opref_type` / `OptBoxEnv::get_type`,
     /// so typed positions never grow `value_types`.
@@ -2910,7 +2910,7 @@ impl OptContext {
             // Tag the freshly allocated position with the producer op's
             // result type so the variant-tag readers
             // (`opref_type`/`OptBoxEnv::get_type`) resolve at priority 0
-            // (resoperation.py:1693 `opclasses[opnum].type` parity).
+            // (resoperation.py `opclasses[opnum].type` parity).
             op.pos.set(self.reserve_pos_typed(op.result_type()));
         } else {
             // Position invariants for an op that already carries a position:
@@ -2972,15 +2972,15 @@ impl OptContext {
         // has unique identity. The forwarding set by import_box must
         // survive body op emission for consumer switchover to work.
 
-        // RPython optimizer.py:652-686 emit_guard_operation — guard resume
+        // RPython optimizer.py emit_guard_operation — guard resume
         // data sharing via _copy_resume_data_from / ResumeGuardCopiedDescr.
         //
         // RPython has exactly one emit path (`Optimizer._emit_operation`,
-        // optimizer.py:614).  Pyre's `Optimizer::emit_operation`
+        // optimizer.py).  Pyre's `Optimizer::emit_operation`
         // (`optimizer.rs`) handles guard dispatch (force_box on args,
         // emit_guard_operation, force_box on fail_args, _maybe_replace_guard_value)
         // and then calls `ctx.emit(op.clone())` for the
-        // `_newoperations.append(op)` step (optimizer.py:646).  The
+        // `_newoperations.append(op)` step (optimizer.py).  The
         // OptContext-side emit_guard_operation is the standalone path
         // used by unit tests that drive `OptContext::emit` directly
         // without going through `Optimizer::emit_operation`.
@@ -3000,7 +3000,7 @@ impl OptContext {
                 self.emit_guard_operation(&mut op);
             }
         } else if !self.in_final_emission {
-            // optimizer.py:705-711: is_call_pure_pure_canraise — CallPure that
+            // optimizer.py: is_call_pure_pure_canraise — CallPure that
             // can_raise(ignore_memoryerror=True) counts as side-effectful even
             // though has_no_side_effect is true for call_pure opcodes.
             let dominated_by_side_effect = !((op.opcode.has_no_side_effect()
@@ -3056,7 +3056,7 @@ impl OptContext {
                     Some(d) => reused.setdescr(d),
                     None => reused.cleardescr(),
                 }
-                // optimizer.py:674 `self._emittedoperations[op] = None`. The
+                // optimizer.py `self._emittedoperations[op] = None`. The
                 // clone path below records this too; `get_producing_op` only
                 // admits producers present here, so the reused op must be
                 // marked emitted or it stays invisible to producer matching.
@@ -3099,7 +3099,7 @@ impl OptContext {
                 synth.set_forwarded_op(&op_rc);
             }
         }
-        // optimizer.py:674 `self._emittedoperations[op] = None`.
+        // optimizer.py `self._emittedoperations[op] = None`.
         self.emitted_operations
             .insert(majit_ir::operand::Operand::from_bound_op(&op_rc));
         self.push_new_operation(op_rc);
@@ -3171,7 +3171,7 @@ impl OptContext {
 
     /// Queue `op` to be (re)processed by the pass chain starting at
     /// `start_pass`. `emit_extra` enters downstream of the caller; head
-    /// re-dispatch (`send_extra_operation`, optimizer.py:594-596 with
+    /// re-dispatch (`send_extra_operation`, optimizer.py with
     /// `opt=first_optimization`) enters at pass 0.
     fn emit_extra_at(&mut self, start_pass: usize, mut op: Op) -> OpRef {
         if op.pos.get().is_none() {
@@ -3195,7 +3195,7 @@ impl OptContext {
         pos_ref
     }
 
-    /// optimizer.py:594-596 send_extra_operation(op) with `opt=None`:
+    /// optimizer.py send_extra_operation(op) with `opt=None`:
     /// re-dispatch an operation from `first_optimization` (the head of the
     /// pass chain, pass 0), so every pass — including those BEFORE the caller,
     /// e.g. OptIntBounds — reprocesses it. `emit_for_force` only routes through
@@ -3254,7 +3254,7 @@ impl OptContext {
         self.imported_short_preamble_used.clear();
     }
 
-    /// shortpreamble.py:409-430 ShortPreambleBuilder constructor parity.
+    /// shortpreamble.py ShortPreambleBuilder constructor parity.
     ///
     /// Reads `exported_state.short_boxes` (RPython `ExportedState.short_boxes`)
     /// directly, classifying each `ProducedShortOp.preamble_op.args` as
@@ -3289,7 +3289,7 @@ impl OptContext {
             PreambleOpKind, ProducedShortOp, ShortPreambleBuilder,
         };
 
-        // shortpreamble.py:414-426 ShortPreambleBuilder.__init__ parity:
+        // shortpreamble.py ShortPreambleBuilder.__init__ parity:
         //
         //   for produced_op in short_boxes:
         //       op = produced_op.short_op.res
@@ -3339,7 +3339,7 @@ impl OptContext {
             // Look up by the result BOX (`produced_op.res`) — the exporter keyed
             // `_expand_info(produced_op.res)` by the same Rc (cloned from the
             // shared `exported_short_boxes` entry), so the box-identity lookup
-            // hits. unroll.py:483 gates only `_expand_info`; const heap short
+            // hits. unroll.py gates only `_expand_info`; const heap short
             // boxes take the optimizer.getinfo(op) arm at
             // shortpreamble.py:419-420. They travel on the separate const
             // channel, so a Const arriving through this non-const list is
@@ -3388,7 +3388,7 @@ impl OptContext {
                 majit_ir::Type::Void => OpCode::CallLoopinvariantN,
             }
         };
-        // shortpreamble.py:283 `ShortBoxes.produce_arg` — classify an arg
+        // shortpreamble.py `ShortBoxes.produce_arg` — classify an arg
         // through the shared classifier, then collapse the Slot/Const/
         // Produced variants down to the Phase-2 OpRef the builder needs.
         // Sharing the classifier with `ProducedShortOp::produce_op` (which
@@ -3413,7 +3413,7 @@ impl OptContext {
                 crate::optimizeopt::ImportedShortPureArg::Const(_, r) => r,
             })
         };
-        // shortpreamble.py:283-296 produce_arg object-carry: a dependency
+        // shortpreamble.py produce_arg object-carry: a dependency
         // arg is the dep's replay op OBJECT (upstream returns
         // `produced_short_boxes[op].preamble_op`). Bind dep args to the
         // dep entry's replay Rc (the same dual-key dict the builder will
@@ -3552,7 +3552,7 @@ impl OptContext {
                                 majit_ir::Type::Float => OpCode::GetarrayitemGcF,
                                 majit_ir::Type::Void => return false,
                             };
-                            // shortpreamble.py:81 `g.getarg(1).getint()`:
+                            // shortpreamble.py `g.getarg(1).getint()`:
                             // pull the integer VALUE through the shared
                             // `classify_short_arg` rule. `OpRef::raw()` is a
                             // tagged trace position — not the constant value.
@@ -3644,7 +3644,7 @@ impl OptContext {
         true
     }
 
-    /// unroll.py:26-39: force_op_from_preamble(preamble_op)
+    /// unroll.py: force_op_from_preamble(preamble_op)
     ///
     /// RPython receives a PreambleOp with invented_name already set.
     /// Calls use_box then registers in potential_extra_ops.
@@ -3736,7 +3736,7 @@ impl OptContext {
                 self.potential_extra_ops.insert(key, preamble_op.clone());
             }
         }
-        // unroll.py:38 `return preamble_op.op`. RPython's `preamble_op.op`
+        // unroll.py `return preamble_op.op`. RPython's `preamble_op.op`
         // equals `self.res` (shortpreamble.py:120 `op = self.res`); pyre's
         // Phase 1 source IS `self.res` for the imported short box. Return
         // it directly so non-invented Pure body references resolve through
@@ -3744,7 +3744,7 @@ impl OptContext {
         // (unroll.rs `assemble_peeled_trace_with_jump_args`) extends
         // `LABEL.arglist` with that Phase 1 OpRef when the body actually
         // uses it; the orthodox `force_box → potential_extra_ops.pop →
-        // add_preamble_op` path (shortpreamble.py:432-440) handles
+        // add_preamble_op` path (shortpreamble.py) handles
         // `used_boxes` / `short_preamble_jump` / `extra_same_as` for the
         // imported short box.
         let _ = result;
@@ -3793,19 +3793,19 @@ impl OptContext {
         // `use_box`
         // to mirror `arg.set_forwarded(None)` without clearing optimizer info.
         enum ForwardedInfo {
-            // shortpreamble.py:376-379 EmptyInfo / empty_info sentinel.
+            // shortpreamble.py EmptyInfo / empty_info sentinel.
             // Its presence is meaningful for short-preamble dedup, but it
             // intentionally emits no guards.
             Empty,
-            // info.py:600 PtrInfo + ConstPtrInfo (info.py:706). PtrInfo
+            // info.py PtrInfo + ConstPtrInfo (info.py). PtrInfo
             // dispatches further to ConstPtrInfo::make_guards when the
             // PtrInfo is a Constant variant.
             Ptr(PtrInfo),
-            // intutils.py:1264 IntBound::make_guards. Constant ints come
+            // intutils.py IntBound::make_guards. Constant ints come
             // through this arm via IntBound::is_constant().
             Int(crate::optimizeopt::intutils::IntBound),
-            // info.py:851 FloatConstInfo carries a single ConstFloat;
-            // make_guards (info.py:861) emits a GUARD_VALUE pinning `op`
+            // info.py FloatConstInfo carries a single ConstFloat;
+            // make_guards (info.py) emits a GUARD_VALUE pinning `op`
             // to the ConstFloat. `set_preamble_forwarded_info` plants this
             // shape per shortpreamble.py:416
             // `preamble_op.set_forwarded(info)`.
@@ -3815,12 +3815,12 @@ impl OptContext {
             // shortpreamble.py:387 `info = arg.get_forwarded()` — PyPy
             // returns the AbstractInfo subtype stored in `_forwarded`.
             // Pyre's canonical `_forwarded` host carries:
-            //   `Forwarded::Info(OpInfo::Ptr(_))` — info.py:600 PtrInfo
+            //   `Forwarded::Info(OpInfo::Ptr(_))` — info.py PtrInfo
             //   `Forwarded::Info(OpInfo::IntBound(_))` — intutils.py
-            //   `Forwarded::Info(OpInfo::FloatConstInfo(_))` — info.py:851
+            //   `Forwarded::Info(OpInfo::FloatConstInfo(_))` — info.py
             //       FloatConstInfo planted via set_preamble_forwarded_info.
             //   `Forwarded::Info(OpInfo::EmptyInfo(_))` —
-            //       shortpreamble.py:379 empty_info.
+            //       shortpreamble.py empty_info.
             let forwarded = ctx.read_forwarded(arg)?;
             use crate::optimizeopt::info::OpInfo;
             match &forwarded {
@@ -3854,7 +3854,7 @@ impl OptContext {
             if arg.is_constant() || arg.is_none() {
                 continue;
             }
-            // shortpreamble.py:386 `isinstance(arg, AbstractInputArg)` — the
+            // shortpreamble.py `isinstance(arg, AbstractInputArg)` — the
             // classification is the arg's TYPE, not membership in
             // `short_inputargs`. A renamed short inputarg and an original
             // label arg are both AbstractInputArg; either way an input arg's
@@ -3891,11 +3891,11 @@ impl OptContext {
         // (mirroring `ConstInt` / `ConstPtr` inline construction); producer
         // OpRefs come from `alloc_op_position_typed`.
         let mut arg_guards = Vec::new();
-        // info.py:861 FloatConstInfo.make_guards / ConstPtrInfo path —
+        // info.py FloatConstInfo.make_guards / ConstPtrInfo path —
         // single-value info classes emit a GUARD_VALUE that pins `op` to
         // the recorded constant.
         let emit_const_guard = |arg: OpRef, value: &Value, guards: &mut Vec<Op>, ctx: &mut Self| {
-            // history.py:227/268/314 Const{Int,Float,Ptr}.value inline —
+            // history.py/268/314 Const{Int,Float,Ptr}.value inline —
             // GUARD_VALUE second operand is the inline-Const directly.
             let c = match value {
                 Value::Int(v) => OpRef::const_int(*v),
@@ -3903,7 +3903,7 @@ impl OptContext {
                 Value::Ref(v) => OpRef::const_ptr(*v),
                 Value::Void => panic!("emit_const_guard: ConstVoid not allowed"),
             };
-            // ConstInt/Float/Ptr value rides inline on `c` (history.py:227/
+            // ConstInt/Float/Ptr value rides inline on `c` (history.py/
             // 268/314); no `seed_constant` step (its const arm is a no-op).
             let arg_b = ctx.materialize_operand_at(arg);
             let c_b = ctx.materialize_operand_at(c);
@@ -3941,7 +3941,7 @@ impl OptContext {
         Some((arg_guards, result_guards))
     }
 
-    /// shortpreamble.py:425 `preamble_op.set_forwarded(info)` for imported
+    /// shortpreamble.py `preamble_op.set_forwarded(info)` for imported
     /// short preamble ops. Store the same family of info values that RPython
     /// stores in `_forwarded`, without transforming them through
     /// `setinfo_from_preamble` yet.
@@ -3959,7 +3959,7 @@ impl OptContext {
         {
             return;
         }
-        // shortpreamble.py:425 `preamble_op.set_forwarded(info)`. The replay
+        // shortpreamble.py `preamble_op.set_forwarded(info)`. The replay
         // OpRef is a short-preamble op whose producer may not be registered
         // yet (the Pure / Heap / LoopInvariant replay slot is seeded here,
         // before the short-preamble body that builds the producing op).
@@ -4023,14 +4023,14 @@ impl OptContext {
                 majit_ir::forwarding::Forwarded::Info(OpInfo::IntBound(ib)) => {
                     Some(OpInfo::IntBound(ib.clone()))
                 }
-                // info.py:851 FloatConstInfo planted via
+                // info.py FloatConstInfo planted via
                 // `set_preamble_forwarded_info` (shortpreamble.py:416
                 // `preamble_op.set_forwarded(info)`).
                 majit_ir::forwarding::Forwarded::Info(OpInfo::FloatConstInfo(f)) => {
                     Some(OpInfo::FloatConstInfo(*f))
                 }
                 majit_ir::forwarding::Forwarded::Const(c) => {
-                    // optimizer.py:329-338 `getinfo` parity for the Const
+                    // optimizer.py `getinfo` parity for the Const
                     // terminal — Refs surface as `ConstPtrInfo`, Floats as
                     // `FloatConstInfo`, Ints as `IntBound::from_constant`.
                     match *c {
@@ -4057,15 +4057,15 @@ impl OptContext {
         result
     }
 
-    /// unroll.py:53-98: setinfo_from_preamble(op, preamble_info, exported_infos)
+    /// unroll.py: setinfo_from_preamble(op, preamble_info, exported_infos)
     /// RPython uses sequential `if` (not elif) so multiple properties accumulate.
-    /// `exported_infos`: None from use_box path (shortpreamble.py:404),
+    /// `exported_infos`: None from use_box path (shortpreamble.py),
     /// Some from import_state path. When None, virtual branch does NOT recurse.
     ///
     /// `preamble_info_handle` is the live `Rc<RefCell<PtrInfo>>` cell from
     /// the exporter's `_forwarded` slot (or the shortpreamble entry's
     /// `OpInfo::Ptr(rc)`). The virtual branch shares the SAME `Rc`
-    /// (`unroll.py:61` `op.set_forwarded(preamble_info)`) so future
+    /// (`unroll.py` `op.set_forwarded(preamble_info)`) so future
     /// mutations to virtual fields propagate through both export and
     /// import sides — RPython object identity. Non-virtual branches
     /// snapshot the inner `PtrInfo` once because they intentionally
@@ -4114,7 +4114,7 @@ impl OptContext {
                 ));
             }
             if let Some(infos) = exported_infos {
-                // unroll.py:61-62: setinfo_from_preamble_list(
+                // unroll.py: setinfo_from_preamble_list(
                 //     preamble_info.all_items(), exported_infos).
                 // Read field BOXES via `all_items()` — the SAME accessor the
                 // exporter (`_expand_infos_from_virtual`) walks on this shared
@@ -4203,7 +4203,7 @@ impl OptContext {
         }
     }
 
-    /// unroll.py:41-51 setinfo_from_preamble_list(lst, infos):
+    /// unroll.py setinfo_from_preamble_list(lst, infos):
     ///
     /// ```python
     /// def setinfo_from_preamble_list(self, lst, infos):
@@ -4247,7 +4247,7 @@ impl OptContext {
             // box-keyed dict does.
             match exported_infos.get(item).cloned() {
                 Some(info) => {
-                    // unroll.py:47: self.setinfo_from_preamble(item, i, infos)
+                    // unroll.py: self.setinfo_from_preamble(item, i, infos)
                     self.setinfo_from_preamble_item(item, &info, exported_infos);
                 }
                 None => {
@@ -4264,10 +4264,10 @@ impl OptContext {
         }
     }
 
-    /// unroll.py:53-98 `setinfo_from_preamble(op, preamble_info, exported_infos)`.
+    /// unroll.py `setinfo_from_preamble(op, preamble_info, exported_infos)`.
     ///
     /// Shared dispatcher covering the `isinstance(preamble_info, ...)` chain
-    /// at unroll.py:59, 93, 97 — used by both `setinfo_from_preamble_list`
+    /// at unroll.py, 93, 97 — used by both `setinfo_from_preamble_list`
     /// (mod.rs recursive virtual field walker) and `OptUnroll::import_state`
     /// (unroll.rs top-level import). Centralising the dispatch avoids
     /// diverging shortcuts that skip the early-return checks.
@@ -4329,7 +4329,7 @@ impl OptContext {
             // unroll.py:53-98 has no dispatch arm for "no info" — the
             // caller never stores an `Unknown` entry in `exported_infos`
             // (see `collect_exported_info`'s `None` return
-            // in `unroll.rs`, mirroring unroll.py:440 `if info:`).
+            // in `unroll.rs`, mirroring unroll.py `if info:`).
             OpInfo::Unknown | OpInfo::EmptyInfo(_) => unreachable!(
                 "exported_infos must never contain OpInfo::Unknown/EmptyInfo; \
                  the absent-entry branch (clear_forwarded) handles that case"
@@ -4380,7 +4380,7 @@ impl OptContext {
         }
     }
 
-    /// `optimizer.py:354` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
+    /// `optimizer.py` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
     pub fn take_potential_extra_op(
         &mut self,
         result: OpRef,
@@ -4388,7 +4388,7 @@ impl OptContext {
         self.potential_extra_ops.swap_remove(&result)
     }
 
-    /// `unroll.py:37` `self.optunroll.potential_extra_ops[op] = preamble_op` —
+    /// `unroll.py` `self.optunroll.potential_extra_ops[op] = preamble_op` —
     /// dict-assign semantics: overwrite if `key` exists, else append.
     pub fn set_potential_extra_op(
         &mut self,
@@ -4431,7 +4431,7 @@ impl OptContext {
         &self,
     ) -> Option<crate::optimizeopt::shortpreamble::ShortPreamble> {
         self.active_short_preamble_producer.as_ref().map(|builder| {
-            // history.py:227/268/314 — `Const{Int,Float,Ptr}.value` rides
+            // history.py/268/314 — `Const{Int,Float,Ptr}.value` rides
             // inline on the OpRef; producer-side `make_constant` writes
             // inline-Const variants into `op.args` directly, so no
             // `loop_constants` snapshot is needed at this boundary.
@@ -4451,7 +4451,7 @@ impl OptContext {
         self.imported_short_preamble_builder
             .as_ref()
             .map(|builder| {
-                // history.py:227/268/314 — `Const{Int,Float,Ptr}.value`
+                // history.py/268/314 — `Const{Int,Float,Ptr}.value`
                 // rides inline on the OpRef. `make_constant` mints
                 // `Const*` variants directly into `op.args`, so the
                 // cross-compile `loop_constants` snapshot is empty
@@ -4523,7 +4523,7 @@ impl OptContext {
             .push((opcode, arg0, arg1, result));
     }
 
-    /// `optimizer.py:390-401 make_equal_to(op, newop)` (line-by-line port):
+    /// `optimizer.py make_equal_to(op, newop)` (line-by-line port):
     ///
     /// ```python
     /// def make_equal_to(self, op, newop):
@@ -4541,7 +4541,7 @@ impl OptContext {
         if op.is_constant() {
             return;
         }
-        // optimizer.py:391 op = get_box_replacement(op)
+        // optimizer.py op = get_box_replacement(op)
         let op = op.get_box_replacement(false);
         // optimizer.py:387 Box.type invariant: cross-type forwards would
         // silently retype the chain head. Always-on (not `debug_assert_eq!`)
@@ -4601,7 +4601,7 @@ impl OptContext {
         } else if let Some(target_op) = newop.bound_op() {
             // Op-target chain step: route through Forwarded::Op(Weak<Op>)
             // so the chain refers to the canonical Rc<Op> (PyPy
-            // resoperation.py:240 set_forwarded(forwarded_to) where
+            // resoperation.py set_forwarded(forwarded_to) where
             // forwarded_to is an AbstractResOp), i.e. the
             // `Forwarded::Op` forwarding step.
             //
@@ -4621,7 +4621,7 @@ impl OptContext {
             }
             op.set_forwarded_op(&target_op);
         } else if let Some(target_ia) = newop.bound_inputarg() {
-            // InputArg-target chain step (compile.py:478, unroll.py:497).
+            // InputArg-target chain step (compile.py:478, unroll.py).
             // Same `optimizer.py:392` idempotent gate as the
             // `bound_op` arm above, against the bound `InputArg`
             // identities.
@@ -4654,7 +4654,7 @@ impl OptContext {
         }
     }
 
-    /// info.py:111-118 `mark_last_guard(optimizer)` parity (line-by-line port).
+    /// info.py `mark_last_guard(optimizer)` parity (line-by-line port).
     ///
     /// ```python
     /// def mark_last_guard(self, optimizer):
@@ -4666,7 +4666,7 @@ impl OptContext {
     /// ```
     ///
     /// Upstream defines this as a method ON `PtrInfo`
-    /// (`opinfo.mark_last_guard(self.optimizer)` per optimizer.py:151);
+    /// (`opinfo.mark_last_guard(self.optimizer)` per optimizer.py);
     /// pyre keeps it at the `OptContext` level so the chain walk and
     /// `ptr_info_mut` interior-mutability stay together. Semantics match
     /// the upstream method: no-op when the last emitted op is not a guard,
@@ -4686,7 +4686,7 @@ impl OptContext {
         }
     }
 
-    /// info.py:100-103 `get_last_guard(optimizer)` parity (line-by-line port).
+    /// info.py `get_last_guard(optimizer)` parity (line-by-line port).
     ///
     /// ```python
     /// def get_last_guard(self, optimizer):
@@ -4704,7 +4704,7 @@ impl OptContext {
         if self.new_operations_drained {
             return None;
         }
-        // info.py:100-103: read last_guard_pos from terminal PtrInfo.
+        // info.py: read last_guard_pos from terminal PtrInfo.
         let resolved = op.get_box_replacement(false);
         let pos = resolved.ptr_info().and_then(|p| p.get_last_guard_pos())?;
         let op = self.new_operations.get(pos).map(|rc| rc.as_ref())?;
@@ -4715,7 +4715,7 @@ impl OptContext {
         Some(op)
     }
 
-    /// resoperation.py:57-68 get_box_replacement: follow the forwarding
+    /// resoperation.py get_box_replacement: follow the forwarding
     /// chain (op._forwarded) until we reach a terminal. RPython: walks
     /// op → op._forwarded → ... until None or Info instance.
     ///
@@ -4792,7 +4792,7 @@ impl OptContext {
     ///
     /// Total, like the operand sibling [`Operand::get_box_replacement`]
     /// (returns the position-only operand on a miss) and
-    /// `get_box_replacement` (resoperation.py:57-68 returns `op` itself when the
+    /// `get_box_replacement` (resoperation.py returns `op` itself when the
     /// `_forwarded` chain is empty). A position that resolves to neither a
     /// producer `Op`, an `inputarg_refs` slot, nor a Const falls back to
     /// [`Operand::bound_from_opref`], which mints a synthetic producer carrying
@@ -4817,7 +4817,7 @@ impl OptContext {
     /// `_forwarded` host for `opref` as an [`Operand`] (`Op` / `InputArg`),
     /// minting a `SameAs*` synthetic into `resop_refs` when no producer is
     /// registered yet (the lazy-alloc arm). For a const-namespace OpRef
-    /// returns a fresh `Operand::Const` (`history.py:220` no-dedup; Const
+    /// returns a fresh `Operand::Const` (`history.py` no-dedup; Const
     /// boxes have no `_forwarded`, so any write the caller attempts is a
     /// no-op). Unlike `resolve_to_operand` it never returns `None` for a
     /// value-bearing OpRef — the explicit-mint endpoint (#47) at
@@ -4845,7 +4845,7 @@ impl OptContext {
             "materialize_operand_at: sentinel OpRef::none() has no operand"
         );
         if opref.is_constant() {
-            // history.py:220/261/307: a Const carries its Value on the OpRef.
+            // history.py/261/307: a Const carries its Value on the OpRef.
             let value = self.get_constant(opref).unwrap_or_else(|| {
                 panic!(
                     "materialize_operand_at: const OpRef {opref:?} carries no Value — \
@@ -5196,12 +5196,12 @@ impl OptContext {
             .map(|start| start.get_box_replacement(false))
     }
 
-    /// `optimizer.py:1009 getptrinfo + info.is_virtual()` operand-path
+    /// `optimizer.py getptrinfo + info.is_virtual()` operand-path
     /// helper. Returns whether the box at `opref` (after chain walk)
     /// carries a `PtrInfo` whose `is_virtual()` is true. Reads via
     /// `Operand::ptr_info()` on the chain-walked terminal box; an
     /// unresolvable opref (synthetic test paths) returns `false`.
-    /// `optimizer.py:884-886 is_virtual(op)`:
+    /// `optimizer.py is_virtual(op)`:
     /// ```python
     /// def is_virtual(self, op):
     ///     opinfo = getptrinfo(op)
@@ -5215,7 +5215,7 @@ impl OptContext {
             .is_some_and(|p| p.is_virtual())
     }
 
-    /// `info.py:41-42 PtrInfo.is_nonnull` (base False) + subclass
+    /// `info.py PtrInfo.is_nonnull` (base False) + subclass
     /// overrides — true when the box at `op` carries a non-null
     /// `PtrInfo` in its `_forwarded` Info slot. Chain walks via
     /// `Operand::get_box_replacement` then reads `ptr_info()`.
@@ -5225,7 +5225,7 @@ impl OptContext {
             .is_some_and(|p| p.is_nonnull())
     }
 
-    /// `optimizer.py:99-113 getintbound(op)` read variant — returns an
+    /// `optimizer.py getintbound(op)` read variant — returns an
     /// owned `IntBound` snapshot from the chain terminal's `_forwarded`
     /// slot, plus the ConstInt arm:
     ///
@@ -5253,7 +5253,7 @@ impl OptContext {
         resolved.int_bound().map(|ib| ib.clone())
     }
 
-    /// `info.py:432 op.get_forwarded()` + `isinstance(fw, PtrInfo)` —
+    /// `info.py op.get_forwarded()` + `isinstance(fw, PtrInfo)` —
     /// snapshot read of the chain terminal's `_forwarded` PtrInfo.
     /// Clones the inner `PtrInfo` out of its `Rc<RefCell<>>` cell, so
     /// the result is independent of subsequent mutations.  For RPython
@@ -5285,7 +5285,7 @@ impl OptContext {
     ///
     /// Closure mutations through `EnsuredPtrInfo::as_mut()` land on the
     /// operand's `RefCell<Forwarded>` directly — single-slot RPython parity
-    /// with `optimizer.py:467 ensure_ptr_info_arg0`'s mutate-in-place
+    /// with `optimizer.py ensure_ptr_info_arg0`'s mutate-in-place
     /// behavior.
     pub fn with_ensured_ptr_info_arg0<R>(
         &mut self,
@@ -5295,7 +5295,7 @@ impl OptContext {
         f(self.ensure_ptr_info_arg0(op))
     }
 
-    /// `info.py:91-103 PtrInfo.get_last_guard_pos` operand-direct reader.
+    /// `info.py PtrInfo.get_last_guard_pos` operand-direct reader.
     /// Walks chain to terminal and reads its `_forwarded` PtrInfo slot.
     pub fn last_guard_pos(&self, op: &Operand) -> Option<usize> {
         if self.new_operations_drained {
@@ -5306,7 +5306,7 @@ impl OptContext {
             .and_then(|p| p.get_last_guard_pos())
     }
 
-    /// `info.py:880-894 getptrinfo(op) is not None` parity — true when
+    /// `info.py getptrinfo(op) is not None` parity — true when
     /// the box carries any `PtrInfo` in its chain-terminal `_forwarded`
     /// Info slot. Walks via `Operand::get_box_replacement(false)` then
     /// queries `ptr_info().is_some()`.
@@ -5325,7 +5325,7 @@ impl OptContext {
     }
 
     /// TODO: RPython's virtualizable handling lives
-    /// tracing-side (`pyjitpl.py:1120-1145 _nonstandard_virtualizable`),
+    /// tracing-side (`pyjitpl.py _nonstandard_virtualizable`),
     /// not in optimizeopt — there is no direct `is_virtualizable` helper
     /// in `optimizer.py`. The pyre dedicated `PtrInfo::Virtualizable`
     /// variant + this helper exist because pyre routes virtualizable
@@ -5347,7 +5347,7 @@ impl OptContext {
     /// CONST_BIT `raw()` — which would either miss (large-index) or
     /// alias an unrelated slot.
     pub fn has_forwarding(&self, op: &Operand) -> bool {
-        // `resoperation.py:1162 Const.get_forwarded()` returns None;
+        // `resoperation.py Const.get_forwarded()` returns None;
         // Const boxes carry no `_forwarded` slot upstream.
         if op.is_constant() {
             return false;
@@ -5413,7 +5413,7 @@ impl OptContext {
                 value,
             );
         } else {
-            // optimizer.py:432 `box.set_forwarded(constbox)`, gated on
+            // optimizer.py `box.set_forwarded(constbox)`, gated on
             // `Forwarded::None` so an earlier pass's PtrInfo / IntBound /
             // Box(Const) forwarding is never clobbered.
             if matches!(box_.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
@@ -5461,7 +5461,7 @@ impl OptContext {
         b.int_bound().map(|ib| ib.clone())
     }
 
-    /// `optimizer.py:99-113 getintbound(op)` orthodox identity variant.
+    /// `optimizer.py getintbound(op)` orthodox identity variant.
     ///
     /// Walks `op.get_box_replacement(false)` and returns:
     ///   - `IntBoundHandle::Const(from_constant(v))` for a `ConstInt`
@@ -5522,7 +5522,7 @@ impl OptContext {
         IntBoundHandle::live(rc)
     }
 
-    /// optimizer.py:115-125: setintbound(op, bound) line-by-line port.
+    /// optimizer.py: setintbound(op, bound) line-by-line port.
     ///
     /// ```python
     /// def setintbound(self, op, bound):
@@ -5550,7 +5550,7 @@ impl OptContext {
             "setintbound: expected 'i'-typed operand, got {:?}",
             op.type_()
         );
-        // optimizer.py:117: op = get_box_replacement(op)
+        // optimizer.py: op = get_box_replacement(op)
         let op = op.get_box_replacement(false);
         // optimizer.py:118-119: if op.is_constant(): return
         if op.is_constant() {
@@ -5609,7 +5609,7 @@ impl OptContext {
             "with_intbound_mut: expected 'i'-typed operand, got {:?}",
             op.type_()
         );
-        // optimizer.py:101: op = get_box_replacement(op)
+        // optimizer.py: op = get_box_replacement(op)
         let resolved = op.get_box_replacement(false);
         // optimizer.py:102-103: ConstInt → IntBound.from_constant(...).
         // RPython's getintbound returns a fresh bound; intersect on it is
@@ -5665,9 +5665,9 @@ impl OptContext {
         }
     }
 
-    /// optimizer.py:413-435 make_constant(box, constbox)
+    /// optimizer.py make_constant(box, constbox)
     pub fn make_constant_box(&mut self, op: &Operand, value: Value) {
-        // optimizer.py:415: box = get_box_replacement(box)
+        // optimizer.py: box = get_box_replacement(box)
         let op = op.get_box_replacement(false);
         // optimizer.py:418-429: IntBound safety check
         if let Value::Int(intval) = value
@@ -5692,7 +5692,7 @@ impl OptContext {
             self.copy_fields_to_const(opref, gcref);
         }
         // optimizer.py:432: box.set_forwarded(constbox). Terminate the
-        // chain in an inline value-typed Const payload (history.py:227/
+        // chain in an inline value-typed Const payload (history.py/
         // 268/314) — no separate constant box carrier and no pool index.
         // `get_box_replacement` rematerializes the const and `operand_to_opref`
         // recovers the inline-Const OpRef via `Operand::Const::to_opref`'s
@@ -5703,7 +5703,7 @@ impl OptContext {
         op.set_forwarded_const(value.to_const());
     }
 
-    /// info.py:194-198 (AbstractStructPtrInfo) + info.py:533-538 (ArrayPtrInfo)
+    /// info.py (AbstractStructPtrInfo) + info.py (ArrayPtrInfo)
     /// `copy_fields_to_const(constinfo, optheap)`.
     ///
     /// ```text
@@ -5739,7 +5739,7 @@ impl OptContext {
         };
         let key = gcref.as_usize();
         match info {
-            // info.py:194-198 AbstractStructPtrInfo.copy_fields_to_const →
+            // info.py AbstractStructPtrInfo.copy_fields_to_const →
             // constinfo._get_info(self.descr, optheap) → StructPtrInfo(descr).
             PtrInfo::Instance(v) if !v.fields.is_empty() => {
                 let Some(descr) = v.descr.clone() else {
@@ -5811,7 +5811,7 @@ impl OptContext {
                     s.fields = fields;
                 }
             }
-            // info.py:533-538 ArrayPtrInfo.copy_fields_to_const →
+            // info.py ArrayPtrInfo.copy_fields_to_const →
             // constinfo._get_array_info(descr, optheap) → ArrayPtrInfo(descr).
             PtrInfo::Array(v) if !v.items.is_empty() => {
                 let descr = v.descr.clone();
@@ -5853,7 +5853,7 @@ impl OptContext {
         }
     }
 
-    /// resume.py:157 getconst parity for synthetic rd_numb encoding.
+    /// resume.py getconst parity for synthetic rd_numb encoding.
     /// Returns the (raw bits, type) of a constant operand, or None if it
     /// is not a constant. Type comes from the `Value` variant directly;
     /// raw-pointer Int constants live as inline `Const` operands with
@@ -5897,12 +5897,12 @@ impl OptContext {
             .and_then(|b| b.const_value())
     }
 
-    /// resoperation.py:691-720 `InputArg*.getint/getref_base/getfloatstorage`
+    /// resoperation.py `InputArg*.getint/getref_base/getfloatstorage`
     /// — extract the concrete runtime value carried by an OpRef's OWN box.
     ///
-    /// virtualstate.py:400 `runtime_box.constbox()`, :494 `.getint()`, :579
+    /// virtualstate.py `runtime_box.constbox()`, :494 `.getint()`, :579
     /// `.nonnull()`, :601/:608 `cpu.cls_of_box(runtime_box)` read the runtime
-    /// box object itself: `getint`/`getref_base` (resoperation.py:691) return
+    /// box object itself: `getint`/`getref_base` (resoperation.py) return
     /// `_resint`/`_resref` — the box's own value slot, set when the box was
     /// created — and never walk `_forwarded`. This resolves the box at
     /// `opref`'s own position (`resolve_to_operand`, the canonical host WITHOUT
@@ -5924,7 +5924,7 @@ impl OptContext {
         own.const_value().or_else(|| own.get_value())
     }
 
-    /// `runtime_box.nonnull()` — resoperation.py:583 `IntOp.nonnull`
+    /// `runtime_box.nonnull()` — resoperation.py `IntOp.nonnull`
     /// (`self._resint != 0`), :609 `FloatOp.nonnull`
     /// (`bool(extract_bits(self._resfloat))`), `RefOp.nonnull`
     /// (`bool(self.getref_base())`). Reads the runtime box's carried value
@@ -5943,7 +5943,7 @@ impl OptContext {
 
     /// `cpu.cls_of_box(runtime_box)` — virtualstate.py:601/608/620,
     /// model.py:199-201. Reads the runtime box's OWN ref value
-    /// (`getref_base`, resoperation.py:691 — the box's own `_resref` slot,
+    /// (`getref_base`, resoperation.py — the box's own `_resref` slot,
     /// never the `_forwarded` chain) via `runtime_value_of`, then returns
     /// `ptr2int(typeptr)`, the immortal vtable address as a plain integer.
     ///
@@ -5964,17 +5964,17 @@ impl OptContext {
         }
     }
 
-    /// resoperation.py:38 `AbstractResOpOrInputArg.same_box`: `self is other`
+    /// resoperation.py `AbstractResOpOrInputArg.same_box`: `self is other`
     /// — Python object identity, NOT the value-aware `Const.same_box`.
     ///
-    /// Walks both operands through `get_box_replacement` (resoperation.py:58)
+    /// Walks both operands through `get_box_replacement` (resoperation.py)
     /// then compares the resolved `OpRef`s.
     ///
     /// IDENTITY CAVEAT: `OpRef::Const*` carries the constant VALUE inline
     /// (history.py:227), not a pool-index slot, so two independently-minted
     /// `ConstInt(5)` resolve to the *same* `OpRef` and ARE `box_is`-equal.
     /// For constants this therefore matches PyPy's value-based
-    /// `Const.same_box` (history.py:211), NOT PyPy's object-identity `is`
+    /// `Const.same_box` (history.py), NOT PyPy's object-identity `is`
     /// (two distinct `ConstInt(5)` objects are `is`-False). For non-constant
     /// boxes (InputArg*/`*-Op` positions) the variant tag still encodes a
     /// unique position, so `box_is` remains a faithful 1:1 encoding of `is`.
@@ -5988,7 +5988,7 @@ impl OptContext {
     ///   - rewrite.rs `_optimize_oois_ooisnot` `elif arg0 is arg1`
     ///     (rewrite.py:542): folding equal `ConstPtr`/`ConstInt` to "equal"
     ///     is the correct result.
-    ///   - heap.rs `lookup_cached` `cached_index is indexbox` (heap.py:322):
+    ///   - heap.rs `lookup_cached` `cached_index is indexbox` (heap.py):
     ///     a hit on an equal constant index is valid (the var-index cache is
     ///     write-invalidated, so no stale hit can survive).
     ///     A future `is`-site that must treat equal-valued *distinct* constants
@@ -5997,8 +5997,8 @@ impl OptContext {
         self.get_replacement_opref(a) == self.get_replacement_opref(b)
     }
 
-    /// resoperation.py:38 `same_box` (non-Const: `self is other`) +
-    /// history.py:211 `Const.same_box` (value comparison via
+    /// resoperation.py `same_box` (non-Const: `self is other`) +
+    /// history.py `Const.same_box` (value comparison via
     /// `same_constant`). Resolves both operands through
     /// `get_box_replacement_box` then delegates to `Operand::same_box`. Falls
     /// back to resolved-`OpRef` identity plus constant-value comparison
@@ -6043,8 +6043,8 @@ impl OptContext {
             .map(|ib| ib.get_constant_int())
     }
 
-    /// history.py:361 CONST_NULL = ConstPtr(ConstPtr.value).
-    /// `CONST_NULL.same_constant(op)` parity (history.py:361 `CONST_NULL =
+    /// history.py CONST_NULL = ConstPtr(ConstPtr.value).
+    /// `CONST_NULL.same_constant(op)` parity (history.py `CONST_NULL =
     /// ConstPtr(ConstPtr.value)`). True iff `op` resolves to a Ref-typed
     /// null constant. Walks the chain and reads the terminal's
     /// `const_value()` directly — Const-namespace OpRefs whose
@@ -6057,7 +6057,7 @@ impl OptContext {
         )
     }
 
-    /// optimizer.py:705-711: is_call_pure_pure_canraise — a CallPure op whose
+    /// optimizer.py: is_call_pure_pure_canraise — a CallPure op whose
     /// effectinfo says check_can_raise(ignore_memoryerror=True). These ops are
     /// formally side-effect-free (has_no_side_effect), but their potential to
     /// raise means they break guard resume-data sharing.
@@ -6074,7 +6074,7 @@ impl OptContext {
         cd.get_extra_info().check_can_raise(true)
     }
 
-    /// optimizer.py:652-686 emit_guard_operation — decide whether to share
+    /// optimizer.py emit_guard_operation — decide whether to share
     /// resume data from the previous guard (_copy_resume_data_from) or build
     /// new resume data (store_final_boxes_in_guard).
     fn emit_guard_operation(&mut self, op: &mut Op) {
@@ -6097,7 +6097,7 @@ impl OptContext {
             self.last_guard_idx = None;
         }
 
-        // optimizer.py:672: `self._last_guard_op and guard_op.getdescr() is None`
+        // optimizer.py: `self._last_guard_op and guard_op.getdescr() is None`
         // getdescr() is None only for optimizer-created guards in RPython.
         // Pyre stores resume snapshots in side tables keyed by
         // rd_resume_position; unroll clones those side-table entries and then
@@ -6114,11 +6114,11 @@ impl OptContext {
 
         if can_share {
             let idx = self.last_guard_idx.unwrap();
-            // compile.py:832 ResumeGuardCopiedDescr(prev) parity: stamp
+            // compile.py ResumeGuardCopiedDescr(prev) parity: stamp
             // a `ResumeGuardCopiedDescr` whose `prev` references the
             // donor's descr.  Readers go through
             // `FailDescr::rd_*()` which chases `prev` automatically
-            // (compile.py:849 `get_resumestorage(): return prev`).
+            // (compile.py `get_resumestorage(): return prev`).
             // GUARD_EXCEPTION / GUARD_NO_EXCEPTION mint the exc variant.
             //
             // optimizer.py:691 `assert isinstance(last_descr,
@@ -6161,20 +6161,20 @@ impl OptContext {
                 Some(types) => op.set_fail_arg_types(types.to_vec()),
                 None => op.clear_fail_arg_types(),
             }
-            // optimizer.py:698-699: _maybe_replace_guard_value after copy.
+            // optimizer.py: _maybe_replace_guard_value after copy.
             if op.opcode == OpCode::GuardValue {
                 self.maybe_replace_guard_value(op);
             }
             // Don't update last_guard_idx — copied guards don't become sources.
         } else {
-            // optimizer.py:678: store_final_boxes_in_guard.  This is
+            // optimizer.py: store_final_boxes_in_guard.  This is
             // the standalone OptContext path (used by tests and the
             // direct ctx.emit_guard hook); it has no `pending_for_guard`
             // staging, so pass an empty Vec for the descr-side
             // set_rd_pendingfields write.
             self.store_final_boxes_in_guard(op, None, Vec::new());
             self.last_guard_idx = Some(self.new_operations.len());
-            // optimizer.py:680-683: force_box on fail_args for unrolling.
+            // optimizer.py: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
             // handle tracked preamble ops, force virtuals.
             if let Some(fa) = op.getfailargs() {
@@ -6194,7 +6194,7 @@ impl OptContext {
                     }
                 }
             }
-            // optimizer.py:750-751: _maybe_replace_guard_value after store.
+            // optimizer.py: _maybe_replace_guard_value after store.
             if op.opcode == OpCode::GuardValue {
                 self.maybe_replace_guard_value(op);
             }
@@ -6206,7 +6206,7 @@ impl OptContext {
         }
     }
 
-    /// optimizer.py:754-778 _maybe_replace_guard_value — turn
+    /// optimizer.py _maybe_replace_guard_value — turn
     /// guard_value(bool) into guard_true/guard_false.
     fn maybe_replace_guard_value(&self, op: &mut Op) {
         let arg0 = op.arg(0);
@@ -6215,7 +6215,7 @@ impl OptContext {
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return;
         }
-        // optimizer.py:756: b = self.getintbound(op.getarg(0))
+        // optimizer.py: b = self.getintbound(op.getarg(0))
         let Some(bound) = self
             .get_box_replacement_operand_opt(arg0_resolved)
             .and_then(|b| self.peek_intbound_box(&b))
@@ -6237,7 +6237,7 @@ impl OptContext {
             1 => OpCode::GuardTrue,
             _ => return, // optimizer.py:775: strange code, just disable
         };
-        // optimizer.py:803 newop = self.replace_op_with(op, opnum,
+        // optimizer.py newop = self.replace_op_with(op, opnum,
         //                                  [op.getarg(0)], descr)
         // — produce a fresh op with new opcode and trimmed args, descr
         // unchanged.  copy_and_change preserves fail_args / rd_resume_position
@@ -6245,8 +6245,8 @@ impl OptContext {
         *op = op.copy_and_change(new_opcode, Some(&[arg0]), None);
     }
 
-    /// optimizer.py:345-364 force_box — inline equivalent for
-    /// emit_guard_operation's fail_arg forcing (optimizer.py:680-683).
+    /// optimizer.py force_box — inline equivalent for
+    /// emit_guard_operation's fail_arg forcing (optimizer.py).
     /// Mirrors Optimizer.force_box contract: handle tracked preamble ops,
     /// then force virtuals to concrete. Body refs route through the preamble
     /// source directly, so the prior reverse-lookup 3rd key is no longer
@@ -6302,7 +6302,7 @@ impl OptContext {
         resolved
     }
 
-    /// RPython optimizer.py:722-752 store_final_boxes_in_guard inline.
+    /// RPython optimizer.py store_final_boxes_in_guard inline.
     /// Called from emit() for every guard during optimization. Produces
     /// rd_numb via memo.number() using the CURRENT optimizer state
     /// (replacement chain, constants, virtual info).
@@ -6327,7 +6327,7 @@ impl OptContext {
     ) {
         use crate::resume::{ResumeDataLoopMemo, Snapshot};
 
-        // optimizer.py:722-730 store_final_boxes_in_guard parity:
+        // optimizer.py store_final_boxes_in_guard parity:
         //   if op.getdescr() is not None:
         //       descr = op.getdescr()
         //       assert isinstance(descr, compile.ResumeGuardDescr)
@@ -6337,8 +6337,8 @@ impl OptContext {
         //
         // RPython has exactly one emit path, so this function never
         // sees a `ResumeGuardCopiedDescr` (sibling, not subclass —
-        // compile.py:832) nor an already-finalized `ResumeGuardDescr`
-        // (resume.py:397 `assert not storage.rd_numb` ensures finish()
+        // compile.py) nor an already-finalized `ResumeGuardDescr`
+        // (resume.py `assert not storage.rd_numb` ensures finish()
         // runs at most once per descr).
         //
         // OptContext::emit gates its emit_guard_operation on
@@ -6378,7 +6378,7 @@ impl OptContext {
             );
         }
 
-        // resume.py:397 `assert not storage.rd_numb` — finish() runs at
+        // resume.py `assert not storage.rd_numb` — finish() runs at
         // most once per ResumeGuardDescr.  RPython makes this invariant
         // load-bearing: a second call would clobber an already-numbered
         // livebox set and break bridge attachment.  Promoted from
@@ -6397,7 +6397,7 @@ impl OptContext {
         // before store_final_boxes_in_guard runs.
         let resume_pos = op.rd_resume_position.get();
         let has_snapshot = snapshot_contains(&self.snapshot_boxes, resume_pos);
-        // resume.py:396-397: `assert resume_position >= 0` —
+        // resume.py: `assert resume_position >= 0` —
         // RPython asserts the position is set before calling
         // store_final_boxes_in_guard. Every guard from the production
         // pyre tracer captures its own snapshot via generate_guard /
@@ -6422,7 +6422,7 @@ impl OptContext {
                 .filter(|&p| snapshot_contains(&self.snapshot_boxes, p));
             if let Some(fb_pos) = fallback_pos {
                 op.rd_resume_position.set(fb_pos);
-                // resume.py:570 _add_optimizer_sections: forward knowledge
+                // resume.py _add_optimizer_sections: forward knowledge
                 // to the patchguardop snapshot so heap/class/loopinvariant
                 // sections are serialized into rd_numb. RPython's finish()
                 // always serializes current optimizer knowledge regardless
@@ -6508,7 +6508,7 @@ impl OptContext {
         // TAGBOX numbering. The same OpRefs also appear in fail_args —
         // _number_boxes deduplicates via liveboxes HashMap.
         snapshot.vable_array = vable_oprefs;
-        // resume.py:243-247 _number_boxes also reads vref_array as a
+        // resume.py _number_boxes also reads vref_array as a
         // separate section after vable_array. opencoder.py:767
         // create_top_snapshot writes both arrays into the snapshot.
         snapshot.vref_array = vref_oprefs;
@@ -6613,11 +6613,11 @@ impl OptContext {
             );
         }
 
-        // resume.py:389-452: delegate to ResumeDataVirtualAdder.finish()
+        // resume.py: delegate to ResumeDataVirtualAdder.finish()
         let env = OptBoxEnv { ctx: self };
         let mut memo = ResumeDataLoopMemo::new();
         // resume.py:403-405 passes `minimum_virtualizable_size` here, which
-        // arms the `resume.py:236-239` length check inside `number()`. This
+        // arms the `resume.py` length check inside `number()`. This
         // call site used to hardcode `-1`, so the check — ported faithfully in
         // `resume.rs::number` — was disabled for every guard ever numbered,
         // and a 0-length vable section reached the backend unremarked. It then
@@ -6649,7 +6649,7 @@ impl OptContext {
             return;
         };
 
-        // resume.py:428-445, 520-558: pending_setfields are passed to finish()
+        // resume.py, 520-558: pending_setfields are passed to finish()
         // which handles register_box, visitor_walk_recursive, and tagging.
         let (rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types) =
             memo.finish(numb_state, &env, &mut pending_setfields, knowledge.as_ref());
@@ -6735,7 +6735,7 @@ impl OptContext {
         }
         op.store_final_boxes(final_operands);
         op.set_fail_arg_types(new_types.clone());
-        // optimizer.py:722-730 `store_final_boxes_in_guard` parity:
+        // optimizer.py `store_final_boxes_in_guard` parity:
         //   if op.getdescr() is not None:
         //       descr = op.getdescr()
         //       assert isinstance(descr, compile.ResumeGuardDescr)
@@ -6759,7 +6759,7 @@ impl OptContext {
                 }
             }
             None => {
-                // RPython compile.py:919-937 `invent_fail_descr_for_op`
+                // RPython compile.py `invent_fail_descr_for_op`
                 // dispatches on opcode:
                 //   GUARD_NOT_FORCED / GUARD_NOT_FORCED_2 → ResumeGuardForcedDescr
                 //   GUARD_EXCEPTION  / GUARD_NO_EXCEPTION → ResumeGuardExcDescr
@@ -6782,7 +6782,7 @@ impl OptContext {
                 });
             }
         }
-        // compile.py:855 ResumeGuardDescr `_attrs_` parity: write the
+        // compile.py ResumeGuardDescr `_attrs_` parity: write the
         // post-numbering resume payload onto the descr that
         // store_final_boxes_in_guard just minted (or onto the existing
         // ResumeGuardDescr / ResumeAtPositionDescr / ResumeGuardForcedDescr
@@ -6839,18 +6839,18 @@ impl OptContext {
     /// out early when the input is already a constant OpRef
     /// (`is_constant()` true), which would silently drop the new entry.
     pub fn make_constant_int(&mut self, value: i64) -> OpRef {
-        // history.py:227 ConstInt.value inline.
+        // history.py ConstInt.value inline.
         OpRef::const_int(value)
     }
 
     pub fn make_constant_ref(&mut self, value: GcRef) -> OpRef {
-        // history.py:314 ConstPtr.value inline. The GC walker forwards the
+        // history.py ConstPtr.value inline. The GC walker forwards the
         // inline GcRef across minor collection.
         OpRef::const_ptr(value)
     }
 
     pub fn make_constant_float(&mut self, value: f64) -> OpRef {
-        // history.py:268 ConstFloat.value inline.
+        // history.py ConstFloat.value inline.
         OpRef::const_float(value)
     }
 
@@ -6858,7 +6858,7 @@ impl OptContext {
     /// Used for pattern matching nested operations (e.g., int_add(int_add(x, C1), C2)).
     /// Returns a clone to avoid borrow conflicts with mutable ctx methods.
     ///
-    /// optimizer.py:369-377 `as_operation` ("You should never check
+    /// optimizer.py `as_operation` ("You should never check
     /// isinstance(op, AbstractResOp) directly. Instead, use this
     /// helper.") admits a producer only when `op in
     /// self._emittedoperations` — ops emitted by THIS optimizer run.
@@ -6873,7 +6873,7 @@ impl OptContext {
         // Walk the forwarding chain first (resoperation.py:58) so the
         // replacement box's producer is read.
         let producer = op.get_box_replacement(false).bound_op()?;
-        // optimizer.py:369-377 `op in self._emittedoperations` — keyed by the
+        // optimizer.py `op in self._emittedoperations` — keyed by the
         // producer's box identity (`from_bound_op` memoizes one box per op Rc,
         // so this is the same box recorded at emit).
         if !self
@@ -6895,7 +6895,7 @@ impl OptContext {
         self.new_operations.last().map(|rc| rc.as_ref())
     }
 
-    /// `optimizer.py:379-387 get_constant_box`:
+    /// `optimizer.py get_constant_box`:
     /// ```python
     /// def get_constant_box(self, box):
     ///     box = get_box_replacement(box)
@@ -6908,7 +6908,7 @@ impl OptContext {
     ///     return None
     /// ```
     pub fn get_constant_box(&self, op: &Operand) -> Option<Value> {
-        // optimizer.py:380: box = get_box_replacement(box)
+        // optimizer.py: box = get_box_replacement(box)
         let resolved = op.get_box_replacement(false);
         // optimizer.py:381-382: isinstance(box, Const) → return box
         if let Some(v) = resolved.const_value() {
@@ -6961,7 +6961,7 @@ impl OptContext {
             return None;
         }
         // Const variants carry the value in the variant itself
-        // (history.py:227 `Const.value`).
+        // (history.py `Const.value`).
         opref.inline_const_to_value()
     }
 
@@ -6973,7 +6973,7 @@ impl OptContext {
         }
     }
 
-    /// optimizer.py:810-816 `constant_fold(op)`:
+    /// optimizer.py `constant_fold(op)`:
     ///
     /// ```python
     /// def constant_fold(self, op):
@@ -7047,7 +7047,7 @@ impl OptContext {
         }
     }
 
-    /// optimizer.py:818-867 `protect_speculative_operation(op)` — when
+    /// optimizer.py `protect_speculative_operation(op)` — when
     /// constant-folding a pure operation that reads memory from a
     /// gcref, validate the gcref is non-null and of a valid type;
     /// signal `InvalidLoop` otherwise.
@@ -7091,7 +7091,7 @@ impl OptContext {
 
         let descr = op.getdescr();
         if opnum.is_getfield() {
-            // optimizer.py:829-832 pure-getfield branch.
+            // optimizer.py pure-getfield branch.
             let gcref = match self
                 .get_constant_box(&op.arg(0).get_box_replacement(false))
                 .expect("protect_speculative_operation: arg0 must be Const")
@@ -7281,7 +7281,7 @@ impl OptContext {
     /// arms cover residual cases — ops that have not yet been emitted,
     /// inputarg slots, and PtrInfo-derived Ref typing. Raw-pointer
     /// `ConstInt` Boxes keep `op.type == 'i'` and become `ConstPtrInfo`
-    /// through `getrawptrinfo` per `info.py:870-871`.
+    /// through `getrawptrinfo` per `info.py`.
     ///
     /// Returns `None` only when none of the above sources have type
     /// information for the OpRef. Callers must treat `None` like
@@ -7301,7 +7301,7 @@ impl OptContext {
         if let Some(tp) = self.inputarg_type(resolved) {
             return Some(tp);
         }
-        // 1. RPython `AbstractValue.type` (resoperation.py:29) parity. The
+        // 1. RPython `AbstractValue.type` (resoperation.py) parity. The
         //    OpRef enum encodes `box.type` directly in the variant tag
         //    (`ConstInt`/`InputArgInt`/`IntOp` → Int, etc.), so reading
         //    the tag is the line-by-line equivalent of upstream `box.type`.
@@ -7329,7 +7329,7 @@ impl OptContext {
         //    method (virtualize.py:208-225) — the op never lands in
         //    `new_operations` and is therefore absent from
         //    `phase1_emit_ops`. Phase 2 imports the virtual head's
-        //    `PtrInfo` via `setinfo_from_preamble` (unroll.py:55-64) but
+        //    `PtrInfo` via `setinfo_from_preamble` (unroll.py) but
         //    starts with a fresh `value_types` map, so the prior four
         //    sources all miss. RPython preserves the type intrinsically
         //    on the Box object; pyre recovers it from the PtrInfo variant
@@ -7339,7 +7339,7 @@ impl OptContext {
         //    NonNull / Virtualizable / Str (RPython instances of
         //    AbstractStructPtrInfo / ArrayPtrInfo / StrPtrInfo carry 'r').
         //    Int-typed: VirtualRawBuffer / VirtualRawSlice
-        //    (info.py:865 RawBufferPtrInfo + getrawptrinfo() — these
+        //    (info.py RawBufferPtrInfo + getrawptrinfo() — these
         //    describe raw pointers stored in 'i' Boxes).
         let resolved_box = self.get_box_replacement_operand_opt(opref);
         if let Some(info) = resolved_box.as_ref().and_then(|b| self.peek_ptr_info(b)) {
@@ -7362,7 +7362,7 @@ impl OptContext {
     /// (test contexts that bypass `setup_optimizations`).
     ///
     /// `[0, num_inputs)` fallback: in RPython each `InputArgInt`/
-    /// `InputArgRef`/`InputArgFloat` (resoperation.py:719/727/739) Box
+    /// `InputArgRef`/`InputArgFloat` (resoperation.py/727/739) Box
     /// carries `.type` intrinsically, so Phase 2 reads the same
     /// `box.type` regardless of which iteration's TraceIterator produced
     /// the box.  Pyre's flat `OpRef(u32)` namespace separates Phase 1
@@ -7457,7 +7457,7 @@ impl OptContext {
         self.inputargs.get(idx).copied()
     }
 
-    /// info.py:865-878 `getrawptrinfo(op)` parity (line-by-line port).
+    /// info.py `getrawptrinfo(op)` parity (line-by-line port).
     ///
     /// ```python
     /// def getrawptrinfo(op):
@@ -7476,7 +7476,7 @@ impl OptContext {
     ///     return None
     /// ```
     ///
-    /// info.py:865-878 `getrawptrinfo(op)` parity — orthodox return
+    /// info.py `getrawptrinfo(op)` parity — orthodox return
     /// shape that preserves RPython `_forwarded` object identity.
     /// `PtrInfoHandle::Const(_)` for the `isinstance(op, ConstInt)`
     /// fresh `ConstPtrInfo` arm; `PtrInfoHandle::Live(rc)` for the
@@ -7503,7 +7503,7 @@ impl OptContext {
             majit_ir::Type::Int,
             "getrawptrinfo_handle: terminal expected 'i'-typed operand"
         );
-        // info.py:870-871 — `if isinstance(op, ConstInt): return ConstPtrInfo(op)`.
+        // info.py — `if isinstance(op, ConstInt): return ConstPtrInfo(op)`.
         if let Some(Value::Int(bits)) = terminal.const_value() {
             return Some(PtrInfoHandle::Const(PtrInfo::Constant(majit_ir::GcRef(
                 bits as usize,
@@ -7520,7 +7520,7 @@ impl OptContext {
             Forwarded::None => None,
             Forwarded::Info(OpInfo::IntBound(_)) => None,
             Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc))),
-            // info.py:876 `assert isinstance(fw, AbstractRawPtrInfo)` —
+            // info.py `assert isinstance(fw, AbstractRawPtrInfo)` —
             // a non-Ptr, non-IntBound forwarded on an `'i'`-typed terminal
             // is a structural invariant violation upstream would crash on.
             Forwarded::Info(other) => panic!(
@@ -7541,7 +7541,7 @@ impl OptContext {
         }
     }
 
-    /// info.py:880-894 `getptrinfo(op)` parity (line-by-line port).
+    /// info.py `getptrinfo(op)` parity (line-by-line port).
     ///
     /// ```python
     /// def getptrinfo(op):
@@ -7560,7 +7560,7 @@ impl OptContext {
     ///         return fw
     ///     return None
     /// ```
-    /// The Int arm delegates to `getrawptrinfo` per `info.py:881-882`.
+    /// The Int arm delegates to `getrawptrinfo` per `info.py`.
     /// The Float arm short-circuits to `None`. The Void arm panics —
     /// `info.py:885 assert op.type == 'r'` rejects Void boxes outright;
     /// no synthetic Void filler box exists that would smuggle a
@@ -7569,14 +7569,14 @@ impl OptContext {
         self.getptrinfo_handle(op).map(|h| h.snapshot())
     }
 
-    /// info.py:880-894 `getptrinfo(op)` parity — orthodox return
+    /// info.py `getptrinfo(op)` parity — orthodox return
     /// shape that preserves RPython `_forwarded` object identity.
     /// See `getrawptrinfo_handle` for the variant semantics.
     pub fn getptrinfo_handle(&self, op: &Operand) -> Option<PtrInfoHandle> {
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::forwarding::Forwarded;
         match op.type_() {
-            // info.py:881-882 — `if op.type == 'i': return getrawptrinfo(op)`.
+            // info.py — `if op.type == 'i': return getrawptrinfo(op)`.
             majit_ir::Type::Int => return self.getrawptrinfo_handle(op),
             // info.py:883-884 — `elif op.type == 'f': return None`.
             majit_ir::Type::Float => return None,
@@ -7603,14 +7603,14 @@ impl OptContext {
             "getptrinfo_handle: chain-walked replacement lost Ref type (got {:?})",
             terminal.type_(),
         );
-        // info.py:888-889: if isinstance(op, ConstPtr): return ConstPtrInfo(op)
+        // info.py: if isinstance(op, ConstPtr): return ConstPtrInfo(op)
         if let Some(Value::Ref(gcref)) = terminal.const_value() {
             return Some(PtrInfoHandle::Const(PtrInfo::Constant(gcref)));
         }
         match &terminal.get_forwarded() {
             Forwarded::None => None,
             Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc))),
-            // info.py:892 `assert isinstance(fw, PtrInfo)` — a Ref-typed
+            // info.py `assert isinstance(fw, PtrInfo)` — a Ref-typed
             // terminal must not forward to IntBound / FloatConst / Unknown.
             Forwarded::Info(other) => panic!(
                 "getptrinfo: forwarded must be PtrInfo (info.py:892), got {:?}",
@@ -7629,7 +7629,7 @@ impl OptContext {
         }
     }
 
-    /// virtualstate.py:48-55 `GenerateGuardState.get_runtime_field(box, descr)`
+    /// virtualstate.py `GenerateGuardState.get_runtime_field(box, descr)`
     /// parity.
     ///
     /// ```python
@@ -7770,7 +7770,7 @@ impl OptContext {
     ///
     /// When `runtime_box` resolves to an unmaterialized `VirtualArrayStruct`,
     /// the interior field's observed value lives on the virtual's tracked
-    /// element-field box (info.py:663-668 `getinteriorfield_virtual`), not a
+    /// element-field box (info.py `getinteriorfield_virtual`), not a
     /// concrete struct. Read it the same way `get_virtual_runtime_field` reads a
     /// struct field. Returns `None` when the runtime box is not a virtual
     /// array-struct, the slot is unset, or the slot carries no observed value.
@@ -7814,7 +7814,7 @@ impl OptContext {
         }
     }
 
-    /// virtualstate.py:39-47 `GenerateGuardState.get_runtime_item(box, descr, i)`
+    /// virtualstate.py `GenerateGuardState.get_runtime_item(box, descr, i)`
     /// parity.
     ///
     /// ```python
@@ -7884,7 +7884,7 @@ impl OptContext {
         }
     }
 
-    /// virtualstate.py:57-67 `GenerateGuardState.get_runtime_interiorfield(box, descr, i)`
+    /// virtualstate.py `GenerateGuardState.get_runtime_interiorfield(box, descr, i)`
     /// parity.
     ///
     /// ```python
@@ -7960,7 +7960,7 @@ impl OptContext {
         }
     }
 
-    /// model.py:199-201 `cpu.cls_of_box(box)` parity:
+    /// model.py `cpu.cls_of_box(box)` parity:
     ///
     /// ```python
     /// def cls_of_box(self, box):
@@ -7985,7 +7985,7 @@ impl OptContext {
     /// `bh_*` runtime calls will land on the same `Cpu` trait and lose
     /// the `OptContext::cls_of_box` wrapper as that surface fills out.
     pub fn cls_of_box(&self, op: &Operand) -> Option<i64> {
-        // model.py:199-201 `cpu.cls_of_box(box)` returns `ConstInt(ptr2int(
+        // model.py `cpu.cls_of_box(box)` returns `ConstInt(ptr2int(
         // typeptr))` — the immortal vtable address as a plain integer, never
         // a traced ref. DefaultCpu walks the operand to its Const terminal
         // and dereferences the typeptr-at-offset-0. Returns 0 for
@@ -7994,7 +7994,7 @@ impl OptContext {
         if typeptr != 0 {
             return Some(typeptr);
         }
-        // resoperation.py:612-642 `RefOp._resref` fallback — when the
+        // resoperation.py `RefOp._resref` fallback — when the
         // forwarding chain has no Const terminal, read the mixin slot
         // directly off the resolved operand.  Wrap as a synthetic Const so
         // the typeptr deref goes through the same `cpu.cls_of_box`
@@ -8015,7 +8015,7 @@ impl OptContext {
         if typeptr == 0 { None } else { Some(typeptr) }
     }
 
-    /// info.py:880 `getptrinfo(op).get_known_class(cpu)` parity.
+    /// info.py `getptrinfo(op).get_known_class(cpu)` parity.
     ///
     /// Delegates to `getptrinfo(&Operand)` + `PtrInfo::get_known_class` so
     /// constant pointers are handled via `cls_of_box` the same way
@@ -8024,7 +8024,7 @@ impl OptContext {
         self.getptrinfo(op)?.get_known_class(self.cpu.as_ref())
     }
 
-    /// optimizer.py:127-135 `getnullness(op)` parity (line-by-line port).
+    /// optimizer.py `getnullness(op)` parity (line-by-line port).
     ///
     /// ```python
     /// def getnullness(self, op):
@@ -8042,14 +8042,14 @@ impl OptContext {
     /// (info.py:13-15) so callers can compare directly against the
     /// upstream constants.
     ///
-    /// The `Type::Int` arm inlines `getintbound` (optimizer.py:99-113)
+    /// The `Type::Int` arm inlines `getintbound` (optimizer.py)
     /// operand-direct, preserving the lazy install of `IntBound.unbounded()`
     /// on first access via `set_forwarded_info` (interior mutability lets
     /// the method take `&self`).
     pub fn getnullness(&self, op: &Operand) -> i8 {
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::forwarding::Forwarded;
-        // optimizer.py:128: if op.type == 'r' or self.is_raw_ptr(op):
+        // optimizer.py: if op.type == 'r' or self.is_raw_ptr(op):
         //
         // `Box.type` is intrinsic in upstream — never Void. In pyre,
         // `materialize_operand_at` lazy-creates `Type::Void` phantom placeholders
@@ -8061,7 +8061,7 @@ impl OptContext {
         let resolved = op.get_box_replacement(false);
         let tp = resolved.type_();
         if matches!(tp, majit_ir::Type::Ref) || self.is_raw_ptr(op) {
-            // optimizer.py:129-132 with info.py:880-894 `getptrinfo` inlined.
+            // optimizer.py:129-132 with info.py `getptrinfo` inlined.
             //
             // info.py:886-893: `r`-typed: walk the chain, synthesize
             // `ConstPtrInfo` for `ConstPtr`, else return the forwarded slot.
@@ -8069,27 +8069,27 @@ impl OptContext {
             // `is_raw_ptr(op)` returned true), the forwarded slot is a
             // `VirtualRaw{Buffer,Slice}` and `ptr_info()` reads it directly.
             let ptrinfo: Option<PtrInfo> = if let Some(Value::Ref(gcref)) = resolved.const_value() {
-                // info.py:888-889: isinstance(op, ConstPtr): ConstPtrInfo(op)
+                // info.py: isinstance(op, ConstPtr): ConstPtrInfo(op)
                 Some(PtrInfo::Constant(gcref))
             } else {
                 // info.py:890-893: fw = op.get_forwarded(); return fw or None
                 resolved.ptr_info().map(|r| r.clone())
             };
-            // optimizer.py:130-132: if ptrinfo is None: INFO_UNKNOWN; else ptrinfo.getnullness()
+            // optimizer.py: if ptrinfo is None: INFO_UNKNOWN; else ptrinfo.getnullness()
             return match ptrinfo {
                 None => INFO_UNKNOWN,
                 Some(info) => info.getnullness(),
             };
         }
-        // optimizer.py:133-134: elif op.type == 'i': return getintbound(op).getnullness()
+        // optimizer.py: elif op.type == 'i': return getintbound(op).getnullness()
         //
         // Void phantoms (untyped recorder placeholders) route through the
         // Int arm as the pyre equivalent of RPython's unknown-type tolerance
         // — the inlined `getintbound` side effect (line 110-113) installs
         // `IntBound.unbounded()` so subsequent reads agree.
         if matches!(tp, majit_ir::Type::Int | majit_ir::Type::Void) {
-            // optimizer.py:99-113 `getintbound` inlined operand-direct.
-            // optimizer.py:101: op = get_box_replacement(op) — already
+            // optimizer.py `getintbound` inlined operand-direct.
+            // optimizer.py: op = get_box_replacement(op) — already
             // walked above (`resolved` shadows here for parity).
             // optimizer.py:102-103: if isinstance(op, ConstInt): from_constant
             if let Some(Value::Int(v)) = resolved.const_value() {
@@ -8121,7 +8121,7 @@ impl OptContext {
         INFO_UNKNOWN
     }
 
-    /// optimizer.py:154-158 `is_raw_ptr(op)` parity (line-by-line port).
+    /// optimizer.py `is_raw_ptr(op)` parity (line-by-line port).
     ///
     /// ```python
     /// def is_raw_ptr(self, op):
@@ -8132,14 +8132,14 @@ impl OptContext {
     /// ```
     ///
     /// `AbstractRawPtrInfo` is the upstream base for `RawBufferPtrInfo`,
-    /// `RawStructPtrInfo`, `RawSlicePtrInfo` (info.py:374-485). Of these:
+    /// `RawStructPtrInfo`, `RawSlicePtrInfo` (info.py). Of these:
     ///
     /// - `RawBufferPtrInfo` ↔ majit `PtrInfo::VirtualRawBuffer` (created
     ///   by `OptVirtualize` from `RAW_MALLOC_VARSIZE_CHAR`).
     /// - `RawSlicePtrInfo` ↔ majit `PtrInfo::VirtualRawSlice` (created
     ///   by `OptVirtualize::optimize_int_add` slice creator,
-    ///   virtualize.py:60 make_virtual_raw_slice).
-    /// - `RawStructPtrInfo` is defined at info.py:452 but never
+    ///   virtualize.py make_virtual_raw_slice).
+    /// - `RawStructPtrInfo` is defined at info.py but never
     ///   instantiated anywhere in upstream (`grep -rn "RawStructPtrInfo("
     ///   rpython/jit/` returns only the class definition). It is dead
     ///   reservation code, so the absence of a majit variant is not a
@@ -8175,7 +8175,7 @@ impl OptContext {
         }
     }
 
-    /// info.py:718-726 `ConstPtrInfo._get_info(descr, optheap)` parity.
+    /// info.py `ConstPtrInfo._get_info(descr, optheap)` parity.
     ///
     /// ```python
     /// def _get_info(self, descr, optheap):
@@ -8234,10 +8234,10 @@ impl OptContext {
         self.get_const_info_mut_if_exists_box(&op)
     }
 
-    /// info.py:715-726 `ConstPtrInfo._get_info(descr, optheap)` parity.
+    /// info.py `ConstPtrInfo._get_info(descr, optheap)` parity.
     ///
     /// `parent_descr` is the parent SizeDescr, passed so that the
-    /// vacant-slot case creates `StructPtrInfo(descr)` (info.py:724)
+    /// vacant-slot case creates `StructPtrInfo(descr)` (info.py)
     /// rather than a bare `PtrInfo::instance(None, None)`. Callers
     /// that don't have the parent descr (e.g. the field read path)
     /// extract it from the field descr via
@@ -8255,7 +8255,7 @@ impl OptContext {
 
     /// Box-native form of `get_const_info_mut_if_exists`: the caller already
     /// holds the (canonical) struct box, so `getptrinfo` chain-walks it
-    /// directly (info.py:886 `op = get_box_replacement(op)`). Returns `None`
+    /// directly (info.py `op = get_box_replacement(op)`). Returns `None`
     /// when the box is not a constant pointer, the constant is null, or no
     /// `const_infos` entry exists yet.
     pub fn get_const_info_mut_if_exists_box(
@@ -8300,7 +8300,7 @@ impl OptContext {
         //                  if info is None: info = StructPtrInfo(descr)
         //                  optheap.const_infos[ref] = info
         Some(self.const_infos.entry(addr).or_insert_with(|| {
-            // info.py:724: StructPtrInfo(descr)
+            // info.py: StructPtrInfo(descr)
             match parent_descr {
                 Some(d) => PtrInfo::struct_ptr(d),
                 None => PtrInfo::instance(None, None),
@@ -8308,7 +8308,7 @@ impl OptContext {
         }))
     }
 
-    /// info.py:728-735 `ConstPtrInfo._get_array_info(descr, optheap)`
+    /// info.py `ConstPtrInfo._get_array_info(descr, optheap)`
     /// parity:
     ///
     /// ```python
@@ -8371,7 +8371,7 @@ impl OptContext {
         }))
     }
 
-    /// info.py:750-752 `ConstPtrInfo.setfield` + info.py:203-211
+    /// info.py `ConstPtrInfo.setfield` + info.py
     /// `AbstractStructPtrInfo.setfield` parity (line-by-line PyPy
     /// `structinfo.setfield(...)` routing).
     ///
@@ -8407,7 +8407,7 @@ impl OptContext {
             }
             return;
         }
-        // info.py:203-211 AbstractStructPtrInfo.setfield: mutate `_fields`
+        // info.py AbstractStructPtrInfo.setfield: mutate `_fields`
         // in the PtrInfo object stored in the operand's `_forwarded` slot.
         // PyPy has the same single-object behavior via `box._forwarded`.
         self.with_ensured_ptr_info_arg0(op, |mut handle| {
@@ -8417,7 +8417,7 @@ impl OptContext {
         });
     }
 
-    /// info.py:746-748 `ConstPtrInfo.setitem` + info.py: ArrayPtrInfo
+    /// info.py `ConstPtrInfo.setitem` + info.py: ArrayPtrInfo
     /// `setitem` parity. Same shape as `structinfo_setfield` but routes
     /// through `_get_array_info` (`get_const_info_array_mut`) for the
     /// constant arg0 path so the const_infos slot is created as
@@ -8442,7 +8442,7 @@ impl OptContext {
         });
     }
 
-    /// optimizer.py:440-451: make_nonnull(op) line-by-line port.
+    /// optimizer.py: make_nonnull(op) line-by-line port.
     ///
     /// ```python
     /// def make_nonnull(self, op):
@@ -8460,7 +8460,7 @@ impl OptContext {
     /// ```
     pub fn make_nonnull(&self, op: &Operand) {
         use crate::optimizeopt::info::OpInfo;
-        // optimizer.py:441: op = self.get_box_replacement(op)
+        // optimizer.py: op = self.get_box_replacement(op)
         let op = op.get_box_replacement(false);
         // optimizer.py:442-443: if op.is_constant(): return
         if op.is_constant() {
@@ -8483,7 +8483,7 @@ impl OptContext {
         op.set_forwarded_info(OpInfo::ptr(PtrInfo::NonNull { last_guard_pos: -1 }));
     }
 
-    /// optimizer.py:461-499 `ensure_ptr_info_arg0(op)` — direct line-by-line
+    /// optimizer.py `ensure_ptr_info_arg0(op)` — direct line-by-line
     /// port that returns the same kind of value as PyPy.
     ///
     /// ```python
@@ -8534,7 +8534,7 @@ impl OptContext {
     /// matching PyPy's `structinfo.setfield(...)` /
     /// `arrayinfo.getlenbound(...)` patterns.
     pub fn ensure_ptr_info_arg0(&mut self, op: &Op) -> EnsuredPtrInfo {
-        // optimizer.py:464: arg0 = self.get_box_replacement(op.getarg(0))
+        // optimizer.py: arg0 = self.get_box_replacement(op.getarg(0))
         let arg0_box = op.arg(0).get_box_replacement(false);
         let arg0 = arg0_box.to_opref();
         // optimizer.py:465-466: if arg0.is_constant(): return info.ConstPtrInfo(arg0)
@@ -8557,7 +8557,7 @@ impl OptContext {
                 // the dereference at the actual use site.
                 _ => majit_ir::GcRef(0),
             };
-            // info.py:810-822 `ConstPtrInfo.getstrlen1(mode)`: clone the
+            // info.py `ConstPtrInfo.getstrlen1(mode)`: clone the
             // resolver Arc into the EnsuredPtrInfo so subsequent
             // `getlenbound(Some(mode))` calls can ask the runtime for an
             // exact constant string length without re-borrowing self.
@@ -8704,7 +8704,7 @@ impl OptContext {
                     PtrInfo::struct_ptr(parent_descr.clone())
                 };
                 // optimizer.py:484: opinfo.init_fields(parent_descr, descr.get_index())
-                // info.py:180-188 init_fields(parent_descr, index) sets self.descr
+                // info.py init_fields(parent_descr, index) sets self.descr
                 // and pre-allocates _fields by parent slot count.
                 new_info.init_fields(parent_descr, field_descr.index_in_parent());
                 new_info
@@ -8766,7 +8766,7 @@ impl OptContext {
         EnsuredPtrInfo::Forwarded(arg0_box)
     }
 
-    /// optimizer.py:453-462: make_nonnull_str(op, mode) line-by-line port.
+    /// optimizer.py: make_nonnull_str(op, mode) line-by-line port.
     ///
     /// ```python
     /// def make_nonnull_str(self, op, mode):
@@ -8781,7 +8781,7 @@ impl OptContext {
     /// ```
     pub fn make_nonnull_str(&self, op: &Operand, mode: u8) {
         use crate::optimizeopt::info::OpInfo;
-        // optimizer.py:455: op = self.get_box_replacement(op)
+        // optimizer.py: op = self.get_box_replacement(op)
         let op = op.get_box_replacement(false);
         // optimizer.py:457: if op.is_constant(): return
         if op.is_constant() {
@@ -9064,7 +9064,7 @@ mod boxref_forwarding_tests {
         assert!(matches!(b0.get_forwarded(), BoxForwarded::None));
     }
 
-    /// `optimizer.py:387-400 make_equal_to` Info transfer parity: when
+    /// `optimizer.py make_equal_to` Info transfer parity: when
     /// `old` carries `Forwarded::IntBound(_)` and is forwarded to a
     /// non-constant `new`, the IntBound moves to `new`'s slot.
     #[test]
@@ -9101,7 +9101,7 @@ mod boxref_forwarding_tests {
         // Seed an IntBound on old.
         let bound = IntBound::from_constant(42);
         ctx.setintbound(&b0, &bound);
-        // Forward to an inline-Const target — history.py:227 ConstInt.value
+        // Forward to an inline-Const target — history.py ConstInt.value
         // carries the value on the Box itself, no const_pool seed needed.
         let const_opref = OpRef::const_int(42);
         let b_const = ctx.materialize_operand_at(const_opref);
@@ -9165,7 +9165,7 @@ mod boxref_forwarding_tests {
         }
     }
 
-    /// `resoperation.py:57-68 get_box_replacement` + `history.py:188
+    /// `resoperation.py get_box_replacement` + `history.py:188
     /// Const.is_constant()` parity: after the chain walker advances into
     /// a `Forwarded::Const(constval)` target, `is_constant()` on the
     /// terminal box reports True. Covers both encodings of "this slot is
@@ -9196,7 +9196,7 @@ mod boxref_forwarding_tests {
         assert!(!nb.get_box_replacement(false).is_constant());
     }
 
-    /// `make_constant` mirrors PyPy optimizer.py:432
+    /// `make_constant` mirrors PyPy optimizer.py
     /// `box.set_forwarded(constbox)` — Const variant.
     #[test]
     fn h3_1_make_constant_mirrors_box_info_constant() {
@@ -9228,7 +9228,7 @@ mod boxref_forwarding_tests {
 
     /// `make_equal_to(old, ConstX)` mirrors onto `old_box.set_forwarded_const(
     /// const_value)`. Per RPython parity (`optimizer.py:393`,
-    /// `history.py:220` ConstInt construction), the const target is built
+    /// `history.py` ConstInt construction), the const target is built
     /// fresh from `const_pool[const_index]` per call site — no dedup, value
     /// equality via `same_constant`. The mirror must record the same Value
     /// as the seeded constant via `Forwarded::Const`.
@@ -9246,7 +9246,7 @@ mod boxref_forwarding_tests {
         }
     }
 
-    /// resoperation.py:58 get_box_replacement(not_const=True) stops before
+    /// resoperation.py get_box_replacement(not_const=True) stops before
     /// stepping into a Const target. This is required for guard fail args:
     /// resume numbering encodes constants as TAGCONST, while backend liveboxes
     /// keep the runtime Box identity.
@@ -9360,7 +9360,7 @@ mod boxref_forwarding_tests {
     /// `h3_4_phase2_placeholder_forwarding_yields_consistent_reads`. Pre-import
     /// (no `setinfo_from_preamble` call), reading `target_p1` info via either
     /// path returns None — consistent within pyre. PyPy parity here depends on
-    /// `ExportedState.exported_infos` (`unroll.py:529` canonical field)
+    /// `ExportedState.exported_infos` (`unroll.py` canonical field)
     /// carrying every preamble op info the body needs; the placeholder cannot
     /// fabricate preamble info that wasn't exported. PyPy itself uses the same
     /// serialization map for the import (PyPy's body optimizer reads exported_infos
@@ -9605,7 +9605,7 @@ mod boxref_forwarding_tests {
     #[test]
     fn h3_2c_last_guard_pos_returns_none_when_no_recorded_guard() {
         let (mut ctx, b) = ctx_with_one_ref_box();
-        // info.py:91 last_guard_pos == -1 → get_last_guard_pos returns None.
+        // info.py last_guard_pos == -1 → get_last_guard_pos returns None.
         ctx.set_ptr_info(&b, PtrInfo::NonNull { last_guard_pos: -1 });
         assert!(ctx.last_guard_pos(&b).is_none());
     }
@@ -9865,7 +9865,7 @@ mod boxref_forwarding_tests {
         );
     }
 
-    /// `resoperation.py:57-68 get_box_replacement` walks the
+    /// `resoperation.py get_box_replacement` walks the
     /// `_forwarded` chain until it hits a terminal that is not a Box
     /// forward.  After two consecutive `make_equal_to(a, b)` /
     /// `make_equal_to(b, c)` calls, reading `getptrinfo_handle(&a)`
@@ -9900,7 +9900,7 @@ mod boxref_forwarding_tests {
         assert_eq!(h_c.borrow().get_last_guard_pos(), Some(7));
     }
 
-    /// `optimizer.py:387 make_equal_to` transfers the `_forwarded`
+    /// `optimizer.py make_equal_to` transfers the `_forwarded`
     /// IntBound from `op` to `newop` by writing the same Python object
     /// into `newop.set_forwarded(...)`.  Counterpart of
     /// [`replace_op_preserves_ptr_info_rc_identity`] for the IntBound
@@ -9935,7 +9935,7 @@ mod boxref_forwarding_tests {
         );
     }
 
-    /// `optimizer.py:387 make_equal_to` transfers the `_forwarded`
+    /// `optimizer.py make_equal_to` transfers the `_forwarded`
     /// PtrInfo from `op` to `newop` by writing the same Python object
     /// into `newop.set_forwarded(...)`.  pyre's `make_equal_to` clones
     /// the `OpInfo` enum, but since `OpInfo::Ptr` holds an `Rc`, the
@@ -9975,7 +9975,7 @@ mod boxref_forwarding_tests {
         );
     }
 
-    /// `make_equal_to` (`optimizer.py:390-401`) shares the same
+    /// `make_equal_to` (`optimizer.py`) shares the same
     /// `Rc<RefCell<IntBound>>` identity across `old` → `new` forwarding.
     #[test]
     fn make_equal_to_preserves_int_bound_rc_identity() {
@@ -10094,7 +10094,7 @@ mod boxref_forwarding_tests {
 
 #[cfg(test)]
 mod constant_ptr_info_tests {
-    //! info.py:706-758 + 865-894 ConstPtrInfo / getptrinfo / getrawptrinfo
+    //! info.py + 865-894 ConstPtrInfo / getptrinfo / getrawptrinfo
     //! parity tests for the typed-Int constant override path. RPython
     //! treats `ConstInt` (raw pointer) and `ConstPtr` uniformly via
     //! `_const.getref_base()`; majit must do the same regardless of how
@@ -10105,7 +10105,7 @@ mod constant_ptr_info_tests {
     use majit_ir::{GcRef, OpRef, Type, Value};
     use std::borrow::Cow;
 
-    /// info.py:880-894 getptrinfo(ConstPtr) → ConstPtrInfo(op).
+    /// info.py getptrinfo(ConstPtr) → ConstPtrInfo(op).
     /// A `Value::Ref` constant must be wrapped in `PtrInfo::Constant`.
     #[test]
     fn getptrinfo_returns_constant_for_value_ref() {
@@ -10119,7 +10119,7 @@ mod constant_ptr_info_tests {
         }
     }
 
-    /// info.py:870-871 getrawptrinfo(ConstInt) → ConstPtrInfo(op).
+    /// info.py getrawptrinfo(ConstInt) → ConstPtrInfo(op).
     /// Every ConstInt reaching `getrawptrinfo` is treated as a raw
     /// pointer (the caller has selected the helper because the
     /// `'i'`-typed box is intended as a pointer). The wrapped GcRef
@@ -10136,7 +10136,7 @@ mod constant_ptr_info_tests {
         }
     }
 
-    /// info.py:718-726 ConstPtrInfo._get_info(descr, optheap) parity:
+    /// info.py ConstPtrInfo._get_info(descr, optheap) parity:
     /// the same constant must always resolve to the same shared
     /// `const_infos[ref]` slot. Calling `get_const_info_mut` twice on a
     /// `Value::Ref` constant returns identical info — and a mutation
@@ -10207,7 +10207,7 @@ mod constant_ptr_info_tests {
         assert!(invalid.0.contains("null constant base pointer"));
     }
 
-    /// optimizer.py:154-158 `is_raw_ptr(op)` parity for
+    /// optimizer.py `is_raw_ptr(op)` parity for
     /// `info.RawSlicePtrInfo`: once a raw slice PtrInfo is present, it
     /// must be classified as an `AbstractRawPtrInfo` exactly like its
     /// parent raw buffer.
@@ -10239,7 +10239,7 @@ mod constant_ptr_info_tests {
         assert!(ctx.is_raw_ptr(&slice_box));
     }
 
-    /// vstring.py:50 `StrPtrInfo.__init__(mode, is_virtual=False, length=-1)`
+    /// vstring.py `StrPtrInfo.__init__(mode, is_virtual=False, length=-1)`
     /// parity for non-virtual strings: `make_nonnull_str()` must install
     /// a base `StrPtrInfo`, not one of the virtual subclasses.
     #[test]
@@ -10267,7 +10267,7 @@ mod constant_ptr_info_tests {
 
 #[cfg(test)]
 mod ensure_ptr_info_arg0_tests {
-    //! optimizer.py:461-499 `ensure_ptr_info_arg0` parity tests.
+    //! optimizer.py `ensure_ptr_info_arg0` parity tests.
     //!
     //! Each test mirrors a single PyPy branch in `ensure_ptr_info_arg0`:
     //! the constant arg0 path, the AbstractVirtualPtrInfo early-return path,
@@ -10358,7 +10358,7 @@ mod ensure_ptr_info_arg0_tests {
 
     fn field_op_with_parent(parent: DescrRef) -> Op {
         // history.py:182 GetfieldGc receiver is a Ref box; arg0 must
-        // carry the Ref variant tag (resoperation.py:615 RefOp).
+        // carry the Ref variant tag (resoperation.py RefOp).
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(
             OpCode::GetfieldGcI,
@@ -10424,7 +10424,7 @@ mod ensure_ptr_info_arg0_tests {
         assert!(matches!(info, EnsuredPtrInfo::Constant { .. }));
     }
 
-    /// info.py:796-822 `ConstPtrInfo.getlenbound(mode_string)` returns
+    /// info.py `ConstPtrInfo.getlenbound(mode_string)` returns
     /// `IntBound.from_constant(length)` when `getstrlen1(mode)` knows the
     /// exact length. The Rust port consults the `string_length_resolver`
     /// hook the host runtime registered on `OptContext`.
@@ -10551,9 +10551,9 @@ mod ensure_ptr_info_arg0_tests {
         assert_eq!(bound.lower, IntBound::nonnegative().lower);
     }
 
-    /// info.py:796-802 `ConstPtrInfo.getlenbound(mode)` returns
+    /// info.py `ConstPtrInfo.getlenbound(mode)` returns
     /// `IntBound.nonnegative()` whenever `getstrlen1(mode)` produces a
-    /// negative length. info.py:823-824 makes `mode is None` (no
+    /// negative length. info.py makes `mode is None` (no
     /// vstring mode) one of those cases via the `else: return -1`
     /// branch. The Rust port must therefore answer `Some(nonnegative())`
     /// — not `None` — for `Constant.getlenbound(None)` so the
@@ -10788,7 +10788,7 @@ mod intbound_invariant_tests {
     #[should_panic]
     fn setintbound_rejects_non_int_boxes() {
         let ctx = OptContext::new(0);
-        // setintbound asserts `op.type_()` is Int/Void per optimizer.py:116.
+        // setintbound asserts `op.type_()` is Int/Void per optimizer.py.
         // A Ref-typed operand should trigger the panic.
         let ref_op = crate::history::test_support::rooted_inputarg_operand(majit_ir::Type::Ref, 0);
         ctx.setintbound(&ref_op, &IntBound::nonnegative());
@@ -10819,7 +10819,7 @@ mod imported_short_preamble_fallback_tests {
             ],
         );
         replay_op.pos.set(OpRef::int_op(14));
-        // shortpreamble.py:120 non-invented PureOp.produce_op: `op = self.res`.
+        // shortpreamble.py non-invented PureOp.produce_op: `op = self.res`.
         // pop.op carries the body-visible OpRef directly (no forwarding chain
         // installed for non-invented Pure).
         let pop = crate::optimizeopt::info::PreambleOp {
@@ -10921,8 +10921,8 @@ mod opt_box_env_tests {
 
     #[test]
     fn materialize_operand_at_lazy_materialises_inputarg_for_empty_inputarg_slot() {
-        // `resoperation.py:699 AbstractInputArg` and
-        // `resoperation.py:250 AbstractResOp` are distinct classes
+        // `resoperation.py AbstractInputArg` and
+        // `resoperation.py AbstractResOp` are distinct classes
         // upstream — a Box materialised against `OpRef::InputArg*`
         // must be `is_inputarg()` so the chain walker reconstructs
         // the same variant on the round-trip through the
@@ -10945,7 +10945,7 @@ mod opt_box_env_tests {
         assert_eq!(ia.tp, majit_ir::Type::Int);
 
         // Re-entering must resolve to the same canonical `_forwarded`
-        // host (`resoperation.py:700 AbstractInputArg._forwarded`) —
+        // host (`resoperation.py AbstractInputArg._forwarded`) —
         // identity lives on the bound `InputArgRc`.
         let second = ctx.materialize_operand_at(arg);
         assert!(

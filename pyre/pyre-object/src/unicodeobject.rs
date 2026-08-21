@@ -42,7 +42,7 @@ pub struct W_UnicodeObject {
     /// `Member.index` from its layout. Keeping this on the object mirrors
     /// PyPy's `_mapdict_*storage` owner and avoids an address-keyed side table.
     pub w_slots: PyObjectRef,
-    /// `W_UnicodeObject._index_storage` (`unicodeobject.py:1196`) — the
+    /// `W_UnicodeObject._index_storage` (`unicodeobject.py`) — the
     /// `rutf8` code point index table, built on the first non-ASCII index and
     /// null until then.  A pure cache: dropping it only costs the next lookup a
     /// rebuild.
@@ -52,7 +52,7 @@ pub struct W_UnicodeObject {
     /// walker's `is_managed_heap_object` edge guard skips, the same split its
     /// `value` buffer already makes.
     pub index_storage: *mut crate::rutf8::Utf8IndexStorage,
-    /// Memoized digest, `rstr.py:395-412 LLHelpers.ll_strhash`.  RPython
+    /// Memoized digest, `rstr.py LLHelpers.ll_strhash`.  RPython
     /// keeps the hash in the string itself and recomputes only while the
     /// slot still reads zero (`jit.conditional_call_elidable(s.hash, ...)`);
     /// `W_UnicodeObject.hash_w` reaches it through `compute_hash(self._utf8)`,
@@ -159,7 +159,7 @@ impl crate::lltype::GcType for W_UnicodeObjectUser {
 /// (`try_gc_alloc_stable`) header + GC value box.  `from_string` takes ownership
 /// of the bytes with no copy or re-validation (every `&str` is valid WTF-8).
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// `box_str_constant` twin: the body runs a `str::chars` count plus an
 /// unfused `malloc_typed` NewWithVtable (`W_UnicodeObject`), so the JIT
 /// residualises the whole `&str -> W_UnicodeObject` construction to a
@@ -223,9 +223,9 @@ pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
 }
 
 /// Box one code point as a one-character `str`, `rutf8.unichr_as_utf8`
-/// (`rutf8.py:40`) under `_getitem_result` (`unicodeobject.py:1205`).
+/// (`rutf8.py:40`) under `_getitem_result` (`unicodeobject.py`).
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// [`w_str_new`] twin: the body encodes into a fresh `Wtf8Buf` and runs the
 /// unfused `malloc_typed` NewWithVtable behind it.  The code point crosses
 /// as its scalar value because a `CodePoint` is a struct, which the residual
@@ -242,9 +242,9 @@ pub fn w_str_from_codepoint(code_point: u32) -> PyObjectRef {
 }
 
 /// The code points at `start, start + step, …` boxed as a fresh `str` —
-/// `_unicode_sliced` / `descr_getslice` (`unicodeobject.py:1373-1379`).
+/// `_unicode_sliced` / `descr_getslice` (`unicodeobject.py`).
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// [`w_str_from_codepoint`] twin: the cut is assembled by pushing code
 /// points into a `Wtf8Buf`, and a mutable string builder has no counterpart
 /// in the immutable lifted string model.  The caller keeps the
@@ -275,10 +275,10 @@ pub unsafe fn w_str_slice_codepoints(
     w_str_from_wtf8_managed(result)
 }
 
-/// `ll_strconcat` (`rstr.py:425-428`) — the two operands' WTF-8 buffers
+/// `ll_strconcat` (`rstr.py`) — the two operands' WTF-8 buffers
 /// joined into a fresh collectable `str`.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
 /// upstream reaches concatenation through `@jit.oopspec('stroruni.concat')`
 /// rather than tracing the buffer build, and pyre's build — `Wtf8Buf`
 /// reserve plus two `push_wtf8` — has no lowering in the immutable lifted
@@ -347,13 +347,13 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
     }
 }
 
-/// `_utf8_sliced` (unicodeobject.py:1373-1379) — wrap a piece cut out of
+/// `_utf8_sliced` (unicodeobject.py) — wrap a piece cut out of
 /// `recv`'s own WTF-8 storage.
 ///
 /// The cut goes through `self._utf8[start:stop]`, and
-/// `ll_stringslice_startstop` (rstr.py:867-869) hands the source string back
+/// `ll_stringslice_startstop` (rstr.py) hands the source string back
 /// unchanged when the cut spans it whole (`start == 0 and stop >= len`).  The
-/// piece then shares its operand's storage, so `is_w` (unicodeobject.py:110-111)
+/// piece then shares its operand's storage, so `is_w` (unicodeobject.py)
 /// reports the two identical.  A piece cut from `recv` spans it whole exactly
 /// when their WTF-8 byte counts agree.
 ///
@@ -368,10 +368,10 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
 ///
 /// Restricted further to cuts upstream spells with **both** bounds.  Only
 /// `ll_stringslice_startstop` carries the shortcut; a one-bound `s[start:]`
-/// goes through `ll_stringslice_startonly` (rstr.py:857-858), which calls
+/// goes through `ll_stringslice_startonly` (rstr.py), which calls
 /// `_ll_stringslice` directly and always builds a fresh string.  So a method
 /// whose match arm slices with a single bound — `descr_removeprefix`'s
-/// `selfval[len(prefix):]` (stringmethods.py:879) — must allocate even when an
+/// `selfval[len(prefix):]` (stringmethods.py) — must allocate even when an
 /// empty argument makes the cut span the receiver whole, and must not come
 /// here.  Check which helper the upstream arm resolves to before routing a new
 /// call site through this function.
@@ -681,7 +681,7 @@ pub unsafe fn as_str_unchecked(value: &Wtf8) -> &str {
 /// Scan the buffer for the code point index of its first lone surrogate, or
 /// `-1` when every code point encodes as UTF-8.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the
 /// scan walks the whole buffer, and both answers it carries — the validity
 /// bit [`w_str_is_utf8`] tests and the error offset `str_utf8_w` reports —
 /// ride back in the one machine word.
@@ -731,7 +731,7 @@ pub unsafe fn w_str_get_wtf8(obj: PyObjectRef) -> &'static Wtf8 {
     }
 }
 
-/// `rstr.py:395-400 ll_strhash` — the memoized digest, or zero while it has
+/// `rstr.py ll_strhash` — the memoized digest, or zero while it has
 /// not been computed yet ("our malloc initializes the memory to zero, so we
 /// use zero as the value of a string whose hash is not computed yet").
 ///
@@ -754,7 +754,7 @@ pub unsafe fn w_str_set_hash(obj: PyObjectRef, hash: i64) {
     unsafe { (*(obj as *mut W_UnicodeObject)).hash = hash }
 }
 
-/// `rstr.py:402-412 ll_strhash` — read the memo, and compute the digest only
+/// `rstr.py ll_strhash` — read the memo, and compute the digest only
 /// while the slot still reads zero:
 ///
 /// ```python
@@ -815,7 +815,7 @@ pub unsafe fn w_str_len(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_UnicodeObject)).len }
 }
 
-/// `unicodeobject.py:1245 W_UnicodeObject.is_ascii` — `self._length ==
+/// `unicodeobject.py W_UnicodeObject.is_ascii` — `self._length ==
 /// len(self._utf8)`.  One byte per code point means a code point index is
 /// already a byte offset.
 ///
@@ -829,7 +829,7 @@ pub unsafe fn w_str_is_ascii(obj: PyObjectRef) -> bool {
     }
 }
 
-/// `W_UnicodeObject._compute_index_storage` (`unicodeobject.py:1200`) — build
+/// `W_UnicodeObject._compute_index_storage` (`unicodeobject.py`) — build
 /// the `rutf8` code point index table and cache it in the `index_storage` slot.
 ///
 /// The table's holder follows the string's own: a GC-managed string boxes it
@@ -838,7 +838,7 @@ pub unsafe fn w_str_is_ascii(obj: PyObjectRef) -> bool {
 /// `try_gc_owns_object` is the same discriminator every other mixed-allocation
 /// host path uses.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`) stands in
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`) stands in
 /// for the `jit.conditional_call_elidable` that keeps this build off the trace
 /// upstream: [`w_str_get_index_storage`] traces the cached-pointer test and
 /// residualizes the build behind it.
@@ -862,7 +862,7 @@ unsafe fn w_str_compute_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Ut
     }
 }
 
-/// `W_UnicodeObject._get_index_storage` (`unicodeobject.py:1196`) — the cached
+/// `W_UnicodeObject._get_index_storage` (`unicodeobject.py`) — the cached
 /// index table, computing it on first use.
 ///
 /// # Safety
@@ -878,7 +878,7 @@ unsafe fn w_str_get_index_storage(obj: PyObjectRef) -> *mut crate::rutf8::Utf8In
     }
 }
 
-/// `W_UnicodeObject._index_to_byte` (`unicodeobject.py:1251`) — the byte offset
+/// `W_UnicodeObject._index_to_byte` (`unicodeobject.py`) — the byte offset
 /// of code point `index`, which must not exceed the code point count.  The
 /// count itself resolves to the end of the buffer, which is what a `start` or
 /// `end` bound equal to the length asks for.
@@ -899,7 +899,7 @@ pub unsafe fn w_str_index_to_byte(obj: PyObjectRef, index: usize) -> usize {
     }
 }
 
-/// `W_UnicodeObject._byte_to_index` (`unicodeobject.py:1263`) — the code point
+/// `W_UnicodeObject._byte_to_index` (`unicodeobject.py`) — the code point
 /// index whose [`w_str_index_to_byte`] is `bytepos`.
 ///
 /// Logarithmic in the string length, with a constant that is not tiny either,
@@ -923,7 +923,7 @@ pub unsafe fn w_str_byte_to_index(obj: PyObjectRef, bytepos: usize) -> usize {
     }
 }
 
-/// `W_UnicodeObject._codepoints_in_utf8` (`unicodeobject.py:1257`) — the number
+/// `W_UnicodeObject._codepoints_in_utf8` (`unicodeobject.py`) — the number
 /// of code points in the byte window `start..end`.
 ///
 /// # Safety
@@ -939,9 +939,9 @@ pub unsafe fn w_str_codepoints_in_utf8(obj: PyObjectRef, start: usize, end: usiz
 
 /// The code point at `index`, or `None` past the end.
 ///
-/// `rutf8.codepoint_at_index` (`rutf8.py:576`) is the read for a non-ASCII
+/// `rutf8.codepoint_at_index` (`rutf8.py`) is the read for a non-ASCII
 /// payload; an ASCII one takes `_index_to_byte`'s direct branch
-/// (`unicodeobject.py:1251`), where the code point index is already the byte
+/// (`unicodeobject.py`), where the code point index is already the byte
 /// offset, and never builds a table.
 ///
 /// # Safety

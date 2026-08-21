@@ -284,13 +284,13 @@ pub struct W_PickleBuffer {
 
 #[crate::pyre_methods(
     doc = "PickleBuffer(buffer) -> wrapper for potentially out-of-band serialization.",
-    // interp_buffer.py:209 make_weakref_descr(W_PickleBuffer)
+    // interp_buffer.py make_weakref_descr(W_PickleBuffer)
     weakrefable
 )]
 impl W_PickleBuffer {
     #[staticmethod]
     fn __new__(_cls: PyObjectRef, w_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
-        // interp_buffer.py:201-203 descr_new_picklebuffer — acquire the
+        // interp_buffer.py descr_new_picklebuffer — acquire the
         // export while constructing the object; PickleBuffer has no separate
         // __init__ phase.
         let (w_buffer, release_memoryview, w_release_exporter) = acquire_pickle_buffer(w_obj)?;
@@ -373,7 +373,7 @@ impl W_PickleBuffer {
 }
 
 impl W_PickleBuffer {
-    /// `_release_buf` (`interp_buffer.py:146-150`) — clear ownership before
+    /// `_release_buf` (`interp_buffer.py`) — clear ownership before
     /// calling the exporter release, making repeated explicit/finalizer calls
     /// idempotent.
     pub(crate) fn release_export(&mut self) {

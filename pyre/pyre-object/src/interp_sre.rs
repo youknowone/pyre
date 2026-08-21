@@ -1,4 +1,4 @@
-//! `pypy/module/_sre/interp_sre.py:147 W_SRE_Pattern` /
+//! `pypy/module/_sre/interp_sre.py W_SRE_Pattern` /
 //! `:675 W_SRE_Match` — typed layouts for compiled patterns and match
 //! results.  Engine state lives in interp-level fields, not in a user
 //! attribute store.
@@ -15,11 +15,11 @@ use pyre_macros::pyre_class;
 /// (`_immutable_fields_ = ["code", ...]`, interp_sre.py:148).
 #[pyre_class("re.Pattern", static_name = "SRE_PATTERN")]
 pub struct W_SRE_Pattern {
-    /// interp_sre.py:630 `srepat.w_pattern` — original uncompiled pattern.
+    /// interp_sre.py `srepat.w_pattern` — original uncompiled pattern.
     pub w_pattern: PyObjectRef,
-    /// interp_sre.py:631 `srepat.flags`.
+    /// interp_sre.py `srepat.flags`.
     pub flags: i64,
-    /// interp_sre.py:635 `srepat.code` (see type doc).
+    /// interp_sre.py `srepat.code` (see type doc).
     pub code: *const u32,
     pub code_len: usize,
     /// interp_sre.py:637 `srepat.num_groups`.
@@ -72,7 +72,7 @@ pub fn w_sre_pattern_new(
     w_groupindex: PyObjectRef,
     w_indexgroup: PyObjectRef,
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_pattern);
     crate::gc_roots::pin_root(w_groupindex);
@@ -110,7 +110,7 @@ pub unsafe fn is_sre_pattern(obj: PyObjectRef) -> bool {
 /// Match result object (interp_sre.py:675).
 ///
 /// Upstream keeps the live match context (`self.ctx`) and flattens the
-/// group marks lazily (`flatten_marks`, interp_sre.py:793-797).  Pyre's
+/// group marks lazily (`flatten_marks`, interp_sre.py).  Pyre's
 /// sre-engine surfaces the marks eagerly at match time, so the span
 /// table (group 0 = whole match first, `(-1, -1)` = unmatched group)
 /// is materialised once into a leaked buffer that plays both `ctx`
@@ -128,11 +128,11 @@ pub struct W_SRE_Match {
     /// backing `bytes`) here; `PY_NULL` when `w_string` is itself the subject
     /// (a `str`/`bytes`/`bytearray`), where slicing reads `w_string` directly.
     pub w_buffer: PyObjectRef,
-    /// `ctx.original_pos` (fget_pos, interp_sre.py:851-852).
+    /// `ctx.original_pos` (fget_pos, interp_sre.py).
     pub pos: i64,
-    /// `ctx.end` (fget_endpos, interp_sre.py:854-855).
+    /// `ctx.end` (fget_endpos, interp_sre.py).
     pub endpos: i64,
-    /// `_last_index()` (interp_sre.py:825-829); `-1` plays None.
+    /// `_last_index()` (interp_sre.py); `-1` plays None.
     pub lastindex: i64,
     /// Flattened spans (see type doc).
     pub spans: *const (i64, i64),
@@ -151,7 +151,7 @@ pub fn w_sre_match_new(
     lastindex: i64,
     spans: &'static [(i64, i64)],
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_srepat);
     crate::gc_roots::pin_root(w_string);
@@ -180,7 +180,7 @@ pub unsafe fn is_sre_match(obj: PyObjectRef) -> bool {
 }
 
 /// The flattened span for group `groupnum` (0 = whole match), or
-/// `None` past the table — `do_span`'s table read (interp_sre.py:817-820).
+/// `None` past the table — `do_span`'s table read (interp_sre.py).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_SRE_Match`.
@@ -195,7 +195,7 @@ pub unsafe fn w_sre_match_get_span(obj: PyObjectRef, groupnum: usize) -> Option<
     }
 }
 
-/// `_sre.SRE_Scanner` (interp_sre.py:904) — the stateful iterator behind
+/// `_sre.SRE_Scanner` (interp_sre.py) — the stateful iterator behind
 /// `Pattern.finditer` (and the undocumented `scanner()`), yielding a
 /// `W_SRE_Match` per non-overlapping match.
 ///
@@ -232,7 +232,7 @@ pub struct W_SRE_Scanner {
     pub export_active: bool,
 }
 
-/// Allocate a `W_SRE_Scanner` — `W_SRE_Scanner.__init__` (interp_sre.py:905).
+/// Allocate a `W_SRE_Scanner` — `W_SRE_Scanner.__init__` (interp_sre.py).
 pub fn w_sre_scanner_new(
     w_srepat: PyObjectRef,
     w_string: PyObjectRef,

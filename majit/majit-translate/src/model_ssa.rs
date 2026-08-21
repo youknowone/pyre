@@ -88,7 +88,7 @@ struct Opportunity {
 }
 
 /// RPython `DataFlowFamilyBuilder(graph).get_variable_families()`
-/// (`ssa.py:4-90`), restricted to the `complete()` pass (`SSA_to_SSI`
+/// (`ssa.py`), restricted to the `complete()` pass (`SSA_to_SSI`
 /// never needs `merge_identical_phi_nodes`).
 ///
 /// Opportunities with any `Constant` link arg are dropped — upstream
@@ -171,7 +171,7 @@ fn compute_variable_families(
     families
 }
 
-/// RPython `variables_created_in(block)` (`ssa.py:128-132`): inputargs
+/// RPython `variables_created_in(block)` (`ssa.py`): inputargs
 /// plus every op result.
 #[expect(
     clippy::mutable_key_type,
@@ -191,7 +191,7 @@ fn variables_created_in(graph: &FunctionGraph, id: BlockId) -> HashSet<Variable>
     s
 }
 
-/// RPython `Block.renamevariables({v: w})` (`flowspace/model.py:238-244`)
+/// RPython `Block.renamevariables({v: w})` (`flowspace/model.py`)
 /// specialised to a single `v -> w` rewrite: rewrites every variable
 /// occurrence in `id`'s inputargs, op args/results, exitswitch, and exit
 /// link args.  `v` is a used-but-not-created variable, so it appears only
@@ -223,7 +223,7 @@ fn renamevariables(graph: &mut FunctionGraph, id: BlockId, v: &Variable, w: &Var
     bm.exits = new_exits;
 }
 
-/// RPython `SSA_to_SSI(graph)` (`ssa.py:135-196`) against the codewriter
+/// RPython `SSA_to_SSI(graph)` (`ssa.py`) against the codewriter
 /// model graph.  Threads every used-but-not-created variable up its
 /// incoming links until it reaches a block that already defines a value
 /// in the same family, restoring the SSI invariant the register

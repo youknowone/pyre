@@ -18,7 +18,7 @@ fn lit(n: i64) -> Hlvalue {
     Hlvalue::Constant(Constant::new(ConstValue::Int(n)))
 }
 
-// ------ test_mingraph (test_checkgraph.py:4-7) ------
+// ------ test_mingraph (test_checkgraph.py) ------
 
 #[test]
 fn test_mingraph() {
@@ -33,7 +33,7 @@ fn test_mingraph() {
     checkgraph(&graph);
 }
 
-// ------ test_exitlessblocknotexitblock (test_checkgraph.py:16-18) ------
+// ------ test_exitlessblocknotexitblock (test_checkgraph.py) ------
 
 #[test]
 #[should_panic]
@@ -45,7 +45,7 @@ fn test_exitlessblocknotexitblock() {
     checkgraph(&graph);
 }
 
-// ------ test_nonvariableinputarg (test_checkgraph.py:21-26) ------
+// ------ test_nonvariableinputarg (test_checkgraph.py) ------
 
 #[test]
 #[should_panic]
@@ -63,7 +63,7 @@ fn test_nonvariableinputarg() {
     checkgraph(&graph);
 }
 
-// ------ test_multiplydefinedvars (test_checkgraph.py:28-40) ------
+// ------ test_multiplydefinedvars (test_checkgraph.py) ------
 
 #[test]
 #[should_panic]
@@ -105,7 +105,7 @@ fn test_multiplydefinedvars_input_and_op_result() {
     checkgraph(&graph);
 }
 
-// ------ test_varinmorethanoneblock (test_checkgraph.py:42-49) ------
+// ------ test_varinmorethanoneblock (test_checkgraph.py) ------
 
 #[test]
 #[should_panic]
@@ -137,7 +137,7 @@ fn test_varinmorethanoneblock() {
     checkgraph(&graph);
 }
 
-// ------ test_useundefinedvar (test_checkgraph.py:51-61) ------
+// ------ test_useundefinedvar (test_checkgraph.py) ------
 
 #[test]
 #[should_panic]
@@ -170,7 +170,7 @@ fn test_useundefinedvar_in_exitswitch() {
     checkgraph(&graph);
 }
 
-// ------ test_invalid_links (test_checkgraph.py:70-86) ------
+// ------ test_invalid_links (test_checkgraph.py) ------
 //
 // Upstream covers three cases:
 //  (a) two Links both targeting returnblock with no exitswitch — the

@@ -58,7 +58,7 @@ pub struct ExceptionTableEntry {
     pub lasti: bool,
 }
 
-/// pycode.py:229-254 `lookup_exceptiontable`.
+/// pycode.py `lookup_exceptiontable`.
 ///
 /// Search `table` for a handler covering `instr_offset` (byte offset
 /// into `co_code`). Returns `Some((target, depth, lasti))` when found,
@@ -202,9 +202,9 @@ pub struct PyCode {
     /// the first collection that moves the string.
     pub filename_bytes: *mut Vec<u8>,
     /// Whether an unrealized nested compiler constant selected by
-    /// `importing.py:379-391 update_code_filenames`' `oldname` guard inherits
+    /// `importing.py update_code_filenames`' `oldname` guard inherits
     /// `filename_bytes` when pyre crosses its lazy wrapping boundary. False
-    /// for `pycode.py:431` constructor/replace filenames, which affect only
+    /// for `pycode.py` constructor/replace filenames, which affect only
     /// the code object being constructed.
     pub filename_inherits_to_nested: bool,
     /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
@@ -215,14 +215,14 @@ pub struct PyCode {
     /// [`W_GLOBALS_STAMPED_CODES`] and forwarded from there. Null until first
     /// stamped by `frame_stores_global`.
     pub w_globals: PyObjectRef,
-    /// PyPy: `PyCode.hidden_applevel` (`pycode.py:111, 147`). Set by
+    /// PyPy: `PyCode.hidden_applevel` (`pycode.py, 147`). Set by
     /// `pycompiler.compile(hidden_applevel=True)` for PyPy gateway/
     /// app_main bridge code.  Pyre has no such call site yet, so this
     /// is always `false` on currently constructed instances; the
     /// field exists so that `frame.hide()` can read the canonical
     /// `pyframe.py:521-522 return self.pycode.hidden_applevel`.
     pub hidden_applevel: bool,
-    /// pycode.py:226-238 `_compute_flatcall`. Cached arity descriptor:
+    /// pycode.py `_compute_flatcall`. Cached arity descriptor:
     /// - 0-4: impossible (builtins only)
     /// - FLATPYCALL | co_argcount: simple user function
     /// - HOPELESS: has *args/**kwargs/kwonly/too many params
@@ -249,12 +249,12 @@ pub struct PyCode {
     pub globals_caches: *mut std::sync::Mutex<
         Vec<Option<std::sync::Weak<std::sync::Mutex<pyre_object::celldict::GlobalCache>>>>,
     >,
-    /// `mapdict.py:1457-1458 self._mapdict_caches = [INVALID_CACHE_ENTRY] *
+    /// `mapdict.py self._mapdict_caches = [INVALID_CACHE_ENTRY] *
     /// len(co_names_w)`.
     ///
     /// Per-name slot for the `LOAD_ATTR_caching` / `STORE_ATTR_caching` inline
     /// attribute cache (`mapdict.py:1480/1574`).  A `None` slot is PyPy's
-    /// `INVALID_CACHE_ENTRY` (mapdict.py:1452); a `Some` holds the immortal map
+    /// `INVALID_CACHE_ENTRY` (mapdict.py); a `Some` holds the immortal map
     /// node + attribute node + `version_tag` last resolved for this slot, so a
     /// monomorphic re-read skips the type lookup + map walk.  The
     /// LOAD_METHOD fill additionally stores a movable `w_method`
@@ -267,7 +267,7 @@ pub struct PyCode {
     pub mapdict_caches: *mut Vec<Option<crate::objspace::std::mapdict::MapdictCacheEntry>>,
     /// `pycode.py:126 self.co_consts_w = consts` (`_immutable_fields_
     /// co_consts_w[*]`, pycode.py:97).  The realized constant objects indexed by
-    /// constant index.  `getconstant_w(index)` (`pyopcode.py:498-499`) returns
+    /// constant index.  `getconstant_w(index)` (`pyopcode.py`) returns
     /// `co_consts_w[index]`, so every `LOAD_CONST` yields the one shared object
     /// stored here — repeated loads (including blackhole resume through the
     /// same virtualizable `pycode`) preserve object identity.
@@ -284,7 +284,7 @@ pub struct PyCode {
     /// `pycode.py:127-129 self.co_names_w = [space.new_interned_str(aname) for
     /// aname in names]` (`_immutable_fields_ co_names_w[*]`, pycode.py:100).
     /// The realized name objects indexed by name index.  `getname_w(index)`
-    /// (`pyopcode.py:521-522`) returns `co_names_w[index]`, so every opcode
+    /// (`pyopcode.py`) returns `co_names_w[index]`, so every opcode
     /// needing a wrapped name hands back the one object this code object owns
     /// rather than minting a `W_UnicodeObject` per execution — the identity
     /// argument of `w_qualname` below, applied per name index.
@@ -418,7 +418,7 @@ pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
 }
 
 /// `pycode.py:135 self.co_filename = filename` as an application-level object,
-/// decoded with the filesystem encoding (`objspace.py:438 newfilename`) so a
+/// decoded with the filesystem encoding (`objspace.py newfilename`) so a
 /// path byte with no UTF-8 spelling survives instead of folding to U+FFFD.
 ///
 /// Unlike [`w_code_name_obj`] and [`w_code_qualname_obj`] this realizes a fresh
@@ -494,7 +494,7 @@ pub(crate) fn walk_prebuilt_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::Gc
 /// GC type id assigned to `PyCode`.
 ///
 /// `PyCode` is a normal interpreter-level code object in PyPy
-/// (`pycode.py:93 class PyCode(eval.Code)`).  This tid is pinned by
+/// (`pycode.py class PyCode(eval.Code)`).  This tid is pinned by
 /// a `debug_assert_eq!` in the pyre-jit type-registration sequence: the
 /// `PyCode` `TypeInfo` is registered explicitly just before the
 /// foreign-pytype loop, taking the slot directly after
@@ -527,7 +527,7 @@ pub fn make_signature(_code: &PyCode) -> PyObjectRef {
     pyre_object::w_none()
 }
 
-/// pycode.py:637-659 _compute_args_as_cellvars
+/// pycode.py _compute_args_as_cellvars
 pub fn _compute_args_as_cellvars(
     varnames: &[String],
     cellvars: &[String],
@@ -560,7 +560,7 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
     w_a
 }
 
-/// pypy/interpreter/pycode.py:107-147 `PyCode.__init__`
+/// pypy/interpreter/pycode.py `PyCode.__init__`
 /// (`hidden_applevel` field assignment, line 147).
 ///
 /// ```python
@@ -571,7 +571,7 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 ///
 /// `w_code_new(code_ptr)` is the `hidden_applevel=False` default
 /// shorthand; callers who need the flag set (mirroring PyPy's
-/// `BuiltinCode` (gateway.py:743) / `ApplevelClass`
+/// `BuiltinCode` (gateway.py) / `ApplevelClass`
 /// (gateway.py:1355) / `_continuation` entrypoint dummy
 /// (interp_continuation.py:195)) construct via this entry point.
 ///
@@ -579,13 +579,13 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// `code_ptr` must be a valid pointer to a `CodeObject` obtained
 /// via `Box::into_raw`.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the body
 /// boxes the `PyCode` through the prebuilt allocator and its per-name cache
 /// tables through direct raw allocations. Residualise the whole
 /// constructor — a `PyObjectRef` GCREF modelled by signature. Code objects are
 /// built at import/compile time, never on a traced hot path.
 ///
-/// `pycode.py:93` makes `PyCode` an ordinary GC object, so upstream traces
+/// `pycode.py` makes `PyCode` an ordinary GC object, so upstream traces
 /// `w_globals` and the cache tables structurally through it. `malloc_typed`
 /// here makes it immortal and non-moving instead, which nothing traces into —
 /// so every GC-heap slot it owns needs an explicit root walker
@@ -639,7 +639,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         v.resize_with(names_len, || None);
         Box::into_raw(Box::new(std::sync::Mutex::new(v)))
     };
-    // `mapdict.py:1457-1458 self._mapdict_caches = [INVALID_CACHE_ENTRY] *
+    // `mapdict.py self._mapdict_caches = [INVALID_CACHE_ENTRY] *
     // len(co_names_w)` — `None` is `INVALID_CACHE_ENTRY`.
     let mapdict_caches = if !code_ptr_aligned {
         std::ptr::null_mut()
@@ -724,7 +724,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     obj
 }
 
-/// pypy/interpreter/pycode.py:107-147 `PyCode.__init__` shorthand —
+/// pypy/interpreter/pycode.py `PyCode.__init__` shorthand —
 /// equivalent to PyPy `hidden_applevel=False` default
 /// (pycode.py:111).  Most user-level pycode constructions take this
 /// path; only the gateway / continuation / `__pypy__.hidden_applevel`
@@ -751,7 +751,7 @@ pub unsafe fn w_code_yields_inside_try(w_code: PyObjectRef) -> bool {
 
 /// Box a compiler code object the caller owns into a heap Python code wrapper.
 ///
-/// PyPy's compiler constructs `PyCode` directly (`pycode.py:115-126`) and
+/// PyPy's compiler constructs `PyCode` directly (`pycode.py`) and
 /// therefore has no foreign compiler-object in the translated graph. Pyre's
 /// compiler-core `CodeObject` is a dependency ADT that recursively owns boxed
 /// slices and nested constants; it is solely the serialization/API seam used
@@ -763,7 +763,7 @@ pub unsafe fn w_code_yields_inside_try(w_code: PyObjectRef) -> bool {
 /// The object is leaked on purpose: code wrappers are immortal and
 /// `pycode_destructor` never frees `code_ptr`.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the body
 /// `Box::into_raw`s a `CodeObject` (unlifted raw allocation) before forwarding
 /// to the residualised `w_code_new`.
 #[majit_macros::dont_look_inside]
@@ -797,7 +797,7 @@ unsafe fn box_code_constant_in_place(code: *const crate::CodeObject) -> PyObject
 
 /// Wrap a nested compiler constant and inherit the enclosing `PyCode`'s raw
 /// filename when it belongs to the set selected by
-/// `importing.py:379-391 update_code_filenames`' `oldname` guard.
+/// `importing.py update_code_filenames`' `oldname` guard.
 ///
 /// # Safety
 /// `code` must satisfy [`box_code_constant_in_place`], and `parent` must be
@@ -1150,7 +1150,7 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         "co_firstlineno" => w_int_new((*(obj as *const PyCode)).co_firstlineno_raw as i64),
         "co_linetable" => pyre_object::bytesobject::w_bytes_from_bytes(&code.linetable),
         "co_exceptiontable" => pyre_object::bytesobject::w_bytes_from_bytes(&code.exceptiontable),
-        // location.py:163-182 `linetable2lnotab`, reconstructed from the
+        // location.py `linetable2lnotab`, reconstructed from the
         // canonical decoded positions kept on CodeObject.
         "co_lnotab" => pyre_object::bytesobject::w_bytes_from_bytes(&legacy_lnotab(
             code,
@@ -1595,7 +1595,7 @@ pub unsafe fn code_branches(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyEr
     Ok(w_seq_iter_new(w_list_new(rows), n))
 }
 
-/// `code.replace(**kwds)` — `pypy/interpreter/pycode.py:74-91` applevel
+/// `code.replace(**kwds)` — `pypy/interpreter/pycode.py` applevel
 /// `replace`, which gathers every `co_*` attribute (taking the keyword
 /// override where present) and reconstructs the code object through the
 /// `CodeType` constructor.  pyre stores a compiler `CodeObject`, so the
@@ -1839,7 +1839,7 @@ unsafe fn read_code_filename(
 }
 
 /// Split the authoritative filesystem bytes from the compiler dependency's
-/// UTF-8-only `source_path` spelling (`objspace.py:438 newfilename`).
+/// UTF-8-only `source_path` spelling (`objspace.py newfilename`).
 pub(crate) fn split_code_filename_bytes(
     bytes: Vec<u8>,
     fallback: Option<&str>,
@@ -2038,7 +2038,7 @@ pub(crate) unsafe fn obj_to_constant_data(
     }
 }
 
-/// `pyopcode.py:498-499 getconstant_w(index) -> co_consts_w[index]`: return the
+/// `pyopcode.py getconstant_w(index) -> co_consts_w[index]`: return the
 /// one shared constant object the enclosing code holds at `index`, realizing
 /// it into the slot on first access (`pycode.py:126` builds `co_consts_w`
 /// eagerly; pyre's compiler representation is unwrapped).
@@ -2113,7 +2113,7 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     published
 }
 
-/// `pyopcode.py:521-522 getname_w(index) -> self.getcode().co_names_w[index]`
+/// `pyopcode.py getname_w(index) -> self.getcode().co_names_w[index]`
 /// — the one wrapped name this code object holds at `idx`.
 ///
 /// Realized on first demand with `w_str_new`, whose result is
@@ -2221,7 +2221,7 @@ pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const PyCode)).code_ptr }
 }
 
-/// `importing.py:379 update_code_filenames`: set `source_path` on `code` and,
+/// `importing.py update_code_filenames`: set `source_path` on `code` and,
 /// recursively, on every nested code constant whose filename still matches the
 /// root's *original* name (leaving unrelated inlined filenames untouched).
 ///
@@ -2257,7 +2257,7 @@ pub unsafe fn fix_co_filename(w_code: PyObjectRef, newname: &[u8]) {
     }
     let old_filename = unsafe { code_filename_bytes(w_code) };
 
-    // `importing.py:379-391 update_code_filenames` mutates already-wrapped
+    // `importing.py update_code_filenames` mutates already-wrapped
     // nested `PyCode` constants. Pyre realizes that list lazily, so update the
     // filled slots now; unrealized children inherit when they are boxed.
     let pycode = unsafe { &*(w_code as *const PyCode) };
@@ -2305,7 +2305,7 @@ pub unsafe fn w_code_npure_cellvars(obj: PyObjectRef) -> Option<usize> {
     }
 }
 
-/// PyPy: `PyCode.hidden_applevel` (`pycode.py:147`). Reads the field
+/// PyPy: `PyCode.hidden_applevel` (`pycode.py`). Reads the field
 /// initialised by `w_code_new`.  `pyframe.py:521-522
 /// hide(self): return self.pycode.hidden_applevel` is the sole caller
 /// in the canonical interpreter; pyre routes through this accessor
@@ -2608,7 +2608,7 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     }
 }
 
-/// pycode.py:226-238 `_compute_flatcall`.
+/// pycode.py `_compute_flatcall`.
 ///
 /// Returns FLATPYCALL | co_argcount for simple user functions (no *args,
 /// **kwargs, keyword-only args). Returns HOPELESS otherwise.
@@ -2673,7 +2673,7 @@ pub unsafe fn code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
     }
 }
 
-/// pycode.py:229-254 `PyCode.lookup_exceptiontable`.
+/// pycode.py `PyCode.lookup_exceptiontable`.
 ///
 /// Search the wrapped code object's exception table for a handler
 /// covering `instr_offset` (byte offset into `co_code`).  Returns
@@ -2697,7 +2697,7 @@ pub unsafe fn w_code_lookup_exceptiontable(
     crate::pycode::lookup_exceptiontable(&code.exceptiontable, instr_offset)
 }
 
-/// pycode.py:145 `self.co_exceptiontable = exceptiontable` — copy the
+/// pycode.py `self.co_exceptiontable = exceptiontable` — copy the
 /// varint-packed table bytes out of the wrapped `CodeObject`.
 ///
 /// The bytes are owned by the inner `CodeObject` (`Box<[u8]>` field), so
@@ -2788,7 +2788,7 @@ pub unsafe fn w_code_globals_caches_len(obj: PyObjectRef) -> usize {
     unsafe { (*code.globals_caches).lock().unwrap().len() }
 }
 
-/// `mapdict.py:1483/1546/1575 entry = pycode._mapdict_caches[nameindex]` — read
+/// `mapdict.py/1546/1575 entry = pycode._mapdict_caches[nameindex]` — read
 /// slot `nameindex`, returning `None` (PyPy `INVALID_CACHE_ENTRY`) when the slot
 /// is unset, out of range, or `code_ptr` is invalid.  The entry is `Copy`, so a
 /// value is returned (no aliasing of the slot).
@@ -2849,7 +2849,7 @@ pub unsafe fn w_code_mapdict_caches_set(
 }
 
 /// Code objects whose `_mapdict_caches` hold (or once held) a filled
-/// `w_method` slot.  In PyPy `CacheEntry.w_method` (mapdict.py:1418)
+/// `w_method` slot.  In PyPy `CacheEntry.w_method` (mapdict.py)
 /// is traced through the GC-managed `PyCode`; a managed wrapper's custom
 /// trace reaches the slot the same way, so only a bootstrap wrapper minted
 /// before the collector exists enters this registry and the extra-root
@@ -2864,7 +2864,7 @@ fn mapdict_method_cache_codes() -> &'static std::sync::Mutex<std::collections::H
 }
 
 /// Code objects whose `w_globals` has been stamped
-/// (`pycode.py:159-165 frame_stores_global`).  `w_globals` is a permanent
+/// (`pycode.py frame_stores_global`).  `w_globals` is a permanent
 /// strong field: the first globals object a code object runs in is kept
 /// for the code object's lifetime and never replaced.  Upstream that
 /// field is traced through the GC-managed `PyCode`, and a managed wrapper's

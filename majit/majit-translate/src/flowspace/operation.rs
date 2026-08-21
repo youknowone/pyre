@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use super::flowcontext::FlowingError;
 use super::model::{ConstValue, Constant, Hlvalue, SpaceOperation, Variable};
 
-/// RPython `NOT_REALLY_CONST` (operation.py:22-35). Maps a module
+/// RPython `NOT_REALLY_CONST` (operation.py). Maps a module
 /// qualname to the set of attribute names that are *real* constants
 /// on that module; any other attribute of a listed module is treated
 /// as runtime-variable and [`constfold_getattr`] declines the fold.
@@ -78,7 +78,7 @@ fn not_really_const_declines(module_qualname: &str, attr: &str) -> bool {
 /// `SpaceOperation.opname`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum OpKind {
-    // ---- add_operator table (operation.py:445-521) ----
+    // ---- add_operator table (operation.py) ----
     // unary/binary operators registered via add_operator(); variant
     // names follow the upstream `opname` argument (UpperCamel'd), with
     // `_ovf` siblings as `*Ovf`.
@@ -185,7 +185,7 @@ pub enum OpKind {
 /// RPython `operation.py` `canraise` entries reference the Python
 /// exception classes `ValueError`, `OverflowError`, … directly. The
 /// Rust port carries identities through this enum so the trailing
-/// `_add_exceptions` table (operation.py:717-763) can populate
+/// `_add_exceptions` table (operation.py) can populate
 /// [`OpKind::canraise`] without pulling in the full `HOST_ENV`
 /// exception hierarchy at this phase.
 ///
@@ -586,9 +586,9 @@ impl OpKind {
     /// `add_operator(name + '_ovf', arity, dispatch, pyfunc=ovf_func)`
     /// (`operation.py:337-338`). The recursive call carries no
     /// `pure=True` / `ovf=True`, so the suffixed twin's `base_cls`
-    /// falls through to plain `HLOperation` (`operation.py:321`) —
+    /// falls through to plain `HLOperation` (`operation.py`) —
     /// which has the default `constfold(self) -> None`
-    /// (`operation.py:96-97`). Therefore `_ovf` ops never constfold:
+    /// (`operation.py`). Therefore `_ovf` ops never constfold:
     /// they remain as ops even when all operands are constants and a
     /// constant-time `ovf_func(*args)` would raise. Reading them as
     /// pure (and folding them) inserts a hard-error divergence at
@@ -658,7 +658,7 @@ impl OpKind {
             | OpKind::LShiftOvf => false,
 
             // upstream `class GetAttr(SingleDispatchMixin, HLOperation)`
-            // (operation.py:617-646) is NOT a PureOperation — only its
+            // (operation.py) is NOT a PureOperation — only its
             // `constfold()` override is wired to fold constant
             // attribute lookups. The Rust port surfaces that via the
             // "custom constfold" eligibility gate in
@@ -704,7 +704,7 @@ impl OpKind {
 
     /// RPython `cls.can_overflow` — `True` for `OverflowingOperation`
     /// (operation.py:194-195) variants. These are the BASE ops created
-    /// via `add_operator(name, …, ovf=True)` (`operation.py:466,469,
+    /// via `add_operator(name, …, ovf=True)` (`operation.py,
     /// 475-477,479-481,483`): `neg`, `abs`, `add`, `sub`, `mul`, `div`,
     /// `floordiv`, `mod`, `lshift`. The `_ovf` siblings created by the
     /// recursive `add_operator(name + '_ovf', arity, dispatch,
@@ -832,7 +832,7 @@ impl OpKind {
         }
     }
 
-    /// RPython `OverflowingOperation.ovf_variant` (operation.py:338-339).
+    /// RPython `OverflowingOperation.ovf_variant` (operation.py).
     ///
     /// Returns the `_ovf` twin of a checked arithmetic op, or `None`
     /// when the op has no overflow variant.
@@ -938,7 +938,7 @@ impl OpKind {
     }
 }
 
-/// RPython `flowspace/operation.py:66-116` — `class HLOperation(SpaceOperation)`.
+/// RPython `flowspace/operation.py` — `class HLOperation(SpaceOperation)`.
 ///
 /// A high-level operation produced by flow objspace handlers. Each
 /// `HLOperation` may be folded to a `Constant` via `constfold()` or
@@ -948,7 +948,7 @@ pub struct HLOperation {
     /// RPython type-erased identity; matches the Python subclass of
     /// `HLOperation` that would have been instantiated upstream.
     pub kind: OpKind,
-    /// RPython `self.args = list(args)` (operation.py:74).
+    /// RPython `self.args = list(args)` (operation.py).
     pub args: Vec<Hlvalue>,
     /// RPython `self.result = Variable()` (operation.py:75).
     pub result: Variable,
@@ -968,10 +968,10 @@ impl HLOperation {
         }
     }
 
-    /// RPython `HLOperation.replace(mapping)` (operation.py:78-84).
+    /// RPython `HLOperation.replace(mapping)` (operation.py).
     ///
     /// The mapping is polymorphic (`Variable → Variable | Constant`)
-    /// per `flowspace/model.py:347 Variable.replace`. HLOperation.result
+    /// per `flowspace/model.py Variable.replace`. HLOperation.result
     /// is typed `Variable` in upstream too, and RPython's pre-rtyper
     /// stages never rename a Variable into a Constant — the Rust port
     /// keeps the field concrete and asserts that shape.
@@ -996,7 +996,7 @@ impl HLOperation {
         }
     }
 
-    /// RPython `HLOperation.constfold()` (operation.py:98-99, overridden
+    /// RPython `HLOperation.constfold()` (operation.py, overridden
     /// on PureOperation at 120-132).
     ///
     /// Behaviour matches PureOperation upstream: require every arg to
@@ -1013,7 +1013,7 @@ impl HLOperation {
     /// `None` (no fold attempted), which is a strict subset of upstream
     /// behaviour.
     pub fn constfold(&self) -> Result<Option<Hlvalue>, FlowingError> {
-        // Pure ops go through PureOperation.constfold (operation.py:120-132).
+        // Pure ops go through PureOperation.constfold (operation.py).
         // A few non-pure ops (`GetAttr`, `Iter`, `Next`) carry their own
         // `constfold()` override upstream and must be allowed past the
         // gate. `SimpleCall` / `CallArgs` / `Pow` handle their own
@@ -1040,7 +1040,7 @@ impl HLOperation {
                 _ => unreachable!("foldable() above excludes Variable args"),
             })
             .collect();
-        // RPython `PureOperation.constfold` (operation.py:120-127) wraps
+        // RPython `PureOperation.constfold` (operation.py) wraps
         // `pyfunc(*args)` in `try/except Exception` and re-raises the
         // captured exception as `FlowingError(...)` when all args are
         // foldable. Rust `pyfunc` returns `Option<ConstValue>`, conflating
@@ -1098,7 +1098,7 @@ impl HLOperation {
         };
         let name_str = name.to_string();
 
-        // upstream operation.py:631-633 — NOT_REALLY_CONST guard. In
+        // upstream operation.py — NOT_REALLY_CONST guard. In
         // the Rust port the table is keyed on module qualname; the
         // guard only fires for module objects.
         if let ConstValue::HostObject(h) = &w_obj.value
@@ -1108,7 +1108,7 @@ impl HLOperation {
             return Ok(None);
         }
 
-        // upstream operation.py:634 — `if w_obj.foldable() and w_name.foldable()`.
+        // upstream operation.py — `if w_obj.foldable() and w_name.foldable()`.
         // Constant-str for `w_name` already satisfies foldable().
         if !w_obj.foldable() {
             return Ok(None);
@@ -1124,7 +1124,7 @@ impl HLOperation {
         }
     }
 
-    /// RPython `OverflowingOperation.ovfchecked()` (operation.py:197-200)
+    /// RPython `OverflowingOperation.ovfchecked()` (operation.py)
     /// — returns the `_ovf` twin of this operation, carrying the same
     /// args / result / offset.
     pub fn ovfchecked(&self) -> Option<HLOperation> {
@@ -1164,13 +1164,13 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
     // --- variadic / ternary ops that fall outside the fixed-arity
     //     match below ---
     match (kind, args.len()) {
-        // RPython `NewTuple` (operation.py:542-548). `PureOperation`
+        // RPython `NewTuple` (operation.py). `PureOperation`
         // whose `pyfunc = lambda *args: args`.
         (OpKind::NewTuple, _) => {
             let items: Vec<ConstValue> = args.iter().map(|&v| v.clone()).collect();
             return Some(ConstValue::Tuple(items));
         }
-        // RPython `Pow(PureOperation)` (operation.py:568-578) with
+        // RPython `Pow(PureOperation)` (operation.py) with
         // arity 3 — `pyfunc = pow`. We fold only the int/int/None
         // variant; float Pow / int-with-mod defer to runtime emit.
         (OpKind::Pow, 3) => {
@@ -1187,7 +1187,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
                 return base.checked_pow(e).map(ConstValue::Int);
             }
         }
-        // RPython `GetAttr.constfold()` (operation.py:624-646).
+        // RPython `GetAttr.constfold()` (operation.py).
         //
         // upstream shape:
         //   if len(self.args) == 3:
@@ -1212,7 +1212,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         //     stricter check lands once `HLOperation::constfold`
         //     returns `Result<Option, FlowingError>` — scheduled
         //     alongside the Phase 5 annotator wiring.
-        //  2. `NOT_REALLY_CONST` table (operation.py:22-35) blocks
+        //  2. `NOT_REALLY_CONST` table (operation.py) blocks
         //     folds of `sys.path`, `sys.modules`, etc. while keeping
         //     `sys.maxint`, `sys.exc_info`, etc. foldable — PARITY
         //     with upstream's sys-attribute allowlist via the
@@ -1351,7 +1351,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         }),
         // `floordiv` and `div` agree on int operands: both fold as
         // `operator.floordiv` (Python 3 floor-toward-`-inf`),
-        // implemented by `ll_int_py_div` (rpython/rtyper/rint.py:398).
+        // implemented by `ll_int_py_div` (rpython/rtyper/rint.py).
         // `int_py_floor_div` ports it line-by-line.
         // `ZeroDivisionError` is surfaced by the always-raises
         // whitelist before this fold runs.
@@ -1369,7 +1369,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
             // (`FlowingError: float floor division by zero`); this arm
             // is only reached for `y != 0.0`. Delegates to
             // `float_py_floor_div` which mirrors upstream
-            // `_divmod_w` (`pypy/objspace/std/floatobject.py:824`).
+            // `_divmod_w` (`pypy/objspace/std/floatobject.py`).
             ArithOps::Float(x, y) => Some(ConstValue::float(float_py_floor_div(x, y))),
         }),
         (OpKind::Div, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
@@ -1380,7 +1380,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
             // `constfold_always_raises`.
             ArithOps::Float(x, y) => Some(ConstValue::float(x / y)),
         }),
-        // `ll_int_py_mod` (rpython/rtyper/rint.py:496): Python's `%`
+        // `ll_int_py_mod` (rpython/rtyper/rint.py): Python's `%`
         // returns a remainder with the sign of the divisor (`3 % -2
         // == -1`, not `1`). Float mod delegates to `float_py_mod`
         // matching upstream `descr_mod`
@@ -1407,7 +1407,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // Shifts: int-shape only (Python `1 << 1.0` raises TypeError).
         // Negative shift counts unreachable per
         // `constfold_always_raises`. LShift count `>= 64` declines per
-        // `can_overflow and type(result) is long` (`operation.py:140-142`).
+        // `can_overflow and type(result) is long` (`operation.py`).
         // RShift is not `can_overflow`, so it saturates at large counts.
         (OpKind::LShift, [a, b]) => coerce_int_pair(a, b).and_then(|(x, y)| {
             if y >= 64 {
@@ -1474,7 +1474,7 @@ pub(crate) fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Order
         (C::Bool(x), C::Int(y)) => Some(i64::from(*x).cmp(y)),
         (C::Int(x), C::Bool(y)) => Some(x.cmp(&i64::from(*y))),
         // Int ↔ Float — exact comparison via `cmp_int_float_exact` (port
-        // of `pypy/objspace/std/floatobject.py:103-148 make_compare_func`
+        // of `pypy/objspace/std/floatobject.py make_compare_func`
         // / `do_compare_bigint`). Naive `*x as f64` rounds to the
         // nearest representable f64 (mantissa is 53 bits), which would
         // misclassify `Int(2^53 + 1) == Float(2^53)` as equal.
@@ -1491,7 +1491,7 @@ pub(crate) fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Order
 }
 
 /// Exact ordering between an i64 and an f64. Mirrors
-/// `pypy/objspace/std/floatobject.py:135-144 _compare`'s W_IntObject
+/// `pypy/objspace/std/floatobject.py _compare`'s W_IntObject
 /// branch, which routes through `do_compare_bigint` whenever
 /// `not int_between(-1, i2 >> 48, 1)` — i.e. when the int's magnitude
 /// exceeds the f64 mantissa's exact range.
@@ -1569,7 +1569,7 @@ pub(crate) enum ArithOps {
 
 /// Numeric coercion helper for [`pyfunc`]'s arithmetic arms. Replicates
 /// the cross-type promotions that `operator.<op>(a, b)` would have
-/// applied in upstream `PureOperation.constfold` (`operation.py:120-127
+/// applied in upstream `PureOperation.constfold` (`operation.py
 /// constfold` calling `pyfunc(*args)` directly — Python's numeric
 /// tower handles `Bool + Int`, `Int + Float`, etc. without explicit
 /// promotion code on the constfold side).
@@ -1610,7 +1610,7 @@ pub(crate) fn coerce_int_pair(a: &ConstValue, b: &ConstValue) -> Option<(i64, i6
 }
 
 /// Python-3 floor division over `i64`. Line-by-line port of
-/// `rpython/rtyper/rint.py:398 ll_int_py_div`:
+/// `rpython/rtyper/rint.py ll_int_py_div`:
 ///
 /// ```text
 /// r = trunc_div(x, y)        # C-style truncation toward 0
@@ -1640,7 +1640,7 @@ pub(crate) fn int_py_floor_div(x: i64, y: i64) -> Option<i64> {
 }
 
 /// Python-3 `%` over `i64`. Line-by-line port of
-/// `rpython/rtyper/rint.py:496 ll_int_py_mod`:
+/// `rpython/rtyper/rint.py ll_int_py_mod`:
 ///
 /// ```text
 /// r = trunc_mod(x, y)        # C-style %, sign of dividend
@@ -1671,7 +1671,7 @@ pub(crate) fn int_py_mod(x: i64, y: i64) -> Option<i64> {
 }
 
 /// Python `float % float` mod result. Line-by-line port of
-/// `pypy/objspace/std/floatobject.py:543-563 W_FloatObject.descr_mod`.
+/// `pypy/objspace/std/floatobject.py W_FloatObject.descr_mod`.
 /// Caller must guarantee `y != 0.0` (the zero-divisor branch surfaces
 /// as `FlowingError` upstream and is gated by `constfold_always_raises`
 /// before this fold runs).
@@ -1799,7 +1799,7 @@ pub(crate) fn python_eq_const(a: &ConstValue, b: &ConstValue) -> bool {
         // beyond the 53-bit mantissa boundary compare correctly.
         // Naive `*x as f64` would round `Int(2^53 + 1)` to `2^53`,
         // misclassifying it as equal to `Float(2^53)`. Mirrors upstream
-        // `pypy/objspace/std/floatobject.py:103-115 do_compare_bigint`'s
+        // `pypy/objspace/std/floatobject.py do_compare_bigint`'s
         // eq branch: a non-integer-valued f64 can never equal an int.
         (C::Int(x), C::Float(bits)) | (C::Float(bits), C::Int(x)) => {
             cmp_int_float_exact(*x, f64::from_bits(*bits))
@@ -1820,7 +1820,7 @@ pub(crate) fn python_eq_const(a: &ConstValue, b: &ConstValue) -> bool {
 }
 
 /// Detect operation/argument combinations that RPython's
-/// `PureOperation.constfold` (operation.py:120-127) catches as
+/// `PureOperation.constfold` (operation.py) catches as
 /// `Exception` and re-raises as `FlowingError`. Returns
 /// `Some(FlowingError)` when the combination ALWAYS raises in
 /// upstream Python; `None` otherwise (let pyfunc decide whether to
@@ -1832,7 +1832,7 @@ pub(crate) fn python_eq_const(a: &ConstValue, b: &ConstValue) -> bool {
 /// - **Integer division / modulo by zero** — upstream Python raises
 ///   `ZeroDivisionError`. Mirrors `Div(int, 0)`, `Mod(int, 0)`,
 ///   `FloorDiv(int, 0)` (the operator-pair entries from
-///   `operation.py:475-491 add_operator`).
+///   `operation.py add_operator`).
 /// - **TrueDiv with int / float zero divisor** — upstream Python
 ///   raises `ZeroDivisionError` for both `1 / 0` and `1.0 / 0.0`.
 ///   Mirrors `TrueDiv` registered as `add_operator('truediv', 2,
@@ -1860,7 +1860,7 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
     };
     match (kind, args) {
         // ZeroDivisionError on int /, //, %. upstream
-        // `PureOperation.constfold` (operation.py:120-127) calls
+        // `PureOperation.constfold` (operation.py) calls
         // `cls.pyfunc(*args)` and re-raises any `Exception` as
         // `FlowingError`. For the BASE ops, that's
         // `operator.{div,floordiv,mod}` which raises
@@ -1871,7 +1871,7 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
         // `add_operator(name + '_ovf', arity, dispatch, pyfunc=ovf_func)`
         // (`operation.py:337-338`) without `pure=True`, so their
         // base class is plain `HLOperation` whose default
-        // `constfold(self) -> None` (`operation.py:96-97`) leaves
+        // `constfold(self) -> None` (`operation.py`) leaves
         // them as ops at compile time. Folding them here would
         // surface a hard-error divergence at every constant-zero-
         // divisor site that upstream leaves to the runtime.
@@ -1952,7 +1952,7 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
         }
         // TypeError / ValueError on shifts. Upstream does not inspect the
         // RHS first; it calls `operator.lshift/rshift(lhs, rhs)` directly
-        // from `PureOperation.constfold` (`operation.py:120-127`). That
+        // from `PureOperation.constfold` (`operation.py`). That
         // means operand type dispatch wins before the "negative shift
         // count" check: `1 << -1` raises `ValueError`, but `1.0 << -1`
         // raises `TypeError` because float has no shift operation.
@@ -2080,7 +2080,7 @@ use std::cell::RefCell;
 use crate::tool::pairtype::DoubleDispatchRegistry;
 
 /// RPython `specialized` closure value returned by
-/// `get_specialization` (operation.py:231-236 / 273-278).
+/// `get_specialization` (operation.py / 273-278).
 ///
 /// Upstream this is a Python closure; it carries an optional
 /// `can_only_throw` attribute that annotator `read_can_only_throw`
@@ -2209,11 +2209,11 @@ pub(crate) type Transformation = Box<
 >;
 
 thread_local! {
-    /// RPython `cls._registry` on `SingleDispatchMixin` (operation.py:59).
+    /// RPython `cls._registry` on `SingleDispatchMixin` (operation.py).
     ///
     /// Upstream: one dict per HLOperation subclass, keyed by the argument
     /// class (`Some_cls`). Lookup walks `Some_cls.__mro__`
-    /// (operation.py:212-219). Rust collapses "per HLOperation subclass"
+    /// (operation.py). Rust collapses "per HLOperation subclass"
     /// into an outer `HashMap<OpKind, ...>` since OpKind replaces the
     /// class identity of the HLOperation subclass. The registry is
     /// `thread_local!` because its contents include non-Send `Rc`
@@ -2233,7 +2233,7 @@ thread_local! {
     };
 
     /// RPython `cls._registry = DoubleDispatchRegistry()` on
-    /// `DoubleDispatchMixin` (operation.py:62). Per-OpKind pair registry
+    /// `DoubleDispatchMixin` (operation.py). Per-OpKind pair registry
     /// using the [`DoubleDispatchRegistry`] ported from
     /// `rpython/tool/pairtype.py`. Initialized on first access by
     /// calling the module-import-time `init` helpers.
@@ -2287,7 +2287,7 @@ thread_local! {
 }
 
 impl HLOperation {
-    /// RPython `HLOperation.consider(self, annotator)` (operation.py:101-104).
+    /// RPython `HLOperation.consider(self, annotator)` (operation.py).
     ///
     /// ```python
     /// def consider(self, annotator):
@@ -2314,7 +2314,7 @@ impl HLOperation {
         // TODO(consider-none-arg-propagation) — STRICT-PARITY DIVERGENCE.
         // Upstream `operation.py:101` collects `annotation(arg)` as a
         // Python list where `None` slots are kept intact;
-        // `SingleDispatchMixin._dispatch` (`operation.py:212-219`)
+        // `SingleDispatchMixin._dispatch` (`operation.py`)
         // walks `type(None).__mro__` so unbound args reach a
         // SomeObject-tagged spec.  `simple_call`
         // (`operation.py:663` `simple_call_SomeObject`) and
@@ -2410,20 +2410,20 @@ impl HLOperation {
                 Ok(result)
             }
             Dispatch::None => {
-                // operation.py:534-565 — per-class `consider()`
+                // operation.py — per-class `consider()`
                 // overrides on explicit `Dispatch::None` subclasses.
                 use crate::annotator::model::SomeTuple as AnSomeTuple;
                 match self.kind {
-                    // operation.py:534-539 — NewDict.consider.
+                    // operation.py — NewDict.consider.
                     OpKind::NewDict => Ok(Some(SomeValue::Dict(annotator.bookkeeper.newdict()))),
-                    // operation.py:542-548 — NewTuple.consider.
+                    // operation.py — NewTuple.consider.
                     OpKind::NewTuple => Ok(Some(SomeValue::Tuple(AnSomeTuple::new(args_s)))),
-                    // operation.py:551-557 — NewList.consider.
+                    // operation.py — NewList.consider.
                     OpKind::NewList => {
                         let list = annotator.bookkeeper.newlist(&args_s, None)?;
                         Ok(Some(SomeValue::List(list)))
                     }
-                    // operation.py:560-565 — NewSlice.consider raises
+                    // operation.py — NewSlice.consider raises
                     // AnnotatorError outright.
                     OpKind::NewSlice => Err(AnnotatorError::new(
                         "Cannot use extended slicing in rpython",
@@ -2441,7 +2441,7 @@ impl HLOperation {
         }
     }
 
-    /// RPython `HLOperation.transform(self, annotator)` (operation.py:112-115).
+    /// RPython `HLOperation.transform(self, annotator)` (operation.py).
     ///
     /// ```python
     /// def transform(self, annotator):
@@ -2450,7 +2450,7 @@ impl HLOperation {
     ///     return transformer(annotator, *self.args)
     /// ```
     ///
-    /// `get_transformer` does an MRO lookup (operation.py:248-255 for
+    /// `get_transformer` does an MRO lookup (operation.py for
     /// single-dispatch, 295-300 for double-dispatch) and returns the
     /// default `lambda *args: None` when no registration matches.
     pub fn transform(
@@ -2498,7 +2498,7 @@ impl HLOperation {
     }
 
     /// RPython `HLOperation.get_can_only_throw(self, annotator)`
-    /// (operation.py:106-107, SingleDispatchMixin:221-224,
+    /// (operation.py, SingleDispatchMixin:221-224,
     /// DoubleDispatchMixin:283-286).
     pub(crate) fn get_can_only_throw(
         &self,
@@ -2648,7 +2648,7 @@ mod tests {
         // '_ovf', arity, dispatch, pyfunc=ovf_func)` carries no
         // `pure=True` (`operation.py:337-338`), so the suffixed
         // class falls through to plain `HLOperation` whose default
-        // `constfold(self) -> None` (`operation.py:96-97`) prevents
+        // `constfold(self) -> None` (`operation.py`) prevents
         // any constant-time overflow / zero-divisor folding.
         assert!(!OpKind::AddOvf.pure());
         assert!(!OpKind::SubOvf.pure());
@@ -2663,7 +2663,7 @@ mod tests {
 
     #[test]
     fn can_overflow_matches_upstream() {
-        // `add_operator(name, ..., ovf=True)` (`operation.py:466-483`)
+        // `add_operator(name, ..., ovf=True)` (`operation.py`)
         // makes the BASE op an `OverflowingOperation` subclass with
         // `can_overflow = True`. The recursive
         // `add_operator(name + '_ovf', arity, dispatch,
@@ -2867,7 +2867,7 @@ mod tests {
 
     #[test]
     fn getattr_constfold_folds_class_attribute() {
-        // upstream operation.py:634-644 — `getattr(cls, 'method')`
+        // upstream operation.py — `getattr(cls, 'method')`
         // folds when the class exposes the attribute via its __dict__.
         use crate::flowspace::model::HostObject;
         let cls = HostObject::new_class("Foo", vec![]);
@@ -2888,7 +2888,7 @@ mod tests {
 
     #[test]
     fn getattr_constfold_folds_instance_dict_attribute() {
-        // upstream operation.py:634-644 — `getattr(instance, 'attr')`
+        // upstream operation.py — `getattr(instance, 'attr')`
         // respects `inst.__dict__` before walking the class MRO. Rust
         // port mirrors this via HostObject::instance_get.
         use crate::flowspace::model::HostObject;
@@ -2930,7 +2930,7 @@ mod tests {
 
     #[test]
     fn getattr_constfold_raises_flowing_error_on_missing_class_attribute() {
-        // upstream operation.py:637-642 — `getattr(cls, 'missing')`
+        // upstream operation.py — `getattr(cls, 'missing')`
         // raises `AttributeError`, which flowspace escalates to
         // `FlowingError("… always raises AttributeError")`.
         use crate::flowspace::model::HostObject;
@@ -3191,7 +3191,7 @@ mod tests {
 
     #[test]
     fn constfold_division_by_zero_raises_flowing_error() {
-        // upstream `PureOperation.constfold` (operation.py:120-127)
+        // upstream `PureOperation.constfold` (operation.py)
         // wraps `pyfunc(*args)` in `try/except Exception` and re-raises
         // captured exceptions as `FlowingError`. Division by zero is
         // the canonical case — Python's int `/`, `//`, `%` raise
@@ -3201,7 +3201,7 @@ mod tests {
         // siblings are NOT pure (`add_operator(name + '_ovf', …)`
         // carries no `pure=True`, `operation.py:337-338`), so their
         // `HLOperation.constfold` default returns `None`
-        // (`operation.py:96-97`) — the op stays as an op for the
+        // (`operation.py`) — the op stays as an op for the
         // runtime to handle. Folding `_ovf` zero-divisor at compile
         // time would surface a hard-error divergence vs upstream.
         for kind in [OpKind::Div, OpKind::Mod, OpKind::FloorDiv] {
@@ -3290,7 +3290,7 @@ mod tests {
         // Once any operand is float, upstream `operator.{div,floordiv,
         // mod}` dispatches to the float method which raises
         // `ZeroDivisionError` with a float-specific message.
-        // `PureOperation.constfold` (operation.py:120-127) catches the
+        // `PureOperation.constfold` (operation.py) catches the
         // exception and re-raises as `FlowingError`, so a constant-
         // folded `7.0 / 0.0`, `7.0 // 0.0`, `7.0 % 0.0` (and the
         // mixed-type variants) must surface as FlowingError, not
@@ -3511,7 +3511,7 @@ mod tests {
         // upstream `operator.floordiv` / `operator.mod` over ints:
         // floor toward `-inf` (Python 3 semantics), NOT C truncation
         // toward 0 and NOT Euclidean (always non-negative remainder).
-        // `rpython/rtyper/rint.py:398 ll_int_py_div` and `:496
+        // `rpython/rtyper/rint.py ll_int_py_div` and `:496
         // ll_int_py_mod` carry the correction over the C primitive;
         // our `int_py_floor_div` / `int_py_mod` helpers port those
         // line-by-line.
@@ -3639,7 +3639,7 @@ mod tests {
         // RShift large positive count: Python arithmetic shift
         // saturates — `1 >> 64 == 0`, `-1 >> 64 == -1`. RShift is
         // NOT registered with `ovf=True` upstream
-        // (`operation.py:484 add_operator('rshift', 2,
+        // (`operation.py add_operator('rshift', 2,
         // dispatch=2, pure=True)`), so the `can_overflow` decline
         // arm doesn't apply; the constfold MUST produce the
         // saturated value.
@@ -3882,7 +3882,7 @@ mod tests {
 
     #[test]
     fn constfold_float_floordiv_matches_pypy_divmod_w() {
-        // Spot-check `pypy/objspace/std/floatobject.py:824-859 _divmod_w`
+        // Spot-check `pypy/objspace/std/floatobject.py _divmod_w`
         // floordiv path. Sign-mismatch correction (`div -= 1.0`) and
         // snap-to-nearest pass land on the same ordinary integers as
         // the naive `(x / y).floor()` for these inputs, so this test

@@ -34,7 +34,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{_getconcretetype, getfunct
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
-/// Port of upstream `class CBuilder(object)` at `genc.py:62-235`.
+/// Port of upstream `class CBuilder(object)` at `genc.py`.
 ///
 /// Field shape mirrors upstream's `__init__` (`:68-78`) plus the
 /// class-level defaults at `:62-66`. Each method below corresponds to a
@@ -150,7 +150,7 @@ impl CBuilder {
         d
     }
 
-    /// Port of upstream `CBuilder.get_eci(self)` at `genc.py:80-84`.
+    /// Port of upstream `CBuilder.get_eci(self)` at `genc.py`.
     ///
     /// Upstream returns an `ExternalCompilationInfo(include_dirs=[
     /// pypy_include_dir, ?revdb])` where `pypy_include_dir` resolves to
@@ -159,7 +159,7 @@ impl CBuilder {
     ///
     /// TODO: the Rust port has not yet vendored the
     /// upstream C-backend header tree (`rpython/translator/c/src/*.h`,
-    /// `g_*.h`, `genc.py:81 pypy_include_dir`). Upstream `get_eci`
+    /// `g_*.h`, `genc.py pypy_include_dir`). Upstream `get_eci`
     /// **always** returns a non-empty `include_dirs` list whose first
     /// entry is the directory containing those headers — downstream
     /// consumers (`merge_eci`, gcc invocations) treat that include dir
@@ -224,7 +224,7 @@ impl CBuilder {
         })
     }
 
-    /// Port of `genc.py:87-138 CBuilder.build_database`.
+    /// Port of `genc.py CBuilder.build_database`.
     ///
     /// Upstream constructs the gcpolicy + exctransformer + DB, sets
     /// `self.db`, walks gc_startup_code, then calls
@@ -327,7 +327,7 @@ impl CBuilder {
     }
 
     /// Port of upstream `CBuilder.collect_compilation_info(db)` at
-    /// `genc.py:145-159`. The first `merge_eci` call (`:147`) folds the
+    /// `genc.py`. The first `merge_eci` call (`:147`) folds the
     /// gc-policy ECI in. The subsequent `globalcontainers()` and
     /// `getstructdeflist()` walks (`:149-158`) collect per-container
     /// `node.compilation_info()` and per-struct `STRUCT._hints['eci']`
@@ -341,7 +341,7 @@ impl CBuilder {
     }
 
     /// Port of upstream `CBuilder.merge_eci(*ecis)` at
-    /// `genc.py:142-143`: `self.eci = self.eci.merge(*ecis)`. The
+    /// `genc.py`: `self.eci = self.eci.merge(*ecis)`. The
     /// local single-arg shape mirrors the only call site
     /// (`collect_compilation_info`'s gc-policy ECI). When the slot
     /// holds a typed [`ExternalCompilationInfo`] the merge runs
@@ -459,7 +459,7 @@ impl CBuilder {
         })
     }
 
-    /// Upstream `CBuilder.compile(self, **kwds)` at `genc.py:225-…`
+    /// Upstream `CBuilder.compile(self, **kwds)` at `genc.py-…`
     /// (overridden in subclasses).
     pub fn compile(&self, _exe_name: Option<String>) -> Result<(), TaskError> {
         Err(TaskError {
@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn get_eci_returns_pypy_include_dir_when_srcroot_is_set() {
-        // Upstream `genc.py:80-85 get_eci`: include_dirs is
+        // Upstream `genc.py get_eci`: include_dirs is
         // `[pypy_include_dir, ?revdb]` where `pypy_include_dir =
         // py.path.local(__file__).join('..')` resolves to
         // `${PYPY_SRCROOT}/rpython/translator/c`. The local port
@@ -931,7 +931,7 @@ mod tests {
     fn build_database_without_rtyper_fails_at_getexceptiontransformer() {
         // Upstream `genc.py:92`: `exctransformer =
         // translator.getexceptiontransformer()`. The
-        // `getexceptiontransformer` body at `translator.py:87-88`
+        // `getexceptiontransformer` body at `translator.py`
         // raises `ValueError("no rtyper")` when the translator has
         // not been rtyped. With the local fixture leaving rtyper
         // unset, build_database must fail at that exact point — not

@@ -358,7 +358,7 @@ fn normalize_function_filter(function_names: &[&str]) -> Option<std::collections
 /// even the reverse-postorder re-lower) or any other unrecognised failure,
 /// the function degrades the program by dropping that one function to a
 /// residual call — never a correctness loss.  This mirrors
-/// `exceptiontransform.py:212` `transform_completely`, which transforms
+/// `exceptiontransform.py` `transform_completely`, which transforms
 /// every graph and leaves an un-rewritable one to the residual-call ABI
 /// rather than aborting the build.  The coverage gate at the end of this
 /// function reports the shape-coverage gap (split by category under
@@ -879,7 +879,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     );
 
     // ── Pass 2: lower every function body and build SemanticFunctions ─
-    // `@jit.dont_look_inside` (`rlib/jit.py:142`) callees declare a
+    // `@jit.dont_look_inside` (`rlib/jit.py`) callees declare a
     // FUNC.RESULT that the legacy walker reads off the Call op's
     // `result_ty` (`legacy_resolve.rs infer_concrete_from_op`), but the
     // real path stubs the opaque body and otherwise drops the residual
@@ -904,7 +904,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         .filter(|(_, hints)| hints.iter().any(|h| h == "elidable"))
         .map(|(path, _)| path.clone())
         .collect();
-    // `objectmodel.py:267 @not_rpython` sets `func._not_rpython_`; the
+    // `objectmodel.py @not_rpython` sets `func._not_rpython_`; the
     // flowspace refuses that function before executing its body
     // (`flowspace/objspace.py:21-22 assert_rpythonic`).  Apply the same gate
     // before MIR lowering, which also prevents host-only carrier types (for
@@ -1193,7 +1193,7 @@ fn should_lower_function(
 /// tuple or fixed-size array that survived into a translated graph.
 ///
 /// RPython creates one distinct `GcStruct('tupleN', item0, item1, ...)` per
-/// [`SomeTuple`] representation (`rtyper/rtuple.py:115-125`), then
+/// [`SomeTuple`] representation (`rtyper/rtuple.py`), then
 /// `TupleRepr.newtuple` allocates that struct and writes its fields
 /// (`rtuple.py:153-169`). Charon has no `TypeDecl` row for Rust's built-in
 /// tuple/array aggregate, so [`derive_program_metadata`] cannot discover
@@ -2177,7 +2177,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         {
             // The exception-link transforms run on a simplified graph,
             // as exceptiontransform.py does (graphs reach it after
-            // `simplify_graph`, simplify.py:1075): the discriminant
+            // `simplify_graph`, simplify.py): the discriminant
             // switch's `default → Abort` else-unreachable arm must be
             // pruned by `remove_assertion_errors` before the diamond
             // matcher sees the switch, leaving the plain 0/1 pair.
@@ -2232,7 +2232,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // block now exits straight to the continue arm and `exceptblock`,
         // so those blocks lose their only predecessor.  RPython graph
         // consumers only iterate blocks reachable from `startblock`
-        // (`flowspace/model.py:66 iterblocks`), so drop the now-unreachable
+        // (`flowspace/model.py iterblocks`), so drop the now-unreachable
         // blocks here — before `prune_dead_phis`, which would otherwise
         // treat a no-predecessor block as an extra root
         // (`transform_dead_op_vars`'s start set), and before the
@@ -2624,21 +2624,21 @@ fn lower_unstructured_with_static_addrs_and_attrs(
 }
 
 /// Per-graph simplification after lowering — the model-layer slice of
-/// RPython `simplify_graph(graph)` (`simplify.py:1075-1081`), which
+/// RPython `simplify_graph(graph)` (`simplify.py`), which
 /// upstream runs on every freshly built flow graph.  Only the passes
 /// the Abort → `RaiseImplicit` fold needs are wired:
 ///
-/// - `eliminate_empty_blocks` (simplify.py:52-69) collapses the empty
+/// - `eliminate_empty_blocks` (simplify.py) collapses the empty
 ///   raise block between a discriminant switch's `else
 ///   unreachable!()` exit and `exceptblock`, exposing the
 ///   `[Constant(AssertionError), …]` link to the next pass.
 /// - `retarget_assert_raise_blocks` points an edge into a bare
 ///   implicit-raise block at `exceptblock` instead, which is where
 ///   upstream's flow space puts it and what the next pass matches.
-/// - `remove_assertion_errors` (simplify.py:321-346) prunes the
+/// - `remove_assertion_errors` (simplify.py) prunes the
 ///   shouldn't-occur branch and promotes the surviving exit to an
 ///   unconditional link.
-/// - `prune_dead_phis` (`transform_dead_op_vars`, simplify.py:422-524)
+/// - `prune_dead_phis` (`transform_dead_op_vars`, simplify.py)
 ///   melts the now-dead condition ops — the `__discriminant`
 ///   FieldRead feeding the dropped exitswitch
 ///   (`removeassert.py:35-37` "now melt away the (hopefully) dead
@@ -2672,10 +2672,10 @@ fn simplify_lowered_graph(
     // the MIR front, and Charon MIR is full of empty blocks: measured over
     // the LLBC corpus, the call rewires a link on 998 of 1255 graphs.
     crate::model::eliminate_empty_blocks(graph);
-    // `eliminate_empty_blocks` (simplify.py:33-78) rewires each incoming
+    // `eliminate_empty_blocks` (simplify.py) rewires each incoming
     // link past an operation-less block and leaves the bypassed block
     // orphaned, still carrying its exits.  Upstream every later consumer
-    // walks the graph through `iterblocks()` (flowspace/model.py:66), so
+    // walks the graph through `iterblocks()` (flowspace/model.py), so
     // the orphan and its stale links are invisible; the model-layer
     // passes below scan `graph.blocks` directly, so the stale links stay
     // in view — `prune_dead_phis` then trims a shared reachable target's
@@ -2696,7 +2696,7 @@ fn simplify_lowered_graph(
     let mut dirty = crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
-    // liveness (`transform_dead_op_vars`, simplify.py:425-479) with the
+    // liveness (`transform_dead_op_vars`, simplify.py) with the
     // malloc-removal exemption (`remove_simple_mallocs`, malloc.py).  Unlike
     // `remove_dead_aggregates` below, it treats a `Link.arg` as a dependency
     // of the target inputarg, not an unconditional read, so it reaches a box
@@ -2728,7 +2728,7 @@ fn simplify_lowered_graph(
         dirty = true;
     }
     // `transform_dead_op_vars` is the first entry in `all_passes`
-    // (simplify.py:1067) and `simplify_graph` (:1080-1086) applies every
+    // (simplify.py) and `simplify_graph` (:1080-1086) applies every
     // pass to every graph — there is no "only if something was removed"
     // condition upstream.  The gate that used to stand here was written
     // when the front made a single-predecessor block's inputargs the
@@ -2745,7 +2745,7 @@ fn simplify_lowered_graph(
     }
     // Collapse again, now that every dead-code sweep above has run.
     //
-    // Upstream orders `all_passes` (simplify.py:1065-1078, applied in list
+    // Upstream orders `all_passes` (simplify.py, applied in list
     // order by `simplify_graph`, :1080-1086) as `transform_dead_op_vars`
     // *then* `eliminate_empty_blocks`, so empty-block elimination observes
     // the dead-op sweep's output.  The head call above runs before all of
@@ -2826,7 +2826,7 @@ impl std::error::Error for LowerError {}
 /// `FixedObjectArray` behind frame locals and mro blocks, which share one
 /// tid and one runtime descr singleton (`pyobject_gcarray_descr`).
 ///
-/// `descr.py:348-378 get_array_descr` keys `cache[ARRAY]` on the ARRAY
+/// `descr.py get_array_descr` keys `cache[ARRAY]` on the ARRAY
 /// lltype's object identity; every lltype op carries its `concretetype`,
 /// so upstream never meets an identity-less array. The arms below reach
 /// these blocks through devirtualized accessor calls rather than a MIR
@@ -4466,7 +4466,7 @@ impl<'a> Lowering<'a> {
                 // (`canonical_binop_label`) — the correct label for
                 // integer truncating division. Over floats `/` is true
                 // division; `pairtype(SomeFloat, SomeFloat)` registers
-                // `truediv` but not `floordiv` (`binaryop.py:440-443`),
+                // `truediv` but not `floordiv` (`binaryop.py`),
                 // the same distinction RPython's flowspace makes by
                 // emitting the `truediv` opname for `/` at graph
                 // construction. Re-label the float result so the prepass
@@ -4712,7 +4712,7 @@ impl<'a> Lowering<'a> {
             }
             // `Repeat(elem, ty, count)` — `[v; N]` literal. The decodable
             // shape follows upstream `transform.py:36-50` and
-            // `rlist.py:346-351`: `newlist(fill)` followed by
+            // `rlist.py`: `newlist(fill)` followed by
             // `mul(list, count)`, which the transform pass collapses to
             // `alloc_and_set(count, fill)`.
             //
@@ -6857,7 +6857,7 @@ impl<'a> Lowering<'a> {
                 // (`flowcontext.py:1271-1284`).  Closing the block
                 // with `[Constant(AssertionError),
                 // Constant(AssertionError(msg))]` lets
-                // `remove_assertion_errors` (simplify.py:321-346)
+                // `remove_assertion_errors` (simplify.py)
                 // prune the branch — e.g. the `else unreachable!()`
                 // arm of a per-variant `let Instruction::X {..} =`
                 // re-match folds away together with its discriminant
@@ -6953,7 +6953,7 @@ impl<'a> Lowering<'a> {
         // destination place. RPython `call.py:222` reads `FUNC.RESULT`
         // off the callee funcptr; the destination local's declared type
         // is that same value at the call site, so deriving it here keeps
-        // `getcalldescr`'s `RESULT == FUNC.RESULT` check (`call.py:230`)
+        // `getcalldescr`'s `RESULT == FUNC.RESULT` check (`call.py`)
         // satisfied for non-`Int` returns such as
         // `new_for_call_with_closure_and_globals_obj` (Ref).
         //
@@ -7500,7 +7500,7 @@ impl<'a> Lowering<'a> {
                 // (`pin_root` / `try_gc_write_barrier` / reload-from-shadow-
                 // stack) because Rust has no GC-transform pass; in the
                 // lifted trace that is exactly RPython's single
-                // `setarrayitem_gc` (`ll_setitem_fast`, `rlist.py:377`),
+                // `setarrayitem_gc` (`ll_setitem_fast`, `rlist.py`),
                 // whose conditional write barrier is re-inserted by the
                 // backend rewrite (`handle_write_barrier_setarrayitem`,
                 // rewrite.py:403), not by a traced source call.  Collapse
@@ -8082,7 +8082,7 @@ impl<'a> Lowering<'a> {
                 let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
                 // `<[T]>::to_vec(slice)` copies the slice into an owned Vec —
                 // the RPython `list(slice)` builtin, whose `rtype_bltn_list`
-                // (`rlist.py:118-122`) `gendirectcall`s `ll_copy`. Retarget the
+                // (`rlist.py`) `gendirectcall`s `ll_copy`. Retarget the
                 // call to the single-segment `list` builtin path so both the
                 // annotator (SomeList result) and the rtyper (`rtype_n` ->
                 // `rtype_bltn_list`) see a list construction. (The old
@@ -8599,7 +8599,7 @@ impl<'a> Lowering<'a> {
 
         // A hint-marker call (`jit::promote(x)` → `hint_promote`,
         // `#[elidable_promote]` → `hint_promote_or_string`) lowers to the
-        // distinct `OpKind::Hint` op (RPython `flowspace/operation.py:521
+        // distinct `OpKind::Hint` op (RPython `flowspace/operation.py
         // add_operator('hint', None, dispatch=1)`) carrying the structured
         // hint `kind`, instead of a synthesised `Call` marker classified by
         // name downstream.  The flowspace oracle types it as `same_as(value)`
@@ -10788,7 +10788,7 @@ impl<'a> Lowering<'a> {
     /// `Address` annotation with no host address.
     ///
     /// This is a fixed-array identity ONLY: it mirrors `ll_fixed_items(l) = l`
-    /// (`rlist.py:399`, a `FixedSizeListRepr` IS its items array).  A resized
+    /// (`rlist.py`, a `FixedSizeListRepr` IS its items array).  A resized
     /// list / `Vec` reaches its items buffer through `ll_items(l) = l.items`
     /// (`rlist.py:368`, a `getfield`), so `alloc::vec::<Impl>::as_ptr` is NOT
     /// an identity on the receiver and must not fold here — it stays a residual
@@ -10947,7 +10947,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
-    /// (`rlib/jit.py:101`), with the `promote_string` (`:118`) and
+    /// (`rlib/jit.py`), with the `promote_string` (`:118`) and
     /// `promote_unicode` (`:124`) siblings.  All three wrappers carry their
     /// flag by name (each body is a bare `hint(x)`), so the callsite is
     /// recognised by the wrapper path, not the body.  Returns the
@@ -12404,10 +12404,10 @@ impl<'a> Lowering<'a> {
     /// Lower `i64::checked_neg()` (`core::num::<Impl>::checked_neg` —
     /// core fn bodies are Opaque in the LLBC, so the `Call` form is
     /// permanently unliftable) to a decomposed ovfcheck shape.
-    /// Upstream `translator/simplify.py:70-108 transform_ovfcheck`
+    /// Upstream `translator/simplify.py transform_ovfcheck`
     /// rewrites `ovfcheck(-x)` into the op's `_ovf` variant
-    /// (`flowspace/operation.py:195-200 ovfchecked`, registered by
-    /// `operation.py:466 add_operator('neg', ..., ovf=True)`), whose
+    /// (`flowspace/operation.py ovfchecked`, registered by
+    /// `operation.py add_operator('neg', ..., ovf=True)`), whose
     /// OverflowError edge the caller branches on.  Rust spells that
     /// ovfcheck as `checked_neg()` + a `Some`/`None` match, so the
     /// equivalent decomposition writes the destination `Option<i64>`
@@ -12701,7 +12701,7 @@ impl<'a> Lowering<'a> {
         // success payload from `generics.types[0]`, then apply the same
         // literal-width atom gate as the other integer conversion lowerings.
         // RPython keeps signed `toint`/`fits_int` distinct from unsigned
-        // `touint` (`rpython/rlib/rbigint.py:465-485, 515-518`).
+        // `touint` (`rpython/rlib/rbigint.py, 515-518`).
         let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
             return Ok(false);
         };
@@ -12876,7 +12876,7 @@ impl<'a> Lowering<'a> {
     /// Opaque in the LLBC like every core fn) to its decomposed
     /// always-`Ok` shape: `__discriminant = 0` (`Result`'s `Ok` tag)
     /// and `__pos_0 = arg` (the widening is an identity on the i64
-    /// carrier).  Upstream `rarithmetic.py:140-145 widen` performs
+    /// carrier).  Upstream `rarithmetic.py widen` performs
     /// the same smaller-than-word unsigned → Signed widening as a
     /// no-op; pyre spells it `usize::try_from(x).expect(..)`
     /// (`pyopcode.rs` `u32_as_usize` / `raise_kind_as_usize`), whose
@@ -13126,7 +13126,7 @@ impl<'a> Lowering<'a> {
     /// keeps its panic-message `&str` argument and the graph walls on
     /// the `__str_const` lowering even though the `Err` arm is
     /// statically dead.  Upstream has no such call: `ovfcheck`-free
-    /// widening is a plain identity (`rarithmetic.py:140-145 widen`),
+    /// widening is a plain identity (`rarithmetic.py widen`),
     /// so the operand *is* the whole operation.  Returns `None` for
     /// any other callee or a receiver without the always-`Ok` record,
     /// keeping the generic `Call` form.
@@ -13886,8 +13886,8 @@ enum FnPtrFamily {
     /// installed at runtime (a host-registered callback, a settable hook),
     /// so the addresses that reach the site are not a closed set a static
     /// walk of the artifact can enumerate.  Carries `None` —
-    /// `graphs_from` then answers `None` (`call.py:105`) and
-    /// `guess_call_kind` answers `residual` (`call.py:137-138`), so
+    /// `graphs_from` then answers `None` (`call.py`) and
+    /// `guess_call_kind` answers `residual` (`call.py`), so
     /// `rewrite_op_indirect_call` emits `handle_residual_call`
     /// (`jtransform.py:410-412`).  `None` is also what keeps the family
     /// analyzers conservative: `Some([])` reads as "empty family" and
@@ -15663,8 +15663,8 @@ fn value_type_bank(ty: &ValueType) -> u8 {
 /// the rtyper retired every typed cast opname from the unary-op path
 /// (`flowspace_adapter::normalize_unary_op_name` accepts only
 /// `neg` / `bool` / `invert` / `same_as`), so the only surface that reaches
-/// `rtype_cast_int_to_ptr` / `rtype_cast_ptr_to_int` (rbuiltin.py:543-557)
-/// and `rtype_builtin_float` / `rtype_builtin_int` (rbuiltin.py:178-189,
+/// `rtype_cast_int_to_ptr` / `rtype_cast_ptr_to_int` (rbuiltin.py)
+/// and `rtype_builtin_float` / `rtype_builtin_int` (rbuiltin.py,
 /// which delegate to `rtype_float` / `rtype_int` and emit the low-level
 /// `cast_int_to_float` / `cast_float_to_int`) is a `simple_call`.  `int →
 /// ptr` / `ptr → int` resolve the `lltype.cast_*` module attr
@@ -15758,7 +15758,7 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
                 return ValueType::Bool;
             }
             if let Some(f) = lit_obj.get("Float").and_then(serde_json::Value::as_str) {
-                // `getkind(SingleFloat) == 'int'` (history.py:53): single
+                // `getkind(SingleFloat) == 'int'` (history.py): single
                 // floats live in the int register bank; only `f64`
                 // (`lltype.Float`) keeps the float kind.
                 return if f == "F32" {
@@ -16638,7 +16638,7 @@ fn is_object_ref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
 }
 
 /// The `__cast_pointer/<Root>` marker call — front::mir's carrier for
-/// the upstream `cast_pointer(PTRTYPE, ptr)` op (lltype.py:964).  The
+/// the upstream `cast_pointer(PTRTYPE, ptr)` op (lltype.py).  The
 /// target class travels in the path (same `Vec<Variable>`-carrier
 /// constraint as the `simple_call(<exc class>)` raise marker,
 /// `front/exc_from_raise.rs`); the flowspace adapter rebuilds the

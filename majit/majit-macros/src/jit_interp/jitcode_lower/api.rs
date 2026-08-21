@@ -71,7 +71,7 @@ pub(crate) struct CallerLocalLayout {
 ///   so subsequent `alloc_reg()` calls inside the body lowering do not
 ///   collide with the pre-bound caller-locals.
 ///
-/// `pyopcode.py:179` and `jtransform.py:480` parity: PyPy's dispatch
+/// `pyopcode.py` and `jtransform.py:480` parity: PyPy's dispatch
 /// inline_call passes `(opcode, oparg, ...)` as call args; the callee
 /// jitcode receives them via portal-input binding slots indexed
 /// per-bank.  Pyre's sub-frame uses the same `int_regs[]` / `ref_regs[]`

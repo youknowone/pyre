@@ -3,7 +3,7 @@
 //! Thin shim over `majit_gc::weakref::Weakref` for pyre-object callers
 //! (typeobject.weak_subclasses, future W_Weakref / WeakrefLifeline).
 //! `pyre-object` cannot depend on `majit-gc`, so this module mirrors
-//! the upstream WEAKREF layout (gctypelayout.py:587
+//! the upstream WEAKREF layout (gctypelayout.py
 //! `WEAKREF = lltype.GcStruct("weakref", ("weakptr", llmemory.Address))`)
 //! and relies on the runtime GC type registration in `pyre-jit::eval`
 //! plus the GC's invalidate_*_weakrefs hooks to keep the slot
@@ -13,7 +13,7 @@ use crate::gc_hook::try_gc_alloc;
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
-/// `interp__weakref.py:19-28 WeakrefLifeline(W_Root)` — the interpreter-owned
+/// `interp__weakref.py WeakrefLifeline(W_Root)` — the interpreter-owned
 /// bookkeeping object attached to every weak-referenceable referent.
 ///
 /// PyPy stores these four values directly on the translated instance.  Keep
@@ -93,7 +93,7 @@ pub unsafe fn w_weakref_lifeline_set_has_callbacks(obj: PyObjectRef) {
     unsafe { (*(obj as *mut W_WeakrefLifeline)).has_callbacks = true };
 }
 
-/// `interp__weakref.py:193-205 W_Weakref(W_WeakrefBase)` — exact builtin
+/// `interp__weakref.py W_Weakref(W_WeakrefBase)` — exact builtin
 /// weak references own the base weak slot/callback and their cached hash
 /// directly.  A Python subclass is a separate translated user layout with
 /// mapdict storage; until that generated layout is ported, the interpreter
@@ -205,7 +205,7 @@ pub struct Weakref {
     pub weakptr: PyObjectRef,
 }
 
-/// `sizeof_weakref = llmemory.sizeof(WEAKREF)` (gctypelayout.py:589).
+/// `sizeof_weakref = llmemory.sizeof(WEAKREF)` (gctypelayout.py).
 pub const SIZEOF_WEAKREF: usize = std::mem::size_of::<Weakref>();
 
 impl crate::lltype::GcType for Weakref {
@@ -271,7 +271,7 @@ pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
     })
 }
 
-/// `ll_weakref_deref(wref)` (gctypelayout.py:594-596). Reads the
+/// `ll_weakref_deref(wref)` (gctypelayout.py). Reads the
 /// `weakptr` slot. Returns null when the GC has already invalidated
 /// the target during a minor / major cycle (incminimark.py:3068-3079
 /// / :3116-3122).
@@ -430,7 +430,7 @@ pub unsafe fn w_gc_weakref_box_deref(obj: PyObjectRef) -> PyObjectRef {
 
 /// Point an existing box at `target` by installing a fresh rweakref.
 ///
-/// `rweaklist.py:44-52 add_handle` reuses the slot of a handle whose referent
+/// `rweaklist.py add_handle` reuses the slot of a handle whose referent
 /// died rather than appending a new one; reusing the box with it keeps the
 /// box count at the peak number of simultaneously live handles instead of the
 /// number of registrations. The previous inner Weakref becomes
@@ -450,7 +450,7 @@ pub unsafe fn w_gc_weakref_box_retarget(obj: PyObjectRef, target: PyObjectRef) -
     if target.is_null() {
         return false;
     }
-    // `rweaklist.py:44-52 add_handle` keeps the handle in its GC-visible
+    // `rweaklist.py add_handle` keeps the handle in its GC-visible
     // `handles` list. Rust locals are not traced, so mirror the translated
     // livevar explicitly: `w_weakref_new` may collect and relocate the box.
     let _roots = crate::gc_roots::push_roots();

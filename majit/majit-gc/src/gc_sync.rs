@@ -266,7 +266,7 @@ pub fn register_thread() {
     drop(state);
 
     // os_thread.py:bootstrap takes the GIL as its first act, through
-    // `rgil.acquire_maybe_in_new_thread` (rgil.py:186-193). Everything below
+    // `rgil.acquire_maybe_in_new_thread` (rgil.py). Everything below
     // this line already runs pyre code and so needs it held.
     crate::rgil::acquire_maybe_in_new_thread();
 }
@@ -967,7 +967,7 @@ mod tests {
     }
 
     /// gc.py:525-531 publishes the nursery slots unconditionally, and
-    /// `llsupport/gc.py:525-531 get_nursery_free_addr/get_nursery_top_addr`
+    /// `llsupport/gc.py get_nursery_free_addr/get_nursery_top_addr`
     /// have no thread-count gate: the non-atomic bump in generated code is safe
     /// because the GIL serialises the mutators that run it.  A second mutator
     /// must therefore leave the published top alone.

@@ -79,7 +79,7 @@ fn builtin(name: &str) -> HostObject {
         .unwrap_or_else(|| panic!("HOST_ENV missing builtin {name}"))
 }
 
-/// RPython `rpython/flowspace/specialcase.py:4` — `SPECIAL_CASES = {}`
+/// RPython `rpython/flowspace/specialcase.py` — `SPECIAL_CASES = {}`
 /// populated by `register_flow_sc` / `redirect_function`.
 #[expect(
     clippy::mutable_key_type,

@@ -35,7 +35,7 @@ fn type_name_of(w_obj: PyObjectRef) -> String {
     }
 }
 
-/// pypy/interpreter/argument.py:13-17 `raise_type_error`.
+/// pypy/interpreter/argument.py `raise_type_error`.
 ///
 /// ```python
 /// @specialize.arg(2)
@@ -84,7 +84,7 @@ pub fn raise_type_error(
     }
 }
 
-/// pypy/interpreter/argument.py:419-423 `contains_w_names`.
+/// pypy/interpreter/argument.py `contains_w_names`.
 ///
 /// ```python
 /// def contains_w_names(w_key, keys_w):
@@ -136,7 +136,7 @@ pub fn contains_w_names(w_key: PyObjectRef, keys_w: &[PyObjectRef]) -> bool {
     false
 }
 
-/// pypy/interpreter/argument.py:410-417 `_check_not_duplicate_kwargs`.
+/// pypy/interpreter/argument.py `_check_not_duplicate_kwargs`.
 ///
 /// ```python
 /// def _check_not_duplicate_kwargs(space, existingkeywords_w, keyword_names_w, keywords_w, w_function):
@@ -180,7 +180,7 @@ pub fn check_not_duplicate_kwargs(
     Ok(())
 }
 
-/// pypy/interpreter/argument.py:425-459 `_do_combine_starstarargs_wrapped`.
+/// pypy/interpreter/argument.py `_do_combine_starstarargs_wrapped`.
 ///
 /// ```python
 /// def _do_combine_starstarargs_wrapped(space, keys_w, w_starstararg, keyword_names_w,
@@ -237,7 +237,7 @@ pub fn do_combine_starstarargs_wrapped(
     is_dict: bool,
     w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
-    // argument.py:428 `seen = {}` — Python dict with None values.  Map
+    // argument.py `seen = {}` — Python dict with None values.  Map
     // to `HashMap<String, ()>` rather than `HashSet` so the shape
     // matches PyPy's `dict` (key membership tested via `in`, value slot
     // present-but-unread per `seen[key] = None` at line 446).
@@ -271,10 +271,10 @@ pub fn do_combine_starstarargs_wrapped(
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     for i in 0..keys_w.len() {
         let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
-        // argument.py:431 — `key = space.text_w(w_key)`; raise TypeError
+        // argument.py — `key = space.text_w(w_key)`; raise TypeError
         // if w_key is not a string.  `_PyStack_UnpackDict` reports this
         // without the callable's qualname or the offending key's type, where
-        // argument.py:434-436 formats `"keywords must be strings, not '%T'"`
+        // argument.py formats `"keywords must be strings, not '%T'"`
         // through `raise_type_error`.
         let key = unsafe {
             if !pyre_object::is_str(w_key) {
@@ -299,7 +299,7 @@ pub fn do_combine_starstarargs_wrapped(
                 format!("got multiple values for keyword argument '{key}'"),
             ));
         }
-        // argument.py:448 — `keyword_names_w[i] = w_key`.
+        // argument.py — `keyword_names_w[i] = w_key`.
         pyre_object::gc_roots::shadow_stack_set(pairs_base + 2 * i, w_key);
         // argument.py:449-457 — value lookup.
         let w_value = if is_dict {
@@ -340,7 +340,7 @@ pub fn do_combine_starstarargs_wrapped(
             crate::baseobjspace::getitem(w_starstararg(), w_key)?
         };
         pyre_object::gc_roots::shadow_stack_set(pairs_base + 2 * i + 1, w_value);
-        // argument.py:446 `seen[key] = None` — record key, value slot
+        // argument.py `seen[key] = None` — record key, value slot
         // is unread.
         seen.insert(key, ());
     }
@@ -351,7 +351,7 @@ pub fn do_combine_starstarargs_wrapped(
     Ok(())
 }
 
-/// pypy/interpreter/argument.py:92-104 `_combine_starargs_wrapped`.
+/// pypy/interpreter/argument.py `_combine_starargs_wrapped`.
 ///
 /// ```python
 /// def _combine_starargs_wrapped(self, w_stararg, w_function=None):
@@ -392,7 +392,7 @@ pub fn combine_starargs_wrapped(
     match crate::baseobjspace::fixedview(w_stararg(), -1) {
         Ok(args_w) => {
             pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut arguments_w[..]);
-            // argument.py:104 — `self.arguments_w = self.arguments_w + args_w`.
+            // argument.py — `self.arguments_w = self.arguments_w + args_w`.
             arguments_w.extend(args_w);
             Ok(())
         }
@@ -415,7 +415,7 @@ pub fn combine_starargs_wrapped(
     }
 }
 
-/// pypy/interpreter/argument.py:106-150 `_combine_starstarargs_wrapped`.
+/// pypy/interpreter/argument.py `_combine_starstarargs_wrapped`.
 ///
 /// ```python
 /// def _combine_starstarargs_wrapped(self, w_starstararg, w_function=None):
@@ -623,7 +623,7 @@ pub fn combine_starstarargs_wrapped(
     Ok(())
 }
 
-/// `pypy/interpreter/argument.py:20 class Arguments`.
+/// `pypy/interpreter/argument.py class Arguments`.
 ///
 /// PyPy fields (argument.py:34-53):
 /// ```text
@@ -636,7 +636,7 @@ pub fn combine_starstarargs_wrapped(
 /// ```
 ///
 /// `w_stararg`, `w_starstararg`, `w_function` are constructor inputs
-/// that PyPy's `_combine_wrapped` (argument.py:85-90) expands into
+/// that PyPy's `_combine_wrapped` (argument.py) expands into
 /// `arguments_w` / `keyword_names_w` / `keywords_w` at construction
 /// time.  They are NOT stored as instance state in PyPy — only their
 /// expanded form is.
@@ -655,8 +655,8 @@ pub fn combine_starstarargs_wrapped(
 /// references — the same mutable list object can be aliased between
 /// the caller's `args` and `Arguments.arguments_w`.  Pyre owns
 /// `Vec<PyObjectRef>` and clones at construction.  Rust's borrow
-/// checker forbids `replace_arguments` (argument.py:77-79) and
-/// `_combine_starargs_wrapped` (argument.py:90-101) from building a
+/// checker forbids `replace_arguments` (argument.py) and
+/// `_combine_starargs_wrapped` (argument.py) from building a
 /// new `Arguments` that aliases `&self.arguments_w` while the
 /// existing instance still holds a `&mut` to it.  Wrapping in
 /// `Rc<RefCell<Vec<PyObjectRef>>>` would restore the alias shape
@@ -673,7 +673,7 @@ pub struct Arguments {
     pub keyword_names_w: Option<Vec<PyObjectRef>>,
     /// argument.py:39 `self.keywords_w = keywords_w` (`None` allowed,
     /// must be parallel to `keyword_names_w` when present —
-    /// argument.py:42 `assert len(keywords_w) == len(keyword_names_w)`).
+    /// argument.py `assert len(keywords_w) == len(keyword_names_w)`).
     pub keywords_w: Option<Vec<PyObjectRef>>,
     /// argument.py:50 `self._jit_few_keywords = self.keyword_names_w
     /// is None or jit.isconstant(len(self.keyword_names_w))`.
@@ -681,14 +681,14 @@ pub struct Arguments {
     /// is set so the unroll predicate is observable when the JIT
     /// catches up.
     pub jit_few_keywords: bool,
-    /// argument.py:53 `self.methodcall = methodcall`.  Default `false`
+    /// argument.py `self.methodcall = methodcall`.  Default `false`
     /// for the `positional_only` / `with_kw` shortcuts; the future
     /// CALL_METHOD opcode port should set it `true`.
     pub methodcall: bool,
 }
 
 impl Arguments {
-    /// pypy/interpreter/argument.py:31-53 `__init__` (full port).
+    /// pypy/interpreter/argument.py `__init__` (full port).
     ///
     /// ```python
     /// def __init__(self, space, args_w, keyword_names_w=None,
@@ -757,7 +757,7 @@ impl Arguments {
         };
         let w_function = w_function.unwrap_or(pyre_object::PY_NULL);
         arguments._combine_wrapped(w_stararg, w_starstararg, w_function)?;
-        // argument.py:50 — recompute after `_combine_wrapped`, since
+        // argument.py — recompute after `_combine_wrapped`, since
         // that helper may have grown `keyword_names_w`.
         arguments.jit_few_keywords = match arguments.keyword_names_w.as_ref() {
             None => true,
@@ -766,7 +766,7 @@ impl Arguments {
         Ok(arguments)
     }
 
-    /// pypy/interpreter/argument.py:85-90 `_combine_wrapped`.
+    /// pypy/interpreter/argument.py `_combine_wrapped`.
     ///
     /// ```python
     /// def _combine_wrapped(self, w_stararg, w_starstararg, w_function=None):
@@ -794,12 +794,12 @@ impl Arguments {
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         pyre_object::gc_roots::pin_root(w_starstararg.unwrap_or(pyre_object::PY_NULL));
         pyre_object::gc_roots::pin_root(w_function);
-        // argument.py:87-88 — `if w_stararg is not None: self._combine_starargs_wrapped(...)`.
+        // argument.py — `if w_stararg is not None: self._combine_starargs_wrapped(...)`.
         if let Some(w_star) = w_stararg {
             let w_function = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             combine_starargs_wrapped(&mut self.arguments_w, w_star, w_function)?;
         }
-        // argument.py:89-90 — `if w_starstararg is not None: self._combine_starstarargs_wrapped(...)`.
+        // argument.py — `if w_starstararg is not None: self._combine_starstarargs_wrapped(...)`.
         // Materialize keyword_names_w / keywords_w as empty Vecs if the
         // field is currently None so the helper has a buffer to extend
         // (mirrors argument.py:111-112 `if self.keyword_names_w is None:
@@ -824,7 +824,7 @@ impl Arguments {
         Ok(())
     }
 
-    /// pypy/interpreter/argument.py:31-53 `__init__` (positional-only shortcut).
+    /// pypy/interpreter/argument.py `__init__` (positional-only shortcut).
     ///
     /// Used for call surfaces that have only positional args (no
     /// kwargs, no star expansion).  Cannot fail because there are no
@@ -835,10 +835,10 @@ impl Arguments {
             .expect("positional_only cannot fail without star args")
     }
 
-    /// pypy/interpreter/argument.py:31-53 `__init__` (positional + kwargs shortcut).
+    /// pypy/interpreter/argument.py `__init__` (positional + kwargs shortcut).
     ///
     /// `keyword_names_w` and `keywords_w` are parallel slices
-    /// (argument.py:42 `assert len(keywords_w) == len(keyword_names_w)`).
+    /// (argument.py `assert len(keywords_w) == len(keyword_names_w)`).
     /// Callers with both positional and kwargs (e.g. the
     /// `call.rs:call_with_kwargs` builtin path) use this to keep
     /// the kwargs separated from `arguments_w`, so `firstarg()`
@@ -864,7 +864,7 @@ impl Arguments {
         .expect("with_kw cannot fail without star args")
     }
 
-    /// pypy/interpreter/argument.py:31-53 `__init__` shortcut with the
+    /// pypy/interpreter/argument.py `__init__` shortcut with the
     /// `methodcall` flag explicit.  Use when the caller has both kwargs
     /// and the `methodcall` flag (e.g. CALL_METHOD lowering); when
     /// methodcall is false, `with_kw` is the lighter alternative.
@@ -888,7 +888,7 @@ impl Arguments {
         .expect("full cannot fail without star args")
     }
 
-    /// pypy/interpreter/argument.py:153-162 `fixedunpack`.
+    /// pypy/interpreter/argument.py `fixedunpack`.
     ///
     /// ```python
     /// def fixedunpack(self, argcount):
@@ -941,7 +941,7 @@ impl Arguments {
         }
     }
 
-    /// pypy/interpreter/argument.py:68-75 `unpack`.
+    /// pypy/interpreter/argument.py `unpack`.
     ///
     /// ```python
     /// @jit.look_inside_iff(lambda self: self._jit_few_keywords)
@@ -989,7 +989,7 @@ impl Arguments {
                         pyre_object::w_str_get_value(*w_name).to_string()
                     } else {
                         // argument.py:72 — `space.text_w(...)`.  PyPy's
-                        // `_typed_unwrap_error` (baseobjspace.py:313-315)
+                        // `_typed_unwrap_error` (baseobjspace.py)
                         // raises `TypeError("expected str, got %T object")`.
                         let tp = type_name_of(*w_name);
                         return Err(crate::PyError::type_error(format!(
@@ -1004,7 +1004,7 @@ impl Arguments {
         Ok((self.arguments_w.clone(), kwds_w))
     }
 
-    /// pypy/interpreter/argument.py:77-79 `replace_arguments`.
+    /// pypy/interpreter/argument.py `replace_arguments`.
     ///
     /// ```python
     /// def replace_arguments(self, args_w):
@@ -1036,7 +1036,7 @@ impl Arguments {
         }
     }
 
-    /// pypy/interpreter/argument.py:81-83 `prepend`.
+    /// pypy/interpreter/argument.py `prepend`.
     ///
     /// ```python
     /// def prepend(self, w_firstarg):
@@ -1050,7 +1050,7 @@ impl Arguments {
         self.replace_arguments(args_w)
     }
 
-    /// pypy/interpreter/argument.py:172-338 `_match_signature`.
+    /// pypy/interpreter/argument.py `_match_signature`.
     ///
     /// Parse positional + kwargs arguments against `signature`, filling
     /// `scope_w` (caller-provided buffer of length `signature.scope_length()`).
@@ -1111,7 +1111,7 @@ impl Arguments {
         let keyword_names_w: Option<&[PyObjectRef]> = self.keyword_names_w.as_deref();
         let num_kwds = keyword_names_w.map(|k| k.len()).unwrap_or(0);
 
-        // argument.py:211-220 — positional copy.
+        // argument.py — positional copy.
         let mut input_argcount = upfront;
         if input_argcount < co_argcount {
             let take = num_args.min(co_argcount - upfront);
@@ -1162,7 +1162,7 @@ impl Arguments {
         // argument.py:222-236 — *vararg collection.
         if signature.has_vararg() {
             let args_left = co_argcount - upfront;
-            // argument.py:225 — `assert args_left >= 0` always holds in
+            // argument.py — `assert args_left >= 0` always holds in
             // pyre (usize subtraction would have panicked above).
             let starargs_w: Vec<PyObjectRef> = if num_args > args_left {
                 if args_left == 0 {
@@ -1198,7 +1198,7 @@ impl Arguments {
         let keywords_w: Option<&[PyObjectRef]> = self.keywords_w.as_deref();
         let mut kwds_mapping: Option<Vec<isize>> = None;
         if num_kwds > 0 {
-            // argument.py:251-254 — pre-init `kwds_mapping[i] = -1`.
+            // argument.py — pre-init `kwds_mapping[i] = -1`.
             let mapping_len = co_argcount + co_kwonlyargcount - input_argcount;
             let mut mapping = vec![-1isize; mapping_len];
             // argument.py:259-262 — match keyword names to argnames.
@@ -1242,7 +1242,7 @@ impl Arguments {
                                 if unsafe { pyre_object::is_str(w_n) } {
                                     name = unsafe { pyre_object::w_str_get_value(w_n).to_string() };
                                 } else {
-                                    // baseobjspace.py:313-315 `_typed_unwrap_error`
+                                    // baseobjspace.py `_typed_unwrap_error`
                                     // → `TypeError("expected str, got %T object")`.
                                     let tp = type_name_of(w_n);
                                     return Err(MatchSignatureError::Py(
@@ -1348,7 +1348,7 @@ impl Arguments {
                     }
                     continue;
                 }
-                // PyPy `baseobjspace.py:870 finditem` re-raises any
+                // PyPy `baseobjspace.py finditem` re-raises any
                 // `OperationError` other than KeyError, so a kwonly-defaults
                 // dict with a subclass `__getitem__` raising e.g.
                 // `RuntimeError` surfaces here instead of being
@@ -1367,7 +1367,7 @@ impl Arguments {
                     }
                 }
             }
-            // argument.py:335-338 — surface ArgErrMissing.
+            // argument.py — surface ArgErrMissing.
             if let Some(missing) = missing_positional {
                 return Err(MatchSignatureError::Shape(ArgErr::Missing {
                     missing,
@@ -1391,7 +1391,7 @@ impl Arguments {
         Ok(())
     }
 
-    /// pypy/interpreter/argument.py:357-365 `_parse`.
+    /// pypy/interpreter/argument.py `_parse`.
     ///
     /// ```python
     /// def _parse(self, w_firstarg, signature, defaults_w, w_kw_defs, blindargs=0):
@@ -1422,7 +1422,7 @@ impl Arguments {
         Ok(scope_w)
     }
 
-    /// pypy/interpreter/argument.py:341-355 `parse_into_scope`.
+    /// pypy/interpreter/argument.py `parse_into_scope`.
     ///
     /// ```python
     /// def parse_into_scope(self, w_firstarg,
@@ -1456,7 +1456,7 @@ impl Arguments {
         }
     }
 
-    /// pypy/interpreter/argument.py:368-383 `parse_obj`.
+    /// pypy/interpreter/argument.py `parse_obj`.
     ///
     /// ```python
     /// def parse_obj(self, w_firstarg,
@@ -1506,7 +1506,7 @@ impl Arguments {
         }
     }
 
-    /// pypy/interpreter/argument.py:385-389 `frompacked`.
+    /// pypy/interpreter/argument.py `frompacked`.
     ///
     /// ```python
     /// @staticmethod
@@ -1522,7 +1522,7 @@ impl Arguments {
         Self::new(&[], None, None, w_args, w_kwds, false, None)
     }
 
-    /// pypy/interpreter/argument.py:391-400 `topacked`.
+    /// pypy/interpreter/argument.py `topacked`.
     ///
     /// ```python
     /// def topacked(self):
@@ -1573,7 +1573,7 @@ impl Arguments {
     }
 }
 
-/// pypy/interpreter/argument.py:172-338 `_match_signature` raises
+/// pypy/interpreter/argument.py `_match_signature` raises
 /// either `ArgErr` (shape mismatch) or `OperationError` (PyError, from
 /// `space.setitem` in `_collect_keyword_args`).  Pyre keeps both
 /// exception types separate via this enum, so callers
@@ -1603,7 +1603,7 @@ impl From<crate::PyError> for MatchSignatureError {
     }
 }
 
-/// pypy/interpreter/argument.py:464-501 `_match_keywords`.
+/// pypy/interpreter/argument.py `_match_keywords`.
 ///
 /// ```python
 /// def _match_keywords(space, signature, blindargs, co_posonlyargcount,
@@ -1696,7 +1696,7 @@ pub fn match_keywords(
     Ok(num_remainingkwds)
 }
 
-/// pypy/interpreter/argument.py:506-516 `_collect_keyword_args`.
+/// pypy/interpreter/argument.py `_collect_keyword_args`.
 ///
 /// ```python
 /// def _collect_keyword_args(space, keyword_names_w, keywords_w, w_kwds,
@@ -1757,7 +1757,7 @@ fn mapping_contains(mapping: &[isize], target: isize) -> bool {
     mapping.contains(&target)
 }
 
-/// pypy/interpreter/argument.py:523-641 — `ArgErr` exception hierarchy.
+/// pypy/interpreter/argument.py — `ArgErr` exception hierarchy.
 ///
 /// PyPy declares `class ArgErr(Exception)` with abstract `getmsg()`
 /// and 6 concrete subclasses (`ArgErrMissing`, `ArgErrTooMany`,
@@ -1773,19 +1773,19 @@ fn mapping_contains(mapping: &[isize], target: isize) -> bool {
 /// formatting line-by-line.
 #[derive(Debug, Clone)]
 pub enum ArgErr {
-    /// argument.py:529-552 `ArgErrMissing(missing, positional)`.
+    /// argument.py `ArgErrMissing(missing, positional)`.
     Missing {
         missing: Vec<String>,
         positional: bool,
     },
-    /// argument.py:555-580 `ArgErrTooMany(signature, num_defaults, given, kwonly_given)`.
+    /// argument.py `ArgErrTooMany(signature, num_defaults, given, kwonly_given)`.
     TooMany {
         signature: crate::gateway::Signature,
         num_defaults: usize,
         given: usize,
         kwonly_given: usize,
     },
-    /// argument.py:582-595 `ArgErrTooManyMethod` — same fields as
+    /// argument.py `ArgErrTooManyMethod` — same fields as
     /// `TooMany`, with appended "did you forget self?" hint when the
     /// signature shape suggests a missing self parameter.
     TooManyMethod {
@@ -1802,12 +1802,12 @@ pub enum ArgErr {
     /// `num_remainingkwds == 1`; pyre stores the resolved name string
     /// directly so the formatter can stay free of space refs.
     UnknownKwds { num_kwds: usize, kwd_name: String },
-    /// argument.py:630-640 `ArgErrPosonlyAsKwds(posonly_kwds)`.
+    /// argument.py `ArgErrPosonlyAsKwds(posonly_kwds)`.
     PosonlyAsKwds { posonly_kwds: Vec<String> },
 }
 
 impl ArgErr {
-    /// pypy/interpreter/argument.py:534-552 `ArgErrMissing.getmsg`,
+    /// pypy/interpreter/argument.py `ArgErrMissing.getmsg`,
     /// :562-580 `ArgErrTooMany.getmsg`, :589-595
     /// `ArgErrTooManyMethod.getmsg`, :603-605
     /// `ArgErrMultipleValues.getmsg`, :620-627
@@ -1889,7 +1889,7 @@ impl ArgErr {
     }
 }
 
-/// pypy/interpreter/argument.py:562-580 `ArgErrTooMany.getmsg` body.
+/// pypy/interpreter/argument.py `ArgErrTooMany.getmsg` body.
 /// Extracted because both `TooMany` and `TooManyMethod` arms share it.
 fn format_too_many(
     signature: &crate::gateway::Signature,
@@ -1925,7 +1925,7 @@ fn format_too_many(
 mod tests {
     use super::*;
 
-    /// pypy/interpreter/argument.py:14-15 — `w_function is None` arm.
+    /// pypy/interpreter/argument.py — `w_function is None` arm.
     #[test]
     fn raise_type_error_no_function() {
         let err = raise_type_error(pyre_object::PY_NULL, "boom".to_string());
@@ -1973,7 +1973,7 @@ mod tests {
         );
     }
 
-    /// pypy/interpreter/argument.py:543 — 3-or-more uses `, and `.
+    /// pypy/interpreter/argument.py — 3-or-more uses `, and `.
     #[test]
     fn arg_err_missing_three_with_oxford_comma() {
         let err = ArgErr::Missing {
@@ -1986,7 +1986,7 @@ mod tests {
         );
     }
 
-    /// pypy/interpreter/argument.py:603-605 `ArgErrMultipleValues`.
+    /// pypy/interpreter/argument.py `ArgErrMultipleValues`.
     #[test]
     fn arg_err_multiple_values() {
         let err = ArgErr::MultipleValues {
@@ -1995,7 +1995,7 @@ mod tests {
         assert_eq!(err.getmsg(), "got multiple values for argument 'kwarg'");
     }
 
-    /// pypy/interpreter/argument.py:621-626 `ArgErrUnknownKwds`
+    /// pypy/interpreter/argument.py `ArgErrUnknownKwds`
     /// — single-name vs multi-count branches.
     #[test]
     fn arg_err_unknown_kwds_branches() {
@@ -2011,7 +2011,7 @@ mod tests {
         assert_eq!(many.getmsg(), "got 3 unexpected keyword arguments");
     }
 
-    /// pypy/interpreter/argument.py:635-637 `ArgErrPosonlyAsKwds.getmsg` —
+    /// pypy/interpreter/argument.py `ArgErrPosonlyAsKwds.getmsg` —
     /// always the plural wording, regardless of `posonly_kwds` length.
     /// CPython's `positional_only_passed_as_keyword` (Python/ceval.c) has
     /// no singular form either.
@@ -2033,7 +2033,7 @@ mod tests {
         );
     }
 
-    /// pypy/interpreter/argument.py:562-580 `ArgErrTooMany.getmsg` —
+    /// pypy/interpreter/argument.py `ArgErrTooMany.getmsg` —
     /// no defaults, single-arg singular path.
     #[test]
     fn arg_err_too_many_no_defaults_singular() {
@@ -2064,7 +2064,7 @@ mod tests {
         );
     }
 
-    /// pypy/interpreter/argument.py:589-595 `ArgErrTooManyMethod`
+    /// pypy/interpreter/argument.py `ArgErrTooManyMethod`
     /// appends self-hint when shape matches and argnames[0] != "self".
     #[test]
     fn arg_err_too_many_method_self_hint_appended() {
@@ -2095,7 +2095,7 @@ mod tests {
         assert!(!msg.contains("Did you forget"));
     }
 
-    /// pypy/interpreter/argument.py:419-423 `contains_w_names` —
+    /// pypy/interpreter/argument.py `contains_w_names` —
     /// string equality match.
     #[test]
     fn contains_w_names_string_match() {
@@ -2123,7 +2123,7 @@ mod tests {
         assert!(err.message_text().contains("got multiple values"));
     }
 
-    /// pypy/interpreter/argument.py:410-417 `_check_not_duplicate_kwargs` —
+    /// pypy/interpreter/argument.py `_check_not_duplicate_kwargs` —
     /// raises TypeError on overlap.
     #[test]
     fn check_not_duplicate_kwargs_raises_on_overlap() {
@@ -2147,7 +2147,7 @@ mod tests {
             .expect("disjoint names should pass");
     }
 
-    /// pypy/interpreter/argument.py:92-104 `_combine_starargs_wrapped`:
+    /// pypy/interpreter/argument.py `_combine_starargs_wrapped`:
     /// list extension via fixedview.
     #[test]
     fn combine_starargs_wrapped_extends_from_list() {
@@ -2322,7 +2322,7 @@ mod tests {
         }
     }
 
-    /// pypy/interpreter/argument.py:106-150 `_combine_starstarargs_wrapped`:
+    /// pypy/interpreter/argument.py `_combine_starstarargs_wrapped`:
     /// dict expansion fills parallel name/value buffers.
     #[test]
     fn combine_starstarargs_wrapped_dict_expansion() {
@@ -2340,7 +2340,7 @@ mod tests {
         assert_eq!(values.len(), 2);
     }
 
-    /// pypy/interpreter/argument.py:31-53 `__init__` with `w_stararg`:
+    /// pypy/interpreter/argument.py `__init__` with `w_stararg`:
     /// star-arg list extends `arguments_w` in-place (Phase A.3 routes
     /// through `combine_starargs_wrapped`).
     #[test]
@@ -2358,7 +2358,7 @@ mod tests {
         }
     }
 
-    /// pypy/interpreter/argument.py:31-53 `__init__` with `w_starstararg`:
+    /// pypy/interpreter/argument.py `__init__` with `w_starstararg`:
     /// star-star dict expands into the kwargs Vecs (Phase A.3 routes
     /// through `combine_starstarargs_wrapped`).
     #[test]
@@ -2401,7 +2401,7 @@ mod tests {
         }
     }
 
-    /// pypy/interpreter/argument.py:77-79 `replace_arguments` —
+    /// pypy/interpreter/argument.py `replace_arguments` —
     /// returns a new Arguments with replaced positional list,
     /// keyword names/values shared (cloned in pyre).
     #[test]
@@ -2421,7 +2421,7 @@ mod tests {
         assert_eq!(names.len(), 1);
     }
 
-    /// pypy/interpreter/argument.py:81-83 `prepend` — `[w_firstarg] + args_w`.
+    /// pypy/interpreter/argument.py `prepend` — `[w_firstarg] + args_w`.
     #[test]
     fn prepend_inserts_at_front() {
         let pos = [pyre_object::w_int_new(2), pyre_object::w_int_new(3)];
@@ -2435,7 +2435,7 @@ mod tests {
         }
     }
 
-    /// pypy/interpreter/argument.py:68-75 `unpack` — returns
+    /// pypy/interpreter/argument.py `unpack` — returns
     /// (positional list, kwds dict).
     #[test]
     fn unpack_returns_args_and_kwds() {
@@ -2487,14 +2487,14 @@ mod tests {
             Ok(_) => panic!("non-string keyword name should TypeError"),
             Err(err) => {
                 assert_eq!(err.kind, crate::PyErrorKind::TypeError);
-                // baseobjspace.py:313-315 `_typed_unwrap_error`:
+                // baseobjspace.py `_typed_unwrap_error`:
                 // `expected str, got <T> object`.
                 assert!(err.message_text().contains("expected str"));
             }
         }
     }
 
-    /// pypy/interpreter/argument.py:341-355 `parse_into_scope` happy
+    /// pypy/interpreter/argument.py `parse_into_scope` happy
     /// path: matches signature, returns scope_length.
     #[test]
     fn parse_into_scope_happy_path() {
@@ -2519,7 +2519,7 @@ mod tests {
         }
     }
 
-    /// pypy/interpreter/argument.py:341-355 `parse_into_scope` shape
+    /// pypy/interpreter/argument.py `parse_into_scope` shape
     /// mismatch surfaces as TypeError with `<fnname>() ` prefix.
     #[test]
     fn parse_into_scope_shape_error_formats_fnname_prefix() {
@@ -2541,7 +2541,7 @@ mod tests {
         assert!(err.message.starts_with("myfn() "));
     }
 
-    /// pypy/interpreter/argument.py:378-380 `parse_obj` special-cases
+    /// pypy/interpreter/argument.py `parse_obj` special-cases
     /// "takes no keyword arguments" when no **kwarg + no kwonly args.
     #[test]
     fn parse_obj_unknown_kwds_no_kwarg_message() {
@@ -2564,7 +2564,7 @@ mod tests {
         assert_eq!(err.message_text(), "myfn() takes no keyword arguments");
     }
 
-    /// pypy/interpreter/argument.py:385-389 `frompacked` builds
+    /// pypy/interpreter/argument.py `frompacked` builds
     /// Arguments from packed star args.
     #[test]
     fn frompacked_expands_w_args() {
@@ -2574,7 +2574,7 @@ mod tests {
         assert_eq!(arguments.arguments_w.len(), 2);
     }
 
-    /// pypy/interpreter/argument.py:391-400 `topacked` round-trips
+    /// pypy/interpreter/argument.py `topacked` round-trips
     /// arguments_w through newtuple + newdict.
     #[test]
     fn topacked_round_trips() {

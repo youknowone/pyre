@@ -34,7 +34,7 @@ pub(crate) fn first_floor_boundary_for_py(
 /// Exact block-head marker matches win first. Otherwise the floor segment is
 /// the Python instruction whose lowering region contains the JitCode PC, the
 /// coordinate the per-bytecode `last_instr` store in
-/// `pyopcode.py:200 dispatch_bytecode` would have left in the frame.
+/// `pyopcode.py dispatch_bytecode` would have left in the frame.
 pub(crate) fn containing_py_pc_for_jitcode_pc(
     metadata: &crate::PyJitCodeMetadata,
     jit_pc: usize,

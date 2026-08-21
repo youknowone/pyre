@@ -12,14 +12,14 @@
 //! that needs to inject a freshly annotated + rtyped helper graph into
 //! an in-flight translation:
 //!
-//! * `ExceptionData.make_helpers` (exceptiondata.py:47-62) →
+//! * `ExceptionData.make_helpers` (exceptiondata.py) →
 //!   `annmixlevel.getgraph(ll_exception_match, …)` etc.
 //! * `normalizecalls.create_instantiate_functions` (normalizecalls.py:
 //!   :~300-370) — generates `my_instantiate_graph` on every `ClassDef`
 //!   with an `__init__`.
-//! * `RPythonTyper.getannmixlevel` (rtyper.py:179-181) and the
+//! * `RPythonTyper.getannmixlevel` (rtyper.py) and the
 //!   `self.annmixlevel.finish()` fixpoint step inside
-//!   `specialize_more_blocks` (rtyper.py:238-241).
+//!   `specialize_more_blocks` (rtyper.py).
 //! * `rpython/translator/backendopt/all.py::backend_optimizations`
 //!   `secondary=True` path (via `backend_optimize`).
 //!
@@ -37,10 +37,10 @@
 //!   helper surfaces are present below, but their bodies still return
 //!   structured pending errors until the corresponding `rstr`, `llmemory`,
 //!   and cast specialization paths land.
-//! * `ADTInterface.__call__` (annlowlevel.py:632-640) — the type
+//! * `ADTInterface.__call__` (annlowlevel.py) — the type
 //!   surface is present; installing `_annenforceargs_` still lacks a
 //!   `ConstValue` carrier for method attributes.
-//! * `cachedtype` metaclass (annlowlevel.py:644-668) — metaclass
+//! * `cachedtype` metaclass (annlowlevel.py) — metaclass
 //!   shape has no direct Rust counterpart; callers reach for
 //!   `once_cell::sync::Lazy` / `std::sync::LazyLock` + a manual cache
 //!   map instead.
@@ -68,7 +68,7 @@
 //! * [`crate::translator::rtyper::normalizecalls::perform_normalizations`]
 //!   (normalizecalls.py:1-20) — called by `finish_rtype`.
 //! * [`crate::translator::rtyper::rmodel::Repr::set_setup_delayed`] +
-//!   `set_setup_maybe_delayed` / `is_setup_delayed` (rmodel.py:79-93).
+//!   `set_setup_maybe_delayed` / `is_setup_delayed` (rmodel.py).
 //!
 //! Filling the method bodies from these primitives is strictly a
 //! line-by-line transliteration of upstream.
@@ -309,10 +309,10 @@ pub fn typemeth_placeholder_sigarg(s: &str) -> Result<SigArgType, TyperError> {
 }
 
 // ---------------------------------------------------------------------
-// annlowlevel.py:20-41 — KeyComp
+// annlowlevel.py — KeyComp
 // ---------------------------------------------------------------------
 
-/// RPython `class KeyComp(object)` (annlowlevel.py:20-41).
+/// RPython `class KeyComp(object)` (annlowlevel.py).
 ///
 /// Wrapper used by `LowLevelAnnotatorPolicy.lowlevelspecialize` to
 /// build cache keys out of PBC constants and low-level types. The
@@ -340,7 +340,7 @@ pub struct KeyComp {
 /// uniform while the various branches are ported one at a time.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum KeyCompValue {
-    /// `lltype.LowLevelType` branch (annlowlevel.py:31-32).
+    /// `lltype.LowLevelType` branch (annlowlevel.py).
     Lltype(LowLevelType),
     /// Generic constant branch (annlowlevel.py:33-39).
     Const(ConstValue),
@@ -353,7 +353,7 @@ impl KeyComp {
     }
 }
 
-/// Upstream `KeyComp.__str__` / `__repr__` (annlowlevel.py:29-41):
+/// Upstream `KeyComp.__str__` / `__repr__` (annlowlevel.py):
 /// `LowLevelType` → `'<short_name>LlT'`; general consts append `'Const'`.
 impl std::fmt::Display for KeyComp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -369,7 +369,7 @@ impl std::fmt::Display for KeyComp {
 }
 
 // ---------------------------------------------------------------------
-// annlowlevel.py:43-90 — LowLevelAnnotatorPolicy
+// annlowlevel.py — LowLevelAnnotatorPolicy
 // ---------------------------------------------------------------------
 
 /// RPython `class LowLevelAnnotatorPolicy(AnnotatorPolicy)`
@@ -521,7 +521,7 @@ impl LowLevelAnnotatorPolicy {
         self.lowlevelspecialize(funcdesc, args_s, &std::collections::HashMap::new())
     }
 
-    /// RPython `specialize__ll = default_specialize` (annlowlevel.py:82).
+    /// RPython `specialize__ll = default_specialize` (annlowlevel.py).
     /// Kept as a distinct method so the
     /// [`crate::annotator::policy::Specializer::Ll`] dispatch can
     /// call it by its upstream attribute name.
@@ -598,7 +598,7 @@ impl From<LowLevelAnnotatorPolicy> for PolicyHandle {
 }
 
 // ---------------------------------------------------------------------
-// annlowlevel.py:92-95 — annotate_lowlevel_helper
+// annlowlevel.py — annotate_lowlevel_helper
 // ---------------------------------------------------------------------
 
 /// RPython `annotate_lowlevel_helper(annotator, ll_function, args_s,
@@ -631,7 +631,7 @@ pub fn annotate_lowlevel_helper(
 }
 
 // ---------------------------------------------------------------------
-// annlowlevel.py:100-123 — MixLevelAnnotatorPolicy
+// annlowlevel.py — MixLevelAnnotatorPolicy
 // ---------------------------------------------------------------------
 
 /// RPython `class MixLevelAnnotatorPolicy(LowLevelAnnotatorPolicy)`
@@ -791,7 +791,7 @@ impl From<MixLevelAnnotatorPolicy> for PolicyHandle {
 }
 
 // ---------------------------------------------------------------------
-// annlowlevel.py:126-284 — MixLevelHelperAnnotator
+// annlowlevel.py — MixLevelHelperAnnotator
 // ---------------------------------------------------------------------
 
 /// One entry of [`MixLevelHelperAnnotator::pending`] — matches the
@@ -806,7 +806,7 @@ pub struct PendingHelper {
 }
 
 /// One entry of [`MixLevelHelperAnnotator::delayedconsts`] — matches
-/// upstream `(delayedptr, repr, obj)` (annlowlevel.py:212).
+/// upstream `(delayedptr, repr, obj)` (annlowlevel.py).
 #[derive(Debug, Clone)]
 pub struct DelayedConst {
     pub delayedptr: _ptr,
@@ -817,7 +817,7 @@ pub struct DelayedConst {
 }
 
 /// One entry of [`MixLevelHelperAnnotator::delayedfuncs`] — matches
-/// upstream `(delayedptr, graph)` (annlowlevel.py:176).
+/// upstream `(delayedptr, graph)` (annlowlevel.py).
 #[derive(Debug, Clone)]
 pub struct DelayedFunc {
     pub delayedptr: _ptr,
@@ -842,7 +842,7 @@ impl PseudoHighLevelCallable {
         }
     }
 
-    /// RPython `PseudoHighLevelCallable.__call__` (annlowlevel.py:298-300).
+    /// RPython `PseudoHighLevelCallable.__call__` (annlowlevel.py).
     #[allow(non_snake_case)]
     pub fn __call__(&self, _args: &[SomeValue]) -> Result<SomeValue, TyperError> {
         Err(TyperError::message(
@@ -867,7 +867,7 @@ impl PseudoHighLevelCallableEntry {
         instance.s_result.clone()
     }
 
-    /// RPython `specialize_call(self, hop)` (annlowlevel.py:308-320).
+    /// RPython `specialize_call(self, hop)` (annlowlevel.py).
     pub fn specialize_call(
         &self,
         instance: &PseudoHighLevelCallable,
@@ -922,11 +922,11 @@ impl PseudoHighLevelCallableEntry {
     }
 }
 
-/// RPython `class LLHelperEntry(ExtRegistryEntry)` (annlowlevel.py:349-376).
+/// RPython `class LLHelperEntry(ExtRegistryEntry)` (annlowlevel.py).
 #[derive(Debug, Clone, Default)]
 pub struct LLHelperEntry;
 
-/// RPython `llhelper(F, f)` (annlowlevel.py:325-344).
+/// RPython `llhelper(F, f)` (annlowlevel.py).
 ///
 /// ```python
 /// return lltype.functionptr(F.TO, f.__name__, _callable=f)
@@ -948,7 +948,7 @@ pub fn llhelper(F: Ptr, f: &HostObject) -> Result<_ptr, TyperError> {
     ))
 }
 
-/// RPython `llhelper_args(f, ARGS, RESULT)` (annlowlevel.py:346-347).
+/// RPython `llhelper_args(f, ARGS, RESULT)` (annlowlevel.py).
 #[allow(non_snake_case)]
 pub fn llhelper_args(f: &HostObject, ARGS: Vec<LowLevelType>, RESULT: LowLevelType) -> _ptr {
     llhelper(
@@ -1041,7 +1041,7 @@ impl LLHelperEntry {
         Ok(SomeValue::Ptr(SomePtr::new(f)))
     }
 
-    /// RPython `specialize_call(self, hop)` (annlowlevel.py:370-376).
+    /// RPython `specialize_call(self, hop)` (annlowlevel.py).
     pub fn specialize_call(&self, hop: &HighLevelOp) -> RTypeResult {
         hop.exception_cannot_occur()?;
         let callable_is_constant = {
@@ -1107,7 +1107,7 @@ pub struct ADTSigTemplate {
     pub result: SigArgType,
 }
 
-/// RPython `class ADTInterface(object)` (annlowlevel.py:607-640).
+/// RPython `class ADTInterface(object)` (annlowlevel.py).
 #[derive(Debug, Clone)]
 pub struct ADTInterface {
     pub sigtemplates: HashMap<String, ADTSigTemplate>,
@@ -1155,7 +1155,7 @@ impl ADTInterface {
         })
     }
 
-    /// RPython `ADTInterface.__call__(self, adtmeths)` (annlowlevel.py:632-639).
+    /// RPython `ADTInterface.__call__(self, adtmeths)` (annlowlevel.py).
     ///
     /// `adtmeths` is the method mapping (`name -> ll function`, stored as
     /// `lltype.Struct._adtmeths`); upstream installs each `sig` as the
@@ -1201,23 +1201,23 @@ pub struct MixLevelHelperAnnotator {
     /// RPython `self.rtyper = rtyper` (annlowlevel.py:129).
     pub rtyper: Weak<RPythonTyper>,
     /// RPython `self.policy = MixLevelAnnotatorPolicy(self)`
-    /// (annlowlevel.py:130). Wrapped in `RefCell` so `finish_annotate`
+    /// (annlowlevel.py). Wrapped in `RefCell` so `finish_annotate`
     /// can borrow-swap it into `annotator.using_policy` without an
     /// owned clone per call.
     pub policy: RefCell<MixLevelAnnotatorPolicy>,
-    /// RPython `self.pending = []` (annlowlevel.py:131). Queue of
+    /// RPython `self.pending = []` (annlowlevel.py). Queue of
     /// helper graphs awaiting `finish_annotate`.
     pub pending: RefCell<Vec<PendingHelper>>,
-    /// RPython `self.delayedreprs = set()` (annlowlevel.py:132).
+    /// RPython `self.delayedreprs = set()` (annlowlevel.py).
     /// Pointer-identity dedup via the caller; entries are
     /// `Arc<dyn Repr>` whose `set_setup_delayed(false)` is flipped by
     /// `finish_rtype`.
     pub delayedreprs: RefCell<Vec<Arc<dyn Repr>>>,
-    /// RPython `self.delayedconsts = []` (annlowlevel.py:133).
+    /// RPython `self.delayedconsts = []` (annlowlevel.py).
     pub delayedconsts: RefCell<Vec<DelayedConst>>,
-    /// RPython `self.delayedfuncs = []` (annlowlevel.py:134).
+    /// RPython `self.delayedfuncs = []` (annlowlevel.py).
     pub delayedfuncs: RefCell<Vec<DelayedFunc>>,
-    /// RPython `self.newgraphs = set()` (annlowlevel.py:135).
+    /// RPython `self.newgraphs = set()` (annlowlevel.py).
     /// Upstream populates this from the `original_graph_count`
     /// checkpoint inside `finish_annotate` / `finish_rtype`.
     pub newgraphs: RefCell<Vec<GraphRef>>,
@@ -1869,7 +1869,7 @@ impl MixLevelHelperAnnotator {
 }
 
 // ---------------------------------------------------------------------
-// annlowlevel.py:380-449 — make_string_entries / hlstr / llstr
+// annlowlevel.py — make_string_entries / hlstr / llstr
 // ---------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

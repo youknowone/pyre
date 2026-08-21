@@ -112,7 +112,7 @@ const PUT: u8 = interp::PUT;
 const ADD: u8 = interp::ADD;
 const SUB: u8 = interp::SUB;
 const MUL: u8 = interp::MUL;
-// DIV not traced: IntObj.div() in tlc.py:144 uses Python 2 floor division (//),
+// DIV not traced: IntObj.div() in tlc.py uses Python 2 floor division (//),
 // which differs from Rust's truncating division for negative operands.
 const EQ: u8 = interp::EQ;
 const NE: u8 = interp::NE;
@@ -152,7 +152,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
     });
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
-    // tlc.py:223 `self.stack = []` is a plain dynamic Python list (no
+    // tlc.py `self.stack = []` is a plain dynamic Python list (no
     // virtualizable). pyre's `state_fields = [int; virt]` requires a fixed
     // size; use `program.len()` as a safe upper bound (no sequence of
     // bytecode ops can push more than one value per opcode without

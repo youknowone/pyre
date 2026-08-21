@@ -6,14 +6,14 @@
 //!
 //! | upstream | Rust mirror |
 //! |---|---|
-//! | `class FloatRepr(Repr)` (`rfloat.py:11-64`) | [`FloatRepr`] |
-//! | `float_repr = FloatRepr()` singleton (`rfloat.py:65`) | [`float_repr`] |
-//! | `class SingleFloatRepr(Repr)` (`rfloat.py:150-158`) | [`SingleFloatRepr`] |
-//! | `class LongFloatRepr(Repr)` (`rfloat.py:166-174`) | [`LongFloatRepr`] |
-//! | `SomeFloat/SomeSingleFloat/SomeLongFloat rtyper_make*` (`rfloat.py:67-72,144-148,160-164`) | wired in [`super::rmodel::rtyper_makerepr`] + [`super::rmodel::rtyper_makekey`] |
-//! | `pairtype(FloatRepr, FloatRepr).rtype_add/sub/mul/truediv` (`rfloat.py:75-93`) | dispatched via [`super::pairtype::pair_rtype_add`] etc. → [`rtype_template`] |
-//! | `pairtype(FloatRepr, FloatRepr).rtype_eq/ne/lt/le/gt/ge/is_` (`rfloat.py:103-130`) | dispatched via [`super::pairtype::pair_rtype_eq`] etc. → [`rtype_compare_template`] |
-//! | `_rtype_template(hop, func)` / `_rtype_compare_template(hop, func)` helpers (`rfloat.py:75-135`) | [`rtype_template`] / [`rtype_compare_template`] |
+//! | `class FloatRepr(Repr)` (`rfloat.py`) | [`FloatRepr`] |
+//! | `float_repr = FloatRepr()` singleton (`rfloat.py`) | [`float_repr`] |
+//! | `class SingleFloatRepr(Repr)` (`rfloat.py`) | [`SingleFloatRepr`] |
+//! | `class LongFloatRepr(Repr)` (`rfloat.py`) | [`LongFloatRepr`] |
+//! | `SomeFloat/SomeSingleFloat/SomeLongFloat rtyper_make*` (`rfloat.py`) | wired in [`super::rmodel::rtyper_makerepr`] + [`super::rmodel::rtyper_makekey`] |
+//! | `pairtype(FloatRepr, FloatRepr).rtype_add/sub/mul/truediv` (`rfloat.py`) | dispatched via [`super::pairtype::pair_rtype_add`] etc. → [`rtype_template`] |
+//! | `pairtype(FloatRepr, FloatRepr).rtype_eq/ne/lt/le/gt/ge/is_` (`rfloat.py`) | dispatched via [`super::pairtype::pair_rtype_eq`] etc. → [`rtype_compare_template`] |
+//! | `_rtype_template(hop, func)` / `_rtype_compare_template(hop, func)` helpers (`rfloat.py`) | [`rtype_template`] / [`rtype_compare_template`] |
 //!
 //! ## Deferred to follow-up commits
 //!
@@ -21,7 +21,7 @@
 //!   trait slots for ordering helpers. Used by `rdict.py` /
 //!   `rordereddict.py` when those land; no current consumer. (`get_ll_eq`
 //!   and `get_ll_hash` are landed on the [`Repr`] trait.)
-//! * `ll_str(self, f)` (`rfloat.py:60-63`) — depends on
+//! * `ll_str(self, f)` (`rfloat.py`) — depends on
 //!   `rpython/rlib/rfloat.py:formatd` + `annlowlevel.llstr` which are
 //!   not ported.
 
@@ -41,7 +41,7 @@ use crate::translator::rtyper::rtyper::{
     variable_with_lltype,
 };
 
-/// RPython `class FloatRepr(Repr)` (`rfloat.py:11-64`).
+/// RPython `class FloatRepr(Repr)` (`rfloat.py`).
 ///
 /// ```python
 /// class FloatRepr(Repr):
@@ -116,7 +116,7 @@ impl Repr for FloatRepr {
         super::pairtype::ReprClassId::FloatRepr
     }
 
-    /// RPython `FloatRepr.get_ll_eq_function(self)` (`rfloat.py:19`):
+    /// RPython `FloatRepr.get_ll_eq_function(self)` (`rfloat.py`):
     ///
     /// ```python
     /// def get_ll_eq_function(self):
@@ -133,7 +133,7 @@ impl Repr for FloatRepr {
         Ok(None)
     }
 
-    /// RPython `FloatRepr.get_ll_hash_function(self)` (`rfloat.py:26-27`):
+    /// RPython `FloatRepr.get_ll_hash_function(self)` (`rfloat.py`):
     ///
     /// ```python
     /// def get_ll_hash_function(self):
@@ -158,7 +158,7 @@ impl Repr for FloatRepr {
             .map(Some)
     }
 
-    /// RPython `FloatRepr.convert_const(self, value)` (`rfloat.py:14-17`):
+    /// RPython `FloatRepr.convert_const(self, value)` (`rfloat.py`):
     ///
     /// ```python
     /// def convert_const(self, value):
@@ -186,7 +186,7 @@ impl Repr for FloatRepr {
         ))
     }
 
-    /// RPython `FloatRepr.rtype_bool(_, hop)` (`rfloat.py:32-34`):
+    /// RPython `FloatRepr.rtype_bool(_, hop)` (`rfloat.py`):
     /// `return hop.genop('float_is_true', [v], resulttype=Bool)`.
     fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;
@@ -197,28 +197,28 @@ impl Repr for FloatRepr {
         ))
     }
 
-    /// RPython `FloatRepr.rtype_neg(_, hop)` (`rfloat.py:36-38`):
+    /// RPython `FloatRepr.rtype_neg(_, hop)` (`rfloat.py`):
     /// `return hop.genop('float_neg', [v], resulttype=Float)`.
     fn rtype_neg(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;
         Ok(hop.genop("float_neg", vlist, GenopResult::LLType(LowLevelType::Float)))
     }
 
-    /// RPython `FloatRepr.rtype_pos(_, hop)` (`rfloat.py:40-42`):
+    /// RPython `FloatRepr.rtype_pos(_, hop)` (`rfloat.py`):
     /// `return vlist[0]` — identity pass-through after inputargs coerces.
     fn rtype_pos(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;
         Ok(vlist.into_iter().next())
     }
 
-    /// RPython `FloatRepr.rtype_abs(_, hop)` (`rfloat.py:44-46`):
+    /// RPython `FloatRepr.rtype_abs(_, hop)` (`rfloat.py`):
     /// `return hop.genop('float_abs', [v], resulttype=Float)`.
     fn rtype_abs(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;
         Ok(hop.genop("float_abs", vlist, GenopResult::LLType(LowLevelType::Float)))
     }
 
-    /// RPython `FloatRepr.rtype_int(_, hop)` (`rfloat.py:48-53`):
+    /// RPython `FloatRepr.rtype_int(_, hop)` (`rfloat.py`):
     ///
     /// ```python
     /// def rtype_int(_, hop):
@@ -238,7 +238,7 @@ impl Repr for FloatRepr {
         ))
     }
 
-    /// RPython `FloatRepr.rtype_float(_, hop)` (`rfloat.py:55-58`):
+    /// RPython `FloatRepr.rtype_float(_, hop)` (`rfloat.py`):
     /// identity pass-through plus `exception_cannot_occur`.
     fn rtype_float(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;
@@ -247,13 +247,13 @@ impl Repr for FloatRepr {
     }
 }
 
-/// RPython `float_repr = FloatRepr()` (`rfloat.py:65`).
+/// RPython `float_repr = FloatRepr()` (`rfloat.py`).
 pub fn float_repr() -> Arc<FloatRepr> {
     static REPR: OnceLock<Arc<FloatRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(FloatRepr::new())).clone()
 }
 
-/// RPython `_hash_float(f)` (`rlib/objectmodel.py:623-647`):
+/// RPython `_hash_float(f)` (`rlib/objectmodel.py`):
 ///
 /// ```python
 /// def _hash_float(f):
@@ -850,7 +850,7 @@ pub(crate) fn build_ll_hash_float_helper_graph(name: &str) -> Result<PyGraph, Ty
 }
 
 // ____________________________________________________________
-// pairtype(FloatRepr, FloatRepr) — rfloat.py:75-135.
+// pairtype(FloatRepr, FloatRepr) — rfloat.py.
 
 pub fn rtype_template(hop: &HighLevelOp, func: &str) -> RTypeResult {
     let vlist = hop.inputargs(vec![
@@ -871,7 +871,7 @@ pub fn rtype_compare_template(hop: &HighLevelOp, func: &str) -> RTypeResult {
 }
 
 // ____________________________________________________________
-// SingleFloatRepr / LongFloatRepr — `rfloat.py:138-174`.
+// SingleFloatRepr / LongFloatRepr — `rfloat.py`.
 //
 // Upstream creates a fresh `SingleFloatRepr()` / `LongFloatRepr()` per
 // `rtyper_makerepr` call (no module-global singleton). Pyre mirrors by
@@ -879,7 +879,7 @@ pub fn rtype_compare_template(hop: &HighLevelOp, func: &str) -> RTypeResult {
 // in [`super::rmodel::rtyper_makerepr`] per SomeSingleFloat /
 // SomeLongFloat.
 
-/// RPython `class SingleFloatRepr(Repr)` (`rfloat.py:150-158`).
+/// RPython `class SingleFloatRepr(Repr)` (`rfloat.py`).
 #[derive(Debug)]
 pub struct SingleFloatRepr {
     state: ReprState,
@@ -938,7 +938,7 @@ impl Repr for SingleFloatRepr {
     }
 }
 
-/// RPython `class LongFloatRepr(Repr)` (`rfloat.py:166-174`).
+/// RPython `class LongFloatRepr(Repr)` (`rfloat.py`).
 #[derive(Debug)]
 pub struct LongFloatRepr {
     state: ReprState,
@@ -978,7 +978,7 @@ impl Repr for LongFloatRepr {
     }
 
     /// RPython `LongFloatRepr.rtype_float(self, hop)`
-    /// (`rfloat.py:169-174`): symmetrical to [`SingleFloatRepr::rtype_float`]
+    /// (`rfloat.py`): symmetrical to [`SingleFloatRepr::rtype_float`]
     /// but over `LongFloat → Float`.
     fn rtype_float(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::LongFloat)])?;
@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn float_repr_lowleveltype_and_repr_string_match_upstream() {
-        // rfloat.py:12 — `lowleveltype = Float`.
+        // rfloat.py — `lowleveltype = Float`.
         let r = FloatRepr::new();
         assert_eq!(r.lowleveltype(), &LowLevelType::Float);
         assert_eq!(r.repr_string(), "<FloatRepr Float>");
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn float_repr_singleton_returns_same_arc() {
-        // rfloat.py:65 — `float_repr = FloatRepr()` module-global.
+        // rfloat.py — `float_repr = FloatRepr()` module-global.
         let a = float_repr();
         let b = float_repr();
         assert!(Arc::ptr_eq(&a, &b));
@@ -1016,7 +1016,7 @@ mod tests {
 
     #[test]
     fn convert_const_accepts_int_float_bool() {
-        // rfloat.py:14-17 — `isinstance(value, (int, base_int, float))`
+        // rfloat.py — `isinstance(value, (int, base_int, float))`
         // admits all numeric kinds. Pyre normalises to `ConstValue::Float`.
         let r = FloatRepr::new();
         let c_int = r.convert_const(&ConstValue::Int(42)).unwrap();
@@ -1037,7 +1037,7 @@ mod tests {
         assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Float));
     }
 
-    /// rfloat.py:26-27 — `FloatRepr.get_ll_hash_function` returns
+    /// rfloat.py — `FloatRepr.get_ll_hash_function` returns
     /// `_hash_float`. The synthesized helper carries the Float→Signed
     /// signature and a 4-block CFG (start, not_finite, inf, finite).
     #[test]
@@ -1182,7 +1182,7 @@ mod tests {
                 "llong_or", // mantissa_bits = mantissa_unsigned | sign_bit
                 "convert_longlong_bytes_to_float",
                 "truncate_longlong_to_int", // expo
-                // _hash_float arithmetic (rlib/objectmodel.py:640-643).
+                // _hash_float arithmetic (rlib/objectmodel.py).
                 "float_mul",
                 "cast_float_to_int",
                 "cast_int_to_float",
@@ -1206,7 +1206,7 @@ mod tests {
 
     #[test]
     fn single_float_repr_lowleveltype_matches_upstream() {
-        // rfloat.py:151 — `lowleveltype = lltype.SingleFloat`.
+        // rfloat.py — `lowleveltype = lltype.SingleFloat`.
         let r = SingleFloatRepr::new();
         assert_eq!(r.lowleveltype(), &LowLevelType::SingleFloat);
         assert_eq!(r.repr_string(), "<SingleFloatRepr SingleFloat>");
@@ -1214,7 +1214,7 @@ mod tests {
 
     #[test]
     fn long_float_repr_lowleveltype_matches_upstream() {
-        // rfloat.py:167 — `lowleveltype = lltype.LongFloat`.
+        // rfloat.py — `lowleveltype = lltype.LongFloat`.
         let r = LongFloatRepr::new();
         assert_eq!(r.lowleveltype(), &LowLevelType::LongFloat);
         assert_eq!(r.repr_string(), "<LongFloatRepr LongFloat>");
@@ -1222,7 +1222,7 @@ mod tests {
 
     #[test]
     fn rtyper_getrepr_on_some_float_returns_the_singleton() {
-        // rfloat.py:67-69 — `SomeFloat.rtyper_makerepr` returns
+        // rfloat.py — `SomeFloat.rtyper_makerepr` returns
         // `float_repr` (module-global). Verify the full dispatch chain.
         use crate::annotator::model::{SomeFloat, SomeValue};
 
@@ -1239,7 +1239,7 @@ mod tests {
 
     #[test]
     fn rtyper_getrepr_on_some_single_float_allocates_per_call_repr() {
-        // rfloat.py:144-148 — `SomeSingleFloat.rtyper_makerepr`
+        // rfloat.py — `SomeSingleFloat.rtyper_makerepr`
         // returns `SingleFloatRepr()` (fresh per call — no module-
         // global singleton). But `getrepr` caches the first produced
         // instance per key, so two lookups return the same Arc.

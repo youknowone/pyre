@@ -26,7 +26,7 @@ use crate::value::{GcRef, Type, Value};
 /// flat encoding reuses the same raw position across InputArg / ResOp /
 /// Const namespaces. `ConstFloat` uses `f64::to_bits()` for
 /// equality, hashing, and ordering to mirror RPython `ConstFloat._get_hash_`
-/// / `same_constant` (history.py:283/292), where `0.0 != -0.0` and
+/// / `same_constant` (history.py/292), where `0.0 != -0.0` and
 /// `NaN == NaN` when their bit patterns agree. The `Ord`/`PartialOrd` impls
 /// (kept for `vecset::VecMap<OpRef, _>` sorted-Vec storage) lift the same
 /// bit-level total order over inline-f64 payloads.
@@ -35,25 +35,25 @@ pub enum OpRef {
     /// Sentinel for missing/absent reference; `OpRef::NONE` aliases this.
     /// RPython has no equivalent — missing values are Python `None`.
     None,
-    /// history.py:227 `ConstInt.value` carried inline as `i64`. Strict
+    /// history.py `ConstInt.value` carried inline as `i64`. Strict
     /// RPython parity: `Const{Int,Float,Ptr}.value` are inline value
     /// attributes on the Box class itself (history.py:227/268/314), no
     /// side-table lookup.
     ConstInt(i64),
-    /// history.py:268 `ConstFloat.value` carried inline as `f64`. See
+    /// history.py `ConstFloat.value` carried inline as `f64`. See
     /// `ConstInt`. Equality / Hash bitwise via `f64::to_bits()`
-    /// per RPython `_get_hash_` / `same_constant` (history.py:283/292).
+    /// per RPython `_get_hash_` / `same_constant` (history.py/292).
     ConstFloat(f64),
-    /// history.py:314 `ConstPtr.value` carried inline as `GcRef`. See
+    /// history.py `ConstPtr.value` carried inline as `GcRef`. See
     /// `ConstInt`. The inline `GcRef` lives directly in the `OpRef` and
     /// must be visited by the GC walker that traces the op-graph.
     ConstPtr(GcRef),
-    /// resoperation.py:719 `InputArgInt` — `type = 'i'`. Payload: input
+    /// resoperation.py `InputArgInt` — `type = 'i'`. Payload: input
     /// arg slot position.
     InputArgInt(u32),
-    /// resoperation.py:727 `InputArgFloat` — `type = 'f'`.
+    /// resoperation.py `InputArgFloat` — `type = 'f'`.
     InputArgFloat(u32),
-    /// resoperation.py:739 `InputArgRef` — `type = 'r'`.
+    /// resoperation.py `InputArgRef` — `type = 'r'`.
     InputArgRef(u32),
     /// `AbstractResOp` + `IntOp` mixin — `type = 'i'`. Payload: op
     /// result OpRef position.
@@ -62,7 +62,7 @@ pub enum OpRef {
     FloatOp(u32),
     /// `AbstractResOp` + `RefOp` mixin — `type = 'r'`.
     RefOp(u32),
-    /// `AbstractResOp` default — `type = 'v'` (resoperation.py:260).
+    /// `AbstractResOp` default — `type = 'v'` (resoperation.py).
     /// Void-result ops (SETFIELD_GC, GUARD_*, JUMP, …) carry no result
     /// type but still occupy an op position.
     VoidOp(u32),
@@ -93,7 +93,7 @@ impl PartialEq for OpRef {
             | (VoidOp(a), VoidOp(b))
             | (TempVar(a), TempVar(b)) => a == b,
             (ConstInt(a), ConstInt(b)) => a == b,
-            // history.py:292 ConstFloat.same_constant: bitwise compare
+            // history.py ConstFloat.same_constant: bitwise compare
             (ConstFloat(a), ConstFloat(b)) => a.to_bits() == b.to_bits(),
             (ConstPtr(a), ConstPtr(b)) => a.0 == b.0,
             _ => false,
@@ -117,7 +117,7 @@ impl std::hash::Hash for OpRef {
             | OpRef::VoidOp(x)
             | OpRef::TempVar(x) => x.hash(state),
             OpRef::ConstInt(v) => v.hash(state),
-            // history.py:283 ConstFloat._get_hash_: bitwise
+            // history.py ConstFloat._get_hash_: bitwise
             OpRef::ConstFloat(v) => v.to_bits().hash(state),
             OpRef::ConstPtr(v) => v.0.hash(state),
         }
@@ -166,7 +166,7 @@ impl OpRef {
     /// here a single high bit suffices (op vs const).
     const CONST_BIT: u32 = 1 << 31;
     /// Top of the u32 range reserved for `TempVar` (regalloc scratch)
-    /// OpRefs. RPython `TempVar()` (`backend/llsupport/regalloc.py:18-23`,
+    /// OpRefs. RPython `TempVar()` (`backend/llsupport/regalloc.py`,
     /// `__init__` body is `pass`, `__repr__` keys off `id(self)`) only
     /// carries Python object identity, so collision is structurally
     /// impossible upstream. pyre's flat-OpRef encoding cannot mint fresh
@@ -238,7 +238,7 @@ impl OpRef {
     /// `TempVar` also returns `None`: RPython's `TempVar`
     /// (`backend/llsupport/regalloc.py:18`) extends `AbstractResOpOrInputArg`
     /// without a `.type` attribute, and `_check_type` at
-    /// `regalloc.py:405-407` exempts it via `isinstance(v, TempVar)`. A
+    /// `regalloc.py` exempts it via `isinstance(v, TempVar)`. A
     /// `TempVar` reaching `.ty()` should fall through to the regalloc-side
     /// `is_temp_var()` exemption rather than masquerade as an integer box.
     pub fn ty(self) -> Option<Type> {
@@ -251,8 +251,8 @@ impl OpRef {
         }
     }
 
-    /// resoperation.py:47 `AbstractValue.is_constant()` returns False;
-    /// history.py:220 `Const.is_constant()` returns True. The
+    /// resoperation.py `AbstractValue.is_constant()` returns False;
+    /// history.py `Const.is_constant()` returns True. The
     /// dispatch is class-based — typed body variants
     /// (`IntOp/RefOp/FloatOp/VoidOp/InputArg*`) correspond to
     /// `AbstractValue` subclasses and are NOT constants.
@@ -323,17 +323,17 @@ impl OpRef {
     // construction entry points; the variant tag IS the RPython Box
     // class identity (history.py:182 / resoperation.py:29).
 
-    /// resoperation.py:719 `InputArgInt` — `type = 'i'`.
+    /// resoperation.py `InputArgInt` — `type = 'i'`.
     pub const fn input_arg_int(pos: u32) -> OpRef {
         OpRef::InputArgInt(pos)
     }
 
-    /// resoperation.py:727 `InputArgFloat` — `type = 'f'`.
+    /// resoperation.py `InputArgFloat` — `type = 'f'`.
     pub const fn input_arg_float(pos: u32) -> OpRef {
         OpRef::InputArgFloat(pos)
     }
 
-    /// resoperation.py:739 `InputArgRef` — `type = 'r'`.
+    /// resoperation.py `InputArgRef` — `type = 'r'`.
     pub const fn input_arg_ref(pos: u32) -> OpRef {
         OpRef::InputArgRef(pos)
     }
@@ -353,7 +353,7 @@ impl OpRef {
         OpRef::RefOp(pos)
     }
 
-    /// `AbstractResOp` default — `type = 'v'` (resoperation.py:260).
+    /// `AbstractResOp` default — `type = 'v'` (resoperation.py).
     pub const fn void_op(pos: u32) -> OpRef {
         OpRef::VoidOp(pos)
     }
@@ -376,7 +376,7 @@ impl OpRef {
 
     /// Integer value of an Int-typed constant — `ConstInt.getint()`
     /// (history.py:240). Returns `None` for every non-Int operand:
-    /// `ConstFloat` / `ConstPtr` have no `getint` (history.py:268/314).
+    /// `ConstFloat` / `ConstPtr` have no `getint` (history.py/314).
     ///
     /// Unlike `inline_const_bits`, this rejects `ConstFloat` and
     /// `ConstPtr`. Use it where the operand is statically an
@@ -452,7 +452,7 @@ impl OpRef {
     /// RPython `TempVar()` / `TempInt()` parity
     /// (`rpython/jit/backend/llsupport/regalloc.py:18-23`,
     /// `x86/regalloc.py:470,514,521,605`,
-    /// `aarch64/regalloc.py:990`). Upstream `TempVar.__init__` is
+    /// `aarch64/regalloc.py`). Upstream `TempVar.__init__` is
     /// `pass`, so each instance is a fresh Python object with unique
     /// `id(self)` identity and collision is structurally impossible.
     /// pyre's flat-OpRef encoding emulates that by minting a unique
@@ -482,13 +482,13 @@ impl OpRef {
         matches!(self, Self::TempVar(_))
     }
 
-    /// `resoperation.py:38 AbstractValue.same_box(other)` plus the
-    /// `Const.same_box` override (history.py:211 → `same_constant`). A flat
+    /// `resoperation.py AbstractValue.same_box(other)` plus the
+    /// `Const.same_box` override (history.py → `same_constant`). A flat
     /// `OpRef` is a tagged handle and `==` compares variant + payload, so a
     /// single `==` already covers both: for non-Const variants it is
     /// position equality (the base `self is other`), and for
     /// `Const{Int,Float,Ptr}` it is inline value equality
-    /// (`Const.same_constant`, including history.py:292 bitwise float so
+    /// (`Const.same_constant`, including history.py bitwise float so
     /// `0.0 != -0.0`). This is the explicit API name so callers don't reach
     /// for `==`.
     ///
@@ -504,7 +504,7 @@ impl OpRef {
     /// Re-encode this OpRef's variant with a fresh raw payload while
     /// preserving the type tag. Used by post-optimization remaps that
     /// renumber positions but keep RPython's `box.type` attached
-    /// (history.py:802 record_same_as parity, where the remapped Box
+    /// (history.py record_same_as parity, where the remapped Box
     /// inherits the source Box's `.type`).
     ///
     /// `None` round-trips to `None` regardless of `new_raw`.
@@ -534,23 +534,23 @@ impl OpRef {
     // attributes on the Box class (history.py:227/268/314). These
     // factories mint an OpRef variant carrying the value directly.
 
-    /// history.py:227 `ConstInt.value: int` carried inline.
+    /// history.py `ConstInt.value: int` carried inline.
     pub const fn const_int(v: i64) -> OpRef {
         OpRef::ConstInt(v)
     }
 
-    /// history.py:268 `ConstFloat.value: float` carried inline.
+    /// history.py `ConstFloat.value: float` carried inline.
     pub const fn const_float(v: f64) -> OpRef {
         OpRef::ConstFloat(v)
     }
 
-    /// history.py:314 `ConstPtr.value: gcref` carried inline.
+    /// history.py `ConstPtr.value: gcref` carried inline.
     pub const fn const_ptr(v: GcRef) -> OpRef {
         OpRef::ConstPtr(v)
     }
 
     /// Mint an inline-Const OpRef from a `Value` per RPython
-    /// `history.py:227/268/314` Const{Int,Float,Ptr}.value (the value
+    /// `history.py/268/314` Const{Int,Float,Ptr}.value (the value
     /// lives inline on the Box). `Value::Void` panics — RPython has no
     /// `ConstVoid` (resoperation.py defines Const subclasses only for
     /// Int/Float/Ref).
@@ -597,23 +597,23 @@ impl OpRef {
 // disjoint `Const` / `InputArg` / `ResOp` sub-hierarchies
 // (resoperation.py:29, history.py:182): two variants compare unequal
 // even when raw payloads coincide (`ConstInt(x) != ConstFloat(x) !=
-// IntOp(x)`). Mirrors `AbstractValue.same_box` (resoperation.py:38
-// `self is other`) and `ConstInt.same_constant` (history.py:244).
+// IntOp(x)`). Mirrors `AbstractValue.same_box` (resoperation.py
+// `self is other`) and `ConstInt.same_constant` (history.py).
 
-/// AbstractValue parity: rpython/jit/metainterp/resoperation.py:29
+/// AbstractValue parity: rpython/jit/metainterp/resoperation.py
 /// + history.py:182.
 ///
 /// RPython's `AbstractValue` is the root of the value hierarchy that
 /// carries `type` ('i' / 'r' / 'f') as a class-level constant. The
 /// concrete subclasses split into three families:
 ///
-/// 1. **`Const` family** (history.py:220 `ConstInt`, history.py:261
-///    `ConstFloat`, history.py:307 `ConstPtr`).
-/// 2. **`AbstractInputArg` family** (resoperation.py:719 `InputArgInt`,
-///    resoperation.py:727 `InputArgFloat`, resoperation.py:739
+/// 1. **`Const` family** (history.py `ConstInt`, history.py
+///    `ConstFloat`, history.py `ConstPtr`).
+/// 2. **`AbstractInputArg` family** (resoperation.py `InputArgInt`,
+///    resoperation.py `InputArgFloat`, resoperation.py
 ///    `InputArgRef`).
-/// 3. **`AbstractResOp`** (resoperation.py:250) mixed with one of the
-///    `IntOp` / `FloatOp` / `RefOp` mixins (resoperation.py:564-638) —
+/// 3. **`AbstractResOp`** (resoperation.py) mixed with one of the
+///    `IntOp` / `FloatOp` / `RefOp` mixins (resoperation.py) —
 ///    every concrete ResOp subclass picks up its `type` attribute via
 ///    one of these three mixins.
 ///
@@ -633,18 +633,18 @@ impl OpRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AbstractValue {
     None,
-    /// history.py:220 `ConstInt` — `type = 'i'`.
+    /// history.py `ConstInt` — `type = 'i'`.
     ConstInt(u32),
-    /// history.py:261 `ConstFloat` — `type = 'f'`.
+    /// history.py `ConstFloat` — `type = 'f'`.
     ConstFloat(u32),
-    /// history.py:307 `ConstPtr` — `type = 'r'`.
+    /// history.py `ConstPtr` — `type = 'r'`.
     ConstPtr(u32),
-    /// resoperation.py:719 `InputArgInt` — `type = 'i'`. Payload: input
+    /// resoperation.py `InputArgInt` — `type = 'i'`. Payload: input
     /// arg slot position.
     InputArgInt(u32),
-    /// resoperation.py:727 `InputArgFloat` — `type = 'f'`.
+    /// resoperation.py `InputArgFloat` — `type = 'f'`.
     InputArgFloat(u32),
-    /// resoperation.py:739 `InputArgRef` — `type = 'r'`.
+    /// resoperation.py `InputArgRef` — `type = 'r'`.
     InputArgRef(u32),
     /// `AbstractResOp` + `IntOp` mixin — `type = 'i'`. Payload: op
     /// result OpRef position.
@@ -653,7 +653,7 @@ pub enum AbstractValue {
     FloatOp(u32),
     /// `AbstractResOp` + `RefOp` mixin — `type = 'r'`.
     RefOp(u32),
-    /// `AbstractResOp` default — `type = 'v'` (resoperation.py:260).
+    /// `AbstractResOp` default — `type = 'v'` (resoperation.py).
     /// Void-result ops (SETFIELD_GC, GUARD_*, JUMP, …).
     VoidOp(u32),
 }
@@ -717,7 +717,7 @@ impl AbstractValue {
 /// resume.py:576-860: virtual object serialization for rd_virtuals.
 ///
 /// Each variant corresponds to a concrete virtual type in RPython's
-/// resume.py:591-593 AbstractVirtualStructInfo.fielddescrs parity.
+/// resume.py AbstractVirtualStructInfo.fielddescrs parity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldDescrInfo {
     pub index: u32,
@@ -728,23 +728,23 @@ pub struct FieldDescrInfo {
 
 /// Serializable snapshot of an ArrayDescr.
 ///
-/// RPython's resume.py:692 VRawBufferInfo carries live ArrayDescr objects,
+/// RPython's resume.py VRawBufferInfo carries live ArrayDescr objects,
 /// but we cannot put `Arc<dyn Descr>` in the IR serialization boundary.
-/// This captures the fields needed by `_descrs_are_compatible()` (rawbuffer.py:83)
-/// and `setrawbuffer_item()` dispatch (resume.py:1543).
+/// This captures the fields needed by `_descrs_are_compatible()` (rawbuffer.py)
+/// and `setrawbuffer_item()` dispatch (resume.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArrayDescrInfo {
     /// Descriptor registry index.
     pub index: u32,
-    /// descr.py:273 ArrayDescr.basesize.
+    /// descr.py ArrayDescr.basesize.
     pub base_size: usize,
-    /// descr.py:274 ArrayDescr.itemsize.
+    /// descr.py ArrayDescr.itemsize.
     pub item_size: usize,
     /// Item type: 0=ref, 1=int, 2=float.
     pub item_type: u8,
-    /// descr.py:241-254 FLAG_SIGNED.
+    /// descr.py FLAG_SIGNED.
     pub is_signed: bool,
-    /// descr.py:277 / descr.py:359-362 — `ArrayDescr.lendescr.offset`.
+    /// descr.py / descr.py — `ArrayDescr.lendescr.offset`.
     /// `None` for the `nolength=True` shape (raw buffers); `Some(off)`
     /// for length-prefixed `Ptr(GcArray(T))`. Carries the live offset
     /// across the resume/materialization summary boundary so backends
@@ -755,7 +755,7 @@ pub struct ArrayDescrInfo {
 /// AbstractVirtualInfo hierarchy (VirtualInfo, VStructInfo, VArrayInfo, etc.).
 #[derive(Clone, Debug)]
 pub enum RdVirtualInfo {
-    /// resume.py:612 VirtualInfo(descr, fielddescrs).
+    /// resume.py VirtualInfo(descr, fielddescrs).
     VirtualInfo {
         /// resume.py:615 self.descr — live SizeDescr reference.
         descr: Option<crate::DescrRef>,
@@ -766,7 +766,7 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
         descr_size: usize,
     },
-    /// resume.py:628 VStructInfo(typedescr, fielddescrs).
+    /// resume.py VStructInfo(typedescr, fielddescrs).
     VStructInfo {
         /// resume.py:631 self.typedescr — live SizeDescr reference.
         typedescr: Option<crate::DescrRef>,
@@ -776,7 +776,7 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
         descr_size: usize,
     },
-    /// resume.py:680: VArrayInfoClear (clear=True)
+    /// resume.py: VArrayInfoClear (clear=True)
     VArrayInfoClear {
         /// resume.py:646 self.arraydescr — live ArrayDescr reference.
         arraydescr: Option<crate::DescrRef>,
@@ -784,7 +784,7 @@ pub enum RdVirtualInfo {
         kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
         fieldnums: Vec<i16>,
     },
-    /// resume.py:683: VArrayInfoNotClear (clear=False)
+    /// resume.py: VArrayInfoNotClear (clear=False)
     VArrayInfoNotClear {
         /// resume.py:646 self.arraydescr — live ArrayDescr reference.
         arraydescr: Option<crate::DescrRef>,
@@ -792,7 +792,7 @@ pub enum RdVirtualInfo {
         kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
         fieldnums: Vec<i16>,
     },
-    /// resume.py:736: VArrayStructInfo
+    /// resume.py: VArrayStructInfo
     VArrayStructInfo {
         /// resume.py:739 self.arraydescr — live ArrayDescr reference.
         arraydescr: Option<crate::DescrRef>,
@@ -804,7 +804,7 @@ pub enum RdVirtualInfo {
         /// resume.py:757: fielddescrs[j].is_pointer_field/is_float_field dispatch.
         /// Per-field type within each element: 0=ref, 1=int, 2=float.
         field_types: Vec<u8>,
-        /// descr.py:273 ArrayDescr.basesize — fixed header before array items.
+        /// descr.py ArrayDescr.basesize — fixed header before array items.
         base_size: usize,
         /// llmodel.py:648: arraydescr.itemsize — bytes per struct element.
         item_size: usize,
@@ -814,7 +814,7 @@ pub enum RdVirtualInfo {
         field_sizes: Vec<usize>,
         fieldnums: Vec<i16>,
     },
-    /// resume.py:692: VRawBufferInfo(func, size, offsets, descrs)
+    /// resume.py: VRawBufferInfo(func, size, offsets, descrs)
     VRawBufferInfo {
         /// resume.py:695: self.func — raw malloc function pointer.
         func: i64,
@@ -829,19 +829,19 @@ pub enum RdVirtualInfo {
         descrs: Vec<ArrayDescrInfo>,
         fieldnums: Vec<i16>,
     },
-    /// resume.py:717: VRawSliceInfo
+    /// resume.py: VRawSliceInfo
     VRawSliceInfo {
         /// info.py:460: signed slice base — `optimize_INT_ADD` folds the
         /// addend as a signed `getint()`.
         offset: i64,
         fieldnums: Vec<i16>,
     },
-    /// resume.py:763 `VStrPlainInfo` — virtual byte-string built from
+    /// resume.py `VStrPlainInfo` — virtual byte-string built from
     /// character fieldnums. `fieldnums` length = string length.
     VStrPlainInfo {
         fieldnums: Vec<i16>,
     },
-    /// resume.py:781 `VStrConcatInfo` — virtual concatenation of two
+    /// resume.py `VStrConcatInfo` — virtual concatenation of two
     /// strings. `fieldnums = [left, right]`. The OS_STR_CONCAT funcptr
     /// is resolved at materialization time via
     /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
@@ -849,27 +849,27 @@ pub enum RdVirtualInfo {
     VStrConcatInfo {
         fieldnums: Vec<i16>,
     },
-    /// resume.py:801 `VStrSliceInfo` — virtual slice of a larger string.
+    /// resume.py `VStrSliceInfo` — virtual slice of a larger string.
     /// `fieldnums = [largerstr, start, length]` (pyre stores `length`;
     /// the backend reader converts to RPython's `(start, start + length)`
     /// before calling the OS_STR_SLICE funcptr — see
-    /// `resume.py:1479` and `resume.rs::ResumeDataDirectReader::slice_string`).
+    /// `resume.py` and `resume.rs::ResumeDataDirectReader::slice_string`).
     /// OS_STR_SLICE funcptr is resolved via callinfocollection at
     /// materialization time.
     VStrSliceInfo {
         fieldnums: Vec<i16>,
     },
-    /// resume.py:817 `VUniPlainInfo` — unicode counterpart of VStrPlain.
+    /// resume.py `VUniPlainInfo` — unicode counterpart of VStrPlain.
     VUniPlainInfo {
         fieldnums: Vec<i16>,
     },
-    /// resume.py:836 `VUniConcatInfo` — unicode counterpart of VStrConcat.
+    /// resume.py `VUniConcatInfo` — unicode counterpart of VStrConcat.
     /// OS_UNI_CONCAT funcptr is resolved via callinfocollection at
     /// materialization time.
     VUniConcatInfo {
         fieldnums: Vec<i16>,
     },
-    /// resume.py:856 `VUniSliceInfo` — unicode counterpart of `VStrSlice`
+    /// resume.py `VUniSliceInfo` — unicode counterpart of `VStrSlice`
     /// (same length-vs-stop convention; backend reader adds
     /// `start + length` before calling the OS_UNI_SLICE funcptr).
     /// OS_UNI_SLICE funcptr is resolved via callinfocollection at
@@ -1052,7 +1052,7 @@ impl PartialEq for RdVirtualInfo {
 impl Eq for RdVirtualInfo {}
 
 impl RdVirtualInfo {
-    /// resume.py:584-585 `AbstractVirtualInfo.set_content` stores `fieldnums`
+    /// resume.py `AbstractVirtualInfo.set_content` stores `fieldnums`
     /// onto every concrete vinfo. This accessor exposes that per-variant
     /// field for `equals` / caching.
     pub fn fieldnums(&self) -> Option<&[i16]> {
@@ -1074,27 +1074,27 @@ impl RdVirtualInfo {
         }
     }
 
-    /// resume.py:581-582 `AbstractVirtualInfo.equals(fieldnums)`:
+    /// resume.py `AbstractVirtualInfo.equals(fieldnums)`:
     ///
     /// ```python
     /// def equals(self, fieldnums):
     ///     return tagged_list_eq(self.fieldnums, fieldnums)
     /// ```
     ///
-    /// Used by `ResumeDataVirtualAdder.make_virtual_info` (resume.py:310)
+    /// Used by `ResumeDataVirtualAdder.make_virtual_info` (resume.py)
     /// to decide whether a cached `_cached_vinfo` can be reused verbatim.
     pub fn equals(&self, other_fieldnums: &[i16]) -> bool {
         self.fieldnums().is_some_and(|fns| fns == other_fieldnums)
     }
 
-    /// resume.py:584-585 `AbstractVirtualInfo.set_content(fieldnums)`:
+    /// resume.py `AbstractVirtualInfo.set_content(fieldnums)`:
     ///
     /// ```python
     /// def set_content(self, fieldnums):
     ///     self.fieldnums = fieldnums
     /// ```
     ///
-    /// Called by `ResumeDataVirtualAdder.make_virtual_info` (resume.py:313)
+    /// Called by `ResumeDataVirtualAdder.make_virtual_info` (resume.py)
     /// after `info.visitor_dispatch_virtual_type(self)` produced a fresh
     /// vinfo — the visitor constructs the variant without fieldnums,
     /// and this method stores the caller-supplied `fieldnums` onto it
@@ -1119,7 +1119,7 @@ impl RdVirtualInfo {
     }
 }
 
-/// resume.py:87-92 PENDINGFIELDSTRUCT parity: a deferred
+/// resume.py PENDINGFIELDSTRUCT parity: a deferred
 /// SETFIELD_GC/SETARRAYITEM_GC where the stored value is virtual.
 /// Encoded into the guard's resume data and replayed on guard failure
 /// after virtual materialization.
@@ -1140,10 +1140,10 @@ pub struct GuardPendingFieldEntry {
     pub target: OpRef,
     /// OpRef of the value being stored (compile-time SSA position).
     pub value: OpRef,
-    /// resume.py:89 `num` — tagged target (TAGBOX/TAGCONST/TAGVIRTUAL).
+    /// resume.py `num` — tagged target (TAGBOX/TAGCONST/TAGVIRTUAL).
     /// Set by store_final_boxes_in_guard when resume numbering is available.
     pub target_tagged: i16,
-    /// resume.py:90 `fieldnum` — tagged value (TAGBOX/TAGCONST/TAGVIRTUAL).
+    /// resume.py `fieldnum` — tagged value (TAGBOX/TAGCONST/TAGVIRTUAL).
     pub value_tagged: i16,
 }
 
@@ -1162,14 +1162,14 @@ pub struct VirtualFieldsInfo {
     pub field_oprefs: Vec<OpRef>,
 }
 
-/// resume.py:192-226 parity: box environment for _number_boxes.
+/// resume.py parity: box environment for _number_boxes.
 ///
 /// Abstracts the operations RPython performs on boxes during snapshot
 /// numbering. Used by ResumeDataLoopMemo.number() to tag each box.
 pub trait BoxEnv {
     /// resume.py:202 — box.get_box_replacement()
     fn get_box_replacement(&self, opref: OpRef) -> OpRef;
-    /// resoperation.py:58 get_box_replacement(not_const=True) — walk
+    /// resoperation.py get_box_replacement(not_const=True) — walk
     /// forwarding chains but stop before stepping into a Const target.
     ///
     /// Used after resume numbering has already classified Const boxes as
@@ -1210,7 +1210,7 @@ pub trait BoxEnv {
     fn has_known_class(&self, _opref: OpRef) -> bool {
         false
     }
-    /// resume.py:307-315 make_virtual_info(info, fieldnums) parity.
+    /// resume.py make_virtual_info(info, fieldnums) parity.
     ///
     /// Creates an `RdVirtualInfo` for a virtual OpRef with given fieldnums.
     /// Dispatches on the virtual type (Virtual, VStruct, VArray, etc.)
@@ -1237,7 +1237,7 @@ pub trait BoxEnv {
 ///
 /// Mirrors RPython's object-identity model: `resoperation.py:250
 /// AbstractResOp` instances are plain Python objects, so every consumer
-/// (`history.py:528 TreeLoop.operations`, `optimizer.py:562 trace.next()`,
+/// (`history.py TreeLoop.operations`, `optimizer.py:562 trace.next()`,
 /// short preamble export, resume metadata, backend input lists) reaches
 /// the **same** ResOperation object and reads/writes `_forwarded`
 /// through that shared identity.  Pyre's analog: every consumer holds
@@ -1251,7 +1251,7 @@ pub type OpRc = std::rc::Rc<Op>;
 
 /// A single IR operation.
 ///
-/// Mirrors `rpython/jit/metainterp/resoperation.py:250` `AbstractResOp`.
+/// Mirrors `rpython/jit/metainterp/resoperation.py` `AbstractResOp`.
 /// The `_forwarded` slot (`resoperation.py:233-242
 /// AbstractResOpOrInputArg._forwarded`) lives directly on this struct in
 /// the [`forwarded`](Op::forwarded) field, matching RPython's
@@ -1260,7 +1260,7 @@ pub type OpRc = std::rc::Rc<Op>;
 #[derive(Debug)]
 pub struct Op {
     pub opcode: OpCode,
-    /// `resoperation.py:281 AbstractResOp` operand list. `RefCell` so
+    /// `resoperation.py AbstractResOp` operand list. `RefCell` so
     /// `setarg` / `initarglist` can mutate through a shared `Op` reached
     /// via `Rc<Op>` — RPython writes
     /// `op._args[i] = ...` on the same Python object the trace list,
@@ -1273,7 +1273,7 @@ pub struct Op {
     /// position-only operand is never stored — that would be a #9 contract
     /// violation.
     pub args: std::cell::RefCell<SmallVec<[Operand; 3]>>,
-    /// `resoperation.py:460 ResOpWithDescr._descr` parity.  `RefCell`
+    /// `resoperation.py ResOpWithDescr._descr` parity.  `RefCell`
     /// so the optimizer can stamp a descr onto a shared `Op` reached
     /// through `Rc<Op>`: RPython's
     /// `op.setdescr(...)` writes through the same slot every observer
@@ -1284,7 +1284,7 @@ pub struct Op {
     /// (the trace-iterator finalizer and unroll's resume-position
     /// retargeting both mutate `pos` after construction).
     pub pos: std::cell::Cell<OpRef>,
-    /// resoperation.py:1693 `opclasses[opnum].type` parity (Box.type intrinsic).
+    /// resoperation.py `opclasses[opnum].type` parity (Box.type intrinsic).
     /// Mirrors RPython's `op.type` class attribute set by `optypes[opnum]`
     /// (`resoperation.py:1597`). Populated at construction from
     /// `opcode.result_type()`. Replaces side-table `value_types: HashMap<u32, Type>`.
@@ -1318,9 +1318,9 @@ pub struct Op {
     /// shared-trace identity model from `Vec<Rc<Op>>`) can update the
     /// slot without requiring `&mut Op`.
     pub rd_resume_position: std::cell::Cell<i32>,
-    /// resoperation.py:111-115 `VecOperationNew.__init__` stores
+    /// resoperation.py `VecOperationNew.__init__` stores
     /// `datatype` / `bytesize` / `signed` / `count` on the op instance
-    /// itself. `resoperation.py:511-518 copy_and_change` propagates them
+    /// itself. `resoperation.py copy_and_change` propagates them
     /// across rewrites. The slot lives on every `Op` (not only on
     /// vector ops) because pyre collapses the upstream
     /// `VectorOp`/`VectorGuardOp` subclasses into the same struct;
@@ -1328,14 +1328,14 @@ pub struct Op {
     /// `op.bytesize = ...` overwrite in `VecOperation.__init__`.
     pub vecinfo: std::cell::RefCell<Option<std::boxed::Box<VectorizationInfo>>>,
 
-    /// `resoperation.py:233-242 AbstractResOpOrInputArg._forwarded` parity
+    /// `resoperation.py AbstractResOpOrInputArg._forwarded` parity
     /// slot — the canonical forwarding host for a bound ResOp box.
     /// `Forwarded::None` until a writer sets it; `set_forwarded_*`
     /// on a bound box routes here, and `get_forwarded` reads it back.
     pub forwarded: std::cell::RefCell<crate::forwarding::Forwarded>,
 
-    /// `resoperation.py:566 IntOp._resint` / `:582 FloatOp._resfloat` /
-    /// `:612 RefOp._resref` parity (`history.py:803-807 *FrontendOp(pos,
+    /// `resoperation.py IntOp._resint` / `:582 FloatOp._resfloat` /
+    /// `:612 RefOp._resref` parity (`history.py *FrontendOp(pos,
     /// value)`) — the concrete runtime value stamped onto this op
     /// identity at execute-time. The canonical per-identity concrete
     /// carrier for a bound ResOp box; the `get_value`/`set_value`
@@ -1347,10 +1347,10 @@ pub struct Op {
 
 impl Clone for Op {
     /// Cloning produces a fresh-identity `Op`. The `_forwarded` slot
-    /// (`resoperation.py:233-242 AbstractResOpOrInputArg._forwarded`) is
+    /// (`resoperation.py AbstractResOpOrInputArg._forwarded`) is
     /// per-instance mutable state tied to that identity, and RPython
     /// resets it for every newly-constructed `ResOperation`
-    /// (`resoperation.py:243-247 __init__`). Preserve identity-shared
+    /// (`resoperation.py __init__`). Preserve identity-shared
     /// forwarding via `Rc::clone` on `OpRc` instead.
     fn clone(&self) -> Self {
         Op {
@@ -1362,7 +1362,7 @@ impl Clone for Op {
             fail_args: std::cell::RefCell::new(self.fail_args.borrow().clone()),
             fail_arg_types: std::cell::RefCell::new(self.fail_arg_types.borrow().clone()),
             rd_resume_position: std::cell::Cell::new(self.rd_resume_position.get()),
-            // resoperation.py:511-518 VectorOp/VectorGuardOp.copy_and_change
+            // resoperation.py VectorOp/VectorGuardOp.copy_and_change
             // copies datatype/bytesize/signed/count from the source.
             vecinfo: std::cell::RefCell::new(self.vecinfo.borrow().clone()),
             forwarded: std::cell::RefCell::new(Forwarded::None),
@@ -1396,7 +1396,7 @@ impl VectorizationInfo {
         }
     }
 
-    /// resoperation.py:163-169 `VectorizationInfo(op)` for Const/InputArg
+    /// resoperation.py `VectorizationInfo(op)` for Const/InputArg
     /// and the default result-type branch for regular ops.
     pub fn from_type(tp: Type) -> Self {
         let mut info = VectorizationInfo::new();
@@ -1404,7 +1404,7 @@ impl VectorizationInfo {
         info
     }
 
-    /// resoperation.py:214-230: setinfo — normalize bytesize by datatype.
+    /// resoperation.py: setinfo — normalize bytesize by datatype.
     pub fn setinfo(&mut self, datatype: char, bytesize: i8, signed: bool) {
         self.datatype = datatype;
         self.bytesize = if bytesize == -1 {
@@ -1538,20 +1538,20 @@ impl Op {
     }
 
     /// Read the concrete runtime value stamped on this op identity
-    /// (`history.py:680 *FrontendOp.getint()` for the `_resint`/
+    /// (`history.py *FrontendOp.getint()` for the `_resint`/
     /// `_resfloat`/`_resref` slot). `None` until a writer stamps it.
     pub fn get_value(&self) -> Option<crate::value::Value> {
         self.value.get()
     }
 
     /// Stamp the concrete runtime value on this op identity
-    /// (`history.py:803 *FrontendOp(pos, value)`).
+    /// (`history.py *FrontendOp(pos, value)`).
     pub fn set_value(&self, v: crate::value::Value) {
         self.value.set(Some(v));
     }
 
-    /// resoperation.py:323-334 AbstractResOp.copy_and_change +
-    /// resoperation.py:498-503 GuardResOp.copy_and_change parity.
+    /// resoperation.py AbstractResOp.copy_and_change +
+    /// resoperation.py GuardResOp.copy_and_change parity.
     ///
     /// "shallow copy: the returned operation is meant to be used in place
     /// of self". For guard ops, copies fail_args AND rd_resume_position.
@@ -1585,7 +1585,7 @@ impl Op {
             fail_args: std::cell::RefCell::new(None),
             fail_arg_types: std::cell::RefCell::new(None),
             rd_resume_position: std::cell::Cell::new(-1),
-            // resoperation.py:511-518 VectorGuardOp.copy_and_change +
+            // resoperation.py VectorGuardOp.copy_and_change +
             // :534-541 VectorOp.copy_and_change propagate
             // datatype/bytesize/signed/count from self. Scalar ops keep
             // `self.vecinfo` as `None`, so the clone is a no-op for them.
@@ -1593,7 +1593,7 @@ impl Op {
             forwarded: std::cell::RefCell::new(Forwarded::None),
             value: std::cell::Cell::new(None),
         };
-        // resoperation.py:498-503 GuardResOp.copy_and_change:
+        // resoperation.py GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
         //   newop.rd_resume_position = self.rd_resume_position
         // The check is on opcode.is_guard() because in RPython this lives
@@ -1632,10 +1632,10 @@ impl Op {
     // `impl FnOnce` parameter types).
     /// compile.py: ResumeGuardDescr.store_final_boxes(guard_op, boxes, metainterp_sd)
     ///   guard_op.setfailargs(boxes)
-    /// compile.py:874-876 store_final_boxes
+    /// compile.py store_final_boxes
     pub fn store_final_boxes(&self, boxes: Vec<Operand>) {
         // optimizer.py:745-749: check no duplicates (debug only).
-        // history.py:213/251 — `Const.same_constant` defines Const equality
+        // history.py/251 — `Const.same_constant` defines Const equality
         // by value (e.g. `ConstInt(7) == ConstInt(7)`), not identity. The
         // duplicate detector uses `Operand::same_box` (ptr identity for
         // bound producers, `same_constant` for inline-Const operands), matching
@@ -1659,7 +1659,7 @@ impl Op {
 
 impl std::fmt::Display for Op {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // history.py:227/268/314 — Const operands carry their value inline.
+        // history.py/268/314 — Const operands carry their value inline.
         // Render those via `const_value()`; bound ResOp / InputArg operands
         // render as `v<pos>` from their producer position; `None` renders
         // as `_`.
@@ -1748,7 +1748,7 @@ pub fn format_trace<V: std::fmt::Debug, T: AsRef<Op>, C: ConstLookup<V>>(
     constants: &C,
 ) -> String {
     use std::fmt::Write;
-    // history.py:227/268/314 — inline-Const variants carry their value
+    // history.py/268/314 — inline-Const variants carry their value
     // directly; render via accessors instead of `.raw()` (which panics
     // on inline-Const). Body-namespace OpRefs continue to render via
     // raw position with constants-map lookup.
@@ -1863,7 +1863,7 @@ pub enum OpCode {
     IntMul,
     UintMulHigh,
     /// `int_floordiv` / `int_mod`: the C-truncating division primitives, as
-    /// `support.py:255-271 _ll_2_int_floordiv` / `_ll_2_int_mod` define them —
+    /// `support.py _ll_2_int_floordiv` / `_ll_2_int_mod` define them —
     /// the quotient rounds toward zero and the remainder carries the
     /// dividend's sign. Python's floor forms are separate: they reach the
     /// optimizer as the `int_py_div` / `int_py_mod` oopspec calls that
@@ -2181,7 +2181,7 @@ impl OpCode {
     }
 
     /// Safe reverse of `as_u16` — bounds-checked conversion used by the
-    /// byte-stream `ByteTraceIter` (opencoder.py:362-406 `next()` reads the
+    /// byte-stream `ByteTraceIter` (opencoder.py `next()` reads the
     /// opnum byte and looks it up in the `OP_*` registry; in RPython this
     /// is the `opnum` → class-table mapping). Returns `None` when `n`
     /// lies outside the defined `0..OPCODE_COUNT` range.
@@ -2238,7 +2238,7 @@ impl OpCode {
         (CALL_FIRST..=CALL_LAST).contains(&n)
     }
 
-    /// resoperation.py:1434 `OpHelpers.is_real_call`.
+    /// resoperation.py `OpHelpers.is_real_call`.
     pub fn is_real_call(self) -> bool {
         matches!(
             self,
@@ -2270,7 +2270,7 @@ impl OpCode {
         RAW_STORE_FIRST < n && n < RAW_STORE_LAST
     }
 
-    /// resoperation.py:1486-1491 `is_primitive_load` / `is_primitive_store`.
+    /// resoperation.py `is_primitive_load` / `is_primitive_store`.
     /// Same opcode range as `is_raw_load` / `is_raw_store` (the upstream
     /// `_RAW_LOAD_FIRST` / `_RAW_LOAD_LAST` bracket — `is_primitive_*` and
     /// `is_raw_*` are the same predicate spelled twice).
@@ -2282,7 +2282,7 @@ impl OpCode {
         self.is_raw_store()
     }
 
-    /// resoperation.py:407-417 `AbstractResOp.is_primitive_array_access`
+    /// resoperation.py `AbstractResOp.is_primitive_array_access`
     /// — opcode side of the check. The descr side
     /// (`descr.is_array_of_primitives()`) must still be tested by the
     /// caller because `Op.descr` lives outside `OpCode`.
@@ -2290,9 +2290,9 @@ impl OpCode {
         self.is_primitive_load() || self.is_primitive_store()
     }
 
-    /// resoperation.py:644-696 `CastOp`/`SignExtOp` mixin attachment
+    /// resoperation.py `CastOp`/`SignExtOp` mixin attachment
     /// (`resoperation.py:1682-1685`). Returns true exactly for the opcodes
-    /// in `_cast_ops` (`resoperation.py:1177-1188`).
+    /// in `_cast_ops` (`resoperation.py`).
     pub fn is_typecast(self) -> bool {
         matches!(
             self,
@@ -2309,9 +2309,9 @@ impl OpCode {
         )
     }
 
-    /// resoperation.py:434-435 `CastOp.cast_types`. Returns
+    /// resoperation.py `CastOp.cast_types`. Returns
     /// `(cls_casts[0], cls_casts[2])` — the (from_type, to_type) pair from
-    /// `_cast_ops` (`resoperation.py:1177-1188`). Defaults to `('\0','\0')`
+    /// `_cast_ops` (`resoperation.py`). Defaults to `('\0','\0')`
     /// (resoperation.py:264) for non-typecast opcodes.
     pub fn cast_types(self) -> (char, char) {
         match self {
@@ -2324,7 +2324,7 @@ impl OpCode {
         }
     }
 
-    /// resoperation.py:437-438 `CastOp.cast_to_bytesize` — returns
+    /// resoperation.py `CastOp.cast_to_bytesize` — returns
     /// `cls_casts[3]`.  The base table at `resoperation.py:1177-1188`
     /// stores 4 for the float↔int casts; the non-x86 override at
     /// `resoperation.py:1190-1196` upgrades `CAST_FLOAT_TO_INT` /
@@ -2336,11 +2336,11 @@ impl OpCode {
     /// `None` is returned for `INT_SIGNEXT` / `VEC_INT_SIGNEXT` where
     /// the `_cast_ops` entry stores 0 and the actual bytesize is the
     /// dynamic value of `arg1` (`SignExtOp.cast_to_bytesize` at
-    /// `resoperation.py:682-686` reads `arg1.value`).  Callers must
+    /// `resoperation.py` reads `arg1.value`).  Callers must
     /// consult the const-pool to recover the bytesize for these two
     /// opcodes.
     pub fn cast_to_bytesize_static(self) -> Option<i32> {
-        // resoperation.py:1190 `if not platform.machine().startswith('x86')`.
+        // resoperation.py `if not platform.machine().startswith('x86')`.
         // pyre is built per target arch; gate at compile time.
         const FLOAT_TO_INT_BYTESIZE: i32 = if cfg!(any(target_arch = "x86", target_arch = "x86_64"))
         {
@@ -2452,7 +2452,7 @@ impl OpCode {
     }
 
     pub fn is_call_release_gil(self) -> bool {
-        // resoperation.py:1238-1248 call_release_gil_for_descr maps
+        // resoperation.py call_release_gil_for_descr maps
         // 'i'/'f'/'v' only; 'r' is `# no such thing`.
         matches!(
             self,
@@ -2570,7 +2570,7 @@ impl OpCode {
         }
     }
 
-    /// Mirrors `resoperation.py:1238-1248 call_release_gil_for_descr`:
+    /// Mirrors `resoperation.py call_release_gil_for_descr`:
     /// the `'r'` arm is explicitly commented out as `# no such thing`,
     /// so a `Type::Ref` result-typed release-gil callee has no upstream
     /// opcode mapping.  Panic rather than returning `CallReleaseGilR`,
@@ -2688,7 +2688,7 @@ impl OpCode {
     /// Maps a scalar op to its vector equivalent, e.g. INT_ADD -> VEC_INT_ADD.
     pub fn to_vector(self) -> Option<OpCode> {
         match self {
-            // resoperation.py:1746-1759 `_opvector`: memory loads/stores map to
+            // resoperation.py `_opvector`: memory loads/stores map to
             // VEC_LOAD/VEC_STORE. The `_R` (ref) array loads have no vector
             // form upstream and are intentionally omitted. There is no `_PURE`
             // vector op; the pure getarrayitem loads still map to VEC_LOAD_I/F.
@@ -2785,7 +2785,7 @@ impl OpCode {
         )
     }
 
-    /// dependency.py:207-208: loads_from_complex_object
+    /// dependency.py: loads_from_complex_object
     /// (ALWAYS_PURE_LAST <= opnum < MALLOC_FIRST in RPython)
     pub fn is_complex_load(self) -> bool {
         matches!(
@@ -2814,7 +2814,7 @@ impl OpCode {
         )
     }
 
-    /// dependency.py:210-211: modifies_complex_object
+    /// dependency.py: modifies_complex_object
     /// (SETARRAYITEM_GC <= opnum <= UNICODESETITEM)
     pub fn is_complex_modify(self) -> bool {
         matches!(
@@ -4509,7 +4509,7 @@ mod tests {
         assert_eq!(OpCode::FloatAdd.to_vector(), Some(OpCode::VecFloatAdd));
         assert_eq!(OpCode::GuardTrue.to_vector(), Some(OpCode::VecGuardTrue));
         assert_eq!(OpCode::SetfieldGc.to_vector(), None);
-        // resoperation.py:1746-1759 `_opvector`: memory loads/stores.
+        // resoperation.py `_opvector`: memory loads/stores.
         assert_eq!(OpCode::RawLoadI.to_vector(), Some(OpCode::VecLoadI));
         assert_eq!(OpCode::RawLoadF.to_vector(), Some(OpCode::VecLoadF));
         assert_eq!(OpCode::GetarrayitemRawI.to_vector(), Some(OpCode::VecLoadI));
@@ -5333,8 +5333,8 @@ mod tests {
 
     #[test]
     fn test_opref_ty_temp_var() {
-        // `regalloc.py:18 TempVar(AbstractResOpOrInputArg)` has no
-        // `.type` attribute; `_check_type` at `regalloc.py:405-407` skips
+        // `regalloc.py TempVar(AbstractResOpOrInputArg)` has no
+        // `.type` attribute; `_check_type` at `regalloc.py` skips
         // it via `isinstance(v, TempVar)`. `OpRef::ty()` must mirror by
         // returning `None` — projecting `Type::Int` would make a temp box
         // indistinguishable from an `IntOp` to anyone holding only the
@@ -5397,7 +5397,7 @@ mod tests {
 
     #[test]
     fn inline_const_constructors_keep_variant_distinct() {
-        // history.py:244 `ConstInt.same_constant` rejects `ConstFloat` /
+        // history.py `ConstInt.same_constant` rejects `ConstFloat` /
         // `ConstPtr` — Const sub-classes are disjoint identities.
         for v in [0i64, 1, 7, 100] {
             assert_ne!(OpRef::const_int(v), OpRef::const_float(v as f64));
@@ -5425,7 +5425,7 @@ mod tests {
 
     #[test]
     fn typed_op_result_constructors_keep_variant_distinct() {
-        // resoperation.py:564-638 `IntOp` / `FloatOp` / `RefOp` mixins:
+        // resoperation.py `IntOp` / `FloatOp` / `RefOp` mixins:
         // each ResOp's `.type` is fixed by the mixin class.
         for pos in [0u32, 1, 7, 100, 1_000_000] {
             assert_ne!(OpRef::int_op(pos), OpRef::float_op(pos));

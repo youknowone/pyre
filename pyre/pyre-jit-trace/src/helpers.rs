@@ -33,7 +33,7 @@ pub fn emit_trace_call_int_typed(
     args: &[OpRef],
     arg_types: &[Type],
 ) -> OpRef {
-    // pyjitpl.py:1995-2068 do_residual_call parity: thread the
+    // pyjitpl.py do_residual_call parity: thread the
     // codewriter-analyzed `EffectInfo` through `record_nospec`. The
     // codewriter's `CallControl::getcalldescr`
     // (`majit-translate/src/codewriter/call.rs`) ports call.py:210-335
@@ -60,14 +60,14 @@ pub fn emit_trace_call_float_typed(
     ctx.call_float_typed_with_effect(helper, args, arg_types, default_effect_info())
 }
 
-/// `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes, descr,
+/// `pyjitpl.py MIFrame.execute_varargs(opnum, argboxes, descr,
 /// exc=False, pure=True)` parity for direct trace emit paths.
 ///
 /// `emit_trace_call_int_typed` calls into the tracer with
 /// `default_effect_info()` (`effectinfo.MOST_GENERAL`), so even an
 /// `#[elidable_cannot_raise]` callee is recorded as a plain `CallI`.  This wrapper threads an explicit
 /// `ElidableCannotRaise` `EffectInfo` through
-/// `record_result_of_call_pure` (`pyjitpl.py:3553-3579`) and patches the
+/// `record_result_of_call_pure` (`pyjitpl.py`) and patches the
 /// trace to `CallPureI`.
 ///
 /// `concrete_arg_values` follows `_build_allboxes`
@@ -137,7 +137,7 @@ pub extern "C" fn jit_dict_exact_int_lookup_or_null(dict: i64, key: i64) -> i64 
 }
 
 /// Read a dict value at an entry index a traced `dict.lookup` settled on —
-/// `rordereddict.py:709 ll_dict_getitem`'s `d.entries[i].value` after
+/// `rordereddict.py ll_dict_getitem`'s `d.entries[i].value` after
 /// `ll_dict_lookup` returned the slot.  The read goes through the live storage
 /// so a value-only overwrite stays visible, which is the whole reason the
 /// lookup and the value read are two operations rather than one.
@@ -207,7 +207,7 @@ pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
     )
 }
 
-/// `celldict.py:42-54 getdictvalue_no_unwrapping` residual: returns the
+/// `celldict.py getdictvalue_no_unwrapping` residual: returns the
 /// raw stored value-or-cell at `slot` of the module dict `namespace_ptr`
 /// (the object, not its storage), _not_ unwrapped.  The elidable form of
 /// this — keyed on `version?` via `QuasiimmutField` — folds to a constant
@@ -243,7 +243,7 @@ pub(crate) fn namespace_slot_lookup_result(result: PyObjectRef) -> Value {
     Value::Ref(GcRef(result as usize))
 }
 
-/// `typeobject.py:516 _pure_lookup_where_with_method_cache` residual: the
+/// `typeobject.py _pure_lookup_where_with_method_cache` residual: the
 /// `@elidable` method-cache lookup keyed on `(w_type, w_name, version_tag)`,
 /// recorded as a foldable `CALL_PURE_R` so repeated same-key lookups in a
 /// hot loop collapse to a constant `w_descr` pointer (null = `None`).  The
@@ -285,7 +285,7 @@ unsafe fn is_mapdict_carrier(w_obj: PyObjectRef) -> bool {
     unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(w_obj) }
 }
 
-/// `mapdict.py:846-847 getdictvalue` residual: the instance-dict shadowing
+/// `mapdict.py getdictvalue` residual: the instance-dict shadowing
 /// read the `LOAD_METHOD` fast path performs after the type lookup
 /// (`callmethod.py:66 w_value = w_obj.getdictvalue(space, name)`), to make
 /// sure no instance attribute shadows the class method.  Returns the
@@ -312,7 +312,7 @@ pub extern "C" fn jit_instance_getdictvalue(w_obj: i64, w_name: i64) -> i64 {
     w_value.unwrap_or(PY_NULL) as i64
 }
 
-/// mapdict.py:914-916 `_mapdict_read_storage(storageindex)` — the LOAD_ATTR
+/// mapdict.py `_mapdict_read_storage(storageindex)` — the LOAD_ATTR
 /// fast-path storage read.  A plain `extern "C"` i64-ABI wrapper recorded as a
 /// residual call, like [`jit_instance_getdictvalue`]: the value changes per
 /// instance so it is not folded, but `storageindex` is a green constant (the
@@ -353,7 +353,7 @@ pub extern "C" fn jit_mapdict_boxed_write(w_obj: i64, storageindex: i64, value: 
 
 /// Raw unboxed counterpart of [`jit_mapdict_read`].  The guarded map pins the
 /// shared longlong-list coordinates, so this non-forcing helper performs only
-/// `_prim_direct_read`'s storage read (mapdict.py:600-601); boxing stays in the
+/// `_prim_direct_read`'s storage read (mapdict.py); boxing stays in the
 /// trace so an immediate consumer can virtualize it away.  Null receiver /
 /// non-carrier returns zero only for a torn recording.
 pub extern "C" fn jit_mapdict_unboxed_read_raw(
@@ -397,7 +397,7 @@ pub extern "C" fn jit_hash_normalize_digest(digest: i64) -> i64 {
 
 /// Float-bank counterpart of [`jit_mapdict_unboxed_read_raw`].  Unboxed float
 /// storage already contains the value's IEEE-754 bit pattern, so this helper
-/// performs the raw read and reconstructs the float (mapdict.py:577-584).
+/// performs the raw read and reconstructs the float (mapdict.py).
 /// Null receiver / non-carrier returns zero only for a torn recording.
 pub extern "C" fn jit_mapdict_unboxed_read_f(w_obj: i64, storageindex: i64, listindex: i64) -> f64 {
     let w_obj = w_obj as PyObjectRef;
@@ -533,7 +533,7 @@ pub fn emit_trace_bool_value_from_truth(ctx: &mut TraceCtx, truth: OpRef, negate
     )
 }
 
-/// `ll_unboxed_getclass` low-bit test (rtagged.py:155): IntAnd(CastPtrToInt(obj),1).
+/// `ll_unboxed_getclass` low-bit test (rtagged.py): IntAnd(CastPtrToInt(obj),1).
 /// Caller emits the GuardTrue (tagged leg) / GuardFalse (boxed leg) via its
 /// path-native guard mechanism. `observed_tagged` stamps the folded bit.
 pub(crate) fn emit_tag_lowbit_test(ctx: &mut TraceCtx, obj: OpRef, observed_tagged: bool) -> OpRef {
@@ -544,7 +544,7 @@ pub(crate) fn emit_tag_lowbit_test(ctx: &mut TraceCtx, obj: OpRef, observed_tagg
     lowbit
 }
 
-/// `ll_unboxed_to_int` (rtagged.py:147): arithmetic IntRshift(CastPtrToInt(obj),1).
+/// `ll_unboxed_to_int` (rtagged.py): arithmetic IntRshift(CastPtrToInt(obj),1).
 pub(crate) fn emit_untag_int(ctx: &mut TraceCtx, obj: OpRef, value: i64) -> OpRef {
     let as_int = ctx.record_op(OpCode::CastPtrToInt, &[obj]);
     let one = ctx.const_int(1);
@@ -555,17 +555,17 @@ pub(crate) fn emit_untag_int(ctx: &mut TraceCtx, obj: OpRef, value: i64) -> OpRe
 
 /// Emit inline W_Int creation (NewWithVtable + SetfieldGc).
 ///
-/// jtransform.py:908-911 rewrite_op_setfield: setfield on typeptr is dropped
-/// — `new_with_vtable` writes the typeptr in the backend (llmodel.py:778-782).
+/// jtransform.py rewrite_op_setfield: setfield on typeptr is dropped
+/// — `new_with_vtable` writes the typeptr in the backend (llmodel.py).
 pub fn emit_box_int_inline(
     ctx: &mut TraceCtx,
     raw_int: OpRef,
     size_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
 ) -> OpRef {
-    // jtransform.py:908-911: rewrite_op_setfield skips typeptr setfield
+    // jtransform.py: rewrite_op_setfield skips typeptr setfield
     // entirely ("ignore the operation completely -- instead, it's done by
-    // 'new'"). rewrite.py:479-484 handle_malloc_operation emits the vtable
+    // 'new'"). rewrite.py handle_malloc_operation emits the vtable
     // setfield via fielddescr_vtable during GC rewrite of NEW_WITH_VTABLE.
     let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     ctx.heap_cache_mut().new_object(new_op);
@@ -684,10 +684,10 @@ pub fn emit_bound_method_inline(
 }
 
 /// Emit inline `Function` creation for `MAKE_FUNCTION` — `NewWithVtable` plus
-/// the `SetfieldGc` set `function.py:47-57 Function.__init__` performs — instead
+/// the `SetfieldGc` set `function.py Function.__init__` performs — instead
 /// of the opaque `jit_make_function_from_globals` residual.
 ///
-/// `pyopcode.py:1457 MAKE_FUNCTION` builds a fresh function on every execution,
+/// `pyopcode.py MAKE_FUNCTION` builds a fresh function on every execution,
 /// so a `def` inside a loop allocates once per iteration; emitting the
 /// allocation as `New` + `SetField` lets the optimizer virtualize it away when
 /// the function never escapes, which is what upstream gets by tracing straight
@@ -745,7 +745,7 @@ pub fn emit_make_function_inline(
 /// `objectobject.rs w_instance_new`.
 ///
 /// `storage` keeps the allocation's zero — `w_instance_new` stores a null
-/// there as well (`mapdict.py:908-910 _mapdict_init_empty`, `storage = None`).
+/// there as well (`mapdict.py _mapdict_init_empty`, `storage = None`).
 /// `map` is the owning type's terminator, read eagerly for the same reason
 /// `w_instance_new` reads it: a deferred install leaves the promoted map guard
 /// on the next iteration's fresh instance naming a map the instance does not
@@ -773,7 +773,7 @@ pub fn emit_instance_inline(ctx: &mut TraceCtx, header_w_class: OpRef, map: OpRe
     new_op
 }
 
-/// Emit `_set_mapdict_increase_storage1` (`mapdict.py:942-959`) as trace
+/// Emit `_set_mapdict_increase_storage1` (`mapdict.py`) as trace
 /// operations: allocate the one-slot-longer storage block, copy the
 /// `old_len` live slots over, append the new value, then install the block
 /// and the transition map on the instance.
@@ -1089,7 +1089,7 @@ pub fn emit_object_tuple_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
 /// Integer / Float arm of `listobject.rs::w_list_new` (`IntArray::from_vec` /
 /// `FloatArray::from_vec`), so OptVirtualize can fold the whole list (wrapper +
 /// block) when it never escapes — the orthodox `newlist` shape
-/// (`rlist.py:324 ll_newlist`, two mallocs).
+/// (`rlist.py ll_newlist`, two mallocs).
 ///
 /// The typed strategy keeps `length = 0` and `items = null`
 /// (`w_list_new_with_strategy` non-Object arm): `length` is stored explicitly
@@ -1215,7 +1215,7 @@ pub fn emit_promote_empty_list_inline(
             // Seed the block's capacity getfield cache with the const (1). The
             // block is a fresh const-size allocation whose capacity is known,
             // matching the heapcache length tracking a `new_array` gets for a
-            // const-length array (heapcache.py:508 `new_array` →
+            // const-length array (heapcache.py `new_array` →
             // `arraylen_now_known`). The append body sub-walk reads
             // `ItemsBlock.capacity` via a getfield (not arraylen), so seed that
             // field-index channel explicitly; otherwise the read stays symbolic
@@ -1297,9 +1297,9 @@ pub fn emit_promote_empty_list_inline(
 /// Emit inline `space.newslice(w_start, w_end, w_step)` creation
 /// (NewWithVtable + 3 SetfieldGc).
 ///
-/// `pypy/objspace/std/objspace.py:385` `space.newslice` returns
+/// `pypy/objspace/std/objspace.py` `space.newslice` returns
 /// `W_SliceObject(w_start, w_end, w_step)` — a fresh allocation per
-/// invocation (matching `pypy/interpreter/pyopcode.py:1463 BUILD_SLICE`).
+/// invocation (matching `pypy/interpreter/pyopcode.py BUILD_SLICE`).
 /// `_immutable_fields_ = ['w_start', 'w_stop', 'w_step']`
 /// (`sliceobject.py:13`) marks all three slots immutable, so the
 /// `optimizeopt/virtualize.py optimize_NEW_WITH_VTABLE` pass can
@@ -1307,9 +1307,9 @@ pub fn emit_promote_empty_list_inline(
 /// shape (NewWithVtable + 3 SetfieldGc) preserves the operand
 /// dependencies the optimizer needs to reason about that.
 ///
-/// `jtransform.py:908-911 rewrite_op_setfield` skips the typeptr
+/// `jtransform.py rewrite_op_setfield` skips the typeptr
 /// setfield (the backend writes typeptr inside `new_with_vtable` per
-/// `llmodel.py:778-782`); `rewrite.py:479-484 handle_malloc_operation`
+/// `llmodel.py:778-782`); `rewrite.py handle_malloc_operation`
 /// emits the vtable setfield via `fielddescr_vtable` during the GC
 /// rewrite pass.
 pub fn emit_box_slice_inline(
@@ -1544,7 +1544,7 @@ pub fn emit_new_pyframe_inline_with_params(
     // seed TraceCtx's concrete sanity cache with the constructor-time zero;
     // a later mark_as_escaped read must observe the carrier's current byte.
 
-    // pyframe.py:76-79 `f_generator_nowref`/`w_yielding_from`/`f_backref`
+    // pyframe.py `f_generator_nowref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (None/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
     // setfield for them; clear_gc_fields initializes these GC-reference slots,
@@ -1666,7 +1666,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // materialization, but its constructor-time value is not the concrete
     // carrier's necessarily later record-time state.
 
-    // pyframe.py:76-79 `f_generator_nowref`/`w_yielding_from`/`f_backref`
+    // pyframe.py `f_generator_nowref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (None/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
     // setfield for them; clear_gc_fields initializes these GC-reference slots,
@@ -1683,7 +1683,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
 
 // ── Elidable canary helper ──────────────────────────────────────────
 //
-// rlib/jit.py:13 `@jit.elidable` parity.  PyPy `intobject.py:891-895
+// rlib/jit.py `@jit.elidable` parity.  PyPy `intobject.py
 // wrapint` in-range check parity: returns true iff `value` falls inside
 // the prebuilt-int small cache range AND the cache is enabled.
 //
@@ -1750,7 +1750,7 @@ mod tests {
         // `pypy/interpreter/pyopcode.py:921 LOAD_GLOBAL_cached` resolves
         // builtin names through `frame.get_builtin().getdictvalue(name)`.
         // Pyre's `get_builtin()` returns the builtin Module whose
-        // `w_dict` is a `W_ModuleDictObject` (per `dictmultiobject.py:60-69
+        // `w_dict` is a `W_ModuleDictObject` (per `dictmultiobject.py
         // allocate_and_init_instance(module=True)`); reach `abs` via
         // that path instead of the legacy raw storage pointer so the
         // test exercises the same dispatch the JIT trace helpers will

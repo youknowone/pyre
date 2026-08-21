@@ -33,7 +33,7 @@ struct Opportunity {
     linkvars: Vec<Hlvalue>,
 }
 
-/// RPython `class DataFlowFamilyBuilder` (ssa.py:4-90).
+/// RPython `class DataFlowFamilyBuilder` (ssa.py).
 ///
 /// > Follow the flow of the data in the graph. Builds a UnionFind
 /// > grouping all the variables by families: each family contains
@@ -45,7 +45,7 @@ pub struct DataFlowFamilyBuilder {
     opportunities: Vec<Opportunity>,
     /// RPython `self.opportunities_with_const` (ssa.py:18).
     opportunities_with_const: Vec<Opportunity>,
-    /// RPython `self.variable_families = UnionFind()` (ssa.py:36).
+    /// RPython `self.variable_families = UnionFind()` (ssa.py).
     pub variable_families: UnionFind<Hlvalue, ()>,
 }
 
@@ -137,7 +137,7 @@ impl DataFlowFamilyBuilder {
         }
     }
 
-    /// RPython `DataFlowFamilyBuilder.complete(self)` (ssa.py:38-63).
+    /// RPython `DataFlowFamilyBuilder.complete(self)` (ssa.py).
     ///
     /// ```python
     /// def complete(self):
@@ -358,7 +358,7 @@ fn rewrite_variables_in_block(block: &BlockRef, rename: &HashMap<u64, (String, i
     }
 }
 
-/// RPython `variables_created_in(block)` (ssa.py:128-132).
+/// RPython `variables_created_in(block)` (ssa.py).
 ///
 /// ```python
 /// def variables_created_in(block):
@@ -383,7 +383,7 @@ pub fn variables_created_in(block: &BlockRef) -> HashSet<Hlvalue> {
     result
 }
 
-/// RPython `SSI_to_SSA(graph)` (ssa.py:93-124).
+/// RPython `SSI_to_SSA(graph)` (ssa.py).
 ///
 /// ```python
 /// def SSI_to_SSA(graph):
@@ -476,7 +476,7 @@ pub fn ssi_to_ssa(graph: &FunctionGraph) {
     }
 }
 
-/// RPython `SSA_to_SSI(graph, annotator=None)` (ssa.py:135-196).
+/// RPython `SSA_to_SSI(graph, annotator=None)` (ssa.py).
 ///
 /// ```python
 /// def SSA_to_SSI(graph, annotator=None):
@@ -742,7 +742,7 @@ mod tests {
     fn ssi_to_ssa_collapses_chain_to_single_name() {
         // start(v_in) -> middle(v_mid) -> return(v_ret). After
         // SSI_to_SSA, the three variables must share the same name
-        // prefix (upstream: ssa.py:106-108 `v.set_name_from(v1)`). The
+        // prefix (upstream: ssa.py `v.set_name_from(v1)`). The
         // exact prefix is whichever Variable wins the UF weighted-union
         // race, so we don't assert the specific value — only that all
         // three agree.

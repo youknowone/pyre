@@ -63,7 +63,7 @@ pub(crate) fn fbw_max_multiframe_depth() -> usize {
 /// bytecode)` (`interp_jit.py:34`); matching `w_code` alone is that comparison,
 /// because every entry this scan can see carries `next_instr == 0`:
 ///
-/// * `MIFrame.setup` (`pyjitpl.py:74-80`) assigns `greenkey` once and never
+/// * `MIFrame.setup` (`pyjitpl.py`) assigns `greenkey` once and never
 ///   updates it, so a frame's greenkey stays its ENTRY greens however far its
 ///   pc has since advanced;
 /// * every [`InlineFrame`] is pushed by `InlineFrameGuard::enter` at a callee
@@ -142,7 +142,7 @@ thread_local! {
     /// This root exists because of the *outliving*, not because a walk-time
     /// concrete is otherwise unrooted.  Every value the walk computes is
     /// stamped onto its frontend op (`set_opref_concrete` →
-    /// `history.py:803-807` `*FrontendOp(pos, value)`), and
+    /// `history.py` `*FrontendOp(pos, value)`), and
     /// `MetaInterp::walk_active_trace_refs` forwards every recorder
     /// `Op`/`InputArg` `value` cell holding a `Value::Ref` — so for the
     /// duration of the walk the recorder IS the root set.  The compile path
@@ -1596,7 +1596,7 @@ thread_local! {
     /// inline callsite declines them from then on, so the call residualizes
     /// and the enclosing trace never re-enters the identical abort.
     ///
-    /// This is `disable_noninlinable_function` (`warmstate.py:331`, which sets
+    /// This is `disable_noninlinable_function` (`warmstate.py`, which sets
     /// `JC_DONT_TRACE_HERE` = "do not inline calls to this function"): upstream
     /// answers an abort attributable to one inlined callee by denying THAT
     /// callee and retracing the enclosing loop, not by penalising the loop
@@ -1630,7 +1630,7 @@ thread_local! {
     /// (`pycode.rs`) allocates every `PyCode` with `Box::into_raw` and nothing
     /// frees it: the address is unique for the process and never moves.
     /// Upstream can key on the object because a `JitCell` holds its greens and
-    /// `should_remove_jitcell` (`warmstate.py:212`) prunes dead ones; this set
+    /// `should_remove_jitcell` (`warmstate.py`) prunes dead ones; this set
     /// has neither, so it relies on that immortality.  `eval.rs`'s `PyCode`
     /// registration names the change that would end it — switching `w_code_new`
     /// to `try_gc_alloc_stable`.  At that point a reclaimed address can be
@@ -1676,7 +1676,7 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
 ///
 /// Returns the code key of the offending callee, which is the entity the
 /// decline is a property of and therefore the one to deny — the same
-/// attribution `find_biggest_function` (`pyjitpl.py:3538`) performs before
+/// attribution `find_biggest_function` (`pyjitpl.py`) performs before
 /// `disable_noninlinable_function`.  Declining it at its own callsite makes
 /// the next attempt residualize that call, so the surviving nest is
 /// hazard-free and the enclosing loop can compile.

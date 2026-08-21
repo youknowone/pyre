@@ -3,7 +3,7 @@
 //! Mirrors RPython's `lltype.malloc(T, flavor='gc')`
 //! (`rpython/rtyper/lltypesystem/lltype.py:2192`), the user-facing
 //! allocation primitive used throughout PyPy's interpreter
-//! (`pypy/objspace/std/intobject.py:883 wrapint` etc.). In RPython's
+//! (`pypy/objspace/std/intobject.py wrapint` etc.). In RPython's
 //! translation pipeline, every `lltype.malloc(T)` call is rewritten by
 //! the GC transform (`rpython/memory/gctransform/framework.py:803-853
 //! gct_fv_gc_malloc`) into a managed allocation surrounded by
@@ -19,7 +19,7 @@
 //! plain Rust compiled by cargo. This module provides the same API
 //! shape (the low-level allocation primitive that the GC transform
 //! consumes; PyPy interpreter source-level constructors like
-//! `pypy/objspace/std/intobject.py:883 wrapint` are plain
+//! `pypy/objspace/std/intobject.py wrapint` are plain
 //! `W_IntObject(x)` calls and `lltype.malloc` only emerges from the
 //! rtyping stage `rpython/rtyper/rclass.py:731`) so that:
 //!
@@ -40,7 +40,7 @@
 //! [`GcHeader`]: majit_gc::header::GcHeader
 
 /// Per-type GC metadata, mirroring the compile-time constants that
-/// RPython's `gct_fv_gc_malloc` (`framework.py:807-811`) closes over:
+/// RPython's `gct_fv_gc_malloc` (`framework.py`) closes over:
 ///
 /// ```python
 /// type_id = self.get_type_id(TYPE)
@@ -133,7 +133,7 @@ impl TypeIdCell {
 /// Compile-time descriptor every `#[pyre_class]` type emits, consumed
 /// by the JIT driver's GC registration loop in
 /// `pyre/pyre-jit/src/eval.rs`.  Mirrors the per-type tuple PyPy's
-/// `framework.py:807-811` materializes (TYPE_ID + fixed size + GC
+/// `framework.py` materializes (TYPE_ID + fixed size + GC
 /// pointer offsets) plus the static `PyType` the dispatcher uses to
 /// recognise the layout at runtime.
 pub struct PyreClassDescriptor {

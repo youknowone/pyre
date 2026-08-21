@@ -30,7 +30,7 @@ static RECURSION_LIMIT: AtomicI32 = AtomicI32::new(DEFAULT_RECURSION_LIMIT);
 pub const DEFAULT_MAX_STR_DIGITS: i32 = 4300;
 pub const MAX_STR_DIGITS_THRESHOLD: i32 = 640;
 
-/// `State.w_int_max_str_digits` parity (`pypy/module/sys/state.py:21`).
+/// `State.w_int_max_str_digits` parity (`pypy/module/sys/state.py`).
 /// Pyre currently has one object space, so its process-global sys module
 /// state is represented by the corresponding process-global atomic.
 static INT_MAX_STR_DIGITS: AtomicI32 = AtomicI32::new(DEFAULT_MAX_STR_DIGITS);

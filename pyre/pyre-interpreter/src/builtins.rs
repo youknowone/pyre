@@ -157,7 +157,7 @@ pub(crate) unsafe fn bytearray_check_exports(obj: PyObjectRef) -> Result<(), cra
         // operand slots.  When this check is reached from assembler that
         // virtualizable field is still register-resident, so materialize the
         // current red frame first.  This is the explicit counterpart of
-        // RPython `rvirtualizable.py:49-53 hook_access_field`: an opaque
+        // RPython `rvirtualizable.py hook_access_field`: an opaque
         // consumer which reads a redirected field receives
         // `force_virtualizable_if_necessary` before the read.
         crate::executioncontext::force_frame(crate::eval::current_frame());
@@ -223,7 +223,7 @@ unsafe fn w_memoryview_new_derived(
     }
 }
 
-/// `_cast_to_1D` (`memoryobject.py:635`) — a `View1D` reinterpreting the
+/// `_cast_to_1D` (`memoryobject.py`) — a `View1D` reinterpreting the
 /// source view's bytes under a new 1-D element format.  The source
 /// memoryview and the fresh format object are pinned across the header
 /// allocation (the sole collection point); the source view then clones over
@@ -371,7 +371,7 @@ unsafe fn w_memoryview_new_plain(
 }
 
 /// Build the `BytesIOView` returned by `W_BytesIO.getbuffer_w`
-/// (`interp_bytesio.py:149-152`): its `BytesIOBuffer` reads the bytearray
+/// (`interp_bytesio.py`): its `BytesIOBuffer` reads the bytearray
 /// backing, while `BytesIOView.__init__` reports the `W_BytesIO` as `.obj`
 /// (`interp_bytesio.py:52-62`).
 pub(crate) fn w_memoryview_new_simple_with_owner(
@@ -448,7 +448,7 @@ unsafe fn w_memoryview_new_mmap(
 /// `mv` must point to a valid `W_MemoryView` with a live backing.
 ///
 /// The gather walks the exporter's backing storage through pointer
-/// arithmetic and grows a `Vec<u8>` (`buffer.py:117-127 _copy_base`, an
+/// arithmetic and grows a `Vec<u8>` (`buffer.py _copy_base`, an
 /// rstring `StringBuilder` append the tracer does not model element by
 /// element); the sub-slice `&full[b..b+isz]` is a windowed copy, not a
 /// value-model view.  Residualize the whole geometry/copy subtree behind
@@ -1769,7 +1769,7 @@ fn memoryview_toreadonly(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 "cannot create a new view from a restricted memoryview",
             ));
         }
-        // `ReadonlyWrapper(self.view)` (memoryobject.py:256).
+        // `ReadonlyWrapper(self.view)` (memoryobject.py).
         Ok(w_memoryview_new_derived(mv, |v| {
             pyre_object::bufferview::BufferView::Readonly {
                 view: Box::new(v.clone()),
@@ -1789,7 +1789,7 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } else {
         "memory"
     };
-    // baseobjspace.py:115-117 `getrepr` returns `space.newtext(...)` for
+    // baseobjspace.py `getrepr` returns `space.newtext(...)` for
     // both the live and released labels.
     Ok(w_str_new_managed(&format!(
         "<{label} at {}>",
@@ -2280,7 +2280,7 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     result
 }
 
-/// `descr_hash` (memoryobject.py:476) — a writable view is unhashable; a
+/// `descr_hash` (memoryobject.py) — a writable view is unhashable; a
 /// read-only view hashes its raw bytes (so `hash(mv) == hash(bytes)`),
 /// cached in `self._hash` with the `-1` sentinel (`_hash_bytes` never returns
 /// `-1`) — the release / readonly checks run only on the first call, and a
@@ -2739,7 +2739,7 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
     }
 }
 
-/// `pypy/interpreter/gateway.py:1328-1332 GatewayCache.build` parity — attach
+/// `pypy/interpreter/gateway.py GatewayCache.build` parity — attach
 /// the text signature after constructing the builtin function. The spellings
 /// are CPython 3.14's public `builtins` signatures, which take precedence when
 /// PyPy 3.11's generated signature differs.
@@ -3720,7 +3720,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
 /// `pypy/objspace/std/dictmultiobject.py:60-69
 /// allocate_and_init_instance(module=True)` parity — allocate the
 /// builtins module dict as a `W_ModuleDictObject` backed by
-/// `ModuleDictStrategy` (`celldict.py:28`). `install_default_builtins`
+/// `ModuleDictStrategy` (`celldict.py`). `install_default_builtins`
 /// writes directly into the GC module dict. MixedModule parity stamps
 /// interp-level builtins with `__module__ = "builtins"` so pickle can
 /// save them by reference without an unstable `whichmodule` guess.
@@ -3862,7 +3862,7 @@ fn input_eof_error() -> crate::PyError {
     error
 }
 
-/// `pypy/module/__builtin__/app_io.py:24-66 input` — non-readline path.
+/// `pypy/module/__builtin__/app_io.py input` — non-readline path.
 ///
 /// The tty/readline hook remains owned by `sys.__raw_input__`; when it is not
 /// installed (the normal Pyre configuration), this is the literal app-level
@@ -3918,7 +3918,7 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     pyre_object::gc_roots::pin_root(stderr);
     let stderr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-    // app_io.py:44 `stderr.flush()`.
+    // app_io.py `stderr.flush()`.
     let stderr_flush = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(stderr_slot),
         "flush",
@@ -3961,7 +3961,7 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Err(error) => return Err(error),
     }
 
-    // app_io.py:56-65 `line = stdin.readline()` and strip one LF.
+    // app_io.py `line = stdin.readline()` and strip one LF.
     let readline = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(stdin_slot),
         "readline",
@@ -4415,7 +4415,7 @@ pub fn is_builtin_locals_function(callable: PyObjectRef) -> bool {
 
 /// True iff `callable` is the builtin `vars` function object.
 ///
-/// `vars()` with no argument is `locals()` (`app_inspect.py:21-24` →
+/// `vars()` with no argument is `locals()` (`app_inspect.py` →
 /// `interp_inspect.py:7-11`), so the walker recognizes both under one fold.
 pub fn is_builtin_vars_function(callable: PyObjectRef) -> bool {
     is_builtin_code_function(callable, builtin_vars)
@@ -4586,7 +4586,7 @@ fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         if is_long(obj) {
             let val = w_long_get_value(obj);
             // rbigint.py:1303-1308 returns `self` for nonnegative values;
-            // longobject.py:272-277 then allocates a fresh W_LongObject around
+            // longobject.py then allocates a fresh W_LongObject around
             // that same rbigint. Preserve both wrapper identity and payload
             // sharing instead of translating `Clone` into another GC payload.
             if val.get_sign() != -1 {
@@ -4640,7 +4640,7 @@ static __pyre_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor 
 /// slice paired with a keyword lookup helper.
 ///
 /// PRE-EXISTING-ADAPTATION (builtin kwargs ABI, consumer side). PyPy's
-/// gateway gives each builtin a `Signature` (`gateway.py:740 BuiltinCode`,
+/// gateway gives each builtin a `Signature` (`gateway.py BuiltinCode`,
 /// `:804`) and resolves keywords by name through `args.parse_obj` →
 /// `_match_signature` (`argument.py:173`) before the interp-level function
 /// runs; the builtin never sees a marker dict. Pyre's flat `BuiltinCodeFn`
@@ -4725,7 +4725,7 @@ pub(crate) fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
 /// The real keyword `(name, value)` pairs in the kwargs dict from
 /// [`split_builtin_kwargs`] — every entry other than the `__pyre_kw__`
 /// marker.  A builtin that has to re-issue its own call as a keyword call
-/// (`_thread._local` replays the constructor per thread, `os_local.py:57`)
+/// (`_thread._local` replays the constructor per thread, `os_local.py`)
 /// hands these to `call::call_with_kwargs`.
 pub(crate) fn builtin_kwarg_entries(kwargs: Option<PyObjectRef>) -> Vec<(Wtf8Buf, PyObjectRef)> {
     let Some(dict) = kwargs else {
@@ -4748,7 +4748,7 @@ pub(crate) fn kwarg_get(kwargs: Option<PyObjectRef>, name: &str) -> Option<PyObj
 
 /// Reject any keyword argument whose name is not in `allowed`.  Mirrors
 /// PyPy's `unwrap_spec` strict-keyword behaviour — for example
-/// `pypy/module/__builtin__/functional.py:198-201 min_max` raises
+/// `pypy/module/__builtin__/functional.py min_max` raises
 /// `TypeError("min() got unexpected keyword argument")` whenever an
 /// unknown kwarg slips in (only `key` and `default` are accepted).
 /// pyre's flat builtin ABI has to police this manually because
@@ -4935,7 +4935,7 @@ pub(crate) fn bind_builtin_kwargs(
     )?;
     let mut scope: Vec<PyObjectRef> = vec![PY_NULL; names.len()];
     let mut filled: Vec<bool> = vec![false; names.len()];
-    // `argument.py:616` keys the message off `space.text_w(keyword_names_w[i])`,
+    // `argument.py` keys the message off `space.text_w(keyword_names_w[i])`,
     // the keyword's own storage, so a name carrying a lone surrogate reaches
     // `e.args[0]` intact. Keep the WTF-8 rather than a lossy `String`.
     let mut unknown: Option<Wtf8Buf> = None;
@@ -5120,7 +5120,7 @@ pub(crate) unsafe fn obj_to_bigint(obj: PyObjectRef) -> BigInt {
 
 /// `min(*args)` / `min(iterable)` — return the smallest value.
 ///
-/// `pypy/module/__builtin__/functional.py:188-218 min_max`:
+/// `pypy/module/__builtin__/functional.py min_max`:
 ///   - reject any kwargs other than `key` / `default`
 ///   - reject `default=` paired with multiple positional args
 ///   - require ≥1 positional arg
@@ -5146,7 +5146,7 @@ fn min_max_dispatch(
             "{fn_name} expected at least 1 argument, got 0"
         )));
     }
-    // functional.py:198-201 — only `key` and `default` are accepted.
+    // functional.py — only `key` and `default` are accepted.
     kwarg_reject_unknown(kwargs, &["key", "default"], fn_name)?;
     let key_fn = kwarg_get(kwargs, "key").filter(|k| unsafe { !pyre_object::is_none(*k) });
     let default = kwarg_get(kwargs, "default");
@@ -5165,7 +5165,7 @@ fn min_max_dispatch(
     }
 }
 
-/// `pypy/module/__builtin__/functional.py:125-158 min_max_sequence`.
+/// `pypy/module/__builtin__/functional.py min_max_sequence`.
 fn min_max_sequence(
     sequence: PyObjectRef,
     key_fn: Option<PyObjectRef>,
@@ -5278,7 +5278,7 @@ fn min_max_sequence(
     Ok(pyre_object::gc_roots::shadow_stack_get(best_item_slot))
 }
 
-/// `pypy/module/__builtin__/functional.py:163-184 min_max_multiple_args`.
+/// `pypy/module/__builtin__/functional.py min_max_multiple_args`.
 fn min_max_multiple_args(
     positional: &[PyObjectRef],
     key_fn: Option<PyObjectRef>,
@@ -5423,7 +5423,7 @@ fn precheck_for_new(w_type: PyObjectRef) -> Result<(), crate::PyError> {
     }
 }
 
-/// typeobject.py:141 `_check_surrogate` — a type name may not contain a
+/// typeobject.py `_check_surrogate` — a type name may not contain a
 /// lone surrogate.  Scan the code points through the surrogate-aware WTF-8
 /// view (reading the name as `&str` would fail on the surrogate) and raise
 /// `UnicodeEncodeError('utf8', name, pos, pos + 1, 'surrogates not allowed')`
@@ -5603,7 +5603,7 @@ fn type_descr_new_with_metaclass(
             )));
         }
         let w_ns_backing = unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
-        // typeobject.py:953 `_check_surrogate(space, name)` — reject a lone
+        // typeobject.py `_check_surrogate(space, name)` — reject a lone
         // surrogate in the name before it is read as UTF-8 below.
         check_surrogate(name_obj)?;
         for cp in unsafe { pyre_object::w_str_get_wtf8(name_obj) }.code_points() {
@@ -5633,7 +5633,7 @@ fn type_descr_new_with_metaclass(
         }
         let name = crate::baseobjspace::str_utf8_w(name_obj)?;
 
-        // typeobject.py:938-942 `_create_new_type` — direct three-argument
+        // typeobject.py `_create_new_type` — direct three-argument
         // `type()` never performs PEP 560 base rewriting.  A non-type base
         // advertising `__mro_entries__` gets the dedicated diagnostic before
         // metaclass calculation; class statements resolve it earlier in
@@ -5846,7 +5846,7 @@ fn type_descr_new_with_metaclass(
         // is not a subclass of every base's metaclass) is a hard error, not a
         // silent fall-back to `default_meta`.
         //
-        // `_calculate_metaclass` (typeobject.py:945) sees the bases as written.
+        // `_calculate_metaclass` (typeobject.py) sees the bases as written.
         // `(object,)` is substituted for an empty tuple only in
         // `W_TypeObject.__init__` (`bases_w or [space.w_object]`), which runs
         // after the winner is settled — supplying it here would weigh an
@@ -5879,7 +5879,7 @@ fn type_descr_new_with_metaclass(
 
         // `_create_new_type` reaches the instance through
         // `space.allocate_instance(W_TypeObject, w_typetype)`, which runs
-        // `W_TypeObject.check_user_subclass` (typeobject.py:555-567) on the way
+        // `W_TypeObject.check_user_subclass` (typeobject.py) on the way
         // in.  That is the only place a metatype which *is* a type but is not a
         // subtype of `type` gets refused — `precheck_for_new` above settles
         // only that it is a type at all — so without it
@@ -5908,7 +5908,7 @@ fn type_descr_new_with_metaclass(
         // The type allocation may have moved the namespace, so the qualname
         // pass receives the forwarded address rather than the word above.
         type_new_take_qualname(w_type, pyre_object::gc_roots::shadow_stack_get(dict_root))?;
-        // typeobject.py:1143-1204 create_all_slots parity.
+        // typeobject.py create_all_slots parity.
         unsafe { crate::call::create_all_slots(w_type, w_effective_bases)? };
         // rclass.py:739-743 — set w_class (typeptr) at allocation time.
         // For type objects, w_class is the metaclass (type(C) → Meta).
@@ -5925,10 +5925,10 @@ fn type_descr_new_with_metaclass(
             unsafe { pyre_object::w_cell_set(classcell, w_type) };
         }
 
-        // typeobject.py:1595-1613 compute_mro — a custom metaclass `mro`
+        // typeobject.py compute_mro — a custom metaclass `mro`
         // runs after the class cell is bound and before ready().
         unsafe { crate::baseobjspace::compute_and_set_mro(w_type)? };
-        // typeobject.py:373-377 ready() — link self into each base's
+        // typeobject.py ready() — link self into each base's
         // `weak_subclasses` so `mutated()` and `__subclasses__()`
         // observe this class.
         unsafe { pyre_object::typeobject::w_type_ready(w_type) };
@@ -5944,7 +5944,7 @@ fn type_descr_new_with_metaclass(
             }
         }
 
-        // _set_names (typeobject.py:1006) — call `__set_name__(owner, name)`
+        // _set_names (typeobject.py) — call `__set_name__(owner, name)`
         // on each descriptor in the type's FINAL `__dict__` (`w_type.dict_w`),
         // i.e. the filtered namespace with `__classcell__`/`__classdictcell__`
         // already removed, not the original backing.  Collect the entries
@@ -6107,7 +6107,7 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 macro_rules! exc_constructor {
     ($fn_name:ident, $kind:expr) => {
         fn $fn_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            // `interp_exceptions.py:121-124 W_BaseException.descr_init`:
+            // `interp_exceptions.py W_BaseException.descr_init`:
             // `self.args_w = args_w`.  The string form of the exception
             // is derived from `args_w` on demand (`descr_str`), so the
             // constructor only captures the args — no eager message copy.
@@ -6246,7 +6246,7 @@ exc_constructor!(
     pyre_object::interp_exceptions::ExcKind::SyntaxError
 );
 
-/// `interp_exceptions.py:121-124 W_BaseException.descr_init` — store the
+/// `interp_exceptions.py W_BaseException.descr_init` — store the
 /// constructor positional arguments on `self.args_w`.  Installed as
 /// `BaseException.__init__` so the type-call `__new__` ⇒ `__init__`
 /// protocol re-stamps `args` to the values forwarded by a subclass's
@@ -6279,7 +6279,7 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             )));
         }
     }
-    // `interp_exceptions.py:123-124 descr_init` and `:277-282
+    // `interp_exceptions.py descr_init` and `:277-282
     // descr_new_base_exception` both store the `args_w` list their own
     // signature was bound to, so `type.__call__` reaches here holding a list
     // that already contains exactly these objects.  Keep it rather than build
@@ -6293,7 +6293,7 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(pyre_object::w_none())
 }
 
-/// `interp_exceptions.py:490-498 W_StopIteration.descr_init` — initialize
+/// `interp_exceptions.py W_StopIteration.descr_init` — initialize
 /// `w_value` to the first positional argument (or None) independently of the
 /// `args_w` list, then run `W_Exception.descr_init`.
 fn exc_stop_iteration_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6326,7 +6326,7 @@ fn exc_no_keywords_error(w_self: PyObjectRef, fallback: &str) -> crate::PyError 
     crate::PyError::type_error(format!("{type_name}() takes no keyword arguments"))
 }
 
-/// `interp_exceptions.py:836-858 W_SyntaxError.descr_init` — validate the
+/// `interp_exceptions.py W_SyntaxError.descr_init` — validate the
 /// optional details sequence before forwarding the original positional
 /// arguments to `BaseException.__init__`.  The details tuple must contain
 /// either four fields or all six location fields; a five-field form is
@@ -6438,7 +6438,7 @@ fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bo
     }
 }
 
-/// `interp_exceptions.py:551-652 W_OSError._parse_init_args` + `_init_error`.
+/// `interp_exceptions.py W_OSError._parse_init_args` + `_init_error`.
 /// A 2..=5 positional-argument call fills the `errno` / `strerror` /
 /// `filename` / `filename2` slots; when a filename is present it is
 /// dropped from `args_w` (`self.args_w = [w_errno, w_strerror]`, line
@@ -6491,7 +6491,7 @@ fn exc_is_blocking_io_error(exc: PyObjectRef) -> bool {
     )
 }
 
-/// `rwin32.py:285-306 build_winerror_to_errno` — the static Win32 code to
+/// `rwin32.py build_winerror_to_errno` — the static Win32 code to
 /// POSIX errno map, from CPython's `PC/errmap.h`.  A code the table does not
 /// name takes `DEFAULT_WIN32_ERRNO`.
 #[cfg(windows)]
@@ -6572,11 +6572,11 @@ const WINERROR_TO_ERRNO: &[(i64, i64)] = &[
     (1816, 12),
 ];
 
-/// `rwin32.py:306` — `errno.EINVAL` for a Win32 code the map does not name.
+/// `rwin32.py` — `errno.EINVAL` for a Win32 code the map does not name.
 #[cfg(windows)]
 const DEFAULT_WIN32_ERRNO: i64 = 22;
 
-/// `_parse_init_args` (`interp_exceptions.py:565-578`): an *integer* fourth
+/// `_parse_init_args` (`interp_exceptions.py`): an *integer* fourth
 /// argument decides `errno`, and the errno actually passed is ignored.  A
 /// fourth argument of any other shape (including `None`) is kept as the
 /// `winerror` attribute and leaves `errno` alone, which is what
@@ -6750,7 +6750,7 @@ fn errno_is_crt_etimedout(_e: i32) -> bool {
     false
 }
 
-/// `interp_exceptions.py:1207-1227 ERRNO_MAP` — the OSError subclass the
+/// `interp_exceptions.py ERRNO_MAP` — the OSError subclass the
 /// exact `OSError` constructor selects for a recognised errno, by
 /// registered class name.  Returns `None` for an unmapped errno.
 pub(crate) fn os_error_errno_subclass(errno: i64) -> Option<&'static str> {
@@ -6948,7 +6948,7 @@ fn os_error_errno_subclass_for(args: &[PyObjectRef]) -> Option<&'static str> {
     os_error_errno_subclass(unsafe { pyre_object::w_int_get_value(w_errno) })
 }
 
-/// `W_OSError._use_init` (`interp_exceptions.py:531-549`): the slots are
+/// `W_OSError._use_init` (`interp_exceptions.py`): the slots are
 /// already filled by `__new__`, so `descr_init` does extra work only when
 /// the instance's type defines its own `__init__` while keeping
 /// `OSError.__new__`.  Returns `False` for the exact `OSError` type, for
@@ -7016,7 +7016,7 @@ fn os_error_no_keywords_error(w_type: Option<PyObjectRef>) -> crate::PyError {
     crate::PyError::type_error(format!("{type_name}() takes no keyword arguments"))
 }
 
-/// `interp_exceptions.py:551-652 W_OSError._parse_init_args` as the
+/// `interp_exceptions.py W_OSError._parse_init_args` as the
 /// `descr_init` half: re-stamp the errno/strerror/filename slots and the
 /// trimmed `args_w` onto an already-allocated `self`.  Installed as
 /// `OSError.__init__` so the inherited `W_BaseException.descr_init` (which
@@ -7044,7 +7044,7 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(pyre_object::w_none())
 }
 
-/// `interp_exceptions.py:233-237 BaseException.descr_reduce` —
+/// `interp_exceptions.py BaseException.descr_reduce` —
 /// `(cls, args[, dict])`: a 2-tuple normally, a 3-tuple when the instance
 /// dict is non-empty.  Inherited by every builtin exception class through
 /// the MRO, so a subclass pickles via its own class object.
@@ -7200,7 +7200,7 @@ fn attribute_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     ]))
 }
 
-/// `interp_exceptions.py:379-391 W_ImportError.descr_reduce` plus the
+/// `interp_exceptions.py W_ImportError.descr_reduce` plus the
 /// 3.14 `name_from` field: the reduce-state dict carries
 /// `name`/`path`/`name_from` (each only when set), merged over any
 /// instance-dict entries.
@@ -7267,7 +7267,7 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
 }
 
-/// `interp_exceptions.py:393-397 W_ImportError.descr_setstate` plus
+/// `interp_exceptions.py W_ImportError.descr_setstate` plus
 /// `name_from`: pop `name`/`path`/`name_from` into their slots, then update
 /// the instance dict with whatever remains.
 fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -7323,7 +7323,7 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(pyre_object::w_none())
 }
 
-/// `interp_exceptions.py:655-665 W_OSError.descr_reduce` — re-append the
+/// `interp_exceptions.py W_OSError.descr_reduce` — re-append the
 /// `filename`/`filename2` that `os_error_fill_slots` stripped from `args_w`
 /// so the reconstruction call receives the full positional list.  OSError
 /// has no own `__setstate__`; it inherits `BaseException.__setstate__`.
@@ -7460,7 +7460,7 @@ fn exc_file_not_found_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     ))
 }
 
-/// `interp_exceptions.py:583-614 W_OSError.descr_new` — the `__new__` shared
+/// `interp_exceptions.py W_OSError.descr_new` — the `__new__` shared
 /// by `OSError` and every errno subclass.  For the exact `OSError` type it
 /// rejects keyword arguments (line 591-593) and remaps a recognised errno to
 /// the matching subclass (line 596-608), so `OSError(ENOENT, ...)`
@@ -7521,7 +7521,7 @@ pub(crate) fn exc_file_not_found_error_new(
     os_error_family_new(args, exc_file_not_found_error)
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:274-284 _new`'s shape
+/// `pypy/module/exceptions/interp_exceptions.py _new`'s shape
 /// applied to UnicodeTranslateError: allocate the W_BaseException
 /// and store the raw constructor args verbatim into `args_w`.  PyPy's
 /// `_new` runs no per-arg validation — type checks live in
@@ -7539,7 +7539,7 @@ fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     Ok(exc)
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:274-284 _new` shape
+/// `pypy/module/exceptions/interp_exceptions.py _new` shape
 /// for UnicodeDecodeError — allocation + raw args_w only.  Encoding,
 /// object, start/end/reason type checks happen in `descr_init` at
 /// `:1041-1059`.
@@ -7553,7 +7553,7 @@ fn exc_unicode_decode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     Ok(exc)
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py:274-284 _new` shape
+/// `pypy/module/exceptions/interp_exceptions.py _new` shape
 /// for UnicodeEncodeError — allocation + raw args_w only.
 fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exc = pyre_object::interp_exceptions::w_exception_new(
@@ -7855,7 +7855,7 @@ pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
     .any(|&target| crate::gateway::builtin_code_fn_eq(f, target))
 }
 
-/// `interp_exceptions.py:993-998 W_SystemExit.descr_init` — a lone argument
+/// `interp_exceptions.py W_SystemExit.descr_init` — a lone argument
 /// becomes `code` verbatim, several become the args tuple, and none leaves
 /// the `None` class default; `W_BaseException.descr_init` then stamps `args`.
 /// It runs first here so its keyword rejection precedes the `code` write.
@@ -7874,7 +7874,7 @@ fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_none())
 }
 
-/// `interp_exceptions.py:126-133 W_BaseException.descr_str` — the base rule,
+/// `interp_exceptions.py W_BaseException.descr_str` — the base rule,
 /// which reports the args alone.  It is what `BaseException.__str__(exc)`
 /// runs even when `exc`'s own class registers a `descr_str` override.
 fn base_exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
@@ -7939,7 +7939,7 @@ fn exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_str_from_wtf8_managed(text))
 }
 
-/// `interp_exceptions.py:135-151 W_BaseException.descr_repr` — every builtin
+/// `interp_exceptions.py W_BaseException.descr_repr` — every builtin
 /// exception class inherits this one, so it is registered on `BaseException`
 /// alone and reads the receiver's own class name.
 fn exception_repr_method(args: &[PyObjectRef]) -> crate::PyResult {
@@ -8564,7 +8564,7 @@ pub(crate) fn make_exc_type_with_init(
                         2,
                     ),
                 );
-                // `interp_exceptions.py:233-241` — `descr_reduce` /
+                // `interp_exceptions.py` — `descr_reduce` /
                 // `descr_setstate`, installed on `BaseException` so every
                 // subclass inherits them through the MRO.
                 type_ns_store(
@@ -8882,7 +8882,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(pyre_object::gc_roots::shadow_stack_get(exc_slot))
 }
 
-/// `interp_group.py:26-29 W_BaseExceptionGroup.descr_init` — retain the first
+/// `interp_group.py W_BaseExceptionGroup.descr_init` — retain the first
 /// positional value in the shared exception value slot, then delegate the
 /// public `args` tuple update and keyword rejection to BaseException.
 fn exception_group_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -9538,7 +9538,7 @@ pub fn finalization_error(message: Option<&str>) -> crate::PyError {
 
 /// Look up the reusable prebuilt instance for a builtin exception
 /// class, addressed by `ExcKind` name.  Mirrors RPython's
-/// `rpython/rtyper/exceptiondata.py:34-45 get_standard_ll_exc_instance`
+/// `rpython/rtyper/exceptiondata.py get_standard_ll_exc_instance`
 /// — the JIT's `_ovf` direct-raise rewrite
 /// (`rpython/jit/codewriter/flatten.py:165-170`) emits
 /// `raise <Constant(ll_ovf)>` with the prebuilt instance pointer (NOT
@@ -9834,7 +9834,7 @@ pub(crate) fn call_and_check(
     Ok(result)
 }
 
-/// intobject.py:989-1050 _new_baseint
+/// intobject.py _new_baseint
 pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `int(x=0, base=10)` — `x` is positional-only (a `base` keyword is the
     // only one accepted), `base` is positional-or-keyword at position 2
@@ -9864,7 +9864,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     };
 
     if w_base.is_none() {
-        // intobject.py:991: space.is_w(space.type(w_value), space.w_int)
+        // intobject.py: space.is_w(space.type(w_value), space.w_int)
         let w_type = crate::typedef::r#type(obj);
         let w_int = crate::typedef::gettypefor(&INT_TYPE);
         if w_type.is_some() && w_type == w_int {
@@ -9872,7 +9872,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
         // intobject.py:994: space.lookup(w_value, '__int__')
         if unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some() {
-            // intobject.py:995: w_intvalue = space.int(w_value)
+            // intobject.py: w_intvalue = space.int(w_value)
             let w_intvalue = crate::baseobjspace::space_int(obj)?;
             return ensure_baseint_result(w_intvalue, obj);
         }
@@ -9925,14 +9925,14 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     ))
 }
 
-/// intobject.py:1093-1107 _ensure_baseint
+/// intobject.py _ensure_baseint
 fn ensure_baseint_result(
     obj: PyObjectRef,
     _original: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if is_int(obj) {
-            // intobject.py:1096-1098: W_IntObject (or subclass) → wrapint
+            // intobject.py: W_IntObject (or subclass) → wrapint
             return Ok(w_int_new(w_int_get_value(obj)));
         }
         if pyre_object::pyobject::is_long(obj) {
@@ -10087,7 +10087,7 @@ pub(crate) fn parse_int_from_str(
     s: &str,
     base: u32,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // rarithmetic.py:936-957 `string_to_int` first handles short, plain
+    // rarithmetic.py `string_to_int` first handles short, plain
     // decimal strings without constructing a NumberStringParser.
     const OVF_DIGITS: usize = 19; // len(str(sys.maxint)) on pyre's i64 target
     if base == 10 && !s.is_empty() && s.len() < OVF_DIGITS {
@@ -10113,7 +10113,7 @@ pub(crate) fn parse_int_from_str(
         }
     }
 
-    // intobject.py:955-982 `_string_to_int_or_long` constructs the one
+    // intobject.py `_string_to_int_or_long` constructs the one
     // NumberStringParser used by both the machine-int attempt and the
     // rbigint overflow retry.  Do not maintain a second parser here: it
     // diverges on prefix/underscore ordering and erases rbigint allocation
@@ -10212,7 +10212,7 @@ pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, c
             return Err(too_long(maxdigits));
         }
     }
-    // longobject.py:109 calls `self.asbigint().str(max_str_digits=...)`.
+    // longobject.py calls `self.asbigint().str(max_str_digits=...)`.
     // Going through Rust's Display/ToString adapter erases rbigint's
     // MaxIntError and MemoryError edges (and can turn either into a formatting
     // panic), so preserve the direct consumer contract.
@@ -10354,7 +10354,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             let r = unsafe {
                 crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
             };
-            // descroperation.py:609 `space.index` returns an arbitrary-size
+            // descroperation.py `space.index` returns an arbitrary-size
             // Python int.  Accept both the machine-word and W_LongObject
             // layouts, then reuse the integer float conversion so an
             // out-of-range bigint raises `OverflowError`.
@@ -10369,7 +10369,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             )));
         }
     }
-    // floatobject.py:242 — only after the `__float__` / `__index__` lookup,
+    // floatobject.py — only after the `__float__` / `__index__` lookup,
     // unicode (including subclasses without a numeric override) is normalized
     // through `unicode_to_decimal_w` before `_string_to_float`.
     if unsafe { is_str(obj) } {
@@ -10414,7 +10414,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     )))
 }
 
-/// The attribute-name check mirroring `operation.py:41-45 checkattrname`
+/// The attribute-name check mirroring `operation.py checkattrname`
 /// (accept `str` and any `str` subclass via `isinstance_w`), raising
 /// `"attribute name must be string, not '<type>'"`. getattr/hasattr/
 /// setattr/delattr all route through it, matching `operation.py` (and the
@@ -10429,7 +10429,7 @@ fn checkattrname(w_name: PyObjectRef) -> Result<(), crate::PyError> {
     Ok(())
 }
 
-/// `operation.py:65-74 hasattr(obj, name)` → bool: `checkattrname`, then
+/// `operation.py hasattr(obj, name)` → bool: `checkattrname`, then
 /// (unlike Py2) only an `AttributeError` yields `False`; any other error
 /// propagates.
 fn builtin_hasattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -10498,7 +10498,7 @@ fn builtin_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     crate::baseobjspace::getattr(obj, args[1])
 }
 
-/// `pypy/module/__builtin__/operation.py:191-196 setattr`:
+/// `pypy/module/__builtin__/operation.py setattr`:
 ///
 /// ```python
 /// def setattr(space, w_object, w_name, w_val):
@@ -10844,7 +10844,7 @@ pub(crate) fn builtin_super(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         let obj_type = super_check(cls, obj)?;
         return Ok(pyre_object::descriptor::w_super_new(cls, obj_type, obj));
     }
-    // descriptor.py:24-26 / `_super_from_frame`: zero-arg super() reads
+    // descriptor.py / `_super_from_frame`: zero-arg super() reads
     // `space.getexecutioncontext().gettopframe()`.  This must come from the
     // per-frame EC chain, not pyre's portal-level CURRENT_FRAME TLS anchor: an
     // inlined callee has its own red frame/vref at `topframeref`, while the TLS
@@ -12782,7 +12782,7 @@ fn exec_or_eval(
         crate::w_code_get_ptr(code_obj_ref as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
 
-    // pypy/interpreter/eval.py:28-33 Code.exec_code keeps w_globals and
+    // pypy/interpreter/eval.py Code.exec_code keeps w_globals and
     // w_locals as separate dict references — STORE_GLOBAL writes to
     // w_globals and STORE_NAME writes to w_locals.  Pyre mirrors this by
     // building a fresh DictStorage per role and syncing each back to the
@@ -12830,12 +12830,12 @@ fn exec_or_eval(
         w_globals: pyre_object::PyObjectRef,
         exec_ctx: *const crate::PyExecutionContext,
     ) -> Result<(), crate::PyError> {
-        // pypy/module/__builtin__/compiling.py:109-110 eval:
+        // pypy/module/__builtin__/compiling.py eval:
         //
         //   if not space.contains_w(w_globals, space.newtext("__builtins__")):
         //       space.setitem_str(w_globals, "__builtins__", space.builtin)
         //
-        // This is intentionally NOT pyopcode.py:773's `setdefault`
+        // This is intentionally NOT pyopcode.py's `setdefault`
         // call-method path; dict-subclass `setdefault` overrides do
         // not fire for eval() in PyPy.  Dispatch on the dict object so
         // the str-keyed write fans into the storage proxy.
@@ -12885,7 +12885,7 @@ fn exec_or_eval(
         Ok(())
     }
 
-    // pypy/interpreter/pyopcode.py:2003-2013 ensure_ns —
+    // pypy/interpreter/pyopcode.py ensure_ns —
     //   globals: not None ⇒ isinstance_w(w_dict) else TypeError
     //   locals : not None ⇒ space.lookup(__getitem__) is not None
     //                       else TypeError "must be a mapping or None"
@@ -12984,7 +12984,7 @@ fn exec_or_eval(
         unsafe { (*caller_frame).execution_context }
     };
 
-    // pyopcode.py:2005-2009 ensure_ns — the globals object is the
+    // pyopcode.py ensure_ns — the globals object is the
     // user-supplied dict, else the caller frame's globals, else a fresh
     // empty dict (`exec(src)` outside any frame, PyPy `newdict('module')`).
     let w_globals = if !is_none_or_null(globals_arg) {
@@ -13015,7 +13015,7 @@ fn exec_or_eval(
     // dicts and arbitrary `__getitem__`-bearing mappings now share
     // this path.
     //
-    // pypy/interpreter/pyopcode.py:2015 ensure_ns — when the caller
+    // pypy/interpreter/pyopcode.py ensure_ns — when the caller
     // omits both globals and locals, exec falls back to caller globals
     // (already wired above) AND caller `getdictscope()`.  When the
     // caller omits ONLY locals, locals collapse to globals (PyPy
@@ -13077,7 +13077,7 @@ fn exec_or_eval(
     } else {
         None
     };
-    // eval.py:31-33 Code.exec_code → space.createframe(...) + frame.run().
+    // eval.py Code.exec_code → space.createframe(...) + frame.run().
     // For eval() with a code object that carries freevars, `outer_func` is
     // None so createframe surfaces pyframe.py:242-246's TypeError "directly
     // executed code object may not contain free variables" — exec()'s
@@ -13186,7 +13186,7 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 /// The frame whose locals `locals()` / `vars()` / `dir()` report on
-/// (`interp_inspect.py:7-11 locals` — `ec.gettopframe_nohidden()`).
+/// (`interp_inspect.py locals` — `ec.gettopframe_nohidden()`).
 ///
 /// `gettopframe_nohidden` forces the VREF on its first line and then only
 /// follows `f_backref` and tests `hide()`; it runs no per-frame `force_frame`.
@@ -13267,7 +13267,7 @@ fn builtin_vars(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(dict)
 }
 
-/// util.py:62 `_classdir` — union `getattr(klass, '__dict__')`'s keys with,
+/// util.py `_classdir` — union `getattr(klass, '__dict__')`'s keys with,
 /// recursively, `_classdir(base)` for each base in `getattr(klass,
 /// '__bases__')`.  Both attributes are read through the attribute protocol so
 /// a metaclass that customizes `__dict__`/`__bases__` access participates.
@@ -13311,7 +13311,7 @@ unsafe fn classdir_recurse(
     Ok(())
 }
 
-/// util.py:80 `_objectdir` / objectobject.py:324 `descr__dir__`.
+/// util.py `_objectdir` / objectobject.py `descr__dir__`.
 ///
 /// Return the generic object's own dict keys together with the recursive
 /// class namespace.  `dir(obj)` sorts the result after invoking this special
@@ -13352,7 +13352,7 @@ pub(crate) fn object_dir_default(obj: PyObjectRef) -> Result<PyObjectRef, crate:
     ))
 }
 
-/// util.py:62 `_classdir` / typeobject.py:1234 `descr__dir__`.
+/// util.py `_classdir` / typeobject.py:1234 `descr__dir__`.
 ///
 /// Unlike [`object_dir_default`], a type receiver contributes its own class
 /// namespace and recursively the namespaces of its bases; its metaclass is
@@ -13456,7 +13456,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         )));
     }
     let obj = args[0];
-    // app_inspect.py:57-62 — dir() is driven by the object's `__dir__`:
+    // app_inspect.py — dir() is driven by the object's `__dir__`:
     // `lookup_special(obj, '__dir__')` then `sorted(result)`.  pyre's builtin
     // types do not register a default `__dir__` slot, so the manual
     // enumeration below stands in for the default object / type / module
@@ -13491,7 +13491,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // Modules (`pypy/module/__builtin__/moduledef.py:102-103
             // Module(space, None, w_builtin)`) surface their entries
             // alongside storage-backed modules.  PyPy
-            // `pypy/interpreter/module.py:77 Module.getdict()` returns
+            // `pypy/interpreter/module.py Module.getdict()` returns
             // the dict directly regardless of subclass; pyre branches
             // on the underlying shape:
             //   - exact `W_DictObject` → `w_dict_str_entries_wtf8` returns
@@ -13503,7 +13503,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             //     `space.iter(w_dict)` would do the same).
             let w_dict = pyre_object::w_module_get_w_dict(obj);
             if !w_dict.is_null() {
-                // module.py:163 descr_module__dir__ — a `__dir__` stored in the
+                // module.py descr_module__dir__ — a `__dir__` stored in the
                 // module's own dict drives dir() (called with no arguments);
                 // otherwise the dict keys are listed.
                 if let Some(mod_dir) = crate::baseobjspace::finditem_str(w_dict, "__dir__")?
@@ -13527,12 +13527,12 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 }
             }
         } else if pyre_object::is_type(obj) {
-            // util.py:62 `_classdir` (`type.__dir__`, typeobject.py:1234) —
+            // util.py `_classdir` (`type.__dir__`, typeobject.py:1234) —
             // the class's `__dict__` keys unioned with `_classdir` of each
             // base, recursively.
             classdir_into(obj, &mut names)?;
         } else if pyre_object::is_instance(obj) {
-            // util.py:80 `_objectdir` (`object.__dir__`) — use ordinary
+            // util.py `_objectdir` (`object.__dir__`) — use ordinary
             // `getattr(obj, '__dict__'/'__class__', None)`, not raw layout
             // fields.  A class may shadow either name with a slot/descriptor;
             // in particular an uninitialised `__class__` slot suppresses the
@@ -13561,7 +13561,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 classdir_into(w_class, &mut names)?;
             }
         } else {
-            // Fallback `_objectdir` (util.py:80) for builtin W_Root types
+            // Fallback `_objectdir` (util.py) for builtin W_Root types
             // (Function, StaticMethod, PyTraceback, dict views, etc.).  Some
             // W_Root subclasses own a typed dictionary field even though
             // `is_instance()` is false, so use W_Root.getdict + _classdir
@@ -13578,7 +13578,7 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(w_list_new(items))
 }
 
-/// `operation.py:84-88 id(space, w_object)` — `space.id`, then the
+/// `operation.py id(space, w_object)` — `space.id`, then the
 /// `builtins.id` audit event.
 fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
@@ -13589,8 +13589,8 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     // `space.id` (baseobjspace.py): a plain `int` yields its
     // value-derived `immutable_unique_id`; every other object falls back
-    // to `compute_unique_id` (objectmodel.py:572-582), which incminimark
-    // implements through `id_or_identityhash` (incminimark.py:2864) so
+    // to `compute_unique_id` (objectmodel.py), which incminimark
+    // implements through `id_or_identityhash` (incminimark.py) so
     // nursery moves preserve it.  The address-valued function is a
     // different one — `current_object_addr_as_int`
     // (objectmodel.py:584-590), whose docstring exists to say the value
@@ -13603,7 +13603,7 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         Some(w_id) => w_id,
         None => w_int_new(pyre_object::gc_hook::gc_identity_hash(obj as usize) as i64),
     };
-    // `operation.py:87 space.audit("builtins.id", [w_res])`, emitted after the
+    // `operation.py space.audit("builtins.id", [w_res])`, emitted after the
     // id is computed so a hook sees the value the call is about to return.
     if crate::module::sys::vm::audit_hooks_armed() {
         // The event-name wrap and the hooks are both collection points, and the
@@ -13617,12 +13617,12 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_res)
 }
 
-/// `hash(obj)` — PyPy: `descroperation.py:1006 hash`.
+/// `hash(obj)` — PyPy: `descroperation.py hash`.
 ///
 /// CPython / PyPy raise `TypeError: unhashable type: 'X'` when the
 /// object's class lacks a non-None `__hash__` slot.  Built-in
 /// mutable containers (dict, list, set, bytearray) explicitly set
-/// `__hash__ = None` (`dictmultiobject.py:1431`, `listobject.py`,
+/// `__hash__ = None` (`dictmultiobject.py`, `listobject.py`,
 /// `setobject.py`).  `try_hash_value` is the Result-bearing variant
 /// used by both `hash()` and dict key gates: it rejects known
 /// unhashables, recurses through tuple/frozenset contents, and
@@ -13664,7 +13664,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     }
     unsafe {
         // `frozenset` is hashable per setobject.py _hash_frozenset.
-        // `dictmultiobject.py:1626 _is_set_like` — only the keys and items
+        // `dictmultiobject.py _is_set_like` — only the keys and items
         // views are set-like: they define `__eq__` and so are unhashable.  The
         // values view keeps `object.__hash__`.
         let unhashable_kind = pyre_object::is_dict(obj)
@@ -13895,7 +13895,7 @@ fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {
     crate::PyError::type_error(format!("unhashable type: '{}'", name))
 }
 
-/// `pypy/objspace/std/intobject.py:36-37` — `HASH_BITS = 61` (64-bit
+/// `pypy/objspace/std/intobject.py` — `HASH_BITS = 61` (64-bit
 /// host); `HASH_MODULUS = 2**HASH_BITS - 1`.  The Mersenne-prime
 /// modulus is what makes pyre's `hash(42) == hash(42.0) ==
 /// hash(2**100 + 42)`-class invariants hold: every per-type hash
@@ -13903,7 +13903,7 @@ fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {
 /// numeric values land on the same residue.
 const HASH_BITS: i64 = 61;
 const HASH_MODULUS: u64 = (1u64 << HASH_BITS) - 1;
-/// `floatobject.py:29-30` HASH_NAN sentinel.
+/// `floatobject.py` HASH_NAN sentinel.
 const HASH_NAN: i64 = 0;
 
 /// Numeric hash of a machine-word integer: reduce `a` modulo the
@@ -13956,7 +13956,7 @@ pub(crate) fn _hash_float(v: f64) -> i64 {
     rustpython_common::hash::hash_float(v).unwrap_or(HASH_NAN)
 }
 
-/// `tupleobject.py:358-401 descr_hash` — the xxHash sequence hash, delegated
+/// `tupleobject.py descr_hash` — the xxHash sequence hash, delegated
 /// to `rustpython_common::hash::hash_tuple`.  The caller has already computed
 /// each element's hash into `items`, so the fold is infallible here.
 ///
@@ -14375,7 +14375,7 @@ fn builtin_chr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_str_from_wtf8_managed(one))
 }
 
-/// `filter(function or None, iterable)` — `functional.py:980-995
+/// `filter(function or None, iterable)` — `functional.py
 /// W_Filter___new__`.  A lazy iterator: `function == None` keeps truthy
 /// items, otherwise `function(item)` is the predicate.
 pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -14450,7 +14450,7 @@ pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .transpose()?
         .unwrap_or(false);
 
-    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
+    // `functional.py build_iterators_from_args` — `iter()` each input.
     let mut iter_slots = Vec::with_capacity(args.len() - 1);
     for index in 1..args.len() {
         let w_iter = crate::baseobjspace::iter(unsafe {
@@ -14474,7 +14474,7 @@ pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     ))
 }
 
-/// `zip(*iterables, strict=False)` — `functional.py:1101-1105 W_Zip___new__`.
+/// `zip(*iterables, strict=False)` — `functional.py W_Zip___new__`.
 /// A lazy iterator: each `next()` pulls one item per iterable into a tuple,
 /// stopping at the shortest (an empty `zip()` stops immediately); `strict`
 /// raises `ValueError` on a length mismatch.
@@ -14502,7 +14502,7 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         })
         .transpose()?
         .unwrap_or(false);
-    // `functional.py:835-836 build_iterators_from_args` — `iter()` each input.
+    // `functional.py build_iterators_from_args` — `iter()` each input.
     let mut iter_slots = Vec::with_capacity(args.len());
     for index in 0..args.len() {
         let w_iter = crate::baseobjspace::iter(unsafe {
@@ -14527,7 +14527,7 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 /// kwarg surface is also strict: anything other than `start=` is a
 /// TypeError per the gateway's parsed signature.
-// `pypy/module/__builtin__/functional.py:253-275 W_Enumerate.descr___new__`
+// `pypy/module/__builtin__/functional.py W_Enumerate.descr___new__`
 // line-by-line port — constructs the lazy `W_Enumerate` iterator,
 // resolving `start` via `space.index_w` (with overflow promotion to a
 // bigint slot) and capturing either the source iterator or the
@@ -14584,7 +14584,7 @@ pub(crate) fn builtin_enumerate(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
     pyre_object::gc_roots::pin_root(raw_start);
     let raw_start_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-    // `functional.py:255-264 descr___new__` — `space.index(w_start)` then
+    // `functional.py descr___new__` — `space.index(w_start)` then
     // `space.int_w(w_start)`; ONLY OverflowError activates the bigint slot.
     // This preserves an arbitrary-precision start object verbatim, while a
     // machine-sized int/long/bool stays in the unboxed `index` fast path.
@@ -14729,7 +14729,7 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         let has_getitem =
             unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__getitem__") }.is_some();
         if has_getitem {
-            // `functional.py:354-359` — reverse lazily through `W_ReversedIterator`.
+            // `functional.py` — reverse lazily through `W_ReversedIterator`.
             let n = crate::baseobjspace::len_w(obj)?;
             return Ok(pyre_object::functional::w_reversed_new(
                 unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) },
@@ -14778,7 +14778,7 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         .map(crate::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
-    // `app_functional.py:7` `sorted` is `list(iterable)` followed by
+    // `app_functional.py` `sorted` is `list(iterable)` followed by
     // `sorted_lst.sort(key=key, reverse=reverse)`, so the built list picks its
     // storage strategy first and the sort runs through the same body
     // `list.sort` uses.
@@ -14790,7 +14790,7 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(pyre_object::gc_roots::shadow_stack_get(list_slot))
 }
 
-/// `listobject.py:809 descr_sort` — the shared body of `list.sort` and
+/// `listobject.py descr_sort` — the shared body of `list.sort` and
 /// `sorted`.  `list_slot` is a shadow-stack slot holding the list, because a
 /// key call or a comparison dunder can collect and move it.
 pub(crate) fn sort_list_in_place(
@@ -14861,7 +14861,7 @@ pub(crate) fn sort_list_in_place(
     Ok(())
 }
 
-/// `IntegerListStrategy.sort` (`listobject.py:1963`) / `FloatListStrategy.sort`
+/// `IntegerListStrategy.sort` (`listobject.py`) / `FloatListStrategy.sort`
 /// (`:2067`) on the unwrapped storage.
 ///
 /// `descr_sort`'s reverse handling — reverse, stable ascending sort, reverse
@@ -14883,7 +14883,7 @@ where
     Ok(())
 }
 
-/// `listobject.py:2429 IntSort.lt` / `:2434 FloatSort.lt` — a direct scalar
+/// `listobject.py IntSort.lt` / `:2434 FloatSort.lt` — a direct scalar
 /// comparison, never a dunder.
 struct ScalarLt;
 
@@ -14923,7 +14923,7 @@ pub(crate) fn sort_rooted_items(
     let key_base = key_base + usize::from(key_fn_slot.is_some());
     if let Some(key_fn_slot) = key_fn_slot {
         for index in 0..item_len {
-            // `_compute_keys_for_sorting` (listobject.py:894) runs before the
+            // `_compute_keys_for_sorting` (listobject.py) runs before the
             // `reverse` flip, so a raising key leaves the input order.
             match crate::call::call_function_impl_result(
                 pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
@@ -14965,9 +14965,9 @@ pub(crate) fn sort_rooted_items(
 /// shadow-stack base of the values being compared (the keys under `key=`,
 /// otherwise the items themselves).
 ///
-/// `descr_sort` (`listobject.py:809`) resolves the sorter class from the
+/// `descr_sort` (`listobject.py`) resolves the sorter class from the
 /// list's storage strategy, so an integer-strategy list sorts through
-/// `IntSort` (`listobject.py:2429`) and never dispatches a comparison dunder
+/// `IntSort` (`listobject.py`) and never dispatches a comparison dunder
 /// at all; `FloatSort` (`:2434`) is the same for floats, and `SimpleSort`
 /// (`:2423`) / `CustomKeySort` (`:2446`) are the generic `space.lt` path.
 enum SortCompare {
@@ -16078,8 +16078,8 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             // `W_FileIO.truncate` delegates to `rposix.ftruncate`, which binds
-            // `_chsize_s` on Windows (rposix.py:597) under the
-            // invalid-parameter suppression of `SuppressIPH` (rposix.py:606).
+            // `_chsize_s` on Windows (rposix.py) under the
+            // invalid-parameter suppression of `SuppressIPH` (rposix.py).
             // `crt_fd::ftruncate` is that same call, suppression and all, and
             // it keeps the errno `_chsize_s` returns rather than reading the
             // one a -1 return would have set.  The GIL is released around it,
@@ -16304,7 +16304,7 @@ pub(crate) fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
-/// `error.py:805-808` — the `EINTR` arm of `wrap_oserror2(..., eintr_retry=True)`.
+/// `error.py` — the `EINTR` arm of `wrap_oserror2(..., eintr_retry=True)`.
 ///
 /// An interrupted syscall is not a failure the caller reports.  Upstream runs
 /// the pending Python signal handlers (`space.getexecutioncontext()
@@ -16733,7 +16733,7 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 if n >= 0 {
                     break n as i64;
                 }
-                // `interp_fileio.py:433-442` `write_w`: a non-blocking fd that
+                // `interp_fileio.py` `write_w`: a non-blocking fd that
                 // accepted nothing reports "not now" as None, which is what
                 // `BufferedWriter._raw_write` turns into a BlockingIOError
                 // carrying the count actually written.
@@ -17181,7 +17181,7 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     // PyPy `_open` resolves a PathLike after unwrap_spec has converted the
     // remaining arguments, but before parsing the mode or warning about
     // binary line buffering. Hand that exact str/bytes result to `W_FileIO`.
-    // `_open` never probes `__index__` here: `pypy/module/_io/interp_io.py:36`
+    // `_open` never probes `__index__` here: `pypy/module/_io/interp_io.py`
     // routes every non-str/bytes/int argument straight to `fspath`, matching
     // the pinned CPython fallback (`lib-python/3/_pyio.py:194`, `if not
     // isinstance(file, int): file = os.fspath(file)`). An object that defines
@@ -17635,7 +17635,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // `interp_fileio.py` wraps the resolved `w_name`, not the PathLike
         // wrapper from which it came.
         //
-        // `_open_fd` (`interp_fileio.py:135-147`) sits in a `while True` with
+        // `_open_fd` (`interp_fileio.py`) sits in a `while True` with
         // `eintr_retry=True`: opening a FIFO waits for a peer, so an alarm
         // arriving meanwhile runs its handler and the open is re-issued.
         let fd = loop {
@@ -18275,7 +18275,7 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         if structural && is_float(obj) {
             let v = floatobject::w_float_get_value(obj);
             return match ndigits {
-                // `floatobject.py:966-967 _round_float`: nan/inf round to
+                // `floatobject.py _round_float`: nan/inf round to
                 // themselves when an explicit ndigits is supplied.  `ndigits`
                 // is taken through `space.getindex_w(w, None)`, so any
                 // `__index__` object works, an out-of-word value clamps, and a
@@ -18298,7 +18298,7 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                         }
                     }
                 }
-                // `floatobject.py:954-960 _round_float`: single-argument
+                // `floatobject.py _round_float`: single-argument
                 // round routes through newint_from_float, which raises
                 // ValueError on NaN and OverflowError on ±inf.
                 _ => crate::typedef::float_to_pyint(
@@ -18308,7 +18308,7 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             };
         }
         if structural && (is_int(obj) || is_long(obj)) {
-            // intobject.py:144-175 `descr_round`: keep ndigits as an rbigint
+            // intobject.py `descr_round`: keep ndigits as an rbigint
             // obtained through `space.index`, then compute
             // `10 ** -ndigits` and divmod-near.  Converting ndigits to an
             // index-sized Rust word or formatting the operand merely to count

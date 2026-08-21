@@ -122,7 +122,7 @@ fn vable_array_len_lowers_to_arraylen_not_a_call() {
 
 /// The array must not leave the block that reads it.
 ///
-/// `_check_no_vable_array` (jtransform.py:124-127) rejects a graph whose
+/// `_check_no_vable_array` (jtransform.py) rejects a graph whose
 /// `Link.args` carry a virtualizable array, because the target block's
 /// `vable_array_vars` is rebuilt per block and cannot follow the array
 /// across the edge.  Lowering the `len` to `ArrayLen` is not on its own

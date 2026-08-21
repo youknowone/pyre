@@ -1,17 +1,17 @@
 //! Port of `rpython/rtyper/extregistry.py`.
 //!
 //! Upstream provides two parallel registries that
-//! `Bookkeeper.immutablevalue(x)` (`bookkeeper.py:312-314`) and
+//! `Bookkeeper.immutablevalue(x)` (`bookkeeper.py`) and
 //! `signature.annotationoftype(t)` (`signature.py:98-100`) consult
 //! before falling back to the generic callable / instance branches:
 //!
 //! * **Value-level** — `EXT_REGISTRY_BY_VALUE` keyed on the Python
 //!   value itself. Driven by `class Entry(ExtRegistryEntry): _about_ =
-//!   <value>` registrations (extregistry.py:11). [`is_registered`] /
+//!   <value>` registrations (extregistry.py). [`is_registered`] /
 //!   [`lookup`] expose this path; the bookkeeper consumes it.
 //! * **Type-level** — `EXT_REGISTRY_BY_TYPE` keyed on a Python type
 //!   object. Driven by `class Entry(ExtRegistryEntry): _type_ = <type>`
-//!   registrations (extregistry.py:14). [`is_registered_type`] /
+//!   registrations (extregistry.py). [`is_registered_type`] /
 //!   [`lookup_type`] expose this path; the signature module consumes
 //!   it.
 //!
@@ -178,14 +178,14 @@ pub enum ExtRegistryEntry {
     /// `BUILTIN_ANALYZERS` entry (`annotator/builtin.rs`, `bigint_from` →
     /// the classdef-less `SomeInstance` shell), which
     /// `Bookkeeper.immutablevalue_hostobject` resolves and returns *before*
-    /// the `extregistry.is_registered` fall-through (bookkeeper.py:309-314).
+    /// the `extregistry.is_registered` fall-through (bookkeeper.py).
     /// So this entry only ever fires on the rtyper's `findbltintyper` →
     /// `specialize_call` path (the same dual-registration shape as
     /// [`Self::WeAreJitted`]); its `compute_annotation` is unreachable in
     /// practice and returns the same opaque shell to stay a faithful port.
     BigIntFrom,
     /// `longlong2float.float2longlong(f64) -> i64` — RPython
-    /// `Float2LongLongEntry(ExtRegistryEntry)` (`rlib/longlong2float.py:76-86`).
+    /// `Float2LongLongEntry(ExtRegistryEntry)` (`rlib/longlong2float.py`).
     /// Reinterprets the f64 bit pattern as a signed longlong via the
     /// `convert_float_bytes_to_longlong` llop.  Same dual-registration shape as
     /// [`Self::BigIntFrom`]: the annotation half is served by the
@@ -208,7 +208,7 @@ pub enum RegisteredAnnotation {
     Str,
 }
 
-/// RPython `class FlexibleWeakDict(UserDict.DictMixin)` (`extregistry.py:78-112`).
+/// RPython `class FlexibleWeakDict(UserDict.DictMixin)` (`extregistry.py`).
 ///
 /// Upstream stores hashable non-weakrefable keys in `_regdict`,
 /// weakrefable keys in `_weakdict`, and unhashable keys wrapped in
@@ -408,7 +408,7 @@ impl ExtRegistryEntry {
             // so the base returns
             // `SomeBuiltin(self.compute_result_annotation,
             //              methodname=getattr(func, '__name__', None))`.
-            // The `SomeBuiltin.call` dispatcher (unaryop.py:940-946)
+            // The `SomeBuiltin.call` dispatcher (unaryop.py)
             // then drives the bound-method `compute_result_annotation`
             // — Rust mirrors that by special-casing the
             // `SomeValue::Builtin` arm in `model.rs::SomeValue::call`:
@@ -451,7 +451,7 @@ impl ExtRegistryEntry {
                 Ok(SomeValue::Builtin(result))
             }
             // RPython's `we_are_jitted` ExtRegistryEntry annotates the
-            // call `SomeInteger(nonneg=True)` (rlib/jit.py:399); pyre's
+            // call `SomeInteger(nonneg=True)` (rlib/jit.py); pyre's
             // `we_are_jitted() -> bool` makes the faithful annotation
             // `SomeBool` — the same one the
             // `majit_metainterp.jit.we_are_jitted` `BUILTIN_ANALYZERS`
@@ -519,11 +519,11 @@ impl ExtRegistryEntry {
                     kwds_s,
                 )
             }
-            // rlib/jit.py:1012-1014 — `ExtLoopHeader` returns
+            // rlib/jit.py — `ExtLoopHeader` returns
             // `annmodel.s_None` and ignores any kwds (loop_header
             // takes only `self` upstream).
             ExtRegistryEntry::LoopHeader { .. } => Ok(s_none()),
-            // upstream rarithmetic.py:574-577 — `ForTypeEntry.\
+            // upstream rarithmetic.py — `ForTypeEntry.\
             // compute_result_annotation(self, *args_s, **kwds_s)` returns
             // `SomeInteger(knowntype=int_type)`.  The instance is the int
             // class object (`r_uint`, `r_ulonglong`, ...); pyre records
@@ -548,9 +548,9 @@ impl ExtRegistryEntry {
         }
     }
 
-    /// rbuiltin.py:81 `entry.specialize_call` attribute lookup.
+    /// rbuiltin.py `entry.specialize_call` attribute lookup.
     ///
-    /// Upstream `ExtRegistryEntry` (extregistry.py:33-72) does not
+    /// Upstream `ExtRegistryEntry` (extregistry.py) does not
     /// define a base `specialize_call` method; subclasses that override
     /// it return a typer callable that `findbltintyper` returns
     /// directly, while subclasses that do not override it raise
@@ -561,7 +561,7 @@ impl ExtRegistryEntry {
     /// `TyperError` so the rtyper fails closed at the same point.
     pub(crate) fn specialize_call(&self) -> Result<BuiltinTyperFn, TyperError> {
         match self {
-            // lltype.py:1513-1518 `_ptrEntry(ExtRegistryEntry)` defines
+            // lltype.py `_ptrEntry(ExtRegistryEntry)` defines
             // only `_type_` and `compute_annotation` — no
             // `specialize_call`. Upstream raises AttributeError at
             // `entry.specialize_call`.
@@ -592,7 +592,7 @@ impl ExtRegistryEntry {
                      `findbltintyper` cannot capture marker meta in a function pointer",
                 ))
             }
-            // upstream rarithmetic.py:579-582 — `ForTypeEntry.\
+            // upstream rarithmetic.py — `ForTypeEntry.\
             // specialize_call(self, hop)`:
             //     v_result, = hop.inputargs(hop.r_result.lowleveltype)
             //     hop.exception_cannot_occur()
@@ -613,7 +613,7 @@ impl ExtRegistryEntry {
                     )))
                 }
             }
-            // rlib/jit.py:404-406 — `Entry(_about_=we_are_jitted).\
+            // rlib/jit.py — `Entry(_about_=we_are_jitted).\
             // specialize_call(self, hop)`:
             //     hop.exception_cannot_occur()
             //     return hop.inputconst(lltype.Signed, _we_are_jitted)
@@ -630,7 +630,7 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::BigIntFrom => {
                 Ok(super::rbuiltin::rtype_bigint_from as BuiltinTyperFn)
             }
-            // `rlib/longlong2float.py:83-86` — `Float2LongLongEntry.specialize_call`
+            // `rlib/longlong2float.py` — `Float2LongLongEntry.specialize_call`
             // emits `genop('convert_float_bytes_to_longlong', [v_float], SignedLongLong)`.
             ExtRegistryEntry::Float2LongLong => {
                 Ok(super::rbuiltin::rtype_float2longlong as BuiltinTyperFn)
@@ -642,7 +642,7 @@ impl ExtRegistryEntry {
         }
     }
 
-    /// rlib/jit.py:952-1006 — `ExtEnterLeaveMarker.specialize_call(self,
+    /// rlib/jit.py — `ExtEnterLeaveMarker.specialize_call(self,
     /// hop, **kwds_i)`.
     ///
     /// ```python
@@ -672,7 +672,7 @@ impl ExtRegistryEntry {
     ///     return hop.genop('jit_marker', vlist, resulttype=lltype.Void)
     /// ```
     ///
-    /// rlib/jit.py:1016-1023 — `ExtLoopHeader.specialize_call(self, hop)`:
+    /// rlib/jit.py — `ExtLoopHeader.specialize_call(self, hop)`:
     ///
     /// ```python
     /// def specialize_call(self, hop):
@@ -870,7 +870,7 @@ fn bind_lookup_instance(entry: ExtRegistryEntry, instance: &HostObject) -> ExtRe
 }
 
 fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
-    // rlib/jit.py:396 `class Entry(ExtRegistryEntry): _about_ =
+    // rlib/jit.py `class Entry(ExtRegistryEntry): _about_ =
     // we_are_jitted`. The `_about_` value is the host callable itself;
     // match it by qualified name (the same key `annotator/builtin.rs`
     // registers for `BUILTIN_ANALYZERS`).
@@ -903,10 +903,10 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
 }
 
 // ---------------------------------------------------------------------------
-// Value-level registry — RPython `EXT_REGISTRY_BY_VALUE` (extregistry.py:115).
+// Value-level registry — RPython `EXT_REGISTRY_BY_VALUE` (extregistry.py).
 // ---------------------------------------------------------------------------
 
-/// RPython `extregistry.is_registered(instance)` (extregistry.py:141-146).
+/// RPython `extregistry.is_registered(instance)` (extregistry.py).
 ///
 /// Upstream:
 ///
@@ -938,7 +938,7 @@ pub fn is_registered(instance: &ConstValue) -> bool {
     }
 }
 
-/// RPython `extregistry.lookup(instance)` (extregistry.py:137-139).
+/// RPython `extregistry.lookup(instance)` (extregistry.py).
 ///
 /// Upstream:
 ///
@@ -960,10 +960,10 @@ pub fn lookup(instance: &ConstValue) -> Option<ExtRegistryEntry> {
 }
 
 // ---------------------------------------------------------------------------
-// Type-level registry — RPython `EXT_REGISTRY_BY_TYPE` (extregistry.py:116).
+// Type-level registry — RPython `EXT_REGISTRY_BY_TYPE` (extregistry.py).
 // ---------------------------------------------------------------------------
 
-/// RPython `extregistry.is_registered_type(tp)` (extregistry.py:128-129).
+/// RPython `extregistry.is_registered_type(tp)` (extregistry.py).
 ///
 /// Upstream consults `EXT_REGISTRY_BY_TYPE` directly. The Rust port
 /// first checks the HostObject registry dict populated by
@@ -972,7 +972,7 @@ pub fn is_registered_type(host: &HostObject) -> bool {
     host_type_registry().lock().unwrap().contains_key(host)
 }
 
-/// RPython `extregistry.lookup_type(tp)` (extregistry.py:124-126).
+/// RPython `extregistry.lookup_type(tp)` (extregistry.py).
 ///
 /// Upstream:
 ///
@@ -1000,7 +1000,7 @@ mod tests {
         nullptr(RUNTIME_TYPE_INFO.clone()).expect("RUNTIME_TYPE_INFO is a container type")
     }
 
-    /// upstream extregistry.py:141-146 — `is_registered` returns True
+    /// upstream extregistry.py — `is_registered` returns True
     /// for any value whose type is registered (here, `_ptr`).
     #[test]
     fn is_registered_matches_llptr_value() {
@@ -1052,11 +1052,11 @@ mod tests {
         assert_eq!(dict.__delitem__(&"a".to_string()), Some(1));
     }
 
-    /// rlib/jit.py:396 `class Entry(ExtRegistryEntry): _about_ =
+    /// rlib/jit.py `class Entry(ExtRegistryEntry): _about_ =
     /// we_are_jitted` — the `we_are_jitted` host callable surfaces the
     /// `WeAreJitted` entry, whose `specialize_call` resolves the rtyper
     /// path. `compute_annotation` returns `SomeBool` — the faithful
-    /// port of RPython's `SomeInteger(nonneg=True)` (rlib/jit.py:399)
+    /// port of RPython's `SomeInteger(nonneg=True)` (rlib/jit.py)
     /// for pyre's bool-typed `we_are_jitted`, the same annotation the
     /// `BUILTIN_ANALYZERS` entry serves.
     #[test]
@@ -1254,7 +1254,7 @@ mod tests {
         })
     }
 
-    /// rlib/jit.py:798-810 — `_make_extregistryentries` registers
+    /// rlib/jit.py — `_make_extregistryentries` registers
     /// `(jit_merge_point, can_enter_jit)` to one Entry class and
     /// `loop_header` to another. The Rust port replays the
     /// registration shape through HostObject identities.
@@ -1472,7 +1472,7 @@ mod tests {
         assert_eq!(cache.len(), 2, "two kwarg keys, not duplicated per call");
     }
 
-    /// rlib/jit.py:1012-1014 — `ExtLoopHeader.compute_result_annotation`
+    /// rlib/jit.py — `ExtLoopHeader.compute_result_annotation`
     /// returns `annmodel.s_None` and accepts no kwargs.
     #[test]
     fn loop_header_compute_annotation_with_kwds_is_s_none() {
@@ -1486,7 +1486,7 @@ mod tests {
         assert!(matches!(result, SomeValue::None_(_)));
     }
 
-    /// upstream extregistry.py:62-67 — base `compute_annotation` returns
+    /// upstream extregistry.py — base `compute_annotation` returns
     /// `SomeBuiltin(self.compute_result_annotation,
     ///              methodname=getattr(func, '__name__', None))`. The
     /// Rust port mirrors that for both marker variants so the
@@ -1540,7 +1540,7 @@ mod tests {
         }
     }
 
-    /// rlib/jit.py:889-890 + 925-950 — `jit_merge_point` triggers
+    /// rlib/jit.py + 925-950 — `jit_merge_point` triggers
     /// `annotate_hooks`, which routes each driver hook through
     /// `bk.emulate_pbc_call('jitdriver.<hook>', s_func, args_s)`. After
     /// dispatch, the unique key must be present in
@@ -1604,7 +1604,7 @@ mod tests {
         let _ = location_func;
     }
 
-    /// rlib/jit.py:889 — only `jit_merge_point` runs `annotate_hooks`.
+    /// rlib/jit.py — only `jit_merge_point` runs `annotate_hooks`.
     /// `can_enter_jit` must skip the branch entirely so the hook
     /// callable's annotation is not pre-emulated by every reflow.
     #[test]

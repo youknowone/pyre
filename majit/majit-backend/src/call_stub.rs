@@ -4,18 +4,18 @@
 //! it materializes a typed `extern "C" fn` from a raw funcptr and forwards
 //! arguments in the calldescr declaration order preserved by `arg_classes`.
 //! `bh_call_f_dispatch` and `bh_call_v_dispatch` are the float-returning and
-//! void-returning parallels for `llmodel.py:825 bh_call_f` and
-//! `llmodel.py:834 bh_call_v`.
+//! void-returning parallels for `llmodel.py bh_call_f` and
+//! `llmodel.py bh_call_v`.
 //!
 //! Upstream `descr.py:574` builds the generated call expression by walking
-//! `self.arg_classes`, and `descr.py:604-605` builds `FuncType(ARGS, RESULT)`
+//! `self.arg_classes`, and `descr.py` builds `FuncType(ARGS, RESULT)`
 //! from that same ordered class list. Matching that shape is required by the
 //! Microsoft x64 positional-slot convention and is also correct under SysV and
 //! AAPCS.
 
 use majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY;
 
-/// `descr.py:556-570 TYPE()` collapsed to the two C-ABI register classes the
+/// `descr.py TYPE()` collapsed to the two C-ABI register classes the
 /// dispatch table can express: `'i'`, `'r'` and `'L'` (`lltype.Signed`,
 /// `llmemory.GCREF`, `lltype.SignedLongLong`) all pass in an integer register;
 /// `'f'` (`lltype.Float`) passes in a floating-point register.
@@ -29,7 +29,7 @@ pub enum ArgClass {
 /// and `bh_call_v_dispatch`. `$ret` plugs into both the function-pointer
 /// signature and the dispatch function's return type.
 ///
-/// `descr.py:574` / `descr.py:604-605 create_call_stub` parity: the signature
+/// `descr.py` / `descr.py create_call_stub` parity: the signature
 /// is built in `arg_classes` declaration order, so `fn(f64, i64)` is dispatched
 /// as `extern "C" fn(f64, i64)` rather than a class-blind
 /// `extern "C" fn(i64, f64)`. That preserves SysV/AAPCS register-file order
@@ -1065,7 +1065,7 @@ macro_rules! dispatch_classes_body {
             classes => {
                 // TODO: upstream
                 // `rpython/jit/backend/llsupport/descr.py:574` /
-                // `descr.py:604-605 create_call_stub` generates a
+                // `descr.py create_call_stub` generates a
                 // per-calldescr stub at translation time, so every class
                 // sequence has a matching extern "C" signature. Rust has no
                 // translation-time codegen equivalent here, so the dispatch
@@ -1096,10 +1096,10 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
     unsafe { dispatch_classes_body!(func, classes, args, i64) }
 }
 
-/// llmodel.py:834 bh_call_v: void-typed parallel of `bh_call_i_dispatch`.
+/// llmodel.py bh_call_v: void-typed parallel of `bh_call_i_dispatch`.
 ///
 /// Safety: `func` must be a valid function pointer matching `classes`.
-/// `descr.py:590-605 create_call_stub` builds a real void-returning stub for
+/// `descr.py create_call_stub` builds a real void-returning stub for
 /// `RESULT == lltype.Void`; calling such a function through an `i64`-returning
 /// transmute reads garbage from rax/x0, so the canonical
 /// `BC_RESIDUAL_CALL_*_V` blackhole/trace path must use this dispatcher.
@@ -1110,10 +1110,10 @@ pub unsafe fn bh_call_v_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
     unsafe { dispatch_classes_body!(func, classes, args, ()) }
 }
 
-/// llmodel.py:825 bh_call_f: f64-typed parallel of `bh_call_i_dispatch`.
+/// llmodel.py bh_call_f: f64-typed parallel of `bh_call_i_dispatch`.
 ///
 /// Safety: `func` must be a valid function pointer matching `classes`.
-/// `descr.py:584-605 create_call_stub` generates a real f64-returning stub for
+/// `descr.py create_call_stub` generates a real f64-returning stub for
 /// `RESULT == lltype.Float`; the C ABI returns f64 in xmm0 / d0 rather than
 /// rax / x0, so an `i64`-typed transmute would read uninitialized integer-bank
 /// state.
@@ -1165,11 +1165,11 @@ impl CallArgs {
     }
 }
 
-/// `descr.py:615` `assert self.result_type in return_type` — the half of
+/// `descr.py` `assert self.result_type in return_type` — the half of
 /// `verify_types` that [`collect_call_args`] does not cover.
 ///
 /// `accepted` is the caller's `return_type`, the literal each `bh_call_*`
-/// passes in `llmodel.py:816/822/828/835`: `"iS"` (`history.INT + 'S'`),
+/// passes in `llmodel.py/822/828/835`: `"iS"` (`history.INT + 'S'`),
 /// `"r"`, `"fL"` (`history.FLOAT + 'L'`) and `"v"`.
 ///
 /// This is not redundant with the argument-class check. Nothing on the call
@@ -1206,7 +1206,7 @@ pub fn verify_result_type(result_type: char, accepted: &str) {
 ///
 /// `arg_classes` is the per-argument class string from
 /// `majit_translate::jitcode::BhCallDescr`. RPython
-/// `rpython/jit/backend/llsupport/descr.py:545-574 create_call_stub`'s
+/// `rpython/jit/backend/llsupport/descr.py create_call_stub`'s
 /// `process(c)` walks the class string in declaration order and pulls the next
 /// item out of the corresponding storage bank.
 ///
@@ -1232,7 +1232,7 @@ pub fn verify_result_type(result_type: char, accepted: &str) {
 /// today; reaching it requires a foreign-supplied calldescr (e.g. a
 /// build-time bincode embed loaded from RPython).
 ///
-/// Mirrors `rpython/jit/backend/llsupport/descr.py:616-620 verify_types`:
+/// Mirrors `rpython/jit/backend/llsupport/descr.py verify_types`:
 /// the per-class counts in `arg_classes` must match the corresponding list
 /// length, and any unknown class is a codegen bug.
 ///
@@ -1245,7 +1245,7 @@ pub fn collect_call_args(
     args_r: Option<&[i64]>,
     args_f: Option<&[i64]>,
 ) -> CallArgs {
-    // descr.py:616-620 verify_types parity: assert per-class counts.
+    // descr.py verify_types parity: assert per-class counts.
     let count_i: usize = arg_classes
         .chars()
         .filter(|c| matches!(c, 'i' | 'S'))
@@ -1299,7 +1299,7 @@ pub fn collect_call_args(
                 fi += 1;
             }
             'L' => {
-                // descr.py:546-548 process('L'): storage bank = `args_f`
+                // descr.py process('L'): storage bank = `args_f`
                 // (PyPy rewrites `c = 'f'` for the lookup); FUNC parameter
                 // type = `lltype.SignedLongLong` -> C `long long` ->
                 // 8-byte int dispatched in an integer register.
@@ -1310,7 +1310,7 @@ pub fn collect_call_args(
                 fi += 1;
             }
             'S' => {
-                // descr.py:551-552 process('S'): storage bank = `args_i`
+                // descr.py process('S'): storage bank = `args_i`
                 // (PyPy reads via `int2singlefloat(args_i[..])`); FUNC
                 // parameter type = `lltype.SingleFloat` -> C `float` ->
                 // 32-bit float dispatched in an xmm/d register. pyre's
@@ -1384,7 +1384,7 @@ pub fn collect_call_args_positional(
 ///
 /// `bh_call_*_dispatch` transmutes the funcptr to an `extern "C" fn` built
 /// from `arg_classes` declaration order, matching `descr.py:574` /
-/// `descr.py:604-605 create_call_stub`. wasm32 still cannot use that direct
+/// `descr.py create_call_stub`. wasm32 still cannot use that direct
 /// transmute path: `call_indirect` type-checks the callee's declared type on
 /// every call, and a pointer parameter is `i32` where the native table uses
 /// `i64`, so a mistyped guess traps with `indirect call type mismatch`.

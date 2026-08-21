@@ -96,7 +96,7 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
 
 /// Allocate a new bytearray filled with zeros.
 ///
-/// `dont_look_inside` (`rlib/jit.py:139`): the GC-managed box allocation is not
+/// `dont_look_inside` (`rlib/jit.py`): the GC-managed box allocation is not
 /// phaseA-liftable, so the JIT residualises the call, matching the
 /// `w_bytes_from_bytes` residual boundary.
 #[majit_macros::dont_look_inside]
@@ -120,7 +120,7 @@ pub fn w_bytearray_try_new(size: usize) -> Option<PyObjectRef> {
 
 /// Allocate a new bytearray from a byte slice.
 ///
-/// `dont_look_inside` (`rlib/jit.py:139`): see [`w_bytearray_new`].
+/// `dont_look_inside` (`rlib/jit.py`): see [`w_bytearray_new`].
 #[majit_macros::dont_look_inside]
 pub fn w_bytearray_from_bytes(bytes: &[u8]) -> PyObjectRef {
     w_bytearray_alloc(bytes.to_vec())

@@ -1,4 +1,4 @@
-//! `rpython/memory/gctransform/framework.py:1501 get_livevars_for_roots` —
+//! `rpython/memory/gctransform/framework.py get_livevars_for_roots` —
 //! which GC pointers are live across an operation that can collect.
 //!
 //! Upstream reads the answer straight off the flow graph with

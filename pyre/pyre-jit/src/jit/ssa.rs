@@ -1,7 +1,7 @@
 //! Port of `rpython/translator/backendopt/ssa.py` onto pyre-jit's flow graph.
 //!
 //! Provides `DataFlowFamilyBuilder` and `SSA_to_SSI`, the data-flow phi-family
-//! analysis the `simplify_graph` pass list depends on (`simplify.py:1067`).
+//! analysis the `simplify_graph` pass list depends on (`simplify.py`).
 //! Port reference: `majit/majit-translate/src/translator/backendopt/ssa.rs`.
 //!
 //! Classification (issue #112 scope #4): **direct PyPy parity**.
@@ -23,18 +23,18 @@ struct Opportunity {
     linkvars: Vec<FlowValue>,
 }
 
-/// `rpython/translator/backendopt/ssa.py:4-90` `class DataFlowFamilyBuilder`.
+/// `rpython/translator/backendopt/ssa.py` `class DataFlowFamilyBuilder`.
 pub struct DataFlowFamilyBuilder {
     /// `self.opportunities` (ssa.py:17).
     opportunities: Vec<Opportunity>,
     /// `self.opportunities_with_const` (ssa.py:18).
     opportunities_with_const: Vec<Opportunity>,
-    /// `self.variable_families = UnionFind()` (ssa.py:36).
+    /// `self.variable_families = UnionFind()` (ssa.py).
     pub variable_families: UnionFind<FlowValue, ()>,
 }
 
 impl DataFlowFamilyBuilder {
-    /// `DataFlowFamilyBuilder.__init__(self, graph)` (ssa.py:12-36).
+    /// `DataFlowFamilyBuilder.__init__(self, graph)` (ssa.py).
     pub fn new(graph: &FunctionGraph) -> Self {
         let mut opportunities: Vec<Opportunity> = Vec::new();
         let mut opportunities_with_const: Vec<Opportunity> = Vec::new();
@@ -83,7 +83,7 @@ impl DataFlowFamilyBuilder {
         }
     }
 
-    /// `DataFlowFamilyBuilder.complete(self)` (ssa.py:38-63).
+    /// `DataFlowFamilyBuilder.complete(self)` (ssa.py).
     pub fn complete(&mut self) -> bool {
         let mut any_progress_at_all = false;
         let mut progress = true;
@@ -139,7 +139,7 @@ impl DataFlowFamilyBuilder {
         any_progress_at_all
     }
 
-    /// `DataFlowFamilyBuilder.merge_identical_phi_nodes(self)` (ssa.py:65-86).
+    /// `DataFlowFamilyBuilder.merge_identical_phi_nodes(self)` (ssa.py).
     pub fn merge_identical_phi_nodes(&mut self) -> bool {
         let mut any_progress_at_all = false;
         let mut progress = true;
@@ -178,7 +178,7 @@ impl DataFlowFamilyBuilder {
         any_progress_at_all
     }
 
-    /// `DataFlowFamilyBuilder.get_variable_families(self)` (ssa.py:88-90).
+    /// `DataFlowFamilyBuilder.get_variable_families(self)` (ssa.py).
     pub fn get_variable_families(&mut self) -> &mut UnionFind<FlowValue, ()> {
         self.complete();
         &mut self.variable_families
@@ -206,7 +206,7 @@ fn exitswitch_variables(sw: &ExitSwitch) -> Vec<Variable> {
     }
 }
 
-/// `rpython/translator/backendopt/ssa.py:128-132` `variables_created_in`.
+/// `rpython/translator/backendopt/ssa.py` `variables_created_in`.
 ///
 /// ```python
 /// def variables_created_in(block):
@@ -229,7 +229,7 @@ pub fn variables_created_in(block: &BlockRef) -> HashSet<FlowValue> {
     result
 }
 
-/// `rpython/translator/backendopt/ssa.py:135-196` `SSA_to_SSI(graph, annotator=None)`.
+/// `rpython/translator/backendopt/ssa.py` `SSA_to_SSI(graph, annotator=None)`.
 ///
 /// Ensures every Variable used in a block is either defined in that block or
 /// added to its inputargs (and to every incoming link's args), so the graph is

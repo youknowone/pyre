@@ -1,7 +1,7 @@
 //! `array_fields = { Struct::field => ElementType }` — the element descr's
 //! sign flag.
 //!
-//! `descr.py:240-254 get_type_flag(FIELDTYPE)` reads signedness off the
+//! `descr.py get_type_flag(FIELDTYPE)` reads signedness off the
 //! declared element type, and a load honours it: a signed descr sign-extends
 //! the sub-word it read.  So an element declared `u8` whose byte is `0x80`
 //! must reach the trace as `128` — the value the concrete Rust read produces —
@@ -116,7 +116,7 @@ fn a_signed_element_type_still_interns_a_signed_element_descr() {
 /// An `array_fields` buffer is a bare `*mut T` with no object header, so its
 /// element descr must NOT be GC-managed.
 ///
-/// `ArrayPtrInfo::make_guards` (`info.py:632-639`) emits `GUARD_GC_TYPE` for a
+/// `ArrayPtrInfo::make_guards` (`info.py`) emits `GUARD_GC_TYPE` for a
 /// GC-managed array descr, and that guard reads a type-id word at
 /// `ptr - GcHeader::SIZE`. Ahead of a header-less buffer that word belongs to
 /// whatever precedes the allocation, so once the base is red and the loop

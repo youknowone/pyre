@@ -51,7 +51,7 @@ pub fn binary_value(
     if op == BinaryOperator::InplacePower {
         return crate::objspace::descroperation::inplace_pow(a, b);
     }
-    // descroperation.py:825 `inplace_impl` — consult the in-place
+    // descroperation.py `inplace_impl` — consult the in-place
     // special first; fall through to the binary op below when absent or
     // `NotImplemented`.
     if let Some(idunder) = inplace_dunder_name(op).filter(|_| !skips_inplace_special(a, b, op)) {
@@ -790,7 +790,7 @@ pub fn dict_merge_value(
     source: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> Result<(), PyError> {
-    // pyopcode.py:1979 `_dict_merge`.
+    // pyopcode.py `_dict_merge`.
     // `__len__`, `keys()`, `__getitem__` and `__contains__` all run Python, so
     // every step below is a collection point, and the three operands arrive as
     // native copies no root walker updates — the dispatch peeked them and the
@@ -950,7 +950,7 @@ pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 
     match binary_value_from_tag(a as PyObjectRef, b as PyObjectRef, op_tag) {
         Ok(value) => value as i64,
         Err(mut err) => {
-            // llmodel.py:194-199 _store_exception: publish into the backend
+            // llmodel.py _store_exception: publish into the backend
             // exception cells so the trailing GuardNoException deopts and
             // re-raises through the blackhole.  Return null — the guard fires
             // before the result is used.
@@ -966,7 +966,7 @@ pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64
         Ok(value) => value as i64,
         Err(mut err) => {
             // Publish + null so the trailing GuardNoException deopts and
-            // re-raises (llmodel.py:194-199 _store_exception).
+            // re-raises (llmodel.py _store_exception).
             crate::runtime_ops::jit_publish_exception(err.to_exc_object());
             0
         }
@@ -979,7 +979,7 @@ pub extern "C" fn jit_unary_negative_value(value: i64) -> i64 {
         Ok(result) => result as i64,
         Err(mut err) => {
             // Publish + null so the trailing GuardNoException deopts and
-            // re-raises (llmodel.py:194-199 _store_exception).
+            // re-raises (llmodel.py _store_exception).
             crate::runtime_ops::jit_publish_exception(err.to_exc_object());
             0
         }
@@ -992,7 +992,7 @@ pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
         Ok(result) => result as i64,
         Err(mut err) => {
             // Publish + null so the trailing GuardNoException deopts and
-            // re-raises (llmodel.py:194-199 _store_exception).
+            // re-raises (llmodel.py _store_exception).
             crate::runtime_ops::jit_publish_exception(err.to_exc_object());
             0
         }
@@ -1004,7 +1004,7 @@ pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     match getitem(obj as PyObjectRef, index as PyObjectRef) {
         Ok(value) => value as i64,
         Err(mut err) => {
-            // llmodel.py:194-199 _store_exception: publish the exception into
+            // llmodel.py _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
             // after BINARY_SUBSCR (instruction_may_raise) deopts and re-raises
             // through the blackhole resume instead of crashing.  Return null —
@@ -1026,7 +1026,7 @@ pub extern "C" fn jit_setitem(obj: i64, index: i64, value: i64) {
         // the same so the recorded residual is a void `CALL_N`.
         Ok(_) => {}
         Err(mut err) => {
-            // llmodel.py:194-199 _store_exception: publish the exception into
+            // llmodel.py _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
             // after STORE_SUBSCR (instruction_may_raise) deopts and re-raises
             // through the blackhole resume instead of crashing.
@@ -1042,7 +1042,7 @@ pub extern "C" fn jit_getattr(obj: i64, name_ptr: i64, name_len: i64) -> i64 {
     match crate::getattr_str(obj as PyObjectRef, name) {
         Ok(value) => value as i64,
         Err(mut err) => {
-            // llmodel.py:194-199 _store_exception: publish the exception into
+            // llmodel.py _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
             // after LOAD_ATTR (instruction_may_raise) deopts and re-raises
             // through the blackhole resume instead of crashing.  Return null —
@@ -1060,7 +1060,7 @@ pub extern "C" fn jit_setattr(obj: i64, name_ptr: i64, name_len: i64, value: i64
     match crate::setattr_str(obj as PyObjectRef, name, value as PyObjectRef) {
         Ok(_) => 0,
         Err(mut err) => {
-            // llmodel.py:194-199 _store_exception: publish the exception into
+            // llmodel.py _store_exception: publish the exception into
             // the backend pos_exception cells so the GuardNoException recorded
             // after STORE_ATTR (instruction_may_raise) deopts and re-raises
             // through the blackhole resume instead of crashing.  Return garbage

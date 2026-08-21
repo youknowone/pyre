@@ -1,8 +1,8 @@
 //! A tracing abort taken mid-source-opcode must not skip that opcode's
 //! remaining effects on a `[.. ; virt]` state.
 //!
-//! `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` answers an abort by
-//! running `blackhole.py:1799 convert_and_run_from_pyjitpl`, which finishes the
+//! `pyjitpl.py run_blackhole_interp_to_cancel_tracing` answers an abort by
+//! running `blackhole.py convert_and_run_from_pyjitpl`, which finishes the
 //! aborting framestack in the blackhole and resumes from the merge point it
 //! reaches. Without that consumer the abort hands back the walk's root-frame
 //! source pc, which dispatch advanced *before* the opcode arm ran — so a

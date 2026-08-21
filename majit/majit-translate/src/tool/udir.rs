@@ -2,7 +2,7 @@
 //!
 //! Upstream creates a process-wide "usession" directory named
 //! `$PYPY_USESSION_DIR/usession-$PYPY_USESSION_BASENAME-N` and exposes it
-//! as module global `udir` (`udir.py:28-51`).  This Rust port mirrors
+//! as module global `udir` (`udir.py`).  This Rust port mirrors
 //! upstream's environment-variable contract, the basename defaulting that
 //! consults `rpython.tool.version.get_repo_version_info` (`udir.py:31-40`),
 //! and the numbered-directory + cleanup machinery (`udir.py:46`,
@@ -32,7 +32,7 @@ fn pypy_keep() -> usize {
         .unwrap_or(3)
 }
 
-/// Process-wide equivalent of upstream module global `udir` (`udir.py:50-51`).
+/// Process-wide equivalent of upstream module global `udir` (`udir.py`).
 pub fn udir() -> &'static Path {
     static UDIR: OnceLock<PathBuf> = OnceLock::new();
     UDIR.get_or_init(|| {
@@ -45,10 +45,10 @@ pub fn udir() -> &'static Path {
     .as_path()
 }
 
-/// Port of upstream `make_udir(dir=None, basename=None)` (`udir.py:28-48`).
+/// Port of upstream `make_udir(dir=None, basename=None)` (`udir.py`).
 pub fn make_udir(dir: Option<PathBuf>, basename: Option<String>) -> std::io::Result<PathBuf> {
     let root = dir.unwrap_or_else(env::temp_dir);
-    // Upstream `udir.py:31-40`: if `basename is None`, look up the repo's
+    // Upstream `udir.py`: if `basename is None`, look up the repo's
     // `(hgtag, hgid)` via `get_repo_version_info`.  The first element
     // (tag/branch) is used as basename; '?' is rewritten to 'unknown'.
     let basename = match basename {
@@ -164,7 +164,7 @@ fn refresh_user_symlink(root: &Path, prefix: &str, target: &Path) {
     }
 }
 
-/// Port of `rpython.tool.version.get_repo_version_info` (`version.py:22-31`)
+/// Port of `rpython.tool.version.get_repo_version_info` (`version.py`)
 /// for the git path only.  Returns `(branch_or_tag, revision_id)` when the
 /// surrounding source tree is a git checkout, `None` otherwise.  Mercurial
 /// is upstream's other branch (`version.py:48-94`); this port targets the

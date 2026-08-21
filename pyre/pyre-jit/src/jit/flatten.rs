@@ -3,7 +3,7 @@
 //! Covers the data structures the rest of the codewriter pipeline
 //! (`liveness.py`, `assembler.py`) consumes: `SSARepr`, `Label`, `TLabel`,
 //! `Register`, `ListOfKind`, `IndirectCallTargets`, and the `KINDS`
-//! constant. The `GraphFlattener` driver at `flatten.py:60-350` has no
+//! constant. The `GraphFlattener` driver at `flatten.py` has no
 //! 1:1 analog in pyre because pyre's input is a CPython `CodeObject`
 //! rather than an RPython `FunctionGraph`; the equivalent walker lives
 //! in `codewriter.rs` and produces an `SSARepr` whose `insns` contents
@@ -27,7 +27,7 @@ use super::flow::{
     Variable,
 };
 
-/// `rpython/jit/codewriter/flatten.py:59` `KINDS = ['int', 'ref', 'float']`.
+/// `rpython/jit/codewriter/flatten.py` `KINDS = ['int', 'ref', 'float']`.
 ///
 /// RPython stores register kinds as strings; the `Kind` enum is the Rust
 /// analog. The `as_str` method yields the exact RPython string so callers
@@ -89,7 +89,7 @@ impl Kind {
     }
 }
 
-/// `flatten.py:6-10` `class SSARepr(object)`.
+/// `flatten.py` `class SSARepr(object)`.
 ///
 /// Python:
 /// ```py
@@ -211,7 +211,7 @@ impl SSARepr {
     }
 }
 
-/// `flatten.py:12-18` `class Label(object)`.
+/// `flatten.py` `class Label(object)`.
 ///
 /// Python:
 /// ```py
@@ -234,7 +234,7 @@ impl Label {
     }
 }
 
-/// `flatten.py:20-26` `class TLabel(object)`.
+/// `flatten.py` `class TLabel(object)`.
 ///
 /// Python:
 /// ```py
@@ -258,7 +258,7 @@ impl TLabel {
 }
 
 /// Upstream-orthodox per-block label naming.  `rpython/jit/codewriter/
-/// flatten.py:116` emits `Label(block)` once per `SpamBlock` using
+/// flatten.py` emits `Label(block)` once per `SpamBlock` using
 /// Python object identity as the implicit name.  Pyre serializes the
 /// block's `Rc` pointer to a stable per-run string for use in
 /// `Insn::Label` / `Operand::TLabel`.
@@ -278,7 +278,7 @@ pub fn block_tlabel(block: &super::flow::BlockRef) -> TLabel {
     TLabel::new(block_label_name(block))
 }
 
-/// `flatten.py:28-33` `class Register(object)`.
+/// `flatten.py` `class Register(object)`.
 ///
 /// Python:
 /// ```py
@@ -306,7 +306,7 @@ impl Register {
     }
 }
 
-/// `flatten.py:35-51` `class ListOfKind(object)`.
+/// `flatten.py` `class ListOfKind(object)`.
 ///
 /// Python:
 /// ```py
@@ -330,18 +330,18 @@ impl ListOfKind {
         Self { kind, content }
     }
 
-    /// `flatten.py:47` `def __nonzero__(self): return bool(self.content)`.
+    /// `flatten.py` `def __nonzero__(self): return bool(self.content)`.
     pub fn is_empty(&self) -> bool {
         self.content.is_empty()
     }
 
-    /// `flatten.py:45-46` `def __iter__(self): return iter(self.content)`.
+    /// `flatten.py` `def __iter__(self): return iter(self.content)`.
     pub fn iter(&self) -> std::slice::Iter<'_, Operand> {
         self.content.iter()
     }
 }
 
-/// `flatten.py:53-57` `class IndirectCallTargets(object)`.
+/// `flatten.py` `class IndirectCallTargets(object)`.
 ///
 /// Python:
 /// ```py
@@ -362,7 +362,7 @@ pub struct IndirectCallTargets {
     pub lst: Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
 }
 
-/// `rpython/jit/codewriter/jitcode.py:131-143` `class SwitchDictDescr`
+/// `rpython/jit/codewriter/jitcode.py` `class SwitchDictDescr`
 /// as populated by `flatten.py:282-298`.
 ///
 /// Python:
@@ -379,12 +379,12 @@ pub struct IndirectCallTargets {
 /// The SSARepr-side descr carries `_labels` because the liveness pass
 /// (`liveness.py:76-78`) iterates this list to follow switch-target
 /// edges. RPython's runtime `SwitchDictDescr.dict` is set later by
-/// `Assembler.fix_labels` (`assembler.py:258-263`, via `attach`); pyre
+/// `Assembler.fix_labels` (`assembler.py`, via `attach`); pyre
 /// lowers the SSARepr-side `SwitchDictDescr` into the runtime
 /// `BhDescr::SwitchDict` at assemble time.
 #[derive(Debug, Clone, Default)]
 pub struct SwitchDictDescr {
-    /// `flatten.py:284,298` `switchdict._labels.append((key, TLabel(...)))`.
+    /// `flatten.py` `switchdict._labels.append((key, TLabel(...)))`.
     pub labels: Vec<(i64, TLabel)>,
 }
 
@@ -398,7 +398,7 @@ impl SwitchDictDescr {
 ///
 /// RPython's `assembler.py:197-206` handles both regular descrs (runtime
 /// `AbstractDescr`) and the not-yet-attached `SwitchDictDescr` carried as
-/// `isinstance(x, SwitchDictDescr)` (checked at `liveness.py:76`). The
+/// `isinstance(x, SwitchDictDescr)` (checked at `liveness.py`). The
 /// `DescrOperand` enum preserves that distinction so liveness sees
 /// `_labels` and the assembler sees a finalised runtime descr.
 #[derive(Debug, Clone)]
@@ -408,7 +408,7 @@ pub enum DescrOperand {
     /// SSARepr-side `SwitchDictDescr` before `attach()`; liveness reads
     /// its `labels` field to follow control-flow edges.
     SwitchDict(SwitchDictDescr),
-    /// `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call` appends
+    /// `rpython/jit/codewriter/jtransform.py rewrite_call` appends
     /// an `AbstractDescr` (the `calldescr`) at the end of every
     /// `residual_call_*` / `inline_call_*` arg list. The descr carries
     /// `EffectInfo` that downstream (`rpython/jit/metainterp/optimizeopt/
@@ -428,10 +428,10 @@ pub enum DescrOperand {
     /// shape still matches upstream 1:1: one descr operand per residual
     /// call, final argument position.
     CallDescrStub(CallDescrStub),
-    /// `rpython/jit/metainterp/virtualizable.py:73` `VirtualizableInfo
+    /// `rpython/jit/metainterp/virtualizable.py` `VirtualizableInfo
     /// .array_field_descrs[i]` — the `FieldDescr` for the frame field
     /// holding a virtualizable array's pointer.  RPython
-    /// `jtransform.py:1882-1885 do_fixed_list_getitem` and `:1898-1906
+    /// `jtransform.py do_fixed_list_getitem` and `:1898-1906
     /// do_fixed_list_setitem` emit it as the second-to-last operand of
     /// `getarrayitem_vable_X` / `setarrayitem_vable_X` and as one of two
     /// trailing descrs on `arraylen_vable`.  pyre stores the per-array
@@ -439,15 +439,15 @@ pub enum DescrOperand {
     /// array, `locals_cells_stack_w`); assembler dispatch turns it into
     /// a canonical `BhDescr::VableArray` descriptor.
     VableArrayField(u16),
-    /// `rpython/jit/metainterp/virtualizable.py:58` `VirtualizableInfo
+    /// `rpython/jit/metainterp/virtualizable.py` `VirtualizableInfo
     /// .array_descrs[i]` — the `ArrayDescr` for the GcArray that the
     /// `array_field_descr` field points at.  Always paired with a
     /// `VableArrayField(i)` operand at `i+1` in upstream's argv;
-    /// `assembler.py:80-138 emit_const` uses both to encode the per-op
+    /// `assembler.py emit_const` uses both to encode the per-op
     /// bytecode.  pyre carries it as a distinct SSARepr descriptor and the
     /// assembler emits a second `d` operand for the array descriptor.
     VableArray(u16),
-    /// `rpython/jit/metainterp/virtualizable.py:71` `VirtualizableInfo
+    /// `rpython/jit/metainterp/virtualizable.py` `VirtualizableInfo
     /// .static_field_descrs[i]` — the `FieldDescr` for the i-th scalar
     /// (non-array) field of the virtualizable struct. RPython
     /// `jtransform.py:846` (getfield) emits it as the trailing descr
@@ -578,7 +578,7 @@ pub fn intern_call_descr_stub(
 /// directly to reading `effect_info.extraeffect`.
 ///
 /// **Stub limitations.**
-/// RPython `call.py:296-326 getcalldescr` constructs the EffectInfo
+/// RPython `call.py getcalldescr` constructs the EffectInfo
 /// from four static analyzers run over the callee graph:
 ///
 /// | EI field                       | RPython source                        |
@@ -588,7 +588,7 @@ pub fn intern_call_descr_stub(
 /// | `write_descrs_*` (bitsets)     | `readwrite_analyzer.analyze(op, ...)` |
 /// | `can_invalidate`               | `quasiimmut_analyzer.analyze(op)` OR  |
 /// |                                | `randomeffects_analyzer.analyze(op)`  |
-/// | `extraeffect` (elidable 3-way) | `_canraise(op)` (call.py:294-299)     |
+/// | `extraeffect` (elidable 3-way) | `_canraise(op)` (call.py)     |
 /// | `call_release_gil_target`      | `_call_aroundstate_target_` decorator |
 /// | `extradescrs`                  | `_jit_oopspec_extra_` decorator       |
 /// | `can_collect`                  | `collect_analyzer.analyze(op)`        |
@@ -654,7 +654,7 @@ pub fn intern_call_descr_stub(
 /// matching [`majit_metainterp::EffectInfoSlot`] entry that
 /// `JitCallTarget` carries.
 ///
-/// `call.py:282-303 getcalldescr` selects `extraeffect` at codewriter
+/// `call.py getcalldescr` selects `extraeffect` at codewriter
 /// time from the analyzer chain (raise / loopinvariant / elidable);
 /// pyre's macro-time `CallFlavor` already encodes the same per-helper
 /// classification, so this function picks the matching slot const so
@@ -664,7 +664,7 @@ pub fn intern_call_descr_stub(
 /// **Panics for `MayForce` and `ReleaseGil`** — mirroring
 /// `jtransform.py:1677` (`assert not
 /// calldescr.get_extra_info().check_forces_virtual_or_virtualizable()`)
-/// and `pyjitpl.py:2128-2132 do_conditional_call`'s identical assertion.
+/// and `pyjitpl.py do_conditional_call`'s identical assertion.
 /// Those flavors carry runtime-resolved EI fields.  Code paths that
 /// register helpers for residual_call dispatch (which never reads
 /// `JitCallTarget.effect_info_slot`) must classify them through a
@@ -676,10 +676,10 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
         // `graphanalyze.py:109-112` — every `Plain` helper binds an
         // interpreter entry point with no graph for a write analyzer to
         // walk, so its row is `top_result()` → `MOST_GENERAL`, not the
-        // `call.py:301` analyzed `EF_CAN_RAISE`. Matches the EI
+        // `call.py` analyzed `EF_CAN_RAISE`. Matches the EI
         // `effect_info_for_call_flavor` hands the same flavor.
         CallFlavor::Plain => EffectInfoSlot::Unanalyzed,
-        // `call.py:303 getcalldescr` — `EF_CANNOT_RAISE` (`else` branch).
+        // `call.py getcalldescr` — `EF_CANNOT_RAISE` (`else` branch).
         // RPython has a single `EF_CANNOT_RAISE` constant; the "no heap
         // touched" property of `PlainCannotRaiseNoHeap` is captured in
         // the EI's raw/bitstring shape (`effectinfo.py:281-283 empty
@@ -689,14 +689,14 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
         CallFlavor::PlainCannotRaise | CallFlavor::PlainCannotRaiseNoHeap => {
             EffectInfoSlot::CannotRaise
         }
-        // `call.py:291 getcalldescr` — `EF_LOOPINVARIANT`.
+        // `call.py getcalldescr` — `EF_LOOPINVARIANT`.
         CallFlavor::LoopInvariant => EffectInfoSlot::LoopInvariant,
-        // `call.py:292-299 getcalldescr` 3-way elidable pick.
+        // `call.py getcalldescr` 3-way elidable pick.
         CallFlavor::PureCannotRaise => EffectInfoSlot::ElidableCannotRaise,
         CallFlavor::PureOrMemerror => EffectInfoSlot::ElidableOrMemerror,
         CallFlavor::PureCanRaise => EffectInfoSlot::ElidableCanRaise,
-        // `jtransform.py:1677 _rewrite_op_cond_call`'s assert and
-        // `pyjitpl.py:2128-2132 do_conditional_call`'s `assert not
+        // `jtransform.py _rewrite_op_cond_call`'s assert and
+        // `pyjitpl.py do_conditional_call`'s `assert not
         // check_forces_virtual_or_virtualizable()` are violated by
         // these flavors. Crashing here instead of silently lowering
         // to `CanRaise` keeps the assertion semantics intact.
@@ -755,12 +755,12 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
     use majit_ir::{EffectInfo, ExtraEffect};
     match flavor {
         // `EffectInfo::MOST_GENERAL` — the callee has no analyzed
-        // graph, which is `graphanalyze.py:109-112`'s `top_result()`
+        // graph, which is `graphanalyze.py`'s `top_result()`
         // and `effectinfo.py:285-292`'s `EF_RANDOM_EFFECTS` promotion,
-        // not the `graphanalyze.py:60 analyze_external_call`
+        // not the `graphanalyze.py analyze_external_call`
         // `bottom_result()` reserved for external C functions.
         CallFlavor::Plain => majit_metainterp::default_effect_info(),
-        // `EF_CANNOT_RAISE` — `call.py:303 else:` row of `getcalldescr`
+        // `EF_CANNOT_RAISE` — `call.py else:` row of `getcalldescr`
         // (non-elidable + `_canraise(op) == False`). Same
         // analyzer-empty external-call shape as `Plain`, just with
         // `extraeffect=CannotRaise` so `check_can_raise()`
@@ -804,7 +804,7 @@ pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
             extraeffect: ExtraEffect::LoopInvariant,
             ..EffectInfo::default()
         },
-        // `call.py:292-299 getcalldescr`'s 3-way elidable pick:
+        // `call.py getcalldescr`'s 3-way elidable pick:
         //
         //     elif elidable:
         //         cr = self._canraise(op)
@@ -869,14 +869,14 @@ pub fn unresolved_release_gil_effect_info_for_via_target() -> majit_ir::EffectIn
 
 /// Inverse of [`effect_info_for_call_flavor`]: derive the dispatch branch
 /// `dispatch_residual_call` should pick from a calldescr's `EffectInfo`.
-/// Mirrors `rpython/jit/metainterp/pyjitpl.py:1995-2126 do_residual_call`'s
+/// Mirrors `rpython/jit/metainterp/pyjitpl.py do_residual_call`'s
 /// branch precedence — `forces_virtual_or_virtualizable` (with the
 /// `is_call_release_gil()` sub-case) wins first, then `EF_LOOPINVARIANT`,
 /// then `check_is_elidable()`, else the plain `CALL_*` branch.
 ///
 /// Precedence note: `is_call_release_gil()` is checked **before**
 /// `check_forces_virtual_or_virtualizable()` because release-gil EIs
-/// carry `EF_RANDOM_EFFECTS` (mirroring `call.py:282-289 getcalldescr`'s
+/// carry `EF_RANDOM_EFFECTS` (mirroring `call.py getcalldescr`'s
 /// `random_effects` upgrade for release-gil callees), which makes
 /// `check_forces_virtual_or_virtualizable()` (`>= 6`) also return
 /// true on those EI values.  The early `is_call_release_gil()` check
@@ -897,7 +897,7 @@ pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
         ExtraEffect::ElidableCannotRaise => CallFlavor::PureCannotRaise,
         ExtraEffect::ElidableOrMemoryError => CallFlavor::PureOrMemerror,
         ExtraEffect::ElidableCanRaise => CallFlavor::PureCanRaise,
-        // `call.py:303 getcalldescr`'s non-elidable cannot-raise branch.
+        // `call.py getcalldescr`'s non-elidable cannot-raise branch.
         ExtraEffect::CannotRaise => CallFlavor::PlainCannotRaise,
         _ => CallFlavor::Plain,
     }
@@ -913,7 +913,7 @@ pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
 ///
 /// `CALL_ASSEMBLER` is intentionally not represented here — upstream
 /// `rop.CALL_ASSEMBLER_*` is a separate operation chosen via
-/// `OpHelpers.call_assembler_for_descr` (`resoperation.py:1251-1260`),
+/// `OpHelpers.call_assembler_for_descr` (`resoperation.py`),
 /// not derived from `EffectInfo`. pyre's portal-call lowering follows
 /// the same split (`majit-ir/src/resoperation.rs`'s
 /// `CallAssembler{I,R,F,N}`); reintroducing an `Assembler` flavor here
@@ -926,9 +926,9 @@ pub enum CallFlavor {
     /// no-graph `top_result()` outcome. Producers that know more pick
     /// one of the flavors below.
     Plain,
-    /// `EF_CANNOT_RAISE` (`effectinfo.py:19`). `call.py:303 getcalldescr`
+    /// `EF_CANNOT_RAISE` (`effectinfo.py:19`). `call.py getcalldescr`
     /// picks this on the non-elidable `else` branch when
-    /// `_canraise(op) == False` — `pyjitpl.py:2111 do_residual_call`
+    /// `_canraise(op) == False` — `pyjitpl.py do_residual_call`
     /// then drops the trailing `GUARD_NO_EXCEPTION`. pyre's analyzer
     /// port is the upstream replacement; producers select
     /// this flavor today only when the callee is statically known not
@@ -939,7 +939,7 @@ pub enum CallFlavor {
     /// every six `_*_descrs_*` raw set + `*_descrs_*` bitstring =
     /// `Some(Vec::new())`, `can_collect=true`. This is the PyPy
     /// `effectinfo.py:293-299` else-branch shape (analyzer-empty
-    /// `effects` is `bottom_result()` per `graphanalyze.py:60`, not
+    /// `effects` is `bottom_result()` per `graphanalyze.py`, not
     /// `top_set`), distinct from `MOST_GENERAL`. Producers that can
     /// additionally prove "no heap touched + no GC" should use
     /// `PlainCannotRaiseNoHeap` (`can_collect=false`) instead.
@@ -965,7 +965,7 @@ pub enum CallFlavor {
     ReleaseGil,
     /// `EF_ELIDABLE_CANNOT_RAISE` (`effectinfo.py:17`). `call.py:299
     /// getcalldescr` picks this branch when `_canraise(op) == False`.
-    /// `pyjitpl.py:2126 do_residual_call` records `CALL_PURE_*` with
+    /// `pyjitpl.py do_residual_call` records `CALL_PURE_*` with
     /// no trailing `GUARD_NO_EXCEPTION` because
     /// `check_can_raise(False)` is false for `extraeffect == 0`.
     PureCannotRaise,
@@ -982,7 +982,7 @@ pub enum CallFlavor {
 
 impl CallFlavor {
     /// Convenience predicate for the three elidable variants —
-    /// `effectinfo.check_is_elidable()` parity (`effectinfo.py:225`).
+    /// `effectinfo.check_is_elidable()` parity (`effectinfo.py`).
     pub fn is_pure(self) -> bool {
         matches!(
             self,
@@ -1063,8 +1063,8 @@ pub enum Operand {
     TLabel(TLabel),
     /// A same-kind list of Registers/Constants.
     ListOfKind(ListOfKind),
-    /// `assembler.py:197-206` `elif isinstance(x, AbstractDescr)` /
-    /// `liveness.py:76` `elif isinstance(x, SwitchDictDescr)` — either a
+    /// `assembler.py` `elif isinstance(x, AbstractDescr)` /
+    /// `liveness.py` `elif isinstance(x, SwitchDictDescr)` — either a
     /// runtime-resolved descr (`BhDescr`) or an SSARepr-side
     /// `SwitchDictDescr` with a live `_labels` table.
     ///
@@ -1105,7 +1105,7 @@ impl Operand {
     /// `rpython/jit/metainterp/virtualizable.py:73 array_field_descrs[i]`.
     /// Used by `getarrayitem_vable_X` / `setarrayitem_vable_X` /
     /// `arraylen_vable` SSARepr ops to carry the array-field index for
-    /// `assembler.py:80-138 emit_const` lowering.
+    /// `assembler.py emit_const` lowering.
     pub fn descr_vable_array_field(idx: u16) -> Self {
         Operand::Descr(Rc::new(DescrOperand::VableArrayField(idx)))
     }
@@ -1144,7 +1144,7 @@ pub const OPNAME_LIVE: &str = "-live-";
 pub enum Insn {
     /// `(Label(name),)` — block-entry marker.  Names are produced via
     /// `block_label_name(&block)` (Rc-pointer-based), matching upstream
-    /// `flatten.py:116 self.emitline(Label(block))` per-SpamBlock
+    /// `flatten.py self.emitline(Label(block))` per-SpamBlock
     /// emission.
     Label(Label),
     /// `('---',)` — unreachable marker; clears the liveness pass's alive
@@ -1154,7 +1154,7 @@ pub enum Insn {
     /// `-live-` liveness markers (`opname == OPNAME_LIVE`). `result` is
     /// `Some(register)` iff the RPython tuple contains a trailing
     /// `'->' result` pair; the assembler emits the `>` argcode in that
-    /// case (`assembler.py:210-219`). `-live-` always has
+    /// case (`assembler.py`). `-live-` always has
     /// `result == None`.
     Op {
         opname: String,
@@ -1221,11 +1221,11 @@ impl Insn {
 /// it and splices it in as `ssarepr.insns`). The earlier
 /// direct-SSA-emission dual-write is retired.
 pub struct GraphFlattener<'a> {
-    // ─── PyPy-mirror fields (in `flatten.py:77-86 __init__` order) ───
+    // ─── PyPy-mirror fields (in `flatten.py __init__` order) ───
     /// `rpython/jit/codewriter/flatten.py:77 self.graph = graph`.
     ///
     /// `enforce_input_args` reads `self.graph.startblock.inputargs`
-    /// (`flatten.py:89`) and `generate_ssa_form` recurses from
+    /// (`flatten.py`) and `generate_ssa_form` recurses from
     /// `self.graph.startblock` (`flatten.py:104`).
     graph: &'a super::flow::FunctionGraph,
     /// `rpython/jit/codewriter/flatten.py:78 self.regallocs = regallocs`.
@@ -1233,7 +1233,7 @@ pub struct GraphFlattener<'a> {
     /// `getcolor_var` reads `regallocs[kind].coloring[id]` directly,
     /// matching upstream's `self.regallocs[kind].getcolor(v)`.
     ///
-    /// Stored as `&mut` so `enforce_input_args` (`flatten.py:88-100`)
+    /// Stored as `&mut` so `enforce_input_args` (`flatten.py`)
     /// can `swapcolors` in place, matching upstream's
     /// `self.regallocs[kind].swapcolors(realcol, curcol)`.  Read paths
     /// reborrow immutably via `&*self.regallocs`.
@@ -1253,7 +1253,7 @@ pub struct GraphFlattener<'a> {
     /// `rpython/jit/codewriter/flatten.py:80
     /// self._include_all_exc_links = _include_all_exc_links`.
     include_all_exc_links: bool,
-    /// `rpython/jit/codewriter/flatten.py:86 self.ssarepr = SSARepr(name)`.
+    /// `rpython/jit/codewriter/flatten.py self.ssarepr = SSARepr(name)`.
     ///
     /// Upstream owns the SSARepr; pyre's caller owns it and passes a
     /// borrow so the `serialize_op` test fixture sites can reuse an
@@ -1295,13 +1295,13 @@ pub struct GraphFlattener<'a> {
 }
 
 impl<'a> GraphFlattener<'a> {
-    /// `rpython/jit/codewriter/flatten.py:73-86 GraphFlattener.__init__`.
+    /// `rpython/jit/codewriter/flatten.py GraphFlattener.__init__`.
     ///
     /// Upstream takes `(graph, regallocs, _include_all_exc_links=False,
     /// cpu=None)`.  Pyre matches the first two positional arguments
     /// `(graph, regallocs)` and trails them with `ssarepr` (the pyre-
     /// specific borrow — upstream constructs the SSARepr inline at
-    /// `flatten.py:82-86 self.ssarepr = SSARepr(name)`).  The two
+    /// `flatten.py self.ssarepr = SSARepr(name)`).  The two
     /// keyword arguments `_include_all_exc_links` / `cpu` (and pyre's
     /// `lowering_ctx` extension) are exposed via builder methods to
     /// keep the common no-options construction concise.
@@ -1311,7 +1311,7 @@ impl<'a> GraphFlattener<'a> {
         ssarepr: &'a mut SSARepr,
     ) -> Self {
         Self {
-            // PyPy-mirror fields (`flatten.py:77-86 __init__` order).
+            // PyPy-mirror fields (`flatten.py __init__` order).
             graph,
             regallocs,
             cpu: None,
@@ -1326,7 +1326,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `flatten.py:63 def flatten_graph(graph, regallocs,
+    /// `flatten.py def flatten_graph(graph, regallocs,
     /// _include_all_exc_links=False, cpu=None)` cpu kwarg parity.
     ///
     /// Production callers thread `CodeWriter::cpu()` so
@@ -1348,7 +1348,7 @@ impl<'a> GraphFlattener<'a> {
     }
 
     pub fn serialize_op(&mut self, op: &SpaceOperation) {
-        // `flatten.py:373-380 serialize_op`: serialise an op into the
+        // `flatten.py serialize_op`: serialise an op into the
         // SSARepr via `emitline`.  Pyre's `flatten_space_operation`
         // splits out the per-op lowering (HLOp dispatch + arg /
         // result handling); the `emitline` call below matches
@@ -1451,9 +1451,9 @@ impl<'a> GraphFlattener<'a> {
         self.ssarepr.insns.push(insn);
     }
 
-    /// `flatten.py:352-353 popline`: pop the most recently emitted
+    /// `flatten.py popline`: pop the most recently emitted
     /// insn off `ssarepr.insns`.  Used by the `_ovf` rewrite at
-    /// `flatten.py:194 line = self.popline()` to retract the arithmetic
+    /// `flatten.py line = self.popline()` to retract the arithmetic
     /// op just emitted by `serialize_op` and replace it with the
     /// `*_jump_if_ovf` twin.
     fn popline(&mut self) -> Option<Insn> {
@@ -1540,7 +1540,7 @@ impl<'a> GraphFlattener<'a> {
     }
 
     fn make_link(&mut self, link: &LinkRef, handling_ovf: bool) {
-        // `rpython/jit/codewriter/flatten.py:148-155 make_link`:
+        // `rpython/jit/codewriter/flatten.py make_link`:
         //
         //     if (link.target.exits == ()
         //         and link.last_exception not in link.args
@@ -1555,15 +1555,15 @@ impl<'a> GraphFlattener<'a> {
                 .target
                 .clone()
                 .expect("link target required for make_link");
-            // `flatten.py:148-155 make_link` has no `target.dead`
-            // check.  RPython `flowspace/flowcontext.py:455 mergeblock`
+            // `flatten.py make_link` has no `target.dead`
+            // check.  RPython `flowspace/flowcontext.py mergeblock`
             // marks the superseded block dead and reroutes incoming
             // edges to the newblock via `recloseblock`, but the old
             // block itself stays linked from any predecessor whose
             // outgoing edge already named it as target — it serves as
-            // a forwarding stub (`model.py:240-253 recloseblock` only
+            // a forwarding stub (`model.py recloseblock` only
             // replaces exits; predecessors retain their original
-            // target reference).  `iterblocks` (`model.py:55-77`)
+            // target reference).  `iterblocks` (`model.py`)
             // follows links without filtering on `dead`, so flatten
             // legitimately recurses through a dead target whose
             // single exit forwards to the newblock.  Re-asserting
@@ -1602,9 +1602,9 @@ impl<'a> GraphFlattener<'a> {
     }
 
     fn make_exception_link(&mut self, link: &LinkRef, handling_ovf: bool) {
-        // RPython `flatten.py:139-180 make_exception_link` requires
+        // RPython `flatten.py make_exception_link` requires
         // `link.last_exception` and `link.last_exc_value` to be seeded
-        // by upstream `guessexception` (`flowcontext.py:130-143`).  In
+        // by upstream `guessexception` (`flowcontext.py`).  In
         // pyre that seeding lives in `codewriter.rs::
         // attach_catch_exception_edge`'s `Link::extravars(Some, Some)`
         // call.  The W-4 self-loop fix retired the bypass path that
@@ -1702,7 +1702,7 @@ impl<'a> GraphFlattener<'a> {
     /// `_ovf` op's `opname[:7]` always yields the upstream "int_xxx"
     /// prefix (`int_add`, `int_sub`, `int_mul`, `int_neg`, …).
     fn flatten_ovf_canraise(&mut self, exits: &[LinkRef], raising_opname: &str) {
-        // `flatten.py:194 line = self.popline()`.  The most recent
+        // `flatten.py line = self.popline()`.  The most recent
         // serialized op is the `_ovf` arithmetic itself.
         let line = self
             .popline()
@@ -1723,14 +1723,14 @@ impl<'a> GraphFlattener<'a> {
              block.raising_op() opname {raising_opname:?} — serialize_op \
              order is corrupted",
         );
-        // `flatten.py:195-196` `opname[:7] + '_jump_if_ovf'`.
+        // `flatten.py` `opname[:7] + '_jump_if_ovf'`.
         assert!(
             popped_opname.len() >= 7,
             "flatten_ovf_canraise: opname {popped_opname:?} is shorter than the \
              upstream 7-char `int_xxx` prefix expected at flatten.py:195",
         );
         let jump_opname = format!("{}_jump_if_ovf", &popped_opname[..7]);
-        // `flatten.py:196` `*line[1:]` — prepend the overflow target
+        // `flatten.py` `*line[1:]` — prepend the overflow target
         // TLabel, then keep all original args.  The result hint
         // (`Insn::Op::result`) stays on the new op since upstream's
         // `line[1:]` includes the trailing `'->', result` pair.
@@ -1749,12 +1749,12 @@ impl<'a> GraphFlattener<'a> {
              flatten.py:197 (got {})",
             exits.len(),
         );
-        // `flatten.py:198 self.make_link(block.exits[0], False)`.
+        // `flatten.py self.make_link(block.exits[0], False)`.
         self.make_link(&exits[0], false);
-        // `flatten.py:199 self.emitline(Label(block.exits[1]))`.
+        // `flatten.py self.emitline(Label(block.exits[1]))`.
         let exit1_label = self.label_for_link(&exits[1]);
         self.emitline(exit1_label);
-        // `flatten.py:200 self.make_exception_link(block.exits[1], True)`.
+        // `flatten.py self.make_exception_link(block.exits[1], True)`.
         self.make_exception_link(&exits[1], true);
         if exits.len() == 3 {
             // `flatten.py:202 assert block.exits[2].exitcase is Exception`.
@@ -1778,7 +1778,7 @@ impl<'a> GraphFlattener<'a> {
                  (matches `exitcase is Exception` invariant from flatten.py:202)",
             );
             drop(exit2);
-            // `flatten.py:203 self.make_exception_link(block.exits[2], False)`.
+            // `flatten.py self.make_exception_link(block.exits[2], False)`.
             self.make_exception_link(&exits[2], false);
         }
     }
@@ -1821,7 +1821,7 @@ impl<'a> GraphFlattener<'a> {
             // right before `make_exception_link`'s `last_exception` /
             // `last_exc_value` emission, mirroring the canraise arm's
             // `catch_exception TLabel(normal) … Label(normal) …
-            // make_exception_link` layout (flatten.py:139-180).
+            // make_exception_link` layout (flatten.py).
             if block.borrow().canraise() {
                 debug_assert!(
                     block
@@ -1921,7 +1921,7 @@ impl<'a> GraphFlattener<'a> {
             // land in the normal-flow successor, so the graph tail is
             // structurally `[raising_op, -live-]` and `catch_exception`
             // lands directly after the `-live-` — the adjacency
-            // `handle_exception_in_frame` (`blackhole.py:396`) and
+            // `handle_exception_in_frame` (`blackhole.py`) and
             // `derive_after_call_indices_from_sparse` (the
             // after-residual-call resume anchor) both require.
             let block_can_raise = block
@@ -1940,10 +1940,10 @@ impl<'a> GraphFlattener<'a> {
             self.emitline(normal_label);
             let mut captured_all = false;
             for link in &catch_links {
-                // `flatten.py:223-233 insert_exits` lowers every catch link
+                // `flatten.py insert_exits` lowers every catch link
                 // (`block.exits[1:]`) through `make_exception_link`, which
                 // asserts both `last_exception` and `last_exc_value` are seeded
-                // (`flatten.py:161-162`).  There is no ordinary-`make_link` arm
+                // (`flatten.py`).  There is no ordinary-`make_link` arm
                 // for a catch link: one that is not a fully seeded exception
                 // link is a graph-construction bug and fails loud inside
                 // `make_exception_link`.
@@ -2161,7 +2161,7 @@ impl<'a> GraphFlattener<'a> {
         pairs.sort_by_key(|(_, dst)| dst.index);
 
         // `[T; 3]` indexed by `Kind::index()`.
-        // Mirrors `rpython/jit/codewriter/flatten.py:306-334 insert_renamings`
+        // Mirrors `rpython/jit/codewriter/flatten.py insert_renamings`
         // which keys by kind string in a Python dict.
         let mut renamings: [(Vec<RenameOperand>, Vec<RenameOperand>); 3] = [
             (Vec::new(), Vec::new()),
@@ -2218,7 +2218,7 @@ impl<'a> GraphFlattener<'a> {
         // `is_some()` so a `None` arg can never spuriously match a `None`
         // exc field (mirrors the `make_link` guard and the insert_renamings
         // fix). Today the exc pair is always both-Some or both-None
-        // (`model.py:672-680` checkgraph), so this is defensive parity.
+        // (`model.py` checkgraph), so this is defensive parity.
         for (arg, inputarg) in link.args.iter().zip(inputargs) {
             if arg
                 .as_ref()
@@ -2254,7 +2254,7 @@ impl<'a> GraphFlattener<'a> {
         super::regalloc::enforce_input_args(self.graph, self.regallocs);
     }
 
-    /// `rpython/jit/codewriter/flatten.py:102-104 generate_ssa_form` —
+    /// `rpython/jit/codewriter/flatten.py generate_ssa_form` —
     /// reset `seen_blocks` and recurse from `self.graph.startblock`.
     pub fn generate_ssa_form(&mut self) {
         self.seen_blocks.clear();
@@ -2283,10 +2283,10 @@ impl<'a> GraphFlattener<'a> {
         self.seen_blocks.push(block.clone());
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
-        // `flatten.py:106-128` make_bytecode_block emits Label(block)
+        // `flatten.py` make_bytecode_block emits Label(block)
         // at entry, then ops via `serialize_op`, then `insert_exits`.
         // No per-PC anchors, no `-live-` interleaving — those come
-        // from `insert_exits`' canraise path (`flatten.py:259-260`,
+        // from `insert_exits`' canraise path (`flatten.py`,
         // `flatten.py:285`) and from the liveness post-pass
         // (`liveness.py:11-12`).  Pyre's earlier per-PC PA + `-live-`
         // interleaving here was a pyre-only adaptation for runtime
@@ -2383,7 +2383,7 @@ impl<'a> GraphFlattener<'a> {
             // `DescrOperand` variant via singleton `Arc::ptr_eq` —
             // see `flatten_descr_by_ptr`.
             SpaceOperationArg::Descr(descr_by_ptr) => flatten_descr_by_ptr(descr_by_ptr),
-            // `flatten.py:365-367` also passes IndirectCallTargets
+            // `flatten.py` also passes IndirectCallTargets
             // through unchanged.  `Operand::IndirectCallTargets` takes a
             // value, so clone the inner (the `Vec<Arc<JitCode>>` clone
             // is cheap — it bumps Arc refcounts).
@@ -2393,7 +2393,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `flatten.py:355-371 flatten_list(arglist)` — iterate `arglist`
+    /// `flatten.py flatten_list(arglist)` — iterate `arglist`
     /// and dispatch each arg via `flatten_arg`.  Upstream inlines the
     /// per-variant dispatch inside `flatten_list`; pyre splits the
     /// per-arg dispatch into `flatten_arg` for reuse (e.g. by
@@ -2404,7 +2404,7 @@ impl<'a> GraphFlattener<'a> {
         arglist.iter().map(|arg| self.flatten_arg(arg)).collect()
     }
 
-    /// `flatten.py:382-391 GraphFlattener.getcolor(v)`: Variable →
+    /// `flatten.py GraphFlattener.getcolor(v)`: Variable →
     /// Register (via the regallocs coloring), Constant → pass-through
     /// lowered Operand.  Upstream returns `v` unchanged for the
     /// Constant case; pyre's typed `Operand` enum requires explicit
@@ -2418,7 +2418,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `flatten.py:382-391 GraphFlattener.getcolor(v)` Variable arm.
+    /// `flatten.py GraphFlattener.getcolor(v)` Variable arm.
     /// Reads `regallocs[kind].coloring[v.id]` directly — matching
     /// upstream's `self.regallocs[kind].getcolor(v)`.
     fn getcolor_var(&self, v: Variable) -> Register {
@@ -2520,7 +2520,7 @@ impl<'a> GraphFlattener<'a> {
 /// Look up the regalloc color for `v` in the per-Kind `regallocs` table
 /// and build the matching `Register`.  Panics if `v` has no entry — a
 /// missing color signals a regalloc invariant violation upstream of the
-/// driver (`flatten.py:88-100 enforce_input_args` is meant to guarantee
+/// driver (`flatten.py enforce_input_args` is meant to guarantee
 /// every Variable reached by `flatten_space_operation` is colored), and
 /// emitting a synthetic `u16::MAX` register would mask that into
 /// malformed SSA.  Shared by `GraphFlattener::getcolor_var` and the
@@ -2529,7 +2529,7 @@ fn regalloc_color(
     regallocs: &[super::regalloc::GraphAllocationResult; 3],
     v: Variable,
 ) -> Register {
-    // `flatten.py:382-386 GraphFlattener.getcolor` — pick the
+    // `flatten.py GraphFlattener.getcolor` — pick the
     // per-kind allocator and call `regallocs[kind].getcolor(v)`.
     let kind = v.kind.unwrap_or(Kind::Ref);
     let alloc = &regallocs[kind.index()];
@@ -2565,8 +2565,8 @@ fn regalloc_color(
 /// a `guard_no_exception` / inline-boundary resume point that the encoder
 /// reads at the FALLTHROUGH position.  See `serialize_op` for the
 /// canraise-superset rationale.
-/// `jtransform.py:469-470 handle_residual_call` /
-/// `jtransform.py:481 handle_regular_call`: a call op is followed by a
+/// `jtransform.py handle_residual_call` /
+/// `jtransform.py handle_regular_call`: a call op is followed by a
 /// trailing `('-live-', [], None)` marker, but the two call families gate
 /// it differently:
 ///   * `inline_call_*` (handle_regular_call) — ALWAYS.
@@ -2575,7 +2575,7 @@ fn regalloc_color(
 /// The canonical lowering driver never emits the indirect call that is
 /// upstream's only `may_call_jitcodes=True` caller, so the residual gate
 /// is exactly `calldescr_canraise` = `effect_info.check_can_raise(false)`
-/// (`call.py:353-355 calldescr_canraise` -> `effectinfo.py:232
+/// (`call.py calldescr_canraise` -> `effectinfo.py:232
 /// check_can_raise`), read off the trailing `CallDescrStub` operand.
 fn insn_needs_trailing_live(insn: &Insn) -> bool {
     let Insn::Op { opname, args, .. } = insn else {
@@ -2590,16 +2590,16 @@ fn insn_needs_trailing_live(insn: &Insn) -> bool {
     false
 }
 
-/// `flowcontext.py:130-156 guessexception` attaches an exception edge
+/// `flowcontext.py guessexception` attaches an exception edge
 /// only to an operation that can raise; the walker's per-PC catch-attach
 /// site consults this classifier on the graph `SpaceOperation`s it just
 /// recorded to decide whether the opcode closes its block with an
 /// exception edge (and the structural `[op, -live-]` tail).
 ///
-/// * `residual_call_*` — `call.py:353-355 calldescr_canraise`, read off
+/// * `residual_call_*` — `call.py calldescr_canraise`, read off
 ///   the recorded `CallDescrStub` descr operand (the graph-side twin of
 ///   [`insn_needs_trailing_live`]'s emitted-stream rule).
-/// * `inline_call_*` — always (`jtransform.py:481 handle_regular_call`).
+/// * `inline_call_*` — always (`jtransform.py handle_regular_call`).
 /// * pre-rtype HLOps — the `calldescr_canraise` of the residual call the
 ///   lowering dispatcher produces for the opname; the arms below mirror
 ///   the per-family `CallFlavor` each `lower_*_hlop_to_insn` records
@@ -2691,7 +2691,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
     )
 }
 
-/// `call.py:353-355 calldescr_canraise` — `calldescr.get_extra_info()
+/// `call.py calldescr_canraise` — `calldescr.get_extra_info()
 /// .check_can_raise()` (default `ignore_memoryerror=False`).  Reads the
 /// `EffectInfo` off the residual call's trailing `CallDescrStub` operand;
 /// every `build_residual_call_*` appends exactly one.  A residual_call
@@ -2782,7 +2782,7 @@ fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
             value: ConstantValue::Signed(value),
             ..
         })) => *value,
-        // `flatten.py:283` — `kind == 'int'` includes lltype `Bool`
+        // `flatten.py` — `kind == 'int'` includes lltype `Bool`
         // (Bool is an Int subtype upstream); `cast_primitive(Signed,
         // link.llexitcase)` coerces False → 0, True → 1.  Pyre collapses
         // upstream's Bool/Signed lltypes into `Kind::Int` and represents
@@ -3011,12 +3011,12 @@ pub fn flatten_graph_for_test_with_lowering<'a>(
     flattener.generate_ssa_form();
 }
 
-/// `rpython/jit/codewriter/flatten.py:63-70 flatten_graph(graph,
+/// `rpython/jit/codewriter/flatten.py flatten_graph(graph,
 /// regallocs, _include_all_exc_links=False, cpu=None)`.
 ///
 /// The canonical entry point matching upstream signature exactly.
 /// Constructs the `SSARepr` internally, derives `get_register` from
-/// `regallocs[kind].getcolor(v)` (`flatten.py:382-391`), and threads
+/// `regallocs[kind].getcolor(v)` (`flatten.py`), and threads
 /// `cpu` through `make_exception_link` for `handling_ovf=True` reraise
 /// targets (`flatten.py:166-170`).
 ///
@@ -3030,7 +3030,7 @@ pub fn flatten_graph_for_test_with_lowering<'a>(
 /// _include_all_exc_links, cpu)` signature stays intact.
 ///
 /// **Upstream-orthodox entry** matching
-/// `rpython/jit/codewriter/flatten.py:63-70 flatten_graph(graph,
+/// `rpython/jit/codewriter/flatten.py flatten_graph(graph,
 /// regallocs, _include_all_exc_links=False, cpu=None)` signature with
 /// no additional parameters.  Derives the dispatcher's
 /// `LoweringContext` from `cpu.lowering_ctx` (a pyre-specific
@@ -3048,7 +3048,7 @@ pub fn flatten_graph<'a>(
 }
 
 /// Canonical flattening after the caller has already run
-/// `flatten.py:88-100 enforce_input_args`.
+/// `flatten.py enforce_input_args`.
 ///
 /// The per-code Python graph uses the ordinary upstream input convention for
 /// its Python arguments, then reserves distinct colors for the always-live
@@ -3073,7 +3073,7 @@ fn flatten_graph_impl<'a>(
 ) -> SSARepr {
     let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
-    // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
+    // `flatten.py flattener = GraphFlattener(graph, regallocs,
     // _include_all_exc_links, cpu)`.
     let mut flattener = GraphFlattener::new(graph, regallocs, &mut ssarepr);
     if let Some(ctx) = lowering_ctx {
@@ -3082,10 +3082,10 @@ fn flatten_graph_impl<'a>(
     if let Some(cpu) = cpu {
         flattener = flattener.with_cpu(cpu);
     }
-    // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
+    // `flatten.py GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
-    // `flatten.py:68 flattener.enforce_input_args()`. The codewriter's
+    // `flatten.py flattener.enforce_input_args()`. The codewriter's
     // post-enforcement red-color reservation takes the `false` leg because it
     // already performed this exact pass before reserving `(frame, ec)`.
     if enforce_input_args {
@@ -3095,7 +3095,7 @@ fn flatten_graph_impl<'a>(
     // serialization (no upstream counterpart — upstream flowgraphs are
     // always well-formed).  See `color_leaked_arg_variables`.
     flattener.color_leaked_arg_variables();
-    // `flatten.py:69 flattener.generate_ssa_form()`.
+    // `flatten.py flattener.generate_ssa_form()`.
     flattener.generate_ssa_form();
     ssarepr
 }
@@ -3168,7 +3168,7 @@ where
                 })
                 .collect(),
         )),
-        // `flatten.py:365-367` passes `IndirectCallTargets` through the
+        // `flatten.py` passes `IndirectCallTargets` through the
         // generic flatten path unchanged.  Mirror that here so the
         // probe sees the same operand shape inline emits would
         // produce; `Operand::IndirectCallTargets` clones the inner
@@ -3333,7 +3333,7 @@ pub struct LoweringContext {
     pub load_build_class_fn_idx: u16,
     /// `bind(assembler, cpu.newtuple_from_array_fn as *const (),
     /// CallFlavor::Plain)` descrs-pool index for the production
-    /// source.  BUILD_TUPLE records the rtyped `pyopcode.py:995-998`
+    /// source.  BUILD_TUPLE records the rtyped `pyopcode.py`
     /// shape on the graph — `new_array_clear` + argc ×
     /// `setarrayitem_gc_r` (the `@jit.unroll_safe` `popvalues` list
     /// build, `pyframe.py:408-419`) + one `newtuple_from_array` call
@@ -3358,7 +3358,7 @@ pub struct LoweringContext {
     /// (single HLOp opname `simple_call`) lowers to
     /// `residual_call_r_r(call_fn_N_idx, [callable, arg0, ...],
     /// Descr) → reg`; the lowered ListR is frame-less
-    /// (`jtransform.py:414 rewrite_call`) — the parent frame is
+    /// (`jtransform.py rewrite_call`) — the parent frame is
     /// resolved at runtime inside the call helper, not threaded as a
     /// leading operand.
     /// Indexed by nargs (`call_fn_idx_by_nargs[nargs]`): `[u16; 15]` keeps the
@@ -3575,7 +3575,7 @@ pub struct LoweringContext {
     /// stamps a typed field (`Plain` — runs no user code, never raises).
     pub set_function_attribute_fn_idx: u16,
     /// `unary_negative_fn` descrs-pool index.  UNARY_NEGATIVE records the
-    /// flowspace `neg(value)` op (operation.py:466) lowered to
+    /// flowspace `neg(value)` op (operation.py) lowered to
     /// `residual_call_r_r(ConstInt(fn_idx), ListR([value]), Descr) → reg` via
     /// [`lower_unary_negative_hlop_to_insn`] (the single-Ref FORMAT_SIMPLE
     /// shape); `bh_unary_negative_fn` computes `-value` (a user `__neg__`
@@ -4070,7 +4070,7 @@ pub fn build_load_global_fn_residual_call_ir_r_insn(
 
 /// Variant of [`build_load_global_fn_residual_call_ir_r_insn`] that takes the
 /// pycode as a compile-time `Operand::ConstRef` operand instead of a
-/// `Register`.  Mirrors `pyframe.py:509-510` `getcode(): hint(self.pycode,
+/// `Register`.  Mirrors `pyframe.py` `getcode(): hint(self.pycode,
 /// promote=True)`: in a non-portal callee jitcode the pycode is the callee's
 /// own `W_Code` pointer, already a compile-time constant.  `ns_reg` and
 /// `frame_reg` remain register operands — `frame.w_globals` is loaded per-call
@@ -4100,8 +4100,8 @@ pub fn build_load_global_fn_residual_call_ir_r_insn_with_const_pycode(
 /// the namespace, pycode, AND frame as compile-time `Operand::ConstRef`
 /// operands.  Used by non-portal callee emit where:
 ///   * `pycode` is the callee's own `W_Code` pointer (compile-time known
-///     per `pyframe.py:509-510 getcode(): hint(self.pycode, promote=True)`).
-///   * `namespace` is `pycode.w_globals` (`pyframe.py:49 self.w_globals =
+///     per `pyframe.py getcode(): hint(self.pycode, promote=True)`).
+///   * `namespace` is `pycode.w_globals` (`pyframe.py self.w_globals =
 ///     w_globals` initializes `frame.w_globals = pycode.w_globals` at
 ///     frame construction, so a `W_Code`-level promotion is valid).
 ///   * `frame` is `ConstRef(0)` — `bh_load_global_fn`'s `frame_ptr` feeds
@@ -4249,7 +4249,7 @@ pub fn build_load_method_self_fn_residual_call_ir_r_insn(
 }
 
 /// Lower a `LOAD_NAME` pre-rtype HLOp `load_name(frame, w_name, namei)`
-/// → `result: Ref` (the `pyopcode.py:945-955 LOAD_NAME` frame-receiver
+/// → `result: Ref` (the `pyopcode.py LOAD_NAME` frame-receiver
 /// shape recorded by `emit_frontend_load_name`) to the post-rtype
 /// `residual_call_ir_r(ConstInt(load_name_fn_idx), ListI([namei]),
 /// ListR([frame, w_name]), Descr) → reg` Insn.  `bh_load_name_fn(frame:
@@ -4300,7 +4300,7 @@ where
 }
 
 /// Lower a `STORE_NAME` pre-rtype HLOp `store_name(frame, w_name,
-/// value)` → void (the `pyopcode.py:855-859 STORE_NAME` frame-receiver
+/// value)` → void (the `pyopcode.py STORE_NAME` frame-receiver
 /// shape recorded by `emit_frontend_store_name`) to the post-rtype
 /// `residual_call_r_v(ConstInt(store_name_fn_idx), ListR([frame,
 /// w_name, value]), Descr)` Insn — the same void 3-Ref shape as
@@ -4343,7 +4343,7 @@ where
 }
 
 /// Lower a `STORE_GLOBAL` pre-rtype HLOp `store_global(frame, w_name,
-/// value)` → void (the `pyopcode.py:567 STORE_GLOBAL` frame-receiver
+/// value)` → void (the `pyopcode.py STORE_GLOBAL` frame-receiver
 /// shape recorded by `emit_frontend_store_global`) to the post-rtype
 /// `residual_call_r_v(ConstInt(store_global_fn_idx), ListR([frame,
 /// w_name, value]), Descr)` Insn — the same void 3-Ref shape as
@@ -4607,14 +4607,14 @@ pub fn pyobject_gcarray_bh_descr() -> BhDescr {
 /// graph and each op lowers 1:1:
 ///
 /// - `new_array_clear(Const(length)) → array` — the forced
-///   `popvalues` list allocation (`pyframe.py:408-419` `[None] * n`;
+///   `popvalues` list allocation (`pyframe.py` `[None] * n`;
 ///   jtransform lowers the fixed-size list build to
 ///   `new_array_clear`).  `length` is a `ConstInt` operand
 ///   (BUILD_TUPLE argc is a compile-time constant) routed through
 ///   the Int constant pool at assemble time.
 /// - `setarrayitem_gc_r(array, Const(index), value)` — one unrolled
 ///   `values_w[i] = self.popvalue()` store of the `@jit.unroll_safe`
-///   `popvalues` loop (`pyframe.py:408-419`).  `index` is a
+///   `popvalues` loop (`pyframe.py`).  `index` is a
 ///   `ConstInt` operand (the unroll fixes each index).  Void.
 /// - `newtuple_from_array(array) → tuple` / `newlist_from_array(array)
 ///   → list` — `residual_call_r_r(ConstInt(fn_idx), ListR([array]),
@@ -4833,7 +4833,7 @@ where
             // `FloatListStrategy` read `W_IntObject.intval` /
             // `W_FloatObject.floatval`).  The allocation can raise but runs no
             // user code and does not touch the virtualizable, so the effect is
-            // `EF_CAN_RAISE` → `Plain` (`call.py:288`: only the virtualizable
+            // `EF_CAN_RAISE` → `Plain` (`call.py`: only the virtualizable
             // analyzer raises `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`).  Virtual
             // element boxes passed as args are forced by the residual call
             // regardless of flavor.  Matches the pointer-copy-only
@@ -4841,7 +4841,7 @@ where
             //
             // Tag the residual as the BUILD_LIST helper so the FBW walker can
             // intercept it and emit the virtualizable decomposed `newlist`
-            // shape (`pyjitpl.py:779 opimpl_newlist`) instead of recording the
+            // shape (`pyjitpl.py opimpl_newlist`) instead of recording the
             // opaque CallR.  Inert on the assembler/baseline path (it reads
             // fn_idx + args, not `pyre_helper`) and on the legacy trait path
             // (which never emitted this residual); only the FBW intercept keys
@@ -4976,7 +4976,7 @@ pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
 /// `CallFlavor::Plain` (per `register_helper_fn_pointers` — `bh_box_int_fn`
 /// allocates a fresh `PyLong` wrapper without user dispatch and
 /// cannot force virtuals; matches `EF_CAN_RAISE` for allocation
-/// MemoryError).  RPython `jtransform.py:424-426 rewrite_call`
+/// MemoryError).  RPython `jtransform.py rewrite_call`
 /// picks `kinds = 'ir'` whenever `lst_i` is non-empty (or `force_ir`
 /// is set), so a single Int / no-Ref call lowers to
 /// `residual_call_ir_r` with an EMPTY `ListR` between `ListI` and
@@ -5602,10 +5602,10 @@ fn const_int_for_value_arg(arg: &super::flow::SpaceOperationArg) -> Option<i64> 
 /// [`build_load_attr_fn_residual_call_ir_r_insn`] shape.
 ///
 /// Walker contract: pyre's LOAD_ATTR arm records upstream's 2-arg
-/// `op.getattr(w_obj, w_attributename)` (`flowcontext.py:862-867`)
+/// `op.getattr(w_obj, w_attributename)` (`flowcontext.py`)
 /// extended with two rtyper-surrogate operands — the code object as a
 /// post-rtype `Signed(ptr) + Kind::Ref` constant and the `co_names`
-/// index — because pyre runs no `rclass.py:838 rtype_getattr` to
+/// index — because pyre runs no `rclass.py rtype_getattr` to
 /// rewrite the HLOp and `bh_load_attr_fn(obj, code, name_idx)`
 /// resolves the name through the code object.  The shadow
 /// `w_attributename` string (args[1]) is not a lowerable operand
@@ -6070,7 +6070,7 @@ where
         // `w_cell_set` heap write, or returning the raw slot value), so
         // `PlainCannotRaise` — writes heap but omits the trailing
         // `GUARD_NO_EXCEPTION`.  Matches the bind-site flavor in
-        // `codewriter.rs`; `pyopcode.py:574 STORE_DEREF` is `cell.set(...)`.
+        // `codewriter.rs`; `pyopcode.py STORE_DEREF` is `cell.set(...)`.
         CallFlavor::PlainCannotRaise,
         // #57 Option C (Finding #1): a value-returning (`Ref`) heap WRITE — the
         // in-place cell mutation the FOR_ITER body-effect guard's Void-result
@@ -6244,7 +6244,7 @@ where
 }
 
 /// Lower the UNARY_INVERT object-space op `invert(value)` → `result: Ref`
-/// (pyopcode.py:653 `unaryoperation("invert")`) to
+/// (pyopcode.py `unaryoperation("invert")`) to
 /// `residual_call_r_r(ConstInt(unary_invert_fn_idx), ListR([value]),
 /// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
 /// `bh_unary_invert_fn` computes `~value`; a user `__invert__` may force
@@ -6280,7 +6280,7 @@ where
 }
 
 /// Lower the UNARY_POSITIVE object-space op `pos(value)` → `result: Ref`
-/// (pyopcode.py:649 `unaryoperation("pos")`) to
+/// (pyopcode.py `unaryoperation("pos")`) to
 /// `residual_call_r_r(ConstInt(unary_positive_fn_idx), ListR([value]),
 /// Descr) → reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
 /// `bh_unary_positive_fn` computes `+value`; a user `__pos__` may force
@@ -6522,7 +6522,7 @@ where
 }
 
 /// Lower the UNARY_NOT object-space op `not_(value)` → `result: Ref`
-/// (pyopcode.py:651 `unaryoperation("not_")`) to
+/// (pyopcode.py `unaryoperation("not_")`) to
 /// `residual_call_r_r(ConstInt(unary_not_fn_idx), ListR([value]), Descr) →
 /// reg`, the single-Ref [`lower_format_simple_hlop_to_insn`] shape.
 /// `bh_unary_not_fn` returns `not value` as a bool; a user `__bool__` /
@@ -7253,7 +7253,7 @@ where
 /// arg1, ..., argN-1)` → `result: Ref` to the equivalent post-rtype
 /// `residual_call_r_r(ConstInt(call_fn_N_idx), ListR([callable,
 /// arg0, ...]), Descr) → reg` Insn — frame-less, matching RPython
-/// `jtransform.py:414 rewrite_call` (the lowered ListR shape is
+/// `jtransform.py rewrite_call` (the lowered ListR shape is
 /// detailed in the body comment below).
 ///
 /// Arity dispatch: nargs = op.args.len() - 2 selects
@@ -7288,14 +7288,14 @@ where
     // First arg is the callable, second the CALL opcode's null_or_self
     // slot, rest are call arguments.  All Ref.  The lowered ListR is
     // `[callable, null_or_self, args...]`, matching RPython
-    // `jtransform.py:414 rewrite_call` and the frame-less residual call
+    // `jtransform.py rewrite_call` and the frame-less residual call
     // ABI (`bhimpl_residual_call_r_r` → `cpu.bh_call_r(func, None,
     // args_r, ...)`).  The parent frame is resolved at runtime from the
     // execution context inside `bh_call_fn_impl`, not threaded as a
     // leading operand; a non-null null_or_self is the method receiver the
     // helper prepends as arg0 (`eval.rs`'s `PyFrame::call`).  `get_register`
     // routes each arg through `regallocs[Ref].getcolor(v)` per upstream
-    // `flatten.py:382-391`, so every Register index lands in
+    // `flatten.py`, so every Register index lands in
     // `[0, num_colors)`.
     let mut operands: Vec<Operand> = Vec::with_capacity(op.args.len());
     for arg in &op.args {
@@ -7453,7 +7453,7 @@ pub fn build_load_const_fn_residual_call_ir_r_insn(
 /// pycode pointer as a compile-time `ConstRef` operand instead of reading it
 /// out of a `getfield_vable_r` register.
 ///
-/// Mirrors `pyframe.py:509-510` `getcode(): hint(self.pycode, promote=True)`:
+/// Mirrors `pyframe.py` `getcode(): hint(self.pycode, promote=True)`:
 /// `frame.pycode` is hinted promote-to-constant, so every `LOAD_CONST` trace
 /// already sees the pycode as a JIT-time constant.  In a non-portal callee
 /// jitcode the pycode is compile-time known (= the callee's own `PyCode`
@@ -7554,7 +7554,7 @@ mod tests {
         // with `MayForce`, so the reverse mapping collapses to `MayForce`
         // (asserted separately below).
         //
-        // `PlainCannotRaise` → `EF_CANNOT_RAISE` (`call.py:303`),
+        // `PlainCannotRaise` → `EF_CANNOT_RAISE` (`call.py`),
         // dispatch reverses via the `ExtraEffect::CannotRaise =>
         // PlainCannotRaise` arm.
         //
@@ -7626,13 +7626,13 @@ mod tests {
 
     #[test]
     fn analyzer_absent_plain_and_may_force_both_resolve_to_most_general() {
-        // `call.py:282-303 getcalldescr` reaches `EF_CAN_RAISE` and
+        // `call.py getcalldescr` reaches `EF_CAN_RAISE` and
         // `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` only with write-analyzer
         // output in hand; both rows carry the callee's concrete write set.
         // Neither pyre flavor has one — `Plain` means "nothing is known
         // about the callee" and every `MayForce` producer binds an
         // interpreter entry point that runs arbitrary Python code — so
-        // both take `graphanalyze.py:109-112`'s `top_result()` and land on
+        // both take `graphanalyze.py`'s `top_result()` and land on
         // `EF_RANDOM_EFFECTS` (`effectinfo.py:285-292`).
         //
         // The `MayForce` semantics survive the merge: `EF_RANDOM_EFFECTS`
@@ -7718,12 +7718,12 @@ mod tests {
 
     #[test]
     fn plain_cannot_raise_no_heap_skips_check_can_raise() {
-        // effectinfo.py:236 `check_can_raise(self, ignore_memoryerror=False)`:
+        // effectinfo.py `check_can_raise(self, ignore_memoryerror=False)`:
         //   `return self.extraeffect > self.EF_CANNOT_RAISE`
         // EF_CANNOT_RAISE == 2, so the analyzer-confirmed-clean cannot-raise
         // shape (`PlainCannotRaiseNoHeap` → `CANNOT_RAISE_NO_HEAP_EFFECT_INFO`)
         // reads False — the canonical walker uses this to drop
-        // `GUARD_NO_EXCEPTION` (`pyjitpl.py:2111-2115 do_residual_call`).
+        // `GUARD_NO_EXCEPTION` (`pyjitpl.py do_residual_call`).
         let ei = effect_info_for_call_flavor(CallFlavor::PlainCannotRaiseNoHeap);
         assert!(!ei.check_can_raise(false));
 
@@ -7752,7 +7752,7 @@ mod tests {
 
     #[test]
     fn register_repr_matches_rpython() {
-        // RPython `flatten.py:33` `return "%%%s%d" % (self.kind[0], self.index)`.
+        // RPython `flatten.py` `return "%%%s%d" % (self.kind[0], self.index)`.
         assert_eq!(Register::new(Kind::Int, 0).kind.first_char(), 'i');
         assert_eq!(Register::new(Kind::Ref, 3).kind.first_char(), 'r');
         assert_eq!(Register::new(Kind::Float, 7).kind.first_char(), 'f');
@@ -7760,7 +7760,7 @@ mod tests {
 
     #[test]
     fn kind_as_str_roundtrip() {
-        // RPython `flatten.py:59` `KINDS = ['int', 'ref', 'float']`.
+        // RPython `flatten.py` `KINDS = ['int', 'ref', 'float']`.
         assert_eq!(Kind::Int.as_str(), "int");
         assert_eq!(Kind::Ref.as_str(), "ref");
         assert_eq!(Kind::Float.as_str(), "float");
@@ -8759,7 +8759,7 @@ mod tests {
 
     #[test]
     fn lowering_emits_trailing_live_after_residual_call() {
-        // `jtransform.py:467-471 handle_residual_call` pairs a
+        // `jtransform.py handle_residual_call` pairs a
         // `residual_call_*` with a trailing `('-live-', [], None)` so the
         // metainterp can snapshot the post-call `guard_no_exception`
         // resume state.  The canonical driver (`serialize_op` under
@@ -8813,7 +8813,7 @@ mod tests {
 
     #[test]
     fn insn_needs_trailing_live_gates_residual_call_on_calldescr_canraise() {
-        // `jtransform.py:469 handle_residual_call` emits the trailing
+        // `jtransform.py handle_residual_call` emits the trailing
         // `-live-` iff `may_call_jitcodes or calldescr_canraise(calldescr)`.
         // The canonical driver has no `may_call_jitcodes` site, so the gate
         // is `calldescr_canraise` = `effect_info.check_can_raise(false)`.
@@ -10910,7 +10910,7 @@ mod tests {
         // lasti): `[ConstInt(fn_idx), ListI([ConstInt(val)]),
         // ListR([]), Descr(CallDescrStub{Plain, [Int]})] →
         // Reg(Ref, dst)`.  Empty `ListR` is required by RPython
-        // jtransform.py:425 (`elif lst_i or force_ir: kinds = 'ir'`)
+        // jtransform.py (`elif lst_i or force_ir: kinds = 'ir'`)
         // and jtransform.py:430 (`if 'r' in kinds: sublists.append(
         // lst_r)`).
         let insn = build_box_int_fn_residual_call_ir_r_insn(
@@ -11429,7 +11429,7 @@ mod tests {
 
     #[test]
     fn flatten_ovf_canraise_uses_seven_char_prefix() {
-        // flatten.py:195 `opname[:7] + '_jump_if_ovf'` — verify the
+        // flatten.py `opname[:7] + '_jump_if_ovf'` — verify the
         // prefix transform for each of the standard upstream `_ovf` ops.
         let mut cpu = super::super::cpu::Cpu::new();
         // ExceptionData fail-loud invariant: any caller of
@@ -11563,7 +11563,7 @@ mod tests {
 
     #[test]
     fn lower_simple_call_hlop_omits_frame_register() {
-        // `jtransform.py:414 rewrite_call` simple_call lowering: the
+        // `jtransform.py rewrite_call` simple_call lowering: the
         // residual_call's Ref ListR is `[callable, args...]` with no frame
         // operand — the parent frame is resolved at runtime from the
         // execution context inside `bh_call_fn_impl`, matching the

@@ -73,7 +73,7 @@ impl crate::lltype::GcType for Module {
 ///   in which `Module.__init__` skips the `__name__` setitem.
 ///
 fn module_value(name: &str) -> Module {
-    // `pypy/interpreter/module.py:18 Module.__init__` opens
+    // `pypy/interpreter/module.py Module.__init__` opens
     // `w_dict = space.newdict(module=True)` per `dictmultiobject.py:440-451
     // _newdict(module=True)`, which lands on `W_ModuleDictObject`
     // (ModuleDictStrategy + cell-cache). Pyre routes through
@@ -141,7 +141,7 @@ pub fn w_module_new_managed(name: &str) -> PyObjectRef {
 /// for seeding `__name__` (matching PyPy `moduledef.py:102-103
 /// Module(space, None, w_builtin)` where `w_name=None`).
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
 /// the body performs an unported `lltype::malloc_typed` NewWithVtable
 /// (`Module`) that survives `fuse_boxing_alloc` unfused, so the JIT
 /// residualises the whole call to a stable runtime fnaddr instead of

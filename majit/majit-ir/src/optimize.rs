@@ -32,7 +32,7 @@ impl std::fmt::Display for SpeculativeError {
 
 impl std::error::Error for SpeculativeError {}
 
-/// info.py:13-15 INFO_NULL / INFO_NONNULL / INFO_UNKNOWN constants.
+/// info.py INFO_NULL / INFO_NONNULL / INFO_UNKNOWN constants.
 ///
 /// Used by `PtrInfo::getnullness` and `IntBound::getnullness` to
 /// report whether a slot is known null, known non-null, or unknown.

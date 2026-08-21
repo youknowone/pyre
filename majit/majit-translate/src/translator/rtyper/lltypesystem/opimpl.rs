@@ -18,7 +18,7 @@
 //! upstream.
 //!
 //! Symbolic-carrier branches (PARITY by structural unreachability):
-//! upstream `op_int_add` `opimpl.py:208-213`, `op_int_sub` `:215-220`,
+//! upstream `op_int_add` `opimpl.py`, `op_int_sub` `:215-220`,
 //! `op_int_mul` `:269-272`, `op_int_eq` `:107-118` carry
 //! `assert isinstance(x, …, llmemory.AddressOffset)` /
 //! `assert isinstance(x, llgroup.CombinedSymbolic)` clauses that are
@@ -120,7 +120,7 @@ pub fn op_gc_load_indexed(_restype: &LowLevelType, _args: &[ConstValue]) -> Opti
     None
 }
 
-/// RPython `opimpl.op_bool_not` (`opimpl.py:204-206`).
+/// RPython `opimpl.op_bool_not` (`opimpl.py`).
 pub fn op_bool_not(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Bool(b)] => Some(ConstValue::Bool(!b)),
@@ -128,7 +128,7 @@ pub fn op_bool_not(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `opimpl.op_same_as` (`opimpl.py:380-381`).
+/// RPython `opimpl.op_same_as` (`opimpl.py`).
 pub fn op_same_as(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [value] => Some(value.clone()),
@@ -174,7 +174,7 @@ pub fn op_int_invert(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_int_add` (`opimpl.py:208-213`) — `intmask(x + y)`.
+/// RPython `op_int_add` (`opimpl.py`) — `intmask(x + y)`.
 pub fn op_int_add(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Int(a), ConstValue::Int(b)] => Some(ConstValue::Int(a.wrapping_add(*b))),
@@ -182,7 +182,7 @@ pub fn op_int_add(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_int_sub` (`opimpl.py:215-220`).
+/// RPython `op_int_sub` (`opimpl.py`).
 pub fn op_int_sub(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Int(a), ConstValue::Int(b)] => Some(ConstValue::Int(a.wrapping_sub(*b))),
@@ -190,7 +190,7 @@ pub fn op_int_sub(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_int_mul` (`opimpl.py:269-272`).
+/// RPython `op_int_mul` (`opimpl.py`).
 pub fn op_int_mul(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Int(a), ConstValue::Int(b)] => Some(ConstValue::Int(a.wrapping_mul(*b))),
@@ -198,7 +198,7 @@ pub fn op_int_mul(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_int_floordiv` (`opimpl.py:281-288`). Upstream computes
+/// RPython `op_int_floordiv` (`opimpl.py`). Upstream computes
 /// `r = x // y` (Python floor div) then adjusts by `+1` when the
 /// signs of `x` and `y` differ and the remainder is non-zero — the
 /// net effect is **C-style truncating division**. Rust's
@@ -215,7 +215,7 @@ pub fn op_int_floordiv(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_int_mod` (`opimpl.py:290-296`). Same Python-floor →
+/// RPython `op_int_mod` (`opimpl.py`). Same Python-floor →
 /// C-truncate adjustment as `op_int_floordiv`. Rust's
 /// `i64::wrapping_rem` is already C truncating, including
 /// `wrapping_rem(MIN, -1) = 0`, which matches upstream where
@@ -268,7 +268,7 @@ pub fn op_int_rshift(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_int_and`, `op_int_or`, `op_int_xor` (`opimpl.py:247-267`).
+/// RPython `op_int_and`, `op_int_or`, `op_int_xor` (`opimpl.py`).
 pub fn op_int_and(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Int(a), ConstValue::Int(b)] => Some(ConstValue::Int(a & b)),
@@ -291,7 +291,7 @@ pub fn op_int_xor(args: &[ConstValue]) -> Option<ConstValue> {
 }
 
 /// RPython `op_int_eq`, `op_int_ne`, `op_int_lt`, `op_int_le`,
-/// `op_int_gt`, `op_int_ge` (`opimpl.py:107-118` + comparators
+/// `op_int_gt`, `op_int_ge` (`opimpl.py` + comparators
 /// derived via `get_primitive_op_src`).
 pub fn op_int_lt(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -335,7 +335,7 @@ pub fn op_int_ge(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_int_between(a, b, c)` (`opimpl.py:235-239`) —
+/// RPython `op_int_between(a, b, c)` (`opimpl.py`) —
 /// `a <= b < c`.
 pub fn op_int_between(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -346,7 +346,7 @@ pub fn op_int_between(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_int_force_ge_zero(a)` (`opimpl.py:241-245`) —
+/// RPython `op_int_force_ge_zero(a)` (`opimpl.py`) —
 /// `0 if a < 0 else a`.
 pub fn op_int_force_ge_zero(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -357,7 +357,7 @@ pub fn op_int_force_ge_zero(args: &[ConstValue]) -> Option<ConstValue> {
 
 // ---- float_* ------------------------------------------------------
 
-/// `op_float_*` are derived via `get_primitive_op_src` (`opimpl.py:47-94`)
+/// `op_float_*` are derived via `get_primitive_op_src` (`opimpl.py`)
 /// for `argtype = float`. RPython folds them as direct IEEE 754
 /// arithmetic; only division by zero raises `ZeroDivisionError`
 /// upstream, so that case refuses to fold.
@@ -487,23 +487,23 @@ pub fn op_llong_mul(args: &[ConstValue]) -> Option<ConstValue> {
     op_int_mul(args)
 }
 
-/// RPython `op_llong_floordiv` (`opimpl.py:298-304`). Same C-truncating
+/// RPython `op_llong_floordiv` (`opimpl.py`). Same C-truncating
 /// semantics as `op_int_floordiv`.
 pub fn op_llong_floordiv(args: &[ConstValue]) -> Option<ConstValue> {
     op_int_floordiv(args)
 }
 
-/// RPython `op_llong_mod` (`opimpl.py:306-312`).
+/// RPython `op_llong_mod` (`opimpl.py`).
 pub fn op_llong_mod(args: &[ConstValue]) -> Option<ConstValue> {
     op_int_mod(args)
 }
 
-/// RPython `op_llong_lshift` (`opimpl.py:340-343`) — `r_longlong_result(x << y)`.
+/// RPython `op_llong_lshift` (`opimpl.py`) — `r_longlong_result(x << y)`.
 pub fn op_llong_lshift(args: &[ConstValue]) -> Option<ConstValue> {
     op_int_lshift(args)
 }
 
-/// RPython `op_llong_rshift` (`opimpl.py:345-348`).
+/// RPython `op_llong_rshift` (`opimpl.py`).
 pub fn op_llong_rshift(args: &[ConstValue]) -> Option<ConstValue> {
     op_int_rshift(args)
 }
@@ -641,7 +641,7 @@ pub fn op_uint_xor(args: &[ConstValue]) -> Option<ConstValue> {
     Some(ConstValue::Int((a ^ b) as i64))
 }
 
-/// RPython `op_uint_lshift` (`opimpl.py:330-333`) — `r_uint(x << y)`.
+/// RPython `op_uint_lshift` (`opimpl.py`) — `r_uint(x << y)`.
 /// Negative `y` raises ValueError upstream → no fold; `y >= 64`
 /// truncates to 0 in u64 space.
 pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
@@ -660,7 +660,7 @@ pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_uint_rshift` (`opimpl.py:335-338`) — logical right
+/// RPython `op_uint_rshift` (`opimpl.py`) — logical right
 /// shift in u64 space. `y >= 64` collapses to 0.
 pub fn op_uint_rshift(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -753,12 +753,12 @@ pub fn op_ullong_xor(args: &[ConstValue]) -> Option<ConstValue> {
     op_uint_xor(args)
 }
 
-/// RPython `op_ullong_lshift` (`opimpl.py:360-363`).
+/// RPython `op_ullong_lshift` (`opimpl.py`).
 pub fn op_ullong_lshift(args: &[ConstValue]) -> Option<ConstValue> {
     op_uint_lshift(args)
 }
 
-/// RPython `op_ullong_rshift` (`opimpl.py:365-368`).
+/// RPython `op_ullong_rshift` (`opimpl.py`).
 pub fn op_ullong_rshift(args: &[ConstValue]) -> Option<ConstValue> {
     op_uint_rshift(args)
 }
@@ -789,7 +789,7 @@ pub fn op_ullong_ge(args: &[ConstValue]) -> Option<ConstValue> {
 
 // ---- ptr_* ---------------------------------------------------------
 
-/// RPython `op_ptr_eq` (`opimpl.py:120-123`).
+/// RPython `op_ptr_eq` (`opimpl.py`).
 ///
 /// Upstream calls `checkptr(ptr1); checkptr(ptr2)` first, which
 /// raises when either argument is not an `lltype.Ptr` value. The
@@ -805,7 +805,7 @@ pub fn op_ptr_eq(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_ptr_ne` (`opimpl.py:125-128`). Same `checkptr`
+/// RPython `op_ptr_ne` (`opimpl.py`). Same `checkptr`
 /// discipline as `op_ptr_eq` — non-pointer operands refuse to fold.
 pub fn op_ptr_ne(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -814,7 +814,7 @@ pub fn op_ptr_ne(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_ptr_nonzero` (`opimpl.py:130-132`) — `bool(ptr)`.
+/// RPython `op_ptr_nonzero` (`opimpl.py`) — `bool(ptr)`.
 /// Upstream's `checkptr(p)` enforces `Ptr` typeOf; the Rust port
 /// matches the `LLPtr` carrier.
 pub fn op_ptr_nonzero(args: &[ConstValue]) -> Option<ConstValue> {
@@ -824,7 +824,7 @@ pub fn op_ptr_nonzero(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_ptr_iszero` (`opimpl.py:134-136`) — `not bool(ptr)`.
+/// RPython `op_ptr_iszero` (`opimpl.py`) — `not bool(ptr)`.
 pub fn op_ptr_iszero(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::LLPtr(p)] => Some(ConstValue::Bool(!p.nonzero())),
@@ -832,7 +832,7 @@ pub fn op_ptr_iszero(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_adr_eq` (`opimpl.py:520-523`): `checkadr; return addr1 ==
+/// RPython `op_adr_eq` (`opimpl.py`): `checkadr; return addr1 ==
 /// addr2`. The `checkadr` discipline (operands must be `Address`) is the
 /// `LLAddress` carrier match; non-address operands refuse to fold. The
 /// `==` delegates to `fakeaddress.__eq__` ([`_address::_eq`]).
@@ -843,7 +843,7 @@ pub fn op_adr_eq(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_adr_ne` (`opimpl.py:525-528`): `checkadr; return addr1 !=
+/// RPython `op_adr_ne` (`opimpl.py`): `checkadr; return addr1 !=
 /// addr2`, delegating to `fakeaddress.__ne__` ([`_address::_ne`]).
 pub fn op_adr_ne(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -852,7 +852,7 @@ pub fn op_adr_ne(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_adr_lt` (`opimpl.py:510-513`): `checkadr; return addr1 <
+/// RPython `op_adr_lt` (`opimpl.py`): `checkadr; return addr1 <
 /// addr2`. `fakeaddress.__lt__` raises `TypeError` for two non-NULL
 /// addresses; `Err` there maps to "no fold" (the op stays runtime).
 pub fn op_adr_lt(args: &[ConstValue]) -> Option<ConstValue> {
@@ -862,7 +862,7 @@ pub fn op_adr_lt(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_adr_le` (`opimpl.py:515-518`): `checkadr; return addr1 <=
+/// RPython `op_adr_le` (`opimpl.py`): `checkadr; return addr1 <=
 /// addr2`, delegating to `fakeaddress.__le__` ([`_address::_le`]).
 pub fn op_adr_le(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -871,7 +871,7 @@ pub fn op_adr_le(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_adr_gt` (`opimpl.py:530-533`): `checkadr; return addr1 >
+/// RPython `op_adr_gt` (`opimpl.py`): `checkadr; return addr1 >
 /// addr2`, delegating to `fakeaddress.__gt__` ([`_address::_gt`]).
 pub fn op_adr_gt(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -880,7 +880,7 @@ pub fn op_adr_gt(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_adr_ge` (`opimpl.py:535-538`): `checkadr; return addr1 >=
+/// RPython `op_adr_ge` (`opimpl.py`): `checkadr; return addr1 >=
 /// addr2`, delegating to `fakeaddress.__ge__` ([`_address::_ge`]).
 pub fn op_adr_ge(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -889,9 +889,9 @@ pub fn op_adr_ge(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_adr_delta` (`opimpl.py:551-553`): `checkadr(addr1);
+/// RPython `op_adr_delta` (`opimpl.py`): `checkadr(addr1);
 /// checkadr(addr2); return addr1 - addr2`. With two fakeaddresses the
-/// subtraction ([`_address::_delta`], `fakeaddress.__sub__` llmemory.py:481-484)
+/// subtraction ([`_address::_delta`], `fakeaddress.__sub__` llmemory.py)
 /// yields `Signed 0` when the addresses are equal and raises `TypeError`
 /// otherwise; the `Err` maps to "no fold" so the op stays runtime.
 ///
@@ -904,9 +904,9 @@ pub fn op_adr_delta(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_adr_add` (`opimpl.py:540-543`): `checkadr(addr); assert
+/// RPython `op_adr_add` (`opimpl.py`): `checkadr(addr); assert
 /// typeOf(offset) is Signed; return addr + offset`. `fakeaddress.__add__`
-/// (llmemory.py:469-474) raises `NullAddressError` on a NULL base and
+/// (llmemory.py) raises `NullAddressError` on a NULL base and
 /// otherwise returns `fakeaddress(offset.ref(self.ptr))`. The offset is the
 /// `ConstValue::AddressOffset` carrier; [`AddressOffset::r#ref`] declines
 /// (→ no fold) for the bases / element kinds it cannot navigate yet.
@@ -934,9 +934,9 @@ pub fn op_adr_add(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_adr_sub` (`opimpl.py:545-549`): `addr - offset`. With an
+/// RPython `op_adr_sub` (`opimpl.py`): `addr - offset`. With an
 /// `AddressOffset` operand `fakeaddress.__sub__` is `self + (-offset)`
-/// (llmemory.py:476-477); a non-negatable offset (`AddressOffset::neg` →
+/// (llmemory.py); a non-negatable offset (`AddressOffset::neg` →
 /// `None`) declines, as does the underlying `op_adr_add`.
 pub fn op_adr_sub(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -956,8 +956,8 @@ pub fn op_adr_sub(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_int_to_adr(int)` (`opimpl.py:487-489`):
-/// `llmemory.cast_int_to_adr(int)` (llmemory.py:788-796). Folds the
+/// RPython `op_cast_int_to_adr(int)` (`opimpl.py`):
+/// `llmemory.cast_int_to_adr(int)` (llmemory.py). Folds the
 /// `cast_int_to_ptr` + `cast_ptr_to_adr` composition: `0` → NULL address,
 /// an odd integer → a tagged-integer `_NONGCREF` `_ptr` wrapped as the
 /// fakeaddress (`_address::Fake`), an even non-zero integer → declines (its
@@ -969,7 +969,7 @@ pub fn op_cast_int_to_adr(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_adr_to_ptr(TYPE, adr)` (`opimpl.py:482-485`,
+/// RPython `op_cast_adr_to_ptr(TYPE, adr)` (`opimpl.py`,
 /// `need_result_type = True`): `llmemory.cast_adr_to_ptr(adr, TYPE)`. `TYPE`
 /// is the operation result's concretetype (`constfold.py:36` passes RESTYPE
 /// first); it must be a `Ptr`. An int-cast address declines (no tagged-int
@@ -988,7 +988,7 @@ pub fn op_cast_adr_to_ptr(restype: &LowLevelType, args: &[ConstValue]) -> Option
 
 // ---- cast_*_to_* (primitive-only carriers) ------------------------
 
-/// RPython `op_cast_int_to_float` (`opimpl.py:388-391`).
+/// RPython `op_cast_int_to_float` (`opimpl.py`).
 pub fn op_cast_int_to_float(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Int(i)] => Some(ConstValue::float(*i as f64)),
@@ -996,7 +996,7 @@ pub fn op_cast_int_to_float(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_float_to_int` (`opimpl.py:428-430`) —
+/// RPython `op_cast_float_to_int` (`opimpl.py`) —
 /// `intmask(int(f))`. NaN / ±inf raise upstream and refuse to fold.
 /// Finite floats — including those outside `[i64::MIN, i64::MAX]` —
 /// fold to the exact 64-bit truncation of `int(f)`, matching
@@ -1057,7 +1057,7 @@ fn float_to_signed64_intmask(f: f64) -> i64 {
     if sign == 1 { abs.wrapping_neg() } else { abs }
 }
 
-/// RPython `op_cast_bool_to_int` (`opimpl.py:416-418`).
+/// RPython `op_cast_bool_to_int` (`opimpl.py`).
 pub fn op_cast_bool_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Bool(b)] => Some(ConstValue::Int(*b as i64)),
@@ -1065,7 +1065,7 @@ pub fn op_cast_bool_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_bool_to_float` (`opimpl.py:424-426`).
+/// RPython `op_cast_bool_to_float` (`opimpl.py`).
 pub fn op_cast_bool_to_float(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Bool(b)] => Some(ConstValue::float(if *b { 1.0 } else { 0.0 })),
@@ -1073,7 +1073,7 @@ pub fn op_cast_bool_to_float(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_int_to_char` (`opimpl.py:411-414`) —
+/// RPython `op_cast_int_to_char` (`opimpl.py`) —
 /// `chr(b)`. Out-of-range ints raise ValueError upstream → no fold.
 /// The Rust carrier for `char` is a length-1 [`ConstValue::ByteStr`].
 pub fn op_cast_int_to_char(args: &[ConstValue]) -> Option<ConstValue> {
@@ -1083,7 +1083,7 @@ pub fn op_cast_int_to_char(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_char_to_int` (`opimpl.py:448-450`) —
+/// RPython `op_cast_char_to_int` (`opimpl.py`) —
 /// `ord(b)` on a length-1 string. Other shapes refuse to fold.
 pub fn op_cast_char_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -1092,7 +1092,7 @@ pub fn op_cast_char_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_int_to_unichar` (`opimpl.py:456-458`) —
+/// RPython `op_cast_int_to_unichar` (`opimpl.py`) —
 /// `unichr(b)`. The Rust carrier for `unichar` is a length-1
 /// [`ConstValue::UniStr`].
 pub fn op_cast_int_to_unichar(args: &[ConstValue]) -> Option<ConstValue> {
@@ -1106,7 +1106,7 @@ pub fn op_cast_int_to_unichar(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_unichar_to_int` (`opimpl.py:452-454`) — `ord(b)`.
+/// RPython `op_cast_unichar_to_int` (`opimpl.py`) — `ord(b)`.
 pub fn op_cast_unichar_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::UniStr(s)] => {
@@ -1129,7 +1129,7 @@ pub fn op_cast_unichar_to_int(args: &[ConstValue]) -> Option<ConstValue> {
 // identity at the bit-pattern level. Upstream's per-type asserts
 // remain available for parity once the carriers diverge.
 
-/// RPython `op_cast_int_to_uint` (`opimpl.py:460-463`) — `r_uint(b)`.
+/// RPython `op_cast_int_to_uint` (`opimpl.py`) — `r_uint(b)`.
 /// Identity on the i64 carrier.
 pub fn op_cast_int_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -1138,7 +1138,7 @@ pub fn op_cast_int_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_uint_to_int` (`opimpl.py:465-467`) — `intmask(b)`.
+/// RPython `op_cast_uint_to_int` (`opimpl.py`) — `intmask(b)`.
 /// Identity on the i64 carrier (intmask is an i64 truncation that's
 /// already the carrier).
 pub fn op_cast_uint_to_int(args: &[ConstValue]) -> Option<ConstValue> {
@@ -1148,7 +1148,7 @@ pub fn op_cast_uint_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_int_to_longlong` (`opimpl.py:469-471`).
+/// RPython `op_cast_int_to_longlong` (`opimpl.py`).
 /// `r_longlong_result(b)` is `long(b)` on 64-bit, which fits the
 /// existing i64 carrier identically.
 pub fn op_cast_int_to_longlong(args: &[ConstValue]) -> Option<ConstValue> {
@@ -1158,7 +1158,7 @@ pub fn op_cast_int_to_longlong(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_truncate_longlong_to_int` (`opimpl.py:473-475`) —
+/// RPython `op_truncate_longlong_to_int` (`opimpl.py`) —
 /// `intmask(b)`. Identity on i64.
 pub fn op_truncate_longlong_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
@@ -1167,7 +1167,7 @@ pub fn op_truncate_longlong_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_bool_to_uint` (`opimpl.py:420-422`).
+/// RPython `op_cast_bool_to_uint` (`opimpl.py`).
 pub fn op_cast_bool_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Bool(b)] => Some(ConstValue::Int(*b as i64)),
@@ -1175,7 +1175,7 @@ pub fn op_cast_bool_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_uint_to_float` (`opimpl.py:393-395`) — `float(u)`
+/// RPython `op_cast_uint_to_float` (`opimpl.py`) — `float(u)`
 /// in u64 space (preserves precision for values up to 2^53; large
 /// u64 values are folded with the standard `u64 as f64` rounding,
 /// matching upstream's `float(int(...))` lossy conversion).
@@ -1186,21 +1186,21 @@ pub fn op_cast_uint_to_float(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_longlong_to_float` (`opimpl.py:397-402`). On 64-bit
+/// RPython `op_cast_longlong_to_float` (`opimpl.py`). On 64-bit
 /// hosts where `r_longlong is r_int`, this is `float(i)` — identical
 /// to `cast_int_to_float`.
 pub fn op_cast_longlong_to_float(args: &[ConstValue]) -> Option<ConstValue> {
     op_cast_int_to_float(args)
 }
 
-/// RPython `op_cast_ulonglong_to_float` (`opimpl.py:404-409`). On
+/// RPython `op_cast_ulonglong_to_float` (`opimpl.py`). On
 /// 64-bit hosts this is `float(u64_value)`, matching
 /// `op_cast_uint_to_float`.
 pub fn op_cast_ulonglong_to_float(args: &[ConstValue]) -> Option<ConstValue> {
     op_cast_uint_to_float(args)
 }
 
-/// RPython `op_cast_float_to_uint` (`opimpl.py:432-434`) —
+/// RPython `op_cast_float_to_uint` (`opimpl.py`) —
 /// `r_uint(long(f))`. Upstream's `long(f)` truncates toward zero
 /// into a Python arbitrary-precision integer, and `r_uint(...)`
 /// then wraps the value modulo 2^64 (on 64-bit hosts; modulo 2^32
@@ -1283,7 +1283,7 @@ fn float_trunc_mod_2_pow_64(f: f64) -> u64 {
     }
 }
 
-/// RPython `op_cast_float_to_longlong` (`opimpl.py:436-442`).
+/// RPython `op_cast_float_to_longlong` (`opimpl.py`).
 ///
 /// Upstream:
 /// ```python
@@ -1329,12 +1329,12 @@ pub fn op_cast_float_to_longlong(args: &[ConstValue]) -> Option<ConstValue> {
     }
 }
 
-/// RPython `op_cast_float_to_ulonglong` (`opimpl.py:444-446`).
+/// RPython `op_cast_float_to_ulonglong` (`opimpl.py`).
 pub fn op_cast_float_to_ulonglong(args: &[ConstValue]) -> Option<ConstValue> {
     op_cast_float_to_uint(args)
 }
 
-/// RPython `op_convert_float_bytes_to_longlong` (`opimpl.py:490-492`)
+/// RPython `op_convert_float_bytes_to_longlong` (`opimpl.py`)
 /// — `float2longlong(a)`, the reinterpret-cast from f64 bit pattern
 /// to i64.
 pub fn op_convert_float_bytes_to_longlong(args: &[ConstValue]) -> Option<ConstValue> {
@@ -1344,7 +1344,7 @@ pub fn op_convert_float_bytes_to_longlong(args: &[ConstValue]) -> Option<ConstVa
     }
 }
 
-/// RPython `op_convert_longlong_bytes_to_float` (`opimpl.py:494-496`)
+/// RPython `op_convert_longlong_bytes_to_float` (`opimpl.py`)
 /// — `longlong2float(a)`, the reinterpret-cast from i64 bit pattern
 /// to f64.
 pub fn op_convert_longlong_bytes_to_float(args: &[ConstValue]) -> Option<ConstValue> {
@@ -1357,7 +1357,7 @@ pub fn op_convert_longlong_bytes_to_float(args: &[ConstValue]) -> Option<ConstVa
 // ---- char_* / unichar_* comparisons ------------------------------
 
 /// RPython `char_lt`/`char_le`/`char_eq`/`char_ne`/`char_gt`/`char_ge`
-/// derived via `get_primitive_op_src` (`opimpl.py:58-67`). The
+/// derived via `get_primitive_op_src` (`opimpl.py`). The
 /// length-1 carrier is a 1-byte [`ConstValue::ByteStr`].
 fn char_pair(args: &[ConstValue]) -> Option<(u8, u8)> {
     match args {
@@ -1398,7 +1398,7 @@ pub fn op_char_ge(args: &[ConstValue]) -> Option<ConstValue> {
     Some(ConstValue::Bool(a >= b))
 }
 
-/// RPython `op_unichar_eq`/`op_unichar_ne` (`opimpl.py:499-507`).
+/// RPython `op_unichar_eq`/`op_unichar_ne` (`opimpl.py`).
 fn unichar_pair(args: &[ConstValue]) -> Option<(char, char)> {
     match args {
         [ConstValue::UniStr(a), ConstValue::UniStr(b)] => {
@@ -1426,7 +1426,7 @@ pub fn op_unichar_ne(args: &[ConstValue]) -> Option<ConstValue> {
 
 // ---- likely / unlikely --------------------------------------------
 
-/// RPython `op_likely` / `op_unlikely` (`opimpl.py:779-785`) —
+/// RPython `op_likely` / `op_unlikely` (`opimpl.py`) —
 /// identity on `bool`. The annotation is a JIT hint; constant folding
 /// just unwraps the value.
 pub fn op_likely(args: &[ConstValue]) -> Option<ConstValue> {
@@ -2000,7 +2000,7 @@ mod tests {
 
     #[test]
     fn llong_aliases_int_on_64bit_carrier() {
-        // `r_longlong is r_int` on 64-bit hosts (`opimpl.py:23-28`),
+        // `r_longlong is r_int` on 64-bit hosts (`opimpl.py`),
         // so every llong_* op produces the same result as int_* on
         // identical inputs.
         assert_eq!(op_llong_add(&[i(i64::MAX), i(1)]), Some(i(i64::MIN)));

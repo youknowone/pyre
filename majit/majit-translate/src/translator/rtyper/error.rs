@@ -14,20 +14,20 @@
 //!     pass
 //! ```
 //!
-//! Plus `rpython/rtyper/rmodel.py:397 BrokenReprTyperError(TyperError)`
+//! Plus `rpython/rtyper/rmodel.py BrokenReprTyperError(TyperError)`
 //! for the Repr.setup() BROKEN state. Rust collapses the three-class
 //! hierarchy into an enum so call sites can pattern-match on kind
-//! without downcasts; the `where` annotation (`rtyper.py:252
+//! without downcasts; the `where` annotation (`rtyper.py
 //! gottypererror`) is carried on every variant as an optional trio
 //! matching upstream's (stage, block, op) tuple.
 
 use std::fmt;
 
-/// RPython `TyperError(Exception)` hierarchy (error.py:1 + rmodel.py:397).
+/// RPython `TyperError(Exception)` hierarchy (error.py + rmodel.py:397).
 ///
 /// The three upstream subclasses correspond to enum variants. `where`
 /// is a structured annotation upstream stores on the exception via
-/// `__dict__`-style attach after construction (see `rtyper.py:252
+/// `__dict__`-style attach after construction (see `rtyper.py
 /// gottypererror`); mirror it as an `Option<TyperWhere>` field on
 /// every variant.
 #[derive(Debug, Clone)]
@@ -39,18 +39,18 @@ pub enum TyperError {
         text: String,
         where_info: Option<TyperWhere>,
     },
-    /// RPython `class MissingRTypeOperation(TyperError)` (error.py:8).
+    /// RPython `class MissingRTypeOperation(TyperError)` (error.py).
     /// Raised by `Repr` methods that have no implementation for the
-    /// operation name (e.g. `rmodel.py:174 rtype_bltn_list`,
-    /// `rmodel.py:178 rtype_unichr`, `rmodel.py:234 make_iterator_repr`).
-    /// `Repr.rtype_bool` catches this specifically at rmodel.py:201-205.
+    /// operation name (e.g. `rmodel.py rtype_bltn_list`,
+    /// `rmodel.py rtype_unichr`, `rmodel.py make_iterator_repr`).
+    /// `Repr.rtype_bool` catches this specifically at rmodel.py.
     MissingRTypeOperation {
         text: String,
         where_info: Option<TyperWhere>,
     },
-    /// RPython `class BrokenReprTyperError(TyperError)` (rmodel.py:397).
+    /// RPython `class BrokenReprTyperError(TyperError)` (rmodel.py).
     /// Raised by `Repr.setup()` when the target Repr is already in
-    /// `setupstate.BROKEN` state (rmodel.py:42-44).
+    /// `setupstate.BROKEN` state (rmodel.py).
     BrokenRepr {
         text: String,
         where_info: Option<TyperWhere>,
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn broken_repr_variant_is_detected_by_helper() {
-        // rmodel.py:42-44 raises BrokenReprTyperError from setup();
+        // rmodel.py raises BrokenReprTyperError from setup();
         // callers distinguish via isinstance. Pyre mirrors the
         // detection via `.is_broken_repr()`.
         let e = TyperError::broken_repr("cannot setup already failed Repr: <FooRepr>");
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn where_suffix_appended_on_display() {
-        // rtyper.py:252 gottypererror assigns `e.where = (stage,
+        // rtyper.py gottypererror assigns `e.where = (stage,
         // block, op)` before re-raising. Lock in the formatter so
         // post-mortem readers see the upstream 3-line suffix.
         let e = TyperError::message("bad cast").with_where(TyperWhere {

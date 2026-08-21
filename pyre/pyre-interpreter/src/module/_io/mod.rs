@@ -30,7 +30,7 @@ pub fn text_io_wrapper_type() -> PyObjectRef {
 // 128 KiB.  Keep one module-owned value shared by every buffered type.
 pub(crate) const DEFAULT_BUFFER_SIZE: i64 = 128 * 1024;
 
-/// `interp_bufferedio.py:41-60 TryLock` — one native lock and its owning
+/// `interp_bufferedio.py TryLock` — one native lock and its owning
 /// thread per buffered stream. The stream stores the opaque handle directly,
 /// never in a side table.
 struct BufferedTryLock {
@@ -287,21 +287,21 @@ fn iobase_next(args: &[PyObjectRef]) -> crate::PyResult {
 
 // ── AutoFlusher ──────────────────────────────────────────────────────
 //
-// `interp_iobase.py:444-476` keeps one `AutoFlusher` per space, weakly holding
+// `interp_iobase.py` keeps one `AutoFlusher` per space, weakly holding
 // every stream ever constructed, and `moduledef.py:37-40 Module.shutdown`
 // flushes whatever is still alive.  Without it an unclosed buffered stream
 // loses its writes whenever it outlives the only teardown pyre performs — the
 // `__main__` globals — which is every stream reachable from another module,
 // from `sys.modules`, or from a container.
 //
-// `rweaklist.py:52 store_handle` holds each stream through `weakref.ref`; the
+// `rweaklist.py store_handle` holds each stream through `weakref.ref`; the
 // `GcWeakrefBox` is pyre's rweakref, so the handle list is a `Vec` of boxes.
 // A box is collector-managed and this list is its only referent, so
 // [`walk_autoflusher_roots`] walks the slots as roots. The table is shared
 // process state because `space.fromcache(AutoFlusher)` owns one instance for
 // the object space, independent of the thread that constructs a stream.
 
-/// `rweaklist.py:4 INITIAL_SIZE`.
+/// `rweaklist.py INITIAL_SIZE`.
 const AUTOFLUSHER_INITIAL_SIZE: usize = 4;
 
 #[derive(Default)]
@@ -311,20 +311,20 @@ struct AutoFlusher {
     handles: Vec<usize>,
     /// `rweaklist.py:19 self.free_list`.
     free_list: Vec<usize>,
-    /// Marks each `rweaklist.py:17-20 initialize` of the handle table so an
+    /// Marks each `rweaklist.py initialize` of the handle table so an
     /// allocation can detect that shutdown discarded its reserved slot.
     generation: u64,
 }
 
 impl AutoFlusher {
-    /// `rweaklist.py:17-20 initialize`.
+    /// `rweaklist.py initialize`.
     fn initialize(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.handles = vec![0; AUTOFLUSHER_INITIAL_SIZE];
         self.free_list = (0..AUTOFLUSHER_INITIAL_SIZE).collect();
     }
 
-    /// `rweaklist.py:23-42 reserve_next_handle_index`.
+    /// `rweaklist.py reserve_next_handle_index`.
     fn reserve_next_handle_index(&mut self) -> usize {
         if self.handles.is_empty() {
             self.initialize();
@@ -377,8 +377,8 @@ pub fn walk_autoflusher_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
     }
 }
 
-/// `interp_iobase.py:447-453 AutoFlusher.add`, reached from
-/// `interp_iobase.py:61-62 W_IOBase.__init__` for every stream that does not
+/// `interp_iobase.py AutoFlusher.add`, reached from
+/// `interp_iobase.py W_IOBase.__init__` for every stream that does not
 /// opt out.
 ///
 /// Returns `w_iobase`, which the rweakref allocation may have relocated.
@@ -401,7 +401,7 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
             let index = flusher.reserve_next_handle_index();
             (index, flusher.generation, flusher.handles[index])
         };
-        // `rweaklist.py:51-52 store_handle` — reuse the slot's box when it already
+        // `rweaklist.py store_handle` — reuse the slot's box when it already
         // holds one, so a long-lived process bounds the immortal boxes by its peak
         // number of open streams.
         let target = pyre_object::gc_roots::shadow_stack_get(target_root);
@@ -416,7 +416,7 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
             ))
         };
         let mut flusher = AUTOFLUSHER.lock().unwrap();
-        // `rweaklist.py:17-20 initialize` replaces the table, invalidating an
+        // `rweaklist.py initialize` replaces the table, invalidating an
         // index reserved from the previous generation.
         if flusher.generation != generation {
             continue;
@@ -429,7 +429,7 @@ pub(crate) fn autoflusher_add(w_iobase: PyObjectRef) -> PyObjectRef {
     pyre_object::gc_roots::shadow_stack_get(target_root)
 }
 
-/// `interp_iobase.py:455-472 AutoFlusher.flush_all`, run from
+/// `interp_iobase.py AutoFlusher.flush_all`, run from
 /// `moduledef.py:37-40 Module.shutdown` — "at shutdown, flush all open streams.
 /// Ignore I/O errors."
 pub fn flush_all_streams() {
@@ -437,7 +437,7 @@ pub fn flush_all_streams() {
         let handles = {
             let mut flusher = AUTOFLUSHER.lock().unwrap();
             flusher.free_list.clear();
-            // `rweaklist.py:17-20 initialize` resets the state here, so a
+            // `rweaklist.py initialize` resets the state here, so a
             // stream created while flushing is picked up by the next round
             // instead of being flushed twice.
             flusher.generation = flusher.generation.wrapping_add(1);
@@ -488,7 +488,7 @@ pub fn flush_all_streams() {
 
 /// Tag a freshly allocated `_io` object with the class being constructed, then
 /// put it on the finalizer queue — `objspace.py:485-487 allocate_instance`
-/// followed by `interp_iobase.py:63-64 W_IOBase.__init__`:
+/// followed by `interp_iobase.py W_IOBase.__init__`:
 /// `if self.needs_finalizer(): self.register_finalizer(space)`.
 ///
 /// An unclosed stream still has to flush and close once it is unreachable, and
@@ -496,14 +496,14 @@ pub fn flush_all_streams() {
 /// `hasuserdel` — set only for a class whose own dict carries `__del__` — is
 /// false for the plain types and the allocation hook would skip them. A
 /// subclass that does define `__del__` is registered by the hook and reaches
-/// this call too — the case `baseobjspace.py:185-188` returns early on; here
+/// this call too — the case `baseobjspace.py` returns early on; here
 /// the queue drops the repeat.
 pub(crate) fn tag_io_instance(obj: PyObjectRef, cls: PyObjectRef) -> PyObjectRef {
     tag_io_instance_with_finalizer(obj, cls, true)
 }
 
 /// [`tag_io_instance`] for a type that overrides
-/// `interp_iobase.py:157-159 W_IOBase.needs_finalizer` — "can return False if we
+/// `interp_iobase.py W_IOBase.needs_finalizer` — "can return False if we
 /// know that the precise close() method of this class will have no effect".
 /// Every override reads `type(self) is not <that class>`, so a subclass, whose
 /// `close` may do anything, keeps the default answer.
@@ -549,7 +549,7 @@ fn iobase_del(args: &[PyObjectRef]) -> crate::PyResult {
     let Some(&self_obj) = args.first() else {
         return Ok(w_none());
     };
-    // pypy/module/_io/interp_iobase.py:96-111 `descr_del` and CPython 3.14
+    // pypy/module/_io/interp_iobase.py `descr_del` and CPython 3.14
     // Modules/_io/iobase.c:275-310 `iobase_finalize`: failure to obtain or
     // truth-test `closed` means the partially initialized/detached object is
     // unusable and finalization stops quietly.  This check must not collapse
@@ -600,7 +600,7 @@ fn iobase_isatty(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_bool_from(false))
 }
 
-/// `interp_iobase.py:303-322 W_IOBase.writelines_w` — validate the stream,
+/// `interp_iobase.py W_IOBase.writelines_w` — validate the stream,
 /// obtain the input iterator, and call the receiver's (possibly overridden)
 /// `write` method once for each line.  The iteration is deliberately lazy;
 /// no list snapshot is introduced.
@@ -775,7 +775,7 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn init_iobase_type(ns: PyObjectRef) {
-    // interp_iobase.py:333-358 W_IOBase.typedef declares both descriptors
+    // interp_iobase.py W_IOBase.typedef declares both descriptors
     // in the raw typedef.  They must be present before the type/layout is
     // built: setting only the hasdict/weakrefable flags afterwards leaves
     // `_IOBase()` without the observable `__dict__` descriptor.
@@ -925,9 +925,9 @@ fn init_iobase_type(ns: PyObjectRef) {
     };
 }
 
-/// `interp_iobase.py:335 __new__ = generic_new_descr(W_IOBase)`.
+/// `interp_iobase.py __new__ = generic_new_descr(W_IOBase)`.
 ///
-/// `typedef.py:558-564 generic_new_descr` allocates the instance and then runs
+/// `typedef.py generic_new_descr` allocates the instance and then runs
 /// the interp-level `W_IOBase.__init__`, whose only effects are
 /// `interp_iobase.py:61-64` — hand the stream to the autoflusher, and put it on
 /// the finalizer queue so an unclosed one still flushes and closes once it

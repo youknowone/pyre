@@ -29,7 +29,7 @@ pub fn uniquemodulename(name: &str) -> String {
     }
 }
 
-/// RPython `gensupp.C_IDENTIFIER` (`gensupp.py:18-21`). Maps any byte
+/// RPython `gensupp.C_IDENTIFIER` (`gensupp.py`). Maps any byte
 /// not in `[0-9A-Za-z]` to `_`.
 fn c_identifier_byte(b: u8) -> u8 {
     if b.is_ascii_alphanumeric() { b } else { b'_' }
@@ -42,7 +42,7 @@ fn translate_c_identifier(s: &str) -> String {
     s.bytes().map(c_identifier_byte).map(char::from).collect()
 }
 
-/// RPython `class NameManager(object)` (`gensupp.py:28-72`).
+/// RPython `class NameManager(object)` (`gensupp.py`).
 ///
 /// Tracks every global identifier the generated C source uses so that
 /// each new name claim returns a string that doesn't collide with a
@@ -80,7 +80,7 @@ impl NameManager {
         }
     }
 
-    /// RPython `NameManager.make_reserved_names(txt)` (`gensupp.py:36-43`).
+    /// RPython `NameManager.make_reserved_names(txt)` (`gensupp.py`).
     ///
     /// Upstream raises `NameError("%s has already been seen!")` with the
     /// `%s` template literally un-substituted (a pre-existing upstream
@@ -97,7 +97,7 @@ impl NameManager {
         }
     }
 
-    /// RPython `NameManager._ensure_unique(basename)` (`gensupp.py:45-50`).
+    /// RPython `NameManager._ensure_unique(basename)` (`gensupp.py`).
     fn ensure_unique(&mut self, basename: String) -> String {
         let n = *self.seennames.get(&basename).unwrap_or(&0);
         self.seennames.insert(basename.clone(), n + 1);
@@ -181,7 +181,7 @@ impl NameManager {
     /// (`gensupp.py:68-72`).
     ///
     /// Upstream's `_LocalScope.__init__` stores `self.glob = glob`
-    /// (`gensupp.py:76-77`), so subsequent `_LocalScope.uniquename`
+    /// (`gensupp.py`), so subsequent `_LocalScope.uniquename`
     /// / `localname` calls implicitly mutate the parent NameManager.
     /// To match that shape, this constructor takes an
     /// `Rc<RefCell<NameManager>>` shared with the caller — the
@@ -232,10 +232,10 @@ impl NameManager {
     }
 }
 
-/// RPython `class _LocalScope(object)` (`gensupp.py:74-117`).
+/// RPython `class _LocalScope(object)` (`gensupp.py`).
 ///
 /// Tracks per-scope local-name dedup. Upstream stores `self.glob`
-/// (`gensupp.py:77`) as a reference to the parent `NameManager`,
+/// (`gensupp.py`) as a reference to the parent `NameManager`,
 /// then mutates it through `self.glob.uniquename(...)` /
 /// `self.glob.scopelist[...]` inside `uniquename` / `localname`.
 ///
@@ -258,7 +258,7 @@ pub(crate) struct LocalScope {
     pub(crate) usednames: HashMap<String, usize>,
     /// `scope`: parent.scope + 1.
     pub(crate) scope: usize,
-    /// RPython `_LocalScope.parent` (`gensupp.py:80`). Either the
+    /// RPython `_LocalScope.parent` (`gensupp.py`). Either the
     /// parent `_LocalScope` or the glob `NameManager` when no parent
     /// is supplied (upstream `:78-79 if not parent: parent = glob`).
     /// Held as `Option<Rc<LocalScope>>` — `None` mirrors upstream's
@@ -268,7 +268,7 @@ pub(crate) struct LocalScope {
     /// AGENTS.md "RPython object attribute는 Rust struct field로
     /// 보존".
     pub(crate) parent: Option<Rc<LocalScope>>,
-    /// RPython `_LocalScope.glob` (`gensupp.py:77`). Shared
+    /// RPython `_LocalScope.glob` (`gensupp.py`). Shared
     /// `Rc<RefCell<NameManager>>` so subsequent `uniquename` /
     /// `localname` calls borrow the parent NameManager without a
     /// per-call parameter — see the TODO block

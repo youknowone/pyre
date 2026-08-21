@@ -430,7 +430,7 @@ pub(crate) fn vable_array_descrs_from_jitcode<Sym: WalkSym>(
     Ok((fdescr, adescr))
 }
 
-/// `pyjitpl.py:1201-1216 _get_arrayitem_vable_index` opens with
+/// `pyjitpl.py _get_arrayitem_vable_index` opens with
 /// `indexbox = self.implement_guard_value(indexbox, pc)`: the flat array slot
 /// is derived from the index's recording-time value, so the trace is only
 /// sound if it also pins that value.

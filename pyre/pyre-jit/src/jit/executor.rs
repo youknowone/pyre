@@ -16,7 +16,7 @@ pub fn bhimpl_int_add(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     }
 }
 
-/// executor.py:282 do_int_add_ovf: ovfcheck(a + b)
+/// executor.py do_int_add_ovf: ovfcheck(a + b)
 /// Returns (result, ovf_flag). On overflow: result=0, ovf_flag=true.
 pub fn bhimpl_int_add_ovf(a: ConcreteValue, b: ConcreteValue) -> (ConcreteValue, bool) {
     match (a.getint(), b.getint()) {
@@ -35,7 +35,7 @@ pub fn bhimpl_int_sub(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     }
 }
 
-/// executor.py:292 do_int_sub_ovf: ovfcheck(a - b)
+/// executor.py do_int_sub_ovf: ovfcheck(a - b)
 /// Returns (result, ovf_flag). On overflow: result=0, ovf_flag=true.
 pub fn bhimpl_int_sub_ovf(a: ConcreteValue, b: ConcreteValue) -> (ConcreteValue, bool) {
     match (a.getint(), b.getint()) {
@@ -54,7 +54,7 @@ pub fn bhimpl_int_mul(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     }
 }
 
-/// executor.py:303 do_int_mul_ovf: ovfcheck(a * b)
+/// executor.py do_int_mul_ovf: ovfcheck(a * b)
 /// Returns (result, ovf_flag). On overflow: result=0, ovf_flag=true.
 pub fn bhimpl_int_mul_ovf(a: ConcreteValue, b: ConcreteValue) -> (ConcreteValue, bool) {
     match (a.getint(), b.getint()) {
@@ -68,7 +68,7 @@ pub fn bhimpl_int_mul_ovf(a: ConcreteValue, b: ConcreteValue) -> (ConcreteValue,
 
 /// The `int_py_div` residual call's target: Python's floor quotient.
 ///
-/// `rint.py:399-408 ll_int_py_div`: truncate as C does, then correct by the
+/// `rint.py ll_int_py_div`: truncate as C does, then correct by the
 /// sign of the residue. `r * y` and `x - r * y` both stay in range because
 /// `r` is the truncating quotient, so the only wrap is the `INT_MIN / -1`
 /// corner the trace guards out ahead of the call.
@@ -90,7 +90,7 @@ pub fn bhimpl_int_floordiv(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue 
 
 /// The `int_py_mod` residual call's target: Python's floor remainder.
 ///
-/// `rint.py:496-500 ll_int_py_mod`: truncate as C does, then add the divisor
+/// `rint.py ll_int_py_mod`: truncate as C does, then add the divisor
 /// back exactly when the remainder carries the wrong sign. Adding `y` to a
 /// remainder of the opposite sign cannot leave the range, which is why the
 /// correction is masked out of `y` rather than computed as `(r + y) % y` —
@@ -106,7 +106,7 @@ pub fn bhimpl_int_mod(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     }
 }
 
-/// `support.py:255-265 _ll_2_int_floordiv` — the truncating primitive the
+/// `support.py _ll_2_int_floordiv` — the truncating primitive the
 /// `IntFloorDiv` opcode is, as distinct from the floor helper above that the
 /// `int_py_div` call reaches.
 pub fn _ll_2_int_floordiv(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
@@ -116,7 +116,7 @@ pub fn _ll_2_int_floordiv(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     }
 }
 
-/// `support.py:266-271 _ll_2_int_mod` — see [`_ll_2_int_floordiv`].
+/// `support.py _ll_2_int_mod` — see [`_ll_2_int_floordiv`].
 pub fn _ll_2_int_mod(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     match (a.getint(), b.getint()) {
         (Some(x), Some(y)) if y != 0 => ConcreteValue::Int(x.wrapping_rem(y)),
@@ -321,7 +321,7 @@ pub fn execute_opcode(opcode: majit_ir::OpCode, args: &[ConcreteValue]) -> (Conc
                 (ConcreteValue::Null, false)
             }
         }
-        // executor.py:282 do_int_add_ovf: ovfcheck(a + b), ovf_flag on overflow
+        // executor.py do_int_add_ovf: ovfcheck(a + b), ovf_flag on overflow
         OpCode::IntAddOvf => {
             if args.len() >= 2 {
                 bhimpl_int_add_ovf(args[0], args[1])
@@ -336,7 +336,7 @@ pub fn execute_opcode(opcode: majit_ir::OpCode, args: &[ConcreteValue]) -> (Conc
                 (ConcreteValue::Null, false)
             }
         }
-        // executor.py:292 do_int_sub_ovf: ovfcheck(a - b), ovf_flag on overflow
+        // executor.py do_int_sub_ovf: ovfcheck(a - b), ovf_flag on overflow
         OpCode::IntSubOvf => {
             if args.len() >= 2 {
                 bhimpl_int_sub_ovf(args[0], args[1])
@@ -351,7 +351,7 @@ pub fn execute_opcode(opcode: majit_ir::OpCode, args: &[ConcreteValue]) -> (Conc
                 (ConcreteValue::Null, false)
             }
         }
-        // executor.py:303 do_int_mul_ovf: ovfcheck(a * b), ovf_flag on overflow
+        // executor.py do_int_mul_ovf: ovfcheck(a * b), ovf_flag on overflow
         OpCode::IntMulOvf => {
             if args.len() >= 2 {
                 bhimpl_int_mul_ovf(args[0], args[1])

@@ -154,7 +154,7 @@ fn write_attr(obj: PyObjectRef, name: &str, value: PyObjectRef) {
 }
 
 /// Field bridge for typed `W_Weakref` and mapdict `W_AbstractProxy` objects.
-/// `W_WeakrefBase` (interp__weakref.py:160-202) supplies the same fields to
+/// `W_WeakrefBase` (interp__weakref.py) supplies the same fields to
 /// both; only their physical composition differs.
 #[inline]
 fn weakref_obj_weak(obj: PyObjectRef) -> PyObjectRef {
@@ -233,7 +233,7 @@ impl Drop for InstanceRoot {
 
 // ── Type registration ─────────────────────────────────────────────────
 
-/// pypy/module/_weakref/interp__weakref.py:270-280 W_Weakref.typedef
+/// pypy/module/_weakref/interp__weakref.py W_Weakref.typedef
 ///
 /// ```python
 /// W_Weakref.typedef = TypeDef("weakref",
@@ -344,7 +344,7 @@ pub fn weakref_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// pypy/module/_weakref/interp__weakref.py:405-410 W_Proxy.typedef
+/// pypy/module/_weakref/interp__weakref.py W_Proxy.typedef
 ///
 /// ```python
 /// W_Proxy.typedef = TypeDef("weakproxy",
@@ -376,7 +376,7 @@ fn init_proxy_type(ns: PyObjectRef) {
             make_builtin_function_with_arity("__repr__", descr__repr__, 1),
         )
     };
-    // **proxy_typedef_dict — interp__weakref.py:409.
+    // **proxy_typedef_dict — interp__weakref.py.
     register_proxy_typedef_dict(ns, /*include_comparisons=*/ true);
 }
 
@@ -400,7 +400,7 @@ pub fn proxy_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// pypy/module/_weakref/interp__weakref.py:412-418 W_CallableProxy.typedef
+/// pypy/module/_weakref/interp__weakref.py W_CallableProxy.typedef
 ///
 /// ```python
 /// W_CallableProxy.typedef = TypeDef("weakcallableproxy",
@@ -440,7 +440,7 @@ fn init_callable_proxy_type(ns: PyObjectRef) {
             make_builtin_function("__call__", callable_proxy_descr__call__),
         )
     };
-    // **callable_proxy_typedef_dict — interp__weakref.py:417. Comparison
+    // **callable_proxy_typedef_dict — interp__weakref.py. Comparison
     // ops are excluded (interp__weakref.py:390-391 only writes them to
     // `proxy_typedef_dict`).
     register_proxy_typedef_dict(ns, /*include_comparisons=*/ false);
@@ -474,7 +474,7 @@ pub fn callable_proxy_type() -> PyObjectRef {
 //     other_refs_weak = None
 //     has_callbacks   = False
 //
-/// pypy/module/_weakref/interp__weakref.py:27-28 WeakrefLifeline.__init__
+/// pypy/module/_weakref/interp__weakref.py WeakrefLifeline.__init__
 ///
 /// ```python
 /// def __init__(self, space):
@@ -527,7 +527,7 @@ fn enable_callbacks(self_lifeline: PyObjectRef) {
     crate::executioncontext::register_finalizer(self_lifeline);
 }
 
-/// pypy/module/_weakref/interp__weakref.py:60-77 get_or_make_weakref
+/// pypy/module/_weakref/interp__weakref.py get_or_make_weakref
 ///
 /// ```python
 /// @jit.dont_look_inside
@@ -580,7 +580,7 @@ pub fn get_or_make_weakref(
     }
 }
 
-/// pypy/module/_weakref/interp__weakref.py:79-91 get_or_make_proxy
+/// pypy/module/_weakref/interp__weakref.py get_or_make_proxy
 ///
 /// ```python
 /// @jit.dont_look_inside
@@ -598,7 +598,7 @@ pub fn get_or_make_weakref(
 ///     return w_proxy
 /// ```
 pub fn get_or_make_proxy(self_lifeline: PyObjectRef, w_obj: PyObjectRef) -> PyObjectRef {
-    // interp__weakref.py:83-86: cached_proxy is a weakref TO the W_Proxy /
+    // interp__weakref.py: cached_proxy is a weakref TO the W_Proxy /
     // W_CallableProxy; w_cached = self.cached_proxy() returns the proxy
     // or None.
     let cached_slot =
@@ -621,7 +621,7 @@ pub fn get_or_make_proxy(self_lifeline: PyObjectRef, w_obj: PyObjectRef) -> PyOb
     w_proxy
 }
 
-/// pypy/module/_weakref/interp__weakref.py:93-104 get_any_weakref
+/// pypy/module/_weakref/interp__weakref.py get_any_weakref
 ///
 /// ```python
 /// def get_any_weakref(self, space):
@@ -646,7 +646,7 @@ pub fn get_any_weakref(self_lifeline: PyObjectRef) -> PyObjectRef {
     pyre_object::w_none()
 }
 
-/// pypy/module/_weakref/interp__weakref.py:111-118 make_weakref_with_callback
+/// pypy/module/_weakref/interp__weakref.py make_weakref_with_callback
 ///
 /// ```python
 /// @jit.dont_look_inside
@@ -670,7 +670,7 @@ pub fn make_weakref_with_callback(
     w_ref
 }
 
-/// pypy/module/_weakref/interp__weakref.py:120-129 make_proxy_with_callback
+/// pypy/module/_weakref/interp__weakref.py make_proxy_with_callback
 ///
 /// ```python
 /// @jit.dont_look_inside
@@ -721,13 +721,13 @@ pub fn W_Weakref_new(
     w_obj: PyObjectRef,
     w_callable: PyObjectRef,
 ) -> PyObjectRef {
-    // typedef.py:519 generic_new_descr → space.allocate_instance(W_Type, w_subtype)
+    // typedef.py generic_new_descr → space.allocate_instance(W_Type, w_subtype)
     let actual_type = if w_subtype.is_null() {
         weakref_type()
     } else {
         w_subtype
     };
-    // `W_Weakref` (interp__weakref.py:195-257) / `descr__new__weakref`
+    // `W_Weakref` (interp__weakref.py) / `descr__new__weakref`
     // (interp__weakref.py:259-269): the three fields are interpreter-owned, so
     // every subtype keeps the builtin payload. Its Python-level `__dict__` and
     // slots use the same tagged carrier as other builtin subclasses.
@@ -790,7 +790,7 @@ pub fn W_CallableProxy_new(w_obj: PyObjectRef, w_callable: PyObjectRef) -> PyObj
     obj
 }
 
-/// pypy/module/_weakref/interp__weakref.py:168-171 dereference
+/// pypy/module/_weakref/interp__weakref.py dereference
 ///
 /// ```python
 /// @jit.dont_look_inside
@@ -804,7 +804,7 @@ pub fn dereference(w_ref: PyObjectRef) -> PyObjectRef {
     unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(slot) }
 }
 
-/// pypy/module/_weakref/interp__weakref.py:179-190 W_WeakrefBase.descr__repr__
+/// pypy/module/_weakref/interp__weakref.py W_WeakrefBase.descr__repr__
 ///
 /// ```python
 /// def descr__repr__(self, space):
@@ -854,7 +854,7 @@ pub fn descr__repr__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     )))
 }
 
-/// pypy/module/_weakref/interp__weakref.py:207-214 descr__init__weakref
+/// pypy/module/_weakref/interp__weakref.py descr__init__weakref
 ///
 /// ```python
 /// def descr__init__weakref(self, space, w_obj, w_callable=None,
@@ -882,7 +882,7 @@ pub fn descr__init__weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
     Ok(pyre_object::w_none())
 }
 
-/// pypy/module/_weakref/interp__weakref.py:212-219 descr_hash
+/// pypy/module/_weakref/interp__weakref.py descr_hash
 ///
 /// ```python
 /// def descr_hash(self):
@@ -921,7 +921,7 @@ pub fn descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(h)
 }
 
-/// pypy/module/_weakref/interp__weakref.py:225-229 descr_call
+/// pypy/module/_weakref/interp__weakref.py descr_call
 ///
 /// ```python
 /// def descr_call(self):
@@ -939,7 +939,7 @@ pub fn descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(w_obj)
 }
 
-/// pypy/module/_weakref/interp__weakref.py:231-244 W_Weakref.compare
+/// pypy/module/_weakref/interp__weakref.py W_Weakref.compare
 ///
 /// ```python
 /// def compare(self, space, w_ref2, invert):
@@ -979,12 +979,12 @@ fn compare(w_self: PyObjectRef, w_ref2: PyObjectRef, invert: bool) -> Result<PyO
     }
 }
 
-/// pypy/module/_weakref/interp__weakref.py:246-247 descr__eq__
+/// pypy/module/_weakref/interp__weakref.py descr__eq__
 pub fn descr__eq__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     compare(args[0], args[1], false)
 }
 
-/// pypy/module/_weakref/interp__weakref.py:249-250 descr__ne__
+/// pypy/module/_weakref/interp__weakref.py descr__ne__
 pub fn descr__ne__(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     compare(args[0], args[1], true)
 }
@@ -1069,7 +1069,7 @@ fn is_callable(obj: PyObjectRef) -> bool {
 
 // ── module-level helpers ──────────────────────────────────────────────
 
-/// pypy/module/_weakref/interp__weakref.py:252-257 getlifeline
+/// pypy/module/_weakref/interp__weakref.py getlifeline
 ///
 /// ```python
 /// def getlifeline(space, w_obj):
@@ -1117,7 +1117,7 @@ fn lifeline_refs(lifeline: PyObjectRef) -> Vec<PyObjectRef> {
     refs
 }
 
-/// `WeakrefLifeline._finalize_` (interp__weakref.py:131-153), invoked
+/// `WeakrefLifeline._finalize_` (interp__weakref.py), invoked
 /// from pyre's shared finalizer queue when the lifeline becomes unreachable.
 pub fn finalize_weakrefs(w_obj: PyObjectRef) {
     let is_lifeline =
@@ -1189,7 +1189,7 @@ pub fn finalize_weakrefs(w_obj: PyObjectRef) {
     }
 }
 
-/// pypy/module/_weakref/interp__weakref.py:260-268 descr__new__weakref
+/// pypy/module/_weakref/interp__weakref.py descr__new__weakref
 ///
 /// ```python
 /// def descr__new__weakref(space, w_subtype, w_obj, w_callable=None,
@@ -1248,7 +1248,7 @@ fn descr__new__weakref_typecall(args: &[PyObjectRef]) -> Result<PyObjectRef, PyE
     descr__new__weakref(args[0], positional)
 }
 
-/// pypy/module/_weakref/interp__weakref.py:283-295 getweakrefcount
+/// pypy/module/_weakref/interp__weakref.py getweakrefcount
 ///
 /// ```python
 /// def getweakrefcount(space, w_obj):
@@ -1272,7 +1272,7 @@ pub fn getweakrefcount(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(pyre_object::w_int_new(count as i64))
 }
 
-/// pypy/module/_weakref/interp__weakref.py:297-309 getweakrefs
+/// pypy/module/_weakref/interp__weakref.py getweakrefs
 ///
 /// ```python
 /// def getweakrefs(space, w_obj):
@@ -1298,7 +1298,7 @@ pub fn getweakrefs(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 //
 // pypy/module/_weakref/interp__weakref.py:311-417
 
-/// pypy/module/_weakref/interp__weakref.py:318-319 W_Proxy.descr__hash__
+/// pypy/module/_weakref/interp__weakref.py W_Proxy.descr__hash__
 ///
 /// ```python
 /// def descr__hash__(self, space):
@@ -1308,7 +1308,7 @@ pub fn proxy_descr__hash__(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError
     Err(PyError::type_error("unhashable type".to_string()))
 }
 
-/// pypy/module/_weakref/interp__weakref.py:322-324 W_CallableProxy.descr__call__
+/// pypy/module/_weakref/interp__weakref.py W_CallableProxy.descr__call__
 ///
 /// ```python
 /// def descr__call__(self, space, __args__):
@@ -1324,7 +1324,7 @@ pub fn callable_proxy_descr__call__(args: &[PyObjectRef]) -> Result<PyObjectRef,
     crate::builtins::call_forwarding_args(w_obj, &args[1..])
 }
 
-/// pypy/module/_weakref/interp__weakref.py:329-337 proxy
+/// pypy/module/_weakref/interp__weakref.py proxy
 ///
 /// ```python
 /// def proxy(space, w_obj, w_callable=None):
@@ -1357,7 +1357,7 @@ pub fn proxy(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
 }
 
-/// pypy/module/_weakref/interp__weakref.py:339-340 descr__new__proxy
+/// pypy/module/_weakref/interp__weakref.py descr__new__proxy
 ///
 /// ```python
 /// def descr__new__proxy(space, w_subtype, w_obj, w_callable=None):
@@ -1369,7 +1369,7 @@ pub fn descr__new__proxy(_args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> 
     ))
 }
 
-/// pypy/module/_weakref/interp__weakref.py:342-344 descr__new__callableproxy
+/// pypy/module/_weakref/interp__weakref.py descr__new__callableproxy
 ///
 /// ```python
 /// def descr__new__callableproxy(space, w_subtype, w_obj, w_callable=None):
@@ -1382,7 +1382,7 @@ pub fn descr__new__callableproxy(_args: &[PyObjectRef]) -> Result<PyObjectRef, P
     ))
 }
 
-/// pypy/module/_weakref/interp__weakref.py:347-354 force
+/// pypy/module/_weakref/interp__weakref.py force
 ///
 /// ```python
 /// def force(space, proxy):
@@ -2398,7 +2398,7 @@ mod tests {
         assert!(std::ptr::eq(weakref_hash(weakref), first,));
     }
 
-    /// pypy/module/_weakref/interp__weakref.py:347-354 force —
+    /// pypy/module/_weakref/interp__weakref.py force —
     /// dead proxy must raise ReferenceError, not RuntimeError.
     #[test]
     fn test_force_dead_proxy_raises_reference_error() {
@@ -2491,7 +2491,7 @@ mod tests {
     }
 
     /// `proxy[index]` must NOT force the index operand. PyPy's
-    /// interp__weakref.py:365 sets `forcing_count = len(special_methods)`,
+    /// interp__weakref.py sets `forcing_count = len(special_methods)`,
     /// so for `__getitem__` (single special method) only `self` is
     /// dereferenced. A weakproxy passed as the index must reach the
     /// referent's `__getitem__` unchanged so identity-keyed dicts work.
@@ -2525,7 +2525,7 @@ mod tests {
         assert_eq!(unsafe { pyre_object::w_int_get_value(result) }, 256);
     }
 
-    /// pypy/interpreter/baseobjspace.py:2127-2128 — `__instancecheck__`
+    /// pypy/interpreter/baseobjspace.py — `__instancecheck__`
     /// and `__subclasscheck__` must be present on both proxy typedefs.
     /// pypy/interpreter/baseobjspace.py:2159 — divmod must register
     /// both `__divmod__` and `__rdivmod__`.

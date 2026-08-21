@@ -6,7 +6,7 @@
 use majit_backend::Backend;
 use majit_ir::{OpCode, OpRef};
 
-/// rpython/jit/metainterp/executor.py:524-528 `execute_varargs(cpu, metainterp, opnum, argboxes, descr)`.
+/// rpython/jit/metainterp/executor.py `execute_varargs(cpu, metainterp, opnum, argboxes, descr)`.
 ///
 /// ```python
 /// def execute_varargs(cpu, metainterp, opnum, argboxes, descr):
@@ -165,7 +165,7 @@ pub fn do_getarrayitem_gc_f(
     cpu.bh_getarrayitem_gc_f(arraybox, indexbox, arraydescr)
 }
 
-// blackhole.py:1370 bhimpl_arraylen_gc(cpu, array, arraydescr): direct
+// blackhole.py bhimpl_arraylen_gc(cpu, array, arraydescr): direct
 // `cpu.bh_arraylen_gc(array, arraydescr)`.  RPython has no explicit
 // `do_arraylen_gc` in executor.py; the dispatch goes through the
 // blackhole fallback wrapper.  Pyre exposes it here in `executor.rs`
@@ -561,8 +561,8 @@ pub fn execute_nonspec_const(
     // ── arity == 1 row of EXECUTE_BY_NUM_ARGS ──
     if arity == 1 {
         let a = argboxes[0];
-        // executor.py:314-321 `do_same_as_i/r/f` — identity fold for
-        // SAME_AS_I/R/F (`bhimpl_int_same_as` etc., `blackhole.py:455`).
+        // executor.py `do_same_as_i/r/f` — identity fold for
+        // SAME_AS_I/R/F (`bhimpl_int_same_as` etc., `blackhole.py`).
         match opnum {
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF => return Ok(Some(a)),
             _ => {}
@@ -587,11 +587,11 @@ pub fn execute_nonspec_const(
         // `descr.is_always_pure()` at `heap.py:641
         // optimize_GETFIELD_GC_I`), so the fold must accept the plain
         // spelling used for immutable fields.
-        // `optimizer.py:829-832 protect_speculative_operation` has
+        // `optimizer.py protect_speculative_operation` has
         // validated the gcref is non-null and of a valid type for
-        // `fielddescr.parent_descr` (`llmodel.py:555-567`); the
+        // `fielddescr.parent_descr` (`llmodel.py`); the
         // dereference below cannot fault.  Unsupported field_size is
-        // `llmodel.py:478 read_int_at_mem`'s NotImplementedError and
+        // `llmodel.py read_int_at_mem`'s NotImplementedError and
         // would propagate to crash upstream — pyre matches via
         // fail-loud `unreachable!()`.
         if let (Value::Ref(struct_ref), Some(d)) = (a, descr)
@@ -748,7 +748,7 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
     use majit_ir::{GcRef, Value};
     match (opcode, arg) {
         (OpCode::CastFloatToInt, Value::Float(f)) => {
-            // blackhole.py:800-808 `bhimpl_cast_float_to_int = int(int(a))`
+            // blackhole.py `bhimpl_cast_float_to_int = int(int(a))`
             // lowers to `lltype.cast_float_to_int` (C `(long)f`) post-
             // translation. Skip fold on non-finite or out-of-range
             // floats: the runtime path's `as i64` saturates (lenient
@@ -808,7 +808,7 @@ pub fn execute_cast_const(opcode: OpCode, arg: majit_ir::Value) -> Option<majit_
 /// other EI risks landing in `BH_LAST_EXC_VALUE` with no metainterp around
 /// to transcribe it, which would silently swallow the exception.
 ///
-/// `args` follows `_build_allboxes` (`pyjitpl.py:1960-1993`) layout
+/// `args` follows `_build_allboxes` (`pyjitpl.py`) layout
 /// **excluding** the funcbox: the funcbox concrete int is `func_ptr` and the
 /// remaining concrete operand values pass straight through to the host ABI
 /// dispatcher (`pyjitpl::call_int_function` / `call_void_function`).  Up to
@@ -825,7 +825,7 @@ pub fn execute_pure_call(
     );
     let func_ptr = func_ptr as *const ();
     match descr.result_type() {
-        // executor.py:52-65 dispatches Int through `cpu.bh_call_i` and Ref
+        // executor.py dispatches Int through `cpu.bh_call_i` and Ref
         // through `cpu.bh_call_r`; both return a machine word, so pyre shares
         // one dispatcher — Ref is bit-identical to Int at the ABI level.  The
         // descr goes along for the *arguments*: a Float parameter belongs in
@@ -910,7 +910,7 @@ pub fn execute_residual_call(
             crate::pyjitpl::call_void_function_typed(func_ptr, args, descr.arg_types());
             0
         }
-        // executor.py:66-68 `cpu.bh_call_f` — same funcbox provenance as
+        // executor.py `cpu.bh_call_f` — same funcbox provenance as
         // `execute_pure_call`'s Float arm; see its comment for why the
         // callee's own address, not the `f64::to_bits` wrapper, is what
         // reaches this seam.  Returned as raw bits for the caller's
@@ -1071,7 +1071,7 @@ mod execute_pure_call_tests {
         assert_eq!(result, 123, "add3_i64(100, 20, 3) must return 123");
     }
 
-    /// `executor.py:52-58` hands `descr` to `cpu.bh_call_i` just as `:66-72`
+    /// `executor.py` hands `descr` to `cpu.bh_call_i` just as `:66-72`
     /// does to `cpu.bh_call_f`, so a Float parameter is class-`'f'` whatever
     /// the result type is.
     #[test]
@@ -1107,7 +1107,7 @@ mod execute_pure_call_tests {
         );
     }
 
-    /// A Float result is fetched through `cpu.bh_call_f` (`executor.py:66-68`),
+    /// A Float result is fetched through `cpu.bh_call_f` (`executor.py`),
     /// i.e. the floating-point return register.  What puts a Float *argument*
     /// in the FP argument file is the stub's `lltype.Float` parameter
     /// (`descr.py:604-605 ARGS`/`FUNC`).  `args` carries the raw `f64::to_bits`
@@ -1179,7 +1179,7 @@ mod execute_nonspec_const_tests {
 
     /// The getfield fold arm must accept the plain spelling: the
     /// executor helper is registered under the plain opnum upstream,
-    /// and `heap.py:641 optimize_GETFIELD_GC_I` folds a plain-spelled
+    /// and `heap.py optimize_GETFIELD_GC_I` folds a plain-spelled
     /// op whenever `descr.is_always_pure()` holds and the base becomes
     /// constant. A plain-only miss here surfaces as the
     /// `constant_fold` "no helper registered" panic.

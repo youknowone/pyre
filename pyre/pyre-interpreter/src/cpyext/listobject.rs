@@ -113,7 +113,7 @@ pub unsafe extern "C" fn PyList_GetItemRef(object: *mut CPyObject, index: isize)
 /// A list, or the `SystemError` `PyErr_BadInternalCall` records.
 ///
 /// The rejection `PyList_Sort` and `PyList_Reverse` make, which is not the
-/// `TypeError` the reading entry points make (`listobject.py:130`, `:139`).
+/// `TypeError` the reading entry points make (`listobject.py`, `:139`).
 fn internal_list(object: *mut CPyObject) -> Option<PyObjectRef> {
     let value = argument(object)?;
     if !unsafe { pyre_object::is_list(value) } {
@@ -136,7 +136,7 @@ fn list_method(
     }
 }
 
-/// `PyList_Insert(list, index, item)` (`listobject.py:95-102`).
+/// `PyList_Insert(list, index, item)` (`listobject.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_Insert(
     object: *mut CPyObject,
@@ -154,7 +154,7 @@ pub unsafe extern "C" fn PyList_Insert(
     )
 }
 
-/// `PyList_Sort(list)` (`listobject.py:126-133`).
+/// `PyList_Sort(list)` (`listobject.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_Sort(object: *mut CPyObject) -> c_int {
     let Some(value) = internal_list(object) else {
@@ -163,7 +163,7 @@ pub unsafe extern "C" fn PyList_Sort(object: *mut CPyObject) -> c_int {
     list_method(crate::type_methods::list_method_sort, &[value])
 }
 
-/// `PyList_Reverse(list)` (`listobject.py:135-142`).
+/// `PyList_Reverse(list)` (`listobject.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_Reverse(object: *mut CPyObject) -> c_int {
     let Some(value) = internal_list(object) else {
@@ -191,7 +191,7 @@ pub unsafe extern "C" fn PyList_Extend(object: *mut CPyObject, iterable: *mut CP
     list_method(crate::type_methods::list_method_extend, &[value, iterable])
 }
 
-/// `PyList_AsTuple(list)` — `tuple(list)` (`listobject.py:120-124`).
+/// `PyList_AsTuple(list)` — `tuple(list)` (`listobject.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_AsTuple(object: *mut CPyObject) -> *mut CPyObject {
     let Some(value) = argument(object) else {

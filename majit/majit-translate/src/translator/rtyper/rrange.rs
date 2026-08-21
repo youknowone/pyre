@@ -121,7 +121,7 @@ pub fn ll_rangeitem(
     Ok(start + index * step)
 }
 
-/// RPython `rtype_builtin_range(hop)` (`rrange.py:96-126`) — lowers
+/// RPython `rtype_builtin_range(hop)` (`rrange.py`) — lowers
 /// `range(...)`:
 ///
 /// ```python
@@ -154,7 +154,7 @@ pub fn ll_rangeitem(
 /// (`step == 0`) `direct_call`s `ll_newrangest` (`malloc RANGEST` + setfield
 /// start/stop/step, guarded by the runtime `step == 0` → `ValueError`).
 ///
-/// The real-list arm (`ll_range2list`, `rrange.py:128-139`) builds the result
+/// The real-list arm (`ll_range2list`, `rrange.py`) builds the result
 /// via the resized [`ListRepr`] helper graphs: `ll_newlist(length)`, followed
 /// by a runtime fill loop that calls `ll_setitem_fast(idx, start)`.
 pub fn rtype_builtin_range(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
@@ -319,7 +319,7 @@ pub fn ll_range2list(start: i64, stop: i64, step: i64) -> Result<Vec<i64>, Typer
     Ok(out)
 }
 
-/// Synthesise `ll_range2list(LIST, start, stop, step)` (`rrange.py:128-139`):
+/// Synthesise `ll_range2list(LIST, start, stop, step)` (`rrange.py`):
 /// zero-step raises `ValueError`, then the helper allocates `LIST.ll_newlist`
 /// with `_ll_rangelen(start, stop, step)` and fills it by repeated
 /// `ll_setitem_fast(idx, start); start += step; idx += 1`.
@@ -609,7 +609,7 @@ pub fn rtype_builtin_enumerate(_hop: &HighLevelOp) -> RTypeResult {
     Err(rrange_deferred("rtype_builtin_enumerate"))
 }
 
-/// RPython `class AbstractRangeRepr(Repr)` (`rrange.py:10-30`), with the
+/// RPython `class AbstractRangeRepr(Repr)` (`rrange.py`), with the
 /// lltypesystem concrete fields stored here until the concrete module grows
 /// its own wrapper type:
 ///
@@ -683,7 +683,7 @@ impl AbstractRangeRepr {
     ///             [v_rng, hop.inputconst(Void, 'step')], resulttype=Signed)
     /// ```
     ///
-    /// `getfield_opname` is `"getfield"` (`lltypesystem/rrange.py:48`),
+    /// `getfield_opname` is `"getfield"` (`lltypesystem/rrange.py`),
     /// reading the runtime `step` field of a variable-step `RANGEST`.
     fn _getstep(&self, v_rng: Hlvalue, hop: &HighLevelOp) -> Result<Hlvalue, TyperError> {
         hop.genop(
@@ -795,9 +795,9 @@ impl Repr for AbstractRangeRepr {
     /// select one of four `func`-folded helpers via [`rangeitem_helper`]: the
     /// nonneg `dum_nocheck` fast path `ll_rangeitem_nonneg`
     /// (`l.start + index * step`, `rrange.py:74-77`), the negative-index
-    /// `ll_rangeitem` (`rrange.py:88-90`), the bound-checked nonneg
-    /// `ll_rangeitem_nonneg` (`rrange.py:75-76`), or the full checked
-    /// `ll_rangeitem` (`rrange.py:80-87`). A constant step is baked as
+    /// `ll_rangeitem` (`rrange.py`), the bound-checked nonneg
+    /// `ll_rangeitem_nonneg` (`rrange.py`), or the full checked
+    /// `ll_rangeitem` (`rrange.py`). A constant step is baked as
     /// `inputconst(Signed, self.step)`; a variable-step `RANGEST`
     /// (`step == 0`) reads its runtime `step` via `_getstep`.
     fn rtype_getitem(&self, hop: &HighLevelOp) -> RTypeResult {
@@ -860,7 +860,7 @@ impl Repr for AbstractRangeRepr {
     }
 }
 
-/// Synthesise the `ll_rangelen1` helper graph (`rrange.py:68-72`):
+/// Synthesise the `ll_rangelen1` helper graph (`rrange.py`):
 ///
 /// ```python
 /// def ll_rangelen1(l):
@@ -947,8 +947,8 @@ pub(crate) fn build_ll_rangelen1_helper_graph(
     ))
 }
 
-/// Synthesise the general `ll_rangelen` helper graph (`rrange.py:64-65`
-/// delegating to `_ll_rangelen`, `rrange.py:56-63`):
+/// Synthesise the general `ll_rangelen` helper graph (`rrange.py`
+/// delegating to `_ll_rangelen`, `rrange.py`):
 ///
 /// ```python
 /// def ll_rangelen(l, step):
@@ -1030,8 +1030,8 @@ pub(crate) fn build_ll_rangelen_helper_graph(
 }
 
 /// Synthesise the `_ll_rangelen(start, stop, step)` helper graph
-/// (`rrange.py:56-63`) — the shared length core that `ll_rangelen`
-/// (`rrange.py:65-66`) and the checked / negative-index `ll_rangeitem`
+/// (`rrange.py`) — the shared length core that `ll_rangelen`
+/// (`rrange.py`) and the checked / negative-index `ll_rangeitem`
 /// variants `direct_call`. `start`/`stop`/`step` are runtime args; the body is
 /// [`emit_rangelen_body`].
 pub(crate) fn build_underscore_ll_rangelen_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
@@ -1070,7 +1070,7 @@ pub(crate) fn build_underscore_ll_rangelen_helper_graph(name: &str) -> Result<Py
     ))
 }
 
-/// Append the `_ll_rangelen(start, stop, step)` body (`rrange.py:56-63`) onto
+/// Append the `_ll_rangelen(start, stop, step)` body (`rrange.py`) onto
 /// `startblock`, whose `start`/`stop`/`step` operands are already available.
 /// Branches on `int_gt(step, 0)`, runs the matching floor-division arm
 /// `(stop - start + (step - 1)) // step` or `(start - stop - (step + 1)) //
@@ -1240,7 +1240,7 @@ fn emit_rangelen_body(
     ]);
 }
 
-/// Synthesise the `ll_rangeitem_nonneg` helper graph (`rrange.py:74-77`)
+/// Synthesise the `ll_rangeitem_nonneg` helper graph (`rrange.py`)
 /// for the `dum_nocheck` case (the `dum_checkidx` IndexError branch is
 /// folded out):
 ///
@@ -1326,7 +1326,7 @@ fn emit_range_formula(block: &BlockRef, l: &Variable, index: Hlvalue, step: Hlva
 
 /// Build (or retrieve cached) the `_ll_rangelen` sub-helper and return a
 /// funcptr `Constant` to `direct_call` it from the checked / negative-index
-/// `ll_rangeitem` variants (`rrange.py:81,88,131`).
+/// `ll_rangeitem` variants (`rrange.py`).
 fn underscore_rangelen_funcptr(rtyper: &RPythonTyper) -> Result<Constant, TyperError> {
     let inner = rtyper.lowlevel_helper_function_with_builder(
         "_ll_rangelen".to_string(),
@@ -1602,7 +1602,7 @@ fn build_ll_rangeitem_nonneg_checked_helper_graph(
 }
 
 /// `ll_rangeitem(func, l, index, step)` with `func is dum_checkidx`
-/// (`rrange.py:79-90`, then arm): `length = _ll_rangelen(l.start, l.stop,
+/// (`rrange.py`, then arm): `length = _ll_rangelen(l.start, l.stop,
 /// step); if index < 0: index += length; if index < 0 or index >= length:
 /// raise IndexError; return l.start + index * step`. 5-block CFG (start →
 /// block_add → block_check_low → block_check_high → block_dispatch) plus
@@ -1895,7 +1895,7 @@ fn rangeitem_helper(
 /// `&self` method on the range repr and cannot reproduce the `Arc<dyn
 /// Repr>` upstream's `self.r_rng` field holds. The `newiter` conversion
 /// target is therefore `hop.args_r[0]` (the operand's own range repr), so
-/// `convertvar`'s repr-identity short-circuit (`rtyper.py:810`) fires —
+/// `convertvar`'s repr-identity short-circuit (`rtyper.py`) fires —
 /// there is no `RangeRepr -> RangeRepr` conversion, so a rebuilt /
 /// non-identical range repr would fail to convert.
 #[derive(Debug)]
@@ -1918,7 +1918,7 @@ pub struct RangeIteratorRepr {
 
 impl RangeIteratorRepr {
     /// RPython `AbstractRangeIteratorRepr.__init__(self, r_rng)`
-    /// (`rrange.py:146-151`): `RANGEITER` (`step != 0`) or `RANGESTITER`
+    /// (`rrange.py`): `RANGEITER` (`step != 0`) or `RANGESTITER`
     /// (`step == 0`, with the extra runtime `step` field).
     pub fn new(r_rng: &AbstractRangeRepr) -> Result<Self, TyperError> {
         // RANGEITER = GcStruct("range", ("next", Signed), ("stop", Signed));
@@ -1968,7 +1968,7 @@ impl Repr for RangeIteratorRepr {
         super::pairtype::ReprClassId::RangeIteratorRepr
     }
 
-    /// RPython `IteratorRepr.rtype_iter(self, hop)` (rmodel.py:266-268) —
+    /// RPython `IteratorRepr.rtype_iter(self, hop)` (rmodel.py) —
     /// `iter(iter(x)) <==> iter(x)`: an iterator is its own iterator, so
     /// the op is the identity on the receiver (mirroring
     /// [`super::rlist::ListIteratorRepr::rtype_iter`]).
@@ -1978,7 +1978,7 @@ impl Repr for RangeIteratorRepr {
     }
 
     /// RPython `IteratorRepr.rtype_method_next(self, hop)`
-    /// (rmodel.py:270-271) — `iter.next()` delegates to `rtype_next`.
+    /// (rmodel.py) — `iter.next()` delegates to `rtype_next`.
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             "next" => self.rtype_next(hop),
@@ -2899,7 +2899,7 @@ mod tests {
         assert_eq!(startblock.inputargs.len(), 3);
     }
 
-    /// rrange.py:34-50 constant-step + nonneg branch — `getitem` on a
+    /// rrange.py constant-step + nonneg branch — `getitem` on a
     /// `AbstractRangeRepr` lowers to a `direct_call` of `ll_rangeitem_nonneg`
     /// (`start + index*step`), preceded by `hop.exception_is_here()`, with
     /// the constant step appended as the trailing arg.
@@ -3053,7 +3053,7 @@ mod tests {
         );
     }
 
-    /// rrange.py:25-29 — `len()` on a variable-step `RANGEST` reads the
+    /// rrange.py — `len()` on a variable-step `RANGEST` reads the
     /// runtime `step` via `_getstep` (a `getfield`) and passes it to
     /// `ll_rangelen`, so the trailing direct_call arg is the getfield
     /// result variable, not a baked constant.
@@ -3425,7 +3425,7 @@ mod tests {
     }
 
     /// A constant-step `range(a, b)` lowers to a `direct_call` of `ll_newrange`
-    /// (`rrange.py:110-112`); a variable-step result lowers to `ll_newrangest`
+    /// (`rrange.py`); a variable-step result lowers to `ll_newrangest`
     /// (`rrange.py:114`).
     #[test]
     fn rtype_builtin_range_selects_newrange_vs_newrangest_by_step() {
@@ -3754,21 +3754,21 @@ mod tests {
         assert!(matches!(cstep.value, ConstValue::Int(s) if s == step));
     }
 
-    /// rrange.py:158-170 `step > 0` lowers to `ll_rangenext_up` with the
+    /// rrange.py `step > 0` lowers to `ll_rangenext_up` with the
     /// baked positive step.
     #[test]
     fn rangeiter_rtype_next_emits_direct_call_to_ll_rangenext_up() {
         assert_rtype_next_emits_direct_call(1, "ll_rangenext_up");
     }
 
-    /// rrange.py:158-170 `step < 0` lowers to `ll_rangenext_down` with the
+    /// rrange.py `step < 0` lowers to `ll_rangenext_down` with the
     /// baked negative step.
     #[test]
     fn rangeiter_rtype_next_emits_direct_call_to_ll_rangenext_down() {
         assert_rtype_next_emits_direct_call(-1, "ll_rangenext_down");
     }
 
-    /// rmodel.py:266-268 `IteratorRepr.rtype_iter` — `iter()` on a range
+    /// rmodel.py `IteratorRepr.rtype_iter` — `iter()` on a range
     /// iterator is the identity (returns the iterator unchanged, emits no
     /// op), and the iterator carries its own `RangeIteratorRepr` class id.
     #[test]

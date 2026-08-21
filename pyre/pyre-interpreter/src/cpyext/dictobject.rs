@@ -725,7 +725,7 @@ pub unsafe extern "C" fn PyDict_Merge(
     0
 }
 
-/// `PyDict_Update(a, b)` — `PyDict_Merge(a, b, 1)` (`dictobject.py:233-238`).
+/// `PyDict_Update(a, b)` — `PyDict_Merge(a, b, 1)` (`dictobject.py`).
 ///
 /// # Safety
 /// Both arguments must be null or live references.

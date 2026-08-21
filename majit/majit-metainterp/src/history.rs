@@ -8,7 +8,7 @@
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 use std::sync::{Arc, Mutex};
 
-/// history.py:384-394 get_const_ptr_for_string(s)
+/// history.py get_const_ptr_for_string(s)
 ///
 /// Creates a constant GcRef from byte-string character values.
 /// Returns None when the runtime hook is not installed.
@@ -21,7 +21,7 @@ pub fn get_const_ptr_for_string(
     if gcref.is_null() { None } else { Some(gcref) }
 }
 
-/// history.py:397-407 get_const_ptr_for_unicode(s)
+/// history.py get_const_ptr_for_unicode(s)
 ///
 /// Creates a constant GcRef from unicode character values.
 /// Returns None when the runtime hook is not installed.
@@ -111,7 +111,7 @@ impl TargetToken {
 
     /// `compile.py:237` / `compile.py:289` — bind the freshly-made
     /// JitCellToken's `number` to this TargetToken's `original_jitcell_token`.
-    /// Walker (`record_loop_or_bridge`, `compile.py:197-199`) reads this to
+    /// Walker (`record_loop_or_bridge`, `compile.py`) reads this to
     /// determine whether a JUMP crosses to a different loop.
     pub fn set_original_jitcell_token_number(&self, num: u64) {
         majit_ir::LoopTargetDescr::set_original_jitcell_token_number(
@@ -135,7 +135,7 @@ struct LoopTargetDescrState {
 struct LoopTargetDescr {
     token_id: u64,
     is_preamble_target: bool,
-    /// `history.py:478` `TargetToken._ll_loop_code` parity (PyPy stores
+    /// `history.py` `TargetToken._ll_loop_code` parity (PyPy stores
     /// a plain integer GIL-atomic; pyre uses `AtomicUsize` so the
     /// cranelift backend's in-code `closing_jump` dispatch can read
     /// the slot via a baked address without taking a Mutex).
@@ -391,11 +391,11 @@ pub(crate) mod test_support {
 pub type History = crate::trace_ctx::TraceCtx;
 
 /// Stateless `SameConstantOracle` resolving operands purely from the
-/// inline-Const OpRef variants (`history.py:227/268/314` `.value`),
+/// inline-Const OpRef variants (`history.py/268/314` `.value`),
 /// without a constant-pool lookup. This is `Const.same_constant`
-/// (history.py:251 ConstInt / :292 ConstFloat / :338 ConstPtr), which
+/// (history.py ConstInt / :292 ConstFloat / :338 ConstPtr), which
 /// compares each Const's own `.value`; the byte-stream `_refs`/`_bigints`/
-/// `_floats` pools of `opencoder.Trace` (opencoder.py:482-486) are a
+/// `_floats` pools of `opencoder.Trace` (opencoder.py) are a
 /// separate encoding concern. Resolution: reject non-constants, then perform
 /// the same subclass-specific value compare as the RPython methods. The
 /// Rust implementation can fast-path equal OpRef payloads because inline
@@ -453,7 +453,7 @@ pub struct TreeLoop {
     pub inputargs: Vec<majit_ir::InputArgRc>,
     /// The recorded operations, in execution order.
     ///
-    /// `history.py:528` `# self.operations = list of ResOperations` —
+    /// `history.py` `# self.operations = list of ResOperations` —
     /// PyPy's `TreeLoop.operations` holds Python references that are the
     /// *same* objects reached from recorder build-time, optimizer
     /// forwarding state, short preamble export, resume metadata, and
@@ -583,7 +583,7 @@ impl TreeLoop {
         self.inputargs.iter().map(|ia| ia.tp).collect()
     }
 
-    /// opencoder.py:848-850 Trace.get_iter() — produce a TraceIterator over
+    /// opencoder.py Trace.get_iter() — produce a TraceIterator over
     /// the recorded ops with fresh per-iteration boxes.
     ///
     /// `start_index = 0` reproduces the canonical positional layout:
@@ -598,7 +598,7 @@ impl TreeLoop {
         crate::opencoder::TraceIterator::new(&self.ops, 0, self.ops.len(), None, &inputarg_types, 0)
     }
 
-    /// history.py:552-608 check_consistency — full structural validation.
+    /// history.py check_consistency — full structural validation.
     ///
     /// Verifies:
     /// - No constants in inputargs
@@ -650,7 +650,7 @@ impl TreeLoop {
                     return false;
                 }
             }
-            // history.py:579-581: each arg must be Const or in seen
+            // history.py: each arg must be Const or in seen
             for arg in op.getarglist().iter() {
                 if arg.is_none() {
                     return false;
@@ -709,7 +709,7 @@ impl TreeLoop {
         if !last.opcode.is_final() {
             return false;
         }
-        // history.py:605-608: if a JUMP has a target, it must be TargetToken.
+        // history.py: if a JUMP has a target, it must be TargetToken.
         if last.opcode == OpCode::Jump
             && let Some(descr) = last.getdescr()
             && descr.as_loop_target_descr().is_none()
@@ -1209,7 +1209,7 @@ impl TreeLoop {
                                     // Constants and NONE pass through unchanged.
                                     *t
                                 } else {
-                                    // opencoder.py:287-288: _get(i) asserts
+                                    // opencoder.py: _get(i) asserts
                                     // _cache[i] is not None. An unmapped pre-cut
                                     // Box has no entry in the post-cut namespace.
                                     // Map to NONE so _number_boxes emits
@@ -1776,7 +1776,7 @@ mod tests {
 
     #[test]
     fn test_check_consistency_none_arg_invalid() {
-        // history.py:579-582: regular op args must be Const or known boxes;
+        // history.py: regular op args must be Const or known boxes;
         // None is only accepted in fail_args.
         let inputargs = vec![InputArg::new_int(0)];
         let ops = vec![
@@ -1830,7 +1830,7 @@ mod tests {
 
     #[test]
     fn test_check_consistency_guard_without_descr_invalid() {
-        // history.py:583-584: every guard needs a descr when check_descr=True,
+        // history.py: every guard needs a descr when check_descr=True,
         // including overflow guards.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut op0 = Op::new(OpCode::IntAddOvf, &[iarg_box(0), iarg_box(1)]);
@@ -1956,7 +1956,7 @@ mod tests {
 
     #[test]
     fn test_get_iter() {
-        // opencoder.py:848-850 Trace.get_iter() — produce a TraceIterator
+        // opencoder.py Trace.get_iter() — produce a TraceIterator
         // that walks the trace producing fresh boxes per visited op.
         // The trace must reference its own inputargs at OpRef positions
         // [0, num_inputargs); a malformed trace that references raw 0
@@ -1968,7 +1968,7 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
         let mut iter = trace.get_iter();
         assert!(!iter.done());
-        // Walk one op via TraceIterator.next() — opencoder.py:362-406.
+        // Walk one op via TraceIterator.next() — opencoder.py.
         let r = iter.next().unwrap();
         assert_eq!(r.pos.get(), iop(2));
         assert_eq!(r.arg(0).to_opref(), iarg(0));
@@ -2140,7 +2140,7 @@ mod tests {
     /// `vref_boxes` are left empty on purpose: they are not interchangeable
     /// with frame-live slots. `consume_virtualizable_boxes` reads slot zero as
     /// the virtualizable ITSELF and sizes the rest against it
-    /// (`resume.py:1088-1091`), and `consume_virtualref_boxes` hands its pairs
+    /// (`resume.py`), and `consume_virtualref_boxes` hands its pairs
     /// to `continue_tracing`, so putting an operand-stack value there would
     /// exercise a shape the recorder cannot produce.
     fn snapshot_with_frame_boxes(
@@ -2616,7 +2616,7 @@ impl TraceCtx {
         self.snapshots.truncate(pos.snapshot_data_len);
     }
 
-    /// pyjitpl.py:3499-3512 `MetaInterp.replace_box(oldbox, newbox)` —
+    /// pyjitpl.py `MetaInterp.replace_box(oldbox, newbox)` —
     /// trace-context portion.
     ///
     /// ```text
@@ -2685,7 +2685,7 @@ impl TraceCtx {
                 }
             }
         }
-        // pyjitpl.py:3512 self.heapcache.replace_box(oldbox, newbox).
+        // pyjitpl.py self.heapcache.replace_box(oldbox, newbox).
         self.heap_cache.replace_box(oldbox, newbox);
     }
 
@@ -2748,7 +2748,7 @@ impl TraceCtx {
     /// used by callers that record guards without a populated framestack
     /// to walk.
     ///
-    /// RPython's `pyjitpl.py:2586 capture_resumedata` walks the
+    /// RPython's `pyjitpl.py capture_resumedata` walks the
     /// `framestack`, encoding one `SnapshotFrame` per `MIFrame` (with
     /// the real `jitcode_index`, `pc`, plus `virtualizable_boxes` and
     /// `virtualref_boxes` when configured).  Pyre's segmented low-level
@@ -2797,12 +2797,12 @@ impl TraceCtx {
     }
 
     /// `capture_snapshot_for_last_guard` extended with virtualizable /
-    /// virtualref payloads.  Mirrors `opencoder.py:767-784 create_top_snapshot`
+    /// virtualref payloads.  Mirrors `opencoder.py create_top_snapshot`
     /// which prefixes the frame snapshot with a vable_array and a
     /// vref_array; both arrays end up in `Snapshot.vable_boxes` /
     /// `Snapshot.vref_boxes`, are consumed by `resume.rs::number()`, and
     /// surface at resume time via `consume_vable_info` /
-    /// `consume_virtualref_info` (`resume.py:1404` / `resume.py:1417`).
+    /// `consume_virtualref_info` (`resume.py` / `resume.py`).
     ///
     /// Callers carrying a live virtualizable or live virtualrefs at the
     /// guard point (currently only the walker-snapshot path via
@@ -3010,7 +3010,7 @@ impl TraceCtx {
         opref.inline_const_bits()
     }
 
-    /// `history.py:204` `Const.same_constant`-adjacent typed reader.
+    /// `history.py` `Const.same_constant`-adjacent typed reader.
     /// Returns the typed `Value` (Int/Ref/Float/Void) for a constant
     /// `OpRef`.  convergence path: every `constant_value` /
     /// `raw_bits` consumer that needs to distinguish primitive types
@@ -3021,7 +3021,7 @@ impl TraceCtx {
         opref.inline_const_to_value()
     }
 
-    /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage guards
+    /// `pyjitpl.py generate_guard()` parity: tracer-stage guards
     /// carry `descr=None`. The optimizer's `store_final_boxes_in_guard`
     /// (`optimizeopt/mod.rs`) mints the descr via
     /// `invent_fail_descr_for_op`-style dispatch. `num_live` was a
@@ -3031,7 +3031,7 @@ impl TraceCtx {
     pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
         let _ = num_live;
         let opref = Self::do_record_guard(&mut self.recorder, opcode, args, None);
-        // pyjitpl.py:2581 `count_ops(opnum, Counters.GUARDS)` — counted
+        // pyjitpl.py `count_ops(opnum, Counters.GUARDS)` — counted
         // here at the record chokepoint so every recording call site
         // bumps the bucket exactly once. generate_guard's Const-box
         // early return records nothing (pyjitpl.py:2559), and callers
@@ -3059,7 +3059,7 @@ impl TraceCtx {
         opref
     }
 
-    /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage typed
+    /// `pyjitpl.py generate_guard()` parity: tracer-stage typed
     /// guards carry `descr=None`. The `fail_arg_types` are stamped onto
     /// `op.fail_arg_types` directly so the optimizer's
     /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs`) can mint a fresh
@@ -3159,7 +3159,7 @@ impl TraceCtx {
     // points (`record_op_oprefs` / `close_loop_oprefs` / `finish_oprefs`
     // in opencoder.rs), but the `TreeLoop`-shaped result
     // produced by `recorder::Trace::get_trace()` has no RPython analogue
-    // — upstream (opencoder.py:848) exposes `get_iter()` and the
+    // — upstream (opencoder.py) exposes `get_iter()` and the
     // optimizer walks the iterator directly, with no intermediate
     // `Vec<Op>` materialization. The TRB swap must either port pyre's
     // consumers onto an iterator-walk shape or introduce a documented
@@ -3247,7 +3247,7 @@ impl TraceCtx {
         Self::do_record_op(&mut self.recorder, OpCode::Finish, &[result]);
     }
 
-    /// pyjitpl.py:2789-2791 `blackhole_if_trace_too_long` check:
+    /// pyjitpl.py `blackhole_if_trace_too_long` check:
     /// `length > warmrunnerstate.trace_limit`.  `num_ops` is the non-inputarg
     /// op count (= `history.length()`); `trace_limit` is cached from warmstate
     /// at trace start.
@@ -3281,7 +3281,7 @@ impl TraceCtx {
 
     /// pyjitpl.py:2898 `metainterp.resumekey_original_loop_token` accessor.
     /// Returns `Some` when this is a bridge trace, `None` for a loop-entry
-    /// trace.  Read by `prepare_trace_segmenting` (pyjitpl.py:2825-2834) to
+    /// trace.  Read by `prepare_trace_segmenting` (pyjitpl.py) to
     /// decide whether to set `FORCE_BRIDGE_SEGMENTING` on the source token.
     pub fn resumekey_original_loop_token(&self) -> Option<&std::sync::Arc<JitCellToken>> {
         self.resumekey_original_loop_token.as_ref()
@@ -3362,14 +3362,14 @@ impl TraceCtx {
 
     /// Record a float-typed promote (GUARD_VALUE for floats).
     ///
-    /// pyjitpl.py:1515 opimpl_float_guard_value = _opimpl_guard_value
+    /// pyjitpl.py opimpl_float_guard_value = _opimpl_guard_value
     pub fn promote_float(&mut self, opref: OpRef, runtime_value: i64, num_live: usize) -> OpRef {
         let const_ref = self.const_float(runtime_value);
         self.record_guard_with_snapshot(OpCode::GuardValue, &[opref, const_ref], num_live);
         const_ref
     }
 
-    /// `pyjitpl.py:2548-2602 generate_guard` + `:2610 capture_resumedata`:
+    /// `pyjitpl.py generate_guard` + `:2610 capture_resumedata`:
     /// record a guard AND attach a resume snapshot so the optimizer's
     /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs`) reads a
     /// valid `rd_resume_position >= 0` — `resume.py:396-397` asserts that,
@@ -3380,7 +3380,7 @@ impl TraceCtx {
     /// optimizer for these interpreter-side promotes.
     ///
     /// The frame `boxes` / `vable_boxes` / `vref_boxes` are empty because
-    /// `capture_resumedata` (`pyjitpl.py:2610-2625`) walks
+    /// `capture_resumedata` (`pyjitpl.py`) walks
     /// `self.framestack` + `self.virtualizable_boxes` +
     /// `self.virtualref_boxes`, and `TraceCtx` is the recorder-side trace
     /// buffer — it holds no `MIFrameStack`, so the live boxes are not
@@ -3531,7 +3531,7 @@ impl TraceCtx {
     /// Record GUARD_NOT_FORCED (must follow a call_may_force).
     ///
     /// Recorder-layer primitive only — `history.record0(rop.GUARD_NOT_FORCED,
-    /// None)` (`pyjitpl.py:2598`), NOT `generate_guard`.  The op leaves this
+    /// None)` (`pyjitpl.py`), NOT `generate_guard`.  The op leaves this
     /// call with `rd_resume_position == -1`; the metainterp layer owns the
     /// matching `capture_resumedata(resumepc, after_residual_call=True)`
     /// (`pyjitpl.py:2603`) and must attach it, or
@@ -3563,7 +3563,7 @@ impl TraceCtx {
     /// (`call_descr::default_effect_for_opcode`).
     ///
     /// **Prefer `call_typed_with_effect`** for line-by-line PyPy parity:
-    /// `pyjitpl.py:1995-2068 do_residual_call` threads the codewriter-
+    /// `pyjitpl.py do_residual_call` threads the codewriter-
     /// analyzed `calldescr` through `record_nospec` so the trace IR
     /// retains `oopspecindex`, `read/write_descrs_*`, `can_invalidate`,
     /// `can_collect`, and `call_release_gil_target` exactly as written.
@@ -3592,12 +3592,12 @@ impl TraceCtx {
     /// Shared record tail for the `call_*_typed` family: prepend the funcbox,
     /// invalidate heap caches, record the op with `descr`.
     ///
-    /// pyjitpl.py:2683-2684 `_record_helper_varargs` parity:
+    /// pyjitpl.py `_record_helper_varargs` parity:
     /// `heapcache.invalidate_caches_varargs(...)` runs BEFORE
     /// `self.history.record(...)`.  Routes every CALL family record
     /// through `invalidate_caches_varargs` so the elidable /
     /// loopinvariant / arraycopy / arraymove fast-paths inside
-    /// `clear_caches_varargs` (heapcache.py:341-376) run exactly once
+    /// `clear_caches_varargs` (heapcache.py) run exactly once
     /// per call.  The previous escape-only path
     /// (`_escape_argboxes + invalidate_caches_for_escaped`) skipped
     /// those branches.
@@ -3660,7 +3660,7 @@ impl TraceCtx {
 
     /// `call_typed` variant that preserves the caller-supplied `EffectInfo`
     /// instead of re-deriving the default for the opcode. Mirrors
-    /// `pyjitpl.py:1995-2068 do_residual_call` parity: PyPy passes the
+    /// `pyjitpl.py do_residual_call` parity: PyPy passes the
     /// original `calldescr` through `record_nospec` so the trace IR
     /// retains `oopspec`, `read/write_descrs_*`, `can_invalidate`,
     /// `can_collect`, and `call_release_gil_target` exactly as written
@@ -3697,7 +3697,7 @@ impl TraceCtx {
     }
 
     /// Pure-call analog of [`Self::call_typed_with_effect`] that mirrors
-    /// `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes,
+    /// `pyjitpl.py MIFrame.execute_varargs(opnum, argboxes,
     /// descr, exc=False, pure=True)` for `EF_ELIDABLE_CANNOT_RAISE`
     /// callees: records the initial `Call{I,R,F,N}` op, then patches
     /// it via [`Self::record_result_of_call_pure`] so the trace ends up with
@@ -3756,7 +3756,7 @@ impl TraceCtx {
     /// [`Self::call_typed_with_effect_pure`]: records the `Call{I,R,F,N}` and patches
     /// it to `CallPure*` via [`Self::record_result_of_call_pure`] (same pure-folding
     /// path), but the callee may raise, so the **caller must emit a trailing
-    /// `GuardNoException`** (`pyjitpl.py:2082 handle_possible_exception`,
+    /// `GuardNoException`** (`pyjitpl.py handle_possible_exception`,
     /// `do_residual_call`'s `elif cr:` branch) — **except when the returned
     /// `OpRef` is a constant**: an all-`Const`-args pure call folds to a `Const`
     /// here and records no guard, mirroring `pyjitpl.py:1946`'s
@@ -3824,7 +3824,7 @@ impl TraceCtx {
         );
         // pyjitpl.py:1943: patch_pos = self.metainterp.history.get_trace_position()
         let patch_pos = self.get_trace_position();
-        // pyjitpl.py:2683-2684 _record_helper_varargs heap invalidation parity:
+        // pyjitpl.py _record_helper_varargs heap invalidation parity:
         // invalidate before record.
         if let Some(call_descr) = descr.as_call_descr() {
             let oracle: &dyn crate::heapcache::SameConstantOracle =
@@ -3841,11 +3841,11 @@ impl TraceCtx {
                 const_value,
             );
         }
-        // pyjitpl.py:1944-1945: op = execute_and_record_varargs(opnum, ...)
+        // pyjitpl.py: op = execute_and_record_varargs(opnum, ...)
         let op = self
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:1947-1948: record_result_of_call_pure patches CALL → CALL_PURE
+        // pyjitpl.py: record_result_of_call_pure patches CALL → CALL_PURE
         // and populates call_pure_results.
         self.record_result_of_call_pure(
             op,
@@ -3858,7 +3858,7 @@ impl TraceCtx {
         )
     }
 
-    /// pyjitpl.py:3553-3579: record_result_of_call_pure.
+    /// pyjitpl.py: record_result_of_call_pure.
     ///
     /// Patch a CALL into a CALL_PURE. Called after a pure call executes
     /// during tracing with no exception.
@@ -3893,7 +3893,7 @@ impl TraceCtx {
         if all_const {
             // pyjitpl.py:3566-3569: all-constants → cut the CALL
             self.recorder.cut(patch_pos);
-            // history.py:227/268/314 — Const{Int,Float,Ptr}.value inline.
+            // history.py/268/314 — Const{Int,Float,Ptr}.value inline.
             let const_opref = match resbox_as_const {
                 Value::Int(v) => OpRef::const_int(v),
                 Value::Float(v) => OpRef::const_float(v),
@@ -3935,7 +3935,7 @@ impl TraceCtx {
     /// `slot` carries the per-callee `EffectInfo` classification produced
     /// by the macro-time analyzer-equivalent at
     /// `pyre-jit/src/jit/codewriter.rs::register_helper_fn_pointers`,
-    /// mirroring `call.py:282-303 getcalldescr`'s analyzer chain output.
+    /// mirroring `call.py getcalldescr`'s analyzer chain output.
     pub fn cond_call_void_typed(
         &mut self,
         condition: i64,
@@ -3973,13 +3973,13 @@ impl TraceCtx {
 
     /// RPython pyjitpl.py opimpl_conditional_call_value_ir_r: emit CondCallValueR.
     ///
-    /// `blackhole.py:1271-1276 bhimpl_conditional_call_value_ir_r` declares
+    /// `blackhole.py bhimpl_conditional_call_value_ir_r` declares
     /// `@arguments("cpu", "r", "i", "I", "R", "d", returns="r")` — the
     /// leading `value` is a Ref-typed argbox, so the recorded op's first
     /// arg must be a `ConstPtr` rather than a `ConstInt`.  Routing the
     /// raw pointer-as-i64 through `get_or_insert` would produce a
     /// `ConstInt` slot that aliases with any int constant of the same
-    /// numeric value (`history.py:220` `ConstInt` vs `:307 ConstPtr`
+    /// numeric value (`history.py` `ConstInt` vs `:307 ConstPtr`
     /// pin distinct types at construction).
     pub fn cond_call_value_ref_typed(
         &mut self,
@@ -3989,7 +3989,7 @@ impl TraceCtx {
         arg_types: &[Type],
         slot: EffectInfoSlot,
     ) -> OpRef {
-        // history.py:314 ConstPtr.value inline (the op-graph walker
+        // history.py ConstPtr.value inline (the op-graph walker
         // forwards `OpRef::ConstPtr(GcRef)` slots in `op.args`).
         let value_ref = OpRef::const_ptr(majit_ir::GcRef(value as usize));
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
@@ -4005,7 +4005,7 @@ impl TraceCtx {
     /// Mirrors `blackhole.py:620-628 bhimpl_record_known_result_{i,r}_ir_v`'s
     /// `(cpu, res, func, args_i, args_r, calldescr)` signature: the
     /// trailing `d` argcode carries the per-callee calldescr that
-    /// `jtransform.py:299-310 rewrite_op_jit_record_known_result` builds
+    /// `jtransform.py rewrite_op_jit_record_known_result` builds
     /// from `getcalldescr`.  `OptPure.optimize_record_known_result`
     /// (`optimizeopt/pure.py:211-220`, ported at
     /// `optimizeopt/pure.rs`'s `propagate_forward`) keys its `known_result_call_pure`
@@ -4027,7 +4027,7 @@ impl TraceCtx {
     /// matching `CALL_PURE_*` op.
     ///
     /// `slot` is the per-callee classification chosen at producer time
-    /// (`call.py:282-303 getcalldescr`'s `extraeffect` selection); see
+    /// (`call.py getcalldescr`'s `extraeffect` selection); see
     /// `make_call_descr_from_target_slot` for the resolution rule.
     pub fn record_known_result_typed(
         &mut self,
@@ -4045,9 +4045,9 @@ impl TraceCtx {
         // `record_known_result_r_ir_v` and Int-typed for `_i_ir_v`.
         // Use `get_or_insert_typed(result_value, result_type)` so the
         // recorded constant lands as `ConstPtr` for Ref results,
-        // matching `history.py:307 ConstPtr` and preventing alias with
+        // matching `history.py ConstPtr` and preventing alias with
         // `ConstInt` slots of the same raw value.
-        // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
+        // history.py/268/314 Const{Int,Float,Ptr}.value inline.
         // The op-graph walker forwards Ref slots.
         let result_ref = match result_type {
             Type::Int => OpRef::const_int(result_value),
@@ -4073,7 +4073,7 @@ impl TraceCtx {
     }
 
     /// `call_int_typed` preserving the caller-supplied `EffectInfo`.
-    /// Mirrors `pyjitpl.py:1995-2068 do_residual_call` parity (see
+    /// Mirrors `pyjitpl.py do_residual_call` parity (see
     /// `call_typed_with_effect` for the full rationale): PyPy passes
     /// the original `calldescr` through `record_nospec` so the trace
     /// IR retains `oopspec`, `read/write_descrs_*`, `can_invalidate`,
@@ -4204,13 +4204,13 @@ impl TraceCtx {
     }
 
     /// Shared body for typed-helper MayForce calls.  Records
-    /// `[func_ref] + args`, matching `pyjitpl.py:1995-2002 _build_allboxes(
+    /// `[func_ref] + args`, matching `pyjitpl.py _build_allboxes(
     /// funcbox, argboxes, descr)`'s `[funcbox] + reordered_argboxes` shape
     /// (here `args` already excludes the funcbox — `func_ptr` is passed
     /// separately and prepended once).
     ///
     /// Release-GIL calls do NOT route through here: the upstream
-    /// `pyjitpl.py:3671-3681 direct_call_release_gil` records the distinct
+    /// `pyjitpl.py direct_call_release_gil` records the distinct
     /// `[savebox, funcbox_real] + argboxes[1:]` shape with
     /// `funcbox_real` resolved from
     /// `effectinfo.call_release_gil_target` (the *real* C function
@@ -4229,7 +4229,7 @@ impl TraceCtx {
         let descr = make_call_may_force_descr(arg_types, ret_type);
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        // pyjitpl.py:2053-2072 `do_residual_call` may-force branch:
+        // pyjitpl.py `do_residual_call` may-force branch:
         // `direct_call_may_force` (line 2067) RECORDS first, then
         // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
         // runs at line 2072 "based on the CALL_MAY_FORCE operation
@@ -4275,7 +4275,7 @@ impl TraceCtx {
     }
 
     /// `call_family_typed` variant preserving the caller-supplied
-    /// `EffectInfo`. Mirrors `pyjitpl.py:1995-2068 do_residual_call`
+    /// `EffectInfo`. Mirrors `pyjitpl.py do_residual_call`
     /// parity (see `call_typed_with_effect` for the full rationale).
     /// Routes through a fresh `MetaCallDescr` (`make_call_descr_with_effect`)
     /// instead of the static-`EffectInfo` `MetaCallMayForceDescr`, so
@@ -4335,7 +4335,7 @@ impl TraceCtx {
         );
     }
 
-    /// pyjitpl.py:3671-3681 direct_call_release_gil parity. RPython:
+    /// pyjitpl.py direct_call_release_gil parity. RPython:
     /// ```python
     /// realfuncaddr, saveerr = effectinfo.call_release_gil_target
     /// funcbox = ConstInt(adr2int(realfuncaddr))
@@ -4361,7 +4361,7 @@ impl TraceCtx {
     /// Routes heapcache invalidation through `invalidate_caches_varargs`
     /// (heapcache.py:309-340) instead of the escape-only path used by
     /// `call_family_typed_with_effect`. RPython
-    /// `heapcache.py:341-376 clear_caches_varargs` enumerates the
+    /// `heapcache.py clear_caches_varargs` enumerates the
     /// plain CALL_* / CALL_LOOPINVARIANT_* / COND_CALL_* opcodes and
     /// EXCLUDES the `CALL_RELEASE_GIL_*` family — release-gil falls
     /// through to `reset_keep_likely_virtuals` because the optimizer
@@ -4387,7 +4387,7 @@ impl TraceCtx {
     }
 
     /// Shared release-gil recorder for the `i / r / f / v` typed
-    /// variants. Mirrors `pyjitpl.py:3671-3681 direct_call_release_gil`:
+    /// variants. Mirrors `pyjitpl.py direct_call_release_gil`:
     ///
     /// ```python
     /// realfuncaddr, saveerr = effectinfo.call_release_gil_target
@@ -4443,7 +4443,7 @@ impl TraceCtx {
             "release_gil call_release_gil_target unset — emit-side resolve_call_release_gil_target should have populated realfuncaddr",
         );
         let _ = func_ptr;
-        // history.py:227 ConstInt.value inline for saveerr flags + static
+        // history.py ConstInt.value inline for saveerr flags + static
         // function pointer.
         let savebox = OpRef::const_int(saveerr as i64);
         let funcbox = OpRef::const_int(realfuncaddr as i64);
@@ -4454,7 +4454,7 @@ impl TraceCtx {
         call_args.push(savebox);
         call_args.push(funcbox);
         call_args.extend_from_slice(args);
-        // pyjitpl.py:2053-2072 `do_residual_call` release-gil branch:
+        // pyjitpl.py `do_residual_call` release-gil branch:
         // `direct_call_release_gil` (line 2064) records first, then
         // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
         // runs at line 2072 with `opnum1 = CALL_MAY_FORCE_<tp>` from
@@ -4512,7 +4512,7 @@ impl TraceCtx {
         let arg0_int = func_ptr as usize as i64;
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (see
+        // pyjitpl.py `_record_helper_varargs` parity (see
         // `call_typed`): every CALL family record routes through the
         // canonical heap_cache.invalidate_caches_varargs BEFORE the
         // history record.
@@ -4534,7 +4534,7 @@ impl TraceCtx {
         let _ = self
             .recorder
             .record_op_with_descr(opcode, &call_args, descr.clone());
-        // pyjitpl.py:2109 `call_loopinvariant_now_known(allboxes, descr, res)`
+        // pyjitpl.py `call_loopinvariant_now_known(allboxes, descr, res)`
         // with `res = None` for void.  Evicts any prior typed entry sharing
         // this (descr, arg0) key so subsequent typed loop-invariant lookups
         // do not return a stale OpRef.
@@ -4603,7 +4603,7 @@ impl TraceCtx {
     // expectation, so it was removed once the only caller migrated.
     //
     // call_release_gil_ref / _typed intentionally absent:
-    // resoperation.py:1243-1244 (`# no such thing`) excludes
+    // resoperation.py (`# no such thing`) excludes
     // CALL_RELEASE_GIL_R from the upstream opcode table.
 
     /// Record a float-returning GIL-release call (CallReleaseGilF).
@@ -4630,7 +4630,7 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
-        // pyjitpl.py:3671-3681 direct_call_release_gil shape:
+        // pyjitpl.py direct_call_release_gil shape:
         // `[savebox, funcbox_real] + argboxes[1:]`.  Pyre dispatches the
         // C callee directly via `bh_call_*_dispatch` (no asm helper),
         // so `realfuncaddr` IS `func_ptr` and `saveerr=0`.  Populating
@@ -4718,7 +4718,7 @@ impl TraceCtx {
     /// pyjitpl.py:2081-2104: emit a loop-invariant CALL_LOOPINVARIANT_*
     /// with the heapcache lookup/store envelope.
     ///
-    /// `heapcache.py:629-639 call_loopinvariant_known_result` /
+    /// `heapcache.py call_loopinvariant_known_result` /
     /// `call_loopinvariant_now_known` keys the slot by descr **object
     /// identity** (`if self.loop_invariant_descr is not descr: return
     /// None`) and `allboxes[0].getint()`.  `MetaCallDescr` is interned
@@ -4726,7 +4726,7 @@ impl TraceCtx {
     /// `descr.index()` returns a stable per-instance `heapcache_index`
     /// that supplies the `is`-equivalent identity key.  `func_ptr as
     /// i64` is the typed-helper analogue of `funcbox.getint()`
-    /// (`pyjitpl.py:2002 _build_allboxes`'s slot 0).
+    /// (`pyjitpl.py _build_allboxes`'s slot 0).
     ///
     /// An earlier revision used `signature_hash(arg_types, ret_type)`
     /// as a structural surrogate.  That hash violated `is` semantics
@@ -4762,7 +4762,7 @@ impl TraceCtx {
         }
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (mirror
+        // pyjitpl.py `_record_helper_varargs` parity (mirror
         // `call_typed` in trace_ctx.rs). Routes
         // heapcache.invalidate_caches_varargs BEFORE the history record
         // for the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
@@ -4798,7 +4798,7 @@ impl TraceCtx {
     // residual_call recording arms (pyjitpl/dispatch.rs BC_RESIDUAL_CALL_*_{I,R,F})
     // route through these helpers instead of the legacy `_typed`
     // siblings that re-derive the EffectInfo from the opcode policy.
-    // RPython `pyjitpl.py:1995-2068 do_residual_call` threads the
+    // RPython `pyjitpl.py do_residual_call` threads the
     // calldescr's EffectInfo through `record_nospec` for every result
     // kind; pyre's void path already honours that — these wrappers
     // close the i/r/f gap.
@@ -4854,7 +4854,7 @@ impl TraceCtx {
         )
     }
 
-    /// `pyjitpl.py:3671-3681 direct_call_release_gil` — Int result.
+    /// `pyjitpl.py direct_call_release_gil` — Int result.
     /// Routes through the shared `record_release_gil_typed_with_effect`
     /// emitting `[savebox, realfuncaddr] + args` per the void sibling.
     /// `resoperation.py:1243-1244 # no such thing` excludes the Ref
@@ -4954,7 +4954,7 @@ impl TraceCtx {
     ///
     /// Callers use this to short-circuit BOTH the concrete C call and the
     /// trace record on a hit — RPython does the lookup before
-    /// `execute_varargs` (`pyjitpl.py:2088 if res is not None: return res`)
+    /// `execute_varargs` (`pyjitpl.py if res is not None: return res`)
     /// and never executes the call when the cache returns a result.
     pub fn call_loopinvariant_lookup_with_effect(
         &self,
@@ -5003,7 +5003,7 @@ impl TraceCtx {
         }
         let mut call_args = vec![func_ref];
         call_args.extend_from_slice(args);
-        // pyjitpl.py:2683-2684 `_record_helper_varargs` parity (mirror
+        // pyjitpl.py `_record_helper_varargs` parity (mirror
         // `call_typed_with_effect` in trace_ctx.rs). Routes
         // heapcache.invalidate_caches_varargs BEFORE the history record
         // of the CALL_LOOPINVARIANT_* op so escape / clear_caches_varargs
@@ -5057,7 +5057,7 @@ impl TraceCtx {
     }
 
     /// Emit CALL_ASSEMBLER_<type> by token number with explicit arg types.
-    /// resoperation.py:1251 `call_assembler_for_descr`: opcode is selected
+    /// resoperation.py `call_assembler_for_descr`: opcode is selected
     /// from `result_type` per `OpCode::call_assembler_for_type`.
     #[cfg(test)]
     fn call_assembler_typed_by_number(
@@ -5076,7 +5076,7 @@ impl TraceCtx {
                 .and_then(JitDriverStaticData::virtualizable_arg_index),
         );
         let opcode = OpCode::call_assembler_for_type(result_type);
-        // pyjitpl.py:2053-2072 `do_residual_call` assembler-call branch:
+        // pyjitpl.py `do_residual_call` assembler-call branch:
         // `direct_assembler_call` (line 2054) records first, then
         // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
         // runs at line 2072 with `opnum1 = CALL_MAY_FORCE_<tp>` from
@@ -5210,7 +5210,7 @@ impl TraceCtx {
     /// (pyjitpl.py:3589-3609). Takes the JitDriver reds directly — the
     /// callee's compiled loop reconstructs each virtualizable field via
     /// its GETFIELD_GC / GETARRAYITEM_GC preamble emitted by
-    /// `patch_new_loop_to_load_virtualizable_fields` (compile.py:425-461).
+    /// `patch_new_loop_to_load_virtualizable_fields` (compile.py).
     ///
     /// `virtualizable_arg_index` of the emitted descriptor comes from the
     /// active `JitDriverStaticData`, matching RPython's

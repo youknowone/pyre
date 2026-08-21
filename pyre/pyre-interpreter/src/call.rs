@@ -226,7 +226,7 @@ use crate::pyframe::PyFrame;
 
 /// The payload a suspended frame is resumed with.
 ///
-/// `generator.py:121-145 _invoke_execute_frame` hands the frame the sent value
+/// `generator.py _invoke_execute_frame` hands the frame the sent value
 /// and, on `throw()`, the operation error — `pyframe.py:285-315
 /// resume_execute_frame` then consumes them.  `throw_args` carries the original
 /// three-argument form for a non-generator delegate, the Rust representation of
@@ -322,7 +322,7 @@ pub fn bump_frame_entry_count() {
 /// guard that gives it back when the activation finishes.  Re-entering for a
 /// frame that is already accounted spends nothing, so a frame costs exactly one
 /// unit whether it runs as compiled code, through the JIT eval loop, or in the
-/// plain evaluator.  `pyframe.py:360` (`execute_frame.insert_stack_check_here`)
+/// plain evaluator.  `pyframe.py` (`execute_frame.insert_stack_check_here`)
 /// puts the matching stack check at the same seam.
 #[inline]
 pub fn enter_recursive_frame(frame: *const PyFrame) -> RecursionDepthGuard {
@@ -407,7 +407,7 @@ pub fn get_eval_fn() -> EvalFn {
 
 // ── JIT parameter injection ──────────────────────────────────────
 //
-// `pypy/interpreter/executioncontext.py:296-298 settrace` invokes
+// `pypy/interpreter/executioncontext.py settrace` invokes
 // `jit.set_param(None, 'trace_limit', 10000)` on the global default
 // jitdriver to widen the trace budget while a tracefunc is installed.
 // pyre-interpreter cannot import pyre-jit (its lower-layer crate), so
@@ -422,7 +422,7 @@ pub fn register_set_jit_param_hook(f: SetJitParamFn) {
     let _ = SET_JIT_PARAM_HOOK.set(f);
 }
 
-/// `rlib/jit.py:818 jit.set_param(driver=None, name, value)` analogue.
+/// `rlib/jit.py jit.set_param(driver=None, name, value)` analogue.
 /// No-op when pyre-jit has not registered the hook (e.g. JIT-disabled
 /// builds or boot-time callers that fire before the first `eval_with_jit`
 /// invocation).
@@ -432,7 +432,7 @@ pub fn set_jit_param(name: &str, value: i64) {
     }
 }
 
-// `rlib/jit.py:842 set_user_param` — the positional-string form
+// `rlib/jit.py set_user_param` — the positional-string form
 // (`"name=value,…"`, `"off"`, `"default"`) that `pypyjit.set_param(str)`
 // routes through. The JIT owns the authoritative parser, so this forwards the
 // whole string and returns `Err(())` on a malformed string (rlib/jit.py:853).
@@ -504,7 +504,7 @@ pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
 /// `dont_look_inside`: the `LAST_EXEC_CTX` thread-local `.with` read has no
 /// extractable graph (front::mir const-folds the `ThreadLocal` global to
 /// None), so the call stays a residual read via the registered fnaddr
-/// (`@dont_look_inside`, `rlib/jit.py:139`), the `take_call_error` twin.
+/// (`@dont_look_inside`, `rlib/jit.py`), the `take_call_error` twin.
 #[majit_macros::dont_look_inside]
 pub fn take_last_exec_ctx() -> *const crate::PyExecutionContext {
     LAST_EXEC_CTX.with(|c| c.get())
@@ -566,13 +566,13 @@ pub fn register_depth_bump(f: DepthBumpFn) {
 /// user-function call.  Shared by `call_user_function_with_eval`,
 /// `call_user_function_plain_with_ctx` and `call_user_function_with_args`
 /// so all positional-only entries apply the same
-/// `function.py:217` _flat_pycall_defaults + `argument.py:170-338`
+/// `function.py` _flat_pycall_defaults + `argument.py:170-338`
 /// _match_signature subset (positional-only — no kwargs path).
 ///
 /// Raises TypeError on too-many positional args (no `*args` to absorb
 /// overflow) and on missing required positional / keyword-only args after
-/// defaults application, mirroring `argument.py:289-300` ArgErrTooMany and
-/// `argument.py:335-338` ArgErrMissing.
+/// defaults application, mirroring `argument.py` ArgErrTooMany and
+/// `argument.py` ArgErrMissing.
 fn fill_user_function_args(
     callable: PyObjectRef,
     code_ref: &crate::CodeObject,
@@ -902,13 +902,13 @@ fn call_user_function_with_eval(
 }
 
 /// [`call_user_function`] with the execution context in place of the caller
-/// frame — the `function.py:79 Function.call_args(self, args)` shape, which
+/// frame — the `function.py Function.call_args(self, args)` shape, which
 /// upstream reaches with no frame at all.
 ///
 /// Also the residual-call sibling of [`call_user_function_plain`], keeping the
 /// JIT-aware eval function.
 ///
-/// `blackhole.py:1225 bhimpl_residual_call_r_i` is `cpu.bh_call_i(func, ...)`
+/// `blackhole.py bhimpl_residual_call_r_i` is `cpu.bh_call_i(func, ...)`
 /// — it invokes the *translated function*, and when that function's graph
 /// reaches a `jit_merge_point` (`execute_frame` does) the JIT is entered
 /// normally. "Opaque to the trace" does not mean "the JIT is off inside":
@@ -918,12 +918,12 @@ fn call_user_function_with_eval(
 /// is *statically* the portal graph.
 ///
 /// Re-entrant tracing is prevented where upstream prevents it, on the green
-/// key: `warmstate.py:473-477` skips a hot back-edge while `JC_TRACING` is
+/// key: `warmstate.py` skips a hot back-edge while `JC_TRACING` is
 /// set, which pyre mirrors with the `driver.is_tracing()` guard in
 /// `maybe_compile_and_run`.
 ///
 /// The execution context is passed in rather than read off a caller frame:
-/// `bhimpl_residual_call_r_r` (`blackhole.py:1227`) is
+/// `bhimpl_residual_call_r_r` (`blackhole.py`) is
 /// `cpu.bh_call_r(func, None, args_r, ...)`, carrying no frame operand, and
 /// the callee frame takes its context from the space
 /// (`space.getexecutioncontext()`).  A residual helper that resolved the
@@ -1060,7 +1060,7 @@ fn call_builtin_code_many_from_roots(root_base: usize, nargs: usize) -> PyResult
 }
 
 fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyResult {
-    // `gateway.py:824 BuiltinCode.funcrun` is translated with both its code
+    // `gateway.py BuiltinCode.funcrun` is translated with both its code
     // object and `Arguments.arguments_w` live across gateway dispatch.  A
     // collection between the outer `space.call_function` reload and this
     // indirect Rust function-pointer call updates the outer shadow slots but
@@ -1120,7 +1120,7 @@ enum CallMode {
     Plain,
 }
 
-/// `baseobjspace.py:1243 call_valuestack(w_func, nargs, frame, …)` — the one
+/// `baseobjspace.py call_valuestack(w_func, nargs, frame, …)` — the one
 /// dispatcher upstream gives a frame to.  It settles the C-profile question and
 /// hands off to the frameless `space.call_args`, which is
 /// [`call_callable_in_ctx`].
@@ -1134,7 +1134,7 @@ pub fn call_callable(frame: &mut PyFrame, callable: PyObjectRef, args: &[PyObjec
     call_callable_with_mode(frame.execution_context, callable, args, CallMode::Jit)
 }
 
-/// `descroperation.py:189 call_args(space, w_obj, args)` — the generic callable
+/// `descroperation.py call_args(space, w_obj, args)` — the generic callable
 /// dispatcher, which upstream reaches with **no frame**: `Function.call_args`
 /// (`function.py:79`) goes straight to `code.funcrun(self, args)` and the callee
 /// frame takes its execution context from the space.
@@ -1149,8 +1149,8 @@ pub fn call_callable_in_ctx(
 /// The caller frame the C-level profile arm needs, or null when no profiler is
 /// installed.
 ///
-/// `baseobjspace.py:1245` gates the arm on `frame.get_is_being_profiled()`, and
-/// that flag has exactly one writer: `executioncontext.py:147-149 call_trace`
+/// `baseobjspace.py` gates the arm on `frame.get_is_being_profiled()`, and
+/// that flag has exactly one writer: `executioncontext.py call_trace`
 /// sets it only while `profilefunc is not None`, and `:121-123
 /// _c_call_return_trace` clears it and returns the moment `profilefunc is
 /// None`.  So an execution context with no profiler installed cannot take the
@@ -1268,7 +1268,7 @@ pub fn call_function_ex_in_ctx(
     let self_or_null = || pyre_object::gc_roots::shadow_stack_get(callable_slot + 2);
     let starargs = || pyre_object::gc_roots::shadow_stack_get(callable_slot + 3);
     let mut args: Vec<PyObjectRef> = unsafe {
-        // argument.py:92-104 reaches `space.fixedview`, whose fast paths
+        // argument.py reaches `space.fixedview`, whose fast paths
         // (`objspace.py:519-527`) are a tuple whose `__iter__` is still
         // `tuple.__iter__` and an exact list.  A subtype that replaced
         // `__iter__` falls through to the generic path so the override runs.
@@ -1286,7 +1286,7 @@ pub fn call_function_ex_in_ctx(
                 .filter_map(|i| pyre_object::w_list_getitem(starargs(), i))
                 .collect()
         } else {
-            // argument.py:92-104 `_combine_starargs_wrapped` — a non-tuple/list
+            // argument.py `_combine_starargs_wrapped` — a non-tuple/list
             // stararg unpacks through `fixedview`, and a non-iterable surfaces
             // "argument after * must be an iterable, not %T" (not the bare
             // `iter()` TypeError).
@@ -1396,7 +1396,7 @@ pub fn call_kw_in_ctx(
         callable_unwrapped
     };
 
-    // function.py:712-713 `StaticMethod.descr_call` receives the original
+    // function.py `StaticMethod.descr_call` receives the original
     // Arguments object.  Preserve the positional/keyword split before the
     // generic signature resolver (a staticmethod wrapper has no Python
     // signature of its own) and forward both collections unchanged.
@@ -1719,7 +1719,7 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, 
     // recurse natively.  The interpreter-level check turns that into
     // RecursionError instead of exhausting the machine stack.
     crate::stack_check::stack_check()?;
-    // descroperation.py:161-167 `get_and_call_args` — the rule `call_args`
+    // descroperation.py `get_and_call_args` — the rule `call_args`
     // uses for `__call__`: `isinstance(w_descr, Function)`, so a builtin
     // function and a fixed-code function take it too.  Such a descriptor
     // takes the object directly as its first positional argument; every other
@@ -1746,7 +1746,7 @@ fn call_callable_with_mode(
     args: &[PyObjectRef],
     mode: CallMode,
 ) -> PyResult {
-    // baseobjspace.py:1241-1242 `call_valuestack`: Function is the primary
+    // baseobjspace.py `call_valuestack`: Function is the primary
     // speedhack and calls `funccall_valuestack` directly.  Do not retain the
     // generic descriptor/type dispatcher across every Python frame.
     if unsafe { crate::is_function_carrier(callable) } {
@@ -2112,7 +2112,7 @@ pub(crate) fn resolve_kwargs(
         for pi in 0..nparams {
             let param_name = &*code.varnames[skip_cls + pi];
             if kw_str == Some(param_name) {
-                // argument.py:474 — positional-only parameter: if has_kwarg,
+                // argument.py — positional-only parameter: if has_kwarg,
                 // treat as unmatched (absorb into **kwargs); otherwise error.
                 if skip_cls + pi < posonlyarg_count {
                     if has_varkw {
@@ -2148,7 +2148,7 @@ pub(crate) fn resolve_kwargs(
         }
     }
 
-    // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the full
+    // argument.py — ArgErrPosonlyAsKwds, raised after the full
     // keyword scan (and before ArgErrUnknownKwds, since `_match_keywords`
     // raises this before its caller ever checks unmatched kwds).
     raise_if_posonly_kwds(&posonly_kwds, &fname)?;
@@ -2296,7 +2296,7 @@ pub(crate) fn resolve_kwargs(
 
     // Pack *args and **kwargs into scope — PyPy _match_signature lines 207-259.
     // This produces the final scope_w that maps directly to frame locals.
-    // `gct_fv_gc_malloc` bracket (`framework.py:853-856`).  Every reference
+    // `gct_fv_gc_malloc` bracket (`framework.py`).  Every reference
     // live across the packing is a raw copy: the parameters already bound into
     // `result`, the unmatched keyword pairs, and the two tail objects.  Each
     // allocation below — the tail objects, `w_dict_store`'s strategy promotion
@@ -2456,12 +2456,12 @@ pub(crate) fn bind_kwargs_to_signature(
         }
     }
 
-    // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the full
+    // argument.py — ArgErrPosonlyAsKwds, raised after the full
     // keyword scan and before ArgErrUnknownKwds.
     raise_if_posonly_kwds(&posonly_kwds, Wtf8::new(fname))?;
 
     if !unmatched_kw_names.is_empty() {
-        // parse_obj (argument.py:377-380) rewrites the unknown-keyword message
+        // parse_obj (argument.py) rewrites the unknown-keyword message
         // to "takes no keyword arguments" when the signature accepts no keywords
         // at all (no **kwargs and no keyword-only params). Every BuiltinCode
         // call routes through parse_obj (gateway.py funcrun / funcrun_obj), so
@@ -2617,7 +2617,7 @@ fn call_with_kwargs_in_ctx_impl(
             .collect()
     };
 
-    // function.py:712-713 StaticMethod.descr_call — the wrapper contributes
+    // function.py StaticMethod.descr_call — the wrapper contributes
     // no implicit argument; forward the original positional and keyword
     // collections unchanged to its w_function.
     if unsafe { pyre_object::is_exact_type(callable, &pyre_object::function::STATICMETHOD_TYPE) } {
@@ -2694,8 +2694,8 @@ fn call_with_kwargs_in_ctx_impl(
         // For builtins: pack kwargs into a dict as last arg.
         //
         // PRE-EXISTING-ADAPTATION (builtin kwargs ABI). PyPy gives every
-        // builtin a real Signature (`gateway.py:740 BuiltinCode`, `:804
-        // self.sig = app_sig.signature()`) and `funcrun_obj` (`gateway.py:871`)
+        // builtin a real Signature (`gateway.py BuiltinCode`, `:804
+        // self.sig = app_sig.signature()`) and `funcrun_obj` (`gateway.py`)
         // resolves keywords by name through `args.parse_obj` →
         // `_match_signature` (`argument.py:173`), exactly like a user function;
         // there is no marker dict. Pyre's builtin ABI is a flat
@@ -2778,7 +2778,7 @@ fn call_with_kwargs_in_ctx_impl(
                     )
                 });
             }
-            // `gct_fv_gc_malloc` bracket (`framework.py:853-856`) for the kwargs
+            // `gct_fv_gc_malloc` bracket (`framework.py`) for the kwargs
             // dict below.  `w_dict_new` allocates in the nursery, so the fresh
             // dict is a young object no root names, and every step that follows
             // allocates: the key strings, `w_dict_store`'s strategy promotion,
@@ -2833,7 +2833,7 @@ fn call_with_kwargs_in_ctx_impl(
                 // would build `Arguments::positional_only(full_args)`
                 // and surface the trailing kwargs dict at index 0,
                 // breaking the FunctionWithFixedCode rebinding's
-                // firstarg() (`argument.py:164-168` returns `None`
+                // firstarg() (`argument.py` returns `None`
                 // when positional count is zero, not the kwargs dict).
                 let frame_ptr = c_profile_frame(execution_context);
                 if !frame_ptr.is_null() {
@@ -2958,7 +2958,7 @@ fn call_with_kwargs_in_ctx_impl(
                 }
             }
 
-            // argument.py:499-500 — ArgErrPosonlyAsKwds, raised after the
+            // argument.py — ArgErrPosonlyAsKwds, raised after the
             // full keyword scan and before ArgErrUnknownKwds.
             raise_if_posonly_kwds(&posonly_kwds, &fname)?;
 
@@ -3266,7 +3266,7 @@ fn call_with_kwargs_in_ctx_impl(
         ) && let Some(init_descr) =
             unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
         {
-            // typeobject.py:737-740 `space.get_and_call_args`: exact
+            // typeobject.py `space.get_and_call_args`: exact
             // Function takes the instance explicitly; every other descriptor
             // binds itself and receives only the original constructor args.
             let init_result = if unsafe { crate::is_function(init_descr) } {
@@ -3411,7 +3411,7 @@ pub fn call_function_impl_result(
     callable: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, PyError> {
-    // `baseobjspace.py:1195-1198 call_function` is translated RPython: its
+    // `baseobjspace.py call_function` is translated RPython: its
     // callable and `args_w` entries are shadow-stack roots across the entry
     // stack check, and the GC transform reloads their possibly moved
     // addresses afterwards.  Rust's incoming slice only contains copied raw
@@ -3435,7 +3435,7 @@ pub fn call_function_impl_result(
     crate::stack_check::drain_jit_pending_exception()?;
 
     let callable = _roots.get(root_base);
-    // `baseobjspace.py:1193-1213 call_function` carries `args_w` as one
+    // `baseobjspace.py call_function` carries `args_w` as one
     // RPython list.  Rebuild that same dynamic list from the updated root
     // slots.  A former fixed `[PY_NULL; 8]` shortcut ended in Rust's opaque
     // `<[T; N]>::index(&array, ..len)` and prevented the whole call dispatcher
@@ -3532,7 +3532,7 @@ pub fn call_function_impl_result(
         if let Some(bound) = classmethod_call_override(callable)? {
             return call_function_impl_result(bound, &reloaded_args());
         }
-        // ClassMethod has no descr_call (function.py:718-768; CPython 3.14
+        // ClassMethod has no descr_call (function.py; CPython 3.14
         // `PyClassMethod_Type.tp_call = 0`), so a raw wrapper falls through
         // to the ordinary not-callable error.
         // GenericAlias.__call__ (`_pypy_generic_alias.py:41`) —
@@ -3628,7 +3628,7 @@ pub(crate) fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError
             "cannot create '{name}' instances"
         )));
     }
-    // Abstract-class rejection lives in `object.__new__` (objectobject.py:131
+    // Abstract-class rejection lives in `object.__new__` (objectobject.py
     // descr__new__ → `w_type_is_abstract`), the single enforcement point, so
     // the error names the missing methods.  A duplicate check here would fire
     // first with a less specific message.
@@ -4605,7 +4605,7 @@ fn build_class_inner(
     // against it directly so its `__setitem__`/`__getitem__` fire mid-body —
     // e.g. `WHITE = RED | GREEN` reads the values `_EnumDict.__setitem__`
     // resolved on assignment, not the stale `auto()` sentinels.  Upstream
-    // `compiling.py:207-209` runs `frame.setdictscope(w_namespace)`
+    // `compiling.py` runs `frame.setdictscope(w_namespace)`
     // unconditionally; route the frame's name binding through the mapping
     // via setdictscope.  An absent or plain-dict namespace keeps the
     // plain-dict fast path (plain-dict stores have no observable side
@@ -4939,13 +4939,13 @@ fn build_class_inner(
                 "metaclass call for {name} returned NULL"
             )));
         }
-        // compiling.py:224 `w_class = space.call_args(w_meta, args)` returns
+        // compiling.py `w_class = space.call_args(w_meta, args)` returns
         // the metaclass result unchanged. `type.__new__` owns classcell, MRO,
         // ready(), and metaclass identity; a custom metaclass that bypasses
         // type.__new__ must not be repaired or overwritten here.
         result
     } else {
-        // typeobject.py:1554 `ensure_common_attributes` belongs to type
+        // typeobject.py `ensure_common_attributes` belongs to type
         // construction, not to `__build_class__` namespace preparation.  A
         // custom non-type metaclass must observe the compiler-produced
         // namespace without an invented `__doc__` key; the default shortcut
@@ -5014,14 +5014,14 @@ fn build_class_inner(
         );
         pyre_object::gc_roots::pin_root(w);
         crate::builtins::type_new_take_qualname(w, dict_obj)?;
-        // typeobject.py:1143-1204 create_all_slots parity.
+        // typeobject.py create_all_slots parity.
         unsafe { create_all_slots(w, pyre_object::gc_roots::shadow_stack_get(bases_root))? };
         // baseobjspace.py:76 — set w_class to 'type' (default metaclass)
         let w = pyre_object::gc_roots::shadow_stack_get(w_root);
         unsafe {
             (*w).w_class = crate::typedef::w_type();
         }
-        // typeobject.py:1560 `compute_mro(w_self)`, reached only once
+        // typeobject.py `compute_mro(w_self)`, reached only once
         // `check_and_find_best_base` inside `create_all_slots` above accepted
         // the tuple.  `compute_default_mro` cannot raise, so `get_mro`'s
         // classic branch runs through the fallible validation here.
@@ -5034,7 +5034,7 @@ fn build_class_inner(
         let w = pyre_object::gc_roots::shadow_stack_get(w_root);
         let mro = unsafe { crate::baseobjspace::compute_default_mro(w) };
         unsafe { pyre_object::w_type_set_mro(w, mro) };
-        // typeobject.py:373-377 ready() — register self on each base's
+        // typeobject.py ready() — register self on each base's
         // `weak_subclasses` so cross-subclass invalidation in
         // `mutated()` and `__subclasses__()` see this class.
         unsafe { pyre_object::typeobject::w_type_ready(w) };
@@ -5201,7 +5201,7 @@ fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
     kw_roots.get(kw_slot)
 }
 
-/// typeobject.py:1020-1026 `_init_subclass` — after a class is created,
+/// typeobject.py `_init_subclass` — after a class is created,
 /// call `super(w_type, w_type).__init_subclass__(**kwds)` exactly once.
 ///
 /// ```python
@@ -5226,7 +5226,7 @@ pub(crate) fn call_init_subclass_on_bases(
     _w_effective_bases: PyObjectRef,
     init_subclass_kwargs: &[(PyObjectRef, PyObjectRef)],
 ) -> Result<(), crate::PyError> {
-    // typeobject.py:1022 `space.call_function(w_super, w_type, w_type)`
+    // typeobject.py `space.call_function(w_super, w_type, w_type)`
     // goes through `super.__new__` / `_super_check` before constructing the
     // proxy.  This matters for a custom metaclass mro() that omits the
     // nascent class: `super(w_type, w_type)` must reject that incomplete
@@ -5244,9 +5244,9 @@ pub(crate) fn call_init_subclass_on_bases(
     let w_objtype = crate::builtins::super_check(w_type, w_type)?;
     let w_super = pyre_object::descriptor::w_super_new(w_type, w_objtype, w_type);
     let w_func = crate::baseobjspace::getattr_str(w_super, "__init_subclass__")?;
-    // typeobject.py:1025-1026 — `args = __args__.replace_arguments([])` then
+    // typeobject.py — `args = __args__.replace_arguments([])` then
     // `space.call_args(w_func, args)`: keywords only, no positionals, and no
-    // frame, because `call_args` (descroperation.py:189) never takes one.
+    // frame, because `call_args` (descroperation.py) never takes one.
     let kwds: Vec<(Wtf8Buf, PyObjectRef)> = (0..init_subclass_kwargs.len())
         .filter_map(|index| {
             let key = pyre_object::gc_roots::shadow_stack_get(kwarg_base + index * 2);
@@ -5319,7 +5319,7 @@ fn type_descr_call_with_mode(
     let new_fn =
         unsafe { crate::baseobjspace::get(new_descr, pyre_object::PY_NULL, current_type())? }
             .unwrap_or(new_descr);
-    // typeobject.py:731 — `space.call_obj_args(w_newfunc, self, __args__)`.
+    // typeobject.py — `space.call_obj_args(w_newfunc, self, __args__)`.
     let mut new_args = Vec::with_capacity(1 + args.len());
     new_args.push(current_type());
     extend_current_args(&mut new_args);
@@ -5427,7 +5427,7 @@ fn valid_slot_name(name: &str) -> bool {
     true
 }
 
-/// astcompiler/misc.py:78-92 mangle(name, klass):
+/// astcompiler/misc.py mangle(name, klass):
 ///   if not name.startswith('__'): return name
 ///   if name.endswith('__') or '.' in name: return name
 ///   strip leading underscores from klass
@@ -5446,7 +5446,7 @@ fn mangle(name: &str, klass: &str) -> String {
     format!("_{stripped}{name}")
 }
 
-/// typeobject.py:1131-1140 copy_flags_from_bases:
+/// typeobject.py copy_flags_from_bases:
 ///   w_self.hasdict |= w_base.hasdict
 ///   w_self.weakrefable |= w_base.weakrefable
 ///   typeobject.py:1406 w_self.hasuserdel |= w_base.hasuserdel
@@ -5477,7 +5477,7 @@ unsafe fn copy_flags_from_bases(
     }
 }
 
-/// typeobject.py:1143-1204 create_all_slots.
+/// typeobject.py create_all_slots.
 ///
 /// Returns `Err` for invalid __slots__ (TypeError), matching PyPy.
 ///
@@ -5490,7 +5490,7 @@ pub unsafe fn create_all_slots(
     unsafe {
         use pyre_object::typeobject::{Layout, leak_layout};
 
-        // typeobject.py:1245: w_bestbase = check_and_find_best_base(space, bases_w)
+        // typeobject.py: w_bestbase = check_and_find_best_base(space, bases_w)
         let w_bestbase = check_and_find_best_base(w_bases)?;
 
         // typeobject.py:1507-1508: inherit flag_map_or_seq from bases
@@ -5519,7 +5519,7 @@ pub unsafe fn create_all_slots(
             }
         }
 
-        // typeobject.py:1510: copy_flags_from_bases — inherit hasdict/weakrefable/hasuserdel
+        // typeobject.py: copy_flags_from_bases — inherit hasdict/weakrefable/hasuserdel
         copy_flags_from_bases(w_type, w_bases);
 
         // typeobject.py:1146: base_layout = w_bestbase.layout
@@ -5545,7 +5545,7 @@ pub unsafe fn create_all_slots(
                 .is_some_and(|(_, itemsize)| itemsize != 0)
         };
 
-        // typeobject.py:1150-1204 create_all_slots
+        // typeobject.py create_all_slots
         let mut newslotnames = Vec::new();
         let (mut wantdict, mut wantweakref);
         if let Some(w_slots) = crate::type_dict_lookup(w_type, "__slots__") {
@@ -5600,7 +5600,7 @@ pub unsafe fn create_all_slots(
             // typeobject.py:1178: string_sort(newslotnames)
             newslotnames.sort();
 
-            // typeobject.py:1183-1189: create_slot loop
+            // typeobject.py: create_slot loop
             let type_name = pyre_object::w_type_get_name(w_type);
             let mut slot_index = base_nslots;
             let mut i = 0;
@@ -5631,7 +5631,7 @@ pub unsafe fn create_all_slots(
                     }
                     newslotnames.remove(i);
                 } else {
-                    // typeobject.py:1216-1217: create_slot
+                    // typeobject.py: create_slot
                     newslotnames[i] = mangled.clone();
                     if crate::type_dict_has_storage(w_type) {
                         let member = pyre_object::w_member_new(slot_index, mangled.clone(), w_type);
@@ -5710,7 +5710,7 @@ pub unsafe fn create_all_slots(
             }
         }
 
-        // typeobject.py:1192-1195: create_dict_slot / create_weakref_slot
+        // typeobject.py: create_dict_slot / create_weakref_slot
         if wantdict {
             create_dict_slot(w_type);
         }
@@ -5751,7 +5751,7 @@ pub unsafe fn create_all_slots(
     }
 }
 
-/// objspace/std/typeobject.py:1222-1226 create_dict_slot.
+/// objspace/std/typeobject.py create_dict_slot.
 ///
 /// ```python
 /// def create_dict_slot(w_self):
@@ -5773,7 +5773,7 @@ unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
     }
 }
 
-/// objspace/std/typeobject.py:1228-1232 create_weakref_slot.
+/// objspace/std/typeobject.py create_weakref_slot.
 ///
 /// ```python
 /// def create_weakref_slot(w_self):
@@ -5795,7 +5795,7 @@ unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
     }
 }
 
-/// typeobject.py:1335-1353 find_best_base.
+/// typeobject.py find_best_base.
 unsafe fn find_best_base(
     w_bases: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -5840,7 +5840,7 @@ unsafe fn find_best_base(
     }
 }
 
-/// typeobject.py:1107-1129 check_and_find_best_base:
+/// typeobject.py check_and_find_best_base:
 ///   w_bestbase = find_best_base(bases_w)
 ///   if w_bestbase is None: raise TypeError
 ///   if not w_bestbase.layout.typedef.acceptable_as_base_class: raise TypeError
@@ -5915,7 +5915,7 @@ pub(crate) unsafe fn check_and_find_best_base(
     }
 }
 
-/// typedef.py:43 `acceptable_as_base_class = '__new__' in rawdict`.
+/// typedef.py `acceptable_as_base_class = '__new__' in rawdict`.
 /// typeobject.py:1116 checks this flag on the bestbase.
 unsafe fn is_acceptable_base_class(w_type: pyre_object::PyObjectRef) -> bool {
     unsafe { pyre_object::w_type_get_acceptable_as_base_class(w_type) }

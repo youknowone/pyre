@@ -27,7 +27,7 @@ pub struct GeneratorIterator {
     /// Opaque pointer to the suspended PyFrame (Box<PyFrame>).
     /// NULL when the generator is exhausted.
     pub frame_ptr: *mut u8,
-    /// `generator.py:21` `self.pycode = frame.pycode`.  This remains owned by
+    /// `generator.py` `self.pycode = frame.pycode`.  This remains owned by
     /// the generator after `frame` is cleared on exhaustion.
     pub pycode: PyObjectRef,
     /// Whether the generator has been started (first __next__ called).
@@ -49,11 +49,11 @@ pub struct GeneratorIterator {
     pub cr_origin: PyObjectRef,
     /// PyPy: `Coroutine._warned_unawaited`.
     pub warned_unawaited: bool,
-    /// `generator.py:29` `GeneratorOrCoroutine.saved_operr`.  Pyre stores
+    /// `generator.py` `GeneratorOrCoroutine.saved_operr`.  Pyre stores
     /// the materialized exception value carried by `ExecutionContext` rather
     /// than an `OperationError`, but preserves the same per-generator owner.
     pub saved_exc_value: PyObjectRef,
-    /// `generator.py:30` `previous_gen_or_coroutine`: the execution-context
+    /// `generator.py` `previous_gen_or_coroutine`: the execution-context
     /// linked-list edge while this generator is running.
     pub previous_gen_or_coroutine: PyObjectRef,
     /// `AsyncGenerator.hooks_inited` / `ag_running` / `w_finalizer`.

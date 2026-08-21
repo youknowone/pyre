@@ -279,7 +279,7 @@ impl Drop for ReprGuard {
     }
 }
 
-/// `dictmultiobject.py:130-150 descr_repr` — `{k: v, ...}`.  Iterates
+/// `dictmultiobject.py descr_repr` — `{k: v, ...}`.  Iterates
 /// `w_dict_items` (which routes through `is_module_dict`), guarded against
 /// self-recursion.  Shared by the `py_repr` dict fast path and the dict
 /// type's `__repr__` method (so dict-subclass instances and `super().
@@ -680,7 +680,7 @@ unsafe fn module_user_dunder_obj(
 
 /// `space.repr` — the whole type dispatch, answering the encoded bytes.
 ///
-/// `listobject.py:206-225 _listrepr_inner` assembles a container's repr in a
+/// `listobject.py _listrepr_inner` assembles a container's repr in a
 /// `rutf8.Utf8StringBuilder` from each item's `space.utf8_len_w(space.repr(...))`,
 /// so a lone surrogate an item wrote survives being nested. A `Wtf8Buf` is the
 /// buffer that can hold the same thing here; a Rust `String` cannot, so every
@@ -888,16 +888,16 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             let owner_name = pyre_object::w_type_get_name(owner);
             format!("<method '{name}' of '{owner_name}' objects>")
         } else if std::ptr::eq(tp, &BUILTIN_FUNCTION_TYPE as *const PyType) {
-            // function.py:721 BuiltinFunction.descr_function_repr.  Same text
+            // function.py BuiltinFunction.descr_function_repr.  Same text
             // the `__repr__` this type registers in `typedef.rs` produces;
             // this native arm is the one `repr()` actually reaches.
             let name = function_get_name(obj);
             let w_self = crate::function::function_get_self_or_none(obj);
             crate::function::builtin_function_repr_text(name, w_self)
         } else if std::ptr::eq(tp, &FUNCTION_TYPE as *const PyType) {
-            // function.py:283 Function.descr_function_repr —
+            // function.py Function.descr_function_repr —
             // `self.getrepr(space, 'function %s' % self.qualname)`, and
-            // `baseobjspace.py:115 getrepr` appends ` at 0x<addr>`.  Exact
+            // `baseobjspace.py getrepr` appends ` at 0x<addr>`.  Exact
             // builtin values take this fast path instead of dispatching
             // through the `__repr__` the type registers in `typedef.rs`, so it
             // must produce the same address-bearing text.
@@ -1032,7 +1032,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             tp,
             &pyre_object::pyobject::MAPPING_PROXY_TYPE as *const PyType,
         ) {
-            // `pypy/objspace/std/dictproxyobject.py:47 descr_repr` →
+            // `pypy/objspace/std/dictproxyobject.py descr_repr` →
             // `b"mappingproxy(%s)" % space.utf8_w(space.repr(self.w_mapping))`.
             let inner = pyre_object::w_dict_proxy_get_mapping(obj);
             let mut out = Wtf8Buf::new();
@@ -1110,10 +1110,10 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             out.push_str(")");
             return Ok(out);
         } else if pyre_object::interp_sre::is_sre_pattern(obj) {
-            // `pypy/module/_sre/interp_sre.py:153 W_SRE_Pattern.repr_w`.
+            // `pypy/module/_sre/interp_sre.py W_SRE_Pattern.repr_w`.
             return crate::module::_sre::interp_sre::sre_pattern_repr_str(obj);
         } else if pyre_object::interp_sre::is_sre_match(obj) {
-            // `pypy/module/_sre/interp_sre.py:684 W_SRE_Match.repr_w`.
+            // `pypy/module/_sre/interp_sre.py W_SRE_Match.repr_w`.
             return crate::module::_sre::interp_sre::sre_match_repr_str(obj);
         } else if pyre_object::memoryview::is_w_memoryview(obj) {
             // `memoryobject.py descr_repr` — `<memory at 0x...>`, or
@@ -1389,7 +1389,7 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
             pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
                 return unicode_encode_error_str(obj).map(Some);
             }
-            // `interp_exceptions.py:540-548 W_KeyError.descr_str` —
+            // `interp_exceptions.py W_KeyError.descr_str` —
             // a single-argument KeyError stringifies as `repr(args[0])`
             // so `str(KeyError('k'))` is `"'k'"`; with any other arg
             // count it falls back to `W_BaseException.descr_str` below.
@@ -1403,7 +1403,7 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     return Ok(Some(py_repr_wtf8(first)?));
                 }
             }
-            // `interp_exceptions.py:667-703 W_OSError.descr_str` reads
+            // `interp_exceptions.py W_OSError.descr_str` reads
             // the `errno`/`strerror`/`filename`/`filename2` slots:
             // the 2-argument form renders as `"[Errno N] strerror"`,
             // extended with `": 'filename'"` and `" -> 'filename2'"`
@@ -1504,7 +1504,7 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     return Ok(Some(out));
                 }
             }
-            // `interp_exceptions.py:859-883 W_SyntaxError.descr_str` —
+            // `interp_exceptions.py W_SyntaxError.descr_str` —
             // a non-str `msg` stringifies plainly; otherwise the message
             // is suffixed with the `basename(filename)` and `line N` /
             // `lines N-M` derived from the location attributes.  The
@@ -1635,7 +1635,7 @@ fn nt_drive_len(path: &[u8]) -> usize {
 
 /// Where `os.path.basename` starts its result.
 ///
-/// `interp_exceptions.py:875` calls `os.path.basename`, so the split is the
+/// `interp_exceptions.py` calls `os.path.basename`, so the split is the
 /// platform's. `ntpath` peels [`nt_drive_len`] off first and takes what
 /// follows the last `\` or `/` in the remainder — which is empty for a bare
 /// UNC root; `posixpath` takes what follows the last `/`, with no drive.
@@ -1679,7 +1679,7 @@ unsafe fn exception_descr_str_wtf8(obj: PyObjectRef) -> Result<Option<Wtf8Buf>, 
         ) {
             return Ok(None);
         }
-        // `interp_exceptions.py:859 W_SyntaxError.descr_str` — format
+        // `interp_exceptions.py W_SyntaxError.descr_str` — format
         // `msg (filename, line lineno)`, falling back through the
         // filename-only, lineno-only, and bare-msg shapes. Shared by the
         // IndentationError / TabError subclasses (same `ExcKind`).

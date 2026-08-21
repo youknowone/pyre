@@ -46,7 +46,7 @@ pub fn register_gc_hooks(callbacks: GcHookCallbacks) {
     ON_GC_COLLECT.set(Some(callbacks.on_gc_collect));
 }
 
-/// `rpython/memory/gc/hook.py:5-70 GcHooks`.
+/// `rpython/memory/gc/hook.py GcHooks`.
 ///
 /// This zero-sized value is deliberately a field on `MiniMarkGC`; the global
 /// cells provide its translated virtual method bodies, not a parallel store.

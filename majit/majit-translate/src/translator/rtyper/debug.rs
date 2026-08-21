@@ -8,17 +8,17 @@
 
 use std::fmt;
 
-/// RPython `ll_assert(x, msg)` (`debug.py:4-7`).
+/// RPython `ll_assert(x, msg)` (`debug.py`).
 pub fn ll_assert(x: bool, msg: &str) {
     assert!(x, "{msg}");
 }
 
-/// RPython `ll_assert_not_none(x)` (`debug.py:19-22`).
+/// RPython `ll_assert_not_none(x)` (`debug.py`).
 pub fn ll_assert_not_none<T>(x: Option<T>) -> T {
     x.unwrap_or_else(|| panic!("ll_assert_not_none(None)"))
 }
 
-/// RPython `class FatalError(Exception)` (`debug.py:42-43`).
+/// RPython `class FatalError(Exception)` (`debug.py`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FatalError {
     pub msg: String,
@@ -38,7 +38,7 @@ impl fmt::Display for FatalError {
 
 impl std::error::Error for FatalError {}
 
-/// RPython `fatalerror(msg)` (`debug.py:45-53`).
+/// RPython `fatalerror(msg)` (`debug.py`).
 ///
 /// Pyre runs this helper in the untranslated Rust host, so it follows
 /// upstream's `not we_are_translated()` branch and returns `FatalError`.
@@ -46,12 +46,12 @@ pub fn fatalerror(msg: impl Into<String>) -> Result<(), FatalError> {
     Err(FatalError::new(msg))
 }
 
-/// RPython `fatalerror_notb(msg)` (`debug.py:55-62`).
+/// RPython `fatalerror_notb(msg)` (`debug.py`).
 pub fn fatalerror_notb(msg: impl Into<String>) -> Result<(), FatalError> {
     Err(FatalError::new(msg))
 }
 
-/// RPython `debug_print_traceback()` (`debug.py:64-70`).
+/// RPython `debug_print_traceback()` (`debug.py`).
 ///
 /// The untranslated helper is intentionally side-effect free locally; the
 /// translated operation is represented by the `debug_print_traceback` llop.

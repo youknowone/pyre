@@ -20,7 +20,7 @@ use std::sync::atomic::Ordering;
 
 use crate::flowspace::model::HostObject;
 
-/// Port of upstream `rpython/rlib/entrypoint.py:10-12 export_symbol`.
+/// Port of upstream `rpython/rlib/entrypoint.py export_symbol`.
 ///
 /// Upstream `func.exported_symbol = True; return func` is a Python
 /// in-place attribute assignment — the function object's identity

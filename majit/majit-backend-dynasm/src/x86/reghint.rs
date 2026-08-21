@@ -15,7 +15,7 @@ pub const SAVE_DEFAULT_REGS: u8 = 0;
 pub const SAVE_GCREF_REGS: u8 = 1;
 pub const SAVE_ALL_REGS: u8 = 2;
 
-/// reghint.py:29 X86RegisterHints.
+/// reghint.py X86RegisterHints.
 pub struct RegisterHints {
     save_around_call_regs_gpr: Vec<RegLoc>,
     all_regs_gpr: Vec<RegLoc>,
@@ -49,12 +49,12 @@ impl RegisterHints {
         if !arg.is_constant() {
             return None;
         }
-        // history.py:227/268/314 — inline-Const variants carry value inline.
+        // history.py/268/314 — inline-Const variants carry value inline.
         arg.inline_const_bits()
             .or_else(|| self.constants.get(&arg.raw()).copied())
     }
 
-    /// reghint.py:30 `add_hints` — main entry called from
+    /// reghint.py `add_hints` — main entry called from
     /// `RegAlloc::_prepare`.
     pub fn add_hints(
         &self,
@@ -72,7 +72,7 @@ impl RegisterHints {
         }
     }
 
-    /// reghint.py:166-172 `oplist` dispatch.  Implemented as a match
+    /// reghint.py `oplist` dispatch.  Implemented as a match
     /// here because Rust cannot build a class-method oplist at
     /// import time the way Python can.
     fn dispatch(&self, opcode: OpCode, longevity: &mut LifetimeManager, op: &Op, position: i32) {
@@ -81,7 +81,7 @@ impl RegisterHints {
             OpCode::IntNeg | OpCode::IntInvert => {
                 self.consider_int_neg(longevity, op, position);
             }
-            // reghint.py:70-77 _consider_binop_symm
+            // reghint.py _consider_binop_symm
             OpCode::IntMul
             | OpCode::IntAnd
             | OpCode::IntOr
@@ -90,11 +90,11 @@ impl RegisterHints {
             | OpCode::IntAddOvf => {
                 self._consider_binop_symm(longevity, op, position);
             }
-            // reghint.py:76 _consider_binop
+            // reghint.py _consider_binop
             OpCode::IntSubOvf => {
                 self._consider_binop(longevity, op, position);
             }
-            // reghint.py:79-86 consider_int_add + consider_nursery_ptr_increment
+            // reghint.py consider_int_add + consider_nursery_ptr_increment
             OpCode::IntAdd | OpCode::NurseryPtrIncrement => {
                 self.consider_int_add(longevity, op, position);
             }
@@ -102,7 +102,7 @@ impl RegisterHints {
             OpCode::IntSub => {
                 self.consider_int_sub(longevity, op, position);
             }
-            // reghint.py:100-105 _consider_float_op
+            // reghint.py _consider_float_op
             OpCode::FloatAdd
             | OpCode::FloatSub
             | OpCode::FloatMul
@@ -111,22 +111,22 @@ impl RegisterHints {
             | OpCode::FloatAbs => {
                 self._consider_float_op(longevity, op, position);
             }
-            // reghint.py:107-115 consider_int_lshift / rshift / urshift
+            // reghint.py consider_int_lshift / rshift / urshift
             OpCode::IntLshift | OpCode::IntRshift | OpCode::UintRshift => {
                 self.consider_int_lshift(longevity, op, position);
             }
-            // reghint.py:117-121 consider_uint_mul_high
+            // reghint.py consider_uint_mul_high
             OpCode::UintMulHigh => {
                 self.consider_uint_mul_high(longevity, position);
             }
-            // reghint.py:123-128 consider_call_malloc_nursery + varsize variants
+            // reghint.py consider_call_malloc_nursery + varsize variants
             OpCode::CallMallocNursery
             | OpCode::CallMallocNurseryHeaderless
             | OpCode::CallMallocNurseryVarsize
             | OpCode::CallMallocNurseryVarsizeFrame => {
                 self.consider_call_malloc_nursery(longevity, op, position);
             }
-            // reghint.py:147-150 consider_call_{i,r,f,n} → _consider_real_call
+            // reghint.py consider_call_{i,r,f,n} → _consider_real_call
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN => {
                 self._consider_real_call(longevity, op, position);
             }
@@ -145,12 +145,12 @@ impl RegisterHints {
         }
     }
 
-    /// reghint.py:43-45 consider_int_neg / consider_int_invert.
+    /// reghint.py consider_int_neg / consider_int_invert.
     fn consider_int_neg(&self, longevity: &mut LifetimeManager, op: &Op, _position: i32) {
         longevity.try_use_same_register(op.arg(0).to_opref(), op.pos.get());
     }
 
-    /// reghint.py:47-62 `_consider_binop_part`.
+    /// reghint.py `_consider_binop_part`.
     fn _consider_binop_part(
         &self,
         longevity: &mut LifetimeManager,
@@ -181,17 +181,17 @@ impl RegisterHints {
         }
     }
 
-    /// reghint.py:64-65 `_consider_binop`.
+    /// reghint.py `_consider_binop`.
     fn _consider_binop(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
         self._consider_binop_part(longevity, op, position, false);
     }
 
-    /// reghint.py:67-68 `_consider_binop_symm`.
+    /// reghint.py `_consider_binop_symm`.
     fn _consider_binop_symm(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
         self._consider_binop_part(longevity, op, position, true);
     }
 
-    /// reghint.py:79-84 `consider_int_add`.
+    /// reghint.py `consider_int_add`.
     fn consider_int_add(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
         let y = op.arg(1).to_opref();
         if let Some(val) = self.get_const_int(y) {
@@ -203,7 +203,7 @@ impl RegisterHints {
         self._consider_binop_symm(longevity, op, position);
     }
 
-    /// reghint.py:88-93 `consider_int_sub`.
+    /// reghint.py `consider_int_sub`.
     fn consider_int_sub(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
         let y = op.arg(1).to_opref();
         if let Some(val) = self.get_const_int(y) {
@@ -214,7 +214,7 @@ impl RegisterHints {
         self._consider_binop(longevity, op, position);
     }
 
-    /// reghint.py:95-98 `_consider_float_op`.
+    /// reghint.py `_consider_float_op`.
     fn _consider_float_op(&self, longevity: &mut LifetimeManager, op: &Op, _position: i32) {
         let x = op.arg(0).to_opref();
         if !x.is_constant() {
@@ -222,7 +222,7 @@ impl RegisterHints {
         }
     }
 
-    /// reghint.py:107-112 `consider_int_lshift` (shared with rshift /
+    /// reghint.py `consider_int_lshift` (shared with rshift /
     /// uint_rshift per aliases at reghint.py:114-115).
     ///
     /// Shift amount must go in ecx (x86 `shl`/`shr` only accept cl).
@@ -239,7 +239,7 @@ impl RegisterHints {
         }
     }
 
-    /// reghint.py:117-121 `consider_uint_mul_high`.
+    /// reghint.py `consider_uint_mul_high`.
     ///
     /// 64x64→128 MUL on x86 returns low in rax, high in rdx.  Reserve
     /// both at this position so the result/temp aren't spilled over.
@@ -248,7 +248,7 @@ impl RegisterHints {
         longevity.fixed_register(position, EDX, None);
     }
 
-    /// reghint.py:123-128 `consider_call_malloc_nursery` and its
+    /// reghint.py `consider_call_malloc_nursery` and its
     /// varsize/varsize_frame aliases — pins result to ecx and temp
     /// to edx, matching the regalloc.py:1013-1028 contract.
     fn consider_call_malloc_nursery(
@@ -261,7 +261,7 @@ impl RegisterHints {
         longevity.fixed_register(position, EDX, None);
     }
 
-    /// reghint.py:138 `_consider_real_call`.
+    /// reghint.py `_consider_real_call`.
     fn _consider_real_call(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
         let Some(descr) = op.getdescr() else {
             return;
@@ -276,7 +276,7 @@ impl RegisterHints {
         self._consider_call(longevity, op, position, false, 1);
     }
 
-    /// reghint.py:130 `_consider_call`.
+    /// reghint.py `_consider_call`.
     fn _consider_call(
         &self,
         longevity: &mut LifetimeManager,
@@ -301,7 +301,7 @@ impl RegisterHints {
         self.hint(longevity, position, &args, argtypes, gc_level);
     }
 
-    /// reghint.py:207 `CallHints64.hint`.
+    /// reghint.py `CallHints64.hint`.
     fn hint(
         &self,
         longevity: &mut LifetimeManager,
@@ -341,7 +341,7 @@ impl RegisterHints {
         self._block_non_caller_save(longevity, position, save_all_regs, &hinted_gpr, &hinted_xmm);
     }
 
-    /// reghint.py:176 `_block_non_caller_save`.
+    /// reghint.py `_block_non_caller_save`.
     fn _block_non_caller_save(
         &self,
         longevity: &mut LifetimeManager,
@@ -370,7 +370,7 @@ impl RegisterHints {
     }
 }
 
-/// x86/regalloc.py:35 `compute_gc_level`.
+/// x86/regalloc.py `compute_gc_level`.
 fn compute_gc_level(calldescr: &dyn majit_ir::descr::CallDescr, guard_not_forced: bool) -> u8 {
     if guard_not_forced {
         return SAVE_ALL_REGS;

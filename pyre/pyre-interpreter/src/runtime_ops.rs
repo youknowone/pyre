@@ -16,7 +16,7 @@ use crate::{
     w_code_get_ptr,
 };
 
-/// `pypy/interpreter/pyopcode.py:1457 MAKE_FUNCTION` stamps the new
+/// `pypy/interpreter/pyopcode.py MAKE_FUNCTION` stamps the new
 /// function's `w_func_globals = self.w_globals` directly from the
 /// running frame's dict object.  This entry point accepts the canonical
 /// PyObjectRef (`w_globals`) so the freshly-created function inherits
@@ -25,11 +25,11 @@ pub fn make_function_from_code_obj_with_globals_obj(
     code_obj: PyObjectRef,
     w_globals: PyObjectRef,
 ) -> PyObjectRef {
-    // `function.py:51-53 __init__`:
+    // `function.py __init__`:
     //   self.name = forcename or code.co_name
     //   self.qualname = qualname or self.name
     // so `name` is the bare `co_name` and `qualname` is the dotted
-    // `co_qualname`.  `pyopcode.py:1457 MAKE_FUNCTION` then stamps the
+    // `co_qualname`.  `pyopcode.py MAKE_FUNCTION` then stamps the
     // qualified name from `codeobj.co_qualname`, which is why a later
     // `__code__ = new_code` assignment does NOT change `__qualname__`.  Both
     // are read straight off the code object, so neither allocates.
@@ -71,7 +71,7 @@ pub extern "C" fn jit_set_function_attribute(func: i64, attr: i64, flag: i64) ->
         0 => unsafe { crate::function_set_defaults(func, attr) },
         1 => unsafe { crate::function_set_kwdefaults(func, attr) },
         2 => {
-            // `function.py:553-559 fset_func_annotations` — the eager
+            // `function.py fset_func_annotations` — the eager
             // annotations dict is stamped on the typed `Function.w_ann`
             // slot via `function_write_barrier`, so `f.__annotations__ is
             // f.__annotations__` holds through the getattr arm.
@@ -102,7 +102,7 @@ pub extern "C" fn jit_load_name_from_namespace(
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
-    // `pyopcode.py:959 _load_global`: `space.finditem_str(w_globals,
+    // `pyopcode.py _load_global`: `space.finditem_str(w_globals,
     // varname)`.  finditem_str takes the borrowed-string fast path for real
     // dict layouts and dispatches a dict subclass through the general mapping
     // object, so a raising key `__eq__` propagates through the traced path
@@ -165,7 +165,7 @@ pub extern "C" fn jit_store_name_to_namespace(
     let Some(name) = decode_name(name_ptr, name_len) else {
         return 0;
     };
-    // `celldict.py:332 STORE_GLOBAL_cached` (jitted): `space.setitem_str(
+    // `celldict.py STORE_GLOBAL_cached` (jitted): `space.setitem_str(
     // get_w_globals(), varname, w_newvalue)`.  As in the interpreter path,
     // only actual dict layouts may use the raw strategy call; a dict subclass
     // remains the receiver of generic mapping assignment.
@@ -207,7 +207,7 @@ pub fn register_jit_exc_raiser(raiser: JitExcRaiser) {
     let _ = JIT_EXC_RAISER.set(raiser);
 }
 
-/// llmodel.py:194-199 _store_exception: publish `exc_obj` into the
+/// llmodel.py _store_exception: publish `exc_obj` into the
 /// backend's pos_exception/pos_exc_value cells so the residual call's
 /// GuardNoException sees it and side-exits into the handler. Mirrors
 /// `jit_call_user_function_from_frame` (call_jit.rs). MUST NOT use
@@ -418,7 +418,7 @@ define_known_function_call_helper!(
     arg7
 );
 
-/// Which arm a callable dispatches through (`baseobjspace.py:1243`).
+/// Which arm a callable dispatches through (`baseobjspace.py`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CallableKind {
     /// A `BuiltinCode` carrier — `call_args_and_c_profile` / native code.
@@ -679,7 +679,7 @@ pub fn convert_value_code(conv: ConvertValueOparg) -> i64 {
 /// `__str__` / `__repr__` may run Python → fallible.
 pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate::PyError> {
     if conv == 0 || conv == 3 {
-        // `descr_str` (unicodeobject.py:333-337) returns `self` for an exact
+        // `descr_str` (unicodeobject.py) returns `self` for an exact
         // `str` and converts anything else — a subclass included — to a fresh
         // base `str`.
         if unsafe { pyre_object::is_exact_type(value, &pyre_object::STR_TYPE) } {
@@ -804,7 +804,7 @@ pub fn binary_slice_values(
             // Slice on code-point boundaries over the WTF-8 view, so a
             // surrogate-bearing or multi-byte string slices correctly.  The
             // bounds convert through the object's own index storage
-            // (`_index_to_byte`, unicodeobject.py:1251) and the count is the
+            // (`_index_to_byte`, unicodeobject.py) and the count is the
             // stored `_length`: deriving either by walking the payload would
             // make a one-character slice cost the whole string.  A bound equal
             // to the count resolves to the end of the buffer, which is what
@@ -1335,7 +1335,7 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
     };
     if let Some(len) = exact_sequence_len {
         if len != count {
-            // `baseobjspace.py:1041-1053 _unpackiterable_known_length_jitlook`
+            // `baseobjspace.py _unpackiterable_known_length_jitlook`
             // raises ValueError on length mismatch.
             let msg = if len < count {
                 format!("not enough values to unpack (expected {count}, got {len})")
@@ -1364,7 +1364,7 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
             .collect());
     }
     // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
-    // baseobjspace.py:1031 _unpackiterable_known_length_jitlook.  pyopcode.py:872
+    // baseobjspace.py _unpackiterable_known_length_jitlook.  pyopcode.py:872
     // UNPACK_SEQUENCE wraps the whole `fixedview_unroll` (iter + known-length
     // loop) in a TypeError → "cannot unpack non-iterable %T object" remap.
     let non_iterable = || {
@@ -1460,7 +1460,7 @@ pub fn unpack_ex_slots(
         } else if is_list(value()) {
             pyre_object::w_list_items_copy_as_vec(value())
         } else {
-            // pyopcode.py:884 UNPACK_EX wraps `fixedview` in a
+            // pyopcode.py UNPACK_EX wraps `fixedview` in a
             // TypeError → "cannot unpack non-iterable %T object" remap.
             // `collect_iterable` is the `fixedview` analog (iter + next
             // loop), so any TypeError it raises is remapped here.
@@ -1788,7 +1788,7 @@ pub extern "C" fn jit_next(iter: i64) -> i64 {
     }
 }
 
-/// `pyopcode.py:1303-1316` FOR_ITER exception discrimination:
+/// `pyopcode.py` FOR_ITER exception discrimination:
 /// `e.match(space, space.w_StopIteration)`. The caught object and match class
 /// are Python-level objects, so use the same MRO-aware helper as
 /// CHECK_EXC_MATCH. This is infallible and deliberately never publishes a

@@ -82,7 +82,7 @@ impl From<FlowSignal> for StackElem {
 
 /// Interpreter frame snapshot used as the merge unit in flow-space.
 ///
-/// RPython basis: `framestate.py:18-99` — `class FrameState`.
+/// RPython basis: `framestate.py` — `class FrameState`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameState {
     /// RPython `FrameState.locals_w` — slot `None` stands in for
@@ -113,7 +113,7 @@ pub type MergeCell = Option<Hlvalue>;
 
 /// Raised when two `FrameState`s cannot be merged.
 ///
-/// RPython basis: `framestate.py:101-102` — `class UnionError`.
+/// RPython basis: `framestate.py` — `class UnionError`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnionError;
 
@@ -353,7 +353,7 @@ fn union_optlist(
         .collect()
 }
 
-/// RPython `union(w1, w2)` (framestate.py:105-128).
+/// RPython `union(w1, w2)` (framestate.py).
 ///
 /// Input cells are `Option<&Hlvalue>`: `None` is upstream's literal
 /// `None`, which "kills" a union by returning `None`.
@@ -423,7 +423,7 @@ pub(crate) fn union_stack(a: &[StackElem], b: &[StackElem]) -> Result<Vec<StackE
         .collect()
 }
 
-/// RPython `framestate.py:131-148` — `recursively_flatten`.
+/// RPython `framestate.py` — `recursively_flatten`.
 ///
 /// Unpacks any `FlowSignal` cells in the stack into their `args`,
 /// recursively. RPython operates in-place on a copy; we return a

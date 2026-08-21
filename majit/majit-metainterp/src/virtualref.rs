@@ -94,7 +94,7 @@ pub const JIT_VIRTUAL_REF_VTABLE: usize = 0x4A56_5221; // "JVR!"
 /// don't hold a `VirtualRefInfo` — e.g. the interpreter's frame-chain force
 /// path (`ExecutionContext::force_vref`).  The check reads only the module
 /// constant `JIT_VIRTUAL_REF_VTABLE`, so no receiver state is needed.
-/// `virtualref.py:94-98 is_virtual_ref(gcref)`.
+/// `virtualref.py is_virtual_ref(gcref)`.
 ///
 /// # Safety
 /// `ptr` must be null or point to a valid object whose leading
@@ -126,7 +126,7 @@ pub unsafe fn vref_forced(ptr: *const u8) -> *mut u8 {
     unsafe { (*(ptr as *const JitVirtualRef)).forced }
 }
 
-/// `rpython/rlib/jit.py:487 class InvalidVirtualRef(Exception)` —
+/// `rpython/rlib/jit.py class InvalidVirtualRef(Exception)` —
 /// `force_virtual` raises this when `virtual_token == TOKEN_NONE`
 /// but `forced` is null (`virtualref.py:174-176`).  Pyre's single
 /// canonical definition lives in `crate::jit::InvalidVirtualRef`
@@ -135,7 +135,7 @@ pub unsafe fn vref_forced(ptr: *const u8) -> *mut u8 {
 pub use crate::jit::InvalidVirtualRef;
 
 /// Allocate a concrete JitVirtualRef.
-/// `virtualref.py:85-91 virtual_ref_during_tracing(real_object)`.
+/// `virtualref.py virtual_ref_during_tracing(real_object)`.
 /// Initializes virtual_token = TOKEN_NONE, forced = real_object.
 /// Returns raw pointer; caller owns the allocation.
 ///
@@ -184,14 +184,14 @@ fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
 }
 
 /// Token value indicating no JIT frame is active.
-/// `virtualizable.py:329 TOKEN_NONE = lltype.nullptr(llmemory.GCREF.TO)`.
+/// `virtualizable.py TOKEN_NONE = lltype.nullptr(llmemory.GCREF.TO)`.
 pub const TOKEN_NONE: *mut u8 = std::ptr::null_mut();
 
 /// `virtualizable.py:326`:
 /// ```python
 /// _DUMMY = lltype.GcStruct('JITFRAME_DUMMY')
 /// ```
-/// `virtualizable.py:326-330` uses a real pointer to the `_dummy` object, so
+/// `virtualizable.py` uses a real pointer to the `_dummy` object, so
 /// the translated identity word is pointer-sized too.
 pub const JITFRAME_DUMMY_VTABLE: usize = 0x4A46_444D; // "JFDM"
 
@@ -218,7 +218,7 @@ pub fn set_tracing_rescall_dummy_gc_type_id(type_id: u32) {
     TRACING_RESCALL_DUMMY_PTR.store(0, Ordering::Relaxed);
 }
 
-/// `virtualizable.py:327 _dummy = lltype.malloc(_DUMMY)` — allocate
+/// `virtualizable.py _dummy = lltype.malloc(_DUMMY)` — allocate
 /// the singleton dummy `JITFRAME_DUMMY` object whose address serves as the
 /// tracing sentinel. The object is allocated in the GC old generation with a
 /// registered leaf type and held by a program-lifetime root, giving it the
@@ -279,7 +279,7 @@ pub fn token_tracing_rescall() -> *mut u8 {
 /// When code outside the JIT tries to access the virtual object, the
 /// reference is "forced" -- the virtual object is materialized on the heap.
 ///
-/// `virtualref.py:32-42` parity: `descr` / `descr_virtual_token` /
+/// `virtualref.py` parity: `descr` / `descr_virtual_token` /
 /// `descr_forced` hold the live `cpu.sizeof(JIT_VIRTUAL_REF)` and
 /// `cpu.fielddescrof(JIT_VIRTUAL_REF, 'virtual_token' | 'forced')`
 /// Arcs.  Pyre's underlying generators (`vref_size_descr()` /
@@ -305,7 +305,7 @@ impl Default for VirtualRefInfo {
 }
 
 impl crate::resume::VRefInfo for VirtualRefInfo {
-    /// virtualref.py:122-129 continue_tracing(gcref, real_object)
+    /// virtualref.py continue_tracing(gcref, real_object)
     ///
     /// Mirrors RPython:
     ///   if not self.is_virtual_ref(gcref): return
@@ -314,7 +314,7 @@ impl crate::resume::VRefInfo for VirtualRefInfo {
     ///   vref.virtual_token = TOKEN_NONE
     ///   vref.forced = real_object
     fn continue_tracing(&self, vref: i64, virtual_ref: i64) {
-        // `virtualref.py:122-129 continue_tracing(gcref, real_object)`
+        // `virtualref.py continue_tracing(gcref, real_object)`
         // — delegate to the inherent helper which carries the
         // `is_virtual_ref` guard, `assert real_object`, and
         // `assert vref.virtual_token != TOKEN_TRACING_RESCALL`
@@ -358,7 +358,7 @@ impl VirtualRefInfo {
         }
     }
 
-    /// `virtualref.py:157-177 force_virtual(inst)` — force a virtual
+    /// `virtualref.py force_virtual(inst)` — force a virtual
     /// reference: materialise the virtual object if needed.
     ///
     /// Returns `Err(InvalidVirtualRef)` when `virtual_token ==
@@ -435,7 +435,7 @@ impl VirtualRefInfo {
 
     /// Create a virtual reference during tracing.
     ///
-    /// virtualref.py:85-91: `virtual_ref_during_tracing(real_object)`
+    /// virtualref.py: `virtual_ref_during_tracing(real_object)`
     ///
     /// Allocates a concrete JitVirtualRef on the heap with
     /// virtual_token = TOKEN_NONE, forced = real_object.
@@ -443,7 +443,7 @@ impl VirtualRefInfo {
         alloc_virtual_ref(real_object)
     }
 
-    /// `virtualref.py:100-105 tracing_before_residual_call(gcref)` —
+    /// `virtualref.py tracing_before_residual_call(gcref)` —
     /// sets token to `TOKEN_TRACING_RESCALL` so that if the callee
     /// forces the vref, we detect it after the call.  Upstream
     /// guards on `is_virtual_ref(gcref)` first and returns silently
@@ -464,7 +464,7 @@ impl VirtualRefInfo {
         }
     }
 
-    /// `virtualref.py:107-120 tracing_after_residual_call(gcref)` —
+    /// `virtualref.py tracing_after_residual_call(gcref)` —
     /// returns `true` if the vref was forced during the residual
     /// call.  If not forced, resets token to `TOKEN_NONE`.  Upstream
     /// guards on `is_virtual_ref(gcref)` first and returns `False`
@@ -498,7 +498,7 @@ impl VirtualRefInfo {
         }
     }
 
-    /// `virtualref.py:122-129 continue_tracing(gcref, real_object)` —
+    /// `virtualref.py continue_tracing(gcref, real_object)` —
     /// updates the `forced` field and clears the token.  Upstream
     /// guards on `is_virtual_ref(gcref)` first and returns silently
     /// when the gcref is not a JitVirtualRef.
@@ -548,7 +548,7 @@ impl VirtualRefInfo {
         token == token_tracing_rescall()
     }
 
-    /// `virtualref.py:94-98 is_virtual_ref(gcref)`:
+    /// `virtualref.py is_virtual_ref(gcref)`:
     /// ```python
     /// def is_virtual_ref(self, gcref):
     ///     if not gcref:
@@ -602,7 +602,7 @@ mod tests {
         }
     }
 
-    /// `virtualref.py:174-176`: `force_virtual` raises
+    /// `virtualref.py`: `force_virtual` raises
     /// `InvalidVirtualRef` when `virtual_token == TOKEN_NONE` and
     /// `forced` is null.  pyre surfaces the same shape as
     /// `Err(InvalidVirtualRef)`.
@@ -657,7 +657,7 @@ mod tests {
         );
     }
 
-    /// `virtualref.py:168-173`: when `virtual_token != TOKEN_NONE`
+    /// `virtualref.py`: when `virtual_token != TOKEN_NONE`
     /// and != `TOKEN_TRACING_RESCALL`, `force_virtual` invokes
     /// `force_now`, which (mirroring upstream's `cpu.force(token)`
     /// and `handle_async_forcing`) must mutate the vref so that
@@ -692,7 +692,7 @@ mod tests {
         assert_eq!(vref.forced, materialized);
     }
 
-    /// `virtualref.py:101-102`: `tracing_before_residual_call`
+    /// `virtualref.py`: `tracing_before_residual_call`
     /// returns silently when the gcref is not a JitVirtualRef.
     /// pyre's `is_virtual_ref` guard mirrors the shape — a
     /// non-vref pointer (here a word whose leading bytes are NOT
@@ -711,7 +711,7 @@ mod tests {
         );
     }
 
-    /// `virtualref.py:108-109`: `tracing_after_residual_call`
+    /// `virtualref.py`: `tracing_after_residual_call`
     /// returns `false` for a non-vref input.
     #[test]
     fn tracing_after_residual_call_returns_false_for_non_vref() {
@@ -726,7 +726,7 @@ mod tests {
         );
     }
 
-    /// `virtualref.py:123-124`: `continue_tracing` returns silently
+    /// `virtualref.py`: `continue_tracing` returns silently
     /// when the gcref is not a JitVirtualRef.
     #[test]
     fn continue_tracing_skips_non_vref() {

@@ -13,7 +13,7 @@
 // trace_info, external_jump_target, fail_count, bridge caches,
 // bridge_dispatch_cell) live on the metainterp
 // `ResumeGuardDescr` (Slices 7-Tβ6..12) — see `majit-backend::
-// resume_guard_descr`.  PyPy `AbstractFailDescr._attrs_` (history.py:132)
+// resume_guard_descr`.  PyPy `AbstractFailDescr._attrs_` (history.py)
 // carries none of these; Pyre's metainterp descr is the single source
 // of truth for both the `_attrs_` set and the backend-only cells.
 use majit_backend::{ExitRecoveryLayout, TerminalExitLayout};
@@ -22,7 +22,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 // The process-global `FAIL_DESCR_REGISTRY_GLOBAL` Weak HashMap was
-// retired.  `history.py:109-114 AbstractDescr.show(cpu, descr_gcref)
+// retired.  `history.py AbstractDescr.show(cpu, descr_gcref)
 // = cast_gcref_to_instance(...)` parity is now a pure
 // `Arc::from_raw` against the `FailDescrCell` wrapper baked at
 // codegen time (`majit_ir::recover_fail_descr_cell` in
@@ -30,7 +30,7 @@ use std::sync::Arc;
 // `CompiledLoop::fail_descr_cells` / `BridgeData::fail_descr_cells`
 // / `RegisteredLoopTarget::fail_descr_cells` for the life of the
 // CLT they belong to (`model.py:294`,
-// `llmodel.py:252-268 free_loop_and_bridges`).
+// `llmodel.py free_loop_and_bridges`).
 
 /// Compiled bridge data attached to a guard's fail descriptor.
 ///
@@ -58,7 +58,7 @@ pub struct BridgeData {
     pub body_ptr: *const u8,
     /// Fail descriptors within the bridge (guards + finish).
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
-    /// contract (compile.py:183-203 record_loop_or_bridge). Position
+    /// contract (compile.py record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at construction.
     pub fail_descrs: Box<[DescrRef]>,
     /// Position-aligned `FailDescrCell` wrappers (see
@@ -82,7 +82,7 @@ pub struct BridgeData {
     /// the parent loop instead of returning to the interpreter.
     /// Set for bridges that reach the loop's merge_point.
     pub loop_reentry: bool,
-    /// compile.py:186: record_loop_or_bridge sets descr.rd_loop_token = clt
+    /// compile.py: record_loop_or_bridge sets descr.rd_loop_token = clt
     /// on ALL guards (loop and bridge). The bridge shares the parent loop's
     /// invalidation flag (AtomicBool). Holding an Arc clone keeps the flag
     /// alive as long as the bridge exists.

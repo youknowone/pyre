@@ -47,7 +47,7 @@ pub const W_INT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_IntObjectUser>()
 //   prebuiltintfrom  default -5    — lowest integer which is prebuilt
 //   prebuiltintto    default 100   — highest integer (stop-exclusive)
 //
-// `pypy/objspace/std/intobject.py:873-897` `setup_prebuilt` / `wrapint`
+// `pypy/objspace/std/intobject.py` `setup_prebuilt` / `wrapint`
 // consult these three constants. Pyre keeps them as translation-time
 // constants since pyre has no live `space.config` surface — the exact
 // PyPy default (`WITHPREBUILTINT=false`) is used to keep `wrapint`'s
@@ -72,12 +72,12 @@ impl crate::lltype::GcType for W_IntObjectUser {
     const SIZE: usize = W_INT_USER_OBJECT_SIZE;
 }
 
-/// `intobject.py:873-880 setup_prebuilt`. Empty when
+/// `intobject.py setup_prebuilt`. Empty when
 /// `WITHPREBUILTINT=false`; populated `[PREBUILTINTFROM, PREBUILTINTTO)`
 /// (stop-exclusive) when `true`.
 struct PrebuiltInts(Vec<W_IntObject>);
 
-// `intobject.py:873-880 setup_prebuilt` publishes exact, immutable ints for
+// `intobject.py setup_prebuilt` publishes exact, immutable ints for
 // process lifetime. Wrapping the contiguous allocation as Sync preserves that
 // shared upstream owner without making mutable subclass instances globally
 // shareable.
@@ -101,7 +101,7 @@ static SMALL_INTS: LazyLock<PrebuiltInts> = LazyLock::new(|| {
     )
 });
 
-/// `pypy/objspace/std/intobject.py:903-921 wrapint` parity.
+/// `pypy/objspace/std/intobject.py wrapint` parity.
 ///
 /// `withprebuiltint=False` (PyPy default) → always allocate fresh,
 /// matching upstream `return W_IntObject(x)`. With the flag enabled
@@ -189,7 +189,7 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// copying a stack-built struct over it. Returns null when no collector owns
 /// the heap, which is the caller's signal to take the `malloc_typed` arm.
 ///
-/// Residualised (`rlib/jit.py:139 @dont_look_inside`) rather than traced,
+/// Residualised (`rlib/jit.py @dont_look_inside`) rather than traced,
 /// which [`w_int_new`] is not — a deviation this arm alone carries, because
 /// neither spelling of it reaches the trace intact. Writing the fields into
 /// the collector's block, as below, lands the header's own `ob_type` slot at
@@ -326,9 +326,9 @@ pub fn w_int_small_cache_base_ptr() -> PyObjectRef {
     SMALL_INTS.0.as_ptr().cast_mut() as PyObjectRef
 }
 
-/// `intobject.py:516 _bit_count` parity — population count of an i64.
+/// `intobject.py _bit_count` parity — population count of an i64.
 ///
-/// `@jit.elidable` (`rlib/jit.py:13`): deterministic, no allocation,
+/// `@jit.elidable` (`rlib/jit.py`): deterministic, no allocation,
 /// no raise → `EF_ELIDABLE_CANNOT_RAISE` (`call.py:299`).
 ///
 /// Line-by-line port of the upstream RPython loop; `i64::MIN` is
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(INT_INTVAL_OFFSET, 16);
     }
 
-    /// `intobject.py:884 wrapint` parity: with `withprebuiltint=False`
+    /// `intobject.py wrapint` parity: with `withprebuiltint=False`
     /// (PyPy default, mirrored by `WITHPREBUILTINT=false`) every call
     /// allocates a fresh `W_IntObject`, so identity is per-call.
     #[test]
@@ -416,7 +416,7 @@ mod tests {
         }
     }
 
-    /// `intobject.py:891-895 wrapint` in-cache branch — only meaningful
+    /// `intobject.py wrapint` in-cache branch — only meaningful
     /// when `WITHPREBUILTINT=true`. Skipped otherwise (no prebuilt
     /// pool means there is no boundary to test).
     #[test]
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(W_INT_GC_TYPE_ID, 1);
     }
 
-    /// `intobject.py:516 _bit_count` parity — verifies the popcount
+    /// `intobject.py _bit_count` parity — verifies the popcount
     /// against `i64::count_ones`, including the `i64::MIN` sentinel
     /// which the upstream short-circuits to `1`.
     #[test]

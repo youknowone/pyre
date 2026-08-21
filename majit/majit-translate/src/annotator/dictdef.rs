@@ -19,7 +19,7 @@
 //!   [`super::listdef::ItemOwner::DictValue`] variants consulted by
 //!   the shared `ListItem::merge` patch loop.
 //!
-//! * `DictKey.emulate_rdict_calls` (dictdef.py:43-66) dispatches
+//! * `DictKey.emulate_rdict_calls` (dictdef.py) dispatches
 //!   `eq` + `hash` as `bookkeeper.emulate_pbc_call` pairs and
 //!   validates return annotations against `SomeBool` / `SomeInteger`.
 
@@ -30,7 +30,7 @@ use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
 use super::listdef::{ItemOwner, ListItem};
 use super::model::{SomeBool, SomeInteger, SomeValue, UnionError, union};
 
-/// RPython `class DictKey(ListItem)` (dictdef.py:7-66). Zero-sized
+/// RPython `class DictKey(ListItem)` (dictdef.py). Zero-sized
 /// namespace for the subclass constructor + `merge` override. The
 /// subclass-specific `custom_eq_hash` / `s_rdict_eqfn` /
 /// `s_rdict_hashfn` fields live on [`ListItem`] itself (see that
@@ -52,12 +52,12 @@ impl DictKey {
         is_r_dict: bool,
     ) -> Rc<RefCell<ListItem>> {
         let mut item = ListItem::new(bookkeeper, s_value);
-        // upstream: `self.custom_eq_hash = is_r_dict` (dictdef.py:13).
+        // upstream: `self.custom_eq_hash = is_r_dict` (dictdef.py).
         item.custom_eq_hash = is_r_dict;
         Rc::new(RefCell::new(item))
     }
 
-    /// RPython `DictKey.merge(self, other)` (dictdef.py:19-27).
+    /// RPython `DictKey.merge(self, other)` (dictdef.py).
     ///
     /// Wraps [`ListItem::merge`] with the `custom_eq_hash` mixing-guard
     /// from upstream line 21-22 and propagates `update_rdict_annotations`
@@ -121,7 +121,7 @@ impl DictKey {
             b.s_rdict_eqfn = new_eqfn;
             b.s_rdict_hashfn = new_hashfn;
         }
-        // upstream: `self.emulate_rdict_calls(other=other)` (dictdef.py:41
+        // upstream: `self.emulate_rdict_calls(other=other)` (dictdef.py
         // tail). Performs two `bookkeeper.emulate_pbc_call` dispatches —
         // one for eq, one for hash — and validates the return annotations
         // against `s_Bool` / `SomeInteger` (dictdef.py:56-66), raising
@@ -129,7 +129,7 @@ impl DictKey {
         Self::emulate_rdict_calls(self_li)
     }
 
-    /// RPython `DictKey.generalize(s_other_value)` (dictdef.py:29-33).
+    /// RPython `DictKey.generalize(s_other_value)` (dictdef.py).
     ///
     /// Wraps [`ListItem::generalize`] with the rdict eq/hash
     /// re-validation that upstream runs when the key lattice widens
@@ -154,7 +154,7 @@ impl DictKey {
         Ok(updated)
     }
 
-    /// RPython `DictKey.emulate_rdict_calls(other=None)` (dictdef.py:43-66).
+    /// RPython `DictKey.emulate_rdict_calls(other=None)` (dictdef.py).
     ///
     fn emulate_rdict_calls(self_li: &Rc<RefCell<ListItem>>) -> Result<(), UnionError> {
         let (bookkeeper, s_key, s_eqfn, s_hashfn) = {
@@ -222,7 +222,7 @@ impl DictKey {
     }
 }
 
-/// RPython `class DictValue(ListItem)` (dictdef.py:69-72). Zero-sized
+/// RPython `class DictValue(ListItem)` (dictdef.py). Zero-sized
 /// namespace for the subclass's `patch()` override; retargeting
 /// lands through [`ItemOwner::DictValue`].
 #[derive(Debug)]
@@ -230,7 +230,7 @@ pub struct DictValue;
 
 impl DictValue {
     /// Upstream has no explicit `DictValue.__init__` — it inherits
-    /// [`ListItem::__init__`] verbatim (dictdef.py:69). Keep the
+    /// [`ListItem::__init__`] verbatim (dictdef.py). Keep the
     /// factory on the subclass namespace so `DictDef::new` mirrors the
     /// upstream `DictValue(bookkeeper, s_value)` call shape.
     #[expect(
@@ -260,20 +260,20 @@ pub(crate) struct DictDefInner {
     pub(crate) dictkey: RefCell<Rc<RefCell<ListItem>>>,
     /// Current value cell; retargetable via shared ref.
     pub(crate) dictvalue: RefCell<Rc<RefCell<ListItem>>>,
-    /// upstream `self.force_non_null` (dictdef.py:90).
+    /// upstream `self.force_non_null` (dictdef.py).
     pub force_non_null: bool,
-    /// upstream `self.simple_hash_eq` (dictdef.py:91).
+    /// upstream `self.simple_hash_eq` (dictdef.py).
     pub simple_hash_eq: bool,
 }
 
-/// RPython `class DictDef` (dictdef.py:75-117).
+/// RPython `class DictDef` (dictdef.py).
 #[derive(Clone)]
 pub struct DictDef {
     pub(crate) inner: Rc<DictDefInner>,
 }
 
 impl std::fmt::Debug for DictDef {
-    /// Parity with `DictDef.__repr__` (dictdef.py:116):
+    /// Parity with `DictDef.__repr__` (dictdef.py):
     /// `'<{%r: %r}>'`, recursion-guarded (shared [`ReprGuard`]) so a
     /// self-referential key/value type elides instead of overflowing.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -318,12 +318,12 @@ impl DictDef {
             force_non_null,
             simple_hash_eq,
         });
-        // upstream: `self.dictkey.itemof[self] = True` (dictdef.py:87).
+        // upstream: `self.dictkey.itemof[self] = True` (dictdef.py).
         key_li
             .borrow_mut()
             .itemof
             .push(ItemOwner::DictKey(Rc::downgrade(&inner)));
-        // upstream: `self.dictvalue.itemof[self] = True` (dictdef.py:89).
+        // upstream: `self.dictvalue.itemof[self] = True` (dictdef.py).
         value_li
             .borrow_mut()
             .itemof
@@ -331,7 +331,7 @@ impl DictDef {
         DictDef { inner }
     }
 
-    /// RPython `DictDef.same_as(other)` (dictdef.py:101-103): identity
+    /// RPython `DictDef.same_as(other)` (dictdef.py): identity
     /// on BOTH the key cell AND the value cell.
     pub fn same_as(&self, other: &DictDef) -> bool {
         let ak = self.inner.dictkey.borrow();
@@ -341,11 +341,11 @@ impl DictDef {
         Rc::ptr_eq(&*ak, &*bk) && Rc::ptr_eq(&*av, &*bv)
     }
 
-    /// RPython `DictDef.union(other)` (dictdef.py:105-108).
+    /// RPython `DictDef.union(other)` (dictdef.py).
     ///
     /// Dispatches key / value merges through [`DictKey::merge`] and
     /// [`DictValue::merge`] so the `custom_eq_hash` mixing guard and
-    /// `update_rdict_annotations` propagation from dictdef.py:19-27
+    /// `update_rdict_annotations` propagation from dictdef.py
     /// fire at the correct override layer.
     pub fn union_with(&self, other: &DictDef) -> Result<(), UnionError> {
         let self_k = self.inner.dictkey.borrow().clone();
@@ -384,7 +384,7 @@ impl DictDef {
         self.inner.dictvalue.borrow().clone()
     }
 
-    /// RPython `DictDef.read_key(position_key)` (dictdef.py:93-95).
+    /// RPython `DictDef.read_key(position_key)` (dictdef.py).
     ///
     /// `position_key` is `Option` to preserve upstream's "no reflow
     /// frame active → `None` position" flow; `None` is just dropped
@@ -400,7 +400,7 @@ impl DictDef {
         li_mut.s_value.clone()
     }
 
-    /// RPython `DictDef.read_value(position_key)` (dictdef.py:97-99).
+    /// RPython `DictDef.read_value(position_key)` (dictdef.py).
     pub(crate) fn read_value(&self, position_key: Option<PositionKey>) -> SomeValue {
         let li = self.inner.dictvalue.borrow().clone();
         let mut li_mut = li.borrow_mut();
@@ -410,7 +410,7 @@ impl DictDef {
         li_mut.s_value.clone()
     }
 
-    /// RPython `DictDef.generalize_key(s_key)` (dictdef.py:110-111).
+    /// RPython `DictDef.generalize_key(s_key)` (dictdef.py).
     ///
     /// Routes through [`DictKey::generalize`] so the subclass override
     /// (dictdef.py:29-33) fires: when widening a r_dict key cell
@@ -422,7 +422,7 @@ impl DictDef {
         DictKey::generalize(&li, s_key)
     }
 
-    /// RPython `DictDef.generalize_value(s_value)` (dictdef.py:113-114).
+    /// RPython `DictDef.generalize_value(s_value)` (dictdef.py).
     pub fn generalize_value(&self, s_value: &SomeValue) -> Result<bool, UnionError> {
         let li = self.inner.dictvalue.borrow().clone();
         let mut li_mut = li.borrow_mut();

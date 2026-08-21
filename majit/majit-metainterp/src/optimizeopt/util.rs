@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 
 use majit_ir::operand::Operand;
 
-/// util.py:100-111 `args_eq`.
+/// util.py `args_eq`.
 ///
 /// Uses `same_box`, so constants compare by value while regular boxes compare
 /// by object identity.
@@ -26,7 +26,7 @@ pub fn args_eq(args1: &[Option<Operand>], args2: &[Option<Operand>]) -> bool {
             })
 }
 
-/// util.py:113-122 `args_hash`.
+/// util.py `args_hash`.
 ///
 /// The exact Python integer hash width is not part of Rust's hash API; this
 /// preserves the load-bearing contract with `args_eq`: equal argument lists

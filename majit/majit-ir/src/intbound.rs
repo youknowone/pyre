@@ -173,7 +173,7 @@ impl IntBound {
     }
 
     /// TODO: RPython's keyword-default constructor
-    /// `IntBound(lower=lower, upper=upper)` (intutils.py:81-115) leaves
+    /// `IntBound(lower=lower, upper=upper)` (intutils.py) leaves
     /// `tvalue` / `tmask` at the `TNUM_ONLY_VALUE_DEFAULT` (= 0) and
     /// `TNUM_ONLY_MASK_DEFAULT` (= TNUM_UNKNOWN = r_uint(-1)) defaults
     /// while still running `shrink()`. Rust has no keyword defaults so
@@ -212,7 +212,7 @@ impl IntBound {
         self.tmask == 0
     }
 
-    /// intutils.py:448 `get_constant_int` — return the known constant value
+    /// intutils.py `get_constant_int` — return the known constant value
     /// (panics if not constant).
     pub fn get_constant_int(&self) -> i64 {
         debug_assert!(self.is_constant());
@@ -224,7 +224,7 @@ impl IntBound {
         self.lower >= 0
     }
 
-    /// intutils.py:1318-1329 `IntBound.getnullness()` parity (line-by-line port).
+    /// intutils.py `IntBound.getnullness()` parity (line-by-line port).
     ///
     /// ```python
     /// def getnullness(self):
@@ -250,7 +250,7 @@ impl IntBound {
         }
     }
 
-    /// intutils.py:243-247 `_are_knownbits_implied` — true when the stored
+    /// intutils.py `_are_knownbits_implied` — true when the stored
     /// known-bits tnum equals the tnum implied by the lower/upper bounds.
     pub fn are_knownbits_implied(&self) -> bool {
         let (implied_tvalue, implied_tmask) = self._tnum_implied_by_bounds();

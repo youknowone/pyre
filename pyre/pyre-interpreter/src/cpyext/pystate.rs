@@ -9,7 +9,7 @@
 //! -- cffi's embedding header calls them.
 //!
 //! `PyThreadState` is opaque.  Upstream keeps one per execution context and
-//! records whether it is the current one (`pystate.py:179 PyThreadState_Get`,
+//! records whether it is the current one (`pystate.py PyThreadState_Get`,
 //! `:228 PyThreadState_Swap` through `ec.cpyext_threadstate_is_current`); the
 //! same pair here is per thread, since that is what an extension can name.
 
@@ -63,7 +63,7 @@ fn thread_state() -> *mut CPyThreadState {
     THREAD_STATE.with(|state| state.get())
 }
 
-/// `pystate.py:29 PyEval_SaveThread` — drop the GIL, and answer the state the
+/// `pystate.py PyEval_SaveThread` — drop the GIL, and answer the state the
 /// matching [`PyEval_RestoreThread`] is to be handed back.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyEval_SaveThread() -> *mut CPyThreadState {
@@ -73,7 +73,7 @@ pub unsafe extern "C" fn PyEval_SaveThread() -> *mut CPyThreadState {
     state
 }
 
-/// `pystate.py:42 PyEval_RestoreThread` — retake the GIL.
+/// `pystate.py PyEval_RestoreThread` — retake the GIL.
 ///
 /// The argument is the state [`PyEval_SaveThread`] answered with, which for any
 /// one thread is the only state it can be: the release is bound to the thread
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn PyEval_ReleaseThread(_state: *mut CPyThreadState) {
     unsafe { PyEval_SaveThread() };
 }
 
-/// `pystate.py:179 PyThreadState_Get`.
+/// `pystate.py PyThreadState_Get`.
 ///
 /// There is no state to answer with while this thread's is not current, and no
 /// way to say so: the return is a state and every caller reads it.  So the
@@ -115,7 +115,7 @@ pub unsafe extern "C" fn PyThreadState_Get() -> *mut CPyThreadState {
     thread_state()
 }
 
-/// `pystate.py:188 _PyThreadState_UncheckedGet` — [`PyThreadState_Get`]
+/// `pystate.py _PyThreadState_UncheckedGet` — [`PyThreadState_Get`]
 /// without the fatal error, so NULL when this thread's state is not current.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _PyThreadState_UncheckedGet() -> *mut CPyThreadState {
@@ -126,7 +126,7 @@ pub unsafe extern "C" fn _PyThreadState_UncheckedGet() -> *mut CPyThreadState {
     }
 }
 
-/// `pystate.py:228 PyThreadState_Swap` — make `state` the current one and
+/// `pystate.py PyThreadState_Swap` — make `state` the current one and
 /// answer the one it replaces, or NULL if there was none.
 ///
 /// Upstream refuses to switch to a *different* thread state, which is the only
@@ -143,7 +143,7 @@ pub unsafe extern "C" fn PyThreadState_Swap(state: *mut CPyThreadState) -> *mut 
     previous
 }
 
-/// `pystate.py:418 PyGILState_Check` — whether this thread holds the GIL.
+/// `pystate.py PyGILState_Check` — whether this thread holds the GIL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyGILState_Check() -> c_int {
     crate::module::thread::gilstate_check() as c_int
@@ -189,12 +189,12 @@ pub unsafe extern "C" fn PyInterpreterState_GetID(interp: *mut CPyInterpreterSta
     0
 }
 
-/// `pystate.py:51 PyEval_InitThreads` — threads are always available, so
+/// `pystate.py PyEval_InitThreads` — threads are always available, so
 /// upstream's `setup_threads` has nothing left to do here.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyEval_InitThreads() {}
 
-/// `pystate.py:57 PyEval_ThreadsInitialized`.
+/// `pystate.py PyEval_ThreadsInitialized`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyEval_ThreadsInitialized() -> c_int {
     1

@@ -92,7 +92,7 @@ pub(super) fn extract_pat_literals(pat: &Pat) -> Option<Vec<i64>> {
 /// `TokenStream` expression (`#path as i64` or `#lit as i64`) that is valid
 /// in generated Rust code where the constant is in scope.
 ///
-/// pyopcode.py:183+ if/elif dispatch over opcode constants (e.g. `OP_NOP`,
+/// pyopcode.py+ if/elif dispatch over opcode constants (e.g. `OP_NOP`,
 /// `OP_INC_A`) that are defined as symbolic constants, not inline literals.
 pub(super) fn extract_pat_value_tokens(pat: &Pat) -> Option<Vec<TokenStream>> {
     match pat {
@@ -485,7 +485,7 @@ pub(super) fn inline_builder_path(expr: &Expr) -> Option<Path> {
 /// `__prebuild_jitcode_liveness_*` so the helper's per-marker
 /// triples land in `asm.all_liveness` before
 /// `metainterp_sd.liveness_info` snapshot, matching RPython
-/// `pyjitpl.py:2255 finish_setup` order.
+/// `pyjitpl.py finish_setup` order.
 pub(super) fn inline_prebuild_path(expr: &Expr) -> Option<Path> {
     let Expr::Path(ExprPath { path, .. }) = expr else {
         return None;
@@ -522,7 +522,7 @@ pub(crate) fn helper_policy_path(expr: &Expr) -> Option<Path> {
 
 /// Emit the int-binop recording call for `dst = lhs <op> rhs`.
 ///
-/// `jtransform.py:576-577` rewrites `int_floordiv` / `int_mod` to the
+/// `jtransform.py` rewrites `int_floordiv` / `int_mod` to the
 /// `int.py_div` / `int.py_mod` oopspec builtin call (no `bhimpl_int_*`
 /// primitive exists), so those route to `record_int_py_div` /
 /// `record_int_py_mod` (residual call to `ll_int_py_div` / `ll_int_py_mod`);

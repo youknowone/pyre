@@ -30,8 +30,8 @@ use pyre_object::unicodeobject::{
 use rustpython_wtf8::Wtf8Buf;
 
 /// FieldDescr for `W_UnicodeObject.byte_len` — UTF-8 byte count.
-/// RPython STR is `Array(Char)` byte string (`rstr.py:1226`);
-/// `llmodel.py:667 bh_strlen` reads byte count.
+/// RPython STR is `Array(Char)` byte string (`rstr.py`);
+/// `llmodel.py bh_strlen` reads byte count.
 #[derive(Debug)]
 struct PyreStrByteLenFieldDescr;
 
@@ -87,7 +87,7 @@ impl FieldDescr for PyreUnicodeLenFieldDescr {
     }
 }
 
-/// ArrayDescr for STR (byte string per `rstr.py:1226 Array(Char)`).
+/// ArrayDescr for STR (byte string per `rstr.py Array(Char)`).
 /// `len_descr` → `byte_len` field.
 #[derive(Debug)]
 struct PyreStrDescr;
@@ -193,8 +193,8 @@ impl Cpu for PyreCpu {
     }
 
     fn bh_strlen(&self, string: GcRef) -> Option<i64> {
-        // RPython STR is `Array(Char)` byte string (`rstr.py:1226-1228`);
-        // `llmodel.py:667 bh_strlen` returns the byte count.
+        // RPython STR is `Array(Char)` byte string (`rstr.py`);
+        // `llmodel.py bh_strlen` returns the byte count.
         // `str_descr().len_descr()` reads `W_UnicodeObject.byte_len` for the
         // compiled path; this override follows the `*mut Wtf8Buf` indirection
         // directly for the blackhole interpreter path.
@@ -211,7 +211,7 @@ impl Cpu for PyreCpu {
     }
 
     fn bh_strgetitem(&self, string: GcRef, index: i64) -> Option<i64> {
-        // RPython STR is `Array(Char)` byte string (`rstr.py:1226-1228`);
+        // RPython STR is `Array(Char)` byte string (`rstr.py`);
         // STRGETITEM returns `ord(char)` = byte value.
         // `intbounds.rs`'s `propagate_postprocess` narrows the result to `[0, 255]`
         // (`vstring.py:393-400 IntBound.make_ge(0).make_lt(256)`).

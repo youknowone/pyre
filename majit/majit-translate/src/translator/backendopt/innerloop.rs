@@ -32,7 +32,7 @@ impl Hash for BlockVertex {
     }
 }
 
-/// `class Loop` at `innerloop.py:10-14`.
+/// `class Loop` at `innerloop.py`.
 pub struct Loop {
     pub headblock: BlockRef,
     /// list of Links making the cycle, starting from one of the exits
@@ -161,8 +161,8 @@ pub fn find_inner_loops(
         let mut num_loop_constants = 0i64;
         // `Block.inputargs` is `Vec<Hlvalue>`, the faithful port of upstream
         // `self.inputargs = list(inputargs)  # mixed list of variable/const`
-        // (model.py:176): the stored list is untyped, and `checkgraph`'s
-        // `definevar` (model.py:586 `assert isinstance(v, Variable)`, mirrored
+        // (model.py): the stored list is untyped, and `checkgraph`'s
+        // `definevar` (model.py `assert isinstance(v, Variable)`, mirrored
         // in `flowspace/model.rs`'s `checkgraph`) enforces the
         // Variable-only shape only on
         // well-formed graphs. Iterating it (`innerloop.py:87`) and handing
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(loops[0].links.len(), 2);
     }
 
-    /// Parity with `test_innerloop.py:23 test_two_loops`: two sequential
+    /// Parity with `test_innerloop.py test_two_loops`: two sequential
     /// `while` loops are returned as two non-overlapping `Loop`s.
     #[test]
     fn two_sequential_loops_are_both_found() {
@@ -406,7 +406,7 @@ mod tests {
         }
     }
 
-    /// Parity with `test_innerloop.py:44 test_nested_loops`: the inner
+    /// Parity with `test_innerloop.py test_nested_loops`: the inner
     /// loop carries more loop-constant families, so it sorts first and the
     /// overlapping outer loop is dropped — only the inner loop is returned.
     #[test]

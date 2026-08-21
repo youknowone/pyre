@@ -1,4 +1,4 @@
-//! Port of `rpython/jit/metainterp/jitprof.py:52-122 Profiler`.
+//! Port of `rpython/jit/metainterp/jitprof.py Profiler`.
 //!
 //! RPython carries `counters: list[int]` indexed by `Counters.*` (rlib/jit.py:
 //! 1414-1442) and a separate `calls: int` for the CALL+RECORDED_OPS path.
@@ -58,11 +58,11 @@ use majit_ir::OpCode;
 
 use crate::pyjitpl::counters;
 
-/// jitprof.py:16 `BaseProfiler`.
+/// jitprof.py `BaseProfiler`.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BaseProfiler;
 
-/// jitprof.py:19-50 `EmptyProfiler`.
+/// jitprof.py `EmptyProfiler`.
 ///
 /// Used by upstream tests and by `WarmRunnerDesc(...,
 /// ProfilerClass=EmptyProfiler)` when statistics collection is disabled.
@@ -70,7 +70,7 @@ pub struct BaseProfiler;
 /// this no-op surface keeps the translated module shape aligned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmptyProfiler {
-    /// jitprof.py:20 `initialized = True`.
+    /// jitprof.py `initialized = True`.
     pub initialized: bool,
 }
 
@@ -130,10 +130,10 @@ impl EmptyProfiler {
 /// [`owner_thread`]: TimingState::owner_thread
 #[derive(Default, Debug)]
 struct TimingState {
-    /// `self.starttime` (`jitprof.py:64`) — fixed profile start mark;
+    /// `self.starttime` (`jitprof.py`) — fixed profile start mark;
     /// `_print_stats`'s TOTAL line is `tk - starttime`.
     starttime: Option<Instant>,
-    /// `self.tk` (`jitprof.py:71`) — set by `finish()` just before
+    /// `self.tk` (`jitprof.py`) — set by `finish()` just before
     /// `print_stats()`.
     tk: Option<Instant>,
     /// `self.t1` (`jitprof.py:56`) — timer baseline for the next
@@ -154,7 +154,7 @@ struct TimingState {
     owner_thread: Option<std::thread::ThreadId>,
 }
 
-/// jitprof.py:52-122 `Profiler` — every `Counters.*` slot is one
+/// jitprof.py `Profiler` — every `Counters.*` slot is one
 /// `AtomicUsize`, plus the standalone `calls` counter that
 /// `count_ops` increments on the CALL_*+RECORDED_OPS path
 /// (jitprof.py:121-122).
@@ -193,7 +193,7 @@ struct TimingState {
 /// `note_force_quasi_immut_abort`, which stages the reason so the single
 /// `aborted_tracing` that follows tallies it here instead of in the `Generic`
 /// catch-all — the stand-in for the reason
-/// `opimpl_jit_force_quasi_immutable` (`pyjitpl.py:1094-1118`) carries on the
+/// `opimpl_jit_force_quasi_immutable` (`pyjitpl.py`) carries on the
 /// `SwitchToBlackhole` instance it raises.
 ///
 /// The mapdict producer runs only when `PYRE_QMUT_MAPDICT_FORCE` is present in
@@ -215,71 +215,71 @@ pub const ABORT_COUNTER_KINDS: &[(i32, &str)] = &[
 
 #[derive(Default, Debug)]
 pub struct JitProfiler {
-    /// jit.py:1416 `Counters.TRACING` — RPython tracks this as wall-clock
-    /// time + entry count via `_start`/`_end` (jitprof.py:75-93).
+    /// jit.py `Counters.TRACING` — RPython tracks this as wall-clock
+    /// time + entry count via `_start`/`_end` (jitprof.py).
     pub tracing: AtomicUsize,
-    /// jit.py:1417 `Counters.BACKEND` — same shape as TRACING.
+    /// jit.py `Counters.BACKEND` — same shape as TRACING.
     pub backend: AtomicUsize,
     /// Accumulated nanoseconds for `Counters.TRACING`.
     pub tracing_time_ns: AtomicU64,
     /// Accumulated nanoseconds for `Counters.BACKEND`.
     pub backend_time_ns: AtomicU64,
-    /// jit.py:1418 `Counters.OPS` — every executed op
+    /// jit.py `Counters.OPS` — every executed op
     /// (`execute_and_record_varargs` / `execute_and_record`,
     /// pyjitpl.py:2629/2645).
     pub ops: AtomicUsize,
-    /// jit.py:1419 `Counters.HEAPCACHED_OPS` — folded-away ops that the
+    /// jit.py `Counters.HEAPCACHED_OPS` — folded-away ops that the
     /// heapcache resolved without recording (pyjitpl.py:388/397/562/...).
     pub heapcached_ops: AtomicUsize,
-    /// jit.py:1420 `Counters.RECORDED_OPS` — ops that survived the
+    /// jit.py `Counters.RECORDED_OPS` — ops that survived the
     /// heapcache and reached `_record_helper` / `_record_helper_varargs`
     /// (pyjitpl.py:2658/2669).
     pub recorded_ops: AtomicUsize,
-    /// jit.py:1421 `Counters.GUARDS` — guards counted by the trace
+    /// jit.py `Counters.GUARDS` — guards counted by the trace
     /// recorder (pyjitpl.py:2581).
     pub guards: AtomicUsize,
-    /// jit.py:1422 `Counters.OPT_OPS` — every op the optimizer emits
-    /// (optimizer.py:626 inside `_emit_operation`).
+    /// jit.py `Counters.OPT_OPS` — every op the optimizer emits
+    /// (optimizer.py inside `_emit_operation`).
     pub opt_ops: AtomicUsize,
-    /// jit.py:1423 `Counters.OPT_GUARDS` — guards emitted by the
+    /// jit.py `Counters.OPT_GUARDS` — guards emitted by the
     /// optimizer (optimizer.py:629).
     pub opt_guards: AtomicUsize,
-    /// jit.py:1424 `Counters.OPT_GUARDS_SHARED` — guards that share
+    /// jit.py `Counters.OPT_GUARDS_SHARED` — guards that share
     /// resume data with a previous guard via descriptor fusion
     /// (optimizer.py:673-674).
     pub opt_guards_shared: AtomicUsize,
-    /// jit.py:1425 `Counters.OPT_FORCINGS`.
+    /// jit.py `Counters.OPT_FORCINGS`.
     pub opt_forcings: AtomicUsize,
-    /// jit.py:1426 `Counters.OPT_VECTORIZE_TRY` — entries into the
+    /// jit.py `Counters.OPT_VECTORIZE_TRY` — entries into the
     /// vector pass (vector.py:139).
     pub opt_vectorize_try: AtomicUsize,
-    /// jit.py:1427 `Counters.OPT_VECTORIZED` — successful vectorise
+    /// jit.py `Counters.OPT_VECTORIZED` — successful vectorise
     /// (vector.py:146).
     pub opt_vectorized: AtomicUsize,
-    /// jit.py:1428 `Counters.ABORT_TOO_LONG`.
+    /// jit.py `Counters.ABORT_TOO_LONG`.
     pub abort_too_long: AtomicUsize,
-    /// jit.py:1429 `Counters.ABORT_BRIDGE`.
+    /// jit.py `Counters.ABORT_BRIDGE`.
     pub abort_bridge: AtomicUsize,
-    /// jit.py:1430 `Counters.ABORT_BAD_LOOP`.
+    /// jit.py `Counters.ABORT_BAD_LOOP`.
     pub abort_bad_loop: AtomicUsize,
-    /// jit.py:1431 `Counters.ABORT_ESCAPE`.
+    /// jit.py `Counters.ABORT_ESCAPE`.
     pub abort_escape: AtomicUsize,
-    /// jit.py:1432 `Counters.ABORT_FORCE_QUASIIMMUT`.
+    /// jit.py `Counters.ABORT_FORCE_QUASIIMMUT`.
     pub abort_force_quasiimmut: AtomicUsize,
-    /// jit.py:1433 `Counters.ABORT_SEGMENTED_TRACE`.
+    /// jit.py `Counters.ABORT_SEGMENTED_TRACE`.
     pub abort_segmented_trace: AtomicUsize,
-    /// jit.py:1434 `Counters.FORCE_VIRTUALIZABLES`.
+    /// jit.py `Counters.FORCE_VIRTUALIZABLES`.
     pub force_virtualizables: AtomicUsize,
-    /// jit.py:1435 `Counters.NVIRTUALS`.
+    /// jit.py `Counters.NVIRTUALS`.
     pub nvirtuals: AtomicUsize,
-    /// jit.py:1436 `Counters.NVHOLES`.
+    /// jit.py `Counters.NVHOLES`.
     pub nvholes: AtomicUsize,
-    /// jit.py:1437 `Counters.NVREUSED`.
+    /// jit.py `Counters.NVREUSED`.
     pub nvreused: AtomicUsize,
     /// jitprof.Profiler.calls — `count_ops` increments this when the op
     /// is a CALL_* and `kind == RECORDED_OPS` (jitprof.py:121-122).
     pub calls: AtomicUsize,
-    /// pyjitpl.py:2300-2302 `_setup_once` guard — `if not
+    /// pyjitpl.py `_setup_once` guard — `if not
     /// self.profiler.initialized: self.profiler.start(); ...
     /// initialized = True`.  RPython keeps this flag separate from
     /// `Profiler.start()`: `start()` always resets counters, while
@@ -310,7 +310,7 @@ pub struct JitProfiler {
 pub type Profiler = JitProfiler;
 
 impl JitProfiler {
-    /// jitprof.py:55-61 `Profiler.start`.
+    /// jitprof.py `Profiler.start`.
     ///
     /// Not idempotent by design: upstream `Profiler.start()` resets
     /// `self.counters` and `self.calls` every time it is called.  The
@@ -352,7 +352,7 @@ impl JitProfiler {
         }
         self.tracing_time_ns.store(0, Ordering::Relaxed);
         self.backend_time_ns.store(0, Ordering::Relaxed);
-        // `jitprof.py:64-69 start()`:
+        // `jitprof.py start()`:
         //   self.starttime = self.timer()
         //   self.t1 = self.starttime
         //   ...
@@ -366,7 +366,7 @@ impl JitProfiler {
         state.owner_thread = None;
     }
 
-    /// jitprof.py:71-73 `Profiler.finish`.
+    /// jitprof.py `Profiler.finish`.
     ///
     /// ```text
     ///  def finish(self):
@@ -381,7 +381,7 @@ impl JitProfiler {
         self.print_stats();
     }
 
-    /// jitprof.py:124-128 `Profiler.print_stats` — emit the
+    /// jitprof.py `Profiler.print_stats` — emit the
     /// `jit-summary` section (visible under `MAJIT_LOG`).
     pub fn print_stats(&self) {
         crate::debug::debug_start("jit-summary");
@@ -391,7 +391,7 @@ impl JitProfiler {
         crate::debug::debug_stop("jit-summary");
     }
 
-    /// jitprof.py:130-174 `Profiler._print_stats` — line set, order,
+    /// jitprof.py `Profiler._print_stats` — line set, order,
     /// and layout are upstream's.
     fn _print_stats(&self) {
         let snap = self.snapshot();
@@ -439,7 +439,7 @@ impl JitProfiler {
         intline("nvreused", snap.nvreused);
         intline("vecopt tried", snap.opt_vectorize_try);
         intline("vecopt success", snap.opt_vectorized);
-        // jitprof.py:166-174 `if cpu is not None:` — pyre's tracker Arc
+        // jitprof.py `if cpu is not None:` — pyre's tracker Arc
         // is always bound (a fresh one before `set_cpu_tracker`).
         let tracker = self
             .cpu_tracker
@@ -464,27 +464,27 @@ impl JitProfiler {
         );
     }
 
-    /// jitprof.py:95 `Profiler.start_tracing`.
+    /// jitprof.py `Profiler.start_tracing`.
     pub fn start_tracing(&self) {
         self.start_event(counters::TRACING);
     }
 
-    /// jitprof.py:96 `Profiler.end_tracing`.
+    /// jitprof.py `Profiler.end_tracing`.
     pub fn end_tracing(&self) {
         self.end_event(counters::TRACING);
     }
 
-    /// jitprof.py:98 `Profiler.start_backend`.
+    /// jitprof.py `Profiler.start_backend`.
     pub fn start_backend(&self) {
         self.start_event(counters::BACKEND);
     }
 
-    /// jitprof.py:99 `Profiler.end_backend`.
+    /// jitprof.py `Profiler.end_backend`.
     pub fn end_backend(&self) {
         self.end_event(counters::BACKEND);
     }
 
-    /// jitprof.py:118-122 `Profiler.count_ops(opnum, kind=Counters.OPS)`.
+    /// jitprof.py `Profiler.count_ops(opnum, kind=Counters.OPS)`.
     ///
     /// ```python
     /// def count_ops(self, opnum, kind=Counters.OPS):
@@ -518,7 +518,7 @@ impl JitProfiler {
         }
     }
 
-    /// jitprof.py:101-102 `Profiler.count(kind, inc=1)`.
+    /// jitprof.py `Profiler.count(kind, inc=1)`.
     ///
     /// ```python
     /// def count(self, kind, inc=1):
@@ -546,7 +546,7 @@ impl JitProfiler {
         }
     }
 
-    /// jitprof.py:104-113 `Profiler.get_counter(num)` — single-counter
+    /// jitprof.py `Profiler.get_counter(num)` — single-counter
     /// readback via `Counters.*` id.  PyPy routes `TOTAL_COMPILED_*` /
     /// `TOTAL_FREED_*` (ids 22..25) to `self.cpu.tracker.total_*`; pyre
     /// reads from `self.cpu_tracker` for the same four ids and from
@@ -615,7 +615,7 @@ impl JitProfiler {
         f(&tracker)
     }
 
-    /// jitprof.py:115-116 `Profiler.get_times(num)` — seconds.
+    /// jitprof.py `Profiler.get_times(num)` — seconds.
     pub fn get_times(&self, kind: i32) -> Option<f64> {
         self.time_field_for_kind(kind)
             .map(|field| field.load(Ordering::Relaxed) as f64 / 1_000_000_000.0)
@@ -626,7 +626,7 @@ impl JitProfiler {
     /// Each load is `Relaxed`, so the returned snapshot is **not**
     /// guaranteed to be a single coherent read across counters — only
     /// each individual counter's value is consistent with itself.
-    /// Mirrors RPython where `_print_stats` (jitprof.py:130-174) reads
+    /// Mirrors RPython where `_print_stats` (jitprof.py) reads
     /// each `cnt[Counters.X]` one-by-one without any locking.
     pub fn snapshot(&self) -> JitProfilerSnapshot {
         JitProfilerSnapshot {
@@ -735,7 +735,7 @@ impl JitProfiler {
     }
 
     fn start_event(&self, event: i32) {
-        // `jitprof.py:75-81 _start(event)` — profiler bookkeeping only.
+        // `jitprof.py _start(event)` — profiler bookkeeping only.
         // The matching `debug_start(channel)` lives at the caller
         // (PyPy convention; mirrored by [`enter_tracing`] /
         // [`enter_backend`]).
@@ -757,7 +757,7 @@ impl JitProfiler {
     }
 
     fn end_event(&self, event: i32) {
-        // `jitprof.py:83-93 _end(event)` — pop-first, then validate.
+        // `jitprof.py _end(event)` — pop-first, then validate.
         // The matching `debug_stop(channel)` lives at the caller
         // (PyPy convention; mirrored by [`ProfilerEventGuard::drop`]).
         //   t0 = self.t1
@@ -926,7 +926,7 @@ impl Drop for ProfilerEventGuard<'_> {
     }
 }
 
-/// `Counters.TOTAL_COMPILED_*` / `Counters.TOTAL_FREED_*` (jit.py:1438-1441)
+/// `Counters.TOTAL_COMPILED_*` / `Counters.TOTAL_FREED_*` (jit.py)
 /// — the four ids PyPy reads via `cpu.tracker` instead of
 /// `self.counters`.  Used by [`JitProfiler::count`] /
 /// [`JitProfiler::count_ops`] `debug_assert!` to flag callers that
@@ -1010,14 +1010,14 @@ fn debug_channel_for_event(event: i32) -> Option<&'static str> {
     }
 }
 
-/// jitprof.py:176-178 `Profiler._print_line_time` layout:
+/// jitprof.py `Profiler._print_line_time` layout:
 /// `"%s:%s\t%d\t%f" % (string, " " * max(0, 13-len(string)), i, tim)`.
 fn fmt_line_time(string: &str, i: usize, tim: f64) -> String {
     let pad = " ".repeat(13usize.saturating_sub(string.len()));
     format!("{string}:{pad}\t{i}\t{tim:.6}")
 }
 
-/// jitprof.py:180-182 `Profiler._print_intline` layout:
+/// jitprof.py `Profiler._print_intline` layout:
 /// `"%s:%s\t%d" % (string, " " * max(0, 13-len(string)), i)`.
 fn fmt_intline(string: &str, i: usize) -> String {
     let pad = " ".repeat(13usize.saturating_sub(string.len()));
@@ -1027,7 +1027,7 @@ fn fmt_intline(string: &str, i: usize) -> String {
 /// Plain-old-data snapshot of [`JitProfiler`].
 ///
 /// Used by debug printers, tests, and the `JitStats` view. Field order
-/// mirrors RPython's `_print_stats` (jitprof.py:130-174) so the
+/// mirrors RPython's `_print_stats` (jitprof.py) so the
 /// eventual `print_stats` port can iterate on a fixed layout.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct JitProfilerSnapshot {
@@ -1058,7 +1058,7 @@ pub struct JitProfilerSnapshot {
     pub backend_time_ns: u64,
 }
 
-/// jitprof.py:186 `BrokenProfilerData`.
+/// jitprof.py `BrokenProfilerData`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrokenProfilerData;
 
@@ -1246,7 +1246,7 @@ mod tests {
 
     #[test]
     fn snapshot_reads_every_counter_independently() {
-        // jitprof.py:130-174 `_print_stats` reads each cnt[Counters.X]
+        // jitprof.py `_print_stats` reads each cnt[Counters.X]
         // one-by-one with no locking — `snapshot` must do the same.
         let prof = JitProfiler::default();
         prof.count(counters::OPS, 7);
@@ -1263,7 +1263,7 @@ mod tests {
 
     #[test]
     fn get_counter_reads_via_kind_id() {
-        // jitprof.py:104-113 `get_counter(num)` — pyre returns Option to
+        // jitprof.py `get_counter(num)` — pyre returns Option to
         // signal unknown ids instead of upstream's IndexError.
         let prof = JitProfiler::default();
         prof.count(counters::ABORT_ESCAPE, 1);
@@ -1274,7 +1274,7 @@ mod tests {
 
     #[test]
     fn start_end_timed_events_count_and_accumulate_elapsed_time() {
-        // jitprof.py:75-99 `_start`/`_end` contract: entering a nested
+        // jitprof.py `_start`/`_end` contract: entering a nested
         // event charges elapsed time to the previously-active event; leaving
         // charges elapsed time to the ending event.
         let prof = JitProfiler::default();
@@ -1299,7 +1299,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "PyPy raises IndexError")]
     fn count_panics_on_total_compiled_loops_id() {
-        // jitprof.py:101 `self.counters[kind] += inc` raises
+        // jitprof.py `self.counters[kind] += inc` raises
         // `IndexError` when `kind` is `TOTAL_COMPILED_LOOPS` (id 22)
         // because `self.counters` is sized `Counters.ncounters = 22`.
         // Pyre uses `assert!` (not `debug_assert!`) so the panic

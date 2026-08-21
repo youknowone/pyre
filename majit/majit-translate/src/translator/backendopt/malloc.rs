@@ -12,11 +12,11 @@ use crate::flowspace::model::GraphRef;
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
-/// RPython `remove_mallocs(translator, graphs)` at `malloc.py:553-566`.
+/// RPython `remove_mallocs(translator, graphs)` at `malloc.py`.
 ///
-/// The real implementation wraps `LLTypeMallocRemover` (`malloc.py:333-547`),
-/// which inherits `BaseMallocRemover` (`malloc.py:26-332`) and uses
-/// `LifeTime` (`malloc.py:9-24`) to prove non-escaping allocations can be
+/// The real implementation wraps `LLTypeMallocRemover` (`malloc.py`),
+/// which inherits `BaseMallocRemover` (`malloc.py`) and uses
+/// `LifeTime` (`malloc.py`) to prove non-escaping allocations can be
 /// replaced by direct field variables.
 pub fn remove_mallocs(
     _translator: &Rc<TranslationContext>,

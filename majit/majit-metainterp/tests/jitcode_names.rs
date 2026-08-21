@@ -1,6 +1,6 @@
 //! Every macro-built JitCode carries the name of what it was built from.
 //!
-//! `jitcode.py:14-15 def __init__(self, name, ...): self.name = name` — upstream
+//! `jitcode.py def __init__(self, name, ...): self.name = name` — upstream
 //! has no unnamed JitCode, and the name is what `dump()` and every diagnostic
 //! that prints one use to say *which* code they are talking about.
 //!

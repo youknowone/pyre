@@ -27,7 +27,7 @@ pub struct IntArray {
     /// empty form ([`IntArray::empty`]), where the live length and the
     /// allocated capacity are both zero.
     pub block: *mut TypedItemsBlock,
-    /// Live length (rlist.py:116 `("length", Signed)`).
+    /// Live length (rlist.py `("length", Signed)`).
     len: usize,
 }
 
@@ -82,7 +82,7 @@ impl IntArray {
     /// Pin `block` on the shadow stack and return its slot, so the block stays
     /// live across a following GC operation.
     ///
-    /// `gct_fv_gc_malloc` (`framework.py:853-856`) brackets every malloc with
+    /// `gct_fv_gc_malloc` (`framework.py`) brackets every malloc with
     /// `push_roots`/`pop_roots` over the live vars, and that bracket is about
     /// *liveness*, not only relocation: old-gen here is mark-sweep
     /// (`incminimark.py` `STATE_SWEEPING` frees every old object that did not
@@ -155,7 +155,7 @@ impl IntArray {
 
     /// Store the live length without touching the block. The caller must
     /// guarantee `new_len <= heap_capacity()` (the no-resize precondition);
-    /// mirrors `_ll_list_resize_ge`'s `l.length = newsize` (rlist.py:293).
+    /// mirrors `_ll_list_resize_ge`'s `l.length = newsize` (rlist.py).
     /// Enforced here because this is safe/public: a `len` past the allocated
     /// capacity would make `as_slice`/`as_mut_slice` build out-of-bounds
     /// slices (UB).

@@ -1,7 +1,7 @@
 //! Thread-local space-callable hooks consumed by pyre-object's dict
 //! key dispatch.
 //!
-//! `pypy/objspace/std/dictmultiobject.py:1195+ ObjectDictStrategy`
+//! `pypy/objspace/std/dictmultiobject.py+ ObjectDictStrategy`
 //! routes key equality + hashing through `space.eq_w` / `space.hash_w`
 //! so user-defined `__eq__` / `__hash__` resolve through the standard
 //! comparison protocol.  pyre's `pyre-object` crate is below
@@ -18,7 +18,7 @@
 use crate::PyObjectRef;
 use std::cell::Cell;
 
-/// `pypy/interpreter/baseobjspace.py:823-825 W_ObjectSpace.eq_w`
+/// `pypy/interpreter/baseobjspace.py W_ObjectSpace.eq_w`
 /// signature: returns `True` when `a` and `b` are equal per the
 /// standard `__eq__` protocol.  PyPy's `space.eq_w` raises on `__eq__`
 /// errors; the trampoline cannot return a `Result` across the dict
@@ -228,7 +228,7 @@ pub extern "C" fn has_eq_w_hook() -> bool {
 /// installed — gate with [`has_eq_w_hook`] (the [`try_eq_w`] wrapper does).
 /// Not `unsafe` for ABI-surface reasons (residual calls dispatch through a
 /// plain fnaddr); `a` / `b` must nonetheless be valid PyObjectRefs (null
-/// tolerated as per PyPy's `is_w` shortcut at `baseobjspace.py:818-822`).
+/// tolerated as per PyPy's `is_w` shortcut at `baseobjspace.py`).
 #[majit_macros::dont_look_inside]
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
@@ -245,7 +245,7 @@ pub extern "C" fn eq_w_hooked(a: PyObjectRef, b: PyObjectRef) -> bool {
 ///
 /// # Safety
 /// `a` / `b` must be valid PyObjectRefs (null tolerated as per
-/// PyPy's `is_w` shortcut at `baseobjspace.py:818-822`).
+/// PyPy's `is_w` shortcut at `baseobjspace.py`).
 #[inline]
 pub unsafe fn try_eq_w(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
     if has_eq_w_hook() {

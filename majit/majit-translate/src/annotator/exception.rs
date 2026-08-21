@@ -105,7 +105,7 @@ impl StandardExceptionObjects {
     }
 }
 
-/// RPython `exception.standardexceptions` data shape (exception.py:4-7).
+/// RPython `exception.standardexceptions` data shape (exception.py).
 ///
 /// Upstream stores live exception class objects in a set. The Rust port
 /// keeps the same "classes first" surface and resolves them through

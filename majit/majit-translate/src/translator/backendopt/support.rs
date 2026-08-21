@@ -49,7 +49,7 @@ use crate::translator::translator::TranslationContext;
 /// argument because Rust has no equivalent.
 pub static LOG: AnsiLogger = AnsiLogger::new("backendopt");
 
-/// `graph_operations(graph)` at `support.py:9-12`.
+/// `graph_operations(graph)` at `support.py`.
 ///
 /// Upstream is a generator yielding every op in iterblocks order.
 /// The Rust port returns a flat `Vec<SpaceOperation>` so callers can
@@ -66,7 +66,7 @@ pub fn graph_operations(graph: &FunctionGraph) -> Vec<SpaceOperation> {
     out
 }
 
-/// `all_operations(graphs)` at `support.py:14-18`.
+/// `all_operations(graphs)` at `support.py`.
 pub fn all_operations(graphs: &[GraphRef]) -> Vec<SpaceOperation> {
     let mut out = Vec::new();
     for graph in graphs {
@@ -134,7 +134,7 @@ pub fn annotate(
     })
 }
 
-/// `var_needsgc(var)` at `support.py:27-29`.
+/// `var_needsgc(var)` at `support.py`.
 ///
 /// ```python
 /// def var_needsgc(var):
@@ -199,7 +199,7 @@ pub fn find_calls_from(
     res
 }
 
-/// `_find_calls_from(translator, graph)` at `support.py:39-50`.
+/// `_find_calls_from(translator, graph)` at `support.py`.
 fn _find_calls_from(
     translator: &TranslationContext,
     graph: &FunctionGraph,
@@ -245,7 +245,7 @@ fn _find_calls_from(
     out
 }
 
-/// `md5digest(translator)` at `support.py:114-124`.
+/// `md5digest(translator)` at `support.py`.
 ///
 /// Returns `{graph.name -> 16-byte md5 digest}` matching upstream's
 /// `m.update(op.opname + str(op.result))` followed by
@@ -440,7 +440,7 @@ fn find_backedges_dfs(
     seeing.remove(&block_key);
 }
 
-/// `compute_reachability(graph)` at `support.py:72-90`.
+/// `compute_reachability(graph)` at `support.py`.
 ///
 /// Returns a map `{block -> set(reachable_blocks)}`. Walks every
 /// block in reverse iterblocks order so previously-computed
@@ -484,7 +484,7 @@ pub fn compute_reachability(graph: &FunctionGraph) -> HashMap<BlockKey, HashSet<
     reachable
 }
 
-/// `find_loop_blocks(graph)` at `support.py:92-112`.
+/// `find_loop_blocks(graph)` at `support.py`.
 ///
 /// > find the blocks in a graph that are part of a loop
 ///

@@ -8,7 +8,7 @@
 
 use crate::annotator::model::KnownType;
 
-/// RPython `compute_restype(self_type, other_type)` (rarithmetic.py:211-226).
+/// RPython `compute_restype(self_type, other_type)` (rarithmetic.py).
 ///
 /// ```python
 /// def compute_restype(self_type, other_type):
@@ -81,7 +81,7 @@ pub fn compute_restype(self_type: KnownType, other_type: KnownType) -> KnownType
     );
 }
 
-/// RPython `signedtype(t)` (rarithmetic.py:228-233).
+/// RPython `signedtype(t)` (rarithmetic.py).
 ///
 /// ```python
 /// @specialize.memo()

@@ -50,13 +50,13 @@ pub const W_MAPDICT_STORAGE_GC_TYPE_ID: u32 = 55;
 
 /// The `(base_size, item_size, len_offset)` triple describing one varsize
 /// GcArray block, derived from the Rust struct that carries the block's GC type
-/// id — `symbolic.py:29 get_array_token`.
+/// id — `symbolic.py get_array_token`.
 ///
 /// Upstream computes all three numbers from a single array lltype and hands
 /// that one triple to every consumer: the JIT's array descriptor
-/// (`descr.py:354 get_array_descr`), its length descriptor
-/// (`descr.py:262 get_field_arraylen_descr`) and the collector's varsize shape
-/// (`gctypelayout.py:273-291 encode_type_shape`, where `ofstovar`,
+/// (`descr.py get_array_descr`), its length descriptor
+/// (`descr.py get_field_arraylen_descr`) and the collector's varsize shape
+/// (`gctypelayout.py encode_type_shape`, where `ofstovar`,
 /// `varitemsize` and `ofstolength` all read the same `ARRAY`). Picking the
 /// numbers apart per call site is what let the two scalar-array tids be
 /// registered with `GcTypedArray`'s bare length word while the blocks actually
@@ -193,7 +193,7 @@ pub unsafe fn alloc_list_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock 
     }
 }
 
-/// `pypy/objspace/std/tupleobject.py:376-390` `W_TupleObject`
+/// `pypy/objspace/std/tupleobject.py` `W_TupleObject`
 /// allocator. Allocates an `ItemsBlock` with capacity exactly equal to
 /// `values.len()` — tuples are immutable so the GcArray header
 /// `length` IS the live tuple length (no overallocation room). For an
@@ -261,7 +261,7 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 
 /// Allocate a fresh stable `ItemsBlock` holding `values` in its first slots and
 /// NULL in the rest, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID` (leaf). The map is
-/// the length authority (mapdict.py:942-959), so `cap` is an allocation bound
+/// the length authority (mapdict.py), so `cap` is an allocation bound
 /// rather than a length; a live instance passes the larger of its current
 /// capacity and `values.len()` so the capacity never shrinks. Every slot is
 /// written, so the block is safe to expose to the collector immediately. Falls
@@ -432,7 +432,7 @@ pub unsafe fn alloc_list_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBlo
 /// allocation below keeps every item reachable through it and relocates the
 /// slots in place — reading them back afterwards yields post-collection
 /// addresses without naming them one at a time. That is also the upstream
-/// shape: `_ll_list_resize_really` (rlist.py:262-267) mallocs the new array and
+/// shape: `_ll_list_resize_really` (rlist.py) mallocs the new array and
 /// `ll_arraycopy`s into it, with no per-item root bracket anywhere.
 ///
 /// Pinning per item instead made a grow cost `2 * live_len` GC-ownership
@@ -525,7 +525,7 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     // collection unless the block is on the remembered set, so write-barrier
     // it here. A nursery block carries no TRACK_YOUNG_PTRS and the barrier is
     // a no-op; an old-gen block is registered so the next minor collection
-    // walks its items (write_barrier_from_array, incminimark.py:1495). Guard
+    // walks its items (write_barrier_from_array, incminimark.py). Guard
     // on GC ownership exactly like `list_write_barrier`.
     if crate::gc_hook::try_gc_owns_object(block as *mut u8) {
         crate::gc_hook::try_gc_write_barrier(block as *mut u8);
@@ -631,7 +631,7 @@ unsafe fn items_block_items_ptr(block: *mut ItemsBlock) -> *mut PyObjectRef {
 /// walker (once `PY_OBJECT_ARRAY_GC_TYPE_ID` is active on the
 /// allocation) sees valid NULL refs in unused slots — upstream
 /// relies on `gc_malloc_array` zero-filling the fresh block
-/// (rlist.py:262-267 `_ll_list_resize_really`); pyre's `alloc`
+/// (rlist.py `_ll_list_resize_really`); pyre's `alloc`
 /// uses `std::alloc::alloc` which is not zero-filled so we
 /// explicit-init here.
 /// Old block is deallocated. Returns the new block.
@@ -690,7 +690,7 @@ const _: () = assert!(
 
 /// Allocate a fresh zero-filled `TypedItemsBlock` with the given capacity, as a
 /// `tid` (`GC_INT_ARRAY` / `GC_FLOAT_ARRAY`) varsize GcArray. Zero-fill matches
-/// `gc_malloc_array` (rlist.py:262-267 `_ll_list_resize_really`) and the
+/// `gc_malloc_array` (rlist.py `_ll_list_resize_really`) and the
 /// Float/Int strategy `_none_value` (0.0 / 0); `try_gc_alloc_stable` memory is
 /// not guaranteed zeroed, so the items are cleared explicitly. `cap` is clamped
 /// to at least 1 (rlist.py:251 overallocation policy). Falls back to
@@ -930,7 +930,7 @@ impl FixedObjectArray {
             unsafe { self.items_mut_ptr().add(index).write(value) };
             return;
         }
-        // minimark.py:1063-1071 `writebarrier_before_copy` / the ordinary
+        // minimark.py `writebarrier_before_copy` / the ordinary
         // `setarrayitem_gc` rewrite: inspect TRACK_YOUNG_PTRS inline and enter
         // the collecting slow path only while the old array still needs to be
         // remembered.  The barrier clears this bit, so every later store into
@@ -1027,7 +1027,7 @@ impl IndexMut<usize> for FixedObjectArray {
 }
 
 /// Allocate a fixed-length `FixedObjectArray` GcArray pre-filled from
-/// `values`, for `W_TypeObject.mro_w` (typeobject.py:179 `mro_w?[*]`, an
+/// `values`, for `W_TypeObject.mro_w` (typeobject.py `mro_w?[*]`, an
 /// immutable `[W_Root]`). The block is `PY_OBJECT_ARRAY_GC_TYPE_ID`
 /// (`Ptr(GcArray(OBJECTPTR))`), so the collector reads its length from the
 /// offset-0 header and forwards items[0..len]; the prepass types
@@ -1083,9 +1083,9 @@ pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArra
 
 // ─── GcTypedArray: typed array helper for resume / blackhole ─────────
 //
-// llmodel.py:788-789: bh_new_array / bh_new_array_clear
-// llmodel.py:607-619: bh_setarrayitem_gc_r/i/f, bh_getarrayitem_gc_r/i/f
-// resume.py:1444-1537: ResumeDataDirectReader allocate_array + setarrayitem_*
+// llmodel.py: bh_new_array / bh_new_array_clear
+// llmodel.py: bh_setarrayitem_gc_r/i/f, bh_getarrayitem_gc_r/i/f
+// resume.py: ResumeDataDirectReader allocate_array + setarrayitem_*
 //
 // RPython GC arrays are flat varsize blocks:
 //
@@ -1136,7 +1136,7 @@ pub enum ArrayKind {
 }
 
 /// resume.py:1444-1447, llmodel.py:788-790 — API alias.
-/// RPython: `bh_new_array_clear = bh_new_array` (llmodel.py:790).
+/// RPython: `bh_new_array_clear = bh_new_array` (llmodel.py).
 /// Upstream both call `gc_malloc_array` which allocates a zero-filled
 /// varsize block. Ref/int/float slots are word-sized.
 pub fn allocate_array(length: usize, kind: ArrayKind, _clear: bool) -> *mut GcTypedArray {
@@ -1158,7 +1158,7 @@ pub fn allocate_array_with_item_size(
     allocate_flat_gc_typed_array(length, item_size)
 }
 
-/// resume.py:749 VArrayStructInfo.allocate — API alias.
+/// resume.py VArrayStructInfo.allocate — API alias.
 /// Allocate a flat byte buffer for Array(Struct(...)):
 /// `[len][num_elems * item_size bytes]`.
 pub fn allocate_array_struct(num_elems: usize, item_size: usize) -> *mut GcTypedArray {
@@ -1220,7 +1220,7 @@ unsafe fn gc_typed_array_item_ptr(
     unsafe { gc_typed_array_items_base(array).add(index * item_size) }
 }
 
-/// llmodel.py:607-609 bh_setarrayitem_gc_r parity.
+/// llmodel.py bh_setarrayitem_gc_r parity.
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
@@ -1232,7 +1232,7 @@ pub fn setarrayitem_ref(array: *mut GcTypedArray, index: usize, value: PyObjectR
     }
 }
 
-/// llmodel.py:596-598 bh_getarrayitem_gc_r parity.
+/// llmodel.py bh_getarrayitem_gc_r parity.
 /// Read a `PyObjectRef` from a ref array slot.
 pub fn getarrayitem_ref(array: *const GcTypedArray, index: usize) -> PyObjectRef {
     unsafe {
@@ -1245,7 +1245,7 @@ pub fn getarrayitem_ref(array: *const GcTypedArray, index: usize) -> PyObjectRef
     }
 }
 
-/// llmodel.py:613-615 bh_setarrayitem_gc_i parity.
+/// llmodel.py bh_setarrayitem_gc_i parity.
 /// Write a raw i64 to an int array slot.
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
@@ -1258,7 +1258,7 @@ pub fn setarrayitem_int(array: *mut GcTypedArray, index: usize, value: i64) {
     }
 }
 
-/// llmodel.py:618-619 bh_setarrayitem_gc_f parity.
+/// llmodel.py bh_setarrayitem_gc_f parity.
 /// Write a raw f64 to a float array slot.
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
@@ -1271,8 +1271,8 @@ pub fn setarrayitem_float(array: *mut GcTypedArray, index: usize, value: f64) {
     }
 }
 
-/// resume.py:757 setinteriorfield(i, array, num, fielddescrs[j]) parity.
-/// resume.py:1520-1529 ResumeDataDirectReader: dispatch on descr type.
+/// resume.py setinteriorfield(i, array, num, fielddescrs[j]) parity.
+/// resume.py ResumeDataDirectReader: dispatch on descr type.
 /// llmodel.py:648-665: byte offset = elem_idx * item_size + field_offset.
 ///
 #[expect(

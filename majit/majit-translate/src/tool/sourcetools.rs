@@ -37,7 +37,7 @@ pub fn render_docstr(
 }
 
 /// Maximum length of a `valid_identifier` result, mirroring upstream
-/// `sourcetools.py:239 PY_IDENTIFIER_MAX = 120`.
+/// `sourcetools.py PY_IDENTIFIER_MAX = 120`.
 pub const PY_IDENTIFIER_MAX: usize = 120;
 
 /// RPython `rpython.tool.sourcetools.valid_identifier`
@@ -61,9 +61,9 @@ pub fn valid_identifier(stuff: impl std::fmt::Display) -> String {
     stuff
 }
 
-/// RPython `CO_VARARGS` (`sourcetools.py:247`).
+/// RPython `CO_VARARGS` (`sourcetools.py`).
 pub const CO_VARARGS: u32 = 0x0004;
-/// RPython `CO_VARKEYWORDS` (`sourcetools.py:248`).
+/// RPython `CO_VARKEYWORDS` (`sourcetools.py`).
 pub const CO_VARKEYWORDS: u32 = 0x0008;
 
 /// RPython `has_varargs(func)` for callers that already have
@@ -78,7 +78,7 @@ pub fn has_varkeywords_flags(co_flags: u32) -> bool {
     (co_flags & CO_VARKEYWORDS) != 0
 }
 
-/// RPython `has_varargs(func)` (`sourcetools.py:250-252`). Upstream
+/// RPython `has_varargs(func)` (`sourcetools.py`). Upstream
 /// accepts either a function or a raw code object via
 /// `getattr(func, 'func_code', func)`. The Rust port inspects the
 /// `code` slot on [`GraphFunc`] (matching `func.func_code` /
@@ -92,7 +92,7 @@ pub fn has_varargs(func: &GraphFunc) -> bool {
         .unwrap_or(false)
 }
 
-/// RPython `has_varkeywords(func)` (`sourcetools.py:254-256`).
+/// RPython `has_varkeywords(func)` (`sourcetools.py`).
 /// Upstream `getattr(func, 'func_code', func)` fallback over
 /// [`GraphFunc.code`]. See [`has_varargs`].
 pub fn has_varkeywords(func: &GraphFunc) -> bool {
@@ -116,7 +116,7 @@ pub fn has_varkeywords_code(code: &HostCode) -> bool {
     has_varkeywords_flags(code.co_flags)
 }
 
-/// RPython `nice_repr_for_func(fn, name=None)` (`sourcetools.py:258-269`)
+/// RPython `nice_repr_for_func(fn, name=None)` (`sourcetools.py`)
 /// over the Rust `GraphFunc` carrier.
 ///
 /// Upstream uses `fn.__module__` for the module slot and `cls.__name__`
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn func_with_new_name_overrides_globals() {
-        // Upstream `sourcetools.py:217-227 func_with_new_name(func,
+        // Upstream `sourcetools.py func_with_new_name(func,
         // newname, globals=None)`: `Some(globals)` replaces the
         // function's `__globals__` on the renamed copy.
         let mut original_globals = std::collections::HashMap::new();

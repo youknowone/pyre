@@ -20,7 +20,7 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// RPython `class AnsiLogger(object)` (`ansi_print.py:33-86`).
+/// RPython `class AnsiLogger(object)` (`ansi_print.py`).
 ///
 /// Output shape `[name:subname] text` matches `_make_method` at
 /// `ansi_print.py:17-30` for the non-TTY branch. The Rust port keeps

@@ -93,7 +93,7 @@ impl SSAReprEmitter {
     /// used by `register_helper_fn_pointers::bind` for `MayForce` /
     /// `ReleaseGil` flavors whose runtime-resolved EI cannot be
     /// represented as an [`majit_metainterp::EffectInfoSlot`]
-    /// (`pyjitpl.py:2128-2132 do_conditional_call` asserts forces
+    /// (`pyjitpl.py do_conditional_call` asserts forces
     /// never reach the slot-reading dispatcher).  The descriptor
     /// stays at the analyzer-absent default
     /// [`majit_metainterp::EffectInfoSlot::CanRaise`].
@@ -106,7 +106,7 @@ impl SSAReprEmitter {
     /// `register_helper_fn_pointers` to thread each helper's
     /// `CallFlavor` into the [`majit_metainterp::JitCallTarget`]
     /// runtime descriptor so the trace dispatcher can pick the
-    /// matching `EffectInfo` (`call.py:282-303 getcalldescr` parity).
+    /// matching `EffectInfo` (`call.py getcalldescr` parity).
     pub fn add_fn_ptr_with_slot(
         &mut self,
         ptr: *const (),
@@ -140,7 +140,7 @@ impl SSAReprEmitter {
 
     /// Translate an insn-index position into the corresponding JitCode
     /// byte offset using the `ssarepr.insns_pos` table that
-    /// `Assembler::assemble` populates (`assembler.py:41-44`).
+    /// `Assembler::assemble` populates (`assembler.py`).
     pub fn insn_pos_to_byte_offset(
         ssarepr: &SSARepr,
         positions: impl IntoIterator<Item = usize>,
@@ -173,7 +173,7 @@ impl SSAReprEmitter {
     /// `RegAllocator::find_num_colors` from `max(color)+1`
     /// (`codewriter.py:62-67`). Passing pre-regalloc builder values
     /// would over-allocate the `JitCode.num_regs_*` slots that
-    /// `Assembler::emit_reg`'s 256-bound assertion (`assembler.py:73`)
+    /// `Assembler::emit_reg`'s 256-bound assertion (`assembler.py`)
     /// checks against.
     pub fn finish_with_positions_from(
         self,

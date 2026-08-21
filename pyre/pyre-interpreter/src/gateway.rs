@@ -6,7 +6,7 @@
 
 use pyre_object::pyobject::*;
 
-/// pypy/interpreter/gateway.py:36-73 `class SignatureBuilder`.
+/// pypy/interpreter/gateway.py `class SignatureBuilder`.
 ///
 /// ```python
 /// class SignatureBuilder(object):
@@ -66,12 +66,12 @@ impl Default for SignatureBuilder {
 }
 
 impl SignatureBuilder {
-    /// gateway.py:54-55 `append`.
+    /// gateway.py `append`.
     pub fn append(&mut self, argname: &'static str) {
         self.argnames.push(argname);
     }
 
-    /// gateway.py:57-60 `marker_posonly`.  PyPy asserts the marker is
+    /// gateway.py `marker_posonly`.  PyPy asserts the marker is
     /// emitted at most once and before `marker_kwonly`.
     pub fn marker_posonly(&mut self) {
         assert!(self.posonlyargcount == 0);
@@ -79,14 +79,14 @@ impl SignatureBuilder {
         self.posonlyargcount = self.argnames.len();
     }
 
-    /// gateway.py:62-64 `marker_kwonly`.  PyPy asserts the marker is
+    /// gateway.py `marker_kwonly`.  PyPy asserts the marker is
     /// emitted at most once.
     pub fn marker_kwonly(&mut self) {
         assert!(self.kwonlystartindex == -1);
         self.kwonlystartindex = self.argnames.len() as isize;
     }
 
-    /// gateway.py:66-73 `signature`.  Derives `kwonlyargcount` from
+    /// gateway.py `signature`.  Derives `kwonlyargcount` from
     /// the argname list length minus the `marker_kwonly` index, or 0
     /// if the marker never fired.
     pub fn signature(&self) -> Signature {
@@ -105,7 +105,7 @@ impl SignatureBuilder {
     }
 }
 
-/// pypy/interpreter/signature.py:3-78 `class Signature`.
+/// pypy/interpreter/signature.py `class Signature`.
 ///
 /// ```python
 /// class Signature(object):
@@ -129,7 +129,7 @@ pub struct Signature {
 }
 
 impl Signature {
-    /// pypy/interpreter/signature.py:8-16 `Signature.__init__`.
+    /// pypy/interpreter/signature.py `Signature.__init__`.
     pub fn new(
         argnames: Vec<&'static str>,
         varargname: Option<&'static str>,
@@ -146,7 +146,7 @@ impl Signature {
         }
     }
 
-    /// pypy/interpreter/signature.py:18-24 `find_argname`:
+    /// pypy/interpreter/signature.py `find_argname`:
     /// ```python
     /// @jit.elidable
     /// def find_argname(self, name):
@@ -165,7 +165,7 @@ impl Signature {
         -1
     }
 
-    /// pypy/interpreter/signature.py:26-31 `find_w_argname`:
+    /// pypy/interpreter/signature.py `find_w_argname`:
     /// ```python
     /// @jit.elidable
     /// def find_w_argname(self, w_name):
@@ -192,7 +192,7 @@ impl Signature {
         }
     }
 
-    /// pypy/interpreter/signature.py:33-34 `num_argnames`:
+    /// pypy/interpreter/signature.py `num_argnames`:
     /// ```python
     /// def num_argnames(self):
     ///     return len(self.argnames) - self.kwonlyargcount
@@ -201,7 +201,7 @@ impl Signature {
         self.argnames.len() - self.kwonlyargcount
     }
 
-    /// pypy/interpreter/signature.py:36-37 `num_posonlyargnames`:
+    /// pypy/interpreter/signature.py `num_posonlyargnames`:
     /// ```python
     /// def num_posonlyargnames(self):
     ///     return self.posonlyargcount
@@ -210,7 +210,7 @@ impl Signature {
         self.posonlyargcount
     }
 
-    /// pypy/interpreter/signature.py:39-40 `num_kwonlyargnames`:
+    /// pypy/interpreter/signature.py `num_kwonlyargnames`:
     /// ```python
     /// def num_kwonlyargnames(self):
     ///     return self.kwonlyargcount
@@ -219,7 +219,7 @@ impl Signature {
         self.kwonlyargcount
     }
 
-    /// pypy/interpreter/signature.py:42-43 `has_vararg`:
+    /// pypy/interpreter/signature.py `has_vararg`:
     /// ```python
     /// def has_vararg(self):
     ///     return self.varargname is not None
@@ -228,7 +228,7 @@ impl Signature {
         self.varargname.is_some()
     }
 
-    /// pypy/interpreter/signature.py:45-46 `has_kwarg`:
+    /// pypy/interpreter/signature.py `has_kwarg`:
     /// ```python
     /// def has_kwarg(self):
     ///     return self.kwargname is not None
@@ -237,7 +237,7 @@ impl Signature {
         self.kwargname.is_some()
     }
 
-    /// pypy/interpreter/signature.py:48-52 `scope_length`:
+    /// pypy/interpreter/signature.py `scope_length`:
     /// ```python
     /// def scope_length(self):
     ///     scopelen = len(self.argnames)
@@ -256,7 +256,7 @@ impl Signature {
         scopelen
     }
 
-    /// pypy/interpreter/signature.py:54-60 `getallvarnames`:
+    /// pypy/interpreter/signature.py `getallvarnames`:
     /// ```python
     /// def getallvarnames(self):
     ///     argnames = self.argnames
@@ -601,10 +601,10 @@ pub struct MethodOwner {
 
 /// A built-in function object.
 ///
-/// `docstring` mirrors PyPy `BuiltinCode.docstring` (gateway.py:673
+/// `docstring` mirrors PyPy `BuiltinCode.docstring` (gateway.py
 /// `self.docstring = doc or func.__doc__`). It is consulted by
 /// `BuiltinCode::getdocstring`, which is the lazy fallback used by
-/// `Function.fget_func_doc` (function.py:395-398).
+/// `Function.fget_func_doc` (function.py).
 #[repr(C)]
 pub struct BuiltinCode {
     pub ob: PyObject,
@@ -615,7 +615,7 @@ pub struct BuiltinCode {
     /// positional arity 0-4, this equals the arity directly. Builtins
     /// with optional/variadic args use HOPELESS (0x400).
     pub fast_natural_arity: u16,
-    /// gateway.py:743 `BuiltinCode.sig` — the argument `Signature`
+    /// gateway.py `BuiltinCode.sig` — the argument `Signature`
     /// (named params, `*args`/`**kwargs`, kw-only tail) used to bind
     /// keyword arguments into positional order before the function runs.
     /// `null` means "no declared signature" (positional-only), which is
@@ -655,9 +655,9 @@ impl pyre_object::lltype::GcType for BuiltinCode {
 
 /// eval.py:16 — `FLATPYCALL = 0x100`.
 pub const FLATPYCALL: u16 = 0x100;
-/// eval.py:17 — `PASSTHROUGHARGS1 = 0x200`.
+/// eval.py — `PASSTHROUGHARGS1 = 0x200`.
 pub const PASSTHROUGHARGS1: u16 = 0x200;
-/// eval.py:18 — `HOPELESS = 0x400`. Default for code that cannot fast-path.
+/// eval.py — `HOPELESS = 0x400`. Default for code that cannot fast-path.
 pub const HOPELESS: u16 = 0x400;
 
 /// Allocate a new `BuiltinCode` with no docstring.
@@ -667,7 +667,7 @@ pub fn builtin_code_new(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef 
 }
 
 /// Allocate a new `BuiltinCode` with known fixed arity (0-4).
-/// gateway.py:843 — `self.__class__ = globals()['BuiltinCode%d' % arity]`
+/// gateway.py — `self.__class__ = globals()['BuiltinCode%d' % arity]`
 pub fn builtin_code_new_with_arity(
     name: &'static str,
     func: BuiltinCodeFn,
@@ -682,7 +682,7 @@ pub fn builtin_code_new_with_arity(
 
 /// Allocate a new `BuiltinCode` with an explicit docstring.
 ///
-/// PyPy gateway.py:673 — `self.docstring = doc or func.__doc__`. Pyre has
+/// PyPy gateway.py — `self.docstring = doc or func.__doc__`. Pyre has
 /// no introspection of `func.__doc__`, so callers must pass the docstring
 /// explicitly when registering a builtin.
 pub fn builtin_code_new_with_doc(
@@ -710,7 +710,7 @@ pub fn builtin_code_new_passthrough_args1(name: &'static str, func: BuiltinCodeF
 /// (null for positional-only builtins); the pointee must outlive the
 /// object — callers leak it to `'static`.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`), the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// `w_dict_new` twin: the body boxes a `BuiltinCode` through the non-numeric
 /// `malloc_typed` (`fuse_boxing_alloc` fuses only the numeric boxes), so
 /// tracing into it carries the unported `malloc->new` lowering into the caller.
@@ -1172,7 +1172,7 @@ pub unsafe fn builtin_code_call_name(obj: PyObjectRef, receiver: Option<PyObject
     builtin_names(code, receiver).1
 }
 
-/// gateway.py:777 BuiltinCode.getdocstring — return the stored docstring
+/// gateway.py BuiltinCode.getdocstring — return the stored docstring
 /// wrapped as a `str`, or `None` if no docstring was attached.
 ///
 /// # Safety
@@ -1514,7 +1514,7 @@ pub fn make_module_builtin_function_with_arity_and_maybe_sig(
 }
 
 // ── fsencode_bytes_w ─────────────────────────────────────────────────
-/// `baseobjspace.py:1970 fsencode_w` accepts str, bytes, or an object
+/// `baseobjspace.py fsencode_w` accepts str, bytes, or an object
 /// implementing `__fspath__`, and answers with the filesystem-encoded bytes.
 ///
 /// Bytes, not text: a path byte with no UTF-8 spelling has to reach the syscall
@@ -1548,7 +1548,7 @@ pub fn fsdecode_filename_checked(data: &[u8]) -> Result<(), crate::PyError> {
 
 /// The application-level spelling of a string the host handed us, for a caller
 /// holding an `OsString` rather than the bytes behind it — a command-line
-/// argument, where `targetpypystandalone.py:76-80` builds `sys.argv` out of
+/// argument, where `targetpypystandalone.py` builds `sys.argv` out of
 /// `space.newfilename` for exactly this reason.
 ///
 /// The two arms are the host's two spellings, not a portability shim. Where the
@@ -1634,7 +1634,7 @@ pub fn os_string_from_fs_bytes(data: &[u8]) -> std::ffi::OsString {
     }
 }
 
-/// `interp_posix.py:140-152 Path`: the syscall spelling and the resolved path
+/// `interp_posix.py Path`: the syscall spelling and the resolved path
 /// object travel together. For `os.PathLike`, `w_path` is the result of the
 /// single `__fspath__` call, not the wrapper that supplied it.
 pub struct FsEncodedPath {
@@ -1681,7 +1681,7 @@ pub fn fsencode_path_named_w(
 }
 
 /// [`fsencode_path_w`] for a boundary that also takes an open file descriptor —
-/// `interp_posix.py:611 path=path_or_fd(allow_fd=True)`. `funcname` names the
+/// `interp_posix.py path=path_or_fd(allow_fd=True)`. `funcname` names the
 /// caller in the type error, whose allowed-type list widens with `allow_fd`:
 /// `stat` answers "string, bytes, os.PathLike or integer" where `lstat`, which
 /// takes no descriptor, answers "string, bytes or os.PathLike".
@@ -1752,7 +1752,7 @@ fn path_or_fd_w(
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if nullable && pyre_object::is_none(obj) {
             // `_unwrap_path` answers the omitted argument itself, with the
-            // directory it stands for (`interp_posix.py:181` `Path(-1, '.',
+            // directory it stands for (`interp_posix.py` `Path(-1, '.',
             // None, w_None)`), so no boundary has to spell that default again.
             // `None` is not bytes-like, so the names still come back as `str`.
             (b".".to_vec(), obj_slot, -1)
@@ -1799,7 +1799,7 @@ fn path_or_fd_w(
             // `__fspath__` arm reads it after its call.
             let fd =
                 crate::baseobjspace::c_int_w(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
-            // interp_posix.py:269-271 `unwrap_fd` — `-1` is the sentinel for
+            // interp_posix.py `unwrap_fd` — `-1` is the sentinel for
             // "not a descriptor", so a caller naming it has to be turned away
             // here rather than silently read as a path.
             if fd == -1 {
@@ -1863,7 +1863,7 @@ fn path_or_fd_w(
             }
         }
     };
-    // baseobjspace.py:2016-2017 `bytesbuf0_w` rejects embedded nulls. A
+    // baseobjspace.py `bytesbuf0_w` rejects embedded nulls. A
     // descriptor carries no bytes to check.
     if as_fd == -1 && data.contains(&0) {
         return Err(crate::PyError::value_error("embedded null byte"));
@@ -1883,7 +1883,7 @@ fn path_or_fd_w(
     })
 }
 
-/// `baseobjspace.py:1962 space.fsencode` — the plain filesystem encode of a
+/// `baseobjspace.py space.fsencode` — the plain filesystem encode of a
 /// `str`, with no argument conversion, `DeprecationWarning`, or embedded-null
 /// rejection. The caller must already have established that `obj` is a `str`.
 pub fn fsencode(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {

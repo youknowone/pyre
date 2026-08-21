@@ -1,4 +1,4 @@
-//! `compile.py:840-940` `ResumeGuardDescr` family — per-guard descr
+//! `compile.py` `ResumeGuardDescr` family — per-guard descr
 //! carrying both the optimizer's snapshot resume payload and the
 //! backend's codegen identity.  Moved to `majit-backend` so backends
 //! can instantiate it directly without depending on `majit-metainterp`.
@@ -51,7 +51,7 @@ use crate::CompiledTraceInfo;
 use crate::rd_payload::RdPayload;
 use crate::resume_value::ResumeData;
 
-// `compile.py:687-696 AbstractResumeGuardDescr` status-bit constants.
+// `compile.py AbstractResumeGuardDescr` status-bit constants.
 //
 // Status packs three pieces in one `u64`:
 //   - bit 0          : `ST_BUSY_FLAG` (set during retrace; clear once done).
@@ -102,7 +102,7 @@ pub fn flatten_vector_info(head: Option<&AccumInfo>) -> Vec<AccumInfo> {
     result
 }
 
-/// `compile.py:869 self.rd_vector_info = other.rd_vector_info.clone()`
+/// `compile.py self.rd_vector_info = other.rd_vector_info.clone()`
 /// rebuild helper: takes the donor's flattened chain (head at index 0)
 /// and assembles the equivalent linked-list head suitable for writing
 /// through `vector_info: UnsafeCell<Option<Box<AccumInfo>>>`.
@@ -123,7 +123,7 @@ pub fn build_vector_info_chain(chain: Vec<AccumInfo>) -> Option<Box<AccumInfo>> 
 #[derive(Debug)]
 pub struct ResumeGuardDescr {
     pub fail_index: u32,
-    /// `compile.py:869 store_final_boxes` mutates types in place; pyre
+    /// `compile.py store_final_boxes` mutates types in place; pyre
     /// uses `UnsafeCell` so identity is preserved across the optimizer.
     pub types: UnsafeCell<Vec<Type>>,
     /// Pyre keeps `resume_data` (the RPython-style ResumeValueSource
@@ -137,15 +137,15 @@ pub struct ResumeGuardDescr {
     pub payload: RdPayload,
     /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
     pub vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
-    /// `compile.py:186` `descr.rd_loop_token = clt` — owning
+    /// `compile.py` `descr.rd_loop_token = clt` — owning
     /// `Arc<CompiledLoopToken>`.
     pub rd_loop_token_clt: UnsafeCell<Option<Arc<CompiledLoopToken>>>,
-    /// `history.py:132` `AbstractFailDescr._attrs_ = ('adr_jump_offset',
+    /// `history.py` `AbstractFailDescr._attrs_ = ('adr_jump_offset',
     /// 'rd_locs', 'rd_loop_token', 'rd_vector_info')`.
     pub adr_jump_offset: UnsafeCell<usize>,
-    /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs`.
+    /// `history.py` `AbstractFailDescr._attrs_` `rd_locs`.
     pub rd_locs: UnsafeCell<Vec<u16>>,
-    /// `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`.
+    /// `compile.py` `AbstractResumeGuardDescr._attrs_ = ('status',)`.
     pub status: AtomicU64,
     /// Pyre-only: identifier of the compiled trace that owns this guard.
     pub trace_id: AtomicU64,
@@ -165,7 +165,7 @@ pub struct ResumeGuardDescr {
     /// statistics counter to keep scheduled exits out of the guard-failure
     /// total.  See `descr.rs FailDescr::is_back_edge_poll`.
     pub back_edge_poll: AtomicBool,
-    /// `AbstractResumeGuardDescr.handle_fail` (`compile.py:701-717`)
+    /// `AbstractResumeGuardDescr.handle_fail` (`compile.py`)
     /// drives `must_compile` via `jitcounter.tick(status_hash)` in
     /// RPython.  Pyre keeps a raw per-descr counter:
     /// the cranelift dispatch hot path calls `increment_fail_count()`
@@ -186,7 +186,7 @@ pub struct ResumeGuardDescr {
     /// `Arc::into_raw(Arc::new(info))`; `Drop` reclaims the Arc.
     pub trace_info: AtomicPtr<CompiledTraceInfo>,
     /// Per-descr external-JUMP target cell (cranelift-only TODO).
-    /// PyPy's `assembler.py:2456-2462 closing_jump`
+    /// PyPy's `assembler.py closing_jump`
     /// emits a raw inter-function JMP to `target_token._ll_loop_code`
     /// at codegen time, so no per-descr slot exists upstream.  Cranelift
     /// IR cannot emit raw inter-function JMPs, so cross-loop JUMP descrs
@@ -292,7 +292,7 @@ impl Descr for ResumeGuardDescr {
             key => Some(key),
         }
     }
-    /// compile.py:844-846: ResumeGuardDescr.clone()
+    /// compile.py: ResumeGuardDescr.clone()
     fn clone_descr(&self) -> Option<DescrRef> {
         Some(Arc::new(ResumeGuardDescr {
             fail_index: alloc_fail_index(),
@@ -536,7 +536,7 @@ impl FailDescr for ResumeGuardDescr {
         ResumeGuardDescr::bridge_dispatch_swap(self, new_ptr, drop_fn)
     }
 
-    /// `assembler.py:2456-2462 closing_jump` parity: external JUMP exits
+    /// `assembler.py closing_jump` parity: external JUMP exits
     /// are routed through a synthesised `ResumeGuardDescr` whose
     /// `external_jump_target` slot carries the cross-loop TargetToken
     /// `DescrRef`.  Membership in the slot IS the external-JUMP
@@ -545,7 +545,7 @@ impl FailDescr for ResumeGuardDescr {
         self.external_jump_target.get().is_some()
     }
 
-    /// `history.py:478` `TargetToken._ll_loop_code` parity: when this
+    /// `history.py` `TargetToken._ll_loop_code` parity: when this
     /// descr is the synthesised cross-loop JUMP exit, surface the target
     /// `DescrRef` the dispatcher re-enters via.  `None` for regular
     /// guard descrs.
@@ -562,7 +562,7 @@ impl FailDescr for ResumeGuardDescr {
     }
 }
 
-/// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr
+/// compile.py `ResumeGuardDescr` parity: a fresh guard descr
 /// carrying the post-numbering `fail_arg_types`.  `payload` initialized
 /// empty; `store_final_boxes_in_guard` fills `rd_*` slots post-numbering.
 pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
@@ -616,7 +616,7 @@ impl ResumeGuardDescr {
     /// Increment the per-descr `fail_count`.  Returns
     /// the post-increment value.  Mirrors PyPy's `jitcounter.tick`
     /// semantics: one increment per observed guard failure, drives
-    /// `must_compile` threshold in `compile.py:701-717`.
+    /// `must_compile` threshold in `compile.py`.
     pub fn increment_fail_count(&self) -> u32 {
         self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -669,7 +669,7 @@ impl ResumeGuardDescr {
 
     /// Publish the external-JUMP target.  Write-once;
     /// panics if invoked twice on the same descr (mirrors PyPy's
-    /// `assembler.py:2456-2462 closing_jump` codegen-time finality —
+    /// `assembler.py closing_jump` codegen-time finality —
     /// the target is determined at trace emission and never revised).
     pub fn set_external_jump_target(&self, target: DescrRef) {
         self.external_jump_target

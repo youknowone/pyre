@@ -1042,11 +1042,11 @@ pub enum TraceAction {
     /// Finish the trace with terminal output values.
     ///
     /// `exit_with_exception = true` maps to
-    /// `pyjitpl.py:3238 MetaInterp.compile_exit_frame_with_exception` —
+    /// `pyjitpl.py MetaInterp.compile_exit_frame_with_exception` —
     /// the FINISH uses `sd.exit_frame_with_exception_descr_ref` and the
     /// classifier routes to `JitException::ExitFrameWithExceptionRef`.
     /// `false` maps to
-    /// `pyjitpl.py:3198 MetaInterp.compile_done_with_this_frame` —
+    /// `pyjitpl.py MetaInterp.compile_done_with_this_frame` —
     /// FINISH uses `sd.done_with_this_frame_descr_<kind>`.
     Finish {
         finish_args: Vec<OpRef>,
@@ -1055,17 +1055,17 @@ pub enum TraceAction {
         /// The concrete exception object this finish escapes with, as a raw
         /// GC-ref word (`0` when `exit_with_exception` is false).
         ///
-        /// `pyjitpl.py:2530-2562 finishframe_exception` snapshots
+        /// `pyjitpl.py finishframe_exception` snapshots
         /// `excvalue = self.last_exc_value` *before* calling
         /// `compile_exit_frame_with_exception(self.last_exc_box)` and then
         /// raises `jitexc.ExitFrameWithExceptionRef(excvalue)`, which
-        /// `warmspot.py:998-1005` re-raises out of `ll_portal_runner`.  The
+        /// `warmspot.py` re-raises out of `ll_portal_runner`.  The
         /// compile half consumes only the symbolic `finish_args`; the raise
         /// half needs the value, so it travels alongside them.
         exc_value: i64,
     },
     /// Close and compile a segmented loop (force_finish_trace).
-    /// pyjitpl.py:1622 _create_segmented_trace_and_blackhole parity.
+    /// pyjitpl.py _create_segmented_trace_and_blackhole parity.
     /// The trace has GUARD_ALWAYS_FAILS + unreachable FINISH appended.
     /// compile_simple_loop inserts a LABEL at entry for bridge attachment.
     SegmentedLoop,
@@ -1127,9 +1127,9 @@ macro_rules! can_enter_jit {
 /// `recursive_portal_call!(driver, green0, green1, ...)` re-enters the
 /// enclosing `#[jit_interp]` portal with the given green key (the greens in
 /// jitdriver declaration order). It is the explicit-intrinsic analog of
-/// tl.py:177 `res = interp(code, pc + offset)` and of the codewriter's
-/// `recursive_call_*` opcode (jtransform.py:522 `handle_recursive_call`,
-/// recognised upstream by `funcptr is jd.portal_runner_ptr`, call.py:363).
+/// tl.py `res = interp(code, pc + offset)` and of the codewriter's
+/// `recursive_call_*` opcode (jtransform.py `handle_recursive_call`,
+/// recognised upstream by `funcptr is jd.portal_runner_ptr`, call.py).
 ///
 /// Inside `#[jit_interp]` the proc macro rewrites every occurrence:
 /// - the transformed (concrete) function calls the `recursive_entry`
@@ -1153,7 +1153,7 @@ macro_rules! recursive_portal_call {
 /// Assure the JIT that `func(args...)` will produce `result`.
 /// `func` must be an elidable function.
 ///
-/// rlib/jit.py:1224 — `record_known_result(result, func, *args)`
+/// rlib/jit.py — `record_known_result(result, func, *args)`
 ///
 /// At runtime (non-JIT), verifies `func(args) == result` (debug builds).
 /// The jitcode_lower proc-macro intercepts this macro invocation and
@@ -1164,7 +1164,7 @@ macro_rules! recursive_portal_call {
 #[macro_export]
 macro_rules! record_known_result {
     ($result:expr, $func:path $(, $arg:expr)*) => {
-        // rlib/jit.py:1229-1232 — untranslated consistency check
+        // rlib/jit.py — untranslated consistency check
         debug_assert_eq!(
             $func($($arg),*), $result,
             "record_known_result: func(...) != result"
@@ -1172,7 +1172,7 @@ macro_rules! record_known_result {
     };
 }
 
-/// rlib/jit.py:1301 — `conditional_call(condition, function, *args)`
+/// rlib/jit.py — `conditional_call(condition, function, *args)`
 ///
 /// At runtime: `if condition { function(args...) }`.
 /// The jitcode_lower proc-macro intercepts this macro invocation and
@@ -1189,7 +1189,7 @@ macro_rules! conditional_call {
     };
 }
 
-/// rlib/jit.py:1322 — `conditional_call_elidable(value, function, *args)`
+/// rlib/jit.py — `conditional_call_elidable(value, function, *args)`
 ///
 /// At runtime: `if value is falsy { value = function(args...) }; return value`.
 /// The jitcode_lower proc-macro intercepts this macro invocation and
@@ -1213,7 +1213,7 @@ macro_rules! conditional_call_elidable {
 ///
 /// Uses the same algorithm as [`GreenKey::hash_u64`](majit_ir::GreenKey::hash_u64),
 /// so callers can compute a key hash without constructing a full `GreenKey`.
-/// warmstate.py:584-593 `JitCell.get_uhash` — Int-only path.
+/// warmstate.py `JitCell.get_uhash` — Int-only path.
 ///
 /// Callers that have non-Int greens (Float / Ref) must use
 /// [`green_key_hash_typed`] instead; the per-type
@@ -1375,7 +1375,7 @@ pub const MC_DIAG_SLOTS: usize = 79;
 /// `pyjitpl.py:3059-3060 self.current_merge_points.append((live_arg_boxes,
 /// start))` appends unconditionally; 56 = `close_header_pc` fell back to
 /// `self.header_pc` because the walk recorded no close greens, where
-/// `pyjitpl.py:3021 same_greenkey(original_boxes, live_arg_boxes,
+/// `pyjitpl.py same_greenkey(original_boxes, live_arg_boxes,
 /// num_green_args)` always compares the actual closing boxes. 55 and 56 are
 /// gated behind a non-zero `retrace_limit` (default 0, `warmstate.rs`
 /// DEFAULT_RETRACE_LIMIT / `rpython/rlib/jit.py:595`), so a default-parameter
@@ -1732,7 +1732,7 @@ pub fn mc_diag_bump(i: usize) {
     MC_DIAG[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// rpython/rlib/rstack.py:75-90 `stack_almost_full`. Returns `true` if
+/// rpython/rlib/rstack.py `stack_almost_full`. Returns `true` if
 /// the stack is more than 15/16ths full against the recursion-limit
 /// budget. Dispatches to the interpreter-registered hook; in tests or
 /// standalone binaries without the interpreter's stack-check layer,

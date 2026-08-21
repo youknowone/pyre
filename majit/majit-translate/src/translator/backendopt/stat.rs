@@ -48,7 +48,7 @@ pub fn get_statistics(
     let mut seen: HashSet<usize> = HashSet::new();
     let mut stack: Vec<GraphRef> = vec![graph.clone()];
     let mut stats = Statistics::default();
-    // Upstream `stat.py:13` `per_graph = {}`. Insertion-order vector
+    // Upstream `stat.py` `per_graph = {}`. Insertion-order vector
     // keyed by `GraphKey` so the post-walk emission can mirror
     // upstream's per-graph delta tuple.
     let mut per_graph: Vec<PerGraphEntry> = Vec::new();

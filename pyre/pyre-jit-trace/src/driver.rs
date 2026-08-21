@@ -11,7 +11,7 @@ use crate::state::PyreJitState;
 /// `(PyCode*, next_instr)`, and the JIT path never runs under a profiler,
 /// so `is_being_profiled` folds to 0 — the trace-side call sites have no
 /// frame to read it from. The returned u64 is the full
-/// `JitCell.get_uhash` over the typed green tuple (warmstate.py:584-593),
+/// `JitCell.get_uhash` over the typed green tuple (warmstate.py),
 /// so this legacy hash flow and the typed marker-path lookup
 /// (`lookup_chain_with_key`) agree on the same cell.
 #[inline(always)]
@@ -23,7 +23,7 @@ pub fn make_green_key(code_ptr: *const (), pc: usize) -> u64 {
 /// them.
 ///
 /// A warmstate call that reaches a CELL needs this — `JitCell.comparekey`
-/// (warmstate.py:575-582 `def comparekey(self, *greenargs2)`) is what picks one
+/// (warmstate.py `def comparekey(self, *greenargs2)`) is what picks one
 /// cell out of a bucket, and a cell created from the fold alone is filed
 /// without a comparekey, where no later typed lookup can find it. The u64 form
 /// stays correct for calls that only move a counter.

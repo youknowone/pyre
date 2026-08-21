@@ -173,7 +173,7 @@ crate::py_module! {
         "Incomplete" => crate::builtins::lookup_exc_class("Exception").expect("Exception installed"),
     },
     inline_functions: {
-        // interp_hexlify.py:18 `hexlify(data, w_sep=None, w_bytes_per_sep=None)`
+        // interp_hexlify.py `hexlify(data, w_sep=None, w_bytes_per_sep=None)`
         // — three positional-or-keyword slots.  `b2a_hex` is the alias.
         fn b2a_hex(
             data: PyObjectRef,
@@ -189,7 +189,7 @@ crate::py_module! {
         ) -> Result<PyObjectRef, crate::PyError> {
             hexlify_impl(data, sep, bytes_per_sep)
         }
-        // interp_qp.py:19 `a2b_qp(data, header=0)` and interp_qp.py:97
+        // interp_qp.py `a2b_qp(data, header=0)` and interp_qp.py
         // `b2a_qp(data, quotetabs=0, istext=1, header=0)` — every slot
         // positional-or-keyword.
         fn a2b_qp(
@@ -229,7 +229,7 @@ crate::py_module! {
             let out = transforms::a2b_base64(&data, strict_mode).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
         }
-        // interp_base64.py:102 `b2a_base64(bin, __kwonly__, newline=True)` —
+        // interp_base64.py `b2a_base64(bin, __kwonly__, newline=True)` —
         // `data` positional-only, `newline` keyword-only (the `__kwonly__`
         // marker).
         fn b2a_base64(
@@ -243,7 +243,7 @@ crate::py_module! {
             let newline = slot_bool(newline, true)?;
             Ok(w_bytes_from_bytes(&transforms::b2a_base64(&data, newline)))
         }
-        // interp_uu.py:77 `b2a_uu(bin, __kwonly__, backtick=False)`.
+        // interp_uu.py `b2a_uu(bin, __kwonly__, backtick=False)`.
         fn b2a_uu(
             data: PyObjectRef,
             #[posonly]
@@ -258,7 +258,7 @@ crate::py_module! {
         }
     },
     functions: {
-        // interp_hexlify.py:53 `unhexlify(hexstr)` / interp_uu.py:25
+        // interp_hexlify.py `unhexlify(hexstr)` / interp_uu.py:25
         // `a2b_uu(ascii)` — a single positional argument, no keyword surface.
         "a2b_hex" / 1 = |args| {
             let data = as_bytes(args.first().copied().unwrap_or(w_none()))?;
@@ -277,7 +277,7 @@ crate::py_module! {
         },
     },
     extra_init: |ns| {
-        // interp_crc32.py:6 `crc32(data, oldcrc=0)` and interp_hqx.py:254
+        // interp_crc32.py `crc32(data, oldcrc=0)` and interp_hqx.py:254
         // `crc_hqx(data, w_oldcrc)`.  Both are all-positional-only, a shape the
         // `#[pyre_function]` `#[posonly]` marker cannot express (there is no
         // trailing parameter to mark the boundary before), so their
@@ -319,7 +319,7 @@ crate::py_module! {
     },
 }
 
-/// interp_hexlify.py:18 — the shared `hexlify` / `b2a_hex` body.  `data` is a
+/// interp_hexlify.py — the shared `hexlify` / `b2a_hex` body.  `data` is a
 /// bytes-like buffer; `sep` / `bytes_per_sep` are the length-1-ASCII separator
 /// controls validated by [`sep_args`].
 fn hexlify_impl(
@@ -336,7 +336,7 @@ fn hexlify_impl(
     )))
 }
 
-/// interp_crc32.py:6 `crc32(space, data, oldcrc=0)` — all-positional-only:
+/// interp_crc32.py `crc32(space, data, oldcrc=0)` — all-positional-only:
 /// `data` required, `oldcrc` an optional truncated-int.
 fn crc32(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let data = as_buffer_bytes(arg_required(
@@ -349,7 +349,7 @@ fn crc32(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_int_new(transforms::crc32(&data, init) as i64))
 }
 
-/// interp_hqx.py:254 `crc_hqx(space, data, w_oldcrc)` — both positional-only
+/// interp_hqx.py `crc_hqx(space, data, w_oldcrc)` — both positional-only
 /// and required.
 fn crc_hqx(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let data = as_buffer_bytes(arg_required(

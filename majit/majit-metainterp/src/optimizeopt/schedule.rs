@@ -49,7 +49,7 @@ pub struct Pack {
     pub is_accumulating: bool,
     /// schedule.py:989: accumulation argument position (-1 = none).
     pub position: i32,
-    /// schedule.py:981: AccumPack.operator — '+' for INT_ADD, 'g' for guard, None for normal.
+    /// schedule.py: AccumPack.operator — '+' for INT_ADD, 'g' for guard, None for normal.
     pub operator: Option<char>,
 }
 
@@ -57,7 +57,7 @@ pub struct Pack {
 /// (e.g., `sum += array[i]`) that can be vectorized with horizontal
 /// reduction instructions.
 #[derive(Clone, Debug)]
-/// schedule.py:980-1003: AccumPack — accumulation (reduction) pack.
+/// schedule.py: AccumPack — accumulation (reduction) pack.
 pub struct AccumPack {
     /// The scalar opcode of the accumulation (e.g., IntAdd, FloatAdd).
     pub scalar_opcode: OpCode,
@@ -88,7 +88,7 @@ pub struct AccumPack {
 /// #169/#175 follow-up, not a correctness fix.
 #[derive(Clone, Debug)]
 pub struct AccumEntry {
-    /// schedule.py:998: getleftmostseed() — first member's arg at `position`.
+    /// schedule.py: getleftmostseed() — first member's arg at `position`.
     pub seed: OpRef,
     /// schedule.py:981: operator character ('+' etc.)
     pub operator: char,
@@ -165,9 +165,9 @@ pub struct VecScheduleState {
     pub expanded_map: indexmap::IndexMap<OpRef, Vec<(OpRef, i32)>>,
     /// schedule.py:591: inputargs of the loop label.
     pub inputargs: indexmap::IndexMap<OpRef, ()>,
-    /// schedule.py:38,723: invariant_vector_vars — vector ops created by expand()
+    /// schedule.py: invariant_vector_vars — vector ops created by expand()
     /// for loop-invariant scalars (constants and inputargs). Populated in
-    /// expand() (schedule.py:554-555), called from prepare_arguments().
+    /// expand() (schedule.py), called from prepare_arguments().
     pub invariant_vector_vars: indexmap::IndexSet<OpRef>,
     /// schedule.py:532: invariant_oplist — ops to emit before the loop.
     /// `Vec<OpRc>` for the same producer-identity reason as `oplist`.
@@ -176,12 +176,12 @@ pub struct VecScheduleState {
     pub accumulation: indexmap::IndexMap<OpRef, AccumEntry>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
-    /// `schedule.py:20-28 forwarded_vecinfo(op)` scratch, keyed by full `OpRef`
+    /// `schedule.py forwarded_vecinfo(op)` scratch, keyed by full `OpRef`
     /// (InputArg and op namespaces never collide).
     ///
     /// PyPy carries this scheduling scratch in `op._forwarded`
-    /// (`vector.py:54-56 setup_vectorization`) and re-propagates it across its
-    /// SINGLE clone path, `copy_resop` (`vector.py:35-40`), which COPIES the
+    /// (`vector.py setup_vectorization`) and re-propagates it across its
+    /// SINGLE clone path, `copy_resop` (`vector.py`), which COPIES the
     /// already-resolved `VectorizationInfo` — INT_SIGNEXT's bytesize is the
     /// dynamic value of `arg1`, resolved ONCE at setup time
     /// (`resoperation.py:181-186`) and thereafter only copied, never recomputed.
@@ -195,9 +195,9 @@ pub struct VecScheduleState {
     /// `copy_resop`-equivalent exists.
     ///
     /// `Op.vecinfo` is the SEPARATE permanent carrier: the
-    /// `resoperation.py:111-127 VecOperationNew` datatype/bytesize/signed/count
+    /// `resoperation.py VecOperationNew` datatype/bytesize/signed/count
     /// that survives `copy_and_change`, cleared for non-vector ops by
-    /// `vector.py:58-60 teardown_vectorization`.
+    /// `vector.py teardown_vectorization`.
     vecinfo_cache: indexmap::IndexMap<OpRef, majit_ir::VectorizationInfo>,
 }
 
@@ -218,13 +218,13 @@ impl VecScheduleState {
         }
     }
 
-    /// vector.py:54-56 `op.set_forwarded(VectorizationInfo(op))` for one op:
+    /// vector.py `op.set_forwarded(VectorizationInfo(op))` for one op:
     /// the per-op body that `VectorLoop::setup_vectorization` iterates.
     /// PyPy stores the vecinfo on `op._forwarded`; pyre keeps it in this
     /// scheduler's pos-keyed store.
     ///
     /// `constant_of` resolves the optimizer's const-pool so the
-    /// `resoperation.py:181-186 INT_SIGNEXT` branch can read `arg1.value`
+    /// `resoperation.py INT_SIGNEXT` branch can read `arg1.value`
     /// at stamp time — PyPy reads the value off the `ConstInt` instance
     /// directly because `_args[1]` IS the const; pyre's flat-OpRef
     /// encoding stores constants as a pool index, so the resolver fills
@@ -248,7 +248,7 @@ impl VecScheduleState {
         self.vecinfo_cache.swap_remove(&opref);
     }
 
-    /// `resoperation.py:181-186 VectorizationInfo.__init__` INT_SIGNEXT
+    /// `resoperation.py VectorizationInfo.__init__` INT_SIGNEXT
     /// branch.  PyPy reads `op.getarg(1).value` off the `ConstInt` object
     /// directly, after `assert isinstance(arg1, history.ConstInt)`; pyre's
     /// flat-OpRef encoding stores the const as a pool index, so the
@@ -260,7 +260,7 @@ impl VecScheduleState {
         op: &Op,
         constant_of: &dyn Fn(OpRef) -> Option<i64>,
     ) -> majit_ir::VectorizationInfo {
-        // resoperation.py:185 `assert isinstance(arg1, history.ConstInt)`.
+        // resoperation.py `assert isinstance(arg1, history.ConstInt)`.
         let bytesize = constant_of(op.arg(1).to_opref())
             .expect("INT_SIGNEXT arg1 must resolve to a ConstInt (resoperation.py:185)");
         assert!(
@@ -286,7 +286,7 @@ impl VecScheduleState {
         self.vecinfo_cache.insert(opref, info);
     }
 
-    /// schedule.py:20-28 `forwarded_vecinfo(op)`.
+    /// schedule.py `forwarded_vecinfo(op)`.
     pub fn forwarded_vecinfo(&mut self, op: &Op) -> majit_ir::VectorizationInfo {
         let opref = op.pos.get();
         if let Some(info) = self.get_forwarded_vecinfo(opref) {
@@ -324,11 +324,11 @@ impl VecScheduleState {
         info
     }
 
-    /// resoperation.py:163-212 `VectorizationInfo(op)` for ResOps.
+    /// resoperation.py `VectorizationInfo(op)` for ResOps.
     /// Const/InputArg are handled by the cache miss path in
     /// `forwarded_vecinfo_for_ref` (`VectorizationInfo.from_type`).
     ///
-    /// Mirrors PyPy `resoperation.py:163-212 VectorizationInfo.__init__`.
+    /// Mirrors PyPy `resoperation.py VectorizationInfo.__init__`.
     /// The `INT_SIGNEXT` branch (`:181-186`) is handled in
     /// `int_signext_vecinfo` at setup time because it needs the
     /// caller-supplied const-pool resolver; once the forwarded vecinfo
@@ -359,7 +359,7 @@ impl VecScheduleState {
             return info;
         }
 
-        // resoperation.py:187-190 is_typecast branch (INT_SIGNEXT static
+        // resoperation.py is_typecast branch (INT_SIGNEXT static
         // gating returns None per `cast_to_bytesize_static`; the dynamic
         // INT_SIGNEXT bytesize is stamped in `int_signext_vecinfo` at
         // setup time and read back through the forwarded vecinfo cache).
@@ -530,7 +530,7 @@ impl VecScheduleState {
         Self::rebind_op_args_in(op, &[&self.oplist, &self.invariant_oplist]);
     }
 
-    /// resoperation.py:111-116 (VecOperationNew): Create a vector op with
+    /// resoperation.py (VecOperationNew): Create a vector op with
     /// proper VectorizationInfo. All vector helper functions should use this
     /// instead of raw Op::new + register_vec_type.
     pub fn create_vec_op(
@@ -548,7 +548,7 @@ impl VecScheduleState {
         let mut vinfo = majit_ir::VectorizationInfo::new();
         vinfo.setinfo(datatype, bytesize as i8, signed);
         vinfo.count = count as i16;
-        // resoperation.py:111-115 VecOperationNew.__init__ stores the
+        // resoperation.py VecOperationNew.__init__ stores the
         // datatype/bytesize/signed/count on the op object itself; copy_and_change
         // (resoperation.py:511-518) propagates them. Cache the same payload
         // on `Op.vecinfo` so the vector shape survives schedule-state teardown.
@@ -565,13 +565,13 @@ impl VecScheduleState {
         opref.ty() == Some(Type::Float)
     }
 
-    /// schedule.py:625-630: setvector_of_box — record that scalar_op
+    /// schedule.py: setvector_of_box — record that scalar_op
     /// is at index `idx` in the vector `vecop`.
     pub fn setvector_of_box(&mut self, scalar_op: OpRef, idx: usize, vecop: OpRef) {
         self.box_to_vbox.insert(scalar_op, (idx, vecop));
     }
 
-    /// schedule.py:632-638: getvector_of_box — look up which vector
+    /// schedule.py: getvector_of_box — look up which vector
     /// op contains the scalar op.
     pub fn getvector_of_box(&self, scalar_op: OpRef) -> Option<(usize, OpRef)> {
         self.box_to_vbox.get(&scalar_op).copied()
@@ -587,7 +587,7 @@ impl VecScheduleState {
         self.oplist.push(std::rc::Rc::new(op));
     }
 
-    /// schedule.py:754-760: remember_args_in_vector — after creating a new
+    /// schedule.py: remember_args_in_vector — after creating a new
     /// vector from assemble/position, update box_to_vbox for each scalar arg
     /// so future lookups find the correct vector box.
     pub fn remember_args_in_vector(
@@ -615,7 +615,7 @@ impl VecScheduleState {
         }
     }
 
-    /// schedule.py:762-779: VecScheduleState.post_schedule.
+    /// schedule.py: VecScheduleState.post_schedule.
     ///
     /// RPython reads `self.graph.loop`; majit's VecScheduleState holds no
     /// graph/loop field, so the loop is a parameter. `seen` is
@@ -626,8 +626,8 @@ impl VecScheduleState {
         loop_: &mut crate::optimizeopt::vector::VectorLoop,
         seen: &mut indexmap::IndexSet<OpRef>,
     ) {
-        // schedule.py:763 → base SchedulerState.post_schedule (schedule.py:108-116),
-        // inlined here. schedule.py:111-114 resolve_delayed is omitted: majit has
+        // schedule.py → base SchedulerState.post_schedule (schedule.py),
+        // inlined here. schedule.py resolve_delayed is omitted: majit has
         // no `delayed` list (ILP scheduling is done up front via
         // schedule_operations), so the base reduces to rename-jump + move-oplist.
         self.renamer.rename(&mut loop_.jump); // schedule.py:115
@@ -671,7 +671,7 @@ impl VecScheduleState {
                     &mut self.renamer,
                 ));
             }
-            // schedule.py:770-771: opnum = loop.label.getopnum();
+            // schedule.py: opnum = loop.label.getopnum();
             //   op = loop.label.copy_and_change(opnum, args).
             // The opcode ("opnum") is unchanged → loop_.label.opcode; descr None
             // means "keep self.descr"; copy_and_change preserves the result `pos`.
@@ -706,7 +706,7 @@ impl VecScheduleState {
         }
     }
 
-    // ── schedule.py:524-633: expand / find_expanded ──
+    // ── schedule.py: expand / find_expanded ──
 
     /// schedule.py:597-604: record that `args` were expanded into `vecop`.
     pub fn record_expansion(&mut self, args: &[OpRef], vecop: OpRef) {
@@ -723,7 +723,7 @@ impl VecScheduleState {
         }
     }
 
-    /// schedule.py:606-633: find_expanded — look up if `args` have already
+    /// schedule.py: find_expanded — look up if `args` have already
     /// been expanded into a vector op.
     pub fn find_expanded(&self, args: &[OpRef]) -> Option<OpRef> {
         if args.len() == 1 {
@@ -793,14 +793,14 @@ impl From<NotAProfitableLoop> for VectorizeError {
     }
 }
 
-/// schedule.py:462-474: check_if_pack_supported — validate pack constraints.
+/// schedule.py: check_if_pack_supported — validate pack constraints.
 pub fn check_if_pack_supported(
     state: &mut VecScheduleState,
     pack: &Pack,
     ops: &[OpRc],
 ) -> Result<(), NotAProfitableLoop> {
     let first_op = &ops[pack.members[0]];
-    // schedule.py:471-474: INT_MUL with bytesize 8 or 1 is not profitable
+    // schedule.py: INT_MUL with bytesize 8 or 1 is not profitable
     if first_op.opcode == OpCode::IntMul {
         let vi = state.forwarded_vecinfo(first_op);
         let insize = vi.getbytesize();
@@ -811,7 +811,7 @@ pub fn check_if_pack_supported(
     Ok(())
 }
 
-/// schedule.py:476-486: unpack_from_vector — extract a scalar from a vector box.
+/// schedule.py: unpack_from_vector — extract a scalar from a vector box.
 /// Creates a VecUnpack op with the correct type (I or F) based on the
 /// vector box's datatype. Mirrors OpHelpers.create_vec_unpack(var.type, ...).
 pub fn unpack_from_vector(
@@ -829,7 +829,7 @@ pub fn unpack_from_vector(
     } else {
         OpCode::VecUnpackI
     };
-    // schedule.py:479-483: forwarded_vecinfo(arg).bytesize/signed
+    // schedule.py: forwarded_vecinfo(arg).bytesize/signed
     let (datatype, bytesize, signed) = get_vec_info(state, vec_ref, &[]);
     let unpack_op = state.create_vec_op(
         unpack_opcode,
@@ -846,7 +846,7 @@ pub fn unpack_from_vector(
     result
 }
 
-/// schedule.py:388-400: prepare_fail_arguments — process guard failargs
+/// schedule.py: prepare_fail_arguments — process guard failargs
 /// for vectorized guard ops, unpacking vector boxes to scalar.
 pub fn prepare_fail_arguments(
     state: &mut VecScheduleState,
@@ -877,7 +877,7 @@ pub fn prepare_fail_arguments(
     }
 }
 
-/// schedule.py:352-386: prepare_arguments — transform scalar args to vector args.
+/// schedule.py: prepare_arguments — transform scalar args to vector args.
 ///
 /// RPython gates this on cpu.vector_ext.get_operation_restriction(left).
 /// majit uses Cranelift which has no per-op restriction object, so we apply
@@ -901,13 +901,13 @@ pub fn prepare_arguments(
             // schedule.py:385: case 1b — size mismatch (crop)
             crop_vector(state, pack, args, i, ops);
         } else {
-            // schedule.py:377-378: case 2 — not in a vector, expand
+            // schedule.py: case 2 — not in a vector, expand
             expand(state, pack, args, arg, i, ops);
         }
     }
 }
 
-/// schedule.py:420-428: assemble_scattered_values — when pack members'
+/// schedule.py: assemble_scattered_values — when pack members'
 /// args at `index` reside in different vector boxes, gather them into one.
 pub fn assemble_scattered_values(
     state: &mut VecScheduleState,
@@ -942,15 +942,15 @@ pub fn assemble_scattered_values(
         }
     }
 
-    // schedule.py:425-428: if scattered across >1 vector, gather
+    // schedule.py: if scattered across >1 vector, gather
     if vectors.len() > 1 {
         args[index] = gather(state, &vectors, pack.members.len(), ops);
-        // schedule.py:428: remember_args_in_vector
+        // schedule.py: remember_args_in_vector
         state.remember_args_in_vector(pack, index, args[index], ops);
     }
 }
 
-/// schedule.py:430-441: gather — combine multiple vector fragments into one.
+/// schedule.py: gather — combine multiple vector fragments into one.
 /// Uses each fragment's actual lane count (vecinfo.count / newvecinfo.count)
 /// to determine insertion position and guard against overfill.
 pub fn gather(
@@ -996,7 +996,7 @@ fn get_vec_info(state: &mut VecScheduleState, opref: OpRef, ops: &[OpRc]) -> (ch
     }
 }
 
-/// schedule.py:488-502: pack_into_vector — insert `src` at position `tidx`
+/// schedule.py: pack_into_vector — insert `src` at position `tidx`
 /// in `tgt`, producing a wider vector.
 ///
 /// `tgt = [1,2,3,4,_,_,_,_]`, `src = [5,6,_,_]`
@@ -1020,7 +1020,7 @@ pub fn pack_into_vector(
     };
     let tidx_const = OpRef::const_int(tidx as i64);
     let scount_const = OpRef::const_int(scount as i64);
-    // schedule.py:494-497: forwarded_vecinfo(tgt).bytesize/signed, newcount
+    // schedule.py: forwarded_vecinfo(tgt).bytesize/signed, newcount
     let tgt_count = get_vec_count(state, tgt, ops);
     let newcount = tgt_count + scount;
     let (datatype, bytesize, signed) = get_vec_info(state, tgt, ops);
@@ -1039,7 +1039,7 @@ pub fn pack_into_vector(
     result
 }
 
-/// schedule.py:443-460: position_values — if an arg is at position != 0
+/// schedule.py: position_values — if an arg is at position != 0
 /// in its vector box but needs to be at position 0, unpack it.
 pub fn position_values(
     state: &mut VecScheduleState,
@@ -1056,12 +1056,12 @@ pub fn position_values(
         // Without oprestrict, default to 1 (extract single element)
         let count = 1;
         args[index] = unpack_from_vector(state, arg, position, count);
-        // schedule.py:460: remember_args_in_vector
+        // schedule.py: remember_args_in_vector
         state.remember_args_in_vector(pack, index, args[index], ops);
     }
 }
 
-/// schedule.py:402-418: crop_vector — if the vector's element size doesn't
+/// schedule.py: crop_vector — if the vector's element size doesn't
 /// match what the operation requires, insert VEC_INT_SIGNEXT.
 pub fn crop_vector(
     state: &mut VecScheduleState,
@@ -1106,7 +1106,7 @@ fn get_op_bytesize_for_ref(state: &mut VecScheduleState, opref: OpRef, ops: &[Op
     state.forwarded_vecinfo_for_ref(opref, ops).getbytesize() as i32
 }
 
-/// schedule.py:524-582: expand — broadcast or gather a scalar into a vector box.
+/// schedule.py: expand — broadcast or gather a scalar into a vector box.
 ///
 /// Two cases:
 ///   1. All pack members use the same arg at position `index` → VecExpand (broadcast)
@@ -1178,7 +1178,7 @@ pub fn expand(
         return;
     }
 
-    // schedule.py:567: arg_vecinfo = forwarded_vecinfo(arg)
+    // schedule.py: arg_vecinfo = forwarded_vecinfo(arg)
     //   vecop = OpHelpers.create_vec(arg.type, arg_vecinfo.bytesize,
     //                                arg_vecinfo.signed, pack.opnum())
     // Only the heterogeneous (VecPack/gather) branch uses arg's vecinfo —
@@ -1188,7 +1188,7 @@ pub fn expand(
     let bytesize = arg_info.bytesize as i32;
     let signed = arg_info.signed;
 
-    // schedule.py:560-582: VecPack (gather) — heterogeneous args
+    // schedule.py: VecPack (gather) — heterogeneous args
     let expandargs: Vec<OpRef> = pack
         .members
         .iter()
@@ -1257,7 +1257,7 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[OpRc])
     if pack.members.is_empty() {
         return;
     }
-    // schedule.py:324: check_if_pack_supported
+    // schedule.py: check_if_pack_supported
     if check_if_pack_supported(state, pack, ops).is_err() {
         return;
     }
@@ -1271,15 +1271,15 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[OpRc])
         return; // not vectorizable
     };
 
-    // schedule.py:335-336: build args list + prepare_arguments
+    // schedule.py: build args list + prepare_arguments
     let mut args: Vec<OpRef> = first_op.getarglist().iter().map(|a| a.to_opref()).collect();
     prepare_arguments(state, pack, &mut args, ops);
 
-    // schedule.py:337-338: VecOperation(left.vector, args, left, pack.numops())
-    // resoperation.py:100-104: copy datatype/bytesize/signed from baseop's vecinfo
+    // schedule.py: VecOperation(left.vector, args, left, pack.numops())
+    // resoperation.py: copy datatype/bytesize/signed from baseop's vecinfo
     let vi = state.forwarded_vecinfo(first_op);
     let (mut datatype, mut bytesize, signed) = (vi.datatype, vi.bytesize, vi.signed);
-    // resoperation.py:105-108 VecOperation typecast override.
+    // resoperation.py VecOperation typecast override.
     //   if baseop.is_typecast():
     //       ft, tt = baseop.cast_types()
     //       datatype = tt

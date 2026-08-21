@@ -5,19 +5,19 @@
 //!
 //! | upstream | Rust mirror |
 //! |---|---|
-//! | `class BoolRepr(IntegerRepr)` (`rbool.py:10-35`) | [`BoolRepr`] |
-//! | `bool_repr = BoolRepr()` singleton (`rbool.py:36`) | [`bool_repr`] |
-//! | `SomeBool.rtyper_makerepr / rtyper_makekey` (`rbool.py:39-44`) | wired in [`super::rmodel::rtyper_makerepr`] + [`super::rmodel::rtyper_makekey`] |
+//! | `class BoolRepr(IntegerRepr)` (`rbool.py`) | [`BoolRepr`] |
+//! | `bool_repr = BoolRepr()` singleton (`rbool.py`) | [`bool_repr`] |
+//! | `SomeBool.rtyper_makerepr / rtyper_makekey` (`rbool.py`) | wired in [`super::rmodel::rtyper_makerepr`] + [`super::rmodel::rtyper_makekey`] |
 //!
 //! ## Deferred to follow-up commits
 //!
-//! * `BoolRepr(IntegerRepr)` inheritance (`rbool.py:10`) — upstream
+//! * `BoolRepr(IntegerRepr)` inheritance (`rbool.py`) — upstream
 //!   inherits `IntegerRepr` so the bool value participates in
 //!   `pairtype(BoolRepr, IntegerRepr)` conversions. `rint.py IntegerRepr`
 //!   has not been ported yet; Rust implements [`BoolRepr`] as a
 //!   standalone `Repr` and the rint port will wire a shared trait
 //!   (`IntegerRepr` sub-trait) when it lands.
-//! * `self.as_int = signed_repr` (`rbool.py:14-15`) — Rust does not
+//! * `self.as_int = signed_repr` (`rbool.py`) — Rust does not
 //!   carry an explicit field, but `BoolRepr` routes integer coercions
 //!   through the same `Signed` repr that upstream stores there.
 //! * pairtype conversions `BoolRepr ↔ FloatRepr` / `BoolRepr ↔ IntegerRepr`
@@ -33,7 +33,7 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, LowLevelOpList};
 
-/// RPython `class BoolRepr(IntegerRepr)` (`rbool.py:10-35`).
+/// RPython `class BoolRepr(IntegerRepr)` (`rbool.py`).
 ///
 /// ```python
 /// class BoolRepr(IntegerRepr):
@@ -101,8 +101,8 @@ impl Repr for BoolRepr {
         super::pairtype::ReprClassId::BoolRepr
     }
 
-    /// RPython `BoolRepr` inherits from `IntegerRepr` (`rbool.py:10`),
-    /// picking up `IntegerRepr.get_ll_eq_function` (`rint.py:39-42`)
+    /// RPython `BoolRepr` inherits from `IntegerRepr` (`rbool.py`),
+    /// picking up `IntegerRepr.get_ll_eq_function` (`rint.py`)
     /// which returns `None` for non-shortint widths. Bool's lltype
     /// has a non-`None` `_opprefix` (`'int_'`), so the `None` branch
     /// fires; explicit override in Rust since trait dispatch does not
@@ -115,7 +115,7 @@ impl Repr for BoolRepr {
     }
 
     /// RPython `BoolRepr` inherits `IntegerRepr.get_ll_hash_function`
-    /// (`rint.py:50-54`) returning `ll_hash_int`. Bool's bit-pattern
+    /// (`rint.py`) returning `ll_hash_int`. Bool's bit-pattern
     /// representation is `Bool` lltype (1 bit / 1 byte); `intmask(b)`
     /// widens it to `Signed` semantically — synthesizes the same
     /// single-block helper graph as IntegerRepr via the shared
@@ -139,7 +139,7 @@ impl Repr for BoolRepr {
     }
 
     /// RPython `BoolRepr` inherits `IntegerRepr.get_ll_fasthash_function
-    /// = get_ll_hash_function` (`rint.py:50`). Rust trait dispatch does
+    /// = get_ll_hash_function` (`rint.py`). Rust trait dispatch does
     /// not inherit from the concrete `IntegerRepr`, so the alias is
     /// re-stated here; without it the base default (`None`) would fire
     /// and `gen_hash_function` would lose the fast path for Bool dict
@@ -151,7 +151,7 @@ impl Repr for BoolRepr {
         self.get_ll_hash_function(rtyper)
     }
 
-    /// RPython `BoolRepr.convert_const(self, value)` (`rbool.py:17-20`):
+    /// RPython `BoolRepr.convert_const(self, value)` (`rbool.py`):
     ///
     /// ```python
     /// def convert_const(self, value):
@@ -173,7 +173,7 @@ impl Repr for BoolRepr {
         ))
     }
 
-    /// RPython `BoolRepr.rtype_bool(_, hop)` (`rbool.py:22-24`):
+    /// RPython `BoolRepr.rtype_bool(_, hop)` (`rbool.py`):
     ///
     /// ```python
     /// def rtype_bool(_, hop):
@@ -206,7 +206,7 @@ impl Repr for BoolRepr {
     }
 }
 
-/// RPython `bool_repr = BoolRepr()` (`rbool.py:36`).
+/// RPython `bool_repr = BoolRepr()` (`rbool.py`).
 ///
 /// Module-global singleton; pyre matches via `Arc<BoolRepr>` cached in
 /// `OnceLock` so `is bool_repr` identity comparisons upstream relies on
@@ -217,7 +217,7 @@ pub fn bool_repr() -> Arc<BoolRepr> {
 }
 
 // ____________________________________________________________
-// pairtype(BoolRepr, X) conversions — rbool.py:49-84.
+// pairtype(BoolRepr, X) conversions — rbool.py.
 //
 // Upstream keeps each `class __extend__(pairtype(R_A, R_B))` block as
 // a separate metaclass scope, so the four `convert_from_to` methods
@@ -340,19 +340,19 @@ mod tests {
 
     #[test]
     fn bool_repr_lowleveltype_is_bool_and_repr_string_matches_upstream() {
-        // rbool.py:11 — `lowleveltype = Bool`.
+        // rbool.py — `lowleveltype = Bool`.
         let r = BoolRepr::new();
         assert_eq!(r.lowleveltype(), &LowLevelType::Bool);
-        // rmodel.py:30 `<%s %s>` formatter — `<BoolRepr Bool>`.
+        // rmodel.py `<%s %s>` formatter — `<BoolRepr Bool>`.
         assert_eq!(r.repr_string(), "<BoolRepr Bool>");
-        // rmodel.py:33 compact_repr — "BoolRepr" → "BoolR" replacement
+        // rmodel.py compact_repr — "BoolRepr" → "BoolR" replacement
         // followed by short_name.
         assert_eq!(r.compact_repr(), "BoolR Bool");
     }
 
     #[test]
     fn bool_repr_singleton_returns_same_arc() {
-        // rbool.py:36 — `bool_repr = BoolRepr()` module-global.
+        // rbool.py — `bool_repr = BoolRepr()` module-global.
         let a = bool_repr();
         let b = bool_repr();
         assert!(Arc::ptr_eq(&a, &b));
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn convert_const_accepts_bool_values() {
-        // rbool.py:17-20 — convert_const asserts `isinstance(value,
+        // rbool.py — convert_const asserts `isinstance(value,
         // bool)` and returns the value (wrapped with Bool lowleveltype
         // via base Repr::convert_const's pyre adaptation).
         let r = BoolRepr::new();
@@ -381,13 +381,13 @@ mod tests {
 
     #[test]
     fn convert_const_rejects_non_bool() {
-        // rbool.py:18-19 — `raise TyperError("not a bool: %r" % (value,))`.
+        // rbool.py — `raise TyperError("not a bool: %r" % (value,))`.
         let r = BoolRepr::new();
         let err = r.convert_const(&ConstValue::Int(1)).unwrap_err();
         assert!(err.to_string().contains("not a bool"));
     }
 
-    /// rbool.py inherits `IntegerRepr.get_ll_hash_function` (rint.py:50-54);
+    /// rbool.py inherits `IntegerRepr.get_ll_hash_function` (rint.py);
     /// for `Bool` lltype the synthesized helper widens via
     /// `cast_bool_to_int` (`intmask(b)` semantics) so the return value
     /// matches the helper's `Signed` return type. Without the cast the
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn rtyper_getrepr_on_some_bool_returns_the_singleton() {
-        // rbool.py:39-41 — `SomeBool.rtyper_makerepr` returns `bool_repr`.
+        // rbool.py — `SomeBool.rtyper_makerepr` returns `bool_repr`.
         // Verify the full dispatch chain keeps singleton identity.
         use crate::annotator::model::{SomeBool, SomeValue};
 

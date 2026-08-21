@@ -44,14 +44,14 @@
 //! `formatting`, neither of which pyre routes this way.
 //!
 //! Names, entry layout, group sizes and the build loop follow
-//! `rpython/rlib/rutf8.py:131-644`.  The `_is_64bit` branch of
+//! `rpython/rlib/rutf8.py`.  The `_is_64bit` branch of
 //! `next_codepoint_pos` (a hand-tuned x86-64 sequence guarded by
 //! `not jit.we_are_jitted()`) is left out: it computes the same value as the
 //! comparison ladder it sits in front of.
 
 use rustpython_wtf8::{CodePoint, Wtf8};
 
-/// `UTF8_INDEX_STORAGE`'s element (`rutf8.py:508-511`) — `baseindex` is the
+/// `UTF8_INDEX_STORAGE`'s element (`rutf8.py`) — `baseindex` is the
 /// byte offset the 64-code-point group starts at, and `ofs[i]` the byte delta
 /// from it to the code point *after* the group's `4 * i`-th.
 #[repr(C)]
@@ -61,12 +61,12 @@ pub struct Utf8LocElem {
     pub ofs: [u8; 16],
 }
 
-/// `UTF8_INDEX_STORAGE` (`rutf8.py:508`).  A leaf (no inner `PyObjectRef`), so
+/// `UTF8_INDEX_STORAGE` (`rutf8.py`).  A leaf (no inner `PyObjectRef`), so
 /// a mortal string's table lives in a storage box whose drop glue reclaims it,
 /// as its WTF-8 buffer does.
 pub type Utf8IndexStorage = Vec<Utf8LocElem>;
 
-/// `next_codepoint_pos` (`rutf8.py:131`) — the position of the code point after
+/// `next_codepoint_pos` (`rutf8.py`) — the position of the code point after
 /// `pos`.  Assumes valid WTF-8 and `pos` before the end.
 #[inline]
 pub fn next_codepoint_pos(code: &Wtf8, pos: usize) -> usize {
@@ -83,7 +83,7 @@ pub fn next_codepoint_pos(code: &Wtf8, pos: usize) -> usize {
     pos + 4
 }
 
-/// `prev_codepoint_pos` (`rutf8.py:152`) — the position of the code point
+/// `prev_codepoint_pos` (`rutf8.py`) — the position of the code point
 /// before `pos`, which must not be zero.  A `pos` one past the end reads as the
 /// extra `'\x00'` the build loop pretends is there.
 #[inline]
@@ -107,7 +107,7 @@ pub fn prev_codepoint_pos(code: &Wtf8, pos: usize) -> usize {
     pos - 1
 }
 
-/// `codepoint_at_pos` (`rutf8.py:175`) — the code point starting at byte `pos`.
+/// `codepoint_at_pos` (`rutf8.py`) — the code point starting at byte `pos`.
 ///
 /// Assumes valid WTF-8 with `pos` on a boundary before the end, as upstream
 /// does ("no checking!").  The decode itself goes through the crate rather than
@@ -120,7 +120,7 @@ pub fn codepoint_at_pos(code: &Wtf8, pos: usize) -> CodePoint {
         .expect("codepoint_at_pos: pos is not a code point boundary")
 }
 
-/// `codepoint_before_pos` (`rutf8.py:201`) — the code point immediately before
+/// `codepoint_before_pos` (`rutf8.py`) — the code point immediately before
 /// `pos`, which must not be zero.
 ///
 /// Upstream walks the continuation bytes backwards inline; composing the
@@ -132,7 +132,7 @@ pub fn codepoint_before_pos(code: &Wtf8, pos: usize) -> CodePoint {
     codepoint_at_pos(code, prev_codepoint_pos(code, pos))
 }
 
-/// `codepoints_in_utf8` (`rutf8.py:471`) — the number of code points in
+/// `codepoints_in_utf8` (`rutf8.py`) — the number of code points in
 /// `value[start..end]`.
 ///
 /// Counts the bytes that are *not* continuation bytes, which upstream spells as
@@ -147,7 +147,7 @@ pub fn codepoints_in_utf8(value: &Wtf8, start: usize, end: usize) -> usize {
         .count()
 }
 
-/// `create_utf8_index_storage` (`rutf8.py:516`) — the table for `utf8`, whose
+/// `create_utf8_index_storage` (`rutf8.py`) — the table for `utf8`, whose
 /// code point count is `utf8len`.
 pub fn create_utf8_index_storage(utf8: &Wtf8, utf8len: usize) -> Utf8IndexStorage {
     let arraysize = utf8len / 64 + 1;
@@ -194,7 +194,7 @@ pub fn create_utf8_index_storage(utf8: &Wtf8, utf8len: usize) -> Utf8IndexStorag
     storage
 }
 
-/// `codepoint_position_at_index` (`rutf8.py:548`) — the byte offset of code
+/// `codepoint_position_at_index` (`rutf8.py`) — the byte offset of code
 /// point `index`, which must not exceed the string's code point count.
 #[inline]
 pub fn codepoint_position_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) -> usize {
@@ -208,7 +208,7 @@ pub fn codepoint_position_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: 
     }
 }
 
-/// `codepoint_at_index` (`rutf8.py:576`) — the code point at code point
+/// `codepoint_at_index` (`rutf8.py`) — the code point at code point
 /// `index`, which must be below the string's code point count.
 ///
 /// Upstream fuses the position lookup with the decode so the JIT sees one
@@ -219,7 +219,7 @@ pub fn codepoint_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) ->
     codepoint_at_pos(utf8, codepoint_position_at_index(utf8, storage, index))
 }
 
-/// `codepoint_index_at_byte_position` (`rutf8.py:594`) — the code point index
+/// `codepoint_index_at_byte_position` (`rutf8.py`) — the code point index
 /// for which `codepoint_position_at_index` is `bytepos`.
 ///
 /// Logarithmic in the string length, plus a constant that is not tiny either.

@@ -91,9 +91,9 @@ pub fn int_binop_lookup(op: BinaryOperator) -> Option<(majit_ir::OpCode, bool, b
 ///
 /// resoperation.py:959-962: only FLOAT_ADD, FLOAT_SUB, FLOAT_MUL, FLOAT_TRUEDIV.
 /// lloperation.py:260-261: no float_floordiv, no float_mod, no float_pow.
-/// FloorDivide → _divmod_w() residual call (floatobject.py:508).
+/// FloorDivide → _divmod_w() residual call (floatobject.py).
 /// Remainder → math_fmod residual call (floatobject.py:520).
-/// Power → ll_math_pow residual call (ll_math.py:260).
+/// Power → ll_math_pow residual call (ll_math.py).
 pub const FLOAT_BINOP_TABLE: &[(BinaryOperator, BinaryOperator, majit_ir::OpCode)] = &[
     (
         BinaryOperator::Add,

@@ -50,7 +50,7 @@ fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
     Ok(())
 }
 
-/// `executioncontext.py:91-107 leave` for a frame the bridge resumed into
+/// `executioncontext.py leave` for a frame the bridge resumed into
 /// rather than entered.
 ///
 /// A carrier frame's `enter` — and the `virtual_ref` scope it opened — belongs
@@ -91,7 +91,7 @@ pub(crate) fn carrier_ec_leave<Sym: WalkSym>(
         crate::descr::pyframe_execution_context_descr(),
     );
     // Every `GetfieldGcR` the enter/leave pair records carries its concrete
-    // value (`history.py:803 *FrontendOp(pos, value)`); without it
+    // value (`history.py *FrontendOp(pos, value)`); without it
     // `concrete_of_opref` reports this result symbolic on the residual-call
     // and snapshot paths.  The value is the same EC the leave below acts on.
     ctx.set_opref_concrete(
@@ -306,7 +306,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         && trace_ctx.bridge_source_is_exception_guard()
         && !sym.last_exc_box().is_none()
         && !sym.last_exc_value().is_null();
-    // `finishframe_exception` (`pyjitpl.py:2530-2546`) reads the frame's
+    // `finishframe_exception` (`pyjitpl.py`) reads the frame's
     // `catch_exception` and jumps to the handler with no further condition on
     // where the handler leads.  A handler that RETURNS out of the frame instead
     // of rejoining a loop is the ordinary `finishframe` case
@@ -451,14 +451,14 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // GUARD_NO_EXCEPTION at the bridge start is removable by the
             // optimizer (`pyjitpl.py:3132-3138`). pyre emits nothing between
             // them today, so `remove_bridge_exception`
-            // (`majit-gc/src/rewrite.rs`, rewrite.py:988-1001) strips the
+            // (`majit-gc/src/rewrite.rs`, rewrite.py) strips the
             // consecutive triple and leaves the guard. Once pyre replays
             // resume data here, this must split into the same two phases
             // rather than stay one block.
             let class_op = wc.trace_ctx.save_exc_class();
             let value_op = wc.trace_ctx.save_exception();
             wc.trace_ctx.restore_exception(class_op, value_op);
-            // `RefFrontendOp(pos, gcref)` parity (`history.py:803`): SAVE_EXCEPTION
+            // `RefFrontendOp(pos, gcref)` parity (`history.py`): SAVE_EXCEPTION
             // returns `exc_value_box`, whose `getref()` is the concrete restored
             // exception pointer at trace-recording time (`pyjitpl.py:3163
             // execute_ll_raised`).  Stamp that concrete onto `value_op` so the box
@@ -570,7 +570,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 // the unwind readable: this frame keeps running in the
                 // interpreter, which reads its locals out of
                 // `locals_cells_stack_w`, while the walk held them in the
-                // virtualizable boxes.  `virtualizable.py:101-138 write_boxes`
+                // virtualizable boxes.  `virtualizable.py write_boxes`
                 // writes them on every force with no way to decline, and
                 // `record_top_level_application_traceback` above only performs
                 // it concretely, for the recording pass — so without the
@@ -711,7 +711,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
 /// the root register banks come straight from the bridge-seeded `root_sym`
 /// rather than a live caller [`WalkContext`] (the root walk has not started —
 /// this resumes mid-flight).
-/// `blackhole.py:1711 `_copy_data_from_miframe`: the concrete register image a
+/// `blackhole.py `_copy_data_from_miframe`: the concrete register image a
 /// paused caller resumes from when a descendant abort converts the framestack
 /// into blackhole interpreters.
 ///
@@ -719,7 +719,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
 /// still standing in, by reading its live concrete shadow banks. A frame
 /// rebuilt from a guard's resume data has no such bank — its per-color boxes
 /// are all this side holds. They carry the same intrinsic concrete upstream
-/// reads (`history.py:803` `*FrontendOp(pos, value)`; `box.getint()` /
+/// reads (`history.py` `*FrontendOp(pos, value)`; `box.getint()` /
 /// `box.getref_base()` at :1718/:1724), so resolve them through
 /// `concrete_of_opref` instead.
 ///
@@ -1419,7 +1419,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             sub_wc.vstack_valid = true;
         }
         let outcome = walk(callee_code, entry, &mut sub_wc);
-        // `pyjitpl.py:2914 handle_guard_failure` wraps `_handle_guard_failure`
+        // `pyjitpl.py handle_guard_failure` wraps `_handle_guard_failure`
         // in `except SwitchToBlackhole as stb:
         // self.run_blackhole_interp_to_cancel_tracing(stb)` (:2930-2931), which
         // converts the frames `interpret()` reached and runs them forward

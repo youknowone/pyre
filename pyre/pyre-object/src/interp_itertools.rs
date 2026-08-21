@@ -90,7 +90,7 @@ pub struct W_Count {
 }
 
 pub fn w_count_new(w_firstval: PyObjectRef, w_step: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_firstval);
     crate::gc_roots::pin_root(w_step);
@@ -174,7 +174,7 @@ pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
         None => (false, 0),
         Some(n) => (true, n.max(0)),
     };
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_obj);
     W_Repeat::allocate_stable(W_Repeat {
@@ -255,7 +255,7 @@ pub struct W_TakeWhile {
 /// `w_iterable` must already be an iterator (`space.iter` applied by the
 /// caller, matching `W_TakeWhile.__init__`).
 pub fn w_takewhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_predicate);
     crate::gc_roots::pin_root(w_iterable);
@@ -300,7 +300,7 @@ pub struct W_DropWhile {
 /// `w_iterable` must already be an iterator (`space.iter` applied by the
 /// caller, matching `W_DropWhile.__init__`).
 pub fn w_dropwhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_predicate);
     crate::gc_roots::pin_root(w_iterable);
@@ -326,7 +326,7 @@ pub unsafe fn is_dropwhile(obj: PyObjectRef) -> bool {
 
 // ── W_FilterFalse — pypy/module/itertools/interp_itertools.py:class W_FilterFalse ──
 //
-// Subclass of `W_Filter` (`pypy/module/__builtin__/functional.py:916`)
+// Subclass of `W_Filter` (`pypy/module/__builtin__/functional.py`)
 // with `reverse = True`:
 //
 // ```python
@@ -352,7 +352,7 @@ pub struct W_FilterFalse {
 /// `w_iterable` must already be an iterator; `w_predicate` is PY_NULL
 /// for a None predicate (`W_Filter.__init__`).
 pub fn w_filterfalse_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     if !w_predicate.is_null() {
         crate::gc_roots::pin_root(w_predicate);
@@ -1038,7 +1038,7 @@ pub struct W_Pairwise {
 /// `w_iterator` must already be an iterator (`W_Pairwise__new__` applies
 /// `space.iter`).
 pub fn w_pairwise_new(w_iterator: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_iterator);
     W_Pairwise::allocate_stable(W_Pairwise {
@@ -1119,7 +1119,7 @@ pub struct W_Cycle {
 /// `w_iterable` must already be an iterator (`cycle`'s registrar applies
 /// `space.iter`).  Allocates an empty `saved` list.
 pub fn w_cycle_new(w_iterable: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).  Minting
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).  Minting
     // `saved` allocates, and a self-iterating `list` subclass reaches here as
     // a movable header, so `w_iterable` is read back out of its root slot
     // rather than from the parameter copy that collection left pre-move.
@@ -1190,7 +1190,7 @@ pub struct W_Chain {
 /// (`chain` / `chain.from_iterable` apply `space.iter`).  `w_it` starts
 /// PY_NULL (no active sub-iterator yet).
 pub fn w_chain_new(w_iterables: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     crate::gc_roots::pin_root(w_iterables);
     W_Chain::allocate_stable(W_Chain {

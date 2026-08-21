@@ -14,13 +14,13 @@ use crate::jitframe::{FIRST_ITEM_OFFSET, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitF
 
 /// Where a held deadframe keeps its jitframe pointer.
 ///
-/// The frame is an ordinary GC object (`jitframe.py:33-60` makes JITFRAME a
+/// The frame is an ordinary GC object (`jitframe.py` makes JITFRAME a
 /// GcStruct and `llmodel.py:298 malloc_jitframe` allocates it like any other),
 /// so a collection during the window the deadframe is held promotes it to a
 /// different address while every accessor is still reading through the old
 /// one. The pointer therefore has to live somewhere the collector rewrites.
 ///
-/// A root slot is that place. `shadowstack.py:100-106` (`push_stack` /
+/// A root slot is that place. `shadowstack.py` (`push_stack` /
 /// `pop_stack`) names a root by its POSITION on a per-thread stack rather than
 /// by the address of the variable holding it, and `walk_stack_root`
 /// (`shadowstack.py:44-70`) reads each live slot and stores the forwarded
@@ -122,7 +122,7 @@ impl JitFrameDeadFrame {
     /// Present a frame that is still executing as a deadframe, without taking
     /// its `jf_gcmap` over.
     ///
-    /// `llmodel.py:280-284 force` casts the resolved frame to a GCREF and
+    /// `llmodel.py force` casts the resolved frame to a GCREF and
     /// returns it: the forced frame IS the deadframe, and it belongs to the
     /// compiled run that is still on the JF shadow stack.  That run pushed the
     /// map before the residual call it is inside and clears it with
@@ -206,7 +206,7 @@ impl Drop for JitFrameDeadFrame {
     ///
     /// Releasing the root does not take the frame out of the collector's
     /// remembered set, so the frame stays reachable there after this owner is
-    /// gone — and `jitframe_trace` (`jitframe.py:115-135`) would keep walking
+    /// gone — and `jitframe_trace` (`jitframe.py`) would keep walking
     /// the exiting guard's map over `jf_frame` items nothing owns any more.
     /// A null `jf_gcmap` traces no items (`jitframe.py:115-116`) while the
     /// fixed header GCREFs stay traceable, which is what the frame needs once

@@ -7,25 +7,25 @@
 //!
 //! | upstream | Rust mirror |
 //! |---|---|
-//! | `class IntegerRepr(FloatRepr)` (`rint.py:18-66`) | [`IntegerRepr`] |
-//! | `IntegerRepr.__init__` + `opprefix` (`rint.py:19-29`) | [`IntegerRepr::new`] / [`IntegerRepr::opprefix`] |
-//! | `IntegerRepr.convert_const` (`rint.py:31-37`) | [`IntegerRepr::convert_const`] |
-//! | `rtype_bool` (`rint.py:85-88`) | [`IntegerRepr::rtype_bool`] |
-//! | `rtype_abs` (`rint.py:92-98`) | [`IntegerRepr::rtype_abs`] |
-//! | `rtype_invert` (`rint.py:107-110`) | [`IntegerRepr::rtype_invert`] |
-//! | `rtype_neg` (`rint.py:112-121`) | [`IntegerRepr::rtype_neg`] |
-//! | `rtype_pos` (`rint.py:132-135`) | [`IntegerRepr::rtype_pos`] |
-//! | `rtype_int` (`rint.py:137-142`) | [`IntegerRepr::rtype_int`] |
-//! | `rtype_float` (`rint.py:144-147`) | [`IntegerRepr::rtype_float`] |
-//! | `getintegerrepr(lltype, prefix=None)` (`rint.py:177-182`) | [`getintegerrepr`] |
-//! | Standard integer singletons `signed_repr` / `unsigned_repr` / `signedlonglong_repr` / `unsignedlonglong_repr` (`rint.py:193-198`) | [`signed_repr`] / [`unsigned_repr`] / [`signedlonglong_repr`] / [`unsignedlonglong_repr`] |
-//! | `SomeInteger.rtyper_makerepr` / `rtyper_makekey` (`rint.py:185-191`) | wired in [`super::rmodel::rtyper_makerepr`] / [`super::rmodel::rtyper_makekey`] |
-//! | `pairtype(IntegerRepr, IntegerRepr).rtype_add/sub/mul/floordiv/mod/and_/or_/xor/lshift/rshift` + `_ovf` siblings (`rint.py:217-288`) | dispatched via [`super::pairtype::pair_rtype_add`] etc. → [`rtype_template`] / [`rtype_call_helper`] |
-//! | `pairtype(IntegerRepr, IntegerRepr).rtype_eq/ne/lt/le/gt/ge/is_` (`rint.py:292-310`) | dispatched via [`super::pairtype::pair_rtype_eq`] etc. → [`rtype_compare_template`] |
-//! | `pairtype(IntegerRepr, IntegerRepr).convert_from_to` (`rint.py:202-213`) | [`pair_integer_integer_convert_from_to`] |
-//! | `pairtype(IntegerRepr, FloatRepr).convert_from_to` (`rint.py:645-655`) | [`pair_integer_float_convert_from_to`] |
-//! | `pairtype(FloatRepr, IntegerRepr).convert_from_to` (`rint.py:657-665`) | [`pair_float_integer_convert_from_to`] |
-//! | `_rtype_template` / `_rtype_compare_template` / `_rtype_call_helper` + `rtype_add_ovf` (`rint.py:314-388`) | [`rtype_template`] / [`rtype_compare_template`] / [`rtype_call_helper`] / [`rtype_add_ovf`] |
+//! | `class IntegerRepr(FloatRepr)` (`rint.py`) | [`IntegerRepr`] |
+//! | `IntegerRepr.__init__` + `opprefix` (`rint.py`) | [`IntegerRepr::new`] / [`IntegerRepr::opprefix`] |
+//! | `IntegerRepr.convert_const` (`rint.py`) | [`IntegerRepr::convert_const`] |
+//! | `rtype_bool` (`rint.py`) | [`IntegerRepr::rtype_bool`] |
+//! | `rtype_abs` (`rint.py`) | [`IntegerRepr::rtype_abs`] |
+//! | `rtype_invert` (`rint.py`) | [`IntegerRepr::rtype_invert`] |
+//! | `rtype_neg` (`rint.py`) | [`IntegerRepr::rtype_neg`] |
+//! | `rtype_pos` (`rint.py`) | [`IntegerRepr::rtype_pos`] |
+//! | `rtype_int` (`rint.py`) | [`IntegerRepr::rtype_int`] |
+//! | `rtype_float` (`rint.py`) | [`IntegerRepr::rtype_float`] |
+//! | `getintegerrepr(lltype, prefix=None)` (`rint.py`) | [`getintegerrepr`] |
+//! | Standard integer singletons `signed_repr` / `unsigned_repr` / `signedlonglong_repr` / `unsignedlonglong_repr` (`rint.py`) | [`signed_repr`] / [`unsigned_repr`] / [`signedlonglong_repr`] / [`unsignedlonglong_repr`] |
+//! | `SomeInteger.rtyper_makerepr` / `rtyper_makekey` (`rint.py`) | wired in [`super::rmodel::rtyper_makerepr`] / [`super::rmodel::rtyper_makekey`] |
+//! | `pairtype(IntegerRepr, IntegerRepr).rtype_add/sub/mul/floordiv/mod/and_/or_/xor/lshift/rshift` + `_ovf` siblings (`rint.py`) | dispatched via [`super::pairtype::pair_rtype_add`] etc. → [`rtype_template`] / [`rtype_call_helper`] |
+//! | `pairtype(IntegerRepr, IntegerRepr).rtype_eq/ne/lt/le/gt/ge/is_` (`rint.py`) | dispatched via [`super::pairtype::pair_rtype_eq`] etc. → [`rtype_compare_template`] |
+//! | `pairtype(IntegerRepr, IntegerRepr).convert_from_to` (`rint.py`) | [`pair_integer_integer_convert_from_to`] |
+//! | `pairtype(IntegerRepr, FloatRepr).convert_from_to` (`rint.py`) | [`pair_integer_float_convert_from_to`] |
+//! | `pairtype(FloatRepr, IntegerRepr).convert_from_to` (`rint.py`) | [`pair_float_integer_convert_from_to`] |
+//! | `_rtype_template` / `_rtype_compare_template` / `_rtype_call_helper` + `rtype_add_ovf` (`rint.py`) | [`rtype_template`] / [`rtype_compare_template`] / [`rtype_call_helper`] / [`rtype_add_ovf`] |
 //!
 //! ## Deferred to follow-up commits
 //!
@@ -37,7 +37,7 @@
 //!   `rtype_chr` / `rtype_unichr` (`has_implicit_exception(ValueError)`,
 //!   `ZeroDivisionError`, etc.) — the method structure is in place, but
 //!   `rtyper.py:713-729` still needs `exceptiondata.py` parity.
-//! * `rtype_hex` / `rtype_oct` / `rtype_bin` (`rint.py:154-173`) — require
+//! * `rtype_hex` / `rtype_oct` / `rtype_bin` (`rint.py`) — require
 //!   `lltypesystem/ll_str.py` (`ll_int2hex/oct/bin`).
 //! * `ll_str` / `ll_hash_int` / `ll_hash_long_long` / `ll_eq_shortint`
 //!   (`rint.py:149-152,619-627`) — land with `rdict.py` (needs
@@ -57,7 +57,7 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, LowLevelOpList};
 
-/// RPython `class IntegerRepr(FloatRepr)` (`rint.py:18-62`).
+/// RPython `class IntegerRepr(FloatRepr)` (`rint.py`).
 ///
 /// ```python
 /// class IntegerRepr(FloatRepr):
@@ -106,7 +106,7 @@ impl IntegerRepr {
         }
     }
 
-    /// RPython `IntegerRepr.opprefix` property (`rint.py:24-29`).
+    /// RPython `IntegerRepr.opprefix` property (`rint.py`).
     pub fn opprefix(&self) -> Result<&'static str, TyperError> {
         self.opprefix.ok_or_else(|| {
             TyperError::message(format!(
@@ -149,7 +149,7 @@ impl Repr for IntegerRepr {
         super::pairtype::ReprClassId::IntegerRepr
     }
 
-    /// RPython `IntegerRepr.get_ll_eq_function(self)` (`rint.py:39-42`):
+    /// RPython `IntegerRepr.get_ll_eq_function(self)` (`rint.py`):
     ///
     /// ```python
     /// def get_ll_eq_function(self):
@@ -173,7 +173,7 @@ impl Repr for IntegerRepr {
         Ok(None)
     }
 
-    /// RPython `IntegerRepr.get_ll_hash_function(self)` (`rint.py:50-54`):
+    /// RPython `IntegerRepr.get_ll_hash_function(self)` (`rint.py`):
     ///
     /// ```python
     /// def get_ll_hash_function(self):
@@ -216,7 +216,7 @@ impl Repr for IntegerRepr {
         self.get_ll_hash_function(rtyper)
     }
 
-    /// RPython `IntegerRepr.convert_const(self, value)` (`rint.py:31-37`):
+    /// RPython `IntegerRepr.convert_const(self, value)` (`rint.py`):
     ///
     /// ```python
     /// def convert_const(self, value):
@@ -250,7 +250,7 @@ impl Repr for IntegerRepr {
         Ok(Constant::with_concretetype(converted, self.lltype.clone()))
     }
 
-    /// RPython `IntegerRepr.rtype_bool(self, hop)` (`rint.py:85-88`):
+    /// RPython `IntegerRepr.rtype_bool(self, hop)` (`rint.py`):
     ///
     /// ```python
     /// def rtype_bool(self, hop):
@@ -264,7 +264,7 @@ impl Repr for IntegerRepr {
         Ok(hop.genop(&opname, vlist, GenopResult::LLType(LowLevelType::Bool)))
     }
 
-    /// RPython `IntegerRepr.rtype_abs(self, hop)` (`rint.py:92-98`):
+    /// RPython `IntegerRepr.rtype_abs(self, hop)` (`rint.py`):
     ///
     /// ```python
     /// def rtype_abs(self, hop):
@@ -284,7 +284,7 @@ impl Repr for IntegerRepr {
         Ok(hop.genop(&opname, vlist, GenopResult::LLType(self.lltype.clone())))
     }
 
-    /// RPython `IntegerRepr.rtype_abs_ovf(self, hop)` (`rint.py:100-105`).
+    /// RPython `IntegerRepr.rtype_abs_ovf(self, hop)` (`rint.py`).
     fn rtype_abs_ovf(&self, hop: &HighLevelOp) -> RTypeResult {
         if self.s_result_unsigned(hop) {
             return Err(TyperError::message("forbidden uint_abs_ovf"));
@@ -292,7 +292,7 @@ impl Repr for IntegerRepr {
         rtype_call_helper(hop, "abs_ovf".to_string(), &[])
     }
 
-    /// RPython `IntegerRepr.rtype_invert(self, hop)` (`rint.py:107-110`):
+    /// RPython `IntegerRepr.rtype_invert(self, hop)` (`rint.py`):
     ///
     /// ```python
     /// def rtype_invert(self, hop):
@@ -306,7 +306,7 @@ impl Repr for IntegerRepr {
         Ok(hop.genop(&opname, vlist, GenopResult::LLType(self.lltype.clone())))
     }
 
-    /// RPython `IntegerRepr.rtype_neg(self, hop)` (`rint.py:112-121`):
+    /// RPython `IntegerRepr.rtype_neg(self, hop)` (`rint.py`):
     ///
     /// ```python
     /// def rtype_neg(self, hop):
@@ -336,7 +336,7 @@ impl Repr for IntegerRepr {
         Ok(hop.genop(&opname, vlist, GenopResult::LLType(self.lltype.clone())))
     }
 
-    /// RPython `IntegerRepr.rtype_neg_ovf(self, hop)` (`rint.py:123-130`).
+    /// RPython `IntegerRepr.rtype_neg_ovf(self, hop)` (`rint.py`).
     fn rtype_neg_ovf(&self, hop: &HighLevelOp) -> RTypeResult {
         if self.s_result_unsigned(hop) {
             hop.exception_cannot_occur()?;
@@ -345,14 +345,14 @@ impl Repr for IntegerRepr {
         rtype_call_helper(hop, "neg_ovf".to_string(), &[])
     }
 
-    /// RPython `IntegerRepr.rtype_pos(self, hop)` (`rint.py:132-135`):
+    /// RPython `IntegerRepr.rtype_pos(self, hop)` (`rint.py`):
     /// identity pass-through after `inputargs(self)`.
     fn rtype_pos(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
         Ok(vlist.into_iter().next())
     }
 
-    /// RPython `IntegerRepr.rtype_int(self, hop)` (`rint.py:137-142`):
+    /// RPython `IntegerRepr.rtype_int(self, hop)` (`rint.py`):
     ///
     /// ```python
     /// def rtype_int(self, hop):
@@ -376,7 +376,7 @@ impl Repr for IntegerRepr {
         Ok(vlist.into_iter().next())
     }
 
-    /// RPython `IntegerRepr.rtype_float(_, hop)` (`rint.py:144-147`):
+    /// RPython `IntegerRepr.rtype_float(_, hop)` (`rint.py`):
     /// coerce to Float and return — identity over the coerced Float value.
     fn rtype_float(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Float)])?;
@@ -384,7 +384,7 @@ impl Repr for IntegerRepr {
         Ok(vlist.into_iter().next())
     }
 
-    /// RPython `IntegerRepr.rtype_chr(_, hop)` (`rint.py:67-74`).
+    /// RPython `IntegerRepr.rtype_chr(_, hop)` (`rint.py`).
     fn rtype_chr(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
         if hop.has_implicit_exception("ValueError") {
@@ -406,7 +406,7 @@ impl Repr for IntegerRepr {
         ))
     }
 
-    /// RPython `IntegerRepr.rtype_unichr(_, hop)` (`rint.py:76-83`).
+    /// RPython `IntegerRepr.rtype_unichr(_, hop)` (`rint.py`).
     fn rtype_unichr(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
         if hop.has_implicit_exception("ValueError") {
@@ -428,9 +428,9 @@ impl Repr for IntegerRepr {
         ))
     }
 
-    /// `IntegerRepr` inherits `Repr.rtype_str` (`rmodel.py:195-197`), which
+    /// `IntegerRepr` inherits `Repr.rtype_str` (`rmodel.py`), which
     /// calls `hop.gendirectcall(self.ll_str, v_self)`. `IntegerRepr.ll_str`
-    /// (`rint.py:150-152`, `@jit.elidable`) is `ll_int2dec(i)`. The default
+    /// (`rint.py`, `@jit.elidable`) is `ll_int2dec(i)`. The default
     /// `Repr::rtype_str` raises `MissingRTypeOperation`, so this override
     /// supplies the per-width `ll_int2dec` helper graph and calls it.
     fn rtype_str(&self, hop: &HighLevelOp) -> RTypeResult {
@@ -459,9 +459,9 @@ impl Repr for IntegerRepr {
 }
 
 // ____________________________________________________________
-// Helper graph synthesis — `ll_hash_int(n) = intmask(n)` (`rint.py:619-620`).
+// Helper graph synthesis — `ll_hash_int(n) = intmask(n)` (`rint.py`).
 
-/// RPython `ll_hash_int(n) = intmask(n)` (`rint.py:619-620`).
+/// RPython `ll_hash_int(n) = intmask(n)` (`rint.py`).
 ///
 /// Synthesizes a single-block helper graph that maps the per-width
 /// integer input to a `Signed` result. For `Signed`/`Bool` the body is
@@ -543,14 +543,14 @@ pub(crate) fn build_ll_hash_int_helper_graph(
 // ____________________________________________________________
 // Standard integer singletons — `rint.py:193-198`.
 
-/// RPython `signed_repr = getintegerrepr(Signed, 'int_')` (`rint.py:193`).
+/// RPython `signed_repr = getintegerrepr(Signed, 'int_')` (`rint.py`).
 pub fn signed_repr() -> Arc<IntegerRepr> {
     static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_"))))
         .clone()
 }
 
-/// RPython `unsigned_repr = getintegerrepr(Unsigned, 'uint_')` (`rint.py:196`).
+/// RPython `unsigned_repr = getintegerrepr(Unsigned, 'uint_')` (`rint.py`).
 pub fn unsigned_repr() -> Arc<IntegerRepr> {
     static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(IntegerRepr::new(LowLevelType::Unsigned, Some("uint_"))))
@@ -571,7 +571,7 @@ pub fn signedlonglong_repr() -> Arc<IntegerRepr> {
 }
 
 /// RPython `signedlonglonglong_repr =
-/// getintegerrepr(SignedLongLongLong, 'lllong_')` (`rint.py:195`).
+/// getintegerrepr(SignedLongLongLong, 'lllong_')` (`rint.py`).
 pub fn signedlonglonglong_repr() -> Arc<IntegerRepr> {
     static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
     REPR.get_or_init(|| {
@@ -597,7 +597,7 @@ pub fn unsignedlonglong_repr() -> Arc<IntegerRepr> {
 }
 
 /// RPython `unsignedlonglonglong_repr =
-/// getintegerrepr(UnsignedLongLongLong, 'ulllong_')` (`rint.py:198`).
+/// getintegerrepr(UnsignedLongLongLong, 'ulllong_')` (`rint.py`).
 pub fn unsignedlonglonglong_repr() -> Arc<IntegerRepr> {
     static REPR: OnceLock<Arc<IntegerRepr>> = OnceLock::new();
     REPR.get_or_init(|| {
@@ -696,7 +696,7 @@ fn hlvalue_concretetype(value: &Hlvalue) -> Option<LowLevelType> {
 }
 
 // ____________________________________________________________
-// pairtype(IntegerRepr, X) conversions — rint.py:202-213,645-675.
+// pairtype(IntegerRepr, X) conversions — rint.py.
 
 pub fn pair_integer_integer_convert_from_to(
     r_from: &dyn Repr,
@@ -783,7 +783,7 @@ pub fn pair_float_integer_convert_from_to(
 }
 
 // ____________________________________________________________
-// pairtype(IntegerRepr, IntegerRepr) — rint.py:217-341,605-614.
+// pairtype(IntegerRepr, IntegerRepr) — rint.py.
 
 pub fn rtype_template(hop: &HighLevelOp, func: &str) -> RTypeResult {
     let r_result = hop_r_result(hop)?;
@@ -966,7 +966,7 @@ pub fn rtype_compare_template(hop: &HighLevelOp, func: &str) -> RTypeResult {
     let r_union = hop.rtyper.getrepr(&s_union)?;
     let repr = if r_union.lowleveltype() == &LowLevelType::Bool {
         // RPython: `rtyper.getrepr(unionof(...)).as_int`.  BoolRepr sets
-        // `as_int = signed_repr` in rbool.py:13-15.
+        // `as_int = signed_repr` in rbool.py.
         signed_repr()
     } else {
         integer_repr_for_lltype(r_union.lowleveltype())?
@@ -994,7 +994,7 @@ fn overflow_error(message: &str) -> TyperError {
     TyperError::message(message)
 }
 
-/// RPython `ll_int_py_div(x, y)` (`rint.py:397-406`).
+/// RPython `ll_int_py_div(x, y)` (`rint.py`).
 pub fn ll_int_py_div(x: i64, y: i64) -> i64 {
     let r = x.wrapping_div(y);
     let p = r.wrapping_mul(y);
@@ -1253,12 +1253,12 @@ pub fn getintegerrepr(lltype: &LowLevelType) -> Arc<IntegerRepr> {
     }
 }
 
-// RPython `SomeInteger.rtyper_makerepr(self, rtyper)` (`rint.py:185-188`)
+// RPython `SomeInteger.rtyper_makerepr(self, rtyper)` (`rint.py`)
 // inlines into [`super::rmodel::rtyper_makerepr`]'s `SomeValue::Integer`
 // arm — `build_number(None, knowntype)` + `getintegerrepr(lltype)`.
 // Centralising the dispatch there keeps the `rtyper.reprs` cache key
 // computation (`rtyper_makekey`) and the Repr construction adjacent,
-// matching the upstream `rtyper.py:149-164 getrepr` pattern.
+// matching the upstream `rtyper.py getrepr` pattern.
 
 #[cfg(test)]
 mod tests {
@@ -1516,7 +1516,7 @@ mod tests {
 
     #[test]
     fn getintegerrepr_on_standard_lltypes_returns_cached_singletons() {
-        // rint.py:176-183 cache — `_integer_reprs[lltype]` returns the
+        // rint.py cache — `_integer_reprs[lltype]` returns the
         // same IntegerRepr instance on repeated lookups for the
         // standard integer lltypes.
         assert!(Arc::ptr_eq(
@@ -1545,7 +1545,7 @@ mod tests {
         ));
     }
 
-    /// rint.py:50-54 — `IntegerRepr.get_ll_hash_function` returns
+    /// rint.py — `IntegerRepr.get_ll_hash_function` returns
     /// `ll_hash_int`. For Signed (host word), `intmask(n) = n`; the
     /// synthesized helper graph should be a single block with no
     /// operations, returning the inputarg directly.
@@ -1638,7 +1638,7 @@ mod tests {
 
     #[test]
     fn rtyper_getrepr_on_some_integer_returns_lltype_matched_singleton() {
-        // rint.py:185-191 — `SomeInteger.rtyper_makerepr` resolves via
+        // rint.py — `SomeInteger.rtyper_makerepr` resolves via
         // `build_number(None, knowntype) → getintegerrepr(lltype)`.
         // Verify the end-to-end dispatch keeps cached-Arc identity.
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -1843,7 +1843,7 @@ mod tests {
 
     #[test]
     fn rtype_unichr_emits_cast_int_to_unichar_like_rint() {
-        // rint.py:76-83. Mirrors rtype_chr with UniChar result type.
+        // rint.py. Mirrors rtype_chr with UniChar result type.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         rtyper

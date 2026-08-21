@@ -36,7 +36,7 @@ pub unsafe extern "C" fn PyByteArray_CheckExact(object: *mut CPyObject) -> c_int
     (!object.is_null() && is_exactly(object, &pyre_object::BYTEARRAY_TYPE)) as c_int
 }
 
-/// `bytearrayobject.py:44 PyByteArray_FromStringAndSize`.
+/// `bytearrayobject.py PyByteArray_FromStringAndSize`.
 ///
 /// A NULL pointer asks for `length` zero bytes rather than copying from
 /// nowhere, which is how an extension allocates a buffer it then fills through
@@ -63,7 +63,7 @@ pub unsafe extern "C" fn PyByteArray_FromStringAndSize(
     pyobject::make_ref(created)
 }
 
-/// `bytearrayobject.py:35 PyByteArray_FromObject` — `bytearray(o)`.
+/// `bytearrayobject.py PyByteArray_FromObject` — `bytearray(o)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyByteArray_FromObject(object: *mut CPyObject) -> *mut CPyObject {
     let Some(object) = argument(object) else {
@@ -76,7 +76,7 @@ pub unsafe extern "C" fn PyByteArray_FromObject(object: *mut CPyObject) -> *mut 
     ))
 }
 
-/// `bytearrayobject.py:57 PyByteArray_Concat` — `a + b`.
+/// `bytearrayobject.py PyByteArray_Concat` — `a + b`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyByteArray_Concat(
     left: *mut CPyObject,
@@ -88,7 +88,7 @@ pub unsafe extern "C" fn PyByteArray_Concat(
     result(crate::baseobjspace::add(left, right))
 }
 
-/// `bytearrayobject.py:62 PyByteArray_Size`.
+/// `bytearrayobject.py PyByteArray_Size`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyByteArray_Size(object: *mut CPyObject) -> isize {
     let Some(value) = bytearray_argument(object, "PyByteArray_Size") else {
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn PyByteArray_Size(object: *mut CPyObject) -> isize {
     unsafe { pyre_object::bytearrayobject::w_bytearray_len(value) as isize }
 }
 
-/// `bytearrayobject.py:69 PyByteArray_AsString` — the payload, writable.
+/// `bytearrayobject.py PyByteArray_AsString` — the payload, writable.
 ///
 /// The array carries a terminating NUL one past the length, which is what lets
 /// an extension hand it to anything reading a C string. It lives in the
@@ -120,7 +120,7 @@ pub unsafe extern "C" fn PyByteArray_AsString(object: *mut CPyObject) -> *mut c_
     }
 }
 
-/// `bytearrayobject.py:77 PyByteArray_Resize`.
+/// `bytearrayobject.py PyByteArray_Resize`.
 ///
 /// Growing fills with NUL, shrinking drops the tail. A buffer an extension has
 /// exported is what refuses the change, as every size-changing operation on a

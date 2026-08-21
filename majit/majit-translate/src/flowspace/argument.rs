@@ -80,12 +80,12 @@ impl Signature {
         )
     }
 
-    /// RPython `Signature.__len__` (argument.py:48-49).
+    /// RPython `Signature.__len__` (argument.py).
     pub fn len_tuple(&self) -> usize {
         3
     }
 
-    /// RPython `Signature.__getitem__` (argument.py:51-58).
+    /// RPython `Signature.__getitem__` (argument.py).
     #[allow(dead_code)]
     pub(crate) fn getitem(&self, i: usize) -> SignatureItem<'_> {
         match i {
@@ -130,7 +130,7 @@ pub struct CallShape {
 /// Arguments passed into a function call site: the `a, b, *c, **d`
 /// part in `return func(a, b, *c, **d)`.
 ///
-/// RPython basis: `argument.py:76-125` — `class CallSpec`.
+/// RPython basis: `argument.py` — `class CallSpec`.
 ///
 /// Upstream stores `keywords` as a plain `dict`; its iteration order
 /// is unspecified. `_rawshape()` compensates with
@@ -195,7 +195,7 @@ impl CallSpec {
         (shape, data_w)
     }
 
-    /// RPython `argument.py:108-113` — `CallSpec.as_list`.
+    /// RPython `argument.py` — `CallSpec.as_list`.
     ///
     /// ```python
     /// def as_list(self):

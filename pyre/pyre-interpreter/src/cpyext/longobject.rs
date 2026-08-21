@@ -151,7 +151,7 @@ pub unsafe extern "C" fn PyLong_AsSize_t(object: *mut CPyObject) -> usize {
     as_unsigned(object).unwrap_or(u64::MAX) as usize
 }
 
-/// `longobject.py:60-80` — `space.uint_w(space.index(object))`, with the
+/// `longobject.py` — `space.uint_w(space.index(object))`, with the
 /// `ValueError` a negative value raises re-reported as the `OverflowError` this
 /// family answers with.
 fn as_unsigned(object: *mut CPyObject) -> Option<u64> {
@@ -187,7 +187,7 @@ fn as_bigint<T>(object: *mut CPyObject, read: impl FnOnce(&BigInt) -> T) -> Opti
 }
 
 /// `PyLong_AsInt(object)` — [`PyLong_AsLong`] narrowed to a C `int`
-/// (`longobject.py:98-113`, whose `need_to_check` range test this is).
+/// (`longobject.py`, whose `need_to_check` range test this is).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyLong_AsInt(object: *mut CPyObject) -> c_int {
     let Some(value) = as_i64(object) else {

@@ -39,7 +39,7 @@ use crate::translator::translator::TranslationContext;
 /// `collectanalyze.py:7-33`.
 pub struct CollectAnalyzer<'t> {
     translator: &'t TranslationContext,
-    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py:13`).
+    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
     analyzed_calls: UnionFind<usize, Dependency<bool>>,
 }
 
@@ -323,7 +323,7 @@ mod tests {
         let mut analyzer = CollectAnalyzer::new(&translator);
         // `random_effects_on_gcobjs = False` reaches the upstream
         // super-call. With no `_callbacks`, base `GraphAnalyzer`
-        // returns `bottom_result() == False` (graphanalyze.py:60-69).
+        // returns `bottom_result() == False` (graphanalyze.py).
         let mut attrs = HashMap::new();
         attrs.insert(
             "random_effects_on_gcobjs".to_string(),

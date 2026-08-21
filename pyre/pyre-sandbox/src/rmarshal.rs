@@ -5,10 +5,10 @@
 //!
 //!   - `rpython/rlib/rmarshal.py` is the codec used by the sandboxed *client*
 //!     (`rsandbox.py`). On a 64-bit host its `dump_int` always emits
-//!     `TYPE_INT64` (`rmarshal.py:157-164` -> `dump_longlong`).
+//!     `TYPE_INT64` (`rmarshal.py` -> `dump_longlong`).
 //!   - `rpython/translator/sandbox/_marshal.py` is the *controller* codec
 //!     (`sandlib.py`). Its `dump_int` emits `TYPE_INT` for ints that fit in 31
-//!     bits and `TYPE_INT64` otherwise (`_marshal.py:108-116`).
+//!     bits and `TYPE_INT64` otherwise (`_marshal.py`).
 //!
 //! Both *decoders* accept either int tag, which is why the wire interoperates.
 //! [`IntFlavor`] selects the encoder convention; the loaders accept both.
@@ -59,12 +59,12 @@ pub enum MarshalValue {
 // Encoders (append to a Vec<u8>, mirroring rmarshal's "buf is a list of chars").
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// rmarshal.py:119-127 `w_long` — the low 32 bits, little-endian.
+/// rmarshal.py `w_long` — the low 32 bits, little-endian.
 pub fn w_long(buf: &mut Vec<u8>, x: i64) {
     buf.extend_from_slice(&(x as u32).to_le_bytes());
 }
 
-/// rmarshal.py:184-188 `dump_longlong` body — low dword then high dword.
+/// rmarshal.py `dump_longlong` body — low dword then high dword.
 fn w_long64(buf: &mut Vec<u8>, x: i64) {
     w_long(buf, x);
     w_long(buf, x >> 32);
@@ -100,14 +100,14 @@ pub fn dump_int(buf: &mut Vec<u8>, x: i64, flavor: IntFlavor) {
     }
 }
 
-/// rmarshal.py:223-230 `dump_string_or_none` (the non-None branch).
+/// rmarshal.py `dump_string_or_none` (the non-None branch).
 pub fn dump_string(buf: &mut Vec<u8>, s: &[u8]) {
     buf.push(TYPE_STRING);
     w_long(buf, s.len() as i64);
     buf.extend_from_slice(s);
 }
 
-/// rmarshal.py:208-213 `dump_float` — `formatd(x, 'g', 17)` with a single length
+/// rmarshal.py `dump_float` — `formatd(x, 'g', 17)` with a single length
 /// byte.
 ///
 /// The wire field is `'f'` + one length byte + an ASCII float that the peer
@@ -125,7 +125,7 @@ pub fn dump_float(buf: &mut Vec<u8>, x: f64) {
     buf.extend_from_slice(&s);
 }
 
-/// rmarshal.py:472-484 `dump_tuple`.
+/// rmarshal.py `dump_tuple`.
 pub fn dump_tuple(buf: &mut Vec<u8>, items: &[MarshalValue], flavor: IntFlavor) {
     buf.push(TYPE_TUPLE);
     w_long(buf, items.len() as i64);
@@ -134,7 +134,7 @@ pub fn dump_tuple(buf: &mut Vec<u8>, items: &[MarshalValue], flavor: IntFlavor) 
     }
 }
 
-/// rmarshal.py:390-405 `dump_list_or_none` (non-None branch).
+/// rmarshal.py `dump_list_or_none` (non-None branch).
 pub fn dump_list(buf: &mut Vec<u8>, items: &[MarshalValue], flavor: IntFlavor) {
     buf.push(TYPE_LIST);
     w_long(buf, items.len() as i64);
@@ -143,7 +143,7 @@ pub fn dump_list(buf: &mut Vec<u8>, items: &[MarshalValue], flavor: IntFlavor) {
     }
 }
 
-/// rmarshal.py:428-447 `dump_dict_or_none` (non-None branch).
+/// rmarshal.py `dump_dict_or_none` (non-None branch).
 pub fn dump_dict(buf: &mut Vec<u8>, items: &[(MarshalValue, MarshalValue)], flavor: IntFlavor) {
     buf.push(TYPE_DICT);
     for (key, value) in items {
@@ -169,7 +169,7 @@ pub fn dump_value(buf: &mut Vec<u8>, value: &MarshalValue, flavor: IntFlavor) {
 
 // ── The two hand-packed reply encoders (sandlib.py:43-64) ────────────────────
 
-/// `RESULTTYPE_STATRESULT` (`sandlib.py:43-61`), format string `"iIIiiiIfff"`
+/// `RESULTTYPE_STATRESULT` (`sandlib.py`), format string `"iIIiiiIfff"`
 /// over the 10-field `os.stat_result`. rmarshal's stat loader insists on the
 /// exact per-field int widths, so this is hand-packed rather than a plain tuple.
 pub fn dump_statresult(buf: &mut Vec<u8>, st: &StatResult) {
@@ -187,7 +187,7 @@ pub fn dump_statresult(buf: &mut Vec<u8>, st: &StatResult) {
     pack_g(buf, st.st_ctime as f64); // st_ctime
 }
 
-/// `RESULTTYPE_LONGLONG` (`sandlib.py:62-64`), `struct.pack("<cq", 'I', msg)`.
+/// `RESULTTYPE_LONGLONG` (`sandlib.py`), `struct.pack("<cq", 'I', msg)`.
 pub fn dump_longlong_result(buf: &mut Vec<u8>, v: i64) {
     buf.push(TYPE_INT64);
     buf.extend_from_slice(&v.to_le_bytes());
@@ -219,7 +219,7 @@ fn pack_g(buf: &mut Vec<u8>, v: f64) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Source of more bytes when the loader runs out. `rmarshal.Loader.need_more_data`
-/// (`rmarshal.py:292`) errors; `rsandbox.FdLoader` (`rsandbox.py:54-71`) reads the
+/// (`rmarshal.py:292`) errors; `rsandbox.FdLoader` (`rsandbox.py`) reads the
 /// pipe. Returning an empty `Vec` signals EOF.
 pub trait NeedMore {
     fn need_more(&mut self) -> SandboxResult<Vec<u8>>;
@@ -264,7 +264,7 @@ impl<R: std::io::Read> NeedMore for ReadNeedMore<R> {
     }
 }
 
-/// rmarshal.py:282-332 `Loader`.
+/// rmarshal.py `Loader`.
 pub struct Loader<N: NeedMore> {
     buf: Vec<u8>,
     pos: usize,
@@ -312,7 +312,7 @@ impl<N: NeedMore> Loader<N> {
         Ok(self.buf[self.pos])
     }
 
-    // rmarshal.py:325-332 `readlong` — 4 signed LE bytes.
+    // rmarshal.py `readlong` — 4 signed LE bytes.
     fn readlong(&mut self) -> SandboxResult<i32> {
         self.ensure(self.pos + 4)?;
         let b = &self.buf[self.pos..self.pos + 4];
@@ -321,7 +321,7 @@ impl<N: NeedMore> Loader<N> {
         Ok(v)
     }
 
-    // rmarshal.py:298-310 `readstr`.
+    // rmarshal.py `readstr`.
     fn readstr(&mut self, count: usize) -> SandboxResult<Vec<u8>> {
         self.ensure(self.pos + count)?;
         let s = self.buf[self.pos..self.pos + count].to_vec();
@@ -336,7 +336,7 @@ impl<N: NeedMore> Loader<N> {
         Ok(lo | hi)
     }
 
-    /// rmarshal.py:282-290 `check_finished`.
+    /// rmarshal.py `check_finished`.
     pub fn check_finished(&self) -> SandboxResult<()> {
         if self.pos != self.buf.len() {
             Err(SandboxError::Protocol("not all data consumed".into()))
@@ -356,7 +356,7 @@ impl<N: NeedMore> Loader<N> {
 
     /// Returns `true` if the stream is exhausted at a message boundary (no
     /// buffered bytes and the source is at EOF). This is the controller's
-    /// `read_message` -> `EOFError` check (`sandlib.py:237-240`): a clean EOF
+    /// `read_message` -> `EOFError` check (`sandlib.py`): a clean EOF
     /// between messages ends the loop, whereas EOF mid-message is an error.
     pub fn at_message_boundary_eof(&mut self) -> SandboxResult<bool> {
         if self.pos < self.buf.len() {
@@ -371,7 +371,7 @@ impl<N: NeedMore> Loader<N> {
     }
 }
 
-/// rmarshal.py:173-182 `load_int` — accepts both `TYPE_INT` and `TYPE_INT64`.
+/// rmarshal.py `load_int` — accepts both `TYPE_INT` and `TYPE_INT64`.
 pub fn load_int<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<i64> {
     match ld.readchr()? {
         TYPE_INT64 => ld.read_i64_le(),
@@ -380,7 +380,7 @@ pub fn load_int<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<i64> {
     }
 }
 
-/// rmarshal.py:200-205 `load_longlong` — requires `TYPE_INT64`.
+/// rmarshal.py `load_longlong` — requires `TYPE_INT64`.
 pub fn load_longlong<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<i64> {
     if ld.readchr()? != TYPE_INT64 {
         return Err(SandboxError::Protocol("expected a longlong".into()));
@@ -388,7 +388,7 @@ pub fn load_longlong<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<i64> {
     ld.read_i64_le()
 }
 
-/// rmarshal.py:246-252 `load_string` — bytes (NULs allowed).
+/// rmarshal.py `load_string` — bytes (NULs allowed).
 pub fn load_string<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<Vec<u8>> {
     if ld.readchr()? != TYPE_STRING {
         return Err(SandboxError::Protocol("expected a string".into()));
@@ -400,7 +400,7 @@ pub fn load_string<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<Vec<u8>> {
     ld.readstr(length as usize)
 }
 
-/// rmarshal.py:215-221 `load_float`.
+/// rmarshal.py `load_float`.
 pub fn load_float<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<f64> {
     if ld.readchr()? != TYPE_FLOAT {
         return Err(SandboxError::Protocol("expected a float".into()));
@@ -410,7 +410,7 @@ pub fn load_float<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<f64> {
     parse_ascii_float(&s)
 }
 
-/// rmarshal.py:147-154 `load_bool`.
+/// rmarshal.py `load_bool`.
 pub fn load_bool<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<bool> {
     match ld.readchr()? {
         TYPE_TRUE => Ok(true),

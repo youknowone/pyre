@@ -12,7 +12,7 @@ use pyre_object::*;
 
 use std::sync::Mutex;
 
-/// `interp_bz2.py:266 W_BZ2Compressor`: the stream and its lock belong to
+/// `interp_bz2.py W_BZ2Compressor`: the stream and its lock belong to
 /// the wrapper object; there is no process-global side table.
 #[crate::pyre_class("_bz2.BZ2Compressor")]
 #[derive(Default)]
@@ -20,14 +20,14 @@ pub struct W_BZ2Compressor {
     backend: *mut Mutex<backend::Compressor>,
 }
 
-/// `interp_bz2.py:396 W_BZ2Decompressor`, object-owned the same way.
+/// `interp_bz2.py W_BZ2Decompressor`, object-owned the same way.
 #[crate::pyre_class("_bz2.BZ2Decompressor")]
 #[derive(Default)]
 pub struct W_BZ2Decompressor {
     backend: *mut Mutex<backend::Decompressor>,
 }
 
-/// `interp_bz2.py:158 _catch_bz2_error`, carrying the messages
+/// `interp_bz2.py _catch_bz2_error`, carrying the messages
 /// `lib-python/3/test/test_bz2.py:1042` pins.
 fn bz2_error(error: backend::Bz2Error) -> crate::PyError {
     match error {
@@ -42,7 +42,7 @@ fn bz2_error(error: backend::Bz2Error) -> crate::PyError {
     }
 }
 
-/// `interp_bz2.py:311 descr_getstate` — neither object is serialisable.
+/// `interp_bz2.py descr_getstate` — neither object is serialisable.
 fn cannot_serialize(name: &str) -> crate::PyError {
     crate::PyError::type_error(format!("cannot pickle '{name}' object"))
 }
@@ -77,7 +77,7 @@ mod compressor_methods {
                For one-shot compression, use the compress() function instead."
     )]
     impl W_BZ2Compressor {
-        /// `interp_bz2.py:261 descr_compressor__new__` — the compression
+        /// `interp_bz2.py descr_compressor__new__` — the compression
         /// level is checked before `BZ2_bzCompressInit` runs.
         #[staticmethod]
         fn __new__(
@@ -95,7 +95,7 @@ mod compressor_methods {
             }))
         }
 
-        /// `interp_bz2.py:315 compress`.
+        /// `interp_bz2.py compress`.
         fn compress(&mut self, data: PyBufferStr) -> Result<Vec<u8>, crate::PyError> {
             let mut compressor = self.compressor()?.lock().unwrap();
             if compressor.is_flushed() {
@@ -104,7 +104,7 @@ mod compressor_methods {
             compressor.compress(&data).map_err(bz2_error)
         }
 
-        /// `interp_bz2.py:358 flush` — the object may not be used afterwards.
+        /// `interp_bz2.py flush` — the object may not be used afterwards.
         fn flush(&mut self) -> Result<Vec<u8>, crate::PyError> {
             let mut compressor = self.compressor()?.lock().unwrap();
             if compressor.is_flushed() {
@@ -113,7 +113,7 @@ mod compressor_methods {
             compressor.flush().map_err(bz2_error)
         }
 
-        /// `interp_bz2.py:311 descr_getstate`.
+        /// `interp_bz2.py descr_getstate`.
         fn __getstate__(&self) -> Result<PyObjectRef, crate::PyError> {
             Err(cannot_serialize("_bz2.BZ2Compressor"))
         }
@@ -128,7 +128,7 @@ mod decompressor_methods {
                For one-shot decompression, use the decompress() function instead."
     )]
     impl W_BZ2Decompressor {
-        /// `interp_bz2.py:391 descr_decompressor__new__`.
+        /// `interp_bz2.py descr_decompressor__new__`.
         #[staticmethod]
         fn __new__(_cls: PyObjectRef) -> PyObjectRef {
             W_BZ2Decompressor::allocate_stable(W_BZ2Decompressor {
@@ -137,7 +137,7 @@ mod decompressor_methods {
             })
         }
 
-        /// `interp_bz2.py:491 decompress` — a negative `max_length` is
+        /// `interp_bz2.py decompress` — a negative `max_length` is
         /// unlimited.
         fn decompress(
             &mut self,
@@ -172,7 +172,7 @@ mod decompressor_methods {
                 .map_err(bz2_error)
         }
 
-        /// `interp_bz2.py:451 eof_w` — true once the end-of-stream marker
+        /// `interp_bz2.py eof_w` — true once the end-of-stream marker
         /// has been reached.
         #[getter]
         fn eof(&self) -> Result<bool, crate::PyError> {
@@ -186,21 +186,21 @@ mod decompressor_methods {
             Ok(self.decompressor()?.lock().unwrap().unused_data().to_vec())
         }
 
-        /// `interp_bz2.py:446 needs_input_w` — true when more input is
+        /// `interp_bz2.py needs_input_w` — true when more input is
         /// needed before more decompressed data can be produced.
         #[getter]
         fn needs_input(&self) -> Result<bool, crate::PyError> {
             Ok(self.decompressor()?.lock().unwrap().needs_input())
         }
 
-        /// `interp_bz2.py:443 descr_getstate`.
+        /// `interp_bz2.py descr_getstate`.
         fn __getstate__(&self) -> Result<PyObjectRef, crate::PyError> {
             Err(cannot_serialize("_bz2.BZ2Decompressor"))
         }
     }
 } // decompressor_methods
 
-/// Sweep-time counterpart of `interp_bz2.py:304 _finalize_`.  The Box holds
+/// Sweep-time counterpart of `interp_bz2.py _finalize_`.  The Box holds
 /// the per-object mutex and the native stream; dropping it neither allocates
 /// nor calls back into Python.
 ///
@@ -215,7 +215,7 @@ pub unsafe fn w_bz2compressor_dealloc(obj: PyObjectRef) {
     }
 }
 
-/// Sweep-time counterpart of `interp_bz2.py:436 _finalize_`.
+/// Sweep-time counterpart of `interp_bz2.py _finalize_`.
 ///
 /// # Safety
 /// `obj` must be a GC-dead `W_BZ2Decompressor`.

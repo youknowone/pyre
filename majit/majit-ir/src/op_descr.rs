@@ -20,7 +20,7 @@ use crate::descr::{
 use crate::resoperation::{GuardPendingFieldEntry, Op, RdVirtualInfo};
 
 impl Op {
-    /// `resoperation.py:244 AbstractResOpOrInputArg.getdescr` + `:462
+    /// `resoperation.py AbstractResOpOrInputArg.getdescr` + `:462
     /// ResOpWithDescr.getdescr` parity. Returns an owned `Arc` clone of
     /// the `DescrRef` so callers can chain `.as_ref()`, `.expect()`, or
     /// pattern-match without holding a `RefCell` borrow across the call.
@@ -28,7 +28,7 @@ impl Op {
         self.descr.borrow().clone()
     }
 
-    /// `resoperation.py:465 ResOpWithDescr.setdescr` parity — overwrites
+    /// `resoperation.py ResOpWithDescr.setdescr` parity — overwrites
     /// the descr slot.  Takes `&self` (interior mutability) so callers
     /// holding a shared `Op` (e.g., through `Rc<Op>`) can stamp a fresh
     /// descr the same way RPython's `op.setdescr(d)` writes on a shared
@@ -37,7 +37,7 @@ impl Op {
         *self.descr.borrow_mut() = Some(descr);
     }
 
-    /// `resoperation.py:474 ResOpWithDescr.cleardescr` parity — clears
+    /// `resoperation.py ResOpWithDescr.cleardescr` parity — clears
     /// the descr slot.
     pub fn cleardescr(&self) {
         *self.descr.borrow_mut() = None;
@@ -47,7 +47,7 @@ impl Op {
     // source analyzer can resolve the bool return type when callers
     // appear in `!op.has_descr()` patterns inside that file.
 
-    /// `resoperation.py:156-200 VectorizationInfo` slot accessor —
+    /// `resoperation.py VectorizationInfo` slot accessor —
     /// returns an owned clone of the per-op vector metadata installed
     /// by the vectorizer.
     pub fn get_vecinfo(&self) -> Option<crate::resoperation::VectorizationInfo> {
@@ -130,7 +130,7 @@ impl Op {
             .flatten()
     }
 
-    /// `compile.py:849 ResumeGuardCopiedDescr.get_resumestorage(): return prev`
+    /// `compile.py ResumeGuardCopiedDescr.get_resumestorage(): return prev`
     /// parity. Reads `rd_numb` from `op.descr` — `ResumeGuardCopiedDescr`
     /// chases `prev` automatically.  Returns `Arc<[u8]>` so the slice
     /// stays valid once the borrow on `op.descr` drops.
@@ -165,7 +165,7 @@ impl Op {
             .rd_pendingfields_arc()
     }
 
-    /// `resoperation.py:299/489 AbstractResOp/GuardResOp.getfailargs`
+    /// `resoperation.py/489 AbstractResOp/GuardResOp.getfailargs`
     /// parity. Returns an owned `SmallVec` clone of the fail_args slot —
     /// None for non-guard ops.  Clone is cheap because `Operand` is an `Rc`
     /// bump and fail_args almost always fits inline (≤3 entries).  Owned
@@ -175,7 +175,7 @@ impl Op {
         self.fail_args.borrow().as_ref().map(|fa| fa.clone())
     }
 
-    /// `resoperation.py:492 GuardResOp.getfailargs_copy` parity.
+    /// `resoperation.py GuardResOp.getfailargs_copy` parity.
     /// Returns an owned `Vec` copy of the fail_args slot — equivalent
     /// to RPython's `self._fail_args[:]`, which raises `TypeError:
     /// 'NoneType' object is not subscriptable` when `_fail_args` is
@@ -194,7 +194,7 @@ impl Op {
         fa.iter().cloned().collect()
     }
 
-    /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
+    /// `resoperation.py GuardResOp.setfailargs` parity — overwrite
     /// the fail_args slot.  Takes `&self` (interior mutability) so the
     /// optimizer can stamp fail_args onto a shared `Op` reached through
     /// `Rc<Op>`.
@@ -266,7 +266,7 @@ impl Op {
         self.fail_arg_types.borrow().is_some()
     }
 
-    /// `resoperation.py:281 AbstractResOp.getarglist` parity — the stored
+    /// `resoperation.py AbstractResOp.getarglist` parity — the stored
     /// [`Operand`](crate::operand::Operand) args.  Subclass mixins
     /// (`UnaryOp`, `BinaryOp`, ..., `N_aryOp`) implement this differently;
     /// pyre collapses them into a single SmallVec slot.
@@ -278,14 +278,14 @@ impl Op {
         self.args.borrow().iter().cloned().collect()
     }
 
-    /// `resoperation.py:284 AbstractResOp.getarglist_copy` parity —
+    /// `resoperation.py AbstractResOp.getarglist_copy` parity —
     /// `N_aryOp.getarglist_copy` returns `self._args[:]`; pyre returns
     /// an owned `SmallVec` of the stored operands.
     pub fn getarglist_copy(&self) -> smallvec::SmallVec<[crate::operand::Operand; 3]> {
         self.args.borrow().iter().cloned().collect()
     }
 
-    /// `resoperation.py:277 AbstractResOp.initarglist` parity — bulk
+    /// `resoperation.py AbstractResOp.initarglist` parity — bulk
     /// store the operand list.  In RPython this is "supposed to be
     /// called only just after the ResOp has been created"
     /// (resoperation.py:278); pyre matches both the name and intent.
@@ -299,7 +299,7 @@ impl Op {
         *self.args.borrow_mut() = args;
     }
 
-    /// `resoperation.py:290 AbstractResOp.setarg` parity — position-wise
+    /// `resoperation.py AbstractResOp.setarg` parity — position-wise
     /// in-place arg mutation.  Subclass mixins index `_arg0/_arg1/...`
     /// or `_args[i]`; pyre indexes the SmallVec directly.
     pub fn setarg(&self, i: usize, arg: crate::operand::Operand) {

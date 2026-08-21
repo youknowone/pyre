@@ -91,9 +91,9 @@ pub fn rbigint_gc_type_id() -> u32 {
 /// zero results that must remain fresh because their digits are filled later.
 pub(super) fn prebuilt_payload_pointer(value: &RBigInt) -> Option<*mut RBigInt> {
     // All four are single-digit objects: `zero()` carries `_size == 0` and the
-    // other three `|_size| == 1` (rbigint.py:1652-1656). Their digit arrays are
+    // other three `|_size| == 1` (rbigint.py). Their digit arrays are
     // one element long, so a value holding two or more digits cannot alias any
-    // of them — and `_normalize` (rbigint.py:1601-1603) is the only route by
+    // of them — and `_normalize` (rbigint.py) is the only route by
     // which a computed result reaches the zero form, where it assigns
     // `self._digits = NULLDIGITS` itself. Deciding that from the size leaves
     // the table for the values that can actually match.
@@ -143,7 +143,7 @@ pub(crate) fn alloc_rbigint_nursery_impl(
         unsafe {
             std::ptr::write(raw as *mut RBigInt, value);
         }
-        // framework.py:28-61 `propagate_no_write_barrier_needed` removes
+        // framework.py `propagate_no_write_barrier_needed` removes
         // GC-pointer field barriers while initializing a fresh fixed-size
         // nursery allocation. The no-collect allocator reports the exceptional
         // old-gen spill, where `_digits` can still be young.
@@ -186,7 +186,7 @@ fn alloc_rbigint_nursery_collecting_impl(
         //
         // The rbigint payload registers no destructor and is not a WEAKREF —
         // its one traced edge is `_digits` — so this malloc site is one of the
-        // `malloc_fast` sites `gct_fv_gc_malloc` (`framework.py:820-838`)
+        // `malloc_fast` sites `gct_fv_gc_malloc` (`framework.py`)
         // selects.
         let digit_slot =
             (&mut value._digits as *mut *mut TypedItemsBlock).cast::<majit_ir::GcRef>();
@@ -209,7 +209,7 @@ fn alloc_rbigint_nursery_collecting_impl(
             unsafe {
                 std::ptr::write(raw as *mut RBigInt, value);
             }
-            // framework.py:28-61 `propagate_no_write_barrier_needed` removes
+            // framework.py `propagate_no_write_barrier_needed` removes
             // GC-pointer field barriers while initializing a fresh fixed-size
             // nursery allocation. Retain it only for collectors that satisfy
             // the request in old-gen.
@@ -230,7 +230,7 @@ pub fn alloc_rbigint_nursery_collecting(value: RBigInt) -> *mut RBigInt {
 /// Let the collector reclaim the conversion's temporaries before the nursery
 /// is exhausted.
 ///
-/// `rbigint.py:3113-3118`'s loop reaches `x.divmod(...)` on every iteration,
+/// `rbigint.py`'s loop reaches `x.divmod(...)` on every iteration,
 /// and upstream that is an ordinary malloc: `[NULLDIGIT] * size` lowers to
 /// `ll_newlist`, the inlined `malloc_fast` copy of `malloc_fixedsize`
 /// (framework.py:366-373), whose nursery bump reaches `collect_and_reserve`

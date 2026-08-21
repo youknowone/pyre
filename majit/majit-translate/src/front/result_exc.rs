@@ -55,7 +55,7 @@
 //! Both rules must apply together per callee: a transformed callee
 //! returns `T` and raises, so an untransformed caller-side discriminant
 //! switch would read garbage.  Every `Result<T, PyError>` callee is
-//! transformed uniformly (`exceptiontransform.py:212` `transform_completely`,
+//! transformed uniformly (`exceptiontransform.py` `transform_completely`,
 //! no allowlist); the callee-side type gate [`tyref_is_result_of_pyerror`]
 //! is the only filter.  Every call site of such a callee either matches
 //! the `?`-diamond, tail-forwards inside an enclosing transformed graph,

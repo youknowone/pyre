@@ -1,9 +1,9 @@
 //! x86-specific per-CPU assembler state held by `DynasmBackend`.
 //!
 //! PyPy stores `self.malloc_slowpath` / `self.propagate_exception_path`
-//! on `Assembler386` (`rpython/jit/backend/x86/assembler.py:63,344`);
+//! on `Assembler386` (`rpython/jit/backend/x86/assembler.py`);
 //! the assembler is one-per-CPU and lives for the CPU's lifetime, so
-//! the trampolines built at `setup_once` (`llsupport/assembler.py:124-138`)
+//! the trampolines built at `setup_once` (`llsupport/assembler.py`)
 //! persist on it.
 //!
 //! Pyre's `Assembler386` is constructed per-`compile_loop`/`compile_bridge`

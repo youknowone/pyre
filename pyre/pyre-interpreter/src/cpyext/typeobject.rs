@@ -289,7 +289,7 @@ pub static mut CPY_MODULE_DEF_TYPE: CPyTypeObject = immortal_type();
 
 /// The `PyTypeObject` statics an extension names by address.
 ///
-/// `api.py:746-790 build_exported_objects` registers the same family: C spells
+/// `api.py build_exported_objects` registers the same family: C spells
 /// `&PyList_Type`, so each one has to be storage whose address is fixed at link
 /// time and whose body the runtime fills in place, which is what a
 /// [`PyAPI_DATA`] object is and what a mirror allocated on demand can never be.

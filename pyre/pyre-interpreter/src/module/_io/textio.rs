@@ -30,7 +30,7 @@ impl PositionCookie {
         if value.int_lt(0) {
             return Err(crate::PyError::value_error("negative seek position"));
         }
-        // interp_textio.py:253-269 `PositionCookie.__init__`: extract each
+        // interp_textio.py `PositionCookie.__init__`: extract each
         // native word with rbigint's mask conversion, then shift the source.
         // In particular, do not call `to_u64()` on the whole cookie — valid
         // packed cookies intentionally occupy several machine words.
@@ -981,7 +981,7 @@ impl W_TextIOWrapper {
     /// Skips a stream this did not build — a replaced `sys.stdout`, one that
     /// already has a codec, one carrying no encoding string.  A codec the
     /// registry refuses, or an incremental encoder/decoder that will not
-    /// construct, is NOT skipped: `create_stdio` (`app_main.py:495-497`) builds
+    /// construct, is NOT skipped: `create_stdio` (`app_main.py`) builds
     /// the wrapper with its codec in one step and propagates both, and a stream
     /// left silently without one reports itself unreadable however readable its
     /// buffer is.

@@ -14,7 +14,7 @@
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 
-/// opencoder.py:567-568 `cut_point()` — RPython 5-tuple
+/// opencoder.py `cut_point()` — RPython 5-tuple
 /// `(_pos, _count, _index, len(_snapshot_data), len(_snapshot_array_data))`.
 ///
 /// The byte-stream recorder (`TraceRecordBuffer`) fills in every field
@@ -71,7 +71,7 @@ pub struct Snapshot {
 ///
 /// `crate::history::TraceCtx::record_guard_with_snapshot` attaches a
 /// one-frame snapshot to the interpreter-side promotes purely to satisfy
-/// `resume.py:396-397`'s `assert resume_position >= 0`.  That layer is the
+/// `resume.py`'s `assert resume_position >= 0`.  That layer is the
 /// recorder-side trace buffer and holds no `MIFrameStack`, so it has no
 /// position to put in the frame; the dispatch layer re-stamps it with the
 /// walker's real coordinate before the guard is finalized.
@@ -102,7 +102,7 @@ pub struct SnapshotFrame {
     /// re-stamp.
     pub jitcode_index: u32,
     /// Program counter within the jitcode: the JitCode byte offset, as the
-    /// MIFrame's `pc` field is upstream (`pyjitpl.py:185 setposition`). Both
+    /// MIFrame's `pc` field is upstream (`pyjitpl.py setposition`). Both
     /// writers stamp a JitCode offset — `build_state_field_snapshot` reads
     /// `MIFrame::pc` directly, and `capture_snapshot_for_last_guard_multi_frame`
     /// takes it from the walker's own `build_framestack_snapshot`. There is no
@@ -146,7 +146,7 @@ pub enum SnapshotTagged {
     /// RPython: InputArgRef/InputArgInt carry type ('r'/'i'/'f') in
     /// the Box class itself. Pyre stores the typed `OpRef` so the
     /// variant tag (InputArg{Int,Float,Ref} / IntOp/FloatOp/RefOp)
-    /// reaches `_number_boxes` (resume.py:210-216 `box.type == 'r' vs
+    /// reaches `_number_boxes` (resume.py `box.type == 'r' vs
     /// 'i'`). The trailing `Type` is a redundant lockstep slot kept
     /// for callers that need the type without re-deriving it via
     /// `opref.ty()`.
@@ -222,7 +222,7 @@ impl Trace {
     /// Input arguments are numbered starting from 0; the OpRef index matches
     /// the input argument index.
     ///
-    /// resoperation.py:719/727/739 — InputArgInt/InputArgFloat/InputArgRef
+    /// resoperation.py/727/739 — InputArgInt/InputArgFloat/InputArgRef
     /// each pin `type = 'i'/'f'/'r'` at construction.
     pub fn record_input_arg(&mut self, tp: Type) -> OpRef {
         assert!(
@@ -315,9 +315,9 @@ impl Trace {
     /// Record a regular (non-guard) operation.
     /// Returns the OpRef for this operation's result.
     ///
-    /// `AbstractResOp` + IntOp/FloatOp/RefOp mixins (resoperation.py:564-638)
+    /// `AbstractResOp` + IntOp/FloatOp/RefOp mixins (resoperation.py)
     /// pin the result type at construction. Void-result ops keep the
-    /// `AbstractResOp.type = 'v'` default (resoperation.py:260).
+    /// `AbstractResOp.type = 'v'` default (resoperation.py).
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
@@ -352,7 +352,7 @@ impl Trace {
     }
 
     /// Record a guard operation.
-    /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage guards
+    /// `pyjitpl.py generate_guard()` parity: tracer-stage guards
     /// carry `descr=None`. The optimizer creates the FailDescr later in
     /// `store_final_boxes_in_guard` / `invent_fail_descr_for_op`
     /// (compile.py:722-730 / 924-942). Tests that need a pre-stamped
@@ -493,7 +493,7 @@ impl Trace {
 
     /// Opcode of the most recently recorded guard, if any.  Snapshot
     /// capture keys `after_residual_call` on the guard opcode itself
-    /// (`pyjitpl.py:2599-2603 generate_guard`).
+    /// (`pyjitpl.py generate_guard`).
     pub fn last_guard_opcode(&self) -> Option<OpCode> {
         self.ops
             .iter()
@@ -525,7 +525,7 @@ impl Trace {
     /// Set `fail_arg_types` on the last recorded op. Used by
     /// `trace_ctx::record_guard_typed` to record types for fail args
     /// without stamping a tracer-stage descr (codex #3 /
-    /// pyjitpl.py:2548 generate_guard parity).
+    /// pyjitpl.py generate_guard parity).
     pub fn set_last_op_fail_arg_types(&mut self, types: Vec<Type>) {
         if let Some(op) = self.ops.last() {
             op.set_fail_arg_types(types);
@@ -592,7 +592,7 @@ impl Trace {
         crate::history::TreeLoop::from_oprc(self.inputargs, self.ops, Vec::new())
     }
 
-    /// opencoder.py:567-568 `cut_point()` — the recorder's local slice of
+    /// opencoder.py `cut_point()` — the recorder's local slice of
     /// the 5-tuple. `snapshot_data_len` / `snapshot_array_data_len` come
     /// from `TraceCtx` (which owns the pyre-only `Vec<Snapshot>` side
     /// table); callers should use `TraceCtx::get_trace_position` for a
@@ -608,12 +608,12 @@ impl Trace {
         }
     }
 
-    /// opencoder.py:570-575 `cut_at(end)` — restore the recorder to a
+    /// opencoder.py `cut_at(end)` — restore the recorder to a
     /// previously saved position.
     ///
     /// Discards all operations recorded after `pos`. Used to undo a
     /// tentative JUMP after compile_trace succeeds or fails
-    /// (pyjitpl.py:3195 finally: `self.history.cut(cut_at)`).
+    /// (pyjitpl.py finally: `self.history.cut(cut_at)`).
     pub fn cut(&mut self, pos: TracePosition) {
         self.ops.truncate(pos._pos);
         self.op_count = pos._count;
@@ -626,9 +626,9 @@ impl Trace {
             .unwrap_or_else(|| self.ops.iter().filter(|op| op.opcode.is_guard()).count());
     }
 
-    /// history.py:725 `length`: number of non-inputarg ops recorded so far.
+    /// history.py `length`: number of non-inputarg ops recorded so far.
     /// Compared against `warmstate.trace_limit` by
-    /// `MetaInterp.blackhole_if_trace_too_long` (pyjitpl.py:2791).
+    /// `MetaInterp.blackhole_if_trace_too_long` (pyjitpl.py).
     pub fn num_ops(&self) -> usize {
         self.ops.len()
     }
@@ -690,7 +690,7 @@ impl Trace {
     }
 
     /// Stamp the concrete runtime value on the canonical frontend object
-    /// for `position` (`history.py:803 *FrontendOp(pos, value)` — the
+    /// for `position` (`history.py *FrontendOp(pos, value)` — the
     /// value lives on the `InputArg`/`Op` identity, not on a side pool).
     /// `position` indexes the dense recording order: `[0, inputargs.len())`
     /// are inputargs, `[inputargs.len(), ..)` are recorded ops. Returns
@@ -710,7 +710,7 @@ impl Trace {
     }
 
     /// Read the concrete runtime value stamped on the canonical frontend
-    /// object for `position` (`history.py:680 *FrontendOp.getint()`).
+    /// object for `position` (`history.py *FrontendOp.getint()`).
     /// `None` when never stamped or out of range.
     pub(crate) fn concrete_at(&self, position: u32) -> Option<Value> {
         let pos = position as usize;
@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn test_num_ops_counts_non_inputargs() {
-        // history.py:725 length() = trace._count - len(inputargs).
+        // history.py length() = trace._count - len(inputargs).
         // In pyre that's ops.len() since inputargs aren't stored in ops.
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);

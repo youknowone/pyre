@@ -37,7 +37,7 @@ pub fn w_method_new(
     w_self: PyObjectRef,
     w_class: PyObjectRef,
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
     // three members across the GC malloc and re-read their relocated
     // addresses afterwards (a minor collection inside the malloc may move
     // them). A bound method whose `w_function`/`w_self`/`w_class` is
@@ -200,7 +200,7 @@ pub const STATICMETHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(StaticMet
 pub const STATICMETHOD_W_DICT_OFFSET: usize = std::mem::offset_of!(StaticMethod, w_dict);
 
 pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
     // wrapped function across the GC malloc and read its relocated address.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
@@ -260,7 +260,7 @@ pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
         // else revokes a fold over this wrapper: re-initialising an installed
         // descriptor changes no type's version tag, which is the only other pin
         // the folds that unwrap `w_function` hold.  The `is_installed` test is
-        // `pyjitpl.py:1112`'s `mutatebox.nonnull()` — a wrapper no loop watches
+        // `pyjitpl.py`'s `mutatebox.nonnull()` — a wrapper no loop watches
         // pays one load.
         if (*(obj as *const StaticMethod))
             .w_function_watchers
@@ -275,7 +275,7 @@ pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
     }
 }
 
-/// `quasiimmut.py:17-27 get_current_qmut_instance` for `function.py`'s
+/// `quasiimmut.py get_current_qmut_instance` for `function.py`'s
 /// `w_function?` — resolved at RECORD time so a write reached later in the same
 /// trace sees it, and handed back so the loop compiled from that trace
 /// registers on it.
@@ -295,7 +295,7 @@ pub unsafe fn w_staticmethod_current_w_function_qmut(
     )
 }
 
-/// function.py:678-681 `StaticMethod.getdict` — allocate the instance
+/// function.py `StaticMethod.getdict` — allocate the instance
 /// dictionary on first access and retain its identity.
 #[inline]
 /// # Safety
@@ -312,7 +312,7 @@ pub unsafe fn w_staticmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// function.py:683-688 `StaticMethod.setdict`; the caller performs the
+/// function.py `StaticMethod.setdict`; the caller performs the
 /// dict type check before replacing this field.
 #[inline]
 /// # Safety
@@ -335,7 +335,7 @@ pub unsafe fn is_staticmethod(obj: PyObjectRef) -> bool {
 
 /// An exact `staticmethod`, excluding subclasses — the test a caller needs
 /// before it may unwrap `w_function` in place of invoking `__get__`.
-/// `descroperation.py:169-187 get_and_call_function` takes its descriptor
+/// `descroperation.py get_and_call_function` takes its descriptor
 /// shortcut only on the exact type and routes every other one through
 /// `space.get`, so a subclass that overrides `__get__` binds differently.
 /// Compares the user-visible class object, as [`is_exact_tuple`] does, because
@@ -386,7 +386,7 @@ pub const CLASSMETHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(ClassMetho
 pub const CLASSMETHOD_W_DICT_OFFSET: usize = std::mem::offset_of!(ClassMethod, w_dict);
 
 pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
     // wrapped function across the GC malloc and read its relocated address.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
@@ -446,7 +446,7 @@ pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
         // else revokes a fold over this wrapper: re-initialising an installed
         // descriptor changes no type's version tag, which is the only other pin
         // the folds that unwrap `w_function` hold.  The `is_installed` test is
-        // `pyjitpl.py:1112`'s `mutatebox.nonnull()` — a wrapper no loop watches
+        // `pyjitpl.py`'s `mutatebox.nonnull()` — a wrapper no loop watches
         // pays one load.
         if (*(obj as *const ClassMethod))
             .w_function_watchers
@@ -461,7 +461,7 @@ pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
     }
 }
 
-/// `quasiimmut.py:17-27 get_current_qmut_instance` for `function.py`'s
+/// `quasiimmut.py get_current_qmut_instance` for `function.py`'s
 /// `w_function?` — resolved at RECORD time so a write reached later in the same
 /// trace sees it, and handed back so the loop compiled from that trace
 /// registers on it.
@@ -481,7 +481,7 @@ pub unsafe fn w_classmethod_current_w_function_qmut(
     )
 }
 
-/// function.py:726-729 `ClassMethod.getdict`.
+/// function.py `ClassMethod.getdict`.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -497,7 +497,7 @@ pub unsafe fn w_classmethod_getdict(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// function.py:731-736 `ClassMethod.setdict`; the object-space layer checks
+/// function.py `ClassMethod.setdict`; the object-space layer checks
 /// for dict or a dict subclass before replacing the field.
 #[inline]
 /// # Safety

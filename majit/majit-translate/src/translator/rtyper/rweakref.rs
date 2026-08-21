@@ -20,15 +20,15 @@ use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, R
 
 // ─── BaseWeakRefRepr trait ───────────────────────────────────────────
 
-/// rweakref.py:23-48 `class BaseWeakRefRepr(Repr)`.
+/// rweakref.py `class BaseWeakRefRepr(Repr)`.
 ///
 /// Shared interface for `WeakRefRepr` (native) and
 /// `EmulatedWeakRefRepr` (rweakref=False fallback).
 pub trait BaseWeakRefRepr: Repr {
-    /// rweakref.py:58/80 `_weakref_create(hop, v_inst)`.
+    /// rweakref.py/80 `_weakref_create(hop, v_inst)`.
     fn weakref_create(&self, hop: &HighLevelOp, v_inst: Hlvalue) -> RTypeResult;
 
-    /// rweakref.py:62/91 `_weakref_deref(hop, v_wref)`.
+    /// rweakref.py/91 `_weakref_deref(hop, v_wref)`.
     fn weakref_deref(&self, hop: &HighLevelOp, v_wref: Hlvalue) -> RTypeResult;
 }
 
@@ -73,7 +73,7 @@ fn null_ptr_constant(ptr_type: &LowLevelType) -> Result<Constant, TyperError> {
     ))
 }
 
-/// rweakref.py:53 `dead_wref = llmemory.dead_wref` — the single prebuilt
+/// rweakref.py `dead_wref = llmemory.dead_wref` — the single prebuilt
 /// dead-weakref pointer, a `WeakRefRepr` class attribute (not recomputed
 /// per `convert_const`). Delegates to [`llmemory::dead_wref`] so the
 /// singleton lives at its upstream home.
@@ -84,7 +84,7 @@ fn native_dead_wref_constant() -> Result<Constant, TyperError> {
     ))
 }
 
-/// rweakref.py:27-39 `BaseWeakRefRepr.convert_const(self, value)` — the
+/// rweakref.py `BaseWeakRefRepr.convert_const(self, value)` — the
 /// shared body. `None` maps to a null pointer; a dead weakref to the
 /// per-repr `dead_wref`; a live weakref converts its referent through
 /// the referent's own repr (`rtyper.bindingrepr(Constant(instance))`)
@@ -101,7 +101,7 @@ fn base_weakref_convert_const(
         ConstValue::HostObject(obj) if obj.is_weakref() => match obj.weakref_referent() {
             Some(None) => dead_wref(),
             Some(Some(instance)) => {
-                // rweakref.py:33-39 — `bk = self.rtyper.annotator.bookkeeper`
+                // rweakref.py — `bk = self.rtyper.annotator.bookkeeper`
                 // is implicit in `bindingrepr`.
                 let rtyper = rtyper.upgrade().ok_or_else(|| {
                     TyperError::message(
@@ -163,7 +163,7 @@ fn ref_field_const() -> Result<Constant, TyperError> {
 
 // ─── WeakRefRepr ─────────────────────────────────────────────────────
 
-/// rweakref.py:51-64 `class WeakRefRepr(BaseWeakRefRepr)`.
+/// rweakref.py `class WeakRefRepr(BaseWeakRefRepr)`.
 /// `lowleveltype = WeakRefPtr`.
 #[derive(Debug)]
 pub struct WeakRefRepr {
@@ -183,7 +183,7 @@ impl WeakRefRepr {
         }
     }
 
-    /// rweakref.py:55-56 `do_weakref_create(self, llinstance):
+    /// rweakref.py `do_weakref_create(self, llinstance):
     /// return llmemory.weakref_create(llinstance)`.
     fn do_weakref_create(&self, llinstance: &_ptr) -> Result<Constant, TyperError> {
         let wref = llmemory::weakref_create(llinstance).map_err(TyperError::message)?;
@@ -211,7 +211,7 @@ impl Repr for WeakRefRepr {
         ReprClassId::WeakRefRepr
     }
 
-    /// rweakref.py:27-39 (shared `BaseWeakRefRepr.convert_const`).
+    /// rweakref.py (shared `BaseWeakRefRepr.convert_const`).
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         base_weakref_convert_const(
             &self.rtyper,
@@ -273,18 +273,18 @@ impl fmt::Display for WeakRefRepr {
 
 // ─── EmulatedWeakRefRepr ─────────────────────────────────────────────
 
-/// rweakref.py:67-96 `class EmulatedWeakRefRepr(BaseWeakRefRepr)`.
+/// rweakref.py `class EmulatedWeakRefRepr(BaseWeakRefRepr)`.
 /// For `rweakref=False`, emulates weakrefs with strong references.
 /// `lowleveltype = Ptr(GcStruct('EmulatedWeakRef', ('ref', GCREF)))`.
 #[derive(Debug)]
 pub struct EmulatedWeakRefRepr {
     state: ReprState,
     lltype: LowLevelType,
-    /// rweakref.py:24-25 — see [`WeakRefRepr::rtyper`].
+    /// rweakref.py — see [`WeakRefRepr::rtyper`].
     rtyper: Weak<RPythonTyper>,
 }
 
-/// `Ptr(GcStruct('EmulatedWeakRef', ('ref', GCREF)))` (rweakref.py:71-72).
+/// `Ptr(GcStruct('EmulatedWeakRef', ('ref', GCREF)))` (rweakref.py).
 fn emulated_weakref_lltype() -> LowLevelType {
     let gcref = LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Opaque(OpaqueType::gc("GCREF")),
@@ -324,7 +324,7 @@ impl EmulatedWeakRefRepr {
     fn do_weakref_create(&self, llinstance: &_ptr) -> Result<Constant, TyperError> {
         let pointee = ptr_pointee_type(&self.lltype)?;
         let mut p = malloc(pointee, None, MallocFlavor::Gc, true).map_err(TyperError::message)?;
-        // `p.ref = cast_opaque_ptr(GCREF, llinstance)` (rweakref.py:77): wrap
+        // `p.ref = cast_opaque_ptr(GCREF, llinstance)` (rweakref.py): wrap
         // the instance in a hidden GCREF opaque so `weakref_deref` can reveal
         // the original container, rather than just re-typing the pointer.
         let LowLevelType::Ptr(gcref_ptr) = gcref_type() else {
@@ -357,7 +357,7 @@ impl Repr for EmulatedWeakRefRepr {
         ReprClassId::EmulatedWeakRefRepr
     }
 
-    /// rweakref.py:27-39 (shared `BaseWeakRefRepr.convert_const`).
+    /// rweakref.py (shared `BaseWeakRefRepr.convert_const`).
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         base_weakref_convert_const(
             &self.rtyper,
@@ -495,7 +495,7 @@ mod tests {
         assert!(ptr.nonzero());
     }
 
-    /// rweakref.py:54 `dead_wref = llmemory.dead_wref` is a single shared
+    /// rweakref.py `dead_wref = llmemory.dead_wref` is a single shared
     /// prebuilt value. `_ptr` equality respects container identity, so
     /// two conversions of distinct dead weakrefs must compare equal — the
     /// singleton invariant.
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn native_do_weakref_create_yields_nonzero_weakref_ptr() {
-        // rweakref.py:55-56 `return llmemory.weakref_create(llinstance)`.
+        // rweakref.py `return llmemory.weakref_create(llinstance)`.
         let repr = WeakRefRepr::new(Weak::new());
         let c = repr.do_weakref_create(&gc_instance("Inst")).unwrap();
         assert_eq!(c.concretetype, Some(WEAKREF_PTR.clone()));
@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn emulated_do_weakref_create_stores_gcref_in_ref_field() {
-        // rweakref.py:75-78 — malloc EmulatedWeakRef, p.ref = cast_opaque_ptr.
+        // rweakref.py — malloc EmulatedWeakRef, p.ref = cast_opaque_ptr.
         let repr = EmulatedWeakRefRepr::new(Weak::new());
         let c = repr.do_weakref_create(&gc_instance("Inst")).unwrap();
         assert_eq!(c.concretetype, Some(repr.lltype.clone()));
@@ -578,7 +578,7 @@ mod tests {
         assert!(gcref.nonzero());
     }
 
-    /// rweakref.py:37 `repr = self.rtyper.bindingrepr(Constant(instance))`
+    /// rweakref.py `repr = self.rtyper.bindingrepr(Constant(instance))`
     /// — a live referent needs the typer. With a dropped `Weak`, the live
     /// arm surfaces a structured error instead of panicking.
     #[test]

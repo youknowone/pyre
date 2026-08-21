@@ -20,7 +20,7 @@ pub const SLICE_STOP_OFFSET: usize = std::mem::offset_of!(W_SliceObject, stop);
 pub const SLICE_STEP_OFFSET: usize = std::mem::offset_of!(W_SliceObject, step);
 
 pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
     // three bounds across the GC malloc and re-read their relocated
     // addresses afterwards (a minor collection inside the malloc may move
     // them). A slice whose `start`/`stop`/`step` is reachable only through

@@ -5,23 +5,23 @@
 
 use majit_ir::{GcRef, Value};
 
-/// jitexc.py:10 JitException — base class for all JIT control flow.
+/// jitexc.py JitException — base class for all JIT control flow.
 ///
 /// In RPython these are Python exceptions. In Rust we model them as an enum
 /// returned via `Result::Err(JitException)` from blackhole execution.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JitException {
-    /// jitexc.py:17 DoneWithThisFrameVoid
+    /// jitexc.py DoneWithThisFrameVoid
     DoneWithThisFrameVoid,
-    /// jitexc.py:21 DoneWithThisFrameInt
+    /// jitexc.py DoneWithThisFrameInt
     DoneWithThisFrameInt(i64),
-    /// jitexc.py:29 DoneWithThisFrameRef
+    /// jitexc.py DoneWithThisFrameRef
     DoneWithThisFrameRef(GcRef),
-    /// jitexc.py:37 DoneWithThisFrameFloat
+    /// jitexc.py DoneWithThisFrameFloat
     DoneWithThisFrameFloat(f64),
-    /// jitexc.py:45 ExitFrameWithExceptionRef
+    /// jitexc.py ExitFrameWithExceptionRef
     ExitFrameWithExceptionRef(GcRef),
-    /// jitexc.py:53 ContinueRunningNormally
+    /// jitexc.py ContinueRunningNormally
     ContinueRunningNormally(Box<ContinueRunningNormallyArgs>),
 }
 
@@ -40,13 +40,13 @@ pub struct ContinueRunningNormallyArgs {
 /// Mirrors DoneWithThisFrame{Void,Int,Ref,Float} in jitexc.py.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DoneWithThisFrame {
-    /// jitexc.py:17 DoneWithThisFrameVoid
+    /// jitexc.py DoneWithThisFrameVoid
     Void,
-    /// jitexc.py:21 DoneWithThisFrameInt
+    /// jitexc.py DoneWithThisFrameInt
     Int(i64),
-    /// jitexc.py:29 DoneWithThisFrameRef
+    /// jitexc.py DoneWithThisFrameRef
     Ref(GcRef),
-    /// jitexc.py:37 DoneWithThisFrameFloat
+    /// jitexc.py DoneWithThisFrameFloat
     Float(f64),
 }
 

@@ -15,7 +15,7 @@
 //! RPython's dense `Assembler.write_insn()`-grown dict.
 //!
 //! Reference: `rpython/jit/codewriter/assembler.py:19-32`,
-//! `rpython/jit/codewriter/assembler.py:234-248` (`_encode_liveness`),
+//! `rpython/jit/codewriter/assembler.py` (`_encode_liveness`),
 //! `rpython/jit/metainterp/pyjitpl.py:2264`
 //! (`self.liveness_info = "".join(asm.all_liveness)`).
 
@@ -43,8 +43,8 @@ pub struct AssemblerState {
 
 impl AssemblerState {
     fn new() -> Self {
-        // `assembler.py:29-31` gives one `Assembler` one `all_liveness`
-        // buffer, and `codewriter.py:73-86 make_jitcodes` drains *every*
+        // `assembler.py` gives one `Assembler` one `all_liveness`
+        // buffer, and `codewriter.py make_jitcodes` drains *every*
         // pending graph through it, so upstream has exactly one offset space
         // for the whole program. pyre splits the drain across two processes —
         // `build.rs` assembles the extracted interpreter graphs, the runtime
@@ -177,7 +177,7 @@ pub fn publish_state(
 
 #[cfg(test)]
 mod tests {
-    /// `assembler.py:29-31` — one `Assembler`, one `all_liveness` offset
+    /// `assembler.py` — one `Assembler`, one `all_liveness` offset
     /// space. The build-time drain's bytes are the prefix of that buffer, so
     /// every offset baked into a build-time jitcode's `-live-` operand
     /// addresses the same byte in `metainterp_sd.liveness_info` that
@@ -209,8 +209,8 @@ mod tests {
         });
     }
 
-    /// `assembler.py:241` writes `len(live_i)` where `live_i` is the set
-    /// `get_liveness_info` built (`assembler.py:228`), so the count byte and
+    /// `assembler.py` writes `len(live_i)` where `live_i` is the set
+    /// `get_liveness_info` built (`assembler.py`), so the count byte and
     /// the bitset always agree. `intern_liveness` takes plain slices instead
     /// of a set, so a repeated register index is the one input that can drive
     /// the two apart — and the count is what `LivenessIterator` trusts, so an

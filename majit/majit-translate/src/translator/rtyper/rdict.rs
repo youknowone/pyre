@@ -18,7 +18,7 @@ use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{HighLevelOp, RPythonTyper};
 
-/// RPython `class AbstractDictRepr(rmodel.Repr)` (`rdict.py:35-63`).
+/// RPython `class AbstractDictRepr(rmodel.Repr)` (`rdict.py`).
 ///
 /// Rust has no inheritance, so the lltypesystem [`DictRepr`] embeds this
 /// state directly and forwards its `compact_repr` behavior.
@@ -84,7 +84,7 @@ impl AbstractDictRepr {
     }
 }
 
-/// RPython `def rtype_newdict(hop)` (`rdict.py:60-65`):
+/// RPython `def rtype_newdict(hop)` (`rdict.py`):
 ///
 /// ```python
 /// def rtype_newdict(hop):
@@ -95,7 +95,7 @@ impl AbstractDictRepr {
 ///     return v_result
 /// ```
 ///
-/// `SomeDict = SomeOrderedDict` upstream (`model.py:416`), so `hop.r_result`
+/// `SomeDict = SomeOrderedDict` upstream (`model.py`), so `hop.r_result`
 /// is always a concrete [`OrderedDictRepr`] here — the abstract/concrete
 /// split mirrors `rtype_newlist` (`rlist.rs`) downcasting to `ListRepr`.
 pub fn rtype_newdict(hop: &HighLevelOp) -> RTypeResult {
@@ -151,9 +151,9 @@ impl Repr for AbstractDictIteratorRepr {
     }
 }
 
-/// RPython `SomeDict.rtyper_makerepr` (`rdict.py:12-25`).
+/// RPython `SomeDict.rtyper_makerepr` (`rdict.py`).
 ///
-/// Upstream `annotator/model.py:416` aliases `SomeDict =
+/// Upstream `annotator/model.py` aliases `SomeDict =
 /// SomeOrderedDict`, so the `SomeOrderedDict.get_dict_repr` override
 /// (`rdict.py:32-34`) wins and the concrete repr is
 /// `lltypesystem.rordereddict.OrderedDictRepr`.

@@ -40,7 +40,7 @@ const STDOUT_FD: i32 = 1;
 
 /// A [`NeedMore`] that refills from a raw fd via the un-sandboxed `read(2)` — the
 /// reply pipe (STDIN). `buflen` starts at 4096 and doubles on every refill,
-/// matching `rsandbox.FdLoader.need_more_data` (rsandbox.py:54-70). A `FdLoader`
+/// matching `rsandbox.FdLoader.need_more_data` (rsandbox.py). A `FdLoader`
 /// is therefore `Loader<FdNeedMore>`.
 pub struct FdNeedMore {
     fd: i32,
@@ -54,7 +54,7 @@ impl FdNeedMore {
 }
 
 impl NeedMore for FdNeedMore {
-    // rsandbox.py:60 `need_more_data`.
+    // rsandbox.py `need_more_data`.
     fn need_more(&mut self) -> SandboxResult<Vec<u8>> {
         let mut buf = vec![0u8; self.buflen];
         // SAFETY: read(2) into a buffer we own and sized; raw un-sandboxed read.
@@ -81,7 +81,7 @@ pub fn fd_loader(fd: i32) -> Loader<FdNeedMore> {
     Loader::new(Vec::new(), FdNeedMore::new(fd))
 }
 
-/// rsandbox.py:42 `writeall_not_sandboxed` — write the whole buffer with the raw
+/// rsandbox.py `writeall_not_sandboxed` — write the whole buffer with the raw
 /// un-sandboxed `write(2)`, looping over partial writes, IOError on `count <= 0`.
 pub fn writeall_not_sandboxed(fd: i32, mut buf: &[u8]) -> SandboxResult<()> {
     while !buf.is_empty() {
@@ -102,7 +102,7 @@ pub fn writeall_not_sandboxed(fd: i32, mut buf: &[u8]) -> SandboxResult<()> {
     Ok(())
 }
 
-/// rsandbox.py:90 `reraise_error` — map the leading exception code to a
+/// rsandbox.py `reraise_error` — map the leading exception code to a
 /// [`SandboxError`]. Code 1 (`OSError`) reads a second int as the errno;
 /// 2..=8 map via [`error_from_code`]; anything else is `RuntimeError`.
 fn reraise_error<N: NeedMore>(error: i64, loader: &mut Loader<N>) -> SandboxError {
@@ -116,7 +116,7 @@ fn reraise_error<N: NeedMore>(error: i64, loader: &mut Loader<N>) -> SandboxErro
     }
 }
 
-/// rsandbox.py:111 `not_implemented_stub` — raise `RuntimeError` for an external
+/// rsandbox.py `not_implemented_stub` — raise `RuntimeError` for an external
 /// whose signature cannot be marshalled. The RPython original also writes `msg`
 /// to fd 2; this port omits that write (matching the majit sibling mirror) so
 /// the untrusted child never writes directly to an inherited host fd.
@@ -143,7 +143,7 @@ fn as_bytes(v: MarshalValue) -> SandboxResult<Vec<u8>> {
     }
 }
 
-/// rsandbox.py:152,165 `load_result = rmarshal.get_loader(s_result)` — decode the
+/// rsandbox.py `load_result = rmarshal.get_loader(s_result)` — decode the
 /// typed reply payload by dispatching on [`ResultKind`]. The reply shapes are
 /// exactly what `sandlib::encode_reply` emits.
 pub fn load_result<N: NeedMore>(
@@ -201,7 +201,7 @@ pub fn load_result<N: NeedMore>(
     }
 }
 
-/// rsandbox.py:82-88 `sandboxed_io` — write the request, build a loader on the
+/// rsandbox.py `sandboxed_io` — write the request, build a loader on the
 /// reply pipe, read the leading code, and either raise or return the loader
 /// positioned at the result payload.
 fn sandboxed_io(buf: &[u8]) -> SandboxResult<Loader<FdNeedMore>> {
@@ -214,7 +214,7 @@ fn sandboxed_io(buf: &[u8]) -> SandboxResult<Loader<FdNeedMore>> {
     Ok(loader)
 }
 
-/// The generic trampoline body (rsandbox.py:157-167 `execute`). Marshals the
+/// The generic trampoline body (rsandbox.py `execute`). Marshals the
 /// request, performs the round-trip, decodes the typed result, and asserts the
 /// reply was fully consumed.
 pub fn syscall(

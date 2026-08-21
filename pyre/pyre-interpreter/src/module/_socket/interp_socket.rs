@@ -29,7 +29,7 @@ use super::rsocket_rffi as rffi;
 /// constants/helpers above are usable, but `socket.socket(...)` raises
 /// the C-extension stub error.
 
-/// `interp_socket.py:1066-1084 converted_error` — turn an rsocket
+/// `interp_socket.py converted_error` — turn an rsocket
 /// `SocketError` subclass into the matching python-level exception.
 ///
 /// `applevelerrcls` matches the field defined on each rsocket error
@@ -44,7 +44,7 @@ use super::rsocket_rffi as rffi;
 /// When `errno` is `Some`, builds the exception with `(errno, message)`
 /// like `SocketErrorWithErrno` (`interp_socket.py:1074-1075`); otherwise
 /// only `(message,)` like the plain SocketError (`:1077-1078`).
-/// `interp_socket.py:102-123 idna_converter` — turn a hostname argument
+/// `interp_socket.py idna_converter` — turn a hostname argument
 /// into a `Vec<u8>` suitable for passing to a DNS resolver.
 ///
 /// Accepts str / bytes / bytearray.  For str: tries ASCII first; on
@@ -253,7 +253,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     #[cfg(any(unix, windows))]
     rffi::init();
 
-    // `_rsocket_rffi.py:140-220 constant_names` + `:234-262
+    // `_rsocket_rffi.py constant_names` + `:234-262
     // constants_w_defaults` — populated through the libc crate where
     // available, hardcoded for platform-specific constants the crate
     // does not expose.  Mirrors PyPy's
@@ -315,7 +315,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IPPROTO_MAX", libc::IPPROTO_MAX);
         cst!("IPPROTO_GRE", libc::IPPROTO_GRE);
         cst!("IPPROTO_RSVP", libc::IPPROTO_RSVP);
-        // `_rsocket_rffi.py:234-241 constants_w_defaults` — SOL_IP/TCP/UDP
+        // `_rsocket_rffi.py constants_w_defaults` — SOL_IP/TCP/UDP
         // and IPPROTO_* duplicates kept for PyPy compatibility.
         cst!("SOL_IP", 0);
         cst!("SOL_TCP", 6);
@@ -556,7 +556,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IPPROTO_SCTP", ws::IPPROTO_SCTP);
         cst!("IPPROTO_RAW", ws::IPPROTO_RAW);
         cst!("IPPROTO_MAX", ws::IPPROTO_MAX);
-        // `_rsocket_rffi.py:234-241 constants_w_defaults` — SOL_IP/TCP/UDP
+        // `_rsocket_rffi.py constants_w_defaults` — SOL_IP/TCP/UDP
         // kept for PyPy compatibility.
         cst!("SOL_IP", 0);
         cst!("SOL_TCP", 6);
@@ -978,7 +978,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // not the same type on each — see the netdb section there.
     #[cfg(any(unix, windows))]
     {
-        // gethostbyname(name) → ip_string.  `interp_func.py:32-44` —
+        // gethostbyname(name) → ip_string.  `interp_func.py` —
         // host argument runs through encode_idna (→ idna_converter)
         // before the rsocket call.
         crate::module_ns_store(
@@ -1030,7 +1030,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         );
 
         // gethostbyname_ex(name) → (name, aliases, addresses)
-        // `interp_func.py:53-65` — same lookup as gethostbyname but
+        // `interp_func.py` — same lookup as gethostbyname but
         // returns the full hostent triple.
         crate::module_ns_store(
             ns,
@@ -1306,7 +1306,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // a None so attribute lookups succeed.
     crate::module_ns_store(ns, "_default_timeout", pyre_object::w_none());
 
-    // `_rsocket_rffi.py:1155 constants['has_ipv6'] = True` — exposed by
+    // `_rsocket_rffi.py constants['has_ipv6'] = True` — exposed by
     // PyPy's moduledef.py constants loop as a module-level boolean.
     crate::module_ns_store(ns, "has_ipv6", pyre_object::boolobject::w_bool_from(true));
 
@@ -1465,7 +1465,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     // An interface name is an OS string.
-                    // `interp_socket.py:1316` declares `name='text'` and
+                    // `interp_socket.py` declares `name='text'` and
                     // compares against `rsocket.if_nameindex()`'s own names;
                     // `socketmodule.c socket_if_nametoindex` instead reads it
                     // with `PyUnicode_FSConverter`, the filesystem encoding
@@ -1576,7 +1576,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     // ── getaddrinfo / getnameinfo ──
-    // `interp_func.py:294-339` (getaddrinfo) and `:137-156`
+    // `interp_func.py` (getaddrinfo) and `:137-156`
     // (getnameinfo) — directly wrap the host's getaddrinfo / getnameinfo
     // and walk the addrinfo linked list.
     #[cfg(any(unix, windows))]
@@ -1592,7 +1592,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::module_ns_store(ns, "SocketType", socket_tp);
     }
 
-    // `socket.py:662` reaches for `_socket.socketpair` and falls back to its
+    // `socket.py` reaches for `_socket.socketpair` and falls back to its
     // own AF_INET pair when the module does not carry one; `dup`/`fromfd`
     // likewise have no WinSock spelling that duplicates a descriptor in
     // place.  All three stay with the POSIX calls they are built on.
@@ -1721,7 +1721,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 }
 
 // ── hostent → (name, aliases, addrs) ──
-// `interp_func.py:46-51 common_wrapgethost` — packs a resolver hostent
+// `interp_func.py common_wrapgethost` — packs a resolver hostent
 // into the 3-tuple shape used by gethostbyname_ex / gethostbyaddr.
 #[cfg(any(unix, windows))]
 fn unpack_hostent(he: *mut rffi::Hostent) -> Result<pyre_object::PyObjectRef, crate::PyError> {
@@ -2401,7 +2401,7 @@ fn socket_init_state(
     socket_set_attr(obj, "_usecount", pyre_object::w_int_new(1));
 }
 
-/// `rsocket.py:1694 get_socket_family` — the family of an existing fd,
+/// `rsocket.py get_socket_family` — the family of an existing fd,
 /// read from `getsockname`'s returned `sa_family`.
 #[cfg(any(unix, windows))]
 fn socket_detect_family(fd: rffi::Socket) -> Result<libc::c_int, crate::PyError> {
@@ -2414,7 +2414,7 @@ fn socket_detect_family(fd: rffi::Socket) -> Result<libc::c_int, crate::PyError>
     Ok(addr.ss_family as libc::c_int)
 }
 
-/// `rsocket.py:1678 getsockopt_int` — a single int socket option.
+/// `rsocket.py getsockopt_int` — a single int socket option.
 #[cfg(any(unix, windows))]
 fn socket_getsockopt_int(
     fd: rffi::Socket,
@@ -2438,7 +2438,7 @@ fn socket_getsockopt_int(
     Ok(val)
 }
 
-/// `interp_socket.py:93 get_so_protocol` — the protocol of an existing
+/// `interp_socket.py get_so_protocol` — the protocol of an existing
 /// fd via `SO_PROTOCOL`, or `-1` on platforms without it (`HAS_SO_PROTOCOL`).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn socket_get_so_protocol(fd: rffi::Socket) -> Result<libc::c_int, crate::PyError> {
@@ -2497,7 +2497,7 @@ fn pack_inet_addr(
         let sun = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
         sun.sun_family = libc::AF_UNIX as rffi::SaFamily;
         let abstract_name = cfg!(target_os = "linux") && path_bytes_vec.first() == Some(&0);
-        // `rsocket.py:412-420 UNIXAddress.__init__`: an abstract name may fill
+        // `rsocket.py UNIXAddress.__init__`: an abstract name may fill
         // `sun_path` exactly, a regular one has to leave room for its
         // terminator.
         let capacity = sun.sun_path.len() - usize::from(!abstract_name);
@@ -2507,7 +2507,7 @@ fn pack_inet_addr(
         for (i, &b) in path_bytes_vec.iter().enumerate() {
             sun.sun_path[i] = b as libc::c_char;
         }
-        // `rsocket.py:409-410 self.setdata(sun, baseofs + len(path))`: the
+        // `rsocket.py self.setdata(sun, baseofs + len(path))`: the
         // terminator is counted only for a regular name that has one.
         let addrlen = SUN_PATH_OFFSET + path_bytes_vec.len() + usize::from(!abstract_name);
         return Ok((storage, addrlen as rffi::SockLen));
@@ -2791,7 +2791,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         ns,
         "__init__",
         crate::make_builtin_function("__init__", |args| {
-            // `interp_socket.py:216 descr_init(family=-1, type=-1, proto=-1,
+            // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
             // w_fileno=None)`.
             let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             let after_self = if args.is_empty() { args } else { &args[1..] };
@@ -2807,7 +2807,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             crate::builtins::kwarg_reject_duplicate(kwargs, "socket", "type", pos.len() >= 2)?;
             crate::builtins::kwarg_reject_duplicate(kwargs, "socket", "proto", pos.len() >= 3)?;
             crate::builtins::kwarg_reject_duplicate(kwargs, "socket", "fileno", pos.len() >= 4)?;
-            // `interp_socket.py:216 descr_init(family=-1, type=-1, proto=-1,
+            // `interp_socket.py descr_init(family=-1, type=-1, proto=-1,
             // w_fileno=None)` — each parameter comes from its positional
             // slot, then its keyword; family/type/proto keep the sentinel
             // -1 (resolved below from the module defaults or the fd).
@@ -2876,7 +2876,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     "integer argument expected, got float",
                 ));
             }
-            // `interp_socket.py:255` — `space.int_w(w_fileno)` accepts ints,
+            // `interp_socket.py` — `space.int_w(w_fileno)` accepts ints,
             // longs, and objects with `__int__` / `__index__`.
             let fd = crate::baseobjspace::int_w(fileno_obj)?;
             if fd < 0 {
@@ -2937,7 +2937,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             "proto",
         ),
     ) };
-    // `interp_socket.py:454 gettimeout_w` — `timeout` is the stored
+    // `interp_socket.py gettimeout_w` — `timeout` is the stored
     // `_timeout` object (float, or `None` when disabled).
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -3006,7 +3006,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_socket.py:978-996 _reuse_w / _drop_w` — refcount methods
+    // `interp_socket.py _reuse_w / _drop_w` — refcount methods
     // the app-level `socket._socketobject` wrapper uses to share one
     // underlying fd across `socket.makefile()` file-like aliases.
     // `_reuse` increments the usecount; `_drop` decrements and closes
@@ -3138,7 +3138,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_socket.py:1090 socketmethodnames _accept` — primitive
+    // `interp_socket.py socketmethodnames _accept` — primitive
     // returning `(fd, addr)`.  CPython's app-level `socket.py:262 def
     // accept` wraps this to construct the new socket object;
     // pyre's `accept` above bundles both steps for callers that
@@ -3833,7 +3833,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
 
     // recvmsg_into(buffers, [ancbufsize, [flags]]) ->
     //   (nbytes, ancdata, msg_flags, address)
-    // `interp_socket.py:572-652 recvmsg_into_w` — scatter-receive into
+    // `interp_socket.py recvmsg_into_w` — scatter-receive into
     // a list/tuple of writable buffers; each `writebuf_w` slice
     // contributes one iovec entry.
     // The scatter/gather calls and their ancillary data are POSIX-only;
@@ -4000,7 +4000,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let obj = args[0];
             let fd = socket_fd(obj)?;
 
-            // PyPy `interp_socket.py:793-802`: `space.unpackiterable(w_data)`,
+            // PyPy `interp_socket.py`: `space.unpackiterable(w_data)`,
             // then acquire/release one `BUF_SIMPLE` view per item and retain
             // the copied strings.  In particular, asyncio passes an
             // `itertools.islice` of memoryviews here, not a list or tuple.
@@ -4290,7 +4290,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let fd = socket_fd(args[0])?;
             let level = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
             let name = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
-            // `interp_socket.py:434-451 getsockopt_w` — `buflen == 0`
+            // `interp_socket.py getsockopt_w` — `buflen == 0`
             // (including when omitted) reads an int option; otherwise the
             // length must be in `1..=1024` and a bytes buffer is returned.
             let buflen = if args.len() >= 4 {
@@ -4339,7 +4339,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         }),
     ) };
 
-    // `interp_socket.py:777-797 setblocking_w` per PyPy docstring: True
+    // `interp_socket.py setblocking_w` per PyPy docstring: True
     // is equivalent to `settimeout(None)`, False to `settimeout(0.0)`.
     // Routing through `socket_apply_timeout` keeps the SO_*TIMEO state
     // consistent with the timeout attribute and prevents a stale
@@ -4396,7 +4396,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_socket.py:811-828 settimeout_w` then `rsocket.py:RSocket.
+    // `interp_socket.py settimeout_w` then `rsocket.py:RSocket.
     // settimeout`: None → blocking (no O_NONBLOCK, no SO_*TIMEO); 0.0 →
     // non-blocking (O_NONBLOCK on); >0 → blocking + SO_RCVTIMEO +
     // SO_SNDTIMEO set to the duration; <0 → ValueError "Timeout value
@@ -4491,7 +4491,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         }),
     ) };
 
-    // __repr__ — `interp_socket.py:304-312 descr_repr`.  Format
+    // __repr__ — `interp_socket.py descr_repr`.  Format
     // matches CPython: `<socket object, fd=N, family=F, type=T, proto=P>`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,

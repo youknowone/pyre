@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 /// unpublished (no descr, or its arity is not the inputarg count), 22 = a
 /// dropped loop retracted a published entry. 19-21 count loops and
 /// LABEL-bearing bridges alike, since both go through the same publish step
-/// (`x86/assembler.py:990 fixup_target_tokens` runs on either path); a bridge
+/// (`x86/assembler.py fixup_target_tokens` runs on either path); a bridge
 /// with no LABEL is not tallied by 21. `compile_loop`'s own outcome
 /// split — every `Err` it returns is a `loops_aborted` bump in the metainterp,
 /// and the reason string never reaches the host from inside the guest, so the
@@ -520,10 +520,10 @@ use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
 use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
 
-/// `x86/assembler.py:990 fixup_target_tokens`, called from BOTH `assemble_loop`
+/// `x86/assembler.py fixup_target_tokens`, called from BOTH `assemble_loop`
 /// (:612) and `assemble_bridge` (:706) — a LABEL assembled inside a bridge is a
 /// jump target for later traces exactly like a loop's, and `compile_retrace`
-/// (compile.py:341-393) reaches the backend through `send_bridge_to_backend`,
+/// (compile.py) reaches the backend through `send_bridge_to_backend`,
 /// so a retrace IS a bridge that defines its own LABEL.
 ///
 /// Returns `(label_descrs, published_descrs)`: the descr identity of every
@@ -686,7 +686,7 @@ static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 static JIT_CALL_AREA: [AtomicI64; codegen::FrameGeometry::CALL_AREA_SLOTS] =
     [const { AtomicI64::new(0) }; codegen::FrameGeometry::CALL_AREA_SLOTS];
 
-/// llmodel.py:194-199 _store_exception parity: set JIT exception state.
+/// llmodel.py _store_exception parity: set JIT exception state.
 /// `value` is a valid OBJECTPTR (or 0); the exception class is read from
 /// `value.typeptr` (offset 0).
 pub fn jit_exc_raise(value: i64) {
@@ -948,7 +948,7 @@ pub fn active_gc_memory_stats() -> majit_gc::GcMemoryStats {
 }
 
 /// Whether the GC owned by this thread's wasm backend wants a major collection
-/// (incminimark.py:1288-1290 `threshold_reached`). Drives the interpreter GC
+/// (incminimark.py `threshold_reached`). Drives the interpreter GC
 /// safepoint, which is on by default on wasm.
 pub fn active_gc_major_threshold_reached() -> bool {
     with_wasm_active_gc(|gc| gc.major_threshold_reached()).unwrap_or(false)
@@ -1055,7 +1055,7 @@ fn jf_top_addr() -> Option<u32> {
 }
 
 /// `majit_gc::CollectFullFn` installed by `register_active_hooks`. Drives
-/// `gc.collect()` (`interp_gc.py:7-26`) through the active GC. Without it
+/// `gc.collect()` (`interp_gc.py`) through the active GC. Without it
 /// `majit_gc::collect_full` has no hook to dispatch to and silently returns,
 /// so no major cycle ever runs on this backend and
 /// `deal_with_objects_with_finalizers` — which lives inside the major — never
@@ -1140,7 +1140,7 @@ fn wasm_total_memory_pressure() -> isize {
     with_wasm_active_gc_mut(|gc| gc.total_memory_pressure()).unwrap_or(0)
 }
 
-/// `minimark.py:1900-1915 id_or_identityhash` trampoline. The collector
+/// `minimark.py id_or_identityhash` trampoline. The collector
 /// records a move-stable hash in its side table before the object can be
 /// relocated; the unhooked `majit_gc::gc_id_or_identityhash` fallback returns
 /// the raw address instead, which changes under the object when a minor
@@ -1621,11 +1621,11 @@ pub struct WasmBackend {
     /// CPUTotalTracker()` parity — per-instance `cpu.tracker`
     /// exposed via [`majit_backend::Backend::cpu_tracker`].
     cpu_tracker: std::sync::Arc<majit_backend::CpuTotalTracker>,
-    /// `asmmemmgr.py:28` `AsmMemoryManager` parity — what
+    /// `asmmemmgr.py` `AsmMemoryManager` parity — what
     /// `jit_hooks.stats_asmmemmgr_{allocated,used}` reads. The emitted trace is
     /// a wasm module handed to the host compiler, so there is no arena of ours
     /// to size: `allocated` and `used` are both the module's byte length, which
-    /// is the figure `asmmemmgr.py:37` counts for a block a `materialize`
+    /// is the figure `asmmemmgr.py` counts for a block a `materialize`
     /// handed out.
     asm_memory_stats: std::sync::Arc<majit_backend::AsmMemoryManagerStats>,
     /// Lifetime tokens for the blocks recorded above. The host keeps every
@@ -1735,7 +1735,7 @@ pub fn set_force_ca_terminal_decline(selector: u64) {
 /// without a value in the constants pool. `set_constants_pool` runs before
 /// `assemble`, so every legitimate legacy const is already present; an arg
 /// landing here means the optimizer producer failed to seed it. RPython
-/// `ConstInt.value` (history.py:227) is always present, so never register a
+/// `ConstInt.value` (history.py) is always present, so never register a
 /// placeholder `0` — that would emit the constant as zero. Panic at the parity
 /// hole, matching the dynasm/cranelift backends.
 fn missing_legacy_const(arg: majit_ir::OpRef) -> ! {
@@ -1795,7 +1795,7 @@ impl WasmBackend {
         self.vtable_offset = offset;
     }
 
-    /// llsupport/gc.py:563 GcLLDescr_framework
+    /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Resolves a vtable pointer to its registered GC type id via the
     /// installed gc_ll_descr.
@@ -1807,11 +1807,11 @@ impl WasmBackend {
     /// GuardNonnullClass / GuardSubclass `arg(1)`.
     ///
     /// RPython represents these class operands as `ConstInt` vtable
-    /// addresses: `model.py:199-201 cls_of_box()` returns
+    /// addresses: `model.py cls_of_box()` returns
     /// `ConstInt(ptr2int(obj.typeptr))`, `virtualstate.py:748` builds
     /// `ConstInt(descr.get_vtable())`, and backends read
     /// `op.getarg(1).getint()` (aarch64/regalloc.py:829). Inline ConstInt
-    /// carries the value directly (history.py:227 `ConstInt.value`).
+    /// carries the value directly (history.py `ConstInt.value`).
     fn const_class_vtable(&self, arg: majit_ir::OpRef) -> Option<i64> {
         arg.const_int_value()
     }
@@ -1848,8 +1848,8 @@ impl WasmBackend {
     ///
     /// Mirrors the `self.cpu.gc_ll_descr.get_translated_info_*` /
     /// `cpu.subclassrange_min_offset` lookups that RPython's
-    /// `genop_guard_guard_is_object` (x86/assembler.py:1924-1943) and
-    /// `genop_guard_guard_subclass` (x86/assembler.py:1945-1980) do at
+    /// `genop_guard_guard_is_object` (x86/assembler.py) and
+    /// `genop_guard_guard_subclass` (x86/assembler.py) do at
     /// codegen time. The returned struct is handed to
     /// `codegen::build_wasm_module`; the codegen arms assert
     /// `supports_guard_gc_type` before reading any other field.
@@ -1894,7 +1894,7 @@ impl WasmBackend {
 
     /// Pull every reference constant out of `ops` into a per-loop `GcTable`
     /// and replace it with a `LoadFromGcTable` of its slot
-    /// (`majit_gc::rewrite::remove_ref_constants`, rewrite.py:106-116).
+    /// (`majit_gc::rewrite::remove_ref_constants`, rewrite.py).
     ///
     /// A `GcRef` baked as a code immediate is invisible to the moving
     /// collector: the first minor collection that promotes the referenced
@@ -1913,7 +1913,7 @@ impl WasmBackend {
         (ops, table)
     }
 
-    /// `x86/assembler.py:823` `gcreftracers.append(tracer)` — keep the
+    /// `x86/assembler.py` `gcreftracers.append(tracer)` — keep the
     /// per-loop table alive for as long as the compiled trace that bakes its
     /// base address. `LIVE_GC_TABLES` holds only a `Weak`, so this strong
     /// reference is what keeps the slots rooted and forwardable.
@@ -2633,12 +2633,12 @@ impl majit_backend::Backend for WasmBackend {
     // through the wasm thread-local GC; the old-generation allocator never
     // collects, so allocation inputs need no rooting here.
 
-    /// llmodel.py:775 bh_new(sizedescr).
+    /// llmodel.py bh_new(sizedescr).
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         wasm_bh_alloc_struct(sizedescr)
     }
 
-    /// llmodel.py:778-782 bh_new_with_vtable(sizedescr): allocate, then write
+    /// llmodel.py bh_new_with_vtable(sizedescr): allocate, then write
     /// the type pointer at `vtable_offset`.
     fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let vtable = sizedescr.get_vtable();
@@ -2654,7 +2654,7 @@ impl majit_backend::Backend for WasmBackend {
         ptr
     }
 
-    /// llmodel.py:788 bh_new_array(length, arraydescr).
+    /// llmodel.py bh_new_array(length, arraydescr).
     fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let length = usize::try_from(length).expect("bh_new_array length must be non-negative");
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
@@ -2671,7 +2671,7 @@ impl majit_backend::Backend for WasmBackend {
         ptr
     }
 
-    /// llmodel.py:790 bh_new_array_clear = bh_new_array (allocator zeroes).
+    /// llmodel.py bh_new_array_clear = bh_new_array (allocator zeroes).
     fn bh_new_array_clear(
         &self,
         length: i64,
@@ -2680,7 +2680,7 @@ impl majit_backend::Backend for WasmBackend {
         self.bh_new_array(length, arraydescr)
     }
 
-    /// llmodel.py:585-588 bh_arraylen_gc: read the length prefix at
+    /// llmodel.py bh_arraylen_gc: read the length prefix at
     /// `lendescr.offset`. Word-width (`*const usize`), matching the store
     /// `bh_new_array` makes at the same offset — a fixed 8-byte read would fold
     /// the first item into the high half on wasm32.
@@ -2726,7 +2726,7 @@ impl majit_backend::Backend for WasmBackend {
         let raw_num_ref_homes = codegen::count_ref_homes(inputargs, ops);
         let label_ref_slots =
             codegen::label_ref_capture_slots(inputargs, ops).max(FROZEN_CHAIN_LABEL_REF_SLOTS);
-        // An entry bridge (`compile.py:1006-1022 ResumeFromInterpDescr`) is sent
+        // An entry bridge (`compile.py ResumeFromInterpDescr`) is sent
         // to the backend through `compile_loop` like any loop, but it is not one:
         // it has no LABEL of its own and ends in a JUMP into an
         // already-compiled loop. Resolve that loop the same way `compile_bridge`
@@ -2946,7 +2946,7 @@ impl majit_backend::Backend for WasmBackend {
             ));
         }
 
-        // `asmmemmgr.py:37` counts the block a `materialize` handed out, which
+        // `asmmemmgr.py` counts the block a `materialize` handed out, which
         // here is the module the host has taken. Below the decline above, as
         // `compile_bridge` does: a rejected module was never instantiated, and
         // the token retained for it would charge its bytes for the backend's
@@ -3399,7 +3399,7 @@ impl majit_backend::Backend for WasmBackend {
         }
 
         if inline_bridge_enabled() {
-            // `model.py:145-152`: a bridge compiled after `invalidate_loop`
+            // `model.py`: a bridge compiled after `invalidate_loop`
             // starts valid, and only a later invalidation activates its
             // GUARD_NOT_INVALIDATED (`runner_test.py test_guard_not_invalidated`
             // steps 3-4). A merged region reads the owner's root flag, which is
@@ -3519,7 +3519,7 @@ impl majit_backend::Backend for WasmBackend {
                             );
                             // The region has no code of its own: it was
                             // installed by rebuilding the owner, so there is no
-                            // address to report. `model.py:67 compile_bridge`
+                            // address to report. `model.py compile_bridge`
                             // permits `None` here, and the consumers treat the
                             // result as debug data — `interp_resop.py:253-255`
                             // defaults `asmaddr`/`asmlen` to 0 when it is
@@ -3839,7 +3839,7 @@ impl majit_backend::Backend for WasmBackend {
         })
     }
 
-    /// `compile.py:826-830` store_hash relies on a per-guard fail-descr layout
+    /// `compile.py` store_hash relies on a per-guard fail-descr layout
     /// to know which exits are real guards (vs FINISH) and to count them.
     /// `assign_guard_hashes` fetches one jitcounter hash per non-finish guard
     /// from this list, so without it no guard ever gets a hash, `must_compile`
@@ -3887,7 +3887,7 @@ impl majit_backend::Backend for WasmBackend {
         Some(layouts)
     }
 
-    /// `compile.py:826-830` store_hash: stamp the jitcounter hashes assigned by
+    /// `compile.py` store_hash: stamp the jitcounter hashes assigned by
     /// `assign_guard_hashes` onto each guard's metainterp `ResumeGuardDescr`
     /// (`meta_descr`) — the descr `must_compile_with_values` reads the status
     /// from. Same `ResumeDescr`-family + status-0 gate as the native backends.
@@ -3911,7 +3911,7 @@ impl majit_backend::Backend for WasmBackend {
         }
     }
 
-    /// `compile.py:826-830` store_hash for the guards INSIDE a compiled bridge.
+    /// `compile.py` store_hash for the guards INSIDE a compiled bridge.
     /// `compile_bridge` appends a bridge's exit descrs to the source loop's flat
     /// `fail_descrs` and records their `(source_fail_index, start, count)` slice
     /// in `bridge_descr_ranges`. Return one layout per descr in that slice so
@@ -3968,7 +3968,7 @@ impl majit_backend::Backend for WasmBackend {
         Some(layouts)
     }
 
-    /// `compile.py:826-830` store_hash: stamp the hashes `assign_bridge_guard_hashes`
+    /// `compile.py` store_hash: stamp the hashes `assign_bridge_guard_hashes`
     /// assigned onto the metainterp `ResumeGuardDescr` of each guard inside the
     /// bridge attached at `source_fail_index`. Same `ResumeDescr`-family +
     /// status-0 gate as `store_guard_hashes`; iterates the same slice in the
@@ -4117,7 +4117,7 @@ impl majit_backend::Backend for WasmBackend {
                 // root at a major-cycle start), reachable through the major
                 // gray stack or the remembered set. A later collection would
                 // then custom-trace it and read the freed gcmap. A null gcmap
-                // makes jitframe_trace forward nothing (jitframe.py:115-116),
+                // makes jitframe_trace forward nothing (jitframe.py),
                 // which is correct here: the outputs were already read out.
                 unsafe { (*jf).jf_gcmap = std::ptr::null() };
                 majit_gc::shadow_stack::pop_jf_to(saved);
@@ -4223,7 +4223,7 @@ impl majit_backend::Backend for WasmBackend {
         GcRef(data.raw_values[index] as usize)
     }
 
-    /// llmodel.py:240 grab_exc_value parity: the exception captured when the
+    /// llmodel.py grab_exc_value parity: the exception captured when the
     /// trace exited through a GuardNoException / GuardException.
     fn grab_exc_value(&self, frame: &DeadFrame) -> GcRef {
         let data = frame
@@ -4329,7 +4329,7 @@ impl majit_backend::Backend for WasmBackend {
         Ok(())
     }
 
-    /// llsupport/gc.py:563 GcLLDescr_framework
+    /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Resolves a vtable pointer through the installed gc_ll_descr.
     fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
@@ -4387,7 +4387,7 @@ mod tests {
         assert!(compiled.pending_wasm_bytes.borrow().is_some());
     }
 
-    /// llsupport/gc.py:563 GcLLDescr_framework
+    /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr
     /// Verify the wasm backend's gc_ll_descr round-trips a registered
     /// vtable→type_id mapping.

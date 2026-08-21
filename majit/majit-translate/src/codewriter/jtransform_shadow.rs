@@ -24,7 +24,7 @@
 //!
 //! Maintenance note: [`REWRITE_OP_OPNAMES`] and [`BHIMPL_DEFAULT_OPNAMES`]
 //! statically replicate upstream's reflective `_with_prefix('rewrite_op_')`
-//! and `BlackholeInterpreter.__dict__` enumerations (`jtransform.py:2289`).
+//! and `BlackholeInterpreter.__dict__` enumerations (`jtransform.py`).
 //! They are a hand-captured snapshot, not a live mirror — an upstream rename
 //! or a newly added `rewrite_op_*` / `bhimpl_*` will not surface here until
 //! these arrays are re-synced by hand, so a stale entry would misreport an
@@ -46,7 +46,7 @@ use crate::flowspace::model::FunctionGraph;
 
 /// Every opname for which `Transformer` defines a `rewrite_op_<opname>`
 /// attribute, i.e. the keys of `_with_prefix('rewrite_op_')`
-/// (`jtransform.py:2289`).  `_with_prefix` reflects over `dir(Transformer)`,
+/// (`jtransform.py`).  `_with_prefix` reflects over `dir(Transformer)`,
 /// so the set is every `rewrite_op_*` name the class carries, from four
 /// forms — all reproduced here (172 names):
 ///   - explicit `def rewrite_op_<name>` methods;
@@ -55,7 +55,7 @@ use crate::flowspace::model::FunctionGraph;
 ///   - the `exec`-generated long-long / unsigned-long-long handlers
 ///     (`jtransform.py:1493-1554`): the `llong_*` / `ullong_*` ops and the
 ///     `cast_*_to_(u)longlong` / `(cast|truncate)_longlong_*` family;
-///   - the `exec`-generated renames (`jtransform.py:1591-1619`): `bool_not`,
+///   - the `exec`-generated renames (`jtransform.py`): `bool_not`,
 ///     `keepalive`, `char_*`, `unichar_*`, `uint_*`, `adr_add`, ….
 const REWRITE_OP_OPNAMES: &[&str] = &[
     "adr_add",
@@ -497,7 +497,7 @@ const BHIMPL_DEFAULT_OPNAMES: &[&str] = &[
 ];
 
 /// The opname set jtransform accepts as input, mirroring upstream
-/// `_rewrite_ops` (`jtransform.py:2289-2290`):
+/// `_rewrite_ops` (`jtransform.py`):
 ///   `_with_prefix('rewrite_op_')`  — the explicit rewrites ([`REWRITE_OP_OPNAMES`])
 ///   `∪ _add_default_ops`            — every blackhole `bhimpl_<opname>`, kept
 ///                                     unmodified ([`BHIMPL_DEFAULT_OPNAMES`])
@@ -508,7 +508,7 @@ const BHIMPL_DEFAULT_OPNAMES: &[&str] = &[
 /// `insns::wellknown_bh_insns()` subset pyre's runtime emits today — see that
 /// const's doc for why the subset would misclassify upstream-valid
 /// passthrough opnames as "unknown".  `'-live-'` is added separately, exactly
-/// as `_add_default_ops` does (`jtransform.py:2287`).
+/// as `_add_default_ops` does (`jtransform.py`).
 fn admissible_opnames() -> HashSet<String> {
     REWRITE_OP_OPNAMES
         .iter()

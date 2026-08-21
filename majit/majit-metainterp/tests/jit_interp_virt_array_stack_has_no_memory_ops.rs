@@ -1,6 +1,6 @@
 //! A virtualizable array used as an operand stack, indexed by a runtime depth.
 //!
-//! `pyjitpl.py:1201-1216 _get_arrayitem_vable_index` promotes the index of a
+//! `pyjitpl.py _get_arrayitem_vable_index` promotes the index of a
 //! virtualizable array access with `implement_guard_value` and then answers
 //! from `virtualizable_boxes`. So a stack whose index is the machine's own
 //! depth — never a constant in the source — still lowers to boxes rather than
@@ -13,7 +13,7 @@
 //!
 //! The second fixture holds the program fixed and varies only the DECLARED
 //! length of the array, which is what a virtualizable's box count scales with
-//! (`virtualizable.py:115-121 get_total_size`). The compiled loop must not
+//! (`virtualizable.py get_total_size`). The compiled loop must not
 //! grow with it.
 
 use core::sync::atomic::{AtomicUsize, Ordering};

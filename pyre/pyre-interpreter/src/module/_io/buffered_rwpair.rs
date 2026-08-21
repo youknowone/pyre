@@ -59,7 +59,7 @@ impl W_BufferedRWPair {
     #[staticmethod]
     fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
         let obj = W_BufferedRWPair::allocate_stable(W_BufferedRWPair::default());
-        // interp_bufferedio.py:1175-1177 `needs_finalizer`: `self.w_writer` and
+        // interp_bufferedio.py `needs_finalizer`: `self.w_writer` and
         // `self.w_reader` have their own finalizer, so the pair itself needs
         // none. A subclass keeps one — its `close` may do anything.
         let needs_finalizer = !cls.is_null() && !std::ptr::eq(cls, type_object());

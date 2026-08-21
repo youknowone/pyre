@@ -70,7 +70,7 @@ impl GcRef {
 /// A concrete runtime value.
 ///
 /// PartialEq, Eq, and Hash all use f64::to_bits() for Float values,
-/// matching RPython history.py:282-294 where ConstFloat._get_hash_()
+/// matching RPython history.py where ConstFloat._get_hash_()
 /// and same_constant() are both bitwise: 0.0 ≠ -0.0, NaN == NaN
 /// (same bits).
 #[derive(Clone, Copy, Debug)]
@@ -141,7 +141,7 @@ impl Value {
     }
 
     /// Project a `Value` into a `Const`.  Mirrors RPython where
-    /// `ConstInt`/`ConstFloat`/`ConstPtr` (history.py:220/261/307) are
+    /// `ConstInt`/`ConstFloat`/`ConstPtr` (history.py/261/307) are
     /// the only concrete constant classes — there is no `ConstVoid`,
     /// so `Value::Void` panics rather than fabricate one.
     pub fn to_const(&self) -> Const {
@@ -160,7 +160,7 @@ impl Value {
 // `HeapBox { opref, value }` retired — the (identity, value) pair is
 // now carried by the frontend object itself: identity by the `OpRef`
 // position, value by the `Op` / `InputArg` `value: Cell<Option<Value>>`
-// field (PyPy `history.py:803-807 IntFrontendOp(pos, intval) /
+// field (PyPy `history.py IntFrontendOp(pos, intval) /
 // FloatFrontendOp(pos, floatval) / RefFrontendOp(pos, gcref)` parity).
 // Cache writes store the bare `OpRef`; sanity readers resolve the
 // intrinsic value via `TraceCtx::box_value` (composing const pool,
@@ -181,7 +181,7 @@ impl PartialEq for Const {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Const::Int(a), Const::Int(b)) => a == b,
-            // history.py:292 ConstFloat.same_constant: bitwise (0.0 ≠ -0.0, NaN == NaN).
+            // history.py ConstFloat.same_constant: bitwise (0.0 ≠ -0.0, NaN == NaN).
             // A derived `f64 ==` here would be IEEE (0.0 == -0.0, NaN != NaN),
             // collapsing distinct ±0.0 constants — diverging from Value/OpRef.
             (Const::Float(a), Const::Float(b)) => a.to_bits() == b.to_bits(),
@@ -295,7 +295,7 @@ impl Const {
     }
 
     /// Inverse of [`Const::to_value`]. Panics on `Value::Void` since
-    /// PyPy has no void-typed `Const` (`history.py:182`).
+    /// PyPy has no void-typed `Const` (`history.py`).
     pub fn from_value(value: Value) -> Self {
         match value {
             Value::Int(v) => Const::Int(v),
@@ -305,7 +305,7 @@ impl Const {
         }
     }
 
-    /// history.py:225 ConstInt.getint — unsigned/signed integer value.
+    /// history.py ConstInt.getint — unsigned/signed integer value.
     /// Method belongs to ConstInt upstream; Rust single-enum collapses
     /// all variants, so assert variant at call time instead of
     /// silently cross-casting.
@@ -316,7 +316,7 @@ impl Const {
         }
     }
 
-    /// history.py:316 ConstPtr.getref_base — raw GC pointer value.
+    /// history.py ConstPtr.getref_base — raw GC pointer value.
     pub fn getref_base(&self) -> GcRef {
         match self {
             Const::Ref(v) => *v,
@@ -324,7 +324,7 @@ impl Const {
         }
     }
 
-    /// history.py:265 ConstFloat.getfloatstorage — i64 bit-pattern.
+    /// history.py ConstFloat.getfloatstorage — i64 bit-pattern.
     pub fn getfloatstorage(&self) -> i64 {
         match self {
             Const::Float(v) => v.to_bits() as i64,
@@ -368,12 +368,12 @@ pub struct InputArg {
     pub tp: Type,
     /// Index in the inputargs list.
     pub index: u32,
-    /// `resoperation.py:700 AbstractInputArg._forwarded` parity slot —
+    /// `resoperation.py AbstractInputArg._forwarded` parity slot —
     /// the canonical forwarding host for a bound InputArg box.
     /// `Forwarded::None` until a writer sets it; `set_forwarded_*`
     /// on a bound box routes here.
     pub forwarded: std::cell::RefCell<crate::forwarding::Forwarded>,
-    /// `resoperation.py:719/727/739 InputArgInt/Float/Ref` carry the
+    /// `resoperation.py/727/739 InputArgInt/Float/Ref` carry the
     /// concrete runtime value on the frontend-arg object itself (the
     /// `_resint`/`_resfloat`/`_resref` mixin slot, `history.py:803-807`).
     /// The canonical per-identity concrete carrier for a bound InputArg
@@ -409,7 +409,7 @@ impl InputArg {
 
 impl PartialEq for InputArg {
     /// PyPy compares `AbstractInputArg`s by Python object identity
-    /// (`AbstractValue.same_box` at `resoperation.py:38`). Pyre's
+    /// (`AbstractValue.same_box` at `resoperation.py`). Pyre's
     /// value-typed `InputArg` stands in for that identity via
     /// `(tp, index)` tuple equality. `_forwarded` is mutable per-op
     /// state and excluded from identity comparison.
@@ -469,7 +469,7 @@ impl InputArg {
     /// only when both `tp` and `index` match — identity is shared only
     /// when callers `Rc::clone` the same handle.
     /// Read the stamped concrete runtime value (`_resint`/`_resfloat`/
-    /// `_resref`, `history.py:680 *FrontendOp.getint()`). `None` until a
+    /// `_resref`, `history.py *FrontendOp.getint()`). `None` until a
     /// writer stamps it.
     pub fn get_value(&self) -> Option<Value> {
         self.value.get()
@@ -508,7 +508,7 @@ impl InputArg {
     }
 }
 
-/// Shared `InputArg` identity (resoperation.py:700 `AbstractInputArg`).
+/// Shared `InputArg` identity (resoperation.py `AbstractInputArg`).
 ///
 /// PyPy's `inputargs` list holds Python objects that are reachable
 /// unchanged from `TreeLoop.inputargs`, the optimizer's exported state,
@@ -606,7 +606,7 @@ impl JitDriverVar {
     }
 }
 
-/// warmstate.py:108-112 equal_whatever / :115-128 hash_whatever take a
+/// warmstate.py equal_whatever / :115-128 hash_whatever take a
 /// TYPE parameter that can be primitive, generic Ptr, or specifically a
 /// Ptr to rstr.STR / rstr.UNICODE. The IR-level [`Type`] only carries the
 /// kind (i/r/f/v); this enum extends it with the STR/UNICODE subtypes so
@@ -690,7 +690,7 @@ pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
 ///
 /// Unlike every other citation in this file, this pair ports an INVARIANT
 /// and not a function.  There is no upstream symbol to point at: RPython's
-/// `JitCell.__init__` (warmstate.py:568-573) does
+/// `JitCell.__init__` (warmstate.py) does
 ///
 /// ```python
 /// for attrname, _ in green_args_name_spec:
@@ -823,14 +823,14 @@ impl Drop for RetainedGreens {
 /// &'static str` slot ABI (per-occurrence `Box::leak` of a `Box<&'static str>`,
 /// the pyre analog to RPython's GC-allocated `rstr.STR*`).  Decoding
 /// the slot to compare by content is the pyre half of the contract;
-/// RPython's half is in `rstr.py:604 ll_streq`.  Other frontends with
+/// RPython's half is in `rstr.py ll_streq`.  Other frontends with
 /// different STR layouts register their own resolver pair.
 ///
 /// Stable-slot helper for STR/UNICODE green emission.
 ///
 /// Materialises a `*const &'static str` slot at a stable address by
 /// leaking a `Box<&'static str>` — pyre's per-occurrence analog of
-/// RPython's GC-allocated `rstr.STR*` (`rstr.py:25-30`).  Each call
+/// RPython's GC-allocated `rstr.STR*` (`rstr.py`).  Each call
 /// allocates a fresh slot; the GreenKey HashMap content-de-dupes via
 /// `default_str_eq` / `default_str_hash` so semantically every
 /// merge-point hit collapses to a single cache entry, but the leaked
@@ -885,7 +885,7 @@ pub fn default_str_eq(a: i64, b: i64) -> bool {
     sa == sb
 }
 
-/// `rpython/rlib/objectmodel.py:596 _hash_string` parity over a byte
+/// `rpython/rlib/objectmodel.py _hash_string` parity over a byte
 /// stream — the modified Fowler-Noll-Vo (FNV) variant that
 /// CPython 2.7 (and RPython by inheritance) uses for string hashes:
 ///
@@ -914,7 +914,7 @@ fn rpython_hash_bytes(bytes: &[u8]) -> i64 {
     x
 }
 
-/// `rpython/rlib/objectmodel.py:596 _hash_string` parity over a
+/// `rpython/rlib/objectmodel.py _hash_string` parity over a
 /// codepoint stream — companion to [`rpython_hash_bytes`] for
 /// `rstr.UNICODE` (whose `chars` field is an array of codepoint
 /// values, not bytes).  Iterates the `&str` codepoint-by-codepoint
@@ -934,7 +934,7 @@ fn rpython_hash_codepoints(s: &str) -> i64 {
     x
 }
 
-/// `rpython/rtyper/lltypesystem/rstr.py:405 _ll_strhash` zero-substitute.
+/// `rpython/rtyper/lltypesystem/rstr.py _ll_strhash` zero-substitute.
 ///
 /// RPython treats `0` as the "hash not yet computed" sentinel for
 /// `rstr.STR.hash` / `rstr.UNICODE.hash` and substitutes a fixed
@@ -982,7 +982,7 @@ pub fn default_unicode_hash(a: i64) -> u64 {
     rpython_zero_substitute(rpython_hash_codepoints(s)) as u64
 }
 
-/// warmstate.py:108-112 equal_whatever(TYPE, x, y)
+/// warmstate.py equal_whatever(TYPE, x, y)
 ///
 /// Port of RPython's lltype dispatch:
 /// - Ptr to STR / UNICODE → rstr.LLHelpers.ll_streq
@@ -992,7 +992,7 @@ pub fn default_unicode_hash(a: i64) -> u64 {
 /// ([`set_str_resolver`] / [`set_unicode_resolver`]).  Each frontend
 /// owns its own `rstr.STR` / `rstr.UNICODE` decoder; PyPy compiles a
 /// type-specialised `equal_whatever(STR, ..)` whose body is the
-/// frontend's `ll_streq` (`@specialize.arg(0)` at `warmstate.py:107`).
+/// frontend's `ll_streq` (`@specialize.arg(0)` at `warmstate.py`).
 /// Pyre's runtime equivalent: a registered resolver MUST exist before
 /// any STR/UNICODE green key is compared.  An unregistered call
 /// panics rather than silently falling back to bitwise equality —
@@ -1026,7 +1026,7 @@ pub fn equal_whatever(tp: GreenType, x: i64, y: i64) -> bool {
     }
 }
 
-/// warmstate.py:115-128 hash_whatever(TYPE, x)
+/// warmstate.py hash_whatever(TYPE, x)
 ///
 /// - Ptr to STR / UNICODE → rstr.LLHelpers.ll_strhash
 /// - generic GC Ptr → identityhash (or 0 for null)
@@ -1035,7 +1035,7 @@ pub fn equal_whatever(tp: GreenType, x: i64, y: i64) -> bool {
 /// STR / UNICODE indirect through frontend-registered resolvers
 /// ([`set_str_resolver`] / [`set_unicode_resolver`]).  PyPy compiles
 /// a type-specialised `hash_whatever(STR, ..)` whose body is the
-/// frontend's `ll_strhash` (`@specialize.arg(0)` at `warmstate.py:114`).
+/// frontend's `ll_strhash` (`@specialize.arg(0)` at `warmstate.py`).
 /// Pyre's runtime equivalent: a registered resolver MUST exist before
 /// any STR/UNICODE green key is hashed.  An unregistered call panics
 /// rather than silently returning the slot-bits-as-u64 — PyPy never
@@ -1110,14 +1110,14 @@ pub fn green_uhash_step(x: u64, tp: GreenType, value: i64) -> u64 {
 pub struct GreenKey {
     /// Values of all green variables, in declaration order.
     pub values: Vec<i64>,
-    /// warmstate.py:564 — per-entry TYPE. Drives hash_whatever/equal_whatever.
+    /// warmstate.py — per-entry TYPE. Drives hash_whatever/equal_whatever.
     /// `GreenType` (not IR `Type`) so `Ptr to rstr.STR/UNICODE` stays distinct
     /// from generic Ref and is dispatched through ll_streq / ll_strhash.
     pub types: Vec<GreenType>,
 }
 
 impl PartialEq for GreenKey {
-    /// warmstate.py:575-582 JitCell.comparekey(*greenargs2)
+    /// warmstate.py JitCell.comparekey(*greenargs2)
     ///
     /// RPython's comparekey iterates green_args_name_spec (fixed per JitCell
     /// class), comparing each stored attr with the incoming greenarg using
@@ -1148,7 +1148,7 @@ impl std::fmt::Display for GreenKey {
 }
 
 impl std::hash::Hash for GreenKey {
-    /// warmstate.py:584-593 JitCell.get_uhash(*greenargs)
+    /// warmstate.py JitCell.get_uhash(*greenargs)
     ///
     /// Delegates to get_uhash() so that HashMap<GreenKey, _> uses the same
     /// hash as jitcounter bucket lookup.
@@ -1180,7 +1180,7 @@ impl GreenKey {
         }
     }
 
-    /// warmstate.py:584-593 JitCell.get_uhash(*greenargs)
+    /// warmstate.py JitCell.get_uhash(*greenargs)
     ///
     /// Exact port of RPython's hash algorithm:
     ///     x = r_uint(-1888132534)
@@ -1209,7 +1209,7 @@ impl GreenKey {
 /// `GreenKey::with_types(vec![pc, profiled, code], vec![Int, Int, Ref]).get_uhash()`
 /// without allocating the key's `values`/`types` vectors — the portal
 /// merge-point hook hashes this per back-edge, so the hot path must not
-/// allocate (warmstate.py:584-593 `JitCell.get_uhash`).
+/// allocate (warmstate.py `JitCell.get_uhash`).
 pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64) -> u64 {
     let mut x: u64 = GREEN_UHASH_SEED;
     x = green_uhash_step(x, GreenType::Int, pc as i64);
@@ -1224,7 +1224,7 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 ///
 /// The two are a pair and must stay one: the uhash form is the hot
 /// back-edge path (it must not allocate), this form is what a cell read
-/// compares against (`JitCell.comparekey`, warmstate.py:575-582).  Sites
+/// compares against (`JitCell.comparekey`, warmstate.py).  Sites
 /// that only need to *find a bucket* take the uhash; sites that need to
 /// know *which cell in it* take this.  Building the tuple here rather
 /// than open-coding `vec![pc, 0, code]` at each caller is what keeps the
@@ -1247,7 +1247,7 @@ pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> Gr
 ///
 /// Returns the `(i64 bit-representation, GreenType)` pair so the caller
 /// emits both vectors in lockstep with a single move of the green value.
-/// Integer / bool greens widen as Int (`warmstate.py:566 hash_whatever`
+/// Integer / bool greens widen as Int (`warmstate.py hash_whatever`
 /// equal_int / hash_int);  float greens carry their bit-pattern under
 /// Float (equal_float / hash_float);  reference greens widen via raw
 /// pointer bits under Ref (Ptr identity — `equal_ptr` compares the bit
@@ -1378,7 +1378,7 @@ mod tests {
     /// This is the contract that lets a caller who knows its greens
     /// statically skip building the key's `values` / `types` vectors —
     /// upstream's shape, where `get_uhash(*greenargs)` unrolls over a
-    /// per-JitCell-class spec (warmstate.py:584-593). The `#[jit_interp]`
+    /// per-JitCell-class spec (warmstate.py). The `#[jit_interp]`
     /// macro emits exactly this fold.
     ///
     /// It is a correctness test, not a performance one: the two spellings

@@ -41,7 +41,7 @@ pub struct CallJitCallbacks {
     /// Drain the backend `_store_exception` cells (`jit_exc_clear`).  Called
     /// from the authoritative residual-call executor's raise arm so a raise
     /// recorded into `last_exc_value` during tracing does not also leave the
-    /// backend exception cells set — `pyjitpl.py:2763 execute_raised` writes
+    /// backend exception cells set — `pyjitpl.py execute_raised` writes
     /// only `metainterp.last_exc_value`, never the backend cells.
     pub drain_backend_jit_exc: fn(),
 }

@@ -1,6 +1,6 @@
 //! W_TupleObject — Python `tuple` type.
 //!
-//! Upstream `pypy/objspace/std/tupleobject.py:376-390` `W_TupleObject`
+//! Upstream `pypy/objspace/std/tupleobject.py` `W_TupleObject`
 //! stores `wrappeditems: list` with `_immutable_fields_ =
 //! ['wrappeditems[*]']`. After RPython translation `wrappeditems`
 //! becomes `Ptr(GcArray(OBJECTPTR))`; the `[*]` annotation marks both
@@ -275,7 +275,7 @@ fn w_tuple_new_array_backed_impl(
     w_class: PyObjectRef,
     user_layout: bool,
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`):
     //   livevars = self.push_roots(hop)
     //   v_alloc = hop.genop("direct_call", [malloc_fast_ptr, ...])
     //   self.pop_roots(hop, livevars)
@@ -522,7 +522,7 @@ pub unsafe fn w_tuple_set_cached_hash(obj: PyObjectRef, hash: i64) {
 /// args; falls through to `Cls_oo` when neither operand qualifies for
 /// the int-int / float-float fast paths.
 ///
-/// Predicates: `listobject.py:2390 is_plain_int1` accepts exact
+/// Predicates: `listobject.py is_plain_int1` accepts exact
 /// `W_IntObject` (not bool, not int subclass) AND fits-int
 /// `W_LongObject`; `type(w) is W_FloatObject` is strict identity.
 #[expect(
@@ -545,7 +545,7 @@ pub fn makespecialisedtuple2(w_arg1: PyObjectRef, w_arg2: PyObjectRef) -> PyObje
 }
 
 /// `type(w) is W_FloatObject`. Strict identity, no subclass match —
-/// `specialisedtupleobject.py:176` uses `type(w_arg1) is W_FloatObject`
+/// `specialisedtupleobject.py` uses `type(w_arg1) is W_FloatObject`
 /// directly with no fits-* extension (no `is_plain_float1` helper
 /// upstream).
 #[inline]

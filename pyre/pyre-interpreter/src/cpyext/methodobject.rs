@@ -215,7 +215,7 @@ pub fn pycfunction_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// `methodobject.py:264 W_PyCMethodObject` — the carrier a `METH_METHOD` row
+/// `methodobject.py W_PyCMethodObject` — the carrier a `METH_METHOD` row
 /// gets, which is everything `pycfunction_type` carries plus the class the
 /// definition was declared in.
 ///
@@ -259,7 +259,7 @@ fn checked_method_def(object: *mut CPyObject) -> Option<*mut CPyMethodDef> {
     definition
 }
 
-/// `methodobject.py:563 PyCFunction_GetFunction(object)` — the C function the
+/// `methodobject.py PyCFunction_GetFunction(object)` — the C function the
 /// carrier calls.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCFunction_GetFunction(object: *mut CPyObject) -> *mut c_void {
@@ -319,7 +319,7 @@ pub unsafe extern "C" fn PyCFunction_NewEx(
     unsafe { PyCMethod_New(method, receiver, module, std::ptr::null_mut()) }
 }
 
-/// `methodobject.py:544 PyCMethod_New(ml, self, module, cls)` — the same,
+/// `methodobject.py PyCMethod_New(ml, self, module, cls)` — the same,
 /// naming the class a `METH_METHOD` definition was declared in.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyCMethod_New(

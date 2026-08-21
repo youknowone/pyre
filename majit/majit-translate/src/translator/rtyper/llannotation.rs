@@ -9,12 +9,12 @@
 //!
 //! * `annotation_to_lltype` / `lltype_to_annotation` / `ll_to_annotation`
 //!   (llannotation.py:147-200).
-//! * `class SomeInteriorPtr(SomePtr)` (llannotation.py:67-70).
-//! * `class SomeLLADTMeth(SomeObject)` (llannotation.py:72-93).
+//! * `class SomeInteriorPtr(SomePtr)` (llannotation.py).
+//! * `class SomeLLADTMeth(SomeObject)` (llannotation.py).
 //! * `pairtype(SomePtr, SomeInteger)` / `pairtype(SomePtr, SomeObject)`
 //!   binary dispatch (llannotation.py:100-128).
 //!
-//! In addition, upstream's `class SomePtr` (lltype.py:1518-1577) hosts
+//! In addition, upstream's `class SomePtr` (lltype.py) hosts
 //! its own `getattr` / `setattr` / `len` / `bool` / `call` methods —
 //! the Rust port re-homes those methods here next to `SomeInteriorPtr`
 //! so every pointer-annotation surface sits in a single file. The
@@ -40,7 +40,7 @@ use crate::tool::pairtype::DoubleDispatchRegistry;
 // llannotation.py:147-200 — annotation ⇄ lltype helpers.
 // =====================================================================
 
-/// RPython `annotation_to_ll_map` (llannotation.py:135-144).
+/// RPython `annotation_to_ll_map` (llannotation.py).
 fn annotation_to_ll_map() -> Vec<(SomeValue, lltype::LowLevelType)> {
     vec![
         (
@@ -72,7 +72,7 @@ fn annotation_to_ll_map() -> Vec<(SomeValue, lltype::LowLevelType)> {
     ]
 }
 
-/// RPython `annotation_to_lltype(s_val, info=None)` (llannotation.py:147-169).
+/// RPython `annotation_to_lltype(s_val, info=None)` (llannotation.py).
 pub fn annotation_to_lltype(
     s_val: &SomeValue,
     info: Option<&str>,
@@ -137,7 +137,7 @@ pub fn annotation_to_lltype(
     )))
 }
 
-/// RPython `lltype_to_annotation(T)` (llannotation.py:172-185).
+/// RPython `lltype_to_annotation(T)` (llannotation.py).
 ///
 /// Upstream falls back to `SomePtr(T)` / `SomeInteriorPtr(T)` for the
 /// non-primitive cases — `SomePtr.__init__` asserts `isinstance(T,
@@ -187,7 +187,7 @@ where
     }
 }
 
-/// RPython `ll_to_annotation(v)` (llannotation.py:190-200).
+/// RPython `ll_to_annotation(v)` (llannotation.py).
 pub fn ll_to_annotation(v: lltype::LowLevelValue) -> SomeValue {
     if let lltype::LowLevelValue::InteriorPtr(ptr) = v {
         return SomeValue::InteriorPtr(SomeInteriorPtr::new(ptr._TYPE()));
@@ -196,11 +196,11 @@ pub fn ll_to_annotation(v: lltype::LowLevelValue) -> SomeValue {
 }
 
 // =====================================================================
-// lltype.py:1530-1577 — SomePtr pointer-specific methods.
+// lltype.py — SomePtr pointer-specific methods.
 // =====================================================================
 
 impl SomePtr {
-    /// RPython `SomePtr.bool(self)` (lltype.py:1566-1570).
+    /// RPython `SomePtr.bool(self)` (lltype.py).
     pub fn bool(&self) -> SomeValue {
         let mut result = SomeBool::new();
         if self.is_constant()
@@ -212,7 +212,7 @@ impl SomePtr {
         SomeValue::Bool(result)
     }
 
-    /// RPython `SomePtr.len(self)` (lltype.py:1550-1555). Propagates the
+    /// RPython `SomePtr.len(self)` (lltype.py). Propagates the
     /// `TypeError` upstream raises from `_fixedlength` on non-array
     /// pointers as an `AnnotatorError`.
     pub fn len(&self) -> Result<SomeValue, AnnotatorError> {
@@ -228,7 +228,7 @@ impl SomePtr {
         }
     }
 
-    /// RPython `SomePtr.getattr(self, s_attr)` (lltype.py:1531-1548).
+    /// RPython `SomePtr.getattr(self, s_attr)` (lltype.py).
     pub fn getattr(&self, s_attr: &SomeValue) -> Result<SomeValue, AnnotatorError> {
         if !s_attr.is_constant() {
             return Err(AnnotatorError::new(format!(
@@ -236,7 +236,7 @@ impl SomePtr {
                 self.ll_ptrtype
             )));
         }
-        // lltype.py:1531-1548 `SomePtr.getattr` — upstream guards on
+        // lltype.py `SomePtr.getattr` — upstream guards on
         // `s_attr.is_constant()` only and forwards `s_attr.const`
         // straight into `_lookup_adtmeth` / `getattr(example, ...)`
         // with no `isinstance(..., str)` gate. Use [`ConstValue::as_text`]
@@ -282,7 +282,7 @@ impl SomePtr {
         }
     }
 
-    /// RPython `SomePtr.call(self, args)` (lltype.py:1567-1577).
+    /// RPython `SomePtr.call(self, args)` (lltype.py).
     pub fn call(&self, args: &ArgumentsForTranslation) -> Result<SomeValue, AnnotatorError> {
         let (args_s_opt, kwds_s) = args
             .unpack()
@@ -293,7 +293,7 @@ impl SomePtr {
             ));
         }
         let info = "argument to ll function pointer call";
-        // `lltype.py:1573-1574 SomePtr.call`: `[annotation_to_lltype(
+        // `lltype.py SomePtr.call`: `[annotation_to_lltype(
         // s_arg, info)._defl() for s_arg in args_s]` — touches every
         // slot once via the list comprehension; `annotation_to_lltype`
         // raises `AttributeError` on `None.knowntype` at the first slot
@@ -310,7 +310,7 @@ impl SomePtr {
         Ok(ll_to_annotation(v))
     }
 
-    /// RPython `SomePtr.setattr(self, s_attr, s_value)` (lltype.py:1557-1564).
+    /// RPython `SomePtr.setattr(self, s_attr, s_value)` (lltype.py).
     pub fn setattr(
         &self,
         s_attr: &SomeValue,
@@ -340,10 +340,10 @@ impl SomePtr {
 }
 
 // =====================================================================
-// llannotation.py:67-70 — class SomeInteriorPtr(SomePtr)
+// llannotation.py — class SomeInteriorPtr(SomePtr)
 // =====================================================================
 
-/// RPython `class SomeInteriorPtr(SomePtr)` (llannotation.py:67-70).
+/// RPython `class SomeInteriorPtr(SomePtr)` (llannotation.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeInteriorPtr {
     pub base: SomeObject,
@@ -418,7 +418,7 @@ impl SomeInteriorPtr {
             ));
         }
         let info = "argument to ll function pointer call";
-        // `lltype.py:1573-1574 SomePtr.call`: list comprehension touches
+        // `lltype.py SomePtr.call`: list comprehension touches
         // every slot once via `annotation_to_lltype(s_arg, info)._defl()`;
         // `annotation_to_lltype` raises `AttributeError` on
         // `None.knowntype` at the first slot that is unbound.  Per-touch
@@ -480,10 +480,10 @@ impl SomeObjectTrait for SomeInteriorPtr {
 }
 
 // =====================================================================
-// llannotation.py:72-93 — class SomeLLADTMeth(SomeObject)
+// llannotation.py — class SomeLLADTMeth(SomeObject)
 // =====================================================================
 
-/// RPython `class SomeLLADTMeth(SomeObject)` (llannotation.py:72-83).
+/// RPython `class SomeLLADTMeth(SomeObject)` (llannotation.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeLLADTMeth {
     pub base: SomeObject,
@@ -500,7 +500,7 @@ impl SomeLLADTMeth {
         }
     }
 
-    /// RPython `SomeLLADTMeth.call(self, args)` (llannotation.py:82-87).
+    /// RPython `SomeLLADTMeth.call(self, args)` (llannotation.py).
     pub fn call(&self, args: &ArgumentsForTranslation) -> Result<SomeValue, AnnotatorError> {
         let s_func = bookkeeper::immutablevalue(&self.func)?;
         // A low-level adt-method callee always yields a concrete annotation
@@ -583,7 +583,7 @@ fn ptr_integer_getitem(
     ann: &crate::annotator::annrpython::RPythonAnnotator,
     hl: &HLOperation,
 ) -> Option<SomeValue> {
-    // llannotation.py:102-108 — `getitem`: on IndexError (e.g.
+    // llannotation.py — `getitem`: on IndexError (e.g.
     // FixedSizeArray(0)) returns None (void → result bound to Impossible
     // without blocking); otherwise returns the item annotation.
     match ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible) {
@@ -639,7 +639,7 @@ fn ptr_integer_setitem(
         }
         _ => panic!("ptr_integer_setitem: arg 0 not ptr-like"),
     }
-    // llannotation.py:111-115 — setitem "just doing checking", returns None.
+    // llannotation.py — setitem "just doing checking", returns None.
     None
 }
 
@@ -698,11 +698,11 @@ fn init_ptr_object_pairtype(
 
 /// Register the `SomeTypedAddressAccess`/`SomeInteger` getitem/setitem,
 /// `SomeAddress`/`SomeInteger` add/sub, and `SomeAddress`/`SomeAddress`
-/// sub dispatch tables (llannotation.py:15-48).
+/// sub dispatch tables (llannotation.py).
 fn init_address_pairtypes(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // llannotation.py:34-36 `getitem.can_only_throw = []`.
+    // llannotation.py `getitem.can_only_throw = []`.
     register(
         reg,
         OpKind::GetItem,
@@ -713,7 +713,7 @@ fn init_address_pairtypes(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // llannotation.py:38-40 `setitem.can_only_throw = []`.
+    // llannotation.py `setitem.can_only_throw = []`.
     register(
         reg,
         OpKind::SetItem,
@@ -724,7 +724,7 @@ fn init_address_pairtypes(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // llannotation.py:44-45 `def add((s_addr, s_int)): return SomeAddress()`.
+    // llannotation.py `def add((s_addr, s_int)): return SomeAddress()`.
     register(
         reg,
         OpKind::Add,
@@ -735,7 +735,7 @@ fn init_address_pairtypes(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // llannotation.py:47-48 `def sub((s_addr, s_int)): return SomeAddress()`.
+    // llannotation.py `def sub((s_addr, s_int)): return SomeAddress()`.
     register(
         reg,
         OpKind::Sub,
@@ -746,7 +746,7 @@ fn init_address_pairtypes(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // llannotation.py:19-23 `def sub((s_addr1, s_addr2))`.
+    // llannotation.py `def sub((s_addr1, s_addr2))`.
     register(
         reg,
         OpKind::Sub,
@@ -757,7 +757,7 @@ fn init_address_pairtypes(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // llannotation.py:25-26 `def is_((s_addr1, s_addr2)): assert False,
+    // llannotation.py `def is_((s_addr1, s_addr2)): assert False,
     // "comparisons with is not supported by addresses"`. A more specific
     // (Address, Address) entry shadows the (Object, Object) `is__default`.
     register(
@@ -772,7 +772,7 @@ fn init_address_pairtypes(
     );
 }
 
-/// llannotation.py:34-35 `def getitem((s_taa, s_int)): return
+/// llannotation.py `def getitem((s_taa, s_int)): return
 /// lltype_to_annotation(s_taa.type)`.
 fn typed_address_access_integer_getitem(
     ann: &crate::annotator::annrpython::RPythonAnnotator,
@@ -784,7 +784,7 @@ fn typed_address_access_integer_getitem(
     }
 }
 
-/// llannotation.py:38-39 `def setitem((s_taa, s_int), s_value): assert
+/// llannotation.py `def setitem((s_taa, s_int), s_value): assert
 /// annotation_to_lltype(s_value) is s_taa.type`.
 fn typed_address_access_integer_setitem(
     ann: &crate::annotator::annrpython::RPythonAnnotator,
@@ -804,7 +804,7 @@ fn typed_address_access_integer_setitem(
         }
         _ => panic!("typed_address_access_integer_setitem: arg 0 not TypedAddressAccess"),
     }
-    // llannotation.py:38-39 — setitem asserts the value type, returns None.
+    // llannotation.py — setitem asserts the value type, returns None.
     None
 }
 
@@ -869,7 +869,7 @@ mod tests {
                 .get((addr, addr), addr.mro(), addr.mro())
                 .is_some()
         );
-        // llannotation.py:25-26 — (Address, Address) `is_` is registered
+        // llannotation.py — (Address, Address) `is_` is registered
         // (and shadows the (Object, Object) `is__default`), so that
         // comparing two addresses with `is` reaches the asserting arm.
         assert!(

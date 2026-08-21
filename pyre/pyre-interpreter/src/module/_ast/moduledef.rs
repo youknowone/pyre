@@ -147,7 +147,7 @@ fn node_has_location(name: &str) -> bool {
 /// nodes are converted to instances of these public types by `convert.rs`.
 pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `type(name, (base,), {"__module__": "ast"})` — a fresh heap type. The
-    // generated AST types report `__module__ == "ast"` (astcompiler/ast.py:150;
+    // generated AST types report `__module__ == "ast"` (astcompiler/ast.py;
     // the host `_ast.Module.__module__` is likewise `'ast'`).
     let make = |name: &str, base: PyObjectRef| -> PyObjectRef {
         // A `dict` header moves, and every store below allocates: the key

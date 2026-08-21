@@ -13,11 +13,11 @@ use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
 #[cfg(test)]
 use crate::translator::rtyper::lltypesystem::rstr::build_ll_int2hex_helper_graph;
 
-/// RPython `CHAR_ARRAY = GcArray(Char)` (ll_str.py:5).
+/// RPython `CHAR_ARRAY = GcArray(Char)` (ll_str.py).
 pub static CHAR_ARRAY: LazyLock<LowLevelType> =
     LazyLock::new(|| LowLevelType::Array(Box::new(Array::gc(LowLevelType::Char))));
 
-/// RPython `ll_unsigned(i)` (ll_str.py:7-11) for Signed inputs.
+/// RPython `ll_unsigned(i)` (ll_str.py) for Signed inputs.
 pub fn ll_unsigned(i: i64) -> u64 {
     i as u64
 }
@@ -43,14 +43,14 @@ fn format_unsigned_digits(mut value: u64, radix: u64) -> String {
     digits.iter().rev().collect()
 }
 
-/// RPython `@jit.elidable def ll_int2dec(val)` (ll_str.py:14-39).
+/// RPython `@jit.elidable def ll_int2dec(val)` (ll_str.py).
 pub fn ll_int2dec(val: i64) -> String {
     let (sign, value) = unsigned_magnitude(val);
     let digits = format_unsigned_digits(value, 10);
     if sign { format!("-{digits}") } else { digits }
 }
 
-/// RPython `@jit.elidable def ll_int2hex(i, addPrefix)` (ll_str.py:48-82).
+/// RPython `@jit.elidable def ll_int2hex(i, addPrefix)` (ll_str.py).
 pub fn ll_int2hex(i: i64, add_prefix: bool) -> String {
     let (sign, value) = unsigned_magnitude(i);
     let mut result = String::new();
@@ -64,7 +64,7 @@ pub fn ll_int2hex(i: i64, add_prefix: bool) -> String {
     result
 }
 
-/// RPython `@jit.elidable def ll_int2oct(i, addPrefix)` (ll_str.py:85-119).
+/// RPython `@jit.elidable def ll_int2oct(i, addPrefix)` (ll_str.py).
 pub fn ll_int2oct(i: i64, add_prefix: bool) -> String {
     let (sign, value) = unsigned_magnitude(i);
     let mut result = String::new();
@@ -78,7 +78,7 @@ pub fn ll_int2oct(i: i64, add_prefix: bool) -> String {
     result
 }
 
-/// RPython `@jit.elidable def ll_int2bin(i, addPrefix)` (ll_str.py:122-156).
+/// RPython `@jit.elidable def ll_int2bin(i, addPrefix)` (ll_str.py).
 pub fn ll_int2bin(i: i64, add_prefix: bool) -> String {
     let (sign, value) = unsigned_magnitude(i);
     let mut result = String::new();

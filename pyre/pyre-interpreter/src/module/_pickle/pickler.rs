@@ -79,7 +79,7 @@ pub struct W_Pickler {
     /// write. `interp_pickle.py` resolves it at `:555-560` only to validate,
     /// discards the result, and re-resolves per write in `_Framer.file_write`
     /// (`:353`); measured on 3.14.5, rebinding `file.write` after construction
-    /// is *not* observed by a later `dump()`, and `pickle.py:465` captures the
+    /// is *not* observed by a later `dump()`, and `pickle.py` captures the
     /// callable the same way. Reusing the resolution is what matches.
     w_write: PyObjectRef,
     proto: i64,
@@ -480,7 +480,7 @@ impl W_Pickler {
         // `fix_imports` gates the `_compat_pickle` py3→py2 name remap that the
         // protocol-< 3 save path would otherwise always apply.
         let proto = normalize_protocol(pyre_object::gc_roots::shadow_stack_get(protocol_slot))?;
-        // `file must have a 'write' attribute` (interp_pickle.py:557). This
+        // `file must have a 'write' attribute` (interp_pickle.py). This
         // check precedes the `buffer_callback` one below; `descr__new__`
         // (`interp_pickle.py:1822`) orders them the other way. Measured on
         // 3.14.5, a call carrying both faults reports this TypeError.
@@ -690,7 +690,7 @@ impl W_Pickler {
 
     #[setter]
     fn set_fast(&mut self, w_value: PyObjectRef) -> Result<(), PyError> {
-        // `interp_pickle.py:1219-1223` stores `space.int_w(w_val)`.
+        // `interp_pickle.py` stores `space.int_w(w_val)`.
         self.fast = crate::baseobjspace::int_w(w_value)?;
         Ok(())
     }
@@ -2198,7 +2198,7 @@ fn pinned_get(slot: usize, i: usize) -> PyObjectRef {
 
 /// Advance the iterator pinned at `iter_slot`. A yielded object is pinned
 /// before returning because `_batch_appends` fetches its second item before
-/// saving the first, exactly like `interp_pickle.py:829-844`; the first save
+/// saving the first, exactly like `interp_pickle.py`; the first save
 /// may run arbitrary Python and remove the second item from the source list.
 fn pinned_iter_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
     match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
@@ -2243,7 +2243,7 @@ fn snapshot_pinned_iterable(source_slot: usize) -> Result<usize, PyError> {
     Ok(snapshot_slot)
 }
 
-/// `interp_pickle.py:802-851 _batch_appends`.
+/// `interp_pickle.py _batch_appends`.
 ///
 /// Protocol 0 consumes `space.listview(w_list)`, a pre-save snapshot. Binary
 /// protocols keep a live iterator over the original list, so removals can end
@@ -2396,7 +2396,7 @@ fn save_pair(
     }
 }
 
-/// `interp_pickle.py:853-900 _batch_setitems`.
+/// `interp_pickle.py _batch_setitems`.
 ///
 /// The iterable remains live while its pairs are saved. In particular a
 /// `dict_items` iterator raises its normal "dictionary changed size during
@@ -2557,7 +2557,7 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
             obj_repr
         )));
     }
-    // `interp_pickle.py:1738-1742 whichmodule` returns any non-None
+    // `interp_pickle.py whichmodule` returns any non-None
     // `__module__`. A non-string module name is invalid; reject it here with
     // `TypeError("module name must be a string")` — the same error it surfaces
     // once used, raised at resolution time rather than deferred to the import.
@@ -3239,7 +3239,7 @@ fn save_reduce(
             }
             buf.push(op::NEWOBJ_EX);
         } else {
-            // pickle.py:681-690. Protocol 2/3 has no NEWOBJ_EX opcode, so
+            // pickle.py. Protocol 2/3 has no NEWOBJ_EX opcode, so
             // construct `partial(cls.__new__, cls, *args, **kwargs)` and
             // reduce that zero-argument callable. Keeping `cls` and `args`
             // inside the partial is observable in both reconstruction and

@@ -35,7 +35,7 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-/// RPython `info1.absorb(info2)` (unionfind.py:76) — called by
+/// RPython `info1.absorb(info2)` (unionfind.py) — called by
 /// [`UnionFind::union`] when two partitions merge. `self` is the
 /// larger partition's info (pre-weight-swap), `other` the absorbed
 /// partition's info.
@@ -44,12 +44,12 @@ pub trait UnionFindInfo: Sized {
 }
 
 /// No-op `absorb` — mirrors upstream `info_factory=None` skip path
-/// (unionfind.py:75-76 `if info1 is not None`).
+/// (unionfind.py `if info1 is not None`).
 impl UnionFindInfo for () {
     fn absorb(&mut self, _other: Self) {}
 }
 
-/// RPython `class UnionFind(object)` (unionfind.py:6-99).
+/// RPython `class UnionFind(object)` (unionfind.py).
 pub struct UnionFind<K, V>
 where
     K: Eq + Hash + Clone,
@@ -91,7 +91,7 @@ where
         }
     }
 
-    /// RPython `UnionFind.__contains__(self, obj)` (unionfind.py:22-23).
+    /// RPython `UnionFind.__contains__(self, obj)` (unionfind.py).
     pub fn contains(&self, obj: &K) -> bool {
         self.link_to_parent.contains_key(obj)
     }
@@ -102,7 +102,7 @@ where
         self.link_to_parent.keys()
     }
 
-    /// RPython `UnionFind.infos(self)` (unionfind.py:31-32). Roots enter all
+    /// RPython `UnionFind.infos(self)` (unionfind.py). Roots enter all
     /// three dictionaries together; filtering `link_to_parent` insertion
     /// order to surviving roots matches upstream `root_info.values()`.
     pub fn infos(&self) -> impl Iterator<Item = &V> {
@@ -111,7 +111,7 @@ where
             .filter_map(move |k| self.root_info.get(k))
     }
 
-    /// RPython `UnionFind.__getitem__(self, obj)` (unionfind.py:13-20).
+    /// RPython `UnionFind.__getitem__(self, obj)` (unionfind.py).
     ///
     /// Returns `None` for the KeyError case. Path-compresses as a
     /// side-effect; matches upstream (the body calls `self.find`).
@@ -136,7 +136,7 @@ where
         self.root_info.get_mut(&rep)
     }
 
-    /// RPython `UnionFind.find_rep(self, obj)` (unionfind.py:34-43).
+    /// RPython `UnionFind.find_rep(self, obj)` (unionfind.py).
     ///
     /// Returns the root representative. Auto-inserts via
     /// `info_factory` if `obj` isn't tracked yet (matches upstream —
@@ -146,7 +146,7 @@ where
         rep
     }
 
-    /// RPython `UnionFind.find(self, obj)` (unionfind.py:45-65).
+    /// RPython `UnionFind.find(self, obj)` (unionfind.py).
     ///
     /// Returns `(new_root, representative)`. `new_root` is `true` when
     /// `obj` was not previously tracked and a fresh partition was
@@ -178,7 +178,7 @@ where
         (false, parent)
     }
 
-    /// RPython `UnionFind.union(self, obj1, obj2)` (unionfind.py:67-91).
+    /// RPython `UnionFind.union(self, obj1, obj2)` (unionfind.py).
     ///
     /// Returns `(not_noop, representative)`. `not_noop` is `true` iff
     /// the call materially changed the partitioning — either a brand-
@@ -219,7 +219,7 @@ where
         (true, new_rep1)
     }
 
-    /// RPython `UnionFind.union_list(self, objlist)` (unionfind.py:93-99).
+    /// RPython `UnionFind.union_list(self, objlist)` (unionfind.py).
     pub fn union_list(&mut self, objlist: &[K]) {
         if objlist.is_empty() {
             return;
@@ -238,7 +238,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    /// RPython `test_cleanup` (test_unionfind.py:4-21).
+    /// RPython `test_cleanup` (test_unionfind.py).
     ///
     /// Creates two partitions and uses `absorb` to remove absorbed
     /// entries from an external tracking list. The final list length
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(state.len(), 2, "exactly 2 partitions must survive");
     }
 
-    /// RPython `test_asymmetric_absorb` (test_unionfind.py:23-34).
+    /// RPython `test_asymmetric_absorb` (test_unionfind.py).
     #[test]
     fn asymmetric_absorb() {
         #[derive(Debug)]

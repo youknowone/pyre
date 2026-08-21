@@ -66,7 +66,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// RPython `normalize_call_familes(annotator)` (normalizecalls.py:14-21).
+/// RPython `normalize_call_familes(annotator)` (normalizecalls.py).
 ///
 /// ```python
 /// def normalize_call_familes(annotator):
@@ -112,7 +112,7 @@ pub fn normalize_call_familes(annotator: &RPythonAnnotator) -> Result<(), Annota
     Ok(())
 }
 
-/// RPython `perform_normalizations(annotator)` (normalizecalls.py:404-413).
+/// RPython `perform_normalizations(annotator)` (normalizecalls.py).
 ///
 /// ```python
 /// def perform_normalizations(annotator):
@@ -165,7 +165,7 @@ pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), Annota
     Ok(())
 }
 
-/// RPython `assign_inheritance_ids(annotator)` (normalizecalls.py:373-389).
+/// RPython `assign_inheritance_ids(annotator)` (normalizecalls.py).
 ///
 /// ```python
 /// def assign_inheritance_ids(annotator):
@@ -249,7 +249,7 @@ pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), Annota
 /// `commonbase` onto both sides of the connection — onto the
 /// `ClassAttrFamily` itself (consumed by `ClassesPBCRepr.get_access_set`)
 /// and into `commonbase.extra_access_sets` (consumed by
-/// `ClassRepr._setup_repr_pbcfields`, rclass.py:280-285).
+/// `ClassRepr._setup_repr_pbcfields`, rclass.py).
 ///
 /// Pyre lookup deviation: upstream `descs.iterkeys().next()` exploits
 /// Python's hashed `Desc` identity; in Rust the family stores
@@ -437,7 +437,7 @@ pub fn assign_inheritance_ids(annotator: &RPythonAnnotator) {
     // that append after the baked prefix, and leave a fresh subclass of a
     // baked ancestor unnumbered for the per-graph `Skip`
     // (`ClassesPBCRepr.redispatch_call`).  This is the pragmatic counterpart
-    // of upstream's `TooLateForNewSubclass` (normalizecalls.py:347-351),
+    // of upstream's `TooLateForNewSubclass` (normalizecalls.py),
     // which instead raises; numbering such a subclass cleanly needs the
     // two-phase rtype/emit prepass that fixes every id before any constant
     // is baked.  A new hierarchy with no common base sorts after the existing

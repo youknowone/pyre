@@ -20,7 +20,7 @@ use crate::tool::algo::unionfind::{UnionFind, UnionFindInfo};
 use crate::translator::rtyper::lltypesystem::lltype;
 use crate::translator::translator::TranslationContext;
 
-/// `Dependency` (`graphanalyze.py:198-207`). Per-graph cell holding
+/// `Dependency` (`graphanalyze.py`). Per-graph cell holding
 /// the accumulated analyser result. `merge_with_result` and `absorb`
 /// match upstream verbatim.
 #[derive(Clone)]
@@ -33,12 +33,12 @@ impl<R: AnalyzerResult> Dependency<R> {
         Self { result: bottom }
     }
 
-    /// `merge_with_result(self, result)` (`graphanalyze.py:203-204`).
+    /// `merge_with_result(self, result)` (`graphanalyze.py`).
     pub fn merge_with_result(&mut self, result: R) {
         self.result = R::join_two_results(self.result.clone(), result);
     }
 
-    /// `absorb(self, other)` (`graphanalyze.py:206-207`). Upstream
+    /// `absorb(self, other)` (`graphanalyze.py`). Upstream
     /// is `self.merge_with_result(other._result)`.
     pub fn absorb(&mut self, other: &Self) {
         self.merge_with_result(other.result.clone());
@@ -50,7 +50,7 @@ impl<R: AnalyzerResult> Dependency<R> {
 }
 
 impl<R: AnalyzerResult> UnionFindInfo for Dependency<R> {
-    /// `Dependency.absorb(other)` (`graphanalyze.py:206-207`). The
+    /// `Dependency.absorb(other)` (`graphanalyze.py`). The
     /// pyre `UnionFindInfo` trait passes `other` by value so the
     /// absorbed partition's info is consumed; pyre's
     /// `merge_with_result` only needs `other.result`, so consume it.
@@ -62,24 +62,24 @@ impl<R: AnalyzerResult> UnionFindInfo for Dependency<R> {
 /// Analyser-result lattice. Concrete subclasses implement
 /// `bottom_result` / `top_result` / `is_top_result` /
 /// `result_builder` / `add_to_result` / `finalize_builder` /
-/// `join_two_results` per upstream `graphanalyze.py:17-44`.
+/// `join_two_results` per upstream `graphanalyze.py`.
 pub trait AnalyzerResult: Clone + 'static {
-    /// `bottom_result()` (`graphanalyze.py:17-19`).
+    /// `bottom_result()` (`graphanalyze.py`).
     fn bottom_result() -> Self;
 
-    /// `top_result()` (`graphanalyze.py:21-23`).
+    /// `top_result()` (`graphanalyze.py`).
     fn top_result() -> Self;
 
-    /// `is_top_result(result)` (`graphanalyze.py:25-28`).
+    /// `is_top_result(result)` (`graphanalyze.py`).
     fn is_top_result(result: &Self) -> bool;
 
-    /// `result_builder()` (`graphanalyze.py:30-32`).
+    /// `result_builder()` (`graphanalyze.py`).
     fn result_builder() -> Self;
 
-    /// `add_to_result(result, other)` (`graphanalyze.py:34-36`).
+    /// `add_to_result(result, other)` (`graphanalyze.py`).
     fn add_to_result(result: Self, other: Self) -> Self;
 
-    /// `finalize_builder(result)` (`graphanalyze.py:38-40`).
+    /// `finalize_builder(result)` (`graphanalyze.py`).
     fn finalize_builder(result: Self) -> Self;
 
     /// `join_two_results(result1, result2)`
@@ -129,7 +129,7 @@ pub trait GraphInfo: Clone + Default + 'static {}
 
 impl GraphInfo for () {}
 
-/// `GraphAnalyzer` (`graphanalyze.py:7-195`). The Rust port uses a
+/// `GraphAnalyzer` (`graphanalyze.py`). The Rust port uses a
 /// trait so subclasses can be plain structs; the recursive walk
 /// (`analyze_direct_call`, `analyze_indirect_call`, `analyze`,
 /// `analyze_all`) lives in default methods so subclasses only need
@@ -142,7 +142,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     // upstream-overridable hooks
     // ------------------------------------------------------------
 
-    /// `compute_graph_info(graph)` (`graphanalyze.py:76-77`). Default
+    /// `compute_graph_info(graph)` (`graphanalyze.py`). Default
     /// is `None` (`I::default()`). Subclasses override to compute
     /// per-graph metadata once per `analyze_direct_call`.
     fn compute_graph_info(&mut self, _graph: &GraphRef) -> I {
@@ -184,7 +184,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     }
 
     /// `analyze_exceptblock(block, seen)`
-    /// (`graphanalyze.py:51-52`). Default is `bottom_result()`.
+    /// (`graphanalyze.py`). Default is `bottom_result()`.
     /// Subclasses (e.g. `canraise.RaiseAnalyzer.analyze_exceptblock`
     /// at `canraise.py:25 = None`) keep the upstream `block` parameter
     /// so the surface stays compatible with the caller in
@@ -202,7 +202,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     /// (`graphanalyze.py:54-55`). Upstream default routes through
     /// [`Self::analyze_exceptblock`] — subclasses override this hook
     /// directly when they need the enclosing graph (canraise's
-    /// `analyze_exceptblock_in_graph` at `canraise.py:27-41` walks
+    /// `analyze_exceptblock_in_graph` at `canraise.py` walks
     /// `graph.iterlinks()` to suppress re-raise of caught
     /// exceptions). The driver in
     /// [`framework_analyze_direct_call`] calls the `_in_graph`
@@ -217,7 +217,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     }
 
     /// `analyze_startblock(block, seen)`
-    /// (`graphanalyze.py:57-58`). Default is `bottom_result()`.
+    /// (`graphanalyze.py`). Default is `bottom_result()`.
     fn analyze_startblock(
         &mut self,
         _block: &BlockRef,
@@ -227,7 +227,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     }
 
     /// `analyze_link(exit, seen)` per the call site at
-    /// `graphanalyze.py:169 self.analyze_link(exit, seen)`. Upstream's
+    /// `graphanalyze.py self.analyze_link(exit, seen)`. Upstream's
     /// declared signature (`:71 def analyze_link(self, graph, link)`)
     /// is at odds with the call site; the body just returns
     /// `bottom_result()` and ignores arguments, so no concrete
@@ -255,7 +255,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
     // dispatch
     // ------------------------------------------------------------
 
-    /// `analyze(op, seen, graphinfo)` (`graphanalyze.py:93-130`).
+    /// `analyze(op, seen, graphinfo)` (`graphanalyze.py`).
     fn analyze(
         &mut self,
         op: &SpaceOperation,
@@ -306,7 +306,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
                 // Rust analogue must therefore reject
                 // `Some(ConstValue::None)` as well as the missing-key
                 // case. The `external='C'` kwarg from
-                // `lltype.functionptr` (`rffi.py:162`) lands in
+                // `lltype.functionptr` (`rffi.py`) lands in
                 // `attrs["external"]` as a non-`None` ConstValue.
                 if !matches!(funcobj.attrs.get("external"), None | Some(ConstValue::None)) {
                     return self.analyze_external_call(&funcobj, seen);
@@ -395,7 +395,7 @@ pub trait GraphAnalyzer<R: AnalyzerResult, I: GraphInfo>: Sized {
         framework_analyze_indirect_call(self, graphs, seen)
     }
 
-    /// `analyze_all(graphs=None)` (`graphanalyze.py:190-195`).
+    /// `analyze_all(graphs=None)` (`graphanalyze.py`).
     /// Walks every graph and feeds each op into [`Self::analyze`].
     /// Upstream takes the per-graph result and discards it; the same
     /// shape applies here.
@@ -523,7 +523,7 @@ where
     R::finalize_builder(result)
 }
 
-/// Framework body of `analyze_external_call` (`graphanalyze.py:60-69`).
+/// Framework body of `analyze_external_call` (`graphanalyze.py`).
 ///
 /// ```python
 /// def analyze_external_call(self, funcobj, seen=None):
@@ -609,7 +609,7 @@ where
     result
 }
 
-/// `DependencyTracker` (`graphanalyze.py:210-258`). Tracks the
+/// `DependencyTracker` (`graphanalyze.py`). Tracks the
 /// active call-stack so cycles in the analysed call graph can be
 /// detected and merged via the shared
 /// [`crate::tool::algo::unionfind::UnionFind`] cache. Pyre's
@@ -634,7 +634,7 @@ impl<R: AnalyzerResult> DependencyTracker<R> {
         }
     }
 
-    /// `enter(graph)` (`graphanalyze.py:232-248`). Returns `true`
+    /// `enter(graph)` (`graphanalyze.py`). Returns `true`
     /// when the graph is new (caller must analyse it); `false` when
     /// the graph is already on the stack (caller reads the cached
     /// result and merges the strongly-connected component).
@@ -663,7 +663,7 @@ impl<R: AnalyzerResult> DependencyTracker<R> {
         }
     }
 
-    /// `leave_with(result)` (`graphanalyze.py:250-254`).
+    /// `leave_with(result)` (`graphanalyze.py`).
     pub fn leave_with(
         &mut self,
         _key: usize,
@@ -676,7 +676,7 @@ impl<R: AnalyzerResult> DependencyTracker<R> {
         }
     }
 
-    /// `get_cached_result(graph)` (`graphanalyze.py:256-258`).
+    /// `get_cached_result(graph)` (`graphanalyze.py`).
     pub fn get_cached_result(
         &self,
         key: usize,

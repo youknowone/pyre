@@ -18,14 +18,14 @@ use crate::regalloc::RegAllocator;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Label(pub usize);
 
-/// `flatten.py:20-26 class TLabel`.
+/// `flatten.py class TLabel`.
 ///
 /// Rust encodes the definition-vs-target distinction in [`FlatOp`] variants
 /// (`Label` vs jump targets), so the target wrapper shares the same numeric
 /// label carrier.
 pub type TLabel = Label;
 
-/// `flatten.py:28-33 class Register`.
+/// `flatten.py class Register`.
 ///
 /// ```py
 /// class Register(object):
@@ -40,7 +40,7 @@ pub type TLabel = Label;
 /// Two register references with the same `(kind, index)` denote the
 /// same physical register slot.  Created lazily by
 /// [`GraphFlattener::getcolor`] which dedups Registers across the
-/// flatten pass — line-by-line port of `flatten.py:382-391` `getcolor`.
+/// flatten pass — line-by-line port of `flatten.py` `getcolor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Register {
     pub kind: RegKind,
@@ -55,7 +55,7 @@ impl Register {
         }
     }
 
-    /// `flatten.py:33 __repr__` — `'%%%s%d' % (self.kind[0], self.index)`.
+    /// `flatten.py __repr__` — `'%%%s%d' % (self.kind[0], self.index)`.
     pub fn repr(self) -> String {
         let prefix = match self.kind {
             RegKind::Int => 'i',
@@ -67,7 +67,7 @@ impl Register {
 }
 
 /// Either a [`Register`] or a [`Constant`] — the union returned by
-/// `flatten.py:382-391 getcolor` (Constants pass through unchanged;
+/// `flatten.py getcolor` (Constants pass through unchanged;
 /// Variables resolve to a `Register(kind, color)`).
 ///
 /// The line-by-line analogue of upstream's "anything that can appear
@@ -78,7 +78,7 @@ impl Register {
 ///
 /// `Const` carries the full [`Constant`] (not just its `ConstValue`)
 /// so the surrounding `concretetype` field — RPython
-/// `Constant.concretetype` (`flowspace/model.py:354-382`) — survives
+/// `Constant.concretetype` (`flowspace/model.py`) — survives
 /// the lowering.  Consumers reading kind must call
 /// [`constant_kind`] so they pick up `getkind(c.concretetype)` ahead
 /// of any value-variant guess.
@@ -88,7 +88,7 @@ pub enum RegOrConst {
     Const(Constant),
 }
 
-/// `flatten.py:35-51 class ListOfKind`.
+/// `flatten.py class ListOfKind`.
 ///
 /// Pyre's transformed call ops usually store the three per-kind lists as
 /// explicit `args_i` / `args_r` / `args_f` fields, but the upstream carrier is
@@ -187,7 +187,7 @@ pub enum FlatOp {
     },
     /// Copy value (for Phi-node resolution: Link.args → target.inputargs).
     ///
-    /// RPython `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
+    /// RPython `flatten.py` `self.emitline('%s_copy' % kind, v, "->", w)`.
     /// Upstream `getcolor(v)` returns `v` as-is for `Constant`
     /// (flatten.py:382-384), so `src` can be either a `Variable`-backed
     /// [`Register`] or a [`ConstValue`] literal — carried here as
@@ -198,8 +198,8 @@ pub enum FlatOp {
     /// Save a value into the per-kind tmpreg, to break a cycle in a
     /// link renaming. Always paired with a later `Pop`.
     ///
-    /// RPython `flatten.py:329` `self.emitline('%s_push' % kind, v)`.
-    /// Blackhole handler: `blackhole.py:661-669` `bhimpl_{int,ref,float}_push`.
+    /// RPython `flatten.py` `self.emitline('%s_push' % kind, v)`.
+    /// Blackhole handler: `blackhole.py` `bhimpl_{int,ref,float}_push`.
     /// Only register sources participate in cycle breaking, so `Push`
     /// is always [`Register`]-typed even though [`Move`] can copy
     /// constants.
@@ -207,8 +207,8 @@ pub enum FlatOp {
     /// Restore a value from the per-kind tmpreg into `dst`, completing
     /// a cycle break started by a prior `Push`.
     ///
-    /// RPython `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)`.
-    /// Blackhole handler: `blackhole.py:671-679` `bhimpl_{int,ref,float}_pop`.
+    /// RPython `flatten.py` `self.emitline('%s_pop' % kind, "->", w)`.
+    /// Blackhole handler: `blackhole.py` `bhimpl_{int,ref,float}_pop`.
     Pop(Register),
     /// RPython: `('last_exception', '->', result)`.  `dst` is always
     /// Int-kinded (the exception class identity); the [`Register`]
@@ -230,7 +230,7 @@ pub enum FlatOp {
     /// Re-raise the current exception.
     /// RPython: `('reraise',)`.
     Reraise,
-    /// RPython `flatten.py:130-138` `make_return`:
+    /// RPython `flatten.py` `make_return`:
     ///   `{kind}_return` with a single arg when the final block
     ///   returns a non-void value.  The operand is `getcolor(arg)` —
     ///   a [`Register`] (`Int`-kinded for `IntReturn`) or a
@@ -241,22 +241,22 @@ pub enum FlatOp {
     RefReturn(RegOrConst),
     /// RPython `flatten.py:137` `float_return` — Float-kinded operand.
     FloatReturn(RegOrConst),
-    /// RPython `flatten.py:136` `void_return` — blackhole at
+    /// RPython `flatten.py` `void_return` — blackhole at
     /// `blackhole.py:859-863`.
     VoidReturn,
-    /// RPython `flatten.py:139-143` `make_return` with a 2-inputarg
+    /// RPython `flatten.py` `make_return` with a 2-inputarg
     /// final block: emit `raise` on the `evalue` (second inputarg).
-    /// Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.  Ref-kinded.
+    /// Blackhole: `blackhole.py bhimpl_raise(excvalue)`.  Ref-kinded.
     Raise(RegOrConst),
-    /// RPython `flatten.py:146` / `:238` / `:293` `emitline('---')`.
+    /// RPython `flatten.py` / `:238` / `:293` `emitline('---')`.
     /// End-of-block marker placed after every terminator (return /
     /// raise / reraise / unreachable / goto-back-to-seen-block).
     /// Resets the alive set in liveness analysis (`liveness.py:55-57`)
     /// and is skipped during bytecode emission
     /// (`assembler.py:141-142`).
     EndOfBlock,
-    /// RPython `flatten.py:292` `emitline("unreachable")` and
-    /// `blackhole.py:962-964` `bhimpl_unreachable()`.
+    /// RPython `flatten.py` `emitline("unreachable")` and
+    /// `blackhole.py` `bhimpl_unreachable()`.
     ///
     /// Emitted after a switch with no `default` exit so that an
     /// unmatched switch value lands on a real opcode that raises
@@ -271,10 +271,10 @@ impl FlatOp {
     }
 }
 
-/// `flatten.py:30` `Register.kind` — `'int' | 'ref' | 'float'`.
+/// `flatten.py` `Register.kind` — `'int' | 'ref' | 'float'`.
 ///
 /// Pyre uses an enum instead of the upstream string literals; the
-/// canonical iteration order [`KINDS`] mirrors `flatten.py:59`
+/// canonical iteration order [`KINDS`] mirrors `flatten.py`
 /// `KINDS = ['int', 'ref', 'float']` so per-kind grouping in
 /// [`insert_renamings`] produces the same emission order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -284,7 +284,7 @@ pub enum RegKind {
     Float,
 }
 
-/// `flatten.py:59 KINDS = ['int', 'ref', 'float']`.
+/// `flatten.py KINDS = ['int', 'ref', 'float']`.
 pub const KINDS: [RegKind; 3] = [RegKind::Int, RegKind::Ref, RegKind::Float];
 
 /// Result of the flatten pass.
@@ -423,7 +423,7 @@ pub fn flatten_graph(
     flattener.ssarepr
 }
 
-/// `flatten.py:88-100 enforce_input_args(self)` — free-function port
+/// `flatten.py enforce_input_args(self)` — free-function port
 /// that mutates `regallocs` in place.
 ///
 /// **Rust-language adaptation** — RPython has `regallocs` as a dict
@@ -470,7 +470,7 @@ fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, Re
     }
 }
 
-/// `flatten.py:73-86 class GraphFlattener`.
+/// `flatten.py class GraphFlattener`.
 ///
 /// Holds the per-flatten state (graph, regalloc result, the SSARepr
 /// being built, the `seen_blocks` set for the recursive
@@ -491,7 +491,7 @@ pub struct GraphFlattener<'a> {
     /// `flatten.py:103 self.seen_blocks = {}` — set of block ids already
     /// emitted; second visits become `goto + ---` (back-edge).
     pub seen_blocks: std::collections::HashSet<BlockId>,
-    /// `flatten.py:81 self.registers = {}` — `(kind, color) -> Register`
+    /// `flatten.py self.registers = {}` — `(kind, color) -> Register`
     /// dedup cache populated lazily by [`Self::getcolor`].
     pub registers: HashMap<(RegKind, u16), Register>,
     /// Per-block canonical [`Label`].  `flatten.py` uses `Label(block)` /
@@ -530,7 +530,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `flatten.py:382-391 def getcolor(self, v)`.
+    /// `flatten.py def getcolor(self, v)`.
     ///
     /// ```py
     /// def getcolor(self, v):
@@ -628,7 +628,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `flatten.py:88-100 def enforce_input_args(self)` — method
+    /// `flatten.py def enforce_input_args(self)` — method
     /// shell that asserts the rotation already happened.
     ///
     /// The actual color-swapping body lives in the free function
@@ -663,13 +663,13 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `flatten.py:102-104 def generate_ssa_form(self)`.
+    /// `flatten.py def generate_ssa_form(self)`.
     pub fn generate_ssa_form(&mut self) {
         self.seen_blocks.clear();
         self.make_bytecode_block(self.graph.startblock, false);
     }
 
-    /// `flatten.py:106-128 def make_bytecode_block(self, block, handling_ovf=False)`.
+    /// `flatten.py def make_bytecode_block(self, block, handling_ovf=False)`.
     pub fn make_bytecode_block(&mut self, bid: BlockId, handling_ovf: bool) {
         let block = self.graph.block(bid);
         // `if block.exits == (): self.make_return(block.inputargs); return`.
@@ -721,7 +721,7 @@ impl<'a> GraphFlattener<'a> {
         self.insert_exits(bid, handling_ovf);
     }
 
-    /// `flatten.py:373-380 def serialize_op(self, op)`.
+    /// `flatten.py def serialize_op(self, op)`.
     ///
     /// In RPython this would `flatten_list(op.args)` and emit a single
     /// `(opname, *args[, '->', result])` tuple.  Pyre's [`SpaceOperation`]
@@ -743,7 +743,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `flatten.py:130-146 def make_return(self, args)`.
+    /// `flatten.py def make_return(self, args)`.
     pub fn make_return(&mut self, args: &[LinkArg]) {
         // `flatten.py:131-138`: read the kind from the return value's
         // `concretetype` (`getkind(v.concretetype)`), then emit the
@@ -807,7 +807,7 @@ impl<'a> GraphFlattener<'a> {
             }
             other => panic!("make_return: unexpected final-block inputarg count {other}"),
         }
-        // `flatten.py:146 self.emitline('---')`.
+        // `flatten.py self.emitline('---')`.
         self.emitline(FlatOp::EndOfBlock);
     }
 
@@ -822,7 +822,7 @@ impl<'a> GraphFlattener<'a> {
         }
     }
 
-    /// `flatten.py:148-155 def make_link(self, link, handling_ovf)`.
+    /// `flatten.py def make_link(self, link, handling_ovf)`.
     pub fn make_link(&mut self, link: &Link, handling_ovf: bool) {
         let target = self.graph.block(link.target);
         // `if (link.target.exits == ()
@@ -849,7 +849,7 @@ impl<'a> GraphFlattener<'a> {
         self.make_bytecode_block(link.target, handling_ovf);
     }
 
-    /// `flatten.py:306-334 def insert_renamings(self, link)`.
+    /// `flatten.py def insert_renamings(self, link)`.
     ///
     /// Emits the ordered series of `%s_copy` / `%s_push` / `%s_pop`
     /// ops that resolve a link's argument-to-inputarg renaming,
@@ -973,7 +973,7 @@ impl<'a> GraphFlattener<'a> {
                 }
             }
         }
-        // `flatten.py:334 self.generate_last_exc(link, link.target.inputargs)`.
+        // `flatten.py self.generate_last_exc(link, link.target.inputargs)`.
         self.generate_last_exc(link, target_inputargs);
     }
 
@@ -1016,7 +1016,7 @@ impl<'a> GraphFlattener<'a> {
         })
     }
 
-    /// `flatten.py:336-347 def generate_last_exc(self, link, inputargs)`.
+    /// `flatten.py def generate_last_exc(self, link, inputargs)`.
     pub fn generate_last_exc(&mut self, link: &Link, target_inputargs: &[Variable]) {
         if link.last_exception.is_none() && link.last_exc_value.is_none() {
             return;
@@ -1052,7 +1052,7 @@ impl<'a> GraphFlattener<'a> {
         )
     }
 
-    /// `flatten.py:157-175 def make_exception_link(self, link, handling_ovf)`.
+    /// `flatten.py def make_exception_link(self, link, handling_ovf)`.
     pub fn make_exception_link(&mut self, link: &Link, handling_ovf: bool) {
         debug_assert!(link.last_exception.is_some());
         debug_assert!(link.last_exc_value.is_some());
@@ -1078,7 +1078,7 @@ impl<'a> GraphFlattener<'a> {
         self.make_link(link, handling_ovf);
     }
 
-    /// `flatten.py:177-304 def insert_exits(self, block, handling_ovf=False)`.
+    /// `flatten.py def insert_exits(self, block, handling_ovf=False)`.
     pub fn insert_exits(&mut self, bid: BlockId, handling_ovf: bool) {
         let block = self.graph.block(bid);
         let exits = block.exits.clone();
@@ -1138,7 +1138,7 @@ impl<'a> GraphFlattener<'a> {
                 self.make_link(&exits[0], false);
                 return;
             }
-            // `flatten.py:220-238`: emit `catch_exception` then the
+            // `flatten.py`: emit `catch_exception` then the
             // normal-link body, then iterate the typed exception links.
             let normal_landing = Label(self.next_label);
             self.next_label += 1;
@@ -1328,7 +1328,7 @@ impl<'a> GraphFlattener<'a> {
         label
     }
 
-    /// `flatten.py:349-350 def emitline(self, *line)`.
+    /// `flatten.py def emitline(self, *line)`.
     fn emitline(&mut self, op: FlatOp) {
         self.ssarepr.insns.push(op);
     }
@@ -1340,12 +1340,12 @@ fn last_op_result(block: &crate::model::Block) -> Option<Variable> {
 
 // `overflow_jump_op` was promoted to a method on
 // [`GraphFlattener`] so it can resolve operand `(kind, color)` via
-// `getcolor` for line-by-line `flatten.py:382` parity.
+// `getcolor` for line-by-line `flatten.py` parity.
 
 /// Resolve `(kind, color)` for a Variable in the per-kind regalloc
 /// results.
 ///
-/// **RPython invariant** (`flatten.py:382` `getcolor`): the kind comes
+/// **RPython invariant** (`flatten.py` `getcolor`): the kind comes
 /// from `getkind(v.concretetype)` first, then `regallocs[kind]`
 /// supplies the color.  This helper is the regalloc-class scan
 /// fallback used when the Variable's `.concretetype` cell is
@@ -1378,7 +1378,7 @@ fn lookup_kind_color(
 
 // `generate_last_exc` is a method on [`GraphFlattener`] (see
 // `impl<'a> GraphFlattener<'a>::generate_last_exc`).  Mirrors
-// `flatten.py:336-347 def generate_last_exc(self, link, inputargs)`
+// `flatten.py def generate_last_exc(self, link, inputargs)`
 // line-by-line.
 
 /// `flatten.py:325` — kind char for a Variable derived from the
@@ -1465,7 +1465,7 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
 }
 
 fn overflow_error_instance() -> Constant {
-    // RPython `flatten.py:166-173 make_exception_link` builds the
+    // RPython `flatten.py make_exception_link` builds the
     // overflow reraise Constant with the upstream GcStruct pointer
     // type (`rclass.OBJECTPTR`) so downstream consumers reading
     // `getkind(c.concretetype)` see `'ref'`.  Pyre stamps the same
@@ -1482,9 +1482,9 @@ fn overflow_error_instance() -> Constant {
 
 // `insert_renamings` is a method on [`GraphFlattener`] (see
 // `impl<'a> GraphFlattener<'a>::insert_renamings`).  Mirrors
-// `flatten.py:306-334 def insert_renamings(self, link)` line-by-line.
+// `flatten.py def insert_renamings(self, link)` line-by-line.
 
-/// `flatten.py:395-414` `def reorder_renaming_list(frm, to):`.
+/// `flatten.py` `def reorder_renaming_list(frm, to):`.
 ///
 /// Line-by-line port. Given two equal-length sequences `frm[i] -> to[i]`,
 /// return an ordered list of `(src, dst)` pairs so that each move runs
@@ -1973,7 +1973,7 @@ mod tests {
 
         let mut regallocs = identity_regallocs(&graph, 8);
         let flat = flatten_graph(&graph, &mut regallocs);
-        // RPython `flatten.py:106-128 make_bytecode_block` falls through
+        // RPython `flatten.py make_bytecode_block` falls through
         // for unseen targets and only emits `goto, TLabel(block); ---`
         // when re-entering an already-emitted block.  In this loop only
         // the back-edge (body→header) becomes a `Jump` + `EndOfBlock`
@@ -2209,7 +2209,7 @@ mod tests {
             ),
             "typed exception link should materialize last_exception at target inputarg"
         );
-        // RPython `flatten.py:336-347 generate_last_exc` writes the
+        // RPython `flatten.py generate_last_exc` writes the
         // exception value into the TARGET inputarg's register, not the
         // prevblock-side `link.last_exc_value` Variable.
         assert!(
@@ -2425,7 +2425,7 @@ mod tests {
         );
     }
 
-    // `rpython/jit/codewriter/test/test_flatten.py:115-128` `test_reorder_renaming_list`.
+    // `rpython/jit/codewriter/test/test_flatten.py` `test_reorder_renaming_list`.
     #[test]
     fn reorder_renaming_list_empty() {
         let result: Vec<(Option<i32>, Option<i32>)> = reorder_renaming_list::<i32>(&[], &[]);
@@ -2805,7 +2805,7 @@ mod tests {
         );
     }
 
-    /// `format.py:45-50 getlabelname` — labels are numbered lazily, in
+    /// `format.py getlabelname` — labels are numbered lazily, in
     /// order of their first *printed* mention, and a label line counts as
     /// a mention just as much as a jump operand.  A loop is the shape
     /// that separates the two orders: the header's label line prints
@@ -2842,7 +2842,7 @@ mod tests {
         );
     }
 
-    /// `flatten.py:108-109` — a `make_link` whose target is the final
+    /// `flatten.py` — a `make_link` whose target is the final
     /// returnblock collapses into `make_return(link.args)`, so the
     /// flattened text never carries a separate `Jump` to the final
     /// block.  RPython `test_flatten.py:test_simple` shows the same

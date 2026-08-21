@@ -321,7 +321,7 @@ fn walker_read_long_payload<Sym: WalkSym>(
     payload
 }
 
-/// `intobject.py:494 _make_ovf2long`: the tail every int arithmetic fold shares
+/// `intobject.py _make_ovf2long`: the tail every int arithmetic fold shares
 /// once its own guard has pinned the promoting branch — `GUARD_OVERFLOW` for
 /// the `BINARY_OP` arm, `GUARD_VALUE` on the operand for unary negate. The tail
 /// is the elidable raw-int bigint helper (`rbigint.py:717/788/873`) under
@@ -332,7 +332,7 @@ fn walker_read_long_payload<Sym: WalkSym>(
 ///
 /// The box needs no preceding fits_int guard. `newlong_from_rbigint`
 /// (objspace.py:316-320) demotes through `rbigint.toint()`, whose
-/// `numdigits() > MAX_DIGITS_THAT_CAN_FIT_IN_INT` test (rbigint.py:470) that
+/// `numdigits() > MAX_DIGITS_THAT_CAN_FIT_IN_INT` test (rbigint.py) that
 /// guard already answers: the helper is the *exact* int-pair sum / difference /
 /// product, so a value that just overflowed a machine int cannot fit one back.
 /// The same fold is what lets `try_walker_specialize_binary_op_long_int_pow`
@@ -387,7 +387,7 @@ fn walker_emit_ovf2long_box<Sym: WalkSym>(
 /// #61: walker-native int specialization for the `UNARY_NEGATIVE` residual
 /// (oopspec [`majit_ir::PyreHelperKind::UnaryNegative`]).  `-x` on an exact
 /// int is `0 - x`; the object-space `neg` promotes only `-INT_MIN` to a
-/// `W_LongObject` (`intobject.py:628` `descr_neg` → `_make_ovf2long`).  Since
+/// `W_LongObject` (`intobject.py` `descr_neg` → `_make_ovf2long`).  Since
 /// majit has no overflow-checked unary negate, the fold expresses `-x` as
 /// `IntSubOvf(0, x)` behind a `GUARD_CLASS INT`, reusing the binary-sub
 /// overflow discipline in both directions: a record value other than `INT_MIN`
@@ -671,7 +671,7 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
         }
     }
 
-    // pyjitpl.py:1881 handle_possible_overflow_error follows the concrete
+    // pyjitpl.py handle_possible_overflow_error follows the concrete
     // Add/Sub/Mul outcome. The overflowing arm mirrors intobject.py:494
     // _make_ovf2long: guard_overflow, call the elidable raw-int bigint helper
     // (rbigint.py:717/788/873), and inline the W_LongObject box instead of
@@ -1008,7 +1008,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
     }
 
     // The box needs no preceding fits_int guard. `_make_generic_descr_binop`
-    // and `descr_sub` (longobject.py:304-349) wrap with
+    // and `descr_sub` (longobject.py) wrap with
     // `W_LongObject(intop(...))`, and the interpreter arms they model
     // (`long_add`, `long_sub`, `long_mul`, `long_bitand`, `long_bitor`,
     // `long_bitxor`) wrap with `w_long_new`. Neither side demotes a
@@ -1034,14 +1034,14 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
 /// Walker-native `W_LongObject // W_IntObject` / `%` specialization for the
 /// `BINARY_OP` helper residual_call.
 ///
-/// `pypy/objspace/std/longobject.py:424,441 _make_descr_binop` selects
+/// `pypy/objspace/std/longobject.py _make_descr_binop` selects
 /// `_int_floordiv` / `_int_mod` when the right operand is a `W_IntObject`.
 /// The two legs differ in their *result* representation, and that difference
 /// is the whole point of specialising them apart:
-///   * `_int_floordiv` (`longobject.py:417-423`) → `rbigint.int_floordiv` →
+///   * `_int_floordiv` (`longobject.py`) → `rbigint.int_floordiv` →
 ///     a bigint quotient, boxed as a `W_LongObject` — the same shape
 ///     [`try_walker_specialize_binary_op_long_int_shift`] emits.
-///   * `_int_mod` (`longobject.py:434-440`) → `rbigint.int_mod_int_result` →
+///   * `_int_mod` (`longobject.py`) → `rbigint.int_mod_int_result` →
 ///     `space.newint`: the remainder of a long by a machine int always fits a
 ///     machine int, so this leg allocates **no** result bigint and boxes a
 ///     plain `W_IntObject`.
@@ -1214,7 +1214,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
                 walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
             }
             // The box needs no preceding fits_int guard. `_floordiv`/
-            // `_int_floordiv` (longobject.py:409-424) wrap with `newlong` and
+            // `_int_floordiv` (longobject.py) wrap with `newlong` and
             // `long_floordiv` with `w_long_new`, so the quotient is a
             // `W_LongObject` whatever its magnitude, and the inline box carries
             // the payload by pointer — nothing about it varies with the digit
@@ -1267,7 +1267,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
 /// Walker-native `W_LongObject ** W_IntObject` specialization for the
 /// `BINARY_OP` helper residual_call.
 ///
-/// `longobject.py:206-231 descr_pow` keeps a `W_IntObject` exponent unwrapped
+/// `longobject.py descr_pow` keeps a `W_IntObject` exponent unwrapped
 /// (`exp_bigint` stays `None`) and calls `rbigint.int_pow`; only a long
 /// exponent reaches `rbigint.pow`. `long_pow` (`descroperation.rs`) reaches
 /// that call past four short-circuits — a negative exponent goes to the float
@@ -1591,7 +1591,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
     }
 
     // The box needs no preceding fits_int guard: `_int_lshift` wraps with
-    // `W_LongObject(...)` and `_int_rshift` with `newlong` (longobject.py:383,
+    // `W_LongObject(...)` and `_int_rshift` with `newlong` (longobject.py,
     // 402), and `long_lshift`/`long_rshift` both end in `w_long_new`. Neither
     // demotes a machine-sized result — `newlong` only reaches
     // `W_SmallLongObject`, which `withsmalllong` leaves off — so declining on
@@ -1907,7 +1907,7 @@ pub(crate) enum SpecialisedPairKind {
 }
 
 /// Identify the three classes produced by
-/// `specialisedtupleobject.py:169-179 makespecialisedtuple2`.
+/// `specialisedtupleobject.py makespecialisedtuple2`.
 pub(crate) fn specialised_pair_kind(
     seq_type: *const pyre_object::pyobject::PyType,
 ) -> Option<SpecialisedPairKind> {
@@ -1931,8 +1931,8 @@ pub(crate) fn specialised_pair_kind(
 /// specialisation's class once, then read `value0` / `value1` directly instead
 /// of leaving three opaque `CALL_MAY_FORCE` residuals in the loop.
 ///
-/// `objspace.py:519-523 fixedview` reaches `tolist()` for every
-/// `W_AbstractTupleObject`, and `specialisedtupleobject.py:32,58-64 tolist`
+/// `objspace.py fixedview` reaches `tolist()` for every
+/// `W_AbstractTupleObject`, and `specialisedtupleobject.py tolist`
 /// unrolls over `_immutable_fields_` value slots, so upstream traces the whole
 /// unpack inline and the optimizer virtualizes the pair away. Both arity-2
 /// layouts are covered here because `makespecialisedtuple2`
@@ -1977,7 +1977,7 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     };
     // `objspace.py:507-541 StdObjSpace.{unpackiterable,fixedview}` takes an
     // exact tuple straight to its immutable `wrappeditems` list; and
-    // `pyopcode.py:889 UNPACK_SEQUENCE` calls `fixedview_unroll`, so a
+    // `pyopcode.py UNPACK_SEQUENCE` calls `fixedview_unroll`, so a
     // constant item count exposes each tuple item directly to the trace.
     // Preserve that shape for pyre's split `UnpackSequence` / `UnpackItem`
     // helpers.  In particular, `zip` produces an ordinary array-backed tuple
@@ -2146,14 +2146,14 @@ fn walker_guard_specialised_pair_class<Sym: WalkSym>(
 
 /// Read slot `index` (0 or 1) of an arity-2 tuple specialisation whose class
 /// the caller has already guarded, applying that slot's `wraps[i]`
-/// (`specialisedtupleobject.py:26-27`, and `:134-142 getitem`, which unrolls
+/// (`specialisedtupleobject.py`, and `:134-142 getitem`, which unrolls
 /// `iter_n` to the matching `value%s`).
 ///
 /// `Ok(None)` declines: the `ii` / `ff` slots need the authentic box for its
 /// identity, and that execution can fail.
 ///
 /// The `ff` arm currently has no producer to serve. Upstream builds `Cls_ff`
-/// from `makespecialisedtuple2` (`specialisedtupleobject.py:178`) and from
+/// from `makespecialisedtuple2` (`specialisedtupleobject.py`) and from
 /// `specialized_zip_2_lists` (`:230`); pyre does not port the latter, and
 /// `w_tuple_new` (`tupleobject.rs`) sends a plain-float pair to `Cls_oo`
 /// instead so that `(x, x)` keeps the exact `x` object. It is kept because it
@@ -2482,7 +2482,7 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
 
     if field == TracebackWalkField::TbFrame {
         // `descr_get_tb_frame` also runs `frame.mark_as_escaped()`
-        // (`pyframe.py:176 mark_as_escaped`): the reference it hands out has to
+        // (`pyframe.py mark_as_escaped`): the reference it hands out has to
         // keep the frame materialised.  `set_escaped` ORs `FLAG_ESCAPED` into
         // the `flags` byte, so the trace reads that byte, sets the bit, and
         // stores it back.
@@ -2773,7 +2773,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let slot = crate::state::trace_mapdict_storage_getitem(ctx.trace_ctx, block, index);
         let value = match unboxed {
             None => slot,
-            // `_prim_direct_read` (mapdict.py:600-601): the storage slot holds
+            // `_prim_direct_read` (mapdict.py): the storage slot holds
             // the shared longlong block, and the value is `items[listindex]`.
             // Keeping the boxing in the trace lets an immediate integer
             // consumer virtualize it away.
@@ -5099,7 +5099,7 @@ fn is_w_compares_by_value(tp: *const pyre_object::pyobject::PyType) -> bool {
 /// `compare_op_tag_for_opname` assigns those two opnames.
 ///
 /// `IS_OP` is `space.is_w(w_1, w_2)` plus a `newbool`
-/// (`pyopcode.py:1078-1092`), and `is_w` (`baseobjspace.py:833`) dispatches
+/// (`pyopcode.py:1078-1092`), and `is_w` (`baseobjspace.py`) dispatches
 /// to `w_two.is_w(space, w_one)`, whose default is pointer identity.  Two
 /// tiers, mirroring `FASTPATHS_SAME_BOXES`' `ptr_eq`/`ptr_ne` entries
 /// (`pyjitpl.py:326-336`):
@@ -5245,7 +5245,7 @@ fn walker_write_const_bool_result<Sym: WalkSym>(
 
 /// MAKE_FUNCTION inline emission: replace the
 /// `jit_make_function_from_globals(globals, code)` residual with the
-/// `NewWithVtable` + `SetfieldGc` set `function.py:47-57 Function.__init__`
+/// `NewWithVtable` + `SetfieldGc` set `function.py Function.__init__`
 /// performs, so a `def` in a loop body virtualizes away instead of allocating a
 /// `Function` per iteration.
 ///
@@ -5610,7 +5610,7 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
     walker_guard_class(ctx, op_pc, rhs, long_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
     walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
-    // `_make_descr_cmp` (longobject.py:383-391) compares `self.num` against
+    // `_make_descr_cmp` (longobject.py) compares `self.num` against
     // `w_other.num`, so the two payload reads are trace ops rather than work
     // hidden inside the callee. Spelling them out is also what keeps a
     // `W_LongObject` this same trace built from having to escape into the
@@ -5942,7 +5942,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     // what makes the probe non-raising: `UnicodeDictStrategy` hands the dict to
     // `ObjectDictStrategy` the moment a non-exact-str key is stored, so while
     // it holds, every stored key is an exact str and the comparisons are WTF-8
-    // byte equality (`dictmultiobject.py:1286+` `r_dict(unicode_eq,
+    // byte equality (`dictmultiobject.py+` `r_dict(unicode_eq,
     // unicode_hash)`).
     let canonical_dict = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
     let dict_unicode = !canonical_dict.is_null()
@@ -6390,7 +6390,7 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
 }
 
 /// SUBSCRIPT arm for the arity-2 tuple specialisations
-/// (`specialisedtupleobject.py:134-142 getitem`), the analogue of
+/// (`specialisedtupleobject.py getitem`), the analogue of
 /// [`try_walker_specialize_subscr_tuple`] for a receiver whose items are the
 /// inline `value0` / `value1` slots instead of a `wrappeditems` block.
 ///
@@ -6803,7 +6803,7 @@ enum BuiltinLenSource {
     /// `W_ListObject.length()` → `strategy.length` (rlist.py). Carries the
     /// storage-strategy id the read is guarded on.
     ListStrategy(i64),
-    /// `EmptyListStrategy.length()` returns zero (`listobject.py:1131-1132`).
+    /// `EmptyListStrategy.length()` returns zero (`listobject.py`).
     /// The strategy still needs a guard because a reused list may transition
     /// to typed or object storage after tracing.
     EmptyList,
@@ -6816,10 +6816,10 @@ enum BuiltinLenSource {
     /// `tupleobject.py` carries no separate length field, so the length is
     /// `arraylen_gc(wrappeditems)`.
     TupleArrayLen,
-    /// `functional.py:496-497 W_Range.descr_len` returns the precomputed
+    /// `functional.py W_Range.descr_len` returns the precomputed
     /// wrapped `self.w_length` field unchanged.
     RangeField,
-    /// `specialisedtupleobject.py:54-55 length()` returns the constant
+    /// `specialisedtupleobject.py length()` returns the constant
     /// `typelen`.
     PairArity,
 }
@@ -7001,7 +7001,7 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     if let Some(exact_w_class) = exact_w_class {
         walker_guard_exact_w_class(ctx, op.pc, list_op, exact_w_class)?;
     }
-    // `functional.py:496-497 W_Range.descr_len` is already a wrapped-field
+    // `functional.py W_Range.descr_len` is already a wrapped-field
     // read.  Reuse that box directly; unlike the scalar length sources below,
     // there is nothing to unwrap and box again.  A virtual range's cached
     // field makes this fold to its existing virtual wrapped-int value.
@@ -7096,7 +7096,7 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
             crate::descr::bytes_len_descr(),
         ),
         BuiltinLenSource::RangeField => unreachable!("range returned its wrapped length above"),
-        // `specialisedtupleobject.py:54-55 length()` returns the constant
+        // `specialisedtupleobject.py length()` returns the constant
         // `typelen`; there is no field to read, so the class guard above is
         // the whole proof and the box below folds to a constant.
         BuiltinLenSource::PairArity => ctx.trace_ctx.const_int(concrete_len as i64),
@@ -7270,7 +7270,7 @@ fn walker_range_decline<Sym: WalkSym>(
     Ok(None)
 }
 
-/// Emit the machine-int trace of `functional.py:42-53 compute_range_length`
+/// Emit the machine-int trace of `functional.py compute_range_length`
 /// for a path whose converted bounds all fit signed machine words.  Each
 /// source conditional becomes the guard chosen by the recording values; the
 /// overflow guards side-exit to the interpreter's wrapped-int implementation.
@@ -7423,7 +7423,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     }
 
     // Every non-int bound has been resolved and statically preflighted before
-    // this first emission.  `functional.py:461-474 W_Range.descr_new` applies
+    // this first emission.  `functional.py W_Range.descr_new` applies
     // `space.index` independently to start/stop/step; mirror that order and
     // retain each returned box as an intermediate feeding the constructor.
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
@@ -7817,13 +7817,13 @@ enum FrameLocalsBuiltin {
 
 /// Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
 /// frame: model
-/// `pyframe.py:539-583 fast2locals` in the trace instead of residualizing
-/// `interp_inspect.py:7-11 locals` → `pyframe.py:525-529 getdictscope`.
+/// `pyframe.py fast2locals` in the trace instead of residualizing
+/// `interp_inspect.py locals` → `pyframe.py getdictscope`.
 ///
 /// `fast2locals` is `@jit.unroll_safe`, and `policy.py:60-67` cancels
 /// `contains_loop` for unroll_safe graphs, so upstream LOOKS INSIDE it: each
 /// `self.locals_cells_stack_w[i]` lowers to `getarrayitem_vable_r`
-/// (`jtransform.py:1877 do_fixed_list_getitem`), answered from
+/// (`jtransform.py do_fixed_list_getitem`), answered from
 /// `metainterp.virtualizable_boxes`, and `jtransform.py:2164-2172
 /// rewrite_op_jit_force_virtualizable` returns `[]` for a read the tracer is
 /// inside.  There is no residual and no virtualizable force anywhere on the
@@ -7901,7 +7901,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         return Ok(None);
     }
     // `vars()` with no argument delegates straight to `builtin_locals`
-    // (`app_inspect.py:21-24`), so both names share the fold; `vars(obj)` and
+    // (`app_inspect.py`), so both names share the fold; `vars(obj)` and
     // `dir(obj)` carry an extra operand and are already excluded by the arity
     // gate.
     let fold = if pyre_interpreter::builtins::is_builtin_locals_function(concrete_callable)
@@ -7968,7 +7968,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
-    // `fast2locals` opens on `self.getorcreatedebug()` (pyframe.py:555) and
+    // `fast2locals` opens on `self.getorcreatedebug()` (pyframe.py) and
     // writes into ITS `w_locals`: the mapping is the FRAME's, carried across
     // calls, so a key written through `f_locals` outlives every `fast2locals`
     // that does not name it.  `debugdata` is a virtualizable field, so the read
@@ -8168,7 +8168,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // 'pycode']`), so its address is a constant for the compiled loop and
     // carries no guard of its own.
     let code_const = ctx.trace_ctx.const_int(code_ptr as i64);
-    // `d = self.getorcreatedebug()` — pyframe.py:555.  An absent payload has no
+    // `d = self.getorcreatedebug()` — pyframe.py.  An absent payload has no
     // `w_locals` to read, so the guard pins that direction and the fresh-dict
     // arm below stands in for the materialisation.
     let debugdata_present = debugdata_ref.as_usize() != 0;
@@ -8203,7 +8203,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     }
     let mut dict_op = match field_op.filter(|_| frame_owned) {
         Some(op_ref) => op_ref,
-        // pyframe.py:557 `self.space.newdict(instance=True)` — the mapping
+        // pyframe.py `self.space.newdict(instance=True)` — the mapping
         // `fast2locals` would have materialised, built here instead of
         // modelling the store back into the debug payload.
         None => ctx.trace_ctx.call_ref_typed_with_effect(
@@ -8340,12 +8340,12 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 }
 
 /// `sys._getframe()` / `sys._getframe(0)` at the top walk level: publish the
-/// portal virtualizable itself instead of residualizing `vm.py:42-54 getframe`.
+/// portal virtualizable itself instead of residualizing `vm.py getframe`.
 ///
 /// `getframe` is `@jit.look_inside_iff(lambda space, depth:
 /// jit.isconstant(depth))` (`pypy/module/sys/vm.py:41`), so a constant depth is
 /// traced THROUGH: at the portal, `ec.gettopframe_nohidden()` is a vref read
-/// that `pyjitpl.py:2153-2172 _do_jit_force_virtual` answers with
+/// that `pyjitpl.py _do_jit_force_virtual` answers with
 /// `virtualizable_boxes[-1]` under a `ptr_eq` + `implement_guard_value`; in an
 /// inline MIFrame its live `JitVirtualRef` is known non-standard and follows
 /// the residual `jit_force_virtual` path, which `virtualize.py` removes after
@@ -8358,7 +8358,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// Pyre residualizes the same walk as one opaque `bh_call_fn(_getframe,
 /// PY_NULL, depth)` `CallMayForce`, and [`pyre_interpreter::module::sys::vm::getframe`]'s
 /// `force_frame` on the frame it returns — the stand-in for the injection
-/// `rvirtualizable.py:49-53 hook_access_field` performs and pyre's rtyper
+/// `rvirtualizable.py hook_access_field` performs and pyre's rtyper
 /// cannot build — clears `TOKEN_TRACING_RESCALL` inside that call whenever the
 /// returned frame is the traced one, which `tracing_after_residual_call` reads
 /// as an escape (`VableEscapedDuringResidualCall`).  At depth 0 the returned
@@ -8460,8 +8460,8 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     } else {
         (None, 0)
     };
-    // `vm.py:51 audit(space, "sys._getframe", [f])`.  With no hook installed
-    // `audit` takes its `holder.hooks_w is None` early-out (`vm.py:481`) and the
+    // `vm.py audit(space, "sys._getframe", [f])`.  With no hook installed
+    // `audit` takes its `holder.hooks_w is None` early-out (`vm.py`) and the
     // event costs nothing; the emission below pins that read so a later
     // `addaudithook` revokes this loop instead of silently missing the event.
     // With a hook already installed the event reaches `trigger_audit_events`,
@@ -8529,7 +8529,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     };
     // A hop whose `f_backref` is a live `JitVirtualRef` names another INLINED
     // frame, and this walk publishes a forced pair only for the level it owns
-    // (`pyjitpl.py:3349-3367 vrefs_after_residual_call`).  The emitted
+    // (`pyjitpl.py vrefs_after_residual_call`).  The emitted
     // `jit_force_virtual` then reaches a vref the optimizer materialises with a
     // null `forced` field, so the hop lands on whatever that read produces
     // rather than on the caller's frame.  Scan the record-time chain for one
@@ -8672,7 +8672,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             code_op,
             majit_ir::Value::Ref(majit_ir::GcRef(code_ptr as usize)),
         );
-        // `optimizer.py:464-480` reaches for `descr.get_parent_descr()` only
+        // `optimizer.py` reaches for `descr.get_parent_descr()` only
         // when arg0 carries no pointer info yet; a preceding `GUARD_CLASS`
         // gives it `info.InstancePtrInfo()` and that lookup does not run here.
         // The PyCode field group also carries its parent for paths that reach
@@ -8717,9 +8717,9 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         disarm_folded_inline_callee_after_escape(ctx, op.pc)?;
     }
 
-    // `f.mark_as_escaped()` — vm.py:54.  `escaped` is not one of the six fields
+    // `f.mark_as_escaped()` — vm.py.  `escaped` is not one of the six fields
     // `interp_jit.py:25-30` declares, so the store cannot force; it is
-    // load-bearing at `executioncontext.py:99-106 leave`, which forces the
+    // load-bearing at `executioncontext.py leave`, which forces the
     // leaving frame's own vref only for a frame that escaped.  Upstream traces
     // it as the ordinary `setfield_gc` on the flag, so it is emitted as the
     // read/or/store the `tb_frame` fold above already uses — an opaque call
@@ -8743,7 +8743,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // effect here too — the residual would have applied it before returning.
     unsafe { (*cur_ptr).mark_as_escaped() };
 
-    // `audit(space, "sys._getframe", [f])` — vm.py:51.  The gate above resolved
+    // `audit(space, "sys._getframe", [f])` — vm.py.  The gate above resolved
     // it to the no-hook early-out, so all that is emitted is the marker for the
     // read that reached that conclusion.
     walker_pin_audit_hooks(ctx, op.pc, audit_holder)?;
@@ -9586,7 +9586,7 @@ pub(crate) fn try_walker_specialize_builtin_divmod<Sym: WalkSym>(
             && std::ptr::eq((*o).w_class, int_typeobj)
     };
     if !is_exact_int(lhs_obj) || !is_exact_int(rhs_obj) {
-        // `_make_descr_binop(_divmod, _int_divmod)` (longobject.py:459) keeps a
+        // `_make_descr_binop(_divmod, _int_divmod)` (longobject.py) keeps a
         // dedicated long/int arm; every other operand shape stays generic.
         return spec_gate("builtin_divmod_long_int", || {
             try_walker_specialize_builtin_divmod_long_int(
@@ -9695,9 +9695,9 @@ fn walker_guard_builtin_callable_identity<Sym: WalkSym>(
     Ok(())
 }
 
-/// `divmod(W_LongObject, W_IntObject)` — `longobject.py:451 _int_divmod`.
+/// `divmod(W_LongObject, W_IntObject)` — `longobject.py _int_divmod`.
 ///
-/// One `rbigint.int_divmod` (rbigint.py:1050 `@jit.elidable`) produces both
+/// One `rbigint.int_divmod` (rbigint.py `@jit.elidable`) produces both
 /// halves, so the trace is the upstream shape: a single `CallR` returning the
 /// RPython `tuple2`, two `GetfieldGcR` off it, then `newlong` ×2 and the
 /// arity-2 tuple — all three allocations trace-visible, so the shipped oo
@@ -11114,7 +11114,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         }
     }
 
-    // `interp_exceptions.py:993-998 W_SystemExit.descr_init` stores one
+    // `interp_exceptions.py W_SystemExit.descr_init` stores one
     // argument verbatim and several as the tuple selected by `newtuple`.
     // Settle the multi-argument representation before emitting any guards so
     // an unsupported unboxed pair can still decline without leaving trace
@@ -12053,7 +12053,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
         .heap_cache_mut()
         .class_now_known(obj_op, physical_type);
 
-    // `typeobject.py:293-301` promotes the version tag before an MRO lookup.
+    // `typeobject.py` promotes the version tag before an MRO lookup.
     // Pinning the receiver type covers both the named descriptor resolution
     // and the default-`__setattr__` answer.
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
@@ -13678,7 +13678,7 @@ pub(crate) fn try_walker_specialize_compare_op_float<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // floatobject.py:139-146 — an int wider than a double represents exactly
+    // floatobject.py — an int wider than a double represents exactly
     // is compared through its bigint, which this fold cannot express.  Decline
     // so the residual call decides it; the in-range case emits the same
     // precondition as a guard (`exact_int` below).

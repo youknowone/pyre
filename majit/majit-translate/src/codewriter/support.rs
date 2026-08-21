@@ -9,7 +9,7 @@
 //! and consumed by [`decode_builtin_call`] when argnames are
 //! registered via `CallControl::mark_oopspec_argnames`.
 //!
-//! [`INLINE_CALLS_TO`] mirrors `support.py:444-449 inline_calls_to`
+//! [`INLINE_CALLS_TO`] mirrors `support.py inline_calls_to`
 //! verbatim — the four entries upstream's `find_all_graphs` BFS seeds
 //! so the inliner can always reach `int_abs` / `int_floordiv` /
 //! `int_mod` / `ll_math.ll_math_sqrt`.  Pyre does NOT synthesise a
@@ -39,13 +39,13 @@
 //! [`CallControl::cache_builtin_func_for_spec`] (RPython
 //! `rtyper._builtin_func_for_spec_cache`).
 //!
-//! [`setup_extra_builtin`] mirrors `support.py:683-693` verbatim — the
+//! [`setup_extra_builtin`] mirrors `support.py` verbatim — the
 //! same `_ll_<n>_<name>` template, the same `build` prefix when `extra`
 //! is supplied, the same KeyError fallback (pyre collapses
 //! `globals()[name]` / `getattr(LLtypeHelpers, name).im_func` to a single
 //! canonical fnaddr lookup, because pyre's helper namespace is flat).
 //!
-//! [`decode_builtin_call`] mirrors `support.py:755-765` line by line.
+//! [`decode_builtin_call`] mirrors `support.py` line by line.
 //! Upstream walks `op.args[0].value._obj` to read the helper's
 //! `.oopspec` attribute (the spec string set by `@rlib.jit.oopspec`);
 //! pyre has no `_obj` analogue on a Rust function pointer, so the
@@ -62,7 +62,7 @@ use crate::parse::CallPath;
 
 use majit_ir::value::Type;
 
-/// `support.py:444-449 inline_calls_to`.
+/// `support.py inline_calls_to`.
 ///
 /// `(oopspec_name, ll_args, ll_res)` triples whose graphs the BFS
 /// seeds so the optimizer can always look inside.  Mirrors upstream
@@ -74,7 +74,7 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
     ("ll_math.ll_math_sqrt", &[Type::Float], Type::Float),
 ];
 
-/// `support.py:755-765 decode_builtin_call(op)`.
+/// `support.py decode_builtin_call(op)`.
 ///
 /// Line-by-line port.  Upstream:
 ///
@@ -104,7 +104,7 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
 /// [`CallControl::get_oopspec`] — same information as
 /// `op.args[0].value._obj.oopspec`, different host vehicle.  The spec
 /// string is split at `(` to extract the bare name, matching
-/// upstream's `parse_oopspec` first step (`support.py:707
+/// upstream's `parse_oopspec` first step (`support.py
 /// operation_name, args = ll_func.oopspec.split('(', 1)`).
 ///
 /// `opargs = op.args[1:]`: upstream drops the funcptr at args[0] and
@@ -153,7 +153,7 @@ pub fn decode_builtin_call(
             // `:759 get_call_oopspec_opargs(fnobj, opargs)` →
             // `:707 operation_name, args = ll_func.oopspec.split('(', 1)`.
             // Pyre's analogue: the spec string is registered on the
-            // target via `mark_oopspec` (rlib/jit.py:250 `@oopspec(spec)`
+            // target via `mark_oopspec` (rlib/jit.py `@oopspec(spec)`
             // semantics); the bare name is the part before `(`.
             let spec = call_control.get_oopspec(target).unwrap_or_else(|| {
                 panic!(
@@ -223,14 +223,14 @@ pub fn decode_builtin_call(
     }
 }
 
-/// `support.py:697-699 class Index` — placeholder for a positional
+/// `support.py class Index` — placeholder for a positional
 /// arg.  `normalize_opargs` walks an `argtuple` and replaces each
 /// `Index(n)` with `opargs[n]` (passthrough), while non-Index entries
 /// become constant injections.  Pyre's pure-function port emits this
 /// enum from [`parse_oopspec`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum NormalizeSlot {
-    /// `support.py:713 argname2index[argname] = Index(n)` — positional
+    /// `support.py argname2index[argname] = Index(n)` — positional
     /// passthrough.  `n` is the 0-based slot in the callee's
     /// argname list.
     Index(usize),
@@ -252,7 +252,7 @@ pub enum NormalizeSlot {
     ConstFloat(u64),
 }
 
-/// `support.py:717-724 normalize_opargs` return-shape.
+/// `support.py normalize_opargs` return-shape.
 ///
 /// Upstream returns a list where each entry is either an existing
 /// `Variable` reference (`opargs[obj.n]`) or a fresh
@@ -263,21 +263,21 @@ pub enum NormalizeSlot {
 /// graph-builder access at the callsite.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NormalizedArg {
-    /// `support.py:721 result.append(opargs[obj.n])` — pass an
+    /// `support.py result.append(opargs[obj.n])` — pass an
     /// existing `Variable` through verbatim (upstream `Hlvalue::Variable`
-    /// at `flowspace/model.py:140` identity).
+    /// at `flowspace/model.py` identity).
     Pass(crate::flowspace::model::Variable),
-    /// `support.py:723 result.append(Constant(obj, lltype.Signed))`
+    /// `support.py result.append(Constant(obj, lltype.Signed))`
     /// — caller materialises an `OpKind::ConstInt(v)` op carrying
     /// this value.
     ConstInt(i64),
-    /// `support.py:723 result.append(Constant(obj, lltype.Float))`
+    /// `support.py result.append(Constant(obj, lltype.Float))`
     /// — caller materialises an `OpKind::ConstFloat(bits)` op
     /// carrying this value (`bits` is the f64 bit pattern).
     ConstFloat(u64),
 }
 
-/// `support.py:701-715 parse_oopspec(fnobj)` — pure-function port.
+/// `support.py parse_oopspec(fnobj)` — pure-function port.
 ///
 /// ```python
 /// def parse_oopspec(fnobj):
@@ -350,7 +350,7 @@ pub fn parse_oopspec(spec: &str, argnames: &[&str]) -> (String, Vec<NormalizeSlo
         return (operation_name, Vec::new());
     }
     // `support.py:712 nb_args = len(argnames)`
-    // `support.py:713 argname2index = dict(zip(argnames, [Index(n) for n in range(nb_args)]))`
+    // `support.py argname2index = dict(zip(argnames, [Index(n) for n in range(nb_args)]))`
     let argname2index: std::collections::HashMap<&str, usize> = argnames
         .iter()
         .enumerate()
@@ -423,7 +423,7 @@ fn parse_literal_slot(
     );
 }
 
-/// `support.py:717-724 normalize_opargs(argtuple, opargs)` — pure-function port.
+/// `support.py normalize_opargs(argtuple, opargs)` — pure-function port.
 ///
 /// ```python
 /// def normalize_opargs(argtuple, opargs):
@@ -447,10 +447,10 @@ pub fn normalize_opargs(
     argtuple
         .iter()
         .map(|slot| match slot {
-            // `support.py:720-721 if isinstance(obj, Index):
+            // `support.py if isinstance(obj, Index):
             //                        result.append(opargs[obj.n])`
             NormalizeSlot::Index(n) => NormalizedArg::Pass(opargs[*n].clone()),
-            // `support.py:722-723 else: result.append(Constant(obj, lltype.typeOf(obj)))`
+            // `support.py else: result.append(Constant(obj, lltype.typeOf(obj)))`
             // — one branch per lltype Constant flavour.
             NormalizeSlot::ConstInt(v) => NormalizedArg::ConstInt(*v),
             NormalizeSlot::ConstFloat(bits) => NormalizedArg::ConstFloat(*bits),
@@ -487,7 +487,7 @@ pub struct BuiltinFuncSpecCacheKey {
     pub extrakey: Option<String>,
 }
 
-/// `support.py:767-808 builtin_func_for_spec` return value.
+/// `support.py builtin_func_for_spec` return value.
 ///
 /// Upstream returns the 2-tuple `(c_func, LIST_OR_DICT)` where `c_func`
 /// is a `Constant` whose `.value._obj` is a `_ptr` carrying both the
@@ -566,7 +566,7 @@ pub fn setup_extra_builtin(
 ) -> (String, i64, NeedResultType) {
     // `support.py:684`: name = '_ll_%d_%s' % (nb_args, oopspec_name.replace('.', '_'))
     let mut name = format!("_ll_{}_{}", nb_args, oopspec_name.replace('.', "_"));
-    // `support.py:685-686`: if extra is not None: name = 'build' + name
+    // `support.py`: if extra is not None: name = 'build' + name
     if extra.is_some() {
         name = format!("build{}", name);
     }
@@ -587,7 +587,7 @@ pub fn setup_extra_builtin(
          upstream `support.py:687-690` resolves the wrapper through the rtyper-bound \
          `LLtypeHelpers` namespace, which pyre exposes via `CallControl::lookup_function_fnaddr`.",
     );
-    // `support.py:691-692`: if extra is not None: wrapper = wrapper(*extra)
+    // `support.py`: if extra is not None: wrapper = wrapper(*extra)
     //
     // Upstream calls the resolved wrapper as a Python factory to
     // produce the specialized helper.  Pyre cannot run a Rust
@@ -604,7 +604,7 @@ pub fn setup_extra_builtin(
     // canonical key without paying for the factory-registry layer.
     let factory_hit = match (extra, extrakey) {
         (Some(_), Some(k)) => cc.lookup_builtin_factory(&name, k),
-        // `support.py:769 assert (extra is None) == (extrakey is None)`
+        // `support.py assert (extra is None) == (extrakey is None)`
         // is checked at the `builtin_func_for_spec` boundary; both
         // None here means the upstream `wrapper(*extra)` step is
         // skipped, and both Some without a registered factory falls
@@ -703,7 +703,7 @@ pub fn builtin_func_for_spec(
     extra: Option<&[String]>,
     extrakey: Option<&str>,
 ) -> BuiltinFuncSpec {
-    // `support.py:769`: assert (extra is None) == (extrakey is None).
+    // `support.py`: assert (extra is None) == (extrakey is None).
     // The workspace defines no `[profile.release]`, so `debug_assertions`
     // is off in the profile that actually runs the codewriter (the
     // `pyre-jit-trace` build script) — a `debug_assert_eq!` here would be
@@ -881,7 +881,7 @@ mod tests {
 
     #[test]
     fn setup_extra_builtin_prepends_build_when_extra_supplied() {
-        // `support.py:685-686 if extra is not None: name = 'build' + name`
+        // `support.py if extra is not None: name = 'build' + name`
         let mut cc = CallControl::new();
         cc.register_function_fnaddr(CallPath::from_segments(["build_ll_0_dict_make"]), 1);
         let extra: Vec<String> = vec!["foo".to_string()];
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "canonical helper `_ll_2_int_mod` is not registered")]
     fn setup_extra_builtin_panics_when_canonical_unregistered() {
-        // `support.py:687-690`: when both `globals()[name]` and
+        // `support.py`: when both `globals()[name]` and
         // `getattr(LLtypeHelpers, name).im_func` lookups miss, RPython
         // raises `AttributeError`.  Pyre mirrors the raise via panic so
         // missing wiring surfaces loudly at setup time.
@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn setup_extra_builtin_reads_need_result_type_registry() {
-        // `support.py:782-794`: `getattr(impl, 'need_result_type', False)`.
+        // `support.py`: `getattr(impl, 'need_result_type', False)`.
         // Pyre's host registers the flag against the canonical name; the
         // setup_extra_builtin lookup must observe it.
         let mut cc = CallControl::new();
@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn setup_extra_builtin_uses_factory_registry_when_extra_supplied() {
-        // `support.py:691-692 wrapper = wrapper(*extra)`: pyre's
+        // `support.py wrapper = wrapper(*extra)`: pyre's
         // factory registry returns the specialised fnaddr that the
         // host pre-built for `(canonical_name, extrakey)`.  The
         // generic `build_ll_2_dict_iter` canonical-name fallback is
@@ -1077,7 +1077,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "extra and extrakey must be supplied together")]
     fn builtin_func_for_spec_rejects_mismatched_extra_extrakey() {
-        // `support.py:769 assert (extra is None) == (extrakey is None)`
+        // `support.py assert (extra is None) == (extrakey is None)`
         let mut cc = CallControl::new();
         cc.register_function_fnaddr(CallPath::from_segments(["_ll_1_int_abs"]), 0xa);
         let extra: Vec<String> = vec!["a".to_string()];
@@ -1167,7 +1167,7 @@ mod tests {
         // `support.py:707 ll_func.oopspec.split(...)` raises
         // `AttributeError` when the wrapper has no `oopspec`.  Pyre
         // mirrors via panic so callers gating on `CallKind::Builtin`
-        // (per `jtransform.py:484 handle_builtin_call`) catch wiring
+        // (per `jtransform.py handle_builtin_call`) catch wiring
         // gaps loudly.
         let cc = CallControl::new();
         let (op, _args) = make_call_op(
@@ -1224,7 +1224,7 @@ mod tests {
 
     #[test]
     fn parse_oopspec_resolves_positional_identifiers_to_index_slots() {
-        // `support.py:713-714 argname2index = dict(zip(argnames, [Index(n) for n in
+        // `support.py argname2index = dict(zip(argnames, [Index(n) for n in
         // range(nb_args)])); argtuple = eval(args, argname2index)` — the
         // dominant case where the spec's identifiers match the callee's
         // parameter names in order.
@@ -1293,7 +1293,7 @@ mod tests {
 
     #[test]
     fn normalize_opargs_passes_through_index_slots() {
-        // `support.py:720-721 if isinstance(obj, Index):
+        // `support.py if isinstance(obj, Index):
         //                        result.append(opargs[obj.n])` — identity
         // pass for positional placeholders.
         let argtuple = vec![
@@ -1361,7 +1361,7 @@ mod tests {
 
     #[test]
     fn decode_builtin_call_emits_const_int_slot_for_integer_literal() {
-        // Mirrors `test_support.py:15-38 test_decode_builtin_call_nomethod`:
+        // Mirrors `test_support.py test_decode_builtin_call_nomethod`:
         //   `myfoobar(i, marker, c)` with `oopspec = 'foobar(2, c, i)'`.
         //   `decode_builtin_call(op)` returns `("foobar", [Constant(2),
         //   vc, vi])`.  Pyre's `NormalizedArg::ConstInt(2)` is the

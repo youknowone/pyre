@@ -53,10 +53,10 @@ use super::classdesc::ClassDef;
 pub use crate::translator::rtyper::llannotation::{SomeInteriorPtr, SomeLLADTMeth};
 
 // ---------------------------------------------------------------------------
-// State / TLS (model.py:44-49).
+// State / TLS (model.py).
 // ---------------------------------------------------------------------------
 
-/// RPython `class State(object)` (model.py:44-48).
+/// RPython `class State(object)` (model.py).
 ///
 /// ```python
 /// class State(object):
@@ -72,9 +72,9 @@ pub use crate::translator::rtyper::llannotation::{SomeInteriorPtr, SomeLLADTMeth
 /// attributes at runtime, so the slot is declared explicitly here and
 /// `Bookkeeper::enter` / `leave` set / clear it.
 pub struct State {
-    /// RPython `State.check_str_without_nul` (model.py:47).
+    /// RPython `State.check_str_without_nul` (model.py).
     pub check_str_without_nul: bool,
-    /// RPython `State.allow_int_to_float` (model.py:48).
+    /// RPython `State.allow_int_to_float` (model.py).
     pub allow_int_to_float: bool,
     /// RPython `TLS.bookkeeper` (set dynamically by `Bookkeeper.enter`).
     pub bookkeeper: Option<Rc<Bookkeeper>>,
@@ -97,7 +97,7 @@ impl State {
 }
 
 thread_local! {
-    /// RPython `TLS = State()` (model.py:49).
+    /// RPython `TLS = State()` (model.py).
     ///
     /// A single process-wide `State` singleton upstream — modelled as
     /// a `thread_local!` here because `Rc<Bookkeeper>` is `!Send`. The
@@ -199,7 +199,7 @@ impl fmt::Display for KnownType {
     }
 }
 
-/// RPython `commonbase(cls1, cls2)` (model.py:818-826), specialized to
+/// RPython `commonbase(cls1, cls2)` (model.py), specialized to
 /// the Rust port's [`KnownType`] carrier for live Python type objects.
 pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
     if cls1 == cls2 {
@@ -249,10 +249,10 @@ fn same_struct_identity(a: &str, b: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// SomeObject base — RPython `model.py:51-125`.
+// SomeObject base — RPython `model.py`.
 // ---------------------------------------------------------------------------
 
-/// RPython `class SomeObject(object)` (model.py:51-125).
+/// RPython `class SomeObject(object)` (model.py).
 ///
 /// Acts both as the "universal" annotation (`object`) and as the
 /// shared base-state carried by every subclass via composition. The
@@ -307,16 +307,16 @@ pub trait SomeObjectTrait {
     /// RPython `s.immutable` class attribute.
     fn immutable(&self) -> bool;
 
-    /// RPython `s.is_constant()` (model.py:102-104). True iff the
+    /// RPython `s.is_constant()` (model.py). True iff the
     /// underlying const slot carries a wrapped Python value.
     fn is_constant(&self) -> bool;
 
-    /// RPython `s.is_immutable_constant()` (model.py:106-107).
+    /// RPython `s.is_immutable_constant()` (model.py).
     fn is_immutable_constant(&self) -> bool {
         self.immutable() && self.is_constant()
     }
 
-    /// RPython `s.can_be_none()` (model.py:118-119).
+    /// RPython `s.can_be_none()` (model.py).
     fn can_be_none(&self) -> bool;
 }
 
@@ -324,7 +324,7 @@ pub trait SomeObjectTrait {
 // Concrete Some* variants (A4.1 shells).
 // ---------------------------------------------------------------------------
 
-/// RPython `class SomeType(SomeObject)` (model.py:138-144).
+/// RPython `class SomeType(SomeObject)` (model.py).
 /// Stands for a `type` value; upstream sets `can_be_none = False`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeType {
@@ -360,7 +360,7 @@ impl SomeObjectTrait for SomeType {
     }
 }
 
-/// RPython `class SomeFloat(SomeObject)` (model.py:164-183).
+/// RPython `class SomeFloat(SomeObject)` (model.py).
 /// Stands for a float (or, when `allow_int_to_float` is set, an int
 /// promoted to float).
 #[derive(Clone, Debug)]
@@ -424,7 +424,7 @@ impl SomeObjectTrait for SomeFloat {
     }
 }
 
-/// RPython `class SomeSingleFloat(SomeObject)` (model.py:186-193).
+/// RPython `class SomeSingleFloat(SomeObject)` (model.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeSingleFloat {
     pub base: SomeObject,
@@ -459,7 +459,7 @@ impl SomeObjectTrait for SomeSingleFloat {
     }
 }
 
-/// RPython `class SomeLongFloat(SomeObject)` (model.py:196-203).
+/// RPython `class SomeLongFloat(SomeObject)` (model.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeLongFloat {
     pub base: SomeObject,
@@ -494,7 +494,7 @@ impl SomeObjectTrait for SomeLongFloat {
     }
 }
 
-/// RPython `class SomeInteger(SomeFloat)` (model.py:206-224).
+/// RPython `class SomeInteger(SomeFloat)` (model.py).
 ///
 /// Carries `nonneg` / `unsigned` flags and a `knowntype` that can be
 /// `int` or one of the `r_uint` / `r_long` family. For A4.1 we stub
@@ -509,7 +509,7 @@ pub struct SomeInteger {
     pub unsigned: bool,
     /// Branch-refinement facts for an integer-valued exitswitch, keyed
     /// by the case constant ([`ExitCaseKey::Int`]). Upstream defines
-    /// `set_knowntypedata` only on `SomeBool` (model.py:236), since
+    /// `set_knowntypedata` only on `SomeBool` (model.py), since
     /// `SomeBool(SomeInteger)` and its only multi-way narrowing comes
     /// from boolean `is`/`isinstance`/comparison ops. The exitswitch
     /// consumer reads it generically — `getattr(annotation,
@@ -563,7 +563,7 @@ impl SomeInteger {
         }
     }
 
-    /// RPython `SomeBool.set_knowntypedata` (model.py:236-242), reused
+    /// RPython `SomeBool.set_knowntypedata` (model.py), reused
     /// for an integer discriminant. Same set-once assertion and
     /// falsy-inner-dict pruning as [`SomeBool::set_knowntypedata`].
     pub fn set_knowntypedata(&mut self, mut data: KnownTypeData) {
@@ -599,13 +599,13 @@ impl SomeObjectTrait for SomeInteger {
     }
 }
 
-/// RPython `class SomeBool(SomeInteger)` (model.py:227-242).
+/// RPython `class SomeBool(SomeInteger)` (model.py).
 ///
 /// Upstream `SomeBool.__init__` takes no args — the class attributes
 /// fix `knowntype = bool`, `nonneg = True`, `unsigned = False`.
 /// Key for [`KnownTypeData`] — the branch's `exitcase` value, the
 /// typed Rust projection of RPython's generic exitcase key
-/// (`knowntypedata.get(link.exitcase, {})`, annrpython.py:571). A bool
+/// (`knowntypedata.get(link.exitcase, {})`, annrpython.py). A bool
 /// exitswitch keys by the branch truth value; an integer exitswitch —
 /// e.g. an enum discriminant `SwitchInt` — keys by the case constant.
 /// RPython keys directly by the Python exitcase object (`True`/`False`/
@@ -623,14 +623,14 @@ pub enum ExitCaseKey {
 pub type KnownTypeData =
     std::collections::HashMap<ExitCaseKey, std::collections::HashMap<Rc<Variable>, SomeValue>>;
 
-/// `knowntypedata` (set_knowntypedata in model.py:236-242) stores the
+/// `knowntypedata` (set_knowntypedata in model.py) stores the
 /// branch-refinement facts for a bool-valued variable: a map from the
 /// boolean truth value to the variables whose annotation can be
 /// narrowed (and what to narrow to) in that branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeBool {
     pub base: SomeObject,
-    /// RPython `self.knowntypedata` (model.py:236-242). Absent when
+    /// RPython `self.knowntypedata` (model.py). Absent when
     /// `set_knowntypedata` was never called or when all branches were
     /// pruned. Upstream uses a `defaultdict(dict)` keyed by `bool`;
     /// the Rust port keeps the inner map empty when there is nothing
@@ -646,7 +646,7 @@ impl SomeBool {
         }
     }
 
-    /// RPython `SomeBool.set_knowntypedata` (model.py:236-242).
+    /// RPython `SomeBool.set_knowntypedata` (model.py).
     ///
     /// Assertion + falsy-inner-dict pruning: drop any truth key whose
     /// inner dict is empty, then store only if the outer dict is
@@ -685,7 +685,7 @@ impl SomeObjectTrait for SomeBool {
     }
 }
 
-/// RPython `class SomeStringOrUnicode(SomeObject)` (model.py:245-285).
+/// RPython `class SomeStringOrUnicode(SomeObject)` (model.py).
 ///
 /// Shared state for `SomeString`, `SomeUnicodeString`, `SomeByteArray`.
 /// A4.1 stores the two flag bits directly; the full `nonnulify` /
@@ -709,7 +709,7 @@ impl SomeStringOrUnicode {
     }
 }
 
-/// RPython `class SomeString(SomeStringOrUnicode)` (model.py:288-294).
+/// RPython `class SomeString(SomeStringOrUnicode)` (model.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeString {
     pub inner: SomeStringOrUnicode,
@@ -780,12 +780,12 @@ impl SomeObjectTrait for SomeUnicodeString {
     }
 }
 
-/// RPython `class SomeStringBuilder(SomeObject)` (`rlib/rstring.py:890`).
+/// RPython `class SomeStringBuilder(SomeObject)` (`rlib/rstring.py`).
 ///
 /// The annotator shape for a `StringBuilder()` value.  It carries no
 /// payload; its `method_*` annotations describe the builder call surface,
 /// and (once wired) the rtyper binds it to `StringBuilderRepr` via
-/// `rtyper_makerepr` (`rlib/rstring.py:919-921`).
+/// `rtyper_makerepr` (`rlib/rstring.py`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeStringBuilder {
     pub base: SomeObject,
@@ -798,7 +798,7 @@ impl SomeStringBuilder {
         }
     }
 
-    /// `method_append(self, s_str)` (rstring.py:891-894) → `s_None`.
+    /// `method_append(self, s_str)` (rstring.py) → `s_None`.
     pub fn method_append(&self, s_str: &SomeValue) -> SomeValue {
         assert!(
             matches!(
@@ -844,13 +844,13 @@ impl SomeStringBuilder {
         s_none()
     }
 
-    /// `method_getlength(self)` (rstring.py:913-914) →
+    /// `method_getlength(self)` (rstring.py) →
     /// `SomeInteger(nonneg=True)`.
     pub fn method_getlength(&self) -> SomeValue {
         SomeValue::Integer(SomeInteger::new(true, false))
     }
 
-    /// `method_build(self)` (rstring.py:916-917) →
+    /// `method_build(self)` (rstring.py) →
     /// `SomeString(can_be_None=False)`.
     pub fn method_build(&self) -> SomeValue {
         SomeValue::String(SomeString::new(false, false))
@@ -863,7 +863,7 @@ impl Default for SomeStringBuilder {
     }
 }
 
-/// RPython `class SomeUnicodeBuilder(SomeObject)` (`rlib/rstring.py:930`).
+/// RPython `class SomeUnicodeBuilder(SomeObject)` (`rlib/rstring.py`).
 /// The `UnicodeBuilder()` mirror of [`SomeStringBuilder`]; the char /
 /// string arguments and `method_build` result are the unicode variants.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -878,7 +878,7 @@ impl SomeUnicodeBuilder {
         }
     }
 
-    /// `method_append(self, s_str)` (rstring.py:931-934) → `s_None`.
+    /// `method_append(self, s_str)` (rstring.py) → `s_None`.
     pub fn method_append(&self, s_str: &SomeValue) -> SomeValue {
         assert!(
             matches!(
@@ -927,13 +927,13 @@ impl SomeUnicodeBuilder {
         s_none()
     }
 
-    /// `method_getlength(self)` (rstring.py:953-954) →
+    /// `method_getlength(self)` (rstring.py) →
     /// `SomeInteger(nonneg=True)`.
     pub fn method_getlength(&self) -> SomeValue {
         SomeValue::Integer(SomeInteger::new(true, false))
     }
 
-    /// `method_build(self)` (rstring.py:956-957) →
+    /// `method_build(self)` (rstring.py) →
     /// `SomeUnicodeString(can_be_None=False)`.
     pub fn method_build(&self) -> SomeValue {
         SomeValue::UnicodeString(SomeUnicodeString::new(false, false))
@@ -1018,7 +1018,7 @@ impl SomeObjectTrait for SomeByteArray {
     }
 }
 
-/// RPython `class SomeChar(SomeString)` (model.py:309-315).
+/// RPython `class SomeChar(SomeString)` (model.py).
 ///
 /// A character is a length-1 string with `can_be_None = False`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1094,10 +1094,10 @@ impl SomeObjectTrait for SomeUnicodeCodePoint {
 // ---------------------------------------------------------------------------
 // Container-family Some* variants (A4.4).
 //
-// upstream: `class SomeList(SomeObject)` (model.py:332-354),
-// `class SomeTuple(SomeObject)` (model.py:357-371),
-// `class SomeDict(SomeObject)` / `SomeOrderedDict` (model.py:374-416),
-// `class SomeIterator(SomeObject)` (model.py:419-428).
+// upstream: `class SomeList(SomeObject)` (model.py),
+// `class SomeTuple(SomeObject)` (model.py),
+// `class SomeDict(SomeObject)` / `SomeOrderedDict` (model.py),
+// `class SomeIterator(SomeObject)` (model.py).
 //
 // The upstream `listdef.ListDef` / `dictdef.DictDef` classes live in
 // rpython/annotator/listdef.py + dictdef.py and carry classdef /
@@ -1115,7 +1115,7 @@ pub use super::listdef::ListDef;
 /// [`super::dictdef::DictDef`].
 pub use super::dictdef::DictDef;
 
-/// RPython `class SomeList(SomeObject)` (model.py:332-354).
+/// RPython `class SomeList(SomeObject)` (model.py).
 /// Homogeneous list of unknown length.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SomeList {
@@ -1205,7 +1205,7 @@ impl SomeObjectTrait for SomeTuple {
     }
 }
 
-/// RPython `class SomeDict(SomeObject)` (model.py:374-402) — after the
+/// RPython `class SomeDict(SomeObject)` (model.py) — after the
 /// `SomeDict = SomeOrderedDict` assignment at model.py:416, every dict
 /// annotation is ordered. We collapse that into a single `SomeDict`
 /// variant per CLAUDE.md parity rule #1.
@@ -1239,10 +1239,10 @@ impl SomeObjectTrait for SomeDict {
     }
 }
 
-/// RPython `SomeDict = SomeOrderedDict` (model.py:416).
+/// RPython `SomeDict = SomeOrderedDict` (model.py).
 pub type SomeOrderedDict = SomeDict;
 
-/// RPython `class SomeIterator(SomeObject)` (model.py:419-428).
+/// RPython `class SomeIterator(SomeObject)` (model.py).
 /// Wraps a container's element annotation; `variant` captures the
 /// upstream `*variant` tuple (e.g. `"items"`, `"keys"`, `"values"`
 /// for dict iterators).
@@ -1345,7 +1345,7 @@ pub enum DescKind {
     MethodOfFrozen,
 }
 
-/// RPython `class SomeInstance(SomeObject)` (model.py:431-462).
+/// RPython `class SomeInstance(SomeObject)` (model.py).
 ///
 /// Equality on `classdef` is Python-identity (`Rc::ptr_eq`) matching
 /// upstream's `cls is other_cls` semantics — the manual `PartialEq`
@@ -1357,7 +1357,7 @@ pub struct SomeInstance {
     /// (upstream: `SomeInstance(classdef=None)`).
     pub classdef: Option<Rc<RefCell<ClassDef>>>,
     pub can_be_none: bool,
-    /// RPython `self.flags = flags` (model.py:438).
+    /// RPython `self.flags = flags` (model.py).
     ///
     /// Upstream is a Python `dict` whose values are the booleans /
     /// None sentinels produced by `binaryop.py:679`
@@ -1416,7 +1416,7 @@ impl SomeObjectTrait for SomeInstance {
     }
 }
 
-/// RPython `class SomeException(SomeObject)` (model.py:482-492). Set of
+/// RPython `class SomeException(SomeObject)` (model.py). Set of
 /// exception classdefs obeying `type(exc) in self.classes`.
 ///
 /// Equality on `classdefs` is identity-based (`Rc::ptr_eq` per entry,
@@ -1442,7 +1442,7 @@ impl SomeException {
         }
     }
 
-    /// RPython `SomeException.as_SomeInstance()` (model.py:490-491).
+    /// RPython `SomeException.as_SomeInstance()` (model.py).
     pub fn as_some_instance(&self) -> SomeValue {
         let instances: Vec<SomeValue> = self
             .classdefs
@@ -1491,14 +1491,14 @@ impl SomeObjectTrait for SomeException {
     }
 }
 
-/// RPython `class SomePBC(SomeObject)` (model.py:514-601). "Prebuilt
+/// RPython `class SomePBC(SomeObject)` (model.py). "Prebuilt
 /// constant" — a set of descriptions representing a closed family of
 /// callables / classes / frozen instances.
 ///
 /// `descriptions` carries real [`super::description::DescEntry`]
 /// values (one per upstream Desc subclass, each wrapping an
 /// `Rc<RefCell<…>>` of the concrete description instance). The
-/// constructor runs [`simplify`] and the model.py:527-553
+/// constructor runs [`simplify`] and the model.py
 /// `knowntype` / `self.const = desc.pyobj` / multi-desc kind
 /// enforcement branches (ClassDesc / MethodOfFrozenDesc).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1546,7 +1546,7 @@ impl SomePBC {
             can_be_none,
             subset_of,
         };
-        // upstream model.py:526 — `self.simplify()` (dedup +
+        // upstream model.py — `self.simplify()` (dedup +
         // `getKind()` mixed-kind check). The constructor is infallible, so
         // a mixed-kind error here is not propagated at construction;
         // instead it surfaces at every use through the propagating
@@ -1557,7 +1557,7 @@ impl SomePBC {
         // differs. `simplify_desc_set` still runs on the homogeneous
         // (Ok) path.
         let _ = pbc.simplify();
-        // upstream model.py:527-531 — `knowntype = reduce(commonbase,
+        // upstream model.py — `knowntype = reduce(commonbase,
         // [x.knowntype for x in descriptions])`.
         pbc.base.knowntype = pbc
             .descriptions
@@ -1568,7 +1568,7 @@ impl SomePBC {
             })
             .reduce(commonbase)
             .unwrap_or(KnownType::Object);
-        // upstream model.py:532-537 — single-desc pyobj const hack:
+        // upstream model.py — single-desc pyobj const hack:
         //     if len(descriptions) == 1 and not can_be_None:
         //         desc, = descriptions
         //         if desc.pyobj is not None:
@@ -1620,12 +1620,12 @@ impl SomePBC {
         pbc
     }
 
-    /// RPython `SomePBC.any_description()` (model.py:555-556).
+    /// RPython `SomePBC.any_description()` (model.py).
     pub(crate) fn any_description(&self) -> Option<&super::description::DescEntry> {
         self.descriptions.values().next()
     }
 
-    /// RPython `SomePBC.getKind()` (model.py:558-566).
+    /// RPython `SomePBC.getKind()` (model.py).
     ///
     /// Returns the common [`DescKind`] of every description in the
     /// PBC. Upstream raises `AnnotatorError("mixing several kinds of
@@ -1646,7 +1646,7 @@ impl SomePBC {
             .ok_or_else(|| AnnotatorError::new("empty SomePBC descriptions"))
     }
 
-    /// RPython `SomePBC.simplify()` (model.py:568-574).
+    /// RPython `SomePBC.simplify()` (model.py).
     ///
     /// ```python
     /// def simplify(self):
@@ -1659,7 +1659,7 @@ impl SomePBC {
         // upstream: `kind.simplify_desc_set(self.descriptions)` —
         // polymorphic dispatch on `type(desc)`. Desc.simplify_desc_set
         // (description.py:180-182) is the staticmethod no-op base;
-        // MethodDesc overrides it (description.py:473-519).
+        // MethodDesc overrides it (description.py).
         let kind = self.get_kind()?;
         if self.descriptions.len() > 1 {
             match kind {
@@ -1719,7 +1719,7 @@ impl SomePBC {
                 super::description::MethodDesc::consider_call_site(&mds, args, s_result, op_key)?;
             }
             DescKind::Class => {
-                // classdesc.py:853-902 (phase 1 only — __init__
+                // classdesc.py (phase 1 only — __init__
                 // recursion deferred, see ClassDesc::consider_call_site
                 // for the full story).
                 let cds: Vec<_> = descs.iter().filter_map(|d| d.as_class()).collect();
@@ -1750,7 +1750,7 @@ impl SomePBC {
         Ok(())
     }
 
-    /// RPython `SomePBC.nonnoneify()` (model.py:587-589).
+    /// RPython `SomePBC.nonnoneify()` (model.py).
     pub fn nonnoneify(&self) -> SomePBC {
         SomePBC::with_subset(
             self.descriptions.values().cloned(),
@@ -1759,7 +1759,7 @@ impl SomePBC {
         )
     }
 
-    /// RPython `SomePBC.noneify()` (model.py:591-593).
+    /// RPython `SomePBC.noneify()` (model.py).
     pub fn noneify(&self) -> SomePBC {
         SomePBC::with_subset(
             self.descriptions.values().cloned(),
@@ -1769,7 +1769,7 @@ impl SomePBC {
     }
 }
 
-/// RPython `class SomeConstantType(SomePBC)` (model.py:620-626).
+/// RPython `class SomeConstantType(SomePBC)` (model.py).
 ///
 /// The Rust representation uses `SomePBC` plus `const_box` for this
 /// subclass state; exposing the upstream name keeps the annotator and
@@ -1796,7 +1796,7 @@ impl SomeObjectTrait for SomePBC {
     }
 }
 
-/// RPython `class SomeNone(SomeObject)` (model.py:603-617).
+/// RPython `class SomeNone(SomeObject)` (model.py).
 /// Zero-size marker type — every `SomeNone` value is the constant
 /// `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1835,7 +1835,7 @@ impl SomeObjectTrait for SomeNone {
     }
 }
 
-/// RPython `class SomeProperty(SomeObject)` (model.py:672-682).
+/// RPython `class SomeProperty(SomeObject)` (model.py).
 ///
 /// Used only as the annotation carrier for immutable `property`
 /// descriptors returned by `bookkeeper.immutablevalue`.
@@ -1872,7 +1872,7 @@ impl SomeObjectTrait for SomeProperty {
 }
 
 /// Re-export of [`SomePtr`], which RPython declares at
-/// `rpython/rtyper/lltypesystem/lltype.py:1520` (`class SomePtr(SomeObject)`).
+/// `rpython/rtyper/lltypesystem/lltype.py` (`class SomePtr(SomeObject)`).
 /// The struct lives next to its upstream home in
 /// [`crate::translator::rtyper::lltypesystem::lltype`]; this re-export
 /// lets the `SomeValue::Ptr` variant and local call-sites keep
@@ -1880,9 +1880,9 @@ impl SomeObjectTrait for SomeProperty {
 pub use crate::translator::rtyper::lltypesystem::lltype::SomePtr;
 
 /// Re-export of [`SomeAddress`], which RPython declares at
-/// `rpython/rtyper/lltypesystem/llmemory.py:573` (`class SomeAddress(SomeObject)`).
+/// `rpython/rtyper/lltypesystem/llmemory.py` (`class SomeAddress(SomeObject)`).
 pub use crate::translator::rtyper::lltypesystem::llmemory::SomeAddress;
-/// `rpython/rtyper/lltypesystem/llmemory.py:592` (`class SomeTypedAddressAccess(SomeObject)`).
+/// `rpython/rtyper/lltypesystem/llmemory.py` (`class SomeTypedAddressAccess(SomeObject)`).
 pub use crate::translator::rtyper::lltypesystem::llmemory::SomeTypedAddressAccess;
 
 /// RPython `SomeObject.needs_sandboxing` side-attribute payload
@@ -1893,7 +1893,7 @@ pub use crate::translator::rtyper::lltypesystem::llmemory::SomeTypedAddressAcces
 /// registration path flags the callable as sandboxed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxingPayload {
-    /// Matches upstream `s_func.name` (extfunc.py:11).
+    /// Matches upstream `s_func.name` (extfunc.py).
     pub name: String,
     /// Matches upstream `s_func.args_s` — parameter annotations.
     pub args_s: Vec<SomeValue>,
@@ -1901,7 +1901,7 @@ pub struct SandboxingPayload {
     pub s_result: Box<SomeValue>,
 }
 
-/// RPython `class SomeBuiltin(SomeObject)` (model.py:629-645).
+/// RPython `class SomeBuiltin(SomeObject)` (model.py).
 ///
 /// Stands for a built-in function or method. `analyser` in upstream is
 /// a callable hook; Rust port carries an opaque identifier because
@@ -1919,7 +1919,7 @@ pub struct SomeBuiltin {
     pub methodname: Option<String>,
     /// RPython `hasattr(s_func, 'needs_sandboxing')` payload
     /// (policy.py:85 gate). Set on external-function annotations when
-    /// `config.translation.sandbox` is enabled (extfunc.py:100).
+    /// `config.translation.sandbox` is enabled (extfunc.py).
     /// `None` for all non-sandboxed callables.
     pub needs_sandboxing: Option<SandboxingPayload>,
 }
@@ -1955,7 +1955,7 @@ impl SomeObjectTrait for SomeBuiltin {
     }
 }
 
-/// RPython `class SomeBuiltinMethod(SomeBuiltin)` (model.py:648-660).
+/// RPython `class SomeBuiltinMethod(SomeBuiltin)` (model.py).
 ///
 /// Bound-method variant of [`SomeBuiltin`]. Upstream models this as a
 /// distinct subclass whose constructor requires both the receiver and
@@ -1970,7 +1970,7 @@ pub struct SomeBuiltinMethod {
     ///
     /// Stored as an `Rc` (rather than a `Box`) so that `rtyper_makekey`
     /// can hash the receiver by its stable pointer identity — upstream's
-    /// `id(self.s_self)` (rbuiltin.py:41-50) reuses the same Python
+    /// `id(self.s_self)` (rbuiltin.py) reuses the same Python
     /// object for every clone, and `Box` addresses would move on every
     /// `.clone()` of `SomeBuiltinMethod`.
     pub s_self: Rc<SomeValue>,
@@ -2022,7 +2022,7 @@ impl SomeObjectTrait for SomeBuiltinMethod {
     }
 }
 
-/// RPython `class SomeImpossibleValue(SomeObject)` (model.py:662-669).
+/// RPython `class SomeImpossibleValue(SomeObject)` (model.py).
 /// Stored here as an explicit struct variant so `is_immutable_constant`
 /// / `annotationcolor` can be accessed consistently; the enum
 /// `SomeValue::Impossible` remains as a zero-state convenience alias.
@@ -2060,7 +2060,7 @@ impl SomeObjectTrait for SomeImpossibleValue {
     }
 }
 
-/// RPython `class SomeWeakRef(SomeObject)` (model.py:700-709).
+/// RPython `class SomeWeakRef(SomeObject)` (model.py).
 /// Stands for a `weakref.ref` whose target has a known classdef.
 ///
 /// Equality on `classdef` is identity-based (`Rc::ptr_eq`).
@@ -2105,7 +2105,7 @@ impl SomeObjectTrait for SomeWeakRef {
     }
 }
 
-/// RPython `class SomeTypeOf(SomeType)` (model.py:146-149). Used by
+/// RPython `class SomeTypeOf(SomeType)` (model.py). Used by
 /// `typeof(args_v)` to track a type derived from a specific variable.
 ///
 /// Upstream stores the actual `args_v` list — `Variable` objects —
@@ -2156,7 +2156,7 @@ impl SomeObjectTrait for SomeTypeOf {
 /// `Impossible` variant that anchors the lattice bottom.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SomeValue {
-    /// RPython `class SomeImpossibleValue(SomeObject)` (model.py:627 —
+    /// RPython `class SomeImpossibleValue(SomeObject)` (model.py —
     /// lands fully in A4.5). Placeholder until then; no state.
     Impossible,
     Object(SomeObject),
@@ -2254,7 +2254,7 @@ impl SomeValueTag {
             T::Float => &[T::Float, T::Object],
             T::SingleFloat => &[T::SingleFloat, T::Object],
             T::LongFloat => &[T::LongFloat, T::Object],
-            // Type chain: SomeTypeOf < SomeType < SomeObject (model.py:146-149).
+            // Type chain: SomeTypeOf < SomeType < SomeObject (model.py).
             T::TypeOf => &[T::TypeOf, T::Type, T::Object],
             T::Type => &[T::Type, T::Object],
             // String family shares a SomeStringOrUnicode base upstream; dispatch
@@ -2360,14 +2360,14 @@ impl SomeValue {
         SomeValue::Object(SomeObject::default())
     }
 
-    /// RPython `s.contains(other)` (model.py:94-100). Delegates to the
+    /// RPython `s.contains(other)` (model.py). Delegates to the
     /// module-level [`contains`] helper once [`union`] is available
     /// (A4.6).
     pub fn contains(&self, other: &SomeValue) -> bool {
         contains(self, other)
     }
 
-    /// RPython `s.noneify()` (model.py:121-122 plus per-subclass
+    /// RPython `s.noneify()` (model.py plus per-subclass
     /// overrides).
     pub fn noneify(&self) -> Result<SomeValue, UnionError> {
         match self {
@@ -2389,7 +2389,7 @@ impl SomeValue {
                 s.subset_of.clone(),
             ))),
             SomeValue::WeakRef(s) => Ok(SomeValue::WeakRef(SomeWeakRef::new(s.classdef.clone()))),
-            // rstring.py:1231/1271 — SomeStringBuilder / SomeUnicodeBuilder
+            // rstring.py/1271 — SomeStringBuilder / SomeUnicodeBuilder
             // `noneify(self)` returns `self`.
             SomeValue::StringBuilder(_) | SomeValue::UnicodeBuilder(_) => Ok(self.clone()),
             _ => Err(UnionError {
@@ -2400,7 +2400,7 @@ impl SomeValue {
         }
     }
 
-    /// RPython `s.nonnoneify()` (model.py:124-125 plus per-subclass
+    /// RPython `s.nonnoneify()` (model.py plus per-subclass
     /// overrides).
     pub fn nonnoneify(&self) -> SomeValue {
         match self {
@@ -2541,7 +2541,7 @@ impl SomeValue {
         }
     }
 
-    /// RPython `SomeObject.find_method(self, name)` (unaryop.py:206-213).
+    /// RPython `SomeObject.find_method(self, name)` (unaryop.py).
     pub fn find_method(&self, name: &str) -> Option<SomeValue> {
         super::unaryop::find_method(self, name).map(SomeValue::BuiltinMethod)
     }
@@ -2551,7 +2551,7 @@ impl SomeValue {
     /// (unaryop.py:237-238, 961-967, 985-987, 1011-1012).
     ///
     /// Returns `Ok(None)` for a void result — a builtin method analyser
-    /// whose body falls off the end (`unaryop.py:114-118 simple_call`
+    /// whose body falls off the end (`unaryop.py simple_call`
     /// returns `s_func.call(argspec)`, which may be Python `None`). All
     /// other callable kinds yield a concrete annotation wrapped in
     /// `Some(_)`; an unrefined/None receiver still blocks via
@@ -2575,7 +2575,7 @@ impl SomeValue {
             SomeValue::None_(_) => Ok(Some(s_impossible_value())),
             SomeValue::BuiltinMethod(method) => method.call(args),
             SomeValue::Builtin(sb) => {
-                // upstream `SomeBuiltin.call(args)` (unaryop.py:940-946):
+                // upstream `SomeBuiltin.call(args)` (unaryop.py):
                 //
                 //     args_s, kwds = args.unpack()
                 //     kwds_s = {}
@@ -2588,7 +2588,7 @@ impl SomeValue {
                 let (args_s_opt, kwds) = args
                     .unpack()
                     .map_err(|err| AnnotatorError::new(err.getmsg()))?;
-                // `model.py:1182-1188 SomeBuiltin.call` passes args_s
+                // `model.py SomeBuiltin.call` passes args_s
                 // (which may carry None for unbound caller args) directly
                 // to `analyser(*args_s, **kwds_s)`; the analyser body
                 // raises AttributeError on the first attribute access of
@@ -2774,7 +2774,7 @@ impl SomeObjectTrait for SomeValue {
             // is never true). Documented early so A4.5 does not have to
             // change the arm.
             SomeValue::Impossible => false,
-            // The bare SomeObject answers True (model.py:118-119 default).
+            // The bare SomeObject answers True (model.py default).
             SomeValue::Object(_) => true,
             SomeValue::Type(s) => s.can_be_none(),
             SomeValue::Float(s) => s.can_be_none(),
@@ -2814,7 +2814,7 @@ impl SomeObjectTrait for SomeValue {
 
 /// RPython `bind_callables_under(s_value, classdef, name)` — the
 /// method defined on `SomeObject` / `SomePBC` / `SomeNone` via the
-/// `__extend__(...)` decorator in `rpython/annotator/unaryop.py:234-235`,
+/// `__extend__(...)` decorator in `rpython/annotator/unaryop.py`,
 /// 989-991, 1001-1002.
 ///
 /// ```python
@@ -2852,7 +2852,7 @@ pub(crate) fn bind_callables_under(
 // UnionError — raised by A4.6's union dispatch.
 // ---------------------------------------------------------------------------
 
-/// RPython `class UnionError(Exception)` (model.py:625 — exact line
+/// RPython `class UnionError(Exception)` (model.py — exact line
 /// varies by upstream revision). Produced by the union dispatch when
 /// two annotations cannot be merged. Carried here for type completeness;
 /// A4.6 populates the payload.
@@ -2881,22 +2881,22 @@ impl std::error::Error for UnionError {}
 // Module-level singletons (model.py:685-694).
 // ---------------------------------------------------------------------------
 
-/// RPython `s_None = SomeNone()` (model.py:685).
+/// RPython `s_None = SomeNone()` (model.py).
 pub(crate) fn s_none() -> SomeValue {
     SomeValue::None_(SomeNone::new())
 }
 
-/// RPython `s_ImpossibleValue = SomeImpossibleValue()` (model.py:692).
+/// RPython `s_ImpossibleValue = SomeImpossibleValue()` (model.py).
 pub(crate) fn s_impossible_value() -> SomeValue {
     SomeValue::Impossible
 }
 
-/// RPython `s_Bool = SomeBool()` (model.py:686).
+/// RPython `s_Bool = SomeBool()` (model.py).
 pub(crate) fn s_bool() -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
-/// RPython `s_Int = SomeInteger()` (model.py:691).
+/// RPython `s_Int = SomeInteger()` (model.py).
 pub(crate) fn s_int() -> SomeValue {
     SomeValue::Integer(SomeInteger::default())
 }
@@ -2910,16 +2910,16 @@ pub(crate) fn s_uint() -> SomeValue {
     SomeValue::Integer(SomeInteger::new(false, true))
 }
 
-/// RPython `s_Str0 = SomeString(no_nul=True)` (model.py:693).
+/// RPython `s_Str0 = SomeString(no_nul=True)` (model.py).
 pub(crate) fn s_str0() -> SomeValue {
     SomeValue::String(SomeString::new(false, true))
 }
 
 // ---------------------------------------------------------------------------
-// AnnotatorError + helpers (model.py:714-745 + 787-795).
+// AnnotatorError + helpers (model.py + 787-795).
 // ---------------------------------------------------------------------------
 
-/// RPython `class AnnotatorError(Exception)` (model.py:714-725). Base
+/// RPython `class AnnotatorError(Exception)` (model.py). Base
 /// error raised by the annotator outside of the structural `UnionError`
 /// path.
 ///
@@ -3005,7 +3005,7 @@ impl fmt::Display for AnnotatorError {
 impl std::error::Error for AnnotatorError {}
 
 // ---------------------------------------------------------------------------
-// union() dispatch (A4.6) — model.py:750-784 + binaryop.py pair().union().
+// union() dispatch (A4.6) — model.py + binaryop.py pair().union().
 // ---------------------------------------------------------------------------
 
 /// Short identity of a `union` operand for the unhandled-pair error text.
@@ -3039,7 +3039,7 @@ fn union_operand_id(s: &SomeValue) -> String {
     }
 }
 
-/// RPython `union(s1, s2)` (model.py:750-769).
+/// RPython `union(s1, s2)` (model.py).
 ///
 /// The join operation in the lattice of annotations. Returns the most
 /// precise `SomeValue` that contains both inputs, or raises
@@ -3054,7 +3054,7 @@ fn union_operand_id(s: &SomeValue) -> String {
 /// extends this match with the container / PBC / instance pairs.
 pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
     // upstream: `if s1 == s2: return s1`. Identity short-circuit
-    // (comment in model.py:763-766 notes that most pair().union() methods
+    // (comment in model.py notes that most pair().union() methods
     // handle the case incorrectly in the face of constants).
     if s1 == s2 {
         return Ok(s1.clone());
@@ -3139,7 +3139,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             Ok(SomeValue::Integer(si))
         }
 
-        // pairtype(SomeBool, SomeBool).union() (binaryop.py:298-306):
+        // pairtype(SomeBool, SomeBool).union() (binaryop.py):
         // keep the constant only when both sides agree, and intersect
         // knowntypedata when both sides carry it. Dropping the merged
         // knowntypedata here would break `contains` (and hence
@@ -3395,7 +3395,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             )))
         }
 
-        // llannotation.py:84-88 — low-level pointers union only when
+        // llannotation.py — low-level pointers union only when
         // they carry the same `ll_ptrtype`.
         (SomeValue::Ptr(a), SomeValue::Ptr(b)) => {
             if a.ll_ptrtype != b.ll_ptrtype {
@@ -3420,7 +3420,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             )))
         }
 
-        // llannotation.py:15-17 — `pair(SomeAddress, SomeAddress).union()`
+        // llannotation.py — `pair(SomeAddress, SomeAddress).union()`
         (SomeValue::Address(_), SomeValue::Address(_)) => {
             Ok(SomeValue::Address(SomeAddress::new()))
         }
@@ -3464,7 +3464,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // forgotten when the sets no longer agree.
         (SomeValue::PBC(a), SomeValue::PBC(b)) => {
             let can_be_none = a.can_be_none || b.can_be_none;
-            // upstream model.py:558-566: `getKind()` raises
+            // upstream model.py: `getKind()` raises
             // `AnnotatorError("mixing several kinds of PBCs")` for a
             // single PBC whose descriptions span multiple Desc
             // subclasses. The union also widens across the two sides
@@ -3551,7 +3551,7 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
     }
 }
 
-/// RPython `not_const(s_obj)` (model.py:803-812).
+/// RPython `not_const(s_obj)` (model.py).
 ///
 /// ```python
 /// def not_const(s_obj):
@@ -3615,7 +3615,7 @@ pub fn not_const(s: &SomeValue) -> SomeValue {
     cloned
 }
 
-/// RPython `unionof(*somevalues)` (model.py:771-784). Returns the most
+/// RPython `unionof(*somevalues)` (model.py). Returns the most
 /// precise `SomeValue` containing every input; panics propagate
 /// [`UnionError`] per upstream's implicit `Exception` raise.
 pub fn unionof<'a, I: IntoIterator<Item = &'a SomeValue>>(
@@ -3647,7 +3647,7 @@ pub(crate) fn contains(a: &SomeValue, b: &SomeValue) -> bool {
     }
 }
 
-/// RPython `intersection(s_obj1, s_obj2)` (model.py:127-130 +
+/// RPython `intersection(s_obj1, s_obj2)` (model.py +
 /// doubledispatch registrations at 464-512).
 ///
 /// ```python
@@ -3658,23 +3658,23 @@ pub(crate) fn contains(a: &SomeValue, b: &SomeValue) -> bool {
 /// ```
 ///
 /// The @doubledispatch default raises NotImplementedError; the concrete
-/// overloads in model.py:464-512 cover (SomeInstance, SomeInstance),
+/// overloads in model.py cover (SomeInstance, SomeInstance),
 /// (SomeException, SomeInstance), (SomeInstance, SomeException).
 /// The Rust port preserves the strict contract: unregistered pairs
 /// panic rather than silently widen.
 pub fn intersection(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
     match (s_obj1, s_obj2) {
-        // @intersection.register(SomeInstance, SomeInstance) — model.py:464-472.
+        // @intersection.register(SomeInstance, SomeInstance) — model.py.
         (SomeValue::Instance(s_inst1), SomeValue::Instance(s_inst2)) => {
             intersection_Instance(s_inst1, s_inst2)
         }
 
-        // @intersection.register(SomeException, SomeInstance) — model.py:493-499.
+        // @intersection.register(SomeException, SomeInstance) — model.py.
         (SomeValue::Exception(s_exc), SomeValue::Instance(s_inst)) => {
             intersection_Exception_Instance(s_exc, s_inst)
         }
 
-        // @intersection.register(SomeInstance, SomeException) — model.py:501-503.
+        // @intersection.register(SomeInstance, SomeException) — model.py.
         //
         // def intersection_Exception_Instance(s_inst, s_exc):
         //     return intersection(s_exc, s_inst)
@@ -3689,7 +3689,7 @@ pub fn intersection(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
     }
 }
 
-/// RPython `difference(s_obj1, s_obj2)` (model.py:132-135 +
+/// RPython `difference(s_obj1, s_obj2)` (model.py +
 /// doubledispatch registrations at 474-512).
 ///
 /// ```python
@@ -3700,12 +3700,12 @@ pub fn intersection(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
 /// ```
 pub fn difference(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
     match (s_obj1, s_obj2) {
-        // @difference.register(SomeInstance, SomeInstance) — model.py:474-479.
+        // @difference.register(SomeInstance, SomeInstance) — model.py.
         (SomeValue::Instance(s_inst1), SomeValue::Instance(s_inst2)) => {
             difference_Instance_Instance(s_inst1, s_inst2)
         }
 
-        // @difference.register(SomeException, SomeInstance) — model.py:505-512.
+        // @difference.register(SomeException, SomeInstance) — model.py.
         (SomeValue::Exception(s_exc), SomeValue::Instance(s_inst)) => {
             difference_Exception_Instance(s_exc, s_inst)
         }
@@ -3719,7 +3719,7 @@ pub fn difference(s_obj1: &SomeValue, s_obj2: &SomeValue) -> SomeValue {
 }
 
 /// RPython `intersection_Instance` registered for
-/// `(SomeInstance, SomeInstance)` (model.py:464-472).
+/// `(SomeInstance, SomeInstance)` (model.py).
 #[allow(non_snake_case)]
 pub fn intersection_Instance(s_inst1: &SomeInstance, s_inst2: &SomeInstance) -> SomeValue {
     let can_be_none = s_inst1.can_be_none && s_inst2.can_be_none;
@@ -3757,7 +3757,7 @@ pub fn intersection_Instance(s_inst1: &SomeInstance, s_inst2: &SomeInstance) -> 
 }
 
 /// RPython `difference_Instance_Instance` registered for
-/// `(SomeInstance, SomeInstance)` (model.py:474-479).
+/// `(SomeInstance, SomeInstance)` (model.py).
 #[allow(non_snake_case)]
 pub fn difference_Instance_Instance(s_inst1: &SomeInstance, s_inst2: &SomeInstance) -> SomeValue {
     match (&s_inst1.classdef, &s_inst2.classdef) {
@@ -3767,7 +3767,7 @@ pub fn difference_Instance_Instance(s_inst1: &SomeInstance, s_inst2: &SomeInstan
 }
 
 /// RPython `intersection_Exception_Instance` registered for
-/// `(SomeException, SomeInstance)` (model.py:493-499).
+/// `(SomeException, SomeInstance)` (model.py).
 #[allow(non_snake_case)]
 pub fn intersection_Exception_Instance(s_exc: &SomeException, s_inst: &SomeInstance) -> SomeValue {
     let Some(target) = &s_inst.classdef else {
@@ -3789,7 +3789,7 @@ pub fn intersection_Exception_Instance(s_exc: &SomeException, s_inst: &SomeInsta
 }
 
 /// RPython `difference_Exception_Instance` registered for
-/// `(SomeException, SomeInstance)` (model.py:505-512).
+/// `(SomeException, SomeInstance)` (model.py).
 #[allow(non_snake_case)]
 pub fn difference_Exception_Instance(s_exc: &SomeException, s_inst: &SomeInstance) -> SomeValue {
     let Some(target) = &s_inst.classdef else {
@@ -3809,7 +3809,7 @@ pub fn difference_Exception_Instance(s_exc: &SomeException, s_inst: &SomeInstanc
     }
 }
 
-/// RPython `class HarmlesslyBlocked(Exception)` (model.py:831-834).
+/// RPython `class HarmlesslyBlocked(Exception)` (model.py).
 ///
 /// ```python
 /// class HarmlesslyBlocked(Exception):
@@ -3872,7 +3872,7 @@ impl fmt::Display for AnnotatorException {
 
 impl std::error::Error for AnnotatorException {}
 
-/// RPython `read_can_only_throw(opimpl, *args)` (model.py:837-841).
+/// RPython `read_can_only_throw(opimpl, *args)` (model.py).
 ///
 /// ```python
 /// def read_can_only_throw(opimpl, *args):
@@ -3893,7 +3893,7 @@ pub fn read_can_only_throw(
     }
 }
 
-/// RPython `add_knowntypedata(ktd, truth, vars, s_obj)` (model.py:789-791).
+/// RPython `add_knowntypedata(ktd, truth, vars, s_obj)` (model.py).
 ///
 /// Populates an exitcase-keyed table tracking "if this branch takes the
 /// `case` exit, these variables have annotation `s_obj`". RPython keys
@@ -3915,7 +3915,7 @@ pub fn add_knowntypedata(
     }
 }
 
-/// RPython `merge_knowntypedata(ktd1, ktd2)` (model.py:794-800).
+/// RPython `merge_knowntypedata(ktd1, ktd2)` (model.py).
 ///
 /// Intersection of the two tables: a variable survives only if both
 /// branches refined it, and the resulting annotation is the union of
@@ -3936,7 +3936,7 @@ pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownT
     r
 }
 
-/// RPython `typeof(args_v)` (model.py:151-161).
+/// RPython `typeof(args_v)` (model.py).
 ///
 /// Builds a [`SomeTypeOf`] carrying the provided variables, with a
 /// fast path that pins `.const` when the single argument is a
@@ -3946,7 +3946,7 @@ pub fn r#typeof(args_v: &[Rc<Variable>]) -> SomeValue {
         return SomeValue::Type(SomeType::new());
     }
     let result = SomeTypeOf::new(args_v.iter().map(Rc::clone).collect());
-    // TODO(Commit 2+): Exception-const fast path (model.py:154-158)
+    // TODO(Commit 2+): Exception-const fast path (model.py)
     // requires downcasting `v.annotation` to `SomeValue::Exception`
     // and projecting `classdefs -> classdesc.pyobj` onto `result.const`.
     // The HostObject plumbing for that path lands with the exception-
@@ -4060,7 +4060,7 @@ mod tests {
 
     #[test]
     fn someinteger_nonneg_implied_by_unsigned() {
-        // upstream: `self.nonneg = unsigned or nonneg` at model.py:223.
+        // upstream: `self.nonneg = unsigned or nonneg` at model.py.
         let s = SomeInteger::new(false, true);
         assert!(s.nonneg);
         assert!(s.unsigned);
@@ -4156,7 +4156,7 @@ mod tests {
     #[test]
     fn contains_uses_union_dispatch() {
         // A4.6 now delegates `SomeValue::contains` to the union-powered
-        // helper (model.py:94-100). Signed int contains all nonneg
+        // helper (model.py). Signed int contains all nonneg
         // ints; the reverse fails.
         let signed = SomeValue::Integer(SomeInteger::new(false, false));
         let nonneg = SomeValue::Integer(SomeInteger::new(true, false));
@@ -4205,7 +4205,7 @@ mod tests {
     #[test]
     fn sometuple_all_constant_items_propagates_is_constant() {
         // upstream: `SomeTuple.__init__` sets `self.const` when every
-        // item is constant (model.py:362-368). A SomeInteger with a
+        // item is constant (model.py). A SomeInteger with a
         // const_box counts as constant; a vanilla one does not.
         let mut item = SomeInteger::default();
         item.base.const_box = Some(Constant::new(
@@ -4375,7 +4375,7 @@ mod tests {
 
     #[test]
     fn somepbc_single_desc_without_pyobj_is_not_constant() {
-        // upstream: model.py:534-537 — is_constant holds only when
+        // upstream: model.py — is_constant holds only when
         // `len(descriptions) == 1 and not can_be_None and desc.pyobj
         // is not None`. `fake_function_entry` creates a FunctionDesc
         // with `pyobj = None`, so a single-desc SomePBC built from it
@@ -5128,7 +5128,7 @@ mod tests {
         // MemoDesc is a distinct DescKind::Memo, so a FunctionDesc PBC
         // unioned with a MemoDesc PBC is a mixed-kind set and must be
         // rejected — matching upstream where FunctionDesc + MemoDesc are
-        // different classes (model.py:558 getKind).
+        // different classes (model.py getKind).
         let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
         let a = SomeValue::PBC(SomePBC::new(vec![fake_function_entry(&bk, "f")], false));
         let b = SomeValue::PBC(SomePBC::new(vec![fake_memo_entry(&bk, "g")], false));
@@ -5379,7 +5379,7 @@ mod tests {
 
     #[test]
     fn knowntypedata_accessor_reads_generically() {
-        // `getattr(annotation, "knowntypedata", {})` (annrpython.py:566)
+        // `getattr(annotation, "knowntypedata", {})` (annrpython.py)
         // reads off SomeBool and SomeInteger; any other annotation
         // returns the `{}` default (None).
         let x = Rc::new(Variable::named("x"));
@@ -5425,7 +5425,7 @@ mod tests {
         assert_eq!(got, Some(s));
     }
 
-    /// rstring.py:913-917 — `SomeStringBuilder` getlength/build annotate to
+    /// rstring.py — `SomeStringBuilder` getlength/build annotate to
     /// `SomeInteger(nonneg=True)` and `SomeString(can_be_None=False)`.
     #[test]
     fn some_string_builder_method_annotations() {
@@ -5445,7 +5445,7 @@ mod tests {
         assert!(matches!(b.method_getlength(), SomeValue::Integer(_)));
     }
 
-    /// rstring.py:953-957 — `SomeUnicodeBuilder.build` annotates to
+    /// rstring.py — `SomeUnicodeBuilder.build` annotates to
     /// `SomeUnicodeString(can_be_None=False)`; getlength stays the nonneg
     /// integer.
     #[test]

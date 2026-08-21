@@ -369,7 +369,7 @@ fn generate_layout_helpers(
         .map_or_else(|| format_ident!("Ref"), |t| t.clone());
     let arr_type_token = ir_type_token(&arr_type);
     // Red block (extra reds) first, then vable static fields — mirrors
-    // pyjitpl.py:2957 `live_arg_boxes = greenboxes + redboxes` followed by
+    // pyjitpl.py `live_arg_boxes = greenboxes + redboxes` followed by
     // pyjitpl.py:2964 `+ virtualizable_boxes`. JitDriver.reds (e.g.
     // `interp_jit.py:67 reds = ['frame', 'ec']`) come before the
     // virtualizable's static fields in the OpRef stream.
@@ -486,7 +486,7 @@ fn generate_layout_helpers(
         ///
         /// TODO: codegen-time constant equivalent to
         /// `len(VABLEINFO.static_field_descrs) + 1` (frame ptr + N
-        /// `_virtualizable_` scalars from `interp_jit.py:25-30`). RPython
+        /// `_virtualizable_` scalars from `interp_jit.py`). RPython
         /// derives the count dynamically by iterating
         /// `range(len(self.static_field_descrs))` (`virtualizable.py:86`);
         /// pyre crystallises it at proc-macro expansion time so the flat
@@ -527,7 +527,7 @@ fn generate_layout_helpers(
 
         /// Extract live values from state in virtualizable layout order.
         ///
-        /// virtualizable.py:86-99 read_boxes / get_list_of_active_boxes:
+        /// virtualizable.py read_boxes / get_list_of_active_boxes:
         ///   for _, fieldname in unroll_static_fields:
         ///       boxes.append(wrap(cpu, getattr(virtualizable, fieldname)))
         ///   for _, fieldname in unroll_array_fields:

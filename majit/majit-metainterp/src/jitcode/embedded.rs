@@ -1,8 +1,8 @@
 //! A build-time jitcode table and the one descr pool its bodies index.
 //!
-//! `CodeWriter.make_jitcodes()` (codewriter.py:89) produces two lists that
+//! `CodeWriter.make_jitcodes()` (codewriter.py) produces two lists that
 //! only mean anything together: `all_jitcodes`, and the single shared
-//! `Assembler.descrs` (assembler.py:23) that every `d`/`j` argcode in every
+//! `Assembler.descrs` (assembler.py) that every `d`/`j` argcode in every
 //! body indexes. A host that runs the codewriter at build time and embeds the
 //! two serialized lists in its binary has to join them back into the runtime
 //! shapes — `Arc<JitCode>` shells and a `RuntimeBhDescr` pool. This type is
@@ -169,7 +169,7 @@ impl EmbeddedJitCodeTable {
         }))
     }
 
-    /// `metainterp_sd.jitcodes` (warmspot.py:281-282) — the flat registry
+    /// `metainterp_sd.jitcodes` (warmspot.py) — the flat registry
     /// `resume.py:1338-1340` indexes by a frame's `jitcode_pos`.
     pub fn jitcodes(&self) -> &'static [Arc<JitCode>] {
         self.jitcodes

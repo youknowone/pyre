@@ -14,9 +14,9 @@
 //!
 //! ## RPython references
 //!
-//! - `rpython/jit/codewriter/call.py:49-92 find_all_graphs`
-//! - `rpython/jit/codewriter/call.py:116-139 guess_call_kind`
-//! - `rpython/jit/codewriter/policy.py:48-84 look_inside_graph`
+//! - `rpython/jit/codewriter/call.py find_all_graphs`
+//! - `rpython/jit/codewriter/call.py guess_call_kind`
+//! - `rpython/jit/codewriter/policy.py look_inside_graph`
 //!
 //! The test constructs a **minimal synthetic** dispatch graph (no
 //! pyre-interpreter source dependency) so the parity claim is isolated
@@ -120,7 +120,7 @@ fn find_all_graphs_does_not_follow_builtin_targets() {
 
 #[test]
 fn find_all_graphs_does_not_follow_portal_recursive_edges() {
-    // RPython call.py:119-120 `jitdriver_sd_from_portal_runner_ptr` —
+    // RPython call.py `jitdriver_sd_from_portal_runner_ptr` —
     // a call to the portal itself classifies as `recursive`, which
     // call.py:82 skips. The portal remains a candidate (via the seed)
     // but is not re-visited.
@@ -171,8 +171,8 @@ fn build_indirect_caller_graph(name: &str, trait_root: &str, method_name: &str) 
 
 #[test]
 fn find_all_graphs_follows_every_member_of_an_indirect_call_family() {
-    // RPython call.py:76 walks `("direct_call", "indirect_call")`, and
-    // call.py:103-112 `graphs_from` returns the whole attached family for
+    // RPython call.py walks `("direct_call", "indirect_call")`, and
+    // call.py `graphs_from` returns the whole attached family for
     // an indirect_call, so every candidate member enters the closure.
     // Skipping the indirect branch leaves the family out of
     // `candidate_graphs`, which makes `graphs_from` return None at
@@ -209,7 +209,7 @@ fn find_all_graphs_follows_every_member_of_an_indirect_call_family() {
 #[test]
 fn find_all_graphs_does_not_follow_close_stack_targets() {
     // RPython call.py:129-134 `_gctransformer_hint_close_stack_` →
-    // 'residual', skipped by call.py:82. `get_jitcode` asserts a
+    // 'residual', skipped by call.py. `get_jitcode` asserts a
     // close_stack graph never reaches it, so following the edge here
     // turns a residual classification into a panic later.
     let portal_path = CallPath::from_segments(["portal"]);

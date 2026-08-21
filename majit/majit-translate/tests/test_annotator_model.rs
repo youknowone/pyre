@@ -82,7 +82,7 @@ fn const_float(x: f64) -> SomeValue {
 }
 
 // ---------------------------------------------------------------------------
-// test_equality (test_model.py:35-42)
+// test_equality (test_model.py)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -120,7 +120,7 @@ fn test_equality() {
 }
 
 // ---------------------------------------------------------------------------
-// test_contains (test_model.py:44-50)
+// test_contains (test_model.py)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -157,7 +157,7 @@ fn test_contains() {
 }
 
 // ---------------------------------------------------------------------------
-// test_signedness (test_model.py:52-54)
+// test_signedness (test_model.py)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -174,7 +174,7 @@ fn test_signedness() {
 }
 
 // ---------------------------------------------------------------------------
-// test_list_union (test_model.py:79-86)
+// test_list_union (test_model.py)
 //
 // Upstream body:
 //     s1 = SomeList(ListDef('dummy', SomeInteger(nonneg=True)))
@@ -215,7 +215,7 @@ fn test_list_union() {
 }
 
 // ---------------------------------------------------------------------------
-// test_list_contains (test_model.py:88-97)
+// test_list_contains (test_model.py)
 //
 // Upstream semantics are identity-based: independently constructed
 // `ListDef(None, ...)` instances have distinct `ListItem`s, and
@@ -250,7 +250,7 @@ fn test_list_contains() {
 }
 
 // ---------------------------------------------------------------------------
-// test_nan (test_model.py:99-106)
+// test_nan (test_model.py)
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -13,11 +13,11 @@
 //! In pyre this is achieved by `alive_loops` storing
 //! `Arc<JitCellToken>`. When an entry is removed, the Arc drops; when
 //! the last strong reference goes, `JitCellToken::drop` (TBD —
-//! `model.py:289 cpu.free_loop_and_bridges` parity) frees the backend
+//! `model.py cpu.free_loop_and_bridges` parity) frees the backend
 //! resources.
 //!
 //! Both long-lived handles on a compiled token are now weak —
-//! `BaseJitCell::loop_token` (`warmstate.py:188`) and
+//! `BaseJitCell::loop_token` (`warmstate.py`) and
 //! `CompiledEntry::token` — so `alive_loops` is the sole long-lived strong
 //! owner and removing an entry here is what actually frees the token.
 //!
@@ -25,7 +25,7 @@
 //! any cell or table is given a handle to it, or it dies with the producer's
 //! own temporary and the cell it was installed on reads back as "never
 //! compiled" rather than failing loudly. `compile.py:566-567`
-//! (`send_loop_to_backend`) and `compile.py:1148-1149`
+//! (`send_loop_to_backend`) and `compile.py`
 //! (`compile_tmp_callback`) are the two places upstream discharges it.
 
 use indexmap::IndexMap;
@@ -34,28 +34,28 @@ use std::sync::atomic::Ordering;
 
 use majit_backend::JitCellToken;
 
-/// `memmgr.py:23` `class MemoryManager`. Pyre also pins the
+/// `memmgr.py` `class MemoryManager`. Pyre also pins the
 /// retrace/unroll parameters here, mirroring RPython's lazy attribute
 /// writes via `warmstate.py:299-320 set_param_*`. RPython treats them
 /// as Python `int` attributes; pyre declares them as typed fields and
-/// initializes them to the `rlib/jit.py:588 PARAMETERS` defaults.
+/// initializes them to the `rlib/jit.py PARAMETERS` defaults.
 pub struct MemoryManager {
-    /// `memmgr.py:38` `self.current_generation = r_int64(1)`.
+    /// `memmgr.py` `self.current_generation = r_int64(1)`.
     pub current_generation: i64,
-    /// `memmgr.py:39` `self.max_age = max_age` — set by
-    /// `set_max_age` (`memmgr.py:42-50`).  `<= 0` disables eviction.
+    /// `memmgr.py` `self.max_age = max_age` — set by
+    /// `set_max_age` (`memmgr.py`).  `<= 0` disables eviction.
     pub max_age: i64,
     /// `memmgr.py:39` `self.next_check = r_int64(-1)`.  Generation
     /// at which `_kill_old_loops_now` next fires; `-1` means
     /// "eviction disabled" (`memmgr.py:43-44`).
     pub next_check: i64,
-    /// `memmgr.py:26` `self.check_frequency = -1`.  Number of
+    /// `memmgr.py` `self.check_frequency = -1`.  Number of
     /// generations between successive `_kill_old_loops_now` sweeps.
     /// `-1` is "uninitialized"; `set_max_age` derives a real value
     /// (`int(sqrt(max_age))` by default per `memmgr.py:47-48`).
     pub check_frequency: i64,
 
-    /// `memmgr.py:40` `self.alive_loops = {}` — a dict keyed on the
+    /// `memmgr.py` `self.alive_loops = {}` — a dict keyed on the
     /// looptoken object itself.  In Rust the dict key uses the Arc's
     /// pointer-id (stable while the Arc lives) and the value IS the
     /// strong Arc reference: removing the entry drops the Arc, and
@@ -69,22 +69,22 @@ pub struct MemoryManager {
     /// identity is stable until removal.
     pub alive_loops: indexmap::IndexMap<*const JitCellToken, Arc<JitCellToken>>,
 
-    /// `warmstate.py:299-302` `set_param_retrace_limit` writes here.
+    /// `warmstate.py` `set_param_retrace_limit` writes here.
     /// `unroll.py:215` reader.
     pub retrace_limit: u32,
-    /// `warmstate.py:307-310` `set_param_max_retrace_guards`.
+    /// `warmstate.py` `set_param_max_retrace_guards`.
     /// `unroll.py:265` reader.
     pub max_retrace_guards: u32,
-    /// `warmstate.py:312-315` `set_param_max_unroll_loops`.
+    /// `warmstate.py` `set_param_max_unroll_loops`.
     /// `pyjitpl.py:2946` reader.
     pub max_unroll_loops: u32,
-    /// `warmstate.py:317-320` `set_param_max_unroll_recursion`.
+    /// `warmstate.py` `set_param_max_unroll_recursion`.
     /// `pyjitpl.py:1404` reader.
     pub max_unroll_recursion: u32,
 }
 
 impl MemoryManager {
-    /// `memmgr.py:25-40` `MemoryManager.__init__`. Note RPython splits
+    /// `memmgr.py` `MemoryManager.__init__`. Note RPython splits
     /// init from `set_max_age`; pyre takes `max_age` upfront for
     /// ergonomics — `set_max_age` later overwrites it just like the
     /// upstream call sequence at `warmspot.py:118` /
@@ -99,18 +99,18 @@ impl MemoryManager {
             check_frequency: -1,
             max_age: 0,
             alive_loops: indexmap::IndexMap::new(),
-            // rlib/jit.py:588 PARAMETERS defaults.
+            // rlib/jit.py PARAMETERS defaults.
             retrace_limit: 0,
             max_retrace_guards: 15,
             max_unroll_loops: 0,
             max_unroll_recursion: 7,
         };
-        // memmgr.py:42-50 set_max_age — derives next_check / check_frequency.
+        // memmgr.py set_max_age — derives next_check / check_frequency.
         mgr.set_max_age(max_age, 0);
         mgr
     }
 
-    /// `memmgr.py:42-50` `set_max_age(max_age, check_frequency=0)`.
+    /// `memmgr.py` `set_max_age(max_age, check_frequency=0)`.
     ///
     /// ```python
     /// def set_max_age(self, max_age, check_frequency=0):
@@ -146,7 +146,7 @@ impl MemoryManager {
 
     /// Pyre-only readback for `get_param("loop_longevity")`.
     ///
-    /// `set_max_age(<= 0)` matches `memmgr.py:43 self.next_check = -1`
+    /// `set_max_age(<= 0)` matches `memmgr.py self.next_check = -1`
     /// without touching `max_age`, so the raw `max_age` field stays at
     /// the previous positive value. RPython has no `get_param` for
     /// `loop_longevity`, so the field staleness is invisible upstream.
@@ -161,7 +161,7 @@ impl MemoryManager {
         }
     }
 
-    /// `memmgr.py:58-61` `keep_loop_alive(looptoken)`.
+    /// `memmgr.py` `keep_loop_alive(looptoken)`.
     ///
     /// ```python
     /// def keep_loop_alive(self, looptoken):
@@ -179,7 +179,7 @@ impl MemoryManager {
         }
     }
 
-    /// `memmgr.py:52-56` `next_generation`.
+    /// `memmgr.py` `next_generation`.
     ///
     /// ```python
     /// def next_generation(self):
@@ -190,7 +190,7 @@ impl MemoryManager {
     /// ```
     ///
     /// Returns the evicted token objects, where upstream returns `None`:
-    /// `LoopToken.__del__` (`memmgr.py:13`) dispatches
+    /// `LoopToken.__del__` (`memmgr.py`) dispatches
     /// `cpu.free_loop_and_bridges` by itself once the only strong owner
     /// (`alive_loops`) drops the token, and pyre has no destructor hook at
     /// that point.  Both other long-lived handles are weak now, so the drop
@@ -217,7 +217,7 @@ impl MemoryManager {
         }
     }
 
-    /// `memmgr.py:63-83` `_kill_old_loops_now`.  RPython:
+    /// `memmgr.py` `_kill_old_loops_now`.  RPython:
     /// ```python
     /// debug_start("jit-mem-collect")
     /// oldtotal = len(self.alive_loops)
@@ -271,7 +271,7 @@ impl MemoryManager {
         evicted_tokens
     }
 
-    /// `memmgr.py:85-89` `release_all_loops`.
+    /// `memmgr.py` `release_all_loops`.
     ///
     /// ```python
     /// debug_start("jit-mem-releaseall")

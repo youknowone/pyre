@@ -63,7 +63,7 @@ impl Drop for ObjectVecRoot {
 }
 
 thread_local! {
-    /// pyjitpl.py:3048-3091 `raise_continue_running_normally` seam: set
+    /// pyjitpl.py `raise_continue_running_normally` seam: set
     /// when the authoritative full-body walk committed its end-of-walk
     /// frame state into the trace's concrete frame snapshot
     /// (`flush_walk_end_state_to_frame`).  The portal call sites consume
@@ -170,7 +170,7 @@ pub(crate) enum WalkEndCommitLeg {
 /// falls on.
 ///
 /// Upstream's rule is not "never rewind".  `opimpl_str_guard_value`
-/// (`pyjitpl.py:1498-1511`) runs a real `do_residual_call` and then records its
+/// (`pyjitpl.py`) runs a real `do_residual_call` and then records its
 /// guard with `resumepc=orgpc`, an earlier pc; `capture_resumedata` stamps that
 /// pc into the frame (`pyjitpl.py:2617-2620`).  What upstream forbids is
 /// rewinding past an *effectful* residual, and it decides both the permission
@@ -180,7 +180,7 @@ pub(crate) enum WalkEndCommitLeg {
 /// follow a residual take `after_residual_call`, which pins the resume pc to
 /// the POST-call `self.pc` (`pyjitpl.py:2599-2602` → `194-198`).  Upstream's
 /// only op counters are profiling-only and gate nothing
-/// (`jitprof.py:43-44 EmptyProfiler.count_ops` is `pass`).
+/// (`jitprof.py EmptyProfiler.count_ops` is `pass`).
 ///
 /// So this enum discharges an obligation upstream also has, but in a form
 /// upstream does not use: a runtime odometer where upstream uses a declared
@@ -188,7 +188,7 @@ pub(crate) enum WalkEndCommitLeg {
 /// convergence is a static per-callee effect classification.  Separately, the
 /// legs that resume the OUTER frame at a CALL (gh#467, gated by #126/#215's
 /// missing inner-frame rebuild) have no upstream counterpart at all;
-/// `convert_and_run_from_pyjitpl` (`blackhole.py:1799-1821`) gives every frame
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) gives every frame
 /// its own current pc and splices the callee result in PAST the caller's call
 /// (`blackhole.py:1653-1662`), which is the [`WalkEndResume::AfterApplied`]
 /// shape.
@@ -1175,7 +1175,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // identity (seed_virtualizable_boxes) is baked against the live frame
     // address, not the discarded snapshot's.
     sym.set_live_vable_frame_addr(live_frame_addr);
-    // pyjitpl.py:65 MIFrame.__init__: sym fields populated once at frame
+    // pyjitpl.py MIFrame.__init__: sym fields populated once at frame
     // construction. Callee (inline) frames are set up by `inline_call.rs`'s
     // `setup_call` port and don't call init_symbolic; this path
     // handles the root frame push.
@@ -1503,7 +1503,7 @@ fn pending_call_result_semantic_slot(nlocals: usize, post_call_depth: usize) -> 
 /// the full-body walker instead of aborting to a no-JIT re-interpret.
 ///
 /// The carrier reconstructs the in-flight callee framestack
-/// (`rebuild_from_resumedata`, resume.py:1042-1057); each callee is rebuilt as
+/// (`rebuild_from_resumedata`, resume.py); each callee is rebuilt as
 /// a virtualizable the walker can drive (`setup_reconstructed_callee_frame`),
 /// then walked innermost-first via [`dispatch_perfn_frame`], threading each
 /// frame's return into its parent before the parent walks, until the root
@@ -1699,7 +1699,7 @@ fn discard_bridge_carrier_walk<Sym: WalkSym>(
     pre_pos: majit_metainterp::recorder::TracePosition,
     pre_virtualref_boxes: &[(majit_ir::OpRef, usize)],
 ) {
-    // `pyframe.py:316-358 execute_frame` closes exactly the frame entered by
+    // `pyframe.py execute_frame` closes exactly the frame entered by
     // that invocation in its `finally: executioncontext.leave(...)`.  Close
     // only scopes this carrier walk opened, while their recorder positions
     // are still live.  If the walk already closed a parent scope, preserve
@@ -2066,8 +2066,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
     }
 
-    // `pyjitpl.py:2949 run_blackhole_interp_to_cancel_tracing` →
-    // `blackhole.py:1799 convert_and_run_from_pyjitpl`.  The sub-walk above is
+    // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` →
+    // `blackhole.py convert_and_run_from_pyjitpl`.  The sub-walk above is
     // the reconstructed callee's ONE real execution (`drive_bridge_frame_subwalk`
     // is an authoritative executor), so once its odometer has moved the drain
     // may not hand the guard back to a blackhole resume from `rd_numb`: the
@@ -2246,7 +2246,7 @@ fn seed_loop_entry_ref_slots(
 /// resume on the frame the blackhole has been writing, not on one rebuilt from
 /// the terminal register banks.
 ///
-/// `handle_jitexception` (`warmspot.py:970-982`) re-enters the portal with the
+/// `handle_jitexception` (`warmspot.py`) re-enters the portal with the
 /// greens and reds the exception carries; the frame is among the reds, and
 /// nothing reconstructs its contents.  It can afford that because the
 /// blackhole's virtualizable ops are write-through —
@@ -3875,7 +3875,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         Vec::new()
     };
 
-    // resume.py:1036-1038 `_callback_f` parity: seed the Float bank the same
+    // resume.py `_callback_f` parity: seed the Float bank the same
     // way as argboxes_i. Empty for a non-marker resume; `truncate(num_regs_f)`
     // strips the copy_constants tail exactly as the Int build does.
     let argboxes_f: Vec<majit_ir::OpRef> = if sym.bridge_walk_entry_pc().is_some() {
@@ -3911,10 +3911,10 @@ fn run_perfn_walk<Sym: WalkSym>(
     }
 
     // The foreign-JitCode check above is a first-class runtime decline. Below,
-    // resume.py:1017-1057 `consume_boxes` / `enumerate_vars` fills every live
+    // resume.py `consume_boxes` / `enumerate_vars` fills every live
     // Ref, Int, and Float register from the marker's stream. With the total
     // bridge seed above, an uncovered color is a codewriter/seed defect.
-    // `_callback_r` writes `next_ref()` directly (resume.py:1032-1034), so a
+    // `_callback_r` writes `next_ref()` directly (resume.py), so a
     // restored null Ref is covered; only `OpRef::NONE` is absent. `Some` is
     // the resume-marker discriminator: setup_bridge_sym sets it only when the
     // carried frame pc is a decodable `live/` offset.
@@ -4080,7 +4080,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 *back_edge_marker_jit_pc,
             );
         }
-        // pyjitpl.py:3048-3091 raise_continue_running_normally parity: a
+        // pyjitpl.py raise_continue_running_normally parity: a
         // walk that ends at a merge point hands the interpreter (and the
         // compiled loop's heap-reloading preamble) the END-of-walk frame
         // state, so the walked iteration — whose residual calls executed
@@ -4867,7 +4867,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // caller's consume-vs-rewind) stay in agreement.
     //
     // The shortcut itself has no upstream counterpart, and needs none:
-    // `pyjitpl.py:2937-2947 _handle_guard_failure` resumes by continuing from
+    // `pyjitpl.py _handle_guard_failure` resumes by continuing from
     // the framestack `interpret()` already holds and never re-runs a region, so
     // there is no store journal to commit and no concrete to keep.  pyre's
     // walker instead executes and journals residual effects while tracing, so
@@ -5426,7 +5426,7 @@ fn collect_loop_body_referenced_roots(
 /// — now runs interpreted in full, not just the aborting call.  The orthodox
 /// mechanism has no up-front scan at all: an unsupported op raises
 /// `SwitchToBlackhole` mid-trace and
-/// `run_blackhole_interp_to_cancel_tracing` (pyjitpl.py:2949) converts the live
+/// `run_blackhole_interp_to_cancel_tracing` (pyjitpl.py) converts the live
 /// framestack and continues FORWARD in the blackhole interpreter, so nothing
 /// replays and nothing double-applies.  This decline holds until that
 /// forward-resume convergence (#126/#215) lets an inlined-callee abort resume
@@ -5945,7 +5945,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 }
             }
             crate::jitcode_dispatch::DispatchOutcome::CompileTracePending { .. } => {
-                // pyjitpl.py:3095 raise_if_successful parity: the walker's
+                // pyjitpl.py raise_if_successful parity: the walker's
                 // in-walk `compile_trace` already compiled+installed the
                 // trace as a (entry) bridge jumping into an existing loop;
                 // hand the dedicated action back so the driver neither

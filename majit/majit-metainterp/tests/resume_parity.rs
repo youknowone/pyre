@@ -144,7 +144,7 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
     }
 }
 
-/// resume.py:199-226 _number_boxes: count includes ALL liveboxes
+/// resume.py _number_boxes: count includes ALL liveboxes
 /// (frame slots + virtual fields + pending fields).
 #[test]
 fn resume_py_count_includes_virtual_and_pending_field_failargs() {
@@ -207,7 +207,7 @@ fn resume_py_count_frame_only() {
     assert_eq!(encoded.rd_numb[1], 3);
 }
 
-/// resume.py:199-226 _number_boxes: compact numbering assigns sequential
+/// resume.py _number_boxes: compact numbering assigns sequential
 /// indices. Sparse FailArg indices are renumbered: {0,7} → {0,1}, count=2.
 #[test]
 fn resume_py_compact_liveboxes_numbering() {

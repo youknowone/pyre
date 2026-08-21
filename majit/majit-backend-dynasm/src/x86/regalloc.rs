@@ -46,7 +46,7 @@ pub fn save_around_call_core_regs() -> Vec<RegLoc> {
 
 /// x86/regalloc.py X86_64_XMMRegisterManager.all_regs — XMM allocation
 /// pool.  On non-Win64 xmm15 is reserved as scratch.  On Win64 PyPy
-/// uses a separate `X86_64_WIN_XMMRegisterManager` (regalloc.py:128)
+/// uses a separate `X86_64_WIN_XMMRegisterManager` (regalloc.py)
 /// with only `[xmm0..xmm4]`, reserving xmm5 as scratch and leaving
 /// xmm6..xmm15 callee-save untouched so the JIT prologue/epilogue
 /// does not need to save them.  `save_around_call_regs = all_regs`
@@ -97,11 +97,11 @@ pub fn core_reg_index(reg: RegLoc) -> Option<usize> {
     ALL_CORE_REGS.iter().position(|candidate| *candidate == reg)
 }
 
-/// x86/regalloc.py:1013 consider_call_malloc_nursery:
+/// x86/regalloc.py consider_call_malloc_nursery:
 ///   `spill_or_move_registers_before_call([ecx, edx])`
 ///   `force_allocate_reg(op, selected_reg=ecx)`        → result
 ///   `force_allocate_reg(tmp_box, selected_reg=edx)`   → temp
-/// reghint.py:123 consider_call_malloc_nursery:
+/// reghint.py consider_call_malloc_nursery:
 ///   `longevity.fixed_register(position, ecx, op)`
 ///   `longevity.fixed_register(position, edx)`
 pub const MALLOC_NURSERY_CLOBBER: [RegLoc; 2] = [ECX, EDX];
@@ -115,11 +115,11 @@ pub const MALLOC_NURSERY_RESULT: RegLoc = ECX;
 /// x86's two-operand encoding (`OP dst, src` with dst = first
 /// operand) means the result register is forced onto the lhs slot
 /// via `force_result_in_reg`.  RPython parity:
-/// `rpython/jit/backend/x86/regalloc.py:528 _consider_binop_part`
+/// `rpython/jit/backend/x86/regalloc.py _consider_binop_part`
 /// and `:566 consider_int_add` (plus `_consider_lea` for the
 /// `add reg, imm32` LEA shortcut).
 impl<'a> RegAlloc<'a> {
-    /// x86/regalloc.py:528 `_consider_binop_part`. Sets up `dst =
+    /// x86/regalloc.py `_consider_binop_part`. Sets up `dst =
     /// lhs` register coupling; for symmetric ops, swaps `lhs`/`rhs`
     /// when that lets us avoid a spill.
     fn _consider_binop_part_j2(
@@ -163,7 +163,7 @@ impl<'a> RegAlloc<'a> {
         (loc, argloc)
     }
 
-    /// x86/regalloc.py:548 `_consider_binop` — asymmetric binop.
+    /// x86/regalloc.py `_consider_binop` — asymmetric binop.
     pub(crate) fn consider_binop_j2(
         &mut self,
         dst: OpRef,
@@ -176,7 +176,7 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![loc, argloc], Some(loc), output);
     }
 
-    /// x86/regalloc.py:552 `_consider_binop_symm` — symmetric binop
+    /// x86/regalloc.py `_consider_binop_symm` — symmetric binop
     /// with the swap heuristic.
     pub(crate) fn consider_binop_symm_j2(
         &mut self,
@@ -190,7 +190,7 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![loc, argloc], Some(loc), output);
     }
 
-    /// x86/regalloc.py:556 `_consider_lea` — emits `LEA dst, [lhs +
+    /// x86/regalloc.py `_consider_lea` — emits `LEA dst, [lhs +
     /// rhs]` so the result register can differ from `lhs`. Limited
     /// to RHS constants that fit a 32-bit displacement.
     fn _consider_lea_j2(
@@ -208,7 +208,7 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![loc, argloc], Some(resloc), output);
     }
 
-    /// x86/regalloc.py:566 `consider_int_add` — LEA shortcut when
+    /// x86/regalloc.py `consider_int_add` — LEA shortcut when
     /// the RHS is a 32-bit-fitting immediate, otherwise symmetric
     /// 2-operand `ADD dst, src`.
     pub(crate) fn consider_int_add_j2(
@@ -228,7 +228,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_binop_symm_j2(dst, lhs, rhs, i, output);
     }
 
-    /// x86/regalloc.py:575 `consider_int_sub` — LEA shortcut with
+    /// x86/regalloc.py `consider_int_sub` — LEA shortcut with
     /// negated immediate (`LEA dst, [lhs - imm]`).
     pub(crate) fn consider_int_sub_j2(
         &mut self,
@@ -240,7 +240,7 @@ impl<'a> RegAlloc<'a> {
     ) {
         if rhs.is_constant() {
             let val = self.const_value(rhs);
-            // x86/regalloc.py:577 `rx86.fits_in_32bits(-y.value)`. The
+            // x86/regalloc.py `rx86.fits_in_32bits(-y.value)`. The
             // negate-then-range-check filters `i64::MIN` naturally
             // because `wrapping_neg(i64::MIN) == i64::MIN`, which sits
             // outside the i32 range, so the LEA shortcut is skipped
@@ -252,7 +252,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_binop_j2(dst, lhs, rhs, i, output);
     }
 
-    /// x86/regalloc.py:624 `consider_int_lshift` — shift count must
+    /// x86/regalloc.py `consider_int_lshift` — shift count must
     /// be in ECX (`SHL/SHR/SAR reg, CL`) unless it's an immediate.
     pub(crate) fn consider_int_lshift_j2(
         &mut self,
@@ -281,7 +281,7 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![loc1, loc2], Some(loc1), output);
     }
 
-    /// x86/regalloc.py:589 `consider_int_add_ovf = _consider_binop_symm`.
+    /// x86/regalloc.py `consider_int_add_ovf = _consider_binop_symm`.
     /// Distinct from `consider_int_add` because the LEA shortcut does
     /// not set CPU flags and cannot be used when the trace needs the
     /// overflow condition.
@@ -296,7 +296,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_binop_symm_j2(dst, lhs, rhs, i, output);
     }
 
-    /// x86/regalloc.py:588 `consider_int_sub_ovf = _consider_binop`.
+    /// x86/regalloc.py `consider_int_sub_ovf = _consider_binop`.
     /// LEA cannot set flags, so SUB-via-LEA is unavailable for the
     /// overflow form.
     pub(crate) fn consider_int_sub_ovf_j2(
@@ -310,7 +310,7 @@ impl<'a> RegAlloc<'a> {
         self.consider_binop_j2(dst, lhs, rhs, i, output);
     }
 
-    /// x86/regalloc.py:612 `consider_int_neg` / `consider_int_invert`
+    /// x86/regalloc.py `consider_int_neg` / `consider_int_invert`
     /// — `NEG dst` and `NOT dst` overwrite their argument register.
     pub(crate) fn consider_unary_int_j2(
         &mut self,
@@ -333,7 +333,7 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![loc], Some(loc), output);
     }
 
-    /// x86/regalloc.py:1199 `consider_int_is_true` / `consider_int_is_zero`.
+    /// x86/regalloc.py `consider_int_is_true` / `consider_int_is_zero`.
     /// `TEST src, src ; SETcc dst` — input does not need to be in a
     /// register, and the result is allocated via
     /// `force_allocate_reg_or_cc` so that consumers like
@@ -352,7 +352,7 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![argloc], Some(resloc), output);
     }
 
-    /// x86/regalloc.py:591 `consider_uint_mul_high` — emits `MUL src`,
+    /// x86/regalloc.py `consider_uint_mul_high` — emits `MUL src`,
     /// which clobbers EAX (low) and EDX (high), so EAX must be
     /// pinned to one operand and EDX to the result.
     pub(crate) fn consider_uint_mul_high_j2(

@@ -77,7 +77,7 @@ pub struct JitInterpConfig {
     pub greens_declared: bool,
     /// Slice (audit Issue #6) — explicit red declarations for the
     /// dispatch JitCode `BC_JIT_MERGE_POINT` payload.  RPython
-    /// `jtransform.py:1700 make_three_lists(op.args[2+num_green_args:])`
+    /// `jtransform.py make_three_lists(op.args[2+num_green_args:])`
     /// derives reds from the marker call's tail args; pyre's marker is
     /// stateless (no tail args), so consumers declare the reds via
     /// this config slot instead.  Empty = use the default candidate
@@ -114,7 +114,7 @@ pub struct JitInterpConfig {
     pub recover: Option<Path>,
     /// Optional concrete fallback for `recursive_portal_call!` (a recursive
     /// portal re-entry).  The function is the runtime analog of the portal
-    /// runner (`jd.portal_runner_ptr`, call.py:363): the transformed
+    /// runner (`jd.portal_runner_ptr`, call.py): the transformed
     /// (concrete) function calls it with the macro greens forwarded
     /// positionally (jitdriver declaration order), while the dispatch JitCode
     /// emits `BC_RECURSIVE_CALL_*`.  Required iff the body uses
@@ -154,7 +154,7 @@ pub struct JitInterpConfig {
     /// u32, ... }`.  A field access lowers to `getfield_gc_i` /
     /// `setfield_gc_i` either way; what this adds is the field's real width
     /// and signedness, which the descr otherwise reports as a full signed
-    /// machine word.  `descr.py:218-239 get_field_descr` takes both from
+    /// machine word.  `descr.py get_field_descr` takes both from
     /// `FIELDTYPE`, and `intbounds.py` narrows a load's range only when
     /// `descr.is_integer_bounded()` — true exactly for a sub-word integer
     /// field.  Undeclared fields keep the machine-word default, so this is
@@ -188,7 +188,7 @@ pub struct JitInterpConfig {
     /// IR opcode (e.g. `IntAdd`) directly instead of routing through the
     /// call-policy machinery.  The concrete path calls the function normally.
     /// In RPython, `int + int` is lowered to `int_add` at rtype time
-    /// (rint.py:314 `_rtype_template`), so the JIT codewriter never sees a
+    /// (rint.py `_rtype_template`), so the JIT codewriter never sees a
     /// call.  In pyre's LLBC tracer, the equivalent Rust function call
     /// (e.g. `val_add`) is still visible, so this config rewrites it to a
     /// native IR binop at codewriter time.
@@ -441,7 +441,7 @@ pub struct RefFieldEntry {
 /// What it buys is descr identity. A field the outer struct does not itself
 /// declare is *owned* by the base, so an access reaching it is re-expressed
 /// against the base before the field key and the type id are built.
-/// `rclass.py:987-1001 InstanceRepr.getfield` does the same by recursing to
+/// `rclass.py InstanceRepr.getfield` does the same by recursing to
 /// `self.rbase` with `force_cast=True`, which leaves `jtransform.py:881`
 /// reading the descr off the declaring struct in every case — so one physical
 /// field has one descr for a whole family of outer structs, however many of
@@ -500,7 +500,7 @@ pub struct IntFieldEntry {
 }
 
 impl IntFieldEntry {
-    /// `descr.py:240-254 get_type_flag(FIELDTYPE)` — the signed/unsigned half,
+    /// `descr.py get_type_flag(FIELDTYPE)` — the signed/unsigned half,
     /// read off the declared Rust type.
     pub(crate) fn is_signed(&self) -> syn::Result<bool> {
         match self.int_type.to_string().as_str() {
@@ -518,7 +518,7 @@ impl IntFieldEntry {
 pub(crate) enum CallPolicyKind {
     ResidualVoid,
     ResidualVoidWrapped,
-    /// `EF_CANNOT_RAISE` (`call.py:303 getcalldescr`'s non-elidable
+    /// `EF_CANNOT_RAISE` (`call.py getcalldescr`'s non-elidable
     /// `else` branch).  Producers pick this when they statically know
     /// the callee cannot raise but is otherwise neither elidable nor
     /// loop-invariant — e.g. flat TLS / buffer shims.  Maps to
@@ -533,7 +533,7 @@ pub(crate) enum CallPolicyKind {
     LoopInvariantVoidWrapped,
     ResidualInt,
     ResidualIntWrapped,
-    /// `EF_CANNOT_RAISE` (`call.py:303 getcalldescr`'s non-elidable
+    /// `EF_CANNOT_RAISE` (`call.py getcalldescr`'s non-elidable
     /// `else` branch) for int-returning residual helpers.  Mirrors
     /// the void-side `ResidualVoidCannotRaise` pair.  Producers pick
     /// this when the callee is statically known to be non-elidable
@@ -600,7 +600,7 @@ pub(crate) enum CallPolicyKind {
     /// than a macro-generated `__majit_inline_jitcode_<name>` helper. Int /
     /// Ref / Float select the trailing-return register kind read back into the
     /// caller binding; Void records a statement-position call with no result.
-    /// `make_jitcodes()` (codewriter.py:89) builds the callee; the dispatch
+    /// `make_jitcodes()` (codewriter.py) builds the callee; the dispatch
     /// traces into it the same way `Inline*` does, only the jitcode source
     /// differs.
     InlinePipelineInt,
@@ -636,7 +636,7 @@ pub(crate) fn parse_call_policy_kind(kind: &Ident) -> Option<CallPolicyKind> {
         "release_gil_int_wrapped" => CallPolicyKind::ReleaseGilIntWrapped,
         "loopinvariant_int" => CallPolicyKind::LoopInvariantInt,
         "loopinvariant_int_wrapped" => CallPolicyKind::LoopInvariantIntWrapped,
-        // `call.py:292-299 _canraise(op)` 3-way pick on the elidable
+        // `call.py _canraise(op)` 3-way pick on the elidable
         // branch. `elidable_*` (no suffix) is the EF_ELIDABLE_CAN_RAISE
         // default; `_cannot_raise` / `_or_memerror` map to
         // EF_ELIDABLE_CANNOT_RAISE / EF_ELIDABLE_OR_MEMORYERROR.
@@ -1044,7 +1044,7 @@ pub(crate) fn parse_int_fields_map(input: ParseStream) -> syn::Result<Vec<IntFie
 /// The struct that DECLARES `field`, following inlined leading substructures
 /// outward-in.
 ///
-/// `rclass.py:987-1001 InstanceRepr.getfield` resolves a field against the repr
+/// `rclass.py InstanceRepr.getfield` resolves a field against the repr
 /// that owns it: `if attr in self.fields` … else recurse to `self.rbase` with
 /// `force_cast=True`.  That cast is why `jtransform.py:881` always reads the
 /// descr off the declaring struct, and so why one physical field has one
@@ -1740,7 +1740,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 __driver.dispatch_jitcode().cloned();
             __driver.merge_point(|__meta, __sym| {
                 use majit_metainterp::JitCodeSym;
-                // pyjitpl.py:1574 `self.pc = saved_pc`: a merge point whose
+                // pyjitpl.py `self.pc = saved_pc`: a merge point whose
                 // `reached_loop_header` returned without closing (the
                 // `current_merge_points.append` path, :3058-3060) resumes the
                 // walk at the merge point's own guest pc. This closure is
@@ -1820,7 +1820,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     )
                     .expect("merge_point invariant: tracing must be Some");
                 __sym.trace_started = true;
-                // pyjitpl.py:2843 blackhole_if_trace_too_long — check
+                // pyjitpl.py blackhole_if_trace_too_long — check
                 // AFTER executing the step (RPython _interpret loop order).
                 let __too_long = __meta
                     .trace_ctx()
@@ -2351,7 +2351,7 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
 
 /// How a compiled run that ended in FINISH is returned from the portal.
 ///
-/// `compile.py:623-638` marks a FINISH descr `final_descr = True`: the traced
+/// `compile.py` marks a FINISH descr `final_descr = True`: the traced
 /// function has RETURNED, and upstream unwinds the portal by raising
 /// `jitexc.DoneWithThisFrame*`. `back_edge*` reports `Option<resume_pc>`, which
 /// has no variant for that, so the result travels out of band in the driver
@@ -3085,7 +3085,7 @@ fn rewrite_body(
                                 // args sit in fixed positional slots whose
                                 // lltype is fixed by declaration
                                 // (`warmstate.py:564 _green_args_spec`,
-                                // `support.py:126 decode_hp_hint_args`
+                                // `support.py decode_hp_hint_args`
                                 // asserts on count mismatch at translation
                                 // time).  Positional inheritance of
                                 // declaration tags therefore matches

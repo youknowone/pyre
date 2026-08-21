@@ -158,7 +158,7 @@ pub fn gc_diag_counters() -> (usize, usize, usize, usize) {
 mod tests {
     use super::*;
 
-    /// rpython/rlib/rstack.py:42 stack_check / assembler.py:1080
+    /// rpython/rlib/rstack.py stack_check / assembler.py:1080
     /// _call_header_with_stack_check parity contract: backend slowpath
     /// wrappers MUST construct a fresh `RecursionError` and place it
     /// into the current thread's pending JIT exception slot; the JIT

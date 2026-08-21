@@ -175,7 +175,7 @@ pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<*mut u8>
 /// returned `null`; every traced caller already treats those two cases
 /// identically (fall back to `malloc_typed`), so the `Option` discriminant
 /// carries no information the caller reads.  Residualising this primitive
-/// (`@dont_look_inside`, `rlib/jit.py:139`) keeps the process-global hook
+/// (`@dont_look_inside`, `rlib/jit.py`) keeps the process-global hook
 /// dispatch out of the trace — a `*mut u8` return has no discriminant to
 /// erase, unlike the `Option<*mut u8>` accessor.
 #[majit_macros::dont_look_inside]
@@ -253,7 +253,7 @@ pub unsafe fn try_gc_alloc_collecting_rooted(
 }
 
 /// Signature of the host-side full-collection callback. Used by
-/// `pypy/module/gc/interp_gc.py:7-26 collect` ports — i.e. user-level
+/// `pypy/module/gc/interp_gc.py collect` ports — i.e. user-level
 /// `gc.collect()` reaches the live GC through this hook.
 pub type GcCollectHookFn = fn();
 
@@ -279,7 +279,7 @@ pub fn try_gc_collect() {
     }
 }
 
-/// `incminimark.py:810-822 collect_step` callback. The pair is the encoded
+/// `incminimark.py collect_step` callback. The pair is the encoded
 /// `(old_state, new_state)` transition; keeping the hook in primitive terms
 /// avoids making pyre-object depend on majit-gc.
 pub type GcCollectStepHookFn = fn() -> (u8, u8);
@@ -623,7 +623,7 @@ pub fn try_gc_current_object_address(addr: *mut u8) -> *mut u8 {
     majit_gc::gc_current_object_address(addr as usize) as *mut u8
 }
 
-/// minimark.py:1900-1915 `identityhash` hook.
+/// minimark.py `identityhash` hook.
 /// Returns a GC-move-stable address for the given object.
 pub type GcIdentityHashHookFn = fn(obj_addr: usize) -> usize;
 

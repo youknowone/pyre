@@ -106,7 +106,7 @@ pub unsafe extern "C" fn PyImport_ImportModuleAttrString(
     attribute
 }
 
-/// `import_.py:33 PyImport_GetModuleDict()` — `sys.modules`, borrowed.
+/// `import_.py PyImport_GetModuleDict()` — `sys.modules`, borrowed.
 ///
 /// The borrow is sound where `PyImport_AddModule`'s is not: the modules dict
 /// is made during start-up and lives for as long as the interpreter does, so
@@ -124,7 +124,7 @@ pub unsafe extern "C" fn PyImport_GetModuleDict() -> *mut CPyObject {
     pyobject::borrow_mirror(modules)
 }
 
-/// `import_.py:58 PyImport_ImportModuleLevelObject(name, globals, locals,
+/// `import_.py PyImport_ImportModuleLevelObject(name, globals, locals,
 /// fromlist, level)` — `__import__` with each of its arguments.
 ///
 /// A NULL stands for the argument's default, which is what an extension that

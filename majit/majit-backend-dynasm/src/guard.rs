@@ -1,5 +1,5 @@
 /// assembler.py ResumeGuardDescr parity: fail descriptor; the patchable
-/// jump offset (`history.py:132 _attrs_` `adr_jump_offset`) lives on the
+/// jump offset (`history.py _attrs_` `adr_jump_offset`) lives on the
 /// metainterp `ResumeGuardDescr` (`majit-metainterp/src/compile.rs`) and
 /// is accessed here via `meta_resume_fd()` forwarding.
 use majit_ir::FailDescr;
@@ -7,12 +7,12 @@ use majit_ir::FailDescr;
 // Descr-by-address recovery is now a pure `Arc::from_raw` against the
 // `FailDescrCell` wrapper baked at codegen time —
 // `majit_ir::recover_fail_descr_cell(addr)` in `majit-ir/src/descr.rs`.
-// `history.py:113 AbstractDescr.show(cpu, descr_gcref) =
+// `history.py AbstractDescr.show(cpu, descr_gcref) =
 // cast_gcref_to_instance(...)` parity.  The strong refcount is held by
-// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py:294`).
+// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py`).
 
 // RECOVERY_LAYOUT_TABLE removed: `recovery_layout` is not in
-// PyPy `AbstractFailDescr._attrs_` (`history.py:132`).  Upstream resume
+// PyPy `AbstractFailDescr._attrs_` (`history.py`).  Upstream resume
 // code (`resume.py:450-488`) decodes recovery on demand from
 // `rd_numb / rd_consts / rd_virtuals / rd_pendingfields`.  Pyre's
 // metainterp `StoredExitLayout.recovery_layout` (populated by
@@ -26,7 +26,7 @@ use majit_ir::FailDescr;
 // (`history.py:132 _attrs_`).  All readers (`lib.rs:handle_fail_*` and
 // `runner.rs::execute_token`) now decode `descr.rd_locs()` directly
 // via `decode_rd_loc_slot`, matching PyPy's
-// `llmodel.py:422-424 _decode_pos`.
+// `llmodel.py _decode_pos`.
 
 /// Re-export the shared per-cpu descr attachment types so existing
 /// `crate::guard::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle}`
@@ -40,7 +40,7 @@ use majit_ir::FailDescr;
 pub use majit_backend::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle};
 
 /// Re-export the slot decoder for the same reason: `_decode_pos` is a method
-/// on `AbstractLLCPU` (`llmodel.py:422-424`), not a per-arch entry, so its
+/// on `AbstractLLCPU` (`llmodel.py`), not a per-arch entry, so its
 /// definition sits in `majit-backend`'s `llmodel` beside the direct readers it
 /// feeds, and `crate::guard::decode_rd_loc_slot` keeps resolving here.
 pub use majit_backend::llmodel::decode_rd_loc_slot;
@@ -49,7 +49,7 @@ pub use majit_backend::llmodel::decode_rd_loc_slot;
 // `assembler.py` carries no per-emission descr wrapper — every guard
 // op's `op.descr` is the same `ResumeGuardDescr` Arc that the metainterp
 // stamps, and every FINISH emission writes the cpu-attached singleton
-// (`compile.py:665-674 make_and_attach_done_descrs`) directly into
+// (`compile.py make_and_attach_done_descrs`) directly into
 // `jf_descr`.  After the Unified-Descr port the backend no longer
 // owned any field worth wrapping, and the singleton-direct push
 // eliminated the last constructor of the wrapper.  All readers reach
@@ -65,7 +65,7 @@ pub use majit_backend::llmodel::decode_rd_loc_slot;
 /// `fail_index` / `trace_id` are explicit caller arguments rather than
 /// reads off `fd.fail_index_per_trace()` / `fd.trace_id()` so the
 /// `fail_descrs` Vec position can be the identity source.  Singleton
-/// FINISH descrs (`compile.py:623-662 _DoneWithThisFrameDescr` /
+/// FINISH descrs (`compile.py _DoneWithThisFrameDescr` /
 /// `ExitFrameWithExceptionDescrRef`) share an Arc across emissions and
 /// answer the trait-default `0` for both methods; the layout pipeline
 /// must read position from the Vec, not from the descr.

@@ -377,7 +377,7 @@ fn is_recast_narrow(kind: &OpKind) -> bool {
 /// An unregistered `next()` returns an opaque `Ref`; the MIR immediately
 /// narrows it to the concrete `Option<T>` with one or more pure
 /// `__pyre_cast_instance` recasts (the front-end analogue of
-/// `ListIteratorRepr::rtype_next`'s `recast`, `rpython/rtyper/rlist.py:448`).
+/// `ListIteratorRepr::rtype_next`'s `recast`, `rpython/rtyper/rlist.py`).
 /// Peel that trailing chain: starting from the raw `next` result at
 /// `next_idx`, follow each contiguous recast whose sole operand is the prior
 /// result, and return the chain's final result — the value the block forwards
@@ -496,7 +496,7 @@ fn rewire_one_next_site(
     // returns an opaque `Ref` that the MIR immediately recasts to the
     // concrete `Option<T>` via one or more pure `__pyre_cast_instance`
     // narrows (the front-end analogue of `ListIteratorRepr::rtype_next`'s
-    // `recast`, `rpython/rtyper/rlist.py:448` `self.r_list.recast`).  Such a
+    // `recast`, `rpython/rtyper/rlist.py` `self.r_list.recast`).  Such a
     // narrow is a `cast_pointer` alias, so the native `next` op subsumes it:
     // peel the trailing chain and scrutinise its final result as the Option.
     let effective_opt = peel_recast_chain(graph, a, next_idx, opt, "next()")?;
@@ -599,8 +599,8 @@ fn rewire_one_next_site(
 
     // None arm (StopIteration exit): the loop-break continuation.  RPython's
     // `ll_listnext` raises `StopIteration` with NO value on the exhaustion
-    // path (`rpython/rtyper/lltypesystem/rlist.py:476` ll_listnext;
-    // `rpython/rtyper/rlist.py:444` rtype_next — the iteration value is
+    // path (`rpython/rtyper/lltypesystem/rlist.py` ll_listnext;
+    // `rpython/rtyper/rlist.py` rtype_next — the iteration value is
     // defined solely on the normal path), so a forwarded `Option` scrutinee
     // `opt_c` is a Rust value-encoded SSA merge-thread with no RPython
     // counterpart.  Prune it and its whole transitive forward chain iff every

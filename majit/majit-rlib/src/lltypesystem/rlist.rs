@@ -64,7 +64,7 @@ static GC_FLOAT_ARRAY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
 /// ids feed (`ACTIVE_ALLOC_NURSERY_TYPED`) is a single global cell as well.
 /// One host per process is a standing assumption of the whole allocation path,
 /// not a shortcut taken here. Upstream carries no such cell:
-/// `GcLLDescr_framework.init_array_descr` (`gc.py:544-549`) reads the tid off
+/// `GcLLDescr_framework.init_array_descr` (`gc.py`) reads the tid off
 /// `self.layoutbuilder` and writes it into the individual `ArrayDescr`, both
 /// instance-owned, so two backends in one process keep separate ids. Pyre has
 /// no descriptor object at the allocation site — the block allocators take a
@@ -231,11 +231,11 @@ pub unsafe fn alloc_typed_items_block_nursery(cap: usize, tid: u32) -> *mut Type
 
 /// Fallible companion of [`alloc_typed_items_block_nursery`].
 ///
-/// `ll_newlist` (rlist.py:324-329) allocates the items array and writes the
+/// `ll_newlist` (rlist.py) allocates the items array and writes the
 /// length header; the items keep whatever the nursery held, because
-/// `malloc_zero_filled` is false for incminimark (incminimark.py:211). Callers
+/// `malloc_zero_filled` is false for incminimark (incminimark.py). Callers
 /// that need `[0] * n` clear it themselves with [`typed_items_block_clear`],
-/// which is what `ll_alloc_and_set` does (rtyper/rlist.py:494-503); callers
+/// which is what `ll_alloc_and_set` does (rtyper/rlist.py); callers
 /// building a list display write every slot.
 ///
 /// # Safety
@@ -269,7 +269,7 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
              `set_gc_int_array_gc_type_id` / `set_gc_float_array_gc_type_id`"
         );
         // `GcArray(Signed)` / `GcArray(Float)` bodies: no finalizer, not a
-        // WEAKREF, so `gct_fv_gc_malloc` (`framework.py:820-838`) reaches
+        // WEAKREF, so `gct_fv_gc_malloc` (`framework.py`) reaches
         // `malloc_fast`.
         //
         // The twin taken here is the non-collecting one, and that is a
@@ -328,14 +328,14 @@ pub unsafe fn typed_items_block_clear(block: *mut TypedItemsBlock) {
 /// What it owns is the *vocabulary*. Upstream draws this line already:
 /// `rbigint.py` writes `[NULLDIGIT] * size` and `rbigint(digits, sign, size)`
 /// and never names a malloc, an allocation tier, or an array type id — the
-/// rtyper supplies those, `ll_newlist` (rlist.py:324-329) and
-/// `ll_alloc_and_set` (rtyper/rlist.py:494-503). A consumer of this type
+/// rtyper supplies those, `ll_newlist` (rlist.py) and
+/// `ll_alloc_and_set` (rtyper/rlist.py). A consumer of this type
 /// spells the list operation; the array's GC type id and the tier it is
 /// allocated in stay here.
 pub struct Digits;
 
 impl Digits {
-    /// `ll_newlist(LIST, length)` (rlist.py:324-329) — allocate the items
+    /// `ll_newlist(LIST, length)` (rlist.py) — allocate the items
     /// array without initializing it. `malloc_zero_filled` is false for
     /// incminimark (incminimark.py:211), so the items keep whatever the
     /// nursery held.
@@ -362,7 +362,7 @@ impl Digits {
         unsafe { try_alloc_typed_items_block_nursery(length, gc_int_array_gc_type_id()) }
     }
 
-    /// `ll_alloc_and_set(LIST, count, 0)` (rtyper/rlist.py:494-503) —
+    /// `ll_alloc_and_set(LIST, count, 0)` (rtyper/rlist.py) —
     /// `ll_newlist` followed by `rgc.ll_arrayclear`. This is what
     /// `[NULLDIGIT] * count` lowers to.
     ///

@@ -2,11 +2,11 @@
 //!
 //! Ports `rpython/jit/metainterp/optimizeopt/bridgeopt.py`:
 //!
-//! * `serialize_optimizer_knowledge` (bridgeopt.py:63-122) writes the
+//! * `serialize_optimizer_knowledge` (bridgeopt.py) writes the
 //!   known-class bitfield + heap field/array triples + loopinvariant
 //!   call-result tuples onto a guard's `rd_numb` stream when finishing
 //!   resume data.
-//! * `deserialize_optimizer_knowledge` (bridgeopt.py:124-185) reads those
+//! * `deserialize_optimizer_knowledge` (bridgeopt.py) reads those
 //!   sections back at bridge-compile time and applies the facts directly
 //!   onto the bridge optimizer (`Optimizer::make_constant_class`,
 //!   `import_heap_knowledge`, `import_loopinvariant_knowledge`). RPython
@@ -25,7 +25,7 @@ use majit_ir::OpRef;
 use crate::optimizeopt::OptContext;
 pub use crate::resume::decode_box;
 
-/// bridgeopt.py:36-40 tag_box.
+/// bridgeopt.py tag_box.
 pub fn tag_box(
     opref: OpRef,
     liveboxes_from_env: &crate::resume::LiveboxMap,
@@ -36,7 +36,7 @@ pub fn tag_box(
     memo._gettagged(opref, env, liveboxes_from_env, new_liveboxes)
 }
 
-/// bridgeopt.py:124-185 deserialize_optimizer_knowledge.
+/// bridgeopt.py deserialize_optimizer_knowledge.
 ///
 /// Read optimizer knowledge from the guard's rd_numb and apply it
 /// directly to the optimizer passes. RPython parity: the function
@@ -45,7 +45,7 @@ pub fn tag_box(
 /// bridgeopt.py:124 signature:
 /// deserialize_optimizer_knowledge(optimizer, resumestorage, frontend_boxes, liveboxes)
 ///
-/// bridgeopt.py:63-122 `serialize_optimizer_knowledge(optimizer,
+/// bridgeopt.py `serialize_optimizer_knowledge(optimizer,
 /// numb_state, liveboxes, liveboxes_from_env, memo)`.
 ///
 /// Emits three serialized sections on every guard (RPython emits zeros
@@ -69,7 +69,7 @@ pub fn serialize_optimizer_knowledge(
     env: &dyn majit_ir::BoxEnv,
     optimizer_knowledge: Option<&crate::resume::OptimizerKnowledgeForResume>,
 ) {
-    // bridgeopt.py:64-67 `available_boxes = {}` followed by
+    // bridgeopt.py `available_boxes = {}` followed by
     // `available_boxes[box] = None` — RPython uses a dict as a
     // membership set (values are always None). Pyre uses a Vec scanned
     // linearly: the no-HashMap rule precludes a hash-backed mirror, and
@@ -101,11 +101,11 @@ pub fn serialize_optimizer_knowledge(
     // an out-of-bounds rd_numb read in `deserialize_optimizer_knowledge`
     // when super-instruction GEN widens the live register set.
     //
-    // bridgeopt.py:76-77 opens the loop with `if box is None or box.type != "r"`,
+    // bridgeopt.py opens the loop with `if box is None or box.type != "r"`,
     // so upstream emits no bit for a hole. It can also afford not to test for one
     // when reading (bridgeopt.py:135), because
     // `initialize_state_from_guard_failure` has already dropped them —
-    // `return [box for box in inputargs_and_holes if box]` (pyjitpl.py:3310).
+    // `return [box for box in inputargs_and_holes if box]` (pyjitpl.py).
     // pyre has no such filter: a bridge's inputargs are one per fail-arg slot,
     // holes included, and `store_final_boxes_in_guard` types every hole `Ref`.
     // The reader therefore walks the hole positions, and skipping them here
@@ -215,8 +215,8 @@ pub fn serialize_optimizer_knowledge(
 
 /// `frontend_boxes`: runtime values from guard failure (RPython Box objects
 ///   with concrete references). Used by `cpu.cls_of_box` to read vtable.
-/// `cpu`: `optimizer.cpu` (model.py:39 `AbstractCPU`).  Dispatches
-///   `cpu.cls_of_box(frontend_boxes[i])` for bridgeopt.py:145-146
+/// `cpu`: `optimizer.cpu` (model.py `AbstractCPU`).  Dispatches
+///   `cpu.cls_of_box(frontend_boxes[i])` for bridgeopt.py
 ///   `make_constant_class`.
 #[expect(
     clippy::too_many_arguments,
@@ -289,7 +289,7 @@ pub fn deserialize_optimizer_knowledge(
                     majit_ir::GcRef(raw_ref as usize),
                 ));
                 let cls = cpu.cls_of_box(&const_box);
-                // optimizer.py:137-152 `make_constant_class` updates
+                // optimizer.py `make_constant_class` updates
                 // `_forwarded` after `get_box_replacement`. `livebox` is a
                 // bridge livebox (= inputarg materialized by
                 // `ensure_inputarg_bindings`, which runs before

@@ -62,7 +62,7 @@ fn getfield_gc_i_pureornot(
     // Record the plain GETFIELD_GC_I opnum regardless of
     // `descr.is_always_pure()`; purity is re-derived from the descr by
     // OptHeap. There is no pure getfield opnum.
-    // pyjitpl.py:948 cache-miss `execute_with_descr` routes through
+    // pyjitpl.py cache-miss `execute_with_descr` routes through
     // `execute_and_record`, which counts OPS and RECORDED_OPS.
     ctx.profiler()
         .count_ops(OpCode::GetfieldGcI, crate::counters::OPS);
@@ -138,7 +138,7 @@ pub fn trace_box_int(
     // jtransform.py:908-911 parity: typeptr setfield filtered in trace.
     // rewrite.py:479-484 GC rewriter emits vtable via fielddescr_vtable.
     let obj = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
-    // pyjitpl.py:2714-2718 `execute_new_with_vtable` stamps BOTH halves —
+    // pyjitpl.py `execute_new_with_vtable` stamps BOTH halves —
     // `heapcache.new(resbox)` AND `heapcache.class_now_known(resbox)`; only
     // plain `execute_new` (:2720-2723) stops at `new`. The vtable the GC
     // rewriter writes from `size_descr` IS the class, so it is known by
@@ -292,7 +292,7 @@ pub fn getfield_gc_f_pureornot(
     // Record the plain GETFIELD_GC_F opnum regardless of
     // `descr.is_always_pure()`; purity is re-derived from the descr by
     // OptHeap. There is no pure getfield opnum.
-    // pyjitpl.py:948 cache-miss `execute_with_descr` routes through
+    // pyjitpl.py cache-miss `execute_with_descr` routes through
     // `execute_and_record`, which counts OPS and RECORDED_OPS.
     ctx.profiler()
         .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
@@ -345,7 +345,7 @@ pub fn trace_box_float(
     // RPython parity: NEW_WITH_VTABLE + jtransform.py typeptr filter +
     // rewrite.py GC rewriter fielddescr_vtable emission.
     let obj = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
-    // pyjitpl.py:2714-2718: `execute_new_with_vtable` records the class too.
+    // pyjitpl.py: `execute_new_with_vtable` records the class too.
     // Same reasoning as `trace_box_int`.
     ctx.heap_cache_mut().new_object(obj);
     ctx.heap_cache_mut().class_now_known(obj, float_type_addr);

@@ -1,12 +1,12 @@
 //! A virtualizable too large to number must abandon the compile, not compile a
 //! guard that has no resume data.
 //!
-//! `resume.py:96-103` raises `TagOverflow` once a livebox index no longer fits
+//! `resume.py` raises `TagOverflow` once a livebox index no longer fits
 //! the tag's 13 value bits, and `optimizer.py:761-766
 //! store_final_boxes_in_guard` answers it with `raise compile.giveup()` — the
 //! whole compilation is abandoned and the interpreter keeps running from state
 //! it never handed over. Every element of a virtualizable array is a distinct
-//! livebox (`resume.py:243-247 _number_boxes`), so a long enough declared
+//! livebox (`resume.py _number_boxes`), so a long enough declared
 //! length reaches that limit on its own.
 //!
 //! What makes this a correctness test rather than a capacity one: the failure

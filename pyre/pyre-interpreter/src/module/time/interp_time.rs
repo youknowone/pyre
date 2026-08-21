@@ -99,7 +99,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    // `timeutils.py:20-38 timestamp_w` — reduce the argument to an integer
+    // `timeutils.py timestamp_w` — reduce the argument to an integer
     // number of nanoseconds. A float scales then `math.ceil`s, with an
     // `ovfcheck_float_to_longlong` overflow guard and a NaN ValueError; an
     // int (or bool, an int subclass) takes `bigint_w().tolonglong()` and
@@ -137,7 +137,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let big = pyre_object::longobject::w_long_get_value(args[0]);
                 i64::try_from(big).map_err(|_| overflow())?
             } else {
-                // `timeutils.py:31` — `space.bigint_w(w_secs)` applies
+                // `timeutils.py` — `space.bigint_w(w_secs)` applies
                 // `space.int`, so an object with `__int__` / `__index__` is
                 // accepted and reduced to a longlong.
                 let has_int = crate::baseobjspace::lookup(args[0], "__int__").is_some()
@@ -161,7 +161,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             sec.checked_mul(SECS_TO_NS).ok_or_else(overflow)?
         }
     };
-    // `interp_time.py:624` — `if not (timeout >= 0)`.
+    // `interp_time.py` — `if not (timeout >= 0)`.
     if timeout_ns < 0 {
         return Err(crate::PyError::value_error(
             "sleep length must be non-negative",
@@ -171,7 +171,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(w_none());
     }
     let dur = std::time::Duration::from_nanos(timeout_ns as u64);
-    // `nanosleep` is a `releasegil=True` external (interp_time.py:504-506), so
+    // `nanosleep` is a `releasegil=True` external (interp_time.py), so
     // only the blocking call itself runs outside the free-threaded GC's STW
     // RUNNING census.  `checksignals` runs with the GIL re-acquired
     // (interp_time.py:707), i.e. with the mutator back in the census — so the
@@ -189,7 +189,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
-        // `interp_time.py:622-710 time_sleep` — sleep toward a monotonic
+        // `interp_time.py time_sleep` — sleep toward a monotonic
         // deadline; on EINTR deliver any pending signal and retry with the
         // remaining time, breaking once the deadline has passed.
         let deadline = std::time::Instant::now() + dur;
@@ -261,7 +261,7 @@ pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(w_int_new(monotonic_nanos() as i64))
 }
 
-/// `interp_time.py:915-932 _get_time_info` — fill the app-level namespace
+/// `interp_time.py _get_time_info` — fill the app-level namespace
 /// used by `time.get_clock_info`.  The observable fields follow Python 3.14;
 /// all clocks exposed by pyre have nanosecond representation internally.
 pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -313,7 +313,7 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             }
         }
         "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false),
-        // `interp_time.py:926` gates `thread_time` on HAS_THREAD_TIME; describe
+        // `interp_time.py` gates `thread_time` on HAS_THREAD_TIME; describe
         // it only where the platform carries CLOCK_THREAD_CPUTIME_ID and the
         // host clock is wired (the exact gate under which mod.rs registers the
         // `thread_time` function), so the report never names a clock whose
@@ -913,7 +913,7 @@ fn c_tm_to_libc_tm(tm: &c_tm) -> libc::tm {
     }
 }
 
-/// `interp_time.py:512-611 _init_timezone` — derive the module's four
+/// `interp_time.py _init_timezone` — derive the module's four
 /// timezone attributes from libc's January/July broken-down times.  This
 /// preserves the standard-vs-DST ordering in both hemispheres.
 #[cfg(unix)]
@@ -969,7 +969,7 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
     );
 }
 
-/// `interp_time.py:1106-1122 tzset` — ask libc to reread `TZ`, then refresh
+/// `interp_time.py tzset` — ask libc to reread `TZ`, then refresh
 /// the values installed by `_init_timezone`.
 #[cfg(unix)]
 pub fn tzset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1113,7 +1113,7 @@ fn c_tm_to_msvc_tm(tm: &c_tm) -> MsvcTm {
     }
 }
 
-/// `app_time.py:5-23 class struct_time(metaclass=structseqtype)` —
+/// `app_time.py class struct_time(metaclass=structseqtype)` —
 /// process-wide cached subclass-of-tuple type.  The 9-field positional
 /// core, with `tm_zone` / `tm_gmtoff` as named-only extras so
 /// `n_fields == _STRUCT_TM_ITEMS == 11`.
@@ -1153,7 +1153,7 @@ fn _tm_to_tuple(tm: &c_tm) -> PyObjectRef {
     crate::_structseq::new_instance_with_extra(struct_time_type(), seq, extras)
 }
 
-/// `interp_time.py:738-758 _get_inttime` — extract integral epoch seconds
+/// `interp_time.py _get_inttime` — extract integral epoch seconds
 /// from an optional real argument (None/absent means now), rejecting NaN and
 /// values that lose at least one second when cast to the platform time_t.
 fn _get_seconds(args: &[PyObjectRef]) -> Result<time_t, crate::PyError> {
@@ -1208,7 +1208,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
         ));
     };
 
-    // `interp_time.py:801` — `space.fixedview(w_tup)` accepts any sequence
+    // `interp_time.py` — `space.fixedview(w_tup)` accepts any sequence
     // (tuple, list, struct_time), not only an exact tuple.
     let tup_w = crate::baseobjspace::fixedview(tup, -1)?;
     let len = tup_w.len();
@@ -1218,7 +1218,7 @@ fn _gettmarg(args: &[PyObjectRef], default_now: bool) -> Result<c_tm, crate::PyE
                 "argument must be sequence of at least length 9, not {len}"
             )));
         }
-        // `baseobjspace.py:1976 c_int_w` — int_w with a 32-bit range check;
+        // `baseobjspace.py c_int_w` — int_w with a 32-bit range check;
         // floats and non-integers raise rather than being truncated.
         let c_int_w =
             |i: usize| -> Result<i32, crate::PyError> { crate::baseobjspace::c_int_w(tup_w[i]) };
@@ -1304,7 +1304,7 @@ pub fn gmtime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(_tm_to_tuple(&tm))
 }
 
-/// interp_time.py:861-879 `_checktm` — guard the C-adjusted `struct tm`
+/// interp_time.py `_checktm` — guard the C-adjusted `struct tm`
 /// fields that strftime()/asctime() index, so a bad value raises a
 /// ValueError instead of letting libc index out of bounds.  Year and
 /// wday are already handled in `_gettmarg`.
@@ -1530,7 +1530,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // is not valid WTF-8; fall back to surrogateescape rather than raising,
         // mirroring str_decode_locale_surrogateescape.
         let result = match rustpython_wtf8::Wtf8Buf::from_bytes(rendered) {
-            // interp_time.py:1188 returns `space.newutf8(decoded, size)`:
+            // interp_time.py returns `space.newutf8(decoded, size)`:
             // strftime's formatted value is an ordinary runtime string.
             Ok(wtf8) => pyre_object::w_str_from_wtf8_managed(wtf8),
             Err(bytes) => crate::typedef::charp2uni(&bytes),
@@ -1718,7 +1718,7 @@ pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
 }
 
-/// `app_time.py:26-34 strptime` — parse `string` per `format`, delegating to
+/// `app_time.py strptime` — parse `string` per `format`, delegating to
 /// the shared `_strptime` module.  A non-descriptor when stored on a class,
 /// and positional-only: the `app_time.py` definition binds its parameters by
 /// keyword, but the demoted module builtin takes none (`METH_VARARGS`).
@@ -1772,7 +1772,7 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     )
 }
 
-/// `app_time.py:36-44 get_clock_info` — a `types.SimpleNamespace` filled by
+/// `app_time.py get_clock_info` — a `types.SimpleNamespace` filled by
 /// `_get_time_info`.  A non-descriptor when stored on a class, and
 /// positional-only: the `app_time.py` definition binds `name` by keyword, but
 /// the demoted module builtin takes none (`METH_VARARGS`).

@@ -56,7 +56,7 @@ fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
 // ---------------------------------------------------------------------------
 
 /// Test helper — produces a real `ResumeGuardDescr` (PyPy
-/// `compile.py:840-843 ResumeGuardDescr` family) so that
+/// `compile.py ResumeGuardDescr` family) so that
 /// `recovery_layout` storage routes through the meta-side slot.
 /// The meta slot is the sole storage; earlier
 /// test scaffolds returned a custom `TestFailDescr` that the
@@ -263,7 +263,7 @@ fn test_bridge_end_to_end() {
 
     // Pin the loop trace id to match the test's TestFailDescr defaults
     // (`trace_id() == 0`).  In production, metainterp's
-    // `record_loop_or_bridge` (compile.py:185 line-by-line counterpart)
+    // `record_loop_or_bridge` (compile.py line-by-line counterpart)
     // stamps the metainterp ResumeGuardDescr's trace_id to match the
     // backend allocation; this integration test bypasses metainterp, so
     // we instead pin the backend's `next_trace_id` to align both sides

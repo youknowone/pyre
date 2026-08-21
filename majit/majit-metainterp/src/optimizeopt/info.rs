@@ -144,14 +144,14 @@ impl EnsuredPtrInfo {
     /// PtrInfo. For `Constant` the call routes through the optional
     /// `string_length_resolver` so an exact constant length can be returned
     /// when the runtime knows it (PyPy `ConstPtrInfo.getlenbound` →
-    /// `getstrlen1(mode)` → `_unpack_str(mode)` at info.py:796-822).
+    /// `getstrlen1(mode)` → `_unpack_str(mode)` at info.py).
     pub fn getlenbound(&mut self, mode: Option<u8>) -> Option<IntBound> {
         match self {
             EnsuredPtrInfo::Constant {
                 gcref,
                 string_length_resolver,
             } => {
-                // info.py:796-802 ConstPtrInfo.getlenbound(mode):
+                // info.py ConstPtrInfo.getlenbound(mode):
                 //
                 //     def getlenbound(self, mode):
                 //         length = self.getstrlen1(mode)
@@ -159,7 +159,7 @@ impl EnsuredPtrInfo {
                 //             return IntBound.nonnegative()
                 //         return IntBound.from_constant(length)
                 //
-                // info.py:810-824 ConstPtrInfo.getstrlen1(mode):
+                // info.py ConstPtrInfo.getstrlen1(mode):
                 //
                 //     def getstrlen1(self, mode):
                 //         if mode is vstring.mode_string:    ...
@@ -242,11 +242,11 @@ pub trait StrPtrInfoExt {
 }
 
 impl StrPtrInfoExt for StrPtrInfo {
-    /// vstring.py:110/171/251/281 `getstrlen()` on the string ptrinfo classes.
+    /// vstring.py/171/251/281 `getstrlen()` on the string ptrinfo classes.
     ///
     /// Returns the structurally-known constant length for virtual variants
     /// (Plain/Slice/Concat). For the non-virtual `Ptr` variant, returns
-    /// `None` — RPython's base StrPtrInfo.getstrlen() (vstring.py:110-119)
+    /// `None` — RPython's base StrPtrInfo.getstrlen() (vstring.py)
     /// always emits STRLEN and attaches lenbound as metadata; it never
     /// extracts a constant from lenbound directly.
     fn getstrlen(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64> {
@@ -260,19 +260,19 @@ impl StrPtrInfoExt for StrPtrInfo {
                 .and_then(|b| ctx.get_constant_int_box(&b));
         }
         match &self.variant {
-            // vstring.py:110-119: base StrPtrInfo.getstrlen always emits
+            // vstring.py: base StrPtrInfo.getstrlen always emits
             // STRLEN and caches in lgtop; never returns a constant from
             // lenbound. The caller (getstrlen_opref) handles STRLEN emission.
             VStringVariant::Ptr => None,
-            // vstring.py:171-175: VStringPlainInfo.getstrlen
+            // vstring.py: VStringPlainInfo.getstrlen
             VStringVariant::Plain(info) => Some(info._chars.len() as i64),
-            // vstring.py:251-253: VStringSliceInfo.getstrlen → self.lgtop;
+            // vstring.py: VStringSliceInfo.getstrlen → self.lgtop;
             // constant only when it is an actual ConstInt (isinstance check).
             VStringVariant::Slice(info) => {
                 let b = ctx.resolve_operand_operand_opt(&info.lgtop)?;
                 ctx.get_constant_int_box(&b)
             }
-            // vstring.py:281-295: VStringConcatInfo.getstrlen
+            // vstring.py: VStringConcatInfo.getstrlen
             VStringVariant::Concat(info) => {
                 let vleft_box = ctx.resolve_operand_operand_opt(&info.vleft);
                 let vright_box = ctx.resolve_operand_operand_opt(&info.vright);
@@ -285,7 +285,7 @@ impl StrPtrInfoExt for StrPtrInfo {
         }
     }
 
-    /// vstring.py:161 / 172 / 298 `get_constant_string_spec()` on the string
+    /// vstring.py / 172 / 298 `get_constant_string_spec()` on the string
     /// ptrinfo classes.
     ///
     /// The upstream method returns either a low-level string or unicode object.
@@ -304,7 +304,7 @@ impl StrPtrInfoExt for StrPtrInfo {
                 let mut chars = Vec::with_capacity(info._chars.len());
                 for ch in &info._chars {
                     let ch_box = ch.as_ref()?;
-                    // vstring.py:179-180: `if c is None or not c.is_constant()`.
+                    // vstring.py: `if c is None or not c.is_constant()`.
                     // RPython stores the resolved char box in `_chars`, so a
                     // bare `c.is_constant()` suffices. Pyre stores the operand's
                     // position box (which forwards to its Const), so resolving
@@ -348,7 +348,7 @@ impl StrPtrInfoExt for StrPtrInfo {
         }
     }
 
-    /// vstring.py:158 / 172 / 230 `strgetitem()` shape, collapsed into a single
+    /// vstring.py / 172 / 230 `strgetitem()` shape, collapsed into a single
     /// variant-dispatch method on the Rust side.
     fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef> {
         let index = usize::try_from(index).ok()?;
@@ -360,7 +360,7 @@ impl StrPtrInfoExt for StrPtrInfo {
                 .and_then(|o| o.as_ref())
                 .map(|b| b.to_opref()),
             VStringVariant::Slice(info) => {
-                // vstring.py:490-497: index = _int_add(sinfo.start, index), then
+                // vstring.py: index = _int_add(sinfo.start, index), then
                 // the fold proceeds on `getintbound(index).is_constant()` — the
                 // IntBound of the COMPUTED index, not `isinstance(index, ConstInt)`.
                 // So a start whose IntBound is constant (even if the box is not a
@@ -393,7 +393,7 @@ impl StrPtrInfoExt for StrPtrInfo {
 /// The data type and pure-leaf methods live in `majit-ir::ptr_info`; only
 /// methods that depend on metainterp-side helpers stay here as a trait.
 pub trait PtrInfoExt {
-    /// info.py:763-772 `ConstPtrInfo.get_known_class(cpu)` + the other
+    /// info.py `ConstPtrInfo.get_known_class(cpu)` + the other
     /// PtrInfo subclasses' `_known_class` accessors. Probes
     /// `majit_gc::supports_guard_gc_type` / `majit_gc::check_is_object`
     /// when discriminating constant pointers. The `cpu` argument routes
@@ -401,7 +401,7 @@ pub trait PtrInfoExt {
     /// typeptr-at-offset-0 read (`gcremovetypeptr`) are honored.
     fn get_known_class(&self, cpu: &dyn crate::cpu::Cpu) -> Option<i64>;
 
-    /// info.py:83 `make_guards(op, short, optimizer)`. Returns false when a
+    /// info.py `make_guards(op, short, optimizer)`. Returns false when a
     /// required runtime layout guard cannot be expressed.
     fn make_guards(
         &self,
@@ -414,7 +414,7 @@ pub trait PtrInfoExt {
     /// query across `ConstPtrInfo` and `StrPtrInfo`.
     fn get_known_str_length(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64>;
 
-    /// info.py:793 ConstPtrInfo.get_constant_string_spec and
+    /// info.py ConstPtrInfo.get_constant_string_spec and
     /// vstring.py:178 / 236 / 298 — recursive constant string extraction.
     fn get_constant_string_spec(
         &self,
@@ -422,18 +422,18 @@ pub trait PtrInfoExt {
         mode: u8,
     ) -> Option<Vec<i64>>;
 
-    /// vstring.py:172 / 230 `strgetitem()` on string ptrinfo —
+    /// vstring.py / 230 `strgetitem()` on string ptrinfo —
     /// virtual dispatch only.
     fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef>;
 
     /// info.py:331 / 369 / 376 / 445 / 485 / 598 / 701 +
-    /// vstring.py:211 / 263 / 333 `visitor_dispatch_virtual_type`.
+    /// vstring.py / 263 / 333 `visitor_dispatch_virtual_type`.
     fn visitor_dispatch_virtual_type<V: crate::walkvirtual::VirtualVisitor>(
         &self,
         visitor: &mut V,
     ) -> Option<V::VInfo>;
 
-    /// info.py:137-160 / 222-226: force_box() emits the allocation and
+    /// info.py / 222-226: force_box() emits the allocation and
     /// field writes via emit_extra(), recursively forcing child virtuals.
     /// `op` is the (bound) operand of the virtual being forced — RPython
     /// `force_box(self, op, optforce)` passes the op directly
@@ -441,14 +441,14 @@ pub trait PtrInfoExt {
     /// needs no lookup.
     fn force_box(&mut self, op: &Operand, ctx: &mut crate::optimizeopt::OptContext) -> OpRef;
 
-    /// info.py:273-303: `_is_immutable_and_filled_with_constants`
+    /// info.py: `_is_immutable_and_filled_with_constants`
     /// — used by `force_box` to decide whether a virtual can be
     /// constant-folded.
     fn is_immutable_and_filled_with_constants(&self, ctx: &crate::optimizeopt::OptContext) -> bool;
 }
 
 impl PtrInfoExt for PtrInfo {
-    /// info.py:763-772 `ConstPtrInfo.get_known_class(cpu)` +
+    /// info.py `ConstPtrInfo.get_known_class(cpu)` +
     /// the other PtrInfo subclasses' `_known_class` accessors:
     ///
     /// ```text
@@ -499,14 +499,14 @@ impl PtrInfoExt for PtrInfo {
                 if majit_gc::is_tagged_immediate(gcref.as_usize()) {
                     return None;
                 }
-                // info.py:765-767: gate the `check_is_object` call on
+                // info.py: gate the `check_is_object` call on
                 // `supports_guard_gc_type`. When the backend doesn't
                 // support guard_gc_type, RPython simply skips the
                 // `check_is_object` step and still calls `cls_of_box`.
                 if majit_gc::supports_guard_gc_type() && !majit_gc::check_is_object(*gcref) {
                     return None;
                 }
-                // info.py:768 `return cpu.cls_of_box(self._const)` —
+                // info.py `return cpu.cls_of_box(self._const)` —
                 // routes through the Cpu trait so backends that override
                 // the typeptr-at-offset-0 read (e.g. `gcremovetypeptr`)
                 // are honored here too.
@@ -517,11 +517,11 @@ impl PtrInfoExt for PtrInfo {
         }
     }
 
-    /// info.py:83: make_guards(op, short, optimizer)
+    /// info.py: make_guards(op, short, optimizer)
     /// info.py: make_guards(self, op, short, optimizer)
     ///
     /// Append guard operations to `short` that check this PtrInfo's
-    /// properties hold for `op`. Used by use_box (shortpreamble.py:382).
+    /// properties hold for `op`. Used by use_box (shortpreamble.py).
     /// `ctx` plays the role of `optimizer` in the upstream signature:
     /// constant-pool allocation goes through `reserve_const_ref` +
     /// `seed_constant`, and producer-result identity through
@@ -533,7 +533,7 @@ impl PtrInfoExt for PtrInfo {
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> bool {
         let mut alloc_const = |ctx: &mut crate::optimizeopt::OptContext, value: Value| {
-            // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
+            // history.py/268/314 Const{Int,Float,Ptr}.value inline.
             let pos = match value {
                 Value::Int(v) => OpRef::const_int(v),
                 Value::Float(v) => OpRef::const_float(v),
@@ -550,13 +550,13 @@ impl PtrInfoExt for PtrInfo {
         // their producer lives in `short`, not in ctx's registries.
         let op_b = ctx.materialize_operand_at(op);
         match self {
-            // info.py:83-84: PtrInfo base — no-op
+            // info.py: PtrInfo base — no-op
             PtrInfo::NonNull { .. } => {
-                // info.py:120-122: NonNullPtrInfo.make_guards
+                // info.py: NonNullPtrInfo.make_guards
                 short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
             }
             PtrInfo::Instance(info) => {
-                // info.py:336-353 InstancePtrInfo.make_guards line-by-line.
+                // info.py InstancePtrInfo.make_guards line-by-line.
                 //
                 //   def make_guards(self, op, short, optimizer):
                 //       if self._known_class is not None:
@@ -588,7 +588,7 @@ impl PtrInfoExt for PtrInfo {
                 // PyObject layout) gets the upstream guard sequence
                 // without further changes.
                 if let Some(cls) = info.known_class {
-                    // info.py:341-345 stores `_known_class` on PtrInfo, but
+                    // info.py stores `_known_class` on PtrInfo, but
                     // the emitted guard operand is the same ConstInt vtable
                     // address produced by backend/model.py:199-201
                     // `cls_of_box()`.
@@ -607,7 +607,7 @@ impl PtrInfoExt for PtrInfo {
                         ));
                     }
                 } else if let Some(descr) = &info.descr {
-                    // info.py:346-352 reads `self.descr.get_vtable()`
+                    // info.py reads `self.descr.get_vtable()`
                     // unconditionally once the descr is present. Every pyre
                     // producer of an `InstancePtrInfo` descr proves the
                     // downcast: `ensure_ptr_info_arg0` unwraps the identical
@@ -644,7 +644,7 @@ impl PtrInfoExt for PtrInfo {
                 }
             }
             PtrInfo::Struct(info) => {
-                // info.py:360-366: StructPtrInfo.make_guards.
+                // info.py: StructPtrInfo.make_guards.
                 //   if self.descr is not None:
                 //       c_typeid = ConstInt(self.descr.get_type_id())
                 //       short.extend([GUARD_NONNULL[op],
@@ -697,12 +697,12 @@ impl PtrInfoExt for PtrInfo {
                 }
             }
             PtrInfo::Constant(gcref) => {
-                // info.py:715-716: ConstPtrInfo.make_guards
+                // info.py: ConstPtrInfo.make_guards
                 let c = alloc_const(ctx, Value::Ref(*gcref));
                 short.push(Op::new(OpCode::GuardValue, &[op_b.clone(), c.clone()]));
             }
             PtrInfo::Array(info) => {
-                // info.py:632-639: ArrayPtrInfo.make_guards.
+                // info.py: ArrayPtrInfo.make_guards.
                 //   AbstractVirtualPtrInfo.make_guards → NonNullPtrInfo.make_guards
                 //   short.append(GUARD_GC_TYPE[op, ConstInt(descr.get_type_id())])
                 //   if self.lenbound is not None:
@@ -790,7 +790,7 @@ impl PtrInfoExt for PtrInfo {
                     info.lenbound.make_guards(lenop_pos, short, ctx);
                 }
             }
-            // info.py:379-384 `AbstractRawPtrInfo.make_guards`:
+            // info.py `AbstractRawPtrInfo.make_guards`:
             //
             // ```python
             // def make_guards(self, op, short, optimizer):
@@ -803,8 +803,8 @@ impl PtrInfoExt for PtrInfo {
             //
             // Emits "must not be 0" check (null-pointer equivalent for
             // Int-typed raw pointers) at the short-preamble entry.
-            // Both `RawBufferPtrInfo` (info.py:386) and
-            // `RawSlicePtrInfo` (info.py:459) inherit this override.
+            // Both `RawBufferPtrInfo` (info.py) and
+            // `RawSlicePtrInfo` (info.py) inherit this override.
             PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_) => {
                 let zero = alloc_const(ctx, Value::Int(0));
                 let mut eq_op = Op::new(OpCode::IntEq, &[op_b.clone(), zero.clone()]);
@@ -823,7 +823,7 @@ impl PtrInfoExt for PtrInfo {
                 short.push(Op::new(OpCode::GuardFalse, &[arg_eq]));
             }
             PtrInfo::Str(sinfo) => {
-                // vstring.py:116-126: StrPtrInfo.make_guards
+                // vstring.py: StrPtrInfo.make_guards
                 short.push(Op::new(OpCode::GuardNonnull, std::slice::from_ref(&op_b)));
                 if let Some(ref bound) = sinfo.lenbound
                     && bound.lower >= 1
@@ -840,7 +840,7 @@ impl PtrInfoExt for PtrInfo {
                     lenop.pos.set(ctx.alloc_op_position_typed(Type::Int));
                     let lenop_pos = lenop.pos.get();
                     short.push(lenop);
-                    // intutils.py:1264-1289 IntBound.make_guards: emits the
+                    // intutils.py IntBound.make_guards: emits the
                     // chained INT_GE/INT_LE/INT_AND → GUARD_TRUE/GUARD_VALUE
                     // pairs against `lenop_pos`.
                     bound.make_guards(lenop_pos, short, ctx);
@@ -857,7 +857,7 @@ impl PtrInfoExt for PtrInfo {
     fn get_known_str_length(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64> {
         match self {
             PtrInfo::Str(info) => info.getstrlen(ctx, mode),
-            // info.py:804-808 ConstPtrInfo.getstrlen — delegate to
+            // info.py ConstPtrInfo.getstrlen — delegate to
             // the runtime resolver for constant string pointers.
             PtrInfo::Constant(gcref) if !gcref.is_null() => ctx
                 .string_length_resolver
@@ -867,7 +867,7 @@ impl PtrInfoExt for PtrInfo {
         }
     }
 
-    /// info.py:793 ConstPtrInfo.get_constant_string_spec and
+    /// info.py ConstPtrInfo.get_constant_string_spec and
     /// vstring.py:178 / 236 / 298 — recursive constant string extraction.
     fn get_constant_string_spec(
         &self,
@@ -876,7 +876,7 @@ impl PtrInfoExt for PtrInfo {
     ) -> Option<Vec<i64>> {
         match self {
             PtrInfo::Str(info) => info.get_constant_string_spec(ctx, mode),
-            // info.py:793: ConstPtrInfo.get_constant_string_spec
+            // info.py: ConstPtrInfo.get_constant_string_spec
             // delegates to _unpack_str(mode) → extracts chars from the
             // constant GcRef.
             PtrInfo::Constant(gcref) if !gcref.is_null() => ctx
@@ -888,9 +888,9 @@ impl PtrInfoExt for PtrInfo {
         }
     }
 
-    /// vstring.py:172 / 230 `strgetitem()` on string ptrinfo — virtual dispatch only.
+    /// vstring.py / 230 `strgetitem()` on string ptrinfo — virtual dispatch only.
     /// ConstPtr constant resolution is handled by `OptString::strgetitem`
-    /// (vstring.py:393-403 `_strgetitem`), which needs `&mut OptContext`.
+    /// (vstring.py `_strgetitem`), which needs `&mut OptContext`.
     fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<OpRef> {
         match self {
             PtrInfo::Str(info) => info.strgetitem(index, ctx),
@@ -899,14 +899,14 @@ impl PtrInfoExt for PtrInfo {
     }
 
     /// info.py:331 / 369 / 376 / 445 / 485 / 598 / 701 +
-    /// vstring.py:211 / 263 / 333 `visitor_dispatch_virtual_type`.
+    /// vstring.py / 263 / 333 `visitor_dispatch_virtual_type`.
     ///
     /// Each virtual `PtrInfo` subclass implements `visitor_dispatch_virtual_type(visitor)`
     /// which calls the corresponding `visitor.visit_*()` method with the
     /// subclass's static metadata (descr, fielddescrs, array clear flag,
     /// raw buffer offsets, etc.). The visitor is free to produce a
     /// `VInfo` per call; the same visitor pattern is shared by
-    /// `ResumeDataVirtualAdder` (resume.py:312) and `VirtualStateConstructor`
+    /// `ResumeDataVirtualAdder` (resume.py) and `VirtualStateConstructor`
     /// (virtualstate.py:721).
     ///
     /// Returns `None` for non-virtual `PtrInfo` variants — RPython's
@@ -918,7 +918,7 @@ impl PtrInfoExt for PtrInfo {
         visitor: &mut V,
     ) -> Option<V::VInfo> {
         match self {
-            // info.py:331-334 InstancePtrInfo.visitor_dispatch_virtual_type.
+            // info.py InstancePtrInfo.visitor_dispatch_virtual_type.
             // `fields` still stores sparse `(field_index, OpRef)` entries, but
             // the visitor now rebuilds the full descriptor-order slot list so
             // resume.py can pair `fielddescrs` and `fieldnums` 1:1 again.
@@ -927,15 +927,15 @@ impl PtrInfoExt for PtrInfo {
                 let fielddescrs = self.all_fielddescrs_from_descr();
                 Some(visitor.visit_virtual(&info.descr, &indices, &fielddescrs))
             }
-            // info.py:369-372 StructPtrInfo.visitor_dispatch_virtual_type
+            // info.py StructPtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualStruct(info) => {
                 let indices: Vec<u32> = info.fields.iter().map(|(fi, _)| *fi).collect();
                 let fielddescrs = self.all_fielddescrs_from_descr();
                 Some(visitor.visit_vstruct(&info.descr, &indices, &fielddescrs))
             }
-            // info.py:598-599 ArrayPtrInfo.visitor_dispatch_virtual_type
+            // info.py ArrayPtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualArray(info) => Some(visitor.visit_varray(&info.descr, info.clear)),
-            // info.py:701-704 ArrayStructInfo.visitor_dispatch_virtual_type.
+            // info.py ArrayStructInfo.visitor_dispatch_virtual_type.
             // The visitor consumes the canonical `fielddescrs` ordering; the
             // compatibility indices are the same descriptor-order slot numbers.
             PtrInfo::VirtualArrayStruct(info) => {
@@ -947,14 +947,14 @@ impl PtrInfoExt for PtrInfo {
                     &info.fielddescrs,
                 ))
             }
-            // info.py:445-450 RawBufferPtrInfo.visitor_dispatch_virtual_type
+            // info.py RawBufferPtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualRawBuffer(info) => Some(visitor.visit_vrawbuffer(
                 info.func,
                 info.size,
                 info.buffer.offsets(),
                 info.buffer.descrs(),
             )),
-            // info.py:485-486 RawSlicePtrInfo.visitor_dispatch_virtual_type
+            // info.py RawSlicePtrInfo.visitor_dispatch_virtual_type
             PtrInfo::VirtualRawSlice(info) => Some(visitor.visit_vrawslice(info.offset)),
             // vstring.py:211-212 / 263-264 / 333-334 per-variant dispatch
             PtrInfo::Str(info) if info.is_virtual() => {
@@ -970,7 +970,7 @@ impl PtrInfoExt for PtrInfo {
         }
     }
 
-    /// info.py:137-160 / 222-226: force_box() emits the allocation and
+    /// info.py / 222-226: force_box() emits the allocation and
     /// field writes via emit_extra(), recursively forcing child virtuals.
     ///
     /// Generated ops are routed via emit_extra() (RPython
@@ -979,7 +979,7 @@ impl PtrInfoExt for PtrInfo {
         force_box_impl(self, op, ctx)
     }
 
-    /// info.py:273-303: _is_immutable_and_filled_with_constants
+    /// info.py: _is_immutable_and_filled_with_constants
     ///
     /// ```text
     /// if not self.descr.is_immutable():
@@ -998,7 +998,7 @@ impl PtrInfoExt for PtrInfo {
             PtrInfo::VirtualStruct(v) => (&v.fields, &v.descr),
             _ => return false,
         };
-        // info.py:281: `if not self.descr.is_immutable()`.
+        // info.py: `if not self.descr.is_immutable()`.
         let Some(size_descr) = descr.as_size_descr() else {
             return false;
         };
@@ -1058,7 +1058,7 @@ fn force_box_impl(
     // needed for the forwarding writes.
     let opref = op.to_opref();
 
-    // info.py:307: subbox = optimizer.force_box(fld) — `fld` is the field's
+    // info.py: subbox = optimizer.force_box(fld) — `fld` is the field's
     // own box. Force it (materialising a nested virtual) and return the
     // resulting box, which the parent uses as a SETFIELD/SETARRAYITEM value
     // operand. Box-native: the field box is passed and returned directly,
@@ -1121,7 +1121,7 @@ fn force_box_impl(
     // RPython info.py:140-145: immutable virtual filled with constants
     // → constant fold to a compile-time constant pointer.
     if self_.is_immutable_and_filled_with_constants(ctx) {
-        // info.py:305-311 _force_elements_immutable: `subbox =
+        // info.py _force_elements_immutable: `subbox =
         // optimizer.force_box(fld)` materializes EACH field — including a
         // nested immutable virtual — into a Const before the parent's slots
         // are written. `is_immutable_and_filled_with_constants` guarantees a
@@ -1168,7 +1168,7 @@ fn force_box_impl(
             if obj_size > 0 {
                 let ptr = alloc_fn(obj_size);
                 if !ptr.is_null() {
-                    // info.py:144: _force_elements_immutable
+                    // info.py: _force_elements_immutable
                     // Write constant field values directly to the allocated memory.
                     for (field_idx, val_ref) in fields.iter() {
                         let field_idx = *field_idx;
@@ -1208,7 +1208,7 @@ fn force_box_impl(
 
     match self_ {
         PtrInfo::VirtualStruct(vinfo) => {
-            // RPython info.py:216-226 _force_elements clears each
+            // RPython info.py _force_elements clears each
             // `self._fields[i] = None` BEFORE `optforce.emit_extra(setfieldop)`.
             // After force, the non-virtual structinfo carries no field cache,
             // so heap.py do_setfield records the SETFIELD_GC as a lazy_set
@@ -1219,14 +1219,14 @@ fn force_box_impl(
                 last_guard_pos: -1,
             });
             let mut new_op = Op::new(OpCode::New, &[]);
-            // RPython info.py:146-151 force_box emits the ORIGINAL box op.
+            // RPython info.py force_box emits the ORIGINAL box op.
             // Preserve that identity here instead of inventing a fresh
             // OpRef, so later passes (earlyforce → heap → call) all talk
             // about the same concrete allocation.
             new_op.pos.set(opref);
             new_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, new_op);
-            // info.py:152 `newop.set_forwarded(self)` — unconditional.
+            // info.py `newop.set_forwarded(self)` — unconditional.
             // The just-emitted alloc op is bound, so its resolved box
             // carries the PtrInfo install.
             if let Some(b) = ctx.get_box_replacement_operand_opt(alloc_ref) {
@@ -1278,14 +1278,14 @@ fn force_box_impl(
                 last_guard_pos: -1,
             });
             let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
-            // RPython info.py:146-151 force_box emits the ORIGINAL box op.
+            // RPython info.py force_box emits the ORIGINAL box op.
             // Preserve that identity here instead of inventing a fresh
             // OpRef, so later passes (earlyforce → heap → call) all talk
             // about the same concrete allocation.
             new_op.pos.set(opref);
             new_op.setdescr(vinfo.descr.clone());
             let alloc_ref = emit_op(ctx, new_op);
-            // info.py:152 `newop.set_forwarded(self)` — unconditional.
+            // info.py `newop.set_forwarded(self)` — unconditional.
             if let Some(b) = ctx.get_box_replacement_operand_opt(alloc_ref) {
                 ctx.set_ptr_info(&b, preserved);
             }
@@ -1318,7 +1318,7 @@ fn force_box_impl(
             alloc_ref
         }
         PtrInfo::VirtualArray(vinfo) => {
-            // info.py:152: AbstractVirtualPtrInfo.force_box does
+            // info.py: AbstractVirtualPtrInfo.force_box does
             // `newop.set_forwarded(self); self._is_virtual = False` — it keeps
             // the SAME ArrayPtrInfo, now non-virtual, so getarrayinfo still
             // recovers the array identity after forcing.
@@ -1387,11 +1387,11 @@ fn force_box_impl(
             alloc_ref
         }
         PtrInfo::VirtualArrayStruct(vinfo) => {
-            // info.py:670-684 ArrayStructInfo._force_elements
+            // info.py ArrayStructInfo._force_elements
             // virtualize.py:31: assert clear — ArrayStruct is always
             // created with clear=True, so the original op is always
             // NEW_ARRAY_CLEAR.
-            // info.py:152 force_box keeps the SAME info (`set_forwarded(self);
+            // info.py force_box keeps the SAME info (`set_forwarded(self);
             // _is_virtual = False`). PRE-EXISTING DIVERGENCE: pyre installs
             // `nonnull()`, dropping the array-struct identity — same convergence
             // path as VirtualArray (an `is_virtual` flag + gated match sites).
@@ -1450,7 +1450,7 @@ fn force_box_impl(
             alloc_ref
         }
         PtrInfo::VirtualRawBuffer(vinfo) => {
-            // info.py:420-436: RawBufferPtrInfo._force_elements()
+            // info.py: RawBufferPtrInfo._force_elements()
             // info.py:421: self.size = -1 (mark as no longer virtual)
             let entries = vinfo.buffer.drain_entries();
             let func = vinfo.func;
@@ -1501,7 +1501,7 @@ fn force_box_impl(
             emit_op(ctx, check_op);
 
             // info.py:429-436: emit RAW_STORE for each buffered write.
-            // info.py:433 uses `itembox = buffer.values[i]` DIRECTLY in the
+            // info.py uses `itembox = buffer.values[i]` DIRECTLY in the
             // RAW_STORE — unlike the struct/array paths (info.py:222/548),
             // RawBufferPtrInfo._force_elements does NOT optimizer.force_box the
             // value (info.py:240: "there can be no virtuals stored in raw
@@ -1525,7 +1525,7 @@ fn force_box_impl(
             alloc_ref
         }
         PtrInfo::VirtualRawSlice(slice) => {
-            // `info.py:473-476` `RawSlicePtrInfo._force_elements`:
+            // `info.py` `RawSlicePtrInfo._force_elements`:
             //
             // ```python
             // def _force_elements(self, op, optforce, descr):
@@ -1536,7 +1536,7 @@ fn force_box_impl(
             //
             // RPython keeps the `RawSlicePtrInfo` attached to the op and
             // flips it to non-virtual by setting `self.parent = None`
-            // (`is_virtual` at info.py:464-465 is `self.parent is not None`).
+            // (`is_virtual` at info.py is `self.parent is not None`).
             // The info class stays RawSlicePtrInfo so subsequent
             // `getrawptrinfo` lookups still identify it as a raw slice.
             //
@@ -1575,11 +1575,11 @@ fn force_box_impl(
             new_ref
         }
         PtrInfo::Str(sinfo) if sinfo.is_virtual() => {
-            // vstring.py:76-103 StrPtrInfo.force_box
+            // vstring.py StrPtrInfo.force_box
             let mode = sinfo.mode;
             let is_unicode = mode != 0;
 
-            // vstring.py:79-90: if self.mode is mode_string / else
+            // vstring.py: if self.mode is mode_string / else
             let c_s = if mode == crate::optimizeopt::vstring::mode_string {
                 // vstring.py:80-84
                 sinfo
@@ -1604,7 +1604,7 @@ fn force_box_impl(
             };
             let variant = sinfo_full.variant;
 
-            // vstring.py:92: lengthbox = self.getstrlen(op, optstring, mode)
+            // vstring.py: lengthbox = self.getstrlen(op, optstring, mode)
             let lengthbox = match &variant {
                 VStringVariant::Plain(info) => ctx.emit_constant_int(info._chars.len() as i64),
                 VStringVariant::Slice(info) => ctx
@@ -1654,7 +1654,7 @@ fn force_box_impl(
                 ctx.make_equal_to(op, &b_newop);
             }
 
-            // vstring.py:101-102: initialize_forced_string(op, optstring, op, CONST_0, mode)
+            // vstring.py: initialize_forced_string(op, optstring, op, CONST_0, mode)
             let zero = ctx.emit_constant_int(0);
             let set_opcode = if is_unicode {
                 OpCode::Unicodesetitem
@@ -1664,7 +1664,7 @@ fn force_box_impl(
 
             match variant {
                 VStringVariant::Plain(info) => {
-                    // vstring.py:194-205 VStringPlainInfo.initialize_forced_string
+                    // vstring.py VStringPlainInfo.initialize_forced_string
                     let mut offset = ctx.materialize_operand_at(zero);
                     let one = ctx.emit_constant_int(1);
                     let one = ctx.materialize_operand_at(one);
@@ -1686,7 +1686,7 @@ fn force_box_impl(
                     }
                 }
                 VStringVariant::Concat(info) => {
-                    // vstring.py:309-317 VStringConcatInfo.string_copy_parts
+                    // vstring.py VStringConcatInfo.string_copy_parts
                     let newop_box = ctx.materialize_operand_at(newop);
                     let zero_box = ctx.materialize_operand_at(zero);
                     let offset = crate::optimizeopt::vstring::string_copy_parts(
@@ -1705,7 +1705,7 @@ fn force_box_impl(
                     );
                 }
                 VStringVariant::Slice(info) => {
-                    // vstring.py:230-233 VStringSliceInfo.string_copy_parts
+                    // vstring.py VStringSliceInfo.string_copy_parts
                     let newop_box = ctx.materialize_operand_at(newop);
                     let zero_box = ctx.materialize_operand_at(zero);
                     crate::optimizeopt::vstring::copy_str_content(
@@ -1728,7 +1728,7 @@ fn force_box_impl(
     }
 }
 
-/// info.py:124-128 `AbstractVirtualPtrInfo` line-by-line shared state.
+/// info.py `AbstractVirtualPtrInfo` line-by-line shared state.
 ///
 /// ```python
 /// class AbstractVirtualPtrInfo(NonNullPtrInfo):
@@ -1752,7 +1752,7 @@ fn force_box_impl(
 ///     (`PtrInfo::Virtual(_)` IS the truthy carrier of `_is_virtual`);
 ///     no separate slot is needed.
 ///
-/// `make_virtual_info` (resume.py:307-315) reads `cached_vinfo` to
+/// `make_virtual_info` (resume.py) reads `cached_vinfo` to
 /// dedup RdVirtualInfo allocations across multiple finish() calls
 /// referencing the same virtual. `RefCell` provides interior
 /// mutability so the immutable-receiver accessor can populate the

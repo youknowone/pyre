@@ -67,7 +67,7 @@ pub fn reflow_from_pbc_count() -> u64 {
     REFLOW_FROM_PBC.load(Ordering::Relaxed)
 }
 
-/// RPython `bookkeeper.position_key` (bookkeeper.py:147) — the tuple
+/// RPython `bookkeeper.position_key` (bookkeeper.py) — the tuple
 /// identifying "where in the flow graph the annotator is currently
 /// reading/writing a value".
 ///
@@ -132,7 +132,7 @@ impl std::hash::Hash for PositionKey {
     }
 }
 
-/// Upstream `analyzer_for(func)` decorator (bookkeeper.py:34-38).
+/// Upstream `analyzer_for(func)` decorator (bookkeeper.py).
 pub fn analyzer_for(
     reg: &mut HashMap<String, super::builtin::BuiltinAnalyzer>,
     qualname: &str,
@@ -186,9 +186,9 @@ impl PositionKey {
     }
 }
 
-/// RPython `class Bookkeeper` (bookkeeper.py:53).
+/// RPython `class Bookkeeper` (bookkeeper.py).
 pub struct Bookkeeper {
-    /// RPython `self.annotator = annotator` (bookkeeper.py:53). A weak
+    /// RPython `self.annotator = annotator` (bookkeeper.py). A weak
     /// backlink to the owning `RPythonAnnotator`; stored as
     /// `Weak<RPythonAnnotator>` to break the Rc cycle (annotator owns
     /// the bookkeeper via `Rc`). Upgraded on demand via
@@ -197,7 +197,7 @@ pub struct Bookkeeper {
     /// Test-only `Bookkeeper::new()` leaves this slot empty (the tests
     /// never call into annotator-dependent code paths).
     pub annotator: RefCell<Weak<crate::annotator::annrpython::RPythonAnnotator>>,
-    /// RPython `self.policy = annotator.policy` (bookkeeper.py:55).
+    /// RPython `self.policy = annotator.policy` (bookkeeper.py).
     pub policy: AnnotatorPolicy,
     /// RPython `self.position_key = None` initial (bookkeeper.py:147).
     /// The annotator driver (`RPythonAnnotator.reflow`) writes into
@@ -205,7 +205,7 @@ pub struct Bookkeeper {
     /// pick it up. Interior mutability because callers hold
     /// `Rc<Bookkeeper>` sharers.
     pub(crate) position_key: RefCell<Option<PositionKey>>,
-    /// RPython `self.listdefs = {}` (bookkeeper.py:59). Keyed by
+    /// RPython `self.listdefs = {}` (bookkeeper.py). Keyed by
     /// position — callers hitting the same position twice share the
     /// ListDef so merging re-entries stay identity-equal. The key is
     /// `Option<PositionKey>` because upstream uses `self.position_key`
@@ -215,10 +215,10 @@ pub struct Bookkeeper {
     /// the same rather than building a fresh ListDef per call outside
     /// a reflow frame.
     pub(crate) listdefs: RefCell<HashMap<Option<PositionKey>, ListDef>>,
-    /// RPython `self.dictdefs = {}` (bookkeeper.py:60). Same
+    /// RPython `self.dictdefs = {}` (bookkeeper.py). Same
     /// `Option<PositionKey>` key semantics as `listdefs`.
     pub(crate) dictdefs: RefCell<HashMap<Option<PositionKey>, DictDef>>,
-    /// RPython `self.descs = {}` (bookkeeper.py:67). Maps
+    /// RPython `self.descs = {}` (bookkeeper.py). Maps
     /// `Constant(pyobj)` to a FunctionDesc / ClassDesc / FrozenDesc /
     /// MethodDesc / MethodOfFrozenDesc per bookkeeper.py:353-409. The
     /// Rust port keys directly on [`HostObject`] (which already has
@@ -229,12 +229,12 @@ pub struct Bookkeeper {
     /// pointer identity, so only insertion order (IndexMap) is
     /// reproducible — a `HashMap` would number classdefs run-varyingly.
     pub(crate) descs: RefCell<IndexMap<HostObject, DescEntry>>,
-    /// RPython `self.classdefs = []` (bookkeeper.py:68). Populated by
-    /// `ClassDesc._init_classdef` (classdesc.py:672-697). ClassDef
+    /// RPython `self.classdefs = []` (bookkeeper.py). Populated by
+    /// `ClassDesc._init_classdef` (classdesc.py). ClassDef
     /// identity is Rc pointer equality — matches upstream's Python
     /// `cls is other` comparisons.
     pub classdefs: RefCell<Vec<Rc<RefCell<ClassDef>>>>,
-    /// RPython `self.methoddescs = {}` (bookkeeper.py:69). Keyed by
+    /// RPython `self.methoddescs = {}` (bookkeeper.py). Keyed by
     /// `(funcdesc, originclassdef, selfclassdef, name, flags)` tuple
     /// so repeated `getmethoddesc(...)` calls with the same inputs
     /// share identity, per bookkeeper.py:431-442.
@@ -242,9 +242,9 @@ pub struct Bookkeeper {
     /// RPython `self.frozenpbc_attr_families = UnionFind(FrozenAttrFamily)`
     /// (bookkeeper.py:63).
     pub(crate) frozenpbc_attr_families: RefCell<UnionFind<DescKey, Rc<RefCell<FrozenAttrFamily>>>>,
-    /// RPython `self.classpbc_attr_families = {}` (bookkeeper.py:62) —
+    /// RPython `self.classpbc_attr_families = {}` (bookkeeper.py) —
     /// lazy `attrname -> UnionFind(ClassAttrFamily)` map materialised by
-    /// `get_classpbc_attr_families(attrname)` (bookkeeper.py:447-456).
+    /// `get_classpbc_attr_families(attrname)` (bookkeeper.py).
     /// `IndexMap`: `normalize_class_pbcs` iterates this map to build the
     /// commonbase/access-set numbering; upstream is a Python dict.
     pub(crate) classpbc_attr_families:
@@ -277,21 +277,21 @@ pub struct Bookkeeper {
     /// [`super::model::s_impossible_value`] as the
     /// seed for the first hit.
     pub _jit_annotation_cache: RefCell<HashMap<HostObject, HashMap<String, SomeValue>>>,
-    /// RPython `self.immutable_cache = {}` (bookkeeper.py:61), keyed by
+    /// RPython `self.immutable_cache = {}` (bookkeeper.py), keyed by
     /// the identity of `Constant(x)` for the List / Dict / OrderedDict /
-    /// r_dict branches of `immutablevalue` (bookkeeper.py:255-298).
+    /// r_dict branches of `immutablevalue` (bookkeeper.py).
     /// Upstream's cache memoises the returned `SomeList` / `SomeDict` so
     /// downstream `generalize_key` / `generalize` mutations on the
     /// cached `DictDef` / `ListDef` persist across calls.
     ///
-    /// `transform_list_contains` (translator/transform.py:115-134)
+    /// `transform_list_contains` (translator/transform.py)
     /// relies on this: it calls `self.annotation(Constant(dict))` after
     /// rewriting the contains lhs, then mutates the returned SomeDict's
     /// dictdef via `generalize_key`. Without the cache the second
     /// `annotation()` call builds a fresh DictDef and the mutation
     /// dissolves.
     pub immutable_cache: RefCell<HashMap<u64, SomeValue>>,
-    /// RPython `self.pending_specializations = []` (bookkeeper.py:69).
+    /// RPython `self.pending_specializations = []` (bookkeeper.py).
     ///
     /// List of callbacks drained by
     /// `AnnotatorPolicy.no_more_blocks_to_annotate` before the final
@@ -299,12 +299,12 @@ pub struct Bookkeeper {
     /// fallible; upstream lets the exception propagate, so the drain
     /// surfaces the first `Err` instead of swallowing or panicking on it.
     pub pending_specializations: RefCell<Vec<Box<dyn Fn() -> Result<(), AnnotatorError>>>>,
-    /// RPython `self.all_specializations = {}` (bookkeeper.py:68).
+    /// RPython `self.all_specializations = {}` (bookkeeper.py).
     ///
     /// One entry per memo-specialised function, keyed by the funcdesc's
     /// pointer identity (upstream keys by the `funcdesc` object itself,
     /// specialize.py:285). Each value is the
-    /// `UnionFind(compute_one_result)` upstream uses (specialize.py:298) —
+    /// `UnionFind(compute_one_result)` upstream uses (specialize.py) —
     /// the families of argument tuples that can be called together, merged
     /// on `union`, with each result living in its
     /// [`super::specialize::MemoTable`]'s `table` — paired with a per-
@@ -318,13 +318,13 @@ pub struct Bookkeeper {
     /// None). Rust carries [`Self::position_key`] as `Option<_>` in both
     /// cases, so this flag tracks the enter/leave invariant explicitly.
     pub position_entered: std::cell::Cell<bool>,
-    /// RPython `self.needs_generic_instantiate = {}` (bookkeeper.py:72).
+    /// RPython `self.needs_generic_instantiate = {}` (bookkeeper.py).
     ///
     /// Populated by `merge_classpbc_getattr_into_classdef`
     /// (normalizecalls.py:260-262) for every class-PBC call family that
     /// spans more than one class — `ClassesPBCRepr.call()` needs the
     /// generic instantiator. Drained by
-    /// `create_instantiate_functions` (normalizecalls.py:266-273).
+    /// `create_instantiate_functions` (normalizecalls.py).
     ///
     /// Upstream is a `{}` dict keyed by `ClassDef` identity with every
     /// value set to `True` — i.e. used as a set with upstream's
@@ -364,7 +364,7 @@ pub struct Bookkeeper {
     /// descs/classdefs; interning resolves a type-root string to one
     /// class OBJECT exactly once so subsequent `getuniqueclassdef`
     /// lookups key the same `ClassDef` by identity — the pyre analog of
-    /// `annotationoftype(t) -> getuniqueclassdef(t)` (signature.py:103-104)
+    /// `annotationoftype(t) -> getuniqueclassdef(t)` (signature.py)
     /// where `t` is the already-resolved class object.  Used by
     /// [`Self::getuniqueclassdef_for_struct_root`].
     pub pyre_struct_root_classes: RefCell<HashMap<String, HostObject>>,
@@ -379,7 +379,7 @@ pub struct Bookkeeper {
     /// receiver's `ClassDef` through
     /// [`Self::getuniqueclassdef_for_struct_root`].
     /// RPython's annotator never needs this: it sees the concrete
-    /// receiver class at every call site (`classdesc.py:749 lookup`).
+    /// receiver class at every call site (`classdesc.py lookup`).
     pub pyre_trait_unique_impls: RefCell<HashMap<String, String>>,
     /// Trait qualified-path (`name_path()`) → base `HostObject` for a
     /// receiver-driven method-dispatch family registered through
@@ -455,13 +455,13 @@ pub(crate) enum EmulatedPbcCallKey {
         role: &'static str,
     },
     Text(String),
-    /// RPython `('sandboxing', s_func.const)` tuple (policy.py:87). The
+    /// RPython `('sandboxing', s_func.const)` tuple (policy.py). The
     /// inner identity is the `HostObject` pointer for the external
     /// callable being sandboxed.
     Sandboxing {
         callable_id: usize,
     },
-    /// RPython `annlowlevel.py:363` key `(llhelper, desc.pyobj)`.
+    /// RPython `annlowlevel.py` key `(llhelper, desc.pyobj)`.
     LLHelper {
         callable_id: usize,
     },
@@ -486,7 +486,7 @@ pub(crate) enum PbcCallEmulated {
 
 impl EmulatedPbcCallKey {
     /// Build the sandbox-trampoline key used by
-    /// `AnnotatorPolicy::no_more_blocks_to_annotate` (policy.py:87).
+    /// `AnnotatorPolicy::no_more_blocks_to_annotate` (policy.py).
     pub(crate) fn sandboxing(func_const: &crate::flowspace::model::ConstValue) -> Self {
         use crate::flowspace::model::ConstValue;
         let callable_id = match func_const {
@@ -503,7 +503,7 @@ impl EmulatedPbcCallKey {
 }
 
 /// Variant wrapper over the two concrete attribute-family types that
-/// `pbc_getattr` (bookkeeper.py:458-496) consumes polymorphically —
+/// `pbc_getattr` (bookkeeper.py) consumes polymorphically —
 /// `ClassAttrFamily` for ClassDesc PBCs, `FrozenAttrFamily` for
 /// FrozenDesc PBCs. Exposes the exact trio upstream touches:
 /// `read_locations`, `get_s_value(attr)`, `set_s_value(attr, ...)`.
@@ -547,7 +547,7 @@ impl PbcAttrFamily {
 }
 
 impl Bookkeeper {
-    /// RPython `Bookkeeper.__init__(self, annotator)` (bookkeeper.py:52-76).
+    /// RPython `Bookkeeper.__init__(self, annotator)` (bookkeeper.py).
     /// Once the annotator driver lands, this constructor takes an
     /// `annotator` backlink; for now it just initialises the bare
     /// storage slots.
@@ -847,7 +847,7 @@ impl Bookkeeper {
         self.annotator.borrow().upgrade()
     }
 
-    /// RPython `Bookkeeper.warning(self, msg)` (bookkeeper.py:580-581).
+    /// RPython `Bookkeeper.warning(self, msg)` (bookkeeper.py).
     ///
     /// ```python
     /// def warning(self, msg):
@@ -874,7 +874,7 @@ impl Bookkeeper {
         self.position_key.borrow().clone()
     }
 
-    /// RPython `Bookkeeper.enter(self, position_key)` (bookkeeper.py:84-89).
+    /// RPython `Bookkeeper.enter(self, position_key)` (bookkeeper.py).
     ///
     /// Installs the position and registers `self` as the thread-local
     /// bookkeeper so [`getbookkeeper`] returns it. Asserts that no
@@ -884,22 +884,22 @@ impl Bookkeeper {
         assert!(!self.position_entered.get(), "don't call enter() nestedly");
         self.position_entered.set(true);
         self.position_key.replace(position_key);
-        // Upstream: `TLS.bookkeeper = self` (bookkeeper.py:89).
+        // Upstream: `TLS.bookkeeper = self` (bookkeeper.py).
         super::model::TLS.with(|state| state.borrow_mut().bookkeeper = Some(Rc::clone(self)));
     }
 
-    /// RPython `Bookkeeper.leave(self)` (bookkeeper.py:91-94).
+    /// RPython `Bookkeeper.leave(self)` (bookkeeper.py).
     ///
     /// Clears both the position slot and the thread-local bookkeeper
     /// hook. Safe to call only after a matching [`Self::enter`].
     pub(crate) fn leave(&self) {
         self.position_entered.set(false);
         self.position_key.replace(None);
-        // Upstream: `del TLS.bookkeeper` (bookkeeper.py:93).
+        // Upstream: `del TLS.bookkeeper` (bookkeeper.py).
         super::model::TLS.with(|state| state.borrow_mut().bookkeeper = None);
     }
 
-    /// RPython `Bookkeeper.at_position(self, pos)` (bookkeeper.py:96-106).
+    /// RPython `Bookkeeper.at_position(self, pos)` (bookkeeper.py).
     ///
     /// RAII port of the upstream `@contextmanager`. The `pos=None`
     /// fast-path (line 99-101) short-circuits the enter/leave pair when
@@ -1241,7 +1241,7 @@ impl Bookkeeper {
         Ok(())
     }
 
-    /// RPython `Bookkeeper.valueoftype(self, t)` (bookkeeper.py:444-445).
+    /// RPython `Bookkeeper.valueoftype(self, t)` (bookkeeper.py).
     ///
     /// Thin wrapper around [`crate::annotator::signature::annotationoftype`]
     /// used by `binaryop.is_` and the PBC-call site machinery to seed
@@ -1253,7 +1253,7 @@ impl Bookkeeper {
         crate::annotator::signature::annotationoftype(spec, Some(self))
     }
 
-    /// RPython `Bookkeeper.getlistdef(**flags_if_new)` (bookkeeper.py:178-185).
+    /// RPython `Bookkeeper.getlistdef(**flags_if_new)` (bookkeeper.py).
     ///
     /// Returns the (cached or freshly constructed) ListDef for the
     /// bookkeeper's current position. Upstream stores flags inside the
@@ -1281,7 +1281,7 @@ impl Bookkeeper {
         new_ld
     }
 
-    /// RPython `Bookkeeper.newlist(*s_values, **flags)` (bookkeeper.py:187-196).
+    /// RPython `Bookkeeper.newlist(*s_values, **flags)` (bookkeeper.py).
     pub fn newlist(
         self: &Rc<Self>,
         s_values: &[SomeValue],
@@ -1330,12 +1330,12 @@ impl Bookkeeper {
         new_dd
     }
 
-    /// RPython `Bookkeeper.newdict()` (bookkeeper.py:209-212).
+    /// RPython `Bookkeeper.newdict()` (bookkeeper.py).
     pub fn newdict(self: &Rc<Self>) -> SomeDict {
         SomeDict::new(self.getdictdef(false, false, false))
     }
 
-    /// RPython `Bookkeeper.getdesc(pyobj)` (bookkeeper.py:353-409).
+    /// RPython `Bookkeeper.getdesc(pyobj)` (bookkeeper.py).
     ///
     /// Returns the cached [`DescEntry`] for `pyobj`, or constructs a
     /// fresh one per upstream's `isinstance` dispatch. The Rust port
@@ -1442,7 +1442,7 @@ impl Bookkeeper {
         Ok(entry)
     }
 
-    /// RPython `Bookkeeper.newfuncdesc(pyfunc)` (bookkeeper.py:411-426).
+    /// RPython `Bookkeeper.newfuncdesc(pyfunc)` (bookkeeper.py).
     ///
     /// Rust port: pull signature / defaults from the HostObject's
     /// [`crate::flowspace::model::GraphFunc`], and request a
@@ -1460,12 +1460,12 @@ impl Bookkeeper {
                 pyfunc.qualname()
             ))
         })?;
-        // upstream bookkeeper.py:418 `signature = cpython_code_signature(pyfunc.__code__)`.
+        // upstream bookkeeper.py `signature = cpython_code_signature(pyfunc.__code__)`.
         let name = gf.name.clone();
         let signature = match gf.code.as_ref() {
             Some(code) => cpython_code_signature(code),
             // No HostCode attached — upstream hits the
-            // `_generator_next_method_of_` branch (bookkeeper.py:413-416)
+            // `_generator_next_method_of_` branch (bookkeeper.py)
             // or fails. The Rust port defaults to the single-arg
             // `Signature(['entry'])` matching upstream's generator
             // fallback so tests that wire GraphFunc without a HostCode
@@ -1512,7 +1512,7 @@ impl Bookkeeper {
         }
     }
 
-    /// RPython `Bookkeeper.getfrozen(pyobj)` (bookkeeper.py:428-429).
+    /// RPython `Bookkeeper.getfrozen(pyobj)` (bookkeeper.py).
     pub fn getfrozen(
         self: &Rc<Self>,
         pyobj: &HostObject,
@@ -1708,7 +1708,7 @@ impl Bookkeeper {
     }
 
     /// RPython `bookkeeper.classdefs.append(classdef)` — invoked from
-    /// `ClassDesc._init_classdef` (classdesc.py:674). Callers hand over
+    /// `ClassDesc._init_classdef` (classdesc.py). Callers hand over
     /// the fresh `Rc<RefCell<ClassDef>>` so the bookkeeper retains the
     /// identity alongside every other reachable classdef.
     pub fn register_classdef(self: &Rc<Self>, classdef: Rc<RefCell<ClassDef>>) {
@@ -1940,7 +1940,7 @@ impl Bookkeeper {
     /// ([`Self::intern_class_by_qualname_with_bases`]), so the resulting
     /// `ClassDef.basedef` chains through the base. That makes
     /// `commonbase(base, variant) == base`, which is exactly what
-    /// `pairtype(SomeInstance, SomeInstance).improve` (binaryop.py:685)
+    /// `pairtype(SomeInstance, SomeInstance).improve` (binaryop.py)
     /// needs to narrow a `SomeInstance(base)` to `SomeInstance(variant)`.
     /// Identity is the canonical struct-root cache keyed by
     /// `canonical_struct_name`; the base `enum_root` and the
@@ -2075,7 +2075,7 @@ impl Bookkeeper {
     /// arm) intern through here, so a constructed `Some(x)` and a matched
     /// `Some(x)` resolve to ONE class object — the single-class-per-variant
     /// identity RPython gets from one Python class object
-    /// (`bookkeeper.py:339` keys `getuniqueclassdef` by the class object,
+    /// (`bookkeeper.py` keys `getuniqueclassdef` by the class object,
     /// not a name string).  Splitting them into sibling classdefs would
     /// union to the base (losing the payload narrowing) and disagree on
     /// the payload attr/field owner.
@@ -2105,7 +2105,7 @@ impl Bookkeeper {
     /// variant subclass ([`Self::getuniqueclassdef_for_enum_variant`]),
     /// so a `match disc { k => ... }` switch refines `SomeInstance(base)`
     /// to `SomeInstance(variant_k)` in arm `k` through `follow_link`'s
-    /// `improve` (binaryop.py:685).  `enum_root` is the receiver class
+    /// `improve` (binaryop.py).  `enum_root` is the receiver class
     /// name; the variant table is dual-keyed by qualified path and bare
     /// leaf, so either spelling resolves.  Returns `None` when the class
     /// is not a registered enum root (the read then stays a plain
@@ -2819,7 +2819,7 @@ impl Bookkeeper {
         }
     }
 
-    /// RPython `Bookkeeper.getuniqueclassdef(cls)` (bookkeeper.py:282-287):
+    /// RPython `Bookkeeper.getuniqueclassdef(cls)` (bookkeeper.py):
     ///
     /// ```python
     /// def getuniqueclassdef(self, cls):
@@ -2891,7 +2891,7 @@ impl Bookkeeper {
     ///     return s_result
     /// ```
     ///
-    /// RPython `Bookkeeper.pbc_getattr(pbc, s_attr)` (bookkeeper.py:458-496).
+    /// RPython `Bookkeeper.pbc_getattr(pbc, s_attr)` (bookkeeper.py).
     ///
     /// ```python
     /// def pbc_getattr(self, pbc, s_attr):
@@ -2942,7 +2942,7 @@ impl Bookkeeper {
             ))
             .into());
         };
-        // bookkeeper.py:458-466 `pbc_getattr(self, pbc, s_attr)` —
+        // bookkeeper.py `pbc_getattr(self, pbc, s_attr)` —
         // upstream `attr = s_attr.const` with no `isinstance(...,
         // str)` gate. Use [`as_text`] so both `ByteStr` and `UniStr`
         // pass through, mirroring the upstream constant-only check
@@ -3278,7 +3278,7 @@ impl Bookkeeper {
         self.pbc_call(pbc, &args, emulated)
     }
 
-    /// RPython `Bookkeeper.immutablevalue(x)` (bookkeeper.py:214-325).
+    /// RPython `Bookkeeper.immutablevalue(x)` (bookkeeper.py).
     ///
     /// "The most precise SomeValue instance that contains the
     /// immutable value x."
@@ -3530,7 +3530,7 @@ impl Bookkeeper {
         obj: &HostObject,
         raw: &ConstValue,
     ) -> Result<SomeValue, AnnotatorError> {
-        // upstream bookkeeper.py:299-306 — `tp is weakref.ReferenceType`:
+        // upstream bookkeeper.py — `tp is weakref.ReferenceType`:
         //   x1 = x()
         //   if x1 is None:
         //       result = SomeWeakRef(None)    # dead weakref
@@ -3567,7 +3567,7 @@ impl Bookkeeper {
         if obj.is_property() {
             return Ok(SomeValue::Property(super::model::SomeProperty::new(obj)));
         }
-        // upstream bookkeeper.py:309-311 — `elif ishashable(x) and x
+        // upstream bookkeeper.py — `elif ishashable(x) and x
         // in BUILTIN_ANALYZERS: result = SomeBuiltin(...)`.
         if ishashable(obj) && super::builtin::is_registered(obj.qualname()) {
             let module_name = match crate::flowspace::model::host_getattr(obj, "__module__") {
@@ -3637,7 +3637,7 @@ impl Bookkeeper {
             pbc.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::PBC(pbc));
         }
-        // upstream bookkeeper.py:317-331 — `elif callable(x):` splits
+        // upstream bookkeeper.py — `elif callable(x):` splits
         // into im_self/__self__ bound-method routing (→ find_method on
         // s_self) and the plain-callable fallback (→
         // SomePBC([getdesc(x)])). The Rust port encodes these as two
@@ -3957,14 +3957,14 @@ fn lookup_zero_arg_method(
 }
 
 /// RPython `CallOp.build_args(args_s)` dispatch by opname
-/// (operation.py:678-679 for `simple_call`, 699-701 for `call_args`).
+/// (operation.py for `simple_call`, 699-701 for `call_args`).
 ///
 /// `simple_call` wraps `args_s` in a flat `ArgumentsForTranslation`;
 /// `call_args` reads the encoded call shape out of `args_s[0].const`
 /// (`ConstValue::Tuple([Int(cnt), Tuple([Str(k0), …]), Bool(star)])`,
 /// see `flowcontext::build_call_shape_constant`) and reconstructs a
 /// CallShape + tail `args_s[1..]`.
-// check_no_flags_on_instances walker (bookkeeper.py:124-147)
+// check_no_flags_on_instances walker (bookkeeper.py)
 
 /// Entry point for the recursive sanity walk — inspects a `ClassDef`
 /// and recurses through its attributes. `seen_classdefs` /
@@ -4133,7 +4133,7 @@ fn call_shape_from_const(cv: &ConstValue) -> Result<CallShape, AnnotatorError> {
     })
 }
 
-/// RPython `getbookkeeper()` free function (bookkeeper.py:605-611).
+/// RPython `getbookkeeper()` free function (bookkeeper.py).
 ///
 /// ```python
 /// def getbookkeeper():
@@ -4146,7 +4146,7 @@ pub fn getbookkeeper() -> Option<Rc<Bookkeeper>> {
     super::model::TLS.with(|state| state.borrow().bookkeeper.clone())
 }
 
-/// RPython `immutablevalue(x)` free function (bookkeeper.py:613-614).
+/// RPython `immutablevalue(x)` free function (bookkeeper.py).
 ///
 /// Delegates to [`Bookkeeper::immutablevalue`] on the thread-local
 /// bookkeeper. Panics when called without a live bookkeeper — upstream
@@ -4157,7 +4157,7 @@ pub fn immutablevalue(x: &ConstValue) -> Result<SomeValue, AnnotatorError> {
     bk.immutablevalue(x)
 }
 
-/// RPython `origin_of_meth(boundmeth)` (bookkeeper.py:583-593).
+/// RPython `origin_of_meth(boundmeth)` (bookkeeper.py).
 pub fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), AnnotatorError> {
     let origin_class = boundmeth.bound_method_origin_class().ok_or_else(|| {
         AnnotatorError::new(format!(
@@ -4172,7 +4172,7 @@ pub fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), A
     Ok((origin_class, name.to_string()))
 }
 
-/// RPython `ishashable(x)` (bookkeeper.py:595-601).
+/// RPython `ishashable(x)` (bookkeeper.py).
 pub fn ishashable(_x: &HostObject) -> bool {
     true
 }
@@ -5257,7 +5257,7 @@ mod tests {
 
     #[test]
     fn immutablevalue_class_returns_constant_pbc() {
-        // upstream bookkeeper.py:315-316 — `tp is type` produces
+        // upstream bookkeeper.py — `tp is type` produces
         // `SomeConstantType(x, self)`, a SomePBC subclass with
         // `const = x`. The Rust port emits a Class-kind `SomePBC`
         // with `const_box` set; `SomeConstantType` collapses into the
@@ -5285,7 +5285,7 @@ mod tests {
 
     #[test]
     fn immutablevalue_user_function_returns_function_pbc() {
-        // upstream bookkeeper.py:317-331 — `callable(x)` falls into
+        // upstream bookkeeper.py — `callable(x)` falls into
         // `SomePBC([self.getdesc(x)])`. Narrow Rust port emits a
         // Function-kind Desc stub; real FunctionDesc wiring lands
         // when bookkeeper commit 2 ports getdesc.
@@ -5338,7 +5338,7 @@ mod tests {
 
     #[test]
     fn immutablevalue_builtin_callable_returns_somebuiltin() {
-        // upstream bookkeeper.py:309-311 — BUILTIN_ANALYZERS lookup
+        // upstream bookkeeper.py — BUILTIN_ANALYZERS lookup
         // produces SomeBuiltin with methodname
         // `getattr(x, "__module__", "unknown") + "." + x.__name__`.
         use crate::annotator::model::SomeValue;
@@ -5431,7 +5431,7 @@ mod tests {
 
     #[test]
     fn immutablevalue_live_weakref_pulls_instance_classdef() {
-        // upstream bookkeeper.py:303-306 — `s1 = immutablevalue(x1);
+        // upstream bookkeeper.py — `s1 = immutablevalue(x1);
         // assert isinstance(s1, SomeInstance); result = SomeWeakRef(s1.classdef)`.
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::HostObject;
@@ -5526,7 +5526,7 @@ mod tests {
 
     #[test]
     fn immutablevalue_freeze_instance_routes_to_some_pbc() {
-        // upstream bookkeeper.py:332-338 — `hasattr(x, '_freeze_')` +
+        // upstream bookkeeper.py — `hasattr(x, '_freeze_')` +
         // `assert x._freeze_() is True` routes to
         // `SomePBC([getdesc(x)])`. The Rust port registers `_freeze_`
         // as a NativeCallable on the class dict so the descriptor
@@ -5558,7 +5558,7 @@ mod tests {
 
     #[test]
     fn immutablevalue_freeze_returning_false_raises_annotator_error() {
-        // upstream bookkeeper.py:333 `assert x._freeze_() is True` —
+        // upstream bookkeeper.py `assert x._freeze_() is True` —
         // a `_freeze_` returning False triggers AssertionError. The
         // Rust port surfaces this as an `AnnotatorError`.
         use crate::annotator::annrpython::RPythonAnnotator;
@@ -5587,7 +5587,7 @@ mod tests {
 
     #[test]
     fn immutablevalue_non_callable_freeze_raises_annotator_error() {
-        // upstream bookkeeper.py:332-333 performs `x._freeze_()`;
+        // upstream bookkeeper.py performs `x._freeze_()`;
         // if `_freeze_` exists but is not callable, Python raises
         // `TypeError`. The Rust port surfaces that as an AnnotatorError.
         use crate::annotator::annrpython::RPythonAnnotator;
@@ -5900,7 +5900,7 @@ mod tests {
     }
 
     /// `getmethoddesc_for_attribute` mirrors the regular-method branch
-    /// of `bookkeeper.py:383-397 getdesc`: walks the receiver classdef's
+    /// of `bookkeeper.py getdesc`: walks the receiver classdef's
     /// MRO read-only, picks the first Method PBC, and routes through
     /// `getmethoddesc` so the upstream `methoddescs` cache is primed.
     /// Missing attribute → `None`.
@@ -5946,8 +5946,8 @@ mod tests {
         );
     }
 
-    /// `bookkeeper.py:384` getdesc bound-method branch and
-    /// `description.py:451 MethodDesc.bind_self` rebind the descriptor
+    /// `bookkeeper.py` getdesc bound-method branch and
+    /// `description.py MethodDesc.bind_self` rebind the descriptor
     /// to the receiver classdef.  Walking from a subclass receiver
     /// must produce a MethodDesc whose `selfclassdef` is the receiver
     /// classdef key, even when the attr stores an unbound entry on a
@@ -6007,7 +6007,7 @@ mod tests {
         assert!(!Rc::ptr_eq(bound, &unbound));
     }
 
-    /// `classdesc.py:344-365 lookup_filter` only rebinds MDs whose
+    /// `classdesc.py lookup_filter` only rebinds MDs whose
     /// `selfclassdef is None`.  Already-bound MDs (from instance
     /// attribute origin) are appended with their existing
     /// `selfclassdef` preserved.  Walking from a derived receiver
@@ -6070,7 +6070,7 @@ mod tests {
         assert_ne!(derived_key, base_key, "fixture sanity: keys differ");
     }
 
-    /// `classdesc.py:344-365 lookup_filter` first branch: when an
+    /// `classdesc.py lookup_filter` first branch: when an
     /// unbound MD's `originclassdef` is a strict subclass of the
     /// receiver, the method is kept and bound to `methclassdef`
     /// (NOT `receiver`).  Mirrors the comment:
@@ -6136,7 +6136,7 @@ mod tests {
         assert_ne!(base_key, derived_key, "fixture sanity");
     }
 
-    /// classdesc.py:341-367 lookup_filter collects ALL matching descs
+    /// classdesc.py lookup_filter collects ALL matching descs
     /// into `d`, not just the first.  A PBC with both an already-bound
     /// MD and an unbound upward-match MD must return both entries.
     #[test]
@@ -6377,7 +6377,7 @@ mod tests {
 
     #[test]
     fn annotator_backlink_upgrades_when_alive() {
-        // bookkeeper.py:52-54 — `self.annotator = annotator`. In Rust
+        // bookkeeper.py — `self.annotator = annotator`. In Rust
         // the backlink is a Weak<RPythonAnnotator>; while the outer
         // `Rc<RPythonAnnotator>` is alive, `bookkeeper.annotator()`
         // must return a live Rc to the same driver.
@@ -6398,7 +6398,7 @@ mod tests {
 
     #[test]
     fn compute_at_fixpoint_enters_position_and_clears_emulated() {
-        // bookkeeper.py:108-118 — compute_at_fixpoint wraps the work
+        // bookkeeper.py — compute_at_fixpoint wraps the work
         // in `with self.at_position(None)` and clears
         // `emulated_pbc_calls` at the end. Both effects are
         // observable even when the inner loops find no work.

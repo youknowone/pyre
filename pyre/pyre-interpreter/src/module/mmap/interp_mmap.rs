@@ -13,7 +13,7 @@
 // POSIX and on Windows, where the constructor takes a `tagname` instead of
 // flags/prot.  Like PyPy's `rmmap.MMap`, every Python object owns its
 // mapping and the descriptor it duplicated — the fd on POSIX, the file
-// handle on Windows (`rmmap.py:953-970`) — so close()/GC release exactly
+// handle on Windows (`rmmap.py`) — so close()/GC release exactly
 // that object's native resources.
 // ──────────────────────────────────────────────────────────────────────
 
@@ -124,7 +124,7 @@ pub struct W_MMap {
     access: i64,
     /// The protection the mapping was actually created with, which `access`
     /// alone does not determine: `_ACCESS_DEFAULT` resolves against the
-    /// caller's `prot` (`rmmap.py:729-745`).  `resize` remaps with it, where
+    /// caller's `prot` (`rmmap.py`).  `resize` remaps with it, where
     /// `mremap` would have preserved it.  Held as the `AccessMode`
     /// discriminant, which shares its numbering with `MMAP_ACCESS_*`.
     mode: i64,
@@ -177,7 +177,7 @@ fn mmap_mapped(obj: pyre_object::PyObjectRef) -> std::io::Result<&'static Mapped
         .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EBADF))
 }
 
-/// `rmmap.py:566-578 flush` — `c_msync(self.getptr(offset), size, MS_SYNC)`.
+/// `rmmap.py flush` — `c_msync(self.getptr(offset), size, MS_SYNC)`.
 /// The pointer goes to `msync` exactly as computed: Linux rejects a start that
 /// is not page-aligned with EINVAL, and that refusal is observable
 /// (`test_flush_return_value`).  `MappedFile::flush_range` rounds the start
@@ -345,7 +345,7 @@ fn mmap_handle(obj: pyre_object::PyObjectRef) -> Option<host_mmap::Handle> {
     Some(handle as host_mmap::Handle)
 }
 
-/// `rmmap.py:509-524 MMap.file_size` — the backing file's current size, which
+/// `rmmap.py MMap.file_size` — the backing file's current size, which
 /// diverges from the mapped length after `resize()`.  An anonymous map has no
 /// file to stat, and fstat on the `-1` descriptor is the OSError that reports
 /// it.
@@ -467,7 +467,7 @@ fn mmap_get_attr_obj(obj: pyre_object::PyObjectRef, key: &str) -> pyre_object::P
     unsafe { pyre_object::w_dict_getitem_str(d, key) }.unwrap_or(pyre_object::PY_NULL)
 }
 
-// `interp_mmap.py:243 descr_iter` / `:256 descr_reversed` return a
+// `interp_mmap.py descr_iter` / `:256 descr_reversed` return a
 // generator yielding the 1-byte slices `m[i:i+1]`.  pyre models that
 // generator as a dedicated iterator object holding the source mmap, a
 // cursor, and a step (`+1` forwards, `-1` for `reversed`).
@@ -528,7 +528,7 @@ fn init_mmap_iterator_type(ns: pyre_object::PyObjectRef) {
 
 #[cfg(any(unix, windows))]
 fn init_mmap_type(ns: pyre_object::PyObjectRef) {
-    // `interp_mmap.py:341 __new__ = interp2app(mmap)` — the class call
+    // `interp_mmap.py __new__ = interp2app(mmap)` — the class call
     // `mmap.mmap(fileno, length, ...)` lands here.  The common builtin
     // argument binder below supplies PyPy's named/defaulted gateway shape.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -563,7 +563,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_mmap.py:391 closed = GetSetProperty(W_MMap.closed_get)` —
+    // `interp_mmap.py closed = GetSetProperty(W_MMap.closed_get)` —
     // bare attribute access (`m.closed`) returns the bool directly via
     // descriptor lookup, not a bound method.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -586,7 +586,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_mmap.py:98-103 descr_size` returns `mmap.file_size()` —
+    // `interp_mmap.py descr_size` returns `mmap.file_size()` —
     // the underlying file's current size via fstat, not the mapped
     // length.  The two diverge after `resize()`, and an anonymous mmap
     // (no fd) raises ValueError per rmmap.py:MMap.file_size.
@@ -680,7 +680,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 return Err(crate::PyError::type_error("read() missing self"));
             }
             let obj = args[0];
-            // `interp_mmap.py:60-69 read(num=-1)` — None or -1 reads to
+            // `interp_mmap.py read(num=-1)` — None or -1 reads to
             // end; positive value caps at remaining bytes.
             let requested = if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
                 Some(mmap_index_w(obj, args[1])?)
@@ -726,7 +726,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_mmap.py:42 readline` — read bytes from current pos until
+    // `interp_mmap.py readline` — read bytes from current pos until
     // the first '\n' (inclusive); if absent, read to end.  Mirrors
     // `rmmap.py:421-432`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -807,7 +807,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 if access == MMAP_ACCESS_READ {
                     return Err(crate::PyError::type_error("mmap is read-only"));
                 }
-                // `interp_mmap.py:114-121 write_byte(byte=int)` —
+                // `interp_mmap.py write_byte(byte=int)` —
                 // `@unwrap_spec(byte=int)` rejects non-ints, then
                 // `chr(byte)` raises ValueError on values outside
                 // 0..256.
@@ -832,7 +832,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
 
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
-        // `interp_mmap.py:123-134 flush(offset=0, size=0)` —
+        // `interp_mmap.py flush(offset=0, size=0)` —
         // `@unwrap_spec(offset=int, size=int)` then `mmap.flush(offset,
         // size)`.  rmmap.flush passes size==0 through as "whole map",
         // which we mirror via `len - off`.
@@ -899,7 +899,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 }
                 pyre_object::bytesobject::bytes_like_data(args[1])
             };
-            // `interp_mmap.py:56-69 find(w_tofind, w_start=None,
+            // `interp_mmap.py find(w_tofind, w_start=None,
             // w_end=None)` defaults w_start to `self.mmap.pos` then
             // routes through rmmap.find which handles negative start /
             // end by adding `size` and clamping to 0.
@@ -959,7 +959,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 }
                 pyre_object::bytesobject::bytes_like_data(args[1])
             };
-            // `interp_mmap.py:71-84 rfind(w_tofind, w_start=None,
+            // `interp_mmap.py rfind(w_tofind, w_start=None,
             // w_end=None)` defaults w_start to `self.mmap.pos`, not 0.
             // Negative args run through rmmap.find which adds `size`
             // and clamps to 0.
@@ -1040,7 +1040,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_mmap.py:188 descr_getitem` — integer index returns a
+    // `interp_mmap.py descr_getitem` — integer index returns a
     // single int byte; slice returns bytes (contiguous fast path for
     // step=1, stepped extraction otherwise).
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -1094,7 +1094,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_mmap.py:206 descr_setitem` — integer index writes a
+    // `interp_mmap.py descr_setitem` — integer index writes a
     // single byte (0..256); slice writes a buffer whose length matches
     // the slice length.  Read-only mmaps raise TypeError.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -1189,7 +1189,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_mmap.py:243 descr_iter` — iterate the 1-byte slices
+    // `interp_mmap.py descr_iter` — iterate the 1-byte slices
     // `m[i:i+1]` forwards.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -1204,7 +1204,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_mmap.py:256 descr_reversed` — iterate the 1-byte slices
+    // `interp_mmap.py descr_reversed` — iterate the 1-byte slices
     // `m[i:i+1]` from `len(m) - 1` down to `0`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -1220,7 +1220,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_mmap.py:373-374` — `madvise` is registered from `optional[]`,
+    // `interp_mmap.py` — `madvise` is registered from `optional[]`,
     // i.e. only where `rmmap` has the call.  Windows has no counterpart, so
     // the method is absent there rather than present and inert.
     //
@@ -1283,7 +1283,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 let obj = args[0];
-                // `interp_mmap.py:136-143 move(dest, src, count)` —
+                // `interp_mmap.py move(dest, src, count)` —
                 // `@unwrap_spec(dest=int, src=int, count=int)` plus
                 // `self.check_writeable()` upfront.  We require all
                 // three args use the index protocol and reject ACCESS_READ.
@@ -1308,7 +1308,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         ),
     ) };
 
-    // `interp_mmap.py:146 resize` → `rmmap.py:589-601`.  POSIX path:
+    // `interp_mmap.py resize` → `rmmap.py`.  POSIX path:
     // ftruncate the backing fd (if any) to `offset + newsize`, then
     // mremap(MREMAP_MAYMOVE).  Platforms without mremap (e.g. macOS)
     // raise SystemError to match PyPy's RValueError→SystemError
@@ -1357,7 +1357,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             "__repr__",
             |args| {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                // `interp_mmap.py:297-316 descr_repr`: closed mmaps
+                // `interp_mmap.py descr_repr`: closed mmaps
                 // suppress the inner fields and emit just
                 // `<mmap.mmap closed=True>`; otherwise dump
                 // access / length / pos / offset.  Capitalised True /
@@ -1440,7 +1440,7 @@ fn mmap_resize_mapping(
     Ok(())
 }
 
-/// `rmmap.py:602-651` — unmap the view and close the mapping object, move the
+/// `rmmap.py` — unmap the view and close the mapping object, move the
 /// file's EOF to `offset + newsize`, then map the file again.  Dropping the
 /// old mapping first is required, not just tidy: `SetEndOfFile` fails with
 /// ERROR_USER_MAPPED_FILE while any view of the file is open.  An anonymous
@@ -1598,7 +1598,7 @@ const MMAP_ACCESS_WRITE: i64 = 2;
 #[cfg(any(unix, windows))]
 const MMAP_ACCESS_COPY: i64 = 3;
 
-/// `interp_mmap.py:341-345 W_MMap.__init__` — hand the finished mapping to a
+/// `interp_mmap.py W_MMap.__init__` — hand the finished mapping to a
 /// fresh instance of `cls`.  `mmap` is an acceptable base class, so the object
 /// carries the mapdict prefix and the subclass tag rather than being allocated
 /// against the builtin type directly.
@@ -1692,7 +1692,7 @@ fn mmap_construct(
             "mmap can't specify both access and flags, prot.",
         ));
     }
-    // `rmmap.py:681-683 _check_map_size`.
+    // `rmmap.py _check_map_size`.
     if length_raw < 0 {
         return Err(crate::PyError::type_error(
             "memory mapped size must be positive",
@@ -1798,7 +1798,7 @@ fn mmap_construct(
     ))
 }
 
-// `interp_mmap.py:354-370 mmap(fileno, length, tagname, access, offset)` —
+// `interp_mmap.py mmap(fileno, length, tagname, access, offset)` —
 // the Windows constructor names a mapping object where POSIX passes
 // flags/prot, and the mapping's protection comes from `access` alone
 // (`rmmap.py:900-914`).
@@ -1823,7 +1823,7 @@ fn mmap_construct(
     };
     let fileno = index_i64(bound[0], "fileno")? as i32;
     let length = index_i64(bound[1], "length")?;
-    // `rmmap.py:681-683 _check_map_size`.
+    // `rmmap.py _check_map_size`.
     if length < 0 {
         return Err(crate::PyError::type_error(
             "memory mapped size must be positive",
@@ -1886,7 +1886,7 @@ fn mmap_construct(
         let guard = MmapHandleGuard(
             host_mmap::duplicate_handle(fh).map_err(|e| mmap_io_err(e, "DuplicateHandle"))?,
         );
-        // `rmmap.py:925-928` trusts map_size when the size cannot be read
+        // `rmmap.py` trusts map_size when the size cannot be read
         // (a non-seeking file); only a readable size constrains it.
         if let Ok(file_len) = host_mmap::get_file_len(fh) {
             if map_size == 0 {
@@ -1915,7 +1915,7 @@ fn mmap_construct(
             // A given length is not measured against the file at all here.
             // `CreateFileMapping` is asked for `offset + length` and grows the
             // file to it, so a length past EOF is how the mapping is extended
-            // on this platform.  `rmmap.py:949-950` rejects it with "mmap
+            // on this platform.  `rmmap.py` rejects it with "mmap
             // length is greater than file size" instead; the run fails on that
             // at `lib-python/3/test/test_mmap.py:202-209`, which calls
             // `mmap(fileno(), mapsize + 1)` and, on `sys.platform` starting
@@ -2044,7 +2044,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 }
 
-/// `rmmap.py:57-113` — the mapping flags and advice values a POSIX `mmap(2)`
+/// `rmmap.py` — the mapping flags and advice values a POSIX `mmap(2)`
 /// takes.  The portable subset sources from host_env's re-exports; the
 /// platform-specific extras it does not re-export (MAP_FIXED, the Linux-only
 /// MAP_* flags, PROT_NONE) stay on libc.  Windows has none of them: the

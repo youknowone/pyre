@@ -88,7 +88,7 @@ impl RegAllocatorState {
         }
     }
 
-    /// RPython: `RegAllocator.make_dependencies()` — regalloc.py:26-77.
+    /// RPython: `RegAllocator.make_dependencies()` — regalloc.py.
     /// Per-block die_at analysis.
     fn make_dependencies(
         &mut self,
@@ -226,10 +226,10 @@ impl RegAllocatorState {
         }
     }
 
-    /// RPython: `RegAllocator.coalesce_variables()` — regalloc.py:79-96.
+    /// RPython: `RegAllocator.coalesce_variables()` — regalloc.py.
     /// Coalesce link.args[i] with target.inputargs[i] for every exit
     /// link.  Upstream materialises `list(self.graph.iterblocks())` and
-    /// `pop()`s from the END (regalloc.py:81-83), coalescing from the
+    /// `pop()`s from the END (regalloc.py), coalescing from the
     /// tail of the graph because the tail typically runs more often
     /// during blackholing; this visit order is load-bearing for which
     /// equally-valid coloring — and hence which interior register
@@ -255,7 +255,7 @@ impl RegAllocatorState {
                 // lookup.  Without this, coalescing a link arg into an
                 // exception-target inputarg leaves the rep outside
                 // `neighbours`, and `find_node_coloring` silently skips
-                // it (`color.py:25-27 getnodes()` filters
+                // it (`color.py getnodes()` filters
                 // `_all_nodes` by `neighbours.contains_key`).
                 if let Some(arg) = &link.last_exception
                     && let Some(var) = arg.as_variable()
@@ -360,9 +360,9 @@ impl RegAllocator {
         self.coloring.contains_key(var)
     }
 
-    /// `tool/algo/regalloc.py:138-143 swapcolors(col1, col2)` — swap
+    /// `tool/algo/regalloc.py swapcolors(col1, col2)` — swap
     /// every Variable holding `col1` with `col2` and vice versa.
-    /// Used by `flatten.py:88-100 enforce_input_args` to renumber
+    /// Used by `flatten.py enforce_input_args` to renumber
     /// the startblock inputargs into the dense `0..N` prefix of
     /// each kind's color range.
     pub fn swapcolors(&mut self, col1: usize, col2: usize) {
@@ -496,7 +496,7 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
 
 /// [`crate::flowspace::model::Variable`] → [`RegKind`] projection,
 /// reading the Variable's inline `concretetype` cell directly.  Mirrors
-/// upstream RPython's `getkind(v.concretetype)` (`history.py:46-71`).
+/// upstream RPython's `getkind(v.concretetype)` (`history.py`).
 fn variable_regkind(var: &crate::flowspace::model::Variable) -> Option<RegKind> {
     let ct = match var.concretetype.borrow().as_ref() {
         Some(lltype) => crate::model::getkind(lltype),

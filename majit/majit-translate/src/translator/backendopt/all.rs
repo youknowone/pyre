@@ -46,7 +46,7 @@ pub fn backend_optimizations(
     // then `config.set(**kwds)`.
     let config = backendopt_config(kwds, live_config)?;
 
-    // Upstream `all.py:46-47`: `graphs is None` falls back to
+    // Upstream `all.py`: `graphs is None` falls back to
     // `translator.graphs`.
     let graphs = graphs.unwrap_or_else(|| translator.graphs.borrow().clone());
 
@@ -315,7 +315,7 @@ pub(crate) fn inline_malloc_removal_phase(
     // remove_mallocs(translator, graphs); ...`.
     //
     // `malloc.py` is a 566-LOC escape-analysis pass. The driver
-    // `remove_mallocs(translator, graphs)` (`malloc.py:553-566`) wraps
+    // `remove_mallocs(translator, graphs)` (`malloc.py`) wraps
     // a `LLTypeMallocRemover` (`:333-547`, subclass of
     // `BaseMallocRemover`, `:26-332`) that:
     //
@@ -357,7 +357,7 @@ pub(crate) fn inline_malloc_removal_phase(
     Ok(())
 }
 
-/// RPython `constfold(config, graphs)` at `all.py:133-136`.
+/// RPython `constfold(config, graphs)` at `all.py`.
 pub(crate) fn constfold_pass(config: &Rc<Config>, graphs: &[GraphRef]) -> Result<(), TaskError> {
     if boolopt(config, "constfold")? {
         for graph in graphs {
@@ -367,7 +367,7 @@ pub(crate) fn constfold_pass(config: &Rc<Config>, graphs: &[GraphRef]) -> Result
     Ok(())
 }
 
-/// RPython nested `remove_obvious_noops()` at `all.py:69-80`.
+/// RPython nested `remove_obvious_noops()` at `all.py`.
 pub(crate) fn remove_obvious_noops(
     config: &Rc<Config>,
     translator: &TranslationContext,
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn inline_heuristic_other_than_default_returns_taskerror() {
-        // Upstream `get_function(dottedname)` at `all.py:19-33`
+        // Upstream `get_function(dottedname)` at `all.py`
         // uses `__import__` + `getattr` to resolve any dotted name.
         // Pyre's closed-world registry only carries the names that
         // upstream config defaults ship; a misconfigured dotted

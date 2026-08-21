@@ -6,7 +6,7 @@
 //! its `Option<i64>` match into the graph's native `add_ovf` op with an
 //! OverflowError exception edge — the integer-arithmetic analogue of
 //! [`crate::front::iter_next`]'s `next()` → `next`-op rewrite, and the
-//! direct mirror of `simplify.py:70-108 transform_ovfcheck`.
+//! direct mirror of `simplify.py transform_ovfcheck`.
 //!
 //! Rust source models the int fast path
 //! ```text
@@ -23,10 +23,10 @@
 //!     except OverflowError:  return _make_long(..)
 //!     return wrapint(space, z)
 //! ```
-//! where `ovfcheck(x + y)` is the `add_ovf` op (`operation.py:466
+//! where `ovfcheck(x + y)` is the `add_ovf` op (`operation.py
 //! add_operator('add', ..., ovf=True)` → its `_ovf` twin), which returns
 //! the sum directly and raises `OverflowError` on overflow
-//! (`operation.py:760-761 _add_except_ovf`; `OpKind::AddOvf.canraise() =
+//! (`operation.py _add_except_ovf`; `OpKind::AddOvf.canraise() =
 //! [OverflowError]`).  This module rewrites the value-encoded `Option`
 //! diamond into that exception representation: the `Some` arm becomes the
 //! op's normal continuation (the int payload `r`) and the `None` arm
@@ -363,7 +363,7 @@ fn rewire_one_checked_arith_site(graph: &mut FunctionGraph, opt: &Variable) -> R
     //   normal        → Some arm (sum)
     //   OverflowError → None arm (BigInt fallback)
     // `OpKind::AddOvf.canraise()` is exactly `[OverflowError]`
-    // (`operation.py:760-761 _add_except_ovf`), so no catch-all
+    // (`operation.py _add_except_ovf`), so no catch-all
     // propagation edge to `exceptblock` is synthesised (preserving the
     // front graph's "exceptblock edges == MIR unwind terminators"
     // invariant).

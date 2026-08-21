@@ -64,7 +64,7 @@ pub const USE_KARATSUBA: bool = true;
 pub const KARATSUBA_CUTOFF: i64 = 19;
 pub const KARATSUBA_SQUARE_CUTOFF: i64 = 2 * KARATSUBA_CUTOFF;
 pub const FIVEARY_CUTOFF: i64 = 8;
-/// rbigint.py:2427 `LimitHolder` / module-global `HOLDER`.
+/// rbigint.py `LimitHolder` / module-global `HOLDER`.
 ///
 /// PyPy deliberately keeps these algorithm cutoffs on one mutable,
 /// process-global object (its tests temporarily tune `DIV_LIMIT`). Atomics are
@@ -89,7 +89,7 @@ fn holder_limit(slot: &std::sync::atomic::AtomicI64) -> i64 {
     slot.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// rbigint.py:99-101 `@specialize.argtype(0) _mask_digit`.
+// rbigint.py `@specialize.argtype(0) _mask_digit`.
 //
 // RPython emits one graph for every concrete argument type.  Keep those
 // graphs separate here too: collapsing all callers through `u128` introduces
@@ -126,7 +126,7 @@ fn _unsigned_widen_digit(x: Digit) -> UWideDigit {
     x as UDigit as UWideDigit
 }
 
-// rbigint.py:109-111 `@specialize.argtype(0) _store_digit`.  This is only a
+// rbigint.py `@specialize.argtype(0) _store_digit`.  This is only a
 // cast to STORE_TYPE; masking belongs to callers exactly as it does upstream.
 #[inline]
 fn _store_digit(x: Digit) -> Digit {
@@ -157,7 +157,7 @@ fn _load_unsigned_digit(x: Digit) -> UDigit {
 /// Address of `l->items[x]`, the way `rtype_getitem` reaches it after
 /// translation.
 ///
-/// `rtype_getitem` / `rtype_setitem` (rlist.py:247-266, :272-303) select
+/// `rtype_getitem` / `rtype_setitem` (rlist.py, :272-303) select
 /// `dum_checkidx` only where the source catches `IndexError`; every digit
 /// access takes the default `dum_nocheck`, under which `ll_getitem_nonneg`
 /// keeps `ll_assert(index >= 0, ...)` and folds the length test away. Going
@@ -485,7 +485,7 @@ unsafe impl Send for RBigInt {}
 unsafe impl Sync for RBigInt {}
 
 /// RPython's `tuple2` of two `rbigint`s — the return type of `rbigint.divmod`
-/// and `rbigint.int_divmod` (rbigint.py:1002 / 1050, both `@jit.elidable`).
+/// and `rbigint.int_divmod` (rbigint.py / 1050, both `@jit.elidable`).
 ///
 /// RPython gives a multiple-return elidable a real GC struct, so the trace is
 /// one `call_pure_r` yielding this pointer plus two `getfield_gc_r`. Rust
@@ -530,7 +530,7 @@ impl std::fmt::Display for RBigInt {
 }
 
 impl PartialEq for RBigInt {
-    // rbigint.py:174-183: Python `__eq__`/`__ne__` exist for tests only and
+    // rbigint.py: Python `__eq__`/`__ne__` exist for tests only and
     // carry @not_rpython. This Rust comparison trait is the same host-facing
     // adapter; translated code calls the inherent elidable `RBigInt::eq`.
     #[majit_macros::not_rpython]
@@ -592,7 +592,7 @@ impl RBigInt {
         Self::prebuilt(3, 5, 1)
     }
 
-    /// rbigint.py:159 `__init__(digits=NULLDIGITS, sign=0, size=0)`.
+    /// rbigint.py `__init__(digits=NULLDIGITS, sign=0, size=0)`.
     pub fn new(digits: &[Digit], sign: i64, size: i64) -> Self {
         // Upstream calls `_check_digits` only under
         // `if not we_are_translated()`.  The translated constructor relies on
@@ -738,7 +738,7 @@ impl RBigInt {
         unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
-    // rbigint.py:208-212 `@specialize.argtype(2) setdigit`, Unsigned graph.
+    // rbigint.py `@specialize.argtype(2) setdigit`, Unsigned graph.
     #[majit_macros::always_inline]
     #[inline]
     fn setdigit_udigit(&mut self, x: i64, val: UDigit) {
@@ -747,7 +747,7 @@ impl RBigInt {
         unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
-    // rbigint.py:208-212 `@specialize.argtype(2) setdigit`, LONG_TYPE graph.
+    // rbigint.py `@specialize.argtype(2) setdigit`, LONG_TYPE graph.
     #[majit_macros::always_inline]
     #[inline]
     fn setdigit_widedigit(&mut self, x: i64, val: WideDigit) {
@@ -756,7 +756,7 @@ impl RBigInt {
         unsafe { *digits_item(self._digits, x) = _store_digit(val) };
     }
 
-    // rbigint.py:208-212 `@specialize.argtype(2) setdigit`, ULONG_TYPE graph.
+    // rbigint.py `@specialize.argtype(2) setdigit`, ULONG_TYPE graph.
     #[majit_macros::always_inline]
     #[inline]
     fn setdigit_uwidedigit(&mut self, x: i64, val: UWideDigit) {
@@ -774,11 +774,11 @@ impl RBigInt {
         w
     }
 
-    /// rbigint.py:225 `fromint`.
+    /// rbigint.py `fromint`.
     #[majit_macros::jit_elidable]
     pub fn fromint(intval: i64) -> Self {
         let (sign, ival) = if intval < 0 {
-            // `-r_uint(intval)` in rbigint.py:236: negate in the unsigned
+            // `-r_uint(intval)` in rbigint.py: negate in the unsigned
             // domain so the most-negative machine integer remains valid.
             // An i128 negation makes rustc inject an irrelevant i128::MIN
             // overflow assertion into MIR; RPython has no such operation.
@@ -801,13 +801,13 @@ impl RBigInt {
         }
     }
 
-    /// rbigint.py:270 `frombool`.
+    /// rbigint.py `frombool`.
     #[majit_macros::jit_elidable]
     pub fn frombool(value: bool) -> Self {
         if value { Self::one() } else { Self::zero() }
     }
 
-    /// rbigint.py:278 `fromlong`; Python-only upstream helper, represented
+    /// rbigint.py `fromlong`; Python-only upstream helper, represented
     /// with Rust's widest built-in signed integer for port tests.
     #[majit_macros::not_rpython]
     pub fn fromlong(value: i128) -> Self {
@@ -815,7 +815,7 @@ impl RBigInt {
         Self::new(&digits, sign, digits.len() as i64)
     }
 
-    /// rbigint.py:283 `fromfloat`.
+    /// rbigint.py `fromfloat`.
     #[majit_macros::jit_elidable]
     pub fn fromfloat(dval: f64) -> Result<Self, RBigIntError> {
         if dval.is_infinite() {
@@ -827,7 +827,7 @@ impl RBigInt {
         Ok(Self::_fromfloat_finite(dval))
     }
 
-    /// rbigint.py:294 `_fromfloat_finite`.
+    /// rbigint.py `_fromfloat_finite`.
     #[majit_macros::jit_elidable]
     pub fn _fromfloat_finite(mut dval: f64) -> Self {
         let sign = if dval < 0.0 {
@@ -854,7 +854,7 @@ impl RBigInt {
         value
     }
 
-    /// rbigint.py:317 `fromrarith_int`.
+    /// rbigint.py `fromrarith_int`.
     #[majit_macros::jit_elidable]
     pub fn fromrarith_int(value: i64) -> Self {
         let (digits, sign) = args_from_rarith_int(value);
@@ -869,13 +869,13 @@ impl RBigInt {
         Self::new(&digits, sign, digits.len() as i64)
     }
 
-    /// rbigint.py:324 `fromdecimalstr`.
+    /// rbigint.py `fromdecimalstr`.
     #[majit_macros::jit_elidable]
     pub fn fromdecimalstr(s: &str) -> Self {
         _decimalstr_to_bigint(s, 0, s.len() as i64)
     }
 
-    /// rbigint.py:331 `fromstr`.
+    /// rbigint.py `fromstr`.
     #[majit_macros::jit_elidable]
     pub fn fromstr(s: &str, base: i64, allow_underscores: bool) -> Result<Self, RBigIntError> {
         if !s.is_ascii() {
@@ -911,7 +911,7 @@ impl RBigInt {
         Self::_from_numberstring_parser(&mut parser)
     }
 
-    /// rbigint.py:350 `_from_numberstring_parser`.
+    /// rbigint.py `_from_numberstring_parser`.
     pub fn _from_numberstring_parser(
         parser: &mut NumberStringParser<'_>,
     ) -> Result<Self, RBigIntError> {
@@ -1071,7 +1071,7 @@ impl RBigInt {
         Ok(result)
     }
 
-    /// rbigint.py:465 `toint`.
+    /// rbigint.py `toint`.
     #[majit_macros::jit_elidable]
     pub fn toint(&self) -> Result<i64, RBigIntError> {
         if self.numdigits() > MAX_DIGITS_THAT_CAN_FIT_IN_INT {
@@ -2108,7 +2108,7 @@ impl RBigInt {
         Ok(z)
     }
 
-    /// rbigint.py:1357 `lqshift`.
+    /// rbigint.py `lqshift`.
     #[majit_macros::jit_elidable]
     #[majit_macros::always_inline]
     #[inline]
@@ -2338,7 +2338,7 @@ impl RBigInt {
         self.format(BASE16, "0x", "L", 0)
     }
 
-    /// rbigint.py:1568 `log`.
+    /// rbigint.py `log`.
     #[majit_macros::jit_elidable]
     pub fn log(&self, base: f64) -> Result<f64, RBigIntError> {
         if base == 10.0 {
@@ -2354,7 +2354,7 @@ impl RBigInt {
         Ok(result)
     }
 
-    /// rbigint.py:1581 `tolong`; Python-only upstream helper, represented
+    /// rbigint.py `tolong`; Python-only upstream helper, represented
     /// with Rust's widest built-in signed integer for port tests.
     #[majit_macros::not_rpython]
     pub fn tolong(&self) -> Result<i128, RBigIntError> {
@@ -2379,7 +2379,7 @@ impl RBigInt {
         }
     }
 
-    /// rbigint.py:1593 `_normalize`.
+    /// rbigint.py `_normalize`.
     #[majit_macros::always_inline]
     #[inline]
     pub fn _normalize(&mut self) {
@@ -3013,7 +3013,7 @@ fn float_frexp(x: f64) -> (f64, i32) {
     (f64::from_bits(mantissa_bits), exp_field - 1022)
 }
 
-/// rbigint.py:1671 `_help_mult`.
+/// rbigint.py `_help_mult`.
 fn _help_mult(
     x: &RBigInt,
     y: &RBigInt,
@@ -3026,7 +3026,7 @@ fn _help_mult(
     Ok(result)
 }
 
-/// rbigint.py:1685 `digits_from_nonneg_long`.
+/// rbigint.py `digits_from_nonneg_long`.
 fn digits_from_nonneg_long(mut value: i64) -> Vec<Digit> {
     debug_assert!(value >= 0);
     let mut digits = Vec::new();
@@ -3052,7 +3052,7 @@ fn digits_from_nonneg_ulong(mut value: u64) -> Vec<Digit> {
     }
 }
 
-/// rbigint.py:1694 `digits_for_most_neg_long`.
+/// rbigint.py `digits_for_most_neg_long`.
 fn digits_for_most_neg_long(mut value: i64) -> Vec<Digit> {
     let mut digits = Vec::new();
     while _mask_digit(value) == 0 {
@@ -3065,7 +3065,7 @@ fn digits_for_most_neg_long(mut value: i64) -> Vec<Digit> {
     digits
 }
 
-/// rbigint.py:1710 `args_from_rarith_int1`.
+/// rbigint.py `args_from_rarith_int1`.
 fn args_from_rarith_int1(value: i64) -> (Vec<Digit>, i64) {
     if value > 0 {
         (digits_from_nonneg_long(value), 1)
@@ -3078,7 +3078,7 @@ fn args_from_rarith_int1(value: i64) -> (Vec<Digit>, i64) {
     }
 }
 
-/// rbigint.py:1723 `args_from_rarith_int`.
+/// rbigint.py `args_from_rarith_int`.
 fn args_from_rarith_int(value: i64) -> (Vec<Digit>, i64) {
     args_from_rarith_int1(value)
 }
@@ -3099,7 +3099,7 @@ fn args_from_rarith_uint(value: u64) -> (Vec<Digit>, i64) {
     args_from_rarith_uint1(value)
 }
 
-/// rbigint.py:1729 `args_from_long`.
+/// rbigint.py `args_from_long`.
 #[majit_macros::not_rpython]
 fn args_from_long(value: i128) -> (Vec<Digit>, i64) {
     if value > 0 {
@@ -3116,7 +3116,7 @@ fn args_from_long(value: i128) -> (Vec<Digit>, i64) {
     }
 }
 
-/// rbigint.py:1738 `_x_add`.
+/// rbigint.py `_x_add`.
 fn _x_add<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
     let mut size_a = a.numdigits();
     let mut size_b = b.numdigits();
@@ -3144,7 +3144,7 @@ fn _x_add<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
     z
 }
 
-/// rbigint.py:1764 `_x_int_add`.
+/// rbigint.py `_x_int_add`.
 fn _x_int_add(a: &RBigInt, b: i64) -> RBigInt {
     let size_a = a.numdigits();
     let mut z = RBigInt::with_size(size_a + 1, 1);
@@ -3163,7 +3163,7 @@ fn _x_int_add(a: &RBigInt, b: i64) -> RBigInt {
     z
 }
 
-/// rbigint.py:1783 `_x_sub`.
+/// rbigint.py `_x_sub`.
 fn _x_sub<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
     let mut size_a = a.numdigits();
     let mut size_b = b.numdigits();
@@ -3208,7 +3208,7 @@ fn _x_sub<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
     z
 }
 
-/// rbigint.py:1829 `_x_int_sub`.
+/// rbigint.py `_x_int_sub`.
 fn _x_int_sub(a: &RBigInt, b: i64) -> RBigInt {
     let size_a = a.numdigits();
     let bdigit = b.unsigned_abs();
@@ -3240,7 +3240,7 @@ fn _x_int_sub(a: &RBigInt, b: i64) -> RBigInt {
     z
 }
 
-// rbigint.py:1866-1870 `ptwotable`.
+// rbigint.py `ptwotable`.
 //
 // Every upstream lookup first takes an absolute digit and proves that it is a
 // power of two. The immutable dict's positive and negative keys therefore
@@ -3259,7 +3259,7 @@ const fn make_ptwotable() -> [i64; SHIFT as usize] {
 
 const PTWOTABLE: [i64; SHIFT as usize] = make_ptwotable();
 
-/// rbigint.py:1872 `_x_mul`.
+/// rbigint.py `_x_mul`.
 fn _x_mul(a: &RBigInt, b: &RBigInt, digit: Digit) -> RBigInt {
     let size_a = a.numdigits();
     let size_b = b.numdigits();
@@ -3355,7 +3355,7 @@ fn _x_mul(a: &RBigInt, b: &RBigInt, digit: Digit) -> RBigInt {
     z
 }
 
-/// rbigint.py:1983 `_kmul_split`.
+/// rbigint.py `_kmul_split`.
 fn _kmul_split(n: &RBigInt, size: i64) -> (RBigInt, RBigInt) {
     let size_n = n.numdigits();
     let size_lo = size_n.min(size);
@@ -3378,7 +3378,7 @@ fn _kmul_split(n: &RBigInt, size: i64) -> (RBigInt, RBigInt) {
     (hi, lo)
 }
 
-/// rbigint.py:2001 `_k_mul`.
+/// rbigint.py `_k_mul`.
 fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
     let asize = a.numdigits();
     let bsize = b.numdigits();
@@ -3444,7 +3444,7 @@ fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
     ret
 }
 
-/// rbigint.py:2145 `_inplace_divrem1`.
+/// rbigint.py `_inplace_divrem1`.
 fn _inplace_divrem1(pout: &mut RBigInt, pin: &RBigInt, n: Digit) -> Digit {
     debug_assert!(n > 0 && n <= MASK as Digit);
     let mut rem = 0_u128;
@@ -3459,7 +3459,7 @@ fn _inplace_divrem1(pout: &mut RBigInt, pin: &RBigInt, n: Digit) -> Digit {
     rem as Digit
 }
 
-/// rbigint.py:2162 `_divrem1`.
+/// rbigint.py `_divrem1`.
 #[majit_macros::jit_elidable]
 fn _divrem1(a: &RBigInt, n: Digit) -> (RBigInt, Digit) {
     debug_assert!(n > 0 && n <= MASK as Digit);
@@ -3470,7 +3470,7 @@ fn _divrem1(a: &RBigInt, n: Digit) -> (RBigInt, Digit) {
     (z, rem)
 }
 
-/// rbigint.py:2176 `_int_rem_core`.
+/// rbigint.py `_int_rem_core`.
 fn _int_rem_core(a: &RBigInt, digit: Digit) -> Digit {
     let mut size = a.numdigits() - 1;
     if size > 0 {
@@ -3485,7 +3485,7 @@ fn _int_rem_core(a: &RBigInt, digit: Digit) -> Digit {
     }
 }
 
-/// rbigint.py:2191 `_v_iadd`.
+/// rbigint.py `_v_iadd`.
 fn _v_iadd(x: &mut RBigInt, xofs: i64, m: i64, y: &RBigInt, n: i64) -> UDigit {
     debug_assert!(m >= n);
     let mut carry = 0_u64;
@@ -3509,7 +3509,7 @@ fn _v_iadd(x: &mut RBigInt, xofs: i64, m: i64, y: &RBigInt, n: i64) -> UDigit {
     carry
 }
 
-/// rbigint.py:2216 `_v_isub`.
+/// rbigint.py `_v_isub`.
 fn _v_isub(x: &mut RBigInt, xofs: i64, m: i64, y: &RBigInt, n: i64) -> UDigit {
     debug_assert!(m >= n);
     let mut borrow = 0_u64;
@@ -3534,7 +3534,7 @@ fn _v_isub(x: &mut RBigInt, xofs: i64, m: i64, y: &RBigInt, n: i64) -> UDigit {
     borrow
 }
 
-/// rbigint.py:2244 `_muladd1`.
+/// rbigint.py `_muladd1`.
 fn _muladd1(a: &RBigInt, n: Digit, extra: Digit) -> RBigInt {
     debug_assert!(n > 0);
     let size_a = a.numdigits();
@@ -3553,7 +3553,7 @@ fn _muladd1(a: &RBigInt, n: Digit, extra: Digit) -> RBigInt {
     z
 }
 
-/// rbigint.py:2263 `_v_lshift`.
+/// rbigint.py `_v_lshift`.
 fn _v_lshift(z: &mut RBigInt, a: &RBigInt, m: i64, d: i64) -> UWideDigit {
     let mut carry = 0_u128;
     let mut i = 0;
@@ -3566,7 +3566,7 @@ fn _v_lshift(z: &mut RBigInt, a: &RBigInt, m: i64, d: i64) -> UWideDigit {
     carry
 }
 
-/// rbigint.py:2279 `_v_rshift`.
+/// rbigint.py `_v_rshift`.
 fn _v_rshift(z: &mut RBigInt, a: &RBigInt, m: i64, d: i64) -> UWideDigit {
     let mut carry = 0_u128;
     let mask = (1_u128 << d as u32) - 1;
@@ -3580,7 +3580,7 @@ fn _v_rshift(z: &mut RBigInt, a: &RBigInt, m: i64, d: i64) -> UWideDigit {
     carry
 }
 
-/// rbigint.py:2298 `_x_divrem`.
+/// rbigint.py `_x_divrem`.
 pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
     let mut size_v = v1.numdigits();
     let size_w = w1.numdigits();
@@ -3605,7 +3605,7 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
         let carry = _v_rshift(&mut w, &v, size_w, d);
         debug_assert_eq!(carry, 0);
         w._normalize();
-        // rbigint.py:2322 deliberately does not return NULLRBIGINT here:
+        // rbigint.py deliberately does not return NULLRBIGINT here:
         // callers of this internal division helper may modify the result.
         // Keep both the rbigint value and its digit array fresh.
         return (RBigInt::new(&[NULLDIGIT], 0, 0), w);
@@ -3660,7 +3660,7 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
     (a, w)
 }
 
-/// rbigint.py:2396 `_divrem`.
+/// rbigint.py `_divrem`.
 #[majit_macros::jit_elidable]
 pub fn _divrem(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntError> {
     let size_a = a.numdigits();
@@ -3689,7 +3689,7 @@ pub fn _divrem(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntEr
     Ok((z, rem))
 }
 
-/// rbigint.py:2435 `_extract_digits`.
+/// rbigint.py `_extract_digits`.
 fn _extract_digits(a: &RBigInt, startindex: i64, numdigits: i64) -> RBigInt {
     if startindex >= a.numdigits() {
         return RBigInt::zero();
@@ -3707,7 +3707,7 @@ fn _extract_digits(a: &RBigInt, startindex: i64, numdigits: i64) -> RBigInt {
     result
 }
 
-/// rbigint.py:2448 `div2n1n`.
+/// rbigint.py `div2n1n`.
 fn div2n1n(
     a_container: &RBigInt,
     a_startindex: i64,
@@ -3739,7 +3739,7 @@ fn div2n1n(
     Ok((_full_digits_lshift_then_or(&q1, half_n_s, &q2)?, r))
 }
 
-/// rbigint.py:2497 `div3n2n`.
+/// rbigint.py `div3n2n`.
 #[allow(clippy::too_many_arguments)]
 fn div3n2n(
     a12_container: &RBigInt,
@@ -3787,7 +3787,7 @@ fn div3n2n(
     Ok((q, r))
 }
 
-/// rbigint.py:2525 `_full_digits_lshift_then_or`.
+/// rbigint.py `_full_digits_lshift_then_or`.
 fn _full_digits_lshift_then_or(a: &RBigInt, n: i64, b: &RBigInt) -> Result<RBigInt, RBigIntError> {
     if a.get_sign() == 0 {
         return Ok(b.translated_alias());
@@ -3809,7 +3809,7 @@ fn _full_digits_lshift_then_or(a: &RBigInt, n: i64, b: &RBigInt) -> Result<RBigI
     Ok(result)
 }
 
-/// rbigint.py:2545 `_divmod_fast_pos`.
+/// rbigint.py `_divmod_fast_pos`.
 fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntError> {
     let n = b.bit_length()?;
     let m = a.bit_length()?;
@@ -3901,7 +3901,7 @@ fn _divmod_fast_pos(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBig
     Ok((q, r))
 }
 
-/// rbigint.py:2603 `divmod_big`.
+/// rbigint.py `divmod_big`.
 pub fn divmod_big(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntError> {
     if b.get_sign() == 0 {
         return Err(RBigIntError::DivisionByZero);
@@ -3917,7 +3917,7 @@ pub fn divmod_big(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIn
     _divmod_fast_pos(a, b)
 }
 
-/// rbigint.py:2619 `_x_int_lt`.
+/// rbigint.py `_x_int_lt`.
 fn _x_int_lt(a: &RBigInt, b: i64, eq: bool) -> bool {
     let mut osign = 1;
     if b == 0 {
@@ -3948,7 +3948,7 @@ fn _x_int_lt(a: &RBigInt, b: i64, eq: bool) -> bool {
     false
 }
 
-/// rbigint.py:2651 `_AsScaledDouble`.
+/// rbigint.py `_AsScaledDouble`.
 #[allow(non_snake_case)]
 fn _AsScaledDouble(value: &RBigInt) -> (f64, i64) {
     const NBITS_WANTED: i64 = 57;
@@ -3968,7 +3968,7 @@ fn _AsScaledDouble(value: &RBigInt) -> (f64, i64) {
     (x * sign as f64, i)
 }
 
-/// rbigint.py:2698 `_AsDouble`.
+/// rbigint.py `_AsDouble`.
 #[majit_macros::dont_look_inside]
 #[allow(non_snake_case)]
 fn _AsDouble(value: &RBigInt) -> Result<f64, RBigIntError> {
@@ -4013,7 +4013,7 @@ fn _AsDouble(value: &RBigInt) -> Result<f64, RBigIntError> {
     Ok(result)
 }
 
-/// rbigint.py:2747-2764 `@specialize.arg(0) _loghelper(log, arg)`.
+/// rbigint.py `@specialize.arg(0) _loghelper(log, arg)`.
 ///
 /// RPython emits one graph per constant function argument.  These three
 /// bodies are those concrete graphs; there must be no runtime discriminator.
@@ -4041,7 +4041,7 @@ fn _loghelper_log2(arg: &RBigInt) -> Result<f64, RBigIntError> {
     Ok(x.log2() + exponent as f64 * SHIFT as f64 * 2.0_f64.log2())
 }
 
-/// rbigint.py:2777 `bits_in_digit`.
+/// rbigint.py `bits_in_digit`.
 const fn make_bit_length_table() -> [u8; 1 << 8] {
     let mut table = [0_u8; 1 << 8];
     let mut i = 1;
@@ -4064,7 +4064,7 @@ pub fn bits_in_digit(mut d: Digit) -> i64 {
     d_bits + BIT_LENGTH_TABLE[d as usize] as i64
 }
 
-/// rbigint.py:2790 `bit_length_int`.
+/// rbigint.py `bit_length_int`.
 #[majit_macros::jit_elidable]
 pub fn bit_length_int(mut value: i64) -> i64 {
     let mut count;
@@ -4107,7 +4107,7 @@ fn _bitcount64_ops(mut x: u64, k1: u64, k2: u64, k4: u64, kf: u64) -> u64 {
     x.wrapping_mul(kf) >> 56
 }
 
-/// rbigint.py:2836 `_truediv_result`.
+/// rbigint.py `_truediv_result`.
 #[inline]
 fn _truediv_result(result: f64, negate: bool) -> f64 {
     if negate { -result } else { result }
@@ -4134,7 +4134,7 @@ fn _float_ldexp(mut value: f64, mut exponent: i64) -> f64 {
     value * 2.0_f64.powi(exponent as i32)
 }
 
-/// rbigint.py:2844 `_bigint_true_divide`.
+/// rbigint.py `_bigint_true_divide`.
 fn _bigint_true_divide(a: &RBigInt, b: &RBigInt) -> Result<f64, RBigIntError> {
     const DBL_MANT_DIG: i64 = 53;
     const DBL_MAX_EXP: i64 = 1024;
@@ -4224,7 +4224,7 @@ pub const BASE8: &str = "01234567";
 pub const BASE10: &str = "0123456789";
 pub const BASE16: &str = "0123456789abcdef";
 
-/// rbigint.py:2974 `_format_base2_notzero`.
+/// rbigint.py `_format_base2_notzero`.
 fn _format_base2_notzero(
     a: &RBigInt,
     digits: &str,
@@ -4308,7 +4308,7 @@ fn _format_base2_notzero(
 struct PartsCacheBase {
     mindigits: i64,
     lowest_part: i64,
-    // rbigint.py:3046 stores a list of rbigint object references, not inline
+    // rbigint.py stores a list of rbigint object references, not inline
     // value copies.  The outer Arc is pyre's immutable-reader snapshot of that
     // one shared list; each element Arc preserves the identity of the cached
     // rbigint while a later append publishes a longer snapshot.
@@ -4426,7 +4426,7 @@ pub fn initialize_rbigint_parts_cache() {
     std::sync::LazyLock::force(&PARTS_CACHE);
 }
 
-/// rbigint.py:3054 `_PartsCache.get_cached_parts`.
+/// rbigint.py `_PartsCache.get_cached_parts`.
 ///
 /// Upstream owns one process-global 34-slot list. The mutex is only Rust's
 /// synchronization wrapper around that same shared owner; this must never be
@@ -4489,7 +4489,7 @@ const fn make_format10_table2() -> [u8; 200] {
 
 const FORMAT10_TABLE2: [u8; 200] = make_format10_table2();
 
-/// rbigint.py:3081 `_format_int10_18digits`.
+/// rbigint.py `_format_int10_18digits`.
 fn _format_int10_18digits(mut val: i64, builder: &mut String) {
     debug_assert!(val < 10_i64.pow(18));
     let top2 = val / 10_i64.pow(16);
@@ -4712,7 +4712,7 @@ fn _format_lowest_level_divmod_int_results(x: &RBigInt, iother: i64) -> (i64, i6
     (div as i64, rem as i64)
 }
 
-/// rbigint.py:3183 `_format`.
+/// rbigint.py `_format`.
 fn _format(
     x: &RBigInt,
     digits: &str,
@@ -4825,7 +4825,7 @@ fn _format(
     Ok(output)
 }
 
-/// rbigint.py:3240-3321 `@specialize.arg(1) _bitwise(a, '&', b)`.
+/// rbigint.py `@specialize.arg(1) _bitwise(a, '&', b)`.
 fn _bitwise_and(a: &RBigInt, b: &RBigInt) -> RBigInt {
     let a_inverted;
     let (a, mut maska) = if a.get_sign() < 0 {
@@ -5149,7 +5149,7 @@ fn _int_bitwise_xor(a: &RBigInt, mut b: i64) -> RBigInt {
     if negz { z.invert() } else { z }
 }
 
-/// rbigint.py:3410 `_AsLongLong`.
+/// rbigint.py `_AsLongLong`.
 #[allow(non_snake_case)]
 fn _AsLongLong(value: &RBigInt) -> Result<i64, RBigIntError> {
     let x = _AsULonglong_ignore_sign(value)?;
@@ -5166,7 +5166,7 @@ fn _AsLongLong(value: &RBigInt) -> Result<i64, RBigIntError> {
     }
 }
 
-/// rbigint.py:3428 `_AsULonglong_ignore_sign`.
+/// rbigint.py `_AsULonglong_ignore_sign`.
 #[allow(non_snake_case)]
 fn _AsULonglong_ignore_sign(value: &RBigInt) -> Result<u64, RBigIntError> {
     let mut x = 0_u64;
@@ -5182,7 +5182,7 @@ fn _AsULonglong_ignore_sign(value: &RBigInt) -> Result<u64, RBigIntError> {
     Ok(x)
 }
 
-/// rbigint.py:3440 `make_unsigned_mask_conversion`.
+/// rbigint.py `make_unsigned_mask_conversion`.
 ///
 /// Both RPython instantiations (`r_uint` and `r_ulonglong`) are 64-bit on
 /// pyre's supported target, so they specialize to this one concrete graph.
@@ -5205,7 +5205,7 @@ fn _As_unsigned_mask(value: &RBigInt) -> u64 {
     }
 }
 
-/// rbigint.py:3455 `_hash`.
+/// rbigint.py `_hash`.
 fn _hash(v: &RBigInt) -> i64 {
     let mut i = v.numdigits();
     let sign = v.get_sign();
@@ -5256,7 +5256,7 @@ const fn make_base_max() -> [Digit; 37] {
 pub const BASE_MAX: [Digit; 37] = make_base_max();
 pub const DEC_MAX: Digit = digits_max_for_base(10);
 
-/// rbigint.py:3493 `_decimalstr_to_bigint`.
+/// rbigint.py `_decimalstr_to_bigint`.
 fn _decimalstr_to_bigint(s: &str, start: i64, lim: i64) -> RBigInt {
     // Like upstream, this helper is only for a decimal string that has
     // already been parsed and validated. Validation belongs to
@@ -5295,7 +5295,7 @@ fn _decimalstr_to_bigint(s: &str, start: i64, lim: i64) -> RBigInt {
     a
 }
 
-/// rbigint.py:3527 `parse_digit_string`.
+/// rbigint.py `parse_digit_string`.
 pub fn parse_digit_string(parser: &mut NumberStringParser<'_>) -> Result<RBigInt, RBigIntError> {
     let base = parser.base;
     if base >= 2 && (base & (base - 1)) == 0 {
@@ -5364,7 +5364,7 @@ impl FivePowCache {
     }
 }
 
-/// rbigint.py:3565 `_str_to_int_big_w5pow`.
+/// rbigint.py `_str_to_int_big_w5pow`.
 fn _str_to_int_big_w5pow(
     w: i64,
     mem: &mut FivePowCache,
@@ -5389,7 +5389,7 @@ fn _str_to_int_big_w5pow(
     Ok(result)
 }
 
-/// rbigint.py:3590 `_str_to_int_big_inner10`.
+/// rbigint.py `_str_to_int_big_inner10`.
 fn _str_to_int_big_inner10(
     s: &str,
     a: i64,
@@ -5409,7 +5409,7 @@ fn _str_to_int_big_inner10(
     Ok(right.add(&left))
 }
 
-/// rbigint.py:3603 `_str_to_int_big_base10`.
+/// rbigint.py `_str_to_int_big_base10`.
 fn _str_to_int_big_base10(
     s: &str,
     start: i64,
@@ -5420,7 +5420,7 @@ fn _str_to_int_big_base10(
     _str_to_int_big_inner10(s, start, end, &mut mem, limit)
 }
 
-/// rbigint.py:3614 `parse_string_from_binary_base`.
+/// rbigint.py `parse_string_from_binary_base`.
 fn parse_string_from_binary_base(
     parser: &mut NumberStringParser<'_>,
 ) -> Result<RBigInt, RBigIntError> {
@@ -5466,7 +5466,7 @@ fn parse_string_from_binary_base(
     Ok(z)
 }
 
-/// rbigint.py:3664 `gcd_binary`.
+/// rbigint.py `gcd_binary`.
 #[majit_macros::jit_elidable]
 fn gcd_binary(mut a: i64, mut b: i64) -> i64 {
     debug_assert!(a >= 0 && b >= 0);
@@ -5499,7 +5499,7 @@ fn gcd_binary(mut a: i64, mut b: i64) -> i64 {
     a << shift
 }
 
-/// rbigint.py:3695 `lehmer_xgcd`.
+/// rbigint.py `lehmer_xgcd`.
 fn lehmer_xgcd(mut a: u64, mut b: u64) -> (i128, i128, i128, i128) {
     let (mut s_old, mut s_new) = (1_i128, 0_i128);
     let (mut t_old, mut t_new) = (0_i128, 1_i128);
@@ -5514,7 +5514,7 @@ fn lehmer_xgcd(mut a: u64, mut b: u64) -> (i128, i128, i128, i128) {
     (s_old, t_old, s_new, t_new)
 }
 
-/// rbigint.py:3708 `gcd_lehmer`.
+/// rbigint.py `gcd_lehmer`.
 #[majit_macros::jit_elidable]
 fn gcd_lehmer(mut a: RBigInt, mut b: RBigInt) -> Result<RBigInt, RBigIntError> {
     if a.lt(&b) {
@@ -5567,7 +5567,7 @@ fn gcd_lehmer(mut a: RBigInt, mut b: RBigInt) -> Result<RBigInt, RBigIntError> {
     Ok(RBigInt::fromint(gcd_binary(b.toint()?, a.toint()?)))
 }
 
-/// rbigint.py:3763 `frombytes_int`.
+/// rbigint.py `frombytes_int`.
 #[majit_macros::jit_elidable]
 pub fn frombytes_int(bytes: &[u8], byteorder: &str, signed: bool) -> Result<i64, RBigIntError> {
     if byteorder != "big" && byteorder != "little" {
@@ -5622,7 +5622,7 @@ pub fn frombytes_int(bytes: &[u8], byteorder: &str, signed: bool) -> Result<i64,
     Ok(result)
 }
 
-/// rbigint.py:3814 `tobytes_int`.
+/// rbigint.py `tobytes_int`.
 #[majit_macros::jit_elidable]
 pub fn tobytes_int(
     intval: i64,
@@ -6465,7 +6465,7 @@ mod tests {
 
     #[test]
     fn test_x_divrem_zero_quotient_is_fresh() {
-        // rbigint.py:2322 cannot return NULLRBIGINT because callers may
+        // rbigint.py cannot return NULLRBIGINT because callers may
         // modify this internal result.  Equal-sized, two-digit operands with
         // dividend < divisor take the otherwise uncommon k == 0 branch.
         let dividend = RBigInt::new(&[1, 1], 1, 2);

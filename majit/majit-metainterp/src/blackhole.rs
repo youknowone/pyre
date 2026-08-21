@@ -77,7 +77,7 @@ use crate::pyjitpl::{
 };
 
 // BlackholeInterpBuilder instruction setup
-// RPython `blackhole.py:52-103` `class BlackholeInterpBuilder` combines
+// RPython `blackhole.py` `class BlackholeInterpBuilder` combines
 // pool management AND dispatch setup. pyre's existing
 // `BlackholeInterpBuilder` (below, at the pool management section) is the
 // pool manager. The `setup_insns` infrastructure (opcode table + dispatch
@@ -87,7 +87,7 @@ use crate::pyjitpl::{
 
 /// Handler function signature for the codewriter-orthodox dispatch table.
 ///
-/// RPython `blackhole.py:107` `handler(self, code, position) -> position`.
+/// RPython `blackhole.py` `handler(self, code, position) -> position`.
 /// Each handler decodes operands from `code[position..]` based on its
 /// argcodes, calls the corresponding `bhimpl_*` method on `bh`, writes
 /// results, and returns the updated position.
@@ -97,7 +97,7 @@ pub type BhOpcodeHandler =
 /// Default handler installed by `setup_insns` for opcodes whose
 /// `bhimpl_*` has not been ported to `wire_bhimpl_handlers` yet.
 ///
-/// RPython `blackhole.py:76-80` `setup_insns` immediately resolves every
+/// RPython `blackhole.py` `setup_insns` immediately resolves every
 /// entry via `_get_method` and would raise `AttributeError` right there
 /// if a `bhimpl_*` is missing. pyre defers the crash to dispatch time so
 /// the runtime can construct a partial builder and `unwired_opnames()`
@@ -138,7 +138,7 @@ pub use majit_translate::jitcode::{BhCallDescr, BhDescr, DescrTable, EMPTY_DESCR
 /// - `result_type` selects which `bhimpl_recursive_call_{v,i,r,f}`
 ///   method handles the call (blackhole.py:1080-1093).
 /// - `portal_runner_ptr` / `mainjitcode_calldescr` feed
-///   `get_portal_runner` (blackhole.py:1095-1099).
+///   `get_portal_runner` (blackhole.py).
 #[derive(Clone, Debug, Default)]
 pub struct BhJitDriverSd {
     /// warmspot.py:449 `jd.result_type` projected to the blackhole
@@ -176,7 +176,7 @@ pub enum DispatchError {
 /// represents one execution frame. Frame chain is linked via
 /// `nextblackholeinterp`.
 ///
-/// RPython: `BlackholeInterpreter` class in blackhole.py:282-306.
+/// RPython: `BlackholeInterpreter` class in blackhole.py.
 ///
 /// RPython `__init__` receives `builder` and stores:
 ///   self.cpu = builder.cpu
@@ -197,12 +197,12 @@ pub struct BlackholeInterpreter {
     /// of `AbstractDescr` objects carrying field offsets, array item sizes,
     /// etc. In pyre, we store raw offsets (usize) as a simplification —
     /// descriptor-index argcode ('d', 2 bytes) indexes into this table.
-    /// `blackhole.py:288` binds `builder.descrs` by reference and :102-103
+    /// `blackhole.py` binds `builder.descrs` by reference and :102-103
     /// stores the assembler list itself, so the table is shared and never
     /// copied; :154 is its only consumer and only reads. This has the same
     /// lifetime shape as the sibling `cpu: Option<&'static dyn Backend>`.
     pub descrs: &'static dyn DescrTable,
-    /// RPython `blackhole.py:289` `self.op_catch_exception = builder.op_catch_exception`.
+    /// RPython `blackhole.py` `self.op_catch_exception = builder.op_catch_exception`.
     pub op_catch_exception: u8,
     /// RPython `blackhole.py:290` `self.op_rvmprof_code = builder.op_rvmprof_code`.
     pub op_rvmprof_code: u8,
@@ -283,11 +283,11 @@ pub struct BlackholeInterpreter {
     /// dispatch matches upstream line-by-line.
     ///
     /// Upstream reads the table through `self.builder.metainterp_sd`
-    /// (blackhole.py:60 `self.metainterp_sd = metainterp_sd`), so it is
+    /// (blackhole.py `self.metainterp_sd = metainterp_sd`), so it is
     /// builder-shared and every interpreter in a chain sees it by
     /// construction.  A pool-owned Rust interpreter cannot hold a `&builder`
     /// back-reference, so this is the builder's snapshot, copied in by
-    /// `acquire_interp` the same way `descrs` is (blackhole.py:288).  Set it
+    /// `acquire_interp` the same way `descrs` is (blackhole.py).  Set it
     /// via [`BlackholeInterpBuilder::setup_jitdrivers_sd`] before acquiring,
     /// not on individual frames.
     pub jitdrivers_sd: Vec<BhJitDriverSd>,
@@ -295,7 +295,7 @@ pub struct BlackholeInterpreter {
     /// PyFrame.locals_cells_stack_w. RPython does not need this because
     /// its JitCode already operates in register space.
     pub virtualizable_stack_base: usize,
-    /// RPython `blackhole.py:287` `self.dispatch_loop = builder.dispatch_loop`.
+    /// RPython `blackhole.py` `self.dispatch_loop = builder.dispatch_loop`.
     /// Per-instance reference to the builder's dispatch table.  Cloned
     /// from the builder via `Arc::clone` in `acquire_interp` so wired
     /// handler lookup is one indirect call (`self.dispatch_table[opcode]`)
@@ -320,7 +320,7 @@ pub struct BlackholeInterpreter {
 thread_local! {
     pub static BH_LAST_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 
-    /// llmodel.py:240 `grab_exc_value(deadframe)`: the exception a failing
+    /// llmodel.py `grab_exc_value(deadframe)`: the exception a failing
     /// guard carried, parked for the bridge / blackhole handoff.
     ///
     /// Grabbing the value reads `jf_guard_exc` off the deadframe and drops the
@@ -338,10 +338,10 @@ thread_local! {
     ///
     /// Thread-local is the faithful shape rather than a concession: upstream
     /// keeps one shadow stack per thread and switches between them on GIL
-    /// hand-off (`shadowstack.py:140-215`, a `{tid: SHADOWSTACKREF}` map), and
+    /// hand-off (`shadowstack.py`, a `{tid: SHADOWSTACKREF}` map), and
     /// enumerates every thread's block at collection time instead of resolving
     /// the thread local on whichever thread started collecting
-    /// (`rthread.py:429-437 _trace_tlref`). This cell plus the per-mutator area
+    /// (`rthread.py _trace_tlref`). This cell plus the per-mutator area
     /// is that pair, hand-materialized for one live value.
     pub static GUARD_EXC_VALUE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
@@ -388,9 +388,9 @@ impl Default for BlackholeInterpreter {
     fn default() -> Self {
         Self {
             cpu: None,
-            // blackhole.py:280 `EMPTY_LIST_I = [] # shared`.
+            // blackhole.py `EMPTY_LIST_I = [] # shared`.
             descrs: EMPTY_DESCR_TABLE,
-            // RPython blackhole.py:289 — copied from builder in `acquire_interp`.
+            // RPython blackhole.py — copied from builder in `acquire_interp`.
             // Sentinel `u8::MAX` matches RPython's `insns.get('…', -1)` fallback.
             op_catch_exception: u8::MAX,
             op_rvmprof_code: u8::MAX,
@@ -567,7 +567,7 @@ impl BlackholeInterpreter {
         self.record_caught_exception = parent.record_caught_exception;
     }
 
-    /// blackhole.py:312 setposition
+    /// blackhole.py setposition
     ///
     /// Initialize register arrays for a jitcode and set the position.
     /// Allocates registers sized to hold both working regs and constants,
@@ -587,7 +587,7 @@ impl BlackholeInterpreter {
         }
     }
 
-    /// blackhole.py:1095-1099 `get_portal_runner(jdindex)`.
+    /// blackhole.py `get_portal_runner(jdindex)`.
     ///
     /// ```python
     /// def get_portal_runner(self, jdindex):
@@ -644,7 +644,7 @@ impl BlackholeInterpreter {
         (fnptr, calldescr, all_i, all_r, all_f)
     }
 
-    /// blackhole.py:1109-1116 bhimpl_recursive_call_r:
+    /// blackhole.py bhimpl_recursive_call_r:
     ///   fnptr, calldescr = self.get_portal_runner(jdindex)
     ///   return self.cpu.bh_call_r(fnptr, greens_i+reds_i, greens_r+reds_r,
     ///                             greens_f+reds_f, calldescr)
@@ -703,7 +703,7 @@ impl BlackholeInterpreter {
         self.tmpreg_i
     }
 
-    /// blackhole.py:368-373 `get_tmpreg_r`.
+    /// blackhole.py `get_tmpreg_r`.
     ///
     /// Reference scratch values are GC-visible while a blackhole is running,
     /// so consuming one must clear the slot immediately.  Leaving the last
@@ -741,7 +741,7 @@ impl BlackholeInterpreter {
         }
     }
 
-    /// blackhole.py:385 cleanup_registers
+    /// blackhole.py cleanup_registers
     ///
     /// Clear reference registers to avoid keeping objects alive.
     /// Does not clear constants (they are prebuilt).
@@ -759,13 +759,13 @@ impl BlackholeInterpreter {
         // return value into the pool.  Nothing roots it there, so the object
         // can be collected; the next `run()` on that pooled interp then pushes
         // the dead address as a root and the collector reads a header off it.
-        // Upstream's `cleanup_registers` (`blackhole.py:385`) has no such slot
+        // Upstream's `cleanup_registers` (`blackhole.py`) has no such slot
         // to clear: RPython's tmpreg is a traced field of a GC object.
         self.tmpreg_r = 0;
         self.exception_last_value = 0;
     }
 
-    /// blackhole.py:393-394 `get_current_position_info`.
+    /// blackhole.py `get_current_position_info`.
     ///
     /// RPython returns an offset into `metainterp_sd.liveness_info`
     /// (via `jitcode.get_live_vars_info(self.position, self.builder.op_live)`).
@@ -827,32 +827,32 @@ impl BlackholeInterpreter {
         code[pos - 1] as usize
     }
 
-    /// blackhole.py:1653 _setup_return_value_i
+    /// blackhole.py _setup_return_value_i
     ///
     /// Connect the return of values from the called frame to the
     /// 'xxx_call_yyy' instructions from the caller frame.
-    /// blackhole.py:1653 _setup_return_value_i
+    /// blackhole.py _setup_return_value_i
     pub fn setup_return_value_i(&mut self, result: i64) {
         // blackhole.py:1655-1656
         let reg_idx = self.call_result_reg(BhReturnType::Int);
         self.registers_i[reg_idx] = result;
     }
 
-    /// blackhole.py:1657 _setup_return_value_r
+    /// blackhole.py _setup_return_value_r
     pub fn setup_return_value_r(&mut self, result: i64) {
         // blackhole.py:1658-1659
         let reg_idx = self.call_result_reg(BhReturnType::Ref);
         self.registers_r[reg_idx] = result;
     }
 
-    /// blackhole.py:1660 _setup_return_value_f
+    /// blackhole.py _setup_return_value_f
     pub fn setup_return_value_f(&mut self, result: i64) {
         // blackhole.py:1661-1662
         let reg_idx = self.call_result_reg(BhReturnType::Float);
         self.registers_f[reg_idx] = result;
     }
 
-    /// blackhole.py:1664 _done_with_this_frame
+    /// blackhole.py _done_with_this_frame
     ///
     /// Rare case: the blackhole interps all returned normally
     /// (in general we get a ContinueRunningNormally exception).
@@ -869,12 +869,12 @@ impl BlackholeInterpreter {
         }
     }
 
-    /// blackhole.py:1679 _exit_frame_with_exception
+    /// blackhole.py _exit_frame_with_exception
     fn exit_frame_with_exception(&self, exc: i64) -> JitException {
         JitException::ExitFrameWithExceptionRef(GcRef(exc as usize))
     }
 
-    /// blackhole.py:1647 _prepare_resume_from_failure
+    /// blackhole.py _prepare_resume_from_failure
     ///
     /// Extract exception from the CPU deadframe on guard failure.
     /// Returns the exception value (0 if none).
@@ -884,7 +884,7 @@ impl BlackholeInterpreter {
         deadframe_exc
     }
 
-    /// blackhole.py:1612 _resume_mainloop
+    /// blackhole.py _resume_mainloop
     ///
     /// Execute one frame and handle its completion.
     /// Returns Ok(exc) where exc is the exception to propagate to caller (0 = none),
@@ -903,10 +903,10 @@ impl BlackholeInterpreter {
             return Ok(current_exc);
         }
 
-        // blackhole.py:1621 — run the bytecode.
-        // blackhole.py:1612 `_resume_mainloop` does not catch
+        // blackhole.py — run the bytecode.
+        // blackhole.py `_resume_mainloop` does not catch
         // ContinueRunningNormally; it propagates out to `_run_forever`
-        // and then to `handle_jitexception` (warmspot.py:961).
+        // and then to `handle_jitexception` (warmspot.py).
         if let Some(args) = self.run() {
             return Err(JitException::ContinueRunningNormally(Box::new(
                 crate::jitexc::ContinueRunningNormallyArgs {
@@ -1039,7 +1039,7 @@ impl BlackholeInterpreter {
         }
     }
 
-    /// blackhole.py:1732-1748 _get_list_of_values parity.
+    /// blackhole.py _get_list_of_values parity.
     ///
     /// Decodes a bytecode-encoded register list: [length:u8][indices:u8...].
     /// Returns a Vec of register values looked up from the appropriate
@@ -1060,7 +1060,7 @@ impl BlackholeInterpreter {
         values
     }
 
-    /// blackhole.py:1733-1748 _get_list_of_values(self, code, position, 'R')
+    /// blackhole.py _get_list_of_values(self, code, position, 'R')
     fn _get_list_of_values_r(&mut self) -> Vec<i64> {
         let length = self.next_u8() as usize;
         let mut values = Vec::with_capacity(length);
@@ -1081,7 +1081,7 @@ impl BlackholeInterpreter {
         values
     }
 
-    /// blackhole.py:1066-1093 `bhimpl_jit_merge_point`. Decodes
+    /// blackhole.py `bhimpl_jit_merge_point`. Decodes
     /// `@arguments("self", "i", "I", "R", "F", "I", "R", "F")` from
     /// `self.position` (advancing it past the jdindex byte and the six
     /// typed register lists), then either raises `ContinueRunningNormally`
@@ -1217,12 +1217,12 @@ impl BlackholeInterpreter {
         self.position >= self.jitcode.code.len()
     }
 
-    /// blackhole.py:1600-1603 bhimpl_rvmprof_code.
+    /// blackhole.py bhimpl_rvmprof_code.
     pub fn bhimpl_rvmprof_code(&self, leaving: i64, unique_id: i64) {
         jit_rvmprof_code(leaving, unique_id);
     }
 
-    /// blackhole.py:396 handle_exception_in_frame: check if the current
+    /// blackhole.py handle_exception_in_frame: check if the current
     /// position has an immediately-following `catch_exception/L`.
     pub fn handle_exception_in_frame(&mut self, exc_value: i64) -> bool {
         let code = &self.jitcode.code;
@@ -1430,7 +1430,7 @@ impl BlackholeInterpreter {
         None
     }
 
-    /// blackhole.py:424-439 handle_rvmprof_enter.
+    /// blackhole.py handle_rvmprof_enter.
     pub fn handle_rvmprof_enter(&mut self) {
         let code = &self.jitcode.code;
         let mut position = self.position;
@@ -1614,7 +1614,7 @@ impl BlackholeInterpreter {
                     return Some(*args);
                 }
                 Err(DispatchError::RaiseException(exc)) => {
-                    // blackhole.py:359-361: except Exception → handle_exception_in_frame
+                    // blackhole.py: except Exception → handle_exception_in_frame
                     if trace {
                         crate::debug::log_one(
                             "jit-blackhole",
@@ -1637,7 +1637,7 @@ impl BlackholeInterpreter {
     /// Dispatch a single bytecode instruction through the per-instance
     /// `dispatch_table`.
     ///
-    /// RPython parity: `blackhole.py:83-100` `dispatch_loop` calls
+    /// RPython parity: `blackhole.py` `dispatch_loop` calls
     /// `self.dispatch_table[opcode_byte](self, code, position)`
     /// unconditionally — every opcode is wired before the loop runs.
     /// Pyre matches that contract: every dispatching builder
@@ -1660,7 +1660,7 @@ impl BlackholeInterpreter {
             .copied()
             .filter(|h| (*h as *const () as usize) != placeholder_addr);
         let Some(handler) = table_handler else {
-            // RPython parity (`blackhole.py:66-100 setup_insns`
+            // RPython parity (`blackhole.py setup_insns`
             // resolving every key via `_get_method`): a missing handler
             // is `AttributeError` at builder-construction time.  pyre
             // hits this branch only when a builder has not registered
@@ -2059,7 +2059,7 @@ impl BlackholeInterpreter {
 
 /// Pool manager + dispatch builder for blackhole interpreters.
 ///
-/// RPython `blackhole.py:52-103` `class BlackholeInterpBuilder`.
+/// RPython `blackhole.py` `class BlackholeInterpBuilder`.
 ///
 /// Combines two responsibilities:
 /// 1. Interpreter pool management (acquire/release/release_chain).
@@ -2068,7 +2068,7 @@ impl BlackholeInterpreter {
 ///      `bhimpl_*` methods are ported from RPython.
 pub struct BlackholeInterpBuilder {
     pool: Vec<BlackholeInterpreter>,
-    /// RPython `blackhole.py:56` `self.cpu = codewriter.cpu`.
+    /// RPython `blackhole.py` `self.cpu = codewriter.cpu`.
     /// Stored as raw pointer; the Backend outlives the builder.
     /// RPython `blackhole.py:286/56` `self.cpu = builder.cpu`.
     /// Backend trait for `bh_*` concrete execution. None until set.
@@ -2076,7 +2076,7 @@ pub struct BlackholeInterpBuilder {
     /// RPython `blackhole.py:68` `self._insns`: opcode byte → "opname/argcodes".
     /// Populated by `setup_insns`; empty until called.
     pub _insns: Vec<String>,
-    /// RPython `blackhole.py:72` `self.op_live = insns.get('live/', -1)`.
+    /// RPython `blackhole.py` `self.op_live = insns.get('live/', -1)`.
     pub op_live: u8,
     /// RPython `blackhole.py:73` `self.op_catch_exception`.
     pub op_catch_exception: u8,
@@ -2091,13 +2091,13 @@ pub struct BlackholeInterpBuilder {
     ///
     /// `Arc<Vec<...>>` so each `acquire_interp` cheaply shares the same
     /// table snapshot with the returned interpreter (RPython
-    /// `blackhole.py:287` `self.dispatch_loop = builder.dispatch_loop`
+    /// `blackhole.py` `self.dispatch_loop = builder.dispatch_loop`
     /// instance binding).  Wiring mutators (`setup_insns`,
     /// `wire_handler`) take `&mut self` and use `Arc::make_mut`; once
     /// wiring is done before the first `acquire_interp`, the inner Vec
     /// is uniquely owned and `make_mut` is cheap.
     pub(crate) dispatch_table: std::sync::Arc<Vec<BhOpcodeHandler>>,
-    /// RPython `blackhole.py:60` `self.metainterp_sd = metainterp_sd`.
+    /// RPython `blackhole.py` `self.metainterp_sd = metainterp_sd`.
     /// Every interpreter resolves `jitdrivers_sd[jdindex]` through its
     /// builder (blackhole.py:1079 `sd = self.builder.metainterp_sd`,
     /// :1096 `self.builder.metainterp_sd.jitdrivers_sd[jdindex]`), so the
@@ -2120,7 +2120,7 @@ impl BlackholeInterpBuilder {
             op_live: u8::MAX,
             op_catch_exception: u8::MAX,
             op_rvmprof_code: u8::MAX,
-            // blackhole.py:280 `EMPTY_LIST_I = [] # shared`.
+            // blackhole.py `EMPTY_LIST_I = [] # shared`.
             descrs: EMPTY_DESCR_TABLE,
             dispatch_table: std::sync::Arc::new(Vec::new()),
             jitdrivers_sd: Vec::new(),
@@ -2155,7 +2155,7 @@ impl BlackholeInterpBuilder {
         self.op_rvmprof_code = to_u8(op_rvmprof_code);
     }
 
-    /// RPython `blackhole.py:66-100` `setup_insns(insns)`.
+    /// RPython `blackhole.py` `setup_insns(insns)`.
     ///
     /// ```python
     /// def setup_insns(self, insns):
@@ -2200,7 +2200,7 @@ impl BlackholeInterpBuilder {
         };
         self._insns = vec![String::new(); table_len];
         for (key, &value) in insns {
-            // `blackhole.py:69` `assert self._insns[value] is None`:
+            // `blackhole.py` `assert self._insns[value] is None`:
             // every byte slot is filled exactly once across the
             // forward map.  Pyre's `wellknown_bh_insns` +
             // `pyre_extension_insns` + `pipeline.insns` union must
@@ -2219,7 +2219,7 @@ impl BlackholeInterpBuilder {
         self.op_live = insns.get("live/").copied().unwrap_or(u8::MAX);
         self.op_catch_exception = insns.get("catch_exception/L").copied().unwrap_or(u8::MAX);
         self.op_rvmprof_code = insns.get("rvmprof_code/ii").copied().unwrap_or(u8::MAX);
-        // RPython blackhole.py:76-80: build handler table.
+        // RPython blackhole.py: build handler table.
         //
         // RPython immediately calls _get_method(name, argcodes) for every
         // insns key and panics if the corresponding bhimpl_* is missing.
@@ -2237,7 +2237,7 @@ impl BlackholeInterpBuilder {
     /// `setup_insns` placeholder — i.e. no `bhimpl_*` handler has been
     /// wired for them yet.
     ///
-    /// RPython has no analogue: `setup_insns` (blackhole.py:66) resolves
+    /// RPython has no analogue: `setup_insns` (blackhole.py) resolves
     /// every entry via `_get_method` and would raise `AttributeError`
     /// immediately for a missing `bhimpl_*`. pyre splits that into two
     /// phases — `setup_insns` fills placeholders, `wire_bhimpl_handlers`
@@ -2262,14 +2262,14 @@ impl BlackholeInterpBuilder {
             .collect()
     }
 
-    /// RPython `blackhole.py:102-103` `setup_descrs(descrs)`.
+    /// RPython `blackhole.py` `setup_descrs(descrs)`.
     pub fn setup_descrs(&mut self, descrs: &'static dyn DescrTable) {
         self.descrs = descrs;
     }
 
     /// Publish the jitdriver table every interpreter this builder hands out
     /// will resolve `jdindex` against — the builder-side half of
-    /// `blackhole.py:60` `self.metainterp_sd = metainterp_sd` (read back at
+    /// `blackhole.py` `self.metainterp_sd = metainterp_sd` (read back at
     /// :1079 / :1096).  Call before `acquire_interp`: a chain built from a
     /// builder whose table is still empty gives every frame an empty table,
     /// and `bhimpl_jit_merge_point`'s recursive-portal branch indexes it
@@ -2278,7 +2278,7 @@ impl BlackholeInterpBuilder {
         self.jitdrivers_sd = jitdrivers_sd;
     }
 
-    /// RPython `blackhole.py:83-100` `dispatch_loop(self, code, position)`.
+    /// RPython `blackhole.py` `dispatch_loop(self, code, position)`.
     ///
     /// Runs the codewriter-orthodox bytecode dispatch loop. Each iteration
     /// reads one opcode byte, looks up the handler in `dispatch_table`,
@@ -2427,7 +2427,7 @@ impl BlackholeInterpBuilder {
         bh.op_rvmprof_code = self.op_rvmprof_code;
         //   self.op_live = builder.op_live
         bh.op_live = self.op_live;
-        // RPython blackhole.py:287: self.dispatch_loop = builder.dispatch_loop
+        // RPython blackhole.py: self.dispatch_loop = builder.dispatch_loop
         bh.dispatch_table = std::sync::Arc::clone(&self.dispatch_table);
         // blackhole.py:250 `self.builder = builder` — upstream keeps the
         // back-reference and reads `self.builder.metainterp_sd.jitdrivers_sd`
@@ -2437,7 +2437,7 @@ impl BlackholeInterpBuilder {
         bh
     }
 
-    /// blackhole.py:253 release_interp
+    /// blackhole.py release_interp
     pub fn release_interp(&mut self, mut interp: BlackholeInterpreter) {
         // blackhole.py:254
         interp.cleanup_registers();
@@ -2481,7 +2481,7 @@ impl BlackholeInterpBuilder {
     }
 }
 
-/// warmspot.py:961 handle_jitexception parity.
+/// warmspot.py handle_jitexception parity.
 ///
 /// Dispatches on JitException type and returns (return_type, value).
 /// For ContinueRunningNormally, calls portal_runner to re-enter the
@@ -2518,11 +2518,11 @@ fn handle_jitexception_dispatch(
     }
 }
 
-/// blackhole.py:1684 _handle_jitexception_in_portal +
-/// warmspot.py:1039 handle_jitexception_from_blackhole
+/// blackhole.py _handle_jitexception_in_portal +
+/// warmspot.py handle_jitexception_from_blackhole
 ///
 /// Handle a JitException at a recursive portal level.
-/// warmspot.py:1040: result = handle_jitexception(e)
+/// warmspot.py: result = handle_jitexception(e)
 /// warmspot.py:1041-1050: bhcaller._setup_return_value_{i,r,f}(result)
 ///
 /// Returns Ok(()) on success (return value set in bhcaller),
@@ -2537,7 +2537,7 @@ fn handle_jitexception_in_portal(
     exc: JitException,
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
 ) -> Result<(), i64> {
-    // warmspot.py:961 handle_jitexception: while True loop.
+    // warmspot.py handle_jitexception: while True loop.
     // ContinueRunningNormally → portal_runner → may raise JitException → loop.
     let mut current_exc = exc;
     loop {
@@ -2597,7 +2597,7 @@ impl BlackholeTerminalImage {
     }
 }
 
-/// blackhole.py:1762 _handle_jitexception
+/// blackhole.py _handle_jitexception
 ///
 /// Route a JitException through the blackhole frame chain.
 /// Walks up the chain until a portal frame is found. If the portal
@@ -2618,9 +2618,9 @@ fn handle_jitexception(
     // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
     while bh.jitcode.jitdriver_sd().is_none() {
         let next = bh.nextblackholeinterp.take();
-        // `pyopcode.py:184 handle_operation_error` stores
+        // `pyopcode.py handle_operation_error` stores
         // `frame_finished_execution = True` on the route that propagates out
-        // of a frame without a handler, and `executioncontext.py:91 leave`
+        // of a frame without a handler, and `executioncontext.py leave`
         // takes `got_exception` — both run on the unwind, not only on the
         // return.  These levels are the ones the walk abandons on its way to
         // the portal: their chain link is dropped here and never resumes, so
@@ -2650,11 +2650,11 @@ fn handle_jitexception(
 
     // blackhole.py:1770-1780: recursive portal level.
     // _handle_jitexception_in_portal(exc) calls jd.handle_jitexc_from_bh,
-    // which is warmspot.py:1039 handle_jitexception_from_blackhole:
+    // which is warmspot.py handle_jitexception_from_blackhole:
     //   result = handle_jitexception(e)
     //   bhcaller._setup_return_value_{i,r,f}(result)
     //
-    // handle_jitexception (warmspot.py:961) extracts the result from
+    // handle_jitexception (warmspot.py) extracts the result from
     // DoneWithThisFrame{Int,Ref,Float,Void} and returns it.
     //
     // In Rust we can do this directly since JitException carries the result.
@@ -2667,7 +2667,7 @@ fn handle_jitexception(
     Ok((bh, current_exc))
 }
 
-/// blackhole.py:1752 _run_forever
+/// blackhole.py _run_forever
 ///
 /// Execute a blackhole frame chain to completion.
 /// Loops through frames: runs each one via `resume_mainloop`, releases it,
@@ -2683,9 +2683,9 @@ pub fn run_forever(
     run_forever_with_portal(builder, bh, current_exc, None, None, None, None)
 }
 
-/// blackhole.py:1752 _run_forever with optional portal runner callback.
+/// blackhole.py _run_forever with optional portal runner callback.
 ///
-/// `portal_runner` is warmspot.py:961 handle_jitexception parity:
+/// `portal_runner` is warmspot.py handle_jitexception parity:
 /// when ContinueRunningNormally is raised at a recursive portal level,
 /// this callback re-enters the portal function with the exception's
 /// green/red args and returns the result.
@@ -2755,7 +2755,7 @@ pub fn run_forever_with_portal(
         // blackhole.py:1759
         let next = bh.nextblackholeinterp.take();
         // `pyopcode.py:239-241 RETURN_VALUE` (`frame_finished_execution = True`)
-        // and `pyopcode.py:184 handle_operation_error` (the same store on the
+        // and `pyopcode.py handle_operation_error` (the same store on the
         // no-handler propagation): the level reached here has returned to its
         // caller by one of those two routes, so its frame's execution is over.
         // Threaded from the interpreter side for the same reason as
@@ -2777,7 +2777,7 @@ pub fn run_forever_with_portal(
     }
 }
 
-/// blackhole.py:1799 convert_and_run_from_pyjitpl
+/// blackhole.py convert_and_run_from_pyjitpl
 ///
 /// Get a chain of blackhole interpreters and fill them by copying
 /// 'metainterp.framestack'.
@@ -2797,7 +2797,7 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     /// majit-metainterp cannot reference `ExecutionContext`.
     pub on_enter_level: Option<&'a dyn Fn(i64)>,
     /// The `frame_finished_execution` store `pyopcode.py:239-241 RETURN_VALUE`
-    /// and `pyopcode.py:184 handle_operation_error` perform before leaving a
+    /// and `pyopcode.py handle_operation_error` perform before leaving a
     /// frame.  Threaded from the interpreter side for the same reason as
     /// [`Self::on_enter_level`]; called once per level that returns to its
     /// caller, with that level's `virtualizable_ptr`.
@@ -2875,7 +2875,7 @@ pub fn convert_and_run_from_pyjitpl(
     outcome
 }
 
-/// blackhole.py:1782 resume_in_blackhole
+/// blackhole.py resume_in_blackhole
 ///
 /// Resume execution in the blackhole interpreter after a compiled
 /// code guard failure. Builds a frame chain from resume data, extracts
@@ -3104,13 +3104,13 @@ mod tests {
     // `BlackholeInterpreter` dispatches to: `blackhole.py` `bhimpl_*` for the
     // ops that have one, `pyjitpl/dispatch.rs` `eval_*` for float
     // compares + float floordiv/mod, and `support.py` `_ll_2_int_{floordiv,mod}`
-    // for integer division (`jtransform.py:576 _do_builtin_call` residual).
+    // for integer division (`jtransform.py _do_builtin_call` residual).
 
     /// Dispatch a single binary opcode to its orthodox runtime helper and
     /// return the i64 result (float results are returned as `f64::to_bits`).
     fn exec_binop(opcode: OpCode, a: i64, b: i64) -> i64 {
         match opcode {
-            // intmask(a OP b) — blackhole.py:458-468. INT_*_OVF run the same
+            // intmask(a OP b) — blackhole.py. INT_*_OVF run the same
             // wrapping body in the blackhole; overflow detection is the
             // separate `int_*_jump_if_ovf` bytecode (blackhole.py:478-497).
             OpCode::IntAdd | OpCode::IntAddOvf => bhimpl_int_add(a, b),
@@ -3598,7 +3598,7 @@ mod tests {
         /// `move_i`, `jump`, `goto_if_not_int_is_true`,
         /// `load_const_r_value`, `ptr_nonzero`, `goto_if_not_ptr_nonzero`).
         /// Mirrors the RPython contract that every emitted bytecode key
-        /// is wired before `dispatch_loop` runs (`blackhole.py:66-100
+        /// is wired before `dispatch_loop` runs (`blackhole.py
         /// setup_insns` resolving every key via `_get_method`).
         ///
         /// All emit helpers (`record_binop_i`, `goto_if_not_*`,
@@ -3625,7 +3625,7 @@ mod tests {
                 insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
             );
             // Canonical `goto_if_not/iL` alias — `bhimpl_goto_if_not_int_is_true =
-            // bhimpl_goto_if_not` (`blackhole.py:913`) routes both bytes to
+            // bhimpl_goto_if_not` (`blackhole.py`) routes both bytes to
             // the same handler body.
             entries.insert("goto_if_not/iL".to_string(), insns::BC_GOTO_IF_NOT);
             entries.insert(
@@ -3637,7 +3637,7 @@ mod tests {
             builder
         }
 
-        /// `test_blackhole.py:115-143 test_convert_and_run_from_pyjitpl`.
+        /// `test_blackhole.py test_convert_and_run_from_pyjitpl`.
         ///
         /// The fixture puts an illegal instruction at pc 0 and gives the
         /// MIFrame `pc = 1`, so the chain must start at exactly `frame.pc`
@@ -3660,7 +3660,7 @@ mod tests {
             b.int_return(2);
             let jitcode = std::sync::Arc::new(b.finish());
 
-            // test_blackhole.py:124-125 `pc = 1`, `registers_i = [40, 2, None]`.
+            // test_blackhole.py `pc = 1`, `registers_i = [40, 2, None]`.
             let mut frame = MIFrame::new(jitcode, second);
             frame.int_values[0] = Some(40);
             frame.int_values[1] = Some(2);
@@ -3673,7 +3673,7 @@ mod tests {
             builder.setup_insns(&entries);
             wire_bhimpl_handlers(&mut builder);
 
-            // test_blackhole.py:141-143 `DoneWithThisFrameInt`, `result == 42`.
+            // test_blackhole.py `DoneWithThisFrameInt`, `result == 42`.
             let outcome =
                 convert_and_run_from_pyjitpl(&mut builder, &framestack, 0, false, None, None);
             assert_eq!(
@@ -3968,7 +3968,7 @@ mod tests {
         /// frame's handler runs.
         ///
         /// `route_to_catch` stores it in `exception_last_value` and jumps to
-        /// the handler (`blackhole.py:396-411`); the handler recovers it much
+        /// the handler (`blackhole.py`); the handler recovers it much
         /// later through `last_exc_value` / `last_exception`, and the latter
         /// dereferences it via `bh_classof`.  Every allocation the handler
         /// performs in between can trigger a minor collection, so the slot has
@@ -4052,7 +4052,7 @@ mod tests {
 
         /// `random.gauss` contains a float-to-int conversion. A guard failure
         /// can resume forward through that byte, so RPython
-        /// `blackhole.py:66 setup_insns` must bind the already-ported
+        /// `blackhole.py setup_insns` must bind the already-ported
         /// `bhimpl_cast_float_to_int` handler in the production builder.
         #[test]
         fn production_bh_builder_wires_cast_float_to_int() {
@@ -4256,7 +4256,7 @@ mod tests {
             }
         }
 
-        /// `pyopcode.py:184 handle_operation_error` stores
+        /// `pyopcode.py handle_operation_error` stores
         /// `frame_finished_execution = True` on the no-handler propagation out
         /// of a frame, and the walk to the recursive portal
         /// (`blackhole.py:1764`) discards exactly such frames.  The `Ok` arm's
@@ -4433,7 +4433,7 @@ mod tests {
         }
 
         /// `bhimpl_jit_merge_point`'s recursive-portal branch
-        /// (`blackhole.py:1079-1093`) and `get_portal_runner`
+        /// (`blackhole.py`) and `get_portal_runner`
         /// (`blackhole.py:1096`) both index `jitdrivers_sd[jdindex]`
         /// unchecked.  Upstream can, because the table hangs off
         /// `self.builder.metainterp_sd`: one table, reached by every frame of
@@ -5203,7 +5203,7 @@ mod tests {
         }
     }
 
-    // ── `support.py:255-271 _ll_2_int_floordiv` / `_ll_2_int_mod`
+    // ── `support.py _ll_2_int_floordiv` / `_ll_2_int_mod`
     //    C-truncating helper parity tests ─────────────────────────────
 
     #[test]
@@ -5305,12 +5305,12 @@ macro_rules! bhhandler_iii_i {
 }
 
 // Blackhole operations ported from `blackhole.py`
-/// blackhole.py:454-456 `bhimpl_int_same_as`.
+/// blackhole.py `bhimpl_int_same_as`.
 fn bhimpl_int_same_as(a: i64) -> i64 {
     a
 }
 
-/// blackhole.py:458-460 `bhimpl_int_add(a, b): return intmask(a + b)`.
+/// blackhole.py `bhimpl_int_add(a, b): return intmask(a + b)`.
 fn bhimpl_int_add(a: i64, b: i64) -> i64 {
     a.wrapping_add(b)
 }
@@ -5392,7 +5392,7 @@ pub extern "C" fn ll_int_py_mod(a: i64, b: i64) -> i64 {
     }
 }
 
-/// RPython `rint.py:434-436 ll_uint_py_div` (oopspec `int.udiv`).  The
+/// RPython `rint.py ll_uint_py_div` (oopspec `int.udiv`).  The
 /// `OS_INT_UDIV` residual call lands here at runtime.  Unsigned division
 /// has no sign correction to make — `llop.uint_floordiv` translates to
 /// the C macro `OP_UINT_FLOORDIV(x, y, r) r = (x) / (y)` — so the whole
@@ -5402,7 +5402,7 @@ pub extern "C" fn ll_int_py_mod(a: i64, b: i64) -> i64 {
 /// corner: every pair of `u64` operands with a nonzero divisor has a
 /// representable quotient.  The zero divisor remains a precondition
 /// (`wrapping_div(0)` panics in every Rust build), spelled in RPython as
-/// the `rint.py:438 ll_uint_py_div_zer` wrapper whose check is inlined
+/// the `rint.py ll_uint_py_div_zer` wrapper whose check is inlined
 /// into the caller and becomes a runtime guard in the trace.
 ///
 /// `extern "C"` for the same residual-call ABI reason as [`ll_int_py_div`].
@@ -5410,14 +5410,14 @@ pub extern "C" fn ll_uint_py_div(a: i64, b: i64) -> i64 {
     ((a as u64) / (b as u64)) as i64
 }
 
-/// RPython `rint.py:525-527 ll_uint_py_mod` (oopspec `int.umod`).  The
+/// RPython `rint.py ll_uint_py_mod` (oopspec `int.umod`).  The
 /// unsigned remainder needs no sign correction either; see
 /// [`ll_uint_py_div`] for the zero-divisor precondition.
 pub extern "C" fn ll_uint_py_mod(a: i64, b: i64) -> i64 {
     ((a as u64) % (b as u64)) as i64
 }
 
-/// RPython `support.py:255-264 _ll_2_int_floordiv`: C-truncating
+/// RPython `support.py _ll_2_int_floordiv`: C-truncating
 /// floor-division helper.  The upstream comment calls it "the reverse
 /// of `rpython.rtyper.rint.ll_int_py_div()`" — i.e. given an input
 /// pair `(x, y)` it returns the C-style truncated quotient
@@ -5434,21 +5434,21 @@ pub extern "C" fn ll_uint_py_mod(a: i64, b: i64) -> i64 {
 /// through [`ll_int_py_div`] which carries `@jit.oopspec("int.py_div")`
 /// upstream).  Pyre's `jtransform.rs` BinOp{floordiv, Int} arm
 /// rewrites to a `CallResidual` to this helper without an
-/// `OS_INT_PY_DIV` markup, matching `jtransform.py:576 rewrite_op_int_floordiv = _do_builtin_call` route (a).
+/// `OS_INT_PY_DIV` markup, matching `jtransform.py rewrite_op_int_floordiv = _do_builtin_call` route (a).
 ///
 /// `extern "C"`: residual-call ABI parity — see [`ll_int_py_div`].
 pub extern "C" fn _ll_2_int_floordiv(x: i64, y: i64) -> i64 {
     x.wrapping_div(y)
 }
 
-/// RPython `support.py:266-271 _ll_2_int_mod`: C-truncating remainder
+/// RPython `support.py _ll_2_int_mod`: C-truncating remainder
 /// helper.  See [`_ll_2_int_floordiv`] for the no-branch-reverse
 /// rationale.  In Rust, `i64.wrapping_rem` is natively C-truncating.
 pub extern "C" fn _ll_2_int_mod(x: i64, y: i64) -> i64 {
     x.wrapping_rem(y)
 }
 
-/// RPython `support.py:274 _ll_1_cast_uint_to_float(x)` —
+/// RPython `support.py _ll_1_cast_uint_to_float(x)` —
 /// `r_uint(x)`-domain `float(x)` (matching `op_cast_uint_to_float`
 /// at `opimpl.py:393-395`).  `_do_builtin_call` re-routes
 /// `cast_uint_to_float` through this helper so blackhole sees a
@@ -5461,7 +5461,7 @@ pub fn cast_uint_to_float(x: i64) -> f64 {
 
 /// RPython `support.py:274 _ll_1_cast_float_to_uint(f)` —
 /// `r_uint(long(f))` mod 2^64 wrap (matching
-/// `op_cast_float_to_uint` at `opimpl.py:432-434`).  Plain
+/// `op_cast_float_to_uint` at `opimpl.py`).  Plain
 /// `f as u64` saturates outside `[0, 2^64)` rather than wrapping;
 /// reuse the IEEE-754 mantissa+exponent decomposition that
 /// `opimpl.rs::float_trunc_mod_2_pow_64` already implements so
@@ -5507,12 +5507,12 @@ pub fn cast_float_to_uint(f: f64) -> i64 {
 }
 
 // RPython `rstr.LLHelpers.ll_streq_nonnull(s1, s2)`
-// (`rpython/jit/codewriter/support.py:526-538 _ll_2_str_eq_nonnull`)
+// (`rpython/jit/codewriter/support.py _ll_2_str_eq_nonnull`)
 // is the helper canonically registered by `jtransform.py:620-624 /
 // :637-641 _register_extra_helper(OS_STREQ_NONNULL / OS_UNIEQ_NONNULL,
 // "str.eq_nonnull", ...)`.  Its body indexes `s1.chars[i]` against
 // `s2.chars[i]` on the `{hash, chars: Array(Char)}` GC struct at
-// `rpython/rtyper/lltypesystem/rstr.py:1226-1237 STR.become(...)`.
+// `rpython/rtyper/lltypesystem/rstr.py STR.become(...)`.
 //
 // Pyre has no equivalent `rstr.STR`-shaped GC layout yet (byte
 // buffers lower to fat-slice `(ptr, len)` or to `W_BytesObject`),
@@ -5523,7 +5523,7 @@ pub fn cast_float_to_uint(f: f64) -> i64 {
 //
 // Convergence path: once pyre-object grows a GC struct mirroring
 // `rstr.STR`'s `{hash, chars[]}` layout, port the function body
-// line-by-line from `support.py:526-538` and add the registration
+// line-by-line from `support.py` and add the registration
 // here together with the `jit_fnaddr.rs::jit_trace_fnaddrs` entry
 // publishing the host address.  Until then, pyre's type state has no
 // `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)` channel: the elidable-promote
@@ -5533,140 +5533,140 @@ pub fn cast_float_to_uint(f: f64) -> i64 {
 // `codewriter/jtransform.rs`, mirroring upstream's
 // `jit.py:619/636` concretetype assertions.
 
-/// blackhole.py:499-501 `bhimpl_int_and(a, b): return a & b`.
+/// blackhole.py `bhimpl_int_and(a, b): return a & b`.
 fn bhimpl_int_and(a: i64, b: i64) -> i64 {
     a & b
 }
 
-/// blackhole.py:503-505 `bhimpl_int_or(a, b): return a | b`.
+/// blackhole.py `bhimpl_int_or(a, b): return a | b`.
 fn bhimpl_int_or(a: i64, b: i64) -> i64 {
     a | b
 }
 
-/// blackhole.py:507-509 `bhimpl_int_xor(a, b): return a ^ b`.
+/// blackhole.py `bhimpl_int_xor(a, b): return a ^ b`.
 fn bhimpl_int_xor(a: i64, b: i64) -> i64 {
     a ^ b
 }
 
-/// blackhole.py:511-513 `bhimpl_int_rshift(a, b): return a >> b`.
+/// blackhole.py `bhimpl_int_rshift(a, b): return a >> b`.
 fn bhimpl_int_rshift(a: i64, b: i64) -> i64 {
     a >> (b & 63)
 }
 
-/// blackhole.py:516-518 `bhimpl_int_lshift(a, b): return intmask(a << b)`.
+/// blackhole.py `bhimpl_int_lshift(a, b): return intmask(a << b)`.
 fn bhimpl_int_lshift(a: i64, b: i64) -> i64 {
     a.wrapping_shl((b & 63) as u32)
 }
 
-/// blackhole.py:521-524 `bhimpl_uint_rshift(a, b): return intmask(r_uint(a) >> r_uint(b))`.
+/// blackhole.py `bhimpl_uint_rshift(a, b): return intmask(r_uint(a) >> r_uint(b))`.
 fn bhimpl_uint_rshift(a: i64, b: i64) -> i64 {
     ((a as u64) >> ((b as u64) & 63)) as i64
 }
 
-/// blackhole.py:527-529 `bhimpl_int_neg(a): return intmask(-a)`.
+/// blackhole.py `bhimpl_int_neg(a): return intmask(-a)`.
 fn bhimpl_int_neg(a: i64) -> i64 {
     a.wrapping_neg()
 }
 
-/// blackhole.py:531-533 `bhimpl_int_invert(a): return ~a`.
+/// blackhole.py `bhimpl_int_invert(a): return ~a`.
 fn bhimpl_int_invert(a: i64) -> i64 {
     !a
 }
 
-/// blackhole.py:535 `bhimpl_int_lt(a, b): return int(a < b)`.
+/// blackhole.py `bhimpl_int_lt(a, b): return int(a < b)`.
 fn bhimpl_int_lt(a: i64, b: i64) -> i64 {
     (a < b) as i64
 }
 
-/// blackhole.py:539 `bhimpl_int_le(a, b): return int(a <= b)`.
+/// blackhole.py `bhimpl_int_le(a, b): return int(a <= b)`.
 fn bhimpl_int_le(a: i64, b: i64) -> i64 {
     (a <= b) as i64
 }
 
-/// blackhole.py:543 `bhimpl_int_eq(a, b): return int(a == b)`.
+/// blackhole.py `bhimpl_int_eq(a, b): return int(a == b)`.
 fn bhimpl_int_eq(a: i64, b: i64) -> i64 {
     (a == b) as i64
 }
 
-/// blackhole.py:547 `bhimpl_int_ne(a, b): return int(a != b)`.
+/// blackhole.py `bhimpl_int_ne(a, b): return int(a != b)`.
 fn bhimpl_int_ne(a: i64, b: i64) -> i64 {
     (a != b) as i64
 }
 
-/// blackhole.py:548 `bhimpl_int_gt(a, b): return int(a > b)`.
+/// blackhole.py `bhimpl_int_gt(a, b): return int(a > b)`.
 fn bhimpl_int_gt(a: i64, b: i64) -> i64 {
     (a > b) as i64
 }
 
-/// blackhole.py:551 `bhimpl_int_ge(a, b): return int(a >= b)`.
+/// blackhole.py `bhimpl_int_ge(a, b): return int(a >= b)`.
 fn bhimpl_int_ge(a: i64, b: i64) -> i64 {
     (a >= b) as i64
 }
 
-/// blackhole.py:557 `bhimpl_int_is_true(a): return int(bool(a))`.
+/// blackhole.py `bhimpl_int_is_true(a): return int(bool(a))`.
 fn bhimpl_int_is_true(a: i64) -> i64 {
     (a != 0) as i64
 }
 
-/// blackhole.py:554 `bhimpl_int_is_zero(a): return int(not a)`.
+/// blackhole.py `bhimpl_int_is_zero(a): return int(not a)`.
 fn bhimpl_int_is_zero(a: i64) -> i64 {
     (a == 0) as i64
 }
 
-/// blackhole.py:563 `bhimpl_int_force_ge_zero(a): if a < 0: return 0; return a`.
+/// blackhole.py `bhimpl_int_force_ge_zero(a): if a < 0: return 0; return a`.
 fn bhimpl_int_force_ge_zero(a: i64) -> i64 {
     if a < 0 { 0 } else { a }
 }
 
-/// blackhole.py:560 `bhimpl_int_between(a, b, c): return a <= b < c`.
+/// blackhole.py `bhimpl_int_between(a, b, c): return a <= b < c`.
 fn bhimpl_int_between(a: i64, b: i64, c: i64) -> i64 {
     (a <= b && b < c) as i64
 }
 
-/// blackhole.py:568 `bhimpl_int_signext(a, b): return int_signext(a, b)`.
+/// blackhole.py `bhimpl_int_signext(a, b): return int_signext(a, b)`.
 fn bhimpl_int_signext(a: i64, numbytes: i64) -> i64 {
     crate::support::int_signext(a, numbytes)
 }
 
-/// blackhole.py:1044 `bhimpl_int_isconstant(x): return False`.
+/// blackhole.py `bhimpl_int_isconstant(x): return False`.
 fn bhimpl_int_isconstant(_a: i64) -> i64 {
     0
 }
 
-/// blackhole.py:1048 `bhimpl_float_isconstant(x): return False`.
+/// blackhole.py `bhimpl_float_isconstant(x): return False`.
 fn bhimpl_float_isconstant(_a: f64) -> i64 {
     0
 }
 
-/// blackhole.py:828-830 `bhimpl_convert_float_bytes_to_longlong(a): return
+/// blackhole.py `bhimpl_convert_float_bytes_to_longlong(a): return
 /// float2longlong(a)`.
 fn bhimpl_convert_float_bytes_to_longlong(a: f64) -> i64 {
     a.to_bits() as i64
 }
 
-/// blackhole.py:833-835 `bhimpl_convert_longlong_bytes_to_float(a): return
+/// blackhole.py `bhimpl_convert_longlong_bytes_to_float(a): return
 /// longlong2float(a)`.
 fn bhimpl_convert_longlong_bytes_to_float(a: i64) -> f64 {
     f64::from_bits(a as u64)
 }
 
-/// blackhole.py:801-810 `bhimpl_cast_float_to_int(a): return int(int(a))`.
+/// blackhole.py `bhimpl_cast_float_to_int(a): return int(int(a))`.
 fn bhimpl_cast_float_to_int(a: f64) -> i64 {
     a as i64
 }
 
-/// blackhole.py:811-813 `bhimpl_cast_int_to_float(a): return float(a)`.
+/// blackhole.py `bhimpl_cast_int_to_float(a): return float(a)`.
 fn bhimpl_cast_int_to_float(a: i64) -> f64 {
     a as f64
 }
 
-/// blackhole.py:815-820 `bhimpl_cast_float_to_singlefloat(a): return
+/// blackhole.py `bhimpl_cast_float_to_singlefloat(a): return
 /// singlefloat2int(r_singlefloat(a))`.
 fn bhimpl_cast_float_to_singlefloat(a: f64) -> i64 {
     (a as f32).to_bits() as i64
 }
 
-/// blackhole.py:822-826 `bhimpl_cast_singlefloat_to_float(a): return
+/// blackhole.py `bhimpl_cast_singlefloat_to_float(a): return
 /// getfloatstorage(float(int2singlefloat(a)))`.
 fn bhimpl_cast_singlefloat_to_float(a: i64) -> f64 {
     f32::from_bits(a as u32) as f64
@@ -5735,7 +5735,7 @@ fn handler_abort_result_marker_i(
 /// blackhole int register file holds, in flat order,
 /// `[scalars 0..num_scalars | flattened fixed-array elements |
 /// the virtualizable identity]`, seeded by the resume reader via `setarg_i`
-/// (`resume.rs _prepare_next_section` → `blackhole.py:339 setarg_i`).
+/// (`resume.rs _prepare_next_section` → `blackhole.py setarg_i`).
 ///
 /// majit's `state_field` opcodes carry a section-relative logical index
 /// (scalar `field_idx`, array/varray `array_idx`) rather than a flat register
@@ -5925,7 +5925,7 @@ impl StateFieldLayout {
 // `#[jit_interp]` `jitcode_lower` macro emits these to read/write the
 // Rust-port `state_fields`, which ARE the jitdriver reds.  PyPy reds are the
 // blackhole frame's int registers (`blackhole.py:300-302`), seeded by the
-// resume reader via `setarg_i` (`blackhole.py:339`) and read/written by the
+// resume reader via `setarg_i` (`blackhole.py`) and read/written by the
 // register-addressed dispatch opcodes (`blackhole.py:193/223`).  These
 // handlers move between the canonical red register slots: `field_idx` /
 // `array_idx` are section-relative logical indices that
@@ -6067,7 +6067,7 @@ fn handler_jit_merge_point_i(
 }
 
 /// Handler for `jit_merge_point/cIRFIRF` — `BC_JIT_MERGE_POINT_C`
-/// (assembler.py:312 `USE_C_FORM`: jdindex inlined as a signed byte).
+/// (assembler.py `USE_C_FORM`: jdindex inlined as a signed byte).
 fn handler_jit_merge_point_c(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
@@ -6102,7 +6102,7 @@ fn handler_abort_result_marker_r(
 }
 bhhandler_ii_i!(handler_int_mul, bhimpl_int_mul);
 // `int_floordiv` / `int_mod` are NOT registered as bytecode handlers:
-// `jtransform.py:576-577` rewrites both via `_do_builtin_call` to
+// `jtransform.py` rewrites both via `_do_builtin_call` to
 // `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)` before
 // jitcode emission, so RPython's `blackhole.py` has no
 // `bhimpl_int_floordiv` / `bhimpl_int_mod`.  pyre keeps the helper
@@ -6123,7 +6123,7 @@ bhhandler_ii_i!(handler_int_ne, bhimpl_int_ne);
 bhhandler_ii_i!(handler_int_gt, bhimpl_int_gt);
 bhhandler_ii_i!(handler_int_ge, bhimpl_int_ge);
 
-// blackhole.py:638-640 `bhimpl_int_copy(a): return a` — @arguments("i", returns="i").
+// blackhole.py `bhimpl_int_copy(a): return a` — @arguments("i", returns="i").
 // Decoded as `i>i` (same as int_same_as). Already have handler_int_same_as.
 // Wire as alias.
 // Control flow and copy handlers
@@ -6145,44 +6145,44 @@ fn handler_int_copy_c(
     Ok(position + 2)
 }
 
-/// blackhole.py:643 `bhimpl_ref_copy(a): return a` — @arguments("r", returns="r").
+/// blackhole.py `bhimpl_ref_copy(a): return a` — @arguments("r", returns="r").
 fn bhimpl_ref_copy(a: i64) -> i64 {
     a
 }
 
-/// blackhole.py:646 `bhimpl_float_copy(a): return a` — @arguments("f", returns="f").
+/// blackhole.py `bhimpl_float_copy(a): return a` — @arguments("f", returns="f").
 fn bhimpl_float_copy(a: f64) -> f64 {
     a
 }
 
-/// blackhole.py:1052 `bhimpl_ref_isconstant(x): return False`.
+/// blackhole.py `bhimpl_ref_isconstant(x): return False`.
 fn bhimpl_ref_isconstant(_a: i64) -> i64 {
     0
 }
 
-/// blackhole.py:1056 `bhimpl_ref_isvirtual(x): return False`.
+/// blackhole.py `bhimpl_ref_isvirtual(x): return False`.
 fn bhimpl_ref_isvirtual(_a: i64) -> i64 {
     0
 }
 
-/// blackhole.py:613-614 `bhimpl_assert_not_none(a): assert a`.
+/// blackhole.py `bhimpl_assert_not_none(a): assert a`.
 fn bhimpl_assert_not_none(a: i64) {
     assert!(a != 0, "bhimpl_assert_not_none: ref register is null");
 }
 
-/// blackhole.py:616-618 `bhimpl_record_exact_class(a, b): pass`.
+/// blackhole.py `bhimpl_record_exact_class(a, b): pass`.
 fn bhimpl_record_exact_class(_a: i64, _b: i64) {}
 
-/// blackhole.py:631-632 `bhimpl_record_exact_value_r(a, b): pass`.
+/// blackhole.py `bhimpl_record_exact_value_r(a, b): pass`.
 fn bhimpl_record_exact_value_r(_a: i64, _b: i64) {}
 
-/// blackhole.py:635-636 `bhimpl_record_exact_value_i(a, b): pass`.
+/// blackhole.py `bhimpl_record_exact_value_i(a, b): pass`.
 fn bhimpl_record_exact_value_i(_a: i64, _b: i64) {}
 
-/// blackhole.py:1062-1064 `bhimpl_loop_header(jdindex): pass`.
+/// blackhole.py `bhimpl_loop_header(jdindex): pass`.
 fn bhimpl_loop_header(_jdindex: i64) {}
 
-/// blackhole.py:1029-1030 `bhimpl_int_assert_green(x): pass`.
+/// blackhole.py `bhimpl_int_assert_green(x): pass`.
 fn bhimpl_int_assert_green(_a: i64) {}
 
 /// `bhimpl_ref_assert_green(x): pass`.
@@ -6191,67 +6191,67 @@ fn bhimpl_ref_assert_green(_a: i64) {}
 /// `bhimpl_float_assert_green(x): pass`.
 fn bhimpl_float_assert_green(_a: f64) {}
 
-/// blackhole.py:648-650 `bhimpl_int_guard_value(a): pass`.
+/// blackhole.py `bhimpl_int_guard_value(a): pass`.
 fn bhimpl_int_guard_value(_a: i64) {}
 
-/// blackhole.py:651-653 `bhimpl_ref_guard_value(a): pass`.
+/// blackhole.py `bhimpl_ref_guard_value(a): pass`.
 fn bhimpl_ref_guard_value(_a: i64) {}
 
-/// blackhole.py:654-656 `bhimpl_float_guard_value(a): pass`.
+/// blackhole.py `bhimpl_float_guard_value(a): pass`.
 fn bhimpl_float_guard_value(_a: f64) {}
 
-/// blackhole.py:1138-1139 `bhimpl_virtual_ref(a): return a`.
+/// blackhole.py `bhimpl_virtual_ref(a): return a`.
 fn bhimpl_virtual_ref(a: i64) -> i64 {
     a
 }
 
-/// blackhole.py:1142-1143 `bhimpl_virtual_ref_finish(a): pass`.
+/// blackhole.py `bhimpl_virtual_ref_finish(a): pass`.
 fn bhimpl_virtual_ref_finish(_a: i64) {}
 
-/// blackhole.py:963-964 `bhimpl_unreachable(): raise AssertionError("unreachable")`.
+/// blackhole.py `bhimpl_unreachable(): raise AssertionError("unreachable")`.
 fn bhimpl_unreachable() -> ! {
     panic!("bhimpl_unreachable reached")
 }
 
-/// blackhole.py:661-663 `bhimpl_int_push(self, a): self.tmpreg_i = a`.
+/// blackhole.py `bhimpl_int_push(self, a): self.tmpreg_i = a`.
 fn bhimpl_int_push(bh: &mut BlackholeInterpreter, a: i64) {
     bh.tmpreg_i = a;
 }
 
-/// blackhole.py:664-666 `bhimpl_ref_push(self, a): self.tmpreg_r = a`.
+/// blackhole.py `bhimpl_ref_push(self, a): self.tmpreg_r = a`.
 fn bhimpl_ref_push(bh: &mut BlackholeInterpreter, a: i64) {
     bh.tmpreg_r = a;
 }
 
-/// blackhole.py:667-669 `bhimpl_float_push(self, a): self.tmpreg_f = a`.
+/// blackhole.py `bhimpl_float_push(self, a): self.tmpreg_f = a`.
 /// `tmpreg_f` stores floatstorage bits; convert real f64 → bits.
 fn bhimpl_float_push(bh: &mut BlackholeInterpreter, a: f64) {
     bh.tmpreg_f = a.to_bits() as i64;
 }
 
-/// blackhole.py:671-673 `bhimpl_int_pop(self): return self.get_tmpreg_i()`.
+/// blackhole.py `bhimpl_int_pop(self): return self.get_tmpreg_i()`.
 fn bhimpl_int_pop(bh: &mut BlackholeInterpreter) -> i64 {
     bh.tmpreg_i
 }
 
-/// blackhole.py:674-676 `bhimpl_ref_pop(self): return self.get_tmpreg_r()`.
+/// blackhole.py `bhimpl_ref_pop(self): return self.get_tmpreg_r()`.
 fn bhimpl_ref_pop(bh: &mut BlackholeInterpreter) -> i64 {
     bh.get_tmpreg_r()
 }
 
-/// blackhole.py:677-679 `bhimpl_float_pop(self): return self.get_tmpreg_f()`.
+/// blackhole.py `bhimpl_float_pop(self): return self.get_tmpreg_f()`.
 /// `tmpreg_f` stores floatstorage bits; convert bits → real f64.
 fn bhimpl_float_pop(bh: &mut BlackholeInterpreter) -> f64 {
     f64::from_bits(bh.tmpreg_f as u64)
 }
 
-/// blackhole.py:1021-1023 `bhimpl_jit_enter_portal_frame(x): pass`.
+/// blackhole.py `bhimpl_jit_enter_portal_frame(x): pass`.
 fn bhimpl_jit_enter_portal_frame(_x: i64) {}
 
-/// blackhole.py:1025-1027 `bhimpl_jit_leave_portal_frame(): pass`.
+/// blackhole.py `bhimpl_jit_leave_portal_frame(): pass`.
 fn bhimpl_jit_leave_portal_frame() {}
 
-/// blackhole.py:1547-1548 `bhimpl_hint_force_virtualizable(r): pass`.
+/// blackhole.py `bhimpl_hint_force_virtualizable(r): pass`.
 fn bhimpl_hint_force_virtualizable(_r: i64) {}
 
 /// Called at every `-live-` marker, i.e. once per source-level instruction the
@@ -6267,7 +6267,7 @@ fn bhimpl_hint_force_virtualizable(_r: i64) {}
 /// `check_result`'s 256-entry per-kind cap rejects one pool entry per
 /// instruction — registers this hook and writes the field itself.
 /// The hook also owns the register file, because the marker names the live
-/// set: `cleanup_registers` (`blackhole.py:385`) clears `registers_r` "to
+/// set: `cleanup_registers` (`blackhole.py`) clears `registers_r` "to
 /// avoid keeping references alive", but it only runs at `release_interp`
 /// (`blackhole.py:253`), so a register whose live range ended keeps its
 /// object for the rest of the run. RPython is insulated by liverange-based
@@ -6286,7 +6286,7 @@ pub fn register_live_marker_hook(hook: LiveMarkerHook) {
 
 /// Handler for `live/` — liveness marker. Argcodes: empty, but the assembler
 /// emits a 2-byte offset after the opcode. Skip those 2 bytes.
-/// RPython blackhole.py:146-158 (inside _get_method for `-live-` ops).
+/// RPython blackhole.py (inside _get_method for `-live-` ops).
 fn handler_live(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
@@ -6301,7 +6301,7 @@ fn handler_live(
 }
 
 /// Handler for `goto/L` — unconditional jump. Argcodes: `L` (2-byte label).
-/// RPython blackhole.py:950-952: `def bhimpl_goto(target): return target`.
+/// RPython blackhole.py: `def bhimpl_goto(target): return target`.
 fn handler_goto(
     _bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -6325,7 +6325,7 @@ fn handler_int_return(
     let a = bh.registers_i[code[position] as usize];
     bh.tmpreg_i = a;
     bh.return_type = BhReturnType::Int;
-    // RPython blackhole.py:169 `_get_method` stores the decoded position
+    // RPython blackhole.py `_get_method` stores the decoded position
     // back into `self.position` before invoking the bhimpl_*; this is
     // visible after a LeaveFrame since the frame teardown reads the
     // post-operand position.
@@ -6333,7 +6333,7 @@ fn handler_int_return(
     Err(DispatchError::LeaveFrame)
 }
 
-/// Handler for `int_return/c` — USE_C_FORM short source (`assembler.py:312`):
+/// Handler for `int_return/c` — USE_C_FORM short source (`assembler.py`):
 /// `int_return` reads its value from one inline signed byte (`signedord`,
 /// `blackhole.py:123`) rather than a `registers_i` slot.  Identical frame
 /// teardown to `handler_int_return`.
@@ -6711,7 +6711,7 @@ fn bhimpl_uint_ge(a: i64, b: i64) -> i64 {
     ((a as u64) >= (b as u64)) as i64
 }
 
-/// `blackhole.py:471 bhimpl_uint_mul_high` — high 64 bits of unsigned
+/// `blackhole.py bhimpl_uint_mul_high` — high 64 bits of unsigned
 /// 128-bit product.  Extracted from the inline body of
 /// `handler_uint_mul_high` so the bhhandler macro can target a named
 /// bhimpl uniformly with the rest of the binop family.
@@ -6829,37 +6829,37 @@ macro_rules! bhhandler_goto_if_not_rr {
     };
 }
 
-/// blackhole.py:915-920 `bhimpl_goto_if_not_int_is_zero(a, target, pc)`.
+/// blackhole.py `bhimpl_goto_if_not_int_is_zero(a, target, pc)`.
 fn bhimpl_goto_if_not_int_is_zero(a: i64, target: usize, pc: usize) -> usize {
     if a == 0 { pc } else { target }
 }
 
-/// blackhole.py:936-941 `bhimpl_goto_if_not_ptr_iszero(a, target, pc)`.
+/// blackhole.py `bhimpl_goto_if_not_ptr_iszero(a, target, pc)`.
 fn bhimpl_goto_if_not_ptr_iszero(a: i64, target: usize, pc: usize) -> usize {
     if a == 0 { pc } else { target }
 }
 
-/// blackhole.py:943-948 `bhimpl_goto_if_not_ptr_nonzero(a, target, pc)`.
+/// blackhole.py `bhimpl_goto_if_not_ptr_nonzero(a, target, pc)`.
 fn bhimpl_goto_if_not_ptr_nonzero(a: i64, target: usize, pc: usize) -> usize {
     if a != 0 { pc } else { target }
 }
 
-/// blackhole.py:922-927 `bhimpl_goto_if_not_ptr_eq(a, b, target, pc)`.
+/// blackhole.py `bhimpl_goto_if_not_ptr_eq(a, b, target, pc)`.
 fn bhimpl_goto_if_not_ptr_eq(a: i64, b: i64, target: usize, pc: usize) -> usize {
     if a == b { pc } else { target }
 }
 
-/// blackhole.py:929-934 `bhimpl_goto_if_not_ptr_ne(a, b, target, pc)`.
+/// blackhole.py `bhimpl_goto_if_not_ptr_ne(a, b, target, pc)`.
 fn bhimpl_goto_if_not_ptr_ne(a: i64, b: i64, target: usize, pc: usize) -> usize {
     if a != b { pc } else { target }
 }
 
-/// blackhole.py:864-869 `bhimpl_goto_if_not(a, target, pc)`.
+/// blackhole.py `bhimpl_goto_if_not(a, target, pc)`.
 fn bhimpl_goto_if_not(a: i64, target: usize, pc: usize) -> usize {
     if a != 0 { pc } else { target }
 }
 
-/// blackhole.py:950-952 `bhimpl_goto(target): return target`.
+/// blackhole.py `bhimpl_goto(target): return target`.
 fn bhimpl_goto(target: usize) -> usize {
     target
 }
@@ -6973,7 +6973,7 @@ bhhandler_i_f!(handler_cast_int_to_float, bhimpl_cast_int_to_float);
 bhhandler_ii_i!(handler_int_signext, bhimpl_int_signext);
 
 // Overflow operations (`blackhole.py:478-497`)
-/// blackhole.py:478-483 `bhimpl_int_add_jump_if_ovf(label, a, b)`.
+/// blackhole.py `bhimpl_int_add_jump_if_ovf(label, a, b)`.
 /// On overflow: returns `(None, target)` so the handler jumps to label.
 /// On success: returns `(Some(sum), pc)` so the handler stores sum at the
 /// result register and falls through to pc.
@@ -6984,7 +6984,7 @@ fn bhimpl_int_add_jump_if_ovf(a: i64, b: i64, target: usize, pc: usize) -> (Opti
     }
 }
 
-/// blackhole.py:485-490 `bhimpl_int_sub_jump_if_ovf(label, a, b)`.
+/// blackhole.py `bhimpl_int_sub_jump_if_ovf(label, a, b)`.
 fn bhimpl_int_sub_jump_if_ovf(a: i64, b: i64, target: usize, pc: usize) -> (Option<i64>, usize) {
     match a.checked_sub(b) {
         Some(r) => (Some(r), pc),
@@ -6992,7 +6992,7 @@ fn bhimpl_int_sub_jump_if_ovf(a: i64, b: i64, target: usize, pc: usize) -> (Opti
     }
 }
 
-/// blackhole.py:492-497 `bhimpl_int_mul_jump_if_ovf(label, a, b)`.
+/// blackhole.py `bhimpl_int_mul_jump_if_ovf(label, a, b)`.
 fn bhimpl_int_mul_jump_if_ovf(a: i64, b: i64, target: usize, pc: usize) -> (Option<i64>, usize) {
     match a.checked_mul(b) {
         Some(r) => (Some(r), pc),
@@ -7128,7 +7128,7 @@ fn read_descr<'a>(bh: &'a BlackholeInterpreter, code: &[u8], pos: usize) -> (&'a
 /// `bh_getfield_gc_*`
 /// overrides on this BhDescr therefore read i64 / GcRef / f64 at the
 /// resolved offset without consulting size/sign — equivalent to the
-/// llmodel.py:705 `read_int_at_mem(struct, ofs, 8, False)` call.
+/// llmodel.py `read_int_at_mem(struct, ofs, 8, False)` call.
 /// Non-word-sized vable fields would require porting RPython's
 /// `unpack_fielddescr_size` ((ofs, size, sign) tuple) into BhDescr +
 /// updating both backends to honor `size`/`sign`.
@@ -7323,7 +7323,7 @@ fn handler_setfield_gc_i(
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
-// `setfield_gc_i/rcd` — USE_C_FORM short value (`assembler.py:99-107,312`):
+// `setfield_gc_i/rcd` — USE_C_FORM short value (`assembler.py`):
 // the stored int is one inline signed byte read via `signedord`
 // (`blackhole.py:123`) in place of a `registers_i` slot; the struct ref
 // and descr are unchanged from the `rid` form.
@@ -7473,7 +7473,7 @@ fn handler_setarrayitem_gc_r(
 }
 
 // `setarrayitem_gc_r/rcrd` — `c`-argcode index (`assembler.py:99-107
-// emit_const(allow_short=True)`, USE_C_FORM `assembler.py:312`): the
+// emit_const(allow_short=True)`, USE_C_FORM `assembler.py`): the
 // index is one inline signed byte (`blackhole.py:127-129` decodes
 // `'c'` as a signed char), not a `registers_i`/pool slot.
 fn handler_setarrayitem_gc_r_c(
@@ -7491,7 +7491,7 @@ fn handler_setarrayitem_gc_r_c(
 }
 
 // `setarrayitem_gc_i/ricd` — `c`-argcode VALUE (`assembler.py:99-107
-// emit_const(allow_short=True)`, USE_C_FORM `assembler.py:339`): the
+// emit_const(allow_short=True)`, USE_C_FORM `assembler.py`): the
 // stored int is one inline signed byte (`blackhole.py:123` decodes `'c'`
 // as a signed char), not a `registers_i`/pool slot; the array ref, index
 // reg and descr keep the `riid` byte positions.  Mirror of
@@ -7792,7 +7792,7 @@ fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>,
     (values, pos + 1 + count)
 }
 
-/// blackhole.py:351-360 `BlackholeInterpreter.run` exception path: after a
+/// blackhole.py `BlackholeInterpreter.run` exception path: after a
 /// residual call, route a non-zero `BH_LAST_EXC_VALUE` either into the next
 /// `catch_exception` handler in the current frame (returning `Ok(target)`),
 /// or out of the frame as `LeaveFrame` so the outer `run()` propagates.
@@ -7927,7 +7927,7 @@ fn handler_residual_call_irf_i(
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1244-1246 → bhimpl_residual_call_irf_i.
+    // blackhole.py → bhimpl_residual_call_irf_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_i(func, &ai, &ar, &af, &calldescr);
     if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
@@ -7952,7 +7952,7 @@ fn handler_residual_call_irf_r(
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1247-1249 → bhimpl_residual_call_irf_r.
+    // blackhole.py → bhimpl_residual_call_irf_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_r(func, &ai, &ar, &af, &calldescr);
     if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
@@ -7977,7 +7977,7 @@ fn handler_residual_call_irf_f(
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1250-1252 → bhimpl_residual_call_irf_f.
+    // blackhole.py → bhimpl_residual_call_irf_f.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_irf_f(func, &ai, &ar, &af, &calldescr);
     if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
@@ -8001,7 +8001,7 @@ fn handler_residual_call_irf_v(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1253-1255 routes through bhimpl_residual_call_irf_v
+    // blackhole.py routes through bhimpl_residual_call_irf_v
     // which forwards to cpu.bh_call_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_irf_v(func, &ai, &ar, &af, &calldescr);
@@ -8026,7 +8026,7 @@ fn handler_residual_call_ir_i(
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1234-1236 → bhimpl_residual_call_ir_i.
+    // blackhole.py → bhimpl_residual_call_ir_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_i(func, &ai, &ar, &calldescr);
     if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
@@ -8050,7 +8050,7 @@ fn handler_residual_call_ir_r(
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1237-1239 → bhimpl_residual_call_ir_r.
+    // blackhole.py → bhimpl_residual_call_ir_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_ir_r(func, &ai, &ar, &calldescr);
     if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
@@ -8073,7 +8073,7 @@ fn handler_residual_call_ir_v(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1240-1242 → bhimpl_residual_call_ir_v.
+    // blackhole.py → bhimpl_residual_call_ir_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_ir_v(func, &ai, &ar, &calldescr);
     if let Some(handler_pc) = check_residual_call_exception_after(bh, p)? {
@@ -8096,7 +8096,7 @@ fn handler_residual_call_r_i(
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1225-1226 → bhimpl_residual_call_r_i.
+    // blackhole.py → bhimpl_residual_call_r_i.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_i(func, &ar, &calldescr);
     if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
@@ -8119,7 +8119,7 @@ fn handler_residual_call_r_r(
     let calldescr = calldescr.as_calldescr().clone();
     let dst = code[p] as usize;
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1227-1229 → bhimpl_residual_call_r_r.
+    // blackhole.py → bhimpl_residual_call_r_r.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = bh.bhimpl_residual_call_r_r(func, &ar, &calldescr);
     if let Some(handler_pc) = check_residual_call_exception_after(bh, p + 1)? {
@@ -8141,7 +8141,7 @@ fn handler_residual_call_r_v(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     bh_null_arg_report(bh, &ar, position);
-    // blackhole.py:1230-1232 → bhimpl_residual_call_r_v.
+    // blackhole.py → bhimpl_residual_call_r_v.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_residual_call_r_v(func, &ar, &calldescr);
     if let Some(handler_pc) = check_residual_call_exception_after(bh, p)? {
@@ -8340,7 +8340,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "int_copy/i>i".to_string(),
         majit_translate::insns::BC_MOVE_I,
     );
-    // `int_copy/c>i` — USE_C_FORM short source (`assembler.py:312`): a small
+    // `int_copy/c>i` — USE_C_FORM short source (`assembler.py`): a small
     // ConstInt materialised inline as one signed byte instead of a pool slot.
     // pyre emits this for every small int/bool constant, so the production
     // blackhole must dispatch it; `handler_int_copy_c` decodes via `signedord`.
@@ -8365,9 +8365,9 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "goto_if_not_int_is_true/iL".to_string(),
         majit_translate::insns::BC_GOTO_IF_NOT_INT_IS_TRUE,
     );
-    // `blackhole.py:913 bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`
+    // `blackhole.py bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`
     // — both `(opname, argcodes)` keys route to the same handler body.
-    // `Assembler.insns.setdefault` (`assembler.py:221`) allocates the
+    // `Assembler.insns.setdefault` (`assembler.py`) allocates the
     // canonical key `goto_if_not/iL` its own byte (`BC_GOTO_IF_NOT`)
     // distinct from the alias byte (`BC_GOTO_IF_NOT_INT_IS_TRUE`).
     insns.insert(
@@ -8385,7 +8385,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "int_return/i".to_string(),
         majit_translate::insns::BC_INT_RETURN,
     );
-    // `int_return/c` — USE_C_FORM short source (`assembler.py:312`): a small
+    // `int_return/c` — USE_C_FORM short source (`assembler.py`): a small
     // const-int return value emitted inline as one signed byte.
     insns.insert(
         "int_return/c".to_string(),
@@ -8440,7 +8440,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         ("int_neg/i>i", majit_translate::insns::BC_INT_NEG),
         ("int_invert/i>i", majit_translate::insns::BC_INT_INVERT),
         // `int_is_true/i>i` — `@arguments("i", returns="i")` unary
-        // (`blackhole.py:559 bhimpl_int_is_true`). Emitted as the
+        // (`blackhole.py bhimpl_int_is_true`). Emitted as the
         // loop-condition test of any int-typed `while`, including the
         // `_unpackiterable_unknown_length` drain's back-edge guard; its
         // handler is wired in `wire_bhimpl_handlers` but the byte was
@@ -8656,7 +8656,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "vtable_method_ptr/rd>i".to_string(),
         majit_translate::insns::BC_VTABLE_METHOD_PTR,
     );
-    // blackhole.py:954-960 bhimpl_switch. `handler_switch` is wired in
+    // blackhole.py bhimpl_switch. `handler_switch` is wired in
     // `wire_bhimpl_handlers` but the byte was absent from this builder's
     // insns map, so a deopt through a `switch/id` op landed on the
     // unwired-opcode placeholder. RPython's setup_insns binds every opname.
@@ -8906,7 +8906,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "new_array_clear/id>r".to_string(),
         majit_translate::insns::BC_NEW_ARRAY_CLEAR,
     );
-    // Plain struct allocation (`blackhole.py:1301-1310 bhimpl_new` /
+    // Plain struct allocation (`blackhole.py bhimpl_new` /
     // `bhimpl_new_with_vtable`) — a `#[jit_interp]` frontend's declared
     // `struct_allocs` literal lowers straight to it, so any resume that walks
     // forward over one needs the byte dispatchable.  The handlers were already
@@ -9110,7 +9110,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     );
     wire_bhimpl_handlers(&mut builder);
     // Strict-coverage gate: enforce setup-time parity with RPython
-    // `blackhole.py:66 setup_insns` which raises `AttributeError` from
+    // `blackhole.py setup_insns` which raises `AttributeError` from
     // `_get_method(name, argcodes)` whenever an opname has no matching
     // `bhimpl_*`.  pyre's previous behaviour deferred the failure to
     // the `dispatch_step` placeholder panic, which surfaces only when
@@ -9207,7 +9207,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // Copy operations
     builder.wire_handler("int_copy/i>i", handler_int_copy);
-    // `int_copy/c>i` — USE_C_FORM short-const source (`assembler.py:312`).
+    // `int_copy/c>i` — USE_C_FORM short-const source (`assembler.py`).
     builder.wire_handler("int_copy/c>i", handler_int_copy_c);
     // pyre-only abort placeholder emitted by `Assembler::encode_op`'s
     // default branch for `OpKind::Abort { .. }`.
@@ -9290,12 +9290,12 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // backend handlers — RPython jtransform canonicalises these
     // upstream of the assembler:
     //   * `cast_bool_to_int` is dropped entirely
-    //     (`jtransform.py:330 def rewrite_op_cast_bool_to_int(self, op): pass`,
+    //     (`jtransform.py def rewrite_op_cast_bool_to_int(self, op): pass`,
     //     mirrored at `codewriter/jtransform.rs` `same_as`-family arm).
     //   * `cast_bool_to_float` → `cast_int_to_float`
     //     (`jtransform.py:1592` rename pass).
     //   * `float_is_true` → `float_ne(x, 0.0)`
-    //     (`jtransform.py:1627`, mirrored in `jtransform.rs`'s `optimize_block`).
+    //     (`jtransform.py`, mirrored in `jtransform.rs`'s `optimize_block`).
     // Adding backend opcodes for these would diverge from upstream's
     // "shrink the opcode table at jtransform" contract.
 
@@ -9353,7 +9353,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getfield_gc_r_pure/rd>r", handler_getfield_gc_r);
     builder.wire_handler("getfield_gc_f_pure/rd>f", handler_getfield_gc_f);
     builder.wire_handler("setfield_gc_i/rid", handler_setfield_gc_i);
-    // USE_C_FORM short value (`assembler.py:99-107,312`): small ConstInt
+    // USE_C_FORM short value (`assembler.py`): small ConstInt
     // store value inline as one signed byte.
     builder.wire_handler("setfield_gc_i/rcd", handler_setfield_gc_i_c);
     builder.wire_handler("setfield_gc_r/rrd", handler_setfield_gc_r);
@@ -9670,7 +9670,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // RPython `rpython/jit/metainterp/blackhole.py:1101-1132`:
     //   @arguments("self", "i", "I", "R", "F", "I", "R", "F", returns="X")
     // canonical keys `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`. `recursive_call`
-    // is not in `assembler.py:312 USE_C_FORM`, so the `c` short-const
+    // is not in `assembler.py USE_C_FORM`, so the `c` short-const
     // variant is not valid here.
     builder.wire_handler("recursive_call_i/iIRFIRF>i", handler_recursive_call_i);
     builder.wire_handler("recursive_call_r/iIRFIRF>r", handler_recursive_call_r);
@@ -9679,7 +9679,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
 
     // Returns
     builder.wire_handler("int_return/i", handler_int_return);
-    // `int_return/c` — USE_C_FORM short-const source (`assembler.py:312`).
+    // `int_return/c` — USE_C_FORM short-const source (`assembler.py`).
     builder.wire_handler("int_return/c", handler_int_return_c);
     builder.wire_handler("ref_return/r", handler_ref_return);
     builder.wire_handler("float_return/f", handler_float_return);
@@ -9712,7 +9712,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // encoding (`[lhs][rhs][dst]` argcode order via `bhhandler_ii_i!`);
     // the per-opname wire_handler calls above
     // bind the canonical handlers directly.  `int_floordiv` /
-    // `int_mod` have no `bhimpl_*` upstream: `jtransform.py:576-577`
+    // `int_mod` have no `bhimpl_*` upstream: `jtransform.py`
     // rewrites both via `_do_builtin_call` to
     // `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)`
     // before jitcode emission, so neither key reaches `wire_handler`.
@@ -9801,7 +9801,7 @@ fn handler_guard_class(
 /// indirect call survives unfrozen into a metainterp resume.
 ///
 /// The codewriter does emit the op + descriptor (TODO of
-/// `rpython/rtyper/rclass.py:371-377 getclsfield()`) now that indirect
+/// `rpython/rtyper/rclass.py getclsfield()`) now that indirect
 /// routing is the default, but no layer consumes it: there is no backend
 /// lowering (`codewriter/assembler.rs`, "backend lowering of the actual
 /// vtable slot read is not yet implemented"), the walker answers
@@ -9882,7 +9882,7 @@ fn handler_rvmprof_code(
     bh.bhimpl_rvmprof_code(leaving, unique_id);
     Ok(p + 2)
 }
-/// RPython `blackhole.py:1575-1578` `bhimpl_copystrcontent`.
+/// RPython `blackhole.py` `bhimpl_copystrcontent`.
 fn handler_copystrcontent(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -9898,7 +9898,7 @@ fn handler_copystrcontent(
     }
     Ok(p + 5)
 }
-/// RPython `blackhole.py:1593-1595` `bhimpl_copyunicodecontent`.
+/// RPython `blackhole.py` `bhimpl_copyunicodecontent`.
 fn handler_copyunicodecontent(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -9920,17 +9920,17 @@ fn handler_raise(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let exc = bh.registers_r[code[p] as usize];
-    // RPython blackhole.py:999-1003 `bhimpl_raise(self, excvalue)`
+    // RPython blackhole.py `bhimpl_raise(self, excvalue)`
     // `e = cast_opaque_ptr(...); assert e; reraise(e)`.
     assert!(
         exc != 0,
         "blackhole.py:1002 raise: excvalue must be non-null"
     );
-    // RPython blackhole.py:169 `_get_method` stores the decoded position
+    // RPython blackhole.py `_get_method` stores the decoded position
     // back to `self.position` before invoking the bhimpl_*. Required here
     // because `run_inner`'s RaiseException arm calls
     // `handle_exception_in_frame`, which reads `self.position` to find
-    // the immediately-following `catch_exception/L` (blackhole.py:396).
+    // the immediately-following `catch_exception/L` (blackhole.py).
     // Without this update the search would start one byte short of the
     // post-operand position.
     bh.position = p + 1;
@@ -9980,7 +9980,7 @@ fn handler_last_exception(
 /// def bhimpl_last_exc_value(self):
 ///     return cast_opaque_ptr(GCREF, self.exception_last_value)
 /// ```
-/// blackhole.py:991-997 `bhimpl_last_exc_value(self): return self.exception_last_value`.
+/// blackhole.py `bhimpl_last_exc_value(self): return self.exception_last_value`.
 /// `assert real_instance` ensures last_exc_value fires only while an active
 /// caught exception is in scope.
 fn bhimpl_last_exc_value(bh: &mut BlackholeInterpreter) -> i64 {
@@ -10047,7 +10047,7 @@ fn handler_debug_fatalerror(
 ) -> Result<usize, DispatchError> {
     panic!("bhimpl_debug_fatalerror");
 }
-/// blackhole.py:602-606 `bhimpl_cast_ptr_to_int(a)`. The cast is identity
+/// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
 /// (the tagging arithmetic lives at the erase site, never here); the
 /// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
 /// `debug_assert!` mirrors `ll_assert` — removed from the optimized
@@ -10058,7 +10058,7 @@ fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
     a
 }
 
-/// blackhole.py:607-610 `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
 /// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
 /// before it is reinterpreted as a `GCREF`.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
@@ -10375,7 +10375,7 @@ fn handler_arraylen_vable(
 }
 
 // ── getarrayitem_raw / setarrayitem_raw (blackhole.py:1343-1365) ────
-/// RPython `blackhole.py:1343-1345` `bhimpl_getarrayitem_raw_i`:
+/// RPython `blackhole.py` `bhimpl_getarrayitem_raw_i`:
 /// `return cpu.bh_getarrayitem_raw_i(array, index, arraydescr)`.
 /// Raw memory access — NOT GC-managed. Uses unsafe direct read.
 fn handler_getarrayitem_raw_i(
@@ -10392,7 +10392,7 @@ fn handler_getarrayitem_raw_i(
     bh.registers_i[code[p] as usize] = value;
     Ok(p + 1)
 }
-/// RPython `blackhole.py:1360-1362` `bhimpl_setarrayitem_raw_i`.
+/// RPython `blackhole.py` `bhimpl_setarrayitem_raw_i`.
 fn handler_setarrayitem_raw_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10589,7 +10589,7 @@ fn handler_check_resizable_neg_index(
     Ok(p + 1)
 }
 
-// blackhole.py:1336-1337 bhimpl_getarrayitem_gc_f
+// blackhole.py bhimpl_getarrayitem_gc_f
 // Floating-point GC array operations
 fn handler_getarrayitem_gc_f(
     bh: &mut BlackholeInterpreter,
@@ -10604,7 +10604,7 @@ fn handler_getarrayitem_gc_f(
         cpu.bh_getarrayitem_gc_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
 }
-// blackhole.py:1357-1358 bhimpl_setarrayitem_gc_f
+// blackhole.py bhimpl_setarrayitem_gc_f
 fn handler_setarrayitem_gc_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10618,7 +10618,7 @@ fn handler_setarrayitem_gc_f(
     cpu.bh_setarrayitem_gc_f(array, index, value, descr);
     Ok(p)
 }
-// blackhole.py:1347-1348 bhimpl_getarrayitem_raw_f
+// blackhole.py bhimpl_getarrayitem_raw_f
 fn handler_getarrayitem_raw_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10632,7 +10632,7 @@ fn handler_getarrayitem_raw_f(
         cpu.bh_getarrayitem_raw_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
 }
-// blackhole.py:1363-1364 bhimpl_setarrayitem_raw_f
+// blackhole.py bhimpl_setarrayitem_raw_f
 fn handler_setarrayitem_raw_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10744,7 +10744,7 @@ fn handler_gc_load_indexed_f(
         .to_bits() as i64;
     Ok(p + 6)
 }
-// blackhole.py:1525-1529 bhimpl_gc_store_indexed_i
+// blackhole.py bhimpl_gc_store_indexed_i
 fn handler_gc_store_indexed_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10762,7 +10762,7 @@ fn handler_gc_store_indexed_i(
     cpu.bh_gc_store_indexed_i(addr, index, value, scale, base_ofs, bytes);
     Ok(p)
 }
-// blackhole.py:1531-1535 bhimpl_gc_store_indexed_f
+// blackhole.py bhimpl_gc_store_indexed_f
 fn handler_gc_store_indexed_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10780,7 +10780,7 @@ fn handler_gc_store_indexed_f(
     cpu.bh_gc_store_indexed_f(addr, index, value, scale, base_ofs, bytes);
     Ok(p)
 }
-// blackhole.py:1504-1509 bhimpl_raw_store_i/f
+// blackhole.py bhimpl_raw_store_i/f
 fn handler_raw_store_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10911,7 +10911,7 @@ fn handler_newlist_hint(
     bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
-// blackhole.py:1384-1387 bhimpl_getarrayitem_vable_f
+// blackhole.py bhimpl_getarrayitem_vable_f
 // TODO mirrored from `handler_getarrayitem_vable_i`
 // header — pyre's W_ListObject EmbeddedArray storage requires direct
 // `vable_read_array_item`.  `registers_f` stores the f64 bit-pattern
@@ -10933,7 +10933,7 @@ fn handler_getarrayitem_vable_f(
     bh.registers_f[code[p] as usize] = value;
     Ok(p + 1)
 }
-// blackhole.py:1400-1403 bhimpl_setarrayitem_vable_f
+// blackhole.py bhimpl_setarrayitem_vable_f
 fn handler_setarrayitem_vable_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10952,7 +10952,7 @@ fn handler_setarrayitem_vable_f(
     }
     Ok(p)
 }
-// blackhole.py:1204-1206 bhimpl_getlistitem_gc_f
+// blackhole.py bhimpl_getlistitem_gc_f
 fn handler_getlistitem_gc_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -10969,7 +10969,7 @@ fn handler_getlistitem_gc_f(
         .to_bits() as i64;
     Ok(p + 1)
 }
-// blackhole.py:1217-1219 bhimpl_setlistitem_gc_f
+// blackhole.py bhimpl_setlistitem_gc_f
 fn handler_setlistitem_gc_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -11105,7 +11105,7 @@ fn handler_inline_call_irf_i(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    // blackhole.py:1304-1307 → bhimpl_inline_call_irf_i.
+    // blackhole.py → bhimpl_inline_call_irf_i.
     bh.registers_i[code[p] as usize] =
         bh.bhimpl_inline_call_irf_i(fnaddr, &ai, &ar, &af, &calldescr);
     Ok(p + 1)
@@ -11122,7 +11122,7 @@ fn handler_inline_call_irf_r(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    // blackhole.py:1308-1311 → bhimpl_inline_call_irf_r.
+    // blackhole.py → bhimpl_inline_call_irf_r.
     bh.registers_r[code[p] as usize] = bh
         .bhimpl_inline_call_irf_r(fnaddr, &ai, &ar, &af, &calldescr)
         .0 as i64;
@@ -11140,7 +11140,7 @@ fn handler_inline_call_irf_f(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    // blackhole.py:1312-1315 → bhimpl_inline_call_irf_f.
+    // blackhole.py → bhimpl_inline_call_irf_f.
     bh.registers_f[code[p] as usize] = bh
         .bhimpl_inline_call_irf_f(fnaddr, &ai, &ar, &af, &calldescr)
         .to_bits() as i64;
@@ -11158,7 +11158,7 @@ fn handler_inline_call_irf_v(
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
-    // blackhole.py:1316-1319 → bhimpl_inline_call_irf_v.
+    // blackhole.py → bhimpl_inline_call_irf_v.
     bh.bhimpl_inline_call_irf_v(fnaddr, &ai, &ar, &af, &calldescr);
     Ok(p)
 }
@@ -11173,7 +11173,7 @@ fn handler_inline_call_ir_i(
     }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    // blackhole.py:1291-1294 → bhimpl_inline_call_ir_i.
+    // blackhole.py → bhimpl_inline_call_ir_i.
     bh.registers_i[code[p] as usize] = bh.bhimpl_inline_call_ir_i(fnaddr, &ai, &ar, &calldescr);
     Ok(p + 1)
 }
@@ -11188,7 +11188,7 @@ fn handler_inline_call_ir_r(
     }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    // blackhole.py:1295-1298 → bhimpl_inline_call_ir_r.
+    // blackhole.py → bhimpl_inline_call_ir_r.
     bh.registers_r[code[p] as usize] =
         bh.bhimpl_inline_call_ir_r(fnaddr, &ai, &ar, &calldescr).0 as i64;
     Ok(p + 1)
@@ -11204,7 +11204,7 @@ fn handler_inline_call_ir_v(
     }
     let (ai, p) = read_list_i(bh, code, p);
     let (ar, p) = read_list_r(bh, code, p);
-    // blackhole.py:1299-1302 → bhimpl_inline_call_ir_v.
+    // blackhole.py → bhimpl_inline_call_ir_v.
     bh.bhimpl_inline_call_ir_v(fnaddr, &ai, &ar, &calldescr);
     Ok(p)
 }
@@ -11218,7 +11218,7 @@ fn handler_inline_call_r_i(
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     }
     let (ar, p) = read_list_r(bh, code, p);
-    // blackhole.py:1279-1281 → bhimpl_inline_call_r_i.
+    // blackhole.py → bhimpl_inline_call_r_i.
     bh.registers_i[code[p] as usize] = bh.bhimpl_inline_call_r_i(fnaddr, &ar, &calldescr);
     Ok(p + 1)
 }
@@ -11232,7 +11232,7 @@ fn handler_inline_call_r_r(
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     }
     let (ar, p) = read_list_r(bh, code, p);
-    // blackhole.py:1282-1285 → bhimpl_inline_call_r_r.
+    // blackhole.py → bhimpl_inline_call_r_r.
     bh.registers_r[code[p] as usize] = bh.bhimpl_inline_call_r_r(fnaddr, &ar, &calldescr).0 as i64;
     Ok(p + 1)
 }
@@ -11246,7 +11246,7 @@ fn handler_inline_call_r_v(
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     }
     let (ar, p) = read_list_r(bh, code, p);
-    // blackhole.py:1286-1289 → bhimpl_inline_call_r_v.
+    // blackhole.py → bhimpl_inline_call_r_v.
     bh.bhimpl_inline_call_r_v(fnaddr, &ar, &calldescr);
     Ok(p)
 }
@@ -11313,7 +11313,7 @@ fn handler_call_assembler_ref_pyre(
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
-    // RPython `blackhole.py:1244 bhimpl_residual_call_irf_r` →
+    // RPython `blackhole.py bhimpl_residual_call_irf_r` →
     // `cpu.bh_call_r(...)`; pyre's ref ABI uses the same i64 carrier
     // as int (`pyjitpl/dispatch.rs`'s `call_ref_function = call_int_function`),
     // so the alias is structural-parity only.  Picking the ref-named
@@ -11518,7 +11518,7 @@ fn handler_cond_call_value_ref_pyre(
     let result = if value == 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
-        // RPython `blackhole.py:1271 bhimpl_conditional_call_value_ir_r`
+        // RPython `blackhole.py bhimpl_conditional_call_value_ir_r`
         // → `cpu.bh_call_r(...)` (ref ABI).  See note on
         // `handler_call_assembler_ref_pyre`.
         let r = call_ref_function(target.concrete_ptr, &args);
@@ -11657,7 +11657,7 @@ fn handler_inline_call_pyre_nested(
     // recursive merge point silently completes "normally" and the parent
     // frame never sees the portal-restart signal.
     //
-    // RPython's generic `dispatch_loop` wrapper (`blackhole.py:171`)
+    // RPython's generic `dispatch_loop` wrapper (`blackhole.py`)
     // sets `self.position = position` AFTER decoding operands/result
     // and BEFORE re-raising, so the parent frame's post-exception
     // inspectors see the post-op cursor.  Mirror that invariant here:
@@ -11668,7 +11668,7 @@ fn handler_inline_call_pyre_nested(
         return Err(DispatchError::ContinueRunningNormally(Box::new(args)));
     }
 
-    // RPython `blackhole.py:171` invariant: after the handler has
+    // RPython `blackhole.py` invariant: after the handler has
     // decoded operands and consumed the result payload, every
     // exceptional exit path must update `self.position` to the
     // post-op cursor before re-raising.  Mirror that here for the
@@ -11731,7 +11731,7 @@ fn decode_return_slot_at(code: &[u8], cursor: &mut usize) -> Option<usize> {
 }
 
 // recursive_call — stub (needs portal runner)
-/// RPython `blackhole.py:1095-1099` `get_portal_runner(jdindex)`:
+/// RPython `blackhole.py` `get_portal_runner(jdindex)`:
 /// Returns (fnptr, calldescr) from jitdrivers_sd[jdindex].
 /// pyre: uses portal_runner_ptr directly (single jitdriver).
 ///
@@ -11785,7 +11785,7 @@ fn read_recursive_call_args(
         jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p,
     )
 }
-// blackhole.py:1101-1108 bhimpl_recursive_call_i
+// blackhole.py bhimpl_recursive_call_i
 fn handler_recursive_call_i(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -11798,7 +11798,7 @@ fn handler_recursive_call_i(
     );
     Ok(p + 1)
 }
-// blackhole.py:1109-1116 bhimpl_recursive_call_r
+// blackhole.py bhimpl_recursive_call_r
 fn handler_recursive_call_r(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -11813,7 +11813,7 @@ fn handler_recursive_call_r(
         .0 as i64;
     Ok(p + 1)
 }
-// blackhole.py:1117-1124 bhimpl_recursive_call_f
+// blackhole.py bhimpl_recursive_call_f
 fn handler_recursive_call_f(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -11828,7 +11828,7 @@ fn handler_recursive_call_f(
         .to_bits() as i64;
     Ok(p + 1)
 }
-// blackhole.py:1125-1132 bhimpl_recursive_call_v
+// blackhole.py bhimpl_recursive_call_v
 fn handler_recursive_call_v(
     bh: &mut BlackholeInterpreter,
     code: &[u8],

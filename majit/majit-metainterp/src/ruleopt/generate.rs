@@ -106,7 +106,7 @@ pub fn generate_rust_real_rules() -> Result<String, parse::RuleParseError> {
     generate_rust_source(REAL_RULES)
 }
 
-/// Rust library counterpart of PyPy `main(argv)` (`generate.py:7`).
+/// Rust library counterpart of PyPy `main(argv)` (`generate.py`).
 ///
 /// PyPy's script writes `optimizeopt/autogenintrules.py` as a CLI side effect.
 /// This module is consumed as a library, so the parity entry point returns the

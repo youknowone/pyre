@@ -205,7 +205,7 @@ pub fn gai_strerror(code: libc::c_int) -> String {
 
 // ── name lookups ──
 
-/// `interp_func.py:24 gethostname` — the host's own name, as the opaque OS
+/// `interp_func.py gethostname` — the host's own name, as the opaque OS
 /// string it is (`sethostname(2)` takes a plain `const char *`), so a byte or
 /// code unit with no text spelling survives the caller's filesystem decode.
 #[cfg(unix)]
@@ -228,7 +228,7 @@ pub fn hostname() -> std::io::Result<std::ffi::OsString> {
     Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
-/// `interp_func.py:125-134 getprotobyname` — the `IPPROTO_*` number a protocol
+/// `interp_func.py getprotobyname` — the `IPPROTO_*` number a protocol
 /// name stands for, or `None` when the database does not name it.
 #[cfg(unix)]
 pub fn protocol_by_name(name: &std::ffi::CStr) -> Option<libc::c_int> {

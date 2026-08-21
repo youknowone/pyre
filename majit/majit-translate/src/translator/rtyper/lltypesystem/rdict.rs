@@ -19,7 +19,7 @@ use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRep
 use crate::translator::rtyper::rmodel::{Repr, ReprState};
 use crate::translator::rtyper::rtyper::RPythonTyper;
 
-/// RPython `HIGHEST_BIT` / `MASK` (`lltypesystem/rdict.py:13-14`).
+/// RPython `HIGHEST_BIT` / `MASK` (`lltypesystem/rdict.py`).
 pub const HIGHEST_BIT: u64 = 1_u64 << (usize::BITS - 1);
 pub const MASK: u64 = HIGHEST_BIT - 1;
 pub const PERTURB_SHIFT: i64 = 5;
@@ -33,7 +33,7 @@ pub static POPITEMINDEX: LazyLock<LowLevelType> = LazyLock::new(|| {
 #[allow(non_upper_case_globals)]
 pub static global_popitem_index: LazyLock<LowLevelType> = LazyLock::new(|| POPITEMINDEX.clone());
 
-/// RPython `class DictRepr(AbstractDictRepr)` (`lltypesystem/rdict.py:35`).
+/// RPython `class DictRepr(AbstractDictRepr)` (`lltypesystem/rdict.py`).
 #[derive(Debug)]
 #[allow(non_snake_case)]
 pub struct DictRepr {
@@ -53,7 +53,7 @@ pub struct DictRepr {
 
 impl DictRepr {
     /// RPython `DictRepr.__init__` + the data-shape part of
-    /// `_setup_repr` (`lltypesystem/rdict.py:37-169`).
+    /// `_setup_repr` (`lltypesystem/rdict.py`).
     pub fn new(
         rtyper: Rc<RPythonTyper>,
         key_repr: Arc<dyn Repr>,

@@ -20,7 +20,7 @@ pub const FRAME_FIXED_SIZE: usize = 0;
 /// aarch64/arch.py: no scratch slots reserved on the stack.
 pub const PASS_ON_MY_FRAME: usize = 0;
 
-/// aarch64/arch.py:13 — `JITFRAME_FIXED_SIZE = NUM_MANAGED_REGS +
+/// aarch64/arch.py — `JITFRAME_FIXED_SIZE = NUM_MANAGED_REGS +
 /// NUM_VFP_REGS`, i.e. 16 GPR + 8 VFP = 24.
 pub const JITFRAME_FIXED_SIZE: usize = 24;
 

@@ -297,8 +297,8 @@ struct JitCalleeFrameRootArea {
 }
 
 /// Create a callee frame for a JIT call, exactly as the interpreter
-/// creates every other frame: `baseobjspace.py:799-801 createframe` on a
-/// `pyframe.py:52 class PyFrame(W_Root)`, a normal GC object whose
+/// creates every other frame: `baseobjspace.py createframe` on a
+/// `pyframe.py class PyFrame(W_Root)`, a normal GC object whose
 /// lifetime is its reachability. Nothing recycles the block, so a frame
 /// the program retains past the call — a traceback node, an `f_back`
 /// chain, a `sys._getframe` result — stays valid for as long as Python
@@ -325,7 +325,7 @@ fn alloc_callee_frame(
 }
 
 /// Drop the JIT's root on a callee frame that finished running. The
-/// frame itself is not freed — `executioncontext.py:91-107 leave` frees
+/// frame itself is not freed — `executioncontext.py leave` frees
 /// nothing either; the collector reclaims it once nothing reaches it.
 fn unroot_callee_frame(ptr: *mut PyFrame) {
     // This list is what makes a minor collection scan the frame's slots.
@@ -335,7 +335,7 @@ fn unroot_callee_frame(ptr: *mut PyFrame) {
     // a minor does not walk. The frame outlives the call whenever the program
     // retained it (a traceback node, an `f_back` chain), so re-arm the
     // remembered set here, at the moment root-walking stops: the same barrier
-    // `pyframe.py:52 __init__` arms at creation, for the same reason.
+    // `pyframe.py __init__` arms at creation, for the same reason.
     unsafe {
         pyre_interpreter::pyframe::remember_frame_locals_array((*ptr).locals_cells_stack_w);
     }
@@ -424,7 +424,7 @@ extern "C" fn jit_call_user_function_from_frame(
     match pyre_interpreter::call::call_user_function(frame, callable as PyObjectRef, args) {
         Ok(result) => result as i64,
         Err(mut err) => {
-            // llmodel.py:194-199 _store_exception: write the exception
+            // llmodel.py _store_exception: write the exception
             // to the backend's `_exception_emulator` tp/val cells. The
             // matching GUARD_NO_EXCEPTION in the trace then reads
             // pos_exception()/pos_exc_value() and fails, and resume
@@ -441,7 +441,7 @@ extern "C" fn jit_call_user_function_from_frame(
     }
 }
 
-/// llmodel.py:194-199 _store_exception: publish a materialised exception
+/// llmodel.py _store_exception: publish a materialised exception
 /// object into the active backend's `_store_exception` cells so the
 /// GuardNoException after the call detects it. One arm per backend; the wasm
 /// backend keeps the pending exception in shared linear memory.
@@ -518,7 +518,7 @@ struct ParkedResidualException {
 ///
 /// Upstream never needs this: the raise a residual call reports lives in
 /// `metainterp.last_exc_value`, a field of the MetaInterp instance that owns
-/// the call, and `llmodel.py:194 _store_exception` is read back by the same
+/// the call, and `llmodel.py _store_exception` is read back by the same
 /// `bh_call_*` that armed it. Pyre keeps one cell per thread, so a nested
 /// execution inside the call aliases the caller's.
 fn park_residual_call_exception() -> ParkedResidualException {
@@ -578,7 +578,7 @@ fn unpark_residual_call_exception(parked: ParkedResidualException) {
 /// than one exit.
 ///
 /// A whole tracing session needs this for the same reason a single residual
-/// call does. `pyjitpl.py:2763 execute_raised` records a residual's raise into
+/// call does. `pyjitpl.py execute_raised` records a residual's raise into
 /// `metainterp.last_exc_value` — an instance field, so upstream's dies with the
 /// MetaInterp that owned the session. Pyre's stand-in is one cell per thread,
 /// so a session that ends with a raise still recorded (a walk that executes
@@ -621,9 +621,9 @@ impl Drop for ResidualExceptionScope {
 /// Drain the backend `_store_exception` cells (`jit_exc_clear`) without
 /// touching `BH_LAST_EXC_VALUE`.
 ///
-/// `pyjitpl.py:2763 execute_raised` records a raise from a residual call
+/// `pyjitpl.py execute_raised` records a raise from a residual call
 /// into `metainterp.last_exc_value` only — the backend `_store_exception`
-/// cells (`llmodel.py:194` `_store_exception`) are written exclusively by
+/// cells (`llmodel.py` `_store_exception`) are written exclusively by
 /// compiled / blackhole execution, never by metainterp tracing.  Pyre's
 /// authoritative full-body walk shares the `bh_*` residual helpers with
 /// the blackhole, so a raising helper publishes to BOTH cells
@@ -735,7 +735,7 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     // A forwarding raise keeps the chain it arrived with only when this frame
     // attached the head. When the raise came out of an inlined callee, the
     // head names the callee and this frame still owes one node. The ownership
-    // check preserves `pyopcode.py:147-148 handle_operation_error` as the
+    // check preserves `pyopcode.py handle_operation_error` as the
     // one-node-per-frame-per-delivery authority.
     if forwards_existing {
         let owns_head = unsafe {
@@ -791,7 +791,7 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     }
 }
 
-/// `pypy/interpreter/error.py:410-420 record_context` for an exception whose
+/// `pypy/interpreter/error.py record_context` for an exception whose
 /// handler is part of the trace, split so the trace records the store itself.
 ///
 /// The implicit `__context__` is derived by `handle_exception_with_context`,
@@ -883,7 +883,7 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
         return;
     };
     frame.last_instr = last_instruction as isize;
-    // `pyopcode.py:184 handle_operation_error` marks a propagating frame
+    // `pyopcode.py handle_operation_error` marks a propagating frame
     // finished before it leaves that frame.  This object materializes that
     // already-unwound inline callee, so preserve the same lifecycle state;
     // traceback.clear_frames() must not mistake it for a live activation.
@@ -899,7 +899,7 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     }
 }
 
-/// `pytraceback.py:104-109 record_application_traceback` for a frame the resume
+/// `pytraceback.py record_application_traceback` for a frame the resume
 /// crossed and discarded — an inlined callee the exception-edge bridge unwound
 /// clear out of on its way to the live frame's own handler.
 ///
@@ -979,12 +979,12 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
     #[cfg(feature = "cranelift")]
     let _ = majit_backend_cranelift::take_pending_frame_restore();
 
-    // `assembler_call_helper` (warmspot.py:1021-1028) resumes the callee
+    // `assembler_call_helper` (warmspot.py) resumes the callee
     // frame the rewritten CALL_ASSEMBLER passed as arg 0.
     run_frame_through_portal(frame_ptr)
 }
 
-/// warmspot.py:941-959 `ll_portal_runner` core — run the frame the JIT handed
+/// warmspot.py `ll_portal_runner` core — run the frame the JIT handed
 /// in through the portal (`maybe_compile_and_run` + interpreter main loop;
 /// ContinueRunningNormally re-enters the JIT via the portal,
 /// warmspot.py:961-983).
@@ -1017,8 +1017,8 @@ fn run_frame_through_portal(frame_ptr: i64) -> i64 {
     result as i64
 }
 
-/// warmspot.py:941-959 `ll_portal_runner` — the raw-address portal entry whose
-/// address is stored in `jd.portal_runner_adr` (warmspot.py:1010-1012) and
+/// warmspot.py `ll_portal_runner` — the raw-address portal entry whose
+/// address is stored in `jd.portal_runner_adr` (warmspot.py) and
 /// called by the synthetic callback loop that `compile_tmp_callback`
 /// (compile.py:1125-1132) builds for a not-yet-compiled recursive callee.
 ///
@@ -1037,7 +1037,7 @@ pub extern "C" fn ll_portal_runner_shim(
     frame_ptr: i64,
     _ec: i64,
 ) -> i64 {
-    // The callback loop `compile_tmp_callback` builds (compile.py:1125-1132)
+    // The callback loop `compile_tmp_callback` builds (compile.py)
     // passes the callee `frame` red that `emit_new_pyframe_inline_with_params`
     // constructed — a proper `PyFrame` with `locals_cells_stack_w` already
     // populated (NewWithVtable + SetfieldGc).  Run it directly; the greens
@@ -1045,7 +1045,7 @@ pub extern "C" fn ll_portal_runner_shim(
     run_frame_through_portal(frame_ptr)
 }
 
-/// warmspot.py:1021-1028 — assembler_call_helper.
+/// warmspot.py — assembler_call_helper.
 ///
 /// Called when CALL_ASSEMBLER guard-fails (not a finish exit).
 /// Receives a JitFrame pointer, reconstructs a PyFrame from the
@@ -1062,7 +1062,7 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     let jf = jitframe_ptr as *mut JitFrame;
 
     // warmspot.py:1022 — fail_descr = cpu.get_latest_descr(deadframe)
-    // compile.py:701 handle_fail: dispatches on fail_descr to either
+    // compile.py handle_fail: dispatches on fail_descr to either
     // _trace_and_compile_from_bridge or resume_in_blackhole.
     // Bridge compilation is driven by must_compile() in jitdriver.
     // This force path always resumes in the interpreter (blackhole).
@@ -1130,11 +1130,11 @@ fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
     }
 }
 
-/// blackhole.py:1095 get_portal_runner / warmspot.py portal_runner parity:
+/// blackhole.py get_portal_runner / warmspot.py portal_runner parity:
 /// Callback for bhimpl_recursive_call. Receives a frame pointer, executes
 /// the frame through the JIT-enabled interpreter (eval_loop_jit), and
 /// returns the result. This enables JIT re-entry at recursive portal depth.
-/// warmspot.py:941-959 ll_portal_runner(*args) parity.
+/// warmspot.py ll_portal_runner(*args) parity.
 /// Portal runner with full portal arg ABI.
 ///
 /// blackhole.py:1113-1116: called with merged arg lists:
@@ -1216,7 +1216,7 @@ pub extern "C" fn bh_portal_runner_c(
 /// once `consume_vable_info` guarantees resume data validity.
 #[allow(dead_code)] // not all variants are constructed yet
 pub enum JitException {
-    /// jitexc.py:53 ContinueRunningNormally(gi, gr, gf, ri, rr, rf):
+    /// jitexc.py ContinueRunningNormally(gi, gr, gf, ri, rr, rf):
     /// blackhole reached the merge point → restart the portal. The six
     /// vectors carry the green/red int/ref/float live-in arguments used
     /// by `maybe_compile_and_run` to resume execution.
@@ -1228,15 +1228,15 @@ pub enum JitException {
         red_ref: Vec<PyObjectRef>,
         red_float: Vec<f64>,
     },
-    /// jitexc.py:17 DoneWithThisFrameVoid.
+    /// jitexc.py DoneWithThisFrameVoid.
     DoneWithThisFrameVoid,
-    /// jitexc.py:21 DoneWithThisFrameInt(result).
+    /// jitexc.py DoneWithThisFrameInt(result).
     DoneWithThisFrameInt(i64),
-    /// jitexc.py:29 DoneWithThisFrameRef(result).
+    /// jitexc.py DoneWithThisFrameRef(result).
     DoneWithThisFrameRef(PyObjectRef),
-    /// jitexc.py:37 DoneWithThisFrameFloat(result).
+    /// jitexc.py DoneWithThisFrameFloat(result).
     DoneWithThisFrameFloat(f64),
-    /// jitexc.py:45 ExitFrameWithExceptionRef(value): blackhole ran out
+    /// jitexc.py ExitFrameWithExceptionRef(value): blackhole ran out
     /// of caller frames while propagating a Python exception.
     ExitFrameWithExceptionRef(pyre_interpreter::error::PyError),
 }
@@ -1246,7 +1246,7 @@ pub enum JitException {
 /// Each variant matches an RPython JitException subclass 1:1.
 /// The value is carried in its native type — no boxing into PyObjectRef.
 pub enum BlackholeResult {
-    /// jitexc.py:53 ContinueRunningNormally(gi, gr, gf, ri, rr, rf)
+    /// jitexc.py ContinueRunningNormally(gi, gr, gf, ri, rr, rf)
     ContinueRunningNormally {
         green_int: Vec<i64>,
         green_ref: Vec<PyObjectRef>,
@@ -1255,15 +1255,15 @@ pub enum BlackholeResult {
         red_ref: Vec<PyObjectRef>,
         red_float: Vec<f64>,
     },
-    /// jitexc.py:16 DoneWithThisFrameVoid
+    /// jitexc.py DoneWithThisFrameVoid
     DoneWithThisFrameVoid,
-    /// jitexc.py:20 DoneWithThisFrameInt(result: Signed)
+    /// jitexc.py DoneWithThisFrameInt(result: Signed)
     DoneWithThisFrameInt(i64),
-    /// jitexc.py:28 DoneWithThisFrameRef(result: GCREF)
+    /// jitexc.py DoneWithThisFrameRef(result: GCREF)
     DoneWithThisFrameRef(PyObjectRef),
-    /// jitexc.py:36 DoneWithThisFrameFloat(result: FLOATSTORAGE)
+    /// jitexc.py DoneWithThisFrameFloat(result: FLOATSTORAGE)
     DoneWithThisFrameFloat(f64),
-    /// jitexc.py:44 ExitFrameWithExceptionRef(value: GCREF)
+    /// jitexc.py ExitFrameWithExceptionRef(value: GCREF)
     ExitFrameWithExceptionRef(pyre_interpreter::error::PyError),
     /// pyre-only: the blackhole stopped on a pyre `abort_permanent` marker.
     /// This is a designed bail whose resume coordinate the codewriter already
@@ -1337,7 +1337,7 @@ impl BlackholeResult {
     }
 }
 
-/// resume.py:1042 rebuild_from_numbering / read_jitcode_pos_pc output.
+/// resume.py rebuild_from_numbering / read_jitcode_pos_pc output.
 /// Each decoded frame section from rd_numb.
 pub struct ResumedFrame {
     /// resume.py:1050 jitcode_pos → jitcodes[jitcode_pos].
@@ -1364,16 +1364,16 @@ pub struct ResumedFrame {
     /// valuestackdepth extracted from vable_values (snapshot).
     pub vsd: usize,
     /// interp_jit.py:31 w_globals — namespace pointer from vable_values.
-    /// virtualizable.py:126-137 write_from_resume_data_partial:
+    /// virtualizable.py write_from_resume_data_partial:
     /// ALL static fields come from resume data, not from the heap.
     pub namespace: *const (),
-    /// resume.py:928-931 consume_one_section: resolved values.
+    /// resume.py consume_one_section: resolved values.
     /// Structure: [live_registers...] — no scalar inputarg header.
     /// RPython parity: vable values come from snapshot, not fail_args.
     pub values: Vec<majit_ir::Value>,
 }
 
-/// resume.py:945-956 decode_ref / getvirtual_ptr parity.
+/// resume.py decode_ref / getvirtual_ptr parity.
 ///
 /// Re-box optimizer-unboxed values back to PyObjectRef for the
 /// blackhole's ref register file. RPython's decode_ref dispatches
@@ -1391,7 +1391,7 @@ fn materialize_virtual(val: &majit_ir::Value) -> i64 {
     }
 }
 
-/// resume.py:1028 _callback_i → next_int() → write_an_int.
+/// resume.py _callback_i → next_int() → write_an_int.
 /// RPython trusts type discipline — no cross-type coercion.
 #[allow(dead_code)]
 fn materialize_virtual_int(val: &majit_ir::Value) -> i64 {
@@ -1401,7 +1401,7 @@ fn materialize_virtual_int(val: &majit_ir::Value) -> i64 {
     }
 }
 
-/// resume.py:1036 _callback_f → next_float() → write_a_float.
+/// resume.py _callback_f → next_float() → write_a_float.
 /// RPython trusts type discipline — no cross-type coercion.
 #[allow(dead_code)]
 fn materialize_virtual_float(val: &majit_ir::Value) -> i64 {
@@ -1494,9 +1494,9 @@ pub extern "C" fn jit_force_self_recursive_call_1(caller_frame: i64, boxed_arg: 
     }
     // result_type=REF: arg is already boxed Ref
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed_arg_ref);
-    // blackhole.py:1101-1132 bhimpl_recursive_call_r: calls
+    // blackhole.py bhimpl_recursive_call_r: calls
     // cpu.bh_call_r(portal_runner_adr, ...) which re-enters JIT.
-    // warmspot.py:941 ll_portal_runner: maybe_compile_and_run + portal_ptr.
+    // warmspot.py ll_portal_runner: maybe_compile_and_run + portal_ptr.
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
         crate::eval::portal_runner(frame) as i64
@@ -1537,7 +1537,7 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_callee_frame_impl_1_boxed(caller_frame, callable_ref, boxed);
-    // blackhole.py:1101-1116 bhimpl_recursive_call_r: a recursive call
+    // blackhole.py bhimpl_recursive_call_r: a recursive call
     // from compiled assembler is `cpu.bh_call_r(portal_runner_adr, ...)`
     // — i.e. it always re-enters through the portal runner. The portal
     // runner (warmspot.py:944-953) calls `maybe_compile_and_run` and
@@ -1578,9 +1578,9 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);
-    // blackhole.py:1110-1116 bhimpl_recursive_call_r: calls
+    // blackhole.py bhimpl_recursive_call_r: calls
     // cpu.bh_call_r(portal_runner_adr, ...) which invokes
-    // warmspot.py:941 ll_portal_runner. portal_runner re-enters
+    // warmspot.py ll_portal_runner. portal_runner re-enters
     // the JIT through maybe_compile_and_run + portal_ptr.
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
@@ -1597,7 +1597,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     result
 }
 
-/// Dynasm x86/assembler.py:347-390 `_build_stack_check_slowpath` parity.
+/// Dynasm x86/assembler.py `_build_stack_check_slowpath` parity.
 ///
 /// The interpreter-level slowpath stores the RecursionError in the
 /// current thread's pending JIT exception slot for non-dynasm backend
@@ -1629,7 +1629,7 @@ fn unbox_int_for_force(raw: i64) -> i64 {
     }
 }
 
-/// resume.py:763-779 VStrPlainInfo.allocate / resume.py:817-829
+/// resume.py VStrPlainInfo.allocate / resume.py
 /// VUniPlainInfo.allocate parity — materialize a Plain string/unicode
 /// virtual via the frontend backend's bh_newstr / bh_strsetitem (and
 /// unicode variants). Registered into Cranelift's guard-exit recovery
@@ -1656,7 +1656,7 @@ fn materialize_str_plain_for_cranelift(is_unicode: bool, chars: &[i64]) -> i64 {
     string
 }
 
-/// resume.py:1143-1188 string_concat / slice_string and the unicode
+/// resume.py string_concat / slice_string and the unicode
 /// counterparts — materialize Concat / Slice string virtuals via
 /// cpu.bh_call_r(funcptr, args_i, args_r, args_f, calldescr).
 #[allow(dead_code)]
@@ -1723,7 +1723,7 @@ pub fn install_jit_call_bridge() {
         majit_ir::descr::set_w_class_obj_resolver(pyre_jit_trace::descr::w_class_obj_for_vtable);
         register_jit_function_caller(jit_call_user_function_from_frame);
         register_jit_exc_raiser(jit_exc_raise_shim);
-        // compile.py:1090 `memory_error = MemoryError()` parity — give
+        // compile.py `memory_error = MemoryError()` parity — give
         // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
         // pyre's lazy `W_BaseException(MemoryError, "")` singleton
         // before propagating NULL on OOM.  Backend-shared (mirrors
@@ -1749,7 +1749,7 @@ pub fn install_jit_call_bridge() {
             criticalcode_start_adapter,
             criticalcode_stop_adapter,
         );
-        // rpython/rlib/rstack.py:75-90 stack_almost_full hook — lets
+        // rpython/rlib/rstack.py stack_almost_full hook — lets
         // compile.py:702-703 and warmstate.py:430 query the recursion-
         // limit-driven PYRE_STACKTOOBIG budget instead of the OS thread
         // stack.
@@ -1766,7 +1766,7 @@ pub fn install_jit_call_bridge() {
             );
             majit_backend_cranelift::register_jitframe_layout(jitframe_layout_info());
             majit_backend_cranelift::register_call_assembler_unbox_int(unbox_int_for_force);
-            // resume.py:763-870 VStr/VUni.allocate parity — Cranelift
+            // resume.py VStr/VUni.allocate parity — Cranelift
             // backend's materialize_virtual_recursive invokes these
             // callbacks so that bridge-input refs and call_assembler
             // blackhole inputs (compiler.rs) receive materialized string
@@ -1777,7 +1777,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_cranelift::register_materialize_str_call(
                 materialize_str_call_for_cranelift,
             );
-            // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
+            // rpython/jit/backend/llsupport/llmodel.py insert_stack_check
             // parity. Cranelift consumes these addresses to emit the same
             // load/sub/cmp fast path as dynasm, using a stack-slot address as
             // its current-stack approximation and calling slowpath only on miss.
@@ -1801,7 +1801,7 @@ pub fn install_jit_call_bridge() {
             );
             majit_backend_dynasm::register_jitframe_layout(jitframe_layout_info_dynasm());
             majit_backend_dynasm::register_call_assembler_unbox_int(unbox_int_for_force);
-            // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
+            // rpython/jit/backend/llsupport/llmodel.py insert_stack_check
             // parity. The backend inlines MOV [endaddr]; SUB rsp; CMP [lengthaddr]
             // in every JIT prologue and calls slowpath_addr on miss.
             majit_backend_dynasm::register_stack_check_addresses(
@@ -1813,7 +1813,7 @@ pub fn install_jit_call_bridge() {
     });
 }
 
-/// compile.py:701-716 handle_fail → resume_in_blackhole parity.
+/// compile.py handle_fail → resume_in_blackhole parity.
 ///
 /// RPython: guard failure always resumes via jitcode-level blackhole
 /// (blackhole_from_resumedata → _run_forever). There is no IR-level
@@ -1874,7 +1874,7 @@ fn ca_complete_after_bridge_walk(
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
     }
 
-    // raise_continue_running_normally parity (pyjitpl.py:3048-3091 +
+    // raise_continue_running_normally parity (pyjitpl.py +
     // warmspot.py:970-983): the CA bridge walk committed its end-of-walk
     // state into the live callee frame and the frame adopted it. The walk
     // already executed the resumed region's effects concretely, so a
@@ -2032,7 +2032,7 @@ fn jit_blackhole_resume_from_guard(
     // When rd_numb is present, use ResumeDataDirectReader to decode
     // frame sections precisely, matching RPython blackhole_from_resumedata.
     //
-    // compile.py:853 guard-owned `ResumeGuardDescr` storage — share the
+    // compile.py guard-owned `ResumeGuardDescr` storage — share the
     // pool through `Arc<ResumeStorage>` so blackhole resume reads the
     // same `rd_consts` the GC root walker updates. No owned-Vec copy.
     // resume.py parity: deadframe_types tells decode_ref() whether a TAGBOX
@@ -2053,9 +2053,9 @@ fn jit_blackhole_resume_from_guard(
         }
         // resume.py:922 storage.rd_consts: the decoder borrows the shared
         // pool; TAGCONST Ref entries stay visible to `walk_rd_consts_refs`.
-        // resume.py:924 _prepare_pendingfields(storage.rd_pendingfields):
+        // resume.py _prepare_pendingfields(storage.rd_pendingfields):
         // deferred field writes must be replayed before consume_vref_and_vable.
-        // blackhole.py:1794 `current_exc = _prepare_resume_from_failure(
+        // blackhole.py `current_exc = _prepare_resume_from_failure(
         // guard_opnum, deadframe)`. The backend trampoline grabbed
         // `jf_guard_exc` off the jitframe (`cpu.grab_exc_value`,
         // llmodel.py:240) and threaded it through the C-ABI `guard_exc`
@@ -2064,7 +2064,7 @@ fn jit_blackhole_resume_from_guard(
         // callee delivers its pending exception to the blackhole resume
         // instead of resuming the no-exception continuation with a NULL
         // result.
-        // compile.py:950-958 `ResumeGuardForcedDescr.handle_fail` fishes the
+        // compile.py `ResumeGuardForcedDescr.handle_fail` fishes the
         // cache `handle_async_forcing` saved; no other `handle_fail` does.
         // `fail_values[0]` IS the callee's `PyFrame*` for the Python portal
         // (the entry-green-key recovery above relies on the same contract), so
@@ -2220,7 +2220,7 @@ impl Drop for BareRefRoot {
     }
 }
 
-/// `blackhole.py:1679-1682 _exit_frame_with_exception`:
+/// `blackhole.py _exit_frame_with_exception`:
 ///
 /// ```python
 /// e = cast_opaque_ptr(GCREF, e)
@@ -2314,7 +2314,7 @@ fn reject_non_exception_channel_value(
     );
 }
 
-/// `executioncontext.py:91-107 ExecutionContext.leave`'s frame-chain half, for a
+/// `executioncontext.py ExecutionContext.leave`'s frame-chain half, for a
 /// frame a blackhole resumed into and has now finished.
 ///
 /// The profile-hook half (`if self.profilefunc: self._trace(frame,
@@ -2342,7 +2342,7 @@ fn leave_resumed_blackhole_frame(
     ) {
         return;
     }
-    // executioncontext.py:91-107 `leave`: a guard-failure blackhole resumes
+    // executioncontext.py `leave`: a guard-failure blackhole resumes
     // inside a frame whose `enter` already ran in compiled code. Advancing to
     // `nextblackholeinterp` therefore has to close that still-open scope. The
     // resume-data frame chain itself is not the application frame chain, and
@@ -2365,7 +2365,7 @@ fn leave_resumed_blackhole_frame(
     }
 }
 
-/// resume.py:1312 blackhole_from_resumedata parity:
+/// resume.py blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
 pub fn blackhole_resume_via_rd_numb(
@@ -2376,13 +2376,13 @@ pub fn blackhole_resume_via_rd_numb(
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     deadframe_types: Option<&[majit_ir::Type]>,
     guard_exc: i64,
-    // compile.py:990 `vinfo = self.jitdriver_sd.virtualizable_info`: a novable
+    // compile.py `vinfo = self.jitdriver_sd.virtualizable_info`: a novable
     // jitdriver (jd1 `unpackiterable_driver`) has `vinfo=None`, so its resume
     // data carries no vable section. Decoding with the (jd0) vinfo would try to
     // consume a phantom vable and dereference garbage; a novable resume passes
     // `None` for both the vinfo and the per-frame virtualizable handle.
     novable: bool,
-    // compile.py:956-958 — the cache `handle_async_forcing` already
+    // compile.py — the cache `handle_async_forcing` already
     // materialized, when this resume is the GUARD_NOT_FORCED that follows a
     // force. `None` for every other guard.
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
@@ -2477,7 +2477,7 @@ pub fn blackhole_resume_via_rd_numb(
     let deadframe_roots = ResumeDeadframeRoots::register(&mut deadframe_buf, deadframe_types);
     let deadframe: &[i64] = &deadframe_buf;
 
-    // resume.py:983-991 _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
+    // resume.py _prepare_virtuals: convert RdVirtualInfo → VirtualInfo
     // for lazy materialization in getvirtual_ptr/getvirtual_int.
     let count = deadframe.len() as i32;
     let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> = rd_virtuals.map(|rd_virts| {
@@ -2489,7 +2489,7 @@ pub fn blackhole_resume_via_rd_numb(
     });
     let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
-    // resume.py:1312-1343 blackhole_from_resumedata:
+    // resume.py blackhole_from_resumedata:
     // ResumeDataDirectReader decodes rd_numb, builds BH chain.
     // compile.py:990 parity: vinfo = self.jitdriver_sd.virtualizable_info —
     // read the active driver's cached Arc instead of rebuilding a fresh
@@ -2507,7 +2507,7 @@ pub fn blackhole_resume_via_rd_numb(
         if novable { None } else { Some(vinfo_dyn) };
     let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
     let allocator = crate::eval::PyreBlackholeAllocator;
-    // resume.py:1022 `self.metainterp_sd.liveness_info` — the one pool, for
+    // resume.py `self.metainterp_sd.liveness_info` — the one pool, for
     // every driver. A novable drain frame's `-live-` markers carry offsets
     // baked at extraction into the build-time byte stream; those bytes are the
     // prefix of this buffer (`Assembler::resuming_build_time_liveness`), so a
@@ -2546,7 +2546,7 @@ pub fn blackhole_resume_via_rd_numb(
         return BlackholeResult::Failed;
     };
 
-    // resume.py:1404: virtualizable_ptr was read by consume_vable_info
+    // resume.py: virtualizable_ptr was read by consume_vable_info
     // from the vable section. Set on the blackhole for vable bytecodes.
     // A novable resume runs no vable opcodes, so leave both the pointer and
     // the vinfo handle unset (null) instead of borrowing jd0's.
@@ -2568,12 +2568,12 @@ pub fn blackhole_resume_via_rd_numb(
     // registered pins the object it happened to hold at the guard, whether or
     // not the resumed code still uses it.  A `for v in gen(): break` leaves the
     // abandoned generator in such a cell, so it is never collected and its
-    // `finally` never runs.  `blackhole.py:1782-1796 resume_in_blackhole` ends
+    // `finally` never runs.  `blackhole.py resume_in_blackhole` ends
     // `deadframe`'s live range at `_prepare_resume_from_failure`, before
     // `_run_forever`, for the same reason.
     drop(deadframe_roots);
     drop(caller_deadframe_roots);
-    // resume.py:1332-1343 builds the caller chain (`nextblackholeinterp`)
+    // resume.py builds the caller chain (`nextblackholeinterp`)
     // but does not set the virtualizable-info handle on each frame.  pyre
     // stores the vinfo per-`BlackholeInterpreter` (RPython reads it from
     // the field descriptor `blackhole.py:1374 fielddescr.get_vinfo()`, a
@@ -2582,7 +2582,7 @@ pub fn blackhole_resume_via_rd_numb(
     // down the whole chain, mirroring the forward-exec inheritance
     // `self.virtualizable_info = parent.virtualizable_info` performed when
     // a frame enters a callee.
-    // blackhole.py:1095-1099 get_portal_runner parity:
+    // blackhole.py get_portal_runner parity:
     //   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
     //   fnptr        = adr2int(jitdriver_sd.portal_runner_adr)
     //   calldescr    = jitdriver_sd.mainjitcode.calldescr
@@ -2629,7 +2629,7 @@ pub fn blackhole_resume_via_rd_numb(
     // Portal red-arg registers (`pypy/module/pypyjit/interp_jit.py:67
     // reds = ['frame', 'ec']`) are filled per-frame by
     // `consume_one_section` from each section's `-live-` op (resume.py
-    // :1381 / `_prepare_next_section` resume.py:1017). RPython's vable
+    // :1381 / `_prepare_next_section` resume.py). RPython's vable
     // bytecodes use that live frame red directly. Pyre's blackhole vable
     // handlers instead address `BlackholeInterpreter::virtualizable_ptr`,
     // so bind that Pyre-only cache from EACH frame's own red register.
@@ -2695,13 +2695,13 @@ pub fn blackhole_resume_via_rd_numb(
     // unsupported opcode) and the two declined-call rejections (whose call
     // never ran) — so the frame the blackhole leaves behind is a valid resume
     // point and the interpreter continues from it.  This is
-    // `convert_and_run_from_pyjitpl`'s shape (`blackhole.py:1799-1821`): each
+    // `convert_and_run_from_pyjitpl`'s shape (`blackhole.py`): each
     // frame resumes at its own current pc, never rewound.
 
-    // blackhole.py:1794-1795 resume_in_blackhole:
+    // blackhole.py resume_in_blackhole:
     //   current_exc = _prepare_resume_from_failure(guard_opnum, deadframe)
     //   _run_forever(blackholeinterp, current_exc)
-    // `_resume_mainloop` prologue (blackhole.py:1614-1618): when the guard
+    // `_resume_mainloop` prologue (blackhole.py): when the guard
     // failure carries a pending exception (GUARD_NO_EXCEPTION /
     // GUARD_EXCEPTION / GUARD_NOT_FORCED → `cpu.grab_exc_value(deadframe)`),
     // hand it to the resumed frame before running any bytecode so an
@@ -2716,7 +2716,7 @@ pub fn blackhole_resume_via_rd_numb(
                 // Fall through to the run loop to execute the handler.
                 break;
             }
-            // blackhole.py:1616 no handler here → propagate to the caller.
+            // blackhole.py no handler here → propagate to the caller.
             let next = bh.nextblackholeinterp.take();
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
@@ -2765,7 +2765,7 @@ pub fn blackhole_resume_via_rd_numb(
                         match jitcode_index {
                             // Every indexed frame recorded during blackhole
                             // propagation goes through the guarded recorder;
-                            // `pyopcode.py:147-148 handle_operation_error` is
+                            // `pyopcode.py handle_operation_error` is
                             // upstream's single traceback attach point.
                             Some(jitcode_index) => record_caught_blackhole_traceback(
                                 err.exc_object as i64,
@@ -2805,7 +2805,7 @@ pub fn blackhole_resume_via_rd_numb(
         }
     }
 
-    // blackhole.py:1752 _run_forever parity.
+    // blackhole.py _run_forever parity.
     loop {
         // `_resume_mainloop` can hand an unhandled exception to a suspended
         // caller by setting `got_exception` below. Propagate that state before
@@ -2882,7 +2882,7 @@ pub fn blackhole_resume_via_rd_numb(
             // mark-sweep, so an unrooted one in that window is collectable and
             // its block reusable — which is what hands
             // `exit_frame_exception_ref` a mapped object of the wrong class.
-            // `blackhole.py:1752 _run_forever` keeps every interp in the chain
+            // `blackhole.py _run_forever` keeps every interp in the chain
             // — and with it `exception_last_value` — transitively traced for
             // its whole life; root the value across the equivalent window.
             let _exc_roots = pyre_object::gc_roots::push_roots();
@@ -3045,7 +3045,7 @@ pub fn blackhole_resume_via_rd_numb(
         let next = bh.nextblackholeinterp.take();
         let caller = next.map(|b| *b);
         if caller.is_none() {
-            // blackhole.py:1664-1677 _done_with_this_frame
+            // blackhole.py _done_with_this_frame
             let result = match rt {
                 BhReturnType::Void => BlackholeResult::DoneWithThisFrameVoid,
                 BhReturnType::Int => BlackholeResult::DoneWithThisFrameInt(bh.get_tmpreg_i()),
@@ -3072,9 +3072,9 @@ pub fn blackhole_resume_via_rd_numb(
     }
 }
 
-/// warmspot.py:961-1007 handle_jitexception parity.
+/// warmspot.py handle_jitexception parity.
 ///
-/// RPython captures result_kind in closure (warmspot.py:913). For pyre,
+/// RPython captures result_kind in closure (warmspot.py). For pyre,
 /// portal result_type == REF (warmspot.py:449), so ALL CALL_ASSEMBLER
 /// ops use _R. The result is always a Ref (PyObjectRef).
 fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Option<i64> {
@@ -3138,7 +3138,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
         } => {
             // warmspot.py:972-975: portalfunc_ARGS extraction.
             // Build merged arg lists: all_i = gi + ri, all_r = gr + rr, all_f = gf + rf.
-            // warmstate.py:41 unspecialize_value: Ref→GCREF(i64), Float→FLOATSTORAGE(i64).
+            // warmstate.py unspecialize_value: Ref→GCREF(i64), Float→FLOATSTORAGE(i64).
             let mut all_i = green_int;
             all_i.extend(&red_int);
             let mut all_r: Vec<i64> = green_ref.iter().map(|r| *r as i64).collect();
@@ -3215,12 +3215,12 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
 /// Derive the (`green_key`, `trace_id`, `fail_index`) bridge-source identity
 /// strictly from the failing guard's descr Arc.
 ///
-/// `pyjitpl.py:2914 handle_guard_failure(self, resumedescr, deadframe)`
+/// `pyjitpl.py handle_guard_failure(self, resumedescr, deadframe)`
 /// reads identity from `resumedescr` directly: `resumedescr.rd_loop_token
 /// .loop_token_wref()` (line 2897) yields the owning `JitCellToken`,
 /// `resumedescr.get_resumestorage()` (line 2893) yields the `ResumeGuardDescr`
 /// carrying the per-trace `fail_index`, and `record_loop_or_bridge`
-/// (`compile.py:183-185`) stamps `trace_id` onto each `ResumeDescr`.
+/// (`compile.py`) stamps `trace_id` onto each `ResumeDescr`.
 /// Pyre's `descr_owning_jct(arc).green_key`, `arc.fail_index_per_trace()`
 /// and `arc.trace_id()` are the line-by-line equivalents — together they
 /// constitute the canonical bridge-source identity.
@@ -3245,7 +3245,7 @@ pub(crate) fn bridge_source_identity_from_descr(
 
 /// Outcome of `trace_and_compile_from_bridge`.
 ///
-/// `pyjitpl.py:2914 handle_guard_failure` never returns — it raises
+/// `pyjitpl.py handle_guard_failure` never returns — it raises
 /// `ContinueRunningNormally` (bridge attached, resume in compiled code),
 /// switches to the blackhole, or raises `DoneWithThisFrame` when
 /// `interpret()` runs the resumed frames forward to a `Finish`.  Pyre
@@ -3265,7 +3265,7 @@ pub enum BridgeResolution {
     Finished(pyre_jit_trace::state::ConcreteValue),
     /// The single-frame bridge walk ended in an uncaught raise; hand its
     /// concrete exception to the guard's portal as
-    /// `ExitFrameWithExceptionRef` (jitexc.py:44).
+    /// `ExitFrameWithExceptionRef` (jitexc.py).
     FinishedException(pyre_jit_trace::state::ConcreteValue),
 }
 
@@ -3279,12 +3279,12 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
     }
 }
 
-/// compile.py:714 (_trace_and_compile_from_bridge):
+/// compile.py (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
 /// Traces the alternative path from the guard failure point and compiles
 /// a bridge.
 ///
-/// pyjitpl.py:2914 handle_guard_failure:
+/// pyjitpl.py handle_guard_failure:
 ///   initialize_state_from_guard_failure(resumedescr, deadframe)
 ///   prepare_resume_from_failure(deadframe, inputargs, resumedescr, excdata)
 ///   self.interpret()
@@ -3292,12 +3292,12 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
 /// The tracing loop mirrors pyjitpl.py interpret(): execute bytecodes
 /// from the guard failure PC until a Finish (return) or CloseLoop
 /// (back-edge to loop header) is reached.
-/// compile.py:714 _trace_and_compile_from_bridge parity.
+/// compile.py _trace_and_compile_from_bridge parity.
 ///
 /// Returns [`BridgeResolution`]: `CompiledContinue` when the bridge was
 /// compiled and attached, `ResumeBlackhole` on a trace abort / start
 /// failure so the caller falls through to resume_in_blackhole (RPython
-/// pyjitpl.py:2906-2907 SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing),
+/// pyjitpl.py SwitchToBlackhole → run_blackhole_interp_to_cancel_tracing),
 /// or `Finished(cv)` when a single-frame walk ran forward to a `Finish`
 /// (`interpret()` raising `DoneWithThisFrame`).
 ///
@@ -3309,14 +3309,14 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
 #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 #[majit_macros::dont_look_inside]
 pub fn trace_and_compile_from_bridge(
-    // pyjitpl.py:2914 `handle_guard_failure(self, resumedescr, deadframe)`
+    // pyjitpl.py `handle_guard_failure(self, resumedescr, deadframe)`
     // threads `resumedescr` (the descr) as the canonical identity source
     // through the entire bridge tracer.  Pyre's backend FailDescr Arc
     // plays the same role: `descr_owning_jct(arc).green_key` (mirroring
     // `pyjitpl.py:2897 resumedescr.rd_loop_token.loop_token_wref()`),
     // `arc.fail_index_per_trace()` (mirroring `compile.py:854
     // ResumeGuardDescr._attrs_`), and `arc.trace_id()` (mirroring the
-    // `compile.py:183-185 record_loop_or_bridge` stamp) are the line-by-
+    // `compile.py record_loop_or_bridge` stamp) are the line-by-
     // line readers.  Both production callers — the general guard path
     // (eval.rs `handle_fail`) and the CALL_ASSEMBLER bridge entry
     // (call_jit.rs `jit_ca_handle_guard_failure`) — have an Arc available
@@ -3329,7 +3329,7 @@ pub fn trace_and_compile_from_bridge(
     frame: &mut PyFrame,
     raw_values: &[i64],
     exit_layout: &majit_metainterp::CompiledExitLayout,
-    // `cpu.grab_exc_value(deadframe)` (llmodel.py:240): the pending
+    // `cpu.grab_exc_value(deadframe)` (llmodel.py): the pending
     // exception this guard failure carries, or 0. Threaded so the bridge
     // tracer can decline a pending-exception resume at a non-exception
     // guard (the `pending_exc` decline below).
@@ -3377,7 +3377,7 @@ pub fn trace_and_compile_from_bridge(
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
 
-    // compile.py:950-953 `ResumeGuardForcedDescr.handle_fail`: "Failures of
+    // compile.py `ResumeGuardForcedDescr.handle_fail`: "Failures of
     // a GUARD_NOT_FORCED are never compiled, but always just blackholed."
     // A bridge walked from one force flavor (pure force, live call result)
     // would also be entered for forced-and-raised failures whose call result
@@ -3385,7 +3385,7 @@ pub fn trace_and_compile_from_bridge(
     if descr_arc.is_guard_forced() {
         return BridgeResolution::ResumeBlackhole;
     }
-    // compile.py:702-703 `must_compile() and not stack_almost_full()`: this is
+    // compile.py `must_compile() and not stack_almost_full()`: this is
     // pyre's own guard-failure entry, so the diagnostic that suppresses bridge
     // recording has to be read here as well as in the jitdriver's paths.
     if majit_metainterp::no_bridge_enabled() {
@@ -3393,7 +3393,7 @@ pub fn trace_and_compile_from_bridge(
     }
     let Some((green_key, trace_id, fail_index)) = bridge_source_identity_from_descr(descr_arc)
     else {
-        // compile.py:725-729 `_trace_and_compile_from_bridge` raises
+        // compile.py `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when `loop_token` is None (memmgr-evicted).
         // Pyre signals the same outcome by returning `false`, dropping
         // the caller into `resume_in_blackhole` (pyjitpl.py:711).
@@ -3405,10 +3405,10 @@ pub fn trace_and_compile_from_bridge(
         info
     };
 
-    // pyjitpl.py:2914-2935 handle_guard_failure parity:
+    // pyjitpl.py handle_guard_failure parity:
     // RPython creates a fresh MetaInterp and calls
     // initialize_state_from_guard_failure(resumedescr, deadframe)
-    // which internally calls rebuild_from_resumedata (resume.py:1042).
+    // which internally calls rebuild_from_resumedata (resume.py).
     // This restores the complete frame stack INSIDE the bridge function.
     let meta = {
         let (driver, _) = crate::eval::driver_pair();
@@ -3489,8 +3489,8 @@ pub fn trace_and_compile_from_bridge(
         }
         return BridgeResolution::ResumeBlackhole;
     }
-    // `_prepare_exception_resumption` (pyjitpl.py:3101) +
-    // `prepare_resume_from_failure` (pyjitpl.py:3132) parity: for exception
+    // `_prepare_exception_resumption` (pyjitpl.py) +
+    // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception
     // guard bridges (GUARD_EXCEPTION / GUARD_NO_EXCEPTION), SAVE_EXC_CLASS +
     // SAVE_EXCEPTION at trace start, then RESTORE_EXCEPTION before the guard.
     // The walker owns that whole sequence — it emits it at the bridge-entry
@@ -3732,7 +3732,7 @@ pub fn trace_and_compile_from_bridge(
     // word so PyFrame's custom trace can forward `locals_cells_stack_w`.
     let mut bridge_frame_root = FrameRoot::new(frame);
 
-    // pyjitpl.py:2841 interpret(): after start_retrace_from_guard, RPython
+    // pyjitpl.py interpret(): after start_retrace_from_guard, RPython
     // runs a single interpret() over the resumed frame state until the
     // bridge closes or aborts. `trace_bytecode` is the pyre equivalent of
     // that whole-loop interpreter; calling it once preserves the concrete PC
@@ -3760,7 +3760,7 @@ pub fn trace_and_compile_from_bridge(
     // below) stay in agreement and a committed journal never strands into a
     // blackhole re-run.
     //
-    // `pyjitpl.py:2947` `interpret()` "should always raise": a resumed trace
+    // `pyjitpl.py` `interpret()` "should always raise": a resumed trace
     // that runs its frames forward to a return raises `DoneWithThisFrame`
     // from the POST-walk state, whatever the resume's frame count — there is
     // no rewind-to-the-deadframe re-run upstream.  A multi-frame resume walks
@@ -3815,7 +3815,7 @@ pub fn trace_and_compile_from_bridge(
                     live_frame_addr,
                     false,
                 );
-                // pyjitpl.py:3048-3091 raise_continue_running_normally:
+                // pyjitpl.py raise_continue_running_normally:
                 // a bridge walk that closed at a merge point and committed
                 // its end-of-walk state into the trace snapshot
                 // (`flush_walk_end_state_to_frame`) hands the LIVE frame
@@ -3852,7 +3852,7 @@ pub fn trace_and_compile_from_bridge(
     // `ContinueRunningNormally` re-entry — would apply them a second time.
     // Hand the concrete result forward as `DoneWithThisFrame` instead,
     // mirroring the top-level portal (eval.rs `maybe_compile_and_run`) and
-    // `pyjitpl.py:2841` `interpret()` raising `DoneWithThisFrame` from the
+    // `pyjitpl.py` `interpret()` raising `DoneWithThisFrame` from the
     // post-walk state.  Always take (not peek) so a kept stash cannot leak
     // into a later top-level portal `fbw_finish_concrete_take`.
     //
@@ -3988,7 +3988,7 @@ pub fn trace_and_compile_from_bridge(
     // (or aborted) inside merge_point. Check whether a bridge was
     // actually attached to distinguish success from abort.
     //
-    // pyjitpl.py:3057 raise_continue_running_normally: a trace that
+    // pyjitpl.py raise_continue_running_normally: a trace that
     // reached a merge point exits with ContinueRunningNormally from the
     // CURRENT state — never through the blackhole-from-guard path. A
     // committed walk already executed the region and the live frame
@@ -4039,11 +4039,11 @@ pub fn trace_and_compile_from_bridge(
     bridge_resolution_from_bool(adopted_walk_end_state)
 }
 
-/// compile.py:701-717 handle_fail for call_assembler guard failures.
+/// compile.py handle_fail for call_assembler guard failures.
 /// Checks must_compile (jitcounter.tick), and if threshold reached,
 /// traces the alternate path via trace_and_compile_from_bridge.
 ///
-/// pyjitpl.py:2914 `handle_guard_failure(self, resumedescr, deadframe)`
+/// pyjitpl.py `handle_guard_failure(self, resumedescr, deadframe)`
 /// — descr identity is the only argument crossing the C-ABI boundary;
 /// the receiver derives `(green_key, trace_id, fail_index)` from the
 /// recovered Arc, mirroring `compile.py:706-708 _trace_and_compile_
@@ -4078,14 +4078,14 @@ fn jit_ca_handle_guard_failure(
     let raw_values_input = unsafe { std::slice::from_raw_parts(raw_values_ptr, num_values) };
     let mut raw_values_vec = raw_values_input.to_vec();
 
-    // compile.py:706-708 _trace_and_compile_from_bridge.  Native CA code
+    // compile.py _trace_and_compile_from_bridge.  Native CA code
     // crosses the backend boundary with only the raw descr pointer; recover
     // the backend FailDescr Arc before any guard-failure routing so identity
     // is read from the descr just like PyPy reads `resumedescr`.  The
     // recovery is infallible for live JIT code —
     // `Backend::fail_descr_arc_from_addr` panics if the raw value is not
     // a live `FailDescrCell` pointer, matching RPython's
-    // `cpu.get_latest_descr(deadframe)` (warmspot.py:1021) which has no
+    // `cpu.get_latest_descr(deadframe)` (warmspot.py) which has no
     // failure mode.  `trace_and_compile_from_bridge` itself takes only
     // the descr Arc.
     let descr_arc: std::sync::Arc<dyn majit_ir::Descr> = {
@@ -4118,14 +4118,14 @@ fn jit_ca_handle_guard_failure(
         return false;
     }
 
-    // compile.py:738-784 must_compile: jitcounter.tick(guard_hash, increment)
+    // compile.py must_compile: jitcounter.tick(guard_hash, increment)
     let (must_compile, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();
         driver
             .meta_interp_mut()
             .must_compile_with_values(&descr_arc, raw_values, source_green_key)
     };
-    // compile.py:702-703: must_compile() and not stack_almost_full()
+    // compile.py: must_compile() and not stack_almost_full()
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
         return false;
     }
@@ -4137,7 +4137,7 @@ fn jit_ca_handle_guard_failure(
         );
     }
 
-    // compile.py:719-726: get exit_layout from the compiled trace.
+    // compile.py: get exit_layout from the compiled trace.
     // Use owning_key (not green_key) — after retrace the descriptor
     // may belong to a different compiled entry than green_key.
     let exit_layout = {
@@ -4161,10 +4161,10 @@ fn jit_ca_handle_guard_failure(
     }
     let frame = unsafe { &mut *frame_ptr };
 
-    // compile.py:704-709 try/finally: `start_compiling()` before
+    // compile.py try/finally: `start_compiling()` before
     // bridge, `done_compiling()` on every unwind path.  RAII guard
     // dispatches both via `descr.as_fail_descr()` (instance-method
-    // dispatch per `compile.py:786-795`); drop pairs `done_compiling`
+    // dispatch per `compile.py`); drop pairs `done_compiling`
     // with the matching `start_compiling` even on panic.
     let compiled = {
         let _guard = crate::eval::GuardCompilingScope::new(&descr_arc);
@@ -4191,7 +4191,7 @@ fn jit_ca_handle_guard_failure(
             }
         }
     };
-    // compile.py:204-207 record_loop_or_bridge registers every bridge's dependencies.
+    // compile.py record_loop_or_bridge registers every bridge's dependencies.
     crate::eval::register_quasi_immutable_deps(source_green_key);
 
     if majit_metainterp::majit_log_enabled() {
@@ -4335,7 +4335,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             .expect("CA deopt: get_latest_descr_arc returned a non-FailDescr Descr");
         if descr.is_finish() {
             let result = backend.get_ref_value(&frame, 0).as_usize() as i64;
-            // compile.py:658-662 ExitFrameWithExceptionDescrRef parity: a FINISH
+            // compile.py ExitFrameWithExceptionDescrRef parity: a FINISH
             // descr is either DoneWithThisFrame (return the value) or
             // ExitFrameWithException (the callee raised; slot 0 holds the
             // exception). The self-recursive callee re-raised — propagate it
@@ -4424,7 +4424,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             {
                 return result;
             }
-            // compile.py:950-958 `ResumeGuardForcedDescr.handle_fail`: only a
+            // compile.py `ResumeGuardForcedDescr.handle_fail`: only a
             // GUARD_NOT_FORCED failure fishes the cache the force saved, keyed
             // by the callee frame `raw_values[0]` names.
             let forced_cache_owner = if descr_arc.is_guard_forced() {
@@ -4741,7 +4741,7 @@ pub extern "C" fn jit_drop_callee_frame(frame_ptr: i64) {
 /// Store a W_Root into a callee frame's `locals_cells_stack_w[idx]`.
 ///
 /// Residual helper for the inline back-edge CALL_ASSEMBLER writeback
-/// (do_recursive_call, pyjitpl.py:1579-1602): the callee's compiled
+/// (do_recursive_call, pyjitpl.py): the callee's compiled
 /// loop reads its locals from the frame object at entry, so the
 /// inlined prefix's register values are stored back through these
 /// helpers before the call. Plain store, same as `PyFrame::push`.
@@ -4836,7 +4836,7 @@ fn bh_call_self_recursive_portal(
 ///
 /// Convention: residual_call_r_r dispatches with
 /// args=[callable, null_or_self, arg0, ..., argN].  RPython
-/// `bhimpl_residual_call_r_r` (blackhole.py:1227) carries no frame —
+/// `bhimpl_residual_call_r_r` (blackhole.py) carries no frame —
 /// `cpu.bh_call_r(func, None, args_r, ...)` — and `bh_call_fn_impl` carries
 /// none either: it takes `space.getexecutioncontext()` and threads that
 /// through the dispatch, so no branch resolves a caller frame out of
@@ -5022,7 +5022,7 @@ bh_call_fn_arity!(bh_call_fn_14; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 
 /// CALL_KW residual shared body (`call_kw(callable, self_or_null,
 /// positional, kwnames)` HLOp → per-arity `residual_call_r_r`).  Carries no
-/// frame, like [`bh_call_fn_impl`]: `pyopcode.py:1402 CALL_FUNCTION_KW`
+/// frame, like [`bh_call_fn_impl`]: `pyopcode.py CALL_FUNCTION_KW`
 /// settles the C-profile question against its own frame and then calls the
 /// frameless `space.call_args(w_function, args)`, which is what a residual
 /// reaches.  Keyword resolution + the dispatched call run under
@@ -5100,12 +5100,12 @@ bh_call_kw_arity!(bh_call_kw_12; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 bh_call_kw_arity!(bh_call_kw_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
 
 /// blackhole.py:1224 bhimpl_residual_call: cpu.bh_call_r.
-/// RPython: cpu.bh_call_r (llmodel.py:816) invokes calldescr.call_stub_r
+/// RPython: cpu.bh_call_r (llmodel.py) invokes calldescr.call_stub_r
 /// directly — a plain function-pointer call, no portal_runner indirection.
 /// Only bhimpl_recursive_call_* (blackhole.py:1095) uses the portal
 /// runner to re-enter JIT.
 ///
-/// RPython `bhimpl_residual_call_r_r` (blackhole.py:1227) carries no
+/// RPython `bhimpl_residual_call_r_r` (blackhole.py) carries no
 /// frame: `cpu.bh_call_r(func, None, args_r, ...)`.  The user-function
 /// dispatch below reads `execution_context` and the recursive-portal probe
 /// walks the caller chain, so the parent frame is resolved here from the
@@ -5262,7 +5262,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
             };
         }
     }
-    // llmodel.py:822 bh_call_r — calldescr.call_stub_r is callable-type-agnostic.
+    // llmodel.py bh_call_r — calldescr.call_stub_r is callable-type-agnostic.
     // Hot path: Function callables dispatched directly here (builtin or user
     // code), matching call_user_function_plain so eval_frame_plain is used
     // and JIT is not re-entered from the blackhole.
@@ -5312,7 +5312,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         // when the callee is *statically* the portal graph.
         //
         // Re-entrant TRACING stays blocked where upstream blocks it, on the
-        // green key (`warmstate.py:473-477` JC_TRACING, mirrored by
+        // green key (`warmstate.py` JC_TRACING, mirrored by
         // `maybe_compile_and_run`'s `driver.is_tracing()`).
         //
         // Letting the callee re-enter the JIT also lets a nested compiled /
@@ -5366,7 +5366,7 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
 /// starargs, kwargs_or_null)` HLOp → `residual_call_r_r`).  Unpacks the
 /// `*` iterable and merges the `**` mapping through the shared
 /// `call::call_function_ex`, then dispatches.  Carries no frame, like
-/// [`bh_call_fn_impl`]: `pyopcode.py:1429 CALL_FUNCTION_EX` settles the
+/// [`bh_call_fn_impl`]: `pyopcode.py CALL_FUNCTION_EX` settles the
 /// C-profile question against its own frame and then calls the frameless
 /// `space.call_args(w_function, args)`, which is what a residual reaches.
 /// The nested Python call runs under `force_plain_eval` (blackhole.py:1225
@@ -5408,7 +5408,7 @@ pub extern "C" fn bh_call_function_ex_fn(
     }
 }
 
-/// `_load_global` residual (pyopcode.py:958-969).  Resolves the namespace via
+/// `_load_global` residual (pyopcode.py).  Resolves the namespace via
 /// the executing frame's `get_w_globals_storage()` when the live frame OWNS this
 /// `w_code` (`frame.pycode == w_code`) — honoring an `exec(code, ns)`
 /// frame-specific namespace — and falls back to the callee's own promoted
@@ -5445,14 +5445,14 @@ pub extern "C" fn bh_load_global_fn(
     let frame_anchor =
         unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame_ptr as *mut PyFrame) };
     let parent_frame_ptr = frame_anchor.live();
-    // pypy/interpreter/pyopcode.py:958-969 `_load_global`:
+    // pypy/interpreter/pyopcode.py `_load_global`:
     //   w_value = self.space.finditem_str(self.get_w_globals_storage(), varname)
     //   if w_value is None:
     //       w_value = self.get_builtin().getdictvalue(self.space, varname)
     //       if w_value is None:
     //           self._load_global_failed(w_varname)
     //
-    // `self.get_w_globals()` (pyframe.py:49) is the executing frame's own
+    // `self.get_w_globals()` (pyframe.py) is the executing frame's own
     // globals object: the per-frame globals an `exec(code, ns)` installs,
     // falling back to the code's bound globals when there is no override.
     // Use it whenever the live frame OWNS this `w_code`
@@ -5508,7 +5508,7 @@ pub extern "C" fn bh_load_global_fn(
         }
     }
 
-    // pyopcode.py:970 `_load_global_failed`: raise NameError.
+    // pyopcode.py `_load_global_failed`: raise NameError.
     let mut err = pyre_interpreter::PyError::new(
         pyre_interpreter::PyErrorKind::NameError,
         format!("name '{}' is not defined", varname),
@@ -5653,7 +5653,7 @@ pub extern "C" fn bh_load_from_dict_or_globals_fn(
 
 /// `LOAD_ATTR` / method-form `LOAD_ATTR` residual for the standalone
 /// (blackhole / deopt) per-CodeObject jitcode.  pyre's codewriter cannot
-/// rtype `getattr` into `getfield_gc` (`rclass.py:838 rtype_getattr`
+/// rtype `getattr` into `getfield_gc` (`rclass.py rtype_getattr`
 /// rewrites `getattr` → `getfield_gc` after rtyping; pyre has no rtyper),
 /// so the per-CodeObject jitcode lowers `LOAD_ATTR` to this residual call
 /// rather than `abort_permanent`. The full-body walker traces the emitted
@@ -6231,7 +6231,7 @@ pub extern "C" fn bh_with_except_start_fn(exit_func: i64, exit_self: i64, val: i
 }
 
 /// `LOAD_NAME` residual for the standalone (blackhole / deopt)
-/// per-CodeObject jitcode.  `pyopcode.py:945-955 LOAD_NAME` — when
+/// per-CodeObject jitcode.  `pyopcode.py LOAD_NAME` — when
 /// `getorcreatedebug().w_locals is not get_w_globals_storage()` the lookup
 /// tries `finditem_str(w_locals, varname)` first, then falls through
 /// to the `LOAD_GLOBAL` globals → builtins chain.  Delegates to the
@@ -6269,7 +6269,7 @@ pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: i64, namei: i64) -> i6
 }
 
 /// `STORE_NAME` residual for the standalone (blackhole / deopt)
-/// per-CodeObject jitcode.  `pyopcode.py:855-859 STORE_NAME` —
+/// per-CodeObject jitcode.  `pyopcode.py STORE_NAME` —
 /// `setitem_str(getorcreatedebug().w_locals, varname, w_newvalue)`.
 /// Delegates to the interpreter trait impl (`eval.rs
 /// store_name_value`), which routes non-dict mapping locals through
@@ -6310,7 +6310,7 @@ pub extern "C" fn bh_store_name_fn(frame_ptr: i64, w_name: i64, value: i64) -> i
 }
 
 /// `STORE_GLOBAL` residual for the standalone (blackhole / deopt)
-/// per-CodeObject jitcode.  `pyopcode.py:567 STORE_GLOBAL` writes the
+/// per-CodeObject jitcode.  `pyopcode.py STORE_GLOBAL` writes the
 /// value directly into `w_globals`, bypassing `w_locals`.  Delegates to
 /// the interpreter trait impl (`eval.rs store_global_value`), which
 /// routes through `w_dict_setitem_str` on the eagerly-resolved
@@ -6459,7 +6459,7 @@ pub extern "C" fn bh_box_int_fn(value: i64) -> i64 {
 /// `(frame: Ref, exc: Ref, cause: Ref) → Ref`.  The frame pointer is
 /// emitted explicitly by `Instruction::RaiseVarargs` (codewriter.rs)
 /// via `portal_frame_reg`, mirroring `bh_load_global_fn`'s frame-as-arg
-/// ABI.  `pyopcode.py:704-722 RAISE_VARARGS` runs inside an opcode
+/// ABI.  `pyopcode.py RAISE_VARARGS` runs inside an opcode
 /// dispatch where `frame` and `frame.execution_context` are always
 /// valid, so `frame_ptr == 0` here signals a wiring bug — fail fast
 /// at entry rather than degrade silently to a `RuntimeError`.
@@ -6498,7 +6498,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
         //
         // That class call runs Python.  `exc` arrives as a bare operand out of
         // compiled code and holds no root of its own, so bracket the call the
-        // way `framework.py:1501 get_livevars_for_roots` does — around the
+        // way `framework.py get_livevars_for_roots` does — around the
         // operation, not the function — and read the forwarded value back.
         let roots = pyre_object::gc_roots::push_roots();
         let exc_slot = roots.publish(&[exc]);
@@ -6521,7 +6521,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
         if pyre_object::is_exception(exc) {
             exc
         } else if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
-            // pyopcode.py:711-713 — `space.call_function(w_type)` does
+            // pyopcode.py — `space.call_function(w_type)` does
             // not depend on `frame.execution_context`; if the field is
             // null on a valid frame the class-call still proceeds.
             //
@@ -6606,7 +6606,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
     // appear to match — wrong for any clause beyond the first.
     if op_code == pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG {
         // Validate the match target is an exception class / tuple of exception
-        // classes first (`cmp_exc_match`, pyopcode.py:1034-1039), raising
+        // classes first (`cmp_exc_match`, pyopcode.py), raising
         // TypeError otherwise.  The BC handler runs
         // `validate_check_exc_match_class` before the bool-returning
         // `check_exc_match_against`, so the residual path must too — `except 5:`
@@ -6639,7 +6639,7 @@ pub extern "C" fn bh_compare_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
 
     // op_code 8 = IS_OP `is`, 9 = `is not` (from compare_op_tag).
     // `space.is_w`, not raw pointer identity: `W_AbstractIntObject.is_w`
-    // (`intobject.py:44`) and `W_FloatObject.is_w` (`floatobject.py:196`)
+    // (`intobject.py`) and `W_FloatObject.is_w` (`floatobject.py`)
     // compare two plain `int`s / `float`s by value, so a freshly boxed equal
     // value is identical.  Infallible — never publishes BH_LAST_EXC_VALUE.
     if op_code == 8 || op_code == 9 {
@@ -6697,7 +6697,7 @@ pub extern "C" fn bh_binary_op_fn(lhs: i64, rhs: i64, op_code: i64) -> i64 {
 }
 
 /// BUILD_TUPLE: `space.newtuple(list_w)` (`objspace.py:332` →
-/// `tupleobject.py:477` wraptuple) consuming a length-prefixed
+/// `tupleobject.py` wraptuple) consuming a length-prefixed
 /// `GcTypedArray` of refs — the forced `popvalues` list
 /// (`pyframe.py:408-419`).  Length travels inside the array (offset-0
 /// prefix), so there is no arity cap.  Allocation-only; the items are
@@ -7221,7 +7221,7 @@ pub extern "C" fn bh_unpack_ex_fn(before: i64, after: i64, seq: i64) -> i64 {
 
 /// Read the current (per-thread) exception saved in
 /// `pyre_interpreter::eval::CURRENT_EXCEPTION`. Matches the read at
-/// `pyopcode.py:786 PUSH_EXC_INFO` (implicit via `executioncontext.sys_exc_info`).
+/// `pyopcode.py PUSH_EXC_INFO` (implicit via `executioncontext.sys_exc_info`).
 pub extern "C" fn bh_get_current_exception() -> i64 {
     pyre_interpreter::eval::get_current_exception() as i64
 }
@@ -7250,8 +7250,8 @@ pub extern "C" fn bh_reraise_varargs_zero() -> i64 {
 }
 
 /// Store `exc` into the per-thread `CURRENT_EXCEPTION` slot. Matches
-/// the write at `pyopcode.py:778 POP_EXCEPT` (restore of saved
-/// sys_exc_info) and at `pyopcode.py:786 PUSH_EXC_INFO` (new raised
+/// the write at `pyopcode.py POP_EXCEPT` (restore of saved
+/// sys_exc_info) and at `pyopcode.py PUSH_EXC_INFO` (new raised
 /// exception becomes current).
 pub extern "C" fn bh_set_current_exception(exc: i64) {
     pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
@@ -7353,7 +7353,7 @@ pub fn cranelift_resumedata_deopt(
     let rd_virtuals_rcs = rgd.payload.rd_virtuals();
     let rd_pendingfields = rgd.payload.rd_pendingfields();
 
-    // 4. resume.py:983-991 _prepare_virtuals — convert RdVirtualInfo →
+    // 4. resume.py _prepare_virtuals — convert RdVirtualInfo →
     //    VirtualInfo so the decoder can materialise lazily.
     let count = outputs.len() as i32;
     let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> = rd_virtuals_rcs.map(|rcs| {

@@ -52,7 +52,7 @@ fn bytes_like(obj: PyObjectRef, function: &str) -> Result<Vec<u8>, PyError> {
     )))
 }
 
-/// PyPy `marshal_impl.py:104-120 marshal` buffer fallback.
+/// PyPy `marshal_impl.py marshal` buffer fallback.
 ///
 /// Heap types bypass all builtin marshallers, then any object satisfying a
 /// simple contiguous buffer request is written as `TYPE_STRING`.  Keep the
@@ -471,7 +471,7 @@ impl Rooted {
     }
 }
 
-/// PyPy `interp_marshal.py:70-101 FileReader`, with CPython 3.14's
+/// PyPy `interp_marshal.py FileReader`, with CPython 3.14's
 /// `readinto()` validation when that method is available.
 ///
 /// `wire::Read` requires the returned bytes to borrow from the reader, so each
@@ -1004,7 +1004,7 @@ crate::py_module! {
         "version" => wire::FORMAT_VERSION as i64,
     },
     inline_functions: {
-        // interp_marshal.py:33 `dumps(w_data, version=Py_MARSHAL_VERSION)` —
+        // interp_marshal.py `dumps(w_data, version=Py_MARSHAL_VERSION)` —
         // `value` / `version` positional-only, `allow_code` keyword-only
         // (the 3.13 accelerator signature `dumps(value, version, /, *,
         // allow_code=True)`).  `version` stays `Option` so an explicit
@@ -1021,7 +1021,7 @@ crate::py_module! {
             let out = marshal_to_bytes(value, version, allow_code)?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
         }
-        // interp_marshal.py:49 `loads(w_str)` — `bytes` positional-only,
+        // interp_marshal.py `loads(w_str)` — `bytes` positional-only,
         // `allow_code` keyword-only (`loads(bytes, /, *, allow_code=True)`).
         fn loads(
             data: PyObjectRef,
@@ -1033,7 +1033,7 @@ crate::py_module! {
             let data = bytes_like(data, "loads")?;
             unmarshal_bytes(&data, allow_code)
         }
-        // interp_marshal.py:26 `dump(w_data, w_f, version=Py_MARSHAL_VERSION)`
+        // interp_marshal.py `dump(w_data, w_f, version=Py_MARSHAL_VERSION)`
         // — writes the stream `dumps` would return to `f.write`
         // (`dump(value, file, version, /, *, allow_code=True)`).
         fn dump(
@@ -1051,7 +1051,7 @@ crate::py_module! {
             call_method(file, "write", &[bytes])?;
             Ok(w_none())
         }
-        // interp_marshal.py:40 `load(w_f)` reads one value from `f` and
+        // interp_marshal.py `load(w_f)` reads one value from `f` and
         // rewinds `f` past exactly the bytes consumed
         // (`load(file, /, *, allow_code=True)`).
         fn load(

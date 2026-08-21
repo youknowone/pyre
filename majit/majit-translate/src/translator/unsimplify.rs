@@ -368,7 +368,7 @@ pub fn split_block(block: &BlockRef, index: usize, _forcelink: Option<&[Hlvalue]
     };
 
     // Step 5: choose the synthetic link args. Upstream
-    // `unsimplify.py:86-114` either uses `linkargs = varmap.keys()` or,
+    // `unsimplify.py` either uses `linkargs = varmap.keys()` or,
     // with `_forcelink`, the explicit list supplied by the jit-merge
     // rewrite. Missing varmap members are legal only for Void variables:
     // upstream recreates them in the target block with

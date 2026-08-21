@@ -85,7 +85,7 @@ fn op_compare_digest(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_bool_from(result == 0))
 }
 
-/// `interp_operator.py:20 concat` — `a + b` for two subscriptable
+/// `interp_operator.py concat` — `a + b` for two subscriptable
 /// sequences.  Either operand missing `__getitem__` raises a bare
 /// `TypeError` with no message (`OperationError(space.w_TypeError,
 /// space.w_None)`); otherwise the result is `space.add(a, b)`.
@@ -105,7 +105,7 @@ fn op_concat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     add(args[0], args[1])
 }
 
-/// `interp_operator.py:204 iconcat` — `a += b` for two subscriptable
+/// `interp_operator.py iconcat` — `a += b` for two subscriptable
 /// sequences; either operand missing `__getitem__` is a TypeError that
 /// names the left operand.
 fn op_iconcat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -150,8 +150,8 @@ crate::py_module! {
     // builtin delegating to `space.sequence_count`; PyPy keeps it in
     // `app_operator.py`, but `_operator.c` ships `countOf` as a C function, so
     // the interp-level form matches that non-binding exposure.  `indexOf`
-    // likewise delegates to `space.sequence_index` (`interp_operator.py:58`);
-    // `concat` (`op_concat`, `interp_operator.py:20`) guards both operands for
+    // likewise delegates to `space.sequence_index` (`interp_operator.py`);
+    // `concat` (`op_concat`, `interp_operator.py`) guards both operands for
     // `__getitem__`.
     appleveldefs: {
         "app_operator.py" => [

@@ -1,6 +1,6 @@
 //! `#[jit_struct]` attribute macro — generic GcCache descriptor registration.
 //!
-//! RPython parity: descr.py:105-127 `get_size_descr` + descr.py:218-239
+//! RPython parity: descr.py `get_size_descr` + descr.py
 //! `get_field_descr`. RPython's translator walks `lltype.Struct` definitions
 //! and emits FieldDescr/SizeDescr automatically from the type layout; this
 //! macro plays the same auto-discovery role for Rust structs.
@@ -141,7 +141,7 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Classify a Rust field type into (IR Type, ArrayFlag).
 ///
-/// RPython parity: descr.py:240-254 `get_type_flag(FIELDTYPE)`:
+/// RPython parity: descr.py `get_type_flag(FIELDTYPE)`:
 ///   - `lltype.Ptr` with `_gckind == 'gc'`         → FLAG_POINTER  (Ref)
 ///   - `lltype.Ptr` otherwise (raw pointer)         → FLAG_UNSIGNED (Int)
 ///   - `lltype.Struct`                              → FLAG_STRUCT
@@ -161,7 +161,7 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     compile here anyway.
 fn classify_field_type(ty: &Type) -> (TokenStream, TokenStream) {
     // Raw pointers: `*const T` / `*mut T`.
-    // descr.py:243-246 — non-gc Ptr → FLAG_UNSIGNED (kept as Int bank because
+    // descr.py — non-gc Ptr → FLAG_UNSIGNED (kept as Int bank because
     // RPython stores the raw address in a signed-int slot).
     if matches!(ty, Type::Ptr(_)) {
         return (

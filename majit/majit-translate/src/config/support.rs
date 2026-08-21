@@ -9,7 +9,7 @@ use std::env;
 use std::fs;
 use std::process::Command;
 
-/// Upstream `support.py:7-29 detect_number_of_processors`. Returns the
+/// Upstream `support.py detect_number_of_processors`. Returns the
 /// number of processors to use as the `make -j` argument.
 ///
 /// Body shape mirrors upstream `:7-29` line-by-line:
@@ -83,7 +83,7 @@ pub fn detect_number_of_processors_with_path(filename: &str) -> i64 {
     }
 }
 
-/// Upstream `support.py:31-37 sysctl_get_cpu_count(cmd, name='hw.ncpu')`:
+/// Upstream `support.py sysctl_get_cpu_count(cmd, name='hw.ncpu')`:
 ///
 /// ```python
 /// def sysctl_get_cpu_count(cmd, name='hw.ncpu'):
@@ -147,7 +147,7 @@ fn read_cpu_count_from_cpuinfo(filename: &str) -> Option<i64> {
     max_id.map(|m| m + 1)
 }
 
-/// Upstream `support.py:39-50 detect_pax`. Returns `True` when the
+/// Upstream `support.py detect_pax`. Returns `True` when the
 /// running Linux kernel has PaX protection enabled. `support.py:46`
 /// reads `/proc/self/status` and checks the substring `"PaX"`. On
 /// non-Linux platforms upstream short-circuits to `False`.

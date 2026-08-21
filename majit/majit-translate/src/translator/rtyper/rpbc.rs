@@ -2,7 +2,7 @@
 //! method calls on `dyn Trait` receivers.
 //!
 //! RPython equivalent:
-//! `rpython/rtyper/rpbc.py:199-217 FunctionReprBase.call`. RPython's
+//! `rpython/rtyper/rpbc.py FunctionReprBase.call`. RPython's
 //! rtyper materialises the funcptr Variable via
 //! `convert_to_concrete_llfn` and then emits
 //! `genop('indirect_call', [funcptr, *args, c_graphs])` carrying the
@@ -48,7 +48,7 @@ use crate::translator::rtyper::rtyper::RPythonTyper;
 // the rtyper-orthodox `v.concretetype = lltype` write
 // (`rpython/rtyper/rtyper.py:258`).
 
-/// RPython `ConcreteCallTableRow(dict)` (rpbc.py:71-82).
+/// RPython `ConcreteCallTableRow(dict)` (rpbc.py).
 #[derive(Clone, Debug)]
 pub struct ConcreteCallTableRow {
     pub row: HashMap<DescKey, _ptr>,
@@ -93,7 +93,7 @@ impl PartialEq for ConcreteCallTableRow {
 
 impl Eq for ConcreteCallTableRow {}
 
-/// RPython `LLCallTable(object)` (rpbc.py:85-123).
+/// RPython `LLCallTable(object)` (rpbc.py).
 #[derive(Clone, Debug, Default)]
 pub struct LLCallTable {
     /// Upstream `self.table` keyed by `(shape, index)`.
@@ -158,7 +158,7 @@ impl LLCallTable {
     }
 }
 
-/// RPython `build_concrete_calltable(rtyper, callfamily)` (rpbc.py:125-157).
+/// RPython `build_concrete_calltable(rtyper, callfamily)` (rpbc.py).
 pub fn build_concrete_calltable(
     rtyper: &RPythonTyper,
     callfamily: &CallFamily,
@@ -192,7 +192,7 @@ pub fn build_concrete_calltable(
     Ok(llct)
 }
 
-/// RPython `small_cand(rtyper, s_pbc)` (rpbc.py:26-34).
+/// RPython `small_cand(rtyper, s_pbc)` (rpbc.py).
 ///
 /// ```python
 /// def small_cand(rtyper, s_pbc):
@@ -244,7 +244,7 @@ pub fn small_cand(rtyper: &RPythonTyper, s_pbc: &SomePBC) -> Result<bool, TyperE
     }
 }
 
-/// RPython `get_concrete_calltable(rtyper, callfamily)` (rpbc.py:159-174).
+/// RPython `get_concrete_calltable(rtyper, callfamily)` (rpbc.py).
 pub fn get_concrete_calltable(
     rtyper: &RPythonTyper,
     callfamily: &Rc<RefCell<CallFamily>>,
@@ -334,7 +334,7 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
     // pointer `IndirectCall` with `Some([])` as a deferred PBC-family marker.
     // At rtype time CallControl owns both the translated graphs and the
     // linker-resolved wrapper addresses, so fill the same `c_graphs` list
-    // `FunctionReprBase.call()` appends in rpbc.py:216.
+    // `FunctionReprBase.call()` appends in rpbc.py.
     let builtin_wrappers = call_control.builtin_wrapper_indirect_graphs();
     for block in &mut graph.blocks {
         for op in &mut block.operations {
@@ -396,7 +396,7 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
             } => (trait_root, method_name),
             _ => unreachable!("site filter mismatch"),
         };
-        // `rpbc.py:199-217 FunctionReprBase.call` assigns the call result's
+        // `rpbc.py FunctionReprBase.call` assigns the call result's
         // concretetype from the selected call-family row.  Use that family
         // result here as well: a dependency LLBC can expose a transparent
         // scalar wrapper only as an opaque declaration, while a local family
@@ -1142,21 +1142,21 @@ pub(crate) mod tests {
 // rpbc.py:177-994 — full PBC Repr hierarchy
 //
 // Concrete classes ported below mirror upstream's hierarchy:
-//   FunctionReprBase  (rpbc.py:177-221)  — shared base, composed-in
-//   FunctionRepr      (rpbc.py:315-371)  — single concrete function PBC
-//   FunctionsPBCRepr  (rpbc.py:224-313)  — multi-function PBC
-//   SmallFunctionSetPBCRepr (rpbc.py:393-516)
-//   SingleFrozenPBCRepr     (rpbc.py:635-662)
-//   MultipleUnrelatedFrozenPBCRepr (rpbc.py:675-711)
-//   MultipleFrozenPBCRepr   (rpbc.py:728-800)
-//   MethodOfFrozenPBCRepr   (rpbc.py:844-911)
+//   FunctionReprBase  (rpbc.py)  — shared base, composed-in
+//   FunctionRepr      (rpbc.py)  — single concrete function PBC
+//   FunctionsPBCRepr  (rpbc.py)  — multi-function PBC
+//   SmallFunctionSetPBCRepr (rpbc.py)
+//   SingleFrozenPBCRepr     (rpbc.py)
+//   MultipleUnrelatedFrozenPBCRepr (rpbc.py)
+//   MultipleFrozenPBCRepr   (rpbc.py)
+//   MethodOfFrozenPBCRepr   (rpbc.py)
 //   ClassesPBCRepr          (rclass-adjacent PBC dispatch)
 //   MethodsPBCRepr          (method PBC dispatch)
 //
 // Pyre composes rather than inherits — see [`FunctionReprBase`] for the
 // composition layout; each concrete struct embeds the shared base as a
 // field and overrides the lowleveltype + dispatch body.  Pair-type arms
-// (rpbc.py:373-633 `__extend__(pairtype(...))`) live alongside their
+// (rpbc.py `__extend__(pairtype(...))`) live alongside their
 // owning concrete reprs below.
 
 use crate::flowspace::model::{ConstValue, Constant, GraphKey, Hlvalue};
@@ -1166,7 +1166,7 @@ use crate::translator::rtyper::rmodel::{CanBeNull, Repr, ReprState};
 use std::rc::Weak;
 use std::sync::Arc;
 
-/// RPython `class FunctionReprBase(Repr)` (rpbc.py:177-221).
+/// RPython `class FunctionReprBase(Repr)` (rpbc.py).
 ///
 /// Shared state for every function-PBC repr. Concrete subclasses
 /// override `lowleveltype` and the call-dispatch `call()` body —
@@ -1206,7 +1206,7 @@ impl FunctionReprBase {
         // would have tripped the `assert len(descs) > 0` in the ctor.
         // `as_function()` yields the underlying FunctionDesc for both
         // FunctionDesc and MemoDesc (MemoDesc is-a FunctionDesc,
-        // description.py:395). MethodDesc / FrozenDesc /
+        // description.py). MethodDesc / FrozenDesc /
         // MethodOfFrozenDesc / ClassDesc also expose `getcallfamily` via
         // the base `Desc`, but only FunctionRepr needs the stored handle
         // today so those routes stay unpopulated until their concrete
@@ -1222,7 +1222,7 @@ impl FunctionReprBase {
         })
     }
 
-    /// RPython `FunctionReprBase.get_s_callable(self)` (rpbc.py:183-184).
+    /// RPython `FunctionReprBase.get_s_callable(self)` (rpbc.py).
     pub fn get_s_callable(&self) -> &SomePBC {
         &self.s_pbc
     }
@@ -1254,7 +1254,7 @@ impl FunctionReprBase {
                 "FunctionReprBase.get_s_signatures: s_pbc is empty",
             ));
         };
-        // MemoDesc is-a FunctionDesc (description.py:395), so accept its
+        // MemoDesc is-a FunctionDesc (description.py), so accept its
         // wrapped base via `as_function()`.
         let Some(rc) = entry.as_function() else {
             return Err(TyperError::message(
@@ -1267,7 +1267,7 @@ impl FunctionReprBase {
     }
 
     // Deferred ports — the remaining members of upstream
-    // `FunctionReprBase` (rpbc.py:193-217) are:
+    // `FunctionReprBase` (rpbc.py) are:
     //
     //   * `rtype_simple_call(self, hop)`
     //   * `rtype_call_args(self, hop)`
@@ -1281,7 +1281,7 @@ impl FunctionReprBase {
     // lands with the ExceptionData + callparse ports.
 }
 
-/// RPython `class FunctionRepr(FunctionReprBase)` (rpbc.py:315-369).
+/// RPython `class FunctionRepr(FunctionReprBase)` (rpbc.py).
 ///
 /// The repr for a statically known constant function — `SomePBC` with
 /// a single `FunctionDesc` and `can_be_None=False`. `lowleveltype` is
@@ -1397,7 +1397,7 @@ impl FunctionRepr {
         build_llfn_constant(&rtyper, &graph)
     }
 
-    /// RPython `FunctionRepr.get_unique_llfn(self)` (rpbc.py:338-360).
+    /// RPython `FunctionRepr.get_unique_llfn(self)` (rpbc.py).
     ///
     /// ```python
     /// def get_unique_llfn(self):
@@ -1521,7 +1521,7 @@ impl FunctionRepr {
                 "FunctionRepr.get_concrete_llfn: expected a single FunctionDesc",
             ));
         }
-        // MemoDesc is-a FunctionDesc (description.py:395): `as_function()`
+        // MemoDesc is-a FunctionDesc (description.py): `as_function()`
         // yields the wrapped base for both.
         let funcdesc_rc = match s_pbc
             .descriptions
@@ -1559,7 +1559,7 @@ impl FunctionRepr {
         build_llfn_constant(&rtyper, &graph)
     }
 
-    /// RPython `FunctionReprBase.call(self, hop)` (rpbc.py:199-221).
+    /// RPython `FunctionReprBase.call(self, hop)` (rpbc.py).
     /// FunctionRepr override — delegates to the shared free helper
     /// [`pbc_call_via_concrete_llfn`] with `FunctionRepr`'s
     /// `convert_to_concrete_llfn`.
@@ -1829,15 +1829,15 @@ impl Repr for FunctionRepr {
         ReprClassId::FunctionRepr
     }
 
-    /// RPython `FunctionReprBase.get_r_implfunc(self)` (rpbc.py:186-187) —
+    /// RPython `FunctionReprBase.get_r_implfunc(self)` (rpbc.py) —
     /// upstream `return self, 0`. Inherited by `FunctionRepr` via the
     /// `FunctionReprBase` base class.
     fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
         Ok((self, 0))
     }
 
-    /// RPython `FunctionReprBase.s_pbc` (rpbc.py:180) — exposed via the
-    /// trait so `MethodsPBCRepr.redispatch_call` (rpbc.py:1202) can
+    /// RPython `FunctionReprBase.s_pbc` (rpbc.py) — exposed via the
+    /// trait so `MethodsPBCRepr.redispatch_call` (rpbc.py) can
     /// supply `subset_of=r_func.s_pbc` when narrowing per-call SomePBC.
     fn pbc_s_pbc(&self) -> Option<&SomePBC> {
         Some(&self.base.s_pbc)
@@ -1879,7 +1879,7 @@ impl Repr for FunctionRepr {
     }
 
     /// RPython `FunctionReprBase.rtype_simple_call(self, hop)`
-    /// (rpbc.py:193-194) — `return self.call(hop)`. Inherited by
+    /// (rpbc.py) — `return self.call(hop)`. Inherited by
     /// `FunctionRepr` via `class FunctionRepr(FunctionReprBase)`.
     fn rtype_simple_call(
         &self,
@@ -1889,7 +1889,7 @@ impl Repr for FunctionRepr {
     }
 
     /// RPython `FunctionReprBase.rtype_call_args(self, hop)`
-    /// (rpbc.py:196-197) — `return self.call(hop)`. Inherited by
+    /// (rpbc.py) — `return self.call(hop)`. Inherited by
     /// `FunctionRepr` via `class FunctionRepr(FunctionReprBase)`.
     fn rtype_call_args(
         &self,
@@ -1918,26 +1918,26 @@ impl Repr for FunctionRepr {
 /// ```
 ///
 /// Pyre lands both the single-row case (one uniquerow → `lowleveltype =
-/// row.fntype`, rpbc.py:233-234) and the multi-row `setup_specfunc`
-/// branch (rpbc.py:235-239 → `Self::setup_specfunc(...)` below). The
-/// `CanBeNull` mixin (upstream rmodel.py:251-260 — `rtype_bool` via
+/// row.fntype`, rpbc.py) and the multi-row `setup_specfunc`
+/// branch (rpbc.py → `Self::setup_specfunc(...)` below). The
+/// `CanBeNull` mixin (upstream rmodel.py — `rtype_bool` via
 /// `ptr_nonzero`) is wired through `Self::rtype_bool` →
 /// `can_be_null_rtype_bool`.
 #[derive(Debug)]
 pub struct FunctionsPBCRepr {
-    /// Inherited state from `FunctionReprBase` (rpbc.py:178-181).
+    /// Inherited state from `FunctionReprBase` (rpbc.py).
     pub base: FunctionReprBase,
-    /// RPython `self.concretetable = llct.table` (rpbc.py:230).
+    /// RPython `self.concretetable = llct.table` (rpbc.py).
     pub concretetable: HashMap<(CallShape, usize), ConcreteCallTableRowRef>,
-    /// RPython `self.uniquerows = llct.uniquerows` (rpbc.py:231).
+    /// RPython `self.uniquerows = llct.uniquerows` (rpbc.py).
     pub uniquerows: Vec<ConcreteCallTableRowRef>,
-    /// RPython `self.lowleveltype = row.fntype` (rpbc.py:234) or the
-    /// deferred `self.setup_specfunc()` result (rpbc.py:239). Wrapped
+    /// RPython `self.lowleveltype = row.fntype` (rpbc.py) or the
+    /// deferred `self.setup_specfunc()` result (rpbc.py). Wrapped
     /// in `Ptr(...)` so the type is a function pointer as upstream —
     /// `row.fntype` is a `FuncType` and the pointer wrap mirrors
     /// `typeOf(llfn)` which returns `Ptr(FuncType)`.
     lltype: LowLevelType,
-    /// RPython `self.funccache = {}` (rpbc.py:240). Keyed on
+    /// RPython `self.funccache = {}` (rpbc.py). Keyed on
     /// `DescKey` (pointer-identity) matching `convert_desc`'s
     /// upstream `self.funccache[funcdesc]` lookup.
     pub funccache: RefCell<HashMap<DescKey, Constant>>,
@@ -1945,7 +1945,7 @@ pub struct FunctionsPBCRepr {
 }
 
 impl FunctionsPBCRepr {
-    /// RPython `FunctionsPBCRepr(rtyper, s_pbc)` (rpbc.py:227-240).
+    /// RPython `FunctionsPBCRepr(rtyper, s_pbc)` (rpbc.py).
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
         let base = FunctionReprBase::new(rtyper, s_pbc)?;
         let callfamily = base.callfamily.clone().ok_or_else(|| {
@@ -1978,7 +1978,7 @@ impl FunctionsPBCRepr {
         })
     }
 
-    /// RPython `FunctionsPBCRepr.setup_specfunc(self)` (rpbc.py:242-247):
+    /// RPython `FunctionsPBCRepr.setup_specfunc(self)` (rpbc.py):
     ///
     /// ```python
     /// def setup_specfunc(self):
@@ -2121,7 +2121,7 @@ impl FunctionsPBCRepr {
         self.get_specfunc_row(&mut llop, v, &attrname, resulttype)
     }
 
-    /// RPython `FunctionReprBase.call(self, hop)` (rpbc.py:199-221).
+    /// RPython `FunctionReprBase.call(self, hop)` (rpbc.py).
     /// FunctionsPBCRepr override — delegates to the shared free helper
     /// [`pbc_call_via_concrete_llfn`] with `FunctionsPBCRepr`'s
     /// `convert_to_concrete_llfn`. For the single-row case the funcptr
@@ -2155,15 +2155,15 @@ impl Repr for FunctionsPBCRepr {
         ReprClassId::FunctionsPBCRepr
     }
 
-    /// RPython `FunctionReprBase.get_r_implfunc(self)` (rpbc.py:186-187) —
+    /// RPython `FunctionReprBase.get_r_implfunc(self)` (rpbc.py) —
     /// upstream `return self, 0`. Inherited by `FunctionsPBCRepr` via the
     /// `FunctionReprBase` base class.
     fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
         Ok((self, 0))
     }
 
-    /// RPython `FunctionReprBase.s_pbc` (rpbc.py:180) — exposed via the
-    /// trait so `MethodsPBCRepr.redispatch_call` (rpbc.py:1202) can
+    /// RPython `FunctionReprBase.s_pbc` (rpbc.py) — exposed via the
+    /// trait so `MethodsPBCRepr.redispatch_call` (rpbc.py) can
     /// supply `subset_of=r_func.s_pbc` when narrowing per-call SomePBC.
     fn pbc_s_pbc(&self) -> Option<&SomePBC> {
         Some(&self.base.s_pbc)
@@ -2328,9 +2328,9 @@ impl Repr for FunctionsPBCRepr {
         Ok(c)
     }
 
-    /// RPython `CanBeNull.rtype_bool(self, hop)` (rmodel.py:255-260) —
+    /// RPython `CanBeNull.rtype_bool(self, hop)` (rmodel.py) —
     /// `FunctionsPBCRepr` inherits this via `class FunctionsPBCRepr(CanBeNull,
-    /// FunctionReprBase)` (rpbc.py:224). Delegates to
+    /// FunctionReprBase)` (rpbc.py). Delegates to
     /// [`crate::translator::rtyper::rmodel::can_be_null_rtype_bool`] which
     /// emits the constant fast-path or a `ptr_nonzero` guard.
     fn rtype_bool(
@@ -2420,7 +2420,7 @@ impl Repr for FunctionsPBCRepr {
     }
 
     /// RPython `FunctionReprBase.rtype_simple_call(self, hop)`
-    /// (rpbc.py:193-194) — `return self.call(hop)`. Inherited by
+    /// (rpbc.py) — `return self.call(hop)`. Inherited by
     /// `FunctionsPBCRepr` via `class FunctionsPBCRepr(CanBeNull,
     /// FunctionReprBase)`.
     fn rtype_simple_call(
@@ -2431,7 +2431,7 @@ impl Repr for FunctionsPBCRepr {
     }
 
     /// RPython `FunctionReprBase.rtype_call_args(self, hop)`
-    /// (rpbc.py:196-197) — `return self.call(hop)`. Inherited by
+    /// (rpbc.py) — `return self.call(hop)`. Inherited by
     /// `FunctionsPBCRepr` via `class FunctionsPBCRepr(CanBeNull,
     /// FunctionReprBase)`.
     fn rtype_call_args(
@@ -2475,7 +2475,7 @@ impl Repr for FunctionsPBCRepr {
 /// pointer.
 #[derive(Debug)]
 pub struct SmallFunctionSetPBCRepr {
-    /// RPython `FunctionReprBase.__init__` (rpbc.py:395). Carries
+    /// RPython `FunctionReprBase.__init__` (rpbc.py). Carries
     /// `rtyper`, `s_pbc`, `callfamily`.
     pub base: FunctionReprBase,
     /// RPython `self.pointer_repr = FunctionsPBCRepr(rtyper, s_pbc)`
@@ -2488,14 +2488,14 @@ pub struct SmallFunctionSetPBCRepr {
     /// `_setup_repr`.
     pub descriptions: RefCell<Vec<Option<DescEntry>>>,
     /// RPython `self.c_pointer_table = inputconst(Ptr(POINTER_TABLE),
-    /// pointer_table)` (rpbc.py:426). Built by `_setup_repr` from a
+    /// pointer_table)` (rpbc.py). Built by `_setup_repr` from a
     /// `malloc(POINTER_TABLE, len(descriptions), immortal=True)` array
     /// pre-filled with the per-desc / `convert_const(None)` function
     /// pointers. Read by `pairtype(SmallFunctionSetPBCRepr,
-    /// FunctionsPBCRepr).convert_from_to` (rpbc.py:521-526) and by the
+    /// FunctionsPBCRepr).convert_from_to` (rpbc.py) and by the
     /// dispatcher (Step B.3).
     pub c_pointer_table: RefCell<Option<Constant>>,
-    /// RPython `self._dispatch_cache = {}` (rpbc.py:402). Caches the
+    /// RPython `self._dispatch_cache = {}` (rpbc.py). Caches the
     /// per-`(shape, index, argtypes, resulttype)` dispatcher
     /// `Constant` produced by [`SmallFunctionSetPBCRepr::dispatcher`].
     /// Each entry holds the function pointer at the dispatcher graph's
@@ -2506,24 +2506,24 @@ pub struct SmallFunctionSetPBCRepr {
     )]
     pub _dispatch_cache:
         RefCell<HashMap<(CallShape, usize, Vec<LowLevelType>, LowLevelType), Constant>>,
-    /// RPython `self._compression_function = None` (rpbc.py:401).
+    /// RPython `self._compression_function = None` (rpbc.py).
     /// Caches the synthesized `ll_compress` helper graph's function
     /// pointer Constant. The first
     /// `pair(FunctionsPBCRepr, SmallFunctionSetPBCRepr).convert_from_to`
     /// hit builds the helper via [`SmallFunctionSetPBCRepr::compression_function`]
     /// and stashes the resulting `Constant` here.
     pub _compression_function: RefCell<Option<Constant>>,
-    /// RPython `self._conversion_tables = {}` (rpbc.py:400). Caches
+    /// RPython `self._conversion_tables = {}` (rpbc.py). Caches
     /// `conversion_table(r_from=self, r_to)` results keyed on the
     /// *identity* of the target `SmallFunctionSetPBCRepr`. `Some(c)`
     /// stores the `Char Array` indexing constant; `None` records an
     /// identity conversion (upstream's `r = None` branch when
-    /// `l == range(len(r_from.descriptions))`, rpbc.py:589-590) so
+    /// `l == range(len(r_from.descriptions))`, rpbc.py) so
     /// the caller skips the `getarrayitem` and returns `v` unchanged.
     /// Key = pointer address of the target repr (see struct doc above
     /// for the lifetime contract).
     pub _conversion_tables: RefCell<HashMap<usize, Option<Constant>>>,
-    /// RPython `self.lowleveltype = Char` (rpbc.py:398). Stored
+    /// RPython `self.lowleveltype = Char` (rpbc.py). Stored
     /// explicitly because `Repr::lowleveltype` returns `&LowLevelType`.
     lltype: LowLevelType,
     state: ReprState,
@@ -2537,7 +2537,7 @@ impl SmallFunctionSetPBCRepr {
         reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
     )]
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
-        // upstream rpbc.py:395 — `FunctionReprBase.__init__(...)`.
+        // upstream rpbc.py — `FunctionReprBase.__init__(...)`.
         let base = FunctionReprBase::new(rtyper, s_pbc.clone())?;
         // upstream rpbc.py:396-397 —
         //   `llct = get_concrete_calltable(self.rtyper, self.callfamily)`
@@ -2564,13 +2564,13 @@ impl SmallFunctionSetPBCRepr {
             pointer_repr,
             descriptions: RefCell::new(Vec::new()),
             c_pointer_table: RefCell::new(None),
-            // upstream rpbc.py:402 — `self._dispatch_cache = {}`.
+            // upstream rpbc.py — `self._dispatch_cache = {}`.
             _dispatch_cache: RefCell::new(HashMap::new()),
-            // upstream rpbc.py:401 — `self._compression_function = None`.
+            // upstream rpbc.py — `self._compression_function = None`.
             _compression_function: RefCell::new(None),
-            // upstream rpbc.py:400 — `self._conversion_tables = {}`.
+            // upstream rpbc.py — `self._conversion_tables = {}`.
             _conversion_tables: RefCell::new(HashMap::new()),
-            // upstream rpbc.py:398 — `self.lowleveltype = Char`.
+            // upstream rpbc.py — `self.lowleveltype = Char`.
             lltype: LowLevelType::Char,
             state: ReprState::new(),
         })
@@ -2840,7 +2840,7 @@ impl SmallFunctionSetPBCRepr {
 
             // upstream: `llfn = self.rtyper.getcallable(row_of_graphs[desc])`.
             // `row_of_graphs` is built by `build_calltable_row`, which keys
-            // each entry on `desc.rowkey()` (description.py:62-68); look it
+            // each entry on `desc.rowkey()` (description.py); look it
             // up by the same key. For the FunctionDescs in a SmallFunction-
             // SetPBCRepr `rowkey()` is the desc's own identity, matching
             // upstream where `rowkey() is self`.
@@ -2942,7 +2942,7 @@ impl SmallFunctionSetPBCRepr {
         Ok(graph.into_ref())
     }
 
-    /// RPython `compression_function(r_set)` (rpbc.py:529-545).
+    /// RPython `compression_function(r_set)` (rpbc.py).
     ///
     /// ```python
     /// def compression_function(r_set):
@@ -3215,7 +3215,7 @@ impl SmallFunctionSetPBCRepr {
     }
 
     /// RPython `SmallFunctionSetPBCRepr.convert_desc(self, funcdesc)`
-    /// (rpbc.py:428-429): `return chr(self.descriptions.index(funcdesc))`.
+    /// (rpbc.py): `return chr(self.descriptions.index(funcdesc))`.
     ///
     /// `self.descriptions` is populated by `_setup_repr`; calling
     /// `convert_desc` before setup runs surfaces a structured
@@ -3255,7 +3255,7 @@ impl SmallFunctionSetPBCRepr {
         ))
     }
 
-    /// RPython `SmallFunctionSetPBCRepr.call(self, hop)` (rpbc.py:490-506):
+    /// RPython `SmallFunctionSetPBCRepr.call(self, hop)` (rpbc.py):
     ///
     /// ```python
     /// def call(self, hop):
@@ -3410,7 +3410,7 @@ impl Repr for SmallFunctionSetPBCRepr {
         ReprClassId::SmallFunctionSetPBCRepr
     }
 
-    /// RPython `FunctionReprBase.s_pbc` (rpbc.py:180) — exposed via the
+    /// RPython `FunctionReprBase.s_pbc` (rpbc.py) — exposed via the
     /// trait so `MethodsPBCRepr.redispatch_call` can supply
     /// `subset_of=r_func.s_pbc` when the methodname maps to a
     /// SmallFunctionSetPBCRepr.
@@ -3491,7 +3491,7 @@ impl Repr for SmallFunctionSetPBCRepr {
             }
         }
 
-        // upstream rpbc.py:413 — `self.descriptions = list(self.s_pbc.descriptions)`.
+        // upstream rpbc.py — `self.descriptions = list(self.s_pbc.descriptions)`.
         let mut descriptions: Vec<Option<DescEntry>> = self
             .base
             .s_pbc
@@ -3645,7 +3645,7 @@ impl Repr for SmallFunctionSetPBCRepr {
     }
 
     /// RPython `SmallFunctionSetPBCRepr.special_uninitialized_value(self)`
-    /// (rpbc.py:440-441): `return chr(0xFF)`.
+    /// (rpbc.py): `return chr(0xFF)`.
     fn special_uninitialized_value(&self) -> Option<ConstValue> {
         Some(ConstValue::byte_str(vec![0xFFu8]))
     }
@@ -3694,7 +3694,7 @@ impl Repr for SmallFunctionSetPBCRepr {
         ))
     }
 
-    /// RPython `FunctionReprBase.get_r_implfunc(self)` (rpbc.py:186-187) —
+    /// RPython `FunctionReprBase.get_r_implfunc(self)` (rpbc.py) —
     /// inherited via `class SmallFunctionSetPBCRepr(FunctionReprBase)`:
     /// `return self, 0`.
     fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
@@ -3720,7 +3720,7 @@ impl Repr for SmallFunctionSetPBCRepr {
     }
 }
 
-/// RPython `compression_function(r_set)` (rpbc.py:529-545).
+/// RPython `compression_function(r_set)` (rpbc.py).
 pub fn compression_function(r_set: &SmallFunctionSetPBCRepr) -> Result<Constant, TyperError> {
     r_set.compression_function()
 }
@@ -3735,7 +3735,7 @@ pub fn compression_function(r_set: &SmallFunctionSetPBCRepr) -> Result<Constant,
 ///     return inputconst(Char, r_set.convert_desc(desc))
 /// ```
 ///
-/// FunctionRepr always carries a single-FunctionDesc PBC (rpbc.py:316).
+/// FunctionRepr always carries a single-FunctionDesc PBC (rpbc.py).
 /// The Char-typed Constant produced by `r_set.convert_desc(desc)` is
 /// returned wrapped as an `Hlvalue::Constant` — `same_lowleveltype_*`
 /// is *not* used here because the Function source value is discarded.
@@ -3806,7 +3806,7 @@ pub(super) fn pair_function_repr_small_function_set_convert_from_to(
 /// ```
 ///
 /// `r_fpbc1.s_pbc.const` is the host-side `pyobj` of the single
-/// FunctionDesc carried by FunctionRepr (rpbc.py:316 enforces
+/// FunctionDesc carried by FunctionRepr (rpbc.py enforces
 /// `len(descriptions) == 1` and `not can_be_None` so the SomePBC has
 /// a `const_box`). `inputconst(r_fpbc2, pyobj)` routes through
 /// `r_fpbc2.convert_const(pyobj)` to materialise the Ptr-typed
@@ -3903,9 +3903,9 @@ pub(super) fn pair_small_function_set_functions_pbc_convert_from_to(
     Ok(Some(Hlvalue::Variable(v_result)))
 }
 
-/// RPython `conversion_table(r_from, r_to)` (rpbc.py:574-595) +
+/// RPython `conversion_table(r_from, r_to)` (rpbc.py) +
 /// `pairtype(SmallFunctionSetPBCRepr,
-/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py:597-607).
+/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py).
 ///
 /// ```python
 /// def conversion_table(r_from, r_to):
@@ -4026,7 +4026,7 @@ pub fn conversion_table(
     )
     .map_err(TyperError::message)?;
 
-    // upstream rpbc.py:586 — `t[i] = chr(j)` only when d ∈ r_to.descriptions.
+    // upstream rpbc.py — `t[i] = chr(j)` only when d ∈ r_to.descriptions.
     for (i, j_opt) in l.iter().enumerate() {
         if let Some(j) = j_opt {
             if *j > u8::MAX as usize {
@@ -4044,13 +4044,13 @@ pub fn conversion_table(
         // surfaces as undefined behaviour upstream too.
     }
 
-    // upstream rpbc.py:592 — `r = inputconst(typeOf(t), t)`.
+    // upstream rpbc.py — `r = inputconst(typeOf(t), t)`.
     let ptr_type = LowLevelType::Ptr(Box::new(
         lltype::Ptr::from_container_type(array_lltype.clone()).map_err(TyperError::message)?,
     ));
     let c_table = Constant::with_concretetype(ConstValue::LLPtr(Box::new(t)), ptr_type);
 
-    // upstream rpbc.py:593 — `r_from._conversion_tables[r_to] = r`.
+    // upstream rpbc.py — `r_from._conversion_tables[r_to] = r`.
     r_from
         ._conversion_tables
         .borrow_mut()
@@ -4060,7 +4060,7 @@ pub fn conversion_table(
 }
 
 /// RPython `pairtype(SmallFunctionSetPBCRepr,
-/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py:597-607).
+/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py).
 pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
     r_from: &dyn Repr,
     r_to: &dyn Repr,
@@ -4089,7 +4089,7 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
 }
 
 /// RPython `pairtype(SmallFunctionSetPBCRepr,
-/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py:597-607) emit
+/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py) emit
 /// half — `c_table is None` ⇒ identity (`return v`); `c_table is
 /// Some(...)` ⇒ `cast_char_to_int` + `getarrayitem`. Shared between
 /// the cache-hit and cache-miss paths so the `_conversion_tables`
@@ -4142,8 +4142,8 @@ fn small_function_set_apply_conversion(
 }
 
 /// RPython `pairtype(FunctionsPBCRepr,
-/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py:553-556) +
-/// `compression_function(r_set)` (rpbc.py:529-545).
+/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py) +
+/// `compression_function(r_set)` (rpbc.py).
 ///
 /// ```python
 /// class __extend__(pairtype(FunctionsPBCRepr, SmallFunctionSetPBCRepr)):
@@ -4197,7 +4197,7 @@ pub(super) fn pair_functions_pbc_small_function_set_convert_from_to(
     Ok(Some(Hlvalue::Variable(v_result)))
 }
 
-/// RPython `class SingleFrozenPBCRepr(Repr)` (rpbc.py:635-662).
+/// RPython `class SingleFrozenPBCRepr(Repr)` (rpbc.py).
 ///
 /// Void-typed repr for a single-FrozenDesc `SomePBC` with
 /// `can_be_None=False`. `convert_desc` asserts desc-identity with the
@@ -4205,7 +4205,7 @@ pub(super) fn pair_functions_pbc_small_function_set_convert_from_to(
 /// is the same sentinel (upstream `return None`).
 #[derive(Debug)]
 pub struct SingleFrozenPBCRepr {
-    /// RPython `self.frozendesc = frozendesc` (rpbc.py:639-640).
+    /// RPython `self.frozendesc = frozendesc` (rpbc.py).
     pub frozendesc: DescEntry,
     state: ReprState,
     lltype: LowLevelType,
@@ -4415,7 +4415,7 @@ pub trait MultipleFrozenPBCReprBase: CanBeNull {
 pub struct MultipleUnrelatedFrozenPBCRepr {
     /// RPython `self.rtyper = rtyper` (rpbc.py:682).
     pub rtyper: Weak<RPythonTyper>,
-    /// RPython `self.converted_pbc_cache = {}` (rpbc.py:683).
+    /// RPython `self.converted_pbc_cache = {}` (rpbc.py).
     /// Keyed by `DescEntry::desc_key()` for pointer-identity semantics
     /// matching upstream's dict-by-Python-identity. Value is the
     /// `_address` produced by `convert_pbc(pbcptr)` —
@@ -4679,7 +4679,7 @@ impl Repr for MultipleUnrelatedFrozenPBCRepr {
 }
 
 /// RPython `pairtype(MultipleUnrelatedFrozenPBCRepr,
-/// MultipleUnrelatedFrozenPBCRepr).rtype_is_` (rpbc.py:713-725).
+/// MultipleUnrelatedFrozenPBCRepr).rtype_is_` (rpbc.py).
 ///
 /// ```python
 /// def rtype_is_((robj1, robj2), hop):
@@ -4842,20 +4842,20 @@ pub fn pair_function_repr_base_rtype_is_(
 pub struct MultipleFrozenPBCRepr {
     /// RPython `self.rtyper = rtyper` (rpbc.py:732).
     pub rtyper: Weak<RPythonTyper>,
-    /// RPython `self.access_set = access_set` (rpbc.py:733). `None` is the
+    /// RPython `self.access_set = access_set` (rpbc.py). `None` is the
     /// no-attrs arm (`getFrozenPBCRepr`'s `access is None` case): a
     /// zero-field `Struct('pbc')` with no per-attr membership check
     /// (rpbc.py:758, 770).
     pub access_set: Option<Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>>,
-    /// RPython `self.pbc_type = ForwardReference()` (rpbc.py:734).
+    /// RPython `self.pbc_type = ForwardReference()` (rpbc.py).
     /// Stored as a clone alongside [`Self::lltype`] so callers can
     /// observe the resolved struct after `_setup_repr` runs `become`
     /// against either reference (Rust's `ForwardReference` shares its
     /// `Arc<Mutex<…>>` slot across clones).
     pbc_type: crate::translator::rtyper::lltypesystem::lltype::ForwardReference,
-    /// RPython `self.lowleveltype = Ptr(self.pbc_type)` (rpbc.py:735).
+    /// RPython `self.lowleveltype = Ptr(self.pbc_type)` (rpbc.py).
     lltype: LowLevelType,
-    /// RPython `self.pbc_cache = {}` (rpbc.py:736). Caches the
+    /// RPython `self.pbc_cache = {}` (rpbc.py). Caches the
     /// per-frozendesc materialised `_ptr` so repeated `convert_desc`
     /// calls return identity-equal pointers and `convert_const` cycles
     /// terminate.
@@ -4920,7 +4920,7 @@ impl MultipleFrozenPBCRepr {
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
             TyperError::message("MultipleFrozenPBCRepr._setup_repr_fields: rtyper weak ref dropped")
         })?;
-        // upstream `if self.access_set is not None:` (rpbc.py:758) — the
+        // upstream `if self.access_set is not None:` (rpbc.py) — the
         // no-attrs arm leaves `fields`/`fieldmap` empty, giving a
         // zero-field `Struct('pbc')`.
         let Some(access_set) = &self.access_set else {
@@ -4950,7 +4950,7 @@ impl MultipleFrozenPBCRepr {
         Ok(fields)
     }
 
-    /// RPython `MultipleFrozenPBCRepr.create_instance(self)` (rpbc.py:743-744):
+    /// RPython `MultipleFrozenPBCRepr.create_instance(self)` (rpbc.py):
     ///
     /// ```python
     /// def create_instance(self):
@@ -4972,7 +4972,7 @@ impl MultipleFrozenPBCRepr {
         .map_err(TyperError::message)
     }
 
-    /// RPython `MultipleFrozenPBCRepr.null_instance(self)` (rpbc.py:746-747):
+    /// RPython `MultipleFrozenPBCRepr.null_instance(self)` (rpbc.py):
     ///
     /// ```python
     /// def null_instance(self):
@@ -5055,7 +5055,7 @@ impl Repr for MultipleFrozenPBCRepr {
         ReprClassId::MultipleFrozenPBCRepr
     }
 
-    /// RPython `MultipleFrozenPBCRepr._setup_repr(self)` (rpbc.py:738-741):
+    /// RPython `MultipleFrozenPBCRepr._setup_repr(self)` (rpbc.py):
     ///
     /// ```python
     /// def _setup_repr(self):
@@ -5347,7 +5347,7 @@ impl Repr for MultipleFrozenPBCRepr {
     }
 }
 
-/// RPython `adjust_shape(hop2, s_shape)` (rpbc.py:1120-1124):
+/// RPython `adjust_shape(hop2, s_shape)` (rpbc.py):
 ///
 /// ```python
 /// def adjust_shape(hop2, s_shape):
@@ -5361,7 +5361,7 @@ impl Repr for MultipleFrozenPBCRepr {
 /// constant carried by `call_args` ops; the helper bumps `shape_cnt`
 /// by 1 to account for the bound-self arg that
 /// [`MethodOfFrozenPBCRepr::redispatch_call`] /
-/// [`MethodsPBCRepr::redispatch_call`] (rpbc.py:894, :1195) prepend.
+/// [`MethodsPBCRepr::redispatch_call`] (rpbc.py, :1195) prepend.
 pub fn adjust_shape(
     hop2: &crate::translator::rtyper::rtyper::HighLevelOp,
     s_shape: &crate::annotator::model::SomeValue,
@@ -5422,7 +5422,7 @@ pub fn adjust_shape(
     Ok(())
 }
 
-/// RPython `class MethodOfFrozenPBCRepr(Repr)` (rpbc.py:844-911).
+/// RPython `class MethodOfFrozenPBCRepr(Repr)` (rpbc.py).
 ///
 /// ```python
 /// class MethodOfFrozenPBCRepr(Repr):
@@ -5446,7 +5446,7 @@ pub fn adjust_shape(
 pub struct MethodOfFrozenPBCRepr {
     /// RPython `self.rtyper = rtyper` (rpbc.py:850).
     pub rtyper: Weak<RPythonTyper>,
-    /// RPython `self.funcdesc = funcdescs.pop()` (rpbc.py:853) — the
+    /// RPython `self.funcdesc = funcdescs.pop()` (rpbc.py) — the
     /// single shared underlying funcdesc across all bound methods in
     /// `s_pbc`. Carries the whole `FuncDescEntry` so a bound memo method
     /// keeps its MemoDesc identity (upstream `desc.funcdesc` is the
@@ -5733,7 +5733,7 @@ impl Repr for MethodOfFrozenPBCRepr {
         Ok((r_func, 1))
     }
 
-    /// RPython `MethodOfFrozenPBCRepr.convert_desc` (rpbc.py:878-882) —
+    /// RPython `MethodOfFrozenPBCRepr.convert_desc` (rpbc.py) —
     /// thin Repr-trait forwarder; the body lives on the inherent impl.
     fn convert_desc(
         &self,
@@ -5781,7 +5781,7 @@ impl Repr for MethodOfFrozenPBCRepr {
     }
 
     /// RPython `MethodOfFrozenPBCRepr.rtype_simple_call(self, hop)`
-    /// (rpbc.py:888-889) — `return self.redispatch_call(hop, call_args=False)`.
+    /// (rpbc.py) — `return self.redispatch_call(hop, call_args=False)`.
     fn rtype_simple_call(
         &self,
         hop: &crate::translator::rtyper::rtyper::HighLevelOp,
@@ -5790,7 +5790,7 @@ impl Repr for MethodOfFrozenPBCRepr {
     }
 
     /// RPython `MethodOfFrozenPBCRepr.rtype_call_args(self, hop)`
-    /// (rpbc.py:891-892) — `return self.redispatch_call(hop, call_args=True)`.
+    /// (rpbc.py) — `return self.redispatch_call(hop, call_args=True)`.
     fn rtype_call_args(
         &self,
         hop: &crate::translator::rtyper::rtyper::HighLevelOp,
@@ -5799,7 +5799,7 @@ impl Repr for MethodOfFrozenPBCRepr {
     }
 }
 
-/// RPython `class ClassesPBCRepr(Repr)` (rpbc.py:920-968).
+/// RPython `class ClassesPBCRepr(Repr)` (rpbc.py).
 ///
 /// PBC repr for a `SomePBC` whose kind is `DescKind::Class`. Upstream:
 ///
@@ -5837,8 +5837,8 @@ impl ClassesPBCRepr {
     /// RPython `ClassesPBCRepr.__init__(self, rtyper, s_pbc)`
     /// (rpbc.py:923-932). Both constant and non-constant arms ported.
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
-        // upstream rpbc.py:928 — `if s_pbc.is_constant():`. The pyre
-        // `SomePBC::is_constant` mirrors model.py:532-537 which only
+        // upstream rpbc.py — `if s_pbc.is_constant():`. The pyre
+        // `SomePBC::is_constant` mirrors model.py which only
         // sets `const_box` when `len==1 && !can_be_none &&
         // desc.pyobj is not None`, so a single-desc PBC whose
         // ClassDesc has no live pyobj falls through to the non-constant
@@ -5846,7 +5846,7 @@ impl ClassesPBCRepr {
         let lltype = if s_pbc.is_constant() {
             LowLevelType::Void
         } else {
-            // upstream rpbc.py:932 — `self.lowleveltype = self.getlowleveltype()`.
+            // upstream rpbc.py — `self.lowleveltype = self.getlowleveltype()`.
             Self::getlowleveltype()
         };
         Ok(ClassesPBCRepr {
@@ -5857,7 +5857,7 @@ impl ClassesPBCRepr {
         })
     }
 
-    /// RPython `ClassesPBCRepr.getlowleveltype(self)` (rpbc.py:1080-1081).
+    /// RPython `ClassesPBCRepr.getlowleveltype(self)` (rpbc.py).
     ///
     /// ```python
     /// def getlowleveltype(self):
@@ -6067,10 +6067,10 @@ impl ClassesPBCRepr {
         })?;
 
         // Ported envelope gates (each a graceful known-unported skip):
-        //  - has `__init__` ⇒ the rpbc.py:1060-1067 dispatch arm is not
+        //  - has `__init__` ⇒ the rpbc.py dispatch arm is not
         //    ported (would need `replace_class_with_inst_arg`);
         //  - `classdef.minid` unset ⇒ `assign_inheritance_ids` has not
-        //    numbered this class, so `getvtable` (rclass.py:338-339) cannot
+        //    numbered this class, so `getvtable` (rclass.py) cannot
         //    bake the subclass range.  The session prologue numbers only
         //    the struct-root + standard-exception prefix; enum-variant
         //    transparent-ctor classes are interned lazily by the flowspace
@@ -6142,7 +6142,7 @@ impl ClassesPBCRepr {
                 false,
             )?
         };
-        // upstream rpbc.py:1058-1059 — no `__init__` ⇒ the malloc cannot
+        // upstream rpbc.py — no `__init__` ⇒ the malloc cannot
         // raise.
         hop.exception_cannot_occur()?;
         // upstream `return v_instance`.
@@ -6150,7 +6150,7 @@ impl ClassesPBCRepr {
     }
 }
 
-/// RPython `ll_cls_hash(cls)` (rpbc.py:1096-1097).
+/// RPython `ll_cls_hash(cls)` (rpbc.py).
 pub fn ll_cls_hash(cls: &_ptr) -> Result<i64, TyperError> {
     crate::translator::rtyper::lltypesystem::lltype::cast_ptr_to_int(cls)
         .map_err(TyperError::message)
@@ -6227,7 +6227,7 @@ impl Repr for ClassesPBCRepr {
         ))
     }
 
-    /// RPython `ClassesPBCRepr.convert_const(self, cls)` (rpbc.py:959-968).
+    /// RPython `ClassesPBCRepr.convert_const(self, cls)` (rpbc.py).
     ///
     /// ```python
     /// def convert_const(self, cls):
@@ -6480,7 +6480,7 @@ impl Repr for ClassesPBCRepr {
     }
 }
 
-/// RPython `getFrozenPBCRepr(rtyper, s_pbc)` (rpbc.py:610-632).
+/// RPython `getFrozenPBCRepr(rtyper, s_pbc)` (rpbc.py).
 ///
 /// ```python
 /// def getFrozenPBCRepr(rtyper, s_pbc):
@@ -6603,7 +6603,7 @@ pub fn getFrozenPBCRepr(
     // either `Some(usize)` or `None`. `None` means every desc has no
     // attrfamily (uncallable multi-desc function/frozen PBCs) —
     // `MultipleFrozenPBCRepr(rtyper, None)` lowers to a zero-field
-    // `Struct('pbc')` (`_setup_repr_fields` returns `[]`, rpbc.py:758),
+    // `Struct('pbc')` (`_setup_repr_fields` returns `[]`, rpbc.py),
     // cached under the `pbc_reprs[None]` singleton slot.
     use crate::translator::rtyper::rtyper::PbcReprKey;
     let repr_key = match first {
@@ -6644,7 +6644,7 @@ pub fn getFrozenPBCRepr(
     Ok(fresh)
 }
 
-/// RPython `class MethodsPBCRepr(Repr)` (rpbc.py:1126-1218).
+/// RPython `class MethodsPBCRepr(Repr)` (rpbc.py).
 ///
 /// ```python
 /// class MethodsPBCRepr(Repr):
@@ -6677,7 +6677,7 @@ pub struct MethodsPBCRepr {
     /// RPython `self.s_pbc = s_pbc` (rpbc.py:1133) — original PBC of
     /// MethodDesc descriptions.
     pub s_pbc: SomePBC,
-    /// RPython `self.methodname = methodname` (rpbc.py:1151) — the
+    /// RPython `self.methodname = methodname` (rpbc.py) — the
     /// shared method name across all `mdescs`.
     pub methodname: String,
     /// RPython `self.classdef = classdef.get_owner(methodname)`
@@ -6803,7 +6803,7 @@ impl MethodsPBCRepr {
             crate::annotator::model::SomeInstance::new(Some(owner.clone()), false, flags);
 
         // upstream: `self.r_im_self = getinstancerepr(rtyper, self.classdef)`
-        // — `getinstancerepr`'s `default_flavor` parameter (rclass.py:91)
+        // — `getinstancerepr`'s `default_flavor` parameter (rclass.py)
         // defaults to `'gc'`.
         let r_im_self = rclass::getinstancerepr(rtyper, Some(&owner), rclass::Flavor::Gc)?;
 
@@ -7052,7 +7052,7 @@ impl MethodsPBCRepr {
         hop2.dispatch()
     }
 
-    /// RPython `MethodsPBCRepr.get_r_implfunc(self)` (rpbc.py:1165-1168):
+    /// RPython `MethodsPBCRepr.get_r_implfunc(self)` (rpbc.py):
     ///
     /// ```python
     /// def get_r_implfunc(self):
@@ -7111,7 +7111,7 @@ impl MethodsPBCRepr {
     ///     return llops.convertvar(v_inst, r_inst, self.r_im_self)
     /// ```
     ///
-    /// Called from `InstanceRepr.rtype_getattr` (rclass.py:850-854) on
+    /// Called from `InstanceRepr.rtype_getattr` (rclass.py) on
     /// the method-dispatch branch. Pyre's `convertvar` lives on the
     /// active `LowLevelOpList` (`rtyper.rs`); pass it through.
     pub fn get_method_from_instance(
@@ -7141,7 +7141,7 @@ impl Repr for MethodsPBCRepr {
         ReprClassId::MethodsPBCRepr
     }
 
-    /// RPython `MethodsPBCRepr.get_r_implfunc(self)` (rpbc.py:1165-1168).
+    /// RPython `MethodsPBCRepr.get_r_implfunc(self)` (rpbc.py).
     /// The owned-Arc form lives on `get_r_implfunc_arc` because the
     /// returned `r_func` is a clsfields-cache borrow that outlives the
     /// short-lived `RefCell::borrow()` guard via Arc cloning.
@@ -7220,7 +7220,7 @@ impl Repr for MethodsPBCRepr {
     }
 }
 
-/// RPython `SomePBC.rtyper_makerepr` (rpbc.py:35-62), the
+/// RPython `SomePBC.rtyper_makerepr` (rpbc.py), the
 /// `DescKind`-keyed factory. Each `DescKind` arm dispatches to the
 /// matching Repr constructor:
 ///
@@ -7290,7 +7290,7 @@ pub fn somepbc_rtyper_makerepr(
                     .unwrap_or(false);
                 if callable {
                     if small_cand(rtyper, s_pbc)? {
-                        // rpbc.py:47-48 — `getRepr = SmallFunctionSetPBCRepr`.
+                        // rpbc.py — `getRepr = SmallFunctionSetPBCRepr`.
                         Ok(
                             std::sync::Arc::new(SmallFunctionSetPBCRepr::new(
                                 rtyper,
@@ -7318,7 +7318,7 @@ pub fn somepbc_rtyper_makerepr(
             }
         }
         DescKind::Class => {
-            // rpbc.py:50-52 — `getRepr = ClassesPBCRepr`. Both
+            // rpbc.py — `getRepr = ClassesPBCRepr`. Both
             // constant (lowleveltype = Void) and non-constant
             // (lowleveltype = CLASSTYPE) arms are ported in
             // `ClassesPBCRepr::new`.
@@ -7328,7 +7328,7 @@ pub fn somepbc_rtyper_makerepr(
             )
         }
         DescKind::Method => {
-            // rpbc.py:53-54 — `getRepr = MethodsPBCRepr`.
+            // rpbc.py — `getRepr = MethodsPBCRepr`.
             Ok(
                 std::sync::Arc::new(MethodsPBCRepr::new(rtyper, s_pbc.clone())?)
                     as std::sync::Arc<dyn Repr>,
@@ -7336,7 +7336,7 @@ pub fn somepbc_rtyper_makerepr(
         }
         DescKind::Frozen => getFrozenPBCRepr(rtyper, s_pbc),
         DescKind::MethodOfFrozen => {
-            // rpbc.py:57-58 — `getRepr = MethodOfFrozenPBCRepr`.
+            // rpbc.py — `getRepr = MethodOfFrozenPBCRepr`.
             Ok(
                 std::sync::Arc::new(MethodOfFrozenPBCRepr::new(rtyper, s_pbc.clone())?)
                     as std::sync::Arc<dyn Repr>,
@@ -7397,7 +7397,7 @@ mod pbc_repr_tests {
         // Uncallable (no callfamily wired), `can_be_None=true` drops out of
         // the SingleFrozenPBCRepr fast-path → getFrozenPBCRepr multi-desc
         // branch → the `access is None` no-attrs arm builds a zero-field
-        // MultipleFrozenPBCRepr (rpbc.py:626-632 + 758).
+        // MultipleFrozenPBCRepr (rpbc.py + 758).
         let (ann, rtyper) = make_rtyper();
         let f = function_entry(&ann.bookkeeper, "f");
         let s_pbc = SomePBC::new(vec![f], true);
@@ -7408,7 +7408,7 @@ mod pbc_repr_tests {
     #[test]
     fn somepbc_rtyper_makerepr_multi_function_descs_without_callfamily_uses_getfrozenpbcrepr() {
         // Multi-FunctionDesc PBC without an attached callfamily → upstream
-        // rpbc.py:49 routes to getFrozenPBCRepr, whose no-attrs
+        // rpbc.py routes to getFrozenPBCRepr, whose no-attrs
         // (`access is None`) arm yields a zero-field MultipleFrozenPBCRepr.
         let (ann, rtyper) = make_rtyper();
         let f = function_entry(&ann.bookkeeper, "f");
@@ -7421,7 +7421,7 @@ mod pbc_repr_tests {
     #[test]
     fn somepbc_rtyper_makerepr_multi_function_descs_with_callfamily_uses_functionspbcrepr() {
         // Multi-FunctionDesc PBC whose sample has total_calltable_size > 0 →
-        // upstream rpbc.py:44-45 routes to FunctionsPBCRepr. The single
+        // upstream rpbc.py routes to FunctionsPBCRepr. The single
         // uniquerow branch (rpbc.py:232-234) produces lowleveltype = row.fntype
         // wrapped as Ptr(Func).
         use crate::annotator::argument::ArgumentsForTranslation;
@@ -7655,7 +7655,7 @@ mod pbc_repr_tests {
 
     #[test]
     fn functions_pbc_repr_convert_desc_multi_row_returns_specfunc_struct_constant() {
-        // rpbc.py:281-285 — when len(uniquerows) > 1, convert_desc
+        // rpbc.py — when len(uniquerows) > 1, convert_desc
         // calls `create_specfunc()` (≡ ll_malloc(specfunc_struct,
         // immortal=True)) and `setattr(result, attrname, llfn)` for
         // each (attrname, llfn) in llfns. The Constant returned has
@@ -7677,7 +7677,7 @@ mod pbc_repr_tests {
             c1.value,
         );
 
-        // rpbc.py:286-287 caches the result. Second call returns the
+        // rpbc.py caches the result. Second call returns the
         // same Constant (pointer-identity-stable on the inner _ptr).
         let c2 = r.convert_desc(&desc_f).unwrap();
         let (ConstValue::LLPtr(p1), ConstValue::LLPtr(p2)) = (&c1.value, &c2.value) else {
@@ -7782,7 +7782,7 @@ mod pbc_repr_tests {
         let s_pbc = SomePBC::new(vec![f.clone()], false);
         let r = FunctionRepr::new(&rtyper, s_pbc).unwrap();
 
-        // rpbc.py:320-321 — convert_desc returns None; pyre wraps it in
+        // rpbc.py — convert_desc returns None; pyre wraps it in
         // a Void-typed Constant so call sites get a typed value.
         let c = r.convert_desc(&f).unwrap();
         assert_eq!(c.concretetype, Some(LowLevelType::Void));
@@ -7797,7 +7797,7 @@ mod pbc_repr_tests {
         let s_pbc = SomePBC::new(vec![f], false);
         let r = FunctionRepr::new(&rtyper, s_pbc).unwrap();
 
-        // rpbc.py:323-324 — convert_const returns None regardless of
+        // rpbc.py — convert_const returns None regardless of
         // the input value (a constant function PBC has no runtime
         // payload).
         let c = r.convert_const(&ConstValue::Int(123)).unwrap();
@@ -7890,7 +7890,7 @@ mod pbc_repr_tests {
 
     #[test]
     fn method_of_frozen_pbc_repr_convert_const_requires_hostobject_argument() {
-        // rpbc.py:884-886 — `convert_const(method)` calls
+        // rpbc.py — `convert_const(method)` calls
         // `bookkeeper.getdesc(method)` on a host-side bound method.
         // pyre's `bookkeeper.getdesc` only accepts `HostObject`s, so the
         // ported `convert_const` rejects non-`HostObject` ConstValues
@@ -7981,7 +7981,7 @@ mod pbc_repr_tests {
     }
 
     /// Insert a bare `Attribute(name)` into `classdef.attrs` so
-    /// `ClassDef::get_owner(classdef, name)` (`classdesc.py:222-228`)
+    /// `ClassDef::get_owner(classdef, name)` (`classdesc.py`)
     /// returns the classdef. Bypasses `add_source_for_attribute`'s
     /// reflow / validation since these tests only need the dict membership.
     fn register_attr(classdef: &Rc<StdRefCell<crate::annotator::classdesc::ClassDef>>, name: &str) {
@@ -8387,7 +8387,7 @@ mod pbc_repr_tests {
 
     #[test]
     fn getFrozenPBCRepr_unrelated_branch_reuses_rtyper_pbc_reprs_singleton() {
-        // upstream rpbc.py:621-624 caches a single MultipleUnrelatedFrozenPBCRepr
+        // upstream rpbc.py caches a single MultipleUnrelatedFrozenPBCRepr
         // under `rtyper.pbc_reprs['unrelated']`. Two calls with
         // different SomePBCs (both landing in the unrelated branch)
         // must return the same Arc.
@@ -8881,7 +8881,7 @@ mod pbc_repr_tests {
         );
     }
 
-    /// `rtype_getattr` const-result fast path (rpbc.py:971-972):
+    /// `rtype_getattr` const-result fast path (rpbc.py):
     /// when `hop.s_result.is_constant()` the body short-circuits to
     /// `inputconst(hop.r_result, hop.s_result.const)` BEFORE consulting
     /// the access set or the attrname. The general / `__name__` paths
@@ -8937,7 +8937,7 @@ mod pbc_repr_tests {
         assert_eq!(c.value, ConstValue::Int(7));
     }
 
-    /// `rtype_getattr('__name__')` (rpbc.py:975-981) routes through
+    /// `rtype_getattr('__name__')` (rpbc.py) routes through
     /// `rootclass_repr` and emits `genop('getfield', [vcls, 'name'],
     /// resulttype=Ptr(rstr.STR))`. Body uncloses now that
     /// `rstr.STR` + `OBJECT_VTABLE.name` have landed.
@@ -9321,7 +9321,7 @@ mod pbc_repr_tests {
 
     #[test]
     fn function_repr_simple_call_emits_direct_call_op() {
-        // rpbc.py:199-221 — `FunctionReprBase.call` (Rust binding on
+        // rpbc.py — `FunctionReprBase.call` (Rust binding on
         // `FunctionRepr`). The Void-typed `convert_to_concrete_llfn`
         // returns a Constant funcptr, so the dispatch must take the
         // `direct_call` branch and short-circuit at the
@@ -9374,7 +9374,7 @@ mod pbc_repr_tests {
         // upstream rtyper would assign `impossible_repr` to r_result.
         *hop.r_result.borrow_mut() = Some(impossible_repr() as std::sync::Arc<dyn Repr>);
 
-        // upstream rpbc.py:218-219 — `r_result is impossible_repr`
+        // upstream rpbc.py — `r_result is impossible_repr`
         // short-circuits to None.
         let result = r.rtype_simple_call(&hop).unwrap();
         assert!(
@@ -9399,8 +9399,8 @@ mod pbc_repr_tests {
 
     #[test]
     fn functions_pbc_repr_simple_call_emits_indirect_call_op() {
-        // rpbc.py:199-221 (`FunctionReprBase.call`) +
-        // rpbc.py:300-312 (`FunctionsPBCRepr.convert_to_concrete_llfn`).
+        // rpbc.py (`FunctionReprBase.call`) +
+        // rpbc.py (`FunctionsPBCRepr.convert_to_concrete_llfn`).
         // The single-row `convert_to_concrete_llfn` returns `v`
         // unchanged — when `v` is a `Variable` (runtime funcptr),
         // the dispatch must take the `indirect_call` branch and
@@ -9457,7 +9457,7 @@ mod pbc_repr_tests {
         // upstream rtyper would assign `impossible_repr` to r_result.
         *hop.r_result.borrow_mut() = Some(impossible_repr() as std::sync::Arc<dyn Repr>);
 
-        // upstream rpbc.py:218-219 — `r_result is impossible_repr`
+        // upstream rpbc.py — `r_result is impossible_repr`
         // short-circuits to None.
         let result = r.rtype_simple_call(&hop).unwrap();
         assert!(
@@ -9531,7 +9531,7 @@ mod pbc_repr_tests {
 
     #[test]
     fn functions_pbc_repr_convert_desc_returns_llptr_constant_and_caches_it() {
-        // rpbc.py:255-287 — single-row convert_desc must produce a
+        // rpbc.py — single-row convert_desc must produce a
         // Constant wrapping the row's _ptr, and subsequent calls must
         // hit the funccache.
         use crate::annotator::argument::ArgumentsForTranslation;
@@ -9781,7 +9781,7 @@ mod pbc_repr_tests {
 
     #[test]
     fn functions_pbc_repr_rtype_bool_constant_fast_path_returns_bool_constant() {
-        // rmodel.py:255-260 — CanBeNull.rtype_bool fast-path: when the
+        // rmodel.py — CanBeNull.rtype_bool fast-path: when the
         // annotator has proved the result constant, emit inputconst(Bool, ...).
         use crate::annotator::argument::ArgumentsForTranslation;
         use crate::annotator::description::GraphCacheKey;
@@ -10005,7 +10005,7 @@ mod pbc_repr_tests {
 
     #[test]
     fn function_repr_get_r_implfunc_returns_self_and_zero() {
-        // rpbc.py:186-187 — upstream `return self, 0`. Port exposes
+        // rpbc.py — upstream `return self, 0`. Port exposes
         // `(self_as_dyn_repr, 0)`; identity is checked by comparing
         // pointer against the concrete FunctionRepr receiver.
         let (ann, rtyper) = make_rtyper();
@@ -10022,7 +10022,7 @@ mod pbc_repr_tests {
 
     #[test]
     fn function_repr_base_get_s_signatures_delegates_to_funcdesc() {
-        // rpbc.py:189-191 — upstream `return funcdesc.get_s_signatures(shape)`.
+        // rpbc.py — upstream `return funcdesc.get_s_signatures(shape)`.
         // Without a populated calltable, `FunctionDesc.get_s_signatures`
         // returns an empty Vec (its `calltables.get(shape)` miss path).
         let (ann, rtyper) = make_rtyper();

@@ -97,7 +97,7 @@ impl Default for GenericCostModel {
     }
 }
 
-/// vector.py:601-668 (GenericCostModel): Cost model using a single `savings`
+/// vector.py (GenericCostModel): Cost model using a single `savings`
 /// counter. Positive savings = profitable; negative = not worth it.
 pub struct CostModel {
     /// Minimum group size to consider vectorization (default: 2).
@@ -106,7 +106,7 @@ pub struct CostModel {
     pub pack_cost: i32,
     /// Saving per eliminated scalar op (in abstract cost units).
     pub scalar_save: i32,
-    /// vector.py:609: single savings counter (positive = profitable).
+    /// vector.py: single savings counter (positive = profitable).
     pub savings: i32,
 }
 
@@ -120,16 +120,16 @@ impl CostModel {
         }
     }
 
-    /// vector.py:611: reset_savings
+    /// vector.py: reset_savings
     pub fn reset_savings(&mut self) {
         self.savings = 0;
     }
 
-    /// vector.py:636-643 (GenericCostModel.record_pack_savings):
+    /// vector.py (GenericCostModel.record_pack_savings):
     /// Record savings from vectorizing a pack. INT_SIGNEXT gets special cost.
     pub fn record_pack_savings(&mut self, pack: &Pack, times: usize) {
         let (cost, benefit_factor) = if pack.scalar_opcode == OpCode::IntSignext {
-            // vector.py:645-650: cb_signext — no benefit for signext
+            // vector.py: cb_signext — no benefit for signext
             (1i32, 0i32)
         } else {
             (1, 1)
@@ -137,7 +137,7 @@ impl CostModel {
         self.savings += benefit_factor * times as i32 - cost;
     }
 
-    /// vector.py:659-665 (GenericCostModel.record_vector_pack):
+    /// vector.py (GenericCostModel.record_vector_pack):
     /// Record cost of packing a scalar into a vector.
     pub fn record_vector_pack(&mut self, is_float: bool, index: usize, count: usize) {
         if is_float && index == 1 && count == 1 {
@@ -147,12 +147,12 @@ impl CostModel {
         self.savings -= count as i32;
     }
 
-    /// vector.py:667-668: record_vector_unpack delegates to record_vector_pack.
+    /// vector.py: record_vector_unpack delegates to record_vector_pack.
     pub fn record_vector_unpack(&mut self, is_float: bool, index: usize, count: usize) {
         self.record_vector_pack(is_float, index, count);
     }
 
-    /// vector.py:652-657 (GenericCostModel.record_cast_int):
+    /// vector.py (GenericCostModel.record_cast_int):
     /// Record cost of integer sign-extension / size conversion.
     pub fn record_cast_int(&mut self, fromsize: usize, tosize: usize, count: usize) {
         if fromsize == 8 && tosize == 4 && count == 2 {
@@ -162,7 +162,7 @@ impl CostModel {
         }
     }
 
-    /// vector.py:632-633: profitable — savings >= 0.
+    /// vector.py: profitable — savings >= 0.
     pub fn profitable(&self) -> bool {
         self.savings >= 0
     }
@@ -186,7 +186,7 @@ impl Default for CostModel {
     }
 }
 
-/// vector.py:670-678: isomorphic — two ops can be packed if they have the
+/// vector.py: isomorphic — two ops can be packed if they have the
 /// same opcode AND the same vecinfo bytesize. PyPy reads each side through
 /// `forwarded_vecinfo(op)`, which lives on `op._forwarded`; pyre keeps that
 /// forwarded `VectorizationInfo` in the scheduler's pos-keyed store, so the
@@ -218,8 +218,8 @@ impl PackSet {
         self.packs.push(pack);
     }
 
-    /// vector.py:460-494: combine_packset — merge packs where
-    /// pack1.rightmost == pack2.leftmost (schedule.py:931-942).
+    /// vector.py: combine_packset — merge packs where
+    /// pack1.rightmost == pack2.leftmost (schedule.py).
     /// Only merges packs with matching edge, NOT just same opcode.
     pub fn try_merge_packs(&mut self) {
         loop {
@@ -233,7 +233,7 @@ impl PackSet {
                         continue;
                     }
                     if i < self.packs.len() && j < self.packs.len() {
-                        // schedule.py:931-942: rightmost_match_leftmost
+                        // schedule.py: rightmost_match_leftmost
                         let rightmost = *self.packs[i].members.last().unwrap_or(&usize::MAX);
                         let leftmost = *self.packs[j].members.first().unwrap_or(&usize::MAX);
                         // schedule.py:937-941: accumulating pack constraints
@@ -247,7 +247,7 @@ impl PackSet {
                             && self.packs[i].scalar_opcode == self.packs[j].scalar_opcode
                             && accum_ok
                         {
-                            // vector.py:753+: combine — merge j into i, skip overlap
+                            // vector.py+: combine — merge j into i, skip overlap
                             let mut merged_members = self.packs[i].members.clone();
                             merged_members.extend_from_slice(&self.packs[j].members[1..]);
                             self.packs[i].members = merged_members;
@@ -399,9 +399,9 @@ impl PackSet {
         self.packs.iter().map(|p| p.members.len()).sum()
     }
 
-    // ── vector.py:692-824: can_be_packed + accumulation detection ──
+    // ── vector.py: can_be_packed + accumulation detection ──
 
-    /// vector.py:692-722: can_be_packed — central pack eligibility check.
+    /// vector.py: can_be_packed — central pack eligibility check.
     /// Returns Ok(Some(Pack)) if lnode and rnode can form a pair.
     /// Returns Err(NotAVectorizeableLoop) if vectorization must abort.
     pub fn can_be_packed(
@@ -450,7 +450,7 @@ impl PackSet {
                     operator: None,
                 }));
             }
-            // vector.py:715-716: profitable_pack check
+            // vector.py: profitable_pack check
             let origin = origin_pack.unwrap();
             if self.profitable_pack(lnode, rnode, origin, forward, graph) {
                 let vec_op = match l_op.opcode.to_vector() {
@@ -479,7 +479,7 @@ impl PackSet {
         Ok(None)
     }
 
-    /// vector.py:724-729: contains_pair — check if lnode or rnode is already
+    /// vector.py: contains_pair — check if lnode or rnode is already
     /// the leftmost or rightmost of some existing pack.
     fn contains_pair(&self, lnode: usize, rnode: usize) -> bool {
         for pack in &self.packs {
@@ -490,7 +490,7 @@ impl PackSet {
         false
     }
 
-    /// vector.py:731-738: profitable_pack
+    /// vector.py: profitable_pack
     fn profitable_pack(
         &self,
         lnode: usize,
@@ -513,7 +513,7 @@ impl PackSet {
         true
     }
 
-    /// vector.py:740-751: prohibit_packing — block certain op combinations.
+    /// vector.py: prohibit_packing — block certain op combinations.
     fn prohibit_packing(packed: &Op, inquestion: &Op, forward: bool) -> bool {
         // vector.py:742: inquestion.vector == -1
         // In RPython, resoperation._vector == -1 marks non-vectorizable ops.
@@ -540,7 +540,7 @@ impl PackSet {
         false
     }
 
-    /// vector.py:766-818: accumulates_pair — detect accumulation pattern
+    /// vector.py: accumulates_pair — detect accumulation pattern
     /// between two isomorphic, dependent nodes.
     fn accumulates_pair(
         &self,
@@ -582,7 +582,7 @@ impl PackSet {
             return None;
         }
 
-        // vector.py:779: scalar, index = self.getaccumulator_variable(left, right, origin_pack)
+        // vector.py: scalar, index = self.getaccumulator_variable(left, right, origin_pack)
         let (scalar, index) = Self::getaccumulator_variable(left, right);
         scalar?;
         let index = index as usize;
@@ -631,7 +631,7 @@ impl PackSet {
         })
     }
 
-    /// vector.py:820-824: getaccumulator_variable — find which arg of right
+    /// vector.py: getaccumulator_variable — find which arg of right
     /// is the result of left (the accumulator variable).
     fn getaccumulator_variable(left: &Op, right: &Op) -> (Option<OpRef>, i32) {
         for (i, arg) in right.getarglist().iter().enumerate() {
@@ -643,7 +643,7 @@ impl PackSet {
     }
 }
 
-/// vector.py:35-40: copy_resop — clone an op, preserving VectorizationInfo.
+/// vector.py: copy_resop — clone an op, preserving VectorizationInfo.
 ///
 /// In RPython, `get_forwarded()` returns VectorizationInfo if set on the
 /// op, and copy_resop re-attaches it to the clone. In Rust, `Op::clone()`
@@ -657,7 +657,7 @@ pub fn copy_resop(op: &Op) -> Op {
     op.clone()
 }
 
-/// vector.py:42-120: VectorLoop — wraps a loop body (Label..operations..Jump)
+/// vector.py: VectorLoop — wraps a loop body (Label..operations..Jump)
 /// for vectorization analysis and transformation.
 #[derive(Clone, Debug)]
 pub struct VectorLoop {
@@ -684,7 +684,7 @@ pub struct VectorLoop {
 }
 
 impl VectorLoop {
-    /// vector.py:43-52: __init__(self, label, oplist, jump)
+    /// vector.py: __init__(self, label, oplist, jump)
     ///
     /// Each body op is wrapped into an `OpRc` on entry so it becomes the
     /// canonical producer box for its value; the buffer then carries
@@ -734,7 +734,7 @@ impl VectorLoop {
         ))
     }
 
-    /// vector.py:54-56: setup_vectorization — attach a `VectorizationInfo`
+    /// vector.py: setup_vectorization — attach a `VectorizationInfo`
     /// to every loop operation (`for op in self.operations:
     /// op.set_forwarded(VectorizationInfo(op))`). PyPy stores it on
     /// `op._forwarded`; pyre's flat-OpRef operands keep the per-op vecinfo
@@ -750,7 +750,7 @@ impl VectorLoop {
         }
     }
 
-    /// vector.py:58-60: teardown_vectorization — drop every loop op's
+    /// vector.py: teardown_vectorization — drop every loop op's
     /// `VectorizationInfo` (`for op in self.operations:
     /// op.set_forwarded(None)`), clearing the scheduler's forwarded store.
     pub fn teardown_vectorization(&self, state: &mut VecScheduleState) {
@@ -759,7 +759,7 @@ impl VectorLoop {
         }
     }
 
-    /// vector.py:62-92: finaloplist — assemble the complete operation list
+    /// vector.py: finaloplist — assemble the complete operation list
     /// for compilation.
     ///
     /// `jitcell_token`: when supplied, allocate fresh `TargetToken`s for
@@ -854,7 +854,7 @@ impl VectorLoop {
         oplist
     }
 
-    /// vector.py:94-120: clone — deep-clone the loop with renaming.
+    /// vector.py: clone — deep-clone the loop with renaming.
     pub fn clone_loop(&self) -> Self {
         let mut renamer = Renamer::new();
         let mut prefix: Vec<OpRc> = Vec::new();
@@ -904,7 +904,7 @@ impl VectorLoop {
     }
 }
 
-/// vector.py:122-173: optimize_vector — top-level entry point.
+/// vector.py: optimize_vector — top-level entry point.
 ///
 /// Creates a VectorizingOptimizer, runs vectorization on the loop, and
 /// returns the rewritten op list. The loop is modified in place.
@@ -926,7 +926,7 @@ pub fn optimize_vector(
         return Err(VectorizeError::NotVectorizeable);
     }
 
-    // vector.py:134 `version = info.snapshot(loop)` — register the
+    // vector.py `version = info.snapshot(loop)` — register the
     // pre-vectorize loop as the single tracked version (GuardStrengthenOpt
     // asserts versions.len() == 1) and keep an untouched clone so that *any*
     // downstream failure (NotAVectorizeableLoop / NotAProfitableLoop /
@@ -943,9 +943,9 @@ pub fn optimize_vector(
     let version = loop_.clone_loop();
 
     let result = {
-        // vector.py:142-143. `run_optimization` owns the scheduler state, so
-        // it calls vector.py:135 `loop.setup_vectorization()` (and the
-        // vector.py:172 `teardown_vectorization()`) against that state
+        // vector.py. `run_optimization` owns the scheduler state, so
+        // it calls vector.py `loop.setup_vectorization()` (and the
+        // vector.py `teardown_vectorization()`) against that state
         // internally, stamping each op's VectorizationInfo into the
         // `_forwarded` equivalent that `forwarded_vecinfo` reads.
         let mut opt = VectorizingOptimizer::new_with_params(cost_threshold, vec_size);
@@ -953,7 +953,7 @@ pub fn optimize_vector(
     };
 
     if result.is_err() {
-        // vector.py:155 / :160: `return loop_info, version.loop.finaloplist()`.
+        // vector.py / :160: `return loop_info, version.loop.finaloplist()`.
         // Restore the pre-vectorize ops into loop_ so the caller can resume
         // from a clean state if it wants to inspect the loop further.
         *loop_ = version;
@@ -967,7 +967,7 @@ pub fn optimize_vector(
 ///
 /// `optimized_ops` is the flat loop the unroll optimizer produced:
 /// `[prefix…, loop_label, body…, jump]`. Split off the loop part at the
-/// final LABEL (compile.py:322 `loop_info.label_op`), run `optimize_vector`
+/// final LABEL (compile.py `loop_info.label_op`), run `optimize_vector`
 /// on `[label] + body + jump` (compile.py:305), and re-assemble
 /// `prefix + extra_before_label + [label] + loop_ops` (compile.py:327-328).
 ///
@@ -1007,7 +1007,7 @@ pub(crate) fn apply_loop_vectorization(
     {
         return optimized_ops;
     }
-    // vector.py:146 `assert e > 0` — the body between label and jump must be
+    // vector.py `assert e > 0` — the body between label and jump must be
     // non-empty.
     let jump_idx = optimized_ops.len() - 1;
     if jump_idx <= label_idx + 1 {
@@ -1029,8 +1029,8 @@ pub(crate) fn apply_loop_vectorization(
             // compile.py:327-328: `… + extra_before_label + [label_op] +
             // loop_ops`. `optimized_ops[..label_idx]` already carries the
             // preamble + extra_same_as; `vloop.align_operations`
-            // (vector.py:267) is `extra_before_label`; `vloop.label` is
-            // `loop_info.label_op` (vector.py:153 `info.label_op = loop.label`).
+            // (vector.py) is `extra_before_label`; `vloop.label` is
+            // `loop_info.label_op` (vector.py `info.label_op = loop.label`).
             // `loop_ops` came from `finaloplist(label=false)` so it is
             // `body + jump` without the label.
             let mut assembled = Vec::with_capacity(
@@ -1045,7 +1045,7 @@ pub(crate) fn apply_loop_vectorization(
     }
 }
 
-/// vector.py:175-205: user_loop_bail_fast_path — quick pre-check.
+/// vector.py: user_loop_bail_fast_path — quick pre-check.
 ///
 /// Returns `true` if the loop should be SKIPPED (bailed on) for
 /// vectorization. In RPython, `user_code and user_loop_bail_fast_path()`
@@ -1094,7 +1094,7 @@ pub fn user_loop_bail_fast_path(loop_: &VectorLoop) -> bool {
     false
 }
 
-/// vector.py:207-600: VectorizingOptimizer — the vectorization optimizer.
+/// vector.py: VectorizingOptimizer — the vectorization optimizer.
 ///
 /// In RPython, this extends `Optimizer` and is the top-level optimizer for
 /// the vector pass. In Rust, it implements `Optimization` and is used as
@@ -1142,7 +1142,7 @@ pub struct VectorizingOptimizer {
 }
 
 impl VectorizingOptimizer {
-    /// vector.py:210-218: __init__ — default constructor for sub-pass use.
+    /// vector.py: __init__ — default constructor for sub-pass use.
     pub fn new() -> Self {
         VectorizingOptimizer {
             packset: None,
@@ -1169,7 +1169,7 @@ impl VectorizingOptimizer {
         opt
     }
 
-    /// vector.py:220-271: run_optimization — the main vectorization pipeline.
+    /// vector.py: run_optimization — the main vectorization pipeline.
     ///
     /// 1. Find smallest type → determine unroll count
     /// 2. Analyse index calculations → reorder for guard hoisting
@@ -1213,8 +1213,8 @@ impl VectorizingOptimizer {
             return Err(VectorizeError::NotVectorizeable);
         }
 
-        // vector.py:237-240: analyse_index_calculations → reorder.
-        // resoperation.py:181 reads `op.getarg(1).value` off the inline
+        // vector.py: analyse_index_calculations → reorder.
+        // resoperation.py reads `op.getarg(1).value` off the inline
         // ConstInt; the standalone pass has no Optimizer context, so an
         // inline `OpRef::ConstInt` is the only — and the faithful — const
         // source for INT_SIGNEXT bytesize and adjacent-ref index detection.
@@ -1258,9 +1258,9 @@ impl VectorizingOptimizer {
             .unwrap_or(0)
             + 1;
         let mut sched_state = VecScheduleState::new(start_pos);
-        // vector.py:135 loop.setup_vectorization()
+        // vector.py loop.setup_vectorization()
         loop_.setup_vectorization(&mut sched_state, &constant_of);
-        // vector.py:606-609 CostModel.__init__: savings = 0, threshold stored
+        // vector.py CostModel.__init__: savings = 0, threshold stored
         // separately. Initializing savings = self.cost_threshold inverted the
         // gate — a positive threshold made profitable() trivially true.
         let costmodel = CostModel {
@@ -1273,12 +1273,12 @@ impl VectorizingOptimizer {
 
         self.find_adjacent_memory_refs(&graph, loop_, &mut sched_state);
 
-        // vector.py:253-254: extend and combine — combine_packset raises
+        // vector.py: extend and combine — combine_packset raises
         // NotAVectorizeableLoop on an empty packset (vector.py:468-470).
         self.extend_packset(&graph, &mut sched_state);
         self.combine_packset()?;
 
-        // vector.py:254-258: schedule with cost model
+        // vector.py: schedule with cost model
         let packset = self.packset.take().unwrap_or_default();
 
         // Populate inputargs/seen from label args
@@ -1327,7 +1327,7 @@ impl VectorizingOptimizer {
                 return Err(VectorizeError::NotVectorizeable);
             }
             let datatype = 'i';
-            // schedule.py:838-840: bytesize = pack.getbytesize() — read the
+            // schedule.py: bytesize = pack.getbytesize() — read the
             // seed's forwarded VectorizationInfo from the same cache that
             // VectorizationInfo(op) populated, not a separate inline slot.
             let bytesize: i32 = sched_state
@@ -1356,7 +1356,7 @@ impl VectorizingOptimizer {
             sched_state.invariant_oplist.push(std::rc::Rc::new(xor_op));
 
             // VEC_PACK_I args are [vector, scalar, index, count]; index/count
-            // are inline ConstInt (history.py:227), not pool indices.
+            // are inline ConstInt (history.py), not pool indices.
             let zero_const = OpRef::const_int(0);
             let one_const = OpRef::const_int(1);
             let pack_op = sched_state.create_vec_op(
@@ -1434,7 +1434,7 @@ impl VectorizingOptimizer {
             }
         }
 
-        // vector.py:515-520 schedule(): `walk_and_emit` then, only when the
+        // vector.py schedule(): `walk_and_emit` then, only when the
         // cost model is profitable, `post_schedule()`. An unprofitable loop
         // returns *before* post_schedule, so loop_ is never mutated by it.
         // vector.py:256-258 then raises NotAProfitableLoop on the same check;
@@ -1443,7 +1443,7 @@ impl VectorizingOptimizer {
             return Err(VectorizeError::NotProfitable);
         }
 
-        // schedule.py:762-779: VecScheduleState.post_schedule — moves
+        // schedule.py: VecScheduleState.post_schedule — moves
         // invariant_oplist into loop.prefix and routes invariant_vector_vars
         // through prefix_label/jump.
         sched_state.post_schedule(loop_, &mut seen);
@@ -1470,7 +1470,7 @@ impl VectorizingOptimizer {
         // canonical producer `OpRc` as it re-enters the buffer.
         loop_.operations = strengthened.into_iter().map(std::rc::Rc::new).collect();
 
-        // vector.py:262-265: re-schedule the trace to drop pure operations left
+        // vector.py: re-schedule the trace to drop pure operations left
         // dead by guard strengthening (graph = DependencyGraph(loop);
         // state = SchedulerState(cpu, graph); state.schedule()). TODO: the base
         // SchedulerState walk_and_emit is not yet ported; the cleanup reschedule
@@ -1487,12 +1487,12 @@ impl VectorizingOptimizer {
             sched_state.clear_op_forwarded_vecinfo(op.pos.get());
         }
 
-        // vector.py:172 `finally: loop.teardown_vectorization()`. The
+        // vector.py `finally: loop.teardown_vectorization()`. The
         // earlier `?`/`return Err` exits drop `sched_state` instead, which
         // discards the same pos-keyed forwarded store.
         loop_.teardown_vectorization(&mut sched_state);
 
-        // vector.py:271: return loop.finaloplist(jitcell_token, reset_label_token=False).
+        // vector.py: return loop.finaloplist(jitcell_token, reset_label_token=False).
         // post_schedule already set loop_.operations / prefix / prefix_label / jump,
         // so finaloplist concatenates [prefix][prefix_label] operations [jump].
         // TODO: thread jitcell_token through when optimize_vector is wired to the
@@ -1503,7 +1503,7 @@ impl VectorizingOptimizer {
         Ok((ops, gso_consts))
     }
 
-    /// vector.py:359-367: linear_find_smallest_type — scan ops for the
+    /// vector.py: linear_find_smallest_type — scan ops for the
     /// smallest array element byte size to determine SIMD width.
     pub fn linear_find_smallest_type(&mut self, loop_: &VectorLoop) {
         for op in &loop_.operations {
@@ -1524,7 +1524,7 @@ impl VectorizingOptimizer {
         }
     }
 
-    /// vector.py:369-376: get_unroll_count — compute how many times to
+    /// vector.py: get_unroll_count — compute how many times to
     /// unroll based on SIMD register width and smallest type.
     pub fn get_unroll_count(smallest_type_bytes: usize, simd_reg_bytes: usize) -> usize {
         if smallest_type_bytes == 0 {
@@ -1534,11 +1534,11 @@ impl VectorizingOptimizer {
         count.saturating_sub(1) // already unrolled once
     }
 
-    /// vector.py:346-357: copy_guard_descr — clone guard descriptor and
+    /// vector.py: copy_guard_descr — clone guard descriptor and
     /// rename fail args during unrolling.
     fn copy_guard_descr(renamer: &Renamer, copied_op: &mut Op) {
-        // vector.py:349-350: descr.clone() — already cloned by copy_resop
-        // vector.py:351: failargs = renamer.rename_failargs(copied_op, clone=True)
+        // vector.py: descr.clone() — already cloned by copy_resop
+        // vector.py: failargs = renamer.rename_failargs(copied_op, clone=True)
         // renamer.py:40: args[i] = rename_map.get(arg, arg) — a hit installs the
         // BOUND renamed box, a miss KEEPS the original box object. lookup_box
         // returns the bound Operand on a hit (Some) and None on a miss; the miss
@@ -1557,7 +1557,7 @@ impl VectorizingOptimizer {
         }
     }
 
-    /// vector.py:378-402: find_adjacent_memory_refs — seed the packset
+    /// vector.py: find_adjacent_memory_refs — seed the packset
     /// with pairs of adjacent memory accesses.
     fn find_adjacent_memory_refs(
         &mut self,
@@ -1582,7 +1582,7 @@ impl VectorizingOptimizer {
                 }
                 // vector.py:399: memref_a.is_adjacent_after(memref_b)
                 if memref_a.is_adjacent_after(memref_b) {
-                    // vector.py:400-401: packset.can_be_packed(node_a, node_b, None, False)
+                    // vector.py: packset.can_be_packed(node_a, node_b, None, False)
                     if let Ok(Some(pair)) =
                         packset.can_be_packed(state, node_a, node_b, None, false, graph)
                     {
@@ -1595,9 +1595,9 @@ impl VectorizingOptimizer {
         self.packset = Some(packset);
     }
 
-    // ── vector.py:404-458: extend_packset / follow_def_uses / follow_use_defs
+    // ── vector.py: extend_packset / follow_def_uses / follow_use_defs
 
-    /// vector.py:404-425: extend_packset — follow dependency chains to find
+    /// vector.py: extend_packset — follow dependency chains to find
     /// more candidates to put into pairs.
     pub fn extend_packset(&mut self, graph: &DependencyGraph, state: &mut VecScheduleState) {
         let packset = match self.packset.as_mut() {
@@ -1606,7 +1606,7 @@ impl VectorizingOptimizer {
         };
         let mut pack_count = packset.num_packs();
         loop {
-            // vector.py:411-415: follow_def_uses for each 2-pack
+            // vector.py: follow_def_uses for each 2-pack
             let num_packs = packset.packs.len();
             for i in 0..num_packs {
                 if packset.packs[i].members.len() == 2 {
@@ -1632,7 +1632,7 @@ impl VectorizingOptimizer {
         }
     }
 
-    /// vector.py:427-442: follow_use_defs — for a 2-pack, check if
+    /// vector.py: follow_use_defs — for a 2-pack, check if
     /// dependencies of leftmost/rightmost can form new pairs.
     fn follow_use_defs(
         packset: &mut PackSet,
@@ -1663,7 +1663,7 @@ impl VectorizingOptimizer {
                 if !left_args.iter().any(|a| a.to_opref() == dep_opref) {
                     continue;
                 }
-                // vector.py:438-439: isomorphic and lnode.is_before(rnode)
+                // vector.py: isomorphic and lnode.is_before(rnode)
                 if isomorphic(state, l_op, r_op) && l_dep < r_dep {
                     match packset.can_be_packed(state, l_dep, r_dep, Some(pack), false, graph) {
                         Ok(Some(pair)) => packset.add_pack(pair),
@@ -1675,7 +1675,7 @@ impl VectorizingOptimizer {
         }
     }
 
-    /// vector.py:444-458: follow_def_uses — for a 2-pack, check if users
+    /// vector.py: follow_def_uses — for a 2-pack, check if users
     /// of leftmost/rightmost can form new pairs via can_be_packed.
     fn follow_def_uses(
         packset: &mut PackSet,
@@ -1706,7 +1706,7 @@ impl VectorizingOptimizer {
                 if !l_op.getarglist().iter().any(|a| a.to_opref() == left_opref) {
                     continue;
                 }
-                // vector.py:454-455: isomorphic and lnode.is_before(rnode)
+                // vector.py: isomorphic and lnode.is_before(rnode)
                 if isomorphic(state, l_op, r_op) && l_user < r_user {
                     match packset.can_be_packed(state, l_user, r_user, Some(pack), true, graph) {
                         Ok(Some(pair)) => packset.add_pack(pair),
@@ -1718,7 +1718,7 @@ impl VectorizingOptimizer {
         }
     }
 
-    /// vector.py:460-496: combine_packset — merge adjacent 2-packs into
+    /// vector.py: combine_packset — merge adjacent 2-packs into
     /// larger packs, then split overloaded packs.
     pub fn combine_packset(&mut self) -> Result<(), NotAVectorizeableLoop> {
         let packset = match self.packset.as_mut() {
@@ -1740,7 +1740,7 @@ impl VectorizingOptimizer {
             }
         }
 
-        // vector.py:496: self.packset.split_overloaded_packs(self.cpu.vector_ext)
+        // vector.py: self.packset.split_overloaded_packs(self.cpu.vector_ext)
         // TODO: split_overloaded_packs not yet ported.
         // RPython splits packs that exceed the vector register size and
         // removes packs that are too small (< FULL load). This requires
@@ -1749,7 +1749,7 @@ impl VectorizingOptimizer {
         Ok(())
     }
 
-    /// vector.py:515-521: schedule — run the scheduler on the given state.
+    /// vector.py: schedule — run the scheduler on the given state.
     #[allow(dead_code)]
     fn schedule_state(_state: &mut VecScheduleState, _graph: &DependencyGraph) {
         // vector.py:516: state.prepare() — handled by caller
@@ -1758,7 +1758,7 @@ impl VectorizingOptimizer {
         // vector.py:520: state.post_schedule() — handled by caller
     }
 
-    /// vector.py:523-583: analyse_index_calculations — move guarding
+    /// vector.py: analyse_index_calculations — move guarding
     /// instructions (and all the instructions the guard needs) to the loop
     /// header so guards fail "early" and dependencies relax. Without this
     /// step vectorization would not be possible.
@@ -1861,7 +1861,7 @@ impl VectorizingOptimizer {
         if one_valid { Some(graph) } else { None }
     }
 
-    /// vector.py:585-599: mark_guard — marks a guard as an early exit
+    /// vector.py: mark_guard — marks a guard as an early exit
     /// by attaching a CompileLoopVersionDescr and setting failargs to
     /// the label's input args.
     ///
@@ -1916,7 +1916,7 @@ impl VectorizingOptimizer {
             .unwrap_or(0)
             + 1;
         let mut sched_state = VecScheduleState::new(start_pos);
-        // vector.py:135 loop.setup_vectorization() — stamps
+        // vector.py loop.setup_vectorization() — stamps
         // VectorizationInfo on each op. INT_SIGNEXT reads arg1's const
         // value for bytesize (resoperation.py:181); the constant_of
         // resolver feeds that through so the inline vecinfo slot matches
@@ -1953,7 +1953,7 @@ impl VectorizingOptimizer {
             return None;
         }
 
-        // schedule.py:666-670: prepare() — populate inputargs and seen
+        // schedule.py: prepare() — populate inputargs and seen
         for &arg in &self.label_args {
             sched_state.inputargs.insert(arg, ());
         }
@@ -1994,7 +1994,7 @@ impl VectorizingOptimizer {
                 return None;
             }
             let datatype = 'i';
-            // schedule.py:838-840: bytesize = pack.getbytesize() — read the
+            // schedule.py: bytesize = pack.getbytesize() — read the
             // seed's forwarded VectorizationInfo from the same cache that
             // VectorizationInfo(op) populated, not a separate inline slot.
             let bytesize: i32 = sched_state
@@ -2100,14 +2100,14 @@ impl VectorizingOptimizer {
             }
         }
 
-        // vector.py:515-520 schedule(): post_schedule runs only when the cost
+        // vector.py schedule(): post_schedule runs only when the cost
         // model is profitable; an unprofitable loop returns before post_schedule
         // mutates loop_ (matches the run_optimization path and PyPy).
         if !sched_state.costmodel.profitable() {
             return None;
         }
 
-        // schedule.py:762-779: VecScheduleState.post_schedule. Moves
+        // schedule.py: VecScheduleState.post_schedule. Moves
         // invariant_oplist into loop_.prefix and routes invariant_vector_vars
         // through prefix_label/jump renaming. Reachable in the streaming path
         // because propagate_forward holds the LABEL (self.pending_label) until
@@ -2125,7 +2125,7 @@ impl VectorizingOptimizer {
         // correctly targets prefix_label. TODO: thread a JitCellToken when the
         // compile path is un-gated so finaloplist mints fresh prefix-label
         // tokens (`VectorLoop::finaloplist`).
-        // vector.py:172 `finally: loop.teardown_vectorization()`. The earlier
+        // vector.py `finally: loop.teardown_vectorization()`. The earlier
         // `return None` exits drop `sched_state` instead, discarding the same
         // pos-keyed forwarded store.
         loop_.teardown_vectorization(&mut sched_state);
@@ -2182,7 +2182,7 @@ impl VectorizingOptimizer {
 }
 
 impl VectorLoop {
-    /// vector.py:273-344: unroll_loop_iterations — unroll the loop body
+    /// vector.py: unroll_loop_iterations — unroll the loop body
     /// `count` times with proper renaming.
     ///
     /// `align_unroll_once` (vector.py:273) requests one extra alignment
@@ -2246,7 +2246,7 @@ impl VectorLoop {
             }
             renamer.bound_box(renamed)
         }
-        // vector.py:292 `new_label = loop.label` — the label install-target
+        // vector.py `new_label = loop.label` — the label install-target
         // is the existing label by default; the align-unroll arm overwrites
         // it with a freshly minted LABEL after the first body copy.
         let mut new_label = self.label.clone();
@@ -2406,9 +2406,9 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
     }
 }
 
-/// schedule.py:697-736: ensure_args_unpacked — unpack vector-boxed args
+/// schedule.py: ensure_args_unpacked — unpack vector-boxed args
 /// for a scalar op, respecting seen/invariant/accumulation state.
-// TODO(parity): schedule.py:697 ensure_args_unpacked is a method on
+// TODO(parity): schedule.py ensure_args_unpacked is a method on
 // VecScheduleState. Kept as a free `pub(crate)` fn so both the inline
 // scheduling loops here and VecScheduleState::post_schedule (schedule.rs)
 // can call it; promote to a method when the call sites are unified.
@@ -2738,7 +2738,7 @@ mod tests {
         assert_eq!(without_label.len(), 2); // IntAdd + Jump
     }
 
-    // ── post_schedule tests (schedule.py:762-779) ──
+    // ── post_schedule tests (schedule.py) ──
 
     /// schedule.py:762-779: invariant ops are routed into loop.prefix and the
     /// invariant vector var is appended to a fresh prefix_label and jump.
@@ -2785,7 +2785,7 @@ mod tests {
         );
         let seed_vec = pack.pos.get();
         st.invariant_oplist.push(std::rc::Rc::new(pack));
-        // expand() (schedule.py:554-555) registers the splat vector here.
+        // expand() (schedule.py) registers the splat vector here.
         st.invariant_vector_vars.insert(seed_vec);
 
         // The scheduled body lives in oplist; the base post_schedule
@@ -2823,12 +2823,12 @@ mod tests {
         assert_eq!(j_args.len(), 3);
         assert_eq!(j_args[2].to_opref(), seed_vec);
 
-        // base post_schedule (schedule.py:116): operations came from oplist.
+        // base post_schedule (schedule.py): operations came from oplist.
         assert_eq!(vloop.operations.len(), 1);
         assert_eq!(vloop.operations[0].opcode, OpCode::IntAdd);
     }
 
-    /// schedule.py:767 false branch: with no invariants, post_schedule leaves
+    /// schedule.py false branch: with no invariants, post_schedule leaves
     /// prefix/prefix_label empty and the jump arglist unchanged.
     #[test]
     fn test_post_schedule_no_invariants_leaves_label_and_jump() {
@@ -2866,7 +2866,7 @@ mod tests {
 
     /// `run_optimization`'s standalone resolver has no Optimizer context, so
     /// an `INT_SIGNEXT(x, ConstInt(n))` must take arg1's bytesize from the
-    /// inline `OpRef::ConstInt` (resoperation.py:181 reads `arg1.value`).
+    /// inline `OpRef::ConstInt` (resoperation.py reads `arg1.value`).
     /// Regression: the resolver previously returned `None` for every opref,
     /// so `int_signext_vecinfo`'s fail-fast `.expect()` panicked on a valid
     /// INT_SIGNEXT.
@@ -3022,7 +3022,7 @@ mod tests {
         );
     }
 
-    /// vector.py:134/160: `optimize_vector` registers exactly one LoopVersion
+    /// vector.py/160: `optimize_vector` registers exactly one LoopVersion
     /// snapshot before running the pipeline — so GuardStrengthenOpt's
     /// `versions.len() == 1` assert holds when the gso step is reached — and
     /// restores the caller's loop on a bail. A scalar (non-array) loop bails at
@@ -3130,7 +3130,7 @@ mod tests {
 
         // Reaching Ok proves the whole pipeline ran past the profitability gate
         // and through GuardStrengthenOpt: gso runs unconditionally between
-        // post_schedule and finaloplist (vector.py:259-271), so an Ok return
+        // post_schedule and finaloplist (vector.py), so an Ok return
         // means gso.propagate_all_forward was invoked AND its
         // `versions.len() == 1` assert held (otherwise it would panic, not Err).
         let (ops, gso_consts) = result.expect("adjacent-load loop must vectorize");

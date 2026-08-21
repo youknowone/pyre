@@ -8,7 +8,7 @@
 //! `F`/`D` string, char, pad, pascal, bool, half-float and complex codes.
 //! `struct.error`
 //! is `space.new_exception_class("struct.error", space.w_Exception)`
-//! (`interp_struct.py:20 Cache`).
+//! (`interp_struct.py Cache`).
 
 use majit_rlib::rbigint::RBigInt as BigInt;
 use num_traits::ToPrimitive;
@@ -19,7 +19,7 @@ const fn native_is_bigendian() -> bool {
     cfg!(target_endian = "big")
 }
 
-/// `interp_struct.py:23 get_error` — raise an instance of `struct.error`
+/// `interp_struct.py get_error` — raise an instance of `struct.error`
 /// (registered in the exc-class registry under its qualified name) carrying
 /// `msg`.
 fn struct_error(msg: impl Into<String>) -> crate::PyError {
@@ -1094,7 +1094,7 @@ pub(crate) fn unpack_half(bits: u16) -> f64 {
 
 // ── W_Struct ─────────────────────────────────────────────────────────
 
-/// `interp_struct.py:213 W_Struct` — a compiled struct object holding its
+/// `interp_struct.py W_Struct` — a compiled struct object holding its
 /// format string and precomputed size.
 #[crate::pyre_class("_struct.Struct")]
 pub struct W_Struct {
@@ -1122,7 +1122,7 @@ impl W_Struct {
 
 #[crate::pyre_methods(doc = "Struct(fmt) --> compiled struct object")]
 impl W_Struct {
-    /// `interp_struct.py:256 descr__new__` — the format string is consumed by
+    /// `interp_struct.py descr__new__` — the format string is consumed by
     /// `__init__`, so the allocator accepts and discards the trailing
     /// `__args__` instead of failing the gateway arity check.
     #[staticmethod]
@@ -1137,7 +1137,7 @@ impl W_Struct {
         })
     }
 
-    /// `interp_struct.py:222 descr__init__` — store the (normalized)
+    /// `interp_struct.py descr__init__` — store the (normalized)
     /// format string and its `_calcsize`.
     fn __init__(&mut self, w_format: PyObjectRef) -> Result<(), crate::PyError> {
         let format = format_to_string(w_format)?;
@@ -1158,7 +1158,7 @@ impl W_Struct {
         self.size
     }
 
-    /// `interp_struct.py:227 descr_pack` —
+    /// `interp_struct.py descr_pack` —
     /// `do_pack(space, jit.promote_string(self.format), args_w)`.
     /// The whole-args-slice ABI hands `args[0]` = self; the packed values
     /// are `args[1..]`.
@@ -1169,7 +1169,7 @@ impl W_Struct {
         do_pack(fmt, &args[1..])
     }
 
-    /// `interp_struct.py:234 descr_unpack` —
+    /// `interp_struct.py descr_unpack` —
     /// `do_unpack(space, jit.promote_string(self.format), w_str)`.
     fn unpack(&self, w_str: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         self.ensure_ready()?;
@@ -1179,7 +1179,7 @@ impl W_Struct {
         do_unpack(fmt, buf)
     }
 
-    /// `interp_struct.py:275 descr_unpack_from(self, w_buffer, offset=0)` —
+    /// `interp_struct.py descr_unpack_from(self, w_buffer, offset=0)` —
     /// `do_unpack_from(space, jit.promote_string(self.format), buffer, offset)`.
     /// `self` positional-only; `buffer` / `offset` positional-or-keyword.
     /// `offset` is `Option` so an omitted slot becomes `0` while an explicit
@@ -1203,7 +1203,7 @@ impl W_Struct {
         do_unpack_from(fmt, buf, offset)
     }
 
-    /// `interp_struct.py:241 descr_iter_unpack` — a `W_UnpackIter` over
+    /// `interp_struct.py descr_iter_unpack` — a `W_UnpackIter` over
     /// `buffer`.  Whole-args ABI: `args[0]` = self, `args[1]` = buffer.
     fn iter_unpack(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         self.ensure_ready()?;
@@ -1292,7 +1292,7 @@ fn sig_posonly_then_varargs(
     b.signature()
 }
 
-/// `interp_struct.py:66 pack(space, w_format, args_w)`.  The binder hands a
+/// `interp_struct.py pack(space, w_format, args_w)`.  The binder hands a
 /// bound slice `[format, (*args tuple)]`: the named `format` slot then the
 /// packed vararg tail as a single tuple.  A stray keyword is rejected by the
 /// binder before the body runs (`posonlyargcount == 1`, no `**kwargs`).  The
@@ -1307,7 +1307,7 @@ fn pack(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     do_pack(&fmt, &values)
 }
 
-/// `interp_struct.py:76 pack_into(space, w_format, w_buffer, offset, args_w)`.
+/// `interp_struct.py pack_into(space, w_format, w_buffer, offset, args_w)`.
 /// Bound slice `[format, buffer, offset, (*args tuple)]`.  As with [`pack`],
 /// the three required positional slots are `PY_NULL`-checked here.
 fn pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1322,7 +1322,7 @@ fn pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     do_pack_into(&fmt, args[1], offset, &values)
 }
 
-/// `interp_struct.py:268 descr_pack_into(self, w_buffer, offset, args_w)` —
+/// `interp_struct.py descr_pack_into(self, w_buffer, offset, args_w)` —
 /// the `Struct` method form.  Bound slice `[self, buffer, offset,
 /// (*args tuple)]`.  Registered by hand (below) because the
 /// `#[pyre_methods]` arm cannot emit a `varargname`-bearing `Signature` for a
@@ -1347,7 +1347,7 @@ fn struct_pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 // ── W_UnpackIter ─────────────────────────────────────────────────────
 
-/// `interp_struct.py:177 W_UnpackIter` — an iterator yielding the
+/// `interp_struct.py W_UnpackIter` — an iterator yielding the
 /// successive fixed-size records of a buffer.  Kept in its own module
 /// because each `#[pyre_class]` emits a module-scoped `type_object()`.
 pub mod unpack_iter {
@@ -1565,7 +1565,7 @@ crate::py_module! {
             let buf = unsafe { readbuf(buffer)? };
             do_unpack(&fmt, buf)
         }
-        // `interp_struct.py:154 unpack_from(space, w_format, w_buffer, offset=0)`.
+        // `interp_struct.py unpack_from(space, w_format, w_buffer, offset=0)`.
         // `format` positional-only; `buffer` / `offset` positional-or-keyword.
         // `offset` is `Option` rather than `#[default]` so an omitted slot
         // (`None`) becomes `0` while an explicit `offset=None` reaches
@@ -1597,7 +1597,7 @@ crate::py_module! {
         },
     },
     extra_init: |ns| {
-        // `interp_struct.py:20 Cache` —
+        // `interp_struct.py Cache` —
         // `space.new_exception_class("struct.error", space.w_Exception)`.
         let base = crate::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _struct init");
@@ -1607,8 +1607,8 @@ crate::py_module! {
             base,
         );
         crate::module_ns_store(ns, "error", error);
-        // `interp_struct.py:66 pack(w_format, args_w)` and
-        // `interp_struct.py:76 pack_into(w_format, w_buffer, offset, args_w)`
+        // `interp_struct.py pack(w_format, args_w)` and
+        // `interp_struct.py pack_into(w_format, w_buffer, offset, args_w)`
         // — `*args`-carrying builtins whose named parameters are all
         // positional-only.  The `inline_functions:` / `functions:` arms cannot
         // emit a `varargname`-bearing `Signature` (a `&[PyObjectRef]` slice
@@ -1646,7 +1646,7 @@ crate::py_module! {
                 ),
             ),
         );
-        // `interp_struct.py:268 descr_pack_into(self, w_buffer, offset, args_w)`
+        // `interp_struct.py descr_pack_into(self, w_buffer, offset, args_w)`
         // — the `*args` method form.  The `#[pyre_methods]` arm gives a
         // `&[PyObjectRef]` method a null `Signature` (raw whole-args
         // passthrough), so it is registered by hand into the `Struct` type

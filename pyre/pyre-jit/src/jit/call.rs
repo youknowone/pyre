@@ -3,7 +3,7 @@
 //! pyre-specific analog of RPython's `CallControl`. RPython's CallControl
 //! owns the JIT's per-warmspot state: the `jitcodes` dict mapping graphs
 //! to compiled JitCodes and the `unfinished_graphs` queue that
-//! `CodeWriter.make_jitcodes()` drains at warmspot init (codewriter.py:74-89).
+//! `CodeWriter.make_jitcodes()` drains at warmspot init (codewriter.py).
 //!
 //! pyre's "graph" is a `CodeObject` pointer; otherwise the field-by-field
 //! port matches upstream:
@@ -26,7 +26,7 @@
 //! |  translation time)          | `get_loop_header_pcs()`     |
 //!
 //! Note: RPython's CallControl is owned by a single
-//! `CodeWriter` instance (`warmspot.py:245`) for the lifetime of the JIT.
+//! `CodeWriter` instance (`warmspot.py`) for the lifetime of the JIT.
 //! pyre mirrors that with a per-thread singleton accessed via
 //! `CodeWriter::instance()`; interior mutability of the queue/cache is
 //! expressed with `UnsafeCell` on the owning `CodeWriter`.
@@ -63,7 +63,7 @@ impl CallInfoCollection {
 
 /// RPython: `rpython/jit/metainterp/warmspot.py` `JitDriverStaticData` —
 /// the per-portal record `CallControl.jitdrivers_sd` holds and
-/// `grab_initial_jitcodes` (call.py:145-148) iterates.  RPython's
+/// `grab_initial_jitcodes` (call.py) iterates.  RPython's
 /// `JitDriverStaticData` carries far more (`name`, `index`,
 /// `mainjitcode`, `_green_args_spec`, …); pyre adds only the fields
 /// the lazy portal-discovery path actually consumes today.
@@ -80,7 +80,7 @@ pub struct JitDriverStaticData {
     /// fires inside `grab_initial_jitcodes`.
     pub portal_graph: *const CodeObject,
     /// RPython: `JitDriverStaticData.mainjitcode`
-    /// (`call.py:147` `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`
+    /// (`call.py` `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`
     /// left-hand side, plus `call.py:148`
     /// `jd.mainjitcode.jitdriver_sd = jd`).  Populated by
     /// [`CallControl::grab_initial_jitcodes`] with the same Arc that
@@ -114,34 +114,34 @@ pub struct JitDriverStaticData {
     pub mainjitcode: Option<std::sync::Arc<PyJitCode>>,
 }
 
-/// RPython: `rpython/jit/codewriter/call.py:21` `class CallControl(object)`.
+/// RPython: `rpython/jit/codewriter/call.py` `class CallControl(object)`.
 pub struct CallControl {
-    /// call.py:22 `virtualref_info = None` — class-level default,
-    /// populated by `CodeWriter.setup_vrefinfo` (codewriter.py:91-94).
+    /// call.py `virtualref_info = None` — class-level default,
+    /// populated by `CodeWriter.setup_vrefinfo` (codewriter.py).
     ///
     /// Note: pyre has no `virtualref` machinery yet
     /// (no `@jit.virtual_ref` annotations, no `vref_info` lookup); the
     /// slot is `None` and the setter is a no-op shell.
     pub virtualref_info: Option<()>,
 
-    /// call.py:23 `has_libffi_call = False` — class-level default.
+    /// call.py `has_libffi_call = False` — class-level default.
     ///
     /// Note: pyre has no `_call_aroundstate_target_`
     /// rewriting in `getcalldescr`, so this stays `false`.
     pub has_libffi_call: bool,
 
-    /// call.py:27 `self.cpu = cpu`.
+    /// call.py `self.cpu = cpu`.
     ///
     /// pyre's `Cpu` (see [`super::cpu::Cpu`]) bundles the blackhole
     /// helper function pointers used by `transform_graph_to_jitcode`
     /// to populate the `JitCode` fn-ptr table. The same `cpu` is also
-    /// reachable via `CodeWriter::cpu(&self)` (codewriter.py:21
+    /// reachable via `CodeWriter::cpu(&self)` (codewriter.py
     /// `self.cpu = cpu`).
     pub cpu: Cpu,
 
-    /// call.py:28 `self.jitdrivers_sd = jitdrivers_sd`.
+    /// call.py `self.jitdrivers_sd = jitdrivers_sd`.
     ///
-    /// `grab_initial_jitcodes()` (call.py:145-148) iterates this list
+    /// `grab_initial_jitcodes()` (call.py) iterates this list
     /// and calls `get_jitcode(jd.portal_graph)` on each entry. pyre
     /// populates the list lazily via `CodeWriter::setup_jitdriver`
     /// (codewriter.py:96-99), once per unique portal CodeObject the
@@ -149,7 +149,7 @@ pub struct CallControl {
     /// pyre-only adapter fields.
     pub jitdrivers_sd: Vec<JitDriverStaticData>,
 
-    /// call.py:29 `self.jitcodes = {}` — map `{graph: jitcode}`.
+    /// call.py `self.jitcodes = {}` — map `{graph: jitcode}`.
     ///
     /// pyre keys on the canonical raw `CodeObject*` graph identity.
     /// Callers normalize wrapper-backed runtime inputs before they
@@ -168,21 +168,21 @@ pub struct CallControl {
     /// `HashMap` rehashes.
     pub jitcodes: HashMap<usize, std::sync::Arc<PyJitCode>>,
 
-    /// call.py:30 `self.unfinished_graphs = []` — LIFO queue of graphs
+    /// call.py `self.unfinished_graphs = []` — LIFO queue of graphs
     /// pending compilation. Populated by `get_jitcode()` when it sees a
     /// new graph and drained by `enum_pending_graphs()` inside
-    /// `make_jitcodes()` (codewriter.py:79).
+    /// `make_jitcodes()` (codewriter.py).
     ///
     /// pyre now mirrors RPython's bare-graph queue directly. The
     /// pyre-only `w_code` adapter state lives on the cached `PyJitCode`
     /// shell instead of in the queue tuple so
-    /// `enum_pending_graphs()` can match `call.py:150-153` again.
+    /// `enum_pending_graphs()` can match `call.py` again.
     pub unfinished_graphs: Vec<*const CodeObject>,
 
-    /// call.py:31 `self.callinfocollection = CallInfoCollection()`.
+    /// call.py `self.callinfocollection = CallInfoCollection()`.
     ///
     /// Fed to `Assembler::finished()` at the end of
-    /// `CodeWriter::make_jitcodes` (codewriter.py:85). See
+    /// `CodeWriter::make_jitcodes` (codewriter.py). See
     /// [`CallInfoCollection`] for the pyre-side shell rationale.
     pub callinfocollection: CallInfoCollection,
 
@@ -192,7 +192,7 @@ pub struct CallControl {
     /// Loop headers are translation-time information upstream. A
     /// `can_enter_jit` marker in the source graph becomes a `loop_header`
     /// operation while the graph is transformed
-    /// (`jtransform.py:1714-1723 handle_jit_marker__loop_header`), and
+    /// (`jtransform.py handle_jit_marker__loop_header`), and
     /// the marker scan over all graphs — `warmspot.py:143-156
     /// _find_jit_marker` / `:172-173 find_loop_headers` — likewise runs
     /// once, inside `WarmRunnerDesc.__init__`. The running interpreter
@@ -205,8 +205,8 @@ pub struct CallControl {
     /// are a layout artifact rather than a loop back-edge. Keeping the
     /// result here gives that scan upstream's computed-once, per-graph
     /// lifetime, under the same owner and key as the jitcodes it belongs
-    /// with (call.py:29 `self.jitcodes = {}` is a plain instance dict on
-    /// `CallControl`, filled on miss by call.py:155-172 `get_jitcode`).
+    /// with (call.py `self.jitcodes = {}` is a plain instance dict on
+    /// `CallControl`, filled on miss by call.py `get_jitcode`).
     pub loop_header_pcs: HashMap<usize, std::sync::Arc<VecSet<usize>>>,
 
     /// Per-backedge result of pyre's temporary FOR_ITER safety gate.  The
@@ -250,7 +250,7 @@ impl CallControl {
     /// RPython: `CallControl.__init__(cpu=None, jitdrivers_sd=[])`
     /// (call.py:25-47).
     pub fn new(cpu: Cpu, jitdrivers_sd: Vec<JitDriverStaticData>) -> Self {
-        // call.py:26 `assert isinstance(jitdrivers_sd, list)`.
+        // call.py `assert isinstance(jitdrivers_sd, list)`.
         // Rust's type system enforces this at compile time.
         Self {
             virtualref_info: None,
@@ -270,7 +270,7 @@ impl CallControl {
     /// Loop-header PC set for `code`, computed on first request and kept
     /// on this `CallControl` afterwards.
     ///
-    /// Same memoize-on-miss shape as `get_jitcode` (call.py:155-172:
+    /// Same memoize-on-miss shape as `get_jitcode` (call.py:
     /// `try: return self.jitcodes[graph] / except KeyError: ... ;
     /// self.jitcodes[graph] = jitcode; return jitcode`) and keyed by the
     /// same canonical `CodeObject*` graph identity. The scan reads only
@@ -287,7 +287,7 @@ impl CallControl {
         computed
     }
 
-    /// RPython: `CallControl.grab_initial_jitcodes()` (call.py:145-148).
+    /// RPython: `CallControl.grab_initial_jitcodes()` (call.py).
     ///
     /// ```python
     /// for jd in self.jitdrivers_sd:
@@ -297,7 +297,7 @@ impl CallControl {
     ///
     /// PARITY: `JitDriverStaticData.mainjitcode` (call.py:147 left-hand
     /// side) is assigned immediately from `get_jitcode`. The
-    /// back-reference at call.py:148 (`jd.mainjitcode.jitdriver_sd = jd`)
+    /// back-reference at call.py (`jd.mainjitcode.jitdriver_sd = jd`)
     /// is stamped onto the populated runtime `JitCode` in
     /// `CodeWriter::finalize_jitcode`, where the precise jdindex is known
     /// from `CallControl.jitdrivers_sd`.
@@ -310,13 +310,13 @@ impl CallControl {
         for i in 0..self.jitdrivers_sd.len() {
             let portal_graph = self.jitdrivers_sd[i].portal_graph;
             let code = unsafe { &*portal_graph };
-            // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
+            // call.py `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
             // Inserts an empty PyJitCode skeleton into `jitcodes`, pushes
             // the graph onto `unfinished_graphs`. Drop the returned
             // clone immediately so the cached slot is uniquely owned for
             // the call.py:148 stamp below.
             drop(self.get_jitcode(code));
-            // call.py:148 `jd.mainjitcode.jitdriver_sd = jd` — stamp the
+            // call.py `jd.mainjitcode.jitdriver_sd = jd` — stamp the
             // skeleton's `jitdriver_sd` while the outer `Arc<PyJitCode>`
             // and inner `Arc<JitCode>` still have refcount 1 (only the
             // jitcodes slot holds them). Then bind `jd.mainjitcode` to
@@ -395,7 +395,7 @@ impl CallControl {
             .map(|arc| arc.as_ref())
     }
 
-    /// RPython: `CallControl.enum_pending_graphs()` (call.py:150-153).
+    /// RPython: `CallControl.enum_pending_graphs()` (call.py).
     ///
     /// ```python
     /// while self.unfinished_graphs:
@@ -410,7 +410,7 @@ impl CallControl {
     /// RPython: `CallControl.jitdriver_sd_from_portal_graph(graph)` —
     /// returns the `JitDriverStaticData` whose `portal_graph` matches
     /// `code`, or `None` if `code` is not a registered portal. Used by
-    /// `CodeWriter::transform_graph_to_jitcode` (codewriter.py:37) to
+    /// `CodeWriter::transform_graph_to_jitcode` (codewriter.py) to
     /// learn whether a graph is a portal **before** running jtransform,
     /// matching the RPython `portal_jd = self.callcontrol.…` lookup.
     ///
@@ -425,7 +425,7 @@ impl CallControl {
             .position(|jd| jd.portal_graph == code)
     }
 
-    /// RPython: `CallControl.get_jitcode_calldescr(graph)` (call.py:174-187).
+    /// RPython: `CallControl.get_jitcode_calldescr(graph)` (call.py).
     ///
     /// ```python
     /// def get_jitcode_calldescr(self, graph):
@@ -500,10 +500,10 @@ impl CallControl {
             // to unfinished_graphs. The body fill (jtransform / regalloc
             // / flatten / assemble) is deferred to
             // `CodeWriter::make_jitcodes`'s drain loop at
-            // codewriter.py:80 `transform_graph_to_jitcode(graph,
+            // codewriter.py `transform_graph_to_jitcode(graph,
             // jitcode, verbose, len(all_jitcodes))`.
             self.reset_jitcode_skeleton(key, code_ptr);
-            // call.py:171 `self.unfinished_graphs.append(graph)`.
+            // call.py `self.unfinished_graphs.append(graph)`.
             self.unfinished_graphs.push(code_ptr);
         }
         std::sync::Arc::clone(self.jitcodes.get(&key).unwrap())
@@ -517,7 +517,7 @@ impl CallControl {
     /// Inserts a fresh `Arc<PyJitCode>` rather than mutating an existing
     /// payload in place: `publish_jitcode` fills the slot in place after
     /// the drain, but this entry point only runs when the key is absent
-    /// (`get_jitcode`'s `call.py:155` guard), so there is no populated
+    /// (`get_jitcode`'s `call.py` guard), so there is no populated
     /// holder to clobber.
     fn reset_jitcode_skeleton(&mut self, key: usize, code_ptr: *const CodeObject) {
         // Only the absent-key path (`get_jitcode`'s `needs_rebuild`) installs a
@@ -535,9 +535,9 @@ impl CallControl {
     /// Publish the populated jitcode into `self.jitcodes[graph]`.
     ///
     /// RPython mutates the same `JitCode` object in place — the drain
-    /// at `codewriter.py:80` calls `transform_graph_to_jitcode(graph,
+    /// at `codewriter.py` calls `transform_graph_to_jitcode(graph,
     /// jitcode, ...)` where `jitcode` is the skeleton that was already
-    /// stored at `call.py:170` (`self.jitcodes[graph] = jitcode`), and
+    /// stored at `call.py` (`self.jitcodes[graph] = jitcode`), and
     /// inside that call `self.assembler.assemble(ssarepr, jitcode,
     /// num_regs)` (codewriter.py:67) fills the skeleton's fields.
     ///

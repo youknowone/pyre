@@ -12,7 +12,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     Array, GcKind, LowLevelType, PtrTarget, typeOf,
 };
 
-/// RPython `support.USESLOTS = True` (`support.py:8`).
+/// RPython `support.USESLOTS = True` (`support.py`).
 ///
 /// Rust structs already have a fixed layout, but keeping the flag makes
 /// the module-level surface match upstream for callers that branch on
@@ -22,7 +22,7 @@ pub const USESLOTS: bool = true;
 /// RPython `support.log = AnsiLogger("c")` (`support.py:169-170`).
 pub const LOG_NAME: &str = "c";
 
-/// RPython `support.barebonearray(ARRAY)` (`support.py:10-14`).
+/// RPython `support.barebonearray(ARRAY)` (`support.py`).
 ///
 /// True iff `ARRAY` is "simple": carries the `nolength` hint, is not
 /// GC-managed, and its element type is not `Void`.
@@ -84,7 +84,7 @@ pub fn forward_cdecl(
     format!("{prefix}{}", cdecl(ctype, cname, false))
 }
 
-/// RPython `support.somelettersfrom(s)` (`support.py:45-53`).
+/// RPython `support.somelettersfrom(s)` (`support.py`).
 ///
 /// Upstream iterates Python 2 `str` byte-by-byte (`for c in s`,
 /// `s.title()`, `s[:2]`), so the port also walks bytes. The result is
@@ -138,7 +138,7 @@ pub fn is_pointer_to_forward_ref(t: &LowLevelType) -> bool {
     matches!(p.TO, PtrTarget::ForwardReference(_))
 }
 
-/// RPython `support.llvalue_from_constant(c)` (`support.py:60-72`).
+/// RPython `support.llvalue_from_constant(c)` (`support.py`).
 ///
 /// Upstream:
 /// ```python
@@ -247,7 +247,7 @@ fn const_value_compatible_with_concretetype(value: &ConstValue, t: &LowLevelType
     }
 }
 
-/// RPython `support._char_repr(c)` (`support.py:91-95`).
+/// RPython `support._char_repr(c)` (`support.py`).
 ///
 /// Upstream operates on a Python 2 `str` (byte string), so the input
 /// is a raw byte. Mirror by accepting `u8` and matching ASCII space
@@ -263,12 +263,12 @@ fn byte_repr(b: u8) -> String {
     }
 }
 
-/// RPython `support._line_repr(s)` (`support.py:97-98`).
+/// RPython `support._line_repr(s)` (`support.py`).
 fn line_repr(s: &[u8]) -> String {
     s.iter().copied().map(byte_repr).collect()
 }
 
-/// RPython `support.c_string_constant(s)` (`support.py:101-106`).
+/// RPython `support.c_string_constant(s)` (`support.py`).
 ///
 /// Returns a `" "`-delimited string literal for C, broken at every
 /// 64th source byte (upstream uses Python 2 byte strings; the
@@ -282,7 +282,7 @@ pub fn c_string_constant(s: &[u8]) -> String {
     lines.join("\n")
 }
 
-/// RPython `support.c_char_array_constant(s)` (`support.py:109-126`).
+/// RPython `support.c_char_array_constant(s)` (`support.py`).
 ///
 /// Returns an initialiser for a `char[N]` array where `N == len(s)`
 /// (byte length, matching upstream's Python 2 `str`). When `s` ends
@@ -311,7 +311,7 @@ pub fn c_char_array_constant(s: &[u8]) -> String {
     }
 }
 
-/// RPython `support.gen_assignments(assignments)` (`support.py:129-165`).
+/// RPython `support.gen_assignments(assignments)` (`support.py`).
 ///
 /// Reorders `(typename, dest, src)` assignments to avoid clashes —
 /// equivalent to a tuple assignment, reading all sources first and
@@ -371,7 +371,7 @@ pub fn gen_assignments(assignments: &[(String, String, String)]) -> Vec<String> 
     out
 }
 
-/// RPython `support.CNameManager` (`support.py:74-89`).
+/// RPython `support.CNameManager` (`support.py`).
 ///
 /// Upstream `:74 class CNameManager(NameManager)` is a subclass: every
 /// `NameManager` method is callable on a `CNameManager` directly. Rust

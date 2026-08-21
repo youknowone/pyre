@@ -1,6 +1,6 @@
 //! W_BoolObject — Python `bool` type.
 //!
-//! `W_BoolObject` is a subclass of `W_IntObject` (`boolobject.py:30`), so a
+//! `W_BoolObject` is a subclass of `W_IntObject` (`boolobject.py`), so a
 //! bool holds the same `intval: i64` field at the same offset as an int
 //! (0 for `False`, 1 for `True`). The two are distinguished only by the
 //! `&BOOL_TYPE` vtable, which lets `GuardClass` specialize on the concrete
@@ -54,7 +54,7 @@ pub unsafe fn w_bool_get_value(obj: PyObjectRef) -> bool {
 //
 // pypy/objspace/std/objspace.py:61 installs `space.w_True` /
 // `space.w_False` as singletons; every PyPy `space.newbool(value)`
-// call (pypy/interpreter/baseobjspace.py:893 `newbool`) returns one of
+// call (pypy/interpreter/baseobjspace.py `newbool`) returns one of
 // the two pre-allocated objects. pyre mirrors the singleton model with
 // two process-global prebuilt objects and routes all callers through
 // [`w_bool_from`]. Their host allocations carry the same GC header as an
@@ -93,7 +93,7 @@ pub fn w_bool_from(value: bool) -> *mut PyObject {
     }
 }
 
-// ── W_BoolObject.descr_and/or/xor (boolobject.py:54-76) ──────────────
+// ── W_BoolObject.descr_and/or/xor (boolobject.py) ──────────────
 //
 // PyPy _make_bitwise_binop:
 //     def descr_binop(self, space, w_other):
@@ -106,7 +106,7 @@ pub fn w_bool_from(value: bool) -> *mut PyObject {
 // The `isinstance(self, W_BoolObject)` dispatch happens on the caller
 // side (space.and_) — these helpers assume both operands are bool.
 
-/// boolobject.py:74 descr_and — both operands W_BoolObject.
+/// boolobject.py descr_and — both operands W_BoolObject.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -115,7 +115,7 @@ pub unsafe fn bool_descr_and(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     unsafe { w_bool_from(w_bool_get_value(a) & w_bool_get_value(b)) }
 }
 
-/// boolobject.py:75 descr_or — both operands W_BoolObject.
+/// boolobject.py descr_or — both operands W_BoolObject.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -124,7 +124,7 @@ pub unsafe fn bool_descr_or(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     unsafe { w_bool_from(w_bool_get_value(a) | w_bool_get_value(b)) }
 }
 
-/// boolobject.py:76 descr_xor — both operands W_BoolObject.
+/// boolobject.py descr_xor — both operands W_BoolObject.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime

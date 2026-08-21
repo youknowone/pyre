@@ -44,7 +44,7 @@ use std::collections::VecDeque;
 /// `try: ... finally:` block.
 pub type DeferredCall<E> = Box<dyn FnOnce() -> Result<(), E>>;
 
-/// RPython `class FlattenRecursion(TlsClass)` (tool/flattenrec.py:13-31).
+/// RPython `class FlattenRecursion(TlsClass)` (tool/flattenrec.py).
 pub struct FlattenRecursion<E> {
     /// RPython `self.later: list | None` — `None` when not currently
     /// draining; `Some(queue)` while an outer call holds the queue.

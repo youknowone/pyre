@@ -37,7 +37,7 @@ use crate::x86::cpu_ext::X86CpuExt as ArchCpuExt;
 /// `token_number -> DynasmCaTarget` index is required.
 ///
 /// Each entry retains the callee's `Arc<CompiledLoopToken>` so
-/// `handle_call_assembler` (rewrite.py:665-695) can sample
+/// `handle_call_assembler` (rewrite.py) can sample
 /// `_ll_initial_locs` and `frame_info` for the
 /// `call_assembler_callee_locs` callback. The Arc is the compiled token's own
 /// `JitCellToken.compiled_loop_token`, kept alive here so GC-rewrite metadata
@@ -47,7 +47,7 @@ struct DynasmCaTarget {
     /// redirect bookkeeping and diagnostics. Dynasm address resolution now
     /// reads the descr-carried token directly.
     code_addr: usize,
-    /// `model.py:292-338` `CompiledLoopToken` — Arc-shared with the
+    /// `model.py` `CompiledLoopToken` — Arc-shared with the
     /// owning `JitCellToken` once the real target registers.
     compiled_loop_token: Arc<majit_backend::CompiledLoopToken>,
     /// `pyjitpl.py:3629` `outermost_jitdriver_sd.index_of_virtualizable`.
@@ -71,7 +71,7 @@ thread_local! {
         RefCell::new(IndexMap::new());
 }
 
-/// `rewrite.py:665-695` `handle_call_assembler` per-callee metadata
+/// `rewrite.py` `handle_call_assembler` per-callee metadata
 /// lookup, sourced from the registered `DynasmCaTarget`'s CLT Arc.
 /// Mirrors `majit-backend-cranelift::compiler.rs`.
 pub(crate) fn lookup_call_assembler_callee_locs(
@@ -434,7 +434,7 @@ fn dynasm_typeid_subclass_range(typeid: u32) -> Option<(i64, i64)> {
     with_dynasm_active_gc(|gc| gc.typeid_subclass_range(typeid)).flatten()
 }
 
-/// gc.py:525-531 `get_nursery_free_addr` / `get_nursery_top_addr` parity:
+/// gc.py `get_nursery_free_addr` / `get_nursery_top_addr` parity:
 /// the backend reads nursery slot addresses from the active GC descriptor,
 /// NOT from a process-global singleton. Returns `(0, 0)` when no GC is
 /// bound so the assembler falls back to the slow-path helper.
@@ -455,7 +455,7 @@ fn gc_store_supported_factors() -> &'static [i64] {
     &[1]
 }
 
-/// Per-backend `CPU.supports_load_effective_address` — x86/runner.py:22
+/// Per-backend `CPU.supports_load_effective_address` — x86/runner.py
 /// overrides model.py:22 base default `False` to `True`; aarch64/runner.py
 /// inherits the base `False` (rewriter expands to INT_LSHIFT + INT_ADD +
 /// INT_ADD per rewrite.py:1089-1098 instead of emitting LOAD_EFFECTIVE_ADDRESS).
@@ -840,7 +840,7 @@ fn dynasm_gc_memory_stats() -> majit_gc::GcMemoryStats {
 }
 
 /// Report whether the GC wants a major collection, for the interpreter GC
-/// safepoint (incminimark.py:1288-1290 `threshold_reached`).
+/// safepoint (incminimark.py `threshold_reached`).
 fn dynasm_major_threshold_reached() -> bool {
     if let Some(r) = gc_box::with_mut(|g| g.major_threshold_reached()) {
         return r;
@@ -937,7 +937,7 @@ fn oom_signal_if_zero(result: u64) -> u64 {
     if result == 0 {
         let v = majit_backend::memory_error_singleton_ref();
         if v != 0 {
-            // llmodel.py:194-199 `_store_exception` parity — `jit_exc_raise`
+            // llmodel.py `_store_exception` parity — `jit_exc_raise`
             // sets both `JIT_EXC_VALUE` and the typeptr-derived
             // `JIT_EXC_TYPE`, matching the translated `raise MemoryError`
             // sequence inside RPython's `do_malloc_fixedsize_clear`.
@@ -1018,7 +1018,7 @@ pub extern "C" fn dynasm_nursery_slowpath_jitframe(frame_size: u64) -> u64 {
 /// payload pointer.
 ///
 /// **TODO (str/unicode/var slowpath collapse).**
-/// PyPy `x86/assembler.py:231-323 _build_malloc_slowpath(kind)` builds
+/// PyPy `x86/assembler.py _build_malloc_slowpath(kind)` builds
 /// four distinct trampolines (`'fixed'`, `'str'`, `'unicode'`, `'var'`)
 /// stored as separate fields on the assembler
 /// (`malloc_slowpath`/`malloc_slowpath_varsize`/`malloc_slowpath_str`/
@@ -1232,7 +1232,7 @@ fn dynasm_alloc_oldgen_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
     }
 }
 
-/// gc.py:481-490 `malloc_big_fixedsize(size, tid)` — fixed-size object
+/// gc.py `malloc_big_fixedsize(size, tid)` — fixed-size object
 /// large enough to skip the nursery, allocated directly in the old gen
 /// via `do_malloc_fixedsize_clear`.  Header is stamped with the type
 /// id so callers MUST NOT emit a separate `gen_initialize_tid`.
@@ -1248,7 +1248,7 @@ pub extern "C" fn dynasm_malloc_big_fixedsize(size: u64, type_id: u64) -> u64 {
     oom_signal_if_zero(dynasm_alloc_oldgen_typed_or_raw(type_id as u32, payload))
 }
 
-/// gc.py:460 `malloc_str(length)` — but the upstream closure captures
+/// gc.py `malloc_str(length)` — but the upstream closure captures
 /// `str_type_id` from `self.str_descr.tid` at generate-time.  `extern
 /// "C" fn` cannot capture, so the type id is threaded through the
 /// CALL_R as an explicit Signed arg and the calldescr's first param is
@@ -1263,7 +1263,7 @@ pub extern "C" fn dynasm_malloc_str(type_id: u64, length: u64) -> u64 {
     ))
 }
 
-/// gc.py:469 `malloc_unicode(length)` — see `dynasm_malloc_str` for the
+/// gc.py `malloc_unicode(length)` — see `dynasm_malloc_str` for the
 /// closure-vs-extern type-id threading rationale.
 pub extern "C" fn dynasm_malloc_unicode(type_id: u64, length: u64) -> u64 {
     oom_signal_if_zero(dynasm_alloc_varsize_typed_and_set_len(
@@ -1291,7 +1291,7 @@ pub extern "C" fn dynasm_write_barrier(obj_ptr: u64) {
 /// opassembler.py:956-976: non-array write barrier slow path, for an ordinary
 /// store's base.
 ///
-/// `gc.py:295-299 get_write_barrier_fn` resolves to
+/// `gc.py get_write_barrier_fn` resolves to
 /// `framework.py:538-544 gcdata.gc.remember_young_pointer`, whose own comment
 /// is "We know that 'addr_struct' has GCFLAG_TRACK_YOUNG_PTRS so far"
 /// (`incminimark.py:1538-1546`) — the inline test already made that true, so
@@ -1313,7 +1313,7 @@ pub extern "C" fn dynasm_write_barrier_from_array(obj_ptr: u64) {
     });
 }
 
-/// llmodel.py:495-497 `write_ref_at_mem`: the write barrier implied by the
+/// llmodel.py `write_ref_at_mem`: the write barrier implied by the
 /// framework GC transformer around every blackhole ref store
 /// (`bh_setfield_gc_r`, `bh_setarrayitem_gc_r`, `bh_setinteriorfield_gc_r`).
 /// The blackhole interpreter is not the JIT, so no inline TRACK_YOUNG_PTRS
@@ -1382,9 +1382,9 @@ pub unsafe extern "C" fn dynasm_realloc_frame(
     new_jf
 }
 
-/// runner.py:23 AbstractX86CPU — concrete Backend implementation.
+/// runner.py AbstractX86CPU — concrete Backend implementation.
 pub struct DynasmBackend {
-    /// `rpython/jit/backend/model.py:28-29 self.tracker = CPUTotalTracker()`
+    /// `rpython/jit/backend/model.py self.tracker = CPUTotalTracker()`
     /// parity — per-instance `cpu.tracker` exposed via
     /// [`Backend::cpu_tracker`].  Held behind `Arc` so the same
     /// counters are shared with the paired `JitProfiler` (which
@@ -1394,7 +1394,7 @@ pub struct DynasmBackend {
     /// / [`CompiledLoopToken::compiling_a_bridge`] hit one shared
     /// store.
     cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
-    /// `llsupport/asmmemmgr.py:38-40` `cpu.asmmemmgr` parity.  The
+    /// `llsupport/asmmemmgr.py` `cpu.asmmemmgr` parity.  The
     /// handle is owned by this CPU/backend and shared with every compiled code
     /// block and per-CPU helper buffer; its retained inner arena is
     /// process-owned so worker-backend teardown cannot discard reusable pages.
@@ -1460,7 +1460,7 @@ impl DynasmBackend {
         (addr as usize).wrapping_add(offset as usize)
     }
 
-    /// llmodel.py:467-478 read_int_at_mem(gcref, ofs, size, sign).
+    /// llmodel.py read_int_at_mem(gcref, ofs, size, sign).
     fn read_int_at_mem(&self, addr: i64, offset: i64, size: usize, sign: bool) -> i64 {
         let ptr = Self::raw_mem_ptr(addr, offset);
         unsafe {
@@ -1476,7 +1476,7 @@ impl DynasmBackend {
         }
     }
 
-    /// llmodel.py:481-488 write_int_at_mem(gcref, ofs, size, newvalue).
+    /// llmodel.py write_int_at_mem(gcref, ofs, size, newvalue).
     fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64) {
         let ptr = Self::raw_mem_ptr(addr, offset);
         unsafe {
@@ -1489,13 +1489,13 @@ impl DynasmBackend {
         }
     }
 
-    /// llmodel.py:490-491 read_float_at_mem(gcref, ofs).
+    /// llmodel.py read_float_at_mem(gcref, ofs).
     fn read_float_at_mem(&self, addr: i64, offset: i64) -> f64 {
         let ptr = Self::raw_mem_ptr(addr, offset);
         unsafe { (ptr as *const f64).read_unaligned() }
     }
 
-    /// llmodel.py:493-494 write_float_at_mem(gcref, ofs, newvalue).
+    /// llmodel.py write_float_at_mem(gcref, ofs, newvalue).
     fn write_float_at_mem(&self, addr: i64, offset: i64, newvalue: f64) {
         let ptr = Self::raw_mem_ptr(addr, offset);
         unsafe { (ptr as *mut f64).write_unaligned(newvalue) }
@@ -1507,7 +1507,7 @@ impl DynasmBackend {
         // `DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`
         // singletons are attached later by
         // `compile.make_and_attach_done_descrs([self, cpu])` during
-        // `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222).
+        // `MetaInterpStaticData.finish_setup` (pyjitpl.py).
         let asm_memory_stats = Arc::new(majit_backend::AsmMemoryManagerStats::default());
         let asm_memory_manager =
             majit_backend::AsmMemoryManager::new(Arc::clone(&asm_memory_stats));
@@ -1557,13 +1557,13 @@ impl DynasmBackend {
     /// Test helper: attach synthetic per-cpu `DoneWithThisFrame*` +
     /// `ExitFrameWithExceptionDescrRef` descrs, mirroring the state
     /// `MetaInterpStaticData.attach_descrs_to_cpu(cpu)` leaves the
-    /// backend in at `finish_setup` (pyjitpl.py:2222).  Production
+    /// backend in at `finish_setup` (pyjitpl.py).  Production
     /// code reaches this state through `MetaInterp::new`; backend-
     /// only unit/integration tests that skip the metainterp call
     /// this to get a populated cpu before running `compile_loop`.
     pub fn attach_default_test_descrs(&mut self) {
-        // `compile.py:665-674 make_and_attach_done_descrs` +
-        // `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr`
+        // `compile.py make_and_attach_done_descrs` +
+        // `pyjitpl.py` `self.cpu.propagate_exception_descr = exc_descr`
         // parity: attach the class-distinct DoneWithThisFrameDescr* /
         // ExitFrameWithExceptionDescrRef plus a PropagateExceptionDescr
         // stand-in that the metainterp would mint through
@@ -1581,7 +1581,7 @@ impl DynasmBackend {
         let float: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new());
         let exit_exc: majit_ir::DescrRef =
             Arc::new(majit_backend::ExitFrameWithExceptionDescrRef::new());
-        // `compile.py:712 PropagateExceptionDescr` parity: backend-only
+        // `compile.py PropagateExceptionDescr` parity: backend-only
         // tests still need the same descr class identity that production
         // `MetaInterpStaticData.finish_setup` installs.
         let propagate: majit_ir::DescrRef = Arc::new(majit_backend::PropagateExceptionDescr::new());
@@ -1607,12 +1607,12 @@ impl DynasmBackend {
         self.vtable_offset
     }
 
-    /// `compile.py:665-674` `make_and_attach_done_descrs` parity: expose
+    /// `compile.py` `make_and_attach_done_descrs` parity: expose
     /// the six per-cpu-instance descrs as raw pointers for emission
     /// consumers (Assembler386 / AssemblerARM64 FINISH + CALL_ASSEMBLER
     /// sites).  The metainterp attaches the real descrs through
     /// `Backend::set_done_with_this_frame_descr_*` during
-    /// `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222); before that
+    /// `MetaInterpStaticData.finish_setup` (pyjitpl.py); before that
     /// the per-cpu fallback descrs installed by `DynasmBackend::new()`
     /// answer, so backend-only integration tests see distinct, non-zero
     /// pointers per result type without ever consulting per-thread state.
@@ -1648,7 +1648,7 @@ impl DynasmBackend {
     /// `assembler.py:822 gcreftracers.append(tracer)`; the tracer owns
     /// the cell `Arc`s for the lifetime of the compiled loop so the
     /// `FailDescrCell` addresses baked into machine code stay live until
-    /// `free_loop_and_bridges` drops the CLT (`llmodel.py:252-268`).
+    /// `free_loop_and_bridges` drops the CLT (`llmodel.py`).
     pub fn register_fail_descrs(
         &self,
         token: &majit_backend::JitCellToken,
@@ -1672,7 +1672,7 @@ impl DynasmBackend {
     /// is baked into machine code by the `LoadFromGcTable` genops, so the
     /// strong `Arc` must outlive the compiled trace.
     /// `clt.asmmemmgr_gcreftracers` is that lifetime root (`model.py:294`
-    /// / `llmodel.py:252-268 free_loop_and_bridges`); when the CLT drops,
+    /// / `llmodel.py free_loop_and_bridges`); when the CLT drops,
     /// the table frees and its `Weak` in the gcreftracer registry is
     /// reaped lazily, so deregistration needs no `free_loop` hook.
     fn register_gc_table(
@@ -1695,7 +1695,7 @@ impl DynasmBackend {
     ///
     /// Built unconditionally. Upstream never asks whether a collector
     /// exists before rewriting: `aarch64/regalloc.py:188` (and
-    /// `x86/regalloc.py:187`) call `cpu.gc_ll_descr.rewrite_assembler`
+    /// `x86/regalloc.py`) call `cpu.gc_ll_descr.rewrite_assembler`
     /// straight through, and `gc.py:109-112` defines it on the base
     /// `GcLLDescription`, so `GcLLDescr_boehm` — a configuration with no
     /// nursery and no write barrier — still runs the whole pass. The
@@ -1703,7 +1703,7 @@ impl DynasmBackend {
     /// whether the pass runs.
     ///
     /// That distinction is load-bearing because the pass is not only about
-    /// the GC. `transform_to_gc_load` (rewrite.py:212-342) is the memory-op
+    /// the GC. `transform_to_gc_load` (rewrite.py) is the memory-op
     /// lowering, and it reads only descrs and CPU addressing capability:
     /// skip it and `RAW_LOAD_I` never becomes `GC_LOAD_INDEXED_I`
     /// (rewrite.py:228-232 via :199-205), so a variable index box reaches a
@@ -1713,7 +1713,7 @@ impl DynasmBackend {
     /// Four fields come from the collector and two more take their boehm values
     /// when there is none (gc.py:151-162). With none installed
     /// they take upstream's base-class values: `can_use_nursery_malloc`
-    /// returns False (gc.py:81-82, inherited by `GcLLDescr_boehm`), spelled
+    /// returns False (gc.py, inherited by `GcLLDescr_boehm`), spelled
     /// here as `max_nursery_size: 0`, and `write_barrier_descr = None`
     /// (gc.py:156). Allocation then declines to the `dynasm_malloc_*`
     /// helpers, which already answer without a collector by falling back to
@@ -1733,12 +1733,12 @@ impl DynasmBackend {
                 gc.get_write_barrier_descr(),
             )
         });
-        // gc.py:653-664 `get_ll_description(gcdescr)`: `gcdescr is None`
+        // gc.py `get_ll_description(gcdescr)`: `gcdescr is None`
         // selects `GcLLDescr_boehm`, so upstream has no "no collector" state
         // at all — the configuration with none installed IS boehm, and
         // gc.py:151-162 is its field block. Two of the four collector-sourced
         // values already take the base-class answer here
-        // (`can_use_nursery_malloc -> False`, gc.py:81-82, spelled
+        // (`can_use_nursery_malloc -> False`, gc.py, spelled
         // `max_nursery_size: 0`; `write_barrier_descr = None`, gc.py:156);
         // this flag carries the other two, below.
         let is_boehm = collector.is_none();
@@ -1752,7 +1752,7 @@ impl DynasmBackend {
             // collector rather than assuming the MiniMark layout, so the
             // rewriter and `emit_write_barrier_fastpath_for_base` agree on
             // whether barriers exist at all. A collector that needs none
-            // reports `None` (`gc.py:156 GcLLDescr_boehm`), and
+            // reports `None` (`gc.py GcLLDescr_boehm`), and
             // `rewrite.py:393` then emits no `COND_CALL_GC_WB*`.
             wb_descr,
             jitframe_info: crate::jitframe_layout().and_then(|info| info.jitframe_descrs),
@@ -1775,30 +1775,30 @@ impl DynasmBackend {
             // even though the aarch64 backend has a native
             // `genop_load_effective_address` lowering.
             supports_load_effective_address: supports_load_effective_address(),
-            // incminimark.py:211 `malloc_zero_filled = False` when a
+            // incminimark.py `malloc_zero_filled = False` when a
             // collector answers: clear_gc_fields / clear_varsize_gc_fields
             // emit the per-object GC-pointer initialization
             // rewrite.py:498-535 requires. With none installed the value is
-            // gc.py:153 `GcLLDescr_boehm.malloc_zero_filled = True` and both
+            // gc.py `GcLLDescr_boehm.malloc_zero_filled = True` and both
             // are inert (rewrite.py:499-500, :521-522), which is what this
             // configuration's allocation actually does: every malloc reaches
             // a raw fallback built on `libc::calloc`.
             malloc_zero_filled: is_boehm,
-            // gc.py:39 `self.memcpy_fn = memcpy_fn` cast through
-            // `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py:1046-1047).
+            // gc.py `self.memcpy_fn = memcpy_fn` cast through
+            // `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py).
             memcpy_fn: majit_ir::memcpy_fn_addr(),
             // gc.py:40-43 `self.memcpy_descr = get_call_descr(...)`.
             memcpy_descr: majit_ir::make_memcpy_calldescr(),
             // gc.py:46 `self.str_descr = get_array_descr(self, rstr.STR)`.
             str_descr: builtin_string_array_descr(majit_ir::OpCode::Newstr)
                 .expect("Newstr must produce a str ArrayDescr"),
-            // gc.py:47 `self.unicode_descr = get_array_descr(self, rstr.UNICODE)`.
+            // gc.py `self.unicode_descr = get_array_descr(self, rstr.UNICODE)`.
             unicode_descr: builtin_string_array_descr(majit_ir::OpCode::Newunicode)
                 .expect("Newunicode must produce a unicode ArrayDescr"),
             // gc.py:48 `self.str_hash_descr = get_field_descr(self, rstr.STR, 'hash')`.
             str_hash_descr: builtin_string_hash_field_descr(majit_ir::OpCode::Strhash)
                 .expect("Strhash must produce a str hash FieldDescr"),
-            // gc.py:49 `self.unicode_hash_descr = get_field_descr(self, rstr.UNICODE, 'hash')`.
+            // gc.py `self.unicode_hash_descr = get_field_descr(self, rstr.UNICODE, 'hash')`.
             unicode_hash_descr: builtin_string_hash_field_descr(majit_ir::OpCode::Unicodehash)
                 .expect("Unicodehash must produce a unicode hash FieldDescr"),
             // gc.py:33-37 `self.fielddescr_vtable = get_field_descr(
@@ -1812,7 +1812,7 @@ impl DynasmBackend {
             // the descr's offset by `-HDR_SIZE` because pyre's HDR
             // sits before the object pointer. gc.py:157
             // `GcLLDescr_boehm.fielddescr_tid = None` makes
-            // gen_initialize_tid (rewrite.py:914-918) emit nothing, which is
+            // gen_initialize_tid (rewrite.py) emit nothing, which is
             // right with no collector: the raw malloc fallbacks stamp the
             // header themselves, so a second tid GC_STORE has no producer to
             // agree with.
@@ -1913,7 +1913,7 @@ impl DynasmBackend {
         self.vtable_offset = offset;
     }
 
-    /// llsupport/gc.py:563 GcLLDescr_framework
+    /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Resolves a vtable pointer to its registered GC type id via the
     /// installed gc_ll_descr (the GC backend supplied through
@@ -1947,7 +1947,7 @@ impl DynasmBackend {
 
     /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
     /// GuardNonnullClass operand seen in `ops`. RPython resolves these on
-    /// demand inside `_cmp_guard_class` (assembler.py:1887-1890); pyre's
+    /// demand inside `_cmp_guard_class` (assembler.py); pyre's
     /// dynasm assembler runs without a borrow of `self`, so we materialize
     /// the resolver as a IndexMap up front.
     fn collect_classptr_typeid_table(
@@ -1968,7 +1968,7 @@ impl DynasmBackend {
             ) && op.num_args() >= 2
             {
                 let class_arg = op.arg(1).to_opref();
-                // history.py:227 — inline-Const carries its class pointer
+                // history.py — inline-Const carries its class pointer
                 // directly.  The optimizer may also leave it as a plain
                 // const-pool OpRef (short preamble / constant folding), which
                 // regalloc resolves through the constants map in
@@ -2005,7 +2005,7 @@ impl DynasmBackend {
         for op in ops {
             if op.opcode == majit_ir::OpCode::GuardSubclass && op.num_args() >= 2 {
                 let class_arg = op.arg(1).to_opref();
-                // history.py:227 — inline-Const carries its class pointer directly.
+                // history.py — inline-Const carries its class pointer directly.
                 let classptr = class_arg.const_int_value();
                 if let Some(classptr) = classptr
                     && let Some(range) =
@@ -2095,7 +2095,7 @@ impl DynasmBackend {
             );
         }
 
-        // compile.py:658-662 ExitFrameWithExceptionDescrRef — return the
+        // compile.py ExitFrameWithExceptionDescrRef — return the
         // attached metainterp Arc directly; its class identity carries
         // is_exit_frame_with_exception()=true.
         if ptr != 0 && ptr == attached.exit_frame_with_exception_descr_ref {
@@ -2112,7 +2112,7 @@ impl DynasmBackend {
         // jf_descr by the inline propagate path emitted at
         // OpCode::CheckMemoryError when a malloc helper returns NULL.
         //
-        // compile.py:1092-1098 `PropagateExceptionDescr.handle_fail`:
+        // compile.py `PropagateExceptionDescr.handle_fail`:
         //     exception = cpu.grab_exc_value(deadframe)
         //     if not exception:
         //         exception = cast_instance_to_gcref(memory_error)
@@ -2125,7 +2125,7 @@ impl DynasmBackend {
         // _store_and_reset_exception, x86/assembler.rs) into
         // `jf_frame[0]` so the existing slot-0 Ref reader picks it up.
         if ptr != 0 && ptr == attached.propagate_exception_descr {
-            // grab_exc_value reads jf_guard_exc (llmodel.py:240-242); the
+            // grab_exc_value reads jf_guard_exc (llmodel.py); the
             // clear is pyre's — the value moves into jf_frame[0] below and
             // the slot must not hand a second copy to a later grab.
             let exc_val = unsafe {
@@ -2134,7 +2134,7 @@ impl DynasmBackend {
                 *slot = 0;
                 v
             };
-            // memory_error fallback (compile.py:1095) for the unlikely
+            // memory_error fallback (compile.py) for the unlikely
             // case where the propagate path fired without Layer 1's
             // singleton store winning the race (or the singleton
             // provider was never registered — unit tests).
@@ -2147,7 +2147,7 @@ impl DynasmBackend {
             // dispatch reads the exc value through the standard
             // get_ref_value(0) path (compile.py:660).
             unsafe { crate::llmodel::set_int_value(frame_ptr, 0, exc_val as isize) };
-            // `compile.py:1092-1098 PropagateExceptionDescr.handle_fail`
+            // `compile.py PropagateExceptionDescr.handle_fail`
             // raises `jitexc.ExitFrameWithExceptionRef(exception)`.  pyre's
             // flat dispatcher reads `is_exit_frame_with_exception()`, so
             // return the ExitFrameWithExceptionDescrRef metainterp Arc
@@ -2340,7 +2340,7 @@ impl DynasmBackend {
     /// `rpython/jit/backend/llsupport/llmodel.py:534-537`
     /// `get_baseofs_of_frame_field(self)` — offset from a `JITFRAME` base
     /// to the first frame-array item. Used by `_set_initial_bindings`
-    /// (regalloc.py:865) and `update_frame_info` (model.py:316) for
+    /// (regalloc.py:865) and `update_frame_info` (model.py) for
     /// `jfi_frame_size` accounting (jitframe.py:19-22).
     fn get_baseofs_of_frame_field() -> i64 {
         crate::jitframe::FIRST_ITEM_OFFSET as i64
@@ -2382,7 +2382,7 @@ impl Backend for DynasmBackend {
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
-        // gc.py:109 rewrite_assembler parity: run GC rewriter before regalloc.
+        // gc.py rewrite_assembler parity: run GC rewriter before regalloc.
         let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, &ops_owned);
         // The assembler stores the typed `Const` pool directly; each box
         // variant carries its own type (`Const::get_type`).
@@ -2406,7 +2406,7 @@ impl Backend for DynasmBackend {
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
-        // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
+        // PyPy's `setup_once` (`llsupport/assembler.py`) is what
         // builds the per-CPU malloc / propagate trampolines, but the
         // pyre `Backend::setup_once` hook isn't yet wired into every
         // tracing entry (`force_start_tracing` builds the trace ctx
@@ -2462,7 +2462,7 @@ impl Backend for DynasmBackend {
             self.register_gc_table(token, table);
         }
 
-        // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
+        // `compile.py record_loop_or_bridge`: for each ResumeDescr
         // in the newly-compiled trace, stamp the owning CompiledLoopToken.
         // RPython predicates the stamp on `isinstance(descr, ResumeDescr)`
         // (`compile.py:185`); pyre uses the `is_resume_guard()` trait
@@ -2501,10 +2501,10 @@ impl Backend for DynasmBackend {
             clt.frame_info
                 .lock()
                 .update_frame_depth(baseofs, frame_depth);
-            // `llsupport/regalloc.py:861-871` `_set_initial_bindings` —
+            // `llsupport/regalloc.py` `_set_initial_bindings` —
             // each input lands at `loc.value - base_ofs =
             // (JITFRAME_FIXED_SIZE + i) * SIZEOFSIGNED` so the GcStores
-            // synthesized by `handle_call_assembler` (rewrite.py:673)
+            // synthesized by `handle_call_assembler` (rewrite.py)
             // hit the actual input slots, not the managed-register save
             // area at the head of `jf_frame`. The list length must match
             // `inputargs.len()` so `handle_call_assembler` can index it.
@@ -2566,7 +2566,7 @@ impl Backend for DynasmBackend {
             .exit_frame_with_exception_descr_ref = Some(descr);
     }
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
-        // x86/assembler.py:328 `_build_propagate_exception_path` parity:
+        // x86/assembler.py `_build_propagate_exception_path` parity:
         // PyPy bakes `propagate_exception_descr` into the per-CPU
         // propagate trampoline at setup time.  Pyre defers the bake to
         // `X86CpuExt::ensure_propagate_exception_path` (x86/cpu_ext.rs),
@@ -2581,7 +2581,7 @@ impl Backend for DynasmBackend {
         // `Arc` returns immediately.
         //
         // PyPy's lifecycle binds `propagate_exception_descr` before
-        // `cpu.setup_once()` (`pyjitpl.py:2273-2283` precedes
+        // `cpu.setup_once()` (`pyjitpl.py` precedes
         // `pyjitpl.py:2292-2303`) and never swaps it afterwards.
         // Pyre upholds the same invariant: a *different* `Arc`
         // arriving after the propagate / malloc trampolines have
@@ -2659,7 +2659,7 @@ impl Backend for DynasmBackend {
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
-        // PyPy's `setup_once` (`llsupport/assembler.py:97`) is what
+        // PyPy's `setup_once` (`llsupport/assembler.py`) is what
         // builds the per-CPU malloc / propagate trampolines, but the
         // pyre `Backend::setup_once` hook isn't yet wired into every
         // tracing entry (`force_start_tracing` builds the trace ctx
@@ -2729,7 +2729,7 @@ impl Backend for DynasmBackend {
                 fail_descr.fail_index_per_trace(),
             );
         }
-        // `rpython/jit/backend/x86/assembler.py:691-693` `assemble_bridge`:
+        // `rpython/jit/backend/x86/assembler.py` `assemble_bridge`:
         // `frame_depth = max(current_clt.frame_info.jfi_frame_depth,
         //                    frame_depth_no_fixed_size + JITFRAME_FIXED_SIZE)`
         // → `self.update_frame_depth(frame_depth)` which calls
@@ -2788,16 +2788,16 @@ impl Backend for DynasmBackend {
         // ties code blocks and their resume descriptors to the same
         // compiled_loop_token lifetime.
         //
-        // `compile.py:183-186 record_loop_or_bridge` attaches a
+        // `compile.py record_loop_or_bridge` attaches a
         // bridge's resume descrs to the original loop's CLT, so the
         // tracer batch lands on `original_token`'s
-        // `asmmemmgr_gcreftracers` (`model.py:294`).
+        // `asmmemmgr_gcreftracers` (`model.py`).
         self.register_fail_descrs(original_token, &compiled.fail_descrs);
         if let Some(table) = gc_table {
             self.register_gc_table(original_token, table);
         }
 
-        // `compile.py:183-186 record_loop_or_bridge`: a bridge's ResumeDescrs
+        // `compile.py record_loop_or_bridge`: a bridge's ResumeDescrs
         // inherit the original loop's CompiledLoopToken.  See the
         // sibling `compile_loop` site for the parity rationale on the
         // `is_resume_guard()` predicate (`compile.py:185`).
@@ -2835,7 +2835,7 @@ impl Backend for DynasmBackend {
         let compiled = Self::get_compiled(token);
         let entry = codebuf::buffer_ptr(&compiled.buffer);
 
-        // jitframe.py:51 — every JITFRAME carries a non-null JITFRAMEINFO
+        // jitframe.py — every JITFRAME carries a non-null JITFRAMEINFO
         // so the bridge-entry `_check_frame_depth` realloc slowpath
         // (`_frame_realloc_slowpath` → `dynasm_realloc_frame`) can read
         // `jfi_frame_depth` / `jfi_frame_size` to size a grown frame.
@@ -2944,7 +2944,7 @@ impl Backend for DynasmBackend {
             }
         }
 
-        // llmodel.py:276-285 `make_execute_token` fixes the entry signature as
+        // llmodel.py `make_execute_token` fixes the entry signature as
         // `(jitframe, threadlocal_addr) -> jitframe`, and `:317-323` reads the
         // address with `llop.threadlocalref_addr` before the call. The compiled
         // prologue (gen_shadowstack_header) / epilogue
@@ -2974,7 +2974,7 @@ impl Backend for DynasmBackend {
             );
         }
 
-        // llmodel.py:412-420 get_latest_descr: read jf_descr from frame.
+        // llmodel.py get_latest_descr: read jf_descr from frame.
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
         let descr_fd = descr
@@ -3021,7 +3021,7 @@ impl Backend for DynasmBackend {
         let entry = codebuf::buffer_ptr(&compiled.buffer);
 
         // Same non-null JITFRAMEINFO + `jfi_frame_depth` sizing as
-        // `execute_token` (jitframe.py:51) — the bridge realloc slowpath
+        // `execute_token` (jitframe.py) — the bridge realloc slowpath
         // needs the frame_info, and the depth matches cranelift's
         // `max_output_slots`-sized raw outputs (compiler.rs).
         let clt = token.compiled_loop_token_expect();
@@ -3076,7 +3076,7 @@ impl Backend for DynasmBackend {
         for i in 0..num_slots {
             outputs.push(unsafe { crate::llmodel::get_int_value_direct(result_jf, i) as i64 });
         }
-        // PyPy `llmodel.py:422-424 _decode_pos` parity: read each
+        // PyPy `llmodel.py _decode_pos` parity: read each
         // fail-arg slot from `descr.rd_locs[i]`.  Out-of-range index
         // (synthetic descrs without rd_locs) falls back to identity.
         let rd_locs_len = descr_fd.rd_locs().len();
@@ -3109,7 +3109,7 @@ impl Backend for DynasmBackend {
             descr_fd.trace_id(),
         ));
 
-        // grab_exc_value (llmodel.py:240): read jf_guard_exc off the deadframe
+        // grab_exc_value (llmodel.py): read jf_guard_exc off the deadframe
         // tip before the libc jitframe chain is freed (same as execute_token).
         let exception_value = GcRef(unsafe { (*result_jf).jf_guard_exc });
 
@@ -3157,7 +3157,7 @@ impl Backend for DynasmBackend {
             .expect("force descriptor must implement FailDescr")
             .fail_arg_types()
             .len();
-        // `llmodel.py:270-274 force` casts the resolved frame to a GCREF and
+        // `llmodel.py force` casts the resolved frame to a GCREF and
         // returns it — the forced frame IS the deadframe, and it belongs to
         // the compiled run that is still executing, so this deadframe borrows
         // it rather than taking the chain over.
@@ -3187,7 +3187,7 @@ impl Backend for DynasmBackend {
         Arc::clone(&data.fail_descr)
     }
 
-    /// `cpu.grab_exc_value(deadframe)` (llmodel.py:240): return the
+    /// `cpu.grab_exc_value(deadframe)` (llmodel.py): return the
     /// `jf_guard_exc` value captured off the deadframe tip in `execute_token`.
     /// The exc=True failure-recovery stub stored pos_exc_value there for
     /// must_save_exception guards (GUARD_EXCEPTION / GUARD_NO_EXCEPTION /
@@ -3203,7 +3203,7 @@ impl Backend for DynasmBackend {
         crate::jit_exc_clear();
     }
 
-    /// `llmodel.py:252-268 free_loop_and_bridges` parity.  When the CLT
+    /// `llmodel.py free_loop_and_bridges` parity.  When the CLT
     /// drops, `asmmemmgr_gcreftracers` releases its strong refs to the
     /// baked `FailDescrCell` Arcs; subsequent recovery from a stale
     /// address would be UB, but the JIT-emitted code holding the address
@@ -3222,12 +3222,12 @@ impl Backend for DynasmBackend {
     }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
-        // `history.py:109-114 AbstractDescr.show(cpu, descr_gcref) =
+        // `history.py AbstractDescr.show(cpu, descr_gcref) =
         // cast_gcref_to_instance(...)` parity.  `descr_addr` is the thin
         // pointer to the `FailDescrCell` that was baked at codegen time;
         // recovery is a direct `Arc::from_raw` with a refcount bump.
         // Safety: the cell is kept alive by `clt.asmmemmgr_gcreftracers`
-        // for the life of the executing JIT code (`model.py:294`).
+        // for the life of the executing JIT code (`model.py`).
         let cell = unsafe { majit_ir::recover_fail_descr_cell(descr_addr) };
         cell.descr.clone()
     }
@@ -3273,7 +3273,7 @@ impl Backend for DynasmBackend {
         // new loop's frame depth onto the old token and every token in
         // its existing redirect chain, using the `baseofs` obtained from
         // `cpu.get_baseofs_of_frame_field()` so `jfi_frame_size` follows
-        // jitframe.py:19-22 `base_ofs + new_depth * SIZEOFSIGNED`.
+        // jitframe.py `base_ofs + new_depth * SIZEOFSIGNED`.
         let baseofs = Self::get_baseofs_of_frame_field();
         if let (Some(new_clt), Some(old_clt)) =
             (new.compiled_loop_token(), old.compiled_loop_token())
@@ -3286,7 +3286,7 @@ impl Backend for DynasmBackend {
                 .frame_info
                 .lock()
                 .update_frame_depth(baseofs, new_depth as i64);
-            // model.py:316-329 update_frame_info — pass old CLT with a
+            // model.py update_frame_info — pass old CLT with a
             // weak ref for the "append self to chain" step (line 328
             // `new_loop_tokens.append(weakref.ref(oldlooptoken))`).
             let old_weak = Arc::downgrade(&old_clt);
@@ -3315,7 +3315,7 @@ impl Backend for DynasmBackend {
         let compiled = Self::get_compiled(token);
         for (i, &hash) in hashes.iter().enumerate() {
             if let Some(descr) = compiled.fail_descrs.get(i) {
-                // `compile.py:826-829` `store_hash` only fires for non-final
+                // `compile.py` `store_hash` only fires for non-final
                 // `AbstractResumeGuardDescr` whose status is still 0 (no
                 // counter yet stamped).  Route the predicate through the
                 // FailDescr trait so the metainterp class hierarchy
@@ -3383,14 +3383,14 @@ impl Backend for DynasmBackend {
         ptr as i64
     }
 
-    /// llmodel.py:788-790 bh_new_array / bh_new_array_clear.
+    /// llmodel.py bh_new_array / bh_new_array_clear.
     fn bh_new_array(&self, length: i64, arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let length = usize::try_from(length).expect("bh_new_array length must be non-negative");
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let len_offset = arraydescr
             .array_len_offset()
             .expect("bh_new_array requires ArrayDescr.lendescr");
-        // descr.py:340 `ArrayDescr.get_type_id(): assert self.tid` —
+        // descr.py `ArrayDescr.get_type_id(): assert self.tid` —
         // allocation requires a real GC type id; tid=0 means the descr
         // never went through `gc.py:548 set_type_id` and the GC tracer
         // would lack the per-item visit shape.
@@ -3413,7 +3413,7 @@ impl Backend for DynasmBackend {
         ) as i64
     }
 
-    /// llmodel.py:790 bh_new_array_clear = bh_new_array.
+    /// llmodel.py bh_new_array_clear = bh_new_array.
     fn bh_new_array_clear(
         &self,
         length: i64,
@@ -3422,18 +3422,18 @@ impl Backend for DynasmBackend {
         self.bh_new_array(length, arraydescr)
     }
 
-    /// llsupport/gc.py:563 GcLLDescr_framework
+    /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Resolves a vtable pointer through the installed gc_ll_descr.
     fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
         self.lookup_typeid_from_classptr(classptr)
     }
 
-    /// llmodel.py:816 bh_call_i: ABI-correct dispatch via the shared call stub.
+    /// llmodel.py bh_call_i: ABI-correct dispatch via the shared call stub.
     ///
     /// Routes through `majit_backend::call_stub::bh_call_i_dispatch`, whose
     /// signature is built in `arg_classes` declaration order to match
-    /// `descr.py:574` / `descr.py:604-605 create_call_stub`.
+    /// `descr.py` / `descr.py create_call_stub`.
     fn bh_call_i(
         &self,
         func: i64,
@@ -3460,7 +3460,7 @@ impl Backend for DynasmBackend {
         }
     }
 
-    /// llmodel.py:818 bh_call_r: GcRef-returning parallel of `bh_call_i`.
+    /// llmodel.py bh_call_r: GcRef-returning parallel of `bh_call_i`.
     /// `lltype.Ptr(lltype.GcStruct, ...)` lowers to a host pointer that
     /// matches `i64` on 64-bit, so we transmute via the shared int
     /// dispatcher and wrap the result. Without this override
@@ -3493,7 +3493,7 @@ impl Backend for DynasmBackend {
         majit_ir::GcRef(raw as usize)
     }
 
-    /// llmodel.py:825 bh_call_f / descr.py:584-605 create_call_stub
+    /// llmodel.py bh_call_f / descr.py create_call_stub
     /// (`RESULT == lltype.Float`) parity: route through the f64-typed
     /// dispatcher so an f64-returning C callee delivers via xmm0 / d0
     /// instead of rax / x0. Without this override
@@ -3525,7 +3525,7 @@ impl Backend for DynasmBackend {
         }
     }
 
-    /// llmodel.py:834 bh_call_v / descr.py:590-605 create_call_stub
+    /// llmodel.py bh_call_v / descr.py create_call_stub
     /// (`RESULT == lltype.Void`) parity: dispatch the funcptr through
     /// the void-typed `bh_call_v_dispatch` so a genuinely void C callee
     /// is called with the right C-ABI signature. Re-routing through
@@ -3561,22 +3561,22 @@ impl Backend for DynasmBackend {
         }
     }
 
-    /// llmodel.py:747-750 bh_raw_load_i(addr, offset, descr).
+    /// llmodel.py bh_raw_load_i(addr, offset, descr).
     fn bh_raw_load_i(
         &self,
         addr: i64,
         offset: i64,
         descr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        // llmodel.py:748-749: ofs, size, sign = self.unpack_arraydescr_size(descr)
+        // llmodel.py: ofs, size, sign = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:749 assert)
         let size = descr.as_itemsize();
         let sign = descr.is_item_signed();
-        // llmodel.py:750: return self.read_int_at_mem(addr, offset, size, sign)
+        // llmodel.py: return self.read_int_at_mem(addr, offset, size, sign)
         self.read_int_at_mem(addr, offset, size, sign)
     }
 
-    /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr).
+    /// llmodel.py bh_raw_store_i(addr, offset, newvalue, descr).
     fn bh_raw_store_i(
         &self,
         addr: i64,
@@ -3584,25 +3584,25 @@ impl Backend for DynasmBackend {
         newvalue: i64,
         descr: &majit_translate::jitcode::BhDescr,
     ) {
-        // llmodel.py:740-741: ofs, size, _ = self.unpack_arraydescr_size(descr)
+        // llmodel.py: ofs, size, _ = self.unpack_arraydescr_size(descr)
         // ofs == 0 always for raw lengthless arrays (llmodel.py:741 assert)
         let size = descr.as_itemsize();
-        // llmodel.py:742: self.write_int_at_mem(addr, offset, size, newvalue)
+        // llmodel.py: self.write_int_at_mem(addr, offset, size, newvalue)
         self.write_int_at_mem(addr, offset, size, newvalue);
     }
 
-    /// llmodel.py:752-753 bh_raw_load_f(addr, offset, descr).
+    /// llmodel.py bh_raw_load_f(addr, offset, descr).
     fn bh_raw_load_f(
         &self,
         addr: i64,
         offset: i64,
         _descr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        // llmodel.py:753: return self.read_float_at_mem(addr, offset)
+        // llmodel.py: return self.read_float_at_mem(addr, offset)
         self.read_float_at_mem(addr, offset)
     }
 
-    /// llmodel.py:744-745 bh_raw_store_f(addr, offset, newvalue, descr).
+    /// llmodel.py bh_raw_store_f(addr, offset, newvalue, descr).
     fn bh_raw_store_f(
         &self,
         addr: i64,
@@ -3610,11 +3610,11 @@ impl Backend for DynasmBackend {
         newvalue: f64,
         _descr: &majit_translate::jitcode::BhDescr,
     ) {
-        // llmodel.py:745: self.write_float_at_mem(addr, offset, newvalue)
+        // llmodel.py: self.write_float_at_mem(addr, offset, newvalue)
         self.write_float_at_mem(addr, offset, newvalue);
     }
 
-    /// `llmodel.py:693-696 bh_getfield_gc_i` →
+    /// `llmodel.py bh_getfield_gc_i` →
     /// `read_int_at_mem(struct, ofs, size, sign)`.  Threads the per-field
     /// `(offset, size, sign)` tuple from `BhDescr.unpack_fielddescr_size`
     /// to the size dispatch in `llmodel.py:467-478`.
@@ -3636,9 +3636,9 @@ impl Backend for DynasmBackend {
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }
 
-    /// `llmodel.py:718-721 bh_setfield_gc_i` →
+    /// `llmodel.py bh_setfield_gc_i` →
     /// `write_int_at_mem(struct, ofs, size, value)`.  Sign discarded by
-    /// `unpack_fielddescr_size` consumer (`llmodel.py:651`); only
+    /// `unpack_fielddescr_size` consumer (`llmodel.py`); only
     /// `(offset, size)` reach the store.
     fn bh_setfield_gc_i(
         &self,
@@ -3658,7 +3658,7 @@ impl Backend for DynasmBackend {
     ) {
         let offset = fielddescr.as_offset();
         unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
-        // llmodel.py:723 `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
+        // llmodel.py `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the
         // write barrier is implied by the framework GC transformer around the
         // ref store, identical to the array ref setters. The blackhole has no
         // inline TRACK_YOUNG_PTRS test, so use the managed-guarded
@@ -3668,7 +3668,7 @@ impl Backend for DynasmBackend {
         dynasm_write_barrier_if_managed(struct_ptr as u64);
     }
 
-    /// llmodel.py:592-594 bh_getarrayitem_gc_i: ofs=base_size, size+sign
+    /// llmodel.py bh_getarrayitem_gc_i: ofs=base_size, size+sign
     /// from `unpack_arraydescr_size`; route through `read_int_at_mem`
     /// at `gcref + ofs + index*size`.
     fn bh_getarrayitem_gc_i(
@@ -3682,7 +3682,7 @@ impl Backend for DynasmBackend {
         self.read_int_at_mem(array_ptr, offset, itemsize, sign)
     }
 
-    /// model.py:254 / llmodel.py:585-588 bh_arraylen_gc.
+    /// model.py / llmodel.py bh_arraylen_gc.
     /// Read the length word from `arraydescr.lendescr.offset`.
     fn bh_arraylen_gc(
         &self,
@@ -3695,7 +3695,7 @@ impl Backend for DynasmBackend {
         self.read_int_at_mem(array_ptr, ofs as i64, std::mem::size_of::<usize>(), true)
     }
 
-    /// llmodel.py:597-599 bh_getarrayitem_gc_r: ofs=base_size, item width
+    /// llmodel.py bh_getarrayitem_gc_r: ofs=base_size, item width
     /// fixed at `WORD` (8 bytes).  Direct deref of `*const usize` mirrors
     /// `bh_getfield_gc_r`'s pattern so the GcRef carries the raw machine
     /// word from memory.
@@ -3711,7 +3711,7 @@ impl Backend for DynasmBackend {
         majit_ir::GcRef(raw)
     }
 
-    /// llmodel.py:603-606 bh_getarrayitem_gc_f: ofs=base_size, item
+    /// llmodel.py bh_getarrayitem_gc_f: ofs=base_size, item
     /// width fixed at `sizeof(FLOATSTORAGE)` (8 bytes).  Routes through
     /// `read_float_at_mem` for the same `read_unaligned` safety as the
     /// field sibling.
@@ -3726,7 +3726,7 @@ impl Backend for DynasmBackend {
         self.read_float_at_mem(array_ptr, offset)
     }
 
-    /// llmodel.py:609-611 bh_setarrayitem_gc_i.
+    /// llmodel.py bh_setarrayitem_gc_i.
     fn bh_setarrayitem_gc_i(
         &self,
         array_ptr: i64,
@@ -3739,7 +3739,7 @@ impl Backend for DynasmBackend {
         self.write_int_at_mem(array_ptr, offset, itemsize, newvalue);
     }
 
-    /// llmodel.py:613-615 bh_setarrayitem_gc_r.
+    /// llmodel.py bh_setarrayitem_gc_r.
     fn bh_setarrayitem_gc_r(
         &self,
         array_ptr: i64,
@@ -3752,7 +3752,7 @@ impl Backend for DynasmBackend {
         unsafe {
             *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
         }
-        // llmodel.py:495-497 `bh_setarrayitem_gc_r`: store + the generic
+        // llmodel.py `bh_setarrayitem_gc_r`: store + the generic
         // flag-checking `do_write_barrier`. The blackhole has no inline
         // TRACK_YOUNG_PTRS test ahead of the call, so it must not reuse the
         // JIT-only `jit_remember_young_pointer_from_array` (which assumes the
@@ -3762,7 +3762,7 @@ impl Backend for DynasmBackend {
         dynasm_write_barrier_if_managed(array_ptr as u64);
     }
 
-    /// llmodel.py:618-621 bh_setarrayitem_gc_f.
+    /// llmodel.py bh_setarrayitem_gc_f.
     fn bh_setarrayitem_gc_f(
         &self,
         array_ptr: i64,
@@ -3775,7 +3775,7 @@ impl Backend for DynasmBackend {
         self.write_float_at_mem(array_ptr, offset, newvalue);
     }
 
-    /// llmodel.py:648-651 bh_setinteriorfield_gc_i.  Interior address is
+    /// llmodel.py bh_setinteriorfield_gc_i.  Interior address is
     /// `array_base + arraydescr.basesize + fielddescr.offset + index *
     /// arraydescr.itemsize`; the integer field is `field_size` bytes wide.
     fn bh_setinteriorfield_gc_i(
@@ -3794,7 +3794,7 @@ impl Backend for DynasmBackend {
         self.write_int_at_mem(array_ptr, offset, fsize, newvalue);
     }
 
-    /// llmodel.py:648-651 bh_setinteriorfield_gc_r.  Pointer-typed
+    /// llmodel.py bh_setinteriorfield_gc_r.  Pointer-typed
     /// interior field: `WORD`-wide store plus the array write barrier.
     fn bh_setinteriorfield_gc_r(
         &self,
@@ -3818,7 +3818,7 @@ impl Backend for DynasmBackend {
         dynasm_write_barrier_if_managed(array_ptr as u64);
     }
 
-    /// llmodel.py:648-651 bh_setinteriorfield_gc_f.  Float-typed interior
+    /// llmodel.py bh_setinteriorfield_gc_f.  Float-typed interior
     /// field: `sizeof(FLOATSTORAGE)`-wide store via `write_float_at_mem`.
     fn bh_setinteriorfield_gc_f(
         &self,
@@ -3836,7 +3836,7 @@ impl Backend for DynasmBackend {
         self.write_float_at_mem(array_ptr, offset, newvalue);
     }
 
-    /// llmodel.py:705-707 bh_getfield_gc_f delegates to read_float_at_mem.
+    /// llmodel.py bh_getfield_gc_f delegates to read_float_at_mem.
     /// `getfield_vable_f/rd>f` and the floating-point array reader rely
     /// on this — the trait default returns 0.0, which silently produces
     /// wrong results during blackhole resume on float vable fields.
@@ -3853,7 +3853,7 @@ impl Backend for DynasmBackend {
         self.read_float_at_mem(struct_ptr, offset as i64)
     }
 
-    /// llmodel.py:728-730 bh_setfield_gc_f delegates to write_float_at_mem.
+    /// llmodel.py bh_setfield_gc_f delegates to write_float_at_mem.
     /// Mirror of `bh_getfield_gc_f`; the trait default is a silent no-op
     /// which loses writes from `setfield_vable_f/rfd` during resume.
     fn bh_setfield_gc_f(
@@ -3991,7 +3991,7 @@ impl Backend for DynasmBackend {
     /// when this runs; the helpers we materialise here bake those
     /// descr pointers as immediates and assert non-zero on build.
     ///
-    /// PyPy's `llsupport/assembler.py:97 setup_once` builds the
+    /// PyPy's `llsupport/assembler.py setup_once` builds the
     /// propagate trampoline + every `_build_malloc_slowpath` variant
     /// (`fixed` / `varsize` / `str` / `unicode`).  Pyre's x86 path so
     /// far implements only `fixed`; varsize/str/unicode are inlined
@@ -4177,7 +4177,7 @@ mod tests {
         });
     }
 
-    /// llsupport/gc.py:563 GcLLDescr_framework
+    /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr
     /// Verify the dynasm backend's gc_ll_descr round-trips a registered
     /// vtable→type_id mapping (the same contract Cranelift uses).
@@ -4227,7 +4227,7 @@ mod tests {
     #[test]
     fn compile_loop_records_token_inputarg_types() {
         let mut backend = DynasmBackend::new();
-        // `compile.py:665-674 make_and_attach_done_descrs` parity:
+        // `compile.py make_and_attach_done_descrs` parity:
         // FINISH emission stamps the cpu-attached singleton Arc into
         // `compiled.fail_descrs`; without attachment the backend has
         // nothing to push.  Production reaches this state through

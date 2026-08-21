@@ -2,7 +2,7 @@
 //! `rpython/translator/c/`.
 //!
 //! Upstream names these driver tasks `task_database_c` / `task_source_c` /
-//! `task_compile_c` (driver.py:408-541), but pyre does not house a local
+//! `task_compile_c` (driver.py), but pyre does not house a local
 //! C-backend tree.  This module keeps only the builder/database shape those
 //! tasks need while avoiding a misleading local `translator/c` module path.
 //!
@@ -43,7 +43,7 @@ pub enum CBuilderRef {
 }
 
 impl CBuilderRef {
-    /// Upstream `cbuilder.build_database()` (driver.py:435).
+    /// Upstream `cbuilder.build_database()` (driver.py).
     ///
     /// Threads the subclass `getentrypointptr()` callback into
     /// [`genc::CBuilder::build_database_with`] so the dispatch lands at
@@ -77,7 +77,7 @@ impl CBuilderRef {
         }
     }
 
-    /// Upstream `cbuilder.compile(**kwds)` at `driver.py:535`.
+    /// Upstream `cbuilder.compile(**kwds)` at `driver.py`.
     pub fn compile(&self, exe_name: Option<String>) -> Result<(), TaskError> {
         match self {
             CBuilderRef::Standalone(b) => b.compile(exe_name),
@@ -94,7 +94,7 @@ impl CBuilderRef {
         }
     }
 
-    /// Upstream `cbuilder.get_entry_point()` (`driver.py:541`).
+    /// Upstream `cbuilder.get_entry_point()` (`driver.py`).
     pub fn get_entry_point(&self) -> Result<PathBuf, TaskError> {
         match self {
             CBuilderRef::Standalone(b) => b.get_entry_point(),
@@ -110,7 +110,7 @@ impl CBuilderRef {
         }
     }
 
-    /// Upstream `cbuilder.executable_name_w` (`driver.py:490`).
+    /// Upstream `cbuilder.executable_name_w` (`driver.py`).
     pub fn executable_name_w(&self) -> Option<PathBuf> {
         match self {
             CBuilderRef::Standalone(b) => b.executable_name_w.borrow().clone(),

@@ -11,11 +11,11 @@
 //! |---|---|
 //! | `class AbstractCharRepr` (`rstr.py:483-541`) | [`CharRepr`] |
 //! | `class AbstractUniCharRepr` (`rstr.py:758-775`) | [`UniCharRepr`] |
-//! | `AbstractCharRepr.get_ll_eq_function` (`rstr.py:496-497`) | [`Repr::get_ll_eq_function`] impl |
-//! | `AbstractCharRepr.get_ll_hash_function` (`rstr.py:499-500`) | [`Repr::get_ll_hash_function`] impl + [`build_ll_char_hash_helper_graph`] |
-//! | `AbstractUniCharRepr.get_ll_hash_function` (`rstr.py:767-768`) | [`Repr::get_ll_hash_function`] impl + [`build_ll_unichar_hash_helper_graph`] |
-//! | `ll_char_hash` / `ll_unichar_hash` (`rstr.py:937-942`) | helper graph: `cast_char_to_int(ch)` / `cast_unichar_to_int(ch)` |
-//! | `SomeChar.rtyper_makerepr` / `SomeUnicodeCodePoint.rtyper_makerepr` (`rstr.py:589-598`) | wired in [`super::rmodel::rtyper_makerepr`] |
+//! | `AbstractCharRepr.get_ll_eq_function` (`rstr.py`) | [`Repr::get_ll_eq_function`] impl |
+//! | `AbstractCharRepr.get_ll_hash_function` (`rstr.py`) | [`Repr::get_ll_hash_function`] impl + [`build_ll_char_hash_helper_graph`] |
+//! | `AbstractUniCharRepr.get_ll_hash_function` (`rstr.py`) | [`Repr::get_ll_hash_function`] impl + [`build_ll_unichar_hash_helper_graph`] |
+//! | `ll_char_hash` / `ll_unichar_hash` (`rstr.py`) | helper graph: `cast_char_to_int(ch)` / `cast_unichar_to_int(ch)` |
+//! | `SomeChar.rtyper_makerepr` / `SomeUnicodeCodePoint.rtyper_makerepr` (`rstr.py`) | wired in [`super::rmodel::rtyper_makerepr`] |
 //!
 //! ## Deferred to follow-up commits
 //!
@@ -79,14 +79,14 @@ pub fn str_decode_utf8(s: &[u8]) -> Result<String, TyperError> {
 pub struct AbstractStringIteratorRepr;
 
 impl AbstractStringIteratorRepr {
-    /// RPython `AbstractStringIteratorRepr.newiter(self, hop)` (`rstr.py:829-832`).
+    /// RPython `AbstractStringIteratorRepr.newiter(self, hop)` (`rstr.py`).
     pub fn newiter(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(TyperError::missing_rtype_operation(
             "AbstractStringIteratorRepr.newiter",
         ))
     }
 
-    /// RPython `AbstractStringIteratorRepr.rtype_next(self, hop)` (`rstr.py:834-839`).
+    /// RPython `AbstractStringIteratorRepr.rtype_next(self, hop)` (`rstr.py`).
     pub fn rtype_next(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(TyperError::missing_rtype_operation(
             "AbstractStringIteratorRepr.rtype_next",
@@ -116,9 +116,9 @@ impl AbstractLLHelpers {
 }
 
 // ____________________________________________________________
-// StringRepr / UnicodeRepr — `rpython/rtyper/lltypesystem/rstr.py:229`
+// StringRepr / UnicodeRepr — `rpython/rtyper/lltypesystem/rstr.py`
 // + `:247`. The upstream class hierarchy splits over two files:
-// `rstr.py:95` `class AbstractStringRepr(Repr)` carries the abstract
+// `rstr.py` `class AbstractStringRepr(Repr)` carries the abstract
 // method surface (`rtype_len`, `rtype_bool`, `rtype_method_startswith`
 // / `endswith` / `find` / `count` / `strip` / `lower` / `upper` /
 // `split` / `join` / `replace` / `format`, `rtype_int` / `rtype_float`,
@@ -133,7 +133,7 @@ impl AbstractLLHelpers {
 // methods inherit `Repr`'s default `rtype_*` impls, which surface
 // `MissingRTypeOperation` errors with the upstream method name.
 
-/// RPython `class AbstractStringRepr(Repr)` (`rstr.py:95`), collapsed
+/// RPython `class AbstractStringRepr(Repr)` (`rstr.py`), collapsed
 /// with the lltypesystem `StringRepr` lowleveltype binding. The upstream
 /// concrete name is re-exposed from `lltypesystem/rstr.rs`.
 ///
@@ -146,7 +146,7 @@ impl AbstractLLHelpers {
 /// ```
 ///
 /// The `basetype` / `base` / `CACHE` attributes only matter for
-/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`)
+/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py`)
 /// which lands later. Today the struct just carries
 /// `lowleveltype = Ptr(STR)` so [`super::rmodel::rtyper_makerepr`]
 /// can return the singleton when `SomeString` shows up. Per-method
@@ -168,7 +168,7 @@ impl StringRepr {
         }
     }
 
-    /// RPython `StringRepr.char_repr = char_repr` (`lltypesystem/rstr.py:1268`)
+    /// RPython `StringRepr.char_repr = char_repr` (`lltypesystem/rstr.py`)
     /// class-level attribute. Pyre exposes the link as a method that
     /// returns the module-global [`char_repr`] singleton.
     pub fn char_repr(&self) -> Arc<CharRepr> {
@@ -199,7 +199,7 @@ impl Repr for StringRepr {
         super::pairtype::ReprClassId::StringRepr
     }
 
-    /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`):
+    /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py`):
     /// `None` → `nullptr(self.lowleveltype.TO)`, a `str` value → the
     /// prebuilt ll string (`self.ll.llstr(value)`, cached in
     /// `CONST_STR_CACHE`).  The cache exists upstream so one host
@@ -223,7 +223,7 @@ impl Repr for StringRepr {
         }
     }
 
-    /// RPython `AbstractStringRepr.rtype_len(self, hop)` (`rstr.py:119-122`).
+    /// RPython `AbstractStringRepr.rtype_len(self, hop)` (`rstr.py`).
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_len(self, hop, "ll_strlen", STRPTR.clone())
     }
@@ -234,13 +234,13 @@ impl Repr for StringRepr {
         rtype_abstract_string_bool(self, hop, "ll_str_is_true", STRPTR.clone())
     }
 
-    /// RPython `AbstractStringRepr.rtype_unicode` (`rstr.py:385-396`):
+    /// RPython `AbstractStringRepr.rtype_unicode` (`rstr.py`):
     /// non-constant byte strings lower through `LLHelpers.ll_str2unicode`.
     fn rtype_unicode(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_unicode(self, hop)
     }
 
-    /// RPython `AbstractStringRepr.rtype_bytearray` (`rstr.py:398-401`).
+    /// RPython `AbstractStringRepr.rtype_bytearray` (`rstr.py`).
     fn rtype_bytearray(&self, hop: &HighLevelOp) -> RTypeResult {
         hop.exception_is_here()?;
         let v_str = hop.inputarg(ConvertedTo::Repr(self), 0)?;
@@ -253,13 +253,13 @@ impl Repr for StringRepr {
         hop.gendirectcall(&helper, vec![v_str])
     }
 
-    /// RPython `AbstractStringRepr.rtype_int` (`rstr.py:371-383`):
+    /// RPython `AbstractStringRepr.rtype_int` (`rstr.py`):
     /// dispatch to `LLHelpers.ll_int(s, base)`.
     fn rtype_int(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_int(self, hop, "ll_int", STRPTR.clone())
     }
 
-    /// RPython `Repr.rtype_str` (`rmodel.py:195-197`):
+    /// RPython `Repr.rtype_str` (`rmodel.py`):
     /// `return hop.gendirectcall(self.ll_str, v_self)`.  For `Ptr(STR)`,
     /// `ll_str` returns the receiver unchanged when non-null, else the
     /// constant `'None'`.
@@ -267,7 +267,7 @@ impl Repr for StringRepr {
         rtype_abstract_string_str(self, hop, "ll_str", STRPTR.clone())
     }
 
-    /// RPython `AbstractStringRepr.rtype_getslice` (`rstr.py:432-437`).
+    /// RPython `AbstractStringRepr.rtype_getslice` (`rstr.py`).
     fn rtype_getslice(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_getslice(self, hop, "ll_stringslice", STRPTR.clone())
     }
@@ -408,7 +408,7 @@ impl Repr for StringRepr {
         }
     }
 
-    /// RPython `AbstractStringRepr.get_ll_eq_function` (`rstr.py:110-111`):
+    /// RPython `AbstractStringRepr.get_ll_eq_function` (`rstr.py`):
     ///
     /// ```python
     /// def get_ll_eq_function(self):
@@ -430,7 +430,7 @@ impl Repr for StringRepr {
             .map(Some)
     }
 
-    /// RPython `AbstractStringRepr.get_ll_hash_function` (`rstr.py:113-114`):
+    /// RPython `AbstractStringRepr.get_ll_hash_function` (`rstr.py`):
     ///
     /// ```python
     /// def get_ll_hash_function(self):
@@ -458,7 +458,7 @@ impl Repr for StringRepr {
             .map(Some)
     }
 
-    /// rstr.py:116-117 `return self.ll.ll_strfasthash`
+    /// rstr.py `return self.ll.ll_strfasthash`
     fn get_ll_fasthash_function(
         &self,
         rtyper: &RPythonTyper,
@@ -477,7 +477,7 @@ impl Repr for StringRepr {
     }
 }
 
-/// RPython `class AbstractUnicodeRepr(AbstractStringRepr)` (`rstr.py:450`),
+/// RPython `class AbstractUnicodeRepr(AbstractStringRepr)` (`rstr.py`),
 /// collapsed with the lltypesystem `UnicodeRepr` lowleveltype binding. The
 /// upstream concrete name is re-exposed from `lltypesystem/rstr.rs`.
 ///
@@ -538,7 +538,7 @@ impl Repr for UnicodeRepr {
     }
 
     /// RPython `AbstractUnicodeRepr.rtype_len` inherits the
-    /// `AbstractStringRepr.rtype_len` body (`rstr.py:119-122`); the
+    /// `AbstractStringRepr.rtype_len` body (`rstr.py`); the
     /// only delta is the helper-graph identity (`ll_unilen`) and the
     /// pointer lltype (`Ptr(UNICODE)`).
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
@@ -546,7 +546,7 @@ impl Repr for UnicodeRepr {
     }
 
     /// RPython `AbstractUnicodeRepr.rtype_bool` inherits
-    /// `AbstractStringRepr.rtype_bool` (`rstr.py:124-132`); only the
+    /// `AbstractStringRepr.rtype_bool` (`rstr.py`); only the
     /// `is_true` helper identity (`ll_unicode_is_true`) and the
     /// pointer lltype differ.
     fn rtype_bool(&self, hop: &HighLevelOp) -> RTypeResult {
@@ -572,7 +572,7 @@ impl Repr for UnicodeRepr {
     }
 
     /// RPython `AbstractUnicodeRepr.rtype_method_*` dispatch table
-    /// (`rstr.py:134-449` inherited via `AbstractUnicodeRepr(AbstractStringRepr)`).
+    /// (`rstr.py` inherited via `AbstractUnicodeRepr(AbstractStringRepr)`).
     /// Pyre lands methods incrementally; today `startswith` and
     /// `endswith` lower with helper-graph identities
     /// `ll_unicode_startswith` / `ll_unicode_endswith` (Ptr(UNICODE)).
@@ -737,7 +737,7 @@ impl Repr for UnicodeRepr {
             .map(Some)
     }
 
-    /// rstr.py:116-117 `return self.ll.ll_strfasthash` (unicode variant)
+    /// rstr.py `return self.ll.ll_strfasthash` (unicode variant)
     fn get_ll_fasthash_function(
         &self,
         rtyper: &RPythonTyper,
@@ -756,7 +756,7 @@ impl Repr for UnicodeRepr {
     }
 }
 
-/// RPython `string_repr = StringRepr()` (`lltypesystem/rstr.py:1255`)
+/// RPython `string_repr = StringRepr()` (`lltypesystem/rstr.py`)
 /// module-global. Pyre mirrors the upstream singleton via [`OnceLock`]
 /// so every `SomeString.rtyper_makerepr(rtyper)` call returns the same
 /// `Arc`.
@@ -765,14 +765,14 @@ pub(crate) fn string_repr() -> Arc<StringRepr> {
     REPR.get_or_init(|| Arc::new(StringRepr::new())).clone()
 }
 
-/// RPython `unicode_repr = UnicodeRepr()` (`lltypesystem/rstr.py:1260`)
+/// RPython `unicode_repr = UnicodeRepr()` (`lltypesystem/rstr.py`)
 /// module-global.
 pub(crate) fn unicode_repr() -> Arc<UnicodeRepr> {
     static REPR: OnceLock<Arc<UnicodeRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(UnicodeRepr::new())).clone()
 }
 
-/// RPython `AbstractStringRepr.rtype_len(self, hop)` (`rstr.py:119-122`):
+/// RPython `AbstractStringRepr.rtype_len(self, hop)` (`rstr.py`):
 ///
 /// ```python
 /// def rtype_len(self, hop):
@@ -805,7 +805,7 @@ fn rtype_abstract_string_len(
     hop.gendirectcall(&helper, vlist)
 }
 
-/// RPython `AbstractStringRepr.rtype_bool(self, hop)` (`rstr.py:124-132`):
+/// RPython `AbstractStringRepr.rtype_bool(self, hop)` (`rstr.py`):
 ///
 /// ```python
 /// def rtype_bool(self, hop):
@@ -849,7 +849,7 @@ fn rtype_abstract_string_bool(
         )?;
         hop.gendirectcall(&helper, vlist)
     } else {
-        // Replicates `Repr.rtype_bool` (`rmodel.py:199-207`):
+        // Replicates `Repr.rtype_bool` (`rmodel.py`):
         // `gendirectcall(rtype_len)` then wrap with `int_is_true`.
         let v_len = self_repr.rtype_len(hop)?.ok_or_else(|| {
             TyperError::message(format!(
@@ -891,7 +891,7 @@ fn lowlevel_int_function(
     )
 }
 
-/// RPython `AbstractStringRepr.rtype_int` (`rstr.py:371-383`).
+/// RPython `AbstractStringRepr.rtype_int` (`rstr.py`).
 /// The helper itself implements the upstream base parser
 /// (`LLHelpers.ll_int(s, base)`) including base range validation,
 /// leading/trailing spaces, sign handling, and ValueError exits.
@@ -937,7 +937,7 @@ fn rtype_abstract_string_int(
     }
 }
 
-/// RPython `Repr.rtype_str` (`rmodel.py:195-197`):
+/// RPython `Repr.rtype_str` (`rmodel.py`):
 /// `[v_self] = hop.inputargs(self); return hop.gendirectcall(self.ll_str,
 /// v_self)`.  The string reprs bind `self.ll_str` to the identity-or-
 /// `'None'` `ll_str` helper, so `str(s)` needs no allocation.
@@ -961,7 +961,7 @@ fn rtype_abstract_string_str(
     hop.gendirectcall(&helper, vlist)
 }
 
-/// RPython `AbstractStringRepr.rtype_unicode` (`rstr.py:385-396`).
+/// RPython `AbstractStringRepr.rtype_unicode` (`rstr.py`).
 /// The same body is inherited by UnicodeRepr: constants are returned as
 /// constants, already-unicode values are identity, byte strings call
 /// `ll_str2unicode` and can raise `UnicodeDecodeError`.
@@ -1029,7 +1029,7 @@ fn lowlevel_unichr2str_function(rtyper: &RPythonTyper) -> Result<LowLevelFunctio
 
 /// RPython `AbstractCharRepr.ll_str(ch) -> ll_chr2str(ch)` and the
 /// UniChar→Unicode half of `pairtype(AbstractUniCharRepr,
-/// AbstractUnicodeRepr).convert_from_to` (`rstr.py:554-562, 805-814`).
+/// AbstractUnicodeRepr).convert_from_to` (`rstr.py, 805-814`).
 fn rtype_charlike_chr2str(
     hop: &HighLevelOp,
     helper_name: &str,
@@ -1068,7 +1068,7 @@ pub(crate) fn pair_charlike_string_convert_from_to(
             _ => return Ok(None),
         };
 
-    // PyPy `rstr.py:810-814 convert_from_to` calls
+    // PyPy `rstr.py convert_from_to` calls
     // `llops.gendirectcall(r_from.ll.ll_chr2str, v)` with a host helper
     // function — `llops` consults its own `self.rtyper` internally.
     // Pyre routes the helper build through the same `LowLevelOpList`
@@ -1090,7 +1090,7 @@ pub(crate) fn pair_charlike_string_convert_from_to(
 }
 
 /// RPython `pairtype(AbstractStringRepr, AbstractCharRepr).convert_from_to`
-/// (`rstr.py:815-820`): `string_repr -> char_repr` extracts index 0
+/// (`rstr.py`): `string_repr -> char_repr` extracts index 0
 /// through `ll_stritem_nonneg`.
 pub(crate) fn pair_string_char_convert_from_to(
     r_from: &dyn Repr,
@@ -1103,7 +1103,7 @@ pub(crate) fn pair_string_char_convert_from_to(
     {
         return Ok(None);
     }
-    // PyPy `rstr.py:817-820 convert_from_to` calls
+    // PyPy `rstr.py convert_from_to` calls
     // `llops.gendirectcall(r_from.ll.ll_stritem_nonneg, v, c_zero)` —
     // the rtyper lives behind `llops`, never at the call site. Pyre
     // routes the helper build through `LowLevelOpList::
@@ -1127,12 +1127,12 @@ pub(crate) fn pair_string_char_convert_from_to(
 // ____________________________________________________________
 // CharRepr — `rstr.py:483-541` (lltypesystem-bound `AbstractCharRepr`).
 
-/// RPython `class BaseCharReprMixin(object)` (`rstr.py:489`).
+/// RPython `class BaseCharReprMixin(object)` (`rstr.py`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BaseCharReprMixin;
 
 /// RPython `class AbstractCharRepr(AbstractStringRepr, AbstractCharRepr_)`
-/// (`rstr.py:483-541`) — the lltypesystem `CharRepr` carries `lowleveltype = Char`.
+/// (`rstr.py`) — the lltypesystem `CharRepr` carries `lowleveltype = Char`.
 ///
 /// Pyre lands a single concrete `CharRepr` since the
 /// abstract/lltypesystem split is an upstream artefact of supporting
@@ -1157,15 +1157,15 @@ impl CharRepr {
     /// RPython `CharRepr.char_repr = char_repr`
     /// (`lltypesystem/rstr.py:1267`) class-level attribute — char-side
     /// backlink so the shared `BaseCharReprMixin._rtype_method_isxxx`
-    /// helper (`rstr.py:516-520`) can read `hop.args_r[0].char_repr`.
+    /// helper (`rstr.py`) can read `hop.args_r[0].char_repr`.
     pub fn char_repr(&self) -> Arc<CharRepr> {
         char_repr()
     }
 
     /// RPython `class CharRepr(AbstractCharRepr, StringRepr)`
-    /// (`lltypesystem/rstr.py:291-292`) — `CharRepr` MRO inherits
-    /// `StringRepr.repr = string_repr` (`lltypesystem/rstr.py:1262`).
-    /// Method form so callers (`rstr.py:120` `string_repr = self.repr`)
+    /// (`lltypesystem/rstr.py`) — `CharRepr` MRO inherits
+    /// `StringRepr.repr = string_repr` (`lltypesystem/rstr.py`).
+    /// Method form so callers (`rstr.py` `string_repr = self.repr`)
     /// reach the parent string repr through `char_repr.repr()`.
     pub fn repr(&self) -> Arc<StringRepr> {
         string_repr()
@@ -1217,7 +1217,7 @@ impl Repr for CharRepr {
         }
     }
 
-    /// RPython `AbstractCharRepr.get_ll_eq_function` (`rstr.py:496-497`):
+    /// RPython `AbstractCharRepr.get_ll_eq_function` (`rstr.py`):
     ///
     /// ```python
     /// def get_ll_eq_function(self):
@@ -1234,7 +1234,7 @@ impl Repr for CharRepr {
         Ok(None)
     }
 
-    /// RPython `AbstractCharRepr.get_ll_hash_function` (`rstr.py:499-500`):
+    /// RPython `AbstractCharRepr.get_ll_hash_function` (`rstr.py`):
     ///
     /// ```python
     /// def get_ll_hash_function(self):
@@ -1270,7 +1270,7 @@ impl Repr for CharRepr {
         self.get_ll_hash_function(rtyper)
     }
 
-    /// RPython `BaseCharReprMixin.rtype_len(_, hop)` (`rstr.py:504-505`):
+    /// RPython `BaseCharReprMixin.rtype_len(_, hop)` (`rstr.py`):
     /// `return hop.inputconst(Signed, 1)`. Single chars always carry
     /// length 1.
     fn rtype_len(&self, _hop: &HighLevelOp) -> RTypeResult {
@@ -1278,7 +1278,7 @@ impl Repr for CharRepr {
         Ok(Some(Hlvalue::Constant(c)))
     }
 
-    /// RPython `BaseCharReprMixin.rtype_bool(_, hop)` (`rstr.py:507-509`):
+    /// RPython `BaseCharReprMixin.rtype_bool(_, hop)` (`rstr.py`):
     /// `assert not hop.args_s[0].can_be_None; return hop.inputconst(Bool, True)`.
     /// Pyre's CharRepr has lltype `Char` (not nullable in the lltype
     /// sense — `NoneRepr` would be a separate static type), so the
@@ -1295,7 +1295,7 @@ impl Repr for CharRepr {
         rtype_charlike_chr2str(hop, "ll_chr2str", STRPTR.clone(), LowLevelType::Char)
     }
 
-    /// RPython `BaseCharReprMixin.rtype_ord(_, hop)` (`rstr.py:511-514`):
+    /// RPython `BaseCharReprMixin.rtype_ord(_, hop)` (`rstr.py`):
     ///
     /// ```python
     /// def rtype_ord(_, hop):
@@ -1366,13 +1366,13 @@ impl Repr for CharRepr {
     }
 }
 
-/// RPython `char_repr = CharRepr()` (`rstr.py:1009`) module-global.
+/// RPython `char_repr = CharRepr()` (`rstr.py`) module-global.
 pub(crate) fn char_repr() -> Arc<CharRepr> {
     static REPR: OnceLock<Arc<CharRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(CharRepr::new())).clone()
 }
 
-/// Synthesizes the `ll_char_hash(ch)` helper graph (`rstr.py:937-938`):
+/// Synthesizes the `ll_char_hash(ch)` helper graph (`rstr.py`):
 /// single block, `cast_char_to_int(ch) -> hashed` then return.
 pub(crate) fn build_ll_char_hash_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
     build_ll_charlike_hash_helper_graph(name, LowLevelType::Char, "cast_char_to_int")
@@ -1382,7 +1382,7 @@ pub(crate) fn build_ll_char_hash_helper_graph(name: &str) -> Result<PyGraph, Typ
 // UniCharRepr — `rstr.py:758-775` (lltypesystem-bound `AbstractUniCharRepr`).
 
 /// RPython `class AbstractUniCharRepr(AbstractUnicodeRepr,
-/// AbstractCharRepr_)` (`rstr.py:758-775`) — lltypesystem `UniCharRepr`
+/// AbstractCharRepr_)` (`rstr.py`) — lltypesystem `UniCharRepr`
 /// carries `lowleveltype = UniChar`.
 #[derive(Debug)]
 pub struct AbstractUniCharRepr {
@@ -1394,7 +1394,7 @@ pub(crate) type UniCharRepr = AbstractUniCharRepr;
 
 impl UniCharRepr {
     /// RPython `UniCharRepr.char_repr = unichar_repr`
-    /// (`lltypesystem/rstr.py:1265`) — UniCharRepr's char-side backlink
+    /// (`lltypesystem/rstr.py`) — UniCharRepr's char-side backlink
     /// is itself; mirrors `CharRepr.char_repr = char_repr`
     /// (`lltypesystem/rstr.py:1267`).
     pub fn char_repr(&self) -> Arc<UniCharRepr> {
@@ -1402,8 +1402,8 @@ impl UniCharRepr {
     }
 
     /// RPython `class UniCharRepr(AbstractUniCharRepr, UnicodeRepr)`
-    /// (`lltypesystem/rstr.py:294-295`) — `UniCharRepr` MRO inherits
-    /// `UniCharRepr.repr = unicode_repr` (`lltypesystem/rstr.py:1264`).
+    /// (`lltypesystem/rstr.py`) — `UniCharRepr` MRO inherits
+    /// `UniCharRepr.repr = unicode_repr` (`lltypesystem/rstr.py`).
     pub fn repr(&self) -> Arc<UnicodeRepr> {
         unicode_repr()
     }
@@ -1475,7 +1475,7 @@ impl Repr for UniCharRepr {
         }
     }
 
-    /// RPython `AbstractUniCharRepr.get_ll_eq_function` (`rstr.py:764-765`):
+    /// RPython `AbstractUniCharRepr.get_ll_eq_function` (`rstr.py`):
     /// `return None` — callers fall back to primitive `unichar_eq`.
     fn get_ll_eq_function(
         &self,
@@ -1484,7 +1484,7 @@ impl Repr for UniCharRepr {
         Ok(None)
     }
 
-    /// RPython `AbstractUniCharRepr.get_ll_hash_function` (`rstr.py:767-768`):
+    /// RPython `AbstractUniCharRepr.get_ll_hash_function` (`rstr.py`):
     ///
     /// ```python
     /// def get_ll_hash_function(self):
@@ -1516,13 +1516,13 @@ impl Repr for UniCharRepr {
         self.get_ll_hash_function(rtyper)
     }
 
-    /// `BaseCharReprMixin.rtype_len` (`rstr.py:504-505`).
+    /// `BaseCharReprMixin.rtype_len` (`rstr.py`).
     fn rtype_len(&self, _hop: &HighLevelOp) -> RTypeResult {
         let c = HighLevelOp::inputconst(&LowLevelType::Signed, &ConstValue::Int(1))?;
         Ok(Some(Hlvalue::Constant(c)))
     }
 
-    /// `BaseCharReprMixin.rtype_bool` (`rstr.py:507-509`).
+    /// `BaseCharReprMixin.rtype_bool` (`rstr.py`).
     fn rtype_bool(&self, _hop: &HighLevelOp) -> RTypeResult {
         let c = HighLevelOp::inputconst(&LowLevelType::Bool, &ConstValue::Bool(true))?;
         Ok(Some(Hlvalue::Constant(c)))
@@ -1553,7 +1553,7 @@ impl Repr for UniCharRepr {
         hop.gendirectcall(&helper, vlist)
     }
 
-    /// `BaseCharReprMixin.rtype_ord` (`rstr.py:772-775`) — UniChar variant
+    /// `BaseCharReprMixin.rtype_ord` (`rstr.py`) — UniChar variant
     /// uses the `cast_unichar_to_int` op.
     fn rtype_ord(&self, hop: &HighLevelOp) -> RTypeResult {
         let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::UniChar)])?;
@@ -1565,7 +1565,7 @@ impl Repr for UniCharRepr {
     }
 
     /// RPython `BaseCharReprMixin._rtype_method_isxxx(_, llfn, hop)`
-    /// dispatch (`rstr.py:516-538`) — UniCharRepr inherits the same
+    /// dispatch (`rstr.py`) — UniCharRepr inherits the same
     /// mixin, so the predicate routes go through `cast_unichar_to_int`
     /// per-predicate `ll_unichar_*` helpers.
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
@@ -1606,24 +1606,24 @@ impl Repr for UniCharRepr {
     }
 }
 
-/// RPython `unichar_repr = UniCharRepr()` (`rstr.py:1010`) module-global.
+/// RPython `unichar_repr = UniCharRepr()` (`rstr.py`) module-global.
 pub(crate) fn unichar_repr() -> Arc<UniCharRepr> {
     static REPR: OnceLock<Arc<UniCharRepr>> = OnceLock::new();
     REPR.get_or_init(|| Arc::new(UniCharRepr::new())).clone()
 }
 
-/// Synthesizes the `ll_unichar_hash(ch)` helper graph (`rstr.py:941-942`):
+/// Synthesizes the `ll_unichar_hash(ch)` helper graph (`rstr.py`):
 /// single block, `cast_unichar_to_int(ch) -> hashed` then return.
 pub(crate) fn build_ll_unichar_hash_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
     build_ll_charlike_hash_helper_graph(name, LowLevelType::UniChar, "cast_unichar_to_int")
 }
 
 // ____________________________________________________________
-// pairtype(AbstractCharRepr, AbstractCharRepr) — `rstr.py:740-746`.
+// pairtype(AbstractCharRepr, AbstractCharRepr) — `rstr.py`.
 // Six comparison ops (eq/ne/lt/le/gt/ge) all dispatch to the
 // per-name lloperation `char_<func>`.
 
-/// RPython `_rtype_compare_template(hop, func)` (`rstr.py:750-753`):
+/// RPython `_rtype_compare_template(hop, func)` (`rstr.py`):
 ///
 /// ```python
 /// def _rtype_compare_template(hop, func):
@@ -1640,12 +1640,12 @@ pub(crate) fn pair_char_char_rtype_compare(hop: &HighLevelOp, func: &str) -> RTy
 }
 
 // ____________________________________________________________
-// pairtype(AbstractUniCharRepr, AbstractUniCharRepr) — `rstr.py:778-784`.
+// pairtype(AbstractUniCharRepr, AbstractUniCharRepr) — `rstr.py`.
 // `rtype_eq` / `rtype_ne` use the lloperations `unichar_eq` /
 // `unichar_ne`; `rtype_lt|le|gt|ge` cast both args through
 // `cast_unichar_to_int` and dispatch to `int_<func>`.
 
-/// RPython `_rtype_unchr_compare_template(hop, func)` (`rstr.py:789-792`):
+/// RPython `_rtype_unchr_compare_template(hop, func)` (`rstr.py`):
 ///
 /// ```python
 /// def _rtype_unchr_compare_template(hop, func):
@@ -1664,7 +1664,7 @@ pub(crate) fn pair_unichar_unichar_rtype_compare_eqne(
     Ok(hop.genop(&opname, vlist, GenopResult::LLType(LowLevelType::Bool)))
 }
 
-/// RPython `_rtype_unchr_compare_template_ord(hop, func)` (`rstr.py:794-800`):
+/// RPython `_rtype_unchr_compare_template_ord(hop, func)` (`rstr.py`):
 ///
 /// ```python
 /// def _rtype_unchr_compare_template_ord(hop, func):
@@ -1699,14 +1699,14 @@ pub(crate) fn pair_unichar_unichar_rtype_compare_ord(hop: &HighLevelOp, func: &s
 
 // ____________________________________________________________
 // pairtype(AbstractStringRepr, AbstractStringRepr) and
-// pairtype(AbstractUnicodeRepr, AbstractUnicodeRepr) — `rstr.py:651-702`.
+// pairtype(AbstractUnicodeRepr, AbstractUnicodeRepr) — `rstr.py`.
 // Six compare ops (eq/ne/lt/le/gt/ge) all flow through the same body
 // modulo the helper-graph identity (`ll_streq` / `ll_strcmp` for
 // String, `ll_unicode_eq` / `ll_unicode_cmp` for Unicode).
 
 /// RPython pair compare body shared between
 /// `pairtype(AbstractStringRepr, AbstractStringRepr)` and
-/// `pairtype(AbstractUnicodeRepr, AbstractUnicodeRepr)` (`rstr.py:661-692`):
+/// `pairtype(AbstractUnicodeRepr, AbstractUnicodeRepr)` (`rstr.py`):
 ///
 /// ```python
 /// def rtype_eq((r_str1, r_str2), hop):
@@ -1772,7 +1772,7 @@ fn pair_abstract_string_rtype_compare(
 
 /// Lower an already-coerced `(v_str1, v_str2)` string pair to the compare
 /// result: `eq`/`ne` via `ll_streq` (+ `bool_not`), `lt`/`le`/`gt`/`ge` via
-/// `ll_strcmp` + `int_<func>(diff, 0)` (rstr.py:661-692).
+/// `ll_strcmp` + `int_<func>(diff, 0)` (rstr.py).
 fn string_compare_tail(
     hop: &HighLevelOp,
     func: &str,
@@ -1811,12 +1811,12 @@ fn string_compare_tail(
 }
 
 /// RPython resolves a `String <op> Char` comparison through the pair MRO to
-/// `pairtype(AbstractStringRepr, AbstractStringRepr)` (rstr.py:661-692) because
+/// `pairtype(AbstractStringRepr, AbstractStringRepr)` (rstr.py) because
 /// `CharRepr(AbstractCharRepr, StringRepr)` inherits `StringRepr.repr =
-/// string_repr` (lltypesystem/rstr.py:1262). That body does
+/// string_repr` (lltypesystem/rstr.py). That body does
 /// `hop.inputargs(r_str1.repr, r_str2.repr)`, i.e. coerces BOTH operands to the
 /// string repr — the Char operand becomes a 1-char string via `ll_chr2str`
-/// (rstr.py:805-813) — then runs `ll_streq`/`ll_strcmp`. Pyre's `CharRepr`
+/// (rstr.py) — then runs `ll_streq`/`ll_strcmp`. Pyre's `CharRepr`
 /// pair_mro is `[CharRepr, Repr]` (explicit per-class arms, no String MRO
 /// fallback), so the mixed pair needs its own arm. `str_arg_idx` names which
 /// operand is already the string repr; both are coerced to it.
@@ -1883,7 +1883,7 @@ fn call_ll_strcmp_helper(
 
 /// RPython `pairtype(AbstractStringRepr, AbstractStringRepr)` compare
 /// dispatch — String pair, all six ops route through `ll_streq` /
-/// `ll_strcmp` (rstr.py:651-692). Mirror of
+/// `ll_strcmp` (rstr.py). Mirror of
 /// [`pair_unichar_unichar_rtype_compare_ord`] for the StringRepr
 /// surface.
 pub(crate) fn pair_string_string_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeResult {
@@ -2004,7 +2004,7 @@ pub(crate) fn pair_unicode_unicode_rtype_add(hop: &HighLevelOp) -> RTypeResult {
 
 /// Per-pair helper-name bundle for
 /// [`pair_abstract_string_int_rtype_getitem`]. Mirrors the
-/// `r_str.ll.ll_stritem*` lookup table at upstream `rstr.py:619-627`:
+/// `r_str.ll.ll_stritem*` lookup table at upstream `rstr.py`:
 /// the four helpers differ along (checkidx × nonneg) axes, and the
 /// String/Unicode pair surfaces choose between two distinct
 /// helper-cache families (`ll_stritem*` vs `ll_unicode_stritem*`).
@@ -2187,7 +2187,7 @@ pub(crate) fn pair_string_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
 }
 
 /// `pair(StringRepr, IntegerRepr).rtype_getitem_idx` — STR surface,
-/// rstr.py:634 dispatches via `pair(r_str, r_int).rtype_getitem(hop,
+/// rstr.py dispatches via `pair(r_str, r_int).rtype_getitem(hop,
 /// checkidx=True)`.
 pub(crate) fn pair_string_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
     pair_abstract_string_int_rtype_getitem(
@@ -2251,10 +2251,10 @@ fn pair_abstract_char_int_rtype_getitem(hop: &HighLevelOp, checkidx: bool) -> RT
         .ok_or_else(|| TyperError::message("rtype_getitem (Char, Int): args_s[1] missing"))?;
 
     if matches!(s1.const_(), Some(ConstValue::Int(0))) {
-        // rstr.py:725 — `hop.exception_cannot_occur()` precedes the inputarg.
+        // rstr.py — `hop.exception_cannot_occur()` precedes the inputarg.
         hop.exception_cannot_occur()?;
 
-        // rstr.py:726 — `return hop.inputarg(hop.r_result, arg=0)` —
+        // rstr.py — `return hop.inputarg(hop.r_result, arg=0)` —
         // identity-coerce the char arg into the result repr (CharRepr or
         // UniCharRepr). The result repr equals args_r[0] for the constant-0
         // case since `c[0] == c`.
@@ -2566,7 +2566,7 @@ fn rtype_abstract_string_method_startswith(
         .cloned()
         .flatten()
         .ok_or_else(|| TyperError::message("rtype_method_startswith: args_r[1] missing"))?;
-    // Char-side branch (`ll_startswith_char`, rstr.py:138-141): when
+    // Char-side branch (`ll_startswith_char`, rstr.py): when
     // args_r[1] is a CharRepr/UniCharRepr, gendirectcall the
     // single-char helper instead of `ll_startswith`.
     //
@@ -2715,7 +2715,7 @@ enum FindLikeCharKind {
 }
 
 /// Char-needle slice of RPython `rtype_method_find` /
-/// `rtype_method_count` (`rstr.py:160-189`, `:191-207`).
+/// `rtype_method_count` (`rstr.py`, `:191-207`).
 ///
 /// Full PyPy parity also accepts string-family substring needles and
 /// routes to `ll_find` / `ll_rfind` / `ll_count`. The current helper
@@ -2817,7 +2817,7 @@ fn rtype_abstract_string_method_findlike_char(
     hop.gendirectcall(&helper, vec![v_str, v_ch, v_start, v_end])
 }
 
-/// RPython `AbstractStringRepr.rtype_getslice` (`rstr.py:432-437`).
+/// RPython `AbstractStringRepr.rtype_getslice` (`rstr.py`).
 fn rtype_abstract_string_getslice(
     self_repr: &dyn Repr,
     hop: &HighLevelOp,
@@ -2927,7 +2927,7 @@ fn char_predicate_or_of_conditions_method(
 }
 
 /// Shared `rtype_method_<predicate>` wrapper for `lower/upper`. Mirrors
-/// `AbstractCharRepr.rtype_method_lower/upper` (`rstr.py:542-552`):
+/// `AbstractCharRepr.rtype_method_lower/upper` (`rstr.py`):
 ///
 /// ```python
 /// def rtype_method_lower(self, hop):
@@ -2967,7 +2967,7 @@ const ISALPHA_CONDITIONS: &[CharCondition] = &[
     CharCondition::InRange(97, 122),
     CharCondition::InRange(65, 90),
 ];
-// `ll_char_isalnum`: digit or upper-alpha or lower-alpha (rstr.py:903-912 nested form).
+// `ll_char_isalnum`: digit or upper-alpha or lower-alpha (rstr.py nested form).
 const ISALNUM_CONDITIONS: &[CharCondition] = &[
     CharCondition::InRange(48, 57),
     CharCondition::InRange(65, 90),
@@ -3151,7 +3151,7 @@ fn build_ll_charlike_or_of_conditions_helper_graph(
 
 /// Synthesizes the `ll_<charlike>_<predicate>(ch) -> Bool` helper graph
 /// for predicates of the form `lo <= ord(ch) <= hi` (RPython
-/// `rstr.py:891-922` `ll_char_isdigit/isupper/islower`).
+/// `rstr.py` `ll_char_isdigit/isupper/islower`).
 ///
 /// 3-block CFG (mirrors RPython source-level short-circuit `and`):
 /// - **start**: `c = cast_<arg>_to_int(ch); ge = int_ge(c, lo)`. Branches
@@ -3242,7 +3242,7 @@ fn build_ll_charlike_predicate_inrange_helper_graph(
 }
 
 /// Synthesizes the `ll_lower_char(ch) -> Char` /
-/// `ll_upper_char(ch) -> Char` helper graph (RPython `rstr.py:925-934`):
+/// `ll_upper_char(ch) -> Char` helper graph (RPython `rstr.py`):
 ///
 /// ```python
 /// def ll_lower_char(ch):
@@ -3430,7 +3430,7 @@ mod tests {
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 
-    /// `AbstractStringRepr.rtype_getslice` (`rstr.py:432-437`) selects the
+    /// `AbstractStringRepr.rtype_getslice` (`rstr.py`) selects the
     /// start/stop helper and preserves string representation on the result.
     #[test]
     fn string_repr_rtype_getslice_emits_stringslice_helpers() {
@@ -3619,7 +3619,7 @@ mod tests {
         assert_eq!(opnames, vec!["cast_unichar_to_int"]);
     }
 
-    /// rstr.py:110-114 — `AbstractStringRepr.get_ll_eq_function`
+    /// rstr.py — `AbstractStringRepr.get_ll_eq_function`
     /// returns `ll_streq`, `get_ll_hash_function` returns `ll_strhash`.
     /// StringRepr inherits both. The helper-cache materialises both
     /// graphs against `Ptr(STR)`.
@@ -3766,7 +3766,7 @@ mod tests {
         assert!(Arc::ptr_eq(&u1, &u2));
     }
 
-    /// `lltypesystem/rstr.py:1255` — `string_repr = StringRepr()`
+    /// `lltypesystem/rstr.py` — `string_repr = StringRepr()`
     /// module-global. Lowleveltype is `Ptr(STR)`; `class_name` /
     /// `repr_class_id` mirror the `StringRepr` upstream class.
     #[test]
@@ -3782,7 +3782,7 @@ mod tests {
         assert!(Arc::ptr_eq(&r, &r2));
     }
 
-    /// `lltypesystem/rstr.py:1260` — `unicode_repr = UnicodeRepr()`
+    /// `lltypesystem/rstr.py` — `unicode_repr = UnicodeRepr()`
     /// module-global with `Ptr(UNICODE)` lowleveltype.
     #[test]
     fn unicode_repr_singleton_lowleveltype_is_unicodeptr() {
@@ -3797,8 +3797,8 @@ mod tests {
         assert!(Arc::ptr_eq(&r, &r2));
     }
 
-    /// `lltypesystem/rstr.py:1267` — `CharRepr.char_repr = char_repr`;
-    /// `lltypesystem/rstr.py:1268` — `StringRepr.char_repr = char_repr`
+    /// `lltypesystem/rstr.py` — `CharRepr.char_repr = char_repr`;
+    /// `lltypesystem/rstr.py` — `StringRepr.char_repr = char_repr`
     /// — both class-level attributes alias to the same singleton.
     #[test]
     fn string_repr_and_char_repr_char_repr_method_returns_char_repr() {
@@ -3811,8 +3811,8 @@ mod tests {
         assert!(Arc::ptr_eq(&c_via_char, &char_repr()));
     }
 
-    /// `lltypesystem/rstr.py:1265` — `UniCharRepr.char_repr = unichar_repr`;
-    /// `lltypesystem/rstr.py:1266` — `UnicodeRepr.char_repr = unichar_repr`.
+    /// `lltypesystem/rstr.py` — `UniCharRepr.char_repr = unichar_repr`;
+    /// `lltypesystem/rstr.py` — `UnicodeRepr.char_repr = unichar_repr`.
     #[test]
     fn unicode_repr_and_unichar_repr_char_repr_method_returns_unichar_repr() {
         let u = unicode_repr();
@@ -3824,7 +3824,7 @@ mod tests {
         assert!(Arc::ptr_eq(&c_via_unichar, &unichar_repr()));
     }
 
-    /// `lltypesystem/rstr.py:1262` — `StringRepr.repr = string_repr`;
+    /// `lltypesystem/rstr.py` — `StringRepr.repr = string_repr`;
     /// `class CharRepr(AbstractCharRepr, StringRepr)` (`:291-292`)
     /// inherits the attribute. Pyre exposes both via `.repr()`.
     #[test]
@@ -3834,7 +3834,7 @@ mod tests {
         assert!(Arc::ptr_eq(&s_via_char, &string_repr()));
     }
 
-    /// `lltypesystem/rstr.py:1264` — `UniCharRepr.repr = unicode_repr`;
+    /// `lltypesystem/rstr.py` — `UniCharRepr.repr = unicode_repr`;
     /// `class UniCharRepr(AbstractUniCharRepr, UnicodeRepr)` (`:294-295`)
     /// inherits the attribute.
     #[test]
@@ -3877,7 +3877,7 @@ mod tests {
         hop
     }
 
-    /// rstr.py:740-746 + 750-753 — `pairtype(AbstractCharRepr,
+    /// rstr.py + 750-753 — `pairtype(AbstractCharRepr,
     /// AbstractCharRepr).rtype_<func>` emits `char_<func>` for each
     /// of the six compare operations.
     #[test]
@@ -3913,7 +3913,7 @@ mod tests {
         }
     }
 
-    /// rstr.py:778-780 + 789-792 — `pairtype(AbstractUniCharRepr,
+    /// rstr.py + 789-792 — `pairtype(AbstractUniCharRepr,
     /// AbstractUniCharRepr).rtype_eq` / `rtype_ne` emit `unichar_eq`
     /// / `unichar_ne` directly.
     #[test]
@@ -3949,7 +3949,7 @@ mod tests {
         }
     }
 
-    /// rstr.py:781-784 + 794-800 — `pairtype(AbstractUniCharRepr,
+    /// rstr.py + 794-800 — `pairtype(AbstractUniCharRepr,
     /// AbstractUniCharRepr).rtype_lt|le|gt|ge` cast both args via
     /// `cast_unichar_to_int` then dispatch to `int_<func>`.
     #[test]
@@ -3987,7 +3987,7 @@ mod tests {
         }
     }
 
-    /// rstr.py:661-663 — `pairtype(AbstractStringRepr,
+    /// rstr.py — `pairtype(AbstractStringRepr,
     /// AbstractStringRepr).rtype_eq` lowers to a single `direct_call`
     /// against the `ll_streq` helper graph (Bool result).
     #[test]
@@ -4025,7 +4025,7 @@ mod tests {
         assert!(dbg.contains("ll_streq"), "expected 'll_streq' in {dbg}");
     }
 
-    /// rstr.py:665-668 — `pairtype(AbstractStringRepr,
+    /// rstr.py — `pairtype(AbstractStringRepr,
     /// AbstractStringRepr).rtype_ne` emits `direct_call(ll_streq)`
     /// then wraps with `bool_not`.
     #[test]
@@ -4064,7 +4064,7 @@ mod tests {
         assert_eq!(ops.ops[1].opname, "bool_not");
     }
 
-    /// rstr.py:670-692 — `pairtype(AbstractStringRepr,
+    /// rstr.py — `pairtype(AbstractStringRepr,
     /// AbstractStringRepr).rtype_<lt|le|gt|ge>` emits
     /// `direct_call(ll_strcmp)` then `int_<func>(diff, Signed(0))`.
     /// Walk all four ord ops in one loop.
@@ -4202,7 +4202,7 @@ mod tests {
         }
     }
 
-    /// rstr.py:134-145 — `AbstractStringRepr.rtype_method_startswith`
+    /// rstr.py — `AbstractStringRepr.rtype_method_startswith`
     /// (String/String branch) lowers to a single `direct_call` against
     /// the `ll_startswith` helper graph (Bool result).
     #[test]
@@ -4234,7 +4234,7 @@ mod tests {
         let ops = llops.borrow();
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "direct_call");
-        // rstr.py:144 — `hop.exception_cannot_occur()` precedes the
+        // rstr.py — `hop.exception_cannot_occur()` precedes the
         // gendirectcall.
         assert!(
             ops._called_exception_is_here_or_cannot_occur,
@@ -4292,7 +4292,7 @@ mod tests {
     }
 
     /// Char-side branch of `rtype_method_startswith` (`ll_startswith_char`,
-    /// `rstr.py:138-141`) — when `args_r[1]` is a CharRepr, the
+    /// `rstr.py`) — when `args_r[1]` is a CharRepr, the
     /// dispatcher gendirectcalls the single-char helper instead of
     /// `ll_startswith`.
     #[test]
@@ -4571,7 +4571,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:147-158 — `AbstractStringRepr.rtype_method_endswith`
+    /// rstr.py — `AbstractStringRepr.rtype_method_endswith`
     /// (String/String branch) lowers to a single `direct_call` against
     /// the `ll_endswith` helper graph (Bool result).
     #[test]
@@ -4603,7 +4603,7 @@ mod tests {
         let ops = llops.borrow();
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "direct_call");
-        // rstr.py:157 — `hop.exception_cannot_occur()` precedes the
+        // rstr.py — `hop.exception_cannot_occur()` precedes the
         // gendirectcall.
         assert!(
             ops._called_exception_is_here_or_cannot_occur,
@@ -4671,7 +4671,7 @@ mod tests {
         let ops = llops.borrow();
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "direct_call");
-        // rstr.py:628 (checkidx=False path) — `hop.exception_cannot_occur()`
+        // rstr.py (checkidx=False path) — `hop.exception_cannot_occur()`
         // precedes the gendirectcall.
         assert!(
             ops._called_exception_is_here_or_cannot_occur,
@@ -4824,7 +4824,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:614-635 — `rtype_getitem_idx` with `nonneg=False`
+    /// rstr.py — `rtype_getitem_idx` with `nonneg=False`
     /// dispatches to `ll_stritem_checked` (full neg-fix + bound-check;
     /// raises IndexError when `i >= length` or `i < 0` after fix-up).
     #[test]
@@ -4954,7 +4954,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:651-659 (UnicodeRepr inherited) — UNICODE pair surface
+    /// rstr.py (UnicodeRepr inherited) — UNICODE pair surface
     /// uses distinct helper-cache identity `ll_unicode_concat`.
     #[test]
     fn pair_unicode_unicode_rtype_add_emits_direct_call_to_ll_unicode_concat() {
@@ -5182,7 +5182,7 @@ mod tests {
         }
     }
 
-    /// rstr.py:452-457 — UnicodeRepr intentionally rejects
+    /// rstr.py — UnicodeRepr intentionally rejects
     /// `upper/lower` instead of using byte-string casefolding.
     #[test]
     fn unicode_repr_rtype_method_casefold_raises_typererror() {
@@ -5438,7 +5438,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:891-922 ll_char_isdigit / ll_char_isupper /
+    /// rstr.py ll_char_isdigit / ll_char_isupper /
     /// ll_char_islower bodies are all `lo <= ord(ch) <= hi`. Pyre
     /// synthesizes the same shape as a 3-block CFG: cast → int_ge →
     /// branch (False fallthrough to false-return / True to
@@ -5481,7 +5481,7 @@ mod tests {
         assert_eq!(target_ops, vec!["int_le"]);
     }
 
-    /// rstr.py:886-912 — `ll_char_isspace` body is `c == 32 or 9 <= c
+    /// rstr.py — `ll_char_isspace` body is `c == 32 or 9 <= c
     /// <= 13`. Pyre synthesizes a 4-named-block CFG (start +
     /// inrange_check_hi + next-condition-entry + returnblock).
     #[test]
@@ -5539,7 +5539,7 @@ mod tests {
         assert_eq!(entry_ops, vec!["int_ge"]);
     }
 
-    /// rstr.py:925-934 — `ll_lower_char(ch)` body is the conditional
+    /// rstr.py — `ll_lower_char(ch)` body is the conditional
     /// ASCII offset `if 'A' <= ch <= 'Z': ch = chr(ord(ch) + 32)`.
     /// Pyre synthesizes a 4-block CFG: start (cast + ge check),
     /// block_check_hi (le check), block_offset (int_add +
@@ -5589,7 +5589,7 @@ mod tests {
         assert_eq!(offset_ops, vec!["int_add", "cast_int_to_char"]);
     }
 
-    /// rstr.py:516-538 — CharRepr/UniCharRepr inherit
+    /// rstr.py — CharRepr/UniCharRepr inherit
     /// BaseCharReprMixin._rtype_method_isxxx; pyre's `rtype_method`
     /// dispatch routes isdigit/isupper/islower through
     /// `char_predicate_inrange_method`, which emits a single
@@ -5774,7 +5774,7 @@ mod tests {
         hop
     }
 
-    /// rstr.py:119-122 — `AbstractStringRepr.rtype_len` lowers to a
+    /// rstr.py — `AbstractStringRepr.rtype_len` lowers to a
     /// single `direct_call` against the `ll_strlen` helper graph
     /// (Ptr(STR) → Signed). Mirrors upstream `gendirectcall(self.ll.ll_strlen, v_str)`.
     #[test]
@@ -5822,7 +5822,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:119-122 mirror for UnicodeRepr — same shape, different
+    /// rstr.py mirror for UnicodeRepr — same shape, different
     /// helper identity (`ll_unilen`) and pointer lltype (Ptr(UNICODE)).
     #[test]
     fn unicode_repr_rtype_len_emits_direct_call_to_ll_unilen() {
@@ -5868,7 +5868,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:124-132 — `AbstractStringRepr.rtype_bool` with
+    /// rstr.py — `AbstractStringRepr.rtype_bool` with
     /// `can_be_None == True` emits `gendirectcall(ll_str_is_true)`.
     #[test]
     fn string_repr_rtype_bool_when_can_be_none_emits_direct_call_to_ll_str_is_true() {
@@ -5914,7 +5914,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:124-132 mirror for UnicodeRepr — `can_be_None == True`
+    /// rstr.py mirror for UnicodeRepr — `can_be_None == True`
     /// path emits `gendirectcall(ll_unicode_is_true)`.
     #[test]
     fn unicode_repr_rtype_bool_when_can_be_none_emits_direct_call_to_ll_unicode_is_true() {
@@ -6009,7 +6009,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:124-132 + rmodel.py:199-207 mirror for UnicodeRepr —
+    /// rstr.py + rmodel.py:199-207 mirror for UnicodeRepr —
     /// same shape but the underlying length helper is `ll_unilen`.
     #[test]
     fn unicode_repr_rtype_bool_when_not_can_be_none_falls_back_to_int_is_true_of_length() {
@@ -6055,7 +6055,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:385-396 — `unicode(s)` for a byte string emits
+    /// rstr.py — `unicode(s)` for a byte string emits
     /// `direct_call(ll_str2unicode, s)` and marks the operation as
     /// exception-capable because non-ASCII bytes raise
     /// UnicodeDecodeError inside the helper graph.
@@ -6410,7 +6410,7 @@ mod tests {
         assert!(ops._called_exception_is_here_or_cannot_occur);
     }
 
-    /// rstr.py:723-726 — `pairtype(AbstractCharRepr, IntegerRepr).rtype_getitem`
+    /// rstr.py — `pairtype(AbstractCharRepr, IntegerRepr).rtype_getitem`
     /// constant-0 path returns the char itself via
     /// `hop.inputarg(hop.r_result, arg=0)`. No SpaceOperation is
     /// emitted; the result is identity-coerced from arg[0].
@@ -6464,7 +6464,7 @@ mod tests {
         // Constant-0 path emits no SpaceOperation — only the identity
         // inputarg coercion runs (which is a no-op for matched reprs).
         assert_eq!(ops.ops.len(), 0, "constant-0 path should emit zero ops");
-        // rstr.py:725 — `hop.exception_cannot_occur()` precedes the
+        // rstr.py — `hop.exception_cannot_occur()` precedes the
         // inputarg.
         assert!(
             ops._called_exception_is_here_or_cannot_occur,
@@ -6472,7 +6472,7 @@ mod tests {
         );
     }
 
-    /// rstr.py:723-726 — UniCharRepr+Int constant-0 mirror.
+    /// rstr.py — UniCharRepr+Int constant-0 mirror.
     #[test]
     fn pair_unichar_int_rtype_getitem_constant_zero_returns_arg0_identity() {
         use crate::flowspace::model::Variable;

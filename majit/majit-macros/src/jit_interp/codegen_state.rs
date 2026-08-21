@@ -148,7 +148,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
     let num_scalars = scalars.len();
     let num_virt_arrays = virt_arrays.len();
-    // `pyjitpl.py:2984-2989 reached_loop_header` carries the virtualizable
+    // `pyjitpl.py reached_loop_header` carries the virtualizable
     // exactly ONCE: it is a single red (`warmspot.py:529-538
     // jd.index_of_virtualizable = jitdriver.reds.index(vname)`), and
     // `virtualizable.py:150-153` reads every `[.. ; virt]` array's length off
@@ -612,7 +612,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .collect();
 
     // ── canonical_liveness_slots: array_lens slice expression ──
-    // RPython `assembler.py:218-231 get_liveness_info` extracts per-kind
+    // RPython `assembler.py get_liveness_info` extracts per-kind
     // liveness for each `-live-` marker.  In flat-state JIT every slot
     // is permanently live, so the canonical entry is just
     // `[0..total_slots]` of int slots.  The `array_lens` slice fed to
@@ -1938,8 +1938,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     };
 
     // Naming the virtualizable on the jitdriver static data
-    // (`warmspot.py:520-545 make_virtualizable_infos`) is what makes
-    // `compile.py:508-511`'s field-reload preamble run, which retires the
+    // (`warmspot.py make_virtualizable_infos`) is what makes
+    // `compile.py`'s field-reload preamble run, which retires the
     // per-entry re-export of the virtualizable's array elements: the compiled
     // entry reloads them from the virtualizable pointer instead of being handed
     // one entry argument per element.
@@ -1994,7 +1994,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {}
     };
 
-    // pyjitpl.py:3443-3444 `rebuild_state_after_failure`:
+    // pyjitpl.py `rebuild_state_after_failure`:
     //     if vinfo is not None:
     //         self.virtualizable_boxes = virtualizable_boxes
     // The guard's vable section is decoded by `rebuild_from_resumedata` above;
@@ -2249,7 +2249,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 Some(self as *const Self as *mut u8)
             }
 
-            // warmstate.py:387-396 `execute_assembler`: all a compiled entry
+            // warmstate.py `execute_assembler`: all a compiled entry
             // does to its virtualizable is `vinfo.clear_vable_token(virt)` —
             // one store, before the call, and nothing after it. There is no
             // copy in and no copy out, because the virtualizable IS the
@@ -2346,7 +2346,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         }
 
         impl #meta_ty {
-            /// RPython `assembler.py:218-231 get_liveness_info(insn, kind)`
+            /// RPython `assembler.py get_liveness_info(insn, kind)`
             /// adapted for flat-state JIT: every state_field slot is
             /// permanently live, so the canonical `(live_i, live_r,
             /// live_f)` triple is `live_i = 0..total_slots` in the int
@@ -2381,7 +2381,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             /// asm.all_liveness)`).  Builds a fresh `Assembler`,
             /// registers the canonical
             /// `(live_i, live_r, live_f)` triple via
-            /// `Assembler::_encode_liveness` (`assembler.py:235-248`),
+            /// `Assembler::_encode_liveness` (`assembler.py`),
             /// then publishes the resulting `all_liveness` payload
             /// through `JitDriver::install_canonical_liveness`.
             ///
@@ -2409,7 +2409,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 &self,
                 driver: &mut majit_metainterp::JitDriver<#state_type>,
             ) {
-                // RPython `codewriter.py:23-24` calls `CallControl.__init__`
+                // RPython `codewriter.py` calls `CallControl.__init__`
                 // (`call.py:46-47`) before `assemble()` produces the jitcodes
                 // that read `jitdriver_sd.index`. Pyre's analog: stamp the
                 // descriptor onto the driver before the dispatch JitCode
@@ -2435,7 +2435,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // empty stub.  `green_kind_counts` / `red_kind_counts`
                 // then reflect the actual payload partition.
                 #declare_schema_fn_name(driver);
-                // `warmspot.py:520-545 make_virtualizable_infos` names the
+                // `warmspot.py make_virtualizable_infos` names the
                 // virtualizable on the jitdriver static data during setup, i.e.
                 // before the driver is registered. Order matters here for the
                 // same reason: `ensure_descriptor_registered` MOVES the
@@ -2480,7 +2480,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     // JIT entries are registered explicitly here.  The
                     // downstream `MetaInterpStaticData::
                     // install_canonical_liveness` then calls
-                    // `setup_insns(asm.insns())` (`pyjitpl.py:2227-2243`)
+                    // `setup_insns(asm.insns())` (`pyjitpl.py`)
                     // to dynamically resolve `op_live` /
                     // `op_catch_exception` / `op_*_return` instead of a
                     // parallel hardcoded `BC_*` seeding block.
@@ -2509,7 +2509,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                         "void_return/",
                         majit_metainterp::jitcode::insns::BC_VOID_RETURN,
                     );
-                    // RPython `pyjitpl.py:2255 finish_setup` builds every
+                    // RPython `pyjitpl.py finish_setup` builds every
                     // JitCode and stamps every per-marker `-live-` triple
                     // into `asm.all_liveness` *before* snapshotting
                     // `metainterp_sd.liveness_info`. Pyre's lazy factory
@@ -2784,7 +2784,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
 
             // The buffer-filling form is the primary one and the owning form
-            // wraps it: `warmstate.py:503-511 maybe_compile_and_run` hands
+            // wraps it: `warmstate.py maybe_compile_and_run` hands
             // `execute_assembler` reds that are already unboxed locals, so the
             // entry path allocates nothing to describe them. The driver keeps
             // these buffers across calls, so a warm entry refills them.
@@ -2857,7 +2857,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
 
             // ── Part A (bridge resume-decode). ──
             //
-            // resume.py:1042-1057 rebuild_from_resumedata parity for the
+            // resume.py rebuild_from_resumedata parity for the
             // JitDriver state.  Without this the trait default returns None and
             // `start_bridge_tracing` aborts (jitdriver.rs) so no guard-exit
             // bridge ever forms — a failing loop guard re-enters via
@@ -2875,7 +2875,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 fail_arg_types: &[majit_ir::Type],
                 storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
             ) -> Option<majit_metainterp::ResumeDataResult> {
-                // resume.py:1049-1055 rebuild_from_resumedata:
+                // resume.py rebuild_from_resumedata:
                 //     while not resumereader.done_reading():
                 //         jitcode_pos, pc = resumereader.read_jitcode_pos_pc()
                 //         jitcode = metainterp.staticdata.jitcodes[jitcode_pos]
@@ -2883,7 +2883,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 //         resumereader.consume_boxes(f.get_current_position_info(), ..)
                 //
                 // Every section is delimited by ITS OWN jitcode's `-live-`
-                // liveness at ITS OWN pc (jitcode.py:147 `enumerate_vars` ->
+                // liveness at ITS OWN pc (jitcode.py `enumerate_vars` ->
                 // length_i + length_r + length_f); RPython never consumes "the
                 // rest of the stream" as one frame.  The writer already honours
                 // that contract — `build_state_field_snapshot`
@@ -3397,7 +3397,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 let __saved_float_values: Vec<Option<i64>> =
                     __root.float_values[..__fn].to_vec();
                 sym.populate_frame_int_regs(__root);
-                // pyjitpl.py:2586-2610 `capture_resumedata(framestack,
+                // pyjitpl.py `capture_resumedata(framestack,
                 // virtualizable_boxes, virtualref_boxes,
                 // last_snapshot)` — the snapshot must carry the live
                 // vable + vref box lists or the resume reader sees

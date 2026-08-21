@@ -3,7 +3,7 @@ use super::*;
 
 /// The `(field_size, is_signed)` a struct-layout registration reports for one
 /// field, plus a compile-time check that the declaration matches the Rust
-/// struct.  `descr.py:218-239 get_field_descr` derives both from `FIELDTYPE`,
+/// struct.  `descr.py get_field_descr` derives both from `FIELDTYPE`,
 /// but the macro sees only the field's name at the access site, so a sub-word
 /// integer field has to be named in `int_fields` to be registered as one.
 /// Anything undeclared is registered as an `i64` — and has to be that wide to
@@ -714,7 +714,7 @@ impl<'c> Lowerer<'c> {
         Some(())
     }
 
-    /// RPython jtransform.py:650 `hint_force_virtualizable`.
+    /// RPython jtransform.py `hint_force_virtualizable`.
     ///
     /// Recognizes `hint_force_virtualizable!(frame)` macro invocation.
     pub(super) fn lower_vable_force(&mut self, expr: &Expr) -> Option<()> {
@@ -1118,7 +1118,7 @@ impl<'c> Lowerer<'c> {
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
         // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
-        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.
         let struct_path = config.declaring_struct(&struct_path, &member_name);
@@ -1259,7 +1259,7 @@ impl<'c> Lowerer<'c> {
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
         // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
-        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.
         let struct_path = config.declaring_struct(&struct_path, &member_name);
@@ -1406,7 +1406,7 @@ impl<'c> Lowerer<'c> {
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
         // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
-        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.
         let struct_path = config.declaring_struct(&struct_path, &member_name);
@@ -1572,7 +1572,7 @@ impl<'c> Lowerer<'c> {
             quote! {
                 let __descr_idx = __builder.add_raw_int_array_descr_signed(
                     ::core::mem::size_of::<#element_type>(),
-                    // descr.py:240-254 get_type_flag reads signedness off the
+                    // descr.py get_type_flag reads signedness off the
                     // declared element type.  Hard-coding signed would
                     // sign-extend a `u8` element of 0x80 to -128 where the
                     // concrete Rust read yields 128.  `MIN` resolves through a
@@ -1643,7 +1643,7 @@ impl<'c> Lowerer<'c> {
             quote! {
                 let __descr_idx = __builder.add_raw_int_array_descr_signed(
                     ::core::mem::size_of::<#element_type>(),
-                    // descr.py:240-254 get_type_flag reads signedness off the
+                    // descr.py get_type_flag reads signedness off the
                     // declared element type.  Hard-coding signed would
                     // sign-extend a `u8` element of 0x80 to -128 where the
                     // concrete Rust read yields 128.  `MIN` resolves through a
@@ -1777,7 +1777,7 @@ impl<'c> Lowerer<'c> {
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
         // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
-        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.
         let struct_path = config.declaring_struct(&struct_path, &member_name);
@@ -1912,7 +1912,7 @@ impl<'c> Lowerer<'c> {
         // declaring struct together, which is what gives one physical field
         // one descriptor across every struct that embeds it.
         // `rclass.py:987-1001` recurses to `self.rbase` for exactly this, and
-        // its `cast_pointer` costs nothing at runtime (`jtransform.py:254`
+        // its `cast_pointer` costs nothing at runtime (`jtransform.py`
         // lowers it to `same_as`): the base register is unchanged, because an
         // inlined base is required to start at offset 0.
         let struct_path = config.declaring_struct(&struct_path, &member_name);

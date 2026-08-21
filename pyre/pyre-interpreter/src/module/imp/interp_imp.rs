@@ -178,7 +178,7 @@ pub(crate) fn frozen_abi_pointer_variable(name: &str) -> Option<usize> {
 
 static FROZEN_OVERRIDE: AtomicI64 = AtomicI64::new(0);
 
-/// `importing.py:159 ImportRLock` — the interpreter's reentrant import lock.
+/// `importing.py ImportRLock` — the interpreter's reentrant import lock.
 ///
 /// Upstream mutates the three fields with the GIL held (`importing.py:175`
 /// "this function runs with the GIL acquired so there is no race condition in
@@ -228,7 +228,7 @@ impl ImportRLock {
         }
     }
 
-    /// `importing.py:167 lock_held_by_someone_else`.  No caller upstream
+    /// `importing.py lock_held_by_someone_else`.  No caller upstream
     /// either; its `true` branch is additionally unreachable while pyre runs a
     /// single Python thread.
     #[allow(dead_code)]
@@ -238,13 +238,13 @@ impl ImportRLock {
         owner != 0 && owner != me
     }
 
-    /// `importing.py:171 lock_held_by_anyone` — owner-agnostic, which is what
+    /// `importing.py lock_held_by_anyone` — owner-agnostic, which is what
     /// makes `_imp.lock_held()` true when read from a non-owning thread.
     fn lock_held_by_anyone(&self) -> bool {
         self.lockowner.load(Ordering::Acquire) != 0
     }
 
-    /// `importing.py:174 acquire_lock`.
+    /// `importing.py acquire_lock`.
     fn acquire_lock(&self) {
         // importing.py:177-181 — allocate on first use.  A losing racer drops
         // its own box and uses the winner's.
@@ -276,7 +276,7 @@ impl ImportRLock {
         self.lockcounter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `importing.py:192 release_lock(silent_after_fork)`.
+    /// `importing.py release_lock(silent_after_fork)`.
     fn release_lock(&self, silent_after_fork: bool) -> Result<(), crate::PyError> {
         let me = thread_ident();
         let owner = self.lockowner.load(Ordering::Acquire);
@@ -295,7 +295,7 @@ impl ImportRLock {
             // and then the very first unbalanced release of a process would
             // return silently instead of raising.  CONVERGENCE: have the
             // native importer bracket module execution with the lock the way
-            // `importing.py:91 importhook` brackets its own, after which the
+            // `importing.py importhook` brackets its own, after which the
             // lock is allocated before user code runs and the branch stops
             // being observable either way.
             // importing.py:201-203
@@ -313,7 +313,7 @@ impl ImportRLock {
         Ok(())
     }
 
-    /// `importing.py:209 reinit_lock` — run in a fork child so it does not
+    /// `importing.py reinit_lock` — run in a fork child so it does not
     /// share the parent's lock.  Branches on the depth, not on ownership:
     /// a depth above one means the fork happened underneath an import, whose
     /// `before` hook already acquired.
@@ -339,7 +339,7 @@ impl ImportRLock {
     }
 }
 
-/// `importing.py:228 getimportlock(space)` = `space.fromcache(ImportRLock)` —
+/// `importing.py getimportlock(space)` = `space.fromcache(ImportRLock)` —
 /// one instance per interpreter, shared by every thread.  That sharing is what
 /// makes `lockowner` meaningful, so this is a global and never a
 /// `thread_local!`.
@@ -359,23 +359,23 @@ fn getimportlock() -> &'static ImportRLock {
 // below (`interp_imp.py:140`) is constant-true here: pyre's build always
 // registers `_thread`, so the gateways stay ungated.
 
-/// `interp_imp.py:139 lock_held`.
+/// `interp_imp.py lock_held`.
 fn lock_held() -> bool {
     getimportlock().lock_held_by_anyone()
 }
 
-/// `interp_imp.py:146 acquire_lock`.
+/// `interp_imp.py acquire_lock`.
 fn acquire_lock() {
     getimportlock().acquire_lock();
 }
 
-/// `interp_imp.py:150 release_lock` — `silent_after_fork=False`, which is why
+/// `interp_imp.py release_lock` — `silent_after_fork=False`, which is why
 /// an unbalanced `_imp.release_lock()` from Python raises.
 fn release_lock() -> Result<(), crate::PyError> {
     getimportlock().release_lock(false)
 }
 
-/// `interp_imp.py:153 reinit_lock`.  Deliberately absent from the `_imp`
+/// `interp_imp.py reinit_lock`.  Deliberately absent from the `_imp`
 /// namespace: `moduledef.py:26` exposes only `lock_held`, `acquire_lock` and
 /// `release_lock`.
 fn reinit_lock() {
@@ -817,7 +817,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // in a fresh namespace registered under its name and hand the
             // module back, or None when the name is not frozen.  A name
             // already in sys.modules keeps its module.
-            // `interp_imp.py:74 init_frozen` instead always answers None,
+            // `interp_imp.py init_frozen` instead always answers None,
             // leaving frozen modules to the meta path.
             |args| {
                 let name = frozen_name(args, "init_frozen")?;
@@ -1132,7 +1132,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "create_dynamic",
-        // interp_imp.py:49 create_dynamic. Without the `cpyext` feature this is
+        // interp_imp.py create_dynamic. Without the `cpyext` feature this is
         // the `has_so_extension() == False` branch, which is the default build:
         // the spec's `name` and `origin` are read and rejected for an embedded
         // null before reporting the unsupported load, matching
@@ -1216,7 +1216,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(
         ns,
         "_fix_co_filename",
-        // interp_imp.py:157 fix_co_filename(code, pathname).
+        // interp_imp.py fix_co_filename(code, pathname).
         crate::make_builtin_function_with_arity(
             "_fix_co_filename",
             |args| {

@@ -3,7 +3,7 @@
 //!
 //! Upstream's `pair(a, b)` machinery drives `binaryop.py` /
 //! `unaryop.py` class-extension dispatch. Rust port mirrors the
-//! `DoubleDispatchRegistry` precisely (pairtype.py:75-96) and models
+//! `DoubleDispatchRegistry` precisely (pairtype.py) and models
 //! the pair-MRO walk with [`pairmro`]. `pair()` / `pairtype()`
 //! themselves are tightly bound to Python's metaclass machinery and
 //! have no direct Rust analog — the `SomeValueTag` hierarchy defined
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::rc::Rc;
 
-/// RPython `pairmro(cls1, cls2)` (pairtype.py:65-73).
+/// RPython `pairmro(cls1, cls2)` (pairtype.py).
 ///
 /// ```python
 /// def pairmro(cls1, cls2):
@@ -33,7 +33,7 @@ pub fn pairmro<'a, T1: Copy, T2: Copy>(
         .flat_map(move |b2| mro1.iter().map(move |b1| (*b1, *b2)))
 }
 
-/// RPython `class DoubleDispatchRegistry` (pairtype.py:75-96).
+/// RPython `class DoubleDispatchRegistry` (pairtype.py).
 ///
 /// A mapping of pairs of types to arbitrary objects respecting
 /// inheritance. Upstream keeps a `_registry` dict plus a `_cache` that
@@ -51,12 +51,12 @@ where
     K1: Copy + Eq + Hash,
     K2: Copy + Eq + Hash,
 {
-    /// RPython `self._registry = {}` (pairtype.py:80). Stored with
+    /// RPython `self._registry = {}` (pairtype.py). Stored with
     /// `Rc<V>` because upstream's `_cache = self._registry.copy()`
     /// shares Python references (no deep clone); Rust matches that
     /// with reference-counted sharing.
     _registry: HashMap<(K1, K2), Rc<V>>,
-    /// RPython `self._cache = {}` (pairtype.py:81). Starts as a copy of
+    /// RPython `self._cache = {}` (pairtype.py). Starts as a copy of
     /// `_registry` and grows on MRO hits so subsequent lookups for the
     /// same clspair are O(1).
     _cache: HashMap<(K1, K2), Rc<V>>,
@@ -74,7 +74,7 @@ where
         }
     }
 
-    /// RPython `__setitem__(self, clspair, value)` (pairtype.py:94-96).
+    /// RPython `__setitem__(self, clspair, value)` (pairtype.py).
     ///
     /// ```python
     /// def __setitem__(self, clspair, value):
@@ -93,7 +93,7 @@ where
             .collect();
     }
 
-    /// RPython `__getitem__(self, clspair)` (pairtype.py:83-92).
+    /// RPython `__getitem__(self, clspair)` (pairtype.py).
     ///
     /// ```python
     /// def __getitem__(self, clspair):

@@ -2,8 +2,8 @@
 //!
 //! `RaiseAnalyzer` is the `BoolGraphAnalyzer` subclass that decides
 //! whether each call site can raise. Inputs feed
-//! `inline.py:144 BaseInliner.__init__(... raise_analyzer)` and
-//! `inline.py:124-142 any_call_to_raising_graphs`. The Rust port
+//! `inline.py BaseInliner.__init__(... raise_analyzer)` and
+//! `inline.py any_call_to_raising_graphs`. The Rust port
 //! exposes the same surface (`can_raise`, `analyze_simple_operation`,
 //! `analyze_external_call`, `analyze_exceptblock_in_graph`,
 //! `do_ignore_memory_error`).
@@ -26,12 +26,12 @@ use crate::translator::translator::TranslationContext;
 pub struct RaiseAnalyzer<'t> {
     translator: &'t TranslationContext,
     /// Upstream `RaiseAnalyzer.ignore_exact_class = None` at
-    /// `canraise.py:9`. `do_ignore_memory_error` flips this to the
+    /// `canraise.py`. `do_ignore_memory_error` flips this to the
     /// MemoryError class. The Rust port stores the upstream class
     /// name as a literal string because pyre's `LLOp.canraise` carries
     /// `&'static str` exception names rather than class objects.
     ignore_exact_class: Option<&'static str>,
-    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py:13`).
+    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
     analyzed_calls: UnionFind<usize, Dependency<bool>>,
 }
 
@@ -44,7 +44,7 @@ impl<'t> RaiseAnalyzer<'t> {
         }
     }
 
-    /// `do_ignore_memory_error(self)` at `canraise.py:11-12`.
+    /// `do_ignore_memory_error(self)` at `canraise.py`.
     pub fn do_ignore_memory_error(&mut self) {
         self.ignore_exact_class = Some("MemoryError");
     }
@@ -135,7 +135,7 @@ impl<'t> GraphAnalyzer<bool, ()> for RaiseAnalyzer<'t> {
     /// Upstream `:25 analyze_exceptblock = None    # don't call this`.
     /// Replicates the upstream guard: `analyze_exceptblock` should
     /// never fire on a `RaiseAnalyzer` — the framework body calls
-    /// `analyze_exceptblock_in_graph` per `graphanalyze.py:155`. If
+    /// `analyze_exceptblock_in_graph` per `graphanalyze.py`. If
     /// the day ever comes when something routes back through the
     /// vanilla hook, surface the deviation loudly so the contract
     /// stays in sync with upstream.

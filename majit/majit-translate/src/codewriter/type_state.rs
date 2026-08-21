@@ -5,7 +5,7 @@
 //! into every alias).
 //!
 //! Type kinds flow through `Variable.concretetype`
-//! (`rpython/flowspace/model.py:280 Variable.__slots__ = [..., "concretetype"]`;
+//! (`rpython/flowspace/model.py Variable.__slots__ = [..., "concretetype"]`;
 //! `:355 Constant.__slots__ = ["concretetype"]`) — set inline by the
 //! rtyper via `RPythonTyper.setconcretetype()`
 //! (`rpython/rtyper/rtyper.py:258 v.concretetype = ...`).  Pyre
@@ -41,7 +41,7 @@ pub use crate::model::ConcreteType;
 /// it in the graph — `Block.inputargs`, op operands, `Link.args`,
 /// `exitswitch`, `last_exception`, `last_exc_value` — so a single write
 /// onto the key Variable propagates everywhere, mirroring upstream
-/// `v.concretetype = T` attribute aliasing (`history.py:46-71 getkind`
+/// `v.concretetype = T` attribute aliasing (`history.py getkind`
 /// reads `v.concretetype` off the Variable).
 ///
 /// A typed Variable whose `concretetype` is still `None` (rtyper hasn't

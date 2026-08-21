@@ -47,7 +47,7 @@ fn is_pending(raw: *mut CPyObject) -> bool {
 /// The buffer such a mirror hands out and its length, or `None` for a mirror
 /// that already has its `bytes`.
 ///
-/// `bytesobject.py:145-151 _PyBytes_AsString` answers the accessors from the
+/// `bytesobject.py _PyBytes_AsString` answers the accessors from the
 /// buffer rather than the object, so reading one does not decide the contents
 /// early.  The producer below is unreachable: a pending mirror is entered in
 /// the cache when it is allocated.
@@ -60,7 +60,7 @@ fn pending_buffer(raw: *mut CPyObject) -> Option<(*mut c_char, usize)> {
 }
 
 /// A NULL `text` asks for an uninitialized buffer of `size` bytes the caller
-/// then fills through `PyBytes_AS_STRING` — `bytesobject.py:64 new_empty_str`.
+/// then fills through `PyBytes_AS_STRING` — `bytesobject.py new_empty_str`.
 ///
 /// There is no interpreter object yet: what the `bytes` will hold is not
 /// decided until C stops writing.  The mirror is handed out unlinked, and
@@ -108,7 +108,7 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(
 }
 
 /// Give a mirror [`PyBytes_FromStringAndSize`] handed out the `bytes` its
-/// buffer now holds, and link the two — `bytesobject.py:100 bytes_realize`.
+/// buffer now holds, and link the two — `bytesobject.py bytes_realize`.
 ///
 /// Reached from [`super::pyobject::realize`], so the `bytes` is built the first
 /// time the mirror is read as a value.  What C wrote up to that point is what
@@ -306,13 +306,13 @@ pub unsafe extern "C" fn PyBytes_Size(object: *mut CPyObject) -> isize {
     unsafe { pyre_object::bytesobject::w_bytes_len(value) as isize }
 }
 
-/// `bytesobject.py:261-268 PyBytes_FromObject` — the `bytes` an object's buffer
+/// `bytesobject.py PyBytes_FromObject` — the `bytes` an object's buffer
 /// or its elements make, without the `bytes(n)` count spelling and without a
 /// codec.
 ///
 /// A `__bytes__` override is *not* consulted here.  That is
 /// `invoke_bytes_method`, and the only entry point that runs it is
-/// [`super::object::PyObject_Bytes`] (`object.py:199-201`).
+/// [`super::object::PyObject_Bytes`] (`object.py`).
 pub(super) fn bytes_of(object: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { pyre_object::bytesobject::is_bytes(object) } {
         // An exact `bytes` is its own answer; a subclass instance is copied

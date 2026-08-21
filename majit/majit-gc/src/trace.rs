@@ -70,18 +70,18 @@ pub struct TypeEntry {
 }
 
 impl TypeInfoLayout {
-    /// `T_MEMBER_INDEX` (gctypelayout.py:191). Lowest 16 bits of
+    /// `T_MEMBER_INDEX` (gctypelayout.py). Lowest 16 bits of
     /// `infobits` carry the group member index; majit doesn't use
     /// this field today but reserves the bits to keep the bit layout
     /// compatible with the RPython constants below.
     pub const T_MEMBER_INDEX: u64 = 0xffff;
-    /// `T_IS_VARSIZE` (gctypelayout.py:192).
+    /// `T_IS_VARSIZE` (gctypelayout.py).
     pub const T_IS_VARSIZE: u64 = 0x010000;
-    /// `T_HAS_GCPTR_IN_VARSIZE` (gctypelayout.py:193).
+    /// `T_HAS_GCPTR_IN_VARSIZE` (gctypelayout.py).
     pub const T_HAS_GCPTR_IN_VARSIZE: u64 = 0x020000;
-    /// `T_IS_GCARRAY_OF_GCPTR` (gctypelayout.py:194).
+    /// `T_IS_GCARRAY_OF_GCPTR` (gctypelayout.py).
     pub const T_IS_GCARRAY_OF_GCPTR: u64 = 0x040000;
-    /// `T_IS_WEAKREF` (gctypelayout.py:195).
+    /// `T_IS_WEAKREF` (gctypelayout.py).
     pub const T_IS_WEAKREF: u64 = 0x080000;
     /// `T_IS_RPYTHON_INSTANCE` — the type is a subclass of OBJECT
     /// (gctypelayout.py:196). Stored in `infobits` and tested by
@@ -89,9 +89,9 @@ impl TypeInfoLayout {
     /// `gc_ll_descr.get_translated_info_for_guard_is_object`
     /// (gc.py:603-622).
     pub const T_IS_RPYTHON_INSTANCE: u64 = 0x100000;
-    /// `T_HAS_CUSTOM_TRACE` (gctypelayout.py:197).
+    /// `T_HAS_CUSTOM_TRACE` (gctypelayout.py).
     pub const T_HAS_CUSTOM_TRACE: u64 = 0x200000;
-    /// `T_HAS_OLDSTYLE_FINALIZER` (gctypelayout.py:198).
+    /// `T_HAS_OLDSTYLE_FINALIZER` (gctypelayout.py).
     pub const T_HAS_OLDSTYLE_FINALIZER: u64 = 0x400000;
     /// Lightweight-destructor marker (bit 23, the otherwise-unused slot
     /// between `T_HAS_OLDSTYLE_FINALIZER` and `T_HAS_GCPTR`). RPython
@@ -100,16 +100,16 @@ impl TypeInfoLayout {
     /// `TypeInfo.destructor` half with its own bit so the materialized
     /// table reflects which types carry a destructor.
     pub const T_HAS_DESTRUCTOR: u64 = 0x800000;
-    /// `T_HAS_GCPTR` (gctypelayout.py:199).
+    /// `T_HAS_GCPTR` (gctypelayout.py).
     pub const T_HAS_GCPTR: u64 = 0x1000000;
-    /// `T_HAS_MEMORY_PRESSURE` (gctypelayout.py:200) — first field is
+    /// `T_HAS_MEMORY_PRESSURE` (gctypelayout.py) — first field is
     /// memory pressure field.
     pub const T_HAS_MEMORY_PRESSURE: u64 = 0x2000000;
-    /// `T_KEY_MASK` (gctypelayout.py:201) — bug detection mask.
+    /// `T_KEY_MASK` (gctypelayout.py) — bug detection mask.
     /// `_check_valid_type_info` asserts `infobits & T_KEY_MASK ==
     /// T_KEY_VALUE`.
     pub const T_KEY_MASK: u64 = 0xFC000000;
-    /// `T_KEY_VALUE` (gctypelayout.py:202) — bug detection sentinel
+    /// `T_KEY_VALUE` (gctypelayout.py) — bug detection sentinel
     /// stored in every valid `TYPE_INFO.infobits`.
     pub const T_KEY_VALUE: u64 = 0x58000000;
 
@@ -163,7 +163,7 @@ impl TypeEntry {
     }
 }
 
-/// `gctypelayout.encode_type_shape` parity (gctypelayout.py:237-296).
+/// `gctypelayout.encode_type_shape` parity (gctypelayout.py).
 ///
 /// Builds the `infobits` word from the type's structural flags. The
 /// resulting bit layout is:
@@ -199,9 +199,9 @@ impl TypeEntry {
 ///   info.infobits = infobits | T_KEY_VALUE
 /// ```
 pub fn encode_type_shape(info: &TypeInfo, index: u32) -> u64 {
-    // gctypelayout.py:240 `infobits = index` — typeid in low 16 bits.
+    // gctypelayout.py `infobits = index` — typeid in low 16 bits.
     let mut infobits: u64 = (index as u64) & TypeInfoLayout::T_MEMBER_INDEX;
-    // gctypelayout.py:242-243: T_HAS_GCPTR if there are GC pointer
+    // gctypelayout.py: T_HAS_GCPTR if there are GC pointer
     // fields in the fixed part.
     if !info.gc_ptr_offsets.is_empty() {
         infobits |= TypeInfoLayout::T_HAS_GCPTR;
@@ -232,12 +232,12 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> u64 {
             }
         }
     }
-    // gctypelayout.py:292-293 `if builder.is_weakref_type(TYPE):
+    // gctypelayout.py `if builder.is_weakref_type(TYPE):
     // infobits |= T_IS_WEAKREF`.
     if info.is_weakref {
         infobits |= TypeInfoLayout::T_IS_WEAKREF;
     }
-    // gctypelayout.py:294-295 `is_subclass_of_object`.
+    // gctypelayout.py `is_subclass_of_object`.
     if info.is_object {
         infobits |= TypeInfoLayout::T_IS_RPYTHON_INSTANCE;
     }
@@ -251,7 +251,7 @@ pub fn encode_type_shape(info: &TypeInfo, index: u32) -> u64 {
     if info.memory_pressure_offset.is_some() {
         infobits |= TypeInfoLayout::T_HAS_MEMORY_PRESSURE;
     }
-    // gctypelayout.py:296 — T_KEY_VALUE sanity tag.
+    // gctypelayout.py — T_KEY_VALUE sanity tag.
     infobits | TypeInfoLayout::T_KEY_VALUE
 }
 
@@ -301,7 +301,7 @@ pub struct TypeRegistry {
     /// frontend calls `freeze_types`; after that, `register_type`
     /// panics. Mirrors how RPython's translator stops accepting new
     /// types at the end of `make_type_info_group` /
-    /// `encode_type_shapes_now` (gctypelayout.py:393-398).
+    /// `encode_type_shapes_now` (gctypelayout.py).
     can_add_new_types: bool,
 }
 
@@ -369,8 +369,8 @@ pub struct TypeInfo {
     /// `rclass.OBJECT` layout — the first word of the payload is the
     /// `typeptr` (ob_type) and `cls_of_box(gcref)` is valid. False for
     /// raw GC structs / arrays whose first word is not a class pointer.
-    /// Consumed by `check_is_object(gcref)` (llmodel.py:541-546) and by
-    /// `genop_guard_guard_is_object` (x86/assembler.py:1924-1943) which
+    /// Consumed by `check_is_object(gcref)` (llmodel.py) and by
+    /// `genop_guard_guard_is_object` (x86/assembler.py) which
     /// reads it through the materialized `TYPE_INFO` table's `infobits`
     /// byte (gc.py:631-642).
     pub is_object: bool,
@@ -393,13 +393,13 @@ pub struct TypeInfo {
     /// chain feeds into `freeze_types`, which sorts the types
     /// lexicographically by reversed-MRO and assigns
     /// `subclassrange_{min,max}` from the resulting peer order
-    /// (TotalOrderSymbolic, normalizecalls.py:302-354).
+    /// (TotalOrderSymbolic, normalizecalls.py).
     pub parent: Option<u32>,
     /// `rclass.CLASSTYPE.subclassrange_min` for this type's class —
     /// i.e. the lowest preorder index of the class subtree rooted at
     /// this type. Populated by `freeze_types`. Used by
-    /// `genop_guard_guard_subclass` (x86/assembler.py:1971-1978) and
-    /// `execute_guard_subclass` (llgraph/runner.py:1271-1281).
+    /// `genop_guard_guard_subclass` (x86/assembler.py) and
+    /// `execute_guard_subclass` (llgraph/runner.py).
     /// Encoded into the materialized `TYPE_INFO` table at
     /// `subclassrange_min_offset`.
     pub subclassrange_min: i64,
@@ -408,9 +408,9 @@ pub struct TypeInfo {
     /// `freeze_types`.
     pub subclassrange_max: i64,
     /// `gctypelayout.is_weakref_type(TYPE)` parity
-    /// (gctypelayout.py:390-391): set to `true` for the WEAKREF
-    /// GcStruct itself (gctypelayout.py:587). `encode_type_shape`
-    /// emits the `T_IS_WEAKREF` infobits bit (gctypelayout.py:292-293)
+    /// (gctypelayout.py): set to `true` for the WEAKREF
+    /// GcStruct itself (gctypelayout.py). `encode_type_shape`
+    /// emits the `T_IS_WEAKREF` infobits bit (gctypelayout.py)
     /// so the collector's minor / major cycles can locate weakref
     /// objects when scanning the type-info group.
     pub is_weakref: bool,
@@ -514,7 +514,7 @@ impl TypeInfo {
     }
 
     /// `gctypelayout.is_weakref_type(WEAKREF)` parity — TypeInfo for
-    /// the singleton WEAKREF GcStruct itself (gctypelayout.py:587-589).
+    /// the singleton WEAKREF GcStruct itself (gctypelayout.py).
     /// The struct payload is one `weakptr: GcRef` slot; the collector
     /// invalidates it during minor / major cycles instead of tracing
     /// it as a strong reference, so `gc_ptr_offsets` stays empty.
@@ -637,7 +637,7 @@ impl TypeInfo {
     ///
     /// Use this when an `rclass.OBJECT`-shaped class has fields whose
     /// rtyped form is `Ptr(rclass.OBJECT)` — for example
-    /// `pypy/interpreter/function.py:47-86 Function`'s `closure`,
+    /// `pypy/interpreter/function.py Function`'s `closure`,
     /// `defs_w`, `w_kw_defs`, `w_module`.
     pub fn object_subclass_with_gc_ptrs(
         size: usize,
@@ -809,7 +809,7 @@ impl TypeInfo {
     }
 
     /// Compute the total size of an instance (excluding GC header).
-    /// RPython lltypelayout.py:93-100 sizeof(TYPE, i):
+    /// RPython lltypelayout.py sizeof(TYPE, i):
     ///   fixedsize = get_fixed_size(TYPE)
     ///   varsize = get_variable_size(TYPE)
     ///   return fixedsize + i * varsize
@@ -935,7 +935,7 @@ impl TypeRegistry {
     /// just past the class's last descendant. The resulting
     /// `subclassrange_{min,max}` satisfy
     /// `int_between(cls.min, subcls.min, cls.max)` from
-    /// `rclass.py:1133-1137 ll_issubclass`.
+    /// `rclass.py ll_issubclass`.
     pub fn freeze_types(&mut self) {
         if !self.can_add_new_types {
             return;
@@ -949,8 +949,8 @@ impl TypeRegistry {
         }
     }
 
-    /// `rtyper/normalizecalls.py:373-389 assign_inheritance_ids` /
-    /// `TotalOrderSymbolic` parity (normalizecalls.py:302-354).
+    /// `rtyper/normalizecalls.py assign_inheritance_ids` /
+    /// `TotalOrderSymbolic` parity (normalizecalls.py).
     ///
     /// For each type representing a registered classdef, builds
     /// `witness = reversed(MRO of cdef ids)` and pairs it with a
@@ -964,9 +964,9 @@ impl TypeRegistry {
     ///
     /// All peers are then sorted lexicographically; the position of
     /// each peer in the sorted list becomes its preorder value
-    /// (`compute_fn` in normalizecalls.py:342-354). The result
+    /// (`compute_fn` in normalizecalls.py). The result
     /// satisfies `int_between(cls.min, subcls.min, cls.max)` from
-    /// `rclass.py:1133-1137 ll_issubclass`.
+    /// `rclass.py ll_issubclass`.
     ///
     /// RPython encodes the sentinel as the float `1E100` so that any
     /// real cdef-id (a Python int) sorts before it under tuple
@@ -998,7 +998,7 @@ impl TypeRegistry {
         // `(witness, owner)` Min peer and a `(witness + [Max], owner)`
         // Max peer. Sort lexicographically by witness; the peer's
         // position becomes its preorder value (TotalOrderSymbolic
-        // .compute_fn, normalizecalls.py:342-354).
+        // .compute_fn, normalizecalls.py).
         #[derive(Clone)]
         struct Peer {
             witness: Vec<WitnessElement>,
@@ -1065,7 +1065,7 @@ impl TypeRegistry {
     /// Mirrors `llop.gc_get_type_info_group` (gc.py:585): RPython's
     /// translator emits a contiguous group at translation time whose
     /// members alternate between `TYPE_INFO` and `CLASSTYPE`
-    /// (gctypelayout.py:359-374 `add_vtable_after_typeinfo`). majit's
+    /// (gctypelayout.py `add_vtable_after_typeinfo`). majit's
     /// equivalent is the pre-allocated `layout_table` `Vec<TypeEntry>`
     /// maintained eagerly by `register_type` / `freeze_types`. Its
     /// `as_ptr()` is stable as long as `MAX_TYPES` is not exceeded,
@@ -1076,7 +1076,7 @@ impl TypeRegistry {
         &self.layout_table
     }
 
-    /// Translation-time `framework.py:735-761 write_typeid_list` metadata.
+    /// Translation-time `framework.py write_typeid_list` metadata.
     /// Pyre's type-info group contains one row per registered type after the
     /// dummy member, so line `type_id + 1` is the index written to heap dumps.
     pub fn typeids_text(&self) -> Vec<u8> {
@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn test_encode_type_shape_object_flag() {
-        // gctypelayout.py:294-295: T_IS_RPYTHON_INSTANCE is set on
+        // gctypelayout.py: T_IS_RPYTHON_INSTANCE is set on
         // is_object types and stored in the byte that
         // _setup_guard_is_object pulls out — byte 2 of a
         // little-endian Signed for T_IS_RPYTHON_INSTANCE = 0x100000.
@@ -1208,7 +1208,7 @@ mod tests {
 
     #[test]
     fn test_encode_type_shape_varsize_with_gcptrs() {
-        // gctypelayout.py:266-291: varsize encoding sets T_IS_VARSIZE
+        // gctypelayout.py: varsize encoding sets T_IS_VARSIZE
         // and, when items carry GcRefs, both T_HAS_GCPTR_IN_VARSIZE
         // and T_HAS_GCPTR. A pure GcArray-of-GcPtr also sets
         // T_IS_GCARRAY_OF_GCPTR.

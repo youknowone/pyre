@@ -2383,8 +2383,8 @@ fn test_guard_gc_type_uses_immediate_typeid() {
 
 /// Build a `GuardGcTypeInfo` matching what `WasmBackend::compile_loop`
 /// derives from a real `GcLLDescr_framework`-equivalent allocator.
-/// Mirrors `gc.py:592 get_translated_info_for_typeinfo` /
-/// `gc.py:619 get_translated_info_for_guard_is_object` /
+/// Mirrors `gc.py get_translated_info_for_typeinfo` /
+/// `gc.py get_translated_info_for_guard_is_object` /
 /// `x86/assembler.py:1951 cpu.subclassrange_min_offset`.
 fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
     // Pretend the TYPE_INFO table sits at a small in-memory address;
@@ -2392,7 +2392,7 @@ fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
     // load addresses, so any value works for codegen testing.
     // majit `TypeEntry` stride = 32 bytes (TypeInfoLayout 16 + ClassTypeLayout 16).
     // shift_by = log2(32) = 5, sizeof_ti = rffi.sizeof(TYPE_INFO) = 16.
-    // gc.py:603-622 _setup_guard_is_object: T_IS_RPYTHON_INSTANCE
+    // gc.py _setup_guard_is_object: T_IS_RPYTHON_INSTANCE
     // = 0x100000 (gctypelayout.py:196), packed little-endian into a
     // Signed word — byte at offset +2 carries the flag, mask = 0x10.
     codegen::GuardGcTypeInfo {
@@ -2407,7 +2407,7 @@ fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
     }
 }
 
-/// x86/assembler.py:1924-1943 `genop_guard_guard_is_object` lowering —
+/// x86/assembler.py `genop_guard_guard_is_object` lowering —
 /// the wasm backend's GUARD_IS_OBJECT arm emits the same MOV+addr_add
 /// +TEST8+branch sequence. With `supports_guard_gc_type` enabled the
 /// `assert` at line 1925 falls through and the rest of the lowering
@@ -2438,7 +2438,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
     assert_eq!(guards.len(), 1);
 }
 
-/// x86/assembler.py:1945-1980 `genop_guard_guard_subclass` lowering —
+/// x86/assembler.py `genop_guard_guard_subclass` lowering —
 /// the wasm backend's GUARD_SUBCLASS arm emits the gcremovetypeptr
 /// branch (cpu.vtable_offset = None) when `vtable_offset` is `None`,
 /// otherwise the vtable-load branch. With `supports_guard_gc_type`
@@ -2448,9 +2448,9 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
 fn test_guard_subclass_lowers_to_subclassrange_check() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
-    // model.py:199-201 `cls_of_box()` returns `ConstInt(ptr2int(typeptr))` —
+    // model.py `cls_of_box()` returns `ConstInt(ptr2int(typeptr))` —
     // the emitted guard-class operand is the vtable address carried as a raw
-    // integer (read with `op.getarg(1).getint()`, rewrite.py:247). Use the
+    // integer (read with `op.getarg(1).getint()`, rewrite.py). Use the
     // inline ConstInt factory so the variant tag matches the backend reader.
     let class_constant = OpRef::const_int(0xCAFE);
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -2622,8 +2622,8 @@ fn test_single_label_peeled_loop_validates() {
 
 /// A `LoadFromGcTable` placed inside the loop body is emitted inside the loop.
 ///
-/// `rewrite.py:1100-1115 remove_constptr` caches one load per gc-table index,
-/// but `rewrite.py:1003-1006 emit_label` clears `gcrefs_recently_loaded` at
+/// `rewrite.py remove_constptr` caches one load per gc-table index,
+/// but `rewrite.py emit_label` clears `gcrefs_recently_loaded` at
 /// every LABEL, so a reference constant used after the LABEL is loaded again on
 /// each iteration. The comment there rejects keeping the value alive across the
 /// label ("don't spill it") as "the wrong level" — the backend emits the op

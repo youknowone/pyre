@@ -14,12 +14,12 @@ pub fn stats_enabled() -> bool {
         .is_ok_and(|v| v == "1")
 }
 
-/// logger.py:271-277 int_could_be_an_address.
+/// logger.py int_could_be_an_address.
 pub fn int_could_be_an_address(x: i64) -> bool {
     !(-32768..=32767).contains(&x)
 }
 
-/// logger.py:134 `class LogOperations(object)`.
+/// logger.py `class LogOperations(object)`.
 ///
 /// PyPy uses this helper to format ResOperation lists for debug output.
 /// Pyre's current logger records structured statistics only; the type

@@ -38,7 +38,7 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
     ("_jit_cannot_raise_", &["cannot_raise"]),
     ("_jit_loop_invariant_", &["loopinvariant"]),
     ("_jit_unroll_safe_", &["unroll_safe"]),
-    // objectmodel.py:267 `not_rpython` sets `_not_rpython_ = True`;
+    // objectmodel.py `not_rpython` sets `_not_rpython_ = True`;
     // flowspace/objspace.py:21 rejects the function before graph building.
     ("_not_rpython_", &["not_rpython"]),
 ];
@@ -93,7 +93,7 @@ pub fn harvest_hints_from_llbcs(llbcs: &[Llbc]) -> HashMap<String, Vec<String>> 
                 continue;
             }
             // `#[oopspec("spec")]` emits `oopspec_<NAME>: &'static str =
-            // "spec"` (majit_macros::oopspec, rlib/jit.py:255 `func.oopspec
+            // "spec"` (majit_macros::oopspec, rlib/jit.py `func.oopspec
             // = spec`).  Unlike the fixed-hint markers, the payload is the
             // const's *value*, so decode the string literal and emit a
             // companion `oopspec:<spec>` hint that `lib.rs` consumes via
@@ -187,7 +187,7 @@ const IMMUTABLE_FIELDS_PREFIX: &str = "_immutable_fields_";
 /// `_immutable_fields_<Struct>` marker consts present in `llbcs`.
 ///
 /// RPython reads `cls._immutable_fields_` off the class object
-/// (`rclass.py:644-678 _parse_field_list`); the marker const is the
+/// (`rclass.py _parse_field_list`); the marker const is the
 /// ullbc-visible carrier for the same declaration, since the
 /// proc-macro attribute is consumed at expansion time and never
 /// reaches Charon's `attr_info`.
@@ -239,7 +239,7 @@ pub fn harvest_immutable_fields_from_llbcs(
 }
 
 /// Split the marker's comma-joined payload into `(field_name, rank)`
-/// pairs — `rclass.py:644-678 _parse_field_list` over the declared
+/// pairs — `rclass.py _parse_field_list` over the declared
 /// `_immutable_fields_` list.  The suffix grammar lives entirely in
 /// [`crate::model::ImmutableRank::parse`].
 fn parse_immutable_entry_list(joined: &str) -> Vec<(String, crate::model::ImmutableRank)> {

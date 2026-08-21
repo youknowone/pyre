@@ -55,7 +55,7 @@ fn set_contextvar_context(args: &[pyre_object::PyObjectRef]) -> crate::PyResult 
     Ok(pyre_object::w_none())
 }
 
-/// `interp_magic.py:161-165 add_memory_pressure`: report a raw allocation to
+/// `interp_magic.py add_memory_pressure`: report a raw allocation to
 /// incminimark so the next major collection is scheduled sooner. The public
 /// builtin has no owner object; translated internal callers use the same GC
 /// surface with an object when their type carries `special_memory_pressure`.
@@ -87,7 +87,7 @@ fn dict_backing_or_type_error(
     )))
 }
 
-/// `interp_dict.py:34 reversed_dict` — `W_DictMultiObject.descr_reversed`
+/// `interp_dict.py reversed_dict` — `W_DictMultiObject.descr_reversed`
 /// (`dictmultiobject.py:207`): a reverse iterator over the dict keys, resolved
 /// through the backing dict so a subclass `__reversed__` is bypassed.
 fn reversed_dict(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
@@ -100,7 +100,7 @@ fn reversed_dict(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     )
 }
 
-/// `interp_dict.py:69 move_to_end` — `W_DictMultiObject.nondescr_move_to_end`
+/// `interp_dict.py move_to_end` — `W_DictMultiObject.nondescr_move_to_end`
 /// (`dictmultiobject.py:221`): move an existing key to the back (`last`, the
 /// default) or front of the insertion order.  `@unwrap_spec(last=bool)`: `last`
 /// may be supplied positionally or by keyword and is coerced by truthiness.
@@ -128,12 +128,12 @@ fn move_to_end(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     }
 }
 
-/// `interp_magic.py:19 objects_in_repr` — `space.get_objects_in_repr()`
+/// `interp_magic.py objects_in_repr` — `space.get_objects_in_repr()`
 /// (`objspace.py:134`): the execution-context-owned identity dict of objects
 /// currently being `repr()`'d, lazily built and cached on the EC.  `identity_dict`
 /// stays an app-level class, so the instance is constructed by calling that type.
 ///
-/// `get_objects_in_repr` builds `W_IdentityDict(self)` directly (`objspace.py:136`),
+/// `get_objects_in_repr` builds `W_IdentityDict(self)` directly (`objspace.py`),
 /// so the recursion guard cannot be swapped through module monkeypatching.  pyre
 /// mirrors that by constructing from the canonical type captured at module init
 /// (`CANONICAL_IDENTITY_DICT_KEY`), not the publicly reassignable
@@ -168,7 +168,7 @@ fn objects_in_repr(_: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// Box-immortal, so the entry roots the type for the lifetime of the process.
 const CANONICAL_IDENTITY_DICT_KEY: &str = "@objects_in_repr_identity_dict";
 
-/// `interp_magic.py:280-290 write_unraisable` — turn the supplied exception
+/// `interp_magic.py write_unraisable` — turn the supplied exception
 /// value back into an OperationError and report it through `sys.unraisablehook`.
 fn write_unraisable(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let where_desc = crate::baseobjspace::text_wtf8_w(args[0])?.to_wtf8_buf();

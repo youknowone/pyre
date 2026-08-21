@@ -1,6 +1,6 @@
 //! `push_roots` / `pop_roots` parity scaffold.
 //!
-//! Mirrors RPython's `framework.py:803-853 gct_fv_gc_malloc`, which
+//! Mirrors RPython's `framework.py gct_fv_gc_malloc`, which
 //! brackets every GC malloc call with `push_roots(hop)` and
 //! `pop_roots(hop, livevars)`:
 //!
@@ -54,7 +54,7 @@ use std::marker::PhantomData;
 
 use crate::pyobject::PyObjectRef;
 
-/// `shadowstack.py:281 root_stack_depth` — the slot count `ShadowStackPool`
+/// `shadowstack.py root_stack_depth` — the slot count `ShadowStackPool`
 /// raw-mallocs for a thread's root stack before any growth.  `majit-gc`'s
 /// jitframe root stack starts from the same constant.
 const DEFAULT_ROOT_STACK_DEPTH: usize = 163840;
@@ -113,7 +113,7 @@ impl RootStack {
         Layout::array::<PyObjectRef>(depth).expect("root stack layout")
     }
 
-    /// `ShadowStackPool.increase_root_stack_depth` (`shadowstack.py:351-364`):
+    /// `ShadowStackPool.increase_root_stack_depth` (`shadowstack.py`):
     /// allocate a larger buffer, copy the used portion over, and re-derive
     /// base/top; the depth can never shrink.  Unlike upstream this also serves
     /// as the initial `_prepare_unused_stack`, so a null base is the
@@ -152,7 +152,7 @@ impl RootStack {
         }
     }
 
-    /// `incr_stack(1)` (`shadowstack.py:80-84`) — return the slot that was the
+    /// `incr_stack(1)` (`shadowstack.py`) — return the slot that was the
     /// top and advance past it.  Upstream's bump is unchecked because the
     /// native stack check fires first, with `root_stack_depth` scaled to the
     /// recursion limit.  pyre pins one slot per argument as well as per live
@@ -277,7 +277,7 @@ fn with_shadow_stack<R>(f: impl FnOnce(&RootStack) -> R) -> R {
     ROOT_STACK.with(f)
 }
 
-/// `increase_root_stack_depth(new_depth)` (`rlib/rgc.py:775-779` →
+/// `increase_root_stack_depth(new_depth)` (`rlib/rgc.py` →
 /// `shadowstack.py:351-364`).  `sys.setrecursionlimit` scales the root stack
 /// with the limit at `pypy/module/sys/vm.py:97`; the depth can only grow.
 #[majit_macros::dont_look_inside]
@@ -470,7 +470,7 @@ pub fn push_roots() -> RootScope {
 ///
 /// Pushes onto the thread-local `ROOT_STACK`, a runtime-mutable root the
 /// tracer cannot type; the JIT residualises the call instead of tracing into
-/// it (`@dont_look_inside`, `rlib/jit.py:139`), the `shadow_stack_len` twin.
+/// it (`@dont_look_inside`, `rlib/jit.py`), the `shadow_stack_len` twin.
 #[majit_macros::dont_look_inside]
 pub fn pin_root(root: PyObjectRef) {
     #[cfg(debug_assertions)]
@@ -584,7 +584,7 @@ pub fn normalize_roots(base: usize, len: usize) {
 ///
 /// Reads the thread-local `ROOT_STACK`, a runtime-mutable root the
 /// tracer cannot type; the JIT residualises the read instead of tracing
-/// into it (`@dont_look_inside`, `rlib/jit.py:139`). The attribute is a
+/// into it (`@dont_look_inside`, `rlib/jit.py`). The attribute is a
 /// tracing-policy marker only — it leaves the host backend free to inline
 /// this body, exactly as the RPython decorator leaves the C backend free.
 #[majit_macros::dont_look_inside]
@@ -593,7 +593,7 @@ pub fn shadow_stack_len() -> usize {
 }
 
 /// The thread's root-stack cell.  The JIT residualises the resolution instead
-/// of tracing into it (`@dont_look_inside`, `rlib/jit.py:139`), the
+/// of tracing into it (`@dont_look_inside`, `rlib/jit.py`), the
 /// `shadow_stack_len` twin.
 #[majit_macros::dont_look_inside]
 pub fn shadow_stack_cell() -> *const RootStack {
@@ -783,7 +783,7 @@ unsafe fn walk_shadow_stack_cell(
     cell: *const RootStack,
     visitor: &mut impl FnMut(&mut PyObjectRef),
 ) {
-    // The interval is fixed at entry: `walk_stack_root` (`shadowstack.py:43-46`)
+    // The interval is fixed at entry: `walk_stack_root` (`shadowstack.py`)
     // receives `start` and `addr` as arguments and runs `while addr != start`,
     // so a root pushed mid-walk is not part of that walk. Re-reading the length
     // each iteration instead would extend the walk over roots pinned by the
@@ -814,7 +814,7 @@ unsafe fn walk_shadow_stack_cell(
 
 // ── Prebuilt-root write tracking ────────────────────────────────────
 //
-// incminimark.py:106-114 `GCFLAG_TRACK_YOUNG_PTRS` / 339-344
+// incminimark.py `GCFLAG_TRACK_YOUNG_PTRS` / 339-344
 // `old_objects_pointing_to_young` / 355 `prebuilt_root_objects`: an old or
 // prebuilt object is NOT scanned during a minor collection unless the write
 // barrier recorded a store into it since the previous minor collection; a
@@ -1053,7 +1053,7 @@ mod tests {
         // grow, so getting it right means the walk followed the buffer
         // to its new address instead of reading the freed one. The walk stops
         // at the two roots that were live at entry — the interval is fixed
-        // there, as in `walk_stack_root` (`shadowstack.py:43-46`), so the
+        // there, as in `walk_stack_root` (`shadowstack.py`), so the
         // roots the visitor pinned are not part of this walk.
         assert_eq!(seen, vec![0x11, 0x22]);
         assert_eq!(shadow_stack_get(0) as usize, 0x11);

@@ -5,7 +5,7 @@
 //!
 //! Per parity rule #1 (`CLAUDE.md` majit ↔ RPython Parity Rules): this
 //! module has **no RPython counterpart**. Upstream's
-//! `rpython/jit/codewriter/codewriter.py:74 make_jitcodes` is handed
+//! `rpython/jit/codewriter/codewriter.py make_jitcodes` is handed
 //! `translator.graphs` — the rtyper has already materialised every graph
 //! in process memory by the time codewriter runs. pyre cannot inherit
 //! that assumption: Rust interpreter sources are on disk in a sibling crate
@@ -90,7 +90,7 @@
 //! ## What this module does NOT introduce
 //!
 //! - NOT a new key schema. The canonical key is `CallPath` (matching
-//!   `CallControl.jitcodes`, which is `rpython/jit/codewriter/call.py:87
+//!   `CallControl.jitcodes`, which is `rpython/jit/codewriter/call.py
 //!   self.jitcodes` keyed by graph identity).
 //! - NOT a variant-keyed map. JitCode maps are keyed by `CallPath`, never by
 //!   an opcode variant. The scope is every crate under `majit/*/src`, not
@@ -107,7 +107,7 @@ use std::cell::OnceCell;
 pub use crate::codewriter::AllJitCodes;
 
 /// This is the pyre-side equivalent of upstream's "reachable graph set"
-/// consumed by `rpython/jit/codewriter/codewriter.py:74 make_jitcodes`.
+/// consumed by `rpython/jit/codewriter/codewriter.py make_jitcodes`.
 /// The manifest must cover every source module that defines a
 /// function reachable by `direct_call` from a handler graph. pyre's
 /// `analyze_multiple_pipeline_with_modules` resolves cross-file `direct_call`s

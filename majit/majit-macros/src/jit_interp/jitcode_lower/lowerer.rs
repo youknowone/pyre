@@ -351,7 +351,7 @@ impl<'c> Lowerer<'c> {
     /// Resolve the cond_call / record_known_result helper policy for
     /// `func`, falling back to `inferred_default` when the helper has a
     /// `helper_policy_path` but no explicit `calls={{ helper => ... }}`
-    /// entry — RPython's `getcalldescr` (`call.py:282-303`) derives
+    /// entry — RPython's `getcalldescr` (`call.py`) derives
     /// `extraeffect` from the call graph regardless of any user
     /// annotation, so a missing explicit policy must not crash.
     ///
@@ -413,7 +413,7 @@ impl<'c> Lowerer<'c> {
         // For `Infer` mode, the helper's `_jit_helper_policy` byte is
         // the macro-time stand-in for RPython's `_canraise` /
         // `_elidable_function_` / `_jit_loop_invariant_` analyzers
-        // (`call.py:282-303 getcalldescr`).  Map it to the matching
+        // (`call.py getcalldescr`).  Map it to the matching
         // `EffectInfoSlot` at runtime so an auto-discovered
         // `#[elidable_cannot_raise]` helper used without an explicit
         // `calls = { ... }` entry still registers an
@@ -444,7 +444,7 @@ impl<'c> Lowerer<'c> {
                     #VOID_DONT_LOOK_INSIDE | #INT_DONT_LOOK_INSIDE | #REF_DONT_LOOK_INSIDE => {
                         majit_metainterp::EffectInfoSlot::CanRaise
                     }
-                    // `call.py:303 getcalldescr` non-elidable EF_CANNOT_RAISE
+                    // `call.py getcalldescr` non-elidable EF_CANNOT_RAISE
                     // (`#[dont_look_inside_cannot_raise]` opt-in for void/int/ref).
                     #VOID_DONT_LOOK_INSIDE_CANNOT_RAISE | #INT_DONT_LOOK_INSIDE_CANNOT_RAISE
                     | #REF_DONT_LOOK_INSIDE_CANNOT_RAISE => {

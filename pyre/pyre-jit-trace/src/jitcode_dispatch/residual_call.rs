@@ -72,7 +72,7 @@ thread_local! {
     /// upstream decides on: the licence to place a resume pc behind an executed
     /// residual is the codewriter-time `EF_ELIDABLE_CANNOT_RAISE` registration
     /// (`jtransform.py:620-630`), and upstream's only op counters are
-    /// profiling-only and gate nothing (`jitprof.py:43-44`, `count_ops` is
+    /// profiling-only and gate nothing (`jitprof.py`, `count_ops` is
     /// `pass`).
     ///
     /// Reset at walk start.  Residuals are the only executor that can put
@@ -740,7 +740,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
     // Seed every REMAINING color the walk has a concrete value for, not just the
     // ones live at `resume_pc`.
     //
-    // `_copy_data_from_miframe` (blackhole.py:1711-1730) copies
+    // `_copy_data_from_miframe` (blackhole.py) copies
     // `range(num_regs_i/r/f())` — the WHOLE bank, filtering only on "the MIFrame
     // has a box here", never on liveness.  Seeding a liveness-selected subset is
     // the deviation, and it is unsound the moment the drive leaves the straight
@@ -836,10 +836,10 @@ pub(super) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
 ///
 /// `startpoints` (`jitcode.py:40`) is the assembler's own record of where
 /// instructions begin, and the authority the blackhole already uses for this
-/// question — `blackhole.py:88 dispatch_loop` asserts its position against it,
+/// question — `blackhole.py dispatch_loop` asserts its position against it,
 /// and `find_catch_before_resume_live` scans it for op boundaries. Assembled
 /// jitcodes always populate it; a hand-built one leaves it `None`
-/// (`jitcode.py:24 setup(..., startpoints=None)`), so fall back to walking the
+/// (`jitcode.py setup(..., startpoints=None)`), so fall back to walking the
 /// fallthrough layout. `decoded_ops` starts at 0 and stops at the first byte it
 /// cannot decode, so a pc it never yields is either inside an instruction or
 /// past a decode failure — neither is a coordinate the blackhole may dispatch
@@ -866,7 +866,7 @@ fn instruction_starts_at(jitcode: &majit_metainterp::jitcode::JitCode, pc: usize
 /// all three complete MIFrame banks; do the same for this abort instead of
 /// relying on the narrower resume-liveness cache.
 ///
-/// `_copy_data_from_miframe` (`blackhole.py:1713-1730`) guards every bank entry
+/// `_copy_data_from_miframe` (`blackhole.py`) guards every bank entry
 /// with `if box is not None` and has no failing path — but there, a `None`
 /// register is a **dead** one the jitcode's liveness already cleared, and every
 /// register that survives holds a box with a value.  "Live, but the walk knows
@@ -1429,7 +1429,7 @@ pub fn attribute_last_escape_force() {
 }
 
 pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::PyFrame) -> bool {
-    // `executioncontext.py:104-106 leave` — a frame handed to application code
+    // `executioncontext.py leave` — a frame handed to application code
     // keeps a reference to its caller, so escaping the concrete frame an inline
     // sub-walk published escapes the traced virtualizable it runs under.  The
     // flush stays keyed on that virtualizable, whose resume pc this residual
@@ -1474,7 +1474,7 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
             // mutated it since (an `f_locals` write-through) — re-flushing
             // would overwrite that mutation with the same walk-end values.
             // The token force is a no-op then too (`force_now` on
-            // TOKEN_NONE, virtualizable.py:248-260).
+            // TOKEN_NONE, virtualizable.py).
             if COMMITTED_FRAME_ESCAPE_PC
                 .with(|committed| committed.get())
                 .is_some()
@@ -1532,8 +1532,8 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
             //
             // Upstream reports the escape from the vable token state alone,
             // independent of any resume-image write.  See
-            // `virtualizable.py:231-255` (`tracing_after_residual_call` /
-            // `force_now`), `virtualizable.py:311-330` (token states),
+            // `virtualizable.py` (`tracing_after_residual_call` /
+            // `force_now`), `virtualizable.py` (token states),
             // `virtualref.py:157-167` (vref'd inlined callee), and
             // `pyjitpl.py:3373-3390` (unconditional ABORT_ESCAPE).  Runtime
             // forcing also resets the token before writing fields
@@ -1614,7 +1614,7 @@ pub(crate) fn discard_escape_flush_undo() {
 /// frame has to come back IF the walk ends up on the legacy replay.  The
 /// restore itself waits for [`take_escape_flush_undo_pending`] at walk end:
 /// the resume-PAST continuation keeps the flushed frame (upstream's
-/// `virtualizable.py:101-138 write_boxes` has no undo once the vable is
+/// `virtualizable.py write_boxes` has no undo once the vable is
 /// forced), and only the replay-from-entry leg needs the pre-walk state back.
 fn mark_escape_flush_undo_pending() {
     ESCAPE_FLUSH_UNDO_PENDING.with(|slot| slot.set(true));
@@ -1763,7 +1763,7 @@ fn flush_with_latched_stack_inner(
         // pyre/bench/synth, the only slot that ever disagrees with the vable
         // shadow is the in-progress opcode's TOS, and it holds a compile-time
         // NULL *constant* rather than a stale or absent value: exactly what
-        // `popvalue_maybe_none` writes (`pyframe.py:411-417` →
+        // `popvalue_maybe_none` writes (`pyframe.py` →
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
         // via `jtransform.py:1898`).  The opcode had already popped the slot
         // before its residual forced.
@@ -2145,7 +2145,7 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     }
     // Refuse to invoke the helper when any Ref argument is NULL.
     //
-    // `pyjitpl.py:3586-3603 record_result_of_call_pure` folds on the weaker
+    // `pyjitpl.py record_result_of_call_pure` folds on the weaker
     // test "every argbox is a Const", which admits `ConstPtr(NULL)`.  It can
     // afford to: upstream reaches that line only *after* the call has already
     // been executed for real, and its Const arguments come from boxes the
@@ -2159,7 +2159,7 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
     // (`set_opref_concrete`), which `box_value` then hands straight to this
     // fold.  Upstream never derives that NULL in the first place: a pointer
     // becomes nonnull-known there only from the traced program's own null test
-    // (`pyjitpl.py:558-575 _establish_nullity`), so the box stays symbolic and
+    // (`pyjitpl.py _establish_nullity`), so the box stays symbolic and
     // the call is never folded on a NULL it invented.  Executing
     // `helper(NULL)` here would dereference NULL and SEGV.
     //
@@ -2679,7 +2679,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `COND_CALL_GC_WB` is never executed by pyjitpl
     // (`rpython/jit/metainterp/executor.py:446`), is neither can-raise nor a
     // call (`resoperation.py:1124-1125`), and is inserted only by the backend
-    // GC rewrite pass after optimization (`backend/llsupport/rewrite.py:948`),
+    // GC rewrite pass after optimization (`backend/llsupport/rewrite.py`),
     // so it never participates in the metainterp's side-effect analysis.
     let is_idempotent_gc_barrier = pyre_interpreter::is_list_write_barrier(func_ptr as usize);
     // The void bookkeeping residuals a descent into a translated body meets
@@ -3155,8 +3155,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // `BUILD_TUPLE` / `BUILD_LIST` create a fresh container from their fresh
     // backing array (`pyopcode.py:1012-1020`).  Re-executing either allocation
     // cannot mutate an object visible before the call.  Upstream records list
-    // construction directly as `opimpl_newlist` (`pyjitpl.py:779-789`) and
-    // allows residual calls at every `MIFrame` depth (`pyjitpl.py:1995-2080`);
+    // construction directly as `opimpl_newlist` (`pyjitpl.py`) and
+    // allows residual calls at every `MIFrame` depth (`pyjitpl.py`);
     // it has no nested-callee abort for these allocation helpers.  Keep this
     // executor predicate aligned with `fbw_callee_body_replay_safety`, which
     // already admits both helpers as replay-safe reads/fresh allocations.
@@ -3447,7 +3447,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // An empty declared write set is unavailable too: every residual that
         // reaches this gate carries `EF_RANDOM_EFFECTS`, whose write-descr sets
         // are `None` — top, not bottom — by upstream's own assertion
-        // (effectinfo.py:149-155).  So no `EffectInfo` predicate can license
+        // (effectinfo.py).  So no `EffectInfo` predicate can license
         // this rewind, and the licence has to come from the shape gates above.
         // Measured over `pyre/bench/synth` (312 files, 115 forces): the only
         // shape that commits an `EscapeResumeKind::Exact` is a `LoadAttr`/`Ref`
@@ -3473,7 +3473,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             })
             .map(|_| ctx.vstack_boxes.clone());
         let _frame_escape = ActiveFrameEscapeGuard::enter(escape_frame, escape_py_pc, escape_stack);
-        // `executioncontext.py:85 enter` for the inlined callee this residual
+        // `executioncontext.py enter` for the inlined callee this residual
         // runs inside of.
         // RPython's residual executes against `metainterp.framestack[-1]`:
         // the concrete frame belongs to the live MIFrame, not to the portal
@@ -3562,7 +3562,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         // authoritative and its escape walk reloads the shadow; restoring a
         // pre-force value would violate `_opimpl_setfield_vable`'s equality
         // (`pyjitpl.py:1188-1199`) checked by
-        // `check_synchronized_virtualizable` (`pyjitpl.py:3463-3468`).
+        // `check_synchronized_virtualizable` (`pyjitpl.py`).
         if !forced && let Some((prev_op, prev_val)) = saved_last_instr_shadow.take() {
             crate::trace_opcode::mirror_vable_static_to_boxes(
                 ctx.trace_ctx,
@@ -4764,8 +4764,8 @@ pub(crate) fn residual_call_is_proven_truth(
     };
     numeric_ref_regs[arg_reg as usize] || bool_ref_regs[arg_reg as usize]
 }
-/// `pyjitpl.py:1094-1118 opimpl_jit_force_quasi_immutable` for the module
-/// namespace's `version?` (`celldict.py:34 _immutable_fields_ = ["version?"]`),
+/// `pyjitpl.py opimpl_jit_force_quasi_immutable` for the module
+/// namespace's `version?` (`celldict.py _immutable_fields_ = ["version?"]`),
 /// asked ahead of an opaque STORE_NAME / STORE_GLOBAL / DELETE_NAME /
 /// DELETE_GLOBAL residual.
 ///
@@ -4789,7 +4789,7 @@ pub(crate) fn residual_call_is_proven_truth(
 /// `is_installed()` is `mutatebox.nonnull()`; the bump predicate is
 /// [`pyre_object::celldict::store_would_bump_version`], the side-effect-free
 /// twin of `write_cell`, because only the write that replaces the stored
-/// pointer reaches `mutated()` (`celldict.py:80-90`) — an in-place cell write
+/// pointer reaches `mutated()` (`celldict.py`) — an in-place cell write
 /// leaves `version` alone and a hot module-scope loop must keep its trace.
 ///
 /// Deliberately NO `GUARD_ISNULL` arm on the not-installed path. Upstream's
@@ -4844,7 +4844,7 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     }
     // A plain `W_DictObject` for globals (`exec(src, {})`,
     // `FunctionType(code, {})`) has no `version?` field at all, so
-    // `hook_setfield` (rclass.py:714-718) emits no `jit_force_quasi_immutable`
+    // `hook_setfield` (rclass.py) emits no `jit_force_quasi_immutable`
     // for its write and there is nothing to abandon the trace for.
     let strategy =
         unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(w_globals) };
@@ -4877,7 +4877,7 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
             )
         }
     } else {
-        // `celldict.py:106-126 delitem` reaches `mutated()` only after a
+        // `celldict.py delitem` reaches `mutated()` only after a
         // successful removal — `delitem_str` returns early on a missing key.
         slot.is_some()
     };
@@ -4926,7 +4926,7 @@ fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
 /// Tracer-side pyjitpl.py:1105-1120
 /// `opimpl_jit_force_quasi_immutable` for mapdict writes hidden in residuals.
 /// The target predicate is side-effect-free; record comes before the installed
-/// test because pyjitpl.py:1074-1085 `opimpl_record_quasiimmut_field` creates
+/// test because pyjitpl.py `opimpl_record_quasiimmut_field` creates
 /// the hidden instance when it is null. Recording also preserves
 /// `AbstractAttribute.write`'s `if not attr.ever_mutated` read
 /// (mapdict.py:72).
@@ -5494,7 +5494,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // pyjitpl.py:1094-1118 `opimpl_jit_force_quasi_immutable`, asked at the
+    // pyjitpl.py `opimpl_jit_force_quasi_immutable`, asked at the
     // residual boundary because pyre's namespace write lives inside one.
     //
     // Ordered AFTER the cell fold above (a successful in-place fold IS the
@@ -5921,7 +5921,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
     // frame: model `fast2locals`' fastlocals reads as `getarrayitem_vable_r`
     // plus a non-forcing dict-build chain — the shape the meta-tracer produces
-    // upstream, where `pyframe.py:539 fast2locals` is `@jit.unroll_safe` and
+    // upstream, where `pyframe.py fast2locals` is `@jit.unroll_safe` and
     // therefore looked into.  This arm runs BEFORE
     // `try_execute_residual_call_via_executor` arms the vable token protocol,
     // which is the point: the opaque residual is what turns the locals-read
@@ -6196,7 +6196,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
         }
 
-        // pyjitpl.py:2669-2682 `execute_and_record_varargs`; may-force
+        // pyjitpl.py `execute_and_record_varargs`; may-force
         // calls use `history.record_nospec` and therefore count nothing.
         if matches!(
             call_opcode,
@@ -6462,7 +6462,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         original_call_descr.arg_types(),
     );
 
-    // pyjitpl.py:1094-1118 `opimpl_jit_force_quasi_immutable` must run before
+    // pyjitpl.py `opimpl_jit_force_quasi_immutable` must run before
     // any fold or residual applies the opcode. In particular,
     // `try_walker_specialize_store_attr` mutates `?` fields while resolving,
     // so moving this below the STORE_ATTR fold would hide the force. The abort

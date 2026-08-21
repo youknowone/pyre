@@ -21,11 +21,11 @@
 //!    `type(repr)` identity. The [`Repr::repr_class_id`] default
 //!    returns [`ReprClassId::Repr`] (the wildcard base used by
 //!    `pairtype(Repr, X)` / `pairtype(X, Repr)` extension blocks —
-//!    e.g. rnone.py:46,56 or rmodel.py:298); every concrete `Repr`
+//!    e.g. rnone.py:46,56 or rmodel.py); every concrete `Repr`
 //!    overrides to return its specific variant.
 //!
 //! 2. [`ReprClassId::mro`] + [`pair_mro`] — per-class MRO and its
-//!    cross-product, mirroring upstream `pairtype.py:65-73 pairmro`.
+//!    cross-product, mirroring upstream `pairtype.py pairmro`.
 //!    MRO chains for `BoolRepr → IntegerRepr → FloatRepr → Repr` etc.
 //!    match upstream Python class inheritance, so pairtype entries
 //!    resolve through the same walk order.
@@ -64,85 +64,85 @@ pub enum ReprClassId {
     /// Catch-all matching upstream's `class __extend__(pairtype(Repr,
     /// X))` — any unregistered concrete Repr falls back to this tag.
     Repr,
-    /// `rmodel.py:353 VoidRepr`.
+    /// `rmodel.py VoidRepr`.
     VoidRepr,
-    /// `rmodel.py:365 SimplePointerRepr`.
+    /// `rmodel.py SimplePointerRepr`.
     SimplePointerRepr,
-    /// `rnone.py:10 NoneRepr`.
+    /// `rnone.py NoneRepr`.
     NoneRepr,
-    /// `rbool.py:10 BoolRepr(IntegerRepr)` — MRO includes
+    /// `rbool.py BoolRepr(IntegerRepr)` — MRO includes
     /// [`ReprClassId::IntegerRepr`] + [`ReprClassId::FloatRepr`] so
     /// integer / float pairtype entries resolve transitively, matching
     /// upstream's inheritance chain.
     BoolRepr,
-    /// `rint.py:18 IntegerRepr(FloatRepr)` — MRO includes
+    /// `rint.py IntegerRepr(FloatRepr)` — MRO includes
     /// [`ReprClassId::FloatRepr`].
     IntegerRepr,
-    /// `rfloat.py:11 FloatRepr`.
+    /// `rfloat.py FloatRepr`.
     FloatRepr,
-    /// `rfloat.py:150 SingleFloatRepr`.
+    /// `rfloat.py SingleFloatRepr`.
     SingleFloatRepr,
-    /// `rfloat.py:166 LongFloatRepr`.
+    /// `rfloat.py LongFloatRepr`.
     LongFloatRepr,
-    /// `raddress.py:27 AddressRepr`.
+    /// `raddress.py AddressRepr`.
     AddressRepr,
-    /// `raddress.py:65 TypedAddressAccessRepr`.
+    /// `raddress.py TypedAddressAccessRepr`.
     TypedAddressAccessRepr,
-    /// `rptr.py:27 PtrRepr`.
+    /// `rptr.py PtrRepr`.
     PtrRepr,
-    /// `rptr.py:220 InteriorPtrRepr`.
+    /// `rptr.py InteriorPtrRepr`.
     InteriorPtrRepr,
-    /// `rptr.py:195 LLADTMethRepr`.
+    /// `rptr.py LLADTMethRepr`.
     LLADTMethRepr,
-    /// `rpbc.py:315 FunctionRepr`.
+    /// `rpbc.py FunctionRepr`.
     FunctionRepr,
-    /// `rpbc.py:224 FunctionsPBCRepr`.
+    /// `rpbc.py FunctionsPBCRepr`.
     FunctionsPBCRepr,
-    /// `rpbc.py:393 SmallFunctionSetPBCRepr`.
+    /// `rpbc.py SmallFunctionSetPBCRepr`.
     SmallFunctionSetPBCRepr,
-    /// `rbuiltin.py:67 BuiltinFunctionRepr`.
+    /// `rbuiltin.py BuiltinFunctionRepr`.
     BuiltinFunctionRepr,
-    /// `rbuiltin.py:113 BuiltinMethodRepr`.
+    /// `rbuiltin.py BuiltinMethodRepr`.
     BuiltinMethodRepr,
-    /// `rpbc.py:635 SingleFrozenPBCRepr`.
+    /// `rpbc.py SingleFrozenPBCRepr`.
     SingleFrozenPBCRepr,
-    /// `rpbc.py:675 MultipleUnrelatedFrozenPBCRepr`.
+    /// `rpbc.py MultipleUnrelatedFrozenPBCRepr`.
     MultipleUnrelatedFrozenPBCRepr,
-    /// `rpbc.py:728 MultipleFrozenPBCRepr`.
+    /// `rpbc.py MultipleFrozenPBCRepr`.
     MultipleFrozenPBCRepr,
-    /// `rpbc.py:844 MethodOfFrozenPBCRepr`.
+    /// `rpbc.py MethodOfFrozenPBCRepr`.
     MethodOfFrozenPBCRepr,
-    /// `rpbc.py:1126 MethodsPBCRepr`.
+    /// `rpbc.py MethodsPBCRepr`.
     MethodsPBCRepr,
-    /// `controllerentry.py:211 ControlledInstanceRepr`.
+    /// `controllerentry.py ControlledInstanceRepr`.
     ControlledInstanceRepr,
-    /// `rpbc.py:920 ClassesPBCRepr`.
+    /// `rpbc.py ClassesPBCRepr`.
     ClassesPBCRepr,
-    /// `rclass.py:467 InstanceRepr(Repr)`.
+    /// `rclass.py InstanceRepr(Repr)`.
     InstanceRepr,
-    /// `rtuple.py:129 TupleRepr`.
+    /// `rtuple.py TupleRepr`.
     TupleRepr,
-    /// `lltypesystem/rlist.py:173 FixedSizeListRepr(
+    /// `lltypesystem/rlist.py FixedSizeListRepr(
     /// AbstractFixedSizeListRepr, BaseListRepr)` — the non-resized list
     /// whose `LIST` lowers to a bare `Ptr(GcArray(ITEM))`. Slices
     /// (`&[T]`) annotate as a non-resized `SomeList`, so this is the
     /// repr the `len` lowering lands on.
     FixedSizeListRepr,
-    /// `lltypesystem/rlist.py:107 ListRepr(AbstractListRepr,
+    /// `lltypesystem/rlist.py ListRepr(AbstractListRepr,
     /// BaseListRepr)` — the resized list whose `LIST` lowers to a
     /// `Ptr(GcStruct("list", ("length", Signed), ("items",
     /// Ptr(GcArray(ITEM)))))`. Minted when the `listdef` is `resized`
     /// (an `.append()` consumer marks it so).
     ListRepr,
-    /// `rdict.py:35 AbstractDictRepr`.
+    /// `rdict.py AbstractDictRepr`.
     AbstractDictRepr,
-    /// `lltypesystem/rdict.py:42 DictRepr(AbstractDictRepr)`.
+    /// `lltypesystem/rdict.py DictRepr(AbstractDictRepr)`.
     DictRepr,
-    /// `lltypesystem/rordereddict.py:61 OrderedDictRepr(AbstractDictRepr)`.
+    /// `lltypesystem/rordereddict.py OrderedDictRepr(AbstractDictRepr)`.
     OrderedDictRepr,
-    /// `rdict.py:90 AbstractDictIteratorRepr`.
+    /// `rdict.py AbstractDictIteratorRepr`.
     AbstractDictIteratorRepr,
-    /// `lltypesystem/rdict.py:693 DictIteratorRepr(AbstractDictIteratorRepr)`.
+    /// `lltypesystem/rdict.py DictIteratorRepr(AbstractDictIteratorRepr)`.
     DictIteratorRepr,
     /// `rstr.py:483 AbstractCharRepr` (`CharRepr` lltypesystem
     /// realisation, `lowleveltype = Char`).
@@ -156,26 +156,26 @@ pub enum ReprClassId {
     /// `rstr.py:450 AbstractUnicodeRepr` (`lltypesystem.rstr.UnicodeRepr`
     /// realisation, `lowleveltype = Ptr(UNICODE)`).
     UnicodeRepr,
-    /// `rbytearray.py:8 AbstractByteArrayRepr(AbstractStringRepr)`
+    /// `rbytearray.py AbstractByteArrayRepr(AbstractStringRepr)`
     /// (`lltypesystem.rbytearray.ByteArrayRepr`, `lowleveltype =
     /// Ptr(BYTEARRAY)`).
     ByteArrayRepr,
     /// Abstract base shared by `StringRepr` and `UnicodeRepr`.
     AbstractStringRepr,
-    /// `rweakref.py:51 WeakRefRepr(BaseWeakRefRepr)`.
+    /// `rweakref.py WeakRefRepr(BaseWeakRefRepr)`.
     WeakRefRepr,
-    /// `rweakref.py:67 EmulatedWeakRefRepr(BaseWeakRefRepr)`.
+    /// `rweakref.py EmulatedWeakRefRepr(BaseWeakRefRepr)`.
     EmulatedWeakRefRepr,
-    /// `lltypesystem/rgcref.py:8 GCRefRepr`.
+    /// `lltypesystem/rgcref.py GCRefRepr`.
     GCRefRepr,
     /// `rrange.py:43 RangeRepr(AbstractRangeRepr)` — the immutable
     /// `range()`-result list repr (`GcStruct("range", start, stop)`).
     RangeRepr,
-    /// `rlist.py:437 AbstractListIteratorRepr(IteratorRepr)` — the
+    /// `rlist.py AbstractListIteratorRepr(IteratorRepr)` — the
     /// iterator over a list/slice (`GcStruct("listiter", ("list", LIST),
     /// ("index", Signed))`).
     ListIteratorRepr,
-    /// `rrange.py:145 AbstractRangeIteratorRepr(IteratorRepr)` — the
+    /// `rrange.py AbstractRangeIteratorRepr(IteratorRepr)` — the
     /// iterator over a `range()` list (`GcStruct("range", ("next",
     /// Signed), ("stop", Signed))`). Distinct from `RangeRepr`: an
     /// iterator repr is its own iterator, not the container.
@@ -252,7 +252,7 @@ impl ReprClassId {
     }
 }
 
-/// RPython `pairmro(cls1, cls2)` (`pairtype.py:65-73`) — Repr-side wrapper.
+/// RPython `pairmro(cls1, cls2)` (`pairtype.py`) — Repr-side wrapper.
 ///
 /// Defers to [`crate::tool::pairtype::pairmro`], which already ports
 /// upstream's cross-MRO iterator. This wrapper binds it to
@@ -263,7 +263,7 @@ pub fn pair_mro(c1: ReprClassId, c2: ReprClassId) -> Vec<(ReprClassId, ReprClass
     crate::tool::pairtype::pairmro(c1.mro(), c2.mro()).collect()
 }
 
-/// RPython `pair(a, b).convert_from_to(v, llops)` (`pairtype.py:46-49`
+/// RPython `pair(a, b).convert_from_to(v, llops)` (`pairtype.py`
 /// + per-module `class __extend__(pairtype(R_A, R_B))` blocks).
 ///
 /// Returns:
@@ -317,12 +317,12 @@ fn dispatch_convert_from_to(
         (PtrRepr, LLADTMethRepr) | (InteriorPtrRepr, LLADTMethRepr) => {
             same_lowleveltype_convert_from_to(r_from, r_to, v)
         }
-        // rptr.py:338-343 — InteriorPtrRepr -> InteriorPtrRepr is stricter
+        // rptr.py — InteriorPtrRepr -> InteriorPtrRepr is stricter
         // than lowleveltype equality: upstream checks `__dict__` equality.
         (InteriorPtrRepr, InteriorPtrRepr) => {
             same_interior_ptr_dict_convert_from_to(r_from, r_to, v)
         }
-        // rclass.py:1035-1055 — pairtype(InstanceRepr,
+        // rclass.py — pairtype(InstanceRepr,
         // InstanceRepr).convert_from_to: cast_pointer along the
         // subclass/superclass axis when one classdef is a base of the
         // other.
@@ -353,19 +353,19 @@ fn dispatch_convert_from_to(
         (FloatRepr, IntegerRepr) => {
             super::rint::pair_float_integer_convert_from_to(r_from, r_to, v, llops)
         }
-        // rbuiltin.py:144-151 — pairtype(BuiltinMethodRepr,
+        // rbuiltin.py — pairtype(BuiltinMethodRepr,
         // BuiltinMethodRepr).convert_from_to: only converts between
         // same-methodname reprs, delegating the receiver lowering via
         // llops.convertvar(v, r_from.self_repr, r_to.self_repr).
         (BuiltinMethodRepr, BuiltinMethodRepr) => {
             super::rbuiltin::pair_builtin_method_convert_from_to(r_from, r_to, v, llops)
         }
-        // rpbc.py:373-375 — pairtype(FunctionRepr,
+        // rpbc.py — pairtype(FunctionRepr,
         // FunctionRepr).convert_from_to: upstream `return v`. Both
         // ends are Void-typed so the Variable can be passed through
         // unmodified — no need to emit any operation.
         (FunctionRepr, FunctionRepr) => Ok(Some(v.clone())),
-        // rpbc.py:381-383 — pairtype(FunctionsPBCRepr,
+        // rpbc.py — pairtype(FunctionsPBCRepr,
         // FunctionRepr).convert_from_to: upstream
         // `return inputconst(Void, None)`. FunctionRepr is Void-typed,
         // so the conversion collapses to a Void None constant
@@ -374,7 +374,7 @@ fn dispatch_convert_from_to(
             &LowLevelType::Void,
             &ConstValue::None,
         )?))),
-        // rpbc.py:377-379 — pairtype(FunctionRepr,
+        // rpbc.py — pairtype(FunctionRepr,
         // FunctionsPBCRepr).convert_from_to: upstream
         // `return inputconst(r_fpbc2, r_fpbc1.s_pbc.const)`.
         //   FunctionRepr always carries a single-FunctionDesc PBC whose
@@ -384,27 +384,27 @@ fn dispatch_convert_from_to(
         (FunctionRepr, FunctionsPBCRepr) => {
             super::rpbc::pair_function_repr_functions_pbc_convert_from_to(r_from, r_to, v, llops)
         }
-        // rpbc.py:385-390 — pairtype(FunctionsPBCRepr,
+        // rpbc.py — pairtype(FunctionsPBCRepr,
         // FunctionsPBCRepr).convert_from_to: upstream identity if
         // `r_fpbc1.lowleveltype == r_fpbc2.lowleveltype`, else
         // `NotImplemented`. The rtyper distinguishes different spec-func
         // Struct pointer types even within the same Repr subclass.
         (FunctionsPBCRepr, FunctionsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
-        // rpbc.py:1220-1224 — pairtype(MethodsPBCRepr,
+        // rpbc.py — pairtype(MethodsPBCRepr,
         // MethodsPBCRepr).convert_from_to: upstream identity if
         // `r_mpbc1.lowleveltype == r_mpbc2.lowleveltype`, else
         // `NotImplemented`. Two structurally identical method families
         // reach this with the same receiver Ptr lowleveltype (the
         // instance the bound method carries), so the pass-through applies.
         (MethodsPBCRepr, MethodsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
-        // rpbc.py:517-519 — pairtype(SmallFunctionSetPBCRepr,
+        // rpbc.py — pairtype(SmallFunctionSetPBCRepr,
         // FunctionRepr).convert_from_to: `return inputconst(Void, None)`.
         //   FunctionRepr is Void-typed; the Char source variable is
         //   discarded.
         (SmallFunctionSetPBCRepr, FunctionRepr) => Ok(Some(Hlvalue::Constant(
             inputconst_from_lltype(&LowLevelType::Void, &ConstValue::None)?,
         ))),
-        // rpbc.py:521-526 — pairtype(SmallFunctionSetPBCRepr,
+        // rpbc.py — pairtype(SmallFunctionSetPBCRepr,
         // FunctionsPBCRepr).convert_from_to:
         //   `assert v.concretetype is Char;
         //    v_int = llops.genop('cast_char_to_int', [v], resulttype=Signed);
@@ -416,7 +416,7 @@ fn dispatch_convert_from_to(
                 r_from, r_to, v, llops,
             )
         }
-        // rpbc.py:548-551 — pairtype(FunctionRepr,
+        // rpbc.py — pairtype(FunctionRepr,
         // SmallFunctionSetPBCRepr).convert_from_to: pulls the unique
         // FunctionDesc out of `r_ptr.s_pbc.descriptions` and returns
         // `inputconst(Char, r_set.convert_desc(desc))`.
@@ -425,7 +425,7 @@ fn dispatch_convert_from_to(
                 r_from, r_to, v, llops,
             )
         }
-        // rpbc.py:553-556 — pairtype(FunctionsPBCRepr,
+        // rpbc.py — pairtype(FunctionsPBCRepr,
         // SmallFunctionSetPBCRepr).convert_from_to:
         //   `ll_compress = compression_function(r_set);
         //    return llops.gendirectcall(ll_compress, v)`.
@@ -434,7 +434,7 @@ fn dispatch_convert_from_to(
                 r_from, r_to, v, llops,
             )
         }
-        // rpbc.py:597-607 — pairtype(SmallFunctionSetPBCRepr,
+        // rpbc.py — pairtype(SmallFunctionSetPBCRepr,
         // SmallFunctionSetPBCRepr).convert_from_to:
         //   `c_table = conversion_table(r_from, r_to);
         //    if c_table:
@@ -447,7 +447,7 @@ fn dispatch_convert_from_to(
                 r_from, r_to, v, llops,
             )
         }
-        // rtuple.py:340-353 — `pairtype(TupleRepr, TupleRepr).convert_from_to`.
+        // rtuple.py — `pairtype(TupleRepr, TupleRepr).convert_from_to`.
         // Same-arity tuple-to-tuple: identity if lltypes match, else
         // per-item getitem_internal + convertvar + newtuple.
         // Different-arity returns NotImplemented.
@@ -475,19 +475,19 @@ fn dispatch_convert_from_to(
         (StringRepr, CharRepr) => {
             super::rstr::pair_string_char_convert_from_to(r_from, r_to, v, llops)
         }
-        // rmodel.py:361-363 — `pairtype(Repr, VoidRepr).convert_from_to`
+        // rmodel.py — `pairtype(Repr, VoidRepr).convert_from_to`
         // returns `inputconst(Void, None)`.
         (Repr, VoidRepr) => Ok(Some(Hlvalue::Constant(inputconst_from_lltype(
             &LowLevelType::Void,
             &ConstValue::None,
         )?))),
-        // rnone.py:46-49 — `pairtype(Repr, NoneRepr).convert_from_to`
+        // rnone.py — `pairtype(Repr, NoneRepr).convert_from_to`
         // returns `inputconst(Void, None)`.
         (Repr, NoneRepr) => super::rnone::pair_any_none_convert_from_to(r_from, r_to, v, llops),
-        // rnone.py:56-59 — `pairtype(NoneRepr, Repr).convert_from_to`
+        // rnone.py — `pairtype(NoneRepr, Repr).convert_from_to`
         // returns `inputconst(r_to, None)`.
         (NoneRepr, Repr) => super::rnone::pair_none_any_convert_from_to(r_from, r_to, v, llops),
-        // raddress.py:143-144 — `pairtype(PtrRepr, AddressRepr).convert_from_to`.
+        // raddress.py — `pairtype(PtrRepr, AddressRepr).convert_from_to`.
         (PtrRepr, AddressRepr) => {
             let result = llops.genop(
                 "cast_ptr_to_adr",
@@ -557,34 +557,34 @@ fn dispatch_rtype_op(
         (PtrRepr, IntegerRepr, "getitem") | (InteriorPtrRepr, IntegerRepr, "getitem") => {
             committed(r1.rtype_getitem(hop))
         }
-        // rlist.py:245-267 — pair(AbstractBaseListRepr, IntegerRepr).rtype_getitem.
+        // rlist.py — pair(AbstractBaseListRepr, IntegerRepr).rtype_getitem.
         // FixedSizeListRepr (Rust slice / fixed array) handles the nonneg +
         // checkidx=False branch (bare getarrayitem); the negative-index and
         // checkidx branches surface a TyperError until those helpers land.
         (FixedSizeListRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
-        // rlist.py:245-267 — the resized ListRepr shares the dispatch but
+        // rlist.py — the resized ListRepr shares the dispatch but
         // reads through the `items` array out of its `length`/`items`
         // header struct (getfield "items" → getarrayitem).
         (ListRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
-        // rordereddict.py:441-447 — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_getitem`.
+        // rordereddict.py — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_getitem`.
         // The second receiver is never read in the upstream body (only
         // `r_dict.key_repr` is), so this wildcards `_` on the key repr class,
         // same pattern as `(TupleRepr, _, "contains")` below.
         (OrderedDictRepr, _, "getitem") => committed(r1.rtype_getitem(hop)),
-        // rordereddict.py:449-454 — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_delitem`.
+        // rordereddict.py — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_delitem`.
         // Same wildcard-`_` dispatch rationale as the `"getitem"` arm above
         // (`r_key` is never read, only `r_dict.key_repr`).
         (OrderedDictRepr, _, "delitem") => committed(r1.rtype_delitem(hop)),
-        // rrange.py:34-50 — pair(AbstractRangeRepr, IntegerRepr).rtype_getitem.
+        // rrange.py — pair(AbstractRangeRepr, IntegerRepr).rtype_getitem.
         // RangeRepr handles the constant-step + nonneg + dum_nocheck branch
         // (start + index*step); the checkidx, negative-index, and
         // variable-step branches surface a TyperError until those land.
         (RangeRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
-        // rtuple.py:264-273 — `pairtype(TupleRepr, IntegerRepr).rtype_getitem`.
+        // rtuple.py — `pairtype(TupleRepr, IntegerRepr).rtype_getitem`.
         (TupleRepr, IntegerRepr, "getitem") => {
             committed(super::rtuple::pair_tuple_int_rtype_getitem(r1, hop))
         }
-        // rstr.py:614-632 — `pair(AbstractStringRepr, IntegerRepr).rtype_getitem`.
+        // rstr.py — `pair(AbstractStringRepr, IntegerRepr).rtype_getitem`.
         // Pyre handles the nonneg + checkidx=False branch; other
         // branches (negative-index ll_stritem, checkidx
         // ll_stritem_*_checked) surface a TyperError until those
@@ -595,7 +595,7 @@ fn dispatch_rtype_op(
         (UnicodeRepr, IntegerRepr, "getitem") => {
             committed(super::rstr::pair_unicode_int_rtype_getitem(hop))
         }
-        // rstr.py:634-635 — `rtype_getitem_idx` defers to
+        // rstr.py — `rtype_getitem_idx` defers to
         // `rtype_getitem(hop, checkidx=True)`. The checked path raises
         // IndexError from inside ll_stritem_checked /
         // ll_stritem_nonneg_checked.
@@ -605,7 +605,7 @@ fn dispatch_rtype_op(
         (UnicodeRepr, IntegerRepr, "getitem_idx") => {
             committed(super::rstr::pair_unicode_int_rtype_getitem_idx(hop))
         }
-        // rstr.py:723-730 — `pairtype(AbstractCharRepr, IntegerRepr)`
+        // rstr.py — `pairtype(AbstractCharRepr, IntegerRepr)`
         // and `pairtype(AbstractUniCharRepr, IntegerRepr)` rtype_getitem
         // share the same body: constant-0 pass-through, otherwise
         // Char→Str/UniChar→Unicode via `ll_chr2str` and reuse
@@ -622,7 +622,7 @@ fn dispatch_rtype_op(
         (UniCharRepr, IntegerRepr, "getitem_idx") => {
             committed(super::rstr::pair_unichar_int_rtype_getitem_idx(hop))
         }
-        // rstr.py:651-659 — `pair(AbstractStringRepr, AbstractStringRepr).rtype_add`
+        // rstr.py — `pair(AbstractStringRepr, AbstractStringRepr).rtype_add`
         // (and `rtype_inplace_add`) lower to
         // `direct_call(ll_strconcat, v_s1, v_s2)` against the
         // helper graph synthesised by
@@ -638,45 +638,45 @@ fn dispatch_rtype_op(
         | (AbstractStringRepr, AbstractStringRepr, "inplace_add") => {
             committed(super::rstr::pair_abstract_string_rtype_add(r1, r2, hop))
         }
-        // rtuple.py:319-327 — `pairtype(TupleRepr, TupleRepr).rtype_add`
+        // rtuple.py — `pairtype(TupleRepr, TupleRepr).rtype_add`
         // (and its `rtype_inplace_add` alias) concatenates two tuples
         // by per-position getfield + newtuple_cached.
         (TupleRepr, TupleRepr, "add") | (TupleRepr, TupleRepr, "inplace_add") => {
             committed(super::rtuple::pair_tuple_tuple_rtype_add(r1, r2, hop))
         }
-        // rtuple.py:329-334 — `pairtype(TupleRepr, TupleRepr).rtype_eq`
+        // rtuple.py — `pairtype(TupleRepr, TupleRepr).rtype_eq`
         // dispatches to the per-shape `ll_eq` helper synthesised by
         // `gen_eq_function`.
         (TupleRepr, TupleRepr, "eq") => {
             committed(super::rtuple::pair_tuple_tuple_rtype_eq(r1, r2, hop))
         }
-        // rtuple.py:336-338 — `rtype_ne = rtype_eq + bool_not`.
+        // rtuple.py — `rtype_ne = rtype_eq + bool_not`.
         (TupleRepr, TupleRepr, "ne") => {
             committed(super::rtuple::pair_tuple_tuple_rtype_ne(r1, r2, hop))
         }
-        // rtuple.py:292-315 — `pairtype(TupleRepr, Repr).rtype_contains`
+        // rtuple.py — `pairtype(TupleRepr, Repr).rtype_contains`
         // dispatches to a constant-tuple membership test using the
         // synthesised per-type `ll_equal` helper.
         (TupleRepr, _, "contains") => {
             committed(super::rtuple::pair_tuple_repr_rtype_contains(r1, r2, hop))
         }
-        // rordereddict.py:464-467 — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_contains`.
+        // rordereddict.py — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_contains`.
         (OrderedDictRepr, _, "contains") => committed(
             super::lltypesystem::rordereddict::pair_ordereddict_repr_rtype_contains(r1, r2, hop),
         ),
         (PtrRepr, IntegerRepr, "setitem") | (InteriorPtrRepr, IntegerRepr, "setitem") => {
             committed(r1.rtype_setitem(hop))
         }
-        // rlist.py:272-284 — pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem.
+        // rlist.py — pair(AbstractBaseListRepr, IntegerRepr).rtype_setitem.
         // FixedSizeListRepr handles the nonneg + dum_nocheck branch (bare
         // setarrayitem); the checkidx (IndexError) and negative-index
         // branches surface a TyperError until those helpers land.
         (FixedSizeListRepr, IntegerRepr, "setitem") => committed(r1.rtype_setitem(hop)),
-        // rlist.py:272-284 — the resized ListRepr shares the dispatch but
+        // rlist.py — the resized ListRepr shares the dispatch but
         // reads through the `items` array out of its `length`/`items`
         // header struct (getfield "items" → setarrayitem).
         (ListRepr, IntegerRepr, "setitem") => committed(r1.rtype_setitem(hop)),
-        // rordereddict.py:448-455 — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_setitem`.
+        // rordereddict.py — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_setitem`.
         // Same wildcard-`_` dispatch rationale as the `"getitem"` arm above
         // (`r_key` is never read, only `r_dict.key_repr`).
         (OrderedDictRepr, _, "setitem") => committed(r1.rtype_setitem(hop)),
@@ -688,7 +688,7 @@ fn dispatch_rtype_op(
         (Repr, PtrRepr, "eq") => committed(r2.rtype_eq(hop)),
         (Repr, PtrRepr, "ne") => committed(r2.rtype_ne(hop)),
 
-        // rclass.py:1070 — `pairtype(InstanceRepr, InstanceRepr).rtype_eq
+        // rclass.py — `pairtype(InstanceRepr, InstanceRepr).rtype_eq
         // = rtype_is_`: both sides upcast to the common-base instance
         // repr, then pointer identity (`ptr_eq`).  rtype_ne (1072-1074)
         // negates it.
@@ -699,7 +699,7 @@ fn dispatch_rtype_op(
             committed(super::rclass::pair_instance_instance_rtype_ne(r1, r2, hop))
         }
 
-        // rint.py:217-310 — IntegerRepr/IntegerRepr pair arithmetic and
+        // rint.py — IntegerRepr/IntegerRepr pair arithmetic and
         // comparisons. `truediv` is intentionally absent here: upstream
         // delegates it to FloatRepr through the MRO.
         (IntegerRepr, IntegerRepr, "add") => committed(super::rint::rtype_template(hop, "add")),
@@ -768,7 +768,7 @@ fn dispatch_rtype_op(
             committed(super::rint::rtype_compare_template(hop, "eq"))
         }
 
-        // rfloat.py:75-135 — FloatRepr/FloatRepr pair arithmetic and
+        // rfloat.py — FloatRepr/FloatRepr pair arithmetic and
         // comparisons. IntegerRepr inherits FloatRepr upstream, so mixed
         // int/float arithmetic reaches these arms via `pair_mro`.
         (FloatRepr, FloatRepr, "add") => committed(super::rfloat::rtype_template(hop, "add")),
@@ -787,7 +787,7 @@ fn dispatch_rtype_op(
             committed(super::rfloat::rtype_compare_template(hop, "eq"))
         }
 
-        // rstr.py:740-746 — pairtype(AbstractCharRepr, AbstractCharRepr)
+        // rstr.py — pairtype(AbstractCharRepr, AbstractCharRepr)
         // dispatches all six compare ops to `char_<func>` lloperations.
         (CharRepr, CharRepr, "eq") => {
             committed(super::rstr::pair_char_char_rtype_compare(hop, "eq"))
@@ -808,7 +808,7 @@ fn dispatch_rtype_op(
             committed(super::rstr::pair_char_char_rtype_compare(hop, "ge"))
         }
 
-        // rstr.py:778-784 — pairtype(AbstractUniCharRepr, AbstractUniCharRepr).
+        // rstr.py — pairtype(AbstractUniCharRepr, AbstractUniCharRepr).
         // eq/ne dispatch to `unichar_<func>`; lt/le/gt/ge cast both
         // arms via `cast_unichar_to_int` and dispatch to `int_<func>`.
         (UniCharRepr, UniCharRepr, "eq") => committed(
@@ -830,7 +830,7 @@ fn dispatch_rtype_op(
             super::rstr::pair_unichar_unichar_rtype_compare_ord(hop, "ge"),
         ),
 
-        // rstr.py:651-692 — pairtype(AbstractStringRepr, AbstractStringRepr).
+        // rstr.py — pairtype(AbstractStringRepr, AbstractStringRepr).
         // eq routes through ll_streq, ne wraps ll_streq with bool_not,
         // lt/le/gt/ge route through ll_strcmp + int_<func>(diff, 0).
         (StringRepr, StringRepr, "eq") => {
@@ -865,7 +865,7 @@ fn dispatch_rtype_op(
             committed(super::rstr::pair_string_char_rtype_compare(hop, opname, 1))
         }
 
-        // rstr.py:651-692 inherited via AbstractUnicodeRepr(AbstractStringRepr) —
+        // rstr.py inherited via AbstractUnicodeRepr(AbstractStringRepr) —
         // pairtype(AbstractUnicodeRepr, AbstractUnicodeRepr) routes through
         // the same body modulo the helper-graph identity (ll_unicode_eq /
         // ll_unicode_cmp).
@@ -888,16 +888,16 @@ fn dispatch_rtype_op(
             committed(super::rstr::pair_unicode_unicode_rtype_compare(hop, "ge"))
         }
 
-        // raddress.py:74-80 — `pairtype(TypedAddressAccessRepr, IntegerRepr).rtype_getitem`.
+        // raddress.py — `pairtype(TypedAddressAccessRepr, IntegerRepr).rtype_getitem`.
         (TypedAddressAccessRepr, IntegerRepr, "getitem") => {
             committed(pair_typed_address_access_int_rtype_getitem(r1, hop))
         }
-        // raddress.py:82-87 — `pairtype(TypedAddressAccessRepr, IntegerRepr).rtype_setitem`.
+        // raddress.py — `pairtype(TypedAddressAccessRepr, IntegerRepr).rtype_setitem`.
         (TypedAddressAccessRepr, IntegerRepr, "setitem") => {
             committed(pair_typed_address_access_int_rtype_setitem(r1, hop))
         }
 
-        // raddress.py:92-98 — `pairtype(AddressRepr, IntegerRepr).rtype_add/inplace_add`.
+        // raddress.py — `pairtype(AddressRepr, IntegerRepr).rtype_add/inplace_add`.
         (AddressRepr, IntegerRepr, "add") | (AddressRepr, IntegerRepr, "inplace_add") => {
             if *r2.lowleveltype() == LowLevelType::Signed {
                 let v_args = hop.inputargs(vec![
@@ -913,7 +913,7 @@ fn dispatch_rtype_op(
                 Ok(None)
             }
         }
-        // raddress.py:100-106 — `pairtype(AddressRepr, IntegerRepr).rtype_sub/inplace_sub`.
+        // raddress.py — `pairtype(AddressRepr, IntegerRepr).rtype_sub/inplace_sub`.
         (AddressRepr, IntegerRepr, "sub") | (AddressRepr, IntegerRepr, "inplace_sub") => {
             if *r2.lowleveltype() == LowLevelType::Signed {
                 let v_args = hop.inputargs(vec![
@@ -929,7 +929,7 @@ fn dispatch_rtype_op(
                 Ok(None)
             }
         }
-        // raddress.py:111-113 — `pairtype(AddressRepr, AddressRepr).rtype_sub`.
+        // raddress.py — `pairtype(AddressRepr, AddressRepr).rtype_sub`.
         (AddressRepr, AddressRepr, "sub") => {
             let v_args = hop.inputargs(vec![
                 ConvertedTo::LowLevelType(&LowLevelType::Address),
@@ -941,7 +941,7 @@ fn dispatch_rtype_op(
                 GenopResult::LLType(LowLevelType::Signed),
             )))
         }
-        // raddress.py:115-137 — `pairtype(AddressRepr, AddressRepr)` comparisons.
+        // raddress.py — `pairtype(AddressRepr, AddressRepr)` comparisons.
         (AddressRepr, AddressRepr, "eq")
         | (AddressRepr, AddressRepr, "ne")
         | (AddressRepr, AddressRepr, "lt")
@@ -1160,8 +1160,8 @@ pub fn pair_rtype_ge(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) -> RTypeRe
     pair_rtype_op(r1, r2, hop, "ge")
 }
 
-/// RPython `pair(r1, r2).rtype_is_(hop)` (pairtype.py + rnone.py:51-54,
-/// 61-64 + rfloat.py:110 `rtype_is_ = rtype_eq`).
+/// RPython `pair(r1, r2).rtype_is_(hop)` (pairtype.py + rnone.py,
+/// 61-64 + rfloat.py `rtype_is_ = rtype_eq`).
 ///
 /// Equivalent of `translate_op_is` consulting the pair table. `pos`
 /// defaults to 0 upstream for the first-arg side and 1 for the
@@ -1192,10 +1192,10 @@ fn dispatch_rtype_is_(
 ) -> Result<Option<Hlvalue>, TyperError> {
     use ReprClassId::*;
     match (b1, b2) {
-        // rnone.py:51-54 — `pairtype(Repr, NoneRepr).rtype_is_` calls
+        // rnone.py — `pairtype(Repr, NoneRepr).rtype_is_` calls
         // `rtype_is_None(robj1, rnone2, hop, pos=0)`.
         (Repr, NoneRepr) => super::rnone::pair_any_none_rtype_is_(r1, r2, hop),
-        // rnone.py:61-64 — `pairtype(NoneRepr, Repr).rtype_is_` calls
+        // rnone.py — `pairtype(NoneRepr, Repr).rtype_is_` calls
         // `rtype_is_None(robj2, rnone1, hop, pos=1)`.
         (NoneRepr, Repr) => super::rnone::pair_none_any_rtype_is_(r1, r2, hop),
         // rpbc.py:713-725 — the one upstream block registers
@@ -1208,7 +1208,7 @@ fn dispatch_rtype_is_(
         | (SingleFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr) => {
             super::rpbc::pair_mu_mu_rtype_is_(r1, r2, hop).map(Some)
         }
-        // rpbc.py:558-571 — `pairtype(FunctionReprBase,
+        // rpbc.py — `pairtype(FunctionReprBase,
         // FunctionReprBase).rtype_is_`: union the two SomePBCs,
         // resolve the merged repr, convert both sides to it, then
         // emit `char_eq` (Char-typed Small set) or `ptr_eq` (Ptr-typed
@@ -1226,13 +1226,13 @@ fn dispatch_rtype_is_(
         | (SmallFunctionSetPBCRepr, SmallFunctionSetPBCRepr) => {
             super::rpbc::pair_function_repr_base_rtype_is_(r1, r2, hop).map(Some)
         }
-        // rtuple.py:355-356 — `pairtype(TupleRepr, TupleRepr).rtype_is_`
+        // rtuple.py — `pairtype(TupleRepr, TupleRepr).rtype_is_`
         // raises `TyperError("cannot compare tuples with 'is'")`. The
         // identity check is structurally meaningless on a tuple value,
         // and the rtyper rejects it eagerly so callers cannot route a
         // tuple through ptr_eq via the generic `(Repr, Repr)` arm below.
         (TupleRepr, TupleRepr) => super::rtuple::pair_tuple_tuple_rtype_is_(r1, r2, hop),
-        // rclass.py:1057-1068 — `pairtype(InstanceRepr, InstanceRepr)
+        // rclass.py — `pairtype(InstanceRepr, InstanceRepr)
         // .rtype_is_`: convert both sides to the common-base instance
         // repr (cast_pointer upcast), then pointer identity via the
         // generic `(Repr, Repr)` arm.
@@ -1357,7 +1357,7 @@ mod tests {
 
     #[test]
     fn convert_from_to_any_to_none_produces_void_constant() {
-        // rnone.py:46-49 — `pairtype(Repr, NoneRepr).convert_from_to`
+        // rnone.py — `pairtype(Repr, NoneRepr).convert_from_to`
         // returns `inputconst(Void, None)`.
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::{ConstValue, Constant};
@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn convert_from_to_ptr_lladtmeth_uses_same_lowleveltype_like_rptr() {
-        // rptr.py:213-218 — pairtype(PtrRepr, LLADTMethRepr) converts by
+        // rptr.py — pairtype(PtrRepr, LLADTMethRepr) converts by
         // identity when the low-level pointer type matches.
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::flowspace::model::{ConstValue, Constant};
@@ -1850,7 +1850,7 @@ mod tests {
 
     #[test]
     fn pair_function_function_convert_from_to_is_identity_and_emits_no_ops() {
-        // rpbc.py:373-375 — pairtype(FunctionRepr,
+        // rpbc.py — pairtype(FunctionRepr,
         // FunctionRepr).convert_from_to is upstream `return v`. Both
         // reprs are Void-typed; the conversion should be a pass-through.
         use crate::annotator::annrpython::RPythonAnnotator;
@@ -1911,7 +1911,7 @@ mod tests {
 
     #[test]
     fn pair_functions_pbc_to_function_returns_void_none_constant() {
-        // rpbc.py:381-383 — FunctionsPBCRepr → FunctionRepr is
+        // rpbc.py — FunctionsPBCRepr → FunctionRepr is
         // `inputconst(Void, None)`, irrespective of the source variable.
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::annotator::bookkeeper::Bookkeeper;
@@ -1990,7 +1990,7 @@ mod tests {
 
     #[test]
     fn pair_functions_pbc_identity_passes_through_when_lowleveltypes_match() {
-        // rpbc.py:385-390 — two FunctionsPBCRepr reprs with matching
+        // rpbc.py — two FunctionsPBCRepr reprs with matching
         // lowleveltype collapse to `return v`. Re-using the same
         // FunctionsPBCRepr on both ends is the simplest way to trigger
         // the identity arm.

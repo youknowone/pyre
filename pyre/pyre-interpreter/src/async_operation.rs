@@ -12,7 +12,7 @@ use pyre_object::PyObjectRef;
 
 use crate::PyResult;
 
-/// `aiter` / `anext` ported verbatim from app_operation.py:36-81.  The
+/// `aiter` / `anext` ported verbatim from app_operation.py.  The
 /// `_NOT_PROVIDED` sentinel stays in the intermediate namespace that both
 /// functions retain as their `__globals__`, so only the two public names
 /// need to be surfaced.

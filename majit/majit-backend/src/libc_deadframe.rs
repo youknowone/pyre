@@ -1,7 +1,7 @@
 //! The deadframe of a backend whose jitframes are allocated outside the GC
 //! heap.
 //!
-//! `execute_token` mints the frame at `llmodel.py:298 malloc_jitframe` and
+//! `execute_token` mints the frame at `llmodel.py malloc_jitframe` and
 //! hands that same value back at `llmodel.py:328 return ll_frame` — the
 //! deadframe IS the jitframe here as well, so nothing is copied out and the
 //! accessors read `jf_frame[]` in place. What differs from
@@ -38,7 +38,7 @@ pub struct LibcJitFrameDeadFrame {
     /// Head of the chain this deadframe OWNS and frees on drop, or `None`
     /// when the frames belong to somebody else. `Backend::force` mints a
     /// deadframe over the frame of a compiled run that is still executing
-    /// (`llmodel.py:270-274 force` likewise returns that frame rather than a
+    /// (`llmodel.py force` likewise returns that frame rather than a
     /// copy), and freeing it there would pull the ground out from under the
     /// caller.
     owned_head: Option<*mut JitFrame>,
@@ -124,7 +124,7 @@ impl LibcJitFrameDeadFrame {
         self.tip as usize
     }
 
-    /// `llmodel.py:422-424 _decode_pos` — the jitframe slot logical failarg
+    /// `llmodel.py _decode_pos` — the jitframe slot logical failarg
     /// `index` lives in, or `None` when the descr maps it nowhere.
     ///
     /// Indices past `rd_locs` fall through to identity slot indexing, which is
@@ -156,7 +156,7 @@ impl LibcJitFrameDeadFrame {
         GcRef(self.get_int(index) as usize)
     }
 
-    /// `cpu.grab_exc_value(deadframe)` (llmodel.py:240-242) — read
+    /// `cpu.grab_exc_value(deadframe)` (llmodel.py) — read
     /// `jf_guard_exc` off the frame. The exc=True failure-recovery stub staged
     /// `pos_exc_value` there for must_save_exception guards; other guards
     /// leave it NULL.
@@ -173,7 +173,7 @@ impl LibcJitFrameDeadFrame {
 /// of them: when `_check_frame_depth`'s realloc slowpath fires, the outgrown
 /// frame's `jf_forward` links to its replacement, and every node in that chain
 /// was `register_libc_jitframe`'d. Walk the chain the way
-/// `jitframe.py:54-57 jitframe_resolve` walks it — read `jf_forward` before
+/// `jitframe.py jitframe_resolve` walks it — read `jf_forward` before
 /// freeing each node — so every frame is unregistered and freed exactly once.
 /// In the common no-realloc case the chain is one node.
 ///

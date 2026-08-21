@@ -123,7 +123,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     // The 're.Pattern' / 're.Match' W_TypeObjects are created with the
     // other builtin typedefs in `typedef.rs` (W_SRE_Pattern.typedef /
-    // W_SRE_Match.typedef, interp_sre.py:641/:869); instances carry
+    // W_SRE_Match.typedef, interp_sre.py/:869); instances carry
     // `pyre_object::interp_sre` typed payloads.
 }
 
@@ -149,12 +149,12 @@ fn sre_match_receiver(args: &[PyObjectRef]) -> Result<*const W_SRE_Match, crate:
     }
 }
 
-/// W_SRE_Pattern.typedef (interp_sre.py:641-668): instance methods are
+/// W_SRE_Pattern.typedef (interp_sre.py): instance methods are
 /// registered on the type so `pat.match(s)` binds `pat` as `self`,
 /// plus the `flags` / `groupindex` / `groups` / `pattern` attribute
 /// properties (interp_sre.py:662-667).
 pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
-    // interp_sre.py:649 `__new__ = interp2app(SRE_Pattern__new__)`.
+    // interp_sre.py `__new__ = interp2app(SRE_Pattern__new__)`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__new__",
@@ -188,7 +188,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
         "finditer",
         make_builtin_function("finditer", sre_pattern_finditer),
     ) };
-    // interp_sre.py:659 `scanner = interp2app(W_SRE_Pattern.finditer_w)`
+    // interp_sre.py `scanner = interp2app(W_SRE_Pattern.finditer_w)`
     // — CPython/PyPy expose the same iterator constructor under both names.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -254,7 +254,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
             "flags",
         ),
     ) };
-    // interp_sre.py:664 `groupindex = GetSetProperty(fget_groupindex)`
+    // interp_sre.py `groupindex = GetSetProperty(fget_groupindex)`
     // (:202-206 — a dict groupindex is exposed through a dictproxy).
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -303,7 +303,7 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
     ) };
 }
 
-/// W_SRE_Match.typedef (interp_sre.py:869-895): methods + the `re` /
+/// W_SRE_Match.typedef (interp_sre.py): methods + the `re` /
 /// `string` / `pos` / `endpos` / `lastgroup` / `lastindex` attribute
 /// properties.
 pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
@@ -316,19 +316,19 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "start", make_builtin_function("start", sre_match_start)) };
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "end", make_builtin_function("end", sre_match_end)) };
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "span", make_builtin_function("span", sre_match_span)) };
-    // interp_sre.py:880 `groupdict = interp2app(W_SRE_Match.groupdict_w)`.
+    // interp_sre.py `groupdict = interp2app(W_SRE_Match.groupdict_w)`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "groupdict",
         make_builtin_function("groupdict", sre_match_groupdict),
     ) };
-    // interp_sre.py:876 `__getitem__ = interp2app(W_SRE_Match.descr_getitem)`.
+    // interp_sre.py `__getitem__ = interp2app(W_SRE_Match.descr_getitem)`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "__getitem__",
         make_builtin_function("__getitem__", sre_match_getitem),
     ) };
-    // interp_sre.py:884 `expand = interp2app(W_SRE_Match.expand_w)`.
+    // interp_sre.py `expand = interp2app(W_SRE_Match.expand_w)`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "expand",
@@ -364,7 +364,7 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
             "re",
         ),
     ) };
-    // interp_sre.py:888 `string = GetSetProperty(fget_string)` (:866-867).
+    // interp_sre.py `string = GetSetProperty(fget_string)` (:866-867).
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "string",
@@ -377,7 +377,7 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
             "string",
         ),
     ) };
-    // interp_sre.py:889 `pos = GetSetProperty(fget_pos)` (:851-852).
+    // interp_sre.py `pos = GetSetProperty(fget_pos)` (:851-852).
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "pos",
@@ -390,7 +390,7 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
             "pos",
         ),
     ) };
-    // interp_sre.py:890 `endpos = GetSetProperty(fget_endpos)` (:854-855).
+    // interp_sre.py `endpos = GetSetProperty(fget_endpos)` (:854-855).
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "endpos",
@@ -403,7 +403,7 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
             "endpos",
         ),
     ) };
-    // interp_sre.py:891 `lastgroup = GetSetProperty(fget_lastgroup)`
+    // interp_sre.py `lastgroup = GetSetProperty(fget_lastgroup)`
     // (:831-839 — the group name from `w_indexgroup[lastindex]`).
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -434,7 +434,7 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
             "lastgroup",
         ),
     ) };
-    // interp_sre.py:892 `lastindex = GetSetProperty(fget_lastindex)`
+    // interp_sre.py `lastindex = GetSetProperty(fget_lastindex)`
     // (:841-845).
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
@@ -455,7 +455,7 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
             "lastindex",
         ),
     ) };
-    // interp_sre.py:892 `regs = GetSetProperty(W_SRE_Match.fget_regs)`.
+    // interp_sre.py `regs = GetSetProperty(W_SRE_Match.fget_regs)`.
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "regs",
@@ -475,7 +475,7 @@ pub(crate) fn init_sre_match_type(ns: PyObjectRef) {
     ) };
 }
 
-/// W_SRE_Scanner.typedef (interp_sre.py:949-957): the finditer/scanner
+/// W_SRE_Scanner.typedef (interp_sre.py): the finditer/scanner
 /// iterator — `__iter__`/`__next__` plus the undocumented `match`/`search`
 /// methods and the `pattern` attribute property.
 pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
@@ -524,7 +524,7 @@ pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
 }
 
 /// _sre.compile(pattern, flags, code, groups, groupindex, indexgroup)
-/// — `SRE_Pattern__new__` (interp_sre.py:614-639).
+/// — `SRE_Pattern__new__` (interp_sre.py).
 fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() < 3 {
         return Err(crate::PyError::type_error(
@@ -601,7 +601,7 @@ fn get_code(pat: PyObjectRef) -> Option<&'static [u32]> {
     }
 }
 
-/// `_index_to_byte` (`unicodeobject.py:1251`) — the byte offset of a character
+/// `_index_to_byte` (`unicodeobject.py`) — the byte offset of a character
 /// index, read through the object's cached index storage.  An index at or past
 /// the end is the end of the payload, which is the bound `make_ctx` applies to
 /// `endpos` (interp_sre.py:243-244).
@@ -650,7 +650,7 @@ fn normalize_bounds(len: usize, pos: i64, endpos: i64) -> (usize, usize) {
 /// same way it matches on any other character.
 #[derive(Clone, Copy)]
 enum Subject {
-    /// `UnicodeAsciiMatchContext` (interp_sre.py:52), selected by `is_ascii()`
+    /// `UnicodeAsciiMatchContext` (interp_sre.py), selected by `is_ascii()`
     /// at interp_sre.py:246 — one byte per code point, so a character position
     /// *is* a byte offset and the engine drives the payload as bytes.
     /// `StrDrive` carries no semantics of its own (it is `count` and cursor
@@ -675,7 +675,7 @@ impl Subject {
     fn len(self) -> usize {
         match self {
             Subject::AsciiStr(b) | Subject::Bytes(b) => b.len(),
-            // `_len()` (interp_sre.py:235) — the stored code point count.
+            // `_len()` (interp_sre.py) — the stored code point count.
             Subject::Str(obj) => unsafe { w_str_len(obj) },
         }
     }
@@ -696,7 +696,7 @@ unsafe fn str_subject(string: PyObjectRef) -> Subject {
 
 /// The drive behind [`Subject::Str`]: a non-ASCII `str` whose positions are
 /// code point indices, resolved through the object's stored length and index
-/// storage — `_len()` and `_index_to_byte` (unicodeobject.py:1245-1251) —
+/// storage — `_len()` and `_index_to_byte` (unicodeobject.py) —
 /// rather than by walking the payload.
 ///
 /// This is the point of carrying `w_unicode_obj` on the context at all.
@@ -807,14 +807,14 @@ impl RootedObject {
     }
 }
 
-/// `is_known_bytes` (interp_sre.py:208-212) — the pattern was compiled from
+/// `is_known_bytes` (interp_sre.py) — the pattern was compiled from
 /// a bytes-like object (a `None` pattern is unknown, accepting either).
 fn pattern_is_known_bytes(pat: PyObjectRef) -> bool {
     let w_pattern = unsafe { (*(pat as *const W_SRE_Pattern)).w_pattern };
     !unsafe { is_none(w_pattern) } && !unsafe { is_str(w_pattern) }
 }
 
-/// `is_known_unicode` (interp_sre.py:214-218).
+/// `is_known_unicode` (interp_sre.py).
 fn pattern_is_known_unicode(pat: PyObjectRef) -> bool {
     let w_pattern = unsafe { (*(pat as *const W_SRE_Pattern)).w_pattern };
     !unsafe { is_none(w_pattern) } && unsafe { is_str(w_pattern) }
@@ -859,7 +859,7 @@ unsafe fn readbuf_bytes(obj: PyObjectRef) -> Option<&'static [u8]> {
     }
 }
 
-/// `make_ctx` (interp_sre.py:220-285) — resolve the subject and reject a
+/// `make_ctx` (interp_sre.py) — resolve the subject and reject a
 /// pattern/subject type mismatch (a bytes pattern on a str, or a str
 /// pattern on a bytes-like object).  A `str` (or subclass) becomes a
 /// character subject; `bytes`/`bytearray` (or subclass) a byte subject; any
@@ -925,7 +925,7 @@ unsafe fn subject_of(string: PyObjectRef, w_buffer: PyObjectRef) -> Subject {
     }
 }
 
-/// `slice_w` (interp_sre.py:57-80) — the span sliced out of the subject
+/// `slice_w` (interp_sre.py) — the span sliced out of the subject
 /// (`str` → `str`, bytes-like → `bytes`), or `w_default` for an unmatched
 /// group (span `(-1, -1)` or otherwise out of range).
 fn slice_subject(subj: Subject, span: (i64, i64), w_default: PyObjectRef) -> PyObjectRef {
@@ -973,7 +973,7 @@ fn subject_span_bytes(subj: Subject, span: (i64, i64)) -> Option<&'static [u8]> 
 }
 
 /// Wrap accumulated replacement bytes as the subject's kind — `str` from
-/// the (valid UTF-8) builder, or `bytes` (subx result, interp_sre.py:541-548).
+/// the (valid UTF-8) builder, or `bytes` (subx result, interp_sre.py).
 fn finish_output(subj: Subject, out: Vec<u8>) -> PyObjectRef {
     if subj.is_unicode() {
         // interp_sre.py:567 returns `space.newutf8(...)`: substitution and
@@ -1026,7 +1026,7 @@ fn drive_scanner_step<S: StrDrive>(
 }
 
 /// A snapshot of one match for deferred slicing or Match construction — the
-/// flattened span table plus `_last_index` (interp_sre.py:825-829).
+/// flattened span table plus `_last_index` (interp_sre.py).
 struct MatchSnapshot {
     lastindex: i64,
     spans: Vec<(i64, i64)>,
@@ -1062,7 +1062,7 @@ fn collect_matches<S: StrDrive>(
 /// invoking `on_match` for each non-overlapping match as it is found and
 /// stopping once `cap` matches have been processed (`cap == 0` is unlimited;
 /// a negative `cap` processes none).  This streams `search → callback →
-/// search` like `subx`/`split_w` (interp_sre.py:421-558/378-407) rather than
+/// search` like `subx`/`split_w` (interp_sre.py/378-407) rather than
 /// materialising every match first, so a callable replacement's side effects
 /// interleave with the search and a `count`/`maxsplit` bound short-circuits
 /// the remaining scan.  Returns the number of matches processed.
@@ -1096,7 +1096,7 @@ fn stream_matches<S: StrDrive>(
     Ok(n)
 }
 
-/// `W_SRE_Match(self, ctx)` (e.g. interp_sre.py:286-288) from a collected
+/// `W_SRE_Match(self, ctx)` (e.g. interp_sre.py) from a collected
 /// [`MatchSnapshot`].
 fn make_match_from_snapshot(
     pat: PyObjectRef,
@@ -1195,7 +1195,7 @@ fn flatten_spans(pat: PyObjectRef, state: &State) -> Vec<(i64, i64)> {
 }
 
 /// Build the W_SRE_Match for a successful engine run — the
-/// `W_SRE_Match(self, ctx)` constructions (e.g. interp_sre.py:286-288)
+/// `W_SRE_Match(self, ctx)` constructions (e.g. interp_sre.py)
 /// with the span table flattened eagerly (`flatten_marks`, :793-797).
 fn make_match(
     pat: PyObjectRef,
@@ -1205,7 +1205,7 @@ fn make_match(
     pos: i64,
     endpos: i64,
 ) -> PyObjectRef {
-    // `_last_index` (interp_sre.py:825-829); -1 plays None.
+    // `_last_index` (interp_sre.py); -1 plays None.
     let lastindex = {
         let li = state.marks.last_index();
         if li >= 0 { li as i64 } else { -1 }
@@ -1282,7 +1282,7 @@ fn required_arg_kw(
     })
 }
 
-/// `findall_w` (interp_sre.py:339-365) — non-overlapping matches.  With no
+/// `findall_w` (interp_sre.py) — non-overlapping matches.  With no
 /// groups the whole match is collected; with one group that group's text;
 /// with two or more a tuple of the groups.  Unmatched groups become the
 /// empty string (`w_emptystr`, :344-347).
@@ -1311,7 +1311,7 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             collect_matches(s, pos, endpos, code, pat)
         }
     };
-    // `matchlist_w = []` in interp_sre.py:341 is a GC-managed list.  Build
+    // `matchlist_w = []` in interp_sre.py is a GC-managed list.  Build
     // that same shape here instead of retaining every result in an off-heap
     // Rust Vec (which would require an O(number of matches) shadow stack).
     let results = RootedObject::pin(w_list_new_empty());
@@ -1333,7 +1333,7 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(results.get())
 }
 
-/// `finditer_w` (interp_sre.py:368-376) — returns the lazy
+/// `finditer_w` (interp_sre.py) — returns the lazy
 /// `W_SRE_Scanner` that yields a `W_SRE_Match` per non-overlapping match.
 fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
@@ -1369,13 +1369,13 @@ fn sre_pattern_finditer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(scanner)
 }
 
-/// `sub_w` (interp_sre.py:409-412).
+/// `sub_w` (interp_sre.py).
 fn sre_pattern_sub(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (w_item, _n) = subx(args)?;
     Ok(w_item)
 }
 
-/// `subn_w` (interp_sre.py:415-419) — returns `(new_string, count)`.
+/// `subn_w` (interp_sre.py) — returns `(new_string, count)`.
 fn sre_pattern_subn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let (w_item, n) = subx(args)?;
@@ -1384,7 +1384,7 @@ fn sre_pattern_subn(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_tuple_new(vec![w_item.get(), w_n.get()]))
 }
 
-/// `subx` (interp_sre.py:421-558) — the shared sub/subn body.  `repl` is a
+/// `subx` (interp_sre.py) — the shared sub/subn body.  `repl` is a
 /// callable (invoked per match), a literal template string with backslash
 /// references expanded ([`parse_template`]), or a plain literal; `count`
 /// caps the number of substitutions (0 = unlimited).
@@ -1438,7 +1438,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
     let endpos = subj.len();
     let mut out: Vec<u8> = Vec::new();
     let mut last = 0i64;
-    // interp_sre.py:494 `while not count or n < count` — 0 is unlimited, a
+    // interp_sre.py `while not count or n < count` — 0 is unlimited, a
     // negative count performs no substitutions; the matching itself streams so
     // a callable filter's side effects interleave with `search`.
     let on_match = |snap: &MatchSnapshot| -> Result<(), crate::PyError> {
@@ -1511,7 +1511,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
 }
 
 /// `type(w_string) is unicode` / `is bytes` — the exact-type gate of the
-/// `subx` n==0 shortcut (interp_sre.py:481-482).  A `str`/`bytes` subclass or
+/// `subx` n==0 shortcut (interp_sre.py).  A `str`/`bytes` subclass or
 /// a buffer object fails this and is normalized to a base-type slice.
 fn is_exact_str_or_bytes(w: PyObjectRef) -> bool {
     match crate::typedef::r#type(w) {
@@ -1523,7 +1523,7 @@ fn is_exact_str_or_bytes(w: PyObjectRef) -> bool {
     }
 }
 
-/// `split_w` (interp_sre.py:378-407) — split `string` by the
+/// `split_w` (interp_sre.py) — split `string` by the
 /// non-overlapping matches of the pattern.  The text between matches is
 /// emitted as list items; when the pattern has capturing groups, every
 /// group's captured text is interleaved (an unmatched group contributes
@@ -1545,7 +1545,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let w_empty = empty_subject(subj);
 
     let endpos = subj.len();
-    // `splitlist = []` in interp_sre.py:383 is itself the long-lived root;
+    // `splitlist = []` in interp_sre.py is itself the long-lived root;
     // keep only the item currently being appended on the shadow stack.
     let results = RootedObject::pin(w_list_new_empty());
     let mut last = 0i64;
@@ -1554,7 +1554,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         let w_item = RootedObject::pin(slice_subject(subj, span, w_default));
         unsafe { w_list_append(results.get(), w_item.get()) };
     };
-    // interp_sre.py:387 `while not maxsplit or n < maxsplit` — 0 is unlimited,
+    // interp_sre.py `while not maxsplit or n < maxsplit` — 0 is unlimited,
     // a negative cap performs no splits; matching streams so `maxsplit` bounds
     // the scan rather than discarding already-found matches.
     let on_match = |snap: &MatchSnapshot| -> Result<(), crate::PyError> {
@@ -1622,10 +1622,10 @@ fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, 
 }
 
 /// Parse a replacement template into [`TemplateItem`]s by delegating to the
-/// app-level `re._parser.parse_template(source, pattern)` (`re/_parser.py:990`)
+/// app-level `re._parser.parse_template(source, pattern)` (`re/_parser.py`)
 /// — owning the parser there keeps `\g<name>`/octal/group-reference handling
 /// and the `re.error` diagnostics identical to the stdlib.  Mirrors
-/// `import_re` (interp_sre.py:108-109, `subx` :469): `__import__("re")` runs
+/// `import_re` (interp_sre.py, `subx` :469): `__import__("re")` runs
 /// `from . import _parser`, so the parser is always reachable as
 /// `re._parser` once `re` is imported.
 fn parse_replacement_template(
@@ -1688,7 +1688,7 @@ fn sre_match_self(args: &[PyObjectRef]) -> Result<*const W_SRE_Match, crate::PyE
     }
 }
 
-/// `do_span` (interp_sre.py:805-823): resolve a group argument — an
+/// `do_span` (interp_sre.py): resolve a group argument — an
 /// index, or a name looked up in `srepat.w_groupindex` — to its span.
 /// Unknown groups raise IndexError("no such group").
 fn do_span(m: *const W_SRE_Match, w_arg: Option<PyObjectRef>) -> Result<(i64, i64), crate::PyError> {
@@ -1734,7 +1734,7 @@ unsafe fn slice_w(m: *const W_SRE_Match, span: (i64, i64), w_default: PyObjectRe
     slice_subject(subj, span, w_default)
 }
 
-/// `group_w` (interp_sre.py:708-726).
+/// `group_w` (interp_sre.py).
 fn sre_match_group(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
     let group_args = &args[1..];
@@ -1765,7 +1765,7 @@ fn sre_match_group(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     ))
 }
 
-/// `groups_w` (interp_sre.py:728-732) — pyre reads the flattened span
+/// `groups_w` (interp_sre.py) — pyre reads the flattened span
 /// table directly; unmatched groups (span `(-1, -1)`) take the optional
 /// `default` argument.
 fn sre_match_groups(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1789,7 +1789,7 @@ fn sre_match_groups(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     ))
 }
 
-/// `groupdict_w` (interp_sre.py:735-751) — name→group-text map built by
+/// `groupdict_w` (interp_sre.py) — name→group-text map built by
 /// iterating `srepat.w_groupindex`; unmatched groups take `default`.
 fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1802,7 +1802,7 @@ fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         .w_groupindex
     });
     let w_dict = RootedObject::pin(w_dict_new());
-    // interp_sre.py:735-751 groupdict_w — walk `w_groupindex` through the
+    // interp_sre.py groupdict_w — walk `w_groupindex` through the
     // object-space iterator / item protocol, resolving each value with
     // `do_span` so a duck-typed group number works.
     let w_iterator = RootedObject::pin(crate::baseobjspace::iter(w_groupindex.get())?);
@@ -1833,7 +1833,7 @@ fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(w_dict.get())
 }
 
-/// `fget_regs` (interp_sre.py:853-864) — `((start, end), ...)` for group
+/// `fget_regs` (interp_sre.py) — `((start, end), ...)` for group
 /// 0..num_groups, matching what `span(i)` reports; unmatched is `(-1, -1)`.
 fn sre_match_regs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_receiver(args)?;
@@ -1846,28 +1846,28 @@ fn sre_match_regs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_tuple_new(regs))
 }
 
-/// `start_w` (interp_sre.py:758-761).
+/// `start_w` (interp_sre.py).
 fn sre_match_start(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
     let (start, _) = do_span(m, args.get(1).copied())?;
     Ok(w_int_new(start))
 }
 
-/// `end_w` (interp_sre.py:763-766).
+/// `end_w` (interp_sre.py).
 fn sre_match_end(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
     let (_, end) = do_span(m, args.get(1).copied())?;
     Ok(w_int_new(end))
 }
 
-/// `span_w` (interp_sre.py:768-771).
+/// `span_w` (interp_sre.py).
 fn sre_match_span(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
     let (start, end) = do_span(m, args.get(1).copied())?;
     Ok(w_tuple_new(vec![w_int_new(start), w_int_new(end)]))
 }
 
-/// `descr_getitem` (interp_sre.py:704-706) — `m[index]` resolves the
+/// `descr_getitem` (interp_sre.py) — `m[index]` resolves the
 /// single group's span and slices the subject string.
 fn sre_match_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
@@ -1875,7 +1875,7 @@ fn sre_match_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(unsafe { slice_w(m, span, w_none()) })
 }
 
-/// `expand_w` (interp_sre.py:753-757) — substitute the parsed template
+/// `expand_w` (interp_sre.py) — substitute the parsed template
 /// against this match.  Upstream delegates to `re._expand`; pyre expands
 /// natively since it owns the template parser.
 fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1906,7 +1906,7 @@ fn sre_match_expand(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(finish_output(subj, out))
 }
 
-/// `repr_w` (interp_sre.py:684-699) — `<re.Match object; span=(s, e),
+/// `repr_w` (interp_sre.py) — `<re.Match object; span=(s, e),
 /// match=R>` with `R` the repr of the whole match truncated to 50
 /// characters.  Positions are character offsets for a `str` subject and
 /// byte offsets for a bytes-like subject (the sre-engine driver's units).
@@ -1948,7 +1948,7 @@ fn sre_match_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     ))
 }
 
-/// `copy_identity_w` (interp_sre.py:701-702) — match results are
+/// `copy_identity_w` (interp_sre.py) — match results are
 /// immutable, so `__copy__`/`__deepcopy__` return self.
 fn sre_match_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_self(args)?;
@@ -1982,7 +1982,7 @@ const SRE_FLAG_NAMES: [&str; 9] = [
     "re.ASCII",
 ];
 
-/// `repr_w` (interp_sre.py:153-178) — `re.compile(<pattern repr>, <flags>)`
+/// `repr_w` (interp_sre.py) — `re.compile(<pattern repr>, <flags>)`
 /// with the pattern repr truncated to 200 characters and the flag bits
 /// decoded into their `re.*` names (the implicit `re.UNICODE` on a known
 /// unicode pattern is suppressed, :160-165).
@@ -2025,7 +2025,7 @@ fn sre_pattern_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     ))
 }
 
-/// `descr_eq` (interp_sre.py:180-190): compare flags, compiled code, and
+/// `descr_eq` (interp_sre.py): compare flags, compiled code, and
 /// original pattern; groupindex/indexgroup are derived from the pattern.
 fn sre_pattern_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let pat = sre_pattern_self(args)?;
@@ -2044,7 +2044,7 @@ fn sre_pattern_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     ))
 }
 
-/// `descr_hash` (interp_sre.py:193-199): hash the compiled code, flags,
+/// `descr_hash` (interp_sre.py): hash the compiled code, flags,
 /// and original pattern in the same structural order as PyPy.
 fn sre_pattern_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let pat = sre_pattern_self(args)?;
@@ -2058,7 +2058,7 @@ fn sre_pattern_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(w_int_new(x))
 }
 
-/// `copy_identity_w` (interp_sre.py:150-151) — compiled patterns are
+/// `copy_identity_w` (interp_sre.py) — compiled patterns are
 /// immutable, so `__copy__`/`__deepcopy__` return self.
 fn sre_pattern_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let pat = sre_pattern_self(args)?;
@@ -2079,7 +2079,7 @@ fn sre_scanner_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     }
 }
 
-/// `W_SRE_Scanner.getmatch` (interp_sre.py:935-947) — advance the scanner
+/// `W_SRE_Scanner.getmatch` (interp_sre.py) — advance the scanner
 /// one step and build the match.  `anchored` selects `py_match` (the
 /// `match` method) over `search` (`__next__` / `search`).  Returns
 /// `Ok(None)` and marks the scanner exhausted (`self.ctx = None`) when no
@@ -2149,7 +2149,7 @@ pub unsafe fn sre_scanner_release_export(obj: PyObjectRef) {
     }
 }
 
-/// `next_w` (interp_sre.py:918-923) — also the host `space.next` step for
+/// `next_w` (interp_sre.py) — also the host `space.next` step for
 /// `for m in pat.finditer(...)`; raises StopIteration when exhausted.
 pub fn sre_scanner_next(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     match sre_scanner_step(obj, false)? {
@@ -2158,7 +2158,7 @@ pub fn sre_scanner_next(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
     }
 }
 
-/// `iter_w` (interp_sre.py:915-916) — returns self.
+/// `iter_w` (interp_sre.py) — returns self.
 fn sre_scanner_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     sre_scanner_self(args)
 }
@@ -2168,14 +2168,14 @@ fn sre_scanner_next_w(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     sre_scanner_next(self_)
 }
 
-/// `match_w` (interp_sre.py:925-928) — anchored match at the current
+/// `match_w` (interp_sre.py) — anchored match at the current
 /// position; returns None when exhausted instead of raising.
 fn sre_scanner_match(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = sre_scanner_self(args)?;
     Ok(sre_scanner_step(self_, true)?.unwrap_or_else(w_none))
 }
 
-/// `search_w` (interp_sre.py:930-933) — search from the current position;
+/// `search_w` (interp_sre.py) — search from the current position;
 /// returns None when exhausted instead of raising.
 fn sre_scanner_search(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = sre_scanner_self(args)?;

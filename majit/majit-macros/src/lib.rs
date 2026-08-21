@@ -1,14 +1,14 @@
 /// Proc macros for the majit JIT framework.
 ///
 /// rpython/rlib/jit.py decorator equivalents:
-/// - #[elidable]: rlib/jit.py:13 — Mark a function as pure (constant-foldable)
-/// - #[elidable_promote]: rlib/jit.py:180 — Elidable + auto-promote args
-/// - #[dont_look_inside]: rlib/jit.py:132 — Prevent tracing into a function
-/// - #[unroll_safe]: rlib/jit.py:150 — Safe to unroll loops
-/// - #[loop_invariant]: rlib/jit.py:161 — Loop-invariant function
-/// - #[not_in_trace]: rlib/jit.py:260 — Disappears from final assembler
-/// - #[always_inline]: objectmodel.py:174 — Backend optimizer must inline
-/// - #[not_rpython]: objectmodel.py:267 — Reject from RPython flow graphs
+/// - #[elidable]: rlib/jit.py — Mark a function as pure (constant-foldable)
+/// - #[elidable_promote]: rlib/jit.py — Elidable + auto-promote args
+/// - #[dont_look_inside]: rlib/jit.py — Prevent tracing into a function
+/// - #[unroll_safe]: rlib/jit.py — Safe to unroll loops
+/// - #[loop_invariant]: rlib/jit.py — Loop-invariant function
+/// - #[not_in_trace]: rlib/jit.py — Disappears from final assembler
+/// - #[always_inline]: objectmodel.py — Backend optimizer must inline
+/// - #[not_rpython]: objectmodel.py — Reject from RPython flow graphs
 ///
 /// majit-specific extensions:
 /// - #[jit_driver]: Annotate an interpreter's main dispatch loop
@@ -486,15 +486,15 @@ fn helper_call_target_fn_name(path: &Path) -> syn::Result<Ident> {
 /// `rg <attribute>_<NAME>` finds the parity counterpart in both pyre
 /// and PyPy.  RPython source citations:
 ///
-/// * `_elidable_function_` — `rlib/jit.py:72` `@elidable`,
+/// * `_elidable_function_` — `rlib/jit.py` `@elidable`,
 ///   `@elidable_promote()`.  pyre's `_cannot_raise` / `_or_memerror`
 ///   variants are codewriter-derived effect classes that all start
 ///   from the same `_elidable_function_` attribute upstream
-///   (`call.py:292-299` 3-way pick on `_canraise(op)`).
-/// * `_jit_look_inside_` — `rlib/jit.py:139` `@dont_look_inside`
+///   (`call.py` 3-way pick on `_canraise(op)`).
+/// * `_jit_look_inside_` — `rlib/jit.py` `@dont_look_inside`
 ///   (`= False`); `:148` `@look_inside` (`= True`).
-/// * `_jit_loop_invariant_` — `rlib/jit.py:169` `@loop_invariant`.
-/// * `_jit_unroll_safe_` — `rlib/jit.py:159` `@unroll_safe`.
+/// * `_jit_loop_invariant_` — `rlib/jit.py` `@loop_invariant`.
+/// * `_jit_unroll_safe_` — `rlib/jit.py` `@unroll_safe`.
 ///
 /// `_call_aroundstate_target_` (`rffi.py:228`) is emitted separately
 /// in `expand_call_surface_attr` because it carries a 2-tuple
@@ -583,7 +583,7 @@ fn rpython_attribute_const_for(
         ],
         "look_inside" => &[("_jit_look_inside_", true, false)],
         "jit_loop_invariant" => &[("_jit_loop_invariant_", true, false)],
-        // `rlib/jit.py:151 def unroll_safe` emits no policy fn, so a
+        // `rlib/jit.py def unroll_safe` emits no policy fn, so a
         // sibling const would be rejected in a trait impl — `unroll_safe`
         // decorates those (`majit-macros/tests/macros.rs` `NameCollider`).
         // It stays free-fn-only here and reaches methods through the
@@ -853,7 +853,7 @@ fn helper_policy_tokens_for_fn(
     // the parent `#[jit_interp]` lowerer's inferred-policy site
     // (`jitcode_lower.rs::CallPolicySpec::Infer`) skips the call.
     // `save_err` carries the parsed `#[jit_release_gil(save_err = N)]`
-    // value (`rffi.py:62-71` flag bits, default `RFFI_ERR_NONE = 0`)
+    // value (`rffi.py` flag bits, default `RFFI_ERR_NONE = 0`)
     // for the wrapped release-gil lowering's
     // `add_call_target_with_save_err`; non-release-gil arms emit `0i32`.
     use jit_interp::call_policy_byte::{
@@ -869,7 +869,7 @@ fn helper_policy_tokens_for_fn(
             "dont_look_inside" => quote! {
                 (#VOID_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
-            // `call.py:303 getcalldescr`'s non-elidable `else` branch —
+            // `call.py getcalldescr`'s non-elidable `else` branch —
             // EF_CANNOT_RAISE for void-return helpers.  Same dispatch
             // surface as `dont_look_inside` (residual call), but the
             // recording walker uses `cannot_raise_effect_info()` so no
@@ -890,11 +890,11 @@ fn helper_policy_tokens_for_fn(
             "elidable" => quote! {
                 (#INT_ELIDABLE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
-            // call.py:299 elidable && _canraise(op) == False — EF_ELIDABLE_CANNOT_RAISE.
+            // call.py elidable && _canraise(op) == False — EF_ELIDABLE_CANNOT_RAISE.
             "elidable_cannot_raise" => quote! {
                 (#INT_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
-            // call.py:295 elidable && _canraise(op) == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
+            // call.py elidable && _canraise(op) == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
             "elidable_or_memerror" => quote! {
                 (#INT_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
             },
@@ -1002,7 +1002,7 @@ fn emit_helper_policy_fn(
     // The trailing `i32` carries the wrapper
     // callable's `_call_aroundstate_target_[1]` (`save_err`) per
     // `rffi.py:228`; non-`release_gil` policies emit `0i32`
-    // (`RFFI_ERR_NONE`, `rffi.py:80`).
+    // (`RFFI_ERR_NONE`, `rffi.py`).
     Ok(quote! {
         #[doc(hidden)]
         #[allow(non_snake_case)]
@@ -1259,7 +1259,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Mark a function as elidable (pure / constant-foldable).
 ///
 /// The JIT can eliminate calls to this function when all arguments are constants.
-/// `rlib/jit.py:72 elidable` sets `_elidable_function_ = True` and nothing else;
+/// `rlib/jit.py elidable` sets `_elidable_function_ = True` and nothing else;
 /// the flag travels here as the marker const `rpython_attribute_const_for`
 /// emits, which `front/llbc_hints.rs` harvests from the extracted LLBC, and the
 /// constant fold reaches the separate `__majit_call_target_*` trampoline. None
@@ -1267,7 +1267,7 @@ pub fn jit_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// The backend inliner it leaves free is nonetheless a much narrower one than
 /// LLVM's, and that is why `#[inline(never)]` stays below. `auto_inlining`
-/// stops a graph at `weight >= threshold` (`backendopt/inline.py:654`) with
+/// stops a graph at `weight >= threshold` (`backendopt/inline.py`) with
 /// `weight = 0.9999 * measure_median_execution_cost(graph) +
 /// static_instruction_count(graph)` (`:539 inlining_heuristic`, a hard reject
 /// at `count >= 200`), counting roughly one per lltype operation
@@ -1316,19 +1316,19 @@ pub fn purefunction(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_elidable_attribute(item, "elidable")
 }
 
-/// `#[elidable_cannot_raise]` — `call.py:299 getcalldescr`'s
+/// `#[elidable_cannot_raise]` — `call.py getcalldescr`'s
 /// `else` branch (`_canraise(op) == False`).  Maps to
 /// `EF_ELIDABLE_CANNOT_RAISE` (`effectinfo.py:17`).  The canonical
-/// walker (`pyjitpl.py:2126 do_residual_call`) records `CALL_PURE_*`
+/// walker (`pyjitpl.py do_residual_call`) records `CALL_PURE_*`
 /// without the trailing `GUARD_NO_EXCEPTION` because
-/// `effectinfo.check_can_raise(False)` (`effectinfo.py:236`) is false
+/// `effectinfo.check_can_raise(False)` (`effectinfo.py`) is false
 /// for `extraeffect == 0`.
 #[proc_macro_attribute]
 pub fn elidable_cannot_raise(_attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_elidable_attribute(item, "elidable_cannot_raise")
 }
 
-/// `#[elidable_or_memerror]` — `call.py:295 getcalldescr`'s
+/// `#[elidable_or_memerror]` — `call.py getcalldescr`'s
 /// `cr == "mem"` branch.  Maps to `EF_ELIDABLE_OR_MEMORYERROR`
 /// (`effectinfo.py:20`).  Same dispatch as `#[elidable]` (the
 /// trailing `GUARD_NO_EXCEPTION` is recorded — `check_can_raise(False)`
@@ -1396,7 +1396,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
 /// Mark a function as opaque to the tracer.
 ///
 /// The JIT will not trace into this function; it will be called as a black box.
-/// `rlib/jit.py:133-140 @dont_look_inside` — sets `_jit_look_inside_ = False`
+/// `rlib/jit.py @dont_look_inside` — sets `_jit_look_inside_ = False`
 /// (line 139) and nothing else.  This expansion carries that flag as the
 /// `_jit_look_inside_` marker const `rpython_attribute_const_for` emits next
 /// to the function; `front/llbc_hints.rs` harvests it out of the extracted LLBC
@@ -1410,7 +1410,7 @@ pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Make sure the JIT traces inside the decorated function, even if
 /// the rest of the module is not visible to the JIT.
 ///
-/// `rlib/jit.py:142-150 @look_inside` — sets `_jit_look_inside_ =
+/// `rlib/jit.py @look_inside` — sets `_jit_look_inside_ =
 /// True` (line 148).  The RPython body also issues a deprecation
 /// warning (line 147); pyre omits the warning because Rust callers
 /// pick the attribute at compile time rather than at import time.
@@ -1446,7 +1446,7 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// `#[dont_look_inside_cannot_raise]` — non-elidable opaque helper that
 /// the user statically guarantees does not raise.  Maps to
-/// `EF_CANNOT_RAISE` (`call.py:303 getcalldescr`'s non-elidable `else`
+/// `EF_CANNOT_RAISE` (`call.py getcalldescr`'s non-elidable `else`
 /// branch), so the recording walker skips the trailing `-live-` marker
 /// and the produced calldescr's `EffectInfo` matches PyPy's
 /// `cannot_raise_effect_info()`.
@@ -1533,9 +1533,9 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     //
     // `#[elidable]` keeps its `#[inline(never)]` and this family drops it, and
     // the split follows upstream's inlining budget rather than the attribute.
-    // `DEFL_INLINE_THRESHOLD = 32.4` (`config/translationoption.py:11-12`) is
+    // `DEFL_INLINE_THRESHOLD = 32.4` (`config/translationoption.py`) is
     // "just enough to inline add__Int_Int()" — on the order of sixteen lltype
-    // operations, since `inline.py:539 inlining_heuristic` charges a
+    // operations, since `inline.py inlining_heuristic` charges a
     // straight-line graph both its static count and its median execution cost.
     // This family sits inside that budget —
     // `gc_roots::shadow_stack_len` is one call, `pyopcode::label_arg_to_usize`
@@ -1689,7 +1689,7 @@ pub fn jit_may_force(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// save_err=N)` (`rffi.py:80`); the parsed integer flows into the
 /// policy tuple's `save_err` slot, matching the second element of
 /// `_call_aroundstate_target_ = (funcptr, save_err)` (`rffi.py:228`).
-/// Default is `RFFI_ERR_NONE = 0` (`rffi.py:71`).
+/// Default is `RFFI_ERR_NONE = 0` (`rffi.py`).
 #[proc_macro_attribute]
 pub fn jit_release_gil(attr: TokenStream, item: TokenStream) -> TokenStream {
     let save_err = if attr.is_empty() {
@@ -1713,7 +1713,7 @@ pub fn jit_loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream 
 ///
 /// RPython name parity alias for `#[jit_loop_invariant]`.
 ///
-/// rlib/jit.py:161 — `@loop_invariant`: describes a function with no argument
+/// rlib/jit.py — `@loop_invariant`: describes a function with no argument
 /// that returns an object that is always the same in a loop.
 /// Implies `@dont_look_inside`.
 #[proc_macro_attribute]
@@ -1722,7 +1722,7 @@ pub fn loop_invariant(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Parse `save_err = N` from `#[jit_release_gil(...)]` arguments.
-/// Mirrors `rffi.llexternal(..., save_err=...)` kwarg (`rffi.py:80`).
+/// Mirrors `rffi.llexternal(..., save_err=...)` kwarg (`rffi.py`).
 fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32> {
     use syn::{Lit, MetaNameValue, Token};
     let parser = syn::punctuated::Punctuated::<MetaNameValue, Token![,]>::parse_terminated;
@@ -1778,7 +1778,7 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
 /// }
 /// ```
 ///
-/// Entries carry the `rclass.py:644-678 _parse_field_list` suffixes
+/// Entries carry the `rclass.py _parse_field_list` suffixes
 /// (`?` quasi-immutable, `[*]` immutable array); a bare identifier is
 /// accepted as shorthand for a plain immutable field.
 ///
@@ -1798,7 +1798,7 @@ pub fn jit_immutable_fields(attr: TokenStream, item: TokenStream) -> TokenStream
     let item_struct = parse_macro_input!(item as syn::ItemStruct);
     let vis = &item_struct.vis;
     let const_name = format_ident!("_immutable_fields_{}", item_struct.ident);
-    // `rclass.py:644-678 _parse_field_list` splits the declared list into
+    // `rclass.py _parse_field_list` splits the declared list into
     // (name, rank) pairs; the marker carries the list verbatim and the
     // harvester does the splitting, so the suffix grammar stays in one
     // place (`majit_translate::model::ImmutableRank::parse`).
@@ -1844,7 +1844,7 @@ impl Parse for ImmutableFieldList {
 
 /// Mark a method (or free function) as elidable / pure.
 ///
-/// RPython parity: `@jit.elidable` (`rpython/rlib/jit.py:13`). The JIT
+/// RPython parity: `@jit.elidable` (`rpython/rlib/jit.py`). The JIT
 /// can fold calls to this function once all arguments are constant.
 ///
 /// Companion to the existing `#[elidable]` attribute, with two
@@ -1989,7 +1989,7 @@ pub fn always_inline(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// RPython treats this value as truthy when selecting zero-cost inline
 /// candidates, but unlike literal `True` it does not turn a failed inline into
-/// `CannotInline` (`translator/backendopt/inline.py:703-709`).
+/// `CannotInline` (`translator/backendopt/inline.py`).
 #[proc_macro_attribute]
 pub fn always_inline_try(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_ts = proc_macro2::TokenStream::from(item);
@@ -2096,7 +2096,7 @@ pub fn not_rpython(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// JIT can safely unroll loops in this function and this will
 /// not lead to code explosion.
 ///
-/// rlib/jit.py:150 — `@unroll_safe`.
+/// rlib/jit.py — `@unroll_safe`.
 /// Cannot be combined with `#[elidable]` or `#[dont_look_inside]`.
 #[proc_macro_attribute]
 pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -2105,7 +2105,7 @@ pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &func.vis;
     let sig = &func.sig;
     let block = &func.block;
-    // RPython attribute-name parity: `rlib/jit.py:159 func._jit_unroll_safe_
+    // RPython attribute-name parity: `rlib/jit.py func._jit_unroll_safe_
     // = True`.  `front/llbc_hints.rs` harvests `_jit_unroll_safe_<NAME>` and
     // nothing else; the marker this used to leave in the body was spelled
     // `_MAJIT_UNROLL_SAFE`, carrying neither the prefix nor the function
@@ -2146,7 +2146,7 @@ pub fn unroll_safe(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// interpreted mode, and by the jit tracing and blackholing, but not
 /// by the final assembler.
 ///
-/// rlib/jit.py:260 — `@not_in_trace`.
+/// rlib/jit.py — `@not_in_trace`.
 #[proc_macro_attribute]
 pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -2154,7 +2154,7 @@ pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &func.vis;
     let sig = &func.sig;
     let block = &func.block;
-    // RPython attribute-name parity: `rlib/jit.py:261 func.oopspec =
+    // RPython attribute-name parity: `rlib/jit.py func.oopspec =
     // "jit.not_in_trace()"`.  Emit a module-level `pub const
     // oopspec_<NAME>: &'static str` next to the wrapper so `rg oopspec_`
     // finds the parity counterpart in both pyre and PyPy.  Skip for
@@ -2191,7 +2191,7 @@ pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// A decorator that promotes all arguments and then calls the supplied
 /// elidable function.
 ///
-/// rlib/jit.py:180 — `@elidable_promote(promote_args='all')`.
+/// rlib/jit.py — `@elidable_promote(promote_args='all')`.
 ///
 /// Deprecated alias for `#[elidable_promote]`.
 ///
@@ -2243,7 +2243,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
     let orig_name = format_ident!("_orig_{}_unlikely_name", fn_name);
     let output = &sig.output;
 
-    // Collect param info (rlib/jit.py:186 _get_args — includes self if method)
+    // Collect param info (rlib/jit.py _get_args — includes self if method)
     let mut param_names: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut full_params: Vec<syn::FnArg> = Vec::new();
     let mut named_args: Vec<Ident> = Vec::new();
@@ -2264,13 +2264,13 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // rlib/jit.py:191-194 — promote each selected arg with both hints.
+    // rlib/jit.py — promote each selected arg with both hints.
     // promote_indices index into full arg list (including self), matching _get_args.
     let promote_stmts: Vec<_> = promote_indices
         .iter()
         .filter_map(|&idx| {
             if has_self && idx == 0 {
-                // rlib/jit.py:193 — promote self by identity (guard_value on pointer)
+                // rlib/jit.py — promote self by identity (guard_value on pointer)
                 Some(quote! {
                     let _ = majit_metainterp::jit::promote(self as *const _ as usize);
                 })
@@ -2321,7 +2321,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error().into(),
     };
 
-    // `rlib/jit.py:185 elidable(func)` — the ORIGINAL `func` is what
+    // `rlib/jit.py elidable(func)` — the ORIGINAL `func` is what
     // receives `_elidable_function_ = True`; `result` (the returned
     // wrapper, see jit.py:198-201) does NOT carry the attribute.  In
     // pyre's layout `func` becomes the hidden `_orig_<NAME>_unlikely_
@@ -2341,7 +2341,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
-        // rlib/jit.py:184-185 — elidable(func); original body hidden
+        // rlib/jit.py — elidable(func); original body hidden
         #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
@@ -2391,7 +2391,7 @@ impl Parse for ElidablePromoteArgs {
 /// but instead during translation, rewrites it according to the handler in
 /// the codewriter/jtransform.
 ///
-/// rlib/jit.py:250 — `@oopspec(spec)`.
+/// rlib/jit.py — `@oopspec(spec)`.
 ///
 /// Usage: `#[oopspec("jit.isconstant(value)")]`
 ///
@@ -2405,7 +2405,7 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let spec_value = spec.value();
-    // RPython attribute-name parity: `rlib/jit.py:255 func.oopspec =
+    // RPython attribute-name parity: `rlib/jit.py func.oopspec =
     // spec`.  Emit a module-level `pub const oopspec_<NAME>: &'static str
     // = spec` next to the wrapper.  Skip for methods (`self`-receiver) —
     // see `rpython_attribute_const_for`'s receiver guard for the same
@@ -2441,7 +2441,7 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Look inside (including unrolling loops) the target function, if and only if
 /// `predicate(args)` returns true.
 ///
-/// rlib/jit.py:208 — `@look_inside_iff(predicate)`.
+/// rlib/jit.py — `@look_inside_iff(predicate)`.
 ///
 /// Generates three functions:
 /// 1. `_orig_<name>` — original body, marked `#[unroll_safe]` (hidden)
@@ -2461,14 +2461,14 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &func.sig;
     let block = &func.block;
     let fn_name = &sig.ident;
-    // rlib/jit.py:213 — func = unroll_safe(func)
+    // rlib/jit.py — func = unroll_safe(func)
     let orig_name = format_ident!("_orig_{}", fn_name);
-    // rlib/jit.py:232 — trampoline.__name__ = func.__name__ + "_trampoline"
+    // rlib/jit.py — trampoline.__name__ = func.__name__ + "_trampoline"
     let trampoline_name = format_ident!("{}_trampoline", fn_name);
     let output = &sig.output;
 
     // Collect parameter patterns and call argument expressions.
-    // rlib/jit.py:221 args = _get_args(func) — includes `self` if method.
+    // rlib/jit.py args = _get_args(func) — includes `self` if method.
     let mut full_params: Vec<syn::FnArg> = Vec::new();
     let mut call_args: Vec<proc_macro2::TokenStream> = Vec::new();
     for arg in &sig.inputs {
@@ -2488,7 +2488,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let expanded = quote! {
-        // rlib/jit.py:213-214 — func = unroll_safe(func)
+        // rlib/jit.py — func = unroll_safe(func)
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         fn #orig_name(#(#full_params),*) #output {
@@ -2498,7 +2498,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
             #block
         }
 
-        // rlib/jit.py:231-233 — @dont_look_inside def trampoline(...): return func(...)
+        // rlib/jit.py — @dont_look_inside def trampoline(...): return func(...)
         #[inline(never)]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
@@ -2666,7 +2666,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             __builder.finish()
         }
 
-        // RPython `pyjitpl.py:2255 finish_setup` order: pre-register
+        // RPython `pyjitpl.py finish_setup` order: pre-register
         // the helper's per-marker `-live-` triples into the driver-
         // shared `Assembler` at install time so the trace-time
         // `__builder.finalize_liveness(__asm)` above only dedups
@@ -2759,7 +2759,7 @@ pub fn jit_interp(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Register a Rust struct with `majit_ir::descr::GcCache`.
 ///
-/// RPython parity: descr.py:105-127 `get_size_descr` + descr.py:218-239
+/// RPython parity: descr.py `get_size_descr` + descr.py
 /// `get_field_descr`. RPython's translator auto-discovers `lltype.Struct`
 /// fields and emits FieldDescr/SizeDescr; this macro performs the same
 /// auto-discovery for Rust structs using `offset_of!` / `size_of`.
@@ -2780,7 +2780,7 @@ pub fn jit_struct(attr: TokenStream, item: TokenStream) -> TokenStream {
 const JIT_HELPER_ATTRS: &[&str] = &[
     "jit_inline",
     "elidable",
-    // call.py:292-299 _canraise(op) 3-way pick on the elidable branch.
+    // call.py _canraise(op) 3-way pick on the elidable branch.
     "elidable_cannot_raise",
     "elidable_or_memerror",
     "elidable_promote",
@@ -2804,8 +2804,8 @@ const JIT_HELPER_ATTRS: &[&str] = &[
     "jit_may_force",
     "jit_release_gil",
     "jit_loop_invariant",
-    // `rlib/jit.py:75-78` — `@purefunction` is a deprecated alias for
-    // `@elidable`; `@purefunction_promote` (`jit.py:203-205`) likewise
+    // `rlib/jit.py` — `@purefunction` is a deprecated alias for
+    // `@elidable`; `@purefunction_promote` (`jit.py`) likewise
     // for `@elidable_promote`.  Listed here so `#[jit_module]` discovery
     // recognises the alias decorators when callers use the deprecated
     // name.

@@ -489,7 +489,7 @@ mod tests {
         names
     }
 
-    // test_vfs.py:22 test_dir
+    // test_vfs.py test_dir
     #[test]
     fn test_dir() {
         let mut entries: IndexMap<String, FsNode> = IndexMap::new();
@@ -513,7 +513,7 @@ mod tests {
         assert!(!d.access(W_OK).unwrap());
     }
 
-    // test_vfs.py:36 test_file
+    // test_vfs.py test_file
     #[test]
     fn test_file() {
         let f = File::new("hello world");
@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(errno_of(v.join("subdir1/subfile1")), ENOENT);
     }
 
-    // test_vfs.py:100 test_realdir_exclude — case-insensitive suffix exclusion.
+    // test_vfs.py test_realdir_exclude — case-insensitive suffix exclusion.
     #[test]
     fn test_realdir_exclude() {
         let tmp = tempfile::tempdir().unwrap();

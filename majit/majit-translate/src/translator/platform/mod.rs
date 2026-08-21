@@ -12,7 +12,7 @@ use std::process::Command;
 
 use crate::translator::tool::taskengine::TaskError;
 
-/// Port of upstream `CompilationError` (`__init__.py:13-26`).
+/// Port of upstream `CompilationError` (`__init__.py`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompilationError {
     pub out: String,
@@ -50,7 +50,7 @@ impl std::error::Error for CompilationError {}
 /// dict-shaped equivalent here.
 pub type EnvMapping = HashMap<String, String>;
 
-/// Port of upstream `ExecutionResult` (`__init__.py:25-33`).
+/// Port of upstream `ExecutionResult` (`__init__.py`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionResult {
     pub returncode: i32,
@@ -69,7 +69,7 @@ impl ExecutionResult {
 }
 
 /// Minimal slice of upstream ExternalCompilationInfo used by
-/// `Platform.execute(..., compilation_info=...)` (`__init__.py:96-101`).
+/// `Platform.execute(..., compilation_info=...)` (`__init__.py`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompilationInfo {
     pub library_dirs: Vec<PathBuf>,
@@ -89,7 +89,7 @@ impl Platform {
         }
     }
 
-    /// Port of upstream `Platform.execute` (`__init__.py:82-106`).
+    /// Port of upstream `Platform.execute` (`__init__.py`).
     pub fn execute(
         &self,
         executable: impl AsRef<Path>,

@@ -152,7 +152,7 @@ pub fn set_revdb_protected() -> Vec<String> {
         .collect()
 }
 
-/// RPython `prepare_database(db)` (`revdb/gencsupp.py:127-162`).
+/// RPython `prepare_database(db)` (`revdb/gencsupp.py`).
 ///
 /// Deferred port. Upstream reads `db.translator.revdb_commands` (the dict
 /// populated by `rlib/revdb.py register_debug_command`), resolves each

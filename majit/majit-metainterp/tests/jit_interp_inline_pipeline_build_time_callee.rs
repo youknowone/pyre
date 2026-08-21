@@ -6,7 +6,7 @@
 //! (`jitcode_lower/lower_value.rs`). Unlike the `inline_*` policies, the
 //! returned jitcode is not built here: it comes out of a table the host
 //! serialized after running the codewriter, so it already carries the
-//! `jitcode.index` its own operands are written against (`codewriter.py:68`).
+//! `jitcode.index` its own operands are written against (`codewriter.py`).
 //!
 //! That index is the whole point of this fixture. Installing the dispatch
 //! JitCode flattens everything it can inline-call into the flat registry

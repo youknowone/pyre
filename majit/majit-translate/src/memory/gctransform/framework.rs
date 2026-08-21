@@ -12,7 +12,7 @@
 //!
 //! (`framework.py:790, 853, 901, 908, 971, 1022, 1050, 1150, …` — about thirty
 //! pairs).  The live set is never written by hand either:
-//! `get_livevars_for_roots` (`framework.py:1501`) takes `hop.livevars_after_op()`
+//! `get_livevars_for_roots` (`framework.py`) takes `hop.livevars_after_op()`
 //! straight off the flow graph, and for a moving GC deliberately drops the
 //! current operation's own arguments — *"moving GCs don't borrow, so the caller
 //! does not need to keep the arguments alive"*.

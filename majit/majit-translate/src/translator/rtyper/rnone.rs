@@ -5,16 +5,16 @@
 //!
 //! | upstream | Rust mirror |
 //! |---|---|
-//! | `class NoneRepr(Repr)` (`rnone.py:10-31`) | [`NoneRepr`] |
-//! | `none_repr = NoneRepr()` singleton (`rnone.py:33`) | [`none_repr`] |
-//! | `SomeNone.rtyper_makerepr / rtyper_makekey` (`rnone.py:35-40`) | wired in [`super::rmodel::rtyper_makerepr`] + [`super::rmodel::rtyper_makekey`] |
-//! | `ll_none_hash` (`rnone.py:42-43`) | [`ll_none_hash`] |
-//! | `rtype_is_None(robj1, rnone2, hop, pos=0)` (`rnone.py:66-84`) | [`rtype_is_None`] |
+//! | `class NoneRepr(Repr)` (`rnone.py`) | [`NoneRepr`] |
+//! | `none_repr = NoneRepr()` singleton (`rnone.py`) | [`none_repr`] |
+//! | `SomeNone.rtyper_makerepr / rtyper_makekey` (`rnone.py`) | wired in [`super::rmodel::rtyper_makerepr`] + [`super::rmodel::rtyper_makekey`] |
+//! | `ll_none_hash` (`rnone.py`) | [`ll_none_hash`] |
+//! | `rtype_is_None(robj1, rnone2, hop, pos=0)` (`rnone.py`) | [`rtype_is_None`] |
 //!
 //! ## Wired through the pairtype dispatcher
 //!
 //! * `class __extend__(pairtype(Repr, NoneRepr))` + `pairtype(NoneRepr,
-//!   Repr)` `convert_from_to` / `rtype_is_` (rnone.py:46-64) — wired via
+//!   Repr)` `convert_from_to` / `rtype_is_` (rnone.py) — wired via
 //!   [`super::pairtype::pair_convert_from_to`] +
 //!   [`super::pairtype::pair_rtype_is_`] dispatchers calling
 //!   [`pair_any_none_convert_from_to`], [`pair_none_any_convert_from_to`],
@@ -30,10 +30,10 @@
 //! ## Deferred to follow-up commits
 //!
 //! * `get_ll_eq_function` / `get_ll_hash_function` /
-//!   `get_ll_fasthash_function` (rnone.py:22-28) — the [`Repr`] trait
+//!   `get_ll_fasthash_function` (rnone.py) — the [`Repr`] trait
 //!   does not yet carry these slots; they land with the `rdict.py`
 //!   port that consumes them.
-//! * `Address` branch of [`rtype_is_None`] (rnone.py:70-73) — requires
+//! * `Address` branch of [`rtype_is_None`] (rnone.py) — requires
 //!   `lltype.Address` + `adr_eq` + `robj1.null_instance()` which have no
 //!   Rust counterpart (`rpython/rtyper/lltypesystem/llmemory.py` is
 //!   unported). Marked with a structured TyperError placeholder.
@@ -47,7 +47,7 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{GenopResult, HighLevelOp};
 
-/// RPython `class NoneRepr(Repr)` (`rnone.py:10-31`).
+/// RPython `class NoneRepr(Repr)` (`rnone.py`).
 ///
 /// ```python
 /// class NoneRepr(Repr):
@@ -104,7 +104,7 @@ impl Repr for NoneRepr {
         super::pairtype::ReprClassId::NoneRepr
     }
 
-    /// RPython `NoneRepr.get_ll_eq_function(self)` (`rnone.py:22-23`):
+    /// RPython `NoneRepr.get_ll_eq_function(self)` (`rnone.py`):
     ///
     /// ```python
     /// def get_ll_eq_function(self):
@@ -123,7 +123,7 @@ impl Repr for NoneRepr {
         Ok(None)
     }
 
-    /// RPython `NoneRepr.get_ll_hash_function(self)` (`rnone.py:25-26`):
+    /// RPython `NoneRepr.get_ll_hash_function(self)` (`rnone.py`):
     ///
     /// ```python
     /// def get_ll_hash_function(self):
@@ -160,7 +160,7 @@ impl Repr for NoneRepr {
         self.get_ll_hash_function(rtyper)
     }
 
-    /// RPython `NoneRepr.rtype_bool(self, hop)` (`rnone.py:13-14`):
+    /// RPython `NoneRepr.rtype_bool(self, hop)` (`rnone.py`):
     /// `return Constant(False, Bool)`.
     ///
     /// Upstream returns a bare `Constant` with `concretetype=Bool`; no
@@ -174,19 +174,19 @@ impl Repr for NoneRepr {
     }
 
     /// RPython `NoneRepr.none_call(self, hop)` aliased via
-    /// `rtype_simple_call = none_call` (`rnone.py:16-17,30`):
+    /// `rtype_simple_call = none_call` (`rnone.py`):
     /// `raise TyperError("attempt to call constant None")`.
     fn rtype_simple_call(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(TyperError::message("attempt to call constant None"))
     }
 
-    /// RPython `NoneRepr.rtype_call_args = none_call` (`rnone.py:31`).
+    /// RPython `NoneRepr.rtype_call_args = none_call` (`rnone.py`).
     fn rtype_call_args(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(TyperError::message("attempt to call constant None"))
     }
 }
 
-/// RPython `none_repr = NoneRepr()` (`rnone.py:33`).
+/// RPython `none_repr = NoneRepr()` (`rnone.py`).
 ///
 /// Upstream keeps a module-global singleton so `r is none_repr` ==
 /// identity comparisons work throughout the typer. Pyre matches via an
@@ -198,7 +198,7 @@ pub fn none_repr() -> Arc<NoneRepr> {
     REPR.get_or_init(|| Arc::new(NoneRepr::new())).clone()
 }
 
-/// RPython `ll_none_hash(_)` (`rnone.py:42-43`):
+/// RPython `ll_none_hash(_)` (`rnone.py`):
 /// `return 0`.
 ///
 /// Returns the canonical None hash value. Upstream uses this as
@@ -209,7 +209,7 @@ pub fn ll_none_hash(_: &ConstValue) -> i64 {
     0
 }
 
-/// Synthesizes the `ll_none_hash(_)` helper graph (`rnone.py:42-43`):
+/// Synthesizes the `ll_none_hash(_)` helper graph (`rnone.py`):
 /// single block, ignores the `Void` inputarg, returns `Signed 0`.
 ///
 /// Used by [`NoneRepr::get_ll_hash_function`] via
@@ -275,7 +275,7 @@ pub(crate) fn build_ll_none_hash_helper_graph(
 ///
 /// `pos` defaults to 0 upstream; Rust callers pass `0` for
 /// `pairtype(Repr, NoneRepr).rtype_is_` and `1` for
-/// `pairtype(NoneRepr, Repr).rtype_is_` (`rnone.py:54,64`).
+/// `pairtype(NoneRepr, Repr).rtype_is_` (`rnone.py`).
 #[allow(non_snake_case)]
 pub fn rtype_is_None(
     robj1: &dyn Repr,
@@ -294,7 +294,7 @@ pub fn rtype_is_None(
     }
     // upstream: `elif robj1.lowleveltype == Address`
     // (`rnone.py:65-67`). `Address` is the lltype primitive defined
-    // by `llmemory.py:649 NULL = fakeaddress(None)`; pyre carries it
+    // by `llmemory.py NULL = fakeaddress(None)`; pyre carries it
     // via `LowLevelType::Address` and its `_defl()` yields the
     // `_address::Null` default. Construct the NULL Address constant
     // through the same `_defl()` path that
@@ -379,14 +379,14 @@ pub fn rtype_is_None(
 // pairtype helpers — dispatched from [`super::pairtype`].
 //
 // Upstream defines `class __extend__(pairtype(Repr, NoneRepr))` +
-// `pairtype(NoneRepr, Repr)` at `rnone.py:46-64`. Pyre splits the two
+// `pairtype(NoneRepr, Repr)` at `rnone.py`. Pyre splits the two
 // directions into four freestanding helpers that the central
 // pair-dispatchers in `super::pairtype` call. The helper signatures
 // follow `tool/pairtype.py`: a result of `Ok(None)` means "NotImplemented"
 // so the dispatcher keeps walking pair_mro; `Ok(Some(v))` commits this
 // arm.
 
-/// RPython `pairtype(Repr, NoneRepr).convert_from_to` (rnone.py:46-49):
+/// RPython `pairtype(Repr, NoneRepr).convert_from_to` (rnone.py):
 ///
 /// ```python
 /// def convert_from_to((r_from, _), v, llops):
@@ -408,7 +408,7 @@ pub fn pair_any_none_convert_from_to(
     ))))
 }
 
-/// RPython `pairtype(NoneRepr, Repr).convert_from_to` (rnone.py:56-59):
+/// RPython `pairtype(NoneRepr, Repr).convert_from_to` (rnone.py):
 ///
 /// ```python
 /// def convert_from_to((_, r_to), v, llops):
@@ -428,7 +428,7 @@ pub fn pair_none_any_convert_from_to(
     Ok(Some(Hlvalue::Constant(constant)))
 }
 
-/// RPython `pairtype(Repr, NoneRepr).rtype_is_` (rnone.py:51-54):
+/// RPython `pairtype(Repr, NoneRepr).rtype_is_` (rnone.py):
 ///
 /// ```python
 /// def rtype_is_((robj1, rnone2), hop):
@@ -453,7 +453,7 @@ pub fn pair_any_none_rtype_is_(
     rtype_is_None(r1, &none_side, hop, 0)
 }
 
-/// RPython `pairtype(NoneRepr, Repr).rtype_is_` (rnone.py:61-64):
+/// RPython `pairtype(NoneRepr, Repr).rtype_is_` (rnone.py):
 ///
 /// ```python
 /// def rtype_is_((rnone1, robj2), hop):
@@ -475,7 +475,7 @@ pub fn pair_none_any_rtype_is_(
 }
 
 /// Constant-fold shared between `pairtype(Repr, NoneRepr).rtype_is_`
-/// and `pairtype(NoneRepr, Repr).rtype_is_` (`rnone.py:52-53,62-63`):
+/// and `pairtype(NoneRepr, Repr).rtype_is_` (`rnone.py`):
 /// `if hop.s_result.is_constant(): return hop.inputconst(Bool, const)`.
 fn rtype_is_constant_fold(hop: &HighLevelOp) -> Result<Option<Hlvalue>, TyperError> {
     let s_result = hop.s_result.borrow();
@@ -503,19 +503,19 @@ mod tests {
 
     #[test]
     fn none_repr_lowleveltype_is_void_and_repr_string_matches_upstream() {
-        // rnone.py:11 — `lowleveltype = Void`.
+        // rnone.py — `lowleveltype = Void`.
         let r = NoneRepr::new();
         assert_eq!(r.lowleveltype(), &LowLevelType::Void);
-        // rmodel.py:30 `<%s %s>` formatter — `<NoneRepr Void>`.
+        // rmodel.py `<%s %s>` formatter — `<NoneRepr Void>`.
         assert_eq!(r.repr_string(), "<NoneRepr Void>");
-        // rmodel.py:33 compact_repr — "NoneRepr" → "NoneR" replacement
+        // rmodel.py compact_repr — "NoneRepr" → "NoneR" replacement
         // followed by short_name.
         assert_eq!(r.compact_repr(), "NoneR Void");
     }
 
     #[test]
     fn none_repr_singleton_returns_same_arc() {
-        // rnone.py:33 — `none_repr = NoneRepr()` module-global; pyre
+        // rnone.py — `none_repr = NoneRepr()` module-global; pyre
         // mirrors via an `Arc<NoneRepr>` cached in OnceLock.
         let a = none_repr();
         let b = none_repr();
@@ -524,7 +524,7 @@ mod tests {
 
     #[test]
     fn none_repr_singleton_is_distinct_from_impossible_repr() {
-        // rnone.py:33 vs rmodel.py:359 — both are `Void`-typed Repr
+        // rnone.py:33 vs rmodel.py — both are `Void`-typed Repr
         // singletons but have different Python classes (NoneRepr vs
         // VoidRepr); pyre preserves the identity distinction.
         let n = none_repr();
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(r.state().get(), setupstate::Finished);
     }
 
-    /// rnone.py:25-26 — `NoneRepr.get_ll_hash_function` returns the
+    /// rnone.py — `NoneRepr.get_ll_hash_function` returns the
     /// `ll_none_hash` function. The synthesized helper graph has a
     /// single block with no operations and a closeblock returning the
     /// constant `Signed 0` directly.
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn ll_none_hash_returns_zero() {
-        // rnone.py:42-43 — `return 0`.
+        // rnone.py — `return 0`.
         assert_eq!(ll_none_hash(&ConstValue::None), 0);
         // Upstream `ll_none_hash` ignores its argument; pyre keeps the
         // same shape. Any ConstValue should produce 0.
@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn rtype_simple_call_on_none_raises_typer_error() {
-        // rnone.py:16-17 + rnone.py:30 — `rtype_simple_call = none_call`
+        // rnone.py + rnone.py — `rtype_simple_call = none_call`
         // raises `TyperError("attempt to call constant None")`.
         let r = NoneRepr::new();
         let hop = dummy_hop();
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn rtype_call_args_on_none_raises_same_typer_error() {
-        // rnone.py:31 — `rtype_call_args = none_call`.
+        // rnone.py — `rtype_call_args = none_call`.
         let r = NoneRepr::new();
         let hop = dummy_hop();
         let err = r.rtype_call_args(&hop).unwrap_err();
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn rtyper_getrepr_on_some_none_returns_the_singleton() {
-        // rnone.py:35-37 — SomeNone.rtyper_makerepr returns the module-
+        // rnone.py — SomeNone.rtyper_makerepr returns the module-
         // global `none_repr`. Verify the full dispatch chain
         // `rtyper.getrepr → rtyper_makerepr → none_repr()` keeps that
         // singleton identity intact.
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn rtype_bool_on_none_returns_constant_false() {
-        // rnone.py:13-14 — `return Constant(False, Bool)`. Pyre
+        // rnone.py — `return Constant(False, Bool)`. Pyre
         // returns `Some(Hlvalue::Constant(...))` carrying the typed
         // constant directly (no genop emitted).
         let r = NoneRepr::new();

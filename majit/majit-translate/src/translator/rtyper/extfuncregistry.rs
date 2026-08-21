@@ -1,7 +1,7 @@
 //! Port of `rpython/rtyper/extfuncregistry.py`.
 //!
 //! Deferred port: upstream additionally imports `rposix`, `rposix_stat`,
-//! `rposix_environ`, and `rtime` (`extfuncregistry.py:5-6`) for their
+//! `rposix_environ`, and `rtime` (`extfuncregistry.py`) for their
 //! `register_external` side effects, registering the os/stat/environ/time
 //! external functions. Those `rlib` modules are not ported here yet, so
 //! only the math/rfloat registrations below are present. Converge by

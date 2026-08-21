@@ -71,7 +71,7 @@ struct KnownResultEntry {
     result: OpRef,
 }
 
-/// pure.py:36-95 RecentPureOps — fixed-size ring buffer with linear scan.
+/// pure.py RecentPureOps — fixed-size ring buffer with linear scan.
 ///
 /// RPython uses a flat array of Op references, scanned linearly on lookup.
 /// At limit=16 (pureop_historylength), linear scan beats HashMap because:
@@ -92,7 +92,7 @@ impl RecentPureOps {
         }
     }
 
-    /// pure.py:41-48 — add(op): record a pure operation result.
+    /// pure.py — add(op): record a pure operation result.
     fn insert(&mut self, key: PureOpKey, result: OpRef) {
         self.lst[self.next_index] = Some((key, result));
         self.next_index += 1;
@@ -101,7 +101,7 @@ impl RecentPureOps {
         }
     }
 
-    /// pure.py:81-95 lookup(self, optimizer, op, commutative=False).
+    /// pure.py lookup(self, optimizer, op, commutative=False).
     ///
     /// Dispatches to `lookup1` / `lookup2` by arg count; any other
     /// numargs hits the upstream `assert False` because OptPure only
@@ -109,7 +109,7 @@ impl RecentPureOps {
     /// has 4 args but is emitted by `rewrite.py` after OptPure).
     ///
     /// `same_box(query, stored)` mirrors RPython's `box.same_box(other)`
-    /// (history.py:204-205, :244): identity for non-Const Boxes (the
+    /// (history.py, :244): identity for non-Const Boxes (the
     /// caller is expected to apply `get_box_replacement` to both sides
     /// first), value equality for Const subclasses. Without this hook,
     /// raw `OpRef ==` would miss CSE for two distinct constant slots
@@ -138,7 +138,7 @@ impl RecentPureOps {
         }
     }
 
-    /// pure.py:57-65 lookup1(opt, box0, descr).
+    /// pure.py lookup1(opt, box0, descr).
     ///
     /// RPython: `box0.same_box(get_box_replacement(op.getarg(0)))`.
     /// `same_box` is identity for non-constants, value equality for constants.
@@ -166,10 +166,10 @@ impl RecentPureOps {
         None
     }
 
-    /// pure.py:67-79 lookup2(opt, box0, box1, descr, commutative).
+    /// pure.py lookup2(opt, box0, box1, descr, commutative).
     ///
     /// `same_box` applies get_box_replacement internally and uses
-    /// value equality for constants (history.py:204-205 Const.same_box).
+    /// value equality for constants (history.py Const.same_box).
     fn lookup2(
         &self,
         opcode: OpCode,
@@ -338,7 +338,7 @@ pub struct OptPure {
     /// RPython keys are lists of constant boxes (value-based equality).
     /// Keys are the constant Values that _can_optimize_call_pure builds.
     call_pure_results: indexmap::IndexMap<Vec<Value>, Value>,
-    /// shortpreamble.py:124-126: PureOp.produce_op stores PreambleOp in
+    /// shortpreamble.py: PureOp.produce_op stores PreambleOp in
     /// optpure's cache. In majit, PreambleOp entries stored here are
     /// searched with forwarding-aware matching (force_preamble_op pattern).
     /// Body CSE uses `RecentPureOpTable` (the `cache` field above) — a
@@ -346,7 +346,7 @@ pub struct OptPure {
     preamble_pure_ops: Vec<PreamblePureEntry>,
 }
 
-/// shortpreamble.py:124-126: PreambleOp stored in OptPure for always-pure ops.
+/// shortpreamble.py: PreambleOp stored in OptPure for always-pure ops.
 /// Searched with forwarding-aware matching during body optimization.
 #[derive(Clone, Debug)]
 struct PreamblePureEntry {
@@ -424,19 +424,19 @@ impl OptPure {
 
     /// Try to find a cached result for this operation, considering commutativity.
     ///
-    /// pure.py:81-95 `RecentPureOps.lookup` dispatches to `lookup1` /
+    /// pure.py `RecentPureOps.lookup` dispatches to `lookup1` /
     /// `lookup2` so that arg comparison goes through `box.same_box`.
     /// Pyre's typed OpRef Eq matches `same_box` for non-constants
     /// (identity), but constants need value equality
-    /// (history.py:204-205): two distinct ConstInt slots with the same
+    /// (history.py): two distinct ConstInt slots with the same
     /// value are `same_box` true even though `OpRef ==` is false.
     fn lookup_pure(&self, key: &PureOpKey, ctx: &OptContext) -> Option<OpRef> {
         // pure.py:62 / :72-73 — `box.same_box(get_box_replacement(other))`
         // routes through `OptContext::same_box`, which walks both sides
         // through `get_box_replacement` and dispatches Const value equality
-        // for the `history.py:204-205 Const.same_box → same_constant` overload.
+        // for the `history.py Const.same_box → same_constant` overload.
         let same_box = |query: OpRef, stored: OpRef| -> bool { ctx.same_box(query, stored) };
-        // pure.py:88-93 — `commutative` is forwarded into `lookup2`,
+        // pure.py — `commutative` is forwarded into `lookup2`,
         // which checks both `(arg0, arg1)` and `(arg1, arg0)` orderings.
         let commutative = Self::is_commutative(key.opcode);
         self.cache.lookup(key, same_box, commutative)
@@ -500,7 +500,7 @@ impl OptPure {
         self.lookup_pure(&key, ctx)
     }
 
-    /// pure.py:57-65 lookup1(opt, box0, descr).
+    /// pure.py lookup1(opt, box0, descr).
     ///
     /// `same_box(a, b)`: should apply get_box_replacement to `b` and then
     /// compare — identity for ops, value equality for constants.
@@ -514,7 +514,7 @@ impl OptPure {
         self.cache.lookup1(opcode, arg0, descr_identity, same_box)
     }
 
-    /// pure.py:67-79 lookup2(opt, box0, box1, descr, commutative).
+    /// pure.py lookup2(opt, box0, box1, descr, commutative).
     pub fn lookup2(
         &self,
         opcode: OpCode,
@@ -567,7 +567,7 @@ impl OptPure {
             .unwrap_or(true)
     }
 
-    /// pure.py:50-55: RecentPureOps.force_preamble_op
+    /// pure.py: RecentPureOps.force_preamble_op
     /// Searches preamble entries with forwarding-aware arg matching.
     /// On match, forces PreambleOp (in-place replacement) and returns result.
     fn force_preamble_op(&mut self, op: &Op, ctx: &mut OptContext) -> Option<OpRef> {
@@ -582,17 +582,17 @@ impl OptPure {
             if entry.args.len() != op.num_args() {
                 continue;
             }
-            // pure.py:62 lookup1: `box0.same_box(get_box_replacement(op.getarg(0)))`.
+            // pure.py lookup1: `box0.same_box(get_box_replacement(op.getarg(0)))`.
             // Both stored and query are walked through the forwarding chain
             // via `OptContext::same_box` (pure.py:62, :72-73 +
-            // history.py:204-205 Const.same_box → same_constant).
+            // history.py Const.same_box → same_constant).
             let args_match = entry
                 .args
                 .iter()
                 .zip(op.getarglist().iter())
                 .all(|(&stored, query)| ctx.same_box(stored, query.to_opref()));
             if args_match {
-                // pure.py:50-55: force_preamble_op — isinstance check → force → replace
+                // pure.py: force_preamble_op — isinstance check → force → replace
                 if let Some(result) = entry.forced_result {
                     if Self::matches_result_type(op, result, ctx) {
                         return Some(result);
@@ -637,7 +637,7 @@ impl OptPure {
                         // constant via `make_constant` / replace_op chains
                         // still matches, mirroring `_same_args` and
                         // `preamble_pure_ops` upstream paths
-                        // (optimizer.py:343 get_box_replacement).
+                        // (optimizer.py get_box_replacement).
                         match ctx
                             .get_box_replacement_operand_opt(arg)
                             .and_then(|b| b.const_value())
@@ -667,7 +667,7 @@ impl OptPure {
     }
 
     /// Store PreambleOp in OptPure for always-pure ops.
-    /// RPython shortpreamble.py:124-126: opt.pure(op.getopnum(), PreambleOp(...))
+    /// RPython shortpreamble.py: opt.pure(op.getopnum(), PreambleOp(...))
     pub fn pure_preamble(
         &mut self,
         opcode: OpCode,
@@ -685,7 +685,7 @@ impl OptPure {
     }
 
     /// Store PreambleOp in extra_call_pure for CALL_PURE preamble imports.
-    /// RPython shortpreamble.py:122-123: optpure.extra_call_pure.append(PreambleOp(...))
+    /// RPython shortpreamble.py: optpure.extra_call_pure.append(PreambleOp(...))
     pub fn extra_call_pure_preamble(
         &mut self,
         opcode: OpCode,
@@ -702,7 +702,7 @@ impl OptPure {
             .push(ExtraCallPureEntry::Preamble { key, pop });
     }
 
-    /// pure.py:162-171 _can_reuse_oldop
+    /// pure.py _can_reuse_oldop
     ///
     /// OVF guard pairing requires that an overflow-tracking op only reuse
     /// the result of another overflow-tracking op of the same opnum (since
@@ -719,20 +719,20 @@ impl OptPure {
     ///
     /// pure.py:139-155 releases the postponed OVF op as the
     /// `DefaultOptimizationResult.op`, so `send_extra_operation`
-    /// (optimizer.py:594-612) carries it to `opt.next_optimization` —
+    /// (optimizer.py) carries it to `opt.next_optimization` —
     /// OptEarlyForce and then OptHeap — exactly like any other op OptPure
     /// passes on. Emitting it straight into `new_operations` would skip
-    /// OptHeap, whose own `emit()` override (heap.py:417-424) postpones
+    /// OptHeap, whose own `emit()` override (heap.py) postpones
     /// comparisons and flushes the pending one before the next op. Skipping
     /// it strands a preceding comparison in `OptHeap::postponed_op`, which
     /// then flushes BETWEEN the OVF op and its GUARD_NO_OVERFLOW — breaking
-    /// the adjacency `aarch64/assembler.py:1191-1195 _walk_operations`
+    /// the adjacency `aarch64/assembler.py _walk_operations`
     /// asserts and the backends rely on to read the overflow flags.
     fn emit_postponed_downstream(&mut self, postponed: Op, ctx: &mut OptContext) {
         ctx.emit_extra(ctx.current_pass_idx, postponed);
     }
 
-    /// pure.py:240-247 _same_args
+    /// pure.py _same_args
     ///
     /// Compare two argument lists with optional skip-prefixes on each side
     /// (used by COND_CALL_VALUE so its leading condition slot is not
@@ -750,7 +750,7 @@ impl OptPure {
         for (j, i) in (start_index2..).zip(start_index1..op1_args.len()) {
             // pure.py:240-247 — same_box(op1_args[i], op2_args[j])
             // applies `get_box_replacement` to both sides, then dispatches
-            // identity vs Const value equality (`history.py:204-205`).
+            // identity vs Const value equality (`history.py`).
             if !ctx.same_box(op1_args[i], op2_args[j]) {
                 return false;
             }
@@ -758,7 +758,7 @@ impl OptPure {
         true
     }
 
-    /// pure.py:249-265 optimize_call_pure_old
+    /// pure.py optimize_call_pure_old
     ///
     /// Try to fuse `op` with a previously emitted `old_op` (either an
     /// inline call_pure recorded in `call_pure_positions` or an entry from
@@ -791,7 +791,7 @@ impl OptPure {
         } else {
             0
         };
-        // pure.py:255: self._same_args(old_op, op, old_start_index, start_index)
+        // pure.py: self._same_args(old_op, op, old_start_index, start_index)
         let op_args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
         Self::_same_args(old_op_args, &op_args, old_start_index, start_index, ctx)
     }
@@ -823,7 +823,7 @@ impl OptPure {
         resolved
     }
 
-    /// optimizer.py:215-226 _can_optimize_call_pure.
+    /// optimizer.py _can_optimize_call_pure.
     ///
     /// RPython: for each arg, `get_constant_box(arg)` returns the constant
     /// value (ConstInt/ConstPtr/ConstFloat), then uses those values as the
@@ -888,7 +888,7 @@ impl Optimization for OptPure {
         // `propagate_postprocess`. Every ordinary exit now consumes it: the op
         // is collected under its demoted `CallI`/`CallR` opcode, and emission,
         // a later pass's removal and a restart all run the collected callbacks
-        // (`send_extra_operation`, optimizer.py:600-616, ends the walk on a
+        // (`send_extra_operation`, optimizer.py, ends the walk on a
         // removal but not the callbacks). What is left un-consumed is the
         // error exit — a pass reporting `InvalidLoop`, which abandons the
         // trace — so this reset is defensive rather than load-bearing.
@@ -919,7 +919,7 @@ impl Optimization for OptPure {
                 .take()
                 .expect("postponed_box is set whenever postponed_op is set");
             if op.opcode == OpCode::GuardNoOverflow {
-                // pure.py:126-136 — only call `constant_fold` when every
+                // pure.py — only call `constant_fold` when every
                 // arg has resolved to a `Const*` via `get_constant_box`
                 // (the `for...else:` gate).  Without this pre-check,
                 // `constant_fold` would panic on the now-strict
@@ -937,7 +937,7 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove; // guard also removed
                 }
 
-                // pure.py:50-55: force_preamble_op replaces the OVF op
+                // pure.py: force_preamble_op replaces the OVF op
                 // with the preamble's cached result.
                 if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
                     let b_old = postponed_box.clone();
@@ -947,7 +947,7 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove; // guard also removed
                 }
 
-                // pure.py:139-154 + 162-171 _can_reuse_oldop:
+                // pure.py + 162-171 _can_reuse_oldop:
                 // The lookup may surface a non-OVF op of the same shape
                 // (e.g. INT_ADD vs INT_ADD_OVF). _can_reuse_oldop accepts
                 // it only when the cached opnum matches our OVF opnum.
@@ -991,7 +991,7 @@ impl Optimization for OptPure {
 
                 // Resolve the args to their forwarded terminals before the op
                 // is recorded in `self.cache` under its arg identities
-                // (optimizer.py:623-625 force_box loop).
+                // (optimizer.py force_box loop).
                 for i in 0..postponed.num_args() {
                     let forced = self.force_box(&postponed.arg(i), ctx);
                     postponed.setarg(i, ctx.materialize_operand_at(forced));
@@ -1000,7 +1000,7 @@ impl Optimization for OptPure {
                 self.cache.insert(key, postponed.pos.get());
                 // pure.py:321-322: an is_ovf op followed by GUARD_NO_OVERFLOW is
                 // hoistable into the short preamble, like an is_always_pure op
-                // (pure.py:319-320). Push it so produce_potential_short_preamble_ops
+                // (pure.py). Push it so produce_potential_short_preamble_ops
                 // replays it and a loop-invariant overflow-checked op is computed
                 // once in the peeled preamble instead of every iteration.
                 self.short_preamble_pure_ops.push(postponed.clone());
@@ -1025,8 +1025,8 @@ impl Optimization for OptPure {
             return OptimizationResult::PassOn;
         }
 
-        // pure.py:211-220: RECORD_KNOWN_RESULT — record for later CALL_PURE lookup.
-        // pure.py:214: `self.known_result_call_pure.append(op)`
+        // pure.py: RECORD_KNOWN_RESULT — record for later CALL_PURE lookup.
+        // pure.py: `self.known_result_call_pure.append(op)`
         // Lookup compares descr + _same_args(known_op, query_op, 1, start_index).
         if op.opcode == OpCode::RecordKnownResult {
             if op.num_args() >= 2 {
@@ -1120,9 +1120,9 @@ impl Optimization for OptPure {
             return OptimizationResult::PassOn;
         }
 
-        // pure.py:185-228 optimize_call_pure(op, start_index)
-        // pure.py:230-234: optimize_CALL_PURE_I/R/F/N → start_index=0
-        // pure.py:236-238: optimize_COND_CALL_VALUE_I/R → start_index=1
+        // pure.py optimize_call_pure(op, start_index)
+        // pure.py: optimize_CALL_PURE_I/R/F/N → start_index=0
+        // pure.py: optimize_COND_CALL_VALUE_I/R → start_index=1
         if op.opcode.is_call_pure() || op.opcode.is_cond_call_value() {
             let start_index: usize = if op.opcode.is_cond_call_value() { 1 } else { 0 };
             let op_descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
@@ -1313,7 +1313,7 @@ impl Optimization for OptPure {
 
     /// pure.py: produce_potential_short_preamble_ops(sb)
     /// Add pure operations and CALL_PURE results to the short preamble.
-    /// shortpreamble.py:112-126: PureOp.produce_op stores PreambleOp in
+    /// shortpreamble.py: PureOp.produce_op stores PreambleOp in
     /// optpure. In RPython, produce_op accesses opt.optimizer.optpure directly.
     /// In majit, import_short_preamble_ops stores in ctx.imported_short_pure_ops,
     /// then this method transfers them into OptPure's preamble caches.
@@ -1346,10 +1346,10 @@ impl Optimization for OptPure {
             let descr_identity = entry.descr.as_ref().map(majit_ir::descr::descr_identity);
             let pop = entry.pop.clone();
             if entry.opcode.is_call_pure() || entry.opcode.is_call() {
-                // shortpreamble.py:122-123: optpure.extra_call_pure.append(PreambleOp(...))
+                // shortpreamble.py: optpure.extra_call_pure.append(PreambleOp(...))
                 self.extra_call_pure_preamble(entry.opcode, resolved_args, descr_identity, pop);
             } else {
-                // shortpreamble.py:124-126: opt.pure(opnum, PreambleOp(...))
+                // shortpreamble.py: opt.pure(opnum, PreambleOp(...))
                 self.pure_preamble(entry.opcode, resolved_args, descr_identity, pop);
             }
         }
@@ -1397,7 +1397,7 @@ mod tests {
         // Keep the source result available to use_box() exactly like the
         // imported short preamble path does after unroll import.
         if source != OpRef::NONE {
-            // PreambleOp.op carries the Box itself (shortpreamble.py:12).
+            // PreambleOp.op carries the Box itself (shortpreamble.py).
             let source_box = ctx.materialize_operand_at(source);
             // Production threads the builder's replay Rc into the pop
             // (produce_op family); mirror that here so use_box receives
@@ -2008,7 +2008,7 @@ mod tests {
     fn test_call_pure_f_n_demoted() {
         // CallPureF / CallF carry RPython `FloatOp.type = 'f'` parity
         // (resoperation.py:589). CallPureN / CallN are void-result —
-        // `AbstractResOp.type = 'v'` (resoperation.py:260) — and pyre
+        // `AbstractResOp.type = 'v'` (resoperation.py) — and pyre
         // mints them as `OpRef::VoidOp(pos)` whose `ty()` is
         // `Some(Type::Void)`.
         let mut b = crate::history::test_support::TraceBuilder::new();
@@ -2342,7 +2342,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be a gcref")]
     fn test_constant_fold_getfield_gc_does_not_treat_int_constant_as_gc_pointer() {
-        // Upstream `optimizer.py:829-832 protect_speculative_operation`
+        // Upstream `optimizer.py protect_speculative_operation`
         // derefs `op.getarg(0)` via `getref_base()` — only `ConstPtr`
         // supports that. RPython's type system makes a `GETFIELD_GC_I`
         // with `ConstInt` arg0 unconstructible. Pyre's
@@ -2394,7 +2394,7 @@ mod tests {
     }
 
     /// pure.py:62 / :72-74 same_box semantics for constant args.
-    /// history.py:211-212 / :251 — `same_box(a, b) == same_constant(a, b)`
+    /// history.py / :251 — `same_box(a, b) == same_constant(a, b)`
     /// for Const subclasses, so cache hits are value-equality. With
     /// inline `ConstInt.value`, two `make_constant_int(5)` calls return
     /// the same `OpRef::ConstInt(5)` and the cache hit is by
@@ -2439,7 +2439,7 @@ mod tests {
         assert_eq!(pass.get_pure_result(&q_miss, &ctx), None);
     }
 
-    /// pure.py:81-93 applies get_box_replacement to the lookup-side op args
+    /// pure.py applies get_box_replacement to the lookup-side op args
     /// before comparing them with stored pure op args.
     #[test]
     fn lookup_pure_replaces_query_args_before_matching() {
@@ -2571,7 +2571,7 @@ mod tests {
         // re-exported to ShortBoxes via short_preamble_pure_ops.
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
-        // history.py:227 — the imported pure op carries an inline `Const`
+        // history.py — the imported pure op carries an inline `Const`
         // arg (`ConstInt.value`). seed_constant takes the inline branch (no
         // const_pool), and the constant is recognised downstream via
         // `is_constant()`, so the short-preamble producer re-exports the op
@@ -2994,15 +2994,15 @@ mod tests {
     /// args (funcptr + Ref) hit a seeded `call_pure_results` entry must
     /// be removed by OptPure and its result made a Ref constant.
     ///
-    /// pure.py:230-234 `optimize_CALL_PURE_R` → start_index=0 (the
+    /// pure.py `optimize_CALL_PURE_R` → start_index=0 (the
     /// funcptr is part of the lookup key).  `_can_optimize_call_pure`
-    /// (optimizer.py:215-226) reads `get_constant_box(arg)` per arg →
+    /// (optimizer.py) reads `get_constant_box(arg)` per arg →
     /// `Value::Ref(ConstPtr)` for the Ref arg — value equality, so the
     /// 2nd identical call collapses to the 1st's stored result.
     ///
-    /// resoperation.py:638 `RefOp.type = 'r'`: the folded constant must
-    /// be `Value::Ref` (history.py:314 ConstPtr), NOT `Value::Int`
-    /// (history.py:220 ConstInt) of the same numeric value.
+    /// resoperation.py `RefOp.type = 'r'`: the folded constant must
+    /// be `Value::Ref` (history.py ConstPtr), NOT `Value::Int`
+    /// (history.py ConstInt) of the same numeric value.
     #[test]
     fn test_call_pure_r_results_folds_second_identical_call() {
         let result_ptr = GcRef(0xDEAD_BEEF);
@@ -3069,8 +3069,8 @@ mod tests {
         let consumer = &result[0];
         assert_eq!(consumer.opcode, OpCode::CallR);
         // The folded constant reaches the consumer as ConstPtr(result_ptr)
-        // (history.py:314), NOT a ConstInt of the same numeric value
-        // (resoperation.py:638 `RefOp.type = 'r'`).
+        // (history.py), NOT a ConstInt of the same numeric value
+        // (resoperation.py `RefOp.type = 'r'`).
         assert_eq!(
             consumer.arg(1).to_opref(),
             OpRef::const_ptr(result_ptr),

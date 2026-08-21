@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 
 /// `_thread.TIMEOUT_MAX` — the whole-second bound of the nanosecond timestamp
 /// an acquire timeout is converted to.  PyPy exposes the microsecond bound
-/// instead (`moduledef.py:27` `float(os_lock.TIMEOUT_MAX // 1000000)`), which
+/// instead (`moduledef.py` `float(os_lock.TIMEOUT_MAX // 1000000)`), which
 /// is a thousand times larger and is its 3.11-era surface.
 const TIMEOUT_MAX: f64 = (i64::MAX / 1_000_000_000) as f64;
 static THREAD_COUNT: AtomicI64 = AtomicI64::new(0);
 static STACK_SIZE: AtomicUsize = AtomicUsize::new(0);
 static FINALIZING: AtomicBool = AtomicBool::new(false);
 static FINALIZING_THREAD: AtomicI64 = AtomicI64::new(0);
-// `threadlocals.py:64 OSThreadLocals._mainthreadident`.  This belongs to the
+// `threadlocals.py OSThreadLocals._mainthreadident`.  This belongs to the
 // process/interpreter-owned OSThreadLocals object, not TLS: workers consult the
 // same identity to decide whether their EC may dispatch app-level signals.
 static MAIN_THREAD_IDENT: AtomicI64 = AtomicI64::new(0);
@@ -104,7 +104,7 @@ impl Drop for RuntimeThread {
     }
 }
 
-/// `rgil.py:186-193 acquire_maybe_in_new_thread`: a thread that has not run
+/// `rgil.py acquire_maybe_in_new_thread`: a thread that has not run
 /// pyre code before becomes a GC mutator and takes the GIL before it runs any.
 ///
 /// Upstream reaches every RPython thread through `rpython_startup_code` or
@@ -139,7 +139,7 @@ pub fn runtime_thread_entered() -> bool {
     RUNTIME_THREAD_ENTERED.with(|entered| entered.get())
 }
 
-/// `rffi.py:193-211 call_external_function`: release the GIL, run the external
+/// `rffi.py call_external_function`: release the GIL, run the external
 /// call, read `errno`, and only then take the GIL back.  The returned `i32` is
 /// the saved `errno`, meaningful exactly when the call reports failure.
 ///
@@ -263,7 +263,7 @@ pub(crate) fn register_execution_context(ec: *const crate::PyExecutionContext) {
         }
     }
     if main_ident == ident {
-        // threadlocals.py:95-97 `_set_ec`: the first/native main thread is
+        // threadlocals.py `_set_ec`: the first/native main thread is
         // enabled for signals.  Each EC is written only by its owning thread.
         unsafe { (*(ec as *mut crate::PyExecutionContext)).signals_enabled = 1 };
     }
@@ -417,7 +417,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// `pystate.py:390 PyGILState_Ensure`, whose wrapper carries `gil="acquire"`.
+/// `pystate.py PyGILState_Ensure`, whose wrapper carries `gil="acquire"`.
 ///
 /// Takes the GIL, registering the thread with the collector when foreign code
 /// owns it and this is its first entry.  Answers which state the thread was in,
@@ -432,7 +432,7 @@ pub extern "C" fn PyGILState_Ensure() -> i32 {
     if held { 0 } else { 1 }
 }
 
-/// `pystate.py:409 PyGILState_Release`.
+/// `pystate.py PyGILState_Release`.
 ///
 /// Gives back whatever the matching [`PyGILState_Ensure`] took.  The state the
 /// caller passes is what upstream records for its own bookkeeping; here the
@@ -448,12 +448,12 @@ pub extern "C" fn PyGILState_Release(_state: i32) {
     drop(guard);
 }
 
-/// Whether this thread holds the GIL — `pystate.py:418 PyGILState_Check`.
+/// Whether this thread holds the GIL — `pystate.py PyGILState_Check`.
 pub fn gilstate_check() -> bool {
     majit_gc::rgil::am_i_holding_the_gil()
 }
 
-/// `pystate.py:29 PyEval_SaveThread`, whose wrapper carries `gil="release"`.
+/// `pystate.py PyEval_SaveThread`, whose wrapper carries `gil="release"`.
 ///
 /// Drops the GIL and leaves the collector's RUNNING census for as long as the
 /// caller stays outside pyre.  A thread already outside has nothing to give up,
@@ -463,7 +463,7 @@ pub fn save_thread() {
     SAVED_THREADS.with(|saved| saved.borrow_mut().push(guard));
 }
 
-/// `pystate.py:42 PyEval_RestoreThread`: retake what [`save_thread`] gave up.
+/// `pystate.py PyEval_RestoreThread`: retake what [`save_thread`] gave up.
 pub fn restore_thread() {
     let entry = SAVED_THREADS.with(|saved| saved.borrow_mut().pop());
     debug_assert!(
@@ -511,7 +511,7 @@ pub(crate) fn after_fork_child() {
     let ident = current_ident();
     {
         let mut contexts = EXECUTION_CONTEXTS.lock();
-        // threadlocals.py:161-171 `reinit_threads`: a fork can leave a worker
+        // threadlocals.py `reinit_threads`: a fork can leave a worker
         // as the sole surviving thread.  Preserve explicit enable/disable
         // nesting while promoting that EC to the new main thread.
         if let Some(&ec) = contexts.get(&ident) {
@@ -566,7 +566,7 @@ pub(crate) fn after_fork_child() {
     majit_gc::gc_sync::after_fork_child();
 }
 
-// os_lock.py:20 `RPY_LOCK_FAILURE, RPY_LOCK_ACQUIRED, RPY_LOCK_INTR`.
+// os_lock.py `RPY_LOCK_FAILURE, RPY_LOCK_ACQUIRED, RPY_LOCK_INTR`.
 const RPY_LOCK_FAILURE: i64 = 0;
 const RPY_LOCK_ACQUIRED: i64 = 1;
 const RPY_LOCK_INTR: i64 = 2;
@@ -580,7 +580,7 @@ fn lock_state<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// `os_lock.py:23-40 parse_acquire_args`.  The result is the `microseconds`
+/// `os_lock.py parse_acquire_args`.  The result is the `microseconds`
 /// argument of the `RPyThreadAcquireLockTimed` ABI: negative blocks forever,
 /// zero polls once.
 ///
@@ -658,13 +658,13 @@ fn checksignals() -> Result<(), crate::PyError> {
     }
 }
 
-/// `os_lock.py:43-60 acquire_timed` — "Helper to acquire an interruptible lock
+/// `os_lock.py acquire_timed` — "Helper to acquire an interruptible lock
 /// with a timeout."  `RPY_LOCK_INTR` reports a wait that a signal handler cut
 /// short: deliver the signal, then retry with whatever time is left.
 ///
 /// `acquire` is the `RPyThreadAcquireLockTimed` primitive of the lock being
 /// taken; upstream reaches it as `lock.acquire_timed`
-/// (`rthread.py:192-197 Lock.acquire_timed`, `intr_flag=1`).
+/// (`rthread.py Lock.acquire_timed`, `intr_flag=1`).
 fn acquire_timed(
     mut microseconds: i64,
     mut acquire: impl FnMut(i64) -> i64,
@@ -778,7 +778,7 @@ mod lock_class {
             success
         }
 
-        /// `os_lock.py:75-85 descr_lock_acquire`.
+        /// `os_lock.py descr_lock_acquire`.
         fn acquire(
             &self,
             #[default(1)] blocking: i64,
@@ -872,7 +872,7 @@ mod rlock_class {
             Ok(obj)
         }
 
-        /// The native-lock half of `os_lock.py:206-241 acquire_w`, shaped to
+        /// The native-lock half of `os_lock.py acquire_w`, shaped to
         /// the `RPyThreadAcquireLockTimed` ABI (thread_pthread.c:427-485) so
         /// `acquire_timed` can deliver signals between attempts.
         ///
@@ -927,7 +927,7 @@ mod rlock_class {
             success
         }
 
-        /// `os_lock.py:206-241 acquire_w`.
+        /// `os_lock.py acquire_w`.
         fn acquire(
             &self,
             #[default(1)] blocking: i64,
@@ -1019,7 +1019,7 @@ mod rlock_class {
             }
             let count = unsafe { w_int_get_value(items[0]) };
             let owner = unsafe { w_int_get_value(items[1]) };
-            // os_lock.py:286-287 `self.lock.acquire(True)` reaches
+            // os_lock.py `self.lock.acquire(True)` reaches
             // `RPyThreadAcquireLockTimed` with `intr_flag=0`
             // (rthread.py:169-174), so an interrupted wait is retried rather
             // than reported: restoring a saved state is not a place where a
@@ -1115,7 +1115,7 @@ mod handle_class {
                 if is_none(timeout) {
                     None
                 } else if is_float(timeout) {
-                    // os_lock.py:33-39 parse_acquire_args — a timeout past the
+                    // os_lock.py parse_acquire_args — a timeout past the
                     // microsecond clock's range is an OverflowError, never a
                     // native abort.  The negated comparison rejects NaN too.
                     let secs = floatobject::w_float_get_value(timeout);
@@ -1235,7 +1235,7 @@ mod local_class {
     }
 
     impl W_Local {
-        /// `os_local.py:47-64 create_new_dict`.
+        /// `os_local.py create_new_dict`.
         fn create_new_dict(&self, ident: i64) -> Result<PyObjectRef, crate::PyError> {
             let this = self as *const Self as *mut Self;
             let obj = this as PyObjectRef;
@@ -1246,7 +1246,7 @@ mod local_class {
             let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             // Published before the initializer runs: the `__init__` about to be
             // entered reaches `getdict` again, and finding this entry is what
-            // stops it recursing back into `create_new_dict` (os_local.py:28-31).
+            // stops it recursing back into `create_new_dict` (os_local.py).
             {
                 let _guard = self.state_lock.lock();
                 unsafe { pyre_object::w_dict_setitem(self.dicts, ident, w_dict) };
@@ -1328,7 +1328,7 @@ mod local_class {
             crate::call::call_with_kwargs(unsafe { &mut *frame }, w_init, args, &kwds)
         }
 
-        /// `os_local.py:66-76 getdict`.
+        /// `os_local.py getdict`.
         pub(super) fn current_dict(&self) -> Result<PyObjectRef, crate::PyError> {
             let ident = current_ident();
             {
@@ -1383,7 +1383,7 @@ mod local_class {
 
     #[crate::pyre_methods(doc = "Thread-local data", weakrefable)]
     impl W_Local {
-        /// `os_local.py:78-88 descr_local__new__`.
+        /// `os_local.py descr_local__new__`.
         #[staticmethod]
         fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             crate::typedef::check_user_subclass(type_object(), cls)?;
@@ -1393,7 +1393,7 @@ mod local_class {
                 // subtype inherits, not by the requested type: a subclass that
                 // defines its own `__init__` consumes them, and
                 // `create_new_dict` replays that call on every further thread.
-                // os_local.py:81 runs this ahead of `allocate_instance`, so a
+                // os_local.py runs this ahead of `allocate_instance`, so a
                 // refused construction never reaches `_register_in_ec`
                 // (os_local.py:40).
                 let w_parent_init = unsafe { crate::baseobjspace::lookup_where(cls, "__init__") }
@@ -1404,7 +1404,7 @@ mod local_class {
                     ));
                 }
             }
-            // os_local.py:23-38 `Local.__init__` installs the first dictionary
+            // os_local.py `Local.__init__` installs the first dictionary
             // before app-level __init__ is entered, preventing recursive
             // initialization.
             let roots = pyre_object::gc_roots::push_roots();
@@ -1481,7 +1481,7 @@ fn local_type() -> PyObjectRef {
 
 /// W_Root.getdict dispatch for `os_local.Local.getdict`.  `None` means the
 /// receiver is not a `_local`; `Some(Err(..))` is the app-level `__init__` the
-/// first access from a thread runs (`os_local.py:73 create_new_dict`) raising.
+/// first access from a thread runs (`os_local.py create_new_dict`) raising.
 pub(crate) fn local_getdict(obj: PyObjectRef) -> Option<Result<PyObjectRef, crate::PyError>> {
     let local = W_Local::from_obj(obj)?;
     Some(local.current_dict())
@@ -1629,7 +1629,7 @@ fn spawn_thread(
     if parent_ec.is_null() {
         return Err(crate::PyError::runtime_error("no execution context"));
     }
-    // os_thread.py:172 `start_new_thread` begins with `setup_threads(space)`.
+    // os_thread.py `start_new_thread` begins with `setup_threads(space)`.
     gil::setup_threads(unsafe { &mut *(parent_ec as *mut crate::PyExecutionContext) });
 
     let roots = pyre_object::gc_roots::push_roots();
@@ -1945,7 +1945,7 @@ fn stack_size(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let old = STACK_SIZE.load(Ordering::Relaxed);
     if let Some(&arg) = args.first() {
-        // `@unwrap_spec(size=int)` (os_thread.py:216) unwraps through
+        // `@unwrap_spec(size=int)` (os_thread.py) unwraps through
         // `space.int_w`, which rejects a non-integer instead of reading its
         // payload word as one.
         let size = crate::baseobjspace::int_w(arg)?;

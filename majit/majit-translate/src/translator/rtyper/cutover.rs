@@ -244,7 +244,7 @@ pub(crate) enum DualGateOutcome {
         /// (`LegacyToTyped = HashMap<Variable, Variable>`) mapping built
         /// by the flowspace adapter.  Each typed Variable carries the
         /// `RPythonTyper`-set `concretetype` inline (`flowspace/
-        /// model.py:280`), so codewriter callers copy that lltype onto
+        /// model.py`), so codewriter callers copy that lltype onto
         /// the matching legacy Variable via
         /// [`crate::codewriter::type_state::apply_from_flowspace_variables`];
         /// `FunctionGraph::concretetype_of(&v)` then reads the legacy
@@ -381,7 +381,7 @@ pub(crate) fn dual_gate_check_with_registry(
 /// `FunctionDesc.cache` (and any calltable row built during the scope)
 /// still holds the fixed + LL-rewritten + annotation-cleared graph.
 /// Every later subject calling the same callee then dies at
-/// `addpendingblock`'s fixed-graph safety check (annrpython.py:181
+/// `addpendingblock`'s fixed-graph safety check (annrpython.py
 /// reads `arg.annotation`), or at `flowin`'s "unimplemented operation"
 /// on the LL ops.
 ///
@@ -624,7 +624,7 @@ fn select_rtyped_representatives(
 ///
 /// One further legacy-only class lives *inside* the structural closure:
 /// a non-entry block inputarg that no reachable op or exitswitch reads.
-/// Phase B's `transform_dead_op_vars` (simplify.py:422) drops such dead
+/// Phase B's `transform_dead_op_vars` (simplify.py) drops such dead
 /// merge inputargs from the real graph, so the real path never types
 /// them, whereas the legacy walker types every block inputarg.  A value
 /// only *forwarded* through `Link.args` (framestate reusing one Variable
@@ -713,11 +713,11 @@ fn reachable_defined_vars(graph: &LegacyGraph) -> std::collections::HashSet<Vari
 /// dropped-unit results (see [`collect_divergences`]) is unsound for it.
 ///
 /// The colored positions:
-/// - op operands (`serialize_op`/`flatten_list`, `flatten.py:355-374`),
+/// - op operands (`serialize_op`/`flatten_list`, `flatten.py`),
 /// - the block `exitswitch` (`goto_if_not` / `switch`,
 ///   `flatten.py:259/265`, including fused compare operands),
 /// - operands forwarded on a Link into the `exceptblock` — the raise
-///   value colored by `make_return`'s 2-arg arm (`flatten.py:143`).
+///   value colored by `make_return`'s 2-arg arm (`flatten.py`).
 ///
 /// A var forwarded only into the `returnblock` is *not* included: the
 /// 1-arg return arm emits `void_return` without coloring when the kind
@@ -750,7 +750,7 @@ fn colored_operand_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variab
             if link.target != graph.exceptblock {
                 continue;
             }
-            // `flatten.py:139-143 make_return`: the 2-arg exception link emits
+            // `flatten.py make_return`: the 2-arg exception link emits
             // `raise` coloring ONLY `args[1]` (the exception *value* / evalue);
             // `args[0]` (the exception *type* / etype) is not passed to
             // `getcolor`.  Mirror that — color the evalue operand alone, so a
@@ -767,7 +767,7 @@ fn colored_operand_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variab
 /// Variables that appear more than once within a single block's
 /// `inputargs` — duplicate phi columns.  The real path runs
 /// `remove_duplicate_inputargs` (`model::remove_duplicate_inputargs`, the
-/// `simplify.py:565-568 remove_identical_vars_SSA` port) before rtyping:
+/// `simplify.py remove_identical_vars_SSA` port) before rtyping:
 /// when two inputarg columns of one block carry identical phi-args, they
 /// collapse to one representative and the removed column's Variable is
 /// unioned away, so `setup_block_entry` never types that identity.  The
@@ -797,7 +797,7 @@ fn duplicate_inputarg_vars(graph: &LegacyGraph) -> std::collections::HashSet<Var
 /// only consumers are `Link.args` forwardings (dead phi-threads).  This is
 /// the op-result analogue of the dead non-entry-block inputarg
 /// [`reachable_defined_vars`] already excludes: the real path's
-/// `transform_dead_op_vars` (`simplify.py:422`) drops the result binding of
+/// `transform_dead_op_vars` (`simplify.py`) drops the result binding of
 /// such a value, so `setup_block_entry` never types it, whereas the legacy
 /// walker types every op result.
 ///
@@ -1122,7 +1122,7 @@ fn repack_payload_read_vars(graph: &LegacyGraph) -> std::collections::HashSet<Va
 }
 
 /// Whether an op's result may be dropped when unread, mirroring RPython's
-/// `transform_dead_op_vars` `canremove(op, block)` gate (`simplify.py:441`):
+/// `transform_dead_op_vars` `canremove(op, block)` gate (`simplify.py`):
 /// only side-effect-free ops (`op.opname in CanRemove`) have their result
 /// binding removed; a store, a call, a guard, or the block's raising op keeps
 /// its result even when locally unread.  The upstream `CanRemove` set is the
@@ -1279,7 +1279,7 @@ fn collect_divergences(
         // A dead op *result* — no op or exitswitch reads it, only `Link.args`
         // forwarding does, and its op is `canremove`-eligible
         // ([`op_result_can_remove`]) — is dropped by the real path's
-        // `transform_dead_op_vars` (`simplify.py:441`), so it is untyped in
+        // `transform_dead_op_vars` (`simplify.py`), so it is untyped in
         // the real graph while the legacy walker types every op result.  The
         // hitters span both register banks: erased-element `getarrayitem`
         // reads never observed (`swap_values`'s write-back positions,
@@ -1437,7 +1437,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // SomeInstance, so `find_attribute`
         // (`rclass.py:556+find_attribute_or_None`) cannot route the
         // dispatch.  `InstanceRepr::rtype_getattr`
-        // (`rclass.py:838-857`) routes through `getclsfield`, which
+        // (`rclass.py`) routes through `getclsfield`, which
         // surfaces the upstream-orthodox `MissingRTypeAttribute(attr)`
         // when find_attribute returns None.  The `"no method ... on
         // Instance("` substring (`rmodel.rs` default
@@ -1508,21 +1508,21 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         || msg.contains("complete_pending_blocks failed")
         || msg.contains("Cannot find attribute ")
         || msg.contains("AnnotatorError:")
-        // `rtyper.py:810-823 convertvar` — no conversion path between
+        // `rtyper.py convertvar` — no conversion path between
         // the two reprs.  The production hitter is the generic-ADT
         // payload attribute (`core.result.Result.Ok.__pos_0` etc.):
         // pyre collapses every `Result<T, E>` instantiation onto ONE
         // classdef, so the attribute's merged annotation unions
         // unrelated payload classes (unit-tuple placeholder `Adt`,
         // `core.option.Option.None`, …) and `pairtype(InstanceRepr,
-        // InstanceRepr).convert_from_to` (rclass.py:1035-1055)
+        // InstanceRepr).convert_from_to` (rclass.py)
         // correctly finds no common base.  Upstream never faces this
         // shape — RPython has no generics, so each class attribute
         // carries a single annotated type.  Skip until
         // per-instantiation classdef specialization lands.
         || msg.contains("don't know how to convert from")
         // Annotation-stage flavour of the convertvar entry above
-        // (`annrpython.py:432 mergeinputargs` → `UnionError`): two
+        // (`annrpython.py mergeinputargs` → `UnionError`): two
         // `SomeInstance`s with no common base meet at a block merge
         // because pyre collapses every generic-ADT instantiation onto
         // one classdef, so unrelated payload classes union at the phi.
@@ -1532,7 +1532,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         || msg.contains("cannot unify instances with no common base class")
         // The union fallback marker — no arm handles this pair.  Upstream
         // RAISES for the pairs that reach here: `pair(SomeObject, SomeObject)
-        // .union()` raises (binaryop.py:90-93), `pair(SomePtr, SomeObject)`
+        // .union()` raises (binaryop.py), `pair(SomePtr, SomeObject)`
         // raises (llannotation.py:118-120).  So a hit is a pyre PRODUCER
         // divergence — a boxed `*mut PyObject` lifted as `SomePtr` where
         // RPython carries `SomeInstance`, making a `SomeInstance ∪ SomePtr`
@@ -1542,7 +1542,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         || msg.contains("no upstream pair(s1, s2).union() handler in current subset")
         // `InstanceRepr.getfield` walking the `rbase` chain before the
         // repr's deferred `setup()` ran (upstream drains pending
-        // setups via `call_all_setups`, rtyper.py:198, after every
+        // setups via `call_all_setups`, rtyper.py, after every
         // specialized block; pyre's per-subject dual-gate can reach a
         // getfield on a freshly minted inner repr first).  Also covers
         // the `rbase missing — call setup() first` form: host-struct-
@@ -1556,7 +1556,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // (`seed_struct_root_method_members`), whose `simple_call`
         // sites do not yet register call shapes into the CallFamily
         // the way `bookkeeper.pbc_call` does for ordinary descs
-        // (pbc_call → getcallfamily row, bookkeeper.py:553-571).
+        // (pbc_call → getcallfamily row, bookkeeper.py).
         // Skip until the seeded-method family registration lands.
         || msg.contains("calltable row not found in CallFamily")
         // A non-instance constant (e.g. a string literal) reaching
@@ -1567,7 +1567,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // PyError.msg via the type_error raise stubs).  Skip until
         // the typed-Ref field projection covers the remaining rows.
         || msg.contains("InstanceRepr.convert_const: expected HostObject or None")
-        // `rmodel.py:311 rtype_is_` — an `is` (pointer-identity)
+        // `rmodel.py rtype_is_` — an `is` (pointer-identity)
         // comparison where one side is not a pointer repr.  The
         // production hitter is `py_type_check`'s `(*obj).ob_type ==
         // tp` chain when `tp` flowed from a `&STATIC` host address:
@@ -1590,12 +1590,12 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // the legacy type walker instead of panicking during registry
         // population.
         || (msg.contains("Call with CallTarget::Indirect") && msg.contains("rclass"))
-        // `annrpython.py:432 mergeinputargs` — an inputarg Variable
+        // `annrpython.py mergeinputargs` — an inputarg Variable
         // has no annotation. Happens when cross-block locals
         // threading misses a name in the predecessor link; the
         // annotator cannot merge `None` annotations.
         || msg.contains("inputarg lacks annotation")
-        // `BrokenReprTyperError` (`rmodel.py:42-44`, ported at
+        // `BrokenReprTyperError` (`rmodel.py`, ported at
         // `rmodel.rs`): a Repr whose `setup()` failed earlier
         // is re-requested and refuses to half-initialize.  In the
         // per-graph census a Skipped subject can leave a shared
@@ -1637,7 +1637,7 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
         // Cross-block body `Input` whose `name` was not threaded
         // through `Link.args` / target `inputargs` by the predecessor.
         // RPython flowspace has no body-`Input` op — every cross-block
-        // local reference goes via `flowcontext.py:872-884 LOAD_FAST`
+        // local reference goes via `flowcontext.py LOAD_FAST`
         // (which writes into `self.locals_w`) and the target block's
         // pre-allocated `inputargs[]`.  Pyre's body-`Input` emission
         // (the `OpKind::Input` ops `front::mir` pushes into each block)
@@ -1804,7 +1804,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // `NewWithVtable` during MIR `simplify_lowered_graph`
         // (`front/mir.rs`, `model.rs` `payload_fields`) — *before* the
         // rtyper runs, so a numeric `malloc_typed` never reaches Layer-3b.
-        // Upstream `jtransform.rewrite_op_malloc` (`jtransform.py:1012`) lowers
+        // Upstream `jtransform.rewrite_op_malloc` (`jtransform.py`) lowers
         // EVERY mallocable GC struct to `new`/`new_with_vtable`; pyre has not
         // ported that general path. So an UNFUSED `malloc_typed` (any non-numeric
         // struct — `W_BytesObject`, `W_UnicodeObject`, the dict family, …)
@@ -1944,7 +1944,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // `Rc<PyreFunctionEntry>`.
     //
     // Per-callee failure isolation matches RPython
-    // `bookkeeper.py:353-409 getdesc(pyobj)` semantics: each
+    // `bookkeeper.py getdesc(pyobj)` semantics: each
     // `FunctionDesc` is built independently via `newfuncdesc`, and a
     // failure on one callable does NOT abort the bookkeeper's `descs`
     // population for other callables.  Upstream's per-`Constant(pyobj)`
@@ -2004,9 +2004,9 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if !lifted.insert(entry_ptr) {
             continue;
         }
-        // `@jit.dont_look_inside` (`rlib/jit.py:142`) callees: the JIT
+        // `@jit.dont_look_inside` (`rlib/jit.py`) callees: the JIT
         // pipeline never builds a jitcode for the body
-        // (`policy.py:48-84 look_inside_graph` returns False, so
+        // (`policy.py look_inside_graph` returns False, so
         // `codewriter.py find_all_graphs` excludes the graph and the
         // callsite residualizes).  Pyre's annotator exists solely to
         // feed that jitcode pipeline, so lifting the body here is
@@ -2053,7 +2053,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     }
     // Pass 3 — make impl methods visible in their owner's class dict.
     // RPython's ClassDesc reads methods straight off the class object
-    // (`classdesc.py:808-817 find_source_for` → `cls.__dict__[name]`):
+    // (`classdesc.py find_source_for` → `cls.__dict__[name]`):
     // a Python class object already carries its functions as members
     // when annotation starts.  Pyre's struct-root class objects are
     // minted with no members (`Bookkeeper::intern_class_by_qualname`),
@@ -2138,7 +2138,7 @@ pub(crate) fn lift_callee_to_pygraph(
     // RPython parity: `Variable.concretetype` and `Constant.concretetype`
     // already carry the per-variable / per-constant LL type after
     // specialise; downstream readers must consult those fields directly
-    // (`history.py:204` `same_constant`, `model.py:438` `Variable.
+    // (`history.py` `same_constant`, `model.py` `Variable.
     // concretetype`).  The by-slot side map was a pyre-only divergence.
     //
     // Test fixtures that hand-roll minimal SSA shapes must seed
@@ -2211,10 +2211,10 @@ pub(crate) fn lift_callee_to_pygraph(
 /// That constant slot leaks into the rtyper as a fold-eligible
 /// "known false" annotation and can mis-specialise downstream code
 /// that observes the callsite result.  Upstream `ExtRegistryEntry.
-/// compute_result_annotation` (`extregistry.py:33`) returns a
+/// compute_result_annotation` (`extregistry.py`) returns a
 /// `SomeXXX()` shell with no `const`; the pre-annotated Variable
 /// here carries exactly that shape via `binding(arg)` reading
-/// `v.annotation` directly (`annrpython.py:282-287`).
+/// `v.annotation` directly (`annrpython.py`).
 ///
 /// Mirrors how `description.py:193-203` test fixtures build a
 /// `FunctionDesc` with a minimal `PyGraph` body — the upstream
@@ -2289,7 +2289,7 @@ fn build_stub_pygraph_with_result_shell(
 /// for every primitive lltype `lltype_to_annotation` itself handles
 /// (Void / Bool / Float family / Char / UniChar / integer family /
 /// `Ptr(_)` / `InteriorPtr(_)`), so this helper inherits the
-/// upstream `lltype_to_annotation` (`llannotation.py:172-185`) shape
+/// upstream `lltype_to_annotation` (`llannotation.py`) shape
 /// — every returned `SomeXXX` has no `const_box` set, matching
 /// `ExtRegistryEntry.compute_result_annotation` semantics.
 ///
@@ -2299,7 +2299,7 @@ fn build_stub_pygraph_with_result_shell(
 /// treats `None` as "skip this fn"; the unported path then surfaces
 /// the original "not registered" Skip.
 ///
-/// `Address` maps to the untyped `SomeAddress` shell (`llmemory.py:573
+/// `Address` maps to the untyped `SomeAddress` shell (`llmemory.py
 /// SomeAddress`) — the annotation-stage projection a `*const T` / `*mut T`
 /// raw pointer carries when its element type is not modeled, for a residual
 /// whose result is consumed only as a residual-call argument.
@@ -2949,7 +2949,7 @@ fn drive_subject(
     }
 
     // Callee blocks are seeded naturally with no explicit pre-seed:
-    // `@op.simple_call.register(SomeObject)` (unaryop.py:114-118
+    // `@op.simple_call.register(SomeObject)` (unaryop.py
     // parity) makes flowin dispatch the first
     // `simple_call(host_object_const, args)` op through `s_func.call(
     // argspec)` -> `SomePBC.call` -> `Bookkeeper.pbc_call` ->
@@ -2961,7 +2961,7 @@ fn drive_subject(
     // queue so `flowin` walks every block reachable from
     // `graph.startblock` and writes `Variable.annotation` for each
     // op result.  Mirrors upstream `RPythonAnnotator.complete()`
-    // (`annrpython.py:226-232`), which loops `complete_pending_blocks`
+    // (`annrpython.py`), which loops `complete_pending_blocks`
     // → policy hook → exit-on-empty.  Without this drain, the
     // `addpendingblock(startblock, inputcells)` queued just above
     // stays in `genpendingblocks`, `annotated[block]` remains the
@@ -2992,7 +2992,7 @@ fn drive_subject(
     // to a `SomePBC` (via `immutablevalue_hostobject` for the
     // pre-registered `HostObject::UserFunction`), then records the
     // call site in `bookkeeper.pbc_maximal_call_families` so the
-    // rtyper's `FunctionRepr.call(hop)` (`rpbc.py:199`) finds the
+    // rtyper's `FunctionRepr.call(hop)` (`rpbc.py`) finds the
     // matching call-family row at `find_row` time.
     //
     // The subject just seeded into this annotator is brand-new and its
@@ -3459,7 +3459,7 @@ fn run_two_phase_prepass_inner(
 
 /// Phase B: rtype every annotated block in one whole-program pass, tolerant of
 /// per-graph rtype failure (the migration scaffold — upstream `specialize()` is
-/// single-pass-fatal, rtyper.py:177-296). A block's `specialize_block` failure
+/// single-pass-fatal, rtyper.py). A block's `specialize_block` failure
 /// records its owning graph into the cache's `rtype_skipped` set; that graph's
 /// remaining blocks are excluded from later rounds (the publish then Skips it to
 /// the legacy walker) and its half-fixed callees are repaired via
@@ -3494,7 +3494,7 @@ fn run_phase_b_rtype_isolated(
     // Exists to localise prepass nondeterminism (gh#1139).
     let mut phase_b_traced = determinism_trace.then(Vec::new);
 
-    // Upstream `RPythonTyper.specialize()` step 1 (rtyper.py:180-181):
+    // Upstream `RPythonTyper.specialize()` step 1 (rtyper.py):
     // `if not dont_simplify_again: self.annotator.simplify()`. pyre's
     // per-subject annotate-half (`drive_subject`) skips the annotator-wide
     // simplify, so a graph's constant-folded dead arms stay structurally
@@ -3506,7 +3506,7 @@ fn run_phase_b_rtype_isolated(
     // `specialize_block` → `insert_link_conversions` → `bindingrepr`, which
     // then KeyErrors on the dead target's unbound inputargs.
     //
-    // Run `transform_dead_code` (transform.py:145-165) once over the whole
+    // Run `transform_dead_code` (transform.py) once over the whole
     // fully-annotated block set here: it is the simplify pass that prunes
     // links absent from `links_followed`, folding a const switch back to a
     // plain goto. It is a no-op on graphs whose every exit was followed, so
@@ -3551,7 +3551,7 @@ fn run_phase_b_rtype_isolated(
             );
         }
 
-        // Pass 1 — `transform_dead_code` (transform.py:145): prune the
+        // Pass 1 — `transform_dead_code` (transform.py): prune the
         // unfollowed const-switch dead arms. Per-block panic isolation
         // (`cutoff_alwaysraising_block`'s consistency asserts can fire on an
         // unrelated malformed always-raising block).
@@ -3577,7 +3577,7 @@ fn run_phase_b_rtype_isolated(
             eprintln!("[DTRACE-CUTPANIC] total={cutoff_panics}");
         }
 
-        // Pass 2 — `transform_dead_op_vars` (simplify.py:422, transform.py:137):
+        // Pass 2 — `transform_dead_op_vars` (simplify.py, transform.py):
         // drop dead ops and, crucially, dead inputargs together with their
         // matching link args. This is the remaining half of upstream
         // `specialize()` step-1 `simplify()` that the per-subject flow also
@@ -4752,7 +4752,7 @@ mod tests {
     #[test]
     fn dead_op_result_vars_excludes_the_raising_op() {
         // `canremove(op, block)` also excludes `block.raising_op`
-        // (`simplify.py:441`): a `canremove`-classified op that is the last
+        // (`simplify.py`): a `canremove`-classified op that is the last
         // op of a raising block (exitswitch `LastException`) keeps its result
         // even when unread, because the raise side effect is observable.  Two
         // graphs with an identical unread `ArrayRead` last op differ only in
@@ -5095,7 +5095,7 @@ mod tests {
         let _lock = anchor_lock();
         // `valuetype_to_someshell(Ref)` lifts to
         // `SomeInstance(classdef=None)` instead of the illegal
-        // `SomeObject` placeholder (`model.py:51-69` `SomeObject` is
+        // `SomeObject` placeholder (`model.py` `SomeObject` is
         // abstract).  The rtyper routes through `getinstancerepr(rtyper,
         // None, Gc)` -> `InstanceRepr::new_rootinstance` ->
         // `Ptr(GcStruct(OBJECT))` and `lowleveltype_to_concrete`
@@ -5685,7 +5685,7 @@ mod tests {
     #[test]
     fn default_someshell_for_lltype_address_yields_someaddress() {
         use crate::annotator::model::SomeValue;
-        // `Address` maps to the untyped `SomeAddress` shell (llmemory.py:573
+        // `Address` maps to the untyped `SomeAddress` shell (llmemory.py
         // `SomeAddress`) — the projection a raw `*const T` / `*mut T` result
         // takes.
         let s = default_someshell_for_lltype(&LowLevelType::Address)

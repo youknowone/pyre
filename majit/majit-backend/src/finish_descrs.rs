@@ -14,13 +14,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use majit_ir::{Descr, FailDescr, Type};
 
-/// `compile.py:623-624` `class _DoneWithThisFrameDescr(AbstractFailDescr):
+/// `compile.py` `class _DoneWithThisFrameDescr(AbstractFailDescr):
 /// final_descr = True`.
 ///
 /// Shared base fields for the four `DoneWithThisFrame*` subclasses —
 /// a stable `fail_arg_types` vector plus the `final_descr = True`
 /// marker exposed through `FailDescr::is_finish()`.  Inherits the
-/// `history.py:132` `_attrs_` slots `adr_jump_offset` / `rd_locs` from
+/// `history.py` `_attrs_` slots `adr_jump_offset` / `rd_locs` from
 /// `AbstractFailDescr`; backend codegen
 /// (`assembler.py:849 patch_pending_failure_recoveries` /
 /// `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`)
@@ -31,15 +31,15 @@ struct DoneWithThisFrameDescrBase {
     /// `set_descr_index` is never called (no `setup_descrs` pass); we
     /// keep the AbstractDescr default of -1.
     descr_index: AtomicI32,
-    /// `handle_fail` (`compile.py:632`, 641, 650, 659) reads the result
+    /// `handle_fail` (`compile.py`, 641, 650, 659) reads the result
     /// out of `deadframe[0]`.  pyre carries the same one-slot shape via
     /// `fail_arg_types`.
     fail_arg_types: Vec<Type>,
-    /// `history.py:132` `AbstractFailDescr._attrs_` `adr_jump_offset`.
+    /// `history.py` `AbstractFailDescr._attrs_` `adr_jump_offset`.
     /// Stamped by `assembler.py:849 patch_pending_failure_recoveries`
     /// when the recovery stub gets a final address.  `0` until stamped.
     adr_jump_offset: UnsafeCell<usize>,
-    /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs`.  Written
+    /// `history.py` `AbstractFailDescr._attrs_` `rd_locs`.  Written
     /// by `llsupport/assembler.py:279`.  Empty until codegen stamps it.
     rd_locs: UnsafeCell<Vec<u16>>,
 }
@@ -71,7 +71,7 @@ impl DoneWithThisFrameDescrBase {
     }
 }
 
-/// `compile.py:626-629` `class DoneWithThisFrameDescrVoid(_DoneWithThisFrameDescr)`.
+/// `compile.py` `class DoneWithThisFrameDescrVoid(_DoneWithThisFrameDescr)`.
 #[derive(Debug)]
 pub struct DoneWithThisFrameDescrVoid(DoneWithThisFrameDescrBase);
 
@@ -107,7 +107,7 @@ impl FailDescr for DoneWithThisFrameDescrVoid {
         &self.0.fail_arg_types
     }
     fn is_finish(&self) -> bool {
-        // `compile.py:624` `final_descr = True`.
+        // `compile.py` `final_descr = True`.
         true
     }
     fn adr_jump_offset(&self) -> usize {
@@ -124,7 +124,7 @@ impl FailDescr for DoneWithThisFrameDescrVoid {
     }
 }
 
-/// `compile.py:631-638` `class DoneWithThisFrameDescrInt(_DoneWithThisFrameDescr)`.
+/// `compile.py` `class DoneWithThisFrameDescrInt(_DoneWithThisFrameDescr)`.
 #[derive(Debug)]
 pub struct DoneWithThisFrameDescrInt(DoneWithThisFrameDescrBase);
 
@@ -176,7 +176,7 @@ impl FailDescr for DoneWithThisFrameDescrInt {
     }
 }
 
-/// `compile.py:640-647` `class DoneWithThisFrameDescrRef(_DoneWithThisFrameDescr)`.
+/// `compile.py` `class DoneWithThisFrameDescrRef(_DoneWithThisFrameDescr)`.
 #[derive(Debug)]
 pub struct DoneWithThisFrameDescrRef(DoneWithThisFrameDescrBase);
 
@@ -228,7 +228,7 @@ impl FailDescr for DoneWithThisFrameDescrRef {
     }
 }
 
-/// `compile.py:649-656` `class DoneWithThisFrameDescrFloat(_DoneWithThisFrameDescr)`.
+/// `compile.py` `class DoneWithThisFrameDescrFloat(_DoneWithThisFrameDescr)`.
 #[derive(Debug)]
 pub struct DoneWithThisFrameDescrFloat(DoneWithThisFrameDescrBase);
 
@@ -366,7 +366,7 @@ impl FailDescr for DoneWithThisFrameDescrMulti {
     }
 }
 
-/// `compile.py:658-662` `class ExitFrameWithExceptionDescrRef(_DoneWithThisFrameDescr)`.
+/// `compile.py` `class ExitFrameWithExceptionDescrRef(_DoneWithThisFrameDescr)`.
 #[derive(Debug)]
 pub struct ExitFrameWithExceptionDescrRef(DoneWithThisFrameDescrBase);
 
@@ -402,11 +402,11 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
         &self.0.fail_arg_types
     }
     fn is_finish(&self) -> bool {
-        // `compile.py:658` inherits `final_descr = True` from `_DoneWithThisFrameDescr`.
+        // `compile.py` inherits `final_descr = True` from `_DoneWithThisFrameDescr`.
         true
     }
     fn is_exit_frame_with_exception(&self) -> bool {
-        // `compile.py:658` subclass identity: ExitFrameWithExceptionDescrRef
+        // `compile.py` subclass identity: ExitFrameWithExceptionDescrRef
         // dispatches to `jitexc.ExitFrameWithExceptionRef` via `handle_fail`.
         true
     }
@@ -424,7 +424,7 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
     }
 }
 
-/// `compile.py:1092-1099` `class PropagateExceptionDescr(AbstractFailDescr)`.
+/// `compile.py` `class PropagateExceptionDescr(AbstractFailDescr)`.
 ///
 /// `handle_fail` reads the exception out of the `deadframe` and raises
 /// `jitexc.ExitFrameWithExceptionRef`.  Stored on
@@ -436,14 +436,14 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
 pub struct PropagateExceptionDescr {
     /// `history.py:122` `index = -1` default.
     descr_index: AtomicI32,
-    /// `history.py:132` `AbstractFailDescr._attrs_` `adr_jump_offset`
+    /// `history.py` `AbstractFailDescr._attrs_` `adr_jump_offset`
     /// — inherited from `AbstractFailDescr` (compile.py:1092 `class
     /// PropagateExceptionDescr(AbstractFailDescr)`).  Stamped by
     /// `assembler.py:849 patch_pending_failure_recoveries` when the
     /// `GUARD_NO_EXCEPTION` recovery stub at `compile.py:1141` is
     /// finalised.
     adr_jump_offset: UnsafeCell<usize>,
-    /// `history.py:132` `_attrs_` `rd_locs` — same inheritance path.
+    /// `history.py` `_attrs_` `rd_locs` — same inheritance path.
     rd_locs: UnsafeCell<Vec<u16>>,
 }
 
@@ -484,12 +484,12 @@ impl FailDescr for PropagateExceptionDescr {
         u32::MAX
     }
     fn fail_arg_types(&self) -> &[Type] {
-        // `compile.py:1141` `ResOperation(rop.GUARD_NO_EXCEPTION, [], descr=faildescr)`
+        // `compile.py` `ResOperation(rop.GUARD_NO_EXCEPTION, [], descr=faildescr)`
         // `operations[1].setfailargs([])` — no fail args.
         &[]
     }
     fn is_finish(&self) -> bool {
-        // `compile.py:1092` `class PropagateExceptionDescr(AbstractFailDescr)` —
+        // `compile.py` `class PropagateExceptionDescr(AbstractFailDescr)` —
         // inherits `final_descr = False`.  This is a guard descr, not a finish.
         false
     }

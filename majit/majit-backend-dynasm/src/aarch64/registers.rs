@@ -105,16 +105,16 @@ pub const LR: RegLoc = X30;
 /// registers.py:17 `fp = x29`
 pub const FP: RegLoc = X29;
 
-/// registers.py:21 `ip1 = x17`
+/// registers.py `ip1 = x17`
 pub const IP1: RegLoc = X17;
 
-/// registers.py:22 `ip0 = x16`
+/// registers.py `ip0 = x16`
 pub const IP0: RegLoc = X16;
 
-/// registers.py:23 `ip2 = x15`
+/// registers.py `ip2 = x15`
 pub const IP2: RegLoc = X15;
 
-/// registers.py:24 `ip3 = x14`
+/// registers.py `ip3 = x14`
 pub const IP3: RegLoc = X14;
 
 /// registers.py:26 `callee_saved_registers = [x19, x20]`.

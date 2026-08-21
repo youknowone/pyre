@@ -86,7 +86,7 @@ impl Buffer {
         }
     }
 
-    /// `SubBuffer(parent, offset, size)` (`rpython/rlib/buffer.py:389`).  A
+    /// `SubBuffer(parent, offset, size)` (`rpython/rlib/buffer.py`).  A
     /// `Sub` over a `Sub` is collapsed to a single window over the inner
     /// buffer (`buffer.py:397` — "don't nest them"): the offsets sum and the
     /// outer window clamps to the inner one, so the wrapper depth never

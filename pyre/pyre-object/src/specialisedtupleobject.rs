@@ -185,7 +185,7 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
 /// outside the collector's heap. The mark walker's
 /// `is_managed_heap_object` guard keeps that case correctness-safe.
 pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`):
     // both inputs are live PyObjectRef roots that must survive the
     // potential collection inside `try_gc_alloc_stable`. The ii/ff
     // variants take unboxed i64/f64 and need no bracket here.
@@ -272,7 +272,7 @@ pub unsafe fn is_specialised_tuple(obj: PyObjectRef) -> bool {
     }
 }
 
-/// `specialisedtupleobject.py:134-142` `getitem`. Caller has already
+/// `specialisedtupleobject.py` `getitem`. Caller has already
 /// guarded the variant; only index 0 / 1 are valid.
 ///
 /// # Safety

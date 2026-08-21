@@ -510,7 +510,7 @@ declare_seam! {
     sleep(seconds: f64) -> unit = "ll_time.ll_time_sleep";
 }
 
-/// The sandbox trampoline for `inspector.py:89 raw_os_write`, whose
+/// The sandbox trampoline for `inspector.py raw_os_write`, whose
 /// `_nowrapper=True` declaration deliberately keeps the GIL held.  Heap
 /// dumping calls this while it owns the collector's `&mut MiniMarkGC` and,
 /// when another mutator exists, the stop-the-world guard.  The ordinary
@@ -701,7 +701,7 @@ mod real {
         CString::new(path).map_err(|_| SeamError::Value)
     }
 
-    /// `rffi.py:193-211 call_external_function` for the real-host bodies: an OS
+    /// `rffi.py call_external_function` for the real-host bodies: an OS
     /// call blocks, so drop the GIL around it.  `last_os_error` is read inside
     /// `f`, which keeps it ahead of the re-acquire the way `_errno_after`
     /// precedes `rgil.acquire()`.

@@ -1534,7 +1534,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     } else {
         pyre_object::w_module_new_aliasing_dict_managed(name, w_dict)
     };
-    // function.py:797-815 BuiltinFunction.w_moduleobj — MixedModule binds
+    // function.py BuiltinFunction.w_moduleobj — MixedModule binds
     // every interp-level function to the live defining module object.
     for key in &keys {
         if let Some(value) =
@@ -2950,7 +2950,7 @@ unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     }
 }
 
-/// `baseobjspace.py:730` — record the interp-level `__import__` as the space's
+/// `baseobjspace.py` — record the interp-level `__import__` as the space's
 /// default importer.  Called where `builtins.__import__` is bound, which is
 /// what `moduledef.py:87 startup` copies from.
 ///
@@ -3676,7 +3676,7 @@ fn exec_code_module(
             }
         }
     }
-    // importing.py:300 code_w.exec_code(space, w_dict, w_dict) → eval.py:31-33
+    // importing.py:300 code_w.exec_code(space, w_dict, w_dict) → eval.py
     // Code.exec_code → space.createframe(...) + frame.run().  Surface
     // initialize_frame_scopes' freevar/closure mismatch (TypeError /
     // ValueError per pyframe.py:242-253) as PyError so the importer
@@ -3690,7 +3690,7 @@ fn exec_code_module(
 }
 
 // ── appleveldef_install ──────────────────────────────────────────────
-// PyPy equivalent: `pypy/interpreter/mixedmodule.py:135 MixedModule.get`
+// PyPy equivalent: `pypy/interpreter/mixedmodule.py MixedModule.get`
 // resolves an `appleveldefs` entry by lazily executing the sibling
 // `app_*.py` file into a per-mixedmodule namespace and reading the
 // named attribute.  Pyre's macro form bundles all entries from one app
@@ -3728,10 +3728,10 @@ pub fn appleveldef_install(
 /// [`appleveldef_install`] with `seed` bound into the app namespace before the
 /// source runs.
 ///
-/// `mixedmodule.py:135 MixedModule.get` executes the sibling app file lazily, on
+/// `mixedmodule.py MixedModule.get` executes the sibling app file lazily, on
 /// the first access to a name it defines, so by then the module is importable
 /// and the file can reach its own interp-level types through a plain
-/// `import _io` (`app_io.py:1`).  pyre installs app files eagerly from the
+/// `import _io` (`app_io.py`).  pyre installs app files eagerly from the
 /// module initializer, before the module object exists, so a name the source
 /// needs from its own module is bound up front instead.
 pub fn appleveldef_install_seeded(
@@ -4223,7 +4223,7 @@ fn load_part(
     // the fully-qualified name.
     let full_is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(modulename);
     if full_is_builtin {
-        // `pypy/interpreter/module.py:18 Module.__init__` keeps a single
+        // `pypy/interpreter/module.py Module.__init__` keeps a single
         // `Module` per imported module name; `space.builtin` IS the
         // module returned by `import builtins`.  Pyre's
         // `ExecutionContext::get_builtin()` lazily caches the Module
@@ -4456,7 +4456,7 @@ fn absolute_import(
                 &full_name,
             ));
         };
-        // _bootstrap._find_and_load (_bootstrap.py:1346-1352): bind the
+        // _bootstrap._find_and_load (_bootstrap.py): bind the
         // submodule as an attribute of its parent package so `import a.b`
         // makes `a.b` reachable. Only an AttributeError is swallowed (with an
         // ImportWarning); any other exception propagates.
@@ -4684,7 +4684,7 @@ fn strip_bootstrap_traceback_frames(mut err: crate::PyError) -> crate::PyError {
 
 /// Native counterpart of RPython `str.find(char, start) -> Signed`.
 ///
-/// `interp_import.py:76 interp___import__` reads `name.find(".")` as a Signed
+/// `interp_import.py interp___import__` reads `name.find(".")` as a Signed
 /// with `-1` for "no dot".  Rust's `str::find` returns `Option<usize>` and
 /// takes no start, so the interpreter carries this exact compatibility
 /// function and the translator emits the orthodox RPython string method
@@ -4703,7 +4703,7 @@ fn rpython_str_find_char(value: &str, needle: char, start: i64) -> i64 {
 
 /// Native counterpart of RPython `s[:stop]`.
 ///
-/// `interp_import.py:79` slices the dotted name as `name[:dotindex]`.  The
+/// `interp_import.py` slices the dotted name as `name[:dotindex]`.  The
 /// caller has just proved that `stop` is a non-negative byte index returned by
 /// `rpython_str_find_char`, so translation replaces this exact helper with the
 /// existing post-annotation `getslice(s, 0, stop)` marker.
@@ -5241,7 +5241,7 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
         return Ok(None);
     }
 
-    // `space.finditem_str` (baseobjspace.py:870-878) maps only KeyError to a
+    // `space.finditem_str` (baseobjspace.py) maps only KeyError to a
     // missing entry; any other `__getitem__` error (a dict-subclass globals
     // raising) must propagate.  `?` re-raises it; `if let Some(..)` consumes
     // the present case.
@@ -5309,7 +5309,7 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
 //
 // Get an attribute from the module on TOS. Like `space.getattr(w_module, w_name)`.
 
-/// `importing.py:430 get_spec` — `space.getattr(w_module, '__spec__')`,
+/// `importing.py get_spec` — `space.getattr(w_module, '__spec__')`,
 /// returning None when the module carries no `__spec__`.  Only a missing
 /// attribute is suppressed; any other lookup error propagates.
 pub(crate) fn get_spec(module: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -5320,7 +5320,7 @@ pub(crate) fn get_spec(module: PyObjectRef) -> Result<PyObjectRef, crate::PyErro
     }
 }
 
-/// `importing.py:438 is_spec_initializing` — a spec whose `_initializing`
+/// `importing.py is_spec_initializing` — a spec whose `_initializing`
 /// flag is truthy marks a module still executing, the circular-import signal.
 /// A missing `_initializing` reads as not initializing; any other lookup error,
 /// and the truth test itself, propagate.
@@ -5336,7 +5336,7 @@ pub(crate) fn is_spec_initializing(w_spec: PyObjectRef) -> Result<bool, crate::P
     crate::baseobjspace::is_true(w_initializing)
 }
 
-/// `importing.py:452 is_spec_uninitialized_submodule` — the name appears in the
+/// `importing.py is_spec_uninitialized_submodule` — the name appears in the
 /// spec's `_uninitialized_submodules` list.  A missing attribute reads as not a
 /// submodule; any other lookup error, and the containment test, propagate.
 pub(crate) fn is_spec_uninitialized_submodule(
@@ -5464,7 +5464,7 @@ pub fn import_from(
     name: &str,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // pyopcode.py:1127 import_from — first `space.getattr(w_module, w_name)`,
+    // pyopcode.py import_from — first `space.getattr(w_module, w_name)`,
     // which honours the module attribute protocol (`__getattribute__` /
     // `__getattr__`).  Only an AttributeError falls through to the submodule
     // import below; any other error propagates.
@@ -5547,7 +5547,7 @@ pub fn import_from(
     // path=pkgpath)`: `pkgname` is the package `__name__` (default "<unknown
     // module name>"), `pkgpath` its `__file__` (`get_path`, default "unknown
     // location").  pyopcode.py:1152 resolves the name via
-    // `space.getattr(w_module, '__name__')` and importing.py:460-470 `get_path`
+    // `space.getattr(w_module, '__name__')` and importing.py `get_path`
     // via `space.getattr(w_module, '__file__')`, so a descriptor- or
     // `__getattr__`-supplied value and a non-module `from` target are honored;
     // a missing / None path takes the default.
@@ -5561,7 +5561,7 @@ pub fn import_from(
     // collect; the name string is young and movable, so pin it and read it
     // back from the slot afterwards.
     pyre_object::gc_roots::pin_root(w_pkgname);
-    // pypy/module/imp/importing.py:460 get_path — a non-str `__file__`
+    // pypy/module/imp/importing.py get_path — a non-str `__file__`
     // (including None) reports the location as unknown.
     let w_pkgpath = match crate::baseobjspace::getattr_str(module, "__file__") {
         Ok(v) if unsafe { pyre_object::is_str(v) } => v,
@@ -5637,7 +5637,7 @@ pub fn import_from(
 }
 
 // ── import_all_from ──────────────────────────────────────────────────
-// PyPy equivalent: pyopcode.py:2221-2258 `import_all_from(module,
+// PyPy equivalent: pyopcode.py `import_all_from(module,
 // into_locals)` (applevel function called by IMPORT_STAR).
 
 fn type_name_for_err(w_obj: PyObjectRef) -> String {
@@ -5649,7 +5649,7 @@ fn type_name_for_err(w_obj: PyObjectRef) -> String {
     }
 }
 
-/// pypy/interpreter/pyopcode.py:2221-2258 `import_all_from` — applevel
+/// pypy/interpreter/pyopcode.py `import_all_from` — applevel
 /// driver.  Iterates `for name in all:` lazily via `space.iter` /
 /// `space.next`, applies the per-name str check + leading-underscore
 /// filter, and invokes `write` once per accepted name.  Used by the
@@ -5697,7 +5697,7 @@ where
                 match crate::baseobjspace::getattr_str(module, "__dict__") {
                     Ok(w_dict) => {
                         let w_keys_method = crate::baseobjspace::getattr_str(w_dict, "keys")?;
-                        // pyopcode.py:2230 `all = dict.keys()` — pyre's
+                        // pyopcode.py `all = dict.keys()` — pyre's
                         // `call_function` stashes errors as PY_NULL; use
                         // `call_and_check` so a misbehaving `keys()` (or
                         // `__getattr__`-installed override) raises here
@@ -5718,7 +5718,7 @@ where
             Err(e) => return Err(e),
         };
 
-    // pyopcode.py:2235-2237 — `module_name = module.__name__` with str check.
+    // pyopcode.py — `module_name = module.__name__` with str check.
     let module_name_w = crate::baseobjspace::getattr_str(module, "__name__")?;
     if !unsafe { is_str(module_name_w) } {
         return Err(crate::PyError::type_error(format!(
@@ -5728,7 +5728,7 @@ where
     }
     let module_name = unsafe { pyre_object::w_str_get_value(module_name_w) }.to_string();
 
-    // pyopcode.py:2239 — `for name in all:` lazy iteration.
+    // pyopcode.py — `for name in all:` lazy iteration.
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
     loop {
         let w_name = match crate::baseobjspace::next(w_iter) {
@@ -5736,7 +5736,7 @@ where
             Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
         };
-        // pyopcode.py:2240-2255 — per-name str check.
+        // pyopcode.py — per-name str check.
         if !unsafe { is_str(w_name) } {
             let (container, accessor) = if skip_leading_underscores {
                 ("__dict__", "Key")
@@ -5754,14 +5754,14 @@ where
         if skip_leading_underscores && name.starts_with('_') {
             continue;
         }
-        // pyopcode.py:2258 — `into_locals[name] = getattr(module, name)`.
+        // pyopcode.py — `into_locals[name] = getattr(module, name)`.
         let value = crate::baseobjspace::getattr_str(module, &name)?;
         write(&name, value)?;
     }
     Ok(())
 }
 
-/// pypy/interpreter/pyopcode.py:2221-2258 `import_all_from` — applies each
+/// pypy/interpreter/pyopcode.py `import_all_from` — applies each
 /// public name to the locals mapping object via `space.setitem`.  Errors from
 /// `__setitem__` propagate (a misbehaving mapping surfaces its TypeError /
 /// KeyError to the caller).

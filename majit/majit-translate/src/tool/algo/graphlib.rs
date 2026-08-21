@@ -16,7 +16,7 @@
 //!   * `break_cycles` — upstream disables it with `py.test.skip(...)`
 //!     ("not used any more", `graphlib.py:205-209`); the live edge-cutting
 //!     entry point is [`break_cycles_v`].
-//!   * `show_graph` — a graphviz/GUI debug helper (`graphlib.py:398`) with
+//!   * `show_graph` — a graphviz/GUI debug helper (`graphlib.py`) with
 //!     no translation-time consumer.
 
 use std::collections::{HashMap, HashSet};
@@ -24,7 +24,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::rc::Rc;
 
-/// `class Edge` at `graphlib.py:14-19`.
+/// `class Edge` at `graphlib.py`.
 ///
 /// Upstream stores only `source`/`target`, but callers tack extra
 /// attributes onto the instance — e.g. `innerloop` sets `edge.link`
@@ -39,7 +39,7 @@ pub struct Edge<V, P = ()> {
     pub payload: P,
 }
 
-/// `Edge.__repr__` at `graphlib.py:18`: `'%r -> %r' % (source, target)`.
+/// `Edge.__repr__` at `graphlib.py`: `'%r -> %r' % (source, target)`.
 /// `%r` is repr, so this lands on `Debug`; the payload is not part of the
 /// upstream repr.
 impl<V: fmt::Debug, P> fmt::Debug for Edge<V, P> {
@@ -49,7 +49,7 @@ impl<V: fmt::Debug, P> fmt::Debug for Edge<V, P> {
 }
 
 impl<V> Edge<V, ()> {
-    /// `Edge(source, target)` with no extra payload (`graphlib.py:15`).
+    /// `Edge(source, target)` with no extra payload (`graphlib.py`).
     pub fn new(source: V, target: V) -> Self {
         Edge {
             source,
@@ -127,7 +127,7 @@ impl<V: Eq + Hash + Clone> VertexSet<V> for Vec<V> {
 /// with that vertex as their source.
 pub type EdgeDict<V, P> = HashMap<V, Vec<Rc<Edge<V, P>>>>;
 
-/// `make_edge_dict(edge_list)` at `graphlib.py:21-27`.
+/// `make_edge_dict(edge_list)` at `graphlib.py`.
 ///
 /// Puts a list of edges into the official dict format: every edge is
 /// filed under its `source`, and every `target` is guaranteed to be a
@@ -149,7 +149,7 @@ where
     edges
 }
 
-/// `copy_edges(edges)` at `graphlib.py:313-318`: a copy whose lists are
+/// `copy_edges(edges)` at `graphlib.py`: a copy whose lists are
 /// fresh (`value[:]`) but whose `Edge` objects are shared.
 pub fn copy_edges<V, P>(edges: &EdgeDict<V, P>) -> EdgeDict<V, P>
 where
@@ -169,7 +169,7 @@ pub enum DfsEvent {
     Stop,
 }
 
-/// `depth_first_search(root, vertices, edges)` at `graphlib.py:29-50`.
+/// `depth_first_search(root, vertices, edges)` at `graphlib.py`.
 ///
 /// Returns the start/stop event stream of an iterative DFS from `root`,
 /// only descending into targets that are in `vertices`.
@@ -223,7 +223,7 @@ where
     }
 }
 
-/// `vertices_reachable_from(root, vertices, edges)` at `graphlib.py:52-55`.
+/// `vertices_reachable_from(root, vertices, edges)` at `graphlib.py`.
 pub fn vertices_reachable_from<V, P, S>(root: &V, vertices: &S, edges: &EdgeDict<V, P>) -> Vec<V>
 where
     V: Eq + Hash + Clone,
@@ -236,7 +236,7 @@ where
         .collect()
 }
 
-/// `strong_components(vertices, edges)` at `graphlib.py:57-96`.
+/// `strong_components(vertices, edges)` at `graphlib.py`.
 ///
 /// Enumerates the strongly connected components of the graph; each is a
 /// set of vertices mutually reachable along the edges.
@@ -315,7 +315,7 @@ enum Visit<V> {
     },
 }
 
-/// `all_cycles(root, vertices, edges)` at `graphlib.py:98-125`.
+/// `all_cycles(root, vertices, edges)` at `graphlib.py`.
 ///
 /// Enumerates cycles, each returned as a list of edges. As upstream
 /// notes, this may not give strictly all cycles when many cycles are
@@ -346,14 +346,14 @@ where
     let mut edgestack: Vec<Rc<Edge<V, P>>> = Vec::new();
     let mut result: Vec<Vec<Rc<Edge<V, P>>>> = Vec::new();
 
-    // `pending = [visit(root)]` (`graphlib.py:118`).
+    // `pending = [visit(root)]` (`graphlib.py`).
     let mut pending: Vec<Visit<V>> = vec![Visit::Pending(root.clone())];
     while !pending.is_empty() {
         let last = pending.len() - 1;
         match &pending[last] {
             Visit::Pending(v) => {
                 let v = v.clone();
-                // `if v not in stackpos:` (`graphlib.py:106`).
+                // `if v not in stackpos:` (`graphlib.py`).
                 match stackpos.get(&v).copied() {
                     Some(pos) => {
                         // else-branch: a back-edge to a vertex still on
@@ -429,7 +429,7 @@ where
     result
 }
 
-/// `find_roots(vertices, edges)` at `graphlib.py:128-151`.
+/// `find_roots(vertices, edges)` at `graphlib.py`.
 ///
 /// A minimal set of vertices from which all others are reachable.
 pub fn find_roots<V, P, S>(vertices: &S, edges: &EdgeDict<V, P>) -> HashSet<V>
@@ -468,7 +468,7 @@ where
     roots
 }
 
-/// `compute_depths(roots, vertices, edges)` at `graphlib.py:154-171`.
+/// `compute_depths(roots, vertices, edges)` at `graphlib.py`.
 ///
 /// The 'depth' of a vertex is its minimal distance from any root.
 pub fn compute_depths<V, P, S>(
@@ -508,7 +508,7 @@ enum AcyclicVisit<V> {
     Active { v: V, idx: usize },
 }
 
-/// `is_acyclic(vertices, edges)` at `graphlib.py:174-202`.
+/// `is_acyclic(vertices, edges)` at `graphlib.py`.
 pub fn is_acyclic<V, P, S>(vertices: &S, edges: &EdgeDict<V, P>) -> bool
 where
     V: Eq + Hash + Clone,
@@ -570,7 +570,7 @@ where
     true
 }
 
-/// `compute_predecessors(vertices, edgedict)` at `graphlib.py:262-267`.
+/// `compute_predecessors(vertices, edgedict)` at `graphlib.py`.
 ///
 /// Upstream's `vertices` argument is unused, so it is dropped here.
 pub fn compute_predecessors<V, P>(edgedict: &EdgeDict<V, P>) -> HashMap<V, HashSet<V>>
@@ -589,7 +589,7 @@ where
     result
 }
 
-/// `remove_leaves(vertices, edgedict)` at `graphlib.py:269-273`.
+/// `remove_leaves(vertices, edgedict)` at `graphlib.py`.
 ///
 /// Recursively removes leaves — vertices with no outgoing edges —
 /// mutating both `vertices` and `edgedict`.
@@ -662,7 +662,7 @@ pub fn remove_leaves_incoming<V, P, T>(
     }
 }
 
-/// `break_cycles_v(vertices, edges)` at `graphlib.py:321-395`.
+/// `break_cycles_v(vertices, edges)` at `graphlib.py`.
 ///
 /// Enumerates a reasonably minimal set of *vertices* to remove to make
 /// the graph acyclic. Each cycle is broken at the vertex furthest from a
@@ -801,7 +801,7 @@ mod tests {
         cycle.iter().map(|e| (e.source, e.target)).collect()
     }
 
-    /// The `TestSimple.edges` graph (`test_graphlib.py:7-15`).
+    /// The `TestSimple.edges` graph (`test_graphlib.py`).
     fn simple_edges() -> EdgeDict<&'static str, ()> {
         let mut edges: EdgeDict<&'static str, ()> = HashMap::new();
         edges.insert("A", vec![e("A", "B"), e("A", "C")]);
@@ -867,7 +867,7 @@ mod tests {
         all_cycles(&1, &vertices, &edges);
     }
 
-    // ---- TestSimple ports (test_graphlib.py:6-101) ----
+    // ---- TestSimple ports (test_graphlib.py) ----
 
     #[test]
     fn test_depth_first_search() {

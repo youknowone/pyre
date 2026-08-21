@@ -238,7 +238,7 @@ pub struct TwoPhaseTypeCache {
 ///
 /// `entries` is the canonical `FunctionPathKey → Rc<PyreFunctionEntry>`
 /// table — one row per distinct callable identity.  Mirrors RPython
-/// `Bookkeeper.descs[Constant(pyobj)] = Desc` (`bookkeeper.py:353-409`),
+/// `Bookkeeper.descs[Constant(pyobj)] = Desc` (`bookkeeper.py`),
 /// where the dict is keyed by Python function-object identity and
 /// holds at most one `FunctionDesc` per callable.
 ///
@@ -264,11 +264,11 @@ pub struct PyreCallRegistry {
     /// `specialize_legacy_graph_with_registry_returning_value_to_var`
     /// call against this
     /// registry.  RPython parity: `Translator.buildannotator()` /
-    /// `:buildrtyper()` (`translator.py:73-83`) construct exactly one
+    /// `:buildrtyper()` (`translator.py`) construct exactly one
     /// of each per Translator, and `RPythonTyper.specialize` runs
     /// exactly once per Translator (`driver.py:345`).  The per-graph
     /// subject is added through `addpendingblock` and rtyped via
-    /// `specialize_more_blocks` (rtyper.py:198-241), which only
+    /// `specialize_more_blocks` (rtyper.py), which only
     /// touches blocks not yet in `already_seen`.
     session: RefCell<
         Option<(
@@ -546,7 +546,7 @@ impl PyreCallRegistry {
             return Ok((ann.clone(), rt.clone()));
         }
         // Mirror `TranslationContext.buildannotator()` /
-        // `buildrtyper()` (`translator.py:69-83`) which both
+        // `buildrtyper()` (`translator.py`) which both
         // construct the slot value and assign it onto the
         // context (`self.annotator = ...`, `self.rtyper = ...`).
         //
@@ -573,7 +573,7 @@ impl PyreCallRegistry {
             &annotator,
         ));
         rtyper.initialize_exceptiondata()?;
-        // rtyper.py:182 — `self.exceptiondata.finish(self)` is the
+        // rtyper.py — `self.exceptiondata.finish(self)` is the
         // prologue of `RPythonTyper.specialize()`.  In pyre's
         // incremental per-subject flow `specialize()` is not called as
         // a single driver; per-subject `specialize_more_blocks()` runs
@@ -853,7 +853,7 @@ impl PyreCallRegistry {
     /// `bookkeeper.py:362-364`).
     ///
     /// Re-registration with a *different* `Signature` panics — upstream
-    /// `description.py:205 FunctionDesc.__init__` binds the signature
+    /// `description.py FunctionDesc.__init__` binds the signature
     /// to the underlying Python function object once at creation time,
     /// and a single `Constant(<function foo>)` cannot legally project
     /// to two distinct `FunctionDesc.signature` values.  Pyre's
@@ -879,7 +879,7 @@ impl PyreCallRegistry {
             return existing.clone();
         }
         let name = key.name().to_string();
-        // upstream `description.py:193-203 FunctionDesc.__init__` reads
+        // upstream `description.py FunctionDesc.__init__` reads
         // the signature directly; pyre's authoritative signature comes
         // from the `OpKind::Call` lowering site (function declaration's
         // parameter list).
@@ -994,7 +994,7 @@ impl PyreCallRegistry {
 
     /// Number of canonical entries — one row per distinct callable
     /// identity.  Aliases do not count.  Diagnostic only.  Mirrors
-    /// `len(Bookkeeper.descs)` (`bookkeeper.py:353-409`).
+    /// `len(Bookkeeper.descs)` (`bookkeeper.py`).
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.borrow().len()
@@ -1022,8 +1022,8 @@ impl PyreCallRegistry {
     // consumers were per-test invariants asserting the side-table
     // contents.  RPython parity: `Variable.concretetype` and
     // `Constant.concretetype` carry the per-variable / per-constant
-    // LL type after specialise (`history.py:204` `same_constant`,
-    // `model.py:438`); a parallel `FunctionPathKey -> Variable` side
+    // LL type after specialise (`history.py` `same_constant`,
+    // `model.py`); a parallel `FunctionPathKey -> Variable` side
     // map was a pyre-only divergence with no upstream peer.  Real
     // readers must consult `Variable.concretetype` directly through
     // the `PyGraph.graph` already cached on the `PyreFunctionEntry.

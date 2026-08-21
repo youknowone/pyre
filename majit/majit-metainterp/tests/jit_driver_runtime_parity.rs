@@ -7,7 +7,7 @@ use majit_metainterp::{
     virtualizable::VirtualizableInfo,
 };
 
-/// resoperation.py:719/727/739 `inputarg_from_tp(tp)` parity: mint a
+/// resoperation.py/727/739 `inputarg_from_tp(tp)` parity: mint a
 /// sequence of typed `InputArg{Int,Float,Ref}` OpRefs for a test's
 /// `JitState::create_sym`. The caller passes the same `Type` slice
 /// that `extract_live_values` produces values for, so the sym entries

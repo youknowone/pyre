@@ -29,7 +29,7 @@ pub fn w_super_new(
     obj_type: PyObjectRef,
     obj: PyObjectRef,
 ) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
     // `super_type`/`obj_type`/`obj` fields across the GC malloc and re-read their
     // relocated addresses afterwards (a minor collection inside the malloc
     // may move them). A super proxy whose members are reachable only
@@ -170,13 +170,13 @@ pub struct W_Property {
     /// `__doc__` exposed through `GetSetProperty(get_doc, set_doc)`
     /// (descriptor.py:316-318).  NULL plays None.
     pub w_doc: PyObjectRef,
-    /// `descriptor.py:183 self.w_name = None` — set by `__set_name__`
+    /// `descriptor.py self.w_name = None` — set by `__set_name__`
     /// (descriptor.py:274-276) when the property is assigned as a class
     /// attribute.  Surfaced through `__name__` and woven into the
     /// `_properror` accessor messages.  NULL plays unset.
     pub w_name: PyObjectRef,
     /// `descriptor.py:182 self.getter_doc = False` — True when the doc
-    /// was copied from `fget.__doc__` (descriptor.py:196-204); `_copy`
+    /// was copied from `fget.__doc__` (descriptor.py); `_copy`
     /// uses it to drop the inherited doc when the getter is replaced.
     pub getter_doc: bool,
     /// The hidden `mutate_w_fget` field for `descriptor.py:175
@@ -203,7 +203,7 @@ pub struct W_Property {
 ///
 /// PyPy: W_Property.__init__(space, w_fget, w_fset, w_fdel, w_doc)
 pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
     // three accessors across the GC malloc and read back relocated
     // addresses. A property whose `fget`/`fset`/`fdel` is reachable only
     // through it must be GC-traced; a `malloc_typed` property is invisible
@@ -295,14 +295,14 @@ pub unsafe fn w_property_reinit(
     fdel: PyObjectRef,
 ) {
     let prop = obj as *mut W_Property;
-    // `rclass.py:715-718 hook_setfield` emits `jit_force_quasi_immutable`
+    // `rclass.py hook_setfield` emits `jit_force_quasi_immutable`
     // ahead of every store to a `?` field, so the accessors this replaces stop
     // being trace constants before they stop being the live values.  The hook
     // precedes the store and does not consult it, so re-initialising a slot
     // with the value it already holds invalidates as well.  Nothing else
     // revokes them: re-initialising an installed descriptor changes no type's
     // version tag, which is the only other pin a fold over `obj.name` holds.
-    // The `is_installed` test is `pyjitpl.py:1112`'s `mutatebox.nonnull()` — a
+    // The `is_installed` test is `pyjitpl.py`'s `mutatebox.nonnull()` — a
     // property no loop watches pays one load.
     if (*prop).fget_watchers.is_installed() {
         crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fget_watchers);
@@ -319,8 +319,8 @@ pub unsafe fn w_property_reinit(
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// `quasiimmut.py:17-27 get_current_qmut_instance` for
-/// `descriptor.py:175`'s `w_fget?` — resolved at RECORD time so a write
+/// `quasiimmut.py get_current_qmut_instance` for
+/// `descriptor.py`'s `w_fget?` — resolved at RECORD time so a write
 /// reached later in the same trace sees it, and handed back so the loop
 /// compiled from that trace registers on it and `property.__init__` revokes
 /// it.  The
@@ -359,7 +359,7 @@ pub unsafe fn w_property_current_fset_qmut(
     )
 }
 
-/// `descriptor.py:249-250 W_Property.get_doc` — returns the raw slot
+/// `descriptor.py W_Property.get_doc` — returns the raw slot
 /// (NULL plays None; the caller wraps).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -368,7 +368,7 @@ pub unsafe fn w_property_get_doc(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_Property)).w_doc
 }
 
-/// `descriptor.py:252-254 W_Property.set_doc`, with the Python 3.14
+/// `descriptor.py W_Property.set_doc`, with the Python 3.14
 /// `property_set_doc` rule taking precedence: replacing the visible member
 /// does not change whether the constructor originally copied it from the
 /// getter.  `_copy` still needs that provenance so a later `.getter()` can
@@ -415,7 +415,7 @@ pub unsafe fn w_property_get_name(obj: PyObjectRef) -> PyObjectRef {
     (*(obj as *const W_Property)).w_name
 }
 
-/// `descriptor.py:274-276 W_Property.set_name` — record the name the
+/// `descriptor.py W_Property.set_name` — record the name the
 /// property was assigned under.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -436,7 +436,7 @@ pub unsafe fn is_property(obj: PyObjectRef) -> bool {
 
 /// `type(obj) is property`, as opposed to [`is_property`]'s layout test.
 ///
-/// `descroperation.py:169-176 get_and_call_function` spells out why the
+/// `descroperation.py get_and_call_function` spells out why the
 /// difference decides who may take an accessor shortcut: `typ = type(w_descr)`
 /// then `if typ is Function or typ is FunctionWithFixedCode`, with
 /// "isinstance(typ, Function) would not be correct here".  Everything else

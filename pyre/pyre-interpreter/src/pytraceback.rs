@@ -1,4 +1,4 @@
-//! `pypy/interpreter/pytraceback.py:17-115 PyTraceback` line-by-line port.
+//! `pypy/interpreter/pytraceback.py PyTraceback` line-by-line port.
 //!
 //! ```python
 //! class PyTraceback(baseobjspace.W_Root):
@@ -14,7 +14,7 @@
 //! instance: `pytraceback.py:29 self.frame = frame` on a
 //! `baseobjspace.W_Root`, pointing at `pyframe.py:52 class
 //! PyFrame(W_Root)`, which declares no `_alloc_flavor_` and is never
-//! pinned — `rpython/rlib/rgc.py:88-97` documents `pin` as a
+//! pinned — `rpython/rlib/rgc.py` documents `pin` as a
 //! short-lived-buffer facility that does not extend lifetime, and
 //! nothing under `pypy/interpreter/` calls it.  A minor collection
 //! copies the frame (`rpython/memory/gc/incminimark.py:2237`) and
@@ -49,7 +49,7 @@
 
 use pyre_object::pyobject::*;
 
-/// `pytraceback.py:12` `LINENO_NOT_COMPUTED = -sys.maxint-1` —
+/// `pytraceback.py` `LINENO_NOT_COMPUTED = -sys.maxint-1` —
 /// sentinel meaning "please take the lineno from the frame and
 /// `lasti`".  Pyre uses `i64::MIN` to match RPython's `-sys.maxint-1`
 /// idiom (`pytraceback.py:9-12`).
@@ -136,7 +136,7 @@ impl pyre_object::lltype::GcType for PyTraceback {
 }
 
 /// Allocate a fresh traceback.  Mirrors
-/// `pytraceback.py:27-32 PyTraceback.__init__`.
+/// `pytraceback.py PyTraceback.__init__`.
 pub fn w_pytraceback_new(
     frame: *mut crate::pyframe::PyFrame,
     lasti: i64,
@@ -246,7 +246,7 @@ pub unsafe fn w_pytraceback_get_w_next(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const PyTraceback)).w_next }
 }
 
-/// `pytraceback.py:54-62 descr_set_next` — loop-check before writing.
+/// `pytraceback.py descr_set_next` — loop-check before writing.
 /// Raises `ValueError("traceback loop detected")` when the proposed
 /// `w_new_next` chain reaches `obj` itself.
 ///
@@ -295,7 +295,7 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const PyTraceback)).w_code }
 }
 
-/// `pytraceback.py:34-40 PyTraceback.get_lineno` /
+/// `pytraceback.py PyTraceback.get_lineno` /
 /// `descr_get_tb_lineno`:
 ///
 /// ```python
@@ -340,8 +340,8 @@ pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> i64 {
     }
 }
 
-/// The side effect shared by `error.py:359-370 OperationError.get_traceback`
-/// and `interp_exceptions.py:195-200 descr_gettraceback`: a traceback that
+/// The side effect shared by `error.py OperationError.get_traceback`
+/// and `interp_exceptions.py descr_gettraceback`: a traceback that
 /// becomes reachable by app-level code marks its frame escaped, so
 /// `ExecutionContext::leave` forces that frame's vref and the frame stays
 /// inspectable after the JIT frame is gone.
@@ -380,7 +380,7 @@ pub extern "C" fn jit_mark_traceback_escaped(w_traceback: i64) {
     unsafe { mark_traceback_escaped(w_traceback as usize as PyObjectRef) };
 }
 
-/// `pytraceback.py:104-109 record_application_traceback` parity:
+/// `pytraceback.py record_application_traceback` parity:
 ///
 /// ```python
 /// def record_application_traceback(space, operror, frame, last_instruction):

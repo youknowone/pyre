@@ -25,12 +25,12 @@
 // ── DEBUG_ELIDABLE_FUNCTIONS ──
 // rlib/jit.py:11
 
-/// rlib/jit.py:11 — enables runtime consistency checks on elidable functions.
+/// rlib/jit.py — enables runtime consistency checks on elidable functions.
 pub const DEBUG_ELIDABLE_FUNCTIONS: bool = false;
 
 // ── elidable, purefunction ──
-// rlib/jit.py:13 — `@elidable` decorator → proc macro `#[elidable]`
-// rlib/jit.py:75 — `purefunction` is a deprecated alias for `elidable`.
+// rlib/jit.py — `@elidable` decorator → proc macro `#[elidable]`
+// rlib/jit.py — `purefunction` is a deprecated alias for `elidable`.
 //                   Rust users should write `#[elidable]` directly.
 
 // ── hint ──
@@ -49,7 +49,7 @@ pub const DEBUG_ELIDABLE_FUNCTIONS: bool = false;
 /// In Rust, these are separate functions: `promote()`, `promote_string()`, etc.
 /// Virtualizable hints are handled by the `virtualizable!` macro.
 ///
-/// rlib/jit.py:80 — `hint(x, **kwds)` returns x unchanged.
+/// rlib/jit.py — `hint(x, **kwds)` returns x unchanged.
 #[inline(always)]
 pub fn hint<T>(x: T) -> T {
     x
@@ -61,7 +61,7 @@ pub fn hint<T>(x: T) -> T {
 /// Access a virtualizable directly as a structure, without treating it
 /// as a virtualizable.
 ///
-/// rlib/jit.py:88 — `hint(x, access_directly=True)`
+/// rlib/jit.py — `hint(x, access_directly=True)`
 #[inline(always)]
 pub fn hint_access_directly<T>(x: T) -> T {
     hint(x)
@@ -92,7 +92,7 @@ pub fn hint_access_directly<T>(x: T) -> T {
 /// on the far side of a branch — an early return, a loop body, an assertion
 /// behind a null test — are not covered, and each needs its own call.
 ///
-/// rlib/jit.py:90 — `hint(x, fresh_virtualizable=True)`
+/// rlib/jit.py — `hint(x, fresh_virtualizable=True)`
 #[inline(always)]
 pub fn hint_fresh_virtualizable<T>(x: T) -> T {
     hint(x)
@@ -122,7 +122,7 @@ pub fn hint_fresh_virtualizable<T>(x: T) -> T {
 /// Note that promoting a string with `promote` will promote by pointer.
 /// To promote a string by value, see `promote_string`.
 ///
-/// rlib/jit.py:101 — `promote(x) = hint(x, promote=True)`
+/// rlib/jit.py — `promote(x) = hint(x, promote=True)`
 #[inline(always)]
 pub fn promote<T: Copy>(x: T) -> T {
     hint(x)
@@ -133,7 +133,7 @@ pub fn promote<T: Copy>(x: T) -> T {
 
 /// Promote a string by value (not by pointer).
 ///
-/// rlib/jit.py:127 — `promote_string(x) = hint(x, promote_string=True)`
+/// rlib/jit.py — `promote_string(x) = hint(x, promote_string=True)`
 #[inline(always)]
 pub fn promote_string<T: Copy>(x: T) -> T {
     hint(x)
@@ -144,7 +144,7 @@ pub fn promote_string<T: Copy>(x: T) -> T {
 
 /// Promote a unicode string by value (not by pointer).
 ///
-/// rlib/jit.py:130 — `promote_unicode(x) = hint(x, promote_unicode=True)`
+/// rlib/jit.py — `promote_unicode(x) = hint(x, promote_unicode=True)`
 #[inline(always)]
 pub fn promote_unicode<T: Copy>(x: T) -> T {
     hint(x)
@@ -205,7 +205,7 @@ pub fn isvirtual<T: ?Sized>(_value: &T) -> bool {
 /// rlib/jit.py:295
 #[inline(always)]
 pub fn loop_unrolling_heuristic<T>(lst: &[T], size: usize, cutoff: usize) -> bool {
-    // rlib/jit.py:301 — `size == 0 or (isconstant(size) and (isvirtual(lst) or size <= cutoff))`
+    // rlib/jit.py — `size == 0 or (isconstant(size) and (isvirtual(lst) or size <= cutoff))`
     // `isvirtual(lst)` is often lying; also require size to be constant.
     size == 0 || (isconstant(&size) && (isvirtual(lst) || size <= cutoff))
 }
@@ -225,7 +225,7 @@ pub fn we_are_jitted() -> bool {
 // ── _we_are_jitted ──
 // rlib/jit.py:360-361
 
-/// rlib/jit.py:360 — `_we_are_jitted = CDefinedIntSymbolic('0 /* we are not jitted here */', default=0)`
+/// rlib/jit.py — `_we_are_jitted = CDefinedIntSymbolic('0 /* we are not jitted here */', default=0)`
 ///
 /// A C-defined symbolic integer representing the JIT runtime flag at translation
 /// time. In majit this is a runtime thread-local flag exposed via `we_are_jitted()`.
@@ -316,7 +316,7 @@ pub const fn jit_callback(_name: &'static str) {}
 /// rlib/jit.py:465
 #[inline(always)]
 pub fn virtual_ref<T>(x: &T) -> DirectJitVRef<T> {
-    // rlib/jit.py:519 — DirectJitVRef.__init__: assert x is not None
+    // rlib/jit.py — DirectJitVRef.__init__: assert x is not None
     // In Rust a `&T` is never null, so this assertion is statically satisfied.
     DirectJitVRef {
         inner: DirectVRef {
@@ -388,7 +388,7 @@ pub(crate) enum VRefState {
     Invalid,
 }
 
-/// rlib/jit.py:495 — `class DirectVRef(object)`
+/// rlib/jit.py — `class DirectVRef(object)`
 #[derive(Debug)]
 pub struct DirectVRef<T> {
     pub(crate) _x: *const T,
@@ -396,7 +396,7 @@ pub struct DirectVRef<T> {
 }
 
 impl<T> DirectVRef<T> {
-    /// rlib/jit.py:500 — `def __call__(self):`
+    /// rlib/jit.py — `def __call__(self):`
     pub fn force(&mut self) -> Result<&T, InvalidVirtualRef> {
         match self._state {
             // rlib/jit.py:501-502
@@ -410,12 +410,12 @@ impl<T> DirectVRef<T> {
         }
     }
 
-    /// rlib/jit.py:507 — `@property def virtual(self):`
+    /// rlib/jit.py — `@property def virtual(self):`
     pub fn virtual_(&self) -> bool {
         self._state == VRefState::NonForced
     }
 
-    /// rlib/jit.py:513 — `def _finish(self):`
+    /// rlib/jit.py — `def _finish(self):`
     pub(crate) fn _finish(&mut self) {
         if self._state == VRefState::NonForced {
             self._state = VRefState::Invalid;
@@ -426,7 +426,7 @@ impl<T> DirectVRef<T> {
 // ── DirectJitVRef ──
 // rlib/jit.py:517-520
 
-/// rlib/jit.py:517 — `class DirectJitVRef(DirectVRef)`
+/// rlib/jit.py — `class DirectJitVRef(DirectVRef)`
 ///
 /// Rust has no inheritance; modelled as a newtype wrapping `DirectVRef<T>`.
 /// Access to the base class fields goes through `self.inner`.
@@ -436,12 +436,12 @@ pub struct DirectJitVRef<T> {
 }
 
 impl<T> DirectJitVRef<T> {
-    /// rlib/jit.py:500 — delegate to DirectVRef.__call__
+    /// rlib/jit.py — delegate to DirectVRef.__call__
     pub fn force(&mut self) -> Result<&T, InvalidVirtualRef> {
         self.inner.force()
     }
 
-    /// rlib/jit.py:507 — delegate to DirectVRef.virtual
+    /// rlib/jit.py — delegate to DirectVRef.virtual
     pub fn virtual_(&self) -> bool {
         self.inner.virtual_()
     }
@@ -450,7 +450,7 @@ impl<T> DirectJitVRef<T> {
 // ── _virtual_ref_finish ──
 // rlib/jit.py:522-524
 
-/// rlib/jit.py:522 — `def _virtual_ref_finish(vref, x):`
+/// rlib/jit.py — `def _virtual_ref_finish(vref, x):`
 ///
 /// Private helper that asserts identity and calls `_finish()`.
 #[inline(always)]
@@ -460,7 +460,7 @@ fn _virtual_ref_finish<T>(vref: &mut DirectJitVRef<T>, x: &T) {
         std::ptr::eq(vref.inner._x, x),
         "Invalid call to virtual_ref_finish"
     );
-    // rlib/jit.py:524 — vref._finish()
+    // rlib/jit.py — vref._finish()
     vref.inner._finish();
 }
 
@@ -469,7 +469,7 @@ fn _virtual_ref_finish<T>(vref: &mut DirectJitVRef<T>, x: &T) {
 
 /// Pre-made vref for null/absent frames.
 ///
-/// rlib/jit.py:554 — `vref_None = non_virtual_ref(None)`
+/// rlib/jit.py — `vref_None = non_virtual_ref(None)`
 pub const VREF_NONE: DirectVRef<()> = DirectVRef {
     _x: std::ptr::null(),
     _state: VRefState::NonForced,
@@ -503,7 +503,7 @@ pub const ENABLE_ALL_OPTS: &str = "intbounds:rewrite:virtualize:string:pure:earl
 
 /// Documentation strings for each JIT parameter.
 ///
-/// rlib/jit.py:565 — `PARAMETER_DOCS` dict
+/// rlib/jit.py — `PARAMETER_DOCS` dict
 pub fn parameter_doc(name: &str) -> &'static str {
     match name {
         "threshold" => "number of times a loop has to run for it to become hot",
@@ -566,7 +566,7 @@ pub const PARAMETERS: JitParameters = JitParameters {
     vec_cost: 0,
 };
 
-/// rlib/jit.py:588 — PARAMETERS dict
+/// rlib/jit.py — PARAMETERS dict
 #[derive(Debug, Clone)]
 pub struct JitParameters {
     pub threshold: u32,
@@ -598,7 +598,7 @@ pub enum EnableOpts {
 // ── unroll_parameters ──
 // rlib/jit.py:606
 
-/// rlib/jit.py:606 — `unroll_parameters = unrolling_iterable(PARAMETERS.items())`
+/// rlib/jit.py — `unroll_parameters = unrolling_iterable(PARAMETERS.items())`
 ///
 /// The canonical list of (name, default_value_as_i64) pairs used by
 /// `set_user_param` to iterate over all parameters in a fixed order.
@@ -629,7 +629,7 @@ pub const UNROLL_PARAMETERS: &[(&str, i64)] = &[
 // ── _set_param ──
 // rlib/jit.py:812-816
 
-/// rlib/jit.py:812 — `def _set_param(driver, name, value)`
+/// rlib/jit.py — `def _set_param(driver, name, value)`
 ///
 /// Private dispatch to the driver-level parameter setter.
 fn _set_param(params: &mut JitParameters, name: &str, value: i64) -> Result<(), JitHintError> {
@@ -742,7 +742,7 @@ pub fn set_user_param(params: &mut JitParameters, text: &str) -> Result<(), JitH
             };
             continue;
         }
-        // rlib/jit.py:860 — for name1, _ in unroll_parameters:
+        // rlib/jit.py — for name1, _ in unroll_parameters:
         let mut found = false;
         for (name1, _) in UNROLL_PARAMETERS {
             if *name1 == name && *name1 != "enable_opts" {
@@ -777,8 +777,8 @@ pub fn set_user_param(params: &mut JitParameters, text: &str) -> Result<(), JitH
 /// See also `assert_not_none(x)`, which asserts that x is not None
 /// and also assures the JIT that it is the case.
 ///
-/// rlib/jit.py:1181 — `assert type(value) is cls`. RPython
-/// `ll_record_exact_class(ll_value, ll_cls)` (rlib/jit.py:1191) asserts
+/// rlib/jit.py — `assert type(value) is cls`. RPython
+/// `ll_record_exact_class(ll_value, ll_cls)` (rlib/jit.py) asserts
 /// `ll_type(ll_value) is ll_cls`.  The blackhole bytecode signature is
 /// `record_exact_class/ri` (`blackhole.py:616`): the instance is a ref
 /// and the class pointer travels through the int register bank.
@@ -849,7 +849,7 @@ pub fn record_exact_class<V: RecordExactClassValue>(value: V, cls: usize) {
 }
 
 // ── assert_not_none ──
-// rtyper/debug.py:23-26 ll_assert_not_none
+// rtyper/debug.py ll_assert_not_none
 
 /// Assure the JIT that value is not None.
 ///
@@ -871,7 +871,7 @@ pub fn assert_not_none<T>(x: Option<T>) -> T {
 
 /// Marker, special-cased by jtransform during JIT compilation.
 ///
-/// rlib/jit.py:1220 — `def _jit_record_known_result(result, function, *args): pass`
+/// rlib/jit.py — `def _jit_record_known_result(result, function, *args): pass`
 ///
 /// At runtime this is a no-op. During JIT tracing, the codewriter
 /// converts calls to this function into a `RecordKnownResult` operation
@@ -921,7 +921,7 @@ pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const
 //
 // Use the `conditional_call!` macro in `#[jit_interp]` functions for the
 // JIT path. The plain function below is the non-JIT runtime helper —
-// rlib/jit.py:1301-1316 `conditional_call` falls back to `if condition:
+// rlib/jit.py `conditional_call` falls back to `if condition:
 // function(*args)` outside JIT.
 
 /// Does the same as:
@@ -1204,7 +1204,7 @@ mod tests {
         let lst: &[i32] = &[];
         assert!(loop_unrolling_heuristic(lst, 0, 2));
         let lst = &[1, 2];
-        // rlib/jit.py:301 — requires isconstant(size); runtime false → returns false.
+        // rlib/jit.py — requires isconstant(size); runtime false → returns false.
         assert!(!loop_unrolling_heuristic(lst, 2, 2));
     }
 

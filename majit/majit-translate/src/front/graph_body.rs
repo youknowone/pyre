@@ -1,8 +1,8 @@
 //! On-demand construction of a funcobj's lowered body.
 //!
-//! `translator.py:55 buildflowgraph(func)` builds a function's flow graph
+//! `translator.py buildflowgraph(func)` builds a function's flow graph
 //! from the function object when a consumer first asks for it, and
-//! `description.py:1037 FunctionDesc.cachedgraph` is that consumer: a
+//! `description.py FunctionDesc.cachedgraph` is that consumer: a
 //! cache miss builds, a hit returns.  Nothing in upstream builds every
 //! reachable function's graph up front — `translator.graphs` *is* the set
 //! that demand has already reached.
@@ -67,7 +67,7 @@ impl GraphBodyProvider {
     /// Locate the funcobj whose Charon `name_path()` is `name_path`, if
     /// exactly one carries it.
     ///
-    /// `bookkeeper.py:361 getdesc(pyobj)` keys a descriptor by the function
+    /// `bookkeeper.py getdesc(pyobj)` keys a descriptor by the function
     /// object itself, so two distinct functions are never conflated even
     /// when they render the same name.  A name path carries no such
     /// identity, and nothing stops two extracted `FunDecl`s from sharing

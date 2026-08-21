@@ -27,7 +27,7 @@ pub const IS_32BIT: bool = SIZEOFSIGNED == 4;
 // RPython Array(Unsigned) has a length prefix followed by items.
 pub const NULLGCMAP: *const u8 = std::ptr::null();
 
-// ── JITFRAMEINFO (jitframe.py:30-40) ────────────────────────────────
+// ── JITFRAMEINFO (jitframe.py) ────────────────────────────────
 
 /// RPython JITFRAMEINFO — per-compiled-loop metadata.
 ///
@@ -52,10 +52,10 @@ pub struct JitFrameInfo {
 pub const JITFRAMEINFO_SIZE: usize = 2 * SIZEOFSIGNED;
 const _: () = assert!(std::mem::size_of::<JitFrameInfo>() == JITFRAMEINFO_SIZE);
 
-// jitframe.py:18-22 — jitframeinfo_update_depth
-// jitframe.py:24-26 — jitframeinfo_clear
+// jitframe.py — jitframeinfo_update_depth
+// jitframe.py — jitframeinfo_clear
 impl JitFrameInfo {
-    /// jitframe.py:18-22 `jitframeinfo_update_depth(jfi, base_ofs, new_depth)`.
+    /// jitframe.py `jitframeinfo_update_depth(jfi, base_ofs, new_depth)`.
     ///
     /// The fields are `isize` (lltype.Signed = machine word); the frame-depth
     /// call sites (CompiledLoopToken / backend assemblers) thread `base_ofs`
@@ -81,7 +81,7 @@ impl JitFrameInfo {
 pub const NULLFRAMEINFO: *const JitFrameInfo = std::ptr::null();
 pub type JitFrameInfoPtr = *const JitFrameInfo;
 
-// ── JITFRAME (jitframe.py:59-91) ────────────────────────────────────
+// ── JITFRAME (jitframe.py) ────────────────────────────────────
 
 /// RPython JITFRAME — the GC-managed frame for compiled code.
 ///
@@ -133,7 +133,7 @@ pub struct JitFrame {
 /// RPython equivalent: `JITFRAME_FIXED_SIZE` in backend arch.py.
 pub const JITFRAME_FIXED_SIZE: usize = std::mem::size_of::<JitFrame>();
 
-// jitframe.py:93-95 — getofs(name)
+// jitframe.py — getofs(name)
 // Offset constants for codegen.
 pub const JF_FRAME_INFO_OFS: i32 = std::mem::offset_of!(JitFrame, jf_frame_info) as i32;
 pub const JF_DESCR_OFS: i32 = std::mem::offset_of!(JitFrame, jf_descr) as i32;
@@ -267,7 +267,7 @@ impl JitFrame {
         JITFRAME_FIXED_SIZE + SIZEOFSIGNED * (1 + depth) // +1 for length field
     }
 
-    /// jitframe.py:48-52 — jitframe_allocate.
+    /// jitframe.py — jitframe_allocate.
     ///
     /// Initialize a freshly-allocated (zero-filled) JitFrame at `ptr`.
     /// Caller is responsible for allocation (nursery or malloc).
@@ -318,7 +318,7 @@ impl JitFrame {
         }
     }
 
-    /// jitframe.py:54-57 — jitframe_resolve.
+    /// jitframe.py — jitframe_resolve.
     /// # Safety
     /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
     /// invariant required by the object and pointer arguments for the entire call.
@@ -349,7 +349,7 @@ impl JitFrame {
     }
 }
 
-// ── jitframe_trace (jitframe.py:104-136) ────────────────────────────
+// ── jitframe_trace (jitframe.py) ────────────────────────────
 
 /// GC trace callback for JitFrame.
 ///
@@ -379,18 +379,18 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
             return; // done
         }
 
-        // jitframe.py:118 — gcmap_lgt = (gcmap + GCMAPLENGTHOFS).signed[0]
+        // jitframe.py — gcmap_lgt = (gcmap + GCMAPLENGTHOFS).signed[0]
         let gcmap_lgt = *(gcmap_raw.add(GCMAPLENGTHOFS) as *const isize);
 
         // jitframe.py:119-135
         let mut no: isize = 0;
         while no < gcmap_lgt {
-            // jitframe.py:121 — cur = (gcmap + GCMAPBASEOFS + UNSIGN_SIZE * no).unsigned[0]
+            // jitframe.py — cur = (gcmap + GCMAPBASEOFS + UNSIGN_SIZE * no).unsigned[0]
             let cur = *(gcmap_raw.add(GCMAPBASEOFS + UNSIGN_SIZE * no as usize) as *const usize);
             let mut bitindex: usize = 0;
             while bitindex < max {
                 if cur & (1usize << bitindex) != 0 {
-                    // jitframe.py:126 — index = no * SIZEOFSIGNED * 8 + bitindex
+                    // jitframe.py — index = no * SIZEOFSIGNED * 8 + bitindex
                     let index = no as usize * SIZEOFSIGNED * 8 + bitindex;
                     // jitframe.py:128-130 — sanity check
                     let frame_lgt =
@@ -420,7 +420,7 @@ pub unsafe fn jitframe_trace(obj_addr: *mut JitFrame, mut trace_callback: impl F
 /// Adapts `jitframe_trace(*mut JitFrame, FnMut(*mut usize))` to the
 /// `CustomTraceFn(usize, &mut dyn FnMut(*mut GcRef))` interface.
 ///
-/// jitframe.py:49 — `rgc.register_custom_trace_hook(JITFRAME, lambda_jitframe_trace)`
+/// jitframe.py — `rgc.register_custom_trace_hook(JITFRAME, lambda_jitframe_trace)`
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -435,10 +435,10 @@ pub unsafe fn jitframe_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maji
 
 /// Build a `TypeInfo` for JitFrame with the custom trace hook registered.
 ///
-/// jitframe.py:48-52 — the `jitframe_allocate` function registers
+/// jitframe.py — the `jitframe_allocate` function registers
 /// the custom trace hook on first call. In pyre, the TypeInfo is
 /// registered once with `gc.register_type(jitframe_type_info())`.
-/// jitframe.py:48-52 — JITFRAME is a GcStruct with a trailing Array(Signed).
+/// jitframe.py — JITFRAME is a GcStruct with a trailing Array(Signed).
 /// GC must know the varsize layout to copy the full object (header + array).
 ///
 /// Layout: [JitFrame header (56 bytes)] [length: Signed] [items: Signed...]
@@ -467,15 +467,15 @@ pub fn jitframe_prefer_oldgen() -> bool {
     true
 }
 
-// ── realloc_frame (llmodel.py:127-154) ──────────────────────────────
+// ── realloc_frame (llmodel.py) ──────────────────────────────
 
 /// Reallocate a JITFRAME when the frame-depth requirement exceeds its
 /// current allocation. Ported from `rpython/jit/backend/llsupport/
-/// llmodel.py:127-154 realloc_frame`.
+/// llmodel.py realloc_frame`.
 ///
 /// The assembler-emitted `_frame_realloc_slowpath`
 /// (`aarch64/assembler.py:434-493`) calls this helper after
-/// `_check_frame_depth` (`aarch64/assembler.py:927-961`) detects
+/// `_check_frame_depth` (`aarch64/assembler.py`) detects
 /// `jf_frame.length < expected_depth`.
 ///
 /// `alloc` is a raw allocator: given `size_bytes` it must return a

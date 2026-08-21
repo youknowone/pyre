@@ -632,7 +632,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 );
             }
         } else {
-            // listobject.py:1052 `_extend_from_iterable` asks for a length
+            // listobject.py `_extend_from_iterable` asks for a length
             // hint before `_do_extend_from_iterable` obtains and consumes the
             // iterator.  Hint failures other than TypeError/AttributeError are
             // observable and propagate without appending a prefix.
@@ -647,7 +647,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             let iterator =
                 crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(root_base + 1))?;
             pyre_object::gc_roots::pin_root(iterator);
-            // listobject.py:1052 _extend_from_iterable — consult the length
+            // listobject.py _extend_from_iterable — consult the length
             // hint before iterating.  A `__length_hint__` returning a negative
             // value raises ValueError, and one exceeding a C ssize_t raises
             // OverflowError (via `int_w`), rather than being silently ignored.
@@ -715,7 +715,7 @@ pub fn list_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 /// PyPy: listobject.py descr_pop — list.pop([index])
-/// listobject.py:759-772 — empty list raises "pop from empty list",
+/// listobject.py — empty list raises "pop from empty list",
 /// otherwise out-of-range raises "pop index out of range".
 pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "pop", true)?;
@@ -736,7 +736,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             "pop from empty list",
         ));
     }
-    // listobject.py:766-767 — clearly distinguish list.pop() from the
+    // listobject.py — clearly distinguish list.pop() from the
     // general list.pop(index) path.
     if index == -1 {
         return match unsafe { pyre_object::listobject::w_list_pop_end(args[0]) } {
@@ -830,7 +830,7 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_none())
 }
 
-/// listobject.py:795 `descr_index` — list.index(value[, start[, stop]]).
+/// listobject.py `descr_index` — list.index(value[, start[, stop]]).
 pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "index", true)?;
     arity_at_least(args, "index", 1)?;
@@ -883,7 +883,7 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     }
 }
 
-/// listobject.py:744 `descr_count` — list.count(value)
+/// listobject.py `descr_count` — list.count(value)
 pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "count", true)?;
     arity_exact(args, "count", 1)?;
@@ -898,7 +898,7 @@ pub fn list_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     }
 }
 
-/// listobject.py:782 `descr_remove` — list.remove(value).
+/// listobject.py `descr_remove` — list.remove(value).
 pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_list_receiver(args, "remove", true)?;
     arity_exact(args, "remove", 1)?;
@@ -929,7 +929,7 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             crate::builtins::sequence_fast(iterable, "can only join an iterable")?
         }
     };
-    // pypy/objspace/std/unicodeobject.py:856-872 descr_join — each
+    // pypy/objspace/std/unicodeobject.py descr_join — each
     // element must be a str; otherwise TypeError("sequence item N:
     // expected str instance, <T> found"). Silently dropping non-str
     // items lost the error and produced an empty join.
@@ -1089,7 +1089,7 @@ pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let s = unsafe { w_str_get_wtf8(args[0]) };
     let (sep_arg, maxsplit_arg) = resolve_split_args(args, "split")?;
     let sep = parse_split_sep(sep_arg)?;
-    // `unicodeobject.py:972 @unwrap_spec(maxsplit=int) descr_split` —
+    // `unicodeobject.py @unwrap_spec(maxsplit=int) descr_split` —
     // `space.int_w(w_maxsplit)` routes through `__index__`, so any
     // int-like object (subclass, numpy int, etc.) is accepted.
     let maxsplit = parse_split_maxsplit(maxsplit_arg)?;
@@ -1118,7 +1118,7 @@ pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_list_new(parts))
 }
 
-/// `pypy/objspace/std/unicodeobject.py:992-994 W_UnicodeObject
+/// `pypy/objspace/std/unicodeobject.py W_UnicodeObject
 /// .convert_arg_to_w_unicode` parity — `sep` must be `None` or a
 /// `str`; anything else surfaces a TypeError at the same call site
 /// where PyPy's `space.unicode_w` would.
@@ -1152,7 +1152,7 @@ fn parse_split_maxsplit(value: PyObjectRef) -> Result<i64, crate::PyError> {
     crate::builtins::space_index_w(value)
 }
 
-/// `pypy/objspace/std/unicodeobject.py:993-1024 W_UnicodeObject
+/// `pypy/objspace/std/unicodeobject.py W_UnicodeObject
 /// .descr_rsplit`.  Mirrors `split` semantics in reverse — when
 /// `maxsplit` is positive, only the rightmost `maxsplit` separators
 /// participate.  Argument validation follows the same
@@ -1187,7 +1187,7 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(w_list_new(parts))
 }
 
-/// `pypy/objspace/std/unicodeobject.py:767-770 W_UnicodeObject.descr_casefold`:
+/// `pypy/objspace/std/unicodeobject.py W_UnicodeObject.descr_casefold`:
 ///
 /// ```python
 /// def descr_casefold(self, space):
@@ -1208,7 +1208,7 @@ pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     Ok(w_str_from_wtf8_managed(case::casefold_wtf8(s)))
 }
 
-/// `pypy/objspace/std/unicodeobject.py:429-430 W_UnicodeObject
+/// `pypy/objspace/std/unicodeobject.py W_UnicodeObject
 /// .descr_format_map` parity:
 ///
 /// ```python
@@ -1239,7 +1239,7 @@ pub fn str_method_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 ///
 /// Returns the cut itself, not a copy: both `_strip` arms cut
 /// `value[lpos:rpos]` out of the utf8 storage (`_utf8_sliced`,
-/// unicodeobject.py:1456; `_strip_unboxed`, unicodeobject.py:1480), so a strip
+/// unicodeobject.py; `_strip_unboxed`, unicodeobject.py), so a strip
 /// that removes nothing shares its operand's storage — see
 /// [`pyre_object::w_str_cut`].
 fn strip_chars<'a>(s: &'a Wtf8, chars: Option<&Wtf8>, left: bool, right: bool) -> &'a Wtf8 {
@@ -1260,7 +1260,7 @@ fn strip_chars<'a>(s: &'a Wtf8, chars: Option<&Wtf8>, left: bool, right: bool) -
     current
 }
 
-/// `pypy/objspace/std/unicodeobject.py:1464-1473 W_UnicodeObject
+/// `pypy/objspace/std/unicodeobject.py W_UnicodeObject
 /// ._strip` — extract the optional `chars` argument as a `&str`,
 /// raising TypeError on non-str non-None arguments rather than
 /// silently falling through to the whitespace default.
@@ -1313,7 +1313,7 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 
 /// `unicodeobject.py descr_startswith` — accepts either a single str
 /// prefix or a tuple of str prefixes (CPython parity).
-/// unicodeobject.py:848 descr_startswith(self, prefix, start=0, end=sys.maxsize)
+/// unicodeobject.py descr_startswith(self, prefix, start=0, end=sys.maxsize)
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "startswith", 1)?;
     arity_at_most(args, "startswith", 3)?;
@@ -1338,7 +1338,7 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `adapt_lower_bound(_eval_slice_index(...))`, so a non-index bound raises a
 /// TypeError and a bound is coerced via `__index__`.
 ///
-/// `unicodeobject.py:1319 _unwrap_and_compute_idx_params` then converts the
+/// `unicodeobject.py _unwrap_and_compute_idx_params` then converts the
 /// two code-point bounds to byte offsets: a `start` past the end becomes
 /// `end_index + 1` rather than being clamped, and `end` is only lowered when
 /// it is short of the end. `None` signals the resulting window is inverted,
@@ -1472,7 +1472,7 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     crate::builtins::kwarg_reject_unknown(kwargs, &["count"], "replace")?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "replace", "count", pos.get(3).is_some())?;
-    // pypy/objspace/std/unicodeobject.py:1132-1148 descr_replace —
+    // pypy/objspace/std/unicodeobject.py descr_replace —
     // both `old` and `new` must be str / W_UnicodeObject; otherwise
     // TypeError("replace() argument N must be str, not ...").
     if !unsafe { pyre_object::is_str(pos[1]) } {
@@ -1501,7 +1501,7 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         None => -1,
     };
     let (out, replacements) = wtf8_replace(s, old, new, maxcount);
-    // `descr_replace` (unicodeobject.py:1175-1176) returns `self` when nothing
+    // `descr_replace` (unicodeobject.py) returns `self` when nothing
     // was replaced — keyed on the count, so `s.replace('a', 'a')` still builds
     // a new string.  Exact `str` only: a subclass yields a fresh base `str`,
     // and `is_w` rejects a `user_overridden_class` operand
@@ -2423,7 +2423,7 @@ fn pad_to_width(
     })
 }
 
-/// `newformat.py:642-658 Formatter._get_locale`: the decimal point, thousands
+/// `newformat.py Formatter._get_locale`: the decimal point, thousands
 /// separator and group sizes a numeric format renders with.
 ///
 /// Three arms, in upstream's order.  `'n'` takes the current locale.  An
@@ -2457,7 +2457,7 @@ fn get_locale(ty: char, thousands_sep: Option<char>) -> (String, String, Vec<u8>
     }
 }
 
-/// `newformat.py:727-736 Formatter._fill_digits`.  The separator is appended
+/// `newformat.py Formatter._fill_digits`.  The separator is appended
 /// ahead of the digits it precedes because `group_digits` reverses the whole
 /// buffer once at the end.
 ///
@@ -2486,7 +2486,7 @@ fn fill_digits(
     }
 }
 
-/// `newformat.py:738-778 Formatter._group_digits`: separate `digits` at the
+/// `newformat.py Formatter._group_digits`: separate `digits` at the
 /// group sizes `loc_grouping` names, zero-filling out to `min_width` while
 /// doing so.
 ///
@@ -2564,7 +2564,7 @@ fn group_digits(
 mod group_digits_tests {
     use super::{get_locale, group_digits};
 
-    /// Every expectation is what `newformat.py:738-778 _group_digits` returns
+    /// Every expectation is what `newformat.py _group_digits` returns
     /// for the same arguments, taken from the vendored source rather than from
     /// a second implementation of the same rule.
     #[track_caller]
@@ -2929,12 +2929,12 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
 
 /// `PyObject_Format` returning the formatted object rather than its bytes.
 ///
-/// `format_string` (newformat.py:602-608) hands the receiver's own utf8
+/// `format_string` (newformat.py) hands the receiver's own utf8
 /// storage to `self.wrap(...)` once `_parse_spec("s", "<")` reports the
 /// defaults — which only an empty spec does — so `format(s, "")` shares its
-/// operand's storage and `is_w` (unicodeobject.py:110-111) reports the result
+/// operand's storage and `is_w` (unicodeobject.py) reports the result
 /// identical to `s`.  An exact `str` is the whole of that case: a subclass is
-/// converted by `space.str(w_string)` (newformat.py:604) to a fresh base
+/// converted by `space.str(w_string)` (newformat.py) to a fresh base
 /// `str` first, and `is_w` rejects a `user_overridden_class` operand anyway
 /// (unicodeobject.py:106).  Any other receiver, or any non-empty spec, builds
 /// a new string through [`format_value_dispatch`].
@@ -3005,7 +3005,7 @@ pub fn builtin_value_format(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         Wtf8Buf::new()
     };
     if spec.is_empty() {
-        // `format_string` (newformat.py:602-608) wraps the receiver's own utf8
+        // `format_string` (newformat.py) wraps the receiver's own utf8
         // storage when the spec parses to the defaults, so an exact `str`
         // comes back identical (see [`format_value_dispatch_w`]).
         if unsafe { pyre_object::is_exact_type(args[0], &pyre_object::STR_TYPE) } {
@@ -3593,7 +3593,7 @@ fn pad_wtf8(
     Ok(out)
 }
 
-/// runicode.py:333 unicode_encode_utf_8 + interp_codecs.py
+/// runicode.py unicode_encode_utf_8 + interp_codecs.py
 /// surrogatepass / surrogateescape encode branches.  The WTF-8 backing
 /// already stores a lone surrogate as its three-byte sequence, so the
 /// surrogate-free common case is a direct byte copy; surrogate code points
@@ -3634,7 +3634,7 @@ pub(crate) fn encode_utf8_with_errors(
             index + 1
         };
         match err_mode {
-            // surrogatepass_errors encode branch (interp_codecs.py:455-458):
+            // surrogatepass_errors encode branch (interp_codecs.py):
             // emit the three-byte sequence for the surrogate code point.
             "surrogatepass" => {
                 out.push(0xE0 | (code >> 12) as u8);
@@ -3643,7 +3643,7 @@ pub(crate) fn encode_utf8_with_errors(
                 i += 1;
                 continue;
             }
-            // surrogateescape_errors encode branch (interp_codecs.py:528-534):
+            // surrogateescape_errors encode branch (interp_codecs.py):
             // a 0xDC80..0xDCFF surrogate maps back to the byte code-0xDC00;
             // any other surrogate fails.
             "surrogateescape" => {
@@ -4332,7 +4332,7 @@ enum DecodeResume {
     OriginalInput,
 }
 
-/// interp_codecs.py:33-108 `call_errorhandler` (decode branch): invoke a
+/// interp_codecs.py `call_errorhandler` (decode branch): invoke a
 /// custom handler registered through `_codecs.register_error` for a decode
 /// error position.
 /// Returns `(newpos, resume)`.  `newpos` is the byte position to resume
@@ -4483,7 +4483,7 @@ pub(crate) enum EncodeReplacement {
     Bytes(Vec<u8>),
 }
 
-/// interp_codecs.py:33-108 `call_errorhandler` (encode branch): invoke a
+/// interp_codecs.py `call_errorhandler` (encode branch): invoke a
 /// custom handler registered through `_codecs.register_error` for an
 /// encode error span. `start`/`end`/`char_len` are CHARACTER (code-point)
 /// indices into the source; the returned position is a character index to
@@ -4634,7 +4634,7 @@ fn utf16_32_decode_error(
     }
 }
 
-/// `unicodehelper.py str_decode_utf_16_helper` (runicode.py:517).
+/// `unicodehelper.py str_decode_utf_16_helper` (runicode.py).
 fn decode_utf16_impl(
     data: &[u8],
     fixed_be: Option<bool>,
@@ -4704,7 +4704,7 @@ fn decode_utf16_impl(
     Ok((out, pos, byteorder))
 }
 
-/// `unicodehelper.py str_decode_utf_32_helper` (runicode.py:762).  The
+/// `unicodehelper.py str_decode_utf_32_helper` (runicode.py).  The
 /// public codec rejects surrogates (`allow_surrogates=False`), so a
 /// surrogate code point is routed through the error handler.
 fn decode_utf32_impl(
@@ -5467,7 +5467,7 @@ pub(crate) fn rstring_search_normal(
 /// The empty needle is answered here rather than through that path. Any
 /// other needle is a whole encoded sequence, so counting matches over bytes
 /// and counting them over code points give the same number; the empty
-/// needle alone degenerates to `end - start + 1` (`rstring.py:836`), which
+/// needle alone degenerates to `end - start + 1` (`rstring.py`), which
 /// is a length, and the bounds `descr_count` hands down are byte offsets
 /// (`unicodeobject.py:1322` says so). PyPy therefore reports the byte
 /// length plus one for a non-ASCII receiver: `"\xe9\xe8\xe9\xe8\xe9"
@@ -5503,13 +5503,13 @@ fn wtf8_rfind_bounded(haystack: &[u8], needle: &[u8], lo: usize, hi: usize) -> O
     if res == -1 { None } else { Some(res as usize) }
 }
 
-/// PyPy `_unwrap_and_search` (unicodeobject.py:1288-1317) — the shared
+/// PyPy `_unwrap_and_search` (unicodeobject.py) — the shared
 /// path for find/rfind/index/rindex. `start`/`end` (args[2]/args[3])
 /// are codepoint indices: `unwrap_start_stop` adds the length to a
 /// negative value and lower-clamps to 0. The search runs over the
 /// WTF-8 bytes inside that window and the byte offset is converted back
 /// to a codepoint index. Returns None when not found.
-/// `unicodeobject.py:1288 _unwrap_and_search` — the shared path for
+/// `unicodeobject.py _unwrap_and_search` — the shared path for
 /// find/rfind/index/rindex. `start`/`end` (args[2]/args[3]) flow through
 /// `unwrap_start_stop`, so `None` / omitted arguments default, any
 /// `__index__`-bearing object is accepted, and a `TypeError` propagates.
@@ -5589,7 +5589,7 @@ pub fn str_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 /// `unicodeobject.py descr_rindex` — like rfind, but raises ValueError
 /// when the substring is absent.
-/// unicodeobject.py:572 descr_rindex
+/// unicodeobject.py descr_rindex
 pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rindex", 1)?;
     arity_at_most(args, "rindex", 3)?;
@@ -5626,9 +5626,9 @@ pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `None` is an ordinary value and is refused here like any other non-str.
 ///
 /// The operand is converted by two different helpers, and each refuses in its
-/// own words. `descr_center` uses `space.utf8_w` (unicodeobject.py:1101),
+/// own words. `descr_center` uses `space.utf8_w` (unicodeobject.py),
 /// which takes a str and nothing else. `descr_ljust`/`descr_rjust` use
-/// `convert_arg_to_w_unicode` (unicodeobject.py:175-184): it declines `bytes`
+/// `convert_arg_to_w_unicode` (unicodeobject.py): it declines `bytes`
 /// with the message reproduced below, and hands every other non-str to
 /// `decode_object`, which turns a buffer operand into a fill char rather than
 /// refusing it.
@@ -5898,12 +5898,12 @@ fn wtf8_slice_str(bytes: &[u8]) -> PyObjectRef {
 }
 
 /// Replaces up to `maxcount` occurrences of `sub` with `by` over the
-/// WTF-8 bytes (rstring.py:220-309 `replace_count` isutf8 path). A
+/// WTF-8 bytes (rstring.py `replace_count` isutf8 path). A
 /// negative `maxcount` means no limit; an empty `sub` inserts `by` at
 /// every code-point boundary, including the ends.
 ///
 /// Returns the `(res, replacements)` pair `replace_count` does — `descr_replace`
-/// (unicodeobject.py:1175-1176) keys its identity shortcut on the count, not on
+/// (unicodeobject.py) keys its identity shortcut on the count, not on
 /// the resulting bytes.
 fn wtf8_replace(input: &Wtf8, sub: &Wtf8, by: &Wtf8, maxcount: i64) -> (Wtf8Buf, usize) {
     if maxcount == 0 {
@@ -6108,11 +6108,11 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     }
     let s = unsafe { w_str_get_wtf8(pos[0]) };
     let suffix = unsafe { w_str_get_wtf8(pos[1]) };
-    // `descr_removesuffix` (unicodeobject.py:1511-1517) guards the slice arm
+    // `descr_removesuffix` (unicodeobject.py) guards the slice arm
     // with `if suffix and ...`, so an empty suffix falls through to the arm
     // that rewraps the receiver's own storage — `s.removesuffix("") is s` for
     // an exact `str`.  `removeprefix` has no such guard: its slice arm goes
-    // through `ll_stringslice_startonly` (rstr.py:857-858), which has no
+    // through `ll_stringslice_startonly` (rstr.py), which has no
     // whole-span shortcut, so an empty prefix still builds a fresh object.
     if !suffix.is_empty()
         && let Some(rest) = s.strip_suffix(suffix)
@@ -6327,7 +6327,7 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
         if is_dict(obj) {
             return obj;
         }
-        // `pypy/objspace/std/dictproxyobject.py:75-82 keys_w/values_w/
+        // `pypy/objspace/std/dictproxyobject.py keys_w/values_w/
         // items_w` forward through `space.call_method(self.w_mapping,
         // ...)` — the mapping is unwrapped before any dict-method
         // dispatch.  Surface the same shape here so
@@ -6558,13 +6558,13 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
     }
 }
 
-/// `pypy/objspace/std/dictmultiobject.py:585-587 descr_copy` —
+/// `pypy/objspace/std/dictmultiobject.py descr_copy` —
 /// `return w_dict.copy()` which delegates to `strategy.copy(w_dict)`
 /// (`:1152 AbstractTypedStrategy.copy`).  Typed strategies preserve
 /// their backing shape by cloning the typed storage box and wrapping
 /// it in a fresh W_DictObject with the same strategy.  Used by
 /// `dict.copy()` and (via `resolve_dict_backing` proxy unwrap) by
-/// `mappingproxy.copy()` (`dictproxyobject.py:84 copy_w`).
+/// `mappingproxy.copy()` (`dictproxyobject.py copy_w`).
 pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "copy", 0)?;
     let src = resolve_dict_backing(args[0]);
@@ -6579,7 +6579,7 @@ pub fn dict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 /// CPython 3.x signature accepts a single optional positional that is
 /// either a mapping (uses keys()) or an iterable of (key, value) pairs,
 /// followed by arbitrary kwargs that are merged on top.  The trailing
-/// `dictmultiobject.py:1378-1398 update1` — merge `w_data` into
+/// `dictmultiobject.py update1` — merge `w_data` into
 /// `w_dict`.  Shared by `dict.__init__` and `dict.update`.
 pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(), crate::PyError> {
     let dict = resolve_dict_backing(w_dict);
@@ -6602,7 +6602,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
             && pyre_object::is_dict(resolve_dict_backing(data()))
             && dict_subclass_uses_default_iter(data());
         if fast_path_eligible {
-            // `dictmultiobject.py:1401-1406 update1_dict_dict`
+            // `dictmultiobject.py update1_dict_dict`
             let dst_is_empty = pyre_object::dictmultiobject::w_dict_is_regular_empty(dict());
             if dst_is_empty {
                 let w_copy =
@@ -6624,7 +6624,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 let orig_size = pyre_object::dictmultiobject::w_dict_len(source);
                 let mut i = 0;
                 loop {
-                    // `getiteritems_with_hash` (`dictmultiobject.py:991`) — an
+                    // `getiteritems_with_hash` (`dictmultiobject.py`) — an
                     // object- or unicode-shaped source already stores each key's
                     // hash, so reusing it keeps `__hash__` at the single call
                     // that filled the source.  Re-deriving it here is observable
@@ -6668,14 +6668,14 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 }
             }
         } else {
-            // `dictmultiobject.py:1388-1398 update1`
+            // `dictmultiobject.py update1`
             let w_keys_method = match crate::baseobjspace::getattr_str(data(), "keys") {
                 Ok(value) => Some(value),
                 Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
                 Err(e) => return Err(e),
             };
             if let Some(w_method) = w_keys_method {
-                // `dictmultiobject.py:1421-1424 update1_keys`
+                // `dictmultiobject.py update1_keys`
                 let w_keys_view = crate::call::call_function_impl_result(w_method, &[])?;
                 let keys = crate::builtins::collect_iterable(w_keys_view)?;
                 let keys_base = pyre_object::gc_roots::shadow_stack_len();
@@ -6793,7 +6793,7 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
     err
 }
 
-/// `dictmultiobject.py:1430-1443 init_or_update` — shared by `dict.__init__`
+/// `dictmultiobject.py init_or_update` — shared by `dict.__init__`
 /// and `dict.update`; `name` selects the error-message verb (`"dict"` vs
 /// `"update"`). Stores resolve the subclass backing before writing, so a dict
 /// subclass instance is updated through its backing dict rather than its own
@@ -6805,7 +6805,7 @@ pub fn dict_init_or_update(
     args: &[PyObjectRef],
     name: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // `dictmultiobject.py:1430 init_or_update` receives an `Arguments`
+    // `dictmultiobject.py init_or_update` receives an `Arguments`
     // object whose `arguments_w` entries are roots in translated RPython.
     // Keep the flat Rust ABI's equivalent slots live before inspecting the
     // trailing kwargs vehicle or passing an operand to `update1`.
@@ -6855,14 +6855,14 @@ pub fn dict_init_or_update(
     Ok(w_none())
 }
 
-/// `dictmultiobject.py:137-139 descr_update` → `init_or_update`; the verb in
+/// `dictmultiobject.py descr_update` → `init_or_update`; the verb in
 /// the arity error is `update`.
 pub fn dict_method_update(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "update")?;
     dict_init_or_update(args, "update")
 }
 
-/// `dictmultiobject.py:1380-1386 update1` —
+/// `dictmultiobject.py update1` —
 ///
 /// ```python
 /// if (isinstance(w_data, W_DictMultiObject) and
@@ -6902,7 +6902,7 @@ fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
     }
 }
 
-/// `dictmultiobject.py:246-255 descr_pop` →
+/// `dictmultiobject.py descr_pop` →
 /// `strategy.pop(self, w_key, w_default)` — single-operation pop
 /// via strategy dispatch (one hash).
 pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6923,7 +6923,7 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     default.ok_or_else(|| crate::PyError::key_error_with_key(key))
 }
 
-/// `dictmultiobject.py:257` `W_DictMultiObject.descr_popitem`:
+/// `dictmultiobject.py` `W_DictMultiObject.descr_popitem`:
 ///
 /// ```python
 /// def descr_popitem(self, space):
@@ -6958,7 +6958,7 @@ pub fn dict_method_popitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     }
 }
 
-/// `dictmultiobject.py:267-269 descr_setdefault` →
+/// `dictmultiobject.py descr_setdefault` →
 /// `self.setdefault(w_key, w_default)` — delegates to
 /// `strategy.setdefault` as a single atomic operation (one hash).
 pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -7018,7 +7018,7 @@ mod dict_method_tests {
 
     #[test]
     fn dict_setdefault_rejects_unhashable_key() {
-        // `dictmultiobject.py:749-753 EmptyDictStrategy.setdefault`:
+        // `dictmultiobject.py EmptyDictStrategy.setdefault`:
         //   self.switch_to_correct_strategy(w_dict, w_key)
         //   w_dict.setitem(w_key, w_default)
         // `w_dict.setitem` hashes the key via the object strategy's

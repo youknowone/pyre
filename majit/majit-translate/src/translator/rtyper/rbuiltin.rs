@@ -2,8 +2,8 @@
 //! / `SomeBuiltinMethod` annotations.
 //!
 //! Upstream dispatches every `SomeBuiltin(const)` to
-//! [`BuiltinFunctionRepr`] (rbuiltin.py:23-33) and every
-//! `SomeBuiltinMethod` to `BuiltinMethodRepr` (rbuiltin.py:35-50).
+//! [`BuiltinFunctionRepr`] (rbuiltin.py) and every
+//! `SomeBuiltinMethod` to `BuiltinMethodRepr` (rbuiltin.py).
 //! Both repr types carry no runtime value (the function / bound
 //! receiver is known statically) — the calling hop dispatches into a
 //! module-level `BUILTIN_TYPER` registry.
@@ -30,7 +30,7 @@
 //! * `extregistry.specialize_call` (rbuiltin.py:78-81) — the
 //!   [`crate::translator::rtyper::extregistry::ExtRegistryEntry`] type
 //!   has `is_registered` / `lookup` wired for the `_ptr` entry only
-//!   (via `_ptrEntry` at lltype.py:1513-1518, which does not override
+//!   (via `_ptrEntry` at lltype.py, which does not override
 //!   `specialize_call`, matching upstream `AttributeError` when this
 //!   path is hit). The dispatch to `entry.specialize_call` for entry
 //!   types whose upstream subclasses do override it (e.g. `llhelper`,
@@ -86,7 +86,7 @@ use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{ConvertedTo, HighLevelOp, RPythonTyper};
 
-/// RPython `BUILTIN_TYPER = {}` (rbuiltin.py:14).
+/// RPython `BUILTIN_TYPER = {}` (rbuiltin.py).
 ///
 /// Module-level registry mapping builtin callables to their
 /// `rtype_builtin_*` specializer. Upstream populates this dict via
@@ -133,21 +133,21 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 /// inputarg coercion primitive, or `Repr` trait extension) before the
 /// per-typer body can land:
 ///
-///   * rbuiltin.py:234-255 — `min` / `max` landed (`ll_min` / `ll_max`
+///   * rbuiltin.py — `min` / `max` landed (`ll_min` / `ll_max`
 ///     helper graphs keyed per argument lltype).
 ///   * rbuiltin.py:258-261 — `reversed` (need `Repr::newiter` trait
 ///     method + iterator repr family)
-///   * rbuiltin.py:264-305 — `object.__init__` is trivial and landed.
+///   * rbuiltin.py — `object.__init__` is trivial and landed.
 ///     `EnvironmentError.__init__` / `WindowsError.__init__` need
-///     `InstanceRepr::setfield` (rclass.py:511) to lower the
+///     `InstanceRepr::setfield` (rclass.py) to lower the
 ///     `r_self.setfield(v_self, 'errno' / 'strerror' / 'filename' /
 ///     'winerror', ...)` calls; until that helper lands the qualname
 ///     `HostObject`s stay unregistered.
-///   * rbuiltin.py:307-340 — `objectmodel.hlinvoke` (PBC-callable
+///   * rbuiltin.py — `objectmodel.hlinvoke` (PBC-callable
 ///     dispatch)
 ///   * rbuiltin.py:342-344 — `range` / `xrange` / `enumerate`
 ///     (delegate to ported `rrange.py`)
-///   * rbuiltin.py:349-460 — `lltype.malloc` / `free` family fully
+///   * rbuiltin.py — `lltype.malloc` / `free` family fully
 ///     landed (parse_kwds-driven flag plumbing for `flavor` / `zero` /
 ///     `track_allocation` / `add_memory_pressure` / `nonmovable`,
 ///     `malloc_varsize` opname switch on `nb_args == 2`).
@@ -155,7 +155,7 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///     `length_of_simple_gcarray_from_opaque` / `direct_fieldptr` /
 ///     `direct_arrayitems` / `direct_ptradd` / `render_immortal` are
 ///     landed.  Outstanding: `cast_primitive` (rbuiltin.py:471, needs
-///     `gen_cast` helper + the cast-table at `rbuiltin.py:480+`).
+///     `gen_cast` helper + the cast-table at `rbuiltin.py+`).
 ///   * rbuiltin.py:462-600 — `llmemory.*` family (need `Address` /
 ///     `_fakeaddress` ports).  `cast_ptr_to_int` /
 ///     `cast_int_to_ptr` (rbuiltin.py:543/551) are ported —
@@ -173,7 +173,7 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///     TODO: `InstanceRepr→PtrRepr` swap in
 ///     `rtype_cast_ptr_to_int` body awaits typed `&Foo` lift to
 ///     `SomePtr`.
-///   * rbuiltin.py:632-648 — `objectmodel.free_non_gc_object` landed
+///   * rbuiltin.py — `objectmodel.free_non_gc_object` landed
 ///     via `Repr::gc_flavor_str()` (default `None`, `InstanceRepr`
 ///     overrides) — the `std::any::Any` downcast that the original
 ///     port used is retired.  `keepalive_until_here` landed
@@ -188,9 +188,9 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///     in `ConstValue` (upstream returns the `AddressOffset` instance
 ///     as a Signed constant; pyre's `ConstValue` enum has no
 ///     symbolic variant).
-///   * rbuiltin.py:688-715 — `objectmodel.instantiate` (PBC handling +
+///   * rbuiltin.py — `objectmodel.instantiate` (PBC handling +
 ///     `rclass.rtype_new_instance`)
-///   * rbuiltin.py:717-742 — `OrderedDict` / `objectmodel.r_dict` /
+///   * rbuiltin.py — `OrderedDict` / `objectmodel.r_dict` /
 ///     `objectmodel.r_ordereddict` (need `DictRepr::DICT` /
 ///     `ll_newdict` / `custom_eq_hash` interface)
 ///   * rbuiltin.py:744-782 — weakref family low-level path
@@ -287,7 +287,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "free_non_gc_object",
             rtype_free_non_gc_object,
         ),
-        // rbuiltin.py:412-418 — `rtype_const_result` is registered for
+        // rbuiltin.py — `rtype_const_result` is registered for
         // four upstream callables.  `front::mir` synthesises the
         // production dispatch path; these entries keep the registry
         // structurally aligned with upstream until M2.5g lands.
@@ -471,7 +471,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "cast_weakrefptr_to_ptr",
             rtype_cast_weakrefptr_to_ptr,
         ),
-        // rbuiltin.py:744 — `@typer_for(weakref.ref)`
+        // rbuiltin.py — `@typer_for(weakref.ref)`
         ("weakref", "ref", rtype_weakref_create),
         // `lltype.nullptr` analog for the Rust null-pointer builtins;
         // same four spellings as the `ptr_null_constant` analyzer
@@ -510,7 +510,7 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
 /// `rtype_malloc`) read specific keys.
 pub type BuiltinTyperFn = fn(&HighLevelOp, &HashMap<String, usize>) -> RTypeResult;
 
-/// RPython `typer_for(func)` decorator (rbuiltin.py:16-20).
+/// RPython `typer_for(func)` decorator (rbuiltin.py).
 ///
 /// ```python
 /// def typer_for(func):
@@ -559,14 +559,14 @@ fn lookup_typer_by_qualname(qualname: &str) -> Option<BuiltinTyperFn> {
     }
 }
 
-/// RPython `class BuiltinFunctionRepr(Repr)` (rbuiltin.py:67-110).
+/// RPython `class BuiltinFunctionRepr(Repr)` (rbuiltin.py).
 ///
 /// Void-typed repr for a statically known Python builtin callable.
 /// `lowleveltype = Void` because the builtin identifier is resolved
 /// at typing-time via the `BUILTIN_TYPER` registry (not ported yet).
 #[derive(Debug)]
 pub struct BuiltinFunctionRepr {
-    /// RPython `self.builtinfunc = builtinfunc` (rbuiltin.py:70-71).
+    /// RPython `self.builtinfunc = builtinfunc` (rbuiltin.py).
     /// Carried as the pyre [`HostObject`] wrapping the Python builtin;
     /// future `findbltintyper` ports will read this to pick the
     /// right `rtype_builtin_*` dispatcher.
@@ -609,9 +609,9 @@ impl BuiltinFunctionRepr {
     /// [`ExtRegistryEntry::specialize_call`], which mirrors upstream's
     /// per-subclass override pattern: subclasses that define
     /// `specialize_call` add an arm returning `Ok(typer_fn)`; subclasses
-    /// that do not (e.g. `_ptrEntry` in `lltype.py:1513-1518`, the only
+    /// that do not (e.g. `_ptrEntry` in `lltype.py`, the only
     /// registered variant today) yield the upstream `AttributeError`
-    /// surface as a `TyperError`. `ExtRegistryEntry` (extregistry.py:33-72)
+    /// surface as a `TyperError`. `ExtRegistryEntry` (extregistry.py)
     /// defines no base `specialize_call`, so this is a per-arm decision.
     pub(crate) fn findbltintyper(&self) -> Result<BuiltinTyperFn, TyperError> {
         if let Some(f) = lookup_typer(&self.builtinfunc) {
@@ -761,7 +761,7 @@ impl Repr for BuiltinFunctionRepr {
     }
 }
 
-/// RPython `call_args_expand(hop)` (rbuiltin.py:52-64).
+/// RPython `call_args_expand(hop)` (rbuiltin.py).
 ///
 /// ```python
 /// def call_args_expand(hop):
@@ -820,7 +820,7 @@ pub fn call_args_expand(
     Ok((hop, kwds_i))
 }
 
-/// RPython `parse_kwds(hop, *argspec_i_r)` (rbuiltin.py:153-168).
+/// RPython `parse_kwds(hop, *argspec_i_r)` (rbuiltin.py).
 ///
 /// ```python
 /// def parse_kwds(hop, *argspec_i_r):
@@ -923,20 +923,20 @@ pub fn somebuiltin_rtyper_makerepr(s_builtin: &SomeBuiltin) -> Result<Arc<dyn Re
     Ok(Arc::new(BuiltinFunctionRepr::new(host.clone())) as Arc<dyn Repr>)
 }
 
-/// RPython `class BuiltinMethodRepr(Repr)` (rbuiltin.py:113-142).
+/// RPython `class BuiltinMethodRepr(Repr)` (rbuiltin.py).
 ///
 /// Bound builtin method repr — stores the receiver annotation and its
 /// concrete repr; dispatches `rtype_simple_call` via the `self_repr`'s
 /// `rtype_method_<methodname>` lookup.
 #[derive(Debug)]
 pub struct BuiltinMethodRepr {
-    /// RPython `self.s_self = s_self` (rbuiltin.py:116). Shared
+    /// RPython `self.s_self = s_self` (rbuiltin.py). Shared
     /// [`Rc`] mirroring upstream's identity-preserved receiver
     /// annotation.
     pub s_self: Rc<SomeValue>,
-    /// RPython `self.self_repr = rtyper.getrepr(s_self)` (rbuiltin.py:117).
+    /// RPython `self.self_repr = rtyper.getrepr(s_self)` (rbuiltin.py).
     pub self_repr: Arc<dyn Repr>,
-    /// RPython `self.methodname = methodname` (rbuiltin.py:118).
+    /// RPython `self.methodname = methodname` (rbuiltin.py).
     pub methodname: String,
     state: ReprState,
     /// RPython `self.lowleveltype = self.self_repr.lowleveltype`
@@ -1154,7 +1154,7 @@ pub fn dispatch_rtyper_makerepr(
 }
 
 // =====================================================================
-// @typer_for(...) registrations — rbuiltin.py:172- onwards.
+// @typer_for(...) registrations — rbuiltin.py- onwards.
 // Each function mirrors one upstream `@typer_for(<python builtin>)`
 // decorated `rtype_builtin_*` body. Registration is driven by
 // [`install_default_typers`] via the [`BUILTIN_TYPER`] OnceLock init.
@@ -1336,7 +1336,7 @@ pub fn rtype_builtin_min(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
     rtype_builtin_min_max(hop, "ll_min")
 }
 
-/// RPython `def ll_min(i1, i2)` (rbuiltin.py:240-243).
+/// RPython `def ll_min(i1, i2)` (rbuiltin.py).
 pub fn ll_min<T: PartialOrd + Copy>(i1: T, i2: T) -> T {
     if i1 < i2 {
         return i1;
@@ -1358,7 +1358,7 @@ pub fn rtype_builtin_max(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
     rtype_builtin_min_max(hop, "ll_max")
 }
 
-/// RPython `def ll_max(i1, i2)` (rbuiltin.py:252-255).
+/// RPython `def ll_max(i1, i2)` (rbuiltin.py).
 pub fn ll_max<T: PartialOrd + Copy>(i1: T, i2: T) -> T {
     if i1 > i2 {
         return i1;
@@ -1467,7 +1467,7 @@ pub(super) fn rtype_r_uint(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) 
     Ok(vlist.into_iter().next())
 }
 
-/// rlib/jit.py:404-406 — `Entry(_about_=we_are_jitted).\
+/// rlib/jit.py — `Entry(_about_=we_are_jitted).\
 /// specialize_call(self, hop)`:
 ///
 /// ```python
@@ -1508,7 +1508,7 @@ pub(super) fn rtype_we_are_jitted(
 /// `extregistry.lookup(BigInt.from).specialize_call`
 /// ([`super::extregistry::ExtRegistryEntry::BigIntFrom`]).
 ///
-/// Mirrors `extfunc.py:55-64 ExternalFunctionRepr.rtype_simple_call`:
+/// Mirrors `extfunc.py ExternalFunctionRepr.rtype_simple_call`:
 ///
 /// ```python
 /// def rtype_simple_call(self, hop):
@@ -1522,7 +1522,7 @@ pub(super) fn rtype_we_are_jitted(
 /// ```
 ///
 /// The callee has already been popped off `hop` by
-/// `BuiltinFunctionRepr._call` (`rbuiltin.py:94-97
+/// `BuiltinFunctionRepr._call` (`rbuiltin.py
 /// rtype_simple_call` → `r_s_popfirstarg`), so `hop.args_r[0]` is the
 /// `i64` source repr and `hop.r_result` is the classdef-less
 /// `SomeInstance` result repr (root `InstanceRepr`, lltype
@@ -1555,7 +1555,7 @@ pub fn rtype_bigint_from(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
         })?;
     let result_lltype = r_result.lowleveltype().clone();
 
-    // extfunc.py:66-89 `get_funcptr` — `functionptr(FT, name,
+    // extfunc.py `get_funcptr` — `functionptr(FT, name,
     // _external_name=name, _callable=...)`.  `_callable` carries the host
     // callable's qualname (`BigInt.from`) for the llinterp/backend label.
     let funcptr = functionptr_with_external_name(
@@ -1576,11 +1576,11 @@ pub fn rtype_bigint_from(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) ->
     let mut vlist = vec![Hlvalue::Constant(v_func)];
     vlist.extend(hop.inputargs(vec![ConvertedTo::Repr(r_arg.as_ref())])?);
 
-    // extfunc.py:64 — `hop2.genop('direct_call', vlist, r_result)`.
+    // extfunc.py — `hop2.genop('direct_call', vlist, r_result)`.
     Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
 }
 
-/// `rlib/longlong2float.py:83-86` — `Float2LongLongEntry.specialize_call`:
+/// `rlib/longlong2float.py` — `Float2LongLongEntry.specialize_call`:
 /// `hop.inputargs(lltype.Float)`, `hop.exception_cannot_occur()`,
 /// `return hop.genop("convert_float_bytes_to_longlong", [v_float], SignedLongLong)`.
 pub fn rtype_float2longlong(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
@@ -1621,7 +1621,7 @@ pub fn rtype_longlong2float(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>)
 /// materialise); the raw path has no vtable, so it lowers to a residual
 /// `direct_call` carrying THIS callsite's monomorphic `(T-repr) -> Ptr`
 /// signature — same shape as [`rtype_bigint_from`] /
-/// `extfunc.py:55-64 ExternalFunctionRepr.rtype_simple_call`. The
+/// `extfunc.py ExternalFunctionRepr.rtype_simple_call`. The
 /// allocation is treated as non-failing (`exception_cannot_occur`),
 /// matching the cold long-box arm whose `BigInt.from` is likewise
 /// infallible.
@@ -1714,7 +1714,7 @@ pub fn rtype_builtin_reversed(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usiz
 }
 
 /// RPython `@typer_for(EnvironmentError.__init__) def
-/// rtype_EnvironmentError__init__(hop)` (rbuiltin.py:268-283).
+/// rtype_EnvironmentError__init__(hop)` (rbuiltin.py).
 ///
 /// The line-by-line port needs `InstanceRepr::setfield` for `errno`,
 /// `strerror`, and `filename` assignment.
@@ -1727,7 +1727,7 @@ pub fn rtype_EnvironmentError__init__(
 }
 
 /// RPython conditional `@typer_for(WindowsError.__init__) def
-/// rtype_WindowsError__init__(hop)` (rbuiltin.py:286-297).
+/// rtype_WindowsError__init__(hop)` (rbuiltin.py).
 ///
 /// CPython 3 removed `WindowsError` as a distinct builtin, but upstream
 /// still exposes this helper when running on hosts where the class exists.
@@ -1742,7 +1742,7 @@ pub fn rtype_WindowsError__init__(
     Err(rbuiltin_deferred("rtype_WindowsError__init__"))
 }
 
-/// RPython `def rtype_hlinvoke(hop)` (rbuiltin.py:300-309).
+/// RPython `def rtype_hlinvoke(hop)` (rbuiltin.py).
 ///
 /// This is the high-level callable dispatch path for PBC callables. It
 /// depends on the `rpbc` callable repr call protocol, so expose the exact
@@ -1948,7 +1948,7 @@ pub fn rtype_cast_pointer(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -
     Ok(hop.genop("cast_pointer", vec![v_input], GenopResult::LLType(lltype)))
 }
 
-/// RPython `_cast_to_Signed` table (rbuiltin.py:479-487) — opname that
+/// RPython `_cast_to_Signed` table (rbuiltin.py) — opname that
 /// converts a primitive `t` value to lltype.Signed. `None` means
 /// "already Signed, no-op". Returns `None` outright for primitives
 /// that have no Signed counterpart.
@@ -1965,7 +1965,7 @@ fn cast_to_signed_opname(t: &LowLevelType) -> Option<Option<&'static str>> {
     }
 }
 
-/// RPython `_cast_from_Signed` table (rbuiltin.py:488-495) — opname
+/// RPython `_cast_from_Signed` table (rbuiltin.py) — opname
 /// that converts an lltype.Signed value to primitive `t`. `None` means
 /// "already Signed, no-op". Returns `None` outright for primitives
 /// without a Signed source path.
@@ -1981,7 +1981,7 @@ fn cast_from_signed_opname(t: &LowLevelType) -> Option<Option<&'static str>> {
     }
 }
 
-/// RPython `gen_cast(llops, TGT, v_value)` (rbuiltin.py:497-541).
+/// RPython `gen_cast(llops, TGT, v_value)` (rbuiltin.py).
 /// Primitive → primitive arm routes through `Signed` using the
 /// `_cast_to_Signed` + `_cast_from_Signed` tables. The Ptr↔Ptr,
 /// Ptr↔Address, and Address↔Primitive arms upstream require lltype
@@ -2195,7 +2195,7 @@ pub fn rtype_cast_primitive(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>)
         .into_iter()
         .nth(1)
         .ok_or_else(|| TyperError::message("rtype_cast_primitive: missing v_value".to_string()))?;
-    // rbuiltin.py:473 `TGT = hop.args_s[0].const`
+    // rbuiltin.py `TGT = hop.args_s[0].const`
     let tgt = {
         let args_s = hop.args_s.borrow();
         let s0 = args_s.first().ok_or_else(|| {
@@ -2261,7 +2261,7 @@ pub fn rtype_cast_ptr_to_adr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 }
 
 /// RPython `@typer_for(getattr(object.__init__, 'im_func', object.__init__))`
-/// `def rtype_object__init__(hop)` (rbuiltin.py:264-267).
+/// `def rtype_object__init__(hop)` (rbuiltin.py).
 ///
 /// ```python
 /// @typer_for(getattr(object.__init__, 'im_func', object.__init__))
@@ -2357,7 +2357,7 @@ pub fn rtype_cast_adr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     }
     let adr = hop.inputarg(ConvertedTo::Repr(r0.as_ref()), 0)?;
 
-    // rbuiltin.py:670-673 `mode = hop.args_s[1].const`
+    // rbuiltin.py `mode = hop.args_s[1].const`
     let mode = {
         let args_s = hop.args_s.borrow();
         if args_s.len() == 1 {
@@ -2680,7 +2680,7 @@ pub fn rtype_cast_weakrefptr_to_ptr(
 /// with a second Signed `size` operand.
 ///
 /// Upstream `nonmovable` stores the Hlvalue itself
-/// (`flags['nonmovable'] = v_nonmovable`, rbuiltin.py:374), unlike every
+/// (`flags['nonmovable'] = v_nonmovable`, rbuiltin.py), unlike every
 /// other arm which reads `.value`.  `ConstValue::Dict` carries
 /// `ConstValue` payloads only and cannot embed an `Hlvalue`, so the
 /// line-by-line port is blocked on extending `ConstValue` with an
@@ -2727,7 +2727,7 @@ pub fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RType
 
     let _ = i_immortal; // upstream `i_immortal` is parse_kwds-only, never read from `flags`
     // upstream `(i_flavor, lltype.Void)` — `impossible_repr` is the
-    // RPython `r_void = VoidRepr()` singleton (rmodel.py:359), the
+    // RPython `r_void = VoidRepr()` singleton (rmodel.py), the
     // Repr counterpart of `lltype.Void`; routing the flavor slot
     // through it pins the coercion to Void independent of `args_r[i]`.
     let r_void: Arc<dyn Repr> = impossible_repr();
@@ -2807,7 +2807,7 @@ pub fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RType
         );
     }
     if i_nonmovable.is_some() {
-        // upstream `flags['nonmovable'] = v_nonmovable` (rbuiltin.py:374)
+        // upstream `flags['nonmovable'] = v_nonmovable` (rbuiltin.py)
         // stores the Hlvalue itself — the only flag arm that does NOT
         // unwrap via `.value`.  `ConstValue::Dict` is keyed and valued
         // over `ConstValue` and cannot carry an `Hlvalue` payload, so
@@ -3344,7 +3344,7 @@ pub fn rtype_render_immortal(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>)
 /// `is` operation: instance pairs of different classes take the
 /// `pairtype(InstanceRepr, InstanceRepr)` common-base arm
 /// (rclass.py:1057-1068) before the generic pointer body
-/// (rmodel.py:300-318) emits `ptr_eq` with a Bool result and
+/// (rmodel.py) emits `ptr_eq` with a Bool result and
 /// constant-folds when the annotator proved the answer.
 fn rtype_ptr_eq(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
@@ -3361,7 +3361,7 @@ fn rtype_ptr_eq(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeRes
 /// `SomeInstance(can_be_None=True)` so the value stays joinable with
 /// typed receivers, and the null value is recovered here from the
 /// callable's definition: `convert_const(None)` on the result repr is
-/// `null_instance()` (rclass.py:474 `convert_const` None arm).
+/// `null_instance()` (rclass.py `convert_const` None arm).
 fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::Hlvalue;
 
@@ -3437,7 +3437,7 @@ pub fn rtype_const_result(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -
     Ok(Some(Hlvalue::Constant(c)))
 }
 
-/// RPython `@typer_for(lltype.cast_ptr_to_int)` (rbuiltin.py:543-548):
+/// RPython `@typer_for(lltype.cast_ptr_to_int)` (rbuiltin.py):
 ///
 /// ```python
 /// @typer_for(lltype.cast_ptr_to_int)
@@ -3481,7 +3481,7 @@ pub fn rtype_cast_ptr_to_int(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     // annotation (`llannotation.py:185`, `lltype.py:1516-1518`); an
     // RPython class instance — and a host-struct method RECEIVER, which
     // is USED like one (classdef-mediated `getattr`/method dispatch,
-    // `signature.py:103-104` `annotationoftype → SomeInstance`) — is
+    // `signature.py` `annotationoftype → SomeInstance`) — is
     // `SomeInstance(ClassDef)` at annotation and only lowered to
     // `Ptr(GcStruct(OBJECT))` at the rtyper.  `SomePtr.getattr` cannot
     // resolve a class-owned host method (PtrRepr → `_nofield`), so
@@ -3573,7 +3573,7 @@ pub fn rtype_same_as(hop: &HighLevelOp) -> RTypeResult {
     Ok(hop.genop("same_as", vlist, GenopResult::LLType(lltype)))
 }
 
-/// RPython `rbuiltin.py:551-557 @typer_for(lltype.cast_int_to_ptr)`.
+/// RPython `rbuiltin.py @typer_for(lltype.cast_int_to_ptr)`.
 ///
 /// ```python
 /// @typer_for(lltype.cast_int_to_ptr)
@@ -3589,7 +3589,7 @@ pub fn rtype_same_as(hop: &HighLevelOp) -> RTypeResult {
 /// v_int)` shape — `args_s[0]` is the constant target type `T`
 /// (Void-typed at LL, just a marker) and `args_s[1]` is the
 /// integer value.  Upstream `rtype_cast_int_to_ptr` then calls
-/// `hop.inputargs(lltype.Void, lltype.Signed)` (rbuiltin.py:551-557)
+/// `hop.inputargs(lltype.Void, lltype.Signed)` (rbuiltin.py)
 /// — two formal inputs.
 ///
 /// TODO: pyre's frontend emits a 1-arg
@@ -3628,7 +3628,7 @@ pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 /// classdef-less shell), so `hop.r_result` names the destination and the
 /// call lowers to a `cast_pointer` of the pointer operand to that
 /// lowleveltype.  This mirrors `pairtype(InstanceRepr,
-/// InstanceRepr).convert_from_to` (rclass.py:1035) — the same
+/// InstanceRepr).convert_from_to` (rclass.py) — the same
 /// `genop('cast_pointer', [v], resulttype=r_ins2.lowleveltype)` it emits
 /// for the `r_ins1.classdef is None` (classdef-less → concrete) arm, run
 /// in one direction by the narrow and the other by the erasure.
@@ -3681,8 +3681,8 @@ mod tests {
 
     #[test]
     fn builtin_function_repr_convert_const_default_preserves_value_on_void() {
-        // Upstream `Repr.convert_const` default (`rmodel.py:124-130`) keeps
-        // the Python value; `Void._contains_value` (lltype.py:194-197)
+        // Upstream `Repr.convert_const` default (`rmodel.py`) keeps
+        // the Python value; `Void._contains_value` (lltype.py)
         // accepts anything, so Void-typed reprs pass through the value
         // unchanged. No `BuiltinFunctionRepr.convert_const` override
         // exists upstream (rbuiltin.py:67-110).
@@ -4288,7 +4288,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_baseline_builtins_from_host_env() {
-        // rbuiltin.py:172-211 + 709-715 — `@typer_for(<builtin>)` entries
+        // rbuiltin.py + 709-715 — `@typer_for(<builtin>)` entries
         // that reach the registry via the bare `lookup_builtin` path
         // (HOST_ENV `builtins` table).  `unichr` is Python 2-only and
         // absent from pyre's HOST_ENV bootstrap, so the silent-skip on
@@ -4318,7 +4318,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_intmask_longlongmask_from_rarithmetic_module() {
-        // rbuiltin.py:220-231 — `@typer_for(rarithmetic.intmask)` /
+        // rbuiltin.py — `@typer_for(rarithmetic.intmask)` /
         // `@typer_for(rarithmetic.longlongmask)` reach the registry via
         // module-attribute lookup, not the bare `builtins` table.
         for attr in ["intmask", "longlongmask"] {
@@ -4335,7 +4335,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_keepalive_until_here_from_objectmodel_module() {
-        // rbuiltin.py:643-648 — `@typer_for(objectmodel.keepalive_until_here)`.
+        // rbuiltin.py — `@typer_for(objectmodel.keepalive_until_here)`.
         let host = HOST_ENV
             .import_module("rpython.rlib.objectmodel")
             .and_then(|m| m.module_get("keepalive_until_here"))
@@ -4364,7 +4364,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_identityhash_from_lltype_module() {
-        // rbuiltin.py:559-563 — `@typer_for(lltype.identityhash)`.
+        // rbuiltin.py — `@typer_for(lltype.identityhash)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.lltype")
             .and_then(|m| m.module_get("identityhash"))
@@ -4377,7 +4377,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_runtime_type_info_from_lltype_module() {
-        // rbuiltin.py:565-572 — `@typer_for(lltype.runtime_type_info)`.
+        // rbuiltin.py — `@typer_for(lltype.runtime_type_info)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.lltype")
             .and_then(|m| m.module_get("runtime_type_info"))
@@ -4390,7 +4390,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_direct_ptradd_from_lltype_module() {
-        // rbuiltin.py:463-469 — `@typer_for(lltype.direct_ptradd)`.
+        // rbuiltin.py — `@typer_for(lltype.direct_ptradd)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.lltype")
             .and_then(|m| m.module_get("direct_ptradd"))
@@ -4403,7 +4403,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_direct_fieldptr_and_arrayitems_from_lltype_module() {
-        // rbuiltin.py:446-453 / 455-461 — `@typer_for(lltype.direct_fieldptr)` /
+        // rbuiltin.py / 455-461 — `@typer_for(lltype.direct_fieldptr)` /
         // `@typer_for(lltype.direct_arrayitems)`.
         for attr in ["direct_fieldptr", "direct_arrayitems"] {
             let host = HOST_ENV
@@ -4419,7 +4419,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_cast_opaque_ptr_and_length_of_gcarray_from_lltype_module() {
-        // rbuiltin.py:429-436 / 438-444 — `@typer_for(lltype.cast_opaque_ptr)` /
+        // rbuiltin.py / 438-444 — `@typer_for(lltype.cast_opaque_ptr)` /
         // `@typer_for(lltype.length_of_simple_gcarray_from_opaque)`.
         for attr in ["cast_opaque_ptr", "length_of_simple_gcarray_from_opaque"] {
             let host = HOST_ENV
@@ -4435,7 +4435,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_cast_pointer_from_lltype_module() {
-        // rbuiltin.py:420-427 — `@typer_for(lltype.cast_pointer)`.
+        // rbuiltin.py — `@typer_for(lltype.cast_pointer)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.lltype")
             .and_then(|m| m.module_get("cast_pointer"))
@@ -4448,7 +4448,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_render_immortal_from_lltype_module() {
-        // rbuiltin.py:403-410 — `@typer_for(lltype.render_immortal)`.
+        // rbuiltin.py — `@typer_for(lltype.render_immortal)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.lltype")
             .and_then(|m| m.module_get("render_immortal"))
@@ -4461,7 +4461,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_cast_primitive_from_lltype_module() {
-        // rbuiltin.py:471-477 — `@typer_for(lltype.cast_primitive)`.
+        // rbuiltin.py — `@typer_for(lltype.cast_primitive)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.lltype")
             .and_then(|m| m.module_get("cast_primitive"))
@@ -4474,7 +4474,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_raw_malloc_from_llmemory_module() {
-        // rbuiltin.py:577-585 — `@typer_for(llmemory.raw_malloc)`.
+        // rbuiltin.py — `@typer_for(llmemory.raw_malloc)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.llmemory")
             .and_then(|m| m.module_get("raw_malloc"))
@@ -4487,7 +4487,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_raw_malloc_usage_from_llmemory_module() {
-        // rbuiltin.py:587-591 — `@typer_for(llmemory.raw_malloc_usage)`.
+        // rbuiltin.py — `@typer_for(llmemory.raw_malloc_usage)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.llmemory")
             .and_then(|m| m.module_get("raw_malloc_usage"))
@@ -4500,7 +4500,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_cast_ptr_to_adr_from_llmemory_module() {
-        // rbuiltin.py:651-657 — `@typer_for(llmemory.cast_ptr_to_adr)`.
+        // rbuiltin.py — `@typer_for(llmemory.cast_ptr_to_adr)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.llmemory")
             .and_then(|m| m.module_get("cast_ptr_to_adr"))
@@ -4513,7 +4513,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_object_init_qualname_builtin() {
-        // rbuiltin.py:264-267 — `@typer_for(object.__init__)`.
+        // rbuiltin.py — `@typer_for(object.__init__)`.
         let host = HOST_ENV
             .lookup_builtin("object.__init__")
             .expect("HOST_ENV missing `object.__init__` qualname builtin");
@@ -4525,7 +4525,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_cast_int_to_adr_from_llmemory_module() {
-        // rbuiltin.py:680-685 — `@typer_for(llmemory.cast_int_to_adr)`.
+        // rbuiltin.py — `@typer_for(llmemory.cast_int_to_adr)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.llmemory")
             .and_then(|m| m.module_get("cast_int_to_adr"))
@@ -4538,7 +4538,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_malloc_from_lltype_module() {
-        // rbuiltin.py:349-385 — `@typer_for(lltype.malloc)`.
+        // rbuiltin.py — `@typer_for(lltype.malloc)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.lltype")
             .and_then(|m| m.module_get("malloc"))
@@ -4551,7 +4551,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_free_from_lltype_module() {
-        // rbuiltin.py:387-401 — `@typer_for(lltype.free)`.
+        // rbuiltin.py — `@typer_for(lltype.free)`.
         let host = HOST_ENV
             .import_module("rpython.rtyper.lltypesystem.lltype")
             .and_then(|m| m.module_get("free"))
@@ -4564,7 +4564,7 @@ mod tests {
 
     #[test]
     fn install_default_typers_registers_free_non_gc_object_from_objectmodel_module() {
-        // rbuiltin.py:632-640 — `@typer_for(objectmodel.free_non_gc_object)`.
+        // rbuiltin.py — `@typer_for(objectmodel.free_non_gc_object)`.
         let host = HOST_ENV
             .import_module("rpython.rlib.objectmodel")
             .and_then(|m| m.module_get("free_non_gc_object"))

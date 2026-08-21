@@ -121,7 +121,7 @@ unsafe fn read_dims(t: PyObjectRef) -> Vec<i64> {
 /// clones it into the new owner's box.
 #[derive(Clone)]
 pub enum BufferView {
-    /// `SimpleView` (`pypy/interpreter/buffer.py:270`) — a plain contiguous
+    /// `SimpleView` (`pypy/interpreter/buffer.py`) — a plain contiguous
     /// 1-D byte view (`bytes` / `bytearray`).  Format `'B'`, itemsize 1,
     /// ndim 1, offset 0, shape `[length]`, strides `[1]` are all derived;
     /// `readonly` comes from the backing, so nothing but the exporter refs is
@@ -131,7 +131,7 @@ pub enum BufferView {
         w_obj: PyObjectRef,
         length: i64,
     },
-    /// `RawBufferView` (`buffer.py:231`) — a typed contiguous 1-D view
+    /// `RawBufferView` (`buffer.py`) — a typed contiguous 1-D view
     /// (`array.array`).  Format / itemsize are explicit; ndim 1, offset 0,
     /// shape `[length / itemsize]` (`[0]` when empty), strides `[itemsize]`
     /// derive; `readonly` comes from the backing.
@@ -142,7 +142,7 @@ pub enum BufferView {
         itemsize: i64,
         length: i64,
     },
-    /// `BufferSlice` (`buffer.py:321`) — a strided dimension-0 window over a
+    /// `BufferSlice` (`buffer.py`) — a strided dimension-0 window over a
     /// parent view, produced by a step≠1 slice (a step==1 slice of a
     /// `Simple` / `Raw` view re-specialises over a [`Buffer::Sub`] window
     /// instead).  `start` / `step` are in parent dimension-0 element units
@@ -157,7 +157,7 @@ pub enum BufferView {
         step: i64,
         length: i64,
     },
-    /// `BufferView1D` (`memoryobject.py:867`) — a cast to a new 1-D element
+    /// `BufferView1D` (`memoryobject.py`) — a cast to a new 1-D element
     /// format over the parent's bytes (`_cast_to_1D`).  Format / itemsize are
     /// explicit; ndim 1, shape `[parent_length / itemsize]`, strides
     /// `[itemsize]` derive; byte access delegates to the parent
@@ -168,7 +168,7 @@ pub enum BufferView {
         w_fmt: PyObjectRef,
         itemsize: i64,
     },
-    /// `BufferViewND` (`memoryobject.py:893`) — a cast to an N-dimensional
+    /// `BufferViewND` (`memoryobject.py`) — a cast to an N-dimensional
     /// shape over a 1-D parent (`_cast_to_ND`).  `shape` / `strides` ride as
     /// their tuple objects; format / itemsize come from the parent.
     ViewND {
@@ -178,7 +178,7 @@ pub enum BufferView {
         w_shape: PyObjectRef,
         w_strides: PyObjectRef,
     },
-    /// `ReadonlyWrapper` (`buffer.py:415`) — `toreadonly`'s wrapper: every
+    /// `ReadonlyWrapper` (`buffer.py`) — `toreadonly`'s wrapper: every
     /// read delegates to the wrapped view, `readonly` is forced true.
     Readonly {
         view: Box<BufferView>,
@@ -322,7 +322,7 @@ impl BufferView {
                     }
                 }
                 // Dimension 0 takes the slice's element count; later
-                // dimensions ride along (`shape[0] = length`, buffer.py:334).
+                // dimensions ride along (`shape[0] = length`, buffer.py).
                 BufferView::Slice { parent, length, .. } => {
                     let mut shape = parent.native_shape();
                     if let Some(s0) = shape.first_mut() {
@@ -330,7 +330,7 @@ impl BufferView {
                     }
                     shape
                 }
-                // `[getlength() // itemsize]` (memoryobject.py:888).
+                // `[getlength() // itemsize]` (memoryobject.py).
                 BufferView::View1D {
                     parent, itemsize, ..
                 } => vec![parent.length() / *itemsize],
@@ -353,7 +353,7 @@ impl BufferView {
                     vec![*itemsize]
                 }
                 // Dimension 0 steps by the parent's stride times the slice
-                // step (`strides[0] *= step`, buffer.py:332).
+                // step (`strides[0] *= step`, buffer.py).
                 BufferView::Slice { parent, step, .. } => {
                     let mut strides = parent.native_strides();
                     if !strides.is_empty() {
@@ -486,7 +486,7 @@ impl BufferView {
     /// plain contiguous view; every other case wraps the parent in a
     /// [`Slice`](BufferView::Slice).  Slicing a `Slice` composes into its
     /// parent's coordinates — `start` maps through `parent_index`
-    /// (`self.start + self.step * idx`, buffer.py:386) so a re-slice of a
+    /// (`self.start + self.step * idx`, buffer.py) so a re-slice of a
     /// strided slice lands on the elements the composed stride selects.
     ///
     /// # Safety
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn simple_step1_slice_respecializes_over_sub_window() {
-        // SimpleView.new_slice step==1 (buffer.py:312): the result is another
+        // SimpleView.new_slice step==1 (buffer.py): the result is another
         // SimpleView over a SubBuffer window, not a BufferSlice wrapper.
         let s = unsafe { simple(10).new_slice(2, 1, 5) };
         match &s {

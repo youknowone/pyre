@@ -31,10 +31,10 @@ use indexmap::IndexMap;
 // Canonical RPython keys filling free low bytes (`blackhole.py:1149-1525`).
 // One byte per `(opname, argcodes)` per `assembler.py:221
 // setdefault(key, len(self.insns))` — alias-shared bytes would violate the
-// 1:1 invariant that `pyjitpl.py:2230 setup_insns` enforces.
+// 1:1 invariant that `pyjitpl.py setup_insns` enforces.
 pub const BC_CAST_FLOAT_TO_INT: u8 = 0;
 pub const BC_ARRAYLEN_GC: u8 = 1;
-/// RPython `blackhole.py:556-558` `bhimpl_int_is_true(a) -> !!a` — the
+/// RPython `blackhole.py` `bhimpl_int_is_true(a) -> !!a` — the
 /// boolean-coercion of an int, produced by a `Bool` exitswitch source
 /// that is read before the branch rather than fused into
 /// `goto_if_not_int_is_true`. Takes slot 2 (was free; `BC_ARRAYLEN_VABLE`
@@ -87,7 +87,7 @@ pub const BC_RECURSIVE_CALL_VOID: u8 = 226;
 pub const BC_LOOP_HEADER: u8 = 12;
 pub const BC_ABORT: u8 = 13;
 pub const BC_ABORT_PERMANENT: u8 = 14;
-/// RPython `blackhole.py:962` `bhimpl_unreachable()` raises
+/// RPython `blackhole.py` `bhimpl_unreachable()` raises
 /// `AssertionError("unreachable")`. Distinct from `BC_ABORT_PERMANENT`
 /// which permits the interpreter to take over via
 /// `DispatchError::RaiseException`.
@@ -101,8 +101,8 @@ pub const BC_UNREACHABLE: u8 = 19;
 pub const BC_GOTO_IF_NOT_INT_IS_TRUE: u8 = 15;
 pub const BC_JUMP: u8 = 16;
 pub const BC_INLINE_CALL: u8 = 17;
-/// RPython `flatten.py:245` `opname = 'goto_if_not'` — the canonical
-/// boolean-exitswitch branch.  `blackhole.py:865 bhimpl_goto_if_not`
+/// RPython `flatten.py` `opname = 'goto_if_not'` — the canonical
+/// boolean-exitswitch branch.  `blackhole.py bhimpl_goto_if_not`
 /// is the handler shared with the
 /// [`BC_GOTO_IF_NOT_INT_IS_TRUE`] alias per `blackhole.py:913
 /// bhimpl_goto_if_not_int_is_true = bhimpl_goto_if_not`.  Slot 18
@@ -143,10 +143,10 @@ pub const BC_MOVE_F: u8 = 33;
 // EffectInfo-carries-policy rationale as above; see slots 38..=40.
 // slot 42 (formerly BC_CALL_RELEASE_GIL_INT) freed
 // — release-GIL policy rides on
-// `EffectInfo.call_release_gil_target` (`effectinfo.py:255
+// `EffectInfo.call_release_gil_target` (`effectinfo.py
 // is_call_release_gil`).
 // BC_CALL_RELEASE_GIL_REF (slot 43) intentionally absent:
-// resoperation.py:1243-1244 (`# no such thing`) excludes
+// resoperation.py (`# no such thing`) excludes
 // CALL_RELEASE_GIL_R from the upstream opcode table.
 // slot 44 (formerly BC_CALL_RELEASE_GIL_FLOAT) freed — see slot 42
 // above.
@@ -154,7 +154,7 @@ pub const BC_MOVE_F: u8 = 33;
 // above.
 // slots 46..=48 (formerly BC_CALL_LOOPINVARIANT_{INT,REF,FLOAT}) freed
 // — loop-invariant policy rides on
-// `EffectInfo.extraeffect = EF_LOOPINVARIANT` (`effectinfo.py:202`).
+// `EffectInfo.extraeffect = EF_LOOPINVARIANT` (`effectinfo.py`).
 // slot 49 (formerly BC_CALL_LOOPINVARIANT_VOID) freed — see slots
 // 46..=48 above.
 pub const BC_CALL_ASSEMBLER_INT: u8 = 50;
@@ -208,16 +208,16 @@ pub const BC_INT_GUARD_VALUE: u8 = 84;
 pub const BC_REF_GUARD_VALUE: u8 = 85;
 /// pyjitpl.py opimpl_float_guard_value: promote float to constant via GUARD_VALUE.
 pub const BC_FLOAT_GUARD_VALUE: u8 = 86;
-/// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point marker.
+/// blackhole.py bhimpl_jit_merge_point: portal merge point marker.
 /// `iIRFIRF` form: jdindex byte is a `registers_i` pool slot index
-/// (assembler.py:106-107 emit_const default path when `allow_short=False`
+/// (assembler.py emit_const default path when `allow_short=False`
 /// or value > 127).
 pub const BC_JIT_MERGE_POINT: u8 = 87;
 /// `cIRFIRF` form of `bhimpl_jit_merge_point` selected by
-/// assembler.py:312 `USE_C_FORM` membership when jdindex fits in
+/// assembler.py `USE_C_FORM` membership when jdindex fits in
 /// `signed i8` (`-128..=127`). The jdindex byte is the raw signed
-/// value (assembler.py:99-107 emit_const short branch +
-/// blackhole.py:121-123 `argcode == 'c'` handler reads `signedord`).
+/// value (assembler.py emit_const short branch +
+/// blackhole.py `argcode == 'c'` handler reads `signedord`).
 pub const BC_JIT_MERGE_POINT_C: u8 = 131;
 pub const BC_LIVE: u8 = 88;
 pub const BC_CATCH_EXCEPTION: u8 = 89;
@@ -229,14 +229,14 @@ pub const BC_GOTO_IF_EXCEPTION_MISMATCH: u8 = 130;
 /// blackhole.py bhimpl_rvmprof_code: rvmprof enter/leave marker.
 pub const BC_RVMPROF_CODE: u8 = 91;
 
-// RPython jtransform.py:196 `optimize_goto_if_not` fuses
+// RPython jtransform.py `optimize_goto_if_not` fuses
 // `v = int_lt(x, y); exitswitch = v` into
 // `exitswitch = ('int_lt', x, y)`, emitted by flatten.py:247-250 as
-// the jitcode op `goto_if_not_int_lt`. blackhole.py:864-944 consumes
+// the jitcode op `goto_if_not_int_lt`. blackhole.py consumes
 // the fused form with dedicated bhimpls.
 //
 // majit currently reserves one `BC_GOTO_IF_NOT_*` per RPython opname
-// variant; the 'c' short-const argcode (assembler.py:312 `USE_C_FORM`)
+// variant; the 'c' short-const argcode (assembler.py `USE_C_FORM`)
 // is not yet supported in the pyre JitCodeBuilder so only the canonical
 // `iiL` / `ffL` / `rrL` forms get a BC_* allocation here.
 pub const BC_GOTO_IF_NOT_INT_LT: u8 = 92;
@@ -253,15 +253,15 @@ pub const BC_GOTO_IF_NOT_FLOAT_GT: u8 = 102;
 pub const BC_GOTO_IF_NOT_FLOAT_GE: u8 = 103;
 pub const BC_GOTO_IF_NOT_PTR_EQ: u8 = 104;
 pub const BC_GOTO_IF_NOT_PTR_NE: u8 = 105;
-// blackhole.py:916-920 `bhimpl_goto_if_not_int_is_zero(a, target, pc)`:
-// take target iff `a != 0`. jtransform.py:1212 `_rewrite_equality`
+// blackhole.py `bhimpl_goto_if_not_int_is_zero(a, target, pc)`:
+// take target iff `a != 0`. jtransform.py `_rewrite_equality`
 // folds `int_eq(x, 0)` into `int_is_zero(x)`; flatten.py:247 then
 // specialises the bool exitswitch into `goto_if_not_int_is_zero/iL`.
 pub const BC_GOTO_IF_NOT_INT_IS_ZERO: u8 = 106;
 
-// blackhole.py:661-679 bhimpl_int_push / bhimpl_ref_push /
+// blackhole.py bhimpl_int_push / bhimpl_ref_push /
 // bhimpl_float_push and matching pops — one-slot scratch for the
-// cycle-break path emitted by flatten.py:326-332 `insert_renamings`.
+// cycle-break path emitted by flatten.py `insert_renamings`.
 pub const BC_INT_PUSH: u8 = 107;
 pub const BC_REF_PUSH: u8 = 108;
 pub const BC_FLOAT_PUSH: u8 = 109;
@@ -273,7 +273,7 @@ pub const BC_INT_ADD: u8 = 113;
 pub const BC_INT_SUB: u8 = 114;
 pub const BC_INT_MUL: u8 = 115;
 // 116, 117 — reserved (no opcode for `int_floordiv` / `int_mod`).
-// `jtransform.py:576-577` rewrites both via `_do_builtin_call` to
+// `jtransform.py` rewrites both via `_do_builtin_call` to
 // `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)` before
 // jitcode emission; the bytecode dispatch path therefore has no
 // `BC_INT_FLOORDIV` / `BC_INT_MOD` opcode.  Pyre's residual call at
@@ -341,7 +341,7 @@ pub const BC_RESIDUAL_CALL_IRF_F: u8 = 168;
 // `bhimpl_int_return`, `bhimpl_float_return`, `bhimpl_void_return`.
 // pyre's portal return is REF (see BC_REF_RETURN) but the insns map
 // still needs every upstream return flavour so
-// `pyjitpl.py:2240-2243` `setup_insns` fields do not fall back to
+// `pyjitpl.py` `setup_insns` fields do not fall back to
 // `u8::MAX` sentinels.
 pub const BC_INT_RETURN: u8 = 148;
 pub const BC_FLOAT_RETURN: u8 = 149;
@@ -378,15 +378,15 @@ pub const BC_FLOAT_LT: u8 = 181;
 pub const BC_FLOAT_GT: u8 = 182;
 
 // `cast_*_to_*` conversion ops — RPython `bhimpl_cast_ptr_to_int`
-// (`blackhole.py:603-606`), `bhimpl_cast_int_to_ptr`
-// (`blackhole.py:608-610`), `bhimpl_cast_int_to_float`
+// (`blackhole.py`), `bhimpl_cast_int_to_ptr`
+// (`blackhole.py`), `bhimpl_cast_int_to_float`
 // (`blackhole.py:811-816`).
 pub const BC_CAST_INT_TO_FLOAT: u8 = 183;
 pub const BC_CAST_INT_TO_PTR: u8 = 184;
 pub const BC_CAST_PTR_TO_INT: u8 = 185;
 
 // Float<->longlong bit reinterpret — `bhimpl_convert_float_bytes_to_longlong`
-// / `bhimpl_convert_longlong_bytes_to_float` (`blackhole.py:828-834`): a bitcast
+// / `bhimpl_convert_longlong_bytes_to_float` (`blackhole.py`): a bitcast
 // of the 64-bit pattern, NOT a value cast (unlike `cast_float_to_int`).
 pub const BC_CONVERT_FLOAT_BYTES_TO_LONGLONG: u8 = 229;
 pub const BC_CONVERT_LONGLONG_BYTES_TO_FLOAT: u8 = 230;
@@ -401,7 +401,7 @@ pub const BC_INT_ADD_JUMP_IF_OVF: u8 = 231;
 pub const BC_INT_SUB_JUMP_IF_OVF: u8 = 232;
 pub const BC_INT_MUL_JUMP_IF_OVF: u8 = 233;
 
-// `switch/id` — RPython `blackhole.py:954-960` `bhimpl_switch` —
+// `switch/id` — RPython `blackhole.py` `bhimpl_switch` —
 // table-of-cases dispatch keyed by an int register + a descr selecting
 // the case table.
 pub const BC_SWITCH: u8 = 186;
@@ -444,7 +444,7 @@ pub const BC_SETFIELD_GC_F: u8 = 206;
 // self.insns.setdefault(key, len(self.insns))`.  The walker dispatch
 // at `pyre/pyre-jit-trace/src/jitcode_dispatch.rs` routes the `_pure`
 // keys to the same handler as the non-pure form, but the byte must
-// be distinct or `pyjitpl.py:2230 setup_insns`'s
+// be distinct or `pyjitpl.py setup_insns`'s
 // `assert opcode_implementations[value] is None` and pyre's
 // `jitcode_runtime.rs`'s `overlay_insns` duplicate-byte assert would fire.
 pub const BC_GETFIELD_GC_I_PURE: u8 = 207;
@@ -454,31 +454,31 @@ pub const BC_GETARRAYITEM_GC_I_PURE: u8 = 210;
 pub const BC_GETARRAYITEM_GC_R_PURE: u8 = 211;
 pub const BC_GETARRAYITEM_GC_F_PURE: u8 = 212;
 
-// `blackhole.py:559-561 bhimpl_int_between(a, b, c) -> i` —
+// `blackhole.py bhimpl_int_between(a, b, c) -> i` —
 // `@arguments("i", "i", "i", returns="i")` gives canonical key
 // `int_between/iii>i`.  Pyre emits this from
 // `make_ll_isinstance`'s `has_subclasses` body
 // (`translator/rtyper/rtyper.rs::build_ll_isinstance_const_nonnull_graph`),
-// matching `rclass.py:1163-1167 ll_isinstance`'s range-check arm.
+// matching `rclass.py ll_isinstance`'s range-check arm.
 pub const BC_INT_BETWEEN: u8 = 213;
 
-// `blackhole.py:1311-1313 bhimpl_new_array_clear` —
+// `blackhole.py bhimpl_new_array_clear` —
 // `@arguments("cpu", "i", "d", returns="r")` gives canonical key
 // `new_array_clear/id>r`.  Pyre emits this from the BUILD_TUPLE
 // `popvalues` unroll (`pyre-jit/src/jit/codewriter.rs` — the
 // `pyframe.py:408-419` fixed-size items-array allocation).
 pub const BC_NEW_ARRAY_CLEAR: u8 = 214;
 
-// `c`-argcode forms (`assembler.py:99-107 emit_const(allow_short=
+// `c`-argcode forms (`assembler.py emit_const(allow_short=
 // True)`): `new_array_clear` and `setarrayitem_gc_r` are both in
-// `USE_C_FORM` (`assembler.py:312`), so a small ConstInt operand
+// `USE_C_FORM` (`assembler.py`), so a small ConstInt operand
 // (-128..127) is written inline as one signed byte instead of a
 // constant-pool `i` slot, giving keys `new_array_clear/cd>r` and
 // `setarrayitem_gc_r/rcrd`.
 pub const BC_SETARRAYITEM_GC_R_C: u8 = 215;
 pub const BC_NEW_ARRAY_CLEAR_C: u8 = 216;
 
-// `int_copy` is in `USE_C_FORM` (`assembler.py:312`): a small ConstInt
+// `int_copy` is in `USE_C_FORM` (`assembler.py`): a small ConstInt
 // source (-128..127) is written inline as one signed byte instead of a
 // constant-pool `i` slot, giving the key `int_copy/c>i`. pyre materialises
 // every int/bool constant through `int_copy` (`OpKind::ConstInt`/`ConstBool`
@@ -488,13 +488,13 @@ pub const BC_NEW_ARRAY_CLEAR_C: u8 = 216;
 // must stay 1:1 (`insns_byte_to_opname` panics otherwise).
 pub const BC_MOVE_I_C: u8 = 220;
 
-// `int_return` is in `USE_C_FORM` (`assembler.py:312`): a small const-int
+// `int_return` is in `USE_C_FORM` (`assembler.py`): a small const-int
 // return source (`FlatOp::IntReturn(Const)`) is written inline as one
 // signed byte, giving the key `int_return/c` (sibling of `int_return/i`,
 // BC_INT_RETURN = 148).  Byte 221 (not 218, which is `BC_NEW_ARRAY`).
 pub const BC_INT_RETURN_C: u8 = 221;
 
-// `setfield_gc` is in `USE_C_FORM` (`assembler.py:312`): a small ConstInt
+// `setfield_gc` is in `USE_C_FORM` (`assembler.py`): a small ConstInt
 // store value (-128..127) is written inline as one signed byte, giving
 // the key `setfield_gc_i/rcd` (sibling of `setfield_gc_i/rid`,
 // BC_SETFIELD_GC_I = 172).  A wider constant or a register value keeps
@@ -502,7 +502,7 @@ pub const BC_INT_RETURN_C: u8 = 221;
 // `BC_NEW_WITH_VTABLE`).
 pub const BC_SETFIELD_GC_I_C: u8 = 222;
 
-// `setarrayitem_gc_i` is in `USE_C_FORM` (`assembler.py:339`): a small
+// `setarrayitem_gc_i` is in `USE_C_FORM` (`assembler.py`): a small
 // ConstInt store value (-128..127) is written inline as one signed byte,
 // giving the const-VALUE key `setarrayitem_gc_i/ricd` (a sibling of the
 // const-INDEX `setarrayitem_gc_r/rcrd`, BC_SETARRAYITEM_GC_R_C = 215, and
@@ -511,7 +511,7 @@ pub const BC_SETFIELD_GC_I_C: u8 = 222;
 // form.
 pub const BC_SETARRAYITEM_GC_I_C: u8 = 227;
 
-// `raw_store_i/iiid` — `blackhole.py:1504-1506 bhimpl_raw_store_i`
+// `raw_store_i/iiid` — `blackhole.py bhimpl_raw_store_i`
 // (`@arguments("cpu", "i", "i", "i", "d")`): raw address + byte offset +
 // int value + `arraydescrof(rffi.CArray(T))` (`jtransform.py:1156-1163
 // rewrite_op_raw_store`).  Sibling of the read-side `BC_RAW_LOAD_I` (20);
@@ -540,19 +540,19 @@ pub const BC_VTABLE_METHOD_PTR: u8 = 196;
 // Argcodes: `rdd` (struct ref + fielddescr + mutatefielddescr).
 pub const BC_RECORD_QUASIIMMUT_FIELD: u8 = 199;
 
-// `assert_not_none/r` — RPython `pyjitpl.py:385-391 opimpl_assert_not_none`
-// + `blackhole.py:613 bhimpl_assert_not_none`.  Records that `box` is
+// `assert_not_none/r` — RPython `pyjitpl.py opimpl_assert_not_none`
+// + `blackhole.py bhimpl_assert_not_none`.  Records that `box` is
 // known non-null so subsequent nullity-aware sites
 // (`_establish_nullity`, KnownClass guards) can skip their own checks.
 // Argcodes: `r` (struct ref).
 pub const BC_ASSERT_NOT_NONE: u8 = 200;
 
 // `record_exact_class/ri` — RPython `pyjitpl.py:393-410
-// opimpl_record_exact_class` + `blackhole.py:616 bhimpl_record_exact_class`.
+// opimpl_record_exact_class` + `blackhole.py bhimpl_record_exact_class`.
 // Records that `box`'s class is exactly `cls` (vtable ref constant) so
 // subsequent class-aware sites can skip the GuardClass.  Argcodes:
 // `ri` (struct ref + class pointer as int), matching
-// `blackhole.py:616 @arguments("r", "i")`.
+// `blackhole.py @arguments("r", "i")`.
 pub const BC_RECORD_EXACT_CLASS: u8 = 201;
 
 pub const MAX_HOST_CALL_ARITY: usize = 16;
@@ -681,7 +681,7 @@ pub fn is_reserved_opcode_byte(byte: u8) -> bool {
 pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     let mut m = IndexMap::new();
 
-    // pyjitpl.py:2236-2243 — fields `setup_insns` probes explicitly.
+    // pyjitpl.py — fields `setup_insns` probes explicitly.
     m.insert("live/", BC_LIVE);
     m.insert("catch_exception/L", BC_CATCH_EXCEPTION);
     m.insert("rvmprof_code/ii", BC_RVMPROF_CODE);
@@ -692,7 +692,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // registered so `setup_insns` does not fall back to `u8::MAX` for
     // them.
     m.insert("int_return/i", BC_INT_RETURN);
-    // `int_return/c` — USE_C_FORM short source (`assembler.py:312`): a small
+    // `int_return/c` — USE_C_FORM short source (`assembler.py`): a small
     // const-int return value inline as one signed byte.
     m.insert("int_return/c", BC_INT_RETURN_C);
     m.insert("ref_return/r", BC_REF_RETURN);
@@ -706,7 +706,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // strict subset of RPython's `Assembler.insns`. See the comment on
     // `pyre_extension_insns` for the borrow-checker rationale.
 
-    // RPython blackhole.py:962 `bhimpl_unreachable()` raises
+    // RPython blackhole.py `bhimpl_unreachable()` raises
     // `AssertionError("unreachable")`. Distinct opcode from
     // `abort_permanent/` so the interpreter fallback path cannot be taken.
     m.insert("unreachable/", BC_UNREACHABLE);
@@ -739,18 +739,18 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("hint_force_virtualizable/r", BC_HINT_FORCE_VIRTUALIZABLE);
 
     // Control flow / structural markers that actually emit.
-    // pyjitpl.py:2237 `op_goto = insns.get('goto/L', -1)` and
-    // blackhole.py:950 `bhimpl_goto(target): return target` — the
+    // pyjitpl.py `op_goto = insns.get('goto/L', -1)` and
+    // blackhole.py `bhimpl_goto(target): return target` — the
     // canonical key is `goto/L`.
     m.insert("goto/L", BC_JUMP);
     // loop_header takes a single int constant operand (the jitdriver index).
-    // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header emits
+    // RPython jtransform.py handle_jit_marker__loop_header emits
     // SpaceOperation('loop_header', [c_index], None); blackhole.py:1063
     // bhimpl_loop_header(jdindex) is @arguments("i").
     m.insert("loop_header/i", BC_LOOP_HEADER);
     m.insert("raise/r", BC_RAISE);
     m.insert("reraise/", BC_RERAISE);
-    // blackhole.py:987 `@arguments("self", returns="i") bhimpl_last_exception`
+    // blackhole.py `@arguments("self", returns="i") bhimpl_last_exception`
     // yields canonical key `last_exception/>i`.
     m.insert("last_exception/>i", BC_LAST_EXCEPTION);
     m.insert(
@@ -765,7 +765,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // `jit_merge_point` in `USE_C_FORM`, so the jdindex argcode is `c`
     // when the value fits in a signed byte and `i` (constants-pool
     // slot index) otherwise. Both forms reach the same
-    // `bhimpl_jit_merge_point` (blackhole.py:1066) because the
+    // `bhimpl_jit_merge_point` (blackhole.py) because the
     // `@arguments("i", ...)` decoder dispatches on the runtime argcode
     // (blackhole.py:113-123 `argtype == 'i'` branch).
     m.insert("jit_merge_point/cIRFIRF", BC_JIT_MERGE_POINT_C);
@@ -804,7 +804,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // `pyre_extension_insns()`.
 
     // jtransform.py:196 / flatten.py:247 — fused `goto_if_not_<op>_<type>`.
-    // Argcodes follow assembler.py:162-196: two registers + label.
+    // Argcodes follow assembler.py: two registers + label.
     m.insert("goto_if_not_int_lt/iiL", BC_GOTO_IF_NOT_INT_LT);
     m.insert("goto_if_not_int_le/iiL", BC_GOTO_IF_NOT_INT_LE);
     m.insert("goto_if_not_int_eq/iiL", BC_GOTO_IF_NOT_INT_EQ);
@@ -823,7 +823,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("goto_if_not_ptr_nonzero/rL", BC_GOTO_IF_NOT_PTR_NONZERO);
     m.insert("goto_if_not_int_is_zero/iL", BC_GOTO_IF_NOT_INT_IS_ZERO);
 
-    // flatten.py:326-332 `insert_renamings` cycle-break push/pop pairs.
+    // flatten.py `insert_renamings` cycle-break push/pop pairs.
     // Argcodes follow assembler.py:162-196 / blackhole.py:661-679:
     // push takes one register source (`i`/`r`/`f`), pop writes one
     // register destination (`>i`/`>r`/`>f`).
@@ -843,7 +843,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("int_sub_jump_if_ovf/Lii>i", BC_INT_SUB_JUMP_IF_OVF);
     m.insert("int_mul_jump_if_ovf/Lii>i", BC_INT_MUL_JUMP_IF_OVF);
     // `int_floordiv/ii>i` / `int_mod/ii>i` intentionally absent —
-    // `jtransform.py:576-577` rewrites via `_do_builtin_call`, so the
+    // `jtransform.py` rewrites via `_do_builtin_call`, so the
     // SSA-name → bytecode table never matches these.  See the
     // `BC_INT_AND` constants block above for the parity rationale.
     m.insert("int_and/ii>i", BC_INT_AND);
@@ -866,10 +866,10 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("uint_le/ii>i", BC_UINT_LE);
     m.insert("uint_gt/ii>i", BC_UINT_GT);
     m.insert("uint_ge/ii>i", BC_UINT_GE);
-    // `blackhole.py:559-561 bhimpl_int_between(a, b, c) -> i` —
+    // `blackhole.py bhimpl_int_between(a, b, c) -> i` —
     // `a <= b < c` range check.  Emitted by
     // `make_ll_isinstance`'s `has_subclasses` body
-    // (`rclass.py:1163-1167 ll_isinstance` range arm).
+    // (`rclass.py ll_isinstance` range arm).
     m.insert("int_between/iii>i", BC_INT_BETWEEN);
     // Ref/nullity primitives — `blackhole.py:584-610`.
     m.insert("ptr_eq/rr>i", BC_PTR_EQ);
@@ -891,11 +891,11 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // `bhimpl_{int,ref,float}_copy`. `@arguments("i"|"r"|"f",
     // returns="i"|"r"|"f")` yields canonical keys
     // `{int,ref,float}_copy/X>X`. pyre's `move_{i,r,f}` emitters route
-    // through these bytes; flatten.py:326-332 `insert_renamings` is the
+    // through these bytes; flatten.py `insert_renamings` is the
     // main RPython producer of `int_copy` ops (cycle-break renamings),
     // which pyre's super-inst expansion also re-uses.
     m.insert("int_copy/i>i", BC_MOVE_I);
-    // `int_copy/c>i` — USE_C_FORM short source (`assembler.py:312`): a small
+    // `int_copy/c>i` — USE_C_FORM short source (`assembler.py`): a small
     // ConstInt source takes the inline `c` byte instead of a pool `i` slot.
     // pyre materialises every small int/bool constant through `int_copy`
     // (`OpKind::ConstInt`/`ConstBool`), so the short form is the common path
@@ -932,7 +932,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("getfield_gc_r/rd>r", BC_GETFIELD_GC_R);
     m.insert("getfield_gc_f/rd>f", BC_GETFIELD_GC_F);
     m.insert("setfield_gc_i/rid", BC_SETFIELD_GC_I);
-    // USE_C_FORM short value (`assembler.py:99-107,312`): a small
+    // USE_C_FORM short value (`assembler.py`): a small
     // ConstInt store value takes the inline `c` byte in place of the
     // `i` value register.
     m.insert("setfield_gc_i/rcd", BC_SETFIELD_GC_I_C);
@@ -961,13 +961,13 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("setarrayitem_gc_i/riid", BC_SETARRAYITEM_GC_I);
     m.insert("setarrayitem_gc_r/rird", BC_SETARRAYITEM_GC_R);
     m.insert("setarrayitem_gc_f/rifd", BC_SETARRAYITEM_GC_F);
-    // `c`-argcode forms (USE_C_FORM, `assembler.py:163/312`): small
+    // `c`-argcode forms (USE_C_FORM, `assembler.py/312`): small
     // ConstInt index/length written inline as one signed byte.
     // `new_array_clear/id>r` itself is registered with the other
     // allocation opcodes (`new` / `new_with_vtable` / `new_array`) below.
     m.insert("setarrayitem_gc_r/rcrd", BC_SETARRAYITEM_GC_R_C);
     // const-VALUE form: a small ConstInt store value inline as one signed
-    // byte (`setarrayitem_gc_i` ∈ USE_C_FORM, `assembler.py:339`), keyed
+    // byte (`setarrayitem_gc_i` ∈ USE_C_FORM, `assembler.py`), keyed
     // off the int value bank like `setfield_gc_i/rcd`.
     m.insert("setarrayitem_gc_i/ricd", BC_SETARRAYITEM_GC_I_C);
     m.insert("new_array_clear/cd>r", BC_NEW_ARRAY_CLEAR_C);
@@ -983,9 +983,9 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("getarrayitem_gc_r_pure/rid>r", BC_GETARRAYITEM_GC_R_PURE);
     m.insert("getarrayitem_gc_f_pure/rid>f", BC_GETARRAYITEM_GC_F_PURE);
 
-    // Array length — `blackhole.py:1370` `bhimpl_arraylen_gc`
+    // Array length — `blackhole.py` `bhimpl_arraylen_gc`
     // (`@arguments("cpu", "r", "d", returns="i")`).
-    // `bhimpl_arraylen_vable` (`blackhole.py:1406`,
+    // `bhimpl_arraylen_vable` (`blackhole.py`,
     // `@arguments("cpu", "r", "d", "d", returns="i")`) is pinned with
     // its vable siblings above at [`BC_ARRAYLEN_VABLE`] = 74.
     m.insert("arraylen_gc/rd>i", BC_ARRAYLEN_GC);
@@ -1034,10 +1034,10 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("float_gt/ff>i", BC_FLOAT_GT);
     m.insert("float_ge/ff>i", BC_FLOAT_GE);
 
-    // Cross-kind casts — `bhimpl_cast_ptr_to_int` (`blackhole.py:603-606`),
-    // `bhimpl_cast_int_to_ptr` (`blackhole.py:608-610`),
-    // `bhimpl_cast_int_to_float` (`blackhole.py:811-816`),
-    // `bhimpl_cast_float_to_int` (`blackhole.py:801-808`).
+    // Cross-kind casts — `bhimpl_cast_ptr_to_int` (`blackhole.py`),
+    // `bhimpl_cast_int_to_ptr` (`blackhole.py`),
+    // `bhimpl_cast_int_to_float` (`blackhole.py`),
+    // `bhimpl_cast_float_to_int` (`blackhole.py`).
     m.insert("cast_int_to_float/i>f", BC_CAST_INT_TO_FLOAT);
     m.insert("cast_int_to_ptr/i>r", BC_CAST_INT_TO_PTR);
     m.insert("cast_ptr_to_int/r>i", BC_CAST_PTR_TO_INT);
@@ -1051,7 +1051,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
         BC_CONVERT_LONGLONG_BYTES_TO_FLOAT,
     );
 
-    // Switch dispatch — `blackhole.py:954-960` `bhimpl_switch`.
+    // Switch dispatch — `blackhole.py` `bhimpl_switch`.
     // Argcodes `id`: int discriminator + descr selecting the case table.
     m.insert("switch/id", BC_SWITCH);
 

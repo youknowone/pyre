@@ -1,7 +1,7 @@
 //! RPython `rpython/rtyper/lltypesystem/rstr.py` — minimal slice for
 //! the `Ptr(STR)` / `Ptr(UNICODE)` low-level types that
-//! `OBJECT_VTABLE.name` (rclass.py:171) and
-//! `ClassesPBCRepr.rtype_getattr('__name__')` (rpbc.py:975-981)
+//! `OBJECT_VTABLE.name` (rclass.py) and
+//! `ClassesPBCRepr.rtype_getattr('__name__')` (rpbc.py)
 //! consume, plus the `UNICODE` data shape that the eventual
 //! `UnicodeRepr` port will dereference.
 //!
@@ -106,9 +106,9 @@ pub static STR: LazyLock<LowLevelType> = LazyLock::new(|| {
 });
 
 /// RPython `Ptr(STR)` — surfaces as the lltype of
-/// `OBJECT_VTABLE.name` (rclass.py:171) and the result type of
+/// `OBJECT_VTABLE.name` (rclass.py) and the result type of
 /// `genop('getfield', [vcls, 'name'], resulttype=Ptr(rstr.STR))` in
-/// `ClassesPBCRepr.rtype_getattr('__name__')` (rpbc.py:980-981).
+/// `ClassesPBCRepr.rtype_getattr('__name__')` (rpbc.py).
 pub static STRPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
     let str_t = STR.clone();
     let LowLevelType::ForwardReference(fwd) = str_t else {
@@ -130,8 +130,8 @@ pub fn new_malloc() -> Result<(), TyperError> {
     Err(rstr_deferred("new_malloc"))
 }
 
-/// RPython `llstr(s)` (`annlowlevel.py:469-475` via
-/// `rstr.py:1230-1235 mallocstr`): build the prebuilt `Ptr(STR)`
+/// RPython `llstr(s)` (`annlowlevel.py` via
+/// `rstr.py mallocstr`): build the prebuilt `Ptr(STR)`
 /// container for a host string constant — `mallocstr(len(s))` plus a
 /// per-index `chars[i] = s[i]` fill.  `hash` keeps malloc's `Signed`
 /// default `0` (upstream computes it lazily through `ll_strhash`).
@@ -168,7 +168,7 @@ pub(crate) fn llstr(s: &[u8]) -> Result<_ptr, String> {
     Ok(p)
 }
 
-/// `_hash_string(s)` (objectmodel.py:596-618): the modified-FNV hash
+/// `_hash_string(s)` (objectmodel.py): the modified-FNV hash
 /// behind `compute_hash()` — `x = ord(s[0]) << 7`, then
 /// `x = intmask((1000003*x) ^ ord(s[i]))` per char, `x ^= length`,
 /// empty string → `-1`.  `intmask` is machine-word wraparound, hence
@@ -185,7 +185,7 @@ pub(crate) fn hash_string_bytes(s: &[u8]) -> i64 {
     x ^ s.len() as i64
 }
 
-/// `_ll_strhash(s)` value computation (rstr.py:405-414): malloc
+/// `_ll_strhash(s)` value computation (rstr.py): malloc
 /// zero-fills the `hash` slot, so `0` is reserved as the
 /// not-computed-yet marker — a real hash of `0` is replaced with
 /// `29872897` (the same fixup the runtime helper graph
@@ -196,8 +196,8 @@ pub(crate) fn ll_strhash_value(s: &[u8]) -> i64 {
 }
 
 thread_local! {
-    /// `CONST_STR_CACHE = WeakValueDictionary()` (`rstr.py:1226` /
-    /// `StringRepr.CACHE`, `lltypesystem/rstr.py:233`): one host string →
+    /// `CONST_STR_CACHE = WeakValueDictionary()` (`rstr.py` /
+    /// `StringRepr.CACHE`, `lltypesystem/rstr.py`): one host string →
     /// one prebuilt container identity, so repeated `convert_const` calls
     /// on the same literal return the same `_ptr` (prebuilt-constant
     /// `is`-identity upstream relies on).  Thread-lifetime strong
@@ -217,7 +217,7 @@ thread_local! {
 }
 
 /// `self.CACHE.get(value)` / `self.ll.llstr(value)` pair from
-/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`).
+/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py`).
 pub(crate) fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
     CONST_STR_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -225,7 +225,7 @@ pub(crate) fn const_str_cache_llstr(s: &[u8]) -> Result<_ptr, String> {
             return Ok(p.clone());
         }
         let mut p = llstr(s)?;
-        // `p.hash = 0; self.ll.ll_strhash(p)` (rstr.py:199-200):
+        // `p.hash = 0; self.ll.ll_strhash(p)` (rstr.py):
         // precompute the hash before caching the container, so every
         // prebuilt string constant ships with its hash slot filled.
         p.setattr("hash", LowLevelValue::Signed(ll_strhash_value(s)))?;
@@ -281,7 +281,7 @@ pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
 }
 
 /// `nullptr(self.lowleveltype.TO)` for the `value is None` arm of
-/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:192-193`).
+/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py`).
 pub(crate) fn null_str_ptr() -> _ptr {
     let LowLevelType::Ptr(ptr_t) = STRPTR.clone() else {
         panic!("STRPTR must be a Ptr lowleveltype");
@@ -301,7 +301,7 @@ pub(crate) fn null_str_ptr() -> _ptr {
 /// elides both today (see [`STR`] docstring); structural shape is
 /// what the eventual `UnicodeRepr` port consumes.
 pub static UNICODE: LazyLock<LowLevelType> = LazyLock::new(|| {
-    // `Array(UniChar, hints={'immutable': True})` (rstr.py:1239) —
+    // `Array(UniChar, hints={'immutable': True})` (rstr.py) —
     // marks the unichar array read-only; no trailing-NUL reservation.
     let chars = Array::with_hints(
         LowLevelType::UniChar,
@@ -328,7 +328,7 @@ pub static UNICODE: LazyLock<LowLevelType> = LazyLock::new(|| {
 });
 
 /// RPython `Ptr(UNICODE)` — surfaces as the lltype of
-/// `UnicodeRepr.lowleveltype` (rstr.py:248) and is the result type of
+/// `UnicodeRepr.lowleveltype` (rstr.py) and is the result type of
 /// every `gendirectcall(self.ll.ll_*unicode*, ...)` inside
 /// `AbstractUnicodeRepr` methods.
 pub static UNICODEPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
@@ -357,7 +357,7 @@ pub fn emptystrfun() -> Result<_ptr, String> {
     const_str_cache_llstr(b"")
 }
 
-/// RPython `alloc_array_name(name)` (rclass.py:187-188):
+/// RPython `alloc_array_name(name)` (rclass.py):
 ///
 /// ```python
 /// def alloc_array_name(name):
@@ -427,7 +427,7 @@ pub fn do_stringformat() -> Result<(), TyperError> {
     Err(rstr_deferred("do_stringformat"))
 }
 
-/// RPython `class BaseLLStringRepr(Repr)` (`lltypesystem/rstr.py:190`).
+/// RPython `class BaseLLStringRepr(Repr)` (`lltypesystem/rstr.py`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BaseLLStringRepr;
 
@@ -443,7 +443,7 @@ pub type CharRepr = crate::translator::rtyper::rstr::AbstractCharRepr;
 /// RPython `class UniCharRepr(AbstractUniCharRepr, UnicodeRepr)`.
 pub type UniCharRepr = crate::translator::rtyper::rstr::AbstractUniCharRepr;
 
-/// RPython `class LLHelpers(AbstractLLHelpers)` (`lltypesystem/rstr.py:307`).
+/// RPython `class LLHelpers(AbstractLLHelpers)` (`lltypesystem/rstr.py`).
 pub type LLHelpers = crate::translator::rtyper::rstr::AbstractLLHelpers;
 
 /// RPython `class BaseStringIteratorRepr(AbstractStringIteratorRepr)`.
@@ -470,7 +470,7 @@ pub fn ll_getnextindex() -> Result<(), TyperError> {
     Err(rstr_deferred("ll_getnextindex"))
 }
 
-// LLHelpers — `lltypesystem/rstr.py:307` `class LLHelpers(AbstractLLHelpers)`.
+// LLHelpers — `lltypesystem/rstr.py` `class LLHelpers(AbstractLLHelpers)`.
 //
 // Each helper is synthesised as a single-block low-level graph the
 // rtyper inserts via `gendirectcall`. The helpers correspond to
@@ -510,7 +510,7 @@ fn emit_chars_length_ops(
 /// `STR`/`UNICODE` `ForwardReference`. The result wraps the field's
 /// inline `Array(Char|UniChar)` in `Ptr` so the synthesised
 /// `getsubstruct` op's result variable carries a valid
-/// `SomePtr`-shaped annotation (upstream `lltype.py:1530+`'s
+/// `SomePtr`-shaped annotation (upstream `lltype.py+`'s
 /// `SomePtr.__init__` rejects bare container types — see
 /// `llannotation.rs`).
 pub(crate) fn chars_array_ptr_lltype_from_strptr(
@@ -586,7 +586,7 @@ pub(crate) fn struct_lltype_from_strptr(
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_strlen` /
-/// `LLHelpers.ll_length` (`lltypesystem/rstr.py:351-352, 417-418`):
+/// `LLHelpers.ll_length` (`lltypesystem/rstr.py, 417-418`):
 ///
 /// ```python
 /// @staticmethod
@@ -629,7 +629,7 @@ pub(crate) fn build_ll_strlen_helper_graph(
     ))
 }
 
-/// Synthesise `mallocstr` / `mallocunicode` (`lltypesystem/rstr.py:35-46`):
+/// Synthesise `mallocstr` / `mallocunicode` (`lltypesystem/rstr.py`):
 ///
 /// ```python
 /// def mallocstr(length):
@@ -708,7 +708,7 @@ pub(crate) fn build_ll_mallocstr_helper_graph(
     ))
 }
 
-/// Synthesise `LLHelpers.ll_chr2str` (`lltypesystem/rstr.py:363-369`):
+/// Synthesise `LLHelpers.ll_chr2str` (`lltypesystem/rstr.py`):
 ///
 /// ```python
 /// def ll_chr2str(ch):
@@ -820,7 +820,7 @@ pub(crate) fn build_ll_chr2str_helper_graph(
     ))
 }
 
-/// Synthesise `LLHelpers.ll_str2unicode` (`lltypesystem/rstr.py:375-383`):
+/// Synthesise `LLHelpers.ll_str2unicode` (`lltypesystem/rstr.py`):
 ///
 /// ```python
 /// def ll_str2unicode(str):
@@ -1244,7 +1244,7 @@ fn hex_chars_constant() -> Result<Hlvalue, TyperError> {
     ))
 }
 
-/// Synthesise `ll_int2hex` (`lltypesystem/ll_str.py:47-82`):
+/// Synthesise `ll_int2hex` (`lltypesystem/ll_str.py`):
 ///
 /// ```python
 /// @jit.elidable
@@ -1320,8 +1320,8 @@ pub(crate) fn build_ll_int2hex_helper_graph(
         Hlvalue::Variable(ch)
     };
 
-    // ll_str.py:48 `ll_int2hex(i, addPrefix)` is specialised by the type
-    // of `i`. `raddress.py:39` calls `ll_int2hex(r_uint(id), True)`, so the
+    // ll_str.py `ll_int2hex(i, addPrefix)` is specialised by the type
+    // of `i`. `raddress.py` calls `ll_int2hex(r_uint(id), True)`, so the
     // address path needs the `r_uint` (Unsigned) specialisation, in which
     // `if i < 0` is provably false and the whole sign branch is pruned.
     // `signed_input=true` materialises the Signed specialisation (full sign
@@ -2132,8 +2132,8 @@ pub(crate) fn build_ll_int2hex_helper_graph(
     ))
 }
 
-/// Synthesise `IntegerRepr.ll_str` (`rint.py:150-152`) = `ll_int2dec(val)`
-/// (`ll_str.py:14-39`) as a low-level helper graph. Where `ll_int2hex`
+/// Synthesise `IntegerRepr.ll_str` (`rint.py`) = `ll_int2dec(val)`
+/// (`ll_str.py`) as a low-level helper graph. Where `ll_int2hex`
 /// fills a scratch array forward then copies it reversed, `ll_int2dec`
 /// counts the digits first, allocates the exact-length result, and writes
 /// each decimal digit straight to its final reversed slot
@@ -2819,7 +2819,7 @@ pub(crate) fn build_ll_int2dec_helper_graph(
     ))
 }
 
-/// Synthesise `LLHelpers.ll_int` (`lltypesystem/rstr.py:1057-1110`):
+/// Synthesise `LLHelpers.ll_int` (`lltypesystem/rstr.py`):
 ///
 /// ```python
 /// def ll_int(s, base):
@@ -6075,7 +6075,7 @@ fn build_ll_startsendswith_char_helper_graph(
 /// ```
 ///
 /// `s` is a chars Array (`Ptr(Array(Char|UniChar))`), not a STR/UNICODE
-/// pointer — the caller (`ll_hash_string`, objectmodel.py:620-621)
+/// pointer — the caller (`ll_hash_string`, objectmodel.py)
 /// supplies `ll_s.chars` via `getsubstruct`. `intmask` is a no-op
 /// at lltype level (lltype `Signed` arithmetic already wraps), so the
 /// synthesizer drops the call.
@@ -6752,7 +6752,7 @@ pub(crate) fn build_ll_strhash_helper_graph(
     ))
 }
 
-/// lltypesystem/rstr.py:421-423 `ll_strfasthash(s)`:
+/// lltypesystem/rstr.py `ll_strfasthash(s)`:
 /// `ll_assert(s.hash != 0); return s.hash`.
 /// Assumes hash is already computed — a single getfield.
 pub(crate) fn build_ll_strfasthash_helper_graph(
@@ -7775,7 +7775,7 @@ pub(crate) fn build_ll_stritem_helper_graph(
 /// Synthesise a `ll_isdigit/isalpha/isalnum/isspace/isupper/islower`-
 /// style `string-isxxx` helper graph that loops over chars and
 /// `direct_call`s a per-char predicate sub-helper. RPython
-/// `AbstractStringRepr.rtype_method_isdigit` etc. (`rstr.py:253-269`)
+/// `AbstractStringRepr.rtype_method_isdigit` etc. (`rstr.py`)
 /// ultimately lower to `ll_isdigit(s)` / `ll_isalpha(s)` etc., which
 /// in turn iterate `s.chars` and call the matching `ll_char_isxxx`
 /// per-char predicate.
@@ -9154,7 +9154,7 @@ pub(crate) fn build_ll_strconcat_helper_graph(
 
     // ---- start: extract source lengths, malloc the result, then copy each
     //      source's chars into it via copystrcontent.  Mirrors upstream
-    //      `ll_strconcat` (rstr.py:428): malloc + two `copy_contents_from_str`
+    //      `ll_strconcat` (rstr.py): malloc + two `copy_contents_from_str`
     //      calls, each rewritten by the JIT codewriter to a single
     //      `copystrcontent` op.
     let chars1 = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
@@ -9254,7 +9254,7 @@ pub(crate) fn build_ll_strconcat_helper_graph(
 }
 
 /// `LLHelpers._ll_stringslice` plus the three wrappers selected by
-/// `AbstractStringRepr.rtype_getslice` (`rstr.py:432-437`,
+/// `AbstractStringRepr.rtype_getslice` (`rstr.py`,
 /// `lltypesystem/rstr.py:844-876`).  The start/stop wrapper preserves the
 /// identity-bearing `jit.we_are_jitted()` branch: the JIT arm clamps
 /// `stop > len`, while the no-JIT arm returns `s1` for `[0:>=len]`.
@@ -9861,7 +9861,7 @@ mod tests {
         }
     }
 
-    /// `_hash_string` (objectmodel.py:596-618) reproduces CPython
+    /// `_hash_string` (objectmodel.py) reproduces CPython
     /// 2.7's non-randomized 64-bit string hash; spot-check known
     /// values plus the empty-string `-1` and the `_ll_strhash`
     /// zero-fixup passthrough (a `-1` hash is not zero, so the
@@ -9874,7 +9874,7 @@ mod tests {
         assert_eq!(ll_strhash_value(b""), -1);
     }
 
-    /// `CONST_STR_CACHE` (rstr.py:187 / `StringRepr.CACHE`): repeated
+    /// `CONST_STR_CACHE` (rstr.py / `StringRepr.CACHE`): repeated
     /// `convert_const` of the same literal must return the SAME
     /// prebuilt container (`is`-identity upstream), while distinct
     /// literals get distinct containers.
@@ -9921,7 +9921,7 @@ mod tests {
     }
 
     /// `nullptr(self.lowleveltype.TO)` arm of
-    /// `BaseLLStringRepr.convert_const` (lltypesystem/rstr.py:192-193):
+    /// `BaseLLStringRepr.convert_const` (lltypesystem/rstr.py):
     /// a typed null `Ptr(STR)`.
     #[test]
     fn null_str_ptr_is_typed_null_strptr() {
@@ -9966,7 +9966,7 @@ mod tests {
     }
 
     /// `UNICODEPTR` is `Ptr(UNICODE)` — the lltype that
-    /// `UnicodeRepr.lowleveltype` (rstr.py:248) carries.
+    /// `UnicodeRepr.lowleveltype` (rstr.py) carries.
     #[test]
     fn unicodeptr_is_ptr_to_unicode_forwardreference() {
         let LowLevelType::Ptr(ptr) = UNICODEPTR.clone() else {
@@ -10380,7 +10380,7 @@ mod tests {
         assert!(format!("{err:?}").contains("Ptr(STR/UNICODE)"));
     }
 
-    /// rstr.py:35-46 — `mallocstr(length)` lowers to
+    /// rstr.py — `mallocstr(length)` lowers to
     /// `malloc_varsize(STR, gc, length)` + `setfield(r, 'hash', 0)`,
     /// returning `Ptr(STR)`.
     #[test]
@@ -12157,7 +12157,7 @@ mod tests {
     /// CFG: start emits getsubstruct + getarraysize × 2 + int_add
     /// (total) + **malloc_varsize** + two **copystrcontent** ops, then
     /// forwards `newstr` into the returnblock.  Mirrors upstream
-    /// `ll_strconcat` (rstr.py:428): malloc + two `copy_contents_from_str`
+    /// `ll_strconcat` (rstr.py): malloc + two `copy_contents_from_str`
     /// calls (each rewritten to a single `copystrcontent`), no per-char
     /// loop.
     ///

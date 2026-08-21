@@ -519,7 +519,7 @@ impl SpamBlock {
     }
 }
 
-/// RPython `flowcontext.py:47-78` — `class EggBlock(Block)`.
+/// RPython `flowcontext.py` — `class EggBlock(Block)`.
 ///
 /// Deviation from upstream (parity rule #1):
 ///
@@ -530,7 +530,7 @@ impl SpamBlock {
 ///   `BlockRecorder` whose `entry_state` is already the ancestor's
 ///   framestate, so the walked value equals the cached field at
 ///   construction time. Cache coherence is preserved because
-///   `fixeggblocks` (upstream `flowcontext.py:80-83`) only *deletes*
+///   `fixeggblocks` (upstream `flowcontext.py`) only *deletes*
 ///   `SpamBlock.framestate` after graph finalization — it never
 ///   mutates it — and Rust finalization runs after all `EggBlock`s are
 ///   created.
@@ -540,7 +540,7 @@ pub struct EggBlock {
     pub prevblock: BlockRef,
     /// RPython `EggBlock.booloutcome`. Upstream stores a Python duck-
     /// typed value here: `guessbool` assigns a `bool`
-    /// (`flowcontext.py:111-113`), while `guessexception` assigns
+    /// (`flowcontext.py`), while `guessexception` assigns
     /// `None` or an exception class Constant
     /// (`flowcontext.py:139-141`). Rust closes the union by storing
     /// the value as an `Option<Hlvalue>` — `None` mirrors Python
@@ -692,7 +692,7 @@ impl BlockRecorder {
     }
 }
 
-/// RPython `flowcontext.py:152-178` — `class Replayer(Recorder)`.
+/// RPython `flowcontext.py` — `class Replayer(Recorder)`.
 #[derive(Clone, Debug)]
 pub struct Replayer {
     pub crnt_block: BlockRef,
@@ -1196,7 +1196,7 @@ impl FlowContext {
         }
     }
 
-    /// RPython `flowcontext.py:600-636` — `FlowContext.exc_from_raise`.
+    /// RPython `flowcontext.py` — `FlowContext.exc_from_raise`.
     ///
     /// ```python
     /// def exc_from_raise(self, w_arg1, w_arg2):
@@ -1561,7 +1561,7 @@ impl FlowContext {
         ) {
             return self.handle_print_function(arguments, keywords, w_star);
         }
-        // RPython `flowspace/operation.py:666-676` — `SimpleCall.eval`:
+        // RPython `flowspace/operation.py` — `SimpleCall.eval`:
         //
         //     if isinstance(w_callable, Constant):
         //         fn = w_callable.value
@@ -2895,7 +2895,7 @@ impl FlowContext {
                     Ok(None)
                 }
                 Instruction::RaiseVarargs { .. } => {
-                    // RPython `flowcontext.py:638-656` — RAISE_VARARGS.
+                    // RPython `flowcontext.py` — RAISE_VARARGS.
                     // upstream:
                     //   if nbargs == 0:    re-raise last_exception / TypeError
                     //   if nbargs >= 3:    pop traceback (Py2-only, dropped)
@@ -3481,7 +3481,7 @@ impl FlowContext {
     }
 }
 
-/// RPython `flowcontext.py:80-83` — `fixeggblocks(graph)`.
+/// RPython `flowcontext.py` — `fixeggblocks(graph)`.
 ///
 /// Upstream: walks every block and deletes `SpamBlock.framestate`
 /// "memory saver" after graph construction. The Rust port holds
@@ -4206,7 +4206,7 @@ mod test {
 
     #[test]
     fn special_cases_locals_rejects_with_flowing_error() {
-        // RPython basis: specialcase.py:33-41 — @register_flow_sc(locals).
+        // RPython basis: specialcase.py — @register_flow_sc(locals).
         let mut ctx = flow_context("def f():\n    return locals()\n");
         ctx.recorder = None;
         let err = ctx.build_flow().unwrap_err();
@@ -4224,7 +4224,7 @@ mod test {
 
     #[test]
     fn special_cases_getattr_two_arg_records_getattr_op() {
-        // RPython basis: specialcase.py:43-49 — @register_flow_sc(getattr)
+        // RPython basis: specialcase.py — @register_flow_sc(getattr)
         // two-arg path delegates to op.getattr(w_obj, w_index).eval(ctx),
         // which in the Rust port records `getattr(obj, name)`.
         let mut ctx = flow_context("def f(x):\n    return getattr(x, 'attr')\n");
@@ -4268,7 +4268,7 @@ mod test {
 
     #[test]
     fn special_cases_redirect_open_to_create_file() {
-        // RPython basis: specialcase.py:53 — redirect_function(open,
+        // RPython basis: specialcase.py — redirect_function(open,
         // 'rpython.rlib.rfile.create_file'). Rust port encodes the
         // target as BuiltinFunction::CreateFile and SPECIAL_CASES
         // dispatches through `appcall(target, args)` which records
@@ -4364,7 +4364,7 @@ mod test {
 
     #[test]
     fn exception_class_user_defined_base_walk() {
-        // upstream `model.py:354` Constant(SomeClass) + `SomeClass.__bases__`
+        // upstream `model.py` Constant(SomeClass) + `SomeClass.__bases__`
         // drives `issubclass` in exception_match. Rust port mirrors with
         // `HostObject::new_class(name, bases)` + `is_subclass_of`.
         let value_error = HOST_ENV.lookup_builtin("ValueError").unwrap();

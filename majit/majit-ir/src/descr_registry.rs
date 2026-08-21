@@ -1,6 +1,6 @@
 //! Process-global descriptor registry — thin facade over [`crate::descr::gc_cache`].
 //!
-//! PyPy `pyjitpl.py:2287-2290 finish_setup_descrs`:
+//! PyPy `pyjitpl.py finish_setup_descrs`:
 //!
 //! ```python
 //! def finish_setup_descrs(self):
@@ -9,7 +9,7 @@
 //!     effectinfo.compute_bitstrings(self.all_descrs)
 //! ```
 //!
-//! `cpu.setup_descrs()` walks `gc_cache._cache_*` (`backend/llsupport/descr.py:25-47`)
+//! `cpu.setup_descrs()` walks `gc_cache._cache_*` (`backend/llsupport/descr.py`)
 //! across the six categories — size / field / array / arraylen / call /
 //! interiorfield — and returns the concatenated descr list in fixed
 //! group order.  Pyre's lift routes every mint site through the
@@ -27,7 +27,7 @@
 
 use crate::descr::{DescrRef, gc_cache};
 
-/// `descr.py:236-247 get_size_descr` cache-miss publication — register
+/// `descr.py get_size_descr` cache-miss publication — register
 /// a freshly-minted size descr.  TODO: prefer
 /// `gc_cache.get_size_descr(LLType::Struct(...), ...)`.
 pub fn register_size(descr: DescrRef) {
@@ -37,14 +37,14 @@ pub fn register_size(descr: DescrRef) {
 /// Keyed sibling: publishes the descr to `gc_cache._cache_size[key]`
 /// AND `_cache_size_order`, so subsequent
 /// `gc_cache.get_size_descr(key, ...)` calls return the same Arc.
-/// Mirrors `descr.py:108-118 get_size_descr` cache-miss
+/// Mirrors `descr.py get_size_descr` cache-miss
 /// `cache[STRUCT] = sizedescr` (the keyed half) for mint sites that
 /// bypass `get_size_descr` proper.
 pub fn register_keyed_size(key: crate::descr::LLType, descr: DescrRef) {
     gc_cache().lock().unwrap().register_keyed_size(key, descr);
 }
 
-/// `descr.py:225-235 get_field_descr` cache-miss publication.
+/// `descr.py get_field_descr` cache-miss publication.
 /// TODO: prefer
 /// `gc_cache.get_field_descr(LLType::Struct(...), ...)`.
 pub fn register_field(descr: DescrRef) {
@@ -53,7 +53,7 @@ pub fn register_field(descr: DescrRef) {
 
 /// Keyed sibling: publishes the descr to
 /// `gc_cache._cache_field[struct_key][field_name]` AND
-/// `_cache_field_order`.  Mirrors `descr.py:218-239 get_field_descr`
+/// `_cache_field_order`.  Mirrors `descr.py get_field_descr`
 /// cache-miss `cachedict[fieldname] = fielddescr` for mint sites that
 /// bypass `get_field_descr` proper.
 pub fn register_keyed_field(
@@ -67,7 +67,7 @@ pub fn register_keyed_field(
         .register_keyed_field(struct_key, field_name, descr);
 }
 
-/// `descr.py:354-364 get_array_descr` cache-miss publication.
+/// `descr.py get_array_descr` cache-miss publication.
 /// TODO: prefer
 /// `gc_cache.get_array_descr(LLType::Array(...), ...)`.
 pub fn register_array(descr: DescrRef) {
@@ -75,7 +75,7 @@ pub fn register_array(descr: DescrRef) {
 }
 
 /// Keyed sibling: publishes the descr to `gc_cache._cache_array[key]`
-/// AND `_cache_array_order`.  Mirrors `descr.py:348-378 get_array_descr`
+/// AND `_cache_array_order`.  Mirrors `descr.py get_array_descr`
 /// cache-miss `cache[ARRAY_OR_STRUCT] = arraydescr`.
 pub fn register_keyed_array(key: crate::descr::LLType, descr: DescrRef) {
     gc_cache().lock().unwrap().register_keyed_array(key, descr);
@@ -97,7 +97,7 @@ pub fn register_keyed_arraylen(key: crate::descr::LLType, descr: DescrRef) {
         .register_keyed_arraylen(key, descr);
 }
 
-/// `descr.py:404-414 get_interiorfield_descr` cache-miss publication.
+/// `descr.py get_interiorfield_descr` cache-miss publication.
 /// TODO: prefer the keyed cache-or-mint path once
 /// `gc_cache.get_interiorfield_descr` lands.
 pub fn register_interior_field(descr: DescrRef) {
@@ -128,7 +128,7 @@ pub fn register_keyed_interior_field(
         .register_keyed_interiorfield(array_key, name, arrayfieldname, descr);
 }
 
-/// `descr.py:25-47 setup_descrs` snapshot.  Sole production caller is
+/// `descr.py setup_descrs` snapshot.  Sole production caller is
 /// `MetaInterpStaticData::finish_setup_descrs`.  Call descriptors are
 /// owned by `GcCache._cache_call`, so the snapshot is the same six-group
 /// sequence as PyPy: size, field, array, arraylen, call, interiorfield.
@@ -151,7 +151,7 @@ pub fn snapshot_all() -> Vec<DescrRef> {
     out
 }
 
-/// `pyjitpl.py:2289 self.all_descrs = self.cpu.setup_descrs()` — the dense
+/// `pyjitpl.py self.all_descrs = self.cpu.setup_descrs()` — the dense
 /// list `descr_index` indexes into (`descr.py:28 v.descr_index =
 /// len(all_descrs)`), and the list `bridgeopt.py:155
 /// metainterp_sd.all_descrs[descr_index]` reads back.

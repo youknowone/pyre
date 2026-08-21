@@ -2,7 +2,7 @@
 //! support for the `jit_merge_point` / `can_enter_jit` /
 //! `loop_header` markers.
 //!
-//! The runtime `JitDriver` class itself (rlib/jit.py:610-693) lives
+//! The runtime `JitDriver` class itself (rlib/jit.py) lives
 //! on the pyre side as `PyPyJitDriver` (`pyre/pyre-jit/src/eval.rs`).
 //! This module owns only the translator-side mirror metadata
 //! (`JitDriverMeta`) plus the kwarg-validation / cache-union helper
@@ -40,18 +40,18 @@ use crate::flowspace::model::{ConstValue, HostObject};
 /// identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JitMarkerKind {
-    /// `jit_merge_point` (jit.py:756-759).
+    /// `jit_merge_point` (jit.py).
     JitMergePoint,
-    /// `can_enter_jit` (jit.py:761-766).
+    /// `can_enter_jit` (jit.py).
     CanEnterJit,
 }
 
 impl JitMarkerKind {
     /// Upstream `self.instance.__name__` — the bound-method name for
     /// `(jit_merge_point, can_enter_jit)` registered via `_about_` at
-    /// `rlib/jit.py:798-810 _make_extregistryentries`. Used by
+    /// `rlib/jit.py _make_extregistryentries`. Used by
     /// [`ext_enter_leave_marker_compute_result_annotation`] to gate the
-    /// `annotate_hooks` branch (`rlib/jit.py:889`) and as the
+    /// `annotate_hooks` branch (`rlib/jit.py`) and as the
     /// `methodname` carried on the [`crate::annotator::model::SomeBuiltin`]
     /// returned by the marker's `compute_annotation` (mirroring upstream
     /// `extregistry.py:62-67` base implementation).
@@ -76,7 +76,7 @@ impl JitMarkerKind {
     }
 }
 
-/// `rlib/jit.py:1018` — `self.instance.__name__` for `loop_header`.
+/// `rlib/jit.py` — `self.instance.__name__` for `loop_header`.
 pub const LOOP_HEADER_METHOD_NAME: &str = "loop_header";
 
 /// Diagnostic analyser-name for `ExtLoopHeader.compute_annotation`'s
@@ -104,7 +104,7 @@ pub struct JitDriverMeta {
     /// rlib/jit.py:619 / 651 — `name`.
     pub name: String,
     /// rlib/jit.py:649-650 — `greens`. Order is significant
-    /// (rlib/jit.py:736-744 INT/REF/FLOAT heuristic check).
+    /// (rlib/jit.py INT/REF/FLOAT heuristic check).
     pub greens: Vec<String>,
     /// rlib/jit.py:652-662 — `reds`.
     pub reds: Vec<String>,
@@ -118,7 +118,7 @@ pub struct JitDriverMeta {
     pub is_recursive: bool,
     /// rlib/jit.py:693 — `vec` (vectorize default False).
     pub vec: bool,
-    /// rlib/jit.py:682 / 925-929 — `get_printable_location` callable
+    /// rlib/jit.py / 925-929 — `get_printable_location` callable
     /// for `annotate_hooks`. Wired by the pyre side once the host
     /// callable identity is available.
     pub get_printable_location: Option<HostObject>,
@@ -127,7 +127,7 @@ pub struct JitDriverMeta {
     pub get_location: Option<HostObject>,
 }
 
-/// rlib/jit.py:886-923 — `ExtEnterLeaveMarker.compute_result_annotation`.
+/// rlib/jit.py — `ExtEnterLeaveMarker.compute_result_annotation`.
 ///
 /// ```python
 /// def compute_result_annotation(self, **kwds_s):
@@ -214,7 +214,7 @@ pub fn ext_enter_leave_marker_compute_result_annotation(
     Ok(s_none())
 }
 
-/// rlib/jit.py:925-929 — `ExtEnterLeaveMarker.annotate_hooks`.
+/// rlib/jit.py — `ExtEnterLeaveMarker.annotate_hooks`.
 ///
 /// ```python
 /// def annotate_hooks(self, **kwds_s):
@@ -238,7 +238,7 @@ fn annotate_hooks(
     Ok(())
 }
 
-/// rlib/jit.py:931-950 — `ExtEnterLeaveMarker.annotate_hook`.
+/// rlib/jit.py — `ExtEnterLeaveMarker.annotate_hook`.
 ///
 /// ```python
 /// def annotate_hook(self, func, variables, args_s=[], **kwds_s):
@@ -269,7 +269,7 @@ fn annotate_hooks(
 /// touching the variable-loop body.
 ///
 /// The dotted-green branch is held back alongside
-/// `ExtEnterLeaveMarker.specialize_call` (rlib/jit.py:965-993). Until
+/// `ExtEnterLeaveMarker.specialize_call` (rlib/jit.py). Until
 /// then a dotted variable surfaces as an `AnnotatorError` so the gap
 /// fails closed instead of silently dropping the arg.
 fn annotate_hook(
@@ -278,16 +278,16 @@ fn annotate_hook(
     variables: &[String],
     kwds_s: &HashMap<String, Option<SomeValue>>,
 ) -> Result<(), AnnotatorError> {
-    // rlib/jit.py:932-933 — `if func is None: return`.
+    // rlib/jit.py — `if func is None: return`.
     let Some(func) = func else { return Ok(()) };
 
-    // rlib/jit.py:935 — `s_func = bk.immutablevalue(func)`. The hook
+    // rlib/jit.py — `s_func = bk.immutablevalue(func)`. The hook
     // host is wrapped as a `ConstValue::HostObject` so the bookkeeper
     // takes the same branch as upstream's `immutablevalue(func)` for
     // a Python function (returns `SomePBC([funcdesc])`).
     let s_func = bookkeeper.immutablevalue(&ConstValue::HostObject(func.clone()))?;
 
-    // rlib/jit.py:936 — `uniquekey = 'jitdriver.%s' % func.__name__`.
+    // rlib/jit.py — `uniquekey = 'jitdriver.%s' % func.__name__`.
     let unique_key = EmulatedPbcCallKey::Text(format!("jitdriver.{}", func.qualname()));
 
     // rlib/jit.py:937-949 — build `args_s` from greens.
@@ -326,7 +326,7 @@ fn annotate_hook(
         args_s.push(s_arg.clone());
     }
 
-    // rlib/jit.py:950 — `bk.emulate_pbc_call(uniquekey, s_func, args_s)`.
+    // rlib/jit.py — `bk.emulate_pbc_call(uniquekey, s_func, args_s)`.
     // Upstream defaults: `replace=[]`, `callback=None`.
     bookkeeper.emulate_pbc_call(unique_key, &s_func, &args_s, &[], None)?;
     Ok(())

@@ -8,7 +8,7 @@ use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, Ident, Meta};
 
 /// Inputarg field type tag, mirroring RPython's `box.type` ('i'/'r'/'f') from
-/// `resoperation.py:719/727/739` `InputArgInt/InputArgRef/InputArgFloat`. Used
+/// `resoperation.py/727/739` `InputArgInt/InputArgRef/InputArgFloat`. Used
 /// by `#[vable(inputarg, type = int|ref|float)]` to pick the matching
 /// `OpRef::input_arg_*` variant at index minting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +79,7 @@ struct VableField {
     /// For `#[vable(static_field = N)]`: the VirtualizableInfo field index.
     static_field_index: Option<usize>,
     /// For `#[vable(inputarg, type = ...)]`: the RPython `InputArg*` class
-    /// (`InputArgInt/Ref/Float`, resoperation.py:719/727/739) the slot at
+    /// (`InputArgInt/Ref/Float`, resoperation.py/727/739) the slot at
     /// the assigned `flat_input_idx` should mint. `None` falls back to
     /// `Ref` because pyre's pre-typing era treated all OpRef inputargs as
     /// W_Root (the dominant case from interp_jit.py's static-fields list).
@@ -671,7 +671,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
         }
     }
 
-    // resoperation.py:719/727/739 InputArgInt/Ref/Float require an explicit
+    // resoperation.py/727/739 InputArgInt/Ref/Float require an explicit
     // `box.type`. RPython annotates `_virtualizable_` fields directly
     // (`['x', 'y[*]']` plus per-class type annotations), never via an
     // implicit default. Reject `#[vable(inputarg)]` without `type = ...` so
@@ -704,7 +704,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
     // All read/write goes through VirtualizableInfo which handles field types.
     quote! {
         impl #struct_name {
-            /// virtualizable.py:86-99 read_boxes parity.
+            /// virtualizable.py read_boxes parity.
             /// Reads ALL static fields from the heap via VirtualizableInfo.
             pub fn virt_export_static_boxes(
                 &self,
@@ -718,7 +718,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 }
             }
 
-            /// virtualizable.py:126-137 write_from_resume_data_partial parity.
+            /// virtualizable.py write_from_resume_data_partial parity.
             /// Writes ALL static fields to the heap via VirtualizableInfo.
             pub fn virt_import_static_boxes(
                 &mut self,
@@ -736,7 +736,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
                 true
             }
 
-            /// virtualizable.py:86-99 read_boxes + array parity.
+            /// virtualizable.py read_boxes + array parity.
             /// Reads ALL static + array fields from heap via VirtualizableInfo.
             pub fn virt_export_all(
                 &self,

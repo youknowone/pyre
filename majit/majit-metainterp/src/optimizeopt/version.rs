@@ -8,7 +8,7 @@ use majit_ir::{Op, OpRef};
 
 use indexmap::IndexMap;
 
-/// version.py:9-86: LoopVersionInfo(BasicLoopInfo)
+/// version.py: LoopVersionInfo(BasicLoopInfo)
 ///
 /// Tracks multiple compiled versions of a loop, keyed by guard descr.
 /// `descrs` is the ordered list of guard descriptors that have loop versions.
@@ -16,9 +16,9 @@ use indexmap::IndexMap;
 pub struct LoopVersionInfo {
     /// version.py:19 — ordered list of fail indices for tracked guards.
     pub descrs: Vec<u32>,
-    /// version.py:20 — maps fail_index → LoopVersion.
+    /// version.py — maps fail_index → LoopVersion.
     pub leads_to: IndexMap<u32, LoopVersion>,
-    /// version.py:21 — insertion index for track(). -1 means append.
+    /// version.py — insertion index for track(). -1 means append.
     insert_index: i32,
     /// version.py:22 — compiled loop versions.
     pub versions: Vec<LoopVersion>,
@@ -35,17 +35,17 @@ impl LoopVersionInfo {
         }
     }
 
-    /// version.py:24-25: mark()
+    /// version.py: mark()
     pub fn mark(&mut self) {
         self.insert_index = self.descrs.len() as i32;
     }
 
-    /// version.py:27-28: clear()
+    /// version.py: clear()
     pub fn clear(&mut self) {
         self.insert_index = -1;
     }
 
-    /// version.py:30-36: track(op, descr, version)
+    /// version.py: track(op, descr, version)
     ///
     /// `fail_index` is the descr's unique identifier.
     pub fn track(&mut self, fail_index: u32, version: LoopVersion) {
@@ -62,7 +62,7 @@ impl LoopVersionInfo {
         self.leads_to.insert(fail_index, version);
     }
 
-    /// version.py:38-42: remove(descr)
+    /// version.py: remove(descr)
     pub fn remove(&mut self, fail_index: u32) {
         self.leads_to
             .swap_remove(&fail_index)
@@ -70,12 +70,12 @@ impl LoopVersionInfo {
         self.descrs.retain(|d| *d != fail_index);
     }
 
-    /// version.py:44-45: get(descr)
+    /// version.py: get(descr)
     pub fn get(&self, fail_index: u32) -> Option<&LoopVersion> {
         self.leads_to.get(&fail_index)
     }
 
-    /// version.py:47-53: snapshot(loop)
+    /// version.py: snapshot(loop)
     ///
     /// Clone the loop operations and create a new LoopVersion.
     /// The version is registered in `self.versions`.
@@ -87,7 +87,7 @@ impl LoopVersionInfo {
         version
     }
 
-    /// version.py:55-86: post_loop_compilation(...)
+    /// version.py: post_loop_compilation(...)
     ///
     /// Compile each version and stitch to guard descriptors.
     /// This is called after the root trace is already compiled.
@@ -120,7 +120,7 @@ impl Default for LoopVersionInfo {
     }
 }
 
-/// version.py:89-122: LoopVersion
+/// version.py: LoopVersion
 ///
 /// A specialized version of a trace loop, attached to a guard descriptor.
 #[derive(Clone, Debug)]
@@ -136,11 +136,11 @@ impl LoopVersion {
         LoopVersion { ops, inputargs }
     }
 
-    /// version.py:99-112: setup_once(info)
+    /// version.py: setup_once(info)
     ///
     /// Clone guard descriptors in the version's ops so each version
     /// has its own descr identity. Re-track cloned loop-version guards.
-    /// version.py:100-114: setup_once(info)
+    /// version.py: setup_once(info)
     ///
     /// Clone guard descriptors in the version's ops so each version
     /// has its own descr identity. Uses `olddescr.clone()` which

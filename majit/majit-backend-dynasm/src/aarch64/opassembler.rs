@@ -158,10 +158,10 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     // ── emit_op_gc_store ──
-    // aarch64/opassembler.py:365-370 emit_op_gc_store
+    // aarch64/opassembler.py emit_op_gc_store
     // x86/assembler.py:1746 genop_gc_store — size_loc
 
-    /// aarch64/opassembler.py:396-412 `_emit_op_gc_load_indexed` parity.
+    /// aarch64/opassembler.py `_emit_op_gc_load_indexed` parity.
     /// Folds `ofs` into the index via ADD (with LARGE_IMM_SCRATCH = x16
     /// spillover when the immediate does not fit the ADD encoding),
     /// then emits the sized load from `[base + combined_index]`.  The
@@ -192,7 +192,7 @@ impl<'a> AssemblerARM64<'a> {
                 // `opassembler.py:403 ADD_ri(ip0, index, ofs)` is a single
                 // instruction; dynasm's `add Xd|SP, Xn|SP, #uimm` form rejects a
                 // dynamic register operand, so encode the word directly
-                // (`codebuilder.py:113 ADD_ri`).
+                // (`codebuilder.py ADD_ri`).
                 self.emit_add_ri(16, index.value, ofs as u32);
             } else {
                 self.emit_mov_imm64(16, ofs);
@@ -207,7 +207,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// `size`: byte size (1/2/4/8).
-    /// aarch64/opassembler.py:365 emit_op_gc_store parity.
+    /// aarch64/opassembler.py emit_op_gc_store parity.
     pub(crate) fn emit_op_gcstore_regalloc(
         &mut self,
         base: &RegLoc,

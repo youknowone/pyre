@@ -255,7 +255,7 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
             // Identical-code folding can map several build-time addresses to
             // one runtime address; retain the first target for that address.
             //
-            // `pyjitpl.py:2335 bytecode_for_address` asserts the address is
+            // `pyjitpl.py bytecode_for_address` asserts the address is
             // absent instead, because RPython's translation never folds two
             // graphs onto one entry point. Keeping the first target is the
             // only choice available here, but a wrong pick would otherwise be
@@ -497,7 +497,7 @@ static INSNS_OPNAME_TO_BYTE: LazyLock<indexmap::IndexMap<String, u8>> = LazyLock
     // `pyre_extension_insns` keys so the runtime table covers every
     // opname a `BlackholeInterpBuilder` could be asked to dispatch.
     //
-    // RPython parity: `blackhole.py:55-65 BlackholeInterpBuilder.__init__`
+    // RPython parity: `blackhole.py BlackholeInterpBuilder.__init__`
     // populates `self.insns = asm.insns` and then `wire_bhimpl_handlers`
     // (`:152-179`) iterates that map to bind every bhimpl handler.
     // Pyre's build-time `pipeline.insns` only records opnames the
@@ -568,7 +568,7 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
 
 /// Indexed `pipeline.descrs` — RPython `Assembler.descrs`
 /// (assembler.py:23). Handed to `BlackholeInterpBuilder.setup_descrs`
-/// at builder construction (blackhole.py:59 `self.setup_descrs(asm.descrs)`,
+/// at builder construction (blackhole.py `self.setup_descrs(asm.descrs)`,
 /// :102-103 `def setup_descrs(self, descrs): self.descrs = descrs`).
 ///
 /// Each 'd'/'j' argcode in a `JitCode.code` byte stream is a 2-byte
@@ -669,7 +669,7 @@ pub fn descr_table() -> &'static dyn DescrTable {
 /// RPython: `metainterp_sd.opcode_descrs` (`pyjitpl.py:2245-2246`) — the
 /// bytecode constant pool, not `metainterp_sd.all_descrs`.
 ///
-/// `all_descrs` upstream is `cpu.setup_descrs()` (`pyjitpl.py:2289`), the full
+/// `all_descrs` upstream is `cpu.setup_descrs()` (`pyjitpl.py`), the full
 /// gccache walk of `descr.py:25-47`; pyre's counterpart of *that* is
 /// `MetaInterpStaticData::finish_setup_descrs`, which enumerates the live
 /// `descr_registry`. The gap between the two tables is what
@@ -845,7 +845,7 @@ fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit
     majit_metainterp::make_call_descr_sized_with_translated_effect(
         &arg_types,
         result_type,
-        // `descr.py:524-526 get_result_type()` keeps the raw char, so a
+        // `descr.py get_result_type()` keeps the raw char, so a
         // rehydrated descr reports `'S'`/`'L'` rather than the class its
         // normalised `result_type` derives.
         bh.result_type,
@@ -868,7 +868,7 @@ pub fn rehydrate_build_descr_raw_sets() {
         // as `AbsentContainer` and its member is dropped from the raw set for
         // the life of the process.
         crate::descr::publish_runtime_descr_groups();
-        // `descr.py:25-47 setup_descrs` group order — every non-call slot
+        // `descr.py setup_descrs` group order — every non-call slot
         // first.  Each `Size` / `Field` entry publishes its parent's FULL
         // `heaptracker.all_fielddescrs(STRUCT)` list into the gccache, and
         // `descr_from_set_member` is lookup-only, so the raw-set members
@@ -1160,7 +1160,7 @@ pub fn field_position_unresolved_report(all_descrs: usize) -> Vec<String> {
 ///
 /// This matters more on wasm than the name suggests. The invariant is stated in
 /// terms of BYTE OFFSETS — `index_in_parent` must name the slot the field's
-/// offset occupies — and wasm32's word is 4 bytes (`symbolic.py:12 WORD =
+/// offset occupies — and wasm32's word is 4 bytes (`symbolic.py WORD =
 /// sizeof(lltype.Signed)`), so every struct is laid out differently there. A
 /// producer that ranks correctly on a 64-bit host is not thereby correct on
 /// wasm, and without these exports a wasm-only rise reads as absent-and-
@@ -1304,10 +1304,10 @@ pub fn descr_ref_table() -> &'static dyn crate::jitcode_dispatch::DescrRefTable 
 }
 
 /// S4c prerequisite measurement — how many build-time `BhDescr::Field` slots
-/// resolve to the SAME `Arc` the runtime `descr.py:218-239 get_field_descr`
+/// resolve to the SAME `Arc` the runtime `descr.py get_field_descr`
 /// cache holds for their `(STRUCT, fieldname)` key.
 ///
-/// `effectinfo.py:465-547 compute_bitstrings` partitions descrs by object
+/// `effectinfo.py compute_bitstrings` partitions descrs by object
 /// identity, so an `EffectInfo` raw set rehydrated from `descrs.bin` is only
 /// meaningful if each member lands on the descr the trace itself caches.  A
 /// slot that mints a fresh `Arc` instead is a silent mis-partition, which is
@@ -1327,7 +1327,7 @@ fn same_arc(a: &DescrRef, b: &DescrRef) -> bool {
 }
 
 /// Why a build-time `Field` slot fails to land on the canonical
-/// `_cache_field[STRUCT][fieldname]` Arc.  `descr.py:218-239 get_field_descr`
+/// `_cache_field[STRUCT][fieldname]` Arc.  `descr.py get_field_descr`
 /// admits exactly one outcome — cache hit or cache-miss mint — so every
 /// class below except `Converged` marks a place where pyre mints a second
 /// FieldDescr for a `(STRUCT, fieldname)` PyPy keeps single.
@@ -1619,9 +1619,9 @@ pub fn install_global_build_descr_pool() {
 /// jitcodes, paired with the list of `insns` opnames that
 /// `wire_bhimpl_handlers` did not assign a handler to.
 ///
-/// RPython parity: `BlackholeInterpBuilder.__init__` (blackhole.py:55-61)
+/// RPython parity: `BlackholeInterpBuilder.__init__` (blackhole.py)
 /// runs `setup_insns(asm.insns)` + `setup_descrs(asm.descrs)` and
-/// `setup_insns` (blackhole.py:66) resolves each opname via
+/// `setup_insns` (blackhole.py) resolves each opname via
 /// `_get_method` eagerly, raising `AttributeError` if any `bhimpl_*`
 /// is missing. The Rust port mirrors the `setup_insns` + `setup_descrs`
 /// + `wire_bhimpl_handlers` sequence, but surfaces the unwired list as
@@ -1637,7 +1637,7 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     Vec<String>,
 ) {
     let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-    // blackhole.py:58-59 order: setup_insns, then setup_descrs.
+    // blackhole.py order: setup_insns, then setup_descrs.
     builder.setup_insns(insns_opname_to_byte());
     builder.setup_descrs(descr_table());
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
@@ -1672,7 +1672,7 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
 /// — panics when any `insns` opname lacks a `bhimpl_*` handler.
 ///
 /// RPython parity: matches the `AttributeError` raised by upstream's
-/// `setup_insns` (blackhole.py:66) when `_get_method(name, argcodes)`
+/// `setup_insns` (blackhole.py) when `_get_method(name, argcodes)`
 /// fails. Use this in any code path that must run real production
 /// jitcodes; tests that inspect the raw coverage list can use
 /// [`build_default_bh_builder_with_unwired_report`].
@@ -1695,7 +1695,7 @@ pub fn build_default_bh_builder() -> majit_metainterp::blackhole::BlackholeInter
 /// execution of `bhimpl_*`. Lifetime is tied to the `insns` table, so the
 /// opname stays valid while the runtime is alive (`'static`).
 ///
-/// RPython parity: `blackhole.py:105-232` `_get_method.handler` consumes
+/// RPython parity: `blackhole.py` `_get_method.handler` consumes
 /// operand bytes per `argcodes` char; this struct captures the same byte
 /// layout without executing.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1781,7 +1781,7 @@ fn pyre_p_payload_len(opname: &str, code: &[u8], cursor: usize) -> Option<usize>
 /// ```
 ///
 /// `live/` is special-cased to advance by `liveness::OFFSET_SIZE` per
-/// `blackhole.py:1605-1607` (`bhimpl_live(pc): return pc + OFFSET_SIZE`).
+/// `blackhole.py` (`bhimpl_live(pc): return pc + OFFSET_SIZE`).
 pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
     let opcode_byte = *code.get(pc)?;
     let key: &'static str = INSNS_BYTE_TO_OPNAME.get(&opcode_byte)?.as_str();
@@ -1789,7 +1789,7 @@ pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
 
     let mut cursor = pc + 1;
     if opname == "live" {
-        // blackhole.py:1603-1605 bhimpl_live(pc): position += OFFSET_SIZE.
+        // blackhole.py bhimpl_live(pc): position += OFFSET_SIZE.
         // The `live/` key has empty argcodes so the generic walker would
         // advance 0 bytes, but dispatch skips 2 bytes of liveness offset.
         cursor += majit_translate::liveness::OFFSET_SIZE;
@@ -1952,7 +1952,7 @@ impl<'a> RegisterFileView<'a> {
 }
 
 /// Port of `_get_method.handler` operand-resolution phase (everything up
-/// to the `unboundmethod(*args)` call at blackhole.py:170).
+/// to the `unboundmethod(*args)` call at blackhole.py).
 ///
 /// Decodes the op at `pc`, then walks `argcodes` once more — this time
 /// reading each operand byte *and* resolving it via the register files.
@@ -1990,7 +1990,7 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
                 operands.push(ResolvedOperand::IntReg { reg, value });
             }
             'c' => {
-                // blackhole.py:121-123 `signedord`: signed byte constant.
+                // blackhole.py `signedord`: signed byte constant.
                 let byte = *code.get(cursor)? as i8;
                 cursor += 1;
                 operands.push(ResolvedOperand::ConstByte { byte });
@@ -2340,7 +2340,7 @@ mod tests {
     /// the canonical universe (`majit_translate::insns::
     /// {wellknown_bh_insns, pyre_extension_insns}`) must carry the
     /// matching reserved byte.  Translator-only keys allocated by
-    /// `Assembler::get_opnum`'s `setdefault` fallback (`assembler.py:220`
+    /// `Assembler::get_opnum`'s `setdefault` fallback (`assembler.py`
     /// parity) may live in any non-reserved byte, including gaps below
     /// the canonical high-water byte, and are permitted in
     /// pipeline.insns without a canonical entry.
@@ -2449,7 +2449,7 @@ mod tests {
     fn portal_jitcode_resolves_to_unique_jitdriver_entry() {
         // Verify the portal accessor returns the build-time JitCode for the
         // unique main eval driver (RPython
-        // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`).
+        // call.py `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`).
         let portal = portal_jitcode().expect("build-time pipeline must register a portal jitcode");
         assert!(
             portal.jitdriver_sd().is_some(),
@@ -2787,7 +2787,7 @@ mod tests {
     /// set family by family, so an emitted byte outside that surface reaches
     /// `dispatch_step`'s unwired-opcode panic — and only once a forward resume
     /// happens to land on it.  Upstream cannot have this failure mode:
-    /// `setup_insns(asm.insns)` (`blackhole.py:58-59`, :66) resolves every
+    /// `setup_insns(asm.insns)` (`blackhole.py`, :66) resolves every
     /// opname the assembler emitted, so its dispatch table spans the reachable
     /// bytecode universe by construction.
     ///
@@ -3056,7 +3056,7 @@ mod tests {
         // expected `bhimpl_int_add` result.
         //
         // RPython parity: same shape as `setup_insns + dispatch_loop +
-        // bhimpl_int_add` (blackhole.py:66-100 + 452-460), but driven
+        // bhimpl_int_add` (blackhole.py + 452-460), but driven
         // by the artifact this binary actually loads — not a synthetic
         // 3-entry insns dict like the analogous test inside
         // majit-metainterp. Closes the build-artifact → runtime →
@@ -3078,7 +3078,7 @@ mod tests {
 
         // live + int_add(r0, r1) → r2 + int_return(r2). The two zero
         // bytes after `live/` are the OFFSET_SIZE liveness offset that
-        // `bhimpl_live` skips (blackhole.py:1603-1605).
+        // `bhimpl_live` skips (blackhole.py).
         let code: Vec<u8> = vec![
             live_byte,
             0x00,
@@ -3117,7 +3117,7 @@ mod tests {
         // bhimpl handlers (`bhimpl_int_add`, `bhimpl_int_sub`) advance
         // `position` correctly back to back.
         //
-        // RPython parity: blackhole.py:452-460 `bhimpl_int_add` +
+        // RPython parity: blackhole.py `bhimpl_int_add` +
         // :462-464 `bhimpl_int_sub` chained with the same register
         // file, identical to RPython's per-op `_get_method.handler`
         // dispatch.
@@ -3197,7 +3197,7 @@ mod tests {
         //   PC=15:       goto LOOP=3            (backward jump)
         //   PC=18: END:  int_return r0
         //
-        // RPython parity: blackhole.py:864-869 `bhimpl_goto_if_not`
+        // RPython parity: blackhole.py `bhimpl_goto_if_not`
         // — target is an absolute byte offset into the jitcode
         // `code` array.
         let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
@@ -3284,7 +3284,7 @@ mod tests {
         //   PC=3:  float_add r0, r1 → r2
         //   PC=7:  void_return
         //
-        // RPython parity: blackhole.py:696-700 `bhimpl_float_add` +
+        // RPython parity: blackhole.py `bhimpl_float_add` +
         // :859-862 `bhimpl_void_return`. Pyre's `registers_f` stores
         // `f64::to_bits() as i64`; the `bhhandler_ff_f!` macro decodes
         // via `f64::from_bits` on read and `to_bits()` on write, so
@@ -3354,7 +3354,7 @@ mod tests {
         // `constants_i = [42]` so `setposition` allocates a register
         // file of `num_regs_and_consts_i() = 2` slots and copies the
         // constant into slot 1 (RPython
-        // `blackhole.py:312 setposition` parity).
+        // `blackhole.py setposition` parity).
         //
         //   slot 0 = scratch dst
         //   slot 1 = constant 42 (preloaded by setposition)
@@ -3363,7 +3363,7 @@ mod tests {
         //   PC=3:  int_copy r1 → r0    (r0 := constant)
         //   PC=6:  int_return r0
         //
-        // RPython parity: `bhimpl_int_copy` (blackhole.py:455-457)
+        // RPython parity: `bhimpl_int_copy` (blackhole.py)
         // reads from `registers_i[code[pc]]` and writes
         // `registers_i[code[pc+1]]`, which validates that the
         // constants area is reachable through the same register-index
@@ -3449,7 +3449,7 @@ mod tests {
         //   PC=0: live/
         //   PC=3: ref_return r0
         //
-        // RPython parity: blackhole.py:847-851 `bhimpl_ref_return`.
+        // RPython parity: blackhole.py `bhimpl_ref_return`.
         // `registers_r` and `tmpreg_r` store ref pointers as raw `i64`
         // bits; the test uses an arbitrary nonzero pattern to verify
         // the read is byte-for-byte without dereferencing.

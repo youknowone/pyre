@@ -39,7 +39,7 @@ use crate::flowspace::argument::{CallShape, Signature};
 /// (see module doc).
 ///
 /// `arguments_w` carries `Option<SomeValue>` because RPython
-/// `bookkeeper.py:152 consider_call_site` builds args via
+/// `bookkeeper.py consider_call_site` builds args via
 /// `[annotator.annotation(arg) for arg in call_op.args[1:]]`, where
 /// `annotation(v)` returns `None` when `v` is not yet bound at the
 /// current fixpoint round.  The Python list passes None through to
@@ -53,7 +53,7 @@ pub struct ArgumentsForTranslation {
     /// arg (mirrors `annotator.annotation(v) is None`).
     pub arguments_w: Vec<Option<SomeValue>>,
     /// RPython `CallSpec.keywords` — `None` value = unbound caller
-    /// arg, mirroring `argument.py:116 fromshape` and
+    /// arg, mirroring `argument.py fromshape` and
     /// `:153 unmatch_signature` which build the kwds dict via
     /// `dict(zip(shape_keys, w_args[...]))` and propagate `None`
     /// through to the analyser body (where the first attribute touch
@@ -234,7 +234,7 @@ impl ArgumentsForTranslation {
         }
     }
 
-    /// RPython `ArgumentsForTranslation.copy()` (argument.py:39-41).
+    /// RPython `ArgumentsForTranslation.copy()` (argument.py).
     pub fn copy(&self) -> Self {
         self.clone()
     }
@@ -268,7 +268,7 @@ impl ArgumentsForTranslation {
             // `*args` collects positional excess; upstream
             // `argument.py:63 starargs_w = args_w[co_argcount:]` hands
             // the slice to `self.newtuple(starargs_w)` which calls
-            // `SomeTuple(items)` (`model.py:357-368`).  When an item
+            // `SomeTuple(items)` (`model.py`).  When an item
             // is Python None, `i.is_constant()` raises AttributeError
             // there — fail loudly here for the same upstream-faithful
             // shape rather than silently substituting Impossible
@@ -548,12 +548,12 @@ impl ArgumentsForTranslation {
     }
 }
 
-/// RPython `rawshape(args)` (argument.py:159-160).
+/// RPython `rawshape(args)` (argument.py).
 pub fn rawshape(args: &ArgumentsForTranslation) -> CallShape {
     args.rawshape()
 }
 
-/// RPython `simple_args(args_s)` (argument.py:162-163).
+/// RPython `simple_args(args_s)` (argument.py).
 ///
 /// Concrete-args entry: callers that already hold every annotation
 /// bound (e.g. test fixtures, dispatch surfaces post-bind) pass a
@@ -572,7 +572,7 @@ pub(crate) fn simple_args_opt(args_s: Vec<Option<SomeValue>>) -> ArgumentsForTra
     ArgumentsForTranslation::new(args_s, None, None)
 }
 
-/// RPython `complex_args(args_s)` (argument.py:165-167).
+/// RPython `complex_args(args_s)` (argument.py).
 ///
 /// Upstream reads the shape out of `args_s[0].const`. The Rust port
 /// accepts an explicit [`CallShape`] alongside the `args_s` tail so

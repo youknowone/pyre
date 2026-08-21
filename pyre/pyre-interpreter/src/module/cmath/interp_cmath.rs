@@ -19,7 +19,7 @@ fn unpack(obj: PyObjectRef) -> Result<Complex64, crate::PyError> {
     Ok(Complex64::new(re, im))
 }
 
-/// `call_c_func` (interp_cmath.py:19) — errno-style failures become the
+/// `call_c_func` (interp_cmath.py) — errno-style failures become the
 /// fixed cmath messages.
 fn map_err(e: pymath::Error) -> crate::PyError {
     match e {
@@ -33,7 +33,7 @@ fn wrap(z: Complex64) -> PyObjectRef {
     complexobject::w_complex_new(z.re, z.im)
 }
 
-/// `unaryfn` (interp_cmath.py:29) — unpack, compute, wrap.  Arity is
+/// `unaryfn` (interp_cmath.py) — unpack, compute, wrap.  Arity is
 /// enforced by the `/ 1` registration.
 macro_rules! cm1 {
     ($name:ident) => {
@@ -59,7 +59,7 @@ cm1!(asinh);
 cm1!(acosh);
 cm1!(atanh);
 
-/// `wrapped_log` (interp_cmath.py:80) — with a base, `log(z)/log(base)`;
+/// `wrapped_log` (interp_cmath.py) — with a base, `log(z)/log(base)`;
 /// `pymath::cmath::log` carries the `_Py_c_quot` division itself.
 pub fn log(args: &[PyObjectRef]) -> PyResult {
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);

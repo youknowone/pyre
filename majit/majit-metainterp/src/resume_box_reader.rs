@@ -2,7 +2,7 @@
 //! of the resume-data reader.
 //!
 //! resume.py runs virtual rematerialization through a single
-//! `AbstractVirtualInfo.allocate(decoder, index)` (resume.py:618-767) that is
+//! `AbstractVirtualInfo.allocate(decoder, index)` (resume.py) that is
 //! polymorphic over the `decoder`: `ResumeDataDirectReader` (blackhole — real
 //! `cpu.bh_new`, resume.py:1437-1442) writes memory, while
 //! `ResumeDataBoxReader` (tracing/bridge — `metainterp.execute_new_with_vtable`,
@@ -30,7 +30,7 @@ pub fn default_bridge_array_descr(
     majit_ir::descr::make_array_descr_signed(base_size, item_size, item_type, signed)
 }
 
-/// resume.py:874-899 VirtualCache — per-virtual-number `OpRef` banks the box
+/// resume.py VirtualCache — per-virtual-number `OpRef` banks the box
 /// reader probes before allocating, plus the concrete `GcRef`/int shadows a
 /// consumer may seed for branch-fold parity. `mint_raw_array_descr` is the
 /// consumer-provided array-descr factory for `VRawBuffer` materialization (the
@@ -131,7 +131,7 @@ fn emit_stroruni_oopspec_call(
     ctx.record_op_with_descr(majit_ir::OpCode::CallR, &call_args, calldescr.clone())
 }
 
-/// resume.py:1556-1564 decode_box parity for fieldnums (i16 tagged): decode one
+/// resume.py decode_box parity for fieldnums (i16 tagged): decode one
 /// tagged array/field value into its bridge `OpRef` (typed InputArg for TAGBOX,
 /// const for TAGINT/TAGCONST, recursively materialized virtual for TAGVIRTUAL).
 pub fn decode_fieldnum(
@@ -142,16 +142,16 @@ pub fn decode_fieldnum(
     cache: &mut BridgeVirtualCache,
 ) -> OpRef {
     use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
-    // resume.py:1245 `decode_box` dispatches purely on the tag bits;
+    // resume.py `decode_box` dispatches purely on the tag bits;
     // it has no UNINITIALIZED case. The UNINITIALIZED skip lives in
-    // the callers (e.g. VArrayStructInfo.allocate, resume.py:629),
+    // the callers (e.g. VArrayStructInfo.allocate, resume.py),
     // so this decoder mirrors `decode_box` exactly — an UNINITIALIZED
     // tag reaching here falls into the TAGCONST arm and fails loud on
     // the out-of-range const index, matching upstream's IndexError.
     let (val, tagbits) = untag(tagged);
     match tagbits {
         TAGBOX => {
-            // resume.py:1247-1264 decode_box parity:
+            // resume.py decode_box parity:
             //   if num < 0: num += len(liveboxes)
             //   return self.liveboxes[num]
             // The returned Box object carries `box.type` intrinsically
@@ -168,7 +168,7 @@ pub fn decode_fieldnum(
             } else {
                 val
             };
-            // resume.py:1261 `box = self.liveboxes[num]` — direct
+            // resume.py `box = self.liveboxes[num]` — direct
             // indexing, IndexError on out-of-range. Encoder /
             // decoder asymmetry is a bug, not a silent fallback;
             // mirror the upstream fail-loud contract.
@@ -189,7 +189,7 @@ pub fn decode_fieldnum(
         }
         TAGINT => ctx.const_int(val as i64),
         TAGCONST => {
-            // resume.py:1247-1251 decode_box parity:
+            // resume.py decode_box parity:
             //   if tag == TAGCONST:
             //       if tagged_eq(tagged, NULLREF):
             //           box = CONST_NULL
@@ -199,10 +199,10 @@ pub fn decode_fieldnum(
                 return ctx.const_null();
             }
             let ci = (val - TAG_CONST_OFFSET) as usize;
-            // resume.py:1251 `box = self.consts[num - TAG_CONST_OFFSET]`
+            // resume.py `box = self.consts[num - TAG_CONST_OFFSET]`
             // — direct indexing, fail-fast on out-of-range (mirrors
             // Python IndexError; never silently substitutes).
-            // compile.py:853 `ResumeGuardDescr` storage — read off
+            // compile.py `ResumeGuardDescr` storage — read off
             // the shared Arc so the bridge tracer observes the
             // same pool the GC walker updates.
             let storage = resume_data
@@ -241,14 +241,14 @@ pub fn materialize_bridge_virtual(
     use majit_ir::OpCode;
     use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
 
-    // resume.py:874-899 VirtualCache: list caches indexed by virtual number
+    // resume.py VirtualCache: list caches indexed by virtual number
     // (ptr and int banks). This bridge helper is still OpRef-typed, so it
     // probes both banks before allocating.
     if let Some(cached) = cache.get_any(vidx) {
         return cached;
     }
 
-    // resume.py:947 assert self.virtuals_cache is not None — a TAGVIRTUAL in
+    // resume.py assert self.virtuals_cache is not None — a TAGVIRTUAL in
     // the stream guarantees rd_virtuals is present; None is an encoder bug.
     let virtuals = rd_virtuals.expect("materialize_bridge_virtual: rd_virtuals is None");
     // resume.py:951 self.rd_virtuals[index] — direct indexing, IndexError on
@@ -260,7 +260,7 @@ pub fn materialize_bridge_virtual(
     // the AbstractVirtualInfo subclass. Rust equivalent: match on
     // RdVirtualInfo enum variant.
 
-    /// resume.py:591-603 AbstractVirtualStructInfo.setfields helper.
+    /// resume.py AbstractVirtualStructInfo.setfields helper.
     /// Walks fielddescrs in lock-step with fieldnums, decoding each
     /// fieldnum and emitting SETFIELD_GC.
     #[expect(
@@ -277,7 +277,7 @@ pub fn materialize_bridge_virtual(
         resume_data: &crate::jit_state::ResumeDataResult,
         cache: &mut BridgeVirtualCache,
     ) {
-        // resume.py:597-603 setfields — range(len(fielddescrs)), index
+        // resume.py setfields — range(len(fielddescrs)), index
         // fieldnums[i]. The len-equality assert (resume.py:606) is in
         // debug_prints, not this allocate path: a short fieldnums raises
         // IndexError here, a longer one is ignored.
@@ -291,7 +291,7 @@ pub fn materialize_bridge_virtual(
             if value.is_none() {
                 continue;
             }
-            // resume.py:597-603 self.setfields → decoder.setfield(struct,
+            // resume.py self.setfields → decoder.setfield(struct,
             // fieldnum, fielddescr): reuse the parent SizeDescr's live
             // FieldDescr (canonical immutable / quasi-immutable / ei_index)
             // rather than reconstructing a partial copy. The descr is keyed
@@ -321,7 +321,7 @@ pub fn materialize_bridge_virtual(
     }
 
     match entry.as_ref() {
-        // resume.py:612-621 VirtualInfo.allocate
+        // resume.py VirtualInfo.allocate
         majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
             fielddescrs,
@@ -331,16 +331,16 @@ pub fn materialize_bridge_virtual(
             let Some(size_descr) = descr.clone() else {
                 return OpRef::NONE;
             };
-            // resume.py:619 decoder.allocate_with_vtable(descr=self.descr)
+            // resume.py decoder.allocate_with_vtable(descr=self.descr)
             ctx.profiler()
                 .count_ops(OpCode::NewWithVtable, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(OpCode::NewWithVtable, crate::counters::RECORDED_OPS);
             let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
-            // resume.py:620 decoder.virtuals_cache.set_ptr(index, struct)
+            // resume.py decoder.virtuals_cache.set_ptr(index, struct)
             cache.set_ptr(vidx, new_op);
-            // resume.py:621 self.setfields(decoder, struct)
+            // resume.py self.setfields(decoder, struct)
             setfields(
                 ctx,
                 new_op,
@@ -360,7 +360,7 @@ pub fn materialize_bridge_virtual(
             }
             new_op
         }
-        // resume.py:628-637 VStructInfo.allocate
+        // resume.py VStructInfo.allocate
         majit_ir::RdVirtualInfo::VStructInfo {
             typedescr,
             fielddescrs,
@@ -370,15 +370,15 @@ pub fn materialize_bridge_virtual(
             let Some(struct_descr) = typedescr.clone() else {
                 return OpRef::NONE;
             };
-            // resume.py:635 decoder.allocate_struct(self.typedescr)
+            // resume.py decoder.allocate_struct(self.typedescr)
             ctx.profiler().count_ops(OpCode::New, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(OpCode::New, crate::counters::RECORDED_OPS);
             let new_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
-            // resume.py:636 decoder.virtuals_cache.set_ptr(index, struct)
+            // resume.py decoder.virtuals_cache.set_ptr(index, struct)
             cache.set_ptr(vidx, new_op);
-            // resume.py:637 self.setfields(decoder, struct)
+            // resume.py self.setfields(decoder, struct)
             setfields(
                 ctx,
                 new_op,
@@ -398,7 +398,7 @@ pub fn materialize_bridge_virtual(
             }
             new_op
         }
-        // resume.py:649-671 AbstractVArrayInfo.allocate (clear=True or False)
+        // resume.py AbstractVArrayInfo.allocate (clear=True or False)
         majit_ir::RdVirtualInfo::VArrayInfoClear {
             fieldnums,
             kind,
@@ -418,21 +418,21 @@ pub fn materialize_bridge_virtual(
             let kind = *kind;
             let length = fieldnums.len();
             let len_ref = ctx.const_int(length as i64);
-            // resume.py:653 decoder.allocate_array(length, arraydescr, self.clear)
+            // resume.py decoder.allocate_array(length, arraydescr, self.clear)
             let alloc_opcode = if clear {
                 OpCode::NewArrayClear
             } else {
                 OpCode::NewArray
             };
-            // resume.py:645 AbstractVArrayInfo.__init__ asserts arraydescr is
-            // not None; resume.py:652 allocate reads self.arraydescr directly.
+            // resume.py AbstractVArrayInfo.__init__ asserts arraydescr is
+            // not None; resume.py allocate reads self.arraydescr directly.
             let array_descr = arraydescr.clone().expect("VArrayInfo: arraydescr is None");
             ctx.profiler().count_ops(alloc_opcode, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(alloc_opcode, crate::counters::RECORDED_OPS);
             let new_op = ctx.record_op_with_descr(alloc_opcode, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
-            // resume.py:654 decoder.virtuals_cache.set_ptr(index, array)
+            // resume.py decoder.virtuals_cache.set_ptr(index, array)
             cache.set_ptr(vidx, new_op);
             // resume.py:656-670 element loop: dispatch by arraydescr kind
             // NB. the check for the kind of array elements is moved out of the loop
@@ -470,7 +470,7 @@ pub fn materialize_bridge_virtual(
             }
             new_op
         }
-        // resume.py:747-760 VArrayStructInfo.allocate
+        // resume.py VArrayStructInfo.allocate
         majit_ir::RdVirtualInfo::VArrayStructInfo {
             arraydescr,
             fielddescrs,
@@ -479,7 +479,7 @@ pub fn materialize_bridge_virtual(
             ..
         } => {
             let len_ref = ctx.const_int(*size as i64);
-            // resume.py:749: array = decoder.allocate_array(self.size,
+            // resume.py: array = decoder.allocate_array(self.size,
             // self.arraydescr, clear=True) — uses the live `self.arraydescr`
             // directly.
             let array_descr = arraydescr
@@ -492,7 +492,7 @@ pub fn materialize_bridge_virtual(
             let new_op =
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
-            // resume.py:751: decoder.virtuals_cache.set_ptr(index, array)
+            // resume.py: decoder.virtuals_cache.set_ptr(index, array)
             cache.set_ptr(vidx, new_op);
             // resume.py:752-759:
             //   p = 0
@@ -520,7 +520,7 @@ pub fn materialize_bridge_virtual(
                         continue;
                     }
                     let idx_ref = ctx.const_int(i as i64);
-                    // resume.py:757: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
+                    // resume.py: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
                     ctx.record_op_with_descr(
                         OpCode::SetinteriorfieldGc,
                         &[new_op, idx_ref, value],
@@ -537,7 +537,7 @@ pub fn materialize_bridge_virtual(
             }
             new_op
         }
-        // resume.py:700-709 VRawBufferInfo.allocate_int
+        // resume.py VRawBufferInfo.allocate_int
         majit_ir::RdVirtualInfo::VRawBufferInfo {
             func,
             size,
@@ -545,8 +545,8 @@ pub fn materialize_bridge_virtual(
             descrs,
             fieldnums,
         } => {
-            // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
-            // resume.py:1124-1132: ResumeDataBoxReader.allocate_raw_buffer →
+            // resume.py: buffer = decoder.allocate_raw_buffer(self.func, self.size)
+            // resume.py: ResumeDataBoxReader.allocate_raw_buffer →
             //   execute_and_record_varargs(rop.CALL_I, [ConstInt(func), ConstInt(size)], calldescr)
             let func_ref = ctx.const_int(*func);
             let size_ref = ctx.const_int(*size as i64);
@@ -585,7 +585,7 @@ pub fn materialize_bridge_virtual(
                     .cloned()
                     .expect("OS_RAW_MALLOC_VARSIZE_CHAR calldescr (callinfocollection)"),
             );
-            // resume.py:704: decoder.virtuals_cache.set_int(index, buffer)
+            // resume.py: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_int(vidx, buffer);
             // resume.py:705-708 iterate by len(self.offsets), indexing
             // self.descrs[i] and self.fieldnums[i] by the same i — a short
@@ -594,15 +594,15 @@ pub fn materialize_bridge_virtual(
             for i in 0..offsets.len() {
                 let off = offsets[i];
                 let fnum = fieldnums[i];
-                // resume.py:701-708 VRawBufferStateInfo.allocate_int passes
+                // resume.py VRawBufferStateInfo.allocate_int passes
                 // fieldnums[i] straight to setrawbuffer_item with no
                 // UNINITIALIZED skip (unlike VArrayStructInfo) — a raw buffer
                 // is fully written by the encoder.
-                // resume.py:1232: itembox = self.decode_box(fieldnum, kind).
+                // resume.py: itembox = self.decode_box(fieldnum, kind).
                 // `decode_box` always returns a box (no UNINITIALIZED case),
                 // so the store is unconditional, matching setrawbuffer_item.
                 let item = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
-                // resume.py:1225-1234: setrawbuffer_item (direct reader).
+                // resume.py: setrawbuffer_item (direct reader).
                 // Dispatches pointer/float/int via arraydescr — all types allowed.
                 let di = &descrs[i];
                 let tp = match di.item_type {
@@ -639,23 +639,23 @@ pub fn materialize_bridge_virtual(
             }
             buffer
         }
-        // resume.py:722-728 VRawSliceInfo.allocate_int
+        // resume.py VRawSliceInfo.allocate_int
         majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
             // resume.py:724: assert len(self.fieldnums) == 1
             assert!(
                 fieldnums.len() == 1,
                 "VRawSliceInfo must have exactly 1 fieldnum"
             );
-            // resume.py:725: base_buffer = decoder.decode_int(self.fieldnums[0])
+            // resume.py: base_buffer = decoder.decode_int(self.fieldnums[0])
             let base_buffer = decode_fieldnum(ctx, fieldnums[0], rd_virtuals, resume_data, cache);
-            // resume.py:726: buffer = decoder.int_add_const(base_buffer, self.offset)
+            // resume.py: buffer = decoder.int_add_const(base_buffer, self.offset)
             let offset_ref = ctx.const_int(*offset);
             ctx.profiler()
                 .count_ops(OpCode::IntAdd, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(OpCode::IntAdd, crate::counters::RECORDED_OPS);
             let buffer = ctx.record_op(OpCode::IntAdd, &[base_buffer, offset_ref]);
-            // resume.py:727: decoder.virtuals_cache.set_int(index, buffer)
+            // resume.py: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_int(vidx, buffer);
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -667,7 +667,7 @@ pub fn materialize_bridge_virtual(
             }
             buffer
         }
-        // resume.py:766-775 VStrPlainInfo.allocate / resume.py:820-829
+        // resume.py VStrPlainInfo.allocate / resume.py
         // VUniPlainInfo.allocate — `ResumeDataBoxReader.allocate_string /
         // allocate_unicode` followed by `string_setitem` / `unicode_setitem`
         // per character.
@@ -693,19 +693,19 @@ pub fn materialize_bridge_virtual(
             } else {
                 (OpCode::Newstr, OpCode::Strsetitem)
             };
-            // resume.py:769: string = decoder.allocate_string(length)
+            // resume.py: string = decoder.allocate_string(length)
             ctx.profiler().count_ops(alloc_opcode, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(alloc_opcode, crate::counters::RECORDED_OPS);
             let string = ctx.record_op(alloc_opcode, &[length_ref]);
-            // resume.py:770: decoder.virtuals_cache.set_ptr(index, string)
+            // resume.py: decoder.virtuals_cache.set_ptr(index, string)
             cache.set_ptr(vidx, string);
-            // resume.py:771-774: string_setitem for each filled char.
+            // resume.py: string_setitem for each filled char.
             for (i, &charnum) in fieldnums.iter().enumerate() {
                 if charnum == majit_ir::resumedata::UNINITIALIZED_TAG {
                     continue;
                 }
-                // resume.py:1138-1141 ResumeDataBoxReader.string_setitem:
+                // resume.py ResumeDataBoxReader.string_setitem:
                 //   charbox = self.decode_box(charnum, INT)
                 //   execute_and_record(rop.STRSETITEM, string, ConstInt(index), charbox)
                 let charbox = decode_fieldnum(ctx, charnum, rd_virtuals, resume_data, cache);
@@ -729,14 +729,14 @@ pub fn materialize_bridge_virtual(
             }
             string
         }
-        // resume.py:785-793 VStrConcatInfo.allocate / resume.py:840-848
+        // resume.py VStrConcatInfo.allocate / resume.py
         // VUniConcatInfo.allocate:
         //
         //     left, right = self.fieldnums
         //     string = decoder.concat_strings(left, right)   # CALL_R(OS_STR_CONCAT)
         //     decoder.virtuals_cache.set_ptr(index, string)
         //
-        // `ResumeDataBoxReader.concat_strings` at resume.py:1143-1149:
+        // `ResumeDataBoxReader.concat_strings` at resume.py:
         //
         //     cic = self.metainterp.staticdata.callinfocollection
         //     calldescr, func = cic.callinfo_for_oopspec(OS_STR_CONCAT)
@@ -773,15 +773,15 @@ pub fn materialize_bridge_virtual(
             }
             string
         }
-        // resume.py:805-809 VStrSliceInfo.allocate / resume.py:860-864
+        // resume.py VStrSliceInfo.allocate / resume.py
         // VUniSliceInfo.allocate:
         //
         //     largerstr, start, length = self.fieldnums
         //     string = decoder.slice_string(largerstr, start, length)
         //     decoder.virtuals_cache.set_ptr(index, string)
         //
-        // `ResumeDataBoxReader.slice_string` at resume.py:1151-1160 /
-        // `slice_unicode` at resume.py:1179-1188:
+        // `ResumeDataBoxReader.slice_string` at resume.py /
+        // `slice_unicode` at resume.py:
         //
         //     cic = self.metainterp.staticdata.callinfocollection
         //     calldescr, func = cic.callinfo_for_oopspec(OS_STR_SLICE)
@@ -828,7 +828,7 @@ pub fn materialize_bridge_virtual(
             }
             string
         }
-        // resume.py:951/954 getvirtual_ptr direct-indexes rd_virtuals[index];
+        // resume.py/954 getvirtual_ptr direct-indexes rd_virtuals[index];
         // the function preamble already documents this as fail-loud ("not a
         // silent NONE fallback"). An Empty hole here means the resume stream
         // tagged a virtual index that was never assigned a real virtual
@@ -840,7 +840,7 @@ pub fn materialize_bridge_virtual(
     }
 }
 
-/// resume.py:1245-1264 `decode_box` symbolic parity for an already-decoded
+/// resume.py `decode_box` symbolic parity for an already-decoded
 /// [`majit_ir::resumedata::RebuiltValue`]: mint the bridge `OpRef` (typed `InputArg` for a live box,
 /// const for a pooled const, recursively materialized virtual for a virtual).
 pub fn rebuilt_value_to_opref(
@@ -865,7 +865,7 @@ pub fn rebuilt_value_to_opref(
     }
 }
 
-/// resume.py:993-1007 `_prepare_pendingfields` op-emission: replay one deferred
+/// resume.py `_prepare_pendingfields` op-emission: replay one deferred
 /// heap write as a bridge-entry `SETFIELD_GC` / `SETARRAYITEM_GC` and seed the
 /// heapcache so a later same-slot get folds against it. `item_index < 0` marks
 /// a struct field; `>= 0` an array element.
@@ -901,7 +901,7 @@ pub fn emit_pending_field_op(
     }
 }
 
-/// resume.py:993-1007 `_prepare_pendingfields` (box-reader flavour): replay the
+/// resume.py `_prepare_pendingfields` (box-reader flavour): replay the
 /// guard's deferred heap writes as bridge-entry `SETFIELD_GC` /
 /// `SETARRAYITEM_GC` ops so the compiled bridge observes the same heap state the
 /// blackhole would rebuild. Symbolic-only — a consumer that also seeds concrete
@@ -989,17 +989,17 @@ pub fn replay_pending_fields(
     }
 }
 
-/// `pyjitpl.py:3449 rebuild_state_after_failure`:
+/// `pyjitpl.py rebuild_state_after_failure`:
 ///
 /// ```python
 /// if vinfo is not None:
 ///     self.virtualizable_boxes = virtualizable_boxes
 /// ```
 ///
-/// `virtualizable_boxes` is what `resume.py:1083 consume_virtualizable_boxes`
+/// `virtualizable_boxes` is what `resume.py consume_virtualizable_boxes`
 /// built out of the guard's vable section: the virtualizable itself comes
-/// first (`resume.py:1404 virtualizable = self.next_ref()`), then
-/// `virtualizable.py:139 load_list_of_boxes` reads one box per static field
+/// first (`resume.py virtualizable = self.next_ref()`), then
+/// `virtualizable.py load_list_of_boxes` reads one box per static field
 /// and one per array element — off the LIVE object, which is where the array
 /// lengths come from — and returns the list with the virtualizable appended,
 /// so `boxes[-1]` is the identity every consumer indexes.
@@ -1043,13 +1043,13 @@ pub fn seed_bridge_virtualizable_boxes(
     let Some((identity, slots)) = resume_data.virtualizable_values.split_first() else {
         return false;
     };
-    // `resume.py:1404 virtualizable = self.next_ref()` — the first entry is a
+    // `resume.py virtualizable = self.next_ref()` — the first entry is a
     // ref box holding the virtualizable itself.  Anything else means this
     // guard's vable section does not name the virtualizable (the box was
     // replaced, folded, or never made it into the guard's fail args), and
     // dereferencing whatever value sits there would be a wild read; decline
     // the seed instead, which leaves the guard deopting through the blackhole
-    // exactly as it did before — `compile.py:27 compile.giveup()`.
+    // exactly as it did before — `compile.py compile.giveup()`.
     let Some(identity_value @ Value::Ref(vable_ref)) = concrete(identity, fail_values) else {
         return false;
     };
@@ -1065,7 +1065,7 @@ pub fn seed_bridge_virtualizable_boxes(
     }
     // Upstream never validates the decoded identity here: `rebuild_state_after
     // _failure` takes `virtualizable_boxes[-1]` and goes straight on to
-    // `reset_token_gcref` + `synchronize_virtualizable()` (pyjitpl.py:3449-3454),
+    // `reset_token_gcref` + `synchronize_virtualizable()` (pyjitpl.py),
     // because the box came out of ITS OWN numbering and cannot name anything
     // else.  Pyre's does not carry that guarantee — the state-field vable
     // section is only as good as the numbering that produced it — and the

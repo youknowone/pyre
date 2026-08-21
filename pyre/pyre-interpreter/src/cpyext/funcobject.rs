@@ -3,7 +3,7 @@
 use super::object::{argument, result};
 use super::pyobject::{self, CPyObject};
 
-/// `funcobject.py:106 PyMethod_New(func, self)` — bind `receiver` to
+/// `funcobject.py PyMethod_New(func, self)` — bind `receiver` to
 /// `function`, the way an attribute lookup on an instance does.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMethod_New(
@@ -40,14 +40,14 @@ unsafe fn method_member(
     pyobject::borrow_from(method, unsafe { reader(object) })
 }
 
-/// `funcobject.py:114 PyMethod_Function(method)` — the callable the binding
+/// `funcobject.py PyMethod_Function(method)` — the callable the binding
 /// wraps, borrowed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMethod_Function(method: *mut CPyObject) -> *mut CPyObject {
     unsafe { method_member(method, pyre_object::function::w_method_get_func) }
 }
 
-/// `funcobject.py:120 PyMethod_Self(method)` — the receiver the binding
+/// `funcobject.py PyMethod_Self(method)` — the receiver the binding
 /// carries, borrowed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyMethod_Self(method: *mut CPyObject) -> *mut CPyObject {

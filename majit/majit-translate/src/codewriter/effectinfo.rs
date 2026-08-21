@@ -16,7 +16,7 @@
 //! `analyze_simple_operation` opname checks; both inherit the default
 //! `analyze_external_call` (`bottom_result()` = `False`,
 //! `graphanalyze.py:60-69`). [`RandomEffectsAnalyzer`]
-//! (`effectinfo.py:410-418`) overrides `analyze_external_call` to read
+//! (`effectinfo.py`) overrides `analyze_external_call` to read
 //! `funcobj.random_effects_on_gcobjs` off the flowspace funcobj attrs —
 //! the same attribute mirror `collectanalyze::CollectAnalyzer` reads —
 //! failing loud on a missing attr (upstream's direct attribute access)
@@ -43,7 +43,7 @@ pub use majit_ir::{
 /// `effectinfo.py:401-404`.
 pub struct VirtualizableAnalyzer<'t> {
     translator: &'t TranslationContext,
-    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py:13`).
+    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
     analyzed_calls: UnionFind<usize, Dependency<bool>>,
 }
 
@@ -79,7 +79,7 @@ impl<'t> GraphAnalyzer<bool, ()> for VirtualizableAnalyzer<'t> {
 /// `effectinfo.py:406-408`.
 pub struct QuasiImmutAnalyzer<'t> {
     translator: &'t TranslationContext,
-    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py:13`).
+    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
     analyzed_calls: UnionFind<usize, Dependency<bool>>,
 }
 
@@ -112,7 +112,7 @@ impl<'t> GraphAnalyzer<bool, ()> for QuasiImmutAnalyzer<'t> {
 /// `effectinfo.py:410-418`.
 pub struct RandomEffectsAnalyzer<'t> {
     translator: &'t TranslationContext,
-    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py:13`).
+    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
     analyzed_calls: UnionFind<usize, Dependency<bool>>,
 }
 
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn random_effects_external_call_with_attr_returns_true() {
-        // effectinfo.py:412-413 — `funcobj.random_effects_on_gcobjs` → True.
+        // effectinfo.py — `funcobj.random_effects_on_gcobjs` → True.
         let translator = TranslationContext::new();
         let mut analyzer = RandomEffectsAnalyzer::new(&translator);
         let mut attrs = HashMap::new();
@@ -315,7 +315,7 @@ mod tests {
     fn random_effects_external_call_with_false_attr_returns_false() {
         // effectinfo.py:414-415 — `random_effects_on_gcobjs = False` reaches
         // the super-call; with no `_callbacks` the base `GraphAnalyzer`
-        // returns `bottom_result()` == False (graphanalyze.py:60-69).
+        // returns `bottom_result()` == False (graphanalyze.py).
         let translator = TranslationContext::new();
         let mut analyzer = RandomEffectsAnalyzer::new(&translator);
         let mut attrs = HashMap::new();

@@ -15,7 +15,7 @@ use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 pub struct OptEarlyForce;
 
-/// earlyforce.py:7-11: is_raw_free(op, opnum).
+/// earlyforce.py: is_raw_free(op, opnum).
 /// Raw free calls should not force their arguments.
 pub fn is_raw_free(op: &Op, opnum: OpCode) -> bool {
     if !opnum.is_real_call() {
@@ -61,7 +61,7 @@ impl Default for OptEarlyForce {
 }
 
 impl Optimization for OptEarlyForce {
-    /// earlyforce.py:15-29: propagate_forward.
+    /// earlyforce.py: propagate_forward.
     /// Force all virtual args of non-exempt operations, then emit.
     fn propagate_forward(
         &mut self,
@@ -81,7 +81,7 @@ impl Optimization for OptEarlyForce {
                     .as_ref()
                     .map(|o| o.to_opref())
                     .unwrap_or_else(|| op.arg(i).to_opref());
-                // optimizer.py:354-362: force_box pops the arg's
+                // optimizer.py: force_box pops the arg's
                 // potential_extra_op and hands it to the short-preamble
                 // producer BEFORE (and independent of) the virtual check, so a
                 // non-virtual short-box arg is added to the preamble too.

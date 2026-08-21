@@ -17,7 +17,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     Ptr, PtrTarget, Struct, functionptr_with_external_name, malloc,
 };
 
-/// RPython `RFFI_SAVE_ERRNO` and related bit flags (`rffi.py:62-73`).
+/// RPython `RFFI_SAVE_ERRNO` and related bit flags (`rffi.py`).
 pub const RFFI_SAVE_ERRNO: i64 = 1;
 pub const RFFI_READSAVED_ERRNO: i64 = 2;
 pub const RFFI_ZERO_ERRNO_BEFORE: i64 = 4;
@@ -31,18 +31,18 @@ pub const RFFI_ERR_NONE: i64 = 0;
 pub const RFFI_ERR_ALL: i64 = RFFI_FULL_ERRNO | RFFI_FULL_LASTERROR;
 pub const RFFI_ALT_ERRNO: i64 = 64;
 
-/// RPython `_isfunctype(TP)` (`rffi.py:43-48`).
+/// RPython `_isfunctype(TP)` (`rffi.py`).
 pub fn _isfunctype(TP: &LowLevelType) -> bool {
     matches!(TP, LowLevelType::Ptr(ptr) if matches!(ptr.TO, PtrTarget::Func(_)))
 }
 
-/// RPython `_isllptr(p)` (`rffi.py:50-52`). The Rust signature accepts only
+/// RPython `_isllptr(p)` (`rffi.py`). The Rust signature accepts only
 /// `lltype::_ptr`, so every value reaching this helper is a low-level pointer.
 pub fn _isllptr(_p: &_ptr) -> bool {
     true
 }
 
-/// RPython `_IsLLPtrEntry(ExtRegistryEntry)` (`rffi.py:53-60`).
+/// RPython `_IsLLPtrEntry(ExtRegistryEntry)` (`rffi.py`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct _IsLLPtrEntry;
 
@@ -56,7 +56,7 @@ pub const UNSIGNED: LowLevelType = LowLevelType::Unsigned;
 pub const r_singlefloat: LowLevelType = LowLevelType::SingleFloat;
 pub const NULL: Option<()> = None;
 
-/// RPython `TYPES` seed list (`rffi.py:503-538`), narrowed only where the
+/// RPython `TYPES` seed list (`rffi.py`), narrowed only where the
 /// platform-dependent `CompilationError` branch cannot be evaluated in this
 /// static port.
 pub static TYPES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
@@ -117,7 +117,7 @@ fn rffi_name_from_c_type(mut name: &str) -> String {
     }
 }
 
-/// RPython `populate_inttypes()` (`rffi.py:541-559`).
+/// RPython `populate_inttypes()` (`rffi.py`).
 pub fn populate_inttypes() -> Vec<String> {
     TYPES
         .iter()
@@ -125,7 +125,7 @@ pub fn populate_inttypes() -> Vec<String> {
         .collect()
 }
 
-/// RPython `setup()` (`rffi.py:562-575`), represented by the primitive
+/// RPython `setup()` (`rffi.py`), represented by the primitive
 /// low-level types available before the full platform cache is ported.
 pub fn setup() -> Vec<LowLevelType> {
     populate_inttypes()
@@ -186,18 +186,18 @@ pub static VOIDP: LazyLock<LowLevelType> =
 pub static CONST_VOIDP: LazyLock<LowLevelType> =
     LazyLock::new(|| ptr_to_array(LowLevelType::Char, void_hints(true)));
 
-/// `void **` (`rffi.py:751`).
+/// `void **` (`rffi.py`).
 pub static VOIDPP: LazyLock<LowLevelType> = LazyLock::new(|| CArrayPtr((*VOIDP).clone()));
 
 /// `char *` (`rffi.py:754`).
 pub static CCHARP: LazyLock<LowLevelType> =
     LazyLock::new(|| ptr_to_array(LowLevelType::Char, nolength_hints()));
 
-/// `const char *` (`rffi.py:757-758`).
+/// `const char *` (`rffi.py`).
 pub static CONST_CCHARP: LazyLock<LowLevelType> =
     LazyLock::new(|| ptr_to_array(LowLevelType::Char, const_hints()));
 
-/// `wchar_t *` (`rffi.py:761`).
+/// `wchar_t *` (`rffi.py`).
 pub static CWCHARP: LazyLock<LowLevelType> =
     LazyLock::new(|| ptr_to_array(LowLevelType::UniChar, nolength_hints()));
 
@@ -217,7 +217,7 @@ pub static CCHARPP: LazyLock<LowLevelType> =
 pub static CWCHARPP: LazyLock<LowLevelType> =
     LazyLock::new(|| ptr_to_array((*CWCHARP).clone(), nolength_hints()));
 
-/// RPython `CStruct(name, *fields, **kwds)` (`rffi.py:614-626`).
+/// RPython `CStruct(name, *fields, **kwds)` (`rffi.py`).
 ///
 /// Upstream prefixes every field with `c_` and adds the C rendering hints.
 pub fn CStruct(name: &str, fields: Vec<(String, LowLevelType)>) -> Struct {
@@ -238,44 +238,44 @@ pub fn CStruct_with_hints(
     Struct::with_hints(name, c_fields, hints)
 }
 
-/// RPython `CStructPtr(*args, **kwds)` (`rffi.py:628-629`).
+/// RPython `CStructPtr(*args, **kwds)` (`rffi.py`).
 pub fn CStructPtr(name: &str, fields: Vec<(String, LowLevelType)>) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Struct(CStruct(name, fields)),
     }))
 }
 
-/// RPython `CFixedArray(tp, size)` (`rffi.py:631-633`).
+/// RPython `CFixedArray(tp, size)` (`rffi.py`).
 pub fn CFixedArray(tp: LowLevelType, size: usize) -> FixedSizeArray {
     FixedSizeArray::new(tp, size)
 }
 
-/// RPython `CArray(tp)` (`rffi.py:635-637`).
+/// RPython `CArray(tp)` (`rffi.py`).
 pub fn CArray(tp: LowLevelType) -> Array {
     Array::with_hints(tp, nolength_hints())
 }
 
-/// RPython `CArrayPtr(tp)` (`rffi.py:639-641`).
+/// RPython `CArrayPtr(tp)` (`rffi.py`).
 pub fn CArrayPtr(tp: LowLevelType) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Array(CArray(tp)),
     }))
 }
 
-/// RPython `CCallback(args, res)` (`rffi.py:643-645`).
+/// RPython `CCallback(args, res)` (`rffi.py`).
 pub fn CCallback(args: Vec<LowLevelType>, res: LowLevelType) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Func(FuncType { args, result: res }),
     }))
 }
 
-/// RPython `COpaque(...)` (`rffi.py:647-672`), narrowed to the type identity
+/// RPython `COpaque(...)` (`rffi.py`), narrowed to the type identity
 /// available in the current `lltype::OpaqueType` port.
 pub fn COpaque(name: Option<&str>) -> OpaqueType {
     OpaqueType::new(name.unwrap_or("C"))
 }
 
-/// RPython `COpaquePtr(*args, **kwds)` (`rffi.py:674-676`).
+/// RPython `COpaquePtr(*args, **kwds)` (`rffi.py`).
 pub fn COpaquePtr(name: Option<&str>) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Opaque(COpaque(name)),
@@ -289,7 +289,7 @@ pub fn llexternal(name: &str, args: Vec<LowLevelType>, result: LowLevelType) -> 
     functionptr_with_external_name(FuncType { args, result }, name, None)
 }
 
-/// RPython `make(STRUCT, **fields)` (`rffi.py:1299-1305`).
+/// RPython `make(STRUCT, **fields)` (`rffi.py`).
 pub fn make(STRUCT: Struct, fields: Vec<(String, LowLevelValue)>) -> Result<_ptr, String> {
     let mut ptr = malloc(
         LowLevelType::Struct(Box::new(STRUCT)),
@@ -322,7 +322,7 @@ pub struct KeepaliveKeeper {
     pub free_positions: Vec<usize>,
 }
 
-/// RPython `_KEEPER_CACHE = {}` (`rffi.py:456`). This is intentionally a
+/// RPython `_KEEPER_CACHE = {}` (`rffi.py`). This is intentionally a
 /// side cache because upstream uses a module-level dict keyed by low-level
 /// type for callback keepalive slots.
 pub static _KEEPER_CACHE: LazyLock<Mutex<HashMap<LowLevelType, KeepaliveKeeper>>> =
@@ -474,7 +474,7 @@ pub fn offsetof() -> Result<(), TyperError> {
     Err(deferred("offsetof"))
 }
 
-/// RPython `MakeEntry(ExtRegistryEntry)` (`rffi.py:1320`).
+/// RPython `MakeEntry(ExtRegistryEntry)` (`rffi.py`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MakeEntry;
 
@@ -530,7 +530,7 @@ pub fn c_memset() -> Result<(), TyperError> {
     Err(deferred("c_memset"))
 }
 
-/// RPython `TEST_RAW_ADDR_KEEP_ALIVE = {}` (`rffi.py:1512`).
+/// RPython `TEST_RAW_ADDR_KEEP_ALIVE = {}` (`rffi.py`).
 pub static TEST_RAW_ADDR_KEEP_ALIVE: LazyLock<Mutex<HashMap<String, LowLevelType>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -538,13 +538,13 @@ pub fn get_raw_address_of_string() -> Result<(), TyperError> {
     Err(deferred("get_raw_address_of_string"))
 }
 
-/// RPython `_StrFinalizerQueue(rgc.FinalizerQueue)` (`rffi.py:1538`).
+/// RPython `_StrFinalizerQueue(rgc.FinalizerQueue)` (`rffi.py`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct _StrFinalizerQueue {
     pub raw_copies: HashMap<usize, LowLevelType>,
 }
 
-/// RPython `_fq_addr_from_string = _StrFinalizerQueue()` (`rffi.py:1557`).
+/// RPython `_fq_addr_from_string = _StrFinalizerQueue()` (`rffi.py`).
 pub static _fq_addr_from_string: LazyLock<Mutex<_StrFinalizerQueue>> =
     LazyLock::new(|| Mutex::new(_StrFinalizerQueue::default()));
 

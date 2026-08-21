@@ -22,7 +22,7 @@ pub struct AstGraphOptions;
 
 /// Signal that lowering was halted due to an unsupported construct.
 ///
-/// RPython `rpython/flowspace/flowcontext.py:258,417` raises `FlowingError`
+/// RPython `rpython/flowspace/flowcontext.py` raises `FlowingError`
 /// when the abstract interpreter hits a bytecode it cannot model; that
 /// error propagates all the way out of `build_flow_graph`, aborting the
 /// current graph rather than silently continuing with a synthetic value.
@@ -249,7 +249,7 @@ pub struct SemanticProgram {
     /// mutates after construction (or is quasi-immutable).  Both bare and
     /// qualified struct keys are inserted (mirroring `struct_fields`) so
     /// the same lookup logic works across module-prefix variants.  Rank
-    /// encoding follows `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
+    /// encoding follows `rpython/rtyper/rclass.py _parse_field_list`.
     pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
     /// Enum discriminant → variant name, keyed by enum type (both the
     /// qualified path and the bare leaf, mirroring `struct_fields`).

@@ -78,7 +78,7 @@ pub struct TaskRegistration {
     /// itself only propagates it.
     pub title: String,
     /// Upstream `task.task_idempotent` consulted by
-    /// `TranslationDriver._do` (`driver.py:281`). When `true`, the
+    /// `TranslationDriver._do` (`driver.py`). When `true`, the
     /// driver does *not* stash the goal in `self.done`, so a
     /// re-request re-runs the task. The engine does not consult this
     /// itself; it rides along for subclasses.
@@ -110,7 +110,7 @@ type PlanKey = (Vec<String>, Vec<String>);
 /// (`seen` / `constraints`) across calls. `tasks` / `goal_set` /
 /// `skip` are `&` borrows — they don't change inside `_plan`.
 ///
-/// The matching upstream `subgoals(task_name)` (`taskengine.py:26-37`)
+/// The matching upstream `subgoals(task_name)` (`taskengine.py`)
 /// — the `??` / `?` sigil resolver — is inlined here as the
 /// `resolved_deps` filter, matching the same per-dep emission order.
 fn consider(
@@ -181,11 +181,11 @@ fn consider(
 /// SimpleTaskEngine`), with the override-hook methods routed through
 /// the [`TaskEngineHooks`] trait.
 pub struct SimpleTaskEngine {
-    /// Upstream `self._plan_cache = {}` at `taskengine.py:3`. The
+    /// Upstream `self._plan_cache = {}` at `taskengine.py`. The
     /// cache is keyed on `(tuple(goals), tuple(skip))` per
     /// `taskengine.py:19`, storing the topologically-sorted plan.
     _plan_cache: RefCell<HashMap<PlanKey, Vec<String>>>,
-    /// Upstream `self.tasks = tasks = {}` at `taskengine.py:5`. Keyed
+    /// Upstream `self.tasks = tasks = {}` at `taskengine.py`. Keyed
     /// on task name, value is the `(callable, deps)` pair upstream
     /// stores; the Rust port carries the full [`TaskRegistration`] to
     /// preserve `task_title` / `task_idempotent` for subclass hooks.
@@ -209,7 +209,7 @@ impl Default for SimpleTaskEngine {
 }
 
 impl SimpleTaskEngine {
-    /// Upstream `SimpleTaskEngine.__init__` at `taskengine.py:2-14`.
+    /// Upstream `SimpleTaskEngine.__init__` at `taskengine.py`.
     /// Initializes the plan cache + task map; the reflective scan over
     /// `task_<name>` methods at lines 7-14 is deferred to explicit
     /// [`register_task`](Self::register_task) calls by subclasses
@@ -300,7 +300,7 @@ impl SimpleTaskEngine {
         let mut seen: HashSet<String> = HashSet::new();
 
         // Upstream `for goal in goals: consider(goal)` at
-        // `taskengine.py:52-53`. Drives `consider` in goal order so
+        // `taskengine.py`. Drives `consider` in goal order so
         // independent goals' constraints are emitted in the same order
         // PyPy's recursion produces — the topo picker at `:64-69`
         // breaks ties on this ordering, so a LIFO worklist would
@@ -389,7 +389,7 @@ impl SimpleTaskEngine {
     }
 
     /// Upstream `SimpleTaskEngine._depending_on_closure(goal)` at
-    /// `taskengine.py:91-101`. Transitive closure of `_depending_on`.
+    /// `taskengine.py`. Transitive closure of `_depending_on`.
     pub fn _depending_on_closure(&self, goal: &str) -> Vec<String> {
         let mut d: HashSet<String> = HashSet::new();
         let mut stack: Vec<String> = vec![goal.to_string()];
@@ -487,7 +487,7 @@ impl SimpleTaskEngine {
     ) -> Result<TaskOutput, TaskError> {
         let plan = self._plan(goals, task_skip)?;
         // Upstream: first loop emits "planned" events for every task.
-        // Upstream `taskengine.py:108-109` lets a `_event` raise
+        // Upstream `taskengine.py` lets a `_event` raise
         // bubble straight out of `_execute` (no try/except wraps the
         // first loop), so any error returned by the planned-phase
         // earlycheck (`driver.py:611-612`) must propagate here.
@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn plan_cache_hits_on_second_call() {
-        // Upstream `taskengine.py:80`: `self._plan_cache[key] = plan`
+        // Upstream `taskengine.py`: `self._plan_cache[key] = plan`
         // — verify the cache actually fires.
         let e = SimpleTaskEngine::new();
         e.register_task("a", noop_callable(), vec![], "a", false);
@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn execute_runs_plan_and_returns_last_task_result() {
-        // Upstream `taskengine.py:103-121` — `res = None` then each
+        // Upstream `taskengine.py` — `res = None` then each
         // `_do` overwrites. Final `res` is returned.
         let observed: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let obs_a = Rc::clone(&observed);
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn execute_error_hook_fires_on_task_error() {
-        // Upstream `taskengine.py:117-119`: `except: self._error(goal);
+        // Upstream `taskengine.py`: `except: self._error(goal);
         // raise`. In Rust, we route the error AFTER calling `_error`.
         struct Track {
             err_goal: RefCell<Option<String>>,
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn execute_custom_do_hook_wraps_callable() {
-        // Upstream `driver.py:262-..` overrides `_do` to run the
+        // Upstream `driver.py-..` overrides `_do` to run the
         // callable inside a timer. Exercise the hook surface by
         // counting how many times `_do` runs and what it returns.
         struct Counter {

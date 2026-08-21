@@ -20,8 +20,8 @@ const MAGIC_CONSTANT_B: u32 = 19650218;
 const MAGIC_CONSTANT_C: u32 = 1664525;
 const MAGIC_CONSTANT_D: u32 = 1566083941;
 
-/// `rrandom.py:23 class Random` is an ordinary instance that
-/// `interp_random.py:21` allocates on its own — `self._rnd = rrandom.Random()`
+/// `rrandom.py class Random` is an ordinary instance that
+/// `interp_random.py` allocates on its own — `self._rnd = rrandom.Random()`
 /// — so the twister lives *behind* a reference rather than inside its holder.
 /// Keeping that shape is what makes the holder's `self.rnd` field readable:
 /// borrowing an inline aggregate field has no IR spelling, and the front-end's
@@ -187,7 +187,7 @@ impl W_Random {
         let (positional, _kwargs) = crate::builtins::split_builtin_kwargs(args);
         let user_args = positional.get(1..).unwrap_or(&[]);
         let w_anything = user_args.first().copied().unwrap_or_else(w_none);
-        // interp_random.py:13 `space.allocate_instance(W_Random,
+        // interp_random.py `space.allocate_instance(W_Random,
         // w_subtype)` validates the requested subtype and preserves it on
         // the allocated object's class header.  The typed payload layout is
         // shared by subclasses, exactly as `check_user_subclass` verifies.

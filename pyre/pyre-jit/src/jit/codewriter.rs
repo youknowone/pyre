@@ -43,7 +43,7 @@ use super::flatten::{
 /// offset into that vector (no indirection).
 ///
 /// Identity remap of local-index → vable-array slot.
-/// `jtransform.py:1877` `do_fixed_list_getitem` / `:1898`
+/// `jtransform.py` `do_fixed_list_getitem` / `:1898`
 /// `do_fixed_list_setitem` derive the index implicitly from the
 /// `_virtualizable_` slot order on the W_Root subclass. Pyre's
 /// `PyFrame` lays locals first in `locals_cells_stack_w` so the remap
@@ -184,9 +184,9 @@ fn make_three_flow_lists(values: &[super::flow::FlowValue]) -> Vec<super::flow::
 
 /// The `jdindex` operand of `jit_merge_point` / `loop_header` names a
 /// **jitdriver**, and the blackhole resolves it against one process-wide table
-/// (`blackhole.py:1079` `metainterp_sd.jitdrivers_sd[jdindex]`).  Every Python
+/// (`blackhole.py` `metainterp_sd.jitdrivers_sd[jdindex]`).  Every Python
 /// portal jitcode belongs to the single Python jitdriver — upstream's
-/// `PyPyJitDriver` (`interp_jit.py:67-78`), of which `warmspot.py` builds
+/// `PyPyJitDriver` (`interp_jit.py`), of which `warmspot.py` builds
 /// exactly one.
 ///
 /// `CallControl.jitdrivers_sd` is pyre's portal registry: `setup_jitdriver`
@@ -208,7 +208,7 @@ fn portal_jit_merge_point_graph_args(
     jitdriver_index: usize,
 ) -> Vec<super::flow::SpaceOperationArg> {
     let (frame, ec) = portal_graph_inputvars_from_startblock(graph);
-    // `pypyjit/interp_jit.py:67-78` PyPyJitDriver greens =
+    // `pypyjit/interp_jit.py` PyPyJitDriver greens =
     // `['next_instr', 'is_being_profiled', 'pycode']`.  `pycode` is
     // recovered from the live frame at every merge point via the
     // `getfield_vable_r frame, PYCODE_FIELD_IDX → pycode_var` dual-
@@ -350,7 +350,7 @@ impl FrameState {
     /// return the `mergeable()` position
     /// at which a given Variable appears, or `None` if it is not present.
     ///
-    /// `framestate.py:38-43` `mergeable` concatenates `locals_w + stack +
+    /// `framestate.py` `mergeable` concatenates `locals_w + stack +
     /// last_exc pair`; the i-th position is a stable per-FrameState slot
     /// identity that `Link.args` / `target.inputargs` correspondence is
     /// built on (see `getoutputargs` above — `link.args[j]` and
@@ -661,7 +661,7 @@ fn union_kind(left: Option<Kind>, right: Option<Kind>) -> Option<Kind> {
 /// predecessor must pad each slot with the SAME kind, otherwise
 /// `union_flow_value`'s `union_kind(Int, Ref)` collapses to an untyped
 /// merged Variable that later defaults to `Ref` and mints a `ref_copy`
-/// over the real Int type source.  `framestate.py:66-71 _exc_args` pads
+/// over the real Int type source.  `framestate.py _exc_args` pads
 /// both slots with one `Constant(None)` because flowspace Variables are
 /// untyped; the rtyper assigns the exception slots a uniform type
 /// afterwards, and pyre carries that uniform per-slot typing here.
@@ -698,9 +698,9 @@ fn entry_frame_state(code: &CodeObject, frame_inputs: FrameInputs) -> FrameState
 struct SpamBlock {
     /// `flowcontext.py:40` underlying `Block`.
     block: super::flow::BlockRef,
-    /// `flowcontext.py:40` `block.framestate`.
+    /// `flowcontext.py` `block.framestate`.
     framestate: Option<FrameState>,
-    /// `flowcontext.py:41` `block.dead`.
+    /// `flowcontext.py` `block.dead`.
     dead: bool,
     /// Exception edges feeding a shared catch landing. Each upstream
     /// `EggBlock` has one incoming edge; pyre coalesces those eggs by handler
@@ -757,7 +757,7 @@ impl SpamBlockRef {
     fn mark_dead(&self) {
         let mut spam = self.0.borrow_mut();
         spam.dead = true;
-        // `flowspace/flowcontext.py:455-457 mergeblock` runs the
+        // `flowspace/flowcontext.py mergeblock` runs the
         // tuple `block.dead = True; block.operations = ()` in one
         // step.  The empty-operations side carries the "this block
         // contributes no codegen" semantics that `flatten` /
@@ -771,7 +771,7 @@ impl SpamBlockRef {
         // Mirror onto the underlying flow::Block so flatten_graph and
         // any post-walker graph traversal can see the dead status
         // without needing the SpamBlockRef wrapper (matching upstream
-        // `flowcontext.py:42 SpamBlock.dead` which is read during
+        // `flowcontext.py SpamBlock.dead` which is read during
         // `flatten` via `block.dead` access on the flow Block).
         spam.block.borrow_mut().dead = true;
     }
@@ -940,7 +940,7 @@ fn derive_pc_live_indices_from_sparse(
                 // `-live-` markers) by that branch op.  Its `semantic_
                 // fallthrough_pc` is then the branch's FALL-THROUGH arm — the
                 // arm taken when the branch guard fails (`goto_if_not`'s true
-                // path, `flatten.py:264 make_link(linktrue)`).  Keying it to
+                // path, `flatten.py make_link(linktrue)`).  Keying it to
                 // the call's trailing marker `q+1` (which precedes the
                 // `goto_if_not`) makes the resume re-read the unboxed
                 // condition the `truth` left stale and re-branch the wrong
@@ -1150,7 +1150,7 @@ fn fresh_variable_for_state(
 /// never produce CFG pairs in practice.
 ///
 /// `last_exception` / `last_exc_value` link args are skipped per
-/// `flatten.py:336-347 generate_last_exc` — those are emitted
+/// `flatten.py generate_last_exc` — those are emitted
 /// separately and don't participate in coalesce.
 fn collect_cfg_coalesce_pairs(
     graph: &super::flow::FunctionGraph,
@@ -1182,13 +1182,13 @@ fn collect_cfg_coalesce_pairs(
                 {
                     continue;
                 }
-                // `regalloc.py:99-100 _try_coalesce` predicates on
+                // `regalloc.py _try_coalesce` predicates on
                 // `consider_var(v) and consider_var(w)`; the Ref-kind
                 // pass requires both endpoints to be Ref.
                 if src_variable.kind != Some(Kind::Ref) || dst_variable.kind != Some(Kind::Ref) {
                     continue;
                 }
-                // `regalloc.py:98 _try_coalesce` rejects `v is w` before
+                // `regalloc.py _try_coalesce` rejects `v is w` before
                 // any further work — an inputarg forwarded unchanged
                 // through `link.args[i] == target.inputargs[i]` has
                 // nothing to coalesce with itself.  Pyre's pre-merge
@@ -1382,7 +1382,7 @@ fn exceptblock_link_args(source_state: &FrameState) -> Vec<super::flow::FlowValu
 /// Allocate the fresh `(exc_type, exc_value)` Variable pair that
 /// represents an exception edge's payload at the graph level.
 ///
-/// vs `rpython/flowspace/flowcontext.py:1250-1261 Raise.nomoreblocks`:
+/// vs `rpython/flowspace/flowcontext.py Raise.nomoreblocks`:
 /// RPython's flow analysis sees the Python
 /// source form `raise SomeError("msg")` and builds an
 /// `OperationException(w_type=Constant(SomeError), w_value=...)` from
@@ -1397,13 +1397,13 @@ fn exceptblock_link_args(source_state: &FrameState) -> Vec<super::flow::FlowValu
 /// There is no graph-level Variable that stands for "the type of the
 /// raised value" because pyre's graph emission is driven by bytecode,
 /// not by `raise`-statement source.  Synthesizing fresh Variables here
-/// matches `flowcontext.py:133-143 guessexception` — the same
+/// matches `flowcontext.py guessexception` — the same
 /// mechanism upstream itself uses on implicit exception edges, where
 /// type/value are also not statically knowable.
 ///
 /// The fresh pair is carried on the Link as BOTH `link.args` AND
 /// `link.extravars` (see `exception_edge_extravars`), so the upstream
-/// `flatten.py:163-164 make_exception_link` check `link.args ==
+/// `flatten.py make_exception_link` check `link.args ==
 /// [link.last_exception, link.last_exc_value]` matches and the
 /// pass-through `raise` / `reraise` emission path fires.  The payload
 /// is structurally synthetic at the graph layer and becomes concrete
@@ -1413,7 +1413,7 @@ fn exception_edge_vars(
     graph: &mut super::flow::FunctionGraph,
 ) -> (super::flow::Variable, super::flow::Variable) {
     // `last_exception/>i` (Kind::Int) + `last_exc_value/>r` (Kind::Ref)
-    // per `assembler.py:220`.  Matches the walker emit in this file and the
+    // per `assembler.py`.  Matches the walker emit in this file and the
     // fixture etype/evalue kinds in `flatten.rs`.  Untyped Variables
     // crash the canonical SSARepr build's `regalloc_color` when an
     // exception edge propagates them into a colored slot
@@ -1434,7 +1434,7 @@ fn exception_landing_state(
     state
 }
 
-/// `flowcontext.py:635-636` computes `w_type = op.type(w_value).eval(self)`
+/// `flowcontext.py` computes `w_type = op.type(w_value).eval(self)`
 /// before `Raise.nomoreblocks` projects the explicit raise edge to
 /// `[w_exc.w_type, w_exc.w_value]`.
 ///
@@ -1482,9 +1482,9 @@ fn explicit_raise_state(
 /// Mirrors the pattern used by `flowcontext.py:141-143` where the
 /// freshly-created `last_exc` / `last_exc_value` Variables are both
 /// placed into `link.args` AND attached to `link.extravars(...)`
-/// (`model.py:127-129 Link.extravars`) — so downstream passes that
+/// (`model.py Link.extravars`) — so downstream passes that
 /// check `link.args == [link.last_exception, link.last_exc_value]`
-/// (`flatten.py:163-164 make_exception_link`) can identify the edge
+/// (`flatten.py make_exception_link`) can identify the edge
 /// as a pass-through of the exception pair.
 fn exception_edge_extravars(
     edge_state: &FrameState,
@@ -1508,14 +1508,14 @@ fn update_catch_landing_state(
     target: &SpamBlockRef,
     edge_state: &FrameState,
 ) {
-    // `flowcontext.py:130-139 guessexception` separates `vars`
+    // `flowcontext.py guessexception` separates `vars`
     // (link.args, the link's `extravars` — `[last_exc,
     // last_exc_value]`) from `vars2` (target.inputargs, fresh
     // Variables on the EggBlock).  Both single-source and
     // multi-source paths must allocate fresh inputargs so the
     // landing block's `inputargs` Variable IDs are disjoint from
     // the link's outgoing args.  `copy()` is the upstream-canonical
-    // shape — `framestate.py:80 copy(rename)` re-renames every
+    // shape — `framestate.py copy(rename)` re-renames every
     // FlowValue Variable through the closure.
     let existing_state = target.framestate();
     let new_state = if let Some(existing) = existing_state.as_ref() {
@@ -1525,7 +1525,7 @@ fn update_catch_landing_state(
         let mut fresh = |kind| fresh_variable_for_state(graph, kind);
         Some(edge_state.copy(&mut fresh))
     };
-    // `flowcontext.py:139` `egg = EggBlock(vars2, block, case)` — the
+    // `flowcontext.py` `egg = EggBlock(vars2, block, case)` — the
     // catch landing's inputargs receive the exception edge's incoming
     // values.  Single-source case (above) keeps the alias today;
     // pyre's union path (multi-source raise sites flowing into the
@@ -1737,7 +1737,7 @@ fn make_next_block(
         &currentblock.block(),
         output_link(currentstate, &newstate, newblock.block()),
     );
-    // flowcontext.py:472 `self.pendingblocks.append(newblock)`.
+    // flowcontext.py `self.pendingblocks.append(newblock)`.
     pendingblocks.push_back(newblock.clone());
     newblock
 }
@@ -1832,7 +1832,7 @@ fn mergeblock(
 
         candidates.remove(index);
         candidates.insert(0, newblock.clone());
-        // flowcontext.py:463 `self.pendingblocks.append(newblock)`.
+        // flowcontext.py `self.pendingblocks.append(newblock)`.
         pendingblocks.push_back(newblock.clone());
         let _ = newstate;
         return newblock;
@@ -1939,7 +1939,7 @@ fn duplicate_shadow_tos(
 ///
 /// Pyre historically emitted `SSARepr` directly from the trace recorder
 /// and skipped the flow-graph stage.  Pyre reintroduces the graph
-/// (so CFG-level `regalloc.py:79-96 coalesce_variables` can run), but the
+/// (so CFG-level `regalloc.py coalesce_variables` can run), but the
 /// SSARepr emission has not yet been replaced with a `flatten_graph` pass
 /// .  Until it is, each opcode handler must populate both
 /// streams — the SSARepr byte stream that backend/blackhole consume, and
@@ -1956,7 +1956,7 @@ fn record_graph_op(
 ) -> super::flow::SpaceOperation {
     let op = super::flow::SpaceOperation::new(opname, args, result, offset);
     super::flow::push_op(block, op.clone());
-    // `jtransform.py:311-313` / `handle_residual_call`: an operation
+    // `jtransform.py` / `handle_residual_call`: an operation
     // whose lowering can raise is immediately followed by a `-live-`
     // SpaceOperation in the graph, so `flatten.py:206-217` recognises an
     // actually-raising block by its structural `[raising_op, -live-]`
@@ -1974,7 +1974,7 @@ fn record_graph_op(
 }
 
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
-/// `rpython/jit/codewriter/jtransform.py:1898-1906 do_fixed_list_setitem`
+/// `rpython/jit/codewriter/jtransform.py do_fixed_list_setitem`
 /// (vable branch): `[v_base, v_index, v_value, arrayfielddescr,
 /// arraydescr]`. `v_base` is the portal frame Variable produced by
 /// `portal_graph_inputvars(code).0` — matching jtransform.py:840 where
@@ -2004,7 +2004,7 @@ fn vable_setarrayitem_ref_graph_args(
 }
 
 /// Build the 4-arg `getarrayitem_vable_r` arg vector matching
-/// `rpython/jit/codewriter/jtransform.py:1882-1885 do_fixed_list_getitem`
+/// `rpython/jit/codewriter/jtransform.py do_fixed_list_getitem`
 /// (vable branch): `[v_base, v_index, arrayfielddescr, arraydescr]`.
 /// Counterpart of `vable_setarrayitem_ref_graph_args` for the read
 /// side; the result Variable is supplied by the caller to
@@ -2076,7 +2076,7 @@ fn vable_getfield_ref_graph_args(
 /// `emit_frontend_*` HLOp discard it via `let _ = ...` (matching the
 /// `emit_vable_getfield_ref!` graph dual-write pattern).
 ///
-/// Mirrors `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call`
+/// Mirrors `rpython/jit/codewriter/jtransform.py rewrite_call`
 /// SpaceOperation construction.
 fn record_residual_call_graph_op(
     graph: &mut super::flow::FunctionGraph,
@@ -2130,7 +2130,7 @@ fn record_residual_call_graph_op(
         super::flatten::intern_call_descr_stub(effect_info, arg_kinds, reskind.to_kind()).into(),
     );
 
-    // `jtransform.py:311-313` / `handle_residual_call`: a residual_call
+    // `jtransform.py` / `handle_residual_call`: a residual_call
     // whose calldescr can raise is immediately followed by a trailing
     // `-live-` so the liveness pass records the registers alive at the
     // implicit GUARD_NO_EXCEPTION.  `record_graph_op` appends the marker
@@ -2241,7 +2241,7 @@ fn emit_frontend_neg(
     operand: super::flow::FlowValue,
     offset: i64,
 ) -> super::flow::Variable {
-    // flowcontext.py:192 + unaryoperation(): UNARY_NEGATIVE records
+    // flowcontext.py + unaryoperation(): UNARY_NEGATIVE records
     // `op.neg(w_1).eval(self)` at the frontend graph level.  Keep the
     // graph semantic here and leave the current helper-call lowering in
     // SSARepr as a backend adaptation until frontend-lowering lands.
@@ -2254,7 +2254,7 @@ fn emit_frontend_newlist(
     items: Vec<super::flow::FlowValue>,
     offset: i64,
 ) -> super::flow::Variable {
-    // flowcontext.py:1168-1170 BUILD_LIST -> `op.newlist(*items).eval(self)`.
+    // flowcontext.py BUILD_LIST -> `op.newlist(*items).eval(self)`.
     // The flowspace graph carries a single `newlist` op over the operand
     // items; the fixed-size array materialisation (`new_array_clear` +
     // `setarrayitem_gc_r` + `newlist_from_array`) is the rtyper's job and is
@@ -2276,7 +2276,7 @@ fn emit_frontend_newtuple(
     items: Vec<super::flow::FlowValue>,
     offset: i64,
 ) -> super::flow::Variable {
-    // flowcontext.py:1163-1165 BUILD_TUPLE -> `op.newtuple(*items).eval(self)`.
+    // flowcontext.py BUILD_TUPLE -> `op.newtuple(*items).eval(self)`.
     // Same flowspace/rtyper split as `newlist`: the single `newtuple` op is
     // lowered to the fixed-size array build by `lower_frontend_collection_ops`.
     emit_graph_op_with_result(
@@ -2290,7 +2290,7 @@ fn emit_frontend_newtuple(
 }
 
 /// rtyper-analog lowering of the flowspace `newlist`/`newtuple` ops emitted
-/// by BUILD_LIST/BUILD_TUPLE (`flowcontext.py:1165,1170`) into the fixed-size
+/// by BUILD_LIST/BUILD_TUPLE (`flowcontext.py`) into the fixed-size
 /// array build the backend consumes:
 ///
 /// ```text
@@ -2380,7 +2380,7 @@ fn emit_frontend_newslice(
     step: super::flow::FlowValue,
     offset: i64,
 ) -> super::flow::Variable {
-    // flowcontext.py:1154-1161 BUILD_SLICE -> `op.newslice(w_start,
+    // flowcontext.py BUILD_SLICE -> `op.newslice(w_start,
     // w_end, w_step).eval(self)`. Preserve all three operands in the
     // shadow graph so graph-side analysis sees the same dependency shape
     // as RPython/PyPy, even while the bytecode-level SSA stream still uses
@@ -2428,7 +2428,7 @@ fn emit_frontend_setitem(
     value: super::flow::FlowValue,
     offset: i64,
 ) {
-    // flowcontext.py:1146-1149 STORE_SUBSCR ->
+    // flowcontext.py STORE_SUBSCR ->
     // `op.setitem(w_obj, w_subscr, w_newvalue).eval(self)`.
     // Upstream `HLOperation.__init__` (operation.py:66) unconditionally
     // creates a result Variable that rtyper later rewrites to void.
@@ -2494,7 +2494,7 @@ fn emit_frontend_setattr(
     value: super::flow::FlowValue,
     offset: i64,
 ) {
-    // flowcontext.py:1031-1036 STORE_ATTR ->
+    // flowcontext.py STORE_ATTR ->
     // `op.setattr(w_obj, w_attributename, w_newvalue).eval(self)`.
     // See `emit_frontend_setitem` for the void-result rationale.
     record_graph_op(
@@ -2658,13 +2658,13 @@ fn emit_frontend_getattr(
     name_idx_const: super::flow::FlowValue,
     offset: i64,
 ) -> super::flow::Variable {
-    // flowcontext.py:862-867 LOAD_ATTR ->
+    // flowcontext.py LOAD_ATTR ->
     // `op.getattr(w_obj, w_attributename).eval(self)`, extended with
     // two rtyper-surrogate operands (the code object as a post-rtype
     // `Signed(ptr) + Kind::Ref` constant and the `co_names` index)
     // that `flatten.rs::lower_getattr_hlop_to_insn` threads into the
     // `bh_load_attr_fn(obj, code, name_idx)` residual — pyre runs no
-    // `rclass.py:838 rtype_getattr` to rewrite the HLOp post-record.
+    // `rclass.py rtype_getattr` to rewrite the HLOp post-record.
     emit_graph_op_with_result(
         graph,
         block,
@@ -2754,7 +2754,7 @@ fn emit_frontend_load_name(
     namei: usize,
     offset: i64,
 ) -> super::flow::Variable {
-    // pyopcode.py:945-955 LOAD_NAME is a frame method (w_locals probe +
+    // pyopcode.py LOAD_NAME is a frame method (w_locals probe +
     // LOAD_GLOBAL fallback); flow analysis never processes module-scope
     // code upstream, so there is no flowspace HLOp to mirror.  Record
     // the frame-receiver call shape directly; the canonical flatten
@@ -2779,7 +2779,7 @@ fn emit_frontend_store_name(
     value: super::flow::FlowValue,
     offset: i64,
 ) {
-    // pyopcode.py:855-859 STORE_NAME ->
+    // pyopcode.py STORE_NAME ->
     // `setitem_str(getorcreatedebug().w_locals, varname, w_newvalue)`.
     // Frame-receiver call shape like `emit_frontend_load_name`; lowers
     // to `bh_store_name_fn(frame, w_name, value)`
@@ -2802,7 +2802,7 @@ fn emit_frontend_store_global(
     value: super::flow::FlowValue,
     offset: i64,
 ) {
-    // pyopcode.py:934 STORE_GLOBAL — writes the value directly into
+    // pyopcode.py STORE_GLOBAL — writes the value directly into
     // `w_globals`, bypassing `w_locals`.  Frame-receiver call shape like
     // `emit_frontend_store_name`; lowers to `bh_store_global_fn(frame,
     // w_name, value)` (`flatten::lower_store_global_hlop_to_insn`).  See
@@ -3171,7 +3171,7 @@ fn frontend_load_const_flow_value(
     code: &CodeObject,
     idx: usize,
 ) -> super::flow::FlowValue {
-    // `flowcontext.py:841-843 LOAD_CONST`: fetch the pre-wrapped constant
+    // `flowcontext.py LOAD_CONST`: fetch the pre-wrapped constant
     // and push that value. Every top-level constant resolves through the
     // enclosing code's `co_consts_w`, the same object `bh_load_const_fn`
     // returns.
@@ -3185,7 +3185,7 @@ fn frontend_load_const_flow_value(
     pyobject_const_ref_value(pyre_interpreter::pyframe::load_const_from_code(code, idx))
 }
 
-/// Resolve `name` the way `flowcontext.py:845-858 find_global` does —
+/// Resolve `name` the way `flowcontext.py find_global` does —
 /// module globals first, then `__builtins__` — returning the raw resolved
 /// object (or `None` when pyre cannot reproduce the static lookup).
 /// `frontend_global_flow_value` wraps the result in a const `FlowValue`;
@@ -3196,7 +3196,7 @@ fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::
     if w_code.is_null() {
         return None;
     }
-    // pyopcode.py:957 `_load_global`: `finditem_str(self.get_w_globals_storage(),
+    // pyopcode.py `_load_global`: `finditem_str(self.get_w_globals_storage(),
     // varname)` then the builtins fallback. Read the globals OBJECT
     // (`pycode.w_globals`) rather than the off-GC proxy storage.
     let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(w_code) };
@@ -3234,7 +3234,7 @@ fn frontend_global_object(w_code: *const (), name: &str) -> Option<pyre_object::
 }
 
 fn frontend_global_flow_value(w_code: *const (), name: &str) -> Option<super::flow::FlowValue> {
-    // `flowcontext.py:845-858 find_global` resolves globals during flow
+    // `flowcontext.py find_global` resolves globals during flow
     // analysis and pushes a Constant.  Do the same when the current
     // PyCode exposes its globals/builtins; callers fall back to a
     // fresh Ref only when pyre cannot reproduce the static lookup.
@@ -3299,7 +3299,7 @@ fn attach_materialized_exception_edge(
     target: &SpamBlockRef,
     edge_state: &FrameState,
 ) -> super::flow::LinkRef {
-    // `flowcontext.py:148-149 guessexception` marks the source block as
+    // `flowcontext.py guessexception` marks the source block as
     // can-raise before attaching the materialized exception link.
     block.borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Value(
         super::flow::c_last_exception().into(),
@@ -3332,7 +3332,7 @@ fn attach_materialized_exception_edge(
         .expect("catch landing must have a framestate after update_catch_landing_state");
     let link_args = edge_state.getoutputargs(&target_state);
 
-    // `model.py:127-129 Link.extravars` carries the source-side
+    // `model.py Link.extravars` carries the source-side
     // `(last_exception, last_exc_value)` pair so
     // `flatten.py:340-347` can identify the exception edge and
     // emit `last_exception` / `last_exc_value` SSA renamings at
@@ -3358,7 +3358,7 @@ fn attach_catch_exception_edge(
     source_state: &FrameState,
     site: &ExceptionCatchSite,
 ) -> super::flow::LinkRef {
-    // `flowcontext.py:130-134 guessexception` synthesises the
+    // `flowcontext.py guessexception` synthesises the
     // `(last_exception, last_exc_value)` Variable pair for this
     // edge.  `exception_landing_state` clones `source_state` and
     // sets `last_exception` to the fresh pair, so the same
@@ -3408,7 +3408,7 @@ fn restore_canraise_exit_order(block: &super::flow::BlockRef) {
     }
 
     // `flatten.rs` lowers a canraise block's `exits[0]` as the normal edge and
-    // `exits[1:]` as seeded exception edges (`flatten.py:220-233 insert_exits`).
+    // `exits[1:]` as seeded exception edges (`flatten.py insert_exits`).
     // Pyre's PC-sequential walker can emit the normal edge past index 0, so
     // move it back to the front; the exception edges keep their relative order.
     // A non-seeded exit left in the `exits[1:]` position is a graph-construction
@@ -3638,7 +3638,7 @@ struct FnPtrIndices {
 ///
 /// * `get_current_exception_fn` / `set_current_exception_fn`: TLS
 ///   read/write of `CURRENT_EXCEPTION`; never raises.  RPython's
-///   `EF_CANNOT_RAISE` (`call.py:303 getcalldescr`'s `else` branch) →
+///   `EF_CANNOT_RAISE` (`call.py getcalldescr`'s `else` branch) →
 ///   `PlainCannotRaise`.
 /// * `compare_fn` / `binary_op_fn` / `store_subscr_fn` / `call_fn` /
 ///   `call_fn_n` / `truth_fn` / `normalize_raise_varargs_fn`:
@@ -3651,7 +3651,7 @@ struct FnPtrIndices {
 ///   slice allocation; can raise (`NameError` / `MemoryError`) but do
 ///   not force virtuals — `EF_CAN_RAISE` → `Plain`.
 /// * `box_int_fn`: kept on `Plain` until the upstream
-///   `@jit.elidable_promote` decorator is wired (`rpython/rlib/jit.py:180`).
+///   `@jit.elidable_promote` decorator is wired (`rpython/rlib/jit.py`).
 /// * `load_const_fn`: reads the shared `co_consts_w` slot, but pyre lazily
 ///   realizes the compiler's unwrapped constant on the first read. That first
 ///   call allocates and mutates the slot, so it remains `Plain` until the
@@ -3695,7 +3695,7 @@ fn register_helper_fn_pointers(
     // `bh_load_global_fn` mirrors pyopcode.py `_load_global`: globals
     // lookup, then the current frame's picked builtins module, then
     // `NameError` synthesis on miss.
-    // Matches `EF_CAN_RAISE` (`call.py:301` `elif self._canraise(op)`):
+    // Matches `EF_CAN_RAISE` (`call.py` `elif self._canraise(op)`):
     // can raise but does not force virtuals.
     let load_global_fn = bind(
         assembler,
@@ -3733,7 +3733,7 @@ fn register_helper_fn_pointers(
         cpu.store_subscr_fn as *const (),
         CallFlavor::MayForce,
     );
-    // `pypy/interpreter/pyopcode.py:1463-1472 BUILD_SLICE` calls
+    // `pypy/interpreter/pyopcode.py BUILD_SLICE` calls
     // `space.newslice(w_start, w_end, w_step)`.  Pyre mirrors that with
     // a flat allocation helper; no user code runs, but allocation can fail.
     let build_slice_fn = bind(
@@ -3811,7 +3811,7 @@ fn register_helper_fn_pointers(
     // and is emitted only into the blackhole/deopt jitcode — `LOAD_ATTR`
     // is walker-skipped during recording, so this residual call never
     // executes while a virtualizable is live.  Stands in for the rtyped
-    // `getfield_gc` (`rclass.py:838 rtype_getattr`); classified
+    // `getfield_gc` (`rclass.py rtype_getattr`); classified
     // `CallFlavor::Plain` (can-raise, no virtual-force) like
     // `load_global_fn`.  Bound after the existing fn_ptrs to preserve
     // their indices.
@@ -3847,7 +3847,7 @@ fn register_helper_fn_pointers(
         CallFlavor::MayForce,
     );
     // `bh_load_name_fn` / `bh_store_name_fn` delegate to the interpreter
-    // `NamespaceOpcodeHandler` impl (pyopcode.py:945 LOAD_NAME / :855
+    // `NamespaceOpcodeHandler` impl (pyopcode.py LOAD_NAME / :855
     // STORE_NAME). The full-body walker traces the emitted residuals, which
     // share `bh_getattr_fn`'s classification:
     // `CallFlavor::Plain` (can raise, no virtual-force while live).
@@ -3855,7 +3855,7 @@ fn register_helper_fn_pointers(
     let load_name_fn = bind(assembler, cpu.load_name_fn as *const (), CallFlavor::Plain);
     let store_name_fn = bind(assembler, cpu.store_name_fn as *const (), CallFlavor::Plain);
     // `bh_store_global_fn` delegates to the interpreter `store_global_value`
-    // (pyopcode.py:934 STORE_GLOBAL); same blackhole/deopt-only contract and
+    // (pyopcode.py STORE_GLOBAL); same blackhole/deopt-only contract and
     // `CallFlavor::Plain` classification as `store_name_fn`.  Bound adjacent
     // to it to keep the namespace-store helpers contiguous.
     let store_global_fn = bind(
@@ -4045,7 +4045,7 @@ fn register_helper_fn_pointers(
     // popvalues_mutable array) allocates a list and unboxes each element to
     // pick the storage strategy; the allocation can raise (MemoryError) but
     // it runs no user code and does not touch the virtualizable, so the
-    // effect is `EF_CAN_RAISE` → `Plain` (`call.py:288`: only the
+    // effect is `EF_CAN_RAISE` → `Plain` (`call.py`: only the
     // virtualizable analyzer raises `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`).
     // Virtual element boxes passed as call args are forced automatically by
     // any residual call, independent of this flavor.  Matches the
@@ -4084,7 +4084,7 @@ fn register_helper_fn_pointers(
     // `baseobjspace::next`), so a user `__iter__`/`__next__` can run Python
     // and force the virtualizable → `CallFlavor::MayForce`, symmetric with
     // `store_slice_fn` and the `virtualizable_analyzer.analyze(op)` row of
-    // `getcalldescr` (`call.py:288`).  `bh_unpack_item_fn` (already bound)
+    // `getcalldescr` (`call.py`).  `bh_unpack_item_fn` (already bound)
     // only indexes the materialised result tuple and stays `Plain`.  Appended
     // last to preserve fn_ptr indices.
     let unpack_ex_fn = bind(
@@ -4823,7 +4823,7 @@ fn catch_live_coverage_census(
     );
 }
 
-/// RPython: `liveness.py:19-80` `compute_liveness(ssarepr)` —
+/// RPython: `liveness.py` `compute_liveness(ssarepr)` —
 /// backward dataflow over the populated `SSARepr` that fills each
 /// `-live-` marker with the set of registers alive across it.
 ///
@@ -4844,7 +4844,7 @@ fn catch_live_coverage_census(
 /// sole source.
 ///
 /// `live_i` and `live_f` are emitted line-by-line parity with
-/// upstream — RPython's `liveness.py:19-76 compute_liveness`
+/// upstream — RPython's `liveness.py compute_liveness`
 /// produces one SSA-driven alive set as the sole authority, and
 /// `assembler.py:150-152` only splits that set by kind.
 ///
@@ -4996,7 +4996,7 @@ fn filter_liveness_in_place(
     // same class as the per-PC marker: `get_list_of_active_boxes` reads the
     // marker AFTER the call whenever `in_a_call` or `after_residual_call`
     // holds and the one before the op otherwise (`pyjitpl.py:194-198`), and
-    // `compute_liveness` (`liveness.py:19-23`) is one uniform pass over every
+    // `compute_liveness` (`liveness.py`) is one uniform pass over every
     // `-live-` in the stream.  The LV∩SSA narrowing below is pyre's adaptation
     // for a tracer that materializes Python-frame slots only; restricting it
     // to the per-PC markers left the after-call markers naming SSA-live
@@ -5077,8 +5077,8 @@ fn filter_liveness_in_place(
             // index)`, so seen-set dedup keeps the encounter order
             // stable across runs.
             //
-            // liveness.py:67-75 `compute_liveness` adds every Register to
-            // the alive set; assembler.py:150-152 splits the `-live-`
+            // liveness.py `compute_liveness` adds every Register to
+            // the alive set; assembler.py splits the `-live-`
             // args into live_i / live_r / live_f by kind via
             // `get_liveness_info(insn[1:], 'int'/'ref'/'float')`.
             let mut seen_r: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
@@ -5777,7 +5777,7 @@ fn decode_exception_catch_sites(
 /// Compiles Python CodeObjects into JitCode for blackhole execution.
 ///
 /// RPython: `rpython/jit/codewriter/codewriter.py::CodeWriter`.
-/// `codewriter.py:20-23` stores `self.assembler = Assembler()` and
+/// `codewriter.py` stores `self.assembler = Assembler()` and
 /// `self.callcontrol = CallControl(cpu, jitdrivers_sd)` once on the
 /// CodeWriter and reuses them across every `transform_graph_to_jitcode`
 /// call so `all_liveness` / `num_liveness_ops` and the `jitcodes` dict
@@ -5790,19 +5790,19 @@ fn decode_exception_catch_sites(
 /// a `RefCell<Assembler>` field so `transform_graph_to_jitcode` can
 /// still mutate it under the immutable-by-default singleton borrow.
 pub struct CodeWriter {
-    /// `codewriter.py:22` `self.assembler = Assembler()`.
+    /// `codewriter.py` `self.assembler = Assembler()`.
     ///
     /// Single Assembler instance shared across every `transform_graph_to_jitcode`
     /// call on this CodeWriter. `all_liveness` / `all_liveness_positions` /
     /// `num_liveness_ops` accumulate here just like the upstream object.
     assembler: RefCell<Assembler>,
     /// RPython: `self.callcontrol = CallControl(cpu, jitdrivers_sd)`
-    /// (codewriter.py:23). Owned in a `UnsafeCell` so `&CodeWriter` can
+    /// (codewriter.py). Owned in a `UnsafeCell` so `&CodeWriter` can
     /// mint `&mut CallControl` through [`Self::callcontrol`] — matches
     /// the legacy `JITCODE_CACHE` interior-mutability contract.
     callcontrol: UnsafeCell<super::call::CallControl>,
     /// RPython: `gc_ll_descr.gc_cache._cache_call`
-    /// (`backend/llsupport/descr.py:14 GcCache.__init__` +
+    /// (`backend/llsupport/descr.py GcCache.__init__` +
     /// `:665-673 get_call_descr`).  RPython's call descr cache is a
     /// per-`GcCache` instance dict keyed by `(arg_classes, result_type,
     /// result_signed, RESULT_ERASED, extrainfo)` and reached via
@@ -5816,7 +5816,7 @@ pub struct CodeWriter {
 }
 
 impl CodeWriter {
-    /// RPython: `CodeWriter.__init__(cpu, jitdrivers_sd)` (codewriter.py:20-23).
+    /// RPython: `CodeWriter.__init__(cpu, jitdrivers_sd)` (codewriter.py).
     ///
     /// The cpu helpers are fixed module-level functions in
     /// `crate::call_jit`; `callcontrol` is a field so
@@ -5849,7 +5849,7 @@ impl CodeWriter {
         arg_kinds: Vec<Kind>,
         result_kind: Option<Kind>,
     ) -> majit_ir::DescrRef {
-        // `descr.py:665` keys `get_call_descr` on
+        // `descr.py` keys `get_call_descr` on
         // `(arg_classes, result_type, result_signed, RESULT_ERASED, extrainfo)`
         // and `descr.py:670-674` writes `result_type` onto the constructed
         // CallDescr. Pyre mirrors the redundancy: the cache key carries
@@ -5877,10 +5877,10 @@ impl CodeWriter {
         arc.clone() as Arc<dyn majit_ir::Descr>
     }
 
-    /// `codewriter.py:21` `self.cpu = cpu`.
+    /// `codewriter.py` `self.cpu = cpu`.
     ///
     /// Convenience accessor — pyre owns the single `Cpu` on
-    /// `CallControl` (call.py:27 `self.cpu = cpu`); upstream both
+    /// `CallControl` (call.py `self.cpu = cpu`); upstream both
     /// attributes point at the same object.
     pub fn cpu(&self) -> &super::cpu::Cpu {
         &self.callcontrol().cpu
@@ -5901,9 +5901,9 @@ impl CodeWriter {
     /// preserved so future warmspot wiring can call through with the
     /// same name.
     pub fn setup_vrefinfo(&self, vrefinfo: ()) {
-        // codewriter.py:93 `assert self.callcontrol.virtualref_info is None`.
+        // codewriter.py `assert self.callcontrol.virtualref_info is None`.
         assert!(self.callcontrol().virtualref_info.is_none());
-        // codewriter.py:94 `self.callcontrol.virtualref_info = vrefinfo`.
+        // codewriter.py `self.callcontrol.virtualref_info = vrefinfo`.
         self.callcontrol().virtualref_info = Some(vrefinfo);
     }
 
@@ -5932,7 +5932,7 @@ impl CodeWriter {
         {
             return;
         }
-        // codewriter.py:99 `self.callcontrol.jitdrivers_sd.append(jitdriver_sd)`.
+        // codewriter.py `self.callcontrol.jitdrivers_sd.append(jitdriver_sd)`.
         cc.jitdrivers_sd.push(jitdriver_sd);
     }
 
@@ -6002,7 +6002,7 @@ impl CodeWriter {
         // emit sites can reference the same `frame_var`/`ec_var` pair
         // (instead of substituting a `Constant::none()` sentinel).
         let (frame_var, ec_var) = portal_graph_inputvars(code);
-        // RPython codewriter.py:46-48 `regallocs[kind] = perform_register_allocation(graph, kind)`.
+        // RPython codewriter.py `regallocs[kind] = perform_register_allocation(graph, kind)`.
         // pyre's regalloc is trivial — fast locals occupy the bottom of
         // the ref register file and the operand stack stacks above
         // them — so the "allocation" reduces to a `RegisterLayout`
@@ -6615,7 +6615,7 @@ impl CodeWriter {
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
-        // codewriter.py:37 `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
+        // codewriter.py `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
         // — RPython looks up portal-ness in the registry that
         // `setup_jitdriver` populates. pyre matches that: a code is a
         // portal iff it is in `CallControl.jitdrivers_sd`. The portal
@@ -6627,13 +6627,13 @@ impl CodeWriter {
             .jitdriver_sd_from_portal_graph(code as *const CodeObject);
         // #25 step1-2: de-conflate the fused `is_portal` bool into its two
         // independent RPython concepts.  TRUE-PORTAL is the `jit_merge_point`
-        // marker + jitdriver stamp (`portal_jd is not None`, jtransform.py:65).
+        // marker + jitdriver stamp (`portal_jd is not None`, jtransform.py).
         // FRAME INPUT SHAPE is the `[frame, ec]` red inputs + the frame-vable
-        // locals prologue (`reds = ['frame', 'ec']`, interp_jit.py:67). Every
+        // locals prologue (`reds = ['frame', 'ec']`, interp_jit.py). Every
         // drained per-code jitcode carries that Portal input shape, while the
         // marker stays gated on TRUE-PORTAL. Portal registration comes solely
         // from `codewriter.py:37 jitdriver_sd_from_portal_graph`. The vable
-        // access suppression `jtransform.py:977-996 is_virtualizable_getset`
+        // access suppression `jtransform.py is_virtualizable_getset`
         // applies at codewrite time under the `fresh_virtualizable` flag
         // happens here at walk time instead: the strict fresh-frame fold
         // (jitcode_dispatch.rs, gated on `built_as_portal`) folds an inline
@@ -6762,7 +6762,7 @@ impl CodeWriter {
         // shadow `FunctionGraph` alongside `ssarepr`.
         //
         // RPython's flow space keeps `framestate` on each `SpamBlock`
-        // (`flowcontext.py:38-44`) and derives `Link.args ↔
+        // (`flowcontext.py`) and derives `Link.args ↔
         // target.inputargs` from `FrameState.getoutputargs()`. Pyre's
         // walker is still single-pass over Python bytecode, but the
         // shadow graph now carries the same per-block `FrameState`
@@ -6837,11 +6837,11 @@ impl CodeWriter {
         // to the outer `while let Some(pending_block) =
         // pendingblocks.pop_front()` which picks up the queued new
         // block in the next iteration.  Mirrors upstream's
-        // `flowcontext.py:407-416 record_block` shape where each
+        // `flowcontext.py record_block` shape where each
         // block is processed contiguously without mid-iteration
         // re-entry.  Correctness relies on the explicit `goto
         // Label("pcN")` + `Unreachable` pair emitted on the yield
-        // path, aligning with `flatten.py:177-258 insert_exits`.
+        // path, aligning with `flatten.py insert_exits`.
         let mut block_switch_pending: bool = false;
         let mut current_state = current_block
             .framestate()
@@ -6864,7 +6864,7 @@ impl CodeWriter {
         // The deferred case-application across emit_mark_label_pc no
         // longer exists.
 
-        // rpython/flowspace/flowcontext.py:399-405 `build_flow` parity:
+        // rpython/flowspace/flowcontext.py `build_flow` parity:
         // `pendingblocks = deque([startblock])` + `while pendingblocks:
         // block = pendingblocks.popleft(); record_block(block)`.
         // Queue element is the block itself (flowcontext.py:401); the
@@ -6878,14 +6878,14 @@ impl CodeWriter {
         // macro DEFINITION site.
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
         // Upstream `build_flow` relies on `block.dead` alone
-        // (`flowcontext.py:404 if not block.dead: record_block(block)`).
+        // (`flowcontext.py if not block.dead: record_block(block)`).
         // Pyre matches this: supersede may re-walk a PC under widened
         // framestate, producing duplicate `-live-` markers.  The drain
         // keeps the dead block's emit as the runtime canonical bytes;
         // the supersede newblock's re-walk emit is unreachable through
         // the resolved `pc_map`.
 
-        // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
+        // interp_jit.py `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
         // Python backward jump.  jtransform.py:1714-1723
         // `handle_jit_marker__can_enter_jit = handle_jit_marker__loop_header`
@@ -6966,7 +6966,7 @@ impl CodeWriter {
         // compile and target their own loops instead of growing giant
         // bridges.
 
-        // pyframe.py:379-417 pushvalue/popvalue_maybe_none parity:
+        // pyframe.py pushvalue/popvalue_maybe_none parity:
         // Each push/pop writes self.valuestackdepth = depth ± 1.
         // jtransform.py:923-928 lowers this to setfield_vable_i.
         // This macro emits the equivalent BC_SETFIELD_VABLE_I after
@@ -7077,7 +7077,7 @@ impl CodeWriter {
         // therefore keep the runtime-side adaptation (assembler emits
         // `BC_ABORT_PERMANENT` so the blackhole interpreter falls back to
         // CPython evaluation) but never surface the pyre-only opname into
-        // the RPython-parity SSARepr layer — `flatten.py:106` uses plain
+        // the RPython-parity SSARepr layer — `flatten.py` uses plain
         // `Label` for loop headers and `assembler.py:159` does not encode
         // unsupported bytecodes as named opnames.
 
@@ -7090,14 +7090,14 @@ impl CodeWriter {
         // without consulting a label table. The runtime-side adaptation
         // stays (`assembler.rs`'s `write_insn` dispatch) but the
         // pyre-only opname is not surfaced into the RPython-parity
-        // SSARepr layer — `flatten.py:106` uses plain `Label` for loop
+        // SSARepr layer — `flatten.py` uses plain `Label` for loop
         // headers.
 
         // Dual emission for `int_copy` / `ref_copy` /
         // `float_copy` with a Constant source. RPython parity:
-        // `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`
+        // `flatten.py` `self.emitline('%s_copy' % kind, v, "->", w)`
         // — `v` is resolved via `getcolor(v)` which returns either a
-        // `Register` or an unchanged `Constant` (see `flatten.py:382-384`).
+        // `Register` or an unchanged `Constant` (see `flatten.py`).
         // The `assembler.py:140-222` dispatch handles both: the Register
         // source emits an `int_copy/i>i` entry, and the Constant source
         // emits an `int_copy/c>i` entry (argcode `'c'` for a compact
@@ -7120,7 +7120,7 @@ impl CodeWriter {
 
         // Call family intentionally has NO dual-emit.
         //
-        // `rpython/jit/codewriter/jtransform.py:414-435` `rewrite_call()`
+        // `rpython/jit/codewriter/jtransform.py` `rewrite_call()`
         // emits `residual_call_{kinds}_{reskind}` with
         // `[fnptr_constant, ListOfKind(int)?, ListOfKind(ref),
         //   ListOfKind(float)?, calldescr]`. pyre's runtime ABI uses
@@ -7153,7 +7153,7 @@ impl CodeWriter {
                 // attach the return edge to
                 // `graph.returnblock` (`model.py:18`). The return value
                 // now comes from the symbolic `FrameState` stack,
-                // matching `flatten.py:130-139` `make_return(args)`.
+                // matching `flatten.py` `make_return(args)`.
                 let link =
                     super::flow::Link::new(vec![retval], Some(graph.returnblock.clone()), None)
                         .into_ref();
@@ -7163,7 +7163,7 @@ impl CodeWriter {
         }
 
         // RPython parity:
-        // `flatten.py:161` `self.emitline('goto', TLabel(link.target))` —
+        // `flatten.py` `self.emitline('goto', TLabel(link.target))` —
         // `assembler.py:220` turns the op into `goto/L`. Pyre labels are
         // integer indices into `labels[]`, one per Python PC; the
         // `TLabel` carries the synthetic name `pc{target_py_pc}` so the
@@ -7174,7 +7174,7 @@ impl CodeWriter {
                 let target_py_pc = $target_py_pc;
                 // mergeblock establishes the target SpamBlock and the
                 // graph exit edge (`append_exit`).  Mirrors upstream
-                // `flatten.py:161 self.emitline('goto',
+                // `flatten.py self.emitline('goto',
                 // TLabel(link.target))` where `link.target` is a Block
                 // identity, not a PC.
                 let _ = mergeblock(
@@ -7409,7 +7409,7 @@ impl CodeWriter {
                     );
                     emit_catch_exception!(catch_label);
                 } else {
-                    // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
+                    // `flowcontext.py Raise.nomoreblocks` shape:
                     //   link = Link([w_exc.w_type, w_exc.w_value],
                     //               ctx.graph.exceptblock)
                     // `w_exc.w_value` is the actual trace-level FlowValue
@@ -7455,7 +7455,7 @@ impl CodeWriter {
                 // of the same exception exit).
                 //
                 // `reraise` preserves the current handler exception in
-                // `FrameState.last_exception` (framestate.py:22).
+                // `FrameState.last_exception` (framestate.py).
                 // Upstream `rpython/jit/codewriter/flatten.py:161-162`
                 // `make_exception_link` asserts
                 //     assert link.last_exception is not None
@@ -7471,10 +7471,10 @@ impl CodeWriter {
                     Some(graph.exceptblock.clone()),
                     None,
                 );
-                // `flowcontext.py:141-143` `guessexception` / `model.py:
+                // `flowcontext.py` `guessexception` / `model.py:
                 // 127-129 Link.extravars`: pass the exception pair as
                 // both `link.args` and `link.extravars` so the
-                // downstream `flatten.py:163-174 make_exception_link`
+                // downstream `flatten.py make_exception_link`
                 // check `link.args == [link.last_exception,
                 // link.last_exc_value]` matches and emits `reraise`.
                 link.extravars(Some(etype), Some(evalue));
@@ -7519,7 +7519,7 @@ impl CodeWriter {
             }};
         }
 
-        // `flowcontext.py:130-156 BlockRecorder.guessexception` closes the
+        // `flowcontext.py BlockRecorder.guessexception` closes the
         // recording block AT the can-raise operation and resumes normal flow
         // in a fresh `EggBlock`, so an opcode whose can-raise op is followed
         // by its own exit wiring (`guessbool` setting the Bool exitswitch,
@@ -7533,8 +7533,8 @@ impl CodeWriter {
         //
         // `$threaded` carries the Variables the successor consumes that the
         // FrameState does not list — the can-raise op's own result feeding the
-        // branch.  `unsimplify.py:59-76 split_block` threads exactly those
-        // through the link so `regalloc.py:26-77 make_dependencies`, which
+        // branch.  `unsimplify.py split_block` threads exactly those
+        // through the link so `regalloc.py make_dependencies`, which
         // computes liveness per block from `inputargs`, sees them live.
         macro_rules! emit_catch_exception_and_split {
             ($catch_label:expr, $py_pc:expr, $threaded:expr) => {{
@@ -7568,8 +7568,8 @@ impl CodeWriter {
         }
 
         // Dual emission for block `Label`. RPython parity:
-        // `flatten.py:180` `self.emitline(Label(block))` marks block
-        // entry; `assembler.py:157-158` records the label position in
+        // `flatten.py` `self.emitline(Label(block))` marks block
+        // entry; `assembler.py` records the label position in
         // `self.label_positions`. pyre marks a label at every Python PC
         // (`mark_label(labels[py_pc])`) and at each catch landing
         // block's entry. The two naming schemes (`pc{py_pc}` vs
@@ -7742,7 +7742,7 @@ impl CodeWriter {
                     .framestate()
                     .is_some_and(|state| state.next_offset == py_pc)
                 {
-                    // `flowcontext.py:399-416 build_flow` pops a concrete
+                    // `flowcontext.py build_flow` pops a concrete
                     // SpamBlock and records that exact block.  A PC may have
                     // several union-incompatible joinpoint candidates; a
                     // later candidate is then at the head of `joinpoints`,
@@ -7809,7 +7809,7 @@ impl CodeWriter {
                 } else {
                     // `current_block` is dead and this PC carries no
                     // joinpoint candidate.  The only writer of `dead` is
-                    // `mergeblock`'s supersede (`flowcontext.py:455-463`),
+                    // `mergeblock`'s supersede (`flowcontext.py`),
                     // which kills the block a later merge could not union
                     // with and queues its replacement on `pendingblocks`.
                     // Upstream is never here: its walker is per-block, and
@@ -7847,7 +7847,7 @@ impl CodeWriter {
                     // is established by the `mergeblock` above
                     // (`append_exit`); the canonical splice emits the
                     // `goto` from that link.  Mirrors upstream
-                    // `flatten.py:161` `TLabel(link.target)` where
+                    // `flatten.py` `TLabel(link.target)` where
                     // `link.target` is a Block, not a PC.
                     block_switch_pending = true;
                 } else {
@@ -7866,7 +7866,7 @@ impl CodeWriter {
                 let landing_label = $landing_label;
                 // switch the shadow graph's
                 // `current_block` into the pre-allocated catch-landing
-                // block. Matches `flatten.py:180` `Label(block)` being the
+                // block. Matches `flatten.py` `Label(block)` being the
                 // block-entry marker in RPython. Catch landings are
                 // reached via `catch_exception` edges rather than
                 // fallthrough, so no implicit Link is inserted here —
@@ -7901,8 +7901,8 @@ impl CodeWriter {
         // RPython `-live-` placement is *not* per-PC: `jtransform.py`
         // emits `SpaceOperation('-live-', [], None)` graph-side only at
         // raising / virtualizable / inline-call decision points (e.g.
-        // `jtransform.py:469-471 handle_residual_call`,
-        // `jtransform.py:481 handle_regular_call`,
+        // `jtransform.py handle_residual_call`,
+        // `jtransform.py handle_regular_call`,
         // `jtransform.py:845` before `getfield_vable_<kind>`); flatten
         // serialises those graph ops via `serialize_op` and additionally
         // emits SSA-only `-live-` at branch / raise / switch boundaries
@@ -8043,7 +8043,7 @@ impl CodeWriter {
         //   index, matching `assembler.py:80-138`.
         //
         // Graph-side shadow for `getfield_vable_r` intentionally
-        // absent: jtransform.py:919-922 `do_fixed_list_getitem`
+        // absent: jtransform.py `do_fixed_list_getitem`
         // lowers `getfield_vable_r` to a fresh Variable result that
         // subsequent ops consume as an input. Pyre does not yet
         // thread that result through downstream graph ops, so emitting
@@ -8104,7 +8104,7 @@ impl CodeWriter {
                 let pushvalue_ref_py_pc: i64 = ($py_pc) as i64;
                 {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
-                    // `pyframe.py:389 pushvalue` lowers to
+                    // `pyframe.py pushvalue` lowers to
                     // `setarrayitem_vable_r(locals_cells_stack_w,
                     // depth, w_object)` via `jtransform.py:1898
                     // do_fixed_list_setitem` (vable branch).  The
@@ -8133,7 +8133,7 @@ impl CodeWriter {
         }
 
         // null_ref_reg retirement — null_ref_reg → ConstRef(PY_NULL) migration.
-        // pyframe.py:389 `pushvalue(w_object)` lowers, when w_object is a
+        // pyframe.py `pushvalue(w_object)` lowers, when w_object is a
         // compile-time `ConstPtr.NULL`, to `setarrayitem_vable_r(
         // locals_cells_stack_w, depth, ConstPtr(NULL))` via
         // jtransform.py:1898. Pyre's bytecode does not yet expose a
@@ -8177,7 +8177,7 @@ impl CodeWriter {
             }};
         }
 
-        // pyframe.py:411-417 `popvalue_maybe_none` lowers to
+        // pyframe.py `popvalue_maybe_none` lowers to
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
         // + `setfield_vable_i(valuestackdepth, depth)` via
         // jtransform.py:1898 / :927. The SSA op carries `ConstRef(0)`
@@ -8225,9 +8225,9 @@ impl CodeWriter {
             }};
         }
 
-        // pyopcode.py:500-507 LOAD_FAST + pyframe.py:378-381 pushvalue.
+        // pyopcode.py LOAD_FAST + pyframe.py pushvalue.
         // Portal case lowers the local read to `getarrayitem_vable_r`
-        // (jtransform.py:1877 `do_fixed_list_getitem`). Both the load
+        // (jtransform.py `do_fixed_list_getitem`). Both the load
         // and the subsequent pushvalue's `setarrayitem_vable_r` mirror
         // (jtransform.py:1898) are emitted here so the shadow
         // `locals_cells_stack_w` slot mirrors the value loaded into the
@@ -8256,7 +8256,7 @@ impl CodeWriter {
                 // through both ops.
                 //
                 // `current_state.locals_w[reg]` is left UNCHANGED:
-                // pyopcode.py:500-507 LOAD_FAST is a stack push,
+                // pyopcode.py LOAD_FAST is a stack push,
                 // not a local-binding mutation.  The pre-existing
                 // Variable in `locals_w[reg]` continues to identify
                 // the local slot for subsequent reads (matching
@@ -8294,7 +8294,7 @@ impl CodeWriter {
 
         // Post-emit bookkeeping for a stack-pushing handler: append the
         // produced FlowValue to the symbolic stack and run the full
-        // `pyframe.py:389 pushvalue` lowering on it.
+        // `pyframe.py pushvalue` lowering on it.
         //
         // `pushvalue` is one operation upstream, and `jtransform.py:1898
         // do_fixed_list_setitem` lowers it to the pair
@@ -8302,8 +8302,8 @@ impl CodeWriter {
         // `setfield_vable_i(valuestackdepth, depth + 1)`.  Publishing the
         // depth without the slot would tell the resume machinery that a
         // slot exists at `depth` while withholding its value: every
-        // `capture_resumedata` (pyjitpl.py:2611-2622) carries the whole
-        // `virtualizable_boxes` list, and `virtualizable.py:126-137
+        // `capture_resumedata` (pyjitpl.py) carries the whole
+        // `virtualizable_boxes` list, and `virtualizable.py
         // write_from_resume_data_partial` writes back every array element
         // it describes.  An unbound slot therefore restores as NULL rather
         // than as its live value.
@@ -8324,7 +8324,7 @@ impl CodeWriter {
         //
         // Outer loop interleaves the ordinary pending-block drain with
         // newly reachable catch landings.  Upstream's
-        // `flowcontext.py:124-153 guessexception` puts every exception
+        // `flowcontext.py guessexception` puts every exception
         // EggBlock directly on `pendingblocks`, and `build_flow` keeps
         // draining that queue to a fixed point (`flowcontext.py:399-405`).
         // Pyre emits its synthetic catch-landing sequence separately, so
@@ -8802,7 +8802,7 @@ impl CodeWriter {
                             // RPython: no-op operations produce no jitcode output
                         }
 
-                        // jtransform.py:1877 do_fixed_list_getitem vable case:
+                        // jtransform.py do_fixed_list_getitem vable case:
                         // Locals are virtualizable array items — emit
                         // vable_getarrayitem_ref so the optimizer folds the read
                         // against virtualizable_boxes and the blackhole pulls the
@@ -8814,7 +8814,7 @@ impl CodeWriter {
                             emit_load_fast_ref!(current_depth, reg, py_pc);
                         }
 
-                        // jtransform.py:1898 do_fixed_list_setitem vable case:
+                        // jtransform.py do_fixed_list_setitem vable case:
                         // Frames treat `locals_cells_stack_w` as the sole
                         // storage for locals — setarrayitem_vable_r writes from
                         // the value-stack slot directly, so no register-per-local
@@ -8851,7 +8851,7 @@ impl CodeWriter {
                             let val = i.get(op_arg) as u32 as i64;
                             // Graph-side `residual_call_ir_r` for
                             // `box_int_fn(val:Int) → Ref`.  RPython parity:
-                            // `flowcontext.py:135-139 self.recorder.append`
+                            // `flowcontext.py self.recorder.append`
                             // produces a fresh result Variable for every
                             // residual_call, and the consumer (here, the
                             // value-stack push) reads that Variable directly
@@ -8900,7 +8900,7 @@ impl CodeWriter {
                         // identical to plain LoadFast: every local read goes
                         // through getarrayitem_vable_r so blackhole resume can
                         // reload dead-at-resume locals on demand, as RPython does
-                        // via jtransform.py:1877 do_fixed_list_getitem.
+                        // via jtransform.py do_fixed_list_getitem.
                         Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                         | Instruction::LoadFastLoadFast { var_nums } => {
                             let pair = var_nums.get(op_arg);
@@ -8922,7 +8922,7 @@ impl CodeWriter {
                             let stored = pop_ref_or_fresh(&mut current_state, &mut graph);
                             {
                                 // STORE_FAST half graph dual-write
-                                // (jtransform.py:1898 `do_fixed_list_setitem`).
+                                // (jtransform.py `do_fixed_list_setitem`).
                                 let store_slot = local_to_vable_slot(store_reg as usize) as i64;
                                 let v_store_idx: super::flow::FlowValue =
                                     super::flow::Constant::signed(store_slot).into();
@@ -9040,7 +9040,7 @@ impl CodeWriter {
                         Instruction::PopTop => {
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let _ = current_state.stack.pop();
-                            // flowcontext.py:891 `self.popvalue()`; regalloc.py:
+                            // flowcontext.py `self.popvalue()`; regalloc.py:
                             // discard = just decrement depth, no bytecode.
                         }
 
@@ -9176,7 +9176,7 @@ impl CodeWriter {
                                 emit_catch_exception_and_split!(catch_label, py_pc, [bool_value]);
                                 exception_edge_handled = true;
                             }
-                            // flowcontext.py:756-763 `block.exitswitch = w_cond`.
+                            // flowcontext.py `block.exitswitch = w_cond`.
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
                             let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
@@ -9233,7 +9233,7 @@ impl CodeWriter {
                             }
                         }
 
-                        // flowcontext.py:761-763 POP_JUMP_IF_TRUE still branches on
+                        // flowcontext.py POP_JUMP_IF_TRUE still branches on
                         // `guessbool(op.bool(w_value).eval(self))`, so upstream
                         // flatten.py handles it as the same generic Bool exitswitch
                         // shape as POP_JUMP_IF_FALSE. The polarity difference is only
@@ -9263,7 +9263,7 @@ impl CodeWriter {
                                 emit_catch_exception_and_split!(catch_label, py_pc, [bool_value]);
                                 exception_edge_handled = true;
                             }
-                            // flowcontext.py:756-763 `block.exitswitch = w_cond`.
+                            // flowcontext.py `block.exitswitch = w_cond`.
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(bool_value.into()));
                             let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
@@ -9345,7 +9345,7 @@ impl CodeWriter {
                                 backward_jump_target(code, py_pc, instr, op_arg)
                             {
                                 if target_py_pc < num_instrs {
-                                    // interp_jit.py:118 `can_enter_jit` at each
+                                    // interp_jit.py `can_enter_jit` at each
                                     // backward jump → jtransform.py:1714-1723
                                     // lowers it to a `loop_header` op in the
                                     // jumping block, before the goto. The op
@@ -9474,7 +9474,7 @@ impl CodeWriter {
                             // resume, and the extra `getfield_vable_r` graph op
                             // misallocates against the inlined locals.  A
                             // non-portal callee instead keeps the
-                            // `flowcontext.py:856-859 find_global` const-fold,
+                            // `flowcontext.py find_global` const-fold,
                             // which the inliner needs as a foldable constant call
                             // target — EXCEPT for a mutable container (dict /
                             // list / set) or a function.  A container is grown
@@ -9706,7 +9706,7 @@ impl CodeWriter {
                             // with the upstream popvalue read
                             // (`pyframe.py:411-417` reads
                             // `locals_cells_stack_w[depth]` BEFORE clearing it,
-                            // `jtransform.py:1877 do_fixed_list_getitem`) so the
+                            // `jtransform.py do_fixed_list_getitem`) so the
                             // stack register has a producer on the straight-line
                             // jitcode path; a producer-less pinned variable
                             // leaves the register unbound for any execution that
@@ -9871,7 +9871,7 @@ impl CodeWriter {
                             }
                         }
 
-                        // flowcontext.py:1168-1170 BUILD_LIST — `items =
+                        // flowcontext.py BUILD_LIST — `items =
                         // self.popvalues(itemcount)` then `w_list =
                         // op.newlist(*items).eval(self)`.  The flowspace graph
                         // records a single `newlist` op; the array
@@ -9899,8 +9899,8 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             // Physically write the list into its value-stack slot
-                            // (`pyframe.py:389 pushvalue` → `setarrayitem_vable_r`
-                            // via `jtransform.py:1898 do_fixed_list_setitem`), not
+                            // (`pyframe.py pushvalue` → `setarrayitem_vable_r`
+                            // via `jtransform.py do_fixed_list_setitem`), not
                             // just bump the symbolic depth.  `LIST_APPEND` reads
                             // its accumulator back through `getarrayitem_vable_r`
                             // (the `Instruction::ListAppend` arm below), and the
@@ -9918,7 +9918,7 @@ impl CodeWriter {
                             emit_pushvalue_ref!(current_depth, current_depth, pushed, py_pc);
                         }
 
-                        // pyopcode.py:1463 BUILD_SLICE:
+                        // pyopcode.py BUILD_SLICE:
                         //   if numargs == 3: w_step = popvalue()
                         //   elif numargs == 2: w_step = space.w_None
                         //   w_end = popvalue(); w_start = popvalue()
@@ -9953,7 +9953,7 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // pyopcode.py:690 RAISE_VARARGS: argc=0 reraise,
+                        // pyopcode.py RAISE_VARARGS: argc=0 reraise,
                         // argc=1 normalize+raise, argc=2 pop cause + normalize+raise.
                         // `normalize_raise_varargs_fn` residual performs the
                         // exception_is_valid_obj_as_class_w instantiation and
@@ -10070,7 +10070,7 @@ impl CodeWriter {
                                 // the orthodox `flatten.py:make_exception_link`
                                 // catch-covered shape, identical to the
                                 // `Instruction::Reraise` arm — so blackhole
-                                // `handle_exception_in_frame` (`blackhole.py:396`)
+                                // `handle_exception_in_frame` (`blackhole.py`)
                                 // finds the byte-adjacent `catch_exception/L`.
                                 // `emit_reraise!` unconditionally links to
                                 // `graph.exceptblock` (no catch adjacency), so a
@@ -10141,7 +10141,7 @@ impl CodeWriter {
                                     // No enclosing handler, but the state carries a
                                     // live `last_exception` pair: function-level
                                     // exception exit via the orthodox `reraise/`
-                                    // coding (`flatten.py:163-174 make_exception_link`
+                                    // coding (`flatten.py make_exception_link`
                                     // matches `link.args == [last_exception,
                                     // last_exc_value]`).
                                     emit_reraise!();
@@ -10326,7 +10326,7 @@ impl CodeWriter {
                             // Runtime check = `isinstance(exc, match_type)` via
                             // compare_fn with ISINSTANCE_OP (tag 10). No
                             // flowspace-level shortcut — upstream
-                            // flowcontext.py:591 folds `cmp_exc_match` at analysis
+                            // flowcontext.py folds `cmp_exc_match` at analysis
                             // time, but pyre's shadow graph cannot observe the
                             // runtime exception type; the residual helper owns
                             // the check.
@@ -10448,7 +10448,7 @@ impl CodeWriter {
                         }
 
                         Instruction::Reraise { .. } => {
-                            // pyopcode.py:1357-1364 RERAISE:
+                            // pyopcode.py RERAISE:
                             //   oparg>=1: `int_w(self.peekvalue(oparg))` — the
                             //             lasti slot is PEEKED at depth oparg
                             //             below TOS and stays on the stack.
@@ -10470,9 +10470,9 @@ impl CodeWriter {
                             // Pyre's `emit_raise!` emits the `raise/r` insn
                             // and a graph link to `exceptblock` so the block
                             // has a proper terminator (mirrors
-                            // `flatten.py:189 make_exception_link`
+                            // `flatten.py make_exception_link`
                             // exception-edge shape).
-                            // pyframe.py:411-417 `popvalue_maybe_none` first
+                            // pyframe.py `popvalue_maybe_none` first
                             // reads `locals_cells_stack_w[depth - 1]`, then
                             // clears that exact slot.  Read the authoritative
                             // vable slot here before `emit_popvalue_ref!`
@@ -10523,7 +10523,7 @@ impl CodeWriter {
                             // a `finally` cleanup RERAISE, which CPython 3.11+
                             // reaches WITHOUT a `PUSH_EXC_INFO`, so the source
                             // FrameState carries no live `last_exception` pair.
-                            // `flatten.py:163-174 make_exception_link` emits the
+                            // `flatten.py make_exception_link` emits the
                             // `reraise/` coding only when the edge args ARE that
                             // pair; absent it, the orthodox coding is the explicit
                             // `raise/r` of the in-flight exception value — exactly
@@ -10634,7 +10634,7 @@ impl CodeWriter {
                         // current_depth must track interpreter parity so that
                         // subsequent CALL handlers don't underflow.
                         Instruction::LoadName { namei } => {
-                            // pyopcode.py:945-955 LOAD_NAME — w_locals probe +
+                            // pyopcode.py LOAD_NAME — w_locals probe +
                             // LOAD_GLOBAL fallback, a runtime namespace lookup
                             // that cannot fold at codewriter time (module-loop
                             // names mutate every iteration).  Record the
@@ -10660,7 +10660,7 @@ impl CodeWriter {
                             emit_pushvalue_ref!(current_depth, loaded_dst_reg, result_fv, py_pc);
                         }
                         Instruction::StoreName { namei } => {
-                            // pyopcode.py:855-859 STORE_NAME — pops the value
+                            // pyopcode.py STORE_NAME — pops the value
                             // and writes it into `w_locals` via the
                             // `store_name` HLOp → `bh_store_name_fn(frame,
                             // w_name, value)` residual call, which the
@@ -10680,7 +10680,7 @@ impl CodeWriter {
                             );
                         }
                         Instruction::StoreGlobal { namei } => {
-                            // pyopcode.py:934 STORE_GLOBAL — pops the value and
+                            // pyopcode.py STORE_GLOBAL — pops the value and
                             // writes it directly into `w_globals` (bypassing
                             // `w_locals`) via the `store_global` HLOp →
                             // `bh_store_global_fn(frame, w_name, value)`
@@ -11051,7 +11051,7 @@ impl CodeWriter {
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             // Physically write the iterator into its value-stack
-                            // slot (`pyframe.py:389 pushvalue` →
+                            // slot (`pyframe.py pushvalue` →
                             // `setarrayitem_vable_r` via `jtransform.py:1898
                             // do_fixed_list_setitem`), not just bump the symbolic
                             // depth.  The following FOR_ITER reads the iterator
@@ -11078,7 +11078,7 @@ impl CodeWriter {
                             // `w_iterator = self.peekvalue()`
                             // (pyopcode.py:1303-1304).  `peekvalue` reads
                             // `locals_cells_stack_w[index]`, which
-                            // `jtransform.py:760-767 do_fixed_list_getitem`
+                            // `jtransform.py do_fixed_list_getitem`
                             // lowers to `getarrayitem_vable_r` inside the loop
                             // body.  GET_ITER's `pushvalue` populated the slot
                             // via `setarrayitem_vable_r` (the
@@ -11109,7 +11109,7 @@ impl CodeWriter {
                             // are recovered via the register/liveness channel in
                             // `walker_capture_snapshot_for_last_guard_impl`
                             // (jitcode_dispatch.rs), porting
-                            // `get_list_of_active_boxes` (pyjitpl.py:177-234).
+                            // `get_list_of_active_boxes` (pyjitpl.py).
                             let iter_slot_depth = current_depth.saturating_sub(1);
                             let iter_abs_slot =
                                 (stack_base_absolute + iter_slot_depth as usize) as i64;
@@ -11533,7 +11533,7 @@ impl CodeWriter {
                             // carries the value exchange for the compiled trace.
                             // The two affected stack slots also mirror to the
                             // virtualizable array at `stack_base_absolute + depth`
-                            // (jtransform.py:1898 `do_fixed_list_setitem`, vable
+                            // (jtransform.py `do_fixed_list_setitem`, vable
                             // branch); a guard-failure resume walk reconstructs
                             // the live frame from those slots, so emit the crossed
                             // `setarrayitem_vable_r` writes that keep the mirror
@@ -11807,7 +11807,7 @@ impl CodeWriter {
 
                         // BuildTuple(count): pops count items, pushes 1 tuple. Net: -(count-1).
                         //
-                        // flowcontext.py:1163-1165 BUILD_TUPLE — `items =
+                        // flowcontext.py BUILD_TUPLE — `items =
                         // self.popvalues(itemcount)` then `w_tuple =
                         // op.newtuple(*items).eval(self)`.  The flowspace graph
                         // records a single `newtuple` op; the array
@@ -12888,7 +12888,7 @@ impl CodeWriter {
                             let idx = var_num.get(op_arg).as_usize() as u16;
                             // An absent `locals_w` slot means the local is
                             // undefined on at least one predecessor
-                            // (`framestate.py:105-114 union`); the legacy
+                            // (`framestate.py union`); the legacy
                             // `ConstantValue::None` sentinel represents the
                             // statically-unbound form. The walker has no SSA
                             // value for either shape, so read the physical frame
@@ -13157,7 +13157,7 @@ impl CodeWriter {
 
                         // UNARY_INVERT: pops `value`, pushes `~value` (net 0).
                         // The graph records the object-space `invert(value)` op
-                        // (pyopcode.py:653 `unaryoperation("invert")`); the
+                        // (pyopcode.py `unaryoperation("invert")`); the
                         // SSARepr lowering `lower_unary_invert_hlop_to_insn`
                         // turns it into `residual_call_r_r(unary_invert_fn,
                         // ListR[value])` computing `~value` through
@@ -13237,7 +13237,7 @@ impl CodeWriter {
                         // the unchanged cell for a cell slot, or the raw
                         // `value` for a non-cell slot. The result is stored
                         // back into the slot via `setarrayitem_vable_r`
-                        // (jtransform.py:1898 `do_fixed_list_setitem`),
+                        // (jtransform.py `do_fixed_list_setitem`),
                         // mirroring the STORE_FAST shadow write.
                         Instruction::StoreDeref { i } => {
                             let idx = i.get(op_arg).as_usize() as u16;
@@ -13348,7 +13348,7 @@ impl CodeWriter {
                             .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(idx as i64).into();
-                            // pyopcode.py:998 DELETE_FAST checks for an
+                            // pyopcode.py DELETE_FAST checks for an
                             // unbound local before clearing its slot. A
                             // statically unbound slot therefore raises
                             // unconditionally and performs no write.
@@ -13428,7 +13428,7 @@ impl CodeWriter {
                             set_last_bool_exitcase(&current_block.block(), false);
 
                             // The unbound arm raises before any clear,
-                            // matching pyopcode.py:998 DELETE_FAST. Keep
+                            // matching pyopcode.py DELETE_FAST. Keep
                             // last_instr at the deleting instruction so
                             // exception unwind and deopt share its frame
                             // coordinate.
@@ -13460,7 +13460,7 @@ impl CodeWriter {
 
                             // The bound arm is the continuing block. The
                             // clear is one PY_NULL write, matching
-                            // pyopcode.py:998 DELETE_FAST's single slot
+                            // pyopcode.py DELETE_FAST's single slot
                             // assignment after the check succeeds.
                             current_block = bound_block;
                             current_state = bound_state;
@@ -13476,7 +13476,7 @@ impl CodeWriter {
                                 None,
                                 py_pc as i64,
                             );
-                            // `framestate.py:105-114 union`: an undefined
+                            // `framestate.py union`: an undefined
                             // local is `None`, not a Constant(None).  The
                             // graph-side vable write above still carries
                             // the runtime PY_NULL sentinel.
@@ -13509,7 +13509,7 @@ impl CodeWriter {
                         }
 
                         // DELETE_DEREF clears the cell contents after checking
-                        // that they are bound (pyopcode.py:597 DELETE_DEREF).
+                        // that they are bound (pyopcode.py DELETE_DEREF).
                         Instruction::DeleteDeref { i } => {
                             let idx = i.get(op_arg).as_usize() as u16;
                             if pyre_interpreter::pyframe::class_scope_class_deref_is_name(
@@ -13935,7 +13935,7 @@ impl CodeWriter {
                     }
 
                     if !exception_edge_handled && let Some(catch_label) = catch_for_pc[py_pc] {
-                        // RPython `flowcontext.py:130-156 guessexception`
+                        // RPython `flowcontext.py guessexception`
                         // attaches an exception edge only to **canraise**
                         // ops — control-flow opcodes (POP_JUMP_IF_*,
                         // JUMP_*, RETURN_*, RAISE_*, RERAISE) do not
@@ -13985,7 +13985,7 @@ impl CodeWriter {
                             // Move the opcode's post-raise operations (vable
                             // mirror stores of the pushed result, vsd syncs)
                             // into the normal-flow successor — the
-                            // `unsimplify.py:44 split_block` shape.  The
+                            // `unsimplify.py split_block` shape.  The
                             // walker keeps emitting into the successor, so
                             // subsequent PCs land there.
                             let moved: Vec<super::flow::SpaceOperation> = current_block
@@ -14012,7 +14012,7 @@ impl CodeWriter {
                                 Some(next_state.clone()),
                             );
                             all_walker_blocks.push(next_block.clone());
-                            // `unsimplify.py:59-76 split_block` varmap rules:
+                            // `unsimplify.py split_block` varmap rules:
                             //   * a Variable PRODUCED by a moved op
                             //     (`vars_produced_in_new_block`) is defined
                             //     inside the successor — it must NOT be
@@ -14118,7 +14118,7 @@ impl CodeWriter {
                 if site.push_lasti {
                     push_fresh_ref(&mut current_state, &mut graph);
                 }
-                // `flatten.py:336-352 generate_last_exc` emits the
+                // `flatten.py generate_last_exc` emits the
                 // `last_exc_value` SSARepr op at flatten time only — there
                 // is no graph SpaceOperation counterpart, the Variable
                 // flows through `link.last_exc_value` and is materialised
@@ -14142,7 +14142,7 @@ impl CodeWriter {
                     .map(|(_, value)| value.clone())
                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                 current_state.stack.push(exc_value.clone());
-                // pyframe.py:503-510 + `eval.rs`'s `dropvaluesuntil` parity:
+                // pyframe.py + `eval.rs`'s `dropvaluesuntil` parity:
                 //
                 //     while frame.valuestackdepth > target_depth:
                 //         frame.pop()          # locals_cells_stack_w[d] = None
@@ -14188,9 +14188,9 @@ impl CodeWriter {
                         );
                     }
                 }
-                // pyframe.py:378-387 `pushvalue` semantics — each push writes
+                // pyframe.py `pushvalue` semantics — each push writes
                 // `locals_cells_stack_w[depth]` AND bumps `valuestackdepth`.
-                // jtransform.py:1898 `do_fixed_list_setitem` lowers the array
+                // jtransform.py `do_fixed_list_setitem` lowers the array
                 // write to `setarrayitem_vable_r`; jtransform.py:920-928
                 // lowers the `valuestackdepth` write to `setfield_vable_i`.
                 // Without this mirror, the handler's first opcode (and any
@@ -14206,7 +14206,7 @@ impl CodeWriter {
                     // vable-array write so the def-use chain matches the
                     // upstream "call result is the consumer's input" shape
                     // (`flowcontext.py:135-139` recorder pattern,
-                    // `jtransform.py:1898 do_fixed_list_setitem` for the
+                    // `jtransform.py do_fixed_list_setitem` for the
                     // array write).
                     {
                         let boxed_lasti = residual_call!(
@@ -14240,7 +14240,7 @@ impl CodeWriter {
                     depth += 1;
                     emit_vsd!(depth, site.handler_py_pc);
                 }
-                // `flatten.py:336-347 generate_last_exc` emits
+                // `flatten.py generate_last_exc` emits
                 // `last_exception` immediately before `last_exc_value` at
                 // every exception link landing where
                 // `link.last_exception` is in `link.args`.  pyre's walker
@@ -14251,15 +14251,15 @@ impl CodeWriter {
                 // output depends on (the slot itself has no live consumer
                 // — per-kind PyType makes type-discrimination implicit).
                 let _ = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                // `flatten.py:336-347 generate_last_exc` writes `last_exc_value`
+                // `flatten.py generate_last_exc` writes `last_exc_value`
                 // straight into `getcolor(handler_inputarg)`, and
-                // `insert_renamings` (flatten.py:311) excludes the exc value
+                // `insert_renamings` (flatten.py) excludes the exc value
                 // from the copy list.  `exc_value` is colored by the graph
                 // regalloc and its handler-entry slot is reconstructed from the
                 // per-PC pcdep resume map, so no walker slot pin is needed.
                 {
                     let depth_value = (stack_base_absolute + depth as usize) as i64;
-                    // pyframe.py:378-387 `pushvalue` semantics — graph
+                    // pyframe.py `pushvalue` semantics — graph
                     // dual-write of the stack mirror.
                     let v_idx: super::flow::FlowValue =
                         super::flow::Constant::signed(depth_value).into();
@@ -14279,7 +14279,7 @@ impl CodeWriter {
                 // RPython parity: `pypy/interpreter/pyopcode.py` exception
                 // handler entry pushes the lasti box (`push_lasti` arm) and
                 // the captured exc_value onto the value stack; both writes
-                // lower through `jtransform.py:1898 do_fixed_list_setitem`
+                // lower through `jtransform.py do_fixed_list_setitem`
                 // to `setarrayitem_vable_r` in the upstream graph.
                 //
                 // Push exc_value graph dual-write — LANDED above:
@@ -14395,7 +14395,7 @@ impl CodeWriter {
         super::simplify::remove_trivial_links(&graph);
 
         // rtyper-analog lowering: expand the flowspace `newlist`/`newtuple`
-        // ops (BUILD_LIST/BUILD_TUPLE, `flowcontext.py:1165,1170`) into the
+        // ops (BUILD_LIST/BUILD_TUPLE, `flowcontext.py`) into the
         // fixed-size `new_array_clear` + `setarrayitem_gc_r` +
         // `*_from_array` array build.  Must run before register allocation
         // so the fresh array Variables receive colours.
@@ -14408,13 +14408,13 @@ impl CodeWriter {
         // fallback Variables' colors).
         //
         // PyPy `regalloc.py` runs the CFG coalesce sweep BEFORE
-        // `flatten.py:154 insert_renamings` mutates the graph.  Collect the
+        // `flatten.py insert_renamings` mutates the graph.  Collect the
         // `link.args ↔ target.inputargs` pairs once here so the canonical
         // pass observes the pre-renaming graph.
         //
         // These pairs are pre-merged into the union-find BEFORE
         // `make_dependencies` in `perform_register_allocation_with_pairs`.
-        // PyPy `regalloc.py:79-96 coalesce_variables` + `:98-112
+        // PyPy `regalloc.py coalesce_variables` + `:98-112
         // _try_coalesce` coalesce a `link.args ↔ target.inputargs` pair only
         // when the two endpoints do NOT interfere (`v0 not in
         // dg.neighbours[w0]`, py:105); the pre-merge bypasses that check.
@@ -14865,7 +14865,7 @@ impl CodeWriter {
         // and chordal coloring guarantees uniqueness within any
         // simultaneously-live subset.
 
-        // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
+        // codewriter.py parity: `compute_liveness(ssarepr)` runs
         // AFTER regalloc + flatten, so the live-register indices the
         // pass writes into each `-live-` marker are already the
         // post-rename colors. `filter_liveness_in_place` then splits
@@ -14996,7 +14996,7 @@ impl CodeWriter {
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
     ) -> Option<PyJitCode> {
-        // call.py:167-169 — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
+        // call.py — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
         // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
         // before assembly so `JitCodeBuilder::finish()` can stamp them
         // alongside the body in a single object construction step,
@@ -15011,10 +15011,10 @@ impl CodeWriter {
         // pc_map[py_pc] currently holds SSARepr insn indices (returned by
         // SSAReprEmitter::current_pos()). Translate them to JitCode byte
         // offsets via ssarepr.insns_pos, populated during
-        // Assembler::assemble (assembler.py:41-44). Runtime readers
+        // Assembler::assemble (assembler.py). Runtime readers
         // (get_live_vars_info, resume dispatch) expect byte offsets.
         //
-        // `codewriter.py:67` `self.assembler.assemble(ssarepr, jitcode, num_regs)`
+        // `codewriter.py` `self.assembler.assemble(ssarepr, jitcode, num_regs)`
         // parity: borrow the CodeWriter's single Assembler so
         // `all_liveness` / `num_liveness_ops` continue to accumulate
         // across every jitcode compiled on this thread.
@@ -15640,7 +15640,7 @@ impl CodeWriter {
             after_residual_call_resume_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }
 
-        // call.py:148 `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
+        // call.py `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
         // the shell returned by `grab_initial_jitcodes`; pyre still
         // builds the populated `JitCode` as the final codewriter step, so
         // stamp the exact jdindex while constructing that populated object.
@@ -15716,7 +15716,7 @@ impl CodeWriter {
         ))
     }
 
-    /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
+    /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py).
     ///
     /// ```python
     /// def make_jitcodes(self, verbose=False):
@@ -15747,29 +15747,29 @@ impl CodeWriter {
     /// `grab_initial_jitcodes` reads its seed list from
     /// [`super::call::CallControl::jitdrivers_sd`]; callers register
     /// portals with [`Self::setup_jitdriver`] before invoking this
-    /// method (matching codewriter.py:74 — `setup_jitdriver` followed
+    /// method (matching codewriter.py — `setup_jitdriver` followed
     /// by `make_jitcodes` is the upstream order).
     pub fn make_jitcodes(&self) -> Vec<std::sync::Arc<PyJitCode>> {
-        // codewriter.py:75 `log.info("making JitCodes...")` — pyre has no
+        // codewriter.py `log.info("making JitCodes...")` — pyre has no
         // codewriter.py log channel, intentionally elided.
 
-        // codewriter.py:76 `self.callcontrol.grab_initial_jitcodes()`.
+        // codewriter.py `self.callcontrol.grab_initial_jitcodes()`.
         self.callcontrol().grab_initial_jitcodes();
         // codewriter.py:79-84 drain + per-jitcode assemble.
         let all_jitcodes = self.drain_unfinished_graphs();
-        // call.py:148 `jd.mainjitcode.jitdriver_sd = jd` — assign
+        // call.py `jd.mainjitcode.jitdriver_sd = jd` — assign
         // jdindex to each portal's populated `PyJitCode` AFTER the
         // drain so we use the actual position in
         // `CallControl.jitdrivers_sd` instead of a hardcoded `Some(0)`.
         self.assign_portal_jitdriver_indices();
         // codewriter.py:86-88 final log lines — elided.
-        // codewriter.py:89 `return all_jitcodes`.
+        // codewriter.py `return all_jitcodes`.
         all_jitcodes
     }
 
     /// Drain `CallControl.unfinished_graphs`.
     ///
-    /// RPython's `make_jitcodes` (codewriter.py:79-85) drains the queue
+    /// RPython's `make_jitcodes` (codewriter.py) drains the queue
     /// once and then calls `assembler.finished()`. Pyre runs the same
     /// drain from `make_jitcodes` so each batch ends with
     /// `assembler.finished()`
@@ -15783,7 +15783,7 @@ impl CodeWriter {
             let Some(code_ptr) = popped else {
                 break;
             };
-            // codewriter.py:80 `self.transform_graph_to_jitcode(graph,
+            // codewriter.py `self.transform_graph_to_jitcode(graph,
             //                     jitcode, verbose, len(all_jitcodes))`.
             //
             // Note: `transform_graph_to_jitcode`
@@ -15803,10 +15803,10 @@ impl CodeWriter {
             };
             let key = code_ptr as usize;
             let pyjitcode = self.callcontrol().publish_jitcode(key, pyjitcode);
-            // codewriter.py:81 `all_jitcodes.append(jitcode)`.
+            // codewriter.py `all_jitcodes.append(jitcode)`.
             all_jitcodes.push(pyjitcode);
         }
-        // codewriter.py:85 `self.assembler.finished(self.callcontrol.callinfocollection)`.
+        // codewriter.py `self.assembler.finished(self.callcontrol.callinfocollection)`.
         self.assembler
             .borrow_mut()
             .finished(&self.callcontrol().callinfocollection);
@@ -15827,7 +15827,7 @@ impl CodeWriter {
         pyre_jit_trace::state::setup_indirectcalltargets(targets);
     }
 
-    /// call.py:147-148 follow-up after the drain. `grab_initial_jitcodes`
+    /// call.py follow-up after the drain. `grab_initial_jitcodes`
     /// already binds `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`;
     /// the drain fills that same Arc in place, so this method only refreshes
     /// each jd from `CallControl.jitcodes[portal_graph]`. `finalize_jitcode` stamps
@@ -15871,7 +15871,7 @@ fn jump_target_forward(
 
 /// Single-source-of-truth backward-jump target calculation used by both
 /// the loop-header pre-scan (pypy/module/pypyjit/interp_jit.py:103) and
-/// the emitter (jtransform.py:1714 `handle_jit_marker__loop_header`).
+/// the emitter (jtransform.py `handle_jit_marker__loop_header`).
 ///
 /// Returns the target PC for `JumpBackward` (with `skip_caches` on the
 /// next-PC base) and `JumpBackwardNoInterrupt` (direct `py_pc + 1 - delta`
@@ -16016,7 +16016,7 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// JitCode cache — RPython: `CallControl.get_jitcode` (call.py:155-172).
+// JitCode cache — RPython: `CallControl.get_jitcode` (call.py).
 // The cache + `unfinished_graphs` queue live on `super::call::CallControl`;
 // `CallControl::get_jitcode` is the canonical entry point.
 // ---------------------------------------------------------------------------
@@ -16039,7 +16039,7 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 /// in the interpreter.
 pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
     let writer = CodeWriter::instance();
-    // codewriter.py:96-99 `setup_jitdriver(jd)` — register the
+    // codewriter.py `setup_jitdriver(jd)` — register the
     // portal so `grab_initial_jitcodes` finds it.
     writer.setup_jitdriver(super::call::JitDriverStaticData {
         portal_graph: code as *const pyre_interpreter::CodeObject,
@@ -16049,7 +16049,7 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
         // `Arc<PyJitCode>` from `get_jitcode(jd.portal_graph)`.
         mainjitcode: None,
     });
-    // codewriter.py:74 `make_jitcodes()` — drain everything pending.
+    // codewriter.py `make_jitcodes()` — drain everything pending.
     let jitcodes = writer.make_jitcodes();
     // RPython warmspot.py:281-282 stores the complete
     // `make_jitcodes()` result on MetaInterpStaticData before tracing
@@ -16082,7 +16082,7 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 /// `jit_merge_point` marker and the LOAD_GLOBAL /
 /// LOAD_CONST namespace split gate on `is_true_portal`.  Per-helper walker
 /// emit sites feed compile-time-known operands directly per
-/// `pyframe.py:509-510 getcode(): hint(self.pycode, promote=True)`.
+/// `pyframe.py getcode(): hint(self.pycode, promote=True)`.
 ///
 /// Per-helper migration status:
 ///   * `bh_load_const_fn(w_code_ptr, consti)` — **migrated**.  Walker emit
@@ -16104,7 +16104,7 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 ///     `W_Code`, and an inlined callee's `LOAD_GLOBAL` then indexed the
 ///     caller's `names` table (resolving the wrong global, e.g. calling
 ///     an int).  Same basis as the migrated LoadConst pycode ConstRef
-///     (`pyframe.py:509-510 getcode(): hint(self.pycode, promote=True)`)
+///     (`pyframe.py getcode(): hint(self.pycode, promote=True)`)
 ///     and safe for the same reason (see "Why LoadConst ConstRef works"
 ///     below): pycode is a promoted constant whose value equals the
 ///     pointer `getfield_vable_r` would read, so the QuasiimmutField key
@@ -16188,7 +16188,7 @@ pub fn compile_jitcode_for_callee(
     code: &pyre_interpreter::CodeObject,
 ) -> Vec<std::sync::Arc<PyJitCode>> {
     let writer = CodeWriter::instance();
-    // call.py:155-172 `get_jitcode(graph)` — insert skeleton if missing and
+    // call.py `get_jitcode(graph)` — insert skeleton if missing and
     // queue the graph for the drain.
     let _ = writer.callcontrol().get_jitcode(code);
     // codewriter.py:79-85 — drain the queued graph(s), then assembler.finished.
@@ -16202,7 +16202,7 @@ pub fn compile_jitcode_for_callee(
 /// `make_jitcodes()` handoff: the writer owns `CallControl.jitcodes`, and the
 /// trace-side staticdata stores the same populated JitCode objects.
 ///
-/// `call.py:155-172 CallControl.get_jitcode(graph)` keys its dictionary on
+/// `call.py CallControl.get_jitcode(graph)` keys its dictionary on
 /// graph identity; pyre's "graph identity" is the `*const CodeObject`
 /// pointer.  The trace recorder already has that pointer in hand when it
 /// calls into the writer, so consume it directly and assert it agrees with
@@ -16363,7 +16363,7 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
         // only from elsewhere (not from sequential fallthrough), so
         // they are real block entries.  Mirrors upstream's block
         // boundary at every terminator's `next_offset` candidate
-        // (`flowcontext.py:407-475 record_block` exits via terminator;
+        // (`flowcontext.py record_block` exits via terminator;
         // the pendingblocks queue picks up the next block).
         if matches!(
             scan_instr,
@@ -17294,7 +17294,7 @@ mod tests {
     /// Regression: `FrameState::mergeable_index_of` locates
     /// a Variable by its `VariableId` across locals / stack / last-exc
     /// positions and returns `None` for non-existent ids or non-Variable
-    /// FlowValues.  Mirrors `framestate.py:38-43` `mergeable()` layout.
+    /// FlowValues.  Mirrors `framestate.py` `mergeable()` layout.
     #[test]
     fn mergeable_index_of_finds_variables_across_locals_stack_and_last_exc() {
         let v_local = Variable::new(VariableId(0), Kind::Ref);
@@ -18847,7 +18847,7 @@ def f(i):
 
         assert_ne!(merged, existing_block);
         assert!(existing_block.dead());
-        // flowcontext.py:463 `self.pendingblocks.append(newblock)` parity.
+        // flowcontext.py `self.pendingblocks.append(newblock)` parity.
         assert_eq!(
             pendingblocks.len(),
             1,

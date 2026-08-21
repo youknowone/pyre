@@ -119,7 +119,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     };
 
     // Separate ops into before-call and after-call.  Upstream
-    // `rpython/flowspace/model.py:171-180` treats `Block.exitswitch` +
+    // `rpython/flowspace/model.py` treats `Block.exitswitch` +
     // `Block.exits` as the single CFG source of truth, so they move
     // together with the ops they guard into the merge block.
     let after_ops: Vec<SpaceOperation> = block.operations[op_index + 1..].to_vec();
@@ -344,7 +344,7 @@ fn remap_callee_values(
                 map.entry(var).or_insert_with(|| graph.alloc_value_var());
             }
         }
-        // Upstream `rpython/flowspace/model.py:224-229 getvariables`
+        // Upstream `rpython/flowspace/model.py getvariables`
         // walks `link.args` for every exit in addition to ops.  The
         // exitswitch variable is always a block-local value referenced
         // by the raising op / branch condition, so it is already in
@@ -1147,7 +1147,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
 /// CSE, and control-flow-shape consumers of this predicate.
 ///
 /// Dead-operation removal uses [`can_remove_op`] instead.  RPython keeps
-/// `LLOp.is_pure()` (`lloperation.py:82-93`) and `CanRemove`
+/// `LLOp.is_pure()` (`lloperation.py`) and `CanRemove`
 /// (`simplify.py:411-423`) as distinct predicates.
 pub fn is_pure_op(kind: &OpKind) -> bool {
     match kind {
@@ -1158,9 +1158,9 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::NewWithVtable { .. }
         | OpKind::NewArrayClear { .. }
         | OpKind::NewListClear { .. }
-        // `newlist` subclasses `HLOperation` (`operation.py:551-557`), not
+        // `newlist` subclasses `HLOperation` (`operation.py`), not
         // `PureOperation`; its DCE authorization comes from the high-level
-        // `simplify.py:411-418 CanRemove` list alone.
+        // `simplify.py CanRemove` list alone.
         | OpKind::NewList { .. } => false,
         // `OpKind::ConstInt` / `OpKind::ConstFloat` materialize a
         // `Variable` for a literal in pyre's IR.  There
@@ -1214,7 +1214,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         // Pure vtable slot read — `cast_pointer + getfield` chain
         // collapsed into one op (see `OpKind::VtableMethodPtr` doc).
         | OpKind::VtableMethodPtr { .. }
-        // `newtuple` is `PureOperation` (`operation.py:542-548`).
+        // `newtuple` is `PureOperation` (`operation.py`).
         | OpKind::NewTuple { .. }
         // `getslice` is registered `pure=True` for flowspace folding/CSE
         // (`operation.py:461`), but its possible exception excludes it from
@@ -1306,15 +1306,15 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
 }
 
 /// `true` iff `kind` may be removed when its result has no readers.
-/// Models RPython `simplify.py:411-423 CanRemove`, including the default
+/// Models RPython `simplify.py CanRemove`, including the default
 /// `raising_is_ok=False` used by `enum_ops_without_sideeffects()`.
 ///
 pub fn can_remove_op(kind: &OpKind) -> bool {
     match kind {
         // `newlist` is explicitly listed in `simplify.py:413` even though it
-        // is not a flowspace `PureOperation` (`operation.py:551-557`).
+        // is not a flowspace `PureOperation` (`operation.py`).
         OpKind::NewList { .. } => true,
-        // `getslice` is absent from `simplify.py:411-418 CanRemove` and is
+        // `getslice` is absent from `simplify.py CanRemove` and is
         // raising at `lloperation.py:578`, so
         // `enum_ops_without_sideeffects()` does not add it either.
         OpKind::GetSlice { .. } => false,
@@ -1459,21 +1459,21 @@ fn is_pure_binop_opname(opname: &str) -> bool {
 fn is_pure_unary_opname(opname: &str) -> bool {
     matches!(
         opname,
-        // `simplify.py:405-417` CanRemove — every entry registered as
+        // `simplify.py` CanRemove — every entry registered as
         // a 1-arg `add_operator(...)` at `flowspace/operation.py`.
-        //   id     operation.py:446
+        //   id     operation.py
         //   type   operation.py:447
-        //   repr   operation.py:450
+        //   repr   operation.py
         //   str    operation.py:451
-        //   len    operation.py:453
-        //   hash   operation.py:454
+        //   len    operation.py
+        //   hash   operation.py
         //   pos    operation.py:465
         //   neg    operation.py:466
         //   bool   operation.py:467
-        //   abs    operation.py:469
+        //   abs    operation.py
         //   hex    operation.py:470
         //   oct    operation.py:471
-        //   ord    operation.py:473
+        //   ord    operation.py
         //   invert operation.py:474
         //   int    operation.py:488
         //   float  operation.py:490
@@ -1497,7 +1497,7 @@ fn is_pure_unary_opname(opname: &str) -> bool {
         | "float"
         | "long"
         | "iter"
-        // `same_as` — `jtransform.py:246-248 rewrite_op_same_as`
+        // `same_as` — `jtransform.py rewrite_op_same_as`
         // explicitly drops the op + aliases the result.
         | "same_as"
         // `cast_pointer cast_ptr_to_int cast_int_to_ptr ...` — pure

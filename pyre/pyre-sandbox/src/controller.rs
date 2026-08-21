@@ -22,9 +22,9 @@ use indexmap::IndexMap;
 use crate::sandlib::{Console, SandboxPolicy, TimeoutControl};
 use crate::vfs::{Dir, FsNode, RealDir, RealFile};
 
-// pypy_interact.py:39 `argv0 = '/bin/pypy3-c'`.
+// pypy_interact.py `argv0 = '/bin/pypy3-c'`.
 const ARGV0: &str = "/bin/pypy3-c";
-// pypy_interact.py:40 `virtual_cwd = '/tmp'`.
+// pypy_interact.py `virtual_cwd = '/tmp'`.
 const VIRTUAL_CWD: &str = "/tmp";
 
 /// A monotonic "last activity" timestamp shared with the timeout watchdog. The
@@ -96,7 +96,7 @@ impl Watchdog {
     }
 }
 
-/// pypy_interact.py:43 `build_virtual_root`.
+/// pypy_interact.py `build_virtual_root`.
 ///
 /// `lib_root`, when present, is mounted read-only at `/bin/lib` so the child can
 /// import the standard library; an import-free script needs only the executable
@@ -141,7 +141,7 @@ pub struct PyPySandboxedProc {
 }
 
 impl PyPySandboxedProc {
-    /// pypy_interact.py:66 `__init__` + sandlib.py:`SandboxedProc.__init__`.
+    /// pypy_interact.py `__init__` + sandlib.py:`SandboxedProc.__init__`.
     ///
     /// Spawns `executable` (the real sandbox binary) with argv[0] forced to
     /// `/bin/pypy3-c`, a cleared environment, and piped stdin/stdout.
@@ -166,13 +166,13 @@ impl PyPySandboxedProc {
             Some(_) => vec![(b"PYRE_STDLIB".to_vec(), b"/bin/lib".to_vec())],
             None => Vec::new(),
         };
-        // pypy_interact.py:41 `virtual_console_isatty = True`.
+        // pypy_interact.py `virtual_console_isatty = True`.
         let mut policy = SandboxPolicy::new(virtual_root, VIRTUAL_CWD, virtual_env, true);
-        // VirtualizedSocketProc (sandlib.py:546): the operator opts into
+        // VirtualizedSocketProc (sandlib.py): the operator opts into
         // `tcp://` mediation with `--allow-net`; the default policy is
         // network-closed.
         policy.set_allow_net(allow_net);
-        // setlogfile (sandlib.py:334): `--log FILE` appends the guest's stdin
+        // setlogfile (sandlib.py): `--log FILE` appends the guest's stdin
         // to FILE. Open eagerly so a bad path fails before the child starts.
         if let Some(path) = log_file {
             let file = std::fs::OpenOptions::new()

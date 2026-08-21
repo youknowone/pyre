@@ -2,7 +2,7 @@
 //! `ResumeGuardDescr`) — moved here from `majit-metainterp::resume` as
 //! part of the Phase C-1 cascade toward backend struct deletion.
 //!
-//! `compile.py:855 AbstractResumeGuardDescr._attrs_` resume payload
+//! `compile.py AbstractResumeGuardDescr._attrs_` resume payload
 //! references these tags through `rd_virtuals` / pending field
 //! sources; placing them in a backend-accessible crate lets the
 //! eventual `ResumeGuardDescr` definition live where the backend
@@ -256,7 +256,7 @@ pub fn resume_value_layout_summary_from_exit_value_source(
 /// - VRawBufferInfo (raw memory buffer)
 #[derive(Debug, Clone)]
 pub enum VirtualInfo {
-    /// resume.py:612 VirtualInfo(descr, fielddescrs).
+    /// resume.py VirtualInfo(descr, fielddescrs).
     VirtualObj {
         /// resume.py:615 self.descr — live SizeDescr.
         descr: Option<DescrRef>,
@@ -267,7 +267,7 @@ pub enum VirtualInfo {
         fielddescrs: Vec<FieldDescrInfo>,
         descr_size: usize,
     },
-    /// resume.py:628 VStructInfo(typedescr, fielddescrs).
+    /// resume.py VStructInfo(typedescr, fielddescrs).
     VStruct {
         /// resume.py:631 self.typedescr — the full SizeDescr.
         typedescr: Option<DescrRef>,
@@ -276,16 +276,16 @@ pub enum VirtualInfo {
         fielddescrs: Vec<FieldDescrInfo>,
         descr_size: usize,
     },
-    /// resume.py:643-684 AbstractVArrayInfo (from NEW_ARRAY).
+    /// resume.py AbstractVArrayInfo (from NEW_ARRAY).
     VArray {
         /// resume.py:646: self.arraydescr
         arraydescr: Option<DescrRef>,
-        /// resume.py:680-683: VArrayInfoClear.clear / VArrayInfoNotClear.clear
+        /// resume.py: VArrayInfoClear.clear / VArrayInfoNotClear.clear
         clear: bool,
         /// Element values.
         items: Vec<VirtualFieldSource>,
     },
-    /// resume.py:736 VArrayStructInfo (from arrays with interior field access).
+    /// resume.py VArrayStructInfo (from arrays with interior field access).
     VArrayStruct {
         /// resume.py:739: self.arraydescr
         arraydescr: Option<DescrRef>,
@@ -295,7 +295,7 @@ pub enum VirtualInfo {
         /// Per-element fields: outer Vec = elements, inner Vec = (field_index, source).
         element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
     },
-    /// resume.py:692 VRawBufferInfo(func, size, offsets, descrs).
+    /// resume.py VRawBufferInfo(func, size, offsets, descrs).
     VRawBuffer {
         /// resume.py:694: self.func — raw malloc function pointer.
         func: i64,
@@ -316,12 +316,12 @@ pub enum VirtualInfo {
         /// Source of the parent buffer.
         parent: VirtualFieldSource,
     },
-    /// resume.py:763 VStrPlainInfo — virtual string (known characters).
+    /// resume.py VStrPlainInfo — virtual string (known characters).
     VStrPlain {
         /// Character values (as OpRef sources).
         chars: Vec<VirtualFieldSource>,
     },
-    /// resume.py:781 VStrConcatInfo — virtual string concat (left + right).
+    /// resume.py VStrConcatInfo — virtual string concat (left + right).
     /// OS_STR_CONCAT funcptr is resolved at materialization via
     /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
     /// (resume.py:1467-1468); the layout carries no funcptr.
@@ -329,7 +329,7 @@ pub enum VirtualInfo {
         left: Box<VirtualFieldSource>,
         right: Box<VirtualFieldSource>,
     },
-    /// resume.py:801 VStrSliceInfo — virtual string slice. OS_STR_SLICE
+    /// resume.py VStrSliceInfo — virtual string slice. OS_STR_SLICE
     /// funcptr resolved via callinfocollection at materialization
     /// (resume.py:1477-1478).
     VStrSlice {
@@ -337,16 +337,16 @@ pub enum VirtualInfo {
         start: Box<VirtualFieldSource>,
         length: Box<VirtualFieldSource>,
     },
-    /// resume.py:817 VUniPlainInfo — virtual unicode string.
+    /// resume.py VUniPlainInfo — virtual unicode string.
     VUniPlain { chars: Vec<VirtualFieldSource> },
-    /// resume.py:836 VUniConcatInfo — virtual unicode concat.
+    /// resume.py VUniConcatInfo — virtual unicode concat.
     /// OS_UNI_CONCAT funcptr resolved via callinfocollection
     /// (resume.py:1494-1495).
     VUniConcat {
         left: Box<VirtualFieldSource>,
         right: Box<VirtualFieldSource>,
     },
-    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
+    /// resume.py VUniSliceInfo — virtual unicode slice.
     /// OS_UNI_SLICE funcptr resolved via callinfocollection
     /// (resume.py:1504-1505).
     VUniSlice {
@@ -627,7 +627,7 @@ pub struct ResumeData {
 
 /// Deferred heap write to replay during resume.
 ///
-/// `resume.py:87-92 PENDINGFIELDSTRUCT` parity — carries the live
+/// `resume.py PENDINGFIELDSTRUCT` parity — carries the live
 /// `lldescr` Arc.  Identity via `Arc::ptr_eq` (`history.py:125`).
 #[derive(Debug, Clone)]
 pub struct PendingFieldInfo {

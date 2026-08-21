@@ -5,14 +5,14 @@
 
 use crate::{DescrRef, GcRef, OpRef};
 
-/// rawbuffer.py:13 RawBuffer — 4 parallel lists: offsets, lengths, descrs, values.
+/// rawbuffer.py RawBuffer — 4 parallel lists: offsets, lengths, descrs, values.
 /// Sorted by offset. Invariant: offsets[i]+lengths[i] <= offsets[i+1].
 #[derive(Clone, Debug)]
 pub struct RawBuffer {
     /// rawbuffer.py:14: self.offsets — signed because RPython's
     /// unbounded int allows `basesize + itemsize*index` to be negative
     /// when `index < 0`. `write_value` keeps the list sorted using
-    /// signed comparison (rawbuffer.py:104 `self.offsets[i] > offset`).
+    /// signed comparison (rawbuffer.py `self.offsets[i] > offset`).
     offsets: Vec<i64>,
     /// rawbuffer.py:15: self.lengths — always non-negative (unsigned
     /// upstream itemsize from `unpack_arraydescr_size`).
@@ -23,14 +23,14 @@ pub struct RawBuffer {
     values: Vec<OpRef>,
 }
 
-/// rawbuffer.py:4 `InvalidRawOperation` — base class caught by the optimizer.
+/// rawbuffer.py `InvalidRawOperation` — base class caught by the optimizer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvalidRawOperation {
     InvalidRawWrite(InvalidRawWrite),
     InvalidRawRead(InvalidRawRead),
 }
 
-/// rawbuffer.py:7 `InvalidRawWrite`.
+/// rawbuffer.py `InvalidRawWrite`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvalidRawWrite {
     /// A write overlaps with an existing write, or a same-offset write has
@@ -43,7 +43,7 @@ pub enum InvalidRawWrite {
     },
 }
 
-/// rawbuffer.py:10 `InvalidRawRead`.
+/// rawbuffer.py `InvalidRawRead`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvalidRawRead {
     /// A read from an offset that was never written.
@@ -139,7 +139,7 @@ impl RawBuffer {
             .collect()
     }
 
-    /// rawbuffer.py:83: _descrs_are_compatible(d1, d2)
+    /// rawbuffer.py: _descrs_are_compatible(d1, d2)
     /// Two arraydescrs are compatible if they have the same basesize,
     /// itemsize and sign.
     fn descrs_are_compatible(d1: &DescrRef, d2: &DescrRef) -> bool {
@@ -151,7 +151,7 @@ impl RawBuffer {
             && a1.is_item_signed() == a2.is_item_signed()
     }
 
-    /// rawbuffer.py:89: write_value(offset, length, descr, value).
+    /// rawbuffer.py: write_value(offset, length, descr, value).
     ///
     /// Maintains sorted order by offset. Same-offset update only
     /// replaces value (rawbuffer.py:102), never descr.
@@ -249,7 +249,7 @@ impl RawBuffer {
         Ok(())
     }
 
-    /// rawbuffer.py:120: read_value(offset, length, descr).
+    /// rawbuffer.py: read_value(offset, length, descr).
     pub fn read_value(
         &self,
         offset: i64,
@@ -434,7 +434,7 @@ mod tests {
         );
     }
 
-    /// test_rawbuffer.py:66 test_unpack_descrs
+    /// test_rawbuffer.py test_unpack_descrs
     /// Two different descr objects with same (basesize, itemsize, signed)
     /// must be compatible. Different signed-ness must be incompatible.
     #[test]

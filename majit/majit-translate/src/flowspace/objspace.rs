@@ -31,7 +31,7 @@ use super::pygraph::PyGraph;
 /// the caller's — RPython functions must always set this.
 pub const CO_NEWLOCALS: u32 = 0x0002;
 
-/// RPython `objspace.py:14-35` — `_assert_rpythonic(func)`.
+/// RPython `objspace.py` — `_assert_rpythonic(func)`.
 ///
 /// Raises a structural error when `func` cannot be flow-analysed.
 /// Equivalent upstream exceptions collapse into [`FlowContextError`]
@@ -103,7 +103,7 @@ fn _assert_rpythonic(func: &GraphFunc) -> Result<(), FlowContextError> {
     Ok(())
 }
 
-/// RPython `objspace.py:38-53` — `build_flow(func)`.
+/// RPython `objspace.py` — `build_flow(func)`.
 ///
 /// Create the flow graph (in SSA form) for the function. Ownership of
 /// the returned `FunctionGraph` transfers to the caller.

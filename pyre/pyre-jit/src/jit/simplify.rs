@@ -1,7 +1,7 @@
 //! Port of `rpython/translator/simplify.py::simplify_graph` onto pyre-jit's
 //! flow graph (`super::flow`).
 //!
-//! RPython runs `simplify_graph(graph)` (`translator.py:55-56`) right after
+//! RPython runs `simplify_graph(graph)` (`translator.py`) right after
 //! `build_flow`, so every graph reaching the codewriter
 //! (`perform_register_allocation → flatten_graph → compute_liveness →
 //! assemble`) is already normalized.  pyre-jit's walker fuses graph-build and
@@ -55,7 +55,7 @@ use super::flow::{
     FunctionGraph, LinkRef, SpaceOperation, SpaceOperationArg, Variable, mkentrymap,
 };
 
-/// `rpython/translator/simplify.py:52-69` `eliminate_empty_blocks`.
+/// `rpython/translator/simplify.py` `eliminate_empty_blocks`.
 /// Port reference: `majit-translate/src/translator/simplify.rs`'s
 /// `eliminate_empty_blocks`.
 ///
@@ -138,7 +138,7 @@ pub fn eliminate_empty_blocks(graph: &FunctionGraph) {
     }
 }
 
-/// `rpython/translator/simplify.py:242-268` `remove_trivial_links`.
+/// `rpython/translator/simplify.py` `remove_trivial_links`.
 /// Port reference: `majit-translate/src/translator/simplify.rs`'s
 /// `remove_trivial_links`.
 ///
@@ -246,7 +246,7 @@ pub fn remove_trivial_links(graph: &FunctionGraph) {
 
 // ── remove_identical_vars_SSA + supporting helpers ──────────────────────
 
-/// `simplify.py:526-531` `class Representative`.  Stores the partition's
+/// `simplify.py` `class Representative`.  Stores the partition's
 /// representative value; `absorb` is a no-op so the info that wins the
 /// weighted union keeps its `rep`.
 #[derive(Clone, Debug)]
@@ -258,7 +258,7 @@ impl UnionFindInfo for Representative {
     fn absorb(&mut self, _other: Self) {}
 }
 
-/// `simplify.py:533-535` `all_equal`.
+/// `simplify.py` `all_equal`.
 fn all_equal(lst: &[FlowValue]) -> bool {
     match lst.first() {
         None => true,
@@ -266,7 +266,7 @@ fn all_equal(lst: &[FlowValue]) -> bool {
     }
 }
 
-/// `simplify.py:537-538` `isspecialvar`.
+/// `simplify.py` `isspecialvar`.
 fn isspecialvar(v: &FlowValue) -> bool {
     match v {
         FlowValue::Variable(var) => {
@@ -277,7 +277,7 @@ fn isspecialvar(v: &FlowValue) -> bool {
     }
 }
 
-/// `model.py:350 Variable.replace` generalized to a `Variable → FlowValue`
+/// `model.py Variable.replace` generalized to a `Variable → FlowValue`
 /// renaming: a Variable in `mapping` becomes its mapped value, any other
 /// Variable and any Constant is returned unchanged.
 fn rename_value(v: &FlowValue, mapping: &HashMap<Variable, FlowValue>) -> FlowValue {
@@ -304,7 +304,7 @@ fn rename_arg(
                 .map(|value| rename_value(value, mapping))
                 .collect(),
         }),
-        // `flatten.py:365-367` passes AbstractDescr / IndirectCallTargets
+        // `flatten.py` passes AbstractDescr / IndirectCallTargets
         // through unchanged.
         SpaceOperationArg::Descr(_) | SpaceOperationArg::IndirectCallTargets(_) => arg.clone(),
     }
@@ -327,7 +327,7 @@ fn rename_exitswitch(sw: &ExitSwitch, mapping: &HashMap<Variable, FlowValue>) ->
     }
 }
 
-/// `model.py:241-247 Block.renamevariables`, generalized to a
+/// `model.py Block.renamevariables`, generalized to a
 /// `Variable → FlowValue` mapping (the rep can be a Constant) and extended to
 /// the `last_exception` / `last_exc_value` link extras, mirroring the
 /// `majit-translate` `renamevariables_hl`.
@@ -388,7 +388,7 @@ fn renamevariables_value(block: &BlockRef, mapping: &HashMap<Variable, FlowValue
     }
 }
 
-/// `rpython/translator/simplify.py:540-595` `remove_identical_vars_SSA`.
+/// `rpython/translator/simplify.py` `remove_identical_vars_SSA`.
 /// Port reference: `majit-translate/src/translator/simplify.rs`'s
 /// `remove_identical_vars_SSA`.
 ///
@@ -521,7 +521,7 @@ fn simplify_phis_inner(
 
 // ── constfold_exitswitch ────────────────────────────────────────────────
 
-/// `rpython/translator/simplify.py:36-48` `replace_exitswitch_by_constant`.
+/// `rpython/translator/simplify.py` `replace_exitswitch_by_constant`.
 /// Port reference: `majit-translate/src/translator/simplify.rs`'s
 /// `replace_exitswitch_by_constant`.
 ///
@@ -580,7 +580,7 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
     newexits
 }
 
-/// `rpython/translator/simplify.py:218-239` `constfold_exitswitch`.
+/// `rpython/translator/simplify.py` `constfold_exitswitch`.
 /// Port reference: `majit-translate/src/translator/simplify.rs`'s
 /// `constfold_exitswitch`.
 ///
@@ -629,7 +629,7 @@ pub fn constfold_exitswitch(graph: &FunctionGraph) {
 
 // ── simplify_exceptions (structural adaptation — see classification) ─────
 
-/// `rpython/translator/simplify.py:110-170` `simplify_exceptions`.
+/// `rpython/translator/simplify.py` `simplify_exceptions`.
 ///
 /// **Classification (issue #112 scope #4): structural adaptation.**
 ///
@@ -689,7 +689,7 @@ pub fn simplify_exceptions(graph: &FunctionGraph) {
 
 // ── transform_dead_op_vars ──────────────────────────────────────────────
 
-/// `rpython/translator/simplify.py:405-417` `CanRemove` — the fixed opname set
+/// `rpython/translator/simplify.py` `CanRemove` — the fixed opname set
 /// of side-effect-free operations.  The upstream `enum_ops_without_sideeffects()`
 /// addition (the LL-operation table, `simplify.py:414-416`) has no pyre-jit
 /// equivalent: pyre-jit's flow ops are CPython-bytecode-derived, not RPython LL
@@ -752,7 +752,7 @@ fn can_remove_opname(op: &str) -> bool {
     CAN_REMOVE.contains(&op)
 }
 
-/// `rpython/translator/simplify.py:397-524` `transform_dead_op_vars`
+/// `rpython/translator/simplify.py` `transform_dead_op_vars`
 /// (`transform_dead_op_vars_in_blocks`).  Port reference:
 /// `majit-translate/src/translator/simplify.rs`'s `transform_dead_op_vars`.
 ///
@@ -936,7 +936,7 @@ pub fn transform_dead_op_vars(graph: &FunctionGraph) {
 // documented no-op with a tripwire that panics if the target shape appears,
 // signalling that the full pass must then be ported.
 
-/// `rpython/translator/simplify.py:656-699` `coalesce_bool`.
+/// `rpython/translator/simplify.py` `coalesce_bool`.
 /// Classification (scope #4): structural adaptation (no `bool` op present).
 pub fn coalesce_bool(graph: &FunctionGraph) {
     for block in graph.iterblocks() {
@@ -952,7 +952,7 @@ pub fn coalesce_bool(graph: &FunctionGraph) {
     }
 }
 
-/// `rpython/translator/simplify.py:172-186` `transform_xxxitem`.
+/// `rpython/translator/simplify.py` `transform_xxxitem`.
 /// Classification (scope #4): structural adaptation (no `getitem` raising-op,
 /// and pyre-jit has no flowspace `IndexError` exitcase oracle).
 pub fn transform_xxxitem(graph: &FunctionGraph) {
@@ -969,7 +969,7 @@ pub fn transform_xxxitem(graph: &FunctionGraph) {
     }
 }
 
-/// `rpython/translator/simplify.py:71-108` `transform_ovfcheck`.
+/// `rpython/translator/simplify.py` `transform_ovfcheck`.
 /// Classification (scope #4): structural adaptation.  `ovfcheck` is an RPython
 /// `rlib` function the flowspace emits as a `simple_call`; the CPython-bytecode
 /// walker never emits it, and `OverflowingOperation.ovfchecked()` (the `<op>_ovf`
@@ -997,7 +997,7 @@ pub fn transform_ovfcheck(graph: &FunctionGraph) {
 // pyre-jit exception *exits* legitimately exist, so a shape tripwire would
 // false-fire.
 
-/// `rpython/translator/simplify.py:189-216` `remove_dead_exceptions`.
+/// `rpython/translator/simplify.py` `remove_dead_exceptions`.
 /// Classification (scope #4): structural adaptation.  The pass merges/prunes
 /// exception exits via `issubclass(case, member)` (`simplify.py:205,210`); pyre-jit
 /// represents exception exitcases as opaque host-object handles with no subclass
@@ -1008,7 +1008,7 @@ pub fn remove_dead_exceptions(_graph: &FunctionGraph) {
     // the `issubclass` oracle is unavailable.
 }
 
-/// `rpython/translator/simplify.py:321-346` `remove_assertion_errors`.
+/// `rpython/translator/simplify.py` `remove_assertion_errors`.
 /// Classification (scope #4): structural adaptation.  Removes branches that go
 /// directly to `graph.exceptblock` raising a `Constant(AssertionError)` — RPython's
 /// `_implicit_` exception shape (`flowcontext.py`).  The CPython-bytecode walker
@@ -1021,7 +1021,7 @@ pub fn remove_assertion_errors(_graph: &FunctionGraph) {
 
 // ── checkgraph + the simplify_graph driver ──────────────────────────────
 
-/// `rpython/flowspace/model.py:568-667` `checkgraph(graph)` — the pyre-jit
+/// `rpython/flowspace/model.py` `checkgraph(graph)` — the pyre-jit
 /// structural subset.
 ///
 /// The full upstream checker validates SSA/SSI definition, exception-link
@@ -1050,7 +1050,7 @@ pub fn checkgraph(graph: &FunctionGraph) {
     }
 }
 
-/// `rpython/translator/simplify.py:1060-1073` `all_passes`.
+/// `rpython/translator/simplify.py` `all_passes`.
 ///
 /// The order matches upstream exactly.  This uses the faithful
 /// operations-based [`eliminate_empty_blocks`] above (NOT the walker-only
@@ -1074,7 +1074,7 @@ pub fn all_passes() -> &'static [fn(&FunctionGraph)] {
     ]
 }
 
-/// `rpython/translator/simplify.py:1075-1081` `simplify_graph(graph, passes=True)`.
+/// `rpython/translator/simplify.py` `simplify_graph(graph, passes=True)`.
 ///
 /// ```py
 /// def simplify_graph(graph, passes=True):

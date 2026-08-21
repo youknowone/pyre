@@ -3,22 +3,22 @@
 //! `callparse` walks a `HighLevelOp` (`simple_call` / `call_args`) and
 //! emits the low-level argument list expected by the callee
 //! [`crate::flowspace::pygraph::PyGraph`]. It is the bridge that
-//! [`super::rpbc::FunctionReprBase::call`] depends on (rpbc.py:199).
+//! [`super::rpbc::FunctionReprBase::call`] depends on (rpbc.py).
 //!
 //! The port follows upstream class-by-class:
 //!
-//! * `class ArgumentsForRtype(ArgumentsForTranslation)` (callparse.py:7-14)
+//! * `class ArgumentsForRtype(ArgumentsForTranslation)` (callparse.py)
 //!   — overrides `newtuple` / `unpackiterable` so `_match_signature`
 //!   returns [`Holder`] instances instead of [`crate::annotator::model::SomeTuple`].
-//! * `class Holder` (callparse.py:73-88) — base class with an `_emit`
+//! * `class Holder` (callparse.py) — base class with an `_emit`
 //!   cache; cached emit is a per-Holder side table.
-//! * `class VarHolder(Holder)` (callparse.py:91-110) — wraps a positional
+//! * `class VarHolder(Holder)` (callparse.py) — wraps a positional
 //!   argument index with its `SomeValue` annotation.
-//! * `class ConstHolder(Holder)` (callparse.py:112-124) — wraps a default
+//! * `class ConstHolder(Holder)` (callparse.py) — wraps a default
 //!   value or stararg constant.
-//! * `class NewTupleHolder(Holder)` (callparse.py:127-152) — synthetic
+//! * `class NewTupleHolder(Holder)` (callparse.py) — synthetic
 //!   tuple built from peers (e.g. stararg unpack rewrap).
-//! * `class ItemHolder(Holder)` (callparse.py:155-164) — projects the
+//! * `class ItemHolder(Holder)` (callparse.py) — projects the
 //!   `index`-th item of a tuple-typed parent holder.
 //!
 //! ## TODO: `ArgumentsForRtype` storage duplication
@@ -45,7 +45,7 @@
 //!
 //! ## TODO: `Holder::Item` parent sharing
 //!
-//! Upstream `VarHolder.items()` (callparse.py:100-103) builds
+//! Upstream `VarHolder.items()` (callparse.py) builds
 //! `ItemHolder(self, i)` so every sibling `ItemHolder` shares the
 //! `self` parent (Python reference semantics). Pyre's [`Holder::item`]
 //! wraps a `Box<Holder>` whose construction at [`Holder::items`]
@@ -73,7 +73,7 @@ use crate::translator::rtyper::rtuple::TupleRepr;
 use crate::translator::rtyper::rtyper::{HighLevelOp, RPythonTyper};
 
 // ---------------------------------------------------------------------
-// callparse.py:7-14 — class ArgumentsForRtype(ArgumentsForTranslation):
+// callparse.py — class ArgumentsForRtype(ArgumentsForTranslation):
 // ---------------------------------------------------------------------
 
 /// RPython `class ArgumentsForRtype(ArgumentsForTranslation)`
@@ -102,7 +102,7 @@ impl ArgumentsForRtype {
         }
     }
 
-    /// RPython `CallSpec.__init__` full form (flowspace/argument.py:80-84).
+    /// RPython `CallSpec.__init__` full form (flowspace/argument.py).
     pub fn with_keywords_and_stararg(
         arguments_w: Vec<Holder>,
         keywords: HashMap<String, Holder>,
@@ -143,7 +143,7 @@ impl ArgumentsForRtype {
     }
 
     /// RPython `ArgumentsForRtype.newtuple(self, items)`
-    /// (callparse.py:8-9): `return NewTupleHolder(items)`.
+    /// (callparse.py): `return NewTupleHolder(items)`.
     pub fn newtuple(items: Vec<Holder>) -> Holder {
         Holder::new_tuple(items)
     }
@@ -225,7 +225,7 @@ impl ArgumentsForRtype {
             });
         }
 
-        // upstream argument.py:72 — `assert not signature.has_kwarg()`.
+        // upstream argument.py — `assert not signature.has_kwarg()`.
         assert!(
             !signature.has_kwarg(),
             "signature.has_kwarg() not supported"
@@ -344,7 +344,7 @@ impl ArgumentsForRtype {
 }
 
 // ---------------------------------------------------------------------
-// callparse.py:73-164 — Holder hierarchy.
+// callparse.py — Holder hierarchy.
 // ---------------------------------------------------------------------
 
 /// RPython `class Holder(object)` + four direct subclasses
@@ -361,7 +361,7 @@ impl ArgumentsForRtype {
 /// repr is the same allocation.
 #[derive(Clone, Debug)]
 pub enum Holder {
-    /// RPython `class VarHolder(Holder)` (callparse.py:91-110).
+    /// RPython `class VarHolder(Holder)` (callparse.py).
     Var {
         /// RPython `VarHolder.num` — index into `hop.args_v`.
         num: usize,
@@ -370,21 +370,21 @@ pub enum Holder {
         s_obj: Box<SomeValue>,
         cache: RefCell<HashMap<usize, Hlvalue>>,
     },
-    /// RPython `class ConstHolder(Holder)` (callparse.py:112-124).
+    /// RPython `class ConstHolder(Holder)` (callparse.py).
     Const {
         /// RPython `ConstHolder.value` — the untyped Python value;
         /// pyre carries it as a [`ConstValue`].
         value: ConstValue,
         cache: RefCell<HashMap<usize, Hlvalue>>,
     },
-    /// RPython `class NewTupleHolder(Holder)` (callparse.py:127-152).
+    /// RPython `class NewTupleHolder(Holder)` (callparse.py).
     NewTuple {
         /// RPython `NewTupleHolder.holders` — items of the synthetic
         /// tuple.
         holders: Vec<Holder>,
         cache: RefCell<HashMap<usize, Hlvalue>>,
     },
-    /// RPython `class ItemHolder(Holder)` (callparse.py:155-164).
+    /// RPython `class ItemHolder(Holder)` (callparse.py).
     Item {
         /// RPython `ItemHolder.holder` — parent tuple holder.
         holder: Box<Holder>,
@@ -395,7 +395,7 @@ pub enum Holder {
 }
 
 impl Holder {
-    /// RPython `VarHolder(num, s_obj)` (callparse.py:91-95).
+    /// RPython `VarHolder(num, s_obj)` (callparse.py).
     pub fn var(num: usize, s_obj: SomeValue) -> Self {
         Holder::Var {
             num,
@@ -404,7 +404,7 @@ impl Holder {
         }
     }
 
-    /// RPython `ConstHolder(value)` (callparse.py:112-114).
+    /// RPython `ConstHolder(value)` (callparse.py).
     pub fn const_(value: ConstValue) -> Self {
         Holder::Const {
             value,
@@ -412,7 +412,7 @@ impl Holder {
         }
     }
 
-    /// RPython `ItemHolder(holder, index)` (callparse.py:155-158).
+    /// RPython `ItemHolder(holder, index)` (callparse.py).
     pub fn item(holder: Holder, index: usize) -> Self {
         Holder::Item {
             holder: Box::new(holder),
@@ -421,7 +421,7 @@ impl Holder {
         }
     }
 
-    /// RPython `NewTupleHolder.__new__(cls, holders)` (callparse.py:127-137).
+    /// RPython `NewTupleHolder.__new__(cls, holders)` (callparse.py).
     ///
     /// Upstream short-circuits when every input is an `ItemHolder` over
     /// the same parent and the count matches the parent's `items()`
@@ -455,7 +455,7 @@ impl Holder {
         }
     }
 
-    /// RPython `Holder.is_tuple()` (callparse.py:75-76 → `False`,
+    /// RPython `Holder.is_tuple()` (callparse.py → `False`,
     /// overridden by `VarHolder` / `ConstHolder` / `NewTupleHolder`).
     pub fn is_tuple(&self) -> bool {
         match self {
@@ -467,12 +467,12 @@ impl Holder {
     }
 
     /// RPython `Holder.items()` — overridden by tuple-typed subclasses
-    /// (`VarHolder.items` callparse.py:100-103, `ConstHolder.items`
-    /// callparse.py:119-121, `NewTupleHolder.items` callparse.py:142-143).
+    /// (`VarHolder.items` callparse.py, `ConstHolder.items`
+    /// callparse.py, `NewTupleHolder.items` callparse.py).
     pub fn items(&self) -> Vec<Holder> {
         match self {
             Holder::Var { s_obj, .. } => {
-                // upstream callparse.py:100-103 — `n = len(self.s_obj.items)`,
+                // upstream callparse.py — `n = len(self.s_obj.items)`,
                 // `return tuple([ItemHolder(self, i) for i in range(n)])`.
                 let n = match s_obj.as_ref() {
                     SomeValue::Tuple(st) => st.items.len(),
@@ -481,7 +481,7 @@ impl Holder {
                 (0..n).map(|i| Holder::item(self.clone(), i)).collect()
             }
             Holder::Const { value, .. } => {
-                // upstream callparse.py:119-121 — `return self.value`
+                // upstream callparse.py — `return self.value`
                 // (because the value is a Python tuple already).
                 let items = match value {
                     ConstValue::Tuple(items) => items.clone(),
@@ -494,7 +494,7 @@ impl Holder {
         }
     }
 
-    /// RPython `Holder.emit(self, repr, hop)` (callparse.py:78-88).
+    /// RPython `Holder.emit(self, repr, hop)` (callparse.py).
     ///
     /// ```python
     /// def emit(self, repr, hop):
@@ -528,13 +528,13 @@ impl Holder {
     /// (callparse.py:105-106, :123-124, :145-152, :160-164).
     fn _emit(&self, repr: &Arc<dyn Repr>, hop: &HighLevelOp) -> Result<Hlvalue, TyperError> {
         match self {
-            // upstream callparse.py:105-106 — `VarHolder._emit`:
+            // upstream callparse.py — `VarHolder._emit`:
             // `return hop.inputarg(repr, arg=self.num)`.
             Holder::Var { num, .. } => hop.inputarg(repr.as_ref(), *num),
-            // upstream callparse.py:123-124 — `ConstHolder._emit`:
+            // upstream callparse.py — `ConstHolder._emit`:
             // `return hop.inputconst(repr, self.value)`.
             Holder::Const { value, .. } => inputconst(repr.as_ref(), value).map(Hlvalue::Constant),
-            // upstream callparse.py:145-152 — `NewTupleHolder._emit`:
+            // upstream callparse.py — `NewTupleHolder._emit`:
             // verifies repr is a TupleRepr, recursively emits each
             // sub-holder under the matching `items_r` repr, then
             // builds the tuple via `repr.newtuple(hop.llops, repr,
@@ -554,7 +554,7 @@ impl Holder {
                 let mut llops = hop.llops.borrow_mut();
                 TupleRepr::newtuple(&mut llops, r_tup, tupleitems_v)
             }
-            // upstream callparse.py:160-164 — `ItemHolder._emit`:
+            // upstream callparse.py — `ItemHolder._emit`:
             // `r_tup, v_tuple = self.holder.access(hop)`; then
             // `v = r_tup.getitem_internal(hop, v_tuple, index)`; then
             // `return hop.llops.convertvar(v, r_tup.items_r[index],
@@ -576,7 +576,7 @@ impl Holder {
         }
     }
 
-    /// RPython `VarHolder.access(self, hop)` (callparse.py:108-110):
+    /// RPython `VarHolder.access(self, hop)` (callparse.py):
     /// ```python
     /// repr = hop.args_r[self.num]
     /// return repr, self.emit(repr, hop)
@@ -604,10 +604,10 @@ impl Holder {
 }
 
 // ---------------------------------------------------------------------
-// callparse.py:16-32 — getrinputs / getrresult / getsig.
+// callparse.py — getrinputs / getrresult / getsig.
 // ---------------------------------------------------------------------
 
-/// RPython `getrinputs(rtyper, graph)` (callparse.py:16-18):
+/// RPython `getrinputs(rtyper, graph)` (callparse.py):
 /// ```python
 /// return [rtyper.bindingrepr(v) for v in graph.getargs()]
 /// ```
@@ -645,7 +645,7 @@ impl RResult {
     }
 }
 
-/// RPython `getrresult(rtyper, graph)` (callparse.py:20-25):
+/// RPython `getrresult(rtyper, graph)` (callparse.py):
 /// ```python
 /// if graph.getreturnvar().annotation is not None:
 ///     return rtyper.bindingrepr(graph.getreturnvar())
@@ -665,7 +665,7 @@ pub fn getrresult(rtyper: &RPythonTyper, graph: &Rc<PyGraph>) -> Result<RResult,
     }
 }
 
-/// RPython `getsig(rtyper, graph)` (callparse.py:27-32):
+/// RPython `getsig(rtyper, graph)` (callparse.py):
 /// ```python
 /// return (graph.signature, graph.defaults,
 ///         getrinputs(rtyper, graph), getrresult(rtyper, graph))
@@ -694,7 +694,7 @@ pub fn getsig(
 }
 
 // ---------------------------------------------------------------------
-// callparse.py:34-70 — `def callparse(rtyper, graph, hop, r_self=None)`.
+// callparse.py — `def callparse(rtyper, graph, hop, r_self=None)`.
 // ---------------------------------------------------------------------
 
 /// RPython `callparse(rtyper, graph, hop, r_self=None)`

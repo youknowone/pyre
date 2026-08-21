@@ -275,7 +275,7 @@ print("FAILS:" + ",".join(fails) if fails else "ALL-BLOCKED")
     );
 }
 
-/// `inspector.py:89 raw_os_write` is `_nowrapper=True`: heap-dump writes keep
+/// `inspector.py raw_os_write` is `_nowrapper=True`: heap-dump writes keep
 /// the GIL because the dumper owns the collector and a stop-the-world window.
 /// Releasing it for the sandbox controller round trip lets this waiting worker
 /// acquire the GIL and park at the active STW safepoint while still holding

@@ -14,7 +14,7 @@ use crate::descr::DescrRef;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, LazyLock, Mutex};
 
-/// effectinfo.py:9-10 `class UnsupportedFieldExc(Exception)`.
+/// effectinfo.py `class UnsupportedFieldExc(Exception)`.
 #[derive(Debug, Clone)]
 pub struct UnsupportedFieldExc(pub String);
 
@@ -42,13 +42,13 @@ impl std::error::Error for UnsupportedFieldExc {}
 /// any artifact carrying that order a non-function of its inputs.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum DescrSetMember {
-    /// `descr.py:218-239 get_field_descr(gccache, STRUCT, fieldname)` —
+    /// `descr.py get_field_descr(gccache, STRUCT, fieldname)` —
     /// `_cache_field[Struct(struct_id)][field_name]`.
     Field { struct_id: u64, field_name: String },
-    /// `descr.py:348-378 get_array_descr(gccache, ARRAY)` —
+    /// `descr.py get_array_descr(gccache, ARRAY)` —
     /// `_cache_array[Array(array_id)]`.
     Array { array_id: u64 },
-    /// `descr.py:404-437 get_interiorfield_descr(gccache, ARRAY, fieldname)` —
+    /// `descr.py get_interiorfield_descr(gccache, ARRAY, fieldname)` —
     /// `_cache_interiorfield[(Array(array_id), name, "")]`.
     InteriorField { array_id: u64, name: String },
 }
@@ -56,25 +56,25 @@ pub enum DescrSetMember {
 /// The layout arguments `descr.py`'s three getters pass to the descr
 /// constructor on a cache miss.
 ///
-/// `get_field_descr` (`descr.py:218-239`), `get_array_descr`
-/// (`descr.py:348-378`) and `get_interiorfield_descr` (`descr.py:404-437`) are
+/// `get_field_descr` (`descr.py`), `get_array_descr`
+/// (`descr.py`) and `get_interiorfield_descr` (`descr.py`) are
 /// all `try: return cache[key] / except KeyError: <construct>; cache[key] = d`
 /// — they **mint** when the slot is empty.  Upstream never has to serialize
 /// those arguments because there is one gccache in one process: the raw sets
-/// hold the descr objects themselves, and `setup_descrs` (`descr.py:25-47`)
+/// hold the descr objects themselves, and `setup_descrs` (`descr.py`)
 /// snapshots the same cache they were minted into, so
-/// `compute_bitstrings` (`effectinfo.py:465-499`) only ever unions descrs that
+/// `compute_bitstrings` (`effectinfo.py`) only ever unions descrs that
 /// are already present.
 ///
 /// Pyre mints in the analyzer process and resolves in the runtime one, and only
-/// the assembler's opcode table (`pyjitpl.py:2261 setup_descrs(asm.descrs)`)
+/// the assembler's opcode table (`pyjitpl.py setup_descrs(asm.descrs)`)
 /// crosses between them.  A descr the analyzer minted *solely* to fill a raw
 /// set is referenced by no opcode, so it does not cross, and the runtime lookup
 /// finds an empty slot.  Pairing each member with the arguments its cache miss
 /// would need restores upstream's mint-or-hit at the far end.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DescrMintSpec {
-    /// `descr.py:224-231` — the `FieldDescr(name, offset, size, flag,
+    /// `descr.py` — the `FieldDescr(name, offset, size, flag,
     /// index_in_parent, is_pure)` arguments, plus `descr.py:234-238
     /// parent_descr = get_size_descr(gccache, STRUCT, vtable)`'s `STRUCT` size.
     ///
@@ -92,9 +92,9 @@ pub enum DescrMintSpec {
         is_quasi_immutable: bool,
         index_in_parent: usize,
     },
-    /// `descr.py:353-370` — the `ArrayDescr(basesize, itemsize, lendescr, flag,
+    /// `descr.py` — the `ArrayDescr(basesize, itemsize, lendescr, flag,
     /// is_pure, concrete_type)` arguments. `length_offset` is what
-    /// `get_field_arraylen_descr` (`descr.py:256-267`) needs, and is read only
+    /// `get_field_arraylen_descr` (`descr.py`) needs, and is read only
     /// when `!nolength`, matching `descr.py:359-362`.
     Array {
         base_size: usize,
@@ -111,7 +111,7 @@ pub enum DescrMintSpec {
     /// than a flat layout.
     ///
     /// `field_struct_id` is the `REALARRAY.OF` cache key
-    /// (`descr.py:435 get_field_descr(gc_ll_descr, REALARRAY.OF, name)`).
+    /// (`descr.py get_field_descr(gc_ll_descr, REALARRAY.OF, name)`).
     /// Upstream recovers it from the ARRAY lltype; the serialized member names
     /// only the array, so the element struct's key travels explicitly.
     InteriorField {
@@ -136,7 +136,7 @@ pub struct DescrMintEntry {
     pub ei_index: u32,
 }
 
-/// `effectinfo.py:128-145 frozenset_or_none`: serializable projection of
+/// `effectinfo.py frozenset_or_none`: serializable projection of
 /// the six raw EffectInfo descr sets. The vectors are kept in the same
 /// canonical order as the raw `DescrRef` sets so deserialization can rebuild
 /// the exact object graph before `compute_bitstrings`.
@@ -157,7 +157,7 @@ impl DescrSetKeys {
     /// Distinct from `descr_set_keys = None`, which is the
     /// `EF_RANDOM_EFFECTS` wildcard: `effectinfo.py:149-162` makes the raw
     /// sets `None` **iff** the EI is random-effects, and
-    /// `compute_bitstrings` (`effectinfo.py:484-489`) reads the two shapes
+    /// `compute_bitstrings` (`effectinfo.py`) reads the two shapes
     /// oppositely — empty sets keep the bitstrings, `None` clears them.  A
     /// concrete-but-empty EI serialized with `None` would therefore come
     /// back from `descrs.bin` looking random-effects while its
@@ -290,7 +290,7 @@ impl Clone for EffectInfoCell {
     }
 }
 
-/// `effectinfo.py:14, 147-148 EffectInfo._cache`.
+/// `effectinfo.py, 147-148 EffectInfo._cache`.
 ///
 /// PyPy constructs one canonical EffectInfo object for each structural raw-set
 /// key and the call-descr cache stores that object by identity.  Keep the same
@@ -388,7 +388,7 @@ pub fn translated_effect_info(translated_id: u32) -> Option<Arc<EffectInfoCell>>
         .and_then(Clone::clone)
 }
 
-/// effectinfo.py:266-269: frozenset_or_none(x)
+/// effectinfo.py: frozenset_or_none(x)
 ///
 /// `frozenset(x)` if `x is not None`, else `None`. Pyre's lift of
 /// `frozenset[Descr]` is `Vec<DescrRef>` sorted+deduped by
@@ -456,7 +456,7 @@ fn descr_set_hash<H: std::hash::Hasher>(s: &Option<Vec<DescrRef>>, state: &mut H
     }
 }
 
-/// effectinfo.py:380-390: consider_struct(TYPE, fieldname)
+/// effectinfo.py: consider_struct(TYPE, fieldname)
 ///
 /// In RPython this filters out `lltype.Void` fields and non-`GcStruct`
 /// types, plus the `OBJECT.typeptr` special case. Pyre lacks `lltype`
@@ -467,7 +467,7 @@ pub fn consider_struct(_type_name: &str, _fieldname: &str) -> bool {
     true
 }
 
-/// effectinfo.py:392-397: consider_array(ARRAY)
+/// effectinfo.py: consider_array(ARRAY)
 ///
 /// Same caveat as `consider_struct`. TODO.
 pub fn consider_array(_array_name: &str) -> bool {
@@ -476,7 +476,7 @@ pub fn consider_array(_array_name: &str) -> bool {
 
 /// Side effect classification for calls.
 ///
-/// effectinfo.py:13-263: `class EffectInfo`. The seven `EF_*` constants
+/// effectinfo.py: `class EffectInfo`. The seven `EF_*` constants
 /// and the `OS_*` family live as associated constants on this struct
 /// plus the [`ExtraEffect`] / [`OopSpecIndex`] enums for type-safe match.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -498,7 +498,7 @@ pub struct EffectInfo {
     //
     // PyPy stores `_readonly_descrs_fields: frozenset[Descr]` (and the
     // five sibling sets) at `EffectInfo.__init__` time
-    // (`effectinfo.py:128-145 frozenset_or_none`). `compute_bitstrings`
+    // (`effectinfo.py frozenset_or_none`). `compute_bitstrings`
     // (`effectinfo.py:465-547`) later walks every EI, partitions the
     // descrs into (eisetr, eisetw) equivalence classes per category by
     // `id(descr)` (frozenset element identity), assigns
@@ -512,7 +512,7 @@ pub struct EffectInfo {
     // Each Vec is sorted-deduped by `Arc::as_ptr` at construction
     // (`canonicalize_descr_set`); `None` mirrors PyPy's
     // `_readonly_descrs_fields = None` wildcard (random-effects EI).
-    /// effectinfo.py:128 `_readonly_descrs_fields = frozenset_or_none(readonly_descrs_fields)`.
+    /// effectinfo.py `_readonly_descrs_fields = frozenset_or_none(readonly_descrs_fields)`.
     #[serde(skip)]
     pub _readonly_descrs_fields: Option<Vec<DescrRef>>,
     /// effectinfo.py:131 `_write_descrs_fields`.
@@ -530,8 +530,8 @@ pub struct EffectInfo {
     /// effectinfo.py:133 `_write_descrs_interiorfields`.
     #[serde(skip)]
     pub _write_descrs_interiorfields: Option<Vec<DescrRef>>,
-    /// `descr.py:218-239 get_field_descr`, `descr.py:348-378 get_array_descr`,
-    /// `descr.py:404-437 get_interiorfield_descr`: serialized channel for
+    /// `descr.py get_field_descr`, `descr.py get_array_descr`,
+    /// `descr.py get_interiorfield_descr`: serialized channel for
     /// the six skipped raw descr sets above.
     ///
     /// Tracks the `Option`-ness of those sets exactly: `None` here **iff**
@@ -645,7 +645,7 @@ impl Default for EffectInfo {
             extraeffect: ExtraEffect::CanRaise,
             oopspecindex: OopSpecIndex::None,
             pyre_helper: PyreHelperKind::None,
-            // effectinfo.py:128-145 frozenset_or_none: empty frozenset for
+            // effectinfo.py frozenset_or_none: empty frozenset for
             // a non-random-effects EI with no field/array touches yet.
             _readonly_descrs_fields: Some(Vec::new()),
             _write_descrs_fields: Some(Vec::new()),
@@ -654,7 +654,7 @@ impl Default for EffectInfo {
             _readonly_descrs_interiorfields: Some(Vec::new()),
             _write_descrs_interiorfields: Some(Vec::new()),
             descr_set_keys: Some(DescrSetKeys::const_empty()),
-            // effectinfo.py:175-181: empty frozenset for elidable, but `__new__`
+            // effectinfo.py: empty frozenset for elidable, but `__new__`
             // requires a non-None value for non-RandomEffects EIs. Empty Vec
             // is the bitstring equivalent (no descrs touched).
             readonly_descrs_fields: Some(Vec::new()),
@@ -695,7 +695,7 @@ pub enum ExtraEffect {
     ElidableCanRaise = 4,
     /// effectinfo.py:22 `EF_CAN_RAISE = 5`
     CanRaise = 5,
-    /// effectinfo.py:23 `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE = 6`
+    /// effectinfo.py `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE = 6`
     ForcesVirtualOrVirtualizable = 6,
     /// effectinfo.py:24 `EF_RANDOM_EFFECTS = 7`
     RandomEffects = 7,
@@ -812,7 +812,7 @@ pub enum PyreHelperKind {
     StoreSubscr,
     LoadGlobal,
     /// `bh_load_name_fn(frame, w_name, namei)` — the LOAD_NAME frame-receiver
-    /// helper (`pyopcode.py:945-955`, w_locals probe + LOAD_GLOBAL fallback).
+    /// helper (`pyopcode.py`, w_locals probe + LOAD_GLOBAL fallback).
     /// The full-body walker recognises this tag to fold a module-scope name
     /// read (frame's `w_locals_object` is null, so `w_locals` aliases
     /// `w_globals`) through the same module-dict cell fast path as
@@ -835,9 +835,9 @@ pub enum PyreHelperKind {
     /// `bh_delete_name_fn(frame, w_name)` — the DELETE_NAME frame-receiver
     /// helper (`pyopcode.py:869-880`, delegates to `delitem_str`).  Recognised
     /// by the walker only to answer upstream's
-    /// `opimpl_jit_force_quasi_immutable` question (`pyjitpl.py:1094-1118`)
+    /// `opimpl_jit_force_quasi_immutable` question (`pyjitpl.py`)
     /// ahead of the call: a successful delete runs `mutated()`
-    /// (`celldict.py:106-126`), which assigns the `version?` quasi-immutable
+    /// (`celldict.py`), which assigns the `version?` quasi-immutable
     /// field.  Pyre's write lives inside this residual, so the walker never
     /// meets the rtyper operation and has to ask before executing.
     DeleteName,
@@ -1007,13 +1007,13 @@ pub enum PyreHelperKind {
     /// residual (`lower_getattr_hlop_to_insn` → `space.getattr`).  The Ref
     /// operands are the receiver and the jitcode's own PyCode; the Int operand
     /// is the co_names index.  The full-body walker recognises this tag to fold
-    /// a monomorphic instance-attribute read (`mapdict.py:1479-1537
+    /// a monomorphic instance-attribute read (`mapdict.py
     /// LOAD_ATTR_caching`) to `guard_class(obj, w_type)` +
     /// `guard_value(getfield(obj, map), map)` + `getfield(obj, storage)` +
     /// `getarrayitem_gc_r(block, C_storageindex)` (the inline read
-    /// `mapdict.py:914-916 _mapdict_read_storage`), eliding the opaque
+    /// `mapdict.py _mapdict_read_storage`), eliding the opaque
     /// `CALL_MAY_FORCE` MRO-walk residual.  An unboxed slot instead folds to a
-    /// non-forcing raw read of its longlong list (`mapdict.py:600-601
+    /// non-forcing raw read of its longlong list (`mapdict.py
     /// _prim_direct_read`) with the boxing left in the trace.  Falls through to
     /// the residual for every shape neither read covers (non-instance receiver,
     /// custom `__getattribute__`, data descriptor, attribute absent from this
@@ -1051,7 +1051,7 @@ pub enum PyreHelperKind {
     DeleteAttr,
     /// `jit_make_function_from_globals(globals, code)` — the MAKE_FUNCTION
     /// residual (`lower_make_function_hlop_to_insn` →
-    /// `function.py:47-57 Function.__init__`).  Both Ref operands are baked
+    /// `function.py Function.__init__`).  Both Ref operands are baked
     /// constants: the defining frame's globals object and the popped code
     /// object.  The full-body walker recognises this tag to emit the
     /// construction as `NewWithVtable` + the `SetfieldGc` set, so a `def`
@@ -1087,7 +1087,7 @@ impl EffectInfo {
         self.extraeffect >= ExtraEffect::ForcesVirtualOrVirtualizable
     }
 
-    /// `effectinfo.py:252-253` `has_random_effects(self)`:
+    /// `effectinfo.py` `has_random_effects(self)`:
     ///
     /// ```python
     /// def has_random_effects(self):
@@ -1108,7 +1108,7 @@ impl EffectInfo {
         self.oopspecindex != OopSpecIndex::None
     }
 
-    /// effectinfo.py:232-236: check_can_raise(ignore_memoryerror)
+    /// effectinfo.py: check_can_raise(ignore_memoryerror)
     pub fn check_can_raise(&self, ignore_memoryerror: bool) -> bool {
         if ignore_memoryerror {
             self.extraeffect > ExtraEffect::ElidableOrMemoryError
@@ -1117,7 +1117,7 @@ impl EffectInfo {
         }
     }
 
-    /// effectinfo.py:255-257: is_call_release_gil()
+    /// effectinfo.py: is_call_release_gil()
     /// `tgt_func, tgt_saveerr = self.call_release_gil_target; return bool(tgt_func)`
     pub fn is_call_release_gil(&self) -> bool {
         let (tgt_func, _tgt_saveerr) = self.call_release_gil_target;
@@ -1189,9 +1189,9 @@ impl EffectInfo {
     /// effectinfo.py:271-273: MOST_GENERAL
     /// `EffectInfo(None, None, None, None, None, None, EF_RANDOM_EFFECTS, can_invalidate=True)`.
     ///
-    /// `effectinfo.py:149-155` + `compute_bitstrings` line 488-489 keep
+    /// `effectinfo.py` + `compute_bitstrings` line 488-489 keep
     /// the bitstrings as `None` for `EF_RANDOM_EFFECTS`; the optimizer's
-    /// `has_random_effects()` guard (heap.py:460 / heap.rs) prevents
+    /// `has_random_effects()` guard (heap.py / heap.rs) prevents
     /// `check_*_descr_*` from being called on the wildcard.
     pub const MOST_GENERAL: EffectInfo = EffectInfo {
         extraeffect: ExtraEffect::RandomEffects,
@@ -1224,9 +1224,9 @@ impl EffectInfo {
     // `bitstring.bitcheck(self.bitstring_*, ei_index)`.  The
     // `EF_RANDOM_EFFECTS` case is handled at construction time —
     // `effectinfo.py:149-156` keeps the `_readonly_*`/`_write_*` sets as
-    // `None` and `compute_bitstrings` (`effectinfo.py:484-489`) sets the
+    // `None` and `compute_bitstrings` (`effectinfo.py`) sets the
     // bitstring fields to `None` too.  The contract is that callers must
-    // gate via `has_random_effects()` first (heap.py:460) so the
+    // gate via `has_random_effects()` first (heap.py) so the
     // `None`-bitstring case is never queried.
     //
     // Pyre `MOST_GENERAL` (line 380) populates every bitset with `None`,
@@ -1238,7 +1238,7 @@ impl EffectInfo {
     // RPython fail-fast (`TypeError: object of type 'NoneType' has no
     // len()`).
 
-    /// effectinfo.py:211-213: check_readonly_descr_field(fielddescr)
+    /// effectinfo.py: check_readonly_descr_field(fielddescr)
     pub fn check_readonly_descr_field(&self, descr_idx: u32) -> bool {
         crate::bitstring::bitcheck(
             self.readonly_descrs_fields
@@ -1248,7 +1248,7 @@ impl EffectInfo {
         )
     }
 
-    /// effectinfo.py:214-216: check_write_descr_field(fielddescr)
+    /// effectinfo.py: check_write_descr_field(fielddescr)
     pub fn check_write_descr_field(&self, descr_idx: u32) -> bool {
         crate::bitstring::bitcheck(
             self.write_descrs_fields
@@ -1277,7 +1277,7 @@ impl EffectInfo {
         }
     }
 
-    /// effectinfo.py:217-219: check_readonly_descr_array(arraydescr)
+    /// effectinfo.py: check_readonly_descr_array(arraydescr)
     pub fn check_readonly_descr_array(&self, descr_idx: u32) -> bool {
         crate::bitstring::bitcheck(
             self.readonly_descrs_arrays
@@ -1287,7 +1287,7 @@ impl EffectInfo {
         )
     }
 
-    /// effectinfo.py:220-222: check_write_descr_array(arraydescr)
+    /// effectinfo.py: check_write_descr_array(arraydescr)
     pub fn check_write_descr_array(&self, descr_idx: u32) -> bool {
         crate::bitstring::bitcheck(
             self.write_descrs_arrays
@@ -1345,7 +1345,7 @@ impl EffectInfo {
         arrays.iter().any(|d| shape(d) == Some(target))
     }
 
-    /// effectinfo.py:223-226: check_readonly_descr_interiorfield (NOTE: not used so far)
+    /// effectinfo.py: check_readonly_descr_interiorfield (NOTE: not used so far)
     pub fn check_readonly_descr_interiorfield(&self, descr_idx: u32) -> bool {
         crate::bitstring::bitcheck(
             self.readonly_descrs_interiorfields
@@ -1355,7 +1355,7 @@ impl EffectInfo {
         )
     }
 
-    /// effectinfo.py:227-230: check_write_descr_interiorfield (NOTE: not used so far)
+    /// effectinfo.py: check_write_descr_interiorfield (NOTE: not used so far)
     pub fn check_write_descr_interiorfield(&self, descr_idx: u32) -> bool {
         crate::bitstring::bitcheck(
             self.write_descrs_interiorfields
@@ -1390,16 +1390,16 @@ impl EffectInfo {
     }
 }
 
-// effectinfo.py:422-461: CallInfoCollection
+// effectinfo.py: CallInfoCollection
 
-/// effectinfo.py:422: `class CallInfoCollection(object)`.
+/// effectinfo.py: `class CallInfoCollection(object)`.
 ///
 /// Maps oopspec indices to `(calldescr, func_as_int)` pairs. Used to
 /// look up the implementation of special-cased operations (arraycopy,
 /// string ops, etc.).
 #[derive(Debug, Clone, Default)]
 pub struct CallInfoCollection {
-    /// effectinfo.py:425: `_callinfo_for_oopspec` — `{oopspecindex: (calldescr, func_as_int)}`
+    /// effectinfo.py: `_callinfo_for_oopspec` — `{oopspecindex: (calldescr, func_as_int)}`
     entries: std::collections::HashMap<OopSpecIndex, (DescrRef, u64)>,
     /// majit extension: func_as_int → function name.
     /// RPython derives names from `func.ptr._obj._name` at `see_raw_object` time.
@@ -1412,7 +1412,7 @@ impl CallInfoCollection {
         Self::default()
     }
 
-    /// effectinfo.py:430-431: add(oopspecindex, calldescr, func_as_int)
+    /// effectinfo.py: add(oopspecindex, calldescr, func_as_int)
     pub fn add(&mut self, oopspec: OopSpecIndex, calldescr: DescrRef, func_addr: u64) {
         self.entries.insert(oopspec, (calldescr, func_addr));
     }
@@ -1424,12 +1424,12 @@ impl CallInfoCollection {
         self.func_names.insert(func_addr, name);
     }
 
-    /// effectinfo.py:433-434: has_oopspec(oopspecindex)
+    /// effectinfo.py: has_oopspec(oopspecindex)
     pub fn has_oopspec(&self, oopspec: OopSpecIndex) -> bool {
         self.entries.contains_key(&oopspec)
     }
 
-    /// effectinfo.py:439-447: callinfo_for_oopspec(oopspecindex)
+    /// effectinfo.py: callinfo_for_oopspec(oopspecindex)
     /// Returns (calldescr, func_as_int) for the oopspec, or `(None, 0)` on a
     /// miss (KeyError) — the calldescr is optional, the func defaults to 0.
     pub fn callinfo_for_oopspec(&self, oopspec: OopSpecIndex) -> (Option<&DescrRef>, u64) {
@@ -1439,7 +1439,7 @@ impl CallInfoCollection {
         }
     }
 
-    /// effectinfo.py:436-437: all_function_addresses_as_int()
+    /// effectinfo.py: all_function_addresses_as_int()
     pub fn all_function_addresses_as_int(&self) -> Vec<u64> {
         self.entries.values().map(|(_, addr)| *addr).collect()
     }
@@ -1451,8 +1451,8 @@ impl CallInfoCollection {
     }
 }
 
-// effectinfo.py:465-547 `compute_bitstrings(all_descrs)`.
-/// `effectinfo.py:182-184` "no new EffectInfo after compute_bitstrings"
+// effectinfo.py `compute_bitstrings(all_descrs)`.
+/// `effectinfo.py` "no new EffectInfo after compute_bitstrings"
 /// invariant — flipped to `true` on the first
 /// `MetaInterpStaticData::finish_setup_descrs` call.  Late call-descr
 /// minters consult this through
@@ -1504,7 +1504,7 @@ impl EffectInfo {
     }
 }
 
-/// `effectinfo.py:147-148 EffectInfo._cache` parity key.
+/// `effectinfo.py EffectInfo._cache` parity key.
 ///
 /// PyPy keys `EffectInfo._cache` (the EI factory cache) on the tuple
 /// `(readonly_descrs_fields, readonly_descrs_arrays,
@@ -1546,7 +1546,7 @@ enum ReleaseGilCacheKey {
 
 static NEXT_RELEASE_GIL_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// `effectinfo.py:147-148` `EffectInfo._cache` post-frozenset key
+/// `effectinfo.py` `EffectInfo._cache` post-frozenset key
 /// canonicalization for compute_bitstrings's per-EI dedup pass.
 ///
 /// Each raw set is projected to its sorted `Vec<usize>` of
@@ -1820,7 +1820,7 @@ fn assert_member_category(member: &DescrSetMember, category: usize) {
     );
 }
 
-/// `effectinfo.py:465-547` `compute_bitstrings`.
+/// `effectinfo.py` `compute_bitstrings`.
 ///
 /// Walks every `EffectInfo` once: for the three categories
 /// (`fields`/`arrays`/`interiorfields`), partitions the descrs that
@@ -1837,11 +1837,11 @@ fn assert_member_category(member: &DescrSetMember, category: usize) {
 ///   readonly/write set (typically: every field/array/interiorfield
 ///   descr the codewriter has minted by this point). Descrs not in any
 ///   EI keep their `ei_index = u32::MAX` sentinel; PyPy
-///   `effectinfo.py:496` writes the same `descr.ei_index = sys.maxint`
+///   `effectinfo.py` writes the same `descr.ei_index = sys.maxint`
 ///   default for the no-EI branch.
 /// - `all_eis`: the full set of EI handles to compact. EIs whose
 ///   `_readonly_descrs_fields` is `None` (random-effects /
-///   `MOST_GENERAL`) follow PyPy's `effectinfo.py:485-489` rule:
+///   `MOST_GENERAL`) follow PyPy's `effectinfo.py` rule:
 ///   their bitstring fields are also forced to `None`, the call site
 ///   is expected to gate via `has_random_effects()`.
 ///
@@ -1858,7 +1858,7 @@ fn assert_member_category(member: &DescrSetMember, category: usize) {
 pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInfo]) {
     use std::collections::HashMap;
 
-    // `effectinfo.py:479-496` `for descr in all_descrs:` pre-loop —
+    // `effectinfo.py` `for descr in all_descrs:` pre-loop —
     // every non-call descr's `ei_index` is initialised to
     // `sys.maxint` BEFORE any bitstring classification.  Pyre lifts
     // this so re-running `compute_bitstrings` over an `all_descrs`
@@ -1929,11 +1929,11 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
     //
     // Descrs in `all_descrs` that never enter any EI raw set keep
     // their `ei_index = u32::MAX` sentinel via the entry-loop pre-init
-    // (`effectinfo.py:496` `descr.ei_index = sys.maxint`), which runs
+    // (`effectinfo.py` `descr.ei_index = sys.maxint`), which runs
     // unconditionally at the top of `compute_bitstrings` over every
     // non-call descr — no per-category lookup is needed here.
 
-    // `effectinfo.py:147-148` `EffectInfo._cache` parity — PyPy keys
+    // `effectinfo.py` `EffectInfo._cache` parity — PyPy keys
     // the EffectInfo factory cache on the structural tuple (raw sets,
     // extraeffect, oopspecindex, can_invalidate, can_collect,
     // call_release_gil_target) and returns the same EI instance for
@@ -2070,7 +2070,7 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
             descr.set_ei_index(*ei_index);
         }
 
-        // `effectinfo.py:496` `descr.ei_index = sys.maxint`:
+        // `effectinfo.py` `descr.ei_index = sys.maxint`:
         // descrs from `all_descrs` that did NOT appear in any EI raw
         // set keep their `ei_index = u32::MAX` sentinel set by the
         // entry-loop pre-init at the top of this function. Readers

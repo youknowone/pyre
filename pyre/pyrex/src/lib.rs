@@ -351,9 +351,9 @@ fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error>
             Long("heapsize") => {
                 parse_heapsize(&parser.value()?.string()?)?;
             }
-            // setlogfile (sandlib.py:334): append the guest's stdin to FILE.
+            // setlogfile (sandlib.py): append the guest's stdin to FILE.
             Long("log") => log_file = Some(parser.value()?.string()?),
-            // VirtualizedSocketProc (sandlib.py:546): opt in to `tcp://host:port`
+            // VirtualizedSocketProc (sandlib.py): opt in to `tcp://host:port`
             // os.open mediation. Off by default so the sandbox stays
             // network-closed.
             Long("allow-net") => allow_net = true,
@@ -1468,7 +1468,7 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
     // graph, so the teardown below reports signals instead of delivering
     // them.  atexit ran above and may legitimately have used signals.
     pyre_interpreter::module::signal::interp_signal::clear_handlers();
-    // baseobjspace.py:498-501 `finish()` runs every started module's shutdown
+    // baseobjspace.py `finish()` runs every started module's shutdown
     // hook; `_io`'s (moduledef.py:37-40) flushes the streams that are still
     // alive.  The per-global teardown below reaches only the ones `__main__`
     // itself holds, so without this a stream owned by any other module loses
@@ -1503,7 +1503,7 @@ fn finalize_runtime(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecut
 
 /// Resolve a pending `SystemExit`'s status, then finalize and exit with it.
 ///
-/// The order matters: `app_main.py:114-129 handle_sys_exit` runs at
+/// The order matters: `app_main.py handle_sys_exit` runs at
 /// application level, i.e. *before* `targetpypystandalone.py:88
 /// finally: space.finish()`. Resolving `e.code` is an ordinary attribute
 /// lookup that walks the exception's type and that type's dict, and
@@ -1667,7 +1667,7 @@ fn script_startup_dir(path: &str) -> PathBuf {
         } else {
             parent
         };
-        // PyPy `resolvedirof` (`initpath.py:66-78`) uses `rpath.rabspath`,
+        // PyPy `resolvedirof` (`initpath.py`) uses `rpath.rabspath`,
         // whose Windows implementation is `GetFullPathNameW`.  It makes the
         // spelling absolute without resolving junctions or symlinks.  Rust's
         // `canonicalize` is a realpath operation and incorrectly changed a

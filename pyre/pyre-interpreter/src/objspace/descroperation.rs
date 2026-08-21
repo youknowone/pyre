@@ -103,7 +103,7 @@ fn bigint_modulo_nonzero(a: &BigInt, b: &BigInt) -> BigInt {
 }
 
 /// Machine-int-divisor form of [`bigint_floordiv_nonzero`]
-/// (`longobject.py:418 _int_floordiv` → `rbigint.int_floordiv`). The dedicated
+/// (`longobject.py _int_floordiv` → `rbigint.int_floordiv`). The dedicated
 /// leg divides by a single digit instead of first materializing an rbigint for
 /// the `W_IntObject`.
 #[majit_macros::jit_elidable]
@@ -112,7 +112,7 @@ fn bigint_int_floordiv_nonzero(a: &BigInt, b: i64) -> BigInt {
 }
 
 /// Machine-int-divisor form of [`bigint_modulo_nonzero`]
-/// (`longobject.py:435 _int_mod` → `rbigint.int_mod_int_result`). The remainder
+/// (`longobject.py _int_mod` → `rbigint.int_mod_int_result`). The remainder
 /// of a long by a machine int always fits a machine int, so the descriptor
 /// returns `space.newint` and this leg allocates no result bigint.
 #[majit_macros::jit_elidable]
@@ -151,7 +151,7 @@ fn bigint_rshift(a: &BigInt, shift: i64) -> BigInt {
     a.rshift(shift, false).expect("nonnegative shift")
 }
 
-/// Exact `rbigint._divrem` early-return predicate (`rbigint.py:2406-2411`).
+/// Exact `rbigint._divrem` early-return predicate (`rbigint.py`).
 ///
 /// Upstream deliberately tests only the digit count and most-significant
 /// digit here. When it succeeds, the remainder is the input object `a`
@@ -318,7 +318,7 @@ pub extern "C" fn jit_bigint_div_floor(a: i64, b: i64) -> pyre_object::longobjec
     }
 }
 
-/// Machine-int-divisor quotient (`longobject.py:418 _int_floordiv` →
+/// Machine-int-divisor quotient (`longobject.py _int_floordiv` →
 /// `rbigint.int_floordiv`). `b` is a bare machine word, not a payload pointer.
 #[majit_macros::elidable_or_memerror]
 pub extern "C" fn jit_bigint_int_div_floor(
@@ -340,7 +340,7 @@ pub extern "C" fn jit_bigint_int_div_floor(
     }
 }
 
-/// Machine-int-divisor remainder (`longobject.py:435 _int_mod` →
+/// Machine-int-divisor remainder (`longobject.py _int_mod` →
 /// `rbigint.int_mod_int_result`). The remainder of a long by a machine int
 /// always fits a machine int, so this residual returns the value itself and
 /// allocates nothing.
@@ -350,8 +350,8 @@ pub extern "C" fn jit_bigint_int_mod_int_result(a: i64, b: i64) -> i64 {
     unsafe { (&*a).int_mod_int_result(b).expect("division by zero") }
 }
 
-/// Both halves of a machine-int divmod (`longobject.py:451 _int_divmod` →
-/// `rbigint.int_divmod`, rbigint.py:1050 `@jit.elidable`). `b` is a bare
+/// Both halves of a machine-int divmod (`longobject.py _int_divmod` →
+/// `rbigint.int_divmod`, rbigint.py `@jit.elidable`). `b` is a bare
 /// machine word, not a payload pointer.
 ///
 /// One call produces both results: `//` and `%` each reach `_divmod`, so
@@ -686,7 +686,7 @@ pub extern "C" fn jit_bigint_neg(a: i64) -> pyre_object::longobject::JitBigIntRe
     let a = a as *const BigInt;
     unsafe {
         pyre_object::longobject::encode_jit_bigint_result(
-            // rbigint.py:1299-1301 always constructs a fresh rbigint handle,
+            // rbigint.py always constructs a fresh rbigint handle,
             // including for zero; only its immutable digits are shared.
             majit_rlib::rbigint::alloc_rbigint_clone_nursery_collecting((&*a).neg()),
         )
@@ -805,7 +805,7 @@ fn bigint_mod(a: BigInt, b: BigInt) -> BigInt {
     a % b
 }
 
-/// longobject.py:62-70 `_truediv` delegates directly to rbigint.truediv and
+/// longobject.py `_truediv` delegates directly to rbigint.truediv and
 /// only translates its application-level exceptions.
 #[majit_macros::elidable]
 fn bigint_truediv(a: &BigInt, b: &BigInt) -> Result<f64, PyError> {
@@ -1037,7 +1037,7 @@ unsafe fn long_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // longobject.py:424 `_make_descr_binop(_floordiv, _int_floordiv)`: a
+    // longobject.py `_make_descr_binop(_floordiv, _int_floordiv)`: a
     // machine-int divisor takes the dedicated `rbigint.int_floordiv` leg.
     // PyPy's `_floordiv` still carries the 2.x "long ..." wording
     // (longobject.py:409), which a 3.x runtime does not.
@@ -1069,13 +1069,13 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         owned_a = BigInt::from(int_value(a));
         &owned_a
     };
-    // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py:1001).
+    // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py).
     // `_floordiv`/`_int_floordiv` both `newlong` the quotient, keeping a long.
     Ok(w_long_new(bigint_floordiv_nonzero(va, vb)))
 }
 
 unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // longobject.py:441 `_make_descr_binop(_mod, _int_mod)`. `_int_mod`
+    // longobject.py `_make_descr_binop(_mod, _int_mod)`. `_int_mod`
     // (machine-int RHS) computes through `rbigint.int_mod_int_result` and
     // returns `space.newint` — the remainder of a long by a machine int always
     // fits — while `_mod` (long RHS) returns `newlong`.
@@ -1112,7 +1112,7 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             w_long_get_raw_value(a),
         ));
     }
-    // rbigint.mod → _divmod, returning the remainder half (rbigint.py:1001).
+    // rbigint.mod → _divmod, returning the remainder half (rbigint.py).
     Ok(w_long_new(bigint_modulo_nonzero(va, vb)))
 }
 
@@ -1193,8 +1193,8 @@ unsafe fn integer_divmod_pair(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
-/// `rbigint.floordiv` payload half (`longobject.py:409 _floordiv` →
-/// `rbigint.floordiv` → `divmod`, `rbigint.py:1001 @jit.elidable`). Elidable
+/// `rbigint.floordiv` payload half (`longobject.py _floordiv` →
+/// `rbigint.floordiv` → `divmod`, `rbigint.py @jit.elidable`). Elidable
 /// but CAN raise ZeroDivisionError on a zero divisor → `EF_ELIDABLE_CAN_RAISE`:
 /// the trace records `CALL_PURE` + `GUARD_NO_EXCEPTION`. Returns a bare
 /// `*mut BigInt` (Int) on success; on a zero divisor publishes the exception
@@ -1278,7 +1278,7 @@ fn bigint_floordiv_core(a: &BigInt, b: &BigInt, collecting: bool) -> i64 {
         );
         return 0;
     }
-    // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py:1001).
+    // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py).
     alloc_result_bigint(
         a.divmod(b).expect("divisor was checked nonzero").0,
         collecting,
@@ -1406,8 +1406,8 @@ pub extern "C" fn jit_bigint_rshift(a: i64, b: i64) -> i64 {
     bigint_rshift_core(a, b, true)
 }
 
-/// `rbigint.truediv` payload half (`longobject.py:62-70 _truediv` →
-/// `rbigint.truediv`, `rbigint.py:890`). Elidable but CAN raise
+/// `rbigint.truediv` payload half (`longobject.py _truediv` →
+/// `rbigint.truediv`, `rbigint.py`). Elidable but CAN raise
 /// ZeroDivisionError / OverflowError → `EF_ELIDABLE_CAN_RAISE`: `CALL_PURE_F` +
 /// `GUARD_NO_EXCEPTION`. Returns the correctly-rounded quotient as an `f64`
 /// directly (a `CallPureF`, the float analogue of `rbigint.truediv` returning a
@@ -1515,7 +1515,7 @@ unsafe fn float_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_float_new(va / vb))
 }
 
-/// floatobject.py:508-512: descr_floordiv → _divmod_w()[0].
+/// floatobject.py: descr_floordiv → _divmod_w()[0].
 unsafe fn float_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let x = as_float(a);
     reject_float_coercion_overflow(a, x)?;
@@ -1525,7 +1525,7 @@ unsafe fn float_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_float_new(floordiv))
 }
 
-/// floatobject.py:520-540: descr_mod with math_fmod + sign correction.
+/// floatobject.py: descr_mod with math_fmod + sign correction.
 unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let x = as_float(a);
     reject_float_coercion_overflow(a, x)?;
@@ -1548,7 +1548,7 @@ unsafe fn float_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_float_new(m))
 }
 
-/// floatobject.py:758-793: _divmod_w.
+/// floatobject.py: _divmod_w.
 fn float_divmod_w(x: f64, y: f64) -> Result<(f64, f64), PyError> {
     if y == 0.0 {
         // floatobject.py:761
@@ -1589,7 +1589,7 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
     if vb < 0 {
-        // intobject.py:415-419 _pow_nomod raises ValueError for iw < 0,
+        // intobject.py _pow_nomod raises ValueError for iw < 0,
         // descr_pow catches it and routes through float pow — which
         // carries the ZeroDivisionError guard from floatobject.py:910-913.
         return Ok(w_float_new(float_pow_raw(va as f64, vb as f64)?));
@@ -1605,7 +1605,7 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         -1 => return Ok(w_int_new(if vb % 2 == 0 { 1 } else { -1 })),
         _ => {}
     }
-    // intobject.py:414-435 `_pow_nomod`: exponentiation by squaring with an
+    // intobject.py `_pow_nomod`: exponentiation by squaring with an
     // overflow check at each machine multiplication. Keep this literal loop;
     // `checked_mul` is the Rust source spelling the MIR front lowers back to
     // RPython's `int_mul_ovf` exception edge.
@@ -1647,7 +1647,7 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         &vb_owned
     };
     if vb.get_sign() < 0 {
-        // longobject.py:219-222 calls descr_float on both integer operands
+        // longobject.py calls descr_float on both integer operands
         // before float pow.  RBigInt::tofloat raises on an out-of-range value;
         // do not silently pass the infinity sentinel from as_float onward.
         reject_pow_operand_overflow(a)?;
@@ -1656,7 +1656,7 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let fb = as_float(b);
         return Ok(w_float_new(float_pow_raw(fa, fb)?));
     }
-    // longobject.py:229: `if not exp_bigint: return int_pow(0)` → 1. `descr_pow`
+    // longobject.py: `if not exp_bigint: return int_pow(0)` → 1. `descr_pow`
     // wraps every branch as `W_LongObject`, so a long base keeps the long
     // representation across these trivial-base short-circuits too.
     if vb.get_sign() == 0 {
@@ -1687,7 +1687,7 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let even = vb.digit(0) & 1 == 0;
         return Ok(w_long_new(BigInt::from(if even { 1 } else { -1 })));
     }
-    // longobject.py:229-231: `descr_pow` keeps a `W_IntObject` exponent
+    // longobject.py: `descr_pow` keeps a `W_IntObject` exponent
     // unwrapped (`exp_bigint` stays None) and calls `rbigint.int_pow`; only a
     // long exponent reaches `rbigint.pow`.
     if is_int_like(b) {
@@ -1704,7 +1704,7 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if vb < 0 {
         return Err(PyError::value_error("negative shift count"));
     }
-    // intobject.py:374-383 `_lshift`: use the machine-int result while the
+    // intobject.py `_lshift`: use the machine-int result while the
     // shift is in range and `ovfcheck(a << b)` succeeds. Rust's
     // `checked_shl` checks only the count, so verify the arithmetic result by
     // shifting it back. The overflow recovery is the exact
@@ -1725,7 +1725,7 @@ unsafe fn int_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn int_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // intobject.py:393-403 `_rshift(space, a, b)`:
+    // intobject.py `_rshift(space, a, b)`:
     //   if r_uint(b) >= LONG_BIT:
     //       if b < 0: raise ValueError("negative shift count")
     //       # b >= LONG_BIT
@@ -1754,7 +1754,7 @@ unsafe fn long_lshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if vb.get_sign() < 0 {
         return Err(PyError::value_error("negative shift count"));
     }
-    // longobject.py:375-380: `toint()` (signed machine int / i64) overflows
+    // longobject.py: `toint()` (signed machine int / i64) overflows
     // when the count exceeds i64::MAX → 0 if base is zero, OverflowError
     // otherwise.
     let shift = if jit_bigint_to_i64_fits(vb) != 0 {
@@ -1808,7 +1808,7 @@ unsafe fn long_rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     if vb.get_sign() < 0 {
         return Err(PyError::value_error("negative shift count"));
     }
-    // longobject.py:393-397: `toint()` overflow (count > i64::MAX) → positive
+    // longobject.py: `toint()` overflow (count > i64::MAX) → positive
     // yields 0, negative yields -1 (all bits shifted out).
     let shift = if jit_bigint_to_i64_fits(vb) != 0 {
         jit_bigint_to_i64_value(vb)
@@ -2011,7 +2011,7 @@ unsafe fn sequence_repeat(seq: PyObjectRef, count: PyObjectRef) -> PyResult {
     }
 }
 
-/// unicodeobject.py:619-621 descr_mul
+/// unicodeobject.py descr_mul
 pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     // Repeat at the WTF-8 byte level — a repetition of valid WTF-8 is valid
     // WTF-8 — so a surrogate-bearing string repeats without going through
@@ -2132,7 +2132,7 @@ pub(crate) unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     Ok(w_tuple_new(items))
 }
 
-/// listobject.py:638-641 descr_mul
+/// listobject.py descr_mul
 pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult {
     let count = repeat_count(n)?;
     let len = w_list_len(list);
@@ -2158,7 +2158,7 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
     Ok(w_list_new(items))
 }
 
-/// listobject.py:645-648 descr_inplace_mul — repeat the list in place; the
+/// listobject.py descr_inplace_mul — repeat the list in place; the
 /// list object identity is preserved.  Count and overflow handling mirror
 /// `list_repeat`, but the extra copies are appended into the existing
 /// storage instead of building a fresh list.
@@ -2310,7 +2310,7 @@ fn compare_f64(f1: f64, f2: f64, op: CompareOp) -> bool {
     }
 }
 
-/// `specialisedtupleobject.py:113-127 descr_eq`, the arm where both operands
+/// `specialisedtupleobject.py descr_eq`, the arm where both operands
 /// are the SAME specialised class: the value slots compare raw, so neither
 /// side pays the box `getitem` would have to build for an `_ii` / `_ff` slot.
 ///
@@ -2355,7 +2355,7 @@ unsafe fn specialised_tuple_same_class_eq(
     Ok(None)
 }
 
-/// floatobject.py:106-129 `do_compare_bigint` — compare a float against a
+/// floatobject.py `do_compare_bigint` — compare a float against a
 /// bigint without converting the bigint to a double, which would round it.
 fn do_compare_bigint(f1: f64, b2: &BigInt, op: CompareOp) -> bool {
     if matches!(op, CompareOp::Eq | CompareOp::Ne) {
@@ -2388,7 +2388,7 @@ fn do_compare_bigint(f1: f64, b2: &BigInt, op: CompareOp) -> bool {
     }
 }
 
-/// floatobject.py:132-148 `_compare` — the float side of a numeric
+/// floatobject.py `_compare` — the float side of a numeric
 /// comparison.  `w_float` is a float; `w_other` is a float, an int, a bool
 /// or a long.  The relation is evaluated exactly: only an int small enough
 /// that a double represents it losslessly takes the plain f64 path.
@@ -2979,7 +2979,7 @@ enum SeqBase {
     Tuple,
 }
 
-/// descroperation.py:708 `binop_impl` shortcut — the builtin sequence
+/// descroperation.py `binop_impl` shortcut — the builtin sequence
 /// fast path (`str`/`list`/`tuple` concat) bypasses `__op__`/`__rop__`
 /// dispatch unless one operand is a subclass that actually overrides the
 /// forward or reflected special method (descroperation.py:664 "unicode +
@@ -3142,7 +3142,7 @@ unsafe fn numeric_operand_overrides(obj: PyObjectRef, dunder: &str, rdunder: &st
     dunder_overridden(obj, dunder, t) || dunder_overridden(obj, rdunder, t)
 }
 
-/// descroperation.py:708 `binop_impl` shortcut — the builtin numeric
+/// descroperation.py `binop_impl` shortcut — the builtin numeric
 /// (int/long/float) fast path bypasses `__op__`/`__rop__` dispatch unless
 /// an operand is a subclass that actually overrides the forward or
 /// reflected special method.  The seq/bytes analogs are
@@ -3614,10 +3614,10 @@ pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 
 /// True division (`/` operator) — always produces a float result.
 ///
-/// intobject.py:332-345 `_truediv` raises "division by zero" for int/int;
+/// intobject.py `_truediv` raises "division by zero" for int/int;
 /// floatobject.py:519 `_floatdiv` raises "float division by zero" once
 /// any operand is a float.
-/// longobject.py:62-70 `_truediv` catches OverflowError from
+/// longobject.py `_truediv` catches OverflowError from
 /// `rbigint.truediv` and reissues it as
 /// "integer division result too large for a float".
 pub fn truediv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
@@ -3638,7 +3638,7 @@ pub fn truediv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
             if !is_long(b) && as_float(b) == 0.0 {
                 return Err(PyError::zero_division(ZERO_DIVISION_MSG));
             }
-            // intobject.py:332 `_truediv`: machine ints wider than the
+            // intobject.py `_truediv`: machine ints wider than the
             // binary64 mantissa deliberately overflow into the rbigint path
             // so division is rounded once, after exact integer arithmetic.
             let wide_int = (!is_long(a) && int_value(a).unsigned_abs() >> 53 != 0)
@@ -3680,7 +3680,7 @@ pub fn truediv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     }
 }
 
-/// `descroperation.py:425 pow_binary` — return `None` when neither numeric
+/// `descroperation.py pow_binary` — return `None` when neither numeric
 /// fast paths nor `__pow__` / `__rpow__` produce a result.
 fn pow_binary(a: &mut PyObjectRef, b: &mut PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
@@ -3723,7 +3723,7 @@ pub fn pow(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     )))
 }
 
-/// `descroperation.py:486-499 inplace_pow` — unlike the generated in-place
+/// `descroperation.py inplace_pow` — unlike the generated in-place
 /// binary operations, power has its own fallback error spelling.
 pub fn inplace_pow(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     if let Some(result) = try_inplace_special(a, b, "__ipow__", None, false)? {
@@ -4024,7 +4024,7 @@ pub(crate) fn try_call_special(
     }
 }
 
-/// descroperation.py:648 `_call_binop_impl` — resolve the forward
+/// descroperation.py `_call_binop_impl` — resolve the forward
 /// (`dunder`) and reflected (`rdunder`) special methods through
 /// `lookup_where`, decide whether to try the reflected operand first by
 /// comparing the two defining classes, then invoke forward-then-reverse.
@@ -4034,7 +4034,7 @@ pub(crate) fn try_dispatch_binary_special(
     dunder: &str,
     rdunder: &str,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    // descroperation.py:687 `seq_bug_compat = (symbol == '+' or symbol == '*')`.
+    // descroperation.py `seq_bug_compat = (symbol == '+' or symbol == '*')`.
     let seq_bug_compat = dunder == "__add__" || dunder == "__mul__";
     unsafe {
         let Some(w_typ1) = crate::typedef::r#type(*lhs) else {
@@ -4099,11 +4099,11 @@ pub(crate) fn try_dispatch_binary_special(
             slot
         });
         let mut result = None;
-        // descroperation.py:676 — _invoke_binop(w_left_impl, w_obj1, w_obj2).
+        // descroperation.py — _invoke_binop(w_left_impl, w_obj1, w_obj2).
         if let Some(method) = w_left_impl {
             result = try_call_special(method, &[operand(first), operand(second)])?;
         }
-        // descroperation.py:679 — _invoke_binop(w_right_impl, w_obj2, w_obj1).
+        // descroperation.py — _invoke_binop(w_right_impl, w_obj2, w_obj1).
         if result.is_none()
             && let Some(slot) = right_slot
         {
@@ -4205,7 +4205,7 @@ fn try_dispatch_ternary_pow_special(
     }
 }
 
-/// descroperation.py:825 `inplace_impl` — try the in-place special
+/// descroperation.py `inplace_impl` — try the in-place special
 /// (`__iadd__` etc.) on the lhs.  Returns `None` when the type has no
 /// such method or the call yields `NotImplemented`, so the caller falls
 /// back to the corresponding binary operation.
@@ -4400,7 +4400,7 @@ pub(crate) fn binary_builtin_type_error(
 }
 
 /// The three-operand form of [`binary_builtin_type_error`] for `pow(a, b, c)`
-/// — descroperation.py:469 `unsupported operand type(s) for pow(): T, T, T`.
+/// — descroperation.py `unsupported operand type(s) for pow(): T, T, T`.
 pub(crate) fn ternary_builtin_type_error(
     opname: &str,
     a: PyObjectRef,
@@ -4476,7 +4476,7 @@ pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     Err(binary_builtin_type_error("divmod()", a, b))
 }
 
-/// floatobject.py:862 `PowDomainError` — sentinel for a negative base raised to
+/// floatobject.py `PowDomainError` — sentinel for a negative base raised to
 /// a fractional power, which `descr_pow` promotes to a complex result.
 enum FloatPowError {
     Domain,
@@ -4528,7 +4528,7 @@ fn float_pow_overflow_error() -> PyError {
     )
 }
 
-/// floatobject.py:865 `_pow`.
+/// floatobject.py `_pow`.
 fn float_pow_inner(x: f64, y: f64) -> Result<f64, FloatPowError> {
     // floatobject.py:800-801
     if y == 2.0 {
@@ -4607,7 +4607,7 @@ pub fn float_pow_raw(x: f64, y: f64) -> Result<f64, PyError> {
     }
 }
 
-/// floatobject.py:584 `W_FloatObject.descr_pow`.
+/// floatobject.py `W_FloatObject.descr_pow`.
 fn float_pow_impl(x: f64, y: f64) -> PyResult {
     match float_pow_inner(x, y) {
         Ok(z) => Ok(w_float_new(z)),
@@ -4704,7 +4704,7 @@ pub fn and_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        // boolobject.py:74 W_BoolObject.descr_and — both operands bool
+        // boolobject.py W_BoolObject.descr_and — both operands bool
         // → space.newbool(op(a, b)). MRO ensures this runs before the
         // W_IntObject.descr_and fallback in int_bitand.
         if !numeric_override {
@@ -4757,8 +4757,8 @@ pub(crate) fn unionable(obj: PyObjectRef) -> bool {
 /// Bitwise OR dispatch (`|` operator).
 
 pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    // `pypy/objspace/std/dictproxyobject.py:51 descr_or` /
-    // `pypy/objspace/std/dictproxyobject.py:60 descr_ror` —
+    // `pypy/objspace/std/dictproxyobject.py descr_or` /
+    // `pypy/objspace/std/dictproxyobject.py descr_ror` —
     // mappingproxy `|` dispatches by copying the proxy's wrapped
     // mapping then `update`-ing with the other operand.  Pre-unwrap
     // each side so the dict-arm below sees plain dicts and produces
@@ -4791,7 +4791,7 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         {
             return Ok(result);
         }
-        // boolobject.py:75 W_BoolObject.descr_or — both operands bool
+        // boolobject.py W_BoolObject.descr_or — both operands bool
         // → space.newbool(op(a, b)).
         if !numeric {
             if is_bool(a) && is_bool(b) {
@@ -4817,7 +4817,7 @@ pub fn or_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // dict | dict — PEP 584 merge. PyPy: dictmultiobject.py descr_or.
         // Returns a new dict built from `a`'s items, then updated with `b`'s.
         if pyre_object::is_dict(a) && pyre_object::is_dict(b) {
-            // `dictmultiobject.py:288-293 descr_or` — `copyself = self.copy()`
+            // `dictmultiobject.py descr_or` — `copyself = self.copy()`
             // then `update1(space, copyself, w_other)`.  Storing `a`'s items
             // one at a time instead re-hashes every key through its `__hash__`,
             // which the strategy copy does not do.  Each of those hashes also
@@ -5164,7 +5164,7 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 _ => unreachable!(),
             }));
         }
-        // `dictmultiobject.py:1619-1623 _is_set_like` parity — when
+        // `dictmultiobject.py _is_set_like` parity — when
         // one side is a set/frozenset and the other is a set-like
         // dict_view (Keys / Items), the comparison reduces to the
         // set-set arm with the dict_view materialised through its
@@ -5395,7 +5395,7 @@ pub fn pos(a: PyObjectRef) -> PyResult {
             return Ok(w_int_new(int_value(a)));
         }
         if is_long(a) {
-            // intobject.py:182-191 `_self_unaryop('pos')` delegates to
+            // intobject.py `_self_unaryop('pos')` delegates to
             // `self.int(space)`, which returns `self` only for the exact
             // builtin representation.  A subclass returns a plain-int copy
             // (long_pos: exact → self, else `_PyLong_Copy`), so leaking the

@@ -62,7 +62,7 @@ impl AllJitCodes {
 /// In majit, CallControl is passed by `&mut` reference to avoid
 /// lifetime entanglement with the Transformer's borrows.
 pub struct CodeWriter {
-    /// RPython: `self.assembler = Assembler()` (codewriter.py:22).
+    /// RPython: `self.assembler = Assembler()` (codewriter.py).
     pub assembler: Assembler,
     /// RPython: `self.debug = True` (codewriter.py:18).
     pub debug: bool,
@@ -78,7 +78,7 @@ pub struct CodeWriter {
 }
 
 impl CodeWriter {
-    /// RPython: `CodeWriter.__init__(cpu, jitdrivers_sd)` (codewriter.py:20-23).
+    /// RPython: `CodeWriter.__init__(cpu, jitdrivers_sd)` (codewriter.py).
     ///
     /// `debug` mirrors the class-level default `debug = True`
     /// (`codewriter.py:18`). Upstream always produces per-jitcode
@@ -93,7 +93,7 @@ impl CodeWriter {
         }
     }
 
-    /// `codewriter.py:91-94 CodeWriter.setup_vrefinfo(self, vrefinfo)`.
+    /// `codewriter.py CodeWriter.setup_vrefinfo(self, vrefinfo)`.
     ///
     /// ```python
     /// def setup_vrefinfo(self, vrefinfo):
@@ -199,7 +199,7 @@ impl CodeWriter {
         // attrfamily merge.  No-op for pyre production (no families).
         registry.populate_trait_family_base_attrs(callcontrol.trait_family_registrations());
         // RPython parity: `Translator.buildannotator()` /
-        // `Translator.buildrtyper()` (`translator.py:69-83`) construct
+        // `Translator.buildrtyper()` (`translator.py`) construct
         // exactly one annotator and one rtyper per Translator and assert
         // on re-entry.  Pyre mirrors that contract through
         // [`PyreCallRegistry::ensure_session`]
@@ -598,7 +598,7 @@ impl CodeWriter {
         // Variable's lltype onto the matching legacy Variable so
         // `FunctionGraph::concretetype_of(&v)` reads its `concretetype`
         // cell directly.  Upstream parity:
-        // `history.py:46-71 getkind` reads `v.concretetype` from the
+        // `history.py getkind` reads `v.concretetype` from the
         // Variable, so this hydration makes pyre's read path
         // line-for-line equivalent.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
@@ -746,7 +746,7 @@ impl CodeWriter {
                 .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol))
         });
 
-        // call.py:174-187 get_jitcode_calldescr:
+        // call.py get_jitcode_calldescr:
         //   FUNC = lltype.typeOf(fnptr).TO
         //   NON_VOID_ARGS = [ARG for ARG in FUNC.ARGS if ARG is not lltype.Void]
         //   calldescr = self.cpu.calldescrof(FUNC, tuple(NON_VOID_ARGS),
@@ -760,7 +760,7 @@ impl CodeWriter {
         {
             let start_block = rewritten_graph.block(rewritten_graph.startblock);
             let mut arg_classes = String::new();
-            // RPython `call.py:181-187 get_jitcode_calldescr` derives
+            // RPython `call.py get_jitcode_calldescr` derives
             // `FUNC.ARGS` from `lltype.typeOf(fnptr).TO.ARGS`
             // directly.  Pyre's source-of-truth analogue is each
             // start-block inputarg's backing `Variable.concretetype`:
@@ -834,7 +834,7 @@ impl CodeWriter {
         jitcode.set_index(index);
 
         if self.debug {
-            // RPython `codewriter.py:71-72` → `print_ssa_repr(ssarepr,
+            // RPython `codewriter.py` → `print_ssa_repr(ssarepr,
             // portal_jd, verbose)` → `log.dot()` (default, verbose=False)
             // or `print(format_assembler(ssarepr))` (verbose=True). Pyre
             // currently mirrors only the low-noise branch: one line per
@@ -887,7 +887,7 @@ impl CodeWriter {
         );
     }
 
-    /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
+    /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py).
     ///
     /// Full pipeline: grab_initial_jitcodes → enum_pending_graphs loop → finished.
     pub fn make_jitcodes(
@@ -919,7 +919,7 @@ impl CodeWriter {
     /// is guaranteed by `CallControl::collect_jitcodes_in_alloc_order`.
     ///
     /// `verbose` threads through to `transform_graph_to_jitcode`'s debug
-    /// branch; upstream `codewriter.py:74 make_jitcodes(verbose=False)`
+    /// branch; upstream `codewriter.py make_jitcodes(verbose=False)`
     /// treats `False` as the default, matching pyre's call site in
     /// `make_jitcodes` which does not expose the knob to callers yet.
     pub fn drain_pending_graphs(
@@ -974,7 +974,7 @@ impl CodeWriter {
                 continue;
             }
             let Some(graph) = callcontrol.function_graphs().get(&path).cloned() else {
-                // RPython `enum_pending_graphs` (codewriter.py:79-84)
+                // RPython `enum_pending_graphs` (codewriter.py)
                 // never yields a jitcode whose graph is missing —
                 // `get_jitcode()` only allocates shells for paths that
                 // already live in `function_graphs`. Pyre keeps that
@@ -1069,7 +1069,7 @@ impl Default for CodeWriter {
 /// `SomeInstance.classdef` when present, resolves the impl_type name
 /// from the MethodDesc's selfclassdef, builds
 /// `CallPath::for_impl_method` and stamps it as `resolved_path`.
-/// call.py:181 `getfunctionptr(graph)` — consumer does
+/// call.py `getfunctionptr(graph)` — consumer does
 /// `function_graphs.get(&path)` directly.
 #[expect(
     clippy::mutable_key_type,
@@ -1115,7 +1115,7 @@ fn stamp_classdef_hints_on_graph(
             };
             // Resolve impl_type from the MethodDesc selfclassdef.
             // `getmethoddesc_for_attribute` returns the filtered desc
-            // set (classdesc.py:336-374 lookup_filter); in pyre's
+            // set (classdesc.py lookup_filter); in pyre's
             // closed world the receiver SomeInstance carries a single
             // concrete classdef, so the set binds to one selfclassdef
             // and `.next()` selects it. A multi-desc PBC set has no
@@ -1165,7 +1165,7 @@ fn stamp_classdef_hints_on_graph(
 ///
 /// Upstream reads `lltype.typeOf(fnptr).TO.RESULT` from the function
 /// pointer type; the graph-level surface is
-/// `flowspace/model.py:17-18` `graph.returnblock = Block([return_var])`,
+/// `flowspace/model.py` `graph.returnblock = Block([return_var])`,
 /// where `return_var.concretetype` carries the same information.
 /// Pyre reads `graph.concretetype(returnblock.inputargs[0])`,
 /// which routes straight to the backing
@@ -1281,7 +1281,7 @@ mod stamp_classdef_hints_tests {
     /// a `SomePBC` with a `MethodDesc`, the producer routes the receiver
     /// classdef + method name through `Bookkeeper.getmethoddesc_for_attribute`
     /// so the upstream-orthodox `bookkeeper.methoddescs` cache (per
-    /// `bookkeeper.py:431-442 getmethoddesc`) is populated. The cache
+    /// `bookkeeper.py getmethoddesc`) is populated. The cache
     /// is the real PyPy structure; pyre stores no separate
     /// MethodDescKey side-table on CallControl.
     #[test]
@@ -1306,7 +1306,7 @@ mod stamp_classdef_hints_tests {
         // Seed the realistic upstream pattern: `attrs[push_value]`
         // carries an *unbound* MethodDesc (selfclassdef = None). PyPy
         // attaches the unbound carrier to the class dict at class-
-        // definition time, then `bookkeeper.py:384` getdesc binds it
+        // definition time, then `bookkeeper.py` getdesc binds it
         // to the receiver on every access. The producer must perform
         // the same bind via `getmethoddesc_for_attribute`.
         let funcdesc = crate::annotator::description::FuncDescEntry::plain(Rc::new(RefCell::new(

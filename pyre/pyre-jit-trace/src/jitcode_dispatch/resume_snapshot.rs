@@ -218,10 +218,10 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
         return Err(DispatchError::GuardSnapshotVableUntyped { pc: op_pc });
     }
     // Give this promote guard the full inline resume represented by
-    // `_nonstandard_virtualizable` (pyjitpl.py:1120),
-    // `implement_guard_value(eqbox, pc)` (pyjitpl.py:1916),
-    // `generate_guard(GUARD_VALUE, resumepc=orgpc)` (pyjitpl.py:2582),
-    // and `capture_resumedata(resumepc)` (pyjitpl.py:2610) walking the full MIFrame chain
+    // `_nonstandard_virtualizable` (pyjitpl.py),
+    // `implement_guard_value(eqbox, pc)` (pyjitpl.py),
+    // `generate_guard(GUARD_VALUE, resumepc=orgpc)` (pyjitpl.py),
+    // and `capture_resumedata(resumepc)` (pyjitpl.py) walking the full MIFrame chain
     // (opencoder.py:819). Publish the callee's own coordinate when the inline
     // chain is either the single callee frame or is fully covered by paused
     // callers; both shapes are directly represented by the frame list.  Stamp
@@ -1218,7 +1218,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // admitted this guard assumed the recovery covered it, so decline
             // rather than encode the stale merge-color read.
             //
-            // `get_list_of_active_boxes` (`pyjitpl.py:225`) has no such case:
+            // `get_list_of_active_boxes` (`pyjitpl.py`) has no such case:
             // it reads `self.registers_r[index]`, and the register bank IS the
             // source, so every live index resolves by construction.  Pyre's
             // operand stack lives in the virtualizable and is rebuilt from a
@@ -1475,7 +1475,7 @@ pub(crate) fn concrete_ref_for_opref<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     opref: OpRef,
 ) -> Option<pyre_object::PyObjectRef> {
-    // RPython history.py:361 defines CONST_NULL as a real
+    // RPython history.py defines CONST_NULL as a real
     // `ConstPtr(lltype.nullptr(llmemory.GCREF.TO))`.  Preserve that typed
     // constant before consulting the runtime-concrete table: an inline
     // ConstPtr(NULL) is positive proof that this operand-stack slot contains
@@ -1779,7 +1779,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         jitcode_index as i32,
         i32::try_from(call.next_pc).ok()?,
     );
-    // `_copy_data_from_miframe` (`blackhole.py:1711-1730`) copies the WHOLE
+    // `_copy_data_from_miframe` (`blackhole.py`) copies the WHOLE
     // bank — `range(num_regs_i/r/f())` — filtering only on "the MIFrame has a
     // box here", never on liveness.  Each bank below therefore runs twice: the
     // liveness pass, which still DEMANDS a concrete for every color live at
@@ -2459,7 +2459,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                         continue;
                     }
                     let idx = ctx.trace_ctx.const_int(slot as i64);
-                    // pyjitpl.py:3489-3521 `gen_store_back_in_vable`
+                    // pyjitpl.py `gen_store_back_in_vable`
                     // escape flush uses the standard recorded store path.
                     ctx.trace_ctx
                         .profiler()

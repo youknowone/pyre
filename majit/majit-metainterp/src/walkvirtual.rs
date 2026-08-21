@@ -7,7 +7,7 @@
 
 use majit_ir::{DescrRef, OpRef};
 
-/// walkvirtual.py:4-39: VirtualVisitor
+/// walkvirtual.py: VirtualVisitor
 ///
 /// Abstract base class. Every method raises NotImplementedError in RPython;
 /// in Rust this is expressed as required trait methods with no defaults.
@@ -16,8 +16,8 @@ use majit_ir::{DescrRef, OpRef};
 ///
 /// `VInfo` is the associated return type for `visit_*` dispatch methods.
 /// Both RPython subclasses return values:
-/// - `ResumeDataVirtualAdder` (resume.py:320-357) returns `VirtualInfo` subclasses
-/// - `VirtualStateConstructor` (virtualstate.py:743-760) returns `VirtualStateInfo` subclasses
+/// - `ResumeDataVirtualAdder` (resume.py) returns `VirtualInfo` subclasses
+/// - `VirtualStateConstructor` (virtualstate.py) returns `VirtualStateInfo` subclasses
 ///   RPython relies on dynamic dispatch; Rust models this with an associated
 ///   type on the trait (the single minimal adaptation due to static typing).
 pub trait VirtualVisitor {
@@ -41,7 +41,7 @@ pub trait VirtualVisitor {
         fielddescrs: &[DescrRef],
     ) -> Self::VInfo;
 
-    /// walkvirtual.py:11; info.py:368-372. See `visit_virtual` for the
+    /// walkvirtual.py; info.py. See `visit_virtual` for the
     /// compatibility note on `fielddescr_indices`.
     fn visit_vstruct(
         &mut self,
@@ -53,7 +53,7 @@ pub trait VirtualVisitor {
     /// walkvirtual.py:14; info.py:597-599
     fn visit_varray(&mut self, arraydescr: &DescrRef, clear: bool) -> Self::VInfo;
 
-    /// walkvirtual.py:17; info.py:700-704. See `visit_virtual` for the
+    /// walkvirtual.py; info.py. See `visit_virtual` for the
     /// compatibility note on `fielddescr_indices`.
     fn visit_varraystruct(
         &mut self,
@@ -84,7 +84,7 @@ pub trait VirtualVisitor {
     /// walkvirtual.py:32; vstring.py:262-264
     fn visit_vstrslice(&mut self, is_unicode: bool) -> Self::VInfo;
 
-    /// walkvirtual.py:35; info.py:298-302 _visitor_walk_recursive
+    /// walkvirtual.py:35; info.py _visitor_walk_recursive
     fn register_virtual_fields(&mut self, virtualbox: OpRef, fieldboxes: &[OpRef]);
 
     /// walkvirtual.py:38

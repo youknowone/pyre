@@ -171,7 +171,7 @@ extern "C" fn jit_commit_io_shim() {
 /// so that each successful loop iteration flushes its I/O.
 pub fn emit_commit_io(ctx: &mut TraceCtx) {
     let func_ref = ctx.const_int(jit_commit_io_shim as *const () as usize as i64);
-    // `call.py:303 getcalldescr`'s `else` branch — `_canraise(op) == False`
+    // `call.py getcalldescr`'s `else` branch — `_canraise(op) == False`
     // for `jit_commit_io_shim`: it flushes a thread-local `Vec<u8>` to
     // stdout (`io_buffer_commit`); no allocation that can `MemoryError`,
     // no Python-level dispatch that can raise. `EF_CANNOT_RAISE` lets

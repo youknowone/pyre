@@ -6,7 +6,7 @@
 //! the two decoders an oracle for each other: for every fail-arg index `i`, the
 //! `typed_outputs[i]` the raw path reports and the value
 //! `get_{int,float,ref}_value(deadframe, i)` reads back must be the same value.
-//! `llmodel.py:437-439 get_int_value` is the single logical accessor both are
+//! `llmodel.py get_int_value` is the single logical accessor both are
 //! standing in for, so a disagreement means one of them is answering in the
 //! wrong index space.
 //!
@@ -296,7 +296,7 @@ fn guard_float_and_int() -> Case {
 
 /// A guard whose middle fail arg is an absent slot. `locs_for_fail_args` gives
 /// an absent operand no location at all, and the encoder writes 0xFFFF for it
-/// (`llsupport/assembler.py:248-276 store_info_on_descr`), which is the
+/// (`llsupport/assembler.py store_info_on_descr`), which is the
 /// unmapped entry `_decode_pos` has to answer 0 for.
 fn guard_with_hole() -> Case {
     let mut backend = DynasmBackend::new();

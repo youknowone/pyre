@@ -216,7 +216,7 @@ pub fn ll_getlength() -> Result<(), TyperError> {
     Err(builder_runtime_deferred("ll_getlength"))
 }
 
-/// Synthesise `ll_getlength(ll_builder)` (`rbuilder.py:347-350`):
+/// Synthesise `ll_getlength(ll_builder)` (`rbuilder.py`):
 /// `ll_builder.total_size - (ll_builder.current_end - ll_builder.current_pos)`.
 pub fn build_ll_getlength_helper_graph(
     name: &str,
@@ -314,7 +314,7 @@ pub fn ll_bool() -> Result<(), TyperError> {
     Err(builder_runtime_deferred("ll_bool"))
 }
 
-/// Synthesise `ll_bool(ll_builder)` (`rbuilder.py:417-418`):
+/// Synthesise `ll_bool(ll_builder)` (`rbuilder.py`):
 /// `ll_builder != nullptr(lltype.typeOf(ll_builder).TO)`.
 pub fn build_ll_bool_helper_graph(
     name: &str,
@@ -361,7 +361,7 @@ pub fn build_ll_bool_helper_graph(
     ))
 }
 
-/// Synthesise `ll_new(init_size)` (`rbuilder.py:446-455` / `469-478`):
+/// Synthesise `ll_new(init_size)` (`rbuilder.py` / `469-478`):
 ///
 /// ```python
 /// init_size = intmask(min(r_uint(init_size), r_uint(1280)))
@@ -373,7 +373,7 @@ pub fn build_ll_bool_helper_graph(
 /// return ll_builder
 /// ```
 ///
-/// `min` is `rbuiltin.ll_min` (`rbuiltin.py:238`) and `mallocfn` is the
+/// `min` is `rbuiltin.ll_min` (`rbuiltin.py`) and `mallocfn` is the
 /// specialization's `staticAdtMethod(rstr.mallocstr / mallocunicode)`
 /// (`rbuilder.py:54`/`72`) — both baked in as `direct_call` callee consts,
 /// mirroring [`build_ll_call_lookup_function_helper_graph`]. `buf_lltype`
@@ -497,7 +497,7 @@ pub fn build_ll_new_helper_graph(
     ))
 }
 
-/// Synthesise `ll_shrink_final(ll_builder)` (`rbuilder.py:365-372`):
+/// Synthesise `ll_shrink_final(ll_builder)` (`rbuilder.py`):
 ///
 /// ```python
 /// final_size = ll_builder.current_pos
@@ -508,7 +508,7 @@ pub fn build_ll_new_helper_graph(
 /// ll_builder.total_size = final_size
 /// ```
 ///
-/// `rgc.ll_shrink_array` (`rgc.py:471`) is baked in as a `direct_call`
+/// `rgc.ll_shrink_array` (`rgc.py`) is baked in as a `direct_call`
 /// callee const (`shrink_array_fn`); `buf_lltype` is `STRPTR`/`UNICODEPTR`.
 /// Returns `Void`.
 pub fn build_ll_shrink_final_helper_graph(
@@ -2421,7 +2421,7 @@ pub fn build_ll_append_charpsize_helper_graph(
     ))
 }
 
-/// Synthesise `ll_append(ll_builder, ll_str)` (`rbuilder.py:155-161`):
+/// Synthesise `ll_append(ll_builder, ll_str)` (`rbuilder.py`):
 ///
 /// ```python
 /// if jit.we_are_jitted():
@@ -2576,7 +2576,7 @@ pub fn build_ll_append_helper_graph(
     ))
 }
 
-/// Synthesise `ll_jit_append(ll_builder, ll_str)` (`rbuilder.py:164-169`):
+/// Synthesise `ll_jit_append(ll_builder, ll_str)` (`rbuilder.py`):
 ///
 /// ```python
 /// if ll_jit_try_append_slice(ll_builder, ll_str, 0, len(ll_str.chars)):
@@ -2699,7 +2699,7 @@ pub fn build_ll_jit_append_helper_graph(
     ))
 }
 
-/// Synthesise `ll_append_char(ll_builder, char)` (`rbuilder.py:178-184`):
+/// Synthesise `ll_append_char(ll_builder, char)` (`rbuilder.py`):
 ///
 /// ```python
 /// jit.conditional_call(ll_builder.current_pos == ll_builder.current_end,
@@ -3885,7 +3885,7 @@ pub fn build_ll_jit_try_append_slice_helper_graph(
     ))
 }
 
-/// Synthesise `ll_grow_by(ll_builder, needed)` (`rbuilder.py:96-115`):
+/// Synthesise `ll_grow_by(ll_builder, needed)` (`rbuilder.py`):
 ///
 /// ```python
 /// try:
@@ -4087,7 +4087,7 @@ pub fn build_ll_grow_by_helper_graph(
     ))
 }
 
-/// Synthesise `ll_append_res0(ll_builder, ll_str)` (`rbuilder.py:172-173`):
+/// Synthesise `ll_append_res0(ll_builder, ll_str)` (`rbuilder.py`):
 /// `_ll_append(ll_builder, ll_str, 0, len(ll_str.chars))`. `_ll_append` is
 /// baked in as a `direct_call` callee const. Returns `Void`.
 pub fn build_ll_append_res0_helper_graph(
@@ -4163,7 +4163,7 @@ pub fn build_ll_append_res0_helper_graph(
 }
 
 /// Synthesise `ll_append_res_slice(ll_builder, ll_str, start, end)`
-/// (`rbuilder.py:206-207`): `_ll_append(ll_builder, ll_str, start,
+/// (`rbuilder.py`): `_ll_append(ll_builder, ll_str, start,
 /// end - start)`. `_ll_append` baked in as a `direct_call` callee const.
 /// Returns `Void`.
 pub fn build_ll_append_res_slice_helper_graph(
@@ -4534,7 +4534,7 @@ pub fn build_ll__ll_append_helper_graph(
     ))
 }
 
-/// Synthesise `ll_fold_pieces(ll_builder)` (`rbuilder.py:374-412`):
+/// Synthesise `ll_fold_pieces(ll_builder)` (`rbuilder.py`):
 ///
 /// ```python
 /// final_size = BaseStringBuilderRepr.ll_getlength(ll_builder)
@@ -4978,7 +4978,7 @@ pub fn build_ll_fold_pieces_helper_graph(
     ))
 }
 
-/// Synthesise `ll_build(ll_builder)` (`rbuilder.py:356-363`):
+/// Synthesise `ll_build(ll_builder)` (`rbuilder.py`):
 ///
 /// ```python
 /// if ll_builder.extra_pieces:
@@ -5172,7 +5172,7 @@ fn array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
     }))
 }
 
-/// Synthesise `rgc.ll_arrayclear(p)` (`rpython/rlib/rgc.py:510`):
+/// Synthesise `rgc.ll_arrayclear(p)` (`rpython/rlib/rgc.py`):
 ///
 /// ```python
 /// def ll_arrayclear(p):
@@ -5348,7 +5348,7 @@ pub fn build_ll_arrayclear_helper_graph(
     ))
 }
 
-/// Synthesise `rgc.ll_arrayfill(p, item)` (`rpython/rlib/rgc.py:540`,
+/// Synthesise `rgc.ll_arrayfill(p, item)` (`rpython/rlib/rgc.py`,
 /// `@jit.dont_look_inside @specialize.ll()`):
 ///
 /// ```python
@@ -5549,7 +5549,7 @@ impl StringBuilderRepr {
     }
 
     /// RPython `AbstractStringBuilderRepr.rtyper_new(self, hop)`
-    /// (`rtyper/rbuilder.py:8-13`), inherited by `StringBuilderRepr`.
+    /// (`rtyper/rbuilder.py`), inherited by `StringBuilderRepr`.
     pub fn rtyper_new(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_builder_new(
             hop,
@@ -7036,7 +7036,7 @@ mod tests {
         );
     }
 
-    /// rbuilder.py:42-45 — `rtype_method_getlength` lowers to a single
+    /// rbuilder.py — `rtype_method_getlength` lowers to a single
     /// `direct_call` against the `ll_getlength` helper graph.
     #[test]
     fn stringbuilder_rtype_method_getlength_emits_direct_call() {
@@ -7060,7 +7060,7 @@ mod tests {
         assert_single_direct_call_to(&llops, "ll_getlength");
     }
 
-    /// rbuilder.py:52-55 — `rtype_bool` lowers to a single `direct_call`
+    /// rbuilder.py — `rtype_bool` lowers to a single `direct_call`
     /// against the `ll_bool` helper graph.
     #[test]
     fn stringbuilder_rtype_bool_emits_direct_call() {
@@ -7107,7 +7107,7 @@ mod tests {
         )
     }
 
-    /// rtyper/rbuilder.py:8-13 — `rtyper_new` on a zero-argument
+    /// rtyper/rbuilder.py — `rtyper_new` on a zero-argument
     /// constructor lowers to a single `direct_call` against the `ll_new`
     /// helper graph (the `INIT_SIZE` default feeds the const arg).
     #[test]
@@ -7150,7 +7150,7 @@ mod tests {
         assert_single_direct_call_to(&llops, "ll_new");
     }
 
-    /// rbuilder.py:42-45 mirror for UnicodeBuilderRepr — same shape,
+    /// rbuilder.py mirror for UnicodeBuilderRepr — same shape,
     /// distinct builder pointer lltype (`Ptr(UNICODEBUILDER)`).
     #[test]
     fn unicodebuilder_rtype_method_getlength_emits_direct_call() {
@@ -7174,7 +7174,7 @@ mod tests {
         assert_single_direct_call_to(&llops, "ll_getlength");
     }
 
-    /// rbuilder.py:52-55 mirror for UnicodeBuilderRepr.
+    /// rbuilder.py mirror for UnicodeBuilderRepr.
     #[test]
     fn unicodebuilder_rtype_bool_emits_direct_call() {
         use crate::flowspace::model::Hlvalue;

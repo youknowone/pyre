@@ -25,7 +25,7 @@ struct BoundMethodInline {
 
 /// Where an element of a `defs_w` tuple lives, and therefore what the trace
 /// emits to read one.  `w_tuple_new` routes EVERY arity-2 tuple through
-/// `makespecialisedtuple2` (`specialisedtupleobject.py:169-179`), so a callee
+/// `makespecialisedtuple2` (`specialisedtupleobject.py`), so a callee
 /// with exactly two defaulted parameters — an extremely ordinary signature —
 /// never has an array-backed `defs_w` at all.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2199,7 +2199,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     )
 }
 
-/// `executioncontext.py:85-89 ExecutionContext.enter`, at an inlined call.
+/// `executioncontext.py ExecutionContext.enter`, at an inlined call.
 ///
 /// ```python
 /// def enter(self, frame):
@@ -2275,7 +2275,7 @@ fn walker_ec_enter(
     vref
 }
 
-/// `executioncontext.py:91-107 ExecutionContext.leave`'s frame-chain half, at
+/// `executioncontext.py ExecutionContext.leave`'s frame-chain half, at
 /// the return from an inlined call.
 ///
 /// ```python
@@ -2318,7 +2318,7 @@ pub(crate) fn walker_ec_leave(
     concrete_ec: *mut pyre_interpreter::PyExecutionContext,
     got_exception: bool,
 ) {
-    // `pyopcode.py:184 handle_operation_error` marks the frame finished before
+    // `pyopcode.py handle_operation_error` marks the frame finished before
     // an exception escapes into `ExecutionContext.leave`.  Ordinary returns
     // already publish `PyFrame.finish_value` at the lowered `*_return`
     // operation; this boundary supplies the exception sibling on this
@@ -2968,7 +2968,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
 /// Read one of the callee function's `_immutable_fields_` slots live and pin
 /// the value this inline baked, replacing the box so later reads fold.
 ///
-/// `function.py:34-42` declares `code?` / `w_func_globals?` / `closure?[*]` /
+/// `function.py` declares `code?` / `w_func_globals?` / `closure?[*]` /
 /// `defs_w?[*]`; pyre's setters do not yet force the quasi-immutable
 /// invalidation, so a `GuardValue` stands in for it.
 fn walker_guard_function_field<Sym: WalkSym>(
@@ -3158,7 +3158,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     require_exact_int_result: bool,
     instance_next_foriter_green_key: Option<u64>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    // `_compute_flatcall` (`pycode.py:256-268`) leaves `fast_natural_arity`
+    // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
     // `funcrun` path still traces through `_match_signature`, which writes a
     // surplus tuple for `*args` (`argument.py:222-234`); seed that one extra
@@ -3356,7 +3356,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
         pyre_object::PY_NULL
     };
-    // `pyjitpl.py:1382-1416`: consult `can_inline_callable` first, then bound
+    // `pyjitpl.py`: consult `can_inline_callable` first, then bound
     // recursive inlining at `max_unroll_recursion`.  Reaching the bound marks
     // this callee's entry greenkey `dont_trace_here`; that state transition is
     // essential for branching recursion.  Once one arm reaches the bound,
@@ -3540,7 +3540,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // the callee's `CodeObject` (self-recursive), so re-inlining
     // it rebuilds the identical framestack and reaches the identical abort —
     // the enclosing loop is retired for a decline that belongs to the callee.
-    // `warmstate.py:331` `disable_noninlinable_function` is the same answer:
+    // `warmstate.py` `disable_noninlinable_function` is the same answer:
     // the flag it sets means "do not inline calls to this function", and the
     // enclosing loop is left free to retrace.
     //
@@ -4056,7 +4056,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // must not do (a baked `ConstPtr`).
         walker_pin_function_code(ctx, op.pc, callable)?;
     } else {
-        // `function.py:91-96 getcode()` promotes `self.code`, never `self`.
+        // `function.py getcode()` promotes `self.code`, never `self`.
         // The code object below and globals namespace in `InlineCalleeConsts`
         // are baked constants, so guard those `?`-fields off the live
         // function. `defs_w` has its own guard below. Closure cells differ:
@@ -4180,7 +4180,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         //
         // Identity is stricter than needed and costs nothing measured.  All
         // three compilers fold an all-constant defaults list into one code
-        // constant — `codegen.py:582-590 _visit_defaults` takes the
+        // constant — `codegen.py _visit_defaults` takes the
         // `_tuple_of_consts` branch, and pyre's own compiler emits the same
         // single `LOAD_CONST (None, 7)` — so even a `def` re-executed inside
         // the caller's loop hands out the same tuple every iteration.  Only a
@@ -4549,7 +4549,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
 
             callee_regs_r[frame_reg as usize] = callee_frame;
             // `perform_call` creates one concrete frame per MIFrame before
-            // `setup_call` installs the argument boxes (pyjitpl.py:2445-2476,
+            // `setup_call` installs the argument boxes (pyjitpl.py,
             // 1862-1874).  Mirror that recording-time object.  `setup_call`
             // installs the whole box list, so seed every local the symbolic
             // frame above got from `param_boxes` — a `*args` callee's packed
@@ -4852,14 +4852,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             inherited_caller_py_pc,
         )
     };
-    // `executioncontext.py:88 enter` — emitted here, past every decline gate,
+    // `executioncontext.py enter` — emitted here, past every decline gate,
     // so a callee that never runs leaves no half-entered chain behind.  A
     // seeded level is the only one with a frame object to enter with; an
     // unseeded (register-resident) inline has none, which is the remaining gap
     // between this chain and upstream's.  Upstream always has an app-level
     // frame here because it traces the interpreter's own frame construction,
     // so `enter` runs on a real frame object.  The frame `perform_call` →
-    // `newframe` pushes (`pyjitpl.py:2445-2476, 1862-1874`) is the tracer's
+    // `newframe` pushes (`pyjitpl.py, 1862-1874`) is the tracer's
     // `MIFrame` instead, and is not what `enter` takes its vref of.
     let entered_ec = callee_frame_seeded && !ca_concrete_frame.is_null() && {
         let concrete_ec = unsafe { (*ca_concrete_frame).execution_context }
@@ -4958,7 +4958,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         //    the local's recording-time concrete when the heapcache holds no
         //    entry.  A `try_multiframe` callee's param reads forward through the
         //    heapcache only until an in-callee may-force op runs
-        //    `reset_keep_likely_virtuals` (heapcache.py:183) and clears the array
+        //    `reset_keep_likely_virtuals` (heapcache.py) and clears the array
         //    cache; the post-call LOAD_FAST re-read then misses and the branch
         //    value goes non-concrete (`GotoIfNotValueNotConcrete`).  Seeding the
         //    shadow for `try_multiframe` too gives that re-read a fallback — the
@@ -5000,7 +5000,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // unbound.  Record that here so the store handler demotes just
                 // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
                 // what `_opimpl_setarrayitem_vable` does for a
-                // `_nonstandard_virtualizable` (`pyjitpl.py:1120`). Recording
+                // `_nonstandard_virtualizable` (`pyjitpl.py`). Recording
                 // those stores also emits the promote guard in
                 // `vable_getfield_*` (`pyjitpl.py:1916,2582`), whose resume
                 // image must include the paused caller frame
@@ -5046,7 +5046,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // two-frame specialization of `run_blackhole_interp_to_cancel_tracing`:
         // `_copy_data_from_miframe` preserves the callee's own position and
         // live registers instead of collapsing it onto the caller frame.
-        // `newframe(jitcode, greenkey)` (pyjitpl.py:2443-2445) — the callee this
+        // `newframe(jitcode, greenkey)` (pyjitpl.py) — the callee this
         // walk is about to inline is what upstream logs there.  The pair
         // brackets the `walk` call and nothing else: every decline is already
         // behind us and every exit below reads `result`, so the sequence
@@ -5122,7 +5122,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // legs do.
             //
             // Attempted whether or not the callee executed anything.
-            // `convert_and_run_from_pyjitpl` (`blackhole.py:1799-1821`) rebuilds
+            // `convert_and_run_from_pyjitpl` (`blackhole.py`) rebuilds
             // every framestack frame at its own pc unconditionally —
             // `run_blackhole_interp_to_cancel_tracing` ends `assert False`
             // (`pyjitpl.py:2956`) — and the caller is resumed PAST its call
@@ -5299,7 +5299,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
         (result, class_of_last_exc_is_const)
     };
-    // `executioncontext.py:91-107 leave`, in the original's `finally`
+    // `executioncontext.py leave`, in the original's `finally`
     // position: the sub-walk block above is an expression that always
     // completes, so every callee exit — return, exception, or decline —
     // arrives here before any of the early returns below.
@@ -5412,7 +5412,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             if walker_is_exact_machine_int_concrete(obj)
                     )
                 {
-                    // `descroperation.py:608-620 _index` validates the app-level
+                    // `descroperation.py _index` validates the app-level
                     // result before its caller continues, and a long, a bool or an
                     // int subclass are all legal there — only the machine-int
                     // arithmetic downstream cannot take them.  Decline instead of
@@ -6443,7 +6443,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
     }) else {
         return Ok(None);
     };
-    // `get_and_call_function` (`descroperation.py:169-187`) leads the
+    // `get_and_call_function` (`descroperation.py`) leads the
     // positionals with the receiver only for an exact `Function`; every other
     // descriptor goes through `space.get` first and is called with the name
     // alone.  The version-tag pin makes that binding decision a constant of the
@@ -6723,7 +6723,7 @@ pub(crate) struct IndexInlineCandidate {
 }
 
 /// Resolve and statically preflight the call made by
-/// `descroperation.py:599-620 _index`.  The body is held to the existing
+/// `descroperation.py _index`.  The body is held to the existing
 /// strict straight-line inline shape; a non-user descriptor, loop/raise body,
 /// or other unsupported function shape leaves the enclosing builtin on its
 /// ordinary residual path without having emitted anything.
@@ -6773,12 +6773,12 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
     // code, and the bytecode cannot tell them apart.  Separate them here, while
     // declining is still free: every name the body can name has to be a plain
     // mapdict slot on this very receiver, which is the question
-    // `mapdict.py:1479-1537 LOAD_ATTR_caching` asks.  A property, a slot this
+    // `mapdict.py LOAD_ATTR_caching` asks.  A property, a slot this
     // receiver does not carry, and a read chained through some other object all
     // fail it.  Deciding it after the body has run would be too late — a
     // getter's effect has happened by then.  Both storage shapes count: an
     // `__index__` returning an int attribute holds it unboxed
-    // (`mapdict.py:600-601 _prim_direct_read`), which is the common case here.
+    // (`mapdict.py _prim_direct_read`), which is the common case here.
     let mut name_idx = 0usize;
     while let Some(name) =
         crate::jitcode_dispatch::walker_load_name_from_code(w_code as usize, name_idx)
@@ -6889,7 +6889,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
 
 /// Inline `obj[key]` into the receiver type's Python `__getitem__`.
 ///
-/// `descroperation.py:356-381 DescrOperation.getitem` resolves `__getitem__`
+/// `descroperation.py DescrOperation.getitem` resolves `__getitem__`
 /// on the receiver's type and calls it; PyPy traces through that call and
 /// inlines the body.  pyre lowers BINARY_SUBSCR to one `binary_op` residual,
 /// and `try_walker_specialize_subscr` only recognizes the canonical tuple and
@@ -7581,7 +7581,7 @@ pub(crate) fn allocate_callee_register_banks(
 /// Apply the non-exceptional frame-exit state transition and return the
 /// callee's value for caller-side shape handling.
 ///
-/// `pyjitpl.py:2503-2506 finishframe` clears `last_exc_value` before
+/// `pyjitpl.py finishframe` clears `last_exc_value` before
 /// `popframe()`. Because the walker stores that state per frame, the caller's
 /// slot is the one that must observe the null after the callee returns.
 pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(

@@ -1,5 +1,5 @@
 //! Port of `rpython/translator/timing.py` — 52-LOC accumulator that
-//! `translator.driver.TranslationDriver._do` (`driver.py:271-282`)
+//! `translator.driver.TranslationDriver._do` (`driver.py`)
 //! wraps around every task to record per-goal elapsed time.
 //!
 //! Upstream file structure (line-by-line):
@@ -52,7 +52,7 @@ use std::time::Instant;
 
 use crate::tool::ansi_print::AnsiLogger;
 
-/// Upstream `timing.py:9` `log = AnsiLogger("Timer")` module-level
+/// Upstream `timing.py` `log = AnsiLogger("Timer")` module-level
 /// logger.  Routes `Timer.pprint`'s coloured bold output through the
 /// shared logger sink.
 pub static LOG: AnsiLogger = AnsiLogger::new("Timer");
@@ -93,7 +93,7 @@ impl TimeSource for SystemClock {
     }
 }
 
-/// Port of `rpython/translator/timing.py:11-50 Timer`.
+/// Port of `rpython/translator/timing.py Timer`.
 ///
 /// Upstream's state layout:
 /// - `self.events: list[(name, elapsed)]` — per-event timings.
@@ -134,7 +134,7 @@ pub struct Timer<T: TimeSource> {
 
 impl Timer<SystemClock> {
     /// Convenience constructor matching upstream's default
-    /// `Timer()` signature at `timing.py:12`. Uses `SystemClock` so
+    /// `Timer()` signature at `timing.py`. Uses `SystemClock` so
     /// callers that do not care about the clock source get the
     /// upstream-equivalent behaviour with zero boilerplate.
     pub fn new() -> Self {
@@ -163,7 +163,7 @@ impl<T: TimeSource> Timer<T> {
         }
     }
 
-    /// Upstream `Timer.start_event(self, event)` at `timing.py:18-23`.
+    /// Upstream `Timer.start_event(self, event)` at `timing.py`.
     /// Records the starting timestamp; `self.t0` captures the first
     /// `start_event`'s timestamp and is never reset afterwards
     /// (enabling `ttime()`'s "total wall-clock since first start"
@@ -177,7 +177,7 @@ impl<T: TimeSource> Timer<T> {
         self.start_time.set(Some(now));
     }
 
-    /// Upstream `Timer.end_event(self, event)` at `timing.py:25-30`.
+    /// Upstream `Timer.end_event(self, event)` at `timing.py`.
     /// Upstream uses a plain `assert self.next_event == event`, which
     /// panics in both `-O` and non-`-O` Python execution by default
     /// (only `python -OO` strips asserts, and PyPy translation never
@@ -207,7 +207,7 @@ impl<T: TimeSource> Timer<T> {
         self.tk.set(Some(now));
     }
 
-    /// Upstream `Timer.ttime(self)` at `timing.py:32-36`. Returns the
+    /// Upstream `Timer.ttime(self)` at `timing.py`. Returns the
     /// wall-clock span between the first `start_event` and the most
     /// recent `end_event`; `0.0` when either bookend is missing
     /// (upstream's `except AttributeError: return 0.0` path).
@@ -218,7 +218,7 @@ impl<T: TimeSource> Timer<T> {
         }
     }
 
-    /// Upstream `Timer.pprint(self)` at `timing.py:38-51`. Emits the
+    /// Upstream `Timer.pprint(self)` at `timing.py`. Emits the
     /// per-event table + total row through the module-level
     /// [`LOG`] `AnsiLogger("Timer")`'s `bold` channel, line-by-line
     /// matching upstream's four `log.bold(...)` calls.
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn new_timer_has_zero_ttime_until_start_end_complete() {
-        // Upstream `timing.py:32-36`: `ttime()` returns 0.0 when
+        // Upstream `timing.py`: `ttime()` returns 0.0 when
         // `self.tk - self.t0` would raise `AttributeError` (either
         // `t0` or `tk` unset).
         let t = Timer::new();
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn start_then_end_records_event_elapsed_and_updates_ttime() {
-        // Upstream `timing.py:18-30` — start_event captures `t0` and
+        // Upstream `timing.py` — start_event captures `t0` and
         // `start_time`; end_event appends `(event, now - start_time)`
         // and records `tk`.
         let clock = MockClock::new();
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "expected")]
     fn end_event_mismatched_name_asserts_in_debug_only() {
-        // Upstream `timing.py:26`: `assert self.next_event == event`.
+        // Upstream `timing.py`: `assert self.next_event == event`.
         // Debug-only assertion matches upstream's `assert`.
         let clock = MockClock::new();
         let timer = Timer::with_source(&clock);
@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn end_event_clears_next_event_marker() {
-        // Upstream `timing.py:29`: `self.next_event = None`.
+        // Upstream `timing.py`: `self.next_event = None`.
         let clock = MockClock::new();
         let timer = Timer::with_source(&clock);
         timer.start_event("e");

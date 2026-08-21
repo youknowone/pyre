@@ -69,7 +69,7 @@ pub fn run_repl(quiet: bool, no_site: bool) {
         pyre_object::w_dict_setitem_str(w_globals, "__name__", pyre_object::w_str_new("__main__"))
     };
 
-    // PyPy `module.py:77 Module.getdict()` parity: use the canonical
+    // PyPy `module.py Module.getdict()` parity: use the canonical
     // W_DictObject so REPL STORE_NAME writes, `globals()`, `f.__globals__`,
     // and `__main__.__dict__` all share one identity.
     let canonical = w_globals;

@@ -1,7 +1,7 @@
 //! Port slice of `rpython/translator/c/database.py`.
 //!
 //! This module starts with the constructor and the small methods needed by
-//! `genc.py:87-138 CBuilder.build_database`. The full node factory and C
+//! `genc.py CBuilder.build_database`. The full node factory and C
 //! rendering machinery remain to be ported from `database.py`.
 
 use std::any::Any;
@@ -14,7 +14,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj};
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
-/// RPython `gc.name_to_gcpolicy` values consumed by `genc.py:161-167`.
+/// RPython `gc.name_to_gcpolicy` values consumed by `genc.py`.
 #[derive(Clone, Debug)]
 pub enum GcPolicyClass {
     Boehm,
@@ -26,7 +26,7 @@ pub enum GcPolicyClass {
     /// the local port surfaces the raw name so the failure is at the
     /// downstream consumer instead of `from_name`.
     UnknownName(String),
-    /// Upstream `genc.py:161-167 get_gcpolicyclass`: when a custom
+    /// Upstream `genc.py get_gcpolicyclass`: when a custom
     /// `gcpolicy` was supplied to `CBuilder.__init__`, upstream
     /// returns the policy *object* itself. The Rust port keeps the
     /// `Rc<dyn Any>` so the policy's methods/state survive the call;
@@ -66,7 +66,7 @@ impl GcPolicyClass {
     }
 }
 
-/// Small port of `rpython/translator/c/gc.py:9-41 BasicGcPolicy`.
+/// Small port of `rpython/translator/c/gc.py BasicGcPolicy`.
 #[derive(Clone, Debug)]
 pub struct BasicGcPolicy {
     pub policy_class: GcPolicyClass,
@@ -81,12 +81,12 @@ impl BasicGcPolicy {
         }
     }
 
-    /// RPython `BasicGcPolicy.gc_startup_code()` at `gc.py:40-41`.
+    /// RPython `BasicGcPolicy.gc_startup_code()` at `gc.py`.
     pub fn gc_startup_code(&self) -> Vec<Rc<dyn Any>> {
         Vec::new()
     }
 
-    /// RPython `BasicGcPolicy.compilation_info()` at `gc.py:26-35`.
+    /// RPython `BasicGcPolicy.compilation_info()` at `gc.py`.
     /// GC-policy-specific ECI production has not landed yet, so this keeps
     /// the observable "maybe some compilation info" slot empty.
     pub fn compilation_info(&self) -> Option<Rc<dyn Any>> {
@@ -102,7 +102,7 @@ pub struct RevdbCommands {
     pub exported_name: Option<String>,
 }
 
-/// Port of `rpython/translator/c/database.py:27-71 LowLevelDatabase.__init__`.
+/// Port of `rpython/translator/c/database.py LowLevelDatabase.__init__`.
 #[derive(Clone)]
 pub struct LowLevelDatabase {
     pub translator: Option<Rc<TranslationContext>>,
@@ -125,7 +125,7 @@ pub struct LowLevelDatabase {
     pub containerstats: RefCell<HashMap<String, usize>>,
 
     /// RPython `late_initializations`, `completed`,
-    /// `instrument_ncounter`, `all_field_names` at `database.py:57-71`.
+    /// `instrument_ncounter`, `all_field_names` at `database.py`.
     pub late_initializations: RefCell<Vec<Rc<dyn Any>>>,
     pub completed: Cell<bool>,
     pub instrument_ncounter: Cell<usize>,
@@ -190,7 +190,7 @@ impl LowLevelDatabase {
         }
     }
 
-    /// Port slice of `LowLevelDatabase.get(obj)` at `database.py:181-...`.
+    /// Port slice of `LowLevelDatabase.get(obj)` at `database.py-...`.
     /// For function pointers, RPython returns the C function name; the
     /// local `lltype.getfunctionptr` port stores that in `_func._name`.
     ///
@@ -201,7 +201,7 @@ impl LowLevelDatabase {
     /// node-factory side effect — `entrypoint.pf` is therefore NOT a
     /// DB root, so [`Self::complete`] currently has nothing to walk
     /// from. Convergence path = port the
-    /// `database.py:34-71 getcontainernode` factory + the per-lltype
+    /// `database.py getcontainernode` factory + the per-lltype
     /// node renderers (`node.py:Function/StructNode/ArrayNode`); only
     /// after that lands does the `containerlist`/`containerstats`
     /// invariant hold.

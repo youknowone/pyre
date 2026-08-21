@@ -526,7 +526,7 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
     // ── LoadLibrary(name, load_flags=0) → HMODULE ──
     //
     // `LoadLibraryExW(name, NULL, load_flags)`.  The flags are not optional
-    // decoration: `CDLL._load_library` (`ctypes/__init__.py:435-451`) defaults
+    // decoration: `CDLL._load_library` (`ctypes/__init__.py`) defaults
     // `winmode` to `nt._LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` and adds
     // `_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` for a name carrying a separator, so
     // *every* `CDLL` on this platform arrives with a search policy to apply.

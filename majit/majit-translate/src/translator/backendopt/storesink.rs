@@ -20,7 +20,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 };
 use crate::translator::simplify;
 
-/// RPython `OK_OPS` (`storesink.py:8`). Allow-listed names that
+/// RPython `OK_OPS` (`storesink.py`). Allow-listed names that
 /// upstream's `has_side_effects` reports as side-effect-free even
 /// though `LLOp.sideeffects` is True.
 const OK_OPS: &[&str] = &[
@@ -29,7 +29,7 @@ const OK_OPS: &[&str] = &[
     "jit_force_virtualizable",
 ];
 
-/// RPython `has_side_effects(op)` (`storesink.py:10-16`).
+/// RPython `has_side_effects(op)` (`storesink.py`).
 fn has_side_effects(opname: &str) -> bool {
     if OK_OPS.contains(&opname) {
         return false;
@@ -59,7 +59,7 @@ enum CacheKey {
 
 type Cache = HashMap<CacheKey, Hlvalue>;
 
-/// RPython `storesink_graph(graph)` (`storesink.py:19-49`).
+/// RPython `storesink_graph(graph)` (`storesink.py`).
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -132,7 +132,7 @@ pub fn storesink_graph(graph: &FunctionGraph) {
     }
 }
 
-/// RPython `_translate_cache(cache, link)` (`storesink.py:51-72`).
+/// RPython `_translate_cache(cache, link)` (`storesink.py`).
 ///
 /// Maps cache entries through link.args → block.inputargs. If a
 /// cached variable is not yet plumbed across the edge, append a
@@ -229,7 +229,7 @@ fn _translate_cache(cache: &Cache, link: &LinkRef) -> Cache {
     new_cache
 }
 
-/// RPython `_storesink_block(block, cache, inputlink)` (`storesink.py:74-139`).
+/// RPython `_storesink_block(block, cache, inputlink)` (`storesink.py`).
 ///
 /// Returns `true` when the block grew at least one `same_as` op
 /// (cache hit replacing a getfield / cast_pointer).

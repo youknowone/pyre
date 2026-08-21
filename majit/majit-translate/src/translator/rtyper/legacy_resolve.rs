@@ -139,9 +139,9 @@ pub fn resolve_types(graph: &FunctionGraph) {
     // Unknown operands of pure integer ops to `Signed`, matching
     // RPython's mandatory kind assignment.  `ptr_eq` / `ptr_ne` remain
     // Ref-Ref (rewritten in `jtransform` per `rpython/jit/codewriter/
-    // jtransform.py:1243-1255 _rewrite_cmp_ptrs`) and are skipped.
+    // jtransform.py _rewrite_cmp_ptrs`) and are skipped.
     /// Operations whose RPython decorator requires integer operands on
-    /// both sides (`blackhole.py:459+ @arguments("i", "i", returns="i")`).
+    /// both sides (`blackhole.py+ @arguments("i", "i", returns="i")`).
     /// Unlike the comparison ops `lt`/`le`/`gt`/`ge`, no ptr-specific
     /// variant exists in RPython — these must see Signed operands.
     fn canonical_int_binop(op: &str) -> Option<&'static str> {
@@ -230,7 +230,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                             // `float_*` returns Float; comparisons
                             // `lt/le/gt/ge/eq/ne` → `float_*` returns
                             // Int (Bool — RPython `rfloat.py:133`,
-                            // `blackhole.py:731 bhimpl_float_eq`).
+                            // `blackhole.py bhimpl_float_eq`).
                             // `mod` is also Float when a Float operand is
                             // present, but jtransform lowers it to the
                             // residual `ll_math_fmod` helper rather than a
@@ -521,10 +521,10 @@ fn link_arg_concrete_type(src: &LinkArg) -> ConcreteType {
     match src {
         LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
         // RPython `pairtype(Repr, NoneRepr).convert_from_to`
-        // (`rpython/rtyper/rnone.py:48`) emits `inputconst(Void, None)`
+        // (`rpython/rtyper/rnone.py`) emits `inputconst(Void, None)`
         // when None flows into a `NoneRepr` target; the symmetric
         // `pairtype(NoneRepr, Repr).convert_from_to`
-        // (`rpython/rtyper/rnone.py:58`) emits `inputconst(r_to, None)`
+        // (`rpython/rtyper/rnone.py`) emits `inputconst(r_to, None)`
         // which is a null pointer for `Ptr`/ref targets.  Pyre's
         // construction sites that already know the target repr write
         // it onto `Constant.concretetype` at the construction site

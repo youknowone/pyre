@@ -1479,7 +1479,7 @@ impl HomeLiveness {
 
 /// Whether a call has to be followed by the frame and home reloads.
 ///
-/// callbuilder.py:29-43 splits this in two: `emit_no_collect` prepares the
+/// callbuilder.py splits this in two: `emit_no_collect` prepares the
 /// arguments and calls, while `emit` additionally pushes a gcmap and reloads a
 /// possibly-forwarded frame afterwards. Without a gcmap the collector cannot
 /// reach the home slots, so a callee that cannot collect leaves the JitFrame
@@ -1655,7 +1655,7 @@ fn emit_reload_ca_input_refs_from_homes(
     }
 }
 
-/// llsupport/gc.py:563 GcLLDescr_framework
+/// llsupport/gc.py GcLLDescr_framework
 ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
 /// Looks up the materialized table populated by the runner from the
 /// active gc_ll_descr. RPython resolves the same value via
@@ -1689,14 +1689,14 @@ pub struct GuardExit {
 ///
 /// Parity references:
 ///  * `llsupport/gc.py:162` / `gc.py:318` — `supports_guard_gc_type`
-///  * `llsupport/gc.py:592` — `get_translated_info_for_typeinfo`
-///  * `llsupport/gc.py:619` — `get_translated_info_for_guard_is_object`
-///  * `x86/assembler.py:1951` — `cpu.subclassrange_min_offset`
+///  * `llsupport/gc.py` — `get_translated_info_for_typeinfo`
+///  * `llsupport/gc.py` — `get_translated_info_for_guard_is_object`
+///  * `x86/assembler.py` — `cpu.subclassrange_min_offset`
 ///  * `x86/assembler.py:1971-1974` — constant-time
 ///    `(vtable_ptr.subclassrange_min, vtable_ptr.subclassrange_max)`
 ///
 /// The default sets `supports_guard_gc_type = false`, matching
-/// `AbstractCPU.supports_guard_gc_type` in `backend/model.py:21`; the
+/// `AbstractCPU.supports_guard_gc_type` in `backend/model.py`; the
 /// codegen arms assert this flag before reading any other field.
 #[derive(Clone, Default)]
 pub struct GuardGcTypeInfo {
@@ -1709,7 +1709,7 @@ pub struct GuardGcTypeInfo {
     ///     = (infobits_offset, T_IS_RPYTHON_INSTANCE_BYTE).
     pub infobits_offset: usize,
     pub is_object_flag: u8,
-    /// `cpu.subclassrange_min_offset` (x86/assembler.py:1951).
+    /// `cpu.subclassrange_min_offset` (x86/assembler.py).
     pub subclassrange_min_offset: usize,
     /// `(vtable_ptr.subclassrange_min, vtable_ptr.subclassrange_max)`
     /// looked up by constant classptr. Empty when
@@ -2014,10 +2014,10 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
                 .unwrap_or_else(|| fail_args.iter().map(|_| Type::Int).collect());
 
             let meta_descr = op.getdescr();
-            // `regalloc.py:496-499 consider_guard_value` — stamp the per-value
+            // `regalloc.py consider_guard_value` — stamp the per-value
             // counter here, where the native backends stamp it during guard
             // layout, so `store_guard_hashes`' `status == 0` gate
-            // (`compile.py:826-829`) leaves it alone and `must_compile` hashes
+            // (`compile.py`) leaves it alone and `must_compile` hashes
             // the (guard, failing value) pair. Without it a guard whose failing
             // value never repeats accumulates in one bucket and compiles
             // another bridge every `trace_eagerness` failures, without bound.
@@ -3827,7 +3827,7 @@ fn build_function(
                 guard_idx += 1;
             }
             OpCode::GuardClass | OpCode::GuardNonnullClass => {
-                // x86/assembler.py:1880-1891 _cmp_guard_class:
+                // x86/assembler.py _cmp_guard_class:
                 //   offset = self.cpu.vtable_offset
                 //   if offset is not None: CMP(mem(loc_ptr, offset), classptr)
                 //   else:
@@ -3855,7 +3855,7 @@ fn build_function(
                     // gcremovetypeptr fallback (assembler.py:1893-1901):
                     //   on x86_64 the typeid is a 32-bit value at offset 0.
                     let class_arg = op.arg(1).to_opref();
-                    // history.py:227 — inline-Const carries its class pointer directly.
+                    // history.py — inline-Const carries its class pointer directly.
                     let classptr = class_arg.const_int_value().expect(
                         "_cmp_guard_class: gcremovetypeptr requires \
                              loc_classptr to be a ConstInt immediate \
@@ -3958,7 +3958,7 @@ fn build_function(
                 guard_idx += 1;
             }
             OpCode::GuardNoException => {
-                // x86/assembler.py:1799-1801 generate_guard_no_exception:
+                // x86/assembler.py generate_guard_no_exception:
                 // `CMP(pos_exception, imm0)` — fail the guard when a pending
                 // exception is present, keyed on the exception TYPE slot
                 // (pos_exception), the same slot GuardException reads and the
@@ -3981,7 +3981,7 @@ fn build_function(
                 guard_idx += 1;
             }
             OpCode::GuardException => {
-                // x86/assembler.py:1808-1815 genop_guard_guard_exception:
+                // x86/assembler.py genop_guard_guard_exception:
                 //   load pos_exception; CMP expected; guard on equal; then
                 //   _store_and_reset_exception: resloc = pos_exc_value;
                 //   pos_exception = 0; pos_exc_value = 0.
@@ -4211,7 +4211,7 @@ fn build_function(
                 // a Ref receives on entry (`i64_extend_i32_u` loads, or a Rust
                 // residual shim's `ptr as i64`). Without this, a tagged small
                 // int with the top payload bit set (`(v<<1)|1` for v<0 or large
-                // v, rtagged.py:147 `ll_unboxed_to_int`) reads back with a zero
+                // v, rtagged.py `ll_unboxed_to_int`) reads back with a zero
                 // high half, and the trailing arithmetic `IntRshift(,1)` untag
                 // (a 64-bit `i64.shr_s`) recovers the wrong value. `i32.wrap` +
                 // `i64.extend_i32_s` is a no-op for a real heap pointer (top bit
@@ -4496,7 +4496,7 @@ fn build_function(
 
             // ── Exception handling ──
             OpCode::SaveException => {
-                // x86/assembler.py:1820-1821 genop_save_exception:
+                // x86/assembler.py genop_save_exception:
                 //   _store_and_reset_exception → resloc = [pos_exc_value];
                 //   [pos_exception] = 0; [pos_exc_value] = 0.
                 // The result is the caught exception the resumed handler reads,
@@ -4516,7 +4516,7 @@ fn build_function(
                 sink.i64_store(mem64(0));
             }
             OpCode::SaveExcClass => {
-                // x86/assembler.py:1817-1818 genop_save_exc_class:
+                // x86/assembler.py genop_save_exc_class:
                 //   MOV resloc, [pos_exception]
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
@@ -4526,7 +4526,7 @@ fn build_function(
                 }
             }
             OpCode::RestoreException => {
-                // x86/assembler.py:1845-1850 _restore_exception:
+                // x86/assembler.py _restore_exception:
                 //   MOV [pos_exc_value], excvalloc
                 //   MOV [pos_exception], exctploc
                 sink.i32_const(crate::jit_exc_value_addr() as i32);
@@ -4548,7 +4548,7 @@ fn build_function(
                 // call the wasm MVP does not need.
             }
 
-            // x86/assembler.py:1919-1922 genop_guard_guard_gc_type:
+            // x86/assembler.py genop_guard_guard_gc_type:
             // GUARD_GC_TYPE: args[0] = object ref, args[1] = expected
             // type_id. The majit runtime stores the typeid in the GC
             // header word placed immediately before the object payload
@@ -4586,7 +4586,7 @@ fn build_function(
                 }
                 guard_idx += 1;
             }
-            // x86/assembler.py:1924-1943 genop_guard_guard_is_object.
+            // x86/assembler.py genop_guard_guard_is_object.
             //     assert self.cpu.supports_guard_gc_type
             //     [loc_object, loc_typeid] = locs
             //     if IS_X86_32:
@@ -4614,7 +4614,7 @@ fn build_function(
                      supports_guard_gc_type (GcAllocator has not \
                      installed a TYPE_INFO layout)"
                 );
-                // assembler.py:1931-1932 MOV32 loc_typeid, mem(loc_object, 0).
+                // assembler.py MOV32 loc_typeid, mem(loc_object, 0).
                 // majit's GC header sits at obj - GcHeader::SIZE; the
                 // typeid occupies the lower TYPE_ID_BITS of that word.
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
@@ -4661,7 +4661,7 @@ fn build_function(
                 );
                 guard_idx += 1;
             }
-            // x86/assembler.py:1945-1980 genop_guard_guard_subclass.
+            // x86/assembler.py genop_guard_guard_subclass.
             //     assert self.cpu.supports_guard_gc_type
             //     [loc_object, loc_check_against_class, loc_tmp] = locs
             //     offset = self.cpu.vtable_offset
@@ -4698,7 +4698,7 @@ fn build_function(
                 //   .getint(): the bounds are resolved at codegen time,
                 //   so arg1 must be an immediate class pointer.
                 let class_arg = op.arg(1).to_opref();
-                // history.py:227 — inline-Const carries its class pointer directly.
+                // history.py — inline-Const carries its class pointer directly.
                 let loc_check_against_class = class_arg.const_int_value().unwrap_or_else(|| {
                     panic!(
                         "x86/assembler.py:1971 vtable_ptr = \
@@ -4912,9 +4912,9 @@ fn build_function(
                 ));
             }
             OpCode::LoadFromGcTable => {
-                // `assembler.py:1545` `genop_load_from_gc_table`: the arg is a
+                // `assembler.py` `genop_load_from_gc_table`: the arg is a
                 // `ConstInt(index)` into the per-loop `GcTable`
-                // (`remove_ref_constants`, rewrite.py:1100 `remove_constptr`)
+                // (`remove_ref_constants`, rewrite.py `remove_constptr`)
                 // whose base is baked absolute. The table is a plain guest heap
                 // allocation, so `base + index*WORD` is an ordinary linear-memory
                 // address; the collector forwards the slot in place, so the load
@@ -5536,7 +5536,7 @@ fn build_function(
             }
 
             // ── Allocation (via trampoline — treated as CALL) ──
-            // llmodel.py:775-790 bh_new* parity: a `New*` survives
+            // llmodel.py bh_new* parity: a `New*` survives
             // optimization whenever the allocated object escapes the trace
             // (e.g. reboxed result stored into a namespace). The trace cannot
             // allocate inline (the GC is host-side), so route through the
@@ -5708,7 +5708,7 @@ fn build_function(
                 }
 
                 if !OpRef::raw_is_constant(vi) {
-                    // llmodel.py:779-781 write_int_at_mem(res, vtable_offset,
+                    // llmodel.py write_int_at_mem(res, vtable_offset,
                     // WORD, vtable). The `ob_type` field is pointer-width: 4
                     // bytes on wasm32 (GuardClass reads it as i32), so store
                     // the low 32 bits to avoid clobbering the next field.
@@ -6810,7 +6810,7 @@ fn emit_guard_false(
     );
 }
 
-/// `llsupport/regalloc.py:873 next_op_can_accept_cc` — the comparison at `i`
+/// `llsupport/regalloc.py next_op_can_accept_cc` — the comparison at `i`
 /// may hand its condition straight to the op at `i + 1` instead of
 /// materialising a boolean, when that op is the condition's only reader. x86
 /// leaves the condition in the flags (`x86/regalloc.py:265
@@ -6837,7 +6837,7 @@ fn next_op_can_accept_cc<'a>(
     if !matches!(next_op.opcode, OpCode::GuardTrue | OpCode::GuardFalse) {
         return None;
     }
-    // history.py:220 `Const.is_constant()` — a Const operand is not an
+    // history.py `Const.is_constant()` — a Const operand is not an
     // op-result identity, so comparing raw positions against it is invalid.
     if next_op.num_args() == 0 || next_op.arg(0).is_constant() {
         return None;
@@ -6882,7 +6882,7 @@ fn next_ovf_guard(ops: &[Op], i: usize) -> Option<&Op> {
 /// Common guard exit: condition is on stack (i32), spill and leave on failure.
 ///
 /// The spill belongs in this arm rather than in one shared exit handler after
-/// the trace. x86/assembler.py:835-846 `write_pending_failure_recoveries` can
+/// the trace. x86/assembler.py `write_pending_failure_recoveries` can
 /// place its recovery stubs after the hot code because `GuardToken.fail_locs`
 /// (llsupport/assembler.py:24) freezes the register or stack location the
 /// allocator gave each fail argument *at the guard*, so a stub reads a fixed

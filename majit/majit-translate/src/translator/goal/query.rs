@@ -480,7 +480,7 @@ pub fn check_methods_qgen(t: &TranslationContext) -> Vec<String> {
                             Err(_) => continue,
                         };
                         // `isinstance(c, FunctionDesc)` — MemoDesc is-a
-                        // FunctionDesc (description.py:395). Key on the
+                        // FunctionDesc (description.py). Key on the
                         // FuncDescEntry's `desc_key()` (the MemoDesc wrapper
                         // for a memo, the FunctionDesc otherwise), the same
                         // key the `funcs` set is built from above via

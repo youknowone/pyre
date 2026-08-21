@@ -17,15 +17,15 @@ pub fn concrete_float_binop(op: BinaryOperator, lhs: f64, rhs: f64) -> Option<f6
         BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide if rhs != 0.0 => {
             Some(lhs / rhs)
         }
-        // floatobject.py:508: descr_floordiv → _divmod_w()[0]
+        // floatobject.py: descr_floordiv → _divmod_w()[0]
         BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide if rhs != 0.0 => {
             Some(float_divmod_w(lhs, rhs).0)
         }
-        // floatobject.py:520-540: descr_mod → fmod + sign correction + copysign
+        // floatobject.py: descr_mod → fmod + sign correction + copysign
         BinaryOperator::Remainder | BinaryOperator::InplaceRemainder if rhs != 0.0 => {
             Some(float_mod(lhs, rhs))
         }
-        // floatobject.py:561 descr_pow → _pow()
+        // floatobject.py descr_pow → _pow()
         BinaryOperator::Power | BinaryOperator::InplacePower => float_pow(lhs, rhs),
         _ => None,
     }
@@ -47,7 +47,7 @@ fn float_mod(x: f64, y: f64) -> f64 {
     m
 }
 
-/// floatobject.py:758-793: _divmod_w — returns (floordiv, mod).
+/// floatobject.py: _divmod_w — returns (floordiv, mod).
 fn float_divmod_w(x: f64, y: f64) -> (f64, f64) {
     let mut m = x % y; // fmod
     let mut div = (x - m) / y;
@@ -73,7 +73,7 @@ fn float_divmod_w(x: f64, y: f64) -> (f64, f64) {
     (floordiv, m)
 }
 
-/// floatobject.py:799-881: _pow with special-case handling.
+/// floatobject.py: _pow with special-case handling.
 /// Returns None for domain errors (negative base with fractional exponent).
 fn float_pow(x: f64, y: f64) -> Option<f64> {
     if y == 2.0 {

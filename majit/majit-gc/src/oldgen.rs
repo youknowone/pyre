@@ -240,7 +240,7 @@ impl OldGen {
         );
     }
 
-    /// incminimark.py:2695-2702 `free_unvisited_rawmalloc_objects_step`.
+    /// incminimark.py `free_unvisited_rawmalloc_objects_step`.
     /// Process at most `nobjects` candidates and return the unused part of the
     /// budget, exactly like the upstream routine.
     pub fn sweep_rawmalloc_step(&mut self, mut nobjects: usize) -> usize {
@@ -307,7 +307,7 @@ impl OldGen {
     }
 
     /// Non-incremental compatibility entry point, expressed as prepare plus
-    /// draining steps just like minimarkpage.py:376-383 `mass_free`.
+    /// draining steps just like minimarkpage.py `mass_free`.
     #[allow(dead_code)]
     pub fn sweep(&mut self) {
         self.sweep_prepare();

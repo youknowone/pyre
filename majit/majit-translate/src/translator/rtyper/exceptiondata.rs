@@ -7,7 +7,7 @@ use super::lltypesystem::lltype::LowLevelType;
 use super::rmodel::Repr;
 use super::rtyper::LowLevelFunction;
 
-/// RPython `class ExceptionData` (`exceptiondata.py:11-26`).
+/// RPython `class ExceptionData` (`exceptiondata.py`).
 ///
 /// Upstream's `__init__` obtains `r_type = rtyper.rootclass_repr` and
 /// `r_instance = getinstancerepr(rtyper, None)`, then freezes their
@@ -34,7 +34,7 @@ pub struct ExceptionData {
     pub(crate) fn_type_of_exc_inst: RefCell<Option<LowLevelFunction>>,
 }
 
-/// RPython `class UnknownException(Exception)` (`exceptiondata.py:7-8`).
+/// RPython `class UnknownException(Exception)` (`exceptiondata.py`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct UnknownException(pub String);
 

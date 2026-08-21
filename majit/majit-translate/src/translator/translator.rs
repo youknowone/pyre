@@ -43,7 +43,7 @@ pub struct TranslationOptions {
     pub sandbox: bool,
     /// RPython `config.translation.check_str_without_nul` (upstream
     /// default `False`). Copied into `TLS.check_str_without_nul` by
-    /// `RPythonAnnotator.build_types` (annrpython.py:84-85).
+    /// `RPythonAnnotator.build_types` (annrpython.py).
     pub check_str_without_nul: bool,
     /// RPython `config.translation.taggedpointers` (upstream default
     /// `False`). Consumed by `rclass.buildinstancerepr`
@@ -52,7 +52,7 @@ pub struct TranslationOptions {
     pub taggedpointers: bool,
     /// RPython `config.translation.withsmallfuncsets` (upstream
     /// default `0`, i.e. disabled). Gate read by
-    /// `rpython/rtyper/rpbc.py:27 small_cand` — when the PBC's
+    /// `rpython/rtyper/rpbc.py small_cand` — when the PBC's
     /// desc-set size is strictly less than `withsmallfuncsets`,
     /// `SmallFunctionSetPBCRepr` becomes a candidate instead of
     /// `FunctionsPBCRepr`.
@@ -85,7 +85,7 @@ pub struct TranslationConfig {
     /// RPython root-level `config.translating` BoolOption installed by
     /// `get_combined_translation_config(translating=...)` at
     /// `rpython/config/translationoption.py:284-293`. Upstream's
-    /// `TranslationContext.__init__` (translator.py:30) passes
+    /// `TranslationContext.__init__` (translator.py) passes
     /// `translating=True`, so every `TranslationContext` created
     /// without an explicit config observes
     /// `config.translating == True`.
@@ -214,7 +214,7 @@ pub struct CallGraphEdge {
     pub callee: GraphRef,
 }
 
-/// RPython `class TranslationContext` (translator.py:21-43).
+/// RPython `class TranslationContext` (translator.py).
 ///
 /// Held by [`RPythonAnnotator`]; fields land incrementally as the
 /// annotator driver's `self.translator.*` calls manifest.
@@ -224,32 +224,32 @@ pub struct TranslationContext {
     /// is passed to `__init__`; the Rust port mirrors that via
     /// `get_combined_translation_config()`.
     pub config: TranslationConfig,
-    /// RPython `self.annotator = None` (translator.py:31).
+    /// RPython `self.annotator = None` (translator.py).
     ///
     /// Upstream stores a direct back-reference to the live
     /// `RPythonAnnotator`. Rust keeps the same lookup surface but uses
     /// `Weak` to avoid the refcount cycle that Python's GC collects.
     pub annotator: RefCell<Option<Weak<RPythonAnnotator>>>,
-    /// RPython `self.rtyper = None` (translator.py:32).
+    /// RPython `self.rtyper = None` (translator.py).
     pub rtyper: RefCell<Option<Rc<RPythonTyper>>>,
-    /// RPython `self.platform = get_platform(config)` (translator.py:36).
+    /// RPython `self.platform = get_platform(config)` (translator.py).
     pub platform: Platform,
     /// RPython `translator.frozen`, set by `driver.task_database_c`
     /// before the C database builder walks annotated graphs.
     pub frozen: Cell<bool>,
-    // `self.exceptiontransformer = None` (translator.py:33) stays absent:
+    // `self.exceptiontransformer = None` (translator.py) stays absent:
     // exception-transform behavior belongs in pyre's Rust lowering path.
     /// RPython `self.graphs = []` — every flow graph known to the
     /// translator. `RPythonAnnotator.complete()` iterates this to force
     /// annotation of each return variable.
     pub graphs: RefCell<Vec<GraphRef>>,
-    /// RPython `self.callgraph = {}` (translator.py:41).
+    /// RPython `self.callgraph = {}` (translator.py).
     /// `{opaque_tag: (caller-graph, callee-graph)}` — keyed by
     /// `(caller, callee, tag)` triple (translator.py:66). Populated
     /// every time the annotator's `recursivecall` records a non-None
     /// `whence` tag.
     pub callgraph: RefCell<HashMap<CallGraphKey, CallGraphEdge>>,
-    /// RPython `self._prebuilt_graphs = {}` (translator.py:39).
+    /// RPython `self._prebuilt_graphs = {}` (translator.py).
     pub _prebuilt_graphs: RefCell<HashMap<HostObject, Rc<PyGraph>>>,
     /// Per-`HostObject` lift-failure record drained from
     /// `cutover::populate_call_registry_from_call_graphs`'s Pass 2
@@ -307,8 +307,8 @@ impl TranslationContext {
     }
 
     /// RPython `translator.annotator = self` assignment performed in
-    /// `RPythonAnnotator.__init__` (annrpython.py:30-35) and
-    /// `TranslationContext.buildannotator()` (translator.py:73-75).
+    /// `RPythonAnnotator.__init__` (annrpython.py) and
+    /// `TranslationContext.buildannotator()` (translator.py).
     pub fn set_annotator(&self, annotator: Weak<RPythonAnnotator>) {
         *self.annotator.borrow_mut() = Some(annotator);
     }
@@ -317,7 +317,7 @@ impl TranslationContext {
         self.annotator.borrow().as_ref().and_then(Weak::upgrade)
     }
 
-    /// RPython `TranslationContext.buildannotator()` (translator.py:70-75).
+    /// RPython `TranslationContext.buildannotator()` (translator.py).
     pub fn buildannotator(
         self: &Rc<Self>,
         policy: Option<AnnotatorPolicy>,
@@ -335,7 +335,7 @@ impl TranslationContext {
         annotator
     }
 
-    /// RPython `TranslationContext.buildflowgraph()` (translator.py:43-62).
+    /// RPython `TranslationContext.buildflowgraph()` (translator.py).
     pub fn buildflowgraph(&self, func: HostObject, mute_dot: bool) -> Result<Rc<PyGraph>, String> {
         let graph_func = func
             .user_function()
@@ -407,20 +407,20 @@ impl TranslationContext {
     }
 
     /// RPython `translator.rtyper = self` assignment performed in
-    /// `TranslationContext.buildrtyper()` (translator.py:83).  Mirror
+    /// `TranslationContext.buildrtyper()` (translator.py).  Mirror
     /// of [`Self::set_annotator`] for the rtyper slot.
     pub fn set_rtyper(&self, rtyper: Rc<RPythonTyper>) {
         *self.rtyper.borrow_mut() = Some(rtyper);
     }
 
-    /// RPython `TranslationContext.buildrtyper()` (translator.py:77-84).
+    /// RPython `TranslationContext.buildrtyper()` (translator.py).
     pub fn buildrtyper(&self) -> Rc<RPythonTyper> {
         let annotator = self.annotator().expect("ValueError: no annotator");
         if self.rtyper.borrow().is_some() {
             panic!("ValueError: we already have an rtyper");
         }
         let rtyper = Rc::new(RPythonTyper::new(&annotator));
-        // Upstream `rtyper.py:71`: `self.exceptiondata = ExceptionData(self)`
+        // Upstream `rtyper.py`: `self.exceptiondata = ExceptionData(self)`
         // is part of `RPythonTyper.__init__`. The Rust port defers the
         // initialisation so the rtyper can be wrapped in `Rc<Self>`
         // before populating; call it now so callers observe the same
@@ -436,7 +436,7 @@ impl TranslationContext {
         self.rtyper.borrow().as_ref().cloned()
     }
 
-    /// RPython `TranslationContext.checkgraphs()` (translator.py:94-96).
+    /// RPython `TranslationContext.checkgraphs()` (translator.py).
     pub fn checkgraphs(&self) {
         for graph in self.graphs.borrow().iter() {
             checkgraph(&graph.borrow());
@@ -539,7 +539,7 @@ impl Default for TranslationContext {
     }
 }
 
-/// RPython `graphof(translator, func)` (translator.py:151-160).
+/// RPython `graphof(translator, func)` (translator.py).
 ///
 /// The upstream helper also accepts a `FunctionGraph` and returns it
 /// unchanged. Rust call sites already have the typed `GraphRef` in that case,
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn new_context_initializes_prebuilt_graph_cache() {
-        // RPython `TranslationContext.__init__` (translator.py:27-40)
+        // RPython `TranslationContext.__init__` (translator.py)
         // seeds `self._prebuilt_graphs = {}`. Keep only the cache
         // field that is actually consumed by the current Rust port.
         let ctx = TranslationContext::new();
@@ -741,7 +741,7 @@ mod tests {
 
     #[test]
     fn default_construction_sets_translating_true() {
-        // Upstream `TranslationContext.__init__` (translator.py:30)
+        // Upstream `TranslationContext.__init__` (translator.py)
         // calls `get_combined_translation_config(translating=True)`
         // whenever `config is None`. The Rust port mirrors this via
         // the `get_combined_translation_config` helper.

@@ -37,7 +37,7 @@ impl VarRenumbering {
 }
 
 fn render_arg(arg: OpRef, constants: &IndexMap<u32, i64>, vars: &mut VarRenumbering) -> String {
-    // history.py:227/268/314 — inline-Const variants carry value inline.
+    // history.py/268/314 — inline-Const variants carry value inline.
     if let Some(value) = arg
         .inline_const_bits()
         .or_else(|| constants.get(&arg.raw()).copied())

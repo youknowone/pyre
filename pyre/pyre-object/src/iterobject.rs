@@ -94,7 +94,7 @@ fn seq_iter_type_for(seq: PyObjectRef) -> &'static PyType {
 }
 
 pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let seq_slot = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::pin_root(seq);

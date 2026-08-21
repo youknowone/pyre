@@ -89,34 +89,34 @@ pub enum Effect {
 /// `Top` is the `top_set` sentinel.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WriteEffects {
-    /// `top_set` (`writeanalyze.py:5`) — "can write anything".
+    /// `top_set` (`writeanalyze.py`) — "can write anything".
     Top,
     /// `frozenset(...)` / `set()` of [`Effect`]s.
     Set(HashSet<Effect>),
 }
 
 impl crate::translator::backendopt::graphanalyze::AnalyzerResult for WriteEffects {
-    /// `bottom_result` (`writeanalyze.py:16-17`): `empty_set`.
+    /// `bottom_result` (`writeanalyze.py`): `empty_set`.
     fn bottom_result() -> Self {
         WriteEffects::Set(HashSet::new())
     }
 
-    /// `top_result` (`writeanalyze.py:19-20`): `top_set`.
+    /// `top_result` (`writeanalyze.py`): `top_set`.
     fn top_result() -> Self {
         WriteEffects::Top
     }
 
-    /// `is_top_result` (`writeanalyze.py:22-23`): `result is top_set`.
+    /// `is_top_result` (`writeanalyze.py`): `result is top_set`.
     fn is_top_result(result: &Self) -> bool {
         matches!(result, WriteEffects::Top)
     }
 
-    /// `result_builder` (`writeanalyze.py:25-26`): `set()`.
+    /// `result_builder` (`writeanalyze.py`): `set()`.
     fn result_builder() -> Self {
         WriteEffects::Set(HashSet::new())
     }
 
-    /// `add_to_result` (`writeanalyze.py:28-33`):
+    /// `add_to_result` (`writeanalyze.py`):
     ///
     /// ```python
     /// def add_to_result(self, result, other):
@@ -140,7 +140,7 @@ impl crate::translator::backendopt::graphanalyze::AnalyzerResult for WriteEffect
         }
     }
 
-    /// `finalize_builder` (`writeanalyze.py:35-38`):
+    /// `finalize_builder` (`writeanalyze.py`):
     ///
     /// ```python
     /// def finalize_builder(self, result):
@@ -155,7 +155,7 @@ impl crate::translator::backendopt::graphanalyze::AnalyzerResult for WriteEffect
         result
     }
 
-    /// `join_two_results` (`writeanalyze.py:40-43`):
+    /// `join_two_results` (`writeanalyze.py`):
     ///
     /// ```python
     /// def join_two_results(self, result1, result2):
@@ -177,7 +177,7 @@ impl crate::translator::backendopt::graphanalyze::AnalyzerResult for WriteEffect
     }
 }
 
-/// `class FreshMallocs(object)` at `writeanalyze.py:122-145`. Tracks
+/// `class FreshMallocs(object)` at `writeanalyze.py`. Tracks
 /// which variables in a graph hold a pointer to freshly-malloc'd memory
 /// that has not escaped, so writes through them can be ignored.
 #[derive(Clone, Default)]
@@ -194,7 +194,7 @@ pub struct FreshMallocs {
 impl GraphInfo for Option<FreshMallocs> {}
 
 impl FreshMallocs {
-    /// `FreshMallocs.__init__(self, graph)` (`writeanalyze.py:123-144`).
+    /// `FreshMallocs.__init__(self, graph)` (`writeanalyze.py`).
     pub fn new(graph: &FunctionGraph) -> Self {
         let mut fm = FreshMallocs {
             // `self.nonfresh = set(graph.getargs())`.
@@ -280,7 +280,7 @@ impl FreshMallocs {
         fm
     }
 
-    /// `is_fresh_malloc(self, v)` (`writeanalyze.py:147-151`):
+    /// `is_fresh_malloc(self, v)` (`writeanalyze.py`):
     ///
     /// ```python
     /// def is_fresh_malloc(self, v):
@@ -335,14 +335,14 @@ fn as_address_offset(v: &ConstValue) -> &AddressOffset {
     }
 }
 
-/// The `WriteAnalyzer` instance-method surface (`writeanalyze.py:47-112`).
+/// The `WriteAnalyzer` instance-method surface (`writeanalyze.py`).
 /// Upstream these are methods on the `WriteAnalyzer` class, inherited by
 /// `ReadWriteAnalyzer`; the port exposes them as trait default methods so
 /// both analyzers share one body, mirroring the Python inheritance. They
 /// take `&self` even though the bodies are pure, keeping the method
 /// surface 1:1 with upstream rather than scattering free functions.
 trait WriteAnalyzerMethods {
-    /// `_getinteriorname(self, op)` (`writeanalyze.py:47-51`):
+    /// `_getinteriorname(self, op)` (`writeanalyze.py`):
     ///
     /// ```python
     /// def _getinteriorname(self, op):
@@ -366,19 +366,19 @@ trait WriteAnalyzerMethods {
         arg_value(op, 2)
     }
 
-    /// `_array_result(self, TYPE)` (`writeanalyze.py:75-76`):
+    /// `_array_result(self, TYPE)` (`writeanalyze.py`):
     /// `frozenset([("array", TYPE)])`.
     fn array_result(&self, TYPE: LowLevelType) -> WriteEffects {
         WriteEffects::Set(HashSet::from([Effect::Array { TYPE }]))
     }
 
-    /// `_interiorfield_result(self, TYPE, fieldname)` (`writeanalyze.py:78-79`):
+    /// `_interiorfield_result(self, TYPE, fieldname)` (`writeanalyze.py`):
     /// `frozenset([("interiorfield", TYPE, fieldname)])`.
     fn interiorfield_result(&self, TYPE: LowLevelType, fieldname: ConstValue) -> WriteEffects {
         WriteEffects::Set(HashSet::from([Effect::InteriorField { TYPE, fieldname }]))
     }
 
-    /// `_gc_store_indexed_result(self, op)` (`writeanalyze.py:81-84`):
+    /// `_gc_store_indexed_result(self, op)` (`writeanalyze.py`):
     ///
     /// ```python
     /// def _gc_store_indexed_result(self, op):
@@ -530,7 +530,7 @@ fn arg_value(op: &SpaceOperation, i: usize) -> ConstValue {
 /// `writeanalyze.py:13-119`.
 pub struct WriteAnalyzer<'t> {
     translator: &'t TranslationContext,
-    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py:13`).
+    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
     analyzed_calls: UnionFind<usize, Dependency<WriteEffects>>,
 }
 
@@ -555,7 +555,7 @@ impl<'t> GraphAnalyzer<WriteEffects, Option<FreshMallocs>> for WriteAnalyzer<'t>
         &mut self.analyzed_calls
     }
 
-    /// `compute_graph_info(self, graph)` (`writeanalyze.py:120-121`):
+    /// `compute_graph_info(self, graph)` (`writeanalyze.py`):
     /// `return FreshMallocs(graph)`.
     fn compute_graph_info(&mut self, graph: &GraphRef) -> Option<FreshMallocs> {
         Some(FreshMallocs::new(&graph.borrow()))
@@ -570,7 +570,7 @@ impl<'t> GraphAnalyzer<WriteEffects, Option<FreshMallocs>> for WriteAnalyzer<'t>
     }
 }
 
-/// `class ReadWriteAnalyzer(WriteAnalyzer)` at `writeanalyze.py:154-174`.
+/// `class ReadWriteAnalyzer(WriteAnalyzer)` at `writeanalyze.py`.
 pub struct ReadWriteAnalyzer<'t> {
     translator: &'t TranslationContext,
     analyzed_calls: UnionFind<usize, Dependency<WriteEffects>>,
@@ -584,7 +584,7 @@ impl<'t> ReadWriteAnalyzer<'t> {
         }
     }
 
-    /// `_gc_load_indexed_result(self, op)` (`writeanalyze.py:171-174`):
+    /// `_gc_load_indexed_result(self, op)` (`writeanalyze.py`):
     ///
     /// ```python
     /// def _gc_load_indexed_result(self, op):
@@ -740,7 +740,7 @@ mod tests {
 
     /// `gc_load_indexed` routes through `_gc_load_indexed_result` →
     /// `_get_effect_for_offset(.., prefix='read')`. An `ArrayItemsOffset`
-    /// yields a `readarray` effect (`writeanalyze.py:112-113`).
+    /// yields a `readarray` effect (`writeanalyze.py`).
     #[test]
     fn gc_load_indexed_arrayitems_offset_yields_readarray() {
         use crate::translator::rtyper::lltypesystem::llmemory::ArrayItemsOffset;
@@ -826,7 +826,7 @@ mod tests {
     }
 
     /// A `setfield` on a freshly-malloc'd, non-escaped struct is
-    /// suppressed (`writeanalyze.py:53` — `not is_fresh_malloc`).
+    /// suppressed (`writeanalyze.py` — `not is_fresh_malloc`).
     #[test]
     fn setfield_on_fresh_malloc_is_suppressed() {
         // Build a one-block graph:  s = malloc(...); setfield(s, "x", v).
@@ -852,7 +852,7 @@ mod tests {
 
     /// An external call whose funcobj carries `_callbacks` surfaces the
     /// callback graphs' write effects through the inherited
-    /// `GraphAnalyzer::analyze_external_call` (`graphanalyze.py:60-69`,
+    /// `GraphAnalyzer::analyze_external_call` (`graphanalyze.py`,
     /// upstream `test_llexternal_with_callback`). WriteAnalyzer does not
     /// override the base method; this proves the inheritance is live.
     #[test]

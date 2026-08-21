@@ -16,7 +16,7 @@ use majit_ir::{Op, OpCode, OpRef};
 use crate::optimizeopt::OptContext;
 use crate::optimizeopt::dependency::IndexVar;
 
-/// guard.py:16-163: Guard — wraps a guard op with its comparison op for
+/// guard.py: Guard — wraps a guard op with its comparison op for
 /// implication analysis (vector optimizer).
 ///
 /// Stores the full `Op` for both the guard and its comparison, matching
@@ -37,7 +37,7 @@ pub struct Guard {
 }
 
 impl Guard {
-    /// guard.py:22-34: Guard.__init__(index, op, cmp_op, index_vars)
+    /// guard.py: Guard.__init__(index, op, cmp_op, index_vars)
     pub fn new(
         index: usize,
         guard_op: Op,
@@ -67,7 +67,7 @@ impl Guard {
         }
     }
 
-    /// guard.py:158-163: Guard.of(boolarg, operations, index, index_vars)
+    /// guard.py: Guard.of(boolarg, operations, index, index_vars)
     pub fn of(
         index: usize,
         guard_op: &Op,
@@ -89,7 +89,7 @@ impl Guard {
         ))
     }
 
-    /// guard.py:36-43: setindex / setoperation / setcmp
+    /// guard.py: setindex / setoperation / setcmp
     pub fn setindex(&mut self, index: usize) {
         self.index = index;
     }
@@ -102,7 +102,7 @@ impl Guard {
         self.cmp_op = cmp;
     }
 
-    /// guard.py:106-111: get_compare_opnum
+    /// guard.py: get_compare_opnum
     pub fn get_compare_opnum(&self) -> OpCode {
         if self.op.opcode == OpCode::GuardTrue {
             self.cmp_op.opcode
@@ -120,7 +120,7 @@ impl Guard {
         }
     }
 
-    /// guard.py:51-71: implies(other)
+    /// guard.py: implies(other)
     pub fn implies(&self, other: &Guard, _opt: Option<&OptContext>) -> bool {
         if self.op.opcode != other.op.opcode {
             return false;
@@ -144,7 +144,7 @@ impl Guard {
         }
     }
 
-    /// guard.py:45-46: getleftkey / getrightkey
+    /// guard.py: getleftkey / getrightkey
     pub fn getleftkey(&self) -> OpRef {
         self.lhs.getvariable()
     }
@@ -153,7 +153,7 @@ impl Guard {
         self.rhs.getvariable()
     }
 
-    /// guard.py:126-132: emit_varops(opt, var, old_arg)
+    /// guard.py: emit_varops(opt, var, old_arg)
     fn emit_varops(
         var: &IndexVar,
         old_arg: OpRef,
@@ -165,7 +165,7 @@ impl Guard {
         if var.is_identity() {
             return var.var;
         }
-        // history.py:227 ConstInt.value carried inline on the Box. The
+        // history.py ConstInt.value carried inline on the Box. The
         // const_values side-table is preserved for legacy callers that
         // still walk `OpRef → raw u32 → i64`; inline-Const variants make
         // it redundant for new consumers.
@@ -189,7 +189,7 @@ impl Guard {
         last
     }
 
-    /// guard.py:73-97: transitive_imply(other, opt, loop)
+    /// guard.py: transitive_imply(other, opt, loop)
     ///
     /// Emit a transitive guard that eliminates a loop guard.
     /// `label_args` = `loop.label.getarglist_copy()`.
@@ -214,7 +214,7 @@ impl Guard {
         }
         // guard.py:83
         let opnum = Self::transitive_cmpop(self.cmp_op.opcode);
-        // guard.py:84-85: emit_varops
+        // guard.py: emit_varops
         let box_rhs = Self::emit_varops(
             &self.rhs,
             self.cmp_op.arg(1).to_opref(),
@@ -256,7 +256,7 @@ impl Guard {
         //
         // Always create a NEW CompileLoopVersionDescr (loop_version()=true),
         // then copy resume attributes from the source guard's descr.
-        // compile.py:861-872 copy_all_attributes_from copies:
+        // compile.py copy_all_attributes_from copies:
         //   rd_consts, rd_pendingfields, rd_virtuals, rd_numb
         // In pyre these live on the FailDescr (compile.py:855 `_attrs_`);
         // make_compile_loop_version_descr_from reference-shares each
@@ -282,7 +282,7 @@ impl Guard {
                 .map(|a| majit_ir::operand::Operand::bound_from_opref(*a))
                 .collect(),
         );
-        // copy_all_attributes_from parity: compile.py:861-872 copies
+        // copy_all_attributes_from parity: compile.py copies
         // rd_consts / rd_pendingfields / rd_virtuals / rd_numb.  In
         // pyre these live on the FailDescr (compile.py:855 `_attrs_`)
         // and `make_compile_loop_version_descr_from` (called above)
@@ -296,12 +296,12 @@ impl Guard {
         guard_op
             .rd_resume_position
             .set(self.op.rd_resume_position.get());
-        // guard.py:95: opt.emit_operation(guard)
+        // guard.py: opt.emit_operation(guard)
         new_ops.push(guard_op.clone());
         Some(guard_op)
     }
 
-    /// guard.py:99-104: transitive_cmpop(opnum)
+    /// guard.py: transitive_cmpop(opnum)
     pub fn transitive_cmpop(opnum: OpCode) -> OpCode {
         match opnum {
             OpCode::IntLt => OpCode::IntLe,
@@ -310,7 +310,7 @@ impl Guard {
         }
     }
 
-    /// guard.py:113-124: inhert_attributes(other)
+    /// guard.py: inhert_attributes(other)
     ///
     /// Copy index and resume attributes from `other` onto self's existing
     /// descr, preserving `myop.descr` identity (fail_index / status /
@@ -323,7 +323,7 @@ impl Guard {
         // guard.py:118
         self.index = other.index;
         // guard.py:120-121: descr.copy_all_attributes_from(other.op.getdescr())
-        // compile.py:861-872 ResumeGuardDescr.copy_all_attributes_from:
+        // compile.py ResumeGuardDescr.copy_all_attributes_from:
         //     other = other.get_resumestorage()
         //     assert isinstance(other, ResumeGuardDescr)
         //     self.rd_consts = other.rd_consts
@@ -358,7 +358,7 @@ impl Guard {
         }
     }
 
-    /// guard.py:134-147: emit_operations(opt)
+    /// guard.py: emit_operations(opt)
     ///
     /// Re-emit the guard: materialize lhs/rhs via emit_varops,
     /// create fresh cmp + guard, emit them.
@@ -369,7 +369,7 @@ impl Guard {
         next_const_pos: &mut u32,
         const_values: &mut indexmap::IndexMap<OpRef, i64>,
     ) {
-        // guard.py:136-137: lhs/rhs via emit_varops
+        // guard.py: lhs/rhs via emit_varops
         let lhs = Self::emit_varops(
             &self.lhs,
             self.cmp_op.arg(0).to_opref(),
@@ -417,7 +417,7 @@ impl Guard {
         guard
             .rd_resume_position
             .set(self.op.rd_resume_position.get());
-        // compile.py:855 _attrs_ on descr; Arc-clone above shares them.
+        // compile.py _attrs_ on descr; Arc-clone above shares them.
         new_ops.push(guard.clone());
         // guard.py:145-147
         self.setindex(new_ops.len() - 1);
@@ -425,7 +425,7 @@ impl Guard {
         self.setcmp(cmp_op);
     }
 
-    /// guard.py:149-156: set_to_none(info, loop)
+    /// guard.py: set_to_none(info, loop)
     pub fn set_to_none(&self, ops: &mut [Option<Op>]) {
         ops[self.index] = None;
         if self.index > 0 {
@@ -439,7 +439,7 @@ impl Guard {
     }
 }
 
-/// guard.py:165-303: GuardStrengthenOpt (vector optimizer guard pass).
+/// guard.py: GuardStrengthenOpt (vector optimizer guard pass).
 ///
 /// RPython name: `GuardStrengthenOpt`. Collects guard information from
 /// a complete loop, determines implication/strengthening, re-emits with
@@ -479,7 +479,7 @@ impl GuardStrengthenOpt {
         }
     }
 
-    /// guard.py:175-187: collect_guard_information(loop)
+    /// guard.py: collect_guard_information(loop)
     pub fn collect_guard_information(&mut self, ops: &[Op]) {
         for (i, op) in ops.iter().enumerate() {
             if !op.opcode.is_guard() {
@@ -488,7 +488,7 @@ impl GuardStrengthenOpt {
             if op.opcode != OpCode::GuardTrue && op.opcode != OpCode::GuardFalse {
                 continue;
             }
-            // guard.py:183: Guard.of(op.getarg(0), operations, i, self.index_vars)
+            // guard.py: Guard.of(op.getarg(0), operations, i, self.index_vars)
             let bool_arg = op.arg(0).to_opref();
             let cmp_op = ops.iter().rfind(|o| o.pos.get() == bool_arg);
             if let Some(cmp) = cmp_op
@@ -502,12 +502,12 @@ impl GuardStrengthenOpt {
         }
     }
 
-    /// guard.py:189-219: record_guard(key, guard)
+    /// guard.py: record_guard(key, guard)
     fn record_guard(&mut self, key: OpRef, guard: Guard) {
         if key.is_none() {
             return;
         }
-        // guard.py:198-219 — in-place mutation of `self.strongest_guards[key]`.
+        // guard.py — in-place mutation of `self.strongest_guards[key]`.
         // Split-borrow on disjoint fields lets us hold `&mut others`
         // (a slice into strongest_guards) and `&mut self.guards`
         // simultaneously, matching PyPy's two-map update order.
@@ -549,7 +549,7 @@ impl GuardStrengthenOpt {
         guards.insert(idx, val);
     }
 
-    /// guard.py:221-249: eliminate_guards(loop)
+    /// guard.py: eliminate_guards(loop)
     pub fn eliminate_guards(&mut self, ops: &[Op]) -> Vec<Op> {
         // guard.py:222: self.renamer = Renamer()
         self.renamer = indexmap::IndexMap::new();
@@ -569,7 +569,7 @@ impl GuardStrengthenOpt {
                             continue;
                         }
                         Some(guard) => {
-                            // guard.py:234: guard.emit_operations(self)
+                            // guard.py: guard.emit_operations(self)
                             guard.emit_operations(
                                 &mut self._newoperations,
                                 &mut self.renamer,
@@ -580,14 +580,14 @@ impl GuardStrengthenOpt {
                         }
                     }
                 } else {
-                    // guard.py:237: self.emit_operation(op)
+                    // guard.py: self.emit_operation(op)
                     let mut renamed = op.clone();
                     self.rename_op(&mut renamed);
                     self._newoperations.push(renamed);
                     continue;
                 }
             }
-            // guard.py:239-245: non-void index_var → emit_operations + rename
+            // guard.py: non-void index_var → emit_operations + rename
             if op.opcode.result_type() != majit_ir::Type::Void
                 && let Some(index_var) = index_vars.get(&op.pos.get())
                 && !index_var.is_identity()
@@ -603,7 +603,7 @@ impl GuardStrengthenOpt {
                 self.renamer.insert(op.pos.get(), result);
                 continue;
             }
-            // guard.py:246: self.emit_operation(op)
+            // guard.py: self.emit_operation(op)
             let mut renamed = op.clone();
             self.rename_op(&mut renamed);
             self._newoperations.push(renamed);
@@ -612,7 +612,7 @@ impl GuardStrengthenOpt {
         self._newoperations.clone()
     }
 
-    /// guard.py:251-269: propagate_all_forward(info, loop, user_code)
+    /// guard.py: propagate_all_forward(info, loop, user_code)
     ///
     /// `version_info`: optional LoopVersionInfo for loop-version tracking.
     /// `label_args`: label arglist for transitive guard fail_args.
@@ -621,7 +621,7 @@ impl GuardStrengthenOpt {
     /// Returns `(ops, const_values)`. `const_values` maps constant OpRefs
     /// (allocated by IndexVar materialization) to their i64 values.
     /// The caller must register these in the trace's constant pool.
-    /// guard.py:251-269: propagate_all_forward(info, loop, user_code)
+    /// guard.py: propagate_all_forward(info, loop, user_code)
     pub fn propagate_all_forward(
         &mut self,
         ops: &[Op],
@@ -669,7 +669,7 @@ impl GuardStrengthenOpt {
         (result, std::mem::take(&mut self.const_values))
     }
 
-    /// renamer.py:20-22: rename(op) — apply renamer map to op args.
+    /// renamer.py: rename(op) — apply renamer map to op args.
     fn rename_op(&self, op: &mut Op) {
         for i in 0..op.num_args() {
             let arg = op.arg(i).to_opref();
@@ -682,13 +682,13 @@ impl GuardStrengthenOpt {
         }
     }
 
-    /// guard.py:272-274: emit_operation(op)
+    /// guard.py: emit_operation(op)
     pub fn emit_operation(&mut self, mut op: Op) {
         self.rename_op(&mut op);
         self._newoperations.push(op);
     }
 
-    /// guard.py:276-277: operation_position()
+    /// guard.py: operation_position()
     pub fn operation_position(&self) -> usize {
         self._newoperations.len()
     }
@@ -704,7 +704,7 @@ fn info_track_guard(
 }
 
 impl GuardStrengthenOpt {
-    /// guard.py:279-303: eliminate_array_bound_checks(info, loop)
+    /// guard.py: eliminate_array_bound_checks(info, loop)
     ///
     /// `version_info`: LoopVersionInfo for tracking.
     /// `label_args` = `loop.label.getarglist_copy()`.
@@ -764,7 +764,7 @@ impl GuardStrengthenOpt {
                         "guard.py:295 other.op.getdescr() must be a FailDescr"
                     );
                     version_info.remove(other_descr.index());
-                    // guard.py:296: other.set_to_none(info, loop)
+                    // guard.py: other.set_to_none(info, loop)
                     other.set_to_none(&mut opt_ops);
                     // guard.py:297-299: info.track(transitive_guard, descr, version)
                     let tg_descr = tg
@@ -885,7 +885,7 @@ mod tests {
         // With intbounds postprocess_GUARD_TRUE, i1 becomes known
         // constant 1 after GuardTrue(i1). IntMulOvf(x, 1) cannot
         // overflow → second GuardNoOverflow is removed. This matches
-        // RPython intbounds.py:52-58 _postprocess_guard_true_false_value.
+        // RPython intbounds.py _postprocess_guard_true_false_value.
         assert_eq!(
             guard_count, 1,
             "first overflow guard survives; second removed (mul by constant 1 cannot overflow)"
@@ -895,10 +895,10 @@ mod tests {
     #[test]
     fn test_guard_value_to_guard_true() {
         // GUARD_VALUE(v, 1) on a bool-bounded v → GUARD_TRUE(v)
-        // (_maybe_replace_guard_value, optimizer.py:755-776). The [0,1]
+        // (_maybe_replace_guard_value, optimizer.py). The [0,1]
         // bound on v must come from a producer the intbounds pass analyzed
         // (here `int_gt`), not from the guard's own make_constant:
-        // postprocess_GUARD_VALUE (rewrite.py:313-315) runs make_constant
+        // postprocess_GUARD_VALUE (rewrite.py) runs make_constant
         // after the guard is emitted, so at emit time the bound is only
         // whatever the producer established.
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();

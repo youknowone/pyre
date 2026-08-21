@@ -10,7 +10,7 @@ use super::interp_select::filedescriptor_w;
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 use pyre_object::PyObjectRef;
 
-/// `select.kevent` object — PyPy: `interp_kqueue.py:265 class W_Kevent`.
+/// `select.kevent` object — PyPy: `interp_kqueue.py class W_Kevent`.
 ///
 /// Mirrors the platform `struct kevent`: a 64-bit `ident`, signed
 /// 16-bit `filter`, 16-bit `flags`, 32-bit `fflags`, signed 64-bit
@@ -28,7 +28,7 @@ pub struct W_Kevent {
 }
 
 /// Lexicographic comparison of all six fields, matching
-/// `interp_kqueue.py:288 _compare_all_fields`.  Returns an `Ordering`
+/// `interp_kqueue.py _compare_all_fields`.  Returns an `Ordering`
 /// the dunder wrappers turn into the requested relation.
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 impl W_Kevent {
@@ -52,7 +52,7 @@ impl W_Kevent {
     doc = "kevent(ident, filter=KQ_FILTER_READ, flags=KQ_EV_ADD, fflags=0, data=0, udata=0)"
 )]
 impl W_Kevent {
-    /// `interp_kqueue.py:274 descr__init__`.  Mirrors
+    /// `interp_kqueue.py descr__init__`.  Mirrors
     /// `@unwrap_spec(filter=int, flags='c_uint', fflags='c_uint', data=int,
     /// udata=r_uint)`: `ident` is `uint_w` for an int else
     /// `c_filedescriptor_w`; `flags`/`fflags` are `c_uint` (reject
@@ -110,7 +110,7 @@ impl W_Kevent {
         newint_from_u64(self.udata)
     }
 
-    /// `interp_kqueue.py:352 descr__eq__` and friends — two kevents
+    /// `interp_kqueue.py descr__eq__` and friends — two kevents
     /// compare by all six fields lexicographically.  A non-kevent other
     /// yields `NotImplemented`.
     fn __eq__(&self, w_other: PyObjectRef) -> PyObjectRef {

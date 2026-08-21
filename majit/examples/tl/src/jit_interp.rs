@@ -31,14 +31,14 @@ pub static LAST_HAS_JUMP: core::sync::atomic::AtomicBool =
 pub static LAST_ALWAYS_FAILS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Stack rotation — @dont_look_inside in RPython (tl.py:43).
+/// Stack rotation — @dont_look_inside in RPython (tl.py).
 ///
 /// Operates on the live portion of the stack `stack[0..stackpos]`.
 /// The JIT does not trace into this function; it emits a residual CALL.
 ///
 /// The residual is a MAY-FORCE call, not a plain can-raise one.
-/// `call.py:287-289 getcalldescr` consults `virtualizable_analyzer` BEFORE
-/// `_canraise`, and `roll` writes `self.stack[...]`, a field `tl.py:14`
+/// `call.py getcalldescr` consults `virtualizable_analyzer` BEFORE
+/// `_canraise`, and `roll` writes `self.stack[...]`, a field `tl.py`
 /// declares in `Stack._virtualizable_ = ['stackpos', 'stack[*]']` — so the
 /// analyzer picks `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` there. `@dont_look_inside`
 /// only clears `_jit_look_inside_` (`rlib/jit.py:132`); it does not change the
@@ -101,8 +101,8 @@ impl BytecodeExt for [u8] {
     }
 }
 
-/// tl.py:13-14 Stack object. `_virtualizable_ = ['stackpos', 'stack[*]']`.
-/// tl.py:17 `Stack(size)` — `size` is the bytecode length; the caller
+/// tl.py Stack object. `_virtualizable_ = ['stackpos', 'stack[*]']`.
+/// tl.py `Stack(size)` — `size` is the bytecode length; the caller
 /// (`interp_eval`) passes `len(code)`. See tl.py:120.
 struct TlState {
     stackpos: i64,
@@ -230,13 +230,13 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 state.stack[(state.stackpos - 1) as usize] = b;
                 state.stack[(state.stackpos - 2) as usize] = a;
             }
-            // tl.py:106-109  Stack.roll() is @dont_look_inside
+            // tl.py  Stack.roll() is @dont_look_inside
             ROLL => {
                 let r = program[pc] as i8 as i64;
                 pc += 1;
                 storage_roll(state.stack.as_mut_ptr() as usize, state.stackpos, r);
             }
-            // tl.py:111-113  Stack.pick(i): duplicate stack[stackpos - i - 1]
+            // tl.py  Stack.pick(i): duplicate stack[stackpos - i - 1]
             PICK => {
                 let i = program[pc] as usize;
                 pc += 1;
@@ -244,7 +244,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                 state.stack[state.stackpos as usize] = v;
                 state.stackpos += 1;
             }
-            // tl.py:115-117  Stack.put(i): pop and store at stackpos - i - 1
+            // tl.py  Stack.put(i): pop and store at stackpos - i - 1
             PUT => {
                 let i = program[pc] as usize;
                 pc += 1;
@@ -347,7 +347,7 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
                     continue;
                 }
             }
-            // tl.py:174-178 — `res = interp(code, pc + offset)`, a recursive
+            // tl.py — `res = interp(code, pc + offset)`, a recursive
             // portal re-entry.  Greens in declaration order [pc, program];
             // the concrete fallback is `interpret_recursive` (declared via
             // `recursive_entry`), the JIT path emits BC_RECURSIVE_CALL_INT.

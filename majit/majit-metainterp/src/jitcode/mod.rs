@@ -62,7 +62,7 @@ pub use majit_translate::jitcode::enumerate_vars;
 /// through one indirection.
 ///
 /// `effect_info_slot` is the per-target analyzer-result classification
-/// (`call.py:282-303 getcalldescr`'s `extraeffect` selection without
+/// (`call.py getcalldescr`'s `extraeffect` selection without
 /// the graph-based analyzer chain — see
 /// [`crate::call_descr::EffectInfoSlot`]).  Callers that have a
 /// resolved `JitCallTarget` thread the slot through
@@ -76,12 +76,12 @@ pub struct JitCallTarget {
     pub concrete_ptr: *const (),
     pub effect_info_slot: crate::call_descr::EffectInfoSlot,
     /// Per-callee `save_err` decoration mirroring upstream
-    /// `rffi.py:228 call_external_function._call_aroundstate_target_ =
+    /// `rffi.py call_external_function._call_aroundstate_target_ =
     /// (funcptr, save_err)`.  Read at descr-build time by
-    /// `codewriter/call.py:252-258 getcalldescr` to populate
+    /// `codewriter/call.py getcalldescr` to populate
     /// `EffectInfo.call_release_gil_target = (realfuncaddr, tgt_saveerr)`
     /// (`effectinfo.py:114, 197`).  `RFFI_ERR_NONE = 0` matches the
-    /// `llexternal` default (`rffi.py:80`); release-gil callees that
+    /// `llexternal` default (`rffi.py`); release-gil callees that
     /// preserve `errno`, `winerror`, etc. carry one of the
     /// `RFFI_ERR_*` flags (`rffi.py:121-167`).
     pub save_err: i32,
@@ -157,7 +157,7 @@ impl JitCallAssemblerTarget {
 
 /// Per-arg kind tag for typed call argument streams.  Mirrors the
 /// `i`/`r`/`f` register-bank chars RPython carries in
-/// `BlackholeInterpBuilder.descrs` argcode bytes (`blackhole.py:154`).
+/// `BlackholeInterpBuilder.descrs` argcode bytes (`blackhole.py`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JitArgKind {
     Int = 0,
@@ -300,7 +300,7 @@ pub trait RuntimeDescrTable: Sync {
     fn len(&self) -> usize;
 
     /// The build-time `all_jitcodes` list this pool's `j` operands index
-    /// (`codewriter.py:89 make_jitcodes`), positioned by `jitcode.index`.
+    /// (`codewriter.py make_jitcodes`), positioned by `jitcode.index`.
     ///
     /// Empty by default: a host that decodes its jitcodes on demand has no
     /// such list to hand over, and nothing here requires one. A host that
@@ -332,7 +332,7 @@ pub trait RuntimeDescrTable: Sync {
 }
 
 /// Process-global build-time descr pool — RPython's single shared
-/// `Assembler.descrs` (`assembler.py:23`).  Runtime-emitted jitcodes keep a
+/// `Assembler.descrs` (`assembler.py`).  Runtime-emitted jitcodes keep a
 /// per-`JitCode` `exec.descrs` pool (the lazy-emit adaptation described on
 /// [`JitCodeExecState`]); build-time (LLBC-extracted) jitcodes instead carry
 /// an empty per-jitcode pool and resolve their `d`/`j` argcodes through this
@@ -367,8 +367,8 @@ pub(crate) fn global_build_jitcodes() -> &'static [std::sync::Arc<JitCode>] {
 }
 
 /// Per-`JitCode` descrs.  Pyre's analog of
-/// `BlackholeInterpBuilder.descrs` (`blackhole.py:103`) /
-/// `BlackholeInterpreter.descrs` (`blackhole.py:288`).  RPython has a
+/// `BlackholeInterpBuilder.descrs` (`blackhole.py`) /
+/// `BlackholeInterpreter.descrs` (`blackhole.py`).  RPython has a
 /// single shared global pool because translation-time JitCodes are
 /// produced eagerly; pyre's runtime jitcodes are emitted on demand
 /// per-Python-frame and lack a global allocation index, so the pool
@@ -415,7 +415,7 @@ pub struct JitCodeExecState {
 //     (`code`, `constants_*`, `c_num_regs_*`, ...) — exactly the
 //     fields RPython's `JitCode` carries.
 //   * `exec` mirrors the descr pool RPython keeps on the
-//     `BlackholeInterpBuilder` (`blackhole.py:103`).  In RPython the
+//     `BlackholeInterpBuilder` (`blackhole.py`).  In RPython the
 //     pool is shared globally; pyre keeps it per-jitcode for the lazy
 //     emit reasons described above on `JitCodeExecState`.
 //
@@ -438,7 +438,7 @@ pub struct JitCodeExecState {
 #[derive(Debug)]
 pub struct JitCode {
     /// Canonical source-only `JitCode` (RPython
-    /// `rpython/jit/codewriter/jitcode.py:9 class JitCode`).
+    /// `rpython/jit/codewriter/jitcode.py class JitCode`).
     core: majit_translate::jitcode::JitCode,
     /// Per-jitcode descr pool — pyre's analog of
     /// `BlackholeInterpBuilder.descrs` (RPython
@@ -470,7 +470,7 @@ impl JitCode {
         }
     }
 
-    /// `jitcode.py:14 JitCode.name` accessor — proxies to the canonical
+    /// `jitcode.py JitCode.name` accessor — proxies to the canonical
     /// source-only core for diagnostic / parity-validator messages.
     pub fn name(&self) -> &str {
         &self.core.name
@@ -864,14 +864,14 @@ mod tests {
 
     #[test]
     fn canonical_build_jitcode_sizes_blackhole_register_files_without_conversion() {
-        // Extract the upstream-common part of blackhole.py:312 setposition
+        // Extract the upstream-common part of blackhole.py setposition
         // (register sizing + constant copy) and apply it directly to the
         // canonical codewriter JitCode. Dispatch still needs the runtime
         // adapter JitCode for exec.* pools, but the register-file setup no
         // longer needs a build→runtime conversion just to match RPython's
         // `num_regs_* + len(constants_*)` logic.
         //
-        // RPython: `blackhole.py:312 setposition` allocates `num_regs_i +
+        // RPython: `blackhole.py setposition` allocates `num_regs_i +
         // len(constants_i)` slots per register file and copies each constant
         // into the tail portion of the file. We verify both — the array
         // sizes and the copied-in constants.

@@ -842,7 +842,7 @@ fn real_main() {
                 vable_arrays: virtualizable_spec::PYFRAME_VABLE_ARRAYS
                     .iter()
                     .map(|(name, idx)| {
-                        // virtualizable.py:58 — VirtualizableInfo.array_descrs[i] =
+                        // virtualizable.py — VirtualizableInfo.array_descrs[i] =
                         // cpu.arraydescrof(getattr(VTYPE, name).TO). Python frame
                         // locals are PyObjectRef pointers: itemsize is one
                         // target word (the build host's word would mis-stride
@@ -886,7 +886,7 @@ fn real_main() {
                         .collect(),
                 },
                 majit_translate::JitDriverSpec {
-                    // pypy/interpreter/baseobjspace.py:1003 `_unpackiterable_unknown_length`;
+                    // pypy/interpreter/baseobjspace.py `_unpackiterable_unknown_length`;
                     // greens=['greenkey'], reds='auto' (baseobjspace.py:29-32).
                     portal: majit_translate::CallPath::from_segments([
                         "baseobjspace",
@@ -905,7 +905,7 @@ fn real_main() {
             register_trait_families: Vec::new(),
         },
     };
-    // warmspot.py:516 `vinfos[VTYPEPTR] = VirtualizableInfo(self, VTYPEPTR)` —
+    // warmspot.py `vinfos[VTYPEPTR] = VirtualizableInfo(self, VTYPEPTR)` —
     // pyre's runtime `VirtualizableInfo` constructor lives in the
     // `majit-metainterp` crate (`__build_virtualizable_info`) and runs
     // at `JitDriver::new` (jitdriver.rs) where the field offsets
@@ -1138,7 +1138,7 @@ fn real_main() {
             // assembling a concrete EI and then survive in GcCache after a
             // later unrepresentable member degrades that EI to
             // EF_RANDOM_EFFECTS. `setup_descrs()` still enumerates it, while
-            // effectinfo.py:496 leaves its `ei_index = sys.maxint` because no
+            // effectinfo.py leaves its `ei_index = sys.maxint` because no
             // final raw frozenset names it. Preserve that sentinel instead of
             // pretending the mint log is exactly the final raw-set union.
             entry.ei_index = frozen_layout.descr_indices[category]
@@ -1228,7 +1228,7 @@ fn real_main() {
         let insns_bin = bincode::serialize(&insns_sorted).unwrap();
         std::fs::write(format!("{out_dir}/insns.bin"), &insns_bin).unwrap();
 
-        // RPython `blackhole.py:59 self.setup_descrs(asm.descrs)` + `:102-103
+        // RPython `blackhole.py self.setup_descrs(asm.descrs)` + `:102-103
         // def setup_descrs(self, descrs): self.descrs = descrs`. Persists the
         // build-time assembler's shared descr pool so that 'd'/'j' argcodes
         // in `JitCode.code` resolve at runtime via
@@ -1312,8 +1312,8 @@ fn real_main() {
         }
 
         // The table above is RPython's `opcode_descrs` (`pyjitpl.py:2261
-        // setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py:2289
-        // self.cpu.setup_descrs()` = the full gccache walk at `descr.py:25-47`).
+        // setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py
+        // self.cpu.setup_descrs()` = the full gccache walk at `descr.py`).
         // Upstream never has to distinguish them here because one gccache serves
         // one process, so `compute_bitstrings` unions descrs that are already
         // present. Pyre mints in this process and resolves in another, so the

@@ -11,10 +11,10 @@
 
 use std::collections::HashMap;
 
-/// `EPSILON = 1E-12` at `sparsemat.py:3`.
+/// `EPSILON = 1E-12` at `sparsemat.py`.
 pub const EPSILON: f64 = 1.0e-12;
 
-/// `class SparseMatrix` at `sparsemat.py:6-74`.
+/// `class SparseMatrix` at `sparsemat.py`.
 ///
 /// ```python
 /// class SparseMatrix:

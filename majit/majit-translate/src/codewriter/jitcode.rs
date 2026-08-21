@@ -70,20 +70,20 @@ pub struct StrConstDescriptor {
 /// Body of a `JitCode` — populated once by the assembler after
 /// `transform_graph_to_jitcode` runs the full codewriter pipeline.
 ///
-/// RPython `jitcode.py:22-42` `JitCode.setup(...)`. RPython mutates the
+/// RPython `jitcode.py` `JitCode.setup(...)`. RPython mutates the
 /// JitCode object in place; pyre groups the late-set fields into a body
 /// struct that is committed via `OnceLock::set` so `Arc<JitCode>` shells
 /// handed out by `CallControl::get_jitcode` can be filled while shared.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct JitCodeBody {
-    /// RPython `jitcode.py:17` `self.calldescr = calldescr`. RPython sets
+    /// RPython `jitcode.py` `self.calldescr = calldescr`. RPython sets
     /// this at construction because rtyper has resolved the function's
     /// arg/result types upstream; pyre's rtyper-equivalent runs inside
     /// the codewriter pipeline so calldescr is filled here as part of
     /// the body. `transform_graph_to_jitcode` overrides the default with
     /// the assembled `arg_classes`.
     pub calldescr: BhCallDescr,
-    /// RPython `jitcode.py:26` `self.code = code` — bytecode bytes.
+    /// RPython `jitcode.py` `self.code = code` — bytecode bytes.
     pub code: Vec<u8>,
     /// RPython `jitcode.py:32` `self.constants_i`.
     pub constants_i: Vec<i64>,
@@ -111,40 +111,40 @@ pub struct JitCodeBody {
     /// empty: existing jitcodes carry no deferred strings.
     #[serde(default)]
     pub str_consts: Vec<StrConstDescriptor>,
-    /// RPython `jitcode.py:37-39` `self.c_num_regs_i = chr(num_regs_i)`.
+    /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
     /// RPython packs into a single chr (`assert num_regs_i < 256`); pyre
     /// uses `u16` to keep CPython 3.13 codes that legitimately exceed 255
     /// registers per kind reachable.  The codewriter still asserts
     /// `< 256` for now (assembler.rs); widening the field is a parity
     /// preparation for that limit being lifted.
     pub c_num_regs_i: u16,
-    /// RPython `jitcode.py:38` `self.c_num_regs_r = chr(num_regs_r)`.
+    /// RPython `jitcode.py` `self.c_num_regs_r = chr(num_regs_r)`.
     pub c_num_regs_r: u16,
-    /// RPython `jitcode.py:39` `self.c_num_regs_f = chr(num_regs_f)`.
+    /// RPython `jitcode.py` `self.c_num_regs_f = chr(num_regs_f)`.
     pub c_num_regs_f: u16,
-    /// RPython `jitcode.py:40` `self._startpoints = startpoints` —
+    /// RPython `jitcode.py` `self._startpoints = startpoints` —
     /// debug-only set of bytecode offsets where instructions start.
-    /// `setup(..., startpoints=None)` (jitcode.py:24) is the upstream
+    /// `setup(..., startpoints=None)` (jitcode.py) is the upstream
     /// default; `None` here means "the assembler did not record start
     /// positions for this jitcode" (e.g. hand-built helper jitcodes).
     /// Assembled jitcodes always populate `Some(set)`, even when the
-    /// set is empty. `blackhole.py:86 dispatch_loop` consults
+    /// set is empty. `blackhole.py dispatch_loop` consults
     /// `_startpoints is not None` to gate its non-translated `pc in
     /// self._startpoints` assertion.
     pub startpoints: Option<indexmap::IndexSet<usize>>,
-    /// RPython `jitcode.py:41` `self._alllabels = alllabels` — debug-only
+    /// RPython `jitcode.py` `self._alllabels = alllabels` — debug-only
     /// set of bytecode offsets that are label targets.
-    /// `setup(..., alllabels=None)` (jitcode.py:24) is the upstream
+    /// `setup(..., alllabels=None)` (jitcode.py) is the upstream
     /// default; assembled jitcodes always populate `Some(set)`.
     pub alllabels: Option<indexmap::IndexSet<usize>>,
-    /// RPython `jitcode.py:42` `self._resulttypes = resulttypes` —
+    /// RPython `jitcode.py` `self._resulttypes = resulttypes` —
     /// debug-only map from bytecode offset to result type char.  `None`
     /// is the exact `JitCode.setup(..., resulttypes=None)` sentinel;
     /// assembled jitcodes store `Some(dict)`, even when the dict is empty.
     pub resulttypes: Option<indexmap::IndexMap<usize, char>>,
     /// RPython `jitcode.py:20` `self._ssarepr = None` — debug: the
     /// flattened SSA representation, kept for `dump()` output. Set by
-    /// `Assembler.assemble` (assembler.py:49 `jitcode._ssarepr = ssarepr`).
+    /// `Assembler.assemble` (assembler.py `jitcode._ssarepr = ssarepr`).
     /// `OpKind::Call` arg-list rendering reads each operand
     /// `Variable.concretetype` cell directly via `format_assembler`'s
     /// `variable_kind` helper, so no side-table snapshot of the per-
@@ -156,16 +156,16 @@ pub struct JitCodeBody {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JitCode {
-    /// RPython `jitcode.py:15` `self.name = name`.
+    /// RPython `jitcode.py` `self.name = name`.
     pub name: String,
-    /// RPython `jitcode.py:16` `self.fnaddr = fnaddr`. majit stores the
+    /// RPython `jitcode.py` `self.fnaddr = fnaddr`. majit stores the
     /// bound helper trace-call address when the host has supplied one,
     /// otherwise the stable symbolic fallback key; the blackhole-side
     /// inline-call descriptor may still patch its own cached copy from
     /// `all_jitcodes[jitcode.index]`.
     #[serde(default)]
     pub fnaddr: i64,
-    /// RPython `jitcode.py:18` `self.jitdriver_sd = None`. `Some(index)`
+    /// RPython `jitcode.py` `self.jitdriver_sd = None`. `Some(index)`
     /// for portal jitcodes (set by `grab_initial_jitcodes` /
     /// `drain_pending_graphs`). `OnceLock` allows the late single-set
     /// after `Arc<JitCode>` shells have been cloned (e.g. into
@@ -173,13 +173,13 @@ pub struct JitCode {
     /// `set_jitdriver_sd()`.
     #[serde(with = "oncelock_usize_serde")]
     pub jitdriver_sd: OnceLock<usize>,
-    /// RPython `codewriter.py:68` `jitcode.index = index` — sequential
+    /// RPython `codewriter.py` `jitcode.index = index` — sequential
     /// position in `all_jitcodes[]`. Set once when the codewriter has
     /// finished assembling the jitcode and appended it to the completed
     /// list, matching upstream `CodeWriter.make_jitcodes()`.
     #[serde(with = "oncelock_usize_serde")]
     index: OnceLock<usize>,
-    /// RPython `jitcode.py:19` `self._called_from = called_from` — debug:
+    /// RPython `jitcode.py` `self._called_from = called_from` — debug:
     /// which call graph first triggered this jitcode's creation. In RPython
     /// this is a graph object; pyre uses an optional CallPath string.
     #[serde(default)]
@@ -257,11 +257,11 @@ mod oncelock_body_serde {
 }
 
 impl JitCode {
-    /// RPython `jitcode.py:14-20` `JitCode.__init__(name, fnaddr=None,
+    /// RPython `jitcode.py` `JitCode.__init__(name, fnaddr=None,
     /// calldescr=None, called_from=None)`.
     ///
     /// Constructs a JitCode with name + default-initialized state. The
-    /// `setup()` step (RPython `jitcode.py:22-42`) populates `code`,
+    /// `setup()` step (RPython `jitcode.py`) populates `code`,
     /// `constants_*`, `c_num_regs_*`, `startpoints`, etc. via the
     /// assembler.
     ///
@@ -336,7 +336,7 @@ impl JitCode {
     }
 
     /// `Some(idx)` when this jitcode is the portal of jitdriver `idx`.
-    /// RPython `jitcode.py:18` `self.jitdriver_sd = None` (overwritten by
+    /// RPython `jitcode.py` `self.jitdriver_sd = None` (overwritten by
     /// `grab_initial_jitcodes` / `drain_pending_graphs`).
     pub fn jitdriver_sd(&self) -> Option<usize> {
         self.jitdriver_sd.get().copied()
@@ -426,7 +426,7 @@ impl Deref for JitCode {
 }
 
 impl JitCode {
-    /// RPython `jitcode.py:114-119` `def dump(self)`:
+    /// RPython `jitcode.py` `def dump(self)`:
     ///
     /// ```python
     /// def dump(self):
@@ -443,40 +443,40 @@ impl JitCode {
         }
     }
 
-    /// RPython `jitcode.py:47-48` `def num_regs_i(self): return ord(self.c_num_regs_i)`.
+    /// RPython `jitcode.py` `def num_regs_i(self): return ord(self.c_num_regs_i)`.
     pub fn num_regs_i(&self) -> usize {
         self.c_num_regs_i as usize
     }
 
-    /// RPython `jitcode.py:50-51` `def num_regs_r(self): return ord(self.c_num_regs_r)`.
+    /// RPython `jitcode.py` `def num_regs_r(self): return ord(self.c_num_regs_r)`.
     pub fn num_regs_r(&self) -> usize {
         self.c_num_regs_r as usize
     }
 
-    /// RPython `jitcode.py:53-54` `def num_regs_f(self): return ord(self.c_num_regs_f)`.
+    /// RPython `jitcode.py` `def num_regs_f(self): return ord(self.c_num_regs_f)`.
     pub fn num_regs_f(&self) -> usize {
         self.c_num_regs_f as usize
     }
 
-    /// RPython `jitcode.py:56-57` `def num_regs_and_consts_i(self):
+    /// RPython `jitcode.py` `def num_regs_and_consts_i(self):
     /// return ord(self.c_num_regs_i) + len(self.constants_i)`.
     pub fn num_regs_and_consts_i(&self) -> usize {
         self.num_regs_i() + self.constants_i.len()
     }
 
-    /// RPython `jitcode.py:59-60` `def num_regs_and_consts_r(self):
+    /// RPython `jitcode.py` `def num_regs_and_consts_r(self):
     /// return ord(self.c_num_regs_r) + len(self.constants_r)`.
     pub fn num_regs_and_consts_r(&self) -> usize {
         self.num_regs_r() + self.constants_r.len()
     }
 
-    /// RPython `jitcode.py:62-63` `def num_regs_and_consts_f(self):
+    /// RPython `jitcode.py` `def num_regs_and_consts_f(self):
     /// return ord(self.c_num_regs_f) + len(self.constants_f)`.
     pub fn num_regs_and_consts_f(&self) -> usize {
         self.num_regs_f() + self.constants_f.len()
     }
 
-    /// RPython `jitcode.py:102-114` `def follow_jump(self, position)`:
+    /// RPython `jitcode.py` `def follow_jump(self, position)`:
     /// "Assuming that 'position' points just after a bytecode instruction
     /// that ends with a label, follow that label."
     ///
@@ -524,7 +524,7 @@ impl JitCode {
         labelvalue
     }
 
-    /// RPython `jitcode.py:82-93` `get_live_vars_info(pc, op_live)`:
+    /// RPython `jitcode.py` `get_live_vars_info(pc, op_live)`:
     ///
     /// ```python
     /// def get_live_vars_info(self, pc, op_live):
@@ -612,7 +612,7 @@ impl JitCode {
         }
     }
 
-    /// RPython `jitcode.py:95-100` `_missing_liveness(self, pc)`:
+    /// RPython `jitcode.py` `_missing_liveness(self, pc)`:
     ///
     /// ```python
     /// def _missing_liveness(self, pc):
@@ -627,7 +627,7 @@ impl JitCode {
     }
 }
 
-// RPython `jitcode.py:121-122` `def __repr__(self): return '<JitCode %r>' % self.name`.
+// RPython `jitcode.py` `def __repr__(self): return '<JitCode %r>' % self.name`.
 impl std::fmt::Display for JitCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "<JitCode {:?}>", self.name)
@@ -743,7 +743,7 @@ mod jitcode_handle_serde {
     }
 }
 
-/// RPython `jitcode.py:146-167` module-level `enumerate_vars(offset,
+/// RPython `jitcode.py` module-level `enumerate_vars(offset,
 /// all_liveness, callback_i, callback_r, callback_f, spec)`:
 ///
 /// ```python
@@ -811,7 +811,7 @@ pub fn enumerate_vars(
     }
 }
 
-/// RPython `jitcode.py:127-128` `class MissingLiveness(Exception): pass`.
+/// RPython `jitcode.py` `class MissingLiveness(Exception): pass`.
 ///
 /// Raised by `JitCode::get_live_vars_info` when a `-live-` op is missing
 /// at the expected PC. Currently we panic instead of returning a typed
@@ -820,7 +820,7 @@ pub struct MissingLiveness {
     pub message: String,
 }
 
-/// RPython `jitcode.py:131-143` `class SwitchDictDescr(AbstractDescr)`:
+/// RPython `jitcode.py` `class SwitchDictDescr(AbstractDescr)`:
 ///
 /// ```python
 /// class SwitchDictDescr(AbstractDescr):
@@ -859,7 +859,7 @@ pub struct SwitchDictDescr {
 }
 
 impl SwitchDictDescr {
-    /// RPython `jitcode.py:134-136` `def attach(self, as_dict)`.
+    /// RPython `jitcode.py` `def attach(self, as_dict)`.
     pub fn attach(&mut self, as_dict: std::collections::HashMap<i64, usize>) {
         let mut keys: Vec<i64> = as_dict.keys().copied().collect();
         keys.sort();
@@ -965,7 +965,7 @@ pub struct BhCallDescr {
     /// result layout so signature-exact backends call the true ABI.
     #[serde(default)]
     pub void_word_abi: bool,
-    /// RPython `CallDescr.extrainfo` (`descr.py:453`,
+    /// RPython `CallDescr.extrainfo` (`descr.py`,
     /// `effectinfo.py:13-263`).
     pub extra_info: majit_ir::descr::EffectInfo,
     /// Object identity assigned by translation after all EffectInfos are
@@ -984,7 +984,7 @@ pub struct BhCallDescr {
 /// integer-only signatures need one arm per length and run to
 /// [`MAX_HOST_CALL_ARITY`](super::insns::MAX_HOST_CALL_ARITY).
 ///
-/// Upstream has no such limit: `descr.py:604-605 create_call_stub`
+/// Upstream has no such limit: `descr.py create_call_stub`
 /// source-generates `FuncType(ARGS, RESULT)` per calldescr at translation time,
 /// so every sequence has a stub. Lifting it here means an ABI adapter that can
 /// place arguments for a signature only known at run time.
@@ -1020,7 +1020,7 @@ fn debug_assert_dispatchable(arg_classes: &str) {
 
 impl BhCallDescr {
     pub fn from_call_descr(cd: &dyn majit_ir::descr::CallDescr) -> Self {
-        // RPython `descr.py:456 CallDescr.result_type` is the char
+        // RPython `descr.py CallDescr.result_type` is the char
         // 'i'/'r'/'f'/'L'/'S'/'v' itself.  `cd.result_type()` is pyre's
         // coarser IR type, so derive the backend layout from
         // `result_class()` first; SimpleCallDescr preserves specialised
@@ -1166,7 +1166,7 @@ impl BhFieldSpec {
     /// `BhDescr::Size.all_fielddescrs` matching `descr.py:188
     /// init_size_descr` parity.
     pub fn from_field_descr(fd: &dyn majit_ir::descr::FieldDescr) -> Self {
-        // descr.py:241-254 `get_type_flag`: a `Ptr` to a GC struct is
+        // descr.py `get_type_flag`: a `Ptr` to a GC struct is
         // FLAG_POINTER, and only a `Ptr` to a raw struct degrades to
         // FLAG_UNSIGNED.  pyre models the raw case as `Type::Int`, so a
         // pointer field always round-trips as `Pointer` — the same mapping the
@@ -1207,7 +1207,7 @@ impl BhFieldSpec {
     }
 }
 
-/// Mirror `SizeDescr.all_fielddescrs` (`descr.py:122-126`) onto a
+/// Mirror `SizeDescr.all_fielddescrs` (`descr.py`) onto a
 /// fresh `Vec<BhFieldSpec>`.
 pub fn bh_field_specs_from_size_descr(sd: &dyn majit_ir::descr::SizeDescr) -> Vec<BhFieldSpec> {
     sd.all_fielddescrs()
@@ -1302,7 +1302,7 @@ pub const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
 /// varies per process. Two builds of one unchanged source tree therefore
 /// produced two different artefacts, which defeats build caching and makes an
 /// A/B bisection impossible to attribute. Emit the same key order
-/// `const_keys_in_order` already canonicalises to (`jitcode.py:135
+/// `const_keys_in_order` already canonicalises to (`jitcode.py
 /// sorted(as_dict.keys())`). The shape is unchanged — still a map — so the
 /// artefacts stay readable by the existing deserializer.
 mod sorted_switch_dict {
@@ -1366,7 +1366,7 @@ pub enum BhDescr {
     Array {
         base_size: usize,
         itemsize: usize,
-        /// descr.py:277/286 ArrayDescr.lendescr.offset. `None` for
+        /// descr.py/286 ArrayDescr.lendescr.offset. `None` for
         /// nolength/raw array descriptors; `bh_arraylen_gc` requires
         /// `Some` just like llmodel.py asserts an ArrayDescr with lendescr.
         len_offset: Option<usize>,
@@ -1387,7 +1387,7 @@ pub enum BhDescr {
         is_array_of_structs: bool,
         /// descr.py ArrayDescr.is_item_signed() — FLAG_SIGNED vs FLAG_UNSIGNED.
         is_item_signed: bool,
-        /// `effectinfo.py:465 compute_bitstrings` ei_index carried from
+        /// `effectinfo.py compute_bitstrings` ei_index carried from
         /// the producer-side `SimpleArrayDescr.get_ei_index()`. Passed
         /// to `make_descr_from_bh` so the runtime `SimpleArrayDescr` it
         /// reconstructs publishes the same ei_index — without this
@@ -1413,7 +1413,7 @@ pub enum BhDescr {
         /// just as upstream collides two arrays that happen to share
         /// the same lltype.
         array_type_id: Option<String>,
-        /// descr.py:372-375 `arraydescr.all_interiorfielddescrs` for
+        /// descr.py `arraydescr.all_interiorfielddescrs` for
         /// arrays whose item type is an inline struct.
         interior_fields: Vec<BhInteriorFieldSpec>,
         /// Whether the array is GC-managed (carries a GC header).  See
@@ -1437,10 +1437,10 @@ pub enum BhDescr {
     },
     /// Plain `SizeDescr` (no vtable / NEW_WITH_VTABLE descr).
     ///
-    /// `descr.py:120 get_size_descr` + `:188 init_size_descr` populate
+    /// `descr.py get_size_descr` + `:188 init_size_descr` populate
     /// the `SizeDescr.all_fielddescrs` and `gc_fielddescrs` lists from
     /// `heaptracker.all_fielddescrs(STRUCT)` at descr-creation time so
-    /// downstream consumers (`info.py:180 init_fields`, virtualized
+    /// downstream consumers (`info.py init_fields`, virtualized
     /// struct fan-out) read the full per-struct layout off the descr.
     /// `owner` carries the upstream `STRUCT._name` so a producer that
     /// only has the size + type_id can re-resolve the layout via
@@ -1826,7 +1826,7 @@ impl BhDescr {
         }
     }
 
-    /// `llmodel.py:369-374 unpack_fielddescr_size`: return `(offset,
+    /// `llmodel.py unpack_fielddescr_size`: return `(offset,
     /// field_size, is_field_signed)`.  Backend `bh_getfield_gc_i` /
     /// `bh_setfield_gc_i` thread the tuple to `read_int_at_mem` /
     /// `write_int_at_mem` so the per-field byte width and signedness
@@ -1954,7 +1954,7 @@ impl BhDescr {
         }
     }
 
-    /// `llmodel.py:625-628 unpack_arraydescr_size`: return
+    /// `llmodel.py unpack_arraydescr_size`: return
     /// `(base_size, itemsize, is_item_signed)`.  Backend
     /// `bh_getarrayitem_gc_i` / `bh_setarrayitem_gc_i` thread the tuple
     /// to `read_int_at_mem` / `write_int_at_mem` so the per-array
@@ -1972,7 +1972,7 @@ impl BhDescr {
         }
     }
 
-    /// `llmodel.py:618 unpack_arraydescr`: return `base_size`.  Used by
+    /// `llmodel.py unpack_arraydescr`: return `base_size`.  Used by
     /// the ref- and float-typed `bh_getarrayitem_gc_*` /
     /// `bh_setarrayitem_gc_*` paths (`llmodel.py:597-600, 603-606`)
     /// where the item width is fixed (`WORD` for ref,
@@ -1984,7 +1984,7 @@ impl BhDescr {
         }
     }
 
-    /// `llmodel.py:585-588 bh_arraylen_gc`: the length is read from
+    /// `llmodel.py bh_arraylen_gc`: the length is read from
     /// `arraydescr.lendescr.offset`, not assumed to be at offset 0.
     pub fn array_len_offset(&self) -> Option<usize> {
         match self {
@@ -2017,7 +2017,7 @@ impl BhDescr {
         BhDescr::Array {
             base_size: info.base_size,
             itemsize: info.item_size,
-            // descr.py:277 ArrayDescr.lendescr.offset — preserved by the
+            // descr.py ArrayDescr.lendescr.offset — preserved by the
             // summary; `None` is the `nolength=True` shape (raw buffers),
             // not a `base_size`-derived heuristic.
             len_offset: info.len_offset,
@@ -2060,7 +2060,7 @@ impl BhDescr {
             base_size: array_descr.base_size(),
             itemsize: array_descr.item_size(),
             len_offset: array_descr.len_descr().map(|fd| fd.offset()),
-            // `descr.py:348-378` cache identity — `ArrayDescr.cache_key()`
+            // `descr.py` cache identity — `ArrayDescr.cache_key()`
             // returns the u64 `path_hash(array_type_id)` slot stamped by
             // the analyzer's `gc_cache.get_array_descr` cache-miss-mint
             // (zero for legacy non-keyed mints).  Round-trips through
@@ -2114,11 +2114,11 @@ impl BhDescr {
 
     /// Build the runtime BhDescr shape from a live `InteriorFieldDescr`,
     /// composing its `arraydescr` and `fielddescr` summaries.
-    /// `descr.py:388 InteriorFieldDescr(arraydescr, fielddescr)`.
+    /// `descr.py InteriorFieldDescr(arraydescr, fielddescr)`.
     pub fn from_interior_field_descr(ifd: &dyn majit_ir::descr::InteriorFieldDescr) -> Self {
-        // `descr.py:372-375 get_array_descr` attaches `all_interiorfielddescrs`
+        // `descr.py get_array_descr` attaches `all_interiorfielddescrs`
         // to the struct-array descr the `InteriorFieldDescr` is built from
-        // (`descr.py:430 get_interiorfield_descr` reuses that same cached
+        // (`descr.py get_interiorfield_descr` reuses that same cached
         // arraydescr).  `from_array_descr` leaves the list empty for the other
         // resume callers; carry it across the BhDescr boundary here so the
         // restore path can re-attach it (`make_descr_from_bh` →
@@ -2231,7 +2231,7 @@ mod tests {
 
     #[test]
     fn switch_dict_descr_unattached_renders_question_mark() {
-        // RPython `jitcode.py:138 def __repr__(self): dict =
+        // RPython `jitcode.py def __repr__(self): dict =
         // getattr(self, 'dict', '?')` returns `'?'` only when
         // `self.dict` attribute is missing entirely (i.e. `attach`
         // never ran).  Pyre has to track the attach event explicitly

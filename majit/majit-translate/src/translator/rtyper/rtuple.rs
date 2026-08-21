@@ -1,13 +1,13 @@
 //! RPython `rpython/rtyper/rtuple.py` — `TupleRepr` for RPython tuples.
 //!
 //! Upstream rtuple.py (414 LOC) covers:
-//! * `TUPLE_TYPE(field_lltypes)` (rtuple.py:119-126) — Void for empty
+//! * `TUPLE_TYPE(field_lltypes)` (rtuple.py) — Void for empty
 //!   tuples, `Ptr(GcStruct('tuple%d', ('item0', T0), ...))` otherwise.
-//! * `class TupleRepr(Repr)` (rtuple.py:129+) — items_r,
+//! * `class TupleRepr(Repr)` (rtuple.py+) — items_r,
 //!   external_items_r, fieldnames, lltypes, tuple_cache, lowleveltype.
-//! * `getitem` / `getitem_internal` (rtuple.py:144-150).
-//! * `newtuple` / `newtuple_cached` / `_rtype_newtuple` (rtuple.py:153-182).
-//! * `convert_const` / `instantiate` (rtuple.py:184-204).
+//! * `getitem` / `getitem_internal` (rtuple.py).
+//! * `newtuple` / `newtuple_cached` / `_rtype_newtuple` (rtuple.py).
+//! * `convert_const` / `instantiate` (rtuple.py).
 //! * pair-type / iterator / hash / eq / str (rtuple.py:200-414).
 
 use std::cell::RefCell;
@@ -35,7 +35,7 @@ fn rtuple_deferred(name: &str) -> TyperError {
     TyperError::missing_rtype_operation(format!("rtuple.{name} helper surface deferred"))
 }
 
-/// RPython `TUPLE_TYPE(field_lltypes)` (rtuple.py:119-126).
+/// RPython `TUPLE_TYPE(field_lltypes)` (rtuple.py).
 ///
 /// ```python
 /// def TUPLE_TYPE(field_lltypes):
@@ -79,10 +79,10 @@ pub fn rtype_newtuple(
     TupleRepr::rtype_newtuple(hop)
 }
 
-/// RPython `dum_empty_tuple` PBC sentinel (rtuple.py:261).
+/// RPython `dum_empty_tuple` PBC sentinel (rtuple.py).
 pub fn dum_empty_tuple() {}
 
-/// RPython `_gen_eq_function_cache` (rtuple.py:27) + `gen_eq_function`
+/// RPython `_gen_eq_function_cache` (rtuple.py) + `gen_eq_function`
 /// (rtuple.py:31-51).
 ///
 /// ```python
@@ -168,7 +168,7 @@ pub fn gen_eq_function(
         .map(|r| r.get_ll_eq_function(rtyper))
         .collect::<Result<_, _>>()?;
 
-    // upstream `key = tuple(eq_funcs)` (rtuple.py:33) — keyed by helper
+    // upstream `key = tuple(eq_funcs)` (rtuple.py) — keyed by helper
     // identity, not lltype. Pyre encodes the helper-tuple identity into
     // the `lowlevel_helper_function_with_builder` cache key (which is
     // `(name, args, result)`) by composing per-item suffixes from
@@ -194,7 +194,7 @@ pub fn gen_eq_function(
 
 /// Encodes a tuple of (lltype, helper) pairs into a name suffix that
 /// uniquely identifies the cache key. Mirrors upstream's
-/// `tuple(eq_funcs)` / `tuple(hash_funcs)` (rtuple.py:33, :56) —
+/// `tuple(eq_funcs)` / `tuple(hash_funcs)` (rtuple.py, :56) —
 /// helper-identity keying, not lltype keying. For `Some(helper)` the
 /// helper's globally-unique name (assigned at synthesis time by
 /// `lowlevel_helper_function_with_builder`) carries the identity; for
@@ -231,8 +231,8 @@ fn lltype_shape_suffix(lltypes: &[LowLevelType]) -> String {
         .join("_")
 }
 
-/// RPython `_gen_hash_function_cache` (rtuple.py:28) +
-/// `gen_hash_function` (rtuple.py:53-73).
+/// RPython `_gen_hash_function_cache` (rtuple.py) +
+/// `gen_hash_function` (rtuple.py).
 ///
 /// ```python
 /// def gen_hash_function(items_r):
@@ -291,7 +291,7 @@ pub fn gen_hash_function(
         })
         .collect::<Result<_, _>>()?;
 
-    // upstream `key = tuple(hash_funcs)` (rtuple.py:56) — keyed by
+    // upstream `key = tuple(hash_funcs)` (rtuple.py) — keyed by
     // helper identity. Pyre composes the cache key from each helper's
     // unique name so two Reprs with the same lowleveltype but
     // different hash helpers do not collide. Always-Some here (no
@@ -316,7 +316,7 @@ pub fn gen_hash_function(
 }
 
 thread_local! {
-    /// RPython `_gen_str_function_cache = {}` (rtuple.py:29).
+    /// RPython `_gen_str_function_cache = {}` (rtuple.py).
     ///
     /// Upstream keys this dict by `tuple([r_item.ll_str for r_item in
     /// items_r])`. `LowLevelFunction` carries `Rc<PyGraph>`, so the Rust
@@ -326,7 +326,7 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// RPython `gen_str_function(tuplerepr)` (rtuple.py:75-117).
+/// RPython `gen_str_function(tuplerepr)` (rtuple.py).
 ///
 /// The upstream helper builds `ll_str(t)` through `annlowlevel.llstr`,
 /// `annlowlevel.hlstr`, and `rlib.rstring.StringBuilder`. Those pieces
@@ -479,7 +479,7 @@ fn primitive_eq_opname(lltype: &LowLevelType) -> Result<&'static str, TyperError
         LowLevelType::UnsignedLongLong => "ullong_eq",
         LowLevelType::UnsignedLongLongLong => "ulllong_eq",
         LowLevelType::Float => "float_eq",
-        // rstr.py:496 + rstr.py:546 pairtype(AbstractCharRepr,
+        // rstr.py + rstr.py pairtype(AbstractCharRepr,
         // AbstractCharRepr).rtype_eq lowers to `char_eq`. Same for
         // unichar via rstr.py:778-779.
         LowLevelType::Char => "char_eq",
@@ -607,7 +607,7 @@ fn build_gen_eq_function_graph(
             }
             None => {
                 if item_lltype == LowLevelType::Void {
-                    // upstream rtuple.py:31 — `r_item.get_ll_eq_function() or
+                    // upstream rtuple.py — `r_item.get_ll_eq_function() or
                     // operator.eq`. For `NoneRepr`/Void items the fallback
                     // is `operator.eq` which RPython's annotator+rtyper
                     // const-folds to `Constant(True, Bool)` (two Void
@@ -687,7 +687,7 @@ fn build_gen_eq_function_graph(
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
-/// RPython `pairtype(TupleRepr, TupleRepr).rtype_is_` (rtuple.py:355-356):
+/// RPython `pairtype(TupleRepr, TupleRepr).rtype_is_` (rtuple.py):
 ///
 /// ```python
 /// def rtype_is_((robj1, robj2), hop):
@@ -708,7 +708,7 @@ pub fn pair_tuple_tuple_rtype_is_(
     Err(TyperError::message("cannot compare tuples with 'is'"))
 }
 
-/// RPython `pairtype(TupleRepr, TupleRepr).rtype_eq` (rtuple.py:329-334):
+/// RPython `pairtype(TupleRepr, TupleRepr).rtype_eq` (rtuple.py):
 ///
 /// ```python
 /// def rtype_eq((r_tup1, r_tup2), hop):
@@ -757,7 +757,7 @@ pub fn pair_tuple_tuple_rtype_eq(
     Ok(Some(v_result))
 }
 
-/// RPython `pairtype(TupleRepr, TupleRepr).rtype_ne` (rtuple.py:336-338):
+/// RPython `pairtype(TupleRepr, TupleRepr).rtype_ne` (rtuple.py):
 ///
 /// ```python
 /// def rtype_ne(tup1tup2, hop):
@@ -827,7 +827,7 @@ pub fn pair_tuple_tuple_convert_from_to(
     if r_from_t.lowleveltype() == r_to_t.lowleveltype() {
         return Ok(Some(v.clone()));
     }
-    // upstream rtuple.py:344-351 — per-item getitem_internal +
+    // upstream rtuple.py — per-item getitem_internal +
     // convertvar to the matching destination items_r position.
     let n = r_from_t.items_r.len();
     let mut items_v: Vec<Hlvalue> = Vec::with_capacity(n);
@@ -840,12 +840,12 @@ pub fn pair_tuple_tuple_convert_from_to(
         )?;
         items_v.push(item_v);
     }
-    // upstream rtuple.py:352 — `r_from.newtuple(llops, r_to, items_v)`.
+    // upstream rtuple.py — `r_from.newtuple(llops, r_to, items_v)`.
     let result = TupleRepr::newtuple(llops, r_to_t, items_v)?;
     Ok(Some(result))
 }
 
-/// RPython `pairtype(TupleRepr, TupleRepr).rtype_add` (rtuple.py:319-327):
+/// RPython `pairtype(TupleRepr, TupleRepr).rtype_add` (rtuple.py):
 ///
 /// ```python
 /// def rtype_add((r_tup1, r_tup2), hop):
@@ -901,7 +901,7 @@ pub fn pair_tuple_tuple_rtype_add(
     Ok(Some(result))
 }
 
-/// RPython `_ll_equal(x, y): return x == y` (rtuple.py:413-414).
+/// RPython `_ll_equal(x, y): return x == y` (rtuple.py).
 ///
 /// Per-type primitive equality helper used by
 /// `pairtype(TupleRepr, Repr).rtype_contains` when the item Repr's
@@ -955,7 +955,7 @@ fn build_ll_equal_graph(
         Hlvalue::Variable(return_var),
     );
     if item_lltype == &LowLevelType::Void {
-        // upstream rtuple.py:301 — `r_item.get_ll_eq_function() or
+        // upstream rtuple.py — `r_item.get_ll_eq_function() or
         // _ll_equal`. For NoneRepr/Void items the fallback `_ll_equal`
         // would lower `x == y` on two Void operands; RPython's
         // annotator+rtyper const-fold this to `Constant(True, Bool)`.
@@ -994,7 +994,7 @@ fn build_ll_equal_graph(
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
-/// RPython `pairtype(TupleRepr, Repr).rtype_contains` (rtuple.py:292-315):
+/// RPython `pairtype(TupleRepr, Repr).rtype_contains` (rtuple.py):
 ///
 /// ```python
 /// def rtype_contains((r_tup, r_item), hop):
@@ -1078,7 +1078,7 @@ pub fn pair_tuple_repr_rtype_contains(
         if !crate::annotator::model::contains(&s_item, &s_const_item) {
             continue;
         }
-        // upstream rtuple.py:307 — `c_tuple_item = hop.inputconst(r_item, x)`.
+        // upstream rtuple.py — `c_tuple_item = hop.inputconst(r_item, x)`.
         // `inputconst` routes through `r_item.convert_const(x)` so per-Repr
         // conversions (bool→int, int→float, PBC/class/string constant) apply.
         // Stamping `Constant::with_concretetype` directly bypasses that
@@ -1111,7 +1111,7 @@ pub fn pair_tuple_repr_rtype_contains(
     Ok(Some(result))
 }
 
-/// RPython `bookkeeper.immutablevalue(x)` (rtuple.py:304):
+/// RPython `bookkeeper.immutablevalue(x)` (rtuple.py):
 ///
 /// ```python
 /// s_const_item = hop.rtyper.annotator.bookkeeper.immutablevalue(x)
@@ -1151,7 +1151,7 @@ pub fn pair_tuple_int_rtype_getitem(
     r_tup.rtype_pair_getitem(hop)
 }
 
-/// RPython `class AbstractTupleIteratorRepr(IteratorRepr)` (rtuple.py:374-388).
+/// RPython `class AbstractTupleIteratorRepr(IteratorRepr)` (rtuple.py).
 ///
 /// The generic iterator protocol (`newiter` / `rtype_next`) is kept as
 /// an explicit parity surface. Actual lowering needs the tuple iterator
@@ -1163,7 +1163,7 @@ pub struct AbstractTupleIteratorRepr {
 }
 
 impl AbstractTupleIteratorRepr {
-    /// RPython `AbstractTupleIteratorRepr.newiter(self, hop)` (rtuple.py:376-380).
+    /// RPython `AbstractTupleIteratorRepr.newiter(self, hop)` (rtuple.py).
     pub fn newiter(
         &self,
         _hop: &crate::translator::rtyper::rtyper::HighLevelOp,
@@ -1171,7 +1171,7 @@ impl AbstractTupleIteratorRepr {
         Err(rtuple_deferred("AbstractTupleIteratorRepr.newiter"))
     }
 
-    /// RPython `AbstractTupleIteratorRepr.rtype_next(self, hop)` (rtuple.py:382-388).
+    /// RPython `AbstractTupleIteratorRepr.rtype_next(self, hop)` (rtuple.py).
     pub fn rtype_next(
         &self,
         _hop: &crate::translator::rtyper::rtyper::HighLevelOp,
@@ -1228,7 +1228,7 @@ impl Repr for Length1TupleIteratorRepr {
         "Length1TupleIteratorRepr"
     }
 
-    /// RPython `IteratorRepr.rtype_iter(self, hop)` (rmodel.py:266-268) —
+    /// RPython `IteratorRepr.rtype_iter(self, hop)` (rmodel.py) —
     /// `iter(iter(x)) <==> iter(x)`: an iterator is its own iterator, so
     /// the op is the identity on the receiver (mirroring
     /// [`super::rlist::ListIteratorRepr::rtype_iter`]).
@@ -1238,7 +1238,7 @@ impl Repr for Length1TupleIteratorRepr {
     }
 
     /// RPython `IteratorRepr.rtype_method_next(self, hop)`
-    /// (rmodel.py:270-271) — `iter.next()` delegates to `rtype_next`.
+    /// (rmodel.py) — `iter.next()` delegates to `rtype_next`.
     fn rtype_method(
         &self,
         method_name: &str,
@@ -1252,7 +1252,7 @@ impl Repr for Length1TupleIteratorRepr {
         }
     }
 
-    /// RPython `AbstractTupleIteratorRepr.newiter(self, hop)` (rtuple.py:376-380).
+    /// RPython `AbstractTupleIteratorRepr.newiter(self, hop)` (rtuple.py).
     fn newiter(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
         let r_tuple = {
             let args_r = hop.args_r.borrow();
@@ -1280,7 +1280,7 @@ impl Repr for Length1TupleIteratorRepr {
         hop.gendirectcall(&helper, vlist)
     }
 
-    /// RPython `AbstractTupleIteratorRepr.rtype_next(self, hop)` (rtuple.py:382-388).
+    /// RPython `AbstractTupleIteratorRepr.rtype_next(self, hop)` (rtuple.py).
     fn rtype_next(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
         let v_iter = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
         hop.has_implicit_exception("StopIteration");
@@ -1316,7 +1316,7 @@ impl Repr for Length1TupleIteratorRepr {
     }
 }
 
-/// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py:399-402).
+/// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py).
 ///
 /// The executable lowering uses [`build_ll_tupleiter_helper_graph`] because
 /// `hop.gendirectcall` needs a helper graph carrying malloc/setfield ops. Keep
@@ -1326,7 +1326,7 @@ pub fn ll_tupleiter(_iterptr: &LowLevelType, _tuple: Hlvalue) -> Result<Hlvalue,
     Err(rtuple_deferred("ll_tupleiter"))
 }
 
-/// RPython `ll_tuplenext(iter)` (rtuple.py:404-411).
+/// RPython `ll_tuplenext(iter)` (rtuple.py).
 ///
 /// The executable lowering uses [`build_ll_tuplenext_helper_graph`] so it can
 /// model the branch and StopIteration edge in a flow graph. Keep this public
@@ -1335,7 +1335,7 @@ pub fn ll_tuplenext(_iter: Hlvalue) -> Result<Hlvalue, TyperError> {
     Err(rtuple_deferred("ll_tuplenext"))
 }
 
-/// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py:399-402):
+/// RPython `ll_tupleiter(ITERPTR, tuple)` (rtuple.py):
 ///
 /// ```python
 /// def ll_tupleiter(ITERPTR, tuple):
@@ -1414,7 +1414,7 @@ pub(crate) fn build_ll_tupleiter_helper_graph(
     ))
 }
 
-/// RPython `ll_tuplenext(iter)` (rtuple.py:404-411), for length-1 tuples:
+/// RPython `ll_tuplenext(iter)` (rtuple.py), for length-1 tuples:
 ///
 /// ```python
 /// def ll_tuplenext(iter):
@@ -1493,7 +1493,7 @@ pub(crate) fn build_ll_tuplenext_helper_graph(
         .into_ref(),
     ]);
 
-    // `iter.tuple = nullptr(typeOf(t).TO)` (rtuple.py:408): a typed null
+    // `iter.tuple = nullptr(typeOf(t).TO)` (rtuple.py): a typed null
     // pointer, not the `None` sentinel.  The codewriter clears the ref field
     // from a `ConstValue::LLPtr` null; a `ConstValue::None` payload carried on a
     // `Ptr` concretetype is not accepted by `emit_const_r`.
@@ -1545,7 +1545,7 @@ pub(crate) fn build_ll_tuplenext_helper_graph(
     ))
 }
 
-/// RPython `class TupleRepr(Repr)` (rtuple.py:129-204+).
+/// RPython `class TupleRepr(Repr)` (rtuple.py+).
 ///
 /// Minimal slice — carries the item reprs + lowleveltype. Methods that
 /// emit ops (`getitem`, `newtuple`, ...) land in follow-up commits.
@@ -1566,9 +1566,9 @@ pub struct TupleRepr {
     /// RPython `self.lltypes = [r.lowleveltype for r in items_r]`
     /// (rtuple.py:140).
     pub lltypes: Vec<LowLevelType>,
-    /// RPython `self.lowleveltype = TUPLE_TYPE(self.lltypes)` (rtuple.py:142).
+    /// RPython `self.lowleveltype = TUPLE_TYPE(self.lltypes)` (rtuple.py).
     lltype: LowLevelType,
-    /// RPython `self.tuple_cache = {}` (rtuple.py:141). Caches the
+    /// RPython `self.tuple_cache = {}` (rtuple.py). Caches the
     /// instantiated `_ptr` per `Vec<ConstValue>` key. `convert_const`
     /// matches upstream rtuple.py:190-191 — it instantiates, inserts
     /// the pointer into this cache BEFORE filling fields, and then
@@ -1580,7 +1580,7 @@ pub struct TupleRepr {
 }
 
 impl TupleRepr {
-    /// RPython `TupleRepr.__init__(self, rtyper, items_r)` (rtuple.py:131-142).
+    /// RPython `TupleRepr.__init__(self, rtyper, items_r)` (rtuple.py).
     ///
     /// Splits each input item via [`externalvsinternal`]: GC
     /// `InstanceRepr` items are stored internally as the root
@@ -1617,7 +1617,7 @@ impl TupleRepr {
         })
     }
 
-    /// RPython `TupleRepr.instantiate(self)` (rtuple.py:223-227).
+    /// RPython `TupleRepr.instantiate(self)` (rtuple.py).
     ///
     /// ```python
     /// def instantiate(self):
@@ -1633,7 +1633,7 @@ impl TupleRepr {
     /// [`Repr::convert_const`] impl). For non-empty tuples this
     /// allocates a Gc instance of the `tuple%d` GcStruct via
     /// `lltype::malloc` with default `immortal=False` —
-    /// matching upstream rtuple.py:226-227 `malloc(self.lowleveltype.TO)`.
+    /// matching upstream rtuple.py `malloc(self.lowleveltype.TO)`.
     pub fn instantiate(&self) -> Result<_ptr, TyperError> {
         if self.items_r.is_empty() {
             return Err(TyperError::message(
@@ -1661,7 +1661,7 @@ impl TupleRepr {
         lltype::malloc(inner, None, MallocFlavor::Gc, false).map_err(TyperError::message)
     }
 
-    /// RPython empty-tuple branch of `instantiate` (rtuple.py:223-225):
+    /// RPython empty-tuple branch of `instantiate` (rtuple.py):
     ///
     /// ```python
     /// def instantiate(self):
@@ -1865,7 +1865,7 @@ impl TupleRepr {
         Ok(v_result_h)
     }
 
-    /// RPython `TupleRepr.rtype_len(self, hop)` (rtuple.py:200-201):
+    /// RPython `TupleRepr.rtype_len(self, hop)` (rtuple.py):
     ///
     /// ```python
     /// def rtype_len(self, hop):
@@ -1887,7 +1887,7 @@ impl TupleRepr {
         Ok(Some(Hlvalue::Constant(c)))
     }
 
-    /// RPython `TupleRepr._rtype_newtuple(cls, hop)` (rtuple.py:178-182):
+    /// RPython `TupleRepr._rtype_newtuple(cls, hop)` (rtuple.py):
     ///
     /// ```python
     /// @classmethod
@@ -1897,7 +1897,7 @@ impl TupleRepr {
     ///     return cls.newtuple_cached(hop, vlist)
     /// ```
     ///
-    /// `newtuple_cached` (rtuple.py:170-176) routes through the
+    /// `newtuple_cached` (rtuple.py) routes through the
     /// constant-result fast path; otherwise it calls `cls.newtuple`.
     /// Both arms are implemented here.
     /// RPython `pairtype(TupleRepr, IntegerRepr).rtype_getitem`
@@ -2081,7 +2081,7 @@ impl TupleRepr {
         } else {
             Vec::new()
         };
-        // upstream rtuple.py:285 — `assert len(indices) == len(hop.r_result.items_r)`.
+        // upstream rtuple.py — `assert len(indices) == len(hop.r_result.items_r)`.
         let r_result_arc = hop
             .r_result
             .borrow()
@@ -2098,9 +2098,9 @@ impl TupleRepr {
                 r_result.items_r.len()
             )));
         }
-        // upstream rtuple.py:287 — `v_tup = hop.inputarg(r_tup, arg=0)`.
+        // upstream rtuple.py — `v_tup = hop.inputarg(r_tup, arg=0)`.
         let v_tup = hop.inputarg(ConvertedTo::Repr(self), 0)?;
-        // upstream rtuple.py:288-289 — per-index getitem_internal.
+        // upstream rtuple.py — per-index getitem_internal.
         let mut items_v: Vec<Hlvalue> = Vec::with_capacity(indices.len());
         {
             let mut llops = hop.llops.borrow_mut();
@@ -2109,7 +2109,7 @@ impl TupleRepr {
                 items_v.push(Hlvalue::Variable(v));
             }
         }
-        // upstream rtuple.py:290 — `r_result.newtuple(hop.llops, r_result, items_v)`.
+        // upstream rtuple.py — `r_result.newtuple(hop.llops, r_result, items_v)`.
         let result = TupleRepr::newtuple(&mut hop.llops.borrow_mut(), r_result, items_v)?;
         Ok(Some(result))
     }
@@ -2157,14 +2157,14 @@ impl Repr for TupleRepr {
         ReprClassId::TupleRepr
     }
 
-    /// RPython `TupleRepr.compact_repr(self)` (rtuple.py:197-198):
+    /// RPython `TupleRepr.compact_repr(self)` (rtuple.py):
     ///
     /// ```python
     /// def compact_repr(self):
     ///     return "TupleR %s" % ' '.join([llt._short_name() for llt in self.lltypes])
     /// ```
     ///
-    /// Default `Repr.compact_repr` (rmodel.py:32-33) formats as
+    /// Default `Repr.compact_repr` (rmodel.py) formats as
     /// `"{class_name_without_Repr} {lowleveltype._short_name()}"` —
     /// for tuples that produces `"TupleR Ptr <gcstruct tupleN>"`,
     /// hiding the per-item types. Upstream overrides to flatten the
@@ -2180,7 +2180,7 @@ impl Repr for TupleRepr {
         format!("TupleR {}", item_names.join(" "))
     }
 
-    /// `RPythonTyper.translate_op_len` (rtyper.py:484-486) dispatches
+    /// `RPythonTyper.translate_op_len` (rtyper.py) dispatches
     /// `r.rtype_len(hop)` — without this override the default
     /// `Repr.rtype_len` would raise `MissingRTypeOperation` for tuples.
     /// Forwards to the inherent [`TupleRepr::rtype_len`] which mirrors
@@ -2192,7 +2192,7 @@ impl Repr for TupleRepr {
         self.rtype_len_inherent(hop)
     }
 
-    /// `class __extend__(TupleRepr).rtype_getslice` (rtuple.py:277-290).
+    /// `class __extend__(TupleRepr).rtype_getslice` (rtuple.py).
     /// Without this override `Repr.rtype_getslice` raises
     /// `MissingRTypeOperation("getslice")`. Forwards to the inherent
     /// helper.
@@ -2204,7 +2204,7 @@ impl Repr for TupleRepr {
     }
 
     /// `TupleRepr.get_ll_eq_function(self): return gen_eq_function(self.items_r)`
-    /// (rtuple.py:203-204). Returns a synthesized per-shape `ll_eq`
+    /// (rtuple.py). Returns a synthesized per-shape `ll_eq`
     /// helper that compares two tuple values element-by-element.
     fn get_ll_eq_function(
         &self,
@@ -2214,7 +2214,7 @@ impl Repr for TupleRepr {
     }
 
     /// `TupleRepr.get_ll_hash_function(self): return gen_hash_function(self.items_r)`
-    /// (rtuple.py:206-207). Returns a synthesized per-shape `ll_hash`
+    /// (rtuple.py). Returns a synthesized per-shape `ll_hash`
     /// helper using the CPython-style mix.
     fn get_ll_hash_function(
         &self,
@@ -2270,7 +2270,7 @@ impl Repr for TupleRepr {
         Ok(Some(v_result))
     }
 
-    /// RPython `TupleRepr.convert_const(self, value)` (rtuple.py:184-198).
+    /// RPython `TupleRepr.convert_const(self, value)` (rtuple.py).
     ///
     /// ```python
     /// def convert_const(self, value):
@@ -2469,7 +2469,7 @@ mod tests {
         assert_eq!(iter.ll_tuplenext, "ll_tuplenext");
     }
 
-    /// rmodel.py:266-268 `IteratorRepr.rtype_iter` — `iter()` on a tuple
+    /// rmodel.py `IteratorRepr.rtype_iter` — `iter()` on a tuple
     /// iterator is the identity (returns the iterator unchanged, emits no
     /// op); an unknown method routes to the missing-operation error.
     #[test]
@@ -2859,7 +2859,7 @@ mod tests {
         assert_eq!(c.value, ConstValue::Int(2));
     }
 
-    /// `externalvsinternal` (rmodel.py:417-429) maps each GC
+    /// `externalvsinternal` (rmodel.py) maps each GC
     /// `InstanceRepr` item to the root `getinstancerepr(rtyper, None)`
     /// while keeping the concrete repr on the `external_items_r` side.
     /// Non-instance items (Integer / Bool / etc.) pass through with
@@ -2904,7 +2904,7 @@ mod tests {
         );
     }
 
-    /// `translate_op_newtuple` (rtyper.py:547-549) dispatches the free
+    /// `translate_op_newtuple` (rtyper.py) dispatches the free
     /// function `rtuple.rtype_newtuple(hop)`. Without the explicit
     /// `"newtuple"` arm in `RPythonTyper::translate_operation` the op
     /// would fall to `default_translate_operation` and raise
@@ -2970,7 +2970,7 @@ mod tests {
         );
     }
 
-    /// `pairtype(TupleRepr, TupleRepr).rtype_is_` (rtuple.py:355-356)
+    /// `pairtype(TupleRepr, TupleRepr).rtype_is_` (rtuple.py)
     /// raises a `TyperError` instead of routing to `ptr_eq` on the
     /// tuple pointers — upstream rejects tuple identity comparison
     /// eagerly. The dispatch table arm in `pairtype.rs` propagates
@@ -3021,7 +3021,7 @@ mod tests {
         );
     }
 
-    /// `TupleRepr.rtype_getslice` (rtuple.py:277-290) extracts the
+    /// `TupleRepr.rtype_getslice` (rtuple.py) extracts the
     /// per-position items via `getitem_internal` and assembles a
     /// fresh tuple via `newtuple`. For `(a, b, c)[1:3]` the emitted
     /// op stream is: 2× getfield (for items 1 and 2) + 1× malloc + 2×
@@ -3120,7 +3120,7 @@ mod tests {
         );
     }
 
-    /// `pairtype(TupleRepr, TupleRepr).rtype_add` (rtuple.py:319-327)
+    /// `pairtype(TupleRepr, TupleRepr).rtype_add` (rtuple.py)
     /// concatenates two tuples by per-position getfield_internal +
     /// newtuple_cached. For `(a, b) + (c,)` the emitted op stream is:
     /// 3× getfield (items 0,1 of left + item 0 of right) + 1× malloc +
@@ -3185,7 +3185,7 @@ mod tests {
         assert_eq!(setfield_count, 3, "3 setfield on the 3-tuple result");
     }
 
-    /// `pair(TupleRepr, IntegerRepr).rtype_getitem` (rtuple.py:264-273)
+    /// `pair(TupleRepr, IntegerRepr).rtype_getitem` (rtuple.py)
     /// drops the implicit IndexError channel when the typer can prove
     /// the constant-indexed access cannot fail at runtime:
     ///
@@ -3314,7 +3314,7 @@ mod tests {
         assert!(hop.llops.borrow().llop_raising_exceptions.is_none());
     }
 
-    /// `gen_eq_function([r_int, r_int])` (rtuple.py:31-51) synthesizes
+    /// `gen_eq_function([r_int, r_int])` (rtuple.py) synthesizes
     /// a `ll_tuple_eq_signed_signed(t1, t2) -> Bool` helper graph.
     /// The graph chain has N=2 check blocks each emitting
     /// `getfield × 2 + int_eq` and a 2-way exit. Last block's true
@@ -3328,7 +3328,7 @@ mod tests {
         let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
         let llfn =
             gen_eq_function(&rtyper, &[r_int.clone(), r_int.clone()]).expect("gen_eq_function");
-        // Cache key shape (rtuple.py:33 `tuple(eq_funcs)`): each
+        // Cache key shape (rtuple.py `tuple(eq_funcs)`): each
         // primitive Repr returns None from get_ll_eq_function, so the
         // suffix is `<lltype>:eq` per item.
         assert_eq!(llfn.name, "ll_tuple_eq_Signed:eq_Signed:eq");
@@ -3371,7 +3371,7 @@ mod tests {
         assert_eq!(start_ops, vec!["getfield", "getfield", "int_eq"]);
     }
 
-    /// rtuple.py:32 — `eq_funcs = [r_item.get_ll_eq_function() or
+    /// rtuple.py — `eq_funcs = [r_item.get_ll_eq_function() or
     /// operator.eq for r_item in items_r]`. When an item Repr returns
     /// `Some(helper)` (e.g. nested `TupleRepr`), gen_eq must dispatch
     /// to that helper via `direct_call` rather than the primitive
@@ -3406,7 +3406,7 @@ mod tests {
         );
     }
 
-    /// rtuple.py:31-50 — `gen_eq_function([])` produces a helper whose
+    /// rtuple.py — `gen_eq_function([])` produces a helper whose
     /// `autounrolling_funclist` is empty so `equal_so_far = True` is
     /// returned unchanged. Tuple lltype is `Void` (rtuple.py:120-121).
     #[test]
@@ -3430,7 +3430,7 @@ mod tests {
         assert_eq!(c.value, ConstValue::Bool(true));
     }
 
-    /// `pair(TupleRepr, TupleRepr).rtype_eq` (rtuple.py:329-334)
+    /// `pair(TupleRepr, TupleRepr).rtype_eq` (rtuple.py)
     /// dispatches to the synthesized `ll_eq` helper via `gendirectcall`.
     /// One `direct_call` op is emitted with the helper graph as the
     /// callee, and the result Variable is `Bool`-typed.
@@ -3497,7 +3497,7 @@ mod tests {
         assert_eq!(direct_calls, 1, "expected exactly one direct_call op");
     }
 
-    /// `pair(TupleRepr, TupleRepr).rtype_ne` (rtuple.py:336-338)
+    /// `pair(TupleRepr, TupleRepr).rtype_ne` (rtuple.py)
     /// emits direct_call (from rtype_eq) followed by `bool_not`.
     #[test]
     fn pair_tuple_tuple_rtype_ne_appends_bool_not_after_eq() {
@@ -3566,7 +3566,7 @@ mod tests {
         assert!(bn_pos > dc_pos, "bool_not must follow direct_call");
     }
 
-    /// `gen_hash_function([r_int, r_int])` (rtuple.py:53-73) synthesizes
+    /// `gen_hash_function([r_int, r_int])` (rtuple.py) synthesizes
     /// a `ll_tuple_hash_signed_signed(t) -> Signed` helper graph.
     /// Single-block linear shape: per item emits getfield →
     /// direct_call(ll_hash_int) → int_mul → int_xor, accumulating into
@@ -3580,7 +3580,7 @@ mod tests {
         let r_int: Arc<dyn Repr> = signed_repr();
         let llfn =
             gen_hash_function(&rtyper, &[r_int.clone(), r_int.clone()]).expect("gen_hash_function");
-        // Cache key shape (rtuple.py:56 `tuple(hash_funcs)`): each
+        // Cache key shape (rtuple.py `tuple(hash_funcs)`): each
         // item's hash helper name (`ll_hash_int_Signed` for Signed)
         // contributes to the suffix.
         assert_eq!(
@@ -3613,7 +3613,7 @@ mod tests {
         );
     }
 
-    /// rtuple.py:33/56 — `key = tuple(eq_funcs)` / `tuple(hash_funcs)`.
+    /// rtuple.py/56 — `key = tuple(eq_funcs)` / `tuple(hash_funcs)`.
     /// Cache key is the helper-tuple identity, NOT the lltype shape.
     /// Two distinct tuple shapes built from Reprs that share lltypes
     /// but differ in their helpers must yield distinct synthesized
@@ -3713,7 +3713,7 @@ mod tests {
         );
     }
 
-    /// rtuple.py:31 — `r_item.get_ll_eq_function() or operator.eq`.
+    /// rtuple.py — `r_item.get_ll_eq_function() or operator.eq`.
     /// For NoneRepr items the fallback `operator.eq` on two Void
     /// values is annotator/rtyper-folded to `Constant(True, Bool)`.
     /// Pyre mirrors via `same_as(constant_true)` so the per-item
@@ -3761,7 +3761,7 @@ mod tests {
         assert_eq!(block1_ops, vec!["getfield", "getfield", "same_as"]);
     }
 
-    /// rtuple.py:301 — `r_item.get_ll_eq_function() or _ll_equal`.
+    /// rtuple.py — `r_item.get_ll_eq_function() or _ll_equal`.
     /// `ll_equal` for Void items const-folds to `Constant(True, Bool)`;
     /// pyre mirrors via `same_as(constant_true)` instead of the
     /// non-existent `int_eq` for Void.
@@ -3782,7 +3782,7 @@ mod tests {
         assert_eq!(opnames, vec!["same_as"]);
     }
 
-    /// rtuple.py:55 — `hash_funcs = [r_item.get_ll_hash_function() for
+    /// rtuple.py — `hash_funcs = [r_item.get_ll_hash_function() for
     /// r_item in items_r]`. With FloatRepr's `_hash_float` helper now
     /// landed (rfloat.rs `build_ll_hash_float_helper_graph`), tuples
     /// containing Float items synthesize successfully — the per-item
@@ -3828,7 +3828,7 @@ mod tests {
         );
     }
 
-    /// rtuple.py:55 — `hash_funcs = [r_item.get_ll_hash_function() for
+    /// rtuple.py — `hash_funcs = [r_item.get_ll_hash_function() for
     /// r_item in items_r]`. When the item Repr is a nested `TupleRepr`,
     /// gen_hash dispatches to that inner `ll_hash` helper via
     /// `direct_call`. Validates the structural per-item dispatch (no
@@ -3872,7 +3872,7 @@ mod tests {
         );
     }
 
-    /// rtuple.py:53-72 — `gen_hash_function([])` produces a helper whose
+    /// rtuple.py — `gen_hash_function([])` produces a helper whose
     /// `autounrolling_funclist` is empty so `x = 0x345678` is returned
     /// unchanged. Tuple lltype is `Void` (rtuple.py:120-121); single
     /// Void inputarg.
@@ -3897,7 +3897,7 @@ mod tests {
         assert_eq!(c.value, ConstValue::Int(0x345678));
     }
 
-    /// `TupleRepr.rtype_hash` (rtuple.py:206-207) dispatches to the
+    /// `TupleRepr.rtype_hash` (rtuple.py) dispatches to the
     /// synthesized `gen_hash_function` helper via `gendirectcall`.
     #[test]
     fn tuple_repr_rtype_hash_emits_direct_call_to_ll_hash_helper() {
@@ -3947,7 +3947,7 @@ mod tests {
         assert_eq!(direct_calls, 1, "expected exactly one direct_call op");
     }
 
-    /// `pair(TupleRepr, Repr).rtype_contains` (rtuple.py:292-315) for a
+    /// `pair(TupleRepr, Repr).rtype_contains` (rtuple.py) for a
     /// constant 3-tuple `(1, 2, 3)` membership test against a Signed
     /// `v_arg`: emits 3 `direct_call(ll_equal_Signed, v_arg, c_x)` ops
     /// (one per tuple element) chained by 2 `int_or` ops.
@@ -4046,7 +4046,7 @@ mod tests {
         ));
     }
 
-    /// `pairtype(TupleRepr, TupleRepr).convert_from_to` (rtuple.py:340-353)
+    /// `pairtype(TupleRepr, TupleRepr).convert_from_to` (rtuple.py)
     /// returns the source value unchanged when both reprs have the
     /// same lowleveltype (rtuple.py:342-343). Different-arity tuples
     /// return `NotImplemented` (Ok(None)).

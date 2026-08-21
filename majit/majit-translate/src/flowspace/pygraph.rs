@@ -22,7 +22,7 @@ use super::flowcontext::SpamBlock;
 use super::framestate::FrameState;
 use super::model::{Constant, FunctionGraph, GraphFunc, GraphRef, Hlvalue, Variable};
 
-/// RPython `rpython/flowspace/pygraph.py:7-33` — `class PyGraph(FunctionGraph)`.
+/// RPython `rpython/flowspace/pygraph.py` — `class PyGraph(FunctionGraph)`.
 ///
 /// A flow graph for a Python function. Carries the originating
 /// `GraphFunc`, the code object's call `Signature`, and the Python
@@ -56,7 +56,7 @@ pub struct PyGraph {
 }
 
 impl PyGraph {
-    /// RPython `PyGraph.__init__(func, code)` (pygraph.py:12-22).
+    /// RPython `PyGraph.__init__(func, code)` (pygraph.py).
     pub fn new(func: GraphFunc, code: &HostCode) -> Self {
         // upstream: `locals = [None] * code.co_nlocals`.
         let mut locals: Vec<Option<Hlvalue>> = vec![None; code.co_nlocals as usize];
@@ -88,7 +88,7 @@ impl PyGraph {
         }
     }
 
-    /// RPython `PyGraph._sanitize_funcname(func)` (pygraph.py:24-33).
+    /// RPython `PyGraph._sanitize_funcname(func)` (pygraph.py).
     ///
     /// Upstream folds `<`, `>`, `&`, `!` to `_` so the generated name
     /// is safe for identifier-shaped use downstream (graph dumps, C

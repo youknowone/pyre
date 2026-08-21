@@ -11,7 +11,7 @@ use majit_ir::{InputArg, OpRef, Type};
 use indexmap::IndexMap;
 use majit_ir::operand::Operand;
 
-/// renamer.py:3-58: Renamer — maps old OpRefs to new OpRefs during unrolling.
+/// renamer.py: Renamer — maps old OpRefs to new OpRefs during unrolling.
 ///
 /// RPython `rename_map` maps box→box (`renamer.py:5`): the value IS the
 /// renamed-to box OBJECT, and `rename` does `op.setarg(i, rename_map.get(arg,
@@ -64,7 +64,7 @@ impl Renamer {
         self.lookup(opref)
     }
 
-    /// renamer.py:7-8: rename_box — look up the renamed OpRef.
+    /// renamer.py: rename_box — look up the renamed OpRef.
     /// Returns the original if no mapping exists. The map value is now a bound
     /// box, so read its `to_opref()` — byte-identical to the old position-keyed
     /// value.
@@ -111,15 +111,15 @@ impl Renamer {
         }
     }
 
-    /// renamer.py:10-18: start_renaming — register a mapping from `var` to
+    /// renamer.py: start_renaming — register a mapping from `var` to
     /// `tovar`.
     ///
     /// The renamed-to position is bound to a rooted producer box (see
     /// [`Renamer::bound_box`]) so `rename` re-installs a BOUND operand. The
-    /// `tovar.is_constant()` skip is kept (renamer.py:16-17): a constant in the
+    /// `tovar.is_constant()` skip is kept (renamer.py): a constant in the
     /// rename target is never installed (constants are not allowed in failargs).
     pub fn start_renaming(&mut self, var: OpRef, tovar: OpRef) {
-        // renamer.py:16-17: don't rename constants.
+        // renamer.py: don't rename constants.
         if tovar.is_constant() {
             return;
         }
@@ -127,7 +127,7 @@ impl Renamer {
         self.rename_map.insert(var, bound);
     }
 
-    /// renamer.py:20-31: rename — apply renaming to all args and fail_args of an op.
+    /// renamer.py: rename — apply renaming to all args and fail_args of an op.
     pub fn rename(&self, op: &mut Op) -> bool {
         // renamer.py:21-23:
         //   for i, arg in enumerate(op.getarglist()):
@@ -143,9 +143,9 @@ impl Renamer {
         }
 
         if op.opcode.is_guard() {
-            // renamer.py:27: TODO op.rd_snapshot = self.rename_rd_snapshot(...)
-            // renamer.py:28-29: failargs = self.rename_failargs(op, clone=True)
-            // renamer.py:36-40: `self.rename_map.get(arg, arg)` — a missed
+            // renamer.py: TODO op.rd_snapshot = self.rename_rd_snapshot(...)
+            // renamer.py: failargs = self.rename_failargs(op, clone=True)
+            // renamer.py: `self.rename_map.get(arg, arg)` — a missed
             // lookup keeps the SAME box object, so only hits are rewritten.
             if let Some(fail_args) = op.fail_args_mut() {
                 for arg in fail_args.iter_mut() {
@@ -159,12 +159,12 @@ impl Renamer {
         true
     }
 
-    /// renamer.py:33-42: rename_failargs — rename a slice of fail_args.
+    /// renamer.py: rename_failargs — rename a slice of fail_args.
     pub fn rename_failargs(&self, fail_args: &[OpRef]) -> Vec<OpRef> {
         fail_args.iter().map(|arg| self.rename_box(*arg)).collect()
     }
 
-    /// renamer.py:44-57: rename_rd_snapshot — recursively rename snapshot boxes.
+    /// renamer.py: rename_rd_snapshot — recursively rename snapshot boxes.
     /// In RPython, snapshots are nested MIFrame structures. In majit, resume data
     /// uses rd_numb (compact varint encoding), so this is a no-op for now,
     /// matching RPython's own TODO comment at renamer.py:27.

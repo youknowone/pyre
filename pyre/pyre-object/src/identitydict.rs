@@ -3,7 +3,7 @@
 //! override `__hash__`, `__eq__` or `__cmp__`).
 //!
 //! Selected by `EmptyDictStrategy.switch_to_correct_strategy` per
-//! `dictmultiobject.py:725-730 switch_to_identity_strategy` when the
+//! `dictmultiobject.py switch_to_identity_strategy` when the
 //! key's type satisfies `W_TypeObject.compares_by_identity()`
 //! (`typeobject.py:353-371`).  The distinction from
 //! `ObjectDictStrategy` is in the key comparison: raw PyObjectRef
@@ -15,7 +15,7 @@
 use crate::dictmultiobject::DictStrategy;
 use crate::pyobject::PyObjectRef;
 
-/// `identitydict.py:12-83 IdentityDictStrategy` key type — identity
+/// `identitydict.py IdentityDictStrategy` key type — identity
 /// comparison + identity hash.  Stored in
 /// `IndexMap<IdentityKey, PyObjectRef>` for O(1) lookup matching
 /// PyPy's `mark_dict_non_null(d={})` (`:30-32`) — RPython resolves
@@ -60,7 +60,7 @@ pub fn identity_dict_storage_gc_type_id() -> u32 {
     IDENTITY_DICT_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Typed read accessor — `dictmultiobject.py:1063 IdentityDictStrategy.unerase
+/// Typed read accessor — `dictmultiobject.py IdentityDictStrategy.unerase
 /// (w_dict.dstorage)`.
 ///
 /// # Safety
@@ -96,12 +96,12 @@ pub unsafe fn w_dict_lookup_identity_strategy(
     identity_storage(obj).get(&IdentityKey(key)).copied()
 }
 
-/// `dictmultiobject.py:1081-1087 delitem`'s identity-keyed remove — drop the
+/// `dictmultiobject.py delitem`'s identity-keyed remove — drop the
 /// entry for `key` and report whether one was there.
 ///
 /// Residualise the storage remove alone (`@dont_look_inside`,
 /// `rlib/jit.py:139`), the delete twin of [`w_dict_lookup_identity_strategy`]:
-/// upstream's `_ll_dict_del` (`rordereddict.py:884`) carries
+/// upstream's `_ll_dict_del` (`rordereddict.py`) carries
 /// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))`, and an
 /// `IndexMap` can never be virtual to this front end, so the predicate is
 /// permanently false and the residual arm is the only one reachable.  The
@@ -116,13 +116,13 @@ pub unsafe fn w_dict_delete_identity_strategy(obj: PyObjectRef, key: PyObjectRef
         .is_some()
 }
 
-/// `dictmultiobject.py:1061-1067 setitem`'s identity-keyed store — insert
+/// `dictmultiobject.py setitem`'s identity-keyed store — insert
 /// `value` under the address-identity of `key`, reporting whether the slot was
 /// newly filled so the caller bumps the keys-version only on a real insert.
 ///
 /// Residualise the storage insert alone (`@dont_look_inside`,
 /// `rlib/jit.py:139`), the store twin of [`w_dict_lookup_identity_strategy`]:
-/// upstream's `_ll_dict_setitem_lookup_done` (`rordereddict.py:674`) is
+/// upstream's `_ll_dict_setitem_lookup_done` (`rordereddict.py`) is
 /// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))`, and an
 /// `IndexMap` can never be virtual to this front end, so neither conjunct can
 /// hold and the residual arm is the only one reachable.  [`IdentityKey`]
@@ -142,12 +142,12 @@ pub unsafe fn w_dict_store_identity_strategy(
         .is_none()
 }
 
-/// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
+/// `dictmultiobject.py AbstractTypedStrategy.switch_to_object_strategy`
 /// instantiation for IdentityDictStrategy — `wrap` is identity (`:26-27`), so
 /// the migration ports each `IdentityKey(obj)` into
 /// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
 ///
-/// Residualised (`@dont_look_inside`, `rlib/jit.py:139`) for the reason
+/// Residualised (`@dont_look_inside`, `rlib/jit.py`) for the reason
 /// `dictmultiobject::w_dict_switch_int_to_object_strategy` is: the body is
 /// `IndexMap` construction and refill end to end, and the front end has no
 /// lowering for it, so there is no modellable point inside to put the boundary
@@ -181,7 +181,7 @@ unsafe fn identity_storage_mut<'a>(
     &mut *(dict.dstorage as *mut indexmap::IndexMap<IdentityKey, PyObjectRef>)
 }
 
-/// `identitydict.py:12-83 IdentityDictStrategy`.
+/// `identitydict.py IdentityDictStrategy`.
 ///
 /// ```python
 /// class IdentityDictStrategy(AbstractTypedStrategy, DictStrategy):
@@ -209,7 +209,7 @@ unsafe fn identity_storage_mut<'a>(
 /// ```
 pub struct IdentityDictStrategy;
 
-/// `pypy/objspace/std/identitydict.py:12 IdentityDictStrategy`
+/// `pypy/objspace/std/identitydict.py IdentityDictStrategy`
 /// singleton — matches PyPy's `space.fromcache(IdentityDictStrategy)`.
 pub static IDENTITY_DICT_STRATEGY: IdentityDictStrategy = IdentityDictStrategy;
 
@@ -221,7 +221,7 @@ pub static IDENTITY_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
     };
 
 impl IdentityDictStrategy {
-    /// `identitydict.py:36-37 IdentityDictStrategy.is_correct_type` —
+    /// `identitydict.py IdentityDictStrategy.is_correct_type` —
     /// `self.space.type(w_obj).compares_by_identity()`.  Dispatch
     /// through the `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK`
     /// trampoline (pyre-interpreter installs the MRO walker).
@@ -249,7 +249,7 @@ impl DictStrategy for IdentityDictStrategy {
         crate::dictmultiobject::StrategyKind::Identity
     }
 
-    /// `dictmultiobject.py:1143-1150 AbstractTypedStrategy.switch_to_object_strategy`
+    /// `dictmultiobject.py AbstractTypedStrategy.switch_to_object_strategy`
     /// instantiation for IdentityDictStrategy — `wrap` is identity
     /// (`:26-27`), so the migration ports each `IdentityKey(obj)` into
     /// `ObjectKey { hash: hash_w(obj), obj }` without rewrapping keys.
@@ -257,7 +257,7 @@ impl DictStrategy for IdentityDictStrategy {
         w_dict_switch_identity_to_object_strategy(w_dict);
     }
 
-    /// `identitydict.py:67-70 get_empty_storage` — erased `{}` with
+    /// `identitydict.py get_empty_storage` — erased `{}` with
     /// non-null hint.  Pyre stores
     /// `IndexMap<IdentityKey, PyObjectRef>` — identity-keyed hash
     /// bucket for O(1) lookup + insertion-order preserving iteration.
@@ -269,19 +269,19 @@ impl DictStrategy for IdentityDictStrategy {
         ) as *mut u8
     }
 
-    /// `dictmultiobject.py:1095-1103 AbstractTypedStrategy.getitem` —
+    /// `dictmultiobject.py AbstractTypedStrategy.getitem` —
     /// O(1) identity-keyed lookup.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if Self::is_correct_type(w_key) {
             return w_dict_lookup_identity_strategy(w_dict, w_key);
         }
-        // `identitydict.py:40-41 _never_equal_to` → always False, so
+        // `identitydict.py _never_equal_to` → always False, so
         // mismatched keys always promote and retry.
         self.switch_to_object_strategy(w_dict);
         crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
     }
 
-    /// `dictmultiobject.py:1061-1067 setitem` — identity-keyed insert;
+    /// `dictmultiobject.py setitem` — identity-keyed insert;
     /// on mismatch, promote to Object.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if Self::is_correct_type(w_key) {
@@ -295,7 +295,7 @@ impl DictStrategy for IdentityDictStrategy {
         crate::dictmultiobject::w_dict_store(w_dict, w_key, w_value);
     }
 
-    /// `dictmultiobject.py:1069-1071 setitem_str` — IdentityDictStrategy
+    /// `dictmultiobject.py setitem_str` — IdentityDictStrategy
     /// promotes to Object on str setitem_str (str has its own
     /// non-identity `__eq__` / `__hash__`, so OVERRIDES_EQ_CMP_OR_HASH).
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
@@ -303,7 +303,7 @@ impl DictStrategy for IdentityDictStrategy {
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }
 
-    /// `dictmultiobject.py:1081-1087 delitem` — identity-keyed remove;
+    /// `dictmultiobject.py delitem` — identity-keyed remove;
     /// on mismatch, promote to Object.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
         if Self::is_correct_type(w_key) {
@@ -344,7 +344,7 @@ impl DictStrategy for IdentityDictStrategy {
         entries.clear();
     }
 
-    /// `dictmultiobject.py:1152 AbstractTypedStrategy.copy` — clone
+    /// `dictmultiobject.py AbstractTypedStrategy.copy` — clone
     /// the typed `IndexMap<IdentityKey, _>` backing and wrap with the
     /// same IdentityDictStrategy.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {

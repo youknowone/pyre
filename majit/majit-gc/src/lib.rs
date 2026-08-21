@@ -252,24 +252,24 @@ pub fn drain_census_summary() -> String {
 pub struct WriteBarrierDescr {
     /// gc.py:268: GCClass.JIT_WB_IF_FLAG
     pub jit_wb_if_flag: u64,
-    /// gc.py:269: extract_flag_byte(jit_wb_if_flag) → byteofs
+    /// gc.py: extract_flag_byte(jit_wb_if_flag) → byteofs
     /// Object-relative (negative = before object start, in header).
     pub jit_wb_if_flag_byteofs: i32,
-    /// gc.py:269: extract_flag_byte(jit_wb_if_flag) → singlebyte
+    /// gc.py: extract_flag_byte(jit_wb_if_flag) → singlebyte
     pub jit_wb_if_flag_singlebyte: u8,
     /// gc.py:273: GCClass.JIT_WB_CARDS_SET (0 if no card marking)
     pub jit_wb_cards_set: u64,
     /// gc.py:274: GCClass.JIT_WB_CARD_PAGE_SHIFT
     pub jit_wb_card_page_shift: u32,
-    /// gc.py:275: extract_flag_byte(jit_wb_cards_set) → byteofs
+    /// gc.py: extract_flag_byte(jit_wb_cards_set) → byteofs
     pub jit_wb_cards_set_byteofs: i32,
-    /// gc.py:275: extract_flag_byte(jit_wb_cards_set) → singlebyte
+    /// gc.py: extract_flag_byte(jit_wb_cards_set) → singlebyte
     /// Must equal -0x80 (signed) per gc.py:281 assert.
     pub jit_wb_cards_set_singlebyte: i8,
 }
 
 impl WriteBarrierDescr {
-    /// gc.py:285-293 extract_flag_byte: find the non-zero byte in the
+    /// gc.py extract_flag_byte: find the non-zero byte in the
     /// header-shifted flag word and return (obj_relative_byteofs, singlebyte).
     ///
     /// The returned offset is relative to the **object pointer** (not the
@@ -319,7 +319,7 @@ impl WriteBarrierDescr {
 /// GC allocator interface.
 ///
 /// Provides allocation and collection primitives.
-/// One `incminimark.py:810-822 collect_step` state transition.
+/// One `incminimark.py collect_step` state transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GcStepTransition {
     pub old_state: u8,
@@ -332,7 +332,7 @@ impl GcStepTransition {
     pub const SWEEPING: u8 = 2;
     pub const FINALIZING: u8 = 3;
 
-    /// `rgc.py:52-60 is_done__states`: a major collection is done when the
+    /// `rgc.py is_done__states`: a major collection is done when the
     /// step ended in the starting state *and* did not begin there. A step that
     /// found no work reports `(SCANNING, SCANNING)`, which completes nothing.
     pub const fn is_done(self) -> bool {
@@ -340,7 +340,7 @@ impl GcStepTransition {
     }
 }
 
-/// `incminimark.py:3128-3154 get_stats` values owned by the collector.
+/// `incminimark.py get_stats` values owned by the collector.
 /// Every byte count includes the nursery where upstream's corresponding
 /// `rgc.get_stats` selector does.  JIT assembler accounting is deliberately
 /// outside this struct, as it is upstream (`jit_hooks.stats_asmmemmgr_*`).
@@ -441,7 +441,7 @@ pub trait GcAllocator: Send {
     /// [`Self::alloc_nursery_collecting_typed_rooted`] for a type that carries
     /// neither a finalizer nor the weakref flag.
     ///
-    /// `gct_fv_gc_malloc` (`framework.py:820-838`) resolves both properties at
+    /// `gct_fv_gc_malloc` (`framework.py`) resolves both properties at
     /// transformation time and calls `malloc_fast` — the `inline=True` copy of
     /// `malloc_fixedsize` annotated `s_False, s_False, s_False`
     /// (`framework.py:361-382`) — whenever they are both false, which is the
@@ -587,7 +587,7 @@ pub trait GcAllocator: Send {
     /// override to force placement there.
     ///
     /// Non-collecting, unlike its structural counterpart
-    /// `external_malloc` (incminimark.py:987-994), which tests
+    /// `external_malloc` (incminimark.py), which tests
     /// `threshold_reached(raw_malloc_usage(totalsize))` before allocating and
     /// drives `minor_collection_with_major_progress` when it holds. That check
     /// cannot be made here: an RPython caller's locals are shadow-stack roots,
@@ -614,12 +614,12 @@ pub trait GcAllocator: Send {
         self.write_barrier(obj);
     }
 
-    /// incminimark.py:1606 jit_remember_young_pointer_from_array:
+    /// incminimark.py jit_remember_young_pointer_from_array:
     /// Called by JIT when TRACK_YOUNG_PTRS set but CARDS_SET not.
     /// Tries to set CARDS_SET if HAS_CARDS; else generic barrier.
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef);
 
-    /// incminimark.py:1557 remember_young_pointer_from_array2:
+    /// incminimark.py remember_young_pointer_from_array2:
     /// Full card-marking barrier with index. Called when marking a
     /// specific card after CARDS_SET is already established.
     fn remember_young_pointer_from_array2(
@@ -635,7 +635,7 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
-    /// `incminimark.py:810-822 collect_step`: perform one minor collection
+    /// `incminimark.py collect_step`: perform one minor collection
     /// and exactly one major-collection state transition, independently of
     /// the automatic-collection enabled flag.
     ///
@@ -653,7 +653,7 @@ pub trait GcAllocator: Send {
         }
     }
 
-    /// `rpython/rlib/rgc.py:1224 do_get_objects`: walk every object reachable
+    /// `rpython/rlib/rgc.py do_get_objects`: walk every object reachable
     /// from the GC roots and visit the `rclass.OBJECT` instances selected by
     /// the generation argument. The visitor runs before the collector releases
     /// its inspection pause, so callers can root every returned object without
@@ -661,7 +661,7 @@ pub trait GcAllocator: Send {
     /// without an inspector visit no objects.
     fn get_objects(&mut self, _generation: i8, _visitor: &mut dyn FnMut(GcRef)) {}
 
-    /// `pypy/module/gc/referents.py:53-78 _list_w_obj_referents`: visit the
+    /// `pypy/module/gc/referents.py _list_w_obj_referents`: visit the
     /// app-level objects `obj` refers to directly, expanding the
     /// interpreter-internal structs in between. Same rooting contract as
     /// [`GcAllocator::get_objects`]. Collectors without an inspector visit no
@@ -703,7 +703,7 @@ pub trait GcAllocator: Send {
         false
     }
 
-    /// `inspector.py:265-272 dump_rpy_heap`. The fd receives native signed
+    /// `inspector.py dump_rpy_heap`. The fd receives native signed
     /// machine words; `Ok(false)` denotes a collector without an inspector.
     fn dump_rpy_heap(&mut self, _fd: i32) -> Result<bool, i32> {
         Ok(false)
@@ -762,7 +762,7 @@ pub trait GcAllocator: Send {
         None
     }
 
-    /// minimark.py:1900-1915 `id_or_identityhash(gcobj)`.
+    /// minimark.py `id_or_identityhash(gcobj)`.
     /// Return a stable address for the object that does not change
     /// across GC moves.  For nursery objects, allocates a shadow in
     /// old-gen and returns its address.  For old-gen objects, returns
@@ -771,9 +771,9 @@ pub trait GcAllocator: Send {
         obj_addr
     }
 
-    /// `gc.py:401 self.write_barrier_descr = WriteBarrierDescr(self)`:
+    /// `gc.py self.write_barrier_descr = WriteBarrierDescr(self)`:
     /// the descriptor for the write barrier check. Defaulting to `None` is
-    /// `gc.py:156 GcLLDescr_boehm.write_barrier_descr = None` — a collector
+    /// `gc.py GcLLDescr_boehm.write_barrier_descr = None` — a collector
     /// that needs no write barrier. Upstream reads the attribute directly and
     /// has no `get_write_barrier_descr` accessor.
     fn get_write_barrier_descr(&self) -> Option<WriteBarrierDescr> {
@@ -819,7 +819,7 @@ pub trait GcAllocator: Send {
         None
     }
 
-    /// `gc/base.py:380-383 is_valid_gc_object`'s tagged-immediate setting
+    /// `gc/base.py is_valid_gc_object`'s tagged-immediate setting
     /// (`translationoption.py:185 taggedpointers`, default off).
     fn taggedpointers(&self) -> bool {
         false
@@ -828,14 +828,14 @@ pub trait GcAllocator: Send {
     /// Current nursery free pointer.
     fn nursery_free(&self) -> *mut u8;
 
-    /// gc.py:525-531 get_nursery_free_addr parity.
+    /// gc.py get_nursery_free_addr parity.
     /// Address of the mutable nursery_free field that JIT code updates.
     fn nursery_free_addr(&self) -> usize;
 
     /// Nursery top (end) pointer.
     fn nursery_top(&self) -> *const u8;
 
-    /// gc.py:525-531 get_nursery_top_addr parity.
+    /// gc.py get_nursery_top_addr parity.
     /// Address of the published nursery_top slot that JIT code reads.
     fn nursery_top_addr(&self) -> usize;
 
@@ -915,7 +915,7 @@ pub trait GcAllocator: Send {
         GcMemoryStats::default()
     }
 
-    /// incminimark.py:1288-1290 `threshold_reached(0)`: whether the memory the
+    /// incminimark.py `threshold_reached(0)`: whether the memory the
     /// collector is responsible for has caught up to the threshold it set for
     /// the next major collection. Everything that shapes that threshold — the
     /// growth ratio, `growth_rate_max`, `max_delta`, `min_heap_size`,
@@ -953,7 +953,7 @@ pub trait GcAllocator: Send {
         None
     }
 
-    /// llsupport/gc.py:563 GcLLDescr_framework
+    /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Maps a vtable pointer to its registered GC type id. RPython
     /// computes this arithmetically from the GC type_info_group base
@@ -1008,7 +1008,7 @@ pub trait GcAllocator: Send {
     /// `llmodel.py:63`. Gates the backend's `genop_guard_guard_gc_type`,
     /// `genop_guard_guard_is_object`, and `genop_guard_guard_subclass`
     /// (x86/assembler.py:1896, 1925, 1946 `assert`) and
-    /// `ConstPtrInfo.get_known_class(cpu)` at info.py:766. The default
+    /// `ConstPtrInfo.get_known_class(cpu)` at info.py. The default
     /// `false` matches `AbstractCPU.supports_guard_gc_type` in
     /// `rpython/jit/backend/model.py:21` and keeps backends without an
     /// installed TYPE_INFO table from emitting the guards.
@@ -1016,13 +1016,13 @@ pub trait GcAllocator: Send {
         false
     }
 
-    /// llsupport/gc.py:631-642 `check_is_object` parity. Reads the
-    /// typeid for `gcref` (gc.py:623-629 `get_actual_typeid`) and
+    /// llsupport/gc.py `check_is_object` parity. Reads the
+    /// typeid for `gcref` (gc.py `get_actual_typeid`) and
     /// returns whether that type has `rclass.OBJECT` layout — i.e.
     /// whether `T_IS_RPYTHON_INSTANCE` is set in its infobits (gc.py:
     /// 631-642 walks the TYPE_INFO table to test that bit).
     ///
-    /// Exposed on `cpu.check_is_object(gcptr)` via llmodel.py:541-546,
+    /// Exposed on `cpu.check_is_object(gcptr)` via llmodel.py,
     /// which asserts `supports_guard_gc_type` before delegating. The
     /// optimizer consults this through info.py:766 inside
     /// `ConstPtrInfo.get_known_class(cpu)` to decide whether reading
@@ -1035,14 +1035,14 @@ pub trait GcAllocator: Send {
         false
     }
 
-    /// gc/base.py:380-383 `is_valid_gc_object` tagged-immediate test:
+    /// gc/base.py `is_valid_gc_object` tagged-immediate test:
     /// `config.taggedpointers && (addr & 1 == 1)`. Backends with no
     /// tagged-immediate support (the default) return `false`.
     fn is_tagged_immediate(&self, _addr: usize) -> bool {
         false
     }
 
-    /// `rpython/rlib/rgc.py:229` `can_move(p)` — whether the GC object
+    /// `rpython/rlib/rgc.py` `can_move(p)` — whether the GC object
     /// `gcref` sits at an address that may still move. "With non-moving
     /// GCs, it is always False; with moving GCs it can be True for some
     /// time, then False once the object is sure not to move." The default
@@ -1051,14 +1051,14 @@ pub trait GcAllocator: Send {
         false
     }
 
-    /// llsupport/gc.py:592 `get_translated_info_for_typeinfo`.
+    /// llsupport/gc.py `get_translated_info_for_typeinfo`.
     /// Returns `(type_info_group_base, shift_by, sizeof_ti)`:
     ///  * `type_info_group_base` — base address of the `TYPE_INFO` table
     ///    (`llop.gc_get_type_info_group`).
-    ///  * `shift_by` — `2` on 32-bit, `0` on 64-bit (gc.py:596-599).
+    ///  * `shift_by` — `2` on 32-bit, `0` on 64-bit (gc.py).
     ///  * `sizeof_ti` — `rffi.sizeof(GCData.TYPE_INFO)`.
-    ///    Called by `genop_guard_guard_is_object` (x86/assembler.py:1934)
-    ///    and `genop_guard_guard_subclass` (x86/assembler.py:1965).
+    ///    Called by `genop_guard_guard_is_object` (x86/assembler.py)
+    ///    and `genop_guard_guard_subclass` (x86/assembler.py).
     ///
     /// Default panics to match RPython: `GcLLDescr_boehm` does not
     /// define the method, and calling it when
@@ -1071,7 +1071,7 @@ pub trait GcAllocator: Send {
         )
     }
 
-    /// llsupport/gc.py:619 `get_translated_info_for_guard_is_object`.
+    /// llsupport/gc.py `get_translated_info_for_guard_is_object`.
     /// Returns `(infobits_offset, T_IS_RPYTHON_INSTANCE_BYTE)` used by
     /// `genop_guard_guard_is_object` to locate the `infobits` byte in
     /// the `TYPE_INFO` entry and the bitmask for the
@@ -1088,7 +1088,7 @@ pub trait GcAllocator: Send {
         )
     }
 
-    /// x86/assembler.py:1951 `cpu.subclassrange_min_offset`.
+    /// x86/assembler.py `cpu.subclassrange_min_offset`.
     /// Byte offset of the `subclassrange_min` field inside
     /// `rclass.CLASSTYPE`. `genop_guard_guard_subclass` uses it twice:
     /// once to read the subclassrange minimum from the object's
@@ -1129,7 +1129,7 @@ pub trait GcAllocator: Send {
         None
     }
 
-    /// gc.py:624-629 `get_actual_typeid` parity. Reads the typeid
+    /// gc.py `get_actual_typeid` parity. Reads the typeid
     /// from the GC header half-word for managed objects, or resolves
     /// the foreign object's classptr through `vtable_to_type_id` for
     /// backends that register a seam (e.g. pyre's PyObject layout).
@@ -1493,7 +1493,7 @@ pub trait GcRewriter: Send {
     /// `Const` box carries its own type via `Const::get_type`, so a separate
     /// type side-table is no longer threaded through the return. The third
     /// element is the per-loop reference-constant list collected by
-    /// `remove_constptr` (rewrite.py:1033-1043 `gcrefs_output_list`); the
+    /// `remove_constptr` (rewrite.py `gcrefs_output_list`); the
     /// backend builds a `GcTable` from it and bakes its base address into the
     /// `LoadFromGcTable` loads.
     ///
@@ -1571,7 +1571,7 @@ impl Default for GcMap {
 pub type CheckIsObjectFn = fn(GcRef) -> bool;
 
 /// Process-global callback that answers the collector's tagged-immediate
-/// test (gc/base.py:380-383 `is_valid_gc_object`) for the currently
+/// test (gc/base.py `is_valid_gc_object`) for the currently
 /// active backend's GC: `config.taggedpointers && (addr & 1 == 1)`.
 /// Lets a backend-agnostic caller decide that an odd-valued constant
 /// address is an unboxed immediate rather than a heap object, without
@@ -1594,7 +1594,7 @@ pub type GetActualTypeidFn = fn(GcRef) -> Option<u32>;
 pub type SubclassRangeFn = fn(classptr: usize) -> Option<(i64, i64)>;
 
 /// Process-global callback that answers the `value.typeptr
-/// .subclassrange_min/max` lookup from llgraph/runner.py:1271-1281
+/// .subclassrange_min/max` lookup from llgraph/runner.py
 /// directly by typeid. The backend installs this alongside
 /// `subclass_range` so the executor can recover the object side of
 /// `execute_guard_subclass` without going through a vtable pointer —
@@ -1617,7 +1617,7 @@ pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
 
 /// Process-global callback that answers `rgc.can_move(gcref)`
 /// (rpython/rlib/rgc.py:229) for the currently active backend's GC. The
-/// const-baking site (`x86/regalloc.py:58-61 convert_to_imm`) consults
+/// const-baking site (`x86/regalloc.py convert_to_imm`) consults
 /// this before baking a `ConstPtr` immediate.
 pub type CanMoveFn = fn(GcRef) -> bool;
 
@@ -1734,8 +1734,8 @@ global_hook!(static ACTIVE_LIVE_DEADFRAME_WALKER: LiveDeadFrameWalkerFn);
 /// Backend callbacks that expose GC roots which exist only between a compiled
 /// run returning and the frontend finishing with its result.
 ///
-/// `llmodel.py:240-250` (`grab_exc_value` / `get_savedata_ref`) and
-/// `llmodel.py:298` (`malloc_jitframe`) together say that the deadframe IS the
+/// `llmodel.py` (`grab_exc_value` / `get_savedata_ref`) and
+/// `llmodel.py` (`malloc_jitframe`) together say that the deadframe IS the
 /// jitframe: `execute_token` allocates one JITFRAME, compiled code returns it,
 /// and every `cpu.get_*_value(deadframe, i)` is a cast plus a read out of that
 /// same object. Nothing is copied out and nothing else is allocated.
@@ -1790,7 +1790,7 @@ pub fn walk_active_live_deadframes(visitor: &mut dyn FnMut(usize)) {
     }
 }
 
-/// llmodel.py:541-546 `cpu.check_is_object(gcptr)` shim. Returns whether
+/// llmodel.py `cpu.check_is_object(gcptr)` shim. Returns whether
 /// `gcref` is a `T_IS_RPYTHON_INSTANCE` (has `typeptr` at offset 0). When
 /// no backend has installed a callback, returns `false`.
 pub fn check_is_object(gcref: GcRef) -> bool {
@@ -1803,7 +1803,7 @@ pub fn check_is_object(gcref: GcRef) -> bool {
     }
 }
 
-/// gc/base.py:380-383 `is_valid_gc_object` tagged-immediate test shim.
+/// gc/base.py `is_valid_gc_object` tagged-immediate test shim.
 /// Delegates to the active backend's installed callback, which reads its
 /// GC's `config.taggedpointers`. Returns `false` for null and when no
 /// backend is installed — same absent-backend semantics as
@@ -1825,7 +1825,7 @@ pub fn taggedpointers_enabled() -> bool {
     is_tagged_immediate(1)
 }
 
-/// gc.py:624-629 `gc_ll_descr.get_actual_typeid(gcptr)` shim.
+/// gc.py `gc_ll_descr.get_actual_typeid(gcptr)` shim.
 /// Delegates to the active backend's installed callback; returns
 /// `None` when no backend is installed, which mirrors
 /// `llgraph/runner.py:1263-1269` skip semantics (the interpretive
@@ -1840,7 +1840,7 @@ pub fn get_actual_typeid(gcref: GcRef) -> Option<u32> {
     }
 }
 
-/// `rgc.can_move(gcref)` shim (rpython/rlib/rgc.py:229). Delegates to the
+/// `rgc.can_move(gcref)` shim (rpython/rlib/rgc.py). Delegates to the
 /// active backend's installed callback. Returns `false` for null pointers
 /// and when no backend is installed — i.e. a non-moving / absent GC, where
 /// every object address is stable (rgc.py:231 "with non-moving GCs, it is
@@ -2072,7 +2072,7 @@ pub fn gc_allocator_installed() -> bool {
 
 /// What an allocation answered, with the two non-pointer states kept apart.
 ///
-/// `malloc_fixedsize` (incminimark.py:640-693) has neither state. The GC is a
+/// `malloc_fixedsize` (incminimark.py) has neither state. The GC is a
 /// prebuilt constant (framework.py:254), so a route always exists, and a
 /// nursery that cannot satisfy the request reaches `collect_and_reserve`
 /// (incminimark.py:981-985), which raises MemoryError rather than handing a
@@ -2135,7 +2135,7 @@ impl GcAllocOutcome {
 
 /// A GC that owns the heap could not satisfy an allocation.
 ///
-/// `collect_and_reserve` (incminimark.py:981-985) raises MemoryError at this
+/// `collect_and_reserve` (incminimark.py) raises MemoryError at this
 /// point, so no caller of `malloc_fixedsize` observes a null. The callers here
 /// return a bare pointer and run under JIT frames that cannot unwind, so the
 /// failure aborts instead — the answer `alloc_typed_items_block_nursery`
@@ -2161,7 +2161,7 @@ pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
 
 /// [`alloc_nursery_typed`] for a type that carries neither a finalizer nor the
 /// weakref flag: `malloc_fast` (`framework.py:361-382`), the copy
-/// `gct_fv_gc_malloc` (`framework.py:820-838`) selects for exactly that case.
+/// `gct_fv_gc_malloc` (`framework.py`) selects for exactly that case.
 ///
 /// Only the direct path folds the two registrations out. A per-thread GC box is
 /// a backend-test configuration, so its `AllocNurseryTypedFn` keeps running the
@@ -2419,7 +2419,7 @@ pub unsafe fn alloc_fast_nursery_collecting_typed_rooted(
 
 /// Process-global callback that runs a full mark-sweep collection cycle
 /// on the active backend's GC (`GcAllocator::collect_full`). Used by
-/// `pypy/module/gc/interp_gc.py:7-26 collect` ports — i.e. user-level
+/// `pypy/module/gc/interp_gc.py collect` ports — i.e. user-level
 /// `gc.collect()` reaches the live GC through this trampoline. Returns
 /// silently when no backend has installed a hook (callers treat
 /// it as a no-op).
@@ -2441,7 +2441,7 @@ pub fn collect_full() {
     }
 }
 
-/// Active-backend trampoline for `incminimark.py:810-822 collect_step`.
+/// Active-backend trampoline for `incminimark.py collect_step`.
 pub type CollectStepFn = fn() -> GcStepTransition;
 
 global_hook!(static ACTIVE_COLLECT_STEP: CollectStepFn);
@@ -2452,7 +2452,7 @@ pub fn set_active_collect_step(hook: Option<CollectStepFn>) {
 
 /// With no backend installed there is no state machine and nothing to step, so
 /// this reports the same completed transition the trait default does
-/// (`rgc.py:20-31`'s `_encode_states(1, 0)`). Reporting the starting state on
+/// (`rgc.py`'s `_encode_states(1, 0)`). Reporting the starting state on
 /// both sides would say a collection is still in progress, and a caller
 /// stepping until [`GcStepTransition::is_done`] would never stop.
 pub fn collect_step() -> GcStepTransition {
@@ -2590,7 +2590,7 @@ pub fn set_active_dump_rpy_heap(hook: Option<DumpRpyHeapFn>) {
     ACTIVE_DUMP_RPY_HEAP.set(hook);
 }
 
-/// Install the host write used by `inspector.py:212-223 HeapDumper.flush`.
+/// Install the host write used by `inspector.py HeapDumper.flush`.
 /// Sandboxed interpreters use this to translate guest descriptors through
 /// their host seam; when absent, the collector retains its native raw write.
 pub fn set_heap_dump_write(hook: Option<HeapDumpWriteFn>) {
@@ -2778,7 +2778,7 @@ pub fn set_active_gc_is_nursery_object(hook: Option<GcIsNurseryObjectFn>) {
     ACTIVE_GC_IS_NURSERY_OBJECT.set(hook);
 }
 
-/// minimark.py:1900-1915 `id_or_identityhash` hook.
+/// minimark.py `id_or_identityhash` hook.
 pub type GcIdOrIdentityHashFn = fn(addr: usize) -> usize;
 
 global_hook!(static ACTIVE_GC_ID_OR_IDENTITYHASH: GcIdOrIdentityHashFn);

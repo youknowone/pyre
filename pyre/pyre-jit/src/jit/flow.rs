@@ -50,7 +50,7 @@ use std::sync::{LazyLock, Mutex};
 
 use super::flatten::{IndirectCallTargets, Kind};
 
-/// `rpython/flowspace/model.py:241` `class Variable(object)`.
+/// `rpython/flowspace/model.py` `class Variable(object)`.
 ///
 /// Upstream:
 /// ```py
@@ -146,7 +146,7 @@ impl Variable {
     }
 
     /// The name *prefix* (the `_name` slot upstream), without the numeric
-    /// suffix `name()` appends.  `simplify.py:537 isspecialvar` matches on
+    /// suffix `name()` appends.  `simplify.py isspecialvar` matches on
     /// this prefix (`'last_exception_'` / `'last_exc_value_'`).
     pub fn name_prefix(&self) -> String {
         VARIABLE_NAMES
@@ -281,7 +281,7 @@ impl Ord for OpaqueConstant {
     }
 }
 
-/// `rpython/flowspace/model.py:354` `class Constant(Hashable)`.
+/// `rpython/flowspace/model.py` `class Constant(Hashable)`.
 ///
 /// pyre only needs a subset of RPython's full value space today: booleans,
 /// signed ints, strings such as `'default'`, the `last_exception` atom, and
@@ -369,7 +369,7 @@ fn kind_rank(kind: Option<Kind>) -> u8 {
     }
 }
 
-/// `rpython/flowspace/model.py:429-471` `c_last_exception`.
+/// `rpython/flowspace/model.py` `c_last_exception`.
 pub fn c_last_exception() -> Constant {
     Constant::atom(Atom::LastException)
 }
@@ -430,7 +430,7 @@ impl From<Constant> for FlowValue {
     }
 }
 
-/// `rpython/jit/codewriter/flatten.py:35-51` `class ListOfKind(object)`,
+/// `rpython/jit/codewriter/flatten.py` `class ListOfKind(object)`,
 /// but at the pre-regalloc flow-graph stage where the contents are still
 /// Variables / Constants instead of flattened registers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -503,11 +503,11 @@ impl std::hash::Hash for IndirectCallTargetsByPtr {
     }
 }
 
-/// `rpython/flowspace/model.py:436-439 SpaceOperation.args`.
+/// `rpython/flowspace/model.py SpaceOperation.args`.
 ///
 /// Upstream is a duck-typed Python list that mixes `Variable`, `Constant`,
 /// `ListOfKind`, `AbstractDescr`, and `IndirectCallTargets` — see
-/// `flatten.py:358-370` where the serializer walks `op.args` and
+/// `flatten.py` where the serializer walks `op.args` and
 /// dispatches by `isinstance` against those five types.  pyre represents
 /// all five: `Value` covers `Variable | Constant`, `ListOfKind` wraps
 /// `flow::FlowListOfKind`, `Descr` wraps `majit_ir::DescrRef` (upstream
@@ -604,7 +604,7 @@ impl From<FlowListOfKind> for SpaceOperationArg {
     }
 }
 
-/// `rpython/flowspace/model.py:434` `class SpaceOperation(object)`.
+/// `rpython/flowspace/model.py` `class SpaceOperation(object)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SpaceOperation {
     pub opname: String,
@@ -771,7 +771,7 @@ impl Hash for LinkRef {
     }
 }
 
-/// `rpython/flowspace/model.py:109` `class Link(object)`.
+/// `rpython/flowspace/model.py` `class Link(object)`.
 ///
 /// Upstream:
 /// ```py
@@ -834,7 +834,7 @@ impl Link {
         self
     }
 
-    /// `model.py:127-129` `Link.extravars`.
+    /// `model.py` `Link.extravars`.
     pub fn extravars(
         &mut self,
         last_exception: Option<Variable>,
@@ -844,7 +844,7 @@ impl Link {
         self.last_exc_value = last_exc_value;
     }
 
-    /// `model.py:131-138` `Link.getextravars`.
+    /// `model.py` `Link.getextravars`.
     pub fn getextravars(&self) -> Vec<Variable> {
         let mut result = Vec::new();
         if let Some(v) = self.last_exception {
@@ -856,7 +856,7 @@ impl Link {
         result
     }
 
-    /// `model.py:140-147` `Link.copy`.
+    /// `model.py` `Link.copy`.
     pub fn copy<F>(&self, mut rename: F) -> Self
     where
         F: FnMut(Variable) -> Variable,
@@ -876,12 +876,12 @@ impl Link {
         newlink
     }
 
-    /// `model.py:149-153` `Link.replace`.
+    /// `model.py` `Link.replace`.
     pub fn replace(&self, mapping: &HashMap<Variable, Variable>) -> Self {
         self.copy(|v| v.replace(mapping))
     }
 
-    /// `model.py:156-159` `Link.settarget`.
+    /// `model.py` `Link.settarget`.
     pub fn settarget(&mut self, targetblock: BlockRef) {
         assert_eq!(
             self.args.len(),
@@ -911,7 +911,7 @@ impl Link {
     }
 }
 
-/// `rpython/flowspace/model.py:171` `class Block(object)`.
+/// `rpython/flowspace/model.py` `class Block(object)`.
 ///
 #[derive(Debug)]
 pub struct Block {
@@ -925,7 +925,7 @@ pub struct Block {
     pub exitswitch: Option<ExitSwitch>,
     /// `block.exits`.
     pub exits: Vec<LinkRef>,
-    /// Mirror of upstream `flowcontext.py:42 SpamBlock.dead`.  Pyre's
+    /// Mirror of upstream `flowcontext.py SpamBlock.dead`.  Pyre's
     /// PC-sequential walker can leave orphan join-point blocks when the
     /// outer pendingblocks loop skips a popped block whose start_pc was
     /// already emitted by another block.  The walker marks such blocks
@@ -950,7 +950,7 @@ impl Block {
         BlockRef::new(Self::new(inputargs))
     }
 
-    /// `rpython/flowspace/model.py:182` `def is_final_block(self): return
+    /// `rpython/flowspace/model.py` `def is_final_block(self): return
     /// self.operations == ()`.
     pub fn is_final_block(&self) -> bool {
         self.is_final
@@ -961,12 +961,12 @@ impl Block {
         self.is_final = true;
     }
 
-    /// `model.py:216-217` `Block.canraise`.
+    /// `model.py` `Block.canraise`.
     pub fn canraise(&self) -> bool {
         matches!(self.exitswitch, Some(ExitSwitch::Value(ref value)) if value.is_last_exception_sentinel())
     }
 
-    /// `model.py:219-222` `Block.raising_op`.
+    /// `model.py` `Block.raising_op`.
     ///
     /// A caught can-raise operation carries a structural trailing
     /// `-live-` marker (`jtransform.py:311-313`), so the raising op is
@@ -983,7 +983,7 @@ impl Block {
         }
     }
 
-    /// `model.py:224-231` `Block.getvariables`.
+    /// `model.py` `Block.getvariables`.
     pub fn getvariables(&self) -> Vec<Variable> {
         let mut result: Vec<Variable> = self
             .inputargs
@@ -1003,7 +1003,7 @@ impl Block {
         uniqueitems(result)
     }
 
-    /// `model.py:233-239` `Block.getconstants`.
+    /// `model.py` `Block.getconstants`.
     pub fn getconstants(&self) -> Vec<Constant> {
         let mut result: Vec<Constant> = self
             .inputargs
@@ -1018,7 +1018,7 @@ impl Block {
         uniqueitems(result)
     }
 
-    /// `model.py:241-247` `Block.renamevariables`.
+    /// `model.py` `Block.renamevariables`.
     pub fn renamevariables(&mut self, mapping: &HashMap<Variable, Variable>) {
         self.inputargs = self
             .inputargs
@@ -1045,7 +1045,7 @@ impl Block {
     }
 }
 
-/// `rpython/flowspace/model.py:13` `class FunctionGraph(object)`.
+/// `rpython/flowspace/model.py` `class FunctionGraph(object)`.
 ///
 /// Upstream:
 /// ```py
@@ -1069,7 +1069,7 @@ pub struct FunctionGraph {
     ///
     /// Interior-mutable (`Cell`) so graph-normalization passes that take
     /// `&FunctionGraph` (the `simplify_graph` pass shape) can still allocate
-    /// fresh Variables — `SSA_to_SSI`'s `v.copy()` (`ssa.py:622`) needs a new
+    /// fresh Variables — `SSA_to_SSI`'s `v.copy()` (`ssa.py`) needs a new
     /// identity while every other slot mutates through `RefCell` block/link
     /// interior mutability.
     next_variable_id: Cell<u32>,
@@ -1137,7 +1137,7 @@ impl FunctionGraph {
         Variable::new_untyped(id)
     }
 
-    /// `model.py:341-348 Variable.copy` — a fresh identity carrying the same
+    /// `model.py Variable.copy` — a fresh identity carrying the same
     /// kind (`concretetype`) as `v`.  Used by `SSA_to_SSI`.
     pub fn fresh_like(&self, v: Variable) -> Variable {
         match v.kind {
@@ -1154,7 +1154,7 @@ impl FunctionGraph {
         Block::shared(inputargs)
     }
 
-    /// `model.py:28-32` `getargs` / `getreturnvar`.
+    /// `model.py` `getargs` / `getreturnvar`.
     pub fn getargs(&self) -> Vec<FlowValue> {
         self.startblock.borrow().inputargs.clone()
     }
@@ -1165,7 +1165,7 @@ impl FunctionGraph {
             .expect("returnblock inputarg should be a Variable")
     }
 
-    /// `model.py:79-82` `iterblockops`.
+    /// `model.py` `iterblockops`.
     pub fn iterblockops(&self) -> Vec<(BlockRef, SpaceOperation)> {
         let mut out = Vec::new();
         for block in self.iterblocks() {
@@ -1176,7 +1176,7 @@ impl FunctionGraph {
         out
     }
 
-    /// `rpython/flowspace/model.py:66-77` `FunctionGraph.iterblocks`.
+    /// `rpython/flowspace/model.py` `FunctionGraph.iterblocks`.
     pub fn iterblocks(&self) -> Vec<BlockRef> {
         let start = self.startblock.clone();
         let mut out = vec![start.clone()];
@@ -1199,7 +1199,7 @@ impl FunctionGraph {
         out
     }
 
-    /// `rpython/flowspace/model.py:78-88` `FunctionGraph.iterlinks`.
+    /// `rpython/flowspace/model.py` `FunctionGraph.iterlinks`.
     pub fn iterlinks(&self) -> Vec<LinkRef> {
         let start = self.startblock.clone();
         let mut out = Vec::new();
@@ -1297,7 +1297,7 @@ fn copy_space_operation_arg(
                 .collect(),
         )
         .into(),
-        // `model.py:231-233` `Block.copy` passes AbstractDescr and
+        // `model.py` `Block.copy` passes AbstractDescr and
         // IndirectCallTargets through unchanged — both carry
         // graph-external identity and are shared by pointer across
         // clones.
@@ -1335,7 +1335,7 @@ fn copy_exitswitch(
     })
 }
 
-/// `model.py:262-268` `mkentrymap`.
+/// `model.py` `mkentrymap`.
 pub fn mkentrymap(funcgraph: &FunctionGraph) -> HashMap<BlockRef, Vec<LinkRef>> {
     let startlink = Link::new(
         funcgraph.getargs(),
@@ -1353,7 +1353,7 @@ pub fn mkentrymap(funcgraph: &FunctionGraph) -> HashMap<BlockRef, Vec<LinkRef>> 
     result
 }
 
-/// `model.py:269-323` `copygraph`.
+/// `model.py` `copygraph`.
 pub fn copygraph(
     graph: &FunctionGraph,
     shallow: bool,
@@ -1523,7 +1523,7 @@ pub fn copygraph(
     }
 }
 
-/// `model.py:439-446` `summary`.
+/// `model.py` `summary`.
 pub fn summary(graph: &FunctionGraph) -> HashMap<String, usize> {
     let mut insns = HashMap::new();
     for block in graph.iterblocks() {

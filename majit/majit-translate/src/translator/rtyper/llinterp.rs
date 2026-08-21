@@ -105,7 +105,7 @@ impl std::fmt::Display for PleaseOverwriteStoreException {
 
 impl std::error::Error for PleaseOverwriteStoreException {}
 
-/// RPython `checkptr(ptr)` (`llinterp.py:207-208`).
+/// RPython `checkptr(ptr)` (`llinterp.py`).
 pub fn checkptr(ptr: &LowLevelValue) -> Result<(), TyperError> {
     match ptr {
         LowLevelValue::Ptr(_) => Ok(()),
@@ -115,7 +115,7 @@ pub fn checkptr(ptr: &LowLevelValue) -> Result<(), TyperError> {
     }
 }
 
-/// RPython `checkadr(addr)` (`llinterp.py:210-211`).
+/// RPython `checkadr(addr)` (`llinterp.py`).
 pub fn checkadr(addr: &LowLevelValue) -> Result<(), TyperError> {
     match addr {
         LowLevelValue::Address(_) => Ok(()),
@@ -327,7 +327,7 @@ pub struct LLInterpreter {
 }
 
 // Upstream module-level `LLInterpreter.current_interpreter = None`
-// (`llinterp.py:70`) plus its mutation in `eval_graph` (`:99`):
+// (`llinterp.py`) plus its mutation in `eval_graph` (`:99`):
 // `LLInterpreter.current_interpreter = self`. Carried as a thread-local
 // `Weak` pointer so the LLFrame can `current_interpreter()` without
 // receiver plumbing, matching upstream's class-attribute lookup.
@@ -338,7 +338,7 @@ thread_local! {
 
 impl LLInterpreter {
     /// Upstream `LLInterpreter.current_interpreter` class-level slot
-    /// (`llinterp.py:70`) read by `LLFrame` opcode handlers via
+    /// (`llinterp.py`) read by `LLFrame` opcode handlers via
     /// `LLInterpreter.current_interpreter`.
     pub fn current_interpreter() -> Option<Rc<LLInterpreter>> {
         CURRENT_INTERPRETER.with(|cell| cell.borrow().upgrade())
@@ -417,7 +417,7 @@ impl LLInterpreter {
     }
 }
 
-/// Port of upstream `class LLFrame(object)` at `llinterp.py:214-…`.
+/// Port of upstream `class LLFrame(object)` at `llinterp.py-…`.
 pub struct LLFrame {
     pub graph: GraphRef,
     args: Vec<LLValue>,
@@ -551,7 +551,7 @@ impl LLFrame {
         }
     }
 
-    /// Upstream `eval` at `llinterp.py:282-307`.
+    /// Upstream `eval` at `llinterp.py`.
     fn eval(
         &mut self,
         llinterpreter: &LLInterpreter,
@@ -593,7 +593,7 @@ impl LLFrame {
         result
     }
 
-    /// Upstream `eval_block` at `llinterp.py:309-403`.
+    /// Upstream `eval_block` at `llinterp.py`.
     fn eval_block(
         &mut self,
         block: BlockRef,
@@ -757,7 +757,7 @@ impl LLFrame {
             message: "llinterp.py:359 exitswitch is unset".to_string(),
         })?;
         let llexitvalue = self.getval(&switch)?;
-        // Upstream `llinterp.py:386-402`: separate the `"default"`
+        // Upstream `llinterp.py`: separate the `"default"`
         // exitcase (if any) from the regular cases, search regular
         // cases first, fall back to the default link if no match.
         let (defaultexit, nondefaultexits) = match exits.last() {
@@ -786,7 +786,7 @@ impl LLFrame {
         })
     }
 
-    /// Upstream `eval_operation` at `llinterp.py:405-525`.
+    /// Upstream `eval_operation` at `llinterp.py`.
     fn eval_operation(&mut self, operation: &SpaceOperation) -> Result<(), TaskError> {
         let vals = operation
             .args
@@ -797,7 +797,7 @@ impl LLFrame {
         self.setvar(&operation.result, retval)
     }
 
-    /// Upstream `getoperationhandler` at `llinterp.py:273-280`, with
+    /// Upstream `getoperationhandler` at `llinterp.py`, with
     /// only the local primitive fold subset installed.
     fn getoperationhandler(&self, opname: &str, vals: &[LLValue]) -> Result<LLValue, TaskError> {
         match opname {
@@ -871,7 +871,7 @@ impl LLFrame {
             // `op_uint_is_true` (opimpl.py, `is_true` template): the word is
             // true iff nonzero — sign-interpretation-independent.
             "uint_is_true" => Ok(LLValue::Bool(vals[0].truth())),
-            // `op_cast_uint_to_int(b) = intmask(b)` (opimpl.py:465-467):
+            // `op_cast_uint_to_int(b) = intmask(b)` (opimpl.py):
             // reinterpret the unsigned word's bits as Signed. The carrier
             // already stores the word as `i64`, so this is the identity.
             "cast_uint_to_int" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
@@ -879,7 +879,7 @@ impl LLFrame {
             // machine word; the Signed carrier already holds it, so the
             // Signed<->Unsigned cast is the identity on the i64 word.
             "cast_primitive" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
-            // `op_cast_int_to_char(b) = chr(b)` (opimpl.py:411-413): the char
+            // `op_cast_int_to_char(b) = chr(b)` (opimpl.py): the char
             // carrier is the one-char `Str`.
             "cast_int_to_char" => {
                 let code = vals[0].as_i64(opname)?;
@@ -1278,7 +1278,7 @@ mod tests {
 
     #[test]
     fn eval_graph_runs_straight_line_int_add_to_returnblock() {
-        // Covers upstream `eval_graph` (`llinterp.py:84-126`),
+        // Covers upstream `eval_graph` (`llinterp.py`),
         // `LLFrame.eval` (`:282-307`), `fillvars/getval/setvar`
         // (`:236-268`), single-exit `eval_block` (`:309-403`), and
         // primitive `eval_operation` dispatch (`:405-525`).
@@ -1608,7 +1608,7 @@ mod tests {
 
     #[test]
     fn eval_graph_publishes_current_interpreter_during_execution() {
-        // Upstream `llinterp.py:99` `LLInterpreter.current_interpreter
+        // Upstream `llinterp.py` `LLInterpreter.current_interpreter
         // = self` is mandatory side effect of every `eval_graph` call.
         // Without it, downstream opcode handlers (e.g. an `op_*` that
         // reads `LLInterpreter.current_interpreter` per upstream

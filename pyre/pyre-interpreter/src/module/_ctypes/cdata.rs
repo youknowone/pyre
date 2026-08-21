@@ -590,7 +590,7 @@ pub(crate) fn cdata_bytes(obj: PyObjectRef) -> Option<&'static [u8]> {
 /// `b_ptr[..b_size]` boxed as a `bytes`, or `None` for an instance with no
 /// view.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the
 /// address arm borrows foreign memory through `host_ctypes::borrow_memory`,
 /// which has no lifted model, and the `&[u8]` [`cdata_bytes`] hands back is
 /// two words where a residual result is one.  Every caller boxes the slice

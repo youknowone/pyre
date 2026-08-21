@@ -507,7 +507,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // runs over the result.
     //
     // The excursion itself is an artifact of walking a flattened jitcode:
-    // `pyopcode.py:1037` `LOAD_ATTR` pops and pushes the live value stack in
+    // `pyopcode.py` `LOAD_ATTR` pops and pushes the live value stack in
     // place, so the interpreter has no walk position to leave and return to,
     // and nothing here to mirror.
     let returned_to_arm_point = matches!(
@@ -522,7 +522,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             .expect("checked by returned_to_arm_point");
         // `vstack_boxes` has two producers: the executed
         // `setarrayitem_vable_r` store, and this pc-derived reconstruction.
-        // `_opimpl_setarrayitem_vable` (`pyjitpl.py:1245`) is the only writer
+        // `_opimpl_setarrayitem_vable` (`pyjitpl.py`) is the only writer
         // of `virtualizable_boxes` upstream and takes its index from the
         // descr, never from a pc, so no precedence rule was ever needed there.
         // Here one is: a slot the walk actually executed a store into is

@@ -10,7 +10,7 @@
 //!
 //! Commit 3 (primitive arith) fills in:
 //!
-//! * `is__default` for `(SomeObject, SomeObject)` (binaryop.py:26-60)
+//! * `is__default` for `(SomeObject, SomeObject)` (binaryop.py)
 //! * `pairtype(SomeObject, SomeObject)` fallback table (90-144)
 //! * `pairtype(SomeInteger, SomeInteger)` arith (175-242)
 
@@ -32,7 +32,7 @@ use super::model::{
 use crate::tool::pairtype::DoubleDispatchRegistry;
 use crate::translator::rtyper::llannotation;
 
-/// RPython `BINARY_OPERATIONS` (binaryop.py:22-23).
+/// RPython `BINARY_OPERATIONS` (binaryop.py).
 ///
 /// ```python
 /// BINARY_OPERATIONS = set([oper.opname for oper in op.__dict__.values()
@@ -186,7 +186,7 @@ fn init_is_default(
     );
 }
 
-/// RPython `is__default(annotator, obj1, obj2)` (binaryop.py:27-60).
+/// RPython `is__default(annotator, obj1, obj2)` (binaryop.py).
 ///
 /// ```python
 /// @op.is_.register(SomeObject, SomeObject)
@@ -273,7 +273,7 @@ pub fn is__default(annotator: &RPythonAnnotator, hlop: &HLOperation) -> SomeValu
 /// annotation lookup (`bk.valueoftype(t)`) can fire on the `is__default`
 /// `type(x) is T` refinement path (binaryop.py:44-49).
 ///
-/// Mirrors upstream's `_annotation_key` (signature.py:15-28) name-based
+/// Mirrors upstream's `_annotation_key` (signature.py) name-based
 /// dispatch: builtin primitive types dispatch by qualname, everything
 /// else (user classes, exception types) routes through
 /// `AnnotationSpec::UserClass`.
@@ -350,7 +350,7 @@ fn bind_is(
             s_src.clone(),
         );
 
-        // binaryop.py:51-55 — False branch `nonnoneify`.
+        // binaryop.py — False branch `nonnoneify`.
         let s_nonnone = if s_src.is_constant()
             && matches!(s_src.const_(), Some(ConstValue::None))
             && s_tgt.can_be_none()
@@ -506,7 +506,7 @@ fn init_object_pairtype(
         },
     );
 
-    // binaryop.py:118-122 — `cmp` default (immutable-const fold handled
+    // binaryop.py — `cmp` default (immutable-const fold handled
     // by flowspace pyfunc; default returns SomeInteger).
     register(
         reg,
@@ -539,7 +539,7 @@ fn init_object_pairtype(
         },
     );
 
-    // binaryop.py:124-125 — `divmod((obj1, obj2))`.
+    // binaryop.py — `divmod((obj1, obj2))`.
     register(
         reg,
         DivMod,
@@ -559,7 +559,7 @@ fn init_object_pairtype(
         },
     );
 
-    // binaryop.py:127-128 — `coerce((obj1, obj2))` delegates to `pair.union()`.
+    // binaryop.py — `coerce((obj1, obj2))` delegates to `pair.union()`.
     register(
         reg,
         Coerce,
@@ -575,7 +575,7 @@ fn init_object_pairtype(
         },
     );
 
-    // binaryop.py:130-133 — `add = sub = mul = truediv = floordiv = div = mod =
+    // binaryop.py — `add = sub = mul = truediv = floordiv = div = mod =
     //   lshift = rshift = and_ = or_ = xor = delitem = s_ImpossibleValue`.
     for op in &[
         Add, Sub, Mul, TrueDiv, FloorDiv, Div, Mod, LShift, RShift, And, Or, Xor, DelItem,
@@ -592,7 +592,7 @@ fn init_object_pairtype(
         );
     }
 
-    // binaryop.py:135-136 — `def setitem((obj1, obj2), _): return s_ImpossibleValue`.
+    // binaryop.py — `def setitem((obj1, obj2), _): return s_ImpossibleValue`.
     register(
         reg,
         SetItem,
@@ -605,7 +605,7 @@ fn init_object_pairtype(
     );
 }
 
-/// RPython `getitem_default(ann, v_obj, v_index)` (binaryop.py:75-76).
+/// RPython `getitem_default(ann, v_obj, v_index)` (binaryop.py).
 pub fn getitem_default(_ann: &RPythonAnnotator, _hl: &HLOperation) -> SomeValue {
     s_impossible_value()
 }
@@ -622,7 +622,7 @@ fn getitem_can_only_throw(args_s: &[SomeValue]) -> Option<Vec<BuiltinException>>
     ))
 }
 
-/// RPython `getitem_idx(ann, v_obj, v_index)` (binaryop.py:83-86).
+/// RPython `getitem_idx(ann, v_obj, v_index)` (binaryop.py).
 pub fn getitem_idx(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_obj = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
     let s_index = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
@@ -764,7 +764,7 @@ fn init_integer_pairtype(
     use OpKind::*;
     use SomeValueTag::Integer;
 
-    // binaryop.py:204 — `or_ = xor = add = mul = _clone(union, [])`.
+    // binaryop.py — `or_ = xor = add = mul = _clone(union, [])`.
     for op in &[Or, Xor, Add, Mul] {
         register(
             reg,
@@ -777,7 +777,7 @@ fn init_integer_pairtype(
             },
         );
     }
-    // binaryop.py:205 — `add_ovf = mul_ovf = _clone(union, [OverflowError])`.
+    // binaryop.py — `add_ovf = mul_ovf = _clone(union, [OverflowError])`.
     for op in &[AddOvf, MulOvf] {
         register(
             reg,
@@ -790,7 +790,7 @@ fn init_integer_pairtype(
             },
         );
     }
-    // binaryop.py:206 — `div = floordiv = mod = _clone(union, [ZeroDivisionError])`.
+    // binaryop.py — `div = floordiv = mod = _clone(union, [ZeroDivisionError])`.
     for op in &[Div, FloorDiv, Mod] {
         register(
             reg,
@@ -821,7 +821,7 @@ fn init_integer_pairtype(
         );
     }
 
-    // binaryop.py:209-212 — `def truediv((int1, int2)): return SomeFloat()`.
+    // binaryop.py — `def truediv((int1, int2)): return SomeFloat()`.
     register(
         reg,
         TrueDiv,
@@ -833,7 +833,7 @@ fn init_integer_pairtype(
         },
     );
 
-    // binaryop.py:214-215 — `inplace_div = div; inplace_truediv = truediv`.
+    // binaryop.py — `inplace_div = div; inplace_truediv = truediv`.
     register(
         reg,
         InplaceDiv,
@@ -855,7 +855,7 @@ fn init_integer_pairtype(
         },
     );
 
-    // binaryop.py:217-221 — custom `sub` (restype without nonneg).
+    // binaryop.py — custom `sub` (restype without nonneg).
     register(
         reg,
         Sub,
@@ -877,7 +877,7 @@ fn init_integer_pairtype(
         },
     );
 
-    // binaryop.py:223-227 — `and_` propagates nonneg.
+    // binaryop.py — `and_` propagates nonneg.
     register(
         reg,
         And,
@@ -889,7 +889,7 @@ fn init_integer_pairtype(
         },
     );
 
-    // binaryop.py:229-234 — `lshift`.
+    // binaryop.py — `lshift`.
     register(
         reg,
         LShift,
@@ -911,7 +911,7 @@ fn init_integer_pairtype(
         },
     );
 
-    // binaryop.py:237-241 — `rshift`.
+    // binaryop.py — `rshift`.
     register(
         reg,
         RShift,
@@ -925,7 +925,7 @@ fn init_integer_pairtype(
 }
 
 /// RPython `pairtype(SomeInteger, SomeInteger).union((int1, int2))`
-/// (binaryop.py:178-202). Returns the widening union of two integer
+/// (binaryop.py). Returns the widening union of two integer
 /// annotations. `_clone(union, …)` arith entries reuse this body.
 ///
 /// Upstream raises `UnionError` when the signedness cannot be proven;
@@ -989,7 +989,7 @@ fn integer_rshift(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 }
 
 // =====================================================================
-// binaryop.py:62-72 — _make_cmp_annotator_default
+// binaryop.py — _make_cmp_annotator_default
 // =====================================================================
 
 fn init_cmp_default(
@@ -1024,7 +1024,7 @@ fn init_cmp_default(
     }
 }
 
-/// RPython `default_annotate(annotator, obj1, obj2)` (binaryop.py:63-69).
+/// RPython `default_annotate(annotator, obj1, obj2)` (binaryop.py).
 ///
 /// ```python
 /// def default_annotate(annotator, obj1, obj2):
@@ -1062,7 +1062,7 @@ fn cmp_default_annotate(
 }
 
 // =====================================================================
-// binaryop.py:245-294 — _make_cmp_annotator_int
+// binaryop.py — _make_cmp_annotator_int
 // =====================================================================
 
 fn init_cmp_integer(
@@ -1090,7 +1090,7 @@ fn init_cmp_integer(
     }
 }
 
-/// RPython `_compare_helper(annotator, int1, int2)` (binaryop.py:247-291).
+/// RPython `_compare_helper(annotator, int1, int2)` (binaryop.py).
 ///
 /// Branch-refinement cmp: the returned SomeBool carries knowntypedata
 /// propagating `nonneg` information between the two operands for the
@@ -1159,7 +1159,7 @@ fn cmp_integer(cmp_op: OpKind, annotator: &RPythonAnnotator, hl: &HLOperation) -
     }
     r.set_knowntypedata(knowntypedata);
 
-    // binaryop.py:280-290 — special case `x < 0` / `x >= 0` when `int2`
+    // binaryop.py — special case `x < 0` / `x >= 0` when `int2`
     // is a flow-graph Constant.
     if let Hlvalue::Constant(c2) = obj2
         && matches!(&c2.value, ConstValue::Int(0))
@@ -1290,7 +1290,7 @@ fn init_float_pairtype(
 ) {
     use OpKind::*;
     use SomeValueTag::Float;
-    // binaryop.py:438 — `add = sub = mul = union`.
+    // binaryop.py — `add = sub = mul = union`.
     for op in &[Add, Sub, Mul] {
         register(
             reg,
@@ -1303,7 +1303,7 @@ fn init_float_pairtype(
             },
         );
     }
-    // binaryop.py:440-443 — `div` + `truediv = div`, `can_only_throw = []`.
+    // binaryop.py — `div` + `truediv = div`, `can_only_throw = []`.
     register(
         reg,
         Div,
@@ -1324,7 +1324,7 @@ fn init_float_pairtype(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // binaryop.py:446-447 — `inplace_div = div; inplace_truediv = truediv`.
+    // binaryop.py — `inplace_div = div; inplace_truediv = truediv`.
     register(
         reg,
         InplaceDiv,
@@ -1373,7 +1373,7 @@ fn init_longfloat_pairtype(
 fn init_string_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:345-350 — `add`
+    // binaryop.py — `add`
     //
     //     def add((str1, str2)):
     //         # propagate const-ness to help getattr(obj, 'prefix' + const_name)
@@ -1426,7 +1426,7 @@ fn string_string_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 fn init_bytearray_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:357-358 — `add`
+    // binaryop.py — `add`
     //
     //     def add((b1, b2)):
     //         return SomeByteArray()
@@ -1452,7 +1452,7 @@ fn init_bytearray_pairtype(
 fn init_bytearray_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:361-362 — `getitem((s_b, s_i))`: returns SomeInteger()
+    // binaryop.py — `getitem((s_b, s_i))`: returns SomeInteger()
     register(
         reg,
         OpKind::GetItem,
@@ -1463,7 +1463,7 @@ fn init_bytearray_integer_pairtype(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // binaryop.py:364-365 — `setitem((s_b, s_i), s_i2)`: asserts SomeInteger, no return
+    // binaryop.py — `setitem((s_b, s_i), s_i2)`: asserts SomeInteger, no return
     //
     //     def setitem((s_b, s_i), s_i2):
     //         assert isinstance(s_i2, SomeInteger)
@@ -1500,7 +1500,7 @@ fn bytearray_integer_setitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option
 }
 
 // =====================================================================
-// binaryop.py:367-372 — pairtype cross-str/bytearray for `add`
+// binaryop.py — pairtype cross-str/bytearray for `add`
 // =====================================================================
 //
 //     class __extend__(pairtype(SomeString, SomeByteArray),
@@ -1778,7 +1778,7 @@ fn string_object_mod(ann: &RPythonAnnotator, hl: &HLOperation, lhs_tag: SomeValu
 fn init_list_list_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:467-469 — `add((lst1, lst2)):`
+    // binaryop.py — `add((lst1, lst2)):`
     //
     //     def add((lst1, lst2)):
     //         bk = getbookkeeper()
@@ -1793,7 +1793,7 @@ fn init_list_list_pairtype(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // binaryop.py:471-474 — `eq`, `ne = eq`: both call listdef.agree and return s_Bool.
+    // binaryop.py — `eq`, `ne = eq`: both call listdef.agree and return s_Bool.
     for op in &[OpKind::Eq, OpKind::Ne] {
         register(
             reg,
@@ -1847,7 +1847,7 @@ fn list_list_eq(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 fn init_tuple_tuple_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:500-501 — `add((tup1, tup2))`:
+    // binaryop.py — `add((tup1, tup2))`:
     //     return SomeTuple(items = tup1.items + tup2.items)
     register(
         reg,
@@ -1859,7 +1859,7 @@ fn init_tuple_tuple_pairtype(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // binaryop.py:503-506 — `eq`, `ne = eq`: call .union() and return s_Bool.
+    // binaryop.py — `eq`, `ne = eq`: call .union() and return s_Bool.
     for op in &[OpKind::Eq, OpKind::Ne] {
         register(
             reg,
@@ -1872,7 +1872,7 @@ fn init_tuple_tuple_pairtype(
             },
         );
     }
-    // binaryop.py:508-515 — `lt/le/gt/ge`: raise AnnotatorError.
+    // binaryop.py — `lt/le/gt/ge`: raise AnnotatorError.
     for op in &[OpKind::Lt, OpKind::Le, OpKind::Gt, OpKind::Ge] {
         let op_copy = *op;
         register(
@@ -1928,7 +1928,7 @@ fn tuple_tuple_eq(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 fn init_tuple_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:561-569 — `getitem((tup1, int2))`:
+    // binaryop.py — `getitem((tup1, int2))`:
     //
     //     def getitem((tup1, int2)):
     //         if int2.is_immutable_constant():
@@ -1988,7 +1988,7 @@ fn tuple_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue 
 fn init_list_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:574-576 — `mul((lst1, int2))`: offspring(bk).
+    // binaryop.py — `mul((lst1, int2))`: offspring(bk).
     register(
         reg,
         OpKind::Mul,
@@ -1999,7 +1999,7 @@ fn init_list_integer_pairtype(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // binaryop.py:578-581 — `getitem((lst1, int2))`: read_item. `can_only_throw = []`.
+    // binaryop.py — `getitem((lst1, int2))`: read_item. `can_only_throw = []`.
     register(
         reg,
         OpKind::GetItem,
@@ -2010,7 +2010,7 @@ fn init_list_integer_pairtype(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // binaryop.py:583-586 — `getitem_idx`: read_item, `can_only_throw = [IndexError]`.
+    // binaryop.py — `getitem_idx`: read_item, `can_only_throw = [IndexError]`.
     register(
         reg,
         OpKind::GetItemIdx,
@@ -2021,7 +2021,7 @@ fn init_list_integer_pairtype(
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::IndexError]),
         },
     );
-    // binaryop.py:588-591 — `setitem((lst1, int2), s_value)`: mutate + generalize.
+    // binaryop.py — `setitem((lst1, int2), s_value)`: mutate + generalize.
     register(
         reg,
         OpKind::SetItem,
@@ -2032,7 +2032,7 @@ fn init_list_integer_pairtype(
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::IndexError]),
         },
     );
-    // binaryop.py:593-595 — `delitem((lst1, int2))`: resize.
+    // binaryop.py — `delitem((lst1, int2))`: resize.
     register(
         reg,
         OpKind::DelItem,
@@ -2106,7 +2106,7 @@ fn list_integer_delitem(ann: &RPythonAnnotator, hl: &HLOperation) -> Option<Some
 fn init_string_integer_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:599-601 — `getitem((str1, int2))`: SomeChar(no_nul=str1.no_nul).
+    // binaryop.py — `getitem((str1, int2))`: SomeChar(no_nul=str1.no_nul).
     register(
         reg,
         OpKind::GetItem,
@@ -2127,7 +2127,7 @@ fn init_string_integer_pairtype(
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::IndexError]),
         },
     );
-    // binaryop.py:607-608 — `mul((str1, int2))`: SomeString(no_nul=str1.no_nul).
+    // binaryop.py — `mul((str1, int2))`: SomeString(no_nul=str1.no_nul).
     register(
         reg,
         OpKind::Mul,
@@ -2441,7 +2441,7 @@ fn integer_list_mul(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 fn init_dict_dict_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:524-525 — `ne((dic1, dic2)):` raises AnnotatorError.
+    // binaryop.py — `ne((dic1, dic2)):` raises AnnotatorError.
     register(
         reg,
         OpKind::Ne,
@@ -2456,7 +2456,7 @@ fn init_dict_dict_pairtype(
 }
 
 // =====================================================================
-// binaryop.py:527-544 — helpers + @op.getitem.register(SomeDict, SomeObject)
+// binaryop.py — helpers + @op.getitem.register(SomeDict, SomeObject)
 // =====================================================================
 //
 //     def _dict_can_only_throw_keyerror(s_dct, *ignore):
@@ -2545,7 +2545,7 @@ pub fn getitem_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 fn init_dict_object_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:549-552 — `setitem((dic1, obj2), s_value)`:
+    // binaryop.py — `setitem((dic1, obj2), s_value)`:
     //     dic1.dictdef.generalize_key(obj2)
     //     dic1.dictdef.generalize_value(s_value)
     //     setitem.can_only_throw = _dict_can_only_throw_nothing
@@ -2559,7 +2559,7 @@ fn init_dict_object_pairtype(
             can_only_throw: CanOnlyThrow::Callable(Box::new(dict_can_only_throw_nothing)),
         },
     );
-    // binaryop.py:554-556 — `delitem((dic1, obj2))`:
+    // binaryop.py — `delitem((dic1, obj2))`:
     //     dic1.dictdef.generalize_key(obj2)
     //     delitem.can_only_throw = _dict_can_only_throw_keyerror
     register(
@@ -2696,7 +2696,7 @@ pub fn is__PBC_PBC(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 }
 
 // =====================================================================
-// binaryop.py:788-812 — Impossible/None union is handled via model::union().
+// binaryop.py — Impossible/None union is handled via model::union().
 // This init is a no-op guard placeholder — those pair types only bind
 // `union`, which the union dispatch already covers.
 // =====================================================================
@@ -2718,7 +2718,7 @@ fn init_impossible_none_pairtype(
 fn init_pbc_object_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:816-820 — `getitem` / `setitem` raise AnnotatorError.
+    // binaryop.py — `getitem` / `setitem` raise AnnotatorError.
     register(
         reg,
         OpKind::GetItem,
@@ -2748,7 +2748,7 @@ fn init_pbc_object_pairtype(
 fn init_none_object_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:823-825 — `getitem((none, o))`:
+    // binaryop.py — `getitem((none, o))`:
     //     return s_ImpossibleValue
     //     getitem.can_only_throw = []
     register(
@@ -2761,7 +2761,7 @@ fn init_none_object_pairtype(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // binaryop.py:827-828 — `setitem((none, o), s_value)`: return None (void).
+    // binaryop.py — `setitem((none, o), s_value)`: return None (void).
     register(
         reg,
         OpKind::SetItem,
@@ -2781,7 +2781,7 @@ fn init_none_object_pairtype(
 fn init_pbc_string_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:831-832 — pairtype(SomePBC, SomeString).add: AnnotatorError
+    // binaryop.py — pairtype(SomePBC, SomeString).add: AnnotatorError
     register(
         reg,
         OpKind::Add,
@@ -2792,7 +2792,7 @@ fn init_pbc_string_pairtype(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // binaryop.py:838-840 — pairtype(SomeString, SomePBC).add: AnnotatorError
+    // binaryop.py — pairtype(SomeString, SomePBC).add: AnnotatorError
     register(
         reg,
         OpKind::Add,
@@ -2806,7 +2806,7 @@ fn init_pbc_string_pairtype(
 }
 
 // =====================================================================
-// binaryop.py:138-144 / 685-708 — `pair(...).improve()` free function
+// binaryop.py / 685-708 — `pair(...).improve()` free function
 // =====================================================================
 //
 // `improve` is NOT an OpKind — `pair(a, b).improve()` is invoked
@@ -2847,7 +2847,7 @@ fn improve_instance(ins1: &model::SomeInstance, ins2: &model::SomeInstance) -> S
     use super::classdesc::ClassDef;
     use model::SomeInstance;
     use std::cell::RefCell;
-    // upstream binaryop.py:685-708: classdef refinement + super().improve() fallback.
+    // upstream binaryop.py: classdef refinement + super().improve() fallback.
     let resdef: Option<Rc<RefCell<ClassDef>>> = match (&ins1.classdef, &ins2.classdef) {
         (None, _) => ins2.classdef.clone(),
         (_, None) => ins1.classdef.clone(),
@@ -2883,7 +2883,7 @@ fn improve_instance(ins1: &model::SomeInstance, ins2: &model::SomeInstance) -> S
 fn init_none_string_pairtype(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
 ) {
-    // binaryop.py:834-836 — pairtype(SomeNone, SomeString).add: s_ImpossibleValue
+    // binaryop.py — pairtype(SomeNone, SomeString).add: s_ImpossibleValue
     register(
         reg,
         OpKind::Add,
@@ -2894,7 +2894,7 @@ fn init_none_string_pairtype(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // binaryop.py:842-844 — pairtype(SomeString, SomeNone).add: s_ImpossibleValue
+    // binaryop.py — pairtype(SomeString, SomeNone).add: s_ImpossibleValue
     register(
         reg,
         OpKind::Add,
@@ -2920,13 +2920,13 @@ fn mk_hlop(kind: OpKind, args: Vec<Hlvalue>) -> HLOperation {
 }
 
 /// RPython `@op.getitem.register_transform(SomeInstance, SomeObject)`
-/// / setitem / delitem / contains (binaryop.py:727-747). All four
+/// / setitem / delitem / contains (binaryop.py). All four
 /// rewrite `op(v_ins, ...)` to `[op.getattr(v_ins, '__name__'),
 /// op.simple_call(getattr.result, ...)]`.
 fn init_instance_object_transform(
     reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Transformation>>,
 ) {
-    // binaryop.py:727-730 — getitem
+    // binaryop.py — getitem
     register_transform(
         reg,
         OpKind::GetItem,
@@ -2934,7 +2934,7 @@ fn init_instance_object_transform(
         SomeValueTag::Object,
         Box::new(getitem_SomeInstance),
     );
-    // binaryop.py:732-736 — setitem
+    // binaryop.py — setitem
     register_transform(
         reg,
         OpKind::SetItem,
@@ -2942,7 +2942,7 @@ fn init_instance_object_transform(
         SomeValueTag::Object,
         Box::new(setitem_SomeInstance),
     );
-    // binaryop.py:738-742 — delitem
+    // binaryop.py — delitem
     register_transform(
         reg,
         OpKind::DelItem,
@@ -3287,7 +3287,7 @@ mod tests {
 
     #[test]
     fn consider_string_bytearray_add_returns_bytearray() {
-        // binaryop.py:367-372 — cross pair add → SomeByteArray.
+        // binaryop.py — cross pair add → SomeByteArray.
         let ann = mk_ann();
         let mut v0 = Variable::named("s");
         let mut v1 = Variable::named("b");
@@ -3318,7 +3318,7 @@ mod tests {
 
     #[test]
     fn consider_tuple_tuple_add_concats_items() {
-        // binaryop.py:500-501 — add returns SomeTuple with concatenated items.
+        // binaryop.py — add returns SomeTuple with concatenated items.
         let ann = mk_ann();
         let mut v0 = Variable::named("t0");
         let mut v1 = Variable::named("t1");
@@ -3488,7 +3488,7 @@ mod tests {
             OpKind::GetItem,
             vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
         );
-        // llannotation.py:102-108 — getitem on a zero-length array hits
+        // llannotation.py — getitem on a zero-length array hits
         // IndexError and returns None (void); consider binds the result to
         // Impossible without blocking, so the raw consider yields None.
         let r = hl.consider(&ann).unwrap();
@@ -3525,7 +3525,7 @@ mod tests {
                 Hlvalue::Variable(v2),
             ],
         );
-        // llannotation.py:111-115 — ptr setitem is a void op: consider
+        // llannotation.py — ptr setitem is a void op: consider
         // returns None (the result var is bound to Impossible without
         // blocking).
         let r = hl.consider(&ann).unwrap();
@@ -3633,7 +3633,7 @@ mod tests {
 
     #[test]
     fn consider_none_object_getitem_returns_impossible() {
-        // binaryop.py:823-825 — getitem((none, o)) returns s_ImpossibleValue.
+        // binaryop.py — getitem((none, o)) returns s_ImpossibleValue.
         let ann = mk_ann();
         let mut v0 = Variable::named("n");
         let mut v1 = Variable::named("o");
@@ -3649,7 +3649,7 @@ mod tests {
 
     #[test]
     fn consider_none_string_add_returns_impossible() {
-        // binaryop.py:834-836 — pairtype(SomeNone, SomeString).add → s_ImpossibleValue.
+        // binaryop.py — pairtype(SomeNone, SomeString).add → s_ImpossibleValue.
         let ann = mk_ann();
         let mut v0 = Variable::named("n");
         let mut v1 = Variable::named("s");
@@ -3703,7 +3703,7 @@ mod tests {
 
     #[test]
     fn consider_dict_object_getitem_returns_value_type() {
-        // binaryop.py:537-544 — getitem_SomeDict returns dictdef.read_value
+        // binaryop.py — getitem_SomeDict returns dictdef.read_value
         // at bookkeeper.position_key; we check the return path roots at
         // the current value annotation by installing a minimal position_key.
         let ann = mk_ann();

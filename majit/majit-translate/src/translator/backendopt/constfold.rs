@@ -24,7 +24,7 @@ pub(crate) type LinkConstants = HashMap<Variable, LinkArg>;
 
 /// Per-(block, link) split entry collected by `prepare_constant_fold_link`
 /// and consumed by `rewire_links`. Mirrors upstream's tuple
-/// `(folded_count, link, constants)` at `constfold.py:230-231`.
+/// `(folded_count, link, constants)` at `constfold.py`.
 struct LinkSplit {
     folded_count: usize,
     link: LinkRef,
@@ -235,7 +235,7 @@ enum FoldOpListResult {
     Ops(Vec<SpaceOperation>),
 }
 
-/// RPython `constant_fold_block(block)` at `constfold.py:116-135`.
+/// RPython `constant_fold_block(block)` at `constfold.py`.
 ///
 /// Upstream `:122 remaining_exits = [link for link in block.exits
 /// if link.llexitcase == switch]` filters the surviving exit by the
@@ -323,7 +323,7 @@ pub fn constant_fold_block(block: &BlockRef) {
     }
 }
 
-/// RPython `same_constant(c1, c2)` at `constfold.py:306-314`.
+/// RPython `same_constant(c1, c2)` at `constfold.py`.
 ///
 /// Upstream `:308 assert c1.concretetype == c2.concretetype` requires
 /// both constants to be at the same lltype before any value comparison
@@ -685,7 +685,7 @@ fn prepare_constant_fold_link(
     }
 }
 
-/// RPython `rewire_links(splitblocks, graph)` at `constfold.py:233-256`.
+/// RPython `rewire_links(splitblocks, graph)` at `constfold.py`.
 ///
 /// For each block with pending splits, sort the splits by descending
 /// folded position so the block can be split from the end forward
@@ -759,7 +759,7 @@ fn rewire_links(splitblocks: SplitBlocks) {
     }
 }
 
-/// RPython `constant_diffuse(graph)` at `constfold.py:260-304`.
+/// RPython `constant_diffuse(graph)` at `constfold.py`.
 fn constant_diffuse(graph: &FunctionGraph) -> usize {
     use crate::flowspace::model::BlockKey;
 
@@ -903,7 +903,7 @@ fn constant_diffuse(graph: &FunctionGraph) -> usize {
     count
 }
 
-/// RPython `constant_fold_graph(graph)` at `constfold.py:316-370`.
+/// RPython `constant_fold_graph(graph)` at `constfold.py`.
 ///
 /// Two-phase fold:
 /// - Pass 1 (`:317-320`): per-block constant fold.
@@ -1118,7 +1118,7 @@ pub fn replace_symbolic(graph: &FunctionGraph, symbolic: &ConstValue, value: Con
 /// sites" behaviour, but driven by identity rather than string match.
 pub const WE_ARE_JITTED_TAG_ID: u64 = u64::MAX - 0x57E_A1E_71D;
 
-/// RPython `replace_we_are_jitted(graph)` at `constfold.py:385-392`.
+/// RPython `replace_we_are_jitted(graph)` at `constfold.py`.
 ///
 /// Upstream:
 /// ```python
@@ -1168,12 +1168,12 @@ fn constant_for_result(value: ConstValue, result: &Hlvalue) -> Constant {
     }
 }
 
-/// RPython `fixup_op_result` registry at `constfold.py:148-153`.
+/// RPython `fixup_op_result` registry at `constfold.py`.
 ///
 /// Upstream maps `getsubstruct`, `getarraysubstruct`, `direct_fieldptr`,
 /// and `direct_arrayitems` to `fixup_solid`, which pins the parent of
 /// the inlined sub-pointer so the parent keeps the inlined part alive
-/// (`constfold.py:131-145 fixup_solid`). The four pointer-into-parent
+/// (`constfold.py fixup_solid`). The four pointer-into-parent
 /// ops are not yet matched by [`eval_llop`] (verified by
 /// `rg '"getsubstruct"|"getarraysubstruct"|"direct_fieldptr"|
 /// "direct_arrayitems"' rtyper/lltypesystem/opimpl.rs` — zero
@@ -1189,7 +1189,7 @@ fn fixup_op_result(opname: &str, result: ConstValue) -> ConstValue {
     }
 }
 
-/// RPython `fixup_solid(p)` at `constfold.py:131-145`.
+/// RPython `fixup_solid(p)` at `constfold.py`.
 ///
 /// Upstream:
 /// ```python
@@ -1247,7 +1247,7 @@ fn eval_llop(
     opimpl::get_op_impl(opname).and_then(|f| f(args))
 }
 
-/// Port of upstream `fold_ovf_op(spaceop, args)` (`constfold.py:102-114`).
+/// Port of upstream `fold_ovf_op(spaceop, args)` (`constfold.py`).
 ///
 /// Returns `Some(result)` when the overflow-checked op folds without
 /// overflow, and `None` when the operation would always overflow at

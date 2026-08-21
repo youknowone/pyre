@@ -54,7 +54,7 @@ fn test_simple_int_add() {
 
     // Simple trace: i1 = int_add(i0, CONST_1)
     // finish(i1)  [fail_arg_types: [Int], fail_args: [i1]]
-    // history.py:227 ConstInt.value inline.
+    // history.py ConstInt.value inline.
     let const_1 = OpRef::const_int(1);
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
@@ -126,7 +126,7 @@ fn test_float_add() {
     let token = JitCellToken::new(1);
 
     let i0 = OpRef::input_arg_float(0); // input: f64
-    // history.py:268 ConstFloat.value inline.
+    // history.py ConstFloat.value inline.
     let const_half = OpRef::const_float(0.5);
 
     let inputargs = vec![InputArg::from_type(Type::Float, 0)];

@@ -21,7 +21,7 @@ use crate::header::GcHeader;
 // The JIT and the runtime both read/write the SAME memory — no separate
 // global statics, no dual-state synchronization.
 //
-// RPython x86/assembler.py:2567 malloc_cond_varsize_frame inline path:
+// RPython x86/assembler.py malloc_cond_varsize_frame inline path:
 //   ecx = load(nursery_free_adr)
 //   edx = ecx + size
 //   cmp edx, load(nursery_top_adr)
@@ -45,7 +45,7 @@ pub struct NurseryPtrs {
 /// only falls back to this value if that fails.
 pub const TRANSLATION_NURSERY_SIZE: usize = 896 * 1024;
 
-/// env.py:441 `NURSERY_SIZE_UNKNOWN_CACHE`.
+/// env.py `NURSERY_SIZE_UNKNOWN_CACHE`.
 ///
 /// PyPy's translated incminimark normally estimates the nursery from cache
 /// size, but its documented fallback is 4MB.  majit does not yet implement
@@ -75,7 +75,7 @@ pub struct Nursery {
 unsafe impl Send for Nursery {}
 
 impl Nursery {
-    /// incminimark.py:553-560 allocate_nursery parity:
+    /// incminimark.py allocate_nursery parity:
     ///   self.nursery_free = self.nursery
     ///   self.nursery_top = self.nursery + self.nursery_size
     pub fn new(size: usize) -> Self {
@@ -95,7 +95,7 @@ impl Nursery {
         }
     }
 
-    /// incminimark.py:676-680 malloc_fixedsize parity:
+    /// incminimark.py malloc_fixedsize parity:
     ///   result = self.nursery_free
     ///   self.nursery_free = new_free = result + totalsize
     ///   if new_free > self.nursery_top: collect_and_reserve()
@@ -124,7 +124,7 @@ impl Nursery {
     /// incminimark.py:1946 parity: reset nursery after minor collection.
     ///   self.nursery_free = self.nursery
     ///
-    /// incminimark.py:211/1938 parity: `malloc_zero_filled = False` and
+    /// incminimark.py/1938 parity: `malloc_zero_filled = False` and
     /// `arena_reset(..., 0)` leave recycled bytes untouched; allocation
     /// sites initialize their own GC-pointer fields.  Poison mode mirrors
     /// llarena.py mode 3 for detecting violations of that contract.
@@ -173,7 +173,7 @@ impl Nursery {
         self.ptrs.free
     }
 
-    /// gc.py:525-531 get_nursery_free_addr parity.
+    /// gc.py get_nursery_free_addr parity.
     #[inline]
     pub fn free_addr(&self) -> usize {
         std::ptr::addr_of!(self.ptrs.free) as usize
@@ -205,7 +205,7 @@ impl Nursery {
         self.ptrs.top
     }
 
-    /// gc.py:525-531 get_nursery_top_addr parity.
+    /// gc.py get_nursery_top_addr parity.
     #[inline]
     pub fn top_addr(&self) -> usize {
         std::ptr::addr_of!(self.ptrs.top) as usize

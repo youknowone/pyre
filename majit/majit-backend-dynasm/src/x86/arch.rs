@@ -10,7 +10,7 @@ pub const WORD: usize = 8;
 /// arch.py:13 — `IS_X86_64`.
 pub const IS_X86_64: bool = true;
 
-/// arch.py:14 `WIN64 = sys.platform == "win32" and sys.maxint > 2**32`.
+/// arch.py `WIN64 = sys.platform == "win32" and sys.maxint > 2**32`.
 /// pyre is Rust-compiled per target, so the check maps to cfg.
 #[cfg(target_os = "windows")]
 pub const WIN64: bool = true;

@@ -13,11 +13,11 @@ use std::sync::{Arc, OnceLock};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
 
-/// `rpython/jit/backend/model.py:8-12 CPUTotalTracker` — per-CPU totals
+/// `rpython/jit/backend/model.py CPUTotalTracker` — per-CPU totals
 /// bumped by `CompiledLoopToken.__init__` / `compiling_a_bridge` (loops
 /// and bridges created) and by the memory manager (loops and bridges
 /// freed).  PyPy attaches one tracker per `AbstractCPU` instance
-/// (`model.py:28-29 self.tracker = CPUTotalTracker()`).  Pyre matches
+/// (`model.py self.tracker = CPUTotalTracker()`).  Pyre matches
 /// that shape: each [`Backend`] impl owns an `Arc<CpuTotalTracker>`
 /// exposed via [`Backend::cpu_tracker`], and `MetaInterp::new` rebinds
 /// the paired profiler's tracker handle to the same Arc so reads
@@ -127,11 +127,11 @@ pub struct RawExecResult {
     pub trace_id: u64,
     /// Whether this exit is a FINISH rather than a guard failure.
     pub is_finish: bool,
-    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
+    /// compile.py ExitFrameWithExceptionDescrRef parity.
     /// True when this FINISH was emitted via
-    /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
+    /// pyjitpl.py compile_exit_frame_with_exception.
     pub is_exit_frame_with_exception: bool,
-    /// compile.py:741-745: ResumeGuardDescr.status at guard failure time.
+    /// compile.py: ResumeGuardDescr.status at guard failure time.
     pub status: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
     /// `compile.py:701`) — the runtime descr Arc owning this exit.
@@ -165,7 +165,7 @@ pub enum ExitValueSourceLayout {
     /// Slot is a constant value embedded in the layout — `(raw i64 bits,
     /// declared type)`. The type is retained so the resume reader can
     /// reconstruct a typed `Const` rather than assuming `Int`
-    /// (resume.py:1017-1038 `decode_box(tagged, kind)`: a slot's type is the
+    /// (resume.py `decode_box(tagged, kind)`: a slot's type is the
     /// declared type of the variable, so a constant GC pointer decodes as a
     /// `Ref`, not a boxed integer).
     Constant(i64, Type),
@@ -199,22 +199,22 @@ pub enum ExitVirtualKind {
 /// Backend-neutral description of a materialized virtual object.
 #[derive(Debug, Clone)]
 pub enum ExitVirtualLayout {
-    /// resume.py:612 VirtualInfo — allocate_with_vtable(descr=self.descr).
+    /// resume.py VirtualInfo — allocate_with_vtable(descr=self.descr).
     Object {
-        /// resume.py:615 self.descr — live SizeDescr for allocate_with_vtable.
+        /// resume.py self.descr — live SizeDescr for allocate_with_vtable.
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
         /// info.py:318 _known_class — vtable pointer for allocate_with_vtable.
         known_class: Option<i64>,
         fields: Vec<(u32, ExitValueSourceLayout)>,
         target_slot: Option<usize>,
-        /// resume.py:593 fielddescrs for setfield dispatch.
+        /// resume.py fielddescrs for setfield dispatch.
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
     },
-    /// resume.py:628 VStructInfo — allocate_struct(self.typedescr).
+    /// resume.py VStructInfo — allocate_struct(self.typedescr).
     Struct {
-        /// resume.py:631 self.typedescr — live SizeDescr for allocate_struct.
+        /// resume.py self.typedescr — live SizeDescr for allocate_struct.
         typedescr: Option<majit_ir::DescrRef>,
         type_id: u32,
         fields: Vec<(u32, ExitValueSourceLayout)>,
@@ -227,21 +227,21 @@ pub enum ExitVirtualLayout {
         /// `allocate_array`.  Identity-comparable via `Arc::ptr_eq`
         /// (`history.py:125`).
         arraydescr: Option<majit_ir::DescrRef>,
-        /// resume.py:653: allocate_array(length, arraydescr, self.clear)
+        /// resume.py: allocate_array(length, arraydescr, self.clear)
         clear: bool,
         /// resume.py:656: arraydescr element kind (0=ref, 1=int, 2=float)
         kind: u8,
         items: Vec<ExitValueSourceLayout>,
     },
-    /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
+    /// resume.py VArrayStructInfo(arraydescr, size, fielddescrs)
     ArrayStruct {
-        /// resume.py:739: self.arraydescr — live ArrayDescr for allocate_array.
+        /// resume.py: self.arraydescr — live ArrayDescr for allocate_array.
         arraydescr: Option<majit_ir::DescrRef>,
         /// resume.py:740: self.fielddescrs — live InteriorFieldDescr per field slot.
         fielddescrs: Vec<majit_ir::DescrRef>,
         element_fields: Vec<Vec<(u32, ExitValueSourceLayout)>>,
     },
-    /// resume.py:717 VRawSliceInfo — base_buffer + offset.
+    /// resume.py VRawSliceInfo — base_buffer + offset.
     RawSlice {
         /// info.py:460 signed slice base.
         offset: i64,
@@ -258,19 +258,19 @@ pub enum ExitVirtualLayout {
         /// resume.py:693: fieldnums (decoded)
         values: Vec<ExitValueSourceLayout>,
     },
-    /// resume.py:763 VStrPlainInfo — virtual byte-string
+    /// resume.py VStrPlainInfo — virtual byte-string
     /// (bh_newstr(len) + bh_strsetitem per character).
     ///
     /// `is_unicode = false` → bh_newstr/bh_strsetitem.
     /// `is_unicode = true`  → bh_newunicode/bh_unicodesetitem (unified
-    /// variant for resume.py:817 VUniPlainInfo).
+    /// variant for resume.py VUniPlainInfo).
     StrPlain {
         is_unicode: bool,
         /// Per-character values, length = string length. UNINITIALIZED
         /// fieldnums (resume.py:774) remain as `Uninitialized`.
         chars: Vec<ExitValueSourceLayout>,
     },
-    /// resume.py:781 VStrConcatInfo + resume.py:836 VUniConcatInfo.
+    /// resume.py VStrConcatInfo + resume.py VUniConcatInfo.
     /// decoder.concat_strings(left, right) looks up OS_STR_CONCAT (or
     /// OS_UNI_CONCAT) via `callinfocollection.funcptr_for_oopspec(...)`
     /// at materialization (resume.py:1467-1468 / 1494-1495); the layout
@@ -280,7 +280,7 @@ pub enum ExitVirtualLayout {
         left: ExitValueSourceLayout,
         right: ExitValueSourceLayout,
     },
-    /// resume.py:801 VStrSliceInfo + resume.py:856 VUniSliceInfo.
+    /// resume.py VStrSliceInfo + resume.py VUniSliceInfo.
     /// decoder.slice_string(str, start, length) looks up OS_STR_SLICE
     /// (or OS_UNI_SLICE) via callinfocollection at materialization
     /// (resume.py:1477-1478 / 1504-1505); the layout carries no
@@ -596,7 +596,7 @@ impl Eq for ExitVirtualLayout {}
 
 /// Backend-neutral deferred heap write recovered from an exit.
 ///
-/// `resume.py:88 PENDINGFIELDSTRUCT` parity — carries the live
+/// `resume.py PENDINGFIELDSTRUCT` parity — carries the live
 /// `lldescr` and the (target, value) tagged sources only.  Field
 /// metadata (offset / size / type) is *not* duplicated onto the
 /// layout: consumers (`pyre-jit::eval::replay_pending_fields`,
@@ -685,9 +685,9 @@ impl ExitFrameLayout {
 /// Backend-neutral recovery metadata attached to an exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExitRecoveryLayout {
-    /// resume.py:1099 consume_vref_and_vable_boxes / virtualizable_boxes.
+    /// resume.py consume_vref_and_vable_boxes / virtualizable_boxes.
     pub vable_array: Vec<ExitValueSourceLayout>,
-    /// resume.py:1093 consume_virtualref_boxes — [virtual, vref, ...] pairs.
+    /// resume.py consume_virtualref_boxes — [virtual, vref, ...] pairs.
     pub vref_array: Vec<ExitValueSourceLayout>,
     /// Reconstructed frames, outermost first.
     pub frames: Vec<ExitFrameLayout>,
@@ -763,8 +763,8 @@ pub struct FailDescrLayout {
     pub fail_arg_types: Vec<Type>,
     /// Whether this exit is a FINISH rather than a guard failure.
     pub is_finish: bool,
-    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef` vs
-    /// `compile.py:640-647 DoneWithThisFrameDescrRef`: distinguishes the
+    /// `compile.py ExitFrameWithExceptionDescrRef` vs
+    /// `compile.py DoneWithThisFrameDescrRef`: distinguishes the
     /// exception-propagation FINISH from a normal-result FINISH that
     /// happens to carry a single `Type::Ref` slot.  Read from the source
     /// descr's `FailDescr::is_exit_frame_with_exception()` at layout
@@ -811,7 +811,7 @@ pub struct TerminalExitLayout {
     pub exit_types: Vec<Type>,
     /// Whether this exit is a `FINISH` rather than a `JUMP`.
     pub is_finish: bool,
-    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef` discriminator;
+    /// `compile.py ExitFrameWithExceptionDescrRef` discriminator;
     /// see `FailDescrLayout::is_exception_exit`.
     pub is_exception_exit: bool,
     /// Exit slot indices that hold rooted GC references.
@@ -878,16 +878,16 @@ impl std::fmt::Debug for LoopVersionInfo {
 // JITFRAMEINFO is the single `JitFrameInfo` defined in `jitframe.rs`
 // (re-exported at the crate root above). `CompiledLoopToken.frame_info`
 // holds one — the same struct `JitFrame.jf_frame_info` points to, matching
-// RPython's single `JITFRAMEINFO` (jitframe.py:30-40).
+// RPython's single `JITFRAMEINFO` (jitframe.py).
 
-/// `rpython/jit/backend/model.py:292-338` `CompiledLoopToken` parity.
+/// `rpython/jit/backend/model.py` `CompiledLoopToken` parity.
 ///
 /// Per-loop metadata attached to `JitCellToken.compiled_loop_token`.
 /// Mutation goes through `parking_lot::Mutex` on individual fields because
 /// pyre reaches these from `&JitCellToken` shared refs (bridge compilation
 /// under concurrent execution) — RPython mutates through the GIL instead.
 pub struct CompiledLoopToken {
-    /// `model.py:299` `self.number = number`.
+    /// `model.py` `self.number = number`.
     pub number: u64,
     /// `compile.py:180-181` `wref = weakref.ref(original_jitcell_token);
     /// clt.loop_token_wref = wref` parity. Weak back-reference to the
@@ -899,9 +899,9 @@ pub struct CompiledLoopToken {
     /// the owning Arc is built first, then `set_loop_token_wref` patches
     /// the weak ref through `&CompiledLoopToken`.
     pub loop_token_wref: parking_lot::Mutex<std::sync::Weak<JitCellToken>>,
-    /// `model.py:300` `self.bridges_count = 0`.
+    /// `model.py` `self.bridges_count = 0`.
     pub bridges_count: parking_lot::Mutex<usize>,
-    /// `model.py:302-304` `self.looptokens_redirected_to = []` — weak
+    /// `model.py` `self.looptokens_redirected_to = []` — weak
     /// references to `CompiledLoopToken` instances previously redirected
     /// to this one via `redirect_call_assembler`.
     /// `x86/assembler.py:1150-1151` shows that
@@ -910,18 +910,18 @@ pub struct CompiledLoopToken {
     /// `CompiledLoopToken` (not `JitCellToken`), so the chain stores
     /// weak refs to `CompiledLoopToken`.
     pub looptokens_redirected_to: parking_lot::Mutex<Vec<std::sync::Weak<CompiledLoopToken>>>,
-    /// `model.py:293` `asmmemmgr_blocks = None` (class default — lazy-init
+    /// `model.py` `asmmemmgr_blocks = None` (class default — lazy-init
     /// on first access, see `llsupport/assembler.py:184-188`
     /// `get_asmmemmgr_blocks`). pyre eagerly initializes to an empty Vec;
     /// the `None` sentinel is a Python idiom not needed on Rust.
     pub asmmemmgr_blocks: parking_lot::Mutex<Vec<Box<dyn std::any::Any + Send>>>,
-    /// `model.py:294` `asmmemmgr_gcreftracers = None`; parity shape
+    /// `model.py` `asmmemmgr_gcreftracers = None`; parity shape
     /// reserved for the GC ref-tracer lifecycle (llsupport/assembler.py:190).
     /// Eagerly empty (same rationale as `asmmemmgr_blocks`).
     pub asmmemmgr_gcreftracers: parking_lot::Mutex<Vec<Arc<dyn std::any::Any + Send + Sync>>>,
     /// `x86/assembler.py:514` `looptoken.compiled_loop_token.frame_info`
     /// is populated by the backend when assembling this loop. Mutated
-    /// in-place by bridges via `update_frame_info` (model.py:316-329).
+    /// in-place by bridges via `update_frame_info` (model.py).
     pub frame_info: parking_lot::Mutex<JitFrameInfo>,
     /// `rpython/jit/backend/llsupport/regalloc.py:861-871`
     /// `_set_initial_bindings` assigns
@@ -997,7 +997,7 @@ impl CompiledLoopToken {
         }
     }
 
-    /// `compile.py:180-181` `clt.loop_token_wref = wref` setter. Called
+    /// `compile.py` `clt.loop_token_wref = wref` setter. Called
     /// immediately after the owning `Arc<JitCellToken>` becomes the
     /// stable identity (i.e., once `make_jitcell_token` has stamped its
     /// generation and the token is the soon-to-be `compiled_loops[gk]`
@@ -1015,7 +1015,7 @@ impl CompiledLoopToken {
         self.loop_token_wref.lock().upgrade()
     }
 
-    /// `model.py:309-314` `compiling_a_bridge(self)` — bumps the
+    /// `model.py` `compiling_a_bridge(self)` — bumps the
     /// owning backend's `total_compiled_bridges` tracker, increments
     /// this token's local `bridges_count`, and emits the
     /// `jit-mem-looptoken-alloc` debug section line-for-line with
@@ -1057,8 +1057,8 @@ impl CompiledLoopToken {
         oldlooptoken_weak: std::sync::Weak<CompiledLoopToken>,
         baseofs: i64,
     ) {
-        // `model.py:317` `new_fi = self.frame_info`
-        // `model.py:318` `new_loop_tokens = []`
+        // `model.py` `new_fi = self.frame_info`
+        // `model.py` `new_loop_tokens = []`
         let new_fi_depth = self.frame_info.lock().jfi_frame_depth as i64;
         let mut new_loop_tokens: Vec<std::sync::Weak<CompiledLoopToken>> = Vec::new();
         // `model.py:319-324` propagate depth through the old token's
@@ -1084,17 +1084,17 @@ impl CompiledLoopToken {
         // caller provides the weak ref (Rust can't derive it from a
         // borrow alone; the owning Arc stays in `JitCellToken`).
         new_loop_tokens.push(oldlooptoken_weak);
-        // `model.py:329` `self.looptokens_redirected_to = new_loop_tokens`
+        // `model.py` `self.looptokens_redirected_to = new_loop_tokens`
         *self.looptokens_redirected_to.lock() = new_loop_tokens;
     }
 }
 
-/// `compile.py:186` reader chain helper: `descr.rd_loop_token` →
+/// `compile.py` reader chain helper: `descr.rd_loop_token` →
 /// `clt.loop_token_wref.upgrade()` → `JitCellToken.green_key`.
 ///
 /// Returns `None` for descrs that have no `rd_loop_token` set (the
 /// `_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
-/// per `compile.py:185 isinstance(descr, ResumeDescr)` — non-resume
+/// per `compile.py isinstance(descr, ResumeDescr)` — non-resume
 /// descrs are skipped by the post-compile walker) or whose owning
 /// `JitCellToken` has been dropped by memmgr.  Bridge-source paths
 /// consume the metainterp ResumeGuardDescr Arc directly (Unified-Descr
@@ -1106,7 +1106,7 @@ pub fn descr_owning_clt(descr: &dyn FailDescr) -> Option<&Arc<CompiledLoopToken>
         .downcast_ref::<Arc<CompiledLoopToken>>()
 }
 
-/// `pyjitpl.py:2897` reader chain: `resumedescr.rd_loop_token.loop_token_wref()`
+/// `pyjitpl.py` reader chain: `resumedescr.rd_loop_token.loop_token_wref()`
 /// — recover the owning `Arc<JitCellToken>` object identity from a
 /// FailDescr.  RPython callers consume the returned object directly
 /// (e.g. `compile.py:593` passes the descr's owning loop token to
@@ -1115,7 +1115,7 @@ pub fn descr_owning_clt(descr: &dyn FailDescr) -> Option<&Arc<CompiledLoopToken>
 ///
 /// Returns `None` when `descr` is a non-resume FailDescr
 /// (`_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
-/// which `compile.py:185` skips via `isinstance(descr, ResumeDescr)`)
+/// which `compile.py` skips via `isinstance(descr, ResumeDescr)`)
 /// or when the owning JCT was evicted by memmgr.  Bridge-source paths
 /// consume the metainterp `AbstractFailDescr` Arc directly.
 pub fn descr_owning_jct(descr: &dyn FailDescr) -> Option<Arc<JitCellToken>> {
@@ -1139,8 +1139,8 @@ pub struct JitCellToken {
     /// Types of the input arguments, recorded at compile_loop time from
     /// the finalised inputargs. RPython does not carry this list on
     /// `JitCellToken` itself — there, backend code recovers types by
-    /// re-walking the LABEL op (`history.py:501 TreeLoop.inputargs` /
-    /// `regalloc.py:861-871 _set_initial_bindings`). pyre's external-jump
+    /// re-walking the LABEL op (`history.py TreeLoop.inputargs` /
+    /// `regalloc.py _set_initial_bindings`). pyre's external-jump
     /// and bridge-link paths (`compiler.rs:2362/2468/2720/3998/4027`,
     /// `runner.rs:1281`) touch the target token without access to the
     /// trace ops, so this field caches the typed signature for them.
@@ -1159,7 +1159,7 @@ pub struct JitCellToken {
     /// `Cell<Option<usize>>` — written by `configure_loop_token_for_driver`
     /// through `&JitCellToken`.
     pub virtualizable_arg_index: Cell<Option<usize>>,
-    /// compile.py:168 `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`.
+    /// compile.py `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`.
     ///
     /// The backend crate stores the registered jitdriver slot index
     /// rather than a direct metainterp object pointer.
@@ -1202,10 +1202,10 @@ pub struct JitCellToken {
     /// Rust-side equivalent of RPython's implicit dict-mutation interior
     /// mutability under the single-threaded JIT scheduler invariant.
     pub keepalive_tokens: parking_lot::Mutex<Vec<Arc<JitCellToken>>>,
-    /// `rpython/jit/backend/model.py:292` `CompiledLoopToken` parity.
+    /// `rpython/jit/backend/model.py` `CompiledLoopToken` parity.
     ///
     /// Carries per-compilation metadata: `asmmemmgr_blocks` (owned bridge
-    /// memory blocks — `model.py:293`), `asmmemmgr_gcreftracers`
+    /// memory blocks — `model.py`), `asmmemmgr_gcreftracers`
     /// (`model.py:294`), `frame_info` (JIT frame layout —
     /// `x86/assembler.py:514`), `bridges_count`,
     /// `looptokens_redirected_to`. Populated eagerly by `JitCellToken::new`
@@ -1225,7 +1225,7 @@ pub struct JitCellToken {
     /// `looptoken._ll_function_addr = rawstart + functionpos` —
     /// address of the compiled loop entry.
     ///
-    /// RPython's `compile_tmp_callback` (`metainterp/compile.py:1101-
+    /// RPython's `compile_tmp_callback` (`metainterp/compile.py-
     /// 1150`) gives every `CALL_ASSEMBLER` token a real body before
     /// emission, so x86 can bake `descr._ll_function_addr` as an
     /// immediate at `assembler.py:320`.  Pyre still has a pending-token
@@ -1251,18 +1251,18 @@ pub struct JitCellToken {
     /// covered by the existing `unsafe impl Sync for JitCellToken`
     /// at line 1130 — single-threaded JIT scheduler invariant.
     pub generation: Cell<i64>,
-    /// `history.py:442 JitCellToken.retraced_count` parity slot.
+    /// `history.py JitCellToken.retraced_count` parity slot.
     ///
     /// RPython packs two pieces of state into this u-int:
     ///   * bit 0 = `FORCE_BRIDGE_SEGMENTING` flag.
-    ///     `compile.py:728-730 _trace_and_compile_from_bridge` checks
+    ///     `compile.py _trace_and_compile_from_bridge` checks
     ///     `loop_token.retraced_count & FORCE_BRIDGE_SEGMENTING` to
     ///     decide whether the next bridge from this loop should
     ///     segment trace at the guard.  Set at `pyjitpl.py:2833`.
     ///   * bits 1+ = retrace count (`history.py:464-468
     ///     get_retraced_count() = retraced_count >> 1` /
     ///     `set_retraced_count(value) = (value << 1) | (current & 1)`),
-    ///     compared by `unroll.py:264-272` against `retrace_limit`
+    ///     compared by `unroll.py` against `retrace_limit`
     ///     to disable repeated retracing of the same loop.
     ///
     /// Pyre's flow is RPython-orthodox: the retrace count rides on
@@ -1275,7 +1275,7 @@ pub struct JitCellToken {
     ///
     /// The complementary `BaseJitCell.flags & FORCE_FINISH` flag in
     /// `warmstate.rs` is NOT a duplicate of this bit — it mirrors
-    /// upstream `warmstate.py:135 JC_FORCE_FINISH`, a green-key-keyed
+    /// upstream `warmstate.py JC_FORCE_FINISH`, a green-key-keyed
     /// signal read at `warmstate.py:439` (cell-side
     /// `force_finish_trace`).  Upstream itself carries both signals
     /// independently because the green-key cell and the loop token
@@ -1294,9 +1294,9 @@ pub struct JitCellToken {
     /// use the accessors (not `.get()` / `.set()` directly) to keep
     /// the bit-packing invariant.
     pub retraced_count: Cell<u32>,
-    /// `history.py:440` `JitCellToken.target_tokens = None`, the class
+    /// `history.py` `JitCellToken.target_tokens = None`, the class
     /// default, assigned a `list[TargetToken]` at exactly two sites:
-    /// `compile.py:245` in `compile_simple_loop` and `:290` in
+    /// `compile.py` in `compile_simple_loop` and `:290` in
     /// `compile_loop`.  Those are the only writers, so a token minted
     /// anywhere else — `compile_retrace`'s no-resumekey arm mints at
     /// `:1013` — keeps the `None` default.  `pyjitpl.py:3922-3923`
@@ -1322,8 +1322,8 @@ pub struct JitCellToken {
 }
 
 impl JitCellToken {
-    /// `history.py:438` `FORCE_BRIDGE_SEGMENTING = 1` — bit packed
-    /// into `retraced_count`.  Set at `pyjitpl.py:2833` (pyre:
+    /// `history.py` `FORCE_BRIDGE_SEGMENTING = 1` — bit packed
+    /// into `retraced_count`.  Set at `pyjitpl.py` (pyre:
     /// `MetaInterp::blackhole_trace_too_long_slow`) when a bridge
     /// trace aborts without an inlinable function; read at
     /// `compile.py:729` (pyre: `MetaInterp::start_retrace_from_guard`)
@@ -1331,14 +1331,14 @@ impl JitCellToken {
     /// `force_finish_trace`.
     pub const FORCE_BRIDGE_SEGMENTING: u32 = 1;
 
-    /// `history.py:464` `def get_retraced_count(self): return
+    /// `history.py` `def get_retraced_count(self): return
     /// self.retraced_count >> 1`.
     #[inline]
     pub fn get_retraced_count(&self) -> u32 {
         self.retraced_count.get() >> 1
     }
 
-    /// `history.py:467` `def set_retraced_count(self, value):
+    /// `history.py` `def set_retraced_count(self, value):
     /// self.retraced_count = (value << 1) | (self.retraced_count & 1)`.
     /// Preserves the FORCE_BRIDGE_SEGMENTING bit.
     #[inline]
@@ -1366,11 +1366,11 @@ impl JitCellToken {
                 number,
             )))),
             _ll_function_addr: AtomicUsize::new(0),
-            // memmgr.py:38 default; first keep_loop_alive overwrites this.
+            // memmgr.py default; first keep_loop_alive overwrites this.
             generation: Cell::new(0),
-            // history.py:442 `retraced_count = 0` (class attribute default).
+            // history.py `retraced_count = 0` (class attribute default).
             retraced_count: Cell::new(0),
-            // history.py:440 `target_tokens = None` — pyre uses the
+            // history.py `target_tokens = None` — pyre uses the
             // empty-Vec equivalent so `has_target_tokens` is one
             // `is_empty()` check away.
             target_tokens: parking_lot::Mutex::new(Vec::new()),
@@ -1408,7 +1408,7 @@ impl JitCellToken {
             .expect("JitCellToken missing compiled_loop_token")
     }
 
-    /// history.py:451-453: record_jump_to — record that this loop can
+    /// history.py: record_jump_to — record that this loop can
     /// jump to another JitCellToken (via CALL_ASSEMBLER or JUMP).
     ///
     /// ```python
@@ -1439,7 +1439,7 @@ impl JitCellToken {
 
     /// Mark this loop as invalidated. Any subsequent execution of
     /// GUARD_NOT_INVALIDATED in the compiled code will fail.
-    /// `model.py:145 invalidate_loop`: activates the guards in the loop AND
+    /// `model.py invalidate_loop`: activates the guards in the loop AND
     /// all its attached bridges, so every bridge-generation flag minted so
     /// far is set too. A bridge compiled after this call mints a fresh clear
     /// flag and starts valid.
@@ -1577,10 +1577,10 @@ impl JitCellToken {
         self.bridge_invalidation_flags.lock().last().cloned()
     }
 
-    /// `pyjitpl.py:3922-3923` `has_compiled_targets(token)` —
+    /// `pyjitpl.py` `has_compiled_targets(token)` —
     /// `bool(token) and bool(token.target_tokens)`.  PyPy reads
     /// `token.target_tokens` (a `list[TargetToken]` assigned at
-    /// `compile.py:245` / `:290`) and treats a non-empty list as the
+    /// `compile.py` / `:290`) and treats a non-empty list as the
     /// signal that the loop has been compiled.
     #[inline]
     pub fn has_target_tokens(&self) -> bool {
@@ -1594,7 +1594,7 @@ impl JitCellToken {
     /// filter cover both.
     ///
     /// Upstream resolves the close target later and differently:
-    /// `pyjitpl.py:3007` hands `compile_trace` the JitCellToken itself, the
+    /// `pyjitpl.py` hands `compile_trace` the JitCellToken itself, the
     /// JUMP carries that token as its descr, and `unroll.py:320-340` picks
     /// among `target_tokens` by matching each one's `virtual_state`,
     /// skipping `VirtualStatesCantMatch`.  Taking the head here is
@@ -1657,7 +1657,7 @@ unsafe impl Sync for JitCellToken {}
 ///
 /// [`DeadFrame::Boxed`] keeps the erasure for backends that have no
 /// host-visible jitframe to hand back at all and must describe the exit with a
-/// structure of their own — `llgraph/runner.py:1042-1052 LLDeadFrame`, which
+/// structure of their own — `llgraph/runner.py LLDeadFrame`, which
 /// carries `_latest_descr` / `_values` / `_last_exception` because it
 /// interprets the operations instead of running compiled code.
 ///
@@ -1726,10 +1726,10 @@ impl DeadFrame {
     }
 }
 
-/// `compile.py:665-674` `make_and_attach_done_descrs` + `pyjitpl.py:2283`
+/// `compile.py` `make_and_attach_done_descrs` + `pyjitpl.py`
 /// `propagate_exception_descr`: snapshot of the six descrs the metainterp
 /// attaches to the owning cpu instance at
-/// `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222).  RPython backend
+/// `MetaInterpStaticData.finish_setup` (pyjitpl.py).  RPython backend
 /// code reads these as `self.cpu.xxx` attributes at every use site
 /// (`rpython/jit/backend/x86/assembler.py:337`,
 /// `rpython/jit/backend/llgraph/runner.py:1478`); pyre captures them by
@@ -1782,7 +1782,7 @@ impl AttachedDescrPtrs {
     }
 }
 
-/// `compile.py:665-674` `make_and_attach_done_descrs` + `pyjitpl.py:2283`:
+/// `compile.py` `make_and_attach_done_descrs` + `pyjitpl.py`:
 /// the six descrs the metainterp attaches to each cpu instance at
 /// `MetaInterpStaticData.finish_setup`.
 ///
@@ -1845,7 +1845,7 @@ pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
 /// `total_memory_allocated` is the mapped capacity and never shrinks
 /// (`asmmemmgr.py:90` bumps it and nothing subtracts); `total_mallocs` is live
 /// code bytes and is released with each compiled block, exactly like
-/// `AsmMemoryManager.free(start, stop)` (`asmmemmgr.py:47-50`).
+/// `AsmMemoryManager.free(start, stop)` (`asmmemmgr.py`).
 ///
 /// Native backends allocate from [`AsmMemoryManager`], the retained free-list
 /// arena ported below. The wasm backend has no pyre-owned executable mapping;
@@ -2359,7 +2359,7 @@ pub trait Backend: Send {
     /// this header PC to synthesised exit recovery layouts.
     fn set_next_header_pc(&mut self, _header_pc: u64) {}
 
-    /// The compiling driver's override for the `jitcode.py:147 enumerate_vars`
+    /// The compiling driver's override for the `jitcode.py enumerate_vars`
     /// frame box count, when a backend decodes the guards' `rd_numb` itself to
     /// build exit layouts.
     ///
@@ -2371,7 +2371,7 @@ pub trait Backend: Send {
     /// (`majit_ir::resumedata::set_frame_value_count_fn`).
     fn set_next_frame_value_count_fn(&mut self, _fvc: Option<fn(i32, i32) -> usize>) {}
 
-    /// `compile.py:665-674` `make_and_attach_done_descrs([self, cpu])` —
+    /// `compile.py` `make_and_attach_done_descrs([self, cpu])` —
     /// per-result-type `DoneWithThisFrame*` singleton shared with
     /// `MetaInterpStaticData`.  Attached once per CPU instance, matching
     /// `pyjitpl.py:2222`.  Backends that use pointer identity for the
@@ -2380,35 +2380,35 @@ pub trait Backend: Send {
     /// `Arc::as_ptr` to the comparison sites.
     fn set_done_with_this_frame_descr_void(&mut self, _descr: Arc<dyn Descr>) {}
 
-    /// `compile.py:665-674` `done_with_this_frame_descr_int` — INT-typed
+    /// `compile.py` `done_with_this_frame_descr_int` — INT-typed
     /// variant.  See `set_done_with_this_frame_descr_void` for the
     /// attachment contract.
     fn set_done_with_this_frame_descr_int(&mut self, _descr: Arc<dyn Descr>) {}
 
-    /// `compile.py:665-674` `done_with_this_frame_descr_ref` — REF-typed
+    /// `compile.py` `done_with_this_frame_descr_ref` — REF-typed
     /// variant.  See `set_done_with_this_frame_descr_void` for the
     /// attachment contract.
     fn set_done_with_this_frame_descr_ref(&mut self, _descr: Arc<dyn Descr>) {}
 
-    /// `compile.py:665-674` `done_with_this_frame_descr_float` —
+    /// `compile.py` `done_with_this_frame_descr_float` —
     /// FLOAT-typed variant.  See `set_done_with_this_frame_descr_void`
     /// for the attachment contract.
     fn set_done_with_this_frame_descr_float(&mut self, _descr: Arc<dyn Descr>) {}
 
-    /// `compile.py:665-674` `exit_frame_with_exception_descr_ref` —
+    /// `compile.py` `exit_frame_with_exception_descr_ref` —
     /// FINISH descr used by `compile_exit_frame_with_exception`
     /// (`pyjitpl.py:3238-3245`).  See `set_done_with_this_frame_descr_void`
     /// for the attachment contract.
     fn set_exit_frame_with_exception_descr_ref(&mut self, _descr: Arc<dyn Descr>) {}
 
-    /// `pyjitpl.py:2283` `self.cpu.propagate_exception_descr = exc_descr`
+    /// `pyjitpl.py` `self.cpu.propagate_exception_descr = exc_descr`
     /// — shared `PropagateExceptionDescr` instance used by
     /// `compile_tmp_callback`'s `GUARD_NO_EXCEPTION` and by the
     /// backend's propagate-exception slow path
     /// (`x86/assembler.py:870`, `aarch64/assembler.py:566-572`).
     fn set_propagate_exception_descr(&mut self, _descr: Arc<dyn Descr>) {}
 
-    /// `compile.py:484 do_compile_bridge(metainterp_sd, faildescr, inputargs,
+    /// `compile.py do_compile_bridge(metainterp_sd, faildescr, inputargs,
     /// operations, original_loop_token, log, memo)` — RPython's upstream
     /// signature carries one token (`original_loop_token`), reached via
     /// `metainterp.resumekey_original_loop_token = resumedescr.rd_loop_token
@@ -2444,7 +2444,7 @@ pub trait Backend: Send {
     /// re-firing it and the guard falls back to blackhole resume. The
     /// default is `false`: backends that patch machine code in place never
     /// decline structurally, so a transient failure is retried after the
-    /// jitcounter ticks again (`compile.py:790-795 done_compiling`).
+    /// jitcounter ticks again (`compile.py done_compiling`).
     fn bridge_decline_is_terminal(&self) -> bool {
         false
     }
@@ -2487,7 +2487,7 @@ pub trait Backend: Send {
     /// no-op — bridges are attached to the guard's machine code directly.
     fn migrate_bridges(&self, _old_token: &JitCellToken, _new_token: &JitCellToken) {}
 
-    /// compile.py:826-830 store_hash: assign jitcounter hashes to guards.
+    /// compile.py store_hash: assign jitcounter hashes to guards.
     /// Called after compile_loop/compile_bridge with hashes from
     /// jitcounter.fetch_next_hash(). Skips guards that already have
     /// status set by make_a_counter_per_value (GUARD_VALUE).
@@ -2788,7 +2788,7 @@ pub trait Backend: Send {
         GcRef::NULL
     }
 
-    /// `llmodel.py:194-199 _store_exception` counterpart — clear the backend
+    /// `llmodel.py _store_exception` counterpart — clear the backend
     /// `_store_exception` cells (`jit_exc_value` / `jit_exc_type`).  A residual
     /// `bh_call` that raised publishes into BOTH `BH_LAST_EXC_VALUE` and these
     /// cells; when the blackhole catches it in-frame (`route_to_catch`) only
@@ -2812,7 +2812,7 @@ pub trait Backend: Send {
     /// `ExitFrameWithExceptionDescr` / external-JUMP) without a
     /// metainterp counterpart fall back to the backend Arc upcast to
     /// `Arc<dyn Descr>`.  Callers obtain `&dyn FailDescr` via
-    /// `descr_arc.as_fail_descr()` (`history.py:128 AbstractFailDescr`
+    /// `descr_arc.as_fail_descr()` (`history.py AbstractFailDescr`
     /// is a sub-class of `AbstractDescr`, so the upcast is implicit on
     /// the Python side; pyre exposes the supertrait `Descr` and the
     /// sub-trait `FailDescr` separately).
@@ -2824,7 +2824,7 @@ pub trait Backend: Send {
     /// the CA bridge entry as a method on the descr — `compile.py:706-732
     /// _trace_and_compile_from_bridge(self, deadframe, ...)`, where `self`
     /// IS the descr — so the metainterp receives the descr object directly
-    /// (`pyjitpl.py:2914 handle_guard_failure(self, resumedescr, ...)`)
+    /// (`pyjitpl.py handle_guard_failure(self, resumedescr, ...)`)
     /// without any addr→object lookup.  Pyre's bridge crosses native code
     /// through function pointers (`majit-backend-dynasm/src/lib.rs`
     /// `BlackholeFn = fn(usize, *const i64, usize, *const i64, usize) ->
@@ -2839,7 +2839,7 @@ pub trait Backend: Send {
     /// recover via `majit_ir::recover_fail_descr_cell` (`Arc::from_raw`
     /// + `Arc::increment_strong_count`); strong refs live on
     ///
-    /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py:294`,
+    /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py`,
     /// `assembler.py:820-823 gcreftracers.append(tracer)`).  Singletons
     /// without a cell wrapper (FINISH `DoneWithThisFrame*`,
     /// `ExitFrameWithExceptionDescrRef`, `PropagateExceptionDescr`) are
@@ -2893,8 +2893,8 @@ pub trait Backend: Send {
     // to read/write memory at known addresses.
 
     // ── model.py:216-228 field operations ──
-    /// model.py:216 bh_getfield_gc_i(struct, fielddescr)
-    /// `llmodel.py:693-696 bh_getfield_gc_i` → `read_int_at_mem(struct,
+    /// model.py bh_getfield_gc_i(struct, fielddescr)
+    /// `llmodel.py bh_getfield_gc_i` → `read_int_at_mem(struct,
     /// ofs, size, sign)`.  `unpack_fielddescr_size` yields `(offset,
     /// field_size, is_field_signed)`; the load mirrors the array
     /// default's `read_unaligned` discrimination so byte/short fields
@@ -2911,7 +2911,7 @@ pub trait Backend: Send {
         // SAFETY: `struct_ptr` is a GC-managed struct pointer threaded
         // through from the trace recorder / blackhole; `offset`/`size`
         // come from the field descriptor.  `read_unaligned` mirrors
-        // `llmodel.py:490 read_int_at_mem`.
+        // `llmodel.py read_int_at_mem`.
         unsafe {
             match (size, sign) {
                 (1, true) => (addr as *const i8).read_unaligned() as i64,
@@ -2925,7 +2925,7 @@ pub trait Backend: Send {
             }
         }
     }
-    /// model.py:217 bh_getfield_gc_r(struct, fielddescr) →
+    /// model.py bh_getfield_gc_r(struct, fielddescr) →
     /// `read_ref_at_mem(struct, ofs)`.  Pointer-width load at the
     /// field offset.  Shared by pyre's raw-memory backends.
     fn bh_getfield_gc_r(
@@ -2937,7 +2937,7 @@ pub trait Backend: Send {
         // SAFETY: see `bh_getfield_gc_i`.
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }
-    /// model.py:218 bh_getfield_gc_f(struct, fielddescr) →
+    /// model.py bh_getfield_gc_f(struct, fielddescr) →
     /// `read_float_at_mem(struct, ofs)`.  Fixed `FLOATSTORAGE`-width
     /// load at the field offset.  Shared by pyre's raw-memory backends.
     fn bh_getfield_gc_f(
@@ -2950,7 +2950,7 @@ pub trait Backend: Send {
         // SAFETY: see `bh_getfield_gc_i`.
         unsafe { (addr as *const f64).read_unaligned() }
     }
-    /// model.py:222 / llmodel.py:716 bh_setfield_gc_i → `write_int_at_mem(struct,
+    /// model.py / llmodel.py bh_setfield_gc_i → `write_int_at_mem(struct,
     /// ofs, size, value)`.  Size + sign come from `unpack_fielddescr_size`;
     /// the store mirrors the field reader's width discrimination.  Shared by
     /// pyre's raw-memory backends; the trait default was a silent no-op that
@@ -2966,7 +2966,7 @@ pub trait Backend: Send {
         // come from the field descriptor.
         unsafe { crate::llmodel::write_int_at_mem(struct_ptr as usize, offset, size, newvalue) }
     }
-    /// model.py:223 / llmodel.py:723 bh_setfield_gc_r → pointer-width store at
+    /// model.py:223 / llmodel.py bh_setfield_gc_r → pointer-width store at
     /// the field offset plus the write barrier.
     fn bh_setfield_gc_r(
         &self,
@@ -2983,7 +2983,7 @@ pub trait Backend: Send {
         // This is the barrier `write_ref_at_mem` documents its callers as owing.
         majit_gc::gc_write_barrier(GcRef(struct_ptr as usize));
     }
-    /// model.py:224 / llmodel.py:728 bh_setfield_gc_f → `FLOATSTORAGE`-width
+    /// model.py / llmodel.py bh_setfield_gc_f → `FLOATSTORAGE`-width
     /// store at the field offset.
     fn bh_setfield_gc_f(
         &self,
@@ -2997,13 +2997,13 @@ pub trait Backend: Send {
     }
 
     // ── model.py:209-215, 247-253 array operations ──
-    /// `llmodel.py:591 bh_getarrayitem_gc_i`: typed array load with sign
+    /// `llmodel.py bh_getarrayitem_gc_i`: typed array load with sign
     /// extension.
     ///
     /// `unpack_arraydescr_size(arraydescr)` returns `(ofs, size, sign)`;
     /// the `BhDescr::Array` shape carries the equivalent triple as
     /// `(base_size, itemsize, is_item_signed)`.  The default impl mirrors
-    /// `read_int_at_mem(gcref, ofs + index * size, size, sign)` (`llmodel.py:592`)
+    /// `read_int_at_mem(gcref, ofs + index * size, size, sign)` (`llmodel.py`)
     /// — itemsize 1/2/4/8 with explicit sign dispatch — so any backend that
     /// receives a typed-array `BhDescr::Array` (cranelift, dynasm, wasm) gets
     /// the correct signed/unsigned read without a per-backend override.
@@ -3035,7 +3035,7 @@ pub trait Backend: Send {
         // SAFETY: `array_ptr` is a GC-managed array pointer threaded through
         // from the trace recorder; `index` is bounded by the outer
         // interpreter's array-length precondition.  `read_unaligned` mirrors
-        // `llmodel.py:592 read_int_at_mem` — a raw load that does not assume
+        // `llmodel.py read_int_at_mem` — a raw load that does not assume
         // natural alignment (byte/short item arrays need not be 8-aligned) —
         // with size + sign discrimination from the array descriptor, matching
         // the dynasm backend's read_int_at_mem.
@@ -3055,7 +3055,7 @@ pub trait Backend: Send {
             }
         }
     }
-    /// model.py:210 / llmodel.py:597 bh_getarrayitem_gc_r → pointer-width load
+    /// model.py / llmodel.py bh_getarrayitem_gc_r → pointer-width load
     /// at `base_size + index * WORD`.  Shared by pyre's raw-memory backends;
     /// the trait default returned NULL, losing reads of Ref array items (e.g. a
     /// tuple element or a `locals_cells_stack_w` slot during blackhole resume).
@@ -3072,7 +3072,7 @@ pub trait Backend: Send {
         // SAFETY: see `bh_getarrayitem_gc_i`. Ref items are pointer-width.
         GcRef(unsafe { (item_addr as *const usize).read_unaligned() })
     }
-    /// model.py:211 bh_getarrayitem_gc_f(array, index, arraydescr)
+    /// model.py bh_getarrayitem_gc_f(array, index, arraydescr)
     ///
     /// `llmodel.py:601-604`:
     ///   ofs = unpack_arraydescr(arraydescr)
@@ -3108,7 +3108,7 @@ pub trait Backend: Send {
         // natural alignment — matching the dynasm backend's read_float_at_mem.
         unsafe { (item_addr as *const f64).read_unaligned() }
     }
-    /// model.py:247 / llmodel.py:609 bh_setarrayitem_gc_i → typed store at
+    /// model.py:247 / llmodel.py bh_setarrayitem_gc_i → typed store at
     /// `base_size + index * itemsize`.  Width from `unpack_arraydescr_size`.
     fn bh_setarrayitem_gc_i(
         &self,
@@ -3132,7 +3132,7 @@ pub trait Backend: Send {
             }
         }
     }
-    /// model.py:248 / llmodel.py:613 bh_setarrayitem_gc_r → pointer-width store
+    /// model.py / llmodel.py bh_setarrayitem_gc_r → pointer-width store
     /// at `base_size + index * WORD` plus the write barrier.
     fn bh_setarrayitem_gc_r(
         &self,
@@ -3149,7 +3149,7 @@ pub trait Backend: Send {
         unsafe { (item_addr as *mut usize).write_unaligned(newvalue.0) };
         majit_gc::gc_write_barrier(GcRef(array_ptr as usize));
     }
-    /// model.py:249 / llmodel.py:618 bh_setarrayitem_gc_f → `FLOATSTORAGE`-width
+    /// model.py / llmodel.py bh_setarrayitem_gc_f → `FLOATSTORAGE`-width
     /// store at `base_size + index * WORD`.
     fn bh_setarrayitem_gc_f(
         &self,
@@ -3170,7 +3170,7 @@ pub trait Backend: Send {
     // ── model.py: raw array operations ──
     /// model.py:212 bh_getarrayitem_raw_i(array, index, arraydescr)
     ///
-    /// `llmodel.py:592 read_int_at_mem(array, ofs + index * size, size,
+    /// `llmodel.py read_int_at_mem(array, ofs + index * size, size,
     /// sign)` — identical typed-int memory load as the GC variant for the
     /// blackhole reader, so route through [`bh_getarrayitem_gc_i`].
     fn bh_getarrayitem_raw_i(
@@ -3183,7 +3183,7 @@ pub trait Backend: Send {
     }
     /// model.py:214 bh_getarrayitem_raw_f(array, index, arraydescr)
     ///
-    /// `llmodel.py:625 bh_getarrayitem_raw_f = bh_getarrayitem_gc_f` — the
+    /// `llmodel.py bh_getarrayitem_raw_f = bh_getarrayitem_gc_f` — the
     /// raw float read is the identical typed memory access as the GC
     /// variant for the blackhole reader, so route through
     /// [`bh_getarrayitem_gc_f`].
@@ -3214,7 +3214,7 @@ pub trait Backend: Send {
     ) {
     }
 
-    /// model.py:254 bh_arraylen_gc(array, arraydescr).
+    /// model.py bh_arraylen_gc(array, arraydescr).
     ///
     /// Upstream shape is `read_int_at_mem(array, lendescr.offset, WORD, 1)`
     /// (`llmodel.py:585-588`). Production backends override this for
@@ -3229,16 +3229,16 @@ pub trait Backend: Send {
     }
 
     // ── model.py:230-236 allocation ──
-    /// model.py:230 / llmodel.py:775 bh_new(sizedescr)
+    /// model.py / llmodel.py bh_new(sizedescr)
     fn bh_new(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         0
     }
-    /// model.py:231 / llmodel.py:778 bh_new_with_vtable(sizedescr)
+    /// model.py / llmodel.py bh_new_with_vtable(sizedescr)
     fn bh_new_with_vtable(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         0
     }
 
-    /// llsupport/gc.py:563 GcLLDescr_framework
+    /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Backend-side helper consulted only when `vtable_offset is None`
     /// (i.e. translation with --gcremovetypeptr). Returns the typeid that
@@ -3249,7 +3249,7 @@ pub trait Backend: Send {
     fn get_typeid_from_classptr_if_gcremovetypeptr(&self, _classptr: usize) -> Option<u32> {
         None
     }
-    /// model.py:233 bh_new_array(length, arraydescr)
+    /// model.py bh_new_array(length, arraydescr)
     fn bh_new_array(&self, _length: i64, _arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
         0
     }
@@ -3275,7 +3275,7 @@ pub trait Backend: Send {
     fn bh_newstr(&self, _length: i64) -> i64 {
         0
     }
-    /// model.py:266 bh_call_i(func, args_i, args_r, args_f, calldescr).
+    /// model.py bh_call_i(func, args_i, args_r, args_f, calldescr).
     /// `llmodel.py:816 call_stub_i`: ABI-correct dispatch via the shared
     /// arity table.  Default impl shared by pyre's raw-memory backends
     /// (cranelift, dynasm, wasm) — the `extern "C"` transmute+call is
@@ -3305,8 +3305,8 @@ pub trait Backend: Send {
             )
         }
     }
-    /// model.py:268 bh_call_r(func, args_i, args_r, args_f, calldescr).
-    /// `llmodel.py:818 bh_call_r`: GCREF-returning parallel — a host pointer
+    /// model.py bh_call_r(func, args_i, args_r, args_f, calldescr).
+    /// `llmodel.py bh_call_r`: GCREF-returning parallel — a host pointer
     /// matches the integer dispatcher's return register, so wrap its result.
     fn bh_call_r(
         &self,
@@ -3333,8 +3333,8 @@ pub trait Backend: Send {
         };
         GcRef(raw as usize)
     }
-    /// model.py:270 bh_call_f(func, args_i, args_r, args_f, calldescr).
-    /// `llmodel.py:825 bh_call_f`: routes through the f64-typed dispatcher so
+    /// model.py bh_call_f(func, args_i, args_r, args_f, calldescr).
+    /// `llmodel.py bh_call_f`: routes through the f64-typed dispatcher so
     /// an f64 callee returns via the float register file.
     fn bh_call_f(
         &self,
@@ -3360,8 +3360,8 @@ pub trait Backend: Send {
             )
         }
     }
-    /// model.py:272 bh_call_v(func, args_i, args_r, args_f, calldescr).
-    /// `llmodel.py:834 bh_call_v`: void-typed dispatch so a genuinely void
+    /// model.py bh_call_v(func, args_i, args_r, args_f, calldescr).
+    /// `llmodel.py bh_call_v`: void-typed dispatch so a genuinely void
     /// callee is invoked with the right C-ABI signature.
     fn bh_call_v(
         &self,
@@ -3424,7 +3424,7 @@ pub trait Backend: Send {
         _length: i64,
     ) {
     }
-    /// llmodel.py:747-750 bh_raw_load_i(addr, offset, descr).
+    /// llmodel.py bh_raw_load_i(addr, offset, descr).
     fn bh_raw_load_i(
         &self,
         _addr: i64,
@@ -3433,7 +3433,7 @@ pub trait Backend: Send {
     ) -> i64 {
         0
     }
-    /// llmodel.py:739-742 bh_raw_store_i(addr, offset, newvalue, descr).
+    /// llmodel.py bh_raw_store_i(addr, offset, newvalue, descr).
     fn bh_raw_store_i(
         &self,
         _addr: i64,
@@ -3517,7 +3517,7 @@ pub trait Backend: Send {
     ) -> f64 {
         0.0
     }
-    /// blackhole.py:1525-1529 bhimpl_gc_store_indexed_i
+    /// blackhole.py bhimpl_gc_store_indexed_i
     fn bh_gc_store_indexed_i(
         &self,
         _addr: i64,
@@ -3528,7 +3528,7 @@ pub trait Backend: Send {
         _bytes: i64,
     ) {
     }
-    /// blackhole.py:1531-1535 bhimpl_gc_store_indexed_f
+    /// blackhole.py bhimpl_gc_store_indexed_f
     fn bh_gc_store_indexed_f(
         &self,
         _addr: i64,
@@ -3539,7 +3539,7 @@ pub trait Backend: Send {
         _bytes: i64,
     ) {
     }
-    /// llmodel.py:752-753 bh_raw_load_f(addr, offset, descr).
+    /// llmodel.py bh_raw_load_f(addr, offset, descr).
     fn bh_raw_load_f(
         &self,
         _addr: i64,
@@ -3548,7 +3548,7 @@ pub trait Backend: Send {
     ) -> f64 {
         0.0
     }
-    /// llmodel.py:744-745 bh_raw_store_f(addr, offset, newvalue, descr).
+    /// llmodel.py bh_raw_store_f(addr, offset, newvalue, descr).
     fn bh_raw_store_f(
         &self,
         _addr: i64,
@@ -3620,9 +3620,9 @@ pub trait Backend: Send {
         }
     }
 
-    /// `model.py:34 AbstractCPU.setup_once` parity, called by
+    /// `model.py AbstractCPU.setup_once` parity, called by
     /// `pyjitpl.py:2297 self.cpu.setup_once()` inside
-    /// `MetaInterpStaticData._setup_once` (`pyjitpl.py:2292-2303`),
+    /// `MetaInterpStaticData._setup_once` (`pyjitpl.py`),
     /// guarded by `globaldata.initialized` so it runs exactly once
     /// per CPU after every descr setter has been called.  Backends
     /// that need to materialise per-CPU trampolines (x86
@@ -3631,7 +3631,7 @@ pub trait Backend: Send {
     /// setup-time work.
     fn setup_once(&mut self) {}
 
-    /// `backend/x86/vector_ext.py:55 setup_once(asm)` parity, called
+    /// `backend/x86/vector_ext.py setup_once(asm)` parity, called
     /// by `pyjitpl.py:2298-2299
     /// `if self.cpu.vector_ext: self.cpu.vector_ext.setup_once(...)`
     /// inside `MetaInterpStaticData._setup_once`.  Backends with a
@@ -3656,7 +3656,7 @@ pub trait Backend: Send {
     /// pyjitpl.py:2215-2217 `backendmodule = self.cpu.__module__
     /// .split('.')[-2]` parity — backend identifier used in
     /// `self.jit_starting_line = 'JIT starting (%s)' % backendmodule`
-    /// (`pyjitpl.py:2296` `debug_print(self.jit_starting_line)`).
+    /// (`pyjitpl.py` `debug_print(self.jit_starting_line)`).
     /// RPython derives it by reflection on the CPU module path;
     /// pyre returns a literal because the backend struct already
     /// knows its own name at compile time.
@@ -3698,7 +3698,7 @@ pub trait Backend: Send {
         gcref.as_usize() as i64
     }
 
-    /// model.py:199-201 cpu.cls_of_box(box):
+    /// model.py cpu.cls_of_box(box):
     ///   obj = lltype.cast_opaque_ptr(OBJECTPTR, box.getref_base())
     ///   return ConstInt(ptr2int(obj.typeptr))
     ///
@@ -3747,7 +3747,7 @@ pub fn we_are_jitted() -> bool {
     JIT_MODE_FLAG.with(|f| f.get())
 }
 
-/// `compile.py:1090` `memory_error = MemoryError()` cross-crate hook.
+/// `compile.py` `memory_error = MemoryError()` cross-crate hook.
 ///
 /// In RPython the malloc helpers raise `MemoryError`, which the
 /// translator lowers to "set `cpu.pos_exc_value` to the singleton
@@ -3758,7 +3758,7 @@ pub fn we_are_jitted() -> bool {
 ///
 /// Returns 0 when no provider is installed — backends interpret this
 /// as "leave `JIT_EXC_VALUE` untouched".  Layer 4
-/// (`PropagateExceptionDescr.handle_fail`, `compile.py:1092`) has its
+/// (`PropagateExceptionDescr.handle_fail`, `compile.py`) has its
 /// own `cast_instance_to_gcref(memory_error)` fallback for that case.
 static MEMORY_ERROR_PROVIDER: std::sync::OnceLock<fn() -> i64> = std::sync::OnceLock::new();
 

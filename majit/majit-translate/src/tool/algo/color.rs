@@ -81,7 +81,7 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
         }
     }
 
-    /// RPython: `regalloc.py:105` `v0 not in dg.neighbours[w0]`.
+    /// RPython: `regalloc.py` `v0 not in dg.neighbours[w0]`.
     /// Returns true iff there is an interference edge between `v1` and `v2`.
     pub fn has_edge(&self, v1: &N, v2: &N) -> bool {
         self.neighbours.get(v1).is_some_and(|ns| ns.contains(v2))

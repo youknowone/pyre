@@ -17,7 +17,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 /// `rclass.py`. Upstream discovers the redirected field set by reading
 /// `classdesc.get_param('_virtualizable_')` off an RPython class and then
 /// injects a `jit_force_virtualizable` per redirected access
-/// (`hook_access_field`, rvirtualizable.py:49-53) into the FLOWGRAPHS it is
+/// (`hook_access_field`, rvirtualizable.py) into the FLOWGRAPHS it is
 /// about to rtype. Pyre's interpreter is hand-written Rust, so no class
 /// carries that parameter — nothing writes the key — and the rtyper's
 /// lowered op stream is not what the production jitcode is built from.

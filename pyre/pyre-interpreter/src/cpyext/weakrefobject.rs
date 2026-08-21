@@ -11,14 +11,14 @@ fn is_a(object: PyObjectRef, kind: PyObjectRef) -> bool {
     !object.is_null() && unsafe { crate::baseobjspace::isinstance_w(object, kind) }
 }
 
-/// `weakrefobject.py:65 PyWeakref_CheckRef`.
+/// `weakrefobject.py PyWeakref_CheckRef`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_CheckRef(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
     is_a(object, interp__weakref::weakref_type()) as c_int
 }
 
-/// `weakrefobject.py:75 PyWeakref_CheckRefExact`.
+/// `weakrefobject.py PyWeakref_CheckRefExact`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_CheckRefExact(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
@@ -29,7 +29,7 @@ pub unsafe extern "C" fn PyWeakref_CheckRefExact(object: *mut CPyObject) -> c_in
     (own == interp__weakref::weakref_type()) as c_int
 }
 
-/// `weakrefobject.py:82 PyWeakref_CheckProxy` — either proxy type.
+/// `weakrefobject.py PyWeakref_CheckProxy` — either proxy type.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_CheckProxy(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
@@ -37,7 +37,7 @@ pub unsafe extern "C" fn PyWeakref_CheckProxy(object: *mut CPyObject) -> c_int {
         || is_a(object, interp__weakref::callable_proxy_type())) as c_int
 }
 
-/// `weakrefobject.py:91 PyWeakref_Check` — a reference or a proxy.
+/// `weakrefobject.py PyWeakref_Check` — a reference or a proxy.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_Check(object: *mut CPyObject) -> c_int {
     (unsafe { PyWeakref_CheckRef(object) } != 0 || unsafe { PyWeakref_CheckProxy(object) } != 0)
@@ -61,7 +61,7 @@ fn referent_of(object: *mut CPyObject, function: &str) -> Option<PyObjectRef> {
     Some(interp__weakref::dereference(value))
 }
 
-/// `weakrefobject.py:6 PyWeakref_NewRef(ob, callback)`.
+/// `weakrefobject.py PyWeakref_NewRef(ob, callback)`.
 ///
 /// A NULL callback is the "no callback" spelling, which is the one-argument
 /// call rather than one passing `None`: `ref(ob, None)` is a reference with a
@@ -88,7 +88,7 @@ pub unsafe extern "C" fn PyWeakref_NewRef(
     ))
 }
 
-/// `weakrefobject.py:19 PyWeakref_NewProxy(ob, callback)`.
+/// `weakrefobject.py PyWeakref_NewProxy(ob, callback)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyWeakref_NewProxy(
     object: *mut CPyObject,
@@ -107,7 +107,7 @@ pub unsafe extern "C" fn PyWeakref_NewProxy(
     result(interp__weakref::proxy(&arguments))
 }
 
-/// `weakrefobject.py:33 PyWeakref_GetObject` — borrowed, and `None` rather
+/// `weakrefobject.py PyWeakref_GetObject` — borrowed, and `None` rather
 /// than NULL once the referent is gone.
 ///
 /// Borrowed here is [`pyobject::borrow_mirror`] and not the reference a
@@ -175,7 +175,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyWeakref_IsDead as *const ());
 }
 
-/// `object.py:141 PyObject_ClearWeakRefs(object)` — break every weak
+/// `object.py PyObject_ClearWeakRefs(object)` — break every weak
 /// reference to `object` and run the callbacks they carry.
 ///
 /// An object that was never the target of one has no lifeline, and there is

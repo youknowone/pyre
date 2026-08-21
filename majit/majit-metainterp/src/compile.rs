@@ -3,7 +3,7 @@
 //! Mirrors RPython's `compile.py`: guard metadata building, exit layout
 //! management, backend layout merging, trace post-processing (unboxing),
 //! and the ResumeGuard-descriptor class hierarchy
-//! (`compile.py:730-940 AbstractResumeGuardDescr` →
+//! (`compile.py AbstractResumeGuardDescr` →
 //! `ResumeGuardDescr` → `{ResumeAtPositionDescr, ResumeGuardForcedDescr,
 //! ResumeGuardExcDescr, CompileLoopVersionDescr}`,
 //! `ResumeGuardCopiedDescr` / `ResumeGuardCopiedExcDescr`,
@@ -39,7 +39,7 @@ use crate::resume::{
 };
 use crate::trace_ctx::{MergePoint, TraceCtx};
 
-/// `compile.py:166-169` `make_jitcell_token(jitdriver_sd)`.
+/// `compile.py` `make_jitcell_token(jitdriver_sd)`.
 ///
 /// ```python
 /// def make_jitcell_token(jitdriver_sd):
@@ -59,8 +59,8 @@ use crate::trace_ctx::{MergePoint, TraceCtx};
 ///
 /// Returns the canonical `Arc<JitCellToken>` immediately.  Callers can
 /// mutate the token before it is cloned with `Arc::get_mut`, then pass
-/// the same Arc through `compile_loop` (`compile.py:266`) →
-/// `attach_procedure_to_interp` (`compile.py:1019`) →
+/// the same Arc through `compile_loop` (`compile.py`) →
+/// `attach_procedure_to_interp` (`compile.py`) →
 /// `MemoryManager.keep_loop_alive` (`compile.py:567`/`:1149`).
 pub fn make_jitcell_token(number: u64, jd_index: Option<usize>) -> Arc<JitCellToken> {
     let mut token = JitCellToken::new(number);
@@ -96,7 +96,7 @@ fn fail_arg_type(opref: &OpRef) -> Type {
 }
 
 /// Derive slot_types from ExitValueSourceLayout + exit_types.
-/// resume.py:1017-1038 decode_box(tagged, kind) parity: a slot's type
+/// resume.py decode_box(tagged, kind) parity: a slot's type
 /// is the declared type of the variable, so a constant carries its own
 /// declared type rather than being assumed an integer.
 /// ExitValue(idx) → exit_types[idx]; Constant(_, ty) → ty; others → Ref.
@@ -169,8 +169,8 @@ pub struct CompiledExitLayout {
     pub source_op_index: Option<usize>,
     pub exit_types: ExitTypes,
     pub is_finish: bool,
-    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef`
-    /// vs `compile.py:640-647 DoneWithThisFrameDescrRef`: distinguishes
+    /// `compile.py ExitFrameWithExceptionDescrRef`
+    /// vs `compile.py DoneWithThisFrameDescrRef`: distinguishes
     /// the exception-propagation FINISH so the synthesis fallback at
     /// `make_finish_fail_descr_typed` routes a `[Type::Ref]` exit to the
     /// correct `_DoneWithThisFrameDescr` subclass.
@@ -191,7 +191,7 @@ pub struct CompiledExitLayout {
     /// per-entry allocation count is unchanged.
     pub recovery_layout: Option<Box<ExitRecoveryLayout>>,
     pub resume_layout: Option<Box<ResumeLayoutSummary>>,
-    /// compile.py:853 `ResumeGuardDescr` storage handle — shared
+    /// compile.py `ResumeGuardDescr` storage handle — shared
     /// pool with rd_numb / rd_consts / rd_virtuals / rd_pendingfields.
     pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
 }
@@ -243,16 +243,16 @@ pub struct CompileResult<M> {
     /// `fail_index_per_trace` identity used for bridge routing.
     pub descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
     pub is_finish: bool,
-    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity:
+    /// compile.py ExitFrameWithExceptionDescrRef parity:
     /// true when the FINISH descriptor was
     /// `sd.exit_frame_with_exception_descr_ref` (emitted via
-    /// `pyjitpl.py:3238-3245 compile_exit_frame_with_exception`).
+    /// `pyjitpl.py compile_exit_frame_with_exception`).
     /// jitdriver routes this to `jitexc.ExitFrameWithExceptionRef`.
     pub is_exit_frame_with_exception: bool,
     pub exit_layout: CompiledExitLayout,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
-    /// compile.py:741-745: ResumeGuardDescr.status read at guard failure.
+    /// compile.py: ResumeGuardDescr.status read at guard failure.
     pub status: u64,
 }
 
@@ -274,13 +274,13 @@ pub struct RawCompileResult<M> {
     /// `rd_loop_token_clt` / `fail_index_per_trace` directly from this.
     pub descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
     pub is_finish: bool,
-    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity —
+    /// compile.py ExitFrameWithExceptionDescrRef parity —
     /// mirrors `CompileResult::is_exit_frame_with_exception`.
     pub is_exit_frame_with_exception: bool,
     pub exit_layout: CompiledExitLayout,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
-    /// compile.py:741-745: ResumeGuardDescr.status read at guard failure.
+    /// compile.py: ResumeGuardDescr.status read at guard failure.
     pub status: u64,
 }
 
@@ -309,7 +309,7 @@ pub struct DeadFrameArtifacts {
     pub exception: ExceptionState,
 }
 
-/// `compile.py:31` `class CompileData(object)`.
+/// `compile.py` `class CompileData(object)`.
 ///
 /// PYRE-ADAPTATION: RPython's `CompileData.optimize_trace()` builds the
 /// optimizer chain, logs, dispatches to the subclass `optimize()`, and clears
@@ -341,7 +341,7 @@ impl<'a> CompileData<'a> {
     }
 }
 
-/// `compile.py:62` `class PreambleCompileData(CompileData)`.
+/// `compile.py` `class PreambleCompileData(CompileData)`.
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
     #[allow(dead_code)]
@@ -367,7 +367,7 @@ impl<'a> PreambleCompileData<'a> {
     }
 }
 
-/// `compile.py:81` `class SimpleCompileData(CompileData)`.
+/// `compile.py` `class SimpleCompileData(CompileData)`.
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
     #[allow(dead_code)]
@@ -393,7 +393,7 @@ impl<'a> SimpleCompileData<'a> {
     }
 }
 
-/// `compile.py:98` `class BridgeCompileData(CompileData)`.
+/// `compile.py` `class BridgeCompileData(CompileData)`.
 pub struct BridgeCompileData<'a> {
     #[allow(dead_code)]
     pub base: CompileData<'a>,
@@ -426,7 +426,7 @@ impl<'a> BridgeCompileData<'a> {
     }
 }
 
-/// `compile.py:122` `class UnrolledLoopData(CompileData)`.
+/// `compile.py` `class UnrolledLoopData(CompileData)`.
 pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
     #[allow(dead_code)]
@@ -465,7 +465,7 @@ impl<'a> UnrolledLoopData<'a> {
 ///
 /// `frame_value_count_fn` is the compiling driver's
 /// [`crate::jitdriver::JitDriverStaticData::frame_value_count_fn`] override for
-/// the `jitcode.py:147 enumerate_vars` frame box count; `None` falls back to the
+/// the `jitcode.py enumerate_vars` frame box count; `None` falls back to the
 /// process-global callback the host registered.
 pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
     inputargs: &[InputArg],
@@ -555,7 +555,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         let descr_types = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec());
         let exit_types: Vec<Type> = if is_finish {
             // FINISH ops are always emitted with one of the
-            // `_DoneWithThisFrameDescr` family (compile.py:623-672) or
+            // `_DoneWithThisFrameDescr` family (compile.py) or
             // `ExitFrameWithExceptionDescrRef`, all of which carry a
             // fixed `fail_arg_types` (Void → empty, Int → [Int],
             // Ref → [Ref], Float → [Float]). Prefer the descr's
@@ -690,7 +690,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                             }
                         }
                     };
-                // After `opencoder.py:217` `framestack.reverse()` parity,
+                // After `opencoder.py` `framestack.reverse()` parity,
                 // both rd_numb and `ResumeData.frames` agree on outermost-
                 // first ordering, so push frames in stream order.
                 //
@@ -717,7 +717,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
 
             let layout = resume_memo.encode_shared(&builder.build()).layout_summary();
             resume_layout = Some(layout.clone());
-            // compile.py:853 `ResumeGuardDescr` storage — build the shared
+            // compile.py `ResumeGuardDescr` storage — build the shared
             // Arc once from the guard op's `rd_*` fields so every reader
             // (StoredExitLayout, bridge retrace, blackhole resume, GC
             // root walker) observes the same pool.  Resolve through
@@ -753,7 +753,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         // Sharing-path guards (mod.rs::sharing-guard) own a
         // ResumeGuardCopiedDescr whose `prev` points at the donor;
         // the `resolved_rd_*` helpers chase that descr-side pointer
-        // (compile.py:849 get_resumestorage).
+        // (compile.py get_resumestorage).
         let recovery_layout = if op.resolved_rd_numb().is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
             // Build recovery_layout from rd_numb + rd_virtuals.
@@ -818,7 +818,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                 .collect();
             // resume.py:576-860 parity: resolve fieldnums tags for recovery.
             // Follow `descr.prev` so sharing-path guards see the donor's
-            // const pool (compile.py:849 get_resumestorage).
+            // const pool (compile.py get_resumestorage).
             let rd_consts_arc = op.resolved_rd_consts();
             let rd_consts_ref: &[Const] =
                 rd_consts_arc.as_deref().map_or(&[], |pool| pool.as_slice());
@@ -869,7 +869,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     .collect()
             };
             // Sharing-path follows `descr.prev` to read the donor's
-            // virtual table (compile.py:849 get_resumestorage parity).
+            // virtual table (compile.py get_resumestorage parity).
             let virtual_layouts: Vec<majit_backend::ExitVirtualLayout> = op
                 .resolved_rd_virtuals()
                 .map(|entries| {
@@ -987,7 +987,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
-                                    // resume.py:717: VRawSliceInfo — base_buffer + offset.
+                                    // resume.py: VRawSliceInfo — base_buffer + offset.
                                     let base = fieldnums
                                         .first()
                                         .map(|&fnum| resolve_tagged_source(fnum))
@@ -997,8 +997,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                                         base,
                                     }
                                 }
-                                // resume.py:763 VStrPlainInfo /
-                                // resume.py:817 VUniPlainInfo —
+                                // resume.py VStrPlainInfo /
+                                // resume.py VUniPlainInfo —
                                 // length = len(fieldnums).
                                 majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
                                     let chars = fieldnums
@@ -1020,8 +1020,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                                         chars,
                                     }
                                 }
-                                // resume.py:781 VStrConcatInfo /
-                                // resume.py:836 VUniConcatInfo —
+                                // resume.py VStrConcatInfo /
+                                // resume.py VUniConcatInfo —
                                 // decoder.concat_strings(left, right); funcptr
                                 // resolved at materialization via
                                 // `callinfocollection.funcptr_for_oopspec(...)`
@@ -1040,8 +1040,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                                         right,
                                     }
                                 }
-                                // resume.py:801 VStrSliceInfo /
-                                // resume.py:856 VUniSliceInfo —
+                                // resume.py VStrSliceInfo /
+                                // resume.py VUniSliceInfo —
                                 // decoder.slice_string(largerstr, start, length);
                                 // funcptr resolved via callinfocollection at
                                 // materialization (resume.py:1477-1478 / 1504-1505).
@@ -1074,15 +1074,15 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             // itemindex); the layout mirrors that shape and consumers
             // (`pyre-jit::eval::replay_pending_fields`,
             // `cranelift::compiler` guard recovery) call descr methods at
-            // dispatch time, matching `resume.py:1509-1518` (setfield) and
-            // `resume.py:1531-1541` (setarrayitem_int / _ref / _float).
+            // dispatch time, matching `resume.py` (setfield) and
+            // `resume.py` (setarrayitem_int / _ref / _float).
             let pending_field_layouts: Vec<majit_backend::ExitPendingFieldLayout> = op
                 .resolved_rd_pendingfields()
                 .map(|entries| {
                     entries
                         .iter()
                         .map(|pf| {
-                            // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is
+                            // resume.py PENDINGFIELDSTRUCT.lldescr is
                             // always present in RPython — the descr is
                             // captured directly off the Setfield_gc /
                             // Setarrayitem_gc op that produced the pending
@@ -1095,7 +1095,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                                 .descr
                                 .clone()
                                 .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
-                            // resume.py:1003-1007: itemindex >= 0 → setarrayitem.
+                            // resume.py: itemindex >= 0 → setarrayitem.
                             let item_index = if descr.as_array_descr().is_some() {
                                 Some(usize::try_from(pf.item_index).expect(
                                     "resume.py:1003 setarrayitem pending field requires non-negative item_index",
@@ -1182,7 +1182,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
     ops: &[T],
 ) {
     for layout in backend_layouts {
-        // compile.py:861 copy_all_attributes_from parity: when the backend
+        // compile.py copy_all_attributes_from parity: when the backend
         // exposes resume data (rd_numb / rd_consts / rd_virtuals /
         // rd_pendingfields) for an exit the frontend never saw, assemble
         // them into a `ResumeStorage` so downstream consumers
@@ -1786,7 +1786,7 @@ pub(crate) fn normalize_closing_jump_args(
     // The substitution below is positional — jump slot `idx` is repaired from
     // label slot `idx` — so it holds only while the JUMP closes onto THIS
     // LABEL. `compile_retrace` also reaches here with a JUMP retargeted at
-    // another TargetToken (`unroll.py:156/171 jump_to_preamble`), and that
+    // another TargetToken (`unroll.py/171 jump_to_preamble`), and that
     // JUMP already carries the argument order the target token's virtual
     // state produced (`unroll.py:346-357`, which
     // `assemble_peeled_trace_with_jump_args` passes through untouched for
@@ -1803,7 +1803,7 @@ pub(crate) fn normalize_closing_jump_args(
             break;
         }
         let arg = jump.arg(idx);
-        // history.py:189-220 Const* are values, not body-namespace OpRefs
+        // history.py Const* are values, not body-namespace OpRefs
         // — they never need closing-jump normalization.
         if arg.is_constant() {
             continue;
@@ -1865,7 +1865,7 @@ pub(crate) fn normalize_closing_jump_args(
 ///     loop.operations = extra_ops
 /// ```
 ///
-/// Called from `send_loop_to_backend` (compile.py:504-511) after the loop
+/// Called from `send_loop_to_backend` (compile.py) after the loop
 /// has been optimized but before it is handed to the CPU backend. The
 /// virtualizable's static and array fields ride through the optimizer as
 /// expanded trace inputargs; this function strips them and reconstructs
@@ -1885,7 +1885,7 @@ pub(crate) fn normalize_closing_jump_args(
 /// is a hard error for the two to be confused: truncating at the wrong point
 /// silently reinterprets live entry values as virtualizable fields.
 ///
-/// `index_of_virtualizable` is `compile.py:429` — an index INTO that entry
+/// `index_of_virtualizable` is `compile.py` — an index INTO that entry
 /// prefix, so it is expressed in whichever of the two models the caller used.
 ///
 /// `vable_array_lengths` mirrors RPython's `vinfo.get_array_length(vable, i)`
@@ -1908,7 +1908,7 @@ pub(crate) fn normalize_closing_jump_args(
 /// reads a stale length.
 ///
 /// The assertion at the baking site below is what that invariant buys in
-/// code: `compile.py:458 assert i == len(inputargs)` requires the baked
+/// code: `compile.py assert i == len(inputargs)` requires the baked
 /// lengths to account for EXACTLY the inputargs the tracer expanded, so a
 /// length that has moved since trace-start fails the compile instead of
 /// producing a prologue that reads the wrong number of elements. It cannot
@@ -2114,7 +2114,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // compile.py:441-457 — GETFIELD_GC_R (array ptr) + GETARRAYITEM_GC per element.
     let array_descrs_list = vinfo.array_field_descrs();
     for (ai, array_field_descr) in array_descrs_list.iter().enumerate() {
-        // compile.py:443 `arraylen = vinfo.get_array_length(vable, arrayindex)`
+        // compile.py `arraylen = vinfo.get_array_length(vable, arrayindex)`
         // — the length is BAKED into the compiled prologue here, as a fixed
         // count of `GETARRAYITEM` ops. No later check re-reads it: the entry
         // compatibility test is built from the fixed array fields and takes
@@ -2240,8 +2240,8 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             }
         };
         for index in 0..array_len {
-            // compile.py:453 — ConstInt(index) for the array subscript.
-            // history.py:227 ConstInt.value inline.
+            // compile.py — ConstInt(index) for the array subscript.
+            // history.py ConstInt.value inline.
             let const_opref = OpRef::const_int(index as i64);
 
             let old_opref =
@@ -2261,7 +2261,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         }
     }
 
-    // compile.py:458 `assert i == len(inputargs)`. This is also the only
+    // compile.py `assert i == len(inputargs)`. This is also the only
     // in-code check the baked array lengths get: the reconstruction consumed
     // one expanded inputarg per baked element, so an equality here says the
     // lengths passed in still describe the shape the tracer expanded at
@@ -2273,7 +2273,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         expanded_inputargs.len()
     );
 
-    // compile.py:459-461 — emit_op walks the existing ops re-emitting
+    // compile.py — emit_op walks the existing ops re-emitting
     // each one with `get_box_replacement` applied to args + fail_args.
     let original_ops = std::mem::take(ops);
     for op in original_ops.iter() {
@@ -2390,7 +2390,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
 // `majit-metainterp` side so `compile_tmp_callback` and
 // `finish_setup` can reference the same singletons RPython does.
 //
-// `pyjitpl.py:2222` `compile.make_and_attach_done_descrs([self, cpu])` —
+// `pyjitpl.py` `compile.make_and_attach_done_descrs([self, cpu])` —
 // RPython attaches a *single* `DoneWithThisFrameDescr*` object to both
 // `MetaInterpStaticData` and the CPU so the FINISH descr pointer the
 // backend observes is the same Arc the metainterp reads back in
@@ -2400,7 +2400,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
 // impl below), so `MetaInterp::new` installs a single `Arc` on both
 // halves; `attach_descrs_to_cpu` forwards the clones to the backend.
 
-// `compile.py:623-672, 1092-1099` `_DoneWithThisFrameDescr` family /
+// `compile.py, 1092-1099` `_DoneWithThisFrameDescr` family /
 // `ExitFrameWithExceptionDescrRef` / `PropagateExceptionDescr`: the
 // class definitions live in `majit-backend::finish_descrs` so backend
 // codegen and synthetic-exit paths can construct them directly without
@@ -2411,7 +2411,7 @@ pub use majit_backend::{
     DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
 };
 
-/// `compile.py:665-674` `def make_and_attach_done_descrs(targets)`.
+/// `compile.py` `def make_and_attach_done_descrs(targets)`.
 ///
 /// Creates one instance of each `DoneWithThisFrameDescr*` +
 /// `ExitFrameWithExceptionDescrRef` and attaches them to each target
@@ -2438,7 +2438,7 @@ pub fn make_and_attach_done_descrs(targets: &mut [&mut dyn DescrContainer]) {
 
 /// Trait hooked by `make_and_attach_done_descrs`.
 ///
-/// `compile.py:673-674` `setattr(target, name, descr)` — in RPython each
+/// `compile.py` `setattr(target, name, descr)` — in RPython each
 /// target is a Python object with settable attributes; in Rust the
 /// five setters make the contract explicit.  `MetaInterpStaticData`
 /// and `dyn Backend` both implement this trait so a single call to
@@ -2477,7 +2477,7 @@ impl DescrContainer for dyn Backend + '_ {
     }
 }
 
-/// `rpython/jit/metainterp/compile.py:1101-1150` `compile_tmp_callback`.
+/// `rpython/jit/metainterp/compile.py` `compile_tmp_callback`.
 ///
 /// Make a `JitCellToken` that corresponds to assembler code that just
 /// calls back the interpreter.  Used temporarily: a fully compiled
@@ -2490,13 +2490,13 @@ impl DescrContainer for dyn Backend + '_ {
 /// `CALL portal_runner_adr(funcbox, *greenboxes, *inputargs)` →
 /// `GUARD_NO_EXCEPTION` → `FINISH` — which bounces control back into
 /// the interpreter. Once the real trace compiles,
-/// `redirect_call_assembler` (`x86/assembler.py:1138`) in-place patches
+/// `redirect_call_assembler` (`x86/assembler.py`) in-place patches
 /// `_ll_function_addr` so callers reach the real loop transparently.
 ///
 /// # Wiring status
 ///
 /// Recursive `CALL_ASSEMBLER` paths route unfinished callees through
-/// `warmstate::get_assembler_token` (`warmstate.py:714-723`), which installs
+/// `warmstate::get_assembler_token` (`warmstate.py`), which installs
 /// this synthesised cell with `tmp=true` (`set_procedure_token(token, true)`).
 /// Backend address resolution reads the descr-carried `Arc<JitCellToken>` and
 /// its `_ll_function_addr`; backend registries that remain are metadata /
@@ -2510,7 +2510,7 @@ impl DescrContainer for dyn Backend + '_ {
 /// `pyjitpl.py:2279-2281` (see
 /// `MetaInterpStaticData::finish_setup_descrs_for_jitdrivers`).
 ///
-/// `memory_manager` is `compile.py:1101-1102`'s `memory_manager=None`
+/// `memory_manager` is `compile.py`'s `memory_manager=None`
 /// parameter and carries the same "for tests" meaning: pass `Some` from every
 /// production path, because the warm cell that receives this token keeps only
 /// a weak handle to it and `alive_loops` is the sole strong owner
@@ -2554,13 +2554,13 @@ pub fn compile_tmp_callback(
     // adjacent to the InputArg loop so the two signal-pairs (length /
     // typed-shape) sit together. See the `debug_assert_eq!` block at
     // `compile.py:1113` parity below.
-    // `compile.py:1107` `jitcell_token = make_jitcell_token(jitdriver_sd)`.
+    // `compile.py` `jitcell_token = make_jitcell_token(jitdriver_sd)`.
     // Pyre adaptation: the token carries `green_key` (enabling cell lookup
     // on later CALL_ASSEMBLER) and `virtualizable_arg_index` (cached from
     // `jitdriver_sd.index_of_virtualizable`, matching the fields populated
     // on real-loop tokens at `compile_loop`).
     //
-    // `compile.py:168` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
+    // `compile.py` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
     // is set inside `make_jitcell_token`.
     let jitcell_token = make_jitcell_token(token_number, jitdriver_sd.index);
     // `green_key` / `virtualizable_arg_index` are interior-mutable (`Cell`),
@@ -2575,13 +2575,13 @@ pub fn compile_tmp_callback(
         .virtualizable_arg_index
         .set(jitdriver_sd.red_arg_virtualizable_index());
     //
-    // `compile.py:1110` `jl.tmp_callback(jitcell_token)` — JIT logger
+    // `compile.py` `jl.tmp_callback(jitcell_token)` — JIT logger
     // marker.  TODO: `rpython/rlib/jit.py`'s `jl`
     // module is not ported; skip.
     //
-    // `compile.py:1112` `nb_red_args = jitdriver_sd.num_red_args`.
+    // `compile.py` `nb_red_args = jitdriver_sd.num_red_args`.
     let nb_red_args = jitdriver_sd.num_red_args();
-    // `compile.py:1113` `assert len(redargtypes) == nb_red_args`.
+    // `compile.py` `assert len(redargtypes) == nb_red_args`.
     assert_eq!(
         red_arg_types.len(),
         nb_red_args,
@@ -2625,14 +2625,14 @@ pub fn compile_tmp_callback(
     //     k = jitdriver_sd.portal_runner_adr
     //     funcbox = history.ConstInt(adr2int(k))
     //
-    // `compile.py:1127` `callargs = [funcbox] + greenboxes + inputargs`.
+    // `compile.py` `callargs = [funcbox] + greenboxes + inputargs`.
     //
     // pyre layout: the CALL op's `args` slots reference `OpRef` numbers.
     // InputArgs occupy `0..num_inputs` and are minted via
     // `InputArg::opref()` so they carry RPython-parity InputArg{Int,
     // Float,Ref} variants (resoperation.py:719/727/739). Constants
     // (funcbox + greens) carry their value inline on the OpRef
-    // variant (history.py:227/268/314 `Const{Int,Float,Ptr}.value`).
+    // variant (history.py/268/314 `Const{Int,Float,Ptr}.value`).
     // `compile.py:1126` funcbox = ConstInt(adr2int(k)) — `ConstInt.value`
     // inline, carried directly on the OpRef variant.
     let funcbox_ref = OpRef::const_int(jitdriver_sd.portal_runner_adr);
@@ -2640,7 +2640,7 @@ pub fn compile_tmp_callback(
     let mut callargs_box: Vec<Operand> = Vec::with_capacity(1 + greenboxes.len() + inputargs.len());
     callargs_box.push(Operand::from_opref(funcbox_ref));
     for gb in greenboxes.iter() {
-        // history.py:227/268/314 Const{Int,Float,Ptr}.value inline.
+        // history.py/268/314 Const{Int,Float,Ptr}.value inline.
         let g_ref = match *gb {
             Value::Int(v) => OpRef::const_int(v),
             Value::Ref(r) => OpRef::const_ptr(r),
@@ -2671,14 +2671,14 @@ pub fn compile_tmp_callback(
         .expect("compile_tmp_callback: jd.propagate_exc_descr not set")
         .clone();
     //
-    // `compile.py:1130` `jd = jitdriver_sd`.
-    // `compile.py:1131` `opnum = OpHelpers.call_for_descr(jd.portal_calldescr)`.
+    // `compile.py` `jd = jitdriver_sd`.
+    // `compile.py` `opnum = OpHelpers.call_for_descr(jd.portal_calldescr)`.
     let call_opcode = OpCode::call_for_type(jitdriver_sd.result_type);
     // `compile.py:1132` `call_op = ResOperation(opnum, callargs,
     // descr=jd.portal_calldescr)`.
     let call_op = std::rc::Rc::new(Op::with_descr(call_opcode, &callargs_box, portal_calldescr));
     //
-    // `compile.py:1133-1136` `if call_op.type != 'v': finishargs = [call_op]
+    // `compile.py` `if call_op.type != 'v': finishargs = [call_op]
     // else: finishargs = []`.
     //
     // A void CALL leaves no result OpRef — match `Op::default_pos()` /
@@ -2689,7 +2689,7 @@ pub fn compile_tmp_callback(
         Vec::new()
     } else {
         // The CALL writes to the first free OpRef after inputargs.
-        // resoperation.py:564-638 IntOp/FloatOp/RefOp mixin: the result
+        // resoperation.py IntOp/FloatOp/RefOp mixin: the result
         // box of a typed CALL is a typed ResOp variant.
         let call_result_ref = OpRef::op_typed(num_inputs, jitdriver_sd.result_type);
         call_op.pos.set(call_result_ref);
@@ -2700,7 +2700,7 @@ pub fn compile_tmp_callback(
     //   GUARD_NO_EXCEPTION(descr=faildescr),
     //   FINISH(finishargs, descr=jd.portal_finishtoken)].
     let mut guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
-    // `compile.py:1144` `operations[1].setfailargs([])` — no fail args.
+    // `compile.py` `operations[1].setfailargs([])` — no fail args.
     guard_op.setfailargs(smallvec![]);
     let finish_op = Op::with_descr(OpCode::Finish, &finishargs_box, portal_finishtoken);
     let operations: Vec<majit_ir::OpRc> = vec![
@@ -2712,7 +2712,7 @@ pub fn compile_tmp_callback(
     // `compile.py:1145` `operations = get_deep_immutable_oplist(operations)` —
     // pyre has no immutable-list transformation.
     //
-    // `compile.py:1146` `cpu.compile_loop(inputargs, operations, jitcell_token,
+    // `compile.py` `cpu.compile_loop(inputargs, operations, jitcell_token,
     // log=False)`.
     // Inline-Const carries each Const value directly on its OpRef
     // variant (history.py:227/268/314), so the backend pool is left
@@ -2744,7 +2744,7 @@ pub fn compile_tmp_callback(
     }
     //
     // `compile.py:1150` `return jitcell_token`.
-    // `compile.py:179-180` record_loop_or_bridge: the tmp-callback loop is a
+    // `compile.py` record_loop_or_bridge: the tmp-callback loop is a
     // real compiled loop even though MetaInterp never inserts it into
     // compiled_loops. Register it with the backend so `find_descr_by_ptr`
     // can still walk its fail_descrs on cross-token guard resolution.
@@ -2841,7 +2841,7 @@ mod tests {
         assert!(!layout.is_traced_ref_slot(3));
     }
 
-    // history.py:227 ConstInt.value inline — SimpleBoxEnv.get_const
+    // history.py ConstInt.value inline — SimpleBoxEnv.get_const
     // reads inline-Const directly without the legacy raw-u32 side table.
     #[test]
     fn test_build_guard_metadata_keeps_vable_array_out_of_frame_slots() {
@@ -3247,7 +3247,7 @@ fn flatten_vector_info(head: Option<&AccumInfo>) -> Vec<AccumInfo> {
     result
 }
 
-/// `compile.py:869 self.rd_vector_info = other.rd_vector_info.clone()`
+/// `compile.py self.rd_vector_info = other.rd_vector_info.clone()`
 /// rebuild helper: takes the donor's flattened chain (head at index 0)
 /// and assembles the equivalent linked-list head suitable for writing
 /// through `vector_info: UnsafeCell<Option<Box<AccumInfo>>>`.
@@ -3272,7 +3272,7 @@ fn alloc_fail_index() -> u32 {
     NEXT_FAIL_INDEX.fetch_add(1, Ordering::SeqCst)
 }
 
-// `compile.py:687-696 AbstractResumeGuardDescr` status-bit constants.
+// `compile.py AbstractResumeGuardDescr` status-bit constants.
 //
 // Status packs three pieces in one `u64`:
 //   - bit 0          : `ST_BUSY_FLAG` (set during retrace; clear once done).
@@ -3300,7 +3300,7 @@ pub(crate) const STATUS_TY_FLOAT: u64 = 0x06;
 // FailDescr is no longer needed.  All factories
 // (`make_fail_descr_typed`, `make_fail_descr`, `make_fail_descr_with_index`)
 // now route through `make_resume_guard_descr_typed` to produce a
-// `ResumeGuardDescr` (compile.py:840), matching PyPy's class hierarchy
+// `ResumeGuardDescr` (compile.py), matching PyPy's class hierarchy
 // where placeholder guard descrs are the same `ResumeGuardDescr`
 // instances backfilled by `store_final_boxes_in_guard` (compile.py:869).
 
@@ -3323,7 +3323,7 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
 /// Create a FailDescr with an explicit fail_index. Tests only — see
 /// `compile.rs::tests` for the invocation that needs a fixed fail_index
 /// to align against a synthesised bridge descr.  The result is a
-/// `ResumeGuardDescr` (PyPy `compile.py:840`) with the
+/// `ResumeGuardDescr` (PyPy `compile.py`) with the
 /// `Descr::index()` global fail_index set to the requested value
 /// instead of `alloc_fail_index()`.
 #[cfg(test)]
@@ -3362,7 +3362,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
 
 /// Create a guard FailDescr with explicit types and auto-assigned fail_index.
 ///
-/// `compile.py:840-843 ResumeGuardDescr` — pyre routes the
+/// `compile.py ResumeGuardDescr` — pyre routes the
 /// non-finish guard-placeholder factory through the same
 /// `ResumeGuardDescr` constructor `make_resume_guard_descr_typed` uses;
 /// the result's `is_resume_guard()` returns true and the empty
@@ -3377,16 +3377,16 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
 /// terminal-exit fallback in `merge_backend_terminal_exit_layouts` when
 /// the FINISH op has been evicted, and by FINISH-singleton fallbacks in
 /// tests that bypass `MetaInterp::new` (so the resulting descr's
-/// `is_finish()` matches `compile.py:658-662 ExitFrameWithExceptionDescrRef`
-/// / `pyjitpl.py:3198-3220 compile_done_with_this_frame` semantics).
+/// `is_finish()` matches `compile.py ExitFrameWithExceptionDescrRef`
+/// / `pyjitpl.py compile_done_with_this_frame` semantics).
 ///
-/// `compile.py:626-662` `_DoneWithThisFrameDescr` family — return the
+/// `compile.py` `_DoneWithThisFrameDescr` family — return the
 /// class-distinct singleton matching the result-type signature.
 ///
 /// `is_exception_exit` discriminates `compile.py:658-662
 /// ExitFrameWithExceptionDescrRef` (the exception-propagation FINISH
 /// that raises `jitexc.ExitFrameWithExceptionRef`) from the
-/// normal-result `compile.py:640-647 DoneWithThisFrameDescrRef`; both
+/// normal-result `compile.py DoneWithThisFrameDescrRef`; both
 /// carry a single `Type::Ref` slot, so the type list alone cannot
 /// distinguish them.
 pub fn make_finish_fail_descr_typed(types: Vec<Type>, is_exception_exit: bool) -> DescrRef {
@@ -3407,7 +3407,7 @@ pub fn make_finish_fail_descr_typed(types: Vec<Type>, is_exception_exit: bool) -
     }
 }
 
-/// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr
+/// compile.py `ResumeGuardDescr` parity: a fresh guard descr
 /// carrying the post-numbering `fail_arg_types`. Used by
 /// `store_final_boxes_in_guard` to replace the tracer-stamped descr
 /// (whose `types` reflect the pre-numbering snapshot)
@@ -3476,7 +3476,7 @@ pub fn make_resume_guard_descr_range_foriter(green_key: u64) -> DescrRef {
 /// caller FOR_ITER key.  A guard-failure bridge uses the tag to keep the
 /// exception-to-exhaustion conversion on the generic residual path.
 ///
-/// `opcode` selects the subtype `compile.py:924-942 invent_fail_descr_for_op`
+/// `opcode` selects the subtype `compile.py invent_fail_descr_for_op`
 /// would have minted.  Stamping this descr fills `op.getdescr()`, and
 /// `store_final_boxes_in_guard` only invents on the empty arm — so a marker
 /// minted as a plain `ResumeGuardDescr` would cost a `GUARD_NOT_FORCED` its
@@ -3518,7 +3518,7 @@ fn resume_guard_inner(descr: &DescrRef) -> Option<&ResumeGuardDescr> {
         .map(|exc| &exc.inner)
 }
 
-/// compile.py:892: ResumeAtPositionDescr(ResumeGuardDescr) — subclass
+/// compile.py: ResumeAtPositionDescr(ResumeGuardDescr) — subclass
 /// with no additional fields or method overrides. Type tag only.
 ///
 /// In RPython, ResumeAtPositionDescr inherits all of ResumeGuardDescr's
@@ -3547,7 +3547,7 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
         // Hand out the inner ResumeGuardDescr so consumers that want to
         // read meta-side cells (e.g. recovery_layout) can downcast
         // uniformly across the subclass family — matching RPython's
-        // `compile.py:892` `class ResumeAtPositionDescr(ResumeGuardDescr)`
+        // `compile.py` `class ResumeAtPositionDescr(ResumeGuardDescr)`
         // shape where attribute access goes through the base.
         Some(&self.inner)
     }
@@ -3560,7 +3560,7 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
     fn is_resume_guard(&self) -> bool {
         true
     }
-    // compile.py:878-881: inherited ResumeGuardDescr.clone() →
+    // compile.py: inherited ResumeGuardDescr.clone() →
     // plain ResumeGuardDescr with copy_all_attributes_from(self).
     // Marker lost, resume data preserved.
     fn clone_descr(&self) -> Option<DescrRef> {
@@ -3783,11 +3783,11 @@ pub fn make_resume_at_position_descr() -> DescrRef {
     make_resume_at_position_descr_typed(Vec::new())
 }
 
-/// compile.py:945-948: ResumeGuardForcedDescr(ResumeGuardDescr) — subtype
+/// compile.py: ResumeGuardForcedDescr(ResumeGuardDescr) — subtype
 /// minted by `invent_fail_descr_for_op` for `GUARD_NOT_FORCED` /
 /// `GUARD_NOT_FORCED_2`. Upstream attaches `metainterp_sd` /
-/// `jitdriver_sd` via `_init` (compile.py:946-948) so
-/// `handle_async_forcing` (compile.py:986) can call back into resume
+/// `jitdriver_sd` via `_init` (compile.py) so
+/// `handle_async_forcing` (compile.py) can call back into resume
 /// during a residual call.
 ///
 /// PYRE-ADAPTATION: pyre's forced-guard handling currently routes
@@ -3832,7 +3832,7 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
     fn instance_next_foriter_green_key(&self) -> Option<u64> {
         self.inner.instance_next_foriter_green_key()
     }
-    /// compile.py:873-876 ResumeGuardDescr.clone() — `ResumeGuardForcedDescr`
+    /// compile.py ResumeGuardDescr.clone() — `ResumeGuardForcedDescr`
     /// inherits the base implementation (no override at compile.py:939+),
     /// so cloning produces a plain `ResumeGuardDescr` with resume attributes
     /// copied over via `copy_all_attributes_from`. The Forced subtype tag
@@ -4049,7 +4049,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
     })
 }
 
-/// compile.py:888-889: ResumeGuardExcDescr(ResumeGuardDescr) — subtype
+/// compile.py: ResumeGuardExcDescr(ResumeGuardDescr) — subtype
 /// minted by `invent_fail_descr_for_op` for `GUARD_EXCEPTION` /
 /// `GUARD_NO_EXCEPTION`. Upstream uses `pass` to make it a tag-only
 /// subclass; `handle_fail` routes the exception path off this tag.
@@ -4087,8 +4087,8 @@ impl majit_ir::Descr for ResumeGuardExcDescr {
     fn instance_next_foriter_green_key(&self) -> Option<u64> {
         self.inner.instance_next_foriter_green_key()
     }
-    /// compile.py:881-882 `class ResumeGuardExcDescr(ResumeGuardDescr): pass`
-    /// — no clone() override, so inheriting compile.py:873-876
+    /// compile.py `class ResumeGuardExcDescr(ResumeGuardDescr): pass`
+    /// — no clone() override, so inheriting compile.py
     /// `ResumeGuardDescr.clone()` produces a plain `ResumeGuardDescr` with
     /// resume attributes copied via `copy_all_attributes_from`. The Exc
     /// subtype tag is intentionally dropped.
@@ -4304,10 +4304,10 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
     })
 }
 
-/// compile.py:832-851: `ResumeGuardCopiedDescr(prev)` —
+/// compile.py: `ResumeGuardCopiedDescr(prev)` —
 /// shared-resume subtype minted by `invent_fail_descr_for_op` when
 /// `_copy_resume_data_from` shares a donor guard's resume data.
-/// `get_resumestorage()` (compile.py:849) returns the donor
+/// `get_resumestorage()` (compile.py) returns the donor
 /// `ResumeGuardDescr` so reads chase through to the original
 /// `rd_numb` / `rd_consts` / `rd_virtuals` / `rd_pendingfields`.
 ///
@@ -4318,12 +4318,12 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
 #[derive(Debug)]
 pub struct ResumeGuardCopiedDescr {
     fail_index: u32,
-    /// compile.py:836: `assert isinstance(prev, ResumeGuardDescr)`.
+    /// compile.py: `assert isinstance(prev, ResumeGuardDescr)`.
     /// pyre keeps the donor as a `DescrRef` so chained sharing
     /// (`prev.prev` etc.) can be walked uniformly through
     /// `prev_descr()` until a non-copied descr is reached.
     ///
-    /// `compile.py:840-842 ResumeGuardCopiedDescr.copy_all_attributes_from`
+    /// `compile.py ResumeGuardCopiedDescr.copy_all_attributes_from`
     /// mutates `self.prev = other.prev` in place, preserving the
     /// receiver's identity (`fail_index` / status).  Pyre wraps it in
     /// `UnsafeCell` so the optimizer-side helper can swap the donor
@@ -4337,7 +4337,7 @@ pub struct ResumeGuardCopiedDescr {
     /// guard owns its own vector-info chain (history.py:143
     /// `attach_vector_info` writes `self.rd_vector_info`).
     vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
-    /// `history.py:132` `AbstractFailDescr._attrs_` — copied descrs
+    /// `history.py` `AbstractFailDescr._attrs_` — copied descrs
     /// share their donor's *resume* payload via `prev` (`compile.py:849
     /// get_resumestorage(): return prev`), but `adr_jump_offset` is
     /// written per-fail at codegen time (`assembler.py:849`), so each
@@ -4345,18 +4345,18 @@ pub struct ResumeGuardCopiedDescr {
     /// above (history.py:143 writes `self.rd_vector_info`, not
     /// `prev.rd_vector_info`).
     adr_jump_offset: UnsafeCell<usize>,
-    /// `history.py:132` `_attrs_` `rd_locs` — same per-fail scoping
+    /// `history.py` `_attrs_` `rd_locs` — same per-fail scoping
     /// as `adr_jump_offset`.
     rd_locs: UnsafeCell<Vec<u16>>,
-    /// `compile.py:683` `AbstractResumeGuardDescr._attrs_` `status` —
+    /// `compile.py` `AbstractResumeGuardDescr._attrs_` `status` —
     /// each copied descr carries its own status (the copied receiver is
     /// retraced independently of the donor).
     status: AtomicU64,
-    /// `compile.py:186` `descr.rd_loop_token = clt`.  Copied descrs are
+    /// `compile.py` `descr.rd_loop_token = clt`.  Copied descrs are
     /// stamped per-guard by the same `record_loop_or_bridge` walker
-    /// (`compile.py:185 isinstance(descr, ResumeDescr)` covers
+    /// (`compile.py isinstance(descr, ResumeDescr)` covers
     /// `ResumeGuardCopiedDescr` — `_attrs_` lists `rd_loop_token`
-    /// directly on `AbstractFailDescr` at history.py:125, owned by
+    /// directly on `AbstractFailDescr` at history.py, owned by
     /// the receiver, not chased through `prev`).
     rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<CompiledLoopToken>>>,
     /// Pyre-only owning-trace identifier — same role as on
@@ -4388,7 +4388,7 @@ pub struct ResumeGuardCopiedDescr {
     back_edge_poll: std::sync::atomic::AtomicBool,
     /// Pyre-only per-emission failure counter for bridge compilation
     /// thresholds.  PyPy carries the equivalent jitcounter hash in
-    /// `compile.py:683 AbstractResumeGuardDescr._attrs_ ('status',)`
+    /// `compile.py AbstractResumeGuardDescr._attrs_ ('status',)`
     /// — each copied descr has its own status, retracing
     /// independently of the donor.  Owned per copied descr so each
     /// copy's failures accrue separately.
@@ -4396,7 +4396,7 @@ pub struct ResumeGuardCopiedDescr {
     /// Pyre-only per-emission `CompiledTraceInfo` cell.  Same shape
     /// and atomic-swap discipline as
     /// `ResumeGuardDescr::trace_info`.  Per-emission because
-    /// `record_loop_or_bridge` (compile.py:185-186) stamps the
+    /// `record_loop_or_bridge` (compile.py) stamps the
     /// loop-token-equivalent metadata onto each emitted descr
     /// individually; the cell is reclaimed in `Drop`.
     trace_info: std::sync::atomic::AtomicPtr<CompiledTraceInfo>,
@@ -4405,7 +4405,7 @@ pub struct ResumeGuardCopiedDescr {
     /// `Arc::clone` of the meta descr and can be baked into cranelift's
     /// `emit_attached_bridge_dispatch` as an immediate.  Per-emission
     /// because each copied descr can have its own bridge attached
-    /// (compile.py:701-717 `handle_fail` applies to both
+    /// (compile.py `handle_fail` applies to both
     /// ResumeGuardDescr and ResumeGuardCopiedDescr).  `0` means no
     /// bridge attached.
     bridge_code_ptr_cache: Box<std::sync::atomic::AtomicUsize>,
@@ -4513,12 +4513,12 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
     fn set_prev_descr(&self, prev: DescrRef) {
         self.set_prev(prev);
     }
-    /// compile.py:843-846: `clone()` constructs a fresh
+    /// compile.py: `clone()` constructs a fresh
     /// `ResumeGuardCopiedDescr(self.prev)` — identity on `prev` is
     /// preserved (Arc share), only `fail_index` is fresh.
     fn clone_descr(&self) -> Option<DescrRef> {
-        // history.py:127 `rd_vector_info = None` is the class default;
-        // `clone()` does not copy it (compile.py:843-846 only forwards
+        // history.py `rd_vector_info = None` is the class default;
+        // `clone()` does not copy it (compile.py only forwards
         // `prev`).  Mint a fresh empty chain.
         Some(Arc::new(ResumeGuardCopiedDescr {
             fail_index: alloc_fail_index(),
@@ -4562,7 +4562,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
         self.fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
     }
-    /// compile.py:849 `get_resumestorage(): return prev`: reads chase
+    /// compile.py `get_resumestorage(): return prev`: reads chase
     /// to the donor.  The `fail_arg_types` slot is shared too —
     /// upstream stores the type list on the donor `ResumeGuardDescr`,
     /// which `prev` references.
@@ -4585,9 +4585,9 @@ impl FailDescr for ResumeGuardCopiedDescr {
              copied descrs share their donor's type vector via prev"
         );
     }
-    /// history.py:150 `AbstractFailDescr.attach_vector_info`: writes
+    /// history.py `AbstractFailDescr.attach_vector_info`: writes
     /// `self.rd_vector_info`, never `self.prev`.  `prev` is for resume
-    /// storage only (compile.py:849 `get_resumestorage`); vector info
+    /// storage only (compile.py `get_resumestorage`); vector info
     /// lives on the copied descr itself.
     fn attach_vector_info(&self, info: AccumInfo) {
         push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
@@ -4599,7 +4599,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
         unsafe { *self.vector_info.get() = build_vector_info_chain(chain) }
     }
 
-    // compile.py:849 `get_resumestorage(): return prev` — every rd_*
+    // compile.py `get_resumestorage(): return prev` — every rd_*
     // read chases through to the donor descr.  Setters panic for the
     // same reason `set_fail_arg_types` does: `_copy_resume_data_from`
     // never finalizes a copied descr; mutation must go through the
@@ -4810,7 +4810,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
     }
 }
 
-/// compile.py:891-892: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
+/// compile.py: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
 /// — exception variant of the shared-resume descr, minted by
 /// `invent_fail_descr_for_op` for `GUARD_EXCEPTION` /
 /// `GUARD_NO_EXCEPTION` on the sharing path.
@@ -5072,11 +5072,11 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
 /// Mint a `ResumeGuardCopiedExcDescr` for the GUARD_EXCEPTION /
 /// GUARD_NO_EXCEPTION sharing path.
 ///
-/// compile.py:889-890 `ResumeGuardCopiedExcDescr` inherits
+/// compile.py `ResumeGuardCopiedExcDescr` inherits
 /// `ResumeGuardCopiedDescr.__init__`, so the same
 /// `isinstance(prev, ResumeGuardDescr)` invariant applies.
 pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
-    // compile.py:889-890 `class ResumeGuardCopiedExcDescr(...)` inherits
+    // compile.py `class ResumeGuardCopiedExcDescr(...)` inherits
     // `ResumeGuardCopiedDescr.__init__`; same `isinstance(prev,
     // ResumeGuardDescr)` invariant.
     assert!(
@@ -5110,14 +5110,14 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
     })
 }
 
-/// `compile.py:861-867 ResumeGuardDescr.copy_all_attributes_from` +
-/// `compile.py:840-842 ResumeGuardCopiedDescr.copy_all_attributes_from`
+/// `compile.py ResumeGuardDescr.copy_all_attributes_from` +
+/// `compile.py ResumeGuardCopiedDescr.copy_all_attributes_from`
 /// dispatched on the receiver's variant.  Mutates `my_descr` in place;
 /// the receiver's identity (`fail_index` / status / subtype tag) is
 /// always preserved.
 ///
-/// Used by `optimizer.py:713-720 replace_guard_op` and
-/// `guard.py:120-121 inhert_attributes` — both call
+/// Used by `optimizer.py replace_guard_op` and
+/// `guard.py inhert_attributes` — both call
 /// `new_descr.copy_all_attributes_from(old_descr)` on a guard whose
 /// own descr is already in place.
 ///
@@ -5126,11 +5126,11 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
 /// / `ResumeGuardForcedDescr`): copy `rd_numb` / `rd_consts` / `rd_virtuals`
 /// / `rd_pendingfields` / `rd_vector_info` from the donor onto self via
 /// descr-side setters.  `donor.rd_*()` chases through
-/// `ResumeGuardCopiedDescr.prev` automatically (`compile.py:861 other =
+/// `ResumeGuardCopiedDescr.prev` automatically (`compile.py other =
 /// other.get_resumestorage()`).
 ///
 /// `Copied` self (`ResumeGuardCopiedDescr` / `ResumeGuardCopiedExcDescr`):
-/// `compile.py:840-842` overwrites `self.prev = other.prev` in place.
+/// `compile.py` overwrites `self.prev = other.prev` in place.
 /// Pyre stores `prev` in `UnsafeCell<DescrRef>` and exposes
 /// `set_prev_descr(&self, prev)` so the swap preserves the receiver's
 /// `fail_index` and subtype tag — observable from guard failure tables
@@ -5142,7 +5142,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
 /// ResumeGuardCopiedDescr)`).
 pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
     if my_descr.is_resume_guard_copied() {
-        // compile.py:840-842 ResumeGuardCopiedDescr.copy_all_attributes_from:
+        // compile.py ResumeGuardCopiedDescr.copy_all_attributes_from:
         //     assert isinstance(other, ResumeGuardCopiedDescr)
         //     self.prev = other.prev
         let donor_prev = donor_descr
@@ -5150,7 +5150,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
             .expect("compile.py:841 other must be a ResumeGuardCopiedDescr with a prev");
         my_descr.set_prev_descr(donor_prev);
     } else {
-        // compile.py:861-872 ResumeGuardDescr.copy_all_attributes_from:
+        // compile.py ResumeGuardDescr.copy_all_attributes_from:
         //     other = other.get_resumestorage()
         //     assert isinstance(other, ResumeGuardDescr)
         //     self.rd_consts = other.rd_consts
@@ -5160,7 +5160,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
         //     # we don't copy status
         //     if other.rd_vector_info:
         //         self.rd_vector_info = other.rd_vector_info.clone()
-        // compile.py:862 `other = other.get_resumestorage()`: copied
+        // compile.py `other = other.get_resumestorage()`: copied
         // donors route reads through `prev`. Resolve the chain so we
         // never deep-copy from a copied descr's empty payload.
         let resolved_donor = if donor_descr.is_resume_guard_copied() {
@@ -5170,7 +5170,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
         } else {
             donor_descr.clone()
         };
-        // compile.py:863 `assert isinstance(other, ResumeGuardDescr)` —
+        // compile.py `assert isinstance(other, ResumeGuardDescr)` —
         // post-resolution donor must be a ResumeGuardDescr (or subclass).
         assert!(
             resolved_donor.is_resume_guard(),
@@ -5193,7 +5193,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
         my_fd.set_rd_consts_arc(donor_fd.rd_consts_arc());
         my_fd.set_rd_virtuals_arc(donor_fd.rd_virtuals_arc());
         my_fd.set_rd_pendingfields_arc(donor_fd.rd_pendingfields_arc());
-        // compile.py:869-870 — chain.clone() preserves the donor's
+        // compile.py — chain.clone() preserves the donor's
         // (already-flattened) accumulator chain on self, identity-stable.
         let donor_chain = donor_fd.vector_info();
         if !donor_chain.is_empty() {
@@ -5202,7 +5202,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
     }
 }
 
-/// compile.py:895-908: CompileLoopVersionDescr(ResumeGuardDescr)
+/// compile.py: CompileLoopVersionDescr(ResumeGuardDescr)
 ///
 /// A guard descriptor for loop-version guards. These guards must never
 /// fail at runtime — they exist only to mark where a specialized loop
@@ -5214,7 +5214,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
 /// source_op_index, trace_info, fail_count,
 /// external_jump_target, bridge_*) the cranelift codegen path reads
 /// off every guard descr at `collect_guards` / dispatch emission.
-/// Same shape as `ResumeAtPositionDescr` (compile.py:892).
+/// Same shape as `ResumeAtPositionDescr` (compile.py).
 #[derive(Debug)]
 pub struct CompileLoopVersionDescr {
     inner: ResumeGuardDescr,
@@ -5242,7 +5242,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
     fn is_resume_guard(&self) -> bool {
         true
     }
-    /// compile.py:905-908: CompileLoopVersionDescr.clone() — overrides
+    /// compile.py: CompileLoopVersionDescr.clone() — overrides
     /// the inherited `ResumeGuardDescr.clone()` to mint a fresh
     /// `CompileLoopVersionDescr` (preserving the marker).  Resume data
     /// and types are copied via the base clone's `copy_all_attributes_from`
@@ -5491,7 +5491,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
     })
 }
 
-/// compile.py:895-897: a fresh CompileLoopVersionDescr with no copied
+/// compile.py: a fresh CompileLoopVersionDescr with no copied
 /// resume payload. Used by vector.py:588-591 when the early-exit guard
 /// has no donor descr to copy from.
 pub fn make_compile_loop_version_descr_typed(types: Vec<Type>) -> DescrRef {
@@ -5507,7 +5507,7 @@ pub fn make_compile_loop_version_descr() -> DescrRef {
 ///   descr.copy_all_attributes_from(self.op.getdescr())
 ///   descr.rd_vector_info = None
 ///
-/// Creates a fresh CompileLoopVersionDescr.  rd_* (compile.py:855
+/// Creates a fresh CompileLoopVersionDescr.  rd_* (compile.py
 /// `_attrs_`) are reference-shared from the source descr via the
 /// `_arc` getters — same semantics as `copy_all_attributes_from`
 /// (compile.py:861-867).  `rd_vector_info` is reset to None per
@@ -5523,7 +5523,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
     let src_descr = source_op
         .getdescr()
         .expect("guard.py:90: self.op.getdescr() must exist");
-    // compile.py:862 `other = other.get_resumestorage()`: if the source
+    // compile.py `other = other.get_resumestorage()`: if the source
     // is a `ResumeGuardCopiedDescr`, resolve to its `prev` so we read
     // resume data from the canonical donor.  ResumeGuardDescr's
     // `get_resumestorage` returns self, so direct sources pass through
@@ -5535,7 +5535,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
     } else {
         src_descr.clone()
     };
-    // compile.py:863 `assert isinstance(other, ResumeGuardDescr)`:
+    // compile.py `assert isinstance(other, ResumeGuardDescr)`:
     // reject non-resume FailDescr (e.g. `SimpleFailDescr`) that would
     // otherwise yield an empty rd_* payload on the loop-version descr.
     assert!(
@@ -5549,7 +5549,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
         .as_fail_descr()
         .expect("compile.py:863 ResumeGuardDescr is also a FailDescr");
     let types = src_fd.fail_arg_types().to_vec();
-    // compile.py:861-872 copy_all_attributes_from copies rd_*; mirror
+    // compile.py copy_all_attributes_from copies rd_*; mirror
     // RPython's reference-share by reusing the donor's `Arc<[T]>`
     // slots — `Arc::clone` only bumps a refcount.
     let payload = RdPayload::from_arcs(
@@ -5577,7 +5577,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 // `MetaInterp` (pyjitpl.py) owns both the struct and the list.
 
 impl TraceCtx {
-    /// pyjitpl.py:2994-2997 reverse `same_greenkey` scan.
+    /// pyjitpl.py reverse `same_greenkey` scan.
     ///
     /// Pyre's typed `green_key: u64` already collapses the
     /// `same_greenkey` element-wise compare into hash equality (the
@@ -5655,7 +5655,7 @@ impl TraceCtx {
     }
 
     /// `key_typed` is the green key `key` is the `JitCell.get_uhash` of
-    /// (warmstate.py:585-593 `def get_uhash(*greenargs)`). It travels with the
+    /// (warmstate.py `def get_uhash(*greenargs)`). It travels with the
     /// hash because the trace-segmenting consumers of this entry
     /// (`mark_force_finish_tracing`, `disable_noninlinable_function`) reach a
     /// cell to write flags on, and a cell reached by hash alone is installed
@@ -5731,11 +5731,11 @@ impl TraceCtx {
         self.current_merge_points.first().map(|mp| mp.green_key)
     }
 
-    /// pyjitpl.py:2994 same_greenkey + header identity: check if a specific
+    /// pyjitpl.py same_greenkey + header identity: check if a specific
     /// loop header (key, header_pc) was already visited.
     ///
     /// TODO: pyre disambiguates loop headers by
-    /// `(green_key, header_pc)`. RPython's `same_greenkey` (`pyjitpl.py:2994`)
+    /// `(green_key, header_pc)`. RPython's `same_greenkey` (`pyjitpl.py`)
     /// matches by Python box identity over a structural greenkey tuple;
     /// pyre's `make_green_key` collapses `(PyCode*, pc)` into a
     /// `u64`, losing the per-header identity, so the explicit `header_pc`
@@ -5773,7 +5773,7 @@ impl TraceCtx {
 
     /// pyjitpl.py:2988 + header identity: find merge point by (key, header_pc),
     /// searching in reverse order (most recent first).
-    /// pyjitpl.py:3039-3041 `compile_loop(original_boxes, live_arg_boxes,
+    /// pyjitpl.py `compile_loop(original_boxes, live_arg_boxes,
     /// start)`: the closing JUMP's args belong to the label of the loop being
     /// CLOSED — `original_boxes`, taken from the merge point that matched —
     /// not to the trace's own inputargs. The two name the same list only when
@@ -5798,7 +5798,7 @@ impl TraceCtx {
             .map(|mp| mp.green_boxes.iter().map(|green| green.ty).collect())
     }
 
-    /// `pyjitpl.py:3021 same_greenkey(original_boxes, live_arg_boxes,
+    /// `pyjitpl.py same_greenkey(original_boxes, live_arg_boxes,
     /// num_green_args)` — the loop header the trace is closing ON, read from
     /// the greens it closes WITH.
     ///
@@ -5818,7 +5818,7 @@ impl TraceCtx {
         {
             Some(pc) => pc as usize,
             None => {
-                // `pyjitpl.py:3021 same_greenkey(original_boxes,
+                // `pyjitpl.py same_greenkey(original_boxes,
                 // live_arg_boxes, num_green_args)` always compares the actual
                 // closing boxes; upstream has no header-pc fallback. Slot 56
                 // counts every firing so a corpus reading 0 can promote this
@@ -5875,7 +5875,7 @@ impl TraceCtx {
         self.inline_frames.contains(&target)
     }
 
-    /// pyjitpl.py:1389-1402 `_opimpl_recursive_call` element-wise walk:
+    /// pyjitpl.py `_opimpl_recursive_call` element-wise walk:
     ///
     /// ```python
     /// count = 0
@@ -6002,7 +6002,7 @@ mod fail_descr_tests {
         assert_eq!(d.as_fail_descr().unwrap().fail_arg_types(), &types);
     }
 
-    /// `compile.py:869 ResumeGuardDescr.store_final_boxes` parity:
+    /// `compile.py ResumeGuardDescr.store_final_boxes` parity:
     /// `store_final_boxes_in_guard` mutates types in place, preserving
     /// the descr's `Arc` identity, `fail_index`, and concrete subtype.
     #[test]
@@ -6131,9 +6131,9 @@ mod fail_descr_tests {
             &[Type::Float]
         );
 
-        // compile.py:873-876 ResumeGuardDescr.clone() returns a plain
-        // ResumeGuardDescr — both `ResumeGuardForcedDescr` (compile.py:939+,
-        // no clone override) and `ResumeGuardExcDescr` (compile.py:881-882
+        // compile.py ResumeGuardDescr.clone() returns a plain
+        // ResumeGuardDescr — both `ResumeGuardForcedDescr` (compile.py+,
+        // no clone override) and `ResumeGuardExcDescr` (compile.py
         // `pass`) inherit this base implementation, so the subtype tag is
         // intentionally dropped on clone. Resume attributes / fail_arg_types
         // are copied; fail_index is fresh.
@@ -6156,7 +6156,7 @@ mod fail_descr_tests {
         );
     }
 
-    /// compile.py:832-851 ResumeGuardCopiedDescr(prev) parity:
+    /// compile.py ResumeGuardCopiedDescr(prev) parity:
     /// The instance-next FOR_ITER marker key must stay readable no matter
     /// which subtype the guard's opcode selects.  Two consumers depend on it:
     /// guard-failure routing keys the FOR_ITER handling on it, and

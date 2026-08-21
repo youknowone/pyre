@@ -667,7 +667,7 @@ thread_local! {
     /// collected here and handed to the embedder separately from stdout.
     static ERR_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     /// Process status the run ends with: 0, or `SystemExit`'s code, or 1 for
-    /// an uncaught exception. `targetpypystandalone.py:37 entry_point` returns
+    /// an uncaught exception. `targetpypystandalone.py entry_point` returns
     /// the same value; the embedder exits with it.
     static EXIT_CODE: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     /// Path the source came from, if the embedder named one. The guest is
@@ -1236,7 +1236,7 @@ mod host_abi {
 
     /// Status the last `pyre_run_python` ended with: `SystemExit`'s code, 1 for
     /// an uncaught exception or a `SyntaxError`, else 0. The host exits with
-    /// it, as `pyrex` does with `targetpypystandalone.py:37 entry_point`'s
+    /// it, as `pyrex` does with `targetpypystandalone.py entry_point`'s
     /// return value.
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_exit_code() -> i32 {

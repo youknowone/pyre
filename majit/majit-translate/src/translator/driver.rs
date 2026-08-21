@@ -87,7 +87,7 @@ use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::targetspec::TargetSpecDict;
 use crate::translator::timing::{SystemClock, Timer};
 
-/// Upstream `driver.py:19` `log = AnsiLogger("translation")`.  Module-
+/// Upstream `driver.py` `log = AnsiLogger("translation")`.  Module-
 /// level logger for the translation driver; `TranslationDriver::info`
 /// dispatches through this static.
 pub static LOG: AnsiLogger = AnsiLogger::new("translation");
@@ -226,7 +226,7 @@ impl LibDef {
 pub use crate::translator::backend::CBuilderRef;
 pub use crate::translator::backend::database::LowLevelDatabase as DatabaseState;
 
-// Upstream `entrypoint.py:1`: `secondary_entrypoints = {"main": []}`.
+// Upstream `entrypoint.py`: `secondary_entrypoints = {"main": []}`.
 // Stored thread-local because `Rc<dyn Any>` is not `Sync`.
 thread_local! {
     static SECONDARY_ENTRYPOINTS: RefCell<HashMap<String, Vec<EntryPointSpec>>> = {
@@ -236,7 +236,7 @@ thread_local! {
     };
 }
 
-/// Read-only view of upstream `entrypoint.py:1 secondary_entrypoints`.
+/// Read-only view of upstream `entrypoint.py secondary_entrypoints`.
 /// Returns the entries registered under `key` or `None` matching
 /// upstream's `KeyError` raise path on a missing key.
 pub fn secondary_entrypoints_get(key: &str) -> Option<Vec<EntryPointSpec>> {
@@ -279,19 +279,19 @@ pub fn secondary_entrypoints_keys() -> Vec<String> {
     SECONDARY_ENTRYPOINTS.with(|s| s.borrow().keys().cloned().collect())
 }
 
-// Upstream `entrypoint.py:8`: `annotated_jit_entrypoints = []`.
+// Upstream `entrypoint.py`: `annotated_jit_entrypoints = []`.
 thread_local! {
     static ANNOTATED_JIT_ENTRYPOINTS: RefCell<Vec<EntryPointSpec>> =
         RefCell::new(Vec::new());
 }
 
-/// Read-only view of upstream `entrypoint.py:8 annotated_jit_entrypoints`.
+/// Read-only view of upstream `entrypoint.py annotated_jit_entrypoints`.
 pub fn annotated_jit_entrypoints_get() -> Vec<EntryPointSpec> {
     ANNOTATED_JIT_ENTRYPOINTS.with(|s| s.borrow().clone())
 }
 
 /// Typed registration helper for upstream
-/// `entrypoint.py:8 annotated_jit_entrypoints.append((func, argtypes))`.
+/// `entrypoint.py annotated_jit_entrypoints.append((func, argtypes))`.
 /// Same shape as [`secondary_entrypoints_register`] — see that helper's
 /// doc for the typed → opaque-slot conversion rationale.
 pub fn annotated_jit_entrypoints_register(
@@ -483,7 +483,7 @@ pub struct TranslationDriver {
     /// Strong holder for the annotator across the task chain.
     ///
     /// TODO (Rust-language): upstream stores
-    /// `translator.annotator = self` (annrpython.py:30-35) as a
+    /// `translator.annotator = self` (annrpython.py) as a
     /// strong Python attribute; CPython's cyclic GC unwinds the
     /// `translator → annotator → translator` cycle on session exit.
     /// The local `TranslationContext.annotator` is `Weak` to avoid
@@ -1069,7 +1069,7 @@ impl TranslationDriver {
         // Upstream `:191-194`: pick `empty_translator` or build one.
         // When we build, take a snapshot of the driver's `Rc<Config>`
         // so any `override` / `setopts` mutations performed before
-        // `setup` (`driver.py:81-85`) are visible inside the
+        // `setup` (`driver.py`) are visible inside the
         // translator's `config.translation.<X>` reads.
         let translator: Rc<super::translator::TranslationContext> = match empty_translator {
             Some(t) => t,
@@ -2308,7 +2308,7 @@ mod tests {
         HostObject::new_user_function(GraphFunc::new(name, globals))
     }
 
-    /// Mirrors `rpython/translator/test/test_driver.py:7-19 test_ctr`.
+    /// Mirrors `rpython/translator/test/test_driver.py test_ctr`.
     /// Verifies the default-construction `expected` set + the
     /// `backend_select_goals` resolution table.
     #[test]
@@ -2588,7 +2588,7 @@ mod tests {
         // dispatches into `crate::translator::backendopt::all`; default
         // backendopt config has `mallocs=True`, so the first unported
         // subpass to fire after the implemented `all.py` scaffolding is
-        // `malloc.py:553 remove_mallocs`.
+        // `malloc.py remove_mallocs`.
         let td = TranslationDriver::new_default().expect("driver");
         td.setup(None, None, None, HashMap::new(), None)
             .expect("setup");
@@ -2694,7 +2694,7 @@ mod tests {
     }
 
     /// `secondary_entrypoints_register` mirrors upstream
-    /// `entrypoint.py:1 secondary_entrypoints.setdefault(key,
+    /// `entrypoint.py secondary_entrypoints.setdefault(key,
     /// []).append(...)`. The typed (HostObject, Vec<AnnotationSpec>)
     /// shape downcasts back at `task_annotate :308-312` consume time.
     #[test]

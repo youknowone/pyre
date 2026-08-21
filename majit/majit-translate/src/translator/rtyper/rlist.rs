@@ -37,7 +37,7 @@ use crate::translator::rtyper::rtyper::{
 };
 
 /// RPython `class FixedSizeListRepr(AbstractFixedSizeListRepr,
-/// BaseListRepr)` (`lltypesystem/rlist.py:173-187`):
+/// BaseListRepr)` (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// def _setup_repr(self):
@@ -92,7 +92,7 @@ impl FixedSizeListRepr {
     }
 }
 
-/// RPython `AbstractBaseListRepr.recast(self, llops, v)` (`rlist.py:67-68`):
+/// RPython `AbstractBaseListRepr.recast(self, llops, v)` (`rlist.py`):
 ///
 /// ```python
 /// def recast(self, llops, v):
@@ -150,7 +150,7 @@ impl Repr for FixedSizeListRepr {
     ///
     /// `FixedSizeListRepr` is only minted for the non-resized case, so
     /// the lowering is the `ll_len_foldable` path: `l.ll_length()` →
-    /// `ll_fixed_length` (`lltypesystem/rlist.py:395-396`) = `len(l)` =
+    /// `ll_fixed_length` (`lltypesystem/rlist.py`) = `len(l)` =
     /// the `getarraysize` op on the `Ptr(GcArray)` receiver. The
     /// `len_foldable` oopspec is a tracing-time JIT hint; the lowered
     /// op is the bare `getarraysize`.
@@ -198,7 +198,7 @@ impl Repr for FixedSizeListRepr {
     /// the index before dispatching to that fast helper. Rust slice indexing
     /// only ever exercises the nonneg + `dum_nocheck` path.
     ///
-    /// The upstream result `recast` (`rlist.py:266`
+    /// The upstream result `recast` (`rlist.py`
     /// `return r_lst.recast(hop.llops, v_res)`) is applied via
     /// [`list_recast`]: `convertvar(v_res, item_repr, external_item_repr)`.
     /// For the primitive items a live subject builds `external == internal`
@@ -240,7 +240,7 @@ impl Repr for FixedSizeListRepr {
     /// (`ll_setitem_nonneg(dum_nocheck, l, index, item)`, no IndexError
     /// branch — `index >= 0` is a debug `ll_assert`) collapses through
     /// `l.ll_setitem_fast` → `ll_fixed_setitem_fast(l, index, item)` →
-    /// `l[index] = item` (`lltypesystem/rlist.py:407-410`) to the bare
+    /// `l[index] = item` (`lltypesystem/rlist.py`) to the bare
     /// `setarrayitem` on the `Ptr(GcArray)` receiver; the negative-index
     /// (`ll_fixed_setitem`) and `checkidx` (IndexError-raising
     /// `ll_fixed_setitem_*_checked`) helpers fold / window the index first.
@@ -267,7 +267,7 @@ impl Repr for FixedSizeListRepr {
     ///     hop.gendirectcall(ll_reverse, v_lst)
     /// ```
     ///
-    /// `ll_reverse` (`rlist.py:677-686`) is an in-place swap loop over the
+    /// `ll_reverse` (`rlist.py`) is an in-place swap loop over the
     /// `FixedSizeListRepr` receiver (the bare `Ptr(GcArray)`): it reads both
     /// endpoints, writes them crossed, and walks `i` up / `length_1_i` down
     /// toward the middle. The lowered body is the multi-block CFG built by
@@ -275,7 +275,7 @@ impl Repr for FixedSizeListRepr {
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             // `is_null` is the lltype `_ptr` nullity probe on the list
-            // backing pointer — lower it as `ptr_iszero` (opimpl.py:134-136
+            // backing pointer — lower it as `ptr_iszero` (opimpl.py
             // `op_ptr_iszero`), matching the `ptr_method_is_null` bound
             // method the annotator seats on pointer-carrying receivers.
             "is_null" => {
@@ -368,7 +368,7 @@ impl Repr for FixedSizeListRepr {
     }
 }
 
-/// RPython `class AbstractListIteratorRepr(IteratorRepr)` (`rlist.py:437`).
+/// RPython `class AbstractListIteratorRepr(IteratorRepr)` (`rlist.py`).
 ///
 /// Concrete list iterator layouts live in the lltypesystem-specific module.
 /// The generic iterator lowering methods are still deferred.
@@ -379,8 +379,8 @@ fn rlist_runtime_deferred(name: &str) -> TyperError {
     TyperError::missing_rtype_operation(format!("rlist.{name} — list helper deferred"))
 }
 
-/// RPython `rtype_newlist(hop, v_sizehint=None)` (`rlist.py:30-40`) +
-/// `newlist(llops, r_list, items_v, v_sizehint=None)` (`rlist.py:44-66`):
+/// RPython `rtype_newlist(hop, v_sizehint=None)` (`rlist.py`) +
+/// `newlist(llops, r_list, items_v, v_sizehint=None)` (`rlist.py`):
 ///
 /// ```python
 /// def rtype_newlist(hop, v_sizehint=None):
@@ -528,7 +528,7 @@ fn rtype_newlist_layout(
     Ok(Some(v_result))
 }
 
-/// RPython `rtype_alloc_and_set(hop)` (`rlist.py:346-351`):
+/// RPython `rtype_alloc_and_set(hop)` (`rlist.py`):
 ///
 /// ```python
 /// def rtype_alloc_and_set(hop):
@@ -751,7 +751,7 @@ fn build_alloc_and_set_family(
         )?
     };
 
-    // _ll_alloc_and_set_nonnull(LIST, count, item) (rlist.py:530-537).
+    // _ll_alloc_and_set_nonnull(LIST, count, item) (rlist.py).
     let nonnull = {
         let ptr = ptr_lltype.clone();
         let newlist_fn = functionptr_const(rtyper, &newlist)?;
@@ -773,7 +773,7 @@ fn build_alloc_and_set_family(
         )?
     };
 
-    // _ll_alloc_and_set_jit(LIST, count, item) (rlist.py:510-520).
+    // _ll_alloc_and_set_jit(LIST, count, item) (rlist.py).
     let jit = {
         let ptr = ptr_lltype.clone();
         let clear_fn = functionptr_const(rtyper, &clear)?;
@@ -795,7 +795,7 @@ fn build_alloc_and_set_family(
         )?
     };
 
-    // _ll_alloc_and_set_nojit(LIST, count, item) (rlist.py:494-508).
+    // _ll_alloc_and_set_nojit(LIST, count, item) (rlist.py).
     let nojit = {
         let ptr = ptr_lltype.clone();
         let newlist_fn = functionptr_const(rtyper, &newlist)?;
@@ -1157,7 +1157,7 @@ impl Repr for ListRepr {
     }
 
     /// RPython `AbstractBaseListRepr.rtype_len(self, hop)`
-    /// (`rlist.py:124-130`): the resized list takes the `ll_len`
+    /// (`rlist.py`): the resized list takes the `ll_len`
     /// (non-foldable) branch, which reads the struct `length` field —
     /// `ll_length(l)` = `l.length` (`lltypesystem/rlist.py` ADTIList).
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
@@ -1180,7 +1180,7 @@ impl Repr for ListRepr {
     /// [`FixedSizeListRepr::rtype_getitem`] (nonneg + `dum_nocheck` fast
     /// path, `ll_getitem_nonneg` → `l.ll_getitem_fast(index)`), but the
     /// resized receiver is the `Ptr(GcStruct("list", length, items))`
-    /// header, so `ll_getitem_fast` (`lltypesystem/rlist.py:259-262`) reads
+    /// header, so `ll_getitem_fast` (`lltypesystem/rlist.py`) reads
     /// the `items` array out of the struct first
     /// (`l.ll_items()[index]` = `getfield(l, "items")` then
     /// `getarrayitem`). The negative-index (`ll_getitem`) and `checkidx`
@@ -1188,7 +1188,7 @@ impl Repr for ListRepr {
     /// index before dispatching to that fast helper — all selected by the
     /// shared [`list_rtype_getitem`].
     ///
-    /// The upstream result `recast` (`rlist.py:266`) is applied via
+    /// The upstream result `recast` (`rlist.py`) is applied via
     /// [`list_recast`] — identical to `FixedSizeListRepr`: an identity
     /// short-circuit for the primitive items a live subject builds, a
     /// `cast_pointer` downcast for a gc-instance element list.
@@ -1209,7 +1209,7 @@ impl Repr for ListRepr {
     /// `ll_setitem_nonneg` → `l.ll_setitem_fast(index, item)`), but the
     /// resized receiver reads the `items` array out of the
     /// `Ptr(GcStruct("list", length, items))` header first
-    /// (`lltypesystem/rlist.py:264-267` `l.ll_items()[index] = item` =
+    /// (`lltypesystem/rlist.py` `l.ll_items()[index] = item` =
     /// `getfield(l, "items")` then `setarrayitem`). The negative-index
     /// (`ll_setitem`) and `checkidx` (IndexError-raising
     /// `ll_setitem_*_checked`) helpers fold / window the index before
@@ -1238,7 +1238,7 @@ impl Repr for ListRepr {
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             // `is_null` is the lltype `_ptr` nullity probe on the list
-            // header pointer — lower it as `ptr_iszero` (opimpl.py:134-136
+            // header pointer — lower it as `ptr_iszero` (opimpl.py
             // `op_ptr_iszero`), matching the `ptr_method_is_null` bound
             // method the annotator seats on pointer-carrying receivers.
             "is_null" => {
@@ -1357,7 +1357,7 @@ impl Repr for ListRepr {
                 hop.gendirectcall(&append, vargs)
             }
             "extend" => {
-                // RPython `AbstractListRepr.rtype_method_extend` (rlist.py:204):
+                // RPython `AbstractListRepr.rtype_method_extend` (rlist.py):
                 //
                 // ```python
                 // def rtype_method_extend(self, hop):
@@ -1433,7 +1433,7 @@ impl Repr for ListRepr {
                     )?
                 };
                 // The general `rgc.ll_arraycopy(src, dst, src_start,
-                // dst_start, length)` (rgc.py:365) — extend copies the source
+                // dst_start, length)` (rgc.py) — extend copies the source
                 // into `l1.items[len1 ..]`, so `dst_start = len1 != 0` and the
                 // start=0 specialisation used by append's resize does not fit.
                 let arraycopy_range = {
@@ -1594,7 +1594,7 @@ pub(crate) fn build_ll_length_helper_graph(
     ))
 }
 
-/// Synthesise `ll_fixed_getitem_fast` (`lltypesystem/rlist.py:402-405`):
+/// Synthesise `ll_fixed_getitem_fast` (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// def ll_fixed_getitem_fast(l, index):
@@ -1651,7 +1651,7 @@ pub(crate) fn build_ll_fixed_getitem_fast_helper_graph(
     ))
 }
 
-/// Synthesise `ll_getitem_foldable_nonneg` (`rlist.py:721-724`):
+/// Synthesise `ll_getitem_foldable_nonneg` (`rlist.py`):
 ///
 /// ```python
 /// def ll_getitem_foldable_nonneg(l, index):
@@ -1662,7 +1662,7 @@ pub(crate) fn build_ll_fixed_getitem_fast_helper_graph(
 ///
 /// Identical body to [`build_ll_fixed_getitem_fast_helper_graph`] (the
 /// `ll_assert` is a debug-only bound check), except the element read is the
-/// FOLDABLE `getarrayitem_pure`. `rtype_getitem` (rlist.py:255-258) selects
+/// FOLDABLE `getarrayitem_pure`. `rtype_getitem` (rlist.py) selects
 /// this helper instead of `ll_fixed_getitem_fast` when `not
 /// listitem.mutated`, so the immutable element load can be folded / CSE'd;
 /// the `oopspec = 'list.getitem_foldable'` is realised here by the distinct
@@ -1712,7 +1712,7 @@ pub(crate) fn build_ll_fixed_getitem_fast_foldable_helper_graph(
     ))
 }
 
-/// Synthesise `ll_fixed_setitem_fast` (`lltypesystem/rlist.py:407-410`):
+/// Synthesise `ll_fixed_setitem_fast` (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// def ll_fixed_setitem_fast(l, index, item):
@@ -1918,7 +1918,7 @@ pub(crate) fn build_ll_setitem_fast_helper_graph(
     ))
 }
 
-/// Synthesise `ll_reverse` (`rlist.py:677-686`):
+/// Synthesise `ll_reverse` (`rlist.py`):
 ///
 /// ```python
 /// def ll_reverse(l):
@@ -2152,7 +2152,7 @@ pub(crate) fn build_ll_reverse_helper_graph(
     ))
 }
 
-/// Synthesise the resized-list `ll_reverse` (`rlist.py:677-686`):
+/// Synthesise the resized-list `ll_reverse` (`rlist.py`):
 ///
 /// ```python
 /// def ll_reverse(l):
@@ -2435,7 +2435,7 @@ fn none_void_const() -> Hlvalue {
     ))
 }
 
-/// Synthesise `rgc.ll_arraycopy` (`rpython/rlib/rgc.py:365`), specialised
+/// Synthesise `rgc.ll_arraycopy` (`rpython/rlib/rgc.py`), specialised
 /// to `source_start == dest_start == 0` (the only shape
 /// [`build_ll_list_resize_ge_helper_graph`] needs — a resize always copies
 /// the live prefix to offset 0 of a fresh array):
@@ -3176,7 +3176,7 @@ fn build_ll_append_helper_graph(
     ))
 }
 
-/// Synthesise `ll_extend` (`rpython/rtyper/rlist.py:782`):
+/// Synthesise `ll_extend` (`rpython/rtyper/rlist.py`):
 ///
 /// ```python
 /// def ll_extend(l1, l2):
@@ -3513,7 +3513,7 @@ pub(crate) fn build_ll_newlist_helper_graph(
     ))
 }
 
-/// Emit the `_ll_zero_or_null(item)` op chain (`rlist.py:472-479`) onto
+/// Emit the `_ll_zero_or_null(item)` op chain (`rlist.py`) onto
 /// `block`, returning a Bool var that is `True` when `item` IS zero/null:
 ///
 /// ```python
@@ -3602,7 +3602,7 @@ fn emit_list_items_read(
     }
 }
 
-/// Synthesise `ll_alloc_and_set(LIST, count, item)` (`rlist.py:487-492`):
+/// Synthesise `ll_alloc_and_set(LIST, count, item)` (`rlist.py`):
 ///
 /// ```python
 /// def ll_alloc_and_set(LIST, count, item):
@@ -3739,7 +3739,7 @@ fn build_ll_alloc_and_set_helper_graph(
     ))
 }
 
-/// Synthesise `_ll_alloc_and_set_jit(LIST, count, item)` (`rlist.py:510-520`):
+/// Synthesise `_ll_alloc_and_set_jit(LIST, count, item)` (`rlist.py`):
 ///
 /// ```python
 /// def _ll_alloc_and_set_jit(LIST, count, item):
@@ -4003,7 +4003,7 @@ fn build_ll_alloc_and_set_nojit_helper_graph(
     ))
 }
 
-/// Synthesise `_ll_alloc_and_clear(LIST, count)` (`rlist.py:522-528`,
+/// Synthesise `_ll_alloc_and_clear(LIST, count)` (`rlist.py`,
 /// `@jit.oopspec("newlist_clear(count)")`):
 ///
 /// ```python
@@ -4234,7 +4234,7 @@ fn build_ll_alloc_and_set_nonnull_helper_graph(
     ))
 }
 
-/// Synthesise `ll_copy(RESLIST, l)` (`rpython/rtyper/rlist.py:565-569`):
+/// Synthesise `ll_copy(RESLIST, l)` (`rpython/rtyper/rlist.py`):
 ///
 /// ```python
 /// def ll_copy(RESLIST, l):
@@ -4392,7 +4392,7 @@ fn emit_listslice_alloc_and_copy(
     // a header reaching its array through `items`.  Read the result layout off
     // its pointer lltype and branch `dst_items` the same way `src_items`
     // branches on `source_layout` (`ll_arraycopy` uses `dest.ll_items()`,
-    // rlist.py:555-559, which is `ll_fixed_items(l) = l` for a fixed list).
+    // rlist.py, which is `ll_fixed_items(l) = l` for a fixed list).
     let result_layout = list_layout_from_lltype(&result_ptr_lltype)
         .expect("getslice result lltype must be a list pointer");
     // l = RESLIST.ll_newlist(newlength).
@@ -4459,7 +4459,7 @@ fn emit_listslice_alloc_and_copy(
     ]);
 }
 
-/// Synthesise `ll_listslice_startonly(RESLIST, l1, start)` (rlist.py:883-890):
+/// Synthesise `ll_listslice_startonly(RESLIST, l1, start)` (rlist.py):
 ///
 /// ```python
 /// def ll_listslice_startonly(RESLIST, l1, start):
@@ -4539,7 +4539,7 @@ fn build_ll_listslice_startonly_helper_graph(
     ))
 }
 
-/// Synthesise `ll_listslice_minusone(RESLIST, l1)` (rlist.py:906-911):
+/// Synthesise `ll_listslice_minusone(RESLIST, l1)` (rlist.py):
 ///
 /// ```python
 /// def ll_listslice_minusone(RESLIST, l1):
@@ -4784,7 +4784,7 @@ fn list_layout_from_lltype(ptr_lltype: &LowLevelType) -> Result<ListLayout, Type
 }
 
 /// Shared body of `FixedSizeListRepr` / `ListRepr` `rtype_bltn_list`
-/// (`rpython/rtyper/rlist.py:118-122` `rtype_bltn_list`): the receiver has
+/// (`rpython/rtyper/rlist.py` `rtype_bltn_list`): the receiver has
 /// already been threaded into `vlist` and `exception_is_here` declared. Mints
 /// `ll_arraycopy` <- `ll_newlist` <- `ll_copy` in dependency order (the
 /// result `RESLIST` is `hop.r_result`) and `gendirectcall`s `ll_copy`.
@@ -4859,7 +4859,7 @@ fn rtype_bltn_list_via_ll_copy(
     hop.gendirectcall(&copy, vlist)
 }
 
-/// RPython `AbstractBaseListRepr.rtype_getslice(r_lst, hop)` (rlist.py:409-414):
+/// RPython `AbstractBaseListRepr.rtype_getslice(r_lst, hop)` (rlist.py):
 ///
 /// ```python
 /// def rtype_getslice(r_lst, hop):
@@ -4935,7 +4935,7 @@ fn rtype_getslice_via_ll_listslice(
         )?
     };
 
-    // The per-kind `ll_listslice_%s` helper (rlist.py:883-911).
+    // The per-kind `ll_listslice_%s` helper (rlist.py).
     let (helper_name, helper_args): (&str, Vec<LowLevelType>) = match kind {
         SliceKind::MinusOne => ("ll_listslice_minusone", vec![source_ptr_lltype.clone()]),
         SliceKind::StartOnly => (
@@ -5019,7 +5019,7 @@ impl ListLayout {
             ListLayout::Resized => "ll_getitem_fast",
         }
     }
-    /// rlist.py:721-724 `ll_getitem_foldable_nonneg` — the foldable
+    /// rlist.py `ll_getitem_foldable_nonneg` — the foldable
     /// counterpart of `getitem_fast_name`, a DISTINCT function so the
     /// helper cache never serves a foldable graph to a mutated list (or
     /// vice-versa). Only the Fixed layout reaches it (Resized ⟹ mutated).
@@ -5119,7 +5119,7 @@ fn list_getitem_fast_funcptr(
     item_lltype: LowLevelType,
 ) -> Result<Constant, TyperError> {
     // rlist.py:264-266 — the `basegetitem` passed into every (nonneg×checkidx)
-    // wrapper is the foldable `ll_getitem_foldable_nonneg` (rlist.py:721-724)
+    // wrapper is the foldable `ll_getitem_foldable_nonneg` (rlist.py)
     // when the list item is not mutated.  Only Fixed has a foldable element
     // load; Resized is always mutated, so `foldable` is never set for it.
     let foldable_fixed = foldable && matches!(layout, ListLayout::Fixed);
@@ -5158,7 +5158,7 @@ fn list_getitem_fast_funcptr(
     sub_helper_funcptr_constant(rtyper, &inner)
 }
 
-/// rlist.py:697-714 `ll_getitem` with `func is dum_nocheck` — negative index,
+/// rlist.py `ll_getitem` with `func is dum_nocheck` — negative index,
 /// no bound check: `if index < 0: index += l.ll_length(); return
 /// basegetitem(l, index)`. 3-block CFG (start → block_neg_fix → block_dispatch)
 /// forwarding the possibly-fixed index to a `direct_call` of the layout's
@@ -5284,7 +5284,7 @@ fn build_ll_list_getitem_neg_helper_graph(
     ))
 }
 
-/// rlist.py:688-692 `ll_getitem_nonneg` with `func is dum_checkidx` —
+/// rlist.py `ll_getitem_nonneg` with `func is dum_checkidx` —
 /// nonneg index, bound check: `if index >= l.ll_length(): raise IndexError;
 /// return basegetitem(l, index)`. 2-block CFG plus graph.exceptblock.
 fn build_ll_list_getitem_nonneg_checked_helper_graph(
@@ -5383,7 +5383,7 @@ fn build_ll_list_getitem_nonneg_checked_helper_graph(
     ))
 }
 
-/// rlist.py:697-714 `ll_getitem` with `func is dum_checkidx` — the negative
+/// rlist.py `ll_getitem` with `func is dum_checkidx` — the negative
 /// index is folded in (`index += length`) then the `0 <= index < length`
 /// window is enforced, raising IndexError otherwise. The r_uint window test
 /// is lowered to the signed-explicit `index >= length or index < 0` form
@@ -5439,7 +5439,7 @@ fn build_ll_list_getitem_checked_helper_graph(
     // ---- start: length = <len read>; index_u = cast_int_to_uint(index);
     //      length_u = cast_int_to_uint(length); oob = uint_ge(index_u, length_u);
     //      branch.  The common 0 <= index < length case falls straight through
-    //      with no add (`ll_getitem`, rlist.py:699).
+    //      with no add (`ll_getitem`, rlist.py).
     let length = emit_list_length_read(&startblock, layout, &l);
     let i_u = variable_with_lltype("index", LowLevelType::Unsigned);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -5582,9 +5582,9 @@ fn list_getitem_helper(
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
 ) -> Result<LowLevelFunction, TyperError> {
-    // rlist.py:255-266 `basegetitem` selection by the listdef's `mutated` flag,
+    // rlist.py `basegetitem` selection by the listdef's `mutated` flag,
     // passed into ALL four (nonneg×checkidx) wrappers: the foldable
-    // `ll_getitem_foldable_nonneg` (rlist.py:721-724) when not mutated, else
+    // `ll_getitem_foldable_nonneg` (rlist.py) when not mutated, else
     // `ll_getitem_fast`.  Each foldable wrapper gets a distinct `_foldable`
     // cache name so `lowlevel_helper_function_with_builder` never serves a
     // foldable graph to a mutated list of the same item_lltype.  Only Fixed has
@@ -5610,7 +5610,7 @@ fn list_getitem_helper(
         item_lltype,
         move |rtyper_inner, _args, _result| match (checkidx, nonneg) {
             (false, true) => match layout {
-                // rlist.py:721-724 `ll_getitem_foldable_nonneg` — the Fixed
+                // rlist.py `ll_getitem_foldable_nonneg` — the Fixed
                 // fast load, but foldable (`oopspec = 'list.getitem_foldable'`).
                 // The Resized layout is always mutated so `foldable` can only
                 // fire on Fixed.
@@ -5659,10 +5659,10 @@ fn list_getitem_helper(
 }
 
 /// Shared `pair(AbstractBaseListRepr, IntegerRepr).rtype_getitem`
-/// (`rlist.py:247-267`) for both list layouts. The `getitem_idx` op collapses
+/// (`rlist.py`) for both list layouts. The `getitem_idx` op collapses
 /// onto `getitem` in the rtyper dispatch, so `hop.has_implicit_exception` is
 /// the `dum_checkidx` selector — the same caught-IndexError signal
-/// `rtype_setitem` uses (`rlist.py:273`). Returns the (internal-repr) element
+/// `rtype_setitem` uses (`rlist.py`). Returns the (internal-repr) element
 /// value; the caller applies `recast`.
 fn list_rtype_getitem(
     hop: &HighLevelOp,
@@ -5679,7 +5679,7 @@ fn list_rtype_getitem(
     // 'list.getitem_foldable(l, index)'`, rlist.py:721-724). `mutated` is the
     // gate, NOT the layout — a non-resized FixedSizeListRepr that is still
     // mutated (setitem without resize) is non-foldable; a Resized list carries
-    // the `mutated | resized` construction invariant (listdef.py:128 /
+    // the `mutated | resized` construction invariant (listdef.py /
     // listdef.rs) so it is always mutated ⟹ never foldable.
     let s0 = hop
         .args_s
@@ -5773,7 +5773,7 @@ fn list_setitem_fast_funcptr(
     sub_helper_funcptr_constant(rtyper, &inner)
 }
 
-/// rlist.py:716-734 `ll_setitem` with `func is dum_nocheck` — negative index,
+/// rlist.py `ll_setitem` with `func is dum_nocheck` — negative index,
 /// no bound check: `if index < 0: index += l.ll_length(); l.ll_setitem_fast(
 /// index, item)`. 3-block CFG forwarding the possibly-fixed index + item to a
 /// `direct_call` of the layout's `ll_*_setitem_fast` (Void).
@@ -5906,7 +5906,7 @@ fn build_ll_list_setitem_neg_helper_graph(
     ))
 }
 
-/// rlist.py:716-720 `ll_setitem_nonneg` with `func is dum_checkidx` — nonneg
+/// rlist.py `ll_setitem_nonneg` with `func is dum_checkidx` — nonneg
 /// index, bound check: `if index >= l.ll_length(): raise IndexError;
 /// l.ll_setitem_fast(index, item)`. 2-block CFG plus graph.exceptblock.
 fn build_ll_list_setitem_nonneg_checked_helper_graph(
@@ -6003,7 +6003,7 @@ fn build_ll_list_setitem_nonneg_checked_helper_graph(
     ))
 }
 
-/// rlist.py:716-734 `ll_setitem` with `func is dum_checkidx` — fold the
+/// rlist.py `ll_setitem` with `func is dum_checkidx` — fold the
 /// negative index in (`index += length`) then enforce the `0 <= index <
 /// length` window, raising IndexError otherwise (the r_uint window test
 /// lowered to the signed-explicit `index >= length or index < 0` form, as in
@@ -6058,7 +6058,7 @@ fn build_ll_list_setitem_checked_helper_graph(
     // ---- start: length = <len read>; index_u = cast_int_to_uint(index);
     //      length_u = cast_int_to_uint(length); oob = uint_ge(index_u, length_u);
     //      branch.  The common 0 <= index < length case falls straight through
-    //      with no add (`ll_setitem`, rlist.py:737).
+    //      with no add (`ll_setitem`, rlist.py).
     let length = emit_list_length_read(&startblock, layout, &l);
     let i_u = variable_with_lltype("index", LowLevelType::Unsigned);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -6332,7 +6332,7 @@ pub struct ListIteratorRepr {
     list_lltype: LowLevelType,
     /// `r_list.item_repr` — the element repr `ll_listnext` returns.
     item_repr: Arc<dyn Repr>,
-    /// `r_list.external_item_repr` (`lltypesystem/rlist.py:457`
+    /// `r_list.external_item_repr` (`lltypesystem/rlist.py`
     /// `self.external_item_repr = r_list.external_item_repr`) — the surface
     /// element repr `rtype_next` recasts the `ll_listnext` result back to
     /// (identity for primitive items; see [`list_recast`]).
@@ -6344,7 +6344,7 @@ pub struct ListIteratorRepr {
     /// the same `getarraysize`/`length` op whether or not the element load
     /// folds.
     list_is_fixed: bool,
-    /// `not r_list.listitem.mutated` (`lltypesystem/rlist.py:462-466`): selects
+    /// `not r_list.listitem.mutated` (`lltypesystem/rlist.py`): selects
     /// `ll_listnext_foldable` over `ll_listnext`, so an unmutated
     /// `FixedSizeListRepr`'s element load lowers to the PURE `getarrayitem_pure`
     /// the optimizer can fold / CSE across iterations. Only meaningful together
@@ -6404,7 +6404,7 @@ impl Repr for ListIteratorRepr {
         super::pairtype::ReprClassId::ListIteratorRepr
     }
 
-    /// RPython `IteratorRepr.rtype_iter(self, hop)` (rmodel.py:266-268) —
+    /// RPython `IteratorRepr.rtype_iter(self, hop)` (rmodel.py) —
     /// `iter(iter(x)) <==> iter(x)`: the iterator is its own iterator, so
     /// the op is the identity on the receiver.
     fn rtype_iter(&self, hop: &HighLevelOp) -> RTypeResult {
@@ -6476,15 +6476,15 @@ impl Repr for ListIteratorRepr {
     /// `ll_listnext` (the `index >= ll_length()` bounds-check that raises
     /// `StopIteration`) lowers to [`build_ll_listnext_helper_graph`]. For an
     /// unmutated `FixedSizeListRepr` (`self.foldable && self.list_is_fixed`) the
-    /// helper is `ll_listnext_foldable` (`lltypesystem/rlist.py:462-466,
+    /// helper is `ll_listnext_foldable` (`lltypesystem/rlist.py,
     /// 484-491`), whose element read is the PURE `getarrayitem_pure`
     /// (`ll_getitem_foldable_nonneg`, the `list.getitem_foldable` oopspec) the
     /// optimizer can fold / CSE across iterations; every other list keeps the
     /// plain `getarrayitem`. The two helpers carry distinct names so the
     /// per-signature helper cache never serves a folded body for a mutated list
     /// of the same element type.
-    /// The upstream result `recast` (`rlist.py:449` `self.r_list.recast`,
-    /// `rlist.py:67`) converts the `ll_listnext` result back to
+    /// The upstream result `recast` (`rlist.py` `self.r_list.recast`,
+    /// `rlist.py`) converts the `ll_listnext` result back to
     /// `external_item_repr` via [`list_recast`] — identity for primitive
     /// items (no op emitted), pairtype dispatch for a GC-instance element
     /// list.
@@ -6496,7 +6496,7 @@ impl Repr for ListIteratorRepr {
         let iter_lltype = self.lltype.clone();
         let list_lltype = self.list_lltype.clone();
         let list_is_fixed = self.list_is_fixed;
-        // lltypesystem/rlist.py:462-466 — an unmutated FixedSizeListRepr reads
+        // lltypesystem/rlist.py — an unmutated FixedSizeListRepr reads
         // each element through the PURE `getarrayitem_pure`
         // (`ll_getitem_foldable_nonneg`); every other list takes the plain
         // getarrayitem. A resized list is always mutated, so `list_is_fixed`
@@ -6537,7 +6537,7 @@ impl Repr for ListIteratorRepr {
     }
 }
 
-/// Synthesise `ll_listiter` (`lltypesystem/rlist.py:470-474`):
+/// Synthesise `ll_listiter` (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// def ll_listiter(ITERPTR, lst):
@@ -6637,7 +6637,7 @@ pub(crate) fn build_ll_listiter_helper_graph(
     ))
 }
 
-/// Synthesise `ll_listnext` (`lltypesystem/rlist.py:476-482`):
+/// Synthesise `ll_listnext` (`lltypesystem/rlist.py`):
 ///
 /// ```python
 /// def ll_listnext(iter):
@@ -6822,7 +6822,7 @@ pub(crate) fn build_ll_listnext_helper_graph(
                 Hlvalue::Variable(v_res.clone()),
             ));
         } else {
-            // `ll_listnext_foldable` (rlist.py:484-491) reads the element via
+            // `ll_listnext_foldable` (rlist.py) reads the element via
             // `ll_getitem_foldable_nonneg` = the PURE `getarrayitem_pure`; the
             // plain `ll_listnext` uses the non-pure `getarrayitem`. Only the
             // fixed list folds (a resized list is always mutated).
@@ -7063,9 +7063,9 @@ mod tests {
     }
 
     /// `translate_operation("alloc_and_set")` routes to
-    /// [`rtype_alloc_and_set`] (rtyper.py:534-535), which lowers a
+    /// [`rtype_alloc_and_set`] (rtyper.py), which lowers a
     /// `[item] * count` display to a single `gendirectcall(ll_alloc_and_set,
-    /// count, item)` (rlist.py:346-350). Unlike `newlist`, the count is a
+    /// count, item)` (rlist.py). Unlike `newlist`, the count is a
     /// runtime `Signed` operand (not a static element enumeration), so the
     /// dispatch emits exactly one `direct_call` and mints the
     /// `ll_alloc_and_set` dispatch helper graph.
@@ -7148,7 +7148,7 @@ mod tests {
     }
 
     /// `l[start:stop]` on a resized `ListRepr` with non-constant nonneg int
-    /// bounds decomposes to `"startstop"` (rtyper.py:781) and lowers to
+    /// bounds decomposes to `"startstop"` (rtyper.py) and lowers to
     /// `gendirectcall(ll_listslice_startstop, l, start, stop)`, which mints the
     /// `ll_listslice_startstop` / `ll_newlist` / `ll_arraycopy` helper graphs
     /// (rlist.py:893-904).
@@ -7243,7 +7243,7 @@ mod tests {
     }
 
     /// A runtime `start` that is NOT proved non-negative must be rejected by
-    /// `decompose_slice_args` (rtyper.py:768-770) with "slice start must be
+    /// `decompose_slice_args` (rtyper.py) with "slice start must be
     /// proved non-negative", the guard that keeps an unsupported slice form off
     /// the `ll_listslice_*` path. Same hop as the startstop test but with a
     /// `nonneg == false` start annotation.
@@ -7311,8 +7311,8 @@ mod tests {
     }
 
     /// `l[start:]` — non-constant nonneg start, constant `None` stop —
-    /// decomposes to `"startonly"` (rtyper.py:778-779) and lowers to
-    /// `gendirectcall(ll_listslice_startonly, l, start)` (rlist.py:883-890).
+    /// decomposes to `"startonly"` (rtyper.py) and lowers to
+    /// `gendirectcall(ll_listslice_startonly, l, start)` (rlist.py).
     #[test]
     fn translate_operation_getslice_startonly_emits_startonly_helper() {
         use crate::annotator::model::{SomeInteger, SomeValue, s_none};
@@ -7393,7 +7393,7 @@ mod tests {
     /// `FixedSizeListRepr` result (`listdef.offspring` keeps `resized=False`),
     /// so `ll_newlist` returns a bare `Ptr(GcArray)` with no `items` field. The
     /// minted `ll_listslice_startonly` helper must therefore select `dst_items`
-    /// as the result array ITSELF (`ll_fixed_items(l) = l`, rlist.py:411) and
+    /// as the result array ITSELF (`ll_fixed_items(l) = l`, rlist.py) and
     /// emit NO `getfield("items")` — a fixed source AND a fixed result yield a
     /// getfield-free copy body. A regression that hardcodes `getfield(new_lst,
     /// "items")` would target a nonexistent field and reintroduce a getfield.
@@ -7479,9 +7479,9 @@ mod tests {
         );
     }
 
-    /// `l[:-1]` decomposes to `"minusone"` (rtyper.py:772) — start const 0,
+    /// `l[:-1]` decomposes to `"minusone"` (rtyper.py) — start const 0,
     /// stop const -1, no runtime bound args — and lowers to
-    /// `gendirectcall(ll_listslice_minusone, l)` (rlist.py:906-911).
+    /// `gendirectcall(ll_listslice_minusone, l)` (rlist.py).
     #[test]
     fn translate_operation_getslice_minusone_emits_minusone_helper() {
         use crate::annotator::model::{SomeInteger, SomeValue};
@@ -7671,7 +7671,7 @@ mod tests {
         );
     }
 
-    /// rlist.py:255-256 — a MUTATED `FixedSizeListRepr` (in-place setitem
+    /// rlist.py — a MUTATED `FixedSizeListRepr` (in-place setitem
     /// without resize) keeps `basegetitem = ll_getitem_fast`, so `getitem`
     /// lowers to the NON-foldable `ll_fixed_getitem_fast` (plain
     /// `getarrayitem`), proving the foldable selection is gated on
@@ -7938,7 +7938,7 @@ mod tests {
         );
     }
 
-    /// rlist.py:272-284 nonneg + dum_nocheck branch — `setitem` on a
+    /// rlist.py nonneg + dum_nocheck branch — `setitem` on a
     /// `FixedSizeListRepr` lowers to a `direct_call` of
     /// `ll_fixed_setitem_fast` (a single `setarrayitem` on the
     /// `Ptr(GcArray)` receiver), preceded by `hop.exception_is_here()`.
@@ -8178,7 +8178,7 @@ mod tests {
         );
     }
 
-    /// rlist.py:272-284 nonneg + dum_nocheck branch — `setitem` on a
+    /// rlist.py nonneg + dum_nocheck branch — `setitem` on a
     /// resized `ListRepr` lowers to a `direct_call` of `ll_setitem_fast`
     /// (the resized helper, distinct from `FixedSizeListRepr`'s
     /// `ll_fixed_setitem_fast`), preceded by `hop.exception_is_here()`.
@@ -8310,7 +8310,7 @@ mod tests {
     }
 
     /// `slice.reverse()` rtypes through `rtype_method("reverse")` to a
-    /// `direct_call(ll_reverse, v_lst)` (`rlist.py:138-143`); `reverse`
+    /// `direct_call(ll_reverse, v_lst)` (`rlist.py`); `reverse`
     /// returns `None` (void), and the path calls
     /// `hop.exception_cannot_occur()`.
     #[test]
@@ -8624,7 +8624,7 @@ mod tests {
             .collect()
     }
 
-    /// rlist.py:699-714 checked `ll_getitem` (`dum_checkidx`, negative index
+    /// rlist.py checked `ll_getitem` (`dum_checkidx`, negative index
     /// folded in) lowers to the unsigned-window test `r_uint(index) >=
     /// r_uint(length)`: the start reads length (`getarraysize` on the
     /// `FixedSizeListRepr` receiver), casts index/length to unsigned and
@@ -9077,7 +9077,7 @@ mod tests {
 
     /// `next(iter)` rtypes through `ListIteratorRepr::rtype_next` to a
     /// `direct_call(ll_listnext, v_iter)`, recording the implicit
-    /// `StopIteration` (`rlist.py:444-449`).
+    /// `StopIteration` (`rlist.py`).
     #[test]
     fn list_iterator_next_emits_direct_call_to_ll_listnext() {
         let ann = RPythonAnnotator::new(None, None, None, false);

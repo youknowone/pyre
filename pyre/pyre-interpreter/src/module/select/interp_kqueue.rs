@@ -10,7 +10,7 @@ use super::interp_kevent::W_Kevent;
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 use pyre_object::PyObjectRef;
 
-/// `select.kqueue` object — PyPy: `interp_kqueue.py:118 class W_Kqueue`.
+/// `select.kqueue` object — PyPy: `interp_kqueue.py class W_Kqueue`.
 ///
 /// Wraps a kqueue file descriptor (`-1` once closed).  `control()`
 /// marshals a changelist of `kevent`s into the syscall and returns the
@@ -34,7 +34,7 @@ impl Default for W_Kqueue {
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 #[crate::pyre_methods(doc = "kqueue() -> kqueue object")]
 impl W_Kqueue {
-    /// `interp_kqueue.py:124 descr__new__` — opens a fresh kqueue fd,
+    /// `interp_kqueue.py descr__new__` — opens a fresh kqueue fd,
     /// clearing its inheritable flag.
     #[staticmethod]
     fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -58,7 +58,7 @@ impl W_Kqueue {
         }))
     }
 
-    /// `interp_kqueue.py:135 descr_fromfd` — wraps an existing fd.
+    /// `interp_kqueue.py descr_fromfd` — wraps an existing fd.
     #[classmethod]
     fn fromfd(_cls: PyObjectRef, fd: i64) -> PyObjectRef {
         W_Kqueue::allocate(W_Kqueue {
@@ -91,7 +91,7 @@ impl W_Kqueue {
         }
     }
 
-    /// `interp_kqueue.py:167 descr_control` — apply `changelist` (a list
+    /// `interp_kqueue.py descr_control` — apply `changelist` (a list
     /// of kevents or None) and collect up to `max_events` triggered
     /// events.  `timeout` is in seconds (float) or None to block.
     fn control(

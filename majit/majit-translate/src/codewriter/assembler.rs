@@ -105,7 +105,7 @@ fn flatop_debug_label(op: &FlatOp) -> String {
     }
 }
 
-/// `flatten.py:30` `Register.kind[0]` — single-char prefix for opname keys.
+/// `flatten.py` `Register.kind[0]` — single-char prefix for opname keys.
 fn kind_char_of(kind: RegKind) -> char {
     match kind {
         RegKind::Int => 'i',
@@ -124,9 +124,9 @@ fn kind_long_name(kind: RegKind) -> &'static str {
     }
 }
 
-/// `assembler.py:312` `USE_C_FORM` — the set of jitcode opnames whose
+/// `assembler.py` `USE_C_FORM` — the set of jitcode opnames whose
 /// small ConstInt operands may take the inline `c` short-const argcode
-/// (`assembler.py:163` `allow_short = (insn[0] in USE_C_FORM)`).  Listed
+/// (`assembler.py` `allow_short = (insn[0] in USE_C_FORM)`).  Listed
 /// verbatim, kept identical to the runtime assembler's `use_c_form`
 /// (`pyre-jit/src/jit/assembler.rs`).
 ///
@@ -184,12 +184,12 @@ fn use_c_form(opname: &str) -> bool {
 // [`crate::flatten::RegOrConst`]) operand directly.  The assembler
 // reads `r.kind` / `r.index` straight off the operand — no per-call
 // kind-search, no fallback — exactly mirroring RPython's
-// `Register(kind, index)` invariant from `flatten.py:28-33`.
+// `Register(kind, index)` invariant from `flatten.py`.
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody, StrConstDescriptor};
 use crate::regalloc::RegAllocator;
 
-/// RPython `class AssemblerError(Exception)` (assembler.py:15-16).
+/// RPython `class AssemblerError(Exception)` (assembler.py).
 ///
 /// Upstream raises this for unsupported constant kinds while assembling
 /// SSARepr (`assembler.py:124-126`). Most Rust assembler paths currently
@@ -244,7 +244,7 @@ pub struct Assembler {
     /// (`assembler.py:208-209`).  RPython stores `JitCode` objects; we
     /// store their jitcode indices because codewriter owns the
     /// jitcode-index allocator.
-    /// RPython `assembler.py:209` `self.indirectcalltargets.update(x.lst)`:
+    /// RPython `assembler.py` `self.indirectcalltargets.update(x.lst)`:
     /// a `set` of JitCode objects (Python identity dedup). pyre uses
     /// `JitCodeHandle` as the identity-keyed wrapper around
     /// `Arc<JitCode>` so the same shells handed out by
@@ -262,7 +262,7 @@ pub struct Assembler {
     /// Encoded as bytes: [count_i, count_r, count_f, reg_indices...].
     /// Deduplicated across all JitCodes via all_liveness_positions.
     all_liveness: Vec<u8>,
-    /// RPython: Assembler.all_liveness_length (assembler.py:30).
+    /// RPython: Assembler.all_liveness_length (assembler.py).
     pub all_liveness_length: usize,
     /// RPython: Assembler.all_liveness_positions — dedup cache.
     /// Maps (live_i set, live_r set, live_f set) → offset in all_liveness.
@@ -274,11 +274,11 @@ pub struct Assembler {
     /// Length of the build-time liveness prefix installed by an embedded
     /// JitCode table; zero until one is installed.
     embedded_liveness_prefix_len: usize,
-    /// RPython: Assembler.num_liveness_ops (assembler.py:32).
+    /// RPython: Assembler.num_liveness_ops (assembler.py).
     pub num_liveness_ops: usize,
     /// State-field JIT canonical "all-live" liveness triple, set once at
     /// `__JitMeta_<fn>::install_canonical_liveness` time (RPython
-    /// `assembler.py:218-231 get_liveness_info` flat-state adaptation).
+    /// `assembler.py get_liveness_info` flat-state adaptation).
     /// `JitCodeBuilder::live_placeholder` defers patching of the leading
     /// `BC_LIVE` slot at the start of every per-opcode JitCode until
     /// `finalize_liveness` runs, at which point this triple is registered
@@ -414,7 +414,7 @@ impl Assembler {
     /// `ssarepr` (plus the `regallocs` coloring) — never the graph.
     /// The kind source per operand is `Variable.concretetype`, read via
     /// the static `FunctionGraph::concretetype_of(&v)` exactly like
-    /// `flatten.py:382 getcolor` reads `getkind(v.concretetype)`.
+    /// `flatten.py getcolor` reads `getkind(v.concretetype)`.
     pub fn assemble(
         &mut self,
         ssarepr: &mut SSARepr,
@@ -500,7 +500,7 @@ impl Assembler {
         self.current_flatop_debug = None;
         ssarepr.insns_pos = Some(insns_pos);
 
-        // RPython assembler.py:45,250-258: self.fix_labels()
+        // RPython assembler.py: self.fix_labels()
         // Upstream `target = self.label_positions[name]` raises KeyError
         // when the label is missing — never writes a silent 0 target.
         for (label, fixup_pos) in &state.tlabel_fixups {
@@ -551,7 +551,7 @@ impl Assembler {
             }));
         }
 
-        // RPython assembler.py:46 `self.check_result()`, :265-269 —
+        // RPython assembler.py `self.check_result()`, :265-269 —
         // the single-byte operand encoding addresses registers and
         // constants of one kind in one space, so their sum is what the
         // byte has to hold.
@@ -563,13 +563,13 @@ impl Assembler {
         // RPython assembler.py:271-281: jitcode.setup(code, ...)
         // Build the body that the codewriter will commit into the
         // pre-allocated `Arc<JitCode>` shell via `set_body`.
-        // RPython jitcode.py:36 `assert num_regs_i < 256 and ...`. The
+        // RPython jitcode.py `assert num_regs_i < 256 and ...`. The
         // assembler limits register pressure via the same invariant.
         assert!(
             num_regs_i < 256 && num_regs_r < 256 && num_regs_f < 256,
             "too many registers (i={num_regs_i} r={num_regs_r} f={num_regs_f})"
         );
-        // RPython assembler.py:49 `jitcode._ssarepr = ssarepr`
+        // RPython assembler.py `jitcode._ssarepr = ssarepr`
         let body = JitCodeBody {
             calldescr: BhCallDescr::default(),
             code: state.code,
@@ -596,7 +596,7 @@ impl Assembler {
         body
     }
 
-    /// RPython: `Assembler.write_insn(insn)` — assembler.py:140-223.
+    /// RPython: `Assembler.write_insn(insn)` — assembler.py.
     ///
     /// Encodes a single FlatOp into the bytecode stream. Each instruction
     /// is encoded as: opcode_byte + argument_bytes. The opcode byte is
@@ -643,7 +643,7 @@ impl Assembler {
                 // assembler.py:148 `self.code.append(chr(self.insns['live/']))`
                 let opnum = self.get_opnum("live/");
                 state.code.push(opnum);
-                // assembler.py:158 `self._encode_liveness(live_i, live_r, live_f)`
+                // assembler.py `self._encode_liveness(live_i, live_r, live_f)`
                 // — appends the 2-byte offset into `state.code` after
                 // registering or reusing the canonical entry.
                 self._encode_liveness(&live_i, &live_r, &live_f, &mut state.code);
@@ -652,7 +652,7 @@ impl Assembler {
             // RPython assembler.py:141-142: '---' → skip
             FlatOp::EndOfBlock => {}
 
-            // RPython `flatten.py:292` `emitline("unreachable")` →
+            // RPython `flatten.py` `emitline("unreachable")` →
             // single-byte opcode for `bhimpl_unreachable`
             // (`blackhole.py:962-964`). Mirrors the
             // `assembler.py:140-159` general opcode path: a fresh
@@ -710,7 +710,7 @@ impl Assembler {
                 state.code.push(0);
             }
 
-            // RPython flatten.py:247-267: goto_if_not(cond, TLabel(false_path))
+            // RPython flatten.py: goto_if_not(cond, TLabel(false_path))
             // Only goto_if_not exists — no goto_if_true in RPython.
             FlatOp::GotoIfNot { cond, target } => {
                 // RPython parity: `cond.kind == RegKind::Int` because
@@ -853,7 +853,7 @@ impl Assembler {
                 state.resulttypes.insert(state.code.len(), 'i');
             }
 
-            // RPython flatten.py:333 `self.emitline('%s_copy' % kind,
+            // RPython flatten.py `self.emitline('%s_copy' % kind,
             // v, "->", w)` — argcodes `i>i` (typed src, result marker,
             // typed dst). The `>` bears no byte in the stream; it only
             // flags the result position in the key so the blackhole
@@ -892,7 +892,7 @@ impl Assembler {
                 state.resulttypes.insert(state.code.len(), kind_char);
             }
 
-            // RPython `flatten.py:329` `self.emitline('%s_push' % kind, v)`.
+            // RPython `flatten.py` `self.emitline('%s_push' % kind, v)`.
             FlatOp::Push(src) => {
                 let kind_char = kind_char_of(src.kind);
                 let kind_name = kind_long_name(src.kind);
@@ -903,7 +903,7 @@ impl Assembler {
                 state.code.push(src.index as u8);
             }
 
-            // RPython `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)`.
+            // RPython `flatten.py` `self.emitline('%s_pop' % kind, "->", w)`.
             FlatOp::Pop(dst) => {
                 let kind_char = kind_char_of(dst.kind);
                 let kind_name = kind_long_name(dst.kind);
@@ -942,13 +942,13 @@ impl Assembler {
                 state.code.push(opnum);
             }
 
-            // RPython `flatten.py:131-138` `make_return`.  Blackhole
+            // RPython `flatten.py` `make_return`.  Blackhole
             // handlers: `blackhole.py:841-863 bhimpl_{int,ref,float,void}_return`.
             // `emit_const_*` returns a byte ≥ `num_regs_{kind}` so the
             // single-byte argcode `i`/`r`/`f` suffices for both register
             // and constant sources (upstream `assembler.py:164-174`).
             FlatOp::IntReturn(v) => {
-                // `int_return` is in USE_C_FORM (`assembler.py:312`), so a
+                // `int_return` is in USE_C_FORM (`assembler.py`), so a
                 // small const-int source emits `int_return/c`.
                 let (reg, src_argcode) = self.encode_regorconst_source(
                     v,
@@ -985,12 +985,12 @@ impl Assembler {
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
             }
-            // RPython `flatten.py:139-143` `make_return` 2-inputarg case
+            // RPython `flatten.py` `make_return` 2-inputarg case
             // plus the `flatten.py:166-173` overflow reraise.  Both paths
             // funnel through `raise/r` — `RegOrConst::Reg` is the raised
             // exception value's Register, `RegOrConst::Const` is the
             // standard OverflowError instance.  Blackhole:
-            // `blackhole.py:1000 bhimpl_raise(excvalue)`.
+            // `blackhole.py bhimpl_raise(excvalue)`.
             FlatOp::Raise(v) => {
                 // `raise` is not in USE_C_FORM; the excvalue is a Ref → `r`.
                 let (reg, _) =
@@ -1003,7 +1003,7 @@ impl Assembler {
         }
     }
 
-    /// RPython `assembler.py:234-248` `_encode_liveness(live_i, live_r,
+    /// RPython `assembler.py` `_encode_liveness(live_i, live_r,
     /// live_f)` — register a `(live_i, live_r, live_f)` triple in the
     /// shared `all_liveness` table (deduplicating against
     /// `all_liveness_positions`) and append the 2-byte offset of the
@@ -1030,7 +1030,7 @@ impl Assembler {
         code: &mut Vec<u8>,
     ) {
         let pos = self._register_liveness_offset(live_i, live_r, live_f);
-        // assembler.py:248 `encode_offset(pos, self.code)`.
+        // assembler.py `encode_offset(pos, self.code)`.
         crate::codewriter::liveness::encode_offset(pos, code);
     }
 
@@ -1063,7 +1063,7 @@ impl Assembler {
             return cached;
         }
         let pos = self.all_liveness.len();
-        // assembler.py:241 `chr(len(live_i)) + chr(len(live_r)) + chr(len(live_f))`.
+        // assembler.py `chr(len(live_i)) + chr(len(live_r)) + chr(len(live_f))`.
         // RPython `chr(N)` raises `ValueError` for N >= 256; Rust `as u8`
         // silently wraps. Strict assert mirrors the RPython failure mode
         // (`assembler.py:265` constants+regs <= 256 bound) so a regression
@@ -1107,7 +1107,7 @@ impl Assembler {
     /// mirroring `assembler.py:164-174` where the single-byte argcode kind
     /// letter chooses between register and constant via
     /// `byte >= count_regs[kind]`.  `allow_short` is `(opname in
-    /// USE_C_FORM)` (`assembler.py:163`); when set, a small integer-kind
+    /// USE_C_FORM)` (`assembler.py`); when set, a small integer-kind
     /// Constant takes the inline `'c'` short form (`assembler.py:99-107`)
     /// instead of a pooled `'i'` byte.  Register sources and ref/float
     /// Constants always take their kind argcode.
@@ -1125,7 +1125,7 @@ impl Assembler {
             // kind MUST match the expected kind for the surrounding
             // op (e.g. `int_copy/i>i`'s source must be Int).  PyPy
             // satisfies this by construction via
-            // `flatten.py:333` (the source `Register` was created by
+            // `flatten.py` (the source `Register` was created by
             // `getcolor(v)` against the matching `regallocs[w.kind]`
             // entry); pyre mirrors that with a strict assert so an
             // upstream kind-provenance gap surfaces here rather than
@@ -1143,7 +1143,7 @@ impl Assembler {
                 (r.index as u8, kind_char_of(expected_kind))
             }
             crate::flatten::RegOrConst::Const(c) => {
-                // RPython `assembler.py:168` reads `getkind(x.concretetype)`
+                // RPython `assembler.py` reads `getkind(x.concretetype)`
                 // for the Constant operand.  When the Constant carries
                 // a `concretetype` it MUST agree with the surrounding op's
                 // `expected_kind` (the byte-stream argcode is keyed on
@@ -1229,7 +1229,7 @@ impl Assembler {
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
-                // RPython jtransform.py:422-431: rewrite_call
+                // RPython jtransform.py: rewrite_call
                 // Only emit the kind sublists that are in 'kinds'.
                 let kinds = self.kinds_suffix(args_i, args_r, args_f, *result_kind);
                 if kinds.contains('i') {
@@ -1263,12 +1263,12 @@ impl Assembler {
             // RPython: recursive_call → [jd_index, G_I, G_R, G_F, R_I, R_R, R_F]
             //
             // `bhimpl_recursive_call_{i,r,f,v}` declares jd_index as
-            // `@arguments("self", "i", ...)` (blackhole.py:1101-1132) so
+            // `@arguments("self", "i", ...)` (blackhole.py) so
             // the canonical argcode is `i` (register read). `emit_const_i`
             // returns a register-index into the int constant pool; the
             // dispatch side `bh.registers_i[code[p]]` reads the jd_index
             // back out. RPython does not include `recursive_call` in
-            // `USE_C_FORM` (assembler.py:312), so the `c` short-const
+            // `USE_C_FORM` (assembler.py), so the `c` short-const
             // form is not permitted here.
             OpKind::RecursiveCall {
                 jd_index,
@@ -1311,7 +1311,7 @@ impl Assembler {
 
             // RPython: residual_call/call_may_force/call_elidable
             // → [funcptr, calldescr, I[...], R[...], F[...]]
-            // RPython jtransform.py:414-435: rewrite_call splits args
+            // RPython jtransform.py: rewrite_call splits args
             // by kind via make_three_lists.
             OpKind::CallResidual {
                 funcptr,
@@ -1358,7 +1358,7 @@ impl Assembler {
                     OpKind::CallElidable { .. } => "call_elidable",
                     _ => "residual_call",
                 };
-                // RPython `jtransform.py:422-431` `rewrite_call` emits args
+                // RPython `jtransform.py` `rewrite_call` emits args
                 // by kind (I, R, F) first, then the calldescr, producing
                 // keys like `residual_call_ir_r/iIRd>r`. jtransform now
                 // materializes direct-call funcptrs as `ConstInt` values,
@@ -1434,12 +1434,12 @@ impl Assembler {
             // always `Variable`; lowering that limitation is deferred
             // (requires op-level constant operands). Until then, materialise
             // through `int_copy` and reuse the canonical `bhimpl_int_copy`
-            // handler: `int_copy` is in USE_C_FORM (`assembler.py:312`), so a
+            // handler: `int_copy` is in USE_C_FORM (`assembler.py`), so a
             // small value (`-128..=127`) takes the inline `c` byte
             // (`int_copy/c>i`) and a larger one a pool-region `i` slot
             // (`int_copy/i>i`).
             OpKind::ConstInt(val) => {
-                // assembler.py:163 `allow_short = ('int_copy' in USE_C_FORM)` →
+                // assembler.py `allow_short = ('int_copy' in USE_C_FORM)` →
                 // a small constant takes the inline `c` byte (`int_copy/c>i`).
                 let (idx, src_argcode) =
                     self.emit_const_i_allow_short(*val, use_c_form("int_copy"), state);
@@ -1614,7 +1614,7 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
-            // RPython `jtransform.py:1040-1045 rewrite_op_malloc`: a fixed-size
+            // RPython `jtransform.py rewrite_op_malloc`: a fixed-size
             // GC struct without a vtable lowers to `new(descr)`.
             OpKind::New { owner } => {
                 let spec = bh_size_spec_from_callcontrol(
@@ -1645,7 +1645,7 @@ impl Assembler {
             // RPython `new_array_clear(v_length, arraydescr)` — the cleared
             // fixed-size array allocation `do_fixed_newlist_clear` emits
             // (`jtransform.py:1858-1863`).  `bhimpl_new_array_clear`
-            // (`blackhole.py:1311-1313`, `@arguments("cpu", "i", "d",
+            // (`blackhole.py`, `@arguments("cpu", "i", "d",
             // returns="r")`) gives the canonical key `new_array_clear/id>r`:
             // length (Int) + arraydescr + ref result.  The arraydescr is the
             // same `arraydescrof(item_ty, array_type_id, len_offset=Some(0))`
@@ -1933,7 +1933,7 @@ impl Assembler {
                 // kind.  An int Constant takes the short `c` byte
                 // (`setfield_gc_i/rcd`) when small or a pool `i` slot
                 // (`/rid`) when wide (`assembler.py:99-107`, `setfield_gc`
-                // ∈ USE_C_FORM at `assembler.py:312`); a ref/float Constant
+                // ∈ USE_C_FORM at `assembler.py`); a ref/float Constant
                 // takes its pooled `r`/`f` byte (`assembler.py:168`).
                 let value_kind = match value {
                     crate::model::LinkArg::Value(var) => {
@@ -2029,7 +2029,7 @@ impl Assembler {
                     'v'
                 };
                 // `getarrayitem_gc_{i,r,f}_pure` for a foldable/immutable
-                // element load (`ll_getitem_foldable_nonneg`, rlist.py:724);
+                // element load (`ll_getitem_foldable_nonneg`, rlist.py);
                 // `blackhole.py:1339-1341` aliases `bhimpl_getarrayitem_gc_*_pure
                 // = bhimpl_getarrayitem_gc_*`, so the `rid>X` argcodes are
                 // identical to the non-pure form — only the opname differs.
@@ -2071,7 +2071,7 @@ impl Assembler {
                 // (Variable or Constant) verbatim.  Mirror the FieldWrite
                 // c-form: a Variable is a register; an int Constant takes
                 // the short `c` byte (`setarrayitem_gc_i/ricd`) when small
-                // (`setarrayitem_gc_i` ∈ USE_C_FORM, assembler.py:339) or a
+                // (`setarrayitem_gc_i` ∈ USE_C_FORM, assembler.py) or a
                 // pool `i` slot otherwise; a ref/float Constant takes its
                 // pooled byte.
                 let value_kind = match value {
@@ -2366,12 +2366,12 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
 
-            // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header
+            // RPython jtransform.py handle_jit_marker__loop_header
             // emits `SpaceOperation('loop_header', [c_index], None)`; upstream
             // assembler.py encodes that Constant via `emit_const(allow_short=
             // False)` which registers it in `constants_i` and emits a single
             // byte register index (argcodes `i`). The bhimpl signature
-            // (`blackhole.py:1062 @arguments("i")`) looks the byte up in
+            // (`blackhole.py @arguments("i")`) looks the byte up in
             // `registers_i`. The canonical runtime key is `loop_header/i`
             // (`majit-metainterp/src/jitcode`); `emit_const_i`
             // returns `num_regs_i + pool_idx` which the runtime resolves
@@ -2387,11 +2387,11 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
 
-            // RPython jtransform.py:1690-1712 handle_jit_marker__jit_merge_point
+            // RPython jtransform.py handle_jit_marker__jit_merge_point
             // emits `SpaceOperation('jit_merge_point',
             //   [Constant(jdindex), greens_i, greens_r, greens_f,
             //    reds_i, reds_r, reds_f], None)`. Upstream bhimpl signature
-            // (`blackhole.py:1066 @arguments("self","i","I","R","F",
+            // (`blackhole.py @arguments("self","i","I","R","F",
             // "I","R","F")`) reads jdindex + six typed register lists, each
             // encoded as `[len:u8][reg:u8 * N]` (assembler.py:181-196 ListOfKind).
             // pyre's runtime (`blackhole.rs`'s `handler_jit_merge_point_c`)
@@ -2474,7 +2474,7 @@ impl Assembler {
     ///
     /// RPython `assembler.py:181-196`: every item in the
     /// `ListOfKind(kind, [...])` shares the list's `kind` per
-    /// construction (`flatten.py:35-51 ListOfKind` carries `kind` as
+    /// construction (`flatten.py ListOfKind` carries `kind` as
     /// an attribute and the constructors only accept matching
     /// Registers).  Pyre asserts the same invariant strictly: each
     /// item resolves through `lookup_coloring_var` and its kind must
@@ -2512,7 +2512,7 @@ impl Assembler {
         }
     }
 
-    /// RPython `jtransform.py:424-426 rewrite_call`:
+    /// RPython `jtransform.py rewrite_call`:
     /// ```text
     /// if lst_f or reskind == 'f': kinds = 'irf'
     /// elif lst_i or force_ir: kinds = 'ir'
@@ -2652,7 +2652,7 @@ impl Assembler {
 
     /// Resolve `(register_index, kind)` for a `&Variable`.
     ///
-    /// **RPython invariant** (`flatten.py:382 getcolor`): every
+    /// **RPython invariant** (`flatten.py getcolor`): every
     /// Variable has exactly one `(kind, color)` via
     /// `getkind(v.concretetype)` + `regallocs[kind]`.  This helper
     /// reads the declared kind directly from `Variable.concretetype`
@@ -2976,7 +2976,7 @@ impl Assembler {
         }
     }
 
-    /// RPython assembler.py:80-138: emit_const for integer constants.
+    /// RPython assembler.py: emit_const for integer constants.
     /// Adds to constant pool and returns the index byte.
     fn emit_const(
         &mut self,
@@ -3006,7 +3006,7 @@ impl Assembler {
     }
 
     /// Resolve an integer-kind [`ConstValue`] to its concrete `i64`
-    /// (`assembler.py:168` value extraction).  `llmemory` address offsets
+    /// (`assembler.py` value extraction).  `llmemory` address offsets
     /// are symbolic; resolve to the concrete byte size at code emission.
     /// Struct field offsets / sizes come from the `CallControl`'s struct
     /// layouts (it implements `OffsetLayout`); the layout-free offsets
@@ -3060,10 +3060,10 @@ impl Assembler {
         const_pool_slot(state.num_regs_i, state.constants_i.len() - 1)
     }
 
-    /// `assembler.py:99-107` — the `allow_short` branch of `emit_const`.
+    /// `assembler.py` — the `allow_short` branch of `emit_const`.
     /// When `allow_short` (the surrounding opname is in [`use_c_form`])
     /// and `value` fits in signed-i8 range, emit it inline as one byte
-    /// (`assembler.py:106` `self.code.append(chr(value & 0xFF))`) and
+    /// (`assembler.py` `self.code.append(chr(value & 0xFF))`) and
     /// return argcode `'c'`; otherwise fall back to the constant pool and
     /// return argcode `'i'`.  Returns `(byte, argcode)` — the caller
     /// pushes `byte` and appends `argcode`.
@@ -3185,7 +3185,7 @@ fn const_pool_slot(num_regs: usize, pool_index: usize) -> u8 {
     val as u8
 }
 
-/// `assembler.py:265-269 check_result()` — "Limitation of the number of
+/// `assembler.py check_result()` — "Limitation of the number of
 /// registers, from the single-byte encoding".  Each pair is
 /// `(count_regs[kind], len(constants_kind))`.
 fn check_result(int: (usize, usize), reference: (usize, usize), float: (usize, usize)) {
@@ -3290,10 +3290,10 @@ fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
     use crate::model::ValueType;
     match ty {
         // A pointer strides by the target word, not the build host's
-        // (`symbolic.py:12 WORD = sizeof(lltype.Signed)`).  The sibling
+        // (`symbolic.py WORD = sizeof(lltype.Signed)`).  The sibling
         // fallback in `arraydescrof` already reads it this way.
         ValueType::Ref(_) => crate::layout::target_word_size(),
-        // `lltype.Bool` is one byte (`descr.py:223` takes the field's real
+        // `lltype.Bool` is one byte (`descr.py` takes the field's real
         // size from `symbolic.get_field_token`), and so is a Rust `bool` —
         // the spelling-keyed twin already answers 1 for it
         // (`type_flag_from_str` `"u8" | "bool"`).
@@ -3311,7 +3311,7 @@ fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
     }
 }
 
-/// `descr.py:241-254 get_type_flag` over a `ValueType`, for the no-layout
+/// `descr.py get_type_flag` over a `ValueType`, for the no-layout
 /// fallback.
 ///
 /// Cannot go through `ArrayFlag::from_field_type`: that reads the descriptor
@@ -3347,7 +3347,7 @@ fn value_type_to_ir_type_for_descr(ty: &crate::model::ValueType) -> majit_ir::va
     }
 }
 
-/// `descr.py:241-254 get_type_flag`, over a Rust type spelling.
+/// `descr.py get_type_flag`, over a Rust type spelling.
 ///
 /// The authoritative copy is [`super::call::get_type_flag`]; this one serves
 /// the layout walkers below.  Word-sized spellings must resolve through
@@ -3369,7 +3369,7 @@ fn type_flag_from_str(
     use majit_ir::descr::ArrayFlag;
     let word = crate::layout::target_word_size();
     match type_str {
-        // descr.py:241-254 raw Ptr parity; see call.rs::get_type_flag.
+        // descr.py raw Ptr parity; see call.rs::get_type_flag.
         "*const u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
         s if s.starts_with('&')
             || s.starts_with("Box<")
@@ -3661,7 +3661,7 @@ fn bh_size_spec_from_callcontrol(
         size,
         is_gc_managed,
         headerless,
-        // `descr.py:105-127 get_size_descr` keys `_cache_size[STRUCT]` on
+        // `descr.py get_size_descr` keys `_cache_size[STRUCT]` on
         // the lltype STRUCT object identity.  Pyre's analogue is
         // `path_hash_for_gc_kind(owner, is_gc_managed)` per
         // `majit_ir::descr::path_hash_for_gc_kind` doc
@@ -3748,7 +3748,7 @@ fn bh_result_variant_field_specs(
 /// recursively walks `STRUCT._names`, skipping `Void` / `typeptr` /
 /// `c__pad`, and recursing into nested-struct fields so their leaf
 /// fielddescrs land in the same flat `res` list with `index_in_parent`
-/// matching `heaptracker.get_fielddescr_index_in()` (`heaptracker.py:51`).
+/// matching `heaptracker.get_fielddescr_index_in()` (`heaptracker.py`).
 ///
 /// Pyre keeps both a structured `struct_layouts` cache and a textual
 /// `struct_field_entries` registry; the layout path doesn't carry the
@@ -4005,7 +4005,7 @@ fn fielddescrof(
     let canonical_owner = canonical_field_owner(field);
     if let (Some(cc), Some(owner)) = (callcontrol, canonical_owner.as_deref()) {
         parent = bh_size_spec_from_callcontrol(cc, owner);
-        // RPython `descr.py:108-118,218-239` keys both the SizeDescr and
+        // RPython `descr.py` keys both the SizeDescr and
         // FieldDescr caches on the low-level STRUCT object, never on the
         // spelling used to reach that object.  The Rust front end can carry
         // the same external type as `core::result::Result<T, E>` at a
@@ -4331,7 +4331,7 @@ pub(crate) fn bh_interior_field_specs_from_array_descr(
 ///
 /// Determines the full ArrayDescr shape from the array element type.
 /// When `array_type_id` is available (e.g. `Vec<i32>` → element `i32`),
-/// the result is exact. Fallback uses descr.py:241-254 get_type_flag()
+/// the result is exact. Fallback uses descr.py get_type_flag()
 /// semantics: Int → FLAG_SIGNED, Float/Ref → FLAG_UNSIGNED/FLAG_FLOAT.
 ///
 /// When `callcontrol` is present, this routes through
@@ -4361,7 +4361,7 @@ fn arraydescrof(
             base_size: array_descr.base_size(),
             itemsize: array_descr.item_size(),
             len_offset: array_descr.len_descr().map(|fd| fd.offset()),
-            // `descr.py:348-378` cache identity — `ArrayDescr.cache_key()`
+            // `descr.py` cache identity — `ArrayDescr.cache_key()`
             // returns the u64 `path_hash(array_type_id)` slot the analyzer
             // stamped at `gc_cache.get_array_descr` cache-miss-mint.
             // Round-trips through `_cache_array[LLType::Array(cache_key)]`
@@ -4581,7 +4581,7 @@ fn op_kind_to_opname_with_kinds(kind: &crate::model::OpKind, operand_kinds: &str
         return match operand_kinds {
             "i" => "int_is_true".into(),
             "r" => "ptr_nonzero".into(),
-            // RPython `jtransform.py:1627 rewrite_op_float_is_true`
+            // RPython `jtransform.py rewrite_op_float_is_true`
             // collapses both `bool/f` and `float_is_true/f` to
             // `float_ne(x, 0.0)` upstream of the assembler — pyre's
             // jtransform mirror in `rewrite_operation` covers
@@ -4702,7 +4702,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             // depending on the `getkind()` of the guarded arg.
             //
             // RPython also emits `str_guard_value` for `promote_string`
-            // (jit.py:631) / `promote_unicode` (jit.py:647), but pyre
+            // (jit.py) / `promote_unicode` (jit.py), but pyre
             // panics in those rewrite arms (pyre-object lacks an
             // `rstr.STR` / `rstr.UNICODE` GC layout) so `kind_char` is
             // always one of `'i'` / `'r'` / `'f'` here.
@@ -4748,7 +4748,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             s if s.starts_with("uint_") => op.clone(),
             _ => format!("int_{op}"),
         },
-        // RPython `blackhole.py:488-498`: bitwise NOT on i64 is `int_invert`.
+        // RPython `blackhole.py`: bitwise NOT on i64 is `int_invert`.
         // pyre's front-end uses Rust's `syn::UnOp::Not` spelling `not` for
         // both logical-not and bitwise-not (they share the `!` token at the
         // AST level); canonicalize to `int_invert` at the emission boundary.
@@ -4863,7 +4863,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
 pub use majit_ir::CallInfoCollection;
 
 impl Assembler {
-    /// RPython: `Assembler.see_raw_object(value)` (assembler.py:283-298).
+    /// RPython: `Assembler.see_raw_object(value)` (assembler.py).
     ///
     /// Registers a function/vtable name for debugging.
     /// RPython stores `(addr, name)` pairs; majit stores `(path, name)`.
@@ -4874,7 +4874,7 @@ impl Assembler {
         }
     }
 
-    /// RPython: `Assembler.finished(callinfocollection)` (assembler.py:300-305).
+    /// RPython: `Assembler.finished(callinfocollection)` (assembler.py).
     ///
     /// ```python
     /// def finished(self, callinfocollection):
@@ -4910,7 +4910,7 @@ impl Assembler {
     /// RPython `assembler.py:29 self.all_liveness = []` — the shared
     /// liveness byte stream populated by `_encode_liveness`.  Returned
     /// as a contiguous `&[u8]` view so consumers (notably
-    /// `MetaInterpStaticData::finish_setup` per `pyjitpl.py:2264`) can
+    /// `MetaInterpStaticData::finish_setup` per `pyjitpl.py`) can
     /// take a snapshot without depending on the dedup cache or
     /// position table.
     pub fn all_liveness(&self) -> &[u8] {
@@ -5076,7 +5076,7 @@ impl Assembler {
     }
 }
 
-/// `effectinfo.py:152-164` `EffectInfo._cache` cache key parity.
+/// `effectinfo.py` `EffectInfo._cache` cache key parity.
 ///
 /// PyPy keys the EI factory cache on the raw `frozenset[Descr]`
 /// readonly/write sets, NOT on the `bitstring_*` fields.  The
@@ -5292,7 +5292,7 @@ enum AssemblerDescrKey {
         // `ei_index` deliberately omitted from the identity tuple —
         // upstream `gccache._cache_array[ARRAY_OR_STRUCT]`
         // (`descr.py:348-360`) keys on the lltype itself, and
-        // `compute_bitstrings` (`effectinfo.py:465`) later assigns the
+        // `compute_bitstrings` (`effectinfo.py`) later assigns the
         // index slot as a derived attribute that multiple descrs are
         // free to share.
         //
@@ -5348,7 +5348,7 @@ enum AssemblerDescrKey {
         trait_root: String,
         method_name: String,
     },
-    /// `descr.py:388 InteriorFieldDescr(arraydescr, fielddescr)` identity
+    /// `descr.py InteriorFieldDescr(arraydescr, fielddescr)` identity
     /// is the composition of the array and field descriptor keys.
     InteriorField {
         array: Box<AssemblerDescrKey>,
@@ -5974,7 +5974,7 @@ mod tests {
 
     #[test]
     fn use_c_form_matches_assembler_py_membership() {
-        // `assembler.py:312` USE_C_FORM members reachable build-time …
+        // `assembler.py` USE_C_FORM members reachable build-time …
         assert!(use_c_form("int_copy"));
         assert!(use_c_form("int_return"));
         assert!(use_c_form("jit_merge_point"));
@@ -6246,7 +6246,7 @@ mod tests {
 
     #[test]
     fn jit_merge_point_and_loop_header_opnames() {
-        // jtransform.py:1707 `op1 = SpaceOperation('jit_merge_point', args, None)`
+        // jtransform.py `op1 = SpaceOperation('jit_merge_point', args, None)`
         let merge = crate::model::OpKind::JitMergePoint {
             jitdriver_index: 0,
             greens_i: vec![],
@@ -6257,12 +6257,12 @@ mod tests {
             reds_f: vec![],
         };
         assert_eq!(op_kind_to_opname(&merge), "jit_merge_point");
-        // jtransform.py:1718 `SpaceOperation('loop_header', [c_index], None)`
+        // jtransform.py `SpaceOperation('loop_header', [c_index], None)`
         let header = crate::model::OpKind::LoopHeader { jitdriver_index: 0 };
         assert_eq!(op_kind_to_opname(&header), "loop_header");
     }
 
-    /// `OpKind::NewListClear` (`opimpl_newlist_clear`, pyjitpl.py:792-798)
+    /// `OpKind::NewListClear` (`opimpl_newlist_clear`, pyjitpl.py)
     /// carries the same `{length, item_ty, array_type_id}` shape as
     /// `NewArrayClear`.  Its length operand must survive the inline var
     /// remap while the descriptor fields (`item_ty`/`array_type_id`) copy
@@ -6851,7 +6851,7 @@ mod tests {
         // A `setfield_gc_i` whose value is an inline integer Constant takes
         // the short `c` byte (`setfield_gc_i/rcd`) when it fits a signed
         // byte, else a pool `i` slot (`setfield_gc_i/rid`).  `setfield_gc`
-        // ∈ USE_C_FORM, `assembler.py:99-107,312`.
+        // ∈ USE_C_FORM, `assembler.py`.
         let build = |value: i64| -> Assembler {
             let mut graph = FunctionGraph::new("const_setfield");
             let base_var = push_input_var(&mut graph, "obj", ValueType::Ref(None));
@@ -6914,7 +6914,7 @@ mod tests {
 
         // A `setfield_gc_i` whose field is virtualizable rewrites to
         // `setfield_vable_i` (`jtransform.py:921-927`).  `setfield_vable_i`
-        // is NOT in USE_C_FORM (`assembler.py:312-345`), so an inline
+        // is NOT in USE_C_FORM (`assembler.py`), so an inline
         // integer Constant value always takes the pool `i` slot
         // (`setfield_vable_i/rid`) — never the short `c` byte — even when
         // it fits a signed byte.
@@ -7221,7 +7221,7 @@ mod tests {
     /// `getarrayitem_gc_i_pure` opcode (rlist.py:724
     /// `ll_getitem_foldable_nonneg`); a `pure: false` ArrayRead keeps the
     /// non-pure `getarrayitem_gc_i`.  The `rid>i` argcodes are byte-identical
-    /// either way (`blackhole.py:1339-1341` aliases the pure handler) — only
+    /// either way (`blackhole.py` aliases the pure handler) — only
     /// the opname/byte differs.
     fn assemble_arrayread_pure(pure: bool) -> Assembler {
         use crate::flatten::flatten_graph;

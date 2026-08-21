@@ -17,7 +17,7 @@ use crate::translator::backendopt::graphanalyze::{
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::translator::TranslationContext;
 
-/// Upstream `class FinalizerError(Exception)` at `finalizer.py:8-17`.
+/// Upstream `class FinalizerError(Exception)` at `finalizer.py`.
 ///
 /// > `__del__()` is used for lightweight RPython destructors, but the
 /// > FinalizerAnalyzer found that it is not lightweight.
@@ -59,10 +59,10 @@ const OK_OPERATIONS: &[&str] = &[
 /// `finalizer.py:19-64`.
 pub struct FinalizerAnalyzer<'t> {
     translator: &'t TranslationContext,
-    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py:13`).
+    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
     analyzed_calls: UnionFind<usize, Dependency<bool>>,
     /// Upstream `self._must_be_light` set inside
-    /// `analyze_light_finalizer` (`finalizer.py:31-33`). Pyre stores
+    /// `analyze_light_finalizer` (`finalizer.py`). Pyre stores
     /// the graph identity (`Rc::as_ptr` cast) so a subsequent
     /// `analyze_simple_operation` body can surface it in the
     /// `FinalizerError` message.
@@ -162,7 +162,7 @@ fn op_writes_primitive_field(op: &SpaceOperation) -> bool {
     primitive_or_raw_ptr(ct.as_ref())
 }
 
-/// `getfield` field-type primitive predicate at `finalizer.py:54-58`.
+/// `getfield` field-type primitive predicate at `finalizer.py`.
 /// Same shape but the type comes off `op.result.concretetype`.
 fn op_reads_primitive_field(op: &SpaceOperation) -> bool {
     let ct = match &op.result {

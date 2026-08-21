@@ -4,7 +4,7 @@
 //! `OptionDescription` schema tree + a `Config` runtime that holds
 //! one value per option and supports dotted-path `.set(...)` /
 //! `.override(...)` mutation keyed on the schema. Used by
-//! `translator.driver.TranslationDriver.__init__` at `driver.py:70,
+//! `translator.driver.TranslationDriver.__init__` at `driver.py,
 //! :82, :85` to hold translation-time options (`translation.verbose`
 //! / `translation.backend` / …).
 //!
@@ -58,7 +58,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::{Rc, Weak};
 
-/// Upstream `config.py:8 AmbigousOptionError`. Thrown by
+/// Upstream `config.py AmbigousOptionError`. Thrown by
 /// [`Config::set`] when a short-name (e.g. `gc`) matches multiple
 /// full paths (e.g. `translation.gc` and `target.gc`). Name typo
 /// `Ambigous` preserved for grep-parity.
@@ -75,7 +75,7 @@ impl fmt::Display for AmbigousOptionError {
 
 impl std::error::Error for AmbigousOptionError {}
 
-/// Upstream `config.py:11 NoMatchingOptionFound(AttributeError)`.
+/// Upstream `config.py NoMatchingOptionFound(AttributeError)`.
 #[derive(Debug, Clone)]
 pub struct NoMatchingOptionFound {
     pub message: String,
@@ -89,7 +89,7 @@ impl fmt::Display for NoMatchingOptionFound {
 
 impl std::error::Error for NoMatchingOptionFound {}
 
-/// Upstream `config.py:14 ConfigError`. Generic config-layer error.
+/// Upstream `config.py ConfigError`. Generic config-layer error.
 #[derive(Debug, Clone)]
 pub enum ConfigError {
     /// Generic config error (upstream's `ConfigError` base class raise
@@ -110,7 +110,7 @@ pub enum ConfigError {
     /// surfaces a different message for "expected an int" vs "option
     /// not found").
     ValueError(String),
-    /// Upstream `config.py:17 ConflictConfigError(ConfigError)`.
+    /// Upstream `config.py ConflictConfigError(ConfigError)`.
     /// Raised by [`Config::setoption`] when a user mutation would
     /// overwrite a non-default-non-suggested value.
     Conflict(String),
@@ -272,7 +272,7 @@ impl DependencyEdge {
     }
 }
 
-/// Upstream `config.py:213 Option` base class. The port uses a trait
+/// Upstream `config.py Option` base class. The port uses a trait
 /// instead of inheritance because the override points
 /// (`setoption`, `validate`, `add_optparse_option`) naturally map to
 /// trait methods. `getkey` / `convert_from_cmdline` retain upstream's
@@ -368,7 +368,7 @@ pub trait Option {
 #[allow(non_camel_case_types)]
 type Option_<T> = std::option::Option<T>;
 
-/// Upstream `BoolOption(Option)` at `config.py:294-346`.
+/// Upstream `BoolOption(Option)` at `config.py`.
 #[derive(Clone)]
 pub struct BoolOption {
     _name: String,
@@ -506,7 +506,7 @@ impl Option for BoolOption {
     }
 }
 
-/// Upstream `IntOption(Option)` at `config.py:349-367`.
+/// Upstream `IntOption(Option)` at `config.py`.
 #[derive(Debug, Clone)]
 pub struct IntOption {
     _name: String,
@@ -626,7 +626,7 @@ impl Option for IntOption {
     }
 }
 
-/// Upstream `FloatOption(Option)` at `config.py:370-388`.
+/// Upstream `FloatOption(Option)` at `config.py`.
 #[derive(Debug, Clone)]
 pub struct FloatOption {
     _name: String,
@@ -726,7 +726,7 @@ impl Option for FloatOption {
     }
 }
 
-/// Upstream `StrOption(Option)` at `config.py:391-405`.
+/// Upstream `StrOption(Option)` at `config.py`.
 #[derive(Debug, Clone)]
 pub struct StrOption {
     _name: String,
@@ -792,7 +792,7 @@ impl Option for StrOption {
     }
 }
 
-/// Upstream `ChoiceOption(Option)` at `config.py:249-284`.
+/// Upstream `ChoiceOption(Option)` at `config.py`.
 #[derive(Debug, Clone)]
 pub struct ChoiceOption {
     _name: String,
@@ -911,7 +911,7 @@ impl Option for ChoiceOption {
     }
 }
 
-/// Upstream `ArbitraryOption(Option)` at `config.py:408-425`.
+/// Upstream `ArbitraryOption(Option)` at `config.py`.
 ///
 /// `defaultfactory` is `dyn Fn() -> OptionValue` so any dynamically-
 /// produced default is supported. The constructor asserts upstream's
@@ -992,7 +992,7 @@ impl Option for ArbitraryOption {
     }
 }
 
-/// Upstream `config.py:287-292 _getnegation(optname)`. Maps CLI
+/// Upstream `config.py _getnegation(optname)`. Maps CLI
 /// flag names to their "off" counterpart:
 ///
 /// - `without-foo` → `with-foo`
@@ -1034,7 +1034,7 @@ impl Child {
     }
 }
 
-/// Upstream `OptionDescription` at `config.py:428-472`.
+/// Upstream `OptionDescription` at `config.py`.
 pub struct OptionDescription {
     pub _name: String,
     pub doc: String,
@@ -1142,7 +1142,7 @@ impl OptionDescription {
     }
 }
 
-/// Upstream `config.py:20-207 Config`.
+/// Upstream `config.py Config`.
 ///
 /// Holds one value per leaf `Option` under a shared [`OptionDescription`]
 /// schema. Nested `OptionDescription` children are materialised as
@@ -1239,7 +1239,7 @@ impl Config {
         Ok(())
     }
 
-    /// Upstream `Config.override(self, overrides)` at `config.py:40-43`.
+    /// Upstream `Config.override(self, overrides)` at `config.py`.
     /// Name suffixed with `_` to avoid the Rust `override` keyword
     /// (structural parity — same identifier stripped of the reserved-
     /// word collision, documented here).
@@ -1304,7 +1304,7 @@ impl Config {
         Ok(())
     }
 
-    /// Upstream `Config.suggest(self, **kwargs)` at `config.py:117-119`.
+    /// Upstream `Config.suggest(self, **kwargs)` at `config.py`.
     pub fn suggest(
         self: &Rc<Self>,
         kwargs: HashMap<String, OptionValue>,
@@ -1321,7 +1321,7 @@ impl Config {
         let _ = self.setoption(name, value, Owner::Suggested);
     }
 
-    /// Upstream `Config.set(self, **kwargs)` at `config.py:129-143`.
+    /// Upstream `Config.set(self, **kwargs)` at `config.py`.
     /// Resolves short names by matching the suffix against the full
     /// dotted paths returned by `getpaths()`.
     ///
@@ -1720,7 +1720,7 @@ mod tests {
 
     #[test]
     fn config_new_seeds_defaults() {
-        // Upstream `config.py:31-38 _cfgimpl_build`: every Option child
+        // Upstream `config.py _cfgimpl_build`: every Option child
         // receives its `.getdefault()` seed with owner `"default"`.
         let c = Config::new(translation_descr(), HashMap::new()).expect("config");
         let verbose = c.get("translation.verbose").expect("path");
@@ -1732,7 +1732,7 @@ mod tests {
 
     #[test]
     fn config_set_short_name_resolves_unique_suffix() {
-        // Upstream `config.py:129-143 set(**kwargs)`: `gc=boehm` matches
+        // Upstream `config.py set(**kwargs)`: `gc=boehm` matches
         // the full path `translation.gc` (the only path ending with
         // `gc`).
         let c = Config::new(translation_descr(), HashMap::new()).expect("config");
@@ -1747,7 +1747,7 @@ mod tests {
 
     #[test]
     fn config_override_sets_default_owner() {
-        // Upstream `config.py:40-43 override`: writes with
+        // Upstream `config.py override`: writes with
         // `who='default'` so subsequent `setoption("user")` is NOT
         // blocked by ConflictConfigError (override is replacing the
         // default itself).
@@ -1760,7 +1760,7 @@ mod tests {
 
     #[test]
     fn setoption_user_then_conflicting_user_raises() {
-        // Upstream `config.py:112-113` — raising `ConflictConfigError`.
+        // Upstream `config.py` — raising `ConflictConfigError`.
         let c = Config::new(translation_descr(), HashMap::new()).expect("config");
         c.set_value("translation.verbose", OptionValue::Bool(false))
             .expect("first user set");
@@ -1795,7 +1795,7 @@ mod tests {
 
     #[test]
     fn getpaths_returns_leaf_options_in_declaration_order() {
-        // Upstream `config.py:204-207 getpaths` + `:450-472`.
+        // Upstream `config.py getpaths` + `:450-472`.
         let c = Config::new(translation_descr(), HashMap::new()).expect("config");
         let paths = c.getpaths(false);
         assert_eq!(
@@ -1835,7 +1835,7 @@ mod tests {
 
     #[test]
     fn copy_as_default_resets_owners() {
-        // Upstream `config.py:45-62 copy(as_default=True)`: every
+        // Upstream `config.py copy(as_default=True)`: every
         // owner resets to `"default"` so the copy accepts the first
         // user write without conflict.
         let c = Config::new(translation_descr(), HashMap::new()).expect("config");
@@ -1866,7 +1866,7 @@ mod tests {
 
     #[test]
     fn freeze_rejects_value_change() {
-        // Upstream `config.py:64-66 __setattr__` frozen check.
+        // Upstream `config.py __setattr__` frozen check.
         let c = Config::new(translation_descr(), HashMap::new()).expect("config");
         c._freeze_();
         let err = c
@@ -1890,7 +1890,7 @@ mod tests {
 
     #[test]
     fn getnegation_rewrites_cli_prefixes() {
-        // Upstream `config.py:287-292 _getnegation`.
+        // Upstream `config.py _getnegation`.
         assert_eq!(_getnegation("withthread"), "withoutthread");
         assert_eq!(_getnegation("withoutthread"), "withthread");
         assert_eq!(_getnegation("check"), "no-check");
@@ -1898,7 +1898,7 @@ mod tests {
 
     #[test]
     fn bool_option_requires_fire_on_truthy_set() {
-        // Upstream `config.py:313-321 BoolOption.setoption`: truthy
+        // Upstream `config.py BoolOption.setoption`: truthy
         // `_requires` propagate under owner "required" (not "default").
         let flag = BoolOption::new("flag", "switch").with_requires(vec![DependencyEdge::new(
             "backend",
@@ -1929,7 +1929,7 @@ mod tests {
 
     #[test]
     fn config_set_ambigous_on_duplicate_suffix() {
-        // Upstream `config.py:138-140 AmbigousOptionError`. Build a
+        // Upstream `config.py AmbigousOptionError`. Build a
         // schema with two paths ending in `gc` and probe.
         let a_gc = ChoiceOption::new("gc", "a gc", vec!["x".to_string()]).with_default("x");
         let b_gc = ChoiceOption::new("gc", "b gc", vec!["x".to_string()]).with_default("x");

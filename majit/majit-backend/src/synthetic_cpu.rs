@@ -72,7 +72,7 @@ pub fn decode_synthetic(fnaddr: i64) -> Option<usize> {
 #[derive(Default)]
 #[allow(dead_code)]
 pub struct SyntheticCpu {
-    /// `model.py:28-29 self.tracker = CPUTotalTracker()` — synthetic
+    /// `model.py self.tracker = CPUTotalTracker()` — synthetic
     /// backends own a private tracker so cross-test/cross-instance
     /// total counts stay isolated rather than aliasing through the
     /// process-wide fallback.
@@ -95,7 +95,7 @@ impl crate::Backend for SyntheticCpu {
         &self.cpu_tracker
     }
 
-    /// `rpython/jit/backend/model.py:79-91` declares `compile_loop` on every
+    /// `rpython/jit/backend/model.py` declares `compile_loop` on every
     /// `AbstractCPU`.  SyntheticCpu does not produce native code; this method
     /// must never be reached.
     fn compile_loop(

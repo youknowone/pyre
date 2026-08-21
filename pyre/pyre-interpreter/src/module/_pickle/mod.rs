@@ -383,7 +383,7 @@ pub(crate) fn compat_map(
             std::ptr::addr_of!((*state).w_name_mapping).read()
         }
     };
-    // `if w_1:` (find_class, interp_pickle.py:2612) is an interp-level presence
+    // `if w_1:` (find_class, interp_pickle.py) is an interp-level presence
     // test: `space.finditem` returns None when absent, and RPython `if w_1:` on a
     // possibly-None `W_Root` checks `is not None`, not Python truthiness. A
     // present entry commits to `w_module_name, w_name = space.listview(w_1)`,

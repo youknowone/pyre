@@ -33,7 +33,7 @@ impl LifeTime {
     }
 }
 
-/// RPython `parse_file(f, callback)` (`gcstat.py:16-38`).
+/// RPython `parse_file(f, callback)` (`gcstat.py`).
 pub fn parse_file<R, F>(reader: R, mut callback: F) -> Result<(), String>
 where
     R: BufRead,
@@ -94,7 +94,7 @@ where
     Ok(())
 }
 
-/// RPython `collect_all(f)` (`gcstat.py:40-44`).
+/// RPython `collect_all(f)` (`gcstat.py`).
 pub fn collect_all<R>(reader: R) -> Result<Vec<LifeTime>, String>
 where
     R: BufRead,

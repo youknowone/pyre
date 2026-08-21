@@ -30,7 +30,7 @@ use crate::translator::rtyper::rtyper::{
     variable_with_lltype,
 };
 
-/// RPython `UNKNOWN = object()` (`rgcref.py:6`): sentinel marking a
+/// RPython `UNKNOWN = object()` (`rgcref.py`): sentinel marking a
 /// `_ll_eq_func` / `_ll_hash_func` slot as not-yet-computed, distinct from a
 /// computed `None` (the base repr has no eq/hash helper).
 #[derive(Debug, Clone)]
@@ -44,21 +44,21 @@ pub struct GCRefRepr {
     r_base: Arc<dyn Repr>,
     lltype: LowLevelType,
     state: ReprState,
-    /// `self._ll_eq_func = UNKNOWN` (`rgcref.py:21`), memoized on first
+    /// `self._ll_eq_func = UNKNOWN` (`rgcref.py`), memoized on first
     /// `get_ll_eq_function` call.
     _ll_eq_func: RefCell<LlHelperCache>,
-    /// `self._ll_hash_func = UNKNOWN` (`rgcref.py:22`).
+    /// `self._ll_hash_func = UNKNOWN` (`rgcref.py`).
     _ll_hash_func: RefCell<LlHelperCache>,
 }
 
 impl GCRefRepr {
-    /// RPython `GCRefRepr.make(r_base, cache)` (`rgcref.py:11-17`),
-    /// folding in `__init__` (`rgcref.py:20-28`).
+    /// RPython `GCRefRepr.make(r_base, cache)` (`rgcref.py`),
+    /// folding in `__init__` (`rgcref.py`).
     ///
-    /// The conditional `self.ll_str` wrapper (`rgcref.py:24-28`, installed
+    /// The conditional `self.ll_str` wrapper (`rgcref.py`, installed
     /// only `if hasattr(r_base, 'll_str')`) is omitted. Upstream the
-    /// `ll_str` attribute is carried by `VoidRepr` (`rmodel.py:358`, an
-    /// unreachable stub), `TupleRepr` (`rtuple.py:212`,
+    /// `ll_str` attribute is carried by `VoidRepr` (`rmodel.py`, an
+    /// unreachable stub), `TupleRepr` (`rtuple.py`,
     /// `ll_str = property(gen_str_function)`), and the string reprs; pyre's
     /// `Repr` trait has no `ll_str` slot and `rtuple::gen_str_function` is
     /// itself a deferred stub, so no `r_base` supplies `ll_str` and the
@@ -110,7 +110,7 @@ impl Repr for GCRefRepr {
         super::super::pairtype::ReprClassId::GCRefRepr
     }
 
-    /// RPython `GCRefRepr.convert_const` (`rgcref.py:29-30`).
+    /// RPython `GCRefRepr.convert_const` (`rgcref.py`).
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         let base = self.r_base.convert_const(value)?;
         let ConstValue::LLPtr(ptr) = base.value else {
@@ -127,7 +127,7 @@ impl Repr for GCRefRepr {
         ))
     }
 
-    /// RPython `GCRefRepr.get_ll_eq_function` (`rgcref.py:32-46`): compute the
+    /// RPython `GCRefRepr.get_ll_eq_function` (`rgcref.py`): compute the
     /// wrapper once, caching it in `_ll_eq_func` past the `UNKNOWN` sentinel.
     fn get_ll_eq_function(
         &self,
@@ -164,7 +164,7 @@ impl Repr for GCRefRepr {
         }
     }
 
-    /// RPython `GCRefRepr.get_ll_hash_function` (`rgcref.py:48-62`).
+    /// RPython `GCRefRepr.get_ll_hash_function` (`rgcref.py`).
     fn get_ll_hash_function(
         &self,
         rtyper: &RPythonTyper,
@@ -201,15 +201,15 @@ impl Repr for GCRefRepr {
     }
 }
 
-/// RPython `class DummyValueBuilderGCRef(object)` (`rgcref.py:74-104`).
+/// RPython `class DummyValueBuilderGCRef(object)` (`rgcref.py`).
 ///
-/// `ll_dummy_value` (`rgcref.py:93-104`) casts the base-instance dummy
+/// `ll_dummy_value` (`rgcref.py`) casts the base-instance dummy
 /// (`getinstancerepr(None)` → [`DummyValueBuilder`] over `TYPE.TO`) to
 /// `GCREF` and memoises it under `GCREF` in
 /// `RPythonTyper.cache_dummy_values`. Since pyre stores only `rtyper_id`
 /// for identity, the typer is threaded in at call time.
 ///
-/// The producer side — `GCRefRepr.get_ll_dummyval_obj` (`rgcref.py:58-59`)
+/// The producer side — `GCRefRepr.get_ll_dummyval_obj` (`rgcref.py`)
 /// returning this builder — is deferred with the generic
 /// `Repr.get_ll_dummyval_obj`: its only consumers are the unported
 /// dict/ordereddict `ENTRIES.dummy_obj` fields.
@@ -295,7 +295,7 @@ fn as_gcref_repr(repr: &dyn Repr) -> Result<&GCRefRepr, TyperError> {
     })
 }
 
-/// RPython `pairtype(GCRefRepr, Repr).convert_from_to` (`rgcref.py:52-56`).
+/// RPython `pairtype(GCRefRepr, Repr).convert_from_to` (`rgcref.py`).
 pub(crate) fn pair_gcref_repr_convert_from_to(
     _r_from: &dyn Repr,
     r_to: &dyn Repr,
@@ -317,7 +317,7 @@ pub(crate) fn pair_gcref_repr_convert_from_to(
     Ok(None)
 }
 
-/// RPython `pairtype(Repr, GCRefRepr).convert_from_to` (`rgcref.py:58-63`).
+/// RPython `pairtype(Repr, GCRefRepr).convert_from_to` (`rgcref.py`).
 pub(crate) fn pair_repr_gcref_convert_from_to(
     r_from: &dyn Repr,
     r_to: &dyn Repr,

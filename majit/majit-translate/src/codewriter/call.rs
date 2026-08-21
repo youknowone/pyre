@@ -82,9 +82,9 @@ fn is_closure_receiver(receiver: &str) -> bool {
 /// predicates, so the choice is a value here rather than two walks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffectWitness {
-    /// `RandomEffectsAnalyzer` — effectinfo.py:410-418.
+    /// `RandomEffectsAnalyzer` — effectinfo.py.
     RandomEffects,
-    /// `VirtualizableAnalyzer` — effectinfo.py:401-404.
+    /// `VirtualizableAnalyzer` — effectinfo.py.
     ForcesVirtualizable,
 }
 
@@ -123,7 +123,7 @@ pub struct AnalysisCache {
 ///
 /// Represents the set of read/write effects collected from graph traversal.
 /// RPython uses a set of tuples like `("struct", T, fieldname)` and
-/// `compute_bitstrings(all_descrs)` (`effectinfo.py:465`) materializes
+/// `compute_bitstrings(all_descrs)` (`effectinfo.py`) materializes
 /// the EffectInfo bitstrings at the end via
 /// `bitstring.make_bitstring([descr.ei_index for descr in set])`.  Pyre
 /// telescopes that pipeline by collecting the per-descr `ei_index`
@@ -132,7 +132,7 @@ pub struct AnalysisCache {
 /// frozensets, deduped + sorted at conversion time.  Storing as `Vec<u32>`
 /// rather than `u64` removes the 64-descr ceiling so bitstrings scale
 /// with the global descr count, matching PyPy's arbitrary-length
-/// `bitstring.py:3-13 make_bitstring` output.
+/// `bitstring.py make_bitstring` output.
 pub struct WriteAnalysis {
     pub read_fields: Vec<u32>,
     pub write_fields: Vec<u32>,
@@ -140,33 +140,33 @@ pub struct WriteAnalysis {
     pub write_arrays: Vec<u32>,
     pub read_interiorfields: Vec<u32>,
     pub write_interiorfields: Vec<u32>,
-    /// `effectinfo.py:294,301-305` `readonly_descrs_fields = []`
+    /// `effectinfo.py` `readonly_descrs_fields = []`
     /// populated via `add_struct → cpu.fielddescrof(T, fieldname)` from
     /// `("readstruct", T, fieldname)` tuples.
     pub field_read_descrs: Vec<(
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    /// `effectinfo.py:297,301-305` `write_descrs_fields = []` from
+    /// `effectinfo.py` `write_descrs_fields = []` from
     /// `("struct", T, fieldname)` tuples.
     pub field_write_descrs: Vec<(
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    /// `effectinfo.py:296,313-325` `readonly_descrs_interiorfields = []`
+    /// `effectinfo.py` `readonly_descrs_interiorfields = []`
     /// populated via `add_interiorfield → cpu.interiorfielddescrof(T,
     /// fieldname)` from `("readinteriorfield", T, fieldname)` tuples.
     pub interior_read_descrs: Vec<(
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    /// `effectinfo.py:299,313-325` `write_descrs_interiorfields = []`
+    /// `effectinfo.py` `write_descrs_interiorfields = []`
     /// from `("interiorfield", T, fieldname)` tuples.
     pub interior_write_descrs: Vec<(
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    /// `effectinfo.py:295,307-311` `readonly_descrs_arrays = []` populated
+    /// `effectinfo.py` `readonly_descrs_arrays = []` populated
     /// via `add_array → cpu.arraydescrof(ARRAY)` from `("readarray", T)`
     /// tuples (plus `("readinteriorfield", T, _)` tuples synthesised into
     /// `("readarray", T)` at `effectinfo.py:327-340`).
@@ -174,7 +174,7 @@ pub struct WriteAnalysis {
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    /// `effectinfo.py:298,307-311` `write_descrs_arrays = []` mirror of
+    /// `effectinfo.py` `write_descrs_arrays = []` mirror of
     /// the read side, populated from `("array", T)` tuples (plus
     /// `("interiorfield", T, _)` synthesised into `("array", T)`).
     pub array_write_descrs: Vec<(
@@ -188,7 +188,7 @@ pub struct WriteAnalysis {
 /// Call descriptor — `AbstractDescr`-equivalent metadata for a call op.
 ///
 /// RPython equivalent: the `CallDescr` returned by
-/// `CallControl.getcalldescr()` (call.py:236-241), wrapping
+/// `CallControl.getcalldescr()` (call.py), wrapping
 /// `EffectInfo` and the cpu-level descr identity.  Upstream stores
 /// the funcptr separately as `op.args[0]`; pyre carries the funcptr
 /// identity on each `OpKind` variant's dedicated `funcptr` field
@@ -346,7 +346,7 @@ pub enum CallKind {
     Recursive,
 }
 
-/// virtualizable.py:306-307 `VirtualizableInfo.is_vtypeptr(TYPE)` —
+/// virtualizable.py `VirtualizableInfo.is_vtypeptr(TYPE)` —
 /// identity check for the VTYPEPTR (struct-pointer type) the
 /// virtualizable describes.
 ///
@@ -356,9 +356,9 @@ pub enum CallKind {
 /// `VirtualizableInfo` (defined in `majit-metainterp::virtualizable`) by
 /// implementing this trait so codewriter, which sits below metainterp in
 /// the crate graph, can still consult `jd.virtualizable_info` per
-/// `call.py:375-385 CallControl.get_vinfo`.
+/// `call.py CallControl.get_vinfo`.
 pub trait VirtualizableInfoHandle: std::fmt::Debug + Send + Sync {
-    /// virtualizable.py:306-307 `is_vtypeptr(TYPE) → TYPE == self.VTYPEPTR`.
+    /// virtualizable.py `is_vtypeptr(TYPE) → TYPE == self.VTYPEPTR`.
     fn is_vtypeptr(&self, vtypeptr_id: usize) -> bool;
 }
 
@@ -381,7 +381,7 @@ pub trait GreenFieldInfoHandle: std::fmt::Debug + Send + Sync {
 /// `majit-metainterp::virtualref` (the JIT runtime side); codewriter
 /// sits below metainterp in the crate graph and cannot import it.
 /// Hosts implement this trait on `VirtualRefInfo` so
-/// `CodeWriter.setup_vrefinfo` (`codewriter.py:91-94`) can store the
+/// `CodeWriter.setup_vrefinfo` (`codewriter.py`) can store the
 /// instance on `CallControl.virtualref_info`
 /// (`call.py:22 virtualref_info = None`) for later forwarding to
 /// `metainterp_sd.virtualref_info = codewriter.callcontrol.virtualref_info`
@@ -453,10 +453,10 @@ impl VirtualRefInfoHandle for DefaultVirtualRefInfoHandle {
 /// via [`CallControl::set_jitdriver_greenfield_info`].
 #[derive(Debug, Clone)]
 pub struct StaticGreenFieldInfoHandle {
-    /// greenfield.py:14 `self.red_index = jd.jitdriver.reds.index(objname)`
+    /// greenfield.py `self.red_index = jd.jitdriver.reds.index(objname)`
     /// — index of the unique green-field owning red.
     pub red_index: usize,
-    /// greenfield.py:18 `self.green_fields = jd.jitdriver.ll_greenfields.values()`
+    /// greenfield.py `self.green_fields = jd.jitdriver.ll_greenfields.values()`
     /// — `(GTYPE, fieldname)` pairs.
     pub green_fields: Vec<(String, String)>,
 }
@@ -477,7 +477,7 @@ impl GreenFieldInfoHandle for StaticGreenFieldInfoHandle {
 pub struct JitDriverStaticData {
     /// RPython: `jitdriver_sd.index`
     pub index: usize,
-    /// RPython: `jitdriver.active` (jtransform.py:1661-1662). `True` by
+    /// RPython: `jitdriver.active` (jtransform.py). `True` by
     /// default; a deactivated jitdriver drops its `jit_marker` ops at
     /// rewrite time. pyre has no mechanism to deactivate a driver yet, so
     /// this is seeded `true` at `setup_jitdriver`, but the gate is honoured
@@ -489,7 +489,7 @@ pub struct JitDriverStaticData {
     pub reds: Vec<String>,
     /// Optional declared operand kinds parallel to `greens`.
     ///
-    /// Upstream derives these from `PORTALFUNC.ARGS` at warmspot.py:658-670.
+    /// Upstream derives these from `PORTALFUNC.ARGS` at warmspot.py.
     /// Pyre's codewriter does not have that signature layer, so consumers can
     /// declare the positional marker kinds and jtransform checks them.
     pub green_kinds: Vec<majit_ir::Type>,
@@ -524,19 +524,19 @@ pub struct JitDriverStaticData {
     /// codewriter→metainterp boundary is plain Arc handoff (no index
     /// translation step).
     pub mainjitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
-    /// warmspot.py:533 `jd.index_of_virtualizable = jitdriver.reds.index(vname)`.
+    /// warmspot.py `jd.index_of_virtualizable = jitdriver.reds.index(vname)`.
     ///
     /// `-1` for drivers without a virtualizable, otherwise the slot
     /// in `reds` that holds the virtualizable.
     pub index_of_virtualizable: i32,
-    /// warmspot.py:545 `jd.virtualizable_info = vinfos[VTYPEPTR]`.
+    /// warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
     ///
     /// `None` for drivers that do not declare a virtualizable.  Set
     /// from the host runtime once the metainterp-side
     /// `VirtualizableInfo` is built — codewriter only sees the trait
     /// surface required by `CallControl::get_vinfo`.
     pub virtualizable_info: Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
-    /// warmspot.py:519-525 `jd.greenfield_info = GreenFieldInfo(self.cpu, jd)`.
+    /// warmspot.py `jd.greenfield_info = GreenFieldInfo(self.cpu, jd)`.
     ///
     /// Same plumbing as `virtualizable_info` — hosts attach their rich
     /// `GreenFieldInfo` via the trait so `CallControl.could_be_green_field`
@@ -748,7 +748,7 @@ pub struct UnknownCalleeCensus {
     /// `funcobj.graph` arm.
     pub with_graph: HashMap<String, usize>,
     /// No graph, but named in `external_funcobjs`. Upstream's
-    /// `analyze_external_call` arm (`graphanalyze.py:104-108`), reached for
+    /// `analyze_external_call` arm (`graphanalyze.py`), reached for
     /// upstream's reason — with the caveat that membership here means a
     /// `mark_*` setter named the path (`func_effects_mut`), which is an
     /// assertion about the callee rather than upstream's `external`
@@ -756,7 +756,7 @@ pub struct UnknownCalleeCensus {
     /// owns, and the only one.
     pub declared_external: HashMap<String, usize>,
     /// No graph and no declaration. Upstream's `AttributeError` arm
-    /// (`graphanalyze.py:109-112`) takes `top_result()` here; this side
+    /// (`graphanalyze.py`) takes `top_result()` here; this side
     /// answers it as declared-external, which is bottom in five of the six
     /// analyzers.
     pub unknown: HashMap<String, usize>,
@@ -1155,7 +1155,7 @@ pub struct CallControl {
     ///
     /// Convergence path: retired with `impls_for_method_name` and the
     /// name-resolution layer once indirect-call ops carry their candidate
-    /// graph list directly (`call.py:94 graphs_from`, `op.args[-1].value`),
+    /// graph list directly (`call.py graphs_from`, `op.args[-1].value`),
     /// removing the need to recover candidates from a method-name global.
     method_to_impl_types: HashMap<String, Vec<String>>,
 
@@ -1174,7 +1174,7 @@ pub struct CallControl {
     /// commits the body via `OnceLock` interior mutability.
     jitcodes: indexmap::IndexMap<CallPath, std::sync::Arc<crate::jitcode::JitCode>>,
 
-    /// RPython call.py:174-187 resolves `getfunctionptr(graph)` to the
+    /// RPython call.py resolves `getfunctionptr(graph)` to the
     /// graph's real helper address before constructing `JitCode(name,
     /// fnaddr, calldescr)`. majit's source-only codewriter cannot derive
     /// that address from a parsed `CallPath`, so hosts may pre-bind the
@@ -1227,7 +1227,7 @@ pub struct CallControl {
     need_result_type_registry:
         std::cell::RefCell<HashMap<String, crate::codewriter::support::NeedResultType>>,
 
-    /// `support.py:691-692 wrapper = wrapper(*extra)` factory registry.
+    /// `support.py wrapper = wrapper(*extra)` factory registry.
     ///
     /// RPython's `_do_builtin_call` flow for `extra is not None`
     /// (`jtransform.py:480-484` for dict / array build helpers like
@@ -1290,14 +1290,14 @@ pub struct CallControl {
     /// metainterp dependency.
     pub virtualref_info: Option<std::sync::Arc<dyn VirtualRefInfoHandle>>,
 
-    /// RPython: `CallControl.callinfocollection` (call.py:31).
+    /// RPython: `CallControl.callinfocollection` (call.py).
     /// Stores oopspec function info for builtin call handling.
     pub callinfocollection: majit_ir::CallInfoCollection,
 
     /// `cpu.fielddescrof(T, fieldname).get_ei_index()` /
     /// `cpu.arraydescrof(ARRAY).get_ei_index()` —
     /// process-shared sequential, collision-free `ei_index` allocation
-    /// (`effectinfo.py:465 compute_bitstrings`).  Lives on `CallControl`
+    /// (`effectinfo.py compute_bitstrings`).  Lives on `CallControl`
     /// (not `AnalysisCache`) so the bytecode emit path
     /// (`assembler.rs::arraydescrof`) and the writeanalyze walker
     /// (`collect_readwrite_effects`) consult a single source of truth — two
@@ -1334,7 +1334,7 @@ pub struct CallControl {
     /// `derive_subject_inputcells` can resolve a generic receiver's
     /// bound-trait `class_root` to the impl type's `ClassDef`.
     /// RPython has no analogue: its annotator sees the concrete
-    /// receiver class at every call site (`classdesc.py:749 lookup`),
+    /// receiver class at every call site (`classdesc.py lookup`),
     /// while a subject graph annotated standalone only knows the
     /// trait bound.
     trait_unique_impls: HashMap<String, String>,
@@ -1369,7 +1369,7 @@ pub struct CallControl {
     /// Consulted by the heuristic fallback in `all_interiorfielddescrs`
     /// when a struct has no registered StructLayout (Path 1 already carries
     /// `rank` on `StructFieldLayout`).  Rank encoding follows
-    /// `rpython/rtyper/rclass.py:644-678 _parse_field_list`.
+    /// `rpython/rtyper/rclass.py _parse_field_list`.
     pub immutable_fields_by_struct: HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
     /// `descr.py:364 is_pure = ARRAY_INSIDE._immutable_field(None)` parity.
     /// Pre-computed at `set_struct_fields` time by walking
@@ -1634,7 +1634,7 @@ impl StructLayout {
     /// recompute. Per-field type/size/immutability classification stays as
     /// computed from the type strings.
     ///
-    /// `heaptracker.py:51 all_fielddescrs`: this re-synthesis keeps each
+    /// `heaptracker.py all_fielddescrs`: this re-synthesis keeps each
     /// `rows` entry as one leaf — the offset-by-name layout consumed by
     /// `fielddescrof`.  That is sufficient because an inner-field access
     /// resolves on the inner struct directly (owner = the inner type), so
@@ -1705,7 +1705,7 @@ impl StructLayout {
 /// compute_bitstrings()` — the outer `for key in descrs:` loop resets
 /// `mapping = {}` per namespace, so indices can collide across
 /// namespaces.  Indices are monotonic `u32` (no upper bound from the
-/// bitstring representation; `make_bitstring` (`bitstring.py:3-13`)
+/// bitstring representation; `make_bitstring` (`bitstring.py`)
 /// sizes the byte vector to `(max_index + 7) / 8`).  Pyre mirrors this
 /// with three independent counters (`next_field_index`,
 /// `next_array_index`, `next_interiorfield_index`).
@@ -1731,8 +1731,8 @@ pub struct DescrIndexRegistry {
 #[derive(Default)]
 struct DescrIndexRegistryInner {
     /// (owner_root, field_name) → unbounded `ei_index` per
-    /// `effectinfo.py:465 compute_bitstrings`. The value scales with the
-    /// global descr count; `bitstring.make_bitstring` (`bitstring.py:3-13`)
+    /// `effectinfo.py compute_bitstrings`. The value scales with the
+    /// global descr count; `bitstring.make_bitstring` (`bitstring.py`)
     /// produces a bytestring whose length matches the largest index.
     field_indices: HashMap<(Option<String>, String), u32>,
     /// (item_ty_discriminant, array_type_id, len_offset) → unbounded `ei_index`.
@@ -1752,9 +1752,9 @@ impl DescrIndexRegistry {
     /// RPython: `cpu.fielddescrof(T, fieldname).get_ei_index()`.
     ///
     /// Returns the unbounded per-descr `ei_index` matching PyPy's
-    /// `bitstring.py:3-13 make_bitstring(lst)` — the bitstring length
+    /// `bitstring.py make_bitstring(lst)` — the bitstring length
     /// scales with the maximum index, not capped at any width
-    /// (`effectinfo.py:465 compute_bitstrings`).
+    /// (`effectinfo.py compute_bitstrings`).
     pub fn field_index(&self, owner_root: &Option<String>, field_name: &str) -> u32 {
         let mut inner = self.inner.borrow_mut();
         let key = (owner_root.clone(), field_name.to_string());
@@ -2066,7 +2066,7 @@ impl CallControl {
     /// array_type_id, len_offset)` → `ei_index` mapping; routing both through
     /// `descr_indices.array_index` mirrors `effectinfo.py:307-311`'s
     /// shared `cpu.arraydescrof(ARRAY).get_ei_index()` namespace and
-    /// keeps `force_from_effectinfo` (`heap.py:540-560`) from aliasing
+    /// keeps `force_from_effectinfo` (`heap.py`) from aliasing
     /// distinct ARRAY identities onto the same bitstring slot.
     pub fn arraydescrof_for_type(
         &self,
@@ -2123,8 +2123,8 @@ impl CallControl {
     /// `Arc<dyn ArrayDescr>` rather than the trait-erased `DescrRef`.
     /// Used by [`Self::interiorfielddescrof`] which needs the array-descr
     /// trait surface for `SimpleInteriorFieldDescr::new`, mirroring
-    /// `descr.py:430 arraydescr = get_array_descr(gc_ll_descr, ARRAY)`
-    /// reuse inside `get_interiorfield_descr` (`descr.py:404-437`).
+    /// `descr.py arraydescr = get_array_descr(gc_ll_descr, ARRAY)`
+    /// reuse inside `get_interiorfield_descr` (`descr.py`).
     ///
     /// `ei_publish`: `Some(array_idx)` stamps `descr.set_ei_index(array_idx)`
     /// per the codewriter array-namespace pre-seed (`effectinfo.py:307-311`);
@@ -2152,9 +2152,9 @@ impl CallControl {
             .map(String::from);
         let elem_ref = elem_name.as_deref();
         let is_struct = elem_ref.is_some_and(|n| self.is_known_struct(n));
-        // descr.py:363 — flag = get_type_flag(ARRAY_INSIDE.OF).
+        // descr.py — flag = get_type_flag(ARRAY_INSIDE.OF).
         // descr.py:354 — itemsize from symbolic.get_array_token().
-        // descr.py:365 — ArrayDescr(basesize, itemsize, ..., flag).
+        // descr.py — ArrayDescr(basesize, itemsize, ..., flag).
         // Even for struct(struct), itemsize is correct from symbolic.
         let (flag, item_size, item_type) = if is_struct {
             (
@@ -2185,7 +2185,7 @@ impl CallControl {
                 ir_type,
             )
         };
-        // descr.py:366-370 — `concrete_type='f'` when the element OF is
+        // descr.py — `concrete_type='f'` when the element OF is
         // Float or SingleFloat.  A SingleFloat (`f32`) array element is
         // int-banked (`Type::Int`, `get_type_flag`) but keeps the `'f'`
         // width marker, so detect it by element name too.  Otherwise
@@ -2208,7 +2208,7 @@ impl CallControl {
             None => 0,
             Some(off) => self.array_items_base(off + self.array_header_size, elem_ref, item_size),
         };
-        // `descr.py:348-378 get_array_descr(gccache, ARRAY_OR_STRUCT)`:
+        // `descr.py get_array_descr(gccache, ARRAY_OR_STRUCT)`:
         // PyPy keys `cache[ARRAY_OR_STRUCT]` on the ARRAY lltype's
         // object identity.  Pyre's analogue is the codewriter
         // `array_type_id` Rust type spelling — distinct ARRAYs disagree
@@ -2226,7 +2226,7 @@ impl CallControl {
                 let path_hash_u64 = majit_ir::descr::path_hash(atid);
                 let nolength = len_offset.is_none();
                 let length_offset = len_offset.unwrap_or(0);
-                // `descr.py:348-378 get_array_descr` cache-or-mint:
+                // `descr.py get_array_descr` cache-or-mint:
                 // `LLType::Array(path_hash(atid))` cache hit returns the
                 // runtime `__majit_register_descrs`-or-prior-analyzer-
                 // minted `Arc<SimpleArrayDescr>`; a miss mints a fresh
@@ -2317,7 +2317,7 @@ impl CallControl {
                 // alias on).
                 let lendescr: Option<majit_ir::descr::DescrRef> = len_offset.map(|off| {
                     use majit_ir::descr::SimpleFieldDescr;
-                    // `descr.py:264 get_field_arraylen_descr` shape:
+                    // `descr.py get_field_arraylen_descr` shape:
                     // `FieldDescr("len", ofs, WORD, FLAG_SIGNED)`.
                     let word_size = crate::layout::target_word_size();
                     std::sync::Arc::new(SimpleFieldDescr::new_with_name(
@@ -2352,7 +2352,7 @@ impl CallControl {
         // `descr_indices.array_index` identifies this descr in BhDescr
         // round-trips on `pyre-jit-trace::state` decoders.
         ad_arc.set_index(idx);
-        // `effectinfo.py:465 compute_bitstrings` ei_index pre-seed
+        // `effectinfo.py compute_bitstrings` ei_index pre-seed
         // (analyzer publishes the codewriter array_index for
         // `force_from_effectinfo` lookup before `compute_bitstrings`
         // overwrites with the (eisetr, eisetw) class index).  `None`
@@ -2372,7 +2372,7 @@ impl CallControl {
     /// element type come from `get_type_flag(field_type_str)` (same
     /// mechanism `arraydescrof` uses for primitive item sizing).
     ///
-    /// PyPy's `descr.py:218-239 get_field_descr` caches by `(STRUCT,
+    /// PyPy's `descr.py get_field_descr` caches by `(STRUCT,
     /// fieldname)`, so analyzer and runtime users reach one descriptor. Pyre
     /// uses `path_hash(STRUCT)` for that identity. Runtime publication hashes
     /// the definition path through `__majit_type_id` (in `jit_struct.rs`),
@@ -2381,7 +2381,7 @@ impl CallControl {
     /// that owner to its definition path before hashing. The same rule is used
     /// by `interiorfielddescrof` and `all_interiorfielddescrs`.
     ///
-    /// `effectinfo.py:465-538 compute_bitstrings` stores the effect-info index
+    /// `effectinfo.py compute_bitstrings` stores the effect-info index
     /// on the descriptor itself. Canonicalization therefore also ensures that
     /// cross-module callers read the index written by `set_ei_index` from the
     /// same `register_keyed_field` descriptor.
@@ -2417,7 +2417,7 @@ impl CallControl {
     /// runtime share the SAME Arc — `set_ei_index` stamps land on
     /// the runtime's `PyreFieldDescr` instead of a parallel
     /// analyzer-mint `SimpleFieldDescr`.  Resolution order matches
-    /// PyPy `descr.py:218-239 get_field_descr`:
+    /// PyPy `descr.py get_field_descr`:
     ///
     ///   1. `gc_cache.get_size_descr(struct_key)` → cache hit on
     ///      runtime-published `PyreSizeDescr` (publish key = same
@@ -2472,7 +2472,7 @@ impl CallControl {
                 continue;
             }
             if fname == field_name {
-                // `descr.py:218-239 get_field_descr(gccache, STRUCT,
+                // `descr.py get_field_descr(gccache, STRUCT,
                 // fieldname)` cache-or-mint: a `(STRUCT, fieldname)`
                 // cache hit returns the runtime
                 // `__majit_register_descrs`-minted Arc; a miss mints a
@@ -2492,7 +2492,7 @@ impl CallControl {
                 // is the sole writer of this slot (the macro path
                 // discards the return).
                 //
-                // `descr.py:229 is_immutable = STRUCT._immutable_field(
+                // `descr.py is_immutable = STRUCT._immutable_field(
                 // fieldname)` parity: consult
                 // `self.immutable_fields_by_struct` populated from the
                 // program's `#[jit_immutable_fields("name", "name?",
@@ -2523,7 +2523,7 @@ impl CallControl {
                     LLType::Struct(id) => id,
                     _ => unreachable!("fielddescrof_concrete always builds a Struct key"),
                 };
-                // `descr.py:234-238 get_field_descr` always calls
+                // `descr.py get_field_descr` always calls
                 // `get_size_descr(gccache, STRUCT, vtable)` to bind
                 // `fielddescr.parent_descr` before returning. Pyre's
                 // `get_field_descr` only reads `_cache_size` (no mint).
@@ -2698,7 +2698,7 @@ impl CallControl {
     /// `"Point"`), then looking up the named field's offset/size from
     /// `self.struct_fields`. The containing array's
     /// `SimpleArrayDescr` is minted inline at `Ref` element type
-    /// (PyPy's `consider_array(ARRAY)` filter at `effectinfo.py:392`
+    /// (PyPy's `consider_array(ARRAY)` filter at `effectinfo.py`
     /// only emits interiorfield effects for struct arrays where
     /// `ARRAY.OF` is a GcStruct).
     ///
@@ -2735,7 +2735,7 @@ impl CallControl {
         if !self.is_known_struct(&elem_name) {
             return None;
         }
-        // PyPy `descr.py:435 fielddescr = get_field_descr(gc_ll_descr,
+        // PyPy `descr.py fielddescr = get_field_descr(gc_ll_descr,
         // REALARRAY.OF, name)` — the inner FieldDescr.index is the
         // stable per-parent slot from `heaptracker.get_fielddescr_index_in()`
         // (descr.py:228), NOT the analyzer's interiorfield-namespace
@@ -3203,7 +3203,7 @@ impl CallControl {
         );
     }
 
-    /// `codewriter.py:91-94 CodeWriter.setup_vrefinfo(self, vrefinfo)`.
+    /// `codewriter.py CodeWriter.setup_vrefinfo(self, vrefinfo)`.
     ///
     /// ```python
     /// def setup_vrefinfo(self, vrefinfo):
@@ -3219,18 +3219,18 @@ impl CallControl {
     /// codewriter-wrapper-to-callcontrol routing for
     /// `codewriter.py:96-99`.
     pub fn setup_vrefinfo(&mut self, vrefinfo: std::sync::Arc<dyn VirtualRefInfoHandle>) {
-        // codewriter.py:93 `assert self.callcontrol.virtualref_info is None`.
+        // codewriter.py `assert self.callcontrol.virtualref_info is None`.
         assert!(
             self.virtualref_info.is_none(),
             "setup_vrefinfo: must be called at most once (codewriter.py:92)"
         );
-        // codewriter.py:94 `self.callcontrol.virtualref_info = vrefinfo`.
+        // codewriter.py `self.callcontrol.virtualref_info = vrefinfo`.
         self.virtualref_info = Some(vrefinfo);
     }
 
     /// Register a JitDriver with its green/red/virtualizable layout.
     ///
-    /// RPython: `CodeWriter.setup_jitdriver(jitdriver_sd)` (codewriter.py:96-99)
+    /// RPython: `CodeWriter.setup_jitdriver(jitdriver_sd)` (codewriter.py)
     /// + `jitdriver.virtualizables` (rlib/jit.py:601-603).
     /// Each jitdriver gets a sequential index.
     ///
@@ -3292,7 +3292,7 @@ impl CallControl {
         }
     }
 
-    /// warmspot.py:528-545 `jd.virtualizable_info = vinfos[VTYPEPTR]`.
+    /// warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
     ///
     /// Attach the host-built [`VirtualizableInfoHandle`] to the
     /// pre-registered driver at `index`.  Mirrors the upstream
@@ -3323,7 +3323,7 @@ impl CallControl {
         self.jitdrivers_sd[index].greenfield_info = Some(info);
     }
 
-    /// warmspot.py:515-545 `WarmRunnerDesc.make_virtualizable_infos`.
+    /// warmspot.py `WarmRunnerDesc.make_virtualizable_infos`.
     ///
     /// ```python
     /// def make_virtualizable_infos(self):
@@ -3352,7 +3352,7 @@ impl CallControl {
     /// ```
     ///
     /// TODO: upstream owns this method on
-    /// `WarmRunnerDesc` (warmspot.py:451) so it can mutate the single
+    /// `WarmRunnerDesc` (warmspot.py) so it can mutate the single
     /// shared `jitdrivers_sd` list (the same Python list object is
     /// referenced by both `WarmRunnerDesc.jitdrivers_sd` and
     /// `MetaInterpStaticData.jitdrivers_sd`).  Pyre splits that list
@@ -3388,7 +3388,7 @@ impl CallControl {
     where
         VF: FnMut(usize, &str) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
     {
-        // warmspot.py:516 `vinfos = {}` — per-VTYPEPTR cache so multiple
+        // warmspot.py `vinfos = {}` — per-VTYPEPTR cache so multiple
         // jitdrivers sharing the same virtualizable type reuse one handle.
         let mut vinfos: std::collections::HashMap<
             String,
@@ -3405,7 +3405,7 @@ impl CallControl {
         VF: FnMut(usize, &str) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>>,
     {
         for jd_idx in 0..self.jitdrivers_sd.len() {
-            // warmspot.py:519 `jd.greenfield_info = None`
+            // warmspot.py `jd.greenfield_info = None`
             self.jitdrivers_sd[jd_idx].greenfield_info = None;
             // warmspot.py:520-524 — scan greens for '.' and split each
             // dotted name into `(objname, fieldname)`.  Upstream
@@ -3432,14 +3432,14 @@ impl CallControl {
             // descriptor-aware metainterp variant via
             // `set_jitdriver_greenfield_info`.
             if !seen.is_empty() {
-                // greenfield.py:11-13 `assert len(seen) == 1`.
+                // greenfield.py `assert len(seen) == 1`.
                 assert_eq!(
                     seen.len(),
                     1,
                     "greenfield.py:11 — only one instance with green fields supported, found {seen:?}",
                 );
                 let objname = &seen[0];
-                // greenfield.py:14 `red_index = jd.jitdriver.reds.index(objname)`.
+                // greenfield.py `red_index = jd.jitdriver.reds.index(objname)`.
                 let red_index = self.jitdrivers_sd[jd_idx]
                     .reds
                     .iter()
@@ -3450,7 +3450,7 @@ impl CallControl {
                             self.jitdrivers_sd[jd_idx].reds
                         )
                     });
-                // greenfield.py:18 `self.green_fields = jd.jitdriver.ll_greenfields.values()`
+                // greenfield.py `self.green_fields = jd.jitdriver.ll_greenfields.values()`
                 // — values are `(GTYPE, fieldname)` pairs.  Resolve `GTYPE`
                 // by looking up the red slot's type from `red_types`
                 // (parallel to `reds`); legacy callers without
@@ -3482,7 +3482,7 @@ impl CallControl {
                 self.jitdrivers_sd[jd_idx].greenfield_info.is_none(),
                 "warmspot.py:532 — greenfield + virtualizable on the same driver: XXX not supported yet",
             );
-            // warmspot.py:534-538 `[vname] = jitdriver.virtualizables`
+            // warmspot.py `[vname] = jitdriver.virtualizables`
             //                    `jd.index_of_virtualizable = jitdriver.reds.index(vname)`
             assert_eq!(
                 self.jitdrivers_sd[jd_idx].virtualizables.len(),
@@ -3529,14 +3529,14 @@ impl CallControl {
         }
     }
 
-    /// call.py:357-361 `jitdriver_sd_from_portal_graph(graph)`.
+    /// call.py `jitdriver_sd_from_portal_graph(graph)`.
     pub fn jitdriver_sd_from_portal_graph(&self, path: &CallPath) -> Option<&JitDriverStaticData> {
         self.jitdrivers_sd
             .iter()
             .find(|sd| &sd.portal_graph == path)
     }
 
-    /// call.py:363-367 `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
+    /// call.py `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
     ///
     /// Pyre has no separate `portal_runner_ptr` (the runner is the
     /// portal graph itself), so we reuse the path lookup.  Future
@@ -3548,7 +3548,7 @@ impl CallControl {
         self.jitdriver_sd_from_portal_graph(path)
     }
 
-    /// call.py:369-373 `jitdriver_sd_from_jitdriver(jitdriver)`.
+    /// call.py `jitdriver_sd_from_jitdriver(jitdriver)`.
     ///
     /// Pyre identifies a jit driver by its index slot in
     /// `jitdrivers_sd`; we expose the slot lookup under the upstream
@@ -3566,7 +3566,7 @@ impl CallControl {
         self.jitdrivers_sd.get_mut(index)
     }
 
-    /// call.py:375-385 `get_vinfo(VTYPEPTR)`.
+    /// call.py `get_vinfo(VTYPEPTR)`.
     ///
     /// ```python
     /// def get_vinfo(self, VTYPEPTR):
@@ -3619,7 +3619,7 @@ impl CallControl {
         }
     }
 
-    /// call.py:387-393 `could_be_green_field(GTYPE, fieldname)`.
+    /// call.py `could_be_green_field(GTYPE, fieldname)`.
     ///
     /// ```python
     /// def could_be_green_field(self, GTYPE, fieldname):
@@ -3648,12 +3648,12 @@ impl CallControl {
 
     /// Discover candidate graphs by BFS from portal targets.
     ///
-    /// RPython: `CallControl.find_all_graphs(policy)` (call.py:49-92).
+    /// RPython: `CallControl.find_all_graphs(policy)` (call.py).
     ///
     /// Walks from portal graphs transitively: for each Call op,
     /// if the callee has a graph, add it to the candidate set.
     /// Portal must be seeded via `mark_portal()` before calling.
-    /// call.py:49 `find_all_graphs(self, policy)`.
+    /// call.py `find_all_graphs(self, policy)`.
     ///
     /// Discovers all candidate graphs reachable from the portal entry
     /// points. RPython uses `policy.look_inside_graph` to decide whether
@@ -3845,7 +3845,7 @@ impl CallControl {
                     // `call.py:76-77` — only `direct_call` and
                     // `indirect_call` ops are walked; everything else is
                     // skipped.  The op-shape dispatch produces the callee
-                    // set `call.py:83 graphs_from(op, is_candidate)` would
+                    // set `call.py graphs_from(op, is_candidate)` would
                     // yield: one path for a direct call, the whole family
                     // for an indirect one.
                     let callees: Vec<CallPath> = match &op.kind {
@@ -4132,14 +4132,14 @@ impl CallControl {
 
     /// Read the number of jitcodes already appended to `all_jitcodes[]`.
     /// Drain loop callers use this to compute the `index` passed into
-    /// `transform_graph_to_jitcode` (upstream `codewriter.py:80
+    /// `transform_graph_to_jitcode` (upstream `codewriter.py
     /// self.transform_graph_to_jitcode(graph, jitcode, verbose,
     /// len(all_jitcodes))`).
     pub fn finished_jitcodes_len(&self) -> usize {
         self.finished_jitcodes.len()
     }
 
-    /// RPython `call.py:182-187 get_jitcode_calldescr` source-of-truth for
+    /// RPython `call.py get_jitcode_calldescr` source-of-truth for
     /// `FUNC.RESULT`. Pyre derives the calldescr's result kind char from
     /// `graph.return_type` (stamped at registration, mirroring
     /// `funcptr._obj.TO.RESULT`). The mapping mirrors
@@ -4320,7 +4320,7 @@ impl CallControl {
         self.finished_jitcodes.clone()
     }
 
-    /// RPython: `CallControl.grab_initial_jitcodes()` (call.py:145-148).
+    /// RPython: `CallControl.grab_initial_jitcodes()` (call.py).
     ///
     /// ```python
     /// def grab_initial_jitcodes(self):
@@ -4359,7 +4359,7 @@ impl CallControl {
         }
     }
 
-    /// RPython: `CallControl.enum_pending_graphs()` (call.py:150-153).
+    /// RPython: `CallControl.enum_pending_graphs()` (call.py).
     ///
     /// ```python
     /// def enum_pending_graphs(self):
@@ -4382,7 +4382,7 @@ impl CallControl {
 
     /// Classify a call.
     ///
-    /// RPython `call.py:116-139 CallControl.guess_call_kind(op, is_candidate)`
+    /// RPython `call.py CallControl.guess_call_kind(op, is_candidate)`
     /// — line-by-line port.  The `op.opname == 'direct_call'` branch
     /// (call.py:117-136) maps to `OpKind::Call`; the implicit
     /// `indirect_call` branch (RPython falls through to the final
@@ -4397,7 +4397,7 @@ impl CallControl {
             // RPython `call.py:117-136` direct_call branch.
             let path = self.target_to_path(target);
             if let Some(ref p) = path {
-                // call.py:119-120 jitdriver_sd_from_portal_runner_ptr(funcptr)
+                // call.py jitdriver_sd_from_portal_runner_ptr(funcptr)
                 if self.jitdrivers_sd.iter().any(|jd| &jd.portal_graph == p) {
                     return CallKind::Recursive;
                 }
@@ -4405,7 +4405,7 @@ impl CallControl {
                 if self.func_effects(p).is_some_and(|f| f.close_stack) {
                     return CallKind::Residual;
                 }
-                // call.py:135-136 `hasattr(targetgraph.func, 'oopspec')` → 'builtin'
+                // call.py `hasattr(targetgraph.func, 'oopspec')` → 'builtin'
                 if self.func_effects(p).is_some_and(|f| f.oopspec.is_some()) {
                     return CallKind::Builtin;
                 }
@@ -4422,7 +4422,7 @@ impl CallControl {
 
     /// Collect every candidate callee graph reachable through this op.
     ///
-    /// RPython `call.py:94-114 CallControl.graphs_from(op, is_candidate)`
+    /// RPython `call.py CallControl.graphs_from(op, is_candidate)`
     /// — line-by-line port.  The `op.opname == 'direct_call'` branch
     /// (call.py:97-101) returns `[graph]` for a direct call whose target
     /// is a candidate; the `op.opname == 'indirect_call'` branch
@@ -4431,7 +4431,7 @@ impl CallControl {
     /// collapse to `None` when no candidate is reachable — the residual
     /// call path.
     ///
-    /// The `is_candidate` argument from RPython `call.py:94-96` is
+    /// The `is_candidate` argument from RPython `call.py` is
     /// omitted here because majit's `find_all_graphs_for_tests` /
     /// `find_all_graphs` populates `self.candidate_graphs` in bulk
     /// before any caller invokes `graphs_from`; the RPython
@@ -4541,7 +4541,7 @@ impl CallControl {
                 // declaration (e.g.
                 // `lib.rs::register_function_graph_alias` chains).
                 //
-                // PyPy parity: `flowcontext.py:845-866 LOAD_GLOBAL`
+                // PyPy parity: `flowcontext.py LOAD_GLOBAL`
                 // applies to bare-name references; qualified
                 // `module.func` reaches the bookkeeper through its
                 // explicit attribute lookup, not the `f_globals`
@@ -4589,7 +4589,7 @@ impl CallControl {
                     // both modules define a same-leaf free fn with
                     // different signatures.  Mirrors PyPy
                     // `bookkeeper.getdesc(callable)`'s per-function-
-                    // object identity (`annrpython.py:103-150 build_types`)
+                    // object identity (`annrpython.py build_types`)
                     // which never crosses the module boundary on a
                     // syntactically-qualified callsite.
                     //
@@ -4794,7 +4794,7 @@ impl CallControl {
             .cloned()
     }
 
-    /// RPython `call.py:181-183` uses `getfunctionptr(graph)` to obtain the
+    /// RPython `call.py` uses `getfunctionptr(graph)` to obtain the
     /// integer funcptr identity for a call site. majit prefers a host-bound
     /// trace-call address when one has been registered for the resolved
     /// `CallPath`; otherwise it falls back to the stable symbolic address
@@ -4885,7 +4885,7 @@ impl CallControl {
     /// symbolic placeholder.
     ///
     /// Used by [`crate::codewriter::support::builtin_func_for_spec`]
-    /// to mirror RPython's `support.py:767-808` `(c_func, LIST_OR_DICT)`
+    /// to mirror RPython's `support.py` `(c_func, LIST_OR_DICT)`
     /// shape — upstream materialises the helper through
     /// `MixLevelHelperAnnotator.constfunc(impl, ...)`, pyre consults
     /// the persistent fnaddr cache populated from
@@ -4956,7 +4956,7 @@ impl CallControl {
             .insert(canonical_name.to_string(), ty);
     }
 
-    /// `support.py:782` `getattr(impl, 'need_result_type', False)`.
+    /// `support.py` `getattr(impl, 'need_result_type', False)`.
     ///
     /// Returns `Some(ty)` when the host registered the flag for the
     /// canonical name; `None` when it didn't (callers default to
@@ -4972,7 +4972,7 @@ impl CallControl {
             .copied()
     }
 
-    /// `support.py:691-692 wrapper = wrapper(*extra)` factory registration.
+    /// `support.py wrapper = wrapper(*extra)` factory registration.
     ///
     /// Hosts that expose a dict / array build helper register one
     /// fnaddr per `(canonical_name, extrakey)` pair before the
@@ -5336,7 +5336,7 @@ impl CallControl {
         }
     }
 
-    /// RPython: `getattr(func, "_elidable_function_", False)` (call.py:239).
+    /// RPython: `getattr(func, "_elidable_function_", False)` (call.py).
     /// Mark a target as elidable (pure function). Sets the typed
     /// `func.elidable` (read by the analyzers, order-insensitive via the
     /// external-funcobj merge) and stamps the `"elidable"` token onto
@@ -5346,7 +5346,7 @@ impl CallControl {
         self.stamp_graph_hint(&path, "elidable");
     }
 
-    /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py:240).
+    /// RPython: `getattr(func, "_jit_loop_invariant_", False)` (call.py).
     /// Mark a target as loop-invariant.
     pub fn mark_loopinvariant(&mut self, path: CallPath) {
         self.func_effects_mut(&path).loop_invariant = true;
@@ -5454,7 +5454,7 @@ impl CallControl {
         self.stamp_graph_hint(&path, "close_stack");
     }
 
-    /// RPython: collectanalyze.py:21 — `funcobj.random_effects_on_gcobjs`.
+    /// RPython: collectanalyze.py — `funcobj.random_effects_on_gcobjs`.
     /// Mark an external target as having random GC effects.
     pub fn mark_external_gc_effects(&mut self, path: CallPath) {
         self.func_effects_mut(&path).random_effects_on_gcobjs = true;
@@ -5472,13 +5472,13 @@ impl CallControl {
         self.func_effects_mut(&path).canmallocgc = true;
     }
 
-    /// RPython: collectanalyze.py:15 — `_gctransformer_hint_cannot_collect_`.
+    /// RPython: collectanalyze.py — `_gctransformer_hint_cannot_collect_`.
     /// Mark a target as known not to trigger GC collection.
     pub fn mark_cannot_collect(&mut self, path: CallPath) {
         self.func_effects_mut(&path).cannot_collect = true;
     }
 
-    /// RPython: rlib/jit.py:250 `@oopspec(spec)` — store `func.oopspec = spec`.
+    /// RPython: rlib/jit.py `@oopspec(spec)` — store `func.oopspec = spec`.
     /// Mark a target as having an oopspec string for jtransform lowering.
     ///
     /// Presence of `func.oopspec` is also the builtin signal (call.py:135
@@ -5525,7 +5525,7 @@ impl CallControl {
     /// Census of how the analyzers' `function_graphs.get(path)` lookup
     /// classifies every static call site in the registered universe (callee census).
     ///
-    /// `GraphAnalyzer.analyze` (`graphanalyze.py:93-130`) — the single base
+    /// `GraphAnalyzer.analyze` (`graphanalyze.py`) — the single base
     /// all six analyzers below share — splits a `direct_call` four ways, and
     /// two of those arrive here as one. Upstream reads "external" off a
     /// *declaration* on the funcobj (`:104-108`) and gives a callee whose
@@ -5698,7 +5698,7 @@ impl CallControl {
 
     /// RPython: RaiseAnalyzer.analyze() — transitive can-raise analysis.
     ///
-    /// canraise.py:8-24: RaiseAnalyzer(BoolGraphAnalyzer)
+    /// canraise.py: RaiseAnalyzer(BoolGraphAnalyzer)
     /// - `analyze_simple_operation`: checks `LL_OPERATIONS[op.opname].canraise`
     /// - `analyze_external_call`: `getattr(fnobj, 'canraise', True)`
     /// - `analyze_exceptblock_in_graph`: checks except blocks
@@ -5732,7 +5732,7 @@ impl CallControl {
                         self.analyze_can_raise_impl(&callee_path, seen, ignore_memoryerror)
                     }
                     OpKind::IndirectCall { graphs, .. } => match graphs.as_deref() {
-                        None => true, // graphanalyze.py:117-121 → top_result()
+                        None => true, // graphanalyze.py → top_result()
                         Some(graphs) => {
                             for callee_path in graphs {
                                 if self.analyze_can_raise_impl(
@@ -5753,7 +5753,7 @@ impl CallControl {
                 }
             }
         }
-        // RPython `backendopt/canraise.py:27-41 analyze_exceptblock_in_graph`
+        // RPython `backendopt/canraise.py analyze_exceptblock_in_graph`
         // only applies the re-raise suppression in the ignore-MemoryError
         // analyzer. The normal analyzer always treats exceptblock exits as
         // raising.
@@ -5771,7 +5771,7 @@ impl CallControl {
         false
     }
 
-    /// RPython: VirtualizableAnalyzer.analyze() (effectinfo.py:401-404).
+    /// RPython: VirtualizableAnalyzer.analyze() (effectinfo.py).
     ///
     /// analyze_simple_operation: op.opname in ('jit_force_virtualizable',
     ///                                         'jit_force_virtual')
@@ -5816,7 +5816,7 @@ impl CallControl {
         false
     }
 
-    /// RPython: RandomEffectsAnalyzer.analyze() (effectinfo.py:410-418).
+    /// RPython: RandomEffectsAnalyzer.analyze() (effectinfo.py).
     ///
     /// ```python
     /// class RandomEffectsAnalyzer(BoolGraphAnalyzer):
@@ -5883,7 +5883,7 @@ impl CallControl {
         false
     }
 
-    /// RPython: `GraphAnalyzer.explain_analyze_slowly` (graphanalyze.py:79-91)
+    /// RPython: `GraphAnalyzer.explain_analyze_slowly` (graphanalyze.py)
     /// — re-run the analysis with `verbose` set and collect the callstack that
     /// reached the top result, for `_raise_effect_error` to print
     /// (call.py:189-208). The fast analyzers memoize a bare bool, so the
@@ -5968,7 +5968,7 @@ impl CallControl {
         false
     }
 
-    /// RPython: `_raise_effect_error` (call.py:189-208). A failed
+    /// RPython: `_raise_effect_error` (call.py). A failed
     /// `elidable` / `_jit_loop_invariant_` post-condition prints the
     /// callstack that produced the contradicting effect before the error
     /// itself, so the offending edge is named instead of searched for.
@@ -6055,12 +6055,12 @@ impl CallControl {
     /// (collectanalyze.py + graphanalyze.py:139).
     ///
     /// Traverses graph ops with:
-    /// - analyze_simple_operation (collectanalyze.py:27-33): checks malloc/
+    /// - analyze_simple_operation (collectanalyze.py): checks malloc/
     ///   malloc_varsize with GC flavor, LL_OPERATIONS[op].canmallocgc.
     ///   In majit the codewriter graph has no LL_OPERATIONS; allocations are
     ///   only reachable transitively through calls.
     /// - analyze_direct_call: recurse into callee graphs.
-    /// - analyze_external_call (graphanalyze.py:60): bottom_result() (False).
+    /// - analyze_external_call (graphanalyze.py): bottom_result() (False).
     /// - _gctransformer_hint_cannot_collect_ (collectanalyze.py:15-16):
     ///   functions whose `func.cannot_collect` is set are known not to collect.
     fn analyze_can_collect(&self, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
@@ -6079,7 +6079,7 @@ impl CallControl {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => {
-                // collectanalyze.py:21-25: analyze_external_call —
+                // collectanalyze.py: analyze_external_call —
                 // if funcobj.random_effects_on_gcobjs → True,
                 // else → bottom_result() (False).
                 //
@@ -6098,15 +6098,15 @@ impl CallControl {
         };
         for block in &graph.blocks {
             for op in &block.operations {
-                // collectanalyze.py:27-33: analyze_simple_operation
+                // collectanalyze.py: analyze_simple_operation
                 // RPython checks: malloc/malloc_varsize with flavor='gc' → True
                 //                 LL_OPERATIONS[op.opname].canmallocgc → True
                 match &op.kind {
-                    // collectanalyze.py:28-30 — `malloc` / `malloc_varsize`
+                    // collectanalyze.py — `malloc` / `malloc_varsize`
                     // with `flavor='gc'`. These four variants are that
                     // operation on this side of jtransform: `New` and
                     // `NewWithVtable` are `malloc(GcStruct, flavor='gc')`
-                    // (`rewrite_op_malloc`, jtransform.py:1012-1045),
+                    // (`rewrite_op_malloc`, jtransform.py),
                     // `NewArrayClear` is `new_array_clear`
                     // (jtransform.py:1858-1863), and `NewListClear` allocates
                     // a GcStruct plus a cleared items array
@@ -6118,10 +6118,10 @@ impl CallControl {
                     | OpKind::NewArrayClear { .. }
                     | OpKind::NewListClear { .. } => return true,
                     OpKind::Call { target, .. } => {
-                        // graphanalyze.py:139-164: analyze_direct_call — recurse
+                        // graphanalyze.py: analyze_direct_call — recurse
                         let callee_path = match self.target_to_path(target) {
                             Some(p) => p,
-                            // graphanalyze.py:60: external call → bottom_result (False)
+                            // graphanalyze.py: external call → bottom_result (False)
                             None => continue,
                         };
                         if self.analyze_can_collect(&callee_path, seen) {
@@ -6147,7 +6147,7 @@ impl CallControl {
 
     /// Cached version of _canraise for a CallTarget.
     ///
-    /// RPython call.py:337-355 — `_canraise()` returns the tri-state
+    /// RPython call.py — `_canraise()` returns the tri-state
     /// `{False, "mem", True}` collapsed here to [`CanRaise`].
     fn cached_can_raise_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> CanRaise {
         if let Some(&result) = cache.can_raise.get(path) {
@@ -6299,7 +6299,7 @@ impl CallControl {
 
     /// Cached version of analyze_can_collect for a CallTarget.
     /// RPython: collect_analyzer.analyze(op, self.seen_gc) (collectanalyze.py).
-    /// graphanalyze.py:60: analyze_external_call → bottom_result() (False).
+    /// graphanalyze.py: analyze_external_call → bottom_result() (False).
     fn cached_can_collect_path(&self, path: &CallPath, cache: &mut AnalysisCache) -> bool {
         if let Some(&result) = cache.can_collect.get(path) {
             return result;
@@ -6313,7 +6313,7 @@ impl CallControl {
     fn cached_can_collect(&self, target: &CallTarget, cache: &mut AnalysisCache) -> bool {
         let path = match self.target_to_path(target) {
             Some(p) => p,
-            // graphanalyze.py:60: analyze_external_call → bottom_result() (False)
+            // graphanalyze.py: analyze_external_call → bottom_result() (False)
             None => return false,
         };
         self.cached_can_collect_path(&path, cache)
@@ -6333,7 +6333,7 @@ impl CallControl {
             .any(|path| self.cached_can_collect_path(path, cache))
     }
 
-    /// RPython: CallControl._canraise(op) (call.py:337-355).
+    /// RPython: CallControl._canraise(op) (call.py).
     ///
     /// ```python
     /// def _canraise(self, op):
@@ -6371,7 +6371,7 @@ impl CallControl {
         self.cached_can_raise(target, cache)
     }
 
-    /// RPython `call.py:210-335 CallControl.getcalldescr(op, ...)` —
+    /// RPython `call.py CallControl.getcalldescr(op, ...)` —
     /// line-by-line port.  One function that dispatches on `op.kind`:
     ///
     /// - `OpKind::Call` → direct_call branch (call.py:240-257): extract
@@ -6798,7 +6798,7 @@ impl CallControl {
         CallDescriptor::from_signature(&arg_types, result_type, effectinfo)
     }
 
-    /// RPython: calldescr_canraise(calldescr) (call.py:357-359).
+    /// RPython: calldescr_canraise(calldescr) (call.py).
     pub fn calldescr_canraise(&self, calldescr: &CallDescriptor) -> bool {
         calldescr.extra_info.check_can_raise(false)
     }
@@ -6953,7 +6953,7 @@ fn analyze_readwrite(
             &mut analysis.array_write_descrs,
             &mut analysis.is_top,
         );
-        // RPython: top_set only occurs from gc_add_memory_pressure (writeanalyze.py:72).
+        // RPython: top_set only occurs from gc_add_memory_pressure (writeanalyze.py).
         // External calls return empty_set (bottom_result), not top_set.
         // We currently don't have gc_add_memory_pressure, so is_top stays false.
     }
@@ -7031,7 +7031,7 @@ fn analyze_readwrite_indirect_family(
 // FieldRead/FieldWrite/ArrayRead/ArrayWrite and collect their
 // descriptor indices into EffectInfo's bitset fields.
 
-/// RPython: effectinfo_from_writeanalyze() (effectinfo.py:276-378).
+/// RPython: effectinfo_from_writeanalyze() (effectinfo.py).
 ///
 /// Scans the callee's graph for field/array read/write operations
 /// and populates the corresponding bitset fields in EffectInfo.
@@ -7203,7 +7203,7 @@ pub fn effectinfo_from_writeanalyze(
         can_collect
     };
 
-    // `effectinfo.py:128-145 frozenset_or_none` parity: raw descr
+    // `effectinfo.py frozenset_or_none` parity: raw descr
     // sets carry the `cpu.fielddescrof()`/`cpu.arraydescrof()`/
     // `cpu.interiorfielddescrof()` results that the analyzer found.
     //
@@ -7211,14 +7211,14 @@ pub fn effectinfo_from_writeanalyze(
     //   - `_readonly_descrs_fields`, `_write_descrs_fields`: via
     //     `cc.fielddescrof(idx, owner, name)` from `field.owner_root` +
     //     `field.name` at the FieldRead / FieldWrite sites
-    //     (PyPy `effectinfo.py:301-305 add_struct →
+    //     (PyPy `effectinfo.py add_struct →
     //     cpu.fielddescrof(T, fieldname)`).
     //   - `_readonly_descrs_arrays`, `_write_descrs_arrays`: via
     //     `cc.arraydescrof()` from ArrayRead / ArrayWrite ops plus
     //     interior-field synthesised array effects
     //     (`effectinfo.py:327-340` + `:355-360`).
     //     `_write_descrs_arrays` directly drives heap optimizer array
-    //     cache invalidation (`heap.py:537-571 force_from_effectinfo`).
+    //     cache invalidation (`heap.py force_from_effectinfo`).
     //   - `_readonly_descrs_interiorfields`,
     //     `_write_descrs_interiorfields`: via `cc.interiorfielddescrof(
     //     idx, array_type_id, name)` from InteriorFieldRead /
@@ -7228,7 +7228,7 @@ pub fn effectinfo_from_writeanalyze(
     // All `cc.*descrof()` helpers silently skip when struct layout is
     // not registered with `cc.struct_fields`, mirroring PyPy's
     // `consider_struct=False` / `consider_array=False` /
-    // `UnsupportedFieldExc` filters at `effectinfo.py:380-397` +
+    // `UnsupportedFieldExc` filters at `effectinfo.py` +
     // `:316-324`.
     //
     // Runtime `__majit_type_id` values hash the struct's definition path, but
@@ -7466,7 +7466,7 @@ fn resolve_array_identity(
 ///   matched normally. Uses the same element-type recovery convention as
 ///   the front-end's `StructFieldRegistry` array-field handling, so
 ///   source-level analysis and effect bookkeeping agree on the
-///   item type (`descr.py:241-254 get_type_flag` reads the same
+///   item type (`descr.py get_type_flag` reads the same
 ///   `ARRAY.OF` regardless of how the lltype is referenced).
 pub(crate) fn extract_element_type_from_str(type_str: &str) -> Option<String> {
     let mut s = type_str.trim();
@@ -7525,33 +7525,33 @@ fn collect_readwrite_effects(
     // effectinfo.py:313-325: interiorfield descriptor sets.
     read_interiorfields: &mut Vec<u32>,
     write_interiorfields: &mut Vec<u32>,
-    // effectinfo.py:294,301-305: `readonly_descrs_fields = []` populated
+    // effectinfo.py: `readonly_descrs_fields = []` populated
     // via `add_struct → cpu.fielddescrof(T, fieldname)` from
     // `("readstruct", T, fieldname)` tuples.
     field_read_descrs: &mut Vec<(
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    // effectinfo.py:297,301-305: `write_descrs_fields = []` from
+    // effectinfo.py: `write_descrs_fields = []` from
     // `("struct", T, fieldname)` tuples.
     field_write_descrs: &mut Vec<(
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    // effectinfo.py:296,313-325: `readonly_descrs_interiorfields = []`
+    // effectinfo.py: `readonly_descrs_interiorfields = []`
     // populated via `add_interiorfield → cpu.interiorfielddescrof(T,
     // fieldname)` from `("readinteriorfield", T, fieldname)` tuples.
     interior_read_descrs: &mut Vec<(
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    // effectinfo.py:299,313-325: `write_descrs_interiorfields = []`
+    // effectinfo.py: `write_descrs_interiorfields = []`
     // from `("interiorfield", T, fieldname)` tuples.
     interior_write_descrs: &mut Vec<(
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    // effectinfo.py:295,307-311: `readonly_descrs_arrays = []` populated
+    // effectinfo.py: `readonly_descrs_arrays = []` populated
     // via `add_array → cpu.arraydescrof(ARRAY)` from `("readarray", T)`
     // tuples (and `("readinteriorfield", T, _)` synthesised at
     // effectinfo.py:327-340).
@@ -7559,7 +7559,7 @@ fn collect_readwrite_effects(
         majit_ir::descr::DescrRef,
         Option<majit_ir::effectinfo::DescrSetMember>,
     )>,
-    // effectinfo.py:201-206,298,355-356: `write_descrs_arrays = []` —
+    // effectinfo.py: `write_descrs_arrays = []` —
     // also drives single_write_descr_array.
     array_write_descrs: &mut Vec<(
         majit_ir::descr::DescrRef,
@@ -7596,12 +7596,12 @@ fn collect_readwrite_effects(
 
     // RPython: phi/link args carry concretetype through block boundaries.
     // Build inputarg → source value mapping from every exit link (upstream
-    // `flowspace/model.py:244 renamevariables` walks `for link in
+    // `flowspace/model.py renamevariables` walks `for link in
     // self.exits: link.args`), so resolve_array_identity can trace through
     // control-flow merges of any exit fan-out.
     // Build the phi-sources map by walking each exit link's args
     // positionally against the `Block.inputargs` list (`Vec<Variable>`,
-    // orthodox per `flowspace/model.py:244 renamevariables`).
+    // orthodox per `flowspace/model.py renamevariables`).
     // Conservative phi-source map: an inputarg with exactly one
     // incoming edge gets `Some(src)`; an inputarg merged from two or
     // more predecessors is demoted to `None` so `resolve_array_identity`
@@ -7633,12 +7633,12 @@ fn collect_readwrite_effects(
                     // RPython: cpu.fielddescrof(T, fieldname).get_ei_index()
                     let idx = descr_indices.field_index(&field.owner_root, &field.name);
                     read_fields.push(idx);
-                    // RPython: effectinfo.py:301-305 `add_struct →
+                    // RPython: effectinfo.py `add_struct →
                     // cpu.fielddescrof(T, fieldname)`. Dedup by index
                     // (frozenset semantics). Silently skipped when the
                     // struct layout is not registered with `cc.struct_fields`
                     // (analyzer-unknown owner — matches PyPy's
-                    // `consider_struct=False` filter at effectinfo.py:380).
+                    // `consider_struct=False` filter at effectinfo.py).
                     if let Some(owner) = field.owner_root.as_deref()
                         && !field_read_descrs.iter().any(|d| d.0.index() == idx)
                         && let Some(descr) =
@@ -7688,7 +7688,7 @@ fn collect_readwrite_effects(
                         len_offset,
                     );
                     read_arrays.push(idx);
-                    // RPython: effectinfo.py:307-311 + :355-356 — `add_array`
+                    // RPython: effectinfo.py + :355-356 — `add_array`
                     // walks `("readarray", T)` tuples through
                     // `cpu.arraydescrof(ARRAY)` and appends to
                     // `readonly_descrs_arrays`. Dedup by descriptor index
@@ -7799,12 +7799,12 @@ fn collect_readwrite_effects(
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
                     read_interiorfields.push(ifield_idx);
-                    // RPython: effectinfo.py:313-325 `add_interiorfield →
+                    // RPython: effectinfo.py `add_interiorfield →
                     // cpu.interiorfielddescrof(ARRAY, fieldname)`. Dedup
                     // by descriptor index. Silently skipped when the
                     // array's element struct is unknown to
                     // `cc.struct_fields` or the field is absent
-                    // (PyPy `effectinfo.py:316-324 consider_array` /
+                    // (PyPy `effectinfo.py consider_array` /
                     // `Void` / `UnsupportedFieldExc` filters).
                     if !interior_read_descrs
                         .iter()
@@ -8005,7 +8005,7 @@ fn all_interiorfielddescrs(
     array_descr: std::sync::Arc<dyn majit_ir::descr::ArrayDescr>,
 ) -> (Vec<majit_ir::descr::DescrRef>, usize) {
     use majit_ir::descr::{LLType, path_hash};
-    // `descr.py:423-438 get_interiorfield_descr` reuses
+    // `descr.py get_interiorfield_descr` reuses
     // `gc_cache._cache_field[REALARRAY.OF][name]` for the inner
     // FieldDescr and `gc_cache._cache_interiorfield[(ARRAY, name,
     // arrayfieldname=None)]` for the InteriorFieldDescr wrapper.
@@ -8025,14 +8025,14 @@ fn all_interiorfielddescrs(
     // bare name verbatim and we hit the simple-name slot.
     let struct_canonical = majit_ir::descr::canonical_struct_name(struct_name);
     let struct_key = LLType::Struct(path_hash(&struct_canonical));
-    // `descr.py:238 fielddescr.parent_descr = get_size_descr(gccache,
+    // `descr.py fielddescr.parent_descr = get_size_descr(gccache,
     // STRUCT, vtable)` — PyPy's `get_field_descr` calls
     // `get_size_descr` on cache miss so the freshly-minted FieldDescr
     // gets a non-None `parent_descr`.  Pyre's `gc_cache.get_field_descr`
     // only READS `_cache_size[struct_key]`; ensure the
     // slot is populated first by routing through `get_size_descr` here,
     // so the inner-FieldDescr loop below sees the parent.  Cache hit
-    // is a no-op; cache miss mints the SizeDescr per `descr.py:108-118`.
+    // is a no-op; cache miss mints the SizeDescr per `descr.py`.
     // Path 1 carries `layout.size` directly; Path 2 derives from
     // accumulated offsets after the heuristic walk.
     // Path 1: actual layout from runtime (RPython: symbolic.get_field_token)
@@ -8077,7 +8077,7 @@ fn all_interiorfielddescrs(
             (name, offset, field_size, field_type, is_immutable, flag, is_quasi_immutable),
         ) in entries.iter().enumerate()
         {
-            // `descr.py:435 fielddescr = get_field_descr(gc_ll_descr,
+            // `descr.py fielddescr = get_field_descr(gc_ll_descr,
             // REALARRAY.OF, name)` — PyPy's `get_field_descr` returns the
             // SAME FieldDescr object that `cpu.fielddescrof(STRUCT, name)`
             // (the direct path) returns, because `_cache_field[STRUCT][name]`
@@ -8173,7 +8173,7 @@ fn all_interiorfielddescrs(
         if field_type == majit_ir::value::Type::Void {
             continue;
         }
-        // heaptracker.py:87-88 all_interiorfielddescrs:
+        // heaptracker.py all_interiorfielddescrs:
         //   if name == 'typeptr':
         //       continue # dealt otherwise
         if field_name == "typeptr" {
@@ -8285,7 +8285,7 @@ fn all_interiorfielddescrs(
 /// position themselves, and the two do not agree — a bare enumeration numbers
 /// `Void` fields, which `heaptracker.py:104-105` skips.
 ///
-/// The negative return (`heaptracker.py:113` `-cur_index - 1`, "no such
+/// The negative return (`heaptracker.py` `-cur_index - 1`, "no such
 /// field") is not a state `descr.py:228` can reach: it asks only for fields
 /// the same walker already numbered. Both mint sites are inside the branch
 /// that matched `field_name`, so a refusal here means the two disagree about
@@ -8400,7 +8400,7 @@ fn trace_field_ei_descr_mint(
     }
 }
 
-/// RPython: `get_type_flag(TYPE)` (descr.py:241-254).
+/// RPython: `get_type_flag(TYPE)` (descr.py).
 ///
 /// Returns (ArrayFlag, IR type, size in bytes).
 /// The ArrayFlag encodes both category AND signedness, matching RPython:
@@ -8465,7 +8465,7 @@ pub(crate) fn get_type_flag(
         // RPython: TYPE is lltype.Float → FLAG_FLOAT
         "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
         // RPython: SingleFloat is not lltype.Float and `rffi.cast(_, -1)
-        // != -1`, so `get_type_flag` lands FLAG_UNSIGNED (descr.py:254);
+        // != -1`, so `get_type_flag` lands FLAG_UNSIGNED (descr.py);
         // `getkind(SingleFloat) == 'int'` → int-banked, size 4.  The `'f'`
         // width marker for f32 arrays is restored separately in
         // `get_array_descr`.
@@ -8492,7 +8492,7 @@ pub(crate) fn get_type_flag(
         "u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         // Zero-sized types occupy no storage and contribute no field slot
-        // (heaptracker.py:60-62; lltype.py:334 `_names_without_voids()`).
+        // (heaptracker.py:60-62; lltype.py `_names_without_voids()`).
         s if s == "()" || s == "PhantomData" || s.starts_with("PhantomData<") => {
             (ArrayFlag::Void, majit_ir::value::Type::Void, 0)
         }
@@ -8505,7 +8505,7 @@ pub(crate) fn get_type_flag(
     }
 }
 
-/// RPython: `RaiseAnalyzer.analyze_simple_operation(op)` (canraise.py:14-17).
+/// RPython: `RaiseAnalyzer.analyze_simple_operation(op)` (canraise.py).
 ///
 /// ```python
 /// canraise = LL_OPERATIONS[op.opname].canraise
@@ -8577,7 +8577,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::IsVirtual { .. }
         | OpKind::IsInstance { .. }
         | OpKind::RecordKnownResult { .. }
-        // jtransform.py:901-903 — `record_quasiimmut_field` is pure bookkeeping
+        // jtransform.py — `record_quasiimmut_field` is pure bookkeeping
         // that the metainterp converts into a guard; cannot raise.
         | OpKind::RecordQuasiImmutField { .. }
         | OpKind::Live
@@ -8633,13 +8633,13 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython: log.WARNING("Unknown operation: %s" % op.opname)
         //          return True
         OpKind::Abort { .. } => RaiseClass::Yes,
-        // RPython `newtuple` is a `PureOperation` (`operation.py:542`);
+        // RPython `newtuple` is a `PureOperation` (`operation.py`);
         // pure tuple construction cannot raise.
         OpKind::NewTuple { .. } => RaiseClass::No,
         // RPython `newlist` is a `PureOperation`; pure list construction
         // cannot raise.
         OpKind::NewList { .. } => RaiseClass::No,
-        // RPython `getslice` is a `PureOperation` (`operation.py:461`);
+        // RPython `getslice` is a `PureOperation` (`operation.py`);
         // its high-level canraise is False (the MemoryError of the
         // `ll_listslice_*` malloc is carried by the lowered `direct_call`
         // after rtyping).
@@ -8678,7 +8678,7 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         for link in &block.exits {
             // Zip link args against the target block's raw
             // `inputargs` (Variable identities, positional per
-            // `flowspace/model.py:244 renamevariables`).
+            // `flowspace/model.py renamevariables`).
             let target_inputargs = &graph.block(link.target).inputargs;
             for (arg, target_arg) in link.args.iter().zip(target_inputargs.iter()) {
                 if let Some(value) = arg.as_variable() {
@@ -8811,7 +8811,7 @@ const INT_FLOORDIV_TARGETS: &[CallTargetPattern] =
 
 const INT_MOD_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::FunctionPath(&["int_mod"])];
 
-// RPython `jtransform.py:587-588` — `_do_builtin_call` re-routes
+// RPython `jtransform.py` — `_do_builtin_call` re-routes
 // `cast_uint_to_float` / `cast_float_to_uint` to support helpers
 // (`support.py:274 _ll_1_cast_*`).  Cannot raise (NaN/inf are
 // caller-filtered); elidable because the conversion is pure given
@@ -8909,7 +8909,7 @@ const CALL_DESCRIPTOR_TABLE: &[CallDescriptorEntry] = &[
         extraeffect: ExtraEffect::ElidableCanRaise,
         oopspecindex: OopSpecIndex::IntPyMod,
     },
-    // RPython `jtransform.py:587-588` `_do_builtin_call` casts —
+    // RPython `jtransform.py` `_do_builtin_call` casts —
     // unsigned-domain conversion helpers.  Cannot raise; elidable.
     CallDescriptorEntry {
         targets: CAST_UINT_TO_FLOAT_TARGETS,
@@ -9114,7 +9114,7 @@ mod tests {
         assert_ne!(cc.array_items_base(4, Some("i64"), 8), 4);
     }
 
-    /// `getkind(SingleFloat) == 'int'` (history.py:53): `f32` banks to the
+    /// `getkind(SingleFloat) == 'int'` (history.py): `f32` banks to the
     /// int kind across the field/return classifiers (FLAG_UNSIGNED,
     /// descr.py:254), while `f64` (`lltype.Float`) keeps the float kind.
     #[test]
@@ -9454,7 +9454,7 @@ mod tests {
     fn guess_call_kind_builtin() {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["w_int_add"]);
-        // call.py:135 — `hasattr(targetgraph.func, 'oopspec')` is the
+        // call.py — `hasattr(targetgraph.func, 'oopspec')` is the
         // builtin signal; an oopspec registration is what makes a call
         // classify `Builtin`.
         cc.mark_oopspec(path, "int_add(a, b)".to_string());
@@ -9603,7 +9603,7 @@ mod tests {
         cc.register_function_graph(path, graph.with_return_type("i64"));
     }
 
-    /// `collectanalyze.py:27-31 analyze_simple_operation` answers `True` for
+    /// `collectanalyze.py analyze_simple_operation` answers `True` for
     /// `malloc` / `malloc_varsize` with `flavor='gc'`. This graph model spells
     /// that operation four ways, and each has to answer on its own — a graph
     /// reaching an allocation collects even when it calls nothing.
@@ -9666,7 +9666,7 @@ mod tests {
         );
     }
 
-    /// `collectanalyze.py:27-33 analyze_simple_operation` answers True for an
+    /// `collectanalyze.py analyze_simple_operation` answers True for an
     /// allocation. Upstream sees one because it is an operation in a graph it
     /// lowered; a callee in a crate `scripts/extract-llbc.py` does not lower
     /// reaches `analyze_can_collect` with nothing to walk, so the declaration
@@ -9751,7 +9751,7 @@ mod tests {
     /// Synthetic graph that only re-raises a previously-caught exception.
     ///
     /// This mirrors the special case in
-    /// `canraise.py:27-41 analyze_exceptblock_in_graph`: the graph itself
+    /// `canraise.py analyze_exceptblock_in_graph`: the graph itself
     /// should not be treated as the origin of the exception.
     fn reraise_only_graph(name: &str) -> FunctionGraph {
         let mut g = FunctionGraph::new(name);
@@ -10208,7 +10208,7 @@ mod tests {
     fn elidable_read_and_written_field_lands_in_neither_descr_set() {
         // `effectinfo_from_writeanalyze` subtracts `read \ write` against
         // the full effects tuple (effectinfo.py:345-360) and only then does
-        // `EffectInfo.__new__` blank the writes (effectinfo.py:169-181), so a
+        // `EffectInfo.__new__` blank the writes (effectinfo.py), so a
         // field that is both read and written by an elidable graph ends up in
         // NEITHER `_readonly_descrs_fields` nor `_write_descrs_fields`.
         let mut cc = CallControl::new();
@@ -10337,13 +10337,13 @@ mod tests {
         // with an unconditional Link to the exceptblock carrying the
         // `AssertionError` class Constant and an `AssertionError(msg)`
         // instance Constant in the `(etype, evalue)` slots (the
-        // `RaiseImplicit.nomoreblocks` shape, flowcontext.py:1279), so the
+        // `RaiseImplicit.nomoreblocks` shape, flowcontext.py), so the
         // synthetic raising_graph is well-formed and converts — the
         // flowspace RaiseAnalyzer then agrees with the flat `_canraise=Yes`.
         // reraise_only stays malformed for an unrelated reason: it routes an
         // SSA-undefined `continuation_arg` on its NORMAL fall-through link
         // (no producing op, not an entry inputarg), which RPython's own
-        // checkgraph (model.py:668-688) would also reject — every Link.args
+        // checkgraph (model.py) would also reject — every Link.args
         // value must be defined in the predecessor block (only
         // last_exception / last_exc_value may be defined only_in_link).
         // Real front-end graphs ARE well-formed and DO convert — production
@@ -11251,7 +11251,7 @@ mod tests {
 
     /// `getcalldescr` must answer an indirect call whose family it cannot
     /// enumerate with the analyzers' TOP result on every counter, matching
-    /// `graphanalyze.py:117-121` (`graphs is None` → `top_result()`).
+    /// `graphanalyze.py` (`graphs is None` → `top_result()`).
     ///
     /// A family with no members carries no more information than a family
     /// that was never enumerated — nothing in this pipeline ever proves a
@@ -11602,7 +11602,7 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "a", 0), 2);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "p", 0), 3);
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "b", 0), 4);
-        // `heaptracker.py:113` `-cur_index - 1` over the 5 leaves above.
+        // `heaptracker.py` `-cur_index - 1` over the 5 leaves above.
         assert_eq!(get_fielddescr_index_in(&cc, "Outer", "missing", 0), -6);
     }
 

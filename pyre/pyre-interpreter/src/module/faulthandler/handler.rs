@@ -24,7 +24,7 @@ static FAULTHANDLER_ENABLED: std::sync::atomic::AtomicBool =
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 static FAULTHANDLER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(2);
 
-/// `handler.py:145` `self.fatal_error_w_file = w_file` / `handler.py:150`
+/// `handler.py` `self.fatal_error_w_file = w_file` / `handler.py`
 /// `self.fatal_error_w_file = None`: the descriptor the handler writes to
 /// belongs to this object, so it has to outlive the installed handlers rather
 /// than be collected and have its finalizer close the fd under them.  pyre has
@@ -76,7 +76,7 @@ fn lock_faulthandler_state() -> parking_lot::MutexGuard<'static, ()> {
     guard
 }
 
-/// `handler.py:22` `self.user_w_files = None` / `:125`
+/// `handler.py` `self.user_w_files = None` / `:125`
 /// `self.user_w_files[signum] = w_file` / `:132`
 /// `self.user_w_files.pop(signum, None)`: `register` owns the file per signal
 /// for the same reason `enable` owns one, and `unregister` releases it.
@@ -99,7 +99,7 @@ fn set_user_signal_file(signum: libc::c_int, w_file: pyre_object::PyObjectRef) {
     }
 }
 
-/// `handler.py:131-132` `self.user_w_files.pop(signum, None)`.
+/// `handler.py` `self.user_w_files.pop(signum, None)`.
 #[cfg(all(unix, feature = "host_env"))]
 fn clear_user_signal_file(signum: libc::c_int) {
     FAULTHANDLER_USER_FILES.lock().retain(|&(s, _)| s != signum);
@@ -266,7 +266,7 @@ extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
     }
 }
 
-/// `handler.py:35-49 Handler.get_fileno_and_file` — resolve a
+/// `handler.py Handler.get_fileno_and_file` — resolve a
 /// file-or-fd-or-None argument to `(fileno, file)`.  None resolves the CURRENT
 /// `sys.stderr` rather than a hard-coded fd 2, so a redirected stderr is
 /// honoured; an int is used directly and names no file; anything else is asked
@@ -346,7 +346,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_signature(
             "enable",
             |args| {
-                // `handler.py:141-145 enable` — file=None, all_threads=True.
+                // `handler.py enable` — file=None, all_threads=True.
                 // Resolving the argument runs a user `fileno()` and `flush()`;
                 // keep those side effects behind the support gate, so a build
                 // that can only answer NotImplementedError does not run them
@@ -398,7 +398,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             );
                         }
                         FAULTHANDLER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-                        // `handler.py:145` `self.fatal_error_w_file = w_file`.
+                        // `handler.py` `self.fatal_error_w_file = w_file`.
                         set_fatal_error_file(file_slot.map_or(
                             pyre_object::PY_NULL,
                             pyre_object::gc_roots::shadow_stack_get,
@@ -496,7 +496,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // Provide a "registered → no-op" pattern: install the handler when
     // registering, restore on unregister.  The handler writes a short
     // "user signal NN delivered" message to fd 2 (no traceback).
-    // `handler.py:115-128 register(signum, file=None, all_threads=True, chain=False)`.
+    // `handler.py register(signum, file=None, all_threads=True, chain=False)`.
     crate::module_ns_store(
         ns,
         "register",
@@ -562,7 +562,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             format!("register: {e}"),
                         )
                     })?;
-                    // `handler.py:123-125` `self.user_w_files[signum] = w_file`,
+                    // `handler.py` `self.user_w_files[signum] = w_file`,
                     // after `check_err` — a register that failed owns nothing.
                     set_user_signal_file(
                         signum,
@@ -605,7 +605,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let _state = lock_faulthandler_state();
                     let changed =
                         rustpython_host_env::faulthandler::unregister_user_signal(signum);
-                    // `handler.py:131-132` `self.user_w_files.pop(signum, None)`,
+                    // `handler.py` `self.user_w_files.pop(signum, None)`,
                     // run whether or not the signal was registered.
                     clear_user_signal_file(signum);
                     Ok(pyre_object::w_bool_from(changed))
@@ -639,7 +639,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let _ = crate::baseobjspace::int_w(release_gil)?;
             }
             suppress_crash_report();
-            // `handler.py:225 read_null` — null-pointer deref.
+            // `handler.py read_null` — null-pointer deref.
             let p: *const u8 = std::ptr::null();
             let _ = unsafe { p.read_volatile() };
             Ok(pyre_object::w_none())
@@ -676,7 +676,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "_sigfpe",
             |_| {
                 suppress_crash_report();
-                // `handler.py:233 sigfpe` raises the signal, which is what an
+                // `handler.py sigfpe` raises the signal, which is what an
                 // integer division by zero traps as on unix.  Windows delivers
                 // that fault as a structured exception instead, and Rust checks
                 // the divisor rather than letting the CPU trap, so name the
@@ -747,7 +747,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "_stack_overflow",
             |_| {
                 suppress_crash_report();
-                // `handler.py:240 stack_overflow` — infinite recursion.
+                // `handler.py stack_overflow` — infinite recursion.
                 fn blow() {
                     let _buf = [0u8; 4096];
                     blow();

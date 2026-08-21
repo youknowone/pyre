@@ -1,6 +1,6 @@
 //! `PyJitCode`: pyre's per-CodeObject JitCode wrapper.
 //!
-//! RPython's `JitCode` (jitcode.py:9) is a single class that owns
+//! RPython's `JitCode` (jitcode.py) is a single class that owns
 //! both the bytecode (`code` / `constants_*` / `c_num_regs_*`) and
 //! the per-graph metadata (`name`, `fnaddr`, `calldescr`,
 //! `jitdriver_sd`). pyre still has a split runtime representation:
@@ -601,7 +601,7 @@ impl PyJitCode {
     /// "Has `assembler.assemble` been run on this jitcode yet?" A
     /// freshly-constructed RPython `JitCode(name, fnaddr, calldescr,
     /// ...)` (jitcode.py:14, call.py:168) leaves `self.code` unset
-    /// until `setup` (jitcode.py:22) is invoked by
+    /// until `setup` (jitcode.py) is invoked by
     /// `assembler.assemble(ssarepr, jitcode, num_regs)`
     /// (codewriter.py:67); pyre's split wrapper uses `metadata.is_drained`
     /// (the drain that populates the per-Python-PC maps) as the same
@@ -1038,7 +1038,7 @@ impl PyJitCode {
     /// In RPython the `JitCode` constructor returns a fresh object whose
     /// `code` / `descrs` / `liveness` arrays are all empty until
     /// `assembler.assemble(...)` populates them later in
-    /// `make_jitcodes`'s drain loop (codewriter.py:80).  The skeleton
+    /// `make_jitcodes`'s drain loop (codewriter.py).  The skeleton
     /// gives the dict an entry with a stable identity so re-entrant
     /// `get_jitcode` calls can find an existing key without recompiling
     /// (call.py:155 `if graph in self.jitcodes: return`).

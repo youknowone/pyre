@@ -16,7 +16,7 @@ pub use majit_ir::optimize::InvalidLoop;
 /// `Op` / `OptContext` types. Imported wherever `bound.make_guards(...)`
 /// is invoked.
 pub(crate) trait IntBoundMakeGuards {
-    /// intutils.py:1264-1289 `IntBound.make_guards(box, guards, optimizer)`
+    /// intutils.py `IntBound.make_guards(box, guards, optimizer)`
     /// (line-by-line port).
     ///
     /// ```python
@@ -76,7 +76,7 @@ impl IntBoundMakeGuards for IntBound {
         use crate::optimizeopt::Op;
         use majit_ir::{OpCode, Type, Value};
 
-        // history.py:227/268/314 Const{Int,Float,Ptr}.value inline: the
+        // history.py/268/314 Const{Int,Float,Ptr}.value inline: the
         // value rides on the inline-Const OpRef variant tag itself, so no
         // `seed_constant` step is needed (its const arm is a no-op).
         // IntBound guards mint Int values only, so the match is total.

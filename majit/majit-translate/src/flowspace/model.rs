@@ -131,7 +131,7 @@ pub type ConcretetypePlaceholder = crate::translator::rtyper::lltypesystem::llty
 /// RPython `Constant.value` 에 담기는 host-level Python object 의 일반
 /// carrier.
 ///
-/// Upstream `rpython/flowspace/model.py:354` `class Constant(Hashable)`
+/// Upstream `rpython/flowspace/model.py` `class Constant(Hashable)`
 /// 은 `Hashable.value` 에 임의의 Python object 를 그대로 담는다
 /// (`self.value = value`). Rust 포트는 `ConstValue` 를 닫힌 enum 으로
 /// 시작했지만 builtin function / type / exception class / exception
@@ -218,7 +218,7 @@ enum HostObjectKind {
     /// Python `property` descriptor (upstream classdesc.py:591-602). fget
     /// / fset / fdel 은 upstream `property(fget, fset, fdel, doc)` 의
     /// 각 슬롯에 대응하며, `Option<HostObject>` 로 담는다 (None =
-    /// 미정의). unaryop.py:895 `_find_property_meth` 는 classdict 의
+    /// 미정의). unaryop.py `_find_property_meth` 는 classdict 의
     /// `Constant(property_value)` 에서 `getattr(obj.value, meth)` 로 이
     /// 슬롯을 추출한다.
     Property {
@@ -255,7 +255,7 @@ enum HostObjectKind {
     /// a Python-callable whose behaviour we actually need to execute at
     /// annotation time.
     ///
-    /// Upstream RPython evaluates e.g. `x._freeze_()` (bookkeeper.py:332)
+    /// Upstream RPython evaluates e.g. `x._freeze_()` (bookkeeper.py)
     /// or `prop.fget(self)` (descriptor getattr) directly against the
     /// Python object. The Rust port has no Python runtime, so test
     /// fixtures and bootstrap code register the concrete native closure
@@ -634,7 +634,7 @@ impl HostObject {
     }
 
     pub fn new_user_function(graph_func: GraphFunc) -> Self {
-        // `pygraph.py:25-31 _sanitize_funcname`: if `func.class_` is set
+        // `pygraph.py _sanitize_funcname`: if `func.class_` is set
         // (attached by `classdesc.py:606` for method functions), the
         // graph name is `'%s.%s' % (class_.__name__, func.__name__)`.
         // Pyre's `GraphFunc.class_` carries the owner `HostObject` for
@@ -1300,7 +1300,7 @@ fn host_descriptor_get(
 
 /// Rust equivalent of upstream Python `getattr(obj, name)` applied to
 /// a flow-space / annotator constant — the single code path shared
-/// between `flowspace::operation::GetAttr.constfold` (operation.py:624-646)
+/// between `flowspace::operation::GetAttr.constfold` (operation.py)
 /// and `unaryop::OpKind::GetAttr` (unaryop.py:215-229) for constant
 /// receivers. The divergence lives only at the wrap step: flowspace
 /// re-wraps with `const(result)`; the annotator re-wraps with
@@ -1512,7 +1512,7 @@ fn c3_linearise(cls: &HostObject) -> Option<Vec<HostObject>> {
 
 /// Host namespace 에뮬레이션 — upstream 의 `__builtin__` / imported
 /// module table. `HOST_ENV.lookup_builtin(name)` 은
-/// `flowcontext.py:851` 의 `getattr(__builtin__, varname)` 에 대응하고,
+/// `flowcontext.py` 의 `getattr(__builtin__, varname)` 에 대응하고,
 /// `HOST_ENV.import_module(name)` 은 `flowcontext.py:660` 의
 /// `__import__(name, ...)` 에 대응한다.
 ///
@@ -1554,7 +1554,7 @@ impl HostEnv {
         // _StackOverflow 까지 upstream 이 flow 중에 참조하는 class 를
         // 미리 materialise.
         //
-        // rstackovf.py:10-14 — `class StackOverflow(RuntimeError)` 이
+        // rstackovf.py — `class StackOverflow(RuntimeError)` 이
         // 진짜 class 이고, 같은 class object 가 `_StackOverflow` 라는
         // 이름으로도 바인딩된다. 그 직후 모듈-수준 `StackOverflow` 는
         // `((RuntimeError, RuntimeError),)` 튜플 sentinel 로 rebind
@@ -1590,7 +1590,7 @@ impl HostEnv {
         self.insert_builtin("BaseException", base);
         self.insert_builtin("Exception", exc);
         self.insert_builtin("RuntimeError", runtime);
-        // upstream `_StackOverflow = StackOverflow` (rstackovf.py:14) —
+        // upstream `_StackOverflow = StackOverflow` (rstackovf.py) —
         // 동일 class object 를 두 키에 등록. "StackOverflow" 는 모듈
         // 수준의 원 class 이름, "_StackOverflow" 는 flow-level 에서
         // 쓰이는 별칭.
@@ -1700,7 +1700,7 @@ impl HostEnv {
         // Class-method qualnames used by `@typer_for(<class>.__init__)`
         // decorators upstream (rbuiltin.py:264-305).  Pyre encodes them
         // as single-string qualname builtins instead of resolving via
-        // descriptor lookup.  `EnvironmentError.__init__` (rbuiltin.py:269)
+        // descriptor lookup.  `EnvironmentError.__init__` (rbuiltin.py)
         // is omitted — its body uses `r_self.setfield(v_self, 'errno', ...)`
         // which requires InstanceRepr setfield trait plumbing that is
         // not yet wired through `findbltintyper`; registering only the
@@ -1756,8 +1756,8 @@ impl HostEnv {
         // 직접 조회한다.
         let rarithmetic = HostObject::new_module("rpython.rlib.rarithmetic");
         rarithmetic.module_set("ovfcheck", HostObject::new_builtin_callable("ovfcheck"));
-        // `rbuiltin.py:221 @typer_for(rarithmetic.intmask)` /
-        // `rbuiltin.py:228 @typer_for(rarithmetic.longlongmask)`.
+        // `rbuiltin.py @typer_for(rarithmetic.intmask)` /
+        // `rbuiltin.py @typer_for(rarithmetic.longlongmask)`.
         rarithmetic.module_set(
             "intmask",
             HostObject::new_builtin_callable("rarithmetic.intmask"),
@@ -1767,7 +1767,7 @@ impl HostEnv {
             HostObject::new_builtin_callable("rarithmetic.longlongmask"),
         );
         // Upstream `r_uint` is the class object created via
-        // `build_int('r_uint', False, LONG_BIT)` (rarithmetic.py:546-600),
+        // `build_int('r_uint', False, LONG_BIT)` (rarithmetic.py),
         // dispatched via `ForTypeEntry(extregistry.ExtRegistryEntry)`
         // (rarithmetic.py:572-582).  The HostObject registered here is
         // the carrier the extregistry entry keys on; the bootstrap
@@ -1901,8 +1901,8 @@ impl HostEnv {
             "cast_pointer",
             HostObject::new_builtin_callable("lltype.cast_pointer"),
         );
-        // `lltype.cast_primitive` — rbuiltin.py:471-477 typer paired with
-        // `gen_cast` at rbuiltin.py:497-541. The Rust port registers
+        // `lltype.cast_primitive` — rbuiltin.py typer paired with
+        // `gen_cast` at rbuiltin.py. The Rust port registers
         // `rtype_cast_primitive` against this HostObject in
         // `install_default_typers`.
         lltype.module_set(
@@ -1993,7 +1993,7 @@ impl HostEnv {
             HostObject::new_builtin_callable("llmemory.cast_weakrefptr_to_ptr"),
         );
 
-        // rbuiltin.py:744 `@typer_for(weakref.ref)` — weakref.ref aliases
+        // rbuiltin.py `@typer_for(weakref.ref)` — weakref.ref aliases
         // llmemory.weakref_create at the rtyper level.
         let weakref_mod = HostObject::new_module("weakref");
         weakref_mod.module_set("ref", HostObject::new_builtin_callable("weakref.ref"));
@@ -2721,7 +2721,7 @@ impl std::fmt::Display for Atom {
     }
 }
 
-// RPython `flowspace/model.py:279-352` — `Variable` with lazy name
+// RPython `flowspace/model.py` — `Variable` with lazy name
 // numbering.
 //
 // The dummy name is `'v'`; `namesdict` maps each name prefix to a
@@ -2741,7 +2741,7 @@ static NAMESDICT: LazyLock<Mutex<HashMap<String, (String, u32)>>> = LazyLock::ne
     Mutex::new(m)
 });
 
-/// `Variable.rename`'s string-cleaning step (model.py:319-324).
+/// `Variable.rename`'s string-cleaning step (model.py).
 ///
 /// Removes strange characters: keep `[A-Za-z0-9_]`, swap the rest to
 /// `_`; always trail with a `_`; prefix numeric first-chars with `_`
@@ -2789,7 +2789,7 @@ fn alloc_var_id() -> u64 {
     NEXT_VAR_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// RPython `flowspace/model.py:279` — `class Variable`.
+/// RPython `flowspace/model.py` — `class Variable`.
 ///
 /// `__slots__ = ["_name", "_nr", "annotation", "concretetype"]`.
 ///
@@ -2836,7 +2836,7 @@ pub struct VariableInner {
     pub concretetype: std::cell::RefCell<Option<ConcretetypePlaceholder>>,
 }
 
-/// RPython `flowspace/model.py:279` — `class Variable`.
+/// RPython `flowspace/model.py` — `class Variable`.
 ///
 /// `__slots__ = ["_name", "_nr", "annotation", "concretetype"]`.
 ///
@@ -2957,8 +2957,8 @@ impl Variable {
     }
 
     /// RPython `Variable.rename(name)` where `name` is another
-    /// `Variable` (the `_copy(v) -> Variable(v)` path, framestate.py:4 /
-    /// model.py:311-326). Copies the source's prefix and resets `_nr`
+    /// `Variable` (the `_copy(v) -> Variable(v)` path, framestate.py /
+    /// model.py). Copies the source's prefix and resets `_nr`
     /// for lazy renumbering; honours the "don't rename twice" guard and
     /// the "source wasn't renamed either" early-out. Unlike the `&str`
     /// overload it does *not* clean the name (the source prefix is
@@ -3076,7 +3076,7 @@ impl Default for Variable {
     }
 }
 
-/// RPython `flowspace/model.py:354-382` — `class Constant(Hashable)`.
+/// RPython `flowspace/model.py` — `class Constant(Hashable)`.
 ///
 /// `__slots__ = ["concretetype"]`.
 #[derive(Clone, Debug)]
@@ -3113,7 +3113,7 @@ impl Constant {
         }
     }
 
-    /// RPython `flowspace/model.py:362-379` — `Constant.foldable()`.
+    /// RPython `flowspace/model.py` — `Constant.foldable()`.
     ///
     /// upstream line-by-line:
     /// ```python
@@ -3170,7 +3170,7 @@ impl Constant {
         Hlvalue::Constant(self.clone())
     }
 
-    /// RPython `rpython/tool/uid.py:35-39` — `Hashable.__init__` tries
+    /// RPython `rpython/tool/uid.py` — `Hashable.__init__` tries
     /// `hash((type(value), value))` and falls back to `id(self.value)`
     /// when that raises `TypeError`. Rust's derived `Hash` cannot throw,
     /// so this predicate pre-classifies the `ConstValue` variants whose
@@ -3341,7 +3341,7 @@ impl ConstValue {
         ConstValue::UniStr(value.as_ref().to_string())
     }
 
-    /// llmemory.py:579 `not self.const` — true when the value is a
+    /// llmemory.py `not self.const` — true when the value is a
     /// NULL address (`_address::Null` / `fakeaddress(None)`).
     pub fn is_null_address(&self) -> bool {
         matches!(
@@ -3433,7 +3433,7 @@ impl ConstValue {
             ConstValue::Graphs(graphs) => Some(!graphs.is_empty()),
             ConstValue::LowLevelType(_) => Some(true),
             ConstValue::LLPtr(ptr) => Some(ptr.nonzero()),
-            // `fakeaddress.__nonzero__` (llmemory.py:490-491) = `ptr is not
+            // `fakeaddress.__nonzero__` (llmemory.py) = `ptr is not
             // None`: a `Fake` and an (odd, tagged-int) `IntCast` are both
             // non-NULL, only `Null` is false. Single-sourced on `nonzero`.
             ConstValue::LLAddress(addr) => Some(addr.nonzero()),
@@ -3644,7 +3644,7 @@ impl From<Constant> for Hlvalue {
     }
 }
 
-/// RPython `flowspace/model.py:434-461` — `class SpaceOperation`.
+/// RPython `flowspace/model.py` — `class SpaceOperation`.
 #[derive(Clone, Debug, Eq)]
 pub struct SpaceOperation {
     /// RPython `SpaceOperation.opname` — `intern(opname)`.
@@ -3780,7 +3780,7 @@ pub type LinkRef = Rc<RefCell<Link>>;
 /// Rust port preserves that exact shape with `Option<Hlvalue>`.
 pub type LinkArg = Option<Hlvalue>;
 
-/// RPython `flowspace/model.py:109-168` — `class Link`.
+/// RPython `flowspace/model.py` — `class Link`.
 ///
 /// `__slots__ = "args target exitcase llexitcase prevblock
 ///              last_exception last_exc_value".split()`.
@@ -3937,7 +3937,7 @@ impl Link {
     }
 }
 
-/// RPython `flowspace/model.py:171-276` — `class Block`.
+/// RPython `flowspace/model.py` — `class Block`.
 ///
 /// `__slots__ = "inputargs operations exitswitch exits blockcolor
 ///              generation".split()`.
@@ -4289,7 +4289,7 @@ pub struct GraphFunc {
     /// "attribute absent" upstream default.
     pub _dont_reach_me_in_del_: bool,
     /// Upstream `func._always_inline_`, consumed by
-    /// `translator/backendopt/inline.py:604-606 always_inline`.
+    /// `translator/backendopt/inline.py always_inline`.
     ///
     /// RPython distinguishes literal `True` from the truthy string `'try'`:
     /// both select the candidate at zero cost, but only literal `True` makes
@@ -4326,7 +4326,7 @@ pub struct GraphFunc {
     /// upstream default.
     pub _gctransformer_hint_cannot_collect_: bool,
     /// Upstream `func._must_be_light_finalizer_`, consumed by
-    /// `finalizer.py:30 analyze_light_finalizer`. When set on a
+    /// `finalizer.py analyze_light_finalizer`. When set on a
     /// `__del__` method's graph, `FinalizerAnalyzer` rejects any
     /// non-light operation with `FinalizerError`. `false` mirrors the
     /// "attribute absent" upstream default.
@@ -4338,7 +4338,7 @@ pub struct GraphFunc {
     /// same hazard hook.
     pub _transaction_break_: bool,
     /// Upstream `func.exported_symbol` attribute set by
-    /// `rpython/rlib/entrypoint.py:10-12 export_symbol(func)` —
+    /// `rpython/rlib/entrypoint.py export_symbol(func)` —
     /// `func.exported_symbol = True; return func`. Consumed only by
     /// the C backend (`rpython/translator/c/database.py` walks
     /// `getattr(callable, 'exported_symbol', False)`), which is not
@@ -4482,7 +4482,7 @@ impl Eq for GraphFunc {}
 
 static NEXT_GRAPH_FUNC_ID: AtomicU64 = AtomicU64::new(1);
 
-/// RPython `flowspace/model.py:13-106` — `class FunctionGraph`.
+/// RPython `flowspace/model.py` — `class FunctionGraph`.
 #[derive(Debug)]
 pub struct FunctionGraph {
     /// RPython `FunctionGraph.name`.
@@ -4688,7 +4688,7 @@ impl std::fmt::Display for FunctionGraph {
     }
 }
 
-/// RPython `flowspace/model.py:421-432` — `const(obj)`.
+/// RPython `flowspace/model.py` — `const(obj)`.
 ///
 /// Rust callers already carry values as [`ConstValue`], so the host
 /// object rewrite / "already wrapped" dynamic-type checks happen before
@@ -4698,7 +4698,7 @@ pub fn r#const(obj: ConstValue) -> Constant {
     Constant::new(obj)
 }
 
-/// RPython `flowspace/model.py:476-484` — `uniqueitems(lst)`.
+/// RPython `flowspace/model.py` — `uniqueitems(lst)`.
 ///
 /// Returns a list with duplicate elements removed, preserving order.
 pub fn uniqueitems<T: Clone + PartialEq>(lst: &[T]) -> Vec<T> {
@@ -4711,7 +4711,7 @@ pub fn uniqueitems<T: Clone + PartialEq>(lst: &[T]) -> Vec<T> {
     result
 }
 
-/// RPython `flowspace/model.py:495-502` — `mkentrymap(funcgraph)`.
+/// RPython `flowspace/model.py` — `mkentrymap(funcgraph)`.
 ///
 /// Returns a map from each Block to the list of Links that target
 /// it. The entry for the startblock contains a synthetic
@@ -4830,7 +4830,7 @@ impl std::hash::Hash for LinkKey {
     }
 }
 
-/// RPython `flowspace/model.py:504-566` — `copygraph(graph,
+/// RPython `flowspace/model.py` — `copygraph(graph,
 /// shallow=False, varmap={}, shallowvars=False)`.
 ///
 /// Deep-copies a flow graph. Each Variable encountered is replaced
@@ -4952,7 +4952,7 @@ pub fn copygraph(
     newgraph
 }
 
-/// RPython `flowspace/model.py:702-709` — `summary(graph)`.
+/// RPython `flowspace/model.py` — `summary(graph)`.
 ///
 /// Returns a map of opname → occurrence count, excluding `same_as`.
 pub fn summary(graph: &FunctionGraph) -> HashMap<String, usize> {
@@ -4967,7 +4967,7 @@ pub fn summary(graph: &FunctionGraph) -> HashMap<String, usize> {
     insns
 }
 
-/// RPython `flowspace/model.py:711-722` — `safe_iterblocks(graph)`.
+/// RPython `flowspace/model.py` — `safe_iterblocks(graph)`.
 ///
 /// Used for debugging/displaying broken graphs. `FunctionGraph` always
 /// has a concrete startblock in Rust, but this still walks via raw
@@ -4994,7 +4994,7 @@ pub fn safe_iterblocks(graph: &FunctionGraph) -> Vec<BlockRef> {
     result
 }
 
-/// RPython `flowspace/model.py:724-737` — `safe_iterlinks(graph)`.
+/// RPython `flowspace/model.py` — `safe_iterlinks(graph)`.
 ///
 /// Like [`safe_iterblocks`], walks the raw exit lists defensively and
 /// yields each link before deciding whether to recurse into its target.
@@ -5049,7 +5049,7 @@ fn is_valid_switch_exitcase(exitcase: &Hlvalue) -> bool {
     }
 }
 
-/// RPython `flowspace/model.py:568-700` — `checkgraph(graph)`.
+/// RPython `flowspace/model.py` — `checkgraph(graph)`.
 ///
 /// Sanity-check a flow graph. Panics with an assertion failure on any
 /// violation, matching upstream semantics (RPython: `AssertionError`).
@@ -5327,7 +5327,7 @@ mod tests {
     #[test]
     fn lladdress_truthy_mirrors_fakeaddress_nonzero() {
         // `bool(fakeaddress)` = `__nonzero__` = `ptr is not None`
-        // (llmemory.py:490-491): a NULL address is false, a `Fake` and an
+        // (llmemory.py): a NULL address is false, a `Fake` and an
         // odd tagged-int `IntCast` are both true.
         use lltype::{_address, Ptr, PtrTarget, Struct};
         let ptr_t = Ptr {

@@ -26,7 +26,7 @@ use super::policy::{AnnotatorPolicy, PolicyHandle};
 use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::translator::TranslationContext;
 
-/// RPython `annrpython.py:18 log = py.log.Producer("annrpython")`.
+/// RPython `annrpython.py log = py.log.Producer("annrpython")`.
 /// Upstream uses `py.log` which Pyre approximates with [`AnsiLogger`]
 /// (`rpython/tool/ansi_print.py` parity port); both unconditionally
 /// route output to stderr.
@@ -73,7 +73,7 @@ pub(crate) struct NotifyEntry {
     positions: IndexSet<PositionKey>,
 }
 
-/// RPython `class RPythonAnnotator(object)` (annrpython.py:22).
+/// RPython `class RPythonAnnotator(object)` (annrpython.py).
 ///
 /// "Block annotator for RPython."
 pub struct RPythonAnnotator {
@@ -98,7 +98,7 @@ pub struct RPythonAnnotator {
     /// reference so `processblock(graph, block)` can recover the graph
     /// later in `complete_pending_blocks()`.
     pub genpendingblocks: RefCell<Vec<IndexMap<BlockKey, (BlockRef, GraphRef)>>>,
-    /// RPython `self.annotated = {}` (annrpython.py:37).
+    /// RPython `self.annotated = {}` (annrpython.py).
     ///
     /// Upstream stores `dict[Block, bool | FunctionGraph]`:
     ///   * `block not in self.annotated`: never seen.
@@ -116,7 +116,7 @@ pub struct RPythonAnnotator {
     /// `blocked_blocks.insert` — to let `call_sites()` walk "all seen
     /// blocks" without hunting through auxiliary tables.
     pub all_blocks: RefCell<IndexMap<BlockKey, BlockRef>>,
-    /// RPython `self.added_blocks = None` (annrpython.py:38).
+    /// RPython `self.added_blocks = None` (annrpython.py).
     ///
     /// Upstream sentinel: `None = track nothing`, `{} = start
     /// tracking`, filled by `processblock`. Rust port stores
@@ -130,20 +130,20 @@ pub struct RPythonAnnotator {
     /// reflowed, so an uncommitted scope can restore them without cloning the
     /// entire monotonically-growing annotator session for every subject.
     subject_annotation_snapshots: RefCell<Option<IndexMap<BlockKey, BlockAnnotationSnapshot>>>,
-    /// RPython `self.links_followed = {}` (annrpython.py:39).
+    /// RPython `self.links_followed = {}` (annrpython.py).
     /// Retains each link because the key is its address: a link removed from a
     /// block's `exits` would otherwise be freed, and a later link allocated at
     /// that address would read back as already followed.
     pub links_followed: RefCell<IndexMap<LinkKey, LinkRef>>,
-    /// RPython `self.notify = {}` (annrpython.py:40).
+    /// RPython `self.notify = {}` (annrpython.py).
     /// The ordered container is required because the key hashes on a
     /// pointer and the loop over the values produces a work order.
     pub(crate) notify: RefCell<IndexMap<BlockKey, NotifyEntry>>,
-    /// RPython `self.fixed_graphs = {}` (annrpython.py:41). Graphs
+    /// RPython `self.fixed_graphs = {}` (annrpython.py). Graphs
     /// that have already been rtyped — `addpendingblock` rejects new
     /// pending entries against these.
     pub fixed_graphs: RefCell<IndexMap<GraphKey, GraphRef>>,
-    /// RPython `self.blocked_blocks = {}` (annrpython.py:42).
+    /// RPython `self.blocked_blocks = {}` (annrpython.py).
     /// `{blocked_block: (graph, opindex)}`. `opindex == None` upstream
     /// → `None` here (block is blocked at entry, not mid-flow).
     #[expect(
@@ -151,11 +151,11 @@ pub struct RPythonAnnotator {
         reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
     )]
     pub blocked_blocks: RefCell<IndexMap<BlockKey, (BlockRef, GraphRef, Option<usize>)>>,
-    /// RPython `self.blocked_graphs = {}` (annrpython.py:44). Records
+    /// RPython `self.blocked_graphs = {}` (annrpython.py). Records
     /// graphs that have at least one blocked block; the `bool` value
     /// tracks the `blocked_graphs[graph] = True` flip in `complete()`.
     pub blocked_graphs: RefCell<IndexMap<GraphKey, (GraphRef, bool)>>,
-    /// RPython `self.frozen = False` (annrpython.py:46).
+    /// RPython `self.frozen = False` (annrpython.py).
     pub frozen: RefCell<bool>,
     /// RPython `self.policy` (annrpython.py:47-51).
     pub policy: RefCell<PolicyHandle>,
@@ -163,13 +163,13 @@ pub struct RPythonAnnotator {
     pub bookkeeper: Rc<Bookkeeper>,
     /// RPython `self.keepgoing` (annrpython.py:55).
     pub keepgoing: bool,
-    /// RPython `self.failed_blocks = set()` (annrpython.py:56).
+    /// RPython `self.failed_blocks = set()` (annrpython.py).
     pub failed_blocks: RefCell<IndexMap<BlockKey, BlockRef>>,
-    /// RPython `self.errors = []` (annrpython.py:57).
+    /// RPython `self.errors = []` (annrpython.py).
     pub errors: RefCell<Vec<String>>,
 }
 
-/// RPython `class BlockedInference(Exception)` (annrpython.py:673-693).
+/// RPython `class BlockedInference(Exception)` (annrpython.py).
 ///
 /// Thrown from `consider_op` / `flowin` to signal "the situation is
 /// currently blocked, try other blocks and come back later". The
@@ -253,7 +253,7 @@ enum OpLoopOutcome {
     Blocked(BlockedInference),
 }
 
-/// The three exception classes `flowin` (annrpython.py:488-537)
+/// The three exception classes `flowin` (annrpython.py)
 /// catches during the op loop, ported as a Rust `Result` error type
 /// so the loop can dispatch without `panic!` / `catch_unwind`.
 ///
@@ -592,7 +592,7 @@ impl RPythonAnnotator {
         ann
     }
 
-    /// RPython `annotation(self, arg)` (annrpython.py:273-280).
+    /// RPython `annotation(self, arg)` (annrpython.py).
     ///
     /// ```python
     /// def annotation(self, arg):
@@ -624,7 +624,7 @@ impl RPythonAnnotator {
         }
     }
 
-    /// RPython `binding(self, arg)` (annrpython.py:282-287).
+    /// RPython `binding(self, arg)` (annrpython.py).
     ///
     /// ```python
     /// def binding(self, arg):
@@ -644,7 +644,7 @@ impl RPythonAnnotator {
             .unwrap_or_else(|| panic!("KeyError: no binding for arg {arg:?}"))
     }
 
-    /// RPython `typeannotation(self, t)` (annrpython.py:289-290).
+    /// RPython `typeannotation(self, t)` (annrpython.py).
     pub fn typeannotation(
         &self,
         spec: &super::signature::AnnotationSpec,
@@ -652,7 +652,7 @@ impl RPythonAnnotator {
         super::signature::annotation(spec, Some(&self.bookkeeper))
     }
 
-    /// RPython `setbinding(self, arg, s_value)` (annrpython.py:292-299).
+    /// RPython `setbinding(self, arg, s_value)` (annrpython.py).
     ///
     /// ```python
     /// def setbinding(self, arg, s_value):
@@ -685,11 +685,11 @@ impl RPythonAnnotator {
         *arg.annotation.borrow_mut() = Some(Rc::new(s_value));
     }
 
-    /// RPython `warning(self, msg, pos=None)` (annrpython.py:301-...).
+    /// RPython `warning(self, msg, pos=None)` (annrpython.py-...).
     ///
     /// Driver-level logging.
     pub fn warning(&self, msg: &str) {
-        // RPython `annrpython.py:303 log.WARNING("%s/ %s" % (pos, msg))`.
+        // RPython `annrpython.py log.WARNING("%s/ %s" % (pos, msg))`.
         // `log` is `py.log.Producer("annrpython")`, an unconditional
         // diagnostic channel — not the PYPYLOG-gated `debug_print`.
         // Pyre routes through the `AnsiLogger("annrpython")` port so the
@@ -712,7 +712,7 @@ impl RPythonAnnotator {
     // ======================================================================
 
     // ======================================================================
-    // RPython `convenience high-level interface` (annrpython.py:71-141) —
+    // RPython `convenience high-level interface` (annrpython.py) —
     // build_types / build_graph_types / annotate_helper entrypoints.
     // ======================================================================
 
@@ -790,7 +790,7 @@ impl RPythonAnnotator {
         // upstream: `return self.build_graph_types(flowgraph, inputs_s,
         //                                         complete_now=complete_now)`.
         // get_call_parameters now returns Vec<Option<SomeValue>> via
-        // the Option-aware specialize chain (description.py:283-298
+        // the Option-aware specialize chain (description.py
         // pycall propagation parity).
         self.build_graph_types(&flowgraph.graph, &inputs_s, complete_now)
     }
@@ -911,7 +911,7 @@ impl RPythonAnnotator {
         Ok(self.annotation(&returnvar))
     }
 
-    /// RPython `complete_helpers(self)` (annrpython.py:112-120).
+    /// RPython `complete_helpers(self)` (annrpython.py).
     ///
     /// Drives `complete()` inside a scoped `added_blocks` tracker so
     /// the caller can learn which blocks were added for the helper.
@@ -933,7 +933,7 @@ impl RPythonAnnotator {
             .borrow_mut()
             .replace(IndexMap::new());
         // `complete_helpers` is the RPython helper-graph drive: its
-        // `finally` only restores `added_blocks` (annrpython.py:113-119),
+        // `finally` only restores `added_blocks` (annrpython.py),
         // never evicting blocks.  Pre-commit so the guard's
         // subject-isolation eviction (used by the dual-gate driver) stays
         // inert here.
@@ -945,7 +945,7 @@ impl RPythonAnnotator {
             committed: std::cell::Cell::new(true),
         };
         self.complete()?;
-        // upstream annrpython.py:118 passes `block_subset=self.added_blocks`
+        // upstream annrpython.py passes `block_subset=self.added_blocks`
         // unconditionally (the dict we seeded at line 117), so simplify
         // only touches graphs reachable from blocks added during this
         // `complete()`. Passing `Some(&[])` (rather than `None`) when
@@ -964,7 +964,7 @@ impl RPythonAnnotator {
         Ok(())
     }
 
-    /// RPython `using_policy(self, policy)` (annrpython.py:122-128).
+    /// RPython `using_policy(self, policy)` (annrpython.py).
     ///
     /// A context manager that temporarily swaps `self.policy`. The
     /// Rust port returns a RAII guard that restores the saved policy
@@ -981,7 +981,7 @@ impl RPythonAnnotator {
     }
 
     // ======================================================================
-    // RPython `interface for annotator.bookkeeper` (annrpython.py:313-336).
+    // RPython `interface for annotator.bookkeeper` (annrpython.py).
     // ======================================================================
 
     /// RPython `recursivecall(self, graph, whence, inputcells)`
@@ -1034,7 +1034,7 @@ impl RPythonAnnotator {
         self.annotation(&v).unwrap_or_else(s_impossible_value)
     }
 
-    /// RPython `gettype(self, variable)` (annrpython.py:143-156).
+    /// RPython `gettype(self, variable)` (annrpython.py).
     ///
     /// ```python
     /// def gettype(self, variable):
@@ -1070,7 +1070,7 @@ impl RPythonAnnotator {
         }
     }
 
-    /// RPython `getuserclassdefinitions(self)` (annrpython.py:158-160):
+    /// RPython `getuserclassdefinitions(self)` (annrpython.py):
     /// `return self.bookkeeper.classdefs`.
     pub fn getuserclassdefinitions(
         &self,
@@ -1078,7 +1078,7 @@ impl RPythonAnnotator {
         self.bookkeeper.classdefs.borrow().clone()
     }
 
-    /// RPython `validate(self)` (annrpython.py:269-271):
+    /// RPython `validate(self)` (annrpython.py):
     /// `self.bookkeeper.check_no_flags_on_instances()`.
     pub fn validate(&self) {
         self.bookkeeper.check_no_flags_on_instances();
@@ -1148,7 +1148,7 @@ impl RPythonAnnotator {
         out
     }
 
-    /// RPython `call_sites(self)` (annrpython.py:342-353).
+    /// RPython `call_sites(self)` (annrpython.py).
     ///
     /// Yields every `simple_call` / `call_args` operation over the
     /// driver's tracked blocks — `added_blocks` if set, else
@@ -1312,7 +1312,7 @@ impl RPythonAnnotator {
             }
             // upstream: `assert isinstance(s_out, SomeBool)` + rebuild.
             let mut newcell = SomeBool::new();
-            // SomeObject.is_immutable_constant (model.py:106-107):
+            // SomeObject.is_immutable_constant (model.py):
             // `self.is_constant() and self.immutable`. SomeBool
             // carries `immutable = True`, so the precondition here
             // is just "const_box populated".
@@ -1329,7 +1329,7 @@ impl RPythonAnnotator {
         s_out
     }
 
-    /// RPython `whereami(self, position_key)` (annrpython.py:476-486).
+    /// RPython `whereami(self, position_key)` (annrpython.py).
     ///
     /// ```python
     /// graph, block, i = position_key
@@ -1349,7 +1349,7 @@ impl RPythonAnnotator {
         format!("graph={} block={}{}", pk.graph_id, pk.block_id, opid)
     }
 
-    /// RPython `complete(self)` (annrpython.py:226-267).
+    /// RPython `complete(self)` (annrpython.py).
     ///
     /// Drains every pending-block generation until fixpoint, then
     /// validates that every tracked graph has an annotated return
@@ -1654,7 +1654,7 @@ impl RPythonAnnotator {
     }
 
     // ======================================================================
-    // RPython `medium-level interface` (annrpython.py:162-224) — block
+    // RPython `medium-level interface` (annrpython.py) — block
     // scheduling and pending-blocks queue.
     // ======================================================================
 
@@ -1777,7 +1777,7 @@ impl RPythonAnnotator {
         pending[generation].insert(BlockKey::of(block), (Rc::clone(block), Rc::clone(graph)));
     }
 
-    /// RPython `complete_pending_blocks(self)` (annrpython.py:203-224).
+    /// RPython `complete_pending_blocks(self)` (annrpython.py).
     ///
     /// Drains every pending-block generation, bumping each block's
     /// `generation` and calling `processblock(graph, block)`. Because
@@ -2226,7 +2226,7 @@ impl RPythonAnnotator {
             );
             for (a, cell) in blk.inputargs.iter_mut().zip(inputcells.iter()) {
                 if let Hlvalue::Variable(v) = a {
-                    // `annrpython.py:425-426` calls `setbinding(a,
+                    // `annrpython.py` calls `setbinding(a,
                     // cell)` unconditionally.  When `cell is None`
                     // and `arg.annotation` is already set, upstream
                     // crashes with `AttributeError: 'NoneType' object
@@ -2382,10 +2382,10 @@ impl RPythonAnnotator {
     }
 
     // ======================================================================
-    // RPython `flowing annotations in blocks` (annrpython.py:488-670).
+    // RPython `flowing annotations in blocks` (annrpython.py).
     // ======================================================================
 
-    /// RPython `consider_op(self, op)` (annrpython.py:643-660).
+    /// RPython `consider_op(self, op)` (annrpython.py).
     ///
     /// ```python
     /// def consider_op(self, op):
@@ -2438,7 +2438,7 @@ impl RPythonAnnotator {
         Ok(resultcell)
     }
 
-    /// RPython `get_exception(self, operation)` (annrpython.py:662-670).
+    /// RPython `get_exception(self, operation)` (annrpython.py).
     ///
     /// ```python
     /// def get_exception(self, operation):
@@ -2756,7 +2756,7 @@ impl RPythonAnnotator {
         Ok(OpLoopOutcome::Normal)
     }
 
-    /// RPython `flowin(self, graph, block)` (annrpython.py:488-576).
+    /// RPython `flowin(self, graph, block)` (annrpython.py).
     ///
     /// Port structure:
     /// 1. Run the op loop via [`flowin_op_loop`]. Its outcome decides
@@ -2990,7 +2990,7 @@ impl RPythonAnnotator {
         Ok(())
     }
 
-    /// RPython `processblock(self, graph, block)` (annrpython.py:378-412).
+    /// RPython `processblock(self, graph, block)` (annrpython.py).
     ///
     /// ```python
     /// self.annotated[block] = graph
@@ -3606,7 +3606,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Dispatch::None consider() — upstream operation.py:534-565.
+    // Dispatch::None consider() — upstream operation.py.
     // ------------------------------------------------------------------
 
     #[test]
@@ -3784,7 +3784,7 @@ mod tests {
     #[test]
     fn translation_config_check_str_without_nul_round_trips_through_translator() {
         // Minimal scaffolding test: the `TranslationConfig.translation`
-        // subfield added to back `build_types` annrpython.py:84-85 must
+        // subfield added to back `build_types` annrpython.py must
         // be settable at construction and readable through
         // `self.translator.config.translation.*`.
         use crate::translator::translator::TranslationContext;

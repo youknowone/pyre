@@ -7,7 +7,7 @@ use interp_time as t;
 crate::py_module! {
     "time",
     interpleveldefs: {
-        // `app_time.py:5-23 class struct_time` — exposed as `time.struct_time`.
+        // `app_time.py class struct_time` — exposed as `time.struct_time`.
         "struct_time" => t::struct_time_type(),
         // `interp_time.py:290` — 9 base fields plus tm_zone/tm_gmtoff when
         // the platform's `struct tm` carries them (always on the Unix

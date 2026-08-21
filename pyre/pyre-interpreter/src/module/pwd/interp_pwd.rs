@@ -3,7 +3,7 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 #[cfg(unix)]
-/// `app_pwd.py:3-19 class struct_passwd(metaclass=structseqtype)`.
+/// `app_pwd.py class struct_passwd(metaclass=structseqtype)`.
 /// Process-wide cached subclass-of-tuple type so every getpwuid /
 /// getpwnam / getpwall result materialises into the same structseq.
 static STRUCT_PASSWD_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -26,7 +26,7 @@ fn struct_passwd_type() -> pyre_object::PyObjectRef {
     }) as pyre_object::PyObjectRef
 }
 
-/// `interp_pwd.py:50-73 uid_converter` — narrow a python int to `uid_t`.
+/// `interp_pwd.py uid_converter` — narrow a python int to `uid_t`.
 ///
 /// `-1` is the "current uid" sentinel and passes through unchanged
 /// (cast to `uid_t` it becomes the max value, matching the C convention
@@ -91,7 +91,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ],
         )
     }
-    // `interp_pwd.py:75-87 make_struct_passwd` libc backend, used when
+    // `interp_pwd.py make_struct_passwd` libc backend, used when
     // the host_env abstraction layer is disabled.  Mirrors the same
     // rffi.charp2str / int construction PyPy uses.
     #[cfg(not(feature = "host_env"))]
@@ -116,7 +116,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ],
         )
     }
-    // `app_pwd.py:1-21 class struct_passwd(metaclass=structseqtype)`.
+    // `app_pwd.py class struct_passwd(metaclass=structseqtype)`.
     crate::module_ns_store(ns, "struct_passwd", struct_passwd_type());
     crate::module_ns_store(ns, "struct_pwent", struct_passwd_type());
     crate::module_ns_store(
@@ -128,10 +128,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.is_empty() {
                     return Err(crate::PyError::type_error("getpwuid() missing argument"));
                 }
-                // `interp_pwd.py:50-73 uid_converter`: -1 sentinel passes
+                // `interp_pwd.py uid_converter`: -1 sentinel passes
                 // through; negative-other → OverflowError "less than
                 // minimum"; positive-too-big → OverflowError "greater
-                // than maximum".  `interp_pwd.py:97-100 getpwuid` catches
+                // than maximum".  `interp_pwd.py getpwuid` catches
                 // OverflowError and converts it to KeyError "uid not
                 // found".
                 let uid = match pwd_uid_converter(args[0]) {

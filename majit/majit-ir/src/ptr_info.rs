@@ -17,7 +17,7 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
     field_descrs.get(field_idx as usize).cloned()
 }
 
-/// info.py:487-492 `reasonable_array_index(index)` — sanity gate on a
+/// info.py `reasonable_array_index(index)` — sanity gate on a
 /// constant array index or array size. Returns false for negative
 /// values or values above 150_000 so invalid loops and pathological
 /// allocations are not optimized.
@@ -28,18 +28,18 @@ pub fn reasonable_array_index(index: i64) -> bool {
     (0..=150_000).contains(&index)
 }
 
-/// Runtime hook for `ConstPtrInfo.getstrlen1(mode)` (info.py:810-822).
+/// Runtime hook for `ConstPtrInfo.getstrlen1(mode)` (info.py).
 /// Returns `Some(length)` when `gcref` points at a known string of the
 /// requested mode, `None` otherwise.
 pub type StringLengthResolver = std::sync::Arc<dyn Fn(GcRef, u8) -> Option<i64> + Send + Sync>;
 
-/// info.py:788-790 `ConstPtrInfo._unpack_str(mode)` — runtime hook for
+/// info.py `ConstPtrInfo._unpack_str(mode)` — runtime hook for
 /// extracting characters from a constant string GcRef. Returns the char
 /// values as `Vec<i64>`. Set by the host runtime (pyre etc.).
 pub type StringContentResolver =
     std::sync::Arc<dyn Fn(GcRef, u8) -> Option<Vec<i64>> + Send + Sync>;
 
-/// history.py:377-387 `get_const_ptr_for_string(s)` — runtime hook for
+/// history.py `get_const_ptr_for_string(s)` — runtime hook for
 /// creating a constant string GcRef from char values. The bool indicates
 /// unicode (true) vs byte-string (false). Set by the host runtime.
 pub type StringConstantAllocator = std::sync::Arc<dyn Fn(&[i64], bool) -> GcRef + Send + Sync>;
@@ -58,7 +58,7 @@ pub type StringConstantAllocator = std::sync::Arc<dyn Fn(&[i64], bool) -> GcRef 
 ///     (`PtrInfo::Virtual(_)` IS the truthy carrier of `_is_virtual`);
 ///     no separate slot is needed.
 ///
-/// `make_virtual_info` (resume.py:307-315) reads `cached_vinfo` to
+/// `make_virtual_info` (resume.py) reads `cached_vinfo` to
 /// dedup RdVirtualInfo allocations across multiple finish() calls
 /// referencing the same virtual. `RefCell` provides interior
 /// mutability so the immutable-receiver accessor can populate the
@@ -76,12 +76,12 @@ impl AbstractVirtualPtrInfo {
     }
 }
 
-/// vstring.py:50-140: StrPtrInfo
+/// vstring.py: StrPtrInfo
 #[derive(Clone, Debug)]
 pub struct StrPtrInfo {
     /// vstring.py: self.lenbound — IntBound for string length.
     pub lenbound: Option<IntBound>,
-    /// vstring.py:53 self.lgtop — cached length OpRef (set by getstrlen).
+    /// vstring.py self.lgtop — cached length OpRef (set by getstrlen).
     /// After force_box, this preserves the computed length so subsequent
     /// STRLEN queries reuse it instead of emitting a new STRLEN op.
     pub lgtop: Option<Operand>,
@@ -94,8 +94,8 @@ pub struct StrPtrInfo {
     pub variant: VStringVariant,
     /// info.py:91-92: last_guard_pos
     pub last_guard_pos: i32,
-    /// info.py:124-128 `AbstractVirtualPtrInfo._cached_vinfo` — inherited
-    /// through `StrPtrInfo(AbstractVirtualPtrInfo)` (vstring.py:50,55).
+    /// info.py `AbstractVirtualPtrInfo._cached_vinfo` — inherited
+    /// through `StrPtrInfo(AbstractVirtualPtrInfo)` (vstring.py).
     /// Lifted into `AbstractVirtualPtrInfo` per RPython `_attrs_`
     /// inheritance contract; `make_virtual_info` dedups across finish()
     /// calls by comparing fieldnums (resume.py:309-314).
@@ -103,7 +103,7 @@ pub struct StrPtrInfo {
 }
 
 impl StrPtrInfo {
-    /// vstring.py:168 / 227 / 278 `is_virtual()` on the string ptrinfo classes.
+    /// vstring.py / 227 / 278 `is_virtual()` on the string ptrinfo classes.
     pub fn is_virtual(&self) -> bool {
         match &self.variant {
             VStringVariant::Ptr => false,
@@ -113,26 +113,26 @@ impl StrPtrInfo {
     }
 }
 
-/// vstring.py:142-334 subclass state carried by `StrPtrInfo`.
+/// vstring.py subclass state carried by `StrPtrInfo`.
 #[derive(Clone, Debug)]
 pub enum VStringVariant {
     /// Non-virtual base `StrPtrInfo`.
     Ptr,
-    /// vstring.py:142 `VStringPlainInfo`.
+    /// vstring.py `VStringPlainInfo`.
     Plain(VStringPlainInfo),
-    /// vstring.py:214 `VStringSliceInfo`.
+    /// vstring.py `VStringSliceInfo`.
     Slice(VStringSliceInfo),
-    /// vstring.py:266 `VStringConcatInfo`.
+    /// vstring.py `VStringConcatInfo`.
     Concat(VStringConcatInfo),
 }
 
-/// vstring.py:142-212 `VStringPlainInfo`
+/// vstring.py `VStringPlainInfo`
 #[derive(Clone, Debug)]
 pub struct VStringPlainInfo {
     pub _chars: Vec<Option<Operand>>,
 }
 
-/// vstring.py:214-264 `VStringSliceInfo`
+/// vstring.py `VStringSliceInfo`
 #[derive(Clone, Debug)]
 pub struct VStringSliceInfo {
     pub s: Operand,
@@ -140,7 +140,7 @@ pub struct VStringSliceInfo {
     pub lgtop: Operand,
 }
 
-/// vstring.py:266-334 `VStringConcatInfo`
+/// vstring.py `VStringConcatInfo`
 #[derive(Clone, Debug)]
 pub struct VStringConcatInfo {
     pub vleft: Operand,
@@ -154,8 +154,8 @@ pub struct VStringConcatInfo {
 ///
 /// ## Invariant: `fields` NEVER contains typeptr (offset 0)
 ///
-/// Matches RPython upstream: `heaptracker.py:66-67 all_fielddescrs()` skips
-/// `typeptr`, so `info.py:180 AbstractStructPtrInfo.init_fields` sizes
+/// Matches RPython upstream: `heaptracker.py all_fielddescrs()` skips
+/// `typeptr`, so `info.py AbstractStructPtrInfo.init_fields` sizes
 /// `_fields` with typeptr excluded from the indexable range. The typeptr
 /// (offset 0) is tracked separately via `known_class` and emitted by the
 /// GC rewriter's `gen_initialize_vtable` path (rewrite.py:479-484), NOT
@@ -186,7 +186,7 @@ pub struct VirtualInfo {
     pub fields: Vec<(u32, Operand)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
-    /// info.py:124-128 `AbstractVirtualPtrInfo._cached_vinfo` inherited
+    /// info.py `AbstractVirtualPtrInfo._cached_vinfo` inherited
     /// state. Lifted into `AbstractVirtualPtrInfo` per RPython `_attrs_`
     /// inheritance — see the [`AbstractVirtualPtrInfo`] doc.
     pub avpi: AbstractVirtualPtrInfo,
@@ -232,7 +232,7 @@ pub struct InstancePtrInfo {
 pub struct StructPtrInfo {
     /// Exact struct descriptor.
     pub descr: DescrRef,
-    /// info.py:175 _fields — cached field values (same as InstancePtrInfo).
+    /// info.py _fields — cached field values (same as InstancePtrInfo).
     pub fields: Vec<(u32, FieldEntry)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
@@ -289,14 +289,14 @@ pub struct ArrayStructInfo {
 
 /// info.py:RawSlicePtrInfo — alias view into a parent virtual raw buffer.
 ///
-/// Created by `make_virtual_raw_slice` (virtualize.py:60-65) when an
+/// Created by `make_virtual_raw_slice` (virtualize.py) when an
 /// `INT_ADD(rawbuf, const_offset)` is folded against a virtual raw buffer.
 /// Reads / writes through a slice add `offset` to the requested byte
 /// offset and forward to the parent buffer.
 #[derive(Clone, Debug)]
 pub struct RawSlicePtrInfo {
     /// Slice offset relative to the parent buffer's base. Signed because
-    /// `info.py:460 RawSlicePtrInfo.__init__(offset, parent)` accepts an
+    /// `info.py RawSlicePtrInfo.__init__(offset, parent)` accepts an
     /// unbounded RPython int — `optimize_INT_ADD` folds the addend as a
     /// signed `getint()` and a negative addend is a valid (if rare)
     /// slice base.
@@ -311,10 +311,10 @@ pub struct RawSlicePtrInfo {
     pub avpi: AbstractVirtualPtrInfo,
 }
 
-/// info.py:386 RawBufferPtrInfo — pointer info for virtual raw memory.
+/// info.py RawBufferPtrInfo — pointer info for virtual raw memory.
 ///
 /// RPython stores the byte-write tracking in a separate `RawBuffer` object
-/// (`self.buffer = RawBuffer(cpu, None)` in info.py:392-393). Rust mirrors
+/// (`self.buffer = RawBuffer(cpu, None)` in info.py). Rust mirrors
 /// that by keeping the rawbuffer.py parallel-list state in `buffer`, while
 /// this struct owns the RawBufferPtrInfo metadata.
 #[derive(Clone, Debug)]
@@ -348,7 +348,7 @@ impl RawBufferPtrInfo {
         }
     }
 
-    /// info.py:403-410 RawBufferPtrInfo.getitem_raw delegates to RawBuffer.
+    /// info.py RawBufferPtrInfo.getitem_raw delegates to RawBuffer.
     pub fn read_value(
         &self,
         offset: i64,
@@ -358,7 +358,7 @@ impl RawBufferPtrInfo {
         self.buffer.read_value(offset, length, descr)
     }
 
-    /// info.py:412-415 RawBufferPtrInfo.setitem_raw delegates to RawBuffer.
+    /// info.py RawBufferPtrInfo.setitem_raw delegates to RawBuffer.
     pub fn write_value(
         &mut self,
         offset: i64,
@@ -392,7 +392,7 @@ pub struct VirtualizableFieldState {
     pub arrays: Vec<(u32, Vec<Operand>)>,
     /// Ordinary (non-virtualizable) heap fields read off this object, keyed by
     /// `FieldDescr::index_in_parent` — the same `_fields` role
-    /// `AbstractStructPtrInfo` plays at `info.py:175-214`.
+    /// `AbstractStructPtrInfo` plays at `info.py`.
     ///
     /// `fields` above is a different index space (`VirtualizableInfo::
     /// static_fields` order), so the two cannot share storage. Upstream needs
@@ -417,7 +417,7 @@ pub enum PtrInfo {
     /// Known to be non-null, nothing else.
     /// info.py: NonNullPtrInfo
     NonNull {
-        /// info.py:91-92: NonNullPtrInfo.last_guard_pos = -1
+        /// info.py: NonNullPtrInfo.last_guard_pos = -1
         last_guard_pos: i32,
     },
     /// Known constant pointer.
@@ -456,7 +456,7 @@ pub enum PtrInfo {
     VirtualRawSlice(RawSlicePtrInfo),
     /// Virtualizable object (interpreter frame).
     Virtualizable(VirtualizableFieldState),
-    /// vstring.py:50: StrPtrInfo — string with known length bounds.
+    /// vstring.py: StrPtrInfo — string with known length bounds.
     /// Tracks lenbound (IntBound) and mode (string vs unicode).
     Str(StrPtrInfo),
 }
@@ -603,7 +603,7 @@ impl PtrInfo {
 
     // ── info.py:100-118: last_guard_pos methods ──
 
-    /// info.py:100-103: get_last_guard
+    /// info.py: get_last_guard
     pub fn get_last_guard_pos(&self) -> Option<usize> {
         let pos = match self {
             PtrInfo::NonNull { last_guard_pos, .. } => *last_guard_pos,
@@ -643,7 +643,7 @@ impl PtrInfo {
         Some(pos)
     }
 
-    /// info.py:111-118: mark_last_guard
+    /// info.py: mark_last_guard
     pub fn set_last_guard_pos(&mut self, pos: i32) {
         match self {
             PtrInfo::NonNull { last_guard_pos, .. } => *last_guard_pos = pos,
@@ -662,7 +662,7 @@ impl PtrInfo {
         }
     }
 
-    /// info.py:108-109: reset_last_guard_pos
+    /// info.py: reset_last_guard_pos
     pub fn reset_last_guard_pos(&mut self) {
         self.set_last_guard_pos(-1);
     }
@@ -672,7 +672,7 @@ impl PtrInfo {
         PtrInfo::Constant(gcref)
     }
 
-    /// `optimizer.py:137-152 make_constant_class` parity. PyPy stores
+    /// `optimizer.py make_constant_class` parity. PyPy stores
     /// known-class state on `InstancePtrInfo` itself (with `descr=None` and
     /// an empty `_fields`).
     pub fn known_class(class_ptr: i64, _is_nonnull: bool) -> Self {
@@ -786,10 +786,10 @@ impl PtrInfo {
     /// `isinstance(x, info.AbstractVirtualPtrInfo)` — whether this info can
     /// carry cached fields/items, which is a WIDER test than `is_virtual`.
     ///
-    /// `AbstractVirtualPtrInfo` (info.py:124) is the base of
+    /// `AbstractVirtualPtrInfo` (info.py) is the base of
     /// `AbstractStructPtrInfo` (:175, so `InstancePtrInfo` :313 and
     /// `StructPtrInfo`), `ArrayPtrInfo` (:496), `AbstractRawPtrInfo` (:374)
-    /// and `StrPtrInfo` (vstring.py:50). Only `NonNullPtrInfo` (:90) and
+    /// and `StrPtrInfo` (vstring.py). Only `NonNullPtrInfo` (:90) and
     /// `ConstPtrInfo` (:706, which does not even inherit `NonNullPtrInfo`)
     /// fall outside it. A NON-virtual `InstancePtrInfo` therefore answers
     /// `True` here and `False` to `is_virtual`.
@@ -822,7 +822,7 @@ impl PtrInfo {
         }
     }
 
-    /// info.py:826-838 ConstPtrInfo.getstrhash — closure-resolved variant.
+    /// info.py ConstPtrInfo.getstrhash — closure-resolved variant.
     pub fn getstrhash<F>(&self, mode: u8, mut resolver: F) -> Option<i64>
     where
         F: FnMut(GcRef, u8) -> Option<i64>,
@@ -872,7 +872,7 @@ impl PtrInfo {
                 }
                 refs
             }
-            // vstring.py:207-208 / 255-257 / 319-324: each `StrPtrInfo`
+            // vstring.py / 255-257 / 319-324: each `StrPtrInfo`
             // variant registers its child OpRefs via
             // `_visitor_walk_recursive`. Mirror that here so GC rooting
             // (`unroll.rs` exported_infos walk) and other generic-walker
@@ -937,7 +937,7 @@ impl PtrInfo {
         }
     }
 
-    /// info.py:180-188 `AbstractStructPtrInfo.init_fields`.
+    /// info.py `AbstractStructPtrInfo.init_fields`.
     pub fn all_fielddescrs_from_descr(&self) -> Vec<DescrRef> {
         let sd = match self {
             PtrInfo::Virtual(v) => v.descr.as_size_descr(),
@@ -984,7 +984,7 @@ impl PtrInfo {
         }
     }
 
-    /// info.py:64-69 `PtrInfo.getnullness()` parity.
+    /// info.py `PtrInfo.getnullness()` parity.
     pub fn getnullness(&self) -> i8 {
         if self.is_null() {
             crate::optimize::INFO_NULL
@@ -995,13 +995,13 @@ impl PtrInfo {
         }
     }
 
-    /// `info.py:44-45` `PtrInfo.is_about_object()` default `False` /
-    /// `info.py:327-328` `InstancePtrInfo.is_about_object()` override `True`.
+    /// `info.py` `PtrInfo.is_about_object()` default `False` /
+    /// `info.py` `InstancePtrInfo.is_about_object()` override `True`.
     pub fn is_about_object(&self) -> bool {
         matches!(self, PtrInfo::Instance(_) | PtrInfo::Virtual(_))
     }
 
-    /// `info.py:28-29` `PtrInfo.is_precise()` default `False` / virtual
+    /// `info.py` `PtrInfo.is_precise()` default `False` / virtual
     /// subclass override `True`.
     pub fn is_precise(&self) -> bool {
         matches!(
@@ -1073,7 +1073,7 @@ impl PtrInfo {
         }
     }
 
-    /// info.py:180-188 `AbstractStructPtrInfo.init_fields` — upgrade the
+    /// info.py `AbstractStructPtrInfo.init_fields` — upgrade the
     /// descr when a more-precise one shows up via `setfield`.
     pub fn init_fields(&mut self, descr: DescrRef, index: usize) {
         let Some(size_descr) = descr.as_size_descr() else {
@@ -1178,7 +1178,7 @@ impl PtrInfo {
         }
     }
 
-    /// shortpreamble.py:73-79: HeapOp.produce_op stores PreambleOp in _fields.
+    /// shortpreamble.py: HeapOp.produce_op stores PreambleOp in _fields.
     pub fn set_preamble_field(&mut self, field_idx: u32, pop: PreambleOp) {
         assert!(!self.is_virtual(), "set_preamble_field on virtual");
         match self {
@@ -1208,7 +1208,7 @@ impl PtrInfo {
         }
     }
 
-    /// shortpreamble.py:80-85 stores PreambleOp in array `_items[index]`.
+    /// shortpreamble.py stores PreambleOp in array `_items[index]`.
     pub fn set_preamble_item(&mut self, index: usize, pop: PreambleOp) {
         assert!(!self.is_virtual(), "set_preamble_item on virtual");
         if let PtrInfo::Array(v) = self {
@@ -1246,7 +1246,7 @@ impl PtrInfo {
         }
     }
 
-    /// heap.py:177-187: CachedField._getfield detects PreambleOp in _fields.
+    /// heap.py: CachedField._getfield detects PreambleOp in _fields.
     pub fn take_preamble_field(&mut self, field_idx: u32) -> Option<PreambleOp> {
         match self {
             PtrInfo::Instance(v) => {
@@ -1275,7 +1275,7 @@ impl PtrInfo {
         }
     }
 
-    /// heap.py:238-250: ArrayCachedItem._getfield detects PreambleOp in
+    /// heap.py: ArrayCachedItem._getfield detects PreambleOp in
     /// `_items[index]`, forces it, and writes the resolved result back.
     pub fn take_preamble_item(&mut self, index: usize) -> Option<PreambleOp> {
         match self {
@@ -1311,7 +1311,7 @@ impl PtrInfo {
         }
     }
 
-    /// info.py:200-201: all_items — returns _fields directly.
+    /// info.py: all_items — returns _fields directly.
     pub fn all_items(&self) -> Vec<(u32, FieldEntry)> {
         match self {
             PtrInfo::Instance(v) => v.fields.clone(),
@@ -1342,7 +1342,7 @@ impl PtrInfo {
         }
     }
 
-    /// info.py:212-214 AbstractStructPtrInfo.getfield.
+    /// info.py AbstractStructPtrInfo.getfield.
     pub fn getfield(&self, field_idx: u32) -> Option<FieldEntry> {
         match self {
             PtrInfo::Instance(v) => v
@@ -1384,7 +1384,7 @@ impl PtrInfo {
                 v.items[index] = FieldEntry::Value(value);
             }
             PtrInfo::VirtualArray(v)
-                // info.py:568-569 `if self.is_virtual(): return  # bogus
+                // info.py `if self.is_virtual(): return  # bogus
                 // setarrayitem_gc into virtual, drop the operation`.
                 if index < v.items.len() => {
                     v.items[index] = value;
@@ -1402,7 +1402,7 @@ impl PtrInfo {
         }
     }
 
-    /// heap.py:257-262: ArrayCachedItem.invalidate clears the cached slot.
+    /// heap.py: ArrayCachedItem.invalidate clears the cached slot.
     pub fn clear_item(&mut self, index: usize) {
         match self {
             PtrInfo::Array(v) => {
@@ -1417,7 +1417,7 @@ impl PtrInfo {
         }
     }
 
-    /// info.py:663-668: getinteriorfield_virtual(index, fielddescr).
+    /// info.py: getinteriorfield_virtual(index, fielddescr).
     pub fn getinteriorfield_virtual(
         &self,
         element_index: usize,
@@ -1437,7 +1437,7 @@ impl PtrInfo {
         }
     }
 
-    /// info.py:658-661: setinteriorfield_virtual(index, fielddescr, fld).
+    /// info.py: setinteriorfield_virtual(index, fielddescr, fld).
     pub fn setinteriorfield_virtual(
         &mut self,
         element_index: usize,

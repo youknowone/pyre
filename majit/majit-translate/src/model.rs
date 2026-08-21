@@ -42,15 +42,15 @@ pub enum ValueType {
     Int128,
     /// RPython `r_ulonglonglong` / `lltype.UnsignedLongLongLong`.
     UInt128,
-    /// RPython `SomeBool` (`annotator/model.py:185-198`): a Python `bool`
+    /// RPython `SomeBool` (`annotator/model.py`): a Python `bool`
     /// at the annotator level.  Distinct from `Int` (RPython `SomeInteger`,
-    /// `:200-264`) because PyPy's flowspace `UNARY_NOT` (`flowcontext.py:531-538`,
+    /// `:200-264`) because PyPy's flowspace `UNARY_NOT` (`flowcontext.py`,
     /// `op.bool` then `guessbool` fork) and `UNARY_INVERT` (`:188-191`,
     /// `op.invert`) dispatch on which one is on the stack:
     /// `not` for booleans, `~` for integers.
     ///
     /// Every comparison opname (`lt`/`le`/`eq`/`ne`/`gt`/`ge`,
-    /// `operation.py:505-510 add_operator(.., dispatch=2, pure=True)`),
+    /// `operation.py add_operator(.., dispatch=2, pure=True)`),
     /// `is`/`is not`, the unary `bool` op, and Rust `bool`-typed locals
     /// produce `Bool`.
     ///
@@ -159,7 +159,7 @@ pub enum UnsupportedExprKind {
     Verbatim,
     Yield,
     /// Rust `!x` whose operand has no statically-known bool/int type.
-    /// RPython distinguishes UNARY_NOT (`flowcontext.py:531-538`) from
+    /// RPython distinguishes UNARY_NOT (`flowcontext.py`) from
     /// UNARY_INVERT (`flowcontext.py:188-191`) at the bytecode token,
     /// so an Unknown operand cannot pick the parity-correct flowspace
     /// op without guessing.
@@ -176,7 +176,7 @@ pub enum UnsupportedExprKind {
     PathConstantRef,
     /// Rust `|args| body` closure expression used as a value (closure
     /// capture / function-pointer argument).  RPython has no closure
-    /// model in flowspace — `flowcontext.py:1235 MAKE_FUNCTION` raises
+    /// model in flowspace — `flowcontext.py MAKE_FUNCTION` raises
     /// `FlowingError` for nested-fn / lambda surfaces (only top-level
     /// `FunctionGraph`s round-trip through the bookkeeper).  Pyre's
     /// `syn::Expr::Closure` arm produces an `Unknown` marker for the
@@ -188,9 +188,9 @@ pub enum UnsupportedExprKind {
     OtherExpr,
 }
 
-/// RPython `rpython/rtyper/rclass.py:57-60` — `IR_IMMUTABLE` / `IR_IMMUTABLE_ARRAY`
+/// RPython `rpython/rtyper/rclass.py` — `IR_IMMUTABLE` / `IR_IMMUTABLE_ARRAY`
 /// / `IR_QUASIIMMUTABLE` / `IR_QUASIIMMUTABLE_ARRAY`.  Parsed from
-/// `_immutable_fields_` string literals (`rclass.py:644-678 _parse_field_list`):
+/// `_immutable_fields_` string literals (`rclass.py _parse_field_list`):
 ///
 /// * `"field"`       → `Immutable`
 /// * `"field?"`      → `QuasiImmutable`
@@ -221,7 +221,7 @@ impl ImmutableRank {
         }
     }
 
-    /// RPython `ImmutableRanking.pure` flag — `rclass.py:33-37`.  True for
+    /// RPython `ImmutableRanking.pure` flag — `rclass.py`.  True for
     /// `IR_IMMUTABLE` / `IR_IMMUTABLE_ARRAY`; false for the quasi variants
     /// (they pin via guard, not via pure flag).
     pub fn is_immutable(self) -> bool {
@@ -235,7 +235,7 @@ impl ImmutableRank {
     }
 
     /// True for `IR_IMMUTABLE_ARRAY` / `IR_QUASIIMMUTABLE_ARRAY` —
-    /// `rclass.py:670 rank in (IR_QUASIIMMUTABLE_ARRAY, IR_IMMUTABLE_ARRAY)`.
+    /// `rclass.py rank in (IR_QUASIIMMUTABLE_ARRAY, IR_IMMUTABLE_ARRAY)`.
     pub fn is_array(self) -> bool {
         matches!(self, Self::ImmutableArray | Self::QuasiImmutableArray)
     }
@@ -253,7 +253,7 @@ pub enum CallTarget {
         /// type), NOT a graph-object pointer. It is pyre's surrogate for
         /// `call.py:29`'s graph-object dict key: the consumer does
         /// `function_graphs.get(&path)` directly, the `CallPath`-keyed
-        /// stand-in for `getfunctionptr(graph)` (call.py:181). Transient
+        /// stand-in for `getfunctionptr(graph)` (call.py). Transient
         /// (`#[serde(skip)]`) — never reaches codegen / serde.
         #[serde(skip, default)]
         resolved_path: Option<crate::parse::CallPath>,
@@ -272,7 +272,7 @@ pub enum CallTarget {
     /// identity: `HostObject::new_class(qualname)` keys on the joined
     /// path, so `StepResult::Continue` and `JitAction::Continue` produce
     /// distinct ClassDescs and don't collide on the bare leaf — matching
-    /// RPython `bookkeeper.py:353 getdesc(pyobj)` which dedupes by
+    /// RPython `bookkeeper.py getdesc(pyobj)` which dedupes by
     /// object identity, not leaf string.
     SyntheticTransparentCtor {
         name: String,
@@ -637,13 +637,13 @@ pub enum OpKind {
     /// into kind `'int'` (`rpython/jit/codewriter/flatten.py:getkind`),
     /// so backend lowering shares the integer materialization path with
     /// `ConstInt`. Distinct from `ConstInt(0/1)` at the annotator /
-    /// rtyper layer: lifts to `SomeBool` (`annotator/model.py:227`)
+    /// rtyper layer: lifts to `SomeBool` (`annotator/model.py`)
     /// instead of `SomeInteger`, and selects `BoolRepr`
     /// (`rpython/rtyper/rbool.py:10`) instead of `IntegerRepr`.
     ConstBool(bool),
     /// RPython `flowmodel.py:Constant(rfloat)` — a float constant whose
     /// `concretetype` is `lltype.Float`.  Stored as the f64 bit pattern
-    /// (`history.py:265 ConstFloat.getfloatstorage`) so PartialEq/Hash
+    /// (`history.py ConstFloat.getfloatstorage`) so PartialEq/Hash
     /// stay derivable.  The assembler materialises this through the
     /// existing `constants_f` pool with a `float_copy` op, mirroring
     /// the `ConstInt` → `int_copy` lowering.
@@ -688,7 +688,7 @@ pub enum OpKind {
     ConstRefAddr(i64),
     /// An identity-bearing symbolic constant — pyre's model-graph
     /// carrier for RPython's `CDefinedIntSymbolic` singletons
-    /// (`rpython/rlib/jit.py:360 _we_are_jitted`).  `tag` is the
+    /// (`rpython/rlib/jit.py _we_are_jitted`).  `tag` is the
     /// process-unique `flowspace::model::ConstValue::SpecTag` id the
     /// symbolic is keyed by (e.g.
     /// [`crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID`]);
@@ -740,7 +740,7 @@ pub enum OpKind {
         ty: ValueType,
     },
     /// RPython `malloc(GcStruct, flavor='gc')` lowered by
-    /// `jtransform.py:1012-1045 rewrite_op_malloc` to `new(descr)`.
+    /// `jtransform.py rewrite_op_malloc` to `new(descr)`.
     /// Synthetic Rust aggregate constructors reach pyre before the missing
     /// rtyper malloc lowering, so jtransform restores that exact operation
     /// using the aggregate owner to resolve its size descriptor.
@@ -773,7 +773,7 @@ pub enum OpKind {
     /// fixed-size array allocation `do_fixed_newlist_clear` emits
     /// (`jtransform.py:1858-1863`, `corresponds to rtyper.rlist.
     /// ll_alloc_and_clear: needs to clear the items`).  Also the
-    /// allocation half `do_fixed_newlist` picks (`jtransform.py:1851-1855`)
+    /// allocation half `do_fixed_newlist` picks (`jtransform.py`)
     /// when `ARRAY.OF` is a GC `Ptr` or `Struct` — the exact case that
     /// distinguishes `new_array_clear` from the uninitialised `new_array`.
     ///
@@ -782,7 +782,7 @@ pub enum OpKind {
     /// `arraydescr` at assembly exactly like `ArrayRead`/`ArrayWrite`; a
     /// cleared list holds GC pointers (`Ptr(GcArray(OBJECTPTR))`), so
     /// `item_ty` is `Ref`.  The allocator zero-fills every slot
-    /// (`bhimpl_new_array_clear`, `blackhole.py:1311-1313`), so the result
+    /// (`bhimpl_new_array_clear`, `blackhole.py`), so the result
     /// register is always a fresh `Ref` ('r') and the emitted key is
     /// `new_array_clear/id>r`.
     NewArrayClear {
@@ -794,11 +794,11 @@ pub enum OpKind {
     },
     /// The compound resizable-list allocation `opimpl_newlist_clear`
     /// records (`pyjitpl.py:792-798`) — the resized-layout counterpart to
-    /// `do_resizable_newlist_clear` (`jtransform.py:1938-1943`).  Allocates
+    /// `do_resizable_newlist_clear` (`jtransform.py`).  Allocates
     /// the resizable-list `GcStruct` header (the struct named `"list"`),
     /// zero-clears a fresh items array of `length` slots, and wires the two
     /// header fields `length`/`items` so the result is a fully-formed empty
-    /// resizable list.  `bhimpl_newlist_clear` (`blackhole.py:1174-1181`,
+    /// resizable list.  `bhimpl_newlist_clear` (`blackhole.py`,
     /// `@arguments("cpu", "i", "d", "d", returns="r")`) runs the same four
     /// steps at the blackhole boundary: `new(structdescr)` +
     /// `setfield(length)` + `new_array_clear(items_arraydescr)` +
@@ -851,7 +851,7 @@ pub enum OpKind {
         base: crate::flowspace::model::Variable,
         /// ARRAY identity for `cpu.arraydescrof(ARRAY)`.
         array_type_id: Option<String>,
-        /// `ARRAY_INSIDE._hints.get('nolength', False)` (descr.py:359).
+        /// `ARRAY_INSIDE._hints.get('nolength', False)` (descr.py).
         /// `false` (length-prefixed) lays the length word at offset 0.
         nolength: bool,
     },
@@ -909,16 +909,16 @@ pub enum OpKind {
     /// Guard that a value equals a compile-time constant.
     ///
     /// RPython upstream emits three opnames in the guard_value family
-    /// via `codewriter/jtransform.py:608-614 rewrite_op_hint`:
+    /// via `codewriter/jtransform.py rewrite_op_hint`:
     /// `int_guard_value` / `ref_guard_value` / `float_guard_value`,
     /// each a 1-input/0-output pointer-or-value compare per the arg's
     /// `getkind()`.
     ///
-    /// `str_guard_value` (`jit.py:631` for `promote_string`, `:647`
+    /// `str_guard_value` (`jit.py` for `promote_string`, `:647`
     /// for `promote_unicode`) is NOT modeled as a distinct op: it is the
     /// value-equality promotion of an `rstr.STR` / `rstr.UNICODE` low-level
     /// string, comparing the inline char array
-    /// (`support.py:526-538 _ll_2_str_eq_nonnull` indexes `s.chars[i]`).
+    /// (`support.py _ll_2_str_eq_nonnull` indexes `s.chars[i]`).
     /// pyre interpreter strings are `W_UnicodeObject` GC refs, never
     /// `Ptr(rstr.STR)`, so there is no char array to value-compare; the
     /// `PromoteString` / `PromoteUnicode` rewrite arms lower their ref
@@ -933,9 +933,9 @@ pub enum OpKind {
     },
     /// Project a callee function pointer out of a `dyn Trait` receiver's
     /// vtable for the named method slot.  Result is integer-typed so it
-    /// can be fed to `int_guard_value` (RPython `jtransform.py:546`).
+    /// can be fed to `int_guard_value` (RPython `jtransform.py`).
     ///
-    /// TODO: pyre adaptation of `rclass.py:371-377 getclsfield()`. RPython
+    /// TODO: pyre adaptation of `rclass.py getclsfield()`. RPython
     /// emits a `cast_pointer + getfield(vtable_struct, method_name)` chain
     /// because `ClassRepr` models the vtable as an explicit `Struct`. Rust
     /// `dyn Trait` vtable layout is compiler-internal (unstable ABI), so
@@ -959,7 +959,7 @@ pub enum OpKind {
     /// vlist.append(hop.inputconst(Void, row_of_graphs.values()))
     /// v = hop.genop('indirect_call', vlist, resulttype=rresult)
     /// ```
-    /// Lowered downstream by `jtransform.py:410-412 rewrite_op_indirect_call`.
+    /// Lowered downstream by `jtransform.py rewrite_op_indirect_call`.
     IndirectCall {
         funcptr: crate::flowspace::model::Variable,
         args: Vec<crate::flowspace::model::Variable>,
@@ -1017,7 +1017,7 @@ pub enum OpKind {
     /// Virtualizable array length → reads the length off the boxes.
     /// RPython: `arraylen_vable`.
     ///
-    /// Emitted by `jtransform.py:808-817 rewrite_op_getarraysize`, the third
+    /// Emitted by `jtransform.py rewrite_op_getarraysize`, the third
     /// consumer of `vable_array_vars` alongside [`OpKind::VableArrayRead`]
     /// and [`OpKind::VableArrayWrite`].  Without it a `len()` over a
     /// virtualizable array is the one route that still reads the raw array
@@ -1063,7 +1063,7 @@ pub enum OpKind {
     /// JIT hint operation — `hint(x, **kwds)`.
     ///
     /// RPython models a single `hint` operator
-    /// (`rpython/flowspace/operation.py:521 add_operator('hint', None,
+    /// (`rpython/flowspace/operation.py add_operator('hint', None,
     /// dispatch=1)`) whose kwarg dict selects the behaviour; `rlib/jit.py:101
     /// promote(x)` and `#[elidable_promote]`'s per-arg wrapper both lower to
     /// it.  Pyre carries the kwarg key as the structured [`kind`] field
@@ -1081,7 +1081,7 @@ pub enum OpKind {
 
     // ── Call effect classification (generated by jtransform) ────
     //
-    // RPython jtransform.py:414-435 `rewrite_call()`: args are split by kind
+    // RPython jtransform.py `rewrite_call()`: args are split by kind
     // into three ListOfKind lists. The opname encodes the kind signature:
     //   residual_call_ir_i  = int+ref args, int result
     //   call_elidable_r_v   = ref args, void result
@@ -1128,7 +1128,7 @@ pub enum OpKind {
 
     // ── Call kind classification (generated by jtransform via CallControl) ──
     //
-    // RPython jtransform.py:414-435 `rewrite_call()`: args are split by kind
+    // RPython jtransform.py `rewrite_call()`: args are split by kind
     // into three lists (int, ref, float). The opname encodes the kind signature:
     //   inline_call_ir_i  = int+ref args, int result
     //   residual_call_r_v = ref args, void result
@@ -1263,7 +1263,7 @@ pub enum OpKind {
     },
 
     /// RPython `record_quasiimmut_field(v_inst, fielddescr, mutatefielddescr)`
-    /// — `jtransform.py:901-903`.  Emitted by `rewrite_op_getfield` when the
+    /// — `jtransform.py`.  Emitted by `rewrite_op_getfield` when the
     /// field is quasi-immutable; paired with a subsequent pure-read.  The
     /// metainterp/blackhole counterpart (`blackhole.py:1537-1539
     /// bhimpl_record_quasiimmut_field`) is a no-op during blackhole execution
@@ -1287,7 +1287,7 @@ pub enum OpKind {
     Live,
 
     /// JitDriver merge-point marker — RPython `jit_merge_point` opname.
-    /// Emitted by `handle_jit_marker__jit_merge_point` (jtransform.py:1690-1712)
+    /// Emitted by `handle_jit_marker__jit_merge_point` (jtransform.py)
     /// with the portal jitdriver's index and green/red arguments split by
     /// kind (`make_three_lists`). In upstream the args are a flat
     /// `SpaceOperation.args` vec `[index_const, greens_i, greens_r,
@@ -1304,7 +1304,7 @@ pub enum OpKind {
     },
 
     /// JitDriver loop-header marker — RPython `loop_header` opname.
-    /// Emitted by `handle_jit_marker__loop_header` (jtransform.py:1714-1718)
+    /// Emitted by `handle_jit_marker__loop_header` (jtransform.py)
     /// with the jitdriver's index as its single Constant arg.
     /// `can_enter_jit` markers alias to this (jtransform.py:1723).
     LoopHeader {
@@ -1324,8 +1324,8 @@ pub enum OpKind {
         kind: UnknownKind,
     },
 
-    /// RPython `BUILD_TUPLE` (`flowspace/flowcontext.py:1163`) /
-    /// `newtuple` operation (`operation.py:542-548`).  Constructs a
+    /// RPython `BUILD_TUPLE` (`flowspace/flowcontext.py`) /
+    /// `newtuple` operation (`operation.py`).  Constructs a
     /// new tuple from N element values; the result is a fresh tuple
     /// object distinct from any individual element.
     NewTuple {
@@ -1342,7 +1342,7 @@ pub enum OpKind {
 
     /// RPython `getslice` operation (`operation.py`) — `l[start:stop]`.
     /// The three operands are `(list, start, stop)`; the annotator's
-    /// `getslice` handler (`unaryop.py:420-423`) builds a fresh
+    /// `getslice` handler (`unaryop.py`) builds a fresh
     /// `listdef.offspring` (a copy, not a view), and the rtyper lowers it
     /// through `AbstractBaseListRepr.rtype_getslice`
     /// (`rlist.py:409-414`) to a `gendirectcall` of the per-kind
@@ -1409,7 +1409,7 @@ pub enum OpKind {
     /// `-LIT` unary-neg shape and the `thread_local!` `const { LIT }`
     /// wrapper).  `Some(v)` reaches the flowspace adapter as the
     /// concrete `Constant(v)` operand of the synthetic `same_as` op,
-    /// matching PyPy `LOAD_GLOBAL` (`flowcontext.py:856`) pushing the
+    /// matching PyPy `LOAD_GLOBAL` (`flowcontext.py`) pushing the
     /// resolved object.  `None` is rejected before JitCode assembly:
     /// RPython has no blackhole `same_as/*` opcode, so unresolved
     /// statics must be folded to constants or lowered through a real
@@ -1439,7 +1439,7 @@ pub struct SpaceOperation {
 pub enum ExitSwitch {
     Value(crate::flowspace::model::Variable),
     LastException,
-    /// `jtransform.py:196-234 optimize_goto_if_not` fuses a comparison
+    /// `jtransform.py optimize_goto_if_not` fuses a comparison
     /// op into the exitswitch: `block.exitswitch = (opname,) +
     /// tuple(op.args) + ('-live-before',)`.  Carries the RPython
     /// comparison opname (e.g. `int_lt`) and the operands; the trailing
@@ -1464,7 +1464,7 @@ pub enum ExitCase {
     Const(ConstValue),
 }
 
-/// RPython `flowspace/model.py:109-168` `Link`.
+/// RPython `flowspace/model.py` `Link`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub args: Vec<LinkArg>,
@@ -1473,7 +1473,7 @@ pub struct Link {
     /// RPython `Link.prevblock` — the block this Link exits from.
     pub prevblock: Option<BlockId>,
     /// RPython `Link.llexitcase` — the low-level value matched by
-    /// `goto_if_exception_mismatch` (`flatten.py:228-231`).  For
+    /// `goto_if_exception_mismatch` (`flatten.py`).  For
     /// typed exception links this is the rtyper-produced class
     /// identity constant; pyre carries it as a full `ConstValue` so
     /// non-Int llexitcase shapes (`lltype.Ptr`, host class objects)
@@ -1531,7 +1531,7 @@ impl Link {
     }
 
     /// Structural counterpart of RPython rtyper's
-    /// `convert_link()` (`rtyper.py:1338`): copy the flow-level
+    /// `convert_link()` (`rtyper.py`): copy the flow-level
     /// `exitcase` into the low-level `llexitcase` slot for primitive
     /// branch values.  The `"default"` switch sentinel is not a
     /// low-level case and stays `None`.
@@ -1555,7 +1555,7 @@ impl Link {
         self
     }
 
-    /// RPython `flatten.py:224` `if link.exitcase is Exception`.
+    /// RPython `flatten.py` `if link.exitcase is Exception`.
     pub fn catches_all_exceptions(&self) -> bool {
         self.exitcase == Some(exception_exitcase())
     }
@@ -1566,7 +1566,7 @@ pub fn exception_exitcase() -> ExitCase {
 }
 
 /// RPython `Link.args` items are Variables or Constants —
-/// `Link.args: List[Hlvalue]` (`flowspace/model.py:140`) where
+/// `Link.args: List[Hlvalue]` (`flowspace/model.py`) where
 /// `Hlvalue = Variable | Constant`.  Both arms carry the
 /// upstream-orthodox flowspace handles directly: `Value` wraps a
 /// [`crate::flowspace::model::Variable`] (concretetype on the inline
@@ -1614,7 +1614,7 @@ impl LinkArg {
 impl From<ConstValue> for LinkArg {
     /// Wrap a raw [`ConstValue`] in a [`crate::flowspace::model::Constant`]
     /// with no concretetype attached.  Mirrors RPython
-    /// `Constant(value)` (`flowspace/model.py:354 __init__`) where
+    /// `Constant(value)` (`flowspace/model.py __init__`) where
     /// `concretetype` defaults to `None` until the rtyper sets it.
     fn from(value: ConstValue) -> Self {
         Self::Const(crate::flowspace::model::Constant::new(value))
@@ -1629,7 +1629,7 @@ impl From<crate::flowspace::model::Constant> for LinkArg {
 
 /// A basic block in the control flow graph.
 ///
-/// RPython equivalent: `flowspace/model.py:171-180 Block` — slots
+/// RPython equivalent: `flowspace/model.py Block` — slots
 /// `inputargs operations exitswitch exits`.  Upstream has no separate
 /// terminator surface: fall-through is `exitswitch=None` with a single
 /// `Link`, bool branches are `exitswitch=Variable` with two Links
@@ -1641,7 +1641,7 @@ pub struct Block {
     /// Phi-node inputs: values provided by incoming Links.
     ///
     /// RPython parity: `Block.inputargs: List[Variable]`
-    /// (`flowspace/model.py:21-25 Block([Variable("etype"),
+    /// (`flowspace/model.py Block([Variable("etype"),
     /// Variable("evalue")])`) — each predecessor Link carries
     /// values that map 1:1 to these inputargs.  Pyre stores the
     /// upstream-orthodox `Variable` directly; consumers match on the
@@ -1652,7 +1652,7 @@ pub struct Block {
     pub exitswitch: Option<ExitSwitch>,
     /// RPython `Block.exits`.
     pub exits: Vec<Link>,
-    /// RPython `flowspace/flowcontext.py:455 mergeblock`: when a
+    /// RPython `flowspace/flowcontext.py mergeblock`: when a
     /// `SpamBlock` is generalised by a later `union`, the prior
     /// candidate is marked `block.dead = True` and `block.operations
     /// = ()` and its exits are recloseblock'd to forward to the new
@@ -1695,7 +1695,7 @@ pub struct Block {
 /// the same merge point line up positionally even when one of them
 /// rolled back its bindings via `LocalBindingSnapshot::restore`.
 ///
-/// RPython parity: `flowspace/framestate.py:18 FrameState` — a tuple of
+/// RPython parity: `flowspace/framestate.py FrameState` — a tuple of
 /// `(locals_w, stack, last_exception, blocklist, next_offset)`.  Pyre's
 /// graphs are lowered from Charon ULLBC rather than Python bytecode, so
 /// the `stack` / `last_exception` / `blocklist` / `next_offset`
@@ -1739,7 +1739,7 @@ pub struct FrameState {
     /// snapshot point.  Empty for AST-frontend snapshots until the
     /// flowcontext-style walker introduces stack push/pop on Expr
     /// nodes; the `union` invariant requires both predecessors agree
-    /// on stack content (upstream `framestate.py:79 _union(self.stack,
+    /// on stack content (upstream `framestate.py _union(self.stack,
     /// other.stack)` zips positionally — equal-length always for any
     /// program reachable to a join).
     pub stack: Vec<crate::flowspace::framestate::StackElem>,
@@ -1750,13 +1750,13 @@ pub struct FrameState {
     /// `framestate.py:23 self.blocklist` — block-stack snapshot
     /// (`SETUP_*` / `POP_BLOCK` depth at the snapshot point).  Empty
     /// for AST-frontend snapshots until the flowcontext-style walker
-    /// introduces frame-block management.  `framestate.py:58 matches` asserts
+    /// introduces frame-block management.  `framestate.py matches` asserts
     /// blocklist equality across merge candidates as a precondition.
     pub blocklist: Vec<crate::flowspace::flowcontext::FrameBlock>,
     /// `framestate.py:24 self.next_offset` — bytecode offset resumed
     /// at after the snapshot.  `0` for AST-frontend snapshots until
     /// the flowcontext-style walker uses an AST-node index (the equivalent of a
-    /// virtual-bytecode tape position).  `framestate.py:59 matches`
+    /// virtual-bytecode tape position).  `framestate.py matches`
     /// asserts next_offset equality across merge candidates as a
     /// precondition.
     pub next_offset: i64,
@@ -1807,14 +1807,14 @@ impl FrameState {
 
     /// Compute a state at least as general as both `self` and `other`
     /// via positional zip over slots — direct port of RPython
-    /// `framestate.py:14 _union` (`return [union(v1, v2) for v1, v2
-    /// in zip(seq1, seq2)]`) and `framestate.py:73-90 FrameState.union`.
+    /// `framestate.py _union` (`return [union(v1, v2) for v1, v2
+    /// in zip(seq1, seq2)]`) and `framestate.py FrameState.union`.
     /// When one side has fewer slots than the other (a name appended
     /// after the shorter side's snapshot was taken), the missing
     /// slots are treated as `None` so the positional zip extends to
     /// `max(len(self), len(other))`.
     ///
-    /// Per-slot semantics (RPython `framestate.py:105-128 union`):
+    /// Per-slot semantics (RPython `framestate.py union`):
     ///   - `(None, _) | (_, None)` → None-kill (`framestate.py:
     ///     110-111`); merged slot is `None`.
     ///   - `(Some(s), Some(o))` with matching Variable identity →
@@ -1826,7 +1826,7 @@ impl FrameState {
     ///     analogue).
     ///
     /// Type unification is NOT performed here — upstream's per-slot
-    /// `union(w1, w2)` (`framestate.py:105-128`) compares Hlvalue
+    /// `union(w1, w2)` (`framestate.py`) compares Hlvalue
     /// identity only, with type-side reconciliation deferred to the
     /// annotator (`annrpython.py`).  Pyre follows the same convention:
     /// callers query types via `FunctionGraph::concretetype_of(&var)`
@@ -1835,10 +1835,10 @@ impl FrameState {
     ///
     /// Returns `Some(merged_state)` when the union succeeds; `None`
     /// when any per-projection union raises `UnionError`
-    /// (`framestate.py:78 try: ... except UnionError: return None`).
+    /// (`framestate.py try: ... except UnionError: return None`).
     /// The `None` return propagates upstream's "merge candidates
     /// disagree, fall back to a fresh SpamBlock" path at
-    /// `flowcontext.py:431-436 mergeblock`.  Agreement slots in the
+    /// `flowcontext.py mergeblock`.  Agreement slots in the
     /// locals projection carry the predecessor's Variable, disagreement
     /// slots get a freshly-allocated Variable (the upstream `Variable()`
     /// analogue).  Callers detect "this slot is a fresh phi" by
@@ -1848,7 +1848,7 @@ impl FrameState {
     /// the Input op carries the same Variable the merged state already
     /// refers to.
     pub fn union(&self, other: &FrameState, graph: &mut FunctionGraph) -> Option<FrameState> {
-        // Line-by-line port of `framestate.py:73-90 FrameState.union`:
+        // Line-by-line port of `framestate.py FrameState.union`:
         //
         //     def union(self, other):
         //         try:
@@ -1867,7 +1867,7 @@ impl FrameState {
         //
         // Upstream `union` does NOT compare `self.blocklist` /
         // `self.next_offset` against `other.*` — those equality
-        // assertions live in `framestate.py:53-59 matches`, which is a
+        // assertions live in `framestate.py matches`, which is a
         // separate predicate the caller invokes AFTER union.  Pyre's
         // frontend keeps both projections at trivial defaults
         // today (empty Vec, next_offset 0); even when they diverge,
@@ -1889,7 +1889,7 @@ impl FrameState {
         // the reorder is a Rust-side atomic-safety adaptation with
         // no observable upstream-parity divergence.
 
-        // `framestate.py:80 stack = _union(self.stack, other.stack)`.
+        // `framestate.py stack = _union(self.stack, other.stack)`.
         // `flowspace::framestate::union_stack` returns `Err(UnionError)`
         // on stack length disagreement, SpecTag mismatch, or
         // FlowSignal-type mismatch — propagate as `None` per upstream's
@@ -1915,7 +1915,7 @@ impl FrameState {
             let w_value = crate::flowspace::framestate::union(Some(&a[1]), Some(&b[1])).ok()??;
             Some(crate::flowspace::model::FSException::new(w_type, w_value))
         };
-        // `framestate.py:79 locals = _union(self.locals_w, other.locals_w)`.
+        // `framestate.py locals = _union(self.locals_w, other.locals_w)`.
         // Run LAST so the locals projection is computed only after the
         // failure-prone stack / exception projections above have
         // succeeded (each `.ok()?` aborts the whole merge on a per-cell
@@ -1924,7 +1924,7 @@ impl FrameState {
         // Direct line-by-line port: walk `self.locals_w` and
         // `other.locals_w` positionally and dispatch each cell pair
         // through `flowspace::framestate::union` (Hlvalue-domain
-        // per-cell union — `framestate.py:105-128`).  Upstream
+        // per-cell union — `framestate.py`).  Upstream
         // `_union(seq1, seq2)` zips equal-length sequences; pyre's
         // frontend can grow the locals projection across the
         // sub-block boundary when a name is first bound on one side,
@@ -1935,7 +1935,7 @@ impl FrameState {
         let self_view = self.locals_w_view(graph);
         let other_view = other.locals_w_view(graph);
         let len = std::cmp::max(self_view.len(), other_view.len());
-        // Per `framestate.py:78-89`, a `UnionError` raised by ANY
+        // Per `framestate.py`, a `UnionError` raised by ANY
         // per-cell `union(w1, w2)` is caught at the FrameState level
         // and the whole `FrameState.union` returns `None`.  Collect
         // into `Result<Vec<_>, UnionError>` and propagate failure via
@@ -1957,7 +1957,7 @@ impl FrameState {
         // and `entries` is a backward-compatibility view for callers
         // that have not yet migrated.  `Hlvalue::Variable(v)` is
         // cloned directly into the entry, carrying the merged value's
-        // identity (`framestate.py:108/113-114 union` returns either a
+        // identity (`framestate.py/113-114 union` returns either a
         // carry-through Variable or a fresh phi `Variable()`).
         // `Hlvalue::Constant(_)` cells carry no Variable identity
         // (Constants are not Variable-bound in the pyre IR), so they
@@ -1986,7 +1986,7 @@ impl FrameState {
 
     /// Output arguments to thread `self` (a predecessor's exit state)
     /// into the merge block whose entry framestate is `target`.  RPython
-    /// parity: `framestate.py:92-99 FrameState.getoutputargs` walks
+    /// parity: `framestate.py FrameState.getoutputargs` walks
     /// `targetstate.mergeable` positionally, picking `self.mergeable[i]`
     /// at every Variable position.  `target.entries` is dense at the
     /// graph-wide first-bind slot positions, with `None` at slots that
@@ -2020,7 +2020,7 @@ impl FrameState {
         target: &FrameState,
         graph: &FunctionGraph,
     ) -> Option<Vec<LinkArg>> {
-        // Line-by-line port of `framestate.py:92-99 getoutputargs`:
+        // Line-by-line port of `framestate.py getoutputargs`:
         //
         //     def getoutputargs(self, targetstate):
         //         result = []
@@ -2082,7 +2082,7 @@ impl FrameState {
             }
         }
         // (3) exception args projection — `[exc_type, exc_value]`
-        // tail per `framestate.py:34-39 mergeable`.  `exc_args`
+        // tail per `framestate.py mergeable`.  `exc_args`
         // substitutes `Constant(None)` sentinels when no exception is
         // pending, so the Variable predicate skips empty-exception
         // states; non-empty exception cells get the same Hlvalue→
@@ -2098,7 +2098,7 @@ impl FrameState {
     }
 
     /// Enumerate every `Variable` cell across the full mergeable
-    /// projection — RPython `framestate.py:50-51 getvariables` parity:
+    /// projection — RPython `framestate.py getvariables` parity:
     ///
     /// ```python
     /// def getvariables(self):
@@ -2113,7 +2113,7 @@ impl FrameState {
     /// from any predecessor.
     ///
     /// Locals projection consults `self.locals_w` per upstream
-    /// `framestate.py:50-51 getvariables`'s `mergeable` walk —
+    /// `framestate.py getvariables`'s `mergeable` walk —
     /// `mergeable`'s locals head IS `locals_w`.  `locals_w_view`
     /// returns the populated `Hlvalue` slice for union/getstate-derived
     /// states and derives it from `entries` for hand-built fixtures
@@ -2144,7 +2144,7 @@ impl FrameState {
         out
     }
 
-    /// `framestate.py:42-48 FrameState.copy` — "Make a copy of this
+    /// `framestate.py FrameState.copy` — "Make a copy of this
     /// state in which all Variables are fresh."
     ///
     /// ```python
@@ -2157,20 +2157,20 @@ impl FrameState {
     ///                       exc, self.blocklist, self.next_offset)
     /// ```
     ///
-    /// `_copy(v)` (framestate.py:4-12) independently creates a fresh
+    /// `_copy(v)` (framestate.py) independently creates a fresh
     /// `Variable(v)` per occurrence — NO shared mapping across cells.
     /// Constants and None slots pass through unchanged.
     pub fn copy(&self, graph: &mut FunctionGraph) -> FrameState {
         use crate::flowspace::model::{Hlvalue, Variable};
         // `_copy(v)` — each call independently mints a fresh Variable.
-        // `Variable(v)` (model.py:300-311) copies the source's name
+        // `Variable(v)` (model.py) copies the source's name
         // prefix via `rename(v)`, which reads `v._name`; carry the
         // source slot's name onto the fresh Variable so the freshened
         // state's phi inputs keep their human-readable names.
         let copy_hlvalue = |h: &Hlvalue, graph: &mut FunctionGraph| -> Hlvalue {
             match h {
                 Hlvalue::Variable(src) => {
-                    // `_copy(v) -> Variable(v)` (framestate.py:4): fresh
+                    // `_copy(v) -> Variable(v)` (framestate.py): fresh
                     // Variable carrying the source's `_name` prefix
                     // (annotation stays None).
                     let mut nv = graph.alloc_value_var();
@@ -2245,7 +2245,7 @@ impl FrameState {
         }
     }
 
-    /// `framestate.py:53-64 FrameState.matches` — "Two states match if
+    /// `framestate.py FrameState.matches` — "Two states match if
     /// they only differ by using different Variables at the same place."
     ///
     /// ```python
@@ -2329,7 +2329,7 @@ impl FrameState {
 }
 
 /// Hlvalue→LinkArg routing per cell, matching upstream
-/// `framestate.py:92-99 getoutputargs` which appends the polymorphic
+/// `framestate.py getoutputargs` which appends the polymorphic
 /// `mergeable[i]` cell directly into `Link.args`.  Pyre's `LinkArg` is
 /// the matching closed sum: `Hlvalue::Variable(v)` → `LinkArg::Value(v)`
 /// (the Variable carries its identity inline so downstream readers
@@ -2344,7 +2344,7 @@ fn hlvalue_to_linkarg(w: &crate::flowspace::model::Hlvalue) -> LinkArg {
     }
 }
 
-/// RPython `framestate.py:66-71 _exc_args` — return `[w_type, w_value]`,
+/// RPython `framestate.py _exc_args` — return `[w_type, w_value]`,
 /// substituting `Constant(None)` sentinels when no exception is
 /// pending.
 fn exc_args(
@@ -2385,7 +2385,7 @@ fn exc_args(
 /// pass is a no-op on production graphs today.  It becomes
 /// load-bearing once Z4's flowcontext-walker rewrite materialises
 /// intermediate `SpamBlock`s per fold step (the upstream
-/// `flowcontext.py:443-463 mergeblock` chain pattern).
+/// `flowcontext.py mergeblock` chain pattern).
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -2462,13 +2462,13 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
 ///
 /// A block qualifies when it has a single exit, that exit is the
 /// `AssertionError` raise, and every operation it holds satisfies
-/// `can_remove_op` — `CanRemove` (`simplify.py:411-423`), the predicate the
+/// `can_remove_op` — `CanRemove` (`simplify.py`), the predicate the
 /// dead-op pass would apply to those operations once the raise is gone.  An
 /// operation outside it — anything that can raise or write — leaves the edge
 /// pointing at its block.
 ///
 /// The bypassed block keeps its own exits and falls out as unreachable, the
-/// same way `eliminate_empty_blocks` (`simplify.py:52-69`) leaves the blocks
+/// same way `eliminate_empty_blocks` (`simplify.py`) leaves the blocks
 /// it rewires past.
 ///
 /// Returns the number of retargeted edges.
@@ -2538,7 +2538,7 @@ pub fn retarget_assert_raise_blocks(graph: &mut FunctionGraph) -> usize {
     retargeted
 }
 
-/// RPython `remove_assertion_errors(graph)` (simplify.py:321-346) over
+/// RPython `remove_assertion_errors(graph)` (simplify.py) over
 /// the front model graph.
 ///
 /// ```python
@@ -2763,7 +2763,7 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
                 Some(ExitCase::Const(ConstValue::UniStr(s))) if s == "default"
             )
         };
-        // `replace_exitswitch_by_constant` (simplify.py:36-48) collects
+        // `replace_exitswitch_by_constant` (simplify.py) collects
         // *every* arm whose exitcase equals the constant and asserts exactly
         // one survivor (`assert len(newexits) == 1`), falling back to the
         // `"default"` catch-all only when none match: a constant matching
@@ -3046,7 +3046,7 @@ pub fn fuse_boxing_alloc(
     // vtable cannot stand for, which `resolve_header_plan` hands back as a
     // payload.
     // This mirrors the type-generic malloc lowering in the front end
-    // (`rpython/rtyper/rbuiltin.py:349-385` `rtype_malloc`; `rclass.py` reads
+    // (`rpython/rtyper/rbuiltin.py` `rtype_malloc`; `rclass.py` reads
     // the exact lltype's field layout); `struct_field_attrs` is the
     // already-computed layout map the front end owns, so this pass performs no
     // front-end (Llbc) reads.
@@ -3112,7 +3112,7 @@ pub fn fuse_boxing_alloc(
     // the op rather than being dropped.  Returns `0` when the cluster carries no
     // resolvable constant type-pointer (e.g. a synthetic test fixture).
     //
-    // `jtransform.py:1023 rewrite_op_malloc` gets the vtable from malloc's
+    // `jtransform.py rewrite_op_malloc` gets the vtable from malloc's
     // `STRUCT`. `malloc_typed(value)` instead recovers it from
     // `value.ob_header.ob_type`; it must match `w_class`, since values may carry
     // a subclass there.
@@ -3322,7 +3322,7 @@ pub fn fuse_boxing_alloc(
     /// (bytesobject.rs) pins the caller's class on the shadow stack and reads
     /// it back for `type(B(b'x'))`.  Keeping it as a separate store is what
     /// upstream does with every field an allocation does not carry:
-    /// `jtransform.py:1040-1045 rewrite_op_malloc` emits `new_with_vtable`
+    /// `jtransform.py rewrite_op_malloc` emits `new_with_vtable`
     /// carrying only the sizedescr, and each remaining field arrives as its own
     /// `setfield`.
     struct HeaderPlan {
@@ -4082,7 +4082,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///
 /// TODO: `start_blocks` is `{graph.startblock} ∪
 /// {blocks with no incoming link}` rather than the strict single-graph
-/// `{graphs[0].startblock}` of `simplify.py:428`.  The `generated::*`
+/// `{graphs[0].startblock}` of `simplify.py`.  The `generated::*`
 /// pipeline emits closures / specialisations as secondary entries
 /// (function parameters at a non-zero block id with no predecessors)
 /// that are calling-convention contracts but are not registered with
@@ -4096,10 +4096,10 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 /// directly.
 ///
 ///   1. Walk every reachable block.  For each operation, evaluate
-///      `canremove(op, block)` per `simplify.py:435-436`:
+///      `canremove(op, block)` per `simplify.py`:
 ///      `op.opname in CanRemove and op is not block.raising_op`,
 ///      where `block.raising_op` is `block.operations[-1]` whenever
-///      `block.canraise` (`flowspace/model.py:218-221`).  Pyre's
+///      `block.canraise` (`flowspace/model.py`).  Pyre's
 ///      `Block::canraise()` mirrors the upstream
 ///      `block.exitswitch is c_last_exception` check; the raising
 ///      op is the last entry in `block.operations`.
@@ -4134,7 +4134,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///      contracts are already covered by the empty-exits rule
 ///      above.
 ///   4. Backward-flow `read_vars` over `dependencies` to a fixpoint
-///      (`simplify.py:471-479 flow_read_var_backward`).
+///      (`simplify.py flow_read_var_backward`).
 ///   5. Drop every pure op whose result is not in `read_vars`
 ///      (`simplify.py:484-488` removable-op drop), gated by the
 ///      same `canremove(op, block)` predicate from Step 1 — the
@@ -4241,7 +4241,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
         )
         .collect();
 
-    // BFS reachability mirrors `flowspace/model.py:66 iterblocks()`,
+    // BFS reachability mirrors `flowspace/model.py iterblocks()`,
     // unioned across `start_blocks`:
     //
     //     def iterblocks(self):
@@ -4280,12 +4280,12 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // `dependencies` (target inputarg ← link arg, plus pure-op
     // operands routed via `op.result`).
     //
-    // `simplify.py:435-436 canremove`:
+    // `simplify.py canremove`:
     //
     //     def canremove(op, block):
     //         return op.opname in CanRemove and op is not block.raising_op
     //
-    // `block.raising_op` (`flowspace/model.py:218-221`) is
+    // `block.raising_op` (`flowspace/model.py`) is
     // `block.operations[-1]` whenever `block.canraise` (i.e.
     // `block.exitswitch is c_last_exception`).  Pure-classified
     // ops parked there as overflow / zero-divide checks
@@ -4386,7 +4386,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     }
 
     // Step 4: backward flow.
-    // `simplify.py:471-479 flow_read_var_backward`.
+    // `simplify.py flow_read_var_backward`.
     let mut pending: Vec<crate::flowspace::model::Variable> = read_vars.iter().cloned().collect();
     while let Some(var) = pending.pop() {
         if let Some(deps) = dependencies.get(&var).cloned() {
@@ -4504,7 +4504,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     }
 
     // Step 7: drop dead inputargs + their matching `OpKind::Input` ops.
-    // `simplify.py:520-524`.  Walk every reachable block; startblock is
+    // `simplify.py`.  Walk every reachable block; startblock is
     // already pinned in Step 3, return / except blocks in Step 1.
     for block_idx in 0..graph.blocks.len() {
         let block_id = graph.blocks[block_idx].id;
@@ -4531,7 +4531,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
 }
 
 /// Crate-local [`FunctionGraph`] port of RPython
-/// `translator/simplify.py:540-590 remove_identical_vars_SSA`.
+/// `translator/simplify.py remove_identical_vars_SSA`.
 ///
 /// The earlier subset only removed literally duplicated `inputargs`, which
 /// missed upstream's phi-tuple equivalence pass and left codewriter graphs
@@ -4612,12 +4612,12 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
                 .map(|arg| uf.find_rep(arg.clone()))
                 .collect();
             // PRE-EXISTING-ADAPTATION: the all-equal phi collapse of
-            // `simplify.py:561-563` (`if all_equal(new_args):
+            // `simplify.py` (`if all_equal(new_args):
             // uf.union(new_args[0], input)`) is omitted here.  Upstream that
             // collapse deliberately produces cross-block variable references
             // — it removes a merge block's inputarg and leaves the body
             // reading a value defined in a predecessor — and relies on the
-            // next `all_passes` entry, `SSA_to_SSI` (backendopt/ssa.py:135-196),
+            // next `all_passes` entry, `SSA_to_SSI` (backendopt/ssa.py),
             // to repair them by re-threading every used-but-undefined variable
             // as a fresh inputarg through all incoming links.  pyre runs this
             // pass on the `crate::model` front-end graph, which has no
@@ -4796,7 +4796,7 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
         for (dup_i, _) in removable_slots.into_iter().rev() {
             // Drop the `OpKind::Input` op paired with the DUPLICATE slot by its
             // slot position — `del block.inputargs[i]` by index
-            // (simplify.py:650-653).  After the rename several Input ops can
+            // (simplify.py).  After the rename several Input ops can
             // share the survivor's result, so a result match would risk
             // dropping the survivor (first-seen) slot's own `name`/`ty`/
             // `class_root` metadata instead of the duplicate's.  The k-th
@@ -4835,12 +4835,12 @@ impl Block {
 
     /// Variable-identity iter over [`Self::inputargs`] — direct
     /// over the upstream-orthodox `Vec<Variable>` storage, matching
-    /// `Block.inputargs: List[Variable]` (`flowspace/model.py:21-25`).
+    /// `Block.inputargs: List[Variable]` (`flowspace/model.py`).
     pub fn input_variables(&self) -> impl Iterator<Item = &crate::flowspace::model::Variable> + '_ {
         self.inputargs.iter()
     }
 
-    /// RPython `flowspace/model.py:247 closeblock` / `:250 recloseblock`
+    /// RPython `flowspace/model.py closeblock` / `:250 recloseblock`
     /// mark a block's exits tuple as populated.  Pyre mirrors the
     /// "has this block been closed?" predicate by checking that either
     /// `exits` has at least one `Link` or `exitswitch` is set.
@@ -4859,7 +4859,7 @@ impl Block {
     }
 }
 
-/// RPython `flowspace/model.py:238-244 renamevariables` applies a
+/// RPython `flowspace/model.py renamevariables` applies a
 /// value renaming to `inputargs` / `operations` / `exitswitch` /
 /// `link.args` — Variable-direct.  Takes a `Fn(&Variable) -> Variable`
 /// renamer so callers whose alias map is keyed on Variable identity
@@ -4942,7 +4942,7 @@ pub enum ConcreteType {
     Unknown,
 }
 
-/// `rpython/jit/metainterp/history.py:45-71 getkind(TYPE, ...)`.
+/// `rpython/jit/metainterp/history.py getkind(TYPE, ...)`.
 ///
 /// Direct line-by-line port — the canonical
 /// `LowLevelType → 'int' / 'ref' / 'float' / 'void'` projection that
@@ -5138,7 +5138,7 @@ fn ptr_gckind(
 /// GraphId-keyed side tables.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FuncEffects {
-    /// `func.oopspec` (rlib/jit.py:250 `@oopspec(spec)`). Its presence is
+    /// `func.oopspec` (rlib/jit.py `@oopspec(spec)`). Its presence is
     /// the builtin signal (call.py:135 `if hasattr(targetgraph.func,
     /// 'oopspec'): return 'builtin'`).
     pub oopspec: Option<String>,
@@ -5150,11 +5150,11 @@ pub struct FuncEffects {
     /// `func._gctransformer_hint_cannot_collect_` (collectanalyze.py:15)
     /// — `analyze_can_collect` returns False immediately.
     pub cannot_collect: bool,
-    /// `funcobj.random_effects_on_gcobjs` (collectanalyze.py:21-25). Only
+    /// `funcobj.random_effects_on_gcobjs` (collectanalyze.py). Only
     /// meaningful for an external (graph-less) funcobj; a graph-bearing
     /// function derives can-collect by walking the graph instead.
     pub random_effects_on_gcobjs: bool,
-    /// `LL_OPERATIONS[op.opname].canmallocgc` (collectanalyze.py:31-33) for a
+    /// `LL_OPERATIONS[op.opname].canmallocgc` (collectanalyze.py) for a
     /// callee that has no graph.
     ///
     /// Upstream reaches the collector through an *operation* — `malloc` /
@@ -5230,7 +5230,7 @@ pub struct FunctionGraph {
     /// Impl-block self-type root for graphs produced from `impl <T> { fn m(&self, ...) }`.
     /// Mirrors PyPy's `graph.func.im_class` access (the bound-method's class
     /// reference): RPython lifts `self` as `SomeInstance(getuniqueclassdef(im_class))`
-    /// at `description.py:283-305 FunctionDesc.pycall`, then the rtyper resolves
+    /// at `description.py FunctionDesc.pycall`, then the rtyper resolves
     /// `self.<field>` against that ClassDef.  Pyre's per-graph
     /// `derive_subject_inputcells` (`flowspace_adapter.rs`) uses this field
     /// to project the receiver inputarg as `SomeInstance(Some(classdef))` instead
@@ -5239,7 +5239,7 @@ pub struct FunctionGraph {
     /// synthetic test-fixture graphs.
     pub owner_root: Option<String>,
     pub startblock: BlockId,
-    /// RPython `flowspace/model.py:17-18 FunctionGraph.returnblock` —
+    /// RPython `flowspace/model.py FunctionGraph.returnblock` —
     /// `Block([return_var])` with `operations=()` and `exits=()`.
     /// Blocks returning a value route to it via
     /// `Link([value], returnblock)` held in `Block.exits`.
@@ -5264,7 +5264,7 @@ pub struct FunctionGraph {
     /// free-function, trait-method, and inherent-method registration).
     pub return_type: Option<String>,
     /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
-    /// attributes RPython `policy.py:48-62 look_inside_graph` reads off
+    /// attributes RPython `policy.py look_inside_graph` reads off
     /// `graph.func`. Pyre carries them on the graph itself so
     /// [`crate::policy::JitPolicy::look_inside_graph`] reads the canonical
     /// carrier directly. Empty for graphs with no hints (the common case
@@ -5299,7 +5299,7 @@ impl FunctionGraph {
             startblock: entry,
             returnblock,
             exceptblock,
-            // RPython `flowspace/model.py:14-25 FunctionGraph.__init__`:
+            // RPython `flowspace/model.py FunctionGraph.__init__`:
             //   startblock created empty; returnblock = Block([return_var]);
             //   exceptblock = Block([Variable('etype'), Variable('evalue')]).
             // Final blocks have `operations=()` and `exits=()`; fall-through
@@ -5411,7 +5411,7 @@ impl FunctionGraph {
     }
 
     /// Create a merge block whose `inputargs` come from
-    /// `framestate.getvariables()` — RPython `flowcontext.py:38
+    /// `framestate.getvariables()` — RPython `flowcontext.py
     /// SpamBlock(framestate)` parity:
     ///
     /// ```python
@@ -5569,7 +5569,7 @@ impl FunctionGraph {
                 out.push(v);
             }
         };
-        // `iterblocks()` parity (`rpython/flowspace/model.py:66`): walk only
+        // `iterblocks()` parity (`rpython/flowspace/model.py`): walk only
         // the startblock-reachable closure over `Block.exits`, id-keyed
         // because block ids need not be index-aligned
         // (`flowspace_adapter::reachable_block_ids`).  Unreachable lowered
@@ -5676,7 +5676,7 @@ impl FunctionGraph {
         });
     }
 
-    /// RPython `flowspace/model.py:250 recloseblock(*exits)` — stamp
+    /// RPython `flowspace/model.py recloseblock(*exits)` — stamp
     /// `link.prevblock` on each exit and install them as the block's
     /// exits, overwriting any previous contents.  The `exitswitch`
     /// field is passed alongside so callers who set a bool branch or
@@ -5697,7 +5697,7 @@ impl FunctionGraph {
             .collect();
     }
 
-    /// RPython `flowspace/model.py:250 recloseblock(*exits)` — stamp
+    /// RPython `flowspace/model.py recloseblock(*exits)` — stamp
     /// `link.prevblock` on each exit and install them as the block's
     /// exits, overwriting any previous contents.  Like upstream, this
     /// does not touch `exitswitch`; callers that want to change the
@@ -5710,7 +5710,7 @@ impl FunctionGraph {
             .collect();
     }
 
-    /// RPython `flowspace/model.py:246 closeblock(*exits)` —
+    /// RPython `flowspace/model.py closeblock(*exits)` —
     /// `assert self.exits == [], "block already closed"` before
     /// delegating to `recloseblock`.  Keep the invariant as a regular
     /// assert, not `debug_assert!`, so release builds match upstream's
@@ -5734,7 +5734,7 @@ impl FunctionGraph {
         target: BlockId,
         args: Vec<crate::flowspace::model::Variable>,
     ) {
-        // `flowspace/model.py:114 Link.__init__` asserts
+        // `flowspace/model.py Link.__init__` asserts
         // `len(args) == len(target.inputargs)` at construction time.
         // `set_goto` is a production-only wrapper whose `target` is
         // a fully-formed block (inputargs already populated by the
@@ -5802,19 +5802,19 @@ impl FunctionGraph {
         // undefined operand (`flowspace_adapter.rs`).  Walking
         // back through the predecessor chain to add `cond` as a
         // `block.inputargs` entry restores the
-        // `flowspace/flowcontext.py:407-408 setstate(block.framestate)`
+        // `flowspace/flowcontext.py setstate(block.framestate)`
         // shape that the AST walker doesn't produce eagerly.
         for arg in &outputargs {
             if let LinkArg::Value(var) = arg {
                 self.ensure_variable_at_block(block, var);
             }
         }
-        // `flowspace/model.py:114 Link.__init__` asserts
+        // `flowspace/model.py Link.__init__` asserts
         // `len(args) == len(target.inputargs)` at construction time.
         // Run the same check here so a framestate-driven recloseblock
         // catches the mismatch at the merge-close site rather than
         // surfacing it downstream as an unbalanced subst dict in
-        // `eliminate_empty_blocks` (`simplify.py:513`).
+        // `eliminate_empty_blocks` (`simplify.py`).
         let target_inputarg_count = self.block(target_block).inputargs.len();
         assert_eq!(
             outputargs.len(),
@@ -5835,7 +5835,7 @@ impl FunctionGraph {
     /// — compute link args via `getoutputargs` and install the Link
     /// WITHOUT calling [`Self::ensure_variable_at_block`].
     ///
-    /// RPython's `closeblock` (`model.py:246`) asserts the block is open
+    /// RPython's `closeblock` (`model.py`) asserts the block is open
     /// (exits empty) before installing exits.  Use [`Self::recloseblock`]
     /// or [`Self::recloseblock_link`] when re-closing an already-closed
     /// block.
@@ -5865,7 +5865,7 @@ impl FunctionGraph {
 
     /// Like [`Self::closeblock_link`] but for blocks that may already be
     /// closed — delegates to [`Self::recloseblock`] instead of
-    /// [`Self::closeblock`].  `model.py:250 recloseblock`.
+    /// [`Self::closeblock`].  `model.py recloseblock`.
     pub fn recloseblock_link(
         &mut self,
         block: BlockId,
@@ -5907,7 +5907,7 @@ impl FunctionGraph {
     /// `block` has no predecessors AND `var` is not defined locally
     /// — a malformed graph state callers should treat as a bug.
     ///
-    /// `flowspace/flowcontext.py:407-408 setstate(block.framestate)`
+    /// `flowspace/flowcontext.py setstate(block.framestate)`
     /// populates `block.inputargs` with all carry-through Variables at
     /// block entry by walking top-down.  Pyre's AST walker doesn't do
     /// this eagerly, so when a framestate-driven merge
@@ -6089,7 +6089,7 @@ impl FunctionGraph {
                 true,
             )
             .expect("UnaryOp { op: \"bool\", .. } produces a value");
-        // `flowspace/model.py:114 Link.__init__` arity assert per
+        // `flowspace/model.py Link.__init__` arity assert per
         // arm — same rationale as `set_goto`.
         let true_inputarg_count = self.block(if_true).inputargs.len();
         assert_eq!(
@@ -6129,9 +6129,9 @@ impl FunctionGraph {
 
     /// Route a return through the graph's canonical `returnblock`.
     ///
-    /// RPython `flowcontext.py:687-689 RETURN_VALUE` pops `w_returnvalue`
+    /// RPython `flowcontext.py RETURN_VALUE` pops `w_returnvalue`
     /// from the stack and wraps it in `Return(w_returnvalue)`; in
-    /// `flowcontext.py:1232-1236 Return.nomoreblocks`, the link is built
+    /// `flowcontext.py Return.nomoreblocks`, the link is built
     /// as `Link([w_result], ctx.graph.returnblock)`.  For `def foo():
     /// pass`, the bytecode is `LOAD_CONST None; RETURN_VALUE`, so
     /// `w_result` is `Constant(None)` and `Link.args = [Constant(None)]`
@@ -6245,12 +6245,12 @@ impl FunctionGraph {
     /// Terminate `block` with a Link to `exceptblock` carrying the
     /// caller-provided `(etype, evalue)` pair.
     ///
-    /// RPython `flowspace/flowcontext.py:1253 Raise.nomoreblocks`:
+    /// RPython `flowspace/flowcontext.py Raise.nomoreblocks`:
     /// ```python
     /// raise FSException(self.w_type, self.w_value)
     /// ```
     /// The two `W_*` values flow from the preceding `RAISE_VARARGS`
-    /// at `flowspace/flowcontext.py:638-656`, where `popvalue()`s
+    /// at `flowspace/flowcontext.py`, where `popvalue()`s
     /// provide the exception type / value already on the stack.
     /// This API lets pyre's macro lowering thread the evaluated
     /// Variables into the exceptblock Link so the exception payload
@@ -6269,7 +6269,7 @@ impl FunctionGraph {
         &self.blocks[block.0]
     }
 
-    /// `Variable.rename(name)` (model.py:311-326) — name the Variable
+    /// `Variable.rename(name)` (model.py) — name the Variable
     /// object's `_name`. Identity-shared `_name` (`Rc<RefCell<..>>`)
     /// makes the rename visible through every clone, including the
     /// `Block.inputargs` entry and the registry clone, so the cleaned
@@ -6370,7 +6370,7 @@ impl FunctionGraph {
 
     /// Get successor block IDs for a block.
     ///
-    /// RPython `flowspace/model.py:66-76 FunctionGraph.iterblocks`:
+    /// RPython `flowspace/model.py FunctionGraph.iterblocks`:
     /// successor set is derived from `Block.exits` only.  Final blocks
     /// (`exits == ()`) — returnblock / exceptblock — have no successors.
     pub fn successors(&self, block: BlockId) -> Vec<BlockId> {
@@ -6425,7 +6425,7 @@ impl FunctionGraph {
                     .unwrap_or_default();
                 out.push_str(&format!("    {}{:?}\n", result, op.kind));
             }
-            // Upstream `flowspace/model.py:199 __repr__` prints the block
+            // Upstream `flowspace/model.py __repr__` prints the block
             // shape as "block@N with K exits[(exitswitch)]".  Mirror the
             // same summary from pyre's canonical exitswitch/exits pair.
             match &block.exitswitch {
@@ -6489,7 +6489,7 @@ mod tests {
     /// identity to distinguish same-leaf ctors across owner enums
     /// (`StepResult::Continue` vs `JitAction::Continue`).  Collapsing
     /// to the bare leaf would collide their `HostObject` /
-    /// `getdesc(pyobj)` keys (`bookkeeper.py:353`).
+    /// `getdesc(pyobj)` keys (`bookkeeper.py`).
     #[test]
     fn synthetic_transparent_ctor_path_segments_preserve_owner_path() {
         let bare = CallTarget::synthetic_transparent_ctor("Continue");
@@ -6742,7 +6742,7 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let entry = graph.startblock;
         graph.set_raise(entry, "");
-        // RaiseImplicit.nomoreblocks (flowcontext.py:1280-1282): the
+        // RaiseImplicit.nomoreblocks (flowcontext.py): the
         // exceptblock Link carries the AssertionError *class* as w_type
         // and a distinct AssertionError *instance* as w_value — never the
         // class in both slots.
@@ -6978,7 +6978,7 @@ mod tests {
     fn prune_dead_phis_retains_live_single_source_phi_pending_ssa_to_ssi() {
         // entry -> merge(phi 'x' read by a BinOp whose result is the
         // function return value) -> returnblock(reads return value).
-        // RPython `remove_identical_vars_SSA` (simplify.py:561-563) would
+        // RPython `remove_identical_vars_SSA` (simplify.py) would
         // collapse a phi whose incoming args are all the same value and rename
         // downstream readers to that representative, even a live reader.
         // `remove_duplicate_inputargs` omits that all-equal collapse
@@ -9345,7 +9345,7 @@ mod tests {
 
     #[test]
     fn prune_dead_phis_preserves_pure_raising_op() {
-        // `simplify.py:435-436 canremove`'s `op is not block.raising_op`
+        // `simplify.py canremove`'s `op is not block.raising_op`
         // clause: a pure-classified op (e.g. `int_add` modelling
         // `int_add_ovf`) parked as the LAST op of a `canraise` block
         // must NOT be DCE'd even when its result is unread.  The raise
@@ -9682,7 +9682,7 @@ mod tests {
         );
     }
 
-    /// `flowspace/model.py:114 Link.__init__` asserts
+    /// `flowspace/model.py Link.__init__` asserts
     /// `len(args) == len(target.inputargs)` at link construction.  The
     /// pyre port enforces the same predicate inside
     /// `set_goto_from_framestate` so a framestate-driven recloseblock
@@ -10047,7 +10047,7 @@ mod tests {
         assert!(graph.block(right).inputargs.is_empty());
     }
 
-    /// `framestate.py:50-51 getvariables` walks `locals + flatten(stack) +
+    /// `framestate.py getvariables` walks `locals + flatten(stack) +
     /// [exc_type, exc_value]` in order and filters Variable cells.  The
     /// Pyre port emits Variables from each projection in the same
     /// positional order so `block.inputargs` line up with
@@ -10092,7 +10092,7 @@ mod tests {
     }
 
     /// `create_block_from_framestate` materialises the merge block
-    /// shape that `flowcontext.py:38 SpamBlock(framestate)` builds —
+    /// shape that `flowcontext.py SpamBlock(framestate)` builds —
     /// `block.inputargs = framestate.getvariables()`, attached
     /// `block.framestate = framestate`.  Inputarg Variables carry the
     /// framestate's Variable identities directly.

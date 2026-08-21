@@ -21,14 +21,14 @@ use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
 
-/// optimizer.py:47-54 OptimizationResult: result of an optimization pass.
+/// optimizer.py OptimizationResult: result of an optimization pass.
 #[derive(Debug)]
 pub enum OptimizationResult {
     /// Emit this operation (possibly modified).
     Emit(Op),
     /// Replace with a different operation; continue with the next pass.
     Replace(Op),
-    /// optimizer.py:567 `send_extra_operation(newop, opt=None)` — re-dispatch
+    /// optimizer.py `send_extra_operation(newop, opt=None)` — re-dispatch
     /// the new op from the first optimization, dropping the original.
     /// autogenintrules.py:54-55 uses this pattern for every rewrite-style
     /// rule so that chained OptIntBounds rules (add_zero, int_is_zero, …)
@@ -57,19 +57,19 @@ pub trait Optimization {
         ctx: &mut OptContext,
     ) -> OptimizationResult;
 
-    /// optimizer.py:71 propagate_postprocess — called AFTER the op has been
+    /// optimizer.py propagate_postprocess — called AFTER the op has been
     /// emitted through all passes and added to new_operations. Runs in
     /// REVERSE pass order. RPython uses this for bounds propagation
     /// (intbounds.py postprocess_GUARD_TRUE) and heap cache updates
     /// (heap.py postprocess_GETFIELD_GC_I).
     fn propagate_postprocess(&mut self, _op: &Op, _ctx: &mut OptContext) {}
 
-    /// optimizer.py:74-75 have_postprocess
+    /// optimizer.py have_postprocess
     fn have_postprocess(&self) -> bool {
         false
     }
 
-    /// optimizer.py:77-79 have_postprocess_op(opnum)
+    /// optimizer.py have_postprocess_op(opnum)
     fn have_postprocess_op(&self, _opcode: OpCode) -> bool {
         self.have_postprocess()
     }
@@ -94,7 +94,7 @@ pub trait Optimization {
     /// `OptVirtualize` reads this; other passes ignore it.
     fn set_vrefinfo(&mut self, _vrefinfo: crate::virtualref::VirtualRefInfo) {}
 
-    /// optimizer.py:517 propagate_all_forward(trace, call_pure_results, flush).
+    /// optimizer.py propagate_all_forward(trace, call_pure_results, flush).
     /// Only OptPure consumes this; other passes ignore it.
     fn set_call_pure_results(
         &mut self,
@@ -129,7 +129,7 @@ pub trait Optimization {
         // Default: no contribution
     }
 
-    /// heap.py:825-846 serialize_optheap — export struct field triples. The
+    /// heap.py serialize_optheap — export struct field triples. The
     /// `available_boxes` filter (heap.py:836,845) is applied in bridgeopt.
     fn export_cached_fields(
         &self,
@@ -138,7 +138,7 @@ pub trait Optimization {
         Vec::new()
     }
 
-    /// heap.py:870-883 deserialize_optheap — import struct fields.
+    /// heap.py deserialize_optheap — import struct fields.
     fn import_cached_fields(
         &mut self,
         _entries: &[(OpRef, majit_ir::DescrRef, OpRef)],
@@ -146,7 +146,7 @@ pub trait Optimization {
     ) {
     }
 
-    /// heap.py:847-868 serialize_optheap — export array item triples. The
+    /// heap.py serialize_optheap — export array item triples. The
     /// `available_boxes` filter (heap.py:855,866) is applied in bridgeopt.
     fn export_cached_arrayitems(
         &self,
@@ -155,7 +155,7 @@ pub trait Optimization {
         Vec::new()
     }
 
-    /// heap.py:885-894 deserialize_optheap — import array item triples.
+    /// heap.py deserialize_optheap — import array item triples.
     fn import_cached_arrayitems(
         &mut self,
         _entries: &[(OpRef, i64, majit_ir::DescrRef, OpRef)],
@@ -163,7 +163,7 @@ pub trait Optimization {
     ) {
     }
 
-    /// shortpreamble.py:62-85 `HeapOp.produce_op` passes the owning
+    /// shortpreamble.py `HeapOp.produce_op` passes the owning
     /// `CachedField` / `ArrayCachedItem` into `PtrInfo.setfield/setitem`, which
     /// immediately calls `register_info`.  This hook preserves that ownership
     /// while the Rust import driver dispatches across optimizer passes.
@@ -182,15 +182,15 @@ pub trait Optimization {
     ) {
     }
 
-    /// rewrite.py:828-834 serialize_optrewrite
+    /// rewrite.py serialize_optrewrite
     fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
         Vec::new()
     }
 
-    /// rewrite.py:836-838 deserialize_optrewrite
+    /// rewrite.py deserialize_optrewrite
     fn deserialize_optrewrite(&mut self, _entries: &[(i64, OpRef)]) {}
 
-    /// shortpreamble.py:112-126: PureOp.produce_op / LoopInvariantOp.produce_op
+    /// shortpreamble.py: PureOp.produce_op / LoopInvariantOp.produce_op
     /// Transfer imported PreambleOp entries from OptContext to this pass.
     /// RPython calls `opt.optimizer.optpure` directly during produce_op.
     /// In majit, the Optimization trait mediates this transfer.
@@ -223,7 +223,7 @@ pub trait Optimization {
     fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
 }
 
-/// optimizer.py:58-59 `have_postprocess(cls)`.
+/// optimizer.py `have_postprocess(cls)`.
 ///
 /// RPython asks the class object whether `propagate_postprocess` was
 /// overridden. In Rust each pass exposes the same answer through the
@@ -232,7 +232,7 @@ pub fn have_postprocess<T: Optimization + ?Sized>(opt: &T) -> bool {
     opt.have_postprocess()
 }
 
-/// optimizer.py:900-909 `CantReplaceGuards`.
+/// optimizer.py `CantReplaceGuards`.
 ///
 /// PyPy stores the optimizer reference on the context manager.  Pyre cannot
 /// keep a mutable borrow of `Optimizer` across the guarded section, so this
@@ -249,7 +249,7 @@ impl CantReplaceGuards {
     }
 }
 
-/// optimizer.py:29 `LoopInfo`.
+/// optimizer.py `LoopInfo`.
 pub trait LoopInfo {
     fn label_op(&self) -> Option<&Op> {
         None
@@ -267,7 +267,7 @@ pub trait LoopInfo {
     }
 }
 
-/// optimizer.py:32-44 `BasicLoopInfo`.
+/// optimizer.py `BasicLoopInfo`.
 #[derive(Clone, Debug)]
 pub struct BasicLoopInfo {
     pub inputargs: Vec<OpRef>,
@@ -308,7 +308,7 @@ impl LoopInfo for BasicLoopInfo {
 /// bridgeopt.py:124 parity: data needed to call
 /// deserialize_optimizer_knowledge after optimizer setup.
 pub(crate) struct PendingBridgeRd {
-    /// compile.py:853 `ResumeGuardDescr` storage handle. The bridge
+    /// compile.py `ResumeGuardDescr` storage handle. The bridge
     /// deserializer borrows `storage.rd_numb` / `storage.rd_consts()`
     /// off the same Arc the guard owns — no owned clones, and every
     /// reader (runtime + GC walker) observes the same pool.
@@ -318,7 +318,7 @@ pub(crate) struct PendingBridgeRd {
     pub livebox_types: Vec<Type>,
     /// pyjitpl.py:2289 all_descrs: dense list indexed by descr_index.
     pub all_descrs: Arc<Vec<majit_ir::descr::DescrRef>>,
-    /// `optimizer.cpu` (model.py:39 AbstractCPU) — carried through the
+    /// `optimizer.cpu` (model.py AbstractCPU) — carried through the
     /// bridge into the retrace `Optimizer.cpu` slot. RPython never sees a
     /// `None` here: `optimizer.cpu` is set at `Optimizer.__init__` time.
     pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
@@ -376,7 +376,7 @@ pub struct Optimizer {
     /// Maps the original loop-carried input slot to a recursive abstract
     /// description of the virtual's field values.
     pub(crate) imported_virtuals: Vec<ImportedVirtual>,
-    /// optimizer.py:34 `self.inputargs = inputargs` parity.
+    /// optimizer.py `self.inputargs = inputargs` parity.
     /// Typed InputArg OpRefs (InputArgInt/InputArgRef/InputArgFloat)
     /// carrying `box.type` (history.py:220) intrinsically via variant tag.
     pub trace_inputargs: Vec<OpRef>,
@@ -433,12 +433,12 @@ pub struct Optimizer {
     /// after setup(). RPython calls deserialize_optimizer_knowledge after the
     /// optimizer is constructed.
     pending_bridge_rd: Option<PendingBridgeRd>,
-    /// unroll.py:183-236 `optimize_bridge` vs unroll.py:100-110
+    /// unroll.py `optimize_bridge` vs unroll.py
     /// `optimize_preamble`: the bridge path's `propagate_all_forward`
     /// (unroll.py:193) does NOT build the short-preamble/export preview, and
     /// its virtual-state matching is deferred to `jump_to_existing_trace`
     /// (unroll.py:207), which catches `VirtualStatesCantMatch` and falls back
-    /// to `jump_to_preamble` (unroll.py:209-210). pyre folds the preview export
+    /// to `jump_to_preamble` (unroll.py). pyre folds the preview export
     /// into the shared `optimize_with_constants_and_inputs_at`; this flag marks
     /// the bridge call so the preview's `make_inputargs_and_virtuals` mismatch
     /// is NON-fatal (exported_loop_state = None) instead of escaping as an
@@ -449,9 +449,9 @@ pub struct Optimizer {
     /// descr.py:25-47: descriptors get descr_index assigned inline during
     /// collect_optimizer_knowledge_for_resume().
     pub all_descrs: Arc<Vec<DescrRef>>,
-    /// optimizer.py:787: constant_fold allocator for compile-time object creation.
+    /// optimizer.py: constant_fold allocator for compile-time object creation.
     pub constant_fold_alloc: Option<crate::optimizeopt::ConstantFoldAllocFn>,
-    /// info.py:810-822 `ConstPtrInfo.getstrlen1(mode)` runtime hook —
+    /// info.py `ConstPtrInfo.getstrlen1(mode)` runtime hook —
     /// propagated to `OptContext::string_length_resolver` at the start of
     /// each `optimize_with_constants_and_inputs_at` run so
     /// `EnsuredPtrInfo::Constant.getlenbound(Some(mode))` can return an
@@ -460,12 +460,12 @@ pub struct Optimizer {
     /// `Arc` rather than `Box` because the resolver is shared across
     /// multiple optimizer runs (propagation is a `clone()`, not a `take()`).
     pub string_length_resolver: Option<crate::optimizeopt::info::StringLengthResolver>,
-    /// info.py:788-790 ConstPtrInfo._unpack_str(mode) — runtime hook.
+    /// info.py ConstPtrInfo._unpack_str(mode) — runtime hook.
     pub string_content_resolver: Option<crate::optimizeopt::info::StringContentResolver>,
-    /// history.py:377 get_const_ptr_for_string(s) — runtime hook.
+    /// history.py get_const_ptr_for_string(s) — runtime hook.
     pub string_constant_alloc: Option<crate::optimizeopt::info::StringConstantAllocator>,
     /// RPython metainterp_sd.callinfocollection parity.
-    /// Propagated to OptContext for generate_modified_call (vstring.py:853).
+    /// Propagated to OptContext for generate_modified_call (vstring.py).
     pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// optimizer.py:732 — resume.ResumeDataLoopMemo.
     /// Shared constant pool + box numbering cache across all guards in a loop.
@@ -484,14 +484,14 @@ pub struct Optimizer {
     /// `store_final_boxes_in_guard`.
     ///
     /// `-1` disables the check (`resume.py:236-239`); a non-negative value
-    /// arms it. `virtualizable.py:123-124 minimum_size()` is
+    /// arms it. `virtualizable.py minimum_size()` is
     /// `num_static_fields`, and the comparison is `>` rather than `>=`
     /// because the virtualizable identity occupies one array entry of its
     /// own on top of the static fields.
     pub minimum_virtualizable_size: i64,
     /// Per-guard virtualref boxes from tracing-time snapshots.
-    /// resume.py:243-247 _number_boxes reads vref_array as a separate
-    /// section. opencoder.py:767 create_top_snapshot records vref_boxes
+    /// resume.py _number_boxes reads vref_array as a separate
+    /// section. opencoder.py create_top_snapshot records vref_boxes
     /// alongside vable_boxes.
     pub snapshot_vref_boxes: SnapshotBoxes,
     /// Per-guard per-frame (jitcode_index, pc, py_pc) from tracing-time snapshots.
@@ -518,24 +518,24 @@ pub struct Optimizer {
     pub(crate) opt_ops_emitted: usize,
     pub(crate) opt_guards_emitted: usize,
     pub(crate) opt_guards_shared_emitted: usize,
-    /// `optimizer.cpu` (`rpython/jit/backend/model.py:39 AbstractCPU`)
-    /// backref.  Hosts `cls_of_box(box)` (model.py:199-201) and other
+    /// `optimizer.cpu` (`rpython/jit/backend/model.py AbstractCPU`)
+    /// backref.  Hosts `cls_of_box(box)` (model.py) and other
     /// backend services every Optimization sub-class reaches via
     /// `self.optimizer.cpu.<method>()`.  Propagated to `OptContext.cpu`
     /// at `setup_optimizations` time.
     pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
-    /// optimizer.py:246 `self._emittedoperations = {}`. Tracks the
+    /// optimizer.py `self._emittedoperations = {}`. Tracks the
     /// set of ops the optimizer has emitted (or that `replace_guard_op`
     /// substituted in place of an emitted op). RPython keys this set by
     /// the op object (`op in self._emittedoperations` is identity-keyed);
     /// pyre keys by the emitted op's canonical operand (`Rc::ptr_eq`).
     /// Populated at:
-    /// - `emit_operation` after `ctx.emit` (optimizer.py:674
+    /// - `emit_operation` after `ctx.emit` (optimizer.py
     ///   `self._emittedoperations[op] = None` inside _emit_operation).
     /// - `replace_guard_op` after swapping the new op into
     ///   `new_operations` (optimizer.py:747).
     ///
-    /// Read by `as_operation(opref, required_opnum)` (optimizer.py:369-377)
+    /// Read by `as_operation(opref, required_opnum)` (optimizer.py)
     /// which returns the opref iff it has been emitted *and* its opcode
     /// matches the optional `required_opnum`. The lookup resolves the
     /// queried opref through `ctx.get_box_replacement` so it compares the
@@ -556,7 +556,7 @@ pub struct Optimizer {
 /// builders, CompiledTrace storage, and the backend's
 /// `set_constants_pool` boundary.
 ///
-/// history.py:220/261/307 `ConstInt/ConstFloat/ConstPtr` are the only
+/// history.py/261/307 `ConstInt/ConstFloat/ConstPtr` are the only
 /// constant classes — `Value::Void` panics rather than fabricate a
 /// nonexistent `ConstVoid`.
 pub(crate) fn lower_typed_constants_to_const_pool(
@@ -595,7 +595,7 @@ pub(crate) fn sanitize_backend_constants_for_ops<'a>(
 /// `i64` shape via `Value::to_const().as_raw_i64()` when the
 /// `set_constants` call is made.
 ///
-/// history.py:220/261/307 box.type parity: `ConstInt/ConstFloat/ConstPtr`
+/// history.py/261/307 box.type parity: `ConstInt/ConstFloat/ConstPtr`
 /// each pin `.type` on the value object itself. Pyre mirrors that by
 /// keying the optimizer-level pool with `Value` directly, so type
 /// information rides alongside the bits without any external
@@ -733,7 +733,7 @@ impl Optimizer {
         info: &crate::optimizeopt::virtualstate::VirtualStateInfo,
         ctx: &mut OptContext,
     ) -> OpRef {
-        // virtualstate.py:655-683 make_inputargs parity: each VSI leaf
+        // virtualstate.py make_inputargs parity: each VSI leaf
         // realizes a Box whose `box.type` matches the variant. Tag the
         // OpRef variant tag at allocation time so `opref.ty()` resolves
         // priority-0 in `opref_type` / `OptBoxEnv::get_type`.
@@ -747,7 +747,7 @@ impl Optimizer {
             | VirtualStateInfo::KnownClass { .. }
             | VirtualStateInfo::NonNull => majit_ir::Type::Ref,
             VirtualStateInfo::IntBounded(_) => majit_ir::Type::Int,
-            // virtualstate.py:655 not_virtual leaves are int/ref/float —
+            // virtualstate.py not_virtual leaves are int/ref/float —
             // void-result ops are not value boxes (resoperation.py:260),
             // so allocating an InputArg cell tagged Void here would mint
             // an `OpRef::VoidOp` for what should be a value box.
@@ -938,7 +938,7 @@ impl Optimizer {
                 ctx.setintbound(box_, &widened);
             }
             VirtualStateInfo::Unknown(_tp) => {
-                // virtualstate.py:655-683 make_inputargs parity: each
+                // virtualstate.py make_inputargs parity: each
                 // NotVirtualStateInfo leaf is realized as an InputArg* whose
                 // `Box.type` is intrinsic. 5: type lookup now resolves
                 // through the variant tag of `opref` (typed via
@@ -950,7 +950,7 @@ impl Optimizer {
 
     #[allow(deprecated)] // Phase 2 import_state forwards synthetic positions for imported virtual fields.
     pub(crate) fn install_imported_virtuals(&self, ctx: &mut OptContext) {
-        // virtualstate.py:655-670 make_inputargs + 627-634 _enum parity:
+        // virtualstate.py make_inputargs + 627-634 _enum parity:
         // label_args are laid out by recursive _enum traversal where each
         // NotVirtualStateInfo leaf gets a position_in_notvirtuals slot.
         // Virtual states don't consume slots directly — their non-virtual
@@ -1006,7 +1006,7 @@ impl Optimizer {
             .as_ref()
             .map(|s| &s.virtual_state.state[..])
             .unwrap_or(&[]);
-        // virtualstate.py:111-116 `enum` parity: a single visited map
+        // virtualstate.py `enum` parity: a single visited map
         // tracked via `Rc::as_ptr` dedups shared subtrees across all
         // top-level state entries so `label_slot` advances by the same
         // number of leaves as `imported_label_args.len()`.
@@ -1229,7 +1229,7 @@ impl Optimizer {
         }
     }
 
-    /// virtualstate.py:712-728 `VirtualStateConstructor.create_state` cache
+    /// virtualstate.py `VirtualStateConstructor.create_state` cache
     /// parity for the import side: dedup nested `Rc<VirtualStateInfo>`
     /// references via pointer identity, returning the previously imported
     /// Phase 2 OpRef on revisits so shared substates collapse onto a
@@ -1281,7 +1281,7 @@ impl Optimizer {
                 // unroll.py:454 Box carries its type. Virtual heads are
                 // Ref-typed. PtrInfo presence alone cannot stand in for
                 // box.type because PtrInfo can also describe int-typed
-                // raw pointers (info.py:865 RawBufferPtrInfo +
+                // raw pointers (info.py RawBufferPtrInfo +
                 // getrawptrinfo()). Bind the head's canonical host at
                 // allocation so the PtrInfo write below lands
                 // unconditionally — a bare position resolves to `None` and
@@ -1536,7 +1536,7 @@ impl Optimizer {
 
     /// Record a CALL_PURE result for cross-iteration constant folding.
     /// RPython pyjitpl.py:3572: `arg_consts = [executor.constant_from_op(a) ...]`
-    /// RPython optimizer.py:222: `get_constant_box(arg)` → value-based keys.
+    /// RPython optimizer.py: `get_constant_box(arg)` → value-based keys.
     pub fn record_call_pure_result(&mut self, args: Vec<majit_ir::Value>, value: majit_ir::Value) {
         self.call_pure_results.insert(args, value);
     }
@@ -1549,7 +1549,7 @@ impl Optimizer {
             .map(|(_, v)| v)
     }
 
-    /// bridgeopt.py:124-185: deserialize_optimizer_knowledge
+    /// bridgeopt.py: deserialize_optimizer_knowledge
     /// bridgeopt.py:170-171 optimizer.optheap.deserialize_optheap(result_struct, result_array)
     pub fn import_heap_knowledge(
         &mut self,
@@ -1588,10 +1588,10 @@ impl Optimizer {
         self.last_guard_op_idx
     }
 
-    /// optimizer.py:307 replace_guard: `self.replaces_guard[op] = value.last_guard_pos`.
+    /// optimizer.py replace_guard: `self.replaces_guard[op] = value.last_guard_pos`.
     /// Record that a guard at the given position should be replaced when the
     /// future condition is realized. PyPy keys `replaces_guard` by the raw `op`
-    /// object identity, and `_emit_operation` (optimizer.py:660) looks it up by
+    /// object identity, and `_emit_operation` (optimizer.py) looks it up by
     /// the raw `orig_op` — both before `get_box_replacement`. `resolve_to_operand`
     /// yields that producer box (chain root, before `_forwarded`), so insert and
     /// the emit-time lookup compare the same raw box.
@@ -1608,10 +1608,10 @@ impl Optimizer {
         }
     }
 
-    /// optimizer.py:713: replace_guard_op(old_op_pos, new_op)
+    /// optimizer.py: replace_guard_op(old_op_pos, new_op)
     /// Replace a previously emitted guard with a new one.
     ///
-    /// optimizer.py:747: `self._emittedoperations[new_op] = None` —
+    /// optimizer.py: `self._emittedoperations[new_op] = None` —
     /// the new guard takes over the emit identity, so it must enter
     /// the emit set even though it was substituted post-hoc rather
     /// than directly emitted via `_emit_operation`.
@@ -1622,14 +1622,14 @@ impl Optimizer {
         if let Some(op) = ctx.resolve_to_operand(old_pos) {
             self.replaces_guard.insert(op, new_guard);
         }
-        // optimizer.py:747 `self._emittedoperations[new_op] = None` — new_op is
+        // optimizer.py `self._emittedoperations[new_op] = None` — new_op is
         // the canonical (get_box_replacement'd) emitted op, so this insert stays
         // canonical, matching the emit-set keying in `_emit_operation`.
         self.emitted_operations
             .insert(ctx.get_box_replacement_operand(new_pos));
     }
 
-    /// optimizer.py:369-377 `as_operation(op, required_opnum=-1)`:
+    /// optimizer.py `as_operation(op, required_opnum=-1)`:
     ///
     /// ```python
     /// def as_operation(self, op, required_opnum=-1):
@@ -1657,7 +1657,7 @@ impl Optimizer {
         {
             return None;
         }
-        // optimizer.py:374 `if op in self._emittedoperations` keys by the op's
+        // optimizer.py `if op in self._emittedoperations` keys by the op's
         // own (raw) identity, not its forwarded replacement. `resolve_to_operand`
         // is the producer box (chain root, before `_forwarded`); the emit set is
         // populated with the canonical box, so this matches iff the raw op is the
@@ -1674,8 +1674,8 @@ impl Optimizer {
         }
     }
 
-    // RPython optimizer.py:722-752 store_final_boxes_in_guard and
-    // optimizer.py:649-670 emit_guard_operation are implemented inside
+    // RPython optimizer.py store_final_boxes_in_guard and
+    // optimizer.py emit_guard_operation are implemented inside
     // emit_operation: _copy_resume_data_from, store_final_boxes_in_guard,
     // force_box on fail_args, and store_final_boxes_in_guard in ctx.emit().
 
@@ -1704,7 +1704,7 @@ impl Optimizer {
         self.pendingfields.len()
     }
 
-    /// optimizer.py:299 + :899-909 `cant_replace_guards()` returns a
+    /// optimizer.py + :899-909 `cant_replace_guards()` returns a
     /// `CantReplaceGuards` context manager whose `__enter__` saves
     /// `self.optimizer.can_replace_guards` into `self.oldval` and sets
     /// the flag to False; `__exit__` restores from `self.oldval`.
@@ -1729,7 +1729,7 @@ impl Optimizer {
     }
 
     /// Pair with `cant_replace_guards` — restores the saved oldval.
-    /// Matches `CantReplaceGuards.__exit__` (optimizer.py:908-909).
+    /// Matches `CantReplaceGuards.__exit__` (optimizer.py).
     pub fn restore_can_replace_guards(&mut self, ctx: &mut OptContext, guard: CantReplaceGuards) {
         self.can_replace_guards = guard.oldval;
         ctx.can_replace_guards = guard.oldval;
@@ -1870,14 +1870,14 @@ impl Optimizer {
         self.propagate_from_pass(after_pass_idx + 1, &op_rc, ctx)
     }
 
-    /// optimizer.py:345-364: force_box — force a virtual to be materialized.
+    /// optimizer.py: force_box — force a virtual to be materialized.
     /// Also pops from potential_extra_ops (optimizer.py:351-359).
     ///
     /// Body refs route through the preamble source directly, so the prior
     /// reverse-lookup (`imported_short_source`) 3rd key is no longer needed.
     /// Mirrors force_box_inline (mod.rs) contract.
     pub fn force_box(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        // optimizer.py:346: op = get_box_replacement(op)
+        // optimizer.py: op = get_box_replacement(op)
         let resolved = ctx.get_replacement_opref(opref);
         // optimizer.py:351-359: potential_extra_ops.pop(op) → sb.add_preamble_op.
         // The pool is keyed by the pure op's result Box. When that result
@@ -1943,7 +1943,7 @@ impl Optimizer {
         resolved
     }
 
-    /// `optimizer.py:306-319` `force_box_for_end_of_preamble(box)`.
+    /// `optimizer.py` `force_box_for_end_of_preamble(box)`.
     ///
     /// ```python
     /// def force_box_for_end_of_preamble(self, box):
@@ -2025,7 +2025,7 @@ impl Optimizer {
             return resolved;
         };
 
-        // `info.py:53-56` `PtrInfo.force_at_the_end_of_preamble` base:
+        // `info.py` `PtrInfo.force_at_the_end_of_preamble` base:
         //
         // ```python
         // def force_at_the_end_of_preamble(self, op, optforce, rec):
@@ -2075,12 +2075,12 @@ impl Optimizer {
             return resolved;
         }
 
-        // RawBuffer / RawSlice: `AbstractRawPtrInfo` (info.py:374-384)
+        // RawBuffer / RawSlice: `AbstractRawPtrInfo` (info.py)
         // inherits `AbstractVirtualPtrInfo._force_at_the_end_of_preamble`
         // (info.py:159-160) without override, so both take the base
         // `force_box()` materialization path.  pyre mirrors this by
         // matching both `VirtualRawBuffer` and `VirtualRawSlice`
-        // (info.py:386 `RawBufferPtrInfo` / info.py:459 `RawSlicePtrInfo`).
+        // (info.py `RawBufferPtrInfo` / info.py `RawSlicePtrInfo`).
         // optimizer.py:311-312 routes through `optforce = self.optearlyforce`.
         if matches!(
             info,
@@ -2175,7 +2175,7 @@ impl Optimizer {
         eprint!("{}", majit_ir::format_trace(ops, constants));
     }
 
-    /// optimizer.py:127-135 `getnullness(op)` parity (line-by-line port).
+    /// optimizer.py `getnullness(op)` parity (line-by-line port).
     ///
     /// Delegates to `OptContext::getnullness`, which implements the
     /// upstream `op.type == 'r' or is_raw_ptr(op)` dispatch and the
@@ -2186,7 +2186,7 @@ impl Optimizer {
     /// Takes `&mut OptContext` to mirror the upstream `getintbound`
     /// lazy-install side effect (optimizer.py:102-112).
     pub fn getnullness(ctx: &mut OptContext, opref: OpRef) -> i8 {
-        // optimizer.py:127-135 `getnullness` reads `getptrinfo` /
+        // optimizer.py `getnullness` reads `getptrinfo` /
         // `getintbound` of an existing box; the `'r'` arm uses
         // `getptrinfo(create=False)`, so an absent info yields `INFO_UNKNOWN`
         // without minting. Resolve the producer box and delegate — a
@@ -2200,7 +2200,7 @@ impl Optimizer {
         ctx.getnullness(&b)
     }
 
-    /// optimizer.py:137-152: make_constant_class(op, class_const, update_last_guard)
+    /// optimizer.py: make_constant_class(op, class_const, update_last_guard)
     ///
     /// Sets known class on PtrInfo, preserving last_guard_pos from any
     /// existing info. When `update_last_guard` is false (RECORD_EXACT_CLASS),
@@ -2222,7 +2222,7 @@ impl Optimizer {
         class_value: i64,
         update_last_guard: bool,
     ) {
-        // optimizer.py:138: op = op.get_box_replacement()
+        // optimizer.py: op = op.get_box_replacement()
         let resolved = op.get_box_replacement(false);
         // optimizer.py:139: opinfo = op.get_forwarded()
         // RPython's InstancePtrInfo covers both virtual and non-virtual
@@ -2244,7 +2244,7 @@ impl Optimizer {
             .unwrap_or(false);
         if !updated_existing {
             // optimizer.py:142-148: preserve last_guard_pos from old info.
-            // operand-direct read mirrors `info.py:100-103 get_last_guard_pos`
+            // operand-direct read mirrors `info.py get_last_guard_pos`
             // — drops the `last_guard_pos(opref)` bridge.
             let old_guard_pos = resolved
                 .ptr_info()
@@ -2261,7 +2261,7 @@ impl Optimizer {
         }
     }
 
-    /// optimizer.py:705-711 `is_call_pure_pure_canraise(op)`.
+    /// optimizer.py `is_call_pure_pure_canraise(op)`.
     /// Mirrors PyPy exactly: ignore `MemoryError`-only effects when deciding
     /// whether a CALL_PURE breaks guard resume-data sharing.
     pub fn is_call_pure_pure_canraise(op: &Op) -> bool {
@@ -2302,7 +2302,7 @@ impl Optimizer {
     /// Run all optimization passes over a list of operations.
     ///
     /// Returns the optimized operation list.
-    /// optimizer.py:517: propagate_all_forward(trace, call_pure_results, flush)
+    /// optimizer.py: propagate_all_forward(trace, call_pure_results, flush)
     pub fn propagate_all_forward(&mut self, ops: &[Op]) -> Vec<Op> {
         self.optimize_with_constants(ops, &mut majit_ir::ConstMap::new())
     }
@@ -2311,7 +2311,7 @@ impl Optimizer {
     ///
     /// `constants` maps OpRef indices to typed `Value` payloads. RPython
     /// keeps typed `ConstInt/ConstFloat/ConstPtr` boxes in the optimized
-    /// trace (history.py:220/261/307 — every Const pins `box.type`);
+    /// trace (history.py/261/307 — every Const pins `box.type`);
     /// majit mirrors that by carrying `Value` directly here, so the
     /// type is intrinsic to each pool entry.
     ///
@@ -2515,7 +2515,7 @@ impl Optimizer {
         ctx.string_content_resolver = self.string_content_resolver.clone();
         ctx.string_constant_alloc = self.string_constant_alloc.clone();
         ctx.callinfocollection = self.callinfocollection.clone();
-        // virtualstate.py:26-27 `GenerateGuardState.__init__: self.cpu =
+        // virtualstate.py `GenerateGuardState.__init__: self.cpu =
         // optimizer.cpu`. Propagate the runtime typeptr-read hook so
         // virtualstate match (KnownClass arms) can fall back to
         // `cpu.cls_of_box(runtime_box)` when the optimizer-tracked
@@ -2534,7 +2534,7 @@ impl Optimizer {
         // 1. Phase 1 → Phase 2 carry: `phase1_emit_ops` below; `op_at`
         //    resolves cross-phase OpRefs through `op.type_` directly
         //    (history.py:220 box.type parity).
-        // optimizer.py:34 `self.inputargs = inputargs` parity.
+        // optimizer.py `self.inputargs = inputargs` parity.
         ctx.inputargs = self.trace_inputargs.clone();
         // Bind inputarg hosts so `make_equal_to` routes InputArg-targeted
         // chain steps through `Forwarded::InputArg(_)` (the orphan-box
@@ -2630,7 +2630,7 @@ impl Optimizer {
         sanitize_backend_constants_for_ops(ops.iter().map(|op| &**op), constants);
         // Pre-populate known constants so passes can see them.
         //
-        // history.py:220/261/307: `ConstInt/ConstFloat/ConstPtr` pin
+        // history.py/261/307: `ConstInt/ConstFloat/ConstPtr` pin
         // `Box.type` at construction. The `Value` payload carries the
         // box class intrinsically, so the OpRef variant tag is recovered
         // directly from the `Value`'s type tag without any external
@@ -2698,7 +2698,7 @@ impl Optimizer {
             // opencoder.py:259 + unroll.py:479-504 parity: RPython's
             // TraceIterator allocates fresh InputArg Box objects for
             // each iteration, and `import_state` asserts
-            // `source is not target` (unroll.py:483) because the fresh
+            // `source is not target` (unroll.py) because the fresh
             // Phase 2 inputargs never coincide with any Phase 1 emitted
             // Box. majit encodes "fresh per iteration" via the
             // `ctx.inputarg_base` offset — Phase 2's source slots live
@@ -2720,7 +2720,7 @@ impl Optimizer {
             // `next_iteration_args` must not be longer than the trace's
             // inputargs: every loop-back value needs a backing inputarg
             // slot to forward to. RPython guarantees this by construction:
-            // `reached_loop_header` (pyjitpl.py:2934-2978) builds
+            // `reached_loop_header` (pyjitpl.py) builds
             // `live_arg_boxes = reds + virtualizable_boxes[:-1]` for BOTH
             // the merge-point registration and the closing JUMP, so the
             // two shapes always match. Pyre's full-body-walk
@@ -2795,7 +2795,7 @@ impl Optimizer {
                     }
                 })
                 .collect();
-            // unroll.py:479-504 import_state: forwarding + make_inputargs
+            // unroll.py import_state: forwarding + make_inputargs
             // + install_imported_virtuals + ShortPreambleBuilder/produce_op.
             let _label_args = crate::optimizeopt::unroll::import_state_full(
                 &targetargs,
@@ -2886,14 +2886,14 @@ impl Optimizer {
         // and `flush()` have run inside the `exported_loop_state` map
         // closure, mirroring RPython's order. Keep the raw jump args here:
         // unroll.py:452-455 passes `original_label_args` directly to
-        // `force_box_for_end_of_preamble`, and optimizer.py:306-319 returns
+        // `force_box_for_end_of_preamble`, and optimizer.py returns
         // the original box unchanged when no force is required.
         let pre_jump_resolved_args = last_op
             .as_ref()
             .filter(|op| op.opcode == OpCode::Jump)
             .map(|jump_op| jump_op.getarglist_copy());
 
-        // RPython optimizer.py:552-556 (_propagate_all_forward):
+        // RPython optimizer.py (_propagate_all_forward):
         //     if flush:
         //         self.flush()
         //         if last_op:
@@ -2934,7 +2934,7 @@ impl Optimizer {
             // Phase 2: re-resolve after forcing (force may have changed forwarding)
             // and fix Ref→non-Ref type crossings by force_box
             let mut force_needed: Vec<usize> = Vec::new();
-            // optimizer.py:651-652 force_box loop parity:
+            // optimizer.py force_box loop parity:
             //   for i in range(op.numargs()): op.setarg(i, force_box(...))
             //
             // `trace_inputargs` names the positions this JUMP writes into only
@@ -2945,7 +2945,7 @@ impl Optimizer {
             // `trace_inputargs` holds the guard's failargs — two unrelated
             // lists, so a positional Ref check reads arbitrary positions. There
             // the type contract belongs to virtual-state matching
-            // (virtualstate.py:646-653 `generate_guards`), and what applies here
+            // (virtualstate.py `generate_guards`), and what applies here
             // is the plain force_box loop.
             let inputargs_are_the_jump_target = !self.building_bridge;
             for i in 0..terminal_op.num_args() {
@@ -3018,7 +3018,7 @@ impl Optimizer {
                 // flush=False: store for caller to consume.
                 self.terminal_op = Some(terminal_op);
             } else {
-                // flush=True: send through passes (optimizer.py:555-556).
+                // flush=True: send through passes (optimizer.py).
                 self.send_extra_operation(&terminal_op, &mut ctx)?;
             }
         }
@@ -3031,7 +3031,7 @@ impl Optimizer {
         // virtual tagging inline at each guard emit. No post-pass rescan.
 
         // RPython Box type parity: each Box carries its type intrinsically
-        // (resoperation.py:1693 `opclasses[opnum].type` for ResOps,
+        // (resoperation.py `opclasses[opnum].type` for ResOps,
         // history.py:220 `InputArg{Int,Ref,Float}.type` for inputargs).
         // Phase 1 emit ops carry their own `op.type_`; Phase 1 inputarg slot
         // OpRefs are resolved through `OptContext::inputarg_type` (which
@@ -3047,7 +3047,7 @@ impl Optimizer {
         }
         // PyPy parity: a folded `ResOperation` keeps its Python identity
         // through `_forwarded` links (resoperation.py:233-242); the
-        // `optimize_peeled_loop` (compile.py:291) chain walk reaches it
+        // `optimize_peeled_loop` (compile.py) chain walk reaches it
         // via `partial_trace.operations`.
         //
         // pyre's per-iter `TraceIterator::next()` (`opencoder.rs`)
@@ -3191,7 +3191,7 @@ impl Optimizer {
                             continue;
                         }
                         let orig = *arg;
-                        // history.py:802-809 `record_same_as(box)` reads
+                        // history.py `record_same_as(box)` reads
                         // `box.type` directly to pick `same_as_i/r/f` — there is
                         // no guess-on-miss path in RPython. Match strict parity by
                         // requiring `opref_type` to resolve; a None here is a
@@ -3270,7 +3270,7 @@ impl Optimizer {
                         .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
                         .collect(),
                 );
-                // unroll.py:457 `virtual_state = self.get_virtual_state(end_args)`.
+                // unroll.py `virtual_state = self.get_virtual_state(end_args)`.
                 // VS is captured AFTER force + flush so its `Virtual` /
                 // `VStruct` entries match the `info.is_virtual()` predicate
                 // that `enum_forced_boxes` asserts. Virtuals that were
@@ -3355,7 +3355,7 @@ impl Optimizer {
                             // bridges — zero hits, as with pyre/bench and
                             // pyre/extra_tests. Upstream matches
                             // against a *different* loop's stored state in
-                            // `jump_to_existing_trace` (unroll.py:207);
+                            // `jump_to_existing_trace` (unroll.py);
                             // `export_state_re_matched_against_its_own_args_cannot_fail`
                             // (virtualstate.rs) pins the self-match, so moving the
                             // preview to the upstream shape breaks that test and
@@ -3393,7 +3393,7 @@ impl Optimizer {
                         )
                     });
                     if raw_type == majit_ir::Type::Void {
-                        // shortpreamble.py:255-259 reads `box.type` from a
+                        // shortpreamble.py reads `box.type` from a
                         // value Box and emits same_as_i/r/f. RPython has no
                         // Void value Box here; reaching Void means Rust-side
                         // OpRef/type bookkeeping lost Box identity and must not
@@ -3487,11 +3487,11 @@ impl Optimizer {
                         if let Some(replay_result) = replay_result {
                             preamble_op.pos.set(replay_result);
                         }
-                        // optimizer.py:651-652 force_box loop parity.
+                        // optimizer.py force_box loop parity.
                         //
                         // Resolve POSITIONALLY when a producer is registered at
                         // this slot: replay-op args carry the dep replay handle
-                        // (produce_arg, shortpreamble.py:285) whose forwarded slot
+                        // (produce_arg, shortpreamble.py) whose forwarded slot
                         // is empty, so only the body producer registered at the
                         // same position carries the Phase-1 forwarding to the
                         // canonical end box this export boundary needs.
@@ -3614,7 +3614,7 @@ impl Optimizer {
                     jump.getarglist().iter().map(|a| a.to_opref()).collect();
                 let exported_int_bounds =
                     self.collect_exported_int_bounds(&jump_arglist_oprefs, &mut ctx);
-                // RPython unroll.py:186-193 + compile.py:1084: `info.renamed_inputargs`
+                // RPython unroll.py:186-193 + compile.py: `info.renamed_inputargs`
                 // are the fresh per-iteration boxes from `trace.get_iter()`. They
                 // live in this run's iteration namespace, not the original
                 // frontend's. In pyre this maps to `[inputarg_base..inputarg_base
@@ -4095,7 +4095,7 @@ impl Optimizer {
         Ok(ops)
     }
 
-    /// unroll.py:183-236: optimize_bridge()
+    /// unroll.py: optimize_bridge()
     ///
     /// Optimizes a bridge trace and redirects its terminal JUMP to the
     /// appropriate loop body target token, falling back to the preamble
@@ -4138,7 +4138,7 @@ impl Optimizer {
         // seeds inputarg types at the shifted slots.
         bridge_inputarg_base: u32,
     ) -> Result<(Vec<majit_ir::OpRc>, bool), crate::optimize::InvalidLoop> {
-        // bridgeopt.py:124-185: deserialize_optimizer_knowledge
+        // bridgeopt.py: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs
         // clears pass state, so we apply AFTER setup.
         self.pending_bridge_rd = pending_bridge_rd;
@@ -4196,7 +4196,7 @@ impl Optimizer {
             && has_body_guard;
         let skip_flush_saved = self.skip_flush;
         self.skip_flush = retarget_close_jump;
-        // unroll.py:193 `optimize_bridge` propagate_all_forward builds NO
+        // unroll.py `optimize_bridge` propagate_all_forward builds NO
         // short-preamble/export preview; mark the bridge call so the shared
         // `optimize_with_constants_and_inputs_at` preview treats a
         // VirtualStatesCantMatch as non-fatal (deferred to the
@@ -4221,7 +4221,7 @@ impl Optimizer {
         // which bridges skip), so `self.patchguardop` is None where upstream
         // always has one: `_jump_to_existing_trace` dereferences
         // `self.optimizer.patchguardop` unconditionally for the extra guards
-        // (unroll.py:333-335) and passes it to `inline_short_preamble`, which
+        // (unroll.py) and passes it to `inline_short_preamble`, which
         // dereferences it again per replayed guard (unroll.py:409).
         // Synthesize it from the bridge's own last body guard (highest resume
         // position, closest to the close).
@@ -4273,11 +4273,11 @@ impl Optimizer {
             .map(|a| a.to_opref())
             .collect();
 
-        // unroll.py:198-200: not inline_short_preamble → jump_to_preamble
+        // unroll.py: not inline_short_preamble → jump_to_preamble
         // RPython calls send_extra_operation(jump_op) which forces virtuals
         // through the full pass chain. No explicit flush()/force_box() needed.
         if !inline_short_preamble || front_target_tokens.len() <= 1 {
-            // unroll.py:196 `cell_token = jump_op.getdescr()`: the jump-to
+            // unroll.py `cell_token = jump_op.getdescr()`: the jump-to
             // jitcell is the one the recorded close JUMP points to, which is
             // also where `front_target_tokens` comes from (`compile_bridge`
             // resolves it off the JUMP target, not the bridge origin).
@@ -4302,7 +4302,7 @@ impl Optimizer {
                         .unwrap_or_else(|| vec![majit_ir::Type::Ref; ni]);
                     OptContext::with_inputarg_types(32, &types)
                 });
-                // unroll.py:238-242: jump_to_preamble →
+                // unroll.py: jump_to_preamble →
                 //   jump_op = jump_op.copy_and_change(rop.JUMP,
                 //                 descr=cell_token.target_tokens[0])
                 //   self.send_extra_operation(jump_op)
@@ -4344,9 +4344,9 @@ impl Optimizer {
         //     virtual_state = self._jump_to_existing_trace(jump_op, ...)
         //
         // The flush+force pair runs BEFORE `_jump_to_existing_trace`; the
-        // VS is captured inside `_jump_to_existing_trace` (unroll.py:323
+        // VS is captured inside `_jump_to_existing_trace` (unroll.py
         // `get_virtual_state(jump_op.getarglist())`) on the now-forwarded
-        // jump args. force_at_the_end_of_preamble (info.py:282) recurses
+        // jump args. force_at_the_end_of_preamble (info.py) recurses
         // into virtual fields but does NOT force the top-level virtuals,
         // so the top-level VS shape is preserved. We therefore omit any
         // pre-flush snapshot and let try_jump_to_existing_trace compute
@@ -4363,7 +4363,7 @@ impl Optimizer {
         ctx.current_pass_idx = saved_pass_idx;
 
         // A failed match attempt's operations stay in `new_operations`.
-        // unroll.py:305-318 `jump_to_existing_trace` states the choice
+        // unroll.py `jump_to_existing_trace` states the choice
         // outright — "leaving the bogus operations at the end of the trace is
         // not great, but should be safe: at worst, they just always do a bit
         // of stuff and then fail" — and its only stopgap is
@@ -4387,9 +4387,9 @@ impl Optimizer {
         // comparison result to 1. Trimming deleted both while keeping that
         // pin.
 
-        // unroll.py:206-211: jump_to_existing_trace(force_boxes=False)
+        // unroll.py: jump_to_existing_trace(force_boxes=False)
         // RPython iterates ALL target_tokens; preamble (virtual_state=None)
-        // is skipped inside jump_to_existing_trace (unroll.py:327-328).
+        // is skipped inside jump_to_existing_trace (unroll.py).
         let opt_unroll = crate::optimizeopt::unroll::OptUnroll::new();
         let vs = match Self::try_jump_to_existing_trace(
             &opt_unroll,
@@ -4402,11 +4402,11 @@ impl Optimizer {
             None,
         ) {
             Ok(vs) => vs,
-            // unroll.py:209-210: except InvalidLoop → jump_to_preamble
+            // unroll.py: except InvalidLoop → jump_to_preamble
             // RPython: self.jump_to_preamble → send_extra_operation
             Err(_) => {
                 if !front_target_tokens.is_empty() {
-                    // unroll.py:196,238-242 jump_to_preamble parity: the jump-to
+                    // unroll.py jump_to_preamble parity: the jump-to
                     // jitcell is `jump_op.getdescr()` = terminal_jump's own
                     // recorded descr, the preamble of the loop the trace closed
                     // into. Keep both jump_op's forced args AND its descr.
@@ -4464,7 +4464,7 @@ impl Optimizer {
 
         // unroll.py:220-227: retrace limit reached, try force_boxes=True.
         // Matches `_optimize_unrolled_loop`'s second call to
-        // `_jump_to_existing_trace(..., force_boxes=True)` (unroll.py:222);
+        // `_jump_to_existing_trace(..., force_boxes=True)` (unroll.py);
         // VS is recomputed inside that call from the current (post-force)
         // jump_op.getarglist() — no pre-snapshot is reused.
         let vs2 = match Self::try_jump_to_existing_trace(
@@ -4491,7 +4491,7 @@ impl Optimizer {
             return Ok((result, false));
         }
 
-        // unroll.py:228-229,238-242: jump_to_preamble → send_extra_operation.
+        // unroll.py: jump_to_preamble → send_extra_operation.
         // RPython sends the JUMP through the full optimization chain so that
         // force_box materializes virtuals and potential_extra_ops are consumed.
         if crate::optimizeopt::majit_log_enabled() {
@@ -4501,7 +4501,7 @@ impl Optimizer {
             );
         }
         if !front_target_tokens.is_empty() {
-            // unroll.py:196,238-242 jump_to_preamble parity: keep jump_op's own
+            // unroll.py jump_to_preamble parity: keep jump_op's own
             // (forced) args so send_extra_operation's Virtualize pass forces the
             // still-virtual ref args, AND keep its recorded descr. That descr is
             // `cell_token.target_tokens[0]` (cell_token = jump_op.getdescr()) —
@@ -4632,7 +4632,7 @@ impl Optimizer {
     }
 
     /// `optimizer.py:623-625` forces every argument before the operation is
-    /// appended, and `info.py:146-152 force_box` emits the allocation as it
+    /// appended, and `info.py force_box` emits the allocation as it
     /// clears the virtual flag — so a forced box's definition is always already
     /// in `_newoperations`. Pyre's `force_box` only *queues* the allocation
     /// when it runs from a pass rather than from final emission, which leaves a
@@ -4704,7 +4704,7 @@ impl Optimizer {
         // type side-table refresh is redundant.
 
         // Resolve forwarded arguments. PyPy `_emit_operation`
-        // (optimizer.py:614-625) walks args via force_box at the entry to
+        // (optimizer.py) walks args via force_box at the entry to
         // emission; pyre's pre-pass walk via `ctx.get_box_replacement` is
         // the structural analog (force_box is invoked separately at
         // `Optimizer::emit_operation` for the post-pass refresh).
@@ -4716,7 +4716,7 @@ impl Optimizer {
         // post-`make_equal_to(_, const_target)` and de-sync from the
         // numbering snapshot.
         let mut resolved_op = op.clone();
-        // optimizer.py:651-652 force_box loop parity: resolve each arg
+        // optimizer.py force_box loop parity: resolve each arg
         // through its forwarding chain. Store the CANONICAL terminal box
         // (carrying the live _forwarded chain), not a fresh from_opref box,
         // so passes can read PtrInfo / IntBound / known-class directly off
@@ -4751,7 +4751,7 @@ impl Optimizer {
 
         let mut current_op = resolved_op;
 
-        // optimizer.py:864-867: optimize_SAME_AS_I/R/F → make_equal_to(op, arg0)
+        // optimizer.py: optimize_SAME_AS_I/R/F → make_equal_to(op, arg0)
         // SameAs ops are absorbed into forwarding, never emitted.
         if matches!(
             current_op.opcode,
@@ -4815,7 +4815,7 @@ impl Optimizer {
                         current_op.opcode,
                         op.opcode,
                     );
-                    // optimizer.py:576-581: pass emitted (replace ≈ emit
+                    // optimizer.py: pass emitted (replace ≈ emit
                     // with modified op). Collect if has postprocess.
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
@@ -4828,7 +4828,7 @@ impl Optimizer {
                     replaced = true;
                 }
                 OptimizationResult::Restart(op) => {
-                    // optimizer.py:567 `send_extra_operation(newop, opt=None)`:
+                    // optimizer.py `send_extra_operation(newop, opt=None)`:
                     // re-dispatch from `first_optimization`, dropping the
                     // original op (the rule that returned Restart already
                     // skipped its own emit). autogenintrules.py uses this
@@ -4867,7 +4867,7 @@ impl Optimizer {
                 OptimizationResult::Remove => {
                     ctx.pending_mark_last_guard = None;
                     ctx.pending_guard_class_postprocess = None;
-                    // optimizer.py:84-92 `last_emitted_operation = REMOVED`
+                    // optimizer.py `last_emitted_operation = REMOVED`
                     // — broadcast the removal so subsequent passes
                     // (e.g. `optimize_GUARD_NO_EXCEPTION`,
                     // rewrite.py:712-718) can observe the drop.
@@ -4883,7 +4883,7 @@ impl Optimizer {
                     return Ok(());
                 }
                 OptimizationResult::PassOn => {
-                    // optimizer.py:576-583: PASS_OP_ON path.
+                    // optimizer.py: PASS_OP_ON path.
                     // RPython's emit() returns PASS_OP_ON if no postprocess,
                     // OptimizationResult if postprocess needed.
                     // Collect if this pass has postprocess for this opcode.
@@ -4918,7 +4918,7 @@ impl Optimizer {
     /// When emitting a guard, check replaces_guard to see if this guard
     /// should replace a previously emitted one (guard strengthening).
     /// Also track last_guard_op for consecutive guard descriptor sharing.
-    /// RPython optimizer.py:623-625: _emit_operation calls force_box(arg)
+    /// RPython optimizer.py: _emit_operation calls force_box(arg)
     /// on every arg before final emission. In majit, this forces any remaining
     /// virtual args that weren't caught by pass-level handlers.
     fn emit_operation(
@@ -4927,7 +4927,7 @@ impl Optimizer {
         ctx: &mut OptContext,
         reuse: bool,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        // RPython optimizer.py:614: _emit_operation is on the Optimizer (last
+        // RPython optimizer.py: _emit_operation is on the Optimizer (last
         // "pass" in the chain). Any force_box called here should emit directly,
         // matching RPython's Optimizer.emit_extra which just calls self.emit(op).
         let saved_in_final_emission = ctx.in_final_emission;
@@ -4956,7 +4956,7 @@ impl Optimizer {
             return Err(e);
         }
 
-        // optimizer.py:623-625: force_box on every arg unconditionally,
+        // optimizer.py: force_box on every arg unconditionally,
         // then store the CANONICAL box for the forced value (carrying its
         // _forwarded chain) rather than a fresh from_opref box, so emitted
         // ops and get_producing_op consumers can read info off op.arg(i) —
@@ -4997,8 +4997,8 @@ impl Optimizer {
             // emit_guard_operation reads ctx.pending_for_guard inside store_final_boxes_in_guard
             // and clears it.
 
-            // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
-            // optimizer.py:660 `orig_op in self.replaces_guard` keys by the raw
+            // optimizer.py: replaces_guard check BEFORE emit_guard_operation.
+            // optimizer.py `orig_op in self.replaces_guard` keys by the raw
             // `orig_op` identity (before get_box_replacement), so resolve to the
             // producer box without following `_forwarded`.
             if self.can_replace_guards
@@ -5017,7 +5017,7 @@ impl Optimizer {
                             ctx.new_operations.len()
                         );
                     }
-                    // optimizer.py:713-720 replace_guard_op:
+                    // optimizer.py replace_guard_op:
                     //   old_descr = old_op.getdescr()
                     //   new_descr = new_op.getdescr()
                     //   new_descr.copy_all_attributes_from(old_descr)
@@ -5049,7 +5049,7 @@ impl Optimizer {
                 }
             }
 
-            // optimizer.py:637: op = self.emit_guard_operation(op, pendingfields)
+            // optimizer.py: op = self.emit_guard_operation(op, pendingfields)
             op = self.emit_guard_operation(op, ctx);
             // emit_guard_operation may defer an `InvalidLoop` (e.g. a pending
             // SETARRAYITEM index that is not a non-negative constant).
@@ -5088,20 +5088,20 @@ impl Optimizer {
         } else {
             ctx.emit(op.clone())
         };
-        // optimizer.py:674 `self._emittedoperations[op] = None` — record
+        // optimizer.py `self._emittedoperations[op] = None` — record
         // the freshly emitted op so `as_operation` can later confirm it
         // is in the emit set before downstream callers reason about
         // descriptor-sharing or other emit-bound state. Keyed by the
         // emitted op's canonical box (the box-identity analog of `op`).
         self.emitted_operations
             .insert(ctx.get_box_replacement_operand(emitted));
-        // optimizer.py:84-92 `_emit_operation` clears the REMOVED
+        // optimizer.py `_emit_operation` clears the REMOVED
         // sentinel on each successful emit. Cross-pass readers
-        // (rewrite.py:712-718 `optimize_GUARD_NO_EXCEPTION`) see the
+        // (rewrite.py `optimize_GUARD_NO_EXCEPTION`) see the
         // flag transition from true (prior Remove) → false (this
         // emit).
         ctx.last_op_removed = false;
-        // optimizer.py:598-602: returns_bool_result → getintbound(op).make_bool().
+        // optimizer.py: returns_bool_result → getintbound(op).make_bool().
         // Run here (post-emit) so the now-bound op box carries the IntBound
         // write; returns_bool ops are Int-typed (asserted above).
         if op.opcode.returns_bool() {
@@ -5110,7 +5110,7 @@ impl Optimizer {
                 .expect("just-emitted op resolves to a bound operand");
             ctx.with_intbound_mut(&bound_box, |bound| bound.make_bool());
         }
-        // optimizer.py:603-611: after emit, promote IntBound→Const.
+        // optimizer.py: after emit, promote IntBound→Const.
         //   op = self.get_box_replacement(op)
         //   if op.type == 'i':
         //       opinfo = op.get_forwarded()  # IntBound
@@ -5149,16 +5149,16 @@ impl Optimizer {
                 ctx.new_operations.len()
             );
         }
-        // optimizer.py:47-54: run deferred postprocess after emit.
+        // optimizer.py: run deferred postprocess after emit.
         // RPython calls OptimizationResult.callback() → propagate_postprocess.
-        // rewrite.py:282: postprocess_GUARD_NONNULL → mark_last_guard
+        // rewrite.py: postprocess_GUARD_NONNULL → mark_last_guard
         if let Some(opref) = ctx.pending_mark_last_guard.take()
             && let Some(b) = ctx.get_box_replacement_operand_opt(opref)
         {
             ctx.mark_last_guard(&b);
         }
         if let Some(pp) = ctx.pending_guard_class_postprocess.take() {
-            // rewrite.py:430-436 postprocess_GUARD_CLASS:
+            // rewrite.py postprocess_GUARD_CLASS:
             //   update_last_guard = not old_guard or isinstance(descr, ResumeAtPositionDescr)
             //   make_constant_class(arg0, expectedclassbox, update_last_guard)
             //
@@ -5169,7 +5169,7 @@ impl Optimizer {
             // refreshes `_known_class`, matching upstream
             // `optimizer.py:137-151` where `isinstance(opinfo,
             // InstancePtrInfo)` mutates in place.
-            // optimizer.py:137-152 `make_constant_class` always updates
+            // optimizer.py `make_constant_class` always updates
             // `_forwarded` — `materialize_operand_at` materializes the Box so the
             // write is never silently skipped. Same materializer feeds
             // the `last_guard_pos` read; `info.py:91-103
@@ -5196,7 +5196,7 @@ impl Optimizer {
         Ok(())
     }
 
-    /// optimizer.py:652-686 emit_guard_operation
+    /// optimizer.py emit_guard_operation
     ///
     /// Manages the guard sharing chain (`_last_guard_op`) and dispatches to
     /// `_copy_resume_data_from` (descrless follow-up guard, e.g.
@@ -5231,7 +5231,7 @@ impl Optimizer {
         // opencoder.py.  If such a guard shared solely because descr is None,
         // it would inherit the previous guard's resume pc and discard the
         // cloned snapshot.
-        // compile.py:925-926 invent_fail_descr_for_op: GUARD_NOT_FORCED /
+        // compile.py invent_fail_descr_for_op: GUARD_NOT_FORCED /
         // GUARD_NOT_FORCED_2 must always mint a fresh ResumeGuardForcedDescr
         // (`assert copied_from_descr is None`).  They are never on the
         // sharing chain.  Mirrors the OptContext path in
@@ -5272,7 +5272,7 @@ impl Optimizer {
                     .map(|pf_op| {
                         let (target, value, item_index) = if pf_op.opcode == OpCode::SetarrayitemGc
                         {
-                            // resume.py:534-552 _add_pending_fields:
+                            // resume.py _add_pending_fields:
                             //   boxindex = op.getarg(1).get_box_replacement()
                             //   itemindex = boxindex.getint()       # → Const required
                             //   if itemindex < 0: raise TagOverflow
@@ -5320,7 +5320,7 @@ impl Optimizer {
                 Vec::new()
             };
 
-            // resume.py:570-574 _add_optimizer_sections + bridgeopt.py:63-122:
+            // resume.py _add_optimizer_sections + bridgeopt.py:63-122:
             // RPython collects optimizer knowledge INSIDE
             // store_final_boxes_in_guard → finish() → serialize_optimizer_knowledge.
             // Rust adaptation: collect BEFORE the call (borrow checker) and pass
@@ -5332,13 +5332,13 @@ impl Optimizer {
             } else {
                 Some(knowledge_for_resume)
             };
-            // optimizer.py:678: store_final_boxes_in_guard.
-            // resume.py:445 self._add_pending_fields(pending_setfields) —
+            // optimizer.py: store_final_boxes_in_guard.
+            // resume.py self._add_pending_fields(pending_setfields) —
             // tags target_tagged/value_tagged in place during finish();
             // the descr's set_rd_pendingfields receives the tagged slice
             // post-finish (mod.rs::store_final_boxes_in_guard).
             op = Self::store_final_boxes_in_guard(op, ctx, knowledge, pending_for_finish);
-            // optimizer.py:681-683: force_box on each fail_arg for unrolling.
+            // optimizer.py: force_box on each fail_arg for unrolling.
             if let Some(fa) = op.getfailargs() {
                 let fargs: Vec<OpRef> = fa.iter().map(|a| a.to_opref()).collect();
                 for farg in fargs {
@@ -5347,7 +5347,7 @@ impl Optimizer {
                     }
                 }
             }
-            // optimizer.py:750-751 (called from store_final_boxes_in_guard):
+            // optimizer.py (called from store_final_boxes_in_guard):
             // GUARD_VALUE → bool replacement. We invoke it here so descr is
             // already set when _maybe_replace_guard_value reads it.
             if op.opcode == OpCode::GuardValue {
@@ -5370,18 +5370,18 @@ impl Optimizer {
         op
     }
 
-    /// optimizer.py:688-700 _copy_resume_data_from
+    /// optimizer.py _copy_resume_data_from
     ///
     /// Inherits descr / fail_args from `_last_guard_op` for the follow-up
     /// descrless guard, then runs `_maybe_replace_guard_value` if the
     /// inheriting op is a `GUARD_VALUE`.
     ///
-    /// `compile.py:832 ResumeGuardCopiedDescr(prev)` parity: stamp
+    /// `compile.py ResumeGuardCopiedDescr(prev)` parity: stamp
     /// the sharer's descr as a `ResumeGuardCopiedDescr` (or
     /// `ResumeGuardCopiedExcDescr` for exception guards) whose
     /// `prev` references the donor's `ResumeGuardDescr`.  Readers
     /// go through `FailDescr::rd_*()` which chases `prev` automatically
-    /// (compile.py:849 `get_resumestorage(): return prev`).
+    /// (compile.py `get_resumestorage(): return prev`).
     fn _copy_resume_data_from(&mut self, mut op: Op, ctx: &mut OptContext) -> Op {
         let donor_idx = self
             .last_guard_op_idx
@@ -5390,11 +5390,11 @@ impl Optimizer {
             .new_operations
             .get(donor_idx)
             .expect("last_guard_op_idx must point inside ctx.new_operations");
-        // compile.py:919-937 `invent_fail_descr_for_op`: the sharing
+        // compile.py `invent_fail_descr_for_op`: the sharing
         // path mints `ResumeGuardCopiedDescr(prev)` (or
         // `ResumeGuardCopiedExcDescr(prev)` for GUARD_EXCEPTION /
         // GUARD_NO_EXCEPTION) rather than cloning the donor's
-        // ResumeGuardDescr — `get_resumestorage()` (compile.py:849)
+        // ResumeGuardDescr — `get_resumestorage()` (compile.py)
         // routes reads back to `prev`.  GUARD_NOT_FORCED never
         // reaches this path (compile.py:921 `assert copied_from_descr
         // is None`), so no Forced-copied variant is needed.
@@ -5443,7 +5443,7 @@ impl Optimizer {
         } else {
             op.clear_fail_arg_types();
         }
-        // ResumeGuardCopiedDescr(prev) parity (compile.py:849
+        // ResumeGuardCopiedDescr(prev) parity (compile.py
         // `get_resumestorage(): return prev`): the descr-side `prev`
         // pointer (set by `make_resume_guard_copied_descr` above)
         // routes resume reads to the donor's RdPayload — no op-index
@@ -5456,13 +5456,13 @@ impl Optimizer {
         op
     }
 
-    /// optimizer.py:722-752 store_final_boxes_in_guard
+    /// optimizer.py store_final_boxes_in_guard
     ///
     /// Resolve fail_args through get_box_replacement and delegate to
     /// finalize_guard_resume_data for snapshot-based virtual encoding
     /// (rd_numb, rd_consts, rd_virtuals).
     ///
-    /// resume.py:389-452 finish() is unconditional: every guard reaching
+    /// resume.py finish() is unconditional: every guard reaching
     /// here must have a snapshot. We delegate without any guard condition
     /// — finalize_guard_resume_data already handles the missing-snapshot
     /// case internally (silent return for guards without rd_resume_position
@@ -5483,7 +5483,7 @@ impl Optimizer {
         // helpers. In RPython the second argument is `not_const=True`:
         // the chain walk stops before stepping into a Const target, so
         // the guard fail_arg keeps the runtime box identity here. Const
-        // entries are encoded by `resume.py:204 _number_boxes` as TAGCONST
+        // entries are encoded by `resume.py _number_boxes` as TAGCONST
         // in rd_numb during numbering, and the liveboxes returned by
         // `finish()` / `descr.store_final_boxes` remain TAGBOX-only for
         // backend regalloc.
@@ -5501,7 +5501,7 @@ impl Optimizer {
         op
     }
 
-    /// bridgeopt.py:63-122 serialize_optimizer_knowledge parity:
+    /// bridgeopt.py serialize_optimizer_knowledge parity:
     /// Collect UNFILTERED optimizer knowledge from passes for rd_numb
     /// serialization. available_boxes filtering happens inside
     /// memo.finish() during the actual serialization, matching RPython's
@@ -5528,7 +5528,7 @@ impl Optimizer {
         new_idx
     }
 
-    /// virtualize.py:84-90 postprocess_FINISH, Optimizer half.
+    /// virtualize.py postprocess_FINISH, Optimizer half.
     ///
     /// `OptVirtualize::propagate_postprocess` stashed the GUARD_NOT_FORCED_2 it
     /// took off the FINISH; the finalization needs `store_final_boxes_in_guard`
@@ -5593,7 +5593,7 @@ impl Optimizer {
             }
         }
 
-        // descr.py:25-47: assign descr_index inline, matching setup_descrs().
+        // descr.py: assign descr_index inline, matching setup_descrs().
         // heap.py:828: descriptors with get_descr_index() == -1 after
         // ensure_descr_index should not occur — ensure_descr_index always
         // assigns. The filter_map here mirrors the RPython path where
@@ -5624,7 +5624,7 @@ impl Optimizer {
         }
     }
 
-    /// optimizer.py:754-778 _maybe_replace_guard_value
+    /// optimizer.py _maybe_replace_guard_value
     ///
     /// ```text
     /// def _maybe_replace_guard_value(self, op, descr):
@@ -5650,7 +5650,7 @@ impl Optimizer {
         if ctx.opref_type(arg0.to_opref()) != Some(majit_ir::Type::Int) {
             return op;
         }
-        // optimizer.py:756-757: b = self.getintbound(op.getarg(0)); if b.is_bool()
+        // optimizer.py: b = self.getintbound(op.getarg(0)); if b.is_bool()
         let b = {
             let b = ctx.resolve_operand_operand(&arg0);
             ctx.getintbound_handle(&b).borrow().clone()
@@ -5668,7 +5668,7 @@ impl Optimizer {
             1 => OpCode::GuardTrue,
             _ => return op,
         };
-        // optimizer.py:776: replace_op_with(op, opnum, [op.getarg(0)], descr)
+        // optimizer.py: replace_op_with(op, opnum, [op.getarg(0)], descr)
         let mut newop = Op::new(new_opcode, &[arg0]);
         newop.pos.set(op.pos.get());
         if let Some(d) = op.getdescr() {
@@ -5682,7 +5682,7 @@ impl Optimizer {
             Some(types) => newop.set_fail_arg_types(types.to_vec()),
             None => newop.clear_fail_arg_types(),
         }
-        // compile.py:855 _attrs_ live on the descr; Arc-clone of
+        // compile.py _attrs_ live on the descr; Arc-clone of
         // op.descr above shares the donor's RdPayload, so newop's
         // FailDescr::rd_* readers see the same data.
         newop.rd_resume_position.set(op.rd_resume_position.get());
@@ -5692,7 +5692,7 @@ impl Optimizer {
 
 impl Optimizer {
     /// Create an optimizer with the standard pass pipeline.
-    /// RPython __init__.py:15-22 ALL_OPTS + ENABLE_ALL_OPTS (rlib/jit.py):
+    /// RPython __init__.py ALL_OPTS + ENABLE_ALL_OPTS (rlib/jit.py):
     ///   intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll
     /// (unroll is handled separately by UnrollOptimizer)
     pub fn default_pipeline() -> Self {
@@ -5717,7 +5717,7 @@ impl Optimizer {
         //     else:
         //         minimum_virtualizable_size = -1
         //
-        // `virtualizable.py:123-124 minimum_size()` returns `num_static_fields`,
+        // `virtualizable.py minimum_size()` returns `num_static_fields`,
         // which is what `static_field_offsets` enumerates.
         //
         // Deviation, deliberate: RPython gates on the STATIC per-jitdriver
@@ -6524,7 +6524,7 @@ mod tests {
 
     #[test]
     fn test_default_pipeline_has_7_passes() {
-        // RPython __init__.py:15-22 ALL_OPTS + ENABLE_ALL_OPTS (rlib/jit.py):
+        // RPython __init__.py ALL_OPTS + ENABLE_ALL_OPTS (rlib/jit.py):
         // intbounds:rewrite:virtualize:string:pure:earlyforce:heap (unroll separate)
         let opt = Optimizer::default_pipeline();
         assert_eq!(opt.num_passes(), 7);
@@ -7072,7 +7072,7 @@ mod tests {
             "virtual structure should be encoded into rd_virtuals tree"
         );
         let fail_args = guard.getfailargs().expect("guard should keep fail args");
-        // resume.py:411-417 parity: liveboxes is TAGBOX-only.  The virtual
+        // resume.py parity: liveboxes is TAGBOX-only.  The virtual
         // p0 is encoded into rd_virtuals; only its int field (OpRef::int_op(11))
         // survives in liveboxes.
         assert!(
@@ -7245,7 +7245,7 @@ mod tests {
         assert_eq!(opt.num_pending_fields(), 1);
     }
 
-    /// optimizer.py:127-135 `getnullness(op)` parity test.
+    /// optimizer.py `getnullness(op)` parity test.
     ///
     /// Returns the upstream INFO_NULL / INFO_NONNULL / INFO_UNKNOWN
     /// integer constants (info.py:13-15).
@@ -7389,7 +7389,7 @@ mod tests {
         // is the property under test: forcing the virtual must emit its New and
         // SetfieldGc BEFORE the guard that consumes it.
         //
-        // info.py:146-151: force_box emits the ORIGINAL box op, so the forced
+        // info.py: force_box emits the ORIGINAL box op, so the forced
         // GuardNonnull keeps arg(0) = OpRef::ref_op(10) (the virtual's original
         // identity). force_box_impl preserves `new_op.pos = opref`, which is
         // why New lands at RefOp(10) rather than at a fresh position.
@@ -7522,7 +7522,7 @@ mod tests {
 
     #[test]
     fn update_counters_folds_opt_ops_opt_guards_opt_guards_shared_into_profiler() {
-        // optimizer.py:626/629/673-674: every emit_operation bumps OPT_OPS,
+        // optimizer.py/629/673-674: every emit_operation bumps OPT_OPS,
         // each guard bumps OPT_GUARDS additionally, and the sharing path
         // bumps OPT_GUARDS_SHARED.  Pyre defers the fold via
         // update_counters; assert the accumulators land in the matching

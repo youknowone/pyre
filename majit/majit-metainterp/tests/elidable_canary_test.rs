@@ -3,8 +3,8 @@
 //! is patched to `CallPureI` (or fully cut to `Const` when every
 //! argument is a constant).
 //!
-//! `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
-//! + `pyjitpl.py:3553-3579 record_result_of_call_pure` — the live wire
+//! `pyjitpl.py MIFrame.execute_varargs(opnum, argboxes, descr, exc=False, pure=True)`
+//! + `pyjitpl.py record_result_of_call_pure` — the live wire
 //!   must not break when observed from outside the metainterp crate.
 //!
 //! Infrastructure unit tests already exist at:
@@ -24,10 +24,10 @@ use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex, OpCode, Type, Value};
 use majit_macros::elidable_cannot_raise;
 use majit_metainterp::{BackEdgeAction, MetaInterp};
 
-/// Canary helper.  `rlib/jit.py:13 @jit.elidable` parity.
+/// Canary helper.  `rlib/jit.py @jit.elidable` parity.
 ///
 /// Deterministic, no side effects, no raise → `EF_ELIDABLE_CANNOT_RAISE`
-/// (`call.py:299 getcalldescr` else branch, policy byte 19).
+/// (`call.py getcalldescr` else branch, policy byte 19).
 #[elidable_cannot_raise]
 fn elidable_canary_mul(x: i64, y: i64) -> i64 {
     x.wrapping_mul(y) ^ 0x5eed
@@ -66,7 +66,7 @@ fn elidable_canary_traces_to_call_pure_i_when_args_not_all_const() {
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     // EffectInfo: ElidableCannotRaise + OopSpecIndex::None
-    // (= `EffectInfo::new(0, 0)` in `effectinfo.py:17,260` parity).
+    // (= `EffectInfo::new(0, 0)` in `effectinfo.py` parity).
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);
 
     // inputarg slot 0 = first live value (Type::Int).  `force_start_tracing`'s
@@ -92,7 +92,7 @@ fn elidable_canary_traces_to_call_pure_i_when_args_not_all_const() {
         &[Type::Int, Type::Int],
         Type::Int,
         effect,
-        // pyjitpl.py:1960-1993 _build_allboxes parity: funcbox value first,
+        // pyjitpl.py _build_allboxes parity: funcbox value first,
         // then per-arg concrete values.
         &[
             Value::Int(func_ptr as usize as i64),

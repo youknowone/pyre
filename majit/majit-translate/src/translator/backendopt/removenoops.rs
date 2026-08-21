@@ -6,7 +6,7 @@ use crate::flowspace::model::{FunctionGraph, Hlvalue};
 use crate::translator::simplify;
 use crate::translator::translator::TranslationContext;
 
-/// RPython `remove_unaryops(graph, opnames)` at `removenoops.py:6-45`.
+/// RPython `remove_unaryops(graph, opnames)` at `removenoops.py`.
 fn remove_unaryops(graph: &FunctionGraph, opnames: &[&str]) {
     let mut positions = Vec::new();
     for block in graph.iterblocks() {
@@ -63,7 +63,7 @@ fn remove_unaryops(graph: &FunctionGraph, opnames: &[&str]) {
     }
 }
 
-/// RPython `remove_same_as(graph)` at `removenoops.py:47-48`.
+/// RPython `remove_same_as(graph)` at `removenoops.py`.
 pub fn remove_same_as(graph: &FunctionGraph) {
     remove_unaryops(graph, &["same_as"]);
 }
@@ -152,7 +152,7 @@ pub fn remove_duplicate_casts(graph: &FunctionGraph, translator: &TranslationCon
     num_removed
 }
 
-/// RPython `remove_debug_assert(graph)` at `removenoops.py:103-107`.
+/// RPython `remove_debug_assert(graph)` at `removenoops.py`.
 pub fn remove_debug_assert(graph: &FunctionGraph) {
     for block in graph.iterblocks() {
         block

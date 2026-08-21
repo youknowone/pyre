@@ -286,7 +286,7 @@ pub unsafe extern "C" fn PyObject_GenericSetAttr(
 }
 
 /// `PyObject_GenericGetDict(object, context)` — the `__dict__` descriptor's
-/// getter (`typedef.py:543-548 descr_get_dict`).  The `context` a getset
+/// getter (`typedef.py descr_get_dict`).  The `context` a getset
 /// closure would carry has nothing to say here.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GenericGetDict(
@@ -347,7 +347,7 @@ pub unsafe extern "C" fn PyObject_Repr(object: *mut CPyObject) -> *mut CPyObject
     result(unsafe { crate::display::py_repr_wtf8(object) }.map(pyre_object::w_str_from_wtf8))
 }
 
-/// `PyObject_ASCII(object)` — `ascii(object)` (`object.py:224-230`).
+/// `PyObject_ASCII(object)` — `ascii(object)` (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_ASCII(object: *mut CPyObject) -> *mut CPyObject {
     let Some(object) = argument(object) else {
@@ -376,7 +376,7 @@ fn bytes_of_object(object: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     } {
         return Ok(object);
     }
-    // `bytesobject.py:575 invoke_bytes_method` — the override's answer is
+    // `bytesobject.py invoke_bytes_method` — the override's answer is
     // returned unmodified, a `bytes` subclass included.
     if let Some(method) = unsafe { crate::baseobjspace::lookup(object, "__bytes__") } {
         let w_type = crate::typedef::r#type(object).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
@@ -590,7 +590,7 @@ pub unsafe extern "C" fn PyObject_Length(object: *mut CPyObject) -> isize {
 
 // ── deletion and optional lookup ──────────────────────────────────────────
 
-/// `PyObject_DelItem(object, key)` — `del object[key]` (`object.py:169-172`).
+/// `PyObject_DelItem(object, key)` — `del object[key]` (`object.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_DelItem(object: *mut CPyObject, key: *mut CPyObject) -> c_int {
     let Some([object, key]) = arguments([object, key]) else {
@@ -1162,7 +1162,7 @@ unsafe fn PyTuple_from_vector(args: *const *mut CPyObject, count: usize) -> *mut
 // `tp_alloc` handed out; upstream reaches the same raw allocator from both
 // directions (`object.py:18-42`, `src/object.c:103-105`).
 
-/// `PyObject_Malloc(size)` — uninitialized, as `malloc` is (`object.py:18-23`).
+/// `PyObject_Malloc(size)` — uninitialized, as `malloc` is (`object.py`).
 #[unsafe(no_mangle)]
 pub extern "C" fn PyObject_Malloc(size: usize) -> *mut c_void {
     pyobject::allocate_raw(size, false)

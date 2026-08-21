@@ -999,7 +999,7 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
     }
 }
 
-/// `_opimpl_getarrayitem_vable` (pyjitpl.py:1218-1230) and
+/// `_opimpl_getarrayitem_vable` (pyjitpl.py) and
 /// `_opimpl_setarrayitem_vable` (:1236-1247) take the
 /// `_nonstandard_virtualizable` decision FIRST, and their non-standard branch
 /// reaches `getarrayitem_gc_*` / `setarrayitem_gc_any` with the index box as it
@@ -1633,7 +1633,7 @@ impl majit_backend::Backend for AllocTestCpu {
 /// The object `execute_new[_with_vtable]` allocates is rooted by being
 /// stamped onto the op recorded for it: `MetaInterp::walk_active_trace_refs`
 /// forwards every recorder `Op` `value` cell holding a `Value::Ref`
-/// (`history.py:803-807` `*FrontendOp(pos, value)`), and that stamp is the
+/// (`history.py` `*FrontendOp(pos, value)`), and that stamp is the
 /// only thing putting a walk-time allocation in the root set — the walker's
 /// `concrete_registers_r` shadow is a borrowed slice, not a root.
 ///
@@ -4607,7 +4607,7 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
 
 #[test]
 fn top_level_raise_settles_the_vable_token() {
-    // `pyjitpl.py:3261 compile_exit_frame_with_exception` opens with
+    // `pyjitpl.py compile_exit_frame_with_exception` opens with
     // `store_token_in_vable()`, the same as `compile_done_with_this_frame`.
     // Every residual call arms the token
     // (`walker_vable_and_vrefs_before_residual_call`), so an exception exit
@@ -9745,7 +9745,7 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // this fixture.
 }
 
-/// The post-step trace-limit check (`pyjitpl.py:2865 _interpret`) is skipped
+/// The post-step trace-limit check (`pyjitpl.py _interpret`) is skipped
 /// inside a canonical helper descent, which has no blackhole entry point to
 /// abort at, and runs on the enclosing Python frame instead.
 ///

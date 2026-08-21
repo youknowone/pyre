@@ -40,13 +40,13 @@ pub unsafe extern "C" fn PyComplex_CheckExact(object: *mut CPyObject) -> c_int {
     (!object.is_null() && is_exactly(object, &pyre_object::COMPLEX_TYPE)) as c_int
 }
 
-/// `complexobject.py:52 PyComplex_FromDoubles`.
+/// `complexobject.py PyComplex_FromDoubles`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyComplex_FromDoubles(real: c_double, imag: c_double) -> *mut CPyObject {
     pyobject::make_ref(pyre_object::complexobject::w_complex_new(real, imag))
 }
 
-/// `complexobject.py:71 _PyComplex_FromCComplex`, which upstream spells with a
+/// `complexobject.py _PyComplex_FromCComplex`, which upstream spells with a
 /// pointer for want of a struct argument.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyComplex_FromCComplex(value: CPyComplex) -> *mut CPyObject {
@@ -84,7 +84,7 @@ fn unpack(object: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     Ok((crate::baseobjspace::float_w(object)?, 0.0))
 }
 
-/// `complexobject.py:57 PyComplex_RealAsDouble`.
+/// `complexobject.py PyComplex_RealAsDouble`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyComplex_RealAsDouble(object: *mut CPyObject) -> c_double {
     let Some(object) = argument(object) else {
@@ -96,7 +96,7 @@ pub unsafe extern "C" fn PyComplex_RealAsDouble(object: *mut CPyObject) -> c_dou
     super::pyerrors::trap(crate::baseobjspace::float_w(object)).unwrap_or(-1.0)
 }
 
-/// `complexobject.py:65 PyComplex_ImagAsDouble`.
+/// `complexobject.py PyComplex_ImagAsDouble`.
 ///
 /// Anything that is not a complex has no imaginary part to report, and this
 /// answers 0.0 for it without asking whether it is a number at all.
@@ -112,7 +112,7 @@ pub unsafe extern "C" fn PyComplex_ImagAsDouble(object: *mut CPyObject) -> c_dou
     }
 }
 
-/// `complexobject.py:79 _PyComplex_AsCComplex`.
+/// `complexobject.py _PyComplex_AsCComplex`.
 ///
 /// The failure answer is a real part of -1.0 with the error recorded, which is
 /// what a caller distinguishes by asking `PyErr_Occurred`.

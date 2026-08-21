@@ -9,7 +9,7 @@
 //! `pyre_interpreter::module::_io::buffered_rwpair::<Impl>::readinto` graph
 //! dropped to the legacy walker.
 //!
-//! The `ll_listslice_startstop` clamp (`rpython/rtyper/rlist.py:893-903`)
+//! The `ll_listslice_startstop` clamp (`rpython/rtyper/rlist.py`)
 //! repairs the oversized result of an unsigned `len - 1` wrap. The MinusOne
 //! shape is admitted because `len - 1 <= len` is proven for this receiver;
 //! a general RangeTo stop has no `end <= len` proof and is declined. The
@@ -41,7 +41,7 @@
 //! RPython models `l[start:]` as a **copy**: the annotator's `getslice`
 //! handler (`unaryop.py:420-423`) returns a fresh `listdef.offspring`, and the
 //! rtyper lowers it through `AbstractBaseListRepr.rtype_getslice`
-//! (`rlist.py:409-414`) to a `gendirectcall` of `ll_listslice_startonly`.
+//! (`rlist.py`) to a `gendirectcall` of `ll_listslice_startonly`.
 //! There is no borrowed-view concept upstream. This pass reroutes the residual
 //! `slice::index` onto that orthodox path:
 //!

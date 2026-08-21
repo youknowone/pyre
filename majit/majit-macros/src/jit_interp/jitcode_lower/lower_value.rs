@@ -13,7 +13,7 @@ use super::*;
 /// 64-bit range, matching the runtime `LLType::Struct(type_id)` cache-key
 /// identity.
 ///
-/// `descr.py:105 get_size_descr` keys the cache by the actual lltype STRUCT, so
+/// `descr.py get_size_descr` keys the cache by the actual lltype STRUCT, so
 /// a `GcStruct` and a raw `Struct` with identical fields are DISTINCT lltypes
 /// with distinct descrs.  A GC `new_struct(T)` and a raw `ref(T)` state scalar
 /// share a path and would otherwise share an id; the first-registered
@@ -285,11 +285,11 @@ impl<'c> Lowerer<'c> {
             Expr::Unary(ExprUnary { op, expr, .. }) => self.lower_unary(op, expr),
             Expr::Binary(binary) => self.lower_binary(binary),
             Expr::Call(call) => {
-                // jtransform.py:596 rewrite_op_hint: promote → int_guard_value
+                // jtransform.py rewrite_op_hint: promote → int_guard_value
                 if let Some(binding) = self.lower_promote_call(call) {
                     return Some(binding);
                 }
-                // pyjitpl.py:385-391 opimpl_assert_not_none — emit
+                // pyjitpl.py opimpl_assert_not_none — emit
                 // BC_ASSERT_NOT_NONE and return the unwrapped binding.
                 if let Some(binding) = self.lower_assert_not_none_call(call) {
                     return Some(binding);
@@ -300,7 +300,7 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_pool_array_get_call(call) {
                     return Some(binding);
                 }
-                // jtransform.py:2030 _handle_int_special — pure int binop
+                // jtransform.py _handle_int_special — pure int binop
                 // aliases bypass the call-policy machinery and emit a native
                 // IR op (IntAdd, IntSub, etc.) directly.
                 if let Some(binding) = self.lower_native_int_binop_call(call) {
@@ -310,7 +310,7 @@ impl<'c> Lowerer<'c> {
                     return Some(binding);
                 }
                 // Raw native-memory load intrinsic `majit_raw_load_iXX(base, ea)`
-                // → raw_load_i (jtransform.py:1165-1171 rewrite_op_raw_load).
+                // → raw_load_i (jtransform.py rewrite_op_raw_load).
                 if let Some(binding) = self.lower_raw_load_call(call) {
                     return Some(binding);
                 }
@@ -510,7 +510,7 @@ impl<'c> Lowerer<'c> {
     /// Lower a raw native-memory load intrinsic
     /// `majit_raw_load_{i,u}{8,16,32,64}(base, ea)` to a `raw_load_i` op (the
     /// read-side analogue of `lower_raw_store_stmt`).  RPython parity:
-    /// `jtransform.py:1165-1171 rewrite_op_raw_load` lowers a
+    /// `jtransform.py rewrite_op_raw_load` lowers a
     /// `rffi.raw_storage_getitem` to `raw_load_i(base, offset,
     /// arraydescrof(CArray(T)))`.  Both operands are int-kind (raw address,
     /// byte offset); the op writes an int result.
@@ -625,7 +625,7 @@ impl<'c> Lowerer<'c> {
         // discriminator, shared by every spelling of this concrete type.
         let type_id = struct_type_id_tokens(struct_path, true);
         let result_reg = self.alloc_reg();
-        // descr.py:122-126 init_size_descr: the SizeDescr carries the
+        // descr.py init_size_descr: the SizeDescr carries the
         // struct's full `(offset, is_ref, name)` layout so the optimizer can
         // virtualize the New and resolve each field's parent SizeDescr +
         // index. A Rust struct literal may list fields in any order, so the
@@ -775,7 +775,7 @@ impl<'c> Lowerer<'c> {
 
     /// Statement-context lowering for `jit::assert_not_none(x);`.
     ///
-    /// pyjitpl.py:385-391 `opimpl_assert_not_none`. Bare statement form
+    /// pyjitpl.py `opimpl_assert_not_none`. Bare statement form
     /// discards the unwrapped value but still emits the
     /// `BC_ASSERT_NOT_NONE` op so the trace records the nullity hint.
     /// The `let x = jit::assert_not_none(y);` form goes through the
@@ -795,13 +795,13 @@ impl<'c> Lowerer<'c> {
 
     /// Statement-context lowering for `jit::record_exact_class(value, cls);`.
     ///
-    /// pyjitpl.py:393-410 `opimpl_record_exact_class`. RPython
-    /// `rlib/jit.py:1181 record_exact_class` is a void hint, so this is
+    /// pyjitpl.py `opimpl_record_exact_class`. RPython
+    /// `rlib/jit.py record_exact_class` is a void hint, so this is
     /// the only emission shape — there is no value-form (the runtime
     /// stub in `jit.rs` returns `()`).
     ///
     /// `value` must be Ref-kind and `cls` must be Int-kind, matching
-    /// `blackhole.py:616 @arguments("r", "i")`.  Non-matching kinds
+    /// `blackhole.py @arguments("r", "i")`.  Non-matching kinds
     /// silently skip per `pyjitpl.py:399 if isinstance(clsbox, Const):` —
     /// dispatch-time `trace_record_exact_class` also gates on
     /// `cls_const.is_constant()`.
@@ -857,7 +857,7 @@ impl<'c> Lowerer<'c> {
     ///
     /// Recognizes: `assert_not_none(x)`, `jit::assert_not_none(x)`.
     ///
-    /// pyjitpl.py:385-391 `opimpl_assert_not_none(box)`. Emits
+    /// pyjitpl.py `opimpl_assert_not_none(box)`. Emits
     /// `BC_ASSERT_NOT_NONE`; trace-time dispatcher routes through
     /// `TraceCtx::trace_assert_not_none` which gates on
     /// `heap_cache.is_nullity_known` + bumps `HEAPCACHED_OPS` on cache
@@ -1081,7 +1081,7 @@ impl<'c> Lowerer<'c> {
                     // See the stmt-form
                     // ElidableInt arm earlier in this file for the
                     // canonical migration rationale and the 3-way
-                    // `_canraise(op)` pick from `call.py:292-299`.
+                    // `_canraise(op)` pick from `call.py`.
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
@@ -1367,7 +1367,7 @@ impl<'c> Lowerer<'c> {
                     let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
                     let __arg_regs: Vec<Register> =
                         arg_bindings.iter().map(Register::from_binding).collect();
-                    // RPython `pyjitpl.py:2255 finish_setup` order: the
+                    // RPython `pyjitpl.py finish_setup` order: the
                     // helper's per-marker `-live-` triples must land in
                     // `asm.all_liveness` before the parent's
                     // `JitDriver::install_canonical_liveness` snapshot.
@@ -1403,7 +1403,7 @@ impl<'c> Lowerer<'c> {
                     result_kind = binding_kind_for_inline_policy(kind).unwrap();
                     // Resolve the callee by name through the host's
                     // `__majit_pipeline_jitcode`, which returns the
-                    // pipeline-built (`make_jitcodes()`, codewriter.py:89)
+                    // pipeline-built (`make_jitcodes()`, codewriter.py)
                     // sub-jitcode shell. Its build-time liveness table is
                     // installed through the host prebuild hook before the
                     // driver snapshots the shared assembler table.
@@ -1446,7 +1446,7 @@ impl<'c> Lowerer<'c> {
                     "inferred helper policy only supports int-return value calls here; use an explicit inline_ref/inline_float or *_ref_wrapped/*_float_wrapped policy",
                 );
                 // RPython `codewriter.py:55` precomputes per-helper
-                // `-live-` triples and `pyjitpl.py:2255 finish_setup`
+                // `-live-` triples and `pyjitpl.py finish_setup`
                 // snapshots `metainterp_sd.liveness_info` after every
                 // helper has had its triples registered.  When the
                 // inferred path's runtime policy resolves to `4u8`
@@ -1524,11 +1524,11 @@ impl<'c> Lowerer<'c> {
                                 #INT_ELIDABLE => {
                                     __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
-                                // call.py:299 _canraise == False — EF_ELIDABLE_CANNOT_RAISE.
+                                // call.py _canraise == False — EF_ELIDABLE_CANNOT_RAISE.
                                 #INT_ELIDABLE_CANNOT_RAISE => {
                                     __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg);
                                 }
-                                // call.py:295 _canraise == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
+                                // call.py _canraise == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
                                 #INT_ELIDABLE_OR_MEMERROR => {
                                     __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
                                 }
@@ -1622,11 +1622,11 @@ impl<'c> Lowerer<'c> {
                                 #INT_ELIDABLE => {
                                     __builder.call_pure_int_canonical_via_target(__fn_idx, #typed_args, #reg);
                                 }
-                                // call.py:299 _canraise == False — EF_ELIDABLE_CANNOT_RAISE.
+                                // call.py _canraise == False — EF_ELIDABLE_CANNOT_RAISE.
                                 #INT_ELIDABLE_CANNOT_RAISE => {
                                     __builder.call_pure_int_canonical_via_target_cannot_raise(__fn_idx, #typed_args, #reg);
                                 }
-                                // call.py:295 _canraise == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
+                                // call.py _canraise == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
                                 #INT_ELIDABLE_OR_MEMERROR => {
                                     __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
                                 }
@@ -1693,7 +1693,7 @@ impl<'c> Lowerer<'c> {
     /// Lower Rust's explicit wrapping integer methods to the same native int
     /// binops as RPython's `int_add` / `int_sub` / `int_mul` special cases.
     ///
-    /// RPython parity: `jtransform.py:2030 _handle_int_special` emits the
+    /// RPython parity: `jtransform.py _handle_int_special` emits the
     /// arithmetic op directly instead of residualizing a helper call. Rust
     /// kernels use method syntax (`x.wrapping_add(y)`) to spell the same
     /// wraparound semantics, so lower that syntax to `IntAdd` / `IntSub` /
@@ -1744,7 +1744,7 @@ impl<'c> Lowerer<'c> {
     ///
     /// Receiver-resolution policy: only the env parameter (`program`) and
     /// the state parameter (`state`) are accepted; any other receiver
-    /// returns `None`. RPython `call.py:282-324 getcalldescr` keys on
+    /// returns `None`. RPython `call.py getcalldescr` keys on
     /// graph identity (no naming collision possible); pyre keys on
     /// canonical path so the `<state_type|env_type>::<method>` lookup
     /// preserves that fidelity. Arbitrary receivers cannot be resolved
@@ -1757,7 +1757,7 @@ impl<'c> Lowerer<'c> {
     /// when needed.
     ///
     /// RPython parity: `jtransform.py:456-470 rewrite_op` (graph-identity
-    /// lookup) + `call.py:282-324 getcalldescr`.
+    /// lookup) + `call.py getcalldescr`.
     fn lower_method_call_value(&mut self, call: &ExprMethodCall) -> Option<Binding> {
         let receiver_ident = match &*call.receiver {
             Expr::Path(ExprPath { path, .. }) => path.get_ident()?,
@@ -2005,7 +2005,7 @@ impl<'c> Lowerer<'c> {
     /// bypassing the call-policy machinery.  The concrete path calls the
     /// original function normally — no observer replay needed (pure op).
     ///
-    /// jtransform.py:2030 `_handle_int_special()` parity.
+    /// jtransform.py `_handle_int_special()` parity.
     fn lower_native_int_binop_call(&mut self, call: &ExprCall) -> Option<Binding> {
         let config = self.config?;
         let func_segments = canonical_expr_segments(&call.func)?;
@@ -2501,7 +2501,7 @@ mod tests {
 
     #[test]
     fn raw_store_intrinsics_lower_with_width_and_sign() {
-        // `jtransform.py:1156-1163 rewrite_op_raw_store` takes the descr from
+        // `jtransform.py rewrite_op_raw_store` takes the descr from
         // the STORED value's own type, so a sub-word store carries its own
         // width and signedness exactly as the load side does.
         let mut lowerer = Lowerer::new(None);

@@ -2,8 +2,8 @@
 //! struct/array field caches.
 //!
 //! RPython parity:
-//! - `rpython/jit/metainterp/optimizeopt/shortpreamble.py:11-49 PreambleOp`
-//! - `rpython/jit/metainterp/optimizeopt/info.py:203 setfield` —
+//! - `rpython/jit/metainterp/optimizeopt/shortpreamble.py PreambleOp`
+//! - `rpython/jit/metainterp/optimizeopt/info.py setfield` —
 //!   `_fields[]` element is either a normal Box or a PreambleOp.
 //!
 //! Pure data; no metainterp deps. Hosted in `majit-ir` so the
@@ -12,10 +12,10 @@
 
 use crate::OpRef;
 
-/// shortpreamble.py:11-49: PreambleOp
+/// shortpreamble.py: PreambleOp
 ///
 /// Wrapper stored in PtrInfo._fields during Phase 2 import.
-/// When `_getfield` (heap.py:177-187) encounters this in a field slot,
+/// When `_getfield` (heap.py) encounters this in a field slot,
 /// it calls `force_op_from_preamble()` to lazily resolve the value
 /// via the short preamble builder.
 ///
@@ -48,19 +48,19 @@ pub struct PreambleOp {
 
 /// RPython _fields[] element — either a concrete value or a PreambleOp sentinel.
 ///
-/// info.py:203 `setfield` stores either a normal Box or a PreambleOp into
-/// `_fields[]`. heap.py:177 `_getfield` checks `isinstance(res, PreambleOp)`
+/// info.py `setfield` stores either a normal Box or a PreambleOp into
+/// `_fields[]`. heap.py `_getfield` checks `isinstance(res, PreambleOp)`
 /// to decide whether to force the value via the short preamble.
 ///
 /// Rust equivalent: typed enum instead of Python's duck-typed list.
 #[derive(Clone, Debug)]
 pub enum FieldEntry {
-    /// Normal cached field value (info.py:203 setfield). Stored as an
+    /// Normal cached field value (info.py setfield). Stored as an
     /// [`Operand`](crate::operand::Operand) so a `Const` ref is GC-walked
     /// through `Operand::walk_const_ptr_refs`, never persisting a Copy
     /// `OpRef::ConstPtr` that a moving collection cannot reach.
     Value(crate::operand::Operand),
-    /// shortpreamble.py:11 PreambleOp — sentinel stored during Phase 2 import.
+    /// shortpreamble.py PreambleOp — sentinel stored during Phase 2 import.
     Preamble(PreambleOp),
 }
 

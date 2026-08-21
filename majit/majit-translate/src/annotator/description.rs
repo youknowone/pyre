@@ -5,9 +5,9 @@
 //! Commit 1 ported the self-contained family structures
 //! (`CallFamily`, `FrozenAttrFamily`, `ClassAttrFamily`,
 //! `NoStandardGraph`). Commit 2 added the `Desc` base class and the
-//! `FunctionDesc` data-shell (description.py:132-406). Commit 3
+//! `FunctionDesc` data-shell (description.py). Commit 3
 //! (this commit) adds `MethodDesc`, `FrozenDesc`, and
-//! `MethodOfFrozenDesc` — description.py:407-637 — completing the
+//! `MethodOfFrozenDesc` — description.py — completing the
 //! description.py port surface. ClassDef references are carried via
 //! opaque [`ClassDefKey`] handles for pointer-identity hashing on
 //! the live `Rc<RefCell<super::classdesc::ClassDef>>` (the
@@ -74,7 +74,7 @@ pub(crate) fn alloc_desc_key() -> DescKey {
     DescKey(NEXT_DESC_KEY.fetch_add(1, Ordering::Relaxed))
 }
 
-/// RPython `class NoStandardGraph(Exception)` (description.py:185-186).
+/// RPython `class NoStandardGraph(Exception)` (description.py).
 ///
 /// "The function doesn't have a single standard non-specialized
 /// graph."
@@ -90,7 +90,7 @@ impl std::fmt::Display for NoStandardGraph {
 impl std::error::Error for NoStandardGraph {}
 
 /// Upstream `calltable_add_row` stores graph values keyed by
-/// `desc.rowkey()` (description.py:67). Once FunctionDesc lands,
+/// `desc.rowkey()` (description.py). Once FunctionDesc lands,
 /// `rowkey()` returns the Desc itself (identity); for now we carry
 /// the identity via [`DescKey`].
 pub type CallTableRow = HashMap<DescKey, Rc<PyGraph>>;
@@ -144,7 +144,7 @@ impl From<String> for GraphCacheKey {
     }
 }
 
-/// RPython `class CallFamily(object)` (description.py:11-59).
+/// RPython `class CallFamily(object)` (description.py).
 ///
 /// "A family of Desc objects that could be called from common call
 /// sites. The call families are conceptually a partition of all
@@ -158,9 +158,9 @@ pub struct CallFamily {
     /// upstream is a Python dict (insertion order); a `HashMap` would
     /// seed the phi-merge union in a run-varying order.
     pub(crate) descs: IndexMap<DescKey, ()>,
-    /// RPython `self.calltables = {}` (description.py:22).
+    /// RPython `self.calltables = {}` (description.py).
     pub(crate) calltables: IndexMap<CallShape, Vec<CallTableRow>>,
-    /// RPython `self.total_calltable_size = 0` (description.py:23).
+    /// RPython `self.total_calltable_size = 0` (description.py).
     pub(crate) total_calltable_size: usize,
     /// RPython `CallFamily.normalized = False` class-level default
     /// (description.py:17).
@@ -171,7 +171,7 @@ pub struct CallFamily {
 }
 
 impl CallFamily {
-    /// RPython `CallFamily.__init__(desc)` (description.py:20-23).
+    /// RPython `CallFamily.__init__(desc)` (description.py).
     pub(crate) fn new(desc: DescKey) -> Self {
         let mut descs = IndexMap::new();
         descs.insert(desc, ());
@@ -184,9 +184,9 @@ impl CallFamily {
         }
     }
 
-    /// RPython `CallFamily.update(other)` (description.py:25-31).
+    /// RPython `CallFamily.update(other)` (description.py).
     ///
-    /// `absorb = update` (description.py:32) is the UnionFind
+    /// `absorb = update` (description.py) is the UnionFind
     /// alias — Rust exposes [`Self::absorb`] as a thin delegator.
     pub fn update(&mut self, other: &CallFamily) {
         self.modified = true;
@@ -202,7 +202,7 @@ impl CallFamily {
         }
     }
 
-    /// RPython `CallFamily.absorb = update` (description.py:32) —
+    /// RPython `CallFamily.absorb = update` (description.py) —
     /// UnionFind API entry point.
     pub fn absorb(&mut self, other: &CallFamily) {
         self.update(other);
@@ -265,7 +265,7 @@ impl UnionFindInfo for Rc<RefCell<CallFamily>> {
     }
 }
 
-/// RPython `class FrozenAttrFamily(object)` (description.py:71-96).
+/// RPython `class FrozenAttrFamily(object)` (description.py).
 #[derive(Debug)]
 pub struct FrozenAttrFamily {
     /// RPython `self.descs = {desc: True}` (description.py:79).
@@ -273,12 +273,12 @@ pub struct FrozenAttrFamily {
     pub(crate) descs: IndexMap<DescKey, ()>,
     /// RPython `self.read_locations = {}` (description.py:80).
     pub(crate) read_locations: IndexMap<super::bookkeeper::PositionKey, ()>,
-    /// RPython `self.attrs = {}` (description.py:81).
+    /// RPython `self.attrs = {}` (description.py).
     pub(crate) attrs: IndexMap<String, SomeValue>,
 }
 
 impl FrozenAttrFamily {
-    /// RPython `FrozenAttrFamily.__init__(desc)` (description.py:78-81).
+    /// RPython `FrozenAttrFamily.__init__(desc)` (description.py).
     pub(crate) fn new(desc: DescKey) -> Self {
         let mut descs = IndexMap::new();
         descs.insert(desc, ());
@@ -289,7 +289,7 @@ impl FrozenAttrFamily {
         }
     }
 
-    /// RPython `FrozenAttrFamily.update(other)` (description.py:83-86).
+    /// RPython `FrozenAttrFamily.update(other)` (description.py).
     pub fn update(&mut self, other: &FrozenAttrFamily) {
         for (k, v) in &other.descs {
             let _: () = *v;
@@ -304,7 +304,7 @@ impl FrozenAttrFamily {
         }
     }
 
-    /// RPython `FrozenAttrFamily.absorb = update` (description.py:87).
+    /// RPython `FrozenAttrFamily.absorb = update` (description.py).
     pub fn absorb(&mut self, other: &FrozenAttrFamily) {
         self.update(other);
     }
@@ -331,7 +331,7 @@ impl UnionFindInfo for Rc<RefCell<FrozenAttrFamily>> {
     }
 }
 
-/// RPython `class ClassAttrFamily(object)` (description.py:99-128).
+/// RPython `class ClassAttrFamily(object)` (description.py).
 ///
 /// "A family of ClassDesc objects that have common 'getattr' sites
 /// for a given attribute name."
@@ -343,7 +343,7 @@ pub struct ClassAttrFamily {
     pub(crate) descs: IndexMap<DescKey, ()>,
     /// RPython `self.read_locations = {}` (description.py:115).
     pub(crate) read_locations: IndexMap<super::bookkeeper::PositionKey, ()>,
-    /// RPython `self.s_value = s_ImpossibleValue` (description.py:116).
+    /// RPython `self.s_value = s_ImpossibleValue` (description.py).
     pub(crate) s_value: SomeValue,
     /// Upstream sets this dynamically in
     /// `rpython.rtyper.normalizecalls.merge_classpbc_getattr_into_classdef`
@@ -352,13 +352,13 @@ pub struct ClassAttrFamily {
     /// port stores it as a real field that defaults to `None` and is
     /// populated by [`crate::translator::rtyper::normalizecalls::
     /// merge_classpbc_getattr_into_classdef`]. Consumed by
-    /// `ClassesPBCRepr.get_access_set` (rpbc.py:946) to look up the
+    /// `ClassesPBCRepr.get_access_set` (rpbc.py) to look up the
     /// `ClassRepr` that hosts the shared vtable slot for `attrname`.
     pub(crate) commonbase: Option<std::rc::Rc<std::cell::RefCell<super::classdesc::ClassDef>>>,
 }
 
 impl ClassAttrFamily {
-    /// RPython `ClassAttrFamily.__init__(desc)` (description.py:113-116).
+    /// RPython `ClassAttrFamily.__init__(desc)` (description.py).
     pub(crate) fn new(desc: DescKey) -> Self {
         let mut descs = IndexMap::new();
         descs.insert(desc, ());
@@ -370,7 +370,7 @@ impl ClassAttrFamily {
         }
     }
 
-    /// RPython `ClassAttrFamily.update(other)` (description.py:118-121).
+    /// RPython `ClassAttrFamily.update(other)` (description.py).
     ///
     /// Returns `Result<(), UnionError>` because the attribute `union`
     /// can fail (`UnionError` bubbles out of any pair-union branch).
@@ -387,7 +387,7 @@ impl ClassAttrFamily {
         Ok(())
     }
 
-    /// RPython `ClassAttrFamily.absorb = update` (description.py:122).
+    /// RPython `ClassAttrFamily.absorb = update` (description.py).
     pub fn absorb(&mut self, other: &ClassAttrFamily) -> Result<(), super::model::UnionError> {
         self.update(other)
     }
@@ -410,7 +410,7 @@ impl ClassAttrFamily {
 
 impl UnionFindInfo for Rc<RefCell<ClassAttrFamily>> {
     fn absorb(&mut self, other: Self) {
-        // `absorb = update` (description.py:122). `update` propagates a
+        // `absorb = update` (description.py). `update` propagates a
         // `UnionError`; `UnionFindInfo` has no Result channel, so we
         // swallow here — the error surfaces at the next
         // `get_s_value` / set_s_value consumer if the value becomes
@@ -420,10 +420,10 @@ impl UnionFindInfo for Rc<RefCell<ClassAttrFamily>> {
 }
 
 // ---------------------------------------------------------------------------
-// Desc + FunctionDesc (description.py:132-406).
+// Desc + FunctionDesc (description.py).
 // ---------------------------------------------------------------------------
 
-/// RPython `class Desc(object)` (description.py:132-182).
+/// RPython `class Desc(object)` (description.py).
 ///
 /// Base class for every "description" the bookkeeper interns. Rust has
 /// no single inheritance, so the subclass-specific state lives on
@@ -458,7 +458,7 @@ impl Desc {
         }
     }
 
-    /// RPython `Desc.querycallfamily()` (description.py:146-153).
+    /// RPython `Desc.querycallfamily()` (description.py).
     ///
     pub fn querycallfamily(&self) -> Option<Rc<RefCell<CallFamily>>> {
         self.bookkeeper
@@ -468,7 +468,7 @@ impl Desc {
             .cloned()
     }
 
-    /// RPython `Desc.getcallfamily()` (description.py:155-159).
+    /// RPython `Desc.getcallfamily()` (description.py).
     ///
     pub fn getcallfamily(&self) -> Result<Rc<RefCell<CallFamily>>, AnnotatorError> {
         let mut families = self.bookkeeper.pbc_maximal_call_families.borrow_mut();
@@ -479,7 +479,7 @@ impl Desc {
             .expect("UnionFind.find_rep() must materialize a CallFamily"))
     }
 
-    /// RPython `Desc.mergecallfamilies(*others)` (description.py:161-170).
+    /// RPython `Desc.mergecallfamilies(*others)` (description.py).
     ///
     pub fn mergecallfamilies(&self, others: &[&Desc]) -> Result<bool, AnnotatorError> {
         if others.is_empty() {
@@ -496,7 +496,7 @@ impl Desc {
         Ok(changed)
     }
 
-    /// RPython `Desc.queryattrfamily()` (description.py:172-175).
+    /// RPython `Desc.queryattrfamily()` (description.py).
     ///
     /// Base implementation returns `None` — upstream overrides on
     /// [`FrozenDesc`] / `ClassDesc` (commits 3+).
@@ -506,7 +506,7 @@ impl Desc {
 }
 
 /// RPython `Desc.simplify_desc_set(descs)` — `@staticmethod` base
-/// (description.py:180-182). No-op; only [`MethodDesc::simplify_desc_set`]
+/// (description.py). No-op; only [`MethodDesc::simplify_desc_set`]
 /// overrides it. Dispatched polymorphically from
 /// [`super::model::SomePBC::simplify`].
 pub(crate) fn simplify_desc_set_default(
@@ -537,8 +537,8 @@ pub(crate) fn simplify_desc_set_default(
 ///   `bookkeeper.descs.insert(pyobj, entry)`
 #[derive(Clone, Debug)]
 pub enum DescEntry {
-    /// upstream `FunctionDesc` (description.py:190-393) and its subclass
-    /// `MemoDesc` (description.py:395-404), unified into one variant.
+    /// upstream `FunctionDesc` (description.py) and its subclass
+    /// `MemoDesc` (description.py), unified into one variant.
     ///
     /// `isinstance(desc, FunctionDesc)` is true for both, so the two
     /// must never diverge at a use site. Folding them behind the opaque
@@ -548,13 +548,13 @@ pub enum DescEntry {
     /// function and silently skip a memo one. `getKind` keeps them
     /// distinct via [`FuncDescEntry::is_memo`] (model.py:560-566).
     Func(FuncDescEntry),
-    /// upstream `MethodDesc` — description.py:407-519.
+    /// upstream `MethodDesc` — description.py.
     Method(Rc<RefCell<MethodDesc>>),
-    /// upstream `FrozenDesc` — description.py:528-599.
+    /// upstream `FrozenDesc` — description.py.
     Frozen(Rc<RefCell<FrozenDesc>>),
-    /// upstream `MethodOfFrozenDesc` — description.py:601-637.
+    /// upstream `MethodOfFrozenDesc` — description.py.
     MethodOfFrozen(Rc<RefCell<MethodOfFrozenDesc>>),
-    /// upstream `ClassDesc` — classdesc.py:488-918. The full
+    /// upstream `ClassDesc` — classdesc.py. The full
     /// `__init__` body is ported at [`super::classdesc::ClassDesc::new`];
     /// [`super::classdesc::ClassDesc::new_shell`] is the test-only
     /// shell that skips mixin resolution and `add_source_attribute`.
@@ -564,7 +564,7 @@ pub enum DescEntry {
 /// The `FunctionDesc`-or-`MemoDesc` payload of [`DescEntry::Func`].
 ///
 /// `MemoDesc(FunctionDesc)` is a one-method-override subclass upstream
-/// (only `pycall` differs; description.py:395-404), and
+/// (only `pycall` differs; description.py), and
 /// `isinstance(desc, FunctionDesc)` is true for it. Modelling the pair
 /// as one value with a private `inner` means the wrapped `FunctionDesc`
 /// is reachable only through [`func`](Self::func), which yields the
@@ -576,7 +576,7 @@ pub enum DescEntry {
 /// Encoding rationale — why one opaque variant, not two, a trait object,
 /// or a memo flag on FunctionDesc. RPython tests the desc class two
 /// different ways and the encoding must satisfy both:
-///   * `getKind` keys on the exact `desc.__class__` (model.py:563) and
+///   * `getKind` keys on the exact `desc.__class__` (model.py) and
 ///     raises "mixing several kinds of PBCs" on a heterogeneous set
 ///     (model.py:564-565). MemoDesc must therefore stay a *distinct*
 ///     kind: a memo flag on FunctionDesc would make a Function+Memo PBC
@@ -604,7 +604,7 @@ pub struct FuncDescEntry {
 enum FuncDescInner {
     /// a `FunctionDesc` whose specializer is not `memo`.
     Plain(Rc<RefCell<FunctionDesc>>),
-    /// a `MemoDesc` (description.py:395) wrapping its base `FunctionDesc`.
+    /// a `MemoDesc` (description.py) wrapping its base `FunctionDesc`.
     Memo(Rc<RefCell<MemoDesc>>),
 }
 
@@ -618,7 +618,7 @@ impl FuncDescEntry {
 
     /// Wrap a `MemoDesc`.
     ///
-    /// Upstream `MemoDesc(FunctionDesc)` (description.py:395) is one
+    /// Upstream `MemoDesc(FunctionDesc)` (description.py) is one
     /// object with one identity. The Rust port decomposes it into this
     /// wrapper plus a *private* inner base `FunctionDesc` (minted only
     /// inside `newfuncdesc` and never registered on its own).  Both
@@ -636,7 +636,7 @@ impl FuncDescEntry {
 
     /// The underlying `FunctionDesc` — the `isinstance(desc,
     /// FunctionDesc)` view. For a `MemoDesc` this is its wrapped base
-    /// (description.py:395 `MemoDesc(FunctionDesc)`).
+    /// (description.py `MemoDesc(FunctionDesc)`).
     pub(crate) fn func(&self) -> Rc<RefCell<FunctionDesc>> {
         match &self.inner {
             FuncDescInner::Plain(rc) => rc.clone(),
@@ -732,7 +732,7 @@ impl DescEntry {
 
     /// RPython `type(desc)` classifier — maps enum variants back to
     /// the [`super::model::DescKind`] used by
-    /// [`super::model::SomePBC::getKind`] (model.py:560-566).
+    /// [`super::model::SomePBC::getKind`] (model.py).
     pub(crate) fn kind(&self) -> super::model::DescKind {
         match self {
             // upstream `getKind` keys on `desc.__class__`: a MemoDesc is
@@ -749,7 +749,7 @@ impl DescEntry {
         }
     }
 
-    /// RPython `Desc.bind_under(classdef, name)` (description.py:177-178,
+    /// RPython `Desc.bind_under(classdef, name)` (description.py,
     /// 350-355, 447-449).
     ///
     /// Default: return self (Desc.bind_under on Frozen/Class/MethodOfFrozen).
@@ -778,11 +778,11 @@ impl DescEntry {
     /// upstream polymorphism where `FrozenDesc` / `ClassDesc` define
     /// the method and the remaining subclasses leave it absent
     /// (upstream raises `AttributeError` at the Python level when
-    /// reached). `pbc_getattr` (bookkeeper.py:465, 475) consumes the
+    /// reached). `pbc_getattr` (bookkeeper.py, 475) consumes the
     /// result directly so the contract here is:
     ///
-    /// * `Frozen(fd)` → [`FrozenDesc::s_read_attribute`] (description.py:560-566)
-    /// * `Class(cd)` → [`super::classdesc::ClassDesc::s_read_attribute`] (classdesc.py:775-782)
+    /// * `Frozen(fd)` → [`FrozenDesc::s_read_attribute`] (description.py)
+    /// * `Class(cd)` → [`super::classdesc::ClassDesc::s_read_attribute`] (classdesc.py)
     /// * Function / Method / MethodOfFrozen → `AnnotatorError` matching
     ///   upstream's "no s_read_attribute on this Desc" AttributeError.
     pub(crate) fn s_read_attribute(
@@ -826,8 +826,8 @@ impl DescEntry {
     }
 
     /// RPython `desc.create_new_attribute(name, value)` polymorphism as
-    /// used by `MemoTable.finish` (specialize.py:219). Both `FrozenDesc`
-    /// (description.py:568) and `ClassDesc` (classdesc.py:804) define it;
+    /// used by `MemoTable.finish` (specialize.py). Both `FrozenDesc`
+    /// (description.py:568) and `ClassDesc` (classdesc.py) define it;
     /// every other desc kind raising at the Python level is surfaced as
     /// an [`AnnotatorError`] (a memo argument set must be frozen PBCs or
     /// classes).
@@ -891,7 +891,7 @@ impl DescEntry {
     }
 
     /// Upstream `desc.get_graph(args, op)` polymorphic dispatch used by
-    /// `build_calltable_row` (description.py:62-68).
+    /// `build_calltable_row` (description.py).
     pub(crate) fn get_graph(
         &self,
         args: &ArgumentsForTranslation,
@@ -909,7 +909,7 @@ impl DescEntry {
     }
 
     /// Upstream `desc.rowkey()` polymorphic dispatch used by
-    /// `build_calltable_row` (description.py:66-67).
+    /// `build_calltable_row` (description.py).
     pub(crate) fn rowkey(&self) -> Result<DescKey, AnnotatorError> {
         match self {
             // rowkey is a FunctionDesc-level key by design: upstream
@@ -944,14 +944,14 @@ impl PartialEq for DescEntry {
 
 impl Eq for DescEntry {}
 
-/// RPython `class FunctionDesc(Desc)` (description.py:190-393).
+/// RPython `class FunctionDesc(Desc)` (description.py).
 ///
 /// "The 'FunctionDesc' wraps a Python function or method." Fields
 /// match upstream line-by-line. Graph-building / specialization /
 /// pycall paths are wired to `RPythonAnnotator.recursivecall`.
 #[derive(Debug)]
 pub struct FunctionDesc {
-    /// Embedded base-class state (description.py:195 `super().__init__`).
+    /// Embedded base-class state (description.py `super().__init__`).
     pub base: Desc,
     /// RPython `self.name` (description.py:196).
     pub name: String,
@@ -995,7 +995,7 @@ pub struct FunctionDesc {
     /// vector of [`ParamType`] is consumed by
     /// [`super::signature::enforce_signature_args`].
     pub(crate) annsignature: Option<Rc<AnnSignature>>,
-    /// Upstream `self.pyobj._annenforceargs_` (description.py:314-324).
+    /// Upstream `self.pyobj._annenforceargs_` (description.py).
     /// Carried directly on FunctionDesc for the same reason as
     /// [`Self::annsignature`]. `Some(sig)` means an `@enforceargs(...)`
     /// decoration was applied and `normalize_args` should invoke it.
@@ -1021,7 +1021,7 @@ impl std::fmt::Debug for AnnSignature {
     }
 }
 
-/// RPython `build_calltable_row(descs, args, op)` (description.py:62-68).
+/// RPython `build_calltable_row(descs, args, op)` (description.py).
 pub fn build_calltable_row(
     descs: &[DescEntry],
     args: &ArgumentsForTranslation,
@@ -1060,7 +1060,7 @@ impl FunctionDesc {
         }
     }
 
-    /// RPython `FunctionDesc.getgraphs()` (description.py:215-216).
+    /// RPython `FunctionDesc.getgraphs()` (description.py).
     pub fn getgraphs(&self) -> Vec<Rc<PyGraph>> {
         self.cache.borrow().values().cloned().collect()
     }
@@ -1076,7 +1076,7 @@ impl FunctionDesc {
         self.pyre_lift_error.borrow().clone()
     }
 
-    /// RPython `FunctionDesc.rowkey()` (description.py:365-366).
+    /// RPython `FunctionDesc.rowkey()` (description.py).
     /// Returns self's identity — upstream `return self`.
     pub(crate) fn rowkey(self_rc: &Rc<RefCell<FunctionDesc>>) -> DescKey {
         self_rc.borrow().base.identity
@@ -1236,7 +1236,7 @@ impl FunctionDesc {
         if let Some(existing) = self.cache.borrow().get(&key) {
             // Append the lifted callee graph to `translator.graphs`,
             // mirroring `buildflowgraph`'s build-time append
-            // (translator.py:61 `self.graphs.append(graph)`). This is NOT
+            // (translator.py `self.graphs.append(graph)`). This is NOT
             // a second append site: the MISS path below routes through
             // `buildgraph` -> `buildflowgraph` (in `description.rs` /
             // `translator.rs`), which already appends exactly like
@@ -1332,7 +1332,7 @@ impl FunctionDesc {
         args: &ArgumentsForTranslation,
         graph: Option<&PyGraph>,
     ) -> Result<Vec<Option<SomeValue>>, AnnotatorError> {
-        // upstream description.py:256-264 — `if defaults:` walks each
+        // upstream description.py — `if defaults:` walks each
         // Python value through `self.bookkeeper.immutablevalue(x)` at
         // parse time. `graph_defaults` overrides `self.defaults` when
         // the specializer built a `PyGraph` whose `__defaults__` tuple
@@ -1471,7 +1471,7 @@ impl FunctionDesc {
         Ok(pygraph)
     }
 
-    /// RPython `FunctionDesc.getuniquegraph()` (description.py:218-226).
+    /// RPython `FunctionDesc.getuniquegraph()` (description.py).
     ///
     /// Three checks, in order:
     ///   1. `len(self._cache) != 1` → `NoStandardGraph`.
@@ -1519,7 +1519,7 @@ impl FunctionDesc {
         Ok(graph.clone())
     }
 
-    /// RPython `getuniquenondirectgraph(desc)` (specialize.py:91-99).
+    /// RPython `getuniquenondirectgraph(desc)` (specialize.py).
     ///
     /// Returns the only cached graph whose specialization key is not
     /// `(AccessDirect, key)`.
@@ -1597,7 +1597,7 @@ impl FunctionDesc {
             )));
         }
         // upstream: `s_tuple = args_s[-1]; assert isinstance(s_tuple, SomeTuple)`.
-        // `specialize.py:18` reads `args_s[-1]` directly; an unbound
+        // `specialize.py` reads `args_s[-1]` directly; an unbound
         // (None) cell would raise AttributeError on `isinstance`.
         // Pyre's `.expect()` on the trailing *arg slot mirrors that
         // fail-loud surface.
@@ -1831,7 +1831,7 @@ impl FunctionDesc {
                     "specialize:arglistitemtype expects integer indices, got {parms:?}"
                 ))
             })?;
-        // `specialize.py:360 specialize_arglistitemtype` reads
+        // `specialize.py specialize_arglistitemtype` reads
         // `args_s[i].knowntype` directly — if the slot is None,
         // Python raises `AttributeError: 'NoneType' object has no
         // attribute 'knowntype'`.  Mirror the fail-loud rather than
@@ -1961,8 +1961,8 @@ impl FunctionDesc {
     }
 
     /// Whether this function's specializer is `memo`
-    /// (specialize.py:275) — the `if specializer is memo` discriminant
-    /// `newfuncdesc` (bookkeeper.py:419-425) uses to mint a `MemoDesc`
+    /// (specialize.py) — the `if specializer is memo` discriminant
+    /// `newfuncdesc` (bookkeeper.py) uses to mint a `MemoDesc`
     /// rather than a plain `FunctionDesc`.
     pub fn is_memo(&self) -> bool {
         matches!(self.specializer.as_ref(), Some(Specializer::Memo))
@@ -1982,12 +1982,12 @@ impl FunctionDesc {
         op_key: Option<PositionKey>,
     ) -> Result<SpecializeResult, AnnotatorError> {
         let op_key = op_key.or_else(|| self.base.bookkeeper.current_position_key());
-        // upstream description.py:277 — `self.normalize_args(inputcells)`.
+        // upstream description.py — `self.normalize_args(inputcells)`.
         // The Option layer is preserved into the specializer; only the
         // enforceargs / signature paths inside `normalize_args` need
         // concrete cells, and they materialise their own buffer there.
         self.normalize_args(inputcells)?;
-        // upstream specialize.py:275 — `memo` returns either the family's
+        // upstream specialize.py — `memo` returns either the family's
         // dispatch FunctionGraph (once `finish` builds it) or an
         // annotation; it is already a `SpecializeResult`, so it bypasses
         // the graph-producing dispatch below. `MemoDesc::pycall` handles
@@ -2264,7 +2264,7 @@ impl FunctionDesc {
             .map_err(|e| AnnotatorError::new(format!("MemoDesc.pycall unionof: {}", e)))
     }
 
-    /// RPython `FunctionDesc.get_graph(args, op)` (description.py:328-330).
+    /// RPython `FunctionDesc.get_graph(args, op)` (description.py).
     pub(crate) fn get_graph(
         &self,
         args: &ArgumentsForTranslation,
@@ -2479,7 +2479,7 @@ impl FunctionDesc {
     }
 }
 
-/// RPython `class MemoDesc(FunctionDesc)` (description.py:395-404).
+/// RPython `class MemoDesc(FunctionDesc)` (description.py).
 ///
 /// Overrides `pycall` to project the specialized graph's return
 /// annotation directly instead of driving a fresh `recursivecall`.
@@ -2537,7 +2537,7 @@ impl MemoDesc {
 }
 
 // ---------------------------------------------------------------------------
-// MethodDesc + FrozenDesc + MethodOfFrozenDesc (description.py:407-637).
+// MethodDesc + FrozenDesc + MethodOfFrozenDesc (description.py).
 // ---------------------------------------------------------------------------
 
 /// Opaque handle for `ClassDef` references used by
@@ -2560,7 +2560,7 @@ impl ClassDefKey {
     }
 }
 
-/// RPython `class MethodDesc(Desc)` (description.py:407-519).
+/// RPython `class MethodDesc(Desc)` (description.py).
 #[derive(Debug)]
 pub struct MethodDesc {
     pub base: Desc,
@@ -2579,7 +2579,7 @@ pub struct MethodDesc {
     pub(crate) selfclassdef: Option<ClassDefKey>,
     /// RPython `self.name` (description.py:416).
     pub name: String,
-    /// RPython `self.flags = flags` (description.py:417) — upstream
+    /// RPython `self.flags = flags` (description.py) — upstream
     /// default is `{}`; Rust mirrors with an empty BTreeMap for
     /// stable iteration order.
     pub flags: std::collections::BTreeMap<String, bool>,
@@ -2607,12 +2607,12 @@ impl MethodDesc {
         }
     }
 
-    /// RPython `MethodDesc.getuniquegraph()` (description.py:429-430).
+    /// RPython `MethodDesc.getuniquegraph()` (description.py).
     pub fn getuniquegraph(&self) -> Result<Rc<PyGraph>, AnnotatorError> {
         self.funcdesc.func().borrow().getuniquegraph()
     }
 
-    /// RPython `MethodDesc.func_args(args)` (description.py:432-437).
+    /// RPython `MethodDesc.func_args(args)` (description.py).
     ///
     /// ```python
     /// def func_args(self, args):
@@ -2682,7 +2682,7 @@ impl MethodDesc {
             .pycall(whence, &func_args, s_previous_result, op_key)
     }
 
-    /// RPython `MethodDesc.get_graph(args, op)` (description.py:443-445).
+    /// RPython `MethodDesc.get_graph(args, op)` (description.py).
     pub(crate) fn get_graph(
         &self,
         args: &ArgumentsForTranslation,
@@ -2692,7 +2692,7 @@ impl MethodDesc {
         self.funcdesc.func().borrow().get_graph(&func_args, op_key)
     }
 
-    /// RPython `MethodDesc.bind_under(classdef, name)` (description.py:447-449).
+    /// RPython `MethodDesc.bind_under(classdef, name)` (description.py).
     ///
     /// ```python
     /// def bind_under(self, classdef, name):
@@ -2727,7 +2727,7 @@ impl MethodDesc {
         ))
     }
 
-    /// RPython `MethodDesc.rowkey()` (description.py:467-471).
+    /// RPython `MethodDesc.rowkey()` (description.py).
     ///
     /// "we are computing call families and call tables that always
     /// contain FunctionDescs, not MethodDescs. The present method
@@ -2793,7 +2793,7 @@ impl MethodDesc {
         Ok(())
     }
 
-    /// RPython `MethodDesc.simplify_desc_set(descs)` (description.py:473-519).
+    /// RPython `MethodDesc.simplify_desc_set(descs)` (description.py).
     pub(crate) fn simplify_desc_set(descs: &mut std::collections::BTreeMap<DescKey, DescEntry>) {
         let mut lst: Vec<Rc<RefCell<MethodDesc>>> = descs
             .values()
@@ -2895,7 +2895,7 @@ impl MethodDesc {
     }
 }
 
-/// RPython helper `new_or_old_class(c)` (description.py:522-526).
+/// RPython helper `new_or_old_class(c)` (description.py).
 ///
 /// Upstream returns `c.__class__` when available, and `type(c)`
 /// otherwise. The HostObject carrier exposes the same query via
@@ -2907,7 +2907,7 @@ pub fn new_or_old_class(pyobj: &HostObject) -> Option<HostObject> {
 }
 
 /// RPython `read_attribute` callback type for [`FrozenDesc`]
-/// (description.py:532 `lambda attr: getattr(pyobj, attr)`). Returns
+/// (description.py `lambda attr: getattr(pyobj, attr)`). Returns
 /// `Ok(value)` for a present attribute, `Err(HostGetAttrError::Missing)`
 /// for upstream's `AttributeError`, and
 /// `Err(HostGetAttrError::Unsupported)` for every other host-side
@@ -2919,12 +2919,12 @@ pub fn new_or_old_class(pyobj: &HostObject) -> Option<HostObject> {
 pub(crate) type FrozenReadAttr =
     Box<dyn Fn(&str) -> Result<ConstValue, crate::flowspace::model::HostGetAttrError>>;
 
-/// RPython `class FrozenDesc(Desc)` (description.py:528-599).
+/// RPython `class FrozenDesc(Desc)` (description.py).
 pub struct FrozenDesc {
     pub base: Desc,
-    /// RPython `self.attrcache = {}` (description.py:535).
+    /// RPython `self.attrcache = {}` (description.py).
     pub attrcache: RefCell<HashMap<String, ConstValue>>,
-    /// RPython `self.knowntype = new_or_old_class(pyobj)` (description.py:536).
+    /// RPython `self.knowntype = new_or_old_class(pyobj)` (description.py).
     pub knowntype: Option<HostObject>,
     /// RPython `self._read_attribute` (description.py:533-534) — the
     /// caller-supplied attribute-source closure, or the
@@ -2947,7 +2947,7 @@ impl std::fmt::Debug for FrozenDesc {
 
 impl FrozenDesc {
     /// RPython `FrozenDesc.__init__(bookkeeper, pyobj,
-    /// read_attribute=None)` (description.py:530-537).
+    /// read_attribute=None)` (description.py).
     ///
     /// With `read_attribute = None`, upstream installs the default
     /// `lambda attr: getattr(pyobj, attr)`. The Rust port supplies
@@ -2979,7 +2979,7 @@ impl FrozenDesc {
     }
 
     /// Default `read_attribute` closure — Rust equivalent of upstream
-    /// `lambda attr: getattr(pyobj, attr)` (description.py:534).
+    /// `lambda attr: getattr(pyobj, attr)` (description.py).
     ///
     /// The Rust port routes through [`crate::flowspace::model::host_getattr`].
     /// Upstream's lambda raises `AttributeError` when the name is
@@ -2991,7 +2991,7 @@ impl FrozenDesc {
         Box::new(move |attr: &str| host_getattr(&pyobj, attr))
     }
 
-    /// RPython `FrozenDesc.has_attribute(attr)` (description.py:539-546).
+    /// RPython `FrozenDesc.has_attribute(attr)` (description.py).
     ///
     /// Upstream wraps `self._read_attribute(attr)` in
     /// `try: ... except AttributeError: return False`; every other
@@ -3013,7 +3013,7 @@ impl FrozenDesc {
         }
     }
 
-    /// RPython `FrozenDesc.warn_missing_attribute(attr)` (description.py:548-551).
+    /// RPython `FrozenDesc.warn_missing_attribute(attr)` (description.py).
     pub fn warn_missing_attribute(&self, attr: &str) -> Result<bool, AnnotatorError> {
         Ok(!self.has_attribute(attr)? && !attr.starts_with('$'))
     }
@@ -3023,7 +3023,7 @@ impl FrozenDesc {
     /// `AttributeError`; `Err(Unsupported)` means a non-AttributeError
     /// host failure the caller must surface. When the caller supplied
     /// a custom callback, this dispatches to it, matching
-    /// `FrozenDesc._read_attribute(attr)` in description.py:543 /
+    /// `FrozenDesc._read_attribute(attr)` in description.py /
     /// 557 / 570.
     fn read_attribute_raw(
         &self,
@@ -3032,7 +3032,7 @@ impl FrozenDesc {
         (self._read_attribute)(attr)
     }
 
-    /// RPython `FrozenDesc.read_attribute(attr)` (description.py:553-558).
+    /// RPython `FrozenDesc.read_attribute(attr)` (description.py).
     ///
     /// Upstream `read_attribute` propagates `AttributeError` (caller's
     /// `s_read_attribute` then re-catches into `s_ImpossibleValue`)
@@ -3061,7 +3061,7 @@ impl FrozenDesc {
         }
     }
 
-    /// RPython `FrozenDesc.s_read_attribute(attr)` (description.py:560-566).
+    /// RPython `FrozenDesc.s_read_attribute(attr)` (description.py).
     ///
     /// Upstream catches only `AttributeError`; other exceptions
     /// escape. The Rust port mirrors that split: `Missing` collapses
@@ -3114,7 +3114,7 @@ impl FrozenDesc {
             .expect("UnionFind.find_rep() must materialize a FrozenAttrFamily"))
     }
 
-    /// RPython `FrozenDesc.queryattrfamily(attrname=None)` (description.py:583-590).
+    /// RPython `FrozenDesc.queryattrfamily(attrname=None)` (description.py).
     pub fn queryattrfamily(&self) -> Option<Rc<RefCell<FrozenAttrFamily>>> {
         self.base
             .bookkeeper
@@ -3142,7 +3142,7 @@ impl FrozenDesc {
     }
 }
 
-/// RPython `class MethodOfFrozenDesc(Desc)` (description.py:602-637).
+/// RPython `class MethodOfFrozenDesc(Desc)` (description.py).
 #[derive(Debug)]
 pub struct MethodOfFrozenDesc {
     pub base: Desc,
@@ -3168,7 +3168,7 @@ impl MethodOfFrozenDesc {
         }
     }
 
-    /// RPython `MethodOfFrozenDesc.func_args(args)` (description.py:614-617):
+    /// RPython `MethodOfFrozenDesc.func_args(args)` (description.py):
     ///
     /// ```python
     /// def func_args(self, args):
@@ -3213,7 +3213,7 @@ impl MethodOfFrozenDesc {
             .pycall(whence, &func_args, s_previous_result, op_key)
     }
 
-    /// RPython `MethodOfFrozenDesc.get_graph(args, op)` (description.py:623-625).
+    /// RPython `MethodOfFrozenDesc.get_graph(args, op)` (description.py).
     pub(crate) fn get_graph(
         &self,
         args: &ArgumentsForTranslation,
@@ -3223,7 +3223,7 @@ impl MethodOfFrozenDesc {
         self.funcdesc.func().borrow().get_graph(&func_args, op_key)
     }
 
-    /// RPython `MethodOfFrozenDesc.rowkey()` (description.py:636-637).
+    /// RPython `MethodOfFrozenDesc.rowkey()` (description.py).
     pub(crate) fn rowkey(&self) -> DescKey {
         self.funcdesc.func().borrow().base.identity
     }
@@ -3393,7 +3393,7 @@ mod tests {
     }
 
     /// `ClassAttrFamily.commonbase` defaults to `None` until populated
-    /// by `merge_classpbc_getattr_into_classdef` (normalizecalls.py:232).
+    /// by `merge_classpbc_getattr_into_classdef` (normalizecalls.py).
     /// `update`/`absorb` propagate descs / s_value but never touch
     /// `commonbase` — upstream attaches it post-hoc on the live family
     /// instance rather than during merging.
@@ -3654,7 +3654,7 @@ mod tests {
     /// [`DescEntry::Memo`] (upstream `newfuncdesc` `if specializer is
     /// memo`), and its `pycall` projects the union-of-results annotation
     /// — the path a plain `FunctionDesc::pycall` would break on with
-    /// `expect_graph()` (specialize.py:275-312, description.py:395-404).
+    /// `expect_graph()` (specialize.py:275-312, description.py).
     #[test]
     fn getdesc_routes_memo_function_to_memodesc_pycall() {
         use crate::flowspace::model::HostCall;
@@ -4306,7 +4306,7 @@ mod tests {
     }
 
     /// Upstream a `MemoDesc` *is* a `FunctionDesc`: `rowkey()` returns
-    /// `self` (description.py:365) and `getcallfamily()` keys on it. The
+    /// `self` (description.py) and `getcallfamily()` keys on it. The
     /// Rust wrapper slaves the inner base's `identity` to the MemoDesc
     /// (`FuncDescEntry::memo`), so the rowkey / call-family key
     /// (`base.identity`) coincides with the wrapper identity
@@ -4804,7 +4804,7 @@ mod tests {
     fn method_consider_call_site_partitions_by_funcdesc_rowkey() {
         // Two MethodDescs sharing one funcdesc but bound to different
         // classdefs must land in the SAME call-family partition — keyed
-        // by the funcdesc rowkey (description.py:467-471), not by each
+        // by the funcdesc rowkey (description.py), not by each
         // methoddesc's own identity. consider_call_site routes through
         // the funcdesc's call family, so the funcdesc family carries the
         // calltable rows from both sites; per-methoddesc keying would

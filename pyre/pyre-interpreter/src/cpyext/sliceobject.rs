@@ -6,7 +6,7 @@ use pyre_object::PyObjectRef;
 use std::ffi::c_int;
 
 /// `slice(low, high)` — the object the sequence-slice entry points hand to
-/// `getitem`, as `space.getslice` does (`baseobjspace.py:1601-1603`).
+/// `getitem`, as `space.getslice` does (`baseobjspace.py`).
 ///
 /// The two bounds are held on the Rust stack across each other's allocation,
 /// which is what `w_int_new`'s stable (old-gen) allocator exists to allow
@@ -61,7 +61,7 @@ fn out_parameters(pointers: &[*mut isize]) -> bool {
     true
 }
 
-/// `PySlice_New(start, stop, step)` (`sliceobject.py:52-65`).
+/// `PySlice_New(start, stop, step)` (`sliceobject.py`).
 ///
 /// # Safety
 /// Each argument must be null or a live reference.
@@ -113,7 +113,7 @@ pub unsafe extern "C" fn PySlice_Unpack(
 
 /// `PySlice_AdjustIndices(length, *start, *stop, step)` — clamp an unpacked
 /// triple against `length` and answer the slice length
-/// (`sliceobject.py:139` `adjust_indices`).
+/// (`sliceobject.py` `adjust_indices`).
 ///
 /// Upstream cannot fail; -1 here is the NULL-out-parameter rejection, which is
 /// otherwise a store through a null pointer.

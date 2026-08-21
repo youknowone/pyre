@@ -1,7 +1,7 @@
 //! Pickle reduce protocol for `object` — PyPy: `pypy/objspace/std/objectobject.py`.
 //!
 //! The app-level helpers `reduce_1` / `reduce_2` / `get_slotvalues` /
-//! `slotnames` (objectobject.py:23-84) are bundled in
+//! `slotnames` (objectobject.py) are bundled in
 //! `reduce_protocol_app.py` and resolved lazily through
 //! `appleveldef_install` into a rooted GC module dict.  The three
 //! handles the interp-level code calls (`reduce_1`, `reduce_2`,
@@ -97,12 +97,12 @@ fn typename(w_obj: PyObjectRef) -> String {
     }
 }
 
-/// objectobject.py:53 `get_slotvalues(obj)` — app-level handle.
+/// objectobject.py `get_slotvalues(obj)` — app-level handle.
 pub fn get_slotvalues(w_obj: PyObjectRef) -> PyResult {
     crate::call::call_function_impl_result(handle(GET_SLOTVALUES), &[w_obj])
 }
 
-/// objectobject.py:245 `object_getstate_default(space, w_obj, required)`.
+/// objectobject.py `object_getstate_default(space, w_obj, required)`.
 ///
 /// `required` is always 0 from both callers (`descr__getstate__` and the
 /// proto>=2 path), so the variable-sized raise is unreachable and pyre
@@ -162,7 +162,7 @@ pub fn object_getstate_default(w_obj: PyObjectRef) -> PyResult {
     Ok(pyre_object::w_tuple_new(vec![w_ret, w_slots]))
 }
 
-/// objectobject.py:201 `_getnewargs(space, w_obj)` — returns
+/// objectobject.py `_getnewargs(space, w_obj)` — returns
 /// `(hasargs, w_args, w_kwargs)`.
 pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef), PyError> {
     // `__getnewargs_ex__`/`__getnewargs__` run arbitrary Python and the
@@ -240,7 +240,7 @@ pub fn getnewargs(w_obj: PyObjectRef) -> Result<(bool, PyObjectRef, PyObjectRef)
     Ok((hasargs, w_args, w_kwargs))
 }
 
-/// objectobject.py:240 `descr__reduce__(space, w_obj)` — `reduce_1(obj, 0)`.
+/// objectobject.py `descr__reduce__(space, w_obj)` — `reduce_1(obj, 0)`.
 pub fn descr_reduce(w_obj: PyObjectRef) -> PyResult {
     reduce_1(w_obj, 0)
 }
@@ -279,7 +279,7 @@ pub fn set_reduce(w_obj: PyObjectRef) -> PyResult {
     ]))
 }
 
-/// objectobject.py:23 `reduce_1(obj, proto)` — app-level handle.
+/// objectobject.py `reduce_1(obj, proto)` — app-level handle.
 fn reduce_1(w_obj: PyObjectRef, proto: i64) -> PyResult {
     // Boxing `proto` allocates, so the receiver cannot be copied into the
     // argument array before it.
@@ -298,7 +298,7 @@ fn reduce_1(w_obj: PyObjectRef, proto: i64) -> PyResult {
     )
 }
 
-/// objectobject.py:27 `reduce_2(obj, proto, args, kwargs)` — app-level handle.
+/// objectobject.py `reduce_2(obj, proto, args, kwargs)` — app-level handle.
 fn reduce_2(
     w_obj: PyObjectRef,
     proto: i64,
@@ -326,7 +326,7 @@ fn reduce_2(
     )
 }
 
-/// objectobject.py:260 `descr__reduce_ex__(space, w_obj, proto)`.
+/// objectobject.py `descr__reduce_ex__(space, w_obj, proto)`.
 pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
     // Every attribute lookup below can run Python, and `getnewargs` allocates
     // even when the type defines neither hook, so the receiver and the

@@ -35,7 +35,7 @@ fn register_to_box_int(opref: OpRef, value: i64) -> OpBox {
 #[inline]
 fn register_to_box_ref(opref: OpRef, value: i64) -> OpBox {
     if opref.is_constant() {
-        // history.py:314 `ConstPtr.value` is the single object field. The
+        // history.py `ConstPtr.value` is the single object field. The
         // forwarded gcref lives in the inline `OpRef::ConstPtr` payload
         // (`ref_regs[i]`, updated in place by `walk_active_trace_refs`), so
         // read it from `opref` rather than the unforwarded `ref_values`
@@ -95,7 +95,7 @@ pub struct MIFrame {
     /// \[FR\] True only for a frame whose push recorded `ENTER_PORTAL_FRAME`
     /// (an inline-pushed portal, dispatch.rs). Its normal-return and
     /// exception-return pops record the matching `LEAVE_PORTAL_FRAME`, so every
-    /// enter_portal_frame pairs with a leave_portal_frame (pyjitpl.py:2461-2492:
+    /// enter_portal_frame pairs with a leave_portal_frame (pyjitpl.py:
     /// newframe→enter_portal_frame, popframe→leave_portal_frame default True on
     /// both the finishframe and finishframe_exception paths). Distinct from
     /// `inline_frame`, which is also true for ordinary `BC_INLINE_CALL` frames
@@ -136,7 +136,7 @@ pub struct MIFrame {
     /// `None` by `cleanup_registers` so a recycled frame does not keep
     /// the parked box alive.
     pub pushed_box: Option<OpRef>,
-    /// pyjitpl.py:93 `self.parent_snapshot = -1`.
+    /// pyjitpl.py `self.parent_snapshot = -1`.
     ///
     /// Set by `TraceRecordBuffer::_ensure_parent_resumedata` to the
     /// snapshot_index returned by the paired `create_snapshot(back,
@@ -145,13 +145,13 @@ pub struct MIFrame {
     /// the parent chain walk by patching with `snapshot_add_prev(
     /// target.parent_snapshot)` instead of re-emitting the snapshot.
     pub parent_snapshot: i64,
-    /// pyjitpl.py:95 `self.unroll_iterations = 1`.
+    /// pyjitpl.py `self.unroll_iterations = 1`.
     pub unroll_iterations: usize,
 }
 
 impl MIFrame {
     pub fn new(jitcode: Arc<JitCode>, pc: usize) -> Self {
-        // RPython `pyjitpl.py:81-90` `MIFrame.setup` creates the typed
+        // RPython `pyjitpl.py` `MIFrame.setup` creates the typed
         // register arrays sized to `num_regs_and_consts_*()`.  pyre
         // keeps the raw allocation step separate so low-level tests and
         // resume paths can construct a frame without immediately
@@ -162,7 +162,7 @@ impl MIFrame {
         // `MIFrame::setup(...)` below, which mirrors the rest of
         // `pyjitpl.py:74-95`.
         //
-        // RPython `pyjitpl.py:2247-2253` `MIFrame.setup`:
+        // RPython `pyjitpl.py` `MIFrame.setup`:
         //   self.registers_i = [None] * jitcode.num_regs_and_consts_i()
         //   self.registers_r = [None] * jitcode.num_regs_and_consts_r()
         //   self.registers_f = [None] * jitcode.num_regs_and_consts_f()
@@ -198,7 +198,7 @@ impl MIFrame {
         }
     }
 
-    /// RPython `pyjitpl.py:74-95` `MIFrame.setup(jitcode, greenkey=None)`.
+    /// RPython `pyjitpl.py` `MIFrame.setup(jitcode, greenkey=None)`.
     ///
     /// This is the entry-point that should back normal frame creation:
     /// allocate the typed register files, remember the recursive-portal
@@ -328,7 +328,7 @@ impl MIFrame {
     /// Decode a `setfield_gc_<kind>/rXd` operand triple, returning
     /// `(struct_reg, value_reg, descr_pool_idx)`. Canonical layout: 1B
     /// struct_reg + 1B value_reg + 2B descr_pool_idx
-    /// (`blackhole.py:1471 bhimpl_setfield_gc_i`).
+    /// (`blackhole.py bhimpl_setfield_gc_i`).
     pub fn read_setfield_gc(&mut self) -> (usize, usize, usize) {
         let struct_reg = self.next_u8() as usize;
         let value_reg = self.next_u8() as usize;
@@ -363,7 +363,7 @@ impl MIFrame {
     /// Decode a `getfield_gc_<kind>/rd>X` operand triple, returning
     /// `(struct_reg, descr_pool_idx, dest_reg)`. Canonical layout: 1B
     /// struct_reg + 2B descr_pool_idx + 1B dest_reg
-    /// (`blackhole.py:1432 bhimpl_getfield_gc_i`).
+    /// (`blackhole.py bhimpl_getfield_gc_i`).
     pub fn read_getfield_gc(&mut self) -> (usize, usize, usize) {
         let struct_reg = self.next_u8() as usize;
         let descr_idx = self.next_u16() as usize;
@@ -419,7 +419,7 @@ impl MIFrame {
         (base, array_idx, dst)
     }
 
-    /// pyjitpl.py:1530-1535 `MIFrame.verify_green_args(jitdriver_sd, varargs)`.
+    /// pyjitpl.py `MIFrame.verify_green_args(jitdriver_sd, varargs)`.
     ///
     /// ```python
     /// def verify_green_args(self, jitdriver_sd, varargs):
@@ -429,7 +429,7 @@ impl MIFrame {
     ///         assert isinstance(varargs[i], Const)
     /// ```
     ///
-    /// Called from `opimpl_jit_merge_point` (pyjitpl.py:1541) so the
+    /// Called from `opimpl_jit_merge_point` (pyjitpl.py) so the
     /// metainterp aborts immediately if a green arg arrives as a Box
     /// (non-constant) — that would mean the codewriter / annotator
     /// failed to mark it as compile-time-known. The pyre port lifts
@@ -464,11 +464,11 @@ impl MIFrame {
         }
     }
 
-    /// pyjitpl.py:98-119 `MIFrame.copy_constants`.
+    /// pyjitpl.py `MIFrame.copy_constants`.
     ///
     /// RPython copies each entry of `jitcode.constants_{i,r,f}` into the
     /// register file at `registers_X[num_regs_X + i]`, wrapping it in
-    /// `Const{Int,Ptr,Float}`. `MIFrame.setup` (pyjitpl.py:82-90) invokes
+    /// `Const{Int,Ptr,Float}`. `MIFrame.setup` (pyjitpl.py) invokes
     /// this inline right after sizing the register arrays to
     /// `num_regs_and_consts_X`.
     ///
@@ -502,7 +502,7 @@ impl MIFrame {
         self.code_cursor >= self.jitcode.code.len()
     }
 
-    /// pyjitpl.py:121-127 `MIFrame.cleanup_registers()`.
+    /// pyjitpl.py `MIFrame.cleanup_registers()`.
     ///
     /// ```python
     /// def cleanup_registers(self):
@@ -525,12 +525,12 @@ impl MIFrame {
         self.pushed_box = None;
     }
 
-    /// pyjitpl.py:1878-1879 `MIFrame.setup_resume_at_op(pc)`.
+    /// pyjitpl.py `MIFrame.setup_resume_at_op(pc)`.
     pub fn setup_resume_at_op(&mut self, pc: usize) {
         self.pc = pc;
     }
 
-    /// pyjitpl.py:258-275 `MIFrame.make_result_of_lastop(resultbox)`.
+    /// pyjitpl.py `MIFrame.make_result_of_lastop(resultbox)`.
     ///
     /// Stores the result of the last opimpl into the typed register at
     /// `target_index`. RPython reads `target_index = ord(self.bytecode[self.pc-1])`
@@ -598,7 +598,7 @@ impl MIFrame {
         }
     }
 
-    /// pyjitpl.py:1862-1876 `MIFrame.setup_call(argboxes)`.
+    /// pyjitpl.py `MIFrame.setup_call(argboxes)`.
     ///
     /// Resets `pc` to 0 and copies each argbox into the first slot of
     /// its typed register bank in declaration order. RPython's
@@ -607,12 +607,12 @@ impl MIFrame {
     /// tuple per arg.
     ///
     /// Also resets `parent_snapshot = -1`. In RPython this lives in
-    /// `MIFrame.setup()` (pyjitpl.py:93) which always precedes
+    /// `MIFrame.setup()` (pyjitpl.py) which always precedes
     /// `setup_call`; pyre's `MIFrame::new` already sets it, but any
     /// future frame-recycling path (upstream `free_frames_list`) would
     /// reuse an MIFrame and skip `new()`, so we reset here to match the
     /// RPython "every call-entry clears parent_snapshot" invariant.
-    /// pyjitpl.py:177-234 `MIFrame.get_list_of_active_boxes`.
+    /// pyjitpl.py `MIFrame.get_list_of_active_boxes`.
     ///
     /// Reads the LIVE-op liveness header preceding the current pc and
     /// pushes each live register onto the trace's snapshot-array data
@@ -671,7 +671,7 @@ impl MIFrame {
                 .result_arg_index
                 .take()
                 .unwrap_or_else(|| self.jitcode.code[self.pc - 1] as usize);
-            // pyjitpl.py:193 `self._result_argcode = '?'` — mark cleared.
+            // pyjitpl.py `self._result_argcode = '?'` — mark cleared.
             self._result_argcode = b'?';
             if clear_result_register {
                 // pyjitpl.py:184-192 register clearing via inline-Const.
@@ -765,7 +765,7 @@ impl MIFrame {
                         .expect("get_list_of_active_boxes: int value uninitialized");
                     register_to_box_int(opref, value)
                 } else {
-                    // pyjitpl.py:82-83 `copy_constants(..., constants_i, ...,
+                    // pyjitpl.py `copy_constants(..., constants_i, ...,
                     // ConstInt)` — constants live in the `[num_regs_i ..
                     // num_regs_and_consts_i)` back slots.
                     OpBox::ConstInt(self.jitcode.constants_i[idx - num_regs_i])
@@ -793,7 +793,7 @@ impl MIFrame {
                         .expect("get_list_of_active_boxes: ref value uninitialized");
                     register_to_box_ref(opref, value)
                 } else {
-                    // pyjitpl.py:84-85 `copy_constants(..., constants_r, ...,
+                    // pyjitpl.py `copy_constants(..., constants_r, ...,
                     // ConstPtrJitCode)` — constants_r store raw GC
                     // addresses; we cast through u64 for `Box::ConstPtr`.
                     OpBox::ConstPtr(self.jitcode.constants_r[idx - num_regs_r] as u64)
@@ -818,7 +818,7 @@ impl MIFrame {
                         .expect("get_list_of_active_boxes: float value uninitialized");
                     register_to_box_float(opref, value)
                 } else {
-                    // pyjitpl.py:86-87 `copy_constants(..., constants_f,
+                    // pyjitpl.py `copy_constants(..., constants_f,
                     // ..., ConstFloat)` — `constants_f[i]` stores the
                     // raw bits of the f64.
                     OpBox::ConstFloat(self.jitcode.constants_f[idx - num_regs_f] as u64)
@@ -988,7 +988,7 @@ impl MIFrame {
                     let value = self.ref_values[idx]
                         .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
                     if opref.is_constant() {
-                        // history.py:314 `ConstPtr.value` — take the forwarded
+                        // history.py `ConstPtr.value` — take the forwarded
                         // gcref from the inline `OpRef::ConstPtr`, not the
                         // unforwarded `ref_values` mirror (stale after a move).
                         let bits = match opref {
@@ -1033,7 +1033,7 @@ impl MIFrame {
         boxes
     }
 
-    /// pyjitpl.py:236-255 `MIFrame.replace_active_box_in_frame(oldbox, newbox)`.
+    /// pyjitpl.py `MIFrame.replace_active_box_in_frame(oldbox, newbox)`.
     ///
     /// ```python
     /// def replace_active_box_in_frame(self, oldbox, newbox):
@@ -1065,7 +1065,7 @@ impl MIFrame {
     pub fn replace_active_box_in_frame(&mut self, oldbox: OpRef, newbox: OpRef, oldbox_type: Type) {
         // All three banks are flat `Vec<Option<OpRef>>`; the shared replace
         // logic compares by OpRef value (pyre's flat-OpRef adaptation of
-        // pyjitpl.py:240 `registers[i] is oldbox`).
+        // pyjitpl.py `registers[i] is oldbox`).
         let registers = match oldbox_type {
             Type::Int => &mut self.int_regs,
             Type::Float => &mut self.float_regs,
@@ -1133,8 +1133,8 @@ pub struct MIFrameStack {
 
 impl MIFrameStack {
     /// Empty framestack.  Mirrors `self.framestack = []` in
-    /// `MetaInterp.initialize_state_from_start` (pyjitpl.py:3269) and
-    /// `rebuild_state_after_failure` (pyjitpl.py:3403).
+    /// `MetaInterp.initialize_state_from_start` (pyjitpl.py) and
+    /// `rebuild_state_after_failure` (pyjitpl.py).
     pub fn empty() -> Self {
         Self { frames: Vec::new() }
     }
@@ -1465,7 +1465,7 @@ mod tests {
         assert_eq!(tag0, TraceRecordBuffer::_encode_box_position(11));
     }
 
-    /// pyjitpl.py:82-83 `copy_constants` — liveness indices past
+    /// pyjitpl.py `copy_constants` — liveness indices past
     /// `num_regs_i` read from `jitcode.constants_i`.  pyre does not
     /// copy the constants into the `int_regs` Vec; instead the
     /// liveness walk reads `jitcode.constants_i[idx - num_regs_i]`
@@ -1551,7 +1551,7 @@ mod tests {
         assert_eq!(frame.pushed_box, None);
     }
 
-    /// pyjitpl.py:236-255 `MIFrame.replace_active_box_in_frame`.
+    /// pyjitpl.py `MIFrame.replace_active_box_in_frame`.
     ///
     /// Bank dispatch: `oldbox.type` selects which register array to scan;
     /// the other banks must NOT be touched.  Walk replaces every slot
@@ -1724,7 +1724,7 @@ mod tests {
         assert!(frame.float_regs[1].is_some());
     }
 
-    /// pyjitpl.py:1530-1535 — `verify_green_args` accepts only Const
+    /// pyjitpl.py — `verify_green_args` accepts only Const
     /// OpRefs whose count matches `jitdriver_sd.num_green_args`.
     #[test]
     fn verify_green_args_accepts_constants_matching_num_greens() {

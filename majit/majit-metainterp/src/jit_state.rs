@@ -90,7 +90,7 @@ impl DeoptMaterializationCache {
     }
 }
 
-/// resume.py:1042 rebuild_from_resumedata return value.
+/// resume.py rebuild_from_resumedata return value.
 ///
 /// RPython returns `(liveboxes, virtualizable_boxes, virtualref_boxes)`.
 /// `liveboxes[i]` = InputArgBox for TAGBOX(i), None otherwise.
@@ -101,7 +101,7 @@ impl DeoptMaterializationCache {
 /// entries for the optimizer constant pool (no RPython equivalent —
 /// RPython uses ConstBox objects natively in the trace recording).
 ///
-/// resume.py:1245 `decode_box(num, kind)` parity: each
+/// resume.py `decode_box(num, kind)` parity: each
 /// `RebuiltValue::Box(idx, kind)` carries its own kind, sourced from the
 /// parent guard's `fail_arg_types` at `decode_tagged` time. Consumers
 /// read the kind directly from the variant — no parallel
@@ -115,7 +115,7 @@ pub struct ResumeDataResult {
     pub virtualizable_values: Vec<majit_ir::resumedata::RebuiltValue>,
     /// resume.py:1045: virtualref box pairs (decoded from vref section).
     pub virtualref_values: Vec<majit_ir::resumedata::RebuiltValue>,
-    /// compile.py:853 `ResumeGuardDescr` storage handle — the shared
+    /// compile.py `ResumeGuardDescr` storage handle — the shared
     /// `Arc<ResumeStorage>` owned by the guard whose rd_numb we just
     /// decoded. Virtual materialization (resume.py:1251
     /// `decode_box` → `self.consts[num-TAG_CONST_OFFSET]`) reads
@@ -124,14 +124,14 @@ pub struct ResumeDataResult {
     pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
     /// resume.py:1042 num_failargs read from rd_numb header.
     /// Needed by `materialize_bridge_virtual` to translate negative TAGBOX
-    /// numbers in `rd_virtuals` fieldnums (resume.py:1556-1564 decode_box:
+    /// numbers in `rd_virtuals` fieldnums (resume.py decode_box:
     /// Python-style negative indexing into the parent guard's liveboxes
     /// array; the decoder normalizes via `val + num_failargs`).
     pub num_failargs: i32,
     /// compile.py:797 ResumeGuardDescr.fail_arg_types — the type tag of
     /// each parent-guard failarg, in order.
     ///
-    /// resume.py:1247-1264 decode_box reads `self.liveboxes[num]` and
+    /// resume.py decode_box reads `self.liveboxes[num]` and
     /// returns the actual Box object whose `.type` is intrinsic
     /// (history.py:220). For the bridge tracer, those liveboxes ARE the
     /// bridge's `InputArg{Int,Ref,Float}` slots — pyre mints them via
@@ -142,7 +142,7 @@ pub struct ResumeDataResult {
     pub fail_arg_types: Vec<Type>,
 }
 
-/// resume.py:1245 `decode_box(num, kind)` parity for a generic
+/// resume.py `decode_box(num, kind)` parity for a generic
 /// (non-virtualizable) JitDriver sym. Returns the bridge `InputArg` OpRef
 /// for failarg `n` paired with its concrete deadframe shadow
 /// `fail_values[n]`. Both the OpRef and the shadow key off the Box's own
@@ -197,7 +197,7 @@ pub trait JitState: Sized {
     /// Append this state's live values to `out` instead of returning a fresh
     /// `Vec`.
     ///
-    /// `warmstate.py:503-507 maybe_compile_and_run` builds the assembler's
+    /// `warmstate.py maybe_compile_and_run` builds the assembler's
     /// arguments by unspecializing reds that are already unboxed locals, so
     /// the upstream entry path allocates nothing to describe them. The
     /// `Vec`-returning form above cannot express that: the caller entering
@@ -297,7 +297,7 @@ pub trait JitState: Sized {
         None
     }
 
-    /// pyjitpl.py:3062-3070 `_unpack_boxes` parity: read concrete values
+    /// pyjitpl.py `_unpack_boxes` parity: read concrete values
     /// from the live boxes at a successful close-loop back-edge before the
     /// trace history is cleared.
     fn close_loop_live_values(
@@ -319,7 +319,7 @@ pub trait JitState: Sized {
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool;
 
-    /// pyjitpl.py:2982 get_procedure_token(greenboxes): compute the
+    /// pyjitpl.py get_procedure_token(greenboxes): compute the
     /// green key for a given loop header PC. Used by bridge trace close
     /// to find compiled targets at the destination loop header.
     fn green_key_for_pc(&self, _pc: usize) -> Option<u64> {
@@ -353,7 +353,7 @@ pub trait JitState: Sized {
     /// `NEW_WITH_VTABLE`/`SETFIELD_GC` ops via `ctx` to materialize each
     /// virtual at trace start, mirroring RPython's
     /// `ResumeDataBoxReader.consume_boxes` → `rd_virtuals[i].allocate(...)`
-    /// → `metainterp.execute_new_with_vtable` (resume.py:945-956 getvirtual_ptr).
+    /// → `metainterp.execute_new_with_vtable` (resume.py getvirtual_ptr).
     /// `rd_virtuals` is the parent guard's virtual descriptor table from
     /// the source trace's exit layout (None when the parent had no virtuals).
     ///
@@ -374,7 +374,7 @@ pub trait JitState: Sized {
     ) {
     }
 
-    /// resume.py:1042-1057 rebuild_from_resumedata: decode rd_numb to
+    /// resume.py rebuild_from_resumedata: decode rd_numb to
     /// reconstruct the complete frame state for bridge tracing.
     ///
     /// RPython creates ResumeDataBoxReader, consumes vable/vref/frame
@@ -383,7 +383,7 @@ pub trait JitState: Sized {
     ///
     /// Returns None when storage is not available (legacy path).
     /// `storage` is the guard-owned shared `Arc<ResumeStorage>` handle
-    /// (compile.py:853 `ResumeGuardDescr`); readers borrow
+    /// (compile.py `ResumeGuardDescr`); readers borrow
     /// `storage.rd_numb` / `storage.rd_consts()` instead of owned
     /// copies.
     fn rebuild_from_resumedata(
@@ -394,7 +394,7 @@ pub trait JitState: Sized {
         None
     }
 
-    /// pyjitpl.py:3158-3175 compile_loop parity: build final meta from
+    /// pyjitpl.py compile_loop parity: build final meta from
     /// the MergePoint that matched at close time, not from the trace start.
     ///
     /// RPython's compile_loop extracts greenkey and inputargs from
@@ -543,7 +543,7 @@ pub trait JitState: Sized {
     /// overrides it only for consumers declaring a `[.. ; virt]` array.
     fn writeback_virt_array_state_fields_from_values(&mut self, _values: &[i64]) {}
 
-    /// blackhole.py:1679 `_exit_frame_with_exception` → warmspot.py:998-1005.
+    /// blackhole.py `_exit_frame_with_exception` → warmspot.py:998-1005.
     ///
     /// The resumed blackhole frame chain raised an exception (`exc`, a GC ref
     /// to the exception object) that escaped every reconstructed frame. The
@@ -568,7 +568,7 @@ pub trait JitState: Sized {
     /// `live_slots_for_state_field_jit`.  The blackhole resume path threads
     /// this onto the root `BlackholeInterpreter` so its `state_field` handlers
     /// map a logical scalar/array index to the flat register slot the resume
-    /// reader seeded (`blackhole.py:339 setarg_i`).  Default empty for
+    /// reader seeded (`blackhole.py setarg_i`).  Default empty for
     /// interpreters with no state fields (pyre).
     fn state_field_layout(&self) -> crate::blackhole::StateFieldLayout {
         crate::blackhole::StateFieldLayout::default()
@@ -698,7 +698,7 @@ pub trait JitState: Sized {
     /// Buffer-filling form of [`Self::export_virtualizable_boxes`], for the
     /// compiled-entry path that re-reads the virtualizable on every call.
     ///
-    /// `warmstate.py:394-396 execute_assembler` passes the virtualizable to
+    /// `warmstate.py execute_assembler` passes the virtualizable to
     /// the assembler as a single pointer argument and only clears its token;
     /// it never copies the fields out, so upstream has no per-entry cost here
     /// to mirror. majit's entry flattens the fields into scalar inputargs
@@ -738,7 +738,7 @@ pub trait JitState: Sized {
     /// `virtualizable_boxes` shadow (the trace ctx's standard-virtualizable
     /// box list, identity LAST).
     ///
-    /// pyjitpl.py:2982-2989 `reached_loop_header`:
+    /// pyjitpl.py `reached_loop_header`:
     /// `live_arg_boxes += self.virtualizable_boxes; live_arg_boxes.pop()`
     /// — the loop-carried args include every virtualizable element box
     /// (dropping the trailing identity). The macro state-field JIT carries
@@ -874,7 +874,7 @@ pub trait JitState: Sized {
         self.materialize_virtual_ref(meta, virtual_index, materialized)
     }
 
-    /// `resume.py:1009-1014 setarrayitem` / `resume.py:1190 setfield`
+    /// `resume.py setarrayitem` / `resume.py setfield`
     /// parity — RPython dispatches via `descr.is_pointer_field()` /
     /// `arraydescr.is_array_of_pointers()`.  pyre passes the live
     /// `descr` Arc so the driver can call the same `FieldDescr` /
@@ -1466,7 +1466,7 @@ pub trait JitState: Sized {
         materialized_refs: &[Option<GcRef>],
     ) {
         for pending in pending_field_writes {
-            // `resume.py:1000 PENDINGFIELDSTRUCT.lldescr` is always
+            // `resume.py PENDINGFIELDSTRUCT.lldescr` is always
             // present in RPython; a `None` here would mean the
             // optimizer/recorder failed to attach the descr and replaying
             // the write would corrupt memory.  Fail loud rather than

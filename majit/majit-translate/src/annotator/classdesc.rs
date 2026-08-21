@@ -6,15 +6,15 @@
 //!
 //! | upstream | Rust |
 //! |---|---|
-//! | `Attribute` (classdesc.py:72-134) | [`Attribute`] |
-//! | `ClassDef` data + structural methods (classdesc.py:136-431) | [`ClassDef`] |
-//! | `InstanceSource` (classdesc.py:435-464) | [`InstanceSource`] |
-//! | `NoSuchAttrError` (classdesc.py:466-468) | [`NoSuchAttrError`] |
-//! | `is_mixin` (classdesc.py:471) | [`is_mixin`] |
-//! | `is_primitive_type` (classdesc.py:474) | [`is_primitive_type`] |
-//! | `BuiltinTypeDesc` (classdesc.py:479-485) | [`BuiltinTypeDesc`] |
-//! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-961) | [`FORCE_ATTRIBUTES_INTO_CLASSES`] (thread_local; populated by [`register_struct_fields`]) |
-//! | `ClassDesc` (classdesc.py:488-600) | [`ClassDesc`] |
+//! | `Attribute` (classdesc.py) | [`Attribute`] |
+//! | `ClassDef` data + structural methods (classdesc.py) | [`ClassDef`] |
+//! | `InstanceSource` (classdesc.py) | [`InstanceSource`] |
+//! | `NoSuchAttrError` (classdesc.py) | [`NoSuchAttrError`] |
+//! | `is_mixin` (classdesc.py) | [`is_mixin`] |
+//! | `is_primitive_type` (classdesc.py) | [`is_primitive_type`] |
+//! | `BuiltinTypeDesc` (classdesc.py) | [`BuiltinTypeDesc`] |
+//! | `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py) | [`FORCE_ATTRIBUTES_INTO_CLASSES`] (thread_local; populated by [`register_struct_fields`]) |
+//! | `ClassDesc` (classdesc.py) | [`ClassDesc`] |
 //!
 //! ## TODO: cyclic ClassDef ↔ ClassDesc
 //!
@@ -79,19 +79,19 @@ pub fn reflow_from_subclass_count() -> u64 {
 thread_local! {
     /// RPython `ClassDef._see_instance_flattenrec = FlattenRecursion()`
     /// (classdesc.py:402). Upstream's `FlattenRecursion` inherits
-    /// `TlsClass` (tool/flattenrec.py:7-10) so the class-attribute is
+    /// `TlsClass` (tool/flattenrec.py) so the class-attribute is
     /// effectively one-per-thread; the Rust port mirrors the scope
     /// with `thread_local!`.
     static SEE_INSTANCE_FLATTENREC: FlattenRecursion<AnnotatorError> =
         FlattenRecursion::new();
 }
 
-// ClassDictEntry (classdesc.py:506 `{attr: Constant-or-Desc}`).
+// ClassDictEntry (classdesc.py `{attr: Constant-or-Desc}`).
 
 /// RPython `classdict[attr]` value type — upstream comment
-/// (classdesc.py:506) states `{attr: Constant-or-Desc}`. Upstream relies
+/// (classdesc.py) states `{attr: Constant-or-Desc}`. Upstream relies
 /// on Python `isinstance(obj, Constant)` / `isinstance(obj, Desc)`
-/// dispatch at `s_get_value` (classdesc.py:786-802). The Rust port
+/// dispatch at `s_get_value` (classdesc.py). The Rust port
 /// closes the sum explicitly so callers match on the variant.
 ///
 /// The `Desc` variant holds a [`super::description::DescEntry`] — this
@@ -115,7 +115,7 @@ impl ClassDictEntry {
 
 // Error marker (classdesc.py:466-468).
 
-/// RPython `class NoSuchAttrError(AnnotatorError)` (classdesc.py:466-468).
+/// RPython `class NoSuchAttrError(AnnotatorError)` (classdesc.py).
 ///
 /// Raised by `Attribute.validate` when `__slots__` / `_attrs_` forbids
 /// the name, and by `Attribute.modified` when `attr_allowed=False`.
@@ -142,9 +142,9 @@ impl std::fmt::Display for NoSuchAttrError {
 
 impl std::error::Error for NoSuchAttrError {}
 
-// BuiltinTypeDesc (classdesc.py:479-485).
+// BuiltinTypeDesc (classdesc.py).
 
-/// RPython `class BuiltinTypeDesc(object)` (classdesc.py:479-485).
+/// RPython `class BuiltinTypeDesc(object)` (classdesc.py).
 ///
 /// Represents a primitive or builtin type object (e.g. `int`, `str`).
 /// Stored in the bookkeeper alongside `ClassDesc` entries; upstream
@@ -159,15 +159,15 @@ impl BuiltinTypeDesc {
         BuiltinTypeDesc { pyobj }
     }
 
-    /// RPython `BuiltinTypeDesc.issubclass(self, other)` (classdesc.py:484-485).
+    /// RPython `BuiltinTypeDesc.issubclass(self, other)` (classdesc.py).
     pub fn issubclass(&self, other: &BuiltinTypeDesc) -> bool {
         self.pyobj.is_subclass_of(&other.pyobj)
     }
 }
 
-// is_mixin / is_primitive_type helpers (classdesc.py:471-476).
+// is_mixin / is_primitive_type helpers (classdesc.py).
 
-/// RPython `is_mixin(cls)` (classdesc.py:471-472).
+/// RPython `is_mixin(cls)` (classdesc.py).
 ///
 /// Upstream: `cls.__dict__.get('_mixin_', False)`. Rust port reads
 /// through [`HostObject::class_get`] (populated by
@@ -177,7 +177,7 @@ pub fn is_mixin(cls: &HostObject) -> bool {
     matches!(cls.class_get("_mixin_"), Some(ConstValue::Bool(true)))
 }
 
-/// RPython `is_primitive_type(cls)` (classdesc.py:474-476).
+/// RPython `is_primitive_type(cls)` (classdesc.py).
 ///
 /// Upstream checks `cls.__module__ == '__builtin__'` or
 /// `issubclass(cls, base_int)`. The Rust port approximates by
@@ -206,10 +206,10 @@ pub fn is_primitive_type(cls: &HostObject) -> bool {
         )
 }
 
-// FORCE_ATTRIBUTES_INTO_CLASSES (classdesc.py:957-961).
+// FORCE_ATTRIBUTES_INTO_CLASSES (classdesc.py).
 
 thread_local! {
-    /// RPython `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py:957-968).
+    /// RPython `FORCE_ATTRIBUTES_INTO_CLASSES` (classdesc.py).
     ///
     /// Maps class qualnames to the attribute annotations that
     /// `ClassDesc._init_classdef` must eagerly install. Upstream keys
@@ -333,8 +333,8 @@ fn forced_attributes_for(qualname: &str) -> Option<indexmap::IndexMap<String, So
 // ClassDesc).
 
 /// RPython dispatch between class-level sources and prebuilt-instance
-/// sources inside `Attribute.add_constant_source` (classdesc.py:87-93)
-/// and `ClassDef.add_source_for_attribute` (classdesc.py:189-220).
+/// sources inside `Attribute.add_constant_source` (classdesc.py)
+/// and `ClassDef.add_source_for_attribute` (classdesc.py).
 ///
 /// Upstream both `ClassDesc` and `InstanceSource` expose
 /// `.instance_level` + `.s_get_value(classdef, name)`; the Rust port
@@ -342,10 +342,10 @@ fn forced_attributes_for(qualname: &str) -> Option<indexmap::IndexMap<String, So
 /// source kind.
 #[derive(Clone, Debug)]
 pub(crate) enum AttrSource {
-    /// `classsources[attr] = self` (classdesc.py:687-688). The source
+    /// `classsources[attr] = self` (classdesc.py). The source
     /// is the owning `ClassDesc`; `instance_level = False`.
     Class(Weak<RefCell<ClassDesc>>),
-    /// `InstanceSource(bookkeeper, obj)` (classdesc.py:411). The source
+    /// `InstanceSource(bookkeeper, obj)` (classdesc.py). The source
     /// is a prebuilt instance; `instance_level = True`.
     Instance(InstanceSource),
 }
@@ -377,9 +377,9 @@ impl AttrSource {
     }
 }
 
-// InstanceSource (classdesc.py:435-464).
+// InstanceSource (classdesc.py).
 
-/// RPython `class InstanceSource(object)` (classdesc.py:435-464).
+/// RPython `class InstanceSource(object)` (classdesc.py).
 ///
 /// Wraps a prebuilt Python instance seen by the annotator. The Rust
 /// port stores the `Bookkeeper` as `Weak` to match upstream's Python
@@ -392,7 +392,7 @@ pub struct InstanceSource {
 }
 
 impl InstanceSource {
-    /// RPython `instance_level = True` (classdesc.py:436).
+    /// RPython `instance_level = True` (classdesc.py).
     pub const INSTANCE_LEVEL: bool = true;
 
     pub fn new(bookkeeper: &Rc<Bookkeeper>, obj: HostObject) -> Self {
@@ -492,9 +492,9 @@ impl InstanceSource {
     }
 }
 
-// Attribute (classdesc.py:72-134).
+// Attribute (classdesc.py).
 
-/// RPython `class Attribute(object)` (classdesc.py:72-134).
+/// RPython `class Attribute(object)` (classdesc.py).
 ///
 /// Records the merged `SomeValue` annotation for one attribute name
 /// together with the set of read positions. Two invariants from the
@@ -509,13 +509,13 @@ impl InstanceSource {
 pub struct Attribute {
     /// RPython `self.name` (classdesc.py:81).
     pub name: String,
-    /// RPython `self.s_value = s_ImpossibleValue` (classdesc.py:82).
+    /// RPython `self.s_value = s_ImpossibleValue` (classdesc.py).
     pub s_value: SomeValue,
-    /// RPython `self.readonly = True` (classdesc.py:83).
+    /// RPython `self.readonly = True` (classdesc.py).
     pub readonly: bool,
-    /// RPython `self.attr_allowed = True` (classdesc.py:84).
+    /// RPython `self.attr_allowed = True` (classdesc.py).
     pub attr_allowed: bool,
-    /// RPython `self.read_locations = set()` (classdesc.py:85).
+    /// RPython `self.read_locations = set()` (classdesc.py).
     ///
     /// Upstream stores positions as tuples of `(FunctionGraph, Block,
     /// op_index)`; the Rust port uses the ported [`PositionKey`]
@@ -525,7 +525,7 @@ pub struct Attribute {
 }
 
 impl Attribute {
-    /// RPython `Attribute.__init__(self, name)` (classdesc.py:79-85).
+    /// RPython `Attribute.__init__(self, name)` (classdesc.py).
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         assert!(
@@ -578,7 +578,7 @@ impl Attribute {
         Ok(())
     }
 
-    /// RPython `Attribute.validate(self, homedef)` (classdesc.py:103-120).
+    /// RPython `Attribute.validate(self, homedef)` (classdesc.py).
     ///
     /// The `SomePBC` / `MethodDesc` branch triggers
     /// [`ClassDef::check_missing_attribute_update`], which is a c3
@@ -619,7 +619,7 @@ impl Attribute {
         Ok(())
     }
 
-    /// RPython `Attribute.modified(self, classdef='?')` (classdesc.py:122-134).
+    /// RPython `Attribute.modified(self, classdef='?')` (classdesc.py).
     ///
     /// The `attr_allowed=False` path invokes `bookkeeper.getattr_locations`
     /// to render the list of read locations in the `NoSuchAttrError`
@@ -669,9 +669,9 @@ impl Attribute {
     }
 }
 
-// ClassDesc (classdesc.py:488-600).
+// ClassDesc (classdesc.py).
 
-/// RPython `class ClassDesc(Desc)` (classdesc.py:488-600).
+/// RPython `class ClassDesc(Desc)` (classdesc.py).
 ///
 /// Structural port of the annotator-visible surface: `__init__` body
 /// (mixin resolution, slots / `_attrs_` detection,
@@ -731,7 +731,7 @@ pub struct ClassDesc {
 
 impl ClassDesc {
     /// Data-only shell used by unit tests that need a bare `ClassDesc`
-    /// without running the full `__init__` (classdesc.py:494-588)
+    /// without running the full `__init__` (classdesc.py)
     /// mixin / slots / exception-pre-population body. Production
     /// callers use [`Self::new`].
     pub fn new_shell(bookkeeper: &Rc<Bookkeeper>, pyobj: HostObject, name: String) -> Self {
@@ -750,12 +750,12 @@ impl ClassDesc {
         }
     }
 
-    /// RPython `ClassDesc.issubclass(self, other)` (classdesc.py:746-747).
+    /// RPython `ClassDesc.issubclass(self, other)` (classdesc.py).
     pub fn issubclass(&self, other: &ClassDesc) -> bool {
         self.pyobj.is_subclass_of(&other.pyobj)
     }
 
-    /// RPython `ClassDesc.is_exception_class(self)` (classdesc.py:735-736).
+    /// RPython `ClassDesc.is_exception_class(self)` (classdesc.py).
     ///
     /// Upstream: `issubclass(self.pyobj, BaseException)`. The Rust port
     /// looks up `BaseException` via [`HOST_ENV`] and calls
@@ -846,7 +846,7 @@ impl ClassDesc {
             }
         }
 
-        // classdesc.py:513-515 — is_mixin guard on the class itself.
+        // classdesc.py — is_mixin guard on the class itself.
         if is_mixin(&cls) {
             return Err(AnnotatorError::new(format!(
                 "cannot use directly the class {:?} because it is a _mixin_",
@@ -922,7 +922,7 @@ impl ClassDesc {
             bookkeeper: Rc::downgrade(bookkeeper),
         }));
 
-        // classdesc.py:555-557 — add_mixins(after, check_not_in=base); add_mixins(before); add_sources_for_class(cls).
+        // classdesc.py — add_mixins(after, check_not_in=base); add_mixins(before); add_sources_for_class(cls).
         let check_not_in_after = base.clone().or_else(|| object_cls.clone());
         Self::add_mixins(&me, &mixins_after, check_not_in_after.as_ref())?;
         Self::add_mixins(&me, &mixins_before, object_cls.as_ref())?;
@@ -1109,7 +1109,7 @@ impl ClassDesc {
         // classdesc.py:624-626 — MemberDescriptor skip. HostObject does
         // not emit MemberDescriptors so nothing to guard against.
 
-        // classdesc.py:627-633 — __init__ on a builtin exception class
+        // classdesc.py — __init__ on a builtin exception class
         // is dropped unless the method itself is registered in
         // `BUILTIN_ANALYZERS`. Upstream:
         //
@@ -1175,7 +1175,7 @@ impl ClassDesc {
             Self::collect_mro_dict_keys(cni, &mut skip);
         }
 
-        // classdesc.py:653-662 — reversed(mro) iterate → add_source_attribute.
+        // classdesc.py — reversed(mro) iterate → add_source_attribute.
         for base in mixin_mro.iter().rev() {
             if !is_mixin(base) {
                 return Err(AnnotatorError::new(format!(
@@ -1229,7 +1229,7 @@ impl ClassDesc {
         Ok(())
     }
 
-    /// RPython `ClassDesc._init_classdef(self)` (classdesc.py:672-697).
+    /// RPython `ClassDesc._init_classdef(self)` (classdesc.py).
     ///
     /// The final `__del__` branch mirrors upstream's
     /// `bookkeeper.emulate_pbc_call(classdef, s_func, args_s)` exactly,
@@ -1241,7 +1241,7 @@ impl ClassDesc {
             this.borrow().bookkeeper.upgrade().ok_or_else(|| {
                 AnnotatorError::new("ClassDesc._init_classdef: bookkeeper dropped")
             })?;
-        // upstream classdesc.py:673 — ClassDef(bookkeeper, self).
+        // upstream classdesc.py — ClassDef(bookkeeper, self).
         let classdef = ClassDef::new(&bk, this);
         // upstream classdesc.py:674 — bookkeeper.classdefs.append(classdef).
         bk.register_classdef(classdef.clone());
@@ -1249,7 +1249,7 @@ impl ClassDesc {
         // Weak inside ClassDef::new; re-install here to be explicit.
         this.borrow_mut().classdef = Some(Rc::downgrade(&classdef));
 
-        // classdesc.py:679-682 — FORCE_ATTRIBUTES_INTO_CLASSES override.
+        // classdesc.py — FORCE_ATTRIBUTES_INTO_CLASSES override.
         // Single read site for both the hand-coded entries (e.g. the
         // EnvironmentError block at classdesc.py:957-961, ported into
         // [`FORCE_ATTRIBUTES_INTO_CLASSES`]) and the walker-derived
@@ -1348,7 +1348,7 @@ impl ClassDesc {
         Ok(classdef)
     }
 
-    /// RPython `ClassDesc.getuniqueclassdef(self)` (classdesc.py:699-702).
+    /// RPython `ClassDesc.getuniqueclassdef(self)` (classdesc.py).
     pub fn getuniqueclassdef(
         this: &Rc<RefCell<Self>>,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
@@ -1450,7 +1450,7 @@ impl ClassDesc {
         Ok(s_instance)
     }
 
-    /// RPython `ClassDesc.lookup(self, name)` (classdesc.py:749-756).
+    /// RPython `ClassDesc.lookup(self, name)` (classdesc.py).
     ///
     /// ```python
     /// def lookup(self, name):
@@ -1492,7 +1492,7 @@ impl ClassDesc {
         }
     }
 
-    /// RPython `ClassDesc.getallbases(self)` (classdesc.py:900-904).
+    /// RPython `ClassDesc.getallbases(self)` (classdesc.py).
     ///
     /// Walks `basedesc` chain from `self` outward and yields every
     /// intermediate ClassDesc. Upstream returns a generator; Rust
@@ -1508,7 +1508,7 @@ impl ClassDesc {
         out
     }
 
-    /// RPython `ClassDesc.getcommonbase(descs)` (classdesc.py:906-915).
+    /// RPython `ClassDesc.getcommonbase(descs)` (classdesc.py).
     ///
     /// ```python
     /// commondesc = descs[0]
@@ -1573,7 +1573,7 @@ impl ClassDesc {
         cdesc.borrow().classdict.get(name).cloned()
     }
 
-    /// RPython `ClassDesc.s_read_attribute(self, name)` (classdesc.py:775-782).
+    /// RPython `ClassDesc.s_read_attribute(self, name)` (classdesc.py).
     ///
     /// ```python
     /// def s_read_attribute(self, name):
@@ -1759,7 +1759,7 @@ impl ClassDesc {
         }
     }
 
-    /// RPython `ClassDesc.getclassdef(self, key)` (classdesc.py:669-670).
+    /// RPython `ClassDesc.getclassdef(self, key)` (classdesc.py).
     pub fn getclassdef(
         this: &Rc<RefCell<Self>>,
         _key: (),
@@ -1767,7 +1767,7 @@ impl ClassDesc {
         Self::getuniqueclassdef(this)
     }
 
-    /// RPython `ClassDesc.find_source_for(self, name)` (classdesc.py:808-817).
+    /// RPython `ClassDesc.find_source_for(self, name)` (classdesc.py).
     ///
     /// RPython `ClassDesc.create_new_attribute(name, value)`
     /// (classdesc.py:804-806).
@@ -2072,7 +2072,7 @@ impl ClassDesc {
                 continue;
             };
             // upstream `isinstance(initfuncdesc, FunctionDesc)` — MemoDesc
-            // is-a FunctionDesc (description.py:395). Keep the whole
+            // is-a FunctionDesc (description.py). Keep the whole
             // `FuncDescEntry` so a `@specialize.memo` __init__ retains its
             // exact MemoDesc identity in the resulting MethodDesc.
             let Some(initfuncdesc) = entry.as_func_entry().cloned() else {
@@ -2179,7 +2179,7 @@ impl ClassDesc {
     }
 }
 
-// ClassDef (classdesc.py:136-431).
+// ClassDef (classdesc.py).
 
 /// RPython `class ClassDef(object)` — "Wraps a user class."
 /// (classdesc.py:136-431).
@@ -2229,7 +2229,7 @@ pub struct ClassDef {
     /// as identity pointers so `.contains` works with `Rc::as_ptr`.
     pub parentdefs: HashSet<usize>,
     /// Stable classdef identity used by
-    /// `normalizecalls.get_unique_cdef_id()` (normalizecalls.py:393-399)
+    /// `normalizecalls.get_unique_cdef_id()` (normalizecalls.py)
     /// to build reversed-MRO inheritance-order witnesses.
     pub unique_cdef_id: Option<usize>,
     /// RPython `classdef.minid = TotalOrderSymbolic(witness, lst)` set by
@@ -2251,7 +2251,7 @@ pub struct ClassDef {
     /// [`crate::translator::rtyper::normalizecalls::create_instantiate_function`]
     /// for every classdef whose constructor participates in a
     /// polymorphic `ClassesPBCRepr.call()` — consumed by
-    /// `ClassRepr.fill_vtable_root` (rclass.py:356-358) to emit the
+    /// `ClassRepr.fill_vtable_root` (rclass.py) to emit the
     /// `vtable.instantiate` slot. Upstream tests this with
     /// `hasattr(classdef, 'my_instantiate_graph')`; the Rust port uses
     /// `Option::is_some` instead.
@@ -2259,7 +2259,7 @@ pub struct ClassDef {
 }
 
 impl std::fmt::Debug for ClassDef {
-    /// RPython `ClassDef.__repr__` (classdesc.py:242-243):
+    /// RPython `ClassDef.__repr__` (classdesc.py):
     /// `return "<ClassDef '%s'>" % (self.name,)`. Printing only the name
     /// is also load-bearing: a derived `Debug` would recurse through
     /// `attrs[..].s_value` → `SomeInstance.classdef` → back to this
@@ -2334,7 +2334,7 @@ impl ClassDef {
         }
         me.borrow_mut().parentdefs = parents;
 
-        // upstream `ClassDesc._init_classdef` (classdesc.py:672-697) writes
+        // upstream `ClassDesc._init_classdef` (classdesc.py) writes
         // `self.classdef = classdef`. Stored as Weak in Rust so ClassDef
         // strongly owns ClassDesc without cycling through this back-ref.
         classdesc.borrow_mut().classdef = Some(Rc::downgrade(&me));
@@ -2366,12 +2366,12 @@ impl ClassDef {
 
     // Read-only structural methods.
 
-    /// RPython `ClassDef.__repr__` (classdesc.py:242-243).
+    /// RPython `ClassDef.__repr__` (classdesc.py).
     pub fn repr_str(&self) -> String {
         format!("<ClassDef '{}'>", self.name)
     }
 
-    /// RPython `ClassDef.getmro(self)` (classdesc.py:256-259).
+    /// RPython `ClassDef.getmro(self)` (classdesc.py).
     ///
     /// Walks `basedef` chain bottom-up. Returns owning `Rc`s so
     /// downstream callers can identity-compare.
@@ -2386,7 +2386,7 @@ impl ClassDef {
         out
     }
 
-    /// RPython `ClassDef.issubclass(self, other)` (classdesc.py:261-262).
+    /// RPython `ClassDef.issubclass(self, other)` (classdesc.py).
     ///
     /// Delegates to `classdesc.issubclass` (strong Rc — always live).
     pub fn issubclass(&self, other: &Rc<RefCell<ClassDef>>) -> bool {
@@ -2395,7 +2395,7 @@ impl ClassDef {
         self_desc.borrow().issubclass(&other_desc.borrow())
     }
 
-    /// RPython `ClassDef.getallsubdefs(self)` (classdesc.py:264-272).
+    /// RPython `ClassDef.getallsubdefs(self)` (classdesc.py).
     pub fn getallsubdefs(start: &Rc<RefCell<ClassDef>>) -> Vec<Rc<RefCell<ClassDef>>> {
         let mut out = Vec::new();
         let mut pending = vec![start.clone()];
@@ -2416,7 +2416,7 @@ impl ClassDef {
         out
     }
 
-    /// RPython `ClassDef.commonbase(self, other)` (classdesc.py:251-254).
+    /// RPython `ClassDef.commonbase(self, other)` (classdesc.py).
     ///
     /// Free-function form so callers don't need to split `self` from
     /// the `Rc`.
@@ -2435,7 +2435,7 @@ impl ClassDef {
         None
     }
 
-    /// RPython `ClassDef.has_no_attrs(self)` (classdesc.py:245-249).
+    /// RPython `ClassDef.has_no_attrs(self)` (classdesc.py).
     pub fn has_no_attrs(start: &Rc<RefCell<ClassDef>>) -> bool {
         for cd in Self::getmro(start) {
             if !cd.borrow().attrs.is_empty() {
@@ -2445,7 +2445,7 @@ impl ClassDef {
         true
     }
 
-    /// RPython `ClassDef.get_owner(self, attrname)` (classdesc.py:222-228).
+    /// RPython `ClassDef.get_owner(self, attrname)` (classdesc.py).
     pub fn get_owner(
         start: &Rc<RefCell<ClassDef>>,
         attrname: &str,
@@ -2455,7 +2455,7 @@ impl ClassDef {
             .find(|cd| cd.borrow().attrs.contains_key(attrname))
     }
 
-    /// RPython `ClassDef.about_attribute(self, name)` (classdesc.py:324-334).
+    /// RPython `ClassDef.about_attribute(self, name)` (classdesc.py).
     pub fn about_attribute(start: &Rc<RefCell<ClassDef>>, name: &str) -> Option<SomeValue> {
         for cd in Self::getmro(start) {
             let cd_ref = cd.borrow();
@@ -2469,7 +2469,7 @@ impl ClassDef {
         None
     }
 
-    /// RPython `ClassDef._freeze_(self)` (classdesc.py:429-431).
+    /// RPython `ClassDef._freeze_(self)` (classdesc.py).
     ///
     /// Upstream raises to prevent `immutablevalue(classdef)` from
     /// silently storing a ClassDef as a constant. The Rust port
@@ -2483,7 +2483,7 @@ impl ClassDef {
 
     // Mutable structural methods.
 
-    /// RPython `ClassDef.setup(self, sources)` (classdesc.py:161-166).
+    /// RPython `ClassDef.setup(self, sources)` (classdesc.py).
     fn setup(
         this: &Rc<RefCell<ClassDef>>,
         // The ordered container preserves the source-attribute work order.
@@ -2580,7 +2580,7 @@ impl ClassDef {
         Ok(())
     }
 
-    /// RPython `ClassDef.locate_attribute(self, attr)` (classdesc.py:231-237).
+    /// RPython `ClassDef.locate_attribute(self, attr)` (classdesc.py).
     pub fn locate_attribute(
         this: &Rc<RefCell<ClassDef>>,
         attr: &str,
@@ -2592,7 +2592,7 @@ impl ClassDef {
         Ok(this.clone())
     }
 
-    /// RPython `ClassDef.find_attribute(self, attr)` (classdesc.py:239-240).
+    /// RPython `ClassDef.find_attribute(self, attr)` (classdesc.py).
     pub fn find_attribute(
         this: &Rc<RefCell<ClassDef>>,
         attr: &str,
@@ -2711,7 +2711,7 @@ impl ClassDef {
         Ok(super::model::s_impossible_value())
     }
 
-    /// RPython `ClassDef.s_getattr(self, attrname, flags)` (classdesc.py:168-187).
+    /// RPython `ClassDef.s_getattr(self, attrname, flags)` (classdesc.py).
     ///
     /// ```python
     /// def s_getattr(self, attrname, flags):
@@ -2770,7 +2770,7 @@ impl ClassDef {
         }
     }
 
-    /// RPython `ClassDef.check_attr_here(self, name)` (classdesc.py:389-400).
+    /// RPython `ClassDef.check_attr_here(self, name)` (classdesc.py).
     ///
     /// ```python
     /// def check_attr_here(self, name):
@@ -2830,7 +2830,7 @@ impl ClassDef {
         Ok(found)
     }
 
-    /// RPython `ClassDef.see_instance(self, x)` (classdesc.py:402-416).
+    /// RPython `ClassDef.see_instance(self, x)` (classdesc.py).
     ///
     /// ```python
     /// _see_instance_flattenrec = FlattenRecursion()
@@ -2985,7 +2985,7 @@ impl ClassDef {
     /// RPython `ClassDef.see_new_subclass(self, classdef)`
     /// (classdesc.py:418-422).
     ///
-    /// RPython `ClassDef.read_attr__class__(self)` (classdesc.py:424-427).
+    /// RPython `ClassDef.read_attr__class__(self)` (classdesc.py).
     ///
     /// ```python
     /// def read_attr__class__(self):
@@ -3652,7 +3652,7 @@ mod tests {
 
     #[test]
     fn classdesc_add_source_attribute_skips_builtin_exc_init() {
-        // upstream classdesc.py:627-633 — `if __init__ and
+        // upstream classdesc.py — `if __init__ and
         // is_builtin_exception_class() and value not in BUILTIN_ANALYZERS:
         // return`. A non-HostObject ConstValue (here an Int sentinel) is
         // trivially unregistered, so the assignment drops.
@@ -3758,10 +3758,10 @@ mod tests {
 
     #[test]
     fn classdesc_init_classdef_emulates_del_call() {
-        // upstream classdesc.py:691-696 — `_init_classdef` dispatches
+        // upstream classdesc.py — `_init_classdef` dispatches
         // `__del__` through `bookkeeper.emulate_pbc_call`. The new
         // emulate_pbc_call path delegates to real `FunctionDesc.pycall`
-        // (bookkeeper.py:570-572 `self.pbc_call(...)`), which requires a
+        // (bookkeeper.py `self.pbc_call(...)`), which requires a
         // live annotator backlink — so the test wires up the full
         // `RPythonAnnotator` rather than a bare Bookkeeper.
         use crate::annotator::annrpython::RPythonAnnotator;
@@ -3967,7 +3967,7 @@ mod tests {
 
     #[test]
     fn classdesc_getcommonbase_walks_chain() {
-        // classdesc.py:906-915: getcommonbase([A,B]) returns the nearest
+        // classdesc.py: getcommonbase([A,B]) returns the nearest
         // shared ancestor. When A and B share a direct parent P, the
         // common base is P.
         let bk = make_bk();

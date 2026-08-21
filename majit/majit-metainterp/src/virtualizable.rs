@@ -19,7 +19,7 @@ use std::sync::{Arc, Weak};
 
 use majit_ir::{DescrRef, Type, descr::descr_identity};
 
-/// `virtualizable.py:330 TOKEN_TRACING_RESCALL`: the GCREF address of the
+/// `virtualizable.py TOKEN_TRACING_RESCALL`: the GCREF address of the
 /// prebuilt `JITFRAME_DUMMY` object shared with virtual references.
 #[inline]
 pub fn token_tracing_rescall() -> u64 {
@@ -208,12 +208,12 @@ pub struct VirtualizableInfo {
     /// virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to array field index.
     pub array_field_by_descrs: indexmap::IndexMap<usize, usize>,
-    /// virtualizable.py:294-295 `clear_vable_ptr`: function pointer to
+    /// virtualizable.py `clear_vable_ptr`: function pointer to
     /// `clear_vable_token`, callable from JIT-compiled COND_CALL.
     /// Signature: `extern "C" fn(*mut u8)`. Stored as raw address so
     /// `VirtualizableInfo` stays Send+Sync.
     pub clear_vable_ptr: Option<usize>,
-    /// virtualizable.py:300-301 `clear_vable_descr`: CallDescr for the
+    /// virtualizable.py `clear_vable_descr`: CallDescr for the
     /// COND_CALL that invokes `clear_vable_ptr`.
     pub clear_vable_descr: Option<DescrRef>,
     /// Ref-register-bank index of the virtualizable identity inputarg, when
@@ -273,7 +273,7 @@ impl Clone for VirtualizableInfo {
 }
 
 impl majit_translate::call::VirtualizableInfoHandle for VirtualizableInfo {
-    /// virtualizable.py:306-307 `is_vtypeptr(TYPE) → TYPE == self.VTYPEPTR`.
+    /// virtualizable.py `is_vtypeptr(TYPE) → TYPE == self.VTYPEPTR`.
     ///
     /// Pyre identifies VTYPEPTR by the SizeDescr identity stored in
     /// `parent_descr`; `vtypeptr_id` is the `descr_identity` of the
@@ -339,7 +339,7 @@ impl VirtualizableInfo {
     ///
     /// `descr.py FieldDescr.parent_descr` is the SizeDescr of the host
     /// virtualizable struct (`PyFrame` for pyre). The optimizer's
-    /// `ensure_ptr_info_arg0` (`optimizer.py:478-484`) reads this to
+    /// `ensure_ptr_info_arg0` (`optimizer.py`) reads this to
     /// pick `InstancePtrInfo` vs `StructPtrInfo` for GETFIELD/SETFIELD
     /// virtualizable field accesses. Hosts MUST call this once,
     /// immediately after `build_virtualizable_info()`, before the
@@ -353,7 +353,7 @@ impl VirtualizableInfo {
     /// carrying the `VinfoMarker` backreference that
     /// `FieldDescr::get_vinfo()` returns. Mirrors `set_parent_descr` +
     /// the RPython `descr._vinfo = self` stamping pattern
-    /// (pyjitpl.py:1148-1149 `vinfo = fielddescr.get_vinfo()`).
+    /// (pyjitpl.py `vinfo = fielddescr.get_vinfo()`).
     ///
     /// Uses `Arc::new_cyclic` so the descriptors built during
     /// construction observe the final `Weak<Self>` — a single-pass
@@ -471,7 +471,7 @@ impl VirtualizableInfo {
         // object `cpu.fielddescrof(VTYPE, name)` returned to both vinfo
         // and the codewriter.  Pyre splits that role: vinfo carries
         // offset/size-bearing SimpleFieldDescr instances (used by
-        // `compile.py:425-461 patch_new_loop_to_load_virtualizable_fields`
+        // `compile.py patch_new_loop_to_load_virtualizable_fields`
         // to emit GETFIELD_GC at loop entry), while the codewriter emits
         // the `vable_static_field_descr(idx)` singleton in
         // `BhDescr::VableField` (`codewriter/assembler.rs`'s `encode_op`).  Both
@@ -516,7 +516,7 @@ impl VirtualizableInfo {
         Arc::new(descr)
     }
 
-    /// virtualizable.py:293-301 `finish()` registers the `clear_vable_ptr`
+    /// virtualizable.py `finish()` registers the `clear_vable_ptr`
     /// function pointer and `clear_vable_descr` call descriptor.
     ///
     /// `clear_fn` is an `extern "C" fn(*mut u8)` that clears the vable token,
@@ -563,7 +563,7 @@ impl VirtualizableInfo {
         }
     }
 
-    /// virtualizable.py:300-301 `clear_vable_descr` factory. Creates
+    /// virtualizable.py `clear_vable_descr` factory. Creates
     /// the CallDescr for the `COND_CALL` that invokes `clear_vable_ptr`.
     ///
     /// ```text
@@ -1254,7 +1254,7 @@ impl VirtualizableInfo {
                     *ptr = value as usize;
                     // The ref may be nursery-young while the array/frame are
                     // old-gen and run detached from the walked frame chain
-                    // (virtualizable.py:101-113 write_boxes runs under the
+                    // (virtualizable.py write_boxes runs under the
                     // translated write barrier). Arm whichever side the GC
                     // owns: a GC array re-traces its own items; a stationary
                     // block is re-walked through the owning frame's custom
@@ -1396,7 +1396,7 @@ impl VirtualizableInfo {
 
     /// Write all boxes back to the heap object (force direction).
     ///
-    /// virtualizable.py:101-113 write_boxes(virtualizable, boxes).
+    /// virtualizable.py write_boxes(virtualizable, boxes).
     ///
     /// Writes static fields then every array item (using the heap array's
     /// actual length, NOT a caller-provided length). Asserts that exactly
@@ -1463,7 +1463,7 @@ impl VableArrayInfo {
     /// Whether the compiled entry's field-load preamble can rebuild this
     /// array's elements from the virtualizable pointer alone.
     ///
-    /// `compile.py:441-457` reaches every element with `GETFIELD_GC_R` for the
+    /// `compile.py` reaches every element with `GETFIELD_GC_R` for the
     /// array's data pointer followed by one `GETARRAYITEM_GC_*` per element —
     /// two loads expressible in trace IR with nothing but byte offsets. A
     /// storage whose data pointer sits at a fixed offset (from the field, or
@@ -2831,7 +2831,7 @@ mod tests {
 // ── resume.py:1350 VirtualizableInfo trait impl ──
 
 impl crate::resume::VirtualizableInfo for VirtualizableInfo {
-    /// virtualizable.py:115-121 get_total_size
+    /// virtualizable.py get_total_size
     fn get_total_size(&self, virtualizable: i64) -> usize {
         let mut size = self.static_fields.len();
         let vable_ptr = virtualizable as *const u8;
@@ -2844,7 +2844,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         size
     }
 
-    /// virtualizable.py:56 reset_token_gcref
+    /// virtualizable.py reset_token_gcref
     fn reset_token_gcref(&self, virtualizable: i64) {
         let vable_ptr = virtualizable as *mut u8;
         if !vable_ptr.is_null() {
@@ -2911,7 +2911,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         VirtualizableInfo::push_resume_ref_roots_for_registers(self, registers_r);
     }
 
-    /// virtualizable.py:126-137 write_from_resume_data_partial
+    /// virtualizable.py write_from_resume_data_partial
     fn write_from_resume_data_partial(
         &self,
         virtualizable: i64,
@@ -2945,7 +2945,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
 }
 
 /// Read the length of a virtualizable array field.
-/// blackhole.py:1406-1409 bhimpl_arraylen_vable parity.
+/// blackhole.py bhimpl_arraylen_vable parity.
 pub(crate) unsafe fn bhimpl_arraylen_vable(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
     unsafe {
         match array.storage {
@@ -3069,7 +3069,7 @@ pub(crate) unsafe fn vable_write_array_item(
             let dest = data_ptr.add(index * item_size);
             if array.item_type == Type::Ref {
                 std::ptr::write(dest as *mut usize, value as usize);
-                // `llmodel.py:495-497 write_ref_at_mem` — "the write barrier is
+                // `llmodel.py write_ref_at_mem` — "the write barrier is
                 // implied above" — is what every blackhole ref store funnels
                 // through upstream.  The stored ref can be nursery-young while
                 // the array and its owning frame are old-gen, so arm whichever
@@ -3089,7 +3089,7 @@ pub(crate) unsafe fn vable_write_array_item(
     }
 }
 
-/// virtualizable.py:218-222 clear_vable_token, blackhole context.
+/// virtualizable.py clear_vable_token, blackhole context.
 ///
 /// Upstream `clear_vable_token` calls `force_now(virtualizable)` when the token
 /// is set, then asserts it cleared — `force_now` writes the live JIT-register

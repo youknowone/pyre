@@ -470,7 +470,7 @@ fn arg_default(pt: &PatType) -> syn::Result<Option<proc_macro2::TokenStream>> {
 /// unwrap_expr_template)` pair.  Two flavours of alias coexist:
 ///
 /// * Passthrough-with-typecheck (`PyTuple`, `PyList`, …) — mirrors PyPy
-///   `@unwrap_spec(w_x=W_TupleObject)` which `gateway.py:311-316`
+///   `@unwrap_spec(w_x=W_TupleObject)` which `gateway.py`
 ///   lowers to `space.interp_w(W_TupleObject, scope_w[i])`.  Binding
 ///   type stays `PyObjectRef`; the wrapper just emits an `is_X` check
 ///   and bails out with a TypeError on mismatch.
@@ -2197,7 +2197,7 @@ fn expand_pyre_methods(
         // The argument `Signature` this method binds keywords against.  An
         // instance method prepends `self` as a positional-only slot (filled by
         // the receiver, never by keyword), mirroring interp2app's `self`
-        // handling (`UnwrapSpec_Check.visit__W_Root`, gateway.py:227-236); a
+        // handling (`UnwrapSpec_Check.visit__W_Root`, gateway.py); a
         // raw whole-args slice has no by-name binding and carries `None`.
         // `#[staticmethod]` / `#[classmethod]` name every slot (including
         // `cls`) as a typed parameter, so they append no synthetic receiver.
@@ -2221,7 +2221,7 @@ fn expand_pyre_methods(
         };
         let method_sig = quote! {{ #method_sig_body }};
 
-        // gateway.py:1146-1211 `_generate_text_signature`: a regular
+        // gateway.py `_generate_text_signature`: a regular
         // interp2app instance method whose arguments are all required and
         // non-variadic has a lossless generated signature. Defaults need
         // their Python repr, so those continue to require an explicit

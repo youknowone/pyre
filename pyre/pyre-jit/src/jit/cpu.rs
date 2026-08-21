@@ -6,8 +6,8 @@
 //! the per-arity / per-opcode helpers.
 //!
 //! In RPython the same `cpu` object is referenced from both
-//! `CodeWriter.cpu` (codewriter.py:21) and `CallControl.cpu`
-//! (call.py:27); pyre owns it on `CallControl` and exposes a
+//! `CodeWriter.cpu` (codewriter.py) and `CallControl.cpu`
+//! (call.py); pyre owns it on `CallControl` and exposes a
 //! convenience accessor `CodeWriter::cpu(&self)` so the upstream
 //! attribute access pattern still works.
 //!
@@ -19,7 +19,7 @@
 //! the helpers that the codewriter needs at compile time to emit the
 //! correct fn-pointer indices into the `JitCode` table.
 
-/// `rpython/jit/backend/model.py:11` `class AbstractCPU(object)`.
+/// `rpython/jit/backend/model.py` `class AbstractCPU(object)`.
 ///
 /// pyre-side: blackhole `bhimpl_*` helper trampolines, all `extern "C"`
 /// so the compiled `JitCode` can call them via raw fn-pointer slots.
@@ -314,19 +314,19 @@ pub struct Cpu {
     /// `bhimpl_getattr` — `getattr(obj, w_name)`.
     /// `(obj: Ref, w_name: Ref) → Ref` with `w_name` an interned str
     /// constant.  Blackhole/deopt lowering of `LOAD_ATTR`
-    /// (`rclass.py:838 rtype_getattr`).
+    /// (`rclass.py rtype_getattr`).
     pub getattr_fn: extern "C" fn(i64, i64) -> i64,
     /// `bhimpl_load_name` — `(frame: Ref, w_name: Ref, namei: Int) → Ref`
     /// with `w_name` an interned str constant.  Blackhole/deopt lowering
-    /// of `LOAD_NAME` (`pyopcode.py:945`).
+    /// of `LOAD_NAME` (`pyopcode.py`).
     pub load_name_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_store_name` — `(frame: Ref, w_name: Ref, value: Ref) → Void`
     /// with `w_name` an interned str constant.  Blackhole/deopt lowering
-    /// of `STORE_NAME` (`pyopcode.py:855`).
+    /// of `STORE_NAME` (`pyopcode.py`).
     pub store_name_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_store_global` — `(frame: Ref, w_name: Ref, value: Ref) →
     /// Void` with `w_name` an interned str constant.  Blackhole/deopt
-    /// lowering of `STORE_GLOBAL` (`pyopcode.py:567`); writes directly
+    /// lowering of `STORE_GLOBAL` (`pyopcode.py`); writes directly
     /// into `w_globals`, bypassing `w_locals`.
     pub store_global_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bh_delete_name_fn` — `(frame: Ref, w_name: Ref) → Void`, the
@@ -338,11 +338,11 @@ pub struct Cpu {
     /// bypassing `w_locals`.
     pub delete_global_fn: extern "C" fn(i64, i64) -> i64,
     /// `bh_load_locals_fn` — `(frame: Ref) → Ref`, the lowering of
-    /// `LOAD_LOCALS` (`pyopcode.py:793`); hands back the frame's own
+    /// `LOAD_LOCALS` (`pyopcode.py`); hands back the frame's own
     /// `w_locals` mapping.
     pub load_locals_fn: extern "C" fn(i64) -> i64,
     /// `bh_load_build_class_fn` — `(frame: Ref) → Ref`, the lowering of
-    /// `LOAD_BUILD_CLASS` (`pyopcode.py:866`); reads `__build_class__` out of
+    /// `LOAD_BUILD_CLASS` (`pyopcode.py`); reads `__build_class__` out of
     /// the frame's builtin mapping.
     pub load_build_class_fn: extern "C" fn(i64) -> i64,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.

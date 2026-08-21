@@ -28,7 +28,7 @@
 //! `gc_sync::gc_op` be a bare borrow of the singleton.
 //!
 //! Because a thread can therefore hold the GIL while running a long stretch of
-//! bytecode, `GILReleaseAction` (gil.py:44-50) yields it from the periodic
+//! bytecode, `GILReleaseAction` (gil.py) yields it from the periodic
 //! action; [`yield_thread`] is that yield.
 
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
@@ -178,7 +178,7 @@ fn init_mutexes() {
 // rgil.py surface
 // ──────────────────────────────────────────────────────────────
 
-/// rgil.py:161-167 `allocate` / thread_gil.c:100-109 `RPyGilAllocate`.
+/// rgil.py `allocate` / thread_gil.c:100-109 `RPyGilAllocate`.
 ///
 /// The mutexes are const-initialised, so all [`init_mutexes`] would do at
 /// startup is rewrite them with the value they already hold; what is left is
@@ -229,7 +229,7 @@ pub fn acquire() {
     }
 }
 
-/// rgil.py:186-193 `acquire_maybe_in_new_thread`, the acquire used by a thread
+/// rgil.py `acquire_maybe_in_new_thread`, the acquire used by a thread
 /// which has not run pyre code before. Reading [`gc_sync::my_ident`] is what
 /// makes sure this thread's thread-locals exist, standing in for
 /// `rthread.get_or_make_ident()`.
@@ -277,7 +277,7 @@ pub fn gil_get_holder() -> usize {
     RPY_FASTGIL.load(Ordering::Relaxed)
 }
 
-/// rgil.py:236-239 `am_I_holding_the_GIL`, the `rpy_fastgil == get_ident()`
+/// rgil.py `am_I_holding_the_GIL`, the `rpy_fastgil == get_ident()`
 /// idiom of thread_gil.c:19-21.
 #[inline]
 pub fn am_i_holding_the_gil() -> bool {
@@ -377,7 +377,7 @@ fn acquire_slow_path(ident: usize) {
 }
 
 /// thread_gil.c:235-256 `RPyGilYieldThread`, driven by the periodic
-/// `GILReleaseAction` (gil.py:44-50). Returns whether the GIL was actually
+/// `GILReleaseAction` (gil.py). Returns whether the GIL was actually
 /// handed over.
 ///
 /// Releasing `mutex_gil` leaves nobody holding the GIL — `rpy_fastgil` is still

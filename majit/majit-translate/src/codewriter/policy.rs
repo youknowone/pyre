@@ -42,7 +42,7 @@ use std::collections::HashSet;
 use crate::front::semantic::SemanticFunction;
 use crate::model::FunctionGraph;
 
-/// policy.py:10-46: shared mutable state and the default classifier.
+/// policy.py: shared mutable state and the default classifier.
 ///
 /// `JitPolicy.__init__` initializes:
 ///   - `self.unsafe_loopy_graphs = set()`
@@ -82,7 +82,7 @@ impl JitPolicyState {
         self.supports_singlefloats = flag;
     }
 
-    /// policy.py:27-33 `dump_unsafe_loops`.
+    /// policy.py `dump_unsafe_loops`.
     ///
     /// ```python
     /// def dump_unsafe_loops(self):
@@ -118,13 +118,13 @@ pub trait JitPolicy {
     fn state(&self) -> &JitPolicyState;
     fn state_mut(&mut self) -> &mut JitPolicyState;
 
-    /// policy.py:35-36 — return `True` for every function by default.
+    /// policy.py — return `True` for every function by default.
     /// `StopAtXPolicy` overrides this.
     fn look_inside_function(&self, _func: &SemanticFunction) -> bool {
         true
     }
 
-    /// policy.py:38-46 `_reject_function(func)`.
+    /// policy.py `_reject_function(func)`.
     ///
     /// RPython rejects functions tagged `_elidable_function_` (always
     /// opaque) and the `rpython.rtyper.module.*` opaque helpers.  Pyre
@@ -137,7 +137,7 @@ pub trait JitPolicy {
         false
     }
 
-    /// policy.py:48-84 `look_inside_graph(graph)`.
+    /// policy.py `look_inside_graph(graph)`.
     ///
     /// `func._jit_look_inside_` overrides everything; otherwise we
     /// combine `look_inside_function` and `_reject_function`.  Loops
@@ -151,7 +151,7 @@ pub trait JitPolicy {
         } else {
             self.look_inside_function(func) && !self._reject_function(func)
         };
-        // policy.py:61-62: `_jit_unroll_safe_` opts back in despite a loop.
+        // policy.py: `_jit_unroll_safe_` opts back in despite a loop.
         contains_loop = contains_loop && !func.hints.iter().any(|h| h == "unroll_safe");
 
         let res = see_function
@@ -219,7 +219,7 @@ impl JitPolicy for DefaultJitPolicy {
     }
 }
 
-/// policy.py:113-119 `class StopAtXPolicy(JitPolicy)`.
+/// policy.py `class StopAtXPolicy(JitPolicy)`.
 ///
 /// Excludes a fixed list of function names from inlining.  Used by
 /// translator tests that need to JIT-compile one half of a graph and
@@ -227,7 +227,7 @@ impl JitPolicy for DefaultJitPolicy {
 #[derive(Debug, Clone, Default)]
 pub struct StopAtXPolicy {
     pub state: JitPolicyState,
-    /// policy.py:115-116: `self.funcs = funcs` — list of opaque names.
+    /// policy.py: `self.funcs = funcs` — list of opaque names.
     pub funcs: Vec<String>,
 }
 
@@ -247,7 +247,7 @@ impl JitPolicy for StopAtXPolicy {
     fn state_mut(&mut self) -> &mut JitPolicyState {
         &mut self.state
     }
-    /// policy.py:118-119: `return func not in self.funcs`.
+    /// policy.py: `return func not in self.funcs`.
     fn look_inside_function(&self, func: &SemanticFunction) -> bool {
         !self.funcs.iter().any(|f| f == &func.name)
     }
@@ -259,9 +259,9 @@ impl JitPolicy for StopAtXPolicy {
 /// override is present, otherwise `None`.
 ///
 /// rlib/jit.py wires the override via two decorators:
-///   - `@dont_look_inside` (`rlib/jit.py:142`) sets
+///   - `@dont_look_inside` (`rlib/jit.py`) sets
 ///     `func._jit_look_inside_ = False`
-///   - `@look_inside` (`rlib/jit.py:147`) sets
+///   - `@look_inside` (`rlib/jit.py`) sets
 ///     `func._jit_look_inside_ = True`
 ///
 /// `front::llbc_hints::harvest_hints_from_llbcs` lowers those decorators
@@ -286,7 +286,7 @@ fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
     None
 }
 
-/// policy.py:86-109 `contains_unsupported_variable_type(graph, ...)`.
+/// policy.py `contains_unsupported_variable_type(graph, ...)`.
 ///
 /// TODO: pyre's value-id table does not yet carry the
 /// per-value lltype information that RPython walks here.  Since pyre
@@ -351,7 +351,7 @@ fn block_exit_targets(graph: &FunctionGraph, block_idx: usize) -> Vec<usize> {
         Some(b) => b,
         None => return Vec::new(),
     };
-    // RPython `flowspace/model.py:66-76` FunctionGraph.iterblocks derives
+    // RPython `flowspace/model.py` FunctionGraph.iterblocks derives
     // the successor set from `Block.exits` only; final blocks
     // (`exits == ()`) have no outgoing targets.
     block.exits.iter().map(|link| link.target.0).collect()
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn dont_look_inside_hint_overrides_default_to_false() {
-        // test_policy.py:61-66 `test_dont_look_inside`.
+        // test_policy.py `test_dont_look_inside`.
         let mut policy = DefaultJitPolicy::new();
         let f = make_func("h", vec!["dont_look_inside"]);
         assert!(!policy.look_inside_graph(&f));
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn jit_look_inside_hint_overrides_subclass_to_true() {
-        // test_policy.py:68-80 `test_look_inside`.
+        // test_policy.py `test_look_inside`.
         struct NoPolicy(JitPolicyState);
         impl JitPolicy for NoPolicy {
             fn state(&self) -> &JitPolicyState {

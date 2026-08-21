@@ -8,7 +8,7 @@
 use crate::host_seam::sys as libc;
 
 /// Raise `_locale.Error` with the supplied message.  Mirrors
-/// `interp_locale.py:15-20 make_error`.
+/// `interp_locale.py make_error`.
 /// The NUL-terminated buffer a collation call is made with: wide where the
 /// collation is wide, bytes elsewhere.
 ///
@@ -73,7 +73,7 @@ fn locale_error(message: &str) -> crate::PyError {
 }
 
 /// Numeric/monetary locale parameters decoded into owned buffers, the
-/// `lconv` fields `localeconv` exposes (`interp_locale.py:48`).
+/// `lconv` fields `localeconv` exposes (`interp_locale.py`).
 struct LocaleConvData {
     decimal_point: Vec<u8>,
     thousands_sep: Vec<u8>,
@@ -96,7 +96,7 @@ struct LocaleConvData {
 }
 
 /// Build the `localeconv()` result dict.  String fields decode the host
-/// bytes via `charp2uni` (utf-8 + surrogateescape, `interp_locale.py:42`);
+/// bytes via `charp2uni` (utf-8 + surrogateescape, `interp_locale.py`);
 /// grouping lists already carry the trailing 0 that `_w_copy_grouping`
 /// appends to a non-empty grouping (`interp_locale.py:36-40`).
 fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
@@ -217,7 +217,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::module_ns_store(ns, "LC_ALL", pyre_object::w_int_new(libc::LC_ALL as i64));
     }
     // `LC_MESSAGES` is a POSIX category the MSVC CRT has no counterpart for.
-    // `locale.py:1984-1989` appends it to `__all__` only if the name survived
+    // `locale.py` appends it to `__all__` only if the name survived
     // its `from _locale import *`, so publishing it here on Windows puts a
     // category into `from locale import *` that no call can be made with.
     #[cfg(unix)]
@@ -244,7 +244,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     {
         crate::module_ns_store(ns, "CODESET", pyre_object::w_int_new(libc::CODESET as i64));
     }
-    // `interp_locale.py:11 W_Error = _new_exception('Error', W_Exception, 'locale error')`
+    // `interp_locale.py W_Error = _new_exception('Error', W_Exception, 'locale error')`
     let exception_base = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before _locale init");
     let w_error = crate::builtins::make_exc_type(
@@ -267,7 +267,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     let lc = rustpython_host_env::locale::localeconv_data();
-                    // `_w_copy_grouping` (`interp_locale.py:36-40`): every byte
+                    // `_w_copy_grouping` (`interp_locale.py`): every byte
                     // of the C grouping string up to its NUL is one group size
                     // (a `CHAR_MAX` element stays `127`), then a trailing `0`
                     // is appended to a non-empty list. The bytes come from
@@ -527,7 +527,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
                     let out = rustpython_host_env::locale::strxfrm(&c, c.as_bytes().len() + 1);
-                    // `interp_locale.py:139` returns `space.newtext(val)` —
+                    // `interp_locale.py` returns `space.newtext(val)` —
                     // a plain utf-8 decode (lossy), matching `setlocale`;
                     // unlike `localeconv`/`nl_langinfo` it does not apply
                     // surrogateescape.

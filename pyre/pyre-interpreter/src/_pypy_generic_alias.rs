@@ -1,7 +1,7 @@
 //! `types.GenericAlias` — PEP 585 parameterized generics.
 //!
 //! PyPy equivalent: lib_pypy/_pypy_generic_alias.py (GenericAlias) +
-//! pypy/objspace/std/util.py:99 (generic_alias_class_getitem).
+//! pypy/objspace/std/util.py (generic_alias_class_getitem).
 //!
 //! The payload lives in `pyre_object::_pypy_generic_alias::GenericAlias`;
 //! this module is the behaviour surface (class-getitem constructor,
@@ -51,7 +51,7 @@ pub(crate) fn is_attr_blocked(name: &str) -> bool {
     matches!(name, "__bases__" | "__copy__" | "__deepcopy__")
 }
 
-/// `generic_alias_class_getitem(space, w_cls, w_item)` (util.py:99).
+/// `generic_alias_class_getitem(space, w_cls, w_item)` (util.py).
 ///
 /// Registered as the `__class_getitem__` classmethod on builtin
 /// containers, so the bound call delivers `args = [w_cls, w_item]`.  The
@@ -361,7 +361,7 @@ fn tuple_index(t: PyObjectRef, item: PyObjectRef) -> Result<Option<usize>, crate
     Ok(None)
 }
 
-/// `_unpack_args(*items)` (`typing.py:341`) — flatten any element that is an
+/// `_unpack_args(*items)` (`typing.py`) — flatten any element that is an
 /// unpacked `tuple[...]` alias (one exposing `__typing_unpacked_tuple_args__`)
 /// into its members, unless those end in `...`.  Returns a fresh items tuple.
 fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -421,7 +421,7 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_tuple_new(newargs))
 }
 
-/// `_is_unpacked_typevartuple(x)` (`typing.py:1026`) — `x` is an unpacked
+/// `_is_unpacked_typevartuple(x)` (`typing.py`) — `x` is an unpacked
 /// `TypeVarTuple` (`*Ts`), identified by `__typing_is_unpacked_typevartuple__
 /// is True`; a bare class is never one.
 fn is_unpacked_typevartuple(x: PyObjectRef) -> Result<bool, crate::PyError> {

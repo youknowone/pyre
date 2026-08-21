@@ -1,12 +1,12 @@
 //! A forced frame's live `Ref` slots must survive a collection taken while the
 //! run that owns the frame is still executing.
 //!
-//! `force` (`llmodel.py:270-274`) casts the force token to a jitframe, resolves
+//! `force` (`llmodel.py`) casts the force token to a jitframe, resolves
 //! it, stamps `jf_descr` and hands that frame straight back — it does not copy
 //! anything out. So the deadframe it mints BORROWS: the frame is still on the
 //! JF shadow stack, still owns its `jf_forward` chain, and still carries the
 //! `jf_gcmap` the call site stored (`aarch64/callbuilder.py:70-73` calls
-//! `aarch64/assembler.py:993-998 push_gcmap`, which writes the map into
+//! `aarch64/assembler.py push_gcmap`, which writes the map into
 //! `jf_gcmap` before the call; `pop_gcmap` at `assembler.py:1000-1003` is what
 //! zeroes it again, and that only runs once the call has returned). Everything
 //! such a deadframe's own lifetime does must therefore be nothing. Releasing

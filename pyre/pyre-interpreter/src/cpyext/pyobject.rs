@@ -181,7 +181,7 @@ pub(super) fn own_heap_type(ob_type: *mut CPyTypeObject) {
     }
 }
 
-/// `object.py:72-73` — the `finally` half of [`own_heap_type`], run once the
+/// `object.py` — the `finally` half of [`own_heap_type`], run once the
 /// block that held the reference is gone.
 fn release_heap_type(ob_type: *mut CPyTypeObject) {
     if super::typeobject::is_heap_type(ob_type) {
@@ -317,7 +317,7 @@ pub fn as_pyobj(w_obj: PyObjectRef) -> *mut CPyObject {
 }
 
 /// The address parked in a dying mirror's link slot while its deallocator runs
-/// — `pyobject.py:297 w_marker_deallocating`, written by
+/// — `pyobject.py w_marker_deallocating`, written by
 /// `cpyext/src/object.c:77` before it calls `tp_dealloc`.
 ///
 /// Upstream's marker is a real `W_Root` so that `from_ref` can compare against
@@ -380,7 +380,7 @@ pub unsafe fn from_ref(raw: *mut CPyObject) -> PyObjectRef {
     link
 }
 
-/// `pyobject.py:433-438 incref`.
+/// `pyobject.py incref`.
 ///
 /// # Safety
 /// `raw` must be null or a live mirror.
@@ -396,7 +396,7 @@ pub unsafe fn incref(raw: *mut CPyObject) {
     unsafe { (*raw).ob_refcnt += 1 };
 }
 
-/// `pyobject.py:441-453 decref` — release one C reference, and deallocate at
+/// `pyobject.py decref` — release one C reference, and deallocate at
 /// exactly zero.
 ///
 /// Zero, not the link share: while the link is in place the collector owns that
@@ -436,7 +436,7 @@ pub unsafe fn decref(raw: *mut CPyObject) {
 unsafe fn dealloc(raw: *mut CPyObject) {
     let address = raw as usize;
     debug_assert_eq!(unsafe { (*raw).ob_refcnt }, 0, "dealloc below zero");
-    // `object.py:67`, read before `tp_free` can hand the block back: the
+    // `object.py`, read before `tp_free` can hand the block back: the
     // reference this block owns in its type is released at the end.
     let ob_type = unsafe { (*raw).ob_type };
     // object.c:77, the same thing as `rawrefcount.mark_deallocating()`: the
@@ -492,7 +492,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
 ///
 /// Upstream reaches the same allocator from both directions: `_PyPy_Malloc`
 /// hands out an instance's block and `PyObject_Malloc` hands out a plain one,
-/// and `_PyPy_Free` takes either back (`object.py:18-23, 44-60`).
+/// and `_PyPy_Free` takes either back (`object.py, 44-60`).
 ///
 /// The size is floored at a whole [`CPyObject`] because [`free_block`] clears
 /// that header before releasing the block.  A caller asking for less still gets
@@ -579,7 +579,7 @@ pub(super) unsafe fn free_block(raw: *mut CPyObject) {
     }
 }
 
-/// `state.py:216-228 _rawrefcount_perform` — release every mirror the collector
+/// `state.py _rawrefcount_perform` — release every mirror the collector
 /// has queued.
 ///
 /// The collector left each one at a count of 1 (`incminimark.py:3352`), so the

@@ -17,7 +17,7 @@ pub use crate::translator::rtyper::rmodel::{
 pub use crate::translator::rtyper::rptr::PtrRepr;
 
 /// RPython `Address` / `fakeaddress` import surface from
-/// `lltypesystem.llmemory` (`raddress.py:5-7`).
+/// `lltypesystem.llmemory` (`raddress.py`).
 pub type Address = lltype::_address;
 
 #[allow(non_camel_case_types)]
@@ -26,7 +26,7 @@ pub type fakeaddress = lltype::_address;
 /// RPython `NULL = fakeaddress(None)` import surface (`raddress.py:5-7`).
 pub const NULL: Address = lltype::_address::Null;
 
-/// RPython `ll_addrhash(addr1)` (`raddress.py:64-65`).
+/// RPython `ll_addrhash(addr1)` (`raddress.py`).
 pub fn ll_addrhash(addr1: &Address) -> Result<i64, String> {
     cast_adr_to_int(addr1, Some("forced"))
 }

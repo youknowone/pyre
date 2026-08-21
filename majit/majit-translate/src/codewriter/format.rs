@@ -10,14 +10,14 @@
 //! - Constants print as `$<value>` (matching `format.py:23`).
 //! - Labels print as `L<index>`, numbered by first printed mention —
 //!   label line or jump operand, whichever comes first (matching
-//!   `format.py:45-50 getlabelname`).
+//!   `format.py getlabelname`).
 //! - `ListOfKind` argument groups print as `I[…]`, `R[…]`, `F[…]`
 //!   (matching `format.py:27`).
 //! - Call descriptors print via their `Debug` repr (matching
-//!   `format.py:32-33` `repr(AbstractDescr)`).
+//!   `format.py` `repr(AbstractDescr)`).
 //! - When `ssarepr.insns_pos` is set the formatter prefixes each line
-//!   with `'%4d  '` (matching `format.py:57-60`).
-//! - The trailing `('---',)` sentinel (`format.py:54-55`) is trimmed.
+//!   with `'%4d  '` (matching `format.py`).
+//! - The trailing `('---',)` sentinel (`format.py`) is trimmed.
 //!
 //! The reverse direction (`unformat_assembler`) is intentionally not
 //! ported — the parity tests we run end-to-end build SSARepr through
@@ -31,7 +31,7 @@ use std::fmt::Write;
 
 use crate::flatten::{FlatOp, Label, RegKind, RegOrConst, SSARepr};
 
-/// `flatten.py:30 Register.kind[0]` — single-char prefix used in
+/// `flatten.py Register.kind[0]` — single-char prefix used in
 /// `int_copy`/`ref_copy`/`float_copy` opnames.
 fn kind_short_name(kind: RegKind) -> &'static str {
     match kind {
@@ -41,7 +41,7 @@ fn kind_short_name(kind: RegKind) -> &'static str {
     }
 }
 
-/// `flatten.py:382-391 getcolor` returns either a [`Register`] (printed
+/// `flatten.py getcolor` returns either a [`Register`] (printed
 /// as `%i<n>`/`%r<n>`/`%f<n>`) or a [`crate::flowspace::model::Constant`]
 /// (printed as `$<value>`).  This helper renders the union form for
 /// `int_copy` source operands and `int_return` arguments.
@@ -52,11 +52,11 @@ fn regorconst_repr(arg: &RegOrConst) -> String {
     }
 }
 
-/// `format.py:45-50 getlabelname(lbl)`.
+/// `format.py getlabelname(lbl)`.
 ///
 /// Numbering is lazy: a label takes the next ordinal the first time it is
 /// *printed*, whether that mention is a jump operand (`format.py:24-25`
-/// `repr(TLabel)`) or the label line itself (`format.py:61-63`).  In a
+/// `repr(TLabel)`) or the label line itself (`format.py`).  In a
 /// graph with a back edge the two orders differ — the loop header's label
 /// line prints before the back edge that targets it.  `None` is the
 /// `-1` sentinel the marking pass stores.
@@ -74,7 +74,7 @@ fn getlabelname(
     *labelcount
 }
 
-/// `format.py:12-81 format_assembler(ssarepr)`.  Per-arg kinds for
+/// `format.py format_assembler(ssarepr)`.  Per-arg kinds for
 /// `OpKind::Call` argument lists resolve via `getkind(v.concretetype)`
 /// read directly from each operand `Variable`'s `concretetype` cell
 /// (`flowspace/model.py:280` `__slots__ = [..., "concretetype"]`); no
@@ -82,9 +82,9 @@ fn getlabelname(
 ///
 /// **PRE-EXISTING-ADAPTATION** — upstream's `SSARepr` already holds
 /// post-flatten [`crate::flatten::Register`]s (the regalloc color) by
-/// the time `format_assembler` runs, so `format.py:17-18` renders
+/// the time `format_assembler` runs, so `format.py` renders
 /// `'%%%s%d' % (x.kind[0], x.index)` straight off the color.  Pyre's
-/// `serialize_op` (`flatten.py:373-380` analogue) defers per-op arg
+/// `serialize_op` (`flatten.py` analogue) defers per-op arg
 /// rewriting — `FlatOp::Op` keeps the unflattened
 /// [`crate::model::SpaceOperation`] with `Variable` operands — so the
 /// register suffix here renders `Variable.id()` (process-wide
@@ -255,7 +255,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             }
             FlatOp::Live { live_values } => {
                 let mut names: Vec<String> = live_values.iter().map(|reg| reg.repr()).collect();
-                // format.py:76: `if asm[0] == '-live-': lst.sort()`.
+                // format.py: `if asm[0] == '-live-': lst.sort()`.
                 names.sort();
                 // format.py:64-79: the args (and the leading space) print only
                 // `if len(asm) > 1`; an empty `-live-` renders with no trailing
@@ -295,7 +295,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
     out
 }
 
-/// format.py:83-102 `assert_format(ssarepr, expected)`.
+/// format.py `assert_format(ssarepr, expected)`.
 ///
 /// Compares the formatted SSARepr with `expected` line by line.  When a
 /// line differs we emit the same `Got:` / `Expected:` diff format as
@@ -365,7 +365,7 @@ fn normalize_expected(expected: &str) -> String {
     out
 }
 
-/// `format.py:169-184 split_words(line)`.
+/// `format.py split_words(line)`.
 pub fn split_words(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -597,7 +597,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
                 .collect();
             out.push_str(&parts.join(", "));
         }
-        // format.py:23 `'$%r' % (x.value,)` — constants print as $<value>.
+        // format.py `'$%r' % (x.value,)` — constants print as $<value>.
         OpKind::ConstInt(value) => {
             let _ = write!(out, "${value}");
         }
@@ -607,14 +607,14 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
         OpKind::ConstStr(bytes) => {
             let _ = write!(out, "${bytes:?}");
         }
-        // jtransform.py:414-435 `rewrite_call`:
+        // jtransform.py `rewrite_call`:
         //   sublists = [lst_i?, lst_r?, lst_f?, calldescr?]   # only kinds present
         //   args = initialargs + sublists
         // → for residual_call/call_may_force/call_elidable upstream emits
         //   `$<funcptr>, I[…]?, R[…]?, F[…]?, <descr>` where the I/R/F
         //   slots are gated on the opname kind signature.  Pyre carries
         //   the funcptr identity on the dedicated `funcptr` field per
-        //   jtransform.py:457 `[op.args[0]] + extraargs`.
+        //   jtransform.py `[op.args[0]] + extraargs`.
         OpKind::CallElidable {
             funcptr,
             descriptor,
@@ -655,7 +655,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
             parts.push(format!("{:?}", descriptor.extra_info));
             out.push_str(&parts.join(", "));
         }
-        // jtransform.py:473-482 `handle_regular_call`:
+        // jtransform.py `handle_regular_call`:
         //   args = [jitcode] + [I?, R?, F? sublists]   # only kinds present
         // → format.py:34-35 renders the JitCode object via JitCode.__repr__.
         //   Before the codewriter assigns the final dense index, fall back
@@ -683,7 +683,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
             }
             out.push_str(&parts.join(", "));
         }
-        // jtransform.py:522-534 `handle_recursive_call`:
+        // jtransform.py `handle_recursive_call`:
         //   args = [Constant(jdindex, lltype.Signed)] + green sublists + red sublists
         // → format.py:23 renders `Constant(jdindex)` as `$<jdindex>`.
         OpKind::RecursiveCall {
@@ -742,7 +742,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
 /// — direct reader for debug-format helpers that resolve an arg list
 /// whose per-slot kind is not pinned by the variant (notably
 /// [`crate::model::OpKind::Call`]).  Reads
-/// `Variable.concretetype` (`flowspace/model.py:280`) via
+/// `Variable.concretetype` (`flowspace/model.py`) via
 /// [`crate::model::getkind`].  Returns `None` when the cell is unset
 /// or the value classifies as Void / Unknown.
 fn variable_kind(v: &crate::flowspace::model::Variable) -> Option<RegKind> {
@@ -852,7 +852,7 @@ mod tests {
     #[test]
     fn format_label_numbering_follows_first_printed_mention() {
         // `format.py:37-44` only marks the labels that appear as jump
-        // targets; `format.py:45-50 getlabelname` assigns the numbers
+        // targets; `format.py getlabelname` assigns the numbers
         // lazily, so a label takes its ordinal from its first *printed*
         // mention — the label line counts just as much as a jump operand.
         //
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn format_constint_emits_dollar_value() {
-        // format.py:23 `'$%r' % (x.value,)`.
+        // format.py `'$%r' % (x.value,)`.
         use crate::flowspace::model::Variable;
         use crate::model::{OpKind, SpaceOperation};
         let result_var = Variable::new();
@@ -1003,7 +1003,7 @@ mod tests {
         // jtransform.py:456-462 emits funcptr as args[0], calldescr via
         // SpaceOperation.descr.  Pyre carries the funcptr identity on
         // descriptor.target and renders it as `$<* function 'name'>`
-        // mirroring format.py:21-23 Ptr-to-Struct repr.
+        // mirroring format.py Ptr-to-Struct repr.
         assert!(
             text.contains("$<* function 'foo'>"),
             "expected funcptr slot in: {text}"
@@ -1091,7 +1091,7 @@ mod tests {
 
     #[test]
     fn format_with_insns_pos_prepends_position_prefix() {
-        // format.py:57-60 `prefix = '%4d  ' % ssarepr._insns_pos[i]`.
+        // format.py `prefix = '%4d  ' % ssarepr._insns_pos[i]`.
         let mut ssa = empty_ssa();
         ssa.insns.push(FlatOp::Jump(Label(0)));
         ssa.insns.push(FlatOp::Label(Label(0)));

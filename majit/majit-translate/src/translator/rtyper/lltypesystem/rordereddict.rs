@@ -51,7 +51,7 @@ pub static DICTINDEX_SHORT: LazyLock<LowLevelType> =
 pub static DICTINDEX_BYTE: LazyLock<LowLevelType> =
     LazyLock::new(|| ptr_to_gc_array(LowLevelType::Unsigned));
 
-/// RPython `IS_64BIT = sys.maxint != 2 ** 31 - 1` (`rordereddict.py:494`).
+/// RPython `IS_64BIT = sys.maxint != 2 ** 31 - 1` (`rordereddict.py`).
 pub const IS_64BIT: bool = usize::BITS == 64;
 
 /// RPython lookup table selector constants (`rordereddict.py:496-503`).
@@ -79,7 +79,7 @@ pub const MIN_INDEXES_MINUS_ENTRIES: i64 = VALID_OFFSET + 1;
 pub const FLAG_LOOKUP: i64 = 0;
 pub const FLAG_STORE: i64 = 1;
 
-/// RPython `DICT_INITSIZE = 16` (`rordereddict.py:1156`).
+/// RPython `DICT_INITSIZE = 16` (`rordereddict.py`).
 pub const DICT_INITSIZE: i64 = 16;
 
 /// RPython `class OrderedDictRepr(AbstractDictRepr)`
@@ -221,7 +221,7 @@ impl OrderedDictRepr {
     }
 
     /// Fail-closed gate for the still-unported `custom_eq_hash` (`r_dict`)
-    /// path: `get_ll_dict` (`rordereddict.py:137-147`) wires `d.keyeq` to
+    /// path: `get_ll_dict` (`rordereddict.py`) wires `d.keyeq` to
     /// `ll_keyeq_custom`, which reads the runtime `d.fnkeyeq` PBC funcptr
     /// field, and `d.paranoia` is `True` (`not simple_hash_eq`) — the
     /// mutation-restart branch (`ll_dict_lookup`'s recursive
@@ -404,7 +404,7 @@ impl OrderedDictRepr {
         let value_lltype = self.DICTVALUE.clone();
         let entries_array_ty = LowLevelType::Array(Box::new(self.DICTENTRYARRAY.clone()));
 
-        // _ll_write_indexes(d, i, value) (rordereddict.py:558-563) — the real
+        // _ll_write_indexes(d, i, value) (rordereddict.py) — the real
         // helper exists for `build_ll_dict_lookup_helper_graph`'s
         // inlined store path; mint it here as a callable funcptr for the
         // non-inlined callers (`ll_dict_store_clean`).
@@ -425,7 +425,7 @@ impl OrderedDictRepr {
         };
         let write_indexes_const = sub_helper_funcptr_constant(rtyper, &write_indexes_fn)?;
 
-        // ll_dict_store_clean(d, hash, index, T) (rordereddict.py:1108-1125).
+        // ll_dict_store_clean(d, hash, index, T) (rordereddict.py).
         let store_clean_fn = {
             let dict_ptr = dict_ptr.clone();
             rtyper.lowlevel_helper_function_with_builder(
@@ -443,7 +443,7 @@ impl OrderedDictRepr {
         };
         let store_clean_const = sub_helper_funcptr_constant(rtyper, &store_clean_fn)?;
 
-        // ll_call_insert_clean_function(d, hash, i) (rordereddict.py:565-580)
+        // ll_call_insert_clean_function(d, hash, i) (rordereddict.py)
         // — FUNC_* dispatch collapses to a single `ll_dict_store_clean` call,
         // same shape as `ll_call_lookup_function`.
         let insert_clean_fn = {
@@ -483,7 +483,7 @@ impl OrderedDictRepr {
         };
         let malloc_choose_const = sub_helper_funcptr_constant(rtyper, &malloc_choose_fn)?;
 
-        // ll_dict_reindex(d, new_size) (rordereddict.py:979-1019) — always
+        // ll_dict_reindex(d, new_size) (rordereddict.py) — always
         // re-mallocs the index array; see build_ll_dict_reindex_helper_graph
         // for why the "reuse + ll_clear_indexes" branch is skipped.
         let reindex_fn = {
@@ -508,7 +508,7 @@ impl OrderedDictRepr {
         };
         let reindex_const = sub_helper_funcptr_constant(rtyper, &reindex_fn)?;
 
-        // ll_dict_remove_deleted_items(d) (rordereddict.py:802-851).
+        // ll_dict_remove_deleted_items(d) (rordereddict.py).
         let remove_deleted_fn = {
             let dict_ptr = dict_ptr.clone();
             let entries_ptr = entries_ptr.clone();
@@ -535,7 +535,7 @@ impl OrderedDictRepr {
         };
         let remove_deleted_const = sub_helper_funcptr_constant(rtyper, &remove_deleted_fn)?;
 
-        // _ll_dict_resize_to(d, num_extra) (rordereddict.py:923-932).
+        // _ll_dict_resize_to(d, num_extra) (rordereddict.py).
         let resize_to_fn = {
             let dict_ptr = dict_ptr.clone();
             let reindex_const = reindex_const.clone();
@@ -556,7 +556,7 @@ impl OrderedDictRepr {
         };
         let resize_to_const = sub_helper_funcptr_constant(rtyper, &resize_to_fn)?;
 
-        // ll_dict_resize(d) (rordereddict.py:913-916).
+        // ll_dict_resize(d) (rordereddict.py).
         let resize_fn = {
             let dict_ptr = dict_ptr.clone();
             let resize_to_const = resize_to_const.clone();
@@ -604,7 +604,7 @@ impl OrderedDictRepr {
         };
         let arraycopy_const = sub_helper_funcptr_constant(rtyper, &arraycopy_fn)?;
 
-        // ll_dict_grow(d) -> Bool (rordereddict.py:755-787).
+        // ll_dict_grow(d) -> Bool (rordereddict.py).
         let grow_fn = {
             let dict_ptr = dict_ptr.clone();
             let entries_ptr = entries_ptr.clone();
@@ -673,7 +673,7 @@ impl OrderedDictRepr {
         let value_lltype = self.DICTVALUE.clone();
         let lookup_done_fn = self.ll_dict_setitem_lookup_done_helper(hop)?;
         let lookup_done_const = sub_helper_funcptr_constant(rtyper, &lookup_done_fn)?;
-        // ll_dict_setitem(d, key, value) (rordereddict.py:665-673, fused
+        // ll_dict_setitem(d, key, value) (rordereddict.py, fused
         // with its `_with_hash` half and the FLAG_STORE lookup call).
         rtyper.lowlevel_helper_function_with_builder(
             "ll_dict_setitem",
@@ -706,7 +706,7 @@ impl OrderedDictRepr {
         let value_lltype = self.DICTVALUE.clone();
         let entries_array_ty = LowLevelType::Array(Box::new(self.DICTENTRYARRAY.clone()));
 
-        // _ll_write_indexes(d, i, value) (rordereddict.py:558-563).
+        // _ll_write_indexes(d, i, value) (rordereddict.py).
         let write_indexes_fn = {
             let dict_ptr = dict_ptr.clone();
             rtyper.lowlevel_helper_function_with_builder(
@@ -776,7 +776,7 @@ impl OrderedDictRepr {
         };
         let call_delete_const = sub_helper_funcptr_constant(rtyper, &call_delete_fn)?;
 
-        // ll_dict_store_clean(d, hash, index, T) (rordereddict.py:1108-1125),
+        // ll_dict_store_clean(d, hash, index, T) (rordereddict.py),
         // used by ll_dict_reindex below.
         let store_clean_fn = {
             let dict_ptr = dict_ptr.clone();
@@ -1036,8 +1036,8 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `OrderedDictRepr.rtype_len(self, hop)`
-    /// (`rordereddict.py:274-276`): `hop.gendirectcall(ll_dict_len, v_dict)`.
-    /// `ll_dict_len(d)` (`rordereddict.py:648-649`) returns the
+    /// (`rordereddict.py`): `hop.gendirectcall(ll_dict_len, v_dict)`.
+    /// `ll_dict_len(d)` (`rordereddict.py`) returns the
     /// `num_live_items` header field.
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
         let v_dict = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
@@ -1055,8 +1055,8 @@ impl Repr for OrderedDictRepr {
     }
 
     /// RPython `OrderedDictRepr.rtype_bool(self, hop)`
-    /// (`rordereddict.py:278-280`): `hop.gendirectcall(ll_dict_bool, v_dict)`.
-    /// `ll_dict_bool(d)` (`rordereddict.py:651-653`) is `bool(d) and
+    /// (`rordereddict.py`): `hop.gendirectcall(ll_dict_bool, v_dict)`.
+    /// `ll_dict_bool(d)` (`rordereddict.py`) is `bool(d) and
     /// d.num_live_items != 0` — the explicit `bool(d)` guard lets a None-typed
     /// dict read False without dereferencing, so this overrides the
     /// `int_is_true(len)` default (`rmodel.py:199-207`) which would deref the
@@ -1234,7 +1234,7 @@ impl Repr for OrderedDictRepr {
     fn rtype_method(&self, method_name: &str, hop: &HighLevelOp) -> RTypeResult {
         match method_name {
             // `is_null` is the lltype `_ptr` nullity probe on the dict
-            // pointer — lower it as `ptr_iszero` (opimpl.py:134-136
+            // pointer — lower it as `ptr_iszero` (opimpl.py
             // `op_ptr_iszero`), the same lowering `InstanceRepr` uses for
             // the `ptr_method_is_null` bound method the annotator seats on
             // pointer-carrying receivers.
@@ -1331,7 +1331,7 @@ impl Repr for OrderedDictRepr {
     }
 }
 
-/// Synthesise `ll_dict_len(d) -> Signed` (`rordereddict.py:648-649`):
+/// Synthesise `ll_dict_len(d) -> Signed` (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_dict_len(d):
@@ -1380,7 +1380,7 @@ pub(crate) fn build_ll_dict_len_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_bool(d) -> Bool` (`rordereddict.py:651-653`):
+/// Synthesise `ll_dict_bool(d) -> Bool` (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_dict_bool(d):
@@ -1651,7 +1651,7 @@ pub fn ll_clear_indexes() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("ll_clear_indexes"))
 }
 
-/// Synthesise `_ll_write_indexes(d, i, value, T)` (`rordereddict.py:558-563`):
+/// Synthesise `_ll_write_indexes(d, i, value, T)` (`rordereddict.py`):
 ///
 /// ```python
 /// def _ll_write_indexes(d, i, value, T):
@@ -2859,7 +2859,7 @@ pub fn build_ll_dict_lookup_helper_graph(
     ))
 }
 
-/// Synthesise `ll_malloc_indexes_and_choose_lookup(d, n)` (`rordereddict.py:520-541`):
+/// Synthesise `ll_malloc_indexes_and_choose_lookup(d, n)` (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_malloc_indexes_and_choose_lookup(d, n):
@@ -3031,7 +3031,7 @@ pub(crate) fn build_ll_malloc_indexes_and_choose_lookup_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_create_initial_index(d)` (`rordereddict.py:942-953`):
+/// Synthesise `ll_dict_create_initial_index(d)` (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_dict_create_initial_index(d):
@@ -3043,7 +3043,7 @@ pub(crate) fn build_ll_malloc_indexes_and_choose_lookup_helper_graph(
 /// ```
 ///
 /// **Scope note:** the `else` arm rehashes a "prebuilt dictionary frozen by
-/// translation" (`ll_dict_rehash_after_translation`, `rordereddict.py:955-977`,
+/// translation" (`ll_dict_rehash_after_translation`, `rordereddict.py`,
 /// `@jit.dont_look_inside`) — a translation-time-only RPython concept with no
 /// analogue in this runtime JIT, which constructs every dict at run time.
 /// `lookup_function_no` is written to `FUNC_MUST_REINDEX` in exactly one place
@@ -3108,7 +3108,7 @@ pub(crate) fn build_ll_dict_create_initial_index_helper_graph(
     ))
 }
 
-/// Synthesise `ll_ensure_indexes(d)` (`rordereddict.py:934-940`):
+/// Synthesise `ll_ensure_indexes(d)` (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_ensure_indexes(d):
@@ -3309,7 +3309,7 @@ pub(crate) fn build_ll_call_lookup_function_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_getitem(d, key) -> DICTVALUE` (`rordereddict.py:655-663`,
+/// Synthesise `ll_dict_getitem(d, key) -> DICTVALUE` (`rordereddict.py`,
 /// fused with its `_with_hash` half):
 ///
 /// ```python
@@ -3457,7 +3457,7 @@ pub(crate) fn build_ll_dict_getitem_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_contains(d, key) -> Bool` (`rordereddict.py:1462-1468`,
+/// Synthesise `ll_dict_contains(d, key) -> Bool` (`rordereddict.py`,
 /// fused with its `_with_hash` half — same rationale as
 /// [`build_ll_dict_getitem_helper_graph`], minus the raise since `contains`
 /// never fails for the direct-compare key space this port covers):
@@ -3583,7 +3583,7 @@ pub fn pair_ordereddict_repr_rtype_contains(
     hop.gendirectcall(&helper, args)
 }
 
-/// Synthesise `ll_dict_store_clean(d, hash, index, T)` (`rordereddict.py:1108-1125`):
+/// Synthesise `ll_dict_store_clean(d, hash, index, T)` (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_dict_store_clean(d, hash, index, T):
@@ -4293,7 +4293,7 @@ pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
     ))
 }
 
-/// Synthesise a struct-array specialisation of `rgc.ll_arraycopy` (`rgc.py:365`)
+/// Synthesise a struct-array specialisation of `rgc.ll_arraycopy` (`rgc.py`)
 /// for the `odictentry` entries array — the same primitive
 /// `build_ll_arraycopy_helper_graph` in `rlist.rs` specialises for bare
 /// scalar-item `Ptr(GcArray(ITEM))` lists:
@@ -4473,7 +4473,7 @@ pub(crate) fn build_ll_dict_entries_arraycopy_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_remove_deleted_items(d)` (`rordereddict.py:802-851`):
+/// Synthesise `ll_dict_remove_deleted_items(d)` (`rordereddict.py`):
 ///
 /// ```python
 /// if d.num_live_items < len(d.entries) // 4:
@@ -5172,7 +5172,7 @@ pub(crate) fn build_ll_dict_remove_deleted_items_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_grow(d) -> Bool` (`rordereddict.py:755-787`):
+/// Synthesise `ll_dict_grow(d) -> Bool` (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_dict_grow(d):
@@ -5190,7 +5190,7 @@ pub(crate) fn build_ll_dict_remove_deleted_items_helper_graph(
 ///     return False
 /// ```
 ///
-/// rordereddict.py:779-782 — `_ll_dict_entries_size_too_big` remains collapsed:
+/// rordereddict.py — `_ll_dict_entries_size_too_big` remains collapsed:
 /// it protects genuinely narrow UCHAR/USHORT/UINT index arrays from entry-index
 /// overflow, but all local `DICTINDEX_*` aliases are currently
 /// `Ptr(GcArray(Unsigned))` until #148 lands.
@@ -5373,7 +5373,7 @@ pub(crate) fn build_ll_dict_grow_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_reindex(d, new_size)` (`rordereddict.py:979-1019`):
+/// Synthesise `ll_dict_reindex(d, new_size)` (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_dict_reindex(d, new_size):
@@ -5631,7 +5631,7 @@ pub(crate) fn build_ll_dict_reindex_helper_graph(
     ))
 }
 
-/// Synthesise `_ll_dict_resize_to(d, num_extra)` (`rordereddict.py:923-932`):
+/// Synthesise `_ll_dict_resize_to(d, num_extra)` (`rordereddict.py`):
 ///
 /// ```python
 /// def _ll_dict_resize_to(d, num_extra):
@@ -5849,7 +5849,7 @@ pub(crate) fn build_ll_dict_resize_to_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_resize(d)` (`rordereddict.py:913-916`):
+/// Synthesise `ll_dict_resize(d)` (`rordereddict.py`):
 ///
 /// ```python
 /// def ll_dict_resize(d):
@@ -5952,7 +5952,7 @@ pub(crate) fn build_ll_dict_resize_helper_graph(
     ))
 }
 
-/// Synthesise `_ll_dict_del_entry(d, index)` (`rordereddict.py:872-882`):
+/// Synthesise `_ll_dict_del_entry(d, index)` (`rordereddict.py`):
 ///
 /// ```python
 /// d.entries.mark_deleted(index)
@@ -6083,7 +6083,7 @@ pub(crate) fn build_ll_dict_del_entry_helper_graph(
     ))
 }
 
-/// Synthesise `_ll_dict_del(d, hash, index)` (`rordereddict.py:884-911`):
+/// Synthesise `_ll_dict_del(d, hash, index)` (`rordereddict.py`):
 ///
 /// ```python
 /// ll_call_delete_by_entry_index(d, hash, index, DELETED)
@@ -6404,7 +6404,7 @@ pub(crate) fn build_ll_dict_del_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_delitem(d, key)` (`rordereddict.py:854-861`, fused
+/// Synthesise `ll_dict_delitem(d, key)` (`rordereddict.py`, fused
 /// with `ll_dict_delitem_with_hash`):
 ///
 /// ```python
@@ -6517,7 +6517,7 @@ pub(crate) fn build_ll_dict_delitem_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_get(dict, key, default)` (`rordereddict.py:1284-1289`).
+/// Synthesise `ll_dict_get(dict, key, default)` (`rordereddict.py`).
 pub(crate) fn build_ll_dict_get_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -7343,7 +7343,7 @@ pub(crate) fn build_ll_dict_setitem_lookup_done_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dict_setitem(d, key, value)` (`rordereddict.py:665-673`,
+/// Synthesise `ll_dict_setitem(d, key, value)` (`rordereddict.py`,
 /// fused with its `_with_hash` half and the `FLAG_STORE` lookup call — same
 /// fusion rationale as [`build_ll_dict_getitem_helper_graph`]):
 ///
@@ -7429,7 +7429,7 @@ pub(crate) fn build_ll_dict_setitem_helper_graph(
     ))
 }
 
-/// Synthesise `_ll_dictnext(iter) -> Signed` (`rordereddict.py:1229-1259`),
+/// Synthesise `_ll_dictnext(iter) -> Signed` (`rordereddict.py`),
 /// the forward dict-iterator step shared by keys/values/items iteration.
 ///
 /// ```python
@@ -7863,7 +7863,7 @@ pub fn build_ll_dictnext_helper_graph(
     ))
 }
 
-/// Synthesise `ll_dictiter(ITERPTR, d)` (`rordereddict.py:1214-1219`):
+/// Synthesise `ll_dictiter(ITERPTR, d)` (`rordereddict.py`):
 /// allocate a dict iterator, store the source dict, seed the index from
 /// `d.lookup_function_no >> FUNC_SHIFT`, and return the iterator.
 pub fn build_ll_dictiter_helper_graph(
@@ -8081,7 +8081,7 @@ pub fn _ll_len_of_d_indexes() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_len_of_d_indexes"))
 }
 
-/// RPython `_overallocate_entries_len` (`rordereddict.py:748-757`).
+/// RPython `_overallocate_entries_len` (`rordereddict.py`).
 pub fn _overallocate_entries_len(baselen: usize) -> usize {
     let newsize = baselen + (baselen >> 3);
     newsize + 8
@@ -8103,7 +8103,7 @@ pub fn ll_dict_rehash_after_translation() -> Result<(), TyperError> {
     ))
 }
 
-/// RPython `_ll_ptr_to_array_of(T)` (`rordereddict.py:1033-1035`).
+/// RPython `_ll_ptr_to_array_of(T)` (`rordereddict.py`).
 pub fn _ll_ptr_to_array_of(T: LowLevelType) -> LowLevelType {
     ptr_to_gc_array(T)
 }
@@ -8209,7 +8209,7 @@ pub fn _ll_dict_move_to_first_shift_items() -> Result<(), TyperError> {
     ))
 }
 
-/// RPython `get_ll_dictiter(DICTPTR)` (`rordereddict.py:1187-1190`).
+/// RPython `get_ll_dictiter(DICTPTR)` (`rordereddict.py`).
 pub fn get_ll_dictiter(DICTPTR: LowLevelType) -> LowLevelType {
     let dictiter = Struct::gc(
         "dictiter",
@@ -8248,7 +8248,7 @@ pub struct DictIteratorRepr {
 
 impl DictIteratorRepr {
     /// RPython `DictIteratorRepr.__init__(self, r_dict, variant="keys")`
-    /// (`rordereddict.py:1206-1215`). Only the forward `ll_dictiter`/
+    /// (`rordereddict.py`). Only the forward `ll_dictiter`/
     /// `_ll_dictnext` constructors are wired — the `variant == "reversed"`
     /// swap to `ll_dictiter_reversed`/`_ll_dictnext_reversed` is rejected by
     /// [`Repr::make_iterator_repr`] before this ever runs with that variant.
@@ -8269,7 +8269,7 @@ impl DictIteratorRepr {
         }
     }
 
-    /// RPython `AbstractDictIteratorRepr.variant_keys` (`rdict.py:113-118`);
+    /// RPython `AbstractDictIteratorRepr.variant_keys` (`rdict.py`);
     /// also `variant_reversed = variant_keys` (`:120`) — the read step is
     /// identical for the forward and reversed variants, only the iterator
     /// walk direction differs (in the unported `ll_dictiter_reversed`/
@@ -8295,7 +8295,7 @@ impl DictIteratorRepr {
         Ok(Some(recast))
     }
 
-    /// RPython `AbstractDictIteratorRepr.variant_values` (`rdict.py:122-127`).
+    /// RPython `AbstractDictIteratorRepr.variant_values` (`rdict.py`).
     fn variant_values(
         &self,
         hop: &HighLevelOp,
@@ -8322,7 +8322,7 @@ impl DictIteratorRepr {
         Ok(Some(recast))
     }
 
-    /// RPython `AbstractDictIteratorRepr.variant_items` (`rdict.py:129-132`),
+    /// RPython `AbstractDictIteratorRepr.variant_items` (`rdict.py`),
     /// via `get_tuple_result` (`:95-111`). The local `items` result type is
     /// already a [`crate::translator::rtyper::rtuple::TupleRepr`] of
     /// `(external_key_repr, external_value_repr)` (`hop.r_result`), so the
@@ -8388,7 +8388,7 @@ impl Repr for DictIteratorRepr {
         crate::translator::rtyper::pairtype::ReprClassId::DictIteratorRepr
     }
 
-    /// RPython `AbstractDictIteratorRepr.newiter(self, hop)` (`rdict.py:70-73`):
+    /// RPython `AbstractDictIteratorRepr.newiter(self, hop)` (`rdict.py`):
     ///
     /// ```python
     /// def newiter(self, hop):
@@ -8731,7 +8731,7 @@ mod tests {
         );
     }
 
-    /// `OrderedDictRepr::make_iterator_repr` (`rordereddict.py:282-283`)
+    /// `OrderedDictRepr::make_iterator_repr` (`rordereddict.py`)
     /// mints a `DictIteratorRepr` for the implicit `for k in d:` iteration
     /// (no variant); the `reversed(d)` variant is rejected fail-closed since
     /// `ll_dictiter_reversed`/`_ll_dictnext_reversed` are unported.
@@ -8752,7 +8752,7 @@ mod tests {
     }
 
     /// `DictIteratorRepr::new` selects the `keys`/`values`/`items` variant
-    /// (`rordereddict.py:342-352` — `rtype_method_iterkeys`/`itervalues`/
+    /// (`rordereddict.py` — `rtype_method_iterkeys`/`itervalues`/
     /// `iteritems` each construct `DictIteratorRepr(self, "<variant>")`).
     #[test]
     fn dictiteratorrepr_new_selects_keys_values_items_variant() {
@@ -8768,7 +8768,7 @@ mod tests {
     }
 
     /// `iter(d)` rtypes through `DictIteratorRepr::newiter` to a
-    /// `direct_call(ll_dictiter, v_dict)` (`rdict.py:70-73`).
+    /// `direct_call(ll_dictiter, v_dict)` (`rdict.py`).
     #[test]
     fn newiter_emits_direct_call_to_ll_dictiter() {
         let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
@@ -8836,7 +8836,7 @@ mod tests {
     }
 
     /// `next(iter)` rtypes through `DictIteratorRepr::rtype_next`
-    /// (`rdict.py:75-93`): `direct_call(_ll_dictnext, v_iter)`, then
+    /// (`rdict.py`): `direct_call(_ll_dictnext, v_iter)`, then
     /// `getfield(v_iter, 'dict')` / `getfield(v_dict, 'entries')`, then the
     /// `variant_keys` read `getinteriorfield(entries, index, 'key')`.
     #[test]

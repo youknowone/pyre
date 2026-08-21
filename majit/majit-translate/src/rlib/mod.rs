@@ -6,7 +6,7 @@
 //! | majit                 | rpython/rlib/                 |
 //! |-----------------------|-------------------------------|
 //! | `entrypoint`          | `entrypoint.py`               |
-//! | `jit`                 | `jit.py:875-1024` (marker/extregistry half; the user hint API lives at `majit_metainterp::jit`) |
+//! | `jit`                 | `jit.py` (marker/extregistry half; the user hint API lives at `majit_metainterp::jit`) |
 //! | `rarithmetic`         | `rarithmetic.py`              |
 //! | `rvmprof`             | `rvmprof/` disabled-runtime `cintf` adapter |
 

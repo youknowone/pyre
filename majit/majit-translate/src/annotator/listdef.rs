@@ -28,7 +28,7 @@
 //!       separate `patch()` overrides on the subclasses; Rust
 //!       composition flattens the distinction into an enum.
 //!
-//! * `TLS.no_side_effects_in_union` (model.py:758-769) is replaced by
+//! * `TLS.no_side_effects_in_union` (model.py) is replaced by
 //!   a thread-local counter with an RAII guard. The guard name is
 //!   Rust-native — upstream uses a bare `try/finally` on the global —
 //!   but the semantics match byte-for-byte.
@@ -69,7 +69,7 @@ pub fn listitem_notify_update_count() -> u64 {
     LISTITEM_NOTIFY_UPDATE.load(Ordering::Relaxed)
 }
 
-/// RPython `class TooLateForChange(AnnotatorError)` (listdef.py:6-7).
+/// RPython `class TooLateForChange(AnnotatorError)` (listdef.py).
 /// Raised when mutation is attempted on a `dont_change_any_more`
 /// listitem.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,7 +89,7 @@ impl From<TooLateForChange> for AnnotatorError {
     }
 }
 
-/// RPython `class ListChangeUnallowed(AnnotatorError)` (listdef.py:9-10).
+/// RPython `class ListChangeUnallowed(AnnotatorError)` (listdef.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListChangeUnallowed(pub String);
 
@@ -103,7 +103,7 @@ impl std::error::Error for ListChangeUnallowed {}
 
 thread_local! {
     /// Rust-side mirror of upstream `TLS.no_side_effects_in_union`
-    /// (model.py:758). `union()` increments this counter before
+    /// (model.py). `union()` increments this counter before
     /// dispatching to `pair(s1, s2).union()`; `ListItem.merge` /
     /// `DictKey.merge` consult it to refuse mutation and raise
     /// `UnionError` instead. Thread-local so parallel tests observe
@@ -112,7 +112,7 @@ thread_local! {
 }
 
 /// RAII wrapper around the `TLS.no_side_effects_in_union += 1` /
-/// `-= 1` pattern at `model.py:758-769` — upstream guards the
+/// `-= 1` pattern at `model.py` — upstream guards the
 /// increment with a bare `try/finally`; Rust wraps it in a `Drop`
 /// impl so callers cannot accidentally leak the state.
 ///
@@ -149,9 +149,9 @@ pub(crate) fn in_side_effect_free_union() -> bool {
 /// of owner that can hold the listitem so `patch()` retargets the
 /// correct cell.
 ///
-/// Upstream (listdef.py:100-103) `ListItem.patch()` walks
+/// Upstream (listdef.py) `ListItem.patch()` walks
 /// `self.itemof` and sets `listdef.listitem = self`. DictKey /
-/// DictValue override `patch()` (dictdef.py:15-17, 70-72) to retarget
+/// DictValue override `patch()` (dictdef.py, 70-72) to retarget
 /// `dictdef.dictkey` / `dictdef.dictvalue` instead. Rust has no
 /// subclass dispatch for the `patch` override, so the enum captures
 /// the upstream subclass identity directly.
@@ -165,7 +165,7 @@ pub(crate) enum ItemOwner {
     DictValue(Weak<super::dictdef::DictDefInner>),
 }
 
-/// RPython `class ListItem` (listdef.py:12-117).
+/// RPython `class ListItem` (listdef.py).
 ///
 /// The identity-carrying element-type state of a list annotation. Wrap
 /// in `Rc<RefCell<ListItem>>` for sharing — sister `ListDef`s clone
@@ -173,8 +173,8 @@ pub(crate) enum ItemOwner {
 ///
 /// ## TODO: DictKey/DictValue field flattening
 ///
-/// Upstream has `class DictKey(ListItem)` (dictdef.py:7-66) and
-/// `class DictValue(ListItem)` (dictdef.py:69-72). The subclass
+/// Upstream has `class DictKey(ListItem)` (dictdef.py) and
+/// `class DictValue(ListItem)` (dictdef.py). The subclass
 /// instances share a `ListItem`-shaped cell with `DictDef` via
 /// `dictdef.dictkey` / `dictdef.dictvalue`, and merge operations walk
 /// across both base and subclass slots (`custom_eq_hash`,
@@ -184,7 +184,7 @@ pub(crate) enum ItemOwner {
 /// subclass fields onto this base struct. For non-DictKey uses the
 /// fields stay at their default (`custom_eq_hash = false`,
 /// `s_rdict_eqfn = s_rdict_hashfn = SomeValue::Impossible`) exactly
-/// as `class DictKey(ListItem)` declares in dictdef.py:8-9. This is
+/// as `class DictKey(ListItem)` declares in dictdef.py. This is
 /// the minimum-deviation collapse of subclass → flattened field
 /// (parity rule #1).
 #[derive(Debug)]
@@ -210,25 +210,25 @@ pub struct ListItem {
     pub immutable: bool,
     /// RPython `self.must_not_resize` (listdef.py:18).
     pub must_not_resize: bool,
-    /// RPython `self.itemof = {}` (listdef.py:32). Weak backrefs to
+    /// RPython `self.itemof = {}` (listdef.py). Weak backrefs to
     /// every owner currently using this `ListItem`.
     pub(crate) itemof: Vec<ItemOwner>,
-    /// RPython `self.read_locations = set()` (listdef.py:33).
+    /// RPython `self.read_locations = set()` (listdef.py).
     /// The ordered container is required because the key hashes on a
     /// pointer and the loop over the members produces a work order.
     pub(crate) read_locations: IndexSet<PositionKey>,
-    /// Flattened `DictKey.custom_eq_hash` (dictdef.py:13). `false` for
+    /// Flattened `DictKey.custom_eq_hash` (dictdef.py). `false` for
     /// every non-DictKey ListItem.
     pub custom_eq_hash: bool,
-    /// Flattened `DictKey.s_rdict_eqfn` (dictdef.py:8). Defaults to
+    /// Flattened `DictKey.s_rdict_eqfn` (dictdef.py). Defaults to
     /// `SomeValue::Impossible` (= upstream `s_ImpossibleValue`).
     pub s_rdict_eqfn: SomeValue,
-    /// Flattened `DictKey.s_rdict_hashfn` (dictdef.py:9).
+    /// Flattened `DictKey.s_rdict_hashfn` (dictdef.py).
     pub s_rdict_hashfn: SomeValue,
 }
 
 impl ListItem {
-    /// RPython `ListItem.__init__(bookkeeper, s_value)` (listdef.py:29-35).
+    /// RPython `ListItem.__init__(bookkeeper, s_value)` (listdef.py).
     ///
     /// Sets `dont_change_any_more = True` when `bookkeeper is None`.
     pub fn new(bookkeeper: Option<Rc<Bookkeeper>>, s_value: SomeValue) -> Self {
@@ -244,14 +244,14 @@ impl ListItem {
             must_not_resize: false,
             itemof: Vec::new(),
             read_locations: IndexSet::new(),
-            // Flattened DictKey defaults (dictdef.py:8-9, 13).
+            // Flattened DictKey defaults (dictdef.py, 13).
             custom_eq_hash: false,
             s_rdict_eqfn: SomeValue::Impossible,
             s_rdict_hashfn: SomeValue::Impossible,
         }
     }
 
-    /// RPython `ListItem.notify_update()` (listdef.py:104-107).
+    /// RPython `ListItem.notify_update()` (listdef.py).
     ///
     /// ```python
     /// def notify_update(self):
@@ -281,7 +281,7 @@ impl ListItem {
         }
     }
 
-    /// RPython `ListItem.generalize(s_other_value)` (listdef.py:109-117).
+    /// RPython `ListItem.generalize(s_other_value)` (listdef.py).
     ///
     /// Widens `self.s_value` with `s_other_value` via `unionof`, then
     /// (if widened) notifies reflow readers. Returns `true` when the
@@ -304,7 +304,7 @@ impl ListItem {
         Ok(updated)
     }
 
-    /// RPython `ListItem.mutate()` (listdef.py:37-42).
+    /// RPython `ListItem.mutate()` (listdef.py).
     pub fn mutate(&mut self) -> Result<(), TooLateForChange> {
         if !self.mutated {
             if self.dont_change_any_more {
@@ -316,7 +316,7 @@ impl ListItem {
         Ok(())
     }
 
-    /// RPython `ListItem.resize()` (listdef.py:44-50).
+    /// RPython `ListItem.resize()` (listdef.py).
     pub fn resize(&mut self) -> Result<(), AnnotatorError> {
         if !self.resized {
             if self.dont_change_any_more {
@@ -330,7 +330,7 @@ impl ListItem {
         Ok(())
     }
 
-    /// RPython `ListItem.setrangestep(step)` (listdef.py:52-56).
+    /// RPython `ListItem.setrangestep(step)` (listdef.py).
     pub fn setrangestep(&mut self, step: Option<i64>) -> Result<(), TooLateForChange> {
         if step != self.range_step {
             if self.dont_change_any_more {
@@ -341,7 +341,7 @@ impl ListItem {
         Ok(())
     }
 
-    /// RPython `ListItem.merge(other)` (listdef.py:58-98).
+    /// RPython `ListItem.merge(other)` (listdef.py).
     ///
     /// Takes two `Rc<RefCell<ListItem>>` associated-function style
     /// rather than `&mut self` / `&mut other` because the borrow
@@ -455,7 +455,7 @@ impl ListItem {
                 })?;
         }
 
-        // upstream: `self.itemof.update(other.itemof)` (listdef.py:85).
+        // upstream: `self.itemof.update(other.itemof)` (listdef.py).
         driver_li
             .borrow_mut()
             .itemof
@@ -474,7 +474,7 @@ impl ListItem {
             });
         }
 
-        // upstream: `self.patch()` (listdef.py:92, 100-103). After the
+        // upstream: `self.patch()` (listdef.py, 100-103). After the
         // itemof.update above, driver.itemof holds every owner; retarget
         // them all to driver.
         let patch_list = driver_li.borrow().itemof.clone();
@@ -545,14 +545,14 @@ pub(crate) struct ListDefInner {
     pub(crate) listitem: RefCell<Rc<RefCell<ListItem>>>,
 }
 
-/// RPython `class ListDef` (listdef.py:120-204).
+/// RPython `class ListDef` (listdef.py).
 #[derive(Clone)]
 pub struct ListDef {
     pub(crate) inner: Rc<ListDefInner>,
 }
 
 impl fmt::Debug for ListDef {
-    /// Parity with `ListDef.__repr__` (listdef.py:175):
+    /// Parity with `ListDef.__repr__` (listdef.py):
     /// `'<[%r]%s%s%s%s>'`, recursion-guarded so a self-referential
     /// element type elides instead of overflowing the stack.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -603,14 +603,14 @@ impl ListDef {
         ListDef { inner }
     }
 
-    /// RPython `ListDef.same_as(other)` (listdef.py:136-137).
+    /// RPython `ListDef.same_as(other)` (listdef.py).
     pub fn same_as(&self, other: &ListDef) -> bool {
         let a = self.inner.listitem.borrow();
         let b = other.inner.listitem.borrow();
         Rc::ptr_eq(&*a, &*b)
     }
 
-    /// RPython `ListDef.union(other)` (listdef.py:139-141).
+    /// RPython `ListDef.union(other)` (listdef.py).
     pub fn union_with(&self, other: &ListDef) -> Result<(), UnionError> {
         let self_li = self.inner.listitem.borrow().clone();
         let other_li = other.inner.listitem.borrow().clone();
@@ -632,14 +632,14 @@ impl ListDef {
         self.inner.listitem.borrow().clone()
     }
 
-    /// RPython `ListDef.mutate()` (listdef.py:182-183).
+    /// RPython `ListDef.mutate()` (listdef.py).
     pub fn mutate(&self) -> Result<(), TooLateForChange> {
         let li = self.inner.listitem.borrow().clone();
         let mut li_mut = li.borrow_mut();
         li_mut.mutate()
     }
 
-    /// RPython `ListDef.resize()` (listdef.py:185-187).
+    /// RPython `ListDef.resize()` (listdef.py).
     ///
     /// ```python
     /// def resize(self):
@@ -655,7 +655,7 @@ impl ListDef {
         li_mut.resize()
     }
 
-    /// RPython `ListDef.read_item(position_key)` (listdef.py:132-134).
+    /// RPython `ListDef.read_item(position_key)` (listdef.py).
     ///
     /// Records a read location for eventual `notify_update()` reflow,
     /// then returns the current element annotation. `position_key` is
@@ -675,14 +675,14 @@ impl ListDef {
         li_mut.s_value.clone()
     }
 
-    /// RPython `ListDef.generalize(s_value)` (listdef.py:167-168).
+    /// RPython `ListDef.generalize(s_value)` (listdef.py).
     pub fn generalize(&self, s_value: &SomeValue) -> Result<bool, UnionError> {
         let li = self.inner.listitem.borrow().clone();
         let mut li_mut = li.borrow_mut();
         li_mut.generalize(s_value)
     }
 
-    /// RPython `ListDef.never_resize(self)` (listdef.py:189-192).
+    /// RPython `ListDef.never_resize(self)` (listdef.py).
     ///
     /// ```python
     /// def never_resize(self):
@@ -700,7 +700,7 @@ impl ListDef {
         Ok(())
     }
 
-    /// RPython `ListDef.mark_as_immutable(self)` (listdef.py:194-204).
+    /// RPython `ListDef.mark_as_immutable(self)` (listdef.py).
     ///
     /// ```python
     /// def mark_as_immutable(self):
@@ -721,7 +721,7 @@ impl ListDef {
         Ok(())
     }
 
-    /// RPython `ListDef.offspring(bookkeeper, *others)` (listdef.py:154-165).
+    /// RPython `ListDef.offspring(bookkeeper, *others)` (listdef.py).
     ///
     /// ```python
     /// def offspring(self, bookkeeper, *others):
@@ -786,7 +786,7 @@ impl ListDef {
         Ok(())
     }
 
-    /// RPython `ListDef.agree(bookkeeper, other)` (listdef.py:143-152).
+    /// RPython `ListDef.agree(bookkeeper, other)` (listdef.py).
     ///
     /// Bidirectionally generalises both sides against each other at
     /// the bookkeeper's current position, then reconciles `range_step`

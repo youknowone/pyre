@@ -1,7 +1,7 @@
 /// Canonical hint kinds understood by the framework.
 ///
-/// RPython mirrors a single `hint(x, **kwds)` operator (`rlib/jit.py:81`,
-/// `flowspace/operation.py:521 add_operator('hint', None, dispatch=1)`)
+/// RPython mirrors a single `hint(x, **kwds)` operator (`rlib/jit.py`,
+/// `flowspace/operation.py add_operator('hint', None, dispatch=1)`)
 /// whose kwarg dict picks the behaviour.  Pyre's helper layer cannot
 /// carry kwarg dicts on a `Call` shape, so each kwarg-key gets its own
 /// dispatch-by-name helper (`hint_access_directly`, `hint_promote`, …)
@@ -12,19 +12,19 @@
 ///   * `hint(x, fresh_virtualizable=True)` → [`FreshVirtualizable`]
 ///   * `hint(x, force_virtualizable=True)` → [`ForceVirtualizable`]
 ///   * `hint(x, promote=True)`             → [`Promote`]
-///     (also reached via `rlib/jit.py:101 promote(x) → hint(x,
+///     (also reached via `rlib/jit.py promote(x) → hint(x,
 ///     promote=True)`, the user-facing wrapper).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HintKind {
     AccessDirectly,
     FreshVirtualizable,
     ForceVirtualizable,
-    /// `rlib/jit.py:101 promote(x)` / `hint(x, promote=True)`.  Rewrite
+    /// `rlib/jit.py promote(x)` / `hint(x, promote=True)`.  Rewrite
     /// emits `[-live-, <kind>_guard_value(x), Identity(x)]` per
     /// `codewriter/jtransform.py:608-614`; the `<kind>` char is
     /// resolved from the arg's value-kind at rewrite time.
     Promote,
-    /// `rlib/jit.py:127 promote_string(x)` / `hint(x,
+    /// `rlib/jit.py promote_string(x)` / `hint(x,
     /// promote_string=True)`.  Upstream emits the 3-input
     /// `str_guard_value/rid>r` op (`codewriter/jtransform.py:
     /// 615-631`) calling `_ll_2_str_eq_nonnull`
@@ -34,7 +34,7 @@ pub enum HintKind {
     /// equivalent GC layout (`rpython/rtyper/lltypesystem/rstr.py:
     /// 1226-1237 STR.become({hash, chars: Array(Char)})`).
     PromoteString,
-    /// `rlib/jit.py:130 promote_unicode(x)` / `hint(x,
+    /// `rlib/jit.py promote_unicode(x)` / `hint(x,
     /// promote_unicode=True)`.  Same upstream shape as
     /// `PromoteString` but on `Ptr(rstr.UNICODE)` arg
     /// (`codewriter/jtransform.py:632-648`).  Pyre panics for
@@ -42,7 +42,7 @@ pub enum HintKind {
     /// (`rpython/rtyper/lltypesystem/rstr.py:1238-1246
     /// UNICODE.become({hash, chars: Array(UniChar)})`).
     PromoteUnicode,
-    /// `rlib/jit.py:191-194` — `hint(arg, promote=True,
+    /// `rlib/jit.py` — `hint(arg, promote=True,
     /// promote_string=True)` carries both flags so jtransform's
     /// `codewriter/jtransform.py:599-606` disambiguator can pick
     /// the right rewrite based on the arg's `concretetype`.  Pyre's
@@ -55,7 +55,7 @@ pub enum HintKind {
     /// `PromoteString` when `op.args[0].concretetype ==
     /// lltype.Ptr(rstr.STR)` and `Promote` otherwise.  Pyre has no
     /// `Ptr(rstr.STR)` GC layout (`rpython/rtyper/lltypesystem/
-    /// rstr.py:1226-1237 STR.become(...)`), so the `if` branch is
+    /// rstr.py STR.become(...)`), so the `if` branch is
     /// structurally unreachable and every dual-flag hint falls
     /// through to plain `Promote`.
     PromoteOrString,

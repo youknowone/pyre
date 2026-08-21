@@ -1,5 +1,5 @@
 //! Two-argument `iter(callable, sentinel)` product
-//! (`pypy/module/__builtin__/operation.py:114-160 iter_sentinel`,
+//! (`pypy/module/__builtin__/operation.py iter_sentinel`,
 //! `Objects/iterobject.c calliterobject`).  Pyre's `iter` is
 //! interpreter-native, so the result is a small native iterator object
 //! rather than an app-level generator:

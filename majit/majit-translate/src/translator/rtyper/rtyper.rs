@@ -2,8 +2,8 @@
 //! `LowLevelOpList`.
 //!
 //! Mirrors upstream module layout: all three types live in the same
-//! file (`rtyper.py:47 RPythonTyper`, `rtyper.py:617 HighLevelOp`,
-//! `rtyper.py:783 LowLevelOpList`) because the `specialize_block →
+//! file (`rtyper.py RPythonTyper`, `rtyper.py HighLevelOp`,
+//! `rtyper.py LowLevelOpList`) because the `specialize_block →
 //! highlevelops → translate_hl_to_ll` dispatch loop ties them
 //! together.
 //!
@@ -343,15 +343,15 @@ pub(crate) enum PbcReprKey {
     AccessNone,
 }
 
-/// RPython `class RTyperBackend(object): pass` (`rtyper.py:30-31`).
+/// RPython `class RTyperBackend(object): pass` (`rtyper.py`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RTyperBackend;
 
-/// RPython `class GenCBackend(RTyperBackend): pass` (`rtyper.py:33-34`).
+/// RPython `class GenCBackend(RTyperBackend): pass` (`rtyper.py`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GenCBackend;
 
-/// RPython `class LLInterpBackend(RTyperBackend): pass` (`rtyper.py:37-38`).
+/// RPython `class LLInterpBackend(RTyperBackend): pass` (`rtyper.py`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LLInterpBackend;
 
@@ -367,7 +367,7 @@ pub struct RPythonTyper {
     /// Python's GC handles upstream.
     pub annotator: Weak<RPythonAnnotator>,
     /// RPython `self.rootclass_repr = RootClassRepr(self)` assigned at
-    /// `__init__` line 57 (rtyper.py:57). The `.setup()` call at
+    /// `__init__` line 57 (rtyper.py). The `.setup()` call at
     /// `__init__` line 58 is replayed inside
     /// [`RPythonTyper::initialize_exceptiondata`].
     ///
@@ -385,12 +385,12 @@ pub struct RPythonTyper {
     /// (rtyper.py:59). `None` classdef mirrors upstream Python's ability
     /// to use `None` as a dict key (option 3A from the porting plan).
     pub instance_reprs: RefCell<HashMap<InstanceReprKey, Arc<InstanceRepr>>>,
-    /// RPython `self.gcrefreprcache = {}` (`rtyper.py:60`) — used by
+    /// RPython `self.gcrefreprcache = {}` (`rtyper.py`) — used by
     /// `rgcref.GCRefRepr.make(r_base, cache)` when container reprs
     /// request `externalvsinternal(..., gcref=True)`.
     pub gcrefreprcache: RefCell<HashMap<usize, Arc<GCRefRepr>>>,
     /// RPython `self.exceptiondata = ExceptionData(self)` assigned in
-    /// `__init__` (rtyper.py:71). Stays `None` until
+    /// `__init__` (rtyper.py). Stays `None` until
     /// [`RPythonTyper::initialize_exceptiondata`] runs.
     pub exceptiondata: RefCell<Option<Rc<ExceptionData>>>,
     /// Self-weak backref populated by
@@ -409,35 +409,35 @@ pub struct RPythonTyper {
     /// RPython `self.concrete_calltables = {}` assigned in `__init__`
     /// (rtyper.py:57).
     pub concrete_calltables: RefCell<HashMap<usize, (LLCallTable, usize)>>,
-    /// RPython `self.cache_dummy_values = {}` (rtyper.py:66) — memoises the
+    /// RPython `self.cache_dummy_values = {}` (rtyper.py) — memoises the
     /// immortal placeholder allocated by
     /// [`crate::translator::rtyper::rmodel::DummyValueBuilder::ll_dummy_value`]
     /// (and the `GCREF` cast produced by
     /// [`crate::translator::rtyper::lltypesystem::rgcref::DummyValueBuilderGCRef::ll_dummy_value`])
     /// so every dummy of a given `TYPE` shares one prebuilt struct/array.
     pub cache_dummy_values: RefCell<HashMap<LowLevelType, LowLevelValue>>,
-    /// RPython `self.reprs = {}` (`rtyper.py:54`) — cache keyed by
+    /// RPython `self.reprs = {}` (`rtyper.py`) — cache keyed by
     /// `s_obj.rtyper_makekey()`. Pyre stores `Option<Arc<dyn Repr>>`
     /// because upstream pre-inserts `None` before calling
-    /// `rtyper_makerepr` to detect recursive `getrepr()` (rtyper.py:156).
+    /// `rtyper_makerepr` to detect recursive `getrepr()` (rtyper.py).
     pub reprs: RefCell<HashMap<ReprKey, Option<Arc<dyn Repr>>>>,
-    /// RPython `self._reprs_must_call_setup = []` (`rtyper.py:55`).
+    /// RPython `self._reprs_must_call_setup = []` (`rtyper.py`).
     pub reprs_must_call_setup: RefCell<Vec<Arc<dyn Repr>>>,
-    /// RPython `self._seen_reprs_must_call_setup = {}` (`rtyper.py:56`).
+    /// RPython `self._seen_reprs_must_call_setup = {}` (`rtyper.py`).
     ///
     /// Pyre stores pointer-identity fingerprints so Arc-equal Reprs
     /// are deduped without requiring `Hash + Eq` on the trait object.
     pub seen_reprs_must_call_setup: RefCell<Vec<*const ()>>,
-    /// RPython `self.primitive_to_repr = {}` (`rtyper.py:53`).
+    /// RPython `self.primitive_to_repr = {}` (`rtyper.py`).
     pub primitive_to_repr: RefCell<HashMap<LowLevelType, Arc<dyn Repr>>>,
-    /// RPython `self.pbc_reprs = {}` (`rtyper.py:58`, populated by
-    /// `rpbc.getFrozenPBCRepr` at rpbc.py:621-630). Keyed by
+    /// RPython `self.pbc_reprs = {}` (`rtyper.py`, populated by
+    /// `rpbc.getFrozenPBCRepr` at rpbc.py). Keyed by
     /// [`PbcReprKey`] — singleton cache for
     /// [`crate::translator::rtyper::rpbc::MultipleUnrelatedFrozenPBCRepr`]
     /// (and future `MultipleFrozenPBCRepr`).
     pub pbc_reprs: RefCell<HashMap<PbcReprKey, Arc<dyn Repr>>>,
-    /// RPython `self.annmixlevel = None` (rtyper.py:204) lazily filled
-    /// by [`RPythonTyper::getannmixlevel`] (rtyper.py:191-196). Reset to
+    /// RPython `self.annmixlevel = None` (rtyper.py) lazily filled
+    /// by [`RPythonTyper::getannmixlevel`] (rtyper.py). Reset to
     /// `None` at the start of every `specialize_more_blocks()` pass so
     /// helper-annotator state from a prior pass is not reused.
     pub annmixlevel:
@@ -453,7 +453,7 @@ pub struct RPythonTyper {
     /// [`RPythonTyper::initialize_exceptiondata`] after `self_weak` is
     /// set so the policy's `Weak<RPythonTyper>` backref is non-empty,
     /// matching upstream's `LowLevelAnnotatorPolicy(self)` argument.
-    /// Cached on the typer because `annotate_helper` (`rtyper.py:600`)
+    /// Cached on the typer because `annotate_helper` (`rtyper.py`)
     /// passes the same instance on every call.
     pub lowlevel_ann_policy: RefCell<Option<LowLevelAnnotatorPolicy>>,
 }
@@ -537,7 +537,7 @@ impl RPythonTyper {
         }
     }
 
-    /// RPython inlined segment of `RPythonTyper.__init__` (rtyper.py:57-58,71):
+    /// RPython inlined segment of `RPythonTyper.__init__` (rtyper.py):
     ///
     /// ```python
     /// self.rootclass_repr = RootClassRepr(self)
@@ -568,16 +568,16 @@ impl RPythonTyper {
         // LowLevelAnnotatorPolicy(self)`. The policy stores a
         // `Weak<RPythonTyper>` so it is safe to construct now that
         // `self_weak` is populated and to reuse on every
-        // `annotate_helper` call (`rtyper.py:600`).
+        // `annotate_helper` call (`rtyper.py`).
         *self.lowlevel_ann_policy.borrow_mut() = Some(LowLevelAnnotatorPolicy::new(Some(self)));
-        // rtyper.py:57 — `self.rootclass_repr = RootClassRepr(self)`.
+        // rtyper.py — `self.rootclass_repr = RootClassRepr(self)`.
         let root = Arc::new(RootClassRepr::new(self));
-        // rtyper.py:58 — `self.rootclass_repr.setup()`.
+        // rtyper.py — `self.rootclass_repr.setup()`.
         Repr::setup(root.as_ref())?;
         *self.rootclass_repr.borrow_mut() = Some(root.clone());
-        // rtyper.py:71 — `self.exceptiondata = ExceptionData(self)`.
+        // rtyper.py — `self.exceptiondata = ExceptionData(self)`.
         //
-        // Inlining exceptiondata.py:17-26 because `ExceptionData::new`
+        // Inlining exceptiondata.py because `ExceptionData::new`
         // upstream takes `rtyper` and directly reads back the state
         // this method just installed. We keep that single-shot body
         // here rather than add a `Rc<RPythonTyper>` ctor parameter to
@@ -696,14 +696,14 @@ impl RPythonTyper {
     }
 
     /// Test/debug helper mirroring `self.already_seen[block] = True`
-    /// in `specialize_more_blocks()` (rtyper.py:225).
+    /// in `specialize_more_blocks()` (rtyper.py).
     pub fn mark_already_seen(&self, block: &BlockRef) {
         self.already_seen
             .borrow_mut()
             .insert(BlockKey::of(block), true);
     }
 
-    /// RPython `RPythonTyper.getcallable(self, graph)` (rtyper.py:569-584).
+    /// RPython `RPythonTyper.getcallable(self, graph)` (rtyper.py).
     ///
     /// ```python
     /// def getcallable(self, graph):
@@ -724,7 +724,7 @@ impl RPythonTyper {
     ///     return getfunctionptr(graph, getconcretetype)
     /// ```
     pub fn getcallable(&self, graph: &Rc<PyGraph>) -> Result<_ptr, TyperError> {
-        // rtyper.py:572 — `if self.annotator.translator.config.translation.sandbox:`.
+        // rtyper.py — `if self.annotator.translator.config.translation.sandbox:`.
         let sandbox = self
             .annotator
             .upgrade()
@@ -785,7 +785,7 @@ impl RPythonTyper {
                 )));
             }
         }
-        // rtyper.py:584 — `return getfunctionptr(graph, getconcretetype)`.
+        // rtyper.py — `return getfunctionptr(graph, getconcretetype)`.
         getfunctionptr(&graph.graph, |v| {
             self.bindingrepr(v).map(|r| r.lowleveltype().clone())
         })
@@ -827,7 +827,7 @@ impl RPythonTyper {
             })?;
         }
 
-        // rtyper.py:600 — `policy=self.lowlevel_ann_policy`.
+        // rtyper.py — `policy=self.lowlevel_ann_policy`.
         // The same instance is reused on every call; `__init__`
         // (`rtyper.py:53`) stores it once. Surface the missing-init
         // case as a structured `TyperError` to mirror
@@ -928,7 +928,7 @@ impl RPythonTyper {
         Ok(LowLevelFunction::from_pygraph(name, args, result, graph))
     }
 
-    /// RPython `RPythonTyper.annotation(self, var)` (rtyper.py:166-168).
+    /// RPython `RPythonTyper.annotation(self, var)` (rtyper.py).
     ///
     /// ```python
     /// def annotation(self, var):
@@ -939,7 +939,7 @@ impl RPythonTyper {
         self.annotator.upgrade().and_then(|ann| ann.annotation(var))
     }
 
-    /// RPython `RPythonTyper.binding(self, var)` (rtyper.py:170-172).
+    /// RPython `RPythonTyper.binding(self, var)` (rtyper.py).
     ///
     /// ```python
     /// def binding(self, var):
@@ -976,7 +976,7 @@ impl RPythonTyper {
         self.reprs_must_call_setup.borrow_mut().push(repr);
     }
 
-    /// RPython `RPythonTyper.getrepr(self, s_obj)` (rtyper.py:149-164).
+    /// RPython `RPythonTyper.getrepr(self, s_obj)` (rtyper.py).
     ///
     /// ```python
     /// def getrepr(self, s_obj):
@@ -1040,7 +1040,7 @@ impl RPythonTyper {
         Ok(result)
     }
 
-    /// RPython `RPythonTyper.bindingrepr(self, var)` (rtyper.py:174-175).
+    /// RPython `RPythonTyper.bindingrepr(self, var)` (rtyper.py).
     ///
     /// ```python
     /// def bindingrepr(self, var):
@@ -1051,7 +1051,7 @@ impl RPythonTyper {
         self.getrepr(&s_obj)
     }
 
-    /// RPython `RPythonTyper.setconcretetype(self, v)` (rtyper.py:258-260).
+    /// RPython `RPythonTyper.setconcretetype(self, v)` (rtyper.py).
     ///
     /// ```python
     /// def setconcretetype(self, v):
@@ -1214,7 +1214,7 @@ impl RPythonTyper {
             return self.translate_no_return_value(hop);
         };
 
-        // rtyper.py:446 `isinstance(resultvar, (Variable, Constant))` is
+        // rtyper.py `isinstance(resultvar, (Variable, Constant))` is
         // structural under `Hlvalue`.
         let r_result = hop
             .r_result
@@ -1260,7 +1260,7 @@ impl RPythonTyper {
             Hlvalue::Constant(c) => c.concretetype.clone(),
         };
 
-        // rtyper.py:461 `op.result.concretetype = hop.r_result.lowleveltype`.
+        // rtyper.py `op.result.concretetype = hop.r_result.lowleveltype`.
         // Variable op.result: mutate in place (reference-semantic Rc<RefCell>
         // propagates to every clone). Constant op.result: construct a fresh
         // typed Constant mirror and thread it through `varmapping` /
@@ -1341,7 +1341,7 @@ impl RPythonTyper {
                 hop.spaceop.opname,
             )));
         }
-        // rtyper.py:488 `op.result.concretetype = Void` — unconditional
+        // rtyper.py `op.result.concretetype = Void` — unconditional
         // write regardless of whether op.result is Variable or Constant.
         // Variable: Rc<RefCell<Option<LowLevelType>>> propagates through
         // every clone of the same identity. Constant: upstream's Python
@@ -1592,9 +1592,9 @@ impl RPythonTyper {
             b.exits.iter().skip(skip).cloned().collect()
         };
         for link in exits {
-            // rtyper.py:382-383 — `_convert_link` and `setup_block_entry`
+            // rtyper.py — `_convert_link` and `setup_block_entry`
             // errors propagate uncaught; only `newops.convertvar` is
-            // wrapped with `gottypererror` (rtyper.py:400-403).
+            // wrapped with `gottypererror` (rtyper.py).
             self._convert_link(block, &link)?;
 
             let target = link
@@ -1704,13 +1704,13 @@ impl RPythonTyper {
         reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
     )]
     pub fn specialize_block(self: &Rc<Self>, block: &BlockRef) -> Result<(), TyperError> {
-        // RPython `transform.py:36-50` applies `transform_allocate`
-        // as part of `default_extra_passes` (`transform.py:246-251`)
+        // RPython `transform.py` applies `transform_allocate`
+        // as part of `default_extra_passes` (`transform.py`)
         // after whole-program annotation.  Pyre's cutover annotates
         // incrementally, so the whole-program `transform_graph`
         // cannot be applied to a partial block subset here.  This
         // pass is the only extra pass required by the rtyper for
-        // correctness (`rtype_alloc_and_set`, `rlist.py:346-351`,
+        // correctness (`rtype_alloc_and_set`, `rlist.py`,
         // consumes its output); it is a local, idempotent block
         // rewrite and is therefore safe immediately before
         // specialization.  The remaining three extra passes are
@@ -1863,18 +1863,18 @@ impl RPythonTyper {
             })?;
             ann.simplify(None, None);
         }
-        // rtyper.py:182 — `self.exceptiondata.finish(self)`.
+        // rtyper.py — `self.exceptiondata.finish(self)`.
         self.finish_exceptiondata()?;
-        // rtyper.py:186 — `self.already_seen = {}`. Upstream resets the
+        // rtyper.py — `self.already_seen = {}`. Upstream resets the
         // specialize visitation set so a second pass can retrace the
         // newly-created helper blocks; pyre mirrors this with a
         // RefCell-scoped clear.
         self.already_seen.borrow_mut().clear();
-        // rtyper.py:187 — first `specialize_more_blocks()` pass.
+        // rtyper.py — first `specialize_more_blocks()` pass.
         self.specialize_more_blocks()?;
-        // rtyper.py:188 — `self.exceptiondata.make_helpers(self)`.
+        // rtyper.py — `self.exceptiondata.make_helpers(self)`.
         self.exceptiondata()?.make_helpers(self)?;
-        // rtyper.py:189 — second `specialize_more_blocks()` pass for
+        // rtyper.py — second `specialize_more_blocks()` pass for
         // the helpers just made.
         self.specialize_more_blocks()?;
         Ok(())
@@ -1895,7 +1895,7 @@ impl RPythonTyper {
     ///   `annotator.all_blocks`, the Rust-side reverse index that keeps
     ///   Python's "dict keys ARE Block objects" iteration shape.
     pub fn specialize_more_blocks(self: &Rc<Self>) -> Result<(), TyperError> {
-        // upstream rtyper.py:204 — `self.annmixlevel = None`. Resets
+        // upstream rtyper.py — `self.annmixlevel = None`. Resets
         // the helper-annotator cache at every pass so each pass that
         // needs `getannmixlevel` constructs a fresh
         // `MixLevelHelperAnnotator` whose `pending` queue is drained on
@@ -1937,7 +1937,7 @@ impl RPythonTyper {
         Ok(())
     }
 
-    /// RPython `RPythonTyper.getannmixlevel(self)` (rtyper.py:191-196).
+    /// RPython `RPythonTyper.getannmixlevel(self)` (rtyper.py).
     ///
     /// ```python
     /// def getannmixlevel(self):
@@ -1952,7 +1952,7 @@ impl RPythonTyper {
     /// [`MixLevelHelperAnnotator`]. The cache is cleared at every
     /// [`Self::specialize_more_blocks`] entry, so callers within the
     /// same pass share one helper instance and `finish_annotate` in
-    /// `specialize` (rtyper.py:188) drains a deterministic queue.
+    /// `specialize` (rtyper.py) drains a deterministic queue.
     pub fn getannmixlevel(
         self: &Rc<Self>,
     ) -> Rc<crate::translator::rtyper::annlowlevel::MixLevelHelperAnnotator> {
@@ -2042,7 +2042,7 @@ impl RPythonTyper {
         Ok(result)
     }
 
-    /// RPython `RPythonTyper.call_all_setups(self)` (rtyper.py:243-256).
+    /// RPython `RPythonTyper.call_all_setups(self)` (rtyper.py).
     ///
     /// ```python
     /// def call_all_setups(self):
@@ -2125,10 +2125,10 @@ impl RPythonTyper {
         skipped
     }
 
-    /// RPython `HighLevelOp.dispatch` target (`rtyper.py:648-653`).
+    /// RPython `HighLevelOp.dispatch` target (`rtyper.py`).
     pub fn translate_operation(&self, hop: &HighLevelOp) -> RTypeResult {
         match hop.spaceop.opname.as_str() {
-            // rtyper.py:497-518 registers `translate_op_<opname>` for
+            // rtyper.py registers `translate_op_<opname>` for
             // unary/binary operations. Unary ops route to `Repr.rtype_*`;
             // binary ops route through the explicit pairtype dispatcher,
             // matching `pair(r_arg1, r_arg2).rtype_*`.
@@ -2237,23 +2237,23 @@ impl RPythonTyper {
             // `rtype_compare_template`, exactly as `mul` / `lt` route.
             "uint_mul_high" => super::rint::rtype_template(hop, "mul_high"),
             "uint_lt" => super::rint::rtype_compare_template(hop, "lt"),
-            // rtyper.py:547-549 — `translate_op_newtuple` calls the
+            // rtyper.py — `translate_op_newtuple` calls the
             // free function `rtuple.rtype_newtuple(hop)` which routes
             // to `TupleRepr._rtype_newtuple`. No per-Repr dispatch.
             "newtuple" => super::rtuple::TupleRepr::rtype_newtuple(hop),
-            // rtyper.py:543-545 — `translate_op_newlist` calls the free
+            // rtyper.py — `translate_op_newlist` calls the free
             // function `rlist.rtype_newlist(hop)` (`ll_newlist` +
             // positional `ll_setitem_fast`). No per-Repr dispatch.
             "newlist" => super::rlist::rtype_newlist(hop),
-            // rtyper.py:534-535 — `translate_op_alloc_and_set` calls the
+            // rtyper.py — `translate_op_alloc_and_set` calls the
             // free function `rlist.rtype_alloc_and_set(hop)` (`ll_newlist`
             // + `ll_alloc_and_set`). No per-Repr dispatch.
             "alloc_and_set" => super::rlist::rtype_alloc_and_set(hop),
-            // rtyper.py:531-532 — `translate_op_newdict` calls the free
+            // rtyper.py — `translate_op_newdict` calls the free
             // function `rdict.rtype_newdict(hop)` (`ll_newdict`). No
             // per-Repr dispatch.
             "newdict" => super::rdict::rtype_newdict(hop),
-            // rtuple.py:292-315 — `pairtype(TupleRepr, Repr).rtype_contains`.
+            // rtuple.py — `pairtype(TupleRepr, Repr).rtype_contains`.
             "contains" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_contains),
             // `same_as` (rtyper.py:478-481) is RPython's internal
             // renaming op.  It is generated by multiple producers
@@ -2350,7 +2350,7 @@ fn is_primitive_lowleveltype(lltype: &LowLevelType) -> bool {
     )
 }
 
-// HighLevelOp — `rtyper.py:617-779`.
+// HighLevelOp — `rtyper.py`.
 
 /// RPython `HighLevelOp.inputarg(converted_to, arg)` accepts either a
 /// `Repr` instance or a primitive low-level type. Rust makes that overload
@@ -2398,24 +2398,24 @@ impl<'a> ResolvedConvertedTo<'a> {
     }
 }
 
-/// RPython `class HighLevelOp(object)` (rtyper.py:617-779).
+/// RPython `class HighLevelOp(object)` (rtyper.py).
 ///
 /// The per-operation carrier passed to every `translate_op_*` +
 /// `Repr.rtype_*` method during `specialize_block`. Fields populated
 /// in two stages:
 ///
-/// * Construction (`HighLevelOp.__init__`, rtyper.py:619-623) — stores
+/// * Construction (`HighLevelOp.__init__`, rtyper.py) — stores
 ///   the rtyper/spaceop/exceptionlinks/llops handles.
-/// * `setup()` (rtyper.py:625-633) — materialises `args_v`, `args_s`,
+/// * `setup()` (rtyper.py) — materialises `args_v`, `args_s`,
 ///   `s_result`, `args_r`, `r_result` by querying the annotator and
 ///   the rtyper. Calls can still surface `MissingRTypeOperation` until
 ///   each concrete `SomeValue.rtyper_makerepr` arm is ported.
 pub struct HighLevelOp {
-    /// RPython `self.rtyper = rtyper` (rtyper.py:620).
+    /// RPython `self.rtyper = rtyper` (rtyper.py).
     pub rtyper: Rc<RPythonTyper>,
     /// RPython `self.spaceop = spaceop` (rtyper.py:621).
     pub spaceop: SpaceOperation,
-    /// RPython `self.exceptionlinks = exceptionlinks` (rtyper.py:622).
+    /// RPython `self.exceptionlinks = exceptionlinks` (rtyper.py).
     /// Set of exceptional successor links collected by
     /// `highlevelops(...)` when a block raises
     /// (`rtyper.py:428-431`).
@@ -2489,12 +2489,12 @@ impl HighLevelOp {
         *self.position_key.borrow_mut() = position_key;
     }
 
-    /// RPython `HighLevelOp.nb_args` property (rtyper.py:636-637).
+    /// RPython `HighLevelOp.nb_args` property (rtyper.py).
     pub fn nb_args(&self) -> usize {
         self.args_v.borrow().len()
     }
 
-    /// RPython `HighLevelOp.copy(self)` (`rtyper.py:639-646`).
+    /// RPython `HighLevelOp.copy(self)` (`rtyper.py`).
     pub fn copy(&self) -> Self {
         let result = HighLevelOp::new(
             self.rtyper.clone(),
@@ -2511,12 +2511,12 @@ impl HighLevelOp {
         result
     }
 
-    /// RPython `HighLevelOp.dispatch(self)` (`rtyper.py:648-653`).
+    /// RPython `HighLevelOp.dispatch(self)` (`rtyper.py`).
     pub fn dispatch(&self) -> RTypeResult {
         self.rtyper.translate_operation(self)
     }
 
-    /// RPython `HighLevelOp.setup(self)` (rtyper.py:625-633).
+    /// RPython `HighLevelOp.setup(self)` (rtyper.py).
     ///
     /// ```python
     /// def setup(self):
@@ -2693,7 +2693,7 @@ impl HighLevelOp {
         result
     }
 
-    /// RPython `HighLevelOp.exception_is_here(self)` (rtyper.py:731-745).
+    /// RPython `HighLevelOp.exception_is_here(self)` (rtyper.py).
     ///
     /// Stores the index of the current llop as the "raising" llop.
     pub fn exception_is_here(&self) -> Result<(), TyperError> {
@@ -2752,7 +2752,7 @@ impl HighLevelOp {
         Ok(())
     }
 
-    /// RPython `HighLevelOp.r_s_pop(self, index=-1)` (rtyper.py:693-696).
+    /// RPython `HighLevelOp.r_s_pop(self, index=-1)` (rtyper.py).
     ///
     /// ```python
     /// def r_s_pop(self, index=-1):
@@ -2769,12 +2769,12 @@ impl HighLevelOp {
         (r.remove(i), s.remove(i))
     }
 
-    /// RPython `HighLevelOp.r_s_popfirstarg(self)` (rtyper.py:698-700).
+    /// RPython `HighLevelOp.r_s_popfirstarg(self)` (rtyper.py).
     pub fn r_s_popfirstarg(&self) -> (Option<Arc<dyn Repr>>, SomeValue) {
         self.r_s_pop(Some(0))
     }
 
-    /// RPython `HighLevelOp.swap_fst_snd_args(self)` (rtyper.py:708-711).
+    /// RPython `HighLevelOp.swap_fst_snd_args(self)` (rtyper.py).
     pub fn swap_fst_snd_args(&self) {
         let mut v = self.args_v.borrow_mut();
         let mut s = self.args_s.borrow_mut();
@@ -2798,7 +2798,7 @@ impl HighLevelOp {
         Ok(())
     }
 
-    /// RPython `HighLevelOp.decompose_slice_args(self)` (rtyper.py:764-782).
+    /// RPython `HighLevelOp.decompose_slice_args(self)` (rtyper.py).
     ///
     /// ```python
     /// def decompose_slice_args(self):
@@ -2890,7 +2890,7 @@ impl HighLevelOp {
 }
 
 /// The three slice shapes RPython's `decompose_slice_args` selects
-/// (rtyper.py:764-782): `[:-1]`, `[start:]`, `[start:stop]`. Upstream keys
+/// (rtyper.py): `[:-1]`, `[start:]`, `[start:stop]`. Upstream keys
 /// the `globals()['ll_listslice_%s' % kind]` dispatch on the string name;
 /// the Rust port names them explicitly and maps each to the matching
 /// `ll_listslice_*` helper builder.
@@ -2904,15 +2904,15 @@ pub enum SliceKind {
     StartStop,
 }
 
-// LowLevelOpList — `rtyper.py:783-871+`.
+// LowLevelOpList — `rtyper.py+`.
 
-/// RPython `class LowLevelOpList(list)` (rtyper.py:783-809) — mutable
+/// RPython `class LowLevelOpList(list)` (rtyper.py) — mutable
 /// buffer of `SpaceOperation`s built during specialize_block.
 ///
 /// Upstream subclasses `list`; pyre keeps the list in `ops` and
 /// exposes Vec-style operations explicitly.
 pub struct LowLevelOpList {
-    /// RPython `self.rtyper = rtyper` (rtyper.py:794). Upstream's
+    /// RPython `self.rtyper = rtyper` (rtyper.py). Upstream's
     /// `__init__(self, rtyper=None, ...)` accepts `rtyper=None` so
     /// callers that only need `genop` (e.g.
     /// `removeassert.py:72 LowLevelOpList()`) can construct without
@@ -2921,7 +2921,7 @@ pub struct LowLevelOpList {
     /// `record_extra_call`, `record_extra_call_by_graph_id`) surface
     /// a structured `TyperError` when this is `None`.
     pub rtyper: Option<Rc<RPythonTyper>>,
-    /// RPython `self.originalblock = originalblock` (rtyper.py:795).
+    /// RPython `self.originalblock = originalblock` (rtyper.py).
     pub originalblock: Option<BlockRef>,
     /// RPython `LowLevelOpList.llop_raising_exceptions = None` class
     /// attribute (rtyper.py:790), set by
@@ -3230,7 +3230,7 @@ pub(crate) fn void_field_const(name: &str) -> Hlvalue {
     constant_with_lltype(ConstValue::byte_str(name), LowLevelType::Void)
 }
 
-/// `ll_both_none(ins1, ins2)` (rclass.py:1180-1181): `not ins1 and
+/// `ll_both_none(ins1, ins2)` (rclass.py): `not ins1 and
 /// not ins2` — the mixed-gcflavor `is` comparison can only be true
 /// when both pointers are null.  The two argument pointer types
 /// differ (one gc, one raw common repr), so the shape is validated
@@ -3384,7 +3384,7 @@ fn lowlevel_issubclass_helper_graph(
 /// pyre unifies the OBJECT_VTABLE layout into the runtime `PyType`
 /// GcStruct, so `subclassrange_{min,max}` are the PyType's own fields
 /// and the subclass check reads them straight off the PyType ptrs, the
-/// same `int_between` shape as `ll_issubclass` (rclass.py:1133-1137).
+/// same `int_between` shape as `ll_issubclass` (rclass.py).
 /// The class operand is never a materialised object_vtable `_ptr`
 /// (a `&PyType` static lowers to an opaque host-address `_ptr`), so both
 /// operands' ranges are read at runtime — no const-fold. Validation is
@@ -3522,7 +3522,7 @@ fn lowlevel_type_helper_graph(
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
-/// RPython `ll_isinstance(obj, cls)` (rclass.py:1143-1147):
+/// RPython `ll_isinstance(obj, cls)` (rclass.py):
 ///
 /// ```python
 /// def ll_isinstance(obj, cls):  # obj should be cast to OBJECT or NONGCOBJECT
@@ -3542,7 +3542,7 @@ fn lowlevel_isinstance_helper_graph(
     args: &[LowLevelType],
     result: &LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    // Upstream `ll_isinstance(obj, cls)` (rclass.py:1143) is
+    // Upstream `ll_isinstance(obj, cls)` (rclass.py) is
     // polymorphic over `obj`'s flavor — `# obj should be cast to
     // OBJECT or NONGCOBJECT`.  Accept either pointee so raw-flavor
     // instances mint a helper whose body matches their lowleveltype.
@@ -3657,7 +3657,7 @@ fn lowlevel_isinstance_helper_graph(
 /// `ll_isinstance_pytype(obj, cls)` — pyre variant of
 /// [`lowlevel_isinstance_helper_graph`]. `obj` is a
 /// `Ptr(GcStruct pyobject::PyObject)` whose `ob_type` field holds the
-/// runtime `PyType` (the OBJECT `typeptr` role, rclass.py:1143-1147).
+/// runtime `PyType` (the OBJECT `typeptr` role, rclass.py).
 /// Reads `obj.ob_type` and tail-calls `ll_issubclass_pytype`; the
 /// null-check is unconditional, matching pyre-object `ll_isinstance`'s
 /// `if obj.is_null() return false` (covering both can_be_none variants).
@@ -3776,7 +3776,7 @@ fn lowlevel_isinstance_pytype_helper_graph(
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
-/// RPython `make_ll_isinstance(rtyper, cls)` (rclass.py:1149-1168):
+/// RPython `make_ll_isinstance(rtyper, cls)` (rclass.py):
 ///
 /// ```python
 /// def make_ll_isinstance(rtyper, cls):
@@ -4240,7 +4240,7 @@ fn lowlevel_range_check_helper_graph(
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
-/// RPython `ll_min` / `ll_max` (rbuiltin.py:240-243 / 252-255):
+/// RPython `ll_min` / `ll_max` (rbuiltin.py / 252-255):
 ///
 /// ```python
 /// def ll_min(i1, i2):
@@ -4277,7 +4277,7 @@ fn lowlevel_min_max_helper_graph(
         (LowLevelType::Signed, true) => "int_gt",
         // `BoolRepr(IntegerRepr)` compares through `as_int =
         // signed_repr` (rbool.py:10-16; `_rtype_compare_template`
-        // picks `repr.opprefix + func` via `.as_int`, rint.py:605-614)
+        // picks `repr.opprefix + func` via `.as_int`, rint.py)
         // — so `min(bool, bool)` lowers to the Signed comparison.
         (LowLevelType::Bool, false) => "int_lt",
         (LowLevelType::Bool, true) => "int_gt",
@@ -4329,7 +4329,7 @@ fn lowlevel_min_max_helper_graph(
     );
 
     let (cmp1, cmp2) = if llt == LowLevelType::UniChar {
-        // rstr.py:795-799 `_rtype_unchr_compare_template_ord` — cast
+        // rstr.py `_rtype_unchr_compare_template_ord` — cast
         // each operand to Signed before the `int_<func>` comparison.
         let ord1 = variable_with_lltype("ord0", LowLevelType::Signed);
         let ord2 = variable_with_lltype("ord1", LowLevelType::Signed);
@@ -5755,7 +5755,7 @@ impl LowLevelOpList {
         }
     }
 
-    /// RPython `LowLevelOpList()` (rtyper.py:793-795 with default
+    /// RPython `LowLevelOpList()` (rtyper.py with default
     /// `rtyper=None`). Used by callers that only ever invoke
     /// `genop` and friends — e.g. `removeassert.py:72`. Methods
     /// that actually require the typer (`gendirectcall`,
@@ -5807,7 +5807,7 @@ impl LowLevelOpList {
         rtyper.lowlevel_helper_function_with_builder(name, args, result, builder)
     }
 
-    /// RPython `LowLevelOpList.hasparentgraph(self)` (rtyper.py:800-801).
+    /// RPython `LowLevelOpList.hasparentgraph(self)` (rtyper.py).
     pub fn hasparentgraph(&self) -> bool {
         self.originalblock.is_some()
     }
@@ -6134,7 +6134,7 @@ impl LowLevelOpList {
             .upgrade()
             .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
         // Upstream `:849`: `self.lowlevel_ann_policy` is set in
-        // `RPythonTyper.__init__` (`rtyper.py:53`) and is always
+        // `RPythonTyper.__init__` (`rtyper.py`) and is always
         // present at `with using_policy(self.lowlevel_ann_policy):`.
         // Mirror the strict-init invariant that local
         // [`RPythonTyper::annotate_helper`] already enforces
@@ -6220,7 +6220,7 @@ impl LowLevelOpList {
 }
 
 /// RPython `resulttype=None | LowLevelType | Repr` overload type in
-/// `LowLevelOpList.genop` (rtyper.py:825-843). Rust needs an explicit
+/// `LowLevelOpList.genop` (rtyper.py). Rust needs an explicit
 /// enum because the Python overload uses isinstance().
 pub(crate) enum GenopResult {
     /// `resulttype=None` — upstream emits `vresult.concretetype =
@@ -6271,7 +6271,7 @@ mod tests {
 
     #[test]
     fn annotate_helper_arg_matches_rtyper_py_someobject_or_lltype_branch() {
-        // rtyper.py:590-594 keeps already-annotation arguments as-is
+        // rtyper.py keeps already-annotation arguments as-is
         // and only maps low-level types through lltype_to_annotation.
         let already_annotation = SomeValue::Bool(SomeBool::new());
         assert!(matches!(
@@ -6294,7 +6294,7 @@ mod tests {
             .initialize_exceptiondata()
             .expect("initialize_exceptiondata");
 
-        // rtyper.py:57-58 — rootclass_repr set + setup.
+        // rtyper.py — rootclass_repr set + setup.
         let root = rtyper
             .rootclass_repr
             .borrow()
@@ -6316,7 +6316,7 @@ mod tests {
         assert_eq!(inst.object_type(), &OBJECT.clone());
         drop(cache);
 
-        // rtyper.py:71 / exceptiondata.py:22-25 — ExceptionData fields.
+        // rtyper.py:71 / exceptiondata.py — ExceptionData fields.
         let ed = rtyper.exceptiondata().expect("exceptiondata");
         assert_eq!(
             ed.lltype_of_exception_type,
@@ -6367,7 +6367,7 @@ mod tests {
 
     /// Allocate a vtable container and pre-populate the
     /// `subclassrange_min` / `subclassrange_max` head fields. Mirrors the
-    /// upstream `init_vtable` writes (`rclass.py:296-330`) at the granularity
+    /// upstream `init_vtable` writes (`rclass.py`) at the granularity
     /// `generate_exception_match` consumes — no rclass machinery needed.
     fn make_const_etype(min: i64, max: i64) -> Hlvalue {
         use crate::translator::rtyper::lltypesystem::lltype::{
@@ -6864,7 +6864,7 @@ mod tests {
 
     #[test]
     fn highlevelop_constructor_stores_fields_without_running_setup() {
-        // rtyper.py:619-623: `__init__` only records references; the
+        // rtyper.py: `__init__` only records references; the
         // args_v / args_s / args_r / s_result / r_result slots remain
         // empty until `setup()` runs (which pyre defers pending the
         // Repr-dispatch chain).
@@ -7179,7 +7179,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "wrong level!")]
     fn lowlevelop_genop_rejects_args_without_concretetype() {
-        // rtyper.py:826-832: `hop.args_v directly` mistake must
+        // rtyper.py: `hop.args_v directly` mistake must
         // assertion-fail.
         let rtyper = make_rtyper_rc();
         let mut llops = LowLevelOpList::new(rtyper, None);
@@ -7194,7 +7194,7 @@ mod tests {
 
     #[test]
     fn lowlevelop_without_rtyper_supports_genop() {
-        // rtyper.py:793-795 — `LowLevelOpList(rtyper=None)` is the
+        // rtyper.py — `LowLevelOpList(rtyper=None)` is the
         // shape `removeassert.py:72` uses. The Rust port mirrors
         // that with `LowLevelOpList::without_rtyper`; methods that
         // do not require the typer (`genop`, `append`, `len`,
@@ -7253,7 +7253,7 @@ mod tests {
         );
     }
 
-    /// rtyper.py:737-744 — when `has_implicit_exception` was called
+    /// rtyper.py — when `has_implicit_exception` was called
     /// at least once on this hop (`implicit_exceptions_checked` is
     /// `Some`, possibly empty), `exception_is_here` must verify that
     /// every `exceptionlink.exitcase` was checked. If a catch arm is
@@ -7353,7 +7353,7 @@ mod tests {
 
     #[test]
     fn lowlevel_helper_function_builds_rint_check_range_graphs() {
-        // rint.py:629-638: ll_check_chr / ll_check_unichr are real
+        // rint.py: ll_check_chr / ll_check_unichr are real
         // helper bodies, not signature-only synthetic graphs.
         let (_ann, rtyper) = make_live_rtyper();
         for (name, upper_bound) in [("ll_check_chr", 255), ("ll_check_unichr", 0x10ffff)] {
@@ -7539,7 +7539,7 @@ mod tests {
 
     #[test]
     fn rtyper_annotation_returns_none_without_binding() {
-        // rtyper.py:166-168 `annotation(var)` returns the annotator's
+        // rtyper.py `annotation(var)` returns the annotator's
         // bound value or None for unset variables — matches upstream.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
@@ -7549,7 +7549,7 @@ mod tests {
 
     #[test]
     fn rtyper_binding_passes_through_annotator_value() {
-        // rtyper.py:170-172 returns the annotator binding on the
+        // rtyper.py returns the annotator binding on the
         // positive path.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
@@ -7590,7 +7590,7 @@ mod tests {
 
     #[test]
     fn getrepr_surfaces_missing_rtype_operation_for_unported_variants() {
-        // rtyper.py:157 — `s_obj.rtyper_makerepr(self)` raises when
+        // rtyper.py — `s_obj.rtyper_makerepr(self)` raises when
         // the variant has no concrete Repr yet. Pyre surfaces
         // `MissingRTypeOperation` so cascading callers can anchor on
         // the upstream module name in the error message.
@@ -7668,7 +7668,7 @@ mod tests {
 
     #[test]
     fn highlevelops_empty_block_yields_nothing() {
-        // rtyper.py:423-424: `if block.operations:` gates the whole body.
+        // rtyper.py: `if block.operations:` gates the whole body.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let block = Block::shared(vec![]);
@@ -7714,7 +7714,7 @@ mod tests {
 
     #[test]
     fn getrepr_adds_pendingsetup_once_per_key() {
-        // rtyper.py:105-111 + 162: `add_pendingsetup` dedupes by
+        // rtyper.py + 162: `add_pendingsetup` dedupes by
         // Repr instance; the second getrepr hit must not re-enqueue
         // the cached Arc.
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -7777,7 +7777,7 @@ mod tests {
 
     #[test]
     fn highlevelop_setup_surfaces_missing_rtype_operation_for_unported_arg() {
-        // rtyper.py:625-633 → rtyper.py:157 `s_obj.rtyper_makerepr`
+        // rtyper.py → rtyper.py `s_obj.rtyper_makerepr`
         // surfaces MissingRTypeOperation when the argument's
         // SomeValue variant has no concrete Repr yet. Rather than
         // silently fail, the setup path returns the structured
@@ -7839,7 +7839,7 @@ mod tests {
 
     #[test]
     fn translate_no_return_value_on_constant_result_builds_void_typed_mirror() {
-        // rtyper.py:488 `op.result.concretetype = Void` writes
+        // rtyper.py `op.result.concretetype = Void` writes
         // unconditionally. When op.result is a Constant, Rust's
         // immutable Constant cannot be rewritten in place, so the
         // translate path builds a typed mirror Hlvalue. The method
@@ -7968,7 +7968,7 @@ mod tests {
 
     #[test]
     fn convert_link_default_string_exitcase_sets_llexitcase_none() {
-        // rtyper.py:354 — the `exitcase != 'default'` guard short-
+        // rtyper.py — the `exitcase != 'default'` guard short-
         // circuits, so `link.llexitcase` is zeroed even though the
         // exitcase is non-None.
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -8055,7 +8055,7 @@ mod tests {
 
     #[test]
     fn insert_link_conversions_single_exit_matching_reprs_generates_no_ops() {
-        // rtyper.py:398-399 — when `r_a1 == r_a2` for every link arg,
+        // rtyper.py — when `r_a1 == r_a2` for every link arg,
         // no conversion ops are generated. The link ends up unchanged
         // and the source block stays empty of operations.
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -8078,7 +8078,7 @@ mod tests {
 
     #[test]
     fn insert_link_conversions_constant_link_arg_rewritten_to_typed_constant() {
-        // rtyper.py:389-391 — `isinstance(a1, Constant)` short-circuits
+        // rtyper.py — `isinstance(a1, Constant)` short-circuits
         // through `inputconst(r_a2, a1.value)`, overwriting
         // `link.args[i]` with a typed Constant.
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -8218,7 +8218,7 @@ mod tests {
 
     #[test]
     fn specialize_block_setup_block_entry_error_is_annotated_through_gottypererror() {
-        // rtyper.py:292-296 — setup_block_entry failure is routed
+        // rtyper.py — setup_block_entry failure is routed
         // through gottypererror with the "block-entry" position tag.
         // Pyre surfaces both the underlying ExceptionData defer and
         // the where-annotation (graph name from annotator.annotated).
@@ -8317,7 +8317,7 @@ mod tests {
 
     #[test]
     fn specialize_more_blocks_marks_annotated_returnblock_as_seen() {
-        // rtyper.py:222-225 — the driver calls specialize_block on
+        // rtyper.py — the driver calls specialize_block on
         // each pending block and marks it already_seen. One pending
         // returnblock exercises the happy path end to end.
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -8347,7 +8347,7 @@ mod tests {
 
     #[test]
     fn specialize_more_blocks_propagates_setup_block_entry_error() {
-        // rtyper.py:222-224 — specialize_block errors bubble straight
+        // rtyper.py — specialize_block errors bubble straight
         // through; pyre preserves the gottypererror-annotated payload.
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
@@ -8383,7 +8383,7 @@ mod tests {
     #[test]
     fn insert_link_conversions_exception_target_block_error_propagates_without_gottypererror_wrap()
     {
-        // rtyper.py:382-383 vs 400-403 — `_convert_link` and
+        // rtyper.py vs 400-403 — `_convert_link` and
         // `setup_block_entry` errors propagate uncaught; only the
         // `newops.convertvar` call is wrapped through `gottypererror`.
         // Exception-shaped target is still the trigger (ExceptionData
@@ -8422,7 +8422,7 @@ mod tests {
 
     #[test]
     fn min_max_helper_graph_picks_cmp_op_by_lltype() {
-        // rbuiltin.py:240-243 / 252-255 — `ll_min` / `ll_max` compare
+        // rbuiltin.py / 252-255 — `ll_min` / `ll_max` compare
         // with the lltype-specific lt/gt op and return the winning arg
         // on the true/false links.
         for (llt, is_max, expected_op) in [

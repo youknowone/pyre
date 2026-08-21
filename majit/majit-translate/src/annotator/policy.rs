@@ -9,7 +9,7 @@
 //!
 //! ## Dependency-blocked paths
 //!
-//! * `specialize.memo` (specialize.py:275-313) requires evaluating
+//! * `specialize.memo` (specialize.py) requires evaluating
 //!   `value = func(*args)` at annotation time — impossible without a
 //!   Python runtime. The [`Specializer::Memo`] variant surfaces as
 //!   [`AnnotatorError`] matching upstream's `pyobj is None` path.
@@ -18,7 +18,7 @@
 //!   [`crate::translator::rtyper::annlowlevel`], wired through the
 //!   `Specializer::Ll` / `Specializer::LlAndArg` arms in
 //!   [`crate::annotator::description::FunctionDesc::pycall`].
-//! * `no_more_blocks_to_annotate(annotator)` (policy.py:69-100) —
+//! * `no_more_blocks_to_annotate(annotator)` (policy.py) —
 //!   fully structurally ported. Drains `bk.pending_specializations`
 //!   and iterates `added_blocks` / `annotated`, then rewrites call
 //!   sites whose callee annotation carries `needs_sandboxing`
@@ -47,7 +47,7 @@ use std::rc::Rc;
 use crate::annotator::bookkeeper::Bookkeeper;
 
 /// Enumerates the specializer entry points referenced by upstream
-/// `AnnotatorPolicy` class-level attributes (policy.py:53-67).
+/// `AnnotatorPolicy` class-level attributes (policy.py).
 ///
 /// Each variant names one function in
 /// `rpython/annotator/specialize.py` (or
@@ -136,7 +136,7 @@ impl std::fmt::Debug for PolicyHandle {
     }
 }
 
-/// RPython `class AnnotatorPolicy` (policy.py:11-100).
+/// RPython `class AnnotatorPolicy` (policy.py).
 ///
 /// The upstream class is subclass-hook-heavy: `event`,
 /// `get_specializer`, and `no_more_blocks_to_annotate` all accept a
@@ -418,7 +418,7 @@ pub(crate) fn specializer_from_normalized(
 }
 
 /// RPython `raise AttributeError(...)` / `raise Exception(...)` from
-/// `AnnotatorPolicy.get_specializer` (policy.py:36, :41-42).
+/// `AnnotatorPolicy.get_specializer` (policy.py, :41-42).
 ///
 /// The upstream class hierarchy mixes `AttributeError` and a bare
 /// `Exception` on the same code path; Rust collapses both into a

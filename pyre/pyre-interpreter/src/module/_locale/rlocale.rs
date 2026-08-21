@@ -29,12 +29,12 @@ pub(super) fn charp2str(ptr: *const libc::c_char) -> Vec<u8> {
     out
 }
 
-/// `rlocale.py:173-178 numeric_formatting`: the decimal point, thousands
+/// `rlocale.py numeric_formatting`: the decimal point, thousands
 /// separator and grouping string of the current locale, as the bytes
 /// `localeconv()` reports them.
 ///
 /// Off unix, without `host_env`, and under sandbox the C locale's values stand
-/// in.  Upstream declares `localeconv` `sandboxsafe=True` (`rlocale.py:167`,
+/// in.  Upstream declares `localeconv` `sandboxsafe=True` (`rlocale.py`,
 /// `:180-182`) and reads the host locale even there; pyre compiles the call out
 /// instead, because the sandbox build replaces `_locale`'s host entry points
 /// with raising stubs and `format()` must not acquire a raising path.

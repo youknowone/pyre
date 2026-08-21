@@ -6,7 +6,7 @@ use pyre_macros::pyre_class;
 
 // ── functional.rs ─────────────────────────────────────────────
 
-// `pypy/module/__builtin__/functional.py:218-310 W_Enumerate` line-by-line port.
+// `pypy/module/__builtin__/functional.py W_Enumerate` line-by-line port.
 //
 // ```python
 // class W_Enumerate(W_Root):
@@ -138,7 +138,7 @@ mod enumerate_tests {
 
 // ── functional.rs ─────────────────────────────────────────────
 
-// `pypy/module/__builtin__/functional.py:351-440 W_ReversedIterator`
+// `pypy/module/__builtin__/functional.py W_ReversedIterator`
 // line-by-line port.
 //
 // ```python
@@ -163,12 +163,12 @@ pub struct W_ReversedIterator {
     /// `functional.py:359 self.w_sequence` — the source sequence; set to
     /// `PY_NULL` once the iterator is exhausted (`:393`, `:404`).
     pub w_sequence: PyObjectRef,
-    /// `functional.py:355 self.remaining` — index of the next element to
+    /// `functional.py self.remaining` — index of the next element to
     /// yield, counting down from `len(seq) - 1`; `-1` once exhausted.
     pub remaining: i64,
 }
 
-/// Allocate a `W_ReversedIterator`.  Mirrors `functional.py:354-359
+/// Allocate a `W_ReversedIterator`.  Mirrors `functional.py
 /// __init__` with `remaining` already computed as `len(seq) - 1` by the
 /// caller.
 pub fn w_reversed_new(w_sequence: PyObjectRef, remaining: i64) -> PyObjectRef {
@@ -226,7 +226,7 @@ pub unsafe fn w_reversed_set_remaining(obj: PyObjectRef, value: i64) {
 
 // ── functional.rs ─────────────────────────────────────────────
 
-// `pypy/module/__builtin__/functional.py:838-914 W_Map` line-by-line port,
+// `pypy/module/__builtin__/functional.py W_Map` line-by-line port,
 // extended with the CPython 3.14 `strict` keyword (mirrors `zip`).
 //
 // ```python
@@ -308,7 +308,7 @@ pub unsafe fn w_map_set_strict(obj: PyObjectRef, value: bool) {
 
 // ── functional.rs ─────────────────────────────────────────────
 
-// `pypy/module/__builtin__/functional.py:916-1007 W_Filter` line-by-line
+// `pypy/module/__builtin__/functional.py W_Filter` line-by-line
 // port.
 //
 // ```python
@@ -377,7 +377,7 @@ pub unsafe fn w_filter_get_iterable(obj: PyObjectRef) -> PyObjectRef {
 
 // ── functional.rs ─────────────────────────────────────────────
 
-// `pypy/module/__builtin__/functional.py:1010-1123 W_Zip` line-by-line port.
+// `pypy/module/__builtin__/functional.py W_Zip` line-by-line port.
 //
 // ```python
 // class W_Zip(W_Root):
@@ -397,7 +397,7 @@ pub struct W_Zip {
     /// `functional.py:1016 self.iterators_w` — a `list` of sub-iterators, one
     /// per input iterable (`build_iterators_from_args`).
     pub w_iterators: PyObjectRef,
-    /// `functional.py:1014 self.strict`; `descr_setstate` toggles it.
+    /// `functional.py self.strict`; `descr_setstate` toggles it.
     pub strict: bool,
     /// `functional.py:1017 self._iteration_progress` — number of iterators
     /// already consumed in the current tuple, used by strict mismatch

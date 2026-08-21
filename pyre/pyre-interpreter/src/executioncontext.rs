@@ -34,11 +34,11 @@ pub fn force_frame(frame: *mut PyFrame) {
 /// Force a frame whose fastlocals application code is about to read.
 ///
 /// RPython needs no such call because the force is injected for it, not
-/// because none happens: `rvirtualizable.py:49-53 hook_access_field` genops
+/// because none happens: `rvirtualizable.py hook_access_field` genops
 /// `jit_force_virtualizable` on every redirected FIELD access,
 /// `virtualizable.py:288-292` rewrites those into a
 /// `force_virtualizable_if_necessary` call across `translator.graphs`, and
-/// `jtransform.py:2164-2172 rewrite_op_jit_force_virtualizable` drops it again
+/// `jtransform.py rewrite_op_jit_force_virtualizable` drops it again
 /// only in the graphs the codewriter looks inside.  So `pyframe.py:539
 /// fast2locals` always finds a materialized `locals_cells_stack_w` with no
 /// hand-placed hook anywhere.
@@ -66,13 +66,13 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
     }
 }
 
-/// `_jit_vref.py:48-52` `vref()` = `jit_force_virtual`.
+/// `_jit_vref.py` `vref()` = `jit_force_virtual`.
 ///
 /// `topframeref` and every frame's `f_backref` hold a `jit.virtual_ref` — at
-/// interpreter level (`_jit_vref.py:40 VRefRepr.lowleveltype = OBJECTPTR`) that
+/// interpreter level (`_jit_vref.py VRefRepr.lowleveltype = OBJECTPTR`) that
 /// is just the frame pointer itself, so forcing is the identity.  Once the JIT
 /// virtualizes an inlined callee, the slot instead holds a `JitVirtualRef`
-/// whose `virtualref.py:135 force_virtual_if_necessary` materializes the real
+/// whose `virtualref.py force_virtual_if_necessary` materializes the real
 /// frame.  The JIT installs that materialization via
 /// [`register_force_vref_hook`]; interp-level code never stores a
 /// `JitVirtualRef`, so `is_virtual_ref` is always false and this stays the
@@ -139,7 +139,7 @@ pub fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
 /// (on the `CURRENT_FRAME` chain and thus GC-rooted) for the whole
 /// callback, so returning it is safe; mark it escaped so the JIT keeps
 /// it materialised while the callback holds a reference
-/// (`pyframe.py:176 mark_as_escaped`).
+/// (`pyframe.py mark_as_escaped`).
 fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
     if frame.is_null() {
         return pyre_object::w_none();
@@ -148,7 +148,7 @@ fn wrap_trace_frame(frame: *mut PyFrame) -> PyObjectRef {
     frame as PyObjectRef
 }
 
-/// pypy/interpreter/executioncontext.py:10-15 app_profile_call.
+/// pypy/interpreter/executioncontext.py app_profile_call.
 ///
 /// Module-level low-level trampoline used by `setprofile` to bridge
 /// `setllprofile` (which stores a function pointer) to the user
@@ -264,7 +264,7 @@ pub(crate) fn walk_space_user_del_action_roots(visitor: &mut dyn FnMut(&mut maji
     }
 }
 
-/// `baseobjspace.py:173-193 W_Root.register_finalizer` — the single entry
+/// `baseobjspace.py W_Root.register_finalizer` — the single entry
 /// point through which a construction site asks for `_finalize_` to run once
 /// `obj` becomes unreachable.
 ///
@@ -325,7 +325,7 @@ pub struct ExecutionContext {
     /// `pypy/objspace/std/dictmultiobject.py:60-69
     /// allocate_and_init_instance(module=True)` parity — the builtins
     /// module's `w_dict` is a `W_ModuleDictObject` backed by
-    /// `ModuleDictStrategy` (`celldict.py:28`).  Populated once at
+    /// `ModuleDictStrategy` (`celldict.py`).  Populated once at
     /// construction time; pinned with `pin_root` so the strategy
     /// storage survives the EC's lifetime.
     builtins_module: PyObjectRef,
@@ -370,7 +370,7 @@ pub struct ExecutionContext {
     /// `Context.run`.  Execution-context-owned, not a process global or an
     /// independent Rust TLS side table.
     pub contextvar_context: PyObjectRef,
-    /// `objspace.py:131` `ec._py_repr` — the identity dict of objects currently
+    /// `objspace.py` `ec._py_repr` — the identity dict of objects currently
     /// being `repr()`'d (`__pypy__.objects_in_repr()`), lazily created.
     /// Recursive `__repr__` (e.g. `OrderedDict`) consults it to emit `...`
     /// instead of recursing.  Execution-context-owned like `contextvar_context`.
@@ -457,7 +457,7 @@ impl ExecutionContext {
         ec.w_profilefuncarg = pyre_object::PY_NULL;
         ec.thread_disappeared = false;
         ec.w_async_exception_type = pyre_object::PY_NULL;
-        // threadlocals.py:9 — a fresh worker EC starts disabled.  `_set_ec`
+        // threadlocals.py — a fresh worker EC starts disabled.  `_set_ec`
         // enables only the process main thread, and reinit_threads promotes
         // the surviving EC after a fork.
         ec.signals_enabled = 0;
@@ -470,7 +470,7 @@ impl ExecutionContext {
         // builtins_module, matching a fresh PyPy ExecutionContext.
         ec.builtin_dict_cache = std::cell::Cell::new(pyre_object::PY_NULL);
         ec.sys_exc_value = pyre_object::PY_NULL;
-        // executioncontext.py:53 — a fresh ExecutionContext starts at 0.
+        // executioncontext.py — a fresh ExecutionContext starts at 0.
         ec.coroutine_origin_tracking_depth = 0;
         ec.current_gen_or_coroutine = pyre_object::PY_NULL;
         ec.w_asyncgen_firstiter_fn = pyre_object::PY_NULL;
@@ -594,11 +594,11 @@ impl ExecutionContext {
     }
 
     pub fn enter(&mut self, frame: *mut PyFrame) {
-        // pypy/interpreter/executioncontext.py:85-89 enter parity.
+        // pypy/interpreter/executioncontext.py enter parity.
         //
         // `if self.space.reverse_debugging: self._revdb_enter(frame)` folds
         // away: the space carries `reverse_debugging = False`
-        // (baseobjspace.py:429) unless `config.translation.reverse_debugger`
+        // (baseobjspace.py) unless `config.translation.reverse_debugger`
         // sets it (baseobjspace.py:444), and reverse debugging is not ported.
         // Same fold `bytecode_only_trace` and `side_effects_ok` already carry.
         //
@@ -628,7 +628,7 @@ impl ExecutionContext {
         w_exitvalue: PyObjectRef,
         got_exception: bool,
     ) -> Result<(), crate::PyError> {
-        // pypy/interpreter/executioncontext.py:91-109 leave parity.
+        // pypy/interpreter/executioncontext.py leave parity.
         // The original wraps `_trace('leaveframe', …)` in try/finally so
         // the topframeref restore and the vref dance always run.  We
         // capture the trace result and propagate it after the cleanup
@@ -667,11 +667,11 @@ impl ExecutionContext {
         // interp level (both operands are already live in Rust); the JIT
         // records VIRTUAL_REF_FINISH during tracing.
         // `if self.space.reverse_debugging: self._revdb_leave(got_exception)`
-        // (executioncontext.py:108-109) folds away with the arm in `enter`.
+        // (executioncontext.py) folds away with the arm in `enter`.
         trace_result
     }
 
-    /// executioncontext.py:113-115 — `c_call_trace(self, frame, w_func, args=None)`.
+    /// executioncontext.py — `c_call_trace(self, frame, w_func, args=None)`.
     pub fn c_call_trace(
         &mut self,
         frame: *mut PyFrame,
@@ -681,7 +681,7 @@ impl ExecutionContext {
         self._c_call_return_trace(frame, w_func, args, "c_call")
     }
 
-    /// executioncontext.py:117-119 — `c_return_trace(self, frame, w_func, args=None)`.
+    /// executioncontext.py — `c_return_trace(self, frame, w_func, args=None)`.
     pub fn c_return_trace(
         &mut self,
         frame: *mut PyFrame,
@@ -691,7 +691,7 @@ impl ExecutionContext {
         self._c_call_return_trace(frame, w_func, args, "c_return")
     }
 
-    /// executioncontext.py:121-136 — `_c_call_return_trace`.
+    /// executioncontext.py — `_c_call_return_trace`.
     pub fn _c_call_return_trace(
         &mut self,
         frame: *mut PyFrame,
@@ -714,7 +714,7 @@ impl ExecutionContext {
         //       if w_firstarg is not None:
         //           w_func = descr_function_get(self.space, w_func,
         //                                       w_firstarg, self.space.type(w_firstarg))
-        // BuiltinFunction (function.py:786, the module-level
+        // BuiltinFunction (function.py, the module-level
         // builtin sibling) is intentionally excluded — function.py
         // splits the two so that "builtin function binds
         // differently" (no descriptor rebinding).  Pyre's
@@ -805,7 +805,7 @@ impl ExecutionContext {
             // before the upstream decrement-and-dispatch sequence below.
             self.actionflag.sync_async_ticker();
         }
-        // executioncontext.py:158-165 bytecode_trace:
+        // executioncontext.py bytecode_trace:
         //   def bytecode_trace(self, frame, decr_by=TICK_COUNTER_STEP):
         //       self.bytecode_only_trace(frame)
         //       actionflag = self.space.actionflag
@@ -818,7 +818,7 @@ impl ExecutionContext {
         // short-circuits before touching actionflag.
         frame = self.bytecode_only_trace(frame)?;
         if self.actionflag.decrement_ticker(decr_by as isize) < 0 {
-            // executioncontext.py:165 — `actionflag.action_dispatcher`.
+            // executioncontext.py — `actionflag.action_dispatcher`.
             // Routed through a residual (dont_look_inside) boundary so the
             // tracer never sees the action machinery's trait-object
             // virtual calls + `Result<(), PyError>` propagation, which the
@@ -839,13 +839,13 @@ impl ExecutionContext {
     /// out so the JIT warm-up loop can take the slow path inline once the
     /// ticker goes negative without re-entering `bytecode_trace`'s tracer
     /// gate.  Mirrors the `actionflag.action_dispatcher(self, frame)` call
-    /// in `bytecode_trace` (executioncontext.py:165).
+    /// in `bytecode_trace` (executioncontext.py).
     pub fn perform_actions(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
         let self_ptr = self as *mut ExecutionContext;
         self.actionflag.action_dispatcher(self_ptr, frame)
     }
 
-    /// pypy/interpreter/executioncontext.py:173-184 `bytecode_only_trace`.
+    /// pypy/interpreter/executioncontext.py `bytecode_only_trace`.
     ///
     /// ```python
     /// def bytecode_only_trace(self, frame):
@@ -931,7 +931,7 @@ impl ExecutionContext {
         }
     }
 
-    /// pypy/interpreter/executioncontext.py:185-200 `run_trace_func`.
+    /// pypy/interpreter/executioncontext.py `run_trace_func`.
     ///
     /// ```python
     /// def run_trace_func(self, frame):
@@ -1024,7 +1024,7 @@ impl ExecutionContext {
             self.actionflag.sync_async_ticker();
         }
         if self.actionflag.get_ticker() < 0 {
-            // executioncontext.py:207-208 — `if actionflag.get_ticker()
+            // executioncontext.py — `if actionflag.get_ticker()
             // < 0: actionflag.action_dispatcher(self, frame)`.  Routed
             // through the same residual boundary as `bytecode_trace` so a
             // signal delivered during exception handling propagates.
@@ -1038,7 +1038,7 @@ impl ExecutionContext {
         Ok(())
     }
 
-    /// pypy/interpreter/executioncontext.py:430-433 exception_trace.
+    /// pypy/interpreter/executioncontext.py exception_trace.
     ///
     /// ```python
     /// def exception_trace(self, frame, operationerr):
@@ -1076,7 +1076,7 @@ impl ExecutionContext {
         Ok(())
     }
 
-    /// `executioncontext.py:219-232 sys_exc_info` — the topmost handled
+    /// `executioncontext.py sys_exc_info` — the topmost handled
     /// exception, or PY_NULL when nothing is being handled.
     pub fn sys_exc_info(&self) -> PyObjectRef {
         if !self.sys_exc_value.is_null() {
@@ -1088,7 +1088,7 @@ impl ExecutionContext {
         pyre_object::PY_NULL
     }
 
-    /// `executioncontext.py:278-284 _get_topmost_exception` — the first
+    /// `executioncontext.py _get_topmost_exception` — the first
     /// exception parked on the suspended generator/coroutine chain.
     pub fn _get_topmost_exception(&self) -> PyObjectRef {
         let mut generator = self.current_gen_or_coroutine;
@@ -1242,7 +1242,7 @@ impl ExecutionContext {
         result
     }
 
-    /// pypy/interpreter/executioncontext.py:346-428 _trace.
+    /// pypy/interpreter/executioncontext.py _trace.
     ///
     /// Two-arm dispatch: the tracing arm fires every event for the
     /// frame's `w_f_trace` (or the global `w_tracefunc` on `'call'`),
@@ -1252,7 +1252,7 @@ impl ExecutionContext {
     /// `setprofile`-installed callbacks).
     ///
     /// `operr` carries the live `OperationError` instance that
-    /// `executioncontext.py:359-363` reads via `operr.w_type`,
+    /// `executioncontext.py` reads via `operr.w_type`,
     /// `operr.normalize_exception(space)`, and
     /// `operr.get_w_traceback(space)`.  Pyre's `error::OperationError`
     /// is the line-by-line port of `error.OperationError` (the same
@@ -1463,7 +1463,7 @@ impl ExecutionContext {
         Ok(())
     }
 
-    /// executioncontext.py:436-441 `checksignals`:
+    /// executioncontext.py `checksignals`:
     /// ```python
     /// if self.space.check_signal_action is not None:
     ///     self.space.check_signal_action.perform(self, None)
@@ -1526,7 +1526,7 @@ impl ExecutionContext {
     /// `pypy/module/__builtin__/moduledef.py:Module.__init__` — `space.builtin`
     /// is a `Module` (not a dict).  Lazily build a `Module` whose
     /// backing dict IS `self.builtins_module`, so subsequent
-    /// `module.getdict(space)` access (`pyframe.py:770 fget_f_builtins`)
+    /// `module.getdict(space)` access (`pyframe.py fget_f_builtins`)
     /// surfaces the same storage as a dict view.  The cache field stores
     /// the Module identity so identity-sensitive callers (PyPy
     /// `pick_builtin` `if w_builtin is space.builtin: return space.builtin`)
@@ -1560,7 +1560,7 @@ impl ExecutionContext {
             .map(|(key, _)| key)
             .collect();
         let module = pyre_object::w_module_new_aliasing_dict("builtins", self.builtins_module);
-        // function.py:797-815 BuiltinFunction.w_moduleobj. The defining
+        // function.py BuiltinFunction.w_moduleobj. The defining
         // module object does not exist while `new_builtin_module_dict` fills
         // the namespace, so bind each builtin's `__self__` now.
         for key in keys {
@@ -1585,14 +1585,14 @@ impl ExecutionContext {
     /// through `install_default_builtins` on the underlying DictStorage).
     /// Used by `LOAD_GLOBAL` / `LOAD_NAME` to reach builtins like `print`
     /// when the frame's `w_globals` lacks the name (pypy/interpreter/
-    /// pyopcode.py:558-565 LOAD_GLOBAL builtin fallback).
+    /// pyopcode.py LOAD_GLOBAL builtin fallback).
     pub fn lookup_builtin(&self, name: &str) -> Option<PyObjectRef> {
-        // `pypy/interpreter/pyopcode.py:558-565 LOAD_GLOBAL` builtin
+        // `pypy/interpreter/pyopcode.py LOAD_GLOBAL` builtin
         // fallback reads through the builtin Module's W_DictObject
         // (`space.getitem(space.builtin.w_dict, name)`).  Pyre's
         // `builtins_module` IS that W_ModuleDictObject; the
         // dispatching `w_dict_getitem_str` routes through
-        // `ModuleDictStrategy::getitem_str` (`celldict.py:143-145`).
+        // `ModuleDictStrategy::getitem_str` (`celldict.py`).
         unsafe { pyre_object::w_dict_getitem_str(self.builtins_module, name) }
     }
 }
@@ -1602,7 +1602,7 @@ impl ExecutionContext {
 /// Arm the eval breaker's async bit (`interp_signal.py:34-36`
 /// `SignalActionFlag.reset_ticker` publishing a negative ticker).
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the
 /// bit lives in a process-global word an OS signal handler also writes, so
 /// the tracer cannot model the read-modify-write and residualises it, the
 /// [`disarm_async_eval_breaker`] twin.
@@ -1720,7 +1720,7 @@ impl AbstractActionFlag {
     pub fn _rebuild_action_dispatcher(&mut self) {}
 }
 
-/// `pypy/interpreter/executioncontext.py:458-585` — `AbstractActionFlag`
+/// `pypy/interpreter/executioncontext.py` — `AbstractActionFlag`
 /// + `ActionFlag` virtual-dispatch interface.
 ///
 /// PyPy's `AbstractActionFlag.fire` (line 482), `setcheckinterval`
@@ -1739,13 +1739,13 @@ impl AbstractActionFlag {
 /// subclasses (`ActionFlag`) implement only the required methods;
 /// the default bodies stay a line-for-line port of upstream.
 pub trait ActionFlagOps {
-    /// pypy/interpreter/executioncontext.py:574-575 `ActionFlag.reset_ticker`.
+    /// pypy/interpreter/executioncontext.py `ActionFlag.reset_ticker`.
     fn reset_ticker(&mut self, value: isize);
 
-    /// pypy/interpreter/executioncontext.py:571-572 `ActionFlag.get_ticker`.
+    /// pypy/interpreter/executioncontext.py `ActionFlag.get_ticker`.
     fn get_ticker(&self) -> isize;
 
-    /// pypy/interpreter/executioncontext.py:577-585 `ActionFlag.decrement_ticker`.
+    /// pypy/interpreter/executioncontext.py `ActionFlag.decrement_ticker`.
     fn decrement_ticker(&mut self, by: isize) -> isize;
 
     /// Composition accessor: shared `AbstractActionFlag` state.
@@ -1811,12 +1811,12 @@ pub trait ActionFlagOps {
         (flag._nonperiodic_actions.len() - 1) as isize
     }
 
-    /// pypy/interpreter/executioncontext.py:519-520 `getcheckinterval`.
+    /// pypy/interpreter/executioncontext.py `getcheckinterval`.
     fn getcheckinterval(&self) -> usize {
         self.abstract_flag().checkinterval_scaled / TICK_COUNTER_STEP
     }
 
-    /// pypy/interpreter/executioncontext.py:482-490 `fire`.
+    /// pypy/interpreter/executioncontext.py `fire`.
     ///
     /// ```python
     /// def fire(self, action):
@@ -1834,7 +1834,7 @@ pub trait ActionFlagOps {
             return;
         }
         let base = unsafe { (*action).async_action() };
-        // executioncontext.py:484 — `assert action._action_index >= 0`.
+        // executioncontext.py — `assert action._action_index >= 0`.
         debug_assert!(
             base._action_index >= 0,
             "periodic actions must not call fire"
@@ -1847,7 +1847,7 @@ pub trait ActionFlagOps {
         }
     }
 
-    /// pypy/interpreter/executioncontext.py:522-529 `setcheckinterval`.
+    /// pypy/interpreter/executioncontext.py `setcheckinterval`.
     ///
     /// ```python
     /// def setcheckinterval(self, interval):
@@ -1866,7 +1866,7 @@ pub trait ActionFlagOps {
         self.reset_ticker(-1);
     }
 
-    /// pypy/interpreter/executioncontext.py:531-562 `action_dispatcher`.
+    /// pypy/interpreter/executioncontext.py `action_dispatcher`.
     ///
     /// ```python
     /// def action_dispatcher(ec, frame):
@@ -1898,7 +1898,7 @@ pub trait ActionFlagOps {
         // Each `perform` may deliver a signal, which runs the handler at
         // app level; the next action in the loop is handed the same frame.
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-        // executioncontext.py:538 — `self.reset_ticker(self.checkinterval_scaled)`.
+        // executioncontext.py — `self.reset_ticker(self.checkinterval_scaled)`.
         let interval = self.abstract_flag().checkinterval_scaled as isize;
         self.reset_ticker(interval);
         // executioncontext.py:539-540 — periodic actions iter.
@@ -1941,8 +1941,8 @@ pub trait ActionFlagOps {
     }
 }
 
-/// pypy/interpreter/executioncontext.py:566-585 `ActionFlag` merged with
-/// pypy/module/signal/interp_signal.py:24-51 `SignalActionFlag`.
+/// pypy/interpreter/executioncontext.py `ActionFlag` merged with
+/// pypy/module/signal/interp_signal.py `SignalActionFlag`.
 ///
 /// PyPy starts with a plain `ActionFlag` (its ticker is a Python field)
 /// and, when the `signal` module loads, rebinds `space.actionflag` to a
@@ -2018,7 +2018,7 @@ impl ActionFlag {
     }
 }
 
-/// pypy/interpreter/executioncontext.py:566-585 — `class ActionFlag(AbstractActionFlag)`.
+/// pypy/interpreter/executioncontext.py — `class ActionFlag(AbstractActionFlag)`.
 impl ActionFlagOps for ActionFlag {
     fn abstract_flag(&self) -> &AbstractActionFlag {
         &self.base
@@ -2028,14 +2028,14 @@ impl ActionFlagOps for ActionFlag {
         &mut self.base
     }
 
-    /// interp_signal.py:30-32 `SignalActionFlag.get_ticker` — `p.c_value`.
+    /// interp_signal.py `SignalActionFlag.get_ticker` — `p.c_value`.
     /// The safe-checkpoint synchronization above is the Rust equivalent of
     /// the signal handler making this cell negative.
     fn get_ticker(&self) -> isize {
         self._ticker
     }
 
-    /// interp_signal.py:34-36 `SignalActionFlag.reset_ticker` —
+    /// interp_signal.py `SignalActionFlag.reset_ticker` —
     /// `p.c_value = value`.
     fn reset_ticker(&mut self, value: isize) {
         self._ticker = value;
@@ -2061,7 +2061,7 @@ impl ActionFlagOps for ActionFlag {
         }
     }
 
-    /// interp_signal.py:42-51 `SignalActionFlag.decrement_ticker`.
+    /// interp_signal.py `SignalActionFlag.decrement_ticker`.
     ///
     /// ```python
     /// def decrement_ticker(self, by):
@@ -2183,7 +2183,7 @@ pub struct AsyncAction {
     /// Set by `AbstractActionFlag::register_nonperiodic_action` and
     /// consumed by `fire` / `action_dispatcher`'s bit test.
     pub bitmask: usize,
-    /// pypy/interpreter/executioncontext.py:603-606 `AsyncAction.fire`
+    /// pypy/interpreter/executioncontext.py `AsyncAction.fire`
     /// uses `self.space.actionflag` — a constant lookup once the action
     /// is constructed because PyPy's `space.actionflag` is set once at
     /// `pypy/interpreter/baseobjspace.py:447` and never replaced.
@@ -2224,7 +2224,7 @@ impl Default for AsyncAction {
 }
 
 impl AsyncAction {
-    /// pypy/interpreter/executioncontext.py:594-600 `AsyncAction.__init__`.
+    /// pypy/interpreter/executioncontext.py `AsyncAction.__init__`.
     ///
     /// ```python
     /// def __init__(self, space):
@@ -2279,7 +2279,7 @@ impl AsyncAction {
     }
 }
 
-/// pypy/interpreter/executioncontext.py:588-609 — `AsyncAction` virtual surface.
+/// pypy/interpreter/executioncontext.py — `AsyncAction` virtual surface.
 ///
 /// PyPy resolves `action.perform(ec, frame)` through Python class
 /// lookup (line 608-609 — base body is "To be overridden.").  Rust
@@ -2299,7 +2299,7 @@ pub enum AsyncActionControl {
 }
 
 pub trait AsyncActionOps {
-    /// pypy/interpreter/executioncontext.py:608-609 `AsyncAction.perform`:
+    /// pypy/interpreter/executioncontext.py `AsyncAction.perform`:
     /// `def perform(self, executioncontext, frame): "To be overridden."`
     ///
     /// Returns `Result` so an overriding action (e.g. `CheckSignalAction`)
@@ -2347,7 +2347,7 @@ pub trait AsyncActionOps {
         base.bitmask = 1usize << (index as usize);
     }
 
-    /// pypy/interpreter/executioncontext.py:602-606 `AsyncAction.fire`:
+    /// pypy/interpreter/executioncontext.py `AsyncAction.fire`:
     ///
     /// ```python
     /// @rgc.no_collect
@@ -2385,7 +2385,7 @@ pub trait AsyncActionOps {
             "AsyncAction::fire called before registration (executioncontext.py:605)"
         );
         let action_ptr: *mut dyn AsyncActionOps = self;
-        // executioncontext.py:606 — `self.space.actionflag.fire(self)`.
+        // executioncontext.py — `self.space.actionflag.fire(self)`.
         // The trait dispatch reaches the `ActionFlagOps::fire` default
         // body at line 1454 (which encodes executioncontext.py:482-490
         // `AbstractActionFlag.fire`).
@@ -2393,7 +2393,7 @@ pub trait AsyncActionOps {
     }
 }
 
-/// pypy/interpreter/executioncontext.py:588-609 — bare `AsyncAction`.
+/// pypy/interpreter/executioncontext.py — bare `AsyncAction`.
 /// Default `perform` is the "To be overridden." no-op; concrete
 /// subclasses override.
 impl AsyncActionOps for AsyncAction {
@@ -2456,7 +2456,7 @@ pub struct PeriodicAsyncAction {
 }
 
 impl PeriodicAsyncAction {
-    /// pypy/interpreter/executioncontext.py:594-600 `AsyncAction.__init__`
+    /// pypy/interpreter/executioncontext.py `AsyncAction.__init__`
     /// `else` arm (`isinstance(self, PeriodicAsyncAction)`): only sets
     /// `_action_index = -1`, leaves registration to subclass-specific
     /// `space.actionflag.register_periodic_action(self, use_bytecode_counter)`.
@@ -2470,7 +2470,7 @@ impl PeriodicAsyncAction {
         })
     }
 
-    // pypy/interpreter/executioncontext.py:594-600 — PeriodicAsyncAction
+    // pypy/interpreter/executioncontext.py — PeriodicAsyncAction
     // subclasses call `space.actionflag.register_periodic_action(self,
     // use_bytecode_counter)` after their own `__init__`.  In pyre this
     // is the trait default `AsyncActionOps::register_periodic_action`
@@ -2504,7 +2504,7 @@ impl AsyncActionOps for PeriodicAsyncAction {
     }
 }
 
-/// pypy/interpreter/executioncontext.py:612-615 — `PeriodicAsyncAction`
+/// pypy/interpreter/executioncontext.py — `PeriodicAsyncAction`
 /// admits `space.actionflag.register_periodic_action(self, ...)`.
 impl PeriodicAsyncActionOps for PeriodicAsyncAction {}
 
@@ -2531,7 +2531,7 @@ pub struct UserDelAction {
 }
 
 impl UserDelAction {
-    /// pypy/interpreter/executioncontext.py:618-631 `UserDelAction.__init__`.
+    /// pypy/interpreter/executioncontext.py `UserDelAction.__init__`.
     ///
     /// ```python
     /// class UserDelAction(AsyncAction):
@@ -2542,12 +2542,12 @@ impl UserDelAction {
     ///         self.pending_with_disabled_del = None
     /// ```
     ///
-    /// `AsyncAction.__init__` (executioncontext.py:594-600) registers
+    /// `AsyncAction.__init__` (executioncontext.py) registers
     /// the live instance as a nonperiodic action because UserDelAction
     /// is NOT a PeriodicAsyncAction subclass.  Pyre boxes the
     /// UserDelAction so registration captures a stable
     /// `*mut dyn AsyncActionOps` whose vtable dispatches into
-    /// `UserDelAction::perform` (executioncontext.py:632-633).
+    /// `UserDelAction::perform` (executioncontext.py).
     pub fn new(space: PyObjectRef, actionflag: &mut (dyn ActionFlagOps + 'static)) -> Box<Self> {
         let mut action = Box::new(Self {
             base: AsyncAction {
@@ -2731,7 +2731,7 @@ impl AsyncActionOps for UserDelAction {
     }
 }
 
-/// `pypy/module/cpyext/state.py:220-224 PyObjDeallocAction` — run the
+/// `pypy/module/cpyext/state.py PyObjDeallocAction` — run the
 /// deallocators of the mirrors the collector has queued.
 ///
 /// Separate from [`UserDelAction`] because it is a different queue with a
@@ -2774,7 +2774,7 @@ const _: () = {
         }
     }
 
-    /// `state.py:222-224` — `perform` is `_rawrefcount_perform(self.space)`.
+    /// `state.py` — `perform` is `_rawrefcount_perform(self.space)`.
     impl AsyncActionOps for PyObjDeallocAction {
         fn perform(
             &mut self,

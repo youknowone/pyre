@@ -206,7 +206,7 @@ fn sys_namespace_type() -> PyObjectRef {
         // rawdict key would instead claim the typedef manages the dict
         // (typedef.py:40) and suppress the mapdict one
         // (typeobject.py:253-257), so flip `hasdict` directly — the
-        // `create_dict_slot` flag flip (typeobject.py:1222-1226).
+        // `create_dict_slot` flag flip (typeobject.py).
         unsafe { w_type_set_hasdict(tp, true) };
         tp as usize
     });
@@ -369,7 +369,7 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 /// `types.SimpleNamespace` — the attribute-bag type exposed as
-/// `type(sys.implementation)` and re-published by `types.py:20`
+/// `type(sys.implementation)` and re-published by `types.py`
 /// (`SimpleNamespace = type(sys.implementation)`).
 ///
 /// `_structseq.py:166 SimpleNamespace`, with CPython 3.14's newer constructor,
@@ -715,7 +715,7 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// active context (set on eval-loop entry); see the helper's doc for
 /// the staleness gap relative to PyPy's `space.getexecutioncontext()`
 /// which always queries the thread state.
-/// `pypy/module/sys/vm.py:42 getframe` — the non-hidden frame-chain walk that
+/// `pypy/module/sys/vm.py getframe` — the non-hidden frame-chain walk that
 /// `sys._getframe` hands out.
 ///
 /// ```python
@@ -741,7 +741,7 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 ///
 /// The returned object is the live `PyFrame` itself (`FRAME_TYPE` typedef), not
 /// a stub, so `frame.f_globals is globals()` holds and `f_back` chains lazily
-/// through `pyframe.py:767 GetSetProperty(PyFrame.fget_f_back)`.
+/// through `pyframe.py GetSetProperty(PyFrame.fget_f_back)`.
 ///
 /// DEVIATION — the VIRTUALIZABLE force on `current`. The vref force is common
 /// to both worlds and is not optional (`ExecutionContext::gettopframe_raw`), so
@@ -749,9 +749,9 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// *virtualizable* force. Upstream takes neither, because
 /// `look_inside_iff(isconstant(depth))` traces a constant `depth` THROUGH, so
 /// the walk never becomes a residual call — and the frame it hands to app level
-/// materialises through the force `rvirtualizable.py:49-53 hook_access_field`
+/// materialises through the force `rvirtualizable.py hook_access_field`
 /// injects at every redirected FIELD access, which
-/// `jtransform.py:2164-2172 rewrite_op_jit_force_virtualizable` deletes only in
+/// `jtransform.py rewrite_op_jit_force_virtualizable` deletes only in
 /// the graphs the codewriter looks inside.  Pyre has no such injection —
 /// `rclass.rs buildinstancerepr` declines a virtualizable `InstanceRepr`
 /// outright — so the `force_frame` below IS that mechanism, relocated to one
@@ -772,7 +772,7 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// `VableEscapedDuringResidualCall`. Forcing the top of the stack regardless of
 /// `depth` therefore escaped the portal on every call, including the ones whose
 /// answer lies BELOW it; upstream escapes nothing there, because
-/// `pyjitpl.py:2159-2161 _do_jit_force_virtual` answers `topframeref` with
+/// `pyjitpl.py _do_jit_force_virtual` answers `topframeref` with
 /// `virtualizable_boxes[-1]` and never forces it. Measured over the `getframe_*`
 /// corpus: five fixtures that had never compiled a loop now compile one, and the
 /// two bridge fixtures read `guard_failures` 4114 → 201.
@@ -818,7 +818,7 @@ pub fn getframe(depth: i64) -> crate::PyResult {
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(current) };
     crate::executioncontext::force_frame(current);
     current = anchor.live();
-    // `vm.py:51 audit(space, "sys._getframe", [f])`.  Ordered after the force
+    // `vm.py audit(space, "sys._getframe", [f])`.  Ordered after the force
     // because a hook is app code that reads the frame it is handed, and the
     // force is what makes those reads see the JIT's live virtualizable fields —
     // upstream gets that ordering from the `hook_access_field` injection at
@@ -836,7 +836,7 @@ pub fn getframe(depth: i64) -> crate::PyResult {
     Ok(current as PyObjectRef)
 }
 
-/// `pypy/module/sys/vm.py:29 _getframe` — `@unwrap_spec(depth=int)`, the
+/// `pypy/module/sys/vm.py _getframe` — `@unwrap_spec(depth=int)`, the
 /// argument surface in front of [`getframe`].
 ///
 /// A named `fn` rather than a closure so [`is_builtin_getframe_function`] can
@@ -904,7 +904,7 @@ fn sys_gettrace_impl(_args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn sys_settrace_impl(args: &[PyObjectRef]) -> crate::PyResult {
-    // pypy/module/sys/vm.py:217 `def settrace(space, w_func)` — w_func is
+    // pypy/module/sys/vm.py `def settrace(space, w_func)` — w_func is
     // a required positional. Calling `sys.settrace()` with no args raises
     // TypeError at the gateway layer in PyPy; reproduce that here.
     let w_func = *args.first().ok_or_else(|| {
@@ -931,7 +931,7 @@ fn sys_getprofile_impl(_args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
-    // pypy/module/sys/vm.py:227 `def setprofile(space, w_func)` — w_func
+    // pypy/module/sys/vm.py `def setprofile(space, w_func)` — w_func
     // is a required positional. Calling `sys.setprofile()` with no args
     // raises TypeError at the gateway layer in PyPy.
     let w_func = *args.first().ok_or_else(|| {
@@ -941,7 +941,7 @@ fn sys_setprofile_impl(args: &[PyObjectRef]) -> crate::PyResult {
     })?;
     let ec = current_execution_context();
     if !ec.is_null() {
-        // executioncontext.py:317-318 ValueError("Cannot call setllprofile
+        // executioncontext.py ValueError("Cannot call setllprofile
         // with real None") propagates via setprofile -> setllprofile.
         unsafe { (*ec).setprofile(w_func)? };
     }
@@ -1186,7 +1186,7 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
 /// as a `(type, value, traceback)` tuple.
 ///
 /// Used by both the regular `sys.exc_info` builtin and the JIT direct path
-/// in `function.funccall_valuestack` (function.py:146-150). Splitting it
+/// in `function.funccall_valuestack` (function.py). Splitting it
 /// out lets the JIT bypass invoke the same logic without going through the
 /// builtin call dispatch.
 pub fn exc_info_direct() -> PyObjectRef {
@@ -1213,7 +1213,7 @@ pub fn exc_info_direct() -> PyObjectRef {
                 exc_type
             };
             // The third tuple slot mirrors
-            // `vm.py:147-153 exc_info_with_tb`'s
+            // `vm.py exc_info_with_tb`'s
             // `operror.get_w_traceback(space)`, i.e. the slot read plus
             // the escape mark it wraps.  Pyre stores the chain on the
             // typed `w_traceback` slot of `W_BaseException`; surface it
@@ -1335,7 +1335,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // published beside `winver` because both come from the same `MS_COREDLL`
     // block.  `ctypes/__init__.py:562` builds `pythonapi` out of it with no
     // import guard, so a missing attribute is an AttributeError out of `import
-    // ctypes`.  `vm.py:301 get_dllhandle` answers 0 for a build without
+    // ctypes`.  `vm.py get_dllhandle` answers 0 for a build without
     // `cpyext`, and there is no cpyext here, so 0 is the whole answer: the
     // handle names an API this interpreter does not export, and reporting the
     // executable's own module would only make `pythonapi` fail one call later.
@@ -1420,7 +1420,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(ns, "__stdout__", stdout);
     module_ns_store(ns, "__stderr__", stderr);
     module_ns_store(ns, "__stdin__", stdin);
-    // `vm.py:29 _getframe` (arguments) over `vm.py:42 getframe` (the walk) —
+    // `vm.py _getframe` (arguments) over `vm.py getframe` (the walk) —
     // see [`sys_getframe`] and [`getframe`], which keep upstream's split.
     module_ns_store(
         ns,
@@ -1482,7 +1482,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             if current.is_null() {
                 return Ok(pyre_object::w_none());
             }
-            // `w_globals` is one of the six fields `interp_jit.py:25-30`
+            // `w_globals` is one of the six fields `interp_jit.py`
             // declares virtualizable, so the frame it is read off has to be
             // materialized first.  The force belongs HERE, at the consumer, and
             // not at the walk that reached the frame — see [`force_frame`]:
@@ -1513,7 +1513,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `BuiltinCode` object backing `exc_info_fn`; `getcode` returns it.
     let exc_info_code = unsafe { crate::getcode(exc_info_fn) };
     crate::function::register_sys_exc_info_path(exc_info_code, exc_info_direct);
-    // sys.flags — pypy/module/sys/app.py:99-119 `class sysflags` with
+    // sys.flags — pypy/module/sys/app.py `class sysflags` with
     // `__metaclass__ = structseqtype`: an immutable tuple subclass whose
     // first `n_sequence_fields` entries are also indexable, so
     // `sys.flags[3] is sys.flags.optimize` and `isinstance(sys.flags,
@@ -1675,7 +1675,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "_get_cpu_count_config",
         make_builtin_function_with_arity("_get_cpu_count_config", |_| Ok(w_int_new(-1)), 0),
     );
-    // sys.getrecursionlimit / setrecursionlimit — pypy/module/sys/vm.py:45.
+    // sys.getrecursionlimit / setrecursionlimit — pypy/module/sys/vm.py.
     // The runtime stack budget lives in `crate::stack_check`; both
     // helpers route through it so the interpreter, JIT prologue probe,
     // and blackhole resume see a consistent recursion budget.
@@ -1702,7 +1702,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         make_builtin_function_with_arity(
             "setrecursionlimit",
             |args| {
-                // pypy/module/sys/vm.py:63 `@unwrap_spec(new_limit="c_int")`
+                // pypy/module/sys/vm.py `@unwrap_spec(new_limit="c_int")`
                 // — exactly one positional argument, coerced through
                 // baseobjspace.c_int_w (gateway_int_w + 32-bit range
                 // check). `c_int_w` accepts int subclasses and any object
@@ -2146,14 +2146,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
     // construct install paths.
     module_ns_store(ns, "platlibdir", w_str_new("lib"));
-    // `sys/app.py:114-126 exit(exitcode=None)` — raise SystemExit(exitcode),
+    // `sys/app.py exit(exitcode=None)` — raise SystemExit(exitcode),
     // de-tupelizing a tuple argument so `exit((a, b))` becomes
     // `SystemExit(a, b)` (the extra de-tupelizing normalize_exception does
     // for `raise SystemExit, exitcode`).  A bare `exit()` defaults exitcode
     // to None, so the instance carries `code = None` / `args = (None,)`.
     // Interpreting the code (None → 0, int() coercion,
     // print-non-integral-and-exit-1) is the launcher's job
-    // (`app_main.py:114-129 handle_sys_exit`).
+    // (`app_main.py handle_sys_exit`).
     module_ns_store(
         ns,
         "exit",
@@ -2717,7 +2717,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // `vm.py:473 audit` — `@unwrap_spec(event="text")`, so the event name is
+    // `vm.py audit` — `@unwrap_spec(event="text")`, so the event name is
     // required and must be a str; everything after it is the argument tuple.
     module_ns_store(
         ns,
@@ -2783,7 +2783,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `importlib._bootstrap_external.cache_from_source` reads it to compute the
     // bytecode path before `dont_write_bytecode` is consulted.
     module_ns_store(ns, "pycache_prefix", w_none());
-    // `vm.py:485 addaudithook`
+    // `vm.py addaudithook`
     module_ns_store(
         ns,
         "addaudithook",
@@ -2794,7 +2794,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     audit_holder();
 }
 
-/// `pypy/module/sys/vm.py:438 AuditHolder`, which upstream reaches through
+/// `pypy/module/sys/vm.py AuditHolder`, which upstream reaches through
 /// `space.fromcache(AuditHolder)`.
 ///
 /// pyre has no space object graph to hang a cache object off, so the holder is
@@ -2813,7 +2813,7 @@ pub struct AuditHolder {
     /// freed, so [`pyre_object::quasiimmut::QuasiImmutField`]'s `Drop` is
     /// unreachable and its inner box is reclaimed only through `invalidate`.
     pub hooks_watchers: pyre_object::quasiimmut::QuasiImmutField,
-    /// A boxed slice rather than a `Vec` because `vm.py:502
+    /// A boxed slice rather than a `Vec` because `vm.py
     /// debug.make_sure_not_resized` is the other half of that declaration:
     /// [`sys_addaudithook`] replaces the list, never grows it in place.
     hooks_w: Box<[pyre_object::PyObjectRef]>,
@@ -2862,7 +2862,7 @@ pub fn audit_holder_ptr() -> *const AuditHolder {
     AUDIT_HOOKS.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// `quasiimmut.py:17-27 get_current_qmut_instance` for the holder's
+/// `quasiimmut.py get_current_qmut_instance` for the holder's
 /// `hooks_w?` field.
 ///
 /// # Safety
@@ -2890,7 +2890,7 @@ pub(crate) fn walk_audit_hooks_gc(visitor: &mut dyn FnMut(&mut pyre_object::PyOb
     }
 }
 
-/// `vm.py:447 AuditHolder.trigger_audit_events`.
+/// `vm.py AuditHolder.trigger_audit_events`.
 fn trigger_audit_events(
     holder: &AuditHolder,
     w_event: pyre_object::PyObjectRef,
@@ -2935,11 +2935,11 @@ fn trigger_audit_events(
     let mut result = Ok(());
     for i in 0..hook_count {
         let w_hook = pyre_object::gc_roots::shadow_stack_get(hooks_slot + i);
-        // `space.findattr` (`baseobjspace.py:881-888`) answers `None` for ANY
+        // `space.findattr` (`baseobjspace.py`) answers `None` for ANY
         // non-async error out of the lookup, so a hook whose `__cantrace__`
         // descriptor raises is simply treated as not having one.  The bare
         // `findattr` panics on those instead, and this argument is app code, so
-        // it is the async arm alone (`error.py:62-65`; pyre carries SystemExit
+        // it is the async arm alone (`error.py`; pyre carries SystemExit
         // of that pair today) that may travel out of here.
         let w_cantrace = match crate::baseobjspace::findattr_result(w_hook, "__cantrace__") {
             Ok(found) => found,
@@ -2984,7 +2984,7 @@ fn trigger_audit_events(
     result
 }
 
-/// `vm.py:474 audit` with the event already wrapped, for callers that hold a
+/// `vm.py audit` with the event already wrapped, for callers that hold a
 /// `str` object rather than a Rust `&str`.
 pub fn audit_w(
     w_event: pyre_object::PyObjectRef,
@@ -2997,7 +2997,7 @@ pub fn audit_w(
     trigger_audit_events(unsafe { &*holder }, w_event, args_w)
 }
 
-/// `vm.py:474 audit` — `space.audit(event, args_w)` for interpreter-level
+/// `vm.py audit` — `space.audit(event, args_w)` for interpreter-level
 /// emitters.  Free when no hook is installed, which is what lets a caller on a
 /// hot path emit unconditionally.
 pub fn audit(event: &str, args_w: &[pyre_object::PyObjectRef]) -> Result<(), crate::PyError> {
@@ -3025,7 +3025,7 @@ pub fn audit_hooks_armed() -> bool {
     !holder.is_null() && unsafe { (*holder).hooks_armed.get() }
 }
 
-/// `vm.py:474 audit(space, event, args_w)` under `@unwrap_spec(event="text")`.
+/// `vm.py audit(space, event, args_w)` under `@unwrap_spec(event="text")`.
 ///
 /// The unwrap in front of the hook dispatch is observable on its own: the
 /// parameters are positional-only, and the event name has to be a `str` with a
@@ -3077,7 +3077,7 @@ fn sys_audit(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
-/// `vm.py:486 addaudithook`.  The hooks already installed get a say: an
+/// `vm.py addaudithook`.  The hooks already installed get a say: an
 /// `Exception` out of the `sys.addaudithook` event means the set refused the
 /// new hook, and it is dropped rather than added.  A `BaseException` outside
 /// `Exception` propagates.  The new hook is not installed yet when the event
@@ -3117,7 +3117,7 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         let next = next.into_boxed_slice();
         // Notification precedes the store, as `rclass.py:1010-1012
         // hook_setfield` emits `jit_force_quasi_immutable` before `setfield`.
-        // The `is_installed()` fast path is `quasiimmut.py:38-41 invalidation`'s
+        // The `is_installed()` fast path is `quasiimmut.py invalidation`'s
         // null test, so an unwatched install stays lock-free.
         if (*holder).hooks_watchers.is_installed() {
             pyre_object::quasiimmut::sweep_quasi_immut_field(&(*holder).hooks_watchers);
@@ -3315,7 +3315,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_root(buffer);
     let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    // `app_main.py:484 create_stdio` names the raw descriptor object rather
+    // `app_main.py create_stdio` names the raw descriptor object rather
     // than the wrapper, so `repr(sys.stdin.buffer)` reads `name='<stdin>'`
     // instead of the bare descriptor number.
     if let Ok(raw) =

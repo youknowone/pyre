@@ -4,7 +4,7 @@
 /// a RegLoc, FrameLoc, ImmedLoc, or AddressLoc.
 use crate::arch::WORD;
 
-/// regloc.py:18 AssemblerLocation — location code identifies the kind.
+/// regloc.py AssemblerLocation — location code identifies the kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LocationCode {
     /// 'r' — general-purpose register
@@ -21,7 +21,7 @@ pub enum LocationCode {
     AddrImmed,
 }
 
-/// regloc.py:131 RegLoc — a register location (GPR or XMM).
+/// regloc.py RegLoc — a register location (GPR or XMM).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegLoc {
     pub value: u8,
@@ -56,7 +56,7 @@ impl RegLoc {
     }
 }
 
-/// regloc.py:54 RawEbpLoc — RBP-relative memory location.
+/// regloc.py RawEbpLoc — RBP-relative memory location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawEbpLoc {
     pub value: i32,
@@ -87,7 +87,7 @@ impl RawEbpLoc {
     }
 }
 
-/// regloc.py:113 FrameLoc — frame slot location (position-aware RawEbpLoc).
+/// regloc.py FrameLoc — frame slot location (position-aware RawEbpLoc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLoc {
     pub ebp_loc: RawEbpLoc,
@@ -113,7 +113,7 @@ impl FrameLoc {
     }
 }
 
-/// regloc.py:180 ImmedLoc — immediate integer value.
+/// regloc.py ImmedLoc — immediate integer value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImmedLoc {
     pub value: i64,
@@ -140,7 +140,7 @@ impl ImmedLoc {
     }
 }
 
-/// regloc.py:207 AddressLoc — memory address with base + index*scale + offset.
+/// regloc.py AddressLoc — memory address with base + index*scale + offset.
 #[derive(Debug, Clone, Copy)]
 pub struct AddressLoc {
     pub base: u8,    // base register number
@@ -162,7 +162,7 @@ pub enum Loc {
 /// Matches either spelling of a frame-pointer location, binding its
 /// `RawEbpLoc`.
 ///
-/// `regloc.py:113 class FrameLoc(RawEbpLoc)` — the two are one type upstream,
+/// `regloc.py class FrameLoc(RawEbpLoc)` — the two are one type upstream,
 /// separated here only because Rust has no inheritance. Every operand that
 /// addresses through the frame pointer accepts both (`mov`'s `'b'` code), so a
 /// match naming just one spelling silently excludes the other.
@@ -179,7 +179,7 @@ impl Loc {
     pub fn is_reg(&self) -> bool {
         matches!(self, Loc::Reg(_))
     }
-    /// `regloc.py:82 RawEbpLoc.is_stack` returns True, and `FrameLoc` inherits
+    /// `regloc.py RawEbpLoc.is_stack` returns True, and `FrameLoc` inherits
     /// it — a frame slot is a raw ebp location that also knows its stack
     /// position, so both spellings are stack locations.
     ///
@@ -245,7 +245,7 @@ pub const XMM13: RegLoc = xmm(13);
 pub const XMM14: RegLoc = xmm(14);
 pub const XMM15: RegLoc = xmm(15);
 
-/// regloc.py:346 X86_64_SCRATCH_REG = r11
+/// regloc.py X86_64_SCRATCH_REG = r11
 pub const X86_64_SCRATCH_REG: RegLoc = R11;
 
 /// regloc.py:348 X86_64_SCRATCH_REG_2 = r12 (used as secondary scratch)

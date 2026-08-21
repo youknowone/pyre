@@ -18,7 +18,7 @@ pub const PYFRAME_LOCALS_CELLS_STACK_OFFSET: usize =
 pub const PYFRAME_PYCODE_OFFSET: usize = std::mem::offset_of!(PyFrame, pycode);
 
 /// Byte offset of `flags` in `PyFrame` — the `u8` holding `FLAG_ESCAPED`
-/// (`pyframe.py:80 escaped`).  A traced `tb_frame` read has to set that bit
+/// (`pyframe.py escaped`).  A traced `tb_frame` read has to set that bit
 /// the way the getter's `mark_as_escaped()` does.
 pub const PYFRAME_FLAGS_OFFSET: usize = std::mem::offset_of!(PyFrame, flags);
 
@@ -105,7 +105,7 @@ const _: () = {
 /// declaration, and immediately attaches the host `PyFrame` SizeDescr
 /// via `set_parent_descr` so every field descriptor produced by the
 /// `VirtualizableInfo` carries `descr.py FieldDescr.parent_descr` —
-/// required by `OptContext::ensure_ptr_info_arg0` (`optimizer.py:478`)
+/// required by `OptContext::ensure_ptr_info_arg0` (`optimizer.py`)
 /// to dispatch GETFIELD/SETFIELD to `InstancePtrInfo` / `StructPtrInfo`.
 /// virtualizable.py:45-46: clear_vable_ptr — C-ABI helper that writes
 /// TOKEN_NONE (0) to the vable_token field of a PyFrame.
@@ -123,7 +123,7 @@ unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
 
 pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
     let mut info = crate::virtualizable_gen::build_virtualizable_info();
-    // rpython/jit/metainterp/virtualizable.py:293-301 `clear_vable_ptr`
+    // rpython/jit/metainterp/virtualizable.py `clear_vable_ptr`
     // + `clear_vable_descr`. The descr must carry
     // EffectInfo.MOST_GENERAL + OopSpecIndex.JitForceVirtualizable
     // and mark the call CANNOT_RAISE — `VirtualizableInfo::make_clear

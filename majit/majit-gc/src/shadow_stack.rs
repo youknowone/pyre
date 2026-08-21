@@ -182,7 +182,7 @@ pub fn trace_libc_jitframe(obj_addr: usize, update: &mut dyn FnMut(*mut GcRef)) 
     }
 }
 
-/// gc.py:255-257 get_root_stack_top_addr()
+/// gc.py get_root_stack_top_addr()
 /// Returns the ADDRESS of the current thread's root_stack_top variable
 /// (not its value). Compiled code uses this to emit inline loads/stores.
 pub fn get_root_stack_top_addr() -> usize {
@@ -244,7 +244,7 @@ thread_local! {
     static BH_REGS_STACK: RefCell<Vec<BhRegsEntry>> = RefCell::new(Vec::with_capacity(16));
 
     /// Thread-local stack of ref slices live only during blackhole resume
-    /// construction (`resume.py:1312 blackhole_from_resumedata`).  The
+    /// construction (`resume.py blackhole_from_resumedata`).  The
     /// `virtuals_cache` and each frame's `registers_r` are filled by lazily
     /// materializing virtuals (`getvirtual_ptr` → allocator); a minor
     /// collection triggered while materializing a later virtual relocates
@@ -503,7 +503,7 @@ pub fn push(gcref: GcRef) -> usize {
 
 /// Pop entries from the shadow stack back to the given depth.
 ///
-/// `shadowstack.py:86-90 decr_stack` moves `root_stack_top` and returns it;
+/// `shadowstack.py decr_stack` moves `root_stack_top` and returns it;
 /// the popped slots are not read back, and `pop_stack` (`:104-106`) is the
 /// separate operation for callers that want the value.  Shortening in place
 /// mirrors that.  Returning the popped entries instead — `Vec::split_off`,
@@ -748,7 +748,7 @@ pub fn depth() -> usize {
 ///     `new_depth` jitframes without running off the end).
 ///
 /// Never shrinks. Called from `sys.setrecursionlimit` with
-/// `int(new_limit * 0.001 * 163840)` (pypy/module/sys/vm.py:70).
+/// `int(new_limit * 0.001 * 163840)` (pypy/module/sys/vm.py).
 pub fn increase_root_stack_depth(new_depth: usize) {
     MAX_SHADOW_STACK_DEPTH.with(|c| {
         if new_depth > c.get() {
@@ -1004,7 +1004,7 @@ pub fn jf_under_top_ptr() -> GcRef {
 
 // ── Blackhole register bank shadow stack ────────────────────────
 //
-// blackhole.py:840 BlackholeInterpreter.registers_r parity:
+// blackhole.py BlackholeInterpreter.registers_r parity:
 // the ref register file is part of the GC's root set during the
 // blackhole interpreter's lifetime. RPython's GC scans the
 // blackhole interpreter's RPython-managed Box arrays directly;
@@ -1092,7 +1092,7 @@ pub fn walk_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
             visitor(tmp);
             // `exception_last_value` is the same kind of slot: `route_to_catch`
             // stores the caught exception there and jumps to the handler
-            // (`blackhole.py:396-411`), and the handler recovers it much later
+            // (`blackhole.py`), and the handler recovers it much later
             // through `last_exc_value` / `last_exception` — which dereferences
             // it via `bh_classof`. Everything the handler runs in between can
             // allocate, so the reference has to survive a minor collection.
@@ -1150,7 +1150,7 @@ pub fn resume_ref_slice_registered(ptr: *const i64) -> bool {
 }
 
 /// Register a ref slice as a GC root for the blackhole resume
-/// construction window (`resume.py:1312 blackhole_from_resumedata`).
+/// construction window (`resume.py blackhole_from_resumedata`).
 ///
 /// # Safety
 /// `slice` must remain alive and at a fixed address until the matching
@@ -1652,7 +1652,7 @@ mod tests {
     /// A thread that unregisters leaves nothing behind for the all-mutator
     /// walk to reach, and a later thread can take its place.
     ///
-    /// `thread_die` (`shadowstack.py:168-187`) drops the dying thread's entry
+    /// `thread_die` (`shadowstack.py`) drops the dying thread's entry
     /// from `gcdata.thread_stacks` before the last GIL release, so no
     /// subsequent collection walks a stack whose owner is gone. The registry
     /// here is that table; `register_mutator` asserts a thread is not present

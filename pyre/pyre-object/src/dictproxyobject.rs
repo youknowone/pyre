@@ -61,10 +61,10 @@ impl crate::lltype::GcType for W_DictProxyObject {
 
 /// Allocate a `W_DictProxyObject` wrapping `w_mapping`.
 ///
-/// `pypy/objspace/std/dictproxyobject.py:16 def __init__(self,
+/// `pypy/objspace/std/dictproxyobject.py def __init__(self,
 /// w_mapping): self.w_mapping = w_mapping`.
 pub fn w_dict_proxy_new(w_mapping: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`): pin the
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
     // wrapped mapping across the GC malloc and re-read its relocated address
     // afterwards (a minor collection inside the malloc may move it). The
     // proxy's `w_mapping` can be a young W_DICT (e.g. `mappingproxy({})`)

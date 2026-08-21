@@ -17,7 +17,7 @@ use vecset::VecSet;
 
 use super::flatten::{DescrOperand, Insn, Kind, ListOfKind, Operand, Register, SSARepr, TLabel};
 
-/// `assembler.py:65` `count_regs = dict.fromkeys(KINDS, 0)` override.
+/// `assembler.py` `count_regs = dict.fromkeys(KINDS, 0)` override.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NumRegs {
     pub int: u16,
@@ -25,7 +25,7 @@ pub struct NumRegs {
     pub float: u16,
 }
 
-/// `assembler.py:19-32` `class Assembler(object)`.
+/// `assembler.py` `class Assembler(object)`.
 ///
 /// Writer-side state, per-instance, matching `Assembler.__init__`
 /// (rpython/jit/codewriter/assembler.py:19-32) line-by-line. A fresh
@@ -43,7 +43,7 @@ pub struct NumRegs {
 /// relocation.
 #[derive(Debug, Default)]
 pub struct Assembler {
-    /// `assembler.py:20` `self.insns = {}`.
+    /// `assembler.py` `self.insns = {}`.
     ///
     /// RPython grows this dict in `write_insn()` with dense opcode ids.
     /// pyre still emits majit's fixed runtime bytecodes, so the mirror here
@@ -51,15 +51,15 @@ pub struct Assembler {
     /// opcode byte. That is sufficient for the lazy `finish_setup` cache
     /// refresh in `pyre_jit_trace::state`.
     insns: IndexMap<String, u8>,
-    /// `assembler.py:29` `self.all_liveness = []`.
+    /// `assembler.py` `self.all_liveness = []`.
     all_liveness: Vec<u8>,
-    /// `assembler.py:30` `self.all_liveness_length = 0`.
+    /// `assembler.py` `self.all_liveness_length = 0`.
     all_liveness_length: usize,
-    /// `assembler.py:31` `self.all_liveness_positions = {}`.
+    /// `assembler.py` `self.all_liveness_positions = {}`.
     all_liveness_positions: HashMap<(VecSet<u8>, VecSet<u8>, VecSet<u8>), u16>,
-    /// `assembler.py:32` `self.num_liveness_ops = 0`.
+    /// `assembler.py` `self.num_liveness_ops = 0`.
     num_liveness_ops: usize,
-    /// `assembler.py:24` `self.indirectcalltargets = set()    # set of JitCodes`.
+    /// `assembler.py` `self.indirectcalltargets = set()    # set of JitCodes`.
     /// Accumulated across every `assemble()` call; `pyjitpl.py:2262`
     /// `self.setup_indirectcalltargets(asm.indirectcalltargets)` pipes
     /// this set to `MetaInterpStaticData.setup_indirectcalltargets`.
@@ -108,7 +108,7 @@ impl std::hash::Hash for ArcByPtr {
 /// struct because the runtime `JitCodeBuilder` is consumed by `finish()`.
 struct AssemblyState {
     builder: JitCodeBuilder,
-    /// `assembler.py:59` `self.label_positions = {}`.
+    /// `assembler.py` `self.label_positions = {}`.
     label_positions: IndexMap<String, usize>,
     /// Builder adapter for `Label/TLabel` name → builder label id.
     /// RPython stores bytecode positions directly in `label_positions`; this
@@ -142,7 +142,7 @@ impl Assembler {
     /// `assembler.py:20 self.insns = {}` is the other half of the same
     /// continuation, and it is load-bearing for the same reason. The build-time
     /// jitcodes' `-live-` markers are written with the canonical opcode byte,
-    /// and `blackhole.py:55-61 BlackholeInterpBuilder.__init__` recovers it as
+    /// and `blackhole.py BlackholeInterpBuilder.__init__` recovers it as
     /// `asm.insns['live/']` — one dict, because upstream has one assembler.
     /// A runtime `insns` that starts empty leaves
     /// `MetaInterpStaticData.op_live` at its unset sentinel until some Python
@@ -224,7 +224,7 @@ impl Assembler {
             .collect()
     }
 
-    /// `assembler.py:300-305` `finished(self, callinfocollection)`.
+    /// `assembler.py` `finished(self, callinfocollection)`.
     ///
     /// ```python
     /// def finished(self, callinfocollection):
@@ -235,7 +235,7 @@ impl Assembler {
     ///         self.see_raw_object(func.ptr)
     /// ```
     ///
-    /// Called from `codewriter.py:85` after the `enum_pending_graphs`
+    /// Called from `codewriter.py` after the `enum_pending_graphs`
     /// drain loop completes; registers raw helper-function addresses
     /// into `list_of_addr2name` for `MetaInterpStaticData`'s
     /// debug-symbol map.
@@ -255,7 +255,7 @@ impl Assembler {
         );
     }
 
-    /// `assembler.py:34-54` `assemble(self, ssarepr, jitcode=None, num_regs=None)`.
+    /// `assembler.py` `assemble(self, ssarepr, jitcode=None, num_regs=None)`.
     pub fn assemble(
         &mut self,
         ssarepr: &mut SSARepr,
@@ -320,7 +320,7 @@ impl Assembler {
         Some(jitcode)
     }
 
-    /// `assembler.py:140-223` `write_insn(insn)`.
+    /// `assembler.py` `write_insn(insn)`.
     fn write_insn(&mut self, state: &mut AssemblyState, insn: &Insn) {
         match insn {
             Insn::Unreachable => {}
@@ -332,7 +332,7 @@ impl Assembler {
                 args,
                 result,
             } => {
-                // `assembler.py:143-158` `-live-` branch. `liveness.py:5-12`
+                // `assembler.py` `-live-` branch. `liveness.py:5-12`
                 // uses `insn[0] == '-live-'` as the discriminator; pyre
                 // matches on `opname` to keep the tuple-shape parity.
                 if opname == super::flatten::OPNAME_LIVE {
@@ -382,18 +382,18 @@ impl Assembler {
         }
     }
 
-    /// `assembler.py:250-263` `fix_labels()`.
+    /// `assembler.py` `fix_labels()`.
     ///
     /// Note: pyre's runtime `JitCodeBuilder` patches
     /// jumps by symbolic label id rather than by rewriting raw bytes, so
     /// the label-position loop is folded into the builder. The per-descr
     /// switch patching that upstream runs here is handled through the
-    /// shared `BlackholeInterpBuilder.descrs` pool (`blackhole.py:102-103`
+    /// shared `BlackholeInterpBuilder.descrs` pool (`blackhole.py`
     /// `setup_descrs`), not per-jitcode — pyre's runtime codewriter has
     /// no descr-consuming ops yet, so this is currently a no-op.
     fn fix_labels(&mut self, _state: &mut AssemblyState) {}
 
-    /// `assembler.py:265-269` `check_result()`.
+    /// `assembler.py` `check_result()`.
     ///
     /// RPython enforces a 256-entry cap per kind because the assembled
     /// bytecode stream treats register-or-constant operands as one-byte
@@ -416,7 +416,7 @@ impl Assembler {
         );
     }
 
-    /// `assembler.py:234-248` `_encode_liveness(...)`.
+    /// `assembler.py` `_encode_liveness(...)`.
     ///
     /// Line-by-line port of RPython's `_encode_liveness`:
     ///   - Dedup key is `(frozenset(live_i), frozenset(live_r),
@@ -426,7 +426,7 @@ impl Assembler {
     ///   - On miss: append the three u8 length bytes + the encoded
     ///     bitsets, and advance `all_liveness_length`.
     ///   - `num_liveness_ops` bumps once per `-live-` write regardless of
-    ///     dedup (`assembler.py:149` does it in `write_insn`, before this
+    ///     dedup (`assembler.py` does it in `write_insn`, before this
     ///     helper is reached). Matches upstream.
     ///
     /// After the per-instance update we publish the latest buffer to
@@ -851,7 +851,7 @@ fn dispatch_op(
         }
         "jit_merge_point" => {
             // Upstream-orthodox 7-arg shape (jtransform.py:1690-1712 +
-            // jtransform.py:437-445 make_three_lists):
+            // jtransform.py make_three_lists):
             //   [jd_index_const, greens_i, greens_r, greens_f,
             //    reds_i, reds_r, reds_f]
             // Produced by `codewriter.rs::portal_jit_merge_point_graph_args`.
@@ -878,7 +878,7 @@ fn dispatch_op(
             // lltype.Signed)`, so the assembler-side jdindex flows
             // through as a signed integer. The builder selects the
             // USE_C_FORM short byte vs the constants-pool `i` slot per
-            // `assembler.py:99-107` (`-128 <= value <= 127`); no
+            // `assembler.py` (`-128 <= value <= 127`); no
             // pre-builder narrowing here.
             let jdindex = match jdindex_arg {
                 Operand::ConstInt(v) => *v,
@@ -897,10 +897,10 @@ fn dispatch_op(
             );
         }
         "loop_header" => {
-            // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header
+            // RPython jtransform.py handle_jit_marker__loop_header
             // emits SpaceOperation('loop_header', [c_index], None) with
             // `Constant(jd.index, lltype.Signed)`. `loop_header` is not
-            // in `assembler.py:312-346 USE_C_FORM`, so the builder
+            // in `assembler.py USE_C_FORM`, so the builder
             // always emits the constants-pool `i` form regardless of
             // jdindex magnitude — pass the signed value through.
             let jdindex = match &args[0] {
@@ -909,9 +909,9 @@ fn dispatch_op(
             };
             state.builder.loop_header(jdindex);
         }
-        // `flatten.py:130-146 make_return` / `:382-384 getcolor` pass a
+        // `flatten.py make_return` / `:382-384 getcolor` pass a
         // `Constant` operand through unchanged; the const arm encodes it
-        // into the ref constant window (`assembler.py:80-138 emit_const`).
+        // into the ref constant window (`assembler.py emit_const`).
         "ref_return" => {
             if let Some(Operand::ConstRef(value)) = args.first() {
                 state
@@ -943,7 +943,7 @@ fn dispatch_op(
         "abort" => state.builder.abort(),
         "abort_permanent" => state.builder.abort_permanent(),
         "unreachable" => state.builder.unreachable(),
-        // `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`.
+        // `flatten.py` `self.emitline('%s_copy' % kind, v, "->", w)`.
         // `v` is either a `Register` or a `Constant`. Register source
         // lowers to the primitive `move_{i,r,f}` builder method;
         // Constant source lowers via the builder's constant-pool helper,
@@ -987,7 +987,7 @@ fn dispatch_op(
             }
             other => panic!("float_copy expects Register or ConstFloat, got {:?}", other),
         },
-        // `flatten.py:329` `self.emitline('%s_push' % kind, v)` — cycle-break
+        // `flatten.py` `self.emitline('%s_push' % kind, v)` — cycle-break
         // save into the kind-typed scratch slot.
         "int_push" => {
             let src = expect_reg(&args[0], Kind::Int);
@@ -1001,7 +1001,7 @@ fn dispatch_op(
             let src = expect_reg(&args[0], Kind::Float);
             state.builder.push_f(src);
         }
-        // `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)` —
+        // `flatten.py` `self.emitline('%s_pop' % kind, "->", w)` —
         // cycle-break load from the kind-typed scratch slot.
         "int_pop" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
@@ -1050,7 +1050,7 @@ fn dispatch_op(
                 .vable_getfield_float_with_base(dst, vable_reg, field_idx);
         }
         "setfield_vable_i" => {
-            // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` is generic
+            // pyjitpl.py `_opimpl_setfield_vable` is generic
             // across i/r/f — `valuebox` may be a ConstInt after optimizer
             // folding.  Mirror the `setfield_vable_r` ConstRef branch.
             assert_eq!(
@@ -1333,8 +1333,8 @@ fn dispatch_op(
             );
             let dst = expect_result_reg(result, Kind::Ref, "new_array_clear needs result");
             let descr_idx = expect_array_bh_descr(state, &args[1], "new_array_clear");
-            // `assembler.py:99-107 emit_const(allow_short=True)` —
-            // `new_array_clear` is in `USE_C_FORM` (`assembler.py:312`),
+            // `assembler.py emit_const(allow_short=True)` —
+            // `new_array_clear` is in `USE_C_FORM` (`assembler.py`),
             // so a small ConstInt length is encoded inline as the `c`
             // argcode (`new_array_clear/cd>r`).
             match &args[0] {
@@ -1382,7 +1382,7 @@ fn dispatch_op(
         // (`rewrite_op_int_floordiv = _do_builtin_call`,
         // `rewrite_op_int_mod = _do_builtin_call`) replaces both
         // primitives with a `direct_call(prepare_builtin_call(...))` to
-        // `ll_int_py_div` / `ll_int_py_mod` (`rint.py:398/496`); the
+        // `ll_int_py_div` / `ll_int_py_mod` (`rint.py/496`); the
         // bare opname never reaches the SSARepr emitter upstream.  In
         // pyre the runtime trace path goes through the β' redirect at
         // `pyre-jit-trace/src/jitcode_dispatch/specialize.rs::walker_emit_int_py_div_or_mod`,
@@ -1550,7 +1550,7 @@ fn dispatch_op(
                 .builder
                 .record_known_result_r_ir_v_typed_args(fn_idx, result_reg, &call_args);
         }
-        // `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call` shape.
+        // `rpython/jit/codewriter/jtransform.py rewrite_call` shape.
         // 12 opname combinations: residual_call_{r,ir,irf}_{i,r,f,v}. Only
         // the subset the walker currently emits is routed; unused arms
         // panic with a pointer to emit_residual_call.
@@ -1651,10 +1651,10 @@ fn dispatch_residual_call(
 
     // Reassemble flat `&[JitCallArg]` in C-function parameter order.
     // `ListOfKind` slots admit `Variable | Constant`
-    // (`rpython/jit/codewriter/jtransform.py:437-445` `make_three_lists`);
+    // (`rpython/jit/codewriter/jtransform.py` `make_three_lists`);
     // route `Const*` through the per-kind constant pool to synthesize the
     // `num_regs_kind + pool_idx` pseudo-register byte (mirrors
-    // `assembler.py:80-138 emit_const` and the `expect_list_regs_or_pool`
+    // `assembler.py emit_const` and the `expect_list_regs_or_pool`
     // helper used by `jit_merge_point` lowering).
     let mut call_args: Vec<JitCallArg> = Vec::with_capacity(stub.arg_kinds.len());
     let mut i_cursor = 0usize;
@@ -1736,7 +1736,7 @@ fn dispatch_residual_call(
     // wrappers (jitcode/assembler.rs), threading
     // `stub.effect_info` end-to-end exactly like the
     // `residual_call_void_canonical_via_target_with_effect_info_and_word_abi`
-    // arm above.  RPython `pyjitpl.py:1995-2068 do_residual_call` carries
+    // arm above.  RPython `pyjitpl.py do_residual_call` carries
     // the same calldescr across every result kind via
     // `record_nospec(opnum, ..., calldescr)`; pyre now matches that for
     // i / r / f as well — the policy is encoded inside
@@ -1756,12 +1756,12 @@ fn dispatch_residual_call(
     // `BC_RESIDUAL_CALL_*_{I,R,F}` walker
     // (`majit-metainterp/src/pyjitpl/dispatch.rs`) reads
     // `effectinfo.check_is_elidable()` and routes the result through
-    // `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2115`.
+    // `record_result_of_call_pure` mirroring `pyjitpl.py`.
     // ReleaseGil + Ref still panics per `resoperation.py:1243-1244 # no
     // such thing`.
     match (dispatch_kind, reskind) {
         (CallFlavor::ReleaseGil, ResKind::Ref) => {
-            // RPython `resoperation.py:1238 call_release_gil_for_descr`
+            // RPython `resoperation.py call_release_gil_for_descr`
             // explicitly skips the `tp == 'r'` arm with the comment
             // `# no such thing` (`:1243-1244`):
             //
@@ -2021,7 +2021,7 @@ fn expect_vable_arraylen_args(args: &[Operand]) -> (u16, u16) {
 
 /// Resolve a `DescrOperand::Bh(BhDescr::Array { .. })` operand onto the
 /// builder's descrs pool and return the pool index.  RPython
-/// `assembler.py:197-207 _encode_descr` — the descr operand of a heap
+/// `assembler.py _encode_descr` — the descr operand of a heap
 /// array op is appended to `Assembler.descrs` and encoded as a 2-byte
 /// index.
 fn expect_array_bh_descr(state: &mut AssemblyState, op: &Operand, ctx: &'static str) -> u16 {
@@ -2286,7 +2286,7 @@ mod tests {
         // occupy the SAME one-byte namespace above `count_regs[ref]`, and the
         // byte is synthesized as they are appended (`assembler.py:131-137`), so
         // enough of them push a `jit_merge_point` red-list operand past 255 at
-        // the `assembler.py:133` `assert 0 <= val < 256`. The runtime seam must
+        // the `assembler.py` `assert 0 <= val < 256`. The runtime seam must
         // decline there rather than abort while emitting the operand.
         const NUM_REGS_R: u16 = 200;
         let reds_r: Vec<Operand> = (0..100).map(|i| Operand::ConstRef(i * 8)).collect();
@@ -2586,7 +2586,7 @@ mod tests {
             }),
         );
 
-        // `int_copy` is in `USE_C_FORM` (`assembler.py:312`), so
+        // `int_copy` is in `USE_C_FORM` (`assembler.py`), so
         // `assembler.py:99-107` writes a byte-sized value inline and
         // `assembler.py:172` spells the argcode `c` instead of `i`.
         let copy_opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
@@ -2750,7 +2750,7 @@ mod tests {
         ));
         ssarepr.insns.push(Insn::Label(Label::new("L1")));
         // Append a trailing return so `L1` is not at end-of-code.
-        // RPython `jitcode.py:108-112 follow_jump` asserts
+        // RPython `jitcode.py follow_jump` asserts
         // `labelvalue < len(code)` strictly, so the label must not
         // resolve to `len(code)` itself.
         ssarepr.insns.push(Insn::op(
@@ -2949,7 +2949,7 @@ mod tests {
         // calldescr carrying ElidableCanRaise.  The walker
         // (`pyjitpl/dispatch.rs`) reads
         // `effectinfo.check_is_elidable()` and runs
-        // `record_result_of_call_pure` mirroring `pyjitpl.py:2111-2121`.
+        // `record_result_of_call_pure` mirroring `pyjitpl.py`.
         let mut ssarepr = SSARepr::new("residual_call_irf_f");
         let mut builder = JitCodeBuilder::default();
         let fn_idx = builder.add_fn_ptr(0x7777usize as *const ());
@@ -3125,7 +3125,7 @@ mod tests {
     /// descr registration. This test keeps the guarantee explicit so a
     /// future descr-consumer addition is forced to ship the
     /// corresponding registration onto `BlackholeInterpBuilder.descrs`
-    /// (`blackhole.py:102-103 setup_descrs`), not per-jitcode.
+    /// (`blackhole.py setup_descrs`), not per-jitcode.
     #[test]
     fn assemble_does_not_register_unconsumed_descr() {
         let mut switch = SwitchDictDescr::new();

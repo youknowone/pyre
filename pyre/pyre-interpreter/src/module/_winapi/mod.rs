@@ -690,7 +690,7 @@ crate::py_module! {
                 );
             }
             // Fixed-arity builtin fast paths only cover zero through four
-            // arguments (`gateway.py:948-1038 BuiltinCode0..BuiltinCode4`), and
+            // arguments (`gateway.py BuiltinCode0..BuiltinCode4`), and
             // CreateProcess takes nine. It still needs an exact-arity check, so
             // register it through the general call path with a checked body.
             crate::module_ns_store(

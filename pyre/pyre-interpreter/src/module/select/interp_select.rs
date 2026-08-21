@@ -5,7 +5,7 @@
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 use pyre_object::PyObjectRef;
 
-/// `select.poll` object — PyPy: `interp_select.py:26 class Poll`.
+/// `select.poll` object — PyPy: `interp_select.py class Poll`.
 ///
 /// Holds the registered `{fd: events}` map and a re-entrancy guard.
 /// Instances are created only through the module-level `select.poll()`
@@ -18,7 +18,7 @@ pub struct Poll {
     running: bool,
 }
 
-/// `interp_select.py:15 defaultevents = POLLIN | POLLOUT | POLLPRI`.
+/// `interp_select.py defaultevents = POLLIN | POLLOUT | POLLPRI`.
 #[cfg(all(unix, feature = "host_env"))]
 fn default_poll_events() -> i16 {
     libc::POLLIN | libc::POLLOUT | libc::POLLPRI
@@ -60,7 +60,7 @@ pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError>
     unhashable
 )]
 impl Poll {
-    /// `interp_select.py:115-117 descr_new` — the type is not directly
+    /// `interp_select.py descr_new` — the type is not directly
     /// instantiable; `select.poll()` is the module-level factory.
     #[staticmethod]
     fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -69,7 +69,7 @@ impl Poll {
         ))
     }
 
-    /// `interp_select.py:32 Poll.register` — `events` defaults to
+    /// `interp_select.py Poll.register` — `events` defaults to
     /// `POLLIN | POLLOUT | POLLPRI`.
     fn register(
         &mut self,
@@ -87,7 +87,7 @@ impl Poll {
         Ok(())
     }
 
-    /// `interp_select.py:43 Poll.modify` — raises `OSError(ENOENT)` for
+    /// `interp_select.py Poll.modify` — raises `OSError(ENOENT)` for
     /// a descriptor that was never registered.
     fn modify(&mut self, w_fd: PyObjectRef, w_events: PyObjectRef) -> Result<(), crate::PyError> {
         let fd = filedescriptor_w(w_fd)?;
@@ -105,7 +105,7 @@ impl Poll {
         }
     }
 
-    /// `interp_select.py:56 Poll.unregister` — raises `KeyError(fd)` for
+    /// `interp_select.py Poll.unregister` — raises `KeyError(fd)` for
     /// an unknown descriptor.
     fn unregister(&mut self, w_fd: PyObjectRef) -> Result<(), crate::PyError> {
         let fd = filedescriptor_w(w_fd)?;
@@ -117,7 +117,7 @@ impl Poll {
         Ok(())
     }
 
-    /// `interp_select.py:67 Poll.poll` — `timeout` is in milliseconds;
+    /// `interp_select.py Poll.poll` — `timeout` is in milliseconds;
     /// `None` or a negative value blocks indefinitely.  Returns a list
     /// of `(fd, revents)` for the descriptors with pending events.
     fn poll(
@@ -332,7 +332,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let items = crate::baseobjspace::unpackiterable(seq, -1)?;
                     let mut out = Vec::with_capacity(items.len());
                     for item in items {
-                        // `interp_select.py:132 _build_fd_set` — each item is
+                        // `interp_select.py _build_fd_set` — each item is
                         // resolved through `space.c_filedescriptor_w`, then
                         // checked against what this platform's fd_set holds.
                         let fd = filedescriptor_w(item)?;
@@ -496,9 +496,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }),
     );
 
-    // `interp_select.py:18 poll()` — factory returning a fresh polling
+    // `interp_select.py poll()` — factory returning a fresh polling
     // object.  The type has no public constructor, matching
-    // `interp_select.py:115 descr_new` which raises TypeError.
+    // `interp_select.py descr_new` which raises TypeError.
     #[cfg(all(unix, feature = "host_env"))]
     {
         // Force the `select.poll` type to register so instances carry a
@@ -543,7 +543,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     {
         crate::module_ns_store(ns, "kqueue", super::interp_kqueue::type_object());
         crate::module_ns_store(ns, "kevent", super::interp_kevent::type_object());
-        // `interp_kqueue.py:262 W_Kqueue.typedef.acceptable_as_base_class
+        // `interp_kqueue.py W_Kqueue.typedef.acceptable_as_base_class
         // = False` / `:406 W_Kevent.typedef.acceptable_as_base_class =
         // False`.
         unsafe {
@@ -561,7 +561,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
-        // `interp_kqueue.py:62 symbol_map` — KQ_FILTER_* / KQ_EV_*.
+        // `interp_kqueue.py symbol_map` — KQ_FILTER_* / KQ_EV_*.
         kq!("KQ_FILTER_READ", libc::EVFILT_READ);
         kq!("KQ_FILTER_WRITE", libc::EVFILT_WRITE);
         kq!("KQ_FILTER_AIO", libc::EVFILT_AIO);

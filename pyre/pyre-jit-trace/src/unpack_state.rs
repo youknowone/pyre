@@ -89,7 +89,7 @@ impl UnpackJitState {
             vec![("greenkey", Type::Ref)],
             vec![("w_iterator", Type::Ref), ("items", Type::Ref)],
         );
-        // baseobjspace.py:29-31 `unpackiterable_driver` = reds='auto', only a
+        // baseobjspace.py `unpackiterable_driver` = reds='auto', only a
         // `jit_merge_point` in the `while True` drain (no `can_enter_jit`, no
         // `loop_header`). warmspot.py:762-790 leaves `no_loop_header` at its
         // `True` default for such a driver, so `opimpl_jit_merge_point`

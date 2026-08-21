@@ -33,14 +33,14 @@ const STATE_SWEEPING: u8 = 2;
 const STATE_FINALIZING: u8 = 3;
 const STATE_USERDEL: u8 = 4;
 
-/// `rgc.py:52-60 is_done__states`: a major collection has finished when the
+/// `rgc.py is_done__states`: a major collection has finished when the
 /// step ended in the starting state *and* did not start there. A collector
 /// with no work to do reports `(0, 0)`, which is not the end of anything.
 fn is_done_states(oldstate: u8, newstate: u8) -> bool {
     oldstate != STATE_SCANNING && newstate == STATE_SCANNING
 }
 
-/// `interp_gc.py:91-130 StepCollector.finalizing`. `space.fromcache` owns one
+/// `interp_gc.py StepCollector.finalizing`. `space.fromcache` owns one
 /// instance per object space upstream; pyre has one process-wide object space,
 /// so the corresponding state is shared rather than thread-local.
 ///
@@ -64,7 +64,7 @@ fn is_done_states(oldstate: u8, newstate: u8) -> bool {
 /// never reacquire the GIL.
 static STEP_FINALIZING: AtomicBool = AtomicBool::new(false);
 
-/// `referents.py:11-15 W_GcRef(W_Root)`: an app-level handle for a raw GC
+/// `referents.py W_GcRef(W_Root)`: an app-level handle for a raw GC
 /// object that is not itself a Python object.  The field is deliberately on
 /// the wrapper and participates in normal type tracing; a side table would
 /// neither keep the referent alive nor receive forwarding updates.
@@ -110,7 +110,7 @@ pub mod gcref {
     }
 }
 
-/// `referents.py:190-241 W_GcStats`.  These are native integer fields on the
+/// `referents.py W_GcStats`.  These are native integer fields on the
 /// interpreter object, matching the upstream W_Root rather than a Python dict
 /// or a process-global side table.
 pub mod stats {
@@ -657,7 +657,7 @@ fn pin_object(object: majit_ir::GcRef) {
     pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
 }
 
-/// `referents.py:53-78 _list_w_obj_referents`: push the app-level objects
+/// `referents.py _list_w_obj_referents`: push the app-level objects
 /// `w_obj` refers to directly onto the shadow stack. The walk looks through
 /// the interpreter-internal structs in between, so a list reports its items
 /// and not the array holding them.
@@ -672,7 +672,7 @@ fn pin_referents(w_obj: PyObjectRef) {
 }
 
 /// Wrap every raw collector node rooted in `[first, last)` as
-/// `referents.py:35-39 wrap`: app-level objects pass through, internal nodes
+/// `referents.py wrap`: app-level objects pass through, internal nodes
 /// become `W_GcRef`.  Results are rooted as they are made because constructing
 /// a later wrapper can initialize a type and allocate.
 ///
@@ -1202,7 +1202,7 @@ crate::py_module! {
         fn collect(
             #[default(w_int_new(0))] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // PyPy `interp_gc.py:7-26 collect` unwraps the optional generation
+            // PyPy `interp_gc.py collect` unwraps the optional generation
             // as an int, but deliberately ignores its value.  In particular,
             // unlike CPython's three-generation frontend, every integer is
             // accepted and the default is 0.
@@ -1225,7 +1225,7 @@ crate::py_module! {
         }
 
         fn collect_step() -> Result<PyObjectRef, crate::PyError> {
-            // interp_gc.py:91-130 StepCollector: the app-level finalizer drain
+            // interp_gc.py StepCollector: the app-level finalizer drain
             // is a virtual fifth state after the collector has returned to
             // SCANNING.
             if STEP_FINALIZING.load(Ordering::Acquire) {
@@ -1266,7 +1266,7 @@ crate::py_module! {
         fn _get_stats(
             #[default(w_bool_from(false))] memory_pressure: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // referents.py:240-241 `@unwrap_spec(memory_pressure=bool)`.
+            // referents.py `@unwrap_spec(memory_pressure=bool)`.
             Ok(stats::new(crate::baseobjspace::is_true(memory_pressure)?))
         }
 
@@ -1290,7 +1290,7 @@ crate::py_module! {
             Ok(w_none())
         },
         "enable_finalizers" / 0 = |_| {
-            // `interp_gc.py:72-84`: unlike gc.enable(), an unmatched public
+            // `interp_gc.py`: unlike gc.enable(), an unmatched public
             // enable is an error rather than a no-op.
             if let Some(action) = user_del_action() {
                 if action.finalizers_lock_count == 0 {
@@ -1330,7 +1330,7 @@ crate::py_module! {
             Ok(w_bool_from(enabled))
         },
         "get_referrers" / * = |args| {
-            // referents.py:147-169 get_referrers: list every app-level object,
+            // referents.py get_referrers: list every app-level object,
             // then keep the ones whose direct referents include an argument.
             //
             // The argument scan at `referents.py:166-168` has no `break`, and
@@ -1370,7 +1370,7 @@ crate::py_module! {
             Ok(list_from_root_slots(result))
         },
         "get_referents" / * = |args| {
-            // referents.py:128-145 get_referents.
+            // referents.py get_referents.
             let _roots = pyre_object::gc_roots::push_roots();
             let args_base = pyre_object::gc_roots::pin_roots(args);
             let mut rooted_args = vec![std::ptr::null_mut(); args.len()];

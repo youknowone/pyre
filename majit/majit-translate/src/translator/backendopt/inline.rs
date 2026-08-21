@@ -60,8 +60,8 @@ use crate::translator::simplify::get_graph;
 use crate::translator::translator::TranslationContext;
 
 /// Carrier for upstream's `call_count_pred` closure
-/// (`inline.py:138 BaseInliner.__init__`,
-/// `inline.py:608 auto_inlining`). Upstream Python passes the same
+/// (`inline.py BaseInliner.__init__`,
+/// `inline.py auto_inlining`). Upstream Python passes the same
 /// callable instance to every nested `inline_function` call;
 /// `Rc<RefCell<dyn FnMut>>` is the minimal Rust adaptation that
 /// preserves shared mutable identity (a `Box<dyn FnMut>` is not
@@ -69,7 +69,7 @@ use crate::translator::translator::TranslationContext;
 /// `None`).
 pub type CallCountPred = Rc<RefCell<dyn FnMut(i64) -> bool>>;
 
-/// `class CannotInline(Exception)` at `inline.py:14-15`.
+/// `class CannotInline(Exception)` at `inline.py`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CannotInline(pub String);
 
@@ -166,7 +166,7 @@ pub struct CallSite {
     pub op_index: usize,
 }
 
-/// `collect_called_graphs(graph, translator)` at `inline.py:23-40`.
+/// `collect_called_graphs(graph, translator)` at `inline.py`.
 ///
 /// Walks every block / op of `graph`, accumulating each callee
 /// (graph, opaque arg, or CanRaise hint) into a set. The Rust port
@@ -237,7 +237,7 @@ pub fn collect_called_graphs(
     out
 }
 
-/// `iter_callsites(graph, calling_what)` at `inline.py:42-55`.
+/// `iter_callsites(graph, calling_what)` at `inline.py`.
 ///
 /// Returns the list of `(callee_graph, block, op_index)` triples
 /// for every `direct_call` op whose resolved `funcobj` matches
@@ -287,7 +287,7 @@ pub fn iter_callsites(
     out
 }
 
-/// `find_callsites(graph, calling_what)` at `inline.py:57-58`.
+/// `find_callsites(graph, calling_what)` at `inline.py`.
 ///
 /// Upstream is `list(iter_callsites(...))`; the Rust port already
 /// materialises a `Vec` from [`iter_callsites`], so this is a thin
@@ -300,7 +300,7 @@ pub fn find_callsites(
     iter_callsites(graph, calling_what, translator)
 }
 
-/// `contains_call(graph, calling_what)` at `inline.py:67-73`.
+/// `contains_call(graph, calling_what)` at `inline.py`.
 ///
 /// Upstream wraps `iter_callsites` in a `try/except StopIteration`
 /// to short-circuit on the first match. The Rust port walks until
@@ -442,7 +442,7 @@ pub fn any_call_to_raising_graphs(
 // `getattr(..., default)` fallback.
 // ============================================================
 
-/// `OP_WEIGHTS` at `inline.py:470-476`. Per-opname weight table
+/// `OP_WEIGHTS` at `inline.py`. Per-opname weight table
 /// consumed by `block_weight`. Opnames absent from the map default
 /// to `1` per upstream `weights.get(op.opname, 1)` at `:485`.
 ///
@@ -524,7 +524,7 @@ pub fn block_weight(block: &crate::flowspace::model::BlockRef) -> f64 {
     if total < 0.0 { 0.0 } else { total }
 }
 
-/// `static_instruction_count(graph)` at `inline.py:532-536`.
+/// `static_instruction_count(graph)` at `inline.py`.
 ///
 /// ```python
 /// def static_instruction_count(graph):
@@ -542,7 +542,7 @@ pub fn static_instruction_count(graph: &GraphRef) -> f64 {
     count
 }
 
-/// `always_inline(graph)` at `inline.py:604-606`.
+/// `always_inline(graph)` at `inline.py`.
 ///
 /// ```python
 /// def always_inline(graph):
@@ -702,7 +702,7 @@ fn callable_dont_inline(callee: &GraphRef) -> bool {
 // `super::support::find_loop_blocks`.
 // ============================================================
 
-/// `measure_median_execution_cost(graph)` at `inline.py:491-530`.
+/// `measure_median_execution_cost(graph)` at `inline.py`.
 ///
 /// Solves the linear system that estimates how many times each
 /// block runs on average per call. Loop back-edges get a 0.7
@@ -867,7 +867,7 @@ fn same_loop_start(
     }
 }
 
-/// `inlining_heuristic(graph)` at `inline.py:538-544`.
+/// `inlining_heuristic(graph)` at `inline.py`.
 ///
 /// ```python
 /// def inlining_heuristic(graph):
@@ -901,7 +901,7 @@ pub fn inlining_heuristic(graph: &GraphRef) -> (f64, bool) {
 /// [`BaseInliner::search_for_calls`]'s behaviour.
 ///
 /// Upstream models this through subclassing
-/// (`Inliner`, `OneShotInliner` at `inline.py:439-463`); the Rust
+/// (`Inliner`, `OneShotInliner` at `inline.py`); the Rust
 /// port uses a kind enum so the structural state stays in one
 /// place.
 pub enum InlinerKind {
@@ -941,7 +941,7 @@ pub enum PassonCacheKey {
     Index(usize),
 }
 
-/// `class BaseInliner` at `inline.py:144-436`.
+/// `class BaseInliner` at `inline.py`.
 ///
 /// Holds every cross-call piece of inliner state: the host
 /// translator, the host graph being modified, the per-inline
@@ -1037,7 +1037,7 @@ pub struct BaseInliner<'t> {
 }
 
 impl<'t> BaseInliner<'t> {
-    /// `BaseInliner.__init__` at `inline.py:145-161`.
+    /// `BaseInliner.__init__` at `inline.py`.
     ///
     /// Upstream's signature defaults: `inline_guarded_calls=False`,
     /// `inline_guarded_calls_no_matter_what=False`,
@@ -1079,7 +1079,7 @@ impl<'t> BaseInliner<'t> {
         }
     }
 
-    /// `get_graph_from_op(self, op)` at `inline.py:189-191`.
+    /// `get_graph_from_op(self, op)` at `inline.py`.
     ///
     /// > assert op.opname == 'direct_call'
     /// > return self.op.args[0].value._obj.graph
@@ -1097,7 +1097,7 @@ impl<'t> BaseInliner<'t> {
             .and_then(|arg| get_graph(arg, self.translator))
     }
 
-    /// `get_new_name(self, var)` at `inline.py:232-239`.
+    /// `get_new_name(self, var)` at `inline.py`.
     ///
     /// ```python
     /// def get_new_name(self, var):
@@ -1131,7 +1131,7 @@ impl<'t> BaseInliner<'t> {
         arg.map(|a| self.get_new_name(a))
     }
 
-    /// `passon_vars(self, cache_key)` at `inline.py:241-246`.
+    /// `passon_vars(self, cache_key)` at `inline.py`.
     ///
     /// ```python
     /// def passon_vars(self, cache_key):
@@ -1154,7 +1154,7 @@ impl<'t> BaseInliner<'t> {
         fresh
     }
 
-    /// `copy_operation(self, op)` at `inline.py:248-251`.
+    /// `copy_operation(self, op)` at `inline.py`.
     ///
     /// ```python
     /// def copy_operation(self, op):
@@ -1168,7 +1168,7 @@ impl<'t> BaseInliner<'t> {
         SpaceOperation::new(op.opname.clone(), args, result)
     }
 
-    /// `copy_link(self, link, prevblock)` at `inline.py:266-273`.
+    /// `copy_link(self, link, prevblock)` at `inline.py`.
     ///
     /// ```python
     /// def copy_link(self, link, prevblock):
@@ -1247,7 +1247,7 @@ impl<'t> BaseInliner<'t> {
         crate::flowspace::model::LinkRef::new(std::cell::RefCell::new(new_link))
     }
 
-    /// `copy_block(self, block)` at `inline.py:253-264`.
+    /// `copy_block(self, block)` at `inline.py`.
     ///
     /// ```python
     /// def copy_block(self, block):
@@ -1311,7 +1311,7 @@ impl<'t> BaseInliner<'t> {
         new_block
     }
 
-    /// `search_for_calls(self, block)` at `inline.py:212-230` for
+    /// `search_for_calls(self, block)` at `inline.py` for
     /// the `Inliner` subclass and `:462-463` for the `OneShotInliner`
     /// no-op override.
     ///
@@ -1374,7 +1374,7 @@ impl<'t> BaseInliner<'t> {
     }
 
     /// `find_args_in_exceptional_case(self, link, block, etype,
-    /// evalue, afterblock, passon_vars)` at `inline.py:275-287`.
+    /// evalue, afterblock, passon_vars)` at `inline.py`.
     ///
     /// ```python
     /// def find_args_in_exceptional_case(self, link, block, etype, evalue, afterblock, passon_vars):
@@ -1450,7 +1450,7 @@ impl<'t> BaseInliner<'t> {
 
     // ----- orchestrator + rewire mutators + drivers -----
 
-    /// `inline_all(self)` at `inline.py:163-187`.
+    /// `inline_all(self)` at `inline.py`.
     ///
     /// Drains `block_to_index` one (block, op_index, callee) at a
     /// time and runs `inline_once`. Recursive callees are
@@ -1602,7 +1602,7 @@ impl<'t> BaseInliner<'t> {
             // Pass-through cases ultimately route through
             // `rewire_exceptblock` → `rewire_exceptblock_with_guard`,
             // which depends on:
-            //   * `lltype.normalizeptr` (`lltype.py:1139-1161`) —
+            //   * `lltype.normalizeptr` (`lltype.py`) —
             //     pointer normalization for exception-class
             //     constants in `_find_exception_type`.
             //   * `RPythonTyper.lltype_to_classdef_mapping()` —
@@ -1817,7 +1817,7 @@ impl<'t> BaseInliner<'t> {
         self.search_for_calls(block);
     }
 
-    /// `rewire_returnblock(self, afterblock)` at `inline.py:289-296`.
+    /// `rewire_returnblock(self, afterblock)` at `inline.py`.
     ///
     /// Wires the inlined returnblock's outgoing edge to
     /// `afterblock`: `linkfrominlined = Link([returnvar +
@@ -1991,7 +1991,7 @@ impl<'t> BaseInliner<'t> {
         }
     }
 
-    /// `cleanup(self)` at `inline.py:432-436`.
+    /// `cleanup(self)` at `inline.py`.
     ///
     /// > cleaning up -- makes sense to be done after inlining,
     /// > because the inliner inserted quite some empty blocks
@@ -2099,7 +2099,7 @@ impl<'t> BaseInliner<'t> {
 
 /// `inline_function(translator, inline_func, graph,
 /// lltype_to_classdef, raise_analyzer, call_count_pred=None,
-/// cleanup=True)` at `inline.py:75-80`.
+/// cleanup=True)` at `inline.py`.
 ///
 /// ```python
 /// def inline_function(translator, inline_func, graph, lltype_to_classdef,

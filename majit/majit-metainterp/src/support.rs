@@ -10,17 +10,17 @@ pub type AddressAsInt = i64;
 /// Rust-side stand-in for `llmemory.Address` at metainterp boundaries.
 pub type Address = usize;
 
-/// support.py:4-10 `adr2int`.
+/// support.py `adr2int`.
 pub fn adr2int(addr: Address) -> AddressAsInt {
     addr as AddressAsInt
 }
 
-/// support.py:12-17 `int2adr`.
+/// support.py `int2adr`.
 pub fn int2adr(int: AddressAsInt) -> Address {
     int as Address
 }
 
-/// support.py:19-25 `ptr2int`.
+/// support.py `ptr2int`.
 pub fn ptr2int<T>(ptr: *const T) -> AddressAsInt {
     adr2int(ptr as Address)
 }
@@ -32,7 +32,7 @@ pub(crate) fn ptr2int_mut<T>(ptr: *mut T) -> AddressAsInt {
     ptr2int(ptr.cast_const())
 }
 
-/// support.py:28-35 `int_signext`.
+/// support.py `int_signext`.
 pub fn int_signext(value: i64, numbytes: i64) -> i64 {
     if !(1..=8).contains(&numbytes) {
         return value;

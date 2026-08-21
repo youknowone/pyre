@@ -12,7 +12,7 @@
 use crate::intbound::IntBound;
 use crate::ptr_info::PtrInfo;
 
-/// info.py:851 `FloatConstInfo`.
+/// info.py `FloatConstInfo`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FloatConstInfo {
     pub _const: f64,
@@ -32,7 +32,7 @@ impl FloatConstInfo {
     }
 }
 
-/// shortpreamble.py:376 `EmptyInfo`.
+/// shortpreamble.py `EmptyInfo`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EmptyInfo;
 
@@ -52,17 +52,17 @@ impl EmptyInfo {
 pub enum OpInfo {
     /// No information known.
     Unknown,
-    /// shortpreamble.py:379 `empty_info` sentinel.
+    /// shortpreamble.py `empty_info` sentinel.
     EmptyInfo(EmptyInfo),
     /// Known integer bounds. info.py:1264 IntBound.
     /// `IntBound::from_constant(v)` is the canonical Int constant carrier.
     IntBound(std::rc::Rc<std::cell::RefCell<IntBound>>),
     /// Pointer info (non-null, known class, virtual, etc.).
     /// `PtrInfo::Constant(GcRef)` is the Ref constant carrier
-    /// (info.py:706 ConstPtrInfo).
+    /// (info.py ConstPtrInfo).
     Ptr(std::rc::Rc<std::cell::RefCell<PtrInfo>>),
     /// Known constant float value.
-    /// info.py:851 FloatConstInfo — Float constant carrier.
+    /// info.py FloatConstInfo — Float constant carrier.
     FloatConstInfo(FloatConstInfo),
 }
 

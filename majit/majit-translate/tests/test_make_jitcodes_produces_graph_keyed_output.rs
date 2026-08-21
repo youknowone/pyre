@@ -8,10 +8,10 @@
 //!
 //! ## RPython references
 //!
-//! - `rpython/jit/codewriter/codewriter.py:74-89 make_jitcodes` — the
+//! - `rpython/jit/codewriter/codewriter.py make_jitcodes` — the
 //!   main driver that pops from `callcontrol.enum_pending_graphs()`
 //!   and produces one `JitCode` per graph.
-//! - `rpython/jit/codewriter/codewriter.py:33-72 transform_graph_to_jitcode` —
+//! - `rpython/jit/codewriter/codewriter.py transform_graph_to_jitcode` —
 //!   the 4-step pipeline (jtransform → regalloc → flatten → assemble)
 //!   that turns one FunctionGraph into one JitCode.
 //! - `rpython/jit/codewriter/call.py:87 self.jitcodes = {}` — the

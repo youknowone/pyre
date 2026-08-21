@@ -283,7 +283,7 @@ impl AsyncActionOps for GcCollectHookAction {
     }
 }
 
-/// `hook.py:70-115 W_AppLevelHooks`. The callback references live directly
+/// `hook.py W_AppLevelHooks`. The callback references live directly
 /// on the singleton owner, so the generated type tracer forwards them; the
 /// three action objects are embedded exactly as its `gc_minor`,
 /// `gc_collect_step`, and `gc_collect` attributes are upstream.

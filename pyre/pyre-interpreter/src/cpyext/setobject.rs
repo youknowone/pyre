@@ -64,7 +64,7 @@ pub unsafe extern "C" fn PySet_New(iterable: *mut CPyObject) -> *mut CPyObject {
     result(crate::call::call_function_impl_result(w_set, &[iterable]))
 }
 
-/// `PyFrozenSet_New(iterable)` (`setobject.py:152-160`).
+/// `PyFrozenSet_New(iterable)` (`setobject.py`).
 ///
 /// # Safety
 /// `iterable` must be null or a live reference.
@@ -111,7 +111,7 @@ fn add_frozen(set: PyObjectRef, key: PyObjectRef) -> Result<(), crate::PyError> 
     .map_err(crate::baseobjspace::map_set_update_error)
 }
 
-/// `PySet_Add(set, key)` (`setobject.py:75-91`).
+/// `PySet_Add(set, key)` (`setobject.py`).
 ///
 /// A frozenset is accepted while it is still being filled — the documented way
 /// to build one before it is exposed.  "Still being filled" is "has not
@@ -164,7 +164,7 @@ pub unsafe extern "C" fn PySet_Discard(set: *mut CPyObject, key: *mut CPyObject)
     }
 }
 
-/// `PySet_Pop(set)` (`setobject.py:113-118`).
+/// `PySet_Pop(set)` (`setobject.py`).
 ///
 /// # Safety
 /// `set` must be a live reference.
@@ -176,7 +176,7 @@ pub unsafe extern "C" fn PySet_Pop(set: *mut CPyObject) -> *mut CPyObject {
     result(any_set(set, "PySet_Pop").and_then(|set| method(set, "pop", &[])))
 }
 
-/// `PySet_Clear(set)` (`setobject.py:121-124`).
+/// `PySet_Clear(set)` (`setobject.py`).
 ///
 /// # Safety
 /// `set` must be a live reference.
@@ -192,7 +192,7 @@ pub unsafe extern "C" fn PySet_Clear(set: *mut CPyObject) -> c_int {
     }
 }
 
-/// `PySet_Size(anyset)` (`setobject.py:131-137`).
+/// `PySet_Size(anyset)` (`setobject.py`).
 ///
 /// # Safety
 /// `set` must be a live reference.

@@ -28,7 +28,7 @@ pub mod deque_block {
     }
 
     pub fn new(leftlink: PyObjectRef, rightlink: PyObjectRef) -> PyObjectRef {
-        // `interp_deque.py:14 Block.data = [None] * BLOCKLEN` is annotated by
+        // `interp_deque.py Block.data = [None] * BLOCKLEN` is annotated by
         // RPython as a list of `W_Root` references.  It must therefore keep
         // ObjectListStrategy even when every live deque entry is an int or a
         // float; a typed list strategy would unbox and later rebox the entry,

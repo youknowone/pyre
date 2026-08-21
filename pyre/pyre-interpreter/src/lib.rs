@@ -317,7 +317,7 @@ macro_rules! py_module {
                 );
             )*)?
             // exceptions: module-local exception classes — PyPy
-            // `new_exception_class("<mod>.Name", base)` (error.py:857).
+            // `new_exception_class("<mod>.Name", base)` (error.py).
             // The class name is auto-qualified as `"<$name>.<key>"` and
             // built via `make_exc_type` (which also records it in the
             // exc-class registry); the short `key` is the attribute name
@@ -347,7 +347,7 @@ macro_rules! py_module {
                     &[ $( $appname ),* ],
                 );
             )*)?
-            // inline_app: PyPy `applevel(r'''…''')` (gateway.py:823) —
+            // inline_app: PyPy `applevel(r'''…''')` (gateway.py) —
             // embed a Python snippet inline; the runtime executes it the
             // same way as appleveldefs but the source comes from a
             // string literal instead of `include_str!` on a sibling .py

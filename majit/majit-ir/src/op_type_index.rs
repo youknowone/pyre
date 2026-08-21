@@ -5,8 +5,8 @@ use crate::value::{InputArg, Type};
 
 /// O(1) `OpRef → Type` lookup over a trace's inputargs + ops + constant pool.
 ///
-/// rpython/jit/metainterp/history.py:220 `ConstInt.type = INT`,
-/// rpython/jit/metainterp/resoperation.py:567 `IntOp.type = 'i'` —
+/// rpython/jit/metainterp/history.py `ConstInt.type = INT`,
+/// rpython/jit/metainterp/resoperation.py `IntOp.type = 'i'` —
 /// RPython reads `box.type` directly from the Box object. Pyre's typed
 /// `OpRef` variants carry that type tag for value boxes; this index is
 /// the compatibility boundary for raw/index-keyed consumers that still
@@ -176,7 +176,7 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     /// Direct `OpRef → &Op` lookup; returns `None` for constants,
     /// inputargs, or `OpRef::NONE`.
     ///
-    /// resoperation.py:29 `AbstractResOp` vs history.py:182 `AbstractValue`:
+    /// resoperation.py `AbstractResOp` vs history.py:182 `AbstractValue`:
     /// only `*Op` variants (Int/Float/Ref/VoidOp) are produced by a
     /// `ResOperation`; `Const*` and `InputArg*` boxes have no producing
     /// op. Filter on the variant tag so a flat-`OpRef(u32)` collision

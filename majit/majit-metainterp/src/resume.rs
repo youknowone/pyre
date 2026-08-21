@@ -240,7 +240,7 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub struct SnapshotBox {
     /// The trace-position ref this snapshot slot references. A
-    /// `Const{Ptr}` slot carries its gcref inline (history.py:314
+    /// `Const{Ptr}` slot carries its gcref inline (history.py
     /// `ConstPtr.value`); during compilation the snapshot root walker
     /// (`walk_compile_snapshot_refs`) forwards it in place through a
     /// collected `*mut OpRef` slot address.
@@ -405,13 +405,13 @@ impl SimpleBoxEnv {
 }
 
 impl BoxEnv for SimpleBoxEnv {
-    // resoperation.py:57-68 get_box_replacement walks the chain
+    // resoperation.py get_box_replacement walks the chain
     // op -> op._forwarded -> ... until None / AbstractInfo, returning the
     // last item before that. Iterate the replacement map the same way.
     fn get_box_replacement(&self, opref: majit_ir::OpRef) -> majit_ir::OpRef {
-        // history.py:227/268/314 inline-Const is its own forwarding root
+        // history.py/268/314 inline-Const is its own forwarding root
         // (Const objects never participate in `_forwarded` per
-        // resoperation.py:57 default `_forwarded = None`).
+        // resoperation.py default `_forwarded = None`).
         if opref.inline_const_bits().is_some() {
             return opref;
         }
@@ -469,14 +469,14 @@ impl BoxEnv for SimpleBoxEnv {
     }
 
     fn is_const(&self, opref: majit_ir::OpRef) -> bool {
-        // history.py:227/268/314 inline-Const variants are constants by tag.
+        // history.py/268/314 inline-Const variants are constants by tag.
         if opref.is_constant() {
             return true;
         }
         self.constants.contains_key(&opref.raw())
     }
     fn get_const(&self, opref: majit_ir::OpRef) -> (i64, majit_ir::Type) {
-        // history.py:227 ConstInt.value / :268 ConstFloat.value / :314 ConstPtr.value
+        // history.py ConstInt.value / :268 ConstFloat.value / :314 ConstPtr.value
         // inline on the Box; read directly without side-table.
         if let (Some(bits), Some(tp)) = (opref.inline_const_bits(), opref.ty()) {
             return (bits, tp);
@@ -487,7 +487,7 @@ impl BoxEnv for SimpleBoxEnv {
             .unwrap_or((0, majit_ir::Type::Int))
     }
     fn get_type(&self, opref: majit_ir::OpRef) -> majit_ir::Type {
-        // resoperation.py:1693 opclasses[opnum].type — every typed OpRef
+        // resoperation.py opclasses[opnum].type — every typed OpRef
         // variant pins `.type` (history.py:220/261/307 + resoperation.py:567/589/615).
         if let Some(tp) = opref.ty() {
             return tp;
@@ -517,10 +517,10 @@ impl BoxEnv for SimpleBoxEnv {
     }
 }
 
-// resume.py:123-132 — tag constants (i64 widened for rd_numb encoding).
+// resume.py — tag constants (i64 widened for rd_numb encoding).
 // Same values as the i16 TAGCONST/TAGINT/TAGBOX/TAGVIRTUAL above.
 const TAGMASK_I64: i64 = TAGMASK as i64;
-// resume.py:130 `NULLREF = tag(-1, TAGCONST)` — pre-shift num for
+// resume.py `NULLREF = tag(-1, TAGCONST)` — pre-shift num for
 // `Const::Ref(NULL)`. Shared by the i16 `NULLREF` constant and the
 // i64 `getconst_i64`/`decode_box` pair.
 const ENCODED_NULLREF: i64 = -1;
@@ -531,7 +531,7 @@ const ENCODED_UNAVAILABLE: i64 = -3;
 const INLINE_TAGGED_MIN: i64 = -(1_i64 << 61);
 const INLINE_TAGGED_MAX: i64 = (1_i64 << 61) - 1;
 
-/// compile.py:853-876 `ResumeGuardDescr` storage.
+/// compile.py `ResumeGuardDescr` storage.
 ///
 /// Canonical, guard-owned resume payload (`storage.rd_numb/rd_consts/
 /// rd_virtuals/rd_pendingfields`). Shared via `Arc<ResumeStorage>` so
@@ -566,7 +566,7 @@ pub struct ResumeStorage {
 }
 
 impl ResumeStorage {
-    /// `compile.py:849 AbstractResumeGuardDescr.get_resumestorage(): return
+    /// `compile.py AbstractResumeGuardDescr.get_resumestorage(): return
     /// self` — the failing guard descr *is* its own resume storage upstream,
     /// because `rd_numb` / `rd_consts` / `rd_virtuals` / `rd_pendingfields`
     /// are its `_attrs_` (`compile.py:855`).  Pyre additionally indexes the
@@ -672,7 +672,7 @@ impl ResumeStorage {
 ///
 /// `rd_numb` is a flat encoded numbering section (resume.py:466):
 /// 1. items_resume_section (total rd_numb length)
-/// 2. count (number of liveboxes, resume.py:921)
+/// 2. count (number of liveboxes, resume.py)
 /// 3. number of frames
 /// 4. per-frame `(pc, slot_count, slot_sources...)`
 ///
@@ -687,7 +687,7 @@ pub struct EncodedResumeData {
     pub rd_numb: Vec<i64>,
     /// resume.py:467 storage.rd_consts — shared constant pool.
     ///
-    /// RPython stores `list[Const]` (history.py:220/261/307). We keep the
+    /// RPython stores `list[Const]` (history.py/261/307). We keep the
     /// same shape so Ref entries stay visible to the minor-collection root
     /// walker (framework.py `root_walker.walk_roots` parity).
     pub rd_consts: Vec<Const>,
@@ -695,7 +695,7 @@ pub struct EncodedResumeData {
     pub rd_pendingfields: Vec<EncodedPendingFieldWrite>,
     /// compile.py:858 storage.rd_virtuals — live VirtualInfo objects.
     pub rd_virtuals: Vec<VirtualInfo>,
-    /// resume.py:411 liveboxes — compact TAGBOX(n) → original FailArg index.
+    /// resume.py liveboxes — compact TAGBOX(n) → original FailArg index.
     /// In RPython, `liveboxes[n]` is the Box object that was assigned TAGBOX(n).
     /// Here, `liveboxes[n]` is the original deadframe slot index.
     pub liveboxes: Vec<usize>,
@@ -1071,7 +1071,7 @@ fn resume_virtual_layout_to_exit_virtual_layout(
                     .map(|source| source.to_exit_source(virtual_offset))
                     .collect(),
             },
-            // resume.py:781 VStrConcatInfo / resume.py:836 VUniConcatInfo
+            // resume.py VStrConcatInfo / resume.py VUniConcatInfo
             // — funcptr/calldescr resolved at materialization via
             // `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT /
             // OS_UNI_CONCAT)` (resume.py:1467-1468 / 1494-1495), so the
@@ -1086,7 +1086,7 @@ fn resume_virtual_layout_to_exit_virtual_layout(
                 left: left.to_exit_source(virtual_offset),
                 right: right.to_exit_source(virtual_offset),
             },
-            // resume.py:801 VStrSliceInfo / resume.py:856 VUniSliceInfo
+            // resume.py VStrSliceInfo / resume.py VUniSliceInfo
             // — funcptr/calldescr resolved via callinfocollection at
             // materialization (resume.py:1477-1478 / 1504-1505).
             ResumeVirtualLayoutSummary::StrSlice {
@@ -1308,7 +1308,7 @@ fn can_inline_tagged(value: i64) -> bool {
 // so it can share `self.consts` with `getconst`/`newconst` — matching
 // RPython's single `self.consts: list[Const]` pool (resume.py:147).
 
-/// resume.py:99-104 tag() — i64 widened variant for rd_numb encoding.
+/// resume.py tag() — i64 widened variant for rd_numb encoding.
 fn tag_i64(value: i64, tagbits: u8) -> i64 {
     debug_assert!(tagbits <= 3);
     debug_assert!(
@@ -1318,7 +1318,7 @@ fn tag_i64(value: i64, tagbits: u8) -> i64 {
     (value << 2) | tagbits as i64
 }
 
-/// resume.py:106-109 untag() — i64 widened variant for rd_numb decoding.
+/// resume.py untag() — i64 widened variant for rd_numb decoding.
 fn untag_i64(encoded: i64) -> (i64, u8) {
     ((encoded >> 2), (encoded & TAGMASK_I64) as u8)
 }
@@ -1374,7 +1374,7 @@ pub use majit_backend::VirtualFieldSource;
 
 /// Convert a tagged fieldnum (i16, resume.py encoding) to a VirtualFieldSource.
 ///
-/// resume.py:1552-1596 decode_int/decode_ref: tagged values encode where
+/// resume.py decode_int/decode_ref: tagged values encode where
 /// each field value comes from at resume time.
 ///
 /// `consts` is the rd_consts array. `count` is the number of fail_args
@@ -1396,7 +1396,7 @@ pub fn tagged_to_source(
         return ResumeValueSource::Uninitialized;
     }
     if tagged_eq(tagged, NULLREF) {
-        // history.py:361 CONST_NULL = ConstPtr(null). resume.py:1589 parity.
+        // history.py CONST_NULL = ConstPtr(null). resume.py:1589 parity.
         return ResumeValueSource::Constant(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
     }
     let (num, tag_bits) = untag(tagged);
@@ -1404,14 +1404,14 @@ pub fn tagged_to_source(
         TAGCONST => {
             let idx = (num - TAG_CONST_OFFSET) as usize;
             if idx < consts.len() {
-                // resume.py:1568 self.consts[num - TAG_CONST_OFFSET] — the
+                // resume.py self.consts[num - TAG_CONST_OFFSET] — the
                 // Const object carries its type (ConstInt/ConstFloat/ConstPtr).
                 ResumeValueSource::Constant(consts[idx])
             } else {
                 ResumeValueSource::Constant(majit_ir::Const::Int(0))
             }
         }
-        // resume.py:1581 ConstInt(num) — always Int type for TAGINT.
+        // resume.py ConstInt(num) — always Int type for TAGINT.
         TAGINT => ResumeValueSource::Constant(majit_ir::Const::Int(num as i64)),
         TAGBOX => {
             let mut idx = num;
@@ -1538,7 +1538,7 @@ pub fn rd_virtual_to_virtual_info(
             fieldnums,
             ..
         } => {
-            // resume.py:736-740: VArrayStructInfo(arraydescr, size, fielddescrs)
+            // resume.py: VArrayStructInfo(arraydescr, size, fielddescrs)
             // fieldnums is flat: size * len(fielddescrs) entries
             let num_fields = rd_fielddescrs.len().max(1);
             let mut element_fields = Vec::with_capacity(*size);
@@ -1653,7 +1653,7 @@ pub use majit_backend::PendingFieldInfo;
 
 /// Concrete pending heap write reconstructed from resume data.
 ///
-/// `resume.py:1000-1007 _prepare_pendingfields` parity — RPython
+/// `resume.py _prepare_pendingfields` parity — RPython
 /// hands the live `descr` Arc into `setfield` / `setarrayitem` and
 /// they dispatch via `descr.is_pointer_field()` /
 /// `descr.is_array_of_pointers()` etc.
@@ -1682,7 +1682,7 @@ impl Eq for ResolvedPendingFieldWrite {}
 
 /// Encoded pending field write stored alongside an encoded resume snapshot.
 ///
-/// `resume.py:87-92 PENDINGFIELDSTRUCT` parity — the encoded form
+/// `resume.py PENDINGFIELDSTRUCT` parity — the encoded form
 /// carries `lldescr` (the descriptor object itself) so decoding can
 /// hand back a live `Arc<dyn Descr>` via `descr.clone()` rather than
 /// rebuilding it through an index lookup
@@ -1727,7 +1727,7 @@ impl EncodedResumeData {
     ///
     /// Pending-field replay still comes from `store_final_boxes_in_guard`
     /// in production. The encoded pending-field records do carry their
-    /// live descr Arc (`resume.py:88 PENDINGFIELDSTRUCT.lldescr`), but
+    /// live descr Arc (`resume.py PENDINGFIELDSTRUCT.lldescr`), but
     /// this helper does not currently rebuild `GuardPendingFieldEntry`
     /// from them — the production path attaches that elsewhere.
     pub fn to_resume_storage(&self) -> Arc<ResumeStorage> {
@@ -1856,10 +1856,10 @@ impl EncodedResumeData {
                     }
                     // resume.py:740 self.fielddescrs — live InteriorFieldDescr
                     // objects expose offset/field_size/field_type via the
-                    // FieldDescr trait (descr.py:273 / llmodel.py:648-649).
+                    // FieldDescr trait (descr.py / llmodel.py:648-649).
                     // Recover the per-field metadata from the live Arc rather
                     // than emitting placeholders; PyPy `make_virtual_info`
-                    // (resume.py:488) forwards `fielddescrs[j]` to the
+                    // (resume.py) forwards `fielddescrs[j]` to the
                     // VArrayStructInfo materialiser which reads
                     // `is_pointer_field`/`is_float_field`/offset/field_size
                     // through the same accessors at replay time
@@ -2003,10 +2003,10 @@ impl EncodedResumeData {
         )
     }
 
-    /// resume.py:231-267 number + resume.py:380-468 finish
+    /// resume.py number + resume.py finish
     ///
     /// Walks all frames via _number_boxes, assigning compact sequential
-    /// TAGBOX numbers to unique liveboxes (resume.py:199-226).
+    /// TAGBOX numbers to unique liveboxes (resume.py).
     ///
     /// Unlike `ResumeDataLoopMemo::encode_shared`, this is a single-shot
     /// encoder (no cross-guard dedup). It builds a local memo that shares
@@ -2022,7 +2022,7 @@ impl EncodedResumeData {
     ) -> Self {
         let mut memo = ResumeDataLoopMemo::new();
         let mut rd_numb = Vec::new();
-        // resume.py:138 numb_state.liveboxes — compact TAGBOX numbering state.
+        // resume.py numb_state.liveboxes — compact TAGBOX numbering state.
         let mut liveboxes: Vec<usize> = Vec::new();
         let mut box_map: indexmap::IndexMap<usize, usize> = indexmap::IndexMap::new();
 
@@ -2045,13 +2045,13 @@ impl EncodedResumeData {
             rd_numb.push(tagged);
         }
 
-        // resume.py:249-253: per-frame encoding via _number_boxes.
+        // resume.py: per-frame encoding via _number_boxes.
         let mut frame_sizes = Vec::with_capacity(frames.len());
         for frame in frames {
             rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
             rd_numb.push(encode_u64(frame.py_pc as u64));
-            // resume.py:253 _number_boxes(snapshot_iter, iter_array(snapshot), numb_state)
+            // resume.py _number_boxes(snapshot_iter, iter_array(snapshot), numb_state)
             for source in &frame.slot_map {
                 let tagged = memo.encode_tagged_source(source, &mut liveboxes, &mut box_map);
                 rd_numb.push(tagged);
@@ -2104,7 +2104,7 @@ impl EncodedResumeData {
         }
     }
 
-    /// resume.py:916-923 AbstractResumeDataReader._init — decode rd_numb.
+    /// resume.py AbstractResumeDataReader._init — decode rd_numb.
     fn decode_layout(&self) -> DecodedResumeLayout {
         let mut cursor = 0usize;
         // resume.py:919 items_resume_section
@@ -2114,7 +2114,7 @@ impl EncodedResumeData {
             self.rd_numb.len(),
             "resume item count mismatch"
         );
-        // resume.py:921 self.count — number of liveboxes in the deadframe.
+        // resume.py self.count — number of liveboxes in the deadframe.
         let _count = decode_len(self.next_word(&mut cursor));
 
         let vable_count = decode_len(self.next_word(&mut cursor));
@@ -2165,7 +2165,7 @@ impl EncodedResumeData {
             self.rd_numb.len(),
             "resume decoder left trailing data"
         );
-        // resume.py:993-1001 _prepare_pendingfields — lldescr is restored
+        // resume.py _prepare_pendingfields — lldescr is restored
         // directly from `PENDINGFIELDSTRUCT.lldescr` via
         // `cast_base_ptr_to_instance(AbstractDescr, lldescr)`; pyre keeps
         // the live `Arc<dyn Descr>` on the encoded record, so decoding is
@@ -2200,13 +2200,13 @@ impl EncodedResumeData {
         word
     }
 
-    /// resume.py:1240-1270 decode_box — decode a tagged value from rd_numb.
+    /// resume.py decode_box — decode a tagged value from rd_numb.
     fn decode_box(&self, encoded: i64) -> ResumeValueSource {
         let (value, tag) = untag_i64(encoded);
         match tag {
             // resume.py:1257 ConstInt(num).
             TAGINT => ResumeValueSource::Constant(majit_ir::Const::Int(value)),
-            // resume.py:1261 self.liveboxes[num] — compact TAGBOX → original FailArg.
+            // resume.py self.liveboxes[num] — compact TAGBOX → original FailArg.
             TAGBOX => {
                 let compact_idx = decode_len(value);
                 let original_idx = self.liveboxes[compact_idx];
@@ -2214,7 +2214,7 @@ impl EncodedResumeData {
             }
             TAGVIRTUAL => ResumeValueSource::Virtual(decode_len(value)),
             TAGCONST => match value {
-                // resume.py:1552-1596 decode_ref: `if tagged_eq(tagged,
+                // resume.py decode_ref: `if tagged_eq(tagged,
                 // NULLREF): return CONST_NULL`. The i64 decoder mirrors
                 // the free `decode_box(tagged: i16, ..)`'s NULLREF
                 // fast-path so encoder/decoder stay symmetric.
@@ -2224,7 +2224,7 @@ impl EncodedResumeData {
                 ENCODED_UNINITIALIZED => ResumeValueSource::Uninitialized,
                 ENCODED_UNAVAILABLE => ResumeValueSource::Unavailable,
                 index if index >= 0 => {
-                    // resume.py:1555/1571/1583 self.consts[num - TAG_CONST_OFFSET]
+                    // resume.py/1571/1583 self.consts[num - TAG_CONST_OFFSET]
                     // — the Const carries its own type.
                     let c = *self
                         .rd_consts
@@ -2665,7 +2665,7 @@ impl MaterializedValue {
 
 #[derive(Debug, Clone)]
 pub enum MaterializedVirtual {
-    /// Object with vtable — resume.py:612 VirtualInfo.
+    /// Object with vtable — resume.py VirtualInfo.
     /// Carries `descr` (resume.py:615 self.descr) so the deopt path can
     /// `allocate_with_vtable(descr=self.descr)` and replay fields generically,
     /// without special-casing the vtable at the JIT-state layer.
@@ -2676,7 +2676,7 @@ pub enum MaterializedVirtual {
         /// (field_descr_index, concrete_value).
         fields: Vec<(u32, MaterializedValue)>,
     },
-    /// Plain struct — resume.py:628 VStructInfo.
+    /// Plain struct — resume.py VStructInfo.
     Struct {
         /// resume.py:631 self.typedescr.
         descr: Option<majit_ir::DescrRef>,
@@ -2689,7 +2689,7 @@ pub enum MaterializedVirtual {
         descr: Option<majit_ir::DescrRef>,
         items: Vec<MaterializedValue>,
     },
-    /// Array of structs — resume.py:739 VArrayStructInfo.
+    /// Array of structs — resume.py VArrayStructInfo.
     ArrayStruct {
         /// resume.py:739 self.arraydescr.
         descr: Option<majit_ir::DescrRef>,
@@ -2947,7 +2947,7 @@ impl MaterializedVirtual {
 
 /// Builder for constructing ResumeData during trace compilation.
 ///
-/// resume.py:298-493 ResumeDataVirtualAdder.finish() is implemented
+/// resume.py ResumeDataVirtualAdder.finish() is implemented
 /// across two functions in majit:
 /// - `store_final_boxes_in_guard` (mod.rs) — numbering + rd_numb/rd_consts
 /// - `store_final_boxes_in_guard` (optimizer.rs) — virtual expansion + rd_virtuals
@@ -3086,7 +3086,7 @@ impl ResumeDataVirtualAdder {
         })
     }
 
-    /// resume.py:332: visit_varraystruct(arraydescr, size, fielddescrs)
+    /// resume.py: visit_varraystruct(arraydescr, size, fielddescrs)
     ///                 → VArrayStructInfo(arraydescr, size, fielddescrs)
     pub fn add_virtual_array_struct(
         &mut self,
@@ -3121,7 +3121,7 @@ impl ResumeDataVirtualAdder {
 
     /// Add a deferred field write to replay on resume.
     ///
-    /// `resume.py:88 PENDINGFIELDSTRUCT.lldescr` — RPython always
+    /// `resume.py PENDINGFIELDSTRUCT.lldescr` — RPython always
     /// captures a live descr off the originating SetfieldGc op.
     pub fn add_pending_field_write(
         &mut self,
@@ -3191,7 +3191,7 @@ impl Default for ResumeDataVirtualAdder {
 /// RPython's `ResumeDataLoopMemo` shares constant pools and frame sections
 /// across guards. We use a shared `ResumeEncoder` state so that the same
 /// large constant only appears once in the pool.
-/// RPython resume.py:142 ResumeDataLoopMemo.
+/// RPython resume.py ResumeDataLoopMemo.
 /// Shared constant pool + box numbering cache across all guards in a loop.
 ///
 /// NOTE: RPython's ResumeDataLoopMemo also stores `metainterp_sd` and `cpu`
@@ -3204,7 +3204,7 @@ pub struct ResumeDataLoopMemo {
     /// RPython stores Const objects (with type INT/REF/FLOAT).
     /// We store (value, type) pairs to preserve type information.
     consts: Vec<majit_ir::Const>,
-    /// resume.py:148 — large integers (outside TAGINT range) → tagged const.
+    /// resume.py — large integers (outside TAGINT range) → tagged const.
     large_ints: indexmap::IndexMap<i64, i16>,
     /// resume.py:149 — ref pointers → tagged const.
     refs: indexmap::IndexMap<i64, i16>,
@@ -3234,7 +3234,7 @@ impl ResumeDataLoopMemo {
         }
     }
 
-    /// resume.py:199-226 `_number_boxes` + resume.py:209 `getconst` parity.
+    /// resume.py `_number_boxes` + resume.py `getconst` parity.
     ///
     /// Encode one `ResumeValueSource` into the i64 tagged form written to
     /// `rd_numb`. `liveboxes` / `box_map` track compact TAGBOX numbering
@@ -3250,7 +3250,7 @@ impl ResumeDataLoopMemo {
         box_map: &mut indexmap::IndexMap<usize, usize>,
     ) -> i64 {
         match source {
-            // resume.py:214-224: new box → liveboxes[box] = tag(num_boxes, TAGBOX)
+            // resume.py: new box → liveboxes[box] = tag(num_boxes, TAGBOX)
             ResumeValueSource::FailArg(index) => {
                 let compact = *box_map.entry(*index).or_insert_with(|| {
                     let n = liveboxes.len();
@@ -3259,9 +3259,9 @@ impl ResumeDataLoopMemo {
                 });
                 tag_i64(encode_len(compact), TAGBOX)
             }
-            // resume.py:209: isinstance(box, Const) → self.getconst(box).
+            // resume.py: isinstance(box, Const) → self.getconst(box).
             ResumeValueSource::Constant(c) => self.getconst_i64(c),
-            // resume.py:219-221: virtual → tag(num_virtuals, TAGVIRTUAL)
+            // resume.py: virtual → tag(num_virtuals, TAGVIRTUAL)
             ResumeValueSource::Virtual(index) => tag_i64(encode_len(*index), TAGVIRTUAL),
             ResumeValueSource::Tagged(_) => {
                 panic!("runtime tagged source cannot be encoded into a new resume stream")
@@ -3271,7 +3271,7 @@ impl ResumeDataLoopMemo {
         }
     }
 
-    /// resume.py:157-183 getconst(const) — tag a constant value.
+    /// resume.py getconst(const) — tag a constant value.
     /// Unified entry point matching RPython's getconst(const) which
     /// dispatches on const.type (INT, REF, FLOAT).
     pub fn getconst(&mut self, val: i64, tp: majit_ir::Type) -> i16 {
@@ -3283,7 +3283,7 @@ impl ResumeDataLoopMemo {
         }
     }
 
-    /// resume.py:158-172 getconst for INT type.
+    /// resume.py getconst for INT type.
     pub fn getconst_int(&mut self, val: i64) -> i16 {
         // Try inline TAGINT (-8191..8190 in RPython's i16 range).
         let shifted = val >> 13;
@@ -3299,7 +3299,7 @@ impl ResumeDataLoopMemo {
         tagged
     }
 
-    /// resume.py:173-182 getconst for REF type.
+    /// resume.py getconst for REF type.
     pub fn getconst_ref(&mut self, val: i64) -> i16 {
         if val == 0 {
             return NULLREF;
@@ -3312,27 +3312,27 @@ impl ResumeDataLoopMemo {
         tagged
     }
 
-    /// resume.py:183 getconst fallback for FLOAT type.
+    /// resume.py getconst fallback for FLOAT type.
     pub fn getconst_float(&mut self, val: i64) -> i16 {
         // FLOAT constants always go to the pool (no inline encoding).
         // RPython: return self._newconst(const)
         self.newconst(val, majit_ir::Type::Float)
     }
 
-    /// resume.py:185 _newconst — add to consts pool, return TAGCONST-tagged.
+    /// resume.py _newconst — add to consts pool, return TAGCONST-tagged.
     fn newconst(&mut self, val: i64, tp: majit_ir::Type) -> i16 {
         let index = self.consts.len() as i32 + TAG_CONST_OFFSET;
         self.consts.push(majit_ir::Const::from_raw_i64(val, tp));
         ((index << 2) | TAGCONST as i32) as i16
     }
 
-    /// resume.py:161-188 getconst — i64-sized variant used by the rd_numb
+    /// resume.py getconst — i64-sized variant used by the rd_numb
     /// encoder (`encode_shared`). Shares the pool (`self.consts`) with the
     /// i16 variant (`getconst`) so there is exactly one `rd_consts` per
     /// memo, matching RPython's single `self.consts: list[Const]`.
     fn getconst_i64(&mut self, c: &majit_ir::Const) -> i64 {
         match c {
-            // resume.py:163-167: try tag(val, TAGINT).
+            // resume.py: try tag(val, TAGINT).
             majit_ir::Const::Int(value) if can_inline_tagged(*value) => tag_i64(*value, TAGINT),
             majit_ir::Const::Int(value) => {
                 // resume.py:168-172 large int.
@@ -3351,7 +3351,7 @@ impl ResumeDataLoopMemo {
                 tag_i64(encode_len(index), TAGCONST)
             }
             majit_ir::Const::Ref(gcref) => {
-                // resume.py:174-176 val = 0 → NULLREF sentinel (no pool
+                // resume.py val = 0 → NULLREF sentinel (no pool
                 // entry allocated). `NULLREF = tag(-1, TAGCONST)` —
                 // encoder emits `tag_i64(-1, TAGCONST)` and the
                 // matching decoder in `decode_box` recognizes
@@ -3372,7 +3372,7 @@ impl ResumeDataLoopMemo {
                 tag_i64(encode_len(index), TAGCONST)
             }
             majit_ir::Const::Float(v) => {
-                // resume.py:183 _newconst (no dedup for floats in RPython).
+                // resume.py _newconst (no dedup for floats in RPython).
                 let index = self.consts.len();
                 self.consts.push(majit_ir::Const::Float(*v));
                 tag_i64(encode_len(index), TAGCONST)
@@ -3380,18 +3380,18 @@ impl ResumeDataLoopMemo {
         }
     }
 
-    /// resume.py:261-262 num_cached_boxes — length of the box dedup cache.
+    /// resume.py num_cached_boxes — length of the box dedup cache.
     pub fn num_cached_boxes(&self) -> usize {
         self.cached_boxes.len()
     }
 
-    /// resume.py:275-276 num_cached_virtuals — length of the virtual dedup cache.
+    /// resume.py num_cached_virtuals — length of the virtual dedup cache.
     pub fn num_cached_virtuals(&self) -> usize {
         self.cached_virtuals.len()
     }
 
-    /// resume.py:264 assign_number_to_box — returns a negative number.
-    /// resume.py:264-273 assign_number_to_box(box, boxes).
+    /// resume.py assign_number_to_box — returns a negative number.
+    /// resume.py assign_number_to_box(box, boxes).
     ///
     /// RPython version mutates `boxes` list:
     /// - cached: `boxes[-num - 1] = box`
@@ -3416,7 +3416,7 @@ impl ResumeDataLoopMemo {
         num
     }
 
-    /// resume.py:264-273 variant for `_number_virtuals`: boxes is `Vec<Option<OpRef>>`.
+    /// resume.py variant for `_number_virtuals`: boxes is `Vec<Option<OpRef>>`.
     /// RPython's `new_liveboxes = [None] * memo.num_cached_boxes()`.
     pub fn assign_number_to_box_opt(
         &mut self,
@@ -3436,7 +3436,7 @@ impl ResumeDataLoopMemo {
         num
     }
 
-    /// resume.py:278 assign_number_to_virtual — returns a negative number.
+    /// resume.py assign_number_to_virtual — returns a negative number.
     pub fn assign_number_to_virtual(&mut self, b: &majit_ir::operand::Operand) -> i32 {
         if let Some(&num) = self.cached_virtuals.get(b) {
             return num;
@@ -3447,7 +3447,7 @@ impl ResumeDataLoopMemo {
         num
     }
 
-    /// resume.py:290-293 update_counters(profiler).
+    /// resume.py update_counters(profiler).
     ///
     /// Roll the memo's cumulative NVIRTUALS / NVHOLES / NVREUSED into the
     /// caller-supplied profiler. Called from optimizeopt/optimizer.py:557
@@ -3459,14 +3459,14 @@ impl ResumeDataLoopMemo {
         profiler.count(crate::pyjitpl::counters::NVREUSED, self.nvreused);
     }
 
-    /// resume.py:286 clear_box_virtual_numbers.
+    /// resume.py clear_box_virtual_numbers.
     pub fn clear_box_virtual_numbers(&mut self) {
         self.cached_boxes.clear();
         self.cached_virtuals.clear();
     }
 
     /// Access the shared constant pool (value, type) pairs. Parity with
-    /// RPython `memo.consts` list access (resume.py:147).
+    /// RPython `memo.consts` list access (resume.py).
     pub fn consts(&self) -> &[majit_ir::Const] {
         &self.consts
     }
@@ -3477,9 +3477,9 @@ impl ResumeDataLoopMemo {
         std::mem::take(&mut self.consts)
     }
 
-    /// resume.py:370-374 register_box — add a non-const, non-seen box to
+    /// resume.py register_box — add a non-const, non-seen box to
     /// new_liveboxes with `UNASSIGNED`. The virtual classification is
-    /// applied separately by `register_virtual_fields` (resume.py:359),
+    /// applied separately by `register_virtual_fields` (resume.py),
     /// which overwrites the entry with `UNASSIGNEDVIRTUAL` (or a
     /// pre-numbered tag from `liveboxes_from_env`). RPython's
     /// `register_box` does not consult `env.is_virtual` — see
@@ -3498,7 +3498,7 @@ impl ResumeDataLoopMemo {
         if opref.is_none() {
             return;
         }
-        // resume.py:371 — constants are handled by _gettagged
+        // resume.py — constants are handled by _gettagged
         // (TAGCONST/TAGINT) and don't need livebox slots.
         if env.is_const(opref) {
             return;
@@ -3514,7 +3514,7 @@ impl ResumeDataLoopMemo {
         new_liveboxes.insert(b, UNASSIGNED);
     }
 
-    /// resume.py:359-368 register_virtual_fields — stamp a virtual
+    /// resume.py register_virtual_fields — stamp a virtual
     /// box's livebox tag and queue it for visitor_walk_recursive.
     ///
     /// `tagged = liveboxes_from_env.get(virtualbox, UNASSIGNEDVIRTUAL)`
@@ -3536,7 +3536,7 @@ impl ResumeDataLoopMemo {
         new_liveboxes.insert(b, tagged);
     }
 
-    /// resume.py:454-509 `_number_virtuals(liveboxes, num_env_virtuals)`.
+    /// resume.py `_number_virtuals(liveboxes, num_env_virtuals)`.
     ///
     /// Walks `new_liveboxes` in insertion order, converts UNASSIGNED /
     /// UNASSIGNEDVIRTUAL tags into real negative numbers via
@@ -3546,7 +3546,7 @@ impl ResumeDataLoopMemo {
     /// `rd_virtuals` Vec.
     ///
     /// `liveboxes` is extended in place with the freshly numbered boxes
-    /// (resume.py:484 `liveboxes.extend(new_liveboxes)`). Returns
+    /// (resume.py `liveboxes.extend(new_liveboxes)`). Returns
     /// `(rd_virtuals, nholes)` where nholes is used for the
     /// `_invalidation_needed` heuristic check by the caller.
     #[allow(clippy::too_many_arguments)]
@@ -3559,11 +3559,11 @@ impl ResumeDataLoopMemo {
         numb_state: &NumberingState,
         env: &dyn majit_ir::BoxEnv,
     ) -> (Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>, usize) {
-        // resume.py:460: new_liveboxes = [None] * memo.num_cached_boxes()
+        // resume.py: new_liveboxes = [None] * memo.num_cached_boxes()
         let mut new_boxes_list: Vec<Option<majit_ir::OpRef>> = vec![None; self.num_cached_boxes()];
         let mut count = 0;
         // Iterate in insertion order (RPython dict iteration = insertion order).
-        // resoperation.py:38 same_box parity: keys carry the typed OpRef
+        // resoperation.py same_box parity: keys carry the typed OpRef
         // each entry was inserted with so virtual numbering preserves
         // `box.type` (history.py:220).
         // #160/S11: new_liveboxes.iter() yields the canonical box directly.
@@ -3571,7 +3571,7 @@ impl ResumeDataLoopMemo {
         for (box_id, tagged) in keys {
             let (_, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
-                // resume.py:472-473: index = assign_number_to_box; liveboxes[box] = tag(index, TAGBOX)
+                // resume.py: index = assign_number_to_box; liveboxes[box] = tag(index, TAGBOX)
                 let index = self.assign_number_to_box_opt(&box_id, &mut new_boxes_list);
                 if let Ok(t) = tag(index, TAGBOX) {
                     new_liveboxes.insert(box_id, t);
@@ -3580,7 +3580,7 @@ impl ResumeDataLoopMemo {
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
                 if tagged_eq(tagged, UNASSIGNEDVIRTUAL) {
-                    // resume.py:479-480: index = assign_number_to_virtual; liveboxes[box] = tag(index, TAGVIRTUAL)
+                    // resume.py: index = assign_number_to_virtual; liveboxes[box] = tag(index, TAGVIRTUAL)
                     let index = self.assign_number_to_virtual(&box_id);
                     if let Ok(t) = tag(index, TAGVIRTUAL) {
                         new_liveboxes.insert(box_id, t);
@@ -3596,12 +3596,12 @@ impl ResumeDataLoopMemo {
         let nholes = new_boxes_list.len() - count;
 
         // resume.py:488-506: create rd_virtuals
-        // resume.py:500-501: make_virtual_info(info, fieldnums) via BoxEnv dispatch
+        // resume.py: make_virtual_info(info, fieldnums) via BoxEnv dispatch
         let mut rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>> = Vec::new();
         if !virtual_fields.is_empty() {
-            // resume.py:491: length = num_env_virtuals + memo.num_cached_virtuals()
+            // resume.py: length = num_env_virtuals + memo.num_cached_virtuals()
             let length = num_env_virtuals + self.num_cached_virtuals();
-            // TODO: resume.py:492 uses `[None] * length` —
+            // TODO: resume.py uses `[None] * length` —
             // holes are represented as Python `None` in the list. Pyre's
             // descr-side `rd_virtuals: Arc<[Rc<RdVirtualInfo>]>` (compile.py:855
             // `_attrs_`) wraps the whole array in Option but the INNER
@@ -3619,7 +3619,7 @@ impl ResumeDataLoopMemo {
             self.nvholes += length - virtual_fields.len();
 
             for (&opref_id, vf) in virtual_fields {
-                // resume.py:496: num, _ = untag(self.liveboxes[virtualbox])
+                // resume.py: num, _ = untag(self.liveboxes[virtualbox])
                 // Check both numb_state.liveboxes (env virtuals) and
                 // new_liveboxes (nested virtuals discovered via worklist).
                 let opref = opref_id;
@@ -3639,12 +3639,12 @@ impl ResumeDataLoopMemo {
                     (rd_virtuals.len() as i32 + num) as usize
                 };
                 if num_idx < rd_virtuals.len() {
-                    // resume.py:500: fieldnums = [self._gettagged(box) for box in fieldboxes]
+                    // resume.py: fieldnums = [self._gettagged(box) for box in fieldboxes]
                     let fieldnums: Vec<i16> = vf
                         .field_oprefs
                         .iter()
                         .map(|&opref| {
-                            // resume.py:560-568 _gettagged with pyre-specific fallback
+                            // resume.py _gettagged with pyre-specific fallback
                             // to cached_boxes/cached_virtuals when the local
                             // liveboxes entries are still UNASSIGNED/UNASSIGNEDVIRTUAL.
                             if opref.is_none() {
@@ -3676,7 +3676,7 @@ impl ResumeDataLoopMemo {
                         })
                         .collect();
                     let reused = env.virtual_info_would_be_reused(opref_id, &fieldnums);
-                    // resume.py:501: vinfo = self.make_virtual_info(info, fieldnums)
+                    // resume.py: vinfo = self.make_virtual_info(info, fieldnums)
                     if let Some(rd_virt) = env.make_virtual_info(opref_id, fieldnums) {
                         if reused {
                             // resume.py:504-505: cached `_cached_vinfo` reused.
@@ -3690,7 +3690,7 @@ impl ResumeDataLoopMemo {
         (rd_virtuals, nholes)
     }
 
-    /// resume.py:520-558 `_add_pending_fields(pending_setfields)`.
+    /// resume.py `_add_pending_fields(pending_setfields)`.
     ///
     /// Tags the target/value boxes of each pending SETFIELD_GC/SETARRAYITEM_GC
     /// operation so the resume path can replay them against rehydrated
@@ -3708,15 +3708,15 @@ impl ResumeDataLoopMemo {
         for pf in pending_setfields.iter_mut() {
             let target = env.get_box_replacement(pf.target);
             let value = env.get_box_replacement(pf.value);
-            // resume.py:548-549 num = self._gettagged(box); fieldnum = self._gettagged(fieldbox)
+            // resume.py num = self._gettagged(box); fieldnum = self._gettagged(fieldbox)
             pf.target_tagged = self._gettagged(target, env, liveboxes_from_env, new_liveboxes);
             pf.value_tagged = self._gettagged(value, env, liveboxes_from_env, new_liveboxes);
         }
     }
 
-    /// resume.py:570-574 `_add_optimizer_sections(numb_state, liveboxes, liveboxes_from_env)`.
+    /// resume.py `_add_optimizer_sections(numb_state, liveboxes, liveboxes_from_env)`.
     ///
-    /// Delegates to bridgeopt.py:63-122 `serialize_optimizer_knowledge(optimizer,
+    /// Delegates to bridgeopt.py `serialize_optimizer_knowledge(optimizer,
     /// numb_state, liveboxes, liveboxes_from_env, memo)`. Emits three
     /// serialized sections on every guard (RPython emits zeros when the
     /// optheap/optrewrite caches are empty; the deserializer relies on the
@@ -3751,7 +3751,7 @@ impl ResumeDataLoopMemo {
         );
     }
 
-    /// resume.py:511-518 `_invalidation_needed(nliveboxes, nholes)`.
+    /// resume.py `_invalidation_needed(nliveboxes, nholes)`.
     ///
     /// Heuristic for when the shared memo's cached-box dedup should be
     /// flushed after a successful resume encoding:
@@ -3777,7 +3777,7 @@ impl ResumeDataLoopMemo {
         false
     }
 
-    /// resume.py:560-568 _gettagged — resolve an OpRef to its tagged number.
+    /// resume.py _gettagged — resolve an OpRef to its tagged number.
     /// Looks up in liveboxes_from_env first, then new_liveboxes, then constant.
     pub(crate) fn _gettagged(
         &mut self,
@@ -3789,7 +3789,7 @@ impl ResumeDataLoopMemo {
         if opref.is_none() {
             return UNINITIALIZED_TAG;
         }
-        // resume.py:563-564: isinstance(box, Const) → getconst
+        // resume.py: isinstance(box, Const) → getconst
         if env.is_const(opref) {
             let (val, tp) = env.get_const(opref);
             return self.getconst(val, tp);
@@ -3797,7 +3797,7 @@ impl ResumeDataLoopMemo {
         // #160/S11: key the livebox / cached maps by the canonical box
         // (Rc::ptr_eq). `opref` is already replacement-walked by the caller.
         let b = env.get_box_replacement_operand(opref);
-        // resume.py:566-567: liveboxes_from_env → existing tag
+        // resume.py: liveboxes_from_env → existing tag
         if let Some(tagged) = liveboxes_from_env.get(&b) {
             return tagged;
         }
@@ -3840,7 +3840,7 @@ impl ResumeDataLoopMemo {
                 numb_state.append_short(NULLREF);
                 continue;
             }
-            // resume.py:204: isinstance(box, Const) → getconst
+            // resume.py: isinstance(box, Const) → getconst
             if env.is_const(opref) {
                 let (val, tp) = env.get_const(opref);
                 let tagged = self.getconst(val, tp);
@@ -3914,7 +3914,7 @@ impl ResumeDataLoopMemo {
         Ok(())
     }
 
-    /// resume.py:228-256 number() — serialize a guard's full snapshot.
+    /// resume.py number() — serialize a guard's full snapshot.
     ///
     /// Output format (in NumberingState):
     /// ```text
@@ -3931,7 +3931,7 @@ impl ResumeDataLoopMemo {
     ///
     /// `frames` carries `(jitcode_index, pc, py_pc, fail_args_slice)` for each frame.
     /// In pyre (single frame), this is typically one frame.
-    /// resume.py:228-256 number() — serialize a guard's full snapshot.
+    /// resume.py number() — serialize a guard's full snapshot.
     ///
     /// Exact port of RPython's `number(self, position, trace, ...)`.
     ///
@@ -3982,7 +3982,7 @@ impl ResumeDataLoopMemo {
         // (opencoder.py:718-726, `build_vable_snapshot_boxes` for the
         // state-field path) moves `boxes[-1]` to slot 0, so `vable_array` is
         // identity-FIRST and the readers pull the virtualizable out before its
-        // payload (`resume.py:1404 virtualizable = self.next_ref()`;
+        // payload (`resume.py virtualizable = self.next_ref()`;
         // `consume_vable_info`; `seed_bridge_virtualizable_boxes`'s
         // `split_first`). Numbering must not reorder it again — running the
         // whole array through `_number_boxes()` unchanged is the parity.
@@ -4012,16 +4012,16 @@ impl ResumeDataLoopMemo {
         Ok(numb_state)
     }
 
-    /// resume.py:389-452 ResumeDataVirtualAdder.finish() — exact port.
+    /// resume.py ResumeDataVirtualAdder.finish() — exact port.
     ///
     /// `numb_state`: output of `number()`
     /// `env`: BoxEnv for resolving box properties (constants, types).
     ///   Virtual fields are discovered via `env.get_virtual_fields()`,
     ///   matching RPython's `visitor_walk_recursive` callback pattern.
-    /// `pending_setfields`: resume.py:428-442 register_box + visitor_walk_recursive,
-    ///   resume.py:520-558 _add_pending_fields tagging.
+    /// `pending_setfields`: resume.py register_box + visitor_walk_recursive,
+    ///   resume.py _add_pending_fields tagging.
     ///   target_tagged/value_tagged are filled in-place.
-    /// `optimizer_knowledge`: bridgeopt.py:63 serialize_optimizer_knowledge.
+    /// `optimizer_knowledge`: bridgeopt.py serialize_optimizer_knowledge.
     ///   Heap field triples and known-class info for bridge compilation.
     ///
     /// Returns `(rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)`.
@@ -4046,7 +4046,7 @@ impl ResumeDataLoopMemo {
     ) {
         let num_env_virtuals = numb_state.num_virtuals;
 
-        // resume.py:410-426: split liveboxes_from_env into TAGBOX/TAGVIRTUAL
+        // resume.py: split liveboxes_from_env into TAGBOX/TAGVIRTUAL
         let mut liveboxes: Vec<Option<majit_ir::OpRef>> = vec![None; numb_state.num_boxes as usize];
 
         // resume.py:413: self.vfieldboxes collected by virtual walk
@@ -4062,16 +4062,16 @@ impl ResumeDataLoopMemo {
         // observably re-order virtuals across builds.
         //
         // TAGBOX placement at `liveboxes[i] = opref` uses the
-        // tag-derived index (resume.py:417), so it is iteration-order-
+        // tag-derived index (resume.py), so it is iteration-order-
         // invariant; only the TAGVIRTUAL worklist push order matters.
         //
-        // resoperation.py:38 same_box parity: iter() yields the typed
+        // resoperation.py same_box parity: iter() yields the typed
         // OpRef each entry was inserted with, so consumers can read
         // `box.type` (history.py:220) directly via `opref.ty()`.
 
         // Collect virtual fields discovered via env.get_virtual_fields()
         // (resume.py:419-426 visitor_walk_recursive pattern). Keyed by
-        // typed OpRef so the same_box (resoperation.py:38) identity is
+        // typed OpRef so the same_box (resoperation.py) identity is
         // preserved end-to-end through the worklist drain.
         let mut virtual_fields: indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo> =
             indexmap::IndexMap::new();
@@ -4107,9 +4107,9 @@ impl ResumeDataLoopMemo {
             }
             let vf_result = env.get_virtual_fields(opref_id);
             if let Some(vf) = vf_result {
-                // resume.py:362-368: register_virtual_fields
+                // resume.py: register_virtual_fields
                 for &field_opref in &vf.field_oprefs {
-                    // resume.py:370-374: register_box (UNASSIGNED for
+                    // resume.py: register_box (UNASSIGNED for
                     // non-virtual fields).
                     self.register_box(field_opref, env, &numb_state.liveboxes, &mut new_liveboxes);
                     // resume.py:419-426 visitor_walk_recursive: if the
@@ -4134,12 +4134,12 @@ impl ResumeDataLoopMemo {
             }
         }
 
-        // resume.py:428-442: process pending_setfields — register_box on
+        // resume.py: process pending_setfields — register_box on
         // target and value, then visitor_walk_recursive on virtual fieldbox.
         for pf in pending_setfields.iter() {
             let box_opref = env.get_box_replacement(pf.target);
             let fieldbox = env.get_box_replacement(pf.value);
-            // resume.py:438-439: self.register_box(box); self.register_box(fieldbox)
+            // resume.py: self.register_box(box); self.register_box(fieldbox)
             self.register_box(box_opref, env, &numb_state.liveboxes, &mut new_liveboxes);
             self.register_box(fieldbox, env, &numb_state.liveboxes, &mut new_liveboxes);
             // resume.py:440-442 — info.visitor_walk_recursive requires
@@ -4156,7 +4156,7 @@ impl ResumeDataLoopMemo {
                     fieldbox, box_opref
                 )
             });
-            // resume.py:359 register_virtual_fields: stamp the virtual fieldbox
+            // resume.py register_virtual_fields: stamp the virtual fieldbox
             // UNASSIGNEDVIRTUAL (overwriting the UNASSIGNED that register_box
             // installed above) so _number_virtuals numbers it as a virtual
             // rather than a livebox — otherwise it would be force-boxed.
@@ -4210,7 +4210,7 @@ impl ResumeDataLoopMemo {
             }
         }
 
-        // resume.py:454-509 self._number_virtuals(liveboxes, num_env_virtuals)
+        // resume.py self._number_virtuals(liveboxes, num_env_virtuals)
         let (rd_virtuals, nholes) = self._number_virtuals(
             &mut liveboxes,
             &mut new_liveboxes,
@@ -4220,12 +4220,12 @@ impl ResumeDataLoopMemo {
             env,
         );
 
-        // resume.py:508-509: if self._invalidation_needed(...): memo.clear_box_virtual_numbers()
+        // resume.py: if self._invalidation_needed(...): memo.clear_box_virtual_numbers()
         if self._invalidation_needed(liveboxes.len(), nholes) {
             self.clear_box_virtual_numbers();
         }
 
-        // resume.py:445 self._add_pending_fields(pending_setfields)
+        // resume.py self._add_pending_fields(pending_setfields)
         self._add_pending_fields(
             pending_setfields,
             env,
@@ -4236,7 +4236,7 @@ impl ResumeDataLoopMemo {
         // resume.py:447: numb_state.patch(1, len(liveboxes))
         numb_state.writer.patch(1, liveboxes.len() as i32);
 
-        // resume.py:449: self._add_optimizer_sections(numb_state, liveboxes, liveboxes_from_env)
+        // resume.py: self._add_optimizer_sections(numb_state, liveboxes, liveboxes_from_env)
         self._add_optimizer_sections(
             &mut numb_state,
             &liveboxes,
@@ -4314,10 +4314,10 @@ impl ResumeDataLoopMemo {
         )
     }
 
-    /// resume.py:452-468 finish (on ResumeDataVirtualAdder) — encode with shared pool.
+    /// resume.py finish (on ResumeDataVirtualAdder) — encode with shared pool.
     pub fn encode_shared(&mut self, rd: &ResumeData) -> EncodedResumeData {
         let mut rd_numb = Vec::new();
-        // resume.py:138 compact TAGBOX numbering state.
+        // resume.py compact TAGBOX numbering state.
         let mut liveboxes: Vec<usize> = Vec::new();
         let mut box_map: indexmap::IndexMap<usize, usize> = indexmap::IndexMap::new();
 
@@ -4485,7 +4485,7 @@ impl<'a> ResumeDataReader<'a> {
     }
 }
 
-/// resume.py:576-728 VirtualInfo parity.
+/// resume.py VirtualInfo parity.
 /// Describes a virtual object's fields for materialization.
 /// RPython uses a class hierarchy (VirtualInfo, VStructInfo, VArrayInfoClear, etc.).
 /// We use a single struct with tagged field values.
@@ -4533,7 +4533,7 @@ impl OptimizerKnowledgeForResume {
     }
 }
 
-/// bridgeopt.py:44-61 decode_box return type.
+/// bridgeopt.py decode_box return type.
 ///
 /// RPython's decode_box returns actual Const/Box objects. Two Rust
 /// variants mirror that: `LiveBox` for `Box` references (TAGBOX) and
@@ -4547,7 +4547,7 @@ pub enum DecodedBox {
     Const(majit_ir::Const),
 }
 
-/// bridgeopt.py:44-61 decode_box: untag a tagged value from rd_numb.
+/// bridgeopt.py decode_box: untag a tagged value from rd_numb.
 ///
 /// Line-by-line port of PyPy's decode_box(). Returns DecodedBox to
 /// preserve the Const vs Box distinction that RPython encodes via
@@ -4563,7 +4563,7 @@ pub fn decode_box(
     match tag_type {
         TAGCONST => {
             if tagged_eq(tagged, NULLREF) {
-                // bridgeopt.py:51: box = CONST_NULL (history.py:361).
+                // bridgeopt.py:51: box = CONST_NULL (history.py).
                 DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
             } else {
                 // bridgeopt.py:54: box = resumestorage.rd_consts[num - TAG_CONST_OFFSET]
@@ -5519,7 +5519,7 @@ mod tests {
         leaf3_resume_null_identity(Some(OVERRIDE));
     }
 
-    /// resume.py:990-991 `_prepare_virtuals` resets `virtuals_cache` to zeros.
+    /// resume.py `_prepare_virtuals` resets `virtuals_cache` to zeros.
     /// That is why `blackhole_from_resumedata` must not run `_prepare` on the
     /// GUARD_NOT_FORCED path (resume.py:1368-1375): there the preloaded cache is
     /// the resume's only source of virtuals, and `rd_virtuals` stays None.
@@ -5558,7 +5558,7 @@ mod tests {
 
     #[test]
     fn rd_virtual_keeps_const_tag_until_direct_reader_decode() {
-        // resume.py:596-602 keeps AbstractVirtualInfo.fieldnums tagged and
+        // resume.py keeps AbstractVirtualInfo.fieldnums tagged and
         // calls decoder.setfield(..., num, ...). In particular it does not
         // copy ConstPtr.value out of rd_consts before allocate(), because that
         // allocation may collect and forward rd_consts.
@@ -5599,8 +5599,8 @@ mod tests {
     }
 }
 
-// resume.py:901-1039 AbstractResumeDataReader
-// resume.py:1354-1601 ResumeDataDirectReader
+// resume.py AbstractResumeDataReader
+// resume.py ResumeDataDirectReader
 //
 // Direct reader that decodes resume data and fills blackhole
 // interpreter registers with concrete values from the deadframe.
@@ -5658,10 +5658,10 @@ pub trait VirtualizableInfo {
 /// Corresponds to `jitdriver_sd.greenfield_info`.
 pub trait GreenfieldInfo {}
 
-/// resume.py:1354 ResumeDataDirectReader
+/// resume.py ResumeDataDirectReader
 ///
 /// Reads encoded resume data (rd_numb) and fills blackhole interpreter
-/// resume.py:874-899 AbstractVirtualCache / get_VirtualCache_class
+/// resume.py AbstractVirtualCache / get_VirtualCache_class
 ///
 /// ```text
 /// class AbstractVirtualCache(object):
@@ -5694,7 +5694,7 @@ impl VirtualCache {
         VirtualCache::default()
     }
 
-    /// resume.py:882-884 __init__
+    /// resume.py __init__
     pub fn from_caches(virtuals_ptr_cache: Vec<i64>, virtuals_int_cache: Vec<i64>) -> Self {
         VirtualCache {
             virtuals_ptr_cache,
@@ -5702,25 +5702,25 @@ impl VirtualCache {
         }
     }
 
-    /// resume.py:886-887 get_ptr
+    /// resume.py get_ptr
     #[inline]
     pub fn get_ptr(&self, i: usize) -> i64 {
         self.virtuals_ptr_cache[i]
     }
 
-    /// resume.py:889-890 get_int
+    /// resume.py get_int
     #[inline]
     pub fn get_int(&self, i: usize) -> i64 {
         self.virtuals_int_cache[i]
     }
 
-    /// resume.py:892-893 set_ptr
+    /// resume.py set_ptr
     #[inline]
     pub fn set_ptr(&mut self, i: usize, v: i64) {
         self.virtuals_ptr_cache[i] = v;
     }
 
-    /// resume.py:895-896 set_int
+    /// resume.py set_int
     #[inline]
     pub fn set_int(&mut self, i: usize, v: i64) {
         self.virtuals_int_cache[i] = v;
@@ -5738,30 +5738,30 @@ impl VirtualCache {
 
 /// registers directly from the deadframe's fail_args values.
 ///
-/// Combines AbstractResumeDataReader (resume.py:901) mixin with
-/// ResumeDataDirectReader (resume.py:1354) concrete class.
+/// Combines AbstractResumeDataReader (resume.py) mixin with
+/// ResumeDataDirectReader (resume.py) concrete class.
 pub struct ResumeDataDirectReader<'a> {
-    // AbstractResumeDataReader fields (resume.py:909-922)
+    // AbstractResumeDataReader fields (resume.py)
     /// resume.py:918 resumecodereader
     pub resumecodereader: Reader<'a>,
     /// resume.py:919 items_resume_section — total items in resume section
     pub items_resume_section: i32,
-    /// resume.py:921 count — number of failargs
+    /// resume.py count — number of failargs
     pub count: i32,
     /// resume.py:922 consts — constant pool from rd_consts.
     ///
     /// RPython stores `list[Const]` where each `Const` carries its own type
-    /// (history.py:220 ConstInt / :261 ConstFloat / :307 ConstPtr). In the
+    /// (history.py ConstInt / :261 ConstFloat / :307 ConstPtr). In the
     /// Rust port we represent each entry as `(raw_i64, Type)` so that
     /// `ConstPtr.getref_base()` parity (returning a GC-tracked pointer) can
     /// be surfaced to the minor-collection root walker — see
     /// `walk_rd_consts_refs` on `MetaInterp`. Raw `Vec<i64>` hid the
     /// Ref-typed entries from the GC and caused nursery use-after-free in
-    /// TAGCONST decode paths (resume.py:1557 decode_int / :1566 decode_ref /
+    /// TAGCONST decode paths (resume.py decode_int / :1566 decode_ref /
     /// :1578 decode_float).
     pub consts: &'a [majit_ir::Const],
 
-    // ResumeDataDirectReader fields (resume.py:1364-1367)
+    // ResumeDataDirectReader fields (resume.py)
     /// resume.py:1366 deadframe — raw fail_args values
     pub deadframe: &'a [i64],
     /// pyre flat-deadframe adaptation: original type of each deadframe slot.
@@ -5790,20 +5790,20 @@ pub struct ResumeDataDirectReader<'a> {
     /// RPython uses self.cpu (from metainterp_sd.cpu) for allocate_with_vtable etc.
     allocator: &'a dyn BlackholeAllocator,
 
-    /// resume.py:1022 `self.metainterp_sd.liveness_info` — shared
+    /// resume.py `self.metainterp_sd.liveness_info` — shared
     /// packed `all_liveness` buffer used by `_prepare_next_section` /
     /// `enumerate_vars`. RPython reaches it through `self.metainterp_sd`;
     /// pyre holds the slice directly because `ResumeDataDirectReader`
     /// lives outside the `MetaInterpStaticData` ownership graph.
     pub all_liveness: &'a [u8],
 
-    /// resume.py:1404: virtualizable pointer read by consume_vable_info.
+    /// resume.py: virtualizable pointer read by consume_vable_info.
     /// Stored so the caller (blackhole_from_resumedata) can access it
     /// after consume_vref_and_vable completes.
     pub virtualizable_ptr: i64,
 
     /// Resume-data tag for the virtualizable identity consumed at
-    /// resume.py:1404. RPython later decodes the same tag through
+    /// resume.py. RPython later decodes the same tag through
     /// `_callback_r`/`write_a_ref` into blackhole registers; when majit's
     /// state-field JIT supplies a host-stack identity override, the same
     /// override must be used for that register seed too.
@@ -5816,7 +5816,7 @@ pub struct ResumeDataDirectReader<'a> {
 /// ResumeDataDirectReader calls these methods when TAGVIRTUAL values
 /// need to be lazily allocated during decode_ref/decode_int.
 pub trait BlackholeAllocator {
-    /// resume.py:1437-1439 allocate_with_vtable(known_class, descr) →
+    /// resume.py allocate_with_vtable(known_class, descr) →
     ///   exec_new_with_vtable(self.cpu, descr)
     fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
         let _ = (descr, vtable);
@@ -5867,7 +5867,7 @@ pub trait BlackholeAllocator {
     ) {
         let _ = (array, index, value, descr);
     }
-    /// resume.py:1520-1529 setinteriorfield(index, array, fieldnum, descr)
+    /// resume.py setinteriorfield(index, array, fieldnum, descr)
     /// RPython passes the live descr object; backend reads offset/size/type from it.
     fn bh_setinteriorfield_gc_i(
         &self,
@@ -5896,18 +5896,18 @@ pub trait BlackholeAllocator {
     ) {
         let _ = (array, index, value, descr);
     }
-    /// resume.py:1449-1450 allocate_string(length) → cpu.bh_newstr(length)
+    /// resume.py allocate_string(length) → cpu.bh_newstr(length)
     fn bh_newstr(&self, length: usize) -> i64 {
         let _ = length;
         0
     }
-    /// resume.py:1458-1460 string_setitem(str, index, charnum) →
+    /// resume.py string_setitem(str, index, charnum) →
     /// cpu.bh_strsetitem(str, index, char) — `char` is the decoded
     /// integer from the tagged `charnum`.
     fn bh_strsetitem(&self, string: i64, index: usize, char: i64) {
         let _ = (string, index, char);
     }
-    /// resume.py:1462-1470 concat_strings(str1, str2) — implementations
+    /// resume.py concat_strings(str1, str2) — implementations
     /// look up `OS_STR_CONCAT` via `callinfocollection.funcptr_for_oopspec`
     /// (resume.py:1467-1468) and call it directly.  The variant carries
     /// no funcptr.
@@ -5915,7 +5915,7 @@ pub trait BlackholeAllocator {
         let _ = (str1, str2);
         0
     }
-    /// resume.py:1472-1480 slice_string(str, start, length) →
+    /// resume.py slice_string(str, start, length) →
     /// `funcptr_for_oopspec(OS_STR_SLICE)(str, start, stop)` where the
     /// caller pre-computes `stop = start + length` (the OS_STR_SLICE
     /// oopspec signature).  Implementations resolve the funcptr via
@@ -5924,25 +5924,25 @@ pub trait BlackholeAllocator {
         let _ = (str, start, stop);
         0
     }
-    /// resume.py:1482-1483 allocate_unicode(length) →
+    /// resume.py allocate_unicode(length) →
     /// cpu.bh_newunicode(length)
     fn bh_newunicode(&self, length: usize) -> i64 {
         let _ = length;
         0
     }
-    /// resume.py:1485-1487 unicode_setitem(str, index, charnum) →
+    /// resume.py unicode_setitem(str, index, charnum) →
     /// cpu.bh_unicodesetitem(str, index, char)
     fn bh_unicodesetitem(&self, string: i64, index: usize, char: i64) {
         let _ = (string, index, char);
     }
-    /// resume.py:1489-1497 concat_unicodes(str1, str2) →
+    /// resume.py concat_unicodes(str1, str2) →
     /// `funcptr_for_oopspec(OS_UNI_CONCAT)(str1, str2)`. Implementations
     /// resolve the funcptr via `callinfocollection`.
     fn os_uni_concat(&self, str1: i64, str2: i64) -> i64 {
         let _ = (str1, str2);
         0
     }
-    /// resume.py:1499-1507 slice_unicode(str, start, length) →
+    /// resume.py slice_unicode(str, start, length) →
     /// `funcptr_for_oopspec(OS_UNI_SLICE)(str, start, stop)` where the
     /// caller pre-computes `stop = start + length`.  Implementations
     /// resolve the funcptr via `callinfocollection`.
@@ -5950,7 +5950,7 @@ pub trait BlackholeAllocator {
         let _ = (str, start, stop);
         0
     }
-    /// resume.py:1452 allocate_raw_buffer(func, size)
+    /// resume.py allocate_raw_buffer(func, size)
     fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
         let _ = (func, size);
         0
@@ -5958,7 +5958,7 @@ pub trait BlackholeAllocator {
     /// resume.py:1547 cpu.bh_raw_store_f(buffer, offset, value, descr) —
     /// float raw store dispatched from setrawbuffer_item when
     /// `descr.is_array_of_floats()`.  `offset` mirrors
-    /// `RawBuffer.offsets[i]` and is signed (rawbuffer.py:14).
+    /// `RawBuffer.offsets[i]` and is signed (rawbuffer.py).
     fn bh_raw_store_f(
         &self,
         buffer: i64,
@@ -5981,7 +5981,7 @@ pub trait BlackholeAllocator {
         let _ = (buffer, offset, value, descr);
     }
     /// `resume.py:1517 cpu.bh_setfield_gc_i(struct, value, descr)` —
-    /// integer setfield dispatched from `resume.py:1509-1518 setfield`.
+    /// integer setfield dispatched from `resume.py setfield`.
     fn bh_setfield_gc_i(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
         let _ = (struct_ptr, value, descr_info);
     }
@@ -6048,7 +6048,7 @@ fn virtual_source_is_uninitialized(source: &VirtualFieldSource) -> bool {
     }
 }
 
-/// `resume.py:766-775 VStrPlainInfo.allocate` and `resume.py:821-830
+/// `resume.py VStrPlainInfo.allocate` and `resume.py
 /// VUniPlainInfo.allocate` share the same loop body — the only
 /// difference is `decoder.allocate_string` vs `allocate_unicode` and
 /// `string_setitem` vs `unicode_setitem`.  The pyre helper takes an
@@ -6063,17 +6063,17 @@ fn vstr_plain_info_allocate(
     is_unicode: bool,
 ) -> i64 {
     let length = chars.len();
-    // resume.py:769 string = decoder.allocate_string(length)
-    // resume.py:824 string = decoder.allocate_unicode(length)
+    // resume.py string = decoder.allocate_string(length)
+    // resume.py string = decoder.allocate_unicode(length)
     let string = if is_unicode {
         decoder.allocate_unicode(length)
     } else {
         decoder.allocate_string(length)
     };
-    // resume.py:770 / 825 decoder.virtuals_cache.set_ptr(index, string)
+    // resume.py / 825 decoder.virtuals_cache.set_ptr(index, string)
     decoder.virtuals_cache.set_ptr(index, string);
     for (i, char_source) in chars.iter().enumerate() {
-        // resume.py:773 / 828 if not tagged_eq(charnum, UNINITIALIZED)
+        // resume.py / 828 if not tagged_eq(charnum, UNINITIALIZED)
         if virtual_source_is_uninitialized(char_source) {
             continue;
         }
@@ -6087,7 +6087,7 @@ fn vstr_plain_info_allocate(
     string
 }
 
-/// `resume.py:596-603 AbstractVirtualStructInfo.setfields(decoder, struct)`
+/// `resume.py AbstractVirtualStructInfo.setfields(decoder, struct)`
 /// — iterate fielddescrs/fieldnums and call decoder.setfield per
 /// non-UNINITIALIZED entry.  pyre threads the spec-form `FieldDescrInfo`
 /// through `bh_setfield_gc_{i,r,f}` directly because the descr Arc
@@ -6106,11 +6106,11 @@ fn abstract_virtual_struct_info_setfields(
         let Some(descr_info) = fielddescrs.get(i) else {
             continue;
         };
-        // resume.py:601 if not tagged_eq(num, UNINITIALIZED)
+        // resume.py if not tagged_eq(num, UNINITIALIZED)
         if virtual_source_is_uninitialized(source) {
             continue;
         }
-        // resume.py:602 decoder.setfield(struct, num, descr)
+        // resume.py decoder.setfield(struct, num, descr)
         // — pyre dispatches by descr_info.field_type because pyre's
         //   fielddescrs collection holds the spec form, not the live
         //   FieldDescr Arc that RPython passes to decoder.setfield.
@@ -6167,7 +6167,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
         )
     }
 
-    /// resume.py:618/634/650 allocate(decoder, index)
+    /// resume.py/634/650 allocate(decoder, index)
     ///
     /// Allocate a virtual object and fill in its fields from the decoder.
     /// Sets `virtuals_cache_ptr[index]` before filling fields (for recursive refs).
@@ -6185,14 +6185,14 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 known_class,
                 ..
             } => {
-                // resume.py:619 struct = decoder.allocate_with_vtable(descr=self.descr)
+                // resume.py struct = decoder.allocate_with_vtable(descr=self.descr)
                 let vtable = known_class.unwrap_or(0) as usize;
                 let obj = descr
                     .as_ref()
                     .map(|d| decoder.allocate_with_vtable(d, vtable))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
-                // resume.py:621 return self.setfields(decoder, struct)
+                // resume.py return self.setfields(decoder, struct)
                 abstract_virtual_struct_info_setfields(
                     decoder,
                     allocator,
@@ -6210,13 +6210,13 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 fielddescrs,
                 ..
             } => {
-                // resume.py:635 struct = decoder.allocate_struct(self.typedescr)
+                // resume.py struct = decoder.allocate_struct(self.typedescr)
                 let obj = typedescr
                     .as_ref()
                     .map(|d| decoder.allocate_struct(d))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
-                // resume.py:637 return self.setfields(decoder, struct)
+                // resume.py return self.setfields(decoder, struct)
                 abstract_virtual_struct_info_setfields(
                     decoder,
                     allocator,
@@ -6235,7 +6235,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 ..
             } => {
                 let length = items.len();
-                // resume.py:653: array = decoder.allocate_array(length, arraydescr, self.clear)
+                // resume.py: array = decoder.allocate_array(length, arraydescr, self.clear)
                 let array = arraydescr
                     .as_ref()
                     .map(|d| decoder.allocate_array(length, d, *clear))
@@ -6276,7 +6276,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 }
                 decoder.virtuals_cache.get_ptr(index)
             }
-            // resume.py:748-760: VArrayStructInfo.allocate
+            // resume.py: VArrayStructInfo.allocate
             VirtualInfo::VArrayStruct {
                 arraydescr,
                 fielddescrs,
@@ -6284,7 +6284,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 ..
             } => {
                 let size = element_fields.len();
-                // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
+                // resume.py: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
                 let array = arraydescr
                     .as_ref()
                     .map(|d| decoder.allocate_array(size, d, /* clear */ true))
@@ -6309,27 +6309,27 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                         if virtual_source_is_uninitialized(source) {
                             continue;
                         }
-                        // resume.py:757: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
+                        // resume.py: decoder.setinteriorfield(i, array, num, self.fielddescrs[j])
                         decoder.setinteriorfield(i, index, source, &fielddescrs[j], allocator);
                     }
                 }
                 decoder.virtuals_cache.get_ptr(index)
             }
-            // resume.py:766-775 VStrPlainInfo.allocate
+            // resume.py VStrPlainInfo.allocate
             VirtualInfo::VStrPlain { chars } => {
                 vstr_plain_info_allocate(decoder, index, chars, /* is_unicode */ false)
             }
-            // resume.py:821-830 VUniPlainInfo.allocate
+            // resume.py VUniPlainInfo.allocate
             VirtualInfo::VUniPlain { chars } => {
                 vstr_plain_info_allocate(decoder, index, chars, /* is_unicode */ true)
             }
-            // resume.py:786-793 VStrConcatInfo.allocate
+            // resume.py VStrConcatInfo.allocate
             VirtualInfo::VStrConcat { left, right } => {
                 let string = decoder.concat_strings(left, right);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
-            // resume.py:805-809 VStrSliceInfo.allocate
+            // resume.py VStrSliceInfo.allocate
             VirtualInfo::VStrSlice {
                 source,
                 start,
@@ -6339,13 +6339,13 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
-            // resume.py:841-848 VUniConcatInfo.allocate
+            // resume.py VUniConcatInfo.allocate
             VirtualInfo::VUniConcat { left, right } => {
                 let string = decoder.concat_unicodes(left, right);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
-            // resume.py:860-864 VUniSliceInfo.allocate
+            // resume.py VUniSliceInfo.allocate
             VirtualInfo::VUniSlice {
                 source,
                 start,
@@ -6362,7 +6362,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
         }
     }
 
-    /// resume.py:701 VRawBufferInfo.allocate_int / VRawSliceInfo.allocate_int
+    /// resume.py VRawBufferInfo.allocate_int / VRawSliceInfo.allocate_int
     fn allocate_int(
         &self,
         decoder: &mut ResumeDataDirectReader,
@@ -6379,7 +6379,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
             } => {
                 assert_eq!(offsets.len(), descrs.len());
                 assert_eq!(offsets.len(), values.len());
-                // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
+                // resume.py: buffer = decoder.allocate_raw_buffer(self.func, self.size)
                 let buffer = decoder.allocate_raw_buffer(*func, *size);
                 // resume.py:704
                 decoder.virtuals_cache.set_int(index, buffer);
@@ -6401,7 +6401,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     // pyre extracts the per-entry value from the virtual
                     // layout instead of the tagged fieldnum, then writes
                     // through bh_raw_store_{i,f} per descr kind — same
-                    // dispatch as resume.py:1545-1550 setrawbuffer_item.
+                    // dispatch as resume.py setrawbuffer_item.
                     assert!(
                         descr.item_type != 0,
                         "raw buffer entry must not be pointer type"
@@ -6429,7 +6429,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
 }
 
 impl<'a> ResumeDataDirectReader<'a> {
-    /// resume.py:1364 __init__
+    /// resume.py __init__
     pub fn new(
         rd_numb: &'a [u8],
         rd_consts: &'a [majit_ir::Const],
@@ -6439,7 +6439,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
         allocator: &'a dyn BlackholeAllocator,
     ) -> Self {
-        // resume.py:915-922 _init
+        // resume.py _init
         let mut resumecodereader = Reader::new(rd_numb);
         let items_resume_section = resumecodereader.next_item();
         let count = resumecodereader.next_item();
@@ -6472,7 +6472,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:924 _prepare — init virtuals and pending fields.
+    /// resume.py _prepare — init virtuals and pending fields.
     pub fn prepare(
         &mut self,
         rd_virtuals: Option<&'a [VirtualInfo]>,
@@ -6486,11 +6486,11 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:993 _prepare_pendingfields — variant for GuardPendingFieldEntry.
+    /// resume.py _prepare_pendingfields — variant for GuardPendingFieldEntry.
     ///
     /// RPython encodes pendingfield target/value as tagged values (TAGBOX/
     /// TAGCONST/TAGVIRTUAL) via _gettagged in _add_pending_fields
-    /// (resume.py:548-549). At restore time, decode_ref(num) resolves
+    /// (resume.py). At restore time, decode_ref(num) resolves
     /// the tagged value to a concrete pointer.
     ///
     /// `target_tagged` / `value_tagged` are always populated by the
@@ -6503,7 +6503,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     ///     `_add_pending_fields` (this file), which writes
     ///     the tags from `_gettagged`.
     ///   * The sharing path (`_copy_resume_data_from`) routes resume
-    ///     reads through `ResumeGuardCopiedDescr.prev` (compile.py:849
+    ///     reads through `ResumeGuardCopiedDescr.prev` (compile.py
     ///     `get_resumestorage(): return prev`); readers reach the
     ///     donor's already-tagged entries via the descr's `prev`
     ///     pointer rather than touching the shared op directly.
@@ -6515,7 +6515,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// number with `decode_ref`).
     fn prepare_guard_pendingfields(&mut self, pendingfields: &[majit_ir::GuardPendingFieldEntry]) {
         for pf in pendingfields {
-            // resume.py:1000 PENDINGFIELDSTRUCT.lldescr parity:
+            // resume.py PENDINGFIELDSTRUCT.lldescr parity:
             // derive (offset, size, type) from the descr (FieldDescr or
             // ArrayDescr) at consume time. RPython always carries
             // lldescr — pyre's producer in `optimizer.rs`'s
@@ -6537,7 +6537,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                     descr,
                 );
             };
-            // resume.py:1002-1007 tagged path. UNASSIGNED tags must
+            // resume.py tagged path. UNASSIGNED tags must
             // never reach this method: `_add_pending_fields` writes the
             // `_gettagged` tags before restore time.
             assert!(
@@ -6549,15 +6549,15 @@ impl<'a> ResumeDataDirectReader<'a> {
                 pf.value_tagged,
                 descr,
             );
-            // resume.py:1002: struct = self.decode_ref(num)
+            // resume.py: struct = self.decode_ref(num)
             let struct_ptr = self.decode_ref(pf.target_tagged);
 
             if pf.item_index < 0 {
                 let _ = field_info; // setfield dispatcher reads descr directly.
-                // resume.py:1005: self.setfield(struct, fieldnum, descr)
+                // resume.py: self.setfield(struct, fieldnum, descr)
                 self.setfield(struct_ptr, pf.value_tagged, descr);
             } else {
-                // resume.py:1007: self.setarrayitem(struct, itemindex,
+                // resume.py: self.setarrayitem(struct, itemindex,
                 //                  fieldnum, descr).
                 let index = pf.item_index as usize;
                 self.setarrayitem(struct_ptr, index, pf.value_tagged, descr);
@@ -6565,7 +6565,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` dispatcher:
+    /// `resume.py setfield(struct, fieldnum, descr)` dispatcher:
     /// forwards to `bh_setfield_gc_r` / `bh_setfield_gc_f` /
     /// `bh_setfield_gc_i` based on the field's value kind.  `fieldnum` is
     /// the resume.py-tagged value to decode (decode_ref / decode_float /
@@ -6594,19 +6594,19 @@ impl<'a> ResumeDataDirectReader<'a> {
             field_size: fd.field_size(),
         };
         if fd.field_type() == majit_ir::Type::Ref {
-            // resume.py:1511 newvalue = self.decode_ref(fieldnum)
+            // resume.py newvalue = self.decode_ref(fieldnum)
             // resume.py:1512 self.cpu.bh_setfield_gc_r(struct, newvalue, descr)
             let value = self.decode_ref(fieldnum);
             self.allocator
                 .bh_setfield_gc_r(struct_ptr, value, &descr_info);
         } else if fd.is_float_field() {
-            // resume.py:1514 newvalue = self.decode_float(fieldnum)
+            // resume.py newvalue = self.decode_float(fieldnum)
             // resume.py:1515 self.cpu.bh_setfield_gc_f(struct, newvalue, descr)
             let value = self.decode_float(fieldnum);
             self.allocator
                 .bh_setfield_gc_f(struct_ptr, value, &descr_info);
         } else {
-            // resume.py:1517 newvalue = self.decode_int(fieldnum)
+            // resume.py newvalue = self.decode_int(fieldnum)
             // resume.py:1518 self.cpu.bh_setfield_gc_i(struct, newvalue, descr)
             let value = self.decode_int(fieldnum);
             self.allocator
@@ -6614,7 +6614,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:1437-1439 allocate_with_vtable(descr) →
+    /// resume.py allocate_with_vtable(descr) →
     /// `executor.exec_new_with_vtable(self.cpu, descr)` — pyre's
     /// `vtable` argument is the resolved class pointer carried on the
     /// virtual layout (info.py:318 _known_class).
@@ -6622,12 +6622,12 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.allocator.allocate_with_vtable(descr, vtable)
     }
 
-    /// resume.py:1441-1442 allocate_struct(typedescr) → cpu.bh_new(typedescr).
+    /// resume.py allocate_struct(typedescr) → cpu.bh_new(typedescr).
     pub fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
         self.allocator.bh_new(typedescr)
     }
 
-    /// resume.py:1444-1447 allocate_array(length, arraydescr, clear) →
+    /// resume.py allocate_array(length, arraydescr, clear) →
     /// `cpu.bh_new_array_clear` (clear=True) or `cpu.bh_new_array`.
     pub fn allocate_array(
         &self,
@@ -6642,7 +6642,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:1452-1456 allocate_raw_buffer(func, size) → calldescr =
+    /// resume.py allocate_raw_buffer(func, size) → calldescr =
     /// `callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)`,
     /// `cpu.bh_call_i(func, [size], None, None, calldescr)` — pyre's
     /// `BlackholeAllocator::allocate_raw_buffer` keeps the wrapped form
@@ -6652,12 +6652,12 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.allocator.allocate_raw_buffer(func, size)
     }
 
-    /// resume.py:1449-1450 allocate_string(length) — forward to allocator.
+    /// resume.py allocate_string(length) — forward to allocator.
     pub fn allocate_string(&self, length: usize) -> i64 {
         self.allocator.bh_newstr(length)
     }
 
-    /// resume.py:1458-1460 string_setitem(str, index, charnum) — decode
+    /// resume.py string_setitem(str, index, charnum) — decode
     /// the per-character source and forward to the allocator.  Pyre
     /// threads a `VirtualFieldSource` where resume.py threads a tagged
     /// i16 charnum; the structural shape matches because both decoders
@@ -6668,7 +6668,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.allocator.bh_strsetitem(string, index, char);
     }
 
-    /// resume.py:1462-1470 concat_strings(str1num, str2num) — decode
+    /// resume.py concat_strings(str1num, str2num) — decode
     /// the two ref sources and dispatch to OS_STR_CONCAT.  The funcptr
     /// is resolved by the allocator via
     /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
@@ -6683,7 +6683,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.allocator.os_str_concat(str1, str2)
     }
 
-    /// resume.py:1472-1480 slice_string(strnum, startnum, lengthnum) →
+    /// resume.py slice_string(strnum, startnum, lengthnum) →
     /// OS_STR_SLICE funcptr(str, start, start + length).  Funcptr is
     /// resolved by the allocator via `callinfocollection`.
     pub fn slice_string(
@@ -6699,19 +6699,19 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.allocator.os_str_slice(str, start, stop)
     }
 
-    /// resume.py:1482-1483 allocate_unicode(length) → cpu.bh_newunicode.
+    /// resume.py allocate_unicode(length) → cpu.bh_newunicode.
     pub fn allocate_unicode(&self, length: usize) -> i64 {
         self.allocator.bh_newunicode(length)
     }
 
-    /// resume.py:1485-1487 unicode_setitem(str, index, charnum) — same
+    /// resume.py unicode_setitem(str, index, charnum) — same
     /// shape as string_setitem.
     pub fn unicode_setitem(&mut self, string: i64, index: usize, source: &VirtualFieldSource) {
         let char = self.decode_field_source_int(source);
         self.allocator.bh_unicodesetitem(string, index, char);
     }
 
-    /// resume.py:1489-1497 concat_unicodes(str1num, str2num).  Funcptr
+    /// resume.py concat_unicodes(str1num, str2num).  Funcptr
     /// is resolved by the allocator via `callinfocollection`.
     pub fn concat_unicodes(
         &mut self,
@@ -6723,7 +6723,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.allocator.os_uni_concat(str1, str2)
     }
 
-    /// resume.py:1543-1550 setrawbuffer_item(buffer, fieldnum, offset,
+    /// resume.py setrawbuffer_item(buffer, fieldnum, offset,
     /// descr) dispatcher: `assert not descr.is_array_of_pointers()`,
     /// then dispatch to `bh_raw_store_f` (float) or `bh_raw_store_i`
     /// (default).
@@ -6740,19 +6740,19 @@ impl<'a> ResumeDataDirectReader<'a> {
             "setrawbuffer_item: descr must not be array_of_pointers"
         );
         if descr.item_type == 2 {
-            // resume.py:1546-1547 newvalue = self.decode_float(fieldnum)
+            // resume.py newvalue = self.decode_float(fieldnum)
             //                    self.cpu.bh_raw_store_f(...)
             let value = self.decode_float(fieldnum);
             self.allocator.bh_raw_store_f(buffer, offset, value, descr);
         } else {
-            // resume.py:1549-1550 newvalue = self.decode_int(fieldnum)
+            // resume.py newvalue = self.decode_int(fieldnum)
             //                    self.cpu.bh_raw_store_i(...)
             let value = self.decode_int(fieldnum);
             self.allocator.bh_raw_store_i(buffer, offset, value, descr);
         }
     }
 
-    /// resume.py:1499-1507 slice_unicode(strnum, startnum, lengthnum).
+    /// resume.py slice_unicode(strnum, startnum, lengthnum).
     /// Funcptr resolved by the allocator via `callinfocollection`.
     pub fn slice_unicode(
         &mut self,
@@ -6767,7 +6767,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.allocator.os_uni_slice(str, start, stop)
     }
 
-    /// `resume.py:1009-1015 setarrayitem(array, index, fieldnum, descr)`
+    /// `resume.py setarrayitem(array, index, fieldnum, descr)`
     /// dispatcher: forwards to `setarrayitem_ref` /
     /// `setarrayitem_float` / `setarrayitem_int` based on the live
     /// `arraydescr.is_array_of_pointers()` / `is_array_of_floats()`
@@ -6800,14 +6800,14 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:1378 handling_async_forcing
+    /// resume.py handling_async_forcing
     pub fn handling_async_forcing(&mut self) {
         self.resume_after_guard_not_forced = 1;
     }
 
-    // ---- AbstractResumeDataReader methods (resume.py:928-1038) ----
+    // ---- AbstractResumeDataReader methods (resume.py) ----
 
-    /// resume.py:928 read_jitcode_pos_pc. The wire header also carries
+    /// resume.py read_jitcode_pos_pc. The wire header also carries
     /// forward `py_pc`, which blackhole does not use but must consume.
     pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
         let jitcode_pos = self.resumecodereader.next_item();
@@ -6816,13 +6816,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         (jitcode_pos, pc)
     }
 
-    /// resume.py:933 next_int
+    /// resume.py next_int
     pub fn next_int(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item() as i16;
         self.decode_int(tagged)
     }
 
-    /// resume.py:936 next_ref
+    /// resume.py next_ref
     pub fn next_ref(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item() as i16;
         self.decode_ref(tagged)
@@ -6839,13 +6839,13 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:939 next_float
+    /// resume.py next_float
     pub fn next_float(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item() as i16;
         self.decode_float(tagged)
     }
 
-    /// resume.py:1410-1421 load_next_value_of_type
+    /// resume.py load_next_value_of_type
     pub fn next_value_of_type(&mut self, tp: majit_ir::Type) -> i64 {
         match tp {
             majit_ir::Type::Int => self.next_int(),
@@ -6855,12 +6855,12 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:942 done_reading
+    /// resume.py done_reading
     pub fn done_reading(&self) -> bool {
         self.resumecodereader.items_read >= self.items_resume_section as usize
     }
 
-    /// resume.py:945 getvirtual_ptr
+    /// resume.py getvirtual_ptr
     ///
     /// Returns the index'th virtual, building it lazily if needed.
     /// Note that this may be called recursively; that's why the
@@ -6887,7 +6887,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         let vinfo = unsafe { &*rd_virtuals_ptr.add(index) };
         debug_assert!(index < rd_virtuals_len);
         let allocator = self.allocator as *const dyn BlackholeAllocator;
-        // resume.py:954 `v = self.rd_virtuals[index].allocate(self, index)`.
+        // resume.py `v = self.rd_virtuals[index].allocate(self, index)`.
         // RPython returns `allocate`'s result and asserts `v == cache`,
         // relying on `v` being a GC-traced stack local that a minor
         // collection triggered while `allocate` fills the virtual's fields
@@ -6903,7 +6903,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.virtuals_cache.get_ptr(index)
     }
 
-    /// resume.py:958 getvirtual_int
+    /// resume.py getvirtual_int
     pub fn getvirtual_int(&mut self, index: usize) -> i64 {
         // resume.py:959: assert self.virtuals_cache is not None
         assert!(
@@ -6930,7 +6930,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         v
     }
 
-    /// resume.py:969 force_all_virtuals
+    /// resume.py force_all_virtuals
     pub fn force_all_virtuals(&mut self) -> (&[i64], &[i64]) {
         // Materializing one virtual allocates, so it can trigger a collection
         // that relocates the virtuals materialized before it. `getvirtual_ptr`
@@ -6946,7 +6946,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         );
         if let Some(rd_virtuals) = self.rd_virtuals {
             for (i, rd_virtual) in rd_virtuals.iter().enumerate() {
-                // resume.py:973 `if rd_virtual is not None`: skip empty
+                // resume.py `if rd_virtual is not None`: skip empty
                 // slots (Pyre carries them as the `Empty`-derived
                 // placeholder shape).
                 if rd_virtual.is_empty_placeholder() {
@@ -6967,7 +6967,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         )
     }
 
-    /// resume.py:983 _prepare_virtuals
+    /// resume.py _prepare_virtuals
     fn prepare_virtuals(&mut self, virtuals: Option<&'a [VirtualInfo]>) {
         if let Some(v) = virtuals {
             self.rd_virtuals = Some(v);
@@ -6976,9 +6976,9 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    // ---- ResumeDataDirectReader methods (resume.py:1380-1601) ----
+    // ---- ResumeDataDirectReader methods (resume.py) ----
 
-    /// resume.py:1381-1384 `consume_one_section(self, blackholeinterp)`.
+    /// resume.py `consume_one_section(self, blackholeinterp)`.
     ///
     /// ```python
     /// def consume_one_section(self, blackholeinterp):
@@ -6997,7 +6997,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         self._prepare_next_section(info, bh, vinfo);
     }
 
-    /// resume.py:1017-1026 `_prepare_next_section(self, info)`.
+    /// resume.py `_prepare_next_section(self, info)`.
     ///
     /// ```python
     /// def _prepare_next_section(self, info):
@@ -7013,9 +7013,9 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// `self.all_liveness` shadows `self.metainterp_sd.liveness_info` —
     /// the shared packed buffer that `enumerate_vars` indexes with
     /// `info`. The three callbacks still call `next_int`/`next_ref`/
-    /// `next_float` on this reader (resume.py:1028-1038), matching
+    /// `next_float` on this reader (resume.py), matching
     /// `_callback_i/_callback_r/_callback_f` plus `write_an_int/write_a_ref/
-    /// write_a_float` (resume.py:1590-1597).
+    /// write_a_float` (resume.py).
     fn _prepare_next_section(
         &mut self,
         info: usize,
@@ -7041,7 +7041,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 self.resumecodereader.items_read, self.items_resume_section,
             );
         }
-        // resume.py:1028-1030 `_callback_i` / jitcode.py:153-157.
+        // resume.py `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             for reg_idx in it.by_ref() {
@@ -7049,12 +7049,12 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if bh_debug {
                     eprintln!("[bh-seed] i{reg_idx} = {value}");
                 }
-                // resume.py:1590-1591 `write_an_int`.
+                // resume.py `write_an_int`.
                 bh.setarg_i(reg_idx as usize, value);
             }
             offset = it.offset;
         }
-        // resume.py:1032-1034 `_callback_r` / jitcode.py:158-162.
+        // resume.py `_callback_r` / jitcode.py:158-162.
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             for reg_idx in it.by_ref() {
@@ -7062,7 +7062,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if bh_debug {
                     eprintln!("[bh-seed] r{reg_idx} = {value:#x}");
                 }
-                // resume.py:1593-1594 `write_a_ref`.
+                // resume.py `write_a_ref`.
                 bh.setarg_r(reg_idx as usize, value);
                 if let Some(vinfo) = vinfo {
                     vinfo.push_resume_ref_roots_for_value(value);
@@ -7070,12 +7070,12 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
             offset = it.offset;
         }
-        // resume.py:1036-1038 `_callback_f` / jitcode.py:163-166.
+        // resume.py `_callback_f` / jitcode.py:163-166.
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             for reg_idx in it {
                 let value = self.next_float();
-                // resume.py:1596-1597 `write_a_float`.
+                // resume.py `write_a_float`.
                 bh.setarg_f(reg_idx as usize, value);
             }
             // `offset` is the end of the float section; no further use.
@@ -7112,7 +7112,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         // jitcode.py:152
         let mut offset = info + 3;
 
-        // resume.py:1028-1030 `_callback_i` / jitcode.py:153-157.
+        // resume.py `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             for reg_idx in it.by_ref() {
@@ -7121,7 +7121,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
             offset = it.offset;
         }
-        // resume.py:1032-1034 `_callback_r` / jitcode.py:158-162.
+        // resume.py `_callback_r` / jitcode.py:158-162.
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             for reg_idx in it.by_ref() {
@@ -7130,7 +7130,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
             offset = it.offset;
         }
-        // resume.py:1036-1038 `_callback_f` / jitcode.py:163-166.
+        // resume.py `_callback_f` / jitcode.py:163-166.
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             for reg_idx in it {
@@ -7153,7 +7153,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     ///
     /// Caller is expected to drive `prepare(rd_virtuals,
     /// rd_guard_pendingfields)` + `consume_vref_and_vable` first per
-    /// `resume.py:1324-1325 blackhole_from_resumedata`.
+    /// `resume.py blackhole_from_resumedata`.
     pub fn consume_all_sections_into_vec(
         &mut self,
         resolve_jitcode: &dyn Fn(
@@ -7164,7 +7164,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         outputs: &mut Vec<i64>,
     ) -> bool {
         while !self.done_reading() {
-            // resume.py:1338-1340 read_jitcode_pos_pc.
+            // resume.py read_jitcode_pos_pc.
             let (jitcode_pos, pc) = self.read_jitcode_pos_pc();
             let Some((jitcode, resolved_pc, op_live)) = resolve_jitcode(jitcode_pos, pc) else {
                 return false;
@@ -7180,7 +7180,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         true
     }
 
-    /// resume.py:1386 consume_virtualref_info
+    /// resume.py consume_virtualref_info
     pub fn consume_virtualref_info(&mut self, vrefinfo: Option<&dyn VRefInfo>) {
         // resume.py:1389
         let size = self.resumecodereader.next_item();
@@ -7203,7 +7203,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:1399 consume_vable_info
+    /// resume.py consume_vable_info
     pub fn consume_vable_info(
         &mut self,
         vinfo: &dyn VirtualizableInfo,
@@ -7213,12 +7213,12 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py:1403
         assert!(vable_size > 0);
         // The vable section is encoded identity-FIRST: the snapshot writer
-        // (`_list_of_boxes_virtualizable`, opencoder.py:718-726) reorders
+        // (`_list_of_boxes_virtualizable`, opencoder.py) reorders
         // `[field0..fieldN, vable]` to `[vable, field0..fieldN]` so the resume
         // reader can pull the virtualizable out before its field payload. So
         // the identity is the first of the `vable_size` items and the field
         // payload the remaining `vable_size - 1`, read sequentially.
-        // resume.py:1404 virtualizable = self.next_ref()
+        // resume.py virtualizable = self.next_ref()
         //
         // Consume the encoded identity even when a host supplies an override:
         // it occupies one resume-data item and keeps the reader aligned for
@@ -7320,7 +7320,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         vinfo.write_from_resume_data_partial(virtualizable, self);
     }
 
-    /// resume.py:1424 consume_vref_and_vable
+    /// resume.py consume_vref_and_vable
     pub fn consume_vref_and_vable(
         &mut self,
         vrefinfo: Option<&dyn VRefInfo>,
@@ -7372,7 +7372,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:1552 decode_int
+    /// resume.py decode_int
     pub fn decode_int(&mut self, tagged: i16) -> i64 {
         let (num, tag) = untag(tagged);
         match tag {
@@ -7402,7 +7402,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:1566 decode_ref
+    /// resume.py decode_ref
     pub fn decode_ref(&mut self, tagged: i16) -> i64 {
         let (num, tag) = untag(tagged);
         match tag {
@@ -7413,7 +7413,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 }
                 // resume.py:1571
                 let idx = (num - TAG_CONST_OFFSET) as usize;
-                // history.py:316 ConstPtr.getref_base() returns the GCREF value.
+                // history.py ConstPtr.getref_base() returns the GCREF value.
                 self.consts[idx].getref_base().as_usize() as i64
             }
             TAGVIRTUAL => {
@@ -7458,7 +7458,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 }
             }
             _ => {
-                // resume.py:1574 `assert tag == TAGBOX`: in a ref slot
+                // resume.py `assert tag == TAGBOX`: in a ref slot
                 // only TAGCONST / TAGVIRTUAL / TAGBOX are valid.  TAGINT
                 // here means the numbering stage produced an int-tagged
                 // entry in a ref position — a producer bug.
@@ -7467,7 +7467,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:1580 decode_float
+    /// resume.py decode_float
     pub fn decode_float(&mut self, tagged: i16) -> i64 {
         let (num, tag) = untag(tagged);
         match tag {
@@ -7485,13 +7485,13 @@ impl<'a> ResumeDataDirectReader<'a> {
                 self.deadframe[idx as usize]
             }
             _ => {
-                // resume.py:1580 — only TAGCONST and TAGBOX valid for floats
+                // resume.py — only TAGCONST and TAGBOX valid for floats
                 panic!("decode_float: unexpected tag {tag}")
             }
         }
     }
 
-    /// Decode a VirtualFieldSource as a REF value (resume.py:1566 decode_ref).
+    /// Decode a VirtualFieldSource as a REF value (resume.py decode_ref).
     ///
     /// Virtual sources go through getvirtual_ptr (REF virtuals).
     pub fn decode_field_source(&mut self, source: &VirtualFieldSource) -> i64 {
@@ -7506,7 +7506,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// Decode a VirtualFieldSource as an INT value (resume.py:1552 decode_int).
+    /// Decode a VirtualFieldSource as an INT value (resume.py decode_int).
     ///
     /// Virtual sources go through getvirtual_int (INT/raw virtuals).
     pub fn decode_field_source_int(&mut self, source: &VirtualFieldSource) -> i64 {
@@ -7521,7 +7521,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// Decode a VirtualFieldSource as a FLOAT value (resume.py:1554 decode_float).
+    /// Decode a VirtualFieldSource as a FLOAT value (resume.py decode_float).
     ///
     /// Floats are stored as raw i64 bits. TAGVIRTUAL is invalid for
     /// float fields — virtual floats would route through a different
@@ -7540,7 +7540,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:1520-1529 setinteriorfield(index, array, fieldnum, descr)
+    /// resume.py setinteriorfield(index, array, fieldnum, descr)
     ///
     /// Dispatches by descr.is_pointer_field() / is_float_field() / else.
     pub fn setinteriorfield(
@@ -7575,7 +7575,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
-    /// resume.py:1599 int_add_const
+    /// resume.py int_add_const
     pub fn int_add_const(&self, base: i64, offset: i64) -> i64 {
         base + offset
     }
@@ -7589,13 +7589,13 @@ impl Drop for ResumeDataDirectReader<'_> {
     }
 }
 
-/// resume.py:1312 blackhole_from_resumedata
+/// resume.py blackhole_from_resumedata
 ///
 /// Build a chain of BlackholeInterpreters from encoded resume data.
 /// Returns the topmost (innermost) interpreter.
 ///
 /// `resolve_jitcode` corresponds to RPython's `jitcodes[jitcode_pos]` lookup
-/// (`resume.py:1339`). Matches upstream's `(jitcode, pc)` tuple result.
+/// (`resume.py`). Matches upstream's `(jitcode, pc)` tuple result.
 pub struct ResolvedJitCode {
     pub jitcode: std::sync::Arc<crate::jitcode::JitCode>,
     pub pc: usize,
@@ -7617,7 +7617,7 @@ impl ResolvedJitCode {
     }
 }
 
-/// resume.py:1054 `consume_boxes` liveness split for a generic JitDriver
+/// resume.py `consume_boxes` liveness split for a generic JitDriver
 /// `setup_bridge_sym`: the live register indices of a guard's resume frame,
 /// split by the three liveness banks (int / ref / float).  A frame decoded
 /// by `rebuild_from_numbering` lays its `values` out in this same bank order
@@ -7636,13 +7636,13 @@ impl FrameLivenessRegIndices {
     }
 }
 
-/// jitcode.py:149-166 `enumerate_vars` parity: read the per-bank live
+/// jitcode.py `enumerate_vars` parity: read the per-bank live
 /// register indices at a resolved JitCode `pc`. `all_liveness` is
 /// `metainterp_sd.liveness_info`; `op_live` is `metainterp_sd.op_live`.
 /// Returns empty banks when `pc` is not a valid liveness startpoint, so the
 /// caller can decline to seed rather than panic in `get_live_vars_info`.
 ///
-/// jitcode.py:82-100 `get_live_vars_info` asserts on a missing startpoint
+/// jitcode.py `get_live_vars_info` asserts on a missing startpoint
 /// (MissingLiveness); we deliberately soft-decline instead, because a frame
 /// resuming through the Python `pc` legitimately has no JitCode liveness at
 /// this coordinate.  An empty return can however mask a genuinely bad resume
@@ -7777,7 +7777,7 @@ fn prepare_resume_heap_with_roots<'a>(
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
 ) -> ResumeRefRootsScope {
-    // resume.py:1324 _prepare = _prepare_virtuals + _prepare_pendingfields.
+    // resume.py _prepare = _prepare_virtuals + _prepare_pendingfields.
     //
     // Root the lazily-filled `virtuals_cache` for the whole construction
     // window: decoding a virtual target (`getvirtual_ptr` → allocator)
@@ -7786,14 +7786,14 @@ fn prepare_resume_heap_with_roots<'a>(
     // rooted BEFORE the first materialization, including materialization that
     // happens while applying pending fields.
     let resume_roots = ResumeRefRootsScope::enter();
-    // resume.py:925 _prepare_virtuals
+    // resume.py _prepare_virtuals
     resumereader.prepare_virtuals(rd_virtuals);
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(
             &mut resumereader.virtuals_cache.virtuals_ptr_cache,
         );
     }
-    // resume.py:926 _prepare_pendingfields
+    // resume.py _prepare_pendingfields
     if let Some(guard_pf) = rd_guard_pendingfields {
         resumereader.prepare_guard_pendingfields(guard_pf);
     }
@@ -7857,7 +7857,7 @@ pub fn blackhole_from_resumedata<'a>(
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
     virtualizable_identity_override: Option<i64>,
-    // resume.py:1312 `blackhole_from_resumedata(..., all_virtuals=None)`.
+    // resume.py `blackhole_from_resumedata(..., all_virtuals=None)`.
     // `Some` only when resuming from a GUARD_NOT_FORCED whose
     // `handle_async_forcing` already materialized the virtuals
     // (compile.py:956-958): the reader then runs with
@@ -7887,7 +7887,7 @@ pub fn blackhole_from_resumedata<'a>(
         allocator,
     );
 
-    // resume.py:1368-1375: `_prepare` — and so both `_prepare_virtuals` and
+    // resume.py: `_prepare` — and so both `_prepare_virtuals` and
     // `_prepare_pendingfields` — runs only in the `all_virtuals is None`
     // case. Resuming after a GUARD_NOT_FORCED, the force's own reader
     // already built the virtuals and applied the pending fields; redoing
@@ -7903,7 +7903,7 @@ pub fn blackhole_from_resumedata<'a>(
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo, virtualizable_identity_override);
     drop(_cc_guard);
 
-    // resume.py:1404: virtualizable pointer read by consume_vable_info.
+    // resume.py: virtualizable pointer read by consume_vable_info.
     // The virtualizable is the frame being resumed; RPython keeps it live in
     // the GC-traced resume reader across the frame-chain build.  pyre has no
     // GC transform, so root the reader's `virtualizable_ptr` slot for the
@@ -7969,7 +7969,7 @@ pub fn blackhole_from_resumedata<'a>(
     curbh.map(|b| (*b, virtualizable_ptr))
 }
 
-/// resume.py:1345 force_from_resumedata
+/// resume.py force_from_resumedata
 ///
 /// Force all virtuals from resume data without running a blackhole.
 /// Used for GUARD_NOT_FORCED handling.
@@ -8009,7 +8009,7 @@ pub fn force_from_resumedata<'a>(
         None,
         allocator,
     );
-    // resume.py:1371 common-case __init__ calls self._prepare(storage)
+    // resume.py common-case __init__ calls self._prepare(storage)
     // before handling_async_forcing() flips the GUARD_NOT_FORCED state.
     //
     // The scope must outlive `force_all_virtuals` below. `getvirtual_ptr`
@@ -8030,7 +8030,7 @@ pub fn force_from_resumedata<'a>(
     // virtualizable is an interpreter-created frame from `FrameBox::new` →
     // `try_gc_alloc_stable_raw`, which no collection moves.
     let virtualizable_ptr = resumereader.virtualizable_ptr;
-    // resume.py:1351: return resumereader.force_all_virtuals()
+    // resume.py: return resumereader.force_all_virtuals()
     let (ptrs, ints) = resumereader.force_all_virtuals();
     (ptrs.to_vec(), ints.to_vec(), virtualizable_ptr)
 }

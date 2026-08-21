@@ -3,7 +3,7 @@
 //!
 //! The error codes are the contract between `rsandbox.reraise_error`
 //! (`rpython/translator/sandbox/rsandbox.py:90-108`) and `sandlib.write_exception`
-//! / `EXCEPTION_TABLE` (`rpython/translator/sandbox/sandlib.py:69-94`). The two
+//! / `EXCEPTION_TABLE` (`rpython/translator/sandbox/sandlib.py`). The two
 //! tables MUST stay in sync; they are unified here.
 
 /// An error raised across the sandbox boundary.

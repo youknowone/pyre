@@ -16,11 +16,11 @@
 //!     ```
 //!     Pyre's analog is the `RegAllocator` struct below plus its three
 //!     private methods of the same name.
-//!   * `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args` —
+//!   * `rpython/jit/codewriter/flatten.py enforce_input_args` —
 //!     after coloring, `swapcolors` rotates inputarg colors into
 //!     `0..n-1`. Pyre's analog is the `enforce_input_args` free
 //!     function below (called by `GraphFlattener::enforce_input_args`
-//!     at `flatten.rs` to mirror `flatten.py:68 flattener.enforce_input_args()`,
+//!     at `flatten.rs` to mirror `flatten.py flattener.enforce_input_args()`,
 //!     and directly by `codewriter.rs` before it builds the canonical
 //!     `codewriter.py:53 flatten_graph(graph, regallocs, cpu)` stream).
 //!   * `rpython/jit/codewriter/codewriter.py:62-67` —
@@ -48,7 +48,7 @@ pub struct GraphAllocationResult {
 }
 
 impl GraphAllocationResult {
-    /// `rpython/tool/algo/regalloc.py:129-130 RegAllocator.getcolor` —
+    /// `rpython/tool/algo/regalloc.py RegAllocator.getcolor` —
     /// return the post-coloring color for a Variable.  Panics when
     /// `v` is not colored (matches PyPy `_coloring[...]` KeyError).
     /// Pyre's `enforce_input_args` short-circuits via direct
@@ -61,9 +61,9 @@ impl GraphAllocationResult {
         })
     }
 
-    /// `rpython/tool/algo/regalloc.py:138-143 RegAllocator.swapcolors`
+    /// `rpython/tool/algo/regalloc.py RegAllocator.swapcolors`
     /// — swap every occurrence of `col1` and `col2` across the coloring
-    /// dict.  Called by `enforce_input_args` (`flatten.py:88-100`) when
+    /// dict.  Called by `enforce_input_args` (`flatten.py`) when
     /// an inputarg's coloring lands on a higher color than its
     /// positional `realcol`.
     pub fn swapcolors(&mut self, col1: u16, col2: u16) {
@@ -268,7 +268,7 @@ impl<'a> RegAllocator<'a> {
         }
     }
 
-    /// `rpython/tool/algo/regalloc.py:98-112 _try_coalesce` — kind
+    /// `rpython/tool/algo/regalloc.py _try_coalesce` — kind
     /// check + identity short-circuit + interference check + union.
     /// Both endpoints are normally in `_depgraph` already because
     /// `make_dependencies` registered every op result, inputarg, and
@@ -365,7 +365,7 @@ impl<'a> RegAllocator<'a> {
     }
 }
 
-/// `rpython/jit/codewriter/regalloc.py:6 perform_register_allocation(graph, kind)`
+/// `rpython/jit/codewriter/regalloc.py perform_register_allocation(graph, kind)`
 /// — thin wrapper over `rpython/tool/algo/regalloc.py:8-15
 /// perform_register_allocation(graph, consider_var, ListOfKind=())`.
 ///
@@ -510,7 +510,7 @@ pub fn perform_register_allocation_with_pairs(
 /// never recoverable at the guard snapshot (#124 float tail).
 ///
 /// PyPy runs the check on the PRE-renaming graph (the CFG coalesce sweep
-/// precedes `flatten.py:154 insert_renamings`); this filter does the same
+/// precedes `flatten.py insert_renamings`); this filter does the same
 /// by building the dependency graph on `graph` (the same pre-renaming graph
 /// `collect_cfg_coalesce_pairs` reads) with an EMPTY union-find, so
 /// `make_dependencies` records true interference.  It then replays the
@@ -611,7 +611,7 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
     ]
 }
 
-/// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`
+/// Mirrors `rpython/jit/codewriter/flatten.py enforce_input_args`
 ///
 
 /// Walks the startblock's inputargs in source order; for each inputarg
@@ -631,7 +631,7 @@ pub fn perform_register_allocation_all_kinds_with_pairs(
 /// swap must run BEFORE the closure is constructed.
 pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationResult; 3]) {
     let inputargs = graph.startblock.borrow().inputargs.clone();
-    // RPython `numkinds = {}` (flatten.py:91); pyre stores the per-kind
+    // RPython `numkinds = {}` (flatten.py); pyre stores the per-kind
     // counter in a `[u16; 3]` array indexed by `Kind::index()`.
     let mut numkinds: [u16; 3] = [0; 3];
     for arg in &inputargs {
@@ -773,7 +773,7 @@ mod tests {
         // colors.  `extra_coalesce_pairs` pre-merges them in the
         // union-find before `make_dependencies` so they collapse into
         // a single node and share a color — bypassing the interference
-        // edge that `_try_coalesce` (regalloc.py:106) would otherwise
+        // edge that `_try_coalesce` (regalloc.py) would otherwise
         // honour.
         let build_graph = || {
             let v0 = flow_var(0, Kind::Ref);
@@ -969,7 +969,7 @@ mod tests {
         assert_eq!(result.num_colors, 2);
     }
 
-    /// `flatten.py:88-100 enforce_input_args` parity at the graph
+    /// `flatten.py enforce_input_args` parity at the graph
     /// allocator level: after the swap, every kind's startblock
     /// inputargs occupy colors `0, 1, 2, …` in source order.
     #[test]

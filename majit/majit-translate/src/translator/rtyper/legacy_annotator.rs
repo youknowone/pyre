@@ -227,15 +227,15 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         ConstValue::Placeholder => ValueType::Unknown,
         // RPython `Constant(None)` is annotated as `SomeNone`
         // (`rpython/annotator/annrpython.py:273 immutablevalue(None)`
-        // → `SomeNone()` per `annotator/model.py:603`), distinct from
+        // → `SomeNone()` per `annotator/model.py`), distinct from
         // `SomeInteger` / `SomeString`.  Pyre's `ValueType` lacks a
         // dedicated `SomeNone` variant, so collapse to `Ref` — the
         // closest match for the dominant downstream consumer where
         // None flows into a `Ptr` target and the rtyper emits
         // `inputconst(Ptr, None)` per `pairtype(NoneRepr, Repr).
-        // convert_from_to` (`rpython/rtyper/rnone.py:58`).  For the
+        // convert_from_to` (`rpython/rtyper/rnone.py`).  For the
         // `Constant(None) → NoneRepr` target case (where the rtyper
-        // returns `inputconst(Void, None)` per `rnone.py:48`),
+        // returns `inputconst(Void, None)` per `rnone.py`),
         // construction sites such as `set_return` write the target
         // repr onto `Constant.concretetype`; the rtyping-layer
         // projection at `legacy_resolve::link_arg_concrete_type` then
@@ -376,7 +376,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         | OpKind::JitDebug { .. }
         | OpKind::AssertGreen { .. }
         | OpKind::RecordKnownResult { .. }
-        // jtransform.py:901-903 — `record_quasiimmut_field` has no result.
+        // jtransform.py — `record_quasiimmut_field` has no result.
         | OpKind::RecordQuasiImmutField { .. }
         // jtransform.py:1707,1718 — jit_merge_point / loop_header have no
         // result; upstream emits them with `op1 = SpaceOperation(..., None)`.
@@ -472,7 +472,7 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
         // resolves by inheritance to `pair(SomeInteger, SomeInteger).union`
         // (`binaryop.py:178`; there is no `pairtype(SomeBool, SomeInteger)`
         // override).  SomeBool is `nonneg=True, unsigned=False,
-        // knowntype=bool` (`model.py:227-231`); bool→int is normalised at
+        // knowntype=bool` (`model.py`); bool→int is normalised at
         // `binaryop.py:183-184`.  Against signed Int the same-signedness
         // branch returns SomeInteger(knowntype=int) = Int.  Against Unsigned
         // (`unsigned=True, nonneg=True, knowntype=r_uint`) the differing-

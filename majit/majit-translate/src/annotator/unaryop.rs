@@ -36,7 +36,7 @@ use super::model::{
     SomeValueTag, add_knowntypedata, s_bool, s_impossible_value, s_none,
 };
 
-/// RPython `UNARY_OPERATIONS` (unaryop.py:26-28).
+/// RPython `UNARY_OPERATIONS` (unaryop.py).
 ///
 /// ```python
 /// UNARY_OPERATIONS = set([oper.opname for oper in op.__dict__.values()
@@ -162,7 +162,7 @@ fn register_transform(
 
 #[allow(non_snake_case)]
 pub fn type_SomeObject(_ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
-    // upstream unaryop.py:31-33 — `SomeTypeOf([v_arg])`.
+    // upstream unaryop.py — `SomeTypeOf([v_arg])`.
     // Constants are ignored: upstream `type(const)` would never enter
     // this dispatcher (it lands on the const-folding path of
     // `Type.constfold`). When the arg happens to be a constant we fall
@@ -189,7 +189,7 @@ fn init_type_register(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:1023-1027 — `@op.issubtype.register(SomeTypeOf)`.
+    // unaryop.py — `@op.issubtype.register(SomeTypeOf)`.
     register(
         reg,
         OpKind::IsSubtype,
@@ -267,7 +267,7 @@ fn init_contains_register(
 }
 
 // =====================================================================
-// unaryop.py:36-76, 147-153, 1023-1027 — isinstance / issubtype
+// unaryop.py, 147-153, 1023-1027 — isinstance / issubtype
 // =====================================================================
 
 enum TypeDesc {
@@ -503,7 +503,7 @@ fn issubtype_SomeTypeOf(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 }
 
 // =====================================================================
-// unaryop.py:156-254 — class __extend__(SomeObject) simple-return defaults
+// unaryop.py — class __extend__(SomeObject) simple-return defaults
 // =====================================================================
 //
 // `class __extend__(SomeObject)` upstream defines the defaults fetched by
@@ -519,19 +519,19 @@ pub fn bool_SomeObject(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     // Dispatch of `annotation(obj).bool_behavior(r)` over the per-type
     // `bool_behavior` overrides.
     match &s_obj {
-        // unaryop.py:863-865 `SomeInstance.bool_behavior`.
+        // unaryop.py `SomeInstance.bool_behavior`.
         SomeValue::Instance(s_inst) if !s_inst.can_be_none => {
             r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
         }
-        // unaryop.py:993-995 `SomePBC.bool_behavior`.
+        // unaryop.py `SomePBC.bool_behavior`.
         SomeValue::PBC(pbc) if !pbc.can_be_none => {
             r.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
         }
-        // unaryop.py:1014-1015 `SomeNone.bool_behavior`.
+        // unaryop.py `SomeNone.bool_behavior`.
         SomeValue::None_(_) => {
             r.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
         }
-        // unaryop.py:161-167 `SomeObject.bool_behavior`.
+        // unaryop.py `SomeObject.bool_behavior`.
         _ => {
             if s_obj.is_immutable_constant()
                 && let Some(c) = s_obj.const_()
@@ -625,7 +625,7 @@ fn init_someobject_defaults(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:73-76 — `@op.isinstance.register(SomeObject)`.
+    // unaryop.py — `@op.isinstance.register(SomeObject)`.
     register(
         reg,
         OpKind::IsInstance,
@@ -635,7 +635,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:147-153 — `@op.issubtype.register(SomeObject)`.
+    // unaryop.py — `@op.issubtype.register(SomeObject)`.
     register(
         reg,
         OpKind::IsSubtype,
@@ -645,7 +645,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:158-159 — len(self): return SomeInteger(nonneg=True)
+    // unaryop.py — len(self): return SomeInteger(nonneg=True)
     register(
         reg,
         OpKind::Len,
@@ -655,7 +655,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:78-87 / 151-156 — bool(self): bool_behavior +
+    // unaryop.py / 151-156 — bool(self): bool_behavior +
     // truth-branch knowntypedata via nonnoneify().
     register(
         reg,
@@ -666,7 +666,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:169-170 — hash: raise AnnotatorError("cannot use hash() in RPython").
+    // unaryop.py — hash: raise AnnotatorError("cannot use hash() in RPython").
     register(
         reg,
         OpKind::Hash,
@@ -676,7 +676,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:172-173 — str: SomeString().
+    // unaryop.py — str: SomeString().
     register(
         reg,
         OpKind::Str,
@@ -686,7 +686,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:178-179 — repr: SomeString().
+    // unaryop.py — repr: SomeString().
     register(
         reg,
         OpKind::Repr,
@@ -696,7 +696,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:181-188 — hex/bin/oct: SomeString().
+    // unaryop.py — hex/bin/oct: SomeString().
     for op in &[OpKind::Hex, OpKind::Bin, OpKind::Oct] {
         register(
             reg,
@@ -708,7 +708,7 @@ fn init_someobject_defaults(
             },
         );
     }
-    // unaryop.py:190-192 — id: raise AnnotatorError.
+    // unaryop.py — id: raise AnnotatorError.
     register(
         reg,
         OpKind::Id,
@@ -720,7 +720,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:194-195 — int: SomeInteger().
+    // unaryop.py — int: SomeInteger().
     register(
         reg,
         OpKind::Int,
@@ -730,7 +730,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:197-198 — float: SomeFloat().
+    // unaryop.py — float: SomeFloat().
     register(
         reg,
         OpKind::Float,
@@ -740,7 +740,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:215-229 — SomeObject.getattr(self, s_attr).
+    // unaryop.py — SomeObject.getattr(self, s_attr).
     register(
         reg,
         OpKind::GetAttr,
@@ -817,7 +817,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:972-980 — SomePBC.getattr(self, s_attr).
+    // unaryop.py — SomePBC.getattr(self, s_attr).
     //
     //   def getattr(self, s_attr):
     //       assert s_attr.is_constant()
@@ -842,7 +842,7 @@ fn init_someobject_defaults(
                 let SomeValue::PBC(pbc) = &s_self else {
                     unreachable!("PBC-tag dispatch must carry SomePBC, got {s_self:?}");
                 };
-                // unaryop.py:972-980 — `SomePBC.getattr(self, s_attr)`.
+                // unaryop.py — `SomePBC.getattr(self, s_attr)`.
                 // Upstream only asserts `s_attr.is_constant()` and
                 // uses `s_attr.const` directly — no `isinstance(...,
                 // str)` gate. Python 2 string equality crosses the
@@ -883,7 +883,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:200-204 — delattr: warning-only. Returns no value
+    // unaryop.py — delattr: warning-only. Returns no value
     // (upstream implicit None). Port as a void specialization returning
     // `None`, so consider binds the result to Impossible without blocking.
     register(
@@ -895,7 +895,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:114-118 — `@op.simple_call.register(SomeObject)`.
+    // unaryop.py — `@op.simple_call.register(SomeObject)`.
     //
     //     @op.simple_call.register(SomeObject)
     //     def simple_call_SomeObject(annotator, func, *args):
@@ -922,7 +922,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:142-145 — `@op.call_args.register(SomeObject)`.
+    // unaryop.py — `@op.call_args.register(SomeObject)`.
     register(
         reg,
         OpKind::CallArgs,
@@ -932,7 +932,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:240-241 — hint(self, *args_s): return self.
+    // unaryop.py — hint(self, *args_s): return self.
     register(
         reg,
         OpKind::Hint,
@@ -942,7 +942,7 @@ fn init_someobject_defaults(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:243-250 — getslice/setslice/delslice: s_ImpossibleValue.
+    // unaryop.py — getslice/setslice/delslice: s_ImpossibleValue.
     for op in &[OpKind::GetSlice, OpKind::SetSlice, OpKind::DelSlice] {
         register(
             reg,
@@ -954,7 +954,7 @@ fn init_someobject_defaults(
             },
         );
     }
-    // unaryop.py:252-254 — pos/neg/abs/ord/invert/long/iter/next: s_ImpossibleValue.
+    // unaryop.py — pos/neg/abs/ord/invert/long/iter/next: s_ImpossibleValue.
     //
     //     def pos(self):
     //         return s_ImpossibleValue
@@ -982,7 +982,7 @@ fn init_someobject_defaults(
 }
 
 // =====================================================================
-// unaryop.py:257-273 — class __extend__(SomeFloat)
+// unaryop.py — class __extend__(SomeFloat)
 // =====================================================================
 
 fn init_somefloat_overrides(
@@ -991,7 +991,7 @@ fn init_somefloat_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:259-260 — pos(self): return self.
+    // unaryop.py — pos(self): return self.
     register(
         reg,
         OpKind::Pos,
@@ -1001,7 +1001,7 @@ fn init_somefloat_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:262-265 — neg(self): SomeFloat(). abs = neg.
+    // unaryop.py — neg(self): SomeFloat(). abs = neg.
     for op in &[OpKind::Neg, OpKind::Abs] {
         register(
             reg,
@@ -1013,7 +1013,7 @@ fn init_somefloat_overrides(
             },
         );
     }
-    // unaryop.py:267-270 — bool(self): SomeBool (const if self is constant).
+    // unaryop.py — bool(self): SomeBool (const if self is constant).
     register(
         reg,
         OpKind::Bool,
@@ -1036,7 +1036,7 @@ fn init_somefloat_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:272-273 — len(self): raise AnnotatorError.
+    // unaryop.py — len(self): raise AnnotatorError.
     register(
         reg,
         OpKind::Len,
@@ -1049,7 +1049,7 @@ fn init_somefloat_overrides(
 }
 
 // =====================================================================
-// unaryop.py:275-302 — class __extend__(SomeInteger)
+// unaryop.py — class __extend__(SomeInteger)
 // =====================================================================
 
 fn init_someinteger_overrides(
@@ -1058,7 +1058,7 @@ fn init_someinteger_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:277-285 — invert/pos/int: SomeInteger(knowntype=self.knowntype).
+    // unaryop.py — invert/pos/int: SomeInteger(knowntype=self.knowntype).
     //                      can_only_throw = [].
     let same_kt_int = |ann: &RPythonAnnotator, hl: &HLOperation| -> SomeValue {
         let kt = match ann.annotation(&hl.args[0]) {
@@ -1078,7 +1078,7 @@ fn init_someinteger_overrides(
             },
         );
     }
-    // unaryop.py:289-293 — neg: SomeInteger(knowntype=self.knowntype). neg_ovf overflows.
+    // unaryop.py — neg: SomeInteger(knowntype=self.knowntype). neg_ovf overflows.
     register(
         reg,
         OpKind::Neg,
@@ -1097,7 +1097,7 @@ fn init_someinteger_overrides(
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
         },
     );
-    // unaryop.py:295-299 — abs: SomeInteger(nonneg=True, knowntype=self.knowntype).
+    // unaryop.py — abs: SomeInteger(nonneg=True, knowntype=self.knowntype).
     let abs_int = |ann: &RPythonAnnotator, hl: &HLOperation| -> SomeValue {
         let kt = match ann.annotation(&hl.args[0]) {
             Some(SomeValue::Integer(i)) => i.base.knowntype,
@@ -1126,7 +1126,7 @@ fn init_someinteger_overrides(
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
         },
     );
-    // unaryop.py:301-302 — len: raise.
+    // unaryop.py — len: raise.
     register(
         reg,
         OpKind::Len,
@@ -1139,7 +1139,7 @@ fn init_someinteger_overrides(
 }
 
 // =====================================================================
-// unaryop.py:305-330 — class __extend__(SomeBool)
+// unaryop.py — class __extend__(SomeBool)
 // =====================================================================
 
 fn init_somebool_overrides(
@@ -1148,7 +1148,7 @@ fn init_somebool_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:306-307 — bool(self): return self.
+    // unaryop.py — bool(self): return self.
     register(
         reg,
         OpKind::Bool,
@@ -1158,7 +1158,7 @@ fn init_somebool_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:309-312 — invert: SomeInteger(). can_only_throw=[].
+    // unaryop.py — invert: SomeInteger(). can_only_throw=[].
     register(
         reg,
         OpKind::Invert,
@@ -1168,7 +1168,7 @@ fn init_somebool_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:314-318 — neg: SomeInteger(). neg_ovf overflows.
+    // unaryop.py — neg: SomeInteger(). neg_ovf overflows.
     register(
         reg,
         OpKind::Neg,
@@ -1187,7 +1187,7 @@ fn init_somebool_overrides(
             can_only_throw: CanOnlyThrow::List(vec![BuiltinException::OverflowError]),
         },
     );
-    // unaryop.py:320-330 — abs / abs_ovf / pos / int: SomeInteger(nonneg=True).
+    // unaryop.py — abs / abs_ovf / pos / int: SomeInteger(nonneg=True).
     let nonneg_int = |_ann: &RPythonAnnotator, _hl: &HLOperation| -> SomeValue {
         let i = SomeInteger {
             nonneg: true,
@@ -1234,7 +1234,7 @@ fn init_somebool_overrides(
 }
 
 // =====================================================================
-// unaryop.py:332-348 — class __extend__(SomeTuple)
+// unaryop.py — class __extend__(SomeTuple)
 // =====================================================================
 
 fn init_sometuple_overrides(
@@ -1243,7 +1243,7 @@ fn init_sometuple_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:334-335 — len(self): immutablevalue(len(self.items)).
+    // unaryop.py — len(self): immutablevalue(len(self.items)).
     register(
         reg,
         OpKind::Len,
@@ -1261,7 +1261,7 @@ fn init_sometuple_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:337-339 — iter(self): SomeIterator(self). can_only_throw=[].
+    // unaryop.py — iter(self): SomeIterator(self). can_only_throw=[].
     register(
         reg,
         OpKind::Iter,
@@ -1274,7 +1274,7 @@ fn init_sometuple_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:344-348 — getslice((self, s_start, s_stop)): require
+    // unaryop.py — getslice((self, s_start, s_stop)): require
     // constant indices, slice items, rebuild SomeTuple. Registered as
     // the primary SomeTuple.getslice handler (the SomeObject fallback
     // would have returned s_ImpossibleValue).
@@ -1337,7 +1337,7 @@ fn init_sometuple_overrides(
 }
 
 // =====================================================================
-// unaryop.py:350-443 — @op.contains.register(SomeList) + class __extend__(SomeList)
+// unaryop.py — @op.contains.register(SomeList) + class __extend__(SomeList)
 // =====================================================================
 
 #[allow(non_snake_case)]
@@ -1372,7 +1372,7 @@ fn init_somelist_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:391-396 — len(self): position read_item → 0 if impossible,
+    // unaryop.py — len(self): position read_item → 0 if impossible,
     // else SomeObject.len.
     register(
         reg,
@@ -1399,7 +1399,7 @@ fn init_somelist_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:398-400 — iter(self): SomeIterator(self). can_only_throw=[].
+    // unaryop.py — iter(self): SomeIterator(self). can_only_throw=[].
     register(
         reg,
         OpKind::Iter,
@@ -1412,7 +1412,7 @@ fn init_somelist_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:420-423 — getslice((self, s_start, s_stop)):
+    // unaryop.py — getslice((self, s_start, s_stop)):
     //     check_negative_slice(...); return listdef.offspring(bk).
     register(
         reg,
@@ -1440,7 +1440,7 @@ fn init_somelist_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:425-431 — setslice((self, s_start, s_stop), s_iterable):
+    // unaryop.py — setslice((self, s_start, s_stop), s_iterable):
     //     check_negative + isinstance(SomeList) + mutate + agree + resize.
     //     No return → None (void).
     register(
@@ -1478,7 +1478,7 @@ fn init_somelist_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:433-435 — delslice((self, s_start, s_stop)):
+    // unaryop.py — delslice((self, s_start, s_stop)):
     //     check_negative + resize. No return → None (void).
     register(
         reg,
@@ -1546,7 +1546,7 @@ fn list_method_append(
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
 ) -> Option<SomeValue> {
-    // unaryop.py:357-359 — method_append falls off the end (returns None
+    // unaryop.py — method_append falls off the end (returns None
     // = void op), so the call binds Impossible without blocking.
     s_self.listdef.resize().expect("resize");
     s_self.listdef.generalize(s_value).expect("generalize");
@@ -1572,10 +1572,10 @@ fn list_method_extend(
         //     self.method_append(s_iter.next())
         //
         // `SomeIterator(s_iterable, variant=())` mirrors every
-        // `SomeX.iter()` handler (unaryop.py:337/389/660/806/…),
+        // `SomeX.iter()` handler (unaryop.py/389/660/806/…),
         // which all reduce to `SomeIterator(self)` on the iterable.
         // `someiterator_next` is the extracted body of upstream
-        // `SomeIterator.next` (unaryop.py:818-828).
+        // `SomeIterator.next` (unaryop.py).
         let s_iter = SomeIterator::new(s_iterable.clone(), vec![]);
         let s_item = someiterator_next(ann, &s_iter);
         list_method_append(ann, s_self, &s_item);
@@ -1600,7 +1600,7 @@ fn list_method_insert(
     _s_index: &SomeValue,
     s_value: &SomeValue,
 ) -> Option<SomeValue> {
-    // unaryop.py:372-373 — delegates to method_append (also void).
+    // unaryop.py — delegates to method_append (also void).
     list_method_append(ann, s_self, s_value)
 }
 
@@ -1640,7 +1640,7 @@ fn list_method_index(
 }
 
 // =====================================================================
-// unaryop.py:446-460 — @op.contains.register(SomeDict) + dict_contains helper
+// unaryop.py — @op.contains.register(SomeDict) + dict_contains helper
 // =====================================================================
 
 #[allow(non_snake_case)]
@@ -1656,7 +1656,7 @@ pub fn contains_SomeDict(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue 
     dict_contains(&s_dct, &s_elem, position)
 }
 
-/// RPython `dict_contains(s_dct, s_element, position)` (unaryop.py:446-452).
+/// RPython `dict_contains(s_dct, s_element, position)` (unaryop.py).
 ///
 /// ```python
 /// def dict_contains(s_dct, s_element, position):
@@ -1682,7 +1682,7 @@ pub fn dict_contains(
     SomeValue::Bool(SomeBool::new())
 }
 
-/// RPython `SomeDict._is_empty(self, position)` (unaryop.py:464-468).
+/// RPython `SomeDict._is_empty(self, position)` (unaryop.py).
 fn dict_is_empty(
     s_dct: &super::model::SomeDict,
     position: Option<super::bookkeeper::PositionKey>,
@@ -1708,7 +1708,7 @@ fn init_somedict_overrides(
         Specialization {
             apply: pure(contains_SomeDict),
             can_only_throw: CanOnlyThrow::Callable(Box::new(|args_s| {
-                // Mirror binaryop::_dict_can_only_throw_nothing (binaryop.py:532-535).
+                // Mirror binaryop::_dict_can_only_throw_nothing (binaryop.py).
                 match args_s.first() {
                     Some(SomeValue::Dict(d)) => {
                         if d.dictdef.custom_eq_hash() {
@@ -1722,7 +1722,7 @@ fn init_somedict_overrides(
             })),
         },
     );
-    // unaryop.py:470-474 — len(self): 0 if empty, else SomeObject.len.
+    // unaryop.py — len(self): 0 if empty, else SomeObject.len.
     register(
         reg,
         OpKind::Len,
@@ -1745,7 +1745,7 @@ fn init_somedict_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:476-478 — iter(self): SomeIterator(self). can_only_throw=[].
+    // unaryop.py — iter(self): SomeIterator(self). can_only_throw=[].
     register(
         reg,
         OpKind::Iter,
@@ -1851,7 +1851,7 @@ fn dict_method_values(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -
 
 #[allow(dead_code)]
 fn dict_method_items(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
-    // unaryop.py:529-531 — bk.newlist(self.getanyitem(..., variant='items')).
+    // unaryop.py — bk.newlist(self.getanyitem(..., variant='items')).
     let position = ann.bookkeeper.current_position_key();
     let s_item = container_getanyitem(&SomeValue::Dict(s_self.clone()), Some("items"), position);
     let s_list = ann
@@ -1919,7 +1919,7 @@ fn dict_method_clear(
 
 #[allow(dead_code)]
 fn dict_method_popitem(ann: &RPythonAnnotator, s_self: &super::model::SomeDict) -> SomeValue {
-    // unaryop.py:551-553 — return self.getanyitem(position, variant='items').
+    // unaryop.py — return self.getanyitem(position, variant='items').
     let position = ann.bookkeeper.current_position_key();
     container_getanyitem(&SomeValue::Dict(s_self.clone()), Some("items"), position)
 }
@@ -2031,7 +2031,7 @@ fn dict_method_move_to_end(
     s_last: &SomeValue,
 ) -> Option<SomeValue> {
     // unaryop.py:585-588 on SomeOrderedDict. Rust collapses SomeDict =
-    // SomeOrderedDict (model.py:416), so the same analyzer lives on
+    // SomeOrderedDict (model.py), so the same analyzer lives on
     // SomeDict. assert + delitem, falls off the end (void op).
     assert!(
         s_bool().contains(s_last),
@@ -2081,7 +2081,7 @@ fn init_somestring_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:593-605 — contains_String:
+    // unaryop.py — contains_String:
     //   if const '\0': knowntypedata-based refinement, else SomeObject fallback.
     //   can_only_throw=[].
     register(
@@ -2093,7 +2093,7 @@ fn init_somestring_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:660-662 — iter(self): SomeIterator(self). can_only_throw=[].
+    // unaryop.py — iter(self): SomeIterator(self). can_only_throw=[].
     register(
         reg,
         OpKind::Iter,
@@ -2106,7 +2106,7 @@ fn init_somestring_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:684-687 — getslice: check_negative_slice + basestringclass(no_nul).
+    // unaryop.py — getslice: check_negative_slice + basestringclass(no_nul).
     register(
         reg,
         OpKind::GetSlice,
@@ -2129,7 +2129,7 @@ fn init_somestring_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:720-725 — len(self): immutablevalue(len(const)) if const, else SomeInteger(nonneg).
+    // unaryop.py — len(self): immutablevalue(len(const)) if const, else SomeInteger(nonneg).
     register(
         reg,
         OpKind::Len,
@@ -2171,7 +2171,7 @@ fn init_someunicodestring_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:660-662 — iter on SomeUnicodeString.
+    // unaryop.py — iter on SomeUnicodeString.
     register(
         reg,
         OpKind::Iter,
@@ -2184,7 +2184,7 @@ fn init_someunicodestring_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:684-687 — getslice on SomeUnicodeString (basestringclass=SomeUnicodeString).
+    // unaryop.py — getslice on SomeUnicodeString (basestringclass=SomeUnicodeString).
     register(
         reg,
         OpKind::GetSlice,
@@ -2215,7 +2215,7 @@ fn init_somebytearray_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:693-696 — SomeByteArray.getslice: check + SomeByteArray().
+    // unaryop.py — SomeByteArray.getslice: check + SomeByteArray().
     register(
         reg,
         OpKind::GetSlice,
@@ -2237,7 +2237,7 @@ fn init_somebytearray_overrides(
 }
 
 // =====================================================================
-// unaryop.py:771-797 — class __extend__(SomeChar, SomeUnicodeCodePoint) / SomeChar
+// unaryop.py — class __extend__(SomeChar, SomeUnicodeCodePoint) / SomeChar
 // =====================================================================
 
 fn init_somechar_overrides(
@@ -2246,7 +2246,7 @@ fn init_somechar_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:771-774 — len(self) = immutablevalue(1).
+    // unaryop.py — len(self) = immutablevalue(1).
     register(
         reg,
         OpKind::Len,
@@ -2260,7 +2260,7 @@ fn init_somechar_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:776-779 — ord(self) = SomeInteger(nonneg=True).
+    // unaryop.py — ord(self) = SomeInteger(nonneg=True).
     register(
         reg,
         OpKind::Ord,
@@ -2278,7 +2278,7 @@ fn init_someunicodecp_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:771-774 — len(self) = immutablevalue(1) on SomeUnicodeCodePoint.
+    // unaryop.py — len(self) = immutablevalue(1) on SomeUnicodeCodePoint.
     register(
         reg,
         OpKind::Len,
@@ -2292,7 +2292,7 @@ fn init_someunicodecp_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:799-804 — ord(self): SomeInteger(nonneg=True).
+    // unaryop.py — ord(self): SomeInteger(nonneg=True).
     register(
         reg,
         OpKind::Ord,
@@ -2399,7 +2399,7 @@ fn str_method_find(
     s_start: Option<&SomeValue>,
     s_end: Option<&SomeValue>,
 ) -> SomeValue {
-    // unaryop.py:621-623 — check_negative_slice(start,end,"find") → SomeInteger().
+    // unaryop.py — check_negative_slice(start,end,"find") → SomeInteger().
     if let (Some(start), Some(end)) = (s_start, s_end) {
         check_negative_slice(start, end, "find");
     }
@@ -2643,7 +2643,7 @@ fn char_method_isupper(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValu
     SomeValue::Bool(SomeBool::new())
 }
 
-/// RPython `SomeObject.find_method(self, name)` (unaryop.py:206-213).
+/// RPython `SomeObject.find_method(self, name)` (unaryop.py).
 pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinMethod> {
     let analyser_name = match s_self {
         SomeValue::List(_) => match name {
@@ -2754,7 +2754,7 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "isalnum" => "str_method_isalnum",
             _ => return None,
         },
-        // unaryop.py:830 — `method_next = next` on SomeIterator.  Lets
+        // unaryop.py — `method_next = next` on SomeIterator.  Lets
         // `getattr(iter, "next")` (emitted by `next_SomeInstance` when an
         // `OpKind::Next` lowers on an instance-shaped receiver that later
         // refines to an iterator) resolve to a bound builtin method instead
@@ -2865,7 +2865,7 @@ pub(crate) fn call_builtin_method(
     let (args_s, kwds) = args
         .unpack()
         .map_err(|err| AnnotatorError::new(err.getmsg()))?;
-    // `unaryop.py:961-967 SomeBuiltinMethod.call` passes args_s
+    // `unaryop.py SomeBuiltinMethod.call` passes args_s
     // through `bookkeeper.consider_call_site` and into the analyser
     // body.  Optional-default methods (list.pop(s_index=None),
     // dict.pop(s_dfl=None), str.find(start=None, end=None)) accept
@@ -3548,7 +3548,7 @@ pub(crate) fn call_builtin_method(
             };
             ann.bookkeeper.project_pyre_field_type("PyObjectRef")
         }
-        // unaryop.py:818-830 — `next(self)` / `method_next = next`.  The
+        // unaryop.py — `next(self)` / `method_next = next`.  The
         // bound iterator is the receiver; next takes no positional args and
         // returns the element type via the shared `someiterator_next` body
         // (same analyser as the `OpKind::Next` specialization).
@@ -3576,7 +3576,7 @@ pub(crate) fn call_builtin_method(
 }
 
 // =====================================================================
-// unaryop.py:806-830 — class __extend__(SomeIterator)
+// unaryop.py — class __extend__(SomeIterator)
 // =====================================================================
 
 fn init_someiterator_overrides(
@@ -3585,7 +3585,7 @@ fn init_someiterator_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:808-810 — iter(self): return self. can_only_throw=[].
+    // unaryop.py — iter(self): return self. can_only_throw=[].
     register(
         reg,
         OpKind::Iter,
@@ -3595,7 +3595,7 @@ fn init_someiterator_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:818-830 — next(self):
+    // unaryop.py — next(self):
     //   position = getbookkeeper().position_key
     //   if s_None.contains(self.s_container): return s_ImpossibleValue
     //   if self.variant and self.variant[0] == "enumerate":
@@ -3618,7 +3618,7 @@ fn init_someiterator_overrides(
                 someiterator_next(ann, &it)
             }),
             can_only_throw: CanOnlyThrow::Callable(Box::new(|args_s| {
-                // upstream `_can_only_throw` (unaryop.py:812-816):
+                // upstream `_can_only_throw` (unaryop.py):
                 //   can_throw = [StopIteration]
                 //   if isinstance(self.s_container, SomeDict):
                 //       can_throw.append(RuntimeError)
@@ -3635,7 +3635,7 @@ fn init_someiterator_overrides(
     );
 }
 
-/// RPython `SomeIterator.next(self)` (unaryop.py:818-828). Extracted
+/// RPython `SomeIterator.next(self)` (unaryop.py). Extracted
 /// into a free function so `list_method_extend` (unaryop.py:363-369)
 /// can call `s_iterable.iter().next()` directly without going through
 /// the HLOperation dispatch framework — upstream also calls it as a
@@ -3669,10 +3669,10 @@ fn someiterator_next(ann: &RPythonAnnotator, it: &SomeIterator) -> SomeValue {
 /// once for the default branch (variant = `it.variant`).
 ///
 /// Upstream definitions:
-/// * SomeTuple (unaryop.py:341-342): `unionof(*self.items)`.
+/// * SomeTuple (unaryop.py): `unionof(*self.items)`.
 /// * SomeList (unaryop.py:402-403):  `self.listdef.read_item(position)`.
 /// * SomeDict (unaryop.py:480-500):  variant-dispatched.
-/// * SomeStringOrUnicode (unaryop.py:664-665): `self.basecharclass()`.
+/// * SomeStringOrUnicode (unaryop.py): `self.basecharclass()`.
 pub(crate) fn container_getanyitem(
     s_container: &SomeValue,
     variant: Option<&str>,
@@ -3734,7 +3734,7 @@ pub(crate) fn container_getanyitem(
                 other => panic!("getanyitem(dict): unknown variant {other:?}"),
             }
         }
-        // unaryop.py:664-665 — `SomeStringOrUnicode.getanyitem` returns
+        // unaryop.py — `SomeStringOrUnicode.getanyitem` returns
         // `self.basecharclass()`. model.py:326-329 assigns
         //   SomeString.basecharclass = SomeChar
         //   SomeUnicodeString.basecharclass = SomeUnicodeCodePoint
@@ -3749,7 +3749,7 @@ pub(crate) fn container_getanyitem(
 }
 
 // =====================================================================
-// unaryop.py:970-998 — class __extend__(SomePBC)
+// unaryop.py — class __extend__(SomePBC)
 // =====================================================================
 
 fn init_somepbc_overrides(
@@ -3758,7 +3758,7 @@ fn init_somepbc_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:982-983 — setattr raises.
+    // unaryop.py — setattr raises.
     register(
         reg,
         OpKind::SetAttr,
@@ -3770,7 +3770,7 @@ fn init_somepbc_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:997-998 — len raises.
+    // unaryop.py — len raises.
     register(
         reg,
         OpKind::Len,
@@ -3783,7 +3783,7 @@ fn init_somepbc_overrides(
 }
 
 // =====================================================================
-// lltype.py:1566-1570 — SomePtr.bool
+// lltype.py — SomePtr.bool
 // =====================================================================
 
 fn init_someptr_overrides(
@@ -3827,7 +3827,7 @@ fn init_someptr_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // llmemory.py:582-586 — SomeAddress.getattr(self, s_attr).
+    // llmemory.py — SomeAddress.getattr(self, s_attr).
     register(
         reg,
         OpKind::GetAttr,
@@ -3849,7 +3849,7 @@ fn init_someptr_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // llmemory.py:588-589 — SomeAddress.bool(self) → s_Bool.
+    // llmemory.py — SomeAddress.bool(self) → s_Bool.
     register(
         reg,
         OpKind::Bool,
@@ -3894,7 +3894,7 @@ fn init_someptr_overrides(
         OpKind::SetAttr,
         SomeValueTag::Ptr,
         Specialization {
-            // lltype.py:1557-1564 — SomePtr.setattr "just doing checking",
+            // lltype.py — SomePtr.setattr "just doing checking",
             // returns None (void).
             apply: Box::new(|ann, hl| {
                 let s = ann
@@ -3925,7 +3925,7 @@ fn init_someptr_overrides(
 }
 
 // =====================================================================
-// unaryop.py:1000-1021 — class __extend__(SomeNone)
+// unaryop.py — class __extend__(SomeNone)
 // =====================================================================
 
 fn init_somenone_overrides(
@@ -3934,7 +3934,7 @@ fn init_somenone_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:1004-1006 — getattr: s_ImpossibleValue, can_only_throw=[].
+    // unaryop.py — getattr: s_ImpossibleValue, can_only_throw=[].
     register(
         reg,
         OpKind::GetAttr,
@@ -3944,7 +3944,7 @@ fn init_somenone_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:1008-1009 — setattr: return None (void).
+    // unaryop.py — setattr: return None (void).
     register(
         reg,
         OpKind::SetAttr,
@@ -3954,7 +3954,7 @@ fn init_somenone_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
-    // unaryop.py:1011-1012 — call / simple_call / call_args: s_ImpossibleValue.
+    // unaryop.py — call / simple_call / call_args: s_ImpossibleValue.
     for op in &[OpKind::SimpleCall, OpKind::CallArgs] {
         register(
             reg,
@@ -3966,7 +3966,7 @@ fn init_somenone_overrides(
             },
         );
     }
-    // unaryop.py:1017-1021 — len(self): SomeImpossibleValue.
+    // unaryop.py — len(self): SomeImpossibleValue.
     register(
         reg,
         OpKind::Len,
@@ -3979,7 +3979,7 @@ fn init_somenone_overrides(
 }
 
 // =====================================================================
-// unaryop.py:833-865 — class __extend__(SomeInstance)
+// unaryop.py — class __extend__(SomeInstance)
 // =====================================================================
 
 fn init_someinstance_overrides(
@@ -3988,7 +3988,7 @@ fn init_someinstance_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:833-842 — SomeInstance.getattr(self, s_attr).
+    // unaryop.py — SomeInstance.getattr(self, s_attr).
     //
     //   def getattr(self, s_attr):
     //       if not(s_attr.is_constant() and isinstance(s_attr.const, str)):
@@ -4037,7 +4037,7 @@ fn init_someinstance_overrides(
                 // callable bound method — returning a bare `SomeBool`
                 // would seat a non-callable in the simple_call callee
                 // slot.  Upstream keeps this on `SomePtr.getattr`
-                // (lltype.py:1531) and `SomeInstance.getattr`
+                // (lltype.py) and `SomeInstance.getattr`
                 // (unaryop.py:833) never sees it; pyre carries both
                 // erased pointers (classdef-less) and `cast_pointer`-
                 // typed receivers (`SomeInstance(cd)` from `obj as
@@ -4065,7 +4065,7 @@ fn init_someinstance_overrides(
                 }
                 // `to_exc_object` — `PyError`'s exception-object
                 // materialization (error.rs `to_exc_object`), the
-                // `rpyexc_raise` analog (exceptiontransform.py:347-354).  The
+                // `rpyexc_raise` analog (exceptiontransform.py).  The
                 // result_exc `?`-lowering mints it as a
                 // `Method{receiver_root: "PyError"}` residual (result_exc.rs)
                 // the codewriter resolves through `for_impl_method` to the real
@@ -4163,7 +4163,7 @@ fn init_someinstance_overrides(
                              record_getattr failed: {err:?}"
                         )
                     });
-                // unaryop.py:841 — `return self.classdef.s_getattr(attr, self.flags)`.
+                // unaryop.py — `return self.classdef.s_getattr(attr, self.flags)`.
                 let s_attr = super::classdesc::ClassDef::s_getattr(classdef, &attr, &inst.flags)
                     .unwrap_or_else(|err| {
                         panic!("AnnotatorError: SomeInstance.s_getattr({attr:?}) failed: {err:?}")
@@ -4206,7 +4206,7 @@ fn init_someinstance_overrides(
             can_only_throw: CanOnlyThrow::List(vec![]),
         },
     );
-    // unaryop.py:844-859 — SomeInstance.setattr.
+    // unaryop.py — SomeInstance.setattr.
     //
     //   def setattr(self, s_attr, s_obj):
     //       if s_attr.is_constant() and isinstance(s_attr.const, str):
@@ -4224,7 +4224,7 @@ fn init_someinstance_overrides(
     //
     // The success path records the write and falls through with no
     // return → None (void); a non-constant attr raises. (The base
-    // `SomeObject.setattr` at unaryop.py:231-232 is the one that returns
+    // `SomeObject.setattr` at unaryop.py is the one that returns
     // `s_ImpossibleValue`; this `SomeInstance` override does not.)
     register(
         reg,
@@ -4276,7 +4276,7 @@ fn init_someinstance_overrides(
                         )
                     }
                 };
-                // unaryop.py:847 — `clsdef = self.classdef.locate_attribute(attr)`.
+                // unaryop.py — `clsdef = self.classdef.locate_attribute(attr)`.
                 let clsdef = super::classdesc::ClassDef::locate_attribute(&classdef, &attr)
                     .unwrap_or_else(|err| {
                         panic!(
@@ -4311,7 +4311,7 @@ fn init_someinstance_overrides(
                 };
                 let already_contains = s_value.contains(&s_obj);
                 if !already_contains {
-                    // unaryop.py:854 — `clsdef.generalize_attr(attr, s_obj)`.
+                    // unaryop.py — `clsdef.generalize_attr(attr, s_obj)`.
                     super::classdesc::ClassDef::generalize_attr(
                         &clsdef,
                         &attr,
@@ -4347,7 +4347,7 @@ fn init_someinstance_overrides(
 }
 
 // =====================================================================
-// unaryop.py:1032-1037 — class __extend__(SomeWeakRef)
+// unaryop.py — class __extend__(SomeWeakRef)
 // =====================================================================
 
 fn init_someweakref_overrides(
@@ -4356,7 +4356,7 @@ fn init_someweakref_overrides(
         std::collections::HashMap<SomeValueTag, Specialization>,
     >,
 ) {
-    // unaryop.py:1033-1037 — simple_call(self):
+    // unaryop.py — simple_call(self):
     //   if classdef is None: return s_None (dead weakref)
     //   else: SomeInstance(classdef, can_be_None=True)
     register(
@@ -4393,7 +4393,7 @@ fn _keep_imports_live() {
 }
 
 // =====================================================================
-// unaryop.py:120-139 — @op.call_args.register_transform(SomeObject)
+// unaryop.py — @op.call_args.register_transform(SomeObject)
 // =====================================================================
 //
 // Upstream rewrites `op.call_args(v_func, v_shape, *data_v)` when the
@@ -4473,7 +4473,7 @@ fn init_object_call_args_transform(
         std::collections::HashMap<SomeValueTag, Transformation>,
     >,
 ) {
-    // unaryop.py:120-139 — @op.call_args.register_transform(SomeObject).
+    // unaryop.py — @op.call_args.register_transform(SomeObject).
     // ```python
     // def transform_varargs(annotator, v_func, v_shape, *data_v):
     //     callspec = CallSpec.fromshape(v_shape.value, list(data_v))
@@ -4545,7 +4545,7 @@ fn encode_call_shape(shape: &super::super::flowspace::argument::CallShape) -> Co
 }
 
 // =====================================================================
-// unaryop.py:867-892 — @op.{len,iter,next,getslice,setslice}.register_transform(SomeInstance)
+// unaryop.py — @op.{len,iter,next,getslice,setslice}.register_transform(SomeInstance)
 // =====================================================================
 
 /// Helper — build a new [`HLOperation`] with a fresh result variable,
@@ -4554,7 +4554,7 @@ fn mk_hlop(kind: OpKind, args: Vec<Hlvalue>) -> HLOperation {
     HLOperation::new(kind, args)
 }
 
-/// RPython `_find_property_meth(s_obj, attr, meth)` (unaryop.py:895-906).
+/// RPython `_find_property_meth(s_obj, attr, meth)` (unaryop.py).
 ///
 /// Walks `s_obj.classdef.getmro()` and collects the `property` descriptor's
 /// `fget` / `fset` / `fdel` method reference for `attr`. Returns `None`
@@ -4707,35 +4707,35 @@ fn init_instance_single_transform(
 ) {
     super::binaryop::init_contains_instance_transform(reg);
 
-    // unaryop.py:867-870 — len(v_arg) -> [getattr(v_arg, '__len__'), simple_call(getattr.result)]
+    // unaryop.py — len(v_arg) -> [getattr(v_arg, '__len__'), simple_call(getattr.result)]
     register_transform(
         reg,
         OpKind::Len,
         SomeValueTag::Instance,
         Box::new(len_SomeInstance),
     );
-    // unaryop.py:872-875 — iter
+    // unaryop.py — iter
     register_transform(
         reg,
         OpKind::Iter,
         SomeValueTag::Instance,
         Box::new(iter_SomeInstance),
     );
-    // unaryop.py:877-880 — next
+    // unaryop.py — next
     register_transform(
         reg,
         OpKind::Next,
         SomeValueTag::Instance,
         Box::new(next_SomeInstance),
     );
-    // unaryop.py:882-885 — getslice
+    // unaryop.py — getslice
     register_transform(
         reg,
         OpKind::GetSlice,
         SomeValueTag::Instance,
         Box::new(getslice_SomeInstance),
     );
-    // unaryop.py:888-892 — setslice
+    // unaryop.py — setslice
     register_transform(
         reg,
         OpKind::SetSlice,
@@ -4745,7 +4745,7 @@ fn init_instance_single_transform(
 }
 
 // =====================================================================
-// unaryop.py:909-936 — @op.{getattr,setattr}.register_transform(SomeInstance)
+// unaryop.py — @op.{getattr,setattr}.register_transform(SomeInstance)
 // =====================================================================
 
 /// RPython `getattr_SomeInstance` / `setattr_SomeInstance`
@@ -4838,14 +4838,14 @@ fn init_instance_attr_transform(
         std::collections::HashMap<SomeValueTag, Transformation>,
     >,
 ) {
-    // unaryop.py:909-921 — getattr
+    // unaryop.py — getattr
     register_transform(
         reg,
         OpKind::GetAttr,
         SomeValueTag::Instance,
         Box::new(getattr_SomeInstance),
     );
-    // unaryop.py:924-936 — setattr_SomeInstance.
+    // unaryop.py — setattr_SomeInstance.
     //
     //   if not s_attr.is_constant() or not isinstance(s_attr.const, str): return
     //
@@ -4993,7 +4993,7 @@ mod tests {
 
     #[test]
     fn transform_len_someinstance_rewrites_to_getattr_plus_simple_call() {
-        // unaryop.py:867-870 — `op.len(v_ins)` → [getattr(v_ins, '__len__'), simple_call(r)].
+        // unaryop.py — `op.len(v_ins)` → [getattr(v_ins, '__len__'), simple_call(r)].
         use super::super::classdesc::ClassDef;
         use super::super::model::SomeInstance;
 
@@ -5209,7 +5209,7 @@ mod tests {
 
     #[test]
     fn transform_getitem_someinstance_rewrites_to_getattr_plus_simple_call() {
-        // binaryop.py:727-730 — `op.getitem(v_ins, v_idx)` → getattr + simple_call.
+        // binaryop.py — `op.getitem(v_ins, v_idx)` → getattr + simple_call.
         use super::super::classdesc::ClassDef;
         use super::super::model::{SomeInstance, SomeInteger};
 
@@ -5240,7 +5240,7 @@ mod tests {
 
     #[test]
     fn consider_someobject_len_returns_nonneg_integer() {
-        // unaryop.py:158-159 — default len returns SomeInteger(nonneg=True).
+        // unaryop.py — default len returns SomeInteger(nonneg=True).
         let (hl, ann) = hl1(OpKind::Len, SomeValue::object());
         let r = hl.consider(&ann).unwrap().unwrap();
         match r {
@@ -5363,7 +5363,7 @@ mod tests {
             Array, LowLevelType, Ptr, PtrTarget,
         };
 
-        // upstream `SomePtr.len()` (lltype.py:1550-1555) propagates
+        // upstream `SomePtr.len()` (lltype.py) propagates
         // `_fixedlength`'s `len()` probe, which raises `TypeError` on
         // non-array pointers. Use an Array ptr so the override returns
         // `SomeInteger(nonneg=True)` (the varsize-array path).
@@ -5496,7 +5496,7 @@ mod tests {
 
     #[test]
     fn consider_sometuple_len_is_constant() {
-        // unaryop.py:334-335 — len returns immutablevalue(len(items)).
+        // unaryop.py — len returns immutablevalue(len(items)).
         let (hl, ann) = hl1(
             OpKind::Len,
             SomeValue::Tuple(SomeTuple::new(vec![
@@ -5538,7 +5538,7 @@ mod tests {
 
     #[test]
     fn consider_someobject_pos_returns_impossible() {
-        // unaryop.py:252-254 — default pos returns s_ImpossibleValue.
+        // unaryop.py — default pos returns s_ImpossibleValue.
         let (hl, ann) = hl1(OpKind::Pos, SomeValue::object());
         let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
@@ -5604,7 +5604,7 @@ mod tests {
 
     #[test]
     fn consider_somestring_len_const_returns_const_int() {
-        // unaryop.py:720-725 — len(const "abc") → SomeInteger(const=3).
+        // unaryop.py — len(const "abc") → SomeInteger(const=3).
         let mut s = SomeString::new(false, false);
         s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("abc")));
         let (hl, ann) = hl1(OpKind::Len, SomeValue::String(s));
@@ -5620,7 +5620,7 @@ mod tests {
 
     #[test]
     fn consider_somechar_len_is_const_1() {
-        // unaryop.py:771-774 — SomeChar.len() → immutablevalue(1).
+        // unaryop.py — SomeChar.len() → immutablevalue(1).
         let (hl, ann) = hl1(
             OpKind::Len,
             SomeValue::Char(super::super::model::SomeChar::new(false)),
@@ -5650,7 +5650,7 @@ mod tests {
 
     #[test]
     fn consider_someiterator_iter_returns_self() {
-        // unaryop.py:808-810 — iter on iterator returns self.
+        // unaryop.py — iter on iterator returns self.
         let ann = mk_ann();
         let it = SomeIterator::new(SomeValue::Tuple(SomeTuple::new(vec![])), vec![]);
         let mut v = Variable::named("it");
@@ -5702,7 +5702,7 @@ mod tests {
 
     #[test]
     fn consider_someiterator_next_reversed_acts_as_default() {
-        // upstream unaryop.py:826-827 — `("reversed",)` collapses to ().
+        // upstream unaryop.py — `("reversed",)` collapses to ().
         let ann = mk_ann();
         let it = SomeIterator::new(
             SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Integer(
@@ -6045,7 +6045,7 @@ mod tests {
         // The ptr-method arm answers a classed receiver (`SomeInstance(cd)`
         // from `cast_pointer`) only while the class hierarchy defines no
         // `is_null` of its own — a real classdict member keeps upstream's
-        // `SomeInstance.getattr` classdef dispatch (unaryop.py:833).
+        // `SomeInstance.getattr` classdef dispatch (unaryop.py).
         use super::super::classdesc::{ClassDef, ClassDictEntry};
         use super::super::model::SomeInstance;
         let ann = mk_ann();

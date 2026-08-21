@@ -23,7 +23,7 @@ pub struct FloatArray {
     /// form ([`FloatArray::empty`]), where the live length and the allocated
     /// capacity are both zero.
     pub block: *mut TypedItemsBlock,
-    /// Live length (rlist.py:116 `("length", Signed)`).
+    /// Live length (rlist.py `("length", Signed)`).
     len: usize,
 }
 
@@ -111,7 +111,7 @@ impl FloatArray {
 
     /// Store the live length without touching the block. The caller must
     /// guarantee `new_len <= heap_capacity()` (the no-resize precondition);
-    /// mirrors `_ll_list_resize_ge`'s `l.length = newsize` (rlist.py:293).
+    /// mirrors `_ll_list_resize_ge`'s `l.length = newsize` (rlist.py).
     /// Enforced here because this is safe/public: a `len` past the allocated
     /// capacity would make `as_slice`/`as_mut_slice` build out-of-bounds
     /// slices (UB).

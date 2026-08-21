@@ -200,7 +200,7 @@ pub unsafe extern "C" fn PySequence_GetSlice(
     result(crate::baseobjspace::getitem(object, slice))
 }
 
-/// `PySequence_SetSlice(o, low, high, value)` (`sequence.py:127-132`).
+/// `PySequence_SetSlice(o, low, high, value)` (`sequence.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_SetSlice(
     object: *mut CPyObject,
@@ -217,7 +217,7 @@ pub unsafe extern "C" fn PySequence_SetSlice(
     if trap(assigned).is_none() { -1 } else { 0 }
 }
 
-/// `PySequence_DelSlice(o, low, high)` (`sequence.py:134-139`).
+/// `PySequence_DelSlice(o, low, high)` (`sequence.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_DelSlice(
     object: *mut CPyObject,
@@ -308,7 +308,7 @@ pub unsafe extern "C" fn PySequence_Fast(
     }
 }
 
-/// `PySequence_Fast_GET_SIZE(o)` (`sequence.py:83-98`).
+/// `PySequence_Fast_GET_SIZE(o)` (`sequence.py`).
 ///
 /// A function rather than the macro the reference header spells: a mirror has
 /// no item array of its own, so the length comes from the interpreter object.
@@ -321,7 +321,7 @@ pub unsafe extern "C" fn PySequence_Fast_GET_SIZE(object: *mut CPyObject) -> isi
     unsafe { super::listobject::PyList_Size(object) }
 }
 
-/// `PySequence_Fast_GET_ITEM(o, index)` — borrowed (`sequence.py:68-81`).
+/// `PySequence_Fast_GET_ITEM(o, index)` — borrowed (`sequence.py`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PySequence_Fast_GET_ITEM(
     object: *mut CPyObject,

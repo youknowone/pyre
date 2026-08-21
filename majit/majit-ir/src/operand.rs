@@ -1,7 +1,7 @@
 //! `Operand` — the operand-union carrier for `Op.args` /
 //! `Op.fail_args` (#9).
 //!
-//! `resoperation.py:281` `N_aryOp._args` stores operands as the
+//! `resoperation.py` `N_aryOp._args` stores operands as the
 //! `AbstractValue` objects themselves — a result op, an input arg, or a
 //! constant — with no integer-position indirection. `Operand` is the Rust
 //! shape of that: a strong-ref union carrying the producer directly, so
@@ -45,15 +45,15 @@ pub enum Operand {
     Op(OpRc),
     /// An input-arg producer (`resoperation.py` `AbstractInputArg`).
     InputArg(InputArgRc),
-    /// A constant (`history.py:227/268/314` `ConstInt`/`ConstFloat`/
+    /// A constant (`history.py/268/314` `ConstInt`/`ConstFloat`/
     /// `ConstPtr`). The value lives in an `Rc<Cell<Value>>`: the `Cell` lets
     /// the GC root walker forward an inline `ConstPtr` `GcRef` in place
     /// through a shared `&self` borrow of `Op.args` (`walk_const_ptr_refs`
     /// get/visit/set cycle), and the `Rc` gives the const an object identity
-    /// — `==` is `Rc::ptr_eq` (resoperation.py:29-39 `AbstractValue` keys by
+    /// — `==` is `Rc::ptr_eq` (resoperation.py `AbstractValue` keys by
     /// `is`), so two distinct `const_` mints compare unequal while a clone
     /// shares the same const object (`getarglist_copy` reuses the same
-    /// `Const`). Value equality is the opt-in `same_constant` (history.py:211),
+    /// `Const`). Value equality is the opt-in `same_constant` (history.py),
     /// surfaced as [`same_box`](Self::same_box). This is the same shared-cell
     /// in-place-forward contract the const-kind `Forwarded::Const(Const)`
     /// carrier provided. The forwarding visitor is
@@ -84,7 +84,7 @@ impl Operand {
     }
 
     /// A constant operand straight from a [`Value`] — the successor to
-    /// a fresh `Rc<Cell<Value>>` const identity (`history.py:220` `ConstInt`).
+    /// a fresh `Rc<Cell<Value>>` const identity (`history.py` `ConstInt`).
     pub fn const_from_value(value: Value) -> Operand {
         Operand::Const(Rc::new(Cell::new(value)))
     }
@@ -199,7 +199,7 @@ impl Operand {
         }
     }
 
-    /// The inline constant value (`history.py:233` `Const.getint` family),
+    /// The inline constant value (`history.py` `Const.getint` family),
     /// `None` for non-`Const`.
     pub fn const_value(&self) -> Option<Value> {
         match self {
@@ -208,10 +208,10 @@ impl Operand {
         }
     }
 
-    /// `history.py:803 IntFrontendOp(pos, intval)` parity — read the
+    /// `history.py IntFrontendOp(pos, intval)` parity — read the
     /// concrete intrinsic value off this operand. `Const` reads its inline
     /// cell; a bound `Op` / `InputArg` reads the producer's value carrier
-    /// (`resoperation.py:566 IntOp._resint`); `None` carries no value.
+    /// (`resoperation.py IntOp._resint`); `None` carries no value.
     /// `history.py` concrete-value read.
     pub fn get_value(&self) -> Option<Value> {
         match self {
@@ -234,7 +234,7 @@ impl Operand {
         }
     }
 
-    /// `resoperation.py:47 is_constant`.
+    /// `resoperation.py is_constant`.
     pub fn is_constant(&self) -> bool {
         matches!(self, Operand::Const(_))
     }
@@ -252,9 +252,9 @@ impl Operand {
         matches!(self, Operand::None)
     }
 
-    /// `resoperation.py:38 AbstractValue.same_box`: pointer identity
+    /// `resoperation.py AbstractValue.same_box`: pointer identity
     /// (`Rc::ptr_eq`) for `Op` / `InputArg`, value comparison for `Const`
-    /// (`history.py:211 Const.same_box` delegates to `same_constant`), and the
+    /// (`history.py Const.same_box` delegates to `same_constant`), and the
     /// `None` sentinel matches only itself. Native dispatch on the operand
     /// union: two operands carrying the same producer `Rc` are `ptr_eq`; two
     /// `Const` operands compare by value (`Value`'s `==` is bit-exact, so
@@ -275,13 +275,13 @@ impl Operand {
         }
     }
 
-    /// `resoperation.py:58-70 get_box_replacement(not_const=False)`.
+    /// `resoperation.py get_box_replacement(not_const=False)`.
     ///
     /// Walk the `_forwarded` chain from this operand, returning the operand
     /// one step before the chain hits `None`, an `Info` instance, or (when
     /// `not_const`) a constant. Only `Op` / `InputArg` carry a `_forwarded`
     /// slot (`AbstractResOpOrInputArg`); `Const` / `None` are terminal
-    /// (`resoperation.py:62 while isinstance(op, AbstractResOpOrInputArg)`).
+    /// (`resoperation.py while isinstance(op, AbstractResOpOrInputArg)`).
     /// This is the canonical walker; the former box-wrapper `get_box_replacement`
     /// delegates here.
     pub fn get_box_replacement(&self, not_const: bool) -> Operand {
@@ -366,10 +366,10 @@ impl Operand {
         }
     }
 
-    /// `resoperation.py:237 get_forwarded`. Clone of the canonical
+    /// `resoperation.py get_forwarded`. Clone of the canonical
     /// `_forwarded` slot routed through the carried `Op` / `InputArg`; `Const`
     /// and `None` return `Forwarded::None`. Successor to
-    /// `resoperation.py:237 get_forwarded`.
+    /// `resoperation.py get_forwarded`.
     pub fn get_forwarded(&self) -> Forwarded {
         self.read_forwarding_host(Forwarded::None, |h| h.get_forwarded())
     }
@@ -401,7 +401,7 @@ impl Operand {
         });
     }
 
-    /// `optimizer.py:432 make_constant(box, constbox)` — terminates the chain
+    /// `optimizer.py make_constant(box, constbox)` — terminates the chain
     /// in a value-typed payload. Routes to
     /// [`ForwardingHost::set_forwarded_const`].
     pub fn set_forwarded_const(&self, value: Const) {
@@ -413,7 +413,7 @@ impl Operand {
         self.with_forwarding_host("set_forwarded_const", |h| h.set_forwarded_const(value));
     }
 
-    /// `resoperation.py:53 set_forwarded(forwarded_to)` — `Info` target.
+    /// `resoperation.py set_forwarded(forwarded_to)` — `Info` target.
     /// Routes to [`ForwardingHost::set_forwarded_info`].
     pub fn set_forwarded_info(&self, info: OpInfo) {
         assert!(
@@ -452,9 +452,9 @@ impl Operand {
         self.read_forwarding_host(None, |h| h.ptr_info_mut())
     }
 
-    /// `optimizer.py:99-113 getintbound` reader: the inner `IntBound` when
+    /// `optimizer.py getintbound` reader: the inner `IntBound` when
     /// `_forwarded` is `Info(OpInfo::IntBound(_))`, else `None`. Mirror of
-    /// `optimizer.py:99-113 getintbound`.
+    /// `optimizer.py getintbound`.
     pub fn int_bound(&self) -> Option<IntBoundBorrow> {
         self.read_forwarding_host(None, |h| h.int_bound())
     }
@@ -510,7 +510,7 @@ impl PartialEq for Operand {
     /// that producer/const handle; two `none()` sentinels match (Python's
     /// singleton `None`). Equal-valued constants minted separately are NOT
     /// equal here — value equality is the opt-in [`same_box`](Self::same_box)
-    /// (`history.py:211`), never `==`, so a `same_box`-deduping table must
+    /// (`history.py`), never `==`, so a `same_box`-deduping table must
     /// build an explicit value-keyed map, not key on `Operand`.
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

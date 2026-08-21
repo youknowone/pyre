@@ -17,9 +17,9 @@ use crate::pyobject::*;
 /// - `ob_type`: always &INSTANCE_TYPE (for is_instance() checks)
 /// - `w_class`: pointer to the W_TypeObject this is an instance of
 /// - `map`: the attribute map (`AbstractAttribute` chain) — the
-///   `self.map` of `MapdictStorageMixin` (`mapdict.py:907`)
+///   `self.map` of `MapdictStorageMixin` (`mapdict.py`)
 /// - `storage`: the per-instance attribute storage list — the
-///   `self.storage` of `MapdictStorageMixin` (`mapdict.py:910`)
+///   `self.storage` of `MapdictStorageMixin` (`mapdict.py`)
 ///
 /// The Python class is stored in `ob_header.w_class`, shared with all
 /// other object types. RPython stores this in `typeptr` (rclass.py).
@@ -44,7 +44,7 @@ pub struct W_ObjectObject {
     pub map: usize,
     /// `self.storage` (`mapdict.py:910`) — a `Ptr(GcArray(OBJECTPTR))` block of
     /// attribute values (`ItemsBlock`, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID`).
-    /// null = `None`, the `_mapdict_init_empty` empty state (`mapdict.py:910`).
+    /// null = `None`, the `_mapdict_init_empty` empty state (`mapdict.py`).
     /// The block is a mixed boxed/unboxed array; the mapdict layer
     /// (`pyre-interpreter`) reads/writes it through `crate::object_array`
     /// helpers, and `object_object_custom_trace` walks its boxed slots.
@@ -79,7 +79,7 @@ pub const W_OBJECT_OBJECT_GC_TYPE_ID: u32 = 53;
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
 )]
 pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
-    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`) for
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py`) for
     // the allocation below. `w_type` is a `W_TypeObject`
     // (`pyre-object::typeobject` GC type id 33) — user-defined types
     // are stable old-gen GC objects, so the pinned typeptr remains a live,
@@ -94,7 +94,7 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
             ob_type: &INSTANCE_TYPE as *const PyType,
             w_class: w_type,
         },
-        // `mapdict.py:758-761 user_setup` → `_mapdict_init_empty(
+        // `mapdict.py user_setup` → `_mapdict_init_empty(
         // w_subtype.terminator)` (`mapdict.py:908-910`): the instance map is
         // the owning type's terminator from construction, and `storage = None`.
         //

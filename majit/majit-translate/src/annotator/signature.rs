@@ -24,7 +24,7 @@
 //!   [`crate::translator::rtyper::extregistry::is_registered`]; per-entry
 //!   coverage extends as registrations land.
 //! * `extregistry` type-level branch (`annotationoftype`
-//!   signature.py:98-100) — wired below in [`annotationoftype`] via
+//!   signature.py) — wired below in [`annotationoftype`] via
 //!   [`crate::translator::rtyper::extregistry::is_registered_type`] /
 //!   `lookup_type`.
 //! * `lltype.LowLevelType` branch (`_compute_annotation`
@@ -34,7 +34,7 @@
 //!   `LowLevelType` instance) still needs the matching
 //!   `SomeLowLevelType` variant on [`super::model::SomeValue`] before
 //!   wire-up.
-//! * `_annotation_cache` memoization (signature.py:13, 30-38) —
+//! * `_annotation_cache` memoization (signature.py, 30-38) —
 //!   skipped; callers re-compute on every call. Performance-only;
 //!   correctness matches upstream.
 
@@ -82,19 +82,19 @@ pub enum AnnotationSpec {
     /// (signature.py:103-104). The qualified name is preserved by the
     /// carried [`HostObject`] (`.qualname()`).
     UserClass(HostObject),
-    /// `[X]` — list-of-X annotation (signature.py:61-64).
+    /// `[X]` — list-of-X annotation (signature.py).
     List(Box<AnnotationSpec>),
     /// `{K: V}` — dict-with-K-keys-and-V-values annotation
     /// (signature.py:67-70).
     Dict(Box<AnnotationSpec>, Box<AnnotationSpec>),
-    /// `(X, Y, ...)` — tuple annotation (signature.py:65-66).
+    /// `(X, Y, ...)` — tuple annotation (signature.py).
     Tuple(Vec<AnnotationSpec>),
     /// Already-computed `SomeValue` — upstream `isinstance(t,
     /// SomeObject)` short-circuit (signature.py:57-58).
     Already(Box<SomeValue>),
 }
 
-/// RPython `class SignatureError(AnnotatorError)` (signature.py:149-150).
+/// RPython `class SignatureError(AnnotatorError)` (signature.py).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignatureError(pub String);
 
@@ -118,7 +118,7 @@ impl From<SignatureError> for AnnotatorError {
     }
 }
 
-/// RPython `_validate_annotation_size(t)` (signature.py:42-50).
+/// RPython `_validate_annotation_size(t)` (signature.py).
 ///
 /// Upstream rejects multi-element lists / dicts (which indicate an
 /// ill-formed annotation spec); tuples are always accepted regardless
@@ -130,7 +130,7 @@ fn validate_annotation_size(_spec: &AnnotationSpec) -> Result<(), SignatureError
     Ok(())
 }
 
-/// RPython `annotation(t, bookkeeper=None)` (signature.py:30-39).
+/// RPython `annotation(t, bookkeeper=None)` (signature.py).
 ///
 /// Upstream memoises lookups in `_annotation_cache` when
 /// `bookkeeper is None`; the Rust port skips the cache (perf-only,
@@ -142,7 +142,7 @@ pub fn annotation(
     compute_annotation(spec, bookkeeper)
 }
 
-/// RPython `_compute_annotation(t, bookkeeper=None)` (signature.py:53-78).
+/// RPython `_compute_annotation(t, bookkeeper=None)` (signature.py).
 fn compute_annotation(
     spec: &AnnotationSpec,
     bookkeeper: Option<&Rc<Bookkeeper>>,
@@ -192,7 +192,7 @@ fn compute_annotation(
     }
 }
 
-/// RPython `annotationoftype(t, bookkeeper=False)` (signature.py:80-106).
+/// RPython `annotationoftype(t, bookkeeper=False)` (signature.py).
 ///
 /// Builds the most-precise [`SomeValue`] for a plain Python type
 /// object. `bookkeeper` is `Some` when the caller has a live
@@ -267,7 +267,7 @@ pub fn annotationoftype(
         // List / Dict / Tuple / Already fall through here when the
         // caller entered via `annotationoftype` directly rather than
         // through `annotation`. Upstream's assertion at
-        // signature.py:85 — `assert isinstance(t, (type, types.ClassType))`
+        // signature.py — `assert isinstance(t, (type, types.ClassType))`
         // — rules out containers; map to SignatureError.
         _ => Err(SignatureError(format!(
             "annotationoftype: spec {spec:?} is not a type object"
@@ -275,7 +275,7 @@ pub fn annotationoftype(
     }
 }
 
-/// Upstream `Sig.argtypes[i]` element taxonomy (signature.py:118-134).
+/// Upstream `Sig.argtypes[i]` element taxonomy (signature.py).
 ///
 /// Each variant maps to one branch of upstream's dispatch loop:
 ///
@@ -293,7 +293,7 @@ pub fn annotationoftype(
 #[derive(Clone)]
 pub enum SigArgType {
     /// `types.FunctionType` / `types.MethodType` — upstream invokes
-    /// `argtype = argtype(*inputcells)` (signature.py:119-120) to
+    /// `argtype = argtype(*inputcells)` (signature.py) to
     /// resolve the real argtype at call time. The Rust port models
     /// the callable as a Rust closure that receives the inputcells
     /// and returns the resolved [`SigArgType`].
@@ -353,7 +353,7 @@ impl From<AnnotationSpec> for SigArgType {
     }
 }
 
-/// RPython `class Sig` (signature.py:108-147).
+/// RPython `class Sig` (signature.py).
 ///
 /// Carries the list of argument types declared via `@signature(...)`.
 /// [`Self::call`] walks `inputcells` against `argtypes`, branching per
@@ -420,7 +420,7 @@ impl Sig {
                 other => other.clone(),
             };
             match resolved {
-                // upstream signature.py:121-127 — `lltype.Void` branch:
+                // upstream signature.py — `lltype.Void` branch:
                 // assert the inputcell is a constant SomePBC/SomeNone,
                 // pass it through unchanged.
                 SigArgType::Void => {
@@ -437,12 +437,12 @@ impl Sig {
                     }
                     args_s.push(s_input.clone());
                 }
-                // upstream signature.py:128-129 — `argtype is None`:
+                // upstream signature.py — `argtype is None`:
                 // pass the inputcell through unchanged.
                 SigArgType::PassThrough => {
                     args_s.push(inputcells.get(i).cloned().unwrap_or(SomeValue::Impossible));
                 }
-                // upstream signature.py:130-132 — `argtype is NOT_CONSTANT`:
+                // upstream signature.py — `argtype is NOT_CONSTANT`:
                 // drop the constant tag via `not_const`.
                 SigArgType::NotConstant => {
                     let s_input = inputcells.get(i).cloned().unwrap_or(SomeValue::Impossible);
@@ -513,7 +513,7 @@ pub enum TypeMarker {
 }
 
 /// One entry in `enforce_signature_args.paramtypes` — the three
-/// shapes upstream `finish_type` dispatches on (signature.py:152-161).
+/// shapes upstream `finish_type` dispatches on (signature.py).
 pub enum ParamType {
     /// Already a `SomeObject` instance — upstream `isinstance(paramtype,
     /// SomeObject)` branch.
@@ -536,7 +536,7 @@ impl std::fmt::Debug for ParamType {
     }
 }
 
-/// RPython `finish_type(paramtype, bookkeeper, func)` (signature.py:152-161).
+/// RPython `finish_type(paramtype, bookkeeper, func)` (signature.py).
 ///
 /// Returns `Some(s)` when the paramtype resolves to a concrete
 /// annotation, `None` when it is an "any" marker (per upstream
@@ -877,7 +877,7 @@ mod tests {
 
     #[test]
     fn sig_call_rewrites_inputcells_to_declared_types() {
-        // upstream signature.py:113-147 — Sig.__call__ rebuilds inputcells
+        // upstream signature.py — Sig.__call__ rebuilds inputcells
         // from annotation(argtype, ...) when the arg contains the input.
         let bk = bk();
         let sig = Sig::from_specs(vec![AnnotationSpec::Int, AnnotationSpec::Bool]);
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn sig_call_passthrough_leaves_inputcell_untouched() {
-        // upstream signature.py:128-129 — `argtype is None`: inputcell
+        // upstream signature.py — `argtype is None`: inputcell
         // passes through unchanged. The Rust port models this as
         // `SigArgType::PassThrough` (distinct from Spec(Already(X))).
         let bk = bk();
@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn sig_call_not_constant_drops_const_box() {
-        // upstream signature.py:130-132 — `argtype is NOT_CONSTANT`:
+        // upstream signature.py — `argtype is NOT_CONSTANT`:
         // route the inputcell through `not_const`. For a constant
         // SomeInteger, the const_box should be cleared.
         let bk = bk();
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn sig_call_dynamic_callable_resolves_argtype() {
-        // upstream signature.py:119-120 — `argtype(*inputcells)` is
+        // upstream signature.py — `argtype(*inputcells)` is
         // invoked when the argtype is a FunctionType/MethodType. The
         // resolved argtype then drives the normal Spec/Void/… dispatch.
         let bk = bk();

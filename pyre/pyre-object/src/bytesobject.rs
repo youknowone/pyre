@@ -95,7 +95,7 @@ impl crate::lltype::GcType for W_BytesObject {
 /// through it and greys the box, mirroring `w_list_new`/`w_set_new`. Falls back
 /// to `malloc_typed`/`malloc_raw` when no GC hook is installed (unit tests).
 ///
-/// `dont_look_inside` (`rlib/jit.py:139`): the tracer cannot model the box
+/// `dont_look_inside` (`rlib/jit.py`): the tracer cannot model the box
 /// allocation, so the JIT residualises the call.
 #[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {

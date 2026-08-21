@@ -85,35 +85,35 @@ pub fn after_fork_child() {
 
 // ── attribute shapes (mapdict.py:32-42, 720-732) ──────────────────────
 
-/// mapdict.py:35 `NUM_DIGITS = 4`.
+/// mapdict.py `NUM_DIGITS = 4`.
 pub const NUM_DIGITS: u32 = 4;
-/// mapdict.py:36 `NUM_DIGITS_POW2 = 1 << NUM_DIGITS`.
+/// mapdict.py `NUM_DIGITS_POW2 = 1 << NUM_DIGITS`.
 ///
 /// Note: upstream multiplies by `NUM_DIGITS_POW2` rather than shifting by
-/// `NUM_DIGITS` so the result is known non-negative (mapdict.py:37-38).
+/// `NUM_DIGITS` so the result is known non-negative (mapdict.py).
 pub const NUM_DIGITS_POW2: usize = 1 << NUM_DIGITS;
 
 /// mapdict.py:40-42 — the maximum number of attributes stored in mapdict
 /// (afterwards just use a dict).
 pub const LIMIT_MAP_ATTRIBUTES: usize = 80;
 
-/// mapdict.py:30 `ALLOW_UNBOXING_INTS = LONG_BIT == 64`. pyre targets
+/// mapdict.py `ALLOW_UNBOXING_INTS = LONG_BIT == 64`. pyre targets
 /// 64-bit, so int unboxing is permitted.
 pub const ALLOW_UNBOXING_INTS: bool = usize::BITS == 64;
 
-/// mapdict.py:720 `DICT = 0` — attrkind for instance `__dict__` entries.
+/// mapdict.py `DICT = 0` — attrkind for instance `__dict__` entries.
 pub const DICT: u16 = 0;
-/// mapdict.py:721 `SPECIAL = 1` — attrkind for the `"dict"` / `"weakref"`
+/// mapdict.py `SPECIAL = 1` — attrkind for the `"dict"` / `"weakref"`
 /// special slots.
 pub const SPECIAL: u16 = 1;
-/// mapdict.py:722 `INVALID = 2` — sentinel attrkind for empty
+/// mapdict.py `INVALID = 2` — sentinel attrkind for empty
 /// `MapAttrCache` slots.
 pub const INVALID: u16 = 2;
-/// mapdict.py:723 `SLOTS_STARTING_FROM = 3` — attrkind for `__slots__`
+/// mapdict.py `SLOTS_STARTING_FROM = 3` — attrkind for `__slots__`
 /// slot `i` is `SLOTS_STARTING_FROM + i`.
 pub const SLOTS_STARTING_FROM: u16 = 3;
 
-/// mapdict.py:725-732 `attrkind_name`.
+/// mapdict.py `attrkind_name`.
 ///
 /// ```python
 /// def attrkind_name(attrkind):
@@ -142,40 +142,40 @@ pub fn attrkind_name(attrkind: u16) -> String {
 // `MapNode` enum (the enum-vs-hierarchy adaptation explicitly permitted by
 // the parity rules) so the recurring `isinstance(self, PlainAttribute)`
 // chain tests (mapdict.py:118-122,186) become a cheap `match`, and the three
-// Terminator subclasses become a `TerminatorKind` field (mapdict.py:357-418).
+// Terminator subclasses become a `TerminatorKind` field (mapdict.py).
 //
 // Map nodes are interned and shared per type (PyPy interns transitions so the
 // same attribute added from the same map yields the same child map); they are
 // never freed, so a node is referenced by a raw `*const MapNode` (`MapRef`)
 // and the few mutable fields (`ever_mutated`, `allow_unboxing`) use Cell.
 //
-// AbstractAttribute.space (mapdict.py:47) is omitted: pyre's object space is
+// AbstractAttribute.space (mapdict.py) is omitted: pyre's object space is
 // ambient (global helpers) rather than an object threaded through nodes,
 // matching the rest of pyre-interpreter.
 
-/// `2 ** methodcachesizeexp` is the MapAttrCache size (pypyoption.py:230,
+/// `2 ** methodcachesizeexp` is the MapAttrCache size (pypyoption.py,
 /// default 11).
 pub const METHODCACHESIZEEXP: u32 = 11;
 
 /// A shared, interned, immortal map node (mapdict.py AbstractAttribute).
 pub type MapRef = *const MapNode;
 
-/// mapdict.py:357/376/382 — the three Terminator subclasses.
+/// mapdict.py/376/382 — the three Terminator subclasses.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TerminatorKind {
-    /// `DictTerminator` (mapdict.py:357).
+    /// `DictTerminator` (mapdict.py).
     Dict,
-    /// `NoDictTerminator` (mapdict.py:376).
+    /// `NoDictTerminator` (mapdict.py).
     NoDict,
-    /// `DevolvedDictTerminator` (mapdict.py:382).
+    /// `DevolvedDictTerminator` (mapdict.py).
     Devolved,
 }
 
-/// mapdict.py:304 `Terminator(AbstractAttribute)` — the root of a map chain.
+/// mapdict.py `Terminator(AbstractAttribute)` — the root of a map chain.
 pub struct Terminator {
     /// mapdict.py:307 `w_cls`.
     pub w_cls: PyObjectRef,
-    /// mapdict.py:305 `_immutable_fields_` declares `allow_unboxing?`;
+    /// mapdict.py `_immutable_fields_` declares `allow_unboxing?`;
     /// mapdict.py:308 `allow_unboxing` permits unboxed attributes until a
     /// differently-typed reassignment freezes them off. [`Self::set_allow_unboxing`]
     /// invalidates watchers before changing it.
@@ -188,14 +188,14 @@ pub struct Terminator {
     pub allow_unboxing_watchers: QuasiImmutField,
     /// Which Terminator subclass this is.
     pub kind: TerminatorKind,
-    /// mapdict.py:360 `DictTerminator.devolved_dict_terminator` (null unless
+    /// mapdict.py `DictTerminator.devolved_dict_terminator` (null unless
     /// `kind == Dict`).
     pub devolved_dict_terminator: Cell<MapRef>,
-    /// mapdict.py:47 `AbstractAttribute.cache_attrs` — the per-node transition
+    /// mapdict.py `AbstractAttribute.cache_attrs` — the per-node transition
     /// cache `(name, attrkind) -> CachedAttributeHolder`. PyPy lazily inits it
     /// to `{}`; the eager empty map here is equivalent.
     pub cache_attrs: Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
-    /// mapdict.py:53 `AbstractAttribute.terminator` — a Terminator points to
+    /// mapdict.py `AbstractAttribute.terminator` — a Terminator points to
     /// itself.
     pub terminator: MapRef,
 }
@@ -208,9 +208,9 @@ impl Terminator {
     /// writes in mapdict.py `PlainAttribute._direct_write` and
     /// `CachedAttributeHolder.pick_attr` can repeatedly write `False`, and a
     /// re-armed watcher must not retrace without bound. The `is_installed()`
-    /// fast path is quasiimmut.py:38-41 `invalidation`'s null test and remains
+    /// fast path is quasiimmut.py `invalidation`'s null test and remains
     /// outside the sweep so the common case is lock-free. Notification must
-    /// precede the store: rclass.py:1010-1012 `hook_setfield` emits
+    /// precede the store: rclass.py `hook_setfield` emits
     /// `jit_force_quasi_immutable` before `setfield`, as do celldict.rs
     /// `mutated` and typeobject.rs `w_type_set_version_tag`.
     pub fn set_allow_unboxing(&self, v: bool) {
@@ -240,7 +240,7 @@ impl Terminator {
     }
 }
 
-/// `quasiimmut.py:17-27 get_current_qmut_instance` for a Terminator's `allow_unboxing?` field.
+/// `quasiimmut.py get_current_qmut_instance` for a Terminator's `allow_unboxing?` field.
 ///
 /// # Safety
 /// `terminator` must be null or point at a live owner.
@@ -274,7 +274,7 @@ pub unsafe fn terminator_force_allow_unboxing_qmut(terminator: *const Terminator
     unsafe { (*terminator).force_allow_unboxing_qmut() };
 }
 
-/// The unbox type of an `UnboxedPlainAttribute` (mapdict.py:534/547,
+/// The unbox type of an `UnboxedPlainAttribute` (mapdict.py/547,
 /// `space.IntObjectCls` / `space.FloatObjectCls`). pyre exposes no per-type
 /// impl-class object, so the int/float distinction is captured by this enum
 /// and resolved through `is_int`/`is_float` (the enum-vs-class-object
@@ -287,7 +287,7 @@ pub enum UnboxType {
     Float,
 }
 
-/// mapdict.py:532-563 `UnboxedPlainAttribute`'s extra fields. PyPy models the
+/// mapdict.py `UnboxedPlainAttribute`'s extra fields. PyPy models the
 /// unboxed attribute as a `PlainAttribute` subclass; pyre keeps it an optional
 /// field on `PlainAttribute` so all the shared `PlainAttribute` machinery
 /// (find_map_attr / add_attr / reorder / cache) applies unchanged
@@ -304,19 +304,19 @@ pub struct UnboxedExtra {
     pub firstunwrapped: bool,
 }
 
-/// mapdict.py:420 `PlainAttribute(AbstractAttribute)` — one stored attribute.
+/// mapdict.py `PlainAttribute(AbstractAttribute)` — one stored attribute.
 pub struct PlainAttribute {
     /// mapdict.py:425 `name` (utf8-encoded).
     pub name: Wtf8Buf,
     /// mapdict.py:426 `attrkind`.
     pub attrkind: u16,
-    /// mapdict.py:427 `storageindex` (= `back.storage_needed()`).
+    /// mapdict.py `storageindex` (= `back.storage_needed()`).
     pub storageindex: usize,
-    /// mapdict.py:428 `_num_attributes` (= `back.num_attributes() + 1`).
+    /// mapdict.py `_num_attributes` (= `back.num_attributes() + 1`).
     pub num_attributes: usize,
     /// mapdict.py:429 `back`.
     pub back: MapRef,
-    /// mapdict.py:421 `_immutable_fields_` declares `ever_mutated?`;
+    /// mapdict.py `_immutable_fields_` declares `ever_mutated?`;
     /// mapdict.py:430 `ever_mutated` records whether this attribute has ever
     /// been overwritten or deleted. [`Self::set_ever_mutated`] invalidates
     /// watchers before changing it.
@@ -329,12 +329,12 @@ pub struct PlainAttribute {
     pub ever_mutated_watchers: QuasiImmutField,
     /// mapdict.py:431 `order`.
     pub order: usize,
-    /// mapdict.py:47 `AbstractAttribute.cache_attrs` — the per-node transition
+    /// mapdict.py `AbstractAttribute.cache_attrs` — the per-node transition
     /// cache `(name, attrkind) -> CachedAttributeHolder`.
     pub cache_attrs: Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>,
-    /// mapdict.py:53 `AbstractAttribute.terminator` (= `back.terminator`).
+    /// mapdict.py `AbstractAttribute.terminator` (= `back.terminator`).
     pub terminator: MapRef,
-    /// `Some` for an `UnboxedPlainAttribute` (mapdict.py:532); `None` for a
+    /// `Some` for an `UnboxedPlainAttribute` (mapdict.py); `None` for a
     /// plain boxed attribute.
     pub unboxed: Option<UnboxedExtra>,
 }
@@ -367,7 +367,7 @@ impl PlainAttribute {
     }
 }
 
-/// `quasiimmut.py:17-27 get_current_qmut_instance` for a PlainAttribute's `ever_mutated?` field.
+/// `quasiimmut.py get_current_qmut_instance` for a PlainAttribute's `ever_mutated?` field.
 ///
 /// # Safety
 /// `attribute` must be null or point at a live owner.
@@ -403,7 +403,7 @@ pub unsafe fn plain_attribute_force_ever_mutated_qmut(attribute: *const PlainAtt
     unsafe { (*attribute).force_ever_mutated_qmut() };
 }
 
-/// mapdict.py:45 `AbstractAttribute` plus its two concrete subclasses.
+/// mapdict.py `AbstractAttribute` plus its two concrete subclasses.
 pub enum MapNode {
     Terminator(Terminator),
     Plain(PlainAttribute),
@@ -414,7 +414,7 @@ fn intern_node(node: MapNode) -> MapRef {
     Box::into_raw(Box::new(node)) as MapRef
 }
 
-/// mapdict.py:306-310 `Terminator.__init__`. `AbstractAttribute.__init__(space,
+/// mapdict.py `Terminator.__init__`. `AbstractAttribute.__init__(space,
 /// self)` makes the terminator its own `terminator`.
 pub fn new_terminator(w_cls: PyObjectRef, kind: TerminatorKind) -> MapRef {
     let raw = Box::into_raw(Box::new(MapNode::Terminator(Terminator {
@@ -436,7 +436,7 @@ pub fn new_terminator(w_cls: PyObjectRef, kind: TerminatorKind) -> MapRef {
     raw as MapRef
 }
 
-/// mapdict.py:358-360 `DictTerminator.__init__` — also builds the paired
+/// mapdict.py `DictTerminator.__init__` — also builds the paired
 /// `DevolvedDictTerminator` and links it.
 pub fn new_dict_terminator(w_cls: PyObjectRef) -> MapRef {
     let devolved = new_terminator(w_cls, TerminatorKind::Devolved);
@@ -448,8 +448,8 @@ pub fn new_dict_terminator(w_cls: PyObjectRef) -> MapRef {
 }
 
 /// Build the per-type map terminator (typeobject.py:251-260 +
-/// mapdict.py:357-360): a `DictTerminator` when the type has `__dict__`, else
-/// a `NoDictTerminator`. `allow_unboxing` keeps its `mapdict.py:308` default of
+/// mapdict.py): a `DictTerminator` when the type has `__dict__`, else
+/// a `NoDictTerminator`. `allow_unboxing` keeps its `mapdict.py` default of
 /// `True`; type instability later freezes it off per-class through the reactive
 /// paths (`plain_direct_write` type change / `holder_pick_attr` mismatch), and
 /// the affected instances rebuild boxed storage via `convert_to_boxed`.
@@ -477,7 +477,7 @@ pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdic
     }
 }
 
-/// `_mapdict_init_empty` deferred to first attribute access (mapdict.py:758-761
+/// `_mapdict_init_empty` deferred to first attribute access (mapdict.py
 /// `user_setup` calls it at construction with `w_subtype.terminator`; pyre
 /// defers to first access). If the instance's `map` is null, fetch the owning
 /// type's terminator — lazily creating and storing it on the type if absent,
@@ -605,7 +605,7 @@ unsafe fn is_queue_mapdict_layout(obj: PyObjectRef) -> bool {
 }
 
 /// Whether `obj`'s physical allocation carries the slots supplied by
-/// `MapdictStorageMixin` (`mapdict.py:748-761, 905-910`). Ordinary instances
+/// `MapdictStorageMixin` (`mapdict.py, 905-910`). Ordinary instances
 /// and `_random.Random` keep the historical prefix. The generated tuple/int/str
 /// user layouts append the mixin after their unchanged builtin base payload
 /// (`typedef.py:174-227`) whether or not the class routes attributes through a
@@ -676,7 +676,7 @@ unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
     term as MapRef
 }
 
-/// mapdict.py:754-756 `MapdictDictSupport.setclass` — re-root `obj`'s map chain
+/// mapdict.py `MapdictDictSupport.setclass` — re-root `obj`'s map chain
 /// onto `w_cls`'s terminator and transplant the rebuilt storage+map. Called from
 /// `descr_set___class__` for a `W_ObjectObject`. pyre additionally keeps the
 /// `w_class` field authoritative for `type()` (the node layer's
@@ -702,7 +702,7 @@ pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     inst._set_mapdict_storage_and_map(new_obj.storage, new_map);
 }
 
-/// `setdictvalue` routed to the mapdict node layer (mapdict.py:849-850
+/// `setdictvalue` routed to the mapdict node layer (mapdict.py
 /// `MapdictDictSupport.setdictvalue` → `map.write(self, attrname, DICT,
 /// w_value)`, dispatch at mapdict.py:68-75).
 ///
@@ -715,7 +715,7 @@ pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
 /// layer's unboxed storage path (`erase_unboxed`/`unerase_unboxed` raw
 /// `*mut Vec<i64>` casts and `Box` allocation for the shared longlong list,
 /// mapdict.py:565-646) is not annotator-lowerable, so the boundary stays.
-/// Look-inside (the `map.write` JIT specialization, mapdict.py:614-628) is a
+/// Look-inside (the `map.write` JIT specialization, mapdict.py) is a
 /// future convergence, once the unboxed storage shape is JIT-representable.
 ///
 /// # Safety
@@ -733,7 +733,7 @@ pub unsafe fn instance_node_setdictvalue(
     node_write(map, &mut inst, name, DICT, value)
 }
 
-/// Whether `map` is rooted at a `DevolvedDictTerminator` (mapdict.py:382),
+/// Whether `map` is rooted at a `DevolvedDictTerminator` (mapdict.py),
 /// i.e. the instance has spilled its attributes into a real dictionary.
 ///
 /// A devolved map no longer names the instance's attributes, and it does not
@@ -754,7 +754,7 @@ pub unsafe fn map_is_devolved(map: MapRef) -> bool {
     unsafe { (*terminator).as_terminator() }.kind == TerminatorKind::Devolved
 }
 
-/// `getdictvalue` routed to the mapdict node layer (mapdict.py:846-847
+/// `getdictvalue` routed to the mapdict node layer (mapdict.py
 /// `MapdictDictSupport.getdictvalue` → `map.read(self, attrname, DICT)`).
 /// Returns the value or `None` when the attribute is absent.
 ///
@@ -791,13 +791,13 @@ pub unsafe fn instance_node_getdictvalue_checked(
     ensure_mapdict_initialized(obj);
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
-    // mapdict.py:846-847 getdictvalue → read → _direct_read (592-598): the read
+    // mapdict.py getdictvalue → read → _direct_read (592-598): the read
     // and its lazy migrate-to-boxed tail, off one resolved node.
     let w = unsafe { node_read_converting(map, &mut inst, name, DICT) }?;
     Ok(w)
 }
 
-/// `deldictvalue` routed to the mapdict node layer (mapdict.py:852-857
+/// `deldictvalue` routed to the mapdict node layer (mapdict.py
 /// `MapdictDictSupport.deldictvalue` → `map.delete(self, attrname, DICT)` then
 /// `_set_mapdict_storage_and_map`). Returns `true` if the attribute existed and
 /// was removed, `false` otherwise (the caller raises AttributeError on false).
@@ -824,7 +824,7 @@ pub unsafe fn instance_node_deldictvalue(obj: PyObjectRef, name: &Wtf8) -> bool 
 }
 
 /// Read the instance `__dict__` wrapper from the "dict" SPECIAL slot
-/// (mapdict.py:828 `w_dict = self._get_mapdict_map().read(self, "dict",
+/// (mapdict.py `w_dict = self._get_mapdict_map().read(self, "dict",
 /// SPECIAL)`). Returns `None` when the wrapper has not been materialised.
 ///
 /// `dont_look_inside` — same residual-call rationale as
@@ -844,7 +844,7 @@ pub unsafe fn instance_get_dict_slot(obj: PyObjectRef) -> Option<PyObjectRef> {
 }
 
 /// Write the instance `__dict__` wrapper into the "dict" SPECIAL slot
-/// (mapdict.py:833/859 `flag = self._get_mapdict_map().write(self, "dict",
+/// (mapdict.py/859 `flag = self._get_mapdict_map().write(self, "dict",
 /// SPECIAL, w_dict)`). `node_write` grows the map+storage by the SPECIAL slot on
 /// first write (the same transplant path the DICT setter takes). Returns the
 /// `write` flag.
@@ -864,7 +864,7 @@ pub unsafe fn instance_set_dict_slot(obj: PyObjectRef, w_dict: PyObjectRef) -> b
 }
 
 /// Read the weakref lifeline from the instance's `"weakref"` SPECIAL slot
-/// (mapdict.py:787 `self._get_mapdict_map().read(self, "weakref", SPECIAL)`).
+/// (mapdict.py `self._get_mapdict_map().read(self, "weakref", SPECIAL)`).
 ///
 /// # Safety
 /// `obj` must be a live `W_ObjectObject`.
@@ -881,7 +881,7 @@ pub unsafe fn instance_get_weakref_slot(obj: PyObjectRef) -> Option<PyObjectRef>
 }
 
 /// Write the weakref lifeline into the instance's `"weakref"` SPECIAL slot
-/// (mapdict.py:798 `self._get_mapdict_map().write(...)`).
+/// (mapdict.py `self._get_mapdict_map().write(...)`).
 ///
 /// # Safety
 /// `obj` must be a live `W_ObjectObject`.
@@ -916,7 +916,7 @@ pub unsafe fn instance_del_weakref_slot(obj: PyObjectRef) {
 
 // ── methods needed for slots (mapdict.py:764-780 MapdictSlotsSupport) ──
 
-/// mapdict.py:766-768 `MapdictSlotsSupport.getslotvalue` —
+/// mapdict.py `MapdictSlotsSupport.getslotvalue` —
 /// `map.read(self, "slot", SLOTS_STARTING_FROM + slotindex)`.
 ///
 /// `dont_look_inside` — same residual-call rationale as
@@ -936,13 +936,13 @@ pub unsafe fn getslotvalue(obj: PyObjectRef, slotindex: u32) -> Option<PyObjectR
     let mut inst = mapdict_carrier(obj);
     let map = inst._get_mapdict_map();
     let attrkind = SLOTS_STARTING_FROM + slotindex as u16;
-    // read → _direct_read (mapdict.py:592-598) lazily migrates an unboxed
+    // read → _direct_read (mapdict.py) lazily migrates an unboxed
     // attribute to boxed storage, as in `instance_node_getdictvalue`; both come
     // off the one node `node_read_converting` resolves.
     unsafe { node_read_converting(map, &mut inst, Wtf8::new("slot"), attrkind) }.unwrap_or(None)
 }
 
-/// mapdict.py:770-772 `MapdictSlotsSupport.setslotvalue` —
+/// mapdict.py `MapdictSlotsSupport.setslotvalue` —
 /// `map.write(self, "slot", SLOTS_STARTING_FROM + slotindex, w_value)`.
 ///
 /// `dont_look_inside` — same residual-call rationale as
@@ -966,7 +966,7 @@ pub unsafe fn setslotvalue(obj: PyObjectRef, slotindex: u32, w_value: PyObjectRe
     debug_assert!(flag, "node_write returned false for a slot attribute");
 }
 
-/// mapdict.py:774-780 `MapdictSlotsSupport.delslotvalue` —
+/// mapdict.py `MapdictSlotsSupport.delslotvalue` —
 /// `map.delete(self, "slot", SLOTS_STARTING_FROM + slotindex)` then
 /// `_set_mapdict_storage_and_map`. Returns `false` when the slot was
 /// never written (the caller raises AttributeError).
@@ -997,7 +997,7 @@ pub unsafe fn delslotvalue(obj: PyObjectRef, slotindex: u32) -> bool {
     }
 }
 
-/// mapdict.py:423-431 `PlainAttribute.__init__`.
+/// mapdict.py `PlainAttribute.__init__`.
 ///
 /// # Safety
 /// `back` must point to a live (immortal) map node.
@@ -1023,7 +1023,7 @@ pub unsafe fn new_plain_attribute(
     }))
 }
 
-/// mapdict.py:534-563 `UnboxedPlainAttribute.__init__` +
+/// mapdict.py `UnboxedPlainAttribute.__init__` +
 /// `_compute_storageindex_listindex`.
 ///
 /// Unlike `PlainAttribute.__init__`, the storage index is shared with the
@@ -1041,7 +1041,7 @@ pub unsafe fn new_unboxed_plain_attribute(
     typ: UnboxType,
 ) -> MapRef {
     let back_node = unsafe { &*back };
-    // _compute_storageindex_listindex (mapdict.py:549-563): walk up looking for
+    // _compute_storageindex_listindex (mapdict.py): walk up looking for
     // an existing UnboxedPlainAttribute to share a storage slot with.
     let mut attr = back;
     let mut shared = None;
@@ -1102,7 +1102,7 @@ impl MapNode {
         matches!(self, MapNode::Plain(_))
     }
 
-    /// mapdict.py:53,141 `AbstractAttribute.terminator` / `get_terminator`.
+    /// mapdict.py `AbstractAttribute.terminator` / `get_terminator`.
     pub fn terminator(&self) -> MapRef {
         match self {
             MapNode::Terminator(t) => t.terminator,
@@ -1110,7 +1110,7 @@ impl MapNode {
         }
     }
 
-    /// mapdict.py:327 (Terminator) / 478 (PlainAttribute) / 565-568
+    /// mapdict.py (Terminator) / 478 (PlainAttribute) / 565-568
     /// (UnboxedPlainAttribute) `storage_needed`.
     pub fn storage_needed(&self) -> usize {
         match self {
@@ -1132,7 +1132,7 @@ impl MapNode {
         }
     }
 
-    /// mapdict.py:330 (Terminator) / 481 (PlainAttribute) `num_attributes`.
+    /// mapdict.py (Terminator) / 481 (PlainAttribute) `num_attributes`.
     pub fn num_attributes(&self) -> usize {
         match self {
             MapNode::Terminator(_) => 0,
@@ -1140,7 +1140,7 @@ impl MapNode {
         }
     }
 
-    /// mapdict.py:47 `AbstractAttribute.cache_attrs`.
+    /// mapdict.py `AbstractAttribute.cache_attrs`.
     pub fn cache_attrs(&self) -> &Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>> {
         match self {
             MapNode::Terminator(t) => &t.cache_attrs,
@@ -1149,7 +1149,7 @@ impl MapNode {
     }
 }
 
-/// mapdict.py:140,487-490 `AbstractAttribute.search`.
+/// mapdict.py `AbstractAttribute.search`.
 ///
 /// # Safety
 /// `node` and its `back` chain must point to live map nodes.
@@ -1166,7 +1166,7 @@ pub unsafe fn node_search(node: MapRef, attrtype: u16) -> Option<MapRef> {
     }
 }
 
-/// mapdict.py:118-122 `AbstractAttribute._find_map_attr` — the uncached chain
+/// mapdict.py `AbstractAttribute._find_map_attr` — the uncached chain
 /// walk.
 ///
 /// # Safety
@@ -1181,7 +1181,7 @@ pub unsafe fn find_map_attr_chain(mut node: MapRef, name: &Wtf8, attrkind: u16) 
     None
 }
 
-/// mapdict.py:694-715 `MapAttrCache` — the per-space attribute lookup cache
+/// mapdict.py `MapAttrCache` — the per-space attribute lookup cache
 /// behind `find_map_attr`. A null `MapRef` slot means "empty"/"not found".
 pub struct MapAttrCache {
     attrs: Vec<MapRef>,
@@ -1205,7 +1205,7 @@ impl MapAttrCache {
         }
     }
 
-    /// mapdict.py:705-713 `clear`.
+    /// mapdict.py `clear`.
     pub fn clear(&mut self) {
         for slot in self.attrs.iter_mut() {
             *slot = std::ptr::null();
@@ -1222,21 +1222,21 @@ impl MapAttrCache {
     }
 }
 
-/// `space.fromcache(MapAttrCache)` (mapdict.py:80) — one cache on the shared
+/// `space.fromcache(MapAttrCache)` (mapdict.py) — one cache on the shared
 /// object space.  Pyre's free-threaded execution contexts share that space, so
 /// the cache remains process/interpreter-owned and is synchronized rather than
 /// duplicated through TLS.
 static MAP_ATTR_CACHE: LazyLock<Mutex<MapAttrCache>> =
     LazyLock::new(|| Mutex::new(MapAttrCache::new()));
 
-/// interp_gc.py:14-17 — clear `space.fromcache(MapAttrCache)` before an
+/// interp_gc.py — clear `space.fromcache(MapAttrCache)` before an
 /// explicit full collection so cached map nodes do not retain stale entries.
 #[majit_macros::dont_look_inside]
 pub fn clear_map_attr_cache() {
     MAP_ATTR_CACHE.lock().unwrap().clear();
 }
 
-/// `objectmodel.compute_hash(name)` for a (utf8-encoded) str (mapdict.py:94).
+/// `objectmodel.compute_hash(name)` for a (utf8-encoded) str (mapdict.py).
 ///
 /// This ports the `fnv` mode of `compute_hash` — `objectmodel._hash_string`,
 /// the modified-FNV string hash (`rpython/rlib/objectmodel.py`). `compute_hash`
@@ -1262,9 +1262,9 @@ fn compute_name_hash(name: &Wtf8) -> i64 {
     x
 }
 
-/// mapdict.py:86-117 `AbstractAttribute.find_map_attr` with the method cache
+/// mapdict.py `AbstractAttribute.find_map_attr` with the method cache
 /// always enabled — fuses the dispatcher (mapdict.py:86) and
-/// `_find_map_attr_cache` (mapdict.py:100, `@jit.dont_look_inside`). The
+/// `_find_map_attr_cache` (mapdict.py, `@jit.dont_look_inside`). The
 /// uncached walk is `find_map_attr_chain` (`_find_map_attr`); the JIT calls
 /// that directly rather than tracing this cache path.
 ///
@@ -1333,8 +1333,8 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &Wtf8, attrkind: u16) -> Op
 // were map nodes ever made movable, the raw pointers would
 // dangle and the whole entry would have to switch to that forwarded design.)
 
-/// mapdict.py:1416-1422 `CacheEntry`. PyPy's shared `INVALID_CACHE_ENTRY`
-/// sentinel (a `CacheEntry` carrying a fake map, mapdict.py:1451-1454) is
+/// mapdict.py `CacheEntry`. PyPy's shared `INVALID_CACHE_ENTRY`
+/// sentinel (a `CacheEntry` carrying a fake map, mapdict.py) is
 /// represented here by a `None` slot in `pycode._mapdict_caches`, so this struct
 /// only ever describes a *valid* (or stale-but-checked) entry. The debug-only
 /// `success_counter`/`failure_counter` (mapdict.py:1419-1420, gated on
@@ -1359,7 +1359,7 @@ pub struct MapdictCacheEntry {
 }
 
 impl MapdictCacheEntry {
-    /// mapdict.py:1431-1434 `is_valid_for_map`.
+    /// mapdict.py `is_valid_for_map`.
     ///
     /// # Safety
     /// `map` and `self.cached_map` (when non-null) must point to live map nodes.
@@ -1374,7 +1374,7 @@ impl MapdictCacheEntry {
         unsafe { self._is_valid_for_map(map) }
     }
 
-    /// mapdict.py:1436-1447 `_is_valid_for_map` — same instance map (pointer
+    /// mapdict.py `_is_valid_for_map` — same instance map (pointer
     /// identity on the immortal node) AND the owning type's current
     /// `version_tag` still equals the cached one.
     ///
@@ -1384,10 +1384,10 @@ impl MapdictCacheEntry {
         // mapdict.py:1439-1440 `mymap = self.map_wref(); if mymap is not None and
         // mymap is map`.
         if !self.cached_map.is_null() && std::ptr::eq(self.cached_map, map) {
-            // mapdict.py:1441 `version_tag = map.terminator.w_cls.version_tag()`.
+            // mapdict.py `version_tag = map.terminator.w_cls.version_tag()`.
             let w_cls = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
             let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_cls) };
-            // mapdict.py:1442 `if version_tag is self.version_tag`.
+            // mapdict.py `if version_tag is self.version_tag`.
             if version_tag == self.version_tag {
                 return true;
             }
@@ -1396,7 +1396,7 @@ impl MapdictCacheEntry {
     }
 }
 
-/// mapdict.py:905-906 `W_Root._get_mapdict_map` — the instance's current map
+/// mapdict.py `W_Root._get_mapdict_map` — the instance's current map
 /// (`jit.promote(self.map)`), or null for any object that does not use mapdict
 /// (the base `W_Root` implementation returns None). `ensure_mapdict_initialized`
 /// is a null-check + early return once the map is set, so this stays cheap on
@@ -1418,7 +1418,7 @@ unsafe fn mapdict_map_or_null(w_obj: PyObjectRef) -> MapRef {
     inst._get_mapdict_map()
 }
 
-/// mapdict.py:443 `PlainAttribute._direct_read` and mapdict.py:591-598
+/// mapdict.py `PlainAttribute._direct_read` and mapdict.py
 /// `UnboxedPlainAttribute._direct_read` — the converting attribute read.
 /// `_prim_direct_read` (boxed slot, or box the longlong for an unboxed
 /// attribute), then for an unboxed attribute whose class has frozen unboxing
@@ -1429,12 +1429,12 @@ unsafe fn mapdict_map_or_null(w_obj: PyObjectRef) -> MapRef {
 /// # Safety
 /// `attr` must point to a live `PlainAttribute`; `obj` to its live carrier.
 unsafe fn direct_read<O: MapdictObject>(attr: MapRef, obj: &mut O) -> PyObjectRef {
-    // mapdict.py:592/600-601 `_prim_direct_read`.
+    // mapdict.py/600-601 `_prim_direct_read`.
     let w_res = unsafe { plain_direct_read(attr, &*obj) };
     if !unsafe { attr_migrates_to_boxed(attr) } {
         return w_res;
     }
-    // mapdict.py:594-596 `_convert_to_boxed(obj)`.  It rebuilds the carrier
+    // mapdict.py `_convert_to_boxed(obj)`.  It rebuilds the carrier
     // through `node_copy`, which allocates, and the value read above is named
     // by nothing else — publish it and take it back from the slot.
     let _roots = pyre_object::gc_roots::push_roots();
@@ -1443,7 +1443,7 @@ unsafe fn direct_read<O: MapdictObject>(attr: MapRef, obj: &mut O) -> PyObjectRe
     pyre_object::gc_roots::shadow_stack_get(value_slot)
 }
 
-/// mapdict.py:593-596 — the migration test of `_direct_read`, on an
+/// mapdict.py — the migration test of `_direct_read`, on an
 /// already-resolved node: an unboxed attribute whose class has stopped allowing
 /// unboxing migrates the whole instance off unboxed storage.
 ///
@@ -1468,7 +1468,7 @@ unsafe fn migrate_to_boxed_if_frozen<O: MapdictObject>(attr: MapRef, obj: &mut O
     }
 }
 
-/// mapdict.py:1461-1477 `_fill_cache`. Store the resolved `(map, attr,
+/// mapdict.py `_fill_cache`. Store the resolved `(map, attr,
 /// version_tag)` into slot `nameindex`. PyPy's `INVALID_CACHE_ENTRY` is a `None`
 /// slot, so a fill always writes `Some(entry)`.
 ///
@@ -1542,7 +1542,7 @@ unsafe fn classify_attr(
                         crate::baseobjspace::issubtype_w(w_type, pyre_object::w_member_get_cls(d))
                     }
                 {
-                    // mapdict.py:1518 `("slot", SLOTS_STARTING_FROM + w_descr.index)`.
+                    // mapdict.py `("slot", SLOTS_STARTING_FROM + w_descr.index)`.
                     let kind =
                         SLOTS_STARTING_FROM + unsafe { pyre_object::w_member_get_index(d) } as u16;
                     return (kind, true);
@@ -1561,7 +1561,7 @@ unsafe fn classify_attr(
     }
 }
 
-/// mapdict.py:1520 `space.type(w_descr).is_heaptype()`. Conservatively treats an
+/// mapdict.py `space.type(w_descr).is_heaptype()`. Conservatively treats an
 /// unresolvable type as a heap type (not cacheable).
 ///
 /// # Safety
@@ -1573,7 +1573,7 @@ unsafe fn descr_type_is_heaptype(w_descr: PyObjectRef) -> bool {
     }
 }
 
-/// mapdict.py:1479-1490 `LOAD_ATTR_caching`. The interpreter LOAD_ATTR fast
+/// mapdict.py `LOAD_ATTR_caching`. The interpreter LOAD_ATTR fast
 /// path (reached only under `not we_are_jitted()`): a monomorphic cache hit
 /// re-reads the value straight out of storage; anything else drops to
 /// `load_attr_slowpath`.
@@ -1603,7 +1603,7 @@ pub unsafe fn load_attr_caching(
     };
     let map = {
         let _instance_guard = instance_lock(w_obj);
-        // mapdict.py:1482 `map = w_obj._get_mapdict_map()`.
+        // mapdict.py `map = w_obj._get_mapdict_map()`.
         let map = unsafe { mapdict_map_or_null(w_obj) };
         if let Some(e) = entry {
             // mapdict.py:1483-1487 — valid cache entry with a live attr.
@@ -1613,7 +1613,7 @@ pub unsafe fn load_attr_caching(
                 && !e.cached_attr.is_null()
             {
                 let mut inst = unsafe { mapdict_carrier(w_obj) };
-                // mapdict.py:1487 `return attr._direct_read(w_obj)`.
+                // mapdict.py `return attr._direct_read(w_obj)`.
                 return Ok(unsafe { direct_read(e.cached_attr, &mut inst) });
             }
         }
@@ -1622,7 +1622,7 @@ pub unsafe fn load_attr_caching(
     unsafe { load_attr_slowpath(pycode, w_obj, nameindex, name, map) }
 }
 
-/// mapdict.py:1492-1537 `LOAD_ATTR_slowpath`.
+/// mapdict.py `LOAD_ATTR_slowpath`.
 ///
 /// `dont_look_inside` — reaches the type-lookup method cache and `find_map_attr`
 /// thread-locals; only called from `load_attr_caching`.
@@ -1656,7 +1656,7 @@ unsafe fn load_attr_slowpath(
             let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
             // mapdict.py:1507-1524 classify.
             let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
-            // mapdict.py:1526 `if attrkind != INVALID:`.
+            // mapdict.py `if attrkind != INVALID:`.
             if attrkind != INVALID {
                 let attrname = if is_slot { "slot" } else { name };
                 // The type/descriptor lookup above can execute Python. Re-lock
@@ -1678,7 +1678,7 @@ unsafe fn load_attr_slowpath(
                     }
                 };
                 if let Some((current_map, attr, value)) = direct {
-                    // mapdict.py:1531-1532 `_fill_cache(...,
+                    // mapdict.py `_fill_cache(...,
                     // valid_for_store=w_type.setattr_if_not_from_object() is None)`.
                     let valid_for_store =
                         unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }
@@ -1694,13 +1694,13 @@ unsafe fn load_attr_slowpath(
                             valid_for_store,
                         );
                     }
-                    // mapdict.py:1533 `return attr._direct_read(w_obj)`.
+                    // mapdict.py `return attr._direct_read(w_obj)`.
                     return Ok(value);
                 }
             }
         }
     }
-    // mapdict.py:1537 `return space.getattr(w_obj, w_name)`.
+    // mapdict.py `return space.getattr(w_obj, w_name)`.
     crate::baseobjspace::getattr_str(w_obj, name)
 }
 
@@ -1746,12 +1746,12 @@ pub unsafe fn load_attr_fast_path(
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
-    // mapdict.py:1526 `if attrkind != INVALID:`.
+    // mapdict.py `if attrkind != INVALID:`.
     if attrkind == INVALID {
         return None;
     }
     let attrname = if is_slot { "slot" } else { name };
-    // mapdict.py:1527 `attr = map.find_map_attr(attrname, attrkind)`.
+    // mapdict.py `attr = map.find_map_attr(attrname, attrkind)`.
     let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
     let p = unsafe { (*attr).as_plain() };
     // The inline read is a plain `storage[storageindex]` fetch; an unboxed slot
@@ -1821,7 +1821,7 @@ pub unsafe fn getattr_hook_fast_path(
         return None;
     }
     // A devolved instance keeps its attributes in a real dictionary, and
-    // mapdict.py:1534-1536 states that `find_map_attr` "will always return
+    // mapdict.py states that `find_map_attr` "will always return
     // None if attrkind==DICT" for such a map.  The hit path reads that call
     // for a Some, so a None costs it only the fold; this path reads it for its
     // ABSENCE and would take an always-None answer as proof the name is not on
@@ -1847,7 +1847,7 @@ pub unsafe fn getattr_hook_fast_path(
 
 /// The [`load_attr_fast_path`] twin for a receiver that keeps its attributes in
 /// a `newdict(instance=True)` dictionary rather than in header mapdict storage
-/// (`mapdict.py:1299-1303 make_instance_dict`). It applies the same
+/// (`mapdict.py make_instance_dict`). It applies the same
 /// `load_attr_slowpath` gates (mapdict.py:1496-1527) and differs only in where
 /// the map comes from — the fake carrier the dictionary erases into rather than
 /// the receiver's own header. Returns the type and its version tag alongside
@@ -1910,7 +1910,7 @@ pub unsafe fn instance_dict_attr_fast_path(
     if map.is_null() || unsafe { map_is_devolved(map) } {
         return None;
     }
-    // mapdict.py:1527 `attr = map.find_map_attr(attrname, attrkind)`.
+    // mapdict.py `attr = map.find_map_attr(attrname, attrkind)`.
     let attr = unsafe { find_map_attr(map, Wtf8::new(name), DICT) }?;
     let plain = unsafe { (*attr).as_plain() };
     // `_direct_read` migrates the instance off unboxed storage once its class
@@ -1978,11 +1978,11 @@ unsafe fn property_descr_fast_path(
 /// the full-body walker can inline `fget(obj)` in place of the opaque `getattr`
 /// residual.  Returns `None` (leave the residual) for a write-only property or
 /// any shape [`property_descr_fast_path`] declines.  A custom
-/// `__getattribute__` owns the read (mapdict.py:1497-1499), so it declines to
+/// `__getattribute__` owns the read (mapdict.py), so it declines to
 /// the residual.
 ///
 /// The property object is part of the answer because `fget` alone cannot be
-/// baked: `descriptor.py:175` declares the slot `w_fget?`, so the fold owes it
+/// baked: `descriptor.py` declares the slot `w_fget?`, so the fold owes it
 /// a `QUASIIMMUT_FIELD` marker naming the owner.
 ///
 /// # Safety
@@ -2007,7 +2007,7 @@ pub unsafe fn property_get_fast_path(
 /// object, and its Python `fset` when `obj.name = value` writes a property
 /// setter.  Returns `None` (leave the residual) for a read-only property or any
 /// shape [`property_descr_fast_path`] declines.  A custom `__setattr__` owns
-/// the write (mapdict.py:1612-1614), so it declines to the residual.
+/// the write (mapdict.py), so it declines to the residual.
 ///
 /// # Safety
 /// `w_obj` must be a live object.
@@ -2029,7 +2029,7 @@ pub unsafe fn property_set_fast_path(
 /// The unboxed counterpart of [`load_attr_fast_path`].  It applies the same
 /// LOAD_ATTR resolution gates, but accepts only an `UnboxedPlainAttribute`
 /// and returns the shared longlong-list coordinates and type needed to perform
-/// `_prim_direct_read` (mapdict.py:600-601).
+/// `_prim_direct_read` (mapdict.py).
 ///
 /// # Safety
 /// `w_obj` must be a live object.
@@ -2060,18 +2060,18 @@ pub unsafe fn load_attr_unboxed_fast_path(
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
     let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
-    // mapdict.py:1526 `if attrkind != INVALID:`.
+    // mapdict.py `if attrkind != INVALID:`.
     if attrkind == INVALID {
         return None;
     }
     let attrname = if is_slot { "slot" } else { name };
-    // mapdict.py:1527 `attr = map.find_map_attr(attrname, attrkind)`.
+    // mapdict.py `attr = map.find_map_attr(attrname, attrkind)`.
     let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
     let p = unsafe { (*attr).as_plain() };
     let u = p.unboxed.as_ref()?;
-    // mapdict.py:1539 — `LOAD_ATTR_caching` resolves to `attr._direct_read`,
+    // mapdict.py — `LOAD_ATTR_caching` resolves to `attr._direct_read`,
     // which for an unboxed attribute also migrates `obj` off unboxed storage
-    // once its class froze unboxing (mapdict.py:594-596). The folded read
+    // once its class froze unboxing (mapdict.py). The folded read
     // performs `_prim_direct_read` alone, so leave a frozen class to the
     // residual, whose `direct_read` still runs that migration.
     if !unsafe { (*p.terminator).as_terminator() }
@@ -2086,7 +2086,7 @@ pub unsafe fn load_attr_unboxed_fast_path(
 /// The STORE_ATTR counterpart of [`load_attr_unboxed_fast_path`].  An
 /// existing plain unboxed slot resolves through the same map lookup; the
 /// caller separately proves that the incoming value has the slot's unbox
-/// type before performing the in-place write (mapdict.py:615-619).
+/// type before performing the in-place write (mapdict.py).
 ///
 /// The resolved attribute node is returned so the caller can mark it
 /// `ever_mutated` once it has committed to folding the write out of the trace.
@@ -2110,7 +2110,7 @@ pub unsafe fn store_attr_unboxed_fast_path(
     if w_type.is_null() {
         return None;
     }
-    // mapdict.py:1612-1614 — a custom `__setattr__` owns the write.
+    // mapdict.py — a custom `__setattr__` owns the write.
     if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
         return None;
     }
@@ -2131,7 +2131,7 @@ pub unsafe fn store_attr_unboxed_fast_path(
         return None;
     }
     let attrname = if is_slot { "slot" } else { name };
-    // mapdict.py:1628 `attr = map.find_map_attr(attrname, attrkind)`.
+    // mapdict.py `attr = map.find_map_attr(attrname, attrkind)`.
     let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
     let p = unsafe { (*attr).as_plain() };
     let u = p.unboxed.as_ref()?;
@@ -2173,7 +2173,7 @@ pub unsafe fn store_attr_boxed_fast_path(
     if w_type.is_null() {
         return None;
     }
-    // mapdict.py:1612-1614 — a custom `__setattr__` owns the write.
+    // mapdict.py — a custom `__setattr__` owns the write.
     if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
         return None;
     }
@@ -2194,7 +2194,7 @@ pub unsafe fn store_attr_boxed_fast_path(
         return None;
     }
     let attrname = if is_slot { "slot" } else { name };
-    // mapdict.py:1628 `attr = map.find_map_attr(attrname, attrkind)`.
+    // mapdict.py `attr = map.find_map_attr(attrname, attrkind)`.
     let attr = unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) }?;
     let p = unsafe { (*attr).as_plain() };
     if p.unboxed.is_some() {
@@ -2243,7 +2243,7 @@ pub struct StoreAttrAdd {
 
 /// Resolve the `map -> PlainAttribute` transition that a STORE_ATTR adding a
 /// not-yet-present boxed attribute would take, *without* performing it, so the
-/// JIT can emit `_set_mapdict_increase_storage1` (mapdict.py:942-959) as trace
+/// JIT can emit `_set_mapdict_increase_storage1` (mapdict.py) as trace
 /// operations instead of an opaque residual call.  Every value the caller needs
 /// is a trace-time constant once the receiver's map and its type's version tag
 /// are guarded.
@@ -2253,7 +2253,7 @@ pub struct StoreAttrAdd {
 /// [`store_attr_boxed_fast_path`] / [`store_attr_unboxed_fast_path`] cases), a
 /// value that would take an unboxed float slot or a shared unboxed slot, a
 /// terminator that routes the write elsewhere, the `_reorder_and_add` case
-/// (mapdict.py:204-258), the `LIMIT_MAP_ATTRIBUTES` devolve, and a storage
+/// (mapdict.py), the `LIMIT_MAP_ATTRIBUTES` devolve, and a storage
 /// block the collector does not own (whose replacement the interpreter would
 /// have to free).  A fresh-slot unboxed int add resolves with `unbox_type =
 /// Some(Int)` and grows storage by one exactly like the boxed add.
@@ -2304,11 +2304,11 @@ pub unsafe fn store_attr_add_fast_path(
     }
     let attrname = Wtf8::new(if is_slot { "slot" } else { name });
     // This arm is the ADD; an attribute already in the map belongs to the
-    // in-place write paths (mapdict.py:1628 `map.find_map_attr`).
+    // in-place write paths (mapdict.py `map.find_map_attr`).
     if unsafe { find_map_attr(map, attrname, attrkind) }.is_some() {
         return None;
     }
-    // mapdict.py:312-321 `_write_terminator` — a `NoDictTerminator` rejects a
+    // mapdict.py `_write_terminator` — a `NoDictTerminator` rejects a
     // DICT write and a `DevolvedDictTerminator` sends it to the materialised
     // instance dict; neither reaches `add_attr`.
     if attrkind == DICT && term.kind != TerminatorKind::Dict {
@@ -2323,8 +2323,8 @@ pub unsafe fn store_attr_add_fast_path(
     // The emitted transition copies the live slots into the wider block with
     // reference loads. An unboxed attribute already in the chain is fine: its
     // slot holds the longlong list's GcArray, which is a reference like any
-    // other (mapdict.py:600-601 `_prim_direct_read`).
-    // mapdict.py:170-193 — `number_to_readd != 0` is `_reorder_and_add`, which
+    // other (mapdict.py `_prim_direct_read`).
+    // mapdict.py — `number_to_readd != 0` is `_reorder_and_add`, which
     // pops and re-adds intermediate attributes.
     let (number_to_readd, holder) =
         unsafe { find_branch_to_move_into(map, attrname, attrkind, unbox) };
@@ -2353,7 +2353,7 @@ pub unsafe fn store_attr_add_fast_path(
             Some(u.typ)
         }
     };
-    // mapdict.py:317-323 — a DICT add that reaches the attribute limit devolves
+    // mapdict.py — a DICT add that reaches the attribute limit devolves
     // the instance's `__dict__` into a text-strategy dict.
     if attrkind == DICT && unsafe { (*new_map).num_attributes() } >= LIMIT_MAP_ATTRIBUTES {
         return None;
@@ -2410,7 +2410,7 @@ pub unsafe fn store_attr_add_commit(
     let _instance_guard = instance_lock(w_obj);
     let mut inst = unsafe { mapdict_carrier(w_obj) };
     debug_assert!(std::ptr::eq(inst._get_mapdict_map(), resolved.map));
-    // mapdict.py:449-459 with `storage_needed() > _mapdict_storage_length()`,
+    // mapdict.py with `storage_needed() > _mapdict_storage_length()`,
     // which `store_attr_add_fast_path` proved by construction.
     match resolved.unbox_type {
         None => inst._set_mapdict_increase_storage1(resolved.new_map, w_value),
@@ -2424,7 +2424,7 @@ pub unsafe fn store_attr_add_commit(
     }
 }
 
-/// mapdict.py:914-916 `_mapdict_read_storage(storageindex)` for a
+/// mapdict.py `_mapdict_read_storage(storageindex)` for a
 /// `W_ObjectObject` — the boxed-slot read the JIT LOAD_ATTR fast path folds
 /// to. `load_attr_fast_path` already established that the resolved attribute
 /// is a boxed plain slot (not unboxed), so this is a straight
@@ -2440,7 +2440,7 @@ pub unsafe fn read_boxed_storage(w_obj: PyObjectRef, storageindex: usize) -> PyO
 }
 
 /// Write a boxed attribute value directly to an existing storage slot,
-/// matching `PlainAttribute._direct_write` (mapdict.py:446-447).
+/// matching `PlainAttribute._direct_write` (mapdict.py).
 ///
 /// # Safety
 /// `w_obj` must be a live `W_ObjectObject` whose guarded map owns the supplied
@@ -2485,7 +2485,7 @@ pub unsafe fn write_unboxed_storage_raw(
     }
 }
 
-/// mapdict.py:1574-1586 `STORE_ATTR_caching`. The interpreter STORE_ATTR fast
+/// mapdict.py `STORE_ATTR_caching`. The interpreter STORE_ATTR fast
 /// path (reached only under `not we_are_jitted()`): a monomorphic hit writes
 /// straight through the cached attribute; anything else drops to
 /// `store_attr_slowpath`.
@@ -2508,7 +2508,7 @@ pub unsafe fn store_attr_caching(
     };
     let map = {
         let _instance_guard = instance_lock(w_obj);
-        // mapdict.py:1577 `map = w_obj._get_mapdict_map()`.
+        // mapdict.py `map = w_obj._get_mapdict_map()`.
         let map = unsafe { mapdict_map_or_null(w_obj) };
         if let Some(e) = entry {
             // mapdict.py:1578-1585 — valid cache entry with a live attr.
@@ -2521,7 +2521,7 @@ pub unsafe fn store_attr_caching(
                 let p = unsafe { (*attr).as_plain() };
                 // mapdict.py:1582-1583 `if not attr.ever_mutated: attr.ever_mutated = True`.
                 p.set_ever_mutated(true);
-                // mapdict.py:1584 `attr._direct_write(w_obj, w_value)`.
+                // mapdict.py `attr._direct_write(w_obj, w_value)`.
                 let mut inst = unsafe { mapdict_carrier(w_obj) };
                 unsafe { plain_direct_write(attr, &mut inst, w_value) };
                 return Ok(());
@@ -2532,7 +2532,7 @@ pub unsafe fn store_attr_caching(
     unsafe { store_attr_slowpath(pycode, w_obj, nameindex, name, map, w_value, entry) }
 }
 
-/// mapdict.py:1588-1653 `STORE_ATTR_slowpath`.
+/// mapdict.py `STORE_ATTR_slowpath`.
 ///
 /// `dont_look_inside` — same rationale as `load_attr_slowpath`.
 ///
@@ -2551,7 +2551,7 @@ unsafe fn store_attr_slowpath(
 ) -> Result<(), PyError> {
     // `object.__class__` is a getset data descriptor in PyPy, so `_classify_attr`
     // (classify_attr) marks it INVALID and the store falls through to
-    // `space.setattr` (mapdict.py:1653) — the assignment re-roots the instance
+    // `space.setattr` (mapdict.py) — the assignment re-roots the instance
     // type via `descr_set___class__`, not the instance dict.  pyre models
     // `__class__` through `object_setattr`'s special-case rather than a getset,
     // so it never surfaces as a data descriptor for classify_attr to reject;
@@ -2627,10 +2627,10 @@ unsafe fn store_attr_slowpath(
             let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
             // mapdict.py:1620-1626 classify (no non-data heaptype branch for STORE).
             let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
-            // mapdict.py:1627 `if attrkind != INVALID:`.
+            // mapdict.py `if attrkind != INVALID:`.
             if attrkind != INVALID {
                 let attrname = if is_slot { "slot" } else { name };
-                // mapdict.py:1628 `attr = map.find_map_attr(attrname, attrkind)`.
+                // mapdict.py `attr = map.find_map_attr(attrname, attrkind)`.
                 match unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) } {
                     Some(attr) => {
                         let written = {
@@ -2648,7 +2648,7 @@ unsafe fn store_attr_slowpath(
                                 // mapdict.py:1632-1633
                                 // `if not attr.ever_mutated: ...`.
                                 p.set_ever_mutated(true);
-                                // mapdict.py:1634 `attr._direct_write(...)`.
+                                // mapdict.py `attr._direct_write(...)`.
                                 let mut inst = unsafe { mapdict_carrier(w_obj) };
                                 unsafe { plain_direct_write(attr, &mut inst, w_value) };
                                 true
@@ -2678,7 +2678,7 @@ unsafe fn store_attr_slowpath(
                         return Ok(());
                     }
                     None => {
-                        // mapdict.py:1636-1648 — add a brand-new DICT attribute via
+                        // mapdict.py — add a brand-new DICT attribute via
                         // the DictTerminator, then fill the slot with the resulting
                         // transition map.
                         if attrkind == DICT
@@ -2742,11 +2742,11 @@ unsafe fn store_attr_slowpath(
             }
         }
     }
-    // mapdict.py:1653 `space.setattr(w_obj, w_name, w_value)`.
+    // mapdict.py `space.setattr(w_obj, w_name, w_value)`.
     crate::baseobjspace::setattr_str(w_obj, name, w_value).map(|_| ())
 }
 
-// ── obj storage protocol (mapdict.py:904-964 MapdictStorageMixin) ──────
+// ── obj storage protocol (mapdict.py MapdictStorageMixin) ──────
 //
 // The map-node layer reads and writes attribute values through this trait.
 // PyPy mixes `MapdictStorageMixin` into the instance class; pyre's instance
@@ -2755,26 +2755,26 @@ unsafe fn store_attr_slowpath(
 // W_Root into the untyped storage list) are the identity here.
 
 pub trait MapdictObject {
-    /// mapdict.py:905-906 `_get_mapdict_map` (`jit.promote(self.map)`).
+    /// mapdict.py `_get_mapdict_map` (`jit.promote(self.map)`).
     fn _get_mapdict_map(&self) -> MapRef;
-    /// mapdict.py:907-908 `_set_mapdict_map`.
+    /// mapdict.py `_set_mapdict_map`.
     fn _set_mapdict_map(&mut self, map: MapRef);
-    /// mapdict.py:914-916 `_mapdict_read_storage`.
+    /// mapdict.py `_mapdict_read_storage`.
     fn _mapdict_read_storage(&self, storageindex: usize) -> PyObjectRef;
-    /// mapdict.py:918-919 `_mapdict_write_storage`.
+    /// mapdict.py `_mapdict_write_storage`.
     fn _mapdict_write_storage(&mut self, storageindex: usize, value: PyObjectRef);
-    /// mapdict.py:921-924 `_mapdict_storage_length` (= `self.map.storage_needed()`).
+    /// mapdict.py `_mapdict_storage_length` (= `self.map.storage_needed()`).
     fn _mapdict_storage_length(&self) -> usize;
-    /// mapdict.py:926-939 `_mapdict_pop_attribute`.
+    /// mapdict.py `_mapdict_pop_attribute`.
     fn _mapdict_pop_attribute(&mut self, map: MapRef);
-    /// mapdict.py:942-959 `_set_mapdict_increase_storage1`.
+    /// mapdict.py `_set_mapdict_increase_storage1`.
     fn _set_mapdict_increase_storage1(&mut self, map: MapRef, value: PyObjectRef);
-    /// mapdict.py:961-964 `_set_mapdict_storage_and_map` — install a complete
+    /// mapdict.py `_set_mapdict_storage_and_map` — install a complete
     /// replacement storage list and map (used by `delete`/`copy`).
     fn _set_mapdict_storage_and_map(&mut self, storage: Vec<PyObjectRef>, map: MapRef);
-    /// mapdict.py:859-860 `MapdictDictSupport.getdict` → `_obj_getdict`
+    /// mapdict.py `MapdictDictSupport.getdict` → `_obj_getdict`
     /// (mapdict.py:869-882) — the instance's `__dict__`. Only the live instance
-    /// carrier provides this; the transient `Object` (mapdict.py:978,
+    /// carrier provides this; the transient `Object` (mapdict.py,
     /// copy/materialize result) lacks `MapdictDictSupport`, so its impl is
     /// unreachable. Used by `DevolvedDictTerminator`'s read/write/delete
     /// (mapdict.py:383-409), which only ever run on the live instance.
@@ -2785,7 +2785,7 @@ pub trait MapdictObject {
 /// carrier (`mapdict.py:904-963`): PyPy mixes the mixin into the instance
 /// class, here the instance implements the trait. `map` is the erased
 /// `*const MapNode`; `storage` is a heap `Vec<PyObjectRef>` (null =
-/// `None`, the `_mapdict_init_empty` empty state, mapdict.py:910).
+/// `None`, the `_mapdict_init_empty` empty state, mapdict.py).
 /// Remember an instance that may now hold a young attribute value, mirroring
 /// `dict_write_barrier` (dictmultiobject.rs). RPython's GC inserts the
 /// barrier implicitly at `self.storage[index] = value` (mapdict.py:918-919);
@@ -2808,7 +2808,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         self.map = map as usize;
     }
     fn _mapdict_read_storage(&self, storageindex: usize) -> PyObjectRef {
-        // mapdict.py:914-916. A read is always preceded by the
+        // mapdict.py. A read is always preceded by the
         // `_set_mapdict_increase_storage1` that made `storage` non-null; the
         // block is exact-size (capacity == map.storage_needed()), so
         // `storageindex` (from this instance's map) is always in range.
@@ -2843,7 +2843,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         }
     }
     fn _mapdict_storage_length(&self) -> usize {
-        // mapdict.py:921-924 (= self.map.storage_needed()).
+        // mapdict.py (= self.map.storage_needed()).
         unsafe { (*(self.map as MapRef)).storage_needed() }
     }
     fn _mapdict_pop_attribute(&mut self, map: MapRef) {
@@ -2975,7 +2975,7 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         }
     }
     fn getdict(&self) -> PyObjectRef {
-        // mapdict.py:859-860 MapdictDictSupport.getdict → _obj_getdict
+        // mapdict.py MapdictDictSupport.getdict → _obj_getdict
         // (mapdict.py:869-882). The instance header is at offset 0
         // (`#[repr(C)]`), so the carrier pointer is the instance PyObjectRef.
         _obj_getdict(self as *const Self as PyObjectRef)
@@ -3181,7 +3181,7 @@ impl MapdictObject for MapdictCarrier {
     }
 }
 
-/// mapdict.py:978-985 `Object` — the transient `MapdictStorageMixin` carrier
+/// mapdict.py `Object` — the transient `MapdictStorageMixin` carrier
 /// for the result of `delete`/`copy` (its `storage`/`map` are transplanted
 /// into the real instance by `_set_mapdict_storage_and_map`). pyre keeps that
 /// lightweight owned-`Vec` role here, while a real `W_ObjectObject` provides
@@ -3192,7 +3192,7 @@ pub(crate) struct Object {
 }
 
 impl Object {
-    /// mapdict.py:910-912 `_mapdict_init_empty` — fresh carrier on `map` with
+    /// mapdict.py `_mapdict_init_empty` — fresh carrier on `map` with
     /// an empty storage list.
     fn new_empty(map: MapRef) -> Object {
         Object {
@@ -3219,7 +3219,7 @@ impl MapdictObject for Object {
         unsafe { (*self.map).storage_needed() }
     }
     fn _mapdict_pop_attribute(&mut self, map: MapRef) {
-        // mapdict.py:926-939. `current_map` is the PlainAttribute being popped;
+        // mapdict.py. `current_map` is the PlainAttribute being popped;
         // `map` is its parent. The unboxed-non-firstunwrapped slot to shrink is
         // a `match` on `firstunwrapped` (not `!firstunwrapped`) so the source
         // walker can lower it.
@@ -3256,7 +3256,7 @@ impl MapdictObject for Object {
         self.map = map;
     }
     fn getdict(&self) -> PyObjectRef {
-        // mapdict.py:979-985 gives `Object` both transient-copy and fake-dict
+        // mapdict.py gives `Object` both transient-copy and fake-dict
         // roles. pyre gives the fake-dict role to `W_ObjectObject`, whose
         // getdict is implemented, leaving this carrier transient only. The
         // terminator_read Devolved arm, write_terminator's Devolved and LIMIT
@@ -3330,7 +3330,7 @@ unsafe fn unboxed_items_mut<'a>(slot: PyObjectRef) -> &'a mut [i64] {
     }
 }
 
-/// mapdict.py:571-577 `UnboxedPlainAttribute._unbox`.
+/// mapdict.py `UnboxedPlainAttribute._unbox`.
 ///
 /// # Safety
 /// `w_value` must be of the type named by `typ`.
@@ -3342,7 +3342,7 @@ unsafe fn unbox_value(typ: UnboxType, w_value: PyObjectRef) -> i64 {
     }
 }
 
-/// mapdict.py:579-584 `UnboxedPlainAttribute._box`.
+/// mapdict.py `UnboxedPlainAttribute._box`.
 fn box_value(typ: UnboxType, val: i64) -> PyObjectRef {
     match typ {
         UnboxType::Int => pyre_object::w_int_new(val),
@@ -3351,7 +3351,7 @@ fn box_value(typ: UnboxType, val: i64) -> PyObjectRef {
     }
 }
 
-/// `type(w_value) is space.IntObjectCls` (mapdict.py:198,574,615).
+/// `type(w_value) is space.IntObjectCls` (mapdict.py).
 ///
 /// Pyre gives an int subclass the same native storage layout as W_IntObject
 /// and carries its app-level identity in `w_class`. Testing only the layout
@@ -3400,7 +3400,7 @@ unsafe fn is_unboxable_float(w_value: PyObjectRef) -> bool {
     std::ptr::eq(actual.as_ptr(), exact)
 }
 
-/// mapdict.py:586-590 `UnboxedPlainAttribute._convert_to_boxed` — rebuild the
+/// mapdict.py `UnboxedPlainAttribute._convert_to_boxed` — rebuild the
 /// carrier with boxed storage and transplant it onto `obj`, returning the new
 /// (boxed) map. `node_copy` re-adds every attribute through `add_attr`, which
 /// picks no unbox type because `allow_unboxing` is already frozen off on the
@@ -3417,7 +3417,7 @@ unsafe fn convert_to_boxed<O: MapdictObject>(obj: &mut O) -> MapRef {
     new_map
 }
 
-/// mapdict.py:620-627 `UnboxedPlainAttribute._direct_write` type-change tail —
+/// mapdict.py `UnboxedPlainAttribute._direct_write` type-change tail —
 /// convert `obj` to boxed storage, then write `(name, attrkind) = w_value`
 /// through the now-boxed map (no `UnboxedPlainAttribute` remains because
 /// `allow_unboxing` was just frozen off).
@@ -3445,11 +3445,11 @@ unsafe fn value_has_unbox_type(typ: UnboxType, w_value: PyObjectRef) -> bool {
     }
 }
 
-/// mapdict.py:437-444 `PlainAttribute._direct_read` / `_prim_direct_read` /
+/// mapdict.py `PlainAttribute._direct_read` / `_prim_direct_read` /
 /// `_pure_direct_read` have identical bodies; the `@jit.elidable`
 /// `_pure_direct_read` variant is applied when the read is JIT-wired.
 /// `unerase_item` is identity. For an `UnboxedPlainAttribute`,
-/// mapdict.py:592-612 gives `_direct_read` the allow-unboxing conversion tail;
+/// mapdict.py gives `_direct_read` the allow-unboxing conversion tail;
 /// pyre places that tail in `direct_read`.
 ///
 /// # Safety
@@ -3460,12 +3460,12 @@ pub unsafe fn plain_direct_read<O: MapdictObject>(attr: MapRef, obj: &O) -> PyOb
         // mapdict.py:443 — boxed value straight out of the slot.
         None => obj._mapdict_read_storage(p.storageindex),
         Some(u) => {
-            // _prim_direct_read (mapdict.py:600-601): box the longlong at
+            // _prim_direct_read (mapdict.py): box the longlong at
             // (storageindex, listindex).
             let slot = obj._mapdict_read_storage(p.storageindex);
             let raw = unsafe { unboxed_items(slot)[u.listindex] };
             let w_res = box_value(u.typ, raw);
-            // This is `_prim_direct_read` (mapdict.py:600-601), the non-converting
+            // This is `_prim_direct_read` (mapdict.py), the non-converting
             // read shared by node_read / copy_attr / reorder_and_add /
             // materialize. `_direct_read`'s lazy migrate-to-boxed side effect
             // (mapdict.py:592-598, when the class has frozen unboxing) lives at
@@ -3476,8 +3476,8 @@ pub unsafe fn plain_direct_read<O: MapdictObject>(attr: MapRef, obj: &O) -> PyOb
     }
 }
 
-/// mapdict.py:446-447 `PlainAttribute._direct_write`. `erase_item` is identity.
-/// For an `UnboxedPlainAttribute` this is mapdict.py:614-628.
+/// mapdict.py `PlainAttribute._direct_write`. `erase_item` is identity.
+/// For an `UnboxedPlainAttribute` this is mapdict.py.
 ///
 /// # Safety
 /// `attr` must point to a live `PlainAttribute` map node.
@@ -3513,8 +3513,8 @@ pub unsafe fn plain_direct_write<O: MapdictObject>(
     }
 }
 
-/// mapdict.py:312-313 `Terminator._read_terminator` and its
-/// `DevolvedDictTerminator` override (mapdict.py:387-391). Returns the value or
+/// mapdict.py `Terminator._read_terminator` and its
+/// `DevolvedDictTerminator` override (mapdict.py). Returns the value or
 /// `None` when the attribute is absent.
 ///
 /// # Safety
@@ -3546,7 +3546,7 @@ unsafe fn terminator_read_checked<O: MapdictObject>(
     let t = unsafe { (*term).as_terminator() };
     match t.kind {
         TerminatorKind::Devolved if attrkind == DICT => {
-            // mapdict.py:383-388: the devolved terminator reads DICT attributes
+            // mapdict.py: the devolved terminator reads DICT attributes
             // from the materialised instance dict (`space.finditem_str(
             // obj.getdict(space), name)`).  `finditem_str` is fallible: the
             // probe compares against whatever the bucket holds, so a stored
@@ -3566,7 +3566,7 @@ unsafe fn terminator_read_checked<O: MapdictObject>(
     }
 }
 
-/// mapdict.py:55-66 `AbstractAttribute.read`.
+/// mapdict.py `AbstractAttribute.read`.
 ///
 /// # Safety
 /// `self_node` and its chain must point to live map nodes.
@@ -3580,7 +3580,7 @@ pub unsafe fn node_read<O: MapdictObject>(
 }
 
 /// [`node_read_checked`] plus `_direct_read`'s migration tail
-/// (mapdict.py:592-598), both taken off the node this resolves once — the read
+/// (mapdict.py), both taken off the node this resolves once — the read
 /// the getattr and slot boundaries owe.
 ///
 /// Splitting them costs a second `find_map_attr` for the same
@@ -3619,7 +3619,7 @@ pub unsafe fn node_read_checked<O: MapdictObject>(
     match unsafe { find_map_attr(self_node, name, attrkind) } {
         // The `jit.isconstant(attr) and jit.isconstant(obj) and not
         // attr.ever_mutated` guard selects `_pure_direct_read`
-        // (mapdict.py:60-65). The PlainAttribute variants have the same body;
+        // (mapdict.py). The PlainAttribute variants have the same body;
         // UnboxedPlainAttribute._direct_read's conversion tail lives in
         // `direct_read`.
         Some(attr) => Ok(Some(unsafe { plain_direct_read(attr, obj) })),
@@ -3627,11 +3627,11 @@ pub unsafe fn node_read_checked<O: MapdictObject>(
     }
 }
 
-// ── copy / delete path (mapdict.py:326-330, 433-435, 461-475) ─────────
+// ── copy / delete path (mapdict.py, 433-435, 461-475) ─────────
 
-/// mapdict.py:433-435 `PlainAttribute._copy_attr` — read this attribute from
+/// mapdict.py `PlainAttribute._copy_attr` — read this attribute from
 /// `obj` and re-add it to the freshly built `new_obj`. The read is
-/// `_prim_direct_read` (mapdict.py:440/600-601, the non-converting raw read);
+/// `_prim_direct_read` (mapdict.py/600-601, the non-converting raw read);
 /// pyre's `plain_direct_read` performs exactly that — boxing the longlong slot
 /// when the attribute is unboxed — and defers only the read-path lazy re-box
 /// (`_direct_read`'s allow-unboxing/convert distinction, see
@@ -3666,7 +3666,7 @@ unsafe fn copy_attr<O: MapdictObject>(attr_node: MapRef, obj: &O, new_obj: &mut 
     };
 }
 
-/// mapdict.py:326-330 `Terminator.copy` / 472-475 `PlainAttribute.copy` — build
+/// mapdict.py `Terminator.copy` / 472-475 `PlainAttribute.copy` — build
 /// a fresh `Object` carrier holding the same attributes as `obj` (in canonical
 /// order: the back-chain is copied bottom-up, then the node re-adds itself).
 ///
@@ -3679,12 +3679,12 @@ unsafe fn node_copy<O: MapdictObject>(self_node: MapRef, obj: &O) -> Object {
         unsafe { copy_attr(self_node, obj, &mut new_obj) };
         new_obj
     } else {
-        // Terminator.copy (mapdict.py:326-330): empty carrier on this terminator.
+        // Terminator.copy (mapdict.py): empty carrier on this terminator.
         Object::new_empty(self_node)
     }
 }
 
-/// mapdict.py:338-342 `Terminator.set_terminator`, 483-486
+/// mapdict.py `Terminator.set_terminator`, 483-486
 /// `PlainAttribute.set_terminator`, 414-418 `DevolvedDictTerminator.set_terminator`
 /// — rebuild a fresh `Object` carrier holding `obj`'s attributes (canonical
 /// order, like `node_copy`) but rooted at `new_terminator`. A devolved root
@@ -3723,7 +3723,7 @@ unsafe fn node_set_terminator<O: MapdictObject>(
     }
 }
 
-/// mapdict.py:77-78 `AbstractAttribute.delete` (Terminator/DictTerminator,
+/// mapdict.py `AbstractAttribute.delete` (Terminator/DictTerminator,
 /// returns `None`) and 461-470 `PlainAttribute.delete`. Returns the rebuilt
 /// carrier with `(name, attrkind)` removed, or `None` if the attribute is
 /// absent.
@@ -3754,11 +3754,11 @@ unsafe fn node_delete<O: MapdictObject>(
             None => None,
         }
     } else {
-        // mapdict.py:77-78 Terminator.delete (DictTerminator/NoDictTerminator
+        // mapdict.py Terminator.delete (DictTerminator/NoDictTerminator
         // inherit) returns None.
         let kind = unsafe { (*self_node).as_terminator() }.kind;
         match kind {
-            // mapdict.py:398-409 DevolvedDictTerminator.delete: drop the DICT
+            // mapdict.py DevolvedDictTerminator.delete: drop the DICT
             // attribute from the materialised instance dict (a miss is tolerated
             // — mapdict.py:403-407 swallows KeyError), then return an empty
             // carrier on this terminator (`Terminator.copy(self, obj)`).
@@ -3785,10 +3785,10 @@ unsafe fn node_delete<O: MapdictObject>(
     }
 }
 
-/// mapdict.py:344-345 `Terminator.remove_dict_entries` (= `self.copy(obj)`) and
+/// mapdict.py `Terminator.remove_dict_entries` (= `self.copy(obj)`) and
 /// :511-515 `PlainAttribute.remove_dict_entries` — rebuild a fresh carrier that
 /// keeps every non-`DICT` attribute and drops the `DICT` ones. Used by
-/// `MapDictStrategy.clear` (mapdict.py:1222-1225). Reuses the `node_copy` /
+/// `MapDictStrategy.clear` (mapdict.py). Reuses the `node_copy` /
 /// `copy_attr` machinery already built for `delete`.
 ///
 /// # Safety
@@ -3799,18 +3799,18 @@ unsafe fn node_remove_dict_entries<O: MapdictObject>(self_node: MapRef, obj: &O)
         let back = p.back;
         // mapdict.py:512 — recurse into `back` first.
         let mut new_obj = unsafe { node_remove_dict_entries(back, obj) };
-        // mapdict.py:513-514 — re-add this attribute unless it is a DICT entry.
+        // mapdict.py — re-add this attribute unless it is a DICT entry.
         if p.attrkind != DICT {
             unsafe { copy_attr(self_node, obj, &mut new_obj) };
         }
         new_obj
     } else {
-        // mapdict.py:344-345 Terminator.remove_dict_entries = self.copy(obj).
+        // mapdict.py Terminator.remove_dict_entries = self.copy(obj).
         unsafe { node_copy(self_node, obj) }
     }
 }
 
-/// mapdict.py:362-366 `DictTerminator.materialize_r_dict`/`materialize_str_dict`
+/// mapdict.py `DictTerminator.materialize_r_dict`/`materialize_str_dict`
 /// + 493-509 `PlainAttribute.materialize_r_dict`/`materialize_str_dict`. Drain
 /// the DICT attributes into `w_dict` (already switched to its real strategy) and
 /// rebuild a fresh carrier keeping only the non-DICT attributes, rooted at the
@@ -3850,7 +3850,7 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
             )
         };
         if p.attrkind == DICT {
-            // mapdict.py:495-497/504-506 — move the DICT attribute into the
+            // mapdict.py/504-506 — move the DICT attribute into the
             // materialised dict (`dict_w[space.newtext(name)] =
             // self._prim_direct_read(obj)`). `plain_direct_read` performs that
             // prim read, boxing the slot when the attribute is unboxed.
@@ -3873,12 +3873,12 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
                 *slot = pyre_object::gc_roots::shadow_stack_get(storage_slot + i);
             }
         } else {
-            // mapdict.py:499/508 — keep the non-DICT attribute on the carrier.
+            // mapdict.py/508 — keep the non-DICT attribute on the carrier.
             unsafe { copy_attr(self_node, obj, &mut new_obj) };
         }
         new_obj
     } else {
-        // mapdict.py:362-372 DictTerminator.materialize_* → `_make_devolved`: an
+        // mapdict.py DictTerminator.materialize_* → `_make_devolved`: an
         // empty carrier on the paired DevolvedDictTerminator.
         let t = unsafe { (*self_node).as_terminator() };
         match t.kind {
@@ -3896,7 +3896,7 @@ unsafe fn node_materialize_dict<O: MapdictObject>(
     }
 }
 
-/// mapdict.py:1305-1308 `materialize_r_dict` / 1310-1313 `materialize_str_dict`
+/// mapdict.py `materialize_r_dict` / 1310-1313 `materialize_str_dict`
 /// (module-level) — run the chain over `obj`'s map to fill `w_dict`, then
 /// transplant the rebuilt (devolved) storage+map back onto `obj`. The backing
 /// instance is always a `W_ObjectObject` (the only `MapdictDictSupport`
@@ -3925,9 +3925,9 @@ unsafe fn materialize_dict(obj: PyObjectRef, w_dict: PyObjectRef) {
     inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
 }
 
-// ── write path (mapdict.py:68-258, 312-321, 668-691) ──────────────────
+// ── write path (mapdict.py, 312-321, 668-691) ──────────────────
 
-/// mapdict.py:668-691 `CachedAttributeHolder` — caches the child map produced
+/// mapdict.py `CachedAttributeHolder` — caches the child map produced
 /// by adding `(name, attrkind)` to a parent map, so transitions are shared.
 /// Interned/immortal like the map nodes it holds.
 pub struct CachedAttributeHolder {
@@ -4005,7 +4005,7 @@ impl CachedAttributeHolder {
     }
 }
 
-/// `quasiimmut.py:17-27 get_current_qmut_instance` for a CachedAttributeHolder's `attr?` field.
+/// `quasiimmut.py get_current_qmut_instance` for a CachedAttributeHolder's `attr?` field.
 ///
 /// # Safety
 /// `holder` must be null or point at a live owner.
@@ -4039,7 +4039,7 @@ pub unsafe fn holder_force_attr_qmut(holder: *const CachedAttributeHolder) {
     unsafe { (*holder).force_attr_qmut() };
 }
 
-/// `quasiimmut.py:17-27 get_current_qmut_instance` for a CachedAttributeHolder's `typ?` field.
+/// `quasiimmut.py get_current_qmut_instance` for a CachedAttributeHolder's `typ?` field.
 ///
 /// # Safety
 /// `holder` must be null or point at a live owner.
@@ -4073,7 +4073,7 @@ pub unsafe fn holder_force_typ_qmut(holder: *const CachedAttributeHolder) {
     unsafe { (*holder).force_typ_qmut() };
 }
 
-/// mapdict.py:670-676 `CachedAttributeHolder.__init__`.
+/// mapdict.py `CachedAttributeHolder.__init__`.
 ///
 /// # Safety
 /// `back` must point to a live map node.
@@ -4097,7 +4097,7 @@ unsafe fn new_cached_attribute_holder(
     }))
 }
 
-/// mapdict.py:679-691 `CachedAttributeHolder.pick_attr`.
+/// mapdict.py `CachedAttributeHolder.pick_attr`.
 ///
 /// # Safety
 /// `holder` must point to a live `CachedAttributeHolder`.
@@ -4121,7 +4121,7 @@ unsafe fn holder_pick_attr(
     new_attr
 }
 
-/// mapdict.py:149-156 `AbstractAttribute._get_new_attr`.
+/// mapdict.py `AbstractAttribute._get_new_attr`.
 ///
 /// # Safety
 /// `self_node` must point to a live map node.
@@ -4150,7 +4150,7 @@ unsafe fn get_new_attr(
     holder
 }
 
-/// mapdict.py:170-193 `AbstractAttribute._find_branch_to_move_into`.
+/// mapdict.py `AbstractAttribute._find_branch_to_move_into`.
 ///
 /// # Safety
 /// `self_node` and its chain must point to live map nodes.
@@ -4277,7 +4277,7 @@ pub unsafe fn classify_mapdict_write_attr(w_obj: PyObjectRef, name: &str) -> Opt
     Some(unsafe { classify_attr(w_type, w_descr, true) })
 }
 
-/// Return the first `?` field mapdict.py:68-75 `AbstractAttribute.write` would
+/// Return the first `?` field mapdict.py `AbstractAttribute.write` would
 /// flip, without performing the write or interning a transition.
 ///
 /// Watcher installation belongs to the tracer. This predicate never reads an
@@ -4325,7 +4325,7 @@ pub unsafe fn setattr_would_force_quasi_immut(
     }
 }
 
-/// Return the first `?` field mapdict.py:77-78 / 461-470 delete would flip,
+/// Return the first `?` field mapdict.py / 461-470 delete would flip,
 /// without applying the deletion.
 ///
 /// The `PlainAttribute.delete` → `_copy_attr` → `add_attr` → `pick_attr`
@@ -4357,7 +4357,7 @@ pub unsafe fn delattr_would_force_quasi_immut(
     None
 }
 
-/// mapdict.py:195-202 `AbstractAttribute._pick_unbox_type`.
+/// mapdict.py `AbstractAttribute._pick_unbox_type`.
 ///
 /// Returns the unbox type when the terminator allows unboxing and the value is
 /// an unboxable int (only on 64-bit, `ALLOW_UNBOXING_INTS`) or float.
@@ -4377,8 +4377,8 @@ unsafe fn pick_unbox_type(self_node: MapRef, w_value: PyObjectRef) -> Option<Unb
     None
 }
 
-/// mapdict.py:449-459 `PlainAttribute._switch_map_and_write_increase_storage1`
-/// and the `UnboxedPlainAttribute` override (mapdict.py:629-646).
+/// mapdict.py `PlainAttribute._switch_map_and_write_increase_storage1`
+/// and the `UnboxedPlainAttribute` override (mapdict.py).
 ///
 /// # Safety
 /// `attr` must point to a live `PlainAttribute` map node.
@@ -4433,7 +4433,7 @@ unsafe fn switch_map_and_write_increase_storage1<O: MapdictObject>(
     }
 }
 
-/// mapdict.py:204-258 `AbstractAttribute._reorder_and_add` — the complicated
+/// mapdict.py `AbstractAttribute._reorder_and_add` — the complicated
 /// case where a lower-order ancestor already has the attribute, so the
 /// attributes passed on the way up must be saved and re-added in order.
 ///
@@ -4517,7 +4517,7 @@ unsafe fn reorder_and_add<O: MapdictObject>(
     }
 }
 
-/// mapdict.py:157-169 `AbstractAttribute.add_attr`.
+/// mapdict.py `AbstractAttribute.add_attr`.
 ///
 /// # Safety
 /// `self_node` and its chain must point to live map nodes.
@@ -4540,8 +4540,8 @@ pub unsafe fn add_attr<O: MapdictObject>(
     }
 }
 
-/// mapdict.py:312-321 `Terminator._write_terminator` plus the
-/// `NoDictTerminator` override (mapdict.py:377-380).
+/// mapdict.py `Terminator._write_terminator` plus the
+/// `NoDictTerminator` override (mapdict.py).
 ///
 /// # Safety
 /// `term` must point to a live Terminator map node.
@@ -4557,7 +4557,7 @@ unsafe fn write_terminator<O: MapdictObject>(
         // NoDictTerminator: object without __dict__ rejects DICT writes.
         TerminatorKind::NoDict if attrkind == DICT => return false,
         TerminatorKind::Devolved if attrkind == DICT => {
-            // mapdict.py:390-396: the devolved terminator writes DICT attributes
+            // mapdict.py: the devolved terminator writes DICT attributes
             // into the materialised instance dict (`space.setitem_str(
             // obj.getdict(space), name, w_value)`).  `getdict` builds the
             // wrapper when the SPECIAL slot is still empty, so the incoming
@@ -4586,7 +4586,7 @@ unsafe fn write_terminator<O: MapdictObject>(
         // >= LIMIT_MAP_ATTRIBUTES DICT attributes, devolve its `__dict__` to a
         // UnicodeDictStrategy r_dict. `obj.getdict()` returns the MapDictStrategy
         // view installed by the `_obj_getdict` flip (asserted MapDictStrategy at
-        // mapdict.py:320-322); `switch_to_text_strategy` materialises the DICT
+        // mapdict.py); `switch_to_text_strategy` materialises the DICT
         // attributes into the fresh strategy and rebuilds the map rooted at the
         // DevolvedDictTerminator. Only reachable for a `W_ObjectObject` carrier:
         // a devolved instance returns early through the Devolved arm above, and an
@@ -4606,7 +4606,7 @@ unsafe fn write_terminator<O: MapdictObject>(
     true
 }
 
-/// mapdict.py:68-75 `AbstractAttribute.write`.
+/// mapdict.py `AbstractAttribute.write`.
 ///
 /// # Safety
 /// `self_node` and its chain must point to live map nodes.
@@ -4685,7 +4685,7 @@ static MAPDICT_ROOT_AREA: MapdictRootArea = MapdictRootArea;
 
 // ── MapdictDictSupport ────────────────────────────────────────────────
 
-/// `MapDictStrategy.length` (mapdict.py:1213-1220) — count the DICT attributes
+/// `MapDictStrategy.length` (mapdict.py) — count the DICT attributes
 /// by walking the `search(DICT)` chain. `dont_look_inside`: the map-node layer
 /// (incl. `ensure_mapdict_initialized` → `new_instance_terminator`) is a JIT
 /// residual boundary while Slice D's unboxed branches stay unported, matching
@@ -4701,7 +4701,7 @@ pub unsafe fn instance_node_dict_length(obj: PyObjectRef) -> usize {
     let mut res: usize = 0;
     let mut curr = node_search(inst._get_mapdict_map(), DICT);
     while let Some(node) = curr {
-        // mapdict.py:1216-1219: advance to `back`, re-search, count.
+        // mapdict.py: advance to `back`, re-search, count.
         let back = (*node).as_plain().back;
         curr = node_search(back, DICT);
         res += 1;
@@ -4709,7 +4709,7 @@ pub unsafe fn instance_node_dict_length(obj: PyObjectRef) -> usize {
     res
 }
 
-/// `MapDictStrategy.clear` (mapdict.py:1222-1225) — rebuild the instance's
+/// `MapDictStrategy.clear` (mapdict.py) — rebuild the instance's
 /// map+storage with every DICT entry dropped. `dont_look_inside` (same rationale
 /// as [`instance_node_dict_length`]).
 ///
@@ -4726,7 +4726,7 @@ pub unsafe fn instance_node_dict_clear(obj: PyObjectRef) {
 }
 
 /// Collect the instance's DICT attribute nodes in insertion order (oldest
-/// first): walk `search(DICT)` newest-first (mapdict.py:1240-1247) then reverse
+/// first): walk `search(DICT)` newest-first (mapdict.py) then reverse
 /// (mapdict.py:1250). Shared by the keys/values/items wrappers.
 ///
 /// # Safety
@@ -4748,7 +4748,7 @@ unsafe fn dict_nodes_in_order<O: MapdictObject>(inst: &O) -> Vec<MapRef> {
     ordered
 }
 
-/// `MapDictStrategy.iterkeys` materialised (mapdict.py:1269-1272 / w_keys) —
+/// `MapDictStrategy.iterkeys` materialised (mapdict.py / w_keys) —
 /// the DICT attribute names wrapped as str keys, in insertion order.
 /// `dont_look_inside` (same rationale).
 ///
@@ -4774,11 +4774,11 @@ pub unsafe fn instance_node_dict_keys(obj: PyObjectRef) -> Vec<PyObjectRef> {
     keys
 }
 
-/// `MapDictStrategy` values materialised (mapdict.py:1273-1276) — the DICT
+/// `MapDictStrategy` values materialised (mapdict.py) — the DICT
 /// attribute values in insertion order. `dont_look_inside` (same rationale).
 ///
 /// Reads via `plain_direct_read` (the pure `_prim_direct_read`), intentionally
-/// omitting the `_direct_read` convert-on-read tail (mapdict.py:592-598). That
+/// omitting the `_direct_read` convert-on-read tail (mapdict.py). That
 /// tail is value-invisible — it returns the same box and only re-lays-out
 /// storage — and upstream performs it safely only because `MapDictIterator*`
 /// is name-keyed and lazy, re-resolving each attr against the rebuilt map on
@@ -4817,7 +4817,7 @@ pub unsafe fn instance_node_dict_values(obj: PyObjectRef) -> Vec<PyObjectRef> {
     vals
 }
 
-/// `MapDictStrategy` items materialised (mapdict.py:1275-1276) — (str key,
+/// `MapDictStrategy` items materialised (mapdict.py) — (str key,
 /// value) pairs in insertion order. `dont_look_inside` (same rationale).
 ///
 /// Uses the pure `plain_direct_read` and omits the `_direct_read` convert-on-
@@ -4855,7 +4855,7 @@ pub unsafe fn instance_node_dict_items(obj: PyObjectRef) -> Vec<(PyObjectRef, Py
     out
 }
 
-/// rerased unerase for [`MapDictStrategy`] (mapdict.py:1125-1127): the dict's
+/// rerased unerase for [`MapDictStrategy`] (mapdict.py): the dict's
 /// erased `dstorage` IS the backing instance (mapdict.py:1502
 /// `strategy.erase(self)`), so unerasing yields the `W_ObjectObject`
 /// PyObjectRef directly.
@@ -4867,7 +4867,7 @@ unsafe fn mapdict_strategy_unerase(w_dict: PyObjectRef) -> PyObjectRef {
     dict.dstorage as PyObjectRef
 }
 
-/// `MapDictStrategy.switch_to_object_strategy` (mapdict.py:1139-1146) —
+/// `MapDictStrategy.switch_to_object_strategy` (mapdict.py) —
 /// install a fresh ObjectDictStrategy r_dict over the dict, then materialise the
 /// instance's DICT attributes into it (the map devolves to its paired
 /// DevolvedDictTerminator). `dont_look_inside` keeps the residual boundary like
@@ -4876,7 +4876,7 @@ unsafe fn mapdict_strategy_unerase(w_dict: PyObjectRef) -> PyObjectRef {
 /// callers (`getitem`/`setitem`/`delitem` non-str arms) stay lowerable.
 ///
 /// Unlike a typed strategy's switch, the old `dstorage` here is the backing
-/// `W_ObjectObject` (mapdict.py:1502 `strategy.erase(self)`), an immortal Box,
+/// `W_ObjectObject` (mapdict.py `strategy.erase(self)`), an immortal Box,
 /// not an owned r_dict — so it is overwritten, never freed.
 ///
 /// # Safety
@@ -4907,7 +4907,7 @@ pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
     unsafe { materialize_dict(w_obj, pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
 }
 
-/// `MapDictStrategy.switch_to_text_strategy` (mapdict.py:1148-1155) — the
+/// `MapDictStrategy.switch_to_text_strategy` (mapdict.py) — the
 /// LIMIT-devolve sibling of [`mapdict_switch_to_object_strategy`]: install a
 /// fresh UnicodeDictStrategy r_dict and materialise into it. Same residual
 /// boundary and same overwrite-not-free `dstorage` contract.
@@ -4932,7 +4932,7 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
     unsafe { materialize_dict(w_obj, pyre_object::gc_roots::shadow_stack_get(dict_slot)) };
 }
 
-/// mapdict.py:1123-1279 `MapDictStrategy` — the dict strategy a user instance's
+/// mapdict.py `MapDictStrategy` — the dict strategy a user instance's
 /// `__dict__` adopts. `dstorage` erases the backing `W_ObjectObject`
 /// (mapdict.py:1502), so every routed get/set/del/iter funnels into the
 /// instance's mapdict map+storage. `_obj_getdict` installs this view.
@@ -4948,7 +4948,7 @@ pub fn get_terminator_for_dicts() -> MapRef {
     *TERMINATOR_FOR_DICTS as MapRef
 }
 
-/// mapdict.py:1299-1303 `make_instance_dict`.
+/// mapdict.py `make_instance_dict`.
 #[majit_macros::dont_look_inside]
 pub fn make_instance_dict() -> PyObjectRef {
     let w_fake_object = pyre_object::w_instance_new(pyre_object::PY_NULL);
@@ -4978,7 +4978,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         pyre_object::dictmultiobject::StrategyKind::Map
     }
 
-    /// mapdict.py:1132-1137 `get_empty_storage` — "mainly used for tests": a
+    /// mapdict.py `get_empty_storage` — "mainly used for tests": a
     /// fresh fake `W_ObjectObject` carrier on the shared dict terminator,
     /// erased. Production dstorage is likewise the backing instance
     /// (mapdict.py:1502).
@@ -4991,7 +4991,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         w_result as *mut u8
     }
 
-    /// mapdict.py:1157-1166 `getitem`.
+    /// mapdict.py `getitem`.
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
         if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
             // mapdict.py:1161 `space.text_w(w_key)` — an exact str key
@@ -5019,14 +5019,14 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         )
     }
 
-    /// mapdict.py:1168-1170 `getitem_str` — `w_obj.getdictvalue(space, key)`.
+    /// mapdict.py `getitem_str` — `w_obj.getdictvalue(space, key)`.
     /// The trait key is a UTF-8 `&str`; a UTF-8 string is valid WTF-8, so the
     /// node lookup uses its `Wtf8` view directly.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
         instance_node_getdictvalue(mapdict_strategy_unerase(w_dict), Wtf8::new(key))
     }
 
-    /// mapdict.py:1177-1183 `setitem`.
+    /// mapdict.py `setitem`.
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
         if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
             // mapdict.py:1180 — store under the full WTF-8 name so a
@@ -5053,7 +5053,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         );
     }
 
-    /// mapdict.py:1172-1175 `setitem_str` — `flag = w_obj.setdictvalue(...);
+    /// mapdict.py `setitem_str` — `flag = w_obj.setdictvalue(...);
     /// assert flag`. The receiver is the instance behind a materialised
     /// `__dict__` view, so its terminator has a dict and the write cannot fail.
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
@@ -5062,7 +5062,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         debug_assert!(flag, "mapdict.py:1174 assert flag");
     }
 
-    /// mapdict.py:1185-1196 `setdefault`.
+    /// mapdict.py `setdefault`.
     unsafe fn setdefault(
         &self,
         w_dict: PyObjectRef,
@@ -5100,11 +5100,11 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         .unwrap_or_else(|_| pyre_object::gc_roots::shadow_stack_get(default_slot))
     }
 
-    /// mapdict.py:1198-1211 `delitem`. pyre's trait returns `bool` (true =
+    /// mapdict.py `delitem`. pyre's trait returns `bool` (true =
     /// removed) where PyPy raises KeyError on a miss; the caller raises.
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
         if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
-            // mapdict.py:1203 — delete by the full WTF-8 name (a surrogate
+            // mapdict.py — delete by the full WTF-8 name (a surrogate
             // name addresses a real node, no strategy switch).
             return instance_node_deldictvalue(
                 mapdict_strategy_unerase(w_dict),
@@ -5124,32 +5124,32 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         )
     }
 
-    /// mapdict.py:1213-1220 `length`.
+    /// mapdict.py `length`.
     unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
         instance_node_dict_length(mapdict_strategy_unerase(w_dict))
     }
 
-    /// mapdict.py:1269-1272 `iterkeys` materialised.
+    /// mapdict.py `iterkeys` materialised.
     unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
         instance_node_dict_keys(mapdict_strategy_unerase(w_dict))
     }
 
-    /// mapdict.py:1273-1274 `itervalues` materialised.
+    /// mapdict.py `itervalues` materialised.
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
         instance_node_dict_values(mapdict_strategy_unerase(w_dict))
     }
 
-    /// mapdict.py:1275-1276 `iteritems` materialised.
+    /// mapdict.py `iteritems` materialised.
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
         instance_node_dict_items(mapdict_strategy_unerase(w_dict))
     }
 
-    /// mapdict.py:1222-1225 `clear`.
+    /// mapdict.py `clear`.
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         instance_node_dict_clear(mapdict_strategy_unerase(w_dict));
     }
 
-    /// mapdict.py:1227-1235 `popitem`.
+    /// mapdict.py `popitem`.
     unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
         // The receiver is a `dict` and moves; it is published before the first
         // allocation below rather than alongside the carrier further down,
@@ -5163,9 +5163,9 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let map = inst._get_mapdict_map();
         let curr = node_search(map, DICT)?;
         let key = &(*curr).as_plain().name;
-        // mapdict.py:1231 reads the value with `getitem_str(w_dict, key)`, but
+        // mapdict.py reads the value with `getitem_str(w_dict, key)`, but
         // the trait's `getitem_str` takes a `&str` and a node name is WTF-8:
-        // `setitem` stores the full name (mapdict.py:1180), so a lone surrogate
+        // `setitem` stores the full name (mapdict.py), so a lone surrogate
         // is a node here and has no `&str` form. The `node_search` hit makes
         // the value-present arm explicit: `node_read` would return
         // `Some(plain_direct_read(curr, inst))` (mapdict.py:55-66).
@@ -5183,8 +5183,8 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
             pyre_object::gc_roots::pin_roots(&[pyre_object::unicodeobject::box_str_constant(key)]);
         let inst = mapdict_carrier(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         let value_slot = pyre_object::gc_roots::pin_roots(&[plain_direct_read(curr, &inst)]);
-        // `plain_direct_read` is only `_prim_direct_read` (mapdict.py:600-601).
-        // The read still owes `_direct_read`'s tail (mapdict.py:592-598): an
+        // `plain_direct_read` is only `_prim_direct_read` (mapdict.py).
+        // The read still owes `_direct_read`'s tail (mapdict.py): an
         // unboxed attribute whose terminator has stopped allowing unboxing
         // converts the whole instance to boxed storage. `getdictvalue` pairs
         // the two the same way.
@@ -5200,7 +5200,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         ))
     }
 
-    /// mapdict.py:1237-1253 `copy`.
+    /// mapdict.py `copy`.
     unsafe fn copy(&self, w_dict: PyObjectRef) -> PyObjectRef {
         use pyre_object::dictmultiobject::DictStrategy;
 
@@ -5251,7 +5251,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         ))
     }
 
-    /// mapdict.py:1278-1279 `MapDictKeyIteratorReversed`.
+    /// mapdict.py `MapDictKeyIteratorReversed`.
     unsafe fn getiterreversed(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
         let w_obj = mapdict_strategy_unerase(w_dict);
         let _instance_guard = instance_lock(w_obj);
@@ -5280,7 +5280,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         items
     }
 
-    /// mapdict.py:1139-1146 `switch_to_object_strategy` — Slice E (#196). The
+    /// mapdict.py `switch_to_object_strategy` — Slice E (#196). The
     /// default would mis-read the instance `dstorage` as an ObjectDictStrategy
     /// `IndexMap`, so override to the materialise stub.
     unsafe fn switch_to_object_strategy(&self, w_dict: PyObjectRef) {
@@ -5288,7 +5288,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     }
 
     /// The dict is a view over the backing instance (`dstorage =
-    /// erase(self)`, mapdict.py:1502). `MapDictStrategy.erase/unerase =
+    /// erase(self)`, mapdict.py). `MapDictStrategy.erase/unerase =
     /// rerased.new_erasing_pair("map")` (mapdict.py:1125) boxes the
     /// instance as a real GC reference, so `dstorage` is a true GC edge
     /// the translated `W_DictMultiObject` tracer forwards. Visit the
@@ -5314,7 +5314,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     }
 }
 
-/// objspace/std/mapdict.py:826-840 _obj_getdict.
+/// objspace/std/mapdict.py _obj_getdict.
 ///
 /// ```python
 /// @objectmodel.dont_inline
@@ -5341,7 +5341,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
 /// mapdict.py:826).
 #[majit_macros::dont_look_inside]
 pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
-    // mapdict.py:828-838: read the "dict" SPECIAL slot; on a miss build the
+    // mapdict.py: read the "dict" SPECIAL slot; on a miss build the
     // MapDictStrategy view and write it back into that slot. `strategy.erase(self)`
     // makes the view funnel every get/set/del/iter through the instance map+storage
     // — the single `__dict__` authority.
@@ -5351,9 +5351,9 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     // (`class MyInt(int)`) keep the builtin layout (no map) while their type is
     // hasdict, so their `__dict__` stays in the address-keyed INSTANCE_DICT
     // side table as a plain own-storage dict until subclass instances grow
-    // mapdict storage (upstream `user_setup`, mapdict.py:758).
+    // mapdict storage (upstream `user_setup`, mapdict.py).
     if unsafe { has_mapdict_storage(self_ref) } {
-        // mapdict.py:828-830 `if w_dict is not None`.  RPython's `read` answers
+        // mapdict.py `if w_dict is not None`.  RPython's `read` answers
         // None both for an absent slot and for one holding None, and both mean
         // "build the view" — so a null must not reach the caller.  It would be
         // reported as "the receiver has no dict", which is how
@@ -5762,7 +5762,7 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
     apply_root_rekeys(&WEAKREF_TABLE, weakref_rekeys);
 }
 
-/// objspace/std/mapdict.py:842-860 _obj_setdict.
+/// objspace/std/mapdict.py _obj_setdict.
 ///
 /// ```python
 /// @objectmodel.dont_inline
@@ -5783,7 +5783,7 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
 /// tracer cannot model; the JIT residualises the call (`@dont_look_inside`).
 #[majit_macros::dont_look_inside]
 pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
-    // mapdict.py:848 `space.isinstance_w(w_dict, space.w_dict)` accepts
+    // mapdict.py `space.isinstance_w(w_dict, space.w_dict)` accepts
     // dict subclasses. Pyre's composed dict-subclass representation is
     // resolved by the getdict backing helpers at each raw dict operation,
     // while the SPECIAL slot retains the supplied object's identity.
@@ -5839,7 +5839,7 @@ pub fn _obj_setdict(self_ref: PyObjectRef, w_dict: PyObjectRef) -> Result<(), Py
 
 // ── MapdictWeakrefSupport ─────────────────────────────────────────────
 
-/// objspace/std/mapdict.py:780-787 MapdictWeakrefSupport.getweakref.
+/// objspace/std/mapdict.py MapdictWeakrefSupport.getweakref.
 ///
 /// ```python
 /// def getweakref(self):
@@ -5863,7 +5863,7 @@ pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
     }
 }
 
-/// objspace/std/mapdict.py:789-793 MapdictWeakrefSupport.setweakref.
+/// objspace/std/mapdict.py MapdictWeakrefSupport.setweakref.
 ///
 /// ```python
 /// def setweakref(self, space, weakreflifeline):
@@ -5880,7 +5880,7 @@ pub fn setweakref(self_ref: PyObjectRef, weakreflifeline: PyObjectRef) {
     }
 }
 
-/// objspace/std/mapdict.py:795-797 MapdictWeakrefSupport.delweakref.
+/// objspace/std/mapdict.py MapdictWeakrefSupport.delweakref.
 ///
 /// ```python
 /// def delweakref(self):
@@ -5954,7 +5954,7 @@ mod tests {
     #[test]
     fn cache_entry_validity_keys_on_map_identity_and_version_tag() {
         unsafe {
-            // mapdict.py:1431-1447 is_valid_for_map / _is_valid_for_map. Build a
+            // mapdict.py is_valid_for_map / _is_valid_for_map. Build a
             // real type so the terminator carries a w_cls with a live
             // version_tag.
             crate::typedef::init_typeobjects();
@@ -5972,7 +5972,7 @@ mod tests {
             };
             // matching map + version -> valid for a load
             assert!(entry.is_valid_for_map(attr, false));
-            // a different map fails identity (mapdict.py:1440 `mymap is map`)
+            // a different map fails identity (mapdict.py `mymap is map`)
             let other = new_plain_attribute(wb("y"), DICT, term, 1);
             assert!(!entry.is_valid_for_map(other, false));
             // store gate: valid_for_store == false rejects stores (mapdict.py:1432)
@@ -5985,7 +5985,7 @@ mod tests {
             assert!(store_entry.is_valid_for_map(attr, true));
 
             // a class mutation bumps version_tag -> the entry goes stale
-            // (mapdict.py:1442 `version_tag is self.version_tag`).
+            // (mapdict.py `version_tag is self.version_tag`).
             crate::baseobjspace::mutated(w_cls, None);
             assert!(!entry.is_valid_for_map(attr, false));
             assert!(!store_entry.is_valid_for_map(attr, true));
@@ -6074,7 +6074,7 @@ mod tests {
 
     // A minimal MapdictObject for read-path tests. Storage holds sentinel
     // pointers that are never dereferenced.
-    // mapdict.py:978 `Object` is pyre's production storage carrier (empty map,
+    // mapdict.py `Object` is pyre's production storage carrier (empty map,
     // owned `Vec` storage); the tests drive it under the historical `MockObj`
     // name.
     use super::Object as MockObj;
@@ -6334,7 +6334,7 @@ mod tests {
             assert_eq!(obj._mapdict_storage_length(), 3);
 
             // delete the middle attribute and transplant the rebuilt carrier
-            // (mapdict.py:852-857 deldictvalue).
+            // (mapdict.py deldictvalue).
             let m = obj._get_mapdict_map();
             let new_obj = node_delete(m, &obj, wn("b"), DICT).expect("b present");
             obj._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
@@ -6740,7 +6740,7 @@ mod tests {
     fn instance_dict_wrapper_in_special_slot_not_instance_dict() {
         use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         // An instance's `__dict__` wrapper is stored in the
-        // mapdict "dict" SPECIAL slot (mapdict.py:826-840 _obj_getdict), not in
+        // mapdict "dict" SPECIAL slot (mapdict.py _obj_getdict), not in
         // the INSTANCE_DICT side table. Repeated access returns the same wrapper,
         // and the SPECIAL slot is excluded from the `__dict__` view.
         crate::test_hooks::install_hash_hook();
@@ -6775,7 +6775,7 @@ mod tests {
     #[test]
     fn obj_getdict_rebuilds_the_view_when_the_dict_slot_reads_null() {
         use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
-        // mapdict.py:828-830 `if w_dict is not None` — RPython's `read` answers
+        // mapdict.py `if w_dict is not None` — RPython's `read` answers
         // None both for an absent slot and for one holding None, and both mean
         // "build the view".  Surfacing the null instead makes `getdict` report
         // that the receiver has no dict, which is the single state
@@ -6838,7 +6838,7 @@ mod tests {
     fn instance_custom_trace_and_wrapper_cover_devolved_values() {
         use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         // UAF-prevention case: once an instance devolves (>= LIMIT DICT attrs,
-        // mapdict.py:316-323), its materialised DICT values move into the
+        // mapdict.py), its materialised DICT values move into the
         // wrapper's own backing storage and leave the instance storage. The
         // wrapper stays in the "dict" SPECIAL slot. Coverage is now two-layer:
         // the instance custom trace forwards the wrapper pointer, and the
@@ -6892,7 +6892,7 @@ mod tests {
         use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
         crate::test_hooks::install_hash_hook();
         unsafe {
-            // mapdict.py:316-323: the (LIMIT_MAP_ATTRIBUTES)th DICT write on a
+            // mapdict.py: the (LIMIT_MAP_ATTRIBUTES)th DICT write on a
             // non-devolved instance auto-devolves its `__dict__` to text strategy.
             let term = boxed_dict_terminator();
             let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
@@ -6926,7 +6926,7 @@ mod tests {
             // The backing instance devolved: its map roots at a
             // DevolvedDictTerminator. The "dict" SPECIAL slot (the wrapper,
             // written by obj.getdict() during the LIMIT devolve) is kept on the
-            // rebuilt carrier (mapdict.py:362-372 keeps non-DICT attrs), so the
+            // rebuilt carrier (mapdict.py keeps non-DICT attrs), so the
             // outermost node is that PlainAttribute and the terminator is reached
             // via `.terminator()`. Only the SPECIAL slot survives on storage.
             let inst_map = obj._get_mapdict_map();
@@ -6998,7 +6998,7 @@ mod tests {
         }
     }
 
-    // ── UnboxedPlainAttribute (mapdict.py:532-665) ────────────────────
+    // ── UnboxedPlainAttribute (mapdict.py) ────────────────────
 
     #[test]
     fn unboxed_int_attribute_stores_and_reads() {
@@ -7144,7 +7144,7 @@ mod tests {
             assert!((*obj.map).as_plain().unboxed.is_some());
             // the class becomes type-unstable: freeze unboxing for its terminator.
             (*term).as_terminator().set_allow_unboxing(false);
-            // mapdict.py:592-598 — a read now lazily migrates obj to boxed storage.
+            // mapdict.py — a read now lazily migrates obj to boxed storage.
             let m = obj._get_mapdict_map();
             let attr = find_map_attr(m, wn("x"), DICT).unwrap();
             migrate_to_boxed_if_frozen(attr, &mut obj);

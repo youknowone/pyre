@@ -8,7 +8,7 @@ pub const PYFRAME_VABLE_OWNER_ROOT: &str = "PyFrame";
 /// Virtualizable scalar fields.
 ///
 /// This table is the scalar subset of
-/// `pypy/module/pypyjit/interp_jit.py:25-30`'s `_virtualizable_` list,
+/// `pypy/module/pypyjit/interp_jit.py`'s `_virtualizable_` list,
 /// in declaration order. `PyFrame.lastblock` is deliberately absent:
 /// the frame model tracked by this tree has no block stack. Unwind uses
 /// the `co_exceptiontable` lookup at

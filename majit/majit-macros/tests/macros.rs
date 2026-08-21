@@ -53,7 +53,7 @@ mod driver {
         assert_eq!(compute(5), 26);
         assert_eq!(compute(0), 1);
         assert_eq!(compute(-3), 10);
-        // EF_ELIDABLE_CAN_RAISE — call.py:297 `elif cr:` branch.
+        // EF_ELIDABLE_CAN_RAISE — call.py `elif cr:` branch.
         let (policy, _, _, _, _, _) = __majit_call_policy_compute();
         assert_eq!(policy, 3u8);
     }
@@ -79,7 +79,7 @@ mod driver {
     #[test]
     fn test_elidable_or_memerror_function() {
         assert_eq!(compute_memerror(7), 107);
-        // EF_ELIDABLE_OR_MEMORYERROR — call.py:295 `if cr == "mem":`.
+        // EF_ELIDABLE_OR_MEMORYERROR — call.py `if cr == "mem":`.
         let (policy, _, _, _, _, _) = __majit_call_policy_compute_memerror();
         assert_eq!(policy, 20u8);
     }
@@ -206,7 +206,7 @@ mod jit_module {
             x * 3
         }
 
-        // `#[loop_invariant]` — RPython canonical `rlib/jit.py:162
+        // `#[loop_invariant]` — RPython canonical `rlib/jit.py
         // @loop_invariant`.  `#[jit_loop_invariant]` is a pyre-prefixed
         // alias kept for back-compat (exercised separately in
         // `rpython_attribute_name_module`).
@@ -667,7 +667,7 @@ mod jit_module {
     fn test_rpython_attribute_name_parity() {
         use rpython_attribute_name_module::*;
 
-        // `rlib/jit.py:72 _elidable_function_ = True` — all three elidable
+        // `rlib/jit.py _elidable_function_ = True` — all three elidable
         // variants normalise to the same upstream attribute name (the
         // `_cannot_raise` / `_or_memerror` distinctions are codewriter-
         // derived `EffectInfo` classes per `call.py:292-299`).
@@ -749,7 +749,7 @@ mod jit_module {
     mod look_inside_alias_module {
         use majit_macros::{look_inside, purefunction, purefunction_promote};
 
-        // `rlib/jit.py:142-150 @look_inside` sets `_jit_look_inside_ =
+        // `rlib/jit.py @look_inside` sets `_jit_look_inside_ =
         // True` (line 148) — the opposite of `@dont_look_inside`
         // (`_jit_look_inside_ = False`).
         #[look_inside]
@@ -757,7 +757,7 @@ mod jit_module {
             x + 1
         }
 
-        // `rlib/jit.py:75-78 @purefunction` is a deprecated alias for
+        // `rlib/jit.py @purefunction` is a deprecated alias for
         // `@elidable`; pyre's `#[purefunction]` forwards verbatim so the
         // emitted attribute identifier is `_elidable_function_<NAME>` like
         // canonical `#[elidable]`.
@@ -766,7 +766,7 @@ mod jit_module {
             x * 2
         }
 
-        // `rlib/jit.py:203-205 @purefunction_promote` — deprecated alias
+        // `rlib/jit.py @purefunction_promote` — deprecated alias
         // for `@elidable_promote`; `#[purefunction_promote]` forwards.
         #[purefunction_promote]
         pub fn purefunction_promote_helper(x: i64) -> i64 {
@@ -775,9 +775,9 @@ mod jit_module {
     }
 
     /// RPython parity for the alias / override decorators added in this
-    /// slice: `@look_inside` (`jit.py:148`) flips `_jit_look_inside_` to
-    /// `True`, while `@purefunction` (`jit.py:75`) and
-    /// `@purefunction_promote` (`jit.py:203`) are deprecated aliases for
+    /// slice: `@look_inside` (`jit.py`) flips `_jit_look_inside_` to
+    /// `True`, while `@purefunction` (`jit.py`) and
+    /// `@purefunction_promote` (`jit.py`) are deprecated aliases for
     /// `@elidable` / `@elidable_promote`.
     #[test]
     fn test_look_inside_and_purefunction_aliases() {
@@ -790,8 +790,8 @@ mod jit_module {
         // `_elidable_function_<NAME>` exactly like canonical `@elidable`.
         assert!(std::hint::black_box(_elidable_function_purefunction_helper));
 
-        // `@purefunction_promote` (`jit.py:203`) is the `@elidable_promote`
-        // alias.  `jit.py:185 elidable(func)` puts `_elidable_function_ =
+        // `@purefunction_promote` (`jit.py`) is the `@elidable_promote`
+        // alias.  `jit.py elidable(func)` puts `_elidable_function_ =
         // True` on the ORIGINAL `func` — which pyre stores as the hidden
         // `_orig_<NAME>_unlikely_name` — and NOT on the wrapper `result`
         // returned at `jit.py:201`.
@@ -814,9 +814,9 @@ mod jit_module {
         }
     }
 
-    /// RPython attribute-name parity for `oopspec`.  `rlib/jit.py:255
+    /// RPython attribute-name parity for `oopspec`.  `rlib/jit.py
     /// func.oopspec = spec` (set by `@oopspec(spec)`) and
-    /// `rlib/jit.py:261 func.oopspec = "jit.not_in_trace()"` (set by
+    /// `rlib/jit.py func.oopspec = "jit.not_in_trace()"` (set by
     /// `@not_in_trace`) both write the same attribute name (`oopspec`)
     /// with a string value.  Pyre's `#[oopspec(...)]` and
     /// `#[not_in_trace]` proc-macros emit `pub const oopspec_<NAME>:
@@ -831,7 +831,7 @@ mod jit_module {
 
     /// RPython attribute-name parity: `#[jit_release_gil(save_err = N)]`
     /// emits a named static `_call_aroundstate_target_<NAME>` next to the
-    /// wrapper, mirroring `rffi.py:228
+    /// wrapper, mirroring `rffi.py
     /// call_external_function._call_aroundstate_target_ = funcptr,
     /// save_err`.  Both halves (concrete target + save_err) must be
     /// reachable under this upstream-named identifier so `rg
@@ -959,7 +959,7 @@ mod jit_struct {
             .unwrap()
             .as_field_descr()
             .unwrap();
-        // descr.py:238: fielddescr.parent_descr = get_size_descr(...)
+        // descr.py: fielddescr.parent_descr = get_size_descr(...)
         let parent = value_fd.get_parent_descr().expect("parent_descr wired");
         assert!(std::sync::Arc::ptr_eq(&parent, &node_size));
     }

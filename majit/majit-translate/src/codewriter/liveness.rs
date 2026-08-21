@@ -52,7 +52,7 @@ pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, Re
 /// **Structural divergence (TODO)**: PyPy `liveness.py:67` walks
 /// instructions whose register operands are already
 /// [`Register`] / `ListOfKind` because `flatten_list()`
-/// (`flatten.py:355-371`) projected `Variable` → `Register` at
+/// (`flatten.py`) projected `Variable` → `Register` at
 /// flatten time.  Pyre's `FlatOp::Op` still carries
 /// [`crate::model::SpaceOperation`] with `Variable` slots, so the
 /// liveness pass has to redo the `getcolor` lookup here.  The fix
@@ -60,7 +60,7 @@ pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, Re
 /// can read the kind off the operand directly; until that lands
 /// this helper preserves the same `(kind, color)` answer.
 ///
-/// **RPython invariant** (`flatten.py:382` `getcolor`): every
+/// **RPython invariant** (`flatten.py` `getcolor`): every
 /// `Variable` has a single `(kind, color)` via
 /// `getkind(v.concretetype)` + `regallocs[kind]`.  Reads kind via
 /// `FunctionGraph::concretetype_of(var)` and color via
@@ -125,7 +125,7 @@ fn variable_to_register(
     found
 }
 
-/// RPython liveness.py:82-116: remove_repeated_live.
+/// RPython liveness.py: remove_repeated_live.
 ///
 /// Merges consecutive `-live-` markers into a single one (union of
 /// all live registers). Labels between them are preserved.
@@ -174,7 +174,7 @@ pub fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
 /// Reads each `FlatOp::Op` operand's kind via
 /// `FunctionGraph::concretetype_of(&var)` and color via
 /// `RegAllocator::color_for_variable(&var)`, matching upstream
-/// `flatten.py:382 getcolor` line-for-line.
+/// `flatten.py getcolor` line-for-line.
 fn compute_liveness_pass(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,
@@ -358,10 +358,10 @@ fn compute_liveness_pass(
 // liveness is encoded as a 2 byte offset into the single string all_liveness
 // (which is stored on the metainterp_sd)
 
-/// RPython liveness.py:125 `OFFSET_SIZE`.
+/// RPython liveness.py `OFFSET_SIZE`.
 pub const OFFSET_SIZE: usize = 2;
 
-/// RPython liveness.py:127-131 `encode_offset(pos, code)`.
+/// RPython liveness.py `encode_offset(pos, code)`.
 pub fn encode_offset(pos: usize, code: &mut Vec<u8>) {
     assert_eq!(OFFSET_SIZE, 2);
     code.push((pos & 0xff) as u8);
@@ -369,7 +369,7 @@ pub fn encode_offset(pos: usize, code: &mut Vec<u8>) {
     assert_eq!(pos >> 16, 0);
 }
 
-/// RPython liveness.py:133-136 `decode_offset(jitcode, pc)`.
+/// RPython liveness.py `decode_offset(jitcode, pc)`.
 pub fn decode_offset(jitcode: &[u8], pc: usize) -> usize {
     assert_eq!(OFFSET_SIZE, 2);
     (jitcode[pc] as usize) | ((jitcode[pc + 1] as usize) << 8)
@@ -383,18 +383,18 @@ pub fn decode_offset(jitcode: &[u8], pc: usize) -> usize {
 // | len live_i | len live_r | len live_f
 // | bytes for live_i | bytes for live_r | bytes for live_f
 
-/// RPython liveness.py:147-166 `encode_liveness(live)`.
+/// RPython liveness.py `encode_liveness(live)`.
 ///
 /// Encodes a single register-kind bitset: `live` is a list of register
 /// indices (each `< 256`). Returns the packed bitset bytes (no length
 /// header — the caller is responsible for emitting the three
 /// `len_i/len_r/len_f` header bytes).
 ///
-/// Mirrors RPython's `live = sorted(live)` (liveness.py:148): the input
+/// Mirrors RPython's `live = sorted(live)` (liveness.py): the input
 /// is sorted internally so callers can pass arbitrary-order or
 /// duplicated slices without normalization.
 pub fn encode_liveness(live: &[u8]) -> Vec<u8> {
-    // RPython liveness.py:148 `live = sorted(live)`.
+    // RPython liveness.py `live = sorted(live)`.
     let mut sorted: Vec<u8> = live.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
@@ -424,7 +424,7 @@ pub fn encode_liveness(live: &[u8]) -> Vec<u8> {
 /// Walk an `all_liveness` buffer back into the `(live_i, live_r, live_f)`
 /// records [`encode_liveness`] wrote into it, each with its own offset.
 ///
-/// `assembler.py:236-250 _encode_liveness` appends every record at the
+/// `assembler.py _encode_liveness` appends every record at the
 /// buffer's current end — three count bytes then the three bitsets — so the
 /// buffer is a contiguous run of records starting at 0 and this walk recovers
 /// them exactly. Upstream never needs it: one `Assembler` holds one buffer and
@@ -472,7 +472,7 @@ pub fn decode_liveness_records(all_liveness: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Ve
     records
 }
 
-/// RPython liveness.py:170-200 `LivenessIterator`.
+/// RPython liveness.py `LivenessIterator`.
 ///
 /// Iterates set bit positions from a bitset stored in `all_liveness`
 /// starting at `offset`, producing `length` indices total.
@@ -486,7 +486,7 @@ pub struct LivenessIterator<'a> {
 }
 
 impl<'a> LivenessIterator<'a> {
-    /// RPython liveness.py:172-178 `__init__(self, offset, length, all_liveness)`.
+    /// RPython liveness.py `__init__(self, offset, length, all_liveness)`.
     pub fn new(offset: usize, length: u32, all_liveness: &'a [u8]) -> Self {
         assert!(length != 0);
         LivenessIterator {
@@ -502,7 +502,7 @@ impl<'a> LivenessIterator<'a> {
 impl<'a> Iterator for LivenessIterator<'a> {
     type Item = u32;
 
-    /// RPython liveness.py:184-200 `next(self)`.
+    /// RPython liveness.py `next(self)`.
     fn next(&mut self) -> Option<u32> {
         if self.length == 0 {
             return None;

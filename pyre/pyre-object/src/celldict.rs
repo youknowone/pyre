@@ -14,7 +14,7 @@
 //! plus the supporting `VersionTag` / `ModuleDictStorage` types.
 //! Bodies are stubbed against an in-memory `Vec<(String,
 //! PyObjectRef)>` because the cell-indirection layer
-//! (`pypy/objspace/std/typeobject.py:22-71 MutableCell / write_cell
+//! (`pypy/objspace/std/typeobject.py MutableCell / write_cell
 //! / unwrap_cell`) is a separate port.  Until that lands the
 //! strategy stores raw values directly, which is observationally
 //! correct (cells are a JIT speed optimisation, not a semantic
@@ -37,7 +37,7 @@ use crate::w_str_new;
 // ── MutableCell family ──────────────────────────────────────────────
 //
 // `pypy/objspace/std/typeobject.py:22-71` defines the cell layer
-// referenced by `celldict.py:80-90 _setitem_str_cell_known` and
+// referenced by `celldict.py _setitem_str_cell_known` and
 // `:143-145 getitem_str`.  PyPy keeps a level of indirection so that
 // frequently-rewritten module / type attributes mutate the cell's
 // payload without bumping `mstrategy.version`, which keeps JIT inline
@@ -96,14 +96,14 @@ pub const W_OBJECT_MUTABLE_CELL_GC_TYPE_ID: u32 = 49;
 /// GC type id assigned to `IntMutableCell`.
 pub const W_INT_MUTABLE_CELL_GC_TYPE_ID: u32 = 50;
 
-/// `typeobject.py:26-34 ObjectMutableCell`.
+/// `typeobject.py ObjectMutableCell`.
 #[repr(C)]
 pub struct ObjectMutableCell {
     pub ob_header: PyObject,
     pub w_value: PyObjectRef,
 }
 
-/// `typeobject.py:37-45 IntMutableCell`.
+/// `typeobject.py IntMutableCell`.
 #[repr(C)]
 pub struct IntMutableCell {
     pub ob_header: PyObject,
@@ -182,7 +182,7 @@ pub unsafe fn is_mutable_cell(obj: PyObjectRef) -> bool {
     is_object_mutable_cell(obj) || is_int_mutable_cell(obj)
 }
 
-/// `typeobject.py:48-51 unwrap_cell`:
+/// `typeobject.py unwrap_cell`:
 ///
 /// ```python
 /// def unwrap_cell(space, w_value):
@@ -223,7 +223,7 @@ pub unsafe fn unwrap_cell(w_value: PyObjectRef) -> PyObjectRef {
 /// dict value slot during a GC root walk.
 ///
 /// A module dict entry (and a `GlobalCache.cell`) is either a raw
-/// `w_value` or a `MutableCell` wrapping it (`typeobject.py:48-51
+/// `w_value` or a `MutableCell` wrapping it (`typeobject.py
 /// unwrap_cell`).  `MutableCell`s are `malloc_typed`
 /// (`w_object_mutable_cell_new` / `w_int_mutable_cell_new`), so the
 /// collector never relocates the cell itself and never recurses into
@@ -261,7 +261,7 @@ pub unsafe fn walk_module_value_slot(
     }
 }
 
-/// `typeobject.py:53-71 write_cell`:
+/// `typeobject.py write_cell`:
 ///
 /// ```python
 /// def write_cell(space, w_cell, w_value):
@@ -379,7 +379,7 @@ pub unsafe fn store_would_bump_version(w_cell: Option<PyObjectRef>, w_value: PyO
     )
 }
 
-/// `pypy/objspace/std/celldict.py:20-21 VersionTag`:
+/// `pypy/objspace/std/celldict.py VersionTag`:
 ///
 /// ```python
 /// class VersionTag(object):
@@ -398,7 +398,7 @@ pub struct VersionTag(pub u64);
 /// bumped once per tag.
 ///
 /// The counter is a runtime-mutable global, so the read seam is residual
-/// (`@dont_look_inside`, `rlib/jit.py:139`, the `importing::sys_modules_dict`
+/// (`@dont_look_inside`, `rlib/jit.py`, the `importing::sys_modules_dict`
 /// shape): whatever value the build process happens to observe is not a
 /// constant, and folding it would hand every dict the same tag.  Upstream
 /// allocates a fresh `VersionTag()` object here instead, which rtypes to a
@@ -419,7 +419,7 @@ impl VersionTag {
     }
 }
 
-/// `pypy/objspace/std/celldict.py:24-25 _wrapkey`:
+/// `pypy/objspace/std/celldict.py _wrapkey`:
 ///
 /// ```python
 /// def _wrapkey(space, key):
@@ -471,10 +471,10 @@ pub fn module_dict_storage_gc_type_id() -> u32 {
 }
 
 /// The single `IndexMap` probe [`ModuleDictStorage::get`] runs —
-/// `celldict.py:143-145 getitem_str`'s
+/// `celldict.py getitem_str`'s
 /// `self.unerase(w_dict.dstorage).get(key)`.
 ///
-/// Residualise the probe alone (`@dont_look_inside`, `rlib/jit.py:139`), the
+/// Residualise the probe alone (`@dont_look_inside`, `rlib/jit.py`), the
 /// twin of `dictmultiobject::dict_entries_probe_str`: the `IndexMap::get` it
 /// wraps is an external-crate heap lookup the tracer cannot model — the
 /// oopspec'd residual arm of `rordereddict.ll_dict_getitem` (traced only for a
@@ -495,7 +495,7 @@ pub fn module_dict_entries_get(
 /// `IndexMap::insert` preserves the existing slot's position on overwrite,
 /// matching Python `{}`'s assignment semantics (rewriting an existing key does
 /// not move it to the end).  Residualised for [`module_dict_entries_get`]'s
-/// reason; upstream's `_ll_dict_setitem_lookup_done` (`rordereddict.py:674`)
+/// reason; upstream's `_ll_dict_setitem_lookup_done` (`rordereddict.py`)
 /// is likewise `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))`
 /// and neither conjunct can hold for an `IndexMap` here.  The borrowed name is
 /// copied to the owned `String` the entry table stores inside the boundary.
@@ -543,7 +543,7 @@ impl ModuleDictStorage {
     ///
     /// Uses `shift_remove` (not `swap_remove`) so the remaining keys
     /// keep their relative insertion order, matching Python `dict`'s
-    /// `__delitem__` semantics that `celldict.py:159-160 items` /
+    /// `__delitem__` semantics that `celldict.py items` /
     /// `:166-171 popitem` (LIFO) depend on.
     pub fn remove(&mut self, key: &str) -> Option<PyObjectRef> {
         self.entries.shift_remove(key)
@@ -561,7 +561,7 @@ impl ModuleDictStorage {
     }
 }
 
-/// `pypy/objspace/std/celldict.py:261-277 GlobalCache`:
+/// `pypy/objspace/std/celldict.py GlobalCache`:
 ///
 /// ```python
 /// class GlobalCache(object):
@@ -619,7 +619,7 @@ impl GlobalCache {
         }
     }
 
-    /// `celldict.py:275-277 getvalue`: return the cached cell's
+    /// `celldict.py getvalue`: return the cached cell's
     /// unwrapped value, or `None` if the cache holds `None` (key
     /// absent at install time).
     #[inline]
@@ -639,9 +639,9 @@ impl GlobalCache {
 /// GC root walk over a single `GlobalCache` and its chained
 /// `builtincache`, forwarding the movable value each `cell` holds.
 ///
-/// Mirrors the `GlobalCache` object graph shape (`celldict.py:261-277`):
+/// Mirrors the `GlobalCache` object graph shape (`celldict.py`):
 /// `cell` plus the nested `builtincache`, which always points at a
-/// DIFFERENT `GlobalCache` instance (`celldict.py:236
+/// DIFFERENT `GlobalCache` instance (`celldict.py
 /// builtin_strategy.get_global_cache(...)`), so the outer borrow is
 /// dropped before recursing.  The cached `cell` duplicates the storage
 /// entry it was installed from, so a collection that relocates that
@@ -664,7 +664,7 @@ unsafe fn walk_one_global_cache(
     }
 }
 
-/// `pypy/objspace/std/celldict.py:28-240 ModuleDictStrategy`.
+/// `pypy/objspace/std/celldict.py ModuleDictStrategy`.
 ///
 /// ```python
 /// class ModuleDictStrategy(DictStrategy):
@@ -685,7 +685,7 @@ unsafe fn walk_one_global_cache(
 /// `ModuleDictStorage` is the concrete storage type directly.
 ///
 /// `caches` is the per-name `GlobalCache` registry consulted by the
-/// `LOAD_GLOBAL` fast path (`celldict.py:214 get_global_cache`).
+/// `LOAD_GLOBAL` fast path (`celldict.py get_global_cache`).
 /// Allocated lazily on first cache install. The mutex protects this
 /// strategy-owned registry when multiple Python threads share a module.
 pub struct ModuleDictStrategy {
@@ -731,7 +731,7 @@ impl Default for ModuleDictStrategy {
 }
 
 impl ModuleDictStrategy {
-    /// `celldict.py:36-39 __init__`.
+    /// `celldict.py __init__`.
     pub fn new() -> Self {
         Self {
             version: VersionTag::fresh(),
@@ -740,7 +740,7 @@ impl ModuleDictStrategy {
         }
     }
 
-    /// `quasiimmut.py:17-27 get_current_qmut_instance` for the `version?`
+    /// `quasiimmut.py get_current_qmut_instance` for the `version?`
     /// field — resolve the instance while the trace is still recording, so a
     /// `mutated()` reached later in the same trace finds the field non-null and
     /// the recording can carry the instance to `compile.py:204-207`.
@@ -754,7 +754,7 @@ impl ModuleDictStrategy {
         self.version_watchers.is_installed()
     }
 
-    /// `quasiimmut.py:46-51 do_force_quasi_immutable`, which the tracer calls
+    /// `quasiimmut.py do_force_quasi_immutable`, which the tracer calls
     /// itself before aborting (`pyjitpl.py:1113-1115`). Idempotent: a field
     /// already taken returns early, so the interpreter re-running the opcode
     /// after the abort forces nothing a second time.
@@ -763,7 +763,7 @@ impl ModuleDictStrategy {
     }
 
     /// Invalidate every loop watching `version`
-    /// (`quasiimmut.py:33-38 _invalidate_now`).  Sets each live flag to
+    /// (`quasiimmut.py _invalidate_now`).  Sets each live flag to
     /// `true`, the polarity `GuardNotInvalidated` tests.
     ///
     /// The installed check stays traced and the sweep is residual, for the
@@ -776,7 +776,7 @@ impl ModuleDictStrategy {
         unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.version_watchers) };
     }
 
-    /// `celldict.py:214-240 get_global_cache`:
+    /// `celldict.py get_global_cache`:
     ///
     /// ```python
     /// def get_global_cache(self, w_dict, key):
@@ -831,7 +831,7 @@ impl ModuleDictStrategy {
         }
         let cell = self.getdictvalue_no_unwrapping(storage, key);
         let caches = cache_registry.as_mut().unwrap();
-        // `celldict.py:223 cache = GlobalCache(cell)`.  Lines 224-238
+        // `celldict.py cache = GlobalCache(cell)`.  Lines 224-238
         // (`if not honor__builtins__ and cell is None and w_dict is
         // not space.builtin.w_dict:` …) are skipped because pyre is
         // permanently in `honor__builtins__=True` mode (see method
@@ -845,7 +845,7 @@ impl ModuleDictStrategy {
         cache
     }
 
-    /// `celldict.py:180-184 switch_to_object_strategy` cache flush:
+    /// `celldict.py switch_to_object_strategy` cache flush:
     ///
     /// ```python
     /// if self.caches is not None:
@@ -871,7 +871,7 @@ impl ModuleDictStrategy {
         *cache_registry = None;
     }
 
-    /// `celldict.py:41-42 get_empty_storage`:
+    /// `celldict.py get_empty_storage`:
     ///
     /// ```python
     /// def get_empty_storage(self):
@@ -881,7 +881,7 @@ impl ModuleDictStrategy {
         ModuleDictStorage::new()
     }
 
-    /// `celldict.py:44-45 mutated`:
+    /// `celldict.py mutated`:
     ///
     /// ```python
     /// def mutated(self):
@@ -889,7 +889,7 @@ impl ModuleDictStrategy {
     /// ```
     ///
     /// Reassigning the `version?` quasi-immutable field invalidates the JIT.
-    /// `rclass.py:1010-1012 hook_setfield` notifies watchers before the store;
+    /// `rclass.py hook_setfield` notifies watchers before the store;
     /// pyre flips the registered loop flags explicitly at this write site.
     #[inline]
     pub fn mutated(&mut self) {
@@ -897,7 +897,7 @@ impl ModuleDictStrategy {
         self.version = VersionTag::fresh();
     }
 
-    /// `celldict.py:47-55 getdictvalue_no_unwrapping`:
+    /// `celldict.py getdictvalue_no_unwrapping`:
     ///
     /// ```python
     /// def getdictvalue_no_unwrapping(self, w_dict, key):
@@ -921,7 +921,7 @@ impl ModuleDictStrategy {
         storage.get(key)
     }
 
-    /// `celldict.py:76-78 setitem_str`:
+    /// `celldict.py setitem_str`:
     ///
     /// ```python
     /// def setitem_str(self, w_dict, key, w_value):
@@ -938,7 +938,7 @@ impl ModuleDictStrategy {
         self._setitem_str_cell_known(cell, storage, key, w_value);
     }
 
-    /// `celldict.py:80-90 _setitem_str_cell_known`:
+    /// `celldict.py _setitem_str_cell_known`:
     ///
     /// ```python
     /// def _setitem_str_cell_known(self, cell, w_dict, key, w_value):
@@ -990,7 +990,7 @@ impl ModuleDictStrategy {
         }
     }
 
-    /// `celldict.py:128-129 length`:
+    /// `celldict.py length`:
     ///
     /// ```python
     /// def length(self, w_dict):
@@ -1000,7 +1000,7 @@ impl ModuleDictStrategy {
         storage.len()
     }
 
-    /// `celldict.py:143-145 getitem_str`:
+    /// `celldict.py getitem_str`:
     ///
     /// ```python
     /// def getitem_str(self, w_dict, key):
@@ -1016,7 +1016,7 @@ impl ModuleDictStrategy {
         if v.is_null() { None } else { Some(v) }
     }
 
-    /// `celldict.py:106-126 delitem` — minimal str-key path
+    /// `celldict.py delitem` — minimal str-key path
     /// (`celldict.py:110-121`); the object-fallback /
     /// `_never_equal_to_string` branches belong to the full strategy
     /// dispatch once `ObjectDictStrategy` is wired.
@@ -1038,7 +1038,7 @@ impl ModuleDictStrategy {
         Some(removed)
     }
 
-    /// `celldict.py:162-164 clear`:
+    /// `celldict.py clear`:
     ///
     /// ```python
     /// def clear(self, w_dict):
@@ -1050,7 +1050,7 @@ impl ModuleDictStrategy {
         self.mutated();
     }
 
-    /// `celldict.py:188-189 getiterkeys`:
+    /// `celldict.py getiterkeys`:
     ///
     /// ```python
     /// def getiterkeys(self, w_dict):
@@ -1063,7 +1063,7 @@ impl ModuleDictStrategy {
         storage.entries.keys().map(|k| k.as_str())
     }
 
-    /// `celldict.py:191-192 getitervalues`:
+    /// `celldict.py getitervalues`:
     ///
     /// ```python
     /// def getitervalues(self, w_dict):
@@ -1076,7 +1076,7 @@ impl ModuleDictStrategy {
         &self,
         storage: &'a ModuleDictStorage,
     ) -> impl Iterator<Item = PyObjectRef> + 'a {
-        // `celldict.py:152-154 values`: each cell is unwrapped before
+        // `celldict.py values`: each cell is unwrapped before
         // it crosses out of the strategy.  Without unwrapping, JIT-
         // promoted cell objects would leak into user space and break
         // identity comparisons against the previously-stored value.
@@ -1092,7 +1092,7 @@ impl ModuleDictStrategy {
     }
 
     /// [`Self::nth_key`]'s value half, unwrapped the way `getitervalues`
-    /// unwraps (`celldict.py:152-154 values`).
+    /// unwraps (`celldict.py values`).
     pub fn nth_unwrapped_value(
         &self,
         storage: &ModuleDictStorage,
@@ -1120,11 +1120,11 @@ impl ModuleDictStrategy {
     }
 }
 
-/// `pypy/objspace/std/celldict.py:28 ModuleDictStrategy(DictStrategy)`
+/// `pypy/objspace/std/celldict.py ModuleDictStrategy(DictStrategy)`
 /// — abstract base inheritance.  Every method takes the `W_ModuleDict
 /// Object` (`w_dict: PyObjectRef`) and resolves its `dstorage`
 /// internally, matching PyPy's strategy contract per
-/// `dictmultiobject.py:462 DictStrategy`.
+/// `dictmultiobject.py DictStrategy`.
 ///
 /// The pyre inherent methods on `ModuleDictStrategy`
 /// (`setitem_str(&self, &mut ModuleDictStorage, …)` etc.) are a
@@ -1137,7 +1137,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::dictmultiobject::StrategyKind::Module
     }
 
-    /// `celldict.py:46-49 get_empty_storage` — pyre owns the
+    /// `celldict.py get_empty_storage` — pyre owns the
     /// `ModuleDictStorage` directly (no `rerased` indirection); return
     /// the storage as an erased `*mut u8` so the trait surface stays
     /// strategy-agnostic.
@@ -1145,7 +1145,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::lltype::malloc_raw(ModuleDictStorage::new()) as *mut u8
     }
 
-    /// `celldict.py:131-141 getitem` — str fast path, else
+    /// `celldict.py getitem` — str fast path, else
     /// `switch_to_object_strategy` then walk unified entries.
     /// Body in `w_module_dict_lookup_inner` to avoid recursing
     /// through `w_dict_lookup` (which dispatches back through
@@ -1154,13 +1154,13 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::dictmultiobject::w_module_dict_lookup_inner(w_dict, w_key)
     }
 
-    /// `celldict.py:96-100 getitem_str` — str fast path matches
+    /// `celldict.py getitem_str` — str fast path matches
     /// `w_module_dict_getitem_str` and its cell-cache behavior.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
         crate::dictmultiobject::w_module_dict_getitem_str(w_dict, key)
     }
 
-    /// `celldict.py:41-67 setitem` + `_setitem_str_cell_known` — str
+    /// `celldict.py setitem` + `_setitem_str_cell_known` — str
     /// fast path; non-str keys force `switch_to_object_strategy`.
     /// Body in `w_module_dict_store_inner` to avoid recursing through
     /// `w_dict_store` (which dispatches back through the strategy
@@ -1169,12 +1169,12 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::dictmultiobject::w_module_dict_store_inner(w_dict, w_key, w_value);
     }
 
-    /// `celldict.py:69-74 setitem_str`.
+    /// `celldict.py setitem_str`.
     unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
         crate::dictmultiobject::w_module_dict_setitem_str(w_dict, key, w_value);
     }
 
-    /// `celldict.py:106-126 delitem` — str fast path, else
+    /// `celldict.py delitem` — str fast path, else
     /// `switch_to_object_strategy` then walk unified entries.
     /// Body in `w_module_dict_delitem_inner` to avoid recursing
     /// through `w_dict_delitem` (which dispatches back through
@@ -1183,12 +1183,12 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::dictmultiobject::w_module_dict_delitem_inner(w_dict, w_key)
     }
 
-    /// `celldict.py:85-86 length`.
+    /// `celldict.py length`.
     unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
         crate::dictmultiobject::w_module_dict_length(w_dict)
     }
 
-    /// `celldict.py:140-142 w_keys` — `space.newlist(self.unerase
+    /// `celldict.py w_keys` — `space.newlist(self.unerase
     /// (w_dict.dstorage).keys())`; pyre returns the wrapped key
     /// PyObjectRefs directly so callers can build whatever container
     /// they need.
@@ -1199,14 +1199,14 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             .collect()
     }
 
-    /// `celldict.py:144-149 values` — reads the cells and nothing else.
+    /// `celldict.py values` — reads the cells and nothing else.
     /// Routing this through `items` wrapped every name into a
     /// `W_UnicodeObject` only to drop it.
     unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
         crate::dictmultiobject::w_module_dict_values_inner(w_dict)
     }
 
-    /// `celldict.py:151-155 items` — branches on `is_object_strategy`
+    /// `celldict.py items` — branches on `is_object_strategy`
     /// and emits whichever storage half is live, wrapping str keys
     /// via `w_str_new`.
     unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
@@ -1231,13 +1231,13 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::dictmultiobject::w_module_dict_nth_value_inner(w_dict, index)
     }
 
-    /// `celldict.py:157-159 clear`.  Branches on
+    /// `celldict.py clear`.  Branches on
     /// `is_object_strategy` and drains whichever storage half is live.
     unsafe fn clear(&self, w_dict: PyObjectRef) {
         crate::dictmultiobject::w_module_dict_clear_inner(w_dict);
     }
 
-    /// `celldict.py:166-173 popitem` — pop the most recently inserted
+    /// `celldict.py popitem` — pop the most recently inserted
     /// (key, cell) from the IndexMap, mutated(), unwrap the cell, and
     /// return (`_wrapkey(space, key)`, `unwrap_cell(space, cell)`).
     /// O(1) via `IndexMap::pop`; after a `switch_to_object_strategy` the
@@ -1264,7 +1264,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         Some((crate::w_str_new(&key), unwrap_cell(cell)))
     }
 
-    /// `celldict.py:198-199 getiterreversed` — reverse iteration
+    /// `celldict.py getiterreversed` — reverse iteration
     /// over the IndexMap's key insertion order (used by `reversed
     /// (module.__dict__)`).  Native streaming reverse via
     /// `IndexMap::iter().rev()`; the wrap_cell unwrap matches PyPy's
@@ -1284,7 +1284,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             .collect()
     }
 
-    /// `celldict.py:207-216 copy` — produce a fresh W_DictObject that
+    /// `celldict.py copy` — produce a fresh W_DictObject that
     /// owns unwrapped cell values keyed by str objects.
     ///
     /// The destination is born on `UnicodeDictStrategy` over that
@@ -1313,7 +1313,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     }
 }
 
-/// `celldict.py:243-251 remove_cell(w_dict, space, name)` — replace
+/// `celldict.py remove_cell(w_dict, space, name)` — replace
 /// any cell wrapper at `name` with the unwrapped value so subsequent
 /// reads observe the raw value directly (used when a module-level
 /// name is rebound in a context that no longer needs cell

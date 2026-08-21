@@ -228,7 +228,7 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
 /// allocation. The wrapper itself is born in non-moving old-gen and its
 /// creation barrier records the old→young `LONG_VALUE_OFFSET` edge.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`): the body
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`): the body
 /// delegates through `alloc_bigint_nursery -> *mut BigInt`, so tracing into it
 /// leaks the raw `BigInt` pointee into the return model and unifies against the
 /// `w_int_new` fast path as `PyObject ∪ BigInt`. Residualising the whole box
@@ -258,7 +258,7 @@ pub fn box_bigint_constant(value: &BigInt) -> PyObjectRef {
     w_long_new(value.clone())
 }
 
-/// `rbigint.fromint()` (`rpython/rlib/rbigint.py:225`,
+/// `rbigint.fromint()` (`rpython/rlib/rbigint.py`,
 /// `@jit.elidable`) with the translated one-GC-reference ABI.
 ///
 /// Rust returns `RBigInt` by value, but RPython returns a GC reference.  The
@@ -330,7 +330,7 @@ bigint_scalar_residual!(jit_bigint_is_one, |value: &BigInt| value.is_one());
 bigint_scalar_residual!(jit_bigint_tobool, |value: &BigInt| value.tobool());
 bigint_scalar_residual!(jit_bigint_hash, |value: &BigInt| value.hash());
 
-/// `W_LongObject._fits_int()` — longobject.py:141 / rbigint.fits_int.
+/// `W_LongObject._fits_int()` — longobject.py / rbigint.fits_int.
 /// True if the value fits in a machine-word integer (i64 on 64-bit).
 /// Used by `is_plain_int1` to accept long objects that are in the int range.
 #[inline]
@@ -382,7 +382,7 @@ pub unsafe fn w_long_get_raw_value(obj: PyObjectRef) -> *mut BigInt {
     unsafe { (*(obj as *const W_LongObject)).value }
 }
 
-/// `rbigint.fits_int()` (`rpython/rlib/rbigint.py:490`) — JIT-callable
+/// `rbigint.fits_int()` (`rpython/rlib/rbigint.py`) — JIT-callable
 /// wrapper. Returns 1 when the W_LongObject's BigInt fits in i64,
 /// 0 otherwise. Used as the runtime fits_int guard before
 /// `jit_w_long_toint`.
@@ -410,7 +410,7 @@ pub extern "C" fn jit_bigint_fits_int(num: i64) -> i64 {
     unsafe { jit_bigint_to_i64_fits(&*num) }
 }
 
-/// `rbigint.fits_int()` (`rpython/rlib/rbigint.py:490`) on a borrowed
+/// `rbigint.fits_int()` (`rpython/rlib/rbigint.py`) on a borrowed
 /// BigInt payload. Scalar half of the `BigInt::to_i64()` split used by
 /// the two-phase rtyper so it never has to model an `Option<i64>` ABI.
 #[majit_macros::dont_look_inside]
@@ -418,7 +418,7 @@ pub fn jit_bigint_to_i64_fits(num: &BigInt) -> i64 {
     num.fits_int() as i64
 }
 
-/// `rbigint.toint()` (`rpython/rlib/rbigint.py:465`, `@jit.elidable`) on a
+/// `rbigint.toint()` (`rpython/rlib/rbigint.py`, `@jit.elidable`) on a
 /// borrowed BigInt payload. Callers must first check
 /// [`jit_bigint_to_i64_fits`]; overflow means that guard was violated.
 #[majit_macros::dont_look_inside]
@@ -462,7 +462,7 @@ pub fn jit_bigint_sign_i64(num: &BigInt) -> i64 {
     num.get_sign()
 }
 
-/// `rbigint.tofloat()` (`rpython/rlib/rbigint.py:503`) on a borrowed BigInt
+/// `rbigint.tofloat()` (`rpython/rlib/rbigint.py`) on a borrowed BigInt
 /// payload, with the caller's existing overflow sentinel folded into the
 /// scalar return.
 #[majit_macros::elidable_cannot_raise]
@@ -470,19 +470,19 @@ pub fn jit_bigint_to_f64_or_inf(num: &BigInt) -> f64 {
     num.tofloat().unwrap_or(f64::INFINITY)
 }
 
-/// `rbigint.tofloat()` (`rpython/rlib/rbigint.py:503`) on a borrowed BigInt
+/// `rbigint.tofloat()` (`rpython/rlib/rbigint.py`) on a borrowed BigInt
 /// payload, preserving callers that intentionally collapse overflow to NaN.
 #[majit_macros::elidable_cannot_raise]
 pub fn jit_bigint_to_f64_or_nan(num: &BigInt) -> f64 {
     num.tofloat().unwrap_or(f64::NAN)
 }
 
-/// `W_LongObject.toint()` (`pypy/objspace/std/longobject.py:138`) →
-/// `rbigint.toint()` (`rpython/rlib/rbigint.py:465`, `@jit.elidable`).
+/// `W_LongObject.toint()` (`pypy/objspace/std/longobject.py`) →
+/// `rbigint.toint()` (`rpython/rlib/rbigint.py`, `@jit.elidable`).
 /// Extract an i64 from a W_LongObject. RPython `toint` raises
 /// `OverflowError` when the BigInt does not fit; the elidable
 /// trace-time site emits a `fits_int` GUARD_TRUE first
-/// (`pypy/objspace/std/listobject.py:2390 is_plain_int1` parity), so
+/// (`pypy/objspace/std/listobject.py is_plain_int1` parity), so
 /// the OverflowError path is unreachable in production. Pyre encodes
 /// that unreachability as a panic. There is no `_int_w_unsafe` upstream —
 /// this is the elidable `toint` after a `fits_int` guard.
@@ -497,14 +497,14 @@ pub extern "C" fn jit_w_long_toint(obj: i64) -> i64 {
     }
 }
 
-/// `rbigint.add` (`rpython/rlib/rbigint.py:269`, `@jit.elidable`) — the
-/// payload half of `W_LongObject._add` (`pypy/objspace/std/longobject.py:331`).
+/// `rbigint.add` (`rpython/rlib/rbigint.py`, `@jit.elidable`) — the
+/// payload half of `W_LongObject._add` (`pypy/objspace/std/longobject.py`).
 /// Both operands are guaranteed `W_LongObject` by a preceding
 /// `GuardClass(LONG_TYPE)` on each, so the BigInt payloads are read
 /// directly. Returns a freshly heap-allocated `*mut BigInt` (as i64) — the
 /// arithmetic only, with no Python-object wrapper. `add` allocates a new
 /// bigint, so its only failure mode is MemoryError: `EF_ELIDABLE_OR_MEMORYERROR`
-/// (`call.py:294`, `cr == "mem"`). The value is still a pure function of the
+/// (`call.py`, `cr == "mem"`). The value is still a pure function of the
 /// operand payloads, so the optimizer may fold/CSE it; a trailing
 /// `GuardNoException` covers the allocation. The result is an internal bigint
 /// never exposed to Python `is`, so sharing one payload for two equal-input
@@ -587,7 +587,7 @@ pub extern "C" fn jit_w_long_xor_raw(a: i64, b: i64) -> i64 {
 pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
-        // `rbigint.add` (rbigint.py:684-687) returns the *other operand itself*
+        // `rbigint.add` (rbigint.py) returns the *other operand itself*
         // when one side is zero; the raw-pointer ABI spells that identity as
         // returning the incoming payload instead of re-wrapping an alias.
         if (&*a).get_sign() == 0 {
@@ -600,7 +600,7 @@ pub extern "C" fn jit_bigint_add(a: i64, b: i64) -> i64 {
     }
 }
 
-/// `rbigint.add_int_int_bigint_result` (`rpython/rlib/rbigint.py:717`,
+/// `rbigint.add_int_int_bigint_result` (`rpython/rlib/rbigint.py`,
 /// `@jit.elidable`) — exact bigint sum of two machine ints. Allocates the
 /// result via the COLLECTING nursery, matching [`jit_bigint_add`], and returns
 /// a freshly heap-allocated `*mut BigInt` payload (as i64).
@@ -614,7 +614,7 @@ pub extern "C" fn jit_bigint_add_int_int(a: i64, b: i64) -> i64 {
 pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
     let (a, b) = (a as *const BigInt, b as *const BigInt);
     unsafe {
-        // `rbigint.sub` (rbigint.py:758-759) returns `self` itself for a zero
+        // `rbigint.sub` (rbigint.py) returns `self` itself for a zero
         // subtrahend; see [`jit_bigint_add`] for the raw-pointer spelling.
         if (&*b).get_sign() == 0 {
             return a as i64;
@@ -623,7 +623,7 @@ pub extern "C" fn jit_bigint_sub(a: i64, b: i64) -> i64 {
     }
 }
 
-/// `rbigint.sub_int_int_bigint_result` (`rpython/rlib/rbigint.py:788`,
+/// `rbigint.sub_int_int_bigint_result` (`rpython/rlib/rbigint.py`,
 /// `@jit.elidable`) — exact bigint difference of two machine ints. See
 /// [`jit_bigint_add_int_int`].
 #[majit_macros::elidable_or_memerror]
@@ -638,7 +638,7 @@ pub extern "C" fn jit_bigint_mul(a: i64, b: i64) -> i64 {
     unsafe { alloc_bigint_nursery_collecting(&*a * &*b) as i64 }
 }
 
-/// `rbigint.mul_int_int_bigint_result` (`rpython/rlib/rbigint.py:873`,
+/// `rbigint.mul_int_int_bigint_result` (`rpython/rlib/rbigint.py`,
 /// `@jit.elidable`) — exact bigint product of two machine ints. See
 /// [`jit_bigint_add_int_int`].
 #[majit_macros::elidable_or_memerror]
@@ -669,7 +669,7 @@ pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> i64 {
 
 /// `rbigint` comparison — returns the sign of `a <=> b` as `-1` / `0` / `1`.
 /// RPython exposes the comparison as six methods (`lt`/`le`/`eq`/`ne`/`gt`/`ge`,
-/// the latter built as `other.lt(self)` wrappers, `rbigint.py:573/664`); Rust's
+/// the latter built as `other.lt(self)` wrappers, `rbigint.py/664`); Rust's
 /// total `Ord::cmp` collapses them into one three-way result, and the caller
 /// recovers each relation with a plain `int_<cmp>(sign, 0)` (e.g. `a < b` ⟺
 /// `sign < 0`, `a == b` ⟺ `sign == 0`).  A comparison neither allocates nor
@@ -677,7 +677,7 @@ pub extern "C" fn jit_bigint_xor(a: i64, b: i64) -> i64 {
 /// `CallPure*` with NO trailing guard.
 ///
 /// The arguments are the bare payloads, not the `W_LongObject` boxes:
-/// `_make_descr_cmp` (longobject.py:383-391) compares `self.num` against
+/// `_make_descr_cmp` (longobject.py) compares `self.num` against
 /// `w_other.num`, so the two field reads belong in the trace and not inside the
 /// callee.  With them spelled out, a `W_LongObject` the same trace has just
 /// built is read back through the heap cache and can stay virtual instead of

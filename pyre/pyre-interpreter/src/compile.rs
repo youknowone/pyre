@@ -14,9 +14,9 @@ pub use rustpython_compiler_core::bytecode::{
 
 /// Rewrite every `\r\n` and every lone `\r` in a source as `\n`.
 ///
-/// `pytokenizer.py:654-662` universal_newline does this one line at a time, and
+/// `pytokenizer.py` universal_newline does this one line at a time, and
 /// `generate_tokens` calls it on every line it takes. The lines come from
-/// `splitlines(True)` (`pyparse.py:202`), which ends a line at `\r`, `\r\n` and
+/// `splitlines(True)` (`pyparse.py`), which ends a line at `\r`, `\r\n` and
 /// `\n` alike, so a carriage return can only ever sit at a line's end there —
 /// which makes rewriting them all in one pass the same transformation over the
 /// whole source. Pyre needs the whole-source form because its tokenizer takes
@@ -273,7 +273,7 @@ pub fn decode_source_bytes(
                 };
                 crate::PyError::syntax_error_located(message, filename, 0, -1, 0, 0, None)
             })?;
-        // `pyparse.py:9-15 recode_to_utf8` re-encodes the decoded text to
+        // `pyparse.py recode_to_utf8` re-encodes the decoded text to
         // UTF-8, so a declared codec that yields a surrogate rejects the
         // source rather than silently rewriting it.
         crate::typedef::utf8_strict_w(decoded)

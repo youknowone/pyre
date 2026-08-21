@@ -271,7 +271,7 @@ fn normalize(args: &[PyObjectRef]) -> PyResult {
     }
     let form = normalize_form("normalize", args[0])?;
     let text = normalize_text("normalize", args[1])?;
-    // interp_ucd.py:175-178 returns `space.newutf8(content, strlen)` for
+    // interp_ucd.py returns `space.newutf8(content, strlen)` for
     // ASCII.  PyPy's W_UnicodeObject.is_w treats wrappers sharing that UTF-8
     // buffer as identical; returning the exact base str preserves that O(1)
     // identity without copying Pyre's owned Wtf8Buf.  A subclass must still
@@ -419,7 +419,7 @@ crate::py_module! {
         // Install the TypeDef before allocation so the generated allocator
         // can stamp the canonical Python class in `w_class`.
         let ucd_type = type_object();
-        // `interp_ucd.py:311 UCD.typedef` declares no `__new__`, so the two
+        // `interp_ucd.py UCD.typedef` declares no `__new__`, so the two
         // database instances the module exports are the only ones that exist;
         // reaching generic allocation would hand back a `UCD` with no
         // database at all.

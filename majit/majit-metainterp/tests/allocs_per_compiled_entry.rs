@@ -283,7 +283,7 @@ fn window() -> (u64, u64) {
 /// the configuration this file measures.
 ///
 /// `llmodel.py:298 malloc_jitframe` allocates the frame through the GC, and
-/// `jitframe.py:33-60` makes JITFRAME an ordinary varsize GcStruct — so
+/// `jitframe.py` makes JITFRAME an ordinary varsize GcStruct — so
 /// upstream's per-entry frame is a nursery bump, which no `#[global_allocator]`
 /// ever sees. The cranelift backend reproduces that only when a JITFRAME type
 /// id is registered; with no GC at all it falls back to a `Vec<i64>`, and a

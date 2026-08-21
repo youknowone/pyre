@@ -119,7 +119,7 @@ pub struct ProgramPipelineResult {
     /// Explicit driver-to-main-JitCode mapping. Consumers should use this
     /// instead of rediscovering portals by scanning JitCode flags or names.
     pub jit_drivers: Vec<CompiledJitDriver>,
-    /// RPython: all_jitcodes returned by CodeWriter.make_jitcodes() (codewriter.py:89).
+    /// RPython: all_jitcodes returned by CodeWriter.make_jitcodes() (codewriter.py).
     /// Assembled JitCode bytecode for each transformed graph. `Arc` so the
     /// shells handed out earlier (e.g. into
     /// `JitDriverStaticData.mainjitcode` or `IndirectCallTargets`) share
@@ -157,7 +157,7 @@ pub struct ProgramPipelineResult {
     /// Consumed by `BlackholeInterpBuilder::setup_insns` at runtime.
     #[serde(default)]
     pub insns: indexmap::IndexMap<String, u8>,
-    /// RPython: `Assembler.descrs` (assembler.py:23), consumed by
+    /// RPython: `Assembler.descrs` (assembler.py), consumed by
     /// `BlackholeInterpBuilder.setup_descrs(asm.descrs)`
     /// (blackhole.py:59, 102-103). Each 'd'/'j' argcode in a
     /// `JitCode.code` byte stream indexes into this shared descr pool
@@ -184,8 +184,8 @@ pub struct ProgramPipelineResult {
     /// `EffectInfo` raw set names — see `majit_ir::descr::ei_descr_mints_snapshot`.
     ///
     /// `descrs` above is upstream's `opcode_descrs` (`pyjitpl.py:2261
-    /// setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py:2289
-    /// self.cpu.setup_descrs()`, the full gccache walk at `descr.py:25-47`).
+    /// setup_descrs(asm.descrs)`), not its `all_descrs` (`pyjitpl.py
+    /// self.cpu.setup_descrs()`, the full gccache walk at `descr.py`).
     /// A descr the analyzer minted only to fill a raw set is named by no
     /// opcode, so it is absent from `descrs` and would have no slot to resolve
     /// against once the process boundary is crossed. Upstream never needs this

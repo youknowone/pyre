@@ -19,7 +19,7 @@ pub use majit_translate::liveness::{
     LivenessIterator, OFFSET_SIZE, decode_offset, encode_liveness, encode_offset,
 };
 
-/// `liveness.py:19-23` `def compute_liveness(ssarepr)`.
+/// `liveness.py` `def compute_liveness(ssarepr)`.
 ///
 /// Python:
 /// ```py
@@ -99,7 +99,7 @@ fn compute_liveness_with_remap_internal(
     (remap, label2alive)
 }
 
-/// `liveness.py:25-80` `_compute_liveness_must_continue(ssarepr, label2alive)`.
+/// `liveness.py` `_compute_liveness_must_continue(ssarepr, label2alive)`.
 ///
 /// Walks the instruction list backwards, maintaining the set of live
 /// registers at each point. When a `-live-` marker is reached, the set
@@ -114,10 +114,10 @@ fn _compute_liveness_must_continue(
 ) -> bool {
     // `liveness.py:26` `alive = set()`.
     let mut alive: HashSet<Register> = HashSet::new();
-    // `liveness.py:27` `must_continue = False`.
+    // `liveness.py` `must_continue = False`.
     let mut must_continue = false;
 
-    // `liveness.py:29-31` `def follow_label(lbl)`.
+    // `liveness.py` `def follow_label(lbl)`.
     //
     // Captured closures in Rust fight the borrow checker, so the helper
     // is inlined at its two call sites (`-live-` TLabels, and regular-
@@ -135,23 +135,23 @@ fn _compute_liveness_must_continue(
         }
     }
 
-    // `liveness.py:33` `for i in range(len(ssarepr.insns)-1, -1, -1):`.
+    // `liveness.py` `for i in range(len(ssarepr.insns)-1, -1, -1):`.
     for i in (0..ssarepr.insns.len()).rev() {
         // `liveness.py:34` `insn = ssarepr.insns[i]`.
         // Clone so the borrow on `ssarepr` is released before the later
         // `ssarepr.insns[i] = ...` write at `liveness.py:52`.
         let insn = ssarepr.insns[i].clone();
 
-        // `liveness.py:36-42` `if isinstance(insn[0], Label)`.
+        // `liveness.py` `if isinstance(insn[0], Label)`.
         let label_name = match &insn {
             Insn::Label(label) => Some(label.name.clone()),
             _ => None,
         };
         if let Some(name) = label_name {
             let alive_at_point = label2alive.entry(name).or_default();
-            // `liveness.py:38` `prevlength = len(alive_at_point)`.
+            // `liveness.py` `prevlength = len(alive_at_point)`.
             let prevlength = alive_at_point.len();
-            // `liveness.py:39` `alive_at_point.update(alive)`.
+            // `liveness.py` `alive_at_point.update(alive)`.
             alive_at_point.extend(alive.iter().copied());
             // `liveness.py:40-41`.
             if prevlength != alive_at_point.len() {
@@ -161,7 +161,7 @@ fn _compute_liveness_must_continue(
             continue;
         }
 
-        // `liveness.py:44-53` `if insn[0] == '-live-':`.
+        // `liveness.py` `if insn[0] == '-live-':`.
         if let Some(args) = insn.live_args() {
             // `liveness.py:45` `labels = []`.
             let mut labels: Vec<Operand> = Vec::new();
@@ -194,7 +194,7 @@ fn _compute_liveness_must_continue(
             continue;
         }
 
-        // `liveness.py:55-57` `if insn[0] == '---':`.
+        // `liveness.py` `if insn[0] == '---':`.
         if let Insn::Unreachable = &insn {
             // `liveness.py:56` `alive = set()`.
             alive.clear();
@@ -306,7 +306,7 @@ impl LiveItem {
     }
 }
 
-/// `liveness.py:82-116` `def remove_repeated_live(ssarepr)`.
+/// `liveness.py` `def remove_repeated_live(ssarepr)`.
 ///
 /// Merges runs of consecutive `-live-` markers (optionally with intervening
 /// `Label` markers) into a single `-live-` whose arguments are the union
@@ -395,7 +395,7 @@ fn remove_repeated_live_with_remap_internal(ssarepr: &mut SSARepr) -> Vec<usize>
             remap[label_old_positions[k]] = res.len();
             res.push(label);
         }
-        // `liveness.py:115` `res.append(('-live-', ) + tuple(sorted(liveset)))`.
+        // `liveness.py` `res.append(('-live-', ) + tuple(sorted(liveset)))`.
         //
         // Python's `sorted(set_of_mixed_objects)` raises `TypeError` in
         // Python 3 but RPython's `set()` elements are homogeneous per
@@ -420,7 +420,7 @@ fn remove_repeated_live_with_remap_internal(ssarepr: &mut SSARepr) -> Vec<usize>
         ));
     }
 
-    // `liveness.py:116` `ssarepr.insns = res`.
+    // `liveness.py` `ssarepr.insns = res`.
     ssarepr.insns = res;
     remap
 }
@@ -561,7 +561,7 @@ mod tests {
         assert!(regs_at(5).is_empty());
     }
 
-    // rpython/jit/codewriter/test/test_liveness.py:224-237 `test_live_with_label`.
+    // rpython/jit/codewriter/test/test_liveness.py `test_live_with_label`.
     //
     // Source:
     //     -live- L1
@@ -600,7 +600,7 @@ mod tests {
         );
     }
 
-    // rpython/jit/codewriter/test/test_liveness.py:239-253 `test_live_duplicate`.
+    // rpython/jit/codewriter/test/test_liveness.py `test_live_duplicate`.
     //
     // Source:
     //     -live- L1
@@ -648,7 +648,7 @@ mod tests {
         );
     }
 
-    // rpython/jit/codewriter/test/test_liveness.py:165-192 `test_switch`.
+    // rpython/jit/codewriter/test/test_liveness.py `test_switch`.
     //
     // Source:
     //     goto_maybe L1

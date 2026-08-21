@@ -58,7 +58,7 @@ use crate::translator::translator::TranslationContext;
 ///
 pub struct GilAnalyzer<'t> {
     translator: &'t TranslationContext,
-    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py:13`).
+    /// Upstream `GraphAnalyzer._analyzed_calls` (`graphanalyze.py`).
     analyzed_calls: UnionFind<usize, Dependency<bool>>,
 }
 

@@ -12,13 +12,13 @@
 use pyre_object::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// `abc_invalidation_counter` (`app_abc.py:47`): bumped by every successful
+// `abc_invalidation_counter` (`app_abc.py`): bumped by every successful
 // `_abc_register` — and by nothing else — and read by `get_cache_token`.  A
 // negative cache recorded before a bump no longer describes the registry, so
 // `_abc_negative_cache_version` is compared against this on every check.
 static INVALIDATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The app-level `SimpleWeakSet` (`app_abc.py:15-44`), stashed at module init
+/// The app-level `SimpleWeakSet` (`app_abc.py`), stashed at module init
 /// the way `weakref_type` stashes its own.  The registry and both caches are
 /// instances of it, so the collection this module installs is the one
 /// `_get_dump` describes and a collected member drops itself.
@@ -36,7 +36,7 @@ fn new_simple_weak_set() -> Result<PyObjectRef, crate::PyError> {
     crate::call::call_function_impl_result(simple_weak_set_type(), &[])
 }
 
-/// `app_abc.py:33-38 SimpleWeakSet.__contains__` through the membership
+/// `app_abc.py SimpleWeakSet.__contains__` through the membership
 /// protocol, which is where the weakref probe and the `TypeError` fallback
 /// live.
 ///
@@ -53,7 +53,7 @@ fn weak_cache_contains(
     crate::baseobjspace::contains(roots.get(cache_slot), roots.get(item_slot))
 }
 
-/// `app_abc.py:39-40 SimpleWeakSet.add` — `self.data.add(ref(item, self._remove))`.
+/// `app_abc.py SimpleWeakSet.add` — `self.data.add(ref(item, self._remove))`.
 /// Called rather than open-coded so the entry carries the callback that
 /// discards it once the referent dies; a bare `ref` would leave a spent one
 /// behind for every class the check ever saw.
@@ -74,7 +74,7 @@ fn weak_cache_add(cls: PyObjectRef, name: &str, item: PyObjectRef) -> Result<(),
     Ok(())
 }
 
-/// `SimpleWeakSet.clear` (`app_abc.py:43-44`) on the named collection, in
+/// `SimpleWeakSet.clear` (`app_abc.py`) on the named collection, in
 /// place, so anything already holding it sees the clear.
 fn weak_cache_clear(cls: PyObjectRef, name: &str) -> Result<(), crate::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
@@ -213,7 +213,7 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "Refusing to create an inheritance cycle",
         ));
     }
-    // `app_abc.py:99 cls._abc_registry.add(subclass)`.
+    // `app_abc.py cls._abc_registry.add(subclass)`.
     weak_cache_add(cls, "_abc_registry", subclass)?;
     // `app_abc.py:100-101` — invalidate every negative cache.  A class this
     // registration now makes a subclass may already be recorded as a non-match
@@ -236,7 +236,7 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(subclass)
 }
 
-// `interp_abc.py:15-20 set_collection_flag_recursive` — stamp the marker on
+// `interp_abc.py set_collection_flag_recursive` — stamp the marker on
 // `w_type` and every class already deriving from it.
 fn set_collection_flag_recursive(w_type: PyObjectRef, flag: u8) {
     unsafe {
@@ -257,14 +257,14 @@ fn set_collection_flag_recursive(w_type: PyObjectRef, flag: u8) {
         }
         typeobject::w_type_set_flag_map_or_seq(w_type, flag);
         // `only_real_subclasses` is False for every walk but
-        // `descr___subclasses__` (typeobject.py:677-680).
+        // `descr___subclasses__` (typeobject.py).
         for child in typeobject::w_type_get_subclasses(w_type, false) {
             set_collection_flag_recursive(child, flag);
         }
     }
 }
 
-// `_py_abc.ABCMeta.__subclasscheck__` (`_py_abc.py:108-147`): the caches
+// `_py_abc.ABCMeta.__subclasscheck__` (`_py_abc.py`): the caches
 // first, then the subclass hook, then a direct `__mro__` test, then the
 // recursive registry and subclass walks.  `issubclass` re-dispatches through
 // `__subclasscheck__` so a registered or descendant ABC applies its own hook
@@ -326,7 +326,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     // verdict; the single recording site after the block puts it in the matching
     // cache (`app_abc.py:144-163`, which records at each of its own arms).
     let verdict = 'decide: {
-        // _py_abc.py:122-130 — `ok = cls.__subclasshook__(subclass)`.
+        // _py_abc.py — `ok = cls.__subclasshook__(subclass)`.
         let hook = crate::baseobjspace::getattr_str(roots.get(cls_slot), "__subclasshook__")?;
         if !hook.is_null() {
             let hook_roots = pyre_object::gc_roots::push_roots();
@@ -340,7 +340,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
                 break 'decide crate::baseobjspace::is_true(ok)?;
             }
         }
-        // _py_abc.py:131-134 — direct subclass via `__mro__`.
+        // _py_abc.py — direct subclass via `__mro__`.
         unsafe {
             let mro_ptr = w_type_get_mro(roots.get(subclass_slot));
             if !mro_ptr.is_null() {
@@ -381,7 +381,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
                 }
             }
         }
-        // _py_abc.py:140-144 — `for scls in cls.__subclasses__():`.  This must go
+        // _py_abc.py — `for scls in cls.__subclasses__():`.  This must go
         // through normal attribute lookup, call, and iteration.  Reading the
         // internal type subclass vector directly hides user overrides and their
         // TypeError/custom exceptions, which are observable ABCMeta semantics.
@@ -424,7 +424,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
     Ok(verdict)
 }
 
-/// `_abc_instancecheck` (`app_abc.py:108-121`).
+/// `_abc_instancecheck` (`app_abc.py`).
 ///
 /// The two classes are asked separately because they can differ: `__class__`
 /// is an ordinary attribute an object may answer with something other than its
@@ -524,7 +524,7 @@ fn reset_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
-/// `_abc._reset_caches(cls)` (`app_abc.py:188-191`): empty both of this ABC's
+/// `_abc._reset_caches(cls)` (`app_abc.py`): empty both of this ABC's
 /// caches, leaving the registry and the invalidation counter untouched — a
 /// cleared cache is answered by re-running the walks, which is not a change of
 /// answer, so no token needs to expire.
@@ -540,7 +540,7 @@ fn reset_caches(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
-/// `_abc._get_dump(cls)` (`app_abc.py:165-173`): shallow copies of the
+/// `_abc._get_dump(cls)` (`app_abc.py`): shallow copies of the
 /// registry, both caches, and the negative-cache version.  The three sets are
 /// the collections' own `data`, which is why they are `SimpleWeakSet`s and not
 /// bare sets — `ABC._dump_registry` prints what this returns.

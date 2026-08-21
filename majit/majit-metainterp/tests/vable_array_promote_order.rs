@@ -1,7 +1,7 @@
 //! The six `BC_*ARRAYITEM_VABLE_*` dispatch arms must decide
 //! `_nonstandard_virtualizable` BEFORE promoting the index.
 //!
-//! `pyjitpl.py:1218-1230 _opimpl_getarrayitem_vable` (and `:1236-1247
+//! `pyjitpl.py _opimpl_getarrayitem_vable` (and `:1236-1247
 //! _opimpl_setarrayitem_vable`) open with the decision:
 //!
 //! ```python
@@ -87,8 +87,8 @@ fn one_int_array_vinfo() -> Arc<VirtualizableInfo> {
         ITEMS_OFFSET,
         majit_ir::make_array_descr(ITEMS_OFFSET, ITEM_SIZE, Type::Int),
     );
-    // `virtualizable.py:293-301 finish()`. `_nonstandard_virtualizable` Step 3
-    // emits the force (`pyjitpl.py:1263 emit_force_virtualizable`) before it
+    // `virtualizable.py finish()`. `_nonstandard_virtualizable` Step 3
+    // emits the force (`pyjitpl.py emit_force_virtualizable`) before it
     // reaches the Step 4 `PTR_EQ`, and that emission reads `clear_vable_ptr`.
     // Without it the fixture panics inside the arm — which would look like the
     // arm never running.
@@ -99,7 +99,7 @@ fn one_int_array_vinfo() -> Arc<VirtualizableInfo> {
     info.finalize_arc(majit_ir::descr::make_size_descr(64))
 }
 
-/// Stands in for `virtualizable.py:294 clear_vable_token`. The emission under
+/// Stands in for `virtualizable.py clear_vable_token`. The emission under
 /// test only bakes its ADDRESS into a `COND_CALL`; nothing in a one-step
 /// dispatch calls it, so a body that clears nothing is the honest fixture.
 extern "C" fn clear_vable_noop(_vable: *mut u8) {}

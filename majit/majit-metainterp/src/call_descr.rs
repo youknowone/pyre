@@ -3,7 +3,7 @@
 //! No `rpython/jit/metainterp/call_descr.py` file exists. This module is
 //! the Rust runtime boundary for descriptors produced by
 //! `rpython/jit/codewriter/call.py::getcalldescr` through
-//! `cpu.calldescrof(...)` (`rpython/jit/backend/model.py:180`) and then
+//! `cpu.calldescrof(...)` (`rpython/jit/backend/model.py`) and then
 //! consumed by metainterp, blackhole, optimizer, and backend call paths.
 //! Keeping the constructors here avoids a fake metainterp upstream file
 //! while still making the call-descr surface explicit.
@@ -26,7 +26,7 @@ struct MetaCallDescr {
     heapcache_index: u32,
     arg_types: Vec<Type>,
     result_type: Type,
-    /// `descr.py:524-526 get_result_type()` returns the RAW char.  Carrying it
+    /// `descr.py get_result_type()` returns the RAW char.  Carrying it
     /// keeps `'S'` (singlefloat) and `'L'` distinguishable from the
     /// `'i'`/`'f'` they normalise to, which the resume path depends on when it
     /// rebuilds a `BhCallDescr` off this descr for `bh_call_i`.
@@ -93,7 +93,7 @@ impl CallDescr for MetaCallDescr {
     fn result_type(&self) -> Type {
         self.result_type
     }
-    /// `descr.py:524-526 get_result_type()` — the raw char, not the class the
+    /// `descr.py get_result_type()` — the raw char, not the class the
     /// normalised `result_type` would derive.
     fn result_class(&self) -> char {
         self.result_class
@@ -160,11 +160,11 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 /// EffectInfo for a residual call whose callee has no heap-analyzer
 /// output — `EffectInfo::MOST_GENERAL`.
 ///
-/// `graphanalyze.py:105-116 analyze` splits the direct-call case three
+/// `graphanalyze.py analyze` splits the direct-call case three
 /// ways, and only ONE of them is the empty-set bottom:
 ///
 /// * `:104-108` the callee is `external` → `analyze_external_call`,
-///   whose `graphanalyze.py:60` default is `bottom_result()`;
+///   whose `graphanalyze.py` default is `bottom_result()`;
 /// * `:109-112` the callee has no `funcobj.graph` (nothing to analyze)
 ///   → `top_result()`;
 /// * `:117-122 indirect_call` with `graphs is None` → `top_result()`.
@@ -172,7 +172,7 @@ impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
 /// `effectinfo.py:285-292` then turns a `top_set` result into
 /// `EF_RANDOM_EFFECTS` with all six raw sets and all six bitstrings set
 /// to `None`, which is exactly `EffectInfo.MOST_GENERAL`
-/// (`effectinfo.py:271-273`). `call.py:174-187 get_jitcode_calldescr`
+/// (`effectinfo.py:271-273`). `call.py get_jitcode_calldescr`
 /// uses the same constant for the calldescr it attaches to a JitCode.
 ///
 /// A pyre residual callee reaching this function is the second case,
@@ -190,7 +190,7 @@ pub fn default_effect_info() -> EffectInfo {
     EffectInfo::MOST_GENERAL
 }
 
-/// `call.py:300-301 elif self._canraise(op):` — `EF_CAN_RAISE` built
+/// `call.py elif self._canraise(op):` — `EF_CAN_RAISE` built
 /// through `effectinfo_from_writeanalyze` with an empty analyzer result.
 ///
 /// Shape: `extraeffect=CanRaise`, every `_*_descrs_*` raw set =
@@ -224,11 +224,11 @@ pub fn nursery_alloc_effect_info() -> EffectInfo {
     ei
 }
 
-/// `EF_CANNOT_RAISE` analyzer-absent fallback — the `call.py:303
-/// else:` row of `call.py:282-303 getcalldescr` selected when
+/// `EF_CANNOT_RAISE` analyzer-absent fallback — the `call.py
+/// else:` row of `call.py getcalldescr` selected when
 /// `self._canraise(op) == False`, fed through
 /// `effectinfo_from_writeanalyze` with the
-/// `graphanalyze.py:60 analyze_external_call` default
+/// `graphanalyze.py analyze_external_call` default
 /// (`bottom_result()` = empty set).
 ///
 /// Shape: `extraeffect=CannotRaise`, every `_*_descrs_*` raw set =
@@ -243,7 +243,7 @@ pub fn nursery_alloc_effect_info() -> EffectInfo {
 /// the producer additionally asserts cannot trigger GC; the
 /// analyzer-absent default here keeps the
 /// `effectinfo_from_writeanalyze(can_collect=True)` PyPy default.
-/// `check_can_raise()` (`effectinfo.py:236`) reads
+/// `check_can_raise()` (`effectinfo.py`) reads
 /// `extraeffect > EF_CANNOT_RAISE` so the canonical walker omits
 /// the trailing `GUARD_NO_EXCEPTION` for this slot.
 pub fn cannot_raise_effect_info() -> EffectInfo {
@@ -252,9 +252,9 @@ pub fn cannot_raise_effect_info() -> EffectInfo {
 
 /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` analyzer-absent fallback —
 /// the `call.py:288-289 if self.virtualizable_analyzer.analyze(op)`
-/// row of `call.py:282-303 getcalldescr`, fed through
+/// row of `call.py getcalldescr`, fed through
 /// `effectinfo_from_writeanalyze` with the
-/// `graphanalyze.py:60 analyze_external_call` default
+/// `graphanalyze.py analyze_external_call` default
 /// (`bottom_result()` = empty set).
 ///
 /// Shape: `extraeffect=ForcesVirtualOrVirtualizable`, every
@@ -264,12 +264,12 @@ pub fn cannot_raise_effect_info() -> EffectInfo {
 /// can_collect = True`).
 ///
 /// **Distinct from `MOST_GENERAL`**: `EF_RANDOM_EFFECTS` is reserved
-/// for the `RandomEffectsAnalyzer` (`effectinfo.py:410-415
+/// for the `RandomEffectsAnalyzer` (`effectinfo.py
 /// random_effects_on_gcobjs`) branch. `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`
 /// is the dedicated virtualizable-forcing slot — both pass
 /// `check_forces_virtual_or_virtualizable()` via the `>=` test at
 /// `effectinfo.py:249-250`, but only `RandomEffects` trips
-/// `has_random_effects()` (`effectinfo.py:252`) and routes
+/// `has_random_effects()` (`effectinfo.py`) and routes
 /// `OptHeap` through `clean_caches`. Collapsing MayForce to
 /// `MOST_GENERAL` over-invalidates the heap cache PyPy keeps live
 /// for analyzer-empty virtualizable-forcing callees.
@@ -318,7 +318,7 @@ pub const CANNOT_RAISE_NO_HEAP_EFFECT_INFO: EffectInfo = EffectInfo {
 /// (floor division). RPython parity: jtransform.py:2046-2047
 /// `_handle_int_special` classifies `int.py_div` as
 /// `EF_ELIDABLE_CANNOT_RAISE`. Source-level zero/overflow wrappers
-/// (`rint.py:417 ll_int_py_div_zer`, `:429 ll_int_py_div_ovf_zer`)
+/// (`rint.py ll_int_py_div_zer`, `:429 ll_int_py_div_ovf_zer`)
 /// are inlined into the calling graph before the JIT sees this
 /// oopspec call; their checks become runtime guards in the trace,
 /// not properties of this call descriptor. The optimizer's
@@ -351,9 +351,9 @@ pub const INT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
 };
 
 /// Counterpart of [`INT_PY_DIV_EFFECT_INFO`] for Python `%`. RPython
-/// parity: jtransform.py:2046-2047 classifies `int.py_mod` as
+/// parity: jtransform.py classifies `int.py_mod` as
 /// `EF_ELIDABLE_CANNOT_RAISE`; zero/overflow checks from the source
-/// wrappers (`rint.py:509 ll_int_py_mod_zer`, `:520
+/// wrappers (`rint.py ll_int_py_mod_zer`, `:520
 /// ll_int_py_mod_ovf_zer`) are inlined upstream of the JIT trace.
 pub const INT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::ElidableCannotRaise,
@@ -380,7 +380,7 @@ pub const INT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
 };
 
 /// `EF_ELIDABLE_CANNOT_RAISE` with `OS_INT_UDIV` oopspec — unsigned `/`.
-/// RPython parity: `rint.py:434 ll_uint_py_div` carries
+/// RPython parity: `rint.py ll_uint_py_div` carries
 /// `@jit.oopspec("int.udiv(x, y)")`, and jtransform.py:2043-2047
 /// `_handle_int_special` classifies every `int.*div`/`int.*mod` oopspec as
 /// `EF_ELIDABLE_CANNOT_RAISE`.
@@ -417,7 +417,7 @@ pub const UINT_PY_DIV_EFFECT_INFO: EffectInfo = EffectInfo {
 };
 
 /// Counterpart of [`UINT_PY_DIV_EFFECT_INFO`] for unsigned `%`.
-/// RPython parity: `rint.py:525 ll_uint_py_mod` carries
+/// RPython parity: `rint.py ll_uint_py_mod` carries
 /// `@jit.oopspec("int.umod(x, y)")`.
 pub const UINT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
     extraeffect: ExtraEffect::ElidableCannotRaise,
@@ -444,16 +444,16 @@ pub const UINT_PY_MOD_EFFECT_INFO: EffectInfo = EffectInfo {
 };
 
 /// `EF_ELIDABLE_CANNOT_RAISE` (effectinfo.py:17). Selected by
-/// `call.py:299 getcalldescr` when `_canraise(op) == False` for an
-/// elidable callee — `pyjitpl.py:2126 do_residual_call` records
+/// `call.py getcalldescr` when `_canraise(op) == False` for an
+/// elidable callee — `pyjitpl.py do_residual_call` records
 /// `CALL_PURE_*` without the trailing `GUARD_NO_EXCEPTION` because
-/// `effectinfo.check_can_raise()` (`effectinfo.py:232`) is false for
+/// `effectinfo.check_can_raise()` (`effectinfo.py`) is false for
 /// `extraeffect == 0`.
 pub const ELIDABLE_CANNOT_RAISE_EFFECT_INFO: EffectInfo =
     EffectInfo::const_new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);
 
 /// `EF_ELIDABLE_OR_MEMORYERROR` (effectinfo.py:20). Selected by
-/// `call.py:295 getcalldescr` when `_canraise(op) == "mem"` — i.e.
+/// `call.py getcalldescr` when `_canraise(op) == "mem"` — i.e.
 /// the elidable callee's only failure mode is `MemoryError`. Same
 /// dispatch as `EF_ELIDABLE_CAN_RAISE` (`check_can_raise()` is true
 /// for extraeffect ≥ 3) but distinguishes memory-only raises for the
@@ -475,7 +475,7 @@ pub const ELIDABLE_EFFECT_INFO: EffectInfo =
 pub const LOOPINVARIANT_EFFECT_INFO: EffectInfo =
     EffectInfo::const_new(ExtraEffect::LoopInvariant, OopSpecIndex::None);
 
-/// Per-callee analyzer-result slot.  Mirrors `call.py:282-303 getcalldescr`'s
+/// Per-callee analyzer-result slot.  Mirrors `call.py getcalldescr`'s
 /// `extraeffect` selection without the `raise_analyzer` /
 /// `readwrite_analyzer` / `collect_analyzer` / `randomeffects_analyzer`
 /// graph-based machinery (the analyzers operate on RPython low-level
@@ -496,7 +496,7 @@ pub const LOOPINVARIANT_EFFECT_INFO: EffectInfo =
 /// which is out of scope for the slot enum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EffectInfoSlot {
-    /// `EF_CAN_RAISE` — `call.py:300-301 elif self._canraise(op):`
+    /// `EF_CAN_RAISE` — `call.py elif self._canraise(op):`
     /// branch of `getcalldescr`, resolved through
     /// `can_raise_effect_info()`: `CanRaise` + `Some(empty)` raw sets
     /// and bitstrings.
@@ -521,19 +521,19 @@ pub enum EffectInfoSlot {
     /// `record_known_result` (`jtransform.py:1677`,
     /// `pyjitpl.py:2128-2132` assert the opposite).
     Unanalyzed,
-    /// `EF_CANNOT_RAISE` — `call.py:303` `else` branch.
+    /// `EF_CANNOT_RAISE` — `call.py` `else` branch.
     CannotRaise,
     /// `EF_CANNOT_RAISE` + analyzer-confirmed empty heap. Maps to
     /// `CANNOT_RAISE_NO_HEAP_EFFECT_INFO` (`effectinfo.py:281-283`).
     CannotRaiseNoHeap,
-    /// `EF_ELIDABLE_CAN_RAISE` — `call.py:297` `elif cr:` branch.
+    /// `EF_ELIDABLE_CAN_RAISE` — `call.py` `elif cr:` branch.
     ElidableCanRaise,
     /// `EF_ELIDABLE_CANNOT_RAISE` — `call.py:299` `else` branch under
     /// `elif elidable:`.
     ElidableCannotRaise,
-    /// `EF_ELIDABLE_OR_MEMORYERROR` — `call.py:295` `if cr == "mem":`.
+    /// `EF_ELIDABLE_OR_MEMORYERROR` — `call.py` `if cr == "mem":`.
     ElidableOrMemerror,
-    /// `EF_LOOPINVARIANT` — `call.py:291` `elif loopinvariant:`.
+    /// `EF_LOOPINVARIANT` — `call.py` `elif loopinvariant:`.
     LoopInvariant,
 }
 
@@ -558,7 +558,7 @@ pub fn effect_info_for_slot(slot: EffectInfoSlot) -> EffectInfo {
 /// Pick the upstream-equivalent default effect for an opcode whose
 /// callee has not been write-analyzed.
 ///
-/// `pyjitpl.py:1991-1995 do_residual_or_indirect_call` selects between
+/// `pyjitpl.py do_residual_or_indirect_call` selects between
 /// CALL / CALL_PURE / CALL_LOOPINVARIANT / CALL_MAY_FORCE based on
 /// `descr.get_extra_info().extraeffect`. Pyre baked the choice into the
 /// opcode at codewriter time, so reverse the mapping here so the descr
@@ -602,9 +602,9 @@ pub fn default_effect_for_opcode(opcode: majit_ir::OpCode) -> EffectInfo {
 ///
 /// * [`make_call_descr_from_target_slot`] when a resolved
 ///   [`crate::jitcode::JitCallTarget`] is available — threads the
-///   macro-time [`EffectInfoSlot`] (`call.py:282-303 getcalldescr` parity).
+///   macro-time [`EffectInfoSlot`] (`call.py getcalldescr` parity).
 /// * `make_call_descr_for_opcode` when only the call opcode family is
-///   known (`pyjitpl.py:1991-1995 do_residual_or_indirect_call`'s
+///   known (`pyjitpl.py do_residual_or_indirect_call`'s
 ///   `EF_LOOPINVARIANT` / `EF_ELIDABLE_*` reverse-mapping).
 /// * [`make_call_descr_with_effect`] when an explicit `EffectInfo` has
 ///   been hand-built (release-gil targets, oopspec specializations).
@@ -628,7 +628,7 @@ pub fn make_call_descr_for_opcode(
 
 /// Create a CallDescr from a per-target [`EffectInfoSlot`] classification.
 ///
-/// `call.py:282-303 getcalldescr` selects `extraeffect` per callsite
+/// `call.py getcalldescr` selects `extraeffect` per callsite
 /// from the analyzer chain; pyre's analyzer-absent equivalent is the
 /// `JitCallTarget.effect_info_slot` macro-time classification.  This
 /// factory is the per-target entry point — callers that have a
@@ -733,7 +733,7 @@ fn make_call_descr_sized(
     result_size: usize,
     effect_info: EffectInfo,
 ) -> DescrRef {
-    // `effectinfo.py:182-184` invariant: no new `EffectInfo` may be
+    // `effectinfo.py` invariant: no new `EffectInfo` may be
     // constructed after `compute_bitstrings` has run; PyPy enforces this
     // implicitly through codewriter lifecycle ordering, with `Ellipsis`
     // as a post-hoc bitcheck-time tripwire.  Pyre allows trace-time
@@ -880,7 +880,7 @@ pub fn make_call_may_force_descr(arg_types: &[Type], result_type: Type) -> Descr
 ///
 /// Create a `CALL_ASSEMBLER_*` descr that owns the same `Arc<JitCellToken>`
 /// as the production warm cell / `CompiledEntry::token` / `alive_loops`.
-/// `direct_assembler_call` (`pyjitpl.py:3589-3609`) is the canonical caller —
+/// `direct_assembler_call` (`pyjitpl.py`) is the canonical caller —
 /// it threads the cell's compiled token through, so `record_loop_or_bridge`'s
 /// keepalive walker downcasts the descr and pushes that same Arc into
 /// `original.keepalive_tokens`, matching `compile.py:187 record_jump_to(descr)`.
@@ -1191,7 +1191,7 @@ mod translated_result_class_tests {
     use super::*;
     use majit_ir::EffectInfo;
 
-    /// `descr.py:524-526 get_result_type()` returns the raw result char, and
+    /// `descr.py get_result_type()` returns the raw result char, and
     /// `descr.py:665` keys the call-descr cache on it.  A descr rehydrated
     /// from the translated image goes through
     /// `make_call_descr_sized_with_translated_effect`, which normalises `'S'`

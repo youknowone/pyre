@@ -21,7 +21,7 @@
 use crate::address_dict::AddressMap;
 
 /// The ownership share the linked interpreter object contributes to a mirror's
-/// count — `rawrefcount.py:15 REFCNT_FROM_PYPY`, spelled `sys.maxint // 4 + 1`.
+/// count — `rawrefcount.py REFCNT_FROM_PYPY`, spelled `sys.maxint // 4 + 1`.
 ///
 /// A mirror whose count is exactly this is referenced by nothing except the
 /// link, so the collector is free to let the linked object die.  Every count
@@ -63,7 +63,7 @@ pub struct PyObjHeader {
     pub ob_link: usize,
 }
 
-/// `incminimark.py:3169-3170 _pyobj`.
+/// `incminimark.py _pyobj`.
 #[inline]
 pub(crate) fn pyobj(address: usize) -> *mut PyObjHeader {
     address as *mut PyObjHeader

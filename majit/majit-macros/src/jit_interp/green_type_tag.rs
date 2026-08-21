@@ -29,7 +29,7 @@ use syn::{
 ///
 /// `Str / Unicode` would opt in to content-comparison through the hardcoded
 /// `default_str_eq` / `default_str_hash` / `default_unicode_hash` in
-/// `majit-ir/src/value.rs` (`warmstate.py:108-128 ll_streq` / `ll_strhash`
+/// `majit-ir/src/value.rs` (`warmstate.py ll_streq` / `ll_strhash`
 /// parity, no frontend override) — but both are refused at parse time, see
 /// the module doc. The variants are retained so the codegen arms and
 /// this mapping stay intact for whoever lifts the refusal.

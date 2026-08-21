@@ -12,16 +12,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// counter.py:82 DEFAULT_SIZE = 2048
 pub const DEFAULT_SIZE: usize = 2048;
 
-/// counter.py:12-13 ENTRY: 5 (f32 time, u16 subhash) pairs per bucket.
+/// counter.py ENTRY: 5 (f32 time, u16 subhash) pairs per bucket.
 const ASSOCIATIVITY: usize = 5;
 
-/// counter.py:8 UINT32MAX = 2 ** 32 - 1
+/// counter.py UINT32MAX = 2 ** 32 - 1
 const UINT32MAX: u64 = 0xFFFF_FFFF;
 
 static MINOR_COLLECTION_STEP: AtomicUsize = AtomicUsize::new(0);
 static DECAY_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
-/// counter.py:104-121 invoke_after_minor_collection
+/// counter.py invoke_after_minor_collection
 ///
 /// This runs inside a minor collection, so it must remain allocation-free and
 /// must not touch the counter table or acquire a lock.
@@ -34,7 +34,7 @@ fn invoke_after_minor_collection() {
 }
 
 /// One timetable entry: 5-way associative (time, subhash) pairs.
-/// counter.py:11-13 ENTRY struct.
+/// counter.py ENTRY struct.
 #[derive(Clone)]
 struct Entry {
     /// counter.py: times — f32 timing values, 0.0 to 1.0.
@@ -52,7 +52,7 @@ impl Default for Entry {
     }
 }
 
-/// counter.py:16 JitCounter
+/// counter.py JitCounter
 pub struct JitCounter {
     /// counter.py:86 size
     size: usize,
@@ -70,7 +70,7 @@ pub struct JitCounter {
 }
 
 impl JitCounter {
-    /// counter.py:84-100 __init__(self, size=DEFAULT_SIZE, translator=None)
+    /// counter.py __init__(self, size=DEFAULT_SIZE, translator=None)
     pub fn new(size: usize) -> Self {
         majit_gc::register_after_minor_collection_hook(invoke_after_minor_collection);
         let mut shift = 16u32;
@@ -88,7 +88,7 @@ impl JitCounter {
         }
     }
 
-    /// counter.py:122-126 compute_threshold
+    /// counter.py compute_threshold
     pub fn compute_threshold(&self, threshold: u32) -> f64 {
         if threshold == 0 {
             return 0.0;
@@ -96,7 +96,7 @@ impl JitCounter {
         1.0_f64 / (threshold as f64 - 0.001)
     }
 
-    /// counter.py:86 `self.size = size` — the entry count both tables are
+    /// counter.py `self.size = size` — the entry count both tables are
     /// indexed with. `counter.py:97,103` size the timetable and the celltable
     /// from this one number, so a table living outside this struct has to read
     /// it from here rather than pick its own.
@@ -105,7 +105,7 @@ impl JitCounter {
         self.size
     }
 
-    /// counter.py:128-136 _get_index
+    /// counter.py _get_index
     ///
     /// ```text
     ///  def _get_index(self, hash):
@@ -123,13 +123,13 @@ impl JitCounter {
         (hash32 >> self.shift) as usize
     }
 
-    /// counter.py:138-140 _get_subhash
+    /// counter.py _get_subhash
     #[inline(always)]
     fn _get_subhash(hash: u64) -> u16 {
         (hash & 0xFFFF) as u16
     }
 
-    /// counter.py:142-153 fetch_next_hash
+    /// counter.py fetch_next_hash
     pub fn fetch_next_hash(&mut self) -> u64 {
         let result = self._nexthash;
         self._nexthash =
@@ -137,7 +137,7 @@ impl JitCounter {
         result
     }
 
-    /// counter.py:155-166 _swap
+    /// counter.py _swap
     #[inline(always)]
     fn _swap(entry: &mut Entry, n: usize) -> usize {
         if entry.times[n] > entry.times[n + 1] {
@@ -149,7 +149,7 @@ impl JitCounter {
         }
     }
 
-    /// counter.py:168-183 _tick_slowpath
+    /// counter.py _tick_slowpath
     fn _tick_slowpath(entry: &mut Entry, subhash: u16) -> usize {
         if entry.subhashes[1] == subhash {
             Self::_swap(entry, 0)
@@ -199,7 +199,7 @@ impl JitCounter {
         increment >= 1.0
     }
 
-    /// counter.py:185-202 tick(self, hash, increment)
+    /// counter.py tick(self, hash, increment)
     #[inline(always)]
     pub fn tick(&mut self, hash: u64, increment: f64) -> bool {
         // counter.py:104-121 applies the decay synchronously inside the minor
@@ -234,13 +234,13 @@ impl JitCounter {
             entry.times[n] = counter as f32;
             false
         } else {
-            // counter.py:199-200: self.reset(hash); return True
+            // counter.py: self.reset(hash); return True
             self.reset(hash);
             true
         }
     }
 
-    /// counter.py:204-230 change_current_fraction(hash, new_fraction)
+    /// counter.py change_current_fraction(hash, new_fraction)
     pub fn change_current_fraction(&mut self, hash: u64, new_fraction: f64) {
         self.apply_pending_decay();
 
@@ -261,7 +261,7 @@ impl JitCounter {
         entry.times[0] = new_fraction as f32;
     }
 
-    /// counter.py:232-237 reset(hash)
+    /// counter.py reset(hash)
     pub fn reset(&mut self, hash: u64) {
         self.apply_pending_decay();
 
@@ -285,7 +285,7 @@ impl JitCounter {
         }
     }
 
-    /// counter.py:258-264 set_decay(decay)
+    /// counter.py set_decay(decay)
     pub fn set_decay(&mut self, decay: i32) {
         self.apply_pending_decay();
 
@@ -293,9 +293,9 @@ impl JitCounter {
         self.decay_by_mult = 1.0_f64 - (clamped as f64 * 0.001);
     }
 
-    /// counter.py:266-278 decay_all_counters()
+    /// counter.py decay_all_counters()
     ///
-    /// counter.py:278-279 hands `decay_by_mult` to `pypy__decay_jit_counters`,
+    /// counter.py hands `decay_by_mult` to `pypy__decay_jit_counters`,
     /// whose C body narrows it with `float f = (float)f1` once and then
     /// multiplies each entry in single precision. Narrowing the multiplier here
     /// rather than the product keeps those bits: widening the entry to f64,
@@ -323,7 +323,7 @@ impl JitCounter {
     }
 }
 
-/// counter.py:309 DeterministicJitCounter — test-only, NOT_RPYTHON.
+/// counter.py DeterministicJitCounter — test-only, NOT_RPYTHON.
 ///
 /// RPython: subclasses JitCounter, overrides _get_index to return the
 /// raw hash (identity — no collision), uses a defaultdict timetable.
@@ -339,26 +339,26 @@ impl Default for DeterministicJitCounter {
 }
 
 impl DeterministicJitCounter {
-    /// counter.py:310-315 DeterministicJitCounter.__init__
+    /// counter.py DeterministicJitCounter.__init__
     pub fn new() -> Self {
         DeterministicJitCounter {
             entries: indexmap::IndexMap::new(),
         }
     }
 
-    /// counter.py:318-319 _get_index — identity (no hash collision).
+    /// counter.py _get_index — identity (no hash collision).
     #[inline(always)]
     fn _get_index(hash: u64) -> u64 {
         hash
     }
 
-    /// counter.py:138-140 _get_subhash
+    /// counter.py _get_subhash
     #[inline(always)]
     fn _get_subhash(hash: u64) -> u16 {
         (hash & 0xFFFF) as u16
     }
 
-    /// counter.py:122-126 compute_threshold
+    /// counter.py compute_threshold
     pub fn compute_threshold(&self, threshold: u32) -> f64 {
         if threshold == 0 {
             return 0.0;
@@ -366,7 +366,7 @@ impl DeterministicJitCounter {
         1.0_f64 / (threshold as f64 - 0.001)
     }
 
-    /// counter.py:185-202 tick — same logic but using identity _get_index.
+    /// counter.py tick — same logic but using identity _get_index.
     pub fn tick(&mut self, hash: u64, increment: f64) -> bool {
         let key = Self::_get_index(hash);
         let subhash = Self::_get_subhash(hash);
@@ -402,7 +402,7 @@ impl DeterministicJitCounter {
         }
     }
 
-    /// counter.py:232-237 reset
+    /// counter.py reset
     pub fn reset(&mut self, hash: u64) {
         let key = Self::_get_index(hash);
         let subhash = Self::_get_subhash(hash);
@@ -415,10 +415,10 @@ impl DeterministicJitCounter {
         }
     }
 
-    /// counter.py:322 decay_all_counters — no-op for deterministic counter.
+    /// counter.py decay_all_counters — no-op for deterministic counter.
     pub fn decay_all_counters(&mut self) {}
 
-    /// counter.py:326-327 _clear_all
+    /// counter.py _clear_all
     pub fn _clear_all(&mut self) {
         self.entries.clear();
     }

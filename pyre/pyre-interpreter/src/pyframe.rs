@@ -955,7 +955,7 @@ impl FrameBox {
     /// GC-managed locals, debug data, and block stack once no root
     /// (`walk_pyframe_roots` over the `CURRENT_FRAME` / `f_backref` chain)
     /// reaches it, so `Drop` performs no manual free
-    /// (`executioncontext.py:91-107 leave` frees nothing either).
+    /// (`executioncontext.py leave` frees nothing either).
     ///
     /// The non-moving part is pyre's, not upstream's: `pyframe.py:52 class
     /// PyFrame(W_Root)` declares no placement hint and a minor collection
@@ -979,7 +979,7 @@ impl FrameBox {
     /// frame holding young argument boxes joins the remembered set and is
     /// re-traced every minor collection, and each returned frame is old-gen
     /// garbage only a major reclaims.  Pinning is not an alternative:
-    /// `GcAllocator::pin` ports `gctypelayout.py:88-92 q_cannot_pin` and
+    /// `GcAllocator::pin` ports `gctypelayout.py q_cannot_pin` and
     /// refuses any type carrying GC pointers or a custom trace, which a
     /// `PyFrame` does both.
     ///
@@ -1160,7 +1160,7 @@ impl FrameBox {
         self.owner_root.is_some()
     }
 
-    /// pyframe.py:259 initialize_as_generator — wrap this frame in a generator
+    /// pyframe.py initialize_as_generator — wrap this frame in a generator
     /// object that takes ownership of it. PyPy does `GeneratorIterator(self)`:
     /// the generator references the same frame, no copy. FrameBox already holds
     /// the heap, header-bearing frame, so ownership transfers straight through
@@ -1170,7 +1170,7 @@ impl FrameBox {
         self.into_generator_named(None, None)
     }
 
-    /// `pyframe.py:259 initialize_as_generator(name, qualname)` — function
+    /// `pyframe.py initialize_as_generator(name, qualname)` — function
     /// calls pass the function's current writable metadata so each newly
     /// created generator freezes it independently of the code object.
     /// `__name__` / `__qualname__` are the function's own immutable string
@@ -1220,7 +1220,7 @@ impl FrameBox {
         let _frame_roots = pyre_object::gc_roots::push_roots();
         pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
         let _root = FrameLocalsRoot::new(frame_ptr);
-        // generator.py:21 `self.pycode = frame.pycode`: preserve the exact
+        // generator.py `self.pycode = frame.pycode`: preserve the exact
         // code object independently of the frame, which is cleared when the
         // generator finishes.
         let pycode = unsafe { (*frame_ptr).pycode as pyre_object::PyObjectRef };
@@ -1271,7 +1271,7 @@ impl FrameBox {
         unsafe {
             (*frame_ptr).f_generator_nowref = generator;
         }
-        // generator.py:24-27: every Coroutine needs its `_finalize_` hook for
+        // generator.py: every Coroutine needs its `_finalize_` hook for
         // the never-awaited warning. Ordinary generators only need one when
         // collection must unwind a suspended `finally`/`with` body.
         if is_coroutine || register_final {
@@ -1353,7 +1353,7 @@ impl Drop for FrameBox {
     fn drop(&mut self) {
         // GC-managed (old-gen) frames are reclaimed by a major mark-sweep
         // when no root reaches them (`pyframe.py class PyFrame(W_Root)`;
-        // `executioncontext.py:91-107 leave` frees nothing).  Their
+        // `executioncontext.py leave` frees nothing).  Their
         // The collector reclaims their GC-managed locals array, debug data,
         // and block chain with the frame, so no manual cleanup runs here.
         // Only a `std::alloc` snapshot / bootstrap fallback box is freed
@@ -1632,7 +1632,7 @@ impl PyFrame {
 /// PyPy: `frame.pycode` gives `PyCode` which IS the code object.
 /// pyre: PyCode wraps a raw CodeObject — this extracts it.
 ///
-/// `@jit.elidable` (`rlib/jit.py:13`): deterministic, no allocation,
+/// `@jit.elidable` (`rlib/jit.py`): deterministic, no allocation,
 /// no raise — pure pointer cast through `w_code_get_ptr`.
 /// Mapped to `EF_ELIDABLE_CANNOT_RAISE` (`call.py:299`) so the
 /// metainterp can execute it at trace time and the walker can read
@@ -1652,7 +1652,7 @@ pub unsafe fn pyframe_get_pycode(frame: &PyFrame) -> *const CodeObject {
 /// underflow means the frame — or the code behind it — is no longer the
 /// one the loop started with.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py:139`):
+/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
 /// [`PyFrame::pop`] reaches this on the branch it never takes, so the
 /// instruction-window formatting below — a `Vec<String>` built through
 /// `enumerate`/`skip`/`take`/`map` over the `CodeUnits` deref — would
@@ -2495,7 +2495,7 @@ pub fn deref_unbound_error(code: &CodeObject, idx: usize) -> crate::PyError {
 /// Whether calling a code object with these flags produces a suspended
 /// frame object (generator / coroutine / async generator) rather than
 /// running the body eagerly.
-/// pyframe.py:246 `_is_generator_or_coroutine`: CO_COROUTINE |
+/// pyframe.py `_is_generator_or_coroutine`: CO_COROUTINE |
 /// CO_GENERATOR | CO_ASYNC_GENERATOR.  CO_ITERABLE_COROUTINE is a marker
 /// layered on a generator function (it always co-occurs with
 /// CO_GENERATOR), so it is not tested here.
@@ -2509,13 +2509,13 @@ pub fn code_flags_make_generator(flags: crate::CodeFlags) -> bool {
 }
 
 impl PyFrame {
-    /// pyframe.py:121 getdebug → self.debugdata
+    /// pyframe.py getdebug → self.debugdata
     #[inline]
     fn getdebug_data(&self) -> Option<&FrameDebugData> {
         (!self.debugdata.is_null()).then(|| unsafe { &*self.debugdata })
     }
 
-    /// pyframe.py:124 getorcreatedebug
+    /// pyframe.py getorcreatedebug
     #[inline]
     fn getorcreate_debug_data(&mut self, init_lineno: isize) -> &mut FrameDebugData {
         if self.debugdata.is_null() {
@@ -2599,7 +2599,7 @@ impl PyFrame {
         self.w_globals
     }
 
-    /// pyframe.py:135 get_w_f_trace
+    /// pyframe.py get_w_f_trace
     #[inline]
     pub fn get_w_f_trace(&self) -> PyObjectRef {
         self.getdebug_data()
@@ -2607,7 +2607,7 @@ impl PyFrame {
             .unwrap_or(pyre_object::PY_NULL)
     }
 
-    /// pyframe.py:141 get_is_being_profiled
+    /// pyframe.py get_is_being_profiled
     #[inline]
     pub fn get_is_being_profiled(&self) -> bool {
         self.getdebug_data()
@@ -2679,13 +2679,13 @@ impl PyFrame {
         let w_globals = PY_NULL;
         self.w_builtin = crate::baseobjspace::frame_builtin_obj(w_globals, self.execution_context);
         self.w_globals = w_globals;
-        // pyframe.py:103 — stamp `pycode.w_globals` (the first-globals cache
+        // pyframe.py — stamp `pycode.w_globals` (the first-globals cache
         // the LOAD_GLOBAL fast path keys on); side effect only, since the
         // gated debugdata snapshot retired in favour of `w_globals`.
         unsafe {
             crate::w_code_frame_stores_global(code as PyObjectRef, self.w_globals);
         }
-        // pyframe.py:118 — final step of __init__.
+        // pyframe.py — final step of __init__.
         self.initialize_frame_scopes(outer_func, code).expect(
             "PyFrame::__init__: initialize_frame_scopes raised — caller should use createframe",
         );
@@ -2755,7 +2755,7 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py:223-261 initialize_frame_scopes.
+    /// pyframe.py initialize_frame_scopes.
     ///
     /// Errors mirror pyframe.py:242-246 (TypeError "directly executed code
     /// object may not contain free variables") and pyframe.py:251-253
@@ -2816,11 +2816,11 @@ impl PyFrame {
         Ok(())
     }
 
-    /// pyframe.py:547-552 setdictscope(w_locals, skip_free_vars=False) —
+    /// pyframe.py setdictscope(w_locals, skip_free_vars=False) —
     /// install `w_locals` as the frame's locals mapping and reflect
     /// its entries into the fastlocals via `locals2fast`.
     ///
-    /// `pypy/interpreter/pyopcode.py:2003-2013 ensure_ns` admits any object
+    /// `pypy/interpreter/pyopcode.py ensure_ns` admits any object
     /// exposing `__getitem__` as locals, so the mapping may be a plain dict
     /// (module / class / `exec(src, g, l)`) or an arbitrary mapping; both
     /// share this path and `STORE_NAME` / `LOAD_NAME` / `DELETE_NAME` route
@@ -2869,11 +2869,11 @@ impl PyFrame {
             .map_or(pyre_object::PY_NULL, |data| data.w_extra_locals)
     }
 
-    /// pyframe.py:540-545 getdictscope — runs `fast2locals` then returns
+    /// pyframe.py getdictscope — runs `fast2locals` then returns
     /// `self.debugdata.w_locals` (the locals mapping object).
     ///
     /// `fast2locals` lazily materialises a fresh dict for a function frame
-    /// (pyframe.py:557 `space.newdict(instance=True)`) and caches it in
+    /// (pyframe.py `space.newdict(instance=True)`) and caches it in
     /// `w_locals`, so repeated calls return the same object —
     /// `frame.f_locals is frame.f_locals` holds.
     #[inline]
@@ -2968,7 +2968,7 @@ impl PyFrame {
     /// `space.createframe`.  Pyre keeps `PyFrame::new` for test
     /// ergonomics (~67 callers across `pyre-interpreter`, `pyre-jit`,
     /// `pyre-jit-trace` test modules) but routes the body through
-    /// `createframe` (PyPy `baseobjspace.py:796`) so every heap-allocated
+    /// `createframe` (PyPy `baseobjspace.py`) so every heap-allocated
     /// `PyFrame` flows through the canonical entry point.
     pub fn new(code: CodeObject) -> FrameBox {
         let frame = Self::new_with_context(code, Rc::new(PyExecutionContext::default()))
@@ -3194,7 +3194,7 @@ impl PyFrame {
     #[inline]
     pub fn peek(&self) -> PyObjectRef {
         // The index is computed into a local first, as
-        // `pyframe.py:479-484 peekvalue_maybe_none` computes `index` before
+        // `pyframe.py peekvalue_maybe_none` computes `index` before
         // its subscript.  A subscript evaluates its receiver before its index
         // expression, so spelling the arithmetic inside the brackets emits the
         // `locals_cells_stack_w` read ahead of the subtraction's overflow
@@ -3230,7 +3230,7 @@ impl PyFrame {
         self.push(value)
     }
 
-    /// pyframe.py:304-307 pushvalue_none
+    /// pyframe.py pushvalue_none
     #[inline]
     pub fn pushvalue_none(&mut self) {
         let depth = self.valuestackdepth;
@@ -3260,7 +3260,7 @@ impl PyFrame {
         index >= self.stack_base() && index < locals_w!(self).len()
     }
 
-    /// pyframe.py:313-314 popvalue
+    /// pyframe.py popvalue
     #[inline]
     pub fn popvalue(&mut self) -> PyObjectRef {
         let value = self.popvalue_maybe_none();
@@ -3268,7 +3268,7 @@ impl PyFrame {
         value
     }
 
-    /// pyframe.py:316-322 popvalue_maybe_none
+    /// pyframe.py popvalue_maybe_none
     #[inline]
     pub fn popvalue_maybe_none(&mut self) -> PyObjectRef {
         let depth = self.valuestackdepth - 1;
@@ -3303,7 +3303,7 @@ impl PyFrame {
         self.popvalues(n)
     }
 
-    /// pyframe.py:337-345 peekvalues
+    /// pyframe.py peekvalues
     #[inline]
     pub fn peekvalues(&self, n: usize) -> Vec<PyObjectRef> {
         let base = self.valuestackdepth - n;
@@ -3327,7 +3327,7 @@ impl PyFrame {
         values_w
     }
 
-    /// pyframe.py:348-355 dropvalues
+    /// pyframe.py dropvalues
     #[inline]
     pub fn dropvalues(&mut self, n: usize) {
         let finaldepth = self.valuestackdepth - n;
@@ -3555,7 +3555,7 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py:300 resume_execute_frame, after any suspended delegate has
+    /// pyframe.py resume_execute_frame, after any suspended delegate has
     /// either yielded or completed in `eval_frame_plain_with_resume`.
     #[inline]
     pub fn resume_execute_frame(
@@ -3583,7 +3583,7 @@ impl PyFrame {
         // drive a frame directly — so this is one of the entry points that
         // takes the GIL (rgil.py:186-193).
         crate::module::thread::ensure_runtime_thread();
-        // pyframe.py:360 `execute_frame.insert_stack_check_here = True`.
+        // pyframe.py `execute_frame.insert_stack_check_here = True`.
         // RPython's transform inserts the check at this graph entry, so
         // builtin/object-space calls remain usable while an existing frame is
         // handling RecursionError and every newly entered Python frame is
@@ -3656,7 +3656,7 @@ impl PyFrame {
         )
     }
 
-    /// pyframe.py:521-522 `hide(self): return self.pycode.hidden_applevel`.
+    /// pyframe.py `hide(self): return self.pycode.hidden_applevel`.
     ///
     /// PyPy creates a `PyFrame` for every callable that has a Code
     /// object — including gateway builtins (`BuiltinCode`,
@@ -3760,13 +3760,13 @@ impl PyFrame {
         true
     }
 
-    /// pyframe.py:183 mark_as_escaped
+    /// pyframe.py mark_as_escaped
     #[inline]
     pub fn mark_as_escaped(&mut self) {
         self.set_escaped(true);
     }
 
-    /// pyframe.py:216-220 `get_builtin` — returns `self.builtin` (the
+    /// pyframe.py `get_builtin` — returns `self.builtin` (the
     /// per-frame picked builtin Module, set at frame creation by
     /// `pick_builtin(w_globals)`).  Falls back to the EC's default
     /// builtin when the frame was constructed without globals.
@@ -3792,8 +3792,8 @@ impl PyFrame {
         crate::executioncontext::force_vref(self.f_backref)
     }
 
-    /// pyframe.py:768-771 `fget_f_builtins` — `self.get_builtin()
-    /// .getdict(space)`, which `module.py:20` defines as `self.w_dict`.
+    /// pyframe.py `fget_f_builtins` — `self.get_builtin()
+    /// .getdict(space)`, which `module.py` defines as `self.w_dict`.
     /// Pyre's `w_module_new` constructs `w_dict` at allocation time so
     /// every Module surfaces a stable, non-null identity here.
     #[inline]
@@ -3808,20 +3808,20 @@ impl PyFrame {
         w_builtin
     }
 
-    /// pyframe.py:764 `fget_f_back` — the next non-hidden frame, i.e.
+    /// pyframe.py `fget_f_back` — the next non-hidden frame, i.e.
     /// `ExecutionContext.getnextframe_nohidden(self)`, skipping
     /// `hidden_applevel` gateway / bridge frames.  The plain
     /// `get_f_back()` accessor (used internally, including by the
     /// nohidden walker itself) returns the raw `f_backref` link.
     #[inline]
     pub fn fget_f_back(&self) -> *mut PyFrame {
-        // pyframe.py:767-768 `fget_f_back` → `get_f_back` →
+        // pyframe.py `fget_f_back` → `get_f_back` →
         // `ExecutionContext.getnextframe_nohidden`, with no force of either
         // end.  Upstream needs none: `f_backref` is a `jit.virtual_ref`
         // (executioncontext.py:88-89), so the read at :80 `frame.f_backref()`
         // IS the force, and it is the foldable vref one rather than an
         // unconditional materialisation —
-        // executioncontext.py:323-331 `force_all_frames` says so outright
+        // executioncontext.py `force_all_frames` says so outright
         // ("We get this effect simply by reading the f_back field of all
         // frames").  Forcing both ends concretely here instead escapes the
         // virtualizable during tracing and loses the loop.
@@ -3829,7 +3829,7 @@ impl PyFrame {
         crate::executioncontext::ExecutionContext::getnextframe_nohidden(this)
     }
 
-    /// pyframe.py:641-642 fget_code → self.getcode().  Returns the `PyCode`
+    /// pyframe.py fget_code → self.getcode().  Returns the `PyCode`
     /// wrapper object (`self.pycode`) itself, which is what `frame.f_code`
     /// yields to Python — not the inner `CodeObject`.
     #[inline]
@@ -3837,7 +3837,7 @@ impl PyFrame {
         self.pycode as PyObjectRef
     }
 
-    /// pyframe.py:849-853 descr_repr — `<frame at 0x…, file '…', line …,
+    /// pyframe.py descr_repr — `<frame at 0x…, file '…', line …,
     /// code …>` via `getrepr(space, "frame", moreinfo)`.
     pub fn descr_repr(&self) -> rustpython_wtf8::Wtf8Buf {
         let code = self.code();
@@ -3971,7 +3971,7 @@ impl PyFrame {
         self.valuestackdepth = 0;
     }
 
-    /// pyframe.py:773 fget_f_lasti → space.newint(self.last_instr)
+    /// pyframe.py fget_f_lasti → space.newint(self.last_instr)
     #[inline]
     pub fn fget_f_lasti(&self) -> isize {
         self.last_instr
@@ -3983,7 +3983,7 @@ impl PyFrame {
         self.get_w_f_trace()
     }
 
-    /// pyframe.py:785-791 fset_f_trace
+    /// pyframe.py fset_f_trace
     #[inline]
     pub fn fset_f_trace(&mut self, w_trace: PyObjectRef) {
         if w_trace.is_null() || w_trace == pyre_object::w_none() {
@@ -3996,43 +3996,43 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py:793-794 fdel_f_trace
+    /// pyframe.py fdel_f_trace
     #[inline]
     pub fn fdel_f_trace(&mut self) {
         self.getorcreate_debug_data(-1).w_f_trace = pyre_object::PY_NULL;
     }
 
-    /// pyframe.py:153-157 get_f_trace_lines
+    /// pyframe.py get_f_trace_lines
     #[inline]
     pub fn get_f_trace_lines(&self) -> bool {
         self.getdebug_data().is_none_or(|d| d.f_trace_lines)
     }
 
-    /// pyframe.py:159-163 get_f_trace_opcodes
+    /// pyframe.py get_f_trace_opcodes
     #[inline]
     pub fn get_f_trace_opcodes(&self) -> bool {
         self.getdebug_data().is_some_and(|d| d.f_trace_opcodes)
     }
 
-    /// pyframe.py:796-797 fget_f_trace_lines
+    /// pyframe.py fget_f_trace_lines
     #[inline]
     pub fn fget_f_trace_lines(&self) -> bool {
         self.get_f_trace_lines()
     }
 
-    /// pyframe.py:799-800 fset_f_trace_lines
+    /// pyframe.py fset_f_trace_lines
     #[inline]
     pub fn fset_f_trace_lines(&mut self, value: bool) {
         self.getorcreate_debug_data(-1).f_trace_lines = value;
     }
 
-    /// pyframe.py:802-803 fget_f_trace_opcodes
+    /// pyframe.py fget_f_trace_opcodes
     #[inline]
     pub fn fget_f_trace_opcodes(&self) -> bool {
         self.get_f_trace_opcodes()
     }
 
-    /// pyframe.py:805-806 fset_f_trace_opcodes
+    /// pyframe.py fset_f_trace_opcodes
     #[inline]
     pub fn fset_f_trace_opcodes(&mut self, value: bool) {
         self.getorcreate_debug_data(-1).f_trace_opcodes = value;
@@ -4062,7 +4062,7 @@ impl PyFrame {
         false
     }
 
-    /// pyframe.py:861-863 get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
+    /// pyframe.py get_last_lineno → pytraceback.offset2lineno(pycode, last_instr)
     #[inline]
     pub fn get_last_lineno(&self) -> isize {
         // A malformed replacement linetable is decoded by the compiler-core
@@ -4087,7 +4087,7 @@ impl PyFrame {
         }
     }
 
-    /// pyframe.py:660-671 fget_f_lineno
+    /// pyframe.py fget_f_lineno
     #[inline]
     pub fn fget_f_lineno(&self) -> isize {
         if self.get_w_f_trace().is_null() {
@@ -4262,7 +4262,7 @@ impl PyFrame {
         self.init_cells();
     }
 
-    /// pyframe.py:601-636 locals2fast(skip_free_vars=False) — reflect the
+    /// pyframe.py locals2fast(skip_free_vars=False) — reflect the
     /// locals mapping back into the fastlocals.  Reads each varname / cellvar
     /// / freevar from the mapping via `space.finditem_str` (KeyError →
     /// missing); a frame with no locals bound has nothing to copy.
@@ -4348,7 +4348,7 @@ impl PyFrame {
         Ok(())
     }
 
-    /// pyframe.py:640-651 init_cells.
+    /// pyframe.py init_cells.
     ///
     /// In the CPython 3.11+ unified slot layout that pyre adopted via
     /// `npure_cellvars`, every cellvar that also appears in varnames
@@ -4364,11 +4364,11 @@ impl PyFrame {
     #[inline]
     pub fn init_cells(&mut self) {}
 
-    /// pyframe.py:554-598 fast2locals — copy the fastlocals into the locals
+    /// pyframe.py fast2locals — copy the fastlocals into the locals
     /// mapping via `space.setitem_str` (`pyframe.py:568`), using `space.delitem`
     /// for missing slots (`pyframe.py:571-574`; `delitem`'s `KeyError` is
     /// silently dropped).  A function frame with no locals bound yet lazily
-    /// allocates a fresh dict (pyframe.py:557 `self.space.newdict(instance=True)`)
+    /// allocates a fresh dict (pyframe.py `self.space.newdict(instance=True)`)
     /// and caches it, so `locals() is locals()` holds.  Errors propagate.
     ///
     /// `@jit.unroll_safe` (`pyframe.py:572`) cancels `contains_loop` in the
@@ -4484,7 +4484,7 @@ impl PyFrame {
             && !(0..code.varnames.len()).any(|i| hidden_local(code, i))
     }
 
-    /// pyframe.py:208-218 `make_arguments` — build Arguments from the value
+    /// pyframe.py `make_arguments` — build Arguments from the value
     /// stack. `methodcall` and `w_function` are stored on the resulting
     /// Arguments for diagnostic use (better error messages on argument
     /// mismatch); pyre's call path currently passes only the positional
@@ -4582,7 +4582,7 @@ impl PyFrame {
         )
     }
 
-    /// pyframe.py:114 `Frame.__init__` resolves `self.builtin` through
+    /// pyframe.py `Frame.__init__` resolves `self.builtin` through
     /// `pick_builtin(w_globals)`, which raises a non-KeyError
     /// `OperationError` straight out of `__init__`.  Fallible frame builder
     /// mirroring that path.
@@ -4748,7 +4748,7 @@ impl PyFrame {
         // remember the completed array before the next allocating operation.
         remember_frame_locals_array(locals_cells_stack_w);
 
-        // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the
+        // pyframe.py — stamp `pycode.w_globals`; side effect only (the
         // gated debugdata snapshot retired in favour of `w_globals`).
         unsafe {
             crate::w_code_frame_stores_global(_roots.get(root_base), _roots.get(root_base + 1));
@@ -4792,7 +4792,7 @@ impl PyFrame {
         code_flags_make_generator(self.code().flags)
     }
 
-    /// pyframe.py:276 initialize_as_generator
+    /// pyframe.py initialize_as_generator
     ///
     /// Adaptation: pyre builds the caller's PyFrame on the interpreter stack,
     /// so we snapshot it onto the heap before handing ownership to the
@@ -4968,7 +4968,7 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
 
 // Virtualizable configuration is in jit/frame_layout.rs
 
-/// pypy/interpreter/baseobjspace.py:796-798 `createframe`.
+/// pypy/interpreter/baseobjspace.py `createframe`.
 ///
 /// ```python
 /// def createframe(self, code, w_globals, outer_func=None):
@@ -4977,14 +4977,14 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
 /// ```
 ///
 /// Returns `Box<PyFrame>` matching PyPy's heap-allocated PyFrame (RPython
-/// class instance — `pyframe.py:51 class PyFrame(W_Root)`).  The Box keeps
+/// class instance — `pyframe.py class PyFrame(W_Root)`).  The Box keeps
 /// every `PyFrame` heap-resident.
 ///
-/// The body inlines `pyframe.py:98-119 PyFrame.__init__` line-by-line:
+/// The body inlines `pyframe.py PyFrame.__init__` line-by-line:
 /// allocate `locals_cells_stack_w` of size `nlocals + ncellvars + nfreevars
 /// + stacksize`, set `valuestackdepth`, optionally bind debug `w_globals`
 /// when `code.frame_stores_global(w_globals)`, then call
-/// `self.initialize_frame_scopes(outer_func, code)` (`pyframe.py:223`)
+/// `self.initialize_frame_scopes(outer_func, code)` (`pyframe.py`)
 /// which performs cell init, freevar copy from `outer_func.closure`, and
 /// raises on freevar/closure-size mismatch.  No constructor switch — both
 /// branches share the same allocation + scope-init path so the cell/freevar
@@ -5003,7 +5003,7 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
 ///
 /// **Args binding** (positional argument values into
 /// `locals_cells_stack_w[0..nargs]`) is **caller-side** per PyPy
-/// `pycode.py:241-249 funcrun`: caller invokes
+/// `pycode.py funcrun`: caller invokes
 /// `space.createframe(...) → args.parse_into_scope(...) → frame.init_cells()
 /// → frame.run(...)`.  createframe itself never binds args and never calls
 /// `init_cells()`.
@@ -5022,7 +5022,7 @@ pub fn createframe(
     createframe_obj(code, w_globals, execution_context, outer_func)
 }
 
-/// `baseobjspace.py:796 createframe` with the globals passed as the dict
+/// `baseobjspace.py createframe` with the globals passed as the dict
 /// OBJECT (`pyframe.py:49 self.w_globals = w_globals` stores the object).
 pub fn createframe_obj(
     code: *const (),
@@ -5030,7 +5030,7 @@ pub fn createframe_obj(
     execution_context: *const PyExecutionContext,
     outer_func: Option<PyObjectRef>,
 ) -> Result<FrameBox, crate::PyError> {
-    // pyframe.py:98-119 PyFrame.__init__ — line-by-line.
+    // pyframe.py PyFrame.__init__ — line-by-line.
     //   self.space = space               (pyre: implicit, no field)
     //   self.pycode = code               (pycode field below)
     //   if code.frame_stores_global(w_globals):
@@ -5052,7 +5052,7 @@ pub fn createframe_obj(
     let num_locals = code_ref.varnames.len();
     let num_cells = ncells(code_ref);
     let max_stack = code_ref.max_stackdepth as usize;
-    // pyframe.py:103 — stamp `pycode.w_globals`; side effect only (the gated
+    // pyframe.py — stamp `pycode.w_globals`; side effect only (the gated
     // debugdata snapshot retired in favour of `w_globals`).
     unsafe {
         crate::w_code_frame_stores_global(code as PyObjectRef, w_globals);
@@ -5080,13 +5080,13 @@ pub fn createframe_obj(
         w_builtin,
         w_globals,
     });
-    // pyframe.py:119 — final step of __init__.  PY_NULL plays the role of
+    // pyframe.py — final step of __init__.  PY_NULL plays the role of
     // Python `None` per the existing `initialize_frame_scopes` convention.
     // Top-level module / interactive / expression code
     // arrives here without CO_NEWLOCALS — RustPython codegen emits empty
     // flags for the seed CodeInfo (`crates/codegen/src/compile.rs Compiler::new`)
     // so initialize_frame_scopes selects the `!OPTIMIZED && !NEWLOCALS`
-    // arm and binds `w_locals = w_globals` per pyframe.py:233-235.
+    // arm and binds `w_locals = w_globals` per pyframe.py.
     let outer_ref = outer_func.unwrap_or(PY_NULL);
     // initialize_frame_scopes allocates (the locals dict and `w_cell_new`
     // cells) and stores the cells into `locals_cells_stack_w`; root the slot so
@@ -5108,7 +5108,7 @@ pub fn createframe_obj(
 
 /// `space.finditem_str(w_obj, key)` — `space.getitem` with KeyError
 /// remapped to `None`.  Non-KeyError errors propagate unchanged so
-/// `fast2locals`/`locals2fast` raise as PyPy does at `pyframe.py:613` /
+/// `fast2locals`/`locals2fast` raise as PyPy does at `pyframe.py` /
 /// `pyframe.py:632` (`pypy/objspace/std/objspace.py finditem_str` re-
 /// raises everything except `KeyError`).
 fn finditem_str_object(
@@ -5173,7 +5173,7 @@ fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyErr
 /// `pyframe.py:557 self.space.newdict(instance=True)` — the mapping
 /// `fast2locals` materialises for a frame that has none yet, for a trace that
 /// models the fastlocals reads instead of residualizing
-/// `interp_inspect.py:7-11 locals`.
+/// `interp_inspect.py locals`.
 ///
 /// Takes no `PyFrame`, so nothing reachable from here can call
 /// [`crate::executioncontext::force_frame`] — a helper that touched the frame
@@ -5186,7 +5186,7 @@ pub extern "C" fn jit_locals_dict_new() -> i64 {
     unsafe { pyre_object::w_dict_new() as i64 }
 }
 
-/// `pyframe.py:566-568 fast2locals` for ONE visible fastlocal slot: bind
+/// `pyframe.py fast2locals` for ONE visible fastlocal slot: bind
 /// `code.varnames[index]` to `value` in `dict`.
 ///
 /// `dict` is the frame's own locals mapping — `getorcreatedebug().w_locals`,
@@ -5227,7 +5227,7 @@ pub extern "C" fn jit_locals_dict_setitem_local(
     pyre_object::gc_roots::shadow_stack_get(dict_slot) as i64
 }
 
-/// `pyframe.py:569-574 fast2locals` for ONE visible fastlocal slot that is
+/// `pyframe.py fast2locals` for ONE visible fastlocal slot that is
 /// unbound: remove `code.varnames[index]` from `dict`.
 ///
 /// The delete is fallible for the same reason

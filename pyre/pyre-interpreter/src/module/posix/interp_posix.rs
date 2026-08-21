@@ -63,7 +63,7 @@ pub struct W_ScandirIterator {
     pub entries: PyObjectRef,
     pub index: i64,
     pub open: bool,
-    /// `W_ScandirIterator._in_next` (interp_scandir.py:86).
+    /// `W_ScandirIterator._in_next` (interp_scandir.py).
     pub in_next: bool,
 }
 
@@ -451,7 +451,7 @@ fn stat_result_seq_type() -> PyObjectRef {
                 // `struct stat` carries it (BSD family / macOS).
                 #[cfg(target_os = "macos")]
                 "st_flags",
-                // `build_stat_result` (interp_posix.py:554-557) +
+                // `build_stat_result` (interp_posix.py) +
                 // `rposix_stat.py STAT_FIELDS += ALL_STAT_FIELDS[-3:]`
                 // — the sub-second nanosecond remainders, indices 40..42.
                 "nsec_atime",
@@ -526,7 +526,7 @@ fn waitid_result_seq_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// `posix.sched_param` structseq — the single field `app_posix.py:140-147`
+/// `posix.sched_param` structseq — the single field `app_posix.py`
 /// declares.  `_structseq.py:102-107` already wraps the scalar a 1-field
 /// structseq is handed, so `__new__` only has to name the argument;
 /// `__reduce__` has to be replaced outright, because the generic one hands
@@ -646,7 +646,7 @@ fn sched_priority_w(w_param: PyObjectRef) -> Result<i32, crate::PyError> {
 /// and gnu and `sysctl(CTL_HW, HW_NCPU)` on the Apple and BSD targets. The
 /// third is Windows' and stays with the Windows registration. Anywhere else
 /// there is no answer and the count is 0, which `cpu_count` reports as None
-/// (`interp_posix.py:2910-2914` `if count <= 0`).
+/// (`interp_posix.py` `if count <= 0`).
 ///
 /// This is deliberately not the thread count. `get_number_of_os_threads` reads
 /// `/proc/self/stat`'s `num_threads` and the mach `task_threads` count, and
@@ -1308,7 +1308,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // test_posix then runs a fork+fexecve path whose child must never
         // return to the libregrtest worker.
         //
-        // os.py:145-146 reads this as `listdir` and `scandir` taking a
+        // os.py reads this as `listdir` and `scandir` taking a
         // descriptor, which `fdlistdir` serves through `fdopendir`.
         ("HAVE_FDOPENDIR", HAVE_FDOPENDIR),
         ("HAVE_FPATHCONF", HAVE_FPATHCONF),
@@ -1319,7 +1319,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("HAVE_LINKAT", HAVE_LINKAT),
         ("HAVE_FSTATVFS", HAVE_FSTATVFS),
         ("HAVE_FTRUNCATE", HAVE_FTRUNCATE),
-        // os.py:182 reads this as `chflags` honouring follow_symlinks, which
+        // os.py reads this as `chflags` honouring follow_symlinks, which
         // is its `lchflags` arm.
         ("HAVE_LCHFLAGS", HAVE_LCHFLAGS),
         // os.py:183 reads this as `chmod` honouring follow_symlinks; os.py:179
@@ -1329,7 +1329,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // and os.py:150-151 reads either one as the same `utime` capability.
         ("HAVE_FUTIMENS", HAVE_FUTIMENS),
         ("HAVE_LSTAT", HAVE_LSTAT),
-        // os.py:124-127 reads these as `mkdir`, `mkfifo`, `mknod` and `open`
+        // os.py reads these as `mkdir`, `mkfifo`, `mknod` and `open`
         // honouring dir_fd.
         ("HAVE_MKDIRAT", HAVE_MKDIRAT),
         ("HAVE_MKFIFOAT", HAVE_MKFIFOAT),
@@ -1459,7 +1459,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         #[cfg(not(any(unix, windows)))]
         ("O_SYNC", 0i64),
         // SEEK_SET/SEEK_CUR/SEEK_END are os.py's own (`SEEK_SET = 0`,
-        // os.py:203-206) on every platform, named in its own `__all__`, so a
+        // os.py) on every platform, named in its own `__all__`, so a
         // binding here is counted a second time through the star-import.
         // Neither `posix` nor `nt` carries them; the other SEEK_* values are
         // the module's to publish.
@@ -1585,7 +1585,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ] {
             crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
         }
-        // `<sched.h>`, read as `rposix.py:296-300` reads it: present where the
+        // `<sched.h>`, read as `rposix.py` reads it: present where the
         // header defines it, and with the host's own numbering rather than a
         // shared one — the three disagree between Linux, the BSDs and Darwin.
         // The Apple targets declare them in `<pthread/pthread_impl.h>`, which
@@ -1695,7 +1695,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "waitstatus_to_exitcode",
             "_exit",
             "abort",
-            // "spawnv"/"spawnve" — os.py:881 builds the spawn family out of
+            // "spawnv"/"spawnve" — os.py builds the spawn family out of
             // fork+exec+waitpid, but only `if not _exists("spawnv")`, so a name
             // bound here is not a placeholder waiting to be overwritten: it is
             // what stops the real implementation from ever being defined. That
@@ -1772,7 +1772,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "login_tty",
             "tcgetpgrp",
             "tcsetpgrp",
-            // "get_exec_path" — `os.py:565` writes it in Python and lists it in
+            // "get_exec_path" — `os.py` writes it in Python and lists it in
             // its own `__all__`, so a name bound here is not overwritten by that
             // definition; it is counted a second time, through the star-import.
             "WIFEXITED",
@@ -1785,9 +1785,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // are numbers rather than calls; bound with the other wait options
             // below.
             "_cpu_count",
-            // "spawnvp"/"spawnvpe" — the same os.py:881 branch defines these,
+            // "spawnvp"/"spawnvpe" — the same os.py branch defines these,
             // for the same reason the two above are not bound.
-            // "popen" — `os.py:1020-1067` writes it over `subprocess` and
+            // "popen" — `os.py` writes it over `subprocess` and
             // appends it to its own `__all__`, with no guard on this name being
             // free.
         ],
@@ -1810,7 +1810,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // (`interp_posix.py:2551-2563`) — how a device number is taken apart and
     // put back together, which is the host's own encoding and not arithmetic
     // that can be spelled portably. `tarfile` reads a node's pair out of
-    // `st_rdev` to write a header (`tarfile.py:2275-2276`) and puts one back
+    // `st_rdev` to write a header (`tarfile.py`) and puts one back
     // together to recreate the node (`:2735`), so a `None` here writes a
     // header field that is not a number.
     //
@@ -2141,7 +2141,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function("set_blocking", set_blocking),
     );
 
-    // `baseobjspace.py:1970 fsencode_w` returns filesystem bytes; syscall
+    // `baseobjspace.py fsencode_w` returns filesystem bytes; syscall
     // boundaries must not pass through a Rust `String`.
     use crate::gateway::fsencode_bytes_w as extract_path;
 
@@ -2207,7 +2207,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::PyError::os_error_syscall(errno, w_filename)
     }
 
-    // `interp_posix.py:211-219,332` keeps the resolved `Path.w_path` as
+    // `interp_posix.py` keeps the resolved `Path.w_path` as
     // `OSError.filename`.
     fn errno_err_with_filename(errno: i32, w_path: PyObjectRef) -> crate::PyError {
         crate::PyError::os_error_syscall(errno, w_path)
@@ -2311,7 +2311,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
     }
 
-    /// interp_posix.py:259-272 `unwrap_fd`.
+    /// interp_posix.py `unwrap_fd`.
     ///
     /// ```python
     /// def unwrap_fd(space, w_value, allowed_types='integer'):
@@ -2531,7 +2531,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 None => 0o777,
             };
             // `open` types `dir_fd` as `DirFD(rposix.HAVE_OPENAT)`
-            // (`interp_posix.py:308`). Only the `openat` arm below reads it;
+            // (`interp_posix.py`). Only the `openat` arm below reads it;
             // every other build has already turned a descriptor away, because
             // `HAVE_OPENAT` is what those builds do not claim.
             let _dir_fd = dir_fd_kwarg(kwargs, HAVE_OPENAT)?;
@@ -2559,7 +2559,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let (fd, errno) = {
                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-                    // interp_posix.py:309-332 `open`: the syscall sits inside the
+                    // interp_posix.py `open`: the syscall sits inside the
                     // `eintr_retry=True` loop.  A FIFO opened without O_NONBLOCK
                     // is the case that makes this reachable — it waits for a peer,
                     // and an alarm arriving meanwhile must run its handler rather
@@ -2716,7 +2716,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 #[cfg(not(feature = "sandbox"))]
                 let buf = {
                     let mut buf = vec![0u8; n];
-                    // interp_posix.py:364-372 `read`: the syscall sits inside
+                    // interp_posix.py `read`: the syscall sits inside
                     // the `eintr_retry=True` loop, so an interrupted read runs
                     // the pending signal handlers and is re-issued rather than
                     // surfacing as `InterruptedError`.  The blocking guard is
@@ -2821,7 +2821,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map_err(|_| crate::PyError::type_error("write() arg 2 must be bytes-like"))?;
                 #[cfg(not(feature = "sandbox"))]
                 let ret = {
-                    // interp_posix.py:375-385 `write`: the syscall sits inside
+                    // interp_posix.py `write`: the syscall sits inside
                     // the `eintr_retry=True` loop, so an interrupted write runs
                     // the pending signal handlers and is re-issued rather than
                     // surfacing as `InterruptedError`.  The blocking guard is
@@ -2856,7 +2856,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 if args.len() < 3 {
                     return Err(crate::PyError::type_error("lseek() requires 3 arguments"));
                 }
-                // interp_posix.py:340 `@unwrap_spec(fd=c_int, position=r_longlong,
+                // interp_posix.py `@unwrap_spec(fd=c_int, position=r_longlong,
                 // how=c_int)` — the position is a 64-bit offset, not a C int.
                 let fd = crate::baseobjspace::c_int_w(args[0])? as libc::c_int;
                 let offset = crate::baseobjspace::int_w(args[1])?;
@@ -2891,7 +2891,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             name,
             false,
         )?;
-        // Both take `DirFD(rposix.HAVE_UNLINKAT)` (`interp_posix.py:826,847`).
+        // Both take `DirFD(rposix.HAVE_UNLINKAT)` (`interp_posix.py`).
         let _dir_fd = dir_fd_kwarg(kwargs, HAVE_UNLINKAT)?;
         // `DeleteFileW`, except on a directory symlink, which `RemoveDirectoryW`
         // unlinks without following (`os_unlink_impl`).
@@ -3101,7 +3101,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let dst = crate::gateway::fsencode_path_named_w(pos[1], name, "dst")?;
         let dir_fd = |name: &str| -> Result<Option<i32>, crate::PyError> {
             match crate::builtins::kwarg_get(kwargs, name) {
-                // interp_posix.py:274-278 `_unwrap_dirfd` — a non-`None` value
+                // interp_posix.py `_unwrap_dirfd` — a non-`None` value
                 // goes through `unwrap_fd` with `allowed_types="integer or
                 // None"`.
                 Some(v) if !unsafe { pyre_object::is_none(v) } => {
@@ -3136,7 +3136,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         } else {
             host_os::rename(src_path.as_ref(), src_b, dst_path.as_ref(), dst_b)
         };
-        // interp_posix.py:654 hands both resolved `Path.w_path` objects to
+        // interp_posix.py hands both resolved `Path.w_path` objects to
         // `wrap_oserror2`.
         result.map_err(|e| fs_err_with_filename2(e, 0, src.w_path(), dst.w_path()))?;
         Ok(pyre_object::w_none())
@@ -3154,7 +3154,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
     // os.utime(path, times=None, *, ns=None, dir_fd=None, follow_symlinks=True)
     /// One of the two times `utime` writes, kept the way `rposix.futimens` and
-    /// `rposix.utimensat` keep it (`rposix.py:2634-2671`): the seconds and the
+    /// `rposix.utimensat` keep it (`rposix.py`): the seconds and the
     /// nanoseconds apart, both signed, so a time before the epoch is the
     /// negative second it names rather than a value with no representation.
     /// The nanoseconds are always the ones after that second — `1969-12-31
@@ -3191,7 +3191,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
     }
 
-    /// `do_utimens` (`interp_posix.py:1948-1953`) writes `UTIME_NOW` over both
+    /// `do_utimens` (`interp_posix.py`) writes `UTIME_NOW` over both
     /// nanosecond fields when the caller named no time, rather than reading a
     /// time off its own clock and asking for that one. The two are different
     /// requests: `UTIME_NOW` on both stamps is granted to anyone the file is
@@ -3226,7 +3226,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 pos.len()
             )));
         }
-        // `interp_posix.py:1862` puts `__kwonly__` after `w_times`, so `times`
+        // `interp_posix.py` puts `__kwonly__` after `w_times`, so `times`
         // is the one argument here a caller may spell either way.
         crate::builtins::kwarg_reject_unknown(
             kwargs,
@@ -3239,7 +3239,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "utime() got multiple values for argument 'times'",
             ));
         }
-        // interp_posix.py:1860 `path_or_fd(allow_fd=rposix.HAVE_FUTIMENS or
+        // interp_posix.py `path_or_fd(allow_fd=rposix.HAVE_FUTIMENS or
         // rposix.HAVE_FUTIMES)`.
         let path = crate::gateway::fsencode_path_or_fd_w(pos[0], "utime", HAVE_FUTIMENS)?;
 
@@ -3251,7 +3251,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             None => true,
         };
         let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd").and_then(present) {
-            // interp_posix.py:1863 types `dir_fd` as `DirFD(...)`, whose
+            // interp_posix.py types `dir_fd` as `DirFD(...)`, whose
             // `unwrap` is `_unwrap_dirfd` (:274-278).
             Some(v) => Some(unwrap_fd(v, "integer or None")?),
             None => None,
@@ -3378,7 +3378,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             })
         };
 
-        // `parse_utime_args` (`interp_posix.py:1918-1946`) answers a "now" flag
+        // `parse_utime_args` (`interp_posix.py`) answers a "now" flag
         // beside the pair and leaves the pair itself at zero when it is set;
         // each of the calls below is what turns that flag into its own spelling
         // of "now".
@@ -3430,7 +3430,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "utime: dir_fd and follow_symlinks=False are unavailable on this platform",
                 ));
             }
-            // `time_t_to_FILE_TIME` (`rwin32file.py:320-323`): a FILETIME
+            // `time_t_to_FILE_TIME` (`rwin32file.py`): a FILETIME
             // counts 100ns ticks from 1601-01-01, so shifting the epoch is what
             // makes a second before 1970 an ordinary positive tick count rather
             // than one with no representation. The sub-100ns of a nanosecond is
@@ -3507,7 +3507,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         {
             let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-            // `rposix.utimensat` (`rposix.py:2650-2671`) — the whole name form
+            // `rposix.utimensat` (`rposix.py`) — the whole name form
             // is this one call: the descriptor the name resolves against is
             // `AT_FDCWD` when the caller named none, and `follow_symlinks=False`
             // is `AT_SYMLINK_NOFOLLOW`.
@@ -3626,7 +3626,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         loop {
             // `readdir` reports the end of the directory and a failure the
             // same way — a null return — so errno is cleared before the call
-            // and read back after it (`rposix.py:797` RFFI_FULL_ERRNO_ZERO).
+            // and read back after it (`rposix.py` RFFI_FULL_ERRNO_ZERO).
             rustpython_host_env::os::set_errno(0);
             let entry = unsafe { libc::readdir(dirp) };
             if entry.is_null() {
@@ -3643,7 +3643,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     /// Read a directory descriptor's entries through `f`
-    /// (`rposix.py:810-845` `_listdir`/`fdlistdir`).
+    /// (`rposix.py` `_listdir`/`fdlistdir`).
     ///
     /// `fdopendir` takes the descriptor over and `closedir` closes it, so the
     /// caller's own is duplicated first — `interp_posix.py:1118` spells that
@@ -3651,7 +3651,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// duplicate shares its file description — and so its directory offset —
     /// with the caller's descriptor, which would be left at the end of the
     /// directory and read as empty next time; `_listdir`'s `rewind=True`
-    /// (`rposix.py:844`) puts it back before the close.
+    /// (`rposix.py`) puts it back before the close.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     fn fd_readdir(fd: i32, f: impl FnMut(&[u8], i64, u8)) -> Result<(), i32> {
         let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -4147,7 +4147,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ("st_atime_ns", w_time_ns(st_atime_ns)),
             ("st_mtime_ns", w_time_ns(st_mtime_ns)),
             ("st_ctime_ns", w_time_ns(st_ctime_ns)),
-            // `build_stat_result` (interp_posix.py:554-557): the
+            // `build_stat_result` (interp_posix.py): the
             // sub-second remainder of each full-nanosecond timestamp,
             // `value % 1_000_000_000` (non-negative for pre-1970 times).
             (
@@ -4235,7 +4235,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `os.lstat(path, *, dir_fd=None)` — `follow_symlinks` is keyword-only,
     /// so `stat` cannot take the fixed-arity carrier that rejects keywords.
     /// The three argument forms are the three arms of `do_stat`
-    /// (`interp_posix.py:633-649`): an open descriptor as `path` goes to
+    /// (`interp_posix.py`): an open descriptor as `path` goes to
     /// `fstat`, a `dir_fd`-relative name to `fstatat`, and a bare name to
     /// `stat`/`lstat`.
     fn stat_entry(
@@ -4266,16 +4266,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         };
         // The three arguments are unwrapped in signature order — `path`,
         // `dir_fd`, `follow_symlinks` (`interp_posix.py:610-614`) — because
-        // `gateway.py:705` applies the unwrap specs in that order and each can
+        // `gateway.py` applies the unwrap specs in that order and each can
         // both raise and run user code: `__fspath__` for `path`, `__index__`
         // for `dir_fd`, `__bool__` for `follow_symlinks`.
         //
-        // interp_posix.py:611,659 — `stat` takes `path_or_fd(allow_fd=True)`
+        // interp_posix.py — `stat` takes `path_or_fd(allow_fd=True)`
         // and `lstat` takes `allow_fd=False`, which is also what makes their
         // type errors name different allowed types.
         let path = crate::gateway::fsencode_path_or_fd_w(path, name, default_follow)?;
         // `stat`/`lstat` type `dir_fd` as `DirFD(rposix.HAVE_FSTATAT)`
-        // (`interp_posix.py:612,660`), whose `unwrap` is `_unwrap_dirfd`
+        // (`interp_posix.py`), whose `unwrap` is `_unwrap_dirfd`
         // (:274-278).
         let dir_fd = match crate::builtins::kwarg_get(kwargs, "dir_fd")
             .filter(|&v| !unsafe { pyre_object::is_none(v) })
@@ -4298,10 +4298,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Some(v) => crate::baseobjspace::is_true(v)?,
             None => default_follow,
         };
-        // interp_posix.py:634-644 `do_stat` tests the descriptor first: with one
+        // interp_posix.py `do_stat` tests the descriptor first: with one
         // in hand neither other argument has anything to apply to. Only the
         // `follow_symlinks` rejection precedes the platform's dir_fd
-        // availability, though — `_DirFD_Unavailable` (`interp_posix.py:285-292`,
+        // availability, though — `_DirFD_Unavailable` (`interp_posix.py`,
         // the `!HAVE_FSTATAT` arm above) turns the argument away while
         // unwrapping it, a step earlier than this, so where `fstatat` does not
         // exist a descriptor passed with `dir_fd` reports the platform rather
@@ -4422,7 +4422,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     const HAVE_FCHOWN: bool = HOST_POSIX;
     /// `chown` resolves a name against `dir_fd` and honours
     /// `follow_symlinks=False` through the one `fchownat` call
-    /// (`interp_posix.py:2504`), which is also how `lchown` is spelled.
+    /// (`interp_posix.py`), which is also how `lchown` is spelled.
     const HAVE_FCHOWNAT: bool = HOST_POSIX;
     const HAVE_FPATHCONF: bool = HOST_POSIX;
     const HAVE_FSTATVFS: bool = HOST_POSIX;
@@ -4437,10 +4437,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// against and `follow_symlinks=False` is `AT_SYMLINK_NOFOLLOW`.
     const HAVE_UTIMENSAT: bool = cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_FSTATAT` — what `DirFD` is parameterised on
-    /// (`interp_posix.py:612,660`). `stat_at` calls `fstatat` through `libc`.
+    /// (`interp_posix.py`). `stat_at` calls `fstatat` through `libc`.
     const HAVE_FSTATAT: bool = cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_FCHMODAT` — what `chmod` types its `dir_fd` as
-    /// (`interp_posix.py:1197`), and what `_chmod_path` calls to honour either
+    /// (`interp_posix.py`), and what `_chmod_path` calls to honour either
     /// modifier. `os.py:118` reads it as `chmod` honouring `dir_fd`; `os.py:179`
     /// deliberately does *not* read it for `follow_symlinks`, because a host can
     /// have `fchmodat` and still not honour `AT_SYMLINK_NOFOLLOW`.
@@ -4452,7 +4452,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// only the hosts that carry a working `lchmod` may say it — and those are
     /// exactly the ones `os.lchmod` is registered on below.
     const HAVE_LCHMOD: bool = HOST_POSIX && BSD_FLAVOURED;
-    /// `os.py:182` reads this as `chflags` honouring `follow_symlinks`, which
+    /// `os.py` reads this as `chflags` honouring `follow_symlinks`, which
     /// is the `lchflags` arm of the pair. `chflags` is a BSD interface, so the
     /// two names exist on exactly the hosts this is true for — and where they
     /// do not, `shutil.copystat`'s `lookup("chflags")` finds nothing and skips
@@ -4469,21 +4469,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         target_os = "dragonfly",
     ));
     /// `rposix.HAVE_MKNODAT` — what `mknod` types its `dir_fd` as
-    /// (`interp_posix.py:1345`). Registered beside `mkfifo`, so it carries the
+    /// (`interp_posix.py`). Registered beside `mkfifo`, so it carries the
     /// same condition.
     const HAVE_MKNODAT: bool = HOST_POSIX;
     /// `rposix.HAVE_OPENAT` — what `open` types its `dir_fd` as
-    /// (`interp_posix.py:308`). `openat` is reached through `libc`, so it needs
+    /// (`interp_posix.py`). `openat` is reached through `libc`, so it needs
     /// no `host_env`; the Windows arm serves the name through `_wopen` and
     /// resolves nothing against a descriptor.
     const HAVE_OPENAT: bool = cfg!(all(unix, not(feature = "sandbox")));
-    /// `rposix.HAVE_MKDIRAT` — `mkdir`'s (`interp_posix.py:921`).
+    /// `rposix.HAVE_MKDIRAT` — `mkdir`'s (`interp_posix.py`).
     const HAVE_MKDIRAT: bool = cfg!(all(unix, not(feature = "sandbox")));
     /// `rposix.HAVE_UNLINKAT`. `os.py:131-132` reads it twice, for `unlink` and
     /// for `rmdir`, which are the same `unlinkat` told apart by `AT_REMOVEDIR`
     /// (`rposix.py:2717-2720`) — so the two cannot be advertised apart.
     const HAVE_UNLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
-    /// `rposix.HAVE_MKFIFOAT` — `mkfifo`'s (`interp_posix.py:1322`). Narrower
+    /// `rposix.HAVE_MKFIFOAT` — `mkfifo`'s (`interp_posix.py`). Narrower
     /// than the three above only because `os.mkfifo` itself is registered on
     /// the `host_env` POSIX builds; elsewhere the name is a noop placeholder
     /// that resolves nothing.
@@ -4492,7 +4492,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// from. Its `linkat` call sits with the rest of the `host_env`-backed
     /// entry points, so it carries their condition and not `HAVE_FSTATAT`'s.
     const HAVE_LINKAT: bool = HOST_POSIX;
-    /// `os.py:145-146` reads this as `listdir` and `scandir` taking a
+    /// `os.py` reads this as `listdir` and `scandir` taking a
     /// descriptor, which `fdlistdir` serves through `fdopendir`. `readdir`
     /// reports the end of a directory and a failure alike, so reading it apart
     /// needs the errno seam the host layer wraps — hence `HOST_POSIX` and not
@@ -4505,20 +4505,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `follow_symlinks`; where this bit is false, `MS_WINDOWS` carries that
     /// second claim instead (`os.py:192`).
     const HAVE_LSTAT: bool = HAVE_FSTATAT;
-    /// `_WIN32` (`interp_posix.py:2854-2855`). `os.py` reads it as `chmod`
+    /// `_WIN32` (`interp_posix.py`). `os.py` reads it as `chmod`
     /// taking a descriptor (`:143`), and as `chmod` and `stat` honouring
     /// `follow_symlinks` (`:184`, `:192`) — all three of which the C runtime
     /// block below serves, and the noop placeholders do not.
     const MS_WINDOWS: bool = HOST_WINDOWS_CRT;
 
-    /// `_DirFD_Unavailable` (`interp_posix.py:285-292`) names the argument and
+    /// `_DirFD_Unavailable` (`interp_posix.py`) names the argument and
     /// not the call it was passed to, which is also how
     /// `dir_fd_unavailable` reports it.
     fn dir_fd_unavailable() -> crate::PyError {
         crate::PyError::not_implemented("dir_fd unavailable on this platform")
     }
 
-    /// `argument_unavailable` (`interp_posix.py:298-301`) — a modifier this
+    /// `argument_unavailable` (`interp_posix.py`) — a modifier this
     /// platform has no call to apply, named together with the entry point that
     /// was asked to apply it.
     #[cfg(feature = "host_env")]
@@ -4540,7 +4540,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         )))
     }
 
-    /// `do_stat` (`interp_posix.py:649`) resolves a name against an open
+    /// `do_stat` (`interp_posix.py`) resolves a name against an open
     /// directory descriptor with `fstatat`, where `AT_SYMLINK_NOFOLLOW`
     /// carries `follow_symlinks=False`. An absolute name ignores `dir_fd`,
     /// which is why the caller does not have to test for one.
@@ -4749,7 +4749,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     /// The file type an entry's name resolves to, or `None` for a name that has
-    /// gone away — `check_mode` (`interp_scandir.py:319-330`) answers "no, not
+    /// gone away — `check_mode` (`interp_scandir.py`) answers "no, not
     /// this type" for `ENOENT` alone, on the reasoning that a vanished entry is
     /// better reported as not being of the asked-for kind than as an error.
     /// Every other failure is the caller's to see, named by the entry.
@@ -4972,7 +4972,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // value is an ordinary collectable runtime string.
         Ok(pyre_object::w_str_from_wtf8_managed(out))
     }
-    /// `interp_scandir.py:463-465 descr_reduce_ex` — an entry names a live
+    /// `interp_scandir.py descr_reduce_ex` — an entry names a live
     /// position in a directory listing, so it refuses to be pickled.  `%T` is
     /// `error.py:592-593 space.type(value).name`, the qualified typedef name
     /// (`interp_scandir.py:469 'posix.DirEntry'`), which is what
@@ -4990,7 +4990,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn dir_entry_type() -> PyObjectRef {
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *CELL.get_or_init(|| {
-            // `interp_scandir.py:469` names the typedef `'posix.DirEntry'`.
+            // `interp_scandir.py` names the typedef `'posix.DirEntry'`.
             // `typedef.rs`'s `new_typeobject_with_base_and_layout` turns the
             // leading component of a qualified
             // builtin name into a `__module__` entry, so `type(e).__module__`
@@ -5218,7 +5218,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     fn scandir_iter_type() -> PyObjectRef {
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *CELL.get_or_init(|| {
-            // `interp_scandir.py:173` names the typedef `'posix.ScandirIterator'`.
+            // `interp_scandir.py` names the typedef `'posix.ScandirIterator'`.
             let tp = crate::typedef::make_builtin_type_with_layout(
                 "posix.ScandirIterator",
                 |ns| {
@@ -5539,7 +5539,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             use std::os::unix::io::FromRawFd;
-            // interp_posix.py:599-606 `fstat`: retry its syscall on EINTR.
+            // interp_posix.py `fstat`: retry its syscall on EINTR.
             let meta = loop {
                 let f = unsafe { std::fs::File::from_raw_fd(fd) };
                 let meta = f.metadata();
@@ -5627,7 +5627,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "getcwd",
             |_| {
-                // `interp_posix.py:906-908` is `space.fsdecode(getcwdb(space))`,
+                // `interp_posix.py` is `space.fsdecode(getcwdb(space))`,
                 // so the directory's bytes reach Python through the filesystem
                 // decoder and a byte with no UTF-8 spelling survives as its
                 // surrogate escape. A lossy decode would fold it to U+FFFD,
@@ -5797,7 +5797,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
-    // `getenv` is not bound here. `os.py:818-825` writes it against `environ`
+    // `getenv` is not bound here. `os.py` writes it against `environ`
     // — the dict this module publishes and that os.py's `_Environ` wrapper
     // writes back into — and names it in its own `__all__`, so a binding is
     // both shadowed and counted twice through the star-import.
@@ -5978,7 +5978,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
         // os.pipe2(flags) -> (r_fd, w_fd)
         //
-        // `interp_posix.py:1188-1195`, which — unlike `pipe` two blocks up —
+        // `interp_posix.py`, which — unlike `pipe` two blocks up —
         // forces no inheritance on the pair afterwards: the flags argument is
         // the whole of the caller's control over it.
         #[cfg(any(
@@ -5998,7 +5998,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("pipe2() requires 1 argument"));
                     }
-                    // interp_posix.py:1187 `@unwrap_spec(flags=c_int)`.
+                    // interp_posix.py `@unwrap_spec(flags=c_int)`.
                     let flags = crate::baseobjspace::c_int_w(args[0])?;
                     match host_posix::pipe2(flags) {
                         Ok((rfd, wfd)) => {
@@ -6022,7 +6022,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "sched_yield",
                 |_| {
-                    // interp_posix.py:3018-3024 `sched_yield`: retry on EINTR.
+                    // interp_posix.py `sched_yield`: retry on EINTR.
                     loop {
                         match host_posix::sched_yield() {
                             Ok(()) => break,
@@ -6045,7 +6045,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("nice() requires 1 argument"));
                     }
-                    // interp_posix.py:2565 `@unwrap_spec(increment=c_int)`.
+                    // interp_posix.py `@unwrap_spec(increment=c_int)`.
                     let inc = crate::baseobjspace::c_int_w(args[0])?;
                     let n = host_posix::nice(inc).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_int_new(n as i64))
@@ -6064,7 +6064,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("umask() requires 1 argument"));
                     }
-                    // interp_posix.py:1372 `@unwrap_spec(mask=c_int)`.
+                    // interp_posix.py `@unwrap_spec(mask=c_int)`.
                     let mask = crate::baseobjspace::c_int_w(args[0])? as libc::mode_t;
                     let prev = host_posix::umask(mask);
                     Ok(pyre_object::w_int_new(prev as i64))
@@ -6213,7 +6213,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     // interp_posix.py:2977 `@unwrap_spec(policy=int)`.
                     let policy = crate::baseobjspace::int_w(args[0])? as i32;
-                    // interp_posix.py:2978-2987 `sched_get_priority_max`: retry on EINTR.
+                    // interp_posix.py `sched_get_priority_max`: retry on EINTR.
                     let m = loop {
                         match host_posix::sched_get_priority_max(policy) {
                             Ok(m) => break m,
@@ -6240,7 +6240,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     // interp_posix.py:2991 `@unwrap_spec(policy=int)`.
                     let policy = crate::baseobjspace::int_w(args[0])? as i32;
-                    // interp_posix.py:2992-3001 `sched_get_priority_min`: retry on EINTR.
+                    // interp_posix.py `sched_get_priority_min`: retry on EINTR.
                     let m = loop {
                         match host_posix::sched_get_priority_min(policy) {
                             Ok(m) => break m,
@@ -6291,7 +6291,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                         let mut interval: libc::timespec =
                             unsafe { core::mem::zeroed::<libc::timespec>() };
-                        // interp_posix.py:3062-3068 `sched_rr_get_interval`: retry on EINTR.
+                        // interp_posix.py `sched_rr_get_interval`: retry on EINTR.
                         loop {
                             let (ret, errno) =
                                 crate::module::thread::call_external_function(|| unsafe {
@@ -6327,7 +6327,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         }
                         // interp_posix.py:3073 `@unwrap_spec(pid=int)`.
                         let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
-                        // interp_posix.py:3074-3080 `sched_getscheduler`: retry on EINTR.
+                        // interp_posix.py `sched_getscheduler`: retry on EINTR.
                         let policy = loop {
                             match host_posix::sched_getscheduler(pid) {
                                 Ok(policy) => break policy,
@@ -6356,7 +6356,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         // priority the call fills in is handed back wrapped in
                         // the type, not bare (`interp_posix.py:3113`).
                         let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
-                        // interp_posix.py:3104-3110 `sched_getparam`: retry on EINTR.
+                        // interp_posix.py `sched_getparam`: retry on EINTR.
                         let param = loop {
                             match host_posix::sched_getparam(pid) {
                                 Ok(param) => break param,
@@ -6389,14 +6389,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                                     "sched_setscheduler() requires 3 arguments",
                                 ));
                             }
-                            // interp_posix.py:3085 `@unwrap_spec(pid=int, policy=int)`.
+                            // interp_posix.py `@unwrap_spec(pid=int, policy=int)`.
                             let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                             let policy = crate::baseobjspace::int_w(args[1])? as libc::c_int;
                             let priority = sched_priority_w(args[2])?;
                             let mut param: libc::sched_param =
                                 unsafe { core::mem::zeroed::<libc::sched_param>() };
                             param.sched_priority = priority;
-                            // interp_posix.py:3086-3098 `sched_setscheduler`: retry on EINTR.
+                            // interp_posix.py `sched_setscheduler`: retry on EINTR.
                             loop {
                                 match host_posix::sched_setscheduler(pid, policy, &param) {
                                     Ok(_) => break,
@@ -6429,7 +6429,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             let mut param: libc::sched_param =
                                 unsafe { core::mem::zeroed::<libc::sched_param>() };
                             param.sched_priority = priority;
-                            // interp_posix.py:3119-3131 `sched_setparam`: retry on EINTR.
+                            // interp_posix.py `sched_setparam`: retry on EINTR.
                             loop {
                                 match host_posix::sched_setparam(pid, &param) {
                                     Ok(_) => break,
@@ -6581,7 +6581,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("chdir() requires 1 argument"));
                     }
-                    // interp_posix.py:910-918 dispatches `rposix.chdir` with
+                    // interp_posix.py dispatches `rposix.chdir` with
                     // `allow_fd_fn=os.fchdir` when `rposix.HAVE_FCHDIR`.
                     let path =
                         crate::gateway::fsencode_path_or_fd_w(args[0], "chdir", HAVE_FCHDIR)?;
@@ -6609,11 +6609,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("fchdir() requires 1 argument"));
                     }
-                    // interp_posix.py:458-460 `fchdir(space, w_fd)` unwraps
+                    // interp_posix.py `fchdir(space, w_fd)` unwraps
                     // through `space.c_filedescriptor_w`, which takes an int or
                     // anything exposing `fileno()`.
                     let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                    // interp_posix.py:458-467 `fchdir`: retry on EINTR.
+                    // interp_posix.py `fchdir`: retry on EINTR.
                     loop {
                         match host_posix::fchdir(fd) {
                             Ok(()) => break,
@@ -6801,7 +6801,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "getsid",
                 |args| {
                     let pid = match args.first() {
-                        // interp_posix.py:2246 `@unwrap_spec(pid=c_int)`.
+                        // interp_posix.py `@unwrap_spec(pid=c_int)`.
                         Some(&obj) => crate::baseobjspace::c_int_w(obj)? as libc::pid_t,
                         None => {
                             return Err(crate::PyError::type_error("getsid() requires 1 argument"));
@@ -6840,7 +6840,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "getpgid",
                 |args| {
                     let pid = match args.first() {
-                        // interp_posix.py:2200 `@unwrap_spec(pid=c_int)`.
+                        // interp_posix.py `@unwrap_spec(pid=c_int)`.
                         Some(&obj) => crate::baseobjspace::c_int_w(obj)? as libc::pid_t,
                         None => {
                             return Err(crate::PyError::type_error(
@@ -7012,11 +7012,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("waitpid() requires 2 arguments"));
                     }
-                    // interp_posix.py:1708 `@unwrap_spec(pid=c_int, options=c_int)`.
+                    // interp_posix.py `@unwrap_spec(pid=c_int, options=c_int)`.
                     let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                     let options = crate::baseobjspace::c_int_w(args[1])?;
                     let mut status: i32 = 0;
-                    // interp_posix.py:1709-1719 `waitpid`: retry on EINTR.
+                    // interp_posix.py `waitpid`: retry on EINTR.
                     let res = loop {
                         let result = {
                             let _blocked = crate::module::thread::before_external_block();
@@ -7074,7 +7074,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "_exit",
                 |args| {
                     let code = match args.first() {
-                        // interp_posix.py:1724 `@unwrap_spec(status=c_int)`.
+                        // interp_posix.py `@unwrap_spec(status=c_int)`.
                         Some(&o) => crate::baseobjspace::c_int_w(o)?,
                         None => {
                             return Err(crate::PyError::type_error("_exit() requires 1 argument"));
@@ -7097,7 +7097,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         $name,
                         |args| {
                             let $s = match args.first() {
-                                // interp_posix.py:2363-2371 `declare_new_w_star`
+                                // interp_posix.py `declare_new_w_star`
                                 // types every wait macro `@unwrap_spec(status=c_int)`.
                                 Some(&o) => crate::baseobjspace::c_int_w(o)?,
                                 None => {
@@ -7254,7 +7254,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("dup() requires 1 argument"));
                     }
-                    // interp_posix.py:722 `@unwrap_spec(fd=c_int)`.
+                    // interp_posix.py `@unwrap_spec(fd=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     // `_Py_dup` makes the copy close-on-exec in the same call
                     // that makes it, so no fork in between inherits it.
@@ -7286,7 +7286,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             fd2: pyre_object::PyObjectRef,
             inheritable: Option<pyre_object::PyObjectRef>,
         ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-            // interp_posix.py:733 `@unwrap_spec(fd=c_int, fd2=c_int, inheritable=bool)`.
+            // interp_posix.py `@unwrap_spec(fd=c_int, fd2=c_int, inheritable=bool)`.
             let fd = crate::baseobjspace::c_int_w(fd)?;
             let fd2 = crate::baseobjspace::c_int_w(fd2)?;
             let inheritable = match inheritable {
@@ -7349,10 +7349,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("fsync() requires 1 argument"));
                     }
-                    // interp_posix.py:433-435 `fsync(space, w_fd)` unwraps
+                    // interp_posix.py `fsync(space, w_fd)` unwraps
                     // through `space.c_filedescriptor_w`.
                     let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                    // interp_posix.py:433-441 `fsync`: retry on EINTR.
+                    // interp_posix.py `fsync`: retry on EINTR.
                     loop {
                         let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                             libc::fsync(fd)
@@ -7385,10 +7385,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "fdatasync() requires 1 argument",
                         ));
                     }
-                    // interp_posix.py:443-446 `fdatasync(space, w_fd)` unwraps
+                    // interp_posix.py `fdatasync(space, w_fd)` unwraps
                     // through `space.c_filedescriptor_w`.
                     let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
-                    // interp_posix.py:443-452 `fdatasync`: retry on EINTR.
+                    // interp_posix.py `fdatasync`: retry on EINTR.
                     loop {
                         let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
                             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -7524,7 +7524,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "ftruncate",
                 |args| {
-                    // interp_posix.py:404 `@unwrap_spec(fd=c_int, length=r_longlong)`.
+                    // interp_posix.py `@unwrap_spec(fd=c_int, length=r_longlong)`.
                     // CPython 3.14's clinic gateway accepts `__index__` but not
                     // `__int__`; that newer coercion wins over PyPy's legacy
                     // `gateway_int_w` behavior.
@@ -7557,7 +7557,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
         // os.lockf(fd, cmd, len) -> None
         //
-        // `interp_posix.py:3006-3012` — one `lockf` under the `eintr_retry`
+        // `interp_posix.py` — one `lockf` under the `eintr_retry`
         // loop, so a lock that waits and is interrupted goes back to waiting
         // after the signal handler has run rather than surfacing as
         // `InterruptedError`. F_LOCK blocks, so it is put through the call
@@ -7575,7 +7575,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             args.len(),
                         )));
                     }
-                    // interp_posix.py:3005 `@unwrap_spec(fd=c_int, cmd=c_int,
+                    // interp_posix.py `@unwrap_spec(fd=c_int, cmd=c_int,
                     // length=r_longlong)` — the length is an offset, so it is
                     // the same conversion `ftruncate` gives one.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
@@ -7616,7 +7616,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "mkfifo",
                     false,
                 )?;
-                // interp_posix.py:1322 `@unwrap_spec(mode=c_int, ...)`.
+                // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
                 let mode = match bound[1] {
                     Some(value) => crate::baseobjspace::c_int_w(value)? as libc::mode_t,
                     None => 0o666,
@@ -7628,7 +7628,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 // `mkfifoat` resolves the name against the descriptor
                 // (`rposix.py:2784-2786`).
-                // interp_posix.py:1323-1343 `mkfifo`: retry on EINTR.
+                // interp_posix.py `mkfifo`: retry on EINTR.
                 loop {
                     let (r, errno) =
                         crate::module::thread::call_external_function(|| match dir_fd {
@@ -7666,7 +7666,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "mknod",
                     false,
                 )?;
-                // interp_posix.py:1345 `@unwrap_spec(mode=c_int, device=c_int,
+                // interp_posix.py `@unwrap_spec(mode=c_int, device=c_int,
                 // ...)`.
                 let mode = match bound[1] {
                     Some(value) => crate::baseobjspace::c_int_w(value)? as libc::mode_t,
@@ -7683,7 +7683,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 // `mknodat` resolves the name against the descriptor
                 // (`rposix.py:2793-2795`).
-                // interp_posix.py:1346-1370 `mknod`: retry on EINTR.
+                // interp_posix.py `mknod`: retry on EINTR.
                 loop {
                     let (r, errno) =
                         crate::module::thread::call_external_function(|| match dir_fd {
@@ -7708,9 +7708,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // os.lchflags(path, flags) -> None
         //
         // One call whose `follow_symlinks=False` arm is `lchflags` under its
-        // own name, which is what `os.py:182` reads `HAVE_LCHFLAGS` as. Only
+        // own name, which is what `os.py` reads `HAVE_LCHFLAGS` as. Only
         // the hosts that carry the pair are given the names at all: `chflags`
-        // is a BSD interface, and `shutil.copystat` (`shutil.py:467`) reaches
+        // is a BSD interface, and `shutil.copystat` (`shutil.py`) reaches
         // for it through `lookup("chflags")`, which answers `_nop` where the
         // name is absent — so a name that exists has to work.
         //
@@ -7806,7 +7806,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("kill() requires 2 arguments"));
                     }
-                    // interp_posix.py:1386 `@unwrap_spec(pid=c_int, signal=c_int)`.
+                    // interp_posix.py `@unwrap_spec(pid=c_int, signal=c_int)`.
                     // Both arguments go through `c_int_w`: a raw payload read
                     // would accept any object, and `is_int` is an exact-type
                     // check, so an `int` subclass instance — `signal.SIGHUP` is
@@ -7832,7 +7832,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("killpg() requires 2 arguments"));
                     }
-                    // interp_posix.py:1394 `@unwrap_spec(pgid=c_int, signal=c_int)`.
+                    // interp_posix.py `@unwrap_spec(pgid=c_int, signal=c_int)`.
                     let pgid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
                     let sig = crate::baseobjspace::c_int_w(args[1])? as libc::c_int;
                     let r = unsafe { libc::killpg(pgid, sig) };
@@ -7878,7 +7878,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("statvfs() requires 1 argument"));
                     }
-                    // interp_posix.py:704-719 dispatches `rposix_stat.statvfs`
+                    // interp_posix.py dispatches `rposix_stat.statvfs`
                     // with `allow_fd_fn=rposix_stat.fstatvfs`.
                     let path =
                         crate::gateway::fsencode_path_or_fd_w(args[0], "statvfs", HAVE_FSTATVFS)?;
@@ -7905,9 +7905,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("fstatvfs() requires 1 argument"));
                     }
-                    // interp_posix.py:693 `@unwrap_spec(fd=c_int)`.
+                    // interp_posix.py `@unwrap_spec(fd=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    // interp_posix.py:694-699 `fstatvfs`: retry on EINTR.
+                    // interp_posix.py `fstatvfs`: retry on EINTR.
                     let info = loop {
                         match host_posix::statvfs_fd(fd) {
                             Ok(info) => break info,
@@ -7920,7 +7920,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
 
-        // os.cpu_count() -> int | None — `interp_posix.py:2910-2914`, which
+        // os.cpu_count() -> int | None — `interp_posix.py`, which
         // answers None for a count of 0 or less. Both names read the processor
         // count through `host_cpu_count`; the syscalls it makes are the reason
         // the pair is left to the sandbox stubs below.
@@ -8116,7 +8116,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
             };
             let (path_obj, mode_obj) = (arg(0, "path")?, arg(1, "mode")?);
-            // interp_posix.py:1228-1243 reads a `chmod` whose path did not
+            // interp_posix.py reads a `chmod` whose path did not
             // fsencode as a descriptor and answers it with `os.fchmod`.
             // `lchmod` names no descriptor form.
             let path = crate::gateway::fsencode_path_or_fd_w(
@@ -8134,7 +8134,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 Some(v) => crate::baseobjspace::is_true(v)?,
                 None => default_follow,
             };
-            // interp_posix.py:1199-1252 `chmod`: retry the selected syscall on EINTR.
+            // interp_posix.py `chmod`: retry the selected syscall on EINTR.
             if path.as_fd != -1 {
                 // A descriptor answers before either modifier is consulted
                 // (`interp_posix.py:1233-1242`), so neither is an error here —
@@ -8152,10 +8152,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             }
             let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
-            // `_chmod_path` (`interp_posix.py:1254-1258`) keeps the plain
+            // `_chmod_path` (`interp_posix.py`) keeps the plain
             // `chmod` for the unmodified call and reaches for `fchmodat` only
             // where a name has to be resolved against something else or the
-            // final symlink must not be followed (`rposix.py:2569-2575`).
+            // final symlink must not be followed (`rposix.py`).
             let syscall = || {
                 if dir_fd.is_some() || !follow_symlinks {
                     let flag = if follow_symlinks {
@@ -8235,11 +8235,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("fchmod() requires 2 arguments"));
                     }
-                    // interp_posix.py:1260 `@unwrap_spec(fd=c_int, mode=c_int)`.
+                    // interp_posix.py `@unwrap_spec(fd=c_int, mode=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
                     let bfd = fd_borrow(fd)?;
-                    // interp_posix.py:1261-1270 `fchmod`: retry on EINTR.
+                    // interp_posix.py `fchmod`: retry on EINTR.
                     loop {
                         match host_posix::fchmod(bfd, mode) {
                             Ok(()) => break,
@@ -8342,14 +8342,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 };
             let (uid, gid) = (id_of(uid_obj, "uid")?, id_of(gid_obj, "gid")?);
             // `chown` types `dir_fd` as `DirFD(rposix.HAVE_FCHOWNAT)`
-            // (`interp_posix.py:2452-2453`); `lchown` declares no keyword at
+            // (`interp_posix.py`); `lchown` declares no keyword at
             // all, so `allowed` above has already rejected it.
             let dir_fd = dir_fd_kwarg(kwargs, HAVE_FCHOWNAT)?;
             let follow_symlinks = match crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
                 Some(v) => crate::baseobjspace::is_true(v)?,
                 None => default_follow,
             };
-            // interp_posix.py:2452-2511 `chown`: retry the selected syscall on EINTR.
+            // interp_posix.py `chown`: retry the selected syscall on EINTR.
             if path.as_fd != -1 {
                 // interp_posix.py:2481-2486 — a descriptor already names the
                 // file, so neither modifier, which each reinterpret a name, can
@@ -8374,7 +8374,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 }
                 return Ok(pyre_object::w_none());
             }
-            // `fchownat` is the whole family (`interp_posix.py:2501-2504`): the
+            // `fchownat` is the whole family (`interp_posix.py`): the
             // flagless call follows the final symlink and `AT_SYMLINK_NOFOLLOW`
             // does not, while the directory descriptor it resolves the name
             // against is `AT_FDCWD` when the caller named none.
@@ -8428,13 +8428,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 3 {
                         return Err(crate::PyError::type_error("fchown() requires 3 arguments"));
                     }
-                    // interp_posix.py:2527-2533 `@unwrap_spec(uid=c_uid_t,
+                    // interp_posix.py `@unwrap_spec(uid=c_uid_t,
                     // gid=c_gid_t)` with the descriptor taken by
                     // `space.c_filedescriptor_w`. The spec is applied by the
                     // gateway before the body runs, so a bad uid/gid is
                     // reported ahead of a bad descriptor.
                     //
-                    // `c_uid_t_w` (baseobjspace.py:2110-2125) is what turns -1
+                    // `c_uid_t_w` (baseobjspace.py) is what turns -1
                     // into `UINT_MAX`, i.e. the `(uid_t)-1` "leave unchanged"
                     // sentinel that `host_posix::fchown` spells as `None`.
                     let unchanged = |value: u32| (value != u32::MAX).then_some(value);
@@ -8442,7 +8442,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let gid = unchanged(crate::baseobjspace::c_uid_t_w(args[2])?);
                     let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
                     let bfd = fd_borrow(fd)?;
-                    // interp_posix.py:2528-2539 `fchown`: retry on EINTR.
+                    // interp_posix.py `fchown`: retry on EINTR.
                     loop {
                         match host_posix::fchown(bfd, uid, gid) {
                             Ok(()) => break,
@@ -8492,7 +8492,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "set_inheritable() requires 2 arguments",
                         ));
                     }
-                    // interp_posix.py:1165 `@unwrap_spec(fd=c_int, inheritable=int)`.
+                    // interp_posix.py `@unwrap_spec(fd=c_int, inheritable=int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let inherit = crate::baseobjspace::int_w(args[1])? != 0;
                     let bfd = fd_borrow(fd)?;
@@ -8528,7 +8528,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "path",
                 )?
                 .as_bytes;
-                // interp_posix.py:744 `@unwrap_spec(mode=c_int, ...)`.
+                // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
                 let mode = crate::baseobjspace::c_int_w(bound[1].expect("mode is required"))?;
                 // interp_posix.py:745 types `dir_fd` as
                 // `DirFD(rposix.HAVE_FACCESSAT)`, so a host with no `faccessat`
@@ -8568,7 +8568,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 {
                     let c_path = std::ffi::CString::new(path.as_slice())
                         .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-                    // interp_posix.py:778-786 keeps the plain `access` for the
+                    // interp_posix.py keeps the plain `access` for the
                     // unmodified call and reaches for `faccessat` only where the
                     // name resolves against a descriptor, the final symlink must
                     // not be followed, or the effective ids are the ones to ask
@@ -8738,7 +8738,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // `builtins::eintr_retry_with`.
         //
         // The BSD arm discards a partial `sbytes` on EINTR rather than reporting
-        // it: `rposix.py:3086-3095` rescues a partial transfer for `EAGAIN` and
+        // it: `rposix.py` rescues a partial transfer for `EAGAIN` and
         // `EBUSY` alone, and EINTR falls through to `handle_posix_error`, which
         // raises. The loop then re-runs the whole call with the same `offset` and
         // `count` — both are loop-invariant in `interp_posix.py`, and `rposix`
@@ -8768,7 +8768,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     4,
                     &[],
                 )?;
-                // interp_posix.py:2946 `@unwrap_spec(out_fd=c_int, count=int)`,
+                // interp_posix.py `@unwrap_spec(out_fd=c_int, count=int)`,
                 // with `in_ = space.c_int_w(w_in_fd)` in the body (:2955). The
                 // spec runs in the gateway, so the count is converted before
                 // the descriptor argument that follows it here.
@@ -8790,7 +8790,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     {
                         // host_env doesn't expose a NULL-offset variant; call
                         // libc::sendfile directly with a null pointer, matching
-                        // rposix.sendfile_no_offset (rposix.py:3066-3069).
+                        // rposix.sendfile_no_offset (rposix.py).
                         let count = count_raw as libc::size_t;
                         loop {
                             let (res, errno) =
@@ -8807,7 +8807,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         }
                     }
                 }
-                // interp_posix.py:2968 `space.gateway_r_longlong_w(w_offset)`.
+                // interp_posix.py `space.gateway_r_longlong_w(w_offset)`.
                 let offset_i64 = crate::baseobjspace::int_w(w_offset)?;
                 let out_b = fd_borrow(out_fd)?;
                 let in_b = fd_borrow(in_fd)?;
@@ -8816,7 +8816,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let count = count_raw as usize;
                     loop {
                         // Seeded from the caller's value on every attempt.
-                        // `rposix.sendfile` (`rposix.py:3061-3065`) writes the
+                        // `rposix.sendfile` (`rposix.py`) writes the
                         // offset into a fresh cell each call from the argument it
                         // was passed, and the retry sits above it holding that
                         // argument unchanged, so what a failed call left behind
@@ -8940,7 +8940,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         match res {
                             Ok(_) => return Ok(pyre_object::w_int_new(written)),
                             Err(error) => {
-                                // rposix.py:3086-3095: BSD sendfile reports a
+                                // rposix.py: BSD sendfile reports a
                                 // partial transfer through sbytes even when the
                                 // syscall result is EAGAIN/EBUSY. Return that
                                 // progress so asyncio advances its file offset
@@ -9615,7 +9615,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("ttyname() requires fd"));
                     }
-                    // interp_posix.py:2382 `@unwrap_spec(fd=c_int)`.
+                    // interp_posix.py `@unwrap_spec(fd=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let bfd = fd_borrow(fd)?;
                     let name = host_posix::ttyname(bfd).map_err(|e| io_err(e, ""))?;
@@ -9636,7 +9636,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("tcgetpgrp() requires fd"));
                     }
-                    // interp_posix.py:2269 `@unwrap_spec(fd=c_int)`.
+                    // interp_posix.py `@unwrap_spec(fd=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let bfd = fd_borrow(fd)?;
                     let pgid = host_posix::tcgetpgrp(bfd).map_err(|e| io_err(e, ""))?;
@@ -9657,7 +9657,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("tcsetpgrp() requires fd, pgid"));
                     }
-                    // interp_posix.py:2281 `@unwrap_spec(fd=c_int, pgid=c_gid_t)`.
+                    // interp_posix.py `@unwrap_spec(fd=c_int, pgid=c_gid_t)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let pgid = crate::baseobjspace::c_uid_t_w(args[1])? as libc::pid_t;
                     let bfd = fd_borrow(fd)?;
@@ -9680,7 +9680,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "getpriority() requires which, who",
                         ));
                     }
-                    // interp_posix.py:2340 `@unwrap_spec(which=int, who=int)`.
+                    // interp_posix.py `@unwrap_spec(which=int, who=int)`.
                     let which =
                         crate::baseobjspace::int_w(args[0])? as host_posix::PriorityWhichType;
                     let who = crate::baseobjspace::int_w(args[1])? as host_posix::PriorityWhoType;
@@ -9810,7 +9810,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
         /// A limit the host has no determinate answer for. `pathconf` reports
         /// it as `-1` with the errno left alone, which the host wrapper spells
-        /// `None` — but `interp_posix.py:2433` hands whatever `pathconf`
+        /// `None` — but `interp_posix.py` hands whatever `pathconf`
         /// returned straight to `space.newint`, so what the caller sees is the
         /// number `-1`. `PC_ASYNC_IO` and `PC_SYMLINK_MAX` answer this way on
         /// hosts that do not implement them, and `None` is neither the value
@@ -9868,7 +9868,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("pathconf() requires path, name"));
                     }
-                    // interp_posix.py:2420-2433 `path_or_fd(allow_fd=hasattr(os,
+                    // interp_posix.py `path_or_fd(allow_fd=hasattr(os,
                     // 'fpathconf'))`, whose body converts the name before it
                     // reads `path.as_fd != -1`.
                     let path =
@@ -10033,7 +10033,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         return Err(crate::PyError::type_error("confstr() requires name"));
                     }
                     let name = confname_arg(args[0], CONFSTR_NAMES)?;
-                    // `rposix.confstr` (`rposix.py:2129-2143`) asks for the
+                    // `rposix.confstr` (`rposix.py`) asks for the
                     // length first and fills a buffer of exactly that size on
                     // the second call. A zero length is either a name this host
                     // has no string for, which is `None`, or a name it does not
@@ -10088,7 +10088,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     let cuser = std::ffi::CString::new(user.as_bytes()).map_err(|_| {
                         crate::PyError::value_error("initgroups: embedded null in username")
                     })?;
-                    // interp_posix.py:2137 `@unwrap_spec(username='text', gid=c_gid_t)`.
+                    // interp_posix.py `@unwrap_spec(username='text', gid=c_gid_t)`.
                     let gid = crate::baseobjspace::c_uid_t_w(args[1])?;
                     host_posix::initgroups(&cuser, gid).map_err(|e| io_err(e, ""))?;
                     Ok(pyre_object::w_none())
@@ -10171,7 +10171,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "setresuid() requires ruid, euid, suid",
                         ));
                     }
-                    // interp_posix.py:2318 `@unwrap_spec(ruid=c_uid_t,
+                    // interp_posix.py `@unwrap_spec(ruid=c_uid_t,
                     // euid=c_uid_t, suid=c_uid_t)`.
                     let r = crate::baseobjspace::c_uid_t_w(args[0])?;
                     let e = crate::baseobjspace::c_uid_t_w(args[1])?;
@@ -10196,7 +10196,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "setresgid() requires rgid, egid, sgid",
                         ));
                     }
-                    // interp_posix.py:2329 `@unwrap_spec(rgid=c_gid_t,
+                    // interp_posix.py `@unwrap_spec(rgid=c_gid_t,
                     // egid=c_gid_t, sgid=c_gid_t)`.
                     let r = crate::baseobjspace::c_uid_t_w(args[0])?;
                     let e = crate::baseobjspace::c_uid_t_w(args[1])?;
@@ -10574,7 +10574,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // os.chmod(path, mode, *, dir_fd=None, follow_symlinks=True) -> None
         //
         // `MS_WINDOWS` is what puts this name in `supports_fd` (`os.py:143`)
-        // and in `supports_follow_symlinks` (`os.py:184`), so all three forms
+        // and in `supports_follow_symlinks` (`os.py`), so all three forms
         // are served here: a descriptor through the handle it wraps, a name
         // through the file the link resolves to, and `follow_symlinks=False`
         // through the link's own attributes.  `dir_fd` is the one modifier
@@ -10600,7 +10600,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         args.len()
                     )));
                 }
-                // `_DirFD_Unavailable.unwrap` (`interp_posix.py:285-292`)
+                // `_DirFD_Unavailable.unwrap` (`interp_posix.py`)
                 // converts first and reports the platform second, so a wrongly
                 // typed value is a TypeError here as well.
                 if let Some(w) = crate::builtins::kwarg_get(kwargs, "dir_fd")
@@ -10615,7 +10615,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
                 // The descriptor form has no name to resolve, so neither
                 // modifier applies to it and it dispatches straight to
-                // `os.fchmod` (`interp_posix.py:1233-1241`).
+                // `os.fchmod` (`interp_posix.py`).
                 if path.as_fd != -1 {
                     return match host_nt::fchmod(path.as_fd, mode, S_IWRITE) {
                         Ok(()) => Ok(pyre_object::w_none()),

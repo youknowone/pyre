@@ -14,7 +14,7 @@
 //! Upstream models the array with a `GCREFTRACER` `GcStruct`
 //! (`gcreftracer.py:7-11`) carrying `array_base_addr` + `array_length`,
 //! registered with the GC via a custom trace hook
-//! (`register_custom_trace_hook`, `gcreftracer.py:30`) and *reached* by
+//! (`register_custom_trace_hook`, `gcreftracer.py`) and *reached* by
 //! the collector through the loop token's `asmmemmgr_gcreftracers`, which
 //! in RPython is a GC-managed list (`x86/assembler.py:823`,
 //! `model.py:294`) so the tracer header sits in the live object graph.
@@ -50,7 +50,7 @@ use majit_ir::GcRef;
 
 /// A per-loop array of reference-constant slots.
 ///
-/// `gcreftracer.py:7-11` `GCREFTRACER` stores `array_base_addr` +
+/// `gcreftracer.py` `GCREFTRACER` stores `array_base_addr` +
 /// `array_length`; here the `Box<[Cell<GcRef>]>` *is* that array:
 /// [`base_addr`](GcTable::base_addr) is `array_base_addr` and
 /// [`len`](GcTable::len) is `array_length`. The `Box` is a stable Rust
@@ -75,7 +75,7 @@ unsafe impl Sync for GcTable {}
 
 /// Live per-loop tables, walked as GC roots. The strong reference is
 /// held by `CompiledLoopToken.asmmemmgr_gcreftracers` (parity
-/// `gcreftracers.append(tracer)`, `x86/assembler.py:823`); the registry
+/// `gcreftracers.append(tracer)`, `x86/assembler.py`); the registry
 /// keeps only a `Weak`, so when the loop token is freed the table drops
 /// and its registry entry becomes dangling — deregistration needs no
 /// explicit `free_loop` hook (neither backend's `free_loop` clears
@@ -100,7 +100,7 @@ impl GcTable {
     /// Build a per-loop table from the rewrite's gcref output list and
     /// register it for GC forwarding.
     ///
-    /// `gcreftracer.py:26-43` `make_framework_tracer` warns that the
+    /// `gcreftracer.py` `make_framework_tracer` warns that the
     /// tracer allocation can itself trigger a GC, so it writes the
     /// gcrefs into the raw array only afterwards. Here the
     /// `Box<[Cell<GcRef>]>` is a plain Rust heap allocation that does not
@@ -238,7 +238,7 @@ mod tests {
     fn baked_load_reads_forwarded_ref_after_move() {
         // End-to-end model of a ref constant surviving across compilation and
         // later execution. The backend bakes a `LoadFromGcTable` as a load of
-        // `*(base + index*WORD)` (rewrite.py:1100 `remove_constptr`), with
+        // `*(base + index*WORD)` (rewrite.py `remove_constptr`), with
         // `base` fixed at compile time. A moving collection forwards the slot
         // value in place (gcreftracer.py `trace`), so a later execution of the
         // baked load observes the relocated address — no stale immediate. This

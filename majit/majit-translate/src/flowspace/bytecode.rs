@@ -243,7 +243,7 @@ impl HostCode {
 
     /// Find the exception-table handler covering the given byte offset.
     ///
-    /// `pypy/interpreter/pycode.py:229-254 lookup_exceptiontable` parity:
+    /// `pypy/interpreter/pycode.py lookup_exceptiontable` parity:
     /// last-matching-wins, byte-offset I/O.  `HostCode.read` and flowspace
     /// operate in byte offsets (RPython's `co_code` walk convention), so
     /// the result is byte-offset natively.
@@ -311,7 +311,7 @@ impl HostCode {
     }
 }
 
-/// `pypy/interpreter/pycode.py:683-695 _decode_varint`.  Reads 6 bits per
+/// `pypy/interpreter/pycode.py _decode_varint`.  Reads 6 bits per
 /// byte, MSB first; bit 6 is the continuation flag, bit 7 is the start-of-
 /// entry marker (ignored — masked along with continuation via `& 63`).
 #[inline]

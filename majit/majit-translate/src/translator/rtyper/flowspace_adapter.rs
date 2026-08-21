@@ -168,7 +168,7 @@ fn seed_variable(legacy_var: &Variable) -> Variable {
 /// builds a *block-local* `legacy Variable -> typed Variable` map per
 /// block in the topology assembly pass, mirroring `RPython` `checkgraph`'s
 /// per-block Variable invariant
-/// (`rpython/flowspace/model.py:585-590`: a Variable must be defined in
+/// (`rpython/flowspace/model.py`: a Variable must be defined in
 /// exactly one block).  Using this whole-graph helper as the source of
 /// truth for the adapter's main path would violate that invariant by
 /// reusing a single `Variable` across blocks.  The helper stays in the
@@ -281,7 +281,7 @@ pub(crate) fn build_value_to_variable_map(legacy: &FunctionGraph) -> LegacyToTyp
 /// define-ops.
 ///
 /// RPython's flowspace inlines constants natively as `Hlvalue::Constant`
-/// in `op.args` (`flowspace/operation.py:152` `simple_call(target,
+/// in `op.args` (`flowspace/operation.py` `simple_call(target,
 /// *args)` — `target` and each `arg` is either a `Variable` or
 /// `Constant`). Pyre's legacy graph splits constants into define-ops
 /// (`OpKind::ConstInt(n)` produces a fresh result consumed
@@ -474,16 +474,16 @@ fn resolve_result_hlvalue(
 /// pass-through).  Reaching either arm means a synthetic graph
 /// injected the op directly.  RPython distinguishes logical `not`
 /// (UNARY_NOT, lowered as `bool(operand)` + branch —
-/// `flowcontext.py:531-538`) from bitwise `invert` (UNARY_INVERT —
-/// `flowcontext.py:190` → `op.invert`); without static type info,
+/// `flowcontext.py`) from bitwise `invert` (UNARY_INVERT —
+/// `flowcontext.py` → `op.invert`); without static type info,
 /// the adapter cannot discriminate, so fail-loud is the only safe
 /// choice.
 fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
     match pyre_name {
         "neg" => Ok("neg".to_string()),
         // RPython `bool` is registered as a unary op at
-        // `operation.py:467 add_operator('bool', 1, ..)` and emitted
-        // by `flowcontext.py:531-538 UNARY_NOT` /
+        // `operation.py add_operator('bool', 1, ..)` and emitted
+        // by `flowcontext.py UNARY_NOT` /
         // `:766-777 JUMP_IF_*_OR_POP` as the discriminator before a
         // `guessbool` fork.  Pyre's frontend emits
         // `OpKind::UnaryOp { op: "bool", .. }` from the `&&` / `||`
@@ -546,7 +546,7 @@ fn normalize_unary_op_name(pyre_name: &str) -> Result<String, TyperError> {
 
 /// Map a pyre-frontend binary op name (`front::mir::binop_label`)
 /// onto the RPython flowspace operator name
-/// (`rpython/flowspace/operation.py:485-507 add_operator(...)`).
+/// (`rpython/flowspace/operation.py add_operator(...)`).
 ///
 /// Rust-side identifiers (`bitand`, `bitor`, `bitxor`, `add_assign`,
 /// ...) become the trailing-underscore / `inplace_*` forms RPython
@@ -782,7 +782,7 @@ fn nonraising_core_bridge_opname(segments: &[String], arg_count: usize) -> Optio
 /// source body to register).  Unlike the bridge ops above, `reverse` has no
 /// rtyper *operator* arm, so it is routed in [`translate_op`] to the
 /// `getattr` + `simple_call` *method* shape that reaches
-/// `FixedSizeListRepr.rtype_method("reverse")` (`rlist.py:138-143`
+/// `FixedSizeListRepr.rtype_method("reverse")` (`rlist.py`
 /// `rtype_method_reverse` → `ll_reverse`).  Shared with [`op_canraise`],
 /// which classifies the originating Call non-raising
 /// (`rlist.py:142 hop.exception_cannot_occur()`).
@@ -797,10 +797,10 @@ fn is_slice_reverse_segments(segments: &[String]) -> bool {
 /// `Vec::with_capacity(n)` / `Vec::new()` (Rust MIR `vec::Vec::{with_capacity,
 /// new}`) — the resizable-list constructor. Routed in [`translate_op`] to the
 /// `newlist` operation with no element args, the shape `rtype_newlist`
-/// (`rlist.py:338-344`) lowers through `newlist(llops, r_list, [])`.
+/// (`rlist.py`) lowers through `newlist(llops, r_list, [])`.
 ///
 /// The capacity operand is dropped: upstream keeps a size hint only through
-/// `objectmodel.newlist_hint` (`objectmodel.py:443-447`), whose
+/// `objectmodel.newlist_hint` (`objectmodel.py`), whose
 /// `rtype_newlist(hop, v_sizehint)` path our `rtype_newlist` does not take —
 /// the hint is an allocation optimization, not a semantic difference, so an
 /// empty `newlist` is the faithful lowering of both constructors.
@@ -826,9 +826,9 @@ fn is_vec_ctor_segments(segments: &[String]) -> bool {
 /// `alloc::vec::from_elem(elem, count)` (Rust MIR `vec![elem; count]`) —
 /// the repeated resizable-list constructor.  Routed in [`translate_op`] to
 /// `newlist(elem)` + `mul(list, count)`, the same `[a] * b` shape that
-/// `transform_allocate` (`transform.py:36-50`) collapses to
-/// `alloc_and_set` and `rtype_alloc_and_set` (`rlist.py:346-351`) lowers
-/// through `ll_alloc_and_set` (`rlist.py:487`).
+/// `transform_allocate` (`transform.py`) collapses to
+/// `alloc_and_set` and `rtype_alloc_and_set` (`rlist.py`) lowers
+/// through `ll_alloc_and_set` (`rlist.py`).
 ///
 /// Charon emits this call as `alloc::vec::from_elem`, while the constructor
 /// recognizer above omits the foreign crate prefix. Match the trailing
@@ -861,7 +861,7 @@ fn is_vec_push_segments(segments: &[String]) -> bool {
 
 /// `Vec::extend_from_slice(l, slice)` (Rust MIR `vec::Vec::extend_from_slice`)
 /// — appends every element of `slice` to the resizable list. Routed to the
-/// resized `ListRepr.rtype_method("extend")` (`rlist.py:204`) via the
+/// resized `ListRepr.rtype_method("extend")` (`rlist.py`) via the
 /// `getattr(recv, "extend") + simple_call` method shape, exactly like
 /// [`is_vec_push_segments`]; the Rust method name `extend_from_slice` maps to
 /// the RPython list method `extend` (whose argument is the slice, a
@@ -896,7 +896,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // `InteriorField*` unfolds in `translate_op` into a chained
         // `getitem(base, index)` followed by `getattr` / `setattr`, so it
         // carries the getitem's `[IndexError, KeyError, Exception]`
-        // (operation.py:727-730).  The getattr / setattr step is itself
+        // (operation.py).  The getattr / setattr step is itself
         // non-raising, but the getitem makes the op raise.
         OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => true,
         // A transparent `Ok(x)` / `Some(x)` / `Err(e)` ctor lowers to
@@ -944,7 +944,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         } if nonraising_core_bridge_opname(segments, args.len()).is_some() => false,
         // `core::slice::<Impl>::reverse` lowers (in `translate_op`) to a
         // `getattr` + `simple_call` method shape whose `rtype_method_reverse`
-        // does `hop.exception_cannot_occur()` (`rlist.py:142`); classify the
+        // does `hop.exception_cannot_occur()` (`rlist.py`); classify the
         // originating Call non-raising so a `?` tail op installs no exception
         // edge the lowered op cannot take.  (`reverse` returns `()`, so it is
         // never actually a `?` operand — this keeps the table faithful.)
@@ -954,7 +954,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             ..
         } if is_slice_reverse_segments(segments) => false,
         // `vec::Vec::{with_capacity,new}` lowers (in `translate_op`) to the
-        // `newlist` operation, whose `canraise` is `[]` (operation.py:551-553
+        // `newlist` operation, whose `canraise` is `[]` (operation.py
         // `class NewList`); classify the originating Call non-raising so a `?`
         // tail op installs no exception edge the lowered op cannot take.
         // Matched before the general `Call` arm.
@@ -975,7 +975,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             ..
         } if args.len() == 1 && crate::front::iter_next::is_iter_next_segments(segments) => true,
         // simple_call -> `CallOp.canraise` is `[Exception]` for a
-        // non-builtin callable (operation.py:648-661).  Constant builtin
+        // non-builtin callable (operation.py).  Constant builtin
         // callables (int / float / chr / unicode) carry the narrower
         // `builtins_exceptions` set, but a `?` operand is Result/Option-
         // typed so over-approximating those few builtins is inert.  The
@@ -1010,7 +1010,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
                 | "lshift"
                 | "rshift"
                 // The `_ovf` arithmetic twins carry `[OverflowError]`
-                // (operation.py:760-761 `_add_except_ovf`;
+                // (operation.py `_add_except_ovf`;
                 // `OpKind::{Add,Sub,Mul}Ovf.canraise()`).  The front-end
                 // emits them only at a `LastException` block whose
                 // `raising_op` is the `_ovf` op (`front::checked_arith`),
@@ -1042,7 +1042,7 @@ pub fn translate_op(
     value_map: &HashMap<Variable, Hlvalue>,
     // The call registry is consulted by the `OpKind::Call::FunctionPath`
     // arm to resolve a registered `(HostObject, FunctionDesc)` pair
-    // and emit a flowspace `simple_call` (`operation.py:152`,
+    // and emit a flowspace `simple_call` (`operation.py`,
     // `rpbc.rs`'s `FunctionRepr::rtype_simple_call`).  Empty registry
     // callsites surface a distinct fail-loud message; producers
     // must pre-register every reachable FunctionPath.
@@ -1163,7 +1163,7 @@ pub fn translate_op(
         OpKind::Abort { .. } => Ok(Vec::new()),
 
         // ─── `newtuple` — RPython `BUILD_TUPLE` / `space.newtuple` ───
-        // `PureOperation` (`operation.py:542-548`).  Each `args[i]`
+        // `PureOperation` (`operation.py`).  Each `args[i]`
         // Variable is routed through `value_map` so the legacy
         // flowspace SpaceOperation references the same Hlvalue
         // identities the graph validator (`checkgraph`) tracks; using
@@ -1196,12 +1196,12 @@ pub fn translate_op(
         }
 
         // ─── `getslice` — RPython `l[start:stop]` / `space.getslice` ───
-        // `PureOperation` (`operation.py:461`).  The three operands are
+        // `PureOperation` (`operation.py`).  The three operands are
         // `(list, start, stop)`, each routed through `value_map` so the
         // legacy SpaceOperation references the Hlvalue identities
         // `checkgraph` tracks.  The annotator's `getslice` handler
         // (`unaryop.py:420-423`) builds a fresh `listdef.offspring`, and the
-        // rtyper's `rtype_getslice` (`rlist.py:409-414`) lowers it to a
+        // rtyper's `rtype_getslice` (`rlist.py`) lowers it to a
         // `gendirectcall` of the per-kind `ll_listslice_*` helper.
         OpKind::GetSlice { args } => {
             let mut hl_args: Vec<Hlvalue> = Vec::with_capacity(args.len());
@@ -1243,7 +1243,7 @@ pub fn translate_op(
         // Pyre-only marker emitted by the frontend when a path
         // expression resolves to a crate-level `static` declaration
         // (SHOUTY_CASE constant like `GC_WEAKREF_BOX_TYPE`).  RPython
-        // peer: `LOAD_GLOBAL` (`flowspace/flowcontext.py:1098`)
+        // peer: `LOAD_GLOBAL` (`flowspace/flowcontext.py`)
         // resolves the name lookup to a `Constant(value)` directly
         // — no SpaceOperation is emitted, and the bound `Variable`
         // *is* the graph-level definition.  Pyre always emits an op
@@ -1381,7 +1381,7 @@ pub fn translate_op(
         }
 
         // ─── FieldRead / FieldWrite ports ───
-        // RPython `flowspace/operation.py:617 GetAttr.opname = 'getattr'`
+        // RPython `flowspace/operation.py GetAttr.opname = 'getattr'`
         // and `setattr` (operation.py: same module). The high-level
         // attribute-access op carries the field name as a
         // `ConstValue::ByteStr` (Python 2 `str`), matching the rtyper's
@@ -1522,7 +1522,7 @@ pub fn translate_op(
         }
 
         // ─── Call port (CallTarget per variant) ───
-        // RPython `flowspace/operation.py:663 SimpleCall.opname =
+        // RPython `flowspace/operation.py SimpleCall.opname =
         // 'simple_call'`. The first arg is a Constant wrapping the
         // callable (or a Variable carrying a runtime function pointer).
         // Each `CallTarget` variant maps to a different shape:
@@ -1574,7 +1574,7 @@ pub fn translate_op(
                 // wrapper. The rtyper's `pair_simple_call` then
                 // short-circuits on `bookkeeper.descs` (pre-populated
                 // by the registry) and routes through
-                // `FunctionRepr::call(hop)` (`rpbc.py:199`).
+                // `FunctionRepr::call(hop)` (`rpbc.py`).
                 CallTarget::FunctionPath { segments } => {
                     // `core` method spellings of upstream operations:
                     // pyre source writes `a.min(b)` /
@@ -1654,10 +1654,10 @@ pub fn translate_op(
                     // carrying `(fill, count)` whenever the count decodes.
                     // Expand it into the `[a] * b` shape upstream builds —
                     // `newlist(a)` then `mul(list, b)` — which
-                    // `transform_allocate` (transform.py:36-50) collapses
+                    // `transform_allocate` (transform.py) collapses
                     // into `alloc_and_set(b, a)`, the operation
-                    // `rtype_alloc_and_set` (rlist.py:346-351) lowers
-                    // through `ll_alloc_and_set` (rlist.py:487) to
+                    // `rtype_alloc_and_set` (rlist.py) lowers
+                    // through `ll_alloc_and_set` (rlist.py) to
                     // `_ll_alloc_and_clear` / `_ll_alloc_and_set_nonnull`.
                     //
                     // The list must be `mul`'s arg 0: `transform_allocate`
@@ -1665,7 +1665,7 @@ pub fn translate_op(
                     // count back out of `op.args[1]`, which is the order
                     // `rtype_alloc_and_set` then consumes as
                     // `hop.inputargs(Signed, r_list.item_repr)`.  Upstream's
-                    // `pairtype(SomeInteger, SomeList).mul` (binaryop.py:657)
+                    // `pairtype(SomeInteger, SomeList).mul` (binaryop.py)
                     // exists but `transform_allocate` does not match it.
                     // Both ops go out together so they share a block, which
                     // is the scope `transform_allocate` scans.
@@ -1862,7 +1862,7 @@ pub fn translate_op(
                     // have no source body to register.  Route all three to
                     // the rtyper's `len` operation (`rtyper.rs "len"
                     // arm` → `Repr.rtype_len`), the same dispatch upstream
-                    // `op.len(v)` reaches via `unaryop.py:867-870`.  The
+                    // `op.len(v)` reaches via `unaryop.py`.  The
                     // rtyper dispatches on the receiver repr: a slice maps
                     // to `SomeList` (`ll_length`), a `&str` to `SomeString`
                     // (`StringRepr.rtype_len` → `ll_strlen`).  The helper
@@ -1903,7 +1903,7 @@ pub fn translate_op(
                     // `BuiltinMethodRepr::rtype_simple_call` →
                     // `rtype_method("reverse")` consume, identical to the
                     // `CallTarget::Method` arm below.  `rtype_method_reverse`
-                    // (`rlist.py:138-143`) `gendirectcall`s `ll_reverse`
+                    // (`rlist.py`) `gendirectcall`s `ll_reverse`
                     // (`rlist.py:677-686`).
                     if is_slice_reverse_segments(segments) {
                         if arg_hls.len() != 1 {
@@ -1934,7 +1934,7 @@ pub fn translate_op(
                     // `Vec::with_capacity(n)` / `Vec::new()` lower (in Rust
                     // MIR) to a call to `vec::Vec::{with_capacity,new}`.  Emit
                     // the `newlist` operation with no element args, which
-                    // `rtype_newlist` (`rlist.py:338-344`) lowers through
+                    // `rtype_newlist` (`rlist.py`) lowers through
                     // `newlist(llops, r_list, [])`.  The capacity operand is
                     // dropped — see [`is_vec_ctor_segments`].
                     if is_vec_ctor_segments(segments) {
@@ -2165,7 +2165,7 @@ pub fn translate_op(
                     //    (`HOST_ENV.lookup_builtin(name)`) — analogous
                     //    to `flowcontext.py:851 getattr(__builtin__,
                     //    varname)`, the second stage of
-                    //    `find_global` (`flowcontext.py:845-853`).
+                    //    `find_global` (`flowcontext.py`).
                     //
                     // 3. Multi-segment HOST_ENV module attribute
                     //    (`HOST_ENV.import_module(prefix).module_get(\
@@ -2557,7 +2557,7 @@ pub fn translate_op(
                 // attrfamily merge, so the getattr resolves the impl
                 // `MethodDesc` family and the trailing `simple_call` rtypes
                 // through the ordinary bound-method path
-                // (`rpbc.py:199 FunctionRepr.call`); dispatch stays virtual.
+                // (`rpbc.py FunctionRepr.call`); dispatch stays virtual.
                 //
                 // The cast root must resolve through `pyre_struct_root_classes`
                 // to the base classdef `register_trait_family` minted under
@@ -2667,7 +2667,7 @@ pub fn translate_op(
 
         // ─── Pyre-internal: VtableMethodPtr ───
         // TODO(rclass-vtable-rework): pyre-only adaptation of
-        // `rclass.py:371-377 getclsfield()`.  Emitted by
+        // `rclass.py getclsfield()`.  Emitted by
         // `translator/rtyper/rclass.rs` to project the function
         // pointer out of a `dyn Trait` receiver's vtable. It exists
         // only *inside* the rtyper pipeline (rclass produces it;
@@ -3191,7 +3191,7 @@ fn link_arg_to_hlvalue(
 
 /// Translate an exception-link extra variable.
 ///
-/// RPython `flowspace/model.py:636-642` defines `link.last_exception`
+/// RPython `flowspace/model.py` defines `link.last_exception`
 /// and `link.last_exc_value` in the link scope before checking
 /// `link.args`; those same Variables may then appear in `link.args`.
 /// Pyre's legacy graph represents them as fresh slots whose only
@@ -3326,7 +3326,7 @@ pub(crate) fn derive_subject_inputcells(
             // that gives them a populated receiver.  Other `Ref` variants
             // (no `class_root`, unknown root, or no bookkeeper) keep the
             // classdef-less shell, narrowed by call-propagation as before
-            // (`description.py:283-305 FunctionDesc.pycall`).
+            // (`description.py FunctionDesc.pycall`).
             if matches!(ty, crate::model::ValueType::Ref(_)) {
                 // A list-typed param (`Vec<T>`, `&[T]`, …) carries its
                 // full monomorphic spelling as `class_root` (the named-ADT
@@ -4732,7 +4732,7 @@ mod tests {
     #[test]
     fn translate_op_call_function_path_lowers_to_simple_call() {
         // Call::FunctionPath → `simple_call(callable_host, args...)` per
-        // `flowspace/operation.py:663 SimpleCall.opname = 'simple_call'`.
+        // `flowspace/operation.py SimpleCall.opname = 'simple_call'`.
         // The callable Constant wraps the `PyreCallRegistry` entry's
         // synthetic `HostObject::UserFunction` so the rtyper's
         // `bookkeeper.getdesc` short-circuits onto the registered
@@ -5196,7 +5196,7 @@ mod tests {
     fn translate_op_cast_pointer_marker_rebuilds_two_arg_upstream_call() {
         // `__cast_pointer/<Root>` marker (front::mir
         // `cast_pointer_marker_op`) reconstructs the upstream 2-arg
-        // `cast_pointer(PTRTYPE, ptr)` shape (lltype.py:964-968):
+        // `cast_pointer(PTRTYPE, ptr)` shape (lltype.py):
         // constant callable + constant interned target class, then the
         // pointer operand.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
@@ -5333,7 +5333,7 @@ mod tests {
 
     #[test]
     fn translate_op_ll_issubclass_call_rewrites_to_issubtype() {
-        // `ll_issubclass(subcls, cls)` (rclass.py:1133) must be recognised
+        // `ll_issubclass(subcls, cls)` (rclass.py) must be recognised
         // and rewritten to the flowspace `issubtype` op so the rtyper lowers
         // it to `int_between` over the immutable subclassrange fields, rather
         // than tracing into the pyre-only seqlock body.
@@ -5379,7 +5379,7 @@ mod tests {
 
     #[test]
     fn translate_op_ll_isinstance_call_rewrites_to_isinstance() {
-        // `ll_isinstance(obj, cls)` (rclass.py:1143) recognised and rewritten
+        // `ll_isinstance(obj, cls)` (rclass.py) recognised and rewritten
         // to the flowspace `isinstance` op — same seqlock-free lowering path.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
@@ -5556,7 +5556,7 @@ mod tests {
     #[test]
     fn translate_op_field_read_lowers_to_getattr() {
         // FieldRead → flowspace `getattr(base, ConstValue::ByteStr(name))`
-        // mirroring `flowspace/operation.py:617 GetAttr.opname = 'getattr'`.
+        // mirroring `flowspace/operation.py GetAttr.opname = 'getattr'`.
         // The rtyper later dispatches via `rtype_getattr` based on the
         // base operand's resolved repr (InstanceRepr / etc.).
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();

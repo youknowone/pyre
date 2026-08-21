@@ -4,7 +4,7 @@
 //! management. Here dynasm emits into a temporary mapping, which is copied
 //! into the CPU's `AsmMemoryManager` to return the final arena-owned buffer.
 
-/// codebuf.py:34 MachineCodeBlockWrapper
+/// codebuf.py MachineCodeBlockWrapper
 /// The arena/free-list ownership below is the `MachineCodeBlockWrapper` role.
 use std::sync::Arc;
 

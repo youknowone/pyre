@@ -41,7 +41,7 @@ pub enum CallEffectKind {
 /// assert not (elidable_function and random_effects_on_gcobjs)
 /// ```
 ///
-/// (`rpython/rtyper/lltypesystem/rffi.py:160`, inside `llexternal`) hold **by
+/// (`rpython/rtyper/lltypesystem/rffi.py`, inside `llexternal`) hold **by
 /// construction** — the illegal pairing cannot be written. Upstream enforces
 /// it at the declaration site for externals, which is exactly what this table
 /// is, so the constraint belongs here and not downstream in an analyzer.

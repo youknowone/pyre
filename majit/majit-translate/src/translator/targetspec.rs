@@ -30,7 +30,7 @@ pub enum TargetSpecResult {
 
 impl TargetSpecResult {
     /// Convert to the argument shape consumed by
-    /// `TranslationDriver::setup`, matching `driver.py:587-595`.
+    /// `TranslationDriver::setup`, matching `driver.py`.
     pub fn into_setup_parts(
         self,
     ) -> (

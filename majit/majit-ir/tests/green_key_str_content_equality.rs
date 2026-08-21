@@ -62,9 +62,9 @@ fn str_greens_compare_by_content() {
 }
 
 /// Stand-alone reimplementation of RPython
-/// `rpython/rlib/objectmodel.py:596 _hash_string` (modified Fowler-
+/// `rpython/rlib/objectmodel.py _hash_string` (modified Fowler-
 /// Noll-Vo over a byte stream) plus `rpython/rtyper/lltypesystem/
-/// rstr.py:405 _ll_strhash` zero substitute (`if x == 0: x = 29872897`
+/// rstr.py _ll_strhash` zero substitute (`if x == 0: x = 29872897`
 /// — translation pre-zeroed memory uses 0 as the not-yet-computed
 /// sentinel, so an actual hash of 0 is folded to a fixed constant).
 /// The empty-string path returns `-1` because the FNV step short-
@@ -110,7 +110,7 @@ fn str_greens_hash_by_content() {
     // Pin the production hash to the RPython modified-FNV algorithm —
     // not Rust's `DefaultHasher` (`SipHash13`) or any other host hash.
     // A divergence here means `default_str_hash` deviated from
-    // `objectmodel.py:596 _hash_string`.
+    // `objectmodel.py _hash_string`.
     let expected = rpython_ll_strhash_reference("match-me");
     assert_eq!(
         h1, expected,
@@ -121,7 +121,7 @@ fn str_greens_hash_by_content() {
     );
 }
 
-/// Empty-string boundary: RPython `objectmodel.py:601 _hash_string`
+/// Empty-string boundary: RPython `objectmodel.py _hash_string`
 /// short-circuits with `return -1` on length 0 (BEFORE the zero
 /// substitute folds 0 → 29872897, so empty stays at -1).  pyre's
 /// `default_str_hash` must surface the same sentinel rather than `0`.
@@ -157,7 +157,7 @@ fn distinct_content_str_greens_are_unequal() {
 /// `default_str_eq` / `default_str_hash` like every other STR slot,
 /// and compares content-equal to a stack-local slot carrying the
 /// same content.  RPython's `rstr.STR*` is GC-allocated once per
-/// JitCell (`warmstate.py:564 _green_args_spec` + `_cell_cache`);
+/// JitCell (`warmstate.py _green_args_spec` + `_cell_cache`);
 /// pyre's helper leaks a fresh slot per call — the GreenKey HashMap
 /// content-de-dupes via `default_str_eq`, so semantically every
 /// merge-point hit collapses to a single cache entry.  A

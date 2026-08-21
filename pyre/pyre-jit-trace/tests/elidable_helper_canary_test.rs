@@ -14,8 +14,8 @@
 //! pointer the trace records must match (down to ABI) the function the
 //! JIT actually calls.
 //!
-//! `pyjitpl.py:1941-1958 MIFrame.execute_varargs(opnum, argboxes, descr,
-//! exc=False, pure=True)` + `pyjitpl.py:3553-3579 record_result_of_call_pure`
+//! `pyjitpl.py MIFrame.execute_varargs(opnum, argboxes, descr,
+//! exc=False, pure=True)` + `pyjitpl.py record_result_of_call_pure`
 //! still work when driven from a production helper.
 
 use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
@@ -152,7 +152,7 @@ fn emit_trace_call_int_typed_elidable_cannot_raise_routes_to_call_pure_i() {
 }
 
 /// Confirms that `pyre-object::int_bit_count` (port of RPython
-/// `intobject.py:516 _bit_count`) is patched to `CallPureI` when traced.
+/// `intobject.py _bit_count`) is patched to `CallPureI` when traced.
 /// Together with `jit_int_in_small_cache_range` (pyre-jit-trace side
 /// attachment), this proves that the pyre-object side fires through the
 /// same `record_result_of_call_pure` path.
@@ -258,7 +258,7 @@ fn elidable_helper_all_const_args_fold_to_const_and_cut_call() {
 // call from `trace_load_attr` / `MIFrame::load_method`, with the real
 // two-Ref-args + one-Int-arg shape.
 //
-// The recorder records but does not execute the call (pyjitpl.py:1941-1958
+// The recorder records but does not execute the call (pyjitpl.py
 // `MIFrame.execute_varargs`), using the supplied `concrete_result`, so a
 // synthetic same-shape `extern "C"` pointer stands in for the still-private
 // real lookup helper; the recordable-wrapper canary below wires the real one.
@@ -274,7 +274,7 @@ fn emit_ref_lookup_shape_routes_to_call_pure_r_when_type_not_const() {
     // the call folds entirely (next test).  Before the version_tag guard
     // hoists it, w_type is a live (non-const) Ref — that is the shape that
     // exercises the CALL_R -> CALL_PURE_R patch
-    // (record_result_of_call_pure, pyjitpl.py:3553-3579).
+    // (record_result_of_call_pure, pyjitpl.py).
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
 
@@ -301,7 +301,7 @@ fn emit_ref_lookup_shape_routes_to_call_pure_r_when_type_not_const() {
             func_ptr,
             &[w_type_arg, w_name_arg, version_arg],
             &[Type::Ref, Type::Ref, Type::Int],
-            // _build_allboxes (pyjitpl.py:1960-1993): funcbox concrete value
+            // _build_allboxes (pyjitpl.py): funcbox concrete value
             // first (the raw fn pointer, always Int), then per-arg concretes.
             &[
                 Value::Int(func_ptr as usize as i64),
@@ -410,7 +410,7 @@ fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
 // `MIFrame::load_method` behind a promoted-`version_tag` guard, with
 // `jit_getattr` as the deopt fallback.
 //
-// The recorder records but does not execute the call (pyjitpl.py:1941-1958),
+// The recorder records but does not execute the call (pyjitpl.py),
 // so a synthetic concrete result stands in — the real wrapper would
 // dereference `w_name` and walk the MRO, which needs a live objspace.
 
@@ -531,7 +531,7 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
 // ── getattr-inline: instance-dict shadow read residual ────────────────
 //
 // `jit_instance_getdictvalue` (helpers.rs) wraps `instance_node_getdictvalue`
-// (mapdict.rs, `getdictvalue` mapdict.py:846-847).  The LOAD_METHOD fast
+// (mapdict.rs, `getdictvalue` mapdict.py).  The LOAD_METHOD fast
 // path (callmethod.py:66) reads it after the type lookup to confirm no
 // instance attribute shadows the class method.  Unlike the type lookup, it is
 // NOT pure — the instance dict mutates — so it is recorded as a normal
