@@ -4044,7 +4044,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // which is the whole of what the `CodeObject` predicate was standing in
         // for.
         let poisoned = scan.poison_with_protected();
-        let poison_admit = !legacy_admit
+        let poison_admit = fbw_inline_poison_enabled()
+            && !legacy_admit
             && scan.enforceable()
             && !poisoned.is_empty()
             && match scan.safety {
@@ -4219,11 +4220,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .as_ref()
         .map(|scan| scan.poison_with_protected())
         .unwrap_or_default();
-    let branchy_poison_admit = branchy_handler_scan.as_ref().is_some_and(|scan| {
-        scan.enforceable()
-            && !branchy_poisoned.is_empty()
-            && scan.safety != CalleeReplaySafety::Dirty
-    });
+    let branchy_poison_admit = fbw_inline_poison_enabled()
+        && branchy_handler_scan.as_ref().is_some_and(|scan| {
+            scan.enforceable()
+                && !branchy_poisoned.is_empty()
+                && scan.safety != CalleeReplaySafety::Dirty
+        });
     if branchy_poison_admit {
         inline_poison_pcs = Some(branchy_poisoned.into());
     }
