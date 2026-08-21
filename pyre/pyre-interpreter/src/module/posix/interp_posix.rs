@@ -10691,8 +10691,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         args[0], "lchmod", false,
                     )?;
                     let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
-                    let name = os_str_from_bytes(&path.as_bytes);
-                    host_nt::win32_lchmod(&name, mode, S_IWRITE)
+                    let wide = wide_path(&path.as_bytes)?;
+                    host_nt::win32_lchmod(&wide, mode, S_IWRITE)
                         .map_err(|error| fs_err_with_filename(error, path.w_path()))?;
                     Ok(pyre_object::w_none())
                 },

@@ -2287,6 +2287,20 @@ fn exit_thread(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Err(unsafe { crate::PyError::from_exc_object(exc) })
 }
 
+/// `_thread._NAME_MAXLEN` — the platform's own ceiling on a thread name and
+/// the unit it counts in: UTF-16 code units for `SetThreadDescription`,
+/// encoded bytes for `pthread_setname_np`.  Defined only where a ceiling
+/// exists: a platform without one publishes no such attribute at all, and
+/// `test_threading.test_set_name` reads that absence as "do not truncate".
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+const NAME_MAXLEN: usize = if cfg!(windows) {
+    32_766
+} else if cfg!(target_os = "linux") {
+    15
+} else {
+    63
+};
+
 #[cfg(windows)]
 fn current_thread_name() -> Result<PyObjectRef, crate::PyError> {
     use windows_sys::Win32::{
@@ -2327,7 +2341,7 @@ fn set_current_thread_name(w_name: PyObjectRef) -> Result<(), crate::PyError> {
         .encode_wide()
         .collect();
     let nul = all.iter().position(|&unit| unit == 0).unwrap_or(all.len());
-    let mut end = nul.min(32_766);
+    let mut end = nul.min(NAME_MAXLEN);
     if end < all.len()
         && end > 0
         && (0xD800..=0xDBFF).contains(&all[end - 1])
@@ -2347,8 +2361,8 @@ fn set_current_thread_name(w_name: PyObjectRef) -> Result<(), crate::PyError> {
 }
 
 #[cfg(target_os = "linux")]
-fn current_thread_name() -> Result<String, crate::PyError> {
-    let mut buffer = [0u8; 16];
+fn current_thread_name() -> Result<Vec<u8>, crate::PyError> {
+    let mut buffer = [0u8; NAME_MAXLEN + 1];
     let status = unsafe {
         libc::pthread_getname_np(
             libc::pthread_self(),
@@ -2360,12 +2374,12 @@ fn current_thread_name() -> Result<String, crate::PyError> {
         return Err(crate::PyError::os_error_syscall(status, PY_NULL));
     }
     let len = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
-    Ok(String::from_utf8_lossy(&buffer[..len]).into_owned())
+    Ok(buffer[..len].to_vec())
 }
 
 #[cfg(target_os = "macos")]
-fn current_thread_name() -> Result<String, crate::PyError> {
-    let mut buffer = [0u8; 64];
+fn current_thread_name() -> Result<Vec<u8>, crate::PyError> {
+    let mut buffer = [0u8; NAME_MAXLEN + 1];
     let status = unsafe {
         libc::pthread_getname_np(
             libc::pthread_self(),
@@ -2377,32 +2391,54 @@ fn current_thread_name() -> Result<String, crate::PyError> {
         return Err(crate::PyError::os_error_syscall(status, PY_NULL));
     }
     let len = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
-    Ok(String::from_utf8_lossy(&buffer[..len]).into_owned())
+    Ok(buffer[..len].to_vec())
 }
 
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn current_thread_name() -> Result<String, crate::PyError> {
-    Ok(std::thread::current().name().unwrap_or("").to_string())
-}
-
-#[cfg(not(windows))]
-fn set_current_thread_name(name: &str) -> Result<(), crate::PyError> {
-    let limit = if cfg!(target_os = "linux") {
-        15
-    } else if cfg!(target_os = "macos") {
-        63
-    } else {
-        usize::MAX
-    };
-    let nul = name.find('\0').unwrap_or(name.len());
-    let mut end = nul.min(limit);
-    while !name.is_char_boundary(end) {
-        end -= 1;
+/// The filesystem encoding of a name under the `replace` error handler, which
+/// is what `_thread.set_name` encodes with: no str can fail to encode, and a
+/// lone surrogate - which has no UTF-8 spelling - becomes `?` rather than an
+/// exception.  `threading.Thread._bootstrap_inner` guards `_set_os_name` for
+/// `OSError` alone, so a name that raised anything else would leave the thread
+/// unregistered and its `_started` event unset, hanging `Thread.start()`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fsencode_name_replace(w_name: PyObjectRef) -> Vec<u8> {
+    let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    let mut encoded = Vec::with_capacity(wtf8.len());
+    let mut buffer = [0u8; 4];
+    for code_point in wtf8.code_points() {
+        match code_point.to_char() {
+            Some(ch) => encoded.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes()),
+            None => encoded.push(b'?'),
+        }
     }
-    #[cfg(all(feature = "host_env", any(unix, windows)))]
-    rustpython_host_env::thread::set_current_thread_name(&name[..end]);
-    #[cfg(not(all(feature = "host_env", any(unix, windows))))]
-    let _ = end;
+    encoded
+}
+
+/// `pthread_setname_np` takes the encoded name, so the ceiling counts BYTES
+/// and the cut lands wherever `NAME_MAXLEN` falls - mid-sequence included.
+/// `_get_name` decodes what the platform kept with `surrogateescape`, so a
+/// severed trailing sequence comes back as the lone surrogates spelling those
+/// bytes; backing the cut off to a character boundary would answer a different
+/// name than the one the platform holds.
+///
+/// Called through `libc` rather than `rustpython_host_env::thread`, whose
+/// setter takes a `&str` and so can express neither the lossy encoding nor a
+/// byte-exact cut; `current_thread_name` reads its counterpart the same way.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn set_current_thread_name(w_name: PyObjectRef) -> Result<(), crate::PyError> {
+    let mut encoded = fsencode_name_replace(w_name);
+    if let Some(nul) = encoded.iter().position(|&byte| byte == 0) {
+        encoded.truncate(nul);
+    }
+    encoded.truncate(NAME_MAXLEN);
+    let name = std::ffi::CString::new(encoded).expect("truncated at the first NUL above");
+    #[cfg(target_os = "linux")]
+    let status = unsafe { libc::pthread_setname_np(libc::pthread_self(), name.as_ptr()) };
+    #[cfg(target_os = "macos")]
+    let status = unsafe { libc::pthread_setname_np(name.as_ptr()) };
+    if status != 0 {
+        return Err(crate::PyError::os_error_syscall(status, PY_NULL));
+    }
     Ok(())
 }
 
@@ -2411,11 +2447,17 @@ fn get_thread_name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     current_thread_name()
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn get_thread_name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(w_str_new(&current_thread_name()?))
+    // `PyUnicode_DecodeFSDefault` - `surrogateescape`, so a name the platform
+    // truncated mid-sequence reads back as the lone surrogates spelling the
+    // bytes that survived.
+    Ok(crate::gateway::fsdecode_filename_bytes(
+        &current_thread_name()?,
+    ))
 }
 
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn set_thread_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { !pyre_object::is_str(args[0]) } {
         // `_PyArg_BadArgument` renders the None singleton as `None`, rather
@@ -2429,12 +2471,9 @@ fn set_thread_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             "set_name() argument 'name' must be str, not {type_name}"
         )));
     }
-    // The wide host takes the string object itself, since the name it sets is
-    // counted in UTF-16 code units.
-    #[cfg(windows)]
+    // Both hosts take the string object itself: each counts the ceiling in its
+    // own unit and encodes for its own call.
     set_current_thread_name(args[0])?;
-    #[cfg(not(windows))]
-    set_current_thread_name(crate::baseobjspace::str_utf8_w(args[0])?)?;
     Ok(w_none())
 }
 
@@ -2456,15 +2495,6 @@ crate::py_module! {
         "_local"        => local_type(),
         "_ExceptHookArgs" => except_hook_args_type(),
         "TIMEOUT_MAX"   => w_float_new(TIMEOUT_MAX),
-        "_NAME_MAXLEN"  => w_int_new(if cfg!(windows) {
-            32_766
-        } else if cfg!(target_os = "linux") {
-            15
-        } else if cfg!(target_os = "macos") {
-            63
-        } else {
-            0
-        }),
         "error"         => crate::builtins::lookup_exc_class("RuntimeError")
                                .unwrap_or_else(crate::typedef::w_object),
     },
@@ -2483,12 +2513,40 @@ crate::py_module! {
         "interrupt_main"         / * = interrupt_main,
         "exit"                   / 0 = exit_thread,
         "exit_thread"            / 0 = exit_thread,
-        "_get_name"              / 0 = get_thread_name,
-        "set_name"               / 1 = set_thread_name,
         "_excepthook"            / 1 = thread_excepthook,
         "_get_main_thread_ident" / 0 = |_| Ok(w_int_new(current_ident())),
         "start_joinable_thread"  / * = start_joinable_thread,
         "start_new_thread"       / * = start_new_thread,
         "start_new"              / * = start_new_thread,
+    },
+    extra_init: |ns| {
+        // `set_name`, `_get_name` and `_NAME_MAXLEN` are published only where
+        // the platform has the calls behind them - `HAVE_PTHREAD_GETNAME_NP`
+        // or `MS_WINDOWS` - and a ceiling to name.  Their absence is what
+        // makes `threading._set_os_name` a no-op and
+        // `test_threading.test_set_name` skip, instead of comparing against a
+        // name the platform never stored.
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+        {
+            crate::module_ns_store(ns, "_NAME_MAXLEN", w_int_new(NAME_MAXLEN as i64));
+            crate::module_ns_store(
+                ns,
+                "_get_name",
+                crate::gateway::with_module(
+                    "_thread",
+                    crate::py_module_fn!("_get_name", 0, get_thread_name),
+                ),
+            );
+            crate::module_ns_store(
+                ns,
+                "set_name",
+                crate::gateway::with_module(
+                    "_thread",
+                    crate::py_module_fn!("set_name", 1, set_thread_name),
+                ),
+            );
+        }
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        let _ = ns;
     },
 }
