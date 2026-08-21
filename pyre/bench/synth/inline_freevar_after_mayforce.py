@@ -29,19 +29,20 @@ from fractions import Fraction
 # and moved between two runs of one binary -- 923/6 loops against 925/7 here,
 # 923/6 against 938/8 on ubuntu and 922 against 923 on windows. Convergence
 # completes by 48000 on both native backends, and past it every gated counter is
-# independent of N: dynasm holds 1007 guard failures and cranelift 1012, with
-# seven loops and five bridges, unchanged from 48000 through 96000. This sits far
+# independent of N: dynasm holds 1004 guard failures and cranelift 1009, with
+# six loops and five bridges, unchanged from 48000 through 96000. This sits far
 # enough above that point to keep the fixed point on a host that needs a few
 # more iterations to reach it.
 #
-# That fixed point was six loops and 1004/1009 guard failures until the jd0
-# staticdata started carrying the assembler's real opcode ids instead of the 255
-# `op_live` sentinel. The blackhole only recognizes `catch_exception/L` once
-# those ids are installed, so an exception it used to let escape is now caught,
-# and the extra loop plus three guard failures are that arm being compiled. The
-# reading is unchanged across all three platforms and both native backends,
-# which is what tells it apart from the per-host convergence spread above; the
-# wasm backend does not reach the arm and keeps the six-loop baseline.
+# The fixed point was seven loops and 1007/1012 guard failures for as long as
+# the blackhole recognized `catch_exception/L`: once jd0's staticdata carries
+# the assembler's real opcode ids instead of the 255 `op_live` sentinel, an
+# exception it used to let escape is caught, and the extra loop plus three
+# guard failures are that arm being compiled. `driver_finish_setup` still
+# installs those ids, but the arm is no longer reached, so the counters are
+# back at the pre-arm pair on both native backends and all three platforms.
+# Whatever stopped reaching it is unattributed; the wasm backend never reached
+# the arm at all, which is why its baseline never moved off six.
 N = 64000
 
 
