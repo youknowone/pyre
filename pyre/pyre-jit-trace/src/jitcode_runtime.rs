@@ -577,8 +577,9 @@ pub fn insns_byte_to_opname() -> &'static HashMap<u8, String> {
 /// sub-JitCodes, and switch dicts.
 struct DescrIndex {
     offsets: Box<[u32]>,
-    /// `0` for structural/dispatch descriptors, `1` for Call/JitCode.
-    /// Mirrors the two groups consumed by `rehydrate_build_descr_raw_sets`.
+    /// `0` for descriptors owned by `GcCache`, `1` for Call/JitCode, and
+    /// `2` for opcode-only descriptors such as `SwitchDictDescr`.
+    /// Mirrors the groups consumed by `rehydrate_build_descr_raw_sets`.
     kinds: Box<[u8]>,
     /// Dense reference into `descr_layouts.bin`, or `u32::MAX` for a
     /// descriptor without a parent.  This is the frozen-image spelling of
@@ -604,7 +605,7 @@ fn load_descr_index() -> DescrIndex {
     assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
     assert_eq!(kinds.len() + 1, offsets.len());
     assert_eq!(parent_layouts.len(), kinds.len());
-    assert!(kinds.iter().all(|kind| matches!(kind, 0 | 1)));
+    assert!(kinds.iter().all(|kind| matches!(kind, 0 | 1 | 2)));
     DescrIndex {
         offsets: offsets.into_boxed_slice(),
         kinds: kinds.into_boxed_slice(),
@@ -850,6 +851,45 @@ fn load_ei_descr_mint(index: usize) -> majit_ir::effectinfo::DescrMintEntry {
     })
 }
 
+fn ei_descr_stamp_offsets() -> &'static [u32] {
+    static OFFSETS: OnceLock<Box<[u32]>> = OnceLock::new();
+    OFFSETS.get_or_init(|| {
+        const INDEX_BYTES: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_stamps_index.bin"));
+        const BODY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_stamps.bin"));
+        let offsets: Vec<u32> = bincode::deserialize(INDEX_BYTES).unwrap_or_else(|e| {
+            panic!(
+                "pyre-jit-trace: failed to deserialize ei_descr_stamps_index.bin \
+                 ({} bytes): {e}",
+                INDEX_BYTES.len(),
+            )
+        });
+        assert!(!offsets.is_empty());
+        assert_eq!(offsets.first().copied(), Some(0));
+        assert_eq!(offsets.last().copied(), Some(BODY_BYTES.len() as u32));
+        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        offsets.into_boxed_slice()
+    })
+}
+
+fn ei_descr_stamp_count() -> usize {
+    ei_descr_stamp_offsets().len() - 1
+}
+
+fn load_ei_descr_stamp(index: usize) -> (majit_ir::effectinfo::DescrSetMember, u32) {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ei_descr_stamps.bin"));
+    let offsets = ei_descr_stamp_offsets();
+    let start = offsets[index] as usize;
+    let end = offsets[index + 1] as usize;
+    bincode::deserialize(&BYTES[start..end]).unwrap_or_else(|e| {
+        panic!(
+            "pyre-jit-trace: failed to deserialize ei_descr_stamps.bin entry {index} \
+             ({start}..{end} of {} bytes): {e}",
+            BYTES.len(),
+        )
+    })
+}
+
 /// Analyzer-side release census captured at the end of the build-script
 /// translation. The live process adds its own counters before formatting the
 /// existing field-position stats line.
@@ -968,8 +1008,8 @@ fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit
 /// halves of the lazy plan already ship: `descrs_index.bin` /
 /// `ei_descr_mints_index.bin` / `effect_infos_index.bin` give per-index
 /// locatability, [`descr_cells`] / [`descr_ref_cells`] are the `OnceLock`
-/// arrays, and `descr::force_declared_group` is the on-demand container-group
-/// publish.
+/// arrays, and `descr::force_declared_group` is the exact-key, on-demand
+/// container-group publish.
 ///
 /// What is left eager here is eager because it must be.
 /// `descr::descr_from_set_member` is lookup-only by construction, and
@@ -982,13 +1022,8 @@ fn rehydrated_call_descr_ref(bh: majit_translate::jitcode::BhCallDescr) -> majit
 pub fn rehydrate_build_descr_raw_sets() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        // The runtime's own groups first: `descr_from_set_member` is
-        // lookup-only, so a container that has not been published yet reads
-        // as `AbsentContainer` and its member is dropped from the raw set for
-        // the life of the process.
-        crate::descr::publish_runtime_descr_groups();
-        // `descr.py setup_descrs` group order — every non-call slot
-        // first.  Each `Size` / `Field` entry publishes its parent's FULL
+        // `descr.py::GcCache.setup_descrs` group order — every non-call slot
+        // first. Each `Size` / `Field` entry publishes its parent's FULL
         // `heaptracker.all_fielddescrs(STRUCT)` list into the gccache, and
         // `descr_from_set_member` is lookup-only, so the raw-set members
         // below can only land on slots that already carry their complete
@@ -1005,6 +1040,14 @@ pub fn rehydrate_build_descr_raw_sets() {
                 BhDescr::Call { .. } | BhDescr::JitCode { .. }
             ));
             crate::descr::make_descr_from_bh(&bh);
+        }
+        // Members already published by the opcode-descr pass need only the
+        // `compute_bitstrings` partition stamp. PyPy mutates that one cached
+        // descriptor object in place; replaying the complete mint spec would
+        // re-run a cache-miss recipe against a slot that is already full.
+        for i in 0..ei_descr_stamp_count() {
+            let (member, ei_index) = load_ei_descr_stamp(i);
+            crate::descr::stamp_effect_info_descr(&member, ei_index);
         }
         // Last, and only into what is still empty: the slots no opcode names,
         // which `descrs.bin` — RPython's `opcode_descrs`, not its `all_descrs`
@@ -2214,11 +2257,18 @@ mod tests {
         let index = descrs_index();
         assert_eq!(index.kinds.len(), descr_count());
         for (i, kind) in index.kinds.iter().copied().enumerate() {
-            let call_like = matches!(
-                load_descr_uncached(i),
-                BhDescr::Call { .. } | BhDescr::JitCode { .. }
-            );
-            assert_eq!(kind, u8::from(call_like), "descriptor index {i}");
+            let expected = match load_descr_uncached(i) {
+                BhDescr::Call { .. } | BhDescr::JitCode { .. } => 1,
+                BhDescr::Field { .. }
+                | BhDescr::Array { .. }
+                | BhDescr::InteriorField { .. }
+                | BhDescr::Size { .. } => 0,
+                BhDescr::Switch { .. }
+                | BhDescr::VableField { .. }
+                | BhDescr::VableArray { .. }
+                | BhDescr::VtableMethod { .. } => 2,
+            };
+            assert_eq!(kind, expected, "descriptor index {i}");
         }
     }
 
@@ -2273,8 +2323,24 @@ mod tests {
         let offsets = ei_descr_mint_offsets();
         assert_eq!(offsets.len(), ei_descr_mint_count() + 1);
         for i in 0..ei_descr_mint_count() {
-            let _entry = load_ei_descr_mint(i);
+            let entry = load_ei_descr_mint(i);
+            assert_ne!(
+                entry.ei_index,
+                u32::MAX,
+                "mint entry {i} is absent from every frozen raw set"
+            );
             assert!(offsets[i] < offsets[i + 1], "mint entry {i} is empty");
+        }
+    }
+
+    #[test]
+    fn effect_info_stamp_index_bounds_each_serialized_entry() {
+        let offsets = ei_descr_stamp_offsets();
+        assert_eq!(offsets.len(), ei_descr_stamp_count() + 1);
+        for i in 0..ei_descr_stamp_count() {
+            let (_member, ei_index) = load_ei_descr_stamp(i);
+            assert_ne!(ei_index, u32::MAX, "stamp entry {i} has no partition");
+            assert!(offsets[i] < offsets[i + 1], "stamp entry {i} is empty");
         }
     }
 
@@ -2451,6 +2517,104 @@ mod tests {
                 distinct_layouts.len(),
             );
         }
+    }
+
+    #[test]
+    #[ignore = "measurement; run alone with --exact --nocapture"]
+    fn descr_rehydrate_phase_rss_decomposition() {
+        fn rss_kb() -> i64 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p"])
+                .arg(std::process::id().to_string())
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(-1)
+        }
+
+        let _ = rss_kb();
+        let _: Vec<u32> = bincode::deserialize(&[0_u8; 8]).unwrap();
+        let base = rss_kb();
+        let index = descrs_index();
+        let after_index = rss_kb();
+
+        let layout_count = descr_layout_offsets().len() - 1;
+        for i in 0..layout_count {
+            drop(descr_layout_at(i));
+        }
+        let after_layouts = rss_kb();
+
+        for (i, kind) in index.kinds.iter().copied().enumerate() {
+            if kind == 0 {
+                let bh = load_descr_uncached(i);
+                crate::descr::make_descr_from_bh(&bh);
+            }
+        }
+        let after_noncall = rss_kb();
+
+        for i in 0..ei_descr_stamp_count() {
+            let (member, ei_index) = load_ei_descr_stamp(i);
+            crate::descr::stamp_effect_info_descr(&member, ei_index);
+        }
+        let after_stamps = rss_kb();
+
+        for i in 0..ei_descr_mint_count() {
+            let entry = load_ei_descr_mint(i);
+            crate::descr::publish_effect_info_descr_mints(std::slice::from_ref(&entry));
+        }
+        let after_mints = rss_kb();
+
+        for i in 0..effect_info_count() {
+            let (translated_id, mut effect_info) = load_effect_info(i);
+            crate::descr::prepare_frozen_effect_info(&mut effect_info);
+            majit_ir::effectinfo::intern_translated_effect_info(translated_id, effect_info);
+        }
+        let after_effect_infos = rss_kb();
+
+        for (i, kind) in index.kinds.iter().copied().enumerate() {
+            if kind == 1 {
+                let bh = load_descr_uncached(i);
+                let calldescr = match bh {
+                    BhDescr::Call { calldescr } | BhDescr::JitCode { calldescr, .. } => calldescr,
+                    _ => unreachable!(),
+                };
+                rehydrated_call_descr_ref(calldescr);
+            }
+        }
+        let after_calls = rss_kb();
+
+        eprintln!("[rss-phases] base={base} KB");
+        eprintln!(
+            "[rss-phases] index          delta={} KB",
+            after_index - base
+        );
+        eprintln!(
+            "[rss-phases] wire_layouts   delta={} KB",
+            after_layouts - after_index
+        );
+        eprintln!(
+            "[rss-phases] noncall_descrs delta={} KB",
+            after_noncall - after_layouts
+        );
+        eprintln!(
+            "[rss-phases] compact_stamps delta={} KB",
+            after_stamps - after_noncall
+        );
+        eprintln!(
+            "[rss-phases] raw_set_mints  delta={} KB",
+            after_mints - after_stamps
+        );
+        eprintln!(
+            "[rss-phases] effect_infos   delta={} KB",
+            after_effect_infos - after_mints
+        );
+        eprintln!(
+            "[rss-phases] call_descrs    delta={} KB",
+            after_calls - after_effect_infos
+        );
+        eprintln!("[rss-phases] TOTAL={} KB", after_calls - base);
     }
 
     /// The build-time descr pool must name the same bytes `offset_of!` does.
