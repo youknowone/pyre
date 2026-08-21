@@ -3098,13 +3098,41 @@ mod tests {
     /// never re-checked. Same shape as the GUARD_VALUE half of #210.
     #[test]
     fn guard_isnull_leaves_its_own_operand_unfolded() {
-        let (result, ctx) = run_one(vec![same_r(), op_spec(OpCode::GuardIsnull, &[0])], 1, &[]);
-        assert_pass_on(&result);
+        // p0 = inputarg(Ref); guard_isnull(p0); finish(p0)
+        let p0 = crate::history::test_support::TraceBuilder::new().input(majit_ir::Type::Ref, 0);
+        let ops = {
+            let mut guard = Op::new(OpCode::GuardIsnull, &[p0.clone()]);
+            guard.pos.set(OpRef::void_op(0));
+            let mut finish = Op::new(OpCode::Finish, &[p0]);
+            finish.pos.set(OpRef::void_op(1));
+            vec![guard, finish]
+        };
+        let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(OptRewrite::new()));
+        opt.trace_inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Ref]);
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::new();
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
+        let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1);
+
+        let guard = result
+            .iter()
+            .find(|o| o.opcode == OpCode::GuardIsnull)
+            .expect("GUARD_ISNULL must survive: nothing here proves the pointer null");
         assert_eq!(
-            ctx.get_box_replacement_operand_opt(OpRef::ref_op(0))
-                .and_then(|b| b.const_value()),
+            guard.arg(0).const_value(),
             None,
             "the guard the backend receives still has to carry the pointer it checks"
+        );
+
+        let finish = result
+            .iter()
+            .find(|o| o.opcode == OpCode::Finish)
+            .expect("the FINISH must survive");
+        assert_eq!(
+            finish.arg(0).const_value(),
+            Some(Value::Ref(majit_ir::GcRef(0))),
+            "postprocess_GUARD_ISNULL still has to hand every later op CONST_NULL"
         );
     }
 
