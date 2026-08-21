@@ -5976,9 +5976,11 @@ fn try_walker_inline_type_call_via_new<Sym: WalkSym>(
         walker_pin_type_version_tag(ctx, op.pc, metaclass_const)?;
     }
     if fbw_inline_diag_enabled() {
-        eprintln!("[type-call-inline] pc={} class={} via=__new__", op.pc, unsafe {
-            pyre_object::w_type_get_name(w_type)
-        });
+        eprintln!(
+            "[type-call-inline] pc={} class={} via=__new__",
+            op.pc,
+            unsafe { pyre_object::w_type_get_name(w_type) }
+        );
     }
 
     let inlined = try_walker_inline_resolved_user_call(
@@ -7797,9 +7799,11 @@ pub(crate) fn try_walker_inline_user_contains<Sym: WalkSym>(
     )?
     else {
         if fbw_inline_diag_enabled() {
-            eprintln!("[contains-inline-decline] pc={} why=callee inline of {}.__contains__ declined",
+            eprintln!(
+                "[contains-inline-decline] pc={} why=callee inline of {}.__contains__ declined",
                 op.pc,
-                unsafe { pyre_object::typeobject::w_type_get_name(w_class) });
+                unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+            );
         }
         return Ok(None);
     };
@@ -7849,8 +7853,8 @@ pub(crate) fn try_walker_inline_user_contains<Sym: WalkSym>(
     };
 
     if !result.is_constant() {
-        let bool_type =
-            unsafe { (*(w_true as *const pyre_object::pyobject::PyObject)).ob_type } as usize as i64;
+        let bool_type = unsafe { (*(w_true as *const pyre_object::pyobject::PyObject)).ob_type }
+            as usize as i64;
         if !ctx.trace_ctx.heap_cache().is_class_known(result) {
             let bool_type_const = ctx.trace_ctx.const_int(bool_type);
             ctx.trace_ctx
