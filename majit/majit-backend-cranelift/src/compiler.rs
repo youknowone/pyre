@@ -3439,7 +3439,7 @@ fn emit_call_header_shadowstack(
         .ins()
         .store(MemFlagsData::trusted(), jf_as_ptr, rst, word as i32);
     // ADD ebx, 2*WORD
-    let new_rst = builder.ins().iadd_imm(rst, 2 * word);
+    let new_rst = builder.ins().iadd_imm_s(rst, 2 * word);
     // MOV [root_stack_top_addr], ebx
     builder
         .ins()
@@ -3464,7 +3464,7 @@ fn emit_call_footer_shadowstack(
     let rst = builder
         .ins()
         .load(ptr_type, MemFlagsData::trusted(), rst_addr_val, 0);
-    let new_rst = builder.ins().iadd_imm(rst, -(2 * word));
+    let new_rst = builder.ins().iadd_imm_s(rst, -(2 * word));
     builder
         .ins()
         .store(MemFlagsData::trusted(), new_rst, rst_addr_val, 0);
@@ -6028,7 +6028,7 @@ fn emit_scaled_index_addr(
     let with_base_offset = if base_offset == 0 {
         scaled_index
     } else {
-        builder.ins().iadd_imm(scaled_index, base_offset)
+        builder.ins().iadd_imm_s(scaled_index, base_offset)
     };
     builder.ins().iadd(base, with_base_offset)
 }
@@ -7150,10 +7150,10 @@ fn emit_attached_loop_dispatch(
     // target at the LABEL the JUMP names, not always the first.  The target
     // body's entry `br_table` reserves dispatch_key 0 for its preamble, so a
     // re-entry at LABEL L passes `label_block_id + 1`.
-    let label_selector = builder.ins().iadd_imm(lbid, 1);
+    let label_selector = builder.ins().iadd_imm_s(lbid, 1);
     let dispatch_key = builder
         .ins()
-        .bor_imm(label_selector, IN_CODE_ENTRY_KEY_FLAG as i64);
+        .bor_imm_u(label_selector, IN_CODE_ENTRY_KEY_FLAG as i64);
     builder.ins().return_call_indirect(
         target_sig_ref,
         target_code_ptr,
@@ -9614,7 +9614,7 @@ impl CraneliftBackend {
         let raw_dispatch_key = builder.block_params(entry_block)[1];
         let in_code_bit = builder
             .ins()
-            .band_imm(raw_dispatch_key, IN_CODE_ENTRY_KEY_FLAG as i64);
+            .band_imm_u(raw_dispatch_key, IN_CODE_ENTRY_KEY_FLAG as i64);
         let zero_key = builder.ins().iconst(cl_types::I32, 0);
         let is_in_code_entry = builder.ins().icmp(IntCC::NotEqual, in_code_bit, zero_key);
 
@@ -10238,7 +10238,7 @@ impl CraneliftBackend {
             let label_selector_mask = (!IN_CODE_ENTRY_KEY_FLAG) as i64;
             let dispatch_key = builder
                 .ins()
-                .band_imm(raw_dispatch_key, label_selector_mask);
+                .band_imm_u(raw_dispatch_key, label_selector_mask);
             let preamble_block = builder.create_block();
             let loaders: Vec<cranelift_codegen::ir::Block> = label_blocks
                 .iter()
@@ -11535,7 +11535,7 @@ impl CraneliftBackend {
                         resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
 
                     // Load header word from obj_ptr - GcHeader::SIZE
-                    let hdr_addr = builder.ins().iadd_imm(obj_ptr, -(GcHeader::SIZE as i64));
+                    let hdr_addr = builder.ins().iadd_imm_s(obj_ptr, -(GcHeader::SIZE as i64));
                     let hdr_word =
                         builder
                             .ins()
@@ -11615,7 +11615,9 @@ impl CraneliftBackend {
                     // majit's GC header sits at `obj - GcHeader::SIZE`
                     // (see the GuardGcType arm above); the typeid occupies
                     // the lower `TYPE_ID_BITS` of that header word.
-                    let hdr_addr = builder.ins().iadd_imm(loc_object, -(GcHeader::SIZE as i64));
+                    let hdr_addr = builder
+                        .ins()
+                        .iadd_imm_s(loc_object, -(GcHeader::SIZE as i64));
                     let hdr_word =
                         builder
                             .ins()
@@ -11633,7 +11635,7 @@ impl CraneliftBackend {
                     // assembler.py:1938-1939 addr_add(imm(base_type_info),
                     //     loc_typeid, scale=shift_by, offset=infobits_offset)
                     let shifted_typeid = if shift_by > 0 {
-                        builder.ins().ishl_imm(loc_typeid, shift_by as i64)
+                        builder.ins().ishl_imm_u(loc_typeid, shift_by as i64)
                     } else {
                         loc_typeid
                     };
@@ -11641,7 +11643,7 @@ impl CraneliftBackend {
                     let addr_without_off = builder.ins().iadd(base_val, shifted_typeid);
                     let loc_infobits = builder
                         .ins()
-                        .iadd_imm(addr_without_off, infobits_offset as i64);
+                        .iadd_imm_s(addr_without_off, infobits_offset as i64);
 
                     // assembler.py:1940 TEST8 [loc_infobits], IS_OBJECT_FLAG.
                     let byte =
@@ -11770,7 +11772,9 @@ impl CraneliftBackend {
                         //     MOV loc_tmp, [base_type_info
                         //         + (loc_tmp << shift_by)
                         //         + sizeof_ti + offset2]
-                        let hdr_addr = builder.ins().iadd_imm(loc_object, -(GcHeader::SIZE as i64));
+                        let hdr_addr = builder
+                            .ins()
+                            .iadd_imm_s(loc_object, -(GcHeader::SIZE as i64));
                         let hdr_word =
                             builder
                                 .ins()
@@ -11780,7 +11784,7 @@ impl CraneliftBackend {
                         let (base_type_info, shift_by, sizeof_ti) =
                             with_cranelift_gc_required(|gc| gc.get_translated_info_for_typeinfo());
                         let shifted = if shift_by > 0 {
-                            builder.ins().ishl_imm(typeid, shift_by as i64)
+                            builder.ins().ishl_imm_u(typeid, shift_by as i64)
                         } else {
                             typeid
                         };
@@ -11788,7 +11792,7 @@ impl CraneliftBackend {
                         let addr_base = builder.ins().iadd(base_val, shifted);
                         let addr = builder
                             .ins()
-                            .iadd_imm(addr_base, (sizeof_ti + offset2) as i64);
+                            .iadd_imm_s(addr_base, (sizeof_ti + offset2) as i64);
                         builder
                             .ins()
                             .load(cl_types::I64, MemFlagsData::trusted(), addr, 0)
@@ -11810,7 +11814,7 @@ impl CraneliftBackend {
 
                     // assembler.py:1976-1978 unsigned comparison:
                     //     (loc_tmp - check_min) <u (check_max - check_min)
-                    let sub = builder.ins().iadd_imm(loc_tmp, -check_min);
+                    let sub = builder.ins().iadd_imm_s(loc_tmp, -check_min);
                     let limit = builder.ins().iconst(cl_types::I64, check_max - check_min);
                     // assembler.py:1979 guard_success_cc = Conditions['B']:
                     // the guard passes when sub <u limit; the fail branch
@@ -12047,7 +12051,9 @@ impl CraneliftBackend {
                     // The callee's prologue pushes jf_ptr onto shadow stack,
                     // so GC tracks it during callee execution. After return,
                     let args_ptr = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                    let args_data_ptr = builder.ins().iadd_imm(args_ptr, JF_FRAME_ITEM0_OFS as i64);
+                    let args_data_ptr = builder
+                        .ins()
+                        .iadd_imm_s(args_ptr, JF_FRAME_ITEM0_OFS as i64);
                     let token_val = descr_token
                         .map(|token| token.number)
                         .or_else(|| call_descr.call_target_token())
@@ -12272,8 +12278,9 @@ impl CraneliftBackend {
                         // jitframe onto the shadow stack so GC can trace it during
                         // the helper call. Pop after the helper returns.
                         emit_call_header_shadowstack(&mut builder, ptr_type, result_jf);
-                        let result_jf_data =
-                            builder.ins().iadd_imm(result_jf, JF_FRAME_ITEM0_OFS as i64);
+                        let result_jf_data = builder
+                            .ins()
+                            .iadd_imm_s(result_jf, JF_FRAME_ITEM0_OFS as i64);
                         let result_jf_data_i64 =
                             ptr_arg_as_i64(&mut builder, result_jf_data, ptr_type);
                         // `compile.py:665 setattr(cpu, name, descr)` — bake the
@@ -13049,7 +13056,9 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                         );
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                        let ps = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
+                        let ps = builder
+                            .ins()
+                            .iadd_imm_s(size_total, -(GcHeader::SIZE as i64));
                         let slow_r = emit_host_call(
                             &mut builder,
                             ptr_type,
@@ -13235,7 +13244,9 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                     );
                     emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                    let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
+                    let size = builder
+                        .ins()
+                        .iadd_imm_s(size_total, -(GcHeader::SIZE as i64));
                     let slow_result = emit_host_call(
                         &mut builder,
                         ptr_type,
@@ -13391,16 +13402,16 @@ impl CraneliftBackend {
                         builder.seal_block(card_mark_block);
                         let index = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
                         let shift_plus_3 = (wb_card_shift + 3) as i64;
-                        let shifted = builder.ins().ushr_imm(index, shift_plus_3);
+                        let shifted = builder.ins().ushr_imm_u(index, shift_plus_3);
                         let byteofs_val = builder.ins().bnot(shifted);
-                        let bit_idx = builder.ins().ushr_imm(index, wb_card_shift as i64);
+                        let bit_idx = builder.ins().ushr_imm_u(index, wb_card_shift as i64);
                         let seven = builder.ins().iconst(cl_types::I64, 7);
                         let bit_idx = builder.ins().band(bit_idx, seven);
                         let one = builder.ins().iconst(cl_types::I64, 1);
                         let bit_mask = builder.ins().ishl(one, bit_idx);
                         let card_header_base = builder
                             .ins()
-                            .iadd_imm(obj, -(majit_gc::header::GcHeader::SIZE as i64));
+                            .iadd_imm_s(obj, -(majit_gc::header::GcHeader::SIZE as i64));
                         let card_addr = builder.ins().iadd(card_header_base, byteofs_val);
                         let card_byte =
                             builder
@@ -13669,7 +13680,7 @@ impl CraneliftBackend {
                         .expect("getfield descriptor must be a FieldDescr");
 
                     let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                    let addr = builder.ins().iadd_imm(base, fd.offset() as i64);
+                    let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
                     let r = emit_load_from_addr(
                         &mut builder,
                         addr,
@@ -13691,7 +13702,7 @@ impl CraneliftBackend {
 
                     let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let val = resolve_opref(&mut builder, &constants, op.arg(1).to_opref());
-                    let addr = builder.ins().iadd_imm(base, fd.offset() as i64);
+                    let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
                     emit_store_to_addr(
                         &mut builder,
                         addr,
@@ -13864,7 +13875,7 @@ impl CraneliftBackend {
 
                     let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     if let Some(ld) = ad.len_descr() {
-                        let addr = builder.ins().iadd_imm(base, ld.offset() as i64);
+                        let addr = builder.ins().iadd_imm_s(base, ld.offset() as i64);
                         let r = emit_load_from_addr(
                             &mut builder,
                             addr,
@@ -13893,7 +13904,7 @@ impl CraneliftBackend {
 
                     let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     if let Some(ld) = ad.len_descr() {
-                        let addr = builder.ins().iadd_imm(base, ld.offset() as i64);
+                        let addr = builder.ins().iadd_imm_s(base, ld.offset() as i64);
                         let r = emit_load_from_addr(
                             &mut builder,
                             addr,
@@ -13922,7 +13933,7 @@ impl CraneliftBackend {
                         .expect("strhash/unicodehash descriptor must be a FieldDescr");
                     assert_eq!(fd.field_size(), std::mem::size_of::<usize>());
                     let base = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
-                    let addr = builder.ins().iadd_imm(base, fd.offset() as i64);
+                    let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
                     let hash = emit_load_from_addr(
                         &mut builder,
                         addr,
@@ -14108,7 +14119,7 @@ impl CraneliftBackend {
                             builder.ins().imul(start, scale)
                         }
                     };
-                    let byte_offset = builder.ins().iadd_imm(start_bytes, ad.base_size() as i64);
+                    let byte_offset = builder.ins().iadd_imm_s(start_bytes, ad.base_size() as i64);
                     let byte_size = match scale_size {
                         0 => builder.ins().iconst(cl_types::I64, 0),
                         1 => size,
@@ -15148,7 +15159,7 @@ impl CraneliftBackend {
                 OpCode::LoadFromGcTable => {
                     let index = resolve_opref(&mut builder, &constants, op.arg(0).to_opref());
                     let base = builder.ins().iconst(cl_types::I64, gc_table_base as i64);
-                    let byte_ofs = builder.ins().ishl_imm(index, 3);
+                    let byte_ofs = builder.ins().ishl_imm_u(index, 3);
                     let slot_addr = builder.ins().iadd(base, byte_ofs);
                     let value = builder
                         .ins()
