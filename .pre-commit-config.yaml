@@ -13,3 +13,15 @@ repos:
         types: [rst]
         additional_dependencies:
           - tomli
+
+  - repo: local
+    hooks:
+      - id: no-line-number-citations
+        name: upstream citations name a symbol, not a line number
+        entry: python3 scripts/check-new-line-citations.py
+        language: system
+        pass_filenames: false
+        # Reads the staged diff itself, so it judges what a commit ADDS. Under
+        # `pre-commit run --all-files` that diff is empty and the hook is inert,
+        # which is what keeps the tree's existing numbers out of scope.
+        always_run: true
