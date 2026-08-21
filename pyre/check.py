@@ -909,6 +909,18 @@ def pyre_env():
     return env
 
 
+def effective_wasm_module():
+    """The module path the wasm runner will actually load.
+
+    `pyre_env` defaults `PYRE_WASM_MODULE` to the built module but leaves an
+    inherited one alone, so the default is not what runs whenever the caller
+    set it. A gate that asks about `WASM_MODULE_PATH` under an override checks
+    a file the run never opens, and clears the way for the stale module the
+    override names.
+    """
+    return os.environ.get("PYRE_WASM_MODULE") or WASM_MODULE_PATH
+
+
 def _dump_failed_run(output, stderr, limit=40):
     """Print the tail of a failed run's captured streams.
 
@@ -2110,11 +2122,21 @@ def build_inputs_fingerprint():
         try:
             handle = open(path, "rb")
         except OSError:
-            digest.update(b"<unreadable>\0")
+            digest.update(b"\0")
             continue
+        # Each file contributes a fixed-width value behind a one-byte tag,
+        # rather than its bytes inline: feeding the content straight in leaves
+        # the boundary between one file's tail and the next file's name
+        # unmarked, so a file holding `b"b\0x"` at path `a` hashes to the same
+        # bytes as an empty `a` beside a `b` holding `x`. Two input sets that
+        # collide read as one unchanged tree, which is the answer this gate
+        # exists to refuse.
+        content = hashlib.sha256()
         with handle:
             while chunk := handle.read(1 << 20):
-                digest.update(chunk)
+                content.update(chunk)
+        digest.update(b"\1")
+        digest.update(content.digest())
     _BUILD_INPUTS_FINGERPRINT = digest.hexdigest()
     return _BUILD_INPUTS_FINGERPRINT
 
@@ -4415,19 +4437,24 @@ def main():
                     f"(missing executable: {pyre_bin})"
                 )
             sys.exit(1)
-        if backend == "wasm" and args.no_build and not Path(WASM_MODULE_PATH).is_file():
+        wasm_module = effective_wasm_module() if backend == "wasm" else None
+        if backend == "wasm" and args.no_build and not Path(wasm_module).is_file():
             print(
                 "ERROR: --no-build requested for backend 'wasm', but the "
-                f"wasm-host module is missing: {WASM_MODULE_PATH}"
+                f"wasm-host module is missing: {wasm_module}"
             )
             sys.exit(1)
-        # `--pyre-path` names a binary from outside this tree, so its age says
-        # nothing about these sources.
-        if args.no_build and not args.pyre_path:
-            artefacts = [pyre_bin]
+        if args.no_build:
+            # `--pyre-path` names a binary from outside this tree, so its age
+            # says nothing about these sources. The module is a separate
+            # artefact and is this tree's own unless overridden, so it is asked
+            # about either way; one from elsewhere carries no stamp and draws
+            # the unchecked-freshness note rather than a refusal.
+            artefacts = [] if args.pyre_path else [pyre_bin]
             if backend == "wasm":
-                artefacts.append(WASM_MODULE_PATH)
-            require_fresh_artefacts(backend, artefacts)
+                artefacts.append(wasm_module)
+            if artefacts:
+                require_fresh_artefacts(backend, artefacts)
         chk._set_pyre(backend, pyre_bin)
 
     print()
