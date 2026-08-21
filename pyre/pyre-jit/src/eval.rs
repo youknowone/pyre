@@ -7556,6 +7556,15 @@ fn for_iter_gate_diag_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some())
 }
 
+/// Admit a `LIST_APPEND` FOR_ITER body that also carries a CALL (gh#73/gh#34).
+/// Off by default while the mid-body abort's forward resume is being measured:
+/// a call commits body effects, and the abort's recovery decides whether the
+/// consumed item survives.
+fn for_iter_call_body_admitted() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FORITER_CALL_BODY").is_some())
+}
+
 fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
     use pyre_interpreter::Instruction as I;
     let instructions = &code.instructions;
@@ -7709,7 +7718,8 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
                     | I::SetAdd { .. }
                     | I::MapAdd { .. }
             )
-            || (!body_has_call && matches!(body_instr, I::ListAppend { .. }));
+            || ((!body_has_call || for_iter_call_body_admitted())
+                && matches!(body_instr, I::ListAppend { .. }));
         if !permitted {
             if for_iter_gate_diag_enabled() {
                 eprintln!(
