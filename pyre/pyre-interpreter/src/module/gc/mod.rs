@@ -1300,8 +1300,8 @@ crate::py_module! {
         ) -> Result<PyObjectRef, crate::PyError> {
             // `interp_gc.py collect` unwraps the optional generation
             // as an int, but deliberately ignores its value.  In particular,
-            // unlike CPython's three-generation frontend, every integer is
-            // accepted and the default is 0.
+            // unlike a three-generation frontend, every integer is accepted
+            // and the default is 0.
             let _generation = crate::baseobjspace::int_w(
                 crate::baseobjspace::space_index(generation)?,
             )?;
@@ -1309,7 +1309,11 @@ crate::py_module! {
             crate::objspace::std::mapdict::clear_map_attr_cache();
             pyre_object::gc_hook::try_gc_collect();
             run_finalizers_now();
-            Ok(w_none())
+            // The return value is the caller-observable axis and is an int.
+            // A collector that never counts unreachable objects has no count
+            // to report, so the constant `interp_gc.py:48` carries is what it
+            // answers.  `extra_tests/snippets/stdlib_gc.py` pins the type.
+            Ok(w_int_new(0))
         }
 
         fn collect_step() -> Result<PyObjectRef, crate::PyError> {
