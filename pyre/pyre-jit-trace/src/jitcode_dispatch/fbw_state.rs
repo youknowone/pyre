@@ -2405,13 +2405,25 @@ pub(crate) enum CalleeReplaySafety {
 /// register reaching a join can hold whichever allocation the taken path put
 /// there, which this straight-line scan cannot name.
 ///
-/// Exact numeric provenance for one positional parameter of an inline callee.
-/// The two facts stay separate because bitwise specialization accepts only
-/// exact ints, while add/subtract/multiply also accept exact floats.
+/// What the caller knows about one positional parameter of an inline callee.
+///
+/// The two numeric facts stay separate because bitwise specialization accepts
+/// only exact ints, while add/subtract/multiply also accept exact floats.
+///
+/// `rewind_reallocates` is a different KIND of fact from those two: they
+/// describe the value, it describes what the caller's rewind does to it.  A
+/// guard inside this callee resumes at the caller's CALL, so an argument whose
+/// ALLOCATION sits inside that re-executed region is built again from scratch,
+/// and the aborted attempt's writes into it landed on an object nothing can
+/// reach.  Only a constructor's `self` qualifies, because `__new__` runs inside
+/// the call.  A caller-local that is merely unescaped does NOT: `x = []; f(x)`
+/// leaves `x = []` before the boundary, so the rewind hands `f` back the same
+/// object and a re-run `x.a += 1` reads its own first write.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct ExactNumericArg {
+pub(crate) struct CalleeArgFact {
     pub(crate) numeric: bool,
     pub(crate) plain_int: bool,
+    pub(crate) rewind_reallocates: bool,
 }
 
 /// The `BINARY_OP` exemption needs the mirror-image fact — which values came
@@ -2469,7 +2481,7 @@ fn replay_safety_dump_body(body_code: &[u8], callee_descr_refs: &[DescrRef]) {
 
 pub(crate) fn fbw_callee_body_replay_safety(
     body_code: &[u8],
-    exact_numeric_args: &[ExactNumericArg],
+    arg_facts: &[CalleeArgFact],
     num_regs_i: usize,
     constants_i: &[i64],
     num_regs_r: usize,
@@ -2545,16 +2557,21 @@ pub(crate) fn fbw_callee_body_replay_safety(
     let mut seed_plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
     let mut numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
     let mut plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
-    for (slot, exact) in exact_numeric_args
-        .iter()
-        .take(BODY_TRACKED_FRAME_SLOTS)
-        .enumerate()
-    {
-        numeric_slots[slot] = exact.numeric;
-        plain_int_slots[slot] = exact.plain_int;
+    // Which parameters the caller's rewind rebuilds — tracked in their own sets
+    // rather than folded into `fresh_ref_regs`, whose two exemptions answer a
+    // different question (an allocation THIS body made) and whose reset rules
+    // are not the ones this fact needs.
+    let mut seed_rewind_built_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+    let mut rewind_built_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+    let mut rewind_built_ref_regs = [false; u8::MAX as usize + 1];
+    for (slot, fact) in arg_facts.iter().take(BODY_TRACKED_FRAME_SLOTS).enumerate() {
+        numeric_slots[slot] = fact.numeric;
+        plain_int_slots[slot] = fact.plain_int;
+        rewind_built_slots[slot] = fact.rewind_reallocates;
         if !stored_slots[slot] {
-            seed_numeric_slots[slot] = exact.numeric;
-            seed_plain_int_slots[slot] = exact.plain_int;
+            seed_numeric_slots[slot] = fact.numeric;
+            seed_plain_int_slots[slot] = fact.plain_int;
+            seed_rewind_built_slots[slot] = fact.rewind_reallocates;
         }
     }
     // The frame register every vable op in this body has used so far.  A second
@@ -2571,6 +2588,10 @@ pub(crate) fn fbw_callee_body_replay_safety(
             plain_int_ref_regs = seed_plain_int_ref_regs;
             numeric_slots = seed_numeric_slots;
             plain_int_slots = seed_plain_int_slots;
+            // No constant-pool entry can be an argument the rewind rebuilds, so
+            // the register half resets to empty rather than to a seed.
+            rewind_built_ref_regs = [false; u8::MAX as usize + 1];
+            rewind_built_slots = seed_rewind_built_slots;
         }
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
             replay_dirty!("DecodeOpFailed", pc, "-");
@@ -2610,12 +2631,15 @@ pub(crate) fn fbw_callee_body_replay_safety(
                         .copied();
                     numeric_slots[slot] = src.is_some_and(|src| numeric_ref_regs[src as usize]);
                     plain_int_slots[slot] = src.is_some_and(|src| plain_int_ref_regs[src as usize]);
+                    rewind_built_slots[slot] =
+                        src.is_some_and(|src| rewind_built_ref_regs[src as usize]);
                 }
                 // Past the tracked window: cannot alias a slot inside it.
                 Some(_) => {}
                 None => {
                     numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
                     plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+                    rewind_built_slots = [false; BODY_TRACKED_FRAME_SLOTS];
                 }
             }
         }
@@ -2714,6 +2738,28 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     &d,
                     callee_descr_refs,
                 );
+            // A `STORE_ATTR` whose receiver the caller's rewind rebuilds is an
+            // initialization, not a live-heap write — the same rule the
+            // `setfield_gc` and `setarrayitem_gc` arms below apply to an
+            // allocation this body made, reaching one the CALL boundary made
+            // instead.  It settles every outcome the residual has: if a
+            // `try_walker_specialize_store_attr` arm fires, the slot write it
+            // applies lands on the rebuilt instance; if none does, the residual
+            // survives to `fbw_abort_nested_unjournaled_residual`, which aborts
+            // before the helper runs — so a user `__setattr__` never runs on
+            // this path either.  Receiver freshness alone would NOT be enough:
+            // three of the four arms (`specialize.rs`
+            // `store_attr_unboxed_fast_path` / `store_attr_boxed_fast_path` /
+            // `exception_attr_slot_fold`) write with no freshness requirement
+            // and no journal, so a live receiver — `c.bump(i)` doing
+            // `self.n += i` — would be doubled by the re-run.
+            let accepted_rewind_built_store = !provably_side_effect_free
+                && crate::jitcode_dispatch::residual_call::residual_call_store_attr_receiver_reg(
+                    body_code,
+                    &d,
+                    callee_descr_refs,
+                )
+                .is_some_and(|recv| rewind_built_ref_regs[recv as usize]);
             // An accepted arithmetic op over exact numeric operands returns an
             // exact numeric.  Bitwise ops require and return exact ints.
             dst_exact_numeric = dst_boxed_int || accepted_binop;
@@ -2723,6 +2769,7 @@ pub(crate) fn fbw_callee_body_replay_safety(
                 && accepted_numeric_op.is_none()
                 && !accepted_truth
                 && !accepted_exc_match
+                && !accepted_rewind_built_store
             {
                 // A Python-level CALL is the one shape this scan cannot
                 // settle: the inline lever binds its callee only at the call,
@@ -2808,6 +2855,19 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     // can reach through this frame is unknown here.
                     numeric_slots = [false; BODY_TRACKED_FRAME_SLOTS];
                     plain_int_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+                    // The rewind fact is dropped PERMANENTLY, seed included,
+                    // where the numeric ones come back at the next branch
+                    // target.  The asymmetry is the point: a never-stored slot
+                    // still holds the same exact int the caller passed, so the
+                    // numeric proof survives a call, while "the rewind rebuilds
+                    // this and nothing else can reach it" is a claim about the
+                    // world.  A deferred callee can publish the instance —
+                    // `REGISTRY.append(self)` before `self.v = v` — and after
+                    // that the rewind's fresh instance no longer replaces the
+                    // one the aborted attempt wrote to.
+                    rewind_built_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+                    seed_rewind_built_slots = [false; BODY_TRACKED_FRAME_SLOTS];
+                    rewind_built_ref_regs = [false; u8::MAX as usize + 1];
                 } else {
                     replay_dirty!(
                         format!("ResidualCallWritesLiveHeap/{:?}", ei.pyre_helper),
@@ -2873,6 +2933,17 @@ pub(crate) fn fbw_callee_body_replay_safety(
                     && body_code
                         .get(d.pc + 1)
                         .is_some_and(|src| fresh_ref_regs[*src as usize]));
+            // `self` reaches the `STORE_ATTR` receiver slot the same way every
+            // other parameter reaches a register: `LOAD_FAST` reads it out of
+            // the frame.  So the fact travels slot → register here, and through
+            // `ref_copy` for a body that rebinds it.
+            rewind_built_ref_regs[dst as usize] = vable_slot.is_some_and(|slot| {
+                d.opname.starts_with("getarrayitem_vable_r")
+                    && rewind_built_slots.get(slot).copied().unwrap_or(false)
+            }) || (d.key == "ref_copy/r>r"
+                && body_code
+                    .get(d.pc + 1)
+                    .is_some_and(|src| rewind_built_ref_regs[*src as usize]));
             // A proven value enters a register by being loaded out of a proven
             // frame slot, from the residual arm above, or through a verbatim
             // copy.  Every other producer overwrites the register with an

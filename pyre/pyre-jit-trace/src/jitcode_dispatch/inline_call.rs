@@ -3441,9 +3441,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Preserve exactness per argument.  Method-form calls put a usually
     // nonnumeric `self` in slot 0; folding all arguments into one boolean
     // incorrectly made that erase the proof for an independent numeric `x`.
-    let exact_numeric_args: Vec<ExactNumericArg> = callee_arg_concretes
+    //
+    // The one argument a guard failure inside this callee rebuilds.  The rewind
+    // resumes at the caller's CALL, so it re-runs `type.__call__` from
+    // `__new__` — and only a constructor has its argument's ALLOCATION inside
+    // that region.  `try_walker_inline_type_call` passes the instance it just
+    // emitted as `callee_args[0]` and repeats it in `constructor_result`, so
+    // matching the two names that instance and nothing else; `is_unescaped`
+    // (`heapcache.py:493-494`) is the other half — nothing outside the walk has
+    // taken a reference between the allocation and this boundary.
+    let rewind_built_arg = constructor_result.and_then(|(instance, _)| {
+        (instance != OpRef::NONE
+            && callee_args.first() == Some(&instance)
+            && ctx.trace_ctx.heap_cache().is_unescaped(instance))
+        .then_some(0usize)
+    });
+    let arg_facts: Vec<CalleeArgFact> = callee_arg_concretes
         .iter()
-        .map(|concrete| {
+        .enumerate()
+        .map(|(index, concrete)| {
             let (plain_int, exact_float) = match concrete {
                 ConcreteValue::Int(_) => (true, false),
                 ConcreteValue::Float(_) => (false, true),
@@ -3457,9 +3473,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     (false, false)
                 }
             };
-            ExactNumericArg {
+            CalleeArgFact {
                 numeric: plain_int || exact_float,
                 plain_int,
+                rewind_reallocates: rewind_built_arg == Some(index),
             }
         })
         .collect();
@@ -3570,9 +3587,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let mut foriter_deferred_admit = false;
     let mut foriter_dirty_bound = false;
     if fbw_foriter_inflight_active() && !instance_next_seeded_route {
-        let mut safety = fbw_callee_body_replay_safety(
+        let safety = fbw_callee_body_replay_safety(
             body.code,
-            &exact_numeric_args,
+            &arg_facts,
             body.num_regs_i,
             body.constants_i,
             body.num_regs_r,
@@ -3580,18 +3597,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             callee_descr_refs,
             method_form,
         );
-        // MEASUREMENT PROBE (`PYRE_CTOR_INIT_CLEAN`), not a shipping arm: it
-        // asserts what the scan cannot yet prove — that every live-heap write
-        // an `__init__` performs lands on the instance `__new__` allocated for
-        // THIS call, which the caller-boundary resume re-allocates rather than
-        // doubling.  The scan has no parameter-freshness input, so it cannot
-        // tell that write from one to an object that outlives the rewind.
-        if constructor_result.is_some()
-            && matches!(safety, CalleeReplaySafety::Dirty)
-            && std::env::var_os("PYRE_CTOR_INIT_CLEAN").is_some()
-        {
-            safety = CalleeReplaySafety::Clean;
-        }
         let legacy_admit = match safety {
             CalleeReplaySafety::Clean => true,
             CalleeReplaySafety::DeferredCall => {
@@ -3687,10 +3692,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
         if fbw_inline_diag_enabled() {
             eprintln!(
-                "[inline-foriter-gate] pc={} legacy_admit={legacy_admit} exact_numeric_args={} \
+                "[inline-foriter-gate] pc={} legacy_admit={legacy_admit} numeric_args={} \
+                 rewind_built_arg={rewind_built_arg:?} \
                  safety={safety:?} deferred_admit={foriter_deferred_admit}",
                 op.pc,
-                exact_numeric_args.iter().filter(|arg| arg.numeric).count(),
+                arg_facts.iter().filter(|arg| arg.numeric).count(),
             );
         }
         // An unbound `Dirty` body is not admitted by seeding its frame.  Its
@@ -3824,7 +3830,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if contains_raise && !strict_inlinable && body_facts.has_exception_table {
             Some(fbw_callee_body_replay_safety(
                 body.code,
-                &exact_numeric_args,
+                &arg_facts,
                 body.num_regs_i,
                 body.constants_i,
                 body.num_regs_r,

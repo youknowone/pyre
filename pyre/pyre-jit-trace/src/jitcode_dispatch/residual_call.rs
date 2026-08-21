@@ -4688,6 +4688,34 @@ pub(crate) fn residual_call_specialized_plain_numeric_binop(
     }
 }
 
+/// The register holding the receiver of a `STORE_ATTR` residual in a callee
+/// body, or `None` for any other op or an unexpected shape.
+///
+/// `lower_setattr_hlop_to_insn` builds the R-list as `[obj, value, code]`, and
+/// the executor above reads the receiver back as `r_args.first()`, so operand 0
+/// is the receiver at both ends.  The offsets are the same `iIR` walk
+/// [`residual_call_specialized_plain_numeric_binop`] does: the R-list follows
+/// the I-list, whose length is the byte at `pc + 2`.
+pub(crate) fn residual_call_store_attr_receiver_reg(
+    body_code: &[u8],
+    d: &DecodedOp,
+    callee_descr_refs: &[DescrRef],
+) -> Option<u8> {
+    if d.key != "residual_call_ir_v/iIRd"
+        || residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
+            != Some(majit_ir::PyreHelperKind::StoreAttr)
+    {
+        return None;
+    }
+    let &i_len = body_code.get(d.pc + 2)?;
+    let r_len_pc = d.pc + 1 + 1 + 1 + i_len as usize;
+    // Exactly the three the lowering emits; a different arity is not this shape.
+    if body_code.get(r_len_pc) != Some(&3) {
+        return None;
+    }
+    body_code.get(r_len_pc + 1).copied()
+}
+
 /// Is this body op the `CHECK_EXC_MATCH` residual — `compare_fn(exc,
 /// match_type, ISINSTANCE_OP)`?
 ///
