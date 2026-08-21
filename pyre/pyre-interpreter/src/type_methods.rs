@@ -6462,11 +6462,22 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     arity_at_most(args, "get", 2)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
-    let default = args.get(2).copied().unwrap_or_else(w_none);
     if dict.is_null() {
-        return Ok(default);
+        return Ok(args.get(2).copied().unwrap_or_else(w_none));
     }
-    Ok(dict_lookup_checked(dict, key)?.unwrap_or(default))
+    // The lookup hashes and compares the key, which is user code. `args` is
+    // the stack copy the gateway built, so a default read out of it after that
+    // is a pre-move address whenever the caller passed a list or a dict.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let found = dict_lookup_checked(dict, key)?;
+    Ok(found.unwrap_or_else(|| {
+        if args.len() >= 3 {
+            pyre_object::gc_roots::shadow_stack_get(base + 2)
+        } else {
+            w_none()
+        }
+    }))
 }
 
 /// `pypy/objspace/std/dictmultiobject.py:descr_keys` parity — returns
@@ -6930,7 +6941,10 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     arity_at_most(args, "pop", 2)?;
     let dict = resolve_dict_backing(args[0]);
     let key = args[1];
-    let default = args.get(2).copied();
+    // Rooted as `dict_method_get`: the removal hashes the key, and the default
+    // is only consumed once that has run.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
     if !dict.is_null() {
         unsafe {
             match pyre_object::dictmultiobject::w_dict_pop_checked(dict, key) {
@@ -6940,7 +6954,10 @@ pub fn dict_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             }
         }
     }
-    default.ok_or_else(|| crate::PyError::key_error_with_key(key))
+    if args.len() >= 3 {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(base + 2));
+    }
+    Err(crate::PyError::key_error_with_key(key))
 }
 
 /// `dictmultiobject.py` `W_DictMultiObject.descr_popitem`:
