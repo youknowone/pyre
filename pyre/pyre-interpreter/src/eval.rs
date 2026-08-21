@@ -318,64 +318,41 @@ pub unsafe fn walk_raw_code_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    unsafe fn walk(
-        value: PyObjectRef,
-        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-        visited: &mut Vec<usize>,
-    ) {
-        unsafe {
-            if value.is_null() || !crate::pycode::is_code(value) {
-                return;
-            }
-            let identity = value as usize;
-            // PyPy's GC traces the PyCode constant list transitively and its
-            // mark state prevents revisiting shared/cyclic nodes. PyCode
-            // wrappers may be reached recursively without a collector mark
-            // check, so mirror that small identity set while walking constants.
-            if visited.contains(&identity) {
-                return;
-            }
-            visited.push(identity);
-            let code = &mut *(value as *mut crate::pycode::PyCode);
-            visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
-            // The realized `co_qualname` is an ordinary movable string object
-            // shared by every function built from this code.
-            visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
-            // `co_name` is realized and retained the same way.
-            visitor(&mut *(&mut code.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
-            if !code.co_consts_w.is_null() {
-                for slot in (&*code.co_consts_w).iter() {
-                    let mut child = slot.load(std::sync::atomic::Ordering::Acquire);
-                    if child.is_null() {
-                        continue;
-                    }
-                    visitor(&mut *(&mut child as *mut PyObjectRef as *mut majit_ir::GcRef));
-                    slot.store(child, std::sync::atomic::Ordering::Release);
-                    // Recurse through nested co_consts_w, matching PyPy's
-                    // transitively traced PyCode list.
-                    walk(child, visitor, visited);
-                }
-            }
-            // mapdict.py CacheEntry.w_method is the cache's sole GC
-            // reference.  PyPy traces it as part of the live PyCode; do the
-            // same here now that managed code wrappers reach this walker from
-            // their custom trace (the registry walk remains for bootstrap
-            // prebuilt wrappers).
-            if !code.mapdict_caches.is_null() {
-                for entry in (&mut *code.mapdict_caches).iter_mut().flatten() {
-                    visitor(
-                        &mut *(&mut entry.w_method as *mut PyObjectRef as *mut majit_ir::GcRef),
-                    );
-                }
-            }
-        }
-    }
-
     unsafe {
         if value.is_null() || !crate::pycode::is_code(value) {
             return;
         }
-        walk(value, visitor, &mut Vec::new());
+        // A GC trace callback reports one object's direct edges. PyPy's mark
+        // worklist provides transitive traversal and its VISITED bit provides
+        // cycle suppression; recursively walking nested PyCode values here
+        // duplicated both jobs and allocated a fresh identity Vec on every
+        // trace. Bootstrap wrappers are each registered individually in
+        // PREBUILT_CODE_ROOTS, so the same direct-edge shape covers them too.
+        let code = &mut *(value as *mut crate::pycode::PyCode);
+        visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
+        // The realized `co_qualname` is an ordinary movable string object
+        // shared by every function built from this code.
+        visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
+        // `co_name` is realized and retained the same way.
+        visitor(&mut *(&mut code.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
+        if !code.co_consts_w.is_null() {
+            for slot in (&*code.co_consts_w).iter() {
+                let mut child = slot.load(std::sync::atomic::Ordering::Acquire);
+                if child.is_null() {
+                    continue;
+                }
+                visitor(&mut *(&mut child as *mut PyObjectRef as *mut majit_ir::GcRef));
+                slot.store(child, std::sync::atomic::Ordering::Release);
+            }
+        }
+        // mapdict.py CacheEntry.w_method is the cache's sole GC
+        // reference. PyPy traces it as part of the live PyCode; do the same
+        // here now that managed code wrappers reach this direct-field walker.
+        if !code.mapdict_caches.is_null() {
+            for entry in (&mut *code.mapdict_caches).iter_mut().flatten() {
+                visitor(&mut *(&mut entry.w_method as *mut PyObjectRef as *mut majit_ir::GcRef));
+            }
+        }
     }
 }
 

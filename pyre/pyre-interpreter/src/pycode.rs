@@ -480,8 +480,9 @@ fn unregister_prebuilt_code_root(code: PyObjectRef) {
 }
 
 /// Trace every bootstrap/prebuilt code wrapper exactly as PyPy traces every
-/// live GC-managed `PyCode`. Nested code constants are handled by the raw
-/// walker's own mark-state analogue.
+/// live GC-managed `PyCode`. Every bootstrap wrapper is registered here, so
+/// the raw walker reports direct fields just like a GC trace callback; it does
+/// not need to recreate the collector's transitive mark walk.
 pub(crate) fn walk_prebuilt_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let Some(roots) = PREBUILT_CODE_ROOTS.get() else {
         return;
@@ -3223,7 +3224,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_code_root_walker_recurses_through_nested_code_constants() {
+    fn raw_code_root_walker_reports_one_gc_edge_at_a_time() {
         let code = compile_exec(
             "def outer():\n\
              \x20   def inner():\n\
@@ -3265,17 +3266,37 @@ mod tests {
         let w_outer = unsafe { w_code_const(w_top, outer_idx) };
         let w_inner = unsafe { w_code_const(w_outer, inner_idx) };
         let w_bigint = unsafe { w_code_const(w_inner, bigint_idx) };
-        let mut visited = false;
+        let mut top_reaches_outer = false;
+        let mut top_reaches_deep_value = false;
         unsafe {
             crate::eval::walk_raw_code_roots(w_top, &mut |root| {
+                if root.0 == w_outer as usize {
+                    top_reaches_outer = true;
+                }
                 if root.0 == w_bigint as usize {
-                    visited = true;
+                    top_reaches_deep_value = true;
                 }
             });
         }
         assert!(
-            visited,
-            "an outer PyCode root must trace realized constants in nested PyCode wrappers"
+            top_reaches_outer,
+            "a PyCode trace must report its directly-held child code"
+        );
+        assert!(
+            !top_reaches_deep_value,
+            "a GC trace callback must leave transitive traversal to the mark worklist"
+        );
+        let mut inner_reaches_bigint = false;
+        unsafe {
+            crate::eval::walk_raw_code_roots(w_inner, &mut |root| {
+                if root.0 == w_bigint as usize {
+                    inner_reaches_bigint = true;
+                }
+            });
+        }
+        assert!(
+            inner_reaches_bigint,
+            "the nested object's direct edge was lost"
         );
     }
 

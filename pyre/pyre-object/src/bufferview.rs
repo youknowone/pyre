@@ -556,6 +556,40 @@ impl BufferView {
         unsafe { self.gather_order(false) }
     }
 
+    /// Borrow the live byte run when this view already has the `BUF_SIMPLE`
+    /// shape PyPy's `StringUnmarshaller` consumes directly.
+    ///
+    /// A step-one slice over `Simple`/`Raw` is normalized into a
+    /// [`Buffer::Sub`] by [`new_slice`](Self::new_slice), so the common pyc
+    /// payload view remains in these two arms and [`Buffer::as_bytes`] already
+    /// applies its offset and length. More general geometry deliberately
+    /// returns `None`; callers then use [`gather`](Self::gather), preserving
+    /// the existing strided/N-D semantics without pretending it is one run.
+    ///
+    /// # Safety
+    /// The backing export must remain live and unresized while the returned
+    /// slice is used, exactly as for [`Buffer::as_bytes`].
+    pub unsafe fn as_contiguous_bytes(&self) -> Option<&'static [u8]> {
+        unsafe {
+            match self {
+                BufferView::Simple {
+                    backing, length, ..
+                }
+                | BufferView::Raw {
+                    backing, length, ..
+                } => {
+                    let bytes = backing.as_bytes();
+                    let length = ((*length).max(0) as usize).min(bytes.len());
+                    Some(&bytes[..length])
+                }
+                BufferView::Readonly { view, .. } => view.as_contiguous_bytes(),
+                BufferView::Slice { .. }
+                | BufferView::View1D { .. }
+                | BufferView::ViewND { .. } => None,
+            }
+        }
+    }
+
     /// The `PyBuffer_ToContiguous` copy for C order (`fortran == false`) or
     /// Fortran order (`fortran == true`).  CPython constructs destination
     /// strides for the requested order and copies matching logical indices;
@@ -638,6 +672,19 @@ mod tests {
     }
 
     #[test]
+    fn simple_step1_slice_borrows_its_exact_sub_window() {
+        let exporter = crate::bytesobject::w_bytes_from_bytes(b"0123456789");
+        let view = BufferView::Simple {
+            backing: Buffer::String { w_obj: exporter },
+            w_obj: exporter,
+            length: 10,
+        };
+        let sliced = unsafe { view.new_slice(2, 1, 5) };
+
+        assert_eq!(unsafe { sliced.as_contiguous_bytes() }, Some(&b"23456"[..]));
+    }
+
+    #[test]
     fn raw_step1_slice_scales_the_window_by_itemsize() {
         // RawBufferView.new_slice step==1 (buffer.py:262-265): the SubBuffer
         // window is `start * itemsize .. + slicelength * itemsize`.
@@ -672,6 +719,7 @@ mod tests {
     fn strided_step_wraps_in_a_slice_with_derived_geometry() {
         let s = unsafe { simple(10).new_slice(0, 2, 5) };
         assert!(matches!(s, BufferView::Slice { .. }));
+        assert!(unsafe { s.as_contiguous_bytes() }.is_none());
         unsafe {
             assert_eq!(s.native_shape(), vec![5]);
             assert_eq!(s.native_strides(), vec![2]);
