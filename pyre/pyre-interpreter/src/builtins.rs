@@ -4416,6 +4416,16 @@ pub fn is_builtin_getattr_function(callable: PyObjectRef) -> bool {
     is_builtin_code_function(callable, builtin_getattr)
 }
 
+/// True iff `callable` is the builtin `hasattr` function object.
+///
+/// The walker uses this to recognize the `hasattr(obj, name)` residual whose
+/// answer an instance-shape guard already settles: [`builtin_hasattr`] reports
+/// False only for the `AttributeError` its lookup raises, so an attribute the
+/// shape carries makes the call a constant True.
+pub fn is_builtin_hasattr_function(callable: PyObjectRef) -> bool {
+    is_builtin_code_function(callable, builtin_hasattr)
+}
+
 /// True iff `callable` is the builtin `locals` function object.
 ///
 /// The JIT walker uses this to recognize the `locals()` residual it can
