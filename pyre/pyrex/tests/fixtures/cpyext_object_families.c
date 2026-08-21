@@ -127,6 +127,30 @@ static PyObject *cx_as_ccomplex(PyObject *s, PyObject *o)
     return Py_BuildValue("(dd)", value.real, value.imag);
 }
 
+/* The pair a `complex` block carries, read straight out of the block rather
+   than through an accessor: the block only has room for it if `tp_basicsize`
+   says so. */
+static PyObject *cx_block(PyObject *s, PyObject *o)
+{
+    (void)s;
+    if (!PyComplex_Check(o)) return failed("not-a-complex");
+    if (Py_TYPE(o)->tp_basicsize < (Py_ssize_t)sizeof(PyComplexObject)) {
+        return failed("block-too-small");
+    }
+    Py_complex value = ((PyComplexObject *)o)->cval;
+    return Py_BuildValue("(dd)", value.real, value.imag);
+}
+
+/* What `complex` reports an instance is sized as, beside what this extension
+   was compiled believing. */
+static PyObject *cx_basicsize(PyObject *s, PyObject *unused)
+{
+    (void)s;
+    (void)unused;
+    return Py_BuildValue("(nn)", PyComplex_Type.tp_basicsize,
+                         (Py_ssize_t)sizeof(PyComplexObject));
+}
+
 /* ── weakref ──────────────────────────────────────────────────────────── */
 static PyObject *wr_check(PyObject *s, PyObject *o)
 { (void)s; return PyBool_FromLong(PyWeakref_Check(o)); }
@@ -191,8 +215,9 @@ static PyMethodDef methods[] = {
 
     M("cx_check", cx_check), M("cx_check_exact", cx_check_exact),
     M("cx_round_trip", cx_round_trip), M("cx_parts", cx_parts),
-    M("cx_as_ccomplex", cx_as_ccomplex),
+    M("cx_as_ccomplex", cx_as_ccomplex), M("cx_block", cx_block),
     {"cx_from_doubles", cx_from_doubles, METH_VARARGS, NULL},
+    {"cx_basicsize", cx_basicsize, METH_NOARGS, NULL},
 
     M("wr_check", wr_check), M("wr_check_ref", wr_check_ref),
     M("wr_check_proxy", wr_check_proxy), M("wr_new_ref", wr_new_ref),

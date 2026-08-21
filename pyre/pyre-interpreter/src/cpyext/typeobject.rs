@@ -180,6 +180,28 @@ pub struct CPyTypeObject {
     pub tp_versions_used: u16,
 }
 
+/// C-visible `PyHeapTypeObject`, the twin of the struct in
+/// `include/pyre3.14t/structmember.h`.
+///
+/// This is the shape every type mirror is allocated at, which is what
+/// `tp_basicsize` answers for `type` and the metaclasses derived from it.  The
+/// suites are the storage a type's own `tp_as_*` may name, and the references
+/// past them are a heap type's `__name__`, `__slots__`, `__qualname__` and
+/// `__module__`.
+#[repr(C)]
+pub struct CPyHeapTypeObject {
+    pub ht_type: CPyTypeObject,
+    pub as_async: CPyAsyncMethods,
+    pub as_number: CPyNumberMethods,
+    pub as_mapping: CPyMappingMethods,
+    pub as_sequence: CPySequenceMethods,
+    pub as_buffer: CPyBufferProcs,
+    pub ht_name: *mut CPyObject,
+    pub ht_slots: *mut CPyObject,
+    pub ht_qualname: *mut CPyObject,
+    pub ht_module: *mut CPyObject,
+}
+
 pub const PY_TPFLAGS_DEFAULT: std::ffi::c_ulong = 0;
 pub const PY_TPFLAGS_STATIC_BUILTIN: std::ffi::c_ulong = 1 << 1;
 pub const PY_TPFLAGS_HEAPTYPE: std::ffi::c_ulong = 1 << 9;
@@ -482,6 +504,22 @@ pub(super) unsafe fn forget_type_mirror(raw: *mut CPyObject) {
 /// The refcount is left as [`pyobject::attach`] set it: a synthesized mirror
 /// carries the ordinary link share and is released with the type it stands for,
 /// which is what keeps a class the extension merely observed collectable.
+/// What `tp_basicsize` a mirror of `type`, or of a metaclass derived from it,
+/// carries: an instance of one is a type, and every type mirror is a
+/// [`CPyHeapTypeObject`].  0 for every other type, which asks for the plain
+/// header.
+fn heap_type_basicsize(w_type: PyObjectRef) -> isize {
+    let class = match crate::typedef::gettypefor(&pyre_object::pyobject::TYPE_TYPE) {
+        Some(class) => class.as_ptr(),
+        None => return 0,
+    };
+    let derived = !w_type.is_null() && unsafe { crate::baseobjspace::issubtype_w(w_type, class) };
+    match derived {
+        true => size_of::<CPyHeapTypeObject>() as isize,
+        false => 0,
+    }
+}
+
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries.
 ///
 /// The modules whose mirrors have fields of their own each answer for their
@@ -492,9 +530,11 @@ pub(super) unsafe fn forget_type_mirror(raw: *mut CPyObject) {
 /// struct it declared.
 fn mirror_basicsize(w_type: PyObjectRef) -> isize {
     [
+        heap_type_basicsize(w_type),
         super::frameobject::basicsize(w_type),
         super::pyerrors::basicsize(w_type),
         super::cdatetime::basicsize(w_type),
+        super::complexobject::basicsize(w_type),
     ]
     .into_iter()
     .find(|&size| size != 0)

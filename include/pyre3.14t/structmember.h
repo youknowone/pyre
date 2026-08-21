@@ -94,6 +94,26 @@ struct _typeobject {
     uint16_t tp_versions_used;
 };
 
+/* The block every type is mirrored into.  The five method suites sit inside
+   it so that a type's own `tp_as_*` can name them without a second
+   allocation, and the four references past them are what a heap type answers
+   `__name__`, `__slots__`, `__qualname__` and `__module__` with. */
+typedef struct _heaptypeobject {
+    PyTypeObject ht_type;
+    PyAsyncMethods as_async;
+    PyNumberMethods as_number;
+    PyMappingMethods as_mapping;
+    PySequenceMethods as_sequence;
+    PyBufferProcs as_buffer;
+    PyObject *ht_name, *ht_slots, *ht_qualname;
+    PyObject *ht_module;
+} PyHeapTypeObject;
+
+/* The members a heap type declared, which follow its block rather than
+   sitting in it. */
+#define PyHeapType_GET_MEMBERS(etype) \
+    ((PyMemberDef *)(((char *)etype) + Py_TYPE(etype)->tp_basicsize))
+
 #ifdef __cplusplus
 }
 #endif

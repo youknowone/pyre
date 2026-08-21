@@ -131,6 +131,22 @@ eq('checks str', m.list_checks('x'), (0, 0, 0))
 # `PyType_HasFeature` over a static: ready, not a heap type, and a base.
 eq('flags', m.type_flags(), (1, 0, 1))
 
+# What a class reports is the size of *its instances*, so `type` and any
+# metaclass report the whole heap-type block.  An importer compares the two
+# numbers below and refuses the class outright when the first is the smaller.
+
+
+class Meta(type):
+    pass
+
+
+for name, klass in [('type', type), ('a metaclass', Meta)]:
+    size, declared = m.heap_type_sizes(klass)
+    eq('the block %s reports' % name, size >= declared, True)
+# A class whose instances are not types has no reason to be that large.
+eq('an ordinary class is not sized as a type',
+   m.heap_type_sizes(int)[0] < m.heap_type_sizes(type)[0], True)
+
 # ── the address as a converter argument ────────────────────────────────
 
 eq('O! list', m.parse_typed('list', [1, 2]), (1, 'list', None))

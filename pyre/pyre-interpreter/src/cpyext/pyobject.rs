@@ -139,7 +139,7 @@ pub fn type_mirror(w_obj: PyObjectRef) -> *mut CPyTypeObject {
 
 /// `w_obj`'s mirror, allocated on first demand.
 ///
-/// A type gets a `PyTypeObject`-shaped block by whichever route reaches it
+/// A type gets a `PyHeapTypeObject`-shaped block by whichever route reaches it
 /// first: `Py_TYPE(x)->tp_basicsize` is read off any type mirror, so a type may
 /// never receive the plain `PyObject`-sized block a non-type receives — a
 /// `PyModule_AddObject` of a class would otherwise decide the shape.
@@ -156,7 +156,7 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
             w_obj,
             REFCNT_FROM_PYRE,
             std::ptr::null_mut(),
-            size_of::<CPyTypeObject>(),
+            size_of::<super::typeobject::CPyHeapTypeObject>(),
         ) as *mut CPyTypeObject;
         super::typeobject::describe_interpreter_type(mirror, w_obj);
         // `typeobject.py:727-732`: the metatype is referenced from here only
@@ -171,11 +171,12 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
     }
     let ob_type = type_mirror(w_obj);
     let raw = attach(w_obj, REFCNT_FROM_PYRE, ob_type, mirror_size(ob_type));
-    // The two types whose mirrors carry fields of their own; every other block
+    // The types whose blocks carry fields past the header; every other block
     // this runtime hands out is exactly its header.
     super::frameobject::attach(raw, w_obj);
     super::pyerrors::attach(raw, w_obj);
     super::cdatetime::attach(raw, w_obj);
+    super::complexobject::attach(raw, w_obj);
     raw
 }
 

@@ -17,6 +17,58 @@ pub struct CPyComplex {
     pub imag: c_double,
 }
 
+/// `PyComplexObject` — `complexobject.py:19-21 PyComplexObjectFields`.
+#[repr(C)]
+pub struct CPyComplexObject {
+    pub ob_base: CPyObject,
+    pub cval: CPyComplex,
+}
+
+/// The `complex` class, or null before it is built.
+fn complex_type() -> PyObjectRef {
+    match crate::typedef::gettypefor(&pyre_object::COMPLEX_TYPE) {
+        Some(class) => class.as_ptr(),
+        None => pyre_object::PY_NULL,
+    }
+}
+
+/// What `tp_basicsize` a synthesized mirror of `w_type` carries —
+/// `complexobject.py:26-29 basestruct=PyComplexObject.TO` for `complex` and
+/// the classes derived from it, and 0 for every other type, which asks for the
+/// plain header.
+pub(super) fn basicsize(w_type: PyObjectRef) -> isize {
+    let class = complex_type();
+    let derived = !w_type.is_null()
+        && !class.is_null()
+        && unsafe { crate::baseobjspace::issubtype_w(w_type, class) };
+    match derived {
+        true => size_of::<CPyComplexObject>() as isize,
+        false => 0,
+    }
+}
+
+/// Fill a freshly allocated mirror — `complexobject.py:31-39 complex_attach`.
+pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
+    let tp = unsafe { (*raw).ob_type };
+    // Almost every block is smaller than this one, and that is one load.
+    if tp.is_null() || unsafe { (*tp).tp_basicsize } < size_of::<CPyComplexObject>() as isize {
+        return;
+    }
+    let w_type = match crate::typedef::r#type(w_obj) {
+        Some(w_type) => w_type.as_ptr(),
+        None => return,
+    };
+    if basicsize(w_type) == 0 {
+        return;
+    }
+    unsafe {
+        (*(raw as *mut CPyComplexObject)).cval = CPyComplex {
+            real: pyre_object::complexobject::w_complex_get_real(w_obj),
+            imag: pyre_object::complexobject::w_complex_get_imag(w_obj),
+        };
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyComplex_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };

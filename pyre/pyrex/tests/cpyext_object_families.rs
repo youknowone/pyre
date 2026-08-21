@@ -123,6 +123,17 @@ eq('as_ccomplex(__complex__)', m.cx_as_ccomplex(HasComplex()), (3.0, 4.0))
 eq('as_ccomplex(str) is refused', m.cx_as_ccomplex('1+2j'), 'ascomplex-failed')
 eq('as_ccomplex(list) is refused', m.cx_as_ccomplex([]), 'ascomplex-failed')
 
+# The pair sits in the block, so an extension that casts to `PyComplexObject`
+# reads the same numbers the accessors answer -- and the class has to say the
+# block is that large before the cast is allowed at all.
+size, declared = m.cx_basicsize()
+eq('complex says its block holds the pair', size >= declared, True)
+eq('the block of a complex', m.cx_block(1 + 2j), (1.0, 2.0))
+eq('the block of a negative complex', m.cx_block(-1.5 - 2.5j), (-1.5, -2.5))
+# A subclass is sized as its base, so its block carries the pair too.
+eq('the block of a subclass', m.cx_block(CX(1, 2)), (1.0, 2.0))
+eq('the block of a float', m.cx_block(2.5), 'not-a-complex')
+
 print('cpyext-complex-ok')
 "#;
 
