@@ -2566,6 +2566,24 @@ fn slot_descr_delete(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 ///
 /// The carriers are built before the type exists, so `__objclass__` is stamped
 /// once it does — the same shape `stamp_new_descr_self` uses for `__new__`.
+/// `tp_dict` — the namespace an extension reads and writes through the field.
+///
+/// `__Pyx_setup_reduce` stores `__reduce__` here and calls `PyType_Modified`
+/// afterwards, so the block has to be the type's own namespace: a copy would
+/// take the write and nothing would answer with it.  What is stored is the
+/// namespace's mirror, which stays put while the dict it links to moves.
+///
+/// The reference is never released, which is the whole of what a type mirror
+/// is: [`ready`] makes it immortal, and the namespace outlives the type no
+/// more than the type outlives itself.
+fn stamp_tp_dict(tp: *mut CPyTypeObject, w_type: PyObjectRef) {
+    let w_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type) } as PyObjectRef;
+    if w_dict.is_null() {
+        return;
+    }
+    unsafe { (*tp).tp_dict = pyobject::make_ref(w_dict) };
+}
+
 fn stamp_objclass(w_type: PyObjectRef, tp: *mut CPyTypeObject) {
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2723,6 +2741,7 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
             (*tp).tp_dictoffset != 0,
         )
     };
+    stamp_tp_dict(tp, pyre_object::gc_roots::shadow_stack_get(type_slot));
     stamp_objclass(pyre_object::gc_roots::shadow_stack_get(type_slot), tp);
 
     // The extension's own static becomes the type mirror: it is at a fixed
