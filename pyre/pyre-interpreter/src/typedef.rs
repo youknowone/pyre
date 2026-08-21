@@ -26084,13 +26084,16 @@ pub(crate) fn set_method_union(
     // crosses two full drains. `set_init_from_iterable_impl` pins for the same
     // reason: the set body is non-moving old-gen storage, but it still has to
     // be marked live instead of swept while Rust holds the only reference.
+    // The operands go on in one phase for a second reason: `args` is the stack
+    // copy the gateway built, and a minor rewrites the shadow slots rather
+    // than that copy, so reading operand two out of it after operand one has
+    // run a user `__hash__` answers a pre-move address.
     let _roots = pyre_object::gc_roots::push_roots();
-    let result_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(result);
-    for other in &args[1..] {
-        let _operand_root = pyre_object::gc_roots::push_roots();
-        let operand_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(*other);
+    let operand_base = pyre_object::gc_roots::publish_roots(&args[1..]);
+    let result_slot = pyre_object::gc_roots::publish_roots(&[result]);
+    pyre_object::gc_roots::normalize_roots(operand_base, args.len());
+    for index in 0..args.len() - 1 {
+        let operand_slot = operand_base + index;
         if unsafe {
             pyre_object::is_set_or_frozenset(pyre_object::gc_roots::shadow_stack_get(operand_slot))
         } {
@@ -26561,15 +26564,13 @@ fn set_method_update(
     // Rooted as `set_method_union`, except that the operands merge into
     // `args[0]` itself: a raw Rust slice the collector cannot see either.
     let _roots = pyre_object::gc_roots::push_roots();
-    let set_slot = pyre_object::gc_roots::shadow_stack_len();
-    pyre_object::gc_roots::pin_root(args[0]);
+    let set_slot = pyre_object::gc_roots::pin_roots(args);
+    let operand_base = set_slot + 1;
     // `setobject.py _descr_update` — a set operand's storage merges in
     // as it stands; only another iterable is walked and hashed element by
     // element.
-    for other in &args[1..] {
-        let _operand_root = pyre_object::gc_roots::push_roots();
-        let operand_slot = pyre_object::gc_roots::shadow_stack_len();
-        pyre_object::gc_roots::pin_root(*other);
+    for index in 0..args.len() - 1 {
+        let operand_slot = operand_base + index;
         if unsafe {
             pyre_object::is_set_or_frozenset(pyre_object::gc_roots::shadow_stack_get(operand_slot))
         } {
@@ -26603,10 +26604,21 @@ fn set_method_difference_update(
     if args.is_empty() {
         return Ok(pyre_object::w_none());
     }
-    for other in &args[1..] {
-        let w_other_as_set = set_operand_as_set(*other)?;
-        unsafe { pyre_object::w_set_difference_update_from_set(args[0], w_other_as_set) }
-            .map_err(crate::baseobjspace::map_set_update_error)?;
+    // Rooted as `set_method_update`: turning an operand into a set hashes its
+    // elements, so `args` is read once here and every later use comes off the
+    // root stack.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let set_slot = pyre_object::gc_roots::pin_roots(args);
+    for index in 1..args.len() {
+        let w_other_as_set =
+            set_operand_as_set(pyre_object::gc_roots::shadow_stack_get(set_slot + index))?;
+        unsafe {
+            pyre_object::w_set_difference_update_from_set(
+                pyre_object::gc_roots::shadow_stack_get(set_slot),
+                w_other_as_set,
+            )
+        }
+        .map_err(crate::baseobjspace::map_set_update_error)?;
     }
     Ok(pyre_object::w_none())
 }
