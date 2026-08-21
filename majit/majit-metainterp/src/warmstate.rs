@@ -731,14 +731,19 @@ impl WarmEnterState {
             let dead_token = has_seen_a_procedure_token && !has_procedure_token;
             // pyre's abort ceiling decides here rather than inside the trace
             // start.  `warmstate.py:425-444 bound_reached` traces
-            // unconditionally once entered, so upstream never reaches it with a
-            // cell that will then refuse; `MAX_TRACE_ABORT_COUNT` creates
-            // exactly that state.  `bound_reached`'s first act is
-            // `jitcounter.decay_all_counters()` (`warmstate.py:429`), so a cell
-            // that can never trace again would otherwise decay every OTHER
-            // loop's counter once per back edge and hold them below threshold.
-            // The answer for this cell is unchanged — `force_start_tracing*`
-            // returns `NotHot` for the same condition — only its timing is.
+            // unconditionally once past its own veto, so upstream never reaches
+            // the trace with a cell that will then refuse;
+            // `MAX_TRACE_ABORT_COUNT` creates exactly that state.  The decay
+            // is what makes the timing load-bearing: `bound_reached` calls
+            // `jitcounter.decay_all_counters()` at `warmstate.py:429`, so a
+            // cell that can never trace again would otherwise decay every
+            // OTHER loop's counter once per back edge and hold them below
+            // threshold.  Deciding above the decay is upstream's own shape,
+            // not a departure from it — `warmstate.py:427-428` returns on a
+            // `confirm_enter_jit` veto before reaching `:429`, and this
+            // ceiling is the veto in that position.  The answer for this cell
+            // is unchanged — `force_start_tracing*` returns `NotHot` for the
+            // same condition — only its timing is.
             // A latched cell that is ALSO dead takes the cleanup path instead:
             // leaving it in the chain is the same starvation in another form.
             if !dead_token && abort_count >= MAX_TRACE_ABORT_COUNT {
@@ -841,14 +846,19 @@ impl WarmEnterState {
             let dead_token = has_seen_a_procedure_token && !has_procedure_token;
             // pyre's abort ceiling decides here rather than inside the trace
             // start.  `warmstate.py:425-444 bound_reached` traces
-            // unconditionally once entered, so upstream never reaches it with a
-            // cell that will then refuse; `MAX_TRACE_ABORT_COUNT` creates
-            // exactly that state.  `bound_reached`'s first act is
-            // `jitcounter.decay_all_counters()` (`warmstate.py:429`), so a cell
-            // that can never trace again would otherwise decay every OTHER
-            // loop's counter once per back edge and hold them below threshold.
-            // The answer for this cell is unchanged — `force_start_tracing*`
-            // returns `NotHot` for the same condition — only its timing is.
+            // unconditionally once past its own veto, so upstream never reaches
+            // the trace with a cell that will then refuse;
+            // `MAX_TRACE_ABORT_COUNT` creates exactly that state.  The decay
+            // is what makes the timing load-bearing: `bound_reached` calls
+            // `jitcounter.decay_all_counters()` at `warmstate.py:429`, so a
+            // cell that can never trace again would otherwise decay every
+            // OTHER loop's counter once per back edge and hold them below
+            // threshold.  Deciding above the decay is upstream's own shape,
+            // not a departure from it — `warmstate.py:427-428` returns on a
+            // `confirm_enter_jit` veto before reaching `:429`, and this
+            // ceiling is the veto in that position.  The answer for this cell
+            // is unchanged — `force_start_tracing*` returns `NotHot` for the
+            // same condition — only its timing is.
             // A latched cell that is ALSO dead takes the cleanup path instead:
             // leaving it in the chain is the same starvation in another form.
             if !dead_token && abort_count >= MAX_TRACE_ABORT_COUNT {
