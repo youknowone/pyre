@@ -266,7 +266,7 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 /// `parent` marks the second row as a split of the first so the reader does not
 /// sum them.
 #[rustfmt::skip]
-pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 48] = [
+pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 56] = [
     // (label, site, parent)
     ("truth_int",                 "residual_call", "-"),
     ("truth_bool",                "residual_call", "-"),
@@ -286,10 +286,13 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 48] = [
     ("builtin_dict_get",          "residual_call", "-"),
     ("builtin_type_getattr",      "residual_call", "-"),
     ("builtin_range",             "residual_call", "-"),
+    ("builtin_zip",               "residual_call", "-"),
     ("builtin_locals",            "residual_call", "-"),
     ("sys_getframe",              "residual_call", "-"),
     ("math_sqrt",                 "residual_call", "-"),
     ("math_log_trig",             "residual_call", "-"),
+    ("math_frexp",                "residual_call", "-"),
+    ("math_ldexp",                "residual_call", "-"),
     ("math_isqrt",                "residual_call", "-"),
     ("int_call",                  "residual_call", "-"),
     ("float_call",                "residual_call", "-"),
@@ -305,16 +308,21 @@ pub const SPEC_FOLD_ROWS: [(&str, &str, &str); 48] = [
     ("subscr",                    "residual_call", "-"),
     ("binary_op_int",             "residual_call", "-"),
     ("binary_op_long_int",        "residual_call", "-"),
+    ("binary_op_long_int_shift",  "residual_call", "-"),
     ("binary_op_long_int_div",    "residual_call", "-"),
+    ("binary_op_long_int_pow",    "residual_call", "-"),
     ("binary_op_long",            "residual_call", "-"),
+    ("truediv_op_long",           "residual_call", "-"),
     ("binary_op_float",           "residual_call", "-"),
     ("compare_op_int",            "residual_call", "-"),
+    ("compare_op_long_int",       "residual_call", "-"),
     ("compare_op_long",           "residual_call", "-"),
     ("compare_op_float",          "residual_call", "-"),
     ("unpack",                    "residual_call", "-"),
     ("subscr_tuple",              "specialize",    "subscr"),
     ("subscr_specialised_pair",   "specialize",    "subscr"),
     ("builtin_divmod_long_int",   "specialize",    "builtin_divmod"),
+    ("zip_two_tuple_iters",       "specialize",    "for_iter_next"),
     ("instance_next",             "residual_call", "-"),
 ];
 

@@ -302,8 +302,8 @@ fn trace_abort_error(reason: &'static str) -> PyError {
 /// demotes); the shift ops additionally guard that the shift count fits a
 /// machine int, deopting a huge count to the generic leg (which produces the
 /// `space.newint` W_IntObject).
-/// True-divide is NOT here — it returns a float rather than a bigint, so it
-/// never reaches this table and stays on the generic residual.
+/// True-divide is NOT here — it returns a float (`CallPureF` + `wrapfloat`), so
+/// it has its own specialisation ([`try_walker_specialize_truediv_op_long`]).
 pub(crate) struct LongBinopSpec {
     /// Pure `rbigint` op over the two bare `*const BigInt` *payloads*
     /// `[Ref, Ref] -> Ref`. The walker emits this after a
