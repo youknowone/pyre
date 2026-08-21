@@ -902,15 +902,29 @@ def _dump_output_mismatch(actual, expected, limit=80):
 def _first_stderr_line(stderr):
     """Return `"  <first non-empty stderr line>"`, or `""` when there is none.
 
+    A traceback additionally carries its final line, which is the one that
+    names the exception.
+
     A crash reason is otherwise just an exit code, which on a binary that dies
     before it writes any stdout says nothing about why. The empty answer is
     itself informative: it names a process that produced no diagnostic at all.
+
+    An app-level crash is the one case where the first line carries nothing:
+    every Python traceback opens with the same banner, so a fixture that dies
+    on an assertion reports only `Traceback (most recent call last):` and the
+    CI log holds no other copy of the frames. The line that names the failure
+    is the last one, so append it — the same reason `_jit_panic_reason`
+    appends the message line that follows a Rust panic's location.
     """
-    for line in (stderr or "").splitlines():
-        line = line.strip()
-        if line:
-            return f"  {line[:160]}"
-    return ""
+    lines = [line.strip() for line in (stderr or "").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    reason = lines[0][:160]
+    banner = "Traceback (most recent call last):"
+    if len(lines) > 1 and any(line.startswith(banner) for line in lines):
+        reason += f" | {lines[-1][:400]}"
+    return f"  {reason}"
 
 
 def _jit_panic_reason(stderr):
