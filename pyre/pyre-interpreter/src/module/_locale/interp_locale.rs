@@ -278,7 +278,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // is Windows-only.  The locale name is built from the user's ISO
     // language and territory and reports the active ANSI code page separately.
     // PyPy publishes the same two-item shape from `getdefaultlocale`.
-    #[cfg(windows)]
+    #[cfg(all(windows, not(feature = "sandbox")))]
     crate::module_ns_store(
         ns,
         "_getdefaultlocale",
@@ -625,5 +625,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 crate::make_builtin_function(name, locale_unavailable),
             );
         }
+        // `_getdefaultlocale` reads the user's locale and the active ANSI code
+        // page, so it is host state on the same terms.
+        #[cfg(windows)]
+        crate::module_ns_store(
+            ns,
+            "_getdefaultlocale",
+            crate::make_builtin_function_with_arity(
+                "_getdefaultlocale",
+                locale_unavailable,
+                0,
+            ),
+        );
     }
 }

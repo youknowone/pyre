@@ -113,7 +113,14 @@ impl W_WindowsConsoleIO {
         self.check_closed()?;
         let handle = host_nt::handle_from_fd(self.fd);
         if host_nt::is_invalid_handle(handle) {
-            return Err(io_error(std::io::Error::last_os_error(), PY_NULL));
+            // `_get_osfhandle` rejects a bad descriptor through `errno`, not
+            // `GetLastError`, so this is an `EBADF` `OSError` with no
+            // `winerror` slot - `_Py_get_osfhandle` raises it with
+            // `PyErr_SetFromErrno`.
+            return Err(crate::PyError::os_error_syscall(
+                crate::builtins::crt_errno(),
+                PY_NULL,
+            ));
         }
         Ok(handle)
     }
@@ -362,11 +369,18 @@ impl W_WindowsConsoleIO {
         let close_error = Self::from_slot(self_slot).close_descriptor().err();
         match (flush_error, close_error) {
             (Some(mut flush), Some(mut close)) => {
+                let flush_slot = pyre_object::gc_roots::shadow_stack_len();
                 let flush_obj = flush.to_exc_object();
                 pyre_object::gc_roots::pin_root(flush_obj);
+                // The second `to_exc_object` allocates, so a moving collection
+                // can run between the pin and the read: it forwards the slot,
+                // never the local copy above.
                 let close_obj = close.to_exc_object();
                 unsafe {
-                    pyre_object::interp_exceptions::w_exception_set_context(close_obj, flush_obj)
+                    pyre_object::interp_exceptions::w_exception_set_context(
+                        close_obj,
+                        pyre_object::gc_roots::shadow_stack_get(flush_slot),
+                    )
                 };
                 close.exc_object = close_obj;
                 Err(close)
