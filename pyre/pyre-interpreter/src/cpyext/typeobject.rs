@@ -485,8 +485,11 @@ pub(super) unsafe fn forget_type_mirror(raw: *mut CPyObject) {
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries.
 ///
 /// The modules whose mirrors have fields of their own each answer for their
-/// own types and 0 for everything else; 0 is the plain header, which is what
-/// every other type this runtime defines gets.
+/// own types and 0 for everything else; every other type this runtime defines
+/// is exactly the header, and says so.  A ready type never carries a zero
+/// here -- an extension reads the field to size an allocation, and Cython's
+/// `__Pyx_ImportType` refuses to import a class whose basicsize is under the
+/// struct it declared.
 fn mirror_basicsize(w_type: PyObjectRef) -> isize {
     [
         super::frameobject::basicsize(w_type),
@@ -494,7 +497,7 @@ fn mirror_basicsize(w_type: PyObjectRef) -> isize {
     ]
     .into_iter()
     .find(|&size| size != 0)
-    .unwrap_or(0)
+    .unwrap_or(size_of::<CPyObject>() as isize)
 }
 
 pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
