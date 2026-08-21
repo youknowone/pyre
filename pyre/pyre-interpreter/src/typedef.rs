@@ -22220,9 +22220,6 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     crate::type_methods::arity_at_least(pos, "replace", 2)?;
     crate::type_methods::arity_at_most(pos, "replace", 3)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
-    let old = require_bytes_like(pos[1])?;
-    let new = require_bytes_like(pos[2])?;
     let limit = match pos.get(3) {
         Some(&w_count) if !w_count.is_null() => {
             let c = crate::builtins::space_index_w(w_count)?;
@@ -22230,6 +22227,12 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
         _ => usize::MAX,
     };
+    // Borrowed after the coercions, as `bytes_method_ljust`: all three
+    // operands may be bytearrays, and the `__index__` above can resize any of
+    // them.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    let old = require_bytes_like(pos[1])?;
+    let new = require_bytes_like(pos[2])?;
     let (out, replacements) = replace_bytes(data, old, new, limit);
     // `descr_replace` returns `self` when nothing was replaced
     // (unicodeobject.py for the str twin) — keyed on the count, so
@@ -22496,9 +22499,12 @@ fn bytes_fill_char(args: &[PyObjectRef], idx: usize, method: &str) -> Result<u8,
 /// `stringmethods.py:descr_ljust` — left-justify within `width`.
 fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_between(args, "ljust", 1, 2)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "ljust")?;
+    // Borrowed after the coercions, not before: `__index__` on `width` runs
+    // Python, and a `bytearray` receiver resized there reallocates the buffer
+    // this slice points into.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let len = data.len() as i64;
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
@@ -22512,9 +22518,10 @@ fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// `stringmethods.py:descr_rjust` — right-justify within `width`.
 fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_between(args, "rjust", 1, 2)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "rjust")?;
+    // Borrowed after the coercions, as `bytes_method_ljust`.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let len = data.len() as i64;
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
@@ -22530,9 +22537,10 @@ fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// left-offset.
 fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_between(args, "center", 1, 2)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
     let fill = bytes_fill_char(args, 2, "center")?;
+    // Borrowed after the coercions, as `bytes_method_ljust`.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let len = data.len() as i64;
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
@@ -22550,8 +22558,9 @@ fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// keeping a leading `+`/`-` sign ahead of the zeros.
 fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_exact(args, "zfill", 1)?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let width = crate::builtins::space_index_w(args[1])?;
+    // Borrowed after the coercions, as `bytes_method_ljust`.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
     let len = data.len() as i64;
     if width <= len {
         return Ok(new_bytes_like(args[0], data));
