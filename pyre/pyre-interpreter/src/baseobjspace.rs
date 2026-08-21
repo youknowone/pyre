@@ -1758,13 +1758,22 @@ fn string_index_type_error(index: PyObjectRef) -> PyError {
 
 #[inline(never)]
 unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let mut obj = obj;
     if is_slice(index) {
         let len = w_list_len(obj) as i64;
-        let (rs, rp, st) = crate::sliceobject::slice_unpack(
-            w_slice_get_start(index),
-            w_slice_get_stop(index),
-            w_slice_get_step(index),
-        )?;
+        let (rs, rp, st) = {
+            // Every slice component goes through `__index__`, so this runs
+            // Python and a minor collection can move the list underneath.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let unpacked = crate::sliceobject::slice_unpack(
+                w_slice_get_start(index),
+                w_slice_get_stop(index),
+                w_slice_get_step(index),
+            )?;
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            unpacked
+        };
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
         let mut items = Vec::new();
@@ -1788,7 +1797,17 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = {
+            // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
+            // before dispatching here, so nothing else roots it across the
+            // call. A list is nursery-allocated, so read the address back —
+            // a minor collection during the call moves it.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+            let indexed = space_index(index)?;
+            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            indexed
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -1823,11 +1842,17 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     if is_slice(index) {
         // tupleobject.py descr_getslice → slice.indices.
         let len = w_tuple_len(obj) as i64;
-        let (rs, rp, st) = crate::sliceobject::slice_unpack(
-            w_slice_get_start(index),
-            w_slice_get_stop(index),
-            w_slice_get_step(index),
-        )?;
+        let (rs, rp, st) = {
+            // `slice_unpack` runs each component's `__index__`; the tuple is
+            // rooted for that window and does not move.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            crate::sliceobject::slice_unpack(
+                w_slice_get_start(index),
+                w_slice_get_stop(index),
+                w_slice_get_step(index),
+            )?
+        };
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
         let mut items = Vec::new();
@@ -1847,7 +1872,15 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = {
+            // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
+            // before dispatching here, so nothing else roots it across the
+            // call. A tuple never moves, so the root is for liveness alone
+            // and the address in hand stays correct.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            space_index(index)?
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -1893,11 +1926,17 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // → `slice.indices(len)` (`pypy/objspace/std/sliceobject.py`).
         // Use the shared adjusted slice count so very large steps do not
         // overflow the index loop.
-        let (rs, rp, st) = crate::sliceobject::slice_unpack(
-            w_slice_get_start(index),
-            w_slice_get_stop(index),
-            w_slice_get_step(index),
-        )?;
+        let (rs, rp, st) = {
+            // `slice_unpack` runs each component's `__index__`; the string is
+            // rooted for that window and does not move.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            crate::sliceobject::slice_unpack(
+                w_slice_get_start(index),
+                w_slice_get_stop(index),
+                w_slice_get_step(index),
+            )?
+        };
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len as i64);
         // `_unicode_sliced` (unicodeobject.py) cuts the utf8
@@ -1927,7 +1966,15 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = {
+            // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
+            // before dispatching here, so nothing else roots it across the
+            // call. A str never moves, so the root is for liveness alone
+            // and the address in hand stays correct.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            space_index(index)?
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -1970,11 +2017,18 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // mutate a bytearray), then use `adjust_indices`' explicit slice
         // length.  Iterating by that count also avoids overflowing on the
         // final `start + step` for a step near `sys.maxsize`.
-        let (rs, rp, st) = crate::sliceobject::slice_unpack(
-            w_slice_get_start(index),
-            w_slice_get_stop(index),
-            w_slice_get_step(index),
-        )?;
+        let (rs, rp, st) = {
+            // `slice_unpack` runs each component's `__index__`; the operand is
+            // rooted for that window and neither `bytes` nor `bytearray`
+            // moves.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            crate::sliceobject::slice_unpack(
+                w_slice_get_start(index),
+                w_slice_get_stop(index),
+                w_slice_get_step(index),
+            )?
+        };
         let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -2014,7 +2068,15 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = {
+            // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
+            // before dispatching here, so nothing else roots it across the
+            // call. A bytes-like operand never moves, so the root is for liveness alone
+            // and the address in hand stays correct.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            space_index(index)?
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -2179,7 +2241,14 @@ unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         return range_compute_slice(obj, index);
     }
     // `_compute_item` — `space.index(w_index)` then bounds-check.
-    let w_index = space_index(index)?;
+    let w_index = {
+        // `_compute_item` runs `__index__`, which is user code; the range is
+        // popped off the operand stack before this dispatch, so it needs the
+        // root to survive a collection there.
+        let _roots = pyre_object::gc_roots::push_roots();
+        pyre_object::gc_roots::pin_root(obj);
+        space_index(index)?
+    };
     let idx = pyre_object::range_obj_to_bigint(w_index);
     match pyre_object::w_range_compute_item(obj, &idx) {
         Some(v) => Ok(v),
@@ -3859,6 +3928,8 @@ pub(crate) fn setitem_slot(obj: PyObjectRef, index: PyObjectRef, value: PyObject
 
 #[inline(never)]
 unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let mut obj = obj;
+    let mut value = value;
     if is_slice(index) {
         return setitem_list_slice(obj, index, value);
     }
@@ -3867,7 +3938,18 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = {
+            // `STORE_SUBSCR` pops all three operands before dispatching here,
+            // so nothing roots the list or the assigned value across this
+            // `__index__` call. Both are read back: the list is
+            // nursery-allocated, and the value is whatever the caller wrote.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[obj, value]);
+            let indexed = space_index(index)?;
+            obj = pyre_object::gc_roots::shadow_stack_get(base);
+            value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+            indexed
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -4084,6 +4166,7 @@ pub(crate) unsafe fn getindex_w_index(index: PyObjectRef) -> Result<i64, PyError
 
 #[inline(never)]
 unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+    let mut value = value;
     if is_slice(index) {
         return setitem_bytearray_slice(obj, index, value);
     }
@@ -4098,7 +4181,17 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = space_index(index)?;
+        let indexed = {
+            // `STORE_SUBSCR` pops all three operands before dispatching here.
+            // The bytearray needs the root to stay alive across this
+            // `__index__`; the assigned value additionally gets read back,
+            // since the caller may have written a movable object.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[obj, value]);
+            let indexed = space_index(index)?;
+            value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+            indexed
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -4122,7 +4215,13 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let v = if is_int(value) {
         w_int_get_value(value)
     } else {
-        let indexed = space_index(value)?;
+        let indexed = {
+            // The value's own `__index__` runs Python too, and the bytearray
+            // written below is still unrooted at this point.
+            let _roots = pyre_object::gc_roots::push_roots();
+            pyre_object::gc_roots::pin_root(obj);
+            space_index(value)?
+        };
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -4244,12 +4343,22 @@ unsafe fn setitem_bytearray_slice(
     // components' `__index__` may mutate the bytearray, and the bounds must be
     // clamped against the post-mutation length. (`x[:] = x` stays safe — the
     // source is copied into `sequence2`.)
-    let sequence2 = bytearray_assign_source(value)?;
-    let (rs, rp, st) = crate::sliceobject::slice_unpack(
-        w_slice_get_start(index),
-        w_slice_get_stop(index),
-        w_slice_get_step(index),
-    )?;
+    // Both steps run Python — draining an arbitrary iterable source, then
+    // every slice component's `__index__` — and `STORE_SUBSCR` popped the
+    // receiver and the slice before dispatching here, so root them across the
+    // pair. A bytearray does not move; the root is for liveness alone.
+    let (sequence2, rs, rp, st) = {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
+        let sequence2 = bytearray_assign_source(value)?;
+        let index = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        (sequence2, rs, rp, st)
+    };
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let (start, stop, step, slicelength) =
         crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -19366,13 +19475,24 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
 pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
+        // `DELETE_SUBSCR` pops both operands before dispatching here, so the
+        // container below is a bare address for the rest of this function.
+        let mut obj = obj;
         if is_list(obj) {
             if is_slice(index) {
-                let (raw_start, raw_stop, step) = crate::sliceobject::slice_unpack(
-                    w_slice_get_start(index),
-                    w_slice_get_stop(index),
-                    w_slice_get_step(index),
-                )?;
+                let (raw_start, raw_stop, step) = {
+                    // Every slice component runs `__index__`, so a minor
+                    // collection there moves this nursery-allocated list.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                    let unpacked = crate::sliceobject::slice_unpack(
+                        w_slice_get_start(index),
+                        w_slice_get_stop(index),
+                        w_slice_get_step(index),
+                    )?;
+                    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    unpacked
+                };
                 let len = w_list_len(obj) as i64;
                 let (start, stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, len);
@@ -19432,7 +19552,15 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             let i = if is_int(index) {
                 w_int_get_value(index)
             } else {
-                subscript_index_w("list", index)?
+                {
+                    // `__index__` is user code; the list moves under a minor
+                    // collection taken there.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                    let i = subscript_index_w("list", index)?;
+                    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    i
+                }
             };
             let len = w_list_len(obj) as i64;
             let idx = if i < 0 { len + i } else { i };
@@ -19459,11 +19587,17 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             // delete shrinks the buffer) while an export is outstanding.
             crate::builtins::bytearray_check_exports(obj)?;
             if is_slice(index) {
-                let (rs, rp, st) = crate::sliceobject::slice_unpack(
-                    w_slice_get_start(index),
-                    w_slice_get_stop(index),
-                    w_slice_get_step(index),
-                )?;
+                let (rs, rp, st) = {
+                    // Rooted for the components' `__index__` calls; a
+                    // bytearray does not move, so this is liveness alone.
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    pyre_object::gc_roots::pin_root(obj);
+                    crate::sliceobject::slice_unpack(
+                        w_slice_get_start(index),
+                        w_slice_get_stop(index),
+                        w_slice_get_step(index),
+                    )?
+                };
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
                 let (start, stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -19499,7 +19633,11 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
                 return Ok(());
             }
-            let i = subscript_index_w("bytearray", index)?;
+            let i = {
+                let _roots = pyre_object::gc_roots::push_roots();
+                pyre_object::gc_roots::pin_root(obj);
+                subscript_index_w("bytearray", index)?
+            };
             let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
             let idx = if i < 0 { len + i } else { i };
             if idx >= 0 && idx < len {
