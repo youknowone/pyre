@@ -1760,7 +1760,6 @@ fn string_index_type_error(index: PyObjectRef) -> PyError {
 unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
     if is_slice(index) {
-        let len = w_list_len(obj) as i64;
         let (rs, rp, st) = {
             // Every slice component goes through `__index__`, so this runs
             // Python and a minor collection can move the list underneath.
@@ -1774,6 +1773,10 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             unpacked
         };
+        // The length is read after the unpack, not before: a component's
+        // `__index__` may have appended to or truncated this very list, and
+        // the bounds are clamped against what it holds now.
+        let len = w_list_len(obj) as i64;
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
         let mut items = Vec::new();

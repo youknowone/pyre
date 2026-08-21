@@ -770,18 +770,24 @@ pub fn binary_slice_values(
         let start = roots.get(start_slot);
         let stop = roots.get(stop_slot);
         if pyre_object::is_list(obj) {
-            let len = pyre_object::w_list_len(obj) as i64;
             let s = if pyre_object::is_none(start) {
                 0
             } else {
                 crate::sliceobject::eval_slice_index(start)?
             };
             let stop = roots.get(stop_slot);
-            let e = if pyre_object::is_none(stop) {
-                len
+            let raw_e = if pyre_object::is_none(stop) {
+                None
             } else {
-                crate::sliceobject::eval_slice_index(stop)?
+                Some(crate::sliceobject::eval_slice_index(stop)?)
             };
+            // The length comes after both bounds have been converted: a
+            // bound's own `__index__` may have resized this very list, and it
+            // is what the omitted `stop` defaults to and what a negative bound
+            // folds against.  Read off the root slot, since the same call is
+            // what may have moved the list.
+            let len = pyre_object::w_list_len(roots.get(obj_slot)) as i64;
+            let e = raw_e.unwrap_or(len);
             let s = if s < 0 { (len + s).max(0) } else { s.min(len) } as usize;
             let e = if e < 0 { (len + e).max(0) } else { e.min(len) } as usize;
             // A fetch off an unboxed strategy boxes the element it returns, so

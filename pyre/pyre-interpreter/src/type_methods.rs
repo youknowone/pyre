@@ -854,9 +854,9 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let list = args[0];
     let value = args[1];
     // listobject.py:799 unwrap_spec defaults: w_start=0 / w_stop=sys.maxint.
-    // listobject.py:803 unwrap_start_stop handles negative normalization,
-    // __index__ coercion and TypeError for non-index arguments.
-    let size = unsafe { pyre_object::w_list_len(list) } as i64;
+    // listobject.py:803 `unwrap_start_stop` folds the negative bounds against
+    // the length it was handed; the two halves are called separately below so
+    // the length can be read after the coercion instead.
     let w_start = if args.len() >= 3 {
         args[2]
     } else {
@@ -876,9 +876,13 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let sp = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(list);
     pyre_object::gc_roots::pin_root(value);
-    let (start, stop) = crate::sliceobject::unwrap_start_stop_not_none(size, w_start, w_stop)?;
+    let (raw_start, raw_stop) = crate::sliceobject::index_bounds_not_none(w_start, w_stop)?;
     let list = pyre_object::gc_roots::shadow_stack_get(sp);
     let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+    // The length that folds a negative bound is read after the bounds have
+    // been converted: their `__index__` may have resized this very list.
+    let size = unsafe { pyre_object::w_list_len(list) } as i64;
+    let (start, stop) = crate::sliceobject::adapt_start_stop(size, raw_start, raw_stop);
     match crate::listobject::w_list_find_or_count(list, value, start, stop, false)? {
         crate::listobject::FindOrCountResult::Index(i) => Ok(w_int_new(i)),
         crate::listobject::FindOrCountResult::NotFound => {
