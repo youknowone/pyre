@@ -1,5 +1,6 @@
 //! Deriving in Python from a type an extension defined: what the subtype's own
-//! mirror carries, and what a C constructor handed that subtype can do with it.
+//! mirror carries, what a C constructor handed that subtype can do with it, and
+//! the iteration slots a caller reads off a type this runtime defines.
 //!
 //! The shape is Cython's, whose every `cdef class` compiles a `tp_new` that
 //! reads `tp_alloc` and the struct size off the type it is called with.
@@ -121,6 +122,88 @@ eq('and the module still builds', m.Cell(15).value, 15)
 gc.collect()
 eq('the subtype survives a collection', Sub(16, 'd').doubled(), 32)
 eq('and its mirror still names its base', m.slots_of(Sub)['base'], m.Cell)
+
+
+# ── the iteration slots ────────────────────────────────────────────────
+
+# A compiled loop takes `tp_iter` off the type and then `tp_iternext` off the
+# iterator, rather than calling `PyObject_GetIter` and `PyIter_Next`.  A type
+# this runtime defines has to carry both, or the loop dereferences a null.
+
+
+class Counted:
+    def __init__(self, upto):
+        self.upto = upto
+
+    def __iter__(self):
+        return iter(range(self.upto))
+
+
+class OwnIterator:
+    def __init__(self):
+        self.left = 2
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.left == 0:
+            raise StopIteration
+        self.left -= 1
+        return self.left
+
+
+for name, walked, wanted in [
+        ('a list', [1, 2, 3], [1, 2, 3]),
+        ('a tuple', (1, 2), [1, 2]),
+        ('a str', 'ab', ['a', 'b']),
+        ('a set', {7}, [7]),
+        ('a dict', {'k': 1}, ['k']),
+        ('a range', range(3), [0, 1, 2]),
+        ('a generator', (x * 2 for x in range(3)), [0, 2, 4]),
+        ('a class with __iter__', Counted(3), [0, 1, 2]),
+        ('a class with both', OwnIterator(), [1, 0])]:
+    eq('walking %s through its slots' % name, m.walk_slots(walked), wanted)
+
+
+class L(list):
+    pass
+
+
+class T(tuple):
+    pass
+
+
+eq('walking a list subclass', m.walk_slots(L([4, 5])), [4, 5])
+eq('walking a tuple subclass', m.walk_slots(T((6,))), [6])
+
+# The slot is only there where the method is: an object that is not iterable
+# carries no `tp_iter` to read.
+eq('a class with no __iter__', m.walk_slots(object()), 'no-tp_iter')
+
+# And an iterator's own `__next__` is not published back as a method of the
+# type -- the slot that reaches it resolves the same name.
+eq('the method a walked iterator answers with',
+   type(iter([1])).__next__.__qualname__.endswith('__next__'), True)
+eq('and it still works from Python', next(iter([9])), 9)
+
+
+# ── an exception the walk raises ───────────────────────────────────────
+
+class Angry:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise ValueError('no')
+
+
+try:
+    m.walk_slots(Angry())
+except ValueError as exc:
+    eq('the exception a slot walk reports', str(exc), 'no')
+else:
+    raise AssertionError('a raising __next__ was read as exhaustion')
 
 print('cpyext-derive-ok')
 "#;

@@ -690,6 +690,75 @@ fn base_mirror(w_type: PyObjectRef) -> *mut CPyTypeObject {
     pyobject::make_ref(w_base) as *mut CPyTypeObject
 }
 
+/// `slotdefs.py slot_tp_iter` — `iter(self)` for a type this runtime defines.
+unsafe extern "C" fn interp_tp_iter(raw: *mut CPyObject) -> *mut CPyObject {
+    let Some(w_self) = super::object::argument(raw) else {
+        return std::ptr::null_mut();
+    };
+    super::object::result(crate::baseobjspace::iter(w_self))
+}
+
+/// `slotdefs.py slot_tp_iternext`.
+///
+/// Exhaustion is NULL with the indicator clear, which is what a caller that
+/// read this slot off the type distinguishes from a failure.
+unsafe extern "C" fn interp_tp_iternext(raw: *mut CPyObject) -> *mut CPyObject {
+    let Some(w_self) = super::object::argument(raw) else {
+        return std::ptr::null_mut();
+    };
+    match crate::baseobjspace::next(w_self) {
+        Ok(w_item) => pyobject::make_ref(w_item),
+        Err(mut error) => {
+            if !super::iterator::is_stop_iteration(&mut error) {
+                super::pyerrors::set_pending_error(error);
+            }
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The slots this runtime fills on a mirror to reach a method it answers for
+/// itself, and the method whose presence earns each one --
+/// `typeobject.py update_all_slots_builtin` over `slotdefs`.
+///
+/// Only the iteration pair so far.  A caller that reads `tp_iternext` off the
+/// type instead of calling `PyIter_Next` -- which is what every loop a Cython
+/// module compiles does, for anything but an exact `list` or `tuple` -- has no
+/// other way to reach a `__next__` written here, and reads the NULL as a
+/// failure with no exception to report.
+const INTERPRETER_SLOTS: [(
+    &str,
+    unsafe extern "C" fn(*mut CPyObject) -> *mut CPyObject,
+    fn(*mut CPyTypeObject, *const c_void),
+); 2] = [
+    ("__iter__", interp_tp_iter, |tp, slot| unsafe {
+        (*tp).tp_iter = slot
+    }),
+    ("__next__", interp_tp_iternext, |tp, slot| unsafe {
+        (*tp).tp_iternext = slot
+    }),
+];
+
+/// Is `slot` one this runtime installed to reach a method of its own?
+///
+/// Such a slot must never be published back as that method: the call it makes
+/// resolves the name again, and a published wrapper would answer with itself.
+fn is_interpreter_slot(slot: *const c_void) -> bool {
+    INTERPRETER_SLOTS
+        .iter()
+        .any(|&(_, function, _)| std::ptr::eq(slot, function as *const c_void))
+}
+
+/// `typeobject.py update_all_slots_builtin` — fill the slots `w_type` answers
+/// for itself.
+fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
+    for (method, function, store) in INTERPRETER_SLOTS {
+        if unsafe { crate::baseobjspace::lookup_in_type(w_type, method) }.is_some() {
+            store(mirror, function as *const c_void);
+        }
+    }
+}
+
 /// `typeobject.py:1065-1092 finish_type_2` — the half of the fill that reads
 /// the base's own slots.
 ///
@@ -725,6 +794,9 @@ pub(super) fn finish_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyObje
     if unsafe { (*mirror).tp_dict.is_null() } {
         stamp_tp_dict(mirror, w_type);
     }
+    // Last, as `type_attach` runs it: what the type answers for itself wins
+    // over what the base handed down.
+    fill_interpreter_slots(mirror, w_type);
 }
 
 /// `typeobject.py:945-996 inherit_slots` — what a mirror takes from its base.
@@ -2621,7 +2693,7 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         ("__next__", |tp| unsafe { (*tp).tp_iternext }, slot_iternext),
     ];
     for (dunder, pick, wrapper) in unary {
-        if !pick(tp).is_null() {
+        if !pick(tp).is_null() && !is_interpreter_slot(pick(tp)) {
             store(
                 ns,
                 dunder,

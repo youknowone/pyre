@@ -156,6 +156,53 @@ static PyObject *slots_of(PyObject *self, PyObject *type)
         "base", t->tp_base == NULL ? Py_None : (PyObject *)t->tp_base);
 }
 
+/* Walk `o` the way a compiled loop does: take `tp_iter` off the type, call
+   it, then call the iterator's own `tp_iternext` until it answers NULL.  A
+   NULL slot is reported rather than called, because that is what a caller
+   would otherwise dereference. */
+static PyObject *walk_slots(PyObject *self, PyObject *o)
+{
+    (void)self;
+    getiterfunc get = Py_TYPE(o)->tp_iter;
+    if (get == NULL) {
+        return PyUnicode_FromString("no-tp_iter");
+    }
+    PyObject *it = get(o);
+    if (it == NULL) {
+        return NULL;
+    }
+    iternextfunc next = Py_TYPE(it)->tp_iternext;
+    if (next == NULL) {
+        Py_DECREF(it);
+        return PyUnicode_FromString("no-tp_iternext");
+    }
+    PyObject *seen = PyList_New(0);
+    if (seen == NULL) {
+        Py_DECREF(it);
+        return NULL;
+    }
+    for (;;) {
+        PyObject *item = next(it);
+        if (item == NULL) {
+            break;
+        }
+        if (PyList_Append(seen, item) < 0) {
+            Py_DECREF(item);
+            Py_DECREF(seen);
+            Py_DECREF(it);
+            return NULL;
+        }
+        Py_DECREF(item);
+    }
+    Py_DECREF(it);
+    /* Exhaustion leaves nothing behind; anything else is the walk failing. */
+    if (PyErr_Occurred()) {
+        Py_DECREF(seen);
+        return NULL;
+    }
+    return seen;
+}
+
 /* Whether the constructor the subtype carries is the one its base declared. */
 static PyObject *shares_new(PyObject *self, PyObject *args)
 {
@@ -186,6 +233,7 @@ static PyObject *undisturbed(PyObject *self, PyObject *unused)
 
 static PyMethodDef methods[] = {
     {"slots_of", slots_of, METH_O, NULL},
+    {"walk_slots", walk_slots, METH_O, NULL},
     {"shares_new", shares_new, METH_VARARGS, NULL},
     {"undisturbed", undisturbed, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};
