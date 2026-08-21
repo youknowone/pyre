@@ -4906,7 +4906,7 @@ impl MiniMarkGC {
     /// terminator in [`Self::do_get_referents`] — because upstream passes the
     /// one `try_cast_gcref_to_w_root` to all three.
     fn is_app_level_object_ref(&self, obj: GcRef) -> bool {
-        // `referents.py:18 rgc.get_gcflag_dummy(gcref)`: a dummy stands in for
+        // `referents.py rgc.get_gcflag_dummy(gcref)`: a dummy stands in for
         // an object the collector no longer holds, so it is never an app-level
         // object however its type reads.  Only a managed object carries the
         // header the flag lives in.

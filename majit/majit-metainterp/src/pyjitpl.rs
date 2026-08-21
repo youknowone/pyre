@@ -3395,7 +3395,7 @@ impl<M: Clone> MetaInterp<M> {
     /// that is not.
     ///
     /// Pairs with `JitCellToken::outermost_jitdriver_index`
-    /// (`compile.py:168 jitcell_token.outermost_jitdriver_sd = jitdriver_sd`):
+    /// (`compile.py jitcell_token.outermost_jitdriver_sd = jitdriver_sd`):
     /// a guard-failure consumer holding only a descr recovers the owning
     /// driver through the token chain and asks this, instead of being handed
     /// the answer by its caller.
@@ -6170,7 +6170,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         driver_descriptor: Option<&JitDriverStaticData>,
     ) {
-        // `compile.py:168 jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
+        // `compile.py jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
         // is already set by `make_jitcell_token` at the call site; this
         // helper only fills the pyre-specific fields (`green_key`,
         // `virtualizable_arg_index`) used by warmstate cell lookup and the
@@ -6465,7 +6465,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // `unroll.py disable_retracing_if_max_retrace_guards` writes
         // `retraced_count = sys.maxint`, and the one reader of that value is
-        // `unroll.py:216 if cell_token.retraced_count < limit` — it stops the
+        // `unroll.py if cell_token.retraced_count < limit` — it stops the
         // cell from RETRACING and nothing else. Upstream never lets it decide
         // whether a loop may be compiled: `pyjitpl.py:3185-3189` gives up on a
         // key that already has compiled targets, which the
@@ -6489,7 +6489,7 @@ impl<M: Clone> MetaInterp<M> {
         // gets a fresh `JitCellToken` (`compile.py:220` and `:266` both call
         // `make_jitcell_token`), whose count starts at zero. Only
         // `compile_retrace` reuses a token, and it reuses the live one
-        // (`compile.py:355 get_procedure_token`), so that is where a retrace
+        // (`compile.py get_procedure_token`), so that is where a retrace
         // budget legitimately persists.
 
         // compile.py:269-270 `jitcell_token = cross_loop.jitcell_token`: mark
@@ -10104,9 +10104,9 @@ impl<M: Clone> MetaInterp<M> {
         // TargetToken, prepends LABEL(descr=target_token), and patches the
         // closing JUMP to the same token.
         let target_token = crate::history::TargetToken::new_loop(token_num);
-        // `compile.py:237 target_token.original_jitcell_token = jitcell_token`.
+        // `compile.py target_token.original_jitcell_token = jitcell_token`.
         target_token.set_original_jitcell_token_number(token_num);
-        // `compile.py:245 jitcell_token.target_tokens = [target_token]` —
+        // `compile.py jitcell_token.target_tokens = [target_token]` —
         // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py`).
         token.record_target_token(target_token.as_jump_target_descr());
         let mut compiled_ops = optimized_ops.clone();
@@ -11498,7 +11498,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Return the owning `Arc<JitCellToken>` for the compiled loop at
-    /// `green_key`, matching `compile.py:187 isinstance(descr, JitCellToken)`
+    /// `green_key`, matching `compile.py isinstance(descr, JitCellToken)`
     /// identity. Used by `direct_assembler_call` to thread the same Arc
     /// through `make_call_assembler_descr` so the keepalive walker
     /// (`record_loop_or_bridge`) recovers the production token directly
@@ -11652,7 +11652,7 @@ impl<M: Clone> MetaInterp<M> {
         //
         // `compile.py:183` `for op in loop.operations`.
         for op in ops.iter() {
-            // `compile.py:184 descr = op.getdescr()`. Clone the Arc
+            // `compile.py descr = op.getdescr()`. Clone the Arc
             // (single atomic bump) so the rest of this loop iteration
             // can hold the descr value while still freely mutating
             // `op.descr` to land the `compile.py:191/202 cleardescr()`
@@ -11863,7 +11863,7 @@ impl<M: Clone> MetaInterp<M> {
     /// mirrored onto `JitCellToken.target_tokens` (`backend/src/lib.rs`) is
     /// read only by `first_target_token`, and `has_target_tokens` has no
     /// callers at all.
-    /// Invalidation in PyPy is `quasiimmut.py:99 looptoken.invalidated = True`
+    /// Invalidation in PyPy is `quasiimmut.py looptoken.invalidated = True`
     /// — a single boolean flag, not a clear of `target_tokens`. Pyre
     /// routes the `bool(token)` half through `WarmEnterState::
     /// get_procedure_token` (`warmstate.rs`), which filters on
@@ -13084,8 +13084,8 @@ impl<M: Clone> MetaInterp<M> {
     /// `fail_descr` is the FailDescr from the guard that failed.
     /// `bridge_ops` are the recorded bridge trace operations.
     /// `bridge_inputargs` are the input arguments for the bridge.
-    /// `unroll.py:196-197 cell_token = jump_op.getdescr()` and
-    /// `unroll.py:321-322 jitcelltoken = jump_op.getdescr()`: the jitcell whose
+    /// `unroll.py cell_token = jump_op.getdescr()` and
+    /// `unroll.py jitcelltoken = jump_op.getdescr()`: the jitcell whose
     /// `target_tokens` `optimize_bridge` scans, and whose `retraced_count` it
     /// reads and charges, is the one the closing JUMP *enters* — never the loop
     /// the bridge hangs from.  A JUMP target with no compiled loop has no
@@ -13414,7 +13414,7 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(bridge_ops, &constants));
         }
         let _compiled = self.compiled_loops.get_mut(&green_key).unwrap();
-        // `unroll.py:325 for target_token in jitcelltoken.target_tokens` scans
+        // `unroll.py for target_token in jitcelltoken.target_tokens` scans
         // the tokens of the loop the JUMP enters.  `compiled_loops` cannot
         // hand out a second `&mut` alongside the origin entry, so a cross-loop
         // close runs against a clone of the target's vector and stores it back
@@ -13931,7 +13931,7 @@ impl<M: Clone> MetaInterp<M> {
         // runs once per LIVE box while `rebuild_from_resumedata` walks the
         // resume data, not once per `fail_arg_types` slot, and `compile_bridge`
         // already does exactly that: it zips `liveboxes` with `frontend_boxes`
-        // under `bridgeopt.py:126 assert len(frontend_boxes) == len(liveboxes)`
+        // under `bridgeopt.py assert len(frontend_boxes) == len(liveboxes)`
         // and stamps only the InputArg whose OpRef IS a livebox.
         //
         // Stamping every slot positionally instead gives a value to slots the
@@ -18167,7 +18167,7 @@ pub struct MetaInterpStaticData {
     /// The one flat jitcode table. `codewriter.py:68` stamps each entry with
     /// its position (`jitcode.index = len(all_jitcodes)` at the drain in
     /// `codewriter.py:80`), and every resume frame carries that absolute index,
-    /// so `resume.py:1051 jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`
+    /// so `resume.py jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`
     /// resolves a frame with no per-driver or parent-relative bookkeeping.
     ///
     /// Upstream fills this once at translation, but the structure itself is a
@@ -18688,7 +18688,7 @@ impl MetaInterpStaticData {
         // reshuffle.
     }
 
-    /// Narrow `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`
+    /// Narrow `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`
     /// slice intended for state-field JIT.  Copies the
     /// already-populated `Assembler::all_liveness` byte stream into
     /// `self.liveness_info` and seeds the cached opcode-id fields
@@ -19927,7 +19927,7 @@ mod metainterp_static_data_tests {
         meta.perform_call(mainjitcode.clone(), &[], None)
             .unwrap_err();
         assert_eq!(meta.framestack.len(), 1);
-        // `pyjitpl.py:3273 self.virtualref_boxes = []` is structurally
+        // `pyjitpl.py self.virtualref_boxes = []` is structurally
         // enforced now: the backing vector lives on `TraceCtx`, which
         // is rebuilt per `MetaInterp::setup_tracing` cycle, so no
         // pre-populate / re-assert is needed here.

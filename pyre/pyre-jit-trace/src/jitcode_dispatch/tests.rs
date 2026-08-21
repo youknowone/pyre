@@ -12662,7 +12662,7 @@ fn ref_compare_same_box_fastpath_covers_the_instance_ptr_spellings() {
 // like any other.  The funcbox is the callee's own address on every live
 // path — `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)` and the LLBC path
 // bakes a plain `ConstInt` fnaddr — so `execute_pure_call` fetches the result
-// from the floating-point return register (`executor.py:66-68 cpu.bh_call_f`).
+// from the floating-point return register (`executor.py cpu.bh_call_f`).
 
 /// A real `f64`-returning callee with an integer parameter, i.e. the
 /// `jit_bigint_to_f64_or_inf` shape.  The integer return register is undefined

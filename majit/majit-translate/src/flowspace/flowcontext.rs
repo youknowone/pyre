@@ -1727,7 +1727,7 @@ impl FlowContext {
     }
 
     fn find_global(&self, varname: &str) -> Result<Hlvalue, FlowContextError> {
-        // RPython `flowcontext.py:284 self.w_globals = Constant(func.__globals__)`
+        // RPython `flowcontext.py self.w_globals = Constant(func.__globals__)`
         // wraps `func.__globals__` — a *live* dict reference, not a
         // snapshot. The lookup at `flowcontext.py:847
         // w_globals.value[varname]` therefore observes any module-

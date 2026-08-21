@@ -2301,7 +2301,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// The name arrives as raw bytes because `readdir`'s `d_name` is handed
     /// back unchanged. Both arms keep it openable: bytes mode returns it
     /// verbatim, and the `str` arm takes the filesystem decoding
-    /// (`interp_posix.py:1121 space.newfilename(f)`), so a name like
+    /// (`interp_posix.py space.newfilename(f)`), so a name like
     /// `b"bad_\xff"` still names the file on disk instead of carrying U+FFFD.
     fn fs_name_obj(bytes_mode: bool, name: &[u8]) -> PyObjectRef {
         if bytes_mode {
@@ -4974,8 +4974,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
     /// `interp_scandir.py descr_reduce_ex` — an entry names a live
     /// position in a directory listing, so it refuses to be pickled.  `%T` is
-    /// `error.py:592-593 space.type(value).name`, the qualified typedef name
-    /// (`interp_scandir.py:469 'posix.DirEntry'`), which is what
+    /// `error.py space.type(value).name`, the qualified typedef name
+    /// (`interp_scandir.py 'posix.DirEntry'`), which is what
     /// `w_type_get_name` returns; the flag-driven `reduce_newobj` refusal in
     /// `reduce_protocol_app.py:13-14` spells it with the bare `__name__`.
     fn dir_entry_reduce_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -8701,7 +8701,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("system() requires 1 argument"));
                     }
-                    // `interp_posix.py:815 command='fsencode'`, which
+                    // `interp_posix.py command='fsencode'`, which
                     // `gateway.py:365` unwraps with `space.fsencode_w`: the
                     // shell gets the filesystem bytes, so a command naming a
                     // byte with no UTF-8 spelling survives instead of being

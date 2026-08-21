@@ -2728,20 +2728,6 @@ pub fn build_wasm_module(
         return Err(BackendError::Unsupported(reason));
     }
 
-    // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`): `bridge_finish_fi` is
-    // THIS bridge's own DoneWithThisFrame index (the recursive return), which the
-    // CA arm accepts as a clean callee finish alongside the source loop's
-    // base-case finish. Widen the callee-frame reservation to also fit this
-    // bridge's frame: the source loop's guard-exit chains into this bridge
-    // reusing the same arena frame, so an undersized frame would let the bridge's
-    // home-slot writes overflow into the next arena slot.
-    let bridge_finish_fi = guards
-        .iter()
-        .find(|g| {
-            g.is_finish && !crate::failguard::meta_descr_is_exit_frame_with_exception(&g.meta_descr)
-        })
-        .map(|g| g.fail_index)
-        .unwrap_or(crate::failguard::WASM_CA_FINISH_FI_UNKNOWN);
     // CA frames execute the source loop and this bridge on the same frozen
     // geometry.  `compile_bridge` rejects a bridge that needs more slots, so
     // no global floor or speculative slack is needed here.
@@ -3016,7 +3002,6 @@ pub fn build_wasm_module(
         &float_residual_type_indices,
         true_void_residual_max_arity.map(|_| true_void_residual_type_base),
         ca.clone(),
-        bridge_finish_fi,
         ca_helper_type_idx,
         *trace_entry_census,
     )?;
@@ -3076,9 +3061,6 @@ fn build_function(
     // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`). `ca.emit_ca` off keeps
     // the body byte-identical.
     ca: CaParams,
-    // This bridge's own DoneWithThisFrame Finish index (the recursive return);
-    // the CA arm accepts it or `ca.loop_finish_fi` as a clean callee finish.
-    bridge_finish_fi: u32,
     // wasm type index of the CA deopt helper `(i64, i64) -> i64`, declared in the
     // module type section when `ca.emit_ca`. The CA arm uses it to `call_indirect`
     // `ca.deopt_helper_slot` for a deopted callee.
@@ -5194,15 +5176,18 @@ fn build_function(
                 sink.i64_load(mem64(0));
                 sink.i32_wrap_i64();
                 sink.local_set(ca_fi_local);
-                // is_finish = (fi == loop_finish_fi) | (fi == bridge_finish_fi)
+                // `_call_assembler_check_descr` — every clean finish of this
+                // result kind writes the one `done_with_this_frame_descr_<kind>`
+                // the cpu was handed, so the check is a compare against that
+                // single value. A raising callee writes
+                // `exit_frame_with_exception_descr_ref` and a guard deopt writes
+                // its own exit, so both fail this compare and take the helper
+                // path, which is what propagates the exception.
                 sink.local_get(ca_fi_local);
-                sink.i32_const(dispatch_entry);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_LOOP_FINISH_FI_OFS));
+                sink.i32_const(crate::failguard::done_with_this_frame_exit_index(
+                    op.opcode.result_type(),
+                ) as i32);
                 sink.i32_eq();
-                sink.local_get(ca_fi_local);
-                sink.i32_const(bridge_finish_fi as i32);
-                sink.i32_eq();
-                sink.i32_or();
                 sink.if_(BlockType::Result(ValType::I64));
                 // clean finish: result Ref = F'[1] (output slot 0).
                 sink.local_get(ca_cfp_local);
@@ -7066,7 +7051,22 @@ fn emit_guard_spill(
     op: &Op,
 ) {
     emit_guard_fail_args_spill(sink, constants, value_types, op);
-    emit_guard_fail_index_store(sink, guard_idx);
+    emit_guard_fail_index_store(sink, exit_index(op, guard_idx));
+}
+
+/// The exit a failing `op` writes into `frame[0]`.
+///
+/// `compile_done_with_this_frame` / `compile_exit_frame_with_exception` stamp
+/// the FINISH with the singleton the cpu was handed, so every trace that
+/// finishes the same way names the same exit and `_call_assembler_check_descr`
+/// can recognise it with one compare. Guards, and the N-ary finishes pyre adds
+/// on top of the `_DoneWithThisFrameDescr` family's 0/1-result classes, have no
+/// shared identity and keep their own exit.
+fn exit_index(op: &Op, guard_idx: u32) -> u32 {
+    if op.opcode != OpCode::Finish {
+        return guard_idx;
+    }
+    crate::failguard::attached_finish_exit_index(&op.getdescr()).unwrap_or(guard_idx)
 }
 
 fn emit_guard_fail_args_spill(

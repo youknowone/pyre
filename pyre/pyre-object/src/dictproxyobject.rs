@@ -25,13 +25,13 @@ use crate::pyobject::*;
 ///
 /// `w_mapping` is the wrapped dict-like object — typically a
 /// `W_DictObject` (the type's `w_dict`).  PyPy's
-/// `dictproxyobject.py:17 self.w_mapping = w_mapping` is the same
+/// `dictproxyobject.py self.w_mapping = w_mapping` is the same
 /// single field.
 #[repr(C)]
 pub struct W_DictProxyObject {
     pub ob_header: PyObject,
     /// Wrapped mapping (the `W_DictObject` whose entries the proxy
-    /// surfaces).  `dictproxyobject.py:17 self.w_mapping = w_mapping`.
+    /// surfaces).  `dictproxyobject.py self.w_mapping = w_mapping`.
     pub w_mapping: PyObjectRef,
 }
 

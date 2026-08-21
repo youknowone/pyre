@@ -5170,7 +5170,7 @@ fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyErr
     }
 }
 
-/// `pyframe.py:557 self.space.newdict(instance=True)` — the mapping
+/// `pyframe.py self.space.newdict(instance=True)` — the mapping
 /// `fast2locals` materialises for a frame that has none yet, for a trace that
 /// models the fastlocals reads instead of residualizing
 /// `interp_inspect.py locals`.

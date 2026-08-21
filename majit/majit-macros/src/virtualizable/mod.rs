@@ -45,7 +45,7 @@ pub(crate) struct VirtualizableMacroInput {
     inputargs: Vec<InputArgField>,
     /// Extra red inputargs that are NOT vable scalar fields (= RPython
     /// `JitDriver.reds` minus the vable, e.g. `ec` in
-    /// `interp_jit.py:67 reds = ['frame', 'ec']`). Pushed to
+    /// `interp_jit.py reds = ['frame', 'ec']`). Pushed to
     /// extract_live / jump_args between `frame` and the vable static
     /// fields, mirroring `pyjitpl.py:2957 redboxes` followed by
     /// `:2964 + virtualizable_boxes`. Restored via plain
@@ -103,7 +103,7 @@ impl Parse for VirtualizableMacroInput {
                 }
                 "extra_reds" => {
                     // Non-vable JitDriver red inputargs (e.g. `ec` in
-                    // `interp_jit.py:67 reds = ['frame', 'ec']`). Same syntax
+                    // `interp_jit.py reds = ['frame', 'ec']`). Same syntax
                     // as `inputargs`; layout-wise they sit between the frame
                     // pointer and the vable static fields in the canonical
                     // scalar block (`pyjitpl.py:2957 redboxes` then
@@ -371,7 +371,7 @@ fn generate_layout_helpers(
     // Red block (extra reds) first, then vable static fields — mirrors
     // pyjitpl.py `live_arg_boxes = greenboxes + redboxes` followed by
     // pyjitpl.py:2964 `+ virtualizable_boxes`. JitDriver.reds (e.g.
-    // `interp_jit.py:67 reds = ['frame', 'ec']`) come before the
+    // `interp_jit.py reds = ['frame', 'ec']`) come before the
     // virtualizable's static fields in the OpRef stream.
     let all_scalars: Vec<&InputArgField> = extra_reds.iter().chain(inputargs.iter()).collect();
     let num_scalars = 1 + all_scalars.len(); // frame + extra_red + vable static fields
@@ -509,7 +509,7 @@ fn generate_layout_helpers(
 
         /// Number of non-vable JitDriver red inputargs (e.g. `ec`).
         ///
-        /// `interp_jit.py:67 reds = ['frame', 'ec']` declares these alongside
+        /// `interp_jit.py reds = ['frame', 'ec']` declares these alongside
         /// `frame`; they live between the frame pointer and the vable static
         /// fields in the OpRef stream (`pyjitpl.py:2957 redboxes`).
         pub const NUM_EXTRA_REDS: usize = #num_extra_reds;

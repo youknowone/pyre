@@ -23,7 +23,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      with:
+        # The citation check below needs the merge ref's first parent.
+        fetch-depth: 2
     - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
       with:
         python-version: 3.x
     - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+    # The `no-line-number-citations` hook above reads the staged diff, which is
+    # empty under the action's `--all-files`, so it cannot see what a pull
+    # request adds. A `pull_request` event checks out `refs/pull/N/merge`, whose
+    # first parent is the base branch tip, so `HEAD^1..HEAD` is this PR's own
+    # contribution and nothing else -- which is what keeps the numbers already
+    # in the tree out of scope.
+    #
+    # `--annotate` marks each one on the diff and exits 0. The commit hook is
+    # the blocking side; this side exists for branches that predate the hook and
+    # for commits made with `--no-verify`, where failing the job would wall work
+    # already in flight rather than stop a line being written.
+    - name: upstream citations name a symbol, not a line number
+      if: github.event_name == 'pull_request'
+      run: python3 scripts/check-new-line-citations.py --base HEAD^1 --annotate

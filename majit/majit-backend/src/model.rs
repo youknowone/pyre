@@ -217,7 +217,7 @@ pub trait Cpu: Send + Sync {
         }
     }
 
-    /// `llmodel.py:557 gc_ll_descr.str_descr` — the typed `ArrayDescr`
+    /// `llmodel.py gc_ll_descr.str_descr` — the typed `ArrayDescr`
     /// for the runtime string layout (basesize + length offset + char
     /// item size + `STR` type id).  Cached on the gc_ll_descr at
     /// backend init upstream; pyre exposes it on the `Cpu` trait so
@@ -235,7 +235,7 @@ pub trait Cpu: Send + Sync {
         None
     }
 
-    /// `llmodel.py:557 gc_ll_descr.unicode_descr` — mirror of
+    /// `llmodel.py gc_ll_descr.unicode_descr` — mirror of
     /// `str_descr()` for the unicode layout.  Default `None`.
     fn unicode_descr(&self) -> Option<&dyn ArrayDescr> {
         None

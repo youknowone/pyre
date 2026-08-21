@@ -9,6 +9,12 @@ change ADDS, so the rule applies from here on rather than retroactively.
 Modes:
   (default)      the staged diff, for a pre-commit hook
   --base REF     everything REF..HEAD adds, for CI on a pull request
+  --annotate     report as GitHub annotations and exit 0
+
+The commit hook fails: that is the moment the line is being written and the
+cheapest one at which to fix it. CI annotates instead, so a branch that
+predates the hook -- or a commit made with `--no-verify` -- still shows the
+citation on the diff without walling work that is already in flight.
 
 A line that genuinely needs a number -- an unnamed arm inside a long function,
 a module-level comment with no symbol at all -- keeps it by carrying
@@ -68,14 +74,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", help="diff against this ref instead of the index")
+    ap.add_argument("--annotate", action="store_true",
+                    help="emit GitHub annotations and exit 0 instead of failing")
     ap.add_argument("files", nargs="*", help="ignored; pre-commit passes them")
     args = ap.parse_args()
     keep_output_printable()
 
     bad = []
+    added = rust_added = 0
+    files = set()
     for path, lineno, text in added_lines(args.base):
+        added += 1
         if not path or not path.endswith(".rs"):
             continue
+        files.add(path)
+        rust_added += 1
         comment = text.find("//")
         if comment < 0 or ESCAPE in text[comment:]:
             continue
@@ -83,14 +96,35 @@ def main():
             if m.start() > comment:
                 bad.append((path, lineno, m.group(0), text.strip()))
 
+    # Printed whichever way this ends. A gate whose pass is indistinguishable
+    # from a gate that read an empty range is a gate nobody can trust: the
+    # population belongs in the log next to the verdict.
+    scanned = (f"scanned {rust_added} added Rust line(s) in {len(files)} file(s), "
+               f"of {added} added line(s) in range")
+
     if not bad:
+        print(f"{scanned}; no new line-number citations.")
         return 0
+
+    if args.annotate:
+        # `::warning file=,line=::` puts the marker on the line itself in the
+        # PR's Files-changed view. A message carries no raw newline.
+        for path, lineno, cite, _text in bad:
+            print(f"::warning file={path},line={lineno},"
+                  f"title=Cite upstream by symbol::`{cite}` names a line number. "
+                  "Drop the `:LINE` and name the symbol, or add "
+                  f"`{ESCAPE}` to record that the number was deliberate.")
+        print(f"{scanned}; {len(bad)} new line-number citation(s), "
+              "see the annotations above.")
+        return 0
+
     print("Upstream citations must name a symbol, not a line number "
           "(AGENTS.md, Porting discipline).\n")
     for path, lineno, cite, text in bad:
         print(f"  {path}:{lineno}: {cite}")
         print(f"      {text[:100]}")
-    print(f"\n{len(bad)} new line-number citation(s).")
+    print(f"\n{scanned}.")
+    print(f"{len(bad)} new line-number citation(s).")
     print("Drop the `:LINE` and name the symbol instead — the enclosing "
           "`def`/`class` when the claim is about a statement inside one.")
     print(f"Where no symbol pins the claim, keep the number and add `{ESCAPE}` "

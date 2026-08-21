@@ -233,7 +233,7 @@ pub struct VirtualizableInfo {
     /// Flat position of the virtualizable identity inside the reds the host
     /// hands `initialize_virtualizable` as `live_values`.
     ///
-    /// `pyjitpl.py:3319 virtualizable_box = original_boxes[index]` is a lookup
+    /// `pyjitpl.py virtualizable_box = original_boxes[index]` is a lookup
     /// at a DECLARED position — `warmspot.py:529-538` fixes
     /// `index_of_virtualizable` when the driver is registered, and nothing at
     /// snapshot time searches for the box. Hosts whose reds are not the
@@ -916,7 +916,7 @@ impl VirtualizableInfo {
     /// optimizer's offset-based tracking (majit-opt).
     ///
     /// `vable_input_offset` defaults to 0 here; callers that wire JitDriver
-    /// non-vable reds (e.g. `interp_jit.py:67 reds = ['frame', 'ec']`)
+    /// non-vable reds (e.g. `interp_jit.py reds = ['frame', 'ec']`)
     /// should patch the field after construction — see
     /// `MetaInterp::current_virtualizable_optimizer_config`.
     pub(crate) fn to_optimizer_config(

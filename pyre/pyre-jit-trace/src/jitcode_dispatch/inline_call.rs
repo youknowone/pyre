@@ -2293,7 +2293,7 @@ fn walker_ec_enter(
 /// 'leaveframe', w_exitvalue)`) stays with the interpreter's own
 /// [`pyre_interpreter::PyExecutionContext::leave`].  Omitting it here does not
 /// lose a leave event, because `is_being_profiled` is a portal-driver GREEN
-/// (`interp_jit.py:68 greens = ['next_instr', 'is_being_profiled', 'pycode']`):
+/// (`interp_jit.py greens = ['next_instr', 'is_being_profiled', 'pycode']`):
 /// a trace is keyed on it, so one recorded with profiling off is only ever
 /// entered with profiling off, and turning profiling on selects a different
 /// green key rather than reusing this trace.

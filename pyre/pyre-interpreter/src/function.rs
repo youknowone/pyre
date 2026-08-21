@@ -92,7 +92,7 @@ pub struct Function {
     pub w_module: PyObjectRef,
     /// PyPy: Function.w_func_globals — the module namespace dict object.
     ///
-    /// `function.py:57 self.w_func_globals = w_globals` stores the dict
+    /// `function.py self.w_func_globals = w_globals` stores the dict
     /// object directly; this is the function's sole globals carrier, so
     /// `function.__globals__` returns the same identity as the module's
     /// `__dict__` and frames built from this function share globals.
@@ -104,7 +104,7 @@ pub struct Function {
     /// frame builtin selection: replacing `globals['__builtins__']` later
     /// does not change `function.__builtins__`.
     pub w_builtins: PyObjectRef,
-    /// `function.py:50 w_ann=None` constructor default plus
+    /// `function.py w_ann=None` constructor default plus
     /// `function.py fget_func_annotations` lazy-init shape:
     /// PyPy stores the annotations dict directly on the function and
     /// allocates an empty dict on first read when none was set.
@@ -124,7 +124,7 @@ pub struct Function {
     /// PEP 649); the typed slot mirrors how `w_ann` sits on the
     /// function object rather than a side table.
     pub w_annotate: PyObjectRef,
-    /// `function.py:68 self.w_func_dict = None` — lazily allocated
+    /// `function.py self.w_func_dict = None` — lazily allocated
     /// per-function attribute dictionary.  This is a field on the function,
     /// not mapdict side storage, matching PyPy's `Function.getdict`.
     pub w_func_dict: PyObjectRef,
@@ -147,7 +147,7 @@ pub struct Function {
     /// `w_none()` to make the deleted state sticky against the lazy
     /// fallback (`function.py fdel_func_doc`).
     pub w_doc: PyObjectRef,
-    /// `function.py:54 self.qualname = qualname or self.name` slot —
+    /// `function.py self.qualname = qualname or self.name` slot —
     /// PyPy stores the qualified name as a regular field on the
     /// function object.  `PY_NULL` means "not explicitly set"; the
     /// getter falls back to `code.co_qualname` then `name` to mirror
@@ -584,7 +584,7 @@ pub fn function_new_with_closure(
 
 /// Where a new function's `name` slot points.
 ///
-/// `function.py:51 self.name = forcename or code.co_name` copies the code
+/// `function.py self.name = forcename or code.co_name` copies the code
 /// object's own string; RPython strings are immutable and shared, so no second
 /// allocation exists upstream.  Pyre's names live in explicit storage, so the
 /// two shapes are named here: `Owned` boxes a string the caller built, while
@@ -626,7 +626,7 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     // function so the allocation that can collect runs while no unrooted
     // function is live.
     unsafe { crate::pycode::w_code_name_obj(w_code) };
-    // `function.py:54 self.qualname = qualname or self.name`.  The code object
+    // `function.py self.qualname = qualname or self.name`.  The code object
     // realizes one wrapped qualname and every function built from it names that
     // object, so a later `__code__ = new_code` assignment leaves
     // `__qualname__` alone (`pyopcode.py:1457` stamps it at construction).
@@ -689,7 +689,7 @@ pub(crate) fn function_new_impl(
     pyre_object::gc_roots::pin_root(closure);
     let code_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(code as PyObjectRef);
-    // `function.py:57 self.w_func_globals = w_globals` stores the dict
+    // `function.py self.w_func_globals = w_globals` stores the dict
     // object directly as the function's sole globals carrier.
     let globals_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_func_globals_obj);
@@ -1140,7 +1140,7 @@ pub unsafe fn builtin_function_set_module_attr(obj: PyObjectRef, value: PyObject
 /// `FunctionWithFixedCode` is retagged in place to `BuiltinFunction`
 /// (`BUILTIN_FUNCTION_TYPE`, whose typedef omits `__get__`) so storing it on a
 /// user class and reading it through an instance does not synthesize a bound
-/// method (`typedef.py:918 del BuiltinFunction.typedef.rawdict['__get__']`).
+/// method (`typedef.py del BuiltinFunction.typedef.rawdict['__get__']`).
 ///
 /// Both PyTypes share the `Function` layout and GC type id
 /// (`eval.rs` maps both to `function_tid`), so only `ob_type` (the binding
@@ -1540,7 +1540,7 @@ pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// `function.py:54 self.qualname = qualname or self.name` setter —
+/// `function.py self.qualname = qualname or self.name` setter —
 /// used by MAKE_FUNCTION (`runtime_ops::make_function_from_code_obj_with_globals_obj`)
 /// to freeze the qualified name immediately after `function_new`.
 /// Bypasses `_check_code_mutable` because this is the construction
@@ -1605,7 +1605,7 @@ pub unsafe fn function_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
 
 /// Return the canonical W_DictObject stored as `function.w_func_globals`.
 ///
-/// `function.py:57 self.w_func_globals = w_globals` stores the dict
+/// `function.py self.w_func_globals = w_globals` stores the dict
 /// object directly; this is a plain field load.  Returns `PY_NULL` for
 /// a globals-less carrier (gateway builtins).
 ///
@@ -2817,7 +2817,7 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     } else {
         w_closure
     };
-    // `function.py:57 self.w_func_globals = w_globals` stores the dict
+    // `function.py self.w_func_globals = w_globals` stores the dict
     // object itself as the function's sole globals carrier.  Preserving a
     // dict subclass here is observable: annotationlib's `_StringifierDict`
     // supplies unresolved names through `__missing__` when it clones a PEP

@@ -2,7 +2,7 @@
 //! heap.
 //!
 //! `execute_token` mints the frame at `llmodel.py malloc_jitframe` and
-//! hands that same value back at `llmodel.py:328 return ll_frame` — the
+//! hands that same value back at `llmodel.py return ll_frame` — the
 //! deadframe IS the jitframe here as well, so nothing is copied out and the
 //! accessors read `jf_frame[]` in place. What differs from
 //! [`crate::deadframe::JitFrameDeadFrame`] is

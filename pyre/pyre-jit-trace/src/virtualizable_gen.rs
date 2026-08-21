@@ -21,7 +21,7 @@ majit_macros::virtualizable! {
     // Frame pointer field in PyreJitState
     frame_field = frame,
 
-    // Non-vable JitDriver reds (`interp_jit.py:67 reds = ['frame', 'ec']`).
+    // Non-vable JitDriver reds (`interp_jit.py reds = ['frame', 'ec']`).
     // `frame` is implicit at OpRef::from_raw(0); each entry here shifts
     // `NUM_SCALAR_INPUTARGS` and `SYM_ARRAY_BASE` by one and occupies
     // `OpRef(1..1+NUM_EXTRA_REDS)` between frame and the vable static
@@ -34,7 +34,7 @@ majit_macros::virtualizable! {
     //          valuestackdepth:Int, debugdata:Ref, w_globals:Ref, array...]
     // Mirrors `pypy/module/pypyjit/interp_jit.py:25-30`'s
     // `_virtualizable_` declaration line by line. `ec` is from
-    // `interp_jit.py:67 reds = ['frame', 'ec']` (extra_reds above).
+    // `interp_jit.py reds = ['frame', 'ec']` (extra_reds above).
     inputargs = {
         last_instr: Int,
         pycode: Ref,

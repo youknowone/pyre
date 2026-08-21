@@ -4857,7 +4857,7 @@ impl TraceCtx {
     /// `pyjitpl.py direct_call_release_gil` — Int result.
     /// Routes through the shared `record_release_gil_typed_with_effect`
     /// emitting `[savebox, realfuncaddr] + args` per the void sibling.
-    /// `resoperation.py:1243-1244 # no such thing` excludes the Ref
+    /// `resoperation.py # no such thing` excludes the Ref
     /// flavour, so no `_ref_typed_with_effect` counterpart exists.
     pub fn call_release_gil_int_typed_with_effect(
         &mut self,

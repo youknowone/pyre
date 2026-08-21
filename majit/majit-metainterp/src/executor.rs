@@ -1089,7 +1089,7 @@ mod execute_pure_call_tests {
         );
     }
 
-    /// `executor.py:73-77 cpu.bh_call_v` takes the same `descr`, so a void
+    /// `executor.py cpu.bh_call_v` takes the same `descr`, so a void
     /// callee's Float parameter is placed the same way.
     #[test]
     fn void_result_places_an_interleaved_float_argument_in_order() {

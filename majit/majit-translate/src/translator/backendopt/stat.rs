@@ -164,7 +164,7 @@ fn co_code_bytes(host: &HostCode) -> Vec<u8> {
 }
 
 /// Compute `hashlib.md5(data).hexdigest()` — upstream's
-/// `stat.py:48 md5(code).hexdigest()`.
+/// `stat.py md5(code).hexdigest()`.
 fn md5_hex(data: &[u8]) -> String {
     let digest = Md5::digest(data);
     format!("{digest:x}")

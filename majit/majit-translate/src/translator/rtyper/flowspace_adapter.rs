@@ -785,7 +785,7 @@ fn nonraising_core_bridge_opname(segments: &[String], arg_count: usize) -> Optio
 /// `FixedSizeListRepr.rtype_method("reverse")` (`rlist.py`
 /// `rtype_method_reverse` → `ll_reverse`).  Shared with [`op_canraise`],
 /// which classifies the originating Call non-raising
-/// (`rlist.py:142 hop.exception_cannot_occur()`).
+/// (`rlist.py hop.exception_cannot_occur()`).
 fn is_slice_reverse_segments(segments: &[String]) -> bool {
     segments.len() == 4
         && segments[0] == "core"

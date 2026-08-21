@@ -513,7 +513,7 @@ impl Assembler {
                 .get(label)
                 .unwrap_or_else(|| panic!("undefined TLabel {label:?} at fixup {fixup_pos}"));
             let target_u16 = target as u16;
-            // RPython `assembler.py:255 assert 0 <= target <= 0xFFFF`.
+            // RPython `assembler.py assert 0 <= target <= 0xFFFF`.
             assert!(target <= 0xFFFF, "label target {target} exceeds u16 range");
             // RPython `assembler.py:252-253 assert self.code[pos] == "temp 1"`
             // — the fixup must point to two reserved placeholder
@@ -3176,7 +3176,7 @@ impl Assembler {
 /// Operand byte of a constant-pool entry: `count_regs[kind] +
 /// pool_index` (`assembler.py:132`).  Registers and constants of one
 /// kind share a single byte-wide address space, so the slot is bounded
-/// by `assembler.py:133 assert 0 <= val < 256, "too many constants"`.
+/// by `assembler.py assert 0 <= val < 256, "too many constants"`.
 /// Without the bound a wider pool wraps modulo 256 and silently aliases
 /// a live register or an earlier constant.
 fn const_pool_slot(num_regs: usize, pool_index: usize) -> u8 {
@@ -4907,7 +4907,7 @@ impl Assembler {
         self.insns.insert(name.to_string(), opnum);
     }
 
-    /// RPython `assembler.py:29 self.all_liveness = []` — the shared
+    /// RPython `assembler.py self.all_liveness = []` — the shared
     /// liveness byte stream populated by `_encode_liveness`.  Returned
     /// as a contiguous `&[u8]` view so consumers (notably
     /// `MetaInterpStaticData::finish_setup` per `pyjitpl.py`) can

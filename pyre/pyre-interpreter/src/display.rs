@@ -1653,7 +1653,7 @@ fn basename_start(path: &[u8]) -> usize {
 
 /// The WTF-8 carrying subset of `W_BaseException.descr_str`: a base
 /// exception whose `args_w` is a single `str` stringifies to that str
-/// verbatim (`interp_exceptions.py:131 space.str(self.args_w[0])`).
+/// verbatim (`interp_exceptions.py space.str(self.args_w[0])`).
 /// Returns `None` for every other shape — no args, multiple args, a
 /// non-`str` arg, or the Unicode/`KeyError` kinds whose `descr_str`
 /// overrides are ASCII-only — letting `py_str_wtf8` fall back to

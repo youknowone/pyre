@@ -1024,7 +1024,7 @@ pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<
 /// `PyFrame.frame_finished_execution = True` for a blackhole level that has
 /// returned to its caller.
 ///
-/// `pyopcode.py:239-241 RETURN_VALUE` performs this store before raising
+/// `pyopcode.py RETURN_VALUE` performs this store before raising
 /// `Return`, and `pyopcode.py handle_operation_error` performs it on the
 /// no-handler propagation out of the frame; upstream both live in the
 /// `dispatch_bytecode` graph, so the jitcode carries the store and pyjitpl and
@@ -1218,7 +1218,7 @@ fn clear_dead_ref_registers_at_live_marker(
         // Python PCs are all unreachable is emitted with no registers at all
         // (`filter_liveness_in_place`'s `any_reachable` arm), while a reachable
         // portal marker always names at least the `frame` red
-        // (`interp_jit.py:67 reds = ['frame', 'ec']`). Decline rather than
+        // (`interp_jit.py reds = ['frame', 'ec']`). Decline rather than
         // clear the whole bank on the one shape that cannot be told apart.
         if length_r == 0 {
             return;
@@ -2459,7 +2459,7 @@ pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, 
 }
 
 /// Return the post-regalloc Ref-bank colors of the portal red args
-/// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`) for
+/// (`pypy/module/pypyjit/interp_jit.py reds = ['frame', 'ec']`) for
 /// the registered jitcode at `jitcode_index`. Both are `u16::MAX` for skeletons.
 ///
 /// Used by per-code dispatch and reconstructed inline callees to seed the
@@ -5128,7 +5128,7 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
     // quasiimmut.py:125 `self.constantfieldbox =
     // self.get_current_constant_fieldvalue()` — the field's value at the moment
-    // the trace baked it.  `heap.py:818 is_still_valid_for` compares it against
+    // the trace baked it.  `heap.py is_still_valid_for` compares it against
     // the live value and abandons the loop when they disagree, so it has to be
     // captured here; by the time the optimizer runs, the change it is looking
     // for has already happened.
@@ -5181,8 +5181,8 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
 /// get_current_qmut_instance`), so it exists for the rest of the recording,
 /// which is what arms `opimpl_jit_force_quasi_immutable`'s `mutatebox.nonnull()`
 /// (`pyjitpl.py:1112`) for a write reached later in that same trace. The
-/// instance rides on the descr from here to `heap.py:818 is_still_valid_for`
-/// and `compile.py:204-207 register_loop_token`, so neither has to walk from
+/// instance rides on the descr from here to `heap.py is_still_valid_for`
+/// and `compile.py register_loop_token`, so neither has to walk from
 /// the struct back to the hidden `mutate_*` slot a second time.
 ///
 /// `None` where upstream cannot fail: an operand that is not a concrete
@@ -7595,7 +7595,7 @@ impl PyreJitState {
 
     /// Read the execution context pointer from the heap frame.
     ///
-    /// `interp_jit.py:67 reds = ['frame', 'ec']`: ec is a non-vable red
+    /// `interp_jit.py reds = ['frame', 'ec']`: ec is a non-vable red
     /// inputarg in RPython. pyre's PyFrame carries it inline at
     /// `execution_context`, so this accessor derefs the heap; from the
     /// macro-generated layout's perspective ec sits at SYM_EC_IDX between
@@ -11161,7 +11161,7 @@ impl JitState for PyreJitState {
                 }
             }
         }
-        // `pyjitpl.py:3433 self.virtualref_boxes = virtualref_boxes`.
+        // `pyjitpl.py self.virtualref_boxes = virtualref_boxes`.
         ctx.restore_virtualref_boxes(restored_virtualref_boxes);
 
         // resume.py AbstractResumeDataReader._prepare runs

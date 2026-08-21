@@ -14035,7 +14035,7 @@ pub fn frame_builtin_obj_checked(
 ///      .w_dict, 'None', w_None); return builtin`.
 /// Object-based `pick_builtin` for call frames whose globals came from
 /// `Function.w_func_globals` as a W_DictObject, matching PyPy's
-/// `pyframe.py:115 self.builtin = space.builtin.pick_builtin(w_globals)`.
+/// `pyframe.py self.builtin = space.builtin.pick_builtin(w_globals)`.
 ///
 /// Propagates a non-KeyError from the `__builtins__` lookup per
 /// `moduledef.py:97-98 if not e.match(space, space.w_KeyError): raise`

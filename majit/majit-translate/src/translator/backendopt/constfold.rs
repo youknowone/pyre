@@ -1217,7 +1217,7 @@ fn fixup_solid(p: ConstValue) -> ConstValue {
 }
 
 /// Local subset of upstream `LLOp.__call__` (lloperation.py) at
-/// `constfold.py:36 op(RESTYPE, *args)` dispatch. Upstream looks up
+/// `constfold.py op(RESTYPE, *args)` dispatch. Upstream looks up
 /// `getattr(opimpls, opname)` to invoke the per-op fold callable; the
 /// Rust port carries metadata-only `LLOp` (sideeffects/canfold/
 /// canraise/...) plus the per-op `op_<name>` table in

@@ -41,7 +41,7 @@ use crate::flowspace::model::HostObject;
 ///
 /// Non-function host objects are returned unchanged: upstream
 /// `export_symbol` only ever runs on Python function objects (called
-/// from `interactive.py:18 self.entry_point = export_symbol(entry_point)`
+/// from `interactive.py self.entry_point = export_symbol(entry_point)`
 /// right after the caller selects a function as the translation
 /// entry point), so any other input passing through this helper is
 /// outside the upstream contract. Silently passing through keeps the
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn export_symbol_sets_flag_on_graphfunc() {
-        // Upstream `entrypoint.py:11 func.exported_symbol = True`.
+        // Upstream `entrypoint.py func.exported_symbol = True`.
         let func = sample_user_function("demo");
         assert!(
             !func

@@ -657,7 +657,7 @@ pub fn enforce_input_args(graph: &FlowGraph, regallocs: &mut [GraphAllocationRes
             curcol,
             realcol,
         );
-        // `flatten.py:100 self.regallocs[kind].swapcolors(realcol, curcol)`.
+        // `flatten.py self.regallocs[kind].swapcolors(realcol, curcol)`.
         alloc.swapcolors(realcol, curcol);
     }
 }

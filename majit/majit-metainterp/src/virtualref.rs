@@ -110,7 +110,7 @@ pub unsafe fn ptr_is_virtual_ref(ptr: *const u8) -> bool {
     }
 }
 
-/// `virtualref.py:177 return vref.forced` — the object a vref has already
+/// `virtualref.py return vref.forced` — the object a vref has already
 /// been forced to, read without forcing.
 ///
 /// For readers that cannot run `force_virtual` at all: forcing materializes an
@@ -205,7 +205,7 @@ static TRACING_RESCALL_DUMMY_GC_TYPE_ID: AtomicU32 =
     AtomicU32::new(TRACING_RESCALL_DUMMY_GC_TYPE_ID_UNSET);
 
 /// Publish the registered leaf type used by the prebuilt
-/// `virtualizable.py:326-330 JITFRAME_DUMMY` object.
+/// `virtualizable.py JITFRAME_DUMMY` object.
 ///
 /// Registration comes from `build_gc`, so a second call means a second heap.
 /// A sentinel minted in the previous one is no longer part of the live heap —
@@ -515,7 +515,7 @@ impl VirtualRefInfo {
             // supply a non-null materialised object.
             debug_assert!(!real_object.is_null());
             let vref = &mut *(vref_ptr as *mut JitVirtualRef);
-            // `virtualref.py:127 assert vref.virtual_token != TOKEN_TRACING_RESCALL`
+            // `virtualref.py assert vref.virtual_token != TOKEN_TRACING_RESCALL`
             debug_assert_ne!(vref.virtual_token, token_tracing_rescall());
             vref.virtual_token = TOKEN_NONE;
             // The vref is an old-gen allocation and `real_object` can be young,

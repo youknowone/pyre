@@ -29,7 +29,7 @@ use crate::translator::translator::TranslationContext;
 /// `live_config` is upstream's `translator.config` carried as
 /// [`Rc<Config>`].  The local [`TranslationContext`] holds only a typed
 /// snapshot, so the driver passes the live schema-driven `Rc<Config>`
-/// it owns (`driver.py:194 TranslationContext(config=self.config)`).
+/// it owns (`driver.py TranslationContext(config=self.config)`).
 /// When `None` is supplied we fall back to the schema defaults — that
 /// path is exercised only by tests that build a translator from
 /// scratch without going through the driver.

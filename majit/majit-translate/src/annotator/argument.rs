@@ -266,7 +266,7 @@ impl ArgumentsForTranslation {
         // `if signature.has_vararg(): ...`
         if signature.has_vararg() {
             // `*args` collects positional excess; upstream
-            // `argument.py:63 starargs_w = args_w[co_argcount:]` hands
+            // `argument.py starargs_w = args_w[co_argcount:]` hands
             // the slice to `self.newtuple(starargs_w)` which calls
             // `SomeTuple(items)` (`model.py`).  When an item
             // is Python None, `i.is_constant()` raises AttributeError

@@ -253,7 +253,7 @@ mod jit_module {
     // via the structured `__majit_helper_impl_trace_fnaddrs()` registry,
     // keyed by `impl_type_joined / method` that matches the parser's
     // `self_ty_root` canonicalization (parse.rs, lib.rs) —
-    // RPython `call.py:174-187 getfunctionptr(graph)` parity.
+    // RPython `call.py getfunctionptr(graph)` parity.
     //
     // `#[unroll_safe]` is used here because it is one of the JIT attribute
     // macros that does not generate out-of-scope trampolines; applying it
@@ -680,19 +680,19 @@ mod jit_module {
         // harvester through the body-local marker instead; see
         // `test_unroll_safe_marker_reaches_methods`.
 
-        // `rlib/jit.py:139 _jit_look_inside_ = False` — both opaque
+        // `rlib/jit.py _jit_look_inside_ = False` — both opaque
         // variants share the upstream attribute.
         assert!(!std::hint::black_box(_jit_look_inside_opaque_plain));
         assert!(!std::hint::black_box(_jit_look_inside_opaque_cannot_raise));
         assert!(std::hint::black_box(_jit_cannot_raise_opaque_cannot_raise));
 
-        // `rlib/jit.py:169 _jit_loop_invariant_ = True` — both
+        // `rlib/jit.py _jit_loop_invariant_ = True` — both
         // `loop_invariant` and `jit_loop_invariant` (the latter is a pyre
         // alias for the unprefixed name) share the upstream attribute.
         assert!(std::hint::black_box(_jit_loop_invariant_invariant_jit));
         assert!(std::hint::black_box(_jit_loop_invariant_invariant_plain));
 
-        // `rlib/jit.py:159 _jit_unroll_safe_ = True`.
+        // `rlib/jit.py _jit_unroll_safe_ = True`.
         assert!(std::hint::black_box(_jit_unroll_safe_unrolled_helper));
     }
 

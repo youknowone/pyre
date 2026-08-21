@@ -23,7 +23,7 @@ use majit_ir::{Descr, FailDescr, Type};
 /// `history.py` `_attrs_` slots `adr_jump_offset` / `rd_locs` from
 /// `AbstractFailDescr`; backend codegen
 /// (`assembler.py:849 patch_pending_failure_recoveries` /
-/// `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`)
+/// `llsupport/assembler.py guardtok.faildescr.rd_locs = positions`)
 /// stamps them on every descr regardless of class.
 #[derive(Debug)]
 struct DoneWithThisFrameDescrBase {

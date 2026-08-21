@@ -8016,7 +8016,7 @@ mod tests {
     /// case, with the producer's `make_equal_to(source, value)` forwarding
     /// installed (`shortpreamble.rs::produce_heap_field`).
     /// `force_op_from_preamble_op` returns `preamble_source` (RPython
-    /// `unroll.py:38 return preamble_op.op` ≡ `self.res`); the producer's
+    /// `unroll.py return preamble_op.op` ≡ `self.res`); the producer's
     /// `get_box_replacement(source)` lookup is consumed inside `force_box`
     /// (`shortpreamble.py:436 op = preamble_op.op.get_box_replacement()`)
     /// when it runs `add_preamble_op`.
@@ -8072,7 +8072,7 @@ mod tests {
             preamble_op: produced.preamble_op,
         };
         let forced = ctx.force_op_from_preamble_op(&pop);
-        // RPython `unroll.py:38 return preamble_op.op` ≡ self.res.
+        // RPython `unroll.py return preamble_op.op` ≡ self.res.
         // pyre's Phase 1 source IS self.res for the imported short box.
         assert_eq!(forced, OpRef::ref_op(19));
 

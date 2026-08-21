@@ -1225,7 +1225,7 @@ pub unsafe fn module_dict_strategy_current_version_qmut(
     Some((*strategy).current_version_qmut())
 }
 
-/// `pyjitpl.py:1112 mutatebox.nonnull()` for this strategy's `version?`.
+/// `pyjitpl.py mutatebox.nonnull()` for this strategy's `version?`.
 ///
 /// # Safety
 /// `strategy` must be null or point at a valid `ModuleDictStrategy`.
@@ -1581,7 +1581,7 @@ impl W_DictMultiObject for W_ModuleDictObject {
         unsafe { &*self.mstrategy }
     }
 
-    /// `celldict.py:185 w_dict.set_strategy(strategy)` — the only
+    /// `celldict.py w_dict.set_strategy(strategy)` — the only
     /// strategy transition out of ModuleDictStrategy is to
     /// ObjectDictStrategy via `switch_to_object_strategy` (`:173-186`).
     /// Route through the existing helper so trait-dispatch callers

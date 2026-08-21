@@ -104,7 +104,7 @@ impl TargetSpecDict {
 
     /// Add an arbitrary extra key, matching upstream's open dict.
     ///
-    /// Upstream `driver.py:582 target = targetspec_dic['target']` reads the
+    /// Upstream `driver.py target = targetspec_dic['target']` reads the
     /// callable from the same dict it later passes through to
     /// `setup(extra=targetspec_dic)`, so the dict slot and the cached
     /// callable must stay in lockstep. Reject `"target"` here — overriding

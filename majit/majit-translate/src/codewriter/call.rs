@@ -383,7 +383,7 @@ pub trait GreenFieldInfoHandle: std::fmt::Debug + Send + Sync {
 /// Hosts implement this trait on `VirtualRefInfo` so
 /// `CodeWriter.setup_vrefinfo` (`codewriter.py`) can store the
 /// instance on `CallControl.virtualref_info`
-/// (`call.py:22 virtualref_info = None`) for later forwarding to
+/// (`call.py virtualref_info = None`) for later forwarding to
 /// `metainterp_sd.virtualref_info = codewriter.callcontrol.virtualref_info`
 /// (`pyjitpl.py:2267`).  The three accessors expose the three `u32`
 /// descriptor indices the rebuilt `VirtualRefInfo` consumes on the
@@ -405,7 +405,7 @@ pub trait VirtualRefInfoHandle: std::fmt::Debug + Send + Sync {
     fn descr_size(&self) -> u32;
 }
 
-/// `warmspot.py:262 VirtualRefInfo(self)` ↔ majit codewriter-time
+/// `warmspot.py VirtualRefInfo(self)` ↔ majit codewriter-time
 /// stand-in.  The trait values are the
 /// `majit_metainterp::virtualref::descr` constants; this handle
 /// duplicates them so [`CodeWriter::setup_vrefinfo`] can run before
@@ -1279,7 +1279,7 @@ pub struct CallControl {
     /// graph gets.
     opname_helper_paths: HashSet<CallPath>,
 
-    /// `call.py:22 virtualref_info = None` — class-level default,
+    /// `call.py virtualref_info = None` — class-level default,
     /// populated by `CodeWriter.setup_vrefinfo`
     /// (`codewriter.py:91-94`) before
     /// `MetaInterpStaticData.finish_setup` reads it at
@@ -2627,7 +2627,7 @@ impl CallControl {
                 // the cached SizeDescr (which may be a PyreSizeDescr
                 // if the runtime published the parent but not this
                 // field, or a SimpleSizeDescr from line above).
-                // `descr.py:229 STRUCT._immutable_field(fieldname)` parity.
+                // `descr.py STRUCT._immutable_field(fieldname)` parity.
                 //
                 // `symbolic.get_field_token` (`symbolic.py:7`) returns the
                 // exact offset; prefer `struct_layouts` (rtyper-resolved /
@@ -3079,7 +3079,7 @@ impl CallControl {
     /// `lib.rs`'s `analyze_pipeline_from_module_paths`, so `get_jitcode()`
     /// resolves through to this real
     /// helper address instead of the symbolic hash fallback.  RPython
-    /// `call.py:174-187 getfunctionptr(graph)` parity for `<Type>::method`
+    /// `call.py getfunctionptr(graph)` parity for `<Type>::method`
     /// and `<Type as Trait>::method`.
     ///
     /// NOTE: this `ImplFnAddrBindings` channel is test-only.  Every
@@ -4111,7 +4111,7 @@ impl CallControl {
         self.jitcodes.get(path).cloned()
     }
 
-    /// RPython `codewriter.py:81 all_jitcodes.append(jitcode)` — the
+    /// RPython `codewriter.py all_jitcodes.append(jitcode)` — the
     /// sole append site in upstream's `make_jitcodes` loop. `jitcode.index`
     /// is already set by `transform_graph_to_jitcode` (upstream line 68);
     /// this method is the final positional append.
@@ -5078,7 +5078,7 @@ impl CallControl {
         }
 
         // No receiver-agnostic fallback: a method NAME is not a callee.
-        // `call.py:175-187 getfunctionptr(graph)` keys on graph identity,
+        // `call.py getfunctionptr(graph)` keys on graph identity,
         // so a site whose receiver names no registered impl has no
         // resolution and becomes a residual call.
         //
@@ -5495,7 +5495,7 @@ impl CallControl {
             .and_then(|f| f.oopspec.as_deref())
     }
 
-    /// `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]` —
+    /// `support.py argnames = ll_func.__code__.co_varnames[:nb_args]` —
     /// register the positional parameter names of an oopspec target so
     /// `parse_oopspec` can resolve identifier slots in the spec's
     /// `(...)` pattern to `Index(n)` placeholders.  The list must
@@ -9467,7 +9467,7 @@ mod tests {
     }
 
     /// A sole registered impl does NOT make its method name resolvable
-    /// from an unrelated receiver.  `call.py:175-187 getfunctionptr(graph)`
+    /// from an unrelated receiver.  `call.py getfunctionptr(graph)`
     /// keys on graph identity; the uniqueness this used to lean on could
     /// only be observed over the impls this artifact contains, so an impl
     /// living outside it left the count at one and the bind wrong, with

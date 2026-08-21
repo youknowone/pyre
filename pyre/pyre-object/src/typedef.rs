@@ -49,12 +49,12 @@ pub struct GetSetProperty {
     /// `typedef.py:346 self.name` — descriptor name (defaults to
     /// `'<generic property>'` when the caller passes None).
     pub name: PyObjectRef,
-    /// `typedef.py:320 w_objclass = None` class default + per-instance
+    /// `typedef.py w_objclass = None` class default + per-instance
     /// override stamped by `copy_for_type` (typedef.py).  Read by
     /// `descr_get_objclass` (typedef.py) before falling back
     /// to `space.gettypeobject(self.reqcls.typedef)`.
     pub w_objclass: PyObjectRef,
-    /// `typedef.py:344 self.w_qualname = None` — lazy cache for
+    /// `typedef.py self.w_qualname = None` — lazy cache for
     /// `descr_get_qualname` (typedef.py); first reader stamps
     /// `"<class>.<name>"` (or `"?.<name>"` when `reqcls is None`).
     pub w_qualname: PyObjectRef,
@@ -155,7 +155,7 @@ pub unsafe fn w_getset_set_name(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GetSetProperty)).name = value }
 }
 
-/// `typedef.py:343 self.reqcls = cls` — write the required-receiver
+/// `typedef.py self.reqcls = cls` — write the required-receiver
 /// class slot.  Used by `patch_builtin_function_descriptors` to
 /// install the BuiltinFunction class onto the shared
 /// `__self__`/`__doc__` GetSetProperty descriptors after the
@@ -196,7 +196,7 @@ pub unsafe fn w_getset_set_objclass(obj: PyObjectRef, value: PyObjectRef) {
     unsafe { (*(obj as *mut GetSetProperty)).w_objclass = value }
 }
 
-/// `typedef.py:344 self.w_qualname = None` — lazy cache slot for
+/// `typedef.py self.w_qualname = None` — lazy cache slot for
 /// `descr_get_qualname` (typedef.py).
 ///
 /// # Safety

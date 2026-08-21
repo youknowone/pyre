@@ -3253,7 +3253,7 @@ fn read_source_line(filename: &[u8], lineno: i64) -> Option<String> {
     }
     #[cfg(not(feature = "host_env"))]
     {
-        // Sandbox-intentional: PyPy's `error.py:150 linecache.getline`
+        // Sandbox-intentional: PyPy's `error.py linecache.getline`
         // also returns silently when the source can't be read; with
         // host_env off the interpreter must not reach `std::fs`
         // directly, so we treat every source as unreadable and let the

@@ -55,7 +55,7 @@ fn record_bridge_handler_entry_traceback<Sym: WalkSym>(
 ///
 /// A carrier frame's `enter` — and the `virtual_ref` scope it opened — belongs
 /// to the parent trace; `rebuild_state_after_failure` restores the still-open
-/// pairs (`pyjitpl.py:3433 self.virtualref_boxes = virtualref_boxes`).
+/// pairs (`pyjitpl.py self.virtualref_boxes = virtualref_boxes`).
 /// Upstream's resume continues inside that frame's `execute_frame`, so its
 /// `finally: ec.leave(...)` still runs and closes the scope.  Pyre's carrier
 /// sub-walk enters the callee body directly, with nothing standing in for that

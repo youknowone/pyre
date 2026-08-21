@@ -820,7 +820,7 @@ pub trait GcAllocator: Send {
     }
 
     /// `gc/base.py is_valid_gc_object`'s tagged-immediate setting
-    /// (`translationoption.py:185 taggedpointers`, default off).
+    /// (`translationoption.py taggedpointers`, default off).
     fn taggedpointers(&self) -> bool {
         false
     }

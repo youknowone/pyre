@@ -4343,7 +4343,7 @@ pub struct GraphFunc {
     /// the C backend (`rpython/translator/c/database.py` walks
     /// `getattr(callable, 'exported_symbol', False)`), which is not
     /// ported; the flag still rides along on `GraphFunc` so line-by-
-    /// line surface with `interactive.py:18 export_symbol(entry_point)`
+    /// line surface with `interactive.py export_symbol(entry_point)`
     /// stays intact.
     ///
     /// Wrapped in `Arc<AtomicBool>` so every `Clone`-produced copy of
@@ -4427,7 +4427,7 @@ impl GraphFunc {
 
     /// Snapshot accessor for `func.__globals__`: returns a clone of
     /// the static `self.globals.value` snapshot frozen at construction
-    /// (`flowcontext.py:284 self.w_globals = Constant(func.__globals__)`).
+    /// (`flowcontext.py self.w_globals = Constant(func.__globals__)`).
     pub fn live_globals(&self) -> ConstValue {
         self.globals.value.clone()
     }

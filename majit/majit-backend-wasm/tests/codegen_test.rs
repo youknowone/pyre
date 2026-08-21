@@ -2385,7 +2385,7 @@ fn test_guard_gc_type_uses_immediate_typeid() {
 /// derives from a real `GcLLDescr_framework`-equivalent allocator.
 /// Mirrors `gc.py get_translated_info_for_typeinfo` /
 /// `gc.py get_translated_info_for_guard_is_object` /
-/// `x86/assembler.py:1951 cpu.subclassrange_min_offset`.
+/// `x86/assembler.py cpu.subclassrange_min_offset`.
 fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
     // Pretend the TYPE_INFO table sits at a small in-memory address;
     // wasm validation only checks the bytecode shape, not the actual

@@ -747,7 +747,7 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         w_group_message: PY_NULL,
         w_group_exceptions: PY_NULL,
         w_group_exceptions_repr: PY_NULL,
-        // `interp_exceptions.py:113 w_dict = None` — allocated on the
+        // `interp_exceptions.py w_dict = None` — allocated on the
         // first `getdict` (`:222-225`).
         w_dict: PY_NULL,
         // Only ExceptionGroup exposes this slot; the shared flattened

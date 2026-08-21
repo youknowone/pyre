@@ -356,7 +356,7 @@ fn clear_published_jitframe_gc_type_id() {
 enum JitFrameHeap {
     /// GC-managed under this type id — `jitframe.py:48`
     /// `lltype.malloc(JITFRAME, ...)`, reached through
-    /// `llmodel.py:298 malloc_jitframe`.
+    /// `llmodel.py malloc_jitframe`.
     Nursery(u32),
     /// The installed allocator has no type table, so there is no shape to
     /// allocate a frame under and the frame is a plain `Vec<i64>` block
@@ -17700,7 +17700,7 @@ impl majit_backend::Backend for CraneliftBackend {
         //
         // Old-gen blocks are handed out zero-filled and the helper stores the
         // length, so the memclear the nursery path needed
-        // (`incminimark.py:211 malloc_zero_filled = False`, compensated by
+        // (`incminimark.py malloc_zero_filled = False`, compensated by
         // `framework.py gct_do_malloc_varsize_clear`) is subsumed
         // here.  Inline allocators in compiled code are unaffected: they get
         // their clearing from the rewriter's ZERO_ARRAY (`rewrite.py:499`,
@@ -25355,7 +25355,7 @@ mod tests {
     /// on a 160-byte nursery, which no jitframe fits in, so its frame is born
     /// old-gen and never moves: what it checks is that a REF INSIDE the frame
     /// was forwarded. `jitframe.py` makes JITFRAME an ordinary GcStruct
-    /// and `llmodel.py:298 malloc_jitframe` allocates it like any other object,
+    /// and `llmodel.py malloc_jitframe` allocates it like any other object,
     /// so the frame itself is nursery-born and a minor collection promotes it
     /// to a different address — and every accessor on the deadframe reads
     /// through `jf_gcref()`, which is stale the moment that happens.

@@ -3241,7 +3241,7 @@ where
     };
     let const_idx = consti.get(op_arg);
     // `pyopcode.py LOAD_CONST` reads `getconstant_w(index)`
-    // (`pyopcode.py:498-499 co_consts_w[index]`): every constant, not just a
+    // (`pyopcode.py co_consts_w[index]`): every constant, not just a
     // nested code object, comes from the enclosing PyCode's shared slot.
     let value = executor.constant_at(const_idx, code)?;
     executor.push_value(value)?;

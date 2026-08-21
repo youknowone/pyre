@@ -206,7 +206,7 @@ pub(super) fn liveness_triple_from_reads(reads: &[Register]) -> (Vec<u8>, Vec<u8
 }
 
 /// RPython `compute_liveness(ssarepr)` mutates each `-live-` instruction
-/// (`liveness.py:52 ssarepr.insns[i] = insn[:1] + tuple(alive) + tuple(labels)`)
+/// (`liveness.py ssarepr.insns[i] = insn[:1] + tuple(alive) + tuple(labels)`)
 /// before `remove_repeated_live(ssarepr)` runs. Mirror that order by
 /// materialising the fixed-point alive set back onto each `LiveMarker`'s
 /// `reads` operand; the repeated-live pass and the emit-time triple

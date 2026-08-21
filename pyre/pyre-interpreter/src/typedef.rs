@@ -16517,7 +16517,7 @@ fn staticmethod_descr_reduce_ex(args: &[PyObjectRef]) -> crate::PyResult {
     ))
 }
 
-/// PyPy `typedef.py:852-877 StaticMethod.typedef`, augmented with the newer
+/// PyPy `typedef.py StaticMethod.typedef`, augmented with the newer
 /// PEP 649 proxy descriptors and generic alias support.
 fn init_staticmethod_type(ns: PyObjectRef) {
     let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);
@@ -16837,7 +16837,7 @@ fn classmethod_descr_reduce_ex(args: &[PyObjectRef]) -> crate::PyResult {
     ))
 }
 
-/// PyPy `typedef.py:878-908 ClassMethod.typedef`, augmented with the newer
+/// PyPy `typedef.py ClassMethod.typedef`, augmented with the newer
 /// PEP 649 proxy descriptors and generic alias support.
 fn init_classmethod_type(ns: PyObjectRef) {
     let dict_getter = make_builtin_function_with_arity("__dict__", descr_get_dict, 2);

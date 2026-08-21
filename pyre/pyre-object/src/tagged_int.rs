@@ -26,7 +26,7 @@ use crate::pyobject::PyObjectRef;
 
 /// `rpython/rtyper/lltypesystem/rtagged.py:64-96` static `can_be_tagged`
 /// gate, collapsed to the single runtime `int` class. Off, mirroring
-/// `rpython/config/translationoption.py:185 taggedpointers` left off. When
+/// `rpython/config/translationoption.py taggedpointers` left off. When
 /// enabled, every consumer chokepoint takes the `& 1` tag precheck and the
 /// maker emits small ints as
 /// immediates. `rerased.py:1-3`: the point is to avoid putting `& 1` tag

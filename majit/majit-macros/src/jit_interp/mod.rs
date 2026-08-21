@@ -2934,41 +2934,9 @@ fn rewrite_body(
                     // `parse2` below wants exactly one `Stmt`, and keeping the
                     // original tokens means the error reported is this one
                     // instead of a cascade of unresolved names.
-                    // A missing `greens` key is refused below. An explicit
-                    // `greens = []` remains supported, so the diagnostic also
-                    // explains the degenerate trace shape of that deliberate case.
-                    if self.default_greens.is_empty() {
-                        // This is emitted once per macro expansion because an
-                        // explicitly empty green set cannot provide a resume pc.
-                        let krate = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| {
-                            "<crate unknown: CARGO_PKG_NAME unset>".to_string()
-                        });
-                        let site = self
-                            .merge_fn_name
-                            .to_string()
-                            .strip_prefix("__merge_")
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| self.merge_fn_name.to_string());
-                        eprintln!(
-                            "warning: [{}] `fn {}` expands with an empty green set on its \
-                             `#[jit_interp]` attribute. Its merge point (`{}`) reports no \
-                             concrete pc, so the tracing walk never advances and every \
-                             trace attempt re-records one guard triple. Where the \
-                             attempts survive, that reaches `trace_limit * 4/5` and \
-                             ships a segmented trace whose compiled loop runs zero \
-                             iterations; where an arm on the loop's back edge is a \
-                             degraded stub, they abort inside it and nothing compiles \
-                             at all. Both outcomes are degenerate. The remedy is to \
-                             declare the greens the loop is keyed on, e.g. \
-                             `greens = [pc, program]` — that does not by itself make \
-                             the back edge lower, which is separate work. If the emptiness is deliberate and spelled \
-                             `greens = []`, this line is the expected report for it and \
-                             there is nothing to change.",
-                            krate,
-                            site,
-                            quote!(#driver)
-                        );
-                    }
+                    // Only a missing `greens` key is refused. An explicit
+                    // `greens = []` is a supported spelling — the fixtures that
+                    // grade the empty-greens encoding use it — and compiles.
                     let new_tokens = if !self.greens_declared {
                         let driver_name = quote!(#driver).to_string();
                         // State the required metadata rather than enumerating

@@ -62,7 +62,7 @@ impl<'c> Lowerer<'c> {
         // RPython `flatten.py:259` `-live-` convention: every guard-bearing
         // instruction is *preceded* by a `live` marker (byte order:
         // `BC_LIVE+offset` then the guard op). The recorded `orgpc` (=
-        // RPython `pyjitpl.py:3713 orgpc = position`, copied to the guard's
+        // RPython `pyjitpl.py orgpc = position`, copied to the guard's
         // `resumepc` via `record_state_guard`) is the byte position of the
         // guard op itself, so the BC_LIVE marker sits at `orgpc - SIZE_LIVE_OP`
         // and blackhole's `get_current_position_info` reads liveness from

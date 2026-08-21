@@ -357,7 +357,7 @@ impl JitCode {
         self.index.get().copied()
     }
 
-    /// RPython `codewriter.py:68 jitcode.index = index` — assigned once,
+    /// RPython `codewriter.py jitcode.index = index` — assigned once,
     /// at the moment the finished jitcode is appended to
     /// `all_jitcodes[]`.  Matches upstream `JitCode` Python-object
     /// identity semantics: a second `set_index` with a *different*

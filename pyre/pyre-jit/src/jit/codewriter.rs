@@ -57,7 +57,7 @@ fn local_to_vable_slot(var_num: usize) -> usize {
 /// Re-export of `pyre_jit_trace::pyjitcode::portal_red_pre_regalloc_slots`
 /// so the codewriter pipeline shares the same formula with the
 /// portal-bridge install path in `canonical_bridge.rs`.  See the
-/// definition site for the `interp_jit.py:67 reds = ['frame', 'ec']`
+/// definition site for the `interp_jit.py reds = ['frame', 'ec']`
 /// rationale.
 use pyre_jit_trace::pyjitcode::portal_red_pre_regalloc_slots;
 
@@ -5977,7 +5977,7 @@ impl CodeWriter {
         // instruction index (`flatten.py`'s "pre-create labels for each
         // block") plus one exception-landing label per covered pc, and a
         // label id is a `u16` because the assembled jump target is a two-byte
-        // operand (`assembler.py:255 assert 0 <= target <= 0xFFFF`).  Upstream
+        // operand (`assembler.py assert 0 <= target <= 0xFFFF`).  Upstream
         // can assert on that ceiling: its jitcodes come from RPython
         // functions, so a violation is a translation-time bug.  Pyre compiles
         // arbitrary user bytecode, so the same ceiling has to DECLINE at
@@ -6632,7 +6632,7 @@ impl CodeWriter {
         // locals prologue (`reds = ['frame', 'ec']`, interp_jit.py). Every
         // drained per-code jitcode carries that Portal input shape, while the
         // marker stays gated on TRUE-PORTAL. Portal registration comes solely
-        // from `codewriter.py:37 jitdriver_sd_from_portal_graph`. The vable
+        // from `codewriter.py jitdriver_sd_from_portal_graph`. The vable
         // access suppression `jtransform.py is_virtualizable_getset`
         // applies at codewrite time under the `fresh_virtualizable` flag
         // happens here at walk time instead: the strict fresh-frame fold
@@ -6790,7 +6790,7 @@ impl CodeWriter {
         let preserve_exception_edge_states = catch_sites
             .iter()
             .any(|site| site.landing.has_explicit_raise_operand_edge());
-        // `flowcontext.py:293 self.joinpoints = {}` — sparse-by-PC dict
+        // `flowcontext.py self.joinpoints = {}` — sparse-by-PC dict
         // keyed by `next_offset`, populated via `setdefault(...)` per
         // `flowcontext.py:426`.  Vec-of-Vec value preserves the candidate
         // list semantics for supersede where multiple SpamBlocks at the
@@ -14473,7 +14473,7 @@ impl CodeWriter {
         let splice_pairs = cfg_variable_pairs;
         let (canonical, splice_regallocs) = (|| {
             let mut splice_regallocs = graph_regallocs.clone();
-            // `interp_jit.py:67 reds = ['frame', 'ec']`: both portal inputs
+            // `interp_jit.py reds = ['frame', 'ec']`: both portal inputs
             // are live in every MIFrame at every guard. Give them dedicated
             // Ref colors above the ordinary allocator range so neither can be
             // coalesced with a local/stack value at an interior resume point.

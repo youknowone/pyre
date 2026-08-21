@@ -18,7 +18,7 @@
 //! ── Policy-byte vs fold-path subtlety ───────────────────────────────
 //!
 //! Plain `#[elidable]` advertises a *can-raise* policy byte
-//! (`REF_ELIDABLE = 21`, `call.py:297 elif cr:`).  The fold machinery
+//! (`REF_ELIDABLE = 21`, `call.py elif cr:`).  The fold machinery
 //! exercised by checks 2-3 (`call_typed_with_effect_pure` →
 //! `record_result_of_call_pure` → `execute_pure_call`) is the
 //! `_record_helper_pure` path, which `pyjitpl.py:1351-1352` reaches ONLY

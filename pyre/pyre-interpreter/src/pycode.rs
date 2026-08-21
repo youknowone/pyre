@@ -184,12 +184,12 @@ pub struct PyCode {
     pub ob_header: PyObject,
     /// Opaque pointer to a `CodeObject` (owned via Box::into_raw).
     pub code_ptr: *const (),
-    /// `pycode.py:143 self.co_firstlineno = firstlineno`. RustPython's
+    /// `pycode.py self.co_firstlineno = firstlineno`. RustPython's
     /// `CodeObject.first_line_number: Option<OneIndexed>` cannot represent
     /// the zero/negative values accepted by Python 3.14's CodeType
     /// constructor, so preserve the exact Python integer on the PyCode itself.
     pub co_firstlineno_raw: i32,
-    /// `pycode.py:135 self.co_filename = filename`: the byte-exact filesystem
+    /// `pycode.py self.co_filename = filename`: the byte-exact filesystem
     /// spelling owned by this `PyCode`. Null means that `code.source_path` is
     /// already the exact UTF-8 spelling, avoiding an allocation for compiled
     /// source paths and ordinary filename replacements.
@@ -208,7 +208,7 @@ pub struct PyCode {
     /// the code object being constructed.
     pub filename_inherits_to_nested: bool,
     /// PyPy: `PyCode.w_globals` — the globals dict OBJECT (`W_DictMultiObject`,
-    /// `pycode.py:105 "w_globals?"`).  Module globals are `malloc_typed`-
+    /// `pycode.py "w_globals?"`).  Module globals are `malloc_typed`-
     /// immortal, but `exec`/custom-globals dicts are `try_gc_alloc` movable.
     /// Managed wrappers trace this slot through `eval::walk_raw_code_roots`.
     /// Bootstrap wrappers outside the collector are registered in
@@ -220,7 +220,7 @@ pub struct PyCode {
     /// app_main bridge code.  Pyre has no such call site yet, so this
     /// is always `false` on currently constructed instances; the
     /// field exists so that `frame.hide()` can read the canonical
-    /// `pyframe.py:521-522 return self.pycode.hidden_applevel`.
+    /// `pyframe.py return self.pycode.hidden_applevel`.
     pub hidden_applevel: bool,
     /// pycode.py `_compute_flatcall`. Cached arity descriptor:
     /// - 0-4: impossible (builtins only)
@@ -235,7 +235,7 @@ pub struct PyCode {
     /// `PyFrame::ncells()` / stack-base query (a per-`pop_value` hot path).
     /// `u32::MAX` sentinel when `code_ptr` is null/unaligned (test stubs).
     pub npure_cellvars: u32,
-    /// `pycode.py:198 self._globals_caches = [None] * len(self.co_names_w)`.
+    /// `pycode.py self._globals_caches = [None] * len(self.co_names_w)`.
     ///
     /// Per-name slot for `LOAD_GLOBAL_cached` / `STORE_GLOBAL_cached`
     /// (`celldict.py:292,321,335,353`).  Stores a weak reference to
@@ -265,7 +265,7 @@ pub struct PyCode {
     /// Owned via `Box::into_raw`, sized to `code.names.len()` at construction,
     /// never resized; `null` when `code_ptr` is null or unaligned.
     pub mapdict_caches: *mut Vec<Option<crate::objspace::std::mapdict::MapdictCacheEntry>>,
-    /// `pycode.py:126 self.co_consts_w = consts` (`_immutable_fields_
+    /// `pycode.py self.co_consts_w = consts` (`_immutable_fields_
     /// co_consts_w[*]`, pycode.py:97).  The realized constant objects indexed by
     /// constant index.  `getconstant_w(index)` (`pyopcode.py`) returns
     /// `co_consts_w[index]`, so every `LOAD_CONST` yields the one shared object
@@ -304,10 +304,10 @@ pub struct PyCode {
     /// never resized; a `null` slot is unrealized.  The whole pointer is `null`
     /// when `code_ptr` is null or unaligned (test fixtures, gateway builtins).
     pub co_names_w: *mut Vec<std::sync::atomic::AtomicPtr<PyObject>>,
-    /// `pycode.py:127 self.co_qualname = qualname` realized as one shared
+    /// `pycode.py self.co_qualname = qualname` realized as one shared
     /// wrapped object.
     ///
-    /// `function.py:54 self.qualname = qualname or self.name` copies the code
+    /// `function.py self.qualname = qualname or self.name` copies the code
     /// object's interp-level string into every function built from it, so all
     /// of them name the same immutable string. Pyre wraps names as objects, so
     /// the code object owns the single realized instance and both
@@ -320,10 +320,10 @@ pub struct PyCode {
     /// same reason it forwards `w_globals`: the walker serves both the managed
     /// custom trace and the bootstrap prebuilt-root walk.
     pub w_qualname: PyObjectRef,
-    /// `pycode.py:137 self.co_name = name` realized as one shared wrapped
+    /// `pycode.py self.co_name = name` realized as one shared wrapped
     /// object, the exact counterpart of `w_qualname` above.
     ///
-    /// `function.py:51 self.name = forcename or code.co_name` copies the code
+    /// `function.py self.name = forcename or code.co_name` copies the code
     /// object's interp-level string into every function built from it, so the
     /// same "all of them name one immutable string" argument applies, and the
     /// same realize-once treatment follows.  Without it the getter ran
@@ -357,10 +357,10 @@ pub unsafe fn w_code_firstlineno_raw(w_code: PyObjectRef) -> i32 {
     unsafe { (*(w_code as *const PyCode)).co_firstlineno_raw }
 }
 
-/// `pycode.py:127 self.co_qualname = qualname` — the shared wrapped qualified
+/// `pycode.py self.co_qualname = qualname` — the shared wrapped qualified
 /// name, realized on first demand and retained on the code object.
 ///
-/// `function.py:54 self.qualname = qualname or self.name` and the `co_qualname`
+/// `function.py self.qualname = qualname or self.name` and the `co_qualname`
 /// getter both hand out the code object's own string, so they name one
 /// immutable value; realizing it once here reproduces that identity instead of
 /// minting a `W_UnicodeObject` per `def` and per attribute read.  Returns
@@ -388,7 +388,7 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// `pycode.py:137 self.co_name = name` — the shared wrapped name, realized on
+/// `pycode.py self.co_name = name` — the shared wrapped name, realized on
 /// first demand and retained on the code object.
 ///
 /// The counterpart of [`w_code_qualname_obj`], for the same reason and with the
@@ -417,7 +417,7 @@ pub unsafe fn w_code_name_obj(w_code: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// `pycode.py:135 self.co_filename = filename` as an application-level object,
+/// `pycode.py self.co_filename = filename` as an application-level object,
 /// decoded with the filesystem encoding (`objspace.py newfilename`) so a
 /// path byte with no UTF-8 spelling survives instead of folding to U+FFFD.
 ///
@@ -627,7 +627,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     {
         fast_natural_arity |= YIELDS_INSIDE_TRY_BIT;
     }
-    // `pycode.py:198 self._globals_caches = [None] * len(self.co_names_w)`.
+    // `pycode.py self._globals_caches = [None] * len(self.co_names_w)`.
     let globals_caches = if !code_ptr_aligned {
         std::ptr::null_mut()
     } else {
@@ -651,7 +651,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         v.resize_with(names_len, || None);
         Box::into_raw(Box::new(v))
     };
-    // `pycode.py:126 self.co_consts_w = consts` — the realized-constant table
+    // `pycode.py self.co_consts_w = consts` — the realized-constant table
     // sized to the constant count, with slots filled lazily by `w_code_const`
     // at pyre's wrapped/unwrapped compiler boundary.
     let co_consts_w = if !code_ptr_aligned {
@@ -821,7 +821,7 @@ unsafe fn box_code_constant_inheriting_filename(
 
 /// Attach the filesystem bytes a whole compilation unit was named with.
 ///
-/// `compiling.py:13 filename='fsencode'` names the unit, not one object, so
+/// `compiling.py filename='fsencode'` names the unit, not one object, so
 /// the nested constants this code object still holds unrealized take the same
 /// spelling when they are boxed. That is the difference from `pycode.py:431`,
 /// whose constructor and `replace` filenames rename only the object being
@@ -881,7 +881,7 @@ fn box_code_object_with_firstlineno(code: crate::CodeObject, firstlineno: i32) -
 /// supplied to `CodeType.__new__` / `code.replace`.
 ///
 /// PyPy passes this list straight into `PyCode.__init__`
-/// (`pycode.py:126 self.co_consts_w = consts`), preserving every wrapper's
+/// (`pycode.py self.co_consts_w = consts`), preserving every wrapper's
 /// identity. Pyre additionally serializes the values into compiler
 /// `ConstantData` for bytecode decoding, but that representation must not
 /// replace the interpreter-level owner.
@@ -1058,7 +1058,7 @@ unsafe fn require_code(
 
 /// The `co_names` / `co_varnames` / `co_freevars` / `co_cellvars` getters.
 ///
-/// Interned for `pycode.py:127-129 space.new_interned_str(aname)`' reason: the
+/// Interned for `pycode.py space.new_interned_str(aname)`' reason: the
 /// entries name values, so every code object spelling one must hand back the
 /// same object rather than a fresh immortal string per read.
 fn names_tuple(names: &[String]) -> PyObjectRef {
@@ -1144,7 +1144,7 @@ pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef
         // Shared realized object, like `co_qualname` below.
         "co_name" => unsafe { w_code_name_obj(obj) },
         // The realized qualname is shared with every function built from this
-        // code object (`function.py:54 self.qualname = qualname or self.name`),
+        // code object (`function.py self.qualname = qualname or self.name`),
         // so the attribute yields the same object on each read.
         "co_qualname" => unsafe { w_code_qualname_obj(obj) },
         "co_firstlineno" => w_int_new((*(obj as *const PyCode)).co_firstlineno_raw as i64),
@@ -1821,7 +1821,7 @@ unsafe fn read_code_str(v: PyObjectRef, field: &str) -> Result<String, crate::Py
     Ok(unsafe { pyre_object::w_str_get_value(v) }.to_string())
 }
 
-/// `pycode.py:431 filename='fsencode'`: retain filesystem bytes that the
+/// `pycode.py filename='fsencode'`: retain filesystem bytes that the
 /// compiler dependency's UTF-8 `source_path` cannot represent. A supplied
 /// `fallback` is the last valid UTF-8 spelling used by interpreter/JIT readers;
 /// a new code object uses a lossy compiler-only spelling until those readers
@@ -2157,7 +2157,7 @@ pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectR
     let Some(name) = code.names.get(idx) else {
         return pyre_object::pyobject::PY_NULL;
     };
-    // `pycode.py:127-129 space.new_interned_str(aname)` — one canonical object
+    // `pycode.py space.new_interned_str(aname)` — one canonical object
     // per name value, not one per code object that names it.
     let realized = pyre_object::unicodeobject::intern_str_value(name);
     match slot.compare_exchange(
@@ -2811,7 +2811,7 @@ pub unsafe fn w_code_mapdict_caches_get(
     vec.get(nameindex).copied().flatten()
 }
 
-/// `mapdict.py:1467-1475 pycode._mapdict_caches[nameindex] = entry` — store the
+/// `mapdict.py pycode._mapdict_caches[nameindex] = entry` — store the
 /// filled entry in slot `nameindex`.  No-op when `code_ptr` is invalid or
 /// `nameindex` is out of range.
 ///

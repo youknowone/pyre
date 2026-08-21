@@ -155,7 +155,7 @@ pub struct JitCodeBuilder {
     /// Drained into `JitCodeExecState.call_descr_to_call_target` at
     /// `finish()`.
     call_descr_to_call_target: indexmap::IndexMap<u16, JitCallTarget>,
-    /// RPython `jitcode.py:47 self._resulttypes = resulttypes` —
+    /// RPython `jitcode.py self._resulttypes = resulttypes` —
     /// per-instruction result-kind char keyed by end-of-instruction
     /// position (`assembler.py:217-219`).  Consumed by
     /// `pyjitpl.py make_result_of_lastop` as a non-translated
@@ -2706,7 +2706,7 @@ impl JitCodeBuilder {
     /// `compute_per_marker_liveness` output (`liveness.py:33-79`).  Pyre
     /// renormalises in `_register_liveness_offset`, so callers may pass
     /// arbitrary order; passing the lowerer's already-sorted output
-    /// matches RPython's `liveness.py:148 live = sorted(live)` shape.
+    /// matches RPython's `liveness.py live = sorted(live)` shape.
     pub fn live_placeholder_with_triple(
         &mut self,
         live_i: &[u8],
@@ -3766,7 +3766,7 @@ impl JitCodeBuilder {
             fn_ptr_idx,
             arg_regs,
             majit_ir::descr::EffectInfo {
-                // RPython `effectinfo.py:271-273 MOST_GENERAL` parity:
+                // RPython `effectinfo.py MOST_GENERAL` parity:
                 // release-gil callees default to RandomEffects with
                 // `can_invalidate=true` so the heapcache `clear_caches`
                 // path fires (heapcache.py:343-353) instead of only
@@ -5132,7 +5132,7 @@ impl JitCodeBuilder {
     /// Append a descr-pool entry and return the two-byte operand index that
     /// refers to it.
     ///
-    /// `assembler.py:204 assert 0 <= num <= 0xFFFF, "too many AbstractDescrs!"`
+    /// `assembler.py assert 0 <= num <= 0xFFFF, "too many AbstractDescrs!"`
     /// bounds the same index; upstream aborts translation, and the
     /// build-time builder does too.  This builder runs at runtime and cannot
     /// panic, so an index past the operand width latches the overflow flag
@@ -5392,7 +5392,7 @@ impl JitCodeBuilder {
             panic!("{disagreement}");
         }
         self.patch_const_u8_refs();
-        // RPython `jitcode.py:47 self._resulttypes = resulttypes`.
+        // RPython `jitcode.py self._resulttypes = resulttypes`.
         // Upstream `assembler.py:217-219` records the result-kind
         // char at the end-of-instruction position (`len(self.code)`
         // after operands, before the next instruction's opcode) for
@@ -5446,7 +5446,7 @@ impl JitCodeBuilder {
         // index `num_regs + len(consts) - 1 < 256`, i.e. `total <= 256`.
         debug_assert!(total_i <= 256 && total_r <= 256 && total_f <= 256);
         let body = majit_translate::jitcode::JitCodeBody {
-            // RPython `jitcode.py:17 self.calldescr = calldescr` — the
+            // RPython `jitcode.py self.calldescr = calldescr` — the
             // value was stored on the builder via `set_calldescr` (the
             // analog of upstream's constructor argument).  Without an
             // explicit stage call the field remains at the

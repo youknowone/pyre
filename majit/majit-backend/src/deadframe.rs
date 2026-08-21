@@ -1,6 +1,6 @@
 //! The deadframe a jitframe-backed backend returns from a compiled run.
 //!
-//! `llmodel.py:328 return ll_frame` — the deadframe IS the JitFrame. Values
+//! `llmodel.py return ll_frame` — the deadframe IS the JitFrame. Values
 //! stay in `jf_frame[]` and are never copied out: `get_int_value(deadframe,
 //! index)` (`llmodel.py:437-451`) casts the opaque deadframe back to a
 //! JITFRAMEPTR and reads `jf_frame[index]` in place, and `get_latest_descr`
@@ -15,7 +15,7 @@ use crate::jitframe::{FIRST_ITEM_OFFSET, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitF
 /// Where a held deadframe keeps its jitframe pointer.
 ///
 /// The frame is an ordinary GC object (`jitframe.py` makes JITFRAME a
-/// GcStruct and `llmodel.py:298 malloc_jitframe` allocates it like any other),
+/// GcStruct and `llmodel.py malloc_jitframe` allocates it like any other),
 /// so a collection during the window the deadframe is held promotes it to a
 /// different address while every accessor is still reading through the old
 /// one. The pointer therefore has to live somewhere the collector rewrites.

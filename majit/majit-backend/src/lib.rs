@@ -1190,7 +1190,7 @@ pub struct JitCellToken {
     /// that this loop can jump to (via CALL_ASSEMBLER or JUMP).
     /// Upstream prevents the target from being evicted while this loop
     /// is alive by holding the actual `JitCellToken` object reference
-    /// (`history.py:455 _keepalive_jitcell_tokens = {}` keyed on the
+    /// (`history.py _keepalive_jitcell_tokens = {}` keyed on the
     /// token object itself, with `:457 record_jump_to` writing
     /// `self._keepalive_jitcell_tokens[target] = None`).  Pyre keeps the
     /// same shape: an `Arc<JitCellToken>` set keyed on token number.
@@ -1671,7 +1671,7 @@ pub enum DeadFrame {
     /// `llmodel.py:328` — the deadframe IS the jitframe the run returned,
     /// held in a GC root slot because the collector may move it.
     JitFrame(deadframe::JitFrameDeadFrame),
-    /// `llmodel.py:328` as well, for frames `llmodel.py:298 malloc_jitframe`
+    /// `llmodel.py` as well, for frames `llmodel.py malloc_jitframe`
     /// answered from outside the GC heap: the deadframe is still the jitframe,
     /// but it never moves, takes no root slot, and owns the `jf_forward` chain
     /// it was handed until it drops.
@@ -2845,7 +2845,7 @@ pub trait Backend: Send {
     /// `ExitFrameWithExceptionDescrRef`, `PropagateExceptionDescr`) are
     /// pointer-matched at higher layers before reaching this method.
     ///
-    /// `warmspot.py:1021 cpu.get_latest_descr(deadframe)` has no failure
+    /// `warmspot.py cpu.get_latest_descr(deadframe)` has no failure
     /// mode — every live deadframe carries a valid descr handle.  Pyre
     /// backends mirror this contract via the CLT-pinned cell lifetime;
     /// the recovery is therefore infallible.  Default panics so backends
@@ -3621,7 +3621,7 @@ pub trait Backend: Send {
     }
 
     /// `model.py AbstractCPU.setup_once` parity, called by
-    /// `pyjitpl.py:2297 self.cpu.setup_once()` inside
+    /// `pyjitpl.py self.cpu.setup_once()` inside
     /// `MetaInterpStaticData._setup_once` (`pyjitpl.py`),
     /// guarded by `globaldata.initialized` so it runs exactly once
     /// per CPU after every descr setter has been called.  Backends

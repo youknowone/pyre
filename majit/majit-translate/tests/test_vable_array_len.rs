@@ -133,7 +133,7 @@ fn vable_array_len_lowers_to_arraylen_not_a_call() {
 /// `prune_dead_phis` (`transform_dead_op_vars`) is what removes such a
 /// link arg, and it can only do so when the target's inputargs are
 /// Variables distinct from the link args feeding them
-/// (`flowcontext.py:466 newstate = state.copy()`).  This asserts the
+/// (`flowcontext.py newstate = state.copy()`).  This asserts the
 /// outcome rather than the mechanism, so it stays meaningful if the
 /// freshening moves.
 #[test]

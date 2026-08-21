@@ -1873,7 +1873,7 @@ pub(crate) fn normalize_closing_jump_args(
 /// so the compiled loop's `len(inputargs) == entry_prefix_len` matches
 /// `execute_token`'s `clt._debug_nbargs` and CA's `op.args.len()`.
 ///
-/// `entry_prefix_len` is `compile.py:431 i = jitdriver_sd.num_red_args`: the
+/// `entry_prefix_len` is `compile.py i = jitdriver_sd.num_red_args`: the
 /// number of leading inputargs that survive the truncation, and the position
 /// the field reconstruction starts from. Upstream can spell it as the red-arg
 /// count because upstream's entry contract IS the red list — `warmstate.py:387
@@ -4478,7 +4478,7 @@ impl ResumeGuardCopiedDescr {
         // Safety: single-threaded JIT, no concurrent writers.
         unsafe { &*self.prev.get() }
     }
-    /// `compile.py:842 self.prev = other.prev` — overwrite the donor
+    /// `compile.py self.prev = other.prev` — overwrite the donor
     /// pointer in place. Identity (`fail_index` / subtype tag) stays.
     fn set_prev(&self, prev: DescrRef) {
         // Safety: single-threaded JIT, no concurrent readers.
@@ -5587,7 +5587,7 @@ impl TraceCtx {
     /// survive the collapse.
     ///
     /// **Known parity gap (intentional for now)**: upstream
-    /// `pyjitpl.py:2996 assert len(original_boxes) == len(live_arg_boxes)`
+    /// `pyjitpl.py assert len(original_boxes) == len(live_arg_boxes)`
     /// must fire on every visited merge point because all merge points
     /// in `current_merge_points` come from the same jitdriver (fixed
     /// red-bank shape).  Pyre's `current_merge_points` currently mixes

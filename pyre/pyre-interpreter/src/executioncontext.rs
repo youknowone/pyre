@@ -307,7 +307,7 @@ pub struct ExecutionContext {
     pub w_profilefuncarg: PyObjectRef,
     pub thread_disappeared: bool,
     pub w_async_exception_type: PyObjectRef,
-    /// `threadlocals.py:9,95-97 ExecutionContext._signals_enabled` — only the
+    /// `threadlocals.py ExecutionContext._signals_enabled` — only the
     /// execution context owned by `OSThreadLocals._mainthreadident` may run
     /// app-level signal handlers.  A fork from another thread promotes that
     /// thread's EC in `thread::after_fork_child`.
@@ -616,7 +616,7 @@ impl ExecutionContext {
         }
         // `self.topframeref = jit.virtual_ref(frame)`.  At interp level
         // `virtual_ref(frame)` is the frame pointer itself
-        // (`_jit_vref.py:40 lowleveltype = OBJECTPTR`, no allocation); the
+        // (`_jit_vref.py lowleveltype = OBJECTPTR`, no allocation); the
         // JIT rewrites it to a `JitVirtualRef` when it virtualizes the frame.
         self.topframeref = frame;
     }

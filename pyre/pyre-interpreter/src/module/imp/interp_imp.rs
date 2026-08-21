@@ -1232,7 +1232,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         type_name(args[1])
                     )));
                 }
-                // `interp_imp.py:157 pathname='fsencode'`: preserve the raw
+                // `interp_imp.py pathname='fsencode'`: preserve the raw
                 // filesystem spelling before storing it on the code object.
                 let newname = crate::gateway::fsencode_bytes_w(args[1])?;
                 unsafe { crate::pycode::fix_co_filename(args[0], &newname) };

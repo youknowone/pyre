@@ -1,7 +1,7 @@
 //! `sys` module interpreter-level state.
 //!
 //! PyPy stores `sys.recursionlimit` on the `sys` module instance itself
-//! (`pypy/module/sys/moduledef.py:25 self.recursionlimit = 1000`,
+//! (`pypy/module/sys/moduledef.py self.recursionlimit = 1000`,
 //! read/written through `space.sys.recursionlimit` in
 //! `pypy/module/sys/vm.py:92-96`). Pyre is single-space so the module
 //! singleton maps 1:1 to a static here, but the storage is scoped to
@@ -36,7 +36,7 @@ pub const MAX_STR_DIGITS_THRESHOLD: i32 = 640;
 static INT_MAX_STR_DIGITS: AtomicI32 = AtomicI32::new(DEFAULT_MAX_STR_DIGITS);
 
 /// `space.sys.recursionlimit` getter. Matches
-/// `pypy/module/sys/vm.py:102 return space.newint(space.sys.recursionlimit)`.
+/// `pypy/module/sys/vm.py return space.newint(space.sys.recursionlimit)`.
 ///
 /// The value is mutable sys-module state, so tracing must read it at runtime
 /// rather than bake the build process's atomic value into a JitCode.

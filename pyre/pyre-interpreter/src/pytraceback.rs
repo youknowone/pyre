@@ -11,7 +11,7 @@
 //! ```
 //!
 //! Upstream `frame` is an ordinary traced field of an ordinary movable
-//! instance: `pytraceback.py:29 self.frame = frame` on a
+//! instance: `pytraceback.py self.frame = frame` on a
 //! `baseobjspace.W_Root`, pointing at `pyframe.py:52 class
 //! PyFrame(W_Root)`, which declares no `_alloc_flavor_` and is never
 //! pinned — `rpython/rlib/rgc.py` documents `pin` as a
@@ -67,7 +67,7 @@ pub static PYTRACEBACK_TYPE: PyType = new_pytype("traceback");
 #[repr(C)]
 pub struct PyTraceback {
     pub ob_header: PyObject,
-    /// `pytraceback.py:29 self.frame = frame` — a raw `*mut PyFrame`
+    /// `pytraceback.py self.frame = frame` — a raw `*mut PyFrame`
     /// rather than a `PyObjectRef`, so it takes part in collection
     /// only through `pytraceback_object_custom_trace`.  That hook
     /// forwards the slot when the GC owns the frame, which keeps it
@@ -77,7 +77,7 @@ pub struct PyTraceback {
     /// not — the pre-hook bootstrap window — collects nothing, so a
     /// frame born there is never swept either way.
     pub frame: *mut crate::pyframe::PyFrame,
-    /// `pytraceback.py:30 self.lasti = lasti` — where in the bytecode the
+    /// `pytraceback.py self.lasti = lasti` — where in the bytecode the
     /// exception was raised, in the units `tb_lasti` is defined in: bytes,
     /// two per instruction.  `descr_get_tb_lasti` hands this straight out
     /// (`pytraceback.py:45-46`), and it has to be the byte form for
@@ -85,11 +85,11 @@ pub struct PyTraceback {
     /// `tb_lasti // 2`.  Pyre's own producers count instructions, so
     /// `record_application_traceback` converts; its two readers convert back.
     pub lasti: i64,
-    /// `pytraceback.py:31 self.next = next` — head pointer to the
+    /// `pytraceback.py self.next = next` — head pointer to the
     /// preceding traceback in the chain (caller-side); `PY_NULL`
     /// terminates the chain.
     pub w_next: PyObjectRef,
-    /// `pytraceback.py:32 self.lineno = lineno` — either a real
+    /// `pytraceback.py self.lineno = lineno` — either a real
     /// source line number or `LINENO_NOT_COMPUTED`, in which case
     /// `get_lineno` calls `offset2lineno` to resolve it lazily
     /// (`pytraceback.py:34-37`).
@@ -417,7 +417,7 @@ pub unsafe fn record_application_traceback(
         return;
     }
     unsafe {
-        // `pycode.py:111 self.hidden_applevel` — pyre's
+        // `pycode.py self.hidden_applevel` — pyre's
         // `PyCode.hidden_applevel` flag (`pycode.rs`) skips
         // gateway / app_main bridge frames from the traceback.
         let pycode_ptr = (*frame).pycode as *const crate::pycode::PyCode;

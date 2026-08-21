@@ -764,7 +764,7 @@ fn build_jitcode_registry(
 /// `index_of_virtualizable`. Both spellings work upstream because the compiled
 /// entry is invoked with exactly the jitdriver's reds (`warmstate.py:387
 /// execute_assembler`) and the virtualizable is one of them
-/// (`warmspot.py:538 jd.index_of_virtualizable = jitdriver.reds.index(vname)`).
+/// (`warmspot.py jd.index_of_virtualizable = jitdriver.reds.index(vname)`).
 ///
 /// A driver that declares its runtime state as flat fields presents a
 /// different entry: one slot per declared field, in the order the state's live
@@ -1240,7 +1240,7 @@ impl JitDriverStaticData {
         self.red_arg_virtualizable_index()
     }
 
-    /// `warmspot.py:537 jd.index_of_virtualizable = jitdriver.reds.index(vname)`.
+    /// `warmspot.py jd.index_of_virtualizable = jitdriver.reds.index(vname)`.
     ///
     /// The virtualizable's position among the REDS, and only that — a flat
     /// entry contract does not override it, because the list this indexes is
@@ -1596,7 +1596,7 @@ impl<S: JitState> JitDriver<S> {
 
     /// Copy `shared_asm`'s `all_liveness` byte
     /// stream into `staticdata.liveness_info`, mirroring
-    /// `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
+    /// `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`.
     ///
     /// Must run while `staticdata` Arc is uniquely owned (i.e. before
     /// the first trace clones it), after macro-emitted prebuild has
@@ -1609,7 +1609,7 @@ impl<S: JitState> JitDriver<S> {
     /// Install the state-field JIT canonical liveness payload before
     /// any tracing path runs.  Mirrors RPython `warmspot.py:281-289`'s
     /// `make_jitcodes() → finish_setup(codewriter)` for the narrow
-    /// `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`
+    /// `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`
     /// slice — full `finish_setup` requires `CodeWriter` /
     /// `CallControl` construction, which is not yet wired.
     ///
@@ -1737,7 +1737,7 @@ impl<S: JitState> JitDriver<S> {
     /// A driver that has not registered a dispatch jitcode has nothing to
     /// publish and is left alone.
     ///
-    /// `warmspot.py:281-282 metainterp_sd.jitcodes` now owns the table
+    /// `warmspot.py metainterp_sd.jitcodes` now owns the table
     /// (`MetaInterp::install_jitcodes`), but one `MetaInterpStaticData` per
     /// driver is still not upstream's ONE table, and this store is a separate
     /// per-thread copy of it besides. Re-aiming on entry only removes the
@@ -8919,7 +8919,7 @@ mod tests {
         //   3. Forward to `JitDriver::install_canonical_liveness`.
         //
         // RPython parity: `warmspot.py:281-289` →
-        // `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`
+        // `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`
         // — the metainterp-side test
         // (`pyjitpl.rs::metainterp_install_canonical_liveness_publishes_asm_bytes`)
         // exercises the inner layer; this driver-level test guards the

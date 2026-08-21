@@ -3278,7 +3278,7 @@ pub(super) fn resolve_greens(
 /// pyre's portal inputs are `program` (Ref/r0), `pc` (Int/i0), and optionally
 /// `vable_var` (Ref/r1).  The reds = portal-inputs minus declared greens.
 ///
-/// TODO: `interp_jit.py:67 reds = ['frame', 'ec']` uses
+/// TODO: `interp_jit.py reds = ['frame', 'ec']` uses
 /// PyPy's frame+ec pair; pyre uses `[program, pc]` (minus greens) as its
 /// minimal reds set.  Consumers that want the PyPy parity declaration can set
 /// `greens = [pc, program]`, leaving reds = [], which is the intended A.6

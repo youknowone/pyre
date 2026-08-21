@@ -449,7 +449,7 @@ fn enforce_input_args(graph: &FunctionGraph, regallocs: &mut HashMap<RegKind, Re
         let realcol = numkinds.get(&kind).copied().unwrap_or(0);
         numkinds.insert(kind, realcol + 1);
         if curcol != realcol {
-            // `flatten.py:99 assert curcol > realcol` — startblock
+            // `flatten.py assert curcol > realcol` — startblock
             // inputargs cannot already occupy a color smaller than
             // their own slot index (the regalloc would have packed
             // them tighter).
@@ -488,7 +488,7 @@ pub struct GraphFlattener<'a> {
     pub graph: &'a FunctionGraph,
     pub regallocs: &'a HashMap<RegKind, RegAllocator>,
     pub _include_all_exc_links: bool,
-    /// `flatten.py:103 self.seen_blocks = {}` — set of block ids already
+    /// `flatten.py self.seen_blocks = {}` — set of block ids already
     /// emitted; second visits become `goto + ---` (back-edge).
     pub seen_blocks: std::collections::HashSet<BlockId>,
     /// `flatten.py self.registers = {}` — `(kind, color) -> Register`
@@ -904,7 +904,7 @@ impl<'a> GraphFlattener<'a> {
                 continue;
             }
             // Skip Void inputargs (no color assigned by regalloc) — the
-            // `flatten.py:309 v.concretetype is not lltype.Void` filter.
+            // `flatten.py v.concretetype is not lltype.Void` filter.
             let dst = match self.try_getcolor(dst_var) {
                 Some(r) => r,
                 None => continue,
@@ -925,9 +925,9 @@ impl<'a> GraphFlattener<'a> {
             }
             lst.push((src, dst));
         }
-        // `flatten.py:312 lst.sort(key=lambda(v, w): w.index)`.
+        // `flatten.py lst.sort(key=lambda(v, w): w.index)`.
         lst.sort_by_key(|(_, dst)| dst.index);
-        // `flatten.py:316-318 renamings.setdefault(w.kind, ([], []))`.
+        // `flatten.py renamings.setdefault(w.kind, ([], []))`.
         let mut renamings: HashMap<RegKind, (Vec<RegOrConst>, Vec<Register>)> = HashMap::new();
         for (src, dst) in lst {
             let entry = renamings
