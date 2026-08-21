@@ -557,7 +557,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("AF_SNA", 11);
         cst!("AF_IRDA", 26);
         cst!("AF_BLUETOOTH", 32);
-        cst!("AF_HYPERV", 34);
+        cst!("AF_HYPERV", ws::AF_HYPERV);
         // ── Socket types ──
         cst!("SOCK_STREAM", ws::SOCK_STREAM);
         cst!("SOCK_DGRAM", ws::SOCK_DGRAM);
@@ -2675,11 +2675,144 @@ fn socket_get_so_protocol(_fd: rffi::Socket) -> Result<libc::c_int, crate::PyErr
 #[cfg(unix)]
 const SUN_PATH_OFFSET: usize = core::mem::offset_of!(libc::sockaddr_un, sun_path);
 
+/// `HV_PROTOCOL_RAW` — the only protocol an `AF_HYPERV` socket is opened with.
+/// `hvsocket.h` defines it; `windows-sys` does not carry that header.
+#[cfg(windows)]
+const HV_PROTOCOL_RAW: libc::c_int = 1;
+
+/// `SOCKADDR_HV` (`hvsocket.h`): the family, a reserved word, and the two
+/// GUIDs a Hyper-V endpoint is named by.  36 bytes, so it fits a
+/// `sockaddr_storage` like every other form here.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockaddrHv {
+    family: u16,
+    reserved: u16,
+    vm_id: windows_sys::core::GUID,
+    service_id: windows_sys::core::GUID,
+}
+
+/// The single message `PyArg_ParseTuple(args, "UU;...")` produces for every
+/// shape that is a tuple but not two `str`s — a wrong length included.
+#[cfg(windows)]
+fn hyperv_address_shape_error() -> crate::PyError {
+    crate::PyError::type_error("AF_HYPERV address must be a str tuple (vm_id, service_id)")
+}
+
+/// `UuidFromStringW`, which takes the bare 8-4-4-4-12 spelling and nothing
+/// else: a braced or truncated GUID is rejected here rather than reinterpreted.
+#[cfg(windows)]
+fn parse_hyperv_guid(
+    caller: &str,
+    field: &str,
+    w_text: pyre_object::PyObjectRef,
+) -> Result<windows_sys::core::GUID, crate::PyError> {
+    let mut wide: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(w_text) }
+        .encode_wide()
+        .collect();
+    wide.push(0);
+    let mut guid = windows_sys::core::GUID {
+        data1: 0,
+        data2: 0,
+        data3: 0,
+        data4: [0; 8],
+    };
+    let status =
+        unsafe { windows_sys::Win32::System::Rpc::UuidFromStringW(wide.as_ptr(), &mut guid) };
+    if status != windows_sys::Win32::System::Rpc::RPC_S_OK {
+        return Err(crate::PyError::value_error(format!(
+            "{caller}(): AF_HYPERV address {field} is not a valid UUID string"
+        )));
+    }
+    Ok(guid)
+}
+
+/// The spelling `UuidToStringW` gives a GUID: lower case, unbraced.
+#[cfg(windows)]
+fn hyperv_guid_string(guid: &windows_sys::core::GUID) -> String {
+    use windows_sys::Win32::System::Rpc::{RPC_S_OK, RpcStringFreeW, UuidToStringW};
+
+    let mut text: *mut u16 = std::ptr::null_mut();
+    if unsafe { UuidToStringW(guid, &mut text) } != RPC_S_OK {
+        return String::new();
+    }
+    let mut end = 0usize;
+    while unsafe { *text.add(end) } != 0 {
+        end += 1;
+    }
+    let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, end) });
+    unsafe { RpcStringFreeW(&mut text) };
+    out
+}
+
+/// The `AF_HYPERV` case of `getsockaddrarg` (`socketmodule.c:2643-2712`).
+#[cfg(windows)]
+fn pack_hyperv_addr(
+    caller: &str,
+    proto: libc::c_int,
+    addr: pyre_object::PyObjectRef,
+    storage: &mut rffi::sockaddr_storage,
+) -> Result<rffi::SockLen, crate::PyError> {
+    if proto != HV_PROTOCOL_RAW {
+        return Err(crate::PyError::os_error(format!(
+            "{caller}(): unsupported AF_HYPERV protocol: {proto}"
+        )));
+    }
+    if !unsafe { pyre_object::is_tuple(addr) } {
+        return Err(crate::PyError::type_error(format!(
+            "{caller}(): AF_HYPERV address must be tuple, not {}",
+            crate::type_methods::arg_type_name(addr)
+        )));
+    }
+    if unsafe { pyre_object::w_tuple_len(addr) } != 2 {
+        return Err(hyperv_address_shape_error());
+    }
+    let w_vm_id = unsafe { pyre_object::w_tuple_getitem(addr, 0) }.expect("length checked above");
+    let w_service_id =
+        unsafe { pyre_object::w_tuple_getitem(addr, 1) }.expect("length checked above");
+    if !unsafe { pyre_object::is_str(w_vm_id) } || !unsafe { pyre_object::is_str(w_service_id) } {
+        return Err(hyperv_address_shape_error());
+    }
+    // Both GUIDs are parsed before either is stored: no step here runs Python,
+    // so the two lookups above stay valid across the second parse.
+    let vm_id = parse_hyperv_guid(caller, "vm_id", w_vm_id)?;
+    let service_id = parse_hyperv_guid(caller, "service_id", w_service_id)?;
+    let hv = unsafe { &mut *(storage as *mut _ as *mut SockaddrHv) };
+    *hv = SockaddrHv {
+        family: windows_sys::Win32::Networking::WinSock::AF_HYPERV,
+        reserved: 0,
+        vm_id,
+        service_id,
+    };
+    Ok(core::mem::size_of::<SockaddrHv>() as rffi::SockLen)
+}
+
+/// The `AF_HYPERV` case of `makesockaddr` (`socketmodule.c:1740-1767`) — the
+/// two GUIDs as strings, the same shape `bind` and `connect` accept.
+#[cfg(windows)]
+fn unpack_hyperv_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObjectRef {
+    let hv = unsafe { &*(storage as *const _ as *const SockaddrHv) };
+    let vm_id = hyperv_guid_string(&hv.vm_id);
+    let service_id = hyperv_guid_string(&hv.service_id);
+    pyre_object::w_tuple_new(vec![
+        pyre_object::w_str_new(&vm_id),
+        pyre_object::w_str_new(&service_id),
+    ])
+}
+
 #[cfg(any(unix, windows))]
 fn pack_inet_addr(
+    caller: &str,
     family: libc::c_int,
+    proto: libc::c_int,
     addr: pyre_object::PyObjectRef,
 ) -> Result<(rffi::sockaddr_storage, rffi::SockLen), crate::PyError> {
+    // Only the AF_HYPERV form reads these two: `getsockaddrarg` names the
+    // calling method in its messages and rejects any protocol but
+    // `HV_PROTOCOL_RAW`.
+    #[cfg(not(windows))]
+    let _ = (caller, proto);
     let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
     // AF_UNIX is special: rsocket.py:RSocket.bind/connect accept a bare
     // bytes/str path (or a 1-tuple wrapping the path).  Pull the path
@@ -2725,6 +2858,12 @@ fn pack_inet_addr(
         // terminator is counted only for a regular name that has one.
         let addrlen = SUN_PATH_OFFSET + path_bytes_vec.len() + usize::from(!abstract_name);
         return Ok((storage, addrlen as rffi::SockLen));
+    }
+
+    #[cfg(windows)]
+    if family == windows_sys::Win32::Networking::WinSock::AF_HYPERV as libc::c_int {
+        let addrlen = pack_hyperv_addr(caller, proto, addr, &mut storage)?;
+        return Ok((storage, addrlen));
     }
 
     if !unsafe { pyre_object::is_tuple(addr) } {
@@ -2924,6 +3063,10 @@ fn unpack_inet_addr(
         #[cfg(unix)]
         if family == libc::AF_UNIX {
             return unpack_unix_addr(storage, addrlen);
+        }
+        #[cfg(windows)]
+        if family == windows_sys::Win32::Networking::WinSock::AF_HYPERV as libc::c_int {
+            return unpack_hyperv_addr(storage);
         }
         pyre_object::w_tuple_new(vec![])
     }
@@ -3278,7 +3421,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let obj = args[0];
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let (storage, slen) = pack_inet_addr(family, args[1])?;
+                let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                let (storage, slen) = pack_inet_addr("bind", family, proto, args[1])?;
                 let r =
                     unsafe { rffi::bind(fd, &storage as *const _ as *const rffi::sockaddr, slen) };
                 if r != 0 {
@@ -3408,7 +3552,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let obj = args[0];
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let (storage, slen) = pack_inet_addr(family, args[1])?;
+                let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                let (storage, slen) = pack_inet_addr("connect", family, proto, args[1])?;
                 #[cfg(windows)]
                 if let Some(timeout) = socket_positive_timeout(obj) {
                     return match socket_connect_timed(fd, &storage, slen, timeout) {
@@ -3454,7 +3599,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let obj = args[0];
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let (storage, slen) = pack_inet_addr(family, args[1])?;
+                let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                let (storage, slen) = pack_inet_addr("connect_ex", family, proto, args[1])?;
                 #[cfg(windows)]
                 if let Some(timeout) = socket_positive_timeout(obj) {
                     let err = socket_connect_timed(fd, &storage, slen, timeout).err();
@@ -3662,7 +3808,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let result = (|| -> Result<isize, crate::PyError> {
                 let buf = buffer.as_bytes();
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                let (storage, slen) = pack_inet_addr(family, addr_obj)?;
+                let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                let (storage, slen) = pack_inet_addr("sendto", family, proto, addr_obj)?;
                 loop {
                     let (r, errno) = socket_call(|| unsafe {
                         rffi::sendto(
@@ -4321,7 +4468,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let (addr_storage, addr_len) =
                 if args.len() >= 5 && !unsafe { pyre_object::is_none(args[4]) } {
                     let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
-                    let (s, l) = pack_inet_addr(family, args[4])?;
+                    let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                    let (s, l) = pack_inet_addr("sendmsg", family, proto, args[4])?;
                     (Some(s), l)
                 } else {
                     (None, 0)

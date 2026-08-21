@@ -98,7 +98,9 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 # (PlaySoundW in Media_Audio, Beep and MessageBeep in
 # System_Diagnostics_Debug), and `_winapi.NeedCurrentDirectoryForExePath`
 # (System_Environment), and the OVERLAPPED record `_winapi.Overlapped` owns
-# with the CancelIoEx/GetOverlappedResult pair that drives it (System_IO).
+# with the CancelIoEx/GetOverlappedResult pair that drives it (System_IO), and
+# the UuidFromStringW/UuidToStringW pair an AF_HYPERV address is spelled with
+# (System_Rpc).
 # Kept on the same 0.61 line rustpython-host_env's nt module resolves to, so
 # HANDLE types match at the boundary.
 windows-sys = { version = "0.61", features = [
@@ -115,6 +117,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
+    "Win32_System_Rpc",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
