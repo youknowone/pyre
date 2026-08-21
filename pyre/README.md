@@ -108,6 +108,7 @@ pyre/
 ├── pyre-jit-trace   # Trace-time JIT — MIFrame and tracing logic
 ├── pyre-wasm        # The interpreter compiled to WebAssembly
 ├── pyre-wasm-runner # Native wasmtime host satisfying the JIT host-import contract
+├── pyre-wasm-test   # Interpreter-only smoke binary run inside the wasm sandbox
 └── pyrex            # Executable entry point (builds the `pyre` binary)
 ```
 

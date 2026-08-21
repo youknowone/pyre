@@ -27,7 +27,6 @@ pub(crate) struct VirtualizableConfig {
     /// Byte offsets of static (scalar) frame fields (e.g. next_instr, stack_depth).
     pub static_field_offsets: Vec<usize>,
     /// Types of static (scalar) frame fields, parallel to `static_field_offsets`.
-    #[allow(dead_code)]
     pub static_field_types: Vec<Type>,
     /// virtualizable.py:71-72 `static_field_descrs`.
     ///
@@ -41,7 +40,6 @@ pub(crate) struct VirtualizableConfig {
     /// Byte offsets of array pointer frame fields (e.g. locals_w, value_stack_w).
     pub array_field_offsets: Vec<usize>,
     /// Item types of array fields, parallel to `array_field_offsets`.
-    #[allow(dead_code)]
     pub array_item_types: Vec<Type>,
     /// virtualizable.py:73-74 `array_field_descrs`.
     ///
@@ -139,6 +137,26 @@ pub(crate) struct VirtualizableTracker {
 
 impl VirtualizableTracker {
     fn new(config: VirtualizableConfig) -> Self {
+        assert_eq!(
+            config.static_field_offsets.len(),
+            config.static_field_types.len(),
+            "virtualizable static field offsets and types must stay parallel",
+        );
+        assert!(
+            config.static_field_descrs.is_empty()
+                || config.static_field_descrs.len() == config.static_field_offsets.len(),
+            "virtualizable static field descriptors must be absent or parallel to offsets",
+        );
+        assert_eq!(
+            config.array_field_offsets.len(),
+            config.array_item_types.len(),
+            "virtualizable array field offsets and item types must stay parallel",
+        );
+        assert!(
+            config.array_field_descrs.is_empty()
+                || config.array_field_descrs.len() == config.array_field_offsets.len(),
+            "virtualizable array field descriptors must be absent or parallel to offsets",
+        );
         VirtualizableTracker {
             config,
             needs_setup: false,
