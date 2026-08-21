@@ -35,6 +35,15 @@
 //!   threaded through metainterp optimizers.
 //! * `io_buffer`, `jit_state`, `trace_ctx`, and `parity` are pyre
 //!   runtime/test boundaries with no same-named upstream file.
+//! * `intrinsics` has no same-named upstream file: it is the untraced half of
+//!   the intrinsics `#[jit_interp]` rewrites while tracing, whose traced half
+//!   lives in the macro lowerer. RPython needs no such module because it
+//!   lowers `rawstorage.py` / `longlong2float.py` / `rarithmetic.py` at rtype
+//!   time from the one definition each already has.
+//! * `embed` has no same-named upstream file: it holds the per-run census an
+//!   interpreter would otherwise rebuild around the driver callbacks. The
+//!   upstream equivalent is split between `warmspot.py`'s test harness and
+//!   `jitprof.py`, neither of which is a library surface an embedder calls.
 //! * `jitcode` and `recorder` are transitional runtime ABI boundaries
 //!   around canonical translate-side `jitcode.py` / `opencoder.py`
 //!   ports; their module docs describe the remaining migration path.
@@ -106,6 +115,7 @@ pub mod counter;
 pub use majit_backend::model as cpu;
 pub use majit_ir::Value;
 pub use majit_ir::debug;
+pub mod embed;
 pub mod execute_and_record;
 pub mod executor;
 pub mod gc;
@@ -113,6 +123,7 @@ pub mod graphpage;
 pub mod greenfield;
 pub mod heapcache;
 pub mod history;
+pub mod intrinsics;
 pub(crate) mod io_buffer;
 pub mod jit;
 mod jit_state;

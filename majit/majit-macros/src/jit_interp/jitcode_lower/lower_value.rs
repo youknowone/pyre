@@ -2617,6 +2617,129 @@ mod tests {
         assert!(emitted.contains("true"));
     }
 
+    /// One lowering of `source`, seeded with the same three int bindings every
+    /// spelling gets, reduced to the facts a caller can compare.
+    fn lower_source(source: &str) -> (Vec<OpKind>, Vec<Vec<Register>>, Vec<Vec<Register>>, String) {
+        let mut lowerer = Lowerer::new(None);
+        for (name, reg) in [("base", 3u16), ("ea", 4), ("val", 5)] {
+            lowerer
+                .bindings
+                .insert(name.to_string(), binding(reg, BindingKind::Int));
+        }
+        if source.ends_with(';') {
+            let stmt: syn::Stmt = syn::parse_str(source).expect("parse statement");
+            lowerer.lower_stmt(&stmt).expect("statement lowers");
+        } else {
+            let expr: Expr = syn::parse_str(source).expect("parse expression");
+            lowerer.lower_value_expr(&expr).expect("expression lowers");
+        }
+        (
+            lowerer.op_metadata.iter().map(|m| m.kind).collect(),
+            lowerer
+                .op_metadata
+                .iter()
+                .map(|m| m.reads.clone())
+                .collect(),
+            lowerer
+                .op_metadata
+                .iter()
+                .map(|m| m.writes.clone())
+                .collect(),
+            lowerer
+                .statements
+                .iter()
+                .map(ToString::to_string)
+                .collect::<String>(),
+        )
+    }
+
+    /// An IMPORTED intrinsic lowers exactly as a locally-defined one does.
+    ///
+    /// The lowerer matches the last segment of the call expression's path and
+    /// never looks at where the function is defined, so a `use` of an intrinsic
+    /// from another crate is recognized as readily as a `fn` in this module.
+    /// The two are indistinguishable here on purpose: an imported name is
+    /// spelled as a bare call, which is the same token stream a local
+    /// definition produces, so the bare arm below IS the imported spelling and
+    /// the qualified arm covers the other way to reach the same import.
+    ///
+    /// This matters because the untraced bodies these names need can then live
+    /// in one library instead of being rewritten in every module that traces
+    /// them — a duplication that silently diverges the two tiers the day one
+    /// copy is fixed and the others are not.
+    ///
+    /// The op-kind assertion is load-bearing beyond naming the right op: the
+    /// intrinsic arms run ahead of the generic call path, so a spelling that
+    /// failed to be recognized would lower as a residual `Call` — and a
+    /// residual needs a call-policy the imported spelling has no local
+    /// definition to derive one from.
+    #[test]
+    fn an_imported_intrinsic_lowers_like_a_local_one() {
+        for (bare, qualified, expected_kind, expected_emit) in [
+            (
+                "majit_raw_load_i64(base, ea)",
+                "majit_metainterp::intrinsics::majit_raw_load_i64(base, ea)",
+                OpKind::RawLoad,
+                "raw_load_i",
+            ),
+            (
+                "majit_raw_store_i64(base, ea, val);",
+                "majit_metainterp::intrinsics::majit_raw_store_i64(base, ea, val);",
+                OpKind::RawStore,
+                "raw_store_i",
+            ),
+            (
+                "majit_uint_lt(base, ea)",
+                "majit_metainterp::intrinsics::majit_uint_lt(base, ea)",
+                OpKind::BinopI,
+                "UintLt",
+            ),
+        ] {
+            let local = lower_source(bare);
+            let imported = lower_source(qualified);
+            assert_eq!(
+                local.0,
+                vec![expected_kind],
+                "{bare} lowered to {:?}",
+                local.0
+            );
+            assert_eq!(local, imported, "`{qualified}` lowered unlike `{bare}`");
+            assert!(
+                local.3.contains(expected_emit),
+                "`{bare}` emitted no `{expected_emit}`: {}",
+                local.3
+            );
+        }
+    }
+
+    /// The control for the test above: the match really is on the LAST segment.
+    ///
+    /// Without this, "the qualified spelling lowered the same" would also hold
+    /// of a lowerer that ignored the path and matched on argument shape alone.
+    #[test]
+    fn only_the_last_path_segment_selects_an_intrinsic() {
+        fn raw_load_lowers(source: &str) -> bool {
+            let mut lowerer = Lowerer::new(None);
+            for (name, reg) in [("base", 3u16), ("ea", 4)] {
+                lowerer
+                    .bindings
+                    .insert(name.to_string(), binding(reg, BindingKind::Int));
+            }
+            let Expr::Call(call) = syn::parse_str::<Expr>(source).expect("parse call") else {
+                unreachable!("the sources below are all call expressions");
+            };
+            lowerer.lower_raw_load_call(&call).is_some()
+        }
+
+        // An owner segment nobody declared still lowers: only the tail is read.
+        assert!(raw_load_lowers("whatever::majit_raw_load_i64(base, ea)"));
+        // A tail that is not an intrinsic name declines, however it is spelled.
+        assert!(!raw_load_lowers(
+            "majit_metainterp::intrinsics::majit_raw_load_i128(base, ea)"
+        ));
+        assert!(!raw_load_lowers("majit_raw_load_i128(base, ea)"));
+    }
+
     #[test]
     fn record_exact_class_statement_uses_ref_int_argcodes() {
         let mut lowerer = Lowerer::new(None);
