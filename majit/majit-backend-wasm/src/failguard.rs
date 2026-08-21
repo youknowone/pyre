@@ -25,21 +25,6 @@ pub struct WasmFailDescr {
     pub meta_descr: Option<DescrRef>,
 }
 
-/// `compile.py` ExitFrameWithExceptionDescrRef parity: whether a FINISH
-/// exit is an ExitFrameWithException (the callee raised; slot 0 holds the
-/// exception) rather than a DoneWithThisFrame. `is_finish` alone is true for
-/// both, so the self-recursive CALL_ASSEMBLER arm must exclude the exception
-/// variant when it picks the "clean callee finish" `fail_index` — an
-/// ExitFrameWithException must route to `wasm_ca_resume_deopt`, which propagates
-/// the exception, not be short-circuited to its output slot.
-pub fn meta_descr_is_exit_frame_with_exception(meta_descr: &Option<DescrRef>) -> bool {
-    meta_descr
-        .as_ref()
-        .and_then(|d| d.as_fail_descr())
-        .map(|fd| fd.is_exit_frame_with_exception())
-        .unwrap_or(false)
-}
-
 impl Descr for WasmFailDescr {
     fn index(&self) -> u32 {
         self.fail_index
@@ -154,7 +139,7 @@ mod tests {
     use majit_ir::GcRef;
 
     use super::{Type, WasmFailDescr, WasmFrameData};
-    use super::{fail_descr_base, fail_index_is_clean_finish, register_fail_descrs};
+    use super::{fail_descr_base, global_fail_descr, register_fail_descrs};
 
     struct RootCountingGc(Arc<AtomicUsize>);
 
@@ -242,35 +227,68 @@ mod tests {
     }
 
     #[test]
-    fn clean_finish_flags_stay_indexed_by_fail_index() {
-        // The emitted CALL_ASSEMBLER arm indexes the flags with the same
-        // `fail_index` that indexes `FAIL_DESCR_REGISTRY`, so a registration
-        // that grew one and not the other would answer for the wrong exit.
+    fn a_finish_singleton_resolves_to_its_reserved_exit() {
+        // The emitted FINISH writes the index this returns and the emitted
+        // CALL_ASSEMBLER check compares against the same constant, so a
+        // singleton that failed to bind would send every clean callee finish
+        // back to the host to be decoded and handed straight over.
+        let descr: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
+        super::attach_finish_descr(super::FINISH_EXIT_INDEX_REF, Arc::clone(&descr));
+        assert_eq!(
+            super::attached_finish_exit_index(&Some(Arc::clone(&descr))),
+            Some(super::FINISH_EXIT_INDEX_REF),
+        );
+        assert_eq!(
+            super::done_with_this_frame_exit_index(Type::Ref),
+            super::FINISH_EXIT_INDEX_REF,
+        );
+        // A descr this cpu was never handed has no shared identity, so it keeps
+        // its own exit.
+        let unattached: majit_ir::DescrRef =
+            Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
+        assert_eq!(super::attached_finish_exit_index(&Some(unattached)), None);
+    }
+
+    #[test]
+    fn the_reserved_finish_exits_precede_every_trace_base() {
+        // The emitted CALL_ASSEMBLER check compares against a baked reserved
+        // index, so a trace whose own exits started below the reserved block
+        // would collide with it.
         let base = fail_descr_base();
-        // The third entry is the one a two-index whitelist used to miss.
-        let is_finish = [true, false, true];
-        let descrs: Vec<Arc<WasmFailDescr>> = is_finish
-            .iter()
-            .enumerate()
-            .map(|(i, &is_finish)| {
+        assert!(base >= super::FINISH_EXIT_INDEX_COUNT);
+        for (index, types) in [
+            (super::FINISH_EXIT_INDEX_VOID, &[][..]),
+            (super::FINISH_EXIT_INDEX_INT, &[Type::Int][..]),
+            (super::FINISH_EXIT_INDEX_REF, &[Type::Ref][..]),
+            (super::FINISH_EXIT_INDEX_FLOAT, &[Type::Float][..]),
+            (super::FINISH_EXIT_INDEX_EXC, &[Type::Ref][..]),
+        ] {
+            let descr = global_fail_descr(index).expect("reserved finish exit is unregistered");
+            assert_eq!(descr.fail_index, index);
+            assert!(descr.is_finish, "reserved exit {index} is not a finish");
+            assert_eq!(descr.fail_arg_types, types, "reserved exit {index} layout");
+        }
+
+        let descrs: Vec<Arc<WasmFailDescr>> = (0..3)
+            .map(|i| {
                 Arc::new(WasmFailDescr {
-                    fail_index: base + i as u32,
+                    fail_index: base + i,
                     trace_id: 0,
                     fail_arg_types: vec![Type::Ref],
-                    is_finish,
+                    is_finish: false,
                     meta_descr: None,
                 })
             })
             .collect();
         register_fail_descrs(&descrs);
-        for (i, &expected) in is_finish.iter().enumerate() {
+        for i in 0..3 {
             assert_eq!(
-                fail_index_is_clean_finish(base + i as u32),
-                expected,
-                "flag {i} disagrees with its descr"
+                global_fail_descr(base + i)
+                    .expect("trace exit is unregistered")
+                    .fail_index,
+                base + i,
             );
         }
-        assert!(!fail_index_is_clean_finish(base + is_finish.len() as u32));
     }
 
     #[test]
@@ -341,7 +359,6 @@ pub struct CallAssemblerTarget {
     pub input_types: Vec<Type>,
     pub callee_frame_bytes: u32,
     pub callee_gcmap_ptr: i64,
-    pub loop_finish_fi: u32,
     pub compiled_ptr: u64,
 }
 
@@ -362,59 +379,115 @@ pub static CALL_ASSEMBLER_TARGETS: std::sync::Mutex<
 pub struct WasmCaDispatchEntry {
     /// `__indirect_function_table` slot. Zero means pending/unavailable.
     pub func_handle: AtomicU32,
-    /// Callee DoneWithThisFrame fail index. `u32::MAX` means not installed.
-    pub loop_finish_fi: AtomicU32,
     /// `CompiledWasmLoop` address for the deopt helper, in wasm32 memory.
     pub compiled_ptr: AtomicU32,
 }
 
 pub const WASM_CA_DISPATCH_FUNC_HANDLE_OFS: u64 = 0;
-pub const WASM_CA_DISPATCH_LOOP_FINISH_FI_OFS: u64 = 4;
-pub const WASM_CA_DISPATCH_COMPILED_PTR_OFS: u64 = 8;
-pub const WASM_CA_FINISH_FI_UNKNOWN: u32 = u32::MAX;
+pub const WASM_CA_DISPATCH_COMPILED_PTR_OFS: u64 = 4;
 
-/// Header of the byte-per-`fail_index` clean-finish table the CALL_ASSEMBLER
-/// return arm reads. Boxed for the same reason as `WASM_CA_DISPATCH`: emitted
-/// modules bake the header address, and `base` moves whenever the table grows.
-#[repr(C)]
-pub struct WasmCleanFinishTable {
-    /// Address of the flag bytes, or 0 before the first registration.
-    pub base: AtomicU32,
-    /// Flags behind `base`, one per registered `fail_index`.
-    pub len: AtomicU32,
+/// `make_and_attach_done_descrs` gives every cpu one `DoneWithThisFrame*` per
+/// result kind plus one `ExitFrameWithExceptionDescrRef`, and
+/// `compile_done_with_this_frame` / `compile_exit_frame_with_exception` stamp
+/// that singleton on the FINISH — so every trace that finishes the same way
+/// writes the same `jf_descr`, and `_call_assembler_check_descr` recognises a
+/// clean callee finish by comparing against one value.
+///
+/// A wasm frame slot holds an index into the global exit space rather than a
+/// descr pointer, so the shared identity is a reserved index. The five sit at
+/// the front of [`FAIL_DESCR_REGISTRY`], claimed before any trace takes a
+/// `fail_descr_base`, and carry the attached `Arc` as their `meta_descr` so
+/// `get_latest_descr_arc` still answers with the metainterp's own descr.
+pub const FINISH_EXIT_INDEX_VOID: u32 = 0;
+pub const FINISH_EXIT_INDEX_INT: u32 = 1;
+pub const FINISH_EXIT_INDEX_REF: u32 = 2;
+pub const FINISH_EXIT_INDEX_FLOAT: u32 = 3;
+pub const FINISH_EXIT_INDEX_EXC: u32 = 4;
+const FINISH_EXIT_INDEX_COUNT: u32 = 5;
+
+/// Reserved exit index for the `done_with_this_frame_descr_*` of `ty`.
+pub fn done_with_this_frame_exit_index(ty: Type) -> u32 {
+    match ty {
+        Type::Void => FINISH_EXIT_INDEX_VOID,
+        Type::Int => FINISH_EXIT_INDEX_INT,
+        Type::Ref => FINISH_EXIT_INDEX_REF,
+        Type::Float => FINISH_EXIT_INDEX_FLOAT,
+    }
 }
 
-pub const WASM_CLEAN_FINISH_BASE_OFS: u64 = 0;
-pub const WASM_CLEAN_FINISH_LEN_OFS: u64 = 4;
+/// The four `DoneWithThisFrameDescr*` classes carry the one result of their
+/// kind; `ExitFrameWithExceptionDescrRef` carries the exception Ref.
+fn reserved_fail_arg_types(exit_index: u32) -> Vec<Type> {
+    match exit_index {
+        FINISH_EXIT_INDEX_VOID => Vec::new(),
+        FINISH_EXIT_INDEX_INT => vec![Type::Int],
+        FINISH_EXIT_INDEX_FLOAT => vec![Type::Float],
+        _ => vec![Type::Ref],
+    }
+}
 
-static CLEAN_FINISH_FLAGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
-static CLEAN_FINISH_HEADER: std::sync::OnceLock<Box<WasmCleanFinishTable>> =
-    std::sync::OnceLock::new();
-
-fn clean_finish_header() -> &'static WasmCleanFinishTable {
-    CLEAN_FINISH_HEADER.get_or_init(|| {
-        Box::new(WasmCleanFinishTable {
-            base: AtomicU32::new(0),
-            len: AtomicU32::new(0),
-        })
+fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<WasmFailDescr> {
+    Arc::new(WasmFailDescr {
+        fail_index: exit_index,
+        trace_id: 0,
+        fail_arg_types: reserved_fail_arg_types(exit_index),
+        is_finish: true,
+        meta_descr,
     })
 }
 
-/// Guest address of the clean-finish header, stable for the process. A trace
-/// emitted before any descr is registered reads `len == 0`, so every exit
-/// takes the host deopt path until the first registration publishes the table.
-pub fn clean_finish_table_addr() -> u32 {
-    clean_finish_header() as *const WasmCleanFinishTable as usize as u32
+/// Claim the reserved block if the registry has not been opened yet. Called
+/// under the registry lock from every entry point that can grow or read it, so
+/// a trace can never take a `fail_descr_base` below `FINISH_EXIT_INDEX_COUNT`.
+fn reserve_finish_exit_block(vec: &mut Vec<Arc<WasmFailDescr>>) {
+    if !vec.is_empty() {
+        return;
+    }
+    for index in 0..FINISH_EXIT_INDEX_COUNT {
+        vec.push(reserved_finish_descr(index, None));
+    }
 }
 
-/// Whether `fail_index` names a clean DoneWithThisFrame exit — the predicate
-/// the CALL_ASSEMBLER arm short-circuits on.
-pub fn fail_index_is_clean_finish(fail_index: u32) -> bool {
-    CLEAN_FINISH_FLAGS
-        .lock()
-        .unwrap()
-        .get(fail_index as usize)
-        .is_some_and(|flag| *flag != 0)
+fn thin_descr_ptr(descr: &DescrRef) -> usize {
+    Arc::as_ptr(descr) as *const () as usize
+}
+
+/// `make_and_attach_done_descrs` pointer identity: the reserved exit index for
+/// `descr` when it is one of the five singletons this cpu was handed, else
+/// `None`.
+/// Mirrors `AttachedDescrPtrs::is_done_with_this_frame_descr`, which is how the
+/// native backends recognise the same descrs on the FINISH fast path.
+///
+/// Answered from the reserved entries themselves, so an index this returns
+/// always names a registry entry carrying `descr` — `get_latest_descr_arc`
+/// keeps its `AbstractDescr` identity whatever order attachment and the first
+/// compile happened in.
+pub fn attached_finish_exit_index(descr: &Option<DescrRef>) -> Option<u32> {
+    let ptr = thin_descr_ptr(descr.as_ref()?);
+    let mut reg = FAIL_DESCR_REGISTRY.lock().unwrap();
+    let vec = reg.get_or_insert_with(Default::default);
+    reserve_finish_exit_block(vec);
+    vec[..FINISH_EXIT_INDEX_COUNT as usize]
+        .iter()
+        .position(|reserved| {
+            reserved
+                .meta_descr
+                .as_ref()
+                .is_some_and(|attached| thin_descr_ptr(attached) == ptr)
+        })
+        .map(|index| index as u32)
+}
+
+/// `make_and_attach_done_descrs`' per-target attachment for one of the five.
+/// Binds the singleton to its reserved exit, which is what the emitted FINISH
+/// writes and the emitted CALL_ASSEMBLER check compares against. Rebinding an
+/// already-claimed entry keeps the fast path available to a process that
+/// compiled something before the attachment landed.
+pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
+    let mut reg = FAIL_DESCR_REGISTRY.lock().unwrap();
+    let vec = reg.get_or_insert_with(Default::default);
+    reserve_finish_exit_block(vec);
+    vec[exit_index as usize] = reserved_finish_descr(exit_index, Some(descr));
 }
 
 /// Stable, guest-memory dispatch entries, keyed by CALL_ASSEMBLER token.
@@ -433,7 +506,6 @@ pub fn ca_dispatch_slot(number: u64) -> u32 {
         .or_insert_with(|| {
             Box::new(WasmCaDispatchEntry {
                 func_handle: AtomicU32::new(0),
-                loop_finish_fi: AtomicU32::new(WASM_CA_FINISH_FI_UNKNOWN),
                 compiled_ptr: AtomicU32::new(0),
             })
         });
@@ -451,7 +523,7 @@ pub fn ca_dispatch_exists(number: u64) -> bool {
 /// Publish an installed loop after its module has acquired a shared-table
 /// slot. Release stores pair with the runtime loads in emitted trace modules;
 /// wasm execution cannot begin until this compile call returns.
-pub fn ca_dispatch_publish(number: u64, func_handle: u32, loop_finish_fi: u32, compiled_ptr: u32) {
+pub fn ca_dispatch_publish(number: u64, func_handle: u32, compiled_ptr: u32) {
     let _ = ca_dispatch_slot(number);
     let table = WASM_CA_DISPATCH.lock().unwrap();
     let entry = table
@@ -459,20 +531,12 @@ pub fn ca_dispatch_publish(number: u64, func_handle: u32, loop_finish_fi: u32, c
         .and_then(|table| table.get(&number))
         .expect("CALL_ASSEMBLER dispatch entry disappeared while publishing");
     entry.compiled_ptr.store(compiled_ptr, Ordering::Release);
-    entry
-        .loop_finish_fi
-        .store(loop_finish_fi, Ordering::Release);
     entry.func_handle.store(func_handle, Ordering::Release);
 }
 
 /// Redirect existing callers of `old_number` to the installed target.
-pub fn ca_dispatch_redirect(
-    old_number: u64,
-    func_handle: u32,
-    loop_finish_fi: u32,
-    compiled_ptr: u32,
-) {
-    ca_dispatch_publish(old_number, func_handle, loop_finish_fi, compiled_ptr);
+pub fn ca_dispatch_redirect(old_number: u64, func_handle: u32, compiled_ptr: u32) {
+    ca_dispatch_publish(old_number, func_handle, compiled_ptr);
 }
 
 /// Remove every dispatch entry that still resolves to `compiled_ptr`.  This
@@ -521,7 +585,6 @@ pub fn register_pending_call_assembler_target(number: u64, input_types: Vec<Type
             input_types,
             callee_frame_bytes: 0,
             callee_gcmap_ptr: 0,
-            loop_finish_fi: WASM_CA_FINISH_FI_UNKNOWN,
             compiled_ptr: 0,
         },
     );
@@ -570,11 +633,10 @@ static FAIL_DESCR_REGISTRY: std::sync::Mutex<Option<Vec<Arc<WasmFailDescr>>>> =
 /// `register_fail_descrs`. The wasm host is single-threaded, so no other
 /// compile can interleave between the two calls.
 pub fn fail_descr_base() -> u32 {
-    FAIL_DESCR_REGISTRY
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map_or(0, |v| v.len() as u32)
+    let mut reg = FAIL_DESCR_REGISTRY.lock().unwrap();
+    let vec = reg.get_or_insert_with(Default::default);
+    reserve_finish_exit_block(vec);
+    vec.len() as u32
 }
 
 /// Append a compile's exit descrs to the global space. Each descr's
@@ -583,10 +645,7 @@ pub fn fail_descr_base() -> u32 {
 pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
     let mut reg = FAIL_DESCR_REGISTRY.lock().unwrap();
     let vec = reg.get_or_insert_with(Default::default);
-    // Grown in the same loop as the registry so the two cannot drift: the
-    // emitted CALL_ASSEMBLER arm indexes the flags by the `fail_index` that
-    // indexes this vector.
-    let mut flags = CLEAN_FINISH_FLAGS.lock().unwrap();
+    reserve_finish_exit_block(vec);
     for d in descrs {
         debug_assert_eq!(
             d.fail_index as usize,
@@ -594,15 +653,7 @@ pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
             "fail descr registered out of lockstep with its global fail_index"
         );
         vec.push(Arc::clone(d));
-        flags.push(u8::from(
-            d.is_finish && !meta_descr_is_exit_frame_with_exception(&d.meta_descr),
-        ));
     }
-    let header = clean_finish_header();
-    header
-        .base
-        .store(flags.as_ptr() as usize as u32, Ordering::Release);
-    header.len.store(flags.len() as u32, Ordering::Release);
 }
 
 /// Resolve a `frame[0]` value through the global fail-index space.

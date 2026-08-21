@@ -2120,23 +2120,13 @@ impl WasmBackend {
             &inputs.ops,
             inputs.bridge_entry_arity,
         );
-        let loop_finish_fi = descrs
-            .iter()
-            .find(|descr| {
-                descr.is_finish
-                    && !failguard::meta_descr_is_exit_frame_with_exception(&descr.meta_descr)
-            })
-            .map(|descr| descr.fail_index)
-            .unwrap_or(failguard::WASM_CA_FINISH_FI_UNKNOWN);
         ca_dispatch_publish(
             token.number,
             old_handle,
-            loop_finish_fi,
             compiled as *const CompiledWasmLoop as usize as u32,
         );
         if let Some(mut target) = call_assembler_target(token.number) {
             target.func_handle = old_handle;
-            target.loop_finish_fi = loop_finish_fi;
             target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
             publish_call_assembler_target(token.number, target);
         }
@@ -2354,7 +2344,6 @@ fn general_int_call_assembler_target(
                 input_types: self_.input_types.to_vec(),
                 callee_frame_bytes: self_.frame.ca_frame_bytes,
                 callee_gcmap_ptr,
-                loop_finish_fi: failguard::WASM_CA_FINISH_FI_UNKNOWN,
                 compiled_ptr: 0,
             }
         } else {
@@ -2369,12 +2358,7 @@ fn general_int_call_assembler_target(
                     return None;
                 }
                 registered.func_handle = handle;
-                ca_dispatch_publish(
-                    target_token,
-                    handle,
-                    registered.loop_finish_fi,
-                    registered.compiled_ptr as u32,
-                );
+                ca_dispatch_publish(target_token, handle, registered.compiled_ptr as u32);
                 publish_call_assembler_target(target_token, registered.clone());
             }
             if registered.input_types.as_slice() != arg_types
@@ -3018,16 +3002,6 @@ impl majit_backend::Backend for WasmBackend {
             .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledWasmLoop>())
             .expect("newly compiled wasm loop is missing");
-        let loop_finish_fi = compiled
-            .fail_descrs
-            .borrow()
-            .iter()
-            .find(|descr| {
-                descr.is_finish
-                    && !failguard::meta_descr_is_exit_frame_with_exception(&descr.meta_descr)
-            })
-            .map(|descr| descr.fail_index)
-            .unwrap_or(failguard::WASM_CA_FINISH_FI_UNKNOWN);
         // For a pending self target this is the exact map already embedded in
         // the module's CA arm. Reuse it for the published metadata so the
         // loop and its self-callee have demonstrably identical geometry. A
@@ -3050,7 +3024,6 @@ impl majit_backend::Backend for WasmBackend {
         ca_dispatch_publish(
             token.number,
             compiled.eager_func_handle(),
-            loop_finish_fi,
             compiled as *const CompiledWasmLoop as usize as u32,
         );
         publish_call_assembler_target(
@@ -3061,7 +3034,6 @@ impl majit_backend::Backend for WasmBackend {
                 input_types: compiled.input_types.clone(),
                 callee_frame_bytes: compiled.frame.ca_frame_bytes,
                 callee_gcmap_ptr,
-                loop_finish_fi,
                 compiled_ptr: compiled as *const CompiledWasmLoop as usize as u64,
             },
         );
@@ -3087,6 +3059,32 @@ impl majit_backend::Backend for WasmBackend {
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
         self.trace_counter = trace_id;
+    }
+
+    // `make_and_attach_done_descrs` — the FINISH fast path
+    // needs the singletons' identity, so this backend takes the attachment
+    // instead of the trait's no-op default. Where a native backend publishes
+    // `Arc::as_ptr` to its comparison sites, a wasm frame slot holds an exit
+    // index rather than a pointer, so each singleton is bound to a reserved
+    // index in the global exit space (`failguard::FINISH_EXIT_INDEX_*`).
+    fn set_done_with_this_frame_descr_void(&mut self, descr: Arc<dyn majit_ir::Descr>) {
+        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_VOID, descr);
+    }
+
+    fn set_done_with_this_frame_descr_int(&mut self, descr: Arc<dyn majit_ir::Descr>) {
+        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_INT, descr);
+    }
+
+    fn set_done_with_this_frame_descr_ref(&mut self, descr: Arc<dyn majit_ir::Descr>) {
+        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_REF, descr);
+    }
+
+    fn set_done_with_this_frame_descr_float(&mut self, descr: Arc<dyn majit_ir::Descr>) {
+        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_FLOAT, descr);
+    }
+
+    fn set_exit_frame_with_exception_descr_ref(&mut self, descr: Arc<dyn majit_ir::Descr>) {
+        failguard::attach_finish_descr(failguard::FINISH_EXIT_INDEX_EXC, descr);
     }
 
     // `set_next_header_pc` uses the trait default (no-op) — wasm does
@@ -4292,12 +4290,7 @@ impl majit_backend::Backend for WasmBackend {
                 )));
             }
             new_target.func_handle = handle;
-            ca_dispatch_publish(
-                new.number,
-                handle,
-                new_target.loop_finish_fi,
-                new_target.compiled_ptr as u32,
-            );
+            ca_dispatch_publish(new.number, handle, new_target.compiled_ptr as u32);
             publish_call_assembler_target(new.number, new_target.clone());
         }
         let movable_callee = new_target.callee_frame_bytes != 0
@@ -4320,7 +4313,6 @@ impl majit_backend::Backend for WasmBackend {
         ca_dispatch_redirect(
             old.number,
             new_target.func_handle,
-            new_target.loop_finish_fi,
             new_target.compiled_ptr as u32,
         );
         transfer_call_assembler_target_activity(&old_target, &new_target);

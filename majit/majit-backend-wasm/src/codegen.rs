@@ -5176,34 +5176,18 @@ fn build_function(
                 sink.i64_load(mem64(0));
                 sink.i32_wrap_i64();
                 sink.local_set(ca_fi_local);
-                // A clean finish is any exit the global table flags as a
-                // DoneWithThisFrame that is not an ExitFrameWithException —
-                // `fi < len && flags[fi] != 0`, with the out-of-range arm
-                // falling through to the host rather than reading a stray byte.
-                // Naming the two indices this build happens to know would send
-                // every other finish of the same chain to `wasm_ca_resume_deopt`
-                // to be decoded and handed straight back.
-                let clean_finish_table = crate::failguard::clean_finish_table_addr() as i32;
+                // `_call_assembler_check_descr` — every clean finish of this
+                // result kind writes the one `done_with_this_frame_descr_<kind>`
+                // the cpu was handed, so the check is a compare against that
+                // single value. A raising callee writes
+                // `exit_frame_with_exception_descr_ref` and a guard deopt writes
+                // its own exit, so both fail this compare and take the helper
+                // path, which is what propagates the exception.
                 sink.local_get(ca_fi_local);
-                sink.i32_const(clean_finish_table);
-                sink.i32_load(mem32(crate::failguard::WASM_CLEAN_FINISH_LEN_OFS));
-                sink.i32_lt_u();
-                sink.if_(BlockType::Result(ValType::I32));
-                sink.i32_const(clean_finish_table);
-                sink.i32_load(mem32(crate::failguard::WASM_CLEAN_FINISH_BASE_OFS));
-                sink.local_get(ca_fi_local);
-                sink.i32_add();
-                sink.i32_load8_u(memarg(0, 0));
-                sink.else_();
-                sink.i32_const(0);
-                sink.end();
-                // The host arm takes the exception cell on every return; a
-                // short-circuit leaves it set, so a finish that somehow carries
-                // a pending exception must still go there.
-                sink.i32_const(crate::jit_exc_value_addr() as i32);
-                sink.i64_load(mem64(0));
-                sink.i64_eqz();
-                sink.i32_and();
+                sink.i32_const(crate::failguard::done_with_this_frame_exit_index(
+                    op.opcode.result_type(),
+                ) as i32);
+                sink.i32_eq();
                 sink.if_(BlockType::Result(ValType::I64));
                 // clean finish: result Ref = F'[1] (output slot 0).
                 sink.local_get(ca_cfp_local);
@@ -7067,7 +7051,22 @@ fn emit_guard_spill(
     op: &Op,
 ) {
     emit_guard_fail_args_spill(sink, constants, value_types, op);
-    emit_guard_fail_index_store(sink, guard_idx);
+    emit_guard_fail_index_store(sink, exit_index(op, guard_idx));
+}
+
+/// The exit a failing `op` writes into `frame[0]`.
+///
+/// `compile_done_with_this_frame` / `compile_exit_frame_with_exception` stamp
+/// the FINISH with the singleton the cpu was handed, so every trace that
+/// finishes the same way names the same exit and `_call_assembler_check_descr`
+/// can recognise it with one compare. Guards, and the N-ary finishes pyre adds
+/// on top of the `_DoneWithThisFrameDescr` family's 0/1-result classes, have no
+/// shared identity and keep their own exit.
+fn exit_index(op: &Op, guard_idx: u32) -> u32 {
+    if op.opcode != OpCode::Finish {
+        return guard_idx;
+    }
+    crate::failguard::attached_finish_exit_index(&op.getdescr()).unwrap_or(guard_idx)
 }
 
 fn emit_guard_fail_args_spill(
