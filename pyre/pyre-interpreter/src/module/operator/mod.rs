@@ -33,9 +33,16 @@ fn op_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    let w_iterable = args[0];
+    let mut w_iterable = args[0];
     let default = if let Some(&w_default) = args.get(1) {
+        // The default's `__index__` is user code, and `args` is the stack copy
+        // the gateway built: a minor rewrites the shadow slots and not that
+        // copy, so a list or dict iterable read out of it afterwards is a
+        // pre-move address.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(args);
         let w_index = crate::baseobjspace::space_index(w_default)?;
+        w_iterable = pyre_object::gc_roots::shadow_stack_get(base);
         crate::baseobjspace::int_w(w_index)?
     } else {
         0

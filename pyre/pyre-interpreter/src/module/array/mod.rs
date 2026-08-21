@@ -692,9 +692,13 @@ fn array_find(obj: PyObjectRef, w_value: PyObjectRef) -> Result<Option<usize>, P
 fn array_index_method(args: &[PyObjectRef]) -> PyResult {
     check_arity_range(args, 2, 4, "array.index")?;
     let obj = args[0];
-    let w_value = args[1];
     let len = unsafe { arr::w_array_len(obj) } as i64;
     // Optional start/stop, unwrapped via __index__, clamped like descr_index.
+    // Their `__index__` is user code and `args` is the gateway's stack copy,
+    // so the searched-for value is read back from the shadow stack: the caller
+    // may have passed a list, which a minor moves.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
     let mut start = if args.len() >= 3 {
         crate::builtins::getindex_w(args[2])?
     } else {
@@ -705,6 +709,7 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
     } else {
         len
     };
+    let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if start < 0 {
         start += len;
         if start < 0 {

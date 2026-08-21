@@ -14818,6 +14818,14 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     kwarg_reject_unknown(kwargs, &["key", "reverse"], "sort")?;
     let iterable = positional[0];
     let key_fn = kwarg_get(kwargs, "key").filter(|k| unsafe { !pyre_object::is_none(*k) });
+    // `reverse=` runs a user `__bool__`, and building the list drains the
+    // iterable's own Python, so the iterable and the key callable are pinned
+    // before either and reloaded after, exactly as `list_method_sort` does.
+    // `PY_NULL` stands in when no key was given, keeping the two roots
+    // adjacent so one base covers both.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base =
+        pyre_object::gc_roots::pin_roots(&[iterable, key_fn.unwrap_or(pyre_object::PY_NULL)]);
     let reverse = kwarg_get(kwargs, "reverse")
         .map(crate::baseobjspace::is_true)
         .transpose()?
@@ -14826,10 +14834,10 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // `sorted_lst.sort(key=key, reverse=reverse)`, so the built list picks its
     // storage strategy first and the sort runs through the same body
     // `list.sort` uses.
-    let w_list = builtin_list_ctor(&[iterable])?;
-    let _roots = pyre_object::gc_roots::push_roots();
+    let w_list = builtin_list_ctor(&[pyre_object::gc_roots::shadow_stack_get(base)])?;
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::pin_root(w_list);
+    let key_fn = key_fn.map(|_| pyre_object::gc_roots::shadow_stack_get(base + 1));
     sort_list_in_place(list_slot, key_fn, reverse)?;
     Ok(pyre_object::gc_roots::shadow_stack_get(list_slot))
 }

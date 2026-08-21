@@ -184,9 +184,24 @@ fn context_var_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         Err(err) if err.kind == crate::PyErrorKind::KeyError => token_missing(),
         Err(err) => return Err(err),
     };
-    let updated_data = call_method_result(data, "set", &[args[0], args[1]])?;
+    // The replacement and the store both run Python, and the token below is
+    // the only thing that will ever hold the old binding — nothing roots it
+    // across those two calls, and it is whatever the caller last set, a list
+    // or a dict included.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[context, data, old_value]);
+    let updated_data = call_method_result(
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        "set",
+        &[args[0], args[1]],
+    )?;
+    let context = pyre_object::gc_roots::shadow_stack_get(base);
     crate::baseobjspace::setattr_str(context, "_data", updated_data)?;
-    new_token(context, args[0], old_value)
+    new_token(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        args[0],
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+    )
 }
 
 fn context_var_reset(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
