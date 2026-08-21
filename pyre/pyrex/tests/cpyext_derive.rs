@@ -205,6 +205,74 @@ except ValueError as exc:
 else:
     raise AssertionError('a raising __next__ was read as exhaustion')
 
+# ── the slots a mirror carries for what this runtime answers ───────────
+
+# Every one of these is a raw field read in a compiled module, so a NULL is
+# read as "the type does not do this" and not as an error.
+eq('the repr slot', m.call_slot('tp_repr', [1, 2]), '[1, 2]')
+eq('the str slot', m.call_slot('tp_str', {'a': 1}), "{'a': 1}")
+eq('the hash slot', m.call_slot('tp_hash', 'text'), hash('text'))
+eq('the sequence length slot', m.call_slot('sq_length', [1, 2, 3]), 3)
+eq('the mapping length slot', m.call_slot('mp_length', {'a': 1, 'b': 2}), 2)
+eq('the int slot', m.call_slot('nb_int', 7.5), 7)
+eq('the float slot', m.call_slot('nb_float', 3), 3.0)
+eq('the index slot', m.call_slot('nb_index', True), 1)
+eq('the negation slot', m.call_slot('nb_negative', 5), -5)
+eq('the identity slot', m.call_slot('nb_positive', -5), -5)
+eq('the absolute slot', m.call_slot('nb_absolute', -5), 5)
+eq('the inversion slot', m.call_slot('nb_invert', 5), -6)
+
+
+# A class written in Python reaches its own methods through the same slots.
+class Counted:
+    def __len__(self):
+        return 4
+
+    def __repr__(self):
+        return '<counted>'
+
+    def __index__(self):
+        return 11
+
+
+counted = Counted()
+eq('a Python class fills the length slot', m.call_slot('sq_length', counted), 4)
+eq('a Python class fills the repr slot', m.call_slot('tp_repr', counted), '<counted>')
+eq('a Python class fills the index slot', m.call_slot('nb_index', counted), 11)
+
+# And a name the class does not define leaves the slot NULL rather than
+# installing something that would fail when called.
+eq('an absent method leaves no slot', m.call_slot('nb_invert', counted), 'none')
+eq('a plain object has no length slot', m.call_slot('sq_length', object()), 'none')
+
+# An override is reached through the slot its base filled.
+class Louder(Counted):
+    def __repr__(self):
+        return '<louder>'
+
+
+eq('an override answers the slot', m.call_slot('tp_repr', Louder()), '<louder>')
+
+# A raising method surfaces as the failure it is, not as a slot's own error.
+class Broken:
+    def __len__(self):
+        raise ValueError('no length')
+
+
+try:
+    m.call_slot('sq_length', Broken())
+except ValueError as exc:
+    eq('the exception a length slot reports', str(exc), 'no length')
+else:
+    raise AssertionError('a raising __len__ was read as a count')
+
+
+# The suites a heap type names are the blocks its own layout declares, so the
+# two ways an extension reaches one land on the same words.
+eq('a class names its own suites', m.suites_are_embedded(Counted), (1, 1, 1, 1, 1))
+eq('a static type has no such block', m.suites_are_embedded(dict), 'not-a-heap-type')
+
+
 print('cpyext-derive-ok')
 "#;
 

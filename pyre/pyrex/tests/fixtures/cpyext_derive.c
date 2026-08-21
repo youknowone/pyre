@@ -231,9 +231,104 @@ static PyObject *undisturbed(PyObject *self, PyObject *unused)
     Py_RETURN_TRUE;
 }
 
+/* Read one slot off `o`'s type by name and call it, the way a compiled module
+   reaches a method without going through the abstract entry point.  A NULL
+   slot is reported as `"none"` rather than called: that is the word for what
+   a caller would otherwise dereference, and it is the answer this fixture
+   exists to tell apart from a result. */
+static PyObject *call_slot(PyObject *self, PyObject *args)
+{
+    (void)self;
+    const char *which;
+    PyObject *o;
+    if (!PyArg_ParseTuple(args, "sO", &which, &o)) {
+        return NULL;
+    }
+    PyTypeObject *t = Py_TYPE(o);
+    PyNumberMethods *nb = t->tp_as_number;
+    PySequenceMethods *sq = t->tp_as_sequence;
+    PyMappingMethods *mp = t->tp_as_mapping;
+
+    /* The count-answering slots, whose failure is -1 with an exception set. */
+    lenfunc counts = NULL;
+    hashfunc hashes = NULL;
+    if (strcmp(which, "sq_length") == 0) {
+        counts = sq == NULL ? NULL : sq->sq_length;
+    } else if (strcmp(which, "mp_length") == 0) {
+        counts = mp == NULL ? NULL : mp->mp_length;
+    } else if (strcmp(which, "tp_hash") == 0) {
+        hashes = t->tp_hash;
+    }
+    if (counts != NULL) {
+        Py_ssize_t n = counts(o);
+        return n < 0 && PyErr_Occurred() ? NULL : PyLong_FromSsize_t(n);
+    }
+    if (hashes != NULL) {
+        Py_hash_t h = hashes(o);
+        return h == -1 && PyErr_Occurred() ? NULL : PyLong_FromSsize_t((Py_ssize_t)h);
+    }
+
+    unaryfunc unary = NULL;
+    if (strcmp(which, "tp_repr") == 0) {
+        unary = t->tp_repr;
+    } else if (strcmp(which, "tp_str") == 0) {
+        unary = t->tp_str;
+    } else if (strcmp(which, "nb_int") == 0) {
+        unary = nb == NULL ? NULL : nb->nb_int;
+    } else if (strcmp(which, "nb_float") == 0) {
+        unary = nb == NULL ? NULL : nb->nb_float;
+    } else if (strcmp(which, "nb_index") == 0) {
+        unary = nb == NULL ? NULL : nb->nb_index;
+    } else if (strcmp(which, "nb_negative") == 0) {
+        unary = nb == NULL ? NULL : nb->nb_negative;
+    } else if (strcmp(which, "nb_positive") == 0) {
+        unary = nb == NULL ? NULL : nb->nb_positive;
+    } else if (strcmp(which, "nb_absolute") == 0) {
+        unary = nb == NULL ? NULL : nb->nb_absolute;
+    } else if (strcmp(which, "nb_invert") == 0) {
+        unary = nb == NULL ? NULL : nb->nb_invert;
+    } else if (strcmp(which, "sq_length") != 0 && strcmp(which, "mp_length") != 0 &&
+               strcmp(which, "tp_hash") != 0) {
+        PyErr_Format(PyExc_ValueError, "the fixture does not offer %s", which);
+        return NULL;
+    }
+    if (unary == NULL) {
+        return PyUnicode_FromString("none");
+    }
+    return unary(o);
+}
+
+/* Whether the suite a type names is the block its own `PyHeapTypeObject`
+   declares.  An extension that casts a heap type to `PyHeapTypeObject *` and
+   one that reads `tp_as_number` off it have to reach the same words.
+
+   Only a heap type has that block to compare against; a static type carries
+   suites allocated apart from it, and casting one is what this refuses. */
+static PyObject *suites_are_embedded(PyObject *self, PyObject *o)
+{
+    (void)self;
+    if (!PyType_Check(o)) {
+        PyErr_SetString(PyExc_TypeError, "a type was expected");
+        return NULL;
+    }
+    if (!PyType_HasFeature((PyTypeObject *)o, Py_TPFLAGS_HEAPTYPE)) {
+        return PyUnicode_FromString("not-a-heap-type");
+    }
+    PyTypeObject *t = (PyTypeObject *)o;
+    PyHeapTypeObject *ht = (PyHeapTypeObject *)o;
+    return Py_BuildValue(
+        "(iiiii)", t->tp_as_async == &ht->as_async ? 1 : 0,
+        t->tp_as_number == &ht->as_number ? 1 : 0,
+        t->tp_as_sequence == &ht->as_sequence ? 1 : 0,
+        t->tp_as_mapping == &ht->as_mapping ? 1 : 0,
+        t->tp_as_buffer == &ht->as_buffer ? 1 : 0);
+}
+
 static PyMethodDef methods[] = {
     {"slots_of", slots_of, METH_O, NULL},
     {"walk_slots", walk_slots, METH_O, NULL},
+    {"call_slot", call_slot, METH_VARARGS, NULL},
+    {"suites_are_embedded", suites_are_embedded, METH_O, NULL},
     {"shares_new", shares_new, METH_VARARGS, NULL},
     {"undisturbed", undisturbed, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};

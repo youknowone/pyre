@@ -690,6 +690,100 @@ fn base_mirror(w_type: PyObjectRef) -> *mut CPyTypeObject {
     pyobject::make_ref(w_base) as *mut CPyTypeObject
 }
 
+/// Allocate a zeroed suite on first use — `typeobject.py fill_slot`, which
+/// mallocs the one a slot needs when the type carries none.  A type mirror is
+/// immortal for the same reason its instances are, so the leak is the
+/// intended lifetime.
+macro_rules! table_of {
+    ($tp:expr, $field:ident, $shape:ty) => {{
+        unsafe {
+            if (*$tp).$field.is_null() {
+                (*$tp).$field = Box::leak(Box::new(std::mem::zeroed::<$shape>()));
+            }
+            (*$tp).$field
+        }
+    }};
+}
+
+// ── The slots a mirror carries for the methods this runtime answers ─────
+//
+// `typeobject.py update_all_slots_builtin` walks `slotdefs` and asks
+// `slotdefs.py get_slot_tp_function` what C function each slot of a type the
+// runtime defines should carry.  Every factory there closes over
+// `w_type.lookup(<method>)` and calls it with the receiver; the trampolines
+// below resolve the same name on the receiver's own type instead, so an
+// override reaches a slot its base filled.
+
+/// `space.call_function(w_type.lookup(method), w_self, *arguments)`.
+///
+/// A type lookup, not an attribute one: an instance dict entry of the same
+/// name is not what a slot answers with.
+fn call_slot_method(
+    w_self: PyObjectRef,
+    method: &str,
+    arguments: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(w_self);
+    for &argument in arguments {
+        roots.pin_root(argument);
+    }
+    let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
+    let Some(w_type) = crate::typedef::r#type(reload(0)) else {
+        return Err(crate::PyError::type_error(format!(
+            "a receiver with no type reached {method}"
+        )));
+    };
+    let Some(function) = (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), method) })
+    else {
+        // The fill installs a slot only for a name the type has, so reaching
+        // this is the type having lost it since.
+        return Err(crate::PyError::type_error(format!(
+            "the type no longer defines {method}"
+        )));
+    };
+    let function_slot = pyre_object::gc_roots::shadow_stack_len();
+    roots.pin_root(function);
+    let mut call = Vec::with_capacity(arguments.len() + 1);
+    for index in 0..=arguments.len() {
+        call.push(reload(index));
+    }
+    crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(function_slot),
+        &call,
+    )
+}
+
+/// `slotdefs.py make_unary_slot` — the method called with the receiver alone.
+macro_rules! unary_slots {
+    ($(($rust:ident, $method:literal),)*) => {
+        $(
+            unsafe extern "C" fn $rust(raw: *mut CPyObject) -> *mut CPyObject {
+                let Some(w_self) = super::object::argument(raw) else {
+                    return std::ptr::null_mut();
+                };
+                super::object::result(call_slot_method(w_self, $method, &[]))
+            }
+        )*
+    };
+}
+
+unary_slots! {
+    (interp_tp_repr, "__repr__"),
+    (interp_tp_str, "__str__"),
+    (interp_nb_int, "__int__"),
+    (interp_nb_float, "__float__"),
+    (interp_nb_index, "__index__"),
+    (interp_nb_negative, "__neg__"),
+    (interp_nb_positive, "__pos__"),
+    (interp_nb_absolute, "__abs__"),
+    (interp_nb_invert, "__invert__"),
+    (interp_am_await, "__await__"),
+    (interp_am_aiter, "__aiter__"),
+    (interp_am_anext, "__anext__"),
+}
+
 /// `slotdefs.py slot_tp_iter` — `iter(self)` for a type this runtime defines.
 unsafe extern "C" fn interp_tp_iter(raw: *mut CPyObject) -> *mut CPyObject {
     let Some(w_self) = super::object::argument(raw) else {
@@ -717,25 +811,96 @@ unsafe extern "C" fn interp_tp_iternext(raw: *mut CPyObject) -> *mut CPyObject {
     }
 }
 
-/// The slots this runtime fills on a mirror to reach a method it answers for
-/// itself, and the method whose presence earns each one --
-/// `typeobject.py update_all_slots_builtin` over `slotdefs`.
-///
-/// Only the iteration pair so far.  A caller that reads `tp_iternext` off the
-/// type instead of calling `PyIter_Next` -- which is what every loop a Cython
-/// module compiles does, for anything but an exact `list` or `tuple` -- has no
-/// other way to reach a `__next__` written here, and reads the NULL as a
-/// failure with no exception to report.
-const INTERPRETER_SLOTS: [(
+/// `slotdefs.py make_unary_slot_int` — the method's answer read as an
+/// integer, with -1 the failure a caller checks the indicator for.
+macro_rules! length_slots {
+    ($(($rust:ident, $method:literal),)*) => {
+        $(
+            unsafe extern "C" fn $rust(raw: *mut CPyObject) -> isize {
+                let Some(w_self) = super::object::argument(raw) else {
+                    return -1;
+                };
+                let counted = call_slot_method(w_self, $method, &[])
+                    .and_then(crate::baseobjspace::int_w);
+                match super::pyerrors::trap(counted) {
+                    Some(count) => count as isize,
+                    None => -1,
+                }
+            }
+        )*
+    };
+}
+
+length_slots! {
+    (interp_tp_hash, "__hash__"),
+    (interp_sq_length, "__len__"),
+    (interp_mp_length, "__len__"),
+}
+
+/// Where a filled slot is written.
+type SlotWriter = fn(*mut CPyTypeObject, *const c_void);
+
+/// The `tp_` slots this runtime fills to reach a method it answers for
+/// itself, and the method whose presence on the type earns each one.
+const UNARY_SLOTS: [(
     &str,
     unsafe extern "C" fn(*mut CPyObject) -> *mut CPyObject,
-    fn(*mut CPyTypeObject, *const c_void),
-); 2] = [
+    SlotWriter,
+); 14] = [
+    ("__repr__", interp_tp_repr, |tp, slot| unsafe {
+        (*tp).tp_repr = slot
+    }),
+    ("__str__", interp_tp_str, |tp, slot| unsafe {
+        (*tp).tp_str = slot
+    }),
     ("__iter__", interp_tp_iter, |tp, slot| unsafe {
         (*tp).tp_iter = slot
     }),
     ("__next__", interp_tp_iternext, |tp, slot| unsafe {
         (*tp).tp_iternext = slot
+    }),
+    ("__int__", interp_nb_int, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_int = slot
+    }),
+    ("__float__", interp_nb_float, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_float = slot
+    }),
+    ("__index__", interp_nb_index, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_index = slot
+    }),
+    ("__neg__", interp_nb_negative, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_negative = slot
+    }),
+    ("__pos__", interp_nb_positive, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_positive = slot
+    }),
+    ("__abs__", interp_nb_absolute, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_absolute = slot
+    }),
+    ("__invert__", interp_nb_invert, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_invert = slot
+    }),
+    ("__await__", interp_am_await, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_async, CPyAsyncMethods)).am_await = slot
+    }),
+    ("__aiter__", interp_am_aiter, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_async, CPyAsyncMethods)).am_aiter = slot
+    }),
+    ("__anext__", interp_am_anext, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_async, CPyAsyncMethods)).am_anext = slot
+    }),
+];
+
+/// The slots whose C function answers a count rather than an object.
+const LENGTH_SLOTS: [(&str, unsafe extern "C" fn(*mut CPyObject) -> isize, SlotWriter); 3] = [
+    ("__hash__", interp_tp_hash, |tp, slot| unsafe {
+        (*tp).tp_hash = slot
+    }),
+    ("__len__", interp_sq_length, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_sequence, CPySequenceMethods)).sq_length = slot
+    }),
+    ("__len__", interp_mp_length, |tp, slot| unsafe {
+        (*table_of!(tp, tp_as_mapping, CPyMappingMethods)).mp_length = slot
     }),
 ];
 
@@ -743,17 +908,28 @@ const INTERPRETER_SLOTS: [(
 ///
 /// Such a slot must never be published back as that method: the call it makes
 /// resolves the name again, and a published wrapper would answer with itself.
+/// Only the slots `inherit_slots` copies can reach a type built from C, and
+/// those are the scalar ones — a suite is never handed down whole.
 fn is_interpreter_slot(slot: *const c_void) -> bool {
-    INTERPRETER_SLOTS
+    UNARY_SLOTS
         .iter()
         .any(|&(_, function, _)| std::ptr::eq(slot, function as *const c_void))
+        || LENGTH_SLOTS
+            .iter()
+            .any(|&(_, function, _)| std::ptr::eq(slot, function as *const c_void))
 }
 
 /// `typeobject.py update_all_slots_builtin` — fill the slots `w_type` answers
 /// for itself.
 fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
-    for (method, function, store) in INTERPRETER_SLOTS {
-        if unsafe { crate::baseobjspace::lookup_in_type(w_type, method) }.is_some() {
+    let defines = |method| unsafe { crate::baseobjspace::lookup_in_type(w_type, method) }.is_some();
+    for (method, function, store) in UNARY_SLOTS {
+        if defines(method) {
+            store(mirror, function as *const c_void);
+        }
+    }
+    for (method, function, store) in LENGTH_SLOTS {
+        if defines(method) {
             store(mirror, function as *const c_void);
         }
     }
@@ -826,12 +1002,78 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         tp_free,
         tp_setattro,
         tp_getattro,
-        tp_as_buffer,
-        tp_as_number,
-        tp_as_async,
-        tp_as_sequence,
-        tp_as_mapping,
     );
+    // `typeobject.py:962-992 inherit_slots`.  A mirror allocated as a heap
+    // type already names suites of its own, so the pointer is taken from the
+    // base only when there is none; otherwise what a subclass inherits is the
+    // entries, one at a time.
+    macro_rules! suite {
+        ($field:ident, $($entry:ident),* $(,)?) => {
+            unsafe {
+                if (*tp).$field.is_null() {
+                    (*tp).$field = (*base).$field;
+                } else if !(*base).$field.is_null() {
+                    $(
+                        if (*(*tp).$field).$entry.is_null() {
+                            (*(*tp).$field).$entry = (*(*base).$field).$entry;
+                        }
+                    )*
+                }
+            }
+        };
+    }
+    suite!(tp_as_buffer, bf_getbuffer, bf_releasebuffer);
+    suite!(
+        tp_as_number,
+        nb_add,
+        nb_subtract,
+        nb_multiply,
+        nb_remainder,
+        nb_divmod,
+        nb_power,
+        nb_negative,
+        nb_positive,
+        nb_absolute,
+        nb_bool,
+        nb_invert,
+        nb_lshift,
+        nb_rshift,
+        nb_and,
+        nb_xor,
+        nb_or,
+        nb_int,
+        nb_float,
+        nb_inplace_add,
+        nb_inplace_subtract,
+        nb_inplace_multiply,
+        nb_inplace_remainder,
+        nb_inplace_power,
+        nb_inplace_lshift,
+        nb_inplace_rshift,
+        nb_inplace_and,
+        nb_inplace_xor,
+        nb_inplace_or,
+        nb_floor_divide,
+        nb_true_divide,
+        nb_inplace_floor_divide,
+        nb_inplace_true_divide,
+        nb_index,
+        nb_matrix_multiply,
+        nb_inplace_matrix_multiply,
+    );
+    suite!(tp_as_async, am_await, am_aiter, am_anext);
+    suite!(
+        tp_as_sequence,
+        sq_length,
+        sq_concat,
+        sq_repeat,
+        sq_item,
+        sq_ass_item,
+        sq_contains,
+        sq_inplace_concat,
+        sq_inplace_repeat,
+    );
+    suite!(tp_as_mapping, mp_length, mp_subscript, mp_ass_subscript);
     unsafe {
         if (*tp).tp_vectorcall_offset == 0 {
             (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
@@ -2701,7 +2943,7 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
             );
         }
     }
-    if unsafe { !(*tp).tp_hash.is_null() } {
+    if unsafe { !(*tp).tp_hash.is_null() } && !is_interpreter_slot(unsafe { (*tp).tp_hash }) {
         store(
             ns,
             "__hash__",
@@ -3395,19 +3637,6 @@ mod slot_id {
         TP_VECTORCALL = 82,
         TP_TOKEN = 83,
     }
-}
-
-/// Allocate a zeroed sub-table on first use.  A heap type is immortal for the
-/// same reason its instances are, so the leak is the intended lifetime.
-macro_rules! table_of {
-    ($tp:expr, $field:ident, $shape:ty) => {{
-        unsafe {
-            if (*$tp).$field.is_null() {
-                (*$tp).$field = Box::leak(Box::new(std::mem::zeroed::<$shape>()));
-            }
-            (*$tp).$field
-        }
-    }};
 }
 
 fn apply_slot(tp: *mut CPyTypeObject, id: c_int, value: *mut c_void) -> Result<(), crate::PyError> {

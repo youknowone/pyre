@@ -158,6 +158,17 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
             std::ptr::null_mut(),
             size_of::<super::typeobject::CPyHeapTypeObject>(),
         ) as *mut CPyTypeObject;
+        // `typeobject.py:749-753 type_alloc`.  The suites are the blocks the
+        // `PyHeapTypeObject` above declares, so an extension that reads one
+        // off `ht_type` and one off `tp_as_number` reads the same words.
+        unsafe {
+            let heap = mirror as *mut super::typeobject::CPyHeapTypeObject;
+            (*mirror).tp_as_async = &raw mut (*heap).as_async;
+            (*mirror).tp_as_number = &raw mut (*heap).as_number;
+            (*mirror).tp_as_sequence = &raw mut (*heap).as_sequence;
+            (*mirror).tp_as_mapping = &raw mut (*heap).as_mapping;
+            (*mirror).tp_as_buffer = &raw mut (*heap).as_buffer;
+        }
         super::typeobject::describe_interpreter_type(mirror, w_obj);
         // `typeobject.py:727-732`: the metatype is referenced from here only
         // when it is itself a heap type.
