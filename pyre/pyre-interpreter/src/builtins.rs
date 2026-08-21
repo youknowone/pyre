@@ -4612,8 +4612,64 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     };
     builtin_abs_obj(obj)
 }
+/// Whether the receiver's `__abs__` is still the one its builtin numeric type
+/// installs, which is what makes the structural arms below correct for it.
+/// `int` covers the bigint representation and `bool`, neither of which
+/// registers its own.
+///
+/// # Safety
+/// `obj` must point to a valid object whose header is readable.
+unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
+    let w_class = unsafe { (*obj).w_class };
+    if w_class.is_null() {
+        return true;
+    }
+    // An exact receiver cannot carry a replacement, so the common call spends
+    // a pointer compare rather than a lookup.
+    for tp in [
+        &pyre_object::INT_TYPE,
+        &pyre_object::FLOAT_TYPE,
+        &pyre_object::COMPLEX_TYPE,
+    ] {
+        if std::ptr::eq(w_class, pyre_object::get_instantiate(tp)) {
+            return true;
+        }
+    }
+    let Some((src, _)) = (unsafe { crate::baseobjspace::lookup_where_pair(w_class, "__abs__") })
+    else {
+        return true;
+    };
+    [
+        &pyre_object::INT_TYPE,
+        &pyre_object::FLOAT_TYPE,
+        &pyre_object::COMPLEX_TYPE,
+    ]
+    .into_iter()
+    .any(|tp| std::ptr::eq(src, pyre_object::get_instantiate(tp)))
+}
 
 fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    // `operation.py`'s `abs` hands the operand to `space.abs`, which reaches
+    // `__abs__` through the type, so a subtype that replaced the builtin one —
+    // `__abs__ = None` included — is dispatched by the lookup below rather than
+    // answered structurally.
+    if unsafe { abs_uses_builtin(obj) } {
+        return abs_structural(obj);
+    }
+    unsafe {
+        if let Some(tp) = crate::typedef::r#type(obj)
+            && let Some(method) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__abs__")
+        {
+            return crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[]);
+        }
+    }
+    Err(abs_bad_operand(obj))
+}
+
+/// `int.__abs__` / `float.__abs__`: the layout arms on their own.  These are
+/// what the lookup in `builtin_abs_obj` dispatches to, so they must not repeat
+/// it — a subtype whose `__abs__` calls back into one would not terminate.
+fn abs_structural(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         if is_bool(obj) {
             return Ok(w_int_new(w_bool_get_value(obj) as i64));
@@ -4628,10 +4684,11 @@ fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         }
         if is_long(obj) {
             let val = w_long_get_value(obj);
-            // rbigint.py:1303-1308 returns `self` for nonnegative values;
-            // longobject.py then allocates a fresh W_LongObject around
-            // that same rbigint. Preserve both wrapper identity and payload
-            // sharing instead of translating `Clone` into another GC payload.
+            // `rbigint.abs` returns `self` for nonnegative values, and
+            // longobject.py's `_make_descr_unaryop('abs')` then allocates a
+            // fresh W_LongObject around that same rbigint. Preserve both
+            // wrapper identity and payload sharing instead of translating
+            // `Clone` into another GC payload.
             if val.get_sign() != -1 {
                 return Ok(pyre_object::longobject::w_long_from_raw(
                     pyre_object::longobject::w_long_get_raw_value(obj),
@@ -4646,19 +4703,23 @@ fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             return crate::objspace::descroperation::complex_abs(obj);
         }
     }
-    // Instance __abs__ — PyPy: baseobjspace.py abs
-    unsafe {
-        if pyre_object::is_instance(obj) {
-            let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__abs__") {
-                return crate::call::call_function_impl_result(method, &[obj]);
-            }
-        }
-    }
-    Err(crate::PyError::type_error(format!(
+    Err(abs_bad_operand(obj))
+}
+
+/// `int.__abs__` / `float.__abs__` as gateway functions.
+pub fn builtin_abs_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = match args {
+        [val] => *val,
+        _ => parse_single_required(args, "self", "__abs__")?,
+    };
+    abs_structural(obj)
+}
+
+fn abs_bad_operand(obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
         "bad operand type for abs(): '{}'",
         crate::baseobjspace::object_functionstr_type_name(obj)
-    )))
+    ))
 }
 
 pub fn __pyre_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
