@@ -2464,14 +2464,27 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
 /// The roots built before the `type` typeobject is published read `PY_NULL`
 /// here; the sweep still fills them. A type whose metatype is not `type`
 /// (`_ctypes`' metaclasses) overwrites the slot after construction.
+///
+/// `w_metatype` is the type's own type; `PY_NULL` asks for `type`.  It is
+/// written once, here, and a builtin type's metatype is never changed
+/// afterwards: `try_walker_specialize_load_type_attr` folds a type-attribute
+/// load on the premise that the metatype is `type` and guards the receiver's
+/// identity rather than this slot, which is sound only because a type object
+/// does not exist until this function returns.  Changing a published type's
+/// metatype would owe that fold a guard and `mutated()` a call.
 fn new_builtin_typeobject(
     name: &str,
     bases: PyObjectRef,
     dict_ptr: *mut u8,
     layout_pytype: *const PyType,
+    w_metatype: PyObjectRef,
 ) -> PyObjectRef {
     let type_obj = w_type_new_builtin(name, bases, dict_ptr, layout_pytype);
-    unsafe { (*type_obj).w_class = w_type() };
+    let w_metatype = match w_metatype.is_null() {
+        true => w_type(),
+        false => w_metatype,
+    };
+    unsafe { store_subclass_tag(type_obj, w_metatype) };
     type_obj
 }
 
@@ -2496,6 +2509,7 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
         PY_NULL,
         ns as *mut u8,
         &INSTANCE_TYPE as *const PyType,
+        PY_NULL,
     );
     // typeobject.py setup_builtin_type — root type gets its own Layout.
     unsafe {
@@ -2539,6 +2553,21 @@ fn new_typeobject_with_base_and_layout(
     base: PyObjectRef,
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
+    new_typeobject_with_metatype_and_layout(name, init, base, layout_pytype, PY_NULL)
+}
+
+/// [`new_typeobject_with_base_and_layout`] for a type whose own type is not
+/// `type` — the `metaclass` a C extension names through `PyType_FromMetaclass`,
+/// and the metatype a static `PyTypeObject` declares in its `ob_type`.
+///
+/// `PY_NULL` asks for `type`, which is what every builtin here passes.
+fn new_typeobject_with_metatype_and_layout(
+    name: &str,
+    init: impl FnOnce(PyObjectRef),
+    base: PyObjectRef,
+    layout_pytype: *const PyType,
+    w_metatype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::w_dict_new();
@@ -2566,7 +2595,7 @@ fn new_typeobject_with_base_and_layout(
     // The type object it allocates is what the namespace has to survive: the
     // word handed over is stored in the new type, but this frame's copy is
     // pre-move, so the probes below take a fresh read.
-    let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype);
+    let type_obj = new_builtin_typeobject(name, bases, ns as *mut u8, layout_pytype, w_metatype);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     // typeobject.py setup_builtin_type:
@@ -2658,7 +2687,7 @@ pub fn make_builtin_type_with_bases(
     init(ns);
     let bases_tuple = w_tuple_new(bases.to_vec());
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    let type_obj = new_builtin_typeobject(name, bases_tuple, ns as *mut u8, layout_pytype);
+    let type_obj = new_builtin_typeobject(name, bases_tuple, ns as *mut u8, layout_pytype, PY_NULL);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     unsafe {
@@ -2755,6 +2784,20 @@ pub fn mark_cpython_static_extension_type(type_obj: PyObjectRef) {
     unsafe {
         pyre_object::w_type_set_cpython_type_flags(type_obj, false, false, true);
     }
+}
+
+/// [`make_builtin_type_with_layout`] for a type whose own type is not `type`.
+///
+/// The metatype must be a subclass of `type` whose instances are laid out as
+/// `W_TypeObject` — the caller establishes both; `PY_NULL` asks for `type`.
+pub fn make_builtin_type_with_metatype(
+    name: &str,
+    init: impl FnOnce(PyObjectRef),
+    base: PyObjectRef,
+    layout_pytype: *const PyType,
+    w_metatype: PyObjectRef,
+) -> PyObjectRef {
+    new_typeobject_with_metatype_and_layout(name, init, base, layout_pytype, w_metatype)
 }
 
 /// int.__new__(cls, *args) — PyPy: intobject.py descr__new__

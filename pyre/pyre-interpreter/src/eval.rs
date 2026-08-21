@@ -607,6 +607,12 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
                     &mut (*(w_type as *mut pyre_object::typeobject::W_TypeObject)).bases;
                 forward(bases_slot);
                 let t = &mut *(w_type as *mut pyre_object::typeobject::W_TypeObject);
+                // The metatype.  `type_object_custom_trace` forwards it too,
+                // but never runs for the Box-immortal owners this walk stands
+                // in for.  It is the immortal `type` for all but a type built
+                // through `PyType_FromMetaclass`, whose metatype is an
+                // ordinary object with no other root here.
+                forward(&mut t.ob_header.w_class);
                 forward(&mut t.w_name);
                 forward(&mut t.w_qualname);
                 // Heap and builtin types both hold a managed W_DictObject.

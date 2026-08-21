@@ -7,7 +7,7 @@
 //! way.
 
 use super::pyobject::{self, CPyObject, REFCNT_FROM_PYRE, REFCNT_IMMORTAL};
-use pyre_object::PyObjectRef;
+use pyre_object::{PY_NULL, PyObjectRef};
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::sync::OnceLock;
 
@@ -2295,16 +2295,26 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     }
 
     let ns = reload();
-    store(
-        ns,
-        "__new__",
-        crate::make_builtin_function("__new__", slot_new),
-    );
-    store(
-        ns,
-        "__init__",
-        crate::make_builtin_function("__init__", slot_init),
-    );
+    // A wrapper routes to the slot the receiver's type carries, and by here
+    // `inherit_slots` has copied a base's.  With no slot to route to it can
+    // only refuse, and storing it would cover what the base defines --
+    // `type.__new__` for a metatype, which is the whole of what one is for.
+    // `type_ready_set_new` and `add_operators` publish a wrapper for a slot
+    // the type has and leave an inherited one to the base that declared it.
+    if unsafe { !(*tp).tp_new.is_null() } {
+        store(
+            ns,
+            "__new__",
+            crate::make_builtin_function("__new__", slot_new),
+        );
+    }
+    if unsafe { !(*tp).tp_init.is_null() } {
+        store(
+            ns,
+            "__init__",
+            crate::make_builtin_function("__init__", slot_init),
+        );
+    }
     let unary: [(
         &'static str,
         fn(*mut CPyTypeObject) -> *const c_void,
@@ -2606,13 +2616,17 @@ fn stamp_objclass(w_type: PyObjectRef, tp: *mut CPyTypeObject) {
     }
 }
 
-fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
+fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::PyError> {
     if tp.is_null() {
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,
             "PyType_Ready(): NULL type",
         ));
     }
+    // Before `inherit_slots` copies a base's `tp_new` and the default below
+    // fills the rest: what the metaclass check asks is whether the extension
+    // *declared* one, which the field stops answering a few lines from here.
+    record_declared_tp_new(tp);
     if unsafe { (*tp).tp_flags } & PY_TPFLAGS_READY != 0 {
         return Ok(());
     }
@@ -2631,7 +2645,8 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
 
     let base = unsafe { (*tp).tp_base };
     if !base.is_null() {
-        ready(base)?;
+        // A base is readied for itself, so it derives its own metatype.
+        ready(base, PY_NULL)?;
     }
     inherit_slots(tp, base);
     if unsafe { (*tp).tp_basicsize } == 0 {
@@ -2643,7 +2658,10 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
     if unsafe { (*tp).tp_free.is_null() } {
         unsafe { (*tp).tp_free = PyObject_Free as *const c_void };
     }
-    if unsafe { (*tp).tp_new.is_null() } {
+    // `PyType_GenericNew` builds an ordinary instance, which is not what a
+    // type derived from `type` has for one: left unset, the slot routes to
+    // `type.__new__` through the base instead.
+    if unsafe { (*tp).tp_new.is_null() } && !builds_types(interpreter_type(base)) {
         unsafe { (*tp).tp_new = PyType_GenericNew as *const c_void };
     }
 
@@ -2675,13 +2693,19 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
     // publishes the leading component as the type's `__module__`, which is
     // where `tp_name`'s prefix is meant to end up.
 
+    let w_metatype = resolve_metatype(tp, w_metaclass, w_base)?;
+
     let roots = pyre_object::gc_roots::push_roots();
     let base_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_base);
-    let w_type = crate::typedef::make_builtin_type_with_base(
+    let metatype_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_metatype);
+    let w_type = crate::typedef::make_builtin_type_with_metatype(
         &qualified,
         |ns| install_namespace(ns, tp),
         pyre_object::gc_roots::shadow_stack_get(base_slot),
+        instance_layout(pyre_object::gc_roots::shadow_stack_get(base_slot)),
+        pyre_object::gc_roots::shadow_stack_get(metatype_slot),
     );
     unsafe {
         pyre_object::w_type_set_cpython_type_flags(
@@ -2722,9 +2746,109 @@ fn ready(tp: *mut CPyTypeObject) -> Result<(), crate::PyError> {
     Ok(())
 }
 
+/// The types whose `tp_new` the extension wrote itself.
+///
+/// [`ready`] fills an unset `tp_new` with `PyType_GenericNew` and
+/// [`inherit_slots`] copies a base's before that, so by the time a metaclass is
+/// checked the field answers "does this type have a `tp_new`", which is yes for
+/// every readied type.  What the check asks is the narrower question this
+/// records: did the extension declare one.
+static DECLARED_TP_NEW: super::ForkMutex<
+    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>,
+> = super::ForkMutex::new(std::collections::HashSet::with_hasher(
+    std::hash::BuildHasherDefault::new(),
+));
+
+fn record_declared_tp_new(tp: *mut CPyTypeObject) {
+    if unsafe { (*tp).tp_new.is_null() } {
+        return;
+    }
+    DECLARED_TP_NEW.lock().insert(tp as usize);
+}
+
+fn declares_tp_new(tp: *mut CPyTypeObject) -> bool {
+    !tp.is_null() && DECLARED_TP_NEW.lock().contains(&(tp as usize))
+}
+
+/// Whether a type readied over `w_base` has types for its instances.
+fn builds_types(w_base: PyObjectRef) -> bool {
+    let w_type_type = crate::typedef::w_type();
+    !w_base.is_null()
+        && !w_type_type.is_null()
+        && unsafe { crate::baseobjspace::issubtype_w(w_base, w_type_type) }
+}
+
+/// The layout a type readied over `w_base` gives its instances.
+///
+/// Instances of a type derived from `type` are `W_TypeObject`s, so the type
+/// carries `type`'s layout rather than the general instance one — the same
+/// choice `_ctypes`' `make_ctypes_metatype` makes for its metaclasses.  A
+/// metaclass built here and then handed back through `PyType_FromMetaclass`
+/// is instantiated by both routes, and the general layout makes the Python one
+/// refuse it.
+fn instance_layout(w_base: PyObjectRef) -> *const pyre_object::PyType {
+    match builds_types(w_base) {
+        true => &pyre_object::pyobject::TYPE_TYPE as *const pyre_object::PyType,
+        false => &pyre_object::pyobject::INSTANCE_TYPE as *const pyre_object::PyType,
+    }
+}
+
+/// The metatype a type being readied gets — `typeobject.c
+/// _PyType_FromMetaclass_impl`'s metaclass resolution, plus the metatype a
+/// static `PyTypeObject` declares for itself.
+///
+/// The named metaclass wins; failing that the static's own `ob_type`, which
+/// `type_realize` reads back after `finish_type_1`; failing that the base's
+/// metatype, so a type derived from one built through a metaclass keeps it.
+fn resolve_metatype(
+    tp: *mut CPyTypeObject,
+    w_metaclass: PyObjectRef,
+    w_base: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let declared = match w_metaclass.is_null() {
+        false => w_metaclass,
+        true => interpreter_type(unsafe { (*tp).ob_base.ob_base.ob_type }),
+    };
+    let w_metatype = match declared.is_null() {
+        false => declared,
+        // `finish_type_1` — a static that declares nothing is an instance of
+        // whatever its base is an instance of.
+        true => match crate::typedef::r#type(w_base) {
+            Some(w_type) => w_type.as_ptr(),
+            None => return Ok(PY_NULL),
+        },
+    };
+    let w_type_type = crate::typedef::w_type();
+    if w_type_type.is_null() || std::ptr::eq(w_metatype, w_type_type) {
+        return Ok(PY_NULL);
+    }
+    if !unsafe { pyre_object::is_type(w_metatype) }
+        || !unsafe { crate::baseobjspace::issubtype_w(w_metatype, w_type_type) }
+    {
+        return Err(crate::PyError::type_error(format!(
+            "Metaclass '{}' is not a subclass of 'type'.",
+            metatype_repr(w_metatype)
+        )));
+    }
+    // Its instances have to be `W_TypeObject`s for the type below to be one.
+    let layout = unsafe { pyre_object::w_type_get_layout_ptr(w_metatype) };
+    let laid_out_as_a_type = !layout.is_null()
+        && std::ptr::eq(
+            unsafe { (*layout).typedef },
+            &pyre_object::pyobject::TYPE_TYPE as *const pyre_object::PyType,
+        );
+    if !laid_out_as_a_type {
+        return Err(crate::PyError::type_error(format!(
+            "Metaclass '{}' does not lay its instances out as types",
+            unsafe { pyre_object::w_type_get_name(w_metatype) }
+        )));
+    }
+    Ok(w_metatype)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_Ready(tp: *mut CPyTypeObject) -> c_int {
-    match ready(tp) {
+    match ready(tp, PY_NULL) {
         Ok(()) => 0,
         Err(error) => {
             if !tp.is_null() {
@@ -3069,6 +3193,7 @@ fn from_spec(
     spec: *mut CPyTypeSpec,
     bases: *mut CPyObject,
     module: *mut CPyObject,
+    metaclass: *mut CPyTypeObject,
 ) -> Result<PyObjectRef, crate::PyError> {
     if spec.is_null() {
         return Err(crate::PyError::new(
@@ -3110,8 +3235,11 @@ fn from_spec(
     // measured against, so it has to be final before either is resolved.
     let base = unsafe { (*tp).tp_base };
     if !base.is_null() {
-        ready(base)?;
+        ready(base, PY_NULL)?;
     }
+    // The bases are only final here: `single_base` resolved them before the
+    // slot loop, whose `Py_tp_base`/`Py_tp_bases` arms may have replaced them.
+    let w_metaclass = winning_metaclass(metaclass, base)?;
     let base_basicsize = if base.is_null() {
         size_of::<CPyObject>() as isize
     } else {
@@ -3130,7 +3258,7 @@ fn from_spec(
         };
     }
 
-    ready(tp)?;
+    ready(tp, w_metaclass)?;
     if !token.is_null() {
         TYPE_TOKENS.lock().insert(tp as usize, token as usize);
     }
@@ -3146,7 +3274,12 @@ fn from_spec(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_FromSpec(spec: *mut CPyTypeSpec) -> *mut CPyObject {
-    super::object::result(from_spec(spec, std::ptr::null_mut(), std::ptr::null_mut()))
+    super::object::result(from_spec(
+        spec,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -3154,7 +3287,12 @@ pub unsafe extern "C" fn PyType_FromSpecWithBases(
     spec: *mut CPyTypeSpec,
     bases: *mut CPyObject,
 ) -> *mut CPyObject {
-    super::object::result(from_spec(spec, bases, std::ptr::null_mut()))
+    super::object::result(from_spec(
+        spec,
+        bases,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -3164,7 +3302,7 @@ pub unsafe extern "C" fn PyType_FromModuleAndSpec(
     bases: *mut CPyObject,
 ) -> *mut CPyObject {
     super::object::realize_all([module, bases]);
-    super::object::result(from_spec(spec, bases, module))
+    super::object::result(from_spec(spec, bases, module, std::ptr::null_mut()))
 }
 
 /// `PyType_GetSlot` — read one slot back off a ready type.
@@ -3705,10 +3843,75 @@ pub unsafe extern "C" fn PyType_GetFullyQualifiedName(tp: *mut CPyTypeObject) ->
     pyobject::make_ref(pyre_object::w_str_new(&name))
 }
 
-/// `PyType_FromMetaclass` — the general form of [`PyType_FromModuleAndSpec`].
+/// The metaclass a type built from a spec is an instance of —
+/// `typeobject.c _PyType_FromMetaclass_impl`'s metaclass resolution.
 ///
-/// The metaclass a type is built through is `type` itself here: pyre builds a
-/// type through its own constructor, which has no place to put another one.
+/// Nothing here reads the metaclass's `tp_basicsize`, `tp_itemsize` or
+/// `tp_alloc`, and no check of them belongs here: the storage a type object
+/// gets is a `W_TypeObject` this runtime allocates, not a block the metaclass
+/// describes, so those fields have no part to play and requiring anything of
+/// them would invent a rule the spec does not have.
+fn winning_metaclass(
+    metaclass: *mut CPyTypeObject,
+    base: *mut CPyTypeObject,
+) -> Result<PyObjectRef, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let metaclass_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(interpreter_type(metaclass));
+    let w_base = interpreter_type(base);
+    let bases = match w_base.is_null() {
+        true => PY_NULL,
+        false => {
+            let _ = roots.pin_root(w_base);
+            let w_base = pyre_object::gc_roots::shadow_stack_get(metaclass_slot + 1);
+            pyre_object::w_tuple_new(vec![w_base])
+        }
+    };
+    // A null metaclass is `type`, and the base's own metatype wins over it —
+    // which is how a type derived from one built through a metaclass keeps it.
+    let w_winner = crate::call::calculate_metaclass(
+        pyre_object::gc_roots::shadow_stack_get(metaclass_slot),
+        bases,
+    )?;
+    let w_type_type = crate::typedef::w_type();
+    if w_winner.is_null() || w_type_type.is_null() || std::ptr::eq(w_winner, w_type_type) {
+        return Ok(PY_NULL);
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let winner_slot = pyre_object::gc_roots::shadow_stack_len();
+    let w_winner = roots.pin_root(w_winner);
+    if !unsafe { pyre_object::is_type(w_winner) }
+        || !unsafe { crate::baseobjspace::issubtype_w(w_winner, w_type_type) }
+    {
+        return Err(crate::PyError::type_error(format!(
+            "Metaclass '{}' is not a subclass of 'type'.",
+            metatype_repr(w_winner)
+        )));
+    }
+    // The winner, not the argument: a base's metatype that beat it is the one
+    // that would take the allocation over.  The type is built here and its
+    // `__new__` never runs, so a metaclass that defines one is refused.
+    let w_winner = pyre_object::gc_roots::shadow_stack_get(winner_slot);
+    if declares_tp_new(pyobject::as_pyobj(w_winner) as *mut CPyTypeObject) {
+        return Err(crate::PyError::type_error(
+            "Metaclasses with custom tp_new are not supported.",
+        ));
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(winner_slot))
+}
+
+/// A metatype as the refusals above name it — `%R` of a type, which is
+/// `<class 'name'>`.
+///
+/// Built rather than evaluated: this runs with an error already being
+/// assembled, and a `__repr__` that can itself raise has nowhere to report to.
+fn metatype_repr(w_metatype: PyObjectRef) -> String {
+    format!("<class '{}'>", unsafe {
+        pyre_object::w_type_get_name(w_metatype)
+    })
+}
+
+/// `PyType_FromMetaclass` — the general form of [`PyType_FromModuleAndSpec`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_FromMetaclass(
     metaclass: *mut CPyTypeObject,
@@ -3717,17 +3920,7 @@ pub unsafe extern "C" fn PyType_FromMetaclass(
     bases: *mut CPyObject,
 ) -> *mut CPyObject {
     super::object::realize_all([module, bases]);
-    if !metaclass.is_null() {
-        let w_metaclass = interpreter_type(metaclass);
-        if w_metaclass.is_null() || w_metaclass != crate::typedef::w_type() {
-            super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
-                "Metaclass '{}' is not supported; only 'type' is",
-                type_name_of(metaclass)
-            )));
-            return std::ptr::null_mut();
-        }
-    }
-    super::object::result(from_spec(spec, bases, module))
+    super::object::result(from_spec(spec, bases, module, metaclass))
 }
 
 /// `PyErr_NewExceptionWithDoc` — `type(name, bases, {'__doc__': doc})`.
