@@ -2419,6 +2419,25 @@ pub(crate) enum CalleeReplaySafety {
 /// the call.  A caller-local that is merely unescaped does NOT: `x = []; f(x)`
 /// leaves `x = []` before the boundary, so the rewind hands `f` back the same
 /// object and a re-run `x.a += 1` reads its own first write.
+///
+/// ADAPTATION, and the whole enclosing scan with it.  Upstream has no field
+/// like this and no replay-safety question to answer, because it never re-runs
+/// a callee: `capture_resumedata` (`pyjitpl.py`) hands the WHOLE
+/// `self.framestack` to the trace, its twin in `opencoder.py` chains a snapshot
+/// for every parent through `_ensure_parent_resumedata`, and
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies every frame in
+/// `metainterp.framestack` into a blackhole interpreter and runs FORWARD.  A
+/// guard inside an inlined `__init__` therefore resumes inside `__init__`;
+/// `__new__` is not re-run and no store can be doubled.
+///
+/// Convergence path: seed the callee frame for the constructor route, which is
+/// what the keyed instance-`__next__` route already does
+/// (`inline_call.rs try_walker_inline_resolved_user_call_inner`, the
+/// `instance_next_seeded_route` arm).  Constructors are excluded from it today
+/// only by being pinned to the strict straight-line path
+/// (`constructor_result.is_some() && !strict_inlinable` declines, and
+/// `multiframe_eligible = !strict_inlinable`).  Seeding it deletes this field,
+/// `CalleeReplaySafety`, and [`fbw_callee_body_replay_safety`] outright.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CalleeArgFact {
     pub(crate) numeric: bool,
