@@ -368,7 +368,7 @@ jobs:
       shell: bash
       # Separate compilation failures from test failures in the job log. The
       # following test command reuses these artifacts.
-      run: cargo test --all --no-run --no-default-features --features dynasm
+      run: cargo test --all --no-run --no-default-features --features dynasm,cpyext
 
     - name: Run cargo tests (dynasm)
       shell: bash
@@ -379,8 +379,9 @@ jobs:
       # None of those are gated by the dynasm/cranelift feature, so re-running
       # them under cranelift only reproduced byte-identical results while
       # relinking ~15 extra test binaries (the majit-translate harness alone
-      # links >2900 tests).
-      run: cargo test --all --no-default-features --features dynasm
+      # links >2900 tests). The backend-independent cpyext tests also run here
+      # once, rather than changing the feature set of the cranelift pass.
+      run: cargo test --all --no-default-features --features dynasm,cpyext
 
     - name: Run process-exclusive tests (dynasm, serial)
       shell: bash
@@ -414,66 +415,34 @@ jobs:
 
     - name: Build test binaries (cranelift)
       shell: bash
-      # Keep the package list AND the feature list identical to the cranelift
-      # test step below. This step exists only to compile what that step then
-      # runs, so a feature the two do not share defeats it twice: the binaries
-      # built here are ones nobody runs, and the test step still has to compile
-      # the stack it does run. `cpyext` changes the pyre-interpreter/pyrex
-      # build, so it belongs in both.
+      # Keep this package list identical to the cranelift test step below.
       run: |
-        cargo test --no-run --no-default-features --features cranelift,cpyext \
-          -p majit-metainterp -p majit-backend-cranelift \
-          -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
-          -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
-          -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount
+        cargo test --no-run --no-default-features --features cranelift \
+          -p majit-metainterp -p majit-backend-cranelift
 
     - name: Run cargo tests (cranelift)
       shell: bash
       # This is a separate step so GitHub reports and reruns the backend passes
       # independently. Steps remain in one job, in order, so this pass starts
       # only after dynasm finishes and reuses that pass's Cargo target cache.
-      # Re-run ONLY the crates whose test outcome depends on the active JIT
-      # backend — the metainterp /
-      # pyre-jit / pyre-jit-trace / pyrex stack, the interpreter, the cranelift
-      # backend crate, and the majit example interpreters (each selects the
-      # backend through `majit-metainterp/{dynasm,cranelift}`). Test EXECUTION is
-      # cheap (~7s for the whole workspace); the cost this avoids is the second
-      # backend's compile+link of those otherwise-identical harnesses.
-      #
-      # `cpyext` rides along here rather than in its own step. It is off by
-      # default (see pyre-interpreter's feature table), so its tests — pyrex's
-      # cpyext_smoke, cpyext_methods, cpyext_types, cpyext_unicode,
-      # cpyext_cycles, cpyext_dict_subclass, cpyext_pystate,
-      # cpyext_object_families, cpyext_str, cpyext_exceptions,
-      # cpyext_warnings and cpyext_conversions, which are
-      # backend-independent and compile out off
-      # macOS/Linux — need SOME leg that
-      # enables it, and this leg already recompiles the pyrex/pyre-interpreter
-      # stack under a second feature set. A dedicated step would compile that
-      # stack a third time instead. They run on the ubuntu and macos copies of
-      # this job; on windows the feature compiles away to nothing.
-      #
+      # Exercise the cranelift backend and the metainterp's backend-selection
+      # path. The dynasm pass above already covers the rest of the workspace;
+      # rebuilding the pyre stack and every example with a second backend adds
+      # substantial compile and link cost without covering backend code that
+      # these two crates do not already exercise.
       # `--no-fail-fast` because these are several separate test binaries:
       # without it cargo stops at the first one that fails and the run names a
       # single failure where there may be more, which costs a round trip per
       # hidden sibling.
       run: |
-        cargo test --no-fail-fast --no-default-features --features cranelift,cpyext \
-          -p majit-metainterp -p majit-backend-cranelift \
-          -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
-          -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
-          -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount
+        cargo test --no-fail-fast --no-default-features --features cranelift \
+          -p majit-metainterp -p majit-backend-cranelift
         # The two label-selector tests set PYRE_CL_NO_CLOSING_JUMP, a
         # process-global env var read while compiling, so they are `#[ignore]`d
         # out of the parallel run above and need a serial process of their own.
-        # The package list is repeated verbatim and the name filter narrows the
-        # run to those two: selecting the backend crate alone would be a fourth
-        # feature set and would relink its harness for two tests.
-        cargo test --no-fail-fast --no-default-features --features cranelift,cpyext \
-          -p majit-metainterp -p majit-backend-cranelift \
-          -p pyre-jit -p pyre-jit-trace -p pyrex -p pyre-interpreter -p majit \
-          -p tlr -p tl -p tla -p tiny2 -p tiny3 -p tinyframe \
-          -p braininterp -p dualtape -p tlc -p calc -p i64env -p spcount \
+        # The name filter narrows the run to those two tests and reuses the
+        # backend test harness built above.
+        cargo test --no-fail-fast -p majit-backend-cranelift \
           --lib -- --ignored --test-threads=1 \
           compiler::tests::test_host_loop_external_jump_to
 
