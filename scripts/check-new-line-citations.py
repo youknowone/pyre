@@ -31,7 +31,11 @@ def added_lines(base):
     """(path, hunk line number, text) for every line the diff adds."""
     cmd = ["git", "diff", "-U0"]
     cmd += [base, "--"] if base else ["--cached", "--"]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # Decode as UTF-8 rather than letting `text=True` pick the locale codec:
+    # the diff carries this tree's own bytes, and a Windows box whose ANSI code
+    # page is not UTF-8 fails on the first em dash.
+    proc = subprocess.run(cmd, capture_output=True,
+                          encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         sys.exit(f"error: {' '.join(cmd)} failed: {proc.stderr.strip()}")
     path, lineno = None, 0

@@ -66,7 +66,7 @@ def build_index(root: Path):
             continue
         for p in base_dir.rglob("*.py"):
             try:
-                text = p.read_text(errors="replace")
+                text = p.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             names = set()
@@ -99,7 +99,7 @@ def candidates(pyfile, index, by_path):
 def scan(root: Path, search_roots):
     proc = subprocess.run(
         ["rg", "-l", "--type", "rust", RG_PREFILTER, *search_roots],
-        cwd=root, capture_output=True, text=True,
+        cwd=root, capture_output=True, encoding="utf-8", errors="replace",
     )
     if proc.returncode not in (0, 1):
         sys.exit(f"error: rg failed ({proc.returncode}): {proc.stderr.strip()}")
@@ -110,6 +110,12 @@ def scan(root: Path, search_roots):
             "That is a misconfigured search, not a clean tree."
         )
     return files
+
+
+def read_source(path):
+    """A source file's exact text: UTF-8, and its own line endings kept."""
+    with open(path, encoding="utf-8", newline="") as fh:
+        return fh.read()
 
 
 def rewrite_line(line, index, by_path, stats, refused):
@@ -185,7 +191,7 @@ def main():
     touched = []
     for rel in files:
         p = root / rel
-        original = p.read_text()
+        original = read_source(p)
         lines = original.splitlines(keepends=True)
         new = [rewrite_line(l, index, by_path, stats, refused) for l in lines]
         text = "".join(new)
@@ -196,7 +202,11 @@ def main():
     # citation set nobody can reason about if a later file raises.
     if args.apply:
         for p, text in touched:
-            p.write_text(text)
+            # newline="" on both halves, so a file goes back the way it
+            # came: text mode would read CRLF as LF and then write every LF
+            # as os.linesep, turning an LF tree into a CRLF one on Windows.
+            with open(p, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
 
     print(f"citations seen        {stats['total']:6d}")
     print(f"numbers dropped       {stats['dropped']:6d}")
