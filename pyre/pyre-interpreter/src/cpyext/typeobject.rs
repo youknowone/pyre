@@ -1516,7 +1516,7 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         tp_setattro,
         tp_getattro,
     );
-    // `typeobject.py:962-992 inherit_slots`.  A mirror allocated as a heap
+    // `typeobject.py inherit_slots`.  A mirror allocated as a heap
     // type already names suites of its own, so the pointer is taken from the
     // base only when there is none; otherwise what a subclass inherits is the
     // entries, one at a time.

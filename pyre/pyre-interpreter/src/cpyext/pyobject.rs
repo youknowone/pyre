@@ -158,7 +158,7 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
             std::ptr::null_mut(),
             size_of::<super::typeobject::CPyHeapTypeObject>(),
         ) as *mut CPyTypeObject;
-        // `typeobject.py:749-753 type_alloc`.  The suites are the blocks the
+        // `typeobject.py type_alloc`.  The suites are the blocks the
         // `PyHeapTypeObject` above declares, so an extension that reads one
         // off `ht_type` and one off `tp_as_number` reads the same words.
         unsafe {
