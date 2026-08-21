@@ -792,21 +792,26 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     // the blackhole reproduces it per replayed instruction in
     // `publish_last_instr_at_live_marker`.  None of them covers this one: a
     // frame the walker seeded for an inlined callee takes no per-opcode store
-    // (it is not the virtualizable), and a level the exception merely passes
-    // through replays no instruction, so the frame arrives holding either the
-    // `-1` the frame constructor wrote or the `pc - 1` resume coordinate a
-    // walk-end flush left.  `tb_lasti` was right either way; `f_lasti` read
-    // `-2`, or the position after the call where the interpreter reports the
-    // call itself.
+    // (it is not the virtualizable), so it arrives still holding the `-1` its
+    // constructor wrote.  `tb_lasti` was right; `f_lasti` read `-2`.
     //
-    // Idempotent for a frame that already carries the coordinate, and the
-    // `map_or` above falls back to this very field, so an unmappable coordinate
-    // writes back what is already there.
+    // Only that sentinel is overwritten.  `last_instr` is read back under two
+    // conventions — the executing coordinate this hook resolves, and the `pc -
+    // 1` a walk-end flush leaves for the frame to RESUME from — and they are
+    // not interchangeable: a level the exception merely passes through can
+    // still be resumed, and stamping the executing coordinate over its resume
+    // coordinate restarts it at an instruction its value stack does not match.
+    // Measured on `exception_reused_object_tb_not_doubled`, where the
+    // unconditional store moved one frame from 12 to 31 and the replay died
+    // with `stack underflow during interpreter opcode`.  A frame that never
+    // ran an instruction has no such coordinate to destroy.
     //
     // SAFETY: `frame_ptr` was null-checked above and the callers resolve it from
     // a blackhole level's own `virtualizable_ptr` / portal red.
     unsafe {
-        (*frame_ptr).last_instr = last_instruction as isize;
+        if (*frame_ptr).last_instr < 0 {
+            (*frame_ptr).last_instr = last_instruction as isize;
+        }
     }
     unsafe {
         pyre_interpreter::pytraceback::record_application_traceback(
