@@ -5221,6 +5221,37 @@ impl TraceCtx {
         )
     }
 
+    /// One array slot of `virtualizable.py write_boxes`, emitted into the trace.
+    ///
+    /// `pyjitpl.py synchronize_virtualizable` runs that write-back after every
+    /// vable store, but only against the recording-time virtualizable: upstream
+    /// readers of a virtualizable array are traced through and read the boxes,
+    /// so the compiled trace never needs the array itself to be current.  A
+    /// consumer that reads the array at run time instead needs the same write
+    /// emitted, which is what this records.
+    ///
+    /// The shadow is left alone — it already holds these values and stays
+    /// authoritative for the rest of the trace.
+    ///
+    /// The array base comes from the same `getfield_gc_r` + heapcache step
+    /// `_opimpl_setarrayitem_vable` takes on its non-standard branch; nothing
+    /// about that read is specific to a non-standard virtualizable.
+    pub fn vable_array_item_write_back(
+        &mut self,
+        vable_opref: OpRef,
+        index: OpRef,
+        value: OpRef,
+        fdescr: &DescrRef,
+        adescr: DescrRef,
+    ) {
+        let array_opref = self.nonstandard_vable_array_base(vable_opref, fdescr);
+        self.profiler()
+            .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
+        self.profiler()
+            .count_ops(OpCode::SetarrayitemGc, crate::counters::RECORDED_OPS);
+        self.execute_setarrayitem_gc(array_opref, index, value, adescr);
+    }
+
     /// `_opimpl_setarrayitem_vable` body with the `_nonstandard_virtualizable`
     /// decision already taken by the caller (see
     /// [`Self::nonstandard_virtualizable`]).

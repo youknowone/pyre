@@ -849,11 +849,11 @@ fn simple_namespace_replace(args: &[PyObjectRef]) -> crate::PyResult {
 /// (`pyre-jit-trace/src/jitcode_dispatch/specialize.rs`) reproduces upstream's
 /// traced-through depth-0 form for either the portal or an inline MIFrame.  It
 /// also resolves a guarded positive-depth inline chain when the exact portal
-/// result is immediately consumed by `f_locals`; that getter constructs the
-/// CPython 3.14 write-through proxy around the returned red frame and never
-/// reaches this function's force.  PyPy's corresponding `fast2locals` body is
-/// `@jit.unroll_safe`, and the oracle likewise reports no forcing or abort for
-/// these shapes.
+/// result is immediately consumed by `f_locals`; `fast2locals` is
+/// `@jit.unroll_safe`, so upstream reaches that mapping by reading the
+/// virtualizable boxes instead of forcing, and the specialized `f_locals`
+/// writes the locals region back out of the image in the dropped force's
+/// place.
 ///
 /// Every other shape still arrives here, and the force stays load-bearing for
 /// it.  In particular, generic positive-depth consumers and inline

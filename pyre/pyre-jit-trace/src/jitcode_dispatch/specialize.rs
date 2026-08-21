@@ -2557,6 +2557,75 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Write the standard virtualizable's locals region into the array a folded
+/// `f_locals` hands out.
+///
+/// `pyframe.py fast2locals` — the body behind `getdictscope`, and so behind
+/// `f_locals` — is `@jit.unroll_safe`, and the `locals_cells_stack_w[i]` reads
+/// it unrolls are `getarrayitem_vable_r` against the virtualizable BOXES.  The
+/// getter therefore neither forces the virtualizable nor reads its array, which
+/// is what makes folding it legitimate at all.
+///
+/// pyre answers `f_locals` with the 3.14 `FrameLocalsProxy`, which reads the
+/// frame's array lazily instead of copying out of it at the call, so the values
+/// have to be IN that array by the time the proxy is handed out.
+/// `pyjitpl.py synchronize_virtualizable` (`virtualizable.py write_boxes`) is
+/// the write-back that puts them there.  Upstream runs it against the
+/// recording-time virtualizable after every vable store; both halves are
+/// needed here, because the values have to be in the array for the walk's own
+/// read of the proxy AND for the compiled run's.  So this mirrors the region
+/// onto the concrete frame and emits the same store into the trace.  Without
+/// it the residual getter's read barrier was the only thing writing the region
+/// out, and folding the getter silently dropped every local the traced body
+/// had assigned.
+///
+/// Only the locals/cells region is written back.  `write_boxes` covers the
+/// whole array, but the operand-stack region above `nlocals` is not reachable
+/// through the proxy and its shadow slots read NULL outside a merge point
+/// (see [`crate::state::flush_locals_region_to_frame`]), so writing those back
+/// would destroy the values the walk is holding.
+///
+/// A slot the shadow cannot answer declines the whole write-back, and with it
+/// the fold, leaving the residual force in place.  The validation pass runs
+/// before the first emission, so a decline emits nothing.
+fn walker_write_back_standard_frame_locals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame_op: OpRef,
+    concrete_frame: usize,
+) -> bool {
+    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
+        return false;
+    };
+    let (Some(fdescr), Some(adescr)) = (
+        info.array_field_descrs().first().cloned(),
+        info.array_descrs.first().cloned(),
+    ) else {
+        return false;
+    };
+    let base = info.num_static_extra_boxes;
+    let Some(nlocals) = crate::state::concrete_nlocals(concrete_frame) else {
+        return false;
+    };
+    // `Value::Void` is the shadow's "no concrete half" sentinel rather than an
+    // unbound local, so a slot carrying it cannot be written back.
+    let mut slots = Vec::with_capacity(nlocals);
+    for slot in 0..nlocals {
+        match ctx.trace_ctx.virtualizable_entry_at(base + slot) {
+            Some((_, majit_ir::Value::Void)) | None => return false,
+            Some((value, _)) => slots.push((slot as i64, value)),
+        }
+    }
+    if !crate::state::flush_locals_region_to_frame(ctx.trace_ctx, concrete_frame) {
+        return false;
+    }
+    for (slot, value) in slots {
+        let index = ctx.trace_ctx.const_int(slot);
+        ctx.trace_ctx
+            .vable_array_item_write_back(frame_op, index, value, &fdescr, adescr.clone());
+    }
+    true
+}
+
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
 /// plain (non-method) instance attribute.  When the concrete receiver is a
 /// monomorphic instance whose attribute resolves to a boxed plain storage slot
@@ -2619,10 +2688,11 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // live virtualizable while an inline MIFrame is still active.
     //
     // There are two identities the walker can prove here: the current inline
-    // callee's shadow frame, or the standard portal frame reached by a guarded
-    // positive-depth `_getframe` walk.  The latter is deliberately gated by
-    // BOTH its red box and concrete pointer; this does not collapse an
-    // arbitrary inline callee onto the portal anchor.
+    // callee's shadow frame, whose locals region the walk flushes itself at the
+    // escape, or the standard portal frame, gated by BOTH its red box and its
+    // concrete pointer.  For the portal the dropped force was also what wrote
+    // the locals region out of the virtualizable image, so the fold has to
+    // write that region itself.
     let inline_frame = current_inline_concrete_frame();
     let is_inline_frame = inline_frame != 0
         && concrete_obj as usize == inline_frame
@@ -2647,6 +2717,11 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
         let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
         if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+            return Ok(None);
+        }
+        if is_standard_frame
+            && !walker_write_back_standard_frame_locals(ctx, obj, concrete_obj as usize)
+        {
             return Ok(None);
         }
         let concrete_proxy = pyre_interpreter::pyframe::frame_locals_proxy::new(concrete_obj);
@@ -8999,10 +9074,11 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// published onto the portal frame at every may-force boundary
 /// (`LiveLastInstrGuard`).  Generic `f_lasti` / `f_lineno` readers retain that
 /// residual boundary.  An exact optimized-frame `f_locals` read is specialized
-/// below instead: CPython 3.14's getter only constructs a write-through proxy,
-/// so it need not read or force fast locals at construction time.  PyPy reaches
-/// the same force-free result by tracing through its `@jit.unroll_safe`
-/// `fast2locals` body.
+/// below instead: `pyframe.py fast2locals` is `@jit.unroll_safe`, so upstream
+/// traces through it and reads the virtualizable boxes rather than forcing.
+/// The force it drops was also the only writer of the frame's locals region,
+/// which pyre's `FrameLocalsProxy` reads; the fold therefore performs that
+/// write-back itself (`walker_write_back_standard_frame_locals`).
 ///
 /// Emitted shape, following `getframe`'s body line by line:
 /// `guard_value(callable)`; `guard_class` + exact-class + `getfield_gc_i` on
@@ -9276,9 +9352,10 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // admitting an arbitrary positive-depth result would expose it to a
     // generic residual whose single live-coordinate slot cannot describe a
     // nested caller chain.  The completed slice is the outer standard frame
-    // immediately consumed by `f_locals`: that getter is specialized below
-    // and therefore crosses no such residual boundary.  Preflight its whole
-    // static shape before emitting any part of `_getframe`.
+    // immediately consumed by `f_locals`: that getter is specialized below and
+    // its locals write-back names the same frame, so it crosses no such
+    // residual boundary.  Preflight its whole static shape before emitting any
+    // part of `_getframe`.
     if inline_level && depth_value > 0 {
         let standard_frame = final_concrete_frame as usize == standard_vable_ptr
             && unsafe { (*final_concrete_frame).ob_header.ob_type }
