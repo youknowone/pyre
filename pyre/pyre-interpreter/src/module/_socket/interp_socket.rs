@@ -544,6 +544,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
+        use windows_sys::Win32::Devices::Bluetooth as bt;
         // ── Address families ──
         cst!("AF_UNSPEC", ws::AF_UNSPEC);
         cst!("AF_INET", ws::AF_INET);
@@ -556,7 +557,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // 3.14 Windows SDK exposes in addition to PyPy's older MSVC census.
         cst!("AF_SNA", 11);
         cst!("AF_IRDA", 26);
-        cst!("AF_BLUETOOTH", 32);
+        cst!("AF_BLUETOOTH", bt::AF_BTH);
         cst!("AF_HYPERV", ws::AF_HYPERV);
         // ── Socket types ──
         cst!("SOCK_STREAM", ws::SOCK_STREAM);
@@ -641,7 +642,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // Bluetooth/RFCOMM constants.  The option names are unsigned SDK
         // words but `PyModule_AddIntConstant` exposes their signed C-long
         // readings on Windows.
-        cst!("BTPROTO_RFCOMM", 3);
+        cst!("BTPROTO_RFCOMM", bt::BTHPROTO_RFCOMM);
         cst!("SOL_RFCOMM", 3);
         cst!("SO_BTH_ENCRYPT", 2);
         cst!("SO_BTH_MTU", 0x80000007u32 as i32);
@@ -2680,6 +2681,132 @@ fn socket_get_so_protocol(_fd: rffi::Socket) -> Result<libc::c_int, crate::PyErr
 #[cfg(unix)]
 const SUN_PATH_OFFSET: usize = core::mem::offset_of!(libc::sockaddr_un, sun_path);
 
+/// One `%X` conversion of the scan `setbdaddr` runs: blanks, an optional sign,
+/// an optional `0x` prefix, then hex digits accumulated into the `unsigned
+/// int` the C code declares.  Answers the value and what is left to read.
+#[cfg(windows)]
+fn scan_hex_field(text: &str) -> Option<(u32, &str)> {
+    let text = text.trim_start_matches([' ', '\t', '\n', '\r', '\u{b}', '\u{c}']);
+    let (negative, text) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    // A `0x` counts as a prefix only when a hex digit follows: otherwise the
+    // conversion stops after the `0` and leaves the `x` to be read.
+    let digits = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_hexdigit()) => rest,
+        _ => text,
+    };
+    let mut value: u32 = 0;
+    let mut end = 0;
+    for digit in digits.bytes().take_while(u8::is_ascii_hexdigit) {
+        let digit = char::from(digit).to_digit(16).expect("hex digit");
+        value = value.wrapping_mul(16).wrapping_add(digit);
+        end += 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    Some((if negative { value.wrapping_neg() } else { value }, &digits[end..]))
+}
+
+/// `setbdaddr` — six `%X` fields with a colon between each pair, every one of
+/// them below 256, and a trailing `%c` that makes anything after the sixth a
+/// seventh conversion and so a failure.  The leading field is the most
+/// significant octet, and `BTH_ADDR` carries the six as one number.
+#[cfg(windows)]
+fn parse_bdaddr(name: &str) -> Option<u64> {
+    let mut rest = name;
+    let mut octets = [0u32; 6];
+    for (i, octet) in octets.iter_mut().enumerate() {
+        if i > 0 {
+            rest = rest.strip_prefix(':')?;
+        }
+        (*octet, rest) = scan_hex_field(rest)?;
+    }
+    if !rest.is_empty() || octets.iter().fold(0, |acc, octet| acc | octet) >= 256 {
+        return None;
+    }
+    Some(octets.iter().fold(0u64, |acc, &octet| (acc << 8) | u64::from(octet)))
+}
+
+/// `makebdaddr` — `XX:XX:XX:XX:XX:XX`, most significant octet first.
+#[cfg(windows)]
+fn bdaddr_string(bdaddr: u64) -> String {
+    let octet = |i: u32| (bdaddr >> (8 * i)) & 0xFF;
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        octet(5),
+        octet(4),
+        octet(3),
+        octet(2),
+        octet(1),
+        octet(0)
+    )
+}
+
+/// The `AF_BLUETOOTH` case of `getsockaddrarg` (`socketmodule.c:2104-2205`).
+/// Only RFCOMM reaches here: it is the one Bluetooth protocol Windows carries,
+/// and `SOCKADDR_BTH` is the one address form that goes with it.
+#[cfg(windows)]
+fn pack_bluetooth_addr(
+    caller: &str,
+    proto: libc::c_int,
+    addr: pyre_object::PyObjectRef,
+    storage: &mut rffi::sockaddr_storage,
+) -> Result<rffi::SockLen, crate::PyError> {
+    use windows_sys::Win32::Devices::Bluetooth as bt;
+
+    if proto != bt::BTHPROTO_RFCOMM as libc::c_int {
+        return Err(crate::PyError::os_error(format!(
+            "{caller}(): unknown Bluetooth protocol"
+        )));
+    }
+    // `PyArg_ParseTuple(args, "sk")` fails and is answered with this one
+    // message, so every shape that is not a `str` beside an integer channel —
+    // a wrong length, `bytes`, an embedded NUL, a lone surrogate — reads alike.
+    let wrong_format = || crate::PyError::os_error(format!("{caller}(): wrong format"));
+    if !unsafe { pyre_object::is_tuple(addr) } || unsafe { pyre_object::w_tuple_len(addr) } != 2 {
+        return Err(wrong_format());
+    }
+    let w_name = unsafe { pyre_object::w_tuple_getitem(addr, 0) }.expect("length checked above");
+    let w_channel = unsafe { pyre_object::w_tuple_getitem(addr, 1) }.expect("length checked above");
+    if !unsafe { pyre_object::is_str(w_name) } || !unsafe { pyre_object::is_int(w_channel) } {
+        return Err(wrong_format());
+    }
+    let name = crate::baseobjspace::str_utf8_w(w_name).map_err(|_| wrong_format())?;
+    if name.contains('\0') {
+        return Err(wrong_format());
+    }
+    let bd_addr = parse_bdaddr(name).ok_or_else(|| crate::PyError::os_error("bad bluetooth address"))?;
+    let bth = bt::SOCKADDR_BTH {
+        addressFamily: bt::AF_BTH,
+        btAddr: bd_addr,
+        serviceClassId: Default::default(),
+        // `k` keeps the low `ULONG` of whatever it is handed rather than
+        // reporting an overflow.
+        port: (unsafe { pyre_object::w_int_get_value(w_channel) }) as u32,
+    };
+    // `SOCKADDR_BTH` is packed, so its `BTH_ADDR` sits two bytes into the
+    // storage and no aligned write reaches it.
+    unsafe { core::ptr::write_unaligned(storage as *mut _ as *mut bt::SOCKADDR_BTH, bth) };
+    Ok(core::mem::size_of::<bt::SOCKADDR_BTH>() as rffi::SockLen)
+}
+
+/// The RFCOMM case of `makesockaddr` (`socketmodule.c:1546-1560`) — the address
+/// as a string beside the channel, the shape `bind` and `connect` take back.
+#[cfg(windows)]
+fn unpack_bluetooth_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObjectRef {
+    use windows_sys::Win32::Devices::Bluetooth as bt;
+
+    let bth: bt::SOCKADDR_BTH =
+        unsafe { core::ptr::read_unaligned(storage as *const _ as *const bt::SOCKADDR_BTH) };
+    pyre_object::w_tuple_new(vec![
+        pyre_object::w_str_new(&bdaddr_string(bth.btAddr)),
+        pyre_object::w_int_new(i64::from(bth.port)),
+    ])
+}
+
 /// `HV_PROTOCOL_RAW` — the only protocol an `AF_HYPERV` socket is opened with.
 /// `hvsocket.h` defines it; `windows-sys` does not carry that header.
 #[cfg(windows)]
@@ -2868,6 +2995,12 @@ fn pack_inet_addr(
     #[cfg(windows)]
     if family == windows_sys::Win32::Networking::WinSock::AF_HYPERV as libc::c_int {
         let addrlen = pack_hyperv_addr(caller, proto, addr, &mut storage)?;
+        return Ok((storage, addrlen));
+    }
+
+    #[cfg(windows)]
+    if family == windows_sys::Win32::Devices::Bluetooth::AF_BTH as libc::c_int {
+        let addrlen = pack_bluetooth_addr(caller, proto, addr, &mut storage)?;
         return Ok((storage, addrlen));
     }
 
@@ -3072,6 +3205,10 @@ fn unpack_inet_addr(
         #[cfg(windows)]
         if family == windows_sys::Win32::Networking::WinSock::AF_HYPERV as libc::c_int {
             return unpack_hyperv_addr(storage);
+        }
+        #[cfg(windows)]
+        if family == windows_sys::Win32::Devices::Bluetooth::AF_BTH as libc::c_int {
+            return unpack_bluetooth_addr(storage);
         }
         pyre_object::w_tuple_new(vec![])
     }

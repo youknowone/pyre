@@ -104,6 +104,7 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 # Kept on the same 0.61 line rustpython-host_env's nt module resolves to, so
 # HANDLE types match at the boundary.
 windows-sys = { version = "0.61", features = [
+    "Win32_Devices_Bluetooth",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Media_Audio",
