@@ -7,11 +7,21 @@
 # A rolling ordinal checksum makes a wrong offset or width a visibly wrong
 # number rather than a silent pass. Deterministic; output asserted cpython==pypy.
 #
-# `hot_len` also runs over `bytes`, whose `builtin_len` arm reads
+# `hot_len` also runs over `bytes` and `bytearray`. The `bytes` arm reads
 # `W_BytesObject.len` — the precomputed count standing in for the `strlen`
-# `bytesobject.py` takes off `_value`. Without that arm the call stays an
-# opaque forcing residual and the leg measures ~100x the str one, which the
-# ceiling below is set to catch.
+# `bytesobject.py` takes off `_value` — and the `bytearray` arm reads
+# `W_BytearrayObject.length`, which is what `bytearrayobject.py`'s `_len`
+# reaches through `self._data` as `rlist.py`'s `("length", Signed)`. Without
+# those arms the call stays an opaque forcing residual and the leg measures
+# ~100x the str one, which the ceiling below is set to catch.
+#
+# `hot_mutating_len` is a correctness leg, not a speed one. `bytearray`'s
+# length is MUTABLE, so the compiled loop re-reads the field instead of
+# hoisting it, and the field only stays right because every length-changing
+# mutator republishes it through `w_bytearray_sync_alloc`. Appending and
+# deleting a prefix inside the loop walks both the push path and the one that
+# moves `logical_offset`; a length that went stale anywhere shows up as a wrong
+# checksum here rather than as silently wrong compiled code.
 
 
 def hot_checksum(n, s):
@@ -26,6 +36,16 @@ def hot_len(n, s):
     acc = 0
     for i in range(n):
         acc += len(s)
+    return acc
+
+
+def hot_mutating_len(n, ba):
+    acc = 0
+    for i in range(n):
+        ba.append(i & 0xFF)
+        acc = (acc + len(ba)) & 0xFFFFFFFFFFFF
+        if len(ba) > 64:
+            del ba[0:32]
     return acc
 
 
@@ -53,6 +73,9 @@ def main():
     # legs are what set it on the slowest runner.
     bn = 12000000
     print("blen", hot_len(bn, ascii_b), hot_len(bn, short_b))
+    ban = 12000000
+    print("balen", hot_len(ban, bytearray(ascii_b)), hot_len(ban, bytearray(short_b)))
+    print("bamut", hot_mutating_len(400000, bytearray(short_b)))
 
 
 main()

@@ -13,6 +13,19 @@ pub static BYTEARRAY_TYPE: PyType = crate::pyobject::new_pytype("bytearray");
 pub struct W_BytearrayObject {
     pub ob_header: PyObject,
     pub data: *mut Vec<u8>,
+    /// The count `bytearrayobject.py:_len` computes as
+    /// `len(self._data) - self._offset - 1`.  There `self._data` is an RPython
+    /// list, so `len(...)` is a plain read of `rlist.py:116`'s
+    /// `("length", Signed)` field -- the same field `W_ListObject.length`
+    /// mirrors.  pyre keeps the payload at `Vec[0]` with no trailing NUL, so
+    /// the count is `(*data).len()`; it is held here as well because `Vec`'s
+    /// field order is not part of Rust's guaranteed layout, and a length the
+    /// JIT can only reach through `Vec`'s internals is a length it cannot read
+    /// at all.
+    ///
+    /// [`w_bytearray_sync_alloc`] is what keeps this current.  Every mutator
+    /// that changes the buffer's length already has to call it, for `alloc`.
+    pub length: usize,
     /// CPython `PyByteArrayObject.ob_alloc`, including the trailing NUL byte.
     ///
     /// This cannot be derived from `Vec::capacity()`: Rust's allocator uses a
@@ -36,6 +49,23 @@ pub const W_BYTEARRAY_GC_TYPE_ID: u32 = 28;
 /// Fixed payload size (`framework.py:811`).
 pub const W_BYTEARRAY_OBJECT_SIZE: usize = std::mem::size_of::<W_BytearrayObject>();
 
+/// `W_BytearrayObject.data` — the pointer to the heap-allocated byte buffer.
+pub const BYTEARRAY_DATA_OFFSET: usize = std::mem::offset_of!(W_BytearrayObject, data);
+/// `W_BytearrayObject.length` — the byte count `_len` answers with.
+pub const BYTEARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(W_BytearrayObject, length);
+/// `W_BytearrayObject.alloc` — `ob_alloc`.
+pub const BYTEARRAY_ALLOC_OFFSET: usize = std::mem::offset_of!(W_BytearrayObject, alloc);
+/// `W_BytearrayObject.logical_offset` — `ob_start - ob_bytes`.
+pub const BYTEARRAY_LOGICAL_OFFSET_OFFSET: usize =
+    std::mem::offset_of!(W_BytearrayObject, logical_offset);
+/// `W_BytearrayObject.exports` — `_exports`.
+pub const BYTEARRAY_EXPORTS_OFFSET: usize = std::mem::offset_of!(W_BytearrayObject, exports);
+/// `W_BytearrayObject.w_dict` — mapdict's `dict` SPECIAL slot.
+pub const BYTEARRAY_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BytearrayObject, w_dict);
+/// `W_BytearrayObject.w_weakreflifeline` — mapdict's `weakref` SPECIAL slot.
+pub const BYTEARRAY_W_WEAKREFLIFELINE_OFFSET: usize =
+    std::mem::offset_of!(W_BytearrayObject, w_weakreflifeline);
+
 impl crate::lltype::GcType for W_BytearrayObject {
     fn type_id() -> u32 {
         W_BYTEARRAY_GC_TYPE_ID
@@ -56,6 +86,7 @@ impl crate::lltype::GcType for W_BytearrayObject {
 /// `dont_look_inside` public constructors below, so the tracer never reaches it
 /// (the `Vec<u8>`-by-value argument never crosses a residual call ABI).
 fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
+    let length = buf.len();
     let alloc = if buf.is_empty() { 0 } else { buf.len() + 1 };
     let data =
         crate::gc_storage::gc_alloc_storage_box(buf, crate::bytesobject::bytes_data_gc_type_id());
@@ -72,6 +103,7 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
                 W_BytearrayObject {
                     ob_header: header,
                     data,
+                    length,
                     alloc,
                     logical_offset: 0,
                     exports: 0,
@@ -85,6 +117,7 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
         crate::lltype::malloc_typed(W_BytearrayObject {
             ob_header: header,
             data,
+            length,
             alloc,
             logical_offset: 0,
             exports: 0,
@@ -142,6 +175,7 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
             w_class: crate::gc_roots::shadow_stack_get(root_base),
         },
         data: crate::lltype::malloc_raw(bytes.to_vec()),
+        length: bytes.len(),
         alloc: if bytes.is_empty() { 0 } else { bytes.len() + 1 },
         logical_offset: 0,
         exports: 0,
@@ -208,7 +242,16 @@ pub unsafe fn is_bytearray(obj: PyObjectRef) -> bool {
 pub unsafe fn w_bytearray_len(obj: PyObjectRef) -> usize {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
-        (*ba.data).len()
+        // The JIT folds this call to a read of the same field, so a stale
+        // `length` would be a wrong length in compiled code rather than a
+        // wrong answer here.  Debug builds turn that into a test failure.
+        debug_assert_eq!(
+            ba.length,
+            (*ba.data).len(),
+            "bytearray length is stale: a mutator changed the buffer without \
+             calling w_bytearray_sync_alloc"
+        );
+        ba.length
     }
 }
 
@@ -228,6 +271,9 @@ pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
         let size = (*ba.data).len();
+        // Above the early return: `length` tracks every change, while `alloc`
+        // only moves when the resize policy says it should.
+        ba.length = size;
         if size == old_size {
             return;
         }
@@ -332,7 +378,9 @@ pub unsafe fn w_bytearray_data_mut(obj: PyObjectRef) -> &'static mut [u8] {
 /// Get a mutable reference to the backing `Vec`, for length-changing
 /// mutators (append / insert / remove / pop / clear).  Caller must
 /// ensure the bytearray is not aliased while the reference is live and call
-/// [`w_bytearray_sync_alloc`] after every actual length change.
+/// [`w_bytearray_sync_alloc`] after every actual length change -- that call
+/// is what republishes [`W_BytearrayObject::length`], which the JIT reads
+/// directly.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

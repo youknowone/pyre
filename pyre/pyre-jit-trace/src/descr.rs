@@ -1138,6 +1138,89 @@ static W_BYTES_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+/// `W_BytearrayObject`, the mutable sibling of [`W_BYTES_DESCR_GROUP`].
+///
+/// `length` is the field `bytearrayobject.py`'s `_len` reaches through
+/// `self._data`, where the storage is an RPython list and the read is
+/// `rlist.py:116`'s `("length", Signed)`.  Unlike the bytes `len` it is
+/// MUTABLE: append / insert / remove / pop / clear all move it, so a length
+/// read must not hoist out of a loop that can mutate the receiver.  Same
+/// reason `W_ListObject.length` is mutable.
+static W_BYTEARRAY_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_object::bytearrayobject::W_BYTEARRAY_OBJECT_SIZE,
+        W_BYTEARRAY_GC_TYPE_ID,
+        &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const _ as usize,
+        &[
+            (
+                "data",
+                pyre_object::bytearrayobject::BYTEARRAY_DATA_OFFSET,
+                std::mem::size_of::<*mut Vec<u8>>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "length",
+                pyre_object::bytearrayobject::BYTEARRAY_LENGTH_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "alloc",
+                pyre_object::bytearrayobject::BYTEARRAY_ALLOC_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "logical_offset",
+                pyre_object::bytearrayobject::BYTEARRAY_LOGICAL_OFFSET_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "exports",
+                pyre_object::bytearrayobject::BYTEARRAY_EXPORTS_OFFSET,
+                std::mem::size_of::<i64>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "w_dict",
+                pyre_object::bytearrayobject::BYTEARRAY_W_DICT_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_weakreflifeline",
+                pyre_object::bytearrayobject::BYTEARRAY_W_WEAKREFLIFELINE_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_BytearrayObject",
+        "bytearrayobject::W_BytearrayObject",
+    )
+});
+
 static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
@@ -3887,6 +3970,12 @@ pub fn frame_debug_data_w_locals_descr() -> DescrRef {
 /// `W_BytesObject.len`, so the same answer is one immutable field read.
 pub fn bytes_len_descr() -> DescrRef {
     field_descr_from_group(&W_BYTES_DESCR_GROUP, 1)
+}
+
+/// `W_BytearrayObject.length` — the count `bytearrayobject.py:_len` answers
+/// with. Mutable; see [`W_BYTEARRAY_DESCR_GROUP`].
+pub fn bytearray_length_descr() -> DescrRef {
+    field_descr_from_group(&W_BYTEARRAY_DESCR_GROUP, 1)
 }
 
 pub fn str_len_descr() -> DescrRef {
