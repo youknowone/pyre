@@ -72,6 +72,7 @@ extern crate self as pyre_jit_trace;
 
 pub mod assembler;
 pub mod callbacks;
+pub mod ctor_continuation;
 pub mod descr;
 pub mod driver;
 pub mod frame_layout;

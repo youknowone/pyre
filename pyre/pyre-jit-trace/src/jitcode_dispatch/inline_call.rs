@@ -3769,16 +3769,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .unwrap_or(u16::MAX);
     let strict_inlinable =
         callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
-    // `typeobject.py descr_call` discards `__init__`'s result and returns the
-    // instance.  Hold constructors to the strict straight-line path here;
-    // together with the `constructor_result.is_none()` term on `strict_seed`,
-    // this keeps `__init__` out of every resume chain.  No callee frame is
-    // seeded, so a guard in `__init__` resumes at the caller's CALL coordinate
-    // and re-runs the instantiation, making the result discard unnecessary to
-    // represent.
-    if constructor_result.is_some() && !strict_inlinable {
-        return resolved_inline_decline(op.pc, line!());
-    }
     // A zero-param callee has no positional argument to seed, so the register
     // convention above holds vacuously and the strict path serves it like any
     // other straight-line leaf.  The residual it would otherwise fall back to
@@ -3898,14 +3888,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // callee needing fresh cellvar allocation is not seeded — the seed block
     // below breaks out to the ordinary single-frame inline for it — so exclude
     // it here too, or the preflight would decline a CALL that path still
-    // serves.  Constructor inlining also stays out of the seed: `typeobject.py
-    // descr_call` owns the discard of `__init__`'s result, and the flattened
-    // frame shape cannot reconstruct that discard from a two-frame in-callee
-    // guard pause.
+    // serves.  A constructor is seeded like any other callee: the discard of
+    // `__init__`'s result is `descr_call`'s, and pyre records that as its own
+    // resume level (`crate::ctor_continuation`) rather than by refusing to
+    // seed and re-executing the CALL.
     let strict_seed = strict_inlinable
         && inline_depth < fbw_max_multiframe_depth()
-        && callee_code.cellvars.is_empty()
-        && constructor_result.is_none();
+        && callee_code.cellvars.is_empty();
     // Preflight the caller frame BEFORE the seed below records a virtual
     // PyFrame.  A CALL covered by a try/catch marker must remain residual so
     // its post-call catch resume routes an exception; returning after frame
@@ -4721,8 +4710,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             "Collapse::DepthCap"
         } else if !callee_code.cellvars.is_empty() {
             "Collapse::CellVars"
-        } else if constructor_result.is_some() {
-            "Collapse::Constructor"
         } else {
             "Collapse::Other"
         });
@@ -4916,6 +4903,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 inline_caller_py_pc,
                 instance_next_foriter_green_key,
                 instance_next_foriter_census_active: instance_next_seeded_route,
+                // Only a seeded callee reaches
+                // `walker_capture_multi_frame_inline_snapshot`, which is what
+                // records `descr_call`'s tail.  A constructor that collapsed
+                // to the caller boundary resumes by re-executing the CALL and
+                // must not name a level nothing wrote a section for.
+                ctor_continuation_instance: match constructor_result {
+                    Some((instance, _)) if callee_frame_materialized_has_resume => instance,
+                    _ => OpRef::NONE,
+                },
                 ..ctx.fbw_mode
             },
             session: ctx.session,
@@ -7742,6 +7738,13 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
                 // transparent-helper exclusions at the abort-coordinate claim
                 // and the post-step trace-limit check exist to prevent.
                 transparent_helper_subwalk: true,
+                // For the same reason: a helper descent inside an inlined
+                // `__init__` is not itself the `__init__` level, so it must
+                // not inherit the instance that would make its guards record
+                // `descr_call`'s tail.  `walker_capture_multi_frame_inline_
+                // snapshot` routes this mode away before it reads the field,
+                // so this is the statement of intent rather than the fix.
+                ctor_continuation_instance: OpRef::NONE,
                 ..ctx.fbw_mode
             },
             session: ctx.session,

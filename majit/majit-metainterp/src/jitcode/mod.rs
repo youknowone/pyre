@@ -640,7 +640,7 @@ pub type JitcodeReg = u8;
 /// `try_finish` declines any JitCode with `num_regs >= 256`, so every real
 /// register index is `<= 254`. Encode and decode both reference this constant
 /// so the sentinel never drifts.
-pub(crate) const NO_RETURN_REG: JitcodeReg = JitcodeReg::MAX;
+pub const NO_RETURN_REG: JitcodeReg = JitcodeReg::MAX;
 
 pub(crate) fn read_u8(code: &[u8], cursor: &mut usize) -> u8 {
     let value = *code.get(*cursor).expect("truncated jitcode");

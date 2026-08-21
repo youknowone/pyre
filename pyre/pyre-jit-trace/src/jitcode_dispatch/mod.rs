@@ -1478,6 +1478,15 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// specialization census prove that every captured callee guard was
     /// actually stamped.
     pub instance_next_foriter_census_active: bool,
+    /// The instance `__new__` produced, while this sub-walk is an inlined
+    /// `__init__`.  `OpRef::NONE` for every other callee.
+    ///
+    /// A guard in here resumes through one more level than an ordinary inline:
+    /// `descr_call`'s tail (`ctor_continuation`), which owns the discard of
+    /// `__init__`'s result and hands this instance back as the CALL's value.
+    /// The box travels on the walk mode because the CALL site knows it and the
+    /// guard — anywhere in the body — is what needs it.
+    pub ctor_continuation_instance: OpRef,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -1525,6 +1534,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             bridge_entry_merge_pc: None,
             instance_next_foriter_green_key: None,
             instance_next_foriter_census_active: false,
+            ctor_continuation_instance: OpRef::NONE,
         }
     }
 }

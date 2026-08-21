@@ -3044,6 +3044,33 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         let pf_py_pc = forward_snapshot_py_pc(pf.jitcode_index, pf_pc_word)?;
         frames.push((pf.jitcode_index, pf_pc_word, pf_py_pc, pf.boxes.as_slice()));
     }
+    // `descr_call`'s tail, between the caller and `__init__` — the level
+    // upstream gets for free because `descr_call` is an ordinary graph on the
+    // framestack `capture_resumedata` hands over.  It carries one box, the
+    // instance, and on the way out its `ref_return` is what fills the caller's
+    // pending call-result slot; without it the blackhole would deliver
+    // `__init__`'s `None` there instead.  See `crate::ctor_continuation`.
+    let ctor_instance = ctx.fbw_mode.ctor_continuation_instance;
+    let ctor_boxes;
+    if ctor_instance != OpRef::NONE {
+        let (Some(cont_index), Some(cont_pc)) = (
+            crate::ctor_continuation::jitcode_index(),
+            crate::ctor_continuation::resume_pc(),
+        ) else {
+            return Err(DispatchError::callee_inline_unsupported(callee_op_pc));
+        };
+        ctor_boxes = [ctor_instance];
+        // The level has no Python code object, so it has no Python pc
+        // either.  `u32::MAX` is what `forward_snapshot_py_pc` already answers
+        // for a frame with no Python coordinate, so it is the existing
+        // spelling rather than a new sentinel.
+        frames.push((
+            cont_index as u32,
+            cont_pc as u32,
+            u32::MAX,
+            ctor_boxes.as_slice(),
+        ));
+    }
     let callee_py_pc =
         forward_snapshot_py_pc(callee_jitcode_index as u32, callee_jitcode_pc as u32)?;
     frames.push((

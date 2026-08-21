@@ -2451,11 +2451,19 @@ pub(crate) enum CalleeReplaySafety {
 /// exists — the jd1 drain portal, see `state.rs raw_code_for_jitcode_index` —
 /// so a level with no Python code object is already tolerated.
 ///
-/// Landing that section is what retires this field, `CalleeReplaySafety` and
-/// [`fbw_callee_body_replay_safety`], together with the two constructor
-/// exclusions in `inline_call.rs try_walker_inline_resolved_user_call_inner`
-/// (`constructor_result.is_some() && !strict_inlinable`, and the
-/// `constructor_result.is_none()` term on `strict_seed`).
+/// That section is landed — [`crate::ctor_continuation`] builds the tail,
+/// `walker_capture_multi_frame_inline_snapshot` records it, and both
+/// constructor exclusions in `inline_call.rs
+/// try_walker_inline_resolved_user_call_inner` are gone, so a constructor is
+/// now seeded like any other callee.
+///
+/// It does NOT retire this field.  The scan has two callers and only one of
+/// them is about a guard deopt; the other runs under
+/// `fbw_foriter_inflight_active()`, ahead of the point where seeding is
+/// decided, and answers a different question — whether a FOR_ITER-in-flight
+/// ABORT may rewind to the CALL and re-execute it.  A constructor still
+/// reaches that decision, so this field still has to be able to say that the
+/// re-execution rebuilds the instance.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CalleeArgFact {
     pub(crate) numeric: bool,

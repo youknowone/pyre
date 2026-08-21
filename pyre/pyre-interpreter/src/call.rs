@@ -3755,7 +3755,7 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
 /// `?`-propagating call) and forwarding the stashed error themselves;
 /// this function returns `Ok(())` for null purely as a defensive guard so
 /// it never overwrites the original error with a spurious `TypeError`.
-fn check_init_returned_none(result: PyObjectRef) -> Result<(), PyError> {
+pub fn check_init_returned_none(result: PyObjectRef) -> Result<(), PyError> {
     if result.is_null() || unsafe { pyre_object::is_none(result) } {
         return Ok(());
     }
