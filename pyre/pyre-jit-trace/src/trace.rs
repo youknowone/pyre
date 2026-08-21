@@ -350,6 +350,28 @@ pub(crate) fn set_active_sym_exc(sym: *mut PyreSym) -> ActiveSymExcGuard {
     ActiveSymExcGuard { prev }
 }
 
+/// The LIVE interpreter frame of the walk currently recording, or `0` outside
+/// one.
+///
+/// The walk owns this frame's resume coordinate: it steps the frame's opcodes
+/// itself and, when it declines its end state, hands the frame back for the
+/// interpreter to re-enter.  A hook that writes `PyFrame` fields the resume
+/// path reads must leave this one alone.  Every OTHER frame a walk materializes
+/// — the seeded inline-callee levels — takes no per-opcode store and is never
+/// resumed, which is what makes those safe to write.
+///
+/// SAFETY: same contract as [`walk_active_sym_exc_roots`] — the reader runs on
+/// the tracing thread, so the tracer's `&mut PyreSym` up the stack is a
+/// suspended frame and only a shared read of one `usize` field is taken.
+pub fn active_walk_live_frame() -> usize {
+    let sym_ptr = ACTIVE_SYM_EXC.with(|c| c.get());
+    if sym_ptr.is_null() {
+        return 0;
+    }
+    use crate::state::WalkSym as _;
+    unsafe { (*sym_ptr).live_vable_frame_addr() }
+}
+
 /// Root the trace-time exception carriers held in the active `PyreSym`.
 ///
 /// Between construction (`sym.trace_built_exc` insert, `state.rs`) and

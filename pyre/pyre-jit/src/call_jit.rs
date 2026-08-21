@@ -795,21 +795,42 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     // (it is not the virtualizable), so it arrives still holding the `-1` its
     // constructor wrote.  `tb_lasti` was right; `f_lasti` read `-2`.
     //
-    // Only that sentinel is overwritten.  `last_instr` is read back under two
-    // conventions — the executing coordinate this hook resolves, and the `pc -
-    // 1` a walk-end flush leaves for the frame to RESUME from — and they are
-    // not interchangeable: a level the exception merely passes through can
-    // still be resumed, and stamping the executing coordinate over its resume
-    // coordinate restarts it at an instruction its value stack does not match.
-    // Measured on `exception_reused_object_tb_not_doubled`, where the
-    // unconditional store moved one frame from 12 to 31 and the replay died
-    // with `stack underflow during interpreter opcode`.  A frame that never
-    // ran an instruction has no such coordinate to destroy.
+    // `last_instr` is read back under two conventions — the executing
+    // coordinate this hook resolves, and the `pc - 1` a resume path leaves for
+    // the frame to CONTINUE from (`next_instr` = `last_instr + 1`) — and they
+    // are not interchangeable: stamping the executing coordinate over a resume
+    // coordinate restarts the frame at an instruction its value stack does not
+    // match.  Both conditions below exclude one way that happens.
+    //
+    // The sentinel test excludes a frame stopped mid-body: on
+    // `exception_reused_object_tb_not_doubled` the unconditional store moved
+    // one such frame from 12 to 31.
+    //
+    // The recording-walk test excludes the one frame a walk owns the resume
+    // coordinate of.  `-1` is not the absence of a coordinate — it is the
+    // coordinate that resumes at pc 0 — and a walk that declines its end state
+    // hands its own live frame back holding exactly that.  On
+    // `test.test_userstring` the sentinel test alone let the store through onto
+    // that frame, which then re-entered one opcode past its own CALL and popped
+    // an empty operand stack.  The frames this hook exists for are the OTHER
+    // ones a walk materializes — the seeded inline-callee levels, which take no
+    // per-opcode store and are never resumed.  Measured on
+    // `traceback_inlined_callee_lasti_regression`, where the level the
+    // exception passes through reads `active_walk_live_frame() != frame` on
+    // every iteration that fixture asserts.
+    //
+    // Both died with `stack underflow during interpreter opcode`.
+    //
+    // The execution context's top frame does NOT answer this: `topframeref`
+    // holds a vref, and forcing it materializes the inlined callee, so the
+    // already-left level reads as the top one.
     //
     // SAFETY: `frame_ptr` was null-checked above and the callers resolve it from
     // a blackhole level's own `virtualizable_ptr` / portal red.
     unsafe {
-        if (*frame_ptr).last_instr < 0 {
+        let walk_owns_resume =
+            pyre_jit_trace::trace::active_walk_live_frame() == frame_ptr as usize;
+        if (*frame_ptr).last_instr < 0 && !walk_owns_resume {
             (*frame_ptr).last_instr = last_instruction as isize;
         }
     }
