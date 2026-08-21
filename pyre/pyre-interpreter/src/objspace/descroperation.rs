@@ -5214,8 +5214,15 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                         &crate::type_methods::dict_view_snapshot(obj),
                     )
                 };
+                // Building the second set hashes every element it stores,
+                // which runs Python, and a set `as_set` had to mint is not
+                // held by anything else — it is old-gen, so it never moves,
+                // but an unreachable one is still swept.
+                let _roots = pyre_object::gc_roots::push_roots();
                 let a_set = as_set(a)?;
+                pyre_object::gc_roots::pin_root(a_set);
                 let b_set = as_set(b)?;
+                pyre_object::gc_roots::pin_root(b_set);
                 let la = pyre_object::w_set_len(a_set);
                 let lb = pyre_object::w_set_len(b_set);
                 let a_subset_b = || crate::typedef::set_is_subset_of(a_set, b_set);

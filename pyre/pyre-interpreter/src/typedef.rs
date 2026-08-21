@@ -26566,6 +26566,16 @@ pub(crate) fn set_is_subset_of(
     w_set: pyre_object::PyObjectRef,
     w_other: pyre_object::PyObjectRef,
 ) -> Result<bool, crate::PyError> {
+    // The probe compares with the digest each element was stored under, so the
+    // walk hashes nothing — but a bucket match still runs the elements'
+    // `__eq__`, which is a collection point.  Both operands are pinned here
+    // because a caller cannot be relied on to hold them: `COMPARE_OP` pops
+    // them, and `set_operand_as_set` hands over a set it has just minted.  A
+    // set is old-gen and never moves, so this is liveness only and neither
+    // local is reloaded; `key` stays reachable through the pinned `w_set`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_set);
+    pyre_object::gc_roots::pin_root(w_other);
     unsafe {
         let mut i = 0;
         while let Some(key) = pyre_object::w_set_key_at(w_set, i) {
