@@ -15,13 +15,14 @@ obj = b"abcde"
 a = memoryview(obj)
 assert a.obj == obj
 
-# PyPy's W_MemoryView.typedef installs make_weakref_descr(W_MemoryView),
-# backed by the view's own lifeline rather than a side table.
-assert "__weakref__" in memoryview.__dict__
-assert memoryview.__dict__["__weakref__"].__name__ == "__weakref__"
-assert a.__weakref__ is None
+# A view is weak-referenceable without a published `__weakref__` descriptor:
+# `PyMemoryView_Type` sets `tp_weaklistoffset` and leaves the getset table
+# without an entry for it.
+assert "__weakref__" not in memoryview.__dict__
+with assert_raises(AttributeError):
+    a.__weakref__
 a_ref = weakref.ref(a)
-assert a.__weakref__ is a_ref
+assert a_ref() is a
 
 assert a[2:3] == b"c"
 

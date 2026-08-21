@@ -70,11 +70,22 @@ assert type.__module__ == "builtins"
 assert type.__qualname__ == "type"
 assert type.__name__ == "type"
 assert isinstance(type.__doc__, str)
-assert "__weakref__" in type.__dict__
-assert type.__dict__["__weakref__"].__name__ == "__weakref__"
-assert type.__weakref__ is None
-type_ref = weakref.ref(type)
-assert type.__weakref__ is type_ref
+# `type` is weak-referenceable without publishing a `__weakref__` descriptor.
+# Publishing one would put a data descriptor on the metatype, which wins over
+# the class's own entry and would answer every `SomeClass.__weakref__` with the
+# class's weak reference instead of that class's slot descriptor.
+assert "__weakref__" not in type.__dict__
+with assert_raises(AttributeError):
+    type.__weakref__
+assert weakref.ref(type)() is type
+
+
+class WeakrefSlotted:
+    __slots__ = ("__weakref__",)
+
+
+assert WeakrefSlotted.__weakref__.__name__ == "__weakref__"
+assert WeakrefSlotted.__weakref__.__objclass__ is WeakrefSlotted
 assert object.__qualname__ == "object"
 assert int.__qualname__ == "int"
 
