@@ -3637,7 +3637,7 @@ pub fn plain_attribute_ever_mutated_descr() -> DescrRef {
     PLAIN_ATTRIBUTE_EVER_MUTATED_FIELD_DESCR.clone()
 }
 
-/// `nestedscope.py:135 _immutable_fields_ = ['ever_mutated?']` — the field
+/// `nestedscope.py `CellFamily` _immutable_fields_ = ['ever_mutated?']` — the field
 /// `Cell.get`'s fold reads before returning a constant cell's contents.
 static CELL_FAMILY_EVER_MUTATED_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
     Arc::new(

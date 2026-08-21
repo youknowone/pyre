@@ -7020,8 +7020,9 @@ pub extern "C" fn bh_store_deref_value_fn(cell: i64, value: i64) -> i64 {
 /// raw value here), and return the cell the caller stores back into the
 /// slot.  A slot already holding a cell is returned unchanged so a
 /// never-reassigned cellvar does not become a cell wrapping a cell.
-/// `code` + `slot` name the `pycode.py:190` cell family the new cell joins
-/// (`pyframe.py:239-240`).
+/// `code` + `slot` name the cell family (`pycode.py` `PyCode._initialize`)
+/// the new cell joins
+/// (`pyframe.py` `PyFrame.initialize_frame_scopes`).
 /// Allocates (may trigger a minor GC) but runs no user code and never
 /// raises (`CallFlavor::Plain`).
 pub extern "C" fn bh_make_cell_fn(current: i64, code: i64, slot: i64) -> i64 {

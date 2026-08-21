@@ -16323,7 +16323,7 @@ fn cell_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             )));
         }
     };
-    // `nestedscope.py:131 return Cell(w_obj, DUMMY_FAMILY)` — no code object
+    // `nestedscope.py return Cell(w_obj, DUMMY_FAMILY)` — no code object
     // owns this binding, so the cell can never fold.
     Ok(pyre_object::w_cell_new(
         contents,
@@ -31888,7 +31888,7 @@ mod tests {
 
     fn check_cell_comparison_repr_and_hash() {
         crate::typedef::init_typeobjects();
-        // Hand-built like `descr_new_cell`, so `nestedscope.py:141 DUMMY_FAMILY`.
+        // Hand-built like `descr_new_cell`, so `nestedscope.py DUMMY_FAMILY`.
         let family = pyre_object::nestedscope::dummy_family();
         let empty = pyre_object::w_cell_new(pyre_object::PY_NULL, family);
         let one = pyre_object::w_cell_new(pyre_object::w_int_new(1), family);

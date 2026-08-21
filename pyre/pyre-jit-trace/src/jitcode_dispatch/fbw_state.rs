@@ -1966,7 +1966,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
 /// the next attempt rebuilds identically: without it the abort recurs
 /// byte-for-byte until the enclosing location is retired, so the loop never
 /// compiles at all.  Upstream answers the same situation by denying the callee
-/// and letting the enclosing loop retrace (`pyjitpl.py:2818-2828`).
+/// and letting the enclosing loop retrace (`pyjitpl.py` `MetaInterp.blackhole_if_trace_too_long`).
 ///
 /// `callee_code_key` is `None` when no callee could be named, in which case the
 /// decline still unwinds but nothing is remembered.
@@ -1988,8 +1988,8 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
         // state: `dont_trace_here` counted zero on every fixture that
         // reaches here.  The upstream answer cited above is
         // `disable_noninlinable_function(greenkey_of_huge_function)`
-        // (`pyjitpl.py:2821`), which sets `JC_DONT_TRACE_HERE` on the
-        // callee's cell (`warmstate.py:331-337`).  The recursion-bound deny
+        // (`pyjitpl.py` `MetaInterp.blackhole_if_trace_too_long`), which sets `JC_DONT_TRACE_HERE` on the
+        // callee's cell (`warmstate.py` `WarmEnterState.disable_noninlinable_function`).  The recursion-bound deny
         // in `inline_call.rs` already calls it for the callee it names;
         // this one names a callee the same way and had no reason not to.
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
@@ -2048,7 +2048,8 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
         // frame itself has state to preserve; effects in paused ancestors
         // are already represented by their own frame images.  This is the
         // per-frame boundary `convert_and_run_from_pyjitpl` preserves when
-        // it copies every `MIFrame` independently (`blackhole.py:1799-1821`).
+        // it copies every `MIFrame` independently (`blackhole.py`
+        // `convert_and_run_from_pyjitpl`).
         // An in-flight FOR_ITER item is in no frame image, so the per-frame
         // test above cannot see it: a body effect committed in an enclosing
         // frame leaves the innermost frame's delta at zero while
@@ -2590,7 +2591,7 @@ pub(crate) enum CalleeReplaySafety {
 /// Upstream has no whole-body scan to lose this on.  `pyjitpl.py` traces the
 /// path the interpreter actually takes and meta-interprets each op as it
 /// arrives, so an arm that never executes is never seen; `look_inside_graph`
-/// (`codewriter/policy.py:48`) and `can_inline_callable` (`warmstate.py:669`)
+/// (`codewriter/policy.py` `JitPolicy.look_inside_graph`) and `can_inline_callable` (`warmstate.py`)
 /// decide per CALLABLE, not per body op.  Reporting pcs restores that: the
 /// callee is admitted, and [`crate::jitcode_dispatch::walk`] refuses only if
 /// the walk actually reaches one of them.

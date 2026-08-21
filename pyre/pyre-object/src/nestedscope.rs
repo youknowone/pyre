@@ -9,18 +9,18 @@ use crate::quasiimmut::QuasiImmutField;
 use pyre_macros::pyre_class;
 use std::sync::Arc;
 
-/// nestedscope.py:134-139 `class CellFamily` — one per cellvar name of a code
-/// object (`pycode.py:190`).
+/// nestedscope.py `class CellFamily` — one per cellvar name of a code
+/// object (`pycode.py` `PyCode._initialize`).
 ///
 /// Every cell a frame creates for that cellvar shares this object, so
 /// `ever_mutated` accumulates across frame instantiations: a binding that is
 /// only ever filled once leaves it false, and that is what lets a cell the
 /// trace has as a constant fold its contents.
 pub struct CellFamily {
-    /// nestedscope.py:138 `name` — the cellvar this family belongs to.
+    /// nestedscope.py `CellFamily.__init__` `name` — the cellvar this family belongs to.
     pub name: String,
-    /// nestedscope.py:139 `ever_mutated`, declared quasi-immutable by
-    /// nestedscope.py:135 `_immutable_fields_ = ['ever_mutated?']`.  Recorded
+    /// nestedscope.py `CellFamily.__init__` `ever_mutated`, declared quasi-immutable by
+    /// nestedscope.py `_immutable_fields_ = ['ever_mutated?']`.  Recorded
     /// on a bound-to-bound transition ([`w_cell_set`]) and by
     /// [`w_cell_delete`]; [`Self::set_ever_mutated`] invalidates watchers
     /// before changing it.
@@ -35,7 +35,7 @@ pub struct CellFamily {
 }
 
 impl CellFamily {
-    /// nestedscope.py:137-139 `CellFamily.__init__`.
+    /// nestedscope.py `CellFamily.__init__`.
     pub fn new(name: String) -> Self {
         Self {
             name,
@@ -44,8 +44,9 @@ impl CellFamily {
         }
     }
 
-    /// Change nestedscope.py:139 `ever_mutated` using the ordering, fast path,
-    /// and repeated-value guard `PlainAttribute::set_ever_mutated` documents.
+    /// Change `CellFamily.__init__`'s `ever_mutated` (`nestedscope.py`) using
+    /// the ordering, fast path, and repeated-value guard
+    /// `PlainAttribute::set_ever_mutated` documents.
     pub fn set_ever_mutated(&self, v: bool) {
         if self.ever_mutated.get() == v {
             return;
@@ -69,7 +70,7 @@ impl CellFamily {
     }
 }
 
-/// nestedscope.py:141-142 `DUMMY_FAMILY` — the family a cell built by hand
+/// nestedscope.py `DUMMY_FAMILY` — the family a cell built by hand
 /// carries (`descr_new_cell`, and any cell whose code object has no family
 /// table).  Its `ever_mutated` starts true, so such a cell never folds.
 ///
@@ -92,7 +93,7 @@ pub fn dummy_family() -> *const CellFamily {
 #[pyre_class("cell", type_id = 15, static_name = "CELL")]
 pub struct Cell {
     pub contents: PyObjectRef,
-    /// nestedscope.py:25/29 `_immutable_fields_ = ['family']` — the
+    /// nestedscope.py `Cell` `_immutable_fields_ = ['family']` — the
     /// [`CellFamily`] shared with every other cell of the same cellvar.  Never
     /// null.  The families are leaked, not managed, so this word is absent
     /// from the traced pointer offsets and outlives the code object that
@@ -176,13 +177,13 @@ pub unsafe fn w_cell_family(obj: PyObjectRef) -> *const CellFamily {
     unsafe { (*(obj as *const Cell)).family }
 }
 
-/// Set the value stored in a cell (nestedscope.py:53-56 `Cell.set`).
+/// Set the value stored in a cell (nestedscope.py `Cell.set`).
 ///
 /// # Safety
 /// `obj` must point to a valid `Cell`.
 #[inline]
 pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
-    // nestedscope.py:54-55: only a bound-to-bound transition counts as a
+    // nestedscope.py `Cell.set`: only a bound-to-bound transition counts as a
     // mutation.  The first binding of a cellvar does not, which is what keeps
     // the ordinary write-once closure variable foldable.
     let cell = obj as *mut Cell;
@@ -200,7 +201,7 @@ pub unsafe fn w_cell_set(obj: PyObjectRef, value: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// Clear a cell (nestedscope.py:58-63 `Cell.delete`).  Records the mutation
+/// Clear a cell (nestedscope.py `Cell.delete`).  Records the mutation
 /// whatever the cell held, then clears it; returns false instead of raising
 /// upstream's `ValueError` when the cell was already empty.
 ///
@@ -260,7 +261,7 @@ mod tests {
         }
     }
 
-    /// nestedscope.py:54-55 — the first binding of an empty cell is not a
+    /// nestedscope.py — the first binding of an empty cell is not a
     /// mutation; a second write to a bound cell is.
     #[test]
     fn first_binding_is_not_a_mutation() {
@@ -276,7 +277,7 @@ mod tests {
 
     /// The family is shared, so one cell's rebinding closes folding for every
     /// other cell of the same cellvar — the accumulation across frame
-    /// instantiations `pycode.py:190` exists for.
+    /// instantiations `pycode.py` `PyCode._initialize` exists for.
     #[test]
     fn mutation_is_recorded_on_the_shared_family() {
         let family = leak_family();
@@ -289,7 +290,7 @@ mod tests {
         }
     }
 
-    /// nestedscope.py:58-60 — `delete` records the mutation whatever the cell
+    /// nestedscope.py — `delete` records the mutation whatever the cell
     /// held, unlike `set`, and reports the already-empty case instead of
     /// raising.
     #[test]
@@ -308,7 +309,7 @@ mod tests {
         }
     }
 
-    /// nestedscope.py:141-142 — a hand-built cell can never fold.
+    /// nestedscope.py `DUMMY_FAMILY` — a hand-built cell can never fold.
     #[test]
     fn dummy_family_starts_mutated() {
         unsafe {

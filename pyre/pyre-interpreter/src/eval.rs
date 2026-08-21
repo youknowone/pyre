@@ -3912,7 +3912,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn make_cell(&mut self, idx: usize) -> Result<(), PyError> {
         let current = locals_w!(self)[idx];
         if current.is_null() || !unsafe { pyre_object::is_cell(current) } {
-            // pyframe.py:239-240 `Cell(..., self.pycode.cell_families[i])` —
+            // pyframe.py `PyFrame.initialize_frame_scopes` `Cell(..., self.pycode.cell_families[i])` —
             // the cellvar this parameter slot was promoted for.
             let family = unsafe {
                 crate::pycode::w_code_cell_family(self.pycode as pyre_object::PyObjectRef, idx)

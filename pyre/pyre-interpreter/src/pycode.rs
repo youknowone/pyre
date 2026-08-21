@@ -413,7 +413,7 @@ pub struct PyCode {
     /// `PyFrame::ncells()` / stack-base query (a per-`pop_value` hot path).
     /// `u32::MAX` sentinel when `code_ptr` is null/unaligned (test stubs).
     pub npure_cellvars: u32,
-    /// `pycode.py self.cell_families = [CellFamily(name) for name in
+    /// `pycode.py` `PyCode._initialize`, `self.cell_families = [CellFamily(name) for name in
     /// cellvars]` — one [`CellFamily`] per cellvar, shared by every cell any
     /// frame of this code creates for that cellvar.
     ///
@@ -423,8 +423,7 @@ pub struct PyCode {
     /// pure-cellvar band, so both creation sites
     /// ([`crate::pyframe::PyFrame::initialize_frame_scopes`] and `MAKE_CELL`)
     /// index in O(1).  Slots naming no cellvar hold null; `null` table when
-    /// `code_ptr` is invalid or the code has no cellvars
-    /// (pycode.py `PyCode._initialize`).
+    /// `code_ptr` is invalid or the code has no cellvars (pycode.py `PyCode._initialize`).
     ///
     /// The `Vec` is owned via `Box::into_raw` and dropped with the wrapper, but
     /// the families it points at are leaked: a cell outlives the code object
@@ -906,9 +905,9 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
         crate::pyframe::npure_cellvars(code_ref) as u32
     };
-    // `pycode.py:190 self.cell_families = [CellFamily(name) for name in
+    // `pycode.py` `PyCode._initialize`, `self.cell_families = [CellFamily(name) for name in
     // cellvars]`, laid out by localsplus slot — see the field's doc.
-    // pycode.py:191-193 leaves the list empty when the code has no cellvars.
+    // pycode.py `PyCode._initialize` leaves the list empty when the code has no cellvars.
     let cell_families = if !code_ptr_aligned {
         std::ptr::null_mut()
     } else {
@@ -3278,10 +3277,11 @@ pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
     code.exceptiontable.to_vec()
 }
 
-/// `pycode.py:190 cell_families[...]` for the cellvar occupying localsplus
-/// slot `slot` (`pyframe.py:239-240`).
+/// The `cell_families[...]` entry (`pycode.py` `PyCode._initialize`) for the
+/// cellvar occupying localsplus
+/// slot `slot` (`pyframe.py` `PyFrame.initialize_frame_scopes`).
 ///
-/// Falls back to `nestedscope.py:141 DUMMY_FAMILY` — never null — when the
+/// Falls back to `nestedscope.py DUMMY_FAMILY` — never null — when the
 /// slot names no cellvar or the code carries no family table, so a cell is
 /// always constructible and one built without a family simply never folds.
 ///

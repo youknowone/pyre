@@ -248,6 +248,7 @@ macro_rules! latchdbg {
 ///   immediately after `MIFrame.run_one_step()` and
 ///   `convert_and_run_from_pyjitpl` copies every live MIFrame at its
 ///   already-advanced `pc` (`pyjitpl.py:2863-2866`, `blackhole.py:1799-1821`).
+///   `convert_and_run_from_pyjitpl`).
 ///   `resume_pc` is `walk()`'s post-step `next_pc`.
 /// - A bridge carrier sub-walk that stopped on a walker capability gap.  That
 ///   sub-walk IS the reconstructed callee's one real execution (see
@@ -5053,7 +5054,7 @@ fn mapdict_qmut_force_enabled() -> bool {
     std::env::var_os("PYRE_QMUT_MAPDICT_FORCE").is_some()
 }
 
-/// `nestedscope.py:31-44 Cell.get` for the LOAD_DEREF residual.
+/// `nestedscope.py Cell.get` for the LOAD_DEREF residual.
 ///
 /// ```python
 /// def get(self):
@@ -5082,7 +5083,7 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     op_pc: usize,
     r_args: &[OpRef],
 ) -> Result<Option<OpRef>, DispatchError> {
-    // nestedscope.py:32 `if jit.isconstant(self)`.
+    // nestedscope.py `if jit.isconstant(self)`.
     let Some(&cell_op) = r_args.first() else {
         return Ok(None);
     };
@@ -5100,11 +5101,11 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     if family.is_null() {
         return Ok(None);
     }
-    // nestedscope.py:38 `if not self.family.ever_mutated`.
+    // nestedscope.py `if not self.family.ever_mutated`.
     if unsafe { (*family).ever_mutated.get() } {
         return Ok(None);
     }
-    // nestedscope.py:39-41 `w_res = self._elidable_get(); if w_res is not None`.
+    // nestedscope.py `w_res = self._elidable_get(); if w_res is not None`.
     let contents = unsafe { pyre_object::w_cell_get(cell) };
     if contents.is_null() {
         return Ok(None);
@@ -6883,7 +6884,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // LOAD_DEREF on a constant cell whose binding was only ever filled once:
     // fold to the contents under a `QUASIIMMUT_FIELD(family, ever_mutated)`
     // instead of the opaque read residual, the shape upstream gets for free
-    // from `nestedscope.py:31-44 Cell.get`.  Read-only, and every unrecognised
+    // from `nestedscope.py Cell.get`.  Read-only, and every unrecognised
     // shape falls through to the residual (SAFE).
     //
     // This is the shape that decides whether a closure callee inlines at all:

@@ -4722,7 +4722,7 @@ unsafe fn w_dict_index_of_unicode_locked(obj: PyObjectRef, key: PyObjectRef) -> 
     dict_entries_index_of_str_hashed(entries, hash, key_str)
 }
 
-/// `rstr.py:395-412 ll_strhash` — answer from the digest memoized on the string
+/// `rstr.py ll_strhash` — answer from the digest memoized on the string
 /// and compute it only while the slot still reads zero, which upstream spells
 /// as `jit.conditional_call_elidable(s.hash, ...)`.
 ///

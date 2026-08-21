@@ -6182,7 +6182,8 @@ where
 /// Int [`lower_load_deref_value_hlop_to_insn`] shape.  `current` is the slot
 /// read from `locals_cells_stack_w`; the result is the cell the codewriter
 /// stores via `setarrayitem_vable_r`, and `code` + `slot` name the
-/// `pycode.py:190` cell family it joins.  Allocates a fresh cell but runs no
+/// cell family (`pycode.py` `PyCode._initialize`) it joins.  Allocates a
+/// fresh cell but runs no
 /// user code and never raises → `Plain`.
 ///
 /// Returns `None` for a non-`make_cell_value` opname or unexpected arity so

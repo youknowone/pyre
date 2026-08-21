@@ -13353,7 +13353,8 @@ impl CodeWriter {
                         // LOAD_FAST. The `make_cell_value(current, code, slot)`
                         // HLOp → `residual_call_ir_r(make_cell_fn,
                         // ListR[current, code], ListI[slot])` returns the cell
-                        // to install: a fresh cell of the `pycode.py:190` cell
+                        // to install: a fresh cell of the family
+                        // (`pycode.py` `PyCode._initialize`) cell
                         // family `code` + `slot` names, wrapping the raw
                         // argument value, or the existing cell unchanged
                         // (`bh_make_cell_fn`, Plain — allocates, runs no user

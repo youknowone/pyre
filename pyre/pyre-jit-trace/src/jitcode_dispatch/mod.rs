@@ -7732,7 +7732,7 @@ pub(crate) unsafe fn resolve_inlinable_callee(
 }
 
 /// `space.lookup(w_obj, '__call__')` for a callable that is neither a
-/// `Function` nor a `Method` — `descroperation.py:194-199
+/// `Function` nor a `Method` — `descroperation.py
 /// DescrOperation.call_args`'s third arm.
 ///
 /// Returns the resolved `__call__` alongside the class it was found through and

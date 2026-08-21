@@ -2163,7 +2163,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         None
     };
     let resolved_callable = bound_method.map_or(callable, |bound| bound.function);
-    // `descroperation.py:189-199 DescrOperation.call_args` has three arms, and
+    // `descroperation.py DescrOperation.call_args` has three arms, and
     // the two above are its `Function` and `Method` fast paths.  Anything else
     // resolves `space.lookup(w_obj, '__call__')` and calls that with the object
     // as the receiver.  `__call__` is an ordinary function in the class dict, so
