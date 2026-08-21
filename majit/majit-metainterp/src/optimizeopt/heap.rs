@@ -3061,6 +3061,61 @@ impl OptHeap {
     }
 
     /// heap.py:436-452: operations with no effect on the GC heap caches.
+    ///
+    /// Consulted at TWO sites here against upstream's one.  Upstream reaches the
+    /// list only from `emitting_operation` (heap.py:442, via `emit` at
+    /// heap.py:432 and `dispatch_opt`'s default at heap.py:898).  Here
+    /// `emitting_operation` is a whole-optimizer callback that fires at final
+    /// emission, after this pass has already dispatched — `propagate_forward`
+    /// dispatches on its first line — so without the `handle_side_effects`
+    /// consultation an exempt opcode would clean the caches on the way in and
+    /// the later callback would then spare caches that were already gone.  The
+    /// cost of missing it is pessimisation, not wrong code, which is why
+    /// measurement moved nothing.
+    ///
+    /// Four entries — `SetfieldGc`, `SetfieldRaw`, `SetarrayitemGc`,
+    /// `SetarrayitemRaw` — have their own dispatch arm and so never reach the
+    /// `handle_side_effects` test; they still reach the `emitting_operation`
+    /// one, which is why they stay listed.  Upstream lists its two for the same
+    /// reason and marks them `# handled specially` (heap.py:452, :454).
+    ///
+    /// None of the other eleven can arrive on this tree today, and the reasons
+    /// differ enough to be worth recording:
+    ///   - `DebugMergePoint` has no producer at all; every occurrence is a
+    ///     declaration or a consumer.
+    ///   - `EnterPortalFrame` needs either a `newframe` carrying a greenkey —
+    ///     both non-test callers pass `None` — or a runtime answering
+    ///     `portal_jitcode`, which the production runtime leaves `None`.
+    ///     `LeavePortalFrame` is NOT symmetric: it also rides `popframe`'s
+    ///     `jitdriver_sd` gate, and `call.py:148` does stamp one, so that arm is
+    ///     not known to be dead.  Do not read it as unreachable without
+    ///     measuring.
+    ///   - `setinteriorfield_raw` has no producer and no codewriter `OpKind`.
+    ///   - `jit_debug` IS in the assembled jitcode alphabet, minted from the
+    ///     `jit.debug` oopspec and wired in the blackhole.  It is absent only
+    ///     because nothing calls it.
+    ///   - `RawStore`, `CheckMemoryError`, `Strsetitem`, `Unicodesetitem`,
+    ///     `Copystrcontent` and `Copyunicodecontent` are minted INSIDE the
+    ///     optimizer — the first two by the virtual-raw-buffer force arm in
+    ///     `optimizeopt/info.rs`, the rest by the force and copy paths in
+    ///     `optimizeopt/vstring.rs` — and `emit_for_force` (or the equivalent
+    ///     local closure in `info.rs`) routes them downstream into this pass,
+    ///     which sits after `string` and `earlyforce` in `ENABLE_ALL_OPTS`.  So
+    ///     the jitcode alphabet does not bound these six.
+    ///
+    /// Those six stay absent because the virtuals that would force them never
+    /// exist.  Nothing carries a `stroruni.*` oopspec — the attribute census is
+    /// thirteen `list.*` entries in `pyre-object/src/listobject.rs`, and the
+    /// programmatic `mark_oopspec` table registers only the `jit.*` builtins and
+    /// `newlist_clear` — so `_handle_stroruni_call` never fires and the
+    /// `opt_call_stroruni_*` handlers are unreachable.  And nothing ever assigns
+    /// `RawMallocVarsizeChar` to a call, so no virtual raw buffer is built.
+    ///
+    /// Annotating a string helper with
+    /// `#[majit_macros::oopspec("stroruni.concat")]` is what would make this
+    /// list start paying.  Until then, do not attribute a benchmark move to it:
+    /// a string concat+slice probe over 4000 iterations saw zero of the eleven
+    /// against a working positive control.
     fn has_no_heap_cache_effect(opcode: OpCode) -> bool {
         matches!(
             opcode,
