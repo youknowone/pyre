@@ -26418,10 +26418,19 @@ pub(crate) fn set_method_symmetric_difference(
     // in a set of self's class.  Each set below is freshly minted with no
     // referrer and outlives a further allocation, so each takes the
     // lifetime pin the intersection path takes; sets never move.
+    // The receiver needs the pin too, not just the minted sets: unlike
+    // `set_method_union` and `set_method_difference`, which copy it before any
+    // Python runs, this one drains the operand first and only then walks the
+    // receiver — and `COMPARE_OP` popped it off the value stack.
     let _roots = pyre_object::gc_roots::push_roots();
+    let receiver_slot = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(args[0]);
     let w_other_as_set = set_operand_as_set(args[1])?;
     pyre_object::gc_roots::pin_root(w_other_as_set);
-    let w_new = set_symmetric_difference_storage(args[0], w_other_as_set)?;
+    let w_new = set_symmetric_difference_storage(
+        pyre_object::gc_roots::shadow_stack_get(receiver_slot),
+        w_other_as_set,
+    )?;
     pyre_object::gc_roots::pin_root(w_new);
     unsafe {
         if pyre_object::is_frozenset(args[0]) {
