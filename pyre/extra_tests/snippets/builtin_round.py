@@ -93,3 +93,22 @@ assert math.copysign(1.0, round(0.0, 2)) == 1.0
 assert round(1.0, 1000) == 1.0
 assert round(1.0, -1000) == 0.0
 assert round(1.7976931348623157e308, 0) == 1.7976931348623157e308
+
+
+# `int.__round__` and `float.__round__` are structural, so an override that
+# delegates back to the slot does not re-enter the lookup that reached it.
+class DelegatesToInt(int):
+    def __round__(self, *ndigits):
+        return int.__round__(self, *ndigits)
+
+
+class DelegatesToFloat(float):
+    def __round__(self, *ndigits):
+        return float.__round__(self, *ndigits)
+
+
+assert round(DelegatesToInt(-5)) == -5
+assert round(DelegatesToInt(-5), 1) == -5
+assert round(DelegatesToFloat(-1.5)) == -2
+assert round(DelegatesToFloat(-1.25), 1) == -1.2
+assert int.__round__(DelegatesToInt(-5)) == -5

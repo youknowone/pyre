@@ -10428,6 +10428,41 @@ pub(crate) fn builtin_float_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, 
     )))
 }
 
+/// `int.__float__(self)`, which `bool` inherits — intobject.py `descr_float`.
+/// Structural only, for the reason `builtin_float_dunder` gives: `float()`
+/// looks `__float__` up on a subtype, and this is what that lookup resolves to
+/// when the subtype does not override it.
+pub(crate) fn builtin_int_float_dunder(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args[0];
+    unsafe {
+        if is_bool(obj) {
+            return Ok(floatobject::w_float_new(if w_bool_get_value(obj) {
+                1.0
+            } else {
+                0.0
+            }));
+        }
+        if is_int(obj) {
+            return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
+        }
+        if pyre_object::is_long(obj) {
+            let v = pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj));
+            if !v.is_finite() {
+                return Err(crate::PyError::overflow_error(
+                    "int too large to convert to float",
+                ));
+            }
+            return Ok(floatobject::w_float_new(v));
+        }
+    }
+    Err(crate::PyError::type_error(format!(
+        "descriptor '__float__' requires an 'int' object but received a '{}'",
+        crate::type_methods::arg_type_name(obj)
+    )))
+}
+
 /// `float(obj)` → convert to float
 pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
@@ -10452,7 +10487,13 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             if is_exact_type(obj, &FLOAT_TYPE) {
                 return Ok(obj);
             }
-        } else if is_int(obj) {
+        } else if is_int(obj) && is_exact_type(obj, &INT_TYPE) {
+            // Exact only, for the reason the `float` arm above gives: an `int`
+            // subtype falls through to the `__float__` lookup so an override
+            // is honored, and resolves to `int.__float__` when there is none.
+            // `is_exact_type` answers on `w_class`, which a bigint shares with
+            // `int`, so `is_int` (which reads `ob_type`) is what separates the
+            // two layouts here.
             return Ok(floatobject::w_float_new(w_int_get_value(obj) as f64));
         }
         if is_bool(obj) {
@@ -10462,7 +10503,7 @@ pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 0.0
             }));
         }
-        if pyre_object::is_long(obj) {
+        if pyre_object::is_long(obj) && is_exact_type(obj, &INT_TYPE) {
             // A Python int is finite, so a non-finite conversion means the
             // magnitude exceeds f64 range.
             let v = pyre_object::jit_bigint_to_f64_or_nan(pyre_object::w_long_get_value(obj));
@@ -18461,6 +18502,18 @@ unsafe fn round_uses_builtin(obj: PyObjectRef) -> bool {
 }
 
 pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    round_receiver(args, false)
+}
+
+/// `int.__round__` / `float.__round__`.  These are what the lookup at the end
+/// of `round_receiver` dispatches to, so they must not repeat it: a subtype
+/// whose `__round__` delegates back to the slot would re-enter the lookup that
+/// reached it and never terminate.
+pub(crate) fn builtin_round_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    round_receiver(args, true)
+}
+
+fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate::PyError> {
     // `round(number, ndigits=None)`: both positional-or-keyword; at most two.
     let (pos, kwargs) = split_builtin_kwargs(args);
     let total = pos.len() + real_kwarg_count(kwargs);
@@ -18476,11 +18529,12 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let ndigits_arg = bind_pos_or_kw(pos, kwargs, 1, "ndigits", "round", 2)?;
     let ndigits = ndigits_arg.as_ref();
     unsafe {
-        // `operation.py:97` reaches `__round__` through the type, so a subtype
-        // that replaced the builtin one — `__round__ = None` included — is
-        // dispatched by the lookup at the end of this function rather than
-        // rounded structurally here.
-        let structural = round_uses_builtin(obj);
+        // `operation.py`'s `round` reaches `__round__` through the type, so a
+        // subtype that replaced the builtin one — `__round__ = None` included
+        // — is dispatched by the lookup at the end of this function rather
+        // than rounded structurally here.  Arriving through the slot has
+        // already answered that question the other way.
+        let structural = slot || round_uses_builtin(obj);
         if structural && is_float(obj) {
             let v = floatobject::w_float_get_value(obj);
             return match ndigits {
@@ -18567,9 +18621,11 @@ pub(crate) fn builtin_round(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             };
         }
     }
-    // operation.py:97 — lookup __round__ on user objects.  An omitted or
-    // explicit-None `ndigits` calls `__round__()` with no second argument.
+    // `operation.py`'s `round` looks `__round__` up on user objects.  An
+    // omitted or explicit-None `ndigits` calls `__round__()` with no second
+    // argument.  The slot skips this: it is the lookup's own target.
     if let Some(tp) = crate::typedef::r#type(obj)
+        && !slot
         && let Some(method) =
             unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__round__") }
     {

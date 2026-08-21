@@ -18614,7 +18614,11 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__float__",
-            make_builtin_function_with_arity("__float__", crate::builtins::builtin_float, 1),
+            make_builtin_function_with_arity(
+                "__float__",
+                crate::builtins::builtin_int_float_dunder,
+                1,
+            ),
         )
     };
     unsafe {
