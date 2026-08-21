@@ -6381,10 +6381,14 @@ mod tests {
     fn a_latched_cell_whose_token_died_is_still_removed_from_the_chain() {
         let mut ws = WarmEnterState::new(2);
         let token_num = ws.alloc_token_number();
+        // Seen once, held no longer. `set_procedure_token` stores only a
+        // weak handle (`_makeref`) and takes no ownership, and this fixture
+        // registers the token with no owner, so the weakref is already dead
+        // when `attach_procedure_to_interp` returns while the SLOT stays
+        // `Some` — which is the state `has_seen_a_procedure_token` reads.
+        // Nulling the slot with `clear_loop_token` would instead erase the
+        // record and make the cell read as "never had a token".
         ws.attach_procedure_to_interp(42, JitCellToken::new(token_num));
-        // Seen once, held no longer: `token` is a historical record and is
-        // never cleared, so `has_seen_a_procedure_token` stays true.
-        ws.clear_loop_token(42);
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             ws.abort_tracing(42, false);
         }
@@ -6416,7 +6420,6 @@ mod tests {
         let key = GreenKey::new(vec![7, 11]);
         let token_num = ws.alloc_token_number();
         ws.attach_procedure_to_interp_for_key(&key, JitCellToken::new(token_num));
-        ws.clear_loop_token_for_key(&key);
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             ws.abort_tracing_for_key(&key, false);
         }
