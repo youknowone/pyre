@@ -222,6 +222,9 @@ impl W_WindowsConsoleIO {
             if fd < 0 {
                 return Err(crate::PyError::value_error("negative file descriptor"));
             }
+            // `winconsoleio.c:417-419` sets `self->closefd = 0` for every
+            // `fd >= 0` whatever the argument said, so a descriptor is never
+            // owned here and `close()` leaves it open.
             (fd, false, host_nt::console_type_from_fd(fd))
         } else {
             let closefd = crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(
