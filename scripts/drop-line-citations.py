@@ -52,6 +52,26 @@ IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # `n` occurs everywhere and would pin nothing.
 QUOTE = re.compile(r"`([^`]{6,120})`")
 
+
+def quote_candidates(text):
+    """Backticked spans that can pin a citation on their own.
+
+    A comment often puts the number and the statement it points at inside one
+    span -- ``error.py:548 assert len(strings) == len(formats) + 1`` -- and it
+    is the statement alone that occurs in the upstream file. Yield the
+    remainder after a leading citation as well as the span itself, so that
+    shape pins like any other quote.
+    """
+    for q in QUOTE.findall(text):
+        q = q.strip()
+        if q:
+            yield q
+        m = CITE.match(q)
+        if m:
+            rest = q[m.end():].strip()
+            if len(rest) >= 6:
+                yield rest
+
 # How much of the line around the citation may supply the symbol. Bounded so a
 # long line cannot donate an unrelated identifier from its far end.
 CONTEXT = 90
@@ -138,7 +158,7 @@ def rewrite_line(line, index, by_path, stats, refused):
         if not matched:
             # No symbol -- but a quote occurring exactly once in the file
             # locates the citation on its own, so the number adds nothing.
-            quotes = [q.strip() for q in QUOTE.findall(line[comment:])]
+            quotes = list(quote_candidates(line[comment:]))
             pinned = [rel for rel, _names, body in cands
                       if any(body.count(q) == 1 for q in quotes)]
             if len(pinned) != 1:
