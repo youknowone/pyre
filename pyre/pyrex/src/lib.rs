@@ -1284,7 +1284,7 @@ fn run_atexit_callbacks(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyEx
     }
 }
 
-/// PyPy `ObjSpace.finish()` (`baseobjspace.py:481-504`): join non-daemon
+/// PyPy `ObjSpace.finish()` (`baseobjspace.py`): join non-daemon
 /// threads, run atexit callbacks, mark the runtime finalizing, flush standard
 /// streams, and run started modules' shutdown hooks. PyPy does not force a full
 /// collection or clear `__main__` / `sys.modules` here. The PyPy oracle likewise
