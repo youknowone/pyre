@@ -153,7 +153,14 @@ extern "C" fn jit_builtin_abs_int(obj: i64) -> i64 {
         if pyre_object::is_exact_type(obj, &pyre_object::BOOL_TYPE) {
             return pyre_object::w_bool_get_value(obj) as i64;
         }
-        if pyre_object::is_int(obj) && !pyre_object::is_exact_type(obj, &pyre_object::BOOL_TYPE) {
+        // `is_int` reads `ob_type`, which a subclass instance shares with the
+        // builtin, so it alone would answer for one whose `__abs__` override
+        // the fold has no operand-class guard to notice.  `is_exact_type`
+        // reads `w_class`, which the subclass retags -- and it also excludes
+        // `bool`, whose own arm sits above.  Neither test implies the other:
+        // `is_exact_type` alone would admit a bigint, whose `*mut BigInt` sits
+        // where `intval` does.
+        if pyre_object::is_exact_type(obj, &pyre_object::INT_TYPE) && pyre_object::is_int(obj) {
             return pyre_object::w_int_get_value(obj)
                 .checked_abs()
                 .unwrap_or(INT_FOLD_DECLINE);
