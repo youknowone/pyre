@@ -1828,19 +1828,35 @@ fn spawn_thread(
             // driver owner is made interpreter-global.
             let _plain_worker = crate::call::force_plain_eval();
             if let Err(mut error) = call_thread_target(callable, &args, kwargs, ec_ptr) {
-                let callable_repr = unsafe {
-                    crate::display::py_repr_wtf8(callable).unwrap_or_else(|_| {
-                        rustpython_wtf8::Wtf8Buf::from_string("<unknown>".to_string())
-                    })
-                };
-                error.write_unraisable(
-                    w_none(),
-                    &crate::display::wtf8_format!(
-                        "Exception ignored in thread started by ",
-                        callable_repr
-                    ),
-                    w_none(),
+                // `os_thread.py:136-142` reports every error but `SystemExit`,
+                // which is how `_thread.exit()` ends a worker: printing an
+                // ignored-exception traceback for it would report a normal
+                // exit as a fault.
+                let ends_the_thread = crate::builtins::lookup_exc_class("SystemExit").is_some_and(
+                    |system_exit| unsafe {
+                        crate::baseobjspace::isinstance_w(error.to_exc_object(), system_exit)
+                    },
                 );
+                if !ends_the_thread {
+                    // Read the target out of its pinned slot rather than the
+                    // local: running it is arbitrary Python, and a moving
+                    // collection inside forwards the slot, not the copy taken
+                    // before the call.
+                    let callable = pyre_object::gc_roots::shadow_stack_get(worker_base);
+                    let callable_repr = unsafe {
+                        crate::display::py_repr_wtf8(callable).unwrap_or_else(|_| {
+                            rustpython_wtf8::Wtf8Buf::from_string("<unknown>".to_string())
+                        })
+                    };
+                    error.write_unraisable(
+                        w_none(),
+                        &crate::display::wtf8_format!(
+                            "Exception ignored in thread started by ",
+                            callable_repr
+                        ),
+                        w_none(),
+                    );
+                }
             }
             thread_is_stopping(&mut ec);
             crate::call::set_last_exec_ctx(std::ptr::null());
