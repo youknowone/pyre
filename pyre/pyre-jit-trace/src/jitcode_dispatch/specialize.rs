@@ -7953,6 +7953,12 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
+    // The modelled reads answer from `virtualizable_boxes`, which describe the
+    // PORTAL frame only.  An inline sub-walk publishes a different concrete
+    // frame whose locals live in the callee shadow, not in those boxes.
+    if ctx.fbw_mode.inline_subwalk || current_inline_concrete_frame() != 0 {
+        return Ok(None);
+    }
     let (Some(vable_op), Some(vable_ptr)) = (
         ctx.trace_ctx.standard_virtualizable_box(),
         ctx.trace_ctx.standard_virtualizable_ptr(),
@@ -7963,14 +7969,6 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // (`interp_inspect.py:7-11`).  Resolve it the same way and require it to BE
     // the standard virtualizable: a hidden portal frame, or any deeper frame
     // handed out through the backref chain, resolves elsewhere and declines.
-    //
-    // That identity test is also what makes an inline sub-walk foldable.  The
-    // modelled reads answer from `virtualizable_boxes`, which describe the
-    // portal frame only, and a sub-walk publishes a different concrete frame
-    // whose locals live in the callee shadow — but such a frame is not
-    // `vable_ptr`, so it declines here on its own.  What survives is a sub-walk
-    // whose top non-hidden frame IS the portal frame, and for that one the
-    // boxes describe exactly the frame being asked about.
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
         return Ok(None);
