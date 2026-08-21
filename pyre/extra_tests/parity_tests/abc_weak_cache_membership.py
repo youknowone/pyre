@@ -231,6 +231,60 @@ def a_mutated_contains_body_is_consulted():
         collection.__contains__.__code__ = original
 
 
+def a_non_function_contains_declines():
+    class Guarded(metaclass=ABCMeta):
+        pass
+
+    class Impl(Guarded):
+        pass
+
+    assert isinstance(Impl(), Guarded) is True
+
+    collection = type(Guarded._abc_cache)
+    original = collection.__contains__
+
+    class Descriptor:
+        def __get__(self, obj, objtype=None):
+            return lambda item: True
+
+    # Not a function at all.  Reading the code object off the installed method
+    # is only defined for a function, so the shortcut has to reject this before
+    # the read rather than by comparing whatever the read returned.
+    collection.__contains__ = Descriptor()
+    try:
+        assert isinstance(Plain(), Guarded) is True, 'a non-function __contains__ was read past'
+    finally:
+        collection.__contains__ = original
+
+
+def a_mutated_ref_global_is_consulted():
+    class Watched(metaclass=ABCMeta):
+        pass
+
+    class Impl(Watched):
+        pass
+
+    assert isinstance(Impl(), Watched) is True
+
+    collection = type(Watched._abc_cache)
+    namespace = collection.__contains__.__globals__
+    original = namespace['ref']
+    calls = []
+
+    def watching_ref(item, *rest):
+        calls.append(item)
+        return original(item, *rest)
+
+    # `ref` is the whole free-variable surface of the app-level body, and
+    # rebinding it moves neither the method nor its code object.
+    namespace['ref'] = watching_ref
+    try:
+        isinstance(Impl(), Watched)
+        assert calls, 'the rebound `ref` global was not consulted'
+    finally:
+        namespace['ref'] = original
+
+
 empty_collection_answers_then_fills()
 unweakreferenceable_class_reaches_the_subclass_check()
 a_raising_hash_runs_once()
@@ -241,4 +295,6 @@ if hasattr(ABCMeta('_Probe', (), {}), '_abc_cache'):
     replaced_data_is_consulted()
     a_data_subclass_keeps_its_override()
     a_mutated_contains_body_is_consulted()
+    a_non_function_contains_declines()
+    a_mutated_ref_global_is_consulted()
 print('OK')

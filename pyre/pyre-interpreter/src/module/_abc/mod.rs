@@ -30,30 +30,50 @@ fn simple_weak_set_type() -> PyObjectRef {
         .expect("_abc.SimpleWeakSet must be installed at module init") as PyObjectRef
 }
 
-/// The `__contains__` `app_abc.py` defines and the code object it was defined
-/// with, stashed beside its type.  The class is an ordinary heap type, so the
-/// method is rebindable and the function it holds is mutable in place;
-/// answering natively is only sound while the body a membership test would
-/// reach is still the one written in `app_abc.py`.
+/// The `__contains__` `app_abc.py` defines, stashed beside its type as the
+/// three words a caller can move independently: the method itself, the code
+/// object it holds, and the one global its body reads.  The class is an
+/// ordinary heap type, so the method is rebindable and the function it holds is
+/// mutable in place; answering natively is only sound while the body a
+/// membership test would reach is still the one written in `app_abc.py`.
 ///
-/// The pair is what a rebind and a `__code__` assignment respectively move.  A
-/// function has further mutable state that neither covers — its globals, its
-/// defaults — so this narrows the native answer to the untouched collection
-/// rather than proving the app-level body could not have been redirected.
-static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+/// The body is `try: wr = ref(item) / except TypeError: return False / return
+/// wr in self.data`, so `ref` is its whole free-variable surface and pinning it
+/// is what makes rebinding `__globals__["ref"]` decline.  Defaults are not
+/// pinned because the body takes none.
+static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<(usize, usize, usize)> =
+    std::sync::OnceLock::new();
 
-/// The installed `__contains__` and the code object it currently holds, as the
-/// pair [`SIMPLE_WEAK_SET_CONTAINS`] stores.  A missing method reads as
-/// `(0, 0)`, which no stash can equal.
-fn simple_weak_set_contains_identity() -> (usize, usize) {
+/// The installed `__contains__`, the code object it currently holds and its
+/// `ref` global, as the triple [`SIMPLE_WEAK_SET_CONTAINS`] stores.  Anything
+/// that is not a function reads as `(0, 0, 0)`, which no stash can equal:
+/// [`crate::function_get_code`] reads the `code` field without checking the
+/// type, so a `__contains__` rebound to a non-function must be rejected before
+/// the read rather than by comparing what the read returned.
+fn simple_weak_set_contains_identity() -> (usize, usize, usize) {
+    const NONE: (usize, usize, usize) = (0, 0, 0);
     let Some(method) =
         (unsafe { crate::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__") })
     else {
-        return (0, 0);
+        return NONE;
     };
-    (method as usize, unsafe {
-        crate::function_get_code(method) as usize
-    })
+    if !unsafe { crate::is_function(method) } {
+        return NONE;
+    }
+    let globals = unsafe { crate::function_get_globals_obj(method) };
+    if globals.is_null() {
+        return NONE;
+    }
+    let Some(ref_global) =
+        (unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(globals, "ref") })
+    else {
+        return NONE;
+    };
+    (
+        method as usize,
+        unsafe { crate::function_get_code(method) as usize },
+        ref_global as usize,
+    )
 }
 
 /// `SimpleWeakSet()` — the empty collection `_abc_init` installs and the
@@ -102,9 +122,9 @@ fn simple_weak_set_contains(
         return Ok(None);
     }
     // The receiver being that class is not enough: rebinding the class's own
-    // `__contains__`, or assigning that function a different `__code__`, leaves
-    // every instance an exact `SimpleWeakSet` while changing what a membership
-    // test answers.
+    // `__contains__`, assigning that function a different `__code__`, or
+    // rebinding the `ref` its body calls, each leaves every instance an exact
+    // `SimpleWeakSet` while changing what a membership test answers.
     let Some(&installed) = SIMPLE_WEAK_SET_CONTAINS.get() else {
         return Ok(None);
     };
@@ -704,7 +724,7 @@ crate::py_module! {
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
         let installed = simple_weak_set_contains_identity();
-        if installed != (0, 0) {
+        if installed != (0, 0, 0) {
             let _ = SIMPLE_WEAK_SET_CONTAINS.set(installed);
         }
     },
