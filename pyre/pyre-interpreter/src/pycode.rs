@@ -2428,16 +2428,13 @@ fn code_locations_cache()
 /// `co_firstlineno_raw` stamp that follows `CodeType(...)` and `code.replace`)
 /// simply corrects the recorded line number.
 fn release_code_locations(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32) {
-    // A code object with no instructions has no rows to decode.
-    let code = unsafe { &mut *code_ptr };
-    if code.instructions.is_empty() {
-        return;
-    }
     // Nested constants are wrapped in place, so two threads realizing one
-    // `co_consts_w` slot reach the same `CodeObject`. Whoever creates the
-    // record owns the drop; the array is read and written only under this
-    // lock. A second wrapper over an already-released object must keep the
-    // record the first made — re-deferring would abandon rows a reader has
+    // `co_consts_w` slot reach the same `CodeObject` before either wrapper is
+    // published. The lock is taken and the vacant entry claimed before the
+    // pointer is dereferenced, so only the thread that owns the record ever
+    // forms a `&mut` to the object: the array is read and written under this
+    // lock alone. A second wrapper over an already-released object must keep
+    // the record the first made — re-deferring would abandon rows a reader has
     // since decoded.
     let mut cache = code_locations_cache()
         .lock()
@@ -2445,7 +2442,10 @@ fn release_code_locations(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32
     let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(code_ptr as usize) else {
         return;
     };
-    if code.locations.is_empty() {
+    let code = unsafe { &mut *code_ptr };
+    // A code object with no instructions has no rows to decode, and one that
+    // holds no array has nothing to release.
+    if code.instructions.is_empty() || code.locations.is_empty() {
         return;
     }
     entry.insert(CodeLocations::Deferred(firstlineno_raw));
