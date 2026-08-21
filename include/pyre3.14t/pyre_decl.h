@@ -173,6 +173,12 @@ PyAPI_FUNC(double) PyFloat_AsDouble(PyObject *);
 PyAPI_FUNC(int) PyFloat_Check(PyObject *);
 PyAPI_FUNC(int) PyFloat_CheckExact(PyObject *);
 PyAPI_FUNC(PyObject *) PyFloat_FromDouble(double);
+PyAPI_FUNC(int) PyFloat_Pack2(double, char *, int);
+PyAPI_FUNC(int) PyFloat_Pack4(double, char *, int);
+PyAPI_FUNC(int) PyFloat_Pack8(double, char *, int);
+PyAPI_FUNC(double) PyFloat_Unpack2(const char *, int);
+PyAPI_FUNC(double) PyFloat_Unpack4(const char *, int);
+PyAPI_FUNC(double) PyFloat_Unpack8(const char *, int);
 
 /* cpyext/frameobject.rs */
 PyAPI_FUNC(PyFrameObject *) PyFrame_New(PyThreadState *, PyCodeObject *, PyObject *, PyObject *);
