@@ -2754,7 +2754,17 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
         pyre_object::typeobject::w_type_set_hasdict(
             pyre_object::gc_roots::shadow_stack_get(type_slot),
             (*tp).tp_dictoffset != 0,
-        )
+        );
+        // `typeobject.py:1458-1460 create_all_slots` takes the `wantweakref`
+        // branch for a namespace with no `__slots__`, which is every namespace
+        // built from C.  The field the offset would be read from cannot answer
+        // this: an extension writes `tp_weaklistoffset` after the type it
+        // readied is already built, which is where Cython puts the offset of a
+        // `cdef object __weakref__`.
+        pyre_object::typeobject::w_type_set_weakrefable(
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            true,
+        );
     };
     stamp_tp_dict(tp, pyre_object::gc_roots::shadow_stack_get(type_slot));
     stamp_objclass(pyre_object::gc_roots::shadow_stack_get(type_slot), tp);
