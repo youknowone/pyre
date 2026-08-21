@@ -25259,6 +25259,98 @@ mod tests {
         );
     }
 
+    /// The third minting site. `compile.py:1006-1023
+    /// ResumeFromInterpDescr.compile_and_attach` gives the entry bridge a token
+    /// from `make_jitcell_token`, so it starts at the `history.py:442` default
+    /// however far the entry it replaces had run its own budget down — and the
+    /// `FORCE_BRIDGE_SEGMENTING` bit riding in bit 0 stays behind with it.
+    #[test]
+    fn an_entry_bridge_does_not_inherit_the_retrace_count() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let green_key = 44;
+        for _ in 0..2 {
+            meta.on_back_edge(green_key, &[0]);
+        }
+        assert!(meta.tracing.is_some());
+        if let Some(ctx) = meta.trace_ctx() {
+            let i0 = OpRef::input_arg_int(0);
+            let const_one = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+        }
+        meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+
+        let jump_descr = meta
+            .compiled_loops
+            .get(&green_key)
+            .and_then(|entry| entry.front_target_tokens.first())
+            .expect("the target loop installed a front target")
+            .as_jump_target_descr();
+        let original_green_key = green_key;
+        let stale = std::sync::Arc::new(JitCellToken::new(5));
+        stale.set_inputarg_types(vec![Type::Int]);
+        stale.set_retraced_count(u32::MAX);
+        assert_ne!(
+            stale.retraced_count.get() & JitCellToken::FORCE_BRIDGE_SEGMENTING,
+            0,
+            "the sentinel arms bridge segmenting, which is what must not travel"
+        );
+        meta.compiled_loops
+            .get_mut(&green_key)
+            .expect("the target loop remains installed")
+            .token = std::sync::Arc::downgrade(&stale);
+
+        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                jump_descr,
+            ),
+        ];
+        assert!(meta.compile_entry_bridge(
+            green_key,
+            original_green_key,
+            (),
+            None,
+            std::ptr::null(),
+            &bridge_ops,
+            &bridge_inputargs,
+            majit_ir::ConstMap::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let fresh = meta
+            .compiled_loops
+            .get(&original_green_key)
+            .and_then(|entry| entry.live_token())
+            .expect("the entry bridge installed a live token");
+        assert!(
+            !std::sync::Arc::ptr_eq(&fresh, &stale),
+            "the entry bridge installed a new token"
+        );
+        assert_eq!(
+            fresh.get_retraced_count(),
+            0,
+            "and it starts at zero, so the retired entry's sentinel decides \
+             nothing for the bridges this token will own"
+        );
+    }
+
     #[test]
     fn test_on_compile_loop_fires_with_correct_metadata() {
         // Parity with test_on_compile: after_compile hook fires with green_key,

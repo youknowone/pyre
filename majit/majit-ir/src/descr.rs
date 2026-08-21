@@ -4343,6 +4343,12 @@ pub trait FailDescr: Descr {
     /// that read itself via `metainterp_sd.cpu.get_value_direct(deadframe, tp,
     /// index)`; pyre's metainterp never sees the deadframe, so the backend that
     /// owns it parks the word on the descr the decision is about.
+    ///
+    /// One slot per descr is enough for the same reason the rest of the resume
+    /// state is: the park and the `take` that consumes it are the two halves of
+    /// one guard failure, and guard failures run on pyre's single JIT thread
+    /// (RPython GIL parity). Two concurrent failures of one guard would trade
+    /// values here.
     fn set_pending_counter_value(&self, _value: i64) {}
 
     fn take_pending_counter_value(&self) -> Option<i64> {
