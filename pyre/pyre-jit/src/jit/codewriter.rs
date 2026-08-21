@@ -15859,7 +15859,7 @@ fn backward_jump_target(
 /// one sequential decode pass so an `EXTENDED_ARG` prefix folds into the
 /// following opcode's argument, matching the edge model of
 /// `find_branch_target_pcs`.
-fn code_successors(code: &CodeObject) -> Vec<Vec<usize>> {
+pub(crate) fn code_successors(code: &CodeObject) -> Vec<Vec<usize>> {
     let num_instrs = code.instructions.len();
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); num_instrs];
     let mut scan_state = OpArgState::default();

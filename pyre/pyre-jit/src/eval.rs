@@ -7398,25 +7398,48 @@ fn function_entry_trace_is_jit_safe(code: &pyre_interpreter::CodeObject) -> bool
 }
 
 /// Return the pc ranges that make up the natural loop region whose header is
-/// `loop_header_pc`: the loop body, plus every out-of-line exception handler
-/// that rejoins the body through a backward jump. An empty result means
-/// `loop_header_pc` has no backedge and so names no region.
+/// `loop_header_pc`: the header, plus every instruction that can reach one of
+/// its backedges without passing through the header again. An empty result
+/// means `loop_header_pc` has no backedge and so names no region.
 ///
-/// The region is a set of ranges rather than one span because a handler is laid
+/// This is the natural loop of the backedge, computed over
+/// [`crate::jit::codewriter::code_successors`], which already carries the
+/// exception edges — so an out-of-line handler that rejoins the body is in the
+/// region exactly when control really can return through it, with no appeal to
+/// where the handler was laid out. A `return` leg is reachable from the header
+/// but reaches no backedge, so it stays outside.
+///
+/// It is deliberately not the header's strongly connected component. An inner
+/// loop's SCC is its *outer* loop: leaving the inner loop, finishing the outer
+/// body and taking the outer backedge does return to the inner header, so the
+/// intersection of "reaches" and "is reached by" swallows the enclosing loop
+/// and gates the inner backedge on `FOR_ITER`s outside it. Stopping the walk at
+/// the header is what keeps a nested loop scoped to itself.
+///
+/// The result is a set of ranges rather than one span because a handler is laid
 /// out after the code that follows its `try`, not next to the body it protects.
-/// Whatever sits between the two — a later comprehension, a disjoint loop —
-/// belongs to neither and cannot run in this backedge's trace, so covering the
-/// gap would gate the backedge on `FOR_ITER`s it never reaches. The exception
-/// table names where the out-of-line code begins, which is what lets a
-/// rejoining jump widen the region back to its own handler instead of across
-/// the gap.
+/// Whatever sits between the two belongs to neither and cannot run in this
+/// backedge's trace.
+///
+/// Reading the ranges off the exception table's own `(start, end, target)`
+/// extents does not work, and is not what carries the handlers here. A
+/// rejoining jump is emitted after the block's `PopBlock` / `PopExcept`, so
+/// `assemble_exception_table` stamps it with the popped handler and no entry
+/// covers it — the extents name where a handler protects, never where control
+/// re-enters from. The successor edges do carry it, because the handler's own
+/// instructions reach the backedge.
 fn loop_region_ranges(
     code: &pyre_interpreter::CodeObject,
     loop_header_pc: usize,
 ) -> Vec<std::ops::RangeInclusive<usize>> {
     use pyre_interpreter::Instruction as I;
 
-    let mut backward_jumps: Vec<(usize, usize)> = Vec::new();
+    let num_instrs = code.instructions.len();
+    if loop_header_pc >= num_instrs {
+        return Vec::new();
+    }
+
+    let mut backedge_sources: Vec<usize> = Vec::new();
     let mut arg_state = pyre_interpreter::OpArgState::default();
     for (pc, unit) in code.instructions.iter().copied().enumerate() {
         let (instr, op_arg) = arg_state.get(unit);
@@ -7429,73 +7452,59 @@ fn loop_region_ranges(
             }
             _ => None,
         };
-        if let Some(target) = target {
-            backward_jumps.push((pc, target));
+        if target == Some(loop_header_pc) {
+            backedge_sources.push(pc);
         }
     }
-
-    let Some(body_end) = backward_jumps
-        .iter()
-        .filter(|(_, target)| *target == loop_header_pc)
-        .map(|(pc, _)| *pc)
-        .max()
-    else {
+    if backedge_sources.is_empty() {
         return Vec::new();
-    };
+    }
 
-    // The exception table is keyed by byte offset; pyre's `pc` is the
-    // instruction-unit index (two bytes per unit). Only the handlers laid out
-    // past the body can start an out-of-line block; one inside the body is
-    // already covered.
-    let mut handler_starts: Vec<usize> =
-        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
-            .map(|entry| entry.target as usize / 2)
-            .filter(|start| *start > body_end)
-            .collect();
-    handler_starts.sort_unstable();
-
-    let mut ranges = vec![loop_header_pc..=body_end];
-    loop {
-        let rejoins: Vec<usize> = backward_jumps
-            .iter()
-            .filter(|(pc, target)| {
-                !ranges.iter().any(|range| range.contains(pc))
-                    && ranges.iter().any(|range| range.contains(target))
-            })
-            .map(|(pc, _)| *pc)
-            .collect();
-        if rejoins.is_empty() {
-            return ranges;
-        }
-        for pc in rejoins {
-            // Take the earliest handler that still starts at or before the
-            // jump: a handler runs on through the ones nested inside it, so
-            // the block this jump closes begins at the outermost of them.
-            // Without a handler to name a start the jump is not an out-of-line
-            // rejoin, and the span back to the body is kept whole rather than
-            // guessed at.
-            //
-            // With several disjoint handlers laid out after the body this
-            // swallows the bytecode between the earliest one and the jump.
-            // `loop_region_for_iter_bodies_all_jit_safe`, the one reader, only
-            // loses inlining —
-            // an unsafe `FOR_ITER` in the swallowed span declines a loop that
-            // could not reach it — while narrowing to the handler nearest the
-            // jump would let it admit a frame whose unsafe `FOR_ITER` really
-            // does run.  The pessimistic side is the one that cannot be wrong,
-            // so it stands until the ranges are built from the exception
-            // table's `(start, end, target)` extents, which name the block a
-            // jump belongs to instead of inferring it from target order.
-            let start = handler_starts
-                .iter()
-                .copied()
-                .find(|start| *start <= pc)
-                .unwrap_or(body_end + 1);
-            ranges.push(start..=pc);
+    let succ = crate::jit::codewriter::code_successors(code);
+    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); num_instrs];
+    for (pc, nexts) in succ.iter().enumerate() {
+        for &next in nexts {
+            pred[next].push(pc);
         }
     }
-}
 
+    // Seeding the header first is what bounds the walk: it is already in the
+    // region, so no predecessor edge is ever followed out through it.
+    let mut in_region = vec![false; num_instrs];
+    in_region[loop_header_pc] = true;
+    let mut stack: Vec<usize> = Vec::new();
+    for source in backedge_sources {
+        if source < num_instrs && !in_region[source] {
+            in_region[source] = true;
+            stack.push(source);
+        }
+    }
+    while let Some(pc) = stack.pop() {
+        for &prev in &pred[pc] {
+            if !in_region[prev] {
+                in_region[prev] = true;
+                stack.push(prev);
+            }
+        }
+    }
+
+    let mut ranges: Vec<std::ops::RangeInclusive<usize>> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for pc in 0..num_instrs {
+        match (in_region[pc], run_start) {
+            (true, None) => run_start = Some(pc),
+            (false, Some(start)) => {
+                ranges.push(start..=pc - 1);
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = run_start {
+        ranges.push(start..=num_instrs - 1);
+    }
+    ranges
+}
 /// Apply the FOR_ITER safety gate only to loops inside the natural loop region
 /// whose backedge is being considered. `interp_jit.py:118-120` invokes
 /// `can_enter_jit` for that backedge. Later disjoint loops remain outside the
@@ -13698,6 +13707,137 @@ mod tests {
             &code,
             outer_header
         ));
+    }
+
+    /// A `return` leg is reachable from the header and never returns to it, so
+    /// it is not in the region and its `FOR_ITER`s cannot run in this
+    /// backedge's trace.
+    ///
+    /// The span from the header to the last backedge contains that leg, so
+    /// reading the region off the layout declines the loop for an unsafe
+    /// `FOR_ITER` the loop can only reach on its way out.
+    #[test]
+    fn an_inner_loops_region_excludes_the_loop_that_encloses_it() {
+        use pyre_interpreter::{Instruction as I, compile_exec};
+        // Two backedges: the outer `for`, and the inlined comprehension nested
+        // in its body. Control does leave the inner loop, finish the outer body
+        // and come back round to the inner header — so the inner header's
+        // strongly connected component is the whole outer loop. Its natural
+        // loop is not.
+        let module = compile_exec(
+            "def run(rows, k):\n    total = 0\n    for row in rows:\n        total += sum([y * k for y in row])\n    return total\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "run");
+
+        let mut headers: Vec<usize> = Vec::new();
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        for (pc, unit) in code.instructions.iter().copied().enumerate() {
+            let (instr, op_arg) = arg_state.get(unit);
+            let target = match instr {
+                I::JumpBackward { delta } => {
+                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                I::JumpBackwardNoInterrupt { delta } => {
+                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                headers.push(target);
+            }
+        }
+        headers.sort_unstable();
+        headers.dedup();
+        assert_eq!(
+            headers.len(),
+            2,
+            "fixture must nest one loop inside another"
+        );
+        let (outer_header, inner_header) = (headers[0], headers[1]);
+
+        let inner = loop_region_ranges(&code, inner_header);
+        let outer = loop_region_ranges(&code, outer_header);
+        assert!(
+            !inner.is_empty() && !outer.is_empty(),
+            "both have backedges"
+        );
+
+        assert!(
+            !inner.iter().any(|range| range.contains(&outer_header)),
+            "the enclosing loop's header is not in the inner loop's region",
+        );
+        assert!(
+            outer.iter().any(|range| range.contains(&inner_header)),
+            "the inner header is in the enclosing loop's region",
+        );
+        let count = |ranges: &[std::ops::RangeInclusive<usize>]| -> usize {
+            ranges
+                .iter()
+                .map(|range| range.end() + 1 - range.start())
+                .sum()
+        };
+        assert!(
+            count(&inner) < count(&outer),
+            "the inner region is the smaller of the two, not the same set",
+        );
+    }
+
+    #[test]
+    fn loop_region_excludes_a_return_leg_inside_the_body_span() {
+        use pyre_interpreter::{Instruction as I, compile_exec};
+        let module = compile_exec(
+            "def run(items, k):\n    out = []\n    for x in items:\n        if x < 0:\n            return [str(y) for y in range(k)]\n        out.append(x)\n    return out\n",
+        )
+        .expect("test code should compile");
+        let code = function_code_from_module(&module, "run");
+
+        let mut header = usize::MAX;
+        let mut last_backedge = 0usize;
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        for (pc, unit) in code.instructions.iter().copied().enumerate() {
+            let (instr, op_arg) = arg_state.get(unit);
+            let target = match instr {
+                I::JumpBackward { delta } => {
+                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                I::JumpBackwardNoInterrupt { delta } => {
+                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                header = header.min(target);
+                last_backedge = last_backedge.max(pc);
+            }
+        }
+        assert!(header != usize::MAX, "fixture must contain a backedge");
+
+        // The comprehension's FOR_ITER is the one on the return leg: it sits
+        // inside the header..=last_backedge span but is not the loop's own.
+        let mut return_leg_for_iter = None;
+        let mut arg_state = pyre_interpreter::OpArgState::default();
+        for (pc, unit) in code.instructions.iter().copied().enumerate() {
+            let (instr, _) = arg_state.get(unit);
+            if matches!(instr, I::ForIter { .. }) && pc > header && pc < last_backedge {
+                return_leg_for_iter = Some(pc);
+            }
+        }
+        let return_leg_for_iter =
+            return_leg_for_iter.expect("fixture must inline the comprehension in the body span");
+
+        let ranges = loop_region_ranges(&code, header);
+        assert!(!ranges.is_empty(), "the header has a backedge");
+        assert!(
+            ranges.iter().any(|range| range.contains(&header)),
+            "the header is in its own region",
+        );
+        assert!(
+            !ranges
+                .iter()
+                .any(|range| range.contains(&return_leg_for_iter)),
+            "a return leg does not reach the header, so it is outside the region",
+        );
     }
 
     #[test]
