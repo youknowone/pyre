@@ -7733,6 +7733,21 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
                     | I::ListExtend { .. }
                     | I::SetAdd { .. }
                     | I::MapAdd { .. }
+                    // The other three container-update opcodes lower the same
+                    // way as `LIST_EXTEND`: pop the source, peek the container,
+                    // emit one void accumulate residual, and the codewriter and
+                    // `liveness` already treat all four as one class. Each also
+                    // targets a container built in the same expression -- a set
+                    // or dict display, or a call's `**kwargs` dict -- so a walk
+                    // abort drops an incomplete fresh object rather than
+                    // replaying a mutation of a pre-existing one. A set display
+                    // that must yield a mutable set compiles to `BUILD_SET 0` +
+                    // `SET_UPDATE 1` even when every element is constant, so
+                    // declining these took every loop that builds one out of
+                    // the JIT.
+                    | I::SetUpdate { .. }
+                    | I::DictUpdate { .. }
+                    | I::DictMerge { .. }
             )
             || ((!body_has_call || for_iter_call_body_admitted())
                 && matches!(body_instr, I::ListAppend { .. }));
@@ -13732,6 +13747,26 @@ mod tests {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
             assert!(!function_entry_trace_is_jit_safe(&code));
+            assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+        }
+    }
+
+    #[test]
+    fn for_iter_body_updating_a_fresh_container_is_jit_safe() {
+        // `SET_UPDATE`, `DICT_UPDATE` and `DICT_MERGE` lower like `LIST_EXTEND`
+        // -- one void accumulate residual over a container the same expression
+        // just built. A set display that must yield a mutable set emits
+        // `BUILD_SET 0` + `SET_UPDATE 1` even with constant elements, so
+        // declining it took the whole loop out of the JIT.
+        use pyre_interpreter::compile_exec;
+        for source in [
+            "def f(n):\n    c = 0\n    for i in range(n):\n        s = {0, 1, 2, 3}\n        c += len(s)\n    return c\n",
+            "def f(n):\n    c = 0\n    for i in range(n):\n        d = {**{'a': 1}, 'b': i}\n        c += len(d)\n    return c\n",
+            "def f(n, g):\n    c = 0\n    for i in range(n):\n        c += g(**{'a': i})\n    return c\n",
+        ] {
+            let module = compile_exec(source).expect("test code should compile");
+            let code = function_code_from_module(&module, "f");
+            assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
