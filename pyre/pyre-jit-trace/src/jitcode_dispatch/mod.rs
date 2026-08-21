@@ -2708,7 +2708,16 @@ impl DispatchError {
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
             Self::BranchGuardKeptSlotUnsourced { .. } => "BranchGuardKeptSlotUnsourced",
             Self::ForceQuasiImmutable { .. } => "ForceQuasiImmutable",
-            Self::LoopBearingCalleeInlineUnsupported { .. } => "LoopBearingCalleeInlineUnsupported",
+            // Split on the discriminant: the two carry different recoveries —
+            // `false` routes to the CALL-forward carrier, `true` is owned by the
+            // general walk-abort leg — so one key cannot answer which fired.
+            Self::LoopBearingCalleeInlineUnsupported {
+                blackhole_required: true,
+                ..
+            } => "LoopBearingCalleeInlineUnsupported/blackhole",
+            Self::LoopBearingCalleeInlineUnsupported { .. } => {
+                "LoopBearingCalleeInlineUnsupported/carrier"
+            }
             Self::FieldDescrMissingParentDescr { .. } => "FieldDescrMissingParentDescr",
             Self::OrthodoxSubWalkTraceUnsupported { .. } => "OrthodoxSubWalkTraceUnsupported",
             Self::UnregisteredNewGcType { .. } => "UnregisteredNewGcType",
