@@ -3570,7 +3570,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let mut foriter_deferred_admit = false;
     let mut foriter_dirty_bound = false;
     if fbw_foriter_inflight_active() && !instance_next_seeded_route {
-        let safety = fbw_callee_body_replay_safety(
+        let mut safety = fbw_callee_body_replay_safety(
             body.code,
             &exact_numeric_args,
             body.num_regs_i,
@@ -3580,6 +3580,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             callee_descr_refs,
             method_form,
         );
+        // MEASUREMENT PROBE (`PYRE_CTOR_INIT_CLEAN`), not a shipping arm: it
+        // asserts what the scan cannot yet prove — that every live-heap write
+        // an `__init__` performs lands on the instance `__new__` allocated for
+        // THIS call, which the caller-boundary resume re-allocates rather than
+        // doubling.  The scan has no parameter-freshness input, so it cannot
+        // tell that write from one to an object that outlives the rewind.
+        if constructor_result.is_some()
+            && matches!(safety, CalleeReplaySafety::Dirty)
+            && std::env::var_os("PYRE_CTOR_INIT_CLEAN").is_some()
+        {
+            safety = CalleeReplaySafety::Clean;
+        }
         let legacy_admit = match safety {
             CalleeReplaySafety::Clean => true,
             CalleeReplaySafety::DeferredCall => {
