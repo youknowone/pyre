@@ -435,7 +435,7 @@ impl StoredExitLayout {
     ///   2. A backend-only layout whose `source_op_index` did not
     ///      resolve to an op with a descr — readers treat that as
     ///      an empty type vector (the constructor synthesizes a
-    ///      `MetaFailDescr` for backend-only entries so this branch
+    ///      `ResumeGuardDescr` for backend-only entries so this branch
     ///      is normally unreachable in production).
     pub(crate) fn resolve_exit_types(&self) -> &[Type] {
         if let Some(types) = self
@@ -452,7 +452,7 @@ impl StoredExitLayout {
         // Both descr-side and JUMP-cache fallbacks empty — production
         // builders (`build_terminal_exit_layouts`, `build_guard_metadata`,
         // `merge_backend_*_layouts`) always populate at least one, since
-        // backend-only entries synthesize a `MetaFailDescr` and JUMP
+        // backend-only entries synthesize a `ResumeGuardDescr` and JUMP
         // entries set `op_arg_types_for_jump`.  Hitting this branch
         // means a synthetic test fixture skipped both populators or a
         // builder regressed — flag it loudly in debug builds so it
@@ -9712,7 +9712,7 @@ impl<M: Clone> MetaInterp<M> {
         // fail_arg_types) is NOT applied here. CalAssemblerI calls the
         // callee without adapt-live, so the runtime types at guard failure
         // are the original Ref types. The no-snapshot fallback handles
-        // types correctly via MetaFailDescr.
+        // types correctly via `make_fail_descr_typed`.
 
         // compile.py:504-511 send_loop_to_backend — unconditional virtualizable
         // field reload for every loop. See

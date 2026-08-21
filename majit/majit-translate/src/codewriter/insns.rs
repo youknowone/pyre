@@ -277,7 +277,7 @@ pub const BC_INT_MUL: u8 = 115;
 // `direct_call(ll_int_py_div)` / `direct_call(ll_int_py_mod)` before
 // jitcode emission; the bytecode dispatch path therefore has no
 // `BC_INT_FLOORDIV` / `BC_INT_MOD` opcode.  Pyre's residual call at
-// `majit-translate/src/codegen.rs::generated_binary_int_value`
+// `pyre-jit-trace/src/jitcode_dispatch/specialize.rs::walker_emit_int_py_div_or_mod`
 // emits `CallI(ll_int_py_div, ...)` / `CallI(ll_int_py_mod, ...)`
 // for the same effect.  Slot numbers stay reserved so opcode
 // renumbering stays stable across this gap.

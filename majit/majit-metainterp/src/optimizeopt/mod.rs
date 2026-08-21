@@ -739,7 +739,7 @@ pub struct OptContext {
     /// `Rc`s sharing one position across the peel boundary. An operand
     /// `Rc::ptr_eq` key would silent-miss the pop. Re-keying to box identity
     /// is gated on the same short-preamble / InputArg identity unification
-    /// that defers `resolve_box_box`'s InputArg arm (#9).
+    /// that defers `resolve_operand_operand`'s InputArg arm (#9).
     pub(crate) potential_extra_ops: indexmap::IndexMap<OpRef, crate::optimizeopt::info::PreambleOp>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
@@ -3090,7 +3090,7 @@ impl OptContext {
             // `synth`; without this link its box-native walk freezes on the
             // orphaned stand-in while the OpRef path resolves `op_rc`, so a
             // later fold (e.g. GUARD_TRUE constant-folding the operand) lands
-            // on a different host and `resolve_box_box`'s witness diverges.
+            // on a different host and `resolve_operand_operand`'s witness diverges.
             // `synth` stays alive in `resop_refs` (seeded there alongside
             // `live_synthetics`), so its `Weak` upgrades and the chain reaches
             // `op_rc`.
@@ -5039,7 +5039,7 @@ impl OptContext {
         if arg.bound_op().is_some() || arg.is_constant() {
             let resolved = arg.get_box_replacement(false);
             // Self-resolved box-native: the canonical forwarding for this
-            // position lives in the `OpRef` store (see `resolve_box_box`).
+            // position lives in the `OpRef` store (see `get_box_replacement_operand`).
             if resolved.same_box(arg) {
                 self.get_box_replacement_operand(arg.to_opref())
             } else {
@@ -5082,7 +5082,7 @@ impl OptContext {
     /// op the operands carry at that position stays a DISTINCT, still-
     /// unforwarded `Op`. A box-native walk from such an operand then freezes
     /// on the unforwarded input op while the OpRef path resolves the canonical
-    /// (the witnessed `resolve_box_box` divergence). Link `input_op ->
+    /// (the witnessed `resolve_operand_operand` divergence). Link `input_op ->
     /// canonical` here, the non-emitted analogue of `emit`'s synth->op_rc link,
     /// so both paths agree.
     ///
@@ -6744,7 +6744,7 @@ impl OptContext {
         //       op.setdescr(descr)
         // RPython preserves the existing descr object (and its
         // `fail_index`, subtype, vector_info) and only mutates its
-        // `fail_arg_types`. Pyre's MetaFailDescr / ResumeGuardDescr /
+        // `fail_arg_types`. Pyre's `ResumeGuardDescr` /
         // ResumeAtPositionDescr / CompileLoopVersionDescr keep `types`
         // in `UnsafeCell<Vec<Type>>`, exposed via
         // `FailDescr::set_fail_arg_types`, so we mutate in place — the
@@ -9014,7 +9014,7 @@ mod boxref_forwarding_tests {
     /// dispatched and arg-bound to the pos-2 stand-in before INT_LT (producer)
     /// emits its `new_operations` clone. Without the `emit` `set_forwarded_op`
     /// link the box-native walk of the consumer arg terminates on the stand-in
-    /// while the OpRef path resolves the producer, tripping `resolve_box_box`'s
+    /// while the OpRef path resolves the producer, tripping `resolve_operand_operand`'s
     /// divergence witness (panic under `cfg(debug_assertions)`).
     #[test]
     fn s2_forward_reference_consumer_follows_emitted_producer() {

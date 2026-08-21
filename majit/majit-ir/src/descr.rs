@@ -3577,7 +3577,7 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     /// (`ResumeAtPositionDescr`, `ResumeGuardForcedDescr`,
     /// `ResumeGuardExcDescr`, `CompileLoopVersionDescr`).  Returns false
     /// on `ResumeGuardCopiedDescr` (a sibling, not a subclass — its
-    /// resume reads chase `prev`) and on plain `MetaFailDescr` /
+    /// resume reads chase `prev`) and on plain `SimpleFailDescr` /
     /// other non-resume `FailDescr` subtypes.  Callers that need to
     /// store fresh resume data (`store_final_boxes_in_guard`,
     /// `make_resume_guard_copied_descr`) must assert this before
@@ -3775,7 +3775,7 @@ pub trait FailDescr: Descr {
     /// `guard_op.setfailargs(boxes)` and `store_hash` (compile.py:869);
     /// no per-slot type vector lives on the descr. Pyre's `OpRef` is
     /// untyped, so we cache `Vec<Type>` on the descr and refresh it
-    /// here. Concrete `MetaFailDescr` / `ResumeGuardDescr` /
+    /// here. Concrete `ResumeGuardDescr` /
     /// `ResumeAtPositionDescr` / `CompileLoopVersionDescr` use
     /// `UnsafeCell<Vec<Type>>` so the existing `Arc<dyn FailDescr>`
     /// identity (fail_index, vector_info, subtype) is preserved across

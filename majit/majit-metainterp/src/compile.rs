@@ -1202,7 +1202,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         // is no longer reachable (frontend trace evicted but backend
         // exit layout persists across previous-token fallback) the
         // backend's `fail_arg_types` is the canonical typed-data
-        // carrier; mint a fresh `MetaFailDescr` carrying that vector
+        // carrier; mint a fresh `ResumeGuardDescr` (`make_fail_descr_typed`) carrying that vector
         // so descr-side readers stay populated.  Branch on
         // `layout.is_finish` so a backend-only FINISH entry synthesizes
         // a `_DoneWithThisFrameDescr`-flavored handle (is_finish=true)
@@ -3409,8 +3409,8 @@ pub fn make_finish_fail_descr_typed(types: Vec<Type>, is_exception_exit: bool) -
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr
 /// carrying the post-numbering `fail_arg_types`. Used by
-/// `store_final_boxes_in_guard` to replace the tracer-stamped
-/// `MetaFailDescr` (whose `types` reflect the pre-numbering snapshot)
+/// `store_final_boxes_in_guard` to replace the tracer-stamped descr
+/// (whose `types` reflect the pre-numbering snapshot)
 /// with a descr whose `fail_arg_types()` matches `op.fail_arg_types`
 /// exactly.
 ///
@@ -5038,7 +5038,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
     // subclass thereof: ResumeAtPositionDescr / ResumeGuardForcedDescr /
     // ResumeGuardExcDescr / CompileLoopVersionDescr).  Reject siblings
     // (ResumeGuardCopiedDescr itself) and unrelated FailDescr subtypes
-    // (MetaFailDescr) — the descr-side rd_* readers chase `prev` at
+    // (`SimpleFailDescr`) — the descr-side rd_* readers chase `prev` at
     // resume time and would observe garbage if prev cannot carry resume
     // data.
     assert!(
@@ -5536,7 +5536,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
         src_descr.clone()
     };
     // compile.py:863 `assert isinstance(other, ResumeGuardDescr)`:
-    // reject non-resume FailDescr (e.g. MetaFailDescr) that would
+    // reject non-resume FailDescr (e.g. `SimpleFailDescr`) that would
     // otherwise yield an empty rd_* payload on the loop-version descr.
     assert!(
         resolved_descr.is_resume_guard(),
@@ -6072,7 +6072,7 @@ mod fail_descr_tests {
         assert!(lv.as_fail_descr().unwrap().loop_version());
         assert_eq!(lv.as_fail_descr().unwrap().fail_arg_types(), &[Type::Ref]);
 
-        // MetaFailDescr / plain ResumeGuardDescr factory.
+        // Plain `ResumeGuardDescr` factory.
         let plain = make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
         let plain_fi = plain.index();
         assert!(!plain.is_resume_at_position());

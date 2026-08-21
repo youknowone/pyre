@@ -5348,7 +5348,7 @@ fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
 /// well-defined).  Both corners are unreachable from the JIT trace
 /// path: the `_ovf_zer` wrapper's `int_eq(rhs, 0) -> guard_false` and
 /// `(lhs == INT_MIN) & (rhs == -1) -> guard_false` runtime guards
-/// (emitted at `codegen.rs::generated_binary_int_value`) bail out the
+/// (emitted at `specialize.rs::walker_emit_int_div_domain_guards`) bail out the
 /// trace before this helper is invoked, matching
 /// `rint.ll_int_py_div_ovf_zer`. Direct non-traced
 /// callers must respect the same precondition.
@@ -5357,7 +5357,7 @@ fn bhimpl_int_mul(a: i64, b: i64) -> i64 {
 /// (`majit-backend/src/call_stub.rs` invokes the helper through an
 /// `extern "C" fn(...)` pointer; matching ABI keeps the function
 /// pointer correctly callable from both the Rust-side
-/// `codegen.rs::generated_binary_int_value` (which folds the
+/// `specialize.rs::walker_emit_int_py_div_or_mod` (which folds the
 /// concrete result during trace recording) and the native call
 /// stub.  RPython's `getfunctionptr(graph)` similarly hands the
 /// codewriter a real C ABI pointer to the translated helper.

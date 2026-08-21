@@ -6352,7 +6352,7 @@ mod tests {
         // it stays a live producer at its own position, which guard_b's fail
         // args reference (a fail arg pointing at a *folded* getfield would make
         // the position-only synthetic resolve to itself while the OpRef store
-        // forwards to the survivor — the resolve_box_box divergence tripwire,
+        // forwards to the survivor — the `resolve_operand_operand` divergence tripwire,
         // `materialize_operand_at`; binding to the real folded producer needs the oprc
         // driver, blocked here by CallMayForceR's void result position).
         let field_descr_b = field_group.field_descrs[1].clone() as DescrRef;
@@ -7358,7 +7358,7 @@ mod tests {
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
         let b10 = ctx.materialize_operand_at(OpRef::ref_op(10));
         // The field value box is materialized THROUGH the context so it binds
-        // to the context's producer host; force_box's `resolve_box_box` then
+        // to the context's producer host; force_box's `resolve_operand_operand` then
         // resolves it to a bound box (sheds to Operand::Op), not a fresh
         // position-only `from_opref` box.
         let field_value = ctx.materialize_operand_at(OpRef::int_op(11));

@@ -538,7 +538,7 @@ impl Descr for CallDescrStub {
 /// `gc_ll_descr.gc_cache._cache_call`, `backend/llsupport/descr.py:14`),
 /// reached via the thread-local `CodeWriter::instance()` singleton.
 /// Each entry shares its `Arc` across the inline SSARepr emitter
-/// (`codewriter::emit_residual_call_shape`) and the graph-side
+/// (the `build_*_residual_call_*_insn` family below) and the graph-side
 /// `record_residual_call_graph_op` so a single allocation backs both
 /// layers per call signature.  RPython parity table:
 ///
@@ -3230,7 +3230,7 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
     // downcasts to pyre's `CallDescrStub`.  The graph-side
     // `residual_call_*` recorder threads the interned stub from
     // `intern_call_descr_stub`; the lowered SSA `Operand` must
-    // structurally match what `emit_residual_call_shape` emits inline
+    // structurally match what the `build_*_residual_call_*_insn` family emits inline
     // (clone the stub value into a fresh `Rc<DescrOperand>`).
     if let Some(any) = descr_ref.as_any() {
         if let Some(stub) = any.downcast_ref::<CallDescrStub>() {
@@ -3648,7 +3648,7 @@ pub struct LoweringContext {
     /// `call_function_ex(callable, self_or_null, starargs, kwargs_or_null)`
     /// lowered to `residual_call_r_r(ConstInt(fn_idx), ListR([callable,
     /// self_or_null, starargs, kwargs_or_null]), Descr) → reg` via
-    /// [`lower_call_function_ex_hlop_to_insn`]; `bh_call_function_ex_fn`
+    /// the `"call_function_ex"` arm of [`lower_tuple_build_hlop_to_insn`]; `bh_call_function_ex_fn`
     /// unpacks `*`/`**` and dispatches (user code → `MayForce`).
     pub call_function_ex_fn_idx: u16,
     /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
@@ -3704,7 +3704,7 @@ pub struct LoweringContext {
     /// CALL_KW records `call_kw(callable, null_or_self, kwnames, arg0..
     /// argN-1)` lowered to `residual_call_r_r(ConstInt(fn_idx), ListR([
     /// callable, null_or_self, kwnames, args...]), Descr) → reg` via
-    /// [`lower_call_kw_hlop_to_insn`]; `bh_call_kw_<n>` resolves keyword
+    /// the `"call_kw"` arm of [`lower_tuple_build_hlop_to_insn`]; `bh_call_kw_<n>` resolves keyword
     /// args and dispatches (user code → `MayForce`).  A CALL_KW with
     /// nargs > 13 takes the `abort_permanent` branch and records no HLOp.
     pub call_kw_idx_by_nargs: [u16; 14],
@@ -3758,7 +3758,7 @@ fn binary_op_tag_for_opname(opname: &str) -> Option<i64> {
 /// to the equivalent post-rtype
 /// `residual_call_ir_r(ConstInt(fn_idx), ListR([lhs, rhs]),
 /// ConstInt(op_val), Descr) → reg` Insn.  The shape mirrors what
-/// `emit_residual_call_shape` produces inline at the BinaryOp
+/// `build_binary_op_residual_call_ir_r_insn` produces inline at the BinaryOp
 /// callsite (codewriter.rs's `Instruction::BinaryOp` arm) and what
 /// `record_residual_call_graph_op` records on the graph side
 /// (codewriter.rs).  Both shapes coexist on portal graphs
@@ -3853,7 +3853,7 @@ pub fn build_binary_op_residual_call_ir_r_insn(
 /// literal, the per-family `op_val` (or callee-arg integer), and
 /// the `CallFlavor` carried on the EffectInfo descr.
 ///
-/// Inline arg order produced by `emit_residual_call_shape`
+/// Inline arg order produced here
 /// (codewriter.rs) buckets each `CallArgInput` by `Kind`
 /// into per-kind lists then concatenates `[ConstInt(fn), ListI?,
 /// ListR?, ListF?, Descr]`.  For these families the call_args are
@@ -4530,7 +4530,7 @@ where
 /// [Reg(frame), Reg(callable), Reg(arg0), ..., Reg(arg_{N-1})]`,
 /// `args_f = []` → opname `residual_call_r_r` (kinds `"r"` +
 /// reskind `'r'`) with NO leading `ListI`
-/// (`emit_residual_call_shape` in codewriter.rs omits the
+/// (`build_residual_call_r_r_insn_from_operands` omits the
 /// per-kind list when `args_K` is empty).  The frame operand is the
 /// active portal red variable (`portal_frame_reg`), mirroring
 /// `bh_load_global_fn`'s frame-as-arg ABI.
@@ -5003,7 +5003,7 @@ pub fn build_box_int_fn_residual_call_ir_r_insn(
 /// when empty, so the trailing `Descr` slot stays in its canonical
 /// position.  No `ListF` (empty `args_f`).
 ///
-/// Inline arg order from `emit_residual_call_shape` for call-args
+/// Inline arg order produced here for call-args
 /// `[ConstInt(val)]`: `args_i = [ConstInt(val)]`, `args_r = []`,
 /// `args_f = []` → final SSARepr Insn `[ConstInt(fn_idx),
 ///                                       ListI([ConstInt(val)]),
@@ -5121,7 +5121,7 @@ pub fn build_build_slice_fn_residual_call_ir_r_insn(
 /// the equivalent post-rtype `residual_call_r_i(ConstInt(fn_idx),
 /// ListR([operand]), Descr) → reg` Insn.  `truth_fn` has signature
 /// `(ref) → int` (no Int `op_val` argument), so the lowered shape
-/// has no leading `ListI` — the inline `emit_residual_call_shape`
+/// has no leading `ListI` — the inline `build_truth_fn_residual_call_r_i_insn`
 /// in codewriter.rs's `Instruction::PopJumpIfFalse` arm with
 /// `args_i = []`, `args_r = [cond_reg]` produces `kinds = "r"` +
 /// `reskind = 'i'` →
@@ -5208,7 +5208,7 @@ pub fn build_truth_fn_residual_call_r_i_insn(
 /// `descroperation.py:265`.  ResKind = Int → kinds `"r"` + reskind
 /// `'i'` → opname `"residual_call_r_i"`.
 ///
-/// Inline arg order from `emit_residual_call_shape` with empty
+/// Inline arg order produced here with empty
 /// `args_i` and `args_f`: `[ConstInt(fn), ListR([cond]), Descr]`
 /// (no leading `ListI` because `args_i` is empty so the
 /// `kinds.contains('i')` push branch doesn't fire).
@@ -7426,7 +7426,7 @@ fn build_residual_call_r_v_insn_from_operands(
 /// Int) → Ref`, MayForce) — same opname `residual_call_ir_r` (kinds
 /// `ir` + reskind `r`) but different `arg_kinds` and flavor.
 ///
-/// Inline arg order from `emit_residual_call_shape` for call-args
+/// Inline arg order from `build_residual_call_ir_r_single_ref_plain_insn_from_operands` for call-args
 /// `[Reg(Ref, pycode), ConstInt(idx)]`: `args_i = [ConstInt(idx)]`,
 /// `args_r = [Reg(pycode)]`, `args_f = []` → final SSARepr Insn
 /// `[ConstInt(fn_idx), ListI([ConstInt(idx)]), ListR([Reg(pycode)]),
@@ -7487,7 +7487,7 @@ pub fn build_load_const_fn_residual_call_ir_r_insn_with_const_pycode(
 /// + reskind `r`) but the bucketed argument layout and Descr
 /// `arg_kinds` differ.
 ///
-/// Inline arg order from `emit_residual_call_shape`:
+/// Inline arg order produced here:
 ///   * `args_i = [ConstInt(idx)]`
 ///   * `args_r = [Reg(arg_operand)]`
 ///   * `args_f = []`
@@ -9363,12 +9363,12 @@ mod tests {
     fn lower_binary_op_hlop_to_insn_emits_residual_call_ir_r() {
         // Lowering an `add(lhs, rhs) → result`
         // HLOp must produce the same Insn shape that
-        // `emit_residual_call_shape` produces inline at the BINARY_OP
-        // callsite (codewriter.rs's `Instruction::BinaryOp` arm):
+        // `build_binary_op_residual_call_ir_r_insn` produces inline at the BINARY_OP
+        // callsite (`lower_binary_op_hlop_to_insn`'s residual-call arm):
         // `residual_call_ir_r`
         // with args `[ConstInt(fn_idx), ListI([ConstInt(op_val)]),
         // ListR([lhs, rhs]), Descr(CallDescrStub)] → reg`.
-        // (`emit_residual_call_shape` in codewriter.rs buckets
+        // (`build_residual_call_ir_r_insn_from_operands` buckets
         // each call-arg by `Kind` then concatenates lists in
         // `i,r,f` order, so the `ConstInt(op_val)` rides inside `ListI`
         // — not as a trailing standalone `ConstInt`.)
@@ -9572,7 +9572,7 @@ mod tests {
     fn lower_compare_op_hlop_to_insn_emits_residual_call_ir_r() {
         // Lowering an `lt(lhs, rhs) → result`
         // HLOp must produce the same Insn shape that
-        // `emit_residual_call_shape` produces inline at the
+        // `build_compare_op_residual_call_ir_r_insn` produces inline at the
         // CompareOp callsite (codewriter.rs's `Instruction::CompareOp` arm):
         // `residual_call_ir_r` with args `[ConstInt(fn_idx),
         // ListI([ConstInt(op_val)]), ListR([lhs, rhs]), Descr]`.
@@ -9710,14 +9710,14 @@ mod tests {
     fn lower_bool_hlop_to_insn_emits_residual_call_r_i() {
         // Lowering a `bool(operand) →
         // result` HLOp must produce the same Insn shape that
-        // `emit_residual_call_shape` produces inline at the
+        // `build_truth_fn_residual_call_r_i_insn` produces inline at the
         // PopJumpIfFalse / PopJumpIfTrue callsites
         // (codewriter.rs's `Instruction::PopJumpIfFalse` /
         // `Instruction::PopJumpIfTrue` arms): `residual_call_r_i`
         // with args `[ConstInt(fn_idx), ListR([cond]), Descr]` and a
         // Register(Int) result.  No `ListI` — `truth_fn` has no
         // scalar Int arg, so `args_i` is empty in
-        // `emit_residual_call_shape` and the `ListI` push branch
+        // `build_truth_fn_residual_call_r_i_insn` and the `ListI` push branch
         // doesn't fire.
         let cond = Variable::new(VariableId(0), Kind::Ref);
         let result = Variable::new(VariableId(1), Kind::Int);
@@ -9816,7 +9816,7 @@ mod tests {
         // value)` HLOp (no result — `emit_frontend_setitem` records
         // the SpaceOperation with `result = None` per
         // `emit_frontend_setitem` in codewriter.rs) must produce the same
-        // Insn shape that `emit_residual_call_shape` produces inline at the
+        // Insn shape that `build_store_subscr_fn_residual_call_r_v_insn` produces inline at the
         // StoreSubscr callsite (codewriter.rs's `Instruction::StoreSubscr`
         // arm):
         // `residual_call_r_v` with args `[ConstInt(fn_idx),
@@ -10188,7 +10188,7 @@ mod tests {
     fn build_load_const_fn_residual_call_ir_r_insn_emits_residual_call_ir_r() {
         // LoadConst factor refactor.  The
         // helper must produce the same `residual_call_ir_r` Insn shape
-        // that `emit_residual_call_shape` produced inline at
+        // that `build_load_const_fn_residual_call_ir_r_insn` produced inline at
         // codewriter.rs's `Instruction::LoadConst` arm before the
         // refactor: `[ConstInt(
         // fn_idx), ListI([ConstInt(idx)]), ListR([Reg(pycode)]),
@@ -10331,12 +10331,12 @@ mod tests {
         // `flatten_op_to_insn`.  This guarantees the factor refactor
         // in codewriter.rs's `Instruction::LoadConst` arm produces the same
         // SSARepr bytes
-        // `emit_residual_call_shape` would have produced before the
+        // `build_load_const_fn_residual_call_ir_r_insn` would have produced before the
         // refactor — no behavior change, only a more direct emit
         // path.
         //
         // Shape construction mirrors what the (now-removed) inline
-        // `emit_residual_call_shape` would have produced for call-args
+        // `build_load_const_fn_residual_call_ir_r_insn` would have produced for call-args
         // `[Reg(Ref, pycode), ConstInt(idx)]`: bucketed to `args_i =
         // [ConstInt(idx)]`, `args_r = [Reg(pycode)]` per the upstream
         // `i,r,f` order.
@@ -10377,7 +10377,7 @@ mod tests {
     fn build_load_global_fn_residual_call_ir_r_insn_emits_residual_call_ir_r() {
         // LoadGlobal factor refactor.  The
         // helper must produce the same `residual_call_ir_r` Insn shape
-        // that `emit_residual_call_shape` produced inline at
+        // that `build_load_global_fn_residual_call_ir_r_insn` produced inline at
         // codewriter.rs's `Instruction::LoadGlobal` arm before the
         // refactor: `[ConstInt(
         // fn_idx), ListI([ConstInt(namei)]), ListR([Reg(ns), Reg(
@@ -10607,7 +10607,7 @@ mod tests {
         // `flatten_op_to_insn`.  This guarantees the factor refactor
         // in codewriter.rs's `Instruction::LoadGlobal` arm produces the same
         // SSARepr bytes
-        // `emit_residual_call_shape` would have produced before the
+        // `build_load_global_fn_residual_call_ir_r_insn` would have produced before the
         // refactor — no behavior change, only a more direct emit
         // path.
         let ns_var = Variable::new(VariableId(3), Kind::Ref);
@@ -10707,7 +10707,7 @@ mod tests {
     fn build_call_fn_residual_call_r_r_insn_emits_residual_call_r_r_for_nargs_2() {
         // CALL family factor refactor.  The
         // helper must produce the same `residual_call_r_r` Insn shape
-        // that `emit_residual_call_shape` produced inline at
+        // that `build_call_fn_residual_call_r_r_insn` produced inline at
         // codewriter.rs's `Instruction::Call` arm before the refactor.
         // For nargs=2:
         // `[ConstInt(fn_idx), ListR([Reg(frame), Reg(callable),
@@ -10854,7 +10854,7 @@ mod tests {
         // production helper must match the Insn produced by feeding
         // the equivalent `residual_call_r_r` SpaceOperation through
         // `flatten_op_to_insn`.  Tested at nargs=3 (frame + callable
-        // + 3 args) — the inline `emit_residual_call_shape` produces
+        // + 3 args) — the inline `build_call_fn_residual_call_r_r_insn` produces
         // an Insn with ListR=[frame, callable, arg0, arg1, arg2], no
         // ListI.
         let frame = Variable::new(VariableId(4), Kind::Ref);
@@ -10905,7 +10905,7 @@ mod tests {
     fn build_box_int_fn_residual_call_ir_r_insn_emits_residual_call_ir_r() {
         // box_int_fn factor refactor.  The
         // helper must produce the same `residual_call_ir_r` Insn
-        // shape that `emit_residual_call_shape` produced inline at
+        // shape that `build_box_int_fn_residual_call_ir_r_insn` produced inline at
         // all 3 box_int_fn callsites (LoadSmallInt / UnaryNegative /
         // lasti): `[ConstInt(fn_idx), ListI([ConstInt(val)]),
         // ListR([]), Descr(CallDescrStub{Plain, [Int]})] →
@@ -10999,7 +10999,7 @@ mod tests {
         // production helper must match the Insn produced by feeding
         // the equivalent `residual_call_ir_r` SpaceOperation through
         // `flatten_op_to_insn`.  This guarantees the factor refactor
-        // produces the same SSARepr bytes `emit_residual_call_shape`
+        // produces the same SSARepr bytes `build_box_int_fn_residual_call_ir_r_insn`
         // would have produced before the refactor.
         let dst = Variable::new(VariableId(7), Kind::Ref);
         let descr = intern_call_descr_stub(

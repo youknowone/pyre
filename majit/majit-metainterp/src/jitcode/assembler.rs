@@ -2172,7 +2172,7 @@ impl JitCodeBuilder {
     /// `direct_call(ll_int_py_*)` before jitcode emission, so neither
     /// `bhimpl_*` nor the corresponding `int_(floordiv|mod)/ii>i` insns
     /// key exists upstream.  Pyre's β' redirect at
-    /// `majit-translate/src/codegen.rs::generated_binary_int_value`
+    /// `pyre-jit-trace/src/jitcode_dispatch/specialize.rs::walker_emit_int_py_div_or_mod`
     /// covers the runtime trace path.
     pub fn record_binop_i(&mut self, dst: u16, opcode: OpCode, lhs: u16, rhs: u16) {
         let key = match opcode {
@@ -2256,7 +2256,7 @@ impl JitCodeBuilder {
     /// RPython rewrites them to the `int.py_div` / `int.py_mod` oopspec
     /// residual call (`rint.py ll_int_py_div` / `ll_int_py_mod`,
     /// `EF_ELIDABLE_CANNOT_RAISE`). Mirrors the trace-path redirect at
-    /// `majit-translate/src/codegen.rs::generated_binary_int_value`.  The
+    /// `pyre-jit-trace/src/jitcode_dispatch/specialize.rs::walker_emit_int_py_div_or_mod`.  The
     /// `_ovf_zer` zero/overflow guards the trace path inlines have no
     /// jitcode `guard_false` analog here, so the helper carries the same
     /// precondition (`rhs != 0`, not `INT_MIN / -1`) as any non-traced caller.

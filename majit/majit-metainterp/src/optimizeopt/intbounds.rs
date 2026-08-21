@@ -113,7 +113,7 @@ impl OptIntBounds {
 
     /// operand variant of [`getintbound_box`]. optimizer.py:99
     /// `getintbound(self, op)` does `op = get_box_replacement(op)` then reads
-    /// the bound; this takes that resolve box-native via `resolve_box_box`,
+    /// the bound; this takes that resolve box-native via `resolve_operand_operand`,
     /// without collapsing the operand to an `OpRef` first.
     fn getintbound_arg(&self, arg: &Operand, ctx: &mut OptContext) -> IntBound {
         let b = ctx.resolve_operand_operand(arg);
@@ -1073,7 +1073,7 @@ impl OptIntBounds {
     /// call so the producing op of a now-constant value also gets a chance
     /// to tighten its other arguments.
     /// Reads the operand bound box-native through `getintbound_arg`
-    /// (→ `resolve_box_box`); the `as_operation` producer lookup
+    /// (→ `resolve_operand_operand`); the `as_operation` producer lookup
     /// (`find_producing_op`) now takes the box directly, resolving it through
     /// the `new_operations` position index (the legitimate
     /// `_emittedoperations` residual, #188-gated). The const-fold
@@ -1100,7 +1100,7 @@ impl OptIntBounds {
     ) {
         let arg0 = op.arg(0);
         // optimizer.py:99-113 `getintbound` lazy-installs unbounded; the
-        // dispatch-entry rebind registers the operand, so `resolve_box_box`
+        // dispatch-entry rebind registers the operand, so `resolve_operand_operand`
         // resolves to the bound host the is_raw_ptr read and the downstream
         // bound write both use.
         let arg0_box = self.resolve_box(&arg0, ctx);

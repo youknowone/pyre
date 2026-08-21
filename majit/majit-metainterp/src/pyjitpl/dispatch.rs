@@ -4957,7 +4957,7 @@ where
             // `jtransform.py:576-577` rewrites both via
             // `_do_builtin_call` to `direct_call(ll_int_py_div)` /
             // `direct_call(ll_int_py_mod)` before jitcode emission.
-            // Pyre's `codegen.rs::generated_binary_int_value` emits
+            // Pyre's `specialize.rs::walker_emit_int_py_div_or_mod` emits
             // the same residual call as a `CallI` op directly — no
             // `BC_INT_FLOORDIV` / `BC_INT_MOD` opcode is allocated, so
             // no dispatch arm exists.

@@ -1385,11 +1385,12 @@ fn dispatch_op(
         // `ll_int_py_div` / `ll_int_py_mod` (`rint.py:398/496`); the
         // bare opname never reaches the SSARepr emitter upstream.  In
         // pyre the runtime trace path goes through the β' redirect at
-        // `majit-translate/src/codegen.rs::generated_binary_int_value`,
-        // which emits `CallPureI(bhimpl_int_floordiv|bhimpl_int_mod)`
-        // with `INT_PY_DIV_EFFECT_INFO`/`INT_PY_MOD_EFFECT_INFO` plus
-        // the `int_eq(rhs, 0) -> guard_false` and `INT_MIN / -1`
-        // overflow guards from the `_ovf_zer` wrapper.
+        // `pyre-jit-trace/src/jitcode_dispatch/specialize.rs::walker_emit_int_py_div_or_mod`,
+        // which records `CallI` on `ll_int_py_div` / `ll_int_py_mod`
+        // through `call_typed_with_effect_pure` with
+        // `INT_PY_DIV_EFFECT_INFO`/`INT_PY_MOD_EFFECT_INFO`, preceded by
+        // `walker_emit_int_div_domain_guards`' zero and `INT_MIN / -1`
+        // `guard_false` pair from the `_ovf_zer` wrapper.
         // Per-OpCode opname dispatch for integer / float primitives —
         // RPython `rpython/jit/metainterp/blackhole.py:459-723` defines
         // one `bhimpl_*` per opname; `assembler.py:162-222` routes each
@@ -1564,9 +1565,9 @@ fn dispatch_op(
 }
 
 /// Consumer for the `residual_call_{kinds}_{reskind}` shape
-/// emitted by `codewriter::emit_residual_call_shape`.
+/// emitted by `flatten`'s `build_*_residual_call_*_insn` family.
 ///
-/// SSARepr arg layout (as produced by `emit_residual_call_shape`):
+/// SSARepr arg layout (as produced by those builders):
 /// ```text
 /// [Const(fn_idx),
 ///  ListOfKind(int,   [...])?,   # present iff 'i' in kinds

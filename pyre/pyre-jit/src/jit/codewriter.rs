@@ -2059,10 +2059,11 @@ fn vable_getfield_ref_graph_args(
 }
 
 /// Emit a graph-side `residual_call_{kinds}_{reskind}` SpaceOperation
-/// mirroring the SSA shape produced by [`emit_residual_call_shape`].
+/// mirroring the SSARepr shape built by the
+/// `super::flatten::build_*_residual_call_*_insn` family.
 ///
 /// Args follow the same kinds-string selection logic as the SSA emit
-/// (`emit_residual_call_shape`):
+/// (those builders):
 ///   - opname suffix `kinds` ∈ `{"r", "ir", "irf"}` chosen by which arg
 ///     kinds are present + whether `reskind == ResKind::Float`;
 ///   - argv `[Const(fn_idx), ListI?, ListR?, ListF?, Descr(stub)]`,
