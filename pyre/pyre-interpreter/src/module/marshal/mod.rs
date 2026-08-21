@@ -824,11 +824,12 @@ impl wire::MarshalBag for PyreMarshalBag {
     /// `make_code_with_constants`, which is what `read_code_consts` does for
     /// `code.replace(co_consts=...)`.
     fn code_constant_from_value(&self, value: &Rooted) -> Result<ConstantData, wire::MarshalError> {
-        // PyPy's unmarshaller installs the already-decoded nested PyCode
-        // directly in `co_consts_w` (`marshal_impl.py:426-459`). The compiler
-        // table is only pyre's bytecode-index shape here: using `None` makes
-        // `w_code_fill_wrapped_consts` retain that exact wrapped child instead
-        // of recursively cloning its entire compiler body into a second owner.
+        // `unmarshal_pycode` hands its decoded constants straight to
+        // `PyCode.__init__`, whose `co_consts_w` is the only constants table
+        // upstream keeps. Serializing the child back into pyre's second,
+        // compiler-level table copies its whole body into a second permanent
+        // owner; `None` is the arm `is_wrapped_constant` always stores, so the
+        // already-decoded wrapper stays this slot's authority instead.
         if unsafe { crate::pycode::is_code(value.get()) } {
             return Ok(ConstantData::None);
         }

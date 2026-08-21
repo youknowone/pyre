@@ -400,10 +400,9 @@ impl RootScope {
     pub fn normalize(&self, base: usize, len: usize) {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
-        // Same fast path as `normalize_roots`: RPython has one active mutator
-        // under the GIL, so no root can become a forwarding stub between its
-        // publication and the allocation bracket. Only pyre's second-mutator
-        // extension needs the current-address queries below.
+        // Same guard as `normalize_roots`: RPython has one active mutator under
+        // the GIL, so no root becomes a forwarding stub between its publication
+        // and the allocation bracket.
         if !majit_gc::gc_sync::foreign_mutator_seen() {
             return;
         }
@@ -433,8 +432,9 @@ impl RootScope {
         // another thread's collection.
         // SAFETY: same cell; `slot` bounds-checks `index`.
         unsafe { *(*self.stack_slot).slot(index) = root };
-        // Keep the scope-local spelling in lockstep with `shadow_stack_set`:
-        // PyPy's single-mutator root write is complete at the store above.
+        // Same guard as `shadow_stack_set`, after the raw publish: RPython has
+        // one active mutator under the GIL, so the value just published cannot
+        // have been forwarded between the caller's copy and this write.
         if !majit_gc::gc_sync::foreign_mutator_seen() {
             return;
         }

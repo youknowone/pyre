@@ -755,12 +755,10 @@ impl RootSet {
             self.roots.pop();
             return;
         }
-        // shadowstack.py:80-106 advances one `root_stack_top` on push and
-        // decrements that same top before pop: duplicate roots are therefore
-        // retired newest-first.  The same slot can be registered by nested
-        // host brackets, so the out-of-order fallback must preserve that
-        // order too. Searching from the front leaves the newest duplicate in
-        // place and turns the following, otherwise-LIFO removals into scans.
+        // `shadowstack.py` has no by-value removal: `push_stack`/`pop_stack`
+        // move one `root_stack_top`, so the newest registration is the one
+        // retired.  Either copy leaves the same roots here, but taking the
+        // front one breaks that shape and rescans on every following removal.
         if let Some(pos) = self.roots.iter().rposition(|r| *r == root) {
             self.roots.swap_remove(pos);
         }
