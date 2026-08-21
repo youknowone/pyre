@@ -1546,6 +1546,17 @@ fn install_state_field_fvc(data: &StateFieldFvcData) {
     });
 }
 
+/// The identity slots `base .. base + count` of a blackhole register bank,
+/// clamped to what the bank actually holds.
+///
+/// A frame whose jitcode declares fewer registers than the layout describes is
+/// not a frame the state can have been written through, so a clamped-empty span
+/// compares equal and says so.
+fn bank_span(bank_len: usize, base: usize, count: usize) -> std::ops::Range<usize> {
+    let start = base.min(bank_len);
+    start..(start + count).min(bank_len)
+}
+
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
@@ -5232,14 +5243,30 @@ impl<S: JitState> JitDriver<S> {
                     // (resume.py:1028-1038 seeded it in slot order) and resume
                     // at the CRN green pc.
                     let mut cur_exc = exc;
-                    // Where the guard's resume coordinate sits, against which
-                    // the merge point the walk stops at is compared below.
-                    // `set_position` seeds `last_opcode_position` with it, and
-                    // `run_inner` overwrites that per dispatched op, so the two
-                    // stay equal exactly when the first op the blackhole
-                    // dispatches is the one that raises CRN.
-                    let bh_start_position = bh.position;
                     let mut bh_frames_popped = 0usize;
+                    bh.called_residual.set(false);
+                    // The state fields as the walk found them: the identity
+                    // slots of each bank, which for the int bank is the scalars
+                    // and every array element both.
+                    let bh_sf = state.state_field_layout();
+                    let sf_i = bank_span(
+                        bh.registers_i.len(),
+                        bh_sf.int_scalar_base,
+                        bh_sf.total_slots(),
+                    );
+                    let sf_r = bank_span(
+                        bh.registers_r.len(),
+                        bh_sf.ref_scalar_base,
+                        bh_sf.num_ref_scalars,
+                    );
+                    let sf_f = bank_span(
+                        bh.registers_f.len(),
+                        bh_sf.float_scalar_base,
+                        bh_sf.num_float_scalars,
+                    );
+                    let sf_before_i = bh.registers_i[sf_i.clone()].to_vec();
+                    let sf_before_r = bh.registers_r[sf_r.clone()].to_vec();
+                    let sf_before_f = bh.registers_f[sf_f.clone()].to_vec();
                     let outcome = loop {
                         match bh.resume_mainloop(cur_exc) {
                             Ok(next_exc) => match bh.nextblackholeinterp.take() {
@@ -5263,26 +5290,38 @@ impl<S: JitState> JitDriver<S> {
                     if crate::majit_log_enabled() {
                         eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                     }
-                    // Whether the guard failed AT the merge point rather than
-                    // partway through the opcode that reaches it.
+                    // Whether the guard may source a bridge.
                     //
                     // A bridge is entered from the guard, and it is recorded
                     // from the green pc the walk below reports — the NEXT merge
-                    // point. Everything the blackhole ran to get there is work
-                    // the guard's own opcode still owed, and a bridge that
-                    // starts after it does not contain it: the first failure
-                    // runs it here and every later one jumps into the bridge
-                    // and skips it. A `chain_push` behind a red condition, an
-                    // eviction, a store — each simply stops happening, and
-                    // nothing reports it, because the guard, the recovery
-                    // layout and this resume are all correct.
+                    // point. Everything the walk ran to get there is the tail of
+                    // the opcode the guard sits inside, and the bridge does not
+                    // contain it: the first failure runs it here and every later
+                    // one jumps into the bridge and skips it.
                     //
-                    // The walk stopping on the very op it started on is what
-                    // says the opcode owed nothing, and only then may the guard
-                    // source a bridge. A walk that crossed a frame boundary
-                    // cannot be judged by one frame's coordinate, so it is not.
-                    let guard_at_merge_point =
-                        bh_frames_popped == 0 && bh.last_opcode_position == bh_start_position;
+                    // Values the tail computed are not the problem. The bridge
+                    // is recorded against the state the walk LEFT, so whatever
+                    // the tail derived it derives again. Two things do not come
+                    // back that way:
+                    //
+                    //   * a residual call, which left the interpreter once and
+                    //     is not a value the bridge can recompute, and
+                    //   * a state field the tail wrote, because the bridge is
+                    //     ENTERED with the guard's failargs, which hold the
+                    //     value from before the tail ran.
+                    //
+                    // Neither announces itself: the guard, the recovery layout
+                    // and this resume are all correct, and the loop keeps
+                    // running. Only a count of how often the opcode's tail
+                    // actually happened records it.
+                    //
+                    // A walk that crossed a frame boundary is not judged by one
+                    // frame's registers, so it does not qualify.
+                    let tail_wrote_state = bh.registers_i[sf_i] != sf_before_i[..]
+                        || bh.registers_r[sf_r] != sf_before_r[..]
+                        || bh.registers_f[sf_f] != sf_before_f[..];
+                    let guard_may_bridge =
+                        bh_frames_popped == 0 && !bh.called_residual.get() && !tail_wrote_state;
                     let mut portal_crn_handled = false;
                     let resume_pc = match outcome {
                         // Next merge point reached (loop back-edge): flush the
@@ -5442,7 +5481,7 @@ impl<S: JitState> JitDriver<S> {
                         // already recovered `state` to the resume point, so the
                         // bridge sees the post-guard-failure values.
                         if should_bridge
-                            && guard_at_merge_point
+                            && guard_may_bridge
                             && !portal_crn_handled
                             && pc != usize::MAX
                         {

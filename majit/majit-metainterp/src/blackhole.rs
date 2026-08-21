@@ -243,6 +243,16 @@ pub struct BlackholeInterpreter {
     /// Unlike `aborted`, this indicates a Python-level exception that
     /// should propagate up the blackhole chain, not a JIT infrastructure error.
     pub got_exception: bool,
+    /// Set when this frame made a residual call.
+    ///
+    /// A guard's bridge is recorded from the merge point the resume walk stops
+    /// at, so everything the walk ran to get there is work the bridge does not
+    /// contain and will skip on every later failure. Values are safe — the
+    /// bridge re-derives them from the state the walk left behind — but a call
+    /// out of the interpreter is not: it happened once, here, and never again.
+    /// `back_edge_internal` reads this to decide whether the guard may source a
+    /// bridge at all.
+    pub called_residual: std::cell::Cell<bool>,
     /// Position of the last dispatched opcode (before position advances past operands).
     /// Used by handle_exception_in_frame for handler lookup — the faulting instruction
     /// PC, not the next instruction PC. Public so caller-chain propagation in
@@ -408,6 +418,7 @@ impl Default for BlackholeInterpreter {
             aborted: false,
             abort_permanent_bail: false,
             got_exception: false,
+            called_residual: std::cell::Cell::new(false),
             last_opcode_position: 0,
             entry_position: 0,
             exception_last_value: 0,
@@ -1762,6 +1773,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(func, None, Some(args_r), None, calldescr)
     }
@@ -1773,6 +1785,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(func, None, Some(args_r), None, calldescr)
     }
@@ -1784,6 +1797,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(func, None, Some(args_r), None, calldescr);
     }
@@ -1796,6 +1810,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(func, Some(args_i), Some(args_r), None, calldescr)
     }
@@ -1808,6 +1823,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(func, Some(args_i), Some(args_r), None, calldescr)
     }
@@ -1820,6 +1836,7 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(func, Some(args_i), Some(args_r), None, calldescr);
     }
@@ -1833,6 +1850,7 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
@@ -1846,6 +1864,7 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
@@ -1859,6 +1878,7 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_f(func, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
@@ -1872,6 +1892,7 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(func, Some(args_i), Some(args_r), Some(args_f), calldescr);
     }
