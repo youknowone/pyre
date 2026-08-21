@@ -727,10 +727,8 @@ pub fn opcode_swap<H: StackOpcodeHandler + ?Sized>(
 
 pub fn opcode_get_iter<H: IterOpcodeHandler + ?Sized>(handler: &mut H) -> Result<(), PyError> {
     let iterable = handler.pop_value()?;
-    // A user-defined `__iter__` allocates, so the push goes through the anchor.
-    let anchor = handler.anchor();
     let iterator = handler.iter_value(iterable)?;
-    H::push_anchored(&anchor, iterator)
+    handler.push_value(iterator)
 }
 
 pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>(
@@ -1168,13 +1166,10 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         Self: SharedOpcodeHandler + NamespaceOpcodeHandler,
     {
         let obj = self.pop_value()?;
-        // The lookup runs descriptor code, so it can allocate and relocate a
-        // moving frame; both pushes go through the anchor.
-        let anchor = self.anchor();
         let attr = SharedOpcodeHandler::load_special_attr(self, obj, name)?;
-        Self::push_anchored(&anchor, attr)?;
+        self.push_value(attr)?;
         let null = self.null_value()?;
-        Self::push_anchored(&anchor, null)
+        self.push_value(null)
     }
 
     fn store_attr(&mut self, name: &str) -> Result<(), PyError>

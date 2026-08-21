@@ -3171,12 +3171,33 @@ impl PyFrame {
 
     // ── Stack operations ──────────────────────────────────────────────
 
+    /// Reload `self` the way RPython's GC transform reloads every livevar from
+    /// the shadow stack after a safepoint.
+    ///
+    /// pyre has no such pass — `gc_current_object_address` calls that gap a
+    /// documented TODO — so a `&mut PyFrame` held across an allocating call
+    /// names the abandoned nursery copy once a minor collection relocates a
+    /// JIT-created frame. Following the forwarding stub here is what lets the
+    /// opcode bodies keep the `pop; op; push` shape `pyopcode.py` uses instead
+    /// of each call site carrying an anchor of its own.
+    ///
+    /// Cheap on the common path: a nursery range compare, and the header read
+    /// only for an address the nursery owns.
+    #[inline]
+    fn live_mut(&mut self) -> &mut Self {
+        let addr = self as *mut Self as *mut u8;
+        unsafe { &mut *(pyre_object::gc_hook::try_gc_current_object_address(addr) as *mut Self) }
+    }
+
     #[inline]
     pub fn push(&mut self, value: PyObjectRef) {
-        self.assert_stack_index(self.valuestackdepth);
-        let idx = self.valuestackdepth;
-        self.set_locals_w(idx, value);
-        self.valuestackdepth += 1;
+        // Both writes below — the stack slot and the depth — have to land on
+        // the live frame, so reload once and use it for both.
+        let frame = self.live_mut();
+        frame.assert_stack_index(frame.valuestackdepth);
+        let idx = frame.valuestackdepth;
+        frame.set_locals_w(idx, value);
+        frame.valuestackdepth = idx + 1;
     }
 
     #[inline]
