@@ -30,11 +30,31 @@ fn simple_weak_set_type() -> PyObjectRef {
         .expect("_abc.SimpleWeakSet must be installed at module init") as PyObjectRef
 }
 
-/// The `__contains__` `app_abc.py` defines, stashed beside its type.  The
-/// class is an ordinary heap type, so the method is rebindable, and answering
-/// natively is only sound while the one installed here is still the one a
-/// membership test would reach.
-static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// The `__contains__` `app_abc.py` defines and the code object it was defined
+/// with, stashed beside its type.  The class is an ordinary heap type, so the
+/// method is rebindable and the function it holds is mutable in place;
+/// answering natively is only sound while the body a membership test would
+/// reach is still the one written in `app_abc.py`.
+///
+/// The pair is what a rebind and a `__code__` assignment respectively move.  A
+/// function has further mutable state that neither covers — its globals, its
+/// defaults — so this narrows the native answer to the untouched collection
+/// rather than proving the app-level body could not have been redirected.
+static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+/// The installed `__contains__` and the code object it currently holds, as the
+/// pair [`SIMPLE_WEAK_SET_CONTAINS`] stores.  A missing method reads as
+/// `(0, 0)`, which no stash can equal.
+fn simple_weak_set_contains_identity() -> (usize, usize) {
+    let Some(method) =
+        (unsafe { crate::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__") })
+    else {
+        return (0, 0);
+    };
+    (method as usize, unsafe {
+        crate::function_get_code(method) as usize
+    })
+}
 
 /// `SimpleWeakSet()` — the empty collection `_abc_init` installs and the
 /// invalidation in `subclass_of` rebinds to.
@@ -82,12 +102,13 @@ fn simple_weak_set_contains(
         return Ok(None);
     }
     // The receiver being that class is not enough: rebinding the class's own
-    // `__contains__` leaves every instance an exact `SimpleWeakSet` while
-    // changing what a membership test answers.
-    let installed = SIMPLE_WEAK_SET_CONTAINS.get().copied().unwrap_or(0);
-    let current =
-        unsafe { crate::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__") };
-    if installed == 0 || current.map_or(0, |m| m as usize) != installed {
+    // `__contains__`, or assigning that function a different `__code__`, leaves
+    // every instance an exact `SimpleWeakSet` while changing what a membership
+    // test answers.
+    let Some(&installed) = SIMPLE_WEAK_SET_CONTAINS.get() else {
+        return Ok(None);
+    };
+    if simple_weak_set_contains_identity() != installed {
         return Ok(None);
     }
     let roots = pyre_object::gc_roots::push_roots();
@@ -132,8 +153,9 @@ fn simple_weak_set_contains(
         // raises arrives here.  Recover that exception rather than declining:
         // the protocol would build a second probe and run the same observable
         // `__hash__` again before raising, and the expression it stands in for
-        // runs it once.
-        Err(_) => Err(crate::baseobjspace::take_pending_dict_key_error(
+        // runs it once.  `wr in self.data` is a set membership test, so the
+        // recovered error names a set element.
+        Err(_) => Err(crate::baseobjspace::take_pending_set_element_error(
             roots.get(probe_slot),
         )),
     }
@@ -681,10 +703,9 @@ crate::py_module! {
         let simple_weak_set = crate::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
-        if let Some(contains) =
-            unsafe { crate::baseobjspace::lookup_in_type(simple_weak_set, "__contains__") }
-        {
-            let _ = SIMPLE_WEAK_SET_CONTAINS.set(contains as usize);
+        let installed = simple_weak_set_contains_identity();
+        if installed != (0, 0) {
+            let _ = SIMPLE_WEAK_SET_CONTAINS.set(installed);
         }
     },
 }

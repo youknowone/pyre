@@ -7330,13 +7330,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     )? {
                         return Ok(inlined);
                     }
-                    // CONTAINS_OP rides the same residual under tags 6 / 7,
-                    // which the rich-compare route above does not name.
-                    if let Some(inlined) = try_walker_inline_user_contains(
-                        ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
-                    )? {
-                        return Ok(inlined);
-                    }
                 }
             }
         }

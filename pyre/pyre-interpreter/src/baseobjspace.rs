@@ -126,6 +126,27 @@ pub fn clear_method_cache() {
 /// through unchanged.
 #[majit_macros::dont_look_inside]
 pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
+    take_pending_hash_error_for(key, wrap_dict_key_hash_error)
+}
+
+/// The set-element counterpart, for a caller that reached the shared hash
+/// table through a set.  The two containers name the operand differently in
+/// the message they raise, so a set caller taking the dict recovery reports a
+/// dict key for an element that never was one.
+#[majit_macros::dont_look_inside]
+pub fn take_pending_set_element_error(item: PyObjectRef) -> PyError {
+    take_pending_hash_error_for(item, wrap_set_element_hash_error)
+}
+
+/// Recover the exception a failed hash left pending and give it the calling
+/// container's context.  [`take_pending_hash_error`] is the same recovery
+/// without the context, for a caller with no operand to name.  An error from
+/// anywhere but the hash is returned as raised: only hashing is what the
+/// wrappers describe.
+fn take_pending_hash_error_for(
+    subject: PyObjectRef,
+    wrap: fn(PyObjectRef, PyError) -> PyError,
+) -> PyError {
     let from_hash = PENDING_ERROR_FROM_HASH.with(|cell| cell.replace(false));
     let err = PENDING_HASH_ERROR.with(|cell| {
         cell.take()
@@ -134,7 +155,7 @@ pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
     if !from_hash {
         return err;
     }
-    wrap_dict_key_hash_error(key, err)
+    wrap(subject, err)
 }
 
 /// The direct-hash counterpart of [`take_pending_dict_key_error`], used by

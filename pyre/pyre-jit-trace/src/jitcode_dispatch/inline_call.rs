@@ -3104,7 +3104,6 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         constructor_result,
         None,
         false,
-        false,
         None,
     )
 }
@@ -3157,7 +3156,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     constructor_result: Option<(OpRef, ConcreteValue)>,
     intermediate_result: Option<&mut Option<(OpRef, ConcreteValue)>>,
     require_exact_int_result: bool,
-    require_bool_result: bool,
     instance_next_foriter_green_key: Option<u64>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
@@ -5407,34 +5405,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     );
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
-                if require_bool_result
-                    && !matches!(
-                        concrete_for_shadow,
-                        ConcreteValue::Ref(obj)
-                            if std::ptr::eq(obj, pyre_object::w_bool_from(true))
-                                || std::ptr::eq(obj, pyre_object::w_bool_from(false))
-                    )
-                {
-                    // The membership-shaped routes reduce `space.is_true` to a
-                    // pointer test against `w_True`, which holds only for the two
-                    // singletons; anything else needs the `__bool__` / `__len__`
-                    // dispatch they cannot emit, so the call goes back to its
-                    // residual.  The body has already run at this point, so latch
-                    // the caller's CALL boundary first — returning the error
-                    // unlatched replays the loop from entry and runs the body a
-                    // second time.
-                    latch_abort_call_resume(
-                        code,
-                        op,
-                        ctx,
-                        call_descr,
-                        is_top_inline,
-                        unjournaled_before_subwalk,
-                        executed_effects_before,
-                        abort_flush_call_jitcode_coord,
-                    );
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
-                }
                 if require_exact_int_result
                     && !matches!(
                         concrete_for_shadow,
@@ -6906,7 +6876,6 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         Some(&mut result),
         true,
-        false,
         None,
     )?;
     match (inlined, result) {
@@ -7151,7 +7120,6 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         false,
         None,
         None,
-        false,
         false,
         Some(foriter_green_key),
     );
@@ -7553,254 +7521,6 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
             walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardFalse, &[is_not_implemented])?;
         }
     }
-    Ok(Some(inlined))
-}
-
-/// Run an effect-free straight-line dunder once, before any IR is emitted, and
-/// report whether it answered with one of the two `bool` singletons.
-///
-/// The two membership-shaped routes reduce `space.is_true` to a pointer test
-/// against `w_True`, which only holds for those singletons.  Sampling first is
-/// what lets a body that answers otherwise decline with nothing recorded to
-/// undo; `try_walker_inline_exception_string_override` samples its own override
-/// the same way, under the same `exc_override_sample_safe` gate.
-fn walker_sampled_result_is_bool(
-    method: pyre_object::PyObjectRef,
-    args: &[pyre_object::PyObjectRef],
-) -> bool {
-    let sampled = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_function_impl_result(method, args)
-    };
-    matches!(sampled, Ok(result)
-        if std::ptr::eq(result, pyre_object::w_bool_from(true))
-            || std::ptr::eq(result, pyre_object::w_bool_from(false)))
-}
-
-/// Inline a plain Python `__contains__` after the compare specializations
-/// decline.
-///
-/// `CONTAINS_OP` reaches the walker through the same `compare_fn` residual as
-/// the six rich comparisons — tag 6 is `in`, tag 7 is `not in`, and the
-/// operands are lowered `[item, container]` — but `compare_op_from_tag` names
-/// only tags 0-5, so [`try_walker_inline_user_compareop`] declines both and a
-/// membership test stays opaque even when the container's `__contains__` is
-/// ordinary Python code.
-///
-/// This is the walker counterpart of the instance arm of
-/// `baseobjspace::contains_slot` (`descroperation.py contains_w`): look
-/// `__contains__` up on the receiver's class, call it with the needle, then
-/// apply `space.is_true` to what came back.  Only an instance receiver is
-/// admitted, which is the one arm that reaches a Python body — the builtin
-/// containers answer membership by layout further up `contains_slot` and never
-/// consult a Python `__contains__`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_inline_user_contains<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op: &DecodedOp,
-    code: &[u8],
-    op_tag: i64,
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 2 {
-        return Ok(None);
-    }
-    let negate = match op_tag {
-        6 => false,
-        7 => true,
-        _ => return Ok(None),
-    };
-
-    let needle = r_args[0];
-    let haystack = r_args[1];
-    let Some(concrete_needle) = walker_concrete_ref_object(ctx, needle) else {
-        return Ok(None);
-    };
-    let Some(concrete_haystack) = walker_concrete_ref_object(ctx, haystack) else {
-        return Ok(None);
-    };
-    // A tagged immediate has no heap header to pin, and its membership is not
-    // a Python body.  Inert behind `CAN_BE_TAGGED` (default false).
-    if pyre_object::tagged_int::CAN_BE_TAGGED
-        && (pyre_object::tagged_int::is_tagged_int(concrete_needle)
-            || pyre_object::tagged_int::is_tagged_int(concrete_haystack))
-    {
-        return Ok(None);
-    }
-    if !unsafe { pyre_object::is_instance(concrete_haystack) } {
-        return Ok(None);
-    }
-    let w_class = unsafe { pyre_object::w_instance_get_type(concrete_haystack) };
-    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
-        return Ok(None);
-    }
-    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
-    if version_tag == 0 {
-        return Ok(None);
-    }
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__contains__") })
-    else {
-        return Ok(None);
-    };
-    // `__contains__ = None` blocks both the slot and the iterator fallback and
-    // raises; leave that to the residual.
-    if unsafe { pyre_object::is_none(method) } {
-        return Ok(None);
-    }
-    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
-        return Ok(None);
-    };
-    if nparams != 2 {
-        return Ok(None);
-    }
-
-    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
-        return Ok(None);
-    };
-    // The same admission the `hash` and `str`/`repr` builtin routes take.  A
-    // body that can leave the walk other than by returning — a raise above all —
-    // has already entered its frame when that becomes known, and neither the
-    // decline nor the latched abort can undo a frame entry.
-    if !body_facts.exc_override_straight_line {
-        return Ok(None);
-    }
-    if body_facts.exc_override_sample_safe
-        && !walker_sampled_result_is_bool(method, &[concrete_haystack, concrete_needle])
-    {
-        return Ok(None);
-    }
-
-    let arg_concretes = vec![
-        ConcreteValue::Ref(method),
-        ConcreteValue::Null,
-        ConcreteValue::Ref(concrete_haystack),
-        ConcreteValue::Ref(concrete_needle),
-    ];
-    let method_const = ctx.trace_ctx.const_ref(method as i64);
-    // The needle's class carries no dispatch decision here — unlike a
-    // rich-compare rhs, whose type decides reflected-dunder priority — so it is
-    // left unpinned and the callee body guards whatever it actually reads.
-    let Some(inlined) = try_walker_inline_resolved_user_call_inner(
-        ctx,
-        op,
-        code,
-        method_const,
-        r_args,
-        call_descr,
-        'r',
-        dst,
-        method,
-        method_const,
-        method,
-        arg_concretes,
-        vec![haystack, needle],
-        vec![
-            ConcreteValue::Ref(concrete_haystack),
-            ConcreteValue::Ref(concrete_needle),
-        ],
-        true,
-        None,
-        w_code,
-        nparams,
-        has_closure,
-        Some((haystack, concrete_haystack, w_class, version_tag)),
-        None,
-        false,
-        false,
-        None,
-        None,
-        false,
-        // A body answering with anything but a `bool` singleton has already run
-        // by the time this is known, so the check belongs inside, where the
-        // caller's CALL boundary can be latched before the abort.
-        true,
-        None,
-    )?
-    else {
-        if fbw_inline_diag_enabled() {
-            eprintln!(
-                "[contains-inline-decline] pc={} why=callee inline of {}.__contains__ declined",
-                op.pc,
-                unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
-            );
-        }
-        return Ok(None);
-    };
-    if !matches!(inlined.0, DispatchOutcome::Continue) {
-        return Ok(Some(inlined));
-    }
-
-    // `contains_slot` ends in `space.is_true(result)`, and `CONTAINS_OP` wraps
-    // that back up with `w_bool_from`.  Pinning the returned object to the
-    // `bool` layout collapses both to a pointer test against `w_True`, and for
-    // `in` the wrap is then the identity: the object the body returned already
-    // IS the singleton the opcode produces.
-    // `require_bool_result` above already rejected anything that is not one of
-    // the two singletons, and it did so where the CALL boundary can still be
-    // latched.  Both arms below are therefore unreachable on this path; they
-    // stay as the shape's classification, and abort rather than guess if a
-    // future change relaxes that check — an unlatched abort is the weaker
-    // disposition, so the assertion is what keeps it from becoming live.
-    let result = ctx.registers_r[dst];
-    let w_true = pyre_object::w_bool_from(true);
-    let observed = match concrete_from_recorded_opref(ctx, result) {
-        ConcreteValue::Ref(observed) => observed,
-        _ => {
-            debug_assert!(false, "require_bool_result admitted a non-Ref result");
-            return Err(DispatchError::callee_inline_unsupported(op.pc));
-        }
-    };
-    let found = if std::ptr::eq(observed, w_true) {
-        true
-    } else if std::ptr::eq(observed, pyre_object::w_bool_from(false)) {
-        false
-    } else {
-        // Anything else needs the `__bool__` / `__len__` dispatch this route
-        // cannot emit.
-        if fbw_inline_diag_enabled() {
-            eprintln!("[contains-inline-nonbool] pc={} class={}", op.pc, unsafe {
-                pyre_object::typeobject::w_type_get_name(w_class)
-            });
-        }
-        debug_assert!(false, "require_bool_result admitted a non-singleton result");
-        return Err(DispatchError::callee_inline_unsupported(op.pc));
-    };
-
-    if !result.is_constant() {
-        let bool_type = unsafe { (*(w_true as *const pyre_object::pyobject::PyObject)).ob_type }
-            as usize as i64;
-        if !ctx.trace_ctx.heap_cache().is_class_known(result) {
-            let bool_type_const = ctx.trace_ctx.const_int(bool_type);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[result, bool_type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(result, bool_type);
-        }
-    }
-    let true_const = ctx.trace_ctx.const_ref(w_true as i64);
-    let cmp = if negate { OpCode::PtrNe } else { OpCode::PtrEq };
-    let truth = ctx.trace_ctx.record_op(cmp, &[result, true_const]);
-    let value = found != negate;
-    ctx.trace_ctx
-        .set_opref_concrete(truth, majit_ir::Value::Int(value as i64));
-    let boxed = if negate {
-        let boxed = crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
-        ctx.trace_ctx.set_opref_concrete(
-            boxed,
-            majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::w_bool_from(value) as usize)),
-        );
-        boxed
-    } else {
-        result
-    };
-    bool_box_truth_record(boxed, truth);
-    write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
     Ok(Some(inlined))
 }
 

@@ -107,6 +107,36 @@ def a_raising_hash_runs_once():
     assert len(calls) == 1, 'hash ran %d times' % (len(calls),)
 
 
+def a_raising_hash_names_a_set_element():
+    class Unhashable(ABCMeta):
+        __hash__ = None
+
+    class Warm(metaclass=ABCMeta):
+        pass
+
+    class Member(Warm):
+        pass
+
+    class Refuses(metaclass=Unhashable):
+        pass
+
+    class Claims:
+        __class__ = Refuses
+
+    # A populated collection, so the probe is really built and really hashed.
+    assert isinstance(Member(), Warm) is True
+    try:
+        isinstance(Claims(), Warm)
+    except TypeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError('an unhashable class was accepted')
+    # The collection is a set and the failure names the operand as one.  The
+    # dict spelling of the same recovery renames it, which is what a reader of
+    # the message sees.
+    assert 'as a set element' in message, message
+
+
 def a_collected_entry_stops_matching():
     class Held(metaclass=ABCMeta):
         pass
@@ -176,12 +206,39 @@ def a_data_subclass_keeps_its_override():
     assert isinstance(Plain(), Shadowed) is True, 'a data subclass was read past'
 
 
+def a_mutated_contains_body_is_consulted():
+    class Mutated(metaclass=ABCMeta):
+        pass
+
+    class Impl(Mutated):
+        pass
+
+    assert isinstance(Impl(), Mutated) is True
+
+    collection = type(Mutated._abc_cache)
+    original = collection.__contains__.__code__
+
+    def claims_everything(self, item):
+        return True
+
+    # Assigning `__code__` leaves the same function installed on the same
+    # class, so an identity test over the method alone still matches while the
+    # body it runs no longer does.
+    collection.__contains__.__code__ = claims_everything.__code__
+    try:
+        assert isinstance(Plain(), Mutated) is True, 'the mutated body was read past'
+    finally:
+        collection.__contains__.__code__ = original
+
+
 empty_collection_answers_then_fills()
 unweakreferenceable_class_reaches_the_subclass_check()
 a_raising_hash_runs_once()
+a_raising_hash_names_a_set_element()
 a_collected_entry_stops_matching()
 if hasattr(ABCMeta('_Probe', (), {}), '_abc_cache'):
     rebound_collection_is_consulted()
     replaced_data_is_consulted()
     a_data_subclass_keeps_its_override()
+    a_mutated_contains_body_is_consulted()
 print('OK')
