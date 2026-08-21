@@ -56,6 +56,24 @@ pub struct W_BytesObject {
     pub w_weakreflifeline: PyObjectRef,
 }
 
+/// `W_BytesObject.data` — the pointer to the heap-allocated byte buffer.
+pub const BYTES_DATA_OFFSET: usize = std::mem::offset_of!(W_BytesObject, data);
+
+/// `W_BytesObject.len` — the byte count, the analogue of the `strlen` PyPy
+/// reads off `W_BytesObject._value`.
+pub const BYTES_LEN_OFFSET: usize = std::mem::offset_of!(W_BytesObject, len);
+
+/// `W_BytesObject.ctypes_keepalive_refs`.
+pub const BYTES_CTYPES_KEEPALIVE_REFS_OFFSET: usize =
+    std::mem::offset_of!(W_BytesObject, ctypes_keepalive_refs);
+
+/// `W_BytesObject.w_dict` — mapdict's per-instance dict SPECIAL slot.
+pub const BYTES_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BytesObject, w_dict);
+
+/// `W_BytesObject.w_weakreflifeline` — mapdict's per-instance weakref slot.
+pub const BYTES_W_WEAKREFLIFELINE_OFFSET: usize =
+    std::mem::offset_of!(W_BytesObject, w_weakreflifeline);
+
 /// GC type id assigned to `W_BytesObject` at JitDriver init time.
 pub const W_BYTES_GC_TYPE_ID: u32 = 27;
 

@@ -6809,6 +6809,10 @@ enum BuiltinLenSource {
     EmptyList,
     /// `W_UnicodeObject.len` → `bh_unicodelen`; no storage strategy.
     StrField,
+    /// `W_BytesObject.len` — `bytesobject.py` answers `len(self._value)` off
+    /// the RPython string; pyre precomputes that count into a field, so the
+    /// read is the same shape as [`BuiltinLenSource::StrField`].
+    BytesField,
     /// `tupleobject.py` carries no separate length field, so the length is
     /// `arraylen_gc(wrappeditems)`.
     TupleArrayLen,
@@ -6821,7 +6825,8 @@ enum BuiltinLenSource {
 }
 
 /// `len(x)` on an exact canonical `W_ListObject` / `W_UnicodeObject` /
-/// `W_TupleObject` / `W_Range`, or on an arity-2 tuple specialisation:
+/// `W_BytesObject` / `W_TupleObject` / `W_Range`, or on an arity-2 tuple
+/// specialisation:
 /// lower the opaque `bh_call_fn(len_builtin, PY_NULL, x)` residual to the
 /// inline length read the meta-tracer produces upstream
 /// (descroperation.py `_len`): `guard_value(callable)` +
@@ -6905,6 +6910,18 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
                 Some(exact),
                 BuiltinLenSource::StrField,
                 pyre_object::w_str_len(list_obj),
+            )
+        } else if std::ptr::eq(ob_type, &pyre_object::bytesobject::BYTES_TYPE) {
+            let exact =
+                pyre_object::pyobject::get_instantiate(&pyre_object::bytesobject::BYTES_TYPE);
+            if !std::ptr::eq(w_class, exact) {
+                return Ok(None);
+            }
+            (
+                &pyre_object::bytesobject::BYTES_TYPE as *const _ as i64,
+                Some(exact),
+                BuiltinLenSource::BytesField,
+                pyre_object::bytesobject::w_bytes_len(list_obj),
             )
         } else if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
             let exact = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE);
@@ -7072,6 +7089,11 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
             ctx.trace_ctx,
             list_op,
             crate::descr::str_len_descr(),
+        ),
+        BuiltinLenSource::BytesField => crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            list_op,
+            crate::descr::bytes_len_descr(),
         ),
         BuiltinLenSource::RangeField => unreachable!("range returned its wrapped length above"),
         // `specialisedtupleobject.py:54-55 length()` returns the constant

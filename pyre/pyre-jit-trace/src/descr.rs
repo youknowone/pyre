@@ -1072,6 +1072,72 @@ static W_UNICODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| 
     )
 });
 
+/// `W_BytesObject`, laid out the same way as [`W_UNICODE_DESCR_GROUP`]: a
+/// pointer to the heap byte buffer plus a precomputed length.  `len` is
+/// immutable because bytes is, so a length read hoists out of a loop the way
+/// `bytesobject.py`'s `strlen(self._value)` does once the receiver's class is
+/// pinned.
+///
+/// The group exists so `bytes_len_descr()` mints its FieldDescr with a live
+/// `parent_descr`, which `protect_speculative_field` asks for the expected
+/// type before a pure length read.
+static W_BYTES_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        pyre_object::bytesobject::W_BYTES_OBJECT_SIZE,
+        W_BYTES_GC_TYPE_ID,
+        &pyre_object::bytesobject::BYTES_TYPE as *const _ as usize,
+        &[
+            (
+                "data",
+                pyre_object::bytesobject::BYTES_DATA_OFFSET,
+                std::mem::size_of::<*const Vec<u8>>(),
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "len",
+                pyre_object::bytesobject::BYTES_LEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                true,
+                false,
+            ),
+            (
+                "ctypes_keepalive_refs",
+                pyre_object::bytesobject::BYTES_CTYPES_KEEPALIVE_REFS_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_dict",
+                pyre_object::bytesobject::BYTES_W_DICT_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_weakreflifeline",
+                pyre_object::bytesobject::BYTES_W_WEAKREFLIFELINE_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_BytesObject",
+        "bytesobject::W_BytesObject",
+    )
+});
+
 static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::functional::W_IntRangeIterator>(),
@@ -3814,6 +3880,13 @@ pub fn rbigint_pair_item1_descr() -> DescrRef {
 /// reads at the head of `fast2locals` (pyframe.py:555-557).
 pub fn frame_debug_data_w_locals_descr() -> DescrRef {
     field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 0)
+}
+
+/// `len(bytes)` returns the byte count.  `bytesobject.py` reads it as
+/// `len(self._value)` on the RPython string; pyre precomputes it into
+/// `W_BytesObject.len`, so the same answer is one immutable field read.
+pub fn bytes_len_descr() -> DescrRef {
+    field_descr_from_group(&W_BYTES_DESCR_GROUP, 1)
 }
 
 pub fn str_len_descr() -> DescrRef {
