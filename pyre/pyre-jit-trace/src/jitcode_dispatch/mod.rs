@@ -1595,33 +1595,28 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// would read a stale concrete and silently skip the GUARD_CLASS
     /// gate; the lock-step contract keeps walker-side GUARD_CLASS sound.
     ///
-    /// **Companion bank** `concrete_registers_i` below now exists as a
-    /// skeleton field (Concrete shadow skeleton) so handlers can plumb concrete int
-    /// shadow without changing the WalkContext signature again.  Seed
-    /// wiring (real concrete int values at trace entry + per-handler
-    /// writes for `int_*` arithmetic) is deferred to Concrete shadow seeding and
-    /// later slices.  Until then every callsite passes `&mut []`.
+    /// **Companion bank** `concrete_registers_i` below carries the same
+    /// contract for the Int bank.  Production entries size and seed it:
+    /// `dispatch_via_miframe` from `top_constants_i` and `argboxes_i`,
+    /// and both inline-callee entries; only the test fixtures pass
+    /// `&mut []`.
     ///
-    /// `goto_if_not/iL` and `switch/id` (which consume concrete Int)
-    /// continue to fall back to the strict-mode fail-loud path until
-    /// `concrete_registers_i` is populated.
+    /// `goto_if_not/iL` and `switch/id` read neither bank: both resolve
+    /// their branch value through `TraceCtx::concrete_of_opref` and
+    /// surface `GotoIfNotValueNotConcrete` rather than guess a
+    /// direction.
     pub concrete_registers_r: &'frame mut [ConcreteValue],
-    /// **Skeleton — Concrete shadow skeleton.**  Concrete shadow mirror for
-    /// `registers_i`.  Color-indexed (not semantic-slot indexed like
-    /// `concrete_registers_r`) because pyre's Int bank has no
-    /// "semantic-slot" abstraction — Int registers are post-regalloc
-    /// colors directly.  Length equals `registers_i.len()` when
-    /// populated, or `0` when callsites pass `&mut []`.
+    /// Concrete shadow mirror for `registers_i`.  Color-indexed (not
+    /// semantic-slot indexed like `concrete_registers_r`) because pyre's
+    /// Int bank has no "semantic-slot" abstraction — Int registers are
+    /// post-regalloc colors directly.  Length equals `registers_i.len()`
+    /// on production entries; the test fixtures pass `&mut []`.
     ///
-    /// Future invariant (Concrete shadow seeding+): every walker handler that writes
-    /// `registers_i[dst]` MUST also write `concrete_registers_i[dst]`
-    /// in lock-step, mirroring the Ref-bank contract above.  A future
-    /// `write_int_reg` helper will enforce this once seeding lands.
-    ///
-    /// Consumers (`dispatch_goto_if_not/iL`, `switch/id`) currently
-    /// fall back to the strict-mode fail-loud path; they will switch
-    /// to reading `concrete_registers_i[src]` for the test-direction
-    /// fold once Concrete shadow seeding populates seeds.
+    /// Invariant: every walker handler that writes `registers_i[dst]`
+    /// MUST also write `concrete_registers_i[dst]` in lock-step,
+    /// mirroring the Ref-bank contract above.  `write_int_reg` enforces
+    /// it — it sanitizes the value and writes the shadow slot with the
+    /// symbolic one.
     pub concrete_registers_i: &'frame mut [ConcreteValue],
     /// Descr pool for `d`-coded operands. Each `d` argcode in the
     /// jitcode bytes resolves to `descr_refs[2-byte LE index]`.
@@ -3762,14 +3757,11 @@ enum FinishframeLookahead {
     /// and the call is itself a no-op unless a vmprof profiler HOOK is
     /// installed, so the drop is inert for ordinary execution.
     ///
-    /// Not yet fired here because it needs the concrete operands
-    /// `registers_i[arg1_reg].getint()` / `[arg2_reg].getint()`, and the
-    /// walker's Concrete shadow bank (`concrete_registers_i`) is not yet
-    /// reliably seeded — the same blocker that keeps `goto_if_not/iL` and
-    /// `switch/id` on the strict fail-loud fallback (see `WalkContext`).
-    /// `arg1_reg` / `arg2_reg` are surfaced so that, once seeding lands,
-    /// the call ports directly (`assert arg1 == 1; jit_rvmprof_code(arg1,
-    /// arg2)`) without re-decoding.
+    /// Deliberately not fired here: this helper is a lookahead that pops
+    /// no frame, and `MetaInterp::finishframe_exception` — the loop that
+    /// does pop them — already makes the call, so firing here would
+    /// double the enter/leave marks.  `arg1_reg` / `arg2_reg` stay
+    /// surfaced for the decode.
     #[allow(dead_code)]
     RvmprofCode { arg1_reg: u8, arg2_reg: u8 },
     /// Neither match — unwinding continues with no side effect.

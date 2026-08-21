@@ -451,9 +451,9 @@ pub fn fbw_depth_census_summary() -> String {
 }
 
 /// Parse `PYRE_FBW_NO_SPECIALIZE` once into table-index bits and unknown
-/// selector tokens.  The reserved `all` token turns off these 56 rows and
-/// nothing else: the `try_walker_fold_*` trio and the 11
-/// `try_walker_inline_*` descent entry points all stay live.
+/// selector tokens.  The reserved `all` token turns off every
+/// `SPEC_FOLD_ROWS` row and nothing else: the `try_walker_fold_*` trio
+/// and the `try_walker_inline_*` descent entry points all stay live.
 fn spec_suppression() -> &'static (u64, Vec<String>) {
     static SUPPRESSION: std::sync::OnceLock<(u64, Vec<String>)> = std::sync::OnceLock::new();
     SUPPRESSION.get_or_init(|| {

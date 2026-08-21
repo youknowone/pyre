@@ -2047,15 +2047,13 @@ struct AbstractShortPreambleBuilderState {
     /// Known constant OpRefs. In RPython, isinstance(box, Const) is a type
     /// check. In majit, constant OpRefs must be explicitly tracked.
     known_constants: IndexSet<OpRef>,
-    /// Canonical dedup for `record_imported_preamble_use`.
-    /// `produced_short_boxes` is a dual-key map (source key + result_opref
-    /// key both pointing at the same `ProducedShortOp`), so the source vs.
-    /// body-visible distinction is not enough — RPython's Box identity
-    /// makes one Box equal one slot regardless of how it is reached. The
-    /// canonical key is `replay_op.pos` (a stable proxy for `self.res`):
-    /// dedup here prevents two different lookup keys from pushing the
-    /// same RPython Box twice into `used_boxes` /
-    /// `short_preamble_jump` / `extra_same_as`.
+    /// Canonical dedup for `record_imported_preamble_use`, keyed by
+    /// `replay_op.pos` (a stable proxy for `self.res`).  Two independent
+    /// paths reach the same replay op — `record_preamble_use` and
+    /// `add_preamble_op_from_pop` — and Box identity makes one Box equal
+    /// one slot regardless of how it is reached, so the dedup prevents
+    /// either path from pushing the same RPython Box twice into
+    /// `used_boxes` / `short_preamble_jump` / `extra_same_as`.
     recorded_canonical_results: IndexSet<OpRef>,
 }
 
