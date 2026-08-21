@@ -7806,23 +7806,25 @@ impl CodeWriter {
                     // the next block.
                     current_block.clone()
                 } else {
-                    // `current_block` already closed and no joinpoint
-                    // candidate exists — RPython has no equivalent
-                    // because its per-block walker (`flowcontext.py:
-                    // 407-475`) cannot re-enter PC iteration with a
-                    // dead current block: every walker pop installs a
-                    // fresh live SpamBlock from `pendingblocks`.  Pyre's
-                    // PC-sequential walker drove the prior synthesise-
-                    // fresh-block adaptation here, but with the W-1 fix
-                    // every sequential PC keeps `current_block` alive
-                    // and every branch arrival registers a joinpoint
-                    // candidate, so this arm should be unreachable.
-                    // Fail-loud per RPython invariant.
-                    panic!(
-                        "emit_mark_label_pc!(py_pc={}): no live current_block \
-                         and no joinpoint candidate — invariant violation",
-                        py_pc,
-                    );
+                    // `current_block` is dead and this PC carries no
+                    // joinpoint candidate.  The only writer of `dead` is
+                    // `mergeblock`'s supersede (`flowcontext.py:455-463`),
+                    // which kills the block a later merge could not union
+                    // with and queues its replacement on `pendingblocks`.
+                    // Upstream is never here: its walker is per-block, and
+                    // `closeblock` raises `StopFlowing` so a superseded
+                    // block is never walked further.  Pyre's PC-sequential
+                    // walker can still be standing inside that block when
+                    // the supersede happens, and the PCs after it belong to
+                    // the replacement, not to the corpse.
+                    //
+                    // Stop flowing, which is what upstream does: leave the
+                    // block, and let the outer walker pop the replacement
+                    // `mergeblock` already pushed.  Emitting into a dead
+                    // block instead would put operations somewhere the
+                    // post-walk drain skips.
+                    block_switch_pending = true;
+                    current_block.clone()
                 };
                 // Yield-on-switch: when `new_block` differs from
                 // `current_block`, set the `block_switch_pending`
