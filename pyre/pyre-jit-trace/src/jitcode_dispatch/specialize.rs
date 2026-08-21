@@ -10077,6 +10077,20 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
         return Ok(None);
     };
 
+    // `w_float_get_value` reads the payload without checking the box, and a
+    // non-float here would be read as one rather than rejected, so the value
+    // the trace records would be a number with no relation to the answer.
+    if !unsafe { pyre_object::is_float(boxed_result) } {
+        return Ok(None);
+    }
+    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
+    // The trace computes `FloatAbs` over the coerced operand, so an int too
+    // large to be an exact `f64` would have the trace answering for a value
+    // the builtin never saw.  Compare the two on this operand, by bits so the
+    // two zeroes stay distinct.
+    if val.abs().to_bits() != result_val.to_bits() {
+        return Ok(None);
+    }
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
         let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
@@ -10089,7 +10103,6 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
     }
     let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], arg_obj, is_int, val, false)?;
     let raw = ctx.trace_ctx.record_op(OpCode::FloatAbs, &[x]);
-    let result_val = unsafe { pyre_object::w_float_get_value(boxed_result) };
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Float(result_val));
     let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
@@ -10393,6 +10406,13 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
     let Some(result_value) = fold_finite_float_result(boxed_result) else {
         return Ok(None);
     };
+    // The compiled loop calls the raw helper, not the function it stands for.
+    // Compare the two on this operand and keep the residual when they differ,
+    // so a helper that disagrees is not compiled into the loop.  Bit equality
+    // rather than `==`, which cannot tell the two zeroes apart.
+    if raw_fn(value).to_bits() != result_value.to_bits() {
+        return Ok(None);
+    }
 
     walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let x =
@@ -10453,6 +10473,12 @@ pub(crate) fn try_walker_specialize_math_float2<Sym: WalkSym>(
     let Some(result_value) = fold_finite_float_result(boxed_result) else {
         return Ok(None);
     };
+    // Same cross-check as the one-argument half: the compiled loop calls the
+    // raw helper, so a helper that disagrees with the function it stands for
+    // must not be compiled into it.
+    if raw_fn(x_value, y_value).to_bits() != result_value.to_bits() {
+        return Ok(None);
+    }
 
     walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let x = walker_coerce_operand_to_float(
@@ -10676,9 +10702,19 @@ pub(crate) fn try_walker_specialize_builtin_fold1<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    let mut rows =
-        pyre_interpreter::jit_builtin_folds::builtin_folds_for(concrete_callable, 1).peekable();
-    if rows.peek().is_none() {
+    let rows: Vec<_> =
+        pyre_interpreter::jit_builtin_folds::builtin_folds_for(concrete_callable, 1).collect();
+    // Ask the raw helpers before the builtin runs.  A call no row answers for
+    // is not this fold's shape, and the walker has to learn that without
+    // executing the builtin: the residual it falls back to executes the call
+    // again, so a decline taken afterwards would run a side-effecting
+    // `__hash__` or `__abs__` twice in one walk.
+    let answered = rows.iter().any(|fold| match fold.raw {
+        BuiltinFoldRaw::Int1(raw_fn) => raw_fn(operands[0] as i64) != INT_FOLD_DECLINE,
+        BuiltinFoldRaw::Float1(raw_fn) => !raw_fn(operands[0] as i64).is_nan(),
+        BuiltinFoldRaw::Ref2(_) => false,
+    });
+    if !answered {
         return Ok(None);
     }
     // Authentic boxed result, produced on the plain eval loop exactly as the
@@ -10693,7 +10729,7 @@ pub(crate) fn try_walker_specialize_builtin_fold1<Sym: WalkSym>(
         return Ok(None);
     };
 
-    for fold in rows {
+    for fold in &rows {
         match fold.raw {
             BuiltinFoldRaw::Int1(raw_fn) => {
                 let value = raw_fn(operands[0] as i64);
@@ -10721,7 +10757,9 @@ pub(crate) fn try_walker_specialize_builtin_fold1<Sym: WalkSym>(
                     continue;
                 };
                 let value = raw_fn(operands[0] as i64);
-                if value != result_value {
+                // By bits: `==` cannot tell `-0.0` from `0.0`, and which one
+                // the fold answers with is observable through `copysign`.
+                if value.to_bits() != result_value.to_bits() {
                     continue;
                 }
                 walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
@@ -10767,9 +10805,17 @@ pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    let mut rows =
-        pyre_interpreter::jit_builtin_folds::builtin_folds_for(concrete_callable, 2).peekable();
-    if rows.peek().is_none() {
+    let rows: Vec<_> =
+        pyre_interpreter::jit_builtin_folds::builtin_folds_for(concrete_callable, 2).collect();
+    // Same ordering as the one-argument half: no row may answer only after the
+    // builtin has already run, or the residual re-executes it.
+    let answered = rows.iter().any(|fold| match fold.raw {
+        BuiltinFoldRaw::Ref2(raw_fn) => {
+            !(raw_fn(operands[0] as i64, operands[1] as i64) as pyre_object::PyObjectRef).is_null()
+        }
+        BuiltinFoldRaw::Int1(_) | BuiltinFoldRaw::Float1(_) => false,
+    });
+    if !answered {
         return Ok(None);
     }
     let boxed_result = {
@@ -10780,7 +10826,7 @@ pub(crate) fn try_walker_specialize_builtin_fold2<Sym: WalkSym>(
         return Ok(None);
     };
 
-    for fold in rows {
+    for fold in &rows {
         let BuiltinFoldRaw::Ref2(raw_fn) = fold.raw else {
             continue;
         };
