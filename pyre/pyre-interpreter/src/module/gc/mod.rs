@@ -664,6 +664,19 @@ fn pin_object(object: majit_ir::GcRef) {
     pyre_object::gc_roots::pin_root(object.0 as PyObjectRef);
 }
 
+/// `[3.14-spec]` PyPy's `referents.py:115-122` exposes every app-level
+/// object reached by `rgc.do_get_objects`, while CPython 3.14
+/// `Modules/gcmodule.c:319-342` exposes only objects tracked by its cyclic
+/// collector. Keep the PyPy/RPython traversal in `majit_gc`; filter only at
+/// the public CPython-compatible boundary, using the same tracked-state model
+/// as `gc.is_tracked` below.
+fn pin_cpython_tracked_object(object: majit_ir::GcRef) {
+    let w_obj = object.0 as PyObjectRef;
+    if crate::typedef::cpython_object_is_gc(w_obj) {
+        pyre_object::gc_roots::pin_root(w_obj);
+    }
+}
+
 /// CPython's container traversal sees logical entries even where a PyPy list
 /// or dict strategy stores an unboxed scalar.  The collector walk correctly
 /// has no GC edge to report for those fields, so materialise only the missing
@@ -1337,7 +1350,7 @@ crate::py_module! {
             }
             let _roots = pyre_object::gc_roots::push_roots();
             let first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_object);
+            majit_gc::get_objects(-1, pin_cpython_tracked_object);
             Ok(list_from_roots(first))
         }
 
@@ -1423,7 +1436,7 @@ crate::py_module! {
             pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut rooted_args);
             crate::module::sys::vm::audit("gc.get_referrers", &rooted_args)?;
             let all_first = pyre_object::gc_roots::shadow_stack_len();
-            majit_gc::get_objects(-1, pin_object);
+            majit_gc::get_objects(-1, pin_cpython_tracked_object);
             let all_last = pyre_object::gc_roots::shadow_stack_len();
             // Accumulate the matches as slot indices, not as addresses: the
             // entries stay pinned in `all_first..all_last`, but a copy of one
