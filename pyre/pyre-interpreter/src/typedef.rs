@@ -7171,9 +7171,10 @@ fn init_dict_type(ns: PyObjectRef) {
         // each key; for a dict subclass, construct an instance via `cls()`
         // and route through `space.setitem` so the result is an instance
         // of the subclass.
+        let mut value = value;
         let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
         if cls.is_null() || crate::baseobjspace::is_w(cls, w_dict_type) {
-            let d = pyre_object::w_dict_new();
+            let mut d = pyre_object::w_dict_new();
             // Python 3.14's exact-set/frozenset fast path carries each
             // entry's cached hash into the new exact dict.  This is the
             // reverse of `set_update_dict_lock_held` and avoids a
@@ -7204,7 +7205,18 @@ fn init_dict_type(ns: PyObjectRef) {
                 }
                 return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
             }
-            let items = crate::builtins::collect_iterable(iterable)?;
+            let items = {
+                // Draining the iterable runs Python. `d` is a fresh dict with
+                // no heap edge yet and dicts are nursery-allocated, so it is
+                // rooted and read back here — the loop below re-roots what it
+                // is handed, which cannot cover this window.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = pyre_object::gc_roots::pin_roots(&[d, value]);
+                let items = crate::builtins::collect_iterable(iterable)?;
+                d = pyre_object::gc_roots::shadow_stack_get(base);
+                value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+                items
+            };
             // `try_hash_value` may run a user `__hash__` that allocates
             // and triggers a moving minor collection; `d`, the shared
             // `value` (reused across every key), and every not-yet-added
