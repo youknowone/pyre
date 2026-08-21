@@ -3036,8 +3036,17 @@ pub unsafe fn w_dict_setdefault_checked(
         if let Some(existing) = w_module_dict_lookup_inner_checked(obj, key)? {
             return Ok(existing);
         }
-        w_module_dict_store_inner_checked(obj, key, value)?;
-        return Ok(value);
+        // A non-str key sends the lookup above through the object strategy,
+        // which hashes it, and a `__hash__` written in Python is a collection
+        // point that moves the module dict.  Every word the store is handed
+        // comes off its root slot, and so does the result: the by-value words
+        // taken before the lookup name pre-move headers.
+        w_module_dict_store_inner_checked(
+            _dict_guard.root(0),
+            _dict_guard.root(1),
+            _dict_guard.root(2),
+        )?;
+        return Ok(_dict_guard.root(2));
     }
     let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     // `dictmultiobject.py EmptyDictStrategy.setdefault`:
@@ -3053,7 +3062,7 @@ pub unsafe fn w_dict_setdefault_checked(
     if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY) {
         crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
         w_dict_store_checked(obj, key, value)?;
-        return Ok(value);
+        return Ok(_dict_guard.root(2));
     }
     if strategy_is(
         strategy,
@@ -3061,7 +3070,7 @@ pub unsafe fn w_dict_setdefault_checked(
     ) {
         crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
         w_dict_store_checked(obj, key, value)?;
-        return Ok(value);
+        return Ok(_dict_guard.root(2));
     }
     if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
         // `AbstractTypedStrategy.setdefault` (`dictmultiobject.py`) runs
