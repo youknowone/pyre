@@ -3752,6 +3752,14 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
 /// non-None result raises `TypeError: __init__() should return None, not
 /// 'X'`.
 ///
+/// The trailing `, not 'X'` follows the pinned CPython rather than
+/// `descr_call`, which raises the bare `__init__() should return None`.
+/// Measured at the version in `lib-python/stdlib-version.txt` (3.14.6):
+/// CPython answers `"__init__() should return None, not 'int'"` where PyPy
+/// answers `"__init__() should return None"`.  Only the message text differs
+/// — the exception type, the condition that raises it, and the value the call
+/// then produces are `descr_call`'s.
+///
 /// A null `result` means `__init__` already raised.  Callers are
 /// responsible for detecting that (via `result.is_null()` or a
 /// `?`-propagating call) and forwarding the stashed error themselves;
