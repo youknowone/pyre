@@ -442,6 +442,7 @@ PyAPI_FUNC(void *) PyMem_Realloc(void *, size_t);
 PyAPI_FUNC(void) Py_DecRef(PyObject *);
 PyAPI_FUNC(void) Py_IncRef(PyObject *);
 PyAPI_FUNC(Py_ssize_t) _PyPyre_RefCount(PyObject *);
+PyAPI_FUNC(void) _Py_SetRefcnt(PyObject *, Py_ssize_t);
 
 /* cpyext/pystate.rs */
 PyAPI_FUNC(void) PyEval_AcquireThread(PyThreadState *);
@@ -582,6 +583,7 @@ PyAPI_FUNC(int) PyUnicode_EqualToUTF8AndSize(PyObject *, const char *, Py_ssize_
 PyAPI_FUNC(int) PyUnicode_FSConverter(PyObject *, void *);
 PyAPI_FUNC(int) PyUnicode_FSDecoder(PyObject *, void *);
 PyAPI_FUNC(Py_ssize_t) PyUnicode_FindChar(PyObject *, Py_UCS4, Py_ssize_t, Py_ssize_t, int);
+PyAPI_FUNC(PyObject *) PyUnicode_Format(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) PyUnicode_FromKindAndData(int, const void *, Py_ssize_t);
 PyAPI_FUNC(PyObject *) PyUnicode_FromObject(PyObject *);
 PyAPI_FUNC(PyObject *) PyUnicode_FromOrdinal(int);

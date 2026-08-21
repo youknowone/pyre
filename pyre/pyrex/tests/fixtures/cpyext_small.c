@@ -229,6 +229,37 @@ static PyObject *generic_alias(PyObject *self, PyObject *args)
     return outcome(Py_GenericAlias(origin, parameters));
 }
 
+/* ── the count field ──────────────────────────────────────────────────── */
+
+/* `Py_SET_REFCNT` writes what `Py_REFCNT` reports, so the two round-trip: the
+   +1/-1 bracket around a `__dealloc__` body is the only shape Cython uses it
+   in, and it has to leave the count where it found it. */
+static PyObject *refcount_round_trip(PyObject *self, PyObject *object)
+{
+    Py_ssize_t before, bumped, after;
+    (void)self;
+    before = Py_REFCNT(object);
+    Py_SET_REFCNT(object, Py_REFCNT(object) + 1);
+    bumped = Py_REFCNT(object);
+    Py_SET_REFCNT(object, Py_REFCNT(object) - 1);
+    after = Py_REFCNT(object);
+    return Py_BuildValue("(nn)", bumped - before, after - before);
+}
+
+/* A count that must never be reached is left alone.  Writing 1 over a
+   singleton's would free a block the interpreter still points at, so the
+   refusal is the whole of what this entry point is checked for. */
+static PyObject *refcount_immortal(PyObject *self, PyObject *unused)
+{
+    Py_ssize_t before, after;
+    (void)self;
+    (void)unused;
+    before = Py_REFCNT(Py_None);
+    Py_SET_REFCNT(Py_None, 1);
+    after = Py_REFCNT(Py_None);
+    return Py_BuildValue("(ii)", before == after, after > 1);
+}
+
 static PyMethodDef methods[] = {
     {"type_names", type_names, METH_O, NULL},
     {"repr_guard", repr_guard, METH_O, NULL},
@@ -242,6 +273,8 @@ static PyMethodDef methods[] = {
     {"set_default", set_default, METH_VARARGS, NULL},
     {"set_default_no_result", set_default_no_result, METH_VARARGS, NULL},
     {"generic_alias", generic_alias, METH_VARARGS, NULL},
+    {"refcount_round_trip", refcount_round_trip, METH_O, NULL},
+    {"refcount_immortal", refcount_immortal, METH_NOARGS, NULL},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef def = {PyModuleDef_HEAD_INIT, "cpyext_small", NULL, -1,

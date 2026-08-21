@@ -190,6 +190,21 @@ eq('alias pair error', error, None)
 eq('alias pair str', str(pair), 'dict[str, int]')
 eq('alias pair args', pair.__args__, (str, int))
 
+# ── the count field ────────────────────────────────────────────────────
+
+# `Py_SET_REFCNT` and `Py_REFCNT` speak the same units, so the bracket Cython
+# puts around a `__dealloc__` body leaves the count where it found it.
+subject = ['held']
+eq('refcount bracket', m.refcount_round_trip(subject), (1, 0))
+eq('refcount bracket again', m.refcount_round_trip(subject), (1, 0))
+eq('the object is untouched', subject, ['held'])
+
+# A count that must never be reached is left alone.
+eq('immortal is left alone', m.refcount_immortal(), (1, 1))
+# The write it refused would have freed the block `Py_None` names, so the
+# singleton still being itself is the other half of the answer.
+eq('None is still None', [None, None.__class__], [None, type(None)])
+
 print('cpyext-small-ok')
 "#;
 

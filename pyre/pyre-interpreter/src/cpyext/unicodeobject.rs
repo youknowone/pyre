@@ -483,6 +483,25 @@ fn must_be_str(name: &str) -> String {
     format!("must be str, not {name}")
 }
 
+/// `unicodeobject.py PyUnicode_Format(format, args)` — `format % args`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyUnicode_Format(
+    format: *mut CPyObject,
+    args: *mut CPyObject,
+) -> *mut CPyObject {
+    if format.is_null() || args.is_null() {
+        unsafe { super::pyerrors::PyErr_BadInternalCall() };
+        return std::ptr::null_mut();
+    }
+    let Some(format) = str_argument(format, must_be_str) else {
+        return std::ptr::null_mut();
+    };
+    let Some([args]) = super::object::arguments([args]) else {
+        return std::ptr::null_mut();
+    };
+    super::object::result(crate::mod_(format, args))
+}
+
 /// `unicodeobject.py PyUnicode_FromOrdinal` — `chr(ordinal)`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyUnicode_FromOrdinal(ordinal: c_int) -> *mut CPyObject {
@@ -1445,6 +1464,7 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyUnicode_ReadChar as *const ());
     std::hint::black_box(PyUnicode_WriteChar as *const ());
     std::hint::black_box(PyUnicode_FromOrdinal as *const ());
+    std::hint::black_box(PyUnicode_Format as *const ());
     std::hint::black_box(PyUnicode_DecodeUTF8 as *const ());
     std::hint::black_box(PyUnicode_FromObject as *const ());
     std::hint::black_box(PyUnicode_InternFromString as *const ());

@@ -849,6 +849,21 @@ pub unsafe extern "C" fn Py_DecRef(object: *mut CPyObject) {
     unsafe { decref(object) };
 }
 
+/// `Py_SET_REFCNT` — the whole count field, which is what `Py_REFCNT` reports.
+///
+/// A value written here has to have come from `Py_REFCNT`: the count carries
+/// the share the interpreter link contributes, and an absolute number in the
+/// units C code counts in would take that share away and free a block the
+/// interpreter still points at.  A mirror that must never be freed keeps the
+/// count it has.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn _Py_SetRefcnt(object: *mut CPyObject, refcnt: isize) {
+    if object.is_null() || unsafe { (*object).ob_refcnt } >= REFCNT_IMMORTAL {
+        return;
+    }
+    unsafe { (*object).ob_refcnt = refcnt };
+}
+
 /// The C-visible reference count, with the interpreter's own share removed —
 /// `Py_REFCNT` as a test can read it without depending on the link share.
 #[unsafe(no_mangle)]
@@ -863,4 +878,5 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(Py_IncRef as *const ());
     std::hint::black_box(Py_DecRef as *const ());
     std::hint::black_box(_PyPyre_RefCount as *const ());
+    std::hint::black_box(_Py_SetRefcnt as *const ());
 }
