@@ -163,6 +163,24 @@ pub fn bridge_decode_red(
     (OpRef::input_arg_typed(n as u32, kind), fail_values[n])
 }
 
+/// One live jitcode register as a guard's resume data described it.
+///
+/// `pyjitpl.py rebuild_state_after_failure` rebuilds a `MIFrame` per encoded
+/// section and `resume.py ResumeDataBoxReader.consume_boxes` fills every live
+/// register of each from the guard's numbering.  This is one such register:
+/// `bank` says which of the three banks `index` addresses, `opref` is the
+/// symbolic value the trace continues with — a bridge `InputArg` for a
+/// failarg, a pool constant for one the guard already carried folded — and
+/// `value` is its concrete shadow, which the walk needs because the walk is
+/// what executes.
+#[derive(Debug, Clone, Copy)]
+pub struct GuardResumeReg {
+    pub bank: Type,
+    pub index: u32,
+    pub opref: OpRef,
+    pub value: i64,
+}
+
 /// Interpreter-specific JIT state contract.
 pub trait JitState: Sized {
     type Meta: Clone;
@@ -372,6 +390,36 @@ pub trait JitState: Sized {
         _fail_values: &[i64],
         _fail_types: &[Type],
     ) {
+    }
+
+    /// Enter the walk at the jitcode position a guard failed on.
+    ///
+    /// `pyjitpl.py handle_guard_failure` reaches
+    /// `rebuild_state_after_failure`, whose per-frame
+    /// `setup_resume_at_op(pc)` puts the rebuilt frame back at the guard, and
+    /// then keeps interpreting from there.  The rest of the opcode the guard
+    /// sits inside is therefore recorded, which is the whole difference
+    /// between it and a resume that hands the interpreter a later position:
+    /// the tail runs once either way, but only here does it also land in the
+    /// trace.
+    ///
+    /// `regs` is the rebuilt register file — the walk cannot re-derive it,
+    /// because a guard is not a position the interpreter is re-enterable at.
+    ///
+    /// The default declines.  A state with no dispatch jitcode has no position
+    /// to enter, and declining is not a loss: `compile.py handle_fail` treats
+    /// bridging and the blackhole as alternatives, so the caller takes the
+    /// other one.
+    fn trace_from_guard_resume_position<R: crate::pyjitpl::JitCodeRuntime>(
+        _ctx: &mut crate::trace_ctx::TraceCtx,
+        _sym: &mut Self::Sym,
+        _dispatch_jitcode: &crate::jitcode::JitCode,
+        _resume_pc: usize,
+        _outer_program_pc: usize,
+        _runtime: &R,
+        _regs: &[GuardResumeReg],
+    ) -> Option<crate::TraceAction> {
+        None
     }
 
     /// resume.py rebuild_from_resumedata: decode rd_numb to

@@ -1347,6 +1347,15 @@ pub struct JitDriver<S: JitState> {
     /// `register_descriptor` (each of which clears this cache), and no
     /// `JitState::driver_descriptor` implementation reads its `meta` argument.
     descriptor_cache: Option<Option<std::sync::Arc<JitDriverStaticData>>>,
+    /// Whether the live bridge trace was entered at a guard's own jitcode
+    /// position rather than at a merge point the blackhole walked to.
+    ///
+    /// The abort handling in [`Self::merge_point`] skips its resume handoff
+    /// for a bridge, because a bridge used to be started only after the
+    /// blackhole had already resumed the interpreter. A bridge entered at the
+    /// guard has had no such resume — the walk is the only thing that ran —
+    /// so it needs the handoff like a fresh trace does.
+    bridge_entered_at_guard_resume: bool,
     /// resume.py: result of rebuild_from_resumedata for bridge tracing.
     /// RPython stores this in MIFrame registers; pyre stores it here
     /// for the caller to initialize PyreSym slot-to-OpRef mapping.
@@ -1571,6 +1580,7 @@ impl<S: JitState> JitDriver<S> {
             continue_running_normally_payload: None,
             descriptor: None,
             descriptor_cache: None,
+            bridge_entered_at_guard_resume: false,
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
             bridge_body_start_op_count: None,
@@ -2308,6 +2318,7 @@ impl<S: JitState> JitDriver<S> {
         // fallback when the run produced none.
         if terminal.is_some() {
             self.meta.single_pass_scalar_values = None;
+            self.meta.single_pass_ref_scalar_values = None;
             self.meta.single_pass_virt_array_values = None;
         } else if crate::majit_log_enabled() {
             eprintln!(
@@ -2490,6 +2501,23 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    /// Push the walk's ref state fields into native `state`.
+    ///
+    /// The ref twin of [`Self::writeback_scalar_state_fields`], and its
+    /// consumer is the one the twin does not have: a resume whose native
+    /// `state` was left behind by a compiled run rather than kept current by
+    /// the interpreter. Consumes (`take`s) the stash; no-op when the close
+    /// staged none or the state declares no ref fields.
+    #[inline]
+    pub fn writeback_ref_scalar_state_fields(&mut self, state: &mut S) {
+        let Some(values) = self.meta.single_pass_ref_scalar_values.take() else {
+            return;
+        };
+        for (index, value) in values.into_iter().enumerate() {
+            state.writeback_live_ref_scalar_state_field(index, value);
+        }
+    }
+
     /// Push the walk's loop-carried virtualizable-array element values into
     /// native `state`, the array analog of `writeback_scalar_state_fields`. The
     /// walk mutates the array on the trace-ctx shadow; native `state`'s array is
@@ -2532,6 +2560,7 @@ impl<S: JitState> JitDriver<S> {
     pub fn discard_single_pass_resume(&mut self) {
         self.meta.single_pass_compiled_key = None;
         self.meta.single_pass_scalar_values = None;
+        self.meta.single_pass_ref_scalar_values = None;
         self.meta.single_pass_virt_array_values = None;
         self.meta.single_pass_compact_label_values = None;
         self.meta.single_pass_full_live_values = None;
@@ -3091,6 +3120,11 @@ impl<S: JitState> JitDriver<S> {
                     if let Some(sym) = self.sym.as_ref() {
                         let scalars = S::collect_scalar_state_field_values(sym);
                         self.meta.single_pass_scalar_values = Some(scalars);
+                        // The ref twin, for the one consumer whose native
+                        // `state` is not already current — see
+                        // `single_pass_ref_scalar_values`.
+                        let ref_scalars = S::collect_ref_scalar_state_field_values(sym);
+                        self.meta.single_pass_ref_scalar_values = Some(ref_scalars);
                     }
                     // Capture the walk-final loop-carried virt-array element values
                     // off the still-live trace ctx (the walk mutated the ctx shadow,
@@ -3376,6 +3410,7 @@ impl<S: JitState> JitDriver<S> {
                                 // at the bottom of this arm.
                                 self.meta.single_pass_outcome = None;
                                 self.meta.single_pass_scalar_values = None;
+                                self.meta.single_pass_ref_scalar_values = None;
                                 self.meta.single_pass_virt_array_values = None;
                                 continue;
                             }
@@ -3696,6 +3731,7 @@ impl<S: JitState> JitDriver<S> {
                         // next walk segment still has to record.
                         self.meta.single_pass_outcome = None;
                         self.meta.single_pass_scalar_values = None;
+                        self.meta.single_pass_ref_scalar_values = None;
                         self.meta.single_pass_virt_array_values = None;
                         // pyjitpl.py:1571/1574 `saved_pc` — the resumed walk
                         // re-enters at the merge point's own guest pc, so the
@@ -4218,8 +4254,17 @@ impl<S: JitState> JitDriver<S> {
                     // Bridge/compiled guard-failure recovery owns a separate
                     // blackhole resume path below `back_edge_internal`; do not
                     // feed that path through this fresh-trace handoff.
+                    //
+                    // Unless the bridge was entered at the guard's own position
+                    // — then there was no separate resume: the walk is the only
+                    // thing that ran, and it ran the failing opcode's tail. Its
+                    // frames are the sole record of where that left the
+                    // interpreter, so this bridge needs the handoff for the
+                    // same reason a fresh trace does.
                     if matches!(action, TraceAction::Abort)
-                        && (self.meta.bridge_info().is_none() || self.bridge_attempt_declined)
+                        && (self.meta.bridge_info().is_none()
+                            || self.bridge_attempt_declined
+                            || self.bridge_entered_at_guard_resume)
                     {
                         // This gate asks whether the session still has a bridge
                         // artifact to resume into, which is the PHASE, not the
@@ -4606,6 +4651,228 @@ impl<S: JitState> JitDriver<S> {
             env,
             pre_run,
         ))
+    }
+
+    /// `compile.py handle_fail`'s bridging arm.
+    ///
+    /// Upstream's `handle_fail` is an if/else: a guard that `must_compile()`
+    /// traces a bridge, and one that does not resumes in the blackhole. Never
+    /// both. Tracing starts at the guard itself —
+    /// `initialize_state_from_guard_failure` → `rebuild_state_after_failure`
+    /// rebuilds the frames and `setup_resume_at_op(pc)` puts each back at its
+    /// own position — so the rest of the opcode the guard sits inside is
+    /// recorded into the bridge.
+    ///
+    /// Reaching the same point through the blackhole instead cannot record it:
+    /// the blackhole stops at the next merge point and the bridge is grown
+    /// from THAT position, so the opcode's tail runs once, here, and every
+    /// later failure jumps into a bridge that does not contain it.
+    ///
+    /// Returns the interpreter position to resume at, or `None` when the
+    /// bridge could not be entered AT ALL — the caller then takes the
+    /// blackhole arm, which is upstream's other branch. Every decline is
+    /// therefore sited BEFORE the walk: once the walk has run, the tail has
+    /// happened, and handing the same guard to the blackhole would apply it a
+    /// second time.
+    fn bridge_from_guard_resume_position(
+        &mut self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+        state: &mut S,
+        env: &S::Env,
+        raw_values: &[i64],
+        target_pc: usize,
+    ) -> Option<usize> {
+        use majit_ir::resumedata::RebuiltValue;
+        // Only a state whose machine IS a dispatch jitcode has a guard
+        // position to re-enter at; every other JitState resumes through its
+        // own frontend.
+        let dispatch = self.dispatch_jitcode().cloned()?;
+        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc) {
+            return None;
+        }
+        // From here the trace session is LIVE, so a decline has to tear it
+        // down rather than return through it.
+        let seeded = (|| {
+            let resume = self.resume_data_result.as_ref()?;
+            let frame = resume.frames.first()?;
+            // `resume.py:1338` `jitcode = jitcodes[jitcode_pos]`: the position
+            // is an offset into the jitcode the frame NAMES. Entering a
+            // different one at that offset lands mid-instruction in unrelated
+            // code, and the walk decodes whatever byte is there. Only the
+            // dispatch jitcode is enterable here, so a frame that names any
+            // other one is a decline.
+            if frame.jitcode_index as usize != dispatch.try_index()? {
+                return None;
+            }
+            // `resume.py _prepare_pendingfields` replays the guard's deferred
+            // heap writes through `execute_and_record` — it applies them to the
+            // heap AND puts them in the trace. majit's replay
+            // (`replay_pending_fields`) only records: the applying half was the
+            // blackhole's, because until now a bridge was only ever started
+            // after the blackhole had run. Entering at the guard skips the
+            // blackhole, so nothing applies them, and the interpreter resumes
+            // against a heap where the elided half of a push is missing — a
+            // committed size with a null chain.
+            //
+            // Decline while that half is missing. The blackhole arm is then the
+            // answer for these guards, which is where they were already served.
+            if resume
+                .storage
+                .as_ref()
+                .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
+            {
+                return None;
+            }
+            let fail_types = resume.fail_arg_types.clone();
+            let values = frame.values.clone();
+            let resume_pc = usize::try_from(frame.pc).ok()?;
+            let ctx = self.meta.tracing.as_mut()?;
+            let reg_indices = ctx.bridge_reg_indices()?.clone();
+            // `consume_boxes` fills every live register of the frame, so a
+            // count that disagrees means the two sides read different
+            // liveness and no per-register pairing off them is trustworthy.
+            if reg_indices.total_len() != values.len() {
+                return None;
+            }
+            let banks: [(majit_ir::Type, &Vec<u32>, usize); 3] = [
+                (majit_ir::Type::Int, &reg_indices.int, 0),
+                (
+                    majit_ir::Type::Ref,
+                    &reg_indices.ref_,
+                    reg_indices.int.len(),
+                ),
+                (
+                    majit_ir::Type::Float,
+                    &reg_indices.float,
+                    reg_indices.int.len() + reg_indices.ref_.len(),
+                ),
+            ];
+            let mut regs = Vec::with_capacity(values.len());
+            for (bank, indices, base) in banks {
+                for (i, &index) in indices.iter().enumerate() {
+                    let (opref, value) = match &values[base + i] {
+                        RebuiltValue::Box(n, kind) => {
+                            crate::jit_state::bridge_decode_red(*n, *kind, raw_values, &fail_types)
+                        }
+                        RebuiltValue::Const(c) => {
+                            let bits = c.as_raw_i64();
+                            let opref = match bank {
+                                majit_ir::Type::Ref => ctx.const_ref(bits),
+                                majit_ir::Type::Float => ctx.const_float(bits),
+                                _ => ctx.const_int(bits),
+                            };
+                            (opref, bits)
+                        }
+                        // A virtual has an OpRef but no concrete value, and an
+                        // unassigned slot has neither. The walk executes, so a
+                        // register it cannot read a value out of is not a
+                        // register it can run past — decline the whole frame
+                        // rather than enter it half-seeded.
+                        RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => return None,
+                    };
+                    regs.push(crate::jit_state::GuardResumeReg {
+                        bank,
+                        index,
+                        opref,
+                        value,
+                    });
+                }
+            }
+            Some((resume_pc, regs))
+        })();
+        let Some((resume_pc, regs)) = seeded else {
+            self.meta.abort_trace(false);
+            self.clear_tracing_session_state();
+            self.resume_data_result = None;
+            self.last_bridge_is_exception_guard = false;
+            return None;
+        };
+
+        self.bridge_entered_at_guard_resume = true;
+        let mut entered = false;
+        self.merge_point(|meta, sym| {
+            // `merge_point` re-enters its closure for the `saved_pc`
+            // resumption a declined close asks for. The guard's position is a
+            // one-off; a resumption is an ordinary merge-point entry, which
+            // the `jit_merge_point!` wrapper owns. Returning here leaves
+            // tracing live and hands it over.
+            if std::mem::replace(&mut entered, true) {
+                return TraceAction::Continue;
+            }
+            meta.with_trace_ctx_and_token_resolver(
+                |ctx,
+                 resolve,
+                 rec_target,
+                 rec_decision,
+                 rec_exec,
+                 rec_exec_ref,
+                 rec_exec_float,
+                 rec_exec_void| {
+                    let runtime = crate::pyjitpl::ClosureRuntimeWithResolver::new(
+                        |pc: usize| pc,
+                        resolve,
+                        rec_target,
+                        rec_decision,
+                        rec_exec,
+                        rec_exec_ref,
+                        rec_exec_float,
+                        rec_exec_void,
+                    );
+                    S::trace_from_guard_resume_position(
+                        ctx, sym, &dispatch, resume_pc, target_pc, &runtime, &regs,
+                    )
+                    .unwrap_or(TraceAction::Abort)
+                },
+            )
+            .unwrap_or(TraceAction::Abort)
+        });
+        self.bridge_entered_at_guard_resume = false;
+
+        // Where the interpreter goes next. This is the `jit_merge_point!`
+        // hook's own single-pass handoff, in the same order and with the same
+        // steps: the walk advanced the state on the sym, so whichever arm
+        // answers has to push it into native `state` before the interpreter
+        // reads it. The hook runs for a walk that ended at a merge point; a
+        // walk that started at a guard ends the same way and owes the same
+        // transfer.
+        let mut outcome = self.take_single_pass_outcome();
+        // `pyjitpl.py:2954 convert_and_run_from_pyjitpl`: the walk stopped
+        // somewhere that is not a source-opcode boundary, so the half-executed
+        // opcodes are finished in the blackhole and the position comes from
+        // the merge point they reach. It outranks the walk's own pc for the
+        // same reason it does in the hook.
+        if let Some(pc) = self.run_pending_abort_blackhole(state, env) {
+            outcome = Some((pc, Vec::new()));
+        }
+        if let Some((pc, reds)) = outcome {
+            self.writeback_scalar_state_fields(state);
+            self.writeback_ref_scalar_state_fields(state);
+            self.writeback_virt_array_state_fields(state);
+            if !reds.is_empty() {
+                let resumed_meta = state.build_meta(pc, env);
+                state.restore_values(&resumed_meta, &reds);
+            }
+            state.recover_after_compiled_run();
+            self.log_single_pass_parity_resume(pc, state, env);
+            self.arm_single_pass_label_entry_on_next_back_edge(state);
+            self.discard_single_pass_resume();
+            // A terminal dispatch return means the interpreted function has
+            // returned. The hook `break`s out of the native loop for it; the
+            // back edge's own spelling of that is the out-of-range position
+            // its caller assigns to `pc`, which fails the loop's `pc < len`.
+            if self.take_single_pass_finish() {
+                return Some(usize::MAX);
+            }
+            return Some(pc);
+        }
+        // Neither handoff answered. The walk has already run the tail, so the
+        // blackhole arm is not available and the loop header is the only
+        // position left — it re-executes the opcodes between it and the guard.
+        // The counter is what says whether that ever happens; nothing else
+        // distinguishes this from a clean resume.
+        crate::mc_diag_bump(79); // guard_resume_bridge_no_handoff
+        state.recover_after_compiled_run();
+        Some(target_pc)
     }
 
     /// RPython warmstate.py:482-501 / compile.py:711 parity.
@@ -5061,23 +5328,37 @@ impl<S: JitState> JitDriver<S> {
                 .map(|pc| pc as usize)
                 .unwrap_or(target_pc);
 
-            // compile.py handle_fail. PyPy: `must_compile() and not
+            // compile.py handle_fail. `must_compile() and not
             // stack_almost_full()` → `_trace_and_compile_from_bridge`, else
             // `resume_in_blackhole`; the two are mutually exclusive and
             // neither returns. majit adapts by returning the interpreter
             // resume pc.
-            // Bridge tracing is deferred until AFTER the blackhole resume below
-            // computes the *green* resume pc. `guard_resume_pc`
-            // (`get_merge_point_pc`) is the guard's recovery `header_pc`, which
-            // for a `#[jit_interp]` state-field consumer is a byte offset into
-            // the dispatch *jitcode*, not an index into the interpreter's green
-            // `program`. Resuming the macro mainloop at that jitcode offset
-            // indexes `program[]` out of bounds. The blackhole walk re-derives
-            // the real green pc (the merge point the resumed jitcode reaches),
-            // and the bridge must be recorded from THAT pc — see `should_bridge`
-            // at the `ContinueRunningNormally` arm below. `back_edge_structured`
-            // is the macro-only back edge; pyre-jit-trace bridges via its own
-            // eval.rs path, so this does not touch the rustpython JIT.
+            //
+            // The bridging arm enters the walk at the guard's own jitcode
+            // position, so the rest of the opcode the guard sits inside is
+            // recorded rather than run where the bridge cannot see it. It
+            // declines — and only before running anything — for a state with
+            // no dispatch jitcode, a resume frame it cannot seed a register
+            // file from, or a bridge setup that gave up; the blackhole arm
+            // below is then the answer, exactly as when the guard does not
+            // `must_compile` at all.
+            if should_bridge
+                && let Some(pc) = self.bridge_from_guard_resume_position(
+                    &descr_arc,
+                    state,
+                    env,
+                    &raw_values,
+                    target_pc,
+                )
+            {
+                if crate::majit_log_enabled() {
+                    eprintln!(
+                        "[bridge] guard-resume bridge key={} trace={} fail={} resume_pc={}",
+                        green_key, trace_id, fail_index, pc,
+                    );
+                }
+                return Some(pc);
+            }
 
             // compile.py:711 resume_in_blackhole
             // compile.py `ResumeGuardDescr` storage — borrow
@@ -5290,14 +5571,18 @@ impl<S: JitState> JitDriver<S> {
                     if crate::majit_log_enabled() {
                         eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                     }
-                    // Whether the guard may source a bridge.
+                    // Whether the guard may source a bridge FROM HERE.
                     //
-                    // A bridge is entered from the guard, and it is recorded
-                    // from the green pc the walk below reports — the NEXT merge
-                    // point. Everything the walk ran to get there is the tail of
-                    // the opcode the guard sits inside, and the bridge does not
+                    // This is the fallback bridge — the one recorded from the
+                    // green pc the walk below reports, taken only when
+                    // `bridge_from_guard_resume_position` declined and the
+                    // blackhole ran. Its entry is the NEXT merge point, so
+                    // everything the walk ran to get there is the tail of the
+                    // opcode the guard sits inside, and the bridge does not
                     // contain it: the first failure runs it here and every later
-                    // one jumps into the bridge and skips it.
+                    // one jumps into the bridge and skips it. A bridge entered
+                    // at the guard's own position has no such gap and is not
+                    // gated.
                     //
                     // Values the tail computed are not the problem. The bridge
                     // is recorded against the state the walk LEFT, so whatever

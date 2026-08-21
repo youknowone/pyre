@@ -2975,6 +2975,33 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // fields like `selected` to `Const`, so only the identity register
             // reliably names the field).  Box → `input_arg(n)` + `fail_values[n]`;
             // Const → a folded pool constant.  MAJIT_BRIDGE_DEBUG dumps it.
+            // `pyjitpl.py rebuild_state_after_failure` →
+            // `MIFrame.setup_resume_at_op(pc)`: put the walk back at the
+            // guard's own jitcode position so the rest of the opcode it sits
+            // inside is traced rather than run where the trace cannot see it.
+            // The registers arrive already decoded; nothing here is
+            // machine-specific except the `Sym` type, which is why this
+            // forwards rather than generating a walk of its own.
+            fn trace_from_guard_resume_position<__R: majit_metainterp::JitCodeRuntime>(
+                ctx: &mut majit_metainterp::TraceCtx,
+                sym: &mut #sym_ty,
+                dispatch_jitcode: &majit_metainterp::JitCode,
+                resume_pc: usize,
+                outer_program_pc: usize,
+                runtime: &__R,
+                regs: &[majit_metainterp::GuardResumeReg],
+            ) -> Option<majit_metainterp::TraceAction> {
+                Some(majit_metainterp::trace_jitcode_at_resume_position(
+                    ctx,
+                    sym,
+                    dispatch_jitcode,
+                    resume_pc,
+                    outer_program_pc,
+                    runtime,
+                    regs,
+                ))
+            }
+
             #[allow(clippy::reversed_empty_ranges)]
             fn setup_bridge_sym(
                 sym: &mut #sym_ty,

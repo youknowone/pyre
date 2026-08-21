@@ -5,7 +5,8 @@ pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
     StandaloneFrameStack, residual_write_effect_info, trace_jitcode,
-    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
+    trace_jitcode_at_resume_position, trace_jitcode_from_merge_point, trace_jitcode_with_args,
+    trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{
@@ -1476,6 +1477,16 @@ pub struct MetaInterp<M: Clone> {
     /// via `writeback_scalar_state_fields_from_values`. `None` outside
     /// single-pass or when the state has no scalar fields.
     pub(crate) single_pass_scalar_values: Option<Vec<i64>>,
+    /// The ref twin of [`Self::single_pass_scalar_values`], stashed at the
+    /// same point and in ref-scalar index order.
+    ///
+    /// The `jit_merge_point!` hook does not read it, and does not need to: it
+    /// runs with a native `state` whose ref fields the interpreter itself has
+    /// been keeping current. A bridge entered at a guard has no such
+    /// interpreter — the compiled run left native `state` at its trace-start
+    /// image and only the guard's failargs describe the real one — so the
+    /// walk's ref fields are the only current copy and have to travel.
+    pub(crate) single_pass_ref_scalar_values: Option<Vec<i64>>,
     /// Single-pass tracing: the walk-final concrete values of the loop-carried
     /// virtualizable ARRAY elements, captured off the active `TraceCtx`
     /// (`collect_virtualizable_element_values`) at the CloseLoop point. The walk
@@ -3147,6 +3158,7 @@ impl<M: Clone> MetaInterp<M> {
             single_pass_finish: false,
             back_edge_finish: None,
             single_pass_scalar_values: None,
+            single_pass_ref_scalar_values: None,
             single_pass_virt_array_values: None,
             pending_abort_blackhole: None,
             single_pass_compact_label_values: None,

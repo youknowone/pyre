@@ -9464,22 +9464,36 @@ where
     let action = machine.run_to_end(ctx, sym, runtime);
     drop(machine);
 
-    // A fresh trace executes the portal JitCode forward against the real
-    // interpreter-owned heap.  If that walk aborts, its root frame still has
-    // the source interpreter pc in i0: dispatch advances i0 before executing
-    // the opcode arm.  Preserve that position before the temporary frame is
-    // dropped so the jit_merge_point single-pass handoff can resume after the
-    // committed prefix instead of replaying it from the trace header.
-    //
-    // i0 alone only names a sound resume position when the walk stopped at a
-    // source-opcode boundary; `pyjitpl.py:2949
-    // run_blackhole_interp_to_cancel_tracing` does not depend on that, because
-    // `blackhole.py convert_and_run_from_pyjitpl` finishes the current
-    // jitcode frames in the blackhole and takes the resume position from the
-    // `jit_merge_point` they reach.  Hand the whole framestack to the abort
-    // consumer so it can do that; i0 stays as the fallback for a consumer that
-    // declines the conversion.  CloseLoop and Finish already capture their own
-    // positions; only Abort needs this recovery handoff.
+    publish_walk_abort_handoff(ctx, &action, &mut standalone);
+    action
+}
+
+/// Publish an aborted walk's resume handoff onto the trace ctx.
+///
+/// The walk executes the portal JitCode forward against the real
+/// interpreter-owned heap.  If it aborts, its root frame still has the source
+/// interpreter pc in i0: dispatch advances i0 before executing the opcode arm.
+/// Preserve that position before the temporary frame is dropped so the
+/// jit_merge_point single-pass handoff can resume after the committed prefix
+/// instead of replaying it from the trace header.
+///
+/// i0 alone only names a sound resume position when the walk stopped at a
+/// source-opcode boundary; `pyjitpl.py:2949
+/// run_blackhole_interp_to_cancel_tracing` does not depend on that, because
+/// `blackhole.py convert_and_run_from_pyjitpl` finishes the current jitcode
+/// frames in the blackhole and takes the resume position from the
+/// `jit_merge_point` they reach.  Hand the whole framestack to the abort
+/// consumer so it can do that; i0 stays as the fallback for a consumer that
+/// declines the conversion.  CloseLoop and Finish already capture their own
+/// positions; only Abort needs this recovery handoff.
+///
+/// Shared by every walk entry: where the walk started does not change what a
+/// consumer needs in order to resume from where it stopped.
+fn publish_walk_abort_handoff(
+    ctx: &mut TraceCtx,
+    action: &TraceAction,
+    standalone: &mut StandaloneFrameStack,
+) {
     if matches!(action, TraceAction::Abort) && !standalone.frames.is_empty() {
         if let Some(pc) = standalone.frames.frames[0]
             .int_values
@@ -9551,6 +9565,71 @@ where
             ctx.aborted_framestack = Some(std::mem::take(&mut standalone.frames));
         }
     }
+}
+
+/// Enter the walk at the jitcode position a guard failed on.
+///
+/// `pyjitpl.py handle_guard_failure` →
+/// `initialize_state_from_guard_failure` → `rebuild_state_after_failure`
+/// rebuilds one `MIFrame` per encoded resume section, fills its live registers
+/// from the guard's numbering, and calls `setup_resume_at_op(pc)` on each —
+/// whose whole body is `self.pc = pc`.  `interpret()` then continues the walk
+/// from there, so everything the failing opcode had left to do is recorded
+/// into the bridge instead of being run somewhere the bridge cannot see.
+///
+/// The other entries in this file start a walk at a position the interpreter
+/// is re-enterable at — jitcode entry, or a merge point — and derive the
+/// register file by running forward from it.  A guard is neither: it sits
+/// mid-opcode, so the register file cannot be re-derived and has to be handed
+/// over.  `regs` is that file, one entry per live register.
+///
+/// `outer_program_pc` is the interpreter-space anchor `run_to_end` reports
+/// portal positions against; the guard's own position is jitcode-space and
+/// says nothing about it.
+pub fn trace_jitcode_at_resume_position<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    jitcode: &JitCode,
+    resume_pc: usize,
+    outer_program_pc: usize,
+    runtime: &R,
+    regs: &[crate::jit_state::GuardResumeReg],
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
+    let jitcode_arc = Arc::new(jitcode.clone());
+    let mut frame = MIFrame::setup(jitcode_arc, resume_pc, None, Some(ctx));
+    for reg in regs {
+        let index = reg.index as usize;
+        let (bank_regs, bank_values) = match reg.bank {
+            majit_ir::Type::Ref => (&mut frame.ref_regs, &mut frame.ref_values),
+            majit_ir::Type::Float => (&mut frame.float_regs, &mut frame.float_values),
+            _ => (&mut frame.int_regs, &mut frame.int_values),
+        };
+        // A register the jitcode does not declare is one the guard cannot have
+        // been holding, so there is no value to lose by skipping it — and
+        // indexing past the bank would panic on a mismatch that is already
+        // recoverable.
+        if index >= bank_regs.len() {
+            continue;
+        }
+        bank_regs[index] = Some(reg.opref);
+        bank_values[index] = Some(reg.value);
+    }
+    // The walker reads from `code_cursor`; `pc` is what a snapshot taken
+    // inside this frame reports. `setup_resume_at_op` is both.
+    frame.code_cursor = resume_pc;
+    frame.pc = resume_pc;
+
+    let mut standalone = StandaloneFrameStack::new();
+    standalone.frames.push(frame);
+    let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
+    machine.set_outer_program_pc(outer_program_pc);
+    let action = machine.run_to_end(ctx, sym, runtime);
+    drop(machine);
+    publish_walk_abort_handoff(ctx, &action, &mut standalone);
     action
 }
 

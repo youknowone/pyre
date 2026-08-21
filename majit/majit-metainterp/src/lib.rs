@@ -169,7 +169,7 @@ pub use io_buffer::{
     io_buffer_write_fmt, jit_write_number_i64, jit_write_utf8_codepoint,
 };
 pub use jit_state::{
-    DeoptMaterializationCache, JitState, PendingFieldWriteLayout, ResumeDataResult,
+    DeoptMaterializationCache, GuardResumeReg, JitState, PendingFieldWriteLayout, ResumeDataResult,
     bridge_decode_red,
 };
 pub use jitcode::{
@@ -211,8 +211,8 @@ pub use pyjitpl::{
     resolve_exception_context_for_recording, resolve_exception_context_hook_address,
     set_record_application_traceback_hook, set_record_discarded_level_traceback_hook,
     set_record_inline_application_traceback_hook, set_resolve_exception_context_hook,
-    trace_jitcode, trace_jitcode_from_merge_point, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    trace_jitcode, trace_jitcode_at_resume_position, trace_jitcode_from_merge_point,
+    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
     BridgeVirtualCache, decode_fieldnum, default_bridge_array_descr, emit_pending_field_op,
@@ -1288,7 +1288,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 79;
+pub const MC_DIAG_SLOTS: usize = 80;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -1636,6 +1636,11 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     // runnable today, so a zero here is the difference between "the resumption
     // is correct" and "the resumption has never run".
     "retrace_close_resumed",
+    // A bridge entered at a guard's own position whose walk left no resume
+    // handoff behind — neither the single-pass outcome nor the abort
+    // conversion answered. The fallback re-executes the opcodes between the
+    // loop header and the guard, so a non-zero here is a defect, not a cost.
+    "guard_resume_bridge_no_handoff",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.
