@@ -1256,7 +1256,7 @@ pub unsafe fn module_dict_strategy_current_version_qmut(
     Some((*strategy).current_version_qmut())
 }
 
-/// `pyjitpl.py mutatebox.nonnull()` for this strategy's `version?`.
+/// `pyjitpl.py MIFrame.opimpl_jit_force_quasi_immutable mutatebox.nonnull()` for this strategy's `version?`.
 ///
 /// # Safety
 /// `strategy` must be null or point at a valid `ModuleDictStrategy`.

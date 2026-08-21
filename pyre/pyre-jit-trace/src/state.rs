@@ -5159,7 +5159,7 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
     // quasiimmut.py:125 `self.constantfieldbox =
     // self.get_current_constant_fieldvalue()` — the field's value at the moment
-    // the trace baked it.  `heap.py is_still_valid_for` compares it against
+    // the trace baked it.  `heap.py OptHeap.optimize_QUASIIMMUT_FIELD is_still_valid_for` compares it against
     // the live value and abandons the loop when they disagree, so it has to be
     // captured here; by the time the optimizer runs, the change it is looking
     // for has already happened.
@@ -5212,7 +5212,7 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
 /// get_current_qmut_instance`), so it exists for the rest of the recording,
 /// which is what arms `opimpl_jit_force_quasi_immutable`'s `mutatebox.nonnull()`
 /// (`pyjitpl.py:1112`) for a write reached later in that same trace. The
-/// instance rides on the descr from here to `heap.py is_still_valid_for`
+/// instance rides on the descr from here to `heap.py OptHeap.optimize_QUASIIMMUT_FIELD is_still_valid_for`
 /// and `compile.py register_loop_token`, so neither has to walk from
 /// the struct back to the hidden `mutate_*` slot a second time.
 ///

@@ -6486,7 +6486,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // `unroll.py disable_retracing_if_max_retrace_guards` writes
         // `retraced_count = sys.maxint`, and the one reader of that value is
-        // `unroll.py if cell_token.retraced_count < limit` — it stops the
+        // `unroll.py UnrollOptimizer.optimize_bridge if cell_token.retraced_count < limit` — it stops the
         // cell from RETRACING and nothing else. Upstream never lets it decide
         // whether a loop may be compiled: `pyjitpl.py:3185-3189` gives up on a
         // key that already has compiled targets, which the
@@ -6510,7 +6510,7 @@ impl<M: Clone> MetaInterp<M> {
         // gets a fresh `JitCellToken` (`compile.py:220` and `:266` both call
         // `make_jitcell_token`), whose count starts at zero. Only
         // `compile_retrace` reuses a token, and it reuses the live one
-        // (`compile.py get_procedure_token`), so that is where a retrace
+        // (`compile.py compile_retrace get_procedure_token`), so that is where a retrace
         // budget legitimately persists.
 
         // compile.py:269-270 `jitcell_token = cross_loop.jitcell_token`: mark
@@ -13144,7 +13144,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `fail_descr` is the FailDescr from the guard that failed.
     /// `bridge_ops` are the recorded bridge trace operations.
     /// `bridge_inputargs` are the input arguments for the bridge.
-    /// `unroll.py cell_token = jump_op.getdescr()` and
+    /// `unroll.py UnrollOptimizer.optimize_bridge cell_token = jump_op.getdescr()` and
     /// `unroll.py jitcelltoken = jump_op.getdescr()`: the jitcell whose
     /// `target_tokens` `optimize_bridge` scans, and whose `retraced_count` it
     /// reads and charges, is the one the closing JUMP *enters* — never the loop
@@ -13991,7 +13991,7 @@ impl<M: Clone> MetaInterp<M> {
         // runs once per LIVE box while `rebuild_from_resumedata` walks the
         // resume data, not once per `fail_arg_types` slot, and `compile_bridge`
         // already does exactly that: it zips `liveboxes` with `frontend_boxes`
-        // under `bridgeopt.py assert len(frontend_boxes) == len(liveboxes)`
+        // under `bridgeopt.py deserialize_optimizer_knowledge assert len(frontend_boxes) == len(liveboxes)`
         // and stamps only the InputArg whose OpRef IS a livebox.
         //
         // Stamping every slot positionally instead gives a value to slots the
@@ -18227,7 +18227,7 @@ pub struct MetaInterpStaticData {
     /// The one flat jitcode table. `codewriter.py:68` stamps each entry with
     /// its position (`jitcode.index = len(all_jitcodes)` at the drain in
     /// `codewriter.py:80`), and every resume frame carries that absolute index,
-    /// so `resume.py jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`
+    /// so `resume.py rebuild_from_resumedata jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`
     /// resolves a frame with no per-driver or parent-relative bookkeeping.
     ///
     /// Upstream fills this once at translation, but the structure itself is a
@@ -18748,7 +18748,7 @@ impl MetaInterpStaticData {
         // reshuffle.
     }
 
-    /// Narrow `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`
+    /// Narrow `pyjitpl.py MetaInterpStaticData.finish_setup self.liveness_info = "".join(asm.all_liveness)`
     /// slice intended for state-field JIT.  Copies the
     /// already-populated `Assembler::all_liveness` byte stream into
     /// `self.liveness_info` and seeds the cached opcode-id fields

@@ -595,7 +595,7 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, crate::P
                 }
             }
         }
-        // `app_abc.py _abc_subclasscheck` `for rcls in cls._abc_registry:` — subclass of a
+        // `app_abc.py _abc_subclasscheck for rcls in cls._abc_registry:` — subclass of a
         // registered class (recursive).  `SimpleWeakSet.__iter__` copies the
         // set before yielding and skips entries whose referent is gone, so the
         // walk survives a collection that fires the discard callback partway
@@ -686,14 +686,14 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls_slot = roots.publish(&[args[0]]);
     let instance_slot = roots.publish(&[args[1]]);
 
-    // `app_abc.py _abc_instancecheck` `subclass = instance.__class__`.
+    // `app_abc.py _abc_instancecheck subclass = instance.__class__`.
     let subclass = crate::baseobjspace::getattr_str(roots.get(instance_slot), "__class__")?;
     let subclass_slot = roots.publish(&[subclass]);
     if weak_cache_contains(roots.get(cls_slot), "_abc_cache", roots.get(subclass_slot))? {
         return Ok(w_bool_from(true));
     }
 
-    // `app_abc.py _abc_instancecheck` `subtype = type(instance)` — the instance's real class.
+    // `app_abc.py _abc_instancecheck subtype = type(instance)` — the instance's real class.
     // User-defined instances carry the generic layout marker in `ob_type` and
     // the real class in `w_class`, so reading `ob_type` directly would resolve
     // to `object`; `r#type` returns the class for both builtin and user
@@ -725,7 +725,7 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             roots.get(subclass_slot),
         )?));
     }
-    // `app_abc.py _abc_instancecheck` `any(cls.__subclasscheck__(c) for c in (subclass, subtype))`.
+    // `app_abc.py _abc_instancecheck any(cls.__subclasscheck__(c) for c in (subclass, subtype))`.
     for slot in [subclass_slot, subtype_slot] {
         if subclasscheck_of(roots.get(cls_slot), roots.get(slot))? {
             return Ok(w_bool_from(true));

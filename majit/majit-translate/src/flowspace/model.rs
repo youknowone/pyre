@@ -4343,7 +4343,7 @@ pub struct GraphFunc {
     /// the C backend (`rpython/translator/c/database.py` walks
     /// `getattr(callable, 'exported_symbol', False)`), which is not
     /// ported; the flag still rides along on `GraphFunc` so line-by-
-    /// line surface with `interactive.py export_symbol(entry_point)`
+    /// line surface with `interactive.py Translation.__init__ export_symbol(entry_point)`
     /// stays intact.
     ///
     /// Wrapped in `Arc<AtomicBool>` so every `Clone`-produced copy of

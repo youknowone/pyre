@@ -3212,7 +3212,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 /// registry that belongs to the interpreter rather than to one mutator.  Its
 /// Python objects are handed to the collector by [`walk_audit_hooks_gc`].
 pub struct AuditHolder {
-    /// `vm.py self.hooks_w = None` projected onto a byte at a fixed offset:
+    /// `vm.py AuditHolder.__init__ self.hooks_w = None` projected onto a byte at a fixed offset:
     /// false while upstream's list is None, which is exactly the `vm.py:481`
     /// early-out.  The projection exists because the JIT reads this field
     /// through a descriptor, and `Box<[T]>` has no target-stable null spelling

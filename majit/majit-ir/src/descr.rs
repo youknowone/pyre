@@ -103,7 +103,7 @@ use indexmap::IndexMap;
 ///   matching `virtualref.rs` `VREF_FIELD_*` packed constants are
 ///   retired.  RPython caches real `Arc<dyn FieldDescr>` /
 ///   `Arc<dyn SizeDescr>` on the equivalent struct
-///   (`virtualref.py cpu.fielddescrof`); pyre now does the same
+///   (`virtualref.py VirtualRefInfo.__init__ cpu.fielddescrof`); pyre now does the same
 ///   with `VirtualRefInfo::{descr, descr_virtual_token, descr_forced}`.
 ///   The module-level vref descriptor constructors return the same
 ///   cached Arcs, so `OptVirtualize` emits SETFIELD_GC ops with the

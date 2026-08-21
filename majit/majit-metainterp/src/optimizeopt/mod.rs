@@ -701,7 +701,7 @@ pub struct OptContext {
     /// `optimizer.py` `self.quasi_immutable_deps = None` (initialized
     /// lazily as a dict in `heap.py:821-823`). Each entry is one `QuasiImmut`
     /// instance the trace folded a field of, exactly as upstream keys the dict
-    /// (`heap.py quasi_immutable_deps[qmutdescr.qmut] = None`); PyPy
+    /// (`heap.py OptHeap.optimize_QUASIIMMUT_FIELD quasi_immutable_deps[qmutdescr.qmut] = None`); PyPy
     /// uses `dict[k] = None` for set semantics, but the HashMap house rule
     /// forbids that — pyre uses a Vec with linear-scan dedup on instance
     /// identity. Typical size is small (< a few dozen entries per trace), so

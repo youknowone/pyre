@@ -1055,7 +1055,7 @@ impl OptHeap {
     /// `compute_bitstrings` (`effectinfo.py descr.ei_index = …`).
     /// `effectinfo.py descr.ei_index = sys.maxint` is the sentinel
     /// for descrs absent from any EI's raw set;
-    /// `bitstring.py if byte_number >= len(bitstring)` then makes
+    /// `bitstring.py bitcheck if byte_number >= len(bitstring)` then makes
     /// `bitcheck` return false out of range. Pyre matches by returning
     /// `u32::MAX`, whose `byte_number = u32::MAX >> 3` is far past any
     /// realistic bitstring length so `bitcheck` shorts to false the

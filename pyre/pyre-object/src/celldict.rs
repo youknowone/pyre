@@ -748,7 +748,7 @@ impl ModuleDictStrategy {
         self.version_watchers.get_current_qmut_instance()
     }
 
-    /// `pyjitpl.py mutatebox.nonnull()` — whether some trace or loop is
+    /// `pyjitpl.py MIFrame.opimpl_jit_force_quasi_immutable mutatebox.nonnull()` — whether some trace or loop is
     /// watching `version?` right now.
     pub fn version_qmut_installed(&self) -> bool {
         self.version_watchers.is_installed()
