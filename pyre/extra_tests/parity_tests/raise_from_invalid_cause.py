@@ -68,7 +68,7 @@ def invalid_cause_still_builds_the_raised_class():
     assert Raised.constructed == before + 1, (
         f"the raised class was not instantiated ({before} -> {Raised.constructed})"
     )
-    assert "cause" in message, message
+    assert message == "exception causes must derive from BaseException", message
 
 
 def a_bad_raised_value_reports_its_own_error():
@@ -79,7 +79,7 @@ def a_bad_raised_value_reports_its_own_error():
         message = str(error)
     else:
         raise AssertionError("raising a non-exception must raise TypeError")
-    assert "cause" not in message, message
+    assert message == "exceptions must derive from BaseException", message
 
 
 def a_cause_constructor_error_propagates():
@@ -93,7 +93,10 @@ def a_cause_constructor_error_propagates():
         raise Raised from CauseThatRaises
     except ValueError as error:
         assert str(error) == "cause constructor", error
-    except BaseException as other:
+    except Exception as other:
+        # Narrower than `BaseException` on purpose: a KeyboardInterrupt or a
+        # SystemExit arriving here is the interpreter being asked to stop, not
+        # this assertion failing, and it has to keep travelling.
         raise AssertionError(
             f"the cause constructor's error was swallowed: {type(other).__name__}"
         ) from None
@@ -134,9 +137,10 @@ def a_class_cause_must_answer_an_exception():
             raise AssertionError(
                 f"{constructor.__name__} answered a non-exception cause unchallenged"
             )
-        assert "should have returned an instance of BaseException" in message, message
-        assert constructor.__name__ in message, message
-        assert answered in message, message
+        assert message == (
+            f"calling <class '__main__.{constructor.__name__}'> should have "
+            f"returned an instance of BaseException, not <class '{answered}'>"
+        ), message
         assert Raised.constructed == before + 1, (
             f"the raised class was not instantiated ({before} -> {Raised.constructed})"
         )
@@ -150,8 +154,7 @@ def a_bad_raised_value_outranks_a_bad_class_cause():
         message = str(error)
     else:
         raise AssertionError("raising a non-exception must raise TypeError")
-    assert "should have returned an instance of BaseException" not in message, message
-    assert "cause" not in message, message
+    assert message == "exceptions must derive from BaseException", message
 
 
 for _ in range(ROUNDS):
