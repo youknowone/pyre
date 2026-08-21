@@ -7824,8 +7824,7 @@ mod tests {
             Vec::new(),
             llops.clone(),
         );
-        *hop.r_result.borrow_mut() =
-            Some(super::stringbuilder_repr() as std::sync::Arc<dyn Repr>);
+        *hop.r_result.borrow_mut() = Some(super::stringbuilder_repr() as std::sync::Arc<dyn Repr>);
         let result = rtyper
             .translate_operation(&hop)
             .unwrap_or_else(|err| panic!("translate_operation newstringbuilder: {err:?}"));

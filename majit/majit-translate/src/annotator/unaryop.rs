@@ -6085,7 +6085,8 @@ mod tests {
             ("build", "stringbuilder_method_build"),
             ("getlength", "stringbuilder_method_getlength"),
         ] {
-            let SomeValue::BuiltinMethod(bound) = s_builder.find_method(method_name).unwrap() else {
+            let SomeValue::BuiltinMethod(bound) = s_builder.find_method(method_name).unwrap()
+            else {
                 panic!("StringBuilder.{method_name} must be recognized");
             };
             assert_eq!(bound.analyser_name, analyser);
@@ -6093,7 +6094,8 @@ mod tests {
         assert!(s_builder.find_method("frobnicate").is_none());
 
         // build() → SomeString.
-        let build = SomeBuiltinMethod::new("stringbuilder_method_build", s_builder.clone(), "build");
+        let build =
+            SomeBuiltinMethod::new("stringbuilder_method_build", s_builder.clone(), "build");
         let no_args = super::super::argument::ArgumentsForTranslation::new(vec![], None, None);
         assert!(matches!(
             call_builtin_method(&ann, &build, &no_args).expect("build call"),
@@ -6101,8 +6103,11 @@ mod tests {
         ));
 
         // getlength() → SomeInteger.
-        let getlength =
-            SomeBuiltinMethod::new("stringbuilder_method_getlength", s_builder.clone(), "getlength");
+        let getlength = SomeBuiltinMethod::new(
+            "stringbuilder_method_getlength",
+            s_builder.clone(),
+            "getlength",
+        );
         let no_args2 = super::super::argument::ArgumentsForTranslation::new(vec![], None, None);
         assert!(matches!(
             call_builtin_method(&ann, &getlength, &no_args2).expect("getlength call"),

@@ -1933,9 +1933,7 @@ pub fn translate_op(
                                 "getattr",
                                 vec![
                                     receiver,
-                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                                        "build",
-                                    ))),
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("build"))),
                                 ],
                                 bound_method.clone(),
                             ),

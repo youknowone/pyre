@@ -5470,11 +5470,7 @@ impl<'a> Lowering<'a> {
     /// `move c` of a builder-mode accumulator, returning the built
     /// `SomeString` Variable.  The builder Ref was minted at the ctor and
     /// mutated in place by the appends, so it is read (not rebound) here.
-    fn resolve_builder_build(
-        &mut self,
-        mir_bb: usize,
-        c: usize,
-    ) -> Result<Variable, LowerError> {
+    fn resolve_builder_build(&mut self, mir_bb: usize, c: usize) -> Result<Variable, LowerError> {
         let bb_id = self.block_id[mir_bb];
         let builder = self.local_var[c].clone().ok_or_else(|| {
             LowerError::Unsupported(format!(
@@ -7979,8 +7975,7 @@ impl<'a> Lowering<'a> {
                             },
                         });
                     } else {
-                        let concat =
-                            emit_str_add(&mut self.graph, bb_id, &acc_val, &args[piece_i]);
+                        let concat = emit_str_add(&mut self.graph, bb_id, &acc_val, &args[piece_i]);
                         self.local_var[buf_local] = Some(concat);
                     }
                     self.local_var[dest_local] = Some(
