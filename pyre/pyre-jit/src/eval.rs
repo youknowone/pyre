@@ -7582,7 +7582,7 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     // take now does.
     //
     // The shape no longer reaches it here: #1174 made that walk raise
-    // `callee_inline_blackhole_required` where it raised
+    // `callee_inline_abort` with `blackhole_required` set where it raised
     // `callee_inline_unsupported`, so it stops aborting — 0 in-flight
     // takes and 0 divergences across the whole probe family — which also
     // means this base cannot re-witness the fix end to end; the selection
