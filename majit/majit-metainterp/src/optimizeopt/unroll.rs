@@ -3721,16 +3721,18 @@ impl OptUnroll {
             // `_jump_to_existing_trace` runs `self.optimizer.patchguardop` is
             // always populated.
             //
-            // pyre mirrors that on the LOOP path only: the GFC comes from the
-            // close-loop path and Phase 1 captures it into `patchguardop`,
-            // which Phase 2 inherits. A bridge records no GFC at all, so on
-            // the `optimize_bridge` -> `try_jump_to_existing_trace` route the
-            // only patchguardop is the stand-in `optimize_bridge` synthesizes
-            // from one of the bridge's own body guards — and a bridge whose
-            // body carries no guard with a resume position leaves even that
-            // unset. Upstream cannot reach that state, because :2991-2993
-            // emits the GFC before the closing JUMP of every trace that
-            // reaches `reached_loop_header`, a bridge grown from a
+            // pyre emits the GFC on both closes: the own-loop close gets it
+            // from `close_loop_args_at` and Phase 1 captures it into
+            // `patchguardop`, which Phase 2 inherits; the merge-point crossing
+            // that closes a bridge emits it in `jitcode_dispatch/mod.rs`. A
+            // crossing that skipped that emit — a previously declined close, or
+            // a walk that is not the authoritative top-level executor — reaches
+            // `optimize_bridge` without one, and falls back to the stand-in it
+            // synthesizes from one of the bridge's own body guards; a bridge
+            // whose body carries no guard with a resume position leaves even
+            // that unset. Upstream cannot reach that state, because
+            // `reached_loop_header` emits the GFC before the closing JUMP of
+            // every trace that reaches it, a bridge grown from a
             // ResumeGuardDescr included.
             //
             // Decline this target token rather than dereference a None, the
