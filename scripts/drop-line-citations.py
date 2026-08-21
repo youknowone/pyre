@@ -170,6 +170,20 @@ def rewrite_line(line, index, by_path, stats, refused):
     return "".join(out)
 
 
+def keep_output_printable():
+    """Report through the console's codec without dying on it.
+
+    The comments these scripts quote carry em dashes, and a Windows box whose
+    code page is not UTF-8 cannot spell one: piping the report into anything
+    raises `UnicodeEncodeError` before a single finding reaches the reader.
+    `backslashreplace` spells those characters out instead, so the report
+    survives a console that cannot render it.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -179,6 +193,7 @@ def main():
     ap.add_argument("--report", action="store_true", help="print refusal samples")
     ap.add_argument("--limit", type=int, default=0, help="stop after N files (bisecting aid)")
     args = ap.parse_args()
+    keep_output_printable()
 
     root = args.root.resolve()
     search_roots = args.search_roots or list(SEARCH_ROOTS)

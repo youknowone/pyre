@@ -23,6 +23,20 @@ import re
 import subprocess
 import sys
 
+def keep_output_printable():
+    """Report through the console's codec without dying on it.
+
+    The comments these scripts quote carry em dashes, and a Windows box whose
+    code page is not UTF-8 cannot spell one: piping the report into anything
+    raises `UnicodeEncodeError` before a single finding reaches the reader.
+    `backslashreplace` spells those characters out instead, so the report
+    survives a console that cannot render it.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
+
 CITE = re.compile(r"(?:[A-Za-z0-9_.-]+/)*[a-z_][a-z0-9_]*\.py:\d+")
 ESCAPE = "allow-line-citation"
 
@@ -56,6 +70,7 @@ def main():
     ap.add_argument("--base", help="diff against this ref instead of the index")
     ap.add_argument("files", nargs="*", help="ignored; pre-commit passes them")
     args = ap.parse_args()
+    keep_output_printable()
 
     bad = []
     for path, lineno, text in added_lines(args.base):
