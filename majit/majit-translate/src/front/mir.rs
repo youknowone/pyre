@@ -3090,17 +3090,17 @@ struct Lowering<'a> {
     /// Distinguishes the collapse case from a genuine Ref tuple `.N` read
     /// in [`Lowering::resolve_place`].
     binop_result_locals: std::collections::HashSet<usize>,
-    /// MIR locals a builder-form re-lowering has proven to be builder-mode
-    /// accumulators ([`is_builder_mode_accumulator`]): a single-def
-    /// `Wtf8Buf`/`String` `new`/`with_capacity` ctor, every borrow an
-    /// append, exactly one terminal `move`.  Empty in the default concat
-    /// lowering (so every builder-emit site below is inert); populated by
-    /// [`Lowering::enable_builder_mode`] only when re-lowering a *lifted*
-    /// graph, where the ctor / append / terminal-`move` sites emit the
-    /// `__pyre_stringbuilder_{new,append,build}` markers
-    /// (`flowspace_adapter` → `newstringbuilder` / `append` / `build`)
-    /// instead of the `ll_strconcat` fallback.
-    builder_mode_locals: std::collections::HashSet<usize>,
+    /// Whether this is a builder-form re-lowering: `false` in the default
+    /// concat lowering (so every builder-emit site below is inert), set `true`
+    /// by [`Lowering::enable_builder_mode`] only when re-lowering a *lifted*
+    /// graph, where the ctor / append / terminal-`move` sites of a builder-mode
+    /// accumulator emit the `__pyre_stringbuilder_{new,append,build}` markers
+    /// (`flowspace_adapter` → `newstringbuilder` / `append` / `build`) instead of
+    /// the `ll_strconcat` fallback.  Whether a given local *is* such an
+    /// accumulator is resolved on demand from `body`
+    /// ([`is_builder_mode_accumulator`]) at each emit site — no per-local side
+    /// table, so nothing can drift from the MIR that is the source of truth.
+    builder_mode: bool,
     /// MIR locals bound by a devirtualized workspace `Index::index` /
     /// `IndexMut::index_mut` call, mapped to the `(base, index)`
     /// operand pair.  Those impls bottom out at raw-slice
@@ -3426,7 +3426,7 @@ impl<'a> Lowering<'a> {
             ],
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
-            builder_mode_locals: std::collections::HashSet::new(),
+            builder_mode: false,
             index_elem_alias: std::collections::HashMap::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
@@ -3455,26 +3455,23 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Switch this lowering to builder form: record every builder-mode
-    /// accumulator local ([`is_builder_mode_accumulator`]) so the ctor /
-    /// append / terminal-`move` sites emit the `StringBuilder` markers
+    /// Switch this lowering to builder form so the ctor / append /
+    /// terminal-`move` sites of a builder-mode accumulator
+    /// ([`is_builder_mode_accumulator`]) emit the `StringBuilder` markers
     /// instead of `ll_strconcat`.  The two-pass driver calls this only for
     /// a graph the concat-form prepass already proved lifts, so the markers
     /// only ever reach the flowspace-adapter (Match) path, never the legacy
     /// walker (Skip) — where an unknown marker would residualise and crash.
     /// Returns whether any accumulator was found (a graph with none needs no
-    /// builder variant).
+    /// builder variant).  Membership is resolved on demand at each emit site,
+    /// so this records no per-local table — only the mode flag.
     #[allow(dead_code)] // wired by the make_jitcodes driver (#56)
     fn enable_builder_mode(&mut self) -> bool {
+        self.builder_mode = true;
         let n_locals = self.body.locals.locals.len();
         // Locals 0 (return) and 1..=arg_count (parameters) are never fresh
         // owned accumulators (see [`append_accumulator_of_arg_temp`]).
-        for c in self.arg_count + 1..n_locals {
-            if is_builder_mode_accumulator(self.body, self.llbc, c) {
-                self.builder_mode_locals.insert(c);
-            }
-        }
-        !self.builder_mode_locals.is_empty()
+        (self.arg_count + 1..n_locals).any(|c| is_builder_mode_accumulator(self.body, self.llbc, c))
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
@@ -5454,9 +5451,11 @@ impl<'a> Lowering<'a> {
                 // (`flowspace_adapter` → getattr("build") + simple_call →
                 // `SomeString`) instead of moving the concat accumulator out.
                 // Only a bare `Local(c)` move qualifies; a projection falls
-                // through.  Inert unless `builder_mode_locals` was populated.
+                // through.  Inert unless this is a builder-form re-lowering of a
+                // builder-mode accumulator (resolved on demand from `body`).
                 if let PlaceKind::Local(i) = place.kind
-                    && self.builder_mode_locals.contains(&(i as usize))
+                    && self.builder_mode
+                    && is_builder_mode_accumulator(self.body, self.llbc, i as usize)
                 {
                     return self.resolve_builder_build(mir_bb, i as usize);
                 }
@@ -7896,9 +7895,12 @@ impl<'a> Lowering<'a> {
                 // `StringBuilder` once via the `__pyre_stringbuilder_new`
                 // marker instead of the concat empty string; later appends
                 // mutate it in place.  Placed before the method-specific arms
-                // so it preempts any generic ctor lowering.  Inert unless
-                // `builder_mode_locals` was populated ([`enable_builder_mode`]).
-                if self.builder_mode_locals.contains(&dest_local) {
+                // so it preempts any generic ctor lowering.  Inert unless this is
+                // a builder-form re-lowering ([`enable_builder_mode`]); the
+                // accumulator test resolves on demand from `body`.
+                if self.builder_mode
+                    && is_builder_mode_accumulator(self.body, self.llbc, dest_local)
+                {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7955,7 +7957,9 @@ impl<'a> Lowering<'a> {
                     let acc_val = self.local_var[buf_local]
                         .clone()
                         .unwrap_or_else(|| args[acc_i].clone());
-                    if self.builder_mode_locals.contains(&buf_local) {
+                    if self.builder_mode
+                        && is_builder_mode_accumulator(self.body, self.llbc, buf_local)
+                    {
                         // Builder form: `b.append(piece)` mutates the buffer in
                         // place and returns `()`, so — unlike the concat rebind
                         // below — the accumulator binding is unchanged.  Emit the
@@ -14478,7 +14482,7 @@ fn str_builder_append_args(llbc: &Llbc, reg: &RegularCall) -> Option<(usize, usi
         // under `pyre_interpreter::display`; the `Wtf8Buf` impl resolves to the
         // `Wtf8Buf` owner.  Both append `self` (arg 0) onto the `&mut Wtf8Buf`
         // accumulator (arg 1).
-        "push_onto" => (np.starts_with("pyre_interpreter::display")
+        "push_onto" => (np.split("::").take(2).eq(["pyre_interpreter", "display"])
             || deref_impl_owner_leaf(llbc, fd).as_deref() == Some("Wtf8Buf"))
         .then_some((1, 0)),
         _ => None,

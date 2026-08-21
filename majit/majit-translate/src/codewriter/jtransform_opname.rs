@@ -423,7 +423,16 @@ fn transduce_op(
         // `LowLevelType` constant and keys the assembler's size descriptor
         // (`bh_size_spec_from_callcontrol`, `path_hash(owner)`).  A plain
         // GcStruct with no boxed `ob_type`, so `New` (not `NewWithVtable`).
+        // The flavor operand must be `{'flavor': 'gc'}`: `jtransform.py
+        // rewrite_op_malloc` lowers only the gc flavor to `new(descr)`, so a
+        // `raw`/`nonmovable` allocation is rejected rather than silently
+        // lowered to a GC `New`.
         "malloc" => {
+            assert!(
+                is_gc_flavor_const(&op.args[1]),
+                "jtransform_opname::lower_graph: malloc flavor operand is not {{'flavor': 'gc'}}: {:?}",
+                op.args[1]
+            );
             let owner = malloc_struct_owner(&op.args[0]);
             let result = expect_var(&op.result);
             out.push_op_with_result_var(block, OpKind::New { owner }, result);
@@ -678,6 +687,20 @@ fn malloc_struct_owner(hlv: &Hlvalue) -> String {
             panic!("jtransform_opname::lower_graph: malloc first operand is a Variable")
         }
     }
+}
+
+/// Whether a `malloc` flavor operand is the `{'flavor': 'gc'}` dict constant
+/// (`gc_flavor_const`).  `jtransform.py rewrite_op_malloc` lowers only the gc
+/// flavor to `new(descr)`; a `raw`/`nonmovable` allocation has no such form,
+/// so the transducer rejects it rather than silently emitting a GC `New`.
+fn is_gc_flavor_const(hlv: &Hlvalue) -> bool {
+    let Hlvalue::Constant(c) = hlv else {
+        return false;
+    };
+    let Some(items) = c.value.dict_items() else {
+        return false;
+    };
+    items.get(&ConstValue::byte_str("flavor")) == Some(&ConstValue::byte_str("gc"))
 }
 
 /// A helper graph operates on a single string width, so the family is a
