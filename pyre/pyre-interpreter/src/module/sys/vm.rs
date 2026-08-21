@@ -1156,6 +1156,55 @@ fn sys_breakpointhook(args: &[PyObjectRef]) -> crate::PyResult {
     crate::builtins::call_forwarding_args(hook, args)
 }
 
+/// `sys._baserepl` — `PyRun_AnyFileExFlags(stdin, "<stdin>", 0, &cf)`: read
+/// stdin and execute what it holds in `__main__`'s namespace.
+/// `_pyrepl.main.interactive_console` calls this whenever the enhanced REPL
+/// cannot run, so a body that returns without reading anything ends the
+/// session instead of starting it.
+///
+/// `code.interact` is that loop at applevel, over the same namespace.  pyre's
+/// own prompt cannot answer here: `pyrex::repl::run_repl` builds a fresh
+/// `PyExecutionContext` and a fresh `__main__`, which is a top-level driver
+/// rather than something a running program can call into.
+///
+/// `_Py_FdIsInteractive` sends a terminal — and `-i` — down that prompt
+/// loop, and everything else to `_PyRun_SimpleFileObject`, which compiles the
+/// whole of stdin at once and reports a failure through `PyErr_Print`.  Only
+/// the prompt loop is reproduced: `PyErr_Print` belongs to the driver that
+/// owns process exit, which this crate sits below, so redirected stdin runs
+/// here statement by statement with a prompt written between each.
+fn sys_baserepl(_args: &[PyObjectRef]) -> crate::PyResult {
+    crate::importing::dunder_import(
+        "code",
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        0,
+        std::ptr::null(),
+    )?;
+    let code_module = crate::importing::get_sys_module("code")
+        .ok_or_else(|| crate::PyError::runtime_error("no module named 'code'"))?;
+    // Every argument is pinned as it is produced and read back at the call:
+    // the attribute lookups and string allocations between them can each run a
+    // collection that forwards the slot without touching a local copy.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(code_module, "interact")?);
+    // `interact(banner, readfunc, local, exitmsg)`.  Both messages are empty:
+    // the console this stands in for prints neither a banner nor a farewell.
+    pyre_object::gc_roots::pin_root(pyre_object::w_str_new(""));
+    let main_module = crate::importing::get_sys_module("__main__")
+        .ok_or_else(|| crate::PyError::runtime_error("no module named '__main__'"))?;
+    pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(main_module, "__dict__")?);
+    pyre_object::gc_roots::pin_root(pyre_object::w_str_new(""));
+    let slot = pyre_object::gc_roots::shadow_stack_get;
+    crate::call::call_function_impl_result(
+        slot(base),
+        &[slot(base + 1), w_none(), slot(base + 2), slot(base + 3)],
+    )?;
+    Ok(w_none())
+}
+
 fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     let Some(&w_hookargs) = args.first() else {
         return Err(crate::PyError::type_error(
@@ -2815,7 +2864,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "_baserepl",
-        make_builtin_function_with_arity("_baserepl", |_| Ok(w_none()), 0),
+        make_builtin_function_with_arity("_baserepl", sys_baserepl, 0),
     );
     module_ns_store(
         ns,
@@ -3013,10 +3062,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // `_PyUnicode_EnableLegacyWindowsFSEncoding` also re-runs
                 // `init_fs_codec`, so every path converter switches to
                 // mbcs/replace with it.  Here the flag reaches only the two
-                // getters: `gateway::fsencode` and `typedef::FS_ERRORS` stay on
-                // UTF-8/surrogatepass because there is no `_codecs.mbcs_encode`
-                // to switch them to.  That codec is the dependency to land
-                // before this flag can drive the converters.
+                // getters.  Switching `gateway::fsencode` and
+                // `typedef::FS_ERRORS` as well is not enough on its own: pyre
+                // carries host names as WTF-8 through `fsencode_os_str` and
+                // `os_string_from_fs_bytes`, so the app-level converters and
+                // the host bridge have to change together or a name stops
+                // round-tripping between them.
                 LEGACY_WINDOWS_FS_ENCODING
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(w_none())
