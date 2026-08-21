@@ -7674,8 +7674,11 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
     };
     let exit =
         pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
-    // `LIST_APPEND` (the inlined-comprehension accumulator) is admitted
-    // whatever the body does, like `SET_ADD` and `MAP_ADD` beside it.
+    // The `LIST_APPEND` opcode (the inlined-comprehension accumulator) is
+    // admitted wherever it appears, like `SET_ADD` and `MAP_ADD` beside it.
+    // That is a statement about the one opcode, not about the body around it:
+    // the scan below still walks every body instruction and refuses the whole
+    // FOR_ITER on the first one outside the permitted set.
     //
     // It used to be admitted only for a call-free body, over two hazards.
     // Both were re-measured on 2026-08-20 and neither reproduces:

@@ -18,7 +18,7 @@ hits = [0]
 
 
 class C:
-    def __index__(self):
+    def __index__(self) -> int:
         hits[0] += 1
         return 3
 
