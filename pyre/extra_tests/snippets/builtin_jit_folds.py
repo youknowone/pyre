@@ -122,14 +122,21 @@ for _pair in [(1, 2), (2, 1), (1, 1), (-3, 3), (2**62, 2**62 + 1),
     _stable(min, _pair)
     _stable(max, _pair)
 
-# A tie keeps the first argument, which is the object identity the scan order
-# produces; the fold returns one of its own operands rather than a fresh box.
-_a, _b = 10**3, 10**3
-assert _stable(min, (_a, _b)) is _a
-assert _stable(max, (_a, _b)) is _a
-_x, _y = 1e3, 1e3
-assert _stable(min, (_x, _y)) is _x
-assert _stable(max, (_x, _y)) is _x
+# A tie keeps the first argument, and the fold hands back one of its own
+# operands rather than a fresh box.  The signed zeros are the only tie whose
+# operands stay distinguishable: `is` on two exact ints compares values, so an
+# equal int pair is one object whatever the fold returns, while two exact
+# floats compare bit patterns and `-0.0` is not `0.0`.  The read is inside the
+# loop because `_stable` reports the answer it took before the loop ran.
+_neg, _pos = -0.0, 0.0
+assert _neg is not _pos
+_ties = 0
+for _ in range(ROUNDS):
+    if min(_neg, _pos) is not _neg or max(_neg, _pos) is not _neg:
+        _ties += 1
+    if min(_pos, _neg) is not _pos or max(_pos, _neg) is not _pos:
+        _ties += 1
+assert _ties == 0
 _stable(min, ("b", "a"))
 _stable(max, ([1], [2]))
 _stable(min, (1,))          # a single iterable argument, not the pair form
