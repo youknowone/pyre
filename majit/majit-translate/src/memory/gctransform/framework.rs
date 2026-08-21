@@ -50,6 +50,10 @@ use std::collections::{HashMap, HashSet};
 pub struct CallGraph {
     /// `def_id -> fully qualified name`
     pub names: HashMap<u64, String>,
+    /// `def_id -> the spelling [`Joined`] identifies a function by`.  The name
+    /// for everything charon spelled out, the name plus the item's source line
+    /// where it did not.
+    pub keys: HashMap<u64, String>,
     /// `def_id -> callees`, from `Fun::Regular` Call terminators only.
     pub callees: HashMap<u64, HashSet<u64>>,
     /// `def_id -> callers`, the reverse index.
@@ -322,9 +326,9 @@ impl CallGraph {
 /// program, and `collect_analyzer` closes over the whole call graph at once.
 /// So the artefacts are joined back into one graph here.
 ///
-/// # The join key does not always identify a function
+/// # The name does not always identify a function; the name and line do
 ///
-/// `ItemMeta::name_path` renders an inherent `impl` block as the opaque segment
+/// `ItemMeta::name_path` renders an `impl` block as the opaque segment
 /// `<Impl>`, so `PyFrame::new` and `FrameDebugData::new` are both spelled
 /// `pyframe::<Impl>::new`.  Joining on that spelling merges them into one node
 /// and invents an edge from every caller of one to every callee of the other —
@@ -333,22 +337,30 @@ impl CallGraph {
 /// `framework.py` over-brackets rather than under-brackets, but a fabricated
 /// path is not conservatism, it is a wrong answer with a citation.
 ///
-/// A name **one artefact carries more than once** is therefore not a join key:
-/// each occurrence keeps its own node, exactly as it had before the join.  That
-/// test alone is not enough, because it can only see a collision an artefact
-/// already contains: two artefacts may each carry `pyframe::<Impl>::new`
-/// exactly once, for two different functions, and the join would merge them
-/// with nothing to warn on.  So **any name carrying an opaque `<…>` segment**
-/// is held apart as well — the rendering has already discarded what
-/// distinguished it, and a spelling that cannot fail to collide is not an
-/// identity.
+/// Holding every opaque spelling apart is not the answer either, and errs the
+/// more dangerous way.  The join exists because one artefact declares what
+/// another defines; refusing to join `pyframe::<Impl>::new` leaves the
+/// declaration a childless leaf, and a caller that reaches a collection only
+/// through it comes back "cannot reach" — an under-approximation, which is how
+/// a required root bracket gets reported as unjustified.
 ///
-/// What is joined is what stays fully spelled — the free functions the JIT
-/// reaches the interpreter through (`finditem_str`,
-/// `call_function_impl_result`) — and [`Self::ambiguous_names`] reports what
-/// the two rules held back.  Measured on `pyre-jit` joined with
-/// `pyre-interpreter`, holding the opaque names apart costs 48 nodes of closure
-/// (240 → 192, against 77 unjoined) and no finding at all.
+/// So the key is [`CallGraph::keys`]: the name, plus the item's own source
+/// line where the name went opaque.  Charon stamps that line from the
+/// definition, so it survives into every artefact that carries the item, while
+/// two items collapsing onto one spelling are written at two different lines.
+/// A key **one artefact carries more than once** is still not a join key —
+/// each occurrence keeps its own node — and [`Self::ambiguous_names`] reports
+/// what that held back.
+///
+/// Measured on `pyre-interpreter` joined with `pyre-jit`: of the 1120 opaque
+/// names both artefacts carry, 779 are a single item per artefact whose lines
+/// agree — real joins, which keying on the bare name would have merged by luck
+/// and blacklisting the spelling would have lost — 7 disagree, which is the
+/// collision the key exists to catch, and 334 already repeat inside an
+/// artefact.  Against the bare-name key that gives 1913 spellings merged
+/// rather than 1337 and 215 held apart rather than 2417, and the scan answers
+/// the same 5317/41572 reachable, 583 justified and 256 cannot-reach either
+/// way.
 pub struct Joined {
     /// The joined graph.  Its `opaque` census is left empty: an opaque *count*
     /// is per-artefact accounting, and summing two of them double-counts every
@@ -360,8 +372,8 @@ pub struct Joined {
     /// Unambiguous names carried by more than one artefact — what the join
     /// actually merged.
     pub joined_names: usize,
-    /// Names held apart: carried more than once by some artefact, or spelled
-    /// with an opaque `<…>` segment that cannot identify a function.
+    /// Join keys held apart: carried more than once by some artefact, so the
+    /// key names no single function there.
     pub ambiguous_names: usize,
 }
 
@@ -370,45 +382,41 @@ impl Joined {
         let mut ambiguous: HashSet<&str> = HashSet::new();
         for part in parts {
             let mut seen: HashSet<&str> = HashSet::new();
-            for name in part.names.values() {
-                // A repeat inside one artefact is the visible half of the
-                // problem.  The other half is invisible to it: `name_path`
-                // renders a non-ident segment as the opaque `<Variant>`
-                // (`majit-charon-reader/src/ullbc.rs`), so two artefacts can
-                // each carry `pyframe::<Impl>::new` exactly once for two
-                // different functions, and the repeat test would merge them.
-                // A spelling that has already lost the part that distinguished
-                // it is not an identity in either direction.
-                if name.contains('<') || !seen.insert(name.as_str()) {
-                    ambiguous.insert(name.as_str());
+            for key in part.keys.values() {
+                if !seen.insert(key.as_str()) {
+                    ambiguous.insert(key.as_str());
                 }
             }
         }
         let mut shared: HashMap<&str, u64> = HashMap::new();
         let mut names: HashMap<u64, String> = HashMap::new();
+        let mut joined_keys: HashMap<u64, String> = HashMap::new();
         let mut canonical: Vec<HashMap<u64, u64>> = Vec::with_capacity(parts.len());
         let mut next = 0u64;
         let mut joined_names = 0usize;
         for part in parts {
             // Sorted, so the numbering does not depend on hash order and two
             // runs over the same inputs print the same ids.
-            let mut sorted: Vec<(&u64, &String)> = part.names.iter().collect();
+            let mut sorted: Vec<(&u64, &String)> = part.keys.iter().collect();
             sorted.sort_unstable_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
             let mut mine: HashMap<u64, u64> = HashMap::new();
-            for (&def_id, name) in sorted {
-                let id = if ambiguous.contains(name.as_str()) {
+            for (&def_id, key) in sorted {
+                let name = &part.names[&def_id];
+                let id = if ambiguous.contains(key.as_str()) {
                     let id = next;
                     next += 1;
                     names.insert(id, name.clone());
+                    joined_keys.insert(id, key.clone());
                     id
-                } else if let Some(&id) = shared.get(name.as_str()) {
+                } else if let Some(&id) = shared.get(key.as_str()) {
                     joined_names += 1;
                     id
                 } else {
                     let id = next;
                     next += 1;
                     names.insert(id, name.clone());
-                    shared.insert(name.as_str(), id);
+                    joined_keys.insert(id, key.clone());
+                    shared.insert(key.as_str(), id);
                     id
                 };
                 mine.insert(def_id, id);
@@ -444,6 +452,7 @@ impl Joined {
         Self {
             graph: CallGraph {
                 names,
+                keys: joined_keys,
                 callees,
                 callers,
                 indirect,
@@ -614,6 +623,7 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
     use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
 
     let mut names = HashMap::new();
+    let mut keys: HashMap<u64, String> = HashMap::new();
     let mut callees: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut callers: HashMap<u64, HashSet<u64>> = HashMap::new();
     let mut indirect = HashSet::new();
@@ -634,7 +644,21 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
 
     for fd in llbc.iter_local_fns() {
         let id = fd.def_id;
-        names.insert(id, fd.item_meta.name_path());
+        let name = fd.item_meta.name_path();
+        // `name_path` renders an `impl` block as the opaque segment `<Impl>`,
+        // so the spelling alone does not identify the function.  The item's
+        // own source line restores what the rendering dropped: charon stamps
+        // it from the definition, so every artefact carrying the item — the
+        // one holding the body and the ones holding only a declaration —
+        // stamps the same line, while two items collapsing onto one spelling
+        // are written at two different lines.
+        let key = if name.contains('<') {
+            format!("{name}@{}", fd.item_meta.span.data.beg.line)
+        } else {
+            name.clone()
+        };
+        keys.insert(id, key);
+        names.insert(id, name);
         let entry = callees.entry(id).or_default();
         let Some(body) = fd.unstructured() else {
             continue;
@@ -717,9 +741,156 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
     drop(note_opaque);
     CallGraph {
         names,
+        keys,
         callees,
         callers,
         indirect,
         opaque,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One artefact's graph: `(def_id, name, line)` per function, plus edges.
+    fn part(fns: &[(u64, &str, u64)], edges: &[(u64, u64)]) -> CallGraph {
+        let mut names = HashMap::new();
+        let mut keys = HashMap::new();
+        let mut callees: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for &(id, name, line) in fns {
+            names.insert(id, name.to_string());
+            keys.insert(
+                id,
+                if name.contains('<') {
+                    format!("{name}@{line}")
+                } else {
+                    name.to_string()
+                },
+            );
+            callees.entry(id).or_default();
+        }
+        let mut callers: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for &(from, to) in edges {
+            callees.entry(from).or_default().insert(to);
+            callers.entry(to).or_default().insert(from);
+        }
+        CallGraph {
+            names,
+            keys,
+            callees,
+            callers,
+            indirect: HashSet::new(),
+            opaque: OpaqueCensus::default(),
+        }
+    }
+
+    fn node_of(j: &Joined, part: usize, def_id: u64) -> u64 {
+        j.canonical[part][&def_id]
+    }
+
+    /// The join exists for this: one artefact declares `pyframe::<Impl>::new`
+    /// and calls it, the other defines it.  The opaque spelling must not stop
+    /// the caller from reaching what the body reaches.
+    #[test]
+    fn an_opaque_name_at_one_line_joins_across_artefacts() {
+        let declaring = part(
+            &[
+                (1, "pyre::pyframe::<Impl>::new", 40),
+                (2, "pyre::caller", 9),
+            ],
+            &[(2, 1)],
+        );
+        let defining = part(
+            &[
+                (1, "pyre::pyframe::<Impl>::new", 40),
+                (7, "pyre::allocates", 80),
+            ],
+            &[(1, 7)],
+        );
+        let joined = Joined::build(&[&declaring, &defining]);
+        assert_eq!(node_of(&joined, 0, 1), node_of(&joined, 1, 1));
+        let caller = node_of(&joined, 0, 2);
+        let allocates = node_of(&joined, 1, 7);
+        let reached = joined.graph.reaching(&HashSet::from([allocates]));
+        assert!(
+            reached.contains(&caller),
+            "the caller lost the body it declares"
+        );
+    }
+
+    /// Two different functions rendering to one spelling are two nodes, so no
+    /// edge is invented between a caller of one and a callee of the other.
+    #[test]
+    fn one_opaque_spelling_at_two_lines_stays_two_functions() {
+        let a = part(
+            &[
+                (1, "pyre::pyframe::<Impl>::new", 40),
+                (2, "pyre::caller", 9),
+            ],
+            &[(2, 1)],
+        );
+        let b = part(
+            &[
+                (1, "pyre::pyframe::<Impl>::new", 512),
+                (7, "pyre::allocates", 80),
+            ],
+            &[(1, 7)],
+        );
+        let joined = Joined::build(&[&a, &b]);
+        assert_ne!(node_of(&joined, 0, 1), node_of(&joined, 1, 1));
+        let caller = node_of(&joined, 0, 2);
+        let allocates = node_of(&joined, 1, 7);
+        let reached = joined.graph.reaching(&HashSet::from([allocates]));
+        assert!(
+            !reached.contains(&caller),
+            "the join invented a path between two different functions"
+        );
+    }
+
+    /// A key one artefact carries twice names no single function there.
+    #[test]
+    fn a_key_repeated_inside_one_artefact_is_not_a_join_key() {
+        let a = part(
+            &[
+                (1, "pyre::pyframe::<Impl>::new", 40),
+                (2, "pyre::pyframe::<Impl>::new", 40),
+            ],
+            &[],
+        );
+        let b = part(&[(1, "pyre::pyframe::<Impl>::new", 40)], &[]);
+        let joined = Joined::build(&[&a, &b]);
+        assert_eq!(joined.joined_names, 0);
+        assert_eq!(joined.ambiguous_names, 1);
+        assert_ne!(node_of(&joined, 0, 1), node_of(&joined, 0, 2));
+        assert_ne!(node_of(&joined, 0, 1), node_of(&joined, 1, 1));
+    }
+
+    /// What charon spelled out joins on the name alone, at any line — a
+    /// declaration and its definition are not required to agree on one.
+    #[test]
+    fn a_fully_spelled_name_joins_on_the_name() {
+        let a = part(&[(1, "pyre::call::call_function_impl_result", 100)], &[]);
+        let b = part(&[(9, "pyre::call::call_function_impl_result", 100)], &[]);
+        let joined = Joined::build(&[&a, &b]);
+        assert_eq!(node_of(&joined, 0, 1), node_of(&joined, 1, 9));
+        assert_eq!(joined.joined_names, 1);
+    }
+
+    /// `project` answers in the asked artefact's own def ids.
+    #[test]
+    fn project_maps_a_joined_node_back_onto_one_artefacts_ids() {
+        let a = part(&[(1, "pyre::pyframe::<Impl>::new", 40)], &[]);
+        let b = part(&[(5, "pyre::pyframe::<Impl>::new", 40)], &[]);
+        let joined = Joined::build(&[&a, &b]);
+        let node = node_of(&joined, 0, 1);
+        assert_eq!(
+            joined.project(0, &HashSet::from([node])),
+            HashSet::from([1])
+        );
+        assert_eq!(
+            joined.project(1, &HashSet::from([node])),
+            HashSet::from([5])
+        );
     }
 }
