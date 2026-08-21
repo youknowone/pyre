@@ -83,7 +83,7 @@ pyre follows PyPy's meta-tracing approach:
 1. The **interpreter** (`pyre-interpreter`) executes Python bytecodes normally.
 2. When a loop or function becomes hot, **MaJIT** records the interpreter's execution as a linear trace of IR operations.
 3. The trace passes through an **8-pass optimizer** — the same pipeline as PyPy: IntBounds, Rewrite, Virtualize, String, Pure, Guard, Simplify, Heap.
-4. The optimized IR is compiled by one of three MaJIT backends: `dynasm` (the default; x86-64 and aarch64) and Cranelift emit **native machine code**; the third emits **WebAssembly**, which `pyre-wasm-runner` executes under wasmtime.
+4. The optimized IR is compiled by one of three MaJIT backends: `dynasm` (the default; x86-64 and aarch64) and Cranelift emit **native machine code**; the third emits **WebAssembly**, which `pyre-wasm-runner` executes under wasmtime by default, or under wasmi.
 5. Subsequent executions of that path run the compiled code directly. Guard failures fall back to the interpreter.
 
 ### Function inlining

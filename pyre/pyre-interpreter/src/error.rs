@@ -3664,8 +3664,16 @@ pub fn new_exception_class(
         _roots.get(bases_slot),
         _roots.get(dict_slot),
     ];
-    let Ok(w_exc) = crate::call::call_function_impl_result(crate::typedef::w_type(), &args) else {
-        return std::ptr::null_mut();
+    // `space.call_function` propagates its failure; this signature answers with
+    // NULL instead, so the error travels the bare-return convention's channel —
+    // `set_call_error`, which `take_call_error` hands back — rather than being
+    // dropped for a caller that then reads whatever an earlier call left.
+    let w_exc = match crate::call::call_function_impl_result(crate::typedef::w_type(), &args) {
+        Ok(w_exc) => w_exc,
+        Err(err) => {
+            crate::call::set_call_error(err);
+            return std::ptr::null_mut();
+        }
     };
     if let Some(module) = module {
         let exc_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -3727,11 +3735,15 @@ pub fn wrap_oserror2(
     }
     let msg = PyError::clean_strerror(errno);
     let Some(w_exc) = w_exception_class else {
-        // `space.w_OSError` with the filename the caller kept.
-        return match w_filename {
-            Some(w_filename) => PyError::os_error_syscall(errno, w_filename),
-            None => PyError::os_error_syscall(errno, pyre_object::PY_NULL),
-        };
+        // `space.w_OSError` with both names the caller kept.  The custom-class
+        // arm below hands the constructor `w_filename2`, and the default class
+        // takes it in the same position, so a two-path syscall keeps its
+        // `.filename2` slot and the `" -> 'dest'"` suffix `str(e)` renders.
+        return PyError::os_error_syscall2(
+            errno,
+            w_filename.unwrap_or(pyre_object::PY_NULL),
+            w_filename2.unwrap_or(pyre_object::PY_NULL),
+        );
     };
     // Pinned, then re-read from the slots: a collection during a later
     // allocation rewrites the root SLOT and not this frame's copy of the
