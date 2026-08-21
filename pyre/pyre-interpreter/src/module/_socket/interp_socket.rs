@@ -312,7 +312,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IPPROTO_PIM", libc::IPPROTO_PIM);
         cst!("IPPROTO_SCTP", libc::IPPROTO_SCTP);
         cst!("IPPROTO_RAW", libc::IPPROTO_RAW);
-        cst!("IPPROTO_MAX", libc::IPPROTO_MAX);
+        // libc deprecates this: the kernel raised the value and libc will
+        // follow upstream in a later release (rust-lang/libc#1896). Keep
+        // reading it from libc rather than freezing a literal, so the new
+        // value arrives with the dependency; `socketmodule.c` likewise takes
+        // whatever the platform header defines.
+        #[allow(deprecated)]
+        {
+            cst!("IPPROTO_MAX", libc::IPPROTO_MAX);
+        }
         cst!("IPPROTO_GRE", libc::IPPROTO_GRE);
         cst!("IPPROTO_RSVP", libc::IPPROTO_RSVP);
         // `_rsocket_rffi.py:234-241 constants_w_defaults` — SOL_IP/TCP/UDP

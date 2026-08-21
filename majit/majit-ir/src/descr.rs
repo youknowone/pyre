@@ -7184,7 +7184,14 @@ impl CallDescr for SimpleCallDescr {
 unsafe extern "C" {
     // llsupport/memcpy.py:3-5 — the host `memcpy` symbol that
     // `gc.py:39 self.memcpy_fn = memcpy_fn` binds via `rffi.llexternal`.
-    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+    // Spelled with `c_void` to match the runtime symbol's own signature;
+    // only its address is ever taken (`memcpy_fn_addr`), never a call
+    // through this declaration.
+    fn memcpy(
+        dest: *mut core::ffi::c_void,
+        src: *const core::ffi::c_void,
+        n: usize,
+    ) -> *mut core::ffi::c_void;
 }
 
 /// llsupport/gc.py:39 `GcLLDescr_framework.memcpy_fn` cast to a Signed
