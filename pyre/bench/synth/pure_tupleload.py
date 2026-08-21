@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=87
+# pyre-check: max-pypy-ratio=6
+# The ceiling sits between the two measured states: folded this runs 2.6x
+# pypy, and with `subscr_specialised_pair` suppressed about 198x.
 # #171/#11 Approach C, SUBSCRIPT slice: canonical-tuple `t[i]` emits a PURE
 # getarrayitem in the JIT walker (OptPure CSEs / const-folds the element load).
 #
@@ -9,6 +11,11 @@
 # stored as SPECIALISED_TUPLE_II (inline value0/value1, NO wrappeditems block);
 # the trace-time `ob_type == &TUPLE_TYPE` gate declines it to the non-pure /
 # residual path. It MUST NOT SIGSEGV and MUST stay correct.
+#
+# Case C builds a fresh arity-2 pair per iteration and reads both halves, which
+# is the `subscr_specialised_pair` fold's own shape. Suppressing that one fold
+# measures 46.3x here (0.092s -> 4.257s), the largest single-fold effect in the
+# corpus, so this loop is what keeps the ceiling below honest.
 
 
 def main():
@@ -28,3 +35,17 @@ def main():
 
 
 main()
+
+
+def hot_specialised_pair(n):
+    """Case C: a fresh 2-tuple per iteration, both halves read."""
+    s = 0
+    i = 0
+    while i < n:
+        p = (i, i + 1)
+        s += p[0] + p[1]
+        i += 1
+    return s
+
+
+print(hot_specialised_pair(20000000))

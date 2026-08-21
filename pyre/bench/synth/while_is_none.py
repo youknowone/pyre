@@ -8,13 +8,8 @@
 # `is not None` branch compiles (POP_JUMP_IF_NONE lowering) and the object-attr
 # read folds inline, not to race pypy on the still-residual unboxed read.
 #
-# N/ITERS are kept small because the wasm backend runs every guard-exit
-# re-entry through the not-yet-collected interpreter allocation path, so the
-# residual `head.val` read leaks per re-entry and the wall grows super-linearly
-# in ITERS on wasm (native dynasm/cranelift stay linear via bridge chaining).
-# This is the pre-existing wasm interpreter-alloc leak, not the LOAD_ATTR fold;
-# the size here leaves the wasm run well inside the synthetic timeout while
-# still driving the compiled walk loop thousands of times on every backend.
+# N/ITERS are sized to leave every backend well inside the synthetic timeout
+# while still driving the compiled walk loop thousands of times.
 N = 300
 ITERS = 500
 

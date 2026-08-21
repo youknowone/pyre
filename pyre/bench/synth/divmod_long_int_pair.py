@@ -1,10 +1,7 @@
-# pyre-check: max-pypy-ratio=8
-# Sized for headroom, not sensitivity: the worst ratio measured across
-# platforms is 3.7x (macOS cranelift; macOS dynasm 2.9x, linux/aarch64 2.4x
-# dynasm and 3.2x cranelift), and CI runners swing this fixture by ~20% under
-# load. Losing either fold this file covers also moves `guard_failures`, which
-# the jit-stats baselines gate in both directions, so that is the sensitive
-# guard and this one is the net beneath it.
+# pyre-check: max-pypy-ratio=4
+# The ceiling sits between the two measured states: folded this runs 1.4x
+# pypy, and with `builtin_divmod` / `binary_op_long_int_div` suppressed
+# about 6.2x.
 # `divmod(long, int)` at a traced call site. `_int_divmod` keeps the divisor
 # unwrapped and calls `rbigint.int_divmod`, whose rtyped return is a two-item
 # `GcStruct`: the walker emits one elidable call plus two `getfield_gc_r`, then
@@ -12,6 +9,12 @@
 # allocations per iteration, all inside the loop — an operand varies at every
 # site so the elidable cannot be hoisted out, and the halves stay live across
 # the following iteration's allocations.
+# Two hot loops ride along so the ratio also answers for the folds behind
+# them: `builtin_divmod` on two exact ints (11.7x on its own, 0.100s ->
+# 1.169s) and `binary_op_long_int_div`, the bigint `//`/`%` by a machine int
+# (2.2x, 0.255s -> 0.566s -- the thinnest margin of the group; loosen the
+# ceiling rather than delete the loop if a slower host proves it flaky).
+
 
 BIG = (1 << 200) + 12345
 N = 250000
@@ -63,3 +66,30 @@ print(unpacked(N))
 print(held_across_calls(N))
 print(pair_escapes(N))
 print(negative_divisor(N))
+
+
+def hot_divmod_int(n):
+    """`divmod` on two exact ints, the pair consumed by UNPACK."""
+    s = 0
+    i = 1
+    while i <= n:
+        q, r = divmod(i, 7)
+        s += q + r
+        i += 1
+    return s
+
+
+def hot_long_int_floordiv_mod(n):
+    """Bigint `//` and `%` by a machine int, the `_int_floordiv` / `_int_mod`
+    family."""
+    big = 1 << 200
+    s = 0
+    i = 1
+    while i <= n:
+        s += (big + i) // 1000003 % 7 + (big + i) % 1000003 % 7
+        i += 1
+    return s
+
+
+print(hot_divmod_int(20000000))
+print(hot_long_int_floordiv_mod(6000000))
