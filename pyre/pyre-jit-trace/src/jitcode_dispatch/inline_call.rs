@@ -3128,6 +3128,83 @@ fn resolved_inline_decline<T>(op_pc: usize, line: u32) -> Result<Option<T>, Disp
     Ok(None)
 }
 
+/// The byte ranges of `code`'s exception handlers. A handler begins at a table
+/// entry's `target` and covers the contiguous run of table ranges that starts
+/// there, up to where the next handler begins.
+///
+/// One `except` body routinely spans several table ranges: binding the caught
+/// exception to a name, or a handler body that can itself raise, emits the
+/// cleanup as further ranges whose `start` is nobody's `target`. Accepting only
+/// the range that a `target` opens therefore sees the first few opcodes of the
+/// handler and nothing after them -- for `except E as m: ... raise` it stops
+/// before the `raise`.
+fn callee_handler_spans(code: &pyre_interpreter::CodeObject) -> Vec<(u32, u32)> {
+    let mut entries: Vec<_> =
+        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
+    entries.sort_by_key(|entry| entry.start);
+    let targets: std::collections::HashSet<u32> =
+        entries.iter().map(|entry| entry.target).collect();
+    let mut spans = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if !targets.contains(&entry.start) {
+            continue;
+        }
+        let mut end = entry.end;
+        for next in &entries[index + 1..] {
+            if next.start != end || targets.contains(&next.start) {
+                break;
+            }
+            end = next.end;
+        }
+        spans.push((entry.start, end));
+    }
+    spans
+}
+
+/// True when every `RAISE_VARARGS` in `code` is a bare re-raise sitting inside
+/// one of the callee's own handlers -- the callee spells `except E: raise` and
+/// holds no other way to raise.
+///
+/// The screen exemption below rests on the abort coordinate being a handler's
+/// own re-raise, so it has to hold for whichever raise the walk reaches, not
+/// merely for one of them. Two shapes make the difference. A callee that also
+/// raises on an ordinary path (`if bad: raise ValueError(x)`) can abort at that
+/// raise, where the callee-rebuild would replay an effectful opcode the screen
+/// exists to protect. And 3.14 emits a `finally` body twice, so a bare `raise`
+/// there appears once inside the exceptional copy and once outside it, in the
+/// normal copy -- where no exception is active and it raises `RuntimeError`
+/// rather than re-raising. Requiring every raise to qualify declines both.
+fn callee_only_bare_reraises_in_handlers(code: &pyre_interpreter::CodeObject) -> bool {
+    let spans = callee_handler_spans(code);
+    if spans.is_empty() {
+        return false;
+    }
+    let mut arg_state = pyre_interpreter::bytecode::OpArgState::default();
+    let mut saw_raise = false;
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
+        let (instruction, op_arg) = arg_state.get(unit);
+        let pyre_interpreter::bytecode::Instruction::RaiseVarargs { argc } = instruction else {
+            continue;
+        };
+        saw_raise = true;
+        if !matches!(
+            argc.get(op_arg),
+            pyre_interpreter::bytecode::oparg::RaiseKind::BareRaise
+        ) {
+            return false;
+        }
+        // The table is keyed by byte offset; `pc` is the instruction-unit index.
+        let byte_offset = (pc * 2) as u32;
+        if !spans
+            .iter()
+            .any(|(start, end)| (*start..*end).contains(&byte_offset))
+        {
+            return false;
+        }
+    }
+    saw_raise
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3586,6 +3663,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // does not inherit that route's DeferredCall admission.
     let mut foriter_deferred_admit = false;
     let mut foriter_dirty_bound = false;
+    let mut foriter_dirty_raise_handler_admit = false;
     if fbw_foriter_inflight_active() && !instance_next_seeded_route {
         let safety = fbw_callee_body_replay_safety(
             body.code,
@@ -3680,11 +3758,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 foriter_deferred_admit
             }
             CalleeReplaySafety::Dirty => {
-                // A stored bound method has an explicit receiver and can use
-                // the multi-frame red-frame path below. Keep loop-bearing and
-                // recursive callees residual: either requires another loop
-                // header rather than one bounded callee walk.
-                foriter_dirty_bound = bound_method.is_some()
+                // `MetaInterp.perform_call` pushes one MIFrame for every
+                // inlined call; whether Python spelled it as `f(x)` or
+                // `obj.m(x)` does not change the callee frame or its exception
+                // edges. Route a supported CALL through the same multi-frame
+                // red-frame path below whichever way it is spelled -- the
+                // admission tests the callee body, not the call syntax.
+                //
+                // The generated resume chain is currently sound for one
+                // paused caller around a callee with a bare re-raise in its
+                // own handler when the callable is a trace constant. Keep
+                // red-polymorphic calls and the remaining Dirty shapes
+                // residual until their bridge snapshots can encode every
+                // callable-specific traceback node. A stored bound method
+                // reaches the path on `bound_method` alone as it always has;
+                // one that also meets the body terms takes the same screen
+                // exemption below, because it holds the same seeded frame.
+                let bare_reraise_handler = body_facts.has_exception_table
+                    && callable_guard_op.is_constant()
+                    && ctx.session.borrow().framestack.len() < 2
+                    && callee_only_bare_reraises_in_handlers(callee_code);
+                foriter_dirty_raise_handler_admit = entry_is_call_boundary && bare_reraise_handler;
+                foriter_dirty_bound = entry_is_call_boundary
+                    && (bound_method.is_some() || bare_reraise_handler)
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !pyre_interpreter::code_is_self_recursive(callee_code);
                 foriter_dirty_bound
@@ -3699,12 +3795,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 arg_facts.iter().filter(|arg| arg.numeric).count(),
             );
         }
-        // An unbound `Dirty` body is not admitted by seeding its frame.  Its
-        // residual can raise, and the local `except` that catches it is a
-        // callee-owned catch edge the inline path does not compile, so the
-        // exception escapes the caller instead of being handled where the
-        // source handles it.  Stored bound methods instead take the explicit
-        // multi-frame red-frame path above.
+        // A Dirty body is admitted only when the CALL boundary can seed its
+        // own MIFrame. Non-call specializer entries remain residual.
         if !legacy_admit {
             return resolved_inline_decline(op.pc, line!());
         }
@@ -3831,16 +3923,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         } else {
             None
         };
-    if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean) {
-        // A branchy callee with its own exception handler can take a structural
-        // abort after an earlier effectful Python opcode. The current
-        // callee-rebuild payload resumes at the Python opcode owning the abort
-        // jitcode pc; it cannot yet carry a post-op stack anchor. Re-entering
-        // that opcode would repeat its residual effect (PyPy instead resumes
-        // the live MIFrame at its precise resumepc). Keep that callee on the
-        // ordinary residual path until the generated frame snapshot can
-        // represent the precise post-effect coordinate. A terminal raising
-        // callee without a handler retains its after-residual live anchor.
+    if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean)
+        && !foriter_dirty_raise_handler_admit
+    {
+        // Keep the legacy whole-body replay screen everywhere except the
+        // re-raise shape admitted above. That shape owns a seeded callee frame
+        // and follows RPython `MetaInterp.perform_call`: the live path is
+        // traced in its MIFrame and guards carry its precise resume coordinate.
         crate::jitcode_dispatch::census_record(
             if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {
                 "InlineCallee::BranchyHandlerDeferredCall"
@@ -8376,6 +8465,53 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
             unreachable!(
                 "walk() only exits on Terminate / SubReturn / SubRaise / SwitchToBlackhole"
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::callee_only_bare_reraises_in_handlers;
+
+    fn callee(source: &str) -> pyre_interpreter::CodeObject {
+        use pyre_interpreter::ConstantData;
+        let module = pyre_interpreter::compile_exec(source).expect("test code should compile");
+        module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                    Some((**code).clone())
+                }
+                _ => None,
+            })
+            .expect("module should define `f`")
+    }
+
+    #[test]
+    fn only_a_handler_owned_bare_reraise_qualifies() {
+        // A handler that binds the caught exception spreads over several table
+        // ranges, and the `raise` lands past the first one -- accepting only the
+        // range a `target` opens rejects the very shape this admits.
+        for source in [
+            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError:\n        raise\n",
+            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError as m:\n        raise\n",
+        ] {
+            assert!(callee_only_bare_reraises_in_handlers(&callee(source)));
+        }
+        for source in [
+            // Duplicated `finally` body: the normal copy's bare raise sits
+            // outside every handler, where it raises `RuntimeError`.
+            "def f(x, g):\n    try:\n        return g(x)\n    finally:\n        raise\n",
+            // Reachable on an ordinary path, so the walk can abort at a raise
+            // the exemption does not account for.
+            "def f(x, g):\n    try:\n        if x:\n            raise ValueError(x)\n        return g(x)\n    except ValueError:\n        raise\n",
+            // Raises a second exception rather than re-raising.
+            "def f(x, g):\n    try:\n        return g(x)\n    except ValueError:\n        raise KeyError\n",
+            // No exception table at all.
+            "def f(x):\n    raise ValueError(x)\n",
+        ] {
+            assert!(!callee_only_bare_reraises_in_handlers(&callee(source)));
         }
     }
 }
