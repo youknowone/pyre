@@ -1142,7 +1142,7 @@ static W_BYTES_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 ///
 /// `length` is the field `bytearrayobject.py`'s `_len` reaches through
 /// `self._data`, where the storage is an RPython list and the read is
-/// `rlist.py:116`'s `("length", Signed)`.  Unlike the bytes `len` it is
+/// `rlist.py`'s `("length", Signed)`.  Unlike the bytes `len` it is
 /// MUTABLE: append / insert / remove / pop / clear all move it, so a length
 /// read must not hoist out of a loop that can mutate the receiver.  Same
 /// reason `W_ListObject.length` is mutable.
@@ -1510,7 +1510,7 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         &pyre_interpreter::FUNCTION_TYPE as *const _ as usize,
         &[
             quasi("code", f::FUNCTION_CODE_OFFSET),
-            // `function.py:33 can_change_code = True`; `False` for the
+            // `function.py can_change_code = True`; `False` for the
             // `FunctionWithFixedCode` / `BuiltinFunction` subclasses.  A plain
             // byte, so `clear_gc_fields` leaves it alone and the value a
             // materialized function reports comes from the emit's own store.
@@ -1523,7 +1523,7 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // `function.py:51 self.name = forcename or code.co_name` — a
+            // `function.py self.name = forcename or code.co_name` — a
             // pointer to the name string's storage.  It is pointer-shaped and
             // the runtime walker visits it, so it belongs in the census; the
             // storage itself may be GC-managed (a mortal function's own box) or
@@ -2398,7 +2398,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // `pyframe.py:49 self.w_globals` — the slot the inline
+            // `pyframe.py self.w_globals` — the slot the inline
             // new-PyFrame helper populates from the function's globals dict.
             (
                 "PyFrame.w_globals",
@@ -2979,7 +2979,7 @@ pub fn function_defs_w_descr() -> DescrRef {
 }
 
 /// Live `Function.code` — the field `Function.getcode()` promotes
-/// (`function.py:95 jit.promote(self.code)`).  This is what identifies an
+/// (`function.py jit.promote(self.code)`).  This is what identifies an
 /// inlined body, so the inline lever guards it instead of the function object.
 pub fn function_code_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_CODE_OFFSET)
@@ -3014,7 +3014,7 @@ pub fn function_w_builtins_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_W_BUILTINS_OFFSET)
 }
 
-/// `function.py:54 self.qualname = qualname or self.name` — the wrapped
+/// `function.py self.qualname = qualname or self.name` — the wrapped
 /// qualified name stamped at construction from the code object.
 pub fn function_w_qualname_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_W_QUALNAME_OFFSET)
@@ -3088,7 +3088,7 @@ pub fn function_quasi_immut_slot(index: u32) -> Option<pyre_interpreter::functio
         .map(|(_, slot)| *slot)
 }
 
-/// `function.py:33 can_change_code = True` — a plain byte, so a fresh
+/// `function.py can_change_code = True` — a plain byte, so a fresh
 /// allocation does not zero it and an emit must write it.
 pub fn function_can_change_code_descr() -> DescrRef {
     function_field_descr(std::mem::offset_of!(
@@ -3135,7 +3135,7 @@ pub fn dict_strategy_word_descr() -> DescrRef {
 }
 
 /// The cache-namespace half of the `dict.lookup` oopspec's `extradescrs`
-/// (`heap.py:504-511 descrs[0]`), naming the entry table a lookup probes.
+/// (`heap.py descrs[0]`), naming the entry table a lookup probes.
 /// Only its identity is read; the slot is never loaded.
 pub fn dict_lookup_namespace_descr() -> DescrRef {
     field_descr_from_group(&W_DICT_DESCR_GROUP, 1)
@@ -3332,7 +3332,7 @@ pub fn type_name_obj_descr() -> DescrRef {
 /// `celldict.py ModuleDictStrategy.version` — the module-namespace version
 /// tag (`u64`, 8 bytes, unsigned) on the strategy box.
 ///
-/// Quasi-immutable, per `celldict.py:34 _immutable_fields_ = ["version?"]`,
+/// Quasi-immutable, per `celldict.py _immutable_fields_ = ["version?"]`,
 /// which is the same declaration `getdictvalue_no_unwrapping` promotes before
 /// its elidable lookup (`celldict.py`). The `LOAD_GLOBAL` / `STORE_GLOBAL`
 /// cell folds bake the slot's stored cell as a `ConstPtr` under a
@@ -4002,7 +4002,7 @@ pub fn str_len_descr() -> DescrRef {
 /// without registering a second collector layout.
 static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
-    // `is_immutable` follows `pycode.py:95-106 _immutable_fields_` per field.
+    // `is_immutable` follows `pycode.py _immutable_fields_` per field.
     // `co_firstlineno` is listed there; `co_name` and `hidden_applevel` are
     // not, and `code_ptr` is the raw body pointer with no upstream slot.
     let field = |field_key: &str,
@@ -5089,7 +5089,7 @@ mod tests {
 
     #[test]
     fn pycode_field_descrs_share_parent_and_preserve_specs() {
-        // The `always_pure` column is `pycode.py:95-106 _immutable_fields_`:
+        // The `always_pure` column is `pycode.py _immutable_fields_`:
         // only `co_firstlineno` is listed there, so only its descr answers
         // `is_always_pure()`. Stating it per field rather than asserting a
         // blanket "nothing is pure" keeps the test able to fail when a field's
@@ -6369,7 +6369,7 @@ fn field_descr_from_bh_field(
             let key = majit_ir::descr::LLType::Struct(parent.type_id);
             let field_key = field.field_key().to_string();
             let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
-            // `descr.py:220-221 cache[STRUCT][fieldname]` hit.
+            // `descr.py cache[STRUCT][fieldname]` hit.
             if let Some(fd) = gc
                 ._cache_field
                 .get(&key)
@@ -6564,7 +6564,7 @@ pub fn make_struct_array_descr_full_keyed(
             // descrs.
             //
             // Bare interior field name (`spec.name`) is the cache key per
-            // `descr.py:221 cache[STRUCT][fieldname]` shape.
+            // `descr.py cache[STRUCT][fieldname]` shape.
             let bare_name = interior
                 .field
                 .name
@@ -6594,7 +6594,7 @@ pub fn make_struct_array_descr_full_keyed(
         }
     }
 
-    // `descr.py:372-375 arraydescr.all_interiorfielddescrs = descrs`
+    // `descr.py arraydescr.all_interiorfielddescrs = descrs`
     // set-once via OnceLock.  Cache-hit case: a prior populator already
     // set the list; our set is a no-op which is the desired semantic.
     array_descr_for_interior.set_all_interiorfielddescrs(descrs);
@@ -7251,7 +7251,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                         "BhDescr::InteriorField field slot must be BhDescr::Field, got {other:?}"
                     ),
                 };
-            // Bare interior field name (`descr.py:221 cache[STRUCT][fieldname]`
+            // Bare interior field name (`descr.py cache[STRUCT][fieldname]`
             // shape) — the `get_interiorfield_descr` cache key the
             // `make_struct_array_descr_full_keyed` interior loop used.
             let bare_name = name
@@ -7813,7 +7813,7 @@ fn degrade_to_random_effects(ei: &mut majit_ir::EffectInfo) {
     // effectinfo.py:364-365 — the wildcard forces can_collect.
     ei.can_collect = true;
     // `call.py:284-286` states it outright: "random_effects implies
-    // can_invalidate".  `effectinfo.py:271-273 MOST_GENERAL` is built with
+    // can_invalidate".  `effectinfo.py MOST_GENERAL` is built with
     // `can_invalidate=True`, and so is pyre's own `EffectInfo::MOST_GENERAL`.
     // Without this a degraded EI is a shape upstream cannot construct —
     // random effects with `check_can_invalidate()` still false — and

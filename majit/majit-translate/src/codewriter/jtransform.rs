@@ -795,7 +795,7 @@ impl<'a> Transformer<'a> {
     }
 
     /// Attach the portal JitDriverStaticData index for the current
-    /// graph. RPython `jtransform.py:65 self.portal_jd = portal_jd`
+    /// graph. RPython `jtransform.py self.portal_jd = portal_jd`
     /// — "non-None only for the portal graph(s)". Pyre stores the
     /// index into `CallControl::jitdrivers_sd` rather than a direct
     /// reference so the builder does not force a second borrow of
@@ -899,7 +899,7 @@ impl<'a> Transformer<'a> {
         let mut new_ops = Vec::with_capacity(graph.blocks[block_idx].operations.len());
 
         let original_ops = graph.blocks[block_idx].operations.clone();
-        // `jtransform.py:100 count_before_last_operation = len(newoperations)`
+        // `jtransform.py count_before_last_operation = len(newoperations)`
         // — recorded on every iteration, so after the loop it holds the count
         // from just before the last operation contributed anything.  `None`
         // is upstream's unbound name: the loop body never ran, so there is no
@@ -1123,7 +1123,7 @@ impl<'a> Transformer<'a> {
     /// Two things fixed it, and each is load-bearing on its own —
     /// reverting either one puts the array back on the link.
     /// `lower_framestate` now copies the entry framestate
-    /// (`flowcontext.py:466 newstate = state.copy()`), and
+    /// (`flowcontext.py newstate = state.copy()`), and
     /// `simplify_lowered_graph` runs `prune_dead_phis` unconditionally, as
     /// `all_passes` does (simplify.py).
     ///
@@ -2883,7 +2883,7 @@ impl<'a> Transformer<'a> {
                 self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
             }
             crate::hints::HintKind::PromoteUnicode => {
-                // `rpython/jit/codewriter/jtransform.py:632-648 promote_unicode`:
+                // `rpython/jit/codewriter/jtransform.py promote_unicode`:
                 //     U = lltype.Ptr(rstr.UNICODE)
                 //     assert op.args[0].concretetype == U
                 //     ...register OS_UNIEQ_NONNULL + emit str_guard_value...
@@ -7280,7 +7280,7 @@ fn remap_op(
 /// call `SomeBool` via the `we_are_jitted` `ExtRegistryEntry`) and
 /// before per-op rewriting.  `rewrite_operation` then folds the
 /// symbolic to `ConstBool(true)` keyed on the `SpecTag` identity,
-/// mirroring `jtransform.py:1638 value is _we_are_jitted`.  Running on
+/// mirroring `jtransform.py value is _we_are_jitted`.  Running on
 /// the model graph rather than the annotated flowspace oracle keeps the
 /// un-annotatable `SpecTag` out of `Bookkeeper.immutablevalue` (which
 /// has no symbolic branch — in RPython the symbolic is likewise
@@ -11513,7 +11513,7 @@ mod tests {
     }
 
     /// A block that never had an operation has no *last* operation, so
-    /// `jtransform.py:117 len(newoperations) == count_before_last_operation`
+    /// `jtransform.py len(newoperations) == count_before_last_operation`
     /// does not apply to it — upstream never binds the name and the
     /// comparison cannot come out true.  The exception exits must survive.
     #[test]

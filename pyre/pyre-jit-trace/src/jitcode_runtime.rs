@@ -446,7 +446,7 @@ pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
 /// known.
 ///
 /// `Assembler::get_opnum` mirrors RPython
-/// `assembler.py:221 setdefault(key, len(self.insns))`: keys present
+/// `assembler.py setdefault(key, len(self.insns))`: keys present
 /// in `majit_translate::insns::{wellknown_bh_insns, pyre_extension_insns}`
 /// reuse their reserved `BC_*` byte for build/runtime stability, and
 /// translator-only keys outside the canonical universe get the lowest

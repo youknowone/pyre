@@ -12816,7 +12816,7 @@ fn exec_or_eval(
 
     /// `PyEval_GetBuiltins()` — the value `exec`/`eval` plant under
     /// `__builtins__` in a namespace that lacks it.  PyPy stores the picked
-    /// `Module` (`compiling.py:110 space.builtin`); 3.14 stores that module's
+    /// `Module` (`compiling.py space.builtin`); 3.14 stores that module's
     /// *dict*, which is what `isinstance(__builtins__, dict)` inside
     /// `exec(src, {})` observes.
     fn planted_builtins(w_builtin: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
@@ -14403,7 +14403,7 @@ pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     } else {
         func
     };
-    // `functional.py:925 self.w_iterable = space.iter(w_iterable)`.
+    // `functional.py self.w_iterable = space.iter(w_iterable)`.
     let w_iterable = crate::baseobjspace::iter(unsafe {
         pyre_object::gc_roots::shadow_stack_get(iterable_slot)
     })?;

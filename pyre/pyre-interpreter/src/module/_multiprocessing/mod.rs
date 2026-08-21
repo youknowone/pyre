@@ -41,7 +41,7 @@ fn windows_error(winerror: i32) -> crate::PyError {
     crate::PyError::os_error_win32_syscall2(winerror, PY_NULL, PY_NULL)
 }
 
-/// `interp_semaphore.py:17 RECURSIVE_MUTEX, SEMAPHORE = range(2)`.
+/// `interp_semaphore.py RECURSIVE_MUTEX, SEMAPHORE = range(2)`.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 const RECURSIVE_MUTEX: i64 = 0;
 #[cfg(all(any(unix, windows), feature = "host_env"))]

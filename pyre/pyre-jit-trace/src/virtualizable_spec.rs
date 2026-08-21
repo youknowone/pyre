@@ -12,7 +12,7 @@ pub const PYFRAME_VABLE_OWNER_ROOT: &str = "PyFrame";
 /// in declaration order. `PyFrame.lastblock` is deliberately absent:
 /// the frame model tracked by this tree has no block stack. Unwind uses
 /// the `co_exceptiontable` lookup at
-/// `pypy/interpreter/pyopcode.py:152 lookup_exceptiontable`, and pyre's
+/// `pypy/interpreter/pyopcode.py lookup_exceptiontable`, and pyre's
 /// 3.14 bytecode emits no `SETUP_*` / `POP_BLOCK`, so nothing mutates
 /// the field inside a trace. It remains an ordinary heap field with a
 /// plain `FieldDescr` and a GC root slot. If block opcodes are ever

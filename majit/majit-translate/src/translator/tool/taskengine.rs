@@ -193,7 +193,7 @@ pub struct SimpleTaskEngine {
     /// Sidecar to [`tasks`] tracking registration order. Upstream's
     /// `self.tasks` is a Python dict whose iteration order is the
     /// insertion order (Python 3.7+); callers like
-    /// `driver.py:113 for task in self.tasks:` observe that order.
+    /// `driver.py for task in self.tasks:` observe that order.
     /// Rust's `HashMap` has no ordering guarantee, so the port mirrors
     /// the dict-insertion-order trail in this auxiliary `Vec`.
     /// Re-registering an existing task name preserves the position
@@ -406,14 +406,14 @@ impl SimpleTaskEngine {
 
     /// Access the registered tasks. Mirrors upstream's direct
     /// `self.tasks` attribute access at
-    /// `driver.py:113 for task in self.tasks:`.
+    /// `driver.py for task in self.tasks:`.
     pub fn tasks(&self) -> std::cell::Ref<'_, HashMap<String, TaskRegistration>> {
         self.tasks.borrow()
     }
 
     /// Task names in registration (== upstream dict-insertion) order.
     /// Use this when iterating `self.tasks` matters, e.g. in
-    /// `driver.py:113 for task in self.tasks:` whose loop order is
+    /// `driver.py for task in self.tasks:` whose loop order is
     /// observable through `self.exposed`.
     pub fn task_names_in_registration_order(&self) -> Vec<String> {
         self.task_order.borrow().clone()
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn register_task_overwrites_on_duplicate_preserving_order_position() {
-        // Upstream `taskengine.py:14 tasks[task_name] = task, task_deps`
+        // Upstream `taskengine.py tasks[task_name] = task, task_deps`
         // is dict assignment. Re-registering must overwrite the
         // callable/deps/title/idempotent and preserve the existing key's
         // position in the iteration order (Python dict-assignment
@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn task_names_follow_registration_order() {
-        // Upstream `driver.py:113 for task in self.tasks:` iterates dict
+        // Upstream `driver.py for task in self.tasks:` iterates dict
         // insertion order. Pin the trail.
         let e = SimpleTaskEngine::new();
         e.register_task("annotate", noop_callable(), vec![], "a", false);

@@ -5357,7 +5357,7 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     let header_w_class = ctx
         .trace_ctx
         .const_ref(pyre_object::get_instantiate(&pyre_interpreter::FUNCTION_TYPE) as i64);
-    // `function.py:33 can_change_code = True` for a plain `def`.
+    // `function.py can_change_code = True` for a plain `def`.
     let can_change_code = ctx.trace_ctx.const_int(1);
     let name = ctx
         .trace_ctx

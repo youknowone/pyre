@@ -467,7 +467,7 @@ fn fold_constant_cast_pointer(
 
 /// Map an `lltype.LowLevelValue` to the carrier `ConstValue` so a
 /// folded `getfield` can land in a `Constant`. Mirrors upstream
-/// `storesink.py:100-102 res = Constant(llres, concretetype)` —
+/// `storesink.py res = Constant(llres, concretetype)` —
 /// `Constant.value` carries the LL field value directly. The Rust
 /// port's `ConstValue` variants have to map each `LowLevelValue`
 /// arm to the carrier the rest of the optimizer uses for that

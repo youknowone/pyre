@@ -38,7 +38,7 @@ use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueType};
 /// (production).
 pub fn annotate(graph: &FunctionGraph) {
     // RPython parity: `annrpython.py:RPythonAnnotator.complete()`
-    // (`annrpython.py:603-618 typeof([v_last_exc_value])`) writes
+    // (`annrpython.py typeof([v_last_exc_value])`) writes
     // exceptblock annotations only when a `follow_raise_link` actually
     // reaches the block — they stay `None` for unreachable exceptblocks.
     // No annotator-stage pre-seed runs here; the rtyper-equivalent

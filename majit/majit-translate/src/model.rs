@@ -17,7 +17,7 @@ pub enum ValueType {
     Int,
     /// `lltype.Unsigned` — register class is `'int'` per
     /// `getkind(Unsigned) == 'int'`, distinct from `Signed` only at
-    /// the rtyper dispatch level (`rbool.py:78 uint_is_true`,
+    /// the rtyper dispatch level (`rbool.py uint_is_true`,
     /// `rint.py` cast family).  Downstream consumers that do not
     /// distinguish signedness (regalloc, codewriter,
     /// valuetype_to_someshell) treat `Unsigned` identically to `Int`
@@ -229,7 +229,7 @@ impl ImmutableRank {
     }
 
     /// True for `IR_QUASIIMMUTABLE` / `IR_QUASIIMMUTABLE_ARRAY` —
-    /// `jtransform.py:895 immut in (IR_QUASIIMMUTABLE, IR_QUASIIMMUTABLE_ARRAY)`.
+    /// `jtransform.py immut in (IR_QUASIIMMUTABLE, IR_QUASIIMMUTABLE_ARRAY)`.
     pub fn is_quasi_immutable(self) -> bool {
         matches!(self, Self::QuasiImmutable | Self::QuasiImmutableArray)
     }
@@ -707,7 +707,7 @@ pub enum OpKind {
     /// <ty>)` for the rtyper / `constfold::replace_we_are_jitted`
     /// (→ `false`) genc path, and `jtransform` folds it to
     /// `ConstBool(true)` keyed on the `SpecTag` identity (parity with
-    /// `jtransform.py:1638 value is _we_are_jitted`).  No
+    /// `jtransform.py value is _we_are_jitted`).  No
     /// `ConstSymbolic` survives `jtransform`, so the backend never
     /// materialises one.
     ConstSymbolic {
@@ -4110,7 +4110,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///          update(op.args)` for `canremove`-classified ops).
 ///          Operands become live only if `op.result` becomes live.
 ///        - Otherwise: operands join `read_vars` immediately
-///          (`simplify.py:442-443 read_vars.update(op.args)`
+///          (`simplify.py read_vars.update(op.args)`
 ///          for non-`canremove` ops).  Raising-op operands therefore
 ///          stay live unconditionally — the raise side-effect is
 ///          observable.
@@ -4154,7 +4154,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///      TODO: translator-gated arms not ported.
 ///      Upstream's Step 5 has two further `elif` arms after the
 ///      canremove drop:
-///        - `simplify.py:489-499 elif op.opname == 'simple_call'`
+///        - `simplify.py elif op.opname == 'simple_call'`
 ///          removes `simple_call(builtin, ...)` whose first arg is
 ///          a `Constant` whose value is in `CanRemoveBuiltins`
 ///          (`simplify.py:418-420 = {hasattr: True}`).  The
@@ -4163,7 +4163,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
 ///          `OpKind::IndirectCall` etc., not as `simple_call`-named
 ///          ops, and pyre's frontend never emits a Call to `hasattr`
 ///          — the arm is structurally inapplicable.
-///        - `simplify.py:500-506 elif op.opname == 'direct_call'`
+///        - `simplify.py elif op.opname == 'direct_call'`
 ///          removes the call when `has_no_side_effects(translator,
 ///          graph) and op is not block.raising_op`.  Gated on
 ///          `translator is not None`; pyre's caller passes
@@ -5831,7 +5831,7 @@ impl FunctionGraph {
         self.set_control_flow_metadata(block, None, vec![link]);
     }
 
-    /// `flowcontext.py:440 currentblock.closeblock(Link(outputargs, block))`
+    /// `flowcontext.py currentblock.closeblock(Link(outputargs, block))`
     /// — compute link args via `getoutputargs` and install the Link
     /// WITHOUT calling [`Self::ensure_variable_at_block`].
     ///

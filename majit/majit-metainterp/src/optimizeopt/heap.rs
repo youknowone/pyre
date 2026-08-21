@@ -1053,9 +1053,9 @@ impl OptHeap {
     /// getattr(ei, '_readonly_descrs_' + key)]` — the bit position in
     /// each EI's `bitstring_*` is the descr's `ei_index`, set by
     /// `compute_bitstrings` (`effectinfo.py descr.ei_index = …`).
-    /// `effectinfo.py:496 descr.ei_index = sys.maxint` is the sentinel
+    /// `effectinfo.py descr.ei_index = sys.maxint` is the sentinel
     /// for descrs absent from any EI's raw set;
-    /// `bitstring.py:18 if byte_number >= len(bitstring)` then makes
+    /// `bitstring.py if byte_number >= len(bitstring)` then makes
     /// `bitcheck` return false out of range. Pyre matches by returning
     /// `u32::MAX`, whose `byte_number = u32::MAX >> 3` is far past any
     /// realistic bitstring length so `bitcheck` shorts to false the
@@ -2087,7 +2087,7 @@ impl OptHeap {
         // Bitstring bit position resolves through `descr.get_ei_index()`
         // directly; `effectinfo.py:526 descr.ei_index = …` stamps the
         // slot in-place at `compute_bitstrings` time, and
-        // `effectinfo.py:496 descr.ei_index = sys.maxint` is the
+        // `effectinfo.py descr.ei_index = sys.maxint` is the
         // sentinel for descrs absent from any EI's raw set.
         let array_descrs: Vec<(usize, DescrRef, u32)> = self
             .cached_arrayitems
@@ -4034,7 +4034,7 @@ mod tests {
     ///
     /// `ei_index` mirrors PyPy production field descrs (`history.py:498
     /// FieldDescr.ei_index`); default `u32::MAX` matches PyPy
-    /// `effectinfo.py:496 descr.ei_index = sys.maxint` for descrs absent
+    /// `effectinfo.py descr.ei_index = sys.maxint` for descrs absent
     /// from any EI's raw set. Tests that need a specific `ei_index`
     /// (i.e., the descr appears in some EI's `_*_descrs_*` raw set) call
     /// `descr.set_ei_index(N)` before constructing the EI, mirroring
@@ -4636,7 +4636,7 @@ mod tests {
     /// parentless `TestDescr` used by the sibling test takes
     /// `field_slot_index`'s `Descr::index()` fallback, so it never exercises
     /// the `index_in_parent` slot that `ensure_ptr_info_arg0` sizes the
-    /// `StructPtrInfo` for at `optimizer.py:484 init_fields`.
+    /// `StructPtrInfo` for at `optimizer.py init_fields`.
     #[test]
     fn getfield_read_after_read_folds_through_a_parented_descr() {
         let d: DescrRef = Arc::new(ParentIndexedDescr { parent_idx: 7 });
@@ -4730,7 +4730,7 @@ mod tests {
     /// An ordinary heap field read off a *virtualizable* receiver must still be
     /// cached. Upstream has no `VirtualizablePtrInfo` — `info.py`'s hierarchy
     /// stops at `InstancePtrInfo` / `StructPtrInfo` — so a virtualizable frame
-    /// carries a plain `InstancePtrInfo` and `optimizer.py:484 init_fields`
+    /// carries a plain `InstancePtrInfo` and `optimizer.py init_fields`
     /// gives every declared slot a home. pyre's extra `PtrInfo::Virtualizable`
     /// variant has no `setfield` / `getfield` arm (`ptr_info.rs` falls through
     /// to `_ => {}` / `_ => None`), and `ensure_ptr_info_arg0` early-returns on

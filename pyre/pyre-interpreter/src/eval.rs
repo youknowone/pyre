@@ -1905,7 +1905,7 @@ pub fn handle_exception_with_context(
         if err.exc_object.is_null() {
             err.exc_object = operr_obj;
         }
-        // `pyopcode.py:147-148 pytraceback.record_application_traceback`
+        // `pyopcode.py pytraceback.record_application_traceback`
         // — prepends a `PyTraceback` wrapping the current frame onto
         // the exception's `w_traceback` chain.
         // `w_pytraceback_new` copies this pointer into the node it allocates,
@@ -3008,7 +3008,7 @@ unsafe fn load_global_via_cache(
         // own builtin per `pyframe.py:115`), the cache carries no
         // `builtincache` — that branch is dead in
         // `ModuleDictStrategy::get_global_cache` per its line-by-line port
-        // of `celldict.py:224 not space.config.objspace.honor__builtins__`.
+        // of `celldict.py not space.config.objspace.honor__builtins__`.
         let strategy = &mut *raw.mstrategy;
         let storage = &*raw.dstorage;
         let cache = strategy.get_global_cache(storage, name);

@@ -122,7 +122,7 @@ pub struct MIFrame {
     /// because a fresh frame's "previous opimpl" is the implicit
     /// frame setup (returns void).
     pub _result_argcode: u8,
-    /// Rust bytecode adaptation for `pyjitpl.py:186 ord(self.bytecode[self.pc - 1])`.
+    /// Rust bytecode adaptation for `pyjitpl.py ord(self.bytecode[self.pc - 1])`.
     ///
     /// RPython encodes the result register as the last byte before the
     /// post-call LIVE marker, so `get_list_of_active_boxes(in_a_call=True)`

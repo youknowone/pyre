@@ -502,7 +502,7 @@ pub struct ShortBoxes {
     short_inputarg_refs: Vec<majit_ir::InputArgRc>,
     /// shortpreamble.py `box = label_args[i]` — the ORIGINAL label-arg
     /// references, kept so `potential_ops`/lookups resolve a label arg by
-    /// its own opref (`shortpreamble.py:259 potential_ops[box]`). pyre needs
+    /// its own opref (`shortpreamble.py potential_ops[box]`). pyre needs
     /// this explicitly because OpRef positions are not object identities:
     /// once `short_inputargs[i]` is a distinct renamed box, it no longer
     /// carries the original label-arg identity, so the original must be

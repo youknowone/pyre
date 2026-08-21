@@ -3138,7 +3138,7 @@ fn try_adopt_multi_frame_blackhole(
     let set_topframeref = |frame_ptr: i64| unsafe {
         (*ec).topframeref = frame_ptr as *mut pyre_interpreter::PyFrame;
     };
-    // `pyopcode.py:239-241 RETURN_VALUE` / `pyopcode.py:184
+    // `pyopcode.py RETURN_VALUE` / `pyopcode.py
     // handle_operation_error`: mark each level finished as it returns to its
     // caller, the store the walker performs at the `*_return` jitcode ops.
     //

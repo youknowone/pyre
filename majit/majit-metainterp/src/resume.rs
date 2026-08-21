@@ -1686,7 +1686,7 @@ impl Eq for ResolvedPendingFieldWrite {}
 /// carries `lldescr` (the descriptor object itself) so decoding can
 /// hand back a live `Arc<dyn Descr>` via `descr.clone()` rather than
 /// rebuilding it through an index lookup
-/// (`resume.py:1000-1001 cast_base_ptr_to_instance`).
+/// (`resume.py cast_base_ptr_to_instance`).
 #[derive(Debug, Clone)]
 pub struct EncodedPendingFieldWrite {
     /// `resume.py:88 lldescr` — the field/array descriptor itself.
@@ -4257,7 +4257,7 @@ impl ResumeDataLoopMemo {
         // time (`_number_boxes` classifies via `box.is_constant()` before
         // adding to liveboxes). Backend regalloc enforces the same upstream
         // contract (the backend `regalloc.rs`'s `!arg.is_constant()` assert mirrors
-        // `regalloc.py:1204 assert not isinstance(arg, Const)`).
+        // `regalloc.py assert not isinstance(arg, Const)`).
         //
         // The numbering pass that produced this `liveboxes` list already
         // satisfied that invariant. The re-walk below exists for boxes that
@@ -6020,7 +6020,7 @@ impl BlackholeAllocator for NullAllocator {}
 /// metainterp-specific — so they stay here as a trait extension.
 pub trait VirtualInfoBlackholeExt {
     fn is_about_raw(&self) -> bool;
-    /// `resume.py:973 if rd_virtual is not None`: detect the
+    /// `resume.py if rd_virtual is not None`: detect the
     /// `RdVirtualInfo::Empty` placeholder propagated as a zero-shaped
     /// `VirtualObj` (the `rd_virtual_to_virtual_info` conversion). Used by
     /// `force_all_virtuals` to skip slots that PyPy keeps as `None`.

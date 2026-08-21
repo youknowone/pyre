@@ -644,7 +644,7 @@ fn parse_acquire_args(
     }
 }
 
-/// `os_lock.py:49 space.getexecutioncontext().checksignals()`.  The signal
+/// `os_lock.py space.getexecutioncontext().checksignals()`.  The signal
 /// module is not built for wasm32 (`module/mod.rs`'s `pub mod signal`), where
 /// no handler can be pending, so there the check has nothing to run.
 fn checksignals() -> Result<(), crate::PyError> {

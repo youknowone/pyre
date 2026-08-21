@@ -1235,7 +1235,7 @@ fn analyze_pipeline_from_module_paths(
     // `all_interiorfielddescrs` (the layout-provider path already carries
     // `is_immutable` on `StructFieldLayout`).
     call_control.immutable_fields_by_struct = immutable_fields;
-    // `descr.py:364 ARRAY_INSIDE._immutable_field(None)` parity.
+    // `descr.py ARRAY_INSIDE._immutable_field(None)` parity.
     // Summarise `field[*]` annotations into the array-type-keyed set so
     // `arraydescrof_concrete` can fold field-level immutability into the
     // shared per-ARRAY descr's `is_pure` flag.
@@ -1908,7 +1908,7 @@ fn analyze_pipeline_from_module_paths(
                     call_control.mark_oopspec(p.clone(), spec.to_string());
                     continue;
                 }
-                // `support.py:705 argnames = ll_func.__code__.co_varnames[:nb_args]`
+                // `support.py argnames = ll_func.__code__.co_varnames[:nb_args]`
                 // — companion hint emitted by `front::llbc_hints::harvest_hints_from_llbcs`
                 // when `#[oopspec(...)]` is paired with a function signature.
                 // Threads the declaration-order parameter names into
@@ -2401,7 +2401,7 @@ fn make_jitcodes(
         }
     }
 
-    // RPython `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`.
+    // RPython `pyjitpl.py self.liveness_info = "".join(asm.all_liveness)`.
     // Snapshot the assembler's shared `all_liveness` byte stream so the runtime
     // can resolve the `BC_LIVE` offsets baked into `JitCode.code`.
     let all_liveness = codewriter.assembler.all_liveness().to_vec();

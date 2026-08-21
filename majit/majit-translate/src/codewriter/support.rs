@@ -149,7 +149,7 @@ pub fn decode_builtin_call(
         // `support.py:756-759`: op.opname == 'direct_call' → resolve via fnobj
         OpKind::Call { target, args, .. } => {
             let args: &[crate::flowspace::model::Variable] = args.as_slice();
-            // `support.py:757 fnobj = op.args[0].value._obj` →
+            // `support.py fnobj = op.args[0].value._obj` →
             // `:759 get_call_oopspec_opargs(fnobj, opargs)` →
             // `:707 operation_name, args = ll_func.oopspec.split('(', 1)`.
             // Pyre's analogue: the spec string is registered on the
@@ -167,7 +167,7 @@ pub fn decode_builtin_call(
                      `jtransform.py:484 handle_builtin_call`'s upstream gating.",
                 )
             });
-            // `support.py:707 operation_name, args = ll_func.oopspec.split('(', 1)`
+            // `support.py operation_name, args = ll_func.oopspec.split('(', 1)`
             // → `:726 get_call_oopspec_opargs` → `:727
             // oopspec, argtuple = parse_oopspec(fnobj)`.
             //
@@ -187,7 +187,7 @@ pub fn decode_builtin_call(
                     (oopspec_name, normalized)
                 }
                 None => {
-                    // `support.py:758 opargs = op.args[1:]`: pyre's
+                    // `support.py opargs = op.args[1:]`: pyre's
                     // `OpKind::Call::args` already excludes the funcptr
                     // so the positional args flow through directly,
                     // wrapped as `Pass(Variable)` for the uniform return
@@ -234,7 +234,7 @@ pub enum NormalizeSlot {
     /// passthrough.  `n` is the 0-based slot in the callee's
     /// argname list.
     Index(usize),
-    /// `support.py:714 argtuple = eval(args, argname2index)` — integer
+    /// `support.py argtuple = eval(args, argname2index)` — integer
     /// literal injection.  Upstream wraps as `Constant(obj,
     /// lltype.Signed)`.  Pyre uses this slot only for genuine
     /// `lltype.Signed`-tagged constants: integer literals parsed by
@@ -244,7 +244,7 @@ pub enum NormalizeSlot {
     /// pyre IR analogue and conflating it with `lltype.Signed`
     /// would be a deviation.
     ConstInt(i64),
-    /// `support.py:714 argtuple = eval(args, argname2index)` — float
+    /// `support.py argtuple = eval(args, argname2index)` — float
     /// literal injection (e.g. `1.5`, `2.0e3`).  Upstream wraps as
     /// `Constant(obj, lltype.Float)`.  Stored as the f64 bit pattern
     /// to keep `PartialEq` / `Hash` derivable (`history.py:265
@@ -330,12 +330,12 @@ pub enum NormalizedArg {
 /// `argtuple` with the bare spec as `operation_name`.  This handles
 /// pyre's `lib.rs` jit.* bare-name registrations gracefully.
 pub fn parse_oopspec(spec: &str, argnames: &[&str]) -> (String, Vec<NormalizeSlot>) {
-    // `support.py:707 operation_name, args = ll_func.oopspec.split('(', 1)`
+    // `support.py operation_name, args = ll_func.oopspec.split('(', 1)`
     let (operation_name, args_part) = match spec.split_once('(') {
         Some((name, rest)) => (name.trim().to_string(), rest),
         None => return (spec.trim().to_string(), Vec::new()),
     };
-    // `support.py:708 assert args.endswith(')')`
+    // `support.py assert args.endswith(')')`
     let inner = match args_part.strip_suffix(')') {
         Some(stripped) => stripped,
         None => panic!(
@@ -343,20 +343,20 @@ pub fn parse_oopspec(spec: &str, argnames: &[&str]) -> (String, Vec<NormalizeSlo
              Upstream `support.py:708` asserts `args.endswith(')')`."
         ),
     };
-    // `support.py:709 args = args[:-1] + ','` — trailing-comma tuple syntax.
+    // `support.py args = args[:-1] + ','` — trailing-comma tuple syntax.
     // `support.py:710-711 if args.strip() == ',': args = '()'`
     let trimmed = inner.trim();
     if trimmed.is_empty() {
         return (operation_name, Vec::new());
     }
-    // `support.py:712 nb_args = len(argnames)`
+    // `support.py nb_args = len(argnames)`
     // `support.py argname2index = dict(zip(argnames, [Index(n) for n in range(nb_args)]))`
     let argname2index: std::collections::HashMap<&str, usize> = argnames
         .iter()
         .enumerate()
         .map(|(n, name)| (*name, n))
         .collect();
-    // `support.py:714 argtuple = eval(args, argname2index)`
+    // `support.py argtuple = eval(args, argname2index)`
     //
     // Pyre's narrow expression parser: comma-split, then per-slot
     // resolve as identifier (→ `Index(n)`) or Python literal.  Empty
@@ -684,7 +684,7 @@ pub fn setup_extra_builtin(
 /// Ptr(FuncType(...)))` whose only consumer is the test that
 /// inspects the spec name + arg types.  Pyre's structural divergence:
 /// `setup_extra_builtin` always needs `call_control` for the strict
-/// fnaddr lookup (`support.py:687-690 globals()[name]` /
+/// fnaddr lookup (`support.py globals()[name]` /
 /// `LLtypeHelpers.<name>.im_func` maps to
 /// `CallControl::lookup_function_fnaddr` in pyre, and no Rust analog
 /// of the symbolic Python identifier exists without a registry).
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn setup_extra_builtin_renders_canonical_name() {
-        // `support.py:684 name = '_ll_%d_%s' % (nb_args, oopspec_name.replace('.', '_'))`.
+        // `support.py name = '_ll_%d_%s' % (nb_args, oopspec_name.replace('.', '_'))`.
         // Register stub fnaddrs so the strict-panic resolution succeeds —
         // the test is purely about the name template, not the lookup.
         let mut cc = CallControl::new();
@@ -875,7 +875,7 @@ mod tests {
         let (name, _, _) = setup_extra_builtin(Some(&cc), "int_abs", 1, None, None);
         assert_eq!(name, "_ll_1_int_abs");
         let (name, _, _) = setup_extra_builtin(Some(&cc), "ll_math.ll_math_sqrt", 1, None, None);
-        // `.` → `_` per `support.py:684 .replace('.', '_')`
+        // `.` → `_` per `support.py .replace('.', '_')`
         assert_eq!(name, "_ll_1_ll_math_ll_math_sqrt");
     }
 
@@ -1113,7 +1113,7 @@ mod tests {
 
     #[test]
     fn decode_builtin_call_returns_registered_oopspec_and_positional_args() {
-        // `support.py:707 operation_name, args = ll_func.oopspec.split('(', 1)`:
+        // `support.py operation_name, args = ll_func.oopspec.split('(', 1)`:
         // bare-name spec entries (e.g. the `lib.rs` jit.* bindings)
         // resolve to the spec value itself, no `(` stripping needed.
         let mut cc = CallControl::new();
@@ -1136,7 +1136,7 @@ mod tests {
 
     #[test]
     fn decode_builtin_call_strips_arg_pattern_from_spec_name() {
-        // `support.py:707 ll_func.oopspec.split('(', 1)`: when the spec
+        // `support.py ll_func.oopspec.split('(', 1)`: when the spec
         // carries the placeholder pattern (e.g. `"int.py_mod(x, y)"`),
         // the operation name is the prefix before `(`.  Without
         // argname registration the positional flow forwards args as
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "ValueError(op.opname)")]
     fn decode_builtin_call_panics_on_non_call_opkind() {
-        // `support.py:765 raise ValueError(op.opname)`: any opname
+        // `support.py raise ValueError(op.opname)`: any opname
         // outside {direct_call, gc_identityhash, gc_id} raises.  Pyre
         // mirrors the raise via panic.  IndirectCall is included
         // because upstream does NOT have an `indirect_call` arm
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn parse_oopspec_returns_bare_name_when_spec_has_no_paren() {
-        // `support.py:707 ll_func.oopspec.split('(', 1)` raises
+        // `support.py ll_func.oopspec.split('(', 1)` raises
         // ValueError upstream when there's no `(`.  Pyre's port
         // gracefully handles the bare-name registrations at
         // `lib.rs` (`"jit.isconstant"` etc.) by returning an
@@ -1257,7 +1257,7 @@ mod tests {
 
     #[test]
     fn parse_oopspec_injects_integer_literal_as_const_int_slot() {
-        // `support.py:714 argtuple = eval(args, argname2index)` —
+        // `support.py argtuple = eval(args, argname2index)` —
         // literals that don't match an argname pass through as
         // `Constant(obj, lltype.typeOf(obj))`.  Pyre's narrow port
         // accepts integer literals.
@@ -1276,7 +1276,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "missing the closing `)`")]
     fn parse_oopspec_panics_on_unclosed_paren() {
-        // `support.py:708 assert args.endswith(')')` — mirror the
+        // `support.py assert args.endswith(')')` — mirror the
         // upstream AssertionError with a Rust panic.
         super::parse_oopspec("foo(x", &["x"]);
     }
@@ -1284,7 +1284,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "is neither a known argname")]
     fn parse_oopspec_panics_on_unknown_non_integer_slot() {
-        // `support.py:714 eval(args, argname2index)` would accept
+        // `support.py eval(args, argname2index)` would accept
         // `"z"` only if it's bound in argname2index; otherwise eval
         // raises NameError.  Pyre's port panics with a more
         // informative message citing the eval gap.

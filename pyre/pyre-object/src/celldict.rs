@@ -593,7 +593,7 @@ impl ModuleDictStorage {
 pub struct GlobalCache {
     pub cell: Option<PyObjectRef>,
     pub valid: bool,
-    /// `celldict.py:235 cache.builtincache = builtincache`: stores the
+    /// `celldict.py cache.builtincache = builtincache`: stores the
     /// _same_ `GlobalCache` object that lives inside the builtin
     /// strategy's `caches` map, so a write through the builtin's
     /// strategy that updates `cache.cell` is immediately visible
@@ -748,7 +748,7 @@ impl ModuleDictStrategy {
         self.version_watchers.get_current_qmut_instance()
     }
 
-    /// `pyjitpl.py:1112 mutatebox.nonnull()` — whether some trace or loop is
+    /// `pyjitpl.py mutatebox.nonnull()` — whether some trace or loop is
     /// watching `version?` right now.
     pub fn version_qmut_installed(&self) -> bool {
         self.version_watchers.is_installed()
@@ -801,7 +801,7 @@ impl ModuleDictStrategy {
     /// (`PyFrame.w_builtin` assigned at construction, mirroring
     /// `pyframe.py:115 self.builtin = space.builtin.pick_builtin
     /// (w_globals)` under `honor__builtins__=True`).  Per
-    /// `celldict.py:224 not space.config.objspace.honor__builtins__`
+    /// `celldict.py not space.config.objspace.honor__builtins__`
     /// the builtincache install is therefore a no-op — attaching a
     /// cache keyed to `space.builtin.w_dict` would mis-fire whenever
     /// a frame's picked builtin differs from the singleton.  Only the

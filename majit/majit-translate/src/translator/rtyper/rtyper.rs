@@ -2915,7 +2915,7 @@ pub struct LowLevelOpList {
     /// RPython `self.rtyper = rtyper` (rtyper.py). Upstream's
     /// `__init__(self, rtyper=None, ...)` accepts `rtyper=None` so
     /// callers that only need `genop` (e.g.
-    /// `removeassert.py:72 LowLevelOpList()`) can construct without
+    /// `removeassert.py LowLevelOpList()`) can construct without
     /// the typer. The Rust port mirrors that with `Option<...>`;
     /// methods that actually read the typer (`gendirectcall`,
     /// `record_extra_call`, `record_extra_call_by_graph_id`) surface

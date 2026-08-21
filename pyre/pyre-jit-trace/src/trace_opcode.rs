@@ -997,7 +997,7 @@ impl MIFrame {
         self.sym().frame
     }
 
-    /// `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']` requires
+    /// `pypy/module/pypyjit/interp_jit.py reds = ['frame', 'ec']` requires
     /// every CALL_ASSEMBLER red-args list and JUMP-args list to carry ec.
     /// Normal trace setup seeds `sym.execution_context`; this recovery keeps
     /// adapter paths from passing OpRef::NONE as the ec red.
@@ -1627,7 +1627,7 @@ impl MIFrame {
     /// `[frame:Ref, ec:Ref, last_instr:Int, pycode:Ref,
     ///   valuestackdepth:Int, debugdata:Ref, w_globals:Ref]` — line-by-line
     /// parity with `interp_jit.py:25-30` plus
-    /// `interp_jit.py:67 reds = ['frame', 'ec']`.
+    /// `interp_jit.py reds = ['frame', 'ec']`.
     fn build_fail_arg_types_for_active_boxes(&self, active_boxes: &[OpRef]) -> Vec<Type> {
         let mut types = crate::virtualizable_gen::virt_live_value_types(0);
         for &opref in active_boxes {
@@ -1969,7 +1969,7 @@ impl MIFrame {
     /// `TraceCtx::new`, `TraceCtx::with_green_key`) that need to
     /// allocate `original_boxes` of the same shape future
     /// `close_loop_args` calls will produce, so
-    /// `pyjitpl.py:2996 assert len(original_boxes) == len(live_arg_boxes)`
+    /// `pyjitpl.py assert len(original_boxes) == len(live_arg_boxes)`
     /// can fire (see memory
     /// `merge_point_shape_assert_prerequisite_2026_05_03.md`).
     ///
@@ -2709,7 +2709,7 @@ impl MIFrame {
     /// top frame. Returns the scalar header plus active_boxes —
     /// `[frame, (ec)?, last_instr, pycode, valuestackdepth, debugdata,
     /// w_globals, active_boxes...]` — matching
-    /// `interp_jit.py:25-30 PyFrame._virtualizable_` /
+    /// `interp_jit.py PyFrame._virtualizable_` /
     /// `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS` line-by-line.
     /// `NUM_EXTRA_REDS` controls whether the ec slot
     /// (interp_jit.py `reds = ['frame', 'ec']`) is present between
@@ -2729,7 +2729,7 @@ impl MIFrame {
             Vec::with_capacity(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + active_boxes.len());
         fa.push(s.frame);
         // NUM_EXTRA_REDS == 1 (crate const-assert in `lib.rs`).
-        // `interp_jit.py:67 reds = ['frame', 'ec']`.
+        // `interp_jit.py reds = ['frame', 'ec']`.
         fa.push(ec);
         fa.extend_from_slice(&[
             s.vable_last_instr,

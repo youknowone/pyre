@@ -2883,7 +2883,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // are intentionally NOT bound:
     //   * `_ll_1_int_abs` — RPython `inline_calls_to` seeds the
     //     `int_abs` helper *graph* into the BFS for actual inlining
-    //     at `call.py:60-64 todo.append(c_func.value._obj.graph)`.
+    //     at `call.py todo.append(c_func.value._obj.graph)`.
     //     Pyre can register the fnaddr but cannot fabricate the
     //     helper body graph from an `extern "C"` function pointer
     //     (no `MixLevelHelperAnnotator.constfunc` analogue), so a

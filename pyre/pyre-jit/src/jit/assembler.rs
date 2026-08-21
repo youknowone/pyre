@@ -139,7 +139,7 @@ impl Assembler {
     /// The reader-side mirror seeds identically
     /// (`pyre_jit_trace::assembler::AssemblerState::new`), so the wholesale
     /// replace in `publish_state` never rewinds past this prefix.
-    /// `assembler.py:20 self.insns = {}` is the other half of the same
+    /// `assembler.py self.insns = {}` is the other half of the same
     /// continuation, and it is load-bearing for the same reason. The build-time
     /// jitcodes' `-live-` markers are written with the canonical opcode byte,
     /// and `blackhole.py BlackholeInterpBuilder.__init__` recovers it as

@@ -412,7 +412,7 @@ impl DerefMut for PyJitCode {
     }
 }
 
-/// `interp_jit.py:67 reds = ['frame', 'ec']` pre-regalloc slot derivation.
+/// `interp_jit.py reds = ['frame', 'ec']` pre-regalloc slot derivation.
 ///
 /// Returns `(portal_frame_reg, portal_ec_reg)` — the SSARepr Variable
 /// indices the per-CodeObject codewriter emits for the portal red args.

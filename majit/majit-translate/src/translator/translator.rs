@@ -490,11 +490,11 @@ impl TranslationContext {
         Vec::new()
     }
 
-    /// Upstream `genc.py:130 exports.clear()`. Stub no-op until
+    /// Upstream `genc.py exports.clear()`. Stub no-op until
     /// `rlib/exports.py` lands locally.
     pub fn clear_exports(&self) {}
 
-    /// Upstream `genc.py:132 for ll_func in db.translator._call_at_startup`.
+    /// Upstream `genc.py for ll_func in db.translator._call_at_startup`.
     ///
     /// `_call_at_startup` is registered upstream by code paths that
     /// have not yet been ported (rffi tooling, GC startup hooks).

@@ -188,7 +188,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     ));
                 }
                 let name = crate::baseobjspace::str_utf8_w(args[0])?;
-                // `interp_pwd.py:111 @unwrap_spec(name='text0')` rejects
+                // `interp_pwd.py @unwrap_spec(name='text0')` rejects
                 // embedded NULs.  CString::new() enforces that here.
                 let c_name = std::ffi::CString::new(name).map_err(|_| {
                     crate::PyError::value_error("getpwnam: name must not contain NUL bytes")

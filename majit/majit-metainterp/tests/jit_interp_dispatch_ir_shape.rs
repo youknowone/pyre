@@ -923,7 +923,7 @@ mod oparg_minimal {
     }
 
     /// A.2.4: the `state.last_instr = pc as i64` write
-    /// (`pyopcode.py:172  self.last_instr = intmask(next_instr)`) must
+    /// (`pyopcode.py  self.last_instr = intmask(next_instr)`) must
     /// lower to a single `BC_STORE_STATE_FIELD` op emitted in the
     /// prelude position — between the JIT merge-point markers and the
     /// opcode fetch. The existing `state_fields` macro lowering
@@ -1775,7 +1775,7 @@ mod oparg_with_pc_green {
 
 /// A.3.3 optional parity-anchor fixture: `greens = [pc, program]`.
 ///
-/// Mirrors `interp_jit.py:67 reds = ['frame', 'ec']` adapted to pyre's
+/// Mirrors `interp_jit.py reds = ['frame', 'ec']` adapted to pyre's
 /// portal binding names.  Declaring both portal inputs as green leaves
 /// reds = [] — this is the A.6 follow-up parity shape.
 ///
@@ -1839,7 +1839,7 @@ mod oparg_with_pypy_parity_greens {
 
     /// A.3.3: `greens = [pc, program]` yields empty reds and both portal
     /// inputs in greens buckets.  This is the A.6 parity anchor for
-    /// `interp_jit.py:67 reds = ['frame', 'ec']` adapted to pyre.
+    /// `interp_jit.py reds = ['frame', 'ec']` adapted to pyre.
     #[test]
     fn dispatch_oparg_with_pypy_parity_greens_pins_layout() {
         use majit_metainterp::jitcode::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};

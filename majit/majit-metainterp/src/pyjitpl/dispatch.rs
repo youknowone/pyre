@@ -2487,7 +2487,7 @@ where
         // shortcuts to Abort for that case, so here the exception slot
         // is guaranteed non-zero).
         if let Some(exc_box) = self.last_exception_box {
-            // `pyjitpl.py:2531 excvalue = self.last_exc_value`, snapshotted
+            // `pyjitpl.py excvalue = self.last_exc_value`, snapshotted
             // next to `last_exc_box` so the consumer can raise it after the
             // compile (`pyjitpl.py:2558-2562`).
             let exc_value = self.last_exception_value;
@@ -4996,7 +4996,7 @@ where
                 // [cond:u8][target:u16].
                 let (opcode_pc, cond_idx, target) = {
                     let frame = self.frames.current_mut();
-                    // RPython `pyjitpl.py:3713 orgpc = position` parity: the
+                    // RPython `pyjitpl.py orgpc = position` parity: the
                     // dispatcher's `next_u8()` already stepped past the
                     // opcode byte, so `code_cursor - 1` is the byte position
                     // of the guard op itself — what `generate_guard(...,
@@ -7472,7 +7472,7 @@ where
                     let _ = dst;
                 } else {
                     // ResKind::Ref intentionally rejects ReleaseGil per
-                    // `resoperation.py:1243-1244 # no such thing`. The
+                    // `resoperation.py # no such thing`. The
                     // producer rejects this combination at
                     // `pyre-jit/src/jit/assembler.rs`'s
                     // `dispatch_residual_call` so the
@@ -8451,7 +8451,7 @@ where
                 //     self.metainterp.popframe()
                 //     self.metainterp.finishframe_exception()
                 //
-                // RPython `pyjitpl.py:3713 orgpc = position` parity: the
+                // RPython `pyjitpl.py orgpc = position` parity: the
                 // dispatcher's `next_u8()` already stepped past the
                 // BC_RAISE byte, so `code_cursor - 1` is the byte position
                 // of opimpl_raise itself — what `generate_guard(...,
@@ -10293,7 +10293,7 @@ pub fn call_void_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[
 ///
 /// The top frame's `pc` here holds the *JitCode-internal* resume position
 /// (`record_state_guard` swapped it to the guard's orgpc just before this
-/// call), matching RPython's `pyjitpl.py:2596 frame.pc = resumepc` swap.
+/// call), matching RPython's `pyjitpl.py frame.pc = resumepc` swap.
 /// Intermediate frames keep their natural `pc` (= return-to byte position
 /// in their jitcode, set by `BC_INLINE_CALL` at
 /// `dispatch.rs frame.pc = frame.code_cursor`).

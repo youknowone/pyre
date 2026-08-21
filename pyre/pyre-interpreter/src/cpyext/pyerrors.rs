@@ -1,7 +1,7 @@
 //! The C exception indicator -- PyPy `cpyext/state.py` and `cpyext/pyerrors.py`.
 //!
 //! Upstream parks an `OperationError` on the execution context
-//! (`state.py:14 ExecutionContext.cpyext_operror`) and normalizes it only when
+//! (`state.py ExecutionContext.cpyext_operror`) and normalizes it only when
 //! the interpreter takes it back.  Pyre's [`crate::PyError`] carries the
 //! exception *instance*, so the indicator is the instance's mirror: the mirror
 //! census already roots the link, which is why no separate root walker is

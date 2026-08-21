@@ -2403,7 +2403,7 @@ fn socket_init_state(
     socket_set_attr(obj, "_type", pyre_object::w_int_new(ty as i64));
     socket_set_attr(obj, "_proto", pyre_object::w_int_new(proto as i64));
     socket_set_attr(obj, "_timeout", pyre_object::w_none());
-    // `interp_socket.py:977 usecount = 1` — start the refcount at 1 so
+    // `interp_socket.py usecount = 1` — start the refcount at 1 so
     // `_drop` followed by no `_reuse` closes the underlying fd exactly
     // once.
     socket_set_attr(obj, "_usecount", pyre_object::w_int_new(1));
@@ -2487,7 +2487,7 @@ fn pack_inet_addr(
         } else {
             addr
         };
-        // `interp_socket.py:157-159 w_address = space.fsencode(w_address)`,
+        // `interp_socket.py w_address = space.fsencode(w_address)`,
         // with the upstream note that it deliberately avoids `fsencode_w`
         // because Linux allows embedded NULs in an abstract-namespace path.
         // The raw `fsencode` preserves that carve-out.
@@ -2744,10 +2744,10 @@ fn unpack_unix_addr(
     };
     let bytes: Vec<u8> = sun.sun_path[..end].iter().map(|&b| b as u8).collect();
     if abstract_name {
-        // `interp_socket.py:45 space.newbytes(path)`: abstract names are bytes.
+        // `interp_socket.py space.newbytes(path)`: abstract names are bytes.
         pyre_object::bytesobject::w_bytes_from_bytes(&bytes)
     } else {
-        // `interp_socket.py:47 space.newfilename(path)`: read-back uses the filesystem
+        // `interp_socket.py space.newfilename(path)`: read-back uses the filesystem
         // decoding so a byte with no UTF-8 spelling survives the round trip.
         crate::gateway::fsdecode_filename_bytes(&bytes)
     }

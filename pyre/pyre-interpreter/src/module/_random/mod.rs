@@ -142,7 +142,7 @@ pub struct W_Random {
     /// `_random.Random` itself simply retains the empty/null state.
     pub map: usize,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
-    /// `interp_random.py:21 self._rnd = rrandom.Random()` — the reference to a
+    /// `interp_random.py self._rnd = rrandom.Random()` — the reference to a
     /// separately allocated generator.  `random_object_custom_trace` forwards
     /// it: the mapdict-prefix trace this class shares knows only `w_class`,
     /// `storage` and the boxed attribute slots.

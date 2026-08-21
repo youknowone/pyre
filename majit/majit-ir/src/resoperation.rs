@@ -1237,7 +1237,7 @@ pub trait BoxEnv {
 ///
 /// Mirrors RPython's object-identity model: `resoperation.py:250
 /// AbstractResOp` instances are plain Python objects, so every consumer
-/// (`history.py TreeLoop.operations`, `optimizer.py:562 trace.next()`,
+/// (`history.py TreeLoop.operations`, `optimizer.py trace.next()`,
 /// short preamble export, resume metadata, backend input lists) reaches
 /// the **same** ResOperation object and reads/writes `_forwarded`
 /// through that shared identity.  Pyre's analog: every consumer holds

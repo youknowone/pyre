@@ -246,7 +246,7 @@ impl std::ops::Deref for PtrInfoHandleRef<'_> {
 /// behaviour.  This handle is the public API for that identity:
 ///
 ///   - `Const(IntBound)` — a freshly synthesized `IntBound` from a
-///     `ConstInt` (`optimizer.py:102-103 from_constant`).  Two
+///     `ConstInt` (`optimizer.py from_constant`).  Two
 ///     `Const` handles never compare equal under `ptr_eq` even when
 ///     they wrap the same value.
 ///   - `Live(Rc<RefCell<IntBound>>)` — the actual `_forwarded` cell.
@@ -701,7 +701,7 @@ pub struct OptContext {
     /// `optimizer.py` `self.quasi_immutable_deps = None` (initialized
     /// lazily as a dict in `heap.py:821-823`). Each entry is one `QuasiImmut`
     /// instance the trace folded a field of, exactly as upstream keys the dict
-    /// (`heap.py:821-823 quasi_immutable_deps[qmutdescr.qmut] = None`); PyPy
+    /// (`heap.py quasi_immutable_deps[qmutdescr.qmut] = None`); PyPy
     /// uses `dict[k] = None` for set semantics, but the HashMap house rule
     /// forbids that — pyre uses a Vec with linear-scan dedup on instance
     /// identity. Typical size is small (< a few dozen entries per trace), so
@@ -5352,7 +5352,7 @@ impl OptContext {
         if op.is_constant() {
             return false;
         }
-        // `resoperation.py:235 _forwarded = None` — slot is None until
+        // `resoperation.py _forwarded = None` — slot is None until
         // `set_forwarded` writes. `op.get_forwarded() is not None`.
         !matches!(op.get_forwarded(), majit_ir::forwarding::Forwarded::None)
     }

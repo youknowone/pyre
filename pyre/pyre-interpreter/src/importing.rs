@@ -591,7 +591,7 @@ pub fn install_builtin_modules() {
     #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(time);
     pyre_install_module!(sys);
-    // `moduledef.py:5 applevel_name = '_operator'` — the interp-level table
+    // `moduledef.py applevel_name = '_operator'` — the interp-level table
     // is reachable only as `_operator`; `import operator` resolves to
     // `operator.py`, whose `from _operator import *` drops the underscore
     // names the table also carries.
@@ -3149,7 +3149,7 @@ pub fn stdio_encoding() -> Option<String> {
     SYS_STDIO_ENCODING.lock().unwrap().clone()
 }
 
-/// `app_main.py:1239 sys.orig_argv[:] = [executable] + argv`: the launcher's
+/// `app_main.py sys.orig_argv[:] = [executable] + argv`: the launcher's
 /// own arguments, before parsing rewrote them into the run mode and `sys.argv`.
 /// Held in the host's spelling for the same reason `set_sys_argv` takes it —
 /// an argument with no UTF-8 form has to survive to the decode.

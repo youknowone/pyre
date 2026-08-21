@@ -1520,7 +1520,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
 
     // No `#[inline(never)]`: the tracer's view of this function does not depend
     // on how the host backend codegens it.  `@dont_look_inside` sets one flag
-    // (`rlib/jit.py:139 _jit_look_inside_ = False`) and leaves the C backend's
+    // (`rlib/jit.py _jit_look_inside_ = False`) and leaves the C backend's
     // inliner free to inline the body; the decision is read off the
     // `_jit_look_inside_` marker const below, which `front/llbc_hints.rs`
     // harvests from the extracted LLBC.  That LLBC cannot be reshaped by an
@@ -2652,7 +2652,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             __asm: &mut majit_metainterp::Assembler,
         ) -> majit_metainterp::JitCode {
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
-            // `jitcode.py:15 self.name = name` — every jitcode upstream is
+            // `jitcode.py self.name = name` — every jitcode upstream is
             // named at construction. The builder defaults the field to the
             // empty string, and the diagnostics that print it (the bytecode
             // encoder's register/const ceiling audit among them) then identify

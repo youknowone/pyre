@@ -36,7 +36,7 @@ struct MetaCallDescr {
     effect_info: Arc<EffectInfoCell>,
 }
 
-/// `compile.py:187 isinstance(descr, JitCellToken)` parity.
+/// `compile.py isinstance(descr, JitCellToken)` parity.
 ///
 /// RPython's `op.getdescr()` for a `CALL_ASSEMBLER_*` op IS a `JitCellToken`
 /// — `record_loop_or_bridge` reads `descr.number` directly and calls
@@ -251,7 +251,7 @@ pub fn cannot_raise_effect_info() -> EffectInfo {
 }
 
 /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` analyzer-absent fallback —
-/// the `call.py:288-289 if self.virtualizable_analyzer.analyze(op)`
+/// the `call.py if self.virtualizable_analyzer.analyze(op)`
 /// row of `call.py getcalldescr`, fed through
 /// `effectinfo_from_writeanalyze` with the
 /// `graphanalyze.py analyze_external_call` default
@@ -570,7 +570,7 @@ pub fn effect_info_for_slot(slot: EffectInfoSlot) -> EffectInfo {
 /// `>=` at `effectinfo.py:249-250`. It does NOT prove the write analyzer
 /// ran, so the reconstruction cannot invent an empty write set.
 /// `CALL_RELEASE_GIL` cannot be reconstructed from the opcode alone —
-/// upstream `effectinfo.py:271-273 MOST_GENERAL` pairs `EF_RANDOM_EFFECTS`
+/// upstream `effectinfo.py MOST_GENERAL` pairs `EF_RANDOM_EFFECTS`
 /// with a `call_release_gil_target` funcptr that this helper does not
 /// see, so the analyzer-absent default is fail-loud: any production
 /// path that needs a release-GIL EI must build it explicitly via
@@ -876,14 +876,14 @@ pub fn make_call_may_force_descr(arg_types: &[Type], result_type: Type) -> Descr
     })
 }
 
-/// `compile.py:187 isinstance(descr, JitCellToken)` parity factory.
+/// `compile.py isinstance(descr, JitCellToken)` parity factory.
 ///
 /// Create a `CALL_ASSEMBLER_*` descr that owns the same `Arc<JitCellToken>`
 /// as the production warm cell / `CompiledEntry::token` / `alive_loops`.
 /// `direct_assembler_call` (`pyjitpl.py`) is the canonical caller —
 /// it threads the cell's compiled token through, so `record_loop_or_bridge`'s
 /// keepalive walker downcasts the descr and pushes that same Arc into
-/// `original.keepalive_tokens`, matching `compile.py:187 record_jump_to(descr)`.
+/// `original.keepalive_tokens`, matching `compile.py record_jump_to(descr)`.
 pub fn make_call_assembler_descr(
     target_token: Arc<JitCellToken>,
     arg_types: &[Type],

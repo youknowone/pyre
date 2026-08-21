@@ -58,7 +58,7 @@ impl AssemblerState {
         // writer side the same way, so a `publish_state` wholesale replace
         // never rewinds past this prefix.
         //
-        // `assembler.py:20 self.insns = {}` continues the same way. The
+        // `assembler.py self.insns = {}` continues the same way. The
         // build-time jitcodes' `-live-` markers carry the canonical opcode
         // byte, and `blackhole.py:55-61` recovers it as `asm.insns['live/']`;
         // starting empty leaves `MetaInterpStaticData.op_live` at its unset

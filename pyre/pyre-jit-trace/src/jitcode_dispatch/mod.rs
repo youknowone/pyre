@@ -40,7 +40,7 @@
 //! | `int_<binop>/ii>i`  | PARITY        | int_add/int_sub/int_mul/int_and/int_or/int_xor/int_lshift/int_rshift + comparisons int_eq/int_ne/int_lt/int_le/int_gt/int_ge (14 ops). Reads two `i`-coded regs, records `OpCode::Int<Binop>` with `[a, b]`, writes recorder result into dst (`pyjitpl.py:279-336`). Mixed shapes such as `int_lshift/ri>i` stay unwired: those are kind-flow kind-flow bugs and must stay unsupported. |
 //! | `float_<binop>/ff>f` + `float_neg/f>f` | PARITY | float_add/float_sub/float_truediv binops + float_neg unary (4 ops total — float_mul, float comparisons, float_abs all absent from codewriter today, would land mechanically when emitted). Read on `registers_f` bank, record `OpCode::Float<Binop>`, write dst (`pyjitpl.py:284-292`). |
 //! | `int_neg/i>i`, `int_invert/i>i` | PARITY | unary i→i ops via `unop_int_record`. RPython `pyjitpl.py:356-368` exec-generated unary opimpls. `int_same_as/i>i` has a dormant walker arm for forward-prep, but the generated table should not contain it because RPython `jtransform.py rewrite_op_same_as` removes `same_as` before assembly. |
-//! | `cast_int_to_float/i>f` | PARITY | i-bank read, record `CastIntToFloat`, f-bank write. RPython `pyjitpl.py:357 cast_int_to_float` (same exec-generated unary opimpl loop). |
+//! | `cast_int_to_float/i>f` | PARITY | i-bank read, record `CastIntToFloat`, f-bank write. RPython `pyjitpl.py cast_int_to_float` (same exec-generated unary opimpl loop). |
 //! | `ptr_eq/rr>i`, `ptr_ne/rr>i` | PARITY | r-bank pair → record PtrEq/PtrNe → i-bank dst via `binop_ref_to_int_record`. RPython `pyjitpl.py:326-336` exec-generated comparison opimpls. The `if b1 is b2: return <const>` fast path is wired: `binop_ref_to_int_record` answers an identical operand pair from `fastpath_same_boxes` without recording, as `binop_int_record` does for the int compares. |
 //! | `getfield_gc_i/rd>i`, `getfield_gc_r/rd>r` | PARITY (heapcache-aware) | r-bank obj + descr → heapcache lookup. Cache hit returns cached OpRef without recording; cache miss records `OpCode::GetfieldGc<I,R>` + `getfield_now_known` writeback. RPython `pyjitpl.py + 929-950 _opimpl_getfield_gc_any_pureornot`. ConstPtr fast-path (`pyjitpl.py`) deferred — pyre walker doesn't track ConstPtr identity (optimizer's job post-trace). The pyre-specific `id>X` shape (int source — kind-flow kind-flow) stays unsupported. |
 //! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through. Aliasing semantics: `CacheEntry.do_write_with_aliasing` (heapcache.py) routes through `_clear_cache_on_write(seen_alloc)` — always wipes `cache_anything`, additionally wipes `cache_seen_allocation` when the write target itself isn't seen-allocated. RPython `pyjitpl.py _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (kind-flow territory). |
@@ -727,7 +727,7 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
 /// One node per inlined level the exception-edge bridge resumed PAST, for the
 /// frames `set_exc_edge_discarded_levels` parked before the walk began.
 ///
-/// `pyopcode.py:148 pytraceback.record_application_traceback` runs before the
+/// `pyopcode.py pytraceback.record_application_traceback` runs before the
 /// `:152` exception-table lookup, so a frame the unwind only PASSES THROUGH
 /// contributes a node just like the one that catches it.  Upstream never has to
 /// say so: it resumes onto a rebuilt MIFrame stack and the unwind is traced code
@@ -8893,7 +8893,7 @@ fn walker_pin_function_code<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
-/// The `celldict.py:34 _immutable_fields_ = ["version?"]` twin of
+/// The `celldict.py _immutable_fields_ = ["version?"]` twin of
 /// [`walker_pin_type_version_tag`]: pin the module namespace's strategy version
 /// so the folds that bake a slot's stored cell (or the absence of a name) are
 /// revoked by `mutated()` instead of re-reading the dict each iteration.

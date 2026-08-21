@@ -1591,7 +1591,7 @@ impl DynasmBackend {
         <Self as Backend>::set_done_with_this_frame_descr_float(self, float);
         <Self as Backend>::set_exit_frame_with_exception_descr_ref(self, exit_exc);
         <Self as Backend>::set_propagate_exception_descr(self, propagate);
-        // `pyjitpl.py:2297 self.cpu.setup_once()` parity — production
+        // `pyjitpl.py self.cpu.setup_once()` parity — production
         // reaches `cpu.setup_once()` via `MetaInterpStaticData::_setup_once`
         // (`pyjitpl.py:2292-2303`) on first JIT entry, AFTER every descr
         // setter has run.  Backend-only tests bypass the metainterp gate,
@@ -2991,7 +2991,7 @@ impl Backend for DynasmBackend {
             );
         }
 
-        // `llmodel.py:328 return ll_frame` — the deadframe IS the frame the
+        // `llmodel.py return ll_frame` — the deadframe IS the frame the
         // run returned. `result_jf` is the tip of `jf_ptr`'s `jf_forward`
         // chain whenever `_check_frame_depth` realloc'd; the whole chain is
         // handed to the deadframe, which frees it when it drops rather than
@@ -3983,7 +3983,7 @@ impl Backend for DynasmBackend {
         None
     }
 
-    /// `pyjitpl.py:2297 self.cpu.setup_once()` parity, dispatched by
+    /// `pyjitpl.py self.cpu.setup_once()` parity, dispatched by
     /// `MetaInterpStaticData::_setup_once` under the
     /// `globaldata.initialized` gate (`pyjitpl.py:2292-2303`).  All
     /// per-CPU descrs (notably `propagate_exception_descr` via

@@ -1230,7 +1230,7 @@ impl EffectInfo {
     // `None`-bitstring case is never queried.
     //
     // Pyre `MOST_GENERAL` (line 380) populates every bitset with `None`,
-    // matching `effectinfo.py:271-273 MOST_GENERAL`.  The optimizer
+    // matching `effectinfo.py MOST_GENERAL`.  The optimizer
     // caller (`heap.rs`'s `call_has_random_effects`) gates the same
     // way as PyPy, so the `None`-bitstring case must never be queried;
     // the helpers below `expect()` the bitstring rather than silently
@@ -1512,7 +1512,7 @@ impl EffectInfo {
 ///   write_descrs_arrays, write_descrs_interiorfields, extraeffect,
 ///   oopspecindex, can_invalidate, can_collect)` plus an `object()`
 /// breaker for `call_release_gil_target != 0` (line 144-146).
-/// `effectinfo.py:511-512 frozenset(eisetr)` then collapses the
+/// `effectinfo.py frozenset(eisetr)` then collapses the
 /// per-descr (eisetr, eisetw) lists by `id(ei)`, which is identical
 /// to the cache key in PyPy's runtime because the cache hit returns
 /// the same EI instance.
@@ -2107,7 +2107,7 @@ pub fn compute_bitstrings(all_descrs: &[DescrRef], all_eis: &mut [&mut EffectInf
                         .expect("compute_bitstrings: descr in EI raw set must be in the partition")
                 })
                 .collect();
-            // `effectinfo.py:533-534 assert sys.maxint not in bitstrr` —
+            // `effectinfo.py assert sys.maxint not in bitstrr` —
             // every descr in an active EI's set must have been assigned
             // a finite `ei_index` above (we panic with `expect` if not).
             let r_bs = crate::bitstring::make_bitstring(&r_indices);

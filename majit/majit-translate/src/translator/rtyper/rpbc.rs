@@ -1642,7 +1642,7 @@ where
     // Pyre's analogue is `build_args_for_op(opname, args_s)` —
     // bookkeeper.rs — which mirrors the upstream
     // `CallOp.build_args` polymorphic dispatch
-    // (`flowspace/operation.py:678 simple_call`,
+    // (`flowspace/operation.py simple_call`,
     // `:699 call_args`).
     let args_s_full = hop.args_s.borrow().clone();
     if args_s_full.is_empty() {

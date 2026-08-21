@@ -166,7 +166,7 @@ pub struct W_Property {
     pub fget: PyObjectRef,
     pub fset: PyObjectRef,
     pub fdel: PyObjectRef,
-    /// `descriptor.py:181 self.w_doc = space.w_None` — the instance
+    /// `descriptor.py self.w_doc = space.w_None` — the instance
     /// `__doc__` exposed through `GetSetProperty(get_doc, set_doc)`
     /// (descriptor.py:316-318).  NULL plays None.
     pub w_doc: PyObjectRef,

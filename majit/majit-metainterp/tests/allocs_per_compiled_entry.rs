@@ -282,7 +282,7 @@ fn window() -> (u64, u64) {
 /// Install the process GC, because WHERE the jitframe comes from is part of
 /// the configuration this file measures.
 ///
-/// `llmodel.py:298 malloc_jitframe` allocates the frame through the GC, and
+/// `llmodel.py malloc_jitframe` allocates the frame through the GC, and
 /// `jitframe.py` makes JITFRAME an ordinary varsize GcStruct — so
 /// upstream's per-entry frame is a nursery bump, which no `#[global_allocator]`
 /// ever sees. The cranelift backend reproduces that only when a JITFRAME type
@@ -628,7 +628,7 @@ fn main() {
 ///
 /// | n | site |
 /// |---|------|
-/// | 1 | `majit_backend::jitframe::alloc_off_gc_jitframe` — the JITFRAME itself (`llmodel.py:298 malloc_jitframe`, the ONE allocation upstream makes per entry) |
+/// | 1 | `majit_backend::jitframe::alloc_off_gc_jitframe` — the JITFRAME itself (`llmodel.py malloc_jitframe`, the ONE allocation upstream makes per entry) |
 ///
 /// It used to add three. The two that went:
 ///

@@ -10,7 +10,7 @@ use crate::pyobject::*;
 ///
 /// Layout: `[ob_type | w_name | w_dict]`
 ///
-/// `w_dict` mirrors PyPy `module.py:20 self.w_dict = w_dict` — every
+/// `w_dict` mirrors PyPy `module.py self.w_dict = w_dict` — every
 /// Module owns a non-null `W_DictObject` (or dict subclass instance
 /// for the user-supplied wrap case at `moduledef.py:102-103`).  For
 /// ordinary Modules pyre constructs a `W_ModuleDictObject`, so
@@ -238,7 +238,7 @@ pub unsafe fn w_module_alias_getitem_str(obj: PyObjectRef, name: &str) -> Option
     if module.w_dict.is_null() {
         return None;
     }
-    // `W_ModuleDictObject` (`module.py:18 newdict(module=True)`) joins
+    // `W_ModuleDictObject` (`module.py newdict(module=True)`) joins
     // `W_DictObject` here so `w_dict_getitem_str` (which dispatches via
     // the strategy slot) reaches both module-strategy and object-strategy
     // backings.  Subclass instances still fall through to None so the

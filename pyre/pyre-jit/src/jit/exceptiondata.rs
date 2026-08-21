@@ -1,5 +1,5 @@
 //! `rpython/rtyper/exceptiondata.py` `class ExceptionData(object)` +
-//! `rpython/rtyper/rtyper.py:71 self.exceptiondata = ExceptionData(self)`.
+//! `rpython/rtyper/rtyper.py self.exceptiondata = ExceptionData(self)`.
 //!
 //! Pyre-side shim for the only attribute chain `flatten_graph` reads
 //! from `cpu`: `cpu.rtyper.exceptiondata.get_standard_ll_exc_instance_by_class(...)`
@@ -68,7 +68,7 @@ const STANDARD_EXCEPTIONS: &[&str] = &[
 /// precedence over the lazy resolver because it writes the slot
 /// outright.
 pub struct ExceptionData {
-    /// `exceptiondata.py:14 standardexceptions = standardexceptions`.
+    /// `exceptiondata.py standardexceptions = standardexceptions`.
     pub standardexceptions: &'static [&'static str],
     /// Resolved runtime pointer per standard exception, indexed
     /// parallel to `standardexceptions`.  `None` means the resolver
@@ -226,7 +226,7 @@ impl ExceptionData {
 /// when a flatten / codewriter consumer materializes them.
 #[derive(Debug, Default)]
 pub struct Rtyper {
-    /// `rtyper.py:71 self.exceptiondata = ExceptionData(self)`.
+    /// `rtyper.py self.exceptiondata = ExceptionData(self)`.
     pub exceptiondata: ExceptionData,
 }
 

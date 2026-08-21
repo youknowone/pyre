@@ -583,7 +583,7 @@ pub fn insn_byte(key: &str) -> u8 {
 /// `Some(byte)` for canonical/extension keys (build/runtime-stable
 /// `BC_*`) and `None` for translator-only keys.  `Assembler::get_opnum`
 /// uses the `None` return to fall through to the
-/// `assembler.py:221 setdefault(key, len(self.insns))` dynamic-byte
+/// `assembler.py setdefault(key, len(self.insns))` dynamic-byte
 /// allocator, adjusted for pyre's fixed-byte table by scanning from
 /// zero and skipping reserved bytes.  A `None` here is not a
 /// fail-loud condition — it just means the key flows through the
@@ -941,7 +941,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // RPython `blackhole.py:1441-1443` aliases `bhimpl_getfield_gc_{i,r,f}_pure
     // = bhimpl_getfield_gc_{i,r,f}` — pure-getter shape on quasi-immutable
     // descrs.  Each `(opname, argcodes)` key gets its own byte per
-    // `assembler.py:220 setdefault(key, len(self.insns))`; `pyjitpl.py:2230
+    // `assembler.py setdefault(key, len(self.insns))`; `pyjitpl.py
     // setup_insns` and pyre's `jitcode_runtime.rs` `overlay_insns` both assert no
     // duplicate bytes.  Walker dispatch routes `_pure` to the same handler.
     m.insert("getfield_gc_i_pure/rd>i", BC_GETFIELD_GC_I_PURE);

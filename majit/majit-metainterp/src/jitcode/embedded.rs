@@ -67,7 +67,7 @@ impl EmbeddedJitCodeTable {
     /// Join the two serialized lists into runtime shells and their pool.
     ///
     /// `canonical` must be `all_jitcodes` in allocation order, which
-    /// `codewriter.py:68 jitcode.index = index` makes the same thing as
+    /// `codewriter.py jitcode.index = index` makes the same thing as
     /// "indexed by `jitcode.index`" — asserted here, since every `j` operand
     /// in the pool is an index into it and a list that drifted from its own
     /// indices resolves silently to the wrong callee.

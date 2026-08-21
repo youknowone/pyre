@@ -14,7 +14,7 @@
 //! - `rpython/jit/codewriter/codewriter.py transform_graph_to_jitcode` —
 //!   the 4-step pipeline (jtransform → regalloc → flatten → assemble)
 //!   that turns one FunctionGraph into one JitCode.
-//! - `rpython/jit/codewriter/call.py:87 self.jitcodes = {}` — the
+//! - `rpython/jit/codewriter/call.py self.jitcodes = {}` — the
 //!   graph-keyed dict that `AllJitCodes::by_path` mirrors.
 //! - `rpython/jit/codewriter/call.py:88 self.all_jitcodes = []` — the
 //!   alloc-order list that `AllJitCodes::in_order` mirrors, with the

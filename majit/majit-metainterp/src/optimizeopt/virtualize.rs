@@ -54,7 +54,7 @@ pub(crate) struct VirtualizableConfig {
     /// virtualizable!{} macro (e.g. `1` for pyre's `extra_reds = { ec: Ref }`).
     /// `0` means the legacy `[frame, vable_scalars..., array_items...]`
     /// layout; nonzero shifts every input-derived OpRef by that count.
-    /// Mirrors `interp_jit.py:67 reds = ['frame', 'ec']` — the non-vable
+    /// Mirrors `interp_jit.py reds = ['frame', 'ec']` — the non-vable
     /// extra reds occupy `InputArg` slots `1..1+vable_input_offset`.
     pub vable_input_offset: usize,
     /// Flat input-arg slot holding the virtualizable identity at loop entry.

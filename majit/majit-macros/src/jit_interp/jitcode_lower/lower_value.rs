@@ -802,7 +802,7 @@ impl<'c> Lowerer<'c> {
     ///
     /// `value` must be Ref-kind and `cls` must be Int-kind, matching
     /// `blackhole.py @arguments("r", "i")`.  Non-matching kinds
-    /// silently skip per `pyjitpl.py:399 if isinstance(clsbox, Const):` —
+    /// silently skip per `pyjitpl.py if isinstance(clsbox, Const):` —
     /// dispatch-time `trace_record_exact_class` also gates on
     /// `cls_const.is_constant()`.
     pub(super) fn lower_record_exact_class_stmt(&mut self, expr: &Expr) -> Option<()> {

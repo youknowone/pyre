@@ -130,14 +130,14 @@ pub struct LowLevelDatabase {
     pub completed: Cell<bool>,
     pub instrument_ncounter: Cell<usize>,
     pub all_field_names: RefCell<Option<Vec<String>>>,
-    /// RPython `revdb/gencsupp.py:162 db.stack_bottom_funcnames = []`.
+    /// RPython `revdb/gencsupp.py db.stack_bottom_funcnames = []`.
     pub stack_bottom_funcnames: RefCell<Vec<String>>,
-    /// RPython `revdb/gencsupp.py:122-160 RPY_REVDB_COMMANDS` raw struct,
+    /// RPython `revdb/gencsupp.py RPY_REVDB_COMMANDS` raw struct,
     /// represented by the command metadata until the full low-level node
     /// factory can materialize the raw struct.
     pub revdb_commands: RefCell<Option<RevdbCommands>>,
 
-    /// RPython `database.py:61 self.namespace = CNameManager()`. The
+    /// RPython `database.py self.namespace = CNameManager()`. The
     /// per-DB name uniquifier; consulted by [`Self::get`]'s delayed-
     /// pointer path (upstream `:208`) and by every node renderer
     /// once the node-factory ports land.

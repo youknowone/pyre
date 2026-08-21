@@ -4004,7 +4004,7 @@ impl<'a> AssemblerARM64<'a> {
         if descr_fd.is_resume_guard() || descr_fd.is_resume_guard_copied() {
             descr_fd.set_source_op_index(op_index);
         }
-        // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`
+        // `llsupport/assembler.py guardtok.faildescr.rd_locs = positions`
         // — write through the trait accessor so the metainterp
         // `AbstractFailDescr` (`history.py _attrs_`) receives the
         // canonical copy when present.  Must follow the `meta_descr`

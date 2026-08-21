@@ -5674,7 +5674,7 @@ impl<'a> Lowering<'a> {
                     // scrutinee is built as a positional aggregate and its
                     // `.0` read back to feed the `match` switch, so a blanket
                     // `Ref` here types that switch value as a pointer and
-                    // `flatten.py:280 assert kind == 'int'` rejects the graph.
+                    // `flatten.py assert kind == 'int'` rejects the graph.
                     let ty = tyref_to_value_type(&place_ty, self.llbc);
                     let res = self
                         .graph

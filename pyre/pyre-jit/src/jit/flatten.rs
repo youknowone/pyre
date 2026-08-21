@@ -720,7 +720,7 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// Insn opname that the runtime cannot dispatch.
 ///
 /// `type` — emitted by `codewriter.rs::explicit_raise_exception_pair`
-/// mirroring `flowcontext.py:635 op.type(w_value)`.  The HLOp result
+/// mirroring `flowcontext.py op.type(w_value)`.  The HLOp result
 /// Variable is consumed via `link.last_exception`; the link's
 /// `generate_last_exc` emits a `last_exception` Insn that produces the
 /// type via TLS, so eliding the `type` HLOp itself is safe (the
@@ -1222,13 +1222,13 @@ impl Insn {
 /// direct-SSA-emission dual-write is retired.
 pub struct GraphFlattener<'a> {
     // ─── PyPy-mirror fields (in `flatten.py __init__` order) ───
-    /// `rpython/jit/codewriter/flatten.py:77 self.graph = graph`.
+    /// `rpython/jit/codewriter/flatten.py self.graph = graph`.
     ///
     /// `enforce_input_args` reads `self.graph.startblock.inputargs`
     /// (`flatten.py`) and `generate_ssa_form` recurses from
     /// `self.graph.startblock` (`flatten.py:104`).
     graph: &'a super::flow::FunctionGraph,
-    /// `rpython/jit/codewriter/flatten.py:78 self.regallocs = regallocs`.
+    /// `rpython/jit/codewriter/flatten.py self.regallocs = regallocs`.
     ///
     /// `getcolor_var` reads `regallocs[kind].coloring[id]` directly,
     /// matching upstream's `self.regallocs[kind].getcolor(v)`.
@@ -1238,7 +1238,7 @@ pub struct GraphFlattener<'a> {
     /// `self.regallocs[kind].swapcolors(realcol, curcol)`.  Read paths
     /// reborrow immutably via `&*self.regallocs`.
     regallocs: &'a mut [super::regalloc::GraphAllocationResult; 3],
-    /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
+    /// `rpython/jit/codewriter/flatten.py self.cpu = cpu`.
     ///
     /// Upstream `flatten_graph(graph, regallocs, _include_all_exc_links,
     /// cpu)` threads the LLGraphCPU through so `make_exception_link`
@@ -1261,7 +1261,7 @@ pub struct GraphFlattener<'a> {
     ssarepr: &'a mut SSARepr,
 
     // ─── pyre-only fields (no PyPy counterpart) ───
-    /// `rpython/jit/codewriter/flatten.py:103 self.seen_blocks = {}` —
+    /// `rpython/jit/codewriter/flatten.py self.seen_blocks = {}` —
     /// the recursive `make_bytecode_block` DFS tracks which blocks have
     /// been emitted to short-circuit back-edges into `goto TLabel(block)`.
     /// Pyre uses `Vec<BlockRef>` with
@@ -1742,7 +1742,7 @@ impl<'a> GraphFlattener<'a> {
             None => Insn::op(jump_opname, new_args),
         };
         self.emitline(jump_insn);
-        // `flatten.py:197 assert len(block.exits) in (2, 3)`.
+        // `flatten.py assert len(block.exits) in (2, 3)`.
         assert!(
             matches!(exits.len(), 2 | 3),
             "flatten_ovf_canraise: _ovf canraise block must have 2 or 3 exits per \
@@ -1757,7 +1757,7 @@ impl<'a> GraphFlattener<'a> {
         // `flatten.py self.make_exception_link(block.exits[1], True)`.
         self.make_exception_link(&exits[1], true);
         if exits.len() == 3 {
-            // `flatten.py:202 assert block.exits[2].exitcase is Exception`.
+            // `flatten.py assert block.exits[2].exitcase is Exception`.
             // pyre represents the `Exception` catch-all by an exception
             // link with the extravars (`last_exception`, `last_exc_value`)
             // pair seeded by `attach_catch_exception_edge`, no typed
@@ -1786,7 +1786,7 @@ impl<'a> GraphFlattener<'a> {
     fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
         let exits = block.borrow().exits.clone();
         if exits.len() == 1 {
-            // `flatten.py:181 assert link.exitcase in (None, False, True)`
+            // `flatten.py assert link.exitcase in (None, False, True)`
             // — single-exit links carry either the default fall-through
             // marker (None) or a Bool case from a hand-hacked generator
             // graph (False/True).  Upstream's comment says "the cases
@@ -1853,7 +1853,7 @@ impl<'a> GraphFlattener<'a> {
             // mergeblock.  Inline the assertion below as fail-loud so
             // any future walker regression that violates the
             // exits[0]=normal invariant surfaces immediately.
-            // `flatten.py:211 assert block.exits[0].exitcase is None`.
+            // `flatten.py assert block.exits[0].exitcase is None`.
             // Upstream's `flowcontext.py` guarantees the normal-flow
             // link is always exits[0] for canraise blocks; pyre's
             // `flatten.py:211` `assert exits[0].exitcase is None`.
@@ -9246,7 +9246,7 @@ mod tests {
     /// that exercise `serialize_op` only and never touch
     /// `graph.startblock.inputargs` or `graph.startblock.exits`.
     /// `GraphFlattener::new` requires a `&FunctionGraph` per
-    /// `flatten.py:77 self.graph = graph`; this provides the minimum
+    /// `flatten.py self.graph = graph`; this provides the minimum
     /// shape that satisfies the borrow.
     fn stub_graph() -> super::super::flow::FunctionGraph {
         use super::super::flow::{Block, FunctionGraph};

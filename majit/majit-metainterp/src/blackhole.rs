@@ -1312,7 +1312,7 @@ impl BlackholeInterpreter {
         true
     }
 
-    /// `pyopcode.py:147-148 pytraceback.record_application_traceback` for the
+    /// `pyopcode.py pytraceback.record_application_traceback` for the
     /// frame this interpreter is leaving with `exc_value` live.
     ///
     /// Upstream takes the handler search and the traceback record from one
@@ -2754,7 +2754,7 @@ pub fn run_forever_with_portal(
 
         // blackhole.py:1759
         let next = bh.nextblackholeinterp.take();
-        // `pyopcode.py:239-241 RETURN_VALUE` (`frame_finished_execution = True`)
+        // `pyopcode.py RETURN_VALUE` (`frame_finished_execution = True`)
         // and `pyopcode.py handle_operation_error` (the same store on the
         // no-handler propagation): the level reached here has returned to its
         // caller by one of those two routes, so its frame's execution is over.
@@ -2796,7 +2796,7 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     /// the resumed frame chain.  Threaded from the interpreter side because
     /// majit-metainterp cannot reference `ExecutionContext`.
     pub on_enter_level: Option<&'a dyn Fn(i64)>,
-    /// The `frame_finished_execution` store `pyopcode.py:239-241 RETURN_VALUE`
+    /// The `frame_finished_execution` store `pyopcode.py RETURN_VALUE`
     /// and `pyopcode.py handle_operation_error` perform before leaving a
     /// frame.  Threaded from the interpreter side for the same reason as
     /// [`Self::on_enter_level`]; called once per level that returns to its
@@ -11061,7 +11061,7 @@ pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
 /// Whether a jitcode's `fnaddr` can be called as a function pointer.
 ///
 /// Stricter than `!is_symbolic_fnaddr`: `0` is upstream's own "no address"
-/// spelling (`jitcode.py:14 fnaddr=None`) and must not be called either. The
+/// spelling (`jitcode.py fnaddr=None`) and must not be called either. The
 /// `func == 0` arm of the backends' `bh_call_*` returns `0`/null instead, which
 /// is a fine no-op convention for a `residual_call` whose funcptr the host
 /// deliberately left unbound, but for an `inline_call` it would fabricate a

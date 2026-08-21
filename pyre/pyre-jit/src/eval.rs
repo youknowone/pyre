@@ -9796,7 +9796,7 @@ fn untag_tagged_frame_locals(frame_root: &mut FrameRoot) {
 /// blackhole resume that ran this frame to its return.
 ///
 /// `jitexc.py:16-40 DoneWithThisFrame*` is the blackhole reporting that the
-/// frame is done.  `pyopcode.py:239-241 RETURN_VALUE` performs the store
+/// frame is done.  `pyopcode.py RETURN_VALUE` performs the store
 /// there, and upstream carries it in the jitcode, so pyjitpl, the blackhole
 /// and compiled code all replay it.  Pyre lowers the return into the
 /// `*_return` operation instead, so every executor publishes the transition by
@@ -13144,7 +13144,7 @@ fn write_barrier_after_ref_store(container: i64) {
     }
 }
 
-/// `resume.py:1518 cpu.bh_setfield_gc_i` → `llmodel.py
+/// `resume.py cpu.bh_setfield_gc_i` → `llmodel.py
 /// bh_setfield_gc_i`, which unpacks the field's size and hands it to
 /// `write_int_at_mem`.
 ///

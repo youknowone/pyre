@@ -1369,7 +1369,7 @@ pub const MC_DIAG_SLOTS: usize = 79;
 /// corpus is the evidence needed to replace the rule with a `debug_assert!`:
 /// 54 = `has_merge_point_with_shape_assert` rejected a SAME-green-key merge
 /// point because its `green_boxes` length differed from `live_args_len`, where
-/// `pyjitpl.py:3020 assert len(original_boxes) == len(live_arg_boxes)` asserts
+/// `pyjitpl.py assert len(original_boxes) == len(live_arg_boxes)` asserts
 /// instead of filtering; 55 = `register_retrace_merge_point` declined to
 /// register because some jump arg carried no intrinsic type, where
 /// `pyjitpl.py:3059-3060 self.current_merge_points.append((live_arg_boxes,

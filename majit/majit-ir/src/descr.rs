@@ -102,7 +102,7 @@
 ///   matching `virtualref.rs` `VREF_FIELD_*` packed constants are
 ///   retired.  RPython caches real `Arc<dyn FieldDescr>` /
 ///   `Arc<dyn SizeDescr>` on the equivalent struct
-///   (`virtualref.py:40-42 cpu.fielddescrof`); pyre now does the same
+///   (`virtualref.py cpu.fielddescrof`); pyre now does the same
 ///   with `VirtualRefInfo::{descr, descr_virtual_token, descr_forced}`.
 ///   The module-level vref descriptor constructors return the same
 ///   cached Arcs, so `OptVirtualize` emits SETFIELD_GC ops with the
@@ -3212,7 +3212,7 @@ pub trait LoopTargetDescr: Descr {
     fn target_arglocs(&self) -> Vec<TargetArgLoc>;
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
 
-    /// `history.py:493 self.original_jitcell_token = original_jitcell_token`.
+    /// `history.py self.original_jitcell_token = original_jitcell_token`.
     /// The owning JitCellToken's `number` for this TargetToken — set by
     /// `compile.py:237` / `compile.py:289` once the freshly-made JitCellToken
     /// is bound to the loop. Returns `None` for a TargetToken constructed
@@ -3678,7 +3678,7 @@ pub trait QuasiImmutHandle: Send + Sync + std::fmt::Debug {
 #[derive(Debug)]
 pub struct QuasiImmutDescr {
     fielddescr: DescrRef,
-    /// `quasiimmut.py:121 self.struct = struct` — compared, never dereferenced.
+    /// `quasiimmut.py self.struct = struct` — compared, never dereferenced.
     struct_ptr: u64,
     qmut: std::sync::Arc<dyn QuasiImmutHandle>,
 }
@@ -3698,12 +3698,12 @@ impl QuasiImmutDescr {
         }
     }
 
-    /// `quasiimmut.py:122 self.fielddescr = fielddescr`.
+    /// `quasiimmut.py self.fielddescr = fielddescr`.
     pub fn fielddescr(&self) -> &DescrRef {
         &self.fielddescr
     }
 
-    /// `quasiimmut.py:121 self.struct = struct`.
+    /// `quasiimmut.py self.struct = struct`.
     pub fn struct_ptr(&self) -> u64 {
         self.struct_ptr
     }
@@ -3818,7 +3818,7 @@ pub trait FailDescr: Descr {
         None
     }
 
-    /// `compile.py:864 self.rd_numb = other.rd_numb` parity: the
+    /// `compile.py self.rd_numb = other.rd_numb` parity: the
     /// reference-share variant of `rd_numb()`.  `Arc<[u8]>` lets
     /// `copy_all_attributes_from` clone the donor's payload with a
     /// single refcount bump rather than allocating a fresh buffer.
@@ -3838,7 +3838,7 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// `compile.py:864 self.rd_numb = other.rd_numb` reference-share
+    /// `compile.py self.rd_numb = other.rd_numb` reference-share
     /// setter.  Default panics for non-resume descrs (same contract as
     /// `set_rd_numb`).
     fn set_rd_numb_arc(&self, _value: Option<std::sync::Arc<[u8]>>) {
@@ -5153,7 +5153,7 @@ pub trait SwitchDescr: Descr {
 /// Descriptor carrying a `CALL_ASSEMBLER` loop token.
 ///
 /// RPython routes these ops through `JitCellToken` itself
-/// (`rewrite.py:667 assert isinstance(loop_token, JitCellToken)`), so the
+/// (`rewrite.py assert isinstance(loop_token, JitCellToken)`), so the
 /// token-specific queries live outside generic `CallDescr`.
 pub trait LoopTokenDescr: Descr {
     /// history.py `JitCellToken.number`.
@@ -5478,7 +5478,7 @@ pub use crate::effectinfo::{EffectInfo, ExtraEffect, OopSpecIndex};
 
 // ── Concrete descriptor implementations (descr.py) ──
 
-/// `descr.py:227 name = '%s.%s' % (STRUCT._name, fieldname)` — locate the
+/// `descr.py name = '%s.%s' % (STRUCT._name, fieldname)` — locate the
 /// external `_cache_field[STRUCT][fieldname]` key inside the display name so
 /// every descriptor does not need a second owned string. Both the struct name
 /// and pyre's synthetic nested-field spelling may contain dots, so deriving the
@@ -6836,7 +6836,7 @@ impl ArrayDescr for SimpleArrayDescr {
     fn get_all_interiorfielddescrs(&self) -> Option<&[DescrRef]> {
         self.all_interiorfielddescrs.get().map(Vec::as_slice)
     }
-    /// `descr.py:373 arraydescr.all_interiorfielddescrs = descrs` —
+    /// `descr.py arraydescr.all_interiorfielddescrs = descrs` —
     /// post-construction publish (set-once via `OnceLock`).
     fn set_all_interiorfielddescrs(&self, descrs: Vec<DescrRef>) {
         let _ = self.all_interiorfielddescrs.set(descrs);
@@ -7183,7 +7183,7 @@ impl CallDescr for SimpleCallDescr {
 
 unsafe extern "C" {
     // llsupport/memcpy.py:3-5 — the host `memcpy` symbol that
-    // `gc.py:39 self.memcpy_fn = memcpy_fn` binds via `rffi.llexternal`.
+    // `gc.py self.memcpy_fn = memcpy_fn` binds via `rffi.llexternal`.
     // Spelled with `c_void` to match the runtime symbol's own signature;
     // only its address is ever taken (`memcpy_fn_addr`), never a call
     // through this declaration.
@@ -8973,7 +8973,7 @@ pub fn make_array_descr_full(
 /// callers must extend their cache key to cover whichever inputs
 /// they vary.
 ///
-/// `lendescr` mirrors `descr.py:286-287 self.lendescr = lendescr` —
+/// `lendescr` mirrors `descr.py self.lendescr = lendescr` —
 /// the caller passes a pre-built `FieldDescr` for `nolength=False`
 /// arrays (the upstream `get_field_arraylen_descr` shape) and `None`
 /// for `ARRAY._hints['nolength']` shapes.  `is_pure` mirrors
@@ -8996,7 +8996,7 @@ pub fn make_array_descr_full(
 /// parent.  Pass `Vec::new()` for primitive-item arrays.
 ///
 /// Field provenance (RPython `descr.py ArrayDescr.__init__`):
-/// - `lendescr`: `descr.py:286-287 self.lendescr = lendescr` — points
+/// - `lendescr`: `descr.py self.lendescr = lendescr` — points
 ///   at the array length field's `FieldDescr` for arrays whose
 ///   `ARRAY._hints.get('nolength')` is false.  `None` for fixed-size
 ///   buffers (pyre's `program: &[u8]` opcode-fetch path).
