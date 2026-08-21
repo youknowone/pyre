@@ -867,7 +867,7 @@ impl UnrollOptimizer {
             // fresh Box identity set so _forwarded mutations cannot alias
             // across phases.
             //
-            // Const operands are NOT cached: `get_box_replacement_box`
+            // Const operands are NOT cached: `get_box_replacement_operand_opt`
             // allocates a fresh const operand per call from `const_pool`
             // (`history.py:220` ConstInt(value) per-call-site parity).
             // opt_p1's entry path seeds `const_pool` from the shared

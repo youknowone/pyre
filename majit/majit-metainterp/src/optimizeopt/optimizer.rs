@@ -786,12 +786,12 @@ impl Optimizer {
         // imported state through the caller-provided bound box: fresh
         // virtual-state leaves arrive minted via `reserve_virtual_box`,
         // imported label-arg leaves arrive resolved via
-        // `get_box_replacement_box`. Constants take the value-only path via
+        // `get_box_replacement_operand_opt`. Constants take the value-only path via
         // `make_constant_box`.
         match info {
             VirtualStateInfo::Constant(value) => {
                 // `box_` is a caller-provided bound box (reserve_virtual_box /
-                // get_box_replacement_box), so the Operand lowering is panic-free.
+                // get_box_replacement_operand_opt), so the Operand lowering is panic-free.
                 ctx.make_constant_box(box_, *value);
             }
             VirtualStateInfo::Virtual {
@@ -1156,7 +1156,7 @@ impl Optimizer {
         // aliased JUMP args sharing the same VirtualState position).
         // Keyed by the virtual head's producer identity (`Operand` ptr_eq).
         // A head is normally a NEW (virtual-alloc) ResOp with a producer, so
-        // `get_box_replacement_box` returns the memoized bound box and two
+        // `get_box_replacement_operand_opt` returns the memoized bound box and two
         // entries sharing a head dedupe. A producer-less head resolves to
         // None and is never dedupable (matching the prior fresh-unbound-box
         // behaviour); its `set_ptr_info` is skipped below anyway.
@@ -2547,7 +2547,7 @@ impl Optimizer {
         // (e.g. `OptIntBounds::getintbound_box`) reaches a
         // `set_forwarded_*` write. `TraceIterator::next()`
         // (`opencoder.rs`) plants unbound resop slots; without this
-        // pre-pass, `get_box_replacement_box(&self)` could return an
+        // pre-pass, `get_box_replacement_operand_opt(&self)` could return an
         // unbound terminal that fails `write_forwarded`'s bound-
         // precondition assert.
         ctx.bind_input_resops(ops);
@@ -7567,7 +7567,7 @@ mod tests {
 
     /// Imported virtual heads must carry their `PtrInfo::Virtual`. The
     /// label-args import used to allocate a bare head position and write
-    /// the info through `get_box_replacement_box(..)` guarded by `if let
+    /// the info through `get_box_replacement_operand_opt(..)` guarded by `if let
     /// Some(..)` — always `None` for a bare position, silently dropping
     /// the virtual-ness of the imported state.
     #[test]

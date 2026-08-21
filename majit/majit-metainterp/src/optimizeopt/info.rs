@@ -229,7 +229,7 @@ pub use majit_ir::ptr_info::{
 /// Extension trait carrying the OptContext-coupled methods that used
 /// to live on `impl StrPtrInfo` in metainterp. The data type itself
 /// is in `majit-ir`; only methods that depend on metainterp-side
-/// helpers (`get_constant_int_or_bound`, `get_box_replacement_box`,
+/// helpers (`get_constant_int_or_bound`, `get_box_replacement_operand_opt`,
 /// `getptrinfo`) stay here as a trait.
 pub trait StrPtrInfoExt {
     fn getstrlen(&self, ctx: &crate::optimizeopt::OptContext, mode: u8) -> Option<i64>;

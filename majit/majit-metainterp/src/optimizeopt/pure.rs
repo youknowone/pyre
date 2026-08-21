@@ -807,7 +807,7 @@ impl OptPure {
     fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> OpRef {
         // Single resolve through the operand terminal; the OpRef view is the
         // terminal's `to_opref()` (keystone equivalence, #113), so the prior
-        // paired `get_box_replacement` + `get_box_replacement_box` of the
+        // paired `get_box_replacement` + `get_box_replacement_operand_opt` of the
         // same operand was a redundant double walk.
         let resolved_box = ctx.resolve_operand_operand_opt(op);
         let resolved = resolved_box
@@ -2691,7 +2691,7 @@ mod tests {
         op.setdescr(call_descr);
         // Register the dispatched op as the producer at its position so the
         // collapsed `from_bound_op(op_rc)` resolves to the same box the test
-        // reads back via `get_box_replacement_box(pos)` (mirrors production
+        // reads back via `get_box_replacement_operand_opt(pos)` (mirrors production
         // input-op binding).
         let op_rc = std::rc::Rc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));

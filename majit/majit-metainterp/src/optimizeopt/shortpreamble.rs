@@ -2434,7 +2434,7 @@ impl ShortPreambleBuilder {
     /// compensated for invented-name replay-position aliasing; the carried box
     /// is invariant to that aliasing so the entries collapse to one. The prior
     /// "blocked" verdict (75 agree / 114 diverge) measured the WRONG box:
-    /// `get_box_replacement_box(source)`, a Phase-2 re-resolution that mints a
+    /// `get_box_replacement_operand_opt(source)`, a Phase-2 re-resolution that mints a
     /// fresh non-`ptr_eq` box. The carried Phase-1 res is shared across the
     /// peel boundary (an `Rc::clone` of the exported short-box res), so the
     /// box-identity lookup hits — PYRE_S8B_HARNESS measured 82/82 agreement

@@ -2321,7 +2321,7 @@ impl OptContext {
     /// `resop_refs` so any `Forwarded::Op(_)` chain step targeting the
     /// slot has an upgradable `Weak<Op>` from the start of the
     /// optimization run. Absent this pre-pass, `getintbound_box` →
-    /// `get_box_replacement_box` (a `&self` reader) can land on an
+    /// `get_box_replacement_operand_opt` (a `&self` reader) can land on an
     /// unbound terminal and a subsequent `set_forwarded_info` write
     /// trips `write_forwarded`'s bound-precondition assert.
     ///
@@ -2494,7 +2494,7 @@ impl OptContext {
     /// so a subsequent `set_forwarded_*` lands on the canonical `Op._forwarded`
     /// host. `opref` must be a non-const, non-sentinel resop position whose
     /// producer is not yet emitted (a virgin alias). Callers reach this only on
-    /// the `None` arm of `get_box_replacement_box`; an already-minted or
+    /// the `None` arm of `get_box_replacement_operand_opt`; an already-minted or
     /// producer-backed opref resolves there. Mirrors `materialize_operand_at`'s resop
     /// lazy-alloc arm (`mint_synthetic_resop` + bind).
     pub(crate) fn mint_box_at(&mut self, opref: OpRef) -> Operand {
@@ -6000,7 +6000,7 @@ impl OptContext {
     /// resoperation.py:38 `same_box` (non-Const: `self is other`) +
     /// history.py:211 `Const.same_box` (value comparison via
     /// `same_constant`). Resolves both operands through
-    /// `get_box_replacement_box` then delegates to `Operand::same_box`. Falls
+    /// `get_box_replacement_operand_opt` then delegates to `Operand::same_box`. Falls
     /// back to resolved-`OpRef` identity plus constant-value comparison
     /// when either box is absent: two references to the same unresolved
     /// variable are still the same box (`self is other`), and a
@@ -8228,7 +8228,7 @@ impl OptContext {
         opref: OpRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         // Resolve the position to its canonical box, then delegate to the
-        // box-native form. `get_box_replacement_box` returns `None` for an
+        // box-native form. `get_box_replacement_operand_opt` returns `None` for an
         // unresolved position (the old `and_then`/`_ => return None` arm).
         let op = self.get_box_replacement_operand_opt(opref)?;
         self.get_const_info_mut_if_exists_box(&op)
@@ -9410,7 +9410,7 @@ mod boxref_forwarding_tests {
     /// operand-returning reader resolves the slot's bound InputArg.
     /// `resoperation.py:57-68` walker terminates on `None` immediately.
     #[test]
-    fn h3_2b_get_box_replacement_box_returns_pool_entry_when_no_forward() {
+    fn h3_2b_get_box_replacement_operand_opt_returns_pool_entry_when_no_forward() {
         let (ctx, _b0, _b1, ia_holder) = ctx_with_two_int_boxes();
         let got = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_typed(0, Type::Int))
@@ -9432,7 +9432,7 @@ mod boxref_forwarding_tests {
     /// identity is checked via the shared `InputArg` handle rather than
     /// outer `Rc<Box>` pointer equality.
     #[test]
-    fn h3_2b_get_box_replacement_box_walks_forwarded_chain() {
+    fn h3_2b_get_box_replacement_operand_opt_walks_forwarded_chain() {
         let (mut ctx, b0, b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.make_equal_to(&b0, &b1);
         let got = ctx
@@ -9451,7 +9451,7 @@ mod boxref_forwarding_tests {
     /// operand-returning reader returns `None`; the OpRef-returning walker
     /// cannot resolve a Box identity without a bound producer either.
     #[test]
-    fn h3_2b_get_box_replacement_box_returns_none_when_pool_empty() {
+    fn h3_2b_get_box_replacement_operand_opt_returns_none_when_pool_empty() {
         let ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
         // No seeded producer: no Box identity to resolve.
         assert!(
@@ -9464,7 +9464,7 @@ mod boxref_forwarding_tests {
     /// has no Box to root the walk on. The OpRef-returning reader handles
     /// the sentinel independently by returning it unchanged.
     #[test]
-    fn h3_2b_get_box_replacement_box_handles_none_sentinel() {
+    fn h3_2b_get_box_replacement_operand_opt_handles_none_sentinel() {
         let (ctx, _b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         assert!(ctx.get_box_replacement_operand_opt(OpRef::NONE).is_none());
     }
@@ -9474,7 +9474,7 @@ mod boxref_forwarding_tests {
     /// walker stops before descending into Info, matching
     /// PyPy `resoperation.py:60 isinstance(next, AbstractInfo)`.
     #[test]
-    fn h3_2b_get_box_replacement_box_stops_at_info_terminal() {
+    fn h3_2b_get_box_replacement_operand_opt_stops_at_info_terminal() {
         let (mut ctx, b0, _b1, ia_holder) = ctx_with_two_int_boxes();
         ctx.setintbound(&b0, &IntBound::from_constant(7));
         let got = ctx
@@ -10248,7 +10248,7 @@ mod constant_ptr_info_tests {
         let opref = OpRef::ref_op(10_012);
         // Synthetic-OpRef test fixture: lazy-allocate the operand so the
         // operand-direct `make_nonnull_str` can write through it. Production
-        // callers obtain the box via `get_box_replacement_box`.
+        // callers obtain the box via `get_box_replacement_operand_opt`.
         let op_box = ctx.materialize_operand_at(opref);
 
         ctx.make_nonnull_str(&op_box, 0);

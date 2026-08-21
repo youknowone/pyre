@@ -1024,7 +1024,7 @@ impl OptRewrite {
     fn getnullness(&self, opref: OpRef, ctx: &mut OptContext) -> Nullness {
         // optimizer.py:127-135 `getnullness` has no missing-Box branch —
         // every `op` has a backing `AbstractValue` per
-        // `resoperation.py:233-248`. `get_box_replacement_box` resolves
+        // `resoperation.py:233-248`. `get_box_replacement_operand_opt` resolves
         // the opref to its bound host; the read-only `getnullness` below
         // never writes, so an unresolvable opref (OpRef::NONE sentinel,
         // no upstream equivalent) maps to `INFO_UNKNOWN`.
