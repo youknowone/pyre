@@ -163,6 +163,10 @@ fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
         // when it is itself a heap type.
         let of_type = type_mirror(w_obj);
         unsafe { set_ob_type(&raw mut (*mirror).ob_base.ob_base, of_type) };
+        // Only the startup table has a reason to defer this: every base a
+        // mirror reached from here can name already has its own mirror, or
+        // gets one from this same call a level down.
+        super::typeobject::finish_interpreter_type(mirror, w_obj);
         return mirror as *mut CPyObject;
     }
     let ob_type = type_mirror(w_obj);
@@ -463,7 +467,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::bytesobject::forget_pending(address);
     super::frameobject::forget_block(raw);
     super::pyerrors::forget_block(raw);
-    super::typeobject::forget_type_name(address);
+    unsafe { super::typeobject::forget_type_mirror(raw) };
     super::gc::forget(address);
     let block = block_at(address);
     let returned = if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
