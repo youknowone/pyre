@@ -50,7 +50,69 @@ fn weak_cache_contains(
     let item_slot = roots.publish(&[item]);
     let cache = cache_attr(roots.get(cls_slot), name)?;
     let cache_slot = roots.publish(&[cache]);
+    if let Some(found) = simple_weak_set_contains(roots.get(cache_slot), roots.get(item_slot))? {
+        return Ok(found);
+    }
     crate::baseobjspace::contains(roots.get(cache_slot), roots.get(item_slot))
+}
+
+/// `app_abc.py SimpleWeakSet.__contains__` without the app-level frame,
+/// for the collection `_abc_init` installed and nothing has replaced.
+///
+/// `None` means the receiver is not that collection — a rebound `_abc_cache`, or
+/// one whose `data` is no longer a set — so the caller takes the membership
+/// protocol and whatever the replacement spells.
+///
+/// `_abc_instancecheck` runs this once on a hit and twice on a miss, and the
+/// frame it replaces is most of what the check costs: the body is three
+/// operations, and entering Python to run them is the rest.
+fn simple_weak_set_contains(
+    cache: PyObjectRef,
+    item: PyObjectRef,
+) -> Result<Option<bool>, crate::PyError> {
+    if !crate::typedef::r#type(cache)
+        .is_some_and(|actual| std::ptr::eq(actual.as_ptr(), simple_weak_set_type()))
+    {
+        return Ok(None);
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let cache_slot = roots.publish(&[cache]);
+    let item_slot = roots.publish(&[item]);
+    let data = crate::baseobjspace::getattr_str(roots.get(cache_slot), "data")?;
+    if !unsafe { pyre_object::is_set(data) } {
+        return Ok(None);
+    }
+    let data_slot = roots.publish(&[data]);
+    // An empty collection holds no entry to match, and building the probe has
+    // no other effect, so the two answers agree.  `_in_weak_set` takes the same
+    // shortcut on `PySet_GET_SIZE(set) == 0`.
+    if unsafe { pyre_object::w_set_len(roots.get(data_slot)) } == 0 {
+        return Ok(Some(false));
+    }
+    // `wr = ref(item)`.  The app-level spelling answers False for an item that
+    // cannot carry a weakref and lets every other error out, so match both.
+    let probe = match crate::module::_weakref::interp__weakref::descr__new__weakref(
+        crate::module::_weakref::interp__weakref::weakref_type(),
+        &[roots.get(item_slot)],
+    ) {
+        Ok(probe) => probe,
+        Err(err) if matches!(err.kind, crate::error::PyErrorKind::TypeError) => {
+            return Ok(Some(false));
+        }
+        Err(err) => return Err(err),
+    };
+    let probe_slot = roots.publish(&[probe]);
+    // `wr in self.data`.  The probe carries no callback, and a weakref hashes
+    // and compares by its referent, so it finds the callback-carrying entry
+    // `add` stored.
+    match unsafe {
+        pyre_object::w_set_contains_checked(roots.get(data_slot), roots.get(probe_slot))
+    } {
+        Ok(found) => Ok(Some(found)),
+        // A weakref is hashable, so this is unreachable; leave the faithful
+        // error to the membership protocol rather than inventing one here.
+        Err(_) => Ok(None),
+    }
 }
 
 /// `app_abc.py SimpleWeakSet.add` — `self.data.add(ref(item, self._remove))`.
