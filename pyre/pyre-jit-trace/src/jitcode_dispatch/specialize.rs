@@ -7646,27 +7646,44 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    // CALL_KW keeps the keyword-name tuple after all argument values:
-    // [callable, null_or_self, p, q, strict, kwnames].
+    // A `call_kw` residual leads with its keyword-name tuple rather than
+    // trailing it: `[callable, self_or_null, kwnames, arg0..argN-1]`, the
+    // order `eval.rs call_kw` pushes and `fold_call_kw_permutation` reads.
+    // So `zip(p, q, strict=True)` arrives as
+    // [zip, self_or_null, ("strict",), p, q, True].
     if r_args.len() != 6 {
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
     let [
         ConcreteValue::Ref(callable),
-        ConcreteValue::Ref(null_or_self),
+        self_or_null,
+        ConcreteValue::Ref(kwnames),
         ConcreteValue::Ref(tuple0),
         ConcreteValue::Ref(tuple1),
         ConcreteValue::Ref(strict),
-        ConcreteValue::Ref(kwnames),
     ] = arg_concretes.as_slice()
     else {
         return Ok(None);
     };
+    // The receiver slot has two spellings for the same "no bound receiver".
+    // A keyword call lowers it to a const `PY_NULL` (`ConstPtr(GcRef(0))`),
+    // whose concrete shadow is `ConcreteValue::Null` because constant pool
+    // slots carry no `Ref` shadow; a positional call takes the slot off the
+    // value stack, where it reads `Ref(null)`.  Only the first reaches here,
+    // since `strict=` is what brings this fold in at all.
+    let self_is_null = match self_or_null {
+        ConcreteValue::Ref(p) => p.is_null(),
+        ConcreteValue::Null => matches!(
+            ctx.trace_ctx.box_value(r_args[1]),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0)))
+        ),
+        _ => false,
+    };
     let zip_callable = pyre_interpreter::typedef::gettypeobject(&pyre_object::functional::ZIP_TYPE);
     if callable.is_null()
         || !std::ptr::eq(*callable, zip_callable)
-        || !null_or_self.is_null()
+        || !self_is_null
         || kwnames.is_null()
         || unsafe { !pyre_object::is_tuple(*kwnames) }
         || unsafe { pyre_object::w_tuple_len(*kwnames) } != 1
@@ -7729,7 +7746,7 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
     let zip_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], *callable)?;
-    for (arg_op, concrete) in [(r_args[5], *kwnames), (r_args[4], *strict)] {
+    for (arg_op, concrete) in [(r_args[2], *kwnames), (r_args[5], *strict)] {
         if !arg_op.is_constant() {
             let expected = ctx.trace_ctx.const_ref(concrete as i64);
             walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[arg_op, expected])?;
@@ -7739,7 +7756,7 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
 
     let zero = ctx.trace_ctx.const_int(0);
     let mut iterator_ops = Vec::with_capacity(2);
-    for (tuple_op, concrete_slot) in [(r_args[2], iter0_slot), (r_args[3], iter1_slot)] {
+    for (tuple_op, concrete_slot) in [(r_args[3], iter0_slot), (r_args[4], iter1_slot)] {
         walker_guard_class(ctx, op.pc, tuple_op, tuple_type as i64)?;
         walker_guard_exact_w_class(ctx, op.pc, tuple_op, tuple_class)?;
         let iterator = ctx.trace_ctx.record_op_with_descr(
