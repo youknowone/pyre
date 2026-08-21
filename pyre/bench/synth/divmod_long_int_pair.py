@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=4
+# pyre-check: spec-folds=builtin_divmod,builtin_divmod_long_int,binary_op_long_int_div
 # The ceiling sits between the two measured states: folded this runs 1.4x
 # pypy, and with `builtin_divmod` / `binary_op_long_int_div` suppressed
 # about 6.2x.

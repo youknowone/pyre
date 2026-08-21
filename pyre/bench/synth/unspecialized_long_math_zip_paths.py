@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=6
+# pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters,compare_op_long_int,truediv_op_long,binary_op_long_int_pow,binary_op_long_int_shift,math_frexp,math_ldexp
 # The throughput gate for eight hand-written trace-time folds that no other
 # fixture makes fire: `zip` over two tuples (positional and `strict=True`), a
 # long/int comparison, a two-bigint true-divide, `bigint ** int`,
@@ -10,6 +11,15 @@
 # how these eight were once retired as dead -- so this ceiling is the only
 # thing here that can. Loosen it rather than shrink the loops if a slower host
 # proves it flaky.
+#
+# Which folds a leg fires is a census question, not a reading of the source:
+# `PYRE_FBW_SPEC_CENSUS=1` prints `fold=<label> consulted=N fired=N` per label.
+# This fixture claimed eight and delivered seven for as long as `builtin_zip`
+# read its `call_kw` operands in the wrong order -- consulted once per run and
+# declined every time, so the leg written for it gated nothing and the ceiling
+# below was fitted without it. Read the census, not the leg names, before
+# trusting the coverage claim above; the `zip_strict` sensitivity quoted in the
+# next paragraph predates that fix.
 #
 # The legs are sized per leg, not uniformly, because sensitivity and cost run
 # opposite here: measured at a common 1M iterations, the folds worth the most

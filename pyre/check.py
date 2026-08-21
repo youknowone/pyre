@@ -1769,6 +1769,61 @@ def synth_ungated_jitstats(path):
     )
 
 
+def synth_spec_folds(path):
+    """Read an optional list of trace-time folds a fixture must make fire:
+        # pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters
+
+    A throughput ceiling cannot gate one fold out of several. The legs of a
+    multi-fold fixture sum into one number, so retiring the least valuable one
+    moves that number by less than the span the same fixture reads across the
+    runners (`PERF_GATE_FLOOR_DIVISOR` records how wide that is). A jit-stats
+    baseline covers only part of the set: of the eight folds
+    `unspecialized_long_math_zip_paths` names, suppressing either zip fold
+    moves `bridges_compiled` and `guard_failures`, and suppressing any of the
+    other six alone moves no gated counter at all.
+
+    So this gates coverage instead, which is exact and the same on every host:
+    each named fold has to fire at least once. That is the failure the other
+    two instruments are blind to -- a fold that stops firing reads exactly
+    like a fold nobody wrote a leg for, and `builtin_zip` sat at `fired=0` in
+    the fixture written to gate it for as long as it read its `call_kw`
+    operands in the wrong order.
+
+    It does not claim the folds are worth their code; it claims the fixture
+    still reaches them. Pair it with the ceiling, which gates the sum.
+    """
+    found = _header_directive(path, "# pyre-check: spec-folds=")
+    if found is None:
+        return ()
+    raw, line = found
+    names = tuple(n for n in (part.strip() for part in raw.split(",")) if n)
+    if not names:
+        raise ValueError(f"empty fold list in {path}: {line.strip()}")
+    repeated = sorted({n for n in names if names.count(n) > 1})
+    if repeated:
+        raise ValueError(f"repeated fold label(s) {repeated} in {path}: {line.strip()}")
+    return names
+
+
+# `[spec-census] fold=<label> consulted=N fired=N suppressed=N site=... parent=...`
+SPEC_CENSUS_FOLD_RE = re.compile(r"^\[spec-census\] fold=(\S+) .*?\bfired=(\d+)\b", re.M)
+
+
+def spec_fold_census(binary, path, timeout_s):
+    """`({label: fired}, returncode)` for every fold the run registered.
+
+    The binary owns the label set, so a declared name absent from this map is
+    a typo rather than a fold that stayed quiet, and the caller reports the
+    two differently.
+    """
+    env = pyre_env()
+    env["PYRE_FBW_SPEC_CENSUS"] = "1"
+    _, _, code, err = run_timed([binary, path], timeout_s=timeout_s, env=env)
+    if code != 0:
+        return None, code
+    return {m.group(1): int(m.group(2)) for m in SPEC_CENSUS_FOLD_RE.finditer(err)}, 0
+
+
 def default_binary(backend):
     name = CARGO_CONFIG[backend]["bin"]
     return f"./target/release/{name}{EXE}"
@@ -3315,6 +3370,44 @@ class Check:
 
     # ── synthetic parity suite ──
 
+    def _check_spec_folds(self, name, path, spec_folds, timeout, t_cpython, t_pypy):
+        """True if every fold the fixture declares fired; else record and report.
+
+        The census reads the same on every backend that shares the trace
+        walker, so this runs once on a native backend rather than per backend.
+        A wasm-only run has no walker to census and says so instead of passing
+        quietly, which would make the gate vacuous exactly where it is not run.
+        """
+        sys.stdout.write(f"    {'folds':<10s}")
+        sys.stdout.flush()
+        backend = next(
+            (b for b in ALL_BACKENDS if self.enabled(b) and b != "wasm"), None
+        )
+        if backend is None:
+            print(dim("skip (no native backend enabled)"))
+            return True
+        census, code = spec_fold_census(default_binary(backend), path, timeout)
+        if census is None:
+            detail = f"spec-folds census run failed (exit {code})"
+            print(f"{red('FAIL')}  {detail}")
+        else:
+            unknown = [f for f in spec_folds if f not in census]
+            quiet = [f for f in spec_folds if census.get(f) == 0]
+            if unknown:
+                detail = f"unknown fold label(s): {', '.join(unknown)}"
+                print(f"{red('FAIL')}  {detail}")
+            elif quiet:
+                detail = f"declared fold(s) never fired: {', '.join(quiet)}"
+                print(f"{red('FAIL')}  {detail}")
+            else:
+                print(f"{dim('done')}  {len(spec_folds)} fired")
+                return True
+        for b in ALL_BACKENDS:
+            if self.enabled(b):
+                self._record(b, False, name, detail)
+                self._append_comparison(b, name, t_cpython, t_pypy, "FAIL")
+        return False
+
     def run_synthetic_bench(self, path, timeout):
         name = f"synth/{Path(path).stem}"
         effective_timeout = scaled_timeout(timeout, self.args.timeout_scale)
@@ -3324,6 +3417,7 @@ class Check:
             skip_backends = synth_skip_backends(path)
             skip_cpython = synth_skip_cpython(path)
             no_cpython = synth_no_cpython(path)
+            spec_folds = synth_spec_folds(path)
         except ValueError as e:
             print(f"{red('ERROR')}: {e}")
             sys.exit(1)
@@ -3394,6 +3488,11 @@ class Check:
                     self._append_comparison(
                         backend, name, t_cpython, t_pypy, "BASEFAIL",
                     )
+            return
+
+        if spec_folds and not self._check_spec_folds(
+            name, path, spec_folds, effective_timeout, t_cpython, t_pypy,
+        ):
             return
 
         for backend in ALL_BACKENDS:
