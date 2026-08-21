@@ -1514,6 +1514,10 @@ use majit_metainterp::JitDriver;
 use pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info;
 use pyre_object::floatobject::{FLOAT_FLOATVAL_OFFSET, W_FloatObject};
 use pyre_object::intobject::{INT_INTVAL_OFFSET, W_IntObject};
+use pyre_object::lowlevel_string::{
+    LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_UNICODE_BASE_SIZE, bh_alloc_lowlevel_string,
+    bh_free_lowlevel_string, bh_lowlevel_string_len,
+};
 use pyre_object::{w_bool_from, w_int_new, w_none, w_str_new, w_tuple_new};
 
 // rlib/jit.py PARAMETERS default: loop hot-count threshold. Read from
@@ -13293,53 +13297,10 @@ fn bh_setfield_gc_int_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::
     };
 }
 
-const LOWLEVEL_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
-const LOWLEVEL_STRING_CHARS_OFFSET: usize = 2 * std::mem::size_of::<usize>();
-const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;
-const LOWLEVEL_UNICODE_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET;
-
-fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usize) -> i64 {
-    let Some(items_size) = length.checked_mul(item_size) else {
-        return 0;
-    };
-    let Some(total_size) = base_size.checked_add(items_size) else {
-        return 0;
-    };
-    let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
-        .expect("low-level string layout");
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    if ptr.is_null() {
-        return 0;
-    }
-    unsafe {
-        (ptr.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(length);
-    }
-    ptr as i64
-}
-
-fn bh_lowlevel_string_len(string: i64) -> usize {
-    if string == 0 {
-        return 0;
-    }
-    unsafe { *((string as *const u8).add(LOWLEVEL_STRING_LEN_OFFSET) as *const usize) }
-}
-
-/// Free a low-level string allocated by [`bh_alloc_lowlevel_string`].
-///
-/// Reconstructs the exact `Layout` the allocation used from the capacity word
-/// stored at `LOWLEVEL_STRING_LEN_OFFSET` (the allocation stores its `length`
-/// argument there, and the StringBuilder passes the buffer *capacity* as that
-/// argument). `base_size`/`item_size` must match the allocation call.
-fn bh_free_lowlevel_string(string: i64, base_size: usize, item_size: usize) {
-    if string == 0 {
-        return;
-    }
-    let capacity = bh_lowlevel_string_len(string);
-    let total_size = base_size + capacity * item_size;
-    let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
-        .expect("low-level string layout");
-    unsafe { std::alloc::dealloc(string as *mut u8, layout) };
-}
+// Raw low-level string layout constants + `bh_alloc`/`bh_free`/`bh_len`
+// primitives moved to `pyre_object::lowlevel_string` (imported at the top of
+// this module) so the JIT fnaddr registry can reference the `jit_ll_shrink_array`
+// residual target that shares them.
 
 /// Runtime realization of the RPython `StringBuilder` GcStruct (rbuilder epic
 /// task #43). A bare (no `w_class`) but *headered* GcStruct carrying exactly one

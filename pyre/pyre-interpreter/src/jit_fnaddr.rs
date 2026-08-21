@@ -1969,6 +1969,17 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_int_str",
         pyre_object::jit_int_str as *const (),
     );
+    // `rgc.ll_shrink_array` residual target for the StringBuilder `build` tree
+    // (`_handle_rgc_call` rewrites the oopspec residual to `["jit_ll_shrink_array"]`).
+    // The non-virtual shrink reallocs a raw low-level string down to its final
+    // length; the virtual path is folded by `opt_call_shrink_array` and never
+    // calls this.
+    push_alias_pair(
+        &mut entries,
+        "pyre_object::lowlevel_string::jit_ll_shrink_array",
+        "pyre_object::jit_ll_shrink_array",
+        pyre_object::lowlevel_string::jit_ll_shrink_array as *const (),
+    );
     push_alias_pair(
         &mut entries,
         "pyre_object::functional::jit_range_iter_new",
