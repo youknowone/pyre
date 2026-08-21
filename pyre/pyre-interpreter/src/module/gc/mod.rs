@@ -678,11 +678,12 @@ fn pin_cpython_tracked_object(object: majit_ir::GcRef) {
 }
 
 /// CPython's container traversal sees logical entries even where a PyPy list
-/// or dict strategy stores an unboxed scalar.  The collector walk correctly
-/// has no GC edge to report for those fields, so materialise only the missing
-/// logical half at the public API boundary.  Object-strategy entries remain
-/// the collector's responsibility: rebuilding all of them here would both
-/// duplicate results and lose the identity of direct referents.
+/// strategy, dict strategy, or specialised tuple stores an unboxed scalar.  The
+/// collector walk correctly has no GC edge to report for those fields, so
+/// materialise only the missing logical half at the public API boundary.
+/// Object-strategy entries remain the collector's responsibility: rebuilding
+/// all of them here would both duplicate results and lose the identity of
+/// direct referents.
 fn pin_unboxed_container_referents(source_slot: usize) {
     let w_obj = pyre_object::gc_roots::shadow_stack_get(source_slot);
     if w_obj.is_null()
@@ -721,6 +722,19 @@ fn pin_unboxed_container_referents(source_slot: usize) {
                     // The typed strategy's GC walker already reported the
                     // boxed value; only its native i64/Vec<u8> key was absent.
                     pyre_object::gc_roots::pin_root(key);
+                }
+            }
+        } else if is_specialised_tuple_ii(w_obj) || is_specialised_tuple_ff(w_obj) {
+            // Both items live in inline i64/f64 fields, so these two variants
+            // carry no GC-pointer slot at all and the walker reports an empty
+            // tuple.  `w_tuple_getitem` re-wraps them the same way
+            // `specialisedtupleobject.py:138-141 wraps[i](self.space, value)`
+            // does.  `Cls_oo` stores both items as GC pointers and stays the
+            // collector's.
+            for index in 0..2 {
+                let tuple = pyre_object::gc_roots::shadow_stack_get(source_slot);
+                if let Some(item) = tupleobject::w_tuple_getitem(tuple, index) {
+                    pyre_object::gc_roots::pin_root(item);
                 }
             }
         }

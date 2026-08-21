@@ -351,10 +351,11 @@ fn simple_namespace_new(args: &[PyObjectRef]) -> crate::PyResult {
     let object = crate::typedef::object_descr_new(&args[..1])?;
     let _roots = pyre_object::gc_roots::push_roots();
     let object_slot = pyre_object::gc_roots::pin_roots(&[object]);
-    let dict = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(object_slot),
-        "__dict__",
-    )?;
+    // `W_Root.getdict`, not the public attribute lookup: `namespace_new`
+    // reaches the instance mapping directly, so a subclass that overrides
+    // `__getattribute__` or shadows `__dict__` neither runs during
+    // construction nor can make `S()` raise.
+    let dict = crate::baseobjspace::getdict(pyre_object::gc_roots::shadow_stack_get(object_slot))?;
     pyre_object::gc_roots::pin_root(dict);
     let dict = pyre_object::gc_roots::shadow_stack_get(object_slot + 1);
     unsafe {

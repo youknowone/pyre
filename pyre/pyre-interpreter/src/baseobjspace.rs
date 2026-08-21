@@ -11517,13 +11517,21 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         let w_module_type =
             crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
                 .map_or(PY_NULL, |p| p.as_ptr());
-        let old_supported = w_type_is_cpython_heaptype(w_oldcls.as_ptr())
-            || std::ptr::eq(w_oldcls.as_ptr(), w_module_type);
-        let new_supported =
-            w_type_is_cpython_heaptype(w_newcls) || std::ptr::eq(w_newcls, w_module_type);
+        // A heap projection is not by itself a mutable one: the extension
+        // families marked through `mark_cpython_heap_type(tp, true)` — array,
+        // the sre types, the _io stack, the posix result types — carry
+        // IMMUTABLETYPE beside HEAPTYPE, and an exact instance of one must not
+        // be retagged to a layout-compatible no-slot subclass.  Both ends need
+        // the mutable half.
+        let old_mutable_heap = w_type_is_cpython_heaptype(w_oldcls.as_ptr())
+            && !w_type_is_cpython_immutabletype(w_oldcls.as_ptr());
+        let new_mutable_heap =
+            w_type_is_cpython_heaptype(w_newcls) && !w_type_is_cpython_immutabletype(w_newcls);
+        let old_supported = old_mutable_heap || std::ptr::eq(w_oldcls.as_ptr(), w_module_type);
+        let new_supported = new_mutable_heap || std::ptr::eq(w_newcls, w_module_type);
         if !old_supported || !new_supported {
             return Err(crate::PyError::type_error(
-                "__class__ assignment only supported for heap types or ModuleType subclasses"
+                "__class__ assignment only supported for mutable types or ModuleType subclasses"
                     .to_string(),
             ));
         }
@@ -19032,6 +19040,18 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
     );
     let w_message = w_str_from_wtf8(message);
     if let Err(mut err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
+        // A filter turned into `error` hands back the only reference to the
+        // materialised exception, and it lives in this Rust `PyError`, which
+        // the collector does not scan.  `py_repr_wtf8` below runs app-level
+        // `__repr__` and allocates, so hold the exception on the shadow stack
+        // across the formatting and read it back before it is reported.
+        let exc_slot = if err.exc_object.is_null() {
+            None
+        } else {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            pyre_object::gc_roots::pin_root(err.exc_object);
+            Some(slot)
+        };
         let repr = unsafe {
             crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(async_gen_slot))
         }
@@ -19040,6 +19060,9 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
             "Exception ignored while finalizing async generator ",
             repr
         );
+        if let Some(slot) = exc_slot {
+            err.exc_object = pyre_object::gc_roots::shadow_stack_get(slot);
+        }
         err.write_unraisable(
             w_none(),
             &where_desc,
