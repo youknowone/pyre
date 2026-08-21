@@ -3289,7 +3289,11 @@ fn alloc_fail_index() -> u32 {
 //                      distinguish guard_value-by-int / -by-ref / -by-float.
 //   - bits 3..end    : jitcounter hash (when TY_NONE) or backend value-slot
 //                      index (when TY_INT/REF/FLOAT), accessed via `>>
-//                      ST_SHIFT` with `STATUS_SHIFT_MASK`.
+//                      ST_SHIFT` with `ST_SHIFT_MASK` (compile.py:692).
+//
+// What the value-slot index NAMES is backend-specific — see the same note on
+// `guard_value_counter_slot` in majit-backend's `resume_guard_descr.rs`, which
+// this block mirrors.
 pub(crate) const STATUS_BUSY_FLAG: u64 = 0x01;
 #[allow(dead_code)]
 pub(crate) const STATUS_TYPE_MASK: u64 = 0x06;

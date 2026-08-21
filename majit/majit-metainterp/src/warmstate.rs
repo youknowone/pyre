@@ -2055,13 +2055,22 @@ impl WarmEnterState {
                 }
                 return false;
             }
+            // An invalidated procedure token — one the cell saw and no longer
+            // holds — has to reach `cleanup_chain` below rather than take any
+            // early return (`warmstate.py:483-491`).
+            let dead_token =
+                cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
             // The function-entry door owns the same decision the back-edge
             // doors do, and its caller runs `decay_all_counters()`
             // (`warmstate.py:429`) on the way to `force_start_tracing*`. So the
             // ceiling answers here too, or a latched location decays every
             // OTHER location's counter once per function entry. See
             // [`Self::maybe_compile_decision`].
-            if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+            // A latched cell that is ALSO dead takes the cleanup path instead,
+            // as it does at both back-edge doors: refusing here would leave the
+            // stale entry in the chain for every later call, and its bucket's
+            // counter would never re-arm.
+            if !dead_token && cell.abort_count >= MAX_TRACE_ABORT_COUNT {
                 crate::mc_diag_bump(81); // abort_ceiling_refused
                 return false;
             }
@@ -2078,7 +2087,7 @@ impl WarmEnterState {
                     return true;
                 }
             }
-            if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+            if dead_token {
                 cleanup_dead_token_cell = true;
             }
         }
@@ -4682,6 +4691,44 @@ mod tests {
 
         assert!(!ws.should_trace_function_entry(key));
         assert!(ws.get_cell(key).is_none());
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(ws.should_trace_function_entry(key));
+    }
+
+    /// A cell that has latched the pyre-local abort ceiling AND holds a
+    /// procedure token that was since invalidated must still be removed from
+    /// the chain: `warmstate.py:483-500` re-counts such a location from cold,
+    /// and both back-edge doors already exempt a dead token from the ceiling.
+    /// Refusing at the ceiling first leaves the stale entry in place for every
+    /// later call, so its bucket's counter never re-arms.
+    #[test]
+    fn test_function_entry_ceiling_still_cleans_up_a_dead_token() {
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(2);
+        let key = 0xD010;
+        let qmut = 0xFA14;
+
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(ws.should_trace_function_entry(key));
+        ws.force_start_tracing(key);
+        ws.finish_tracing(key);
+        let token = JitCellToken::new(ws.alloc_token_number());
+        attach_alive(&mut ws, key, token);
+        ws.register_quasiimmut_dependency(qmut, key);
+
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            ws.abort_tracing(key, false);
+        }
+        assert!(ws.get_cell(key).unwrap().abort_count >= MAX_TRACE_ABORT_COUNT);
+
+        assert_eq!(ws.invalidate_quasiimmut(qmut), 1);
+        assert_eq!(ws.get_cell_state(key), BaseJitCellState::Invalidated);
+
+        assert!(!ws.should_trace_function_entry(key));
+        assert!(
+            ws.get_cell(key).is_none(),
+            "a dead token at the abort ceiling must reach cleanup_chain"
+        );
         assert!(!ws.should_trace_function_entry(key));
         assert!(ws.should_trace_function_entry(key));
     }

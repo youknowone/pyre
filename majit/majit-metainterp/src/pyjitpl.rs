@@ -10753,8 +10753,7 @@ impl<M: Clone> MetaInterp<M> {
         // does not belong on a path every entry takes.
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
-        let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
-            .map(|slot| self.backend.get_value_direct(&frame, slot));
+        let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
         // compile.py:186 `descr.rd_loop_token` — owning loop's clt,
         // stamped at compile time.  Walk the chain
         // `descr.rd_loop_token_clt() → clt.upgrade_loop_token()` to
@@ -10922,7 +10921,22 @@ impl<M: Clone> MetaInterp<M> {
         self.execute_assembler_at_dispatch_key(&token, green_key, live_values, dispatch_key)
     }
 
-    /// `compile.py _DoneWithThisFrameDescr.get_result` and
+    /// `compile.py:753-771` reads the failing GUARD_VALUE's operand off the
+    /// deadframe while it is still alive; `must_compile` runs after the frame
+    /// is gone. Both compiled-entry hand-back points therefore take the read
+    /// here and pass the value forward. `None` covers the arms `must_compile`
+    /// never hashes a value on (TY_NONE, busy) and the backends whose slot
+    /// space is the fail-argument vector, which resolve the index later.
+    fn resolve_guard_value_operand(
+        &self,
+        descr: &dyn majit_ir::FailDescr,
+        frame: &majit_backend::DeadFrame,
+    ) -> Option<i64> {
+        majit_backend::guard_value_counter_slot(descr)
+            .map(|slot| self.backend.get_value_direct(frame, slot))
+    }
+
+    /// `compile.py:658-672 _DoneWithThisFrameDescr.get_result` and
     /// `handle_fail`'s exit read: decode a returned frame's exit slots into the
     /// raw and typed lists every consumer of a compiled run reads.
     ///
@@ -11072,8 +11086,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let status = descr.get_status();
-        let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
-            .map(|slot| self.backend.get_value_direct(&frame, slot));
+        let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
         // compile.py:186 `descr.rd_loop_token` — see `run_compiled_detailed`.
         let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
         Self::finish_compiled_run_io();
@@ -12074,6 +12087,13 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     // compile.py:687-696 status encoding constants.
+    //
+    // `status >> ST_SHIFT` is a jitcounter hash under TY_NONE and a backend
+    // value-slot index under TY_INT/REF/FLOAT. That index is only meaningful
+    // to the backend that recorded it, which is why `must_compile_with_values`
+    // prefers the `guard_value_operand` its caller read off the live deadframe
+    // and falls back to `fail_values[index]` for the backends whose slot space
+    // is the dense fail-argument vector.
     const ST_BUSY_FLAG: u64 = 0x01;
     const ST_TYPE_MASK: u64 = 0x06;
     const ST_SHIFT: u32 = 3;

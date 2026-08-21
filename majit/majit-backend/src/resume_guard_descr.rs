@@ -60,7 +60,14 @@ use crate::resume_value::ResumeData;
 //                      distinguish guard_value-by-int / -by-ref / -by-float.
 //   - bits 3..end    : jitcounter hash (when TY_NONE) or backend value-slot
 //                      index (when TY_INT/REF/FLOAT), accessed via `>>
-//                      ST_SHIFT` with `STATUS_SHIFT_MASK`.
+//                      ST_SHIFT` with `ST_SHIFT_MASK` (compile.py:692).
+//
+// What the value-slot index NAMES is backend-specific, because
+// `make_a_counter_per_value` (`regalloc.py:495-500`) records a register or
+// frame position of the trace that failed. On dynasm that is a deadframe
+// slot, read with `Backend::get_value_direct`; on the backends whose slot
+// space IS the dense fail-argument vector it coincides with a fail-argument
+// position, and `must_compile` resolves it out of `fail_values` instead.
 pub const STATUS_BUSY_FLAG: u64 = 0x01;
 pub const STATUS_TYPE_MASK: u64 = 0x06;
 pub const STATUS_SHIFT: u32 = 3;
@@ -74,6 +81,10 @@ pub const STATUS_TY_FLOAT: u64 = 0x06;
 /// operand from, or `None` when this failure does not take that arm:
 /// TY_NONE is the per-guard hash and a busy status is `must_compile`'s
 /// early `return False` (`compile.py:750-751`).
+///
+/// The slot is only meaningful to the backend that recorded it — see the
+/// status-layout note above for which backends read it as a deadframe slot
+/// and which resolve the same index out of the fail-argument vector.
 pub fn guard_value_counter_slot(descr: &dyn FailDescr) -> Option<usize> {
     let status = descr.get_status();
     if status & STATUS_TYPE_MASK == 0 || status & STATUS_BUSY_FLAG != 0 {
