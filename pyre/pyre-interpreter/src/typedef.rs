@@ -21972,18 +21972,32 @@ pub(crate) fn require_contiguous_buffer(obj: PyObjectRef) -> Result<(), crate::P
     Ok(())
 }
 
-/// Require `obj` to be a bytes-like object, returning its bytes; raises
-/// the CPython `a bytes-like object is required, not '<type>'` TypeError
-/// otherwise.  A memoryview is accepted through its backing buffer.
-fn require_bytes_like(obj: PyObjectRef) -> Result<&'static [u8], crate::PyError> {
+/// Resolve `obj` to the bytes-like object backing it; raises the
+/// `a bytes-like object is required, not '<type>'` TypeError otherwise.
+/// A memoryview is accepted through its backing buffer.
+///
+/// Separate from `require_bytes_like` so a caller that must reject a bad
+/// operand *before* running a later argument's `__index__` can do the type
+/// check here and take the payload slice afterwards.  The array, mmap and
+/// ctypes arms mint a fresh `bytes` snapshot, so a result held across a
+/// Python hop needs a root of its own.
+fn require_bytes_like_source(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     require_contiguous_buffer(obj)?;
     match buffer_as_bytes_like(obj)? {
-        Some(src) => Ok(unsafe { pyre_object::bytesobject::bytes_like_data(src) }),
+        Some(src) => Ok(src),
         None => Err(crate::PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
             type_name_of(obj)
         ))),
     }
+}
+
+/// Require `obj` to be a bytes-like object, returning its bytes; raises
+/// the CPython `a bytes-like object is required, not '<type>'` TypeError
+/// otherwise.  A memoryview is accepted through its backing buffer.
+fn require_bytes_like(obj: PyObjectRef) -> Result<&'static [u8], crate::PyError> {
+    let src = require_bytes_like_source(obj)?;
+    Ok(unsafe { pyre_object::bytesobject::bytes_like_data(src) })
 }
 
 /// The Python-visible class name of `obj` (its `w_class`/type name), used in
@@ -22244,6 +22258,14 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     crate::type_methods::arity_at_least(pos, "replace", 2)?;
     crate::type_methods::arity_at_most(pos, "replace", 3)?;
+    // `old` and `new` are rejected before `count` is coerced: the clinic
+    // signature converts the two buffers ahead of the integer, so
+    // `b"".replace(1, b"y", idx)` raises the TypeError without running
+    // `idx.__index__`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let src_base = pyre_object::gc_roots::shadow_stack_len();
+    pyre_object::gc_roots::pin_root(require_bytes_like_source(pos[1])?);
+    pyre_object::gc_roots::pin_root(require_bytes_like_source(pos[2])?);
     let limit = match pos.get(3) {
         Some(&w_count) if !w_count.is_null() => {
             let c = crate::builtins::space_index_w(w_count)?;
@@ -22251,12 +22273,19 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
         _ => usize::MAX,
     };
-    // Borrowed after the coercions, as `bytes_method_ljust`: all three
+    // Borrowed after the coercion, as `bytes_method_ljust`: all three
     // operands may be bytearrays, and the `__index__` above can resize any of
-    // them.
+    // them.  The two sources come back off their root slots, since a snapshot
+    // minted by `require_bytes_like_source` had nothing else holding it.
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
-    let old = require_bytes_like(pos[1])?;
-    let new = require_bytes_like(pos[2])?;
+    let old = unsafe {
+        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(src_base))
+    };
+    let new = unsafe {
+        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(
+            src_base + 1,
+        ))
+    };
     let (out, replacements) = replace_bytes(data, old, new, limit);
     // `descr_replace` returns `self` when nothing was replaced
     // (unicodeobject.py for the str twin) — keyed on the count, so
