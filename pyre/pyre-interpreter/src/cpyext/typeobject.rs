@@ -811,6 +811,128 @@ unsafe extern "C" fn interp_tp_iternext(raw: *mut CPyObject) -> *mut CPyObject {
     }
 }
 
+/// `slotdefs.py make_binary_slot` — the method called with the receiver and
+/// the operand the slot was handed.
+macro_rules! binary_slots {
+    ($(($rust:ident, $method:literal),)*) => {
+        $(
+            unsafe extern "C" fn $rust(
+                raw: *mut CPyObject,
+                operand: *mut CPyObject,
+            ) -> *mut CPyObject {
+                let Some([w_self, w_operand]) = super::object::arguments([raw, operand]) else {
+                    return std::ptr::null_mut();
+                };
+                super::object::result(call_slot_method(w_self, $method, &[w_operand]))
+            }
+        )*
+    };
+}
+
+binary_slots! {
+    (interp_nb_add, "__add__"),
+    (interp_nb_subtract, "__sub__"),
+    (interp_nb_multiply, "__mul__"),
+    (interp_nb_remainder, "__mod__"),
+    (interp_nb_divmod, "__divmod__"),
+    (interp_nb_lshift, "__lshift__"),
+    (interp_nb_rshift, "__rshift__"),
+    (interp_nb_and, "__and__"),
+    (interp_nb_xor, "__xor__"),
+    (interp_nb_or, "__or__"),
+    (interp_sq_concat, "__add__"),
+    (interp_sq_inplace_concat, "__iadd__"),
+    (interp_mp_subscript, "__getitem__"),
+}
+
+/// `slotdefs.py make_binary_slot_int` — the count the slot was handed,
+/// passed on as the `int` the method takes.
+macro_rules! ssize_arg_slots {
+    ($(($rust:ident, $method:literal),)*) => {
+        $(
+            unsafe extern "C" fn $rust(raw: *mut CPyObject, index: isize) -> *mut CPyObject {
+                let Some(w_self) = super::object::argument(raw) else {
+                    return std::ptr::null_mut();
+                };
+                let roots = pyre_object::gc_roots::push_roots();
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                roots.pin_root(w_self);
+                // Minting the index can collect, so the receiver is read back.
+                let w_index = pyre_object::w_int_new(index as i64);
+                let w_self = pyre_object::gc_roots::shadow_stack_get(slot);
+                super::object::result(call_slot_method(w_self, $method, &[w_index]))
+            }
+        )*
+    };
+}
+
+ssize_arg_slots! {
+    (interp_sq_item, "__getitem__"),
+    (interp_sq_repeat, "__mul__"),
+    (interp_sq_inplace_repeat, "__imul__"),
+}
+
+/// `slotdefs.py make_nb_power`.
+///
+/// The modulus is the third operand `pow()` takes; a caller with none of its
+/// own passes `None`, and a NULL is read as that rather than refused.
+unsafe extern "C" fn interp_nb_power(
+    raw: *mut CPyObject,
+    operand: *mut CPyObject,
+    modulus: *mut CPyObject,
+) -> *mut CPyObject {
+    unsafe { pyobject::realize(modulus) };
+    let Some([w_self, w_operand]) = super::object::arguments([raw, operand]) else {
+        return std::ptr::null_mut();
+    };
+    let w_modulus = match modulus.is_null() {
+        true => pyre_object::w_none(),
+        false => unsafe { pyobject::from_ref(modulus) },
+    };
+    super::object::result(call_slot_method(w_self, "__pow__", &[w_operand, w_modulus]))
+}
+
+/// `slotdefs.py make_sq_set_item` and `make_sq_ass_item` — one slot for the
+/// assignment and the deletion both, told apart by the value being NULL.
+fn interp_assign_item(raw: *mut CPyObject, w_key: PyObjectRef, value: *mut CPyObject) -> c_int {
+    let Some(w_self) = super::object::argument(raw) else {
+        return -1;
+    };
+    let assigned = match value.is_null() {
+        true => call_slot_method(w_self, "__delitem__", &[w_key]),
+        false => match super::object::argument(value) {
+            Some(w_value) => call_slot_method(w_self, "__setitem__", &[w_key, w_value]),
+            None => return -1,
+        },
+    };
+    match super::pyerrors::trap(assigned) {
+        Some(_) => 0,
+        None => -1,
+    }
+}
+
+unsafe extern "C" fn interp_mp_ass_subscript(
+    raw: *mut CPyObject,
+    key: *mut CPyObject,
+    value: *mut CPyObject,
+) -> c_int {
+    unsafe { pyobject::realize(key) };
+    unsafe { pyobject::realize(value) };
+    let Some(w_key) = super::object::argument(key) else {
+        return -1;
+    };
+    interp_assign_item(raw, w_key, value)
+}
+
+unsafe extern "C" fn interp_sq_ass_item(
+    raw: *mut CPyObject,
+    index: isize,
+    value: *mut CPyObject,
+) -> c_int {
+    unsafe { pyobject::realize(value) };
+    interp_assign_item(raw, pyre_object::w_int_new(index as i64), value)
+}
+
 /// `slotdefs.py make_unary_slot_int` — the method's answer read as an
 /// integer, with -1 the failure a caller checks the indicator for.
 macro_rules! length_slots {
@@ -837,8 +959,65 @@ length_slots! {
     (interp_mp_length, "__len__"),
 }
 
-/// Where a filled slot is written.
-type SlotWriter = fn(*mut CPyTypeObject, *const c_void);
+/// Whether a number suite may be written for `w_type` — `typeobject.py
+/// fill_slot`, which leaves `list` and `tuple` themselves without one, and
+/// every `bytes` or `str` with it, so that a caller testing for the suite
+/// reads them as the sequences they are.
+fn fills_number_suite(w_type: PyObjectRef) -> bool {
+    let exactly =
+        |builtin| crate::typedef::gettypefor(builtin).is_some_and(|class| class.as_ptr() == w_type);
+    let derived = |builtin| {
+        crate::typedef::gettypefor(builtin).is_some_and(|class| unsafe {
+            crate::baseobjspace::issubtype_w(w_type, class.as_ptr())
+        })
+    };
+    !exactly(&pyre_object::pyobject::LIST_TYPE)
+        && !exactly(&pyre_object::pyobject::TUPLE_TYPE)
+        && !derived(&pyre_object::bytesobject::BYTES_TYPE)
+        && !derived(&pyre_object::pyobject::STR_TYPE)
+}
+
+/// Where a filled slot is written.  The type is passed because a number
+/// suite is not written for every one of them.
+type SlotWriter = fn(*mut CPyTypeObject, PyObjectRef, *const c_void);
+
+macro_rules! scalar_entry {
+    ($field:ident) => {
+        (|tp, _, slot| unsafe { (*tp).$field = slot }) as SlotWriter
+    };
+}
+
+macro_rules! number_entry {
+    ($field:ident) => {
+        (|tp, w_type, slot| {
+            if fills_number_suite(w_type) {
+                unsafe { (*table_of!(tp, tp_as_number, CPyNumberMethods)).$field = slot }
+            }
+        }) as SlotWriter
+    };
+}
+
+macro_rules! sequence_entry {
+    ($field:ident) => {
+        (|tp, _, slot| unsafe {
+            (*table_of!(tp, tp_as_sequence, CPySequenceMethods)).$field = slot
+        }) as SlotWriter
+    };
+}
+
+macro_rules! mapping_entry {
+    ($field:ident) => {
+        (|tp, _, slot| unsafe { (*table_of!(tp, tp_as_mapping, CPyMappingMethods)).$field = slot })
+            as SlotWriter
+    };
+}
+
+macro_rules! async_entry {
+    ($field:ident) => {
+        (|tp, _, slot| unsafe { (*table_of!(tp, tp_as_async, CPyAsyncMethods)).$field = slot })
+            as SlotWriter
+    };
+}
 
 /// The `tp_` slots this runtime fills to reach a method it answers for
 /// itself, and the method whose presence on the type earns each one.
@@ -847,61 +1026,75 @@ const UNARY_SLOTS: [(
     unsafe extern "C" fn(*mut CPyObject) -> *mut CPyObject,
     SlotWriter,
 ); 14] = [
-    ("__repr__", interp_tp_repr, |tp, slot| unsafe {
-        (*tp).tp_repr = slot
-    }),
-    ("__str__", interp_tp_str, |tp, slot| unsafe {
-        (*tp).tp_str = slot
-    }),
-    ("__iter__", interp_tp_iter, |tp, slot| unsafe {
-        (*tp).tp_iter = slot
-    }),
-    ("__next__", interp_tp_iternext, |tp, slot| unsafe {
-        (*tp).tp_iternext = slot
-    }),
-    ("__int__", interp_nb_int, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_int = slot
-    }),
-    ("__float__", interp_nb_float, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_float = slot
-    }),
-    ("__index__", interp_nb_index, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_index = slot
-    }),
-    ("__neg__", interp_nb_negative, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_negative = slot
-    }),
-    ("__pos__", interp_nb_positive, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_positive = slot
-    }),
-    ("__abs__", interp_nb_absolute, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_absolute = slot
-    }),
-    ("__invert__", interp_nb_invert, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_number, CPyNumberMethods)).nb_invert = slot
-    }),
-    ("__await__", interp_am_await, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_async, CPyAsyncMethods)).am_await = slot
-    }),
-    ("__aiter__", interp_am_aiter, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_async, CPyAsyncMethods)).am_aiter = slot
-    }),
-    ("__anext__", interp_am_anext, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_async, CPyAsyncMethods)).am_anext = slot
-    }),
+    ("__repr__", interp_tp_repr, scalar_entry!(tp_repr)),
+    ("__str__", interp_tp_str, scalar_entry!(tp_str)),
+    ("__iter__", interp_tp_iter, scalar_entry!(tp_iter)),
+    ("__next__", interp_tp_iternext, scalar_entry!(tp_iternext)),
+    ("__int__", interp_nb_int, number_entry!(nb_int)),
+    ("__float__", interp_nb_float, number_entry!(nb_float)),
+    ("__index__", interp_nb_index, number_entry!(nb_index)),
+    ("__neg__", interp_nb_negative, number_entry!(nb_negative)),
+    ("__pos__", interp_nb_positive, number_entry!(nb_positive)),
+    ("__abs__", interp_nb_absolute, number_entry!(nb_absolute)),
+    ("__invert__", interp_nb_invert, number_entry!(nb_invert)),
+    ("__await__", interp_am_await, async_entry!(am_await)),
+    ("__aiter__", interp_am_aiter, async_entry!(am_aiter)),
+    ("__anext__", interp_am_anext, async_entry!(am_anext)),
 ];
 
 /// The slots whose C function answers a count rather than an object.
-const LENGTH_SLOTS: [(&str, unsafe extern "C" fn(*mut CPyObject) -> isize, SlotWriter); 3] = [
-    ("__hash__", interp_tp_hash, |tp, slot| unsafe {
-        (*tp).tp_hash = slot
-    }),
-    ("__len__", interp_sq_length, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_sequence, CPySequenceMethods)).sq_length = slot
-    }),
-    ("__len__", interp_mp_length, |tp, slot| unsafe {
-        (*table_of!(tp, tp_as_mapping, CPyMappingMethods)).mp_length = slot
-    }),
+const LENGTH_SLOTS: [(
+    &str,
+    unsafe extern "C" fn(*mut CPyObject) -> isize,
+    SlotWriter,
+); 3] = [
+    ("__hash__", interp_tp_hash, scalar_entry!(tp_hash)),
+    ("__len__", interp_sq_length, sequence_entry!(sq_length)),
+    ("__len__", interp_mp_length, mapping_entry!(mp_length)),
+];
+
+/// The slots taking a second object — `slotdefs.py make_binary_slot`.
+const BINARY_SLOTS: [(
+    &str,
+    unsafe extern "C" fn(*mut CPyObject, *mut CPyObject) -> *mut CPyObject,
+    SlotWriter,
+); 13] = [
+    ("__add__", interp_nb_add, number_entry!(nb_add)),
+    ("__sub__", interp_nb_subtract, number_entry!(nb_subtract)),
+    ("__mul__", interp_nb_multiply, number_entry!(nb_multiply)),
+    ("__mod__", interp_nb_remainder, number_entry!(nb_remainder)),
+    ("__divmod__", interp_nb_divmod, number_entry!(nb_divmod)),
+    ("__lshift__", interp_nb_lshift, number_entry!(nb_lshift)),
+    ("__rshift__", interp_nb_rshift, number_entry!(nb_rshift)),
+    ("__and__", interp_nb_and, number_entry!(nb_and)),
+    ("__xor__", interp_nb_xor, number_entry!(nb_xor)),
+    ("__or__", interp_nb_or, number_entry!(nb_or)),
+    ("__add__", interp_sq_concat, sequence_entry!(sq_concat)),
+    (
+        "__iadd__",
+        interp_sq_inplace_concat,
+        sequence_entry!(sq_inplace_concat),
+    ),
+    (
+        "__getitem__",
+        interp_mp_subscript,
+        mapping_entry!(mp_subscript),
+    ),
+];
+
+/// The slots taking a count — `slotdefs.py make_binary_slot_int`.
+const SSIZE_ARG_SLOTS: [(
+    &str,
+    unsafe extern "C" fn(*mut CPyObject, isize) -> *mut CPyObject,
+    SlotWriter,
+); 3] = [
+    ("__getitem__", interp_sq_item, sequence_entry!(sq_item)),
+    ("__mul__", interp_sq_repeat, sequence_entry!(sq_repeat)),
+    (
+        "__imul__",
+        interp_sq_inplace_repeat,
+        sequence_entry!(sq_inplace_repeat),
+    ),
 ];
 
 /// Is `slot` one this runtime installed to reach a method of its own?
@@ -909,29 +1102,42 @@ const LENGTH_SLOTS: [(&str, unsafe extern "C" fn(*mut CPyObject) -> isize, SlotW
 /// Such a slot must never be published back as that method: the call it makes
 /// resolves the name again, and a published wrapper would answer with itself.
 /// Only the slots `inherit_slots` copies can reach a type built from C, and
-/// those are the scalar ones — a suite is never handed down whole.
+/// those are the scalar ones -- a suite is never handed down whole.
 fn is_interpreter_slot(slot: *const c_void) -> bool {
+    let named = |function| std::ptr::eq(slot, function);
     UNARY_SLOTS
         .iter()
-        .any(|&(_, function, _)| std::ptr::eq(slot, function as *const c_void))
+        .any(|&(_, function, _)| named(function as *const c_void))
         || LENGTH_SLOTS
             .iter()
-            .any(|&(_, function, _)| std::ptr::eq(slot, function as *const c_void))
+            .any(|&(_, function, _)| named(function as *const c_void))
 }
 
 /// `typeobject.py update_all_slots_builtin` — fill the slots `w_type` answers
 /// for itself.
 fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
     let defines = |method| unsafe { crate::baseobjspace::lookup_in_type(w_type, method) }.is_some();
-    for (method, function, store) in UNARY_SLOTS {
-        if defines(method) {
-            store(mirror, function as *const c_void);
-        }
+    macro_rules! fill {
+        ($table:ident) => {
+            for (method, function, store) in $table {
+                if defines(method) {
+                    store(mirror, w_type, function as *const c_void);
+                }
+            }
+        };
     }
-    for (method, function, store) in LENGTH_SLOTS {
-        if defines(method) {
-            store(mirror, function as *const c_void);
-        }
+    fill!(UNARY_SLOTS);
+    fill!(LENGTH_SLOTS);
+    fill!(BINARY_SLOTS);
+    fill!(SSIZE_ARG_SLOTS);
+    if defines("__pow__") {
+        number_entry!(nb_power)(mirror, w_type, interp_nb_power as *const c_void);
+    }
+    // Both names, because one slot answers for the assignment and the
+    // deletion and there is no spelling for having only one of them.
+    if defines("__setitem__") && defines("__delitem__") {
+        mapping_entry!(mp_ass_subscript)(mirror, w_type, interp_mp_ass_subscript as *const c_void);
+        sequence_entry!(sq_ass_item)(mirror, w_type, interp_sq_ass_item as *const c_void);
     }
 }
 

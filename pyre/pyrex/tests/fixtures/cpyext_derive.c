@@ -241,7 +241,9 @@ static PyObject *call_slot(PyObject *self, PyObject *args)
     (void)self;
     const char *which;
     PyObject *o;
-    if (!PyArg_ParseTuple(args, "sO", &which, &o)) {
+    PyObject *operand = NULL;
+    PyObject *value = NULL;
+    if (!PyArg_ParseTuple(args, "sO|OO", &which, &o, &operand, &value)) {
         return NULL;
     }
     PyTypeObject *t = Py_TYPE(o);
@@ -249,53 +251,94 @@ static PyObject *call_slot(PyObject *self, PyObject *args)
     PySequenceMethods *sq = t->tp_as_sequence;
     PyMappingMethods *mp = t->tp_as_mapping;
 
-    /* The count-answering slots, whose failure is -1 with an exception set. */
-    lenfunc counts = NULL;
-    hashfunc hashes = NULL;
-    if (strcmp(which, "sq_length") == 0) {
-        counts = sq == NULL ? NULL : sq->sq_length;
-    } else if (strcmp(which, "mp_length") == 0) {
-        counts = mp == NULL ? NULL : mp->mp_length;
-    } else if (strcmp(which, "tp_hash") == 0) {
-        hashes = t->tp_hash;
-    }
-    if (counts != NULL) {
-        Py_ssize_t n = counts(o);
-        return n < 0 && PyErr_Occurred() ? NULL : PyLong_FromSsize_t(n);
-    }
-    if (hashes != NULL) {
-        Py_hash_t h = hashes(o);
-        return h == -1 && PyErr_Occurred() ? NULL : PyLong_FromSsize_t((Py_ssize_t)h);
-    }
-
-    unaryfunc unary = NULL;
-    if (strcmp(which, "tp_repr") == 0) {
-        unary = t->tp_repr;
-    } else if (strcmp(which, "tp_str") == 0) {
-        unary = t->tp_str;
-    } else if (strcmp(which, "nb_int") == 0) {
-        unary = nb == NULL ? NULL : nb->nb_int;
-    } else if (strcmp(which, "nb_float") == 0) {
-        unary = nb == NULL ? NULL : nb->nb_float;
-    } else if (strcmp(which, "nb_index") == 0) {
-        unary = nb == NULL ? NULL : nb->nb_index;
-    } else if (strcmp(which, "nb_negative") == 0) {
-        unary = nb == NULL ? NULL : nb->nb_negative;
-    } else if (strcmp(which, "nb_positive") == 0) {
-        unary = nb == NULL ? NULL : nb->nb_positive;
-    } else if (strcmp(which, "nb_absolute") == 0) {
-        unary = nb == NULL ? NULL : nb->nb_absolute;
-    } else if (strcmp(which, "nb_invert") == 0) {
-        unary = nb == NULL ? NULL : nb->nb_invert;
-    } else if (strcmp(which, "sq_length") != 0 && strcmp(which, "mp_length") != 0 &&
-               strcmp(which, "tp_hash") != 0) {
+    /* Which field the name reads, and the shape of the call it makes.  The
+       shape is what decides how a failure is told from an answer, so it is
+       settled from the name alone -- a NULL field is still reported as the
+       absent slot it is. */
+    enum { NONE, UNARY, LENGTH, HASH, BINARY, COUNTED, POWER, ASSIGN, ASSIGN_AT } shape =
+        NONE;
+    void *slot = NULL;
+#define PICK(name, kind, field)                                              \
+    if (strcmp(which, name) == 0) {                                          \
+        shape = kind;                                                        \
+        slot = (void *)(field);                                              \
+    } else
+#define SUITE(suite, member) ((suite) == NULL ? NULL : (suite)->member)
+    PICK("tp_repr", UNARY, t->tp_repr)
+    PICK("tp_str", UNARY, t->tp_str)
+    PICK("nb_int", UNARY, SUITE(nb, nb_int))
+    PICK("nb_float", UNARY, SUITE(nb, nb_float))
+    PICK("nb_index", UNARY, SUITE(nb, nb_index))
+    PICK("nb_negative", UNARY, SUITE(nb, nb_negative))
+    PICK("nb_positive", UNARY, SUITE(nb, nb_positive))
+    PICK("nb_absolute", UNARY, SUITE(nb, nb_absolute))
+    PICK("nb_invert", UNARY, SUITE(nb, nb_invert))
+    PICK("tp_hash", HASH, t->tp_hash)
+    PICK("sq_length", LENGTH, SUITE(sq, sq_length))
+    PICK("mp_length", LENGTH, SUITE(mp, mp_length))
+    PICK("nb_add", BINARY, SUITE(nb, nb_add))
+    PICK("nb_subtract", BINARY, SUITE(nb, nb_subtract))
+    PICK("nb_multiply", BINARY, SUITE(nb, nb_multiply))
+    PICK("nb_remainder", BINARY, SUITE(nb, nb_remainder))
+    PICK("nb_and", BINARY, SUITE(nb, nb_and))
+    PICK("sq_concat", BINARY, SUITE(sq, sq_concat))
+    PICK("mp_subscript", BINARY, SUITE(mp, mp_subscript))
+    PICK("sq_item", COUNTED, SUITE(sq, sq_item))
+    PICK("sq_repeat", COUNTED, SUITE(sq, sq_repeat))
+    PICK("nb_power", POWER, SUITE(nb, nb_power))
+    PICK("mp_ass_subscript", ASSIGN, SUITE(mp, mp_ass_subscript))
+    PICK("sq_ass_item", ASSIGN_AT, SUITE(sq, sq_ass_item))
+    {
         PyErr_Format(PyExc_ValueError, "the fixture does not offer %s", which);
         return NULL;
     }
-    if (unary == NULL) {
+#undef SUITE
+#undef PICK
+
+    if (slot == NULL) {
         return PyUnicode_FromString("none");
     }
-    return unary(o);
+    if (shape == UNARY) {
+        return ((unaryfunc)slot)(o);
+    }
+    if (shape == LENGTH) {
+        Py_ssize_t n = ((lenfunc)slot)(o);
+        return n < 0 && PyErr_Occurred() ? NULL : PyLong_FromSsize_t(n);
+    }
+    if (shape == HASH) {
+        Py_hash_t h = ((hashfunc)slot)(o);
+        return h == -1 && PyErr_Occurred() ? NULL : PyLong_FromSsize_t((Py_ssize_t)h);
+    }
+    if (operand == NULL) {
+        PyErr_Format(PyExc_TypeError, "%s takes an operand", which);
+        return NULL;
+    }
+    if (shape == BINARY) {
+        return ((binaryfunc)slot)(o, operand);
+    }
+    if (shape == POWER) {
+        /* The modulus a caller without one of its own passes. */
+        return ((ternaryfunc)slot)(o, operand, value == NULL ? Py_None : value);
+    }
+    if (shape == COUNTED || shape == ASSIGN_AT) {
+        Py_ssize_t index = PyNumber_AsSsize_t(operand, PyExc_IndexError);
+        if (index == -1 && PyErr_Occurred()) {
+            return NULL;
+        }
+        if (shape == COUNTED) {
+            return ((ssizeargfunc)slot)(o, index);
+        }
+        if (((ssizeobjargproc)slot)(o, index, value) < 0) {
+            return NULL;
+        }
+        Py_RETURN_NONE;
+    }
+    /* `ASSIGN`: a fourth argument is the value, and no fourth argument is the
+       deletion the same slot answers for. */
+    if (((objobjargproc)slot)(o, operand, value) < 0) {
+        return NULL;
+    }
+    Py_RETURN_NONE;
 }
 
 /* Whether the suite a type names is the block its own `PyHeapTypeObject`

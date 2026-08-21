@@ -267,6 +267,67 @@ else:
     raise AssertionError('a raising __len__ was read as a count')
 
 
+# The slots taking a second operand.
+eq('the addition slot', m.call_slot('nb_add', 2, 3), 5)
+eq('the subtraction slot', m.call_slot('nb_subtract', 9, 4), 5)
+eq('the remainder slot', m.call_slot('nb_remainder', 9, 4), 1)
+eq('the conjunction slot', m.call_slot('nb_and', 12, 10), 8)
+eq('the concatenation slot', m.call_slot('sq_concat', [1], [2]), [1, 2])
+eq('the subscript slot', m.call_slot('mp_subscript', {'a': 1}, 'a'), 1)
+eq('the item slot', m.call_slot('sq_item', [7, 8, 9], 1), 8)
+eq('the repeat slot', m.call_slot('sq_repeat', [0], 3), [0, 0, 0])
+
+# `list` and `tuple` carry no number suite, so a caller testing for one reads
+# them as the sequences they are -- their `__add__` is the concatenation slot.
+eq('a list has no addition slot', m.call_slot('nb_add', [1], [2]), 'none')
+eq('a tuple has no addition slot', m.call_slot('nb_add', (1,), (2,)), 'none')
+eq('a str has no repetition slot', m.call_slot('nb_multiply', 'ab', 2), 'none')
+eq('a str still repeats', m.call_slot('sq_repeat', 'ab', 2), 'abab')
+
+
+class Boxed:
+    def __init__(self, value):
+        self.value = value
+
+    def __add__(self, other):
+        return Boxed(self.value + other.value)
+
+    def __getitem__(self, key):
+        return ('got', key)
+
+    def __setitem__(self, key, value):
+        self.value = (key, value)
+
+    def __delitem__(self, key):
+        self.value = ('deleted', key)
+
+    def __pow__(self, other, modulus=None):
+        return (self.value, other, modulus)
+
+
+eq('a Python class fills the addition slot',
+   m.call_slot('nb_add', Boxed(2), Boxed(3)).value, 5)
+
+# One `__getitem__` reaches both of the slots an item read is spelled with.
+eq('the mapping half', m.call_slot('mp_subscript', Boxed(0), 'k'), ('got', 'k'))
+eq('the sequence half', m.call_slot('sq_item', Boxed(0), 2), ('got', 2))
+
+# And one slot answers for the assignment and the deletion both.
+box = Boxed(0)
+m.call_slot('mp_ass_subscript', box, 'k', 'v')
+eq('the assignment a slot makes', box.value, ('k', 'v'))
+m.call_slot('mp_ass_subscript', box, 'k')
+eq('the deletion the same slot makes', box.value, ('deleted', 'k'))
+m.call_slot('sq_ass_item', box, 2, 'v')
+eq('the assignment the sequence half makes', box.value, (2, 'v'))
+
+# The power slot takes the modulus as its third operand, and a caller with
+# none of its own passes None.
+eq('the power slot', m.call_slot('nb_power', Boxed(2), 3), (2, 3, None))
+eq('the power slot with a modulus', m.call_slot('nb_power', Boxed(2), 3, 5), (2, 3, 5))
+eq('an int answers the power slot', m.call_slot('nb_power', 2, 10), 1024)
+
+
 # The suites a heap type names are the blocks its own layout declares, so the
 # two ways an extension reaches one land on the same words.
 eq('a class names its own suites', m.suites_are_embedded(Counted), (1, 1, 1, 1, 1))
