@@ -6403,6 +6403,16 @@ impl<S: JitState> JitDriver<S> {
         self.meta.set_on_compile_loop(f);
     }
 
+    /// Set a callback for bridge compilation events.
+    ///
+    /// `f` receives `(green_key, fail_index, num_ops)`. The loop sibling above
+    /// cannot stand in for it: a guard that declines to bridge still deopts
+    /// through the blackhole and the loop keeps running, so only this count
+    /// distinguishes a bridge that was built from one that was passed over.
+    pub fn set_on_compile_bridge(&mut self, f: impl Fn(u64, u32, usize) + Send + 'static) {
+        self.meta.set_on_compile_bridge(f);
+    }
+
     /// Set a callback for guard failure events.
     pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
         self.meta.set_on_guard_failure(f);

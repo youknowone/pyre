@@ -43,6 +43,10 @@ const OP_BACK: u8 = 2;
 const OP_RET: u8 = 3;
 
 static COMPILES: AtomicU32 = AtomicU32::new(0);
+/// Bridges compiled. The counts below hold whether or not a bridge is ever
+/// built — declining to bridge keeps them right too — so without this the
+/// fixture cannot tell the repair from the refusal.
+static BRIDGES: AtomicU32 = AtomicU32::new(0);
 
 /// Counts and sums what it is handed. A count alone cannot tell a lost word
 /// from a duplicated one; the sum can.
@@ -87,6 +91,9 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32, chain: usiz
         majit_metainterp::JitDriver::new(threshold);
     driver.set_on_compile_loop(|_green_key, _before, _after, _opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
+    });
+    driver.set_on_compile_bridge(|_green_key, _fail_index, _num_ops| {
+        BRIDGES.fetch_add(1, Ordering::Relaxed);
     });
     let mut pc: usize = 0;
     let mut state = PlainStack {
@@ -159,6 +166,7 @@ fn a_residual_call_after_a_mid_opcode_guard_survives_a_bridge() {
     const ITERATIONS: i64 = 2000;
 
     COMPILES.store(0, Ordering::Relaxed);
+    BRIDGES.store(0, Ordering::Relaxed);
     // Unreachable threshold, so this run fixes the answer without the JIT.
     let cold = run(&program, ITERATIONS, u32::MAX);
     assert_eq!(
@@ -188,4 +196,10 @@ fn a_residual_call_after_a_mid_opcode_guard_survives_a_bridge() {
          compiled than interpreted"
     );
     assert_eq!(warm.0, cold.0, "compiled height");
+    assert!(
+        BRIDGES.load(Ordering::Relaxed) >= 1,
+        "the mid-opcode guard sourced no bridge, so the counts above agree for \
+         the wrong reason: they say the tail still ran, not that it ran from \
+         inside a bridge"
+    );
 }
