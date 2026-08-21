@@ -128,7 +128,17 @@ def test_bytesio_readinto():
     assert writable.tobytes() == b"hello"
 
     stream.seek(0)
-    assert_raises(TypeError, lambda: stream.readinto(memoryview(b"hello")))
+    with assert_raises(TypeError) as error:
+        stream.readinto(memoryview(b"hello"))
+    assert str(error.exception) == (
+        "readinto() argument must be read-write bytes-like object, not memoryview"
+    )
+
+    with assert_raises(TypeError) as error:
+        stream.readinto("hello")
+    assert str(error.exception) == (
+        "readinto() argument must be read-write bytes-like object, not str"
+    )
 
 
 test_bytesio_readinto()

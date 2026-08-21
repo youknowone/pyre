@@ -15993,6 +15993,16 @@ impl Drop for WritableBuffer {
 unsafe fn fileio_writebuf(
     obj: PyObjectRef,
 ) -> Result<(&'static mut [u8], PyObjectRef), crate::PyError> {
+    fn type_error(obj: PyObjectRef) -> crate::PyError {
+        // PyPy `ObjSpace.acquire_writebuf` reports the rejected exporter's
+        // type.  CPython 3.14's readinto gateways keep the same information
+        // but prefix it with the argument name owned by the builtin method.
+        let type_name = unsafe { pyre_object::type_name_of(obj) };
+        crate::PyError::type_error(format!(
+            "readinto() argument must be read-write bytes-like object, not {type_name}"
+        ))
+    }
+
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             return Ok((pyre_object::bytearrayobject::w_bytearray_data_mut(obj), obj));
@@ -16026,15 +16036,11 @@ unsafe fn fileio_writebuf(
             memoryview_check_released(obj)?;
             if pyre_object::memoryview::w_memoryview_readonly(obj) || !memoryview_contiguity(obj).0
             {
-                return Err(crate::PyError::type_error(
-                    "readinto() argument must be read-write bytes-like object",
-                ));
+                return Err(type_error(obj));
             }
             let view = pyre_object::memoryview::w_memoryview_view(obj);
             let Some(full) = view.backing().as_bytes_mut() else {
-                return Err(crate::PyError::type_error(
-                    "readinto() argument must be read-write bytes-like object",
-                ));
+                return Err(type_error(obj));
             };
             let offset = view.offset() as usize;
             let length = pyre_object::memoryview::w_memoryview_length(obj) as usize;
@@ -16045,9 +16051,7 @@ unsafe fn fileio_writebuf(
             }
             return Ok((&mut full[offset..offset + length], obj));
         }
-        Err(crate::PyError::type_error(
-            "readinto() argument must be read-write bytes-like object",
-        ))
+        Err(type_error(obj))
     }
 }
 
