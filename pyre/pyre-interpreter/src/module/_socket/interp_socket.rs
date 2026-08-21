@@ -655,6 +655,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("TCP_FASTOPEN", 15);
         cst!("TCP_KEEPCNT", 16);
         cst!("TCP_KEEPINTVL", 17);
+        // `SIO_TCP_SET_ACK_FREQUENCY` - the name `socketmodule.c` gives this
+        // option on Windows, which `windows-sys` does not spell.
         cst!("TCP_QUICKACK", 0x98000017u32 as i32);
         // ── IP-level ──
         cst!("IP_TTL", ws::IP_TTL);

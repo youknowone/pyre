@@ -296,12 +296,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     }
                     _ => pyre_object::w_none(),
                 };
+                // The active ANSI code page, spelled `cp<n>` whatever it is:
+                // code page 65001 answers `cp65001`, not `utf-8`.  Mapping it
+                // to a codec name is `locale.getdefaultlocale`'s job, not this
+                // hook's.
                 let codepage = unsafe { windows_sys::Win32::Globalization::GetACP() };
-                let encoding = if codepage == 65001 {
-                    pyre_object::w_str_new("utf-8")
-                } else {
-                    pyre_object::w_str_new(&format!("cp{codepage}"))
-                };
+                let encoding = pyre_object::w_str_new(&format!("cp{codepage}"));
                 Ok(pyre_object::w_tuple_new(vec![locale, encoding]))
             },
             0,

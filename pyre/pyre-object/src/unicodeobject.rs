@@ -635,6 +635,22 @@ pub fn interned_size() -> usize {
         .len()
 }
 
+/// The immortal half of that census - `getunicodeinternedsize(
+/// _only_immortal=True)`.  A build-time constant is immortal; a value first
+/// presented to `sys.intern()` is a managed object the collector owns, and is
+/// not counted.  `libregrtest.refleak` subtracts this number from
+/// `getallocatedblocks`, so a string a test interns dynamically must not move
+/// it.
+#[majit_macros::dont_look_inside]
+pub fn interned_size_immortal() -> usize {
+    STRING_INTERN_TABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .filter(|slot| !crate::gc_hook::try_gc_owns_object(***slot as *mut u8))
+        .count()
+}
+
 /// Box a string constant into a heap Python str object.
 ///
 /// Reads the process-global intern table the tracer cannot model; the JIT

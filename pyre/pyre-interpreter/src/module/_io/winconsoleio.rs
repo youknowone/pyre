@@ -226,7 +226,6 @@ impl W_WindowsConsoleIO {
                 ));
             }
             let path = crate::gateway::fsencode_path_w(name_obj)?;
-            let path_obj = path.w_path();
             let os_name = crate::gateway::os_string_from_fs_bytes(&path.as_bytes);
             let mut kind = host_nt::console_type_from_name(&os_name.to_string_lossy());
             if kind == 'x' {
@@ -238,7 +237,10 @@ impl W_WindowsConsoleIO {
                 let _blocked = crate::module::thread::before_external_block();
                 host_nt::open_console_path_fd(&wide, writable)
             }
-            .map_err(|error| io_error(error, path_obj))?;
+            // Read the rooted slot after the block, not before: releasing the
+            // GIL lets a moving collection run, and a `PyObjectRef` snapshotted
+            // ahead of it names the old address.
+            .map_err(|error| io_error(error, path.w_path()))?;
             (opened, true, kind)
         };
 

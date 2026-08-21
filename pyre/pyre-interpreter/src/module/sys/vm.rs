@@ -2721,12 +2721,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "getunicodeinternedsize() takes no positional arguments",
                 ));
             }
-            if let Some(value) = crate::builtins::kwarg_get(kwargs, "_only_immortal") {
-                let _ = crate::baseobjspace::is_true(value)?;
-            }
-            Ok(w_int_new(
-                pyre_object::unicodeobject::interned_size() as i64,
-            ))
+            let only_immortal = match crate::builtins::kwarg_get(kwargs, "_only_immortal") {
+                Some(value) => crate::baseobjspace::is_true(value)?,
+                None => false,
+            };
+            let size = if only_immortal {
+                pyre_object::unicodeobject::interned_size_immortal()
+            } else {
+                pyre_object::unicodeobject::interned_size()
+            };
+            Ok(w_int_new(size as i64))
         }),
     );
     module_ns_store(
@@ -2765,10 +2769,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     module_ns_store(
         ns,
         "_is_gil_enabled",
-        // This is the 3.14t observable: pyre's execution contexts run
-        // concurrently and synchronize the moving collector with STW safepoints,
-        // not a process-wide interpreter lock.
-        make_builtin_function_with_arity("_is_gil_enabled", |_| Ok(w_bool_from(false)), 0),
+        // Whether the interpreter is *currently* running with the lock on,
+        // which is a separate question from the `t` ABI `sysconfig` publishes.
+        // pyre runs bytecode under `rgil` (majit-gc/src/rgil.rs:21-31): one
+        // process-wide lock, taken when a thread starts and dropped only around
+        // external calls, so a thread holds it across arbitrarily many
+        // bytecodes.  That is a GIL, and it is never off.
+        make_builtin_function_with_arity("_is_gil_enabled", |_| Ok(w_bool_from(true)), 0),
     );
     module_ns_store(
         ns,
@@ -3003,6 +3010,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     "DeprecationWarning",
                     1,
                 )?;
+                // `_PyUnicode_EnableLegacyWindowsFSEncoding` also re-runs
+                // `init_fs_codec`, so every path converter switches to
+                // mbcs/replace with it.  Here the flag reaches only the two
+                // getters: `gateway::fsencode` and `typedef::FS_ERRORS` stay on
+                // UTF-8/surrogatepass because there is no `_codecs.mbcs_encode`
+                // to switch them to.  That codec is the dependency to land
+                // before this flag can drive the converters.
                 LEGACY_WINDOWS_FS_ENCODING
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(w_none())
