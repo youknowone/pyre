@@ -33,6 +33,13 @@ PYPY_FLAGS = 1 | (1 << 5) | (1 << 6) | (1 << 9) | (1 << 17) | (1 << 20)
 
 def check_flags():
     # 0x20 is PATMA_SEQUENCE, 0x40 PATMA_MAPPING, 0x200 `_HEAPTYPE`.
+    #
+    # str, bytes and bytearray carry no row.  `get_flags` answers 0x20 for
+    # them, but a sequence pattern must not match a string, so pyre publishes
+    # 0 and keeps the `S` marker only where `issequence_w` reads it.  That
+    # makes them a place where PyPy is not the reference, which is what this
+    # fixture's rows are for; `bench/synth/match_sequence_str.py` is where the
+    # observable half is pinned.
     expected = {
         object: 0x0,
         type: 0x0,
@@ -41,9 +48,6 @@ def check_flags():
         frozenset: 0x0,
         BaseException: 0x0,
         type(None): 0x0,
-        str: 0x20,
-        bytes: 0x20,
-        bytearray: 0x20,
         list: 0x20,
         tuple: 0x20,
         range: 0x20,
