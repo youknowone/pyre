@@ -89,8 +89,8 @@ pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
     ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TY_FLOAT,
     STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, STATUS_TYPE_MASK, alloc_fail_index,
-    build_vector_info_chain, flatten_vector_info, make_resume_guard_descr_typed,
-    park_guard_value_operand, push_vector_info, reset_fail_index_counter,
+    build_vector_info_chain, flatten_vector_info, guard_value_counter_slot,
+    make_resume_guard_descr_typed, push_vector_info, reset_fail_index_counter,
 };
 pub use resume_value::{
     FrameInfo, FrameSlotSource, PendingFieldInfo, ResumeData, ResumeValueLayoutSummaryExt,
@@ -133,6 +133,8 @@ pub struct RawExecResult {
     pub is_exit_frame_with_exception: bool,
     /// compile.py: ResumeGuardDescr.status at guard failure time.
     pub status: u64,
+    /// Failing GUARD_VALUE operand read from its recorded deadframe slot.
+    pub guard_value_operand: Option<i64>,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
     /// `compile.py:701`) — the runtime descr Arc owning this exit.
     /// Always set: routes through `Backend::get_latest_descr_arc`, so
@@ -2625,6 +2627,8 @@ pub trait Backend: Send {
         let exit_layout = self.describe_deadframe(&frame);
         let savedata = self.get_savedata_ref(&frame);
         let exception_value = self.grab_exc_value(&frame);
+        let guard_value_operand =
+            guard_value_counter_slot(descr).map(|slot| self.get_value_direct(&frame, slot));
         let exit_arity = descr.fail_arg_types().len();
         let mut outputs = Vec::with_capacity(exit_arity);
         let mut typed_outputs = Vec::with_capacity(exit_arity);
@@ -2662,6 +2666,7 @@ pub trait Backend: Send {
             is_finish: descr.is_finish(),
             is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
             status: descr.get_status(),
+            guard_value_operand,
             descr_arc,
         }
     }
@@ -2843,7 +2848,7 @@ pub trait Backend: Send {
     /// without any addr→object lookup.  Pyre's bridge crosses native code
     /// through function pointers (`majit-backend-dynasm/src/lib.rs`
     /// `BlackholeFn = fn(usize, *const i64, usize, *const i64, usize) ->
-    /// Option<i64>` and `BridgeFn = fn(*const i64, usize, usize) -> bool`)
+    /// Option<i64>` and the primitive-only `BridgeFn` callback)
     /// which can only carry primitive types, so the descr identity has to
     /// be transported as a raw `usize` (`descr_addr`) and recovered here
     /// via this method.
@@ -2876,6 +2881,14 @@ pub trait Backend: Send {
 
     /// Read an integer value from a dead frame at the given index.
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64;
+
+    /// `llmodel.py:246-250 get_value_direct` — read the raw frame word at a
+    /// DEADFRAME SLOT, not at a fail-argument position. `get_int_value` maps
+    /// its index through `rd_locs` (`llmodel.py:422-424 _decode_pos`); the
+    /// GUARD_VALUE counter slot `make_a_counter_per_value` records
+    /// (`regalloc.py:495-500`) is a register/frame position of the trace that
+    /// failed and generally has no fail-argument position at all.
+    fn get_value_direct(&self, frame: &DeadFrame, slot: usize) -> i64;
 
     /// Read a float value from a dead frame.
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64;

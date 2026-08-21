@@ -39,9 +39,7 @@
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{
@@ -72,38 +70,16 @@ pub const STATUS_TY_INT: u64 = 0x02;
 pub const STATUS_TY_REF: u64 = 0x04;
 pub const STATUS_TY_FLOAT: u64 = 0x06;
 
-/// `compile.py:753-771` — the GUARD_VALUE arm of `must_compile` fetches the
-/// failing operand itself, with `metainterp_sd.cpu.get_value_direct(deadframe,
-/// tp, index)` at the deadframe slot `make_a_counter_per_value` recorded
-/// (`regalloc.py:495-500 consider_guard_value` passes
-/// `all_reg_indexes[x.value]`).
-///
-/// pyre's metainterp is handed a dense fail-value vector, never the deadframe,
-/// so a backend whose slot space is the jitframe's — the operand may be in a
-/// register the guard does not carry as a fail argument — has to make that read
-/// where the frame is still addressable and park the word on the descr the
-/// decision is about.  Call this at every point a deadframe is handed back for
-/// a guard failure; `must_compile_with_values` consumes it with
-/// `take_pending_counter_value`.
-///
-/// # Safety
-/// `frame_ptr` must point to a live JitFrame whose slot array covers the
-/// recorded slot — every slot a backend can record is either a saved register
-/// or a frame position of the trace that just failed.
-pub unsafe fn park_guard_value_operand(
-    descr: &dyn FailDescr,
-    frame_ptr: *const crate::jitframe::JitFrame,
-) {
+/// The deadframe slot `compile.py:753-771` reads the failing GUARD_VALUE
+/// operand from, or `None` when this failure does not take that arm:
+/// TY_NONE is the per-guard hash and a busy status is `must_compile`'s
+/// early `return False` (`compile.py:750-751`).
+pub fn guard_value_counter_slot(descr: &dyn FailDescr) -> Option<usize> {
     let status = descr.get_status();
-    // TY_NONE is the per-guard hash, and a busy status is `must_compile`'s
-    // early `return False` (`compile.py:750-751`) — neither reads a value.
     if status & STATUS_TYPE_MASK == 0 || status & STATUS_BUSY_FLAG != 0 {
-        return;
+        return None;
     }
-    let slot = (status >> STATUS_SHIFT) as usize;
-    descr.set_pending_counter_value(unsafe {
-        crate::llmodel::get_int_value_direct(frame_ptr, slot) as i64
-    });
+    Some((status >> STATUS_SHIFT) as usize)
 }
 
 /// Global counter for unique fail_index allocation.
@@ -183,13 +159,6 @@ pub struct ResumeGuardDescr {
     pub rd_locs: UnsafeCell<Vec<u16>>,
     /// `compile.py` `AbstractResumeGuardDescr._attrs_ = ('status',)`.
     pub status: AtomicU64,
-    /// Failing GUARD_VALUE operand parked by a backend that owns the
-    /// deadframe, for `must_compile`'s per-value hash. A `Ref` stored here is
-    /// only an integer hash input and is never dereferenced, so this is not a
-    /// GC root.
-    pub pending_counter_value: AtomicI64,
-    /// Whether `pending_counter_value` contains an unread word.
-    pub pending_counter_value_present: AtomicBool,
     /// Pyre-only: identifier of the compiled trace that owns this guard.
     pub trace_id: AtomicU64,
     /// Pyre-only: per-trace `fail_index` assigned by `build_guard_metadata`.
@@ -349,8 +318,6 @@ impl Descr for ResumeGuardDescr {
             adr_jump_offset: UnsafeCell::new(0),
             rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
-            pending_counter_value: AtomicI64::new(0),
-            pending_counter_value_present: AtomicBool::new(false),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -485,16 +452,6 @@ impl FailDescr for ResumeGuardDescr {
     fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
         let value = type_tag | ((index as u64) << STATUS_SHIFT);
         self.status.store(value, Ordering::Release);
-    }
-    fn set_pending_counter_value(&self, value: i64) {
-        self.pending_counter_value.store(value, Ordering::Relaxed);
-        self.pending_counter_value_present
-            .store(true, Ordering::Release);
-    }
-    fn take_pending_counter_value(&self) -> Option<i64> {
-        self.pending_counter_value_present
-            .swap(false, Ordering::AcqRel)
-            .then(|| self.pending_counter_value.load(Ordering::Relaxed))
     }
     fn rd_loop_token_clt(&self) -> Option<&dyn Any> {
         let cell = unsafe { &*self.rd_loop_token_clt.get() };
@@ -636,8 +593,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
         status: AtomicU64::new(0),
-        pending_counter_value: AtomicI64::new(0),
-        pending_counter_value_present: AtomicBool::new(false),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),

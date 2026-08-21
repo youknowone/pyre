@@ -238,7 +238,8 @@ use std::sync::OnceLock;
 /// no-exception continuation.  `0` = no pending exception.
 pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> Option<i64>;
 
-/// Bridge compilation: (raw_values, len, descr_addr) → compiled?
+/// Bridge compilation: raw values, descr identity, and optional GUARD_VALUE
+/// operand → compiled?
 ///
 /// The receiving handler recovers the failed descr from `descr_addr`
 /// via `Backend::fail_descr_arc_from_addr` (`history.py:125`
@@ -247,7 +248,7 @@ pub type BlackholeFn = fn(usize, *const i64, usize, *const i64, usize, i64) -> O
 /// `descr.fail_index_per_trace()`) from that Arc, mirroring
 /// `pyjitpl.py handle_guard_failure(self, resumedescr,
 /// deadframe)`.  No surrogate triple crosses the C-ABI.
-pub type BridgeFn = fn(*const i64, usize, usize) -> bool;
+pub type BridgeFn = fn(*const i64, usize, usize, i64, bool) -> bool;
 
 /// Force callee: (callee_frame_ptr) → result
 pub type ForceFn = extern "C" fn(i64) -> i64;
@@ -709,9 +710,8 @@ fn handle_fail_resume_guard(
         raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
     }
 
-    // compile.py:753-771 `must_compile` reads the failing GUARD_VALUE operand
-    // out of the deadframe; this is the CALL_ASSEMBLER callee's deadframe.
-    unsafe { majit_backend::park_guard_value_operand(descr, frame_ptr) };
+    let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
+        .map(|slot| unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
 
     // pyjitpl.py:2921-2923 parity: recover the owning Arc<JitCellToken>
     // identity from the descr.  When the weakref is dead (memmgr-evicted
@@ -807,7 +807,13 @@ fn handle_fail_resume_guard(
     // The hook compiles+attaches; it does NOT re-enter the bridge.
     // Skipped on giveup (None).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CA_BRIDGE_FN.get()) {
-        bridge_fn(raw_values.as_ptr(), raw_values.len(), descr_raw);
+        bridge_fn(
+            raw_values.as_ptr(),
+            raw_values.len(),
+            descr_raw,
+            guard_value_operand.unwrap_or(0),
+            guard_value_operand.is_some(),
+        );
     }
     drop(resume_ref_roots);
 

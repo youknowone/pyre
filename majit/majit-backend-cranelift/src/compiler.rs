@@ -2199,7 +2199,8 @@ pub fn register_call_assembler_blackhole(f: CallAssemblerBlackholeFn) {
 /// receives the descr directly; the C-ABI delivers the same shape via
 /// `descr_addr` (recovered to `Arc<dyn FailDescr>` by the receiver)
 /// instead of a surrogate `(green_key, trace_id, fail_index)` triple.
-static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(*const i64, usize, usize) -> bool> = OnceLock::new();
+static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(*const i64, usize, usize, i64, bool) -> bool> =
+    OnceLock::new();
 
 /// On-demand resume callback: pyre-jit registers this to
 /// drive `ResumeDataDirectReader` from the failed descr's `rd_numb` /
@@ -2599,7 +2600,7 @@ pub fn prologue_probe_addr() -> Option<usize> {
     PROLOGUE_PROBE_ADDR.get().copied()
 }
 
-pub fn register_call_assembler_bridge(f: fn(*const i64, usize, usize) -> bool) {
+pub fn register_call_assembler_bridge(f: fn(*const i64, usize, usize, i64, bool) -> bool) {
     let _ = CALL_ASSEMBLER_BRIDGE_FN.set(f);
 }
 
@@ -3819,7 +3820,7 @@ fn call_assembler_guard_failure_inner(
     // dispatch on subsequent guard failures.  Skipped on giveup (None).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
         let raw_num = fail_descr.fail_arg_types().len();
-        if bridge_fn(outputs_ptr, raw_num, fail_descr_ptr as usize) {
+        if bridge_fn(outputs_ptr, raw_num, fail_descr_ptr as usize, 0, false) {
             // compile.py:704-716 / dynasm parity: the hook traces and
             // attaches the bridge; the current occurrence still resumes
             // through blackhole instead of re-entering the new bridge.
@@ -17179,6 +17180,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     is_finish: descr.is_finish(),
                     is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
                     status: descr.get_status(),
+                    guard_value_operand: None,
                     descr_arc,
                 };
             }
@@ -17271,6 +17273,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     is_finish: true,
                     is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
                     status: fail_descr_fd.get_status(),
+                    guard_value_operand: None,
                     descr_arc: fail_descr_arc.clone(),
                 };
             }
@@ -17331,6 +17334,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 is_finish: false,
                 is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
                 status: fail_descr_fd.get_status(),
+                guard_value_operand: None,
                 descr_arc: fail_descr_arc.clone(),
             };
         }
@@ -17527,6 +17531,11 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
         get_int_from_deadframe(frame, index).expect("get_int_from_deadframe failed")
+    }
+
+    fn get_value_direct(&self, frame: &DeadFrame, slot: usize) -> i64 {
+        // Cranelift's slot space is the dense fail-value vector.
+        self.get_int_value(frame, slot)
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {

@@ -10707,6 +10707,7 @@ impl<M: Clone> MetaInterp<M> {
             savedata: result.savedata,
             exception,
             status: result.status,
+            guard_value_operand: result.guard_value_operand,
         })
     }
 
@@ -10742,7 +10743,9 @@ impl<M: Clone> MetaInterp<M> {
         // does not belong on a path every entry takes.
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
-        // compile.py `descr.rd_loop_token` — owning loop's clt,
+        let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
+            .map(|slot| self.backend.get_value_direct(&frame, slot));
+        // compile.py:186 `descr.rd_loop_token` — owning loop's clt,
         // stamped at compile time.  Walk the chain
         // `descr.rd_loop_token_clt() → clt.upgrade_loop_token()` to
         // recover the owning `Arc<JitCellToken>` (pyjitpl.py:2897
@@ -10874,6 +10877,7 @@ impl<M: Clone> MetaInterp<M> {
             savedata,
             exception,
             status,
+            guard_value_operand,
         })
     }
 
@@ -11053,11 +11057,14 @@ impl<M: Clone> MetaInterp<M> {
                     ovf_flag: false,
                 },
                 status: 0,
+                guard_value_operand: None,
             });
         }
 
         let status = descr.get_status();
-        // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
+        let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
+            .map(|slot| self.backend.get_value_direct(&frame, slot));
+        // compile.py:186 `descr.rd_loop_token` — see `run_compiled_detailed`.
         let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
         Self::finish_compiled_run_io();
 
@@ -11139,6 +11146,7 @@ impl<M: Clone> MetaInterp<M> {
             savedata,
             exception,
             status,
+            guard_value_operand,
         })
     }
 
@@ -12087,6 +12095,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
         fail_values: &[i64],
+        guard_value_operand: Option<i64>,
         fallback_green_key: u64,
     ) -> (bool, u64) {
         crate::mc_diag_bump(0); // must_compile_with_values entered
@@ -12184,12 +12193,11 @@ impl<M: Clone> MetaInterp<M> {
             // `cast_ptr_to_int` for TY_REF, and `longlong.gethash_fast` for
             // TY_FLOAT, which is `longlong2float.float2longlong` on a 64-bit
             // host (codewriter/longlong.py:28) — the double's raw bit pattern.
-            // A backend that parks the word has already performed
-            // `get_value_direct` against its own deadframe. Backends whose
-            // slot space is the dense fail-arg vector (cranelift and wasm)
-            // still resolve the recorded index from `fail_values` here.
-            let intval: i64 = descr_fd
-                .take_pending_counter_value()
+            // A caller that still held the deadframe performed
+            // `get_value_direct` at the recorded slot. Backends whose slot
+            // space is the dense fail-arg vector resolve the recorded index
+            // from `fail_values` here.
+            let intval: i64 = guard_value_operand
                 .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
             // compile.py:780-781: current_object_addr_as_int(self) * 777767777
             //   + intval * 1442968193

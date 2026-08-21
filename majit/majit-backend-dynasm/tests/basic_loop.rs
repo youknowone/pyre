@@ -10,9 +10,7 @@
 use std::rc::Rc;
 use std::sync::{LazyLock, Mutex};
 
-use majit_backend::{
-    Backend, JitCellToken, STATUS_SHIFT, STATUS_TYPE_MASK, make_resume_guard_descr_typed,
-};
+use majit_backend::{Backend, JitCellToken, STATUS_TYPE_MASK, make_resume_guard_descr_typed};
 use majit_ir::{
     GcRef, InputArg, Op, OpCode, OpRef, Type, Value, make_array_descr, make_loop_target_descr,
 };
@@ -357,7 +355,8 @@ fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
         0,
         "GUARD_VALUE must have a per-value counter when arg0 is not a failarg"
     );
-    let slot = status >> STATUS_SHIFT;
+    let slot = majit_backend::guard_value_counter_slot(guard_fd)
+        .expect("GUARD_VALUE must record a deadframe counter slot");
     assert!(
         slot < 64,
         "GUARD_VALUE deadframe slot is implausible: {slot}"
@@ -370,8 +369,8 @@ fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
     let descr = backend.get_latest_descr(&frame);
     assert!(!descr.is_finish(), "should be guard failure, not finish");
     assert_eq!(
-        guard_fd.take_pending_counter_value(),
-        Some(99),
+        backend.get_value_direct(&frame, slot),
+        99,
         "the deadframe slot recorded for the GUARD_VALUE must hold its operand"
     );
 }

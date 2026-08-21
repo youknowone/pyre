@@ -2991,15 +2991,6 @@ impl Backend for DynasmBackend {
             );
         }
 
-        // `compile.py must_compile` reads the failing GUARD_VALUE operand off
-        // the deadframe.  This is the one point on the top-level guard-failure
-        // path that still holds the jitframe: the driver decodes fail arguments
-        // out of the returned deadframe and hands `must_compile_with_values`
-        // that dense vector, in which a non-fail-arg operand has no position.
-        if !descr_fd.is_finish() {
-            unsafe { majit_backend::park_guard_value_operand(descr_fd, result_jf) };
-        }
-
         // `llmodel.py return ll_frame` — the deadframe IS the frame the
         // run returned. `result_jf` is the tip of `jf_ptr`'s `jf_forward`
         // chain whenever `_check_frame_depth` realloc'd; the whole chain is
@@ -3121,6 +3112,8 @@ impl Backend for DynasmBackend {
         // grab_exc_value (llmodel.py): read jf_guard_exc off the deadframe
         // tip before the libc jitframe chain is freed (same as execute_token).
         let exception_value = GcRef(unsafe { (*result_jf).jf_guard_exc });
+        let guard_value_operand = majit_backend::guard_value_counter_slot(descr_fd)
+            .map(|slot| unsafe { crate::llmodel::get_int_value_direct(result_jf, slot) as i64 });
 
         // No deadframe is built on this path, so nothing else takes ownership
         // of the chain — free it here.
@@ -3138,6 +3131,7 @@ impl Backend for DynasmBackend {
             is_finish: descr_fd.is_finish(),
             is_exit_frame_with_exception: descr_fd.is_exit_frame_with_exception(),
             status: descr_fd.get_status(),
+            guard_value_operand,
             descr_arc,
         }
     }
@@ -3246,6 +3240,13 @@ impl Backend for DynasmBackend {
             .as_libc_jitframe()
             .expect("dynasm deadframe is a libc jitframe")
             .get_int(index)
+    }
+
+    fn get_value_direct(&self, frame: &DeadFrame, slot: usize) -> i64 {
+        frame
+            .as_libc_jitframe()
+            .expect("dynasm deadframe is a libc jitframe")
+            .get_int_at_slot(slot)
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
