@@ -595,30 +595,33 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// scan stack is a cycle and answers `false`: the occurrence that opened it
 /// decides.
 ///
+/// The answer names the blocker rather than merely reporting one, because a
+/// declined descent is a wall to be removed and the removal work is per
+/// blocker, not per declining builtin.  The hash resolves to a description
+/// through the `symbolic_fnaddr_paths` registry the pipeline snapshots, which
+/// `jit_metadata.json` carries.
+///
 /// The answer is memoized on the jitcode itself, so the scan runs once per
 /// body rather than once per call site.  Only this entry point memoizes: the
-/// `false` a cycle produces belongs to the occurrence that opened it, not to
+/// `None` a cycle produces belongs to the occurrence that opened it, not to
 /// the body, so [`scan_body_for_unlowered_helper_call`] caches nothing.
-fn descent_reaches_unlowered_helper_call(jitcode_index: usize) -> bool {
-    let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        // Same condition the caller declines on; nothing to answer for.
-        return false;
-    };
-    jitcode.descent_reaches_unlowered_helper_call(|| {
+fn descent_unlowered_helper_blocker(jitcode_index: usize) -> Option<i64> {
+    let jitcode = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index)?;
+    jitcode.descent_unlowered_helper_blocker(|| {
         scan_body_for_unlowered_helper_call(jitcode_index, &mut Vec::new())
     })
 }
 
-/// Recursive worker of [`descent_reaches_unlowered_helper_call`].  `seen` is
+/// Recursive worker of [`descent_unlowered_helper_blocker`].  `seen` is
 /// the stack of jitcode indices currently being scanned.
-fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usize>) -> bool {
+fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usize>) -> Option<i64> {
     if seen.contains(&jitcode_index) {
-        return false;
+        return None;
     }
     let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode_index) else {
         // No installed body means no descent, so there is nothing to answer
         // for; the caller declines on the same lookup.
-        return false;
+        return None;
     };
     seen.push(jitcode_index);
     let descrs = crate::jitcode_runtime::descr_ref_table();
@@ -631,7 +634,7 @@ fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usiz
         known_i[body.num_regs_i + slot] = Some(value);
     }
     let mut pc = 0usize;
-    let mut verdict = false;
+    let mut blocker = None;
     while pc < body.code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body.code, pc) else {
             break;
@@ -643,7 +646,7 @@ fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usiz
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
                 && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
             {
-                verdict = true;
+                blocker = Some(*fnaddr);
                 break;
             }
         } else if d.opname.starts_with("inline_call") {
@@ -654,9 +657,9 @@ fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usiz
             if let Some(callee) = descrs
                 .at(descr_index)
                 .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                && scan_body_for_unlowered_helper_call(callee, seen)
+                && let Some(callee_blocker) = scan_body_for_unlowered_helper_call(callee, seen)
             {
-                verdict = true;
+                blocker = Some(callee_blocker);
                 break;
             }
         }
@@ -681,7 +684,7 @@ fn scan_body_for_unlowered_helper_call(jitcode_index: usize, seen: &mut Vec<usiz
         pc = d.next_pc;
     }
     seen.pop();
-    verdict
+    blocker
 }
 
 /// Whether an exception string-override body issues a nested Python call.  The
@@ -2592,8 +2595,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     if body.num_regs_r < 1 {
         return Ok(None);
     }
-    if descent_reaches_unlowered_helper_call(jitcode.index()) {
-        builtin_inline_decline!("un-lowered helper call in body", fnaddr);
+    if let Some(blocker) = descent_unlowered_helper_blocker(jitcode.index()) {
+        builtin_inline_decline!(
+            format_args!("un-lowered helper call in body blocker={blocker:#x}"),
+            fnaddr
+        );
         return Ok(None);
     }
     let nested_helper = ctx.fbw_mode.inline_subwalk;
