@@ -9,7 +9,23 @@
 //! 2. Coalesce variables connected by Goto link args
 //! 3. Greedy graph coloring via lexicographic BFS
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
+
+/// The per-variable tables — coloring, interference, liveness — key on
+/// flow-graph `Variable`s, which upstream's dictionaries hash by object
+/// identity, so a probe there is a pointer read.  `std`'s default
+/// `RandomState` runs SipHash-1-3 per probe instead, and the assembler reads
+/// the coloring once per variable occurrence in the flattened graph.  Ordering
+/// is not observable: every read is a point lookup, a `len`, or a value-only
+/// rewrite.  The per-kind map keeps `RandomState`; it holds one entry per
+/// `RegKind` and is not probed in a loop.
+pub type VarMap<V> = FxHashMap<crate::flowspace::model::Variable, V>;
+
+/// The coloring an [`AllocationResult`] carries, nameable by callers that
+/// build one directly.
+pub type Coloring = VarMap<usize>;
+type VarSet = FxHashSet<crate::flowspace::model::Variable>;
 
 use crate::flatten::RegKind;
 use crate::model::{Block, ConcreteType, FunctionGraph, OpKind};
@@ -19,15 +35,15 @@ pub use crate::tool::algo::color::DependencyGraph;
 
 #[derive(Debug, Clone)]
 struct UnionFind<N: Eq + std::hash::Hash + Clone> {
-    parent: HashMap<N, N>,
-    weight: HashMap<N, usize>,
+    parent: FxHashMap<N, N>,
+    weight: FxHashMap<N, usize>,
 }
 
 impl<N: Eq + std::hash::Hash + Clone> UnionFind<N> {
     fn new() -> Self {
         Self {
-            parent: HashMap::new(),
-            weight: HashMap::new(),
+            parent: FxHashMap::default(),
+            weight: FxHashMap::default(),
         }
     }
 
@@ -76,7 +92,7 @@ impl<N: Eq + std::hash::Hash + Clone> UnionFind<N> {
 struct RegAllocatorState {
     depgraph: DependencyGraph<crate::flowspace::model::Variable>,
     unionfind: UnionFind<crate::flowspace::model::Variable>,
-    coloring: HashMap<crate::flowspace::model::Variable, usize>,
+    coloring: VarMap<usize>,
 }
 
 impl RegAllocatorState {
@@ -84,7 +100,7 @@ impl RegAllocatorState {
         Self {
             depgraph: DependencyGraph::new(),
             unionfind: UnionFind::new(),
-            coloring: HashMap::new(),
+            coloring: VarMap::default(),
         }
     }
 
@@ -132,7 +148,7 @@ impl RegAllocatorState {
                 _ => None,
             }))
             .collect();
-        let mut die_at: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
+        let mut die_at: VarMap<usize> = VarMap::default();
         for var in &block_input_vars {
             die_at.insert(var.clone(), 0);
         }
@@ -195,7 +211,7 @@ impl RegAllocatorState {
                 }
             }
         }
-        let mut alive: HashSet<crate::flowspace::model::Variable> = livevars.into_iter().collect();
+        let mut alive: VarSet = livevars.into_iter().collect();
 
         // Scan ops, kill at die_at, add interference edges
         let mut die_index = 0;
@@ -342,7 +358,7 @@ impl RegAllocatorState {
 /// [`Self::color_for_variable`] / [`Self::contains_variable`].
 #[derive(Debug, Clone)]
 pub struct RegAllocator {
-    pub coloring: HashMap<crate::flowspace::model::Variable, usize>,
+    pub coloring: VarMap<usize>,
     pub num_regs: usize,
 }
 
@@ -472,7 +488,7 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
     allocator.coalesce_variables(graph, &consider);
     allocator.find_node_coloring();
 
-    let mut coloring: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
+    let mut coloring: VarMap<usize> = VarMap::default();
     let mut max_reg = 0usize;
     // Walk every Variable minted on the graph and pick those whose
     // concretetype lands in `kind`.  `getcolor` projects through the

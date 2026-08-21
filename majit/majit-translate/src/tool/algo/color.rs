@@ -1,6 +1,16 @@
 //! Chordal graph coloring helper from `rpython/tool/algo/color.py`.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+/// Nodes are compiler-internal identities — a flow-graph `Variable`, a jitcode
+/// variable id — and upstream hashes them by object identity, so a probe there
+/// is a pointer read.  `std`'s default `RandomState` runs SipHash-1-3 over the
+/// key instead, and the chordal walk probes the adjacency of every node once
+/// per node.  Iteration order is not observable: `getnodes` orders from the
+/// `_all_nodes` insertion list, and the adjacency sets are only ever tested
+/// for membership or folded into an order-independent accumulator.
+type HashMap<K, V> = FxHashMap<K, V>;
+type HashSet<T> = FxHashSet<T>;
 
 /// Interference graph for register allocation.
 ///
@@ -35,14 +45,14 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     pub fn new() -> Self {
         Self {
             _all_nodes: Vec::new(),
-            neighbours: HashMap::new(),
+            neighbours: HashMap::default(),
         }
     }
 
     pub fn add_node(&mut self, v: N) {
         if !self.neighbours.contains_key(&v) {
             self._all_nodes.push(v.clone());
-            self.neighbours.insert(v, HashSet::new());
+            self.neighbours.insert(v, HashSet::default());
         }
     }
 
@@ -136,7 +146,7 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     /// Assumes the graph is chordal, as upstream does.
     pub fn size_of_largest_clique(&self) -> usize {
         let mut result = 0;
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         for v in self.lexicographic_order() {
             let mut num = 1;
             if let Some(neighbours) = self.neighbours.get(&v) {
@@ -155,9 +165,9 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     /// RPython: `DependencyGraph.find_node_coloring()`.
     /// Uses `HashSet<usize>` — no color limit (fixes u64 overflow).
     pub fn find_node_coloring(&self) -> HashMap<N, usize> {
-        let mut result = HashMap::new();
+        let mut result = HashMap::default();
         for v in self.lexicographic_order() {
-            let mut forbidden: HashSet<usize> = HashSet::new();
+            let mut forbidden: HashSet<usize> = HashSet::default();
             if let Some(neighbours) = self.neighbours.get(&v) {
                 for n in neighbours {
                     if let Some(&color) = result.get(n) {

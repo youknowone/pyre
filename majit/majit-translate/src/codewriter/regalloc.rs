@@ -12,7 +12,7 @@
 use crate::flatten::RegKind;
 use crate::model::FunctionGraph;
 
-pub use crate::tool::algo::regalloc::RegAllocator;
+pub use crate::tool::algo::regalloc::{Coloring, RegAllocator};
 
 /// `regalloc.py::perform_register_allocation(graph, kind)` wrapper.
 pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegAllocator {

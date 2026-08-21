@@ -32,8 +32,18 @@
 //! preserve the upstream absorb-skip semantics.
 
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::hash::Hash;
+
+/// The three tables key on whatever the caller partitions — a flow-graph
+/// `Variable`, a jitcode variable id.  Upstream's dictionaries hash those by
+/// object identity, so the hash is a pointer read; `std`'s default
+/// `RandomState` instead runs SipHash-1-3 over the key on every probe, and the
+/// register allocator probes several times per operand.  Nothing keyed here
+/// comes from outside the compiler, so the collision resistance that buys is
+/// unused.  Ordering is unaffected: only `link_to_parent` is iterated, and it
+/// is an `IndexMap`, which yields insertion order whatever the hasher is.
+type Table<K, V> = FxHashMap<K, V>;
 
 /// RPython `info1.absorb(info2)` (unionfind.py) — called by
 /// [`UnionFind::union`] when two partitions merge. `self` is the
@@ -58,15 +68,15 @@ where
     /// `IndexMap`, not `HashMap`: `keys()` iterates this to drive commonbase
     /// folding and access-set numbering downstream, matching the upstream
     /// dictionary's insertion order.
-    link_to_parent: IndexMap<K, K>,
+    link_to_parent: IndexMap<K, K, FxBuildHasher>,
     /// RPython `self.weight` (unionfind.py:9).
     /// Upstream dictionary deletion in `union` is O(1); ordering is carried
     /// by `link_to_parent`, so hash storage preserves both properties.
-    weight: HashMap<K, usize>,
+    weight: Table<K, usize>,
     /// RPython `self.root_info` (unionfind.py:11).
     /// Upstream dictionary deletion in `union` is O(1); ordering is derived
     /// from `link_to_parent`, so hash storage preserves both properties.
-    root_info: HashMap<K, V>,
+    root_info: Table<K, V>,
     /// RPython `self.info_factory` (unionfind.py:10). See module doc
     /// for why the Rust port makes this mandatory.
     info_factory: Box<dyn Fn(&K) -> V>,
@@ -84,9 +94,9 @@ where
         F: Fn(&K) -> V + 'static,
     {
         UnionFind {
-            link_to_parent: IndexMap::new(),
-            weight: HashMap::new(),
-            root_info: HashMap::new(),
+            link_to_parent: IndexMap::default(),
+            weight: Table::default(),
+            root_info: Table::default(),
             info_factory: Box::new(info_factory),
         }
     }

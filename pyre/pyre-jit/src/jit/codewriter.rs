@@ -2220,15 +2220,15 @@ fn emit_loop_header(
     );
     let mut empty_regallocs = [
         super::regalloc::GraphAllocationResult {
-            coloring: std::collections::HashMap::new(),
+            coloring: crate::jit::regalloc::Coloring::default(),
             num_colors: 0,
         },
         super::regalloc::GraphAllocationResult {
-            coloring: std::collections::HashMap::new(),
+            coloring: crate::jit::regalloc::Coloring::default(),
             num_colors: 0,
         },
         super::regalloc::GraphAllocationResult {
-            coloring: std::collections::HashMap::new(),
+            coloring: crate::jit::regalloc::Coloring::default(),
             num_colors: 0,
         },
     ];
@@ -5504,8 +5504,8 @@ fn resolve_const_ref_slot(c: &super::flow::Constant) -> Option<i64> {
 fn build_pcdep_color_slots(
     pcdep_slot_var: &[Vec<(u16, u32)>],
     pcdep_slot_var_resume: &[Vec<(u16, u32)>],
-    colorings: [&std::collections::HashMap<super::flow::VariableId, u16>; 3],
-    live_oracles: [&std::collections::HashMap<super::flow::VariableId, u16>; 3],
+    colorings: [&crate::jit::regalloc::Coloring; 3],
+    live_oracles: [&crate::jit::regalloc::Coloring; 3],
     rename: &[Vec<u16>; 3],
     code: &CodeObject,
     depth_at_pc: &[u16],
@@ -5577,8 +5577,8 @@ fn frame_layout_slot(slot: u16, nlocals: usize, stack_base: usize) -> u16 {
 
 fn validate_pcdep_color_map(
     pcdep_slot_var: &[Vec<(u16, u32)>],
-    colorings: [&std::collections::HashMap<super::flow::VariableId, u16>; 3],
-    live_oracles: [&std::collections::HashMap<super::flow::VariableId, u16>; 3],
+    colorings: [&crate::jit::regalloc::Coloring; 3],
+    live_oracles: [&crate::jit::regalloc::Coloring; 3],
     rename: &[Vec<u16>; 3],
     code: &CodeObject,
     depth_at_pc: &[u16],
@@ -8677,13 +8677,13 @@ impl CodeWriter {
                             // outside the canonical graph regalloc pass,
                             // so no `regallocs[]` entry exists for them
                             // — this site assembles one ad hoc.
-                            let mut portal_ref_coloring = std::collections::HashMap::new();
+                            let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
                             portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
                             portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
                             portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
                             let mut portal_regallocs = [
                                 super::regalloc::GraphAllocationResult {
-                                    coloring: std::collections::HashMap::new(),
+                                    coloring: crate::jit::regalloc::Coloring::default(),
                                     num_colors: 0,
                                 },
                                 super::regalloc::GraphAllocationResult {
@@ -8691,7 +8691,7 @@ impl CodeWriter {
                                     num_colors: 3,
                                 },
                                 super::regalloc::GraphAllocationResult {
-                                    coloring: std::collections::HashMap::new(),
+                                    coloring: crate::jit::regalloc::Coloring::default(),
                                     num_colors: 0,
                                 },
                             ];

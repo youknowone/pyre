@@ -1601,8 +1601,7 @@ mod tests {
         graph: &FunctionGraph,
         max_id: usize,
     ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocator> {
-        let mut coloring: std::collections::HashMap<crate::flowspace::model::Variable, usize> =
-            std::collections::HashMap::new();
+        let mut coloring = crate::regalloc::Coloring::default();
         for var in graph.iter_variables() {
             let color = coloring.len();
             coloring.entry(var).or_insert(color);
@@ -2596,7 +2595,7 @@ mod tests {
             .collect();
         let mut regallocs = HashMap::new();
         for (kind, pairs) in kind_colors {
-            let mut coloring: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
+            let mut coloring = crate::regalloc::Coloring::default();
             let mut max_color = 0usize;
             for (vid, color) in *pairs {
                 coloring.insert(vars[*vid].clone(), *color);

@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 # iteration is insertion-ordered.  IndexMap preserves that semantic while
 # `HashMap` does not.
 indexmap = { workspace = true }
+rustc-hash = { workspace = true }
 majit-ir = { workspace = true }
 libc = { workspace = true }
 # PRE-EXISTING-ADAPTATION, parity rule #1.

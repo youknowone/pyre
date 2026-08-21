@@ -2070,6 +2070,7 @@ dependencies = [
  "md-5",
  "proc-macro2",
  "quote",
+ "rustc-hash",
  "rustpython-compiler",
  "rustpython-compiler-core",
  "rustpython-wtf8",
@@ -2766,6 +2767,7 @@ dependencies = [
  "pyre-interpreter",
  "pyre-jit-trace",
  "pyre-object",
+ "rustc-hash",
  "rustpython-wtf8",
  "vecset",
 ]

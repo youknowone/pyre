@@ -5912,21 +5912,21 @@ mod tests {
         regallocs.insert(
             RegKind::Int,
             regalloc::RegAllocator {
-                coloring: HashMap::new(),
+                coloring: regalloc::Coloring::default(),
                 num_regs: 0,
             },
         );
         regallocs.insert(
             RegKind::Ref,
             regalloc::RegAllocator {
-                coloring: HashMap::new(),
+                coloring: regalloc::Coloring::default(),
                 num_regs: 0,
             },
         );
         regallocs.insert(
             RegKind::Float,
             regalloc::RegAllocator {
-                coloring: HashMap::new(),
+                coloring: regalloc::Coloring::default(),
                 num_regs: 0,
             },
         );

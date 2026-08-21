@@ -33,7 +33,23 @@
 //! `majit_translate::regalloc::DependencyGraph::find_node_coloring`
 //! (line-by-line port of `rpython/tool/algo/color.py:31-85`).
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+/// `VariableId` is a `u32` newtype, and `make_dependencies` probes these tables
+/// once per operand of every operation in every block.  Upstream keys the same
+/// dictionaries on `Variable` objects hashed by identity, so its probe is a
+/// pointer read; `std`'s default `RandomState` runs SipHash-1-3 over the four
+/// bytes instead, which is the dominant cost of allocating registers for a
+/// jitcode.  These ids never leave the codewriter, so nothing needs the
+/// collision resistance.  No iteration here is order-sensitive: `die_at` is
+/// sorted by die time before use, and `coloring` is only point-read and
+/// value-rewritten.
+type HashMap<K, V> = FxHashMap<K, V>;
+type HashSet<T> = FxHashSet<T>;
+
+/// The coloring a [`GraphAllocationResult`] carries, nameable by the
+/// codewriter passes that build one directly or take one by reference.
+pub type Coloring = FxHashMap<super::flow::VariableId, u16>;
 
 use majit_translate::regalloc::DependencyGraph;
 use majit_translate::tool::algo::unionfind::UnionFind;
@@ -43,7 +59,7 @@ use super::flow::{ExitSwitch, ExitSwitchElement, FlowValue, FunctionGraph as Flo
 
 #[derive(Debug, Clone)]
 pub struct GraphAllocationResult {
-    pub coloring: HashMap<super::flow::VariableId, u16>,
+    pub coloring: Coloring,
     pub num_colors: u16,
 }
 
@@ -101,7 +117,7 @@ impl<'a> RegAllocator<'a> {
             kind,
             _depgraph: DependencyGraph::new(),
             _unionfind: UnionFind::new(|_| ()),
-            _coloring: HashMap::new(),
+            _coloring: HashMap::default(),
         }
     }
 
@@ -109,7 +125,7 @@ impl<'a> RegAllocator<'a> {
         let kind = self.kind;
         for block in self.graph.iterblocks() {
             let block_borrow = block.borrow();
-            let mut die_at: HashMap<super::flow::VariableId, usize> = HashMap::new();
+            let mut die_at: HashMap<super::flow::VariableId, usize> = HashMap::default();
             for arg in &block_borrow.inputargs {
                 if let Some(v) = arg.as_variable() {
                     if v.kind == Some(kind) {
@@ -449,7 +465,7 @@ pub fn perform_register_allocation_with_pairs(
     }
     allocator.find_node_coloring();
 
-    let mut coloring = HashMap::new();
+    let mut coloring = HashMap::default();
     for block in graph.iterblocks() {
         let block_borrow = block.borrow();
         for variable in block_borrow.getvariables() {

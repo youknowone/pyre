@@ -2895,9 +2895,9 @@ pub fn identity_test_regallocs(
     graph: &super::flow::FunctionGraph,
 ) -> [super::regalloc::GraphAllocationResult; 3] {
     use std::collections::HashMap;
-    let mut int_coloring: HashMap<super::flow::VariableId, u16> = HashMap::new();
-    let mut ref_coloring: HashMap<super::flow::VariableId, u16> = HashMap::new();
-    let mut float_coloring: HashMap<super::flow::VariableId, u16> = HashMap::new();
+    let mut int_coloring = crate::jit::regalloc::Coloring::default();
+    let mut ref_coloring = crate::jit::regalloc::Coloring::default();
+    let mut float_coloring = crate::jit::regalloc::Coloring::default();
     let mut record = |v: Variable| {
         let kind = v.kind.unwrap_or(Kind::Ref);
         let map = match kind {
@@ -2963,7 +2963,7 @@ pub fn identity_test_regallocs(
             }
         }
     }
-    let max_color = |map: &HashMap<super::flow::VariableId, u16>| {
+    let max_color = |map: &crate::jit::regalloc::Coloring| {
         map.values().copied().max().map(|m| m + 1).unwrap_or(0)
     };
     [
@@ -7880,12 +7880,12 @@ mod tests {
             3,
         );
         let mut ssarepr = SSARepr::new("test");
-        let mut ref_coloring = std::collections::HashMap::new();
+        let mut ref_coloring = crate::jit::regalloc::Coloring::default();
         ref_coloring.insert(frame.id, 10u16);
         ref_coloring.insert(ec.id, 11u16);
         let mut regallocs = [
             super::super::regalloc::GraphAllocationResult {
-                coloring: std::collections::HashMap::new(),
+                coloring: crate::jit::regalloc::Coloring::default(),
                 num_colors: 0,
             },
             super::super::regalloc::GraphAllocationResult {
@@ -7893,7 +7893,7 @@ mod tests {
                 num_colors: 2,
             },
             super::super::regalloc::GraphAllocationResult {
-                coloring: std::collections::HashMap::new(),
+                coloring: crate::jit::regalloc::Coloring::default(),
                 num_colors: 0,
             },
         ];
@@ -8443,12 +8443,12 @@ mod tests {
         let dst = Variable::new(VariableId(1), Kind::Ref);
         let op = SpaceOperation::new("type", vec![src.into()], Some(dst.into()), 23);
         let mut ssarepr = SSARepr::new("generic");
-        let mut ref_coloring = std::collections::HashMap::new();
+        let mut ref_coloring = crate::jit::regalloc::Coloring::default();
         ref_coloring.insert(src.id, 0u16);
         ref_coloring.insert(dst.id, 1u16);
         let mut regallocs = [
             super::super::regalloc::GraphAllocationResult {
-                coloring: std::collections::HashMap::new(),
+                coloring: crate::jit::regalloc::Coloring::default(),
                 num_colors: 0,
             },
             super::super::regalloc::GraphAllocationResult {
@@ -8456,7 +8456,7 @@ mod tests {
                 num_colors: 2,
             },
             super::super::regalloc::GraphAllocationResult {
-                coloring: std::collections::HashMap::new(),
+                coloring: crate::jit::regalloc::Coloring::default(),
                 num_colors: 0,
             },
         ];
@@ -8506,13 +8506,13 @@ mod tests {
             )
         };
         let make_regallocs = || {
-            let mut ref_coloring = std::collections::HashMap::new();
+            let mut ref_coloring = crate::jit::regalloc::Coloring::default();
             ref_coloring.insert(obj.id, 0u16);
             ref_coloring.insert(attr.id, 1u16);
             ref_coloring.insert(val.id, 2u16);
             [
                 super::super::regalloc::GraphAllocationResult {
-                    coloring: std::collections::HashMap::new(),
+                    coloring: crate::jit::regalloc::Coloring::default(),
                     num_colors: 0,
                 },
                 super::super::regalloc::GraphAllocationResult {
@@ -8520,7 +8520,7 @@ mod tests {
                     num_colors: 3,
                 },
                 super::super::regalloc::GraphAllocationResult {
-                    coloring: std::collections::HashMap::new(),
+                    coloring: crate::jit::regalloc::Coloring::default(),
                     num_colors: 0,
                 },
             ]
@@ -8592,11 +8592,11 @@ mod tests {
         ]);
 
         // Ref bank: `already` colored 0 (1 color); `leaked` uncolored.
-        let mut ref_coloring = std::collections::HashMap::new();
+        let mut ref_coloring = crate::jit::regalloc::Coloring::default();
         ref_coloring.insert(already.id, 0u16);
         let mut regallocs = [
             super::super::regalloc::GraphAllocationResult {
-                coloring: std::collections::HashMap::new(),
+                coloring: crate::jit::regalloc::Coloring::default(),
                 num_colors: 0,
             },
             super::super::regalloc::GraphAllocationResult {
@@ -8604,7 +8604,7 @@ mod tests {
                 num_colors: 1,
             },
             super::super::regalloc::GraphAllocationResult {
-                coloring: std::collections::HashMap::new(),
+                coloring: crate::jit::regalloc::Coloring::default(),
                 num_colors: 0,
             },
         ];
@@ -9260,15 +9260,15 @@ mod tests {
     fn empty_regallocs() -> [super::super::regalloc::GraphAllocationResult; 3] {
         [
             super::super::regalloc::GraphAllocationResult {
-                coloring: std::collections::HashMap::new(),
+                coloring: crate::jit::regalloc::Coloring::default(),
                 num_colors: 0,
             },
             super::super::regalloc::GraphAllocationResult {
-                coloring: std::collections::HashMap::new(),
+                coloring: crate::jit::regalloc::Coloring::default(),
                 num_colors: 0,
             },
             super::super::regalloc::GraphAllocationResult {
-                coloring: std::collections::HashMap::new(),
+                coloring: crate::jit::regalloc::Coloring::default(),
                 num_colors: 0,
             },
         ]
