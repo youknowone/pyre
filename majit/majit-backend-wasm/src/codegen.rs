@@ -2728,20 +2728,6 @@ pub fn build_wasm_module(
         return Err(BackendError::Unsupported(reason));
     }
 
-    // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`): `bridge_finish_fi` is
-    // THIS bridge's own DoneWithThisFrame index (the recursive return), which the
-    // CA arm accepts as a clean callee finish alongside the source loop's
-    // base-case finish. Widen the callee-frame reservation to also fit this
-    // bridge's frame: the source loop's guard-exit chains into this bridge
-    // reusing the same arena frame, so an undersized frame would let the bridge's
-    // home-slot writes overflow into the next arena slot.
-    let bridge_finish_fi = guards
-        .iter()
-        .find(|g| {
-            g.is_finish && !crate::failguard::meta_descr_is_exit_frame_with_exception(&g.meta_descr)
-        })
-        .map(|g| g.fail_index)
-        .unwrap_or(crate::failguard::WASM_CA_FINISH_FI_UNKNOWN);
     // CA frames execute the source loop and this bridge on the same frozen
     // geometry.  `compile_bridge` rejects a bridge that needs more slots, so
     // no global floor or speculative slack is needed here.
@@ -3016,7 +3002,6 @@ pub fn build_wasm_module(
         &float_residual_type_indices,
         true_void_residual_max_arity.map(|_| true_void_residual_type_base),
         ca.clone(),
-        bridge_finish_fi,
         ca_helper_type_idx,
         *trace_entry_census,
     )?;
@@ -3076,9 +3061,6 @@ fn build_function(
     // Self-recursive CALL_ASSEMBLER arm (`PYRE_WASM_CA`). `ca.emit_ca` off keeps
     // the body byte-identical.
     ca: CaParams,
-    // This bridge's own DoneWithThisFrame Finish index (the recursive return);
-    // the CA arm accepts it or `ca.loop_finish_fi` as a clean callee finish.
-    bridge_finish_fi: u32,
     // wasm type index of the CA deopt helper `(i64, i64) -> i64`, declared in the
     // module type section when `ca.emit_ca`. The CA arm uses it to `call_indirect`
     // `ca.deopt_helper_slot` for a deopted callee.
@@ -5194,15 +5176,34 @@ fn build_function(
                 sink.i64_load(mem64(0));
                 sink.i32_wrap_i64();
                 sink.local_set(ca_fi_local);
-                // is_finish = (fi == loop_finish_fi) | (fi == bridge_finish_fi)
+                // A clean finish is any exit the global table flags as a
+                // DoneWithThisFrame that is not an ExitFrameWithException —
+                // `fi < len && flags[fi] != 0`, with the out-of-range arm
+                // falling through to the host rather than reading a stray byte.
+                // Naming the two indices this build happens to know would send
+                // every other finish of the same chain to `wasm_ca_resume_deopt`
+                // to be decoded and handed straight back.
+                let clean_finish_table = crate::failguard::clean_finish_table_addr() as i32;
                 sink.local_get(ca_fi_local);
-                sink.i32_const(dispatch_entry);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_LOOP_FINISH_FI_OFS));
-                sink.i32_eq();
+                sink.i32_const(clean_finish_table);
+                sink.i32_load(mem32(crate::failguard::WASM_CLEAN_FINISH_LEN_OFS));
+                sink.i32_lt_u();
+                sink.if_(BlockType::Result(ValType::I32));
+                sink.i32_const(clean_finish_table);
+                sink.i32_load(mem32(crate::failguard::WASM_CLEAN_FINISH_BASE_OFS));
                 sink.local_get(ca_fi_local);
-                sink.i32_const(bridge_finish_fi as i32);
-                sink.i32_eq();
-                sink.i32_or();
+                sink.i32_add();
+                sink.i32_load8_u(memarg(0, 0));
+                sink.else_();
+                sink.i32_const(0);
+                sink.end();
+                // The host arm takes the exception cell on every return; a
+                // short-circuit leaves it set, so a finish that somehow carries
+                // a pending exception must still go there.
+                sink.i32_const(crate::jit_exc_value_addr() as i32);
+                sink.i64_load(mem64(0));
+                sink.i64_eqz();
+                sink.i32_and();
                 sink.if_(BlockType::Result(ValType::I64));
                 // clean finish: result Ref = F'[1] (output slot 0).
                 sink.local_get(ca_cfp_local);

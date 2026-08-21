@@ -154,6 +154,7 @@ mod tests {
     use majit_ir::GcRef;
 
     use super::{Type, WasmFailDescr, WasmFrameData};
+    use super::{fail_descr_base, fail_index_is_clean_finish, register_fail_descrs};
 
     struct RootCountingGc(Arc<AtomicUsize>);
 
@@ -238,6 +239,38 @@ mod tests {
             is_finish: false,
             meta_descr: None,
         })
+    }
+
+    #[test]
+    fn clean_finish_flags_stay_indexed_by_fail_index() {
+        // The emitted CALL_ASSEMBLER arm indexes the flags with the same
+        // `fail_index` that indexes `FAIL_DESCR_REGISTRY`, so a registration
+        // that grew one and not the other would answer for the wrong exit.
+        let base = fail_descr_base();
+        // The third entry is the one a two-index whitelist used to miss.
+        let is_finish = [true, false, true];
+        let descrs: Vec<Arc<WasmFailDescr>> = is_finish
+            .iter()
+            .enumerate()
+            .map(|(i, &is_finish)| {
+                Arc::new(WasmFailDescr {
+                    fail_index: base + i as u32,
+                    trace_id: 0,
+                    fail_arg_types: vec![Type::Ref],
+                    is_finish,
+                    meta_descr: None,
+                })
+            })
+            .collect();
+        register_fail_descrs(&descrs);
+        for (i, &expected) in is_finish.iter().enumerate() {
+            assert_eq!(
+                fail_index_is_clean_finish(base + i as u32),
+                expected,
+                "flag {i} disagrees with its descr"
+            );
+        }
+        assert!(!fail_index_is_clean_finish(base + is_finish.len() as u32));
     }
 
     #[test]
@@ -339,6 +372,50 @@ pub const WASM_CA_DISPATCH_FUNC_HANDLE_OFS: u64 = 0;
 pub const WASM_CA_DISPATCH_LOOP_FINISH_FI_OFS: u64 = 4;
 pub const WASM_CA_DISPATCH_COMPILED_PTR_OFS: u64 = 8;
 pub const WASM_CA_FINISH_FI_UNKNOWN: u32 = u32::MAX;
+
+/// Header of the byte-per-`fail_index` clean-finish table the CALL_ASSEMBLER
+/// return arm reads. Boxed for the same reason as `WASM_CA_DISPATCH`: emitted
+/// modules bake the header address, and `base` moves whenever the table grows.
+#[repr(C)]
+pub struct WasmCleanFinishTable {
+    /// Address of the flag bytes, or 0 before the first registration.
+    pub base: AtomicU32,
+    /// Flags behind `base`, one per registered `fail_index`.
+    pub len: AtomicU32,
+}
+
+pub const WASM_CLEAN_FINISH_BASE_OFS: u64 = 0;
+pub const WASM_CLEAN_FINISH_LEN_OFS: u64 = 4;
+
+static CLEAN_FINISH_FLAGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+static CLEAN_FINISH_HEADER: std::sync::OnceLock<Box<WasmCleanFinishTable>> =
+    std::sync::OnceLock::new();
+
+fn clean_finish_header() -> &'static WasmCleanFinishTable {
+    CLEAN_FINISH_HEADER.get_or_init(|| {
+        Box::new(WasmCleanFinishTable {
+            base: AtomicU32::new(0),
+            len: AtomicU32::new(0),
+        })
+    })
+}
+
+/// Guest address of the clean-finish header, stable for the process. A trace
+/// emitted before any descr is registered reads `len == 0`, so every exit
+/// takes the host deopt path until the first registration publishes the table.
+pub fn clean_finish_table_addr() -> u32 {
+    clean_finish_header() as *const WasmCleanFinishTable as usize as u32
+}
+
+/// Whether `fail_index` names a clean DoneWithThisFrame exit — the predicate
+/// the CALL_ASSEMBLER arm short-circuits on.
+pub fn fail_index_is_clean_finish(fail_index: u32) -> bool {
+    CLEAN_FINISH_FLAGS
+        .lock()
+        .unwrap()
+        .get(fail_index as usize)
+        .is_some_and(|flag| *flag != 0)
+}
 
 /// Stable, guest-memory dispatch entries, keyed by CALL_ASSEMBLER token.
 /// `Box` is intentional: an emitted module bakes the entry address.
@@ -506,6 +583,10 @@ pub fn fail_descr_base() -> u32 {
 pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
     let mut reg = FAIL_DESCR_REGISTRY.lock().unwrap();
     let vec = reg.get_or_insert_with(Default::default);
+    // Grown in the same loop as the registry so the two cannot drift: the
+    // emitted CALL_ASSEMBLER arm indexes the flags by the `fail_index` that
+    // indexes this vector.
+    let mut flags = CLEAN_FINISH_FLAGS.lock().unwrap();
     for d in descrs {
         debug_assert_eq!(
             d.fail_index as usize,
@@ -513,7 +594,15 @@ pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
             "fail descr registered out of lockstep with its global fail_index"
         );
         vec.push(Arc::clone(d));
+        flags.push(u8::from(
+            d.is_finish && !meta_descr_is_exit_frame_with_exception(&d.meta_descr),
+        ));
     }
+    let header = clean_finish_header();
+    header
+        .base
+        .store(flags.as_ptr() as usize as u32, Ordering::Release);
+    header.len.store(flags.len() as u32, Ordering::Release);
 }
 
 /// Resolve a `frame[0]` value through the global fail-index space.
