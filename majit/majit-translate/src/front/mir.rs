@@ -979,6 +979,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             static_addrs,
             &struct_field_attrs,
             &dont_look_inside,
+            /* builder_mode = */ false,
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -1014,6 +1015,31 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         } else {
             graph.with_source_identity(fn_path.clone())
         };
+        // Builder variant: the same body re-lowered with `StringBuilder`
+        // markers, decorated with the identical owner-root / source-identity
+        // so it shares the concat graph's `GraphStore` key.  A lowering error
+        // (or no accumulator) degrades to `None` — the concat graph stays the
+        // source of truth; the variant is only ever swapped in for a graph the
+        // two-phase prepass proves lifts.
+        let builder_variant = lower_fun_decl_builder_variant_from_body(
+            llbc,
+            fd,
+            &body,
+            static_addrs,
+            &struct_field_attrs,
+            &dont_look_inside,
+        )
+        .ok()
+        .flatten()
+        .map(|variant| {
+            if let Some(owner) = &self_ty_root {
+                variant
+                    .with_owner_root(owner.clone())
+                    .with_source_identity(format!("{module_path}::{owner}::{name}"))
+            } else {
+                variant.with_source_identity(fn_path.clone())
+            }
+        });
         // Surface trait identity for trait-impl methods so the
         // canonical registration loop can call `register_trait_method`
         // instead of routing through `extract_trait_impls`.  Inherent
@@ -1067,6 +1093,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             trait_root,
             trait_qualified,
             returns_objectptr,
+            builder_variant,
         });
     }
     register_synthetic_positional_metadata(
@@ -2164,7 +2191,79 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
         static_addrs,
         struct_field_attrs,
         &dont_look_inside,
+        /* builder_mode = */ false,
     )
+}
+
+/// Lower `fd` in **builder form** for the two-pass lift gate (design B):
+/// if its body has a builder-mode string accumulator
+/// ([`graph_has_builder_accumulator`]), re-lower it with the
+/// `StringBuilder` markers ([`Lowering::enable_builder_mode`]) and return
+/// `Some(graph)`; otherwise `Ok(None)` so the caller keeps only the concat
+/// graph.  The whole-program pass produces the concat graph; the
+/// `make_jitcodes` driver swaps this builder variant into a graph the
+/// concat-form prepass already proved *lifts*, so the markers only ever
+/// reach the flowspace-adapter (Match) path — never the legacy walker.
+#[allow(dead_code)] // standalone/test entry; the whole-program loop calls the `_from_body` form
+pub(crate) fn lower_fun_decl_builder_variant(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Result<Option<FunctionGraph>, LowerError> {
+    let u = fd.unstructured().ok_or_else(|| {
+        LowerError::Unsupported(format!(
+            "{}: no Unstructured body (extracted with --ullbc?)",
+            fd.item_meta.name_path()
+        ))
+    })?;
+    let dont_look_inside = dont_look_inside_set_of(llbc);
+    lower_fun_decl_builder_variant_from_body(
+        llbc,
+        fd,
+        &u,
+        static_addrs,
+        struct_field_attrs,
+        &dont_look_inside,
+    )
+}
+
+/// Builder-variant lowering from an already-projected body + residual set —
+/// the whole-program-loop form that avoids re-parsing `FunDecl::body` and
+/// re-harvesting `dont_look_inside` (both already in hand at the call site).
+/// Returns `Ok(None)` when the body has no builder-mode accumulator, so the
+/// caller keeps only the concat graph.
+fn lower_fun_decl_builder_variant_from_body(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    u: &Unstructured,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    dont_look_inside: &std::collections::HashSet<String>,
+) -> Result<Option<FunctionGraph>, LowerError> {
+    if !graph_has_builder_accumulator(llbc, u) {
+        return Ok(None);
+    }
+    lower_unstructured_with_static_addrs_and_attrs(
+        llbc,
+        fd,
+        u,
+        static_addrs,
+        struct_field_attrs,
+        dont_look_inside,
+        /* builder_mode = */ true,
+    )
+    .map(Some)
+}
+
+/// Whether `u` (the body of `fd`) contains at least one builder-mode string
+/// accumulator ([`is_builder_mode_accumulator`]) — the cheap pre-check that
+/// decides whether a builder variant is worth lowering at all.
+#[allow(dead_code)] // reached once the whole-program loop calls lower_fun_decl_builder_variant
+fn graph_has_builder_accumulator(llbc: &Llbc, u: &Unstructured) -> bool {
+    let n_locals = u.locals.locals.len();
+    let arg_count = u.locals.arg_count as usize;
+    (arg_count + 1..n_locals).any(|c| is_builder_mode_accumulator(u, llbc, c))
 }
 
 /// Lower `fd` from an already-projected `Unstructured` body.
@@ -2181,6 +2280,13 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     static_addrs: crate::HostStaticAddrs<'_>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     dont_look_inside: &std::collections::HashSet<String>,
+    // When set, each strategy's `Lowering` is switched to builder form
+    // ([`Lowering::enable_builder_mode`]) so a lifted string-accumulator
+    // emits the `StringBuilder` markers instead of `ll_strconcat`.  The
+    // default whole-program pass and the public entry pass `false`; only
+    // [`lower_fun_decl_builder_variant`] passes `true`, after proving the
+    // body has an accumulator.
+    builder_mode: bool,
 ) -> Result<FunctionGraph, LowerError> {
     let name = fd.item_meta.name_path();
     // The Result-of-PyError exception-link lowering's callee rule
@@ -2606,6 +2712,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             fd.generics.as_ref(),
             dont_look_inside,
         )?;
+        if builder_mode {
+            lo.enable_builder_mode();
+        }
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -2645,6 +2754,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         fd.generics.as_ref(),
         dont_look_inside,
     )?;
+    if builder_mode {
+        lo.enable_builder_mode();
+    }
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -2670,6 +2782,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 fd.generics.as_ref(),
                 dont_look_inside,
             )?;
+            if builder_mode {
+                lo.enable_builder_mode();
+            }
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
             Ok(lo.graph)
@@ -2975,6 +3090,17 @@ struct Lowering<'a> {
     /// Distinguishes the collapse case from a genuine Ref tuple `.N` read
     /// in [`Lowering::resolve_place`].
     binop_result_locals: std::collections::HashSet<usize>,
+    /// MIR locals a builder-form re-lowering has proven to be builder-mode
+    /// accumulators ([`is_builder_mode_accumulator`]): a single-def
+    /// `Wtf8Buf`/`String` `new`/`with_capacity` ctor, every borrow an
+    /// append, exactly one terminal `move`.  Empty in the default concat
+    /// lowering (so every builder-emit site below is inert); populated by
+    /// [`Lowering::enable_builder_mode`] only when re-lowering a *lifted*
+    /// graph, where the ctor / append / terminal-`move` sites emit the
+    /// `__pyre_stringbuilder_{new,append,build}` markers
+    /// (`flowspace_adapter` → `newstringbuilder` / `append` / `build`)
+    /// instead of the `ll_strconcat` fallback.
+    builder_mode_locals: std::collections::HashSet<usize>,
     /// MIR locals bound by a devirtualized workspace `Index::index` /
     /// `IndexMut::index_mut` call, mapped to the `(base, index)`
     /// operand pair.  Those impls bottom out at raw-slice
@@ -3300,6 +3426,7 @@ impl<'a> Lowering<'a> {
             ],
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(body),
+            builder_mode_locals: std::collections::HashSet::new(),
             index_elem_alias: std::collections::HashMap::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
@@ -3326,6 +3453,28 @@ impl<'a> Lowering<'a> {
             closure_select_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),
         })
+    }
+
+    /// Switch this lowering to builder form: record every builder-mode
+    /// accumulator local ([`is_builder_mode_accumulator`]) so the ctor /
+    /// append / terminal-`move` sites emit the `StringBuilder` markers
+    /// instead of `ll_strconcat`.  The two-pass driver calls this only for
+    /// a graph the concat-form prepass already proved lifts, so the markers
+    /// only ever reach the flowspace-adapter (Match) path, never the legacy
+    /// walker (Skip) — where an unknown marker would residualise and crash.
+    /// Returns whether any accumulator was found (a graph with none needs no
+    /// builder variant).
+    #[allow(dead_code)] // wired by the make_jitcodes driver (#56)
+    fn enable_builder_mode(&mut self) -> bool {
+        let n_locals = self.body.locals.locals.len();
+        // Locals 0 (return) and 1..=arg_count (parameters) are never fresh
+        // owned accumulators (see [`append_accumulator_of_arg_temp`]).
+        for c in self.arg_count + 1..n_locals {
+            if is_builder_mode_accumulator(self.body, self.llbc, c) {
+                self.builder_mode_locals.insert(c);
+            }
+        }
+        !self.builder_mode_locals.is_empty()
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
@@ -5297,9 +5446,55 @@ impl<'a> Lowering<'a> {
     /// Resolve an [`Operand`] to the Variable the IR should reference.
     fn resolve_operand(&mut self, mir_bb: usize, op: Operand) -> Result<Variable, LowerError> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => self.resolve_place(mir_bb, place),
+            Operand::Copy(place) => self.resolve_place(mir_bb, place),
+            Operand::Move(place) => {
+                // A `move c` of a builder-mode accumulator is its single
+                // `ll_build` materialisation point (`accumulator_move_site_count
+                // == 1`).  Emit the `__pyre_stringbuilder_build` marker
+                // (`flowspace_adapter` → getattr("build") + simple_call →
+                // `SomeString`) instead of moving the concat accumulator out.
+                // Only a bare `Local(c)` move qualifies; a projection falls
+                // through.  Inert unless `builder_mode_locals` was populated.
+                if let PlaceKind::Local(i) = place.kind
+                    && self.builder_mode_locals.contains(&(i as usize))
+                {
+                    return self.resolve_builder_build(mir_bb, i as usize);
+                }
+                self.resolve_place(mir_bb, place)
+            }
             Operand::Const(value) => self.emit_constant(mir_bb, &value),
         }
+    }
+
+    /// Emit the `__pyre_stringbuilder_build(c)` marker for the terminal
+    /// `move c` of a builder-mode accumulator, returning the built
+    /// `SomeString` Variable.  The builder Ref was minted at the ctor and
+    /// mutated in place by the appends, so it is read (not rebound) here.
+    fn resolve_builder_build(
+        &mut self,
+        mir_bb: usize,
+        c: usize,
+    ) -> Result<Variable, LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let builder = self.local_var[c].clone().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "builder-mode accumulator local {c} unbound at its build site"
+            ))
+        })?;
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__pyre_stringbuilder_build".to_string()],
+                },
+                args: vec![builder],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        Ok(result)
     }
 
     /// The [`ValueType`] of a `Copy` / `Move` operand, read from the
@@ -7698,6 +7893,35 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Builder-mode ctor.  When re-lowering in builder form, the
+                // single `Wtf8Buf`/`String` `new`/`with_capacity` def of a
+                // builder-mode accumulator (its dest local, proven single-def
+                // by that ctor in [`is_fresh_str_builder`]) mints the
+                // `StringBuilder` once via the `__pyre_stringbuilder_new`
+                // marker instead of the concat empty string; later appends
+                // mutate it in place.  Placed before the method-specific arms
+                // so it preempts any generic ctor lowering.  Inert unless
+                // `builder_mode_locals` was populated ([`enable_builder_mode`]).
+                if self.builder_mode_locals.contains(&dest_local) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__pyre_stringbuilder_new".to_string()],
+                            },
+                            args: vec![],
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `Wtf8Buf` / `String`::push_str(&mut buf, s) / push_wtf8(&mut
                 // buf, w) — and the argument-swapped `Wtf8Piece::push_onto(&s,
                 // &mut buf)` — an accumulator append.  A `Wtf8Buf` / `String`
@@ -7735,8 +7959,30 @@ impl<'a> Lowering<'a> {
                     let acc_val = self.local_var[buf_local]
                         .clone()
                         .unwrap_or_else(|| args[acc_i].clone());
-                    let concat = emit_str_add(&mut self.graph, bb_id, &acc_val, &args[piece_i]);
-                    self.local_var[buf_local] = Some(concat);
+                    if self.builder_mode_locals.contains(&buf_local) {
+                        // Builder form: `b.append(piece)` mutates the buffer in
+                        // place and returns `()`, so — unlike the concat rebind
+                        // below — the accumulator binding is unchanged.  Emit the
+                        // void `__pyre_stringbuilder_append` marker
+                        // (`flowspace_adapter` → getattr("append") + simple_call).
+                        let void = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(void),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["__pyre_stringbuilder_append".to_string()],
+                                },
+                                args: vec![acc_val, args[piece_i].clone()],
+                                result_ty: ValueType::Void,
+                            },
+                        });
+                    } else {
+                        let concat =
+                            emit_str_add(&mut self.graph, bb_id, &acc_val, &args[piece_i]);
+                        self.local_var[buf_local] = Some(concat);
+                    }
                     self.local_var[dest_local] = Some(
                         self.graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Void),
@@ -14587,6 +14833,74 @@ fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -
     })
 }
 
+/// Count the by-value consumptions (`move c`) of a fresh accumulator local
+/// `c`.  [`clean_accumulator_ref_temps`] already proves every other use of `c`
+/// is the ctor def or an append borrow, so each `move c` is a terminal
+/// materialisation of the finished string — the point where a real builder
+/// must run `ll_build`.  Counted so the builder lift only fires when the build
+/// point is unambiguous (see [`is_builder_mode_accumulator`]).
+#[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
+fn accumulator_move_site_count(body: &Unstructured, c: usize) -> usize {
+    let is_move = |op: &Operand| c_operand_kind(op, c) == Some(true);
+    let mut moves = 0usize;
+    for bb in &body.body {
+        for st in &bb.statements {
+            if let Ok(StmtKind::Assign(_, rvalue)) = st.stmt_kind() {
+                match &rvalue {
+                    Rvalue::Use(op)
+                    | Rvalue::UnaryOp(_, op)
+                    | Rvalue::Cast(_, op, _)
+                    | Rvalue::Repeat(op, _, _)
+                    | Rvalue::ShallowInitBox(op, _) => {
+                        if is_move(op) {
+                            moves += 1;
+                        }
+                    }
+                    Rvalue::BinaryOp(_, l, r) => {
+                        moves += usize::from(is_move(l)) + usize::from(is_move(r));
+                    }
+                    Rvalue::Aggregate(_, ops) => {
+                        for op in ops {
+                            if is_move(op) {
+                                moves += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term() {
+            for a in &call.args {
+                if is_move(a) {
+                    moves += 1;
+                }
+            }
+        }
+    }
+    moves
+}
+
+/// Whether fresh accumulator local `c` should lift to a real RPython
+/// `StringBuilder` (approach D) rather than the functional-concat fallback:
+///
+/// * a single-def `Wtf8Buf` / `String` `new` / `with_capacity` ctor
+///   ([`is_fresh_str_builder`]),
+/// * every borrow of `c` an append ([`clean_accumulator_ref_temps`]), and
+/// * exactly one by-value terminal consumption ([`accumulator_move_site_count`])
+///   — the single `ll_build` materialisation point.
+///
+/// Zero or several terminal moves keep the `ll_strconcat` fallback so the
+/// builder rewrite only fires where the ctor, the appends, and the one build
+/// point are all unambiguous.  Resolved on demand from `body`, so the
+/// recognizer keeps no per-local side table.
+#[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
+fn is_builder_mode_accumulator(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
+    is_fresh_str_builder(body, llbc, c)
+        && clean_accumulator_ref_temps(body, llbc, c).is_some()
+        && accumulator_move_site_count(body, c) == 1
+}
+
 /// Whether a statically-resolved [`RegularCall`] is a workspace
 /// `Index::index` / `IndexMut::index_mut` impl (the `FixedObjectArray`
 /// family) — those bottom out at raw-slice construction and are lowered
@@ -16207,7 +16521,7 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 fn value_type_bank(ty: &ValueType) -> u8 {
     match ty {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref(_) | ValueType::Str => 1,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
         ValueType::State => 4,
@@ -16581,7 +16895,7 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
         ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
             return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
         }
-        ValueType::Ref(_) | ValueType::Str => "ref",
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => "ref",
         ValueType::Void | ValueType::State | ValueType::Unknown => return None,
     };
     Some(token.to_string())
@@ -17878,6 +18192,7 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
             tyref_to_value_type(&field.ty, llbc),
             ValueType::Ref(_)
                 | ValueType::Str
+                | ValueType::StringBuilder
                 | ValueType::Void
                 | ValueType::State
                 | ValueType::Unknown
@@ -24951,6 +25266,7 @@ mod tests {
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,
+            builder_variant: None,
         }];
         let mut known = std::collections::HashSet::new();
         let mut fields = crate::front::semantic::StructFieldRegistry::default();

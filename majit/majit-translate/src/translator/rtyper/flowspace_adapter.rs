@@ -1853,6 +1853,95 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    // `front::mir`'s builder-mode rewrite emits three reserved
+                    // single-segment markers for a *lifted* string-accumulator
+                    // (pass 2 of the two-pass lift gate).  A dropped graph
+                    // keeps the concat form and never reaches this lift-only
+                    // adapter, so the markers only ever appear where
+                    // `SomeStringBuilder` is fully typed.  Each lowers to the
+                    // flowspace shape the annotator's `find_method` /
+                    // `newstringbuilder` arms already consume, mirroring the
+                    // `Vec::push` / `slice.reverse` method arms below.
+                    //
+                    // `__pyre_stringbuilder_new` → `newstringbuilder` (no
+                    // operands; a `with_capacity` size arg is dropped, like
+                    // `is_vec_ctor_segments`).  `rtype_newstringbuilder` picks
+                    // the initial buffer size.
+                    if segments.len() == 1 && segments[0] == "__pyre_stringbuilder_new" {
+                        return Ok(vec![FlowspaceOp::new("newstringbuilder", vec![], result)]);
+                    }
+                    // `__pyre_stringbuilder_append(recv, piece)` →
+                    // `getattr(recv, "append") + simple_call(bound, piece)`,
+                    // reaching `StringBuilderRepr::rtype_method("append")`
+                    // (rstring.py:891-894) — identical to the `Vec::push` arm.
+                    if segments.len() == 1 && segments[0] == "__pyre_stringbuilder_append" {
+                        if arg_hls.len() != 2 {
+                            return Err(TyperError::message(format!(
+                                "__pyre_stringbuilder_append requires exactly two args \
+                                 (receiver, piece), got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "__pyre_stringbuilder_append requires a receiver arg".to_string(),
+                            )
+                        })?;
+                        let piece = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "__pyre_stringbuilder_append requires a piece arg".to_string(),
+                            )
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        "append",
+                                    ))),
+                                ],
+                                bound_method.clone(),
+                            ),
+                            FlowspaceOp::new("simple_call", vec![bound_method, piece], result),
+                        ]);
+                    }
+                    // `__pyre_stringbuilder_build(recv)` →
+                    // `getattr(recv, "build") + simple_call(bound)`, reaching
+                    // `StringBuilderRepr::rtype_method("build")`
+                    // (rstring.py:916-917) → `SomeString` — identical to the
+                    // `slice.reverse` arm (no extra args on the bound method).
+                    if segments.len() == 1 && segments[0] == "__pyre_stringbuilder_build" {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(format!(
+                                "__pyre_stringbuilder_build requires exactly one receiver arg, \
+                                 got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let mut iter = arg_hls.into_iter();
+                        let receiver = iter.next().ok_or_else(|| {
+                            TyperError::message(
+                                "__pyre_stringbuilder_build requires a receiver arg".to_string(),
+                            )
+                        })?;
+                        let bound_method = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new(
+                                "getattr",
+                                vec![
+                                    receiver,
+                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                        "build",
+                                    ))),
+                                ],
+                                bound_method.clone(),
+                            ),
+                            FlowspaceOp::new("simple_call", vec![bound_method], result),
+                        ]);
+                    }
                     // The `len` operation in its three spellings: the
                     // `__len` synthetic `front/mir.rs` lowers `Rvalue::Len`
                     // (and the `<str>::is_empty` decomposition) to; the
@@ -5280,6 +5369,119 @@ mod tests {
             panic!("ctor callable must be ConstValue::HostObject");
         };
         assert_eq!(host.qualname(), "Point");
+    }
+
+    #[test]
+    fn translate_op_stringbuilder_new_marker_lowers_to_newstringbuilder() {
+        // `__pyre_stringbuilder_new` (front builder-mode ctor rewrite) →
+        // one `newstringbuilder` op with no operands; the annotator types
+        // its result `SomeStringBuilder`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__pyre_stringbuilder_new".into()],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__pyre_stringbuilder_new marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "newstringbuilder");
+        assert!(translated[0].args.is_empty());
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_stringbuilder_append_marker_chains_getattr_simple_call() {
+        // `__pyre_stringbuilder_append(recv, piece)` → `getattr(recv,
+        // "append") + simple_call(bound, piece)`, the same method shape as
+        // `Vec::push`; reaches `StringBuilderRepr::rtype_method("append")`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        let recv = Hlvalue::Variable(Variable::new());
+        let piece = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), recv.clone());
+        value_map.insert(vars[2].clone(), piece.clone());
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__pyre_stringbuilder_append".into()],
+                },
+                args: vec![vars[1].clone(), vars[2].clone()],
+                result_ty: ValueType::Void,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__pyre_stringbuilder_append marker must lower");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "getattr");
+        assert_eq!(translated[0].args.len(), 2);
+        assert_eq!(translated[0].args[0], recv);
+        let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
+            panic!("append getattr name must be a Constant");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"append"
+        ));
+        let bound = &translated[0].result;
+        assert_eq!(translated[1].opname, "simple_call");
+        assert_eq!(translated[1].args.len(), 2);
+        assert_eq!(&translated[1].args[0], bound);
+        assert_eq!(translated[1].args[1], piece);
+    }
+
+    #[test]
+    fn translate_op_stringbuilder_build_marker_chains_getattr_simple_call() {
+        // `__pyre_stringbuilder_build(recv)` → `getattr(recv, "build") +
+        // simple_call(bound)`, the same shape as `slice.reverse` (no extra
+        // arg); reaches `StringBuilderRepr::rtype_method("build")` →
+        // `SomeString`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        let recv = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[1].clone(), recv.clone());
+        value_map.insert(vars[2].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__pyre_stringbuilder_build".into()],
+                },
+                args: vec![vars[1].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__pyre_stringbuilder_build marker must lower");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "getattr");
+        assert_eq!(translated[0].args[0], recv);
+        let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
+            panic!("build getattr name must be a Constant");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"build"
+        ));
+        let bound = &translated[0].result;
+        assert_eq!(translated[1].opname, "simple_call");
+        assert_eq!(translated[1].args.len(), 1);
+        assert_eq!(&translated[1].args[0], bound);
+        assert_eq!(translated[1].result, result_var);
     }
 
     #[test]

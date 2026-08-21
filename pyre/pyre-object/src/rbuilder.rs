@@ -15,7 +15,8 @@
 /// Runtime-assigned GC type id for the `StringBuilder` box. Published by
 /// `pyre-jit::eval` at the tail of `build_gc`; read by the size descriptor in
 /// `pyre-jit-trace::descr` and by `bh_new`.
-static STRINGBUILDER_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static STRINGBUILDER_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 /// Record the GC type id registered for the `StringBuilder` box.
 pub fn set_stringbuilder_gc_type_id(id: u32) {

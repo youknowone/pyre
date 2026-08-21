@@ -109,6 +109,16 @@ pub struct SemanticFunction {
     /// `return_type` marker so the residual prefill projects a `Ref`
     /// result.
     pub returns_objectptr: bool,
+    /// The same body re-lowered in `StringBuilder` form when it has a
+    /// builder-mode string accumulator
+    /// ([`crate::front::mir::lower_fun_decl_builder_variant`]), otherwise
+    /// `None`.  Carries the marker-emitting variant alongside the default
+    /// `ll_strconcat` `graph` so `lib.rs` can register it into `CallControl`'s
+    /// builder-variant side-map without re-lowering; the `make_jitcodes`
+    /// two-pass driver swaps it in only for a graph the concat-form prepass
+    /// proved *lifts*, so the markers reach the flowspace-adapter path and
+    /// never the legacy walker.
+    pub builder_variant: Option<FunctionGraph>,
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -490,6 +500,7 @@ mod tests {
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,
+            builder_variant: None,
         }
     }
 

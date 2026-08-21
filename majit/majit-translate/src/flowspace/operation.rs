@@ -174,6 +174,12 @@ pub enum OpKind {
     NewDict,
     NewTuple,
     NewList,
+    /// `StringBuilder()` / `UnicodeBuilder()` construction.  A pyre
+    /// adaptation of the RPython `rlib.rstring` ExtRegistryEntry ctor
+    /// (`simple_call` on the builder class → `SomeStringBuilder`,
+    /// `specialize_call` → `hop.r_result.rtyper_new`), modelled as a
+    /// manual-dispatch construction op alongside `NewList`/`NewDict`.
+    NewStringBuilder,
     Pow,
     Iter,
     Next,
@@ -341,6 +347,7 @@ impl OpKind {
             "newdict" => OpKind::NewDict,
             "newtuple" => OpKind::NewTuple,
             "newlist" => OpKind::NewList,
+            "newstringbuilder" => OpKind::NewStringBuilder,
             "pow" => OpKind::Pow,
             "iter" => OpKind::Iter,
             "next" => OpKind::Next,
@@ -447,6 +454,7 @@ impl OpKind {
             OpKind::NewDict => "newdict",
             OpKind::NewTuple => "newtuple",
             OpKind::NewList => "newlist",
+            OpKind::NewStringBuilder => "newstringbuilder",
             OpKind::Pow => "pow",
             OpKind::Iter => "iter",
             OpKind::Next => "next",
@@ -565,6 +573,7 @@ impl OpKind {
             OpKind::NewDict
             | OpKind::NewTuple
             | OpKind::NewList
+            | OpKind::NewStringBuilder
             | OpKind::SimpleCall
             | OpKind::CallArgs
             | OpKind::Hint => None,
@@ -695,6 +704,7 @@ impl OpKind {
             | OpKind::Hint
             | OpKind::NewDict
             | OpKind::NewList
+            | OpKind::NewStringBuilder
             | OpKind::Iter
             | OpKind::Next
             | OpKind::SimpleCall
@@ -828,6 +838,7 @@ impl OpKind {
             | OpKind::NewDict
             | OpKind::NewTuple
             | OpKind::NewList
+            | OpKind::NewStringBuilder
             | OpKind::Pow => Dispatch::None,
         }
     }
@@ -2423,6 +2434,13 @@ impl HLOperation {
                         let list = annotator.bookkeeper.newlist(&args_s, None)?;
                         Ok(Some(SomeValue::List(list)))
                     }
+                    // `StringBuilder()` construction — the ExtRegistryEntry
+                    // `compute_result_annotation` yields `SomeStringBuilder`
+                    // (rlib/rstring.py).  The optional `init_size` arg (an
+                    // `SomeInteger`) does not refine the result.
+                    OpKind::NewStringBuilder => Ok(Some(SomeValue::StringBuilder(
+                        crate::annotator::model::SomeStringBuilder::new(),
+                    ))),
                     // operation.py — NewSlice.consider raises
                     // AnnotatorError outright.
                     OpKind::NewSlice => Err(AnnotatorError::new(
@@ -2616,6 +2634,21 @@ mod tests {
         // variadic / manual-dispatch → None.
         assert_eq!(OpKind::NewTuple.arity(), None);
         assert_eq!(OpKind::SimpleCall.arity(), None);
+    }
+
+    #[test]
+    fn newstringbuilder_opname_classification_mirrors_newlist() {
+        // The builder ctor op round-trips through the opname map and is
+        // classified like the other manual-dispatch construction ops.
+        assert_eq!(OpKind::NewStringBuilder.opname(), "newstringbuilder");
+        assert_eq!(
+            OpKind::from_opname("newstringbuilder"),
+            Some(OpKind::NewStringBuilder)
+        );
+        assert_eq!(OpKind::NewStringBuilder.dispatch(), Dispatch::None);
+        assert_eq!(OpKind::NewStringBuilder.arity(), None);
+        // Allocation with identity → not a PureOperation (never constfolds).
+        assert!(!OpKind::NewStringBuilder.pure());
     }
 
     #[test]

@@ -1320,8 +1320,7 @@ mod tests {
             TO: PtrTarget::Func(func_type),
         }
         ._example();
-        let callee =
-            constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
 
         let out = variable_with_lltype("out", LowLevelType::Unsigned);
         startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -1359,7 +1358,10 @@ mod tests {
         assert_eq!(const_ints, 1, "the 1280 constant arg materialises once");
         assert_eq!(calls.len(), 1);
         let (target, argc) = &calls[0];
-        assert_eq!(*target, crate::model::CallTarget::function_path(["<example>"]));
+        assert_eq!(
+            *target,
+            crate::model::CallTarget::function_path(["<example>"])
+        );
         assert_eq!(*argc, 2, "size + the materialised 1280");
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
     }

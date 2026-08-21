@@ -13774,7 +13774,14 @@ mod rbuilder_runtime {
         let mut dst = final_size;
         loop {
             dst -= piece_lgt;
-            copy_string_contents(piece, result, 0, dst as usize, piece_lgt as usize, item_size);
+            copy_string_contents(
+                piece,
+                result,
+                0,
+                dst as usize,
+                piece_lgt as usize,
+                item_size,
+            );
             if extra == 0 {
                 break;
             }

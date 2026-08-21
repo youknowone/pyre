@@ -2253,6 +2253,13 @@ impl RPythonTyper {
             // function `rdict.rtype_newdict(hop)` (`ll_newdict`). No
             // per-Repr dispatch.
             "newdict" => super::rdict::rtype_newdict(hop),
+            // The `StringBuilder()` / `UnicodeBuilder()` ctor — the pyre
+            // adaptation of the `rlib.rstring` ExtRegistryEntry
+            // `specialize_call` (`hop.r_result.rtyper_new(hop)`).  Routes
+            // to the result builder repr's `ll_new` helper graph.
+            "newstringbuilder" => {
+                super::lltypesystem::rbuilder::rtype_newstringbuilder(hop)
+            }
             // rtuple.py — `pairtype(TupleRepr, Repr).rtype_contains`.
             "contains" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_contains),
             // `same_as` (rtyper.py:478-481) is RPython's internal

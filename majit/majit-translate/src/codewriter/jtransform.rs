@@ -1259,7 +1259,7 @@ impl<'a> Transformer<'a> {
             ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
                 crate::codewriter::type_state::ConcreteType::Signed
             }
-            ValueType::Ref(_) | ValueType::Str => {
+            ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => {
                 crate::codewriter::type_state::ConcreteType::GcRef
             }
             ValueType::Float => crate::codewriter::type_state::ConcreteType::Float,
@@ -6457,7 +6457,7 @@ fn value_type_to_kind(ty: &ValueType) -> char {
         // return `'int'` (ll Bool / Unsigned share register class
         // with Signed at the codewriter register-kind layer).
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => 'i',
-        ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => 'r',
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::Unknown => 'r',
         ValueType::Float => 'f',
         ValueType::Void => 'v',
         ValueType::Int128 | ValueType::UInt128 => {
@@ -6526,7 +6526,9 @@ fn value_type_to_ir_type(ty: &ValueType) -> majit_ir::value::Type {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
             majit_ir::value::Type::Int
         }
-        ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => majit_ir::value::Type::Ref,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::Unknown => {
+            majit_ir::value::Type::Ref
+        }
         ValueType::Float => majit_ir::value::Type::Float,
         ValueType::Void => majit_ir::value::Type::Void,
         ValueType::Int128 | ValueType::UInt128 => {
@@ -12745,7 +12747,9 @@ mod tests {
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
-            ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => "String",
+            ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::Unknown => {
+                "String"
+            }
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",
@@ -12997,7 +13001,9 @@ mod tests {
         let return_str = match result_ty {
             ValueType::Int | ValueType::State => "i64",
             ValueType::Unsigned => "u64",
-            ValueType::Ref(_) | ValueType::Str | ValueType::Unknown => "String",
+            ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::Unknown => {
+                "String"
+            }
             ValueType::Float => "f64",
             ValueType::Void => "",
             ValueType::Bool => "bool",

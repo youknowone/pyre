@@ -72,6 +72,14 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
         ValueType::Str => Some(SomeValue::String(crate::annotator::model::SomeString::new(
             false, false,
         ))),
+        // RPython `StringBuilder()` binds to `SomeStringBuilder` at the
+        // annotator (`rlib/rstring.py:890`); the rtyper then resolves it
+        // to `StringBuilderRepr`.  Carries no payload — the method call
+        // surface (`append` / `build` / `getlength`) lives on
+        // `SomeStringBuilder` itself.
+        ValueType::StringBuilder => Some(SomeValue::StringBuilder(
+            crate::annotator::model::SomeStringBuilder::new(),
+        )),
         ValueType::Ref(_) => {
             // RPython typed pointers lift to `SomePtr(ll_ptrtype)`
             // (`llannotation.py:64-70`), but the correct Ptr must come
@@ -148,6 +156,10 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         // are stored in an int register, not the float bank.
         SomeValue::SingleFloat(_) => ValueType::Int,
         SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref(None),
+        // Keep the `StringBuilder` shell distinct across the roundtrip so
+        // the rtyper picks `StringBuilderRepr` rather than the generic
+        // `Ref` fallback (which would erase the builder method surface).
+        SomeValue::StringBuilder(_) => ValueType::StringBuilder,
         // `SomeImpossibleValue` represents unreachable code (`model.py:627`),
         // which projects to `ValueType::Void` in pyre's flat enum just
         // like upstream `lltype.Void`.
@@ -180,6 +192,21 @@ mod tests {
             }
             other => panic!("typed Ref must use fallback Instance, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stringbuilder_roundtrips_through_shell() {
+        // `ValueType::StringBuilder` must project to the `SomeStringBuilder`
+        // shell (so the rtyper picks `StringBuilderRepr`) and reduce back to
+        // `ValueType::StringBuilder` (so the roundtrip is stable and the
+        // builder is never erased to the generic `Ref` fallback).
+        let shell =
+            valuetype_to_someshell(&ValueType::StringBuilder).expect("StringBuilder projects");
+        assert!(
+            matches!(shell, SomeValue::StringBuilder(_)),
+            "StringBuilder must project to SomeStringBuilder, got {shell:?}"
+        );
+        assert_eq!(somevalue_to_valuetype(&shell), ValueType::StringBuilder);
     }
 
     #[test]

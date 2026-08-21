@@ -1097,6 +1097,18 @@ pub struct CallControl {
     /// `{name: funcobj}` aliasing.
     function_graphs: GraphStore,
 
+    /// Builder-variant graphs, keyed by the same `CallPath` spellings as their
+    /// `ll_strconcat` counterparts in `function_graphs` (registered by
+    /// [`Self::register_builder_variant`] from
+    /// `SemanticFunction::builder_variant`).  The two-phase `make_jitcodes`
+    /// driver ([`Self::swap_in_builder_variants`]) consults this side-map after
+    /// the concat-form prepass: for each variant whose concat graph the prepass
+    /// proved *lifts*, it swaps the variant into `function_graphs` and re-drives
+    /// it, so the `StringBuilder` markers only ever reach the flowspace-adapter
+    /// (Match) path.  A graph with no builder accumulator has no entry here and
+    /// keeps its concat graph untouched.
+    builder_variant_graphs: GraphStore,
+
     /// Leaf-name → free-function `CallPath`s with `owner_root.is_none()`.
     ///
     /// Pyre-only acceleration for `target_to_path`'s cross-module
@@ -1804,6 +1816,7 @@ impl CallControl {
     pub fn new() -> Self {
         Self {
             function_graphs: GraphStore::new(),
+            builder_variant_graphs: GraphStore::new(),
             free_fn_leaf_index: HashMap::new(),
             impl_method_leaf_index: HashMap::new(),
             external_funcobjs: HashMap::new(),
@@ -2975,6 +2988,106 @@ impl CallControl {
         self.insert_function_graph_indexed(path, graph);
     }
 
+    /// Register a builder-variant graph under the same `CallPath` its concat
+    /// counterpart uses in `function_graphs`.  Called from `lib.rs` for every
+    /// `SemanticFunction` whose `builder_variant` is present, once per alias
+    /// spelling; `GraphStore` de-dups by funcobj identity, so a graph
+    /// registered under N aliases stores one shared variant reachable through
+    /// every spelling.  No leaf index is maintained — the side-map is iterated
+    /// by [`Self::swap_in_builder_variants`], never resolved by leaf-match.
+    pub fn register_builder_variant(&mut self, path: CallPath, graph: FunctionGraph) {
+        self.builder_variant_graphs.insert(path, graph);
+    }
+
+    /// Populate the builder-variant side-map from `variants_by_key` (funcobj
+    /// `GraphStore` key -> variant graph, built in `lib.rs` from
+    /// `SemanticFunction::builder_variant`).  Registers each variant under
+    /// every `CallPath` spelling its concat counterpart already occupies in
+    /// `function_graphs`, so the side-map shares the concat keys exactly,
+    /// handling free functions and impl methods uniformly, independent of the
+    /// per-shape registration paths.
+    pub fn register_builder_variants_by_key(
+        &mut self,
+        variants_by_key: &HashMap<(Option<String>, String), FunctionGraph>,
+    ) {
+        if variants_by_key.is_empty() {
+            return;
+        }
+        let regs: Vec<(CallPath, FunctionGraph)> = self
+            .function_graphs
+            .iter()
+            .filter_map(|(path, graph)| {
+                let key = (
+                    graph
+                        .source_identity
+                        .clone()
+                        .or_else(|| graph.owner_root.clone()),
+                    graph.name.clone(),
+                );
+                variants_by_key.get(&key).map(|v| (path.clone(), v.clone()))
+            })
+            .collect();
+        for (path, variant) in regs {
+            self.register_builder_variant(path, variant);
+        }
+    }
+
+    /// Two-pass builder lift gate driver (design B), run from `make_jitcodes`
+    /// after the concat-form `run_two_phase_prepass` populated the lift-set.
+    ///
+    /// For each builder variant whose concat counterpart the prepass proved
+    /// *lifts* (its `CallPath::canonical_key()` is a `two_phase().subjects`
+    /// key), swap the variant into `function_graphs` and surgically re-drive it
+    /// ([`crate::translator::rtyper::cutover::redrive_builder_variant_subjects`])
+    /// so the drain publishes the builder-typed graph.  A variant that fails to
+    /// re-lift is reverted to its concat graph — both the `function_graphs` slot
+    /// (here) and the cached subject (in the re-drive).  Graphs with no builder
+    /// accumulator have no side-map entry and are untouched.
+    pub fn swap_in_builder_variants(
+        &mut self,
+        call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+    ) {
+        // Subject-alias paths of every builder variant that lifted in the
+        // concat prepass; cloned out before mutating `function_graphs`.
+        let swapped_paths: Vec<CallPath> = {
+            let tp = call_registry.two_phase();
+            self.builder_variant_graphs
+                .iter()
+                .filter(|(path, _)| tp.subjects.contains_key(&path.canonical_key()))
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        if swapped_paths.is_empty() {
+            return;
+        }
+        // Save each slot's concat graph, then swap the variant in.
+        let mut saved_concat: HashMap<CallPath, FunctionGraph> = HashMap::new();
+        for path in &swapped_paths {
+            if let Some(concat) = self.function_graphs.get(path).cloned() {
+                saved_concat.insert(path.clone(), concat);
+            }
+            let variant = self.builder_variant_graphs.get(path).cloned();
+            if let Some(variant) = variant
+                && let Some(slot) = self.function_graphs.get_mut(path)
+            {
+                *slot = variant;
+            }
+        }
+        // Surgical re-drive; revert the `function_graphs` slot for any failure.
+        let failed = crate::translator::rtyper::cutover::redrive_builder_variant_subjects(
+            call_registry,
+            &self.function_graphs,
+            &swapped_paths,
+        );
+        for path in &failed {
+            if let Some(concat) = saved_concat.get(path)
+                && let Some(slot) = self.function_graphs.get_mut(path)
+            {
+                *slot = concat.clone();
+            }
+        }
+    }
+
     /// Register a free function graph together with its hints.
     /// `hints` mirror RPython `func._jit_*_` / `_elidable_function_`
     /// attributes; they are consulted by
@@ -3978,6 +4091,7 @@ impl CallControl {
                             trait_root: None,
                             trait_qualified: None,
                             returns_objectptr: false,
+                            builder_variant: None,
                         };
                         if policy.look_inside_graph(&func) {
                             self.candidate_graphs.insert(callee_path.clone());
@@ -7703,6 +7817,7 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
                             crate::model::ValueType::Ref(_)
                             | crate::model::ValueType::Str
+                            | crate::model::ValueType::StringBuilder
                             | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
@@ -7755,6 +7870,7 @@ fn collect_readwrite_effects(
                             | crate::model::ValueType::State => majit_ir::value::Type::Int,
                             crate::model::ValueType::Ref(_)
                             | crate::model::ValueType::Str
+                            | crate::model::ValueType::StringBuilder
                             | crate::model::ValueType::Unknown => majit_ir::value::Type::Ref,
                             crate::model::ValueType::Float => majit_ir::value::Type::Float,
                             crate::model::ValueType::Void => majit_ir::value::Type::Void,
@@ -8711,7 +8827,7 @@ fn value_type_discriminant(ty: &crate::model::ValueType) -> u8 {
         // and `INT_TYPE` under the same `'int'` kind for descriptor
         // indexing (`lltypesystem/lloperation.py:108 getkind`).
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
-        ValueType::Ref(_) | ValueType::Str => 1,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 1,
         ValueType::Float => 2,
         ValueType::Void => 3,
         ValueType::State => 4,

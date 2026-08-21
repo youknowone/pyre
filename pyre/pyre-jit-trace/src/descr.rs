@@ -960,7 +960,10 @@ fn build_bare_gcstruct_descr_group(
     let size_descr = group.size_descr;
     if !simple_name.is_empty() {
         let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(simple_name));
-        majit_ir::descr_registry::register_keyed_size(key, size_descr.clone() as majit_ir::DescrRef);
+        majit_ir::descr_registry::register_keyed_size(
+            key,
+            size_descr.clone() as majit_ir::DescrRef,
+        );
     }
     PyreObjectDescrGroup {
         size_descr,
@@ -6008,7 +6011,10 @@ mod tests {
         assert_eq!(sd.size(), 40, "stringbuilder body must be 40 bytes");
         // Headered (forwardable across a minor GC), GC-managed — NOT a raw
         // headerless struct, which could not survive a collection while live.
-        assert!(!sd.headerless(), "stringbuilder must be a headered GcStruct");
+        assert!(
+            !sd.headerless(),
+            "stringbuilder must be a headered GcStruct"
+        );
         assert!(sd.is_gc_managed(), "stringbuilder is GC-managed");
         // `current_buf` (offset 0) is a raw off-GC low-level string modeled as
         // scalar `Int`, so it is NOT traced — the box tid's drop glue
@@ -6046,8 +6052,11 @@ mod tests {
             .expect("resolved stringbuilder entry is a SizeDescr");
         assert_eq!(resolved.size(), 40);
         assert_eq!(resolved.type_id(), fake_tid);
-        let resolved_traced: Vec<usize> =
-            resolved.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+        let resolved_traced: Vec<usize> = resolved
+            .gc_fielddescrs()
+            .iter()
+            .map(|f| f.offset())
+            .collect();
         assert_eq!(resolved_traced, vec![32]);
     }
 
@@ -6075,7 +6084,11 @@ mod tests {
             vec![8],
             "stringpiece must trace only prev_piece@8; got offsets {traced:?}",
         );
-        assert_eq!(sd.type_id(), fake_tid, "descr must carry the published node tid");
+        assert_eq!(
+            sd.type_id(),
+            fake_tid,
+            "descr must carry the published node tid"
+        );
         assert_eq!(
             sd.cache_key(),
             majit_ir::descr::path_hash("stringpiece"),
@@ -6095,8 +6108,11 @@ mod tests {
             .expect("resolved stringpiece entry is a SizeDescr");
         assert_eq!(resolved.size(), 16);
         assert_eq!(resolved.type_id(), fake_tid);
-        let resolved_traced: Vec<usize> =
-            resolved.gc_fielddescrs().iter().map(|f| f.offset()).collect();
+        let resolved_traced: Vec<usize> = resolved
+            .gc_fielddescrs()
+            .iter()
+            .map(|f| f.offset())
+            .collect();
         assert_eq!(resolved_traced, vec![8]);
     }
 

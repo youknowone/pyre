@@ -238,6 +238,18 @@ impl CodeWriter {
         );
     }
 
+    /// Two-pass builder lift gate (design B): after `run_two_phase_prepass`
+    /// decided the lift-set over the `ll_strconcat` graphs, swap the
+    /// `StringBuilder` variant into every builder-mode graph that lifted and
+    /// surgically re-drive it, so the drain publishes the builder form.  Reuses
+    /// the same cached `PyreCallRegistry` (hence the same annotator/rtyper
+    /// session and lift-set) the prepass populated.  Must run between
+    /// `run_two_phase_prepass` and `drain_pending_graphs`.
+    pub fn swap_in_builder_variants(&self, callcontrol: &mut CallControl) {
+        let registry = self.dual_gate_registry(callcontrol);
+        callcontrol.swap_in_builder_variants(&registry);
+    }
+
     /// Port of `CodeWriter.transform_graph_to_jitcode`.
     ///
     /// Transforms a `FunctionGraph` into a `JitCode` through the upstream
