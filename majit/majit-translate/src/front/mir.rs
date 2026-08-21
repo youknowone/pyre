@@ -10347,9 +10347,12 @@ impl<'a> Lowering<'a> {
     /// indexing.  RPython represents the same operation directly as
     /// `getitem` / `setitem`; the Rust trait shim is opaque in Charon and must
     /// not survive as a residual call.  Range implementations share the same
-    /// name, so accept only the literal `usize` second argument; RangeFrom /
-    /// RangeTo continue through `front::slice_index`'s bounded getslice
-    /// rewrites.
+    /// name, so accept only an integer-bank second argument. `usize` is the
+    /// ordinary spelling, but Charon may preserve an integer alias instead of
+    /// the literal atom; [`vec_index_type_is_scalar`] performs the same
+    /// representation test used by `Vec::index`. RangeFrom / RangeTo remain
+    /// Ref-bank values and continue through `front::slice_index`'s bounded
+    /// getslice rewrites.
     fn is_slice_scalar_index_call(&self, reg: &RegularCall, index_ty: Option<&TyRef>) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -10360,7 +10363,16 @@ impl<'a> Lowering<'a> {
                 "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
             )
         });
-        is_index && index_ty.and_then(|ty| self.tyref_literal_uint_atom(ty)) == Some("Usize")
+        let callsite_index_is_scalar = index_ty
+            .is_some_and(|ty| vec_index_type_is_scalar(ty, self.llbc))
+            || reg
+                .generics
+                .get("types")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|types| types.get(1))
+                .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())
+                .is_some_and(|ty| vec_index_type_is_scalar(&ty, self.llbc));
+        is_index && callsite_index_is_scalar
     }
 
     fn is_slice_scalar_index_mut_call(&self, reg: &RegularCall) -> bool {
@@ -27304,6 +27316,50 @@ mod tests {
                 )
             }),
             "From<bool> for usize should use RPython's cast_bool_to_uint path"
+        );
+    }
+
+    /// `split_builtin_kwargs` returns `&args[..args.len() - 1]` after proving
+    /// the slice non-empty. MIR carries both the stop and receiver through
+    /// block-link aliases, so the RangeTo proof must resolve those aliases
+    /// before recognizing the orthodox `getslice_minusone` shape.
+    #[test]
+    #[ignore]
+    fn split_builtin_kwargs_rangeto_aliases_lower_to_getslice() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "split_builtin_kwargs")
+            .expect("lower split_builtin_kwargs");
+        let calls_path = |want: &[&str]| -> usize {
+            let want: Vec<String> = want.iter().map(|part| part.to_string()).collect();
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &want
+                    )
+                })
+                .count()
+        };
+        assert_eq!(
+            calls_path(&["core", "slice", "index", "<Impl>", "index"]),
+            0,
+            "the proven RangeTo index must not remain a core residual"
+        );
+        assert_eq!(
+            calls_path(&["__getslice_minusone"]),
+            1,
+            "the marker strip must use the len-minus-one slice helper"
         );
     }
 }

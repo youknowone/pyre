@@ -3075,32 +3075,6 @@ fn emit_frontend_is_op(
     )
 }
 
-fn emit_frontend_import_name(
-    graph: &mut super::flow::FunctionGraph,
-    block: &super::flow::BlockRef,
-    fromlist: super::flow::FlowValue,
-    level: super::flow::FlowValue,
-    code: super::flow::FlowValue,
-    frame: super::flow::FlowValue,
-    name_idx: super::flow::FlowValue,
-    offset: i64,
-) -> super::flow::Variable {
-    emit_graph_op_with_result(
-        graph,
-        block,
-        "import_name",
-        vec![
-            fromlist.into(),
-            level.into(),
-            code.into(),
-            frame.into(),
-            name_idx.into(),
-        ],
-        Kind::Ref,
-        offset,
-    )
-}
-
 fn emit_frontend_import_from(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3575,7 +3549,6 @@ struct FnPtrIndices {
     format_with_spec_fn: HelperHandle,
     build_string_from_array_fn: HelperHandle,
     convert_value_fn: HelperHandle,
-    import_name_fn: HelperHandle,
     import_from_fn: HelperHandle,
     load_super_attr_fn: HelperHandle,
     super_attr_unwrap_fn: HelperHandle,
@@ -3596,6 +3569,7 @@ struct FnPtrIndices {
     match_class_fn: HelperHandle,
     load_locals_fn: HelperHandle,
     load_build_class_fn: HelperHandle,
+    load_import_fn: HelperHandle,
     load_from_dict_or_globals_fn: HelperHandle,
     call_function_ex_fn: HelperHandle,
     unary_not_fn: HelperHandle,
@@ -3950,13 +3924,6 @@ fn register_helper_fn_pointers(
     let convert_value_fn = bind(
         assembler,
         cpu.convert_value_fn as *const (),
-        CallFlavor::MayForce,
-    );
-    // `bh_import_name_fn` runs `__import__` (module top-level Python may run)
-    // → `MayForce`.  Appended last to preserve fn_ptr indices.
-    let import_name_fn = bind(
-        assembler,
-        cpu.import_name_fn as *const (),
         CallFlavor::MayForce,
     );
     // `bh_import_from_fn` runs `importing::import_from` (a submodule-import
@@ -4324,6 +4291,14 @@ fn register_helper_fn_pointers(
         cpu.load_build_class_fn as *const (),
         CallFlavor::Plain,
     );
+    // IMPORT_NAME performs this builtin lookup and then uses the ordinary
+    // CallFn path for the actual invocation. Bind after the existing helpers
+    // so their pool indices remain stable.
+    let load_import_fn = bind(
+        assembler,
+        cpu.load_import_fn as *const (),
+        CallFlavor::Plain,
+    );
     // The hand-written PUSH_EXC_INFO lowering must complete the interpreter's
     // caught-exception ownership transfer.  Bind last so every existing
     // helper index remains stable.
@@ -4394,7 +4369,6 @@ fn register_helper_fn_pointers(
         format_with_spec_fn,
         build_string_from_array_fn,
         convert_value_fn,
-        import_name_fn,
         import_from_fn,
         load_super_attr_fn,
         super_attr_unwrap_fn,
@@ -4427,6 +4401,7 @@ fn register_helper_fn_pointers(
         match_class_fn,
         load_locals_fn,
         load_build_class_fn,
+        load_import_fn,
         load_from_dict_or_globals_fn,
         call_function_ex_fn,
         call_kw_fn_0,
@@ -6348,11 +6323,6 @@ impl CodeWriter {
                     idx: convert_value_fn_idx,
                     flavor: _convert_value_fn_flavor,
                 },
-            import_name_fn:
-                HelperHandle {
-                    idx: import_name_fn_idx,
-                    flavor: _import_name_fn_flavor,
-                },
             import_from_fn:
                 HelperHandle {
                     idx: import_from_fn_idx,
@@ -6442,6 +6412,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: load_build_class_fn_idx,
                     flavor: _load_build_class_fn_flavor,
+                },
+            load_import_fn:
+                HelperHandle {
+                    idx: load_import_fn_idx,
+                    flavor: _load_import_fn_flavor,
                 },
             load_from_dict_or_globals_fn:
                 HelperHandle {
@@ -6699,7 +6674,6 @@ impl CodeWriter {
                 format_with_spec_fn_idx,
                 build_string_from_array_fn_idx,
                 convert_value_fn_idx,
-                import_name_fn_idx,
                 import_from_fn_idx,
                 load_super_attr_fn_idx,
                 super_attr_unwrap_fn_idx,
@@ -6720,6 +6694,7 @@ impl CodeWriter {
                 match_class_fn_idx,
                 load_locals_fn_idx,
                 load_build_class_fn_idx,
+                load_import_fn_idx,
                 load_from_dict_or_globals_fn_idx,
                 call_function_ex_fn_idx,
                 unary_not_fn_idx,
@@ -12305,37 +12280,72 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // ImportName: pops 2 (fromlist=TOS, level=TOS1), pushes
-                        // 1 module. Net: -1.  `import_name(fromlist, level, code,
-                        // name_idx)` HLOp → `residual_call_ir_r(import_name_fn,
-                        // ListI[name_idx], ListR[fromlist, level, code])`.  The
-                        // jitcode's own PyCode travels as a post-rtype
-                        // `Signed(ptr) + Kind::Ref` constant and the `co_names`
-                        // index the helper resolves the module name with — the
-                        // same surrogate-operand shape as the LoadAttr arm.
-                        // `bh_import_name_fn` runs `__import__` through the
-                        // TLS-pinned execution context (MayForce).
+                        // PyPy pyopcode.py IMPORT_NAME: resolve
+                        // `get_builtin().__import__`, then invoke it through
+                        // the ordinary Python call path with
+                        // `(name, globals, None, fromlist, level)`.  Keeping
+                        // the lookup and CallFn separate is load-bearing: the
+                        // latter can descend through BuiltinCode.func and
+                        // trace `_gcd_import`; the old monolithic
+                        // one monolithic residual hid the entire importer.
                         Instruction::ImportName { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
-                            let name_idx_const: super::flow::FlowValue =
-                                super::flow::Constant::signed(name_idx as i64).into();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let fromlist_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let level_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let result_value = emit_frontend_import_name(
+
+                            let callable = emit_frontend_frame_only_ref(
                                 &mut graph,
                                 &current_block.block(),
-                                fromlist_value,
-                                level_value,
-                                code_const,
+                                "load_import",
                                 frame_var.into(),
-                                name_idx_const,
+                                py_pc as i64,
+                            );
+
+                            let name = code
+                                .names
+                                .get(name_idx)
+                                .expect("IMPORT_NAME co_names index is validated by the compiler");
+                            // PyPy pyopcode.py `IMPORT_NAME`'s `getname_w` uses the exact interned
+                            // object in this PyCode's `co_names_w` table.
+                            let w_name = unsafe {
+                                pyre_interpreter::pycode::w_code_getname_w_or_new(
+                                    w_code as pyre_object::PyObjectRef,
+                                    name_idx,
+                                    name.as_ref(),
+                                )
+                            };
+                            let name_value = pyobject_const_ref_value(w_name);
+                            // Every per-code jitcode now carries its own red
+                            // frame.  Read that frame's live w_globals exactly
+                            // as PyPy's `self.get_w_globals()` does; an inlined
+                            // callee must never inherit the caller's namespace
+                            // or a code-wrapper constant in its place.
+                            let globals_value: super::flow::FlowValue = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "getfield_vable_r",
+                                vable_getfield_ref_graph_args(
+                                    frame_var.into(),
+                                    VABLE_NAMESPACE_FIELD_IDX,
+                                ),
+                                Kind::Ref,
+                                py_pc as i64,
+                            )
+                            .into();
+                            let result_value = emit_frontend_simple_call(
+                                &mut graph,
+                                &current_block.block(),
+                                callable.into(),
+                                super::flow::Constant::none().into(),
+                                vec![
+                                    name_value,
+                                    globals_value,
+                                    pyobject_const_ref_value(pyre_object::w_none()),
+                                    fromlist_value,
+                                    level_value,
+                                ],
                                 py_pc as i64,
                             );
                             push_and_bump!(result_value.into(), py_pc);

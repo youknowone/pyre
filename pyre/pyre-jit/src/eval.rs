@@ -7463,6 +7463,12 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             // here added no safety beyond the Layer 2 defense above.
             | I::CallFunctionEx
             | I::LoadGlobal { .. }
+            // IMPORT_NAME is the same Python-call boundary as CALL: it
+            // resolves builtins.__import__ and invokes it.  The Layer 2
+            // effect journal above is the replay-safety authority for both;
+            // rejecting only the opcode spelling kept otherwise identical
+            // `for` loops interpreted while PyPy traces them.
+            | I::ImportName { .. }
             | I::Resume { .. }
             // container builders: produce new heap objects but do not mutate
             // existing ones; walk-abort just drops the incomplete object
@@ -14523,6 +14529,16 @@ mod tests {
             "def f(n):\n    s = 0\n    for i in range(n):\n        s = (s + i * i + 3) % 1000000007\n    return s\n",
         )
         .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+        assert!(function_entry_trace_is_jit_safe(&code));
+        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
+    }
+
+    #[test]
+    fn for_iter_cached_import_body_is_jit_safe() {
+        use pyre_interpreter::compile_exec;
+        let module = compile_exec("def f(n):\n    for _ in range(n):\n        import os\n")
+            .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
         assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);

@@ -395,6 +395,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "builtins::builtin_kwargs_marker_dict",
         crate::builtins::builtin_kwargs_marker_dict as *const (),
     );
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::builtin_unexpected_keyword_failure",
+        "builtins::builtin_unexpected_keyword_failure",
+        crate::builtins::builtin_unexpected_keyword_failure as *const (),
+    );
 
     // RPython annotator PBC parity for `BuiltinCode.func`: every generated
     // interp2app wrapper is a possible value of the indirect function-pointer

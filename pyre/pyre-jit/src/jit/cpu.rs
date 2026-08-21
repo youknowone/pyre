@@ -210,12 +210,6 @@ pub struct Cpu {
     /// `conv` is a `runtime_ops::convert_value_code`; user `__str__` /
     /// `__repr__` may run Python (fallible).
     pub convert_value_fn: extern "C" fn(i64, i64) -> i64,
-    /// `bh_import_name_fn(fromlist, level, code, frame, name_idx)` —
-    /// IMPORT_NAME `__import__` residual; resolves the module name from the
-    /// code object, reads `__name__`/`__package__` for relative imports from
-    /// the threaded `frame`, and imports through the TLS-pinned execution
-    /// context (may run module top-level Python → fallible).
-    pub import_name_fn: extern "C" fn(i64, i64, i64, i64, i64) -> i64,
     /// `bh_import_from_fn(module, code, name_idx)` — IMPORT_FROM residual;
     /// resolves the attribute name from the code object and runs
     /// `importing::import_from` on the peeked module (namespace lookup, then a
@@ -345,6 +339,10 @@ pub struct Cpu {
     /// `LOAD_BUILD_CLASS` (`pyopcode.py`); reads `__build_class__` out of
     /// the frame's builtin mapping.
     pub load_build_class_fn: extern "C" fn(i64) -> i64,
+    /// Load `builtins.__import__` for IMPORT_NAME.  Kept separate from the
+    /// call itself so the generated jitcode has the same ordinary Python
+    /// call boundary as PyPy's `IMPORT_NAME` implementation.
+    pub load_import_fn: extern "C" fn(i64) -> i64,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
     /// The array is the forced `popvalues` list; length travels inside
     /// the array, so any arity fits.
@@ -507,7 +505,6 @@ impl Cpu {
             format_simple_fn: crate::call_jit::bh_format_simple_fn,
             format_with_spec_fn: crate::call_jit::bh_format_with_spec_fn,
             convert_value_fn: crate::call_jit::bh_convert_value_fn,
-            import_name_fn: crate::call_jit::bh_import_name_fn,
             import_from_fn: crate::call_jit::bh_import_from_fn,
             load_super_attr_fn: crate::call_jit::bh_load_super_attr_fn,
             super_attr_unwrap_fn: crate::call_jit::bh_super_attr_unwrap_fn,
@@ -546,6 +543,7 @@ impl Cpu {
             delete_global_fn: crate::call_jit::bh_delete_global_fn,
             load_locals_fn: crate::call_jit::bh_load_locals_fn,
             load_build_class_fn: crate::call_jit::bh_load_build_class_fn,
+            load_import_fn: crate::call_jit::bh_load_import_fn,
             newtuple_from_array_fn: crate::call_jit::bh_newtuple_from_array,
             build_map_from_array_fn: crate::call_jit::bh_build_map_from_array,
             build_set_from_array_fn: crate::call_jit::bh_build_set_from_array,

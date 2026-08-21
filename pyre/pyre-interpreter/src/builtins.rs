@@ -3715,7 +3715,8 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         // `moduledef.py:78-87 startup` — "Copy our __import__ to builtins".
         // `baseobjspace.py:730` keeps that same object as
         // `space.w_default_importlib_import`.
-        let w_import = make_module_builtin_function("__import__", builtin_dunder_import);
+        let w_import =
+            make_module_builtin_function("__import__", __pyre_wrap_builtin_dunder_import);
         crate::importing::set_default_importlib_import(w_import);
         w_import
     });
@@ -5040,6 +5041,11 @@ pub(crate) fn clinic_arity(
 /// keywords by parameter name without a per-function `Signature`; the
 /// `#[pyre_function]` wrapper supplies the name/required tables it knows
 /// at expansion time.
+// PyPy: `Arguments._match_signature` (`pypy/interpreter/argument.py`)
+// is `@jit.unroll_safe`.  The loops below are bounded by the builtin's static
+// signature and argument count in the same way; without the hint the JIT
+// policy residualizes this gateway step and cannot descend into the builtin.
+#[majit_macros::unroll_safe]
 pub(crate) fn bind_builtin_kwargs(
     args: &[PyObjectRef],
     names: &[&str],
@@ -5052,12 +5058,27 @@ pub(crate) fn bind_builtin_kwargs(
     // leaves an omitted one `PY_NULL`; a positional-only registration hands
     // the body just the arguments the call made. Reading a null slot as an
     // argument that was not passed makes the two registrations bind alike.
-    let supplied = positional.iter().filter(|v| !v.is_null()).count();
+    let mut supplied = 0;
+    let mut positional_index = 0;
+    while positional_index < positional.len() {
+        if !positional[positional_index].is_null() {
+            supplied += 1;
+        }
+        positional_index += 1;
+    }
+    let mut required_count = 0;
+    let mut required_index = 0;
+    while required_index < required.len() {
+        if required[required_index] {
+            required_count += 1;
+        }
+        required_index += 1;
+    }
     clinic_arity(
         fn_name,
         supplied,
         real_kwarg_count(kwargs),
-        required.iter().filter(|r| **r).count(),
+        required_count,
         names.len(),
         0,
     )?;
@@ -5066,18 +5087,43 @@ pub(crate) fn bind_builtin_kwargs(
     // `argument.py` keys the message off `space.text_w(keyword_names_w[i])`,
     // the keyword's own storage, so a name carrying a lone surrogate reaches
     // `e.args[0]` intact. Keep the WTF-8 rather than a lossy `String`.
-    let mut unknown: Option<Wtf8Buf> = None;
-    for (i, &v) in positional.iter().enumerate() {
-        scope[i] = v;
-        filled[i] = !v.is_null();
+    let keyword_entries = kwargs.map(|dict| unsafe { pyre_object::w_dict_str_entries_wtf8(dict) });
+    let mut unknown: Option<usize> = None;
+    // PyPy `_match_signature` copies positional values with
+    // `for i in range(take)` so the constant signature bounds let the JIT
+    // unroll ordinary indexed reads. Keep that storage shape instead of Rust
+    // iterator adapters, whose `Filter`/`Enumerate` state has no RPython
+    // counterpart.
+    let mut positional_index = 0;
+    while positional_index < positional.len() {
+        let value = positional[positional_index];
+        scope[positional_index] = value;
+        filled[positional_index] = !value.is_null();
+        positional_index += 1;
     }
-    if let Some(dict) = kwargs {
-        let entries = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) };
-        for (key, val) in entries.iter() {
-            if key.as_str() == Ok("__pyre_kw__") {
+    if let Some(entries) = keyword_entries.as_ref() {
+        let mut entry_index = 0;
+        while entry_index < entries.len() {
+            let (key, val) = &entries[entry_index];
+            let key_str = if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(key) } {
+                Some(unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(key) })
+            } else {
+                None
+            };
+            if key_str == Some("__pyre_kw__") {
+                entry_index += 1;
                 continue;
             }
-            match names.iter().position(|n| key.as_str() == Ok(*n)) {
+            let mut matched_index = None;
+            let mut name_index = 0;
+            while name_index < names.len() {
+                if key_str == Some(names[name_index]) {
+                    matched_index = Some(name_index);
+                    break;
+                }
+                name_index += 1;
+            }
+            match matched_index {
                 Some(idx) => {
                     if filled[idx] {
                         return Err(crate::PyError::type_error(format!(
@@ -5093,27 +5139,47 @@ pub(crate) fn bind_builtin_kwargs(
                 // so a call that misses a required argument is reported
                 // against that argument even when it also passed a keyword
                 // the function does not know.
-                None => unknown = Some(key.to_wtf8_buf()),
+                None => unknown = Some(entry_index),
             }
+            entry_index += 1;
         }
     }
-    for i in 0..names.len() {
-        if !filled[i] && required[i] {
+    let mut name_index = 0;
+    while name_index < names.len() {
+        if !filled[name_index] && required[name_index] {
             return Err(crate::PyError::type_error(format!(
                 "{fn_name}() missing required argument '{}' (pos {})",
-                names[i],
-                i + 1,
+                names[name_index],
+                name_index + 1,
             )));
         }
+        name_index += 1;
     }
-    if let Some(key) = unknown {
-        let mut msg =
-            Wtf8Buf::from_string(format!("{fn_name}() got an unexpected keyword argument '"));
-        msg.push_wtf8(&key);
-        msg.push_str("'");
-        return Err(crate::PyError::type_error(msg));
+    if let Some(entry_index) = unknown {
+        let entries = keyword_entries
+            .as_ref()
+            .expect("an unknown keyword index requires keyword entries");
+        return builtin_unexpected_keyword_failure(fn_name, &entries[entry_index].0);
     }
     Ok(scope)
+}
+
+/// Cold `Arguments._match_signature` unexpected-keyword formatter.
+///
+/// PyPy retains an `ArgErrUnknownKwds` until the gateway converts it to the
+/// final `TypeError`, so accepted calls never trace WTF-8 string assembly.
+/// Keep the same boundary here; the hot binder carries only the offending
+/// entry index and reaches this residual helper after missing-required checks.
+#[cold]
+#[majit_macros::dont_look_inside]
+pub(crate) fn builtin_unexpected_keyword_failure(
+    fn_name: &str,
+    key: &rustpython_wtf8::Wtf8,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    let mut msg = Wtf8Buf::from_string(format!("{fn_name}() got an unexpected keyword argument '"));
+    msg.push_wtf8(key);
+    msg.push_str("'");
+    Err(crate::PyError::type_error(msg))
 }
 
 /// Resolve a builtin with a single required positional-or-keyword parameter
@@ -19216,14 +19282,13 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     } else {
         space_index_w(level_obj)?
     };
-    let exec_ctx = crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            std::ptr::null::<crate::PyExecutionContext>()
-        } else {
-            unsafe { (*frame).execution_context }
-        }
-    });
+    // PyPy's `interp___import__` receives `space` and any slow native-import
+    // fallback reaches the execution context through
+    // `space.getexecutioncontext()`.  Do not recover it from pyre's
+    // portal-level CURRENT_FRAME TLS: an inlined callee has its own red frame,
+    // while that anchor can still name the caller.  The established
+    // object-space analogue owns the shared execution context directly.
+    let exec_ctx = crate::call::getexecutioncontext();
     // The native importer keys every lookup by `&str`, so a name that has no
     // such spelling goes straight to the app-level bootstrap.  Re-read the
     // name through its root: `space_index_w` above may have moved it.
@@ -19235,6 +19300,30 @@ fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     };
     crate::importing::dunder_import(name, globals, locals, fromlist, level, exec_ctx)
 }
+
+/// Gateway target for `builtins.__import__`.
+///
+/// PyPy exposes `interp___import__` through `interp2app`; its generated
+/// `BuiltinCode.func` wrapper is therefore a member of the annotator's PBC
+/// family and the meta-interpreter can descend through it.  Hand-written
+/// builtins have to publish that wrapper explicitly in pyre (the same shape
+/// used by `__pyre_wrap_builtin_len` below), otherwise an `IMPORT_NAME`
+/// reached through the ordinary CALL path stops at an opaque native function
+/// pointer instead of tracing `dunder_import` / `gcd_import_fast`.
+pub fn __pyre_wrap_builtin_dunder_import(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    builtin_dunder_import(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __pyre_wrap_builtin_dunder_import_target: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", "__pyre_wrap_builtin_dunder_import"),
+        func: __pyre_wrap_builtin_dunder_import,
+    };
 
 #[cfg(test)]
 mod tests {

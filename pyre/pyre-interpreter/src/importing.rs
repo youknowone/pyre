@@ -2738,13 +2738,11 @@ pub fn add_sys_path_0() {
 // ── check_sys_modules ────────────────────────────────────────────────
 // PyPy equivalent: importing.py `check_sys_modules(space, w_modulename)`
 
-/// Reads the process-owned `SYS_MODULES` registry (and the runtime-stamped
-/// `sys.modules` dict through `sys_modules_dict`), neither a build-time
-/// constant, so the JIT residualizes the call rather than folding a stale
-/// `sys.modules` snapshot (`@dont_look_inside`, the `sys_modules_dict` /
-/// `lookup_exc_class` shape).  The `Option<PyObjectRef>` return fits one word
-/// and the `&str` argument matches `lookup_exc_class`.
-#[majit_macros::dont_look_inside]
+/// PyPy `importing.py:check_sys_modules` is an ordinary traceable lookup.
+/// The mutable `sys.modules` dictionary supplies the invalidation boundary;
+/// hiding this whole function behind `dont_look_inside` turns the cached
+/// import fast path into an `EF_RANDOM_EFFECTS` residual and prevents the
+/// optimizer from seeing the dictionary read at all.
 pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     // Once installed, the Python-visible dict is the sole semantic module
     // cache.  PyPy's `check_sys_modules` reads `space.sys.get('modules')` and
@@ -4570,7 +4568,7 @@ fn absolute_import(
 /// PyPy equivalent: pyopcode.py `IMPORT_NAME`.
 pub fn import_name(
     frame: &mut PyFrame,
-    name: &str,
+    w_modulename: PyObjectRef,
     w_fromlist: PyObjectRef,
     w_flag: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -4592,8 +4590,6 @@ pub fn import_name(
         _ => pyre_object::w_none(),
     };
     let w_globals = frame.get_w_globals();
-    let w_modulename = pyre_object::w_str_new(name);
-
     crate::call::call_callable(
         frame,
         w_import,

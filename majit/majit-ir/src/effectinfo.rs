@@ -901,6 +901,10 @@ pub enum PyreHelperKind {
     /// helper (`pyopcode.py:866-870`). Same standing as
     /// [`PyreHelperKind::LoadLocals`].
     LoadBuildClass,
+    /// `bh_load_import_fn(frame)` — the builtin lookup half of IMPORT_NAME.
+    /// The following invocation is emitted through [`PyreHelperKind::CallFn`]
+    /// so gateway builtins retain their ordinary meta-traceable call shape.
+    LoadImport,
     /// `bh_call_fn_N(callable, null_or_self, args...)` — the CALL-family
     /// Python-call helper.  `null_or_self` (arg index 1) is a sentinel
     /// the helper checks before use (a non-null receiver is prepended as

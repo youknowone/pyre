@@ -5917,65 +5917,6 @@ pub extern "C" fn bh_delete_attr_fn(obj: i64, w_code_ptr: i64, name_idx: i64) ->
     0
 }
 
-/// IMPORT_NAME residual (`import_name` HLOp → `residual_call_ir_r`).
-/// Resolves the module name from the jitcode's own code object via
-/// `name_idx` (same `co_names` invariant as `bh_load_attr_fn`), fetches
-/// `__import__` from the threaded frame's builtins, and calls it with the
-/// frame's globals and locals. Importing a module may run its
-/// top-level Python (`MayForce`); on error the exception is published
-/// through `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the
-/// call returns 0.  `fromlist` and `level` are the two popped operands
-/// (`eval.rs import_name`: `fromlist = pop()`, `level = pop()`).
-pub extern "C" fn bh_import_name_fn(
-    fromlist: i64,
-    level: i64,
-    w_code_ptr: i64,
-    frame_ptr: i64,
-    name_idx: i64,
-) -> i64 {
-    let w_code = w_code_ptr as pyre_object::PyObjectRef;
-    let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
-    };
-    let idx = name_idx as usize;
-    debug_assert!(
-        idx < code.names.len(),
-        "bh_import_name_fn name_idx {idx} out of range ({} names) — codegen invariant",
-        code.names.len()
-    );
-    if idx >= code.names.len() {
-        return 0;
-    }
-    let name = code.names[idx].as_ref();
-    let frame = frame_ptr as *mut PyFrame;
-    debug_assert!(!frame.is_null(), "IMPORT_NAME requires a live frame");
-    if frame.is_null() {
-        // IMPORT_NAME produces a module or raises; it never yields a null
-        // result.  A null frame cannot honour that, so fail closed by
-        // publishing an exception for the trailing `GuardNoException`
-        // instead of returning a bare 0 the guard would accept.
-        let mut err = pyre_interpreter::PyError::new(
-            pyre_interpreter::PyErrorKind::SystemError,
-            "IMPORT_NAME residual received a null frame",
-        );
-        publish_residual_call_exception(err.to_exc_object() as i64);
-        return 0;
-    }
-    match pyre_interpreter::importing::import_name(
-        unsafe { &mut *frame },
-        name,
-        fromlist as pyre_object::PyObjectRef,
-        level as pyre_object::PyObjectRef,
-    ) {
-        Ok(module) => module as i64,
-        Err(mut err) => {
-            let exc_obj = err.to_exc_object();
-            publish_residual_call_exception(exc_obj as i64);
-            0
-        }
-    }
-}
-
 /// IMPORT_FROM residual (`import_from` HLOp → `residual_call_ir_r`).
 /// Resolves the attribute name from the jitcode's own code object via
 /// `name_idx` (same `co_names` invariant as `bh_load_attr_fn`) and runs
@@ -6529,6 +6470,47 @@ pub extern "C" fn bh_load_build_class_fn(frame_ptr: i64) -> i64 {
             0
         }
     }
+}
+
+/// IMPORT_NAME's builtin lookup, split from the subsequent Python call just
+/// like PyPy's `pyopcode.py:IMPORT_NAME` (`get_builtin().__import__`, then
+/// `space.call_function`).  Keeping this lookup as a small residual lets the
+/// ordinary `CallFn` path descend through a gateway `BuiltinCode.func` rather
+/// than hiding the whole importer behind one opaque residual.
+pub extern "C" fn bh_load_import_fn(frame_ptr: i64) -> i64 {
+    let frame = frame_ptr as *mut PyFrame;
+    debug_assert!(
+        !frame.is_null(),
+        "bh_load_import_fn requires a non-null PyFrame"
+    );
+    if frame.is_null() {
+        let mut err = pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::SystemError,
+            "IMPORT_NAME received a null frame",
+        );
+        publish_residual_call_exception(err.to_exc_object() as i64);
+        return 0;
+    }
+    let w_builtin = unsafe { (*frame).get_builtin() };
+    if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+        let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        if !w_dict.is_null() {
+            match pyre_interpreter::baseobjspace::finditem_str(w_dict, "__import__") {
+                Ok(Some(value)) => return value as i64,
+                Ok(None) => {}
+                Err(mut err) => {
+                    publish_residual_call_exception(err.to_exc_object() as i64);
+                    return 0;
+                }
+            }
+        }
+    }
+    let mut err = pyre_interpreter::PyError::new(
+        pyre_interpreter::PyErrorKind::ImportError,
+        "__import__ not found",
+    );
+    publish_residual_call_exception(err.to_exc_object() as i64);
+    0
 }
 
 /// DELETE_GLOBAL residual using the frame receiver and interned-name ABI.
