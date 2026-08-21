@@ -9,6 +9,12 @@ change ADDS, so the rule applies from here on rather than retroactively.
 Modes:
   (default)      the staged diff, for a pre-commit hook
   --base REF     everything REF..HEAD adds, for CI on a pull request
+  --annotate     report as GitHub annotations and exit 0
+
+The commit hook fails: that is the moment the line is being written and the
+cheapest one at which to fix it. CI annotates instead, so a branch that
+predates the hook -- or a commit made with `--no-verify` -- still shows the
+citation on the diff without walling work that is already in flight.
 
 A line that genuinely needs a number -- an unnamed arm inside a long function,
 a module-level comment with no symbol at all -- keeps it by carrying
@@ -50,6 +56,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", help="diff against this ref instead of the index")
+    ap.add_argument("--annotate", action="store_true",
+                    help="emit GitHub annotations and exit 0 instead of failing")
     ap.add_argument("files", nargs="*", help="ignored; pre-commit passes them")
     args = ap.parse_args()
 
@@ -66,6 +74,18 @@ def main():
 
     if not bad:
         return 0
+
+    if args.annotate:
+        # `::warning file=,line=::` puts the marker on the line itself in the
+        # PR's Files-changed view. A message carries no raw newline.
+        for path, lineno, cite, _text in bad:
+            print(f"::warning file={path},line={lineno},"
+                  f"title=Cite upstream by symbol::`{cite}` names a line number. "
+                  "Drop the `:LINE` and name the symbol, or add "
+                  f"`{ESCAPE}` to record that the number was deliberate.")
+        print(f"{len(bad)} new line-number citation(s); see the annotations above.")
+        return 0
+
     print("Upstream citations must name a symbol, not a line number "
           "(AGENTS.md, Porting discipline).\n")
     for path, lineno, cite, text in bad:
