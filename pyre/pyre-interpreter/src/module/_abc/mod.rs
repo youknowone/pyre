@@ -30,6 +30,12 @@ fn simple_weak_set_type() -> PyObjectRef {
         .expect("_abc.SimpleWeakSet must be installed at module init") as PyObjectRef
 }
 
+/// The `__contains__` `app_abc.py` defines, stashed beside its type.  The
+/// class is an ordinary heap type, so the method is rebindable, and answering
+/// natively is only sound while the one installed here is still the one a
+/// membership test would reach.
+static SIMPLE_WEAK_SET_CONTAINS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
 /// `SimpleWeakSet()` — the empty collection `_abc_init` installs and the
 /// invalidation in `subclass_of` rebinds to.
 fn new_simple_weak_set() -> Result<PyObjectRef, crate::PyError> {
@@ -73,6 +79,15 @@ fn simple_weak_set_contains(
     if !crate::typedef::r#type(cache)
         .is_some_and(|actual| std::ptr::eq(actual.as_ptr(), simple_weak_set_type()))
     {
+        return Ok(None);
+    }
+    // The receiver being that class is not enough: rebinding the class's own
+    // `__contains__` leaves every instance an exact `SimpleWeakSet` while
+    // changing what a membership test answers.
+    let installed = SIMPLE_WEAK_SET_CONTAINS.get().copied().unwrap_or(0);
+    let current =
+        unsafe { crate::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__") };
+    if installed == 0 || current.map_or(0, |m| m as usize) != installed {
         return Ok(None);
     }
     let roots = pyre_object::gc_roots::push_roots();
@@ -666,5 +681,10 @@ crate::py_module! {
         let simple_weak_set = crate::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
+        if let Some(contains) =
+            unsafe { crate::baseobjspace::lookup_in_type(simple_weak_set, "__contains__") }
+        {
+            let _ = SIMPLE_WEAK_SET_CONTAINS.set(contains as usize);
+        }
     },
 }
