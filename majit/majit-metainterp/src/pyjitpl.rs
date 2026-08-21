@@ -877,7 +877,15 @@ fn prepare_bridge_trace_for_optimizer(
     let inputargs = bridge_inputargs
         .iter()
         .zip(iter.inputargs.iter())
-        .map(|(arg, ia)| InputArg::from_type(arg.tp, ia.opref().raw()))
+        .map(|(arg, ia)| {
+            let reminted = InputArg::from_type(arg.tp, ia.opref().raw());
+            // The inputarg half carries its value for the same reason as the op
+            // loop above: pyjitpl.py:3213 keeps original InputArg and Op boxes alike.
+            if let Some(value) = arg.get_value() {
+                reminted.set_value(value);
+            }
+            reminted
+        })
         .collect();
     let cache = iter._cache;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
@@ -12620,6 +12628,40 @@ impl<M: Clone> MetaInterp<M> {
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        // Bridge inputarg `InputArg*.value` stamp.
+        //
+        // bridgeopt.py:124 `deserialize_optimizer_knowledge` receives
+        // `frontend_boxes` (the source guard's live boxes) alongside
+        // `liveboxes` (the bridge inputargs). It reads class knowledge
+        // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` at :145
+        // and heap knowledge through `decode_box` at :153-157.
+        //
+        // Pyre stamps the `frontend_boxes` concrete values onto the
+        // bridge inputarg operands here, so `runtime_value_of` and
+        // `cls_of_box` consumers in the optimizer can read them.
+        // The stamp must precede `closing_jump_runtime_boxes`, which folds a
+        // valued inputarg JUMP arg into an inline Const.
+        if let Some(frontend_boxes) = self.pending_frontend_boxes.as_deref() {
+            // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)` —
+            // failed source-guard `fail_args` must be paired 1:1 with
+            // the bridge's `liveboxes` (== `bridge_inputargs` here).  A
+            // length mismatch is a fail_args-vs-liveboxes plumbing bug,
+            // not a "partial fill" mode RPython tolerates.
+            assert_eq!(
+                frontend_boxes.len(),
+                bridge_inputargs.len(),
+                "bridge frontend_boxes ({}) ≠ bridge_inputargs ({}); \
+                 fail_args plumbing diverged from liveboxes (bridgeopt.py:126)",
+                frontend_boxes.len(),
+                bridge_inputargs.len(),
+            );
+            for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
+                let value = heap_value_for(ia.tp, raw);
+                // Stamp the concrete value on the canonical bridge `InputArg`
+                // identity (`history.py:803 *FrontendOp(pos, value)`).
+                ia.set_value(value);
+            }
+        }
         // compile.py:1056 / unroll.py:183 parity: runtime_boxes are passed
         // separately from the trace iterator and stay as the original live
         // boxes from the closing JUMP.
@@ -12674,38 +12716,6 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
-        // Bridge inputarg `InputArg*.value` stamp.
-        //
-        // bridgeopt.py `deserialize_optimizer_knowledge` receives
-        // `frontend_boxes` (the source guard's live boxes) alongside
-        // `liveboxes` (the bridge inputargs). It reads class knowledge
-        // via `optimizer.cpu.cls_of_box(frontend_boxes[i])` at :145
-        // and heap knowledge through `decode_box` at :153-157.
-        //
-        // Pyre stamps the `frontend_boxes` concrete values onto the
-        // bridge inputarg operands here, so `runtime_value_of` and
-        // `cls_of_box` consumers in the optimizer can read them.
-        if let Some(frontend_boxes) = self.pending_frontend_boxes.as_deref() {
-            // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)` —
-            // failed source-guard `fail_args` must be paired 1:1 with
-            // the bridge's `liveboxes` (== `bridge_inputargs` here).  A
-            // length mismatch is a fail_args-vs-liveboxes plumbing bug,
-            // not a "partial fill" mode RPython tolerates.
-            assert_eq!(
-                frontend_boxes.len(),
-                bridge_inputargs.len(),
-                "bridge frontend_boxes ({}) ≠ bridge_inputargs ({}); \
-                 fail_args plumbing diverged from liveboxes (bridgeopt.py:126)",
-                frontend_boxes.len(),
-                bridge_inputargs.len(),
-            );
-            for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
-                let value = heap_value_for(ia.tp, raw);
-                // Stamp the concrete value on the canonical bridge `InputArg`
-                // identity (`history.py *FrontendOp(pos, value)`).
-                ia.set_value(value);
-            }
-        }
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
@@ -13315,7 +13325,25 @@ impl<M: Clone> MetaInterp<M> {
         // Optimizer::optimize_bridge docstring for the RPython identity
         // model this mirrors (opencoder.py:249-273).
         let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
-        // compile.py: BridgeCompileData is built from the original
+        if let Some(prd) = pending_bridge_rd.as_ref() {
+            // bridgeopt.py:126 `assert len(frontend_boxes) == len(liveboxes)`.
+            // The concrete values belong on the pre-iterator bridge InputArg
+            // objects themselves, mirroring `FrontendOp(pos, value)` rather
+            // than a side table keyed by OpRef.
+            assert_eq!(prd.frontend_boxes.len(), prd.liveboxes.len());
+            for (&livebox, &raw) in prd.liveboxes.iter().zip(prd.frontend_boxes.iter()) {
+                let tp = livebox
+                    .ty()
+                    .expect("bridge livebox OpRef must carry box.type");
+                if tp == Type::Void {
+                    continue;
+                }
+                if let Some(ia) = bridge_inputargs.iter().find(|ia| ia.opref() == livebox) {
+                    ia.set_value(heap_value_for(tp, raw));
+                }
+            }
+        }
+        // compile.py:1056-1060: BridgeCompileData is built from the original
         // history trace/runtime boxes. The explicit Rust TraceIterator
         // preparation below mirrors unroll.py:187 `trace = trace.get_iter()`
         // and must happen after this payload is formed.
@@ -13381,24 +13409,6 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().unwrap().clone();
-        if let Some(prd) = pending_bridge_rd.as_ref() {
-            // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)`.
-            // The concrete values belong on the fresh bridge InputArg objects
-            // themselves, mirroring `FrontendOp(pos, value)` rather than a
-            // side table keyed by OpRef.
-            assert_eq!(prd.frontend_boxes.len(), prd.liveboxes.len());
-            for (&livebox, &raw) in prd.liveboxes.iter().zip(prd.frontend_boxes.iter()) {
-                let tp = livebox
-                    .ty()
-                    .expect("bridge livebox OpRef must carry box.type");
-                if tp == Type::Void {
-                    continue;
-                }
-                if let Some(ia) = bridge_inputargs.iter().find(|ia| ia.opref() == livebox) {
-                    ia.set_value(heap_value_for(tp, raw));
-                }
-            }
-        }
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = bridge_constants
@@ -23099,6 +23109,30 @@ mod tests {
             prepared.runtime_boxes,
             vec![OpRef::ref_op(12), OpRef::int_op(13)]
         );
+    }
+
+    /// pyjitpl.py:3213 + unroll.py:187: original inputarg boxes retain their
+    /// observed runtime values across the fresh trace iterator.
+    #[test]
+    fn prepare_bridge_trace_carries_inputarg_runtime_values() {
+        let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
+        bridge_inputargs[0].set_value(Value::Int(42));
+
+        let prepared = prepare_bridge_trace_for_optimizer(
+            &[],
+            &bridge_inputargs,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            10,
+        );
+
+        assert_eq!(prepared.inputargs[0].get_value(), Some(Value::Int(42)));
+        assert_eq!(prepared.inputargs[1].get_value(), None);
     }
 
     #[test]
