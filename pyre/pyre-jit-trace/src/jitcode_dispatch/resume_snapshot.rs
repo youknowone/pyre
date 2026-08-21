@@ -49,8 +49,18 @@ fn forward_snapshot_py_pc(jitcode_index: u32, pc: u32) -> Result<u32, DispatchEr
     if pc == majit_ir::resumedata::NO_JITCODE_PC as u32 {
         return Ok(u32::MAX);
     }
-    crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
-        .and_then(|payload| payload.resume_position_for_jitcode_pc(pc as usize))
+    let payload = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: pc as usize })?;
+    // A level with no Python code object has no Python pc, and so no entry in
+    // a table keyed by one.  `descr_call`'s tail (`crate::ctor_continuation`)
+    // is the one such level; `u32::MAX` is the same "no coordinate" answer the
+    // sentinel arm above gives, and what every reader of this field already
+    // treats as absent.
+    if payload.code_ptr.is_null() {
+        return Ok(u32::MAX);
+    }
+    payload
+        .resume_position_for_jitcode_pc(pc as usize)
         .map(|(_, py_pc)| py_pc)
         .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: pc as usize })
 }
@@ -235,13 +245,13 @@ fn walker_capture_inline_nonstandard_vable_guard_inner<Sym: WalkSym>(
             session
                 .framestack
                 .iter()
-                .filter(|frame| frame.parent.is_some())
+                .filter(|frame| !frame.parents.is_empty())
                 .count(),
             session.framestack.len(),
             session
                 .framestack
                 .iter()
-                .filter_map(|frame| frame.parent.clone())
+                .flat_map(|frame| frame.parents.iter().cloned())
                 .collect::<Vec<_>>(),
         )
     };
@@ -315,7 +325,7 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     let n_parents = session
         .framestack
         .iter()
-        .filter(|frame| frame.parent.is_some())
+        .filter(|frame| !frame.parents.is_empty())
         .count();
     n_parents > 0 && n_parents == session.framestack.len()
 }
@@ -439,7 +449,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             session
                 .framestack
                 .iter()
-                .filter_map(|frame| frame.parent.clone())
+                .flat_map(|frame| frame.parents.iter().cloned())
                 .collect::<Vec<_>>()
         };
         // Fire the multi-frame snapshot only when the paused-caller chain
@@ -3044,33 +3054,10 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         let pf_py_pc = forward_snapshot_py_pc(pf.jitcode_index, pf_pc_word)?;
         frames.push((pf.jitcode_index, pf_pc_word, pf_py_pc, pf.boxes.as_slice()));
     }
-    // `descr_call`'s tail, between the caller and `__init__` — the level
-    // upstream gets for free because `descr_call` is an ordinary graph on the
-    // framestack `capture_resumedata` hands over.  It carries one box, the
-    // instance, and on the way out its `ref_return` is what fills the caller's
-    // pending call-result slot; without it the blackhole would deliver
-    // `__init__`'s `None` there instead.  See `crate::ctor_continuation`.
-    let ctor_instance = ctx.fbw_mode.ctor_continuation_instance;
-    let ctor_boxes;
-    if ctor_instance != OpRef::NONE {
-        let (Some(cont_index), Some(cont_pc)) = (
-            crate::ctor_continuation::jitcode_index(),
-            crate::ctor_continuation::resume_pc(),
-        ) else {
-            return Err(DispatchError::callee_inline_unsupported(callee_op_pc));
-        };
-        ctor_boxes = [ctor_instance];
-        // The level has no Python code object, so it has no Python pc
-        // either.  `u32::MAX` is what `forward_snapshot_py_pc` already answers
-        // for a frame with no Python coordinate, so it is the existing
-        // spelling rather than a new sentinel.
-        frames.push((
-            cont_index as u32,
-            cont_pc as u32,
-            u32::MAX,
-            ctor_boxes.as_slice(),
-        ));
-    }
+    // `descr_call`'s tail needs no case of its own here: the constructor
+    // inline records it among `__init__`'s level's `parents`, so the loop
+    // above already emitted it — at its own depth, however deep the chain
+    // below it goes.  See `crate::ctor_continuation`.
     let callee_py_pc =
         forward_snapshot_py_pc(callee_jitcode_index as u32, callee_jitcode_pc as u32)?;
     frames.push((

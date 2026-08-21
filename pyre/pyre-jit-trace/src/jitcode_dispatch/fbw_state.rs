@@ -1842,7 +1842,7 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
                 .framestack
                 .first()
                 .filter(|f| fbw_executed_effect_count() == f.entry_executed_effects);
-            let (outer_resume, stack_overrides) = match outermost.and_then(|f| f.parent.as_ref()) {
+            let (outer_resume, stack_overrides) = match outermost.and_then(|f| f.parents.first()) {
                 Some(frame) => (
                     frame.call_jitcode_pc.map(|jit_pc| {
                         (

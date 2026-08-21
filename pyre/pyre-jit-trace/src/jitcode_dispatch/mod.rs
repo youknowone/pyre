@@ -495,9 +495,18 @@ pub struct InlineFrame {
     /// reaches [`FBW_MAX_INLINE_RECURSION`], the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py`).
     pub w_code: usize,
-    /// Paused caller snapshot for the multi-frame path. `None` preserves the
-    /// straight-line single-frame collapse while retaining the callee level.
-    pub parent: Option<InlineParentFrame>,
+    /// Paused levels sitting between this callee and the next one out,
+    /// OUTERMOST-FIRST; empty preserves the straight-line single-frame
+    /// collapse while retaining the callee level.
+    ///
+    /// Usually one — the caller paused at its CALL.  A constructor adds a
+    /// second: `typeobject.py descr_call` runs between the caller and
+    /// `__init__`, and upstream that is simply another `MIFrame` on
+    /// `metainterp.framestack`, which `capture_resumedata` hands over whole
+    /// and `convert_and_run_from_pyjitpl` chains in order.  Holding the chain
+    /// per level is what keeps such a level at its own depth however deep the
+    /// callee chain below it goes.
+    pub parents: Vec<InlineParentFrame>,
     /// [`FBW_EXECUTED_EFFECT_COUNT`] when this level was entered, i.e. at the
     /// CALL its `parent` pauses on.  An abort-point flush that resumes the
     /// caller AT that CALL re-executes the call, discarding everything this
@@ -1478,15 +1487,6 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// specialization census prove that every captured callee guard was
     /// actually stamped.
     pub instance_next_foriter_census_active: bool,
-    /// The instance `__new__` produced, while this sub-walk is an inlined
-    /// `__init__`.  `OpRef::NONE` for every other callee.
-    ///
-    /// A guard in here resumes through one more level than an ordinary inline:
-    /// `descr_call`'s tail (`ctor_continuation`), which owns the discard of
-    /// `__init__`'s result and hands this instance back as the CALL's value.
-    /// The box travels on the walk mode because the CALL site knows it and the
-    /// guard — anywhere in the body — is what needs it.
-    pub ctor_continuation_instance: OpRef,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -1534,7 +1534,6 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             bridge_entry_merge_pc: None,
             instance_next_foriter_green_key: None,
             instance_next_foriter_census_active: false,
-            ctor_continuation_instance: OpRef::NONE,
         }
     }
 }
@@ -6149,6 +6148,36 @@ enum ParentResumeCoord {
     CallFallthrough(usize),
 }
 
+/// `typeobject.py descr_call` paused between the caller's CALL and `__init__`.
+///
+/// Upstream this level costs nothing to build — `descr_call` is an ordinary
+/// graph, so `perform_call` already pushed its `MIFrame` and
+/// `capture_resumedata` hands it over with the rest of the framestack. Pyre's
+/// walker synthesises the type call instead of entering that graph
+/// (`try_walker_inline_type_call`), so the level has to be spelled out; the
+/// jitcode it names is `crate::ctor_continuation`'s.
+///
+/// `boxes` is the instance alone: that is the tail's whole live state, and its
+/// `ref_return` is what fills the caller's pending call-result slot on the way
+/// out. `blackhole` is `None` because the level owns no register banks to
+/// force, and `call_stack_overrides` is empty because it has no operand stack.
+pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlineParentFrame> {
+    let jitcode_index = crate::ctor_continuation::jitcode_index()?;
+    let resume_pc = crate::ctor_continuation::resume_pc()?;
+    Some(InlineParentFrame {
+        jitcode_index: jitcode_index as u32,
+        call_jitcode_pc: None,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        // The tail has no Python code object and so no Python pc. `Backxlat`
+        // over a codeless jitcode is what already answers `u32::MAX` for such
+        // a frame, which is the existing spelling for "no Python coordinate".
+        resume_coord: ParentResumeCoord::Backxlat(resume_pc),
+        resume_marker_jit_pc: Some(resume_pc),
+        boxes: vec![instance],
+    })
+}
+
 /// RAII guard for one framestack level. Pop on drop so `?` and nested
 /// sub-walks unwind to the caller's level.
 struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);
@@ -6180,11 +6209,11 @@ impl<'a> InlineFrameGuard<'a> {
     fn enter(
         session: &'a std::cell::RefCell<WalkSession>,
         w_code: usize,
-        parent: Option<InlineParentFrame>,
+        parents: Vec<InlineParentFrame>,
     ) -> Self {
         session.borrow_mut().framestack.push(InlineFrame {
             w_code,
-            parent,
+            parents,
             entry_executed_effects: fbw_executed_effect_count(),
         });
         if fbw_depth_census_enabled() {
@@ -7004,7 +7033,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         // session that is live for the duration of this quiesced walk.
         let session = unsafe { &mut *(*session_ptr).as_ptr() };
         for frame in session.framestack.iter_mut() {
-            if let Some(parent) = frame.parent.as_mut() {
+            for parent in frame.parents.iter_mut() {
                 for (_slot, value) in parent.call_stack_overrides.iter_mut() {
                     visitor(unsafe { &mut *(value as *mut pyre_object::PyObjectRef).cast() });
                 }
@@ -9859,7 +9888,7 @@ fn guarded_branch_core<Sym: WalkSym>(
             let n_parents = session
                 .framestack
                 .iter()
-                .filter(|frame| frame.parent.is_some())
+                .filter(|frame| !frame.parents.is_empty())
                 .count();
             let n_callees = session.framestack.len();
             !(n_parents > 0 && n_parents == n_callees)

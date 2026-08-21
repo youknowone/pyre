@@ -53,6 +53,13 @@
 //! replay-safety scan in `fbw_state.rs` stays: its other caller decides
 //! FOR_ITER-in-flight admission, which is a rewind question, not a deopt one.)
 //!
+//! The level is recorded the way upstream's is: as one of the paused levels
+//! on `__init__`'s framestack entry (`InlineFrame::parents`, outermost-first),
+//! not as a value the snapshot splices in at a fixed offset.  That is what
+//! keeps it at its own depth when `__init__` itself inlines a callee — the
+//! chain becomes `caller -> tail -> __init__ -> callee`, which is exactly what
+//! `capture_resumedata` would hand over upstream.
+//!
 //! So this module builds the tail, and only the tail, as its own jitcode:
 //!
 //! ```text
@@ -260,6 +267,30 @@ mod tests {
             startpoints.len(),
             4,
             "startpoints must cover every op in the tail, got {startpoints:?}",
+        );
+    }
+
+    /// The generic paused-level loop resolves every parent's resume offset
+    /// through `resolve_resume_pc_with_jitcode_pc`, so the tail must answer it
+    /// like any other level — otherwise recording the tail as an ordinary
+    /// parent aborts the guard with `GuardResumeCoordinateUnavailable`.
+    #[test]
+    fn the_anchor_resolves_as_an_ordinary_parent_resume_coordinate() {
+        let Some((index, resume_pc)) = level() else {
+            return;
+        };
+        let payload = crate::state::pyjitcode_for_jitcode_index(index)
+            .expect("the tail was just installed at this index");
+        assert!(
+            payload
+                .jitcode
+                .can_decode_live_vars(resume_pc, crate::state::op_live()),
+            "the anchor must decode its live vars",
+        );
+        assert_eq!(
+            payload.resolve_resume_pc_with_jitcode_pc(resume_pc as i32, crate::state::op_live()),
+            Some(resume_pc),
+            "the parent loop must resolve the anchor to itself",
         );
     }
 

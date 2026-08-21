@@ -332,8 +332,8 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     let session = ctx.session.borrow();
     let parent = need!(
         need!(session.framestack.first(), "empty framestack")
-            .parent
-            .as_ref(),
+            .parents
+            .first(),
         "innermost frame has no parent"
     );
     let call_jit_pc = need!(parent.call_jitcode_pc, "parent has no call_jitcode_pc");
@@ -1036,12 +1036,18 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     }
     let mut frames = majit_metainterp::MIFrameStack::empty();
 
-    for (index, inline) in session.framestack.iter().enumerate() {
-        let Some(parent) = inline.parent.as_ref() else {
-            s2dbg!("origin={origin} frame {index}: no parent");
-            return None;
-        };
+    for (index, parent) in session
+        .framestack
+        .iter()
+        .flat_map(|inline| inline.parents.iter())
+        .enumerate()
+    {
         let Some(concrete) = parent.blackhole.as_ref() else {
+            // `descr_call`'s tail reaches here too, and captures no image
+            // because it owns no register banks. Declining is the same
+            // best-effort answer any uncaptured parent gets — never a chain
+            // with a level missing, which would deliver the callee's return
+            // into the wrong caller's slot.
             s2dbg!("origin={origin} frame {index}: parent.blackhole None (capture missing)");
             return None;
         };

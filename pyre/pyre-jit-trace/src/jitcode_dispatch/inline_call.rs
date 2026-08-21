@@ -2829,7 +2829,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // sub-context it builds, so every descent into a canonical helper body
     // carries it — not just the ones entered from another sub-walk.
     let _helper_frame =
-        nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, Some(frame)));
+        nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, vec![frame]));
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -3166,17 +3166,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let positional_only = fbw_callee_scope_is_positional_only(w_code);
     let vararg_slot = fbw_callee_vararg_slot(w_code);
     if !positional_only && vararg_slot.is_none() {
-        return resolved_inline_decline(op.pc, line!());
-    }
-    // A tail on the walk mode means this sub-walk IS `__init__`'s, so inlining
-    // a callee under it would put a second frame between `__init__` and the
-    // guard.  `walker_capture_multi_frame_inline_snapshot` writes the tail
-    // directly beneath whichever callee is current, and the position it needs
-    // is beneath `__init__` — so at that depth it would be recorded one frame
-    // too low, and the chain would deliver the nested callee's return into
-    // `descr_call`'s slot.  Keep the nested call residual: `__init__` stays a
-    // single frame and the tail keeps the only position it can occupy.
-    if ctx.fbw_mode.ctor_continuation_instance != OpRef::NONE {
         return resolved_inline_decline(op.pc, line!());
     }
     // Not every caller pins the callee function itself.  A specializer that
@@ -4914,15 +4903,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 inline_caller_py_pc,
                 instance_next_foriter_green_key,
                 instance_next_foriter_census_active: instance_next_seeded_route,
-                // Only a seeded callee reaches
-                // `walker_capture_multi_frame_inline_snapshot`, which is what
-                // records `descr_call`'s tail.  A constructor that collapsed
-                // to the caller boundary resumes by re-executing the CALL and
-                // must not name a level nothing wrote a section for.
-                ctor_continuation_instance: match constructor_result {
-                    Some((instance, _)) if callee_frame_materialized_has_resume => instance,
-                    _ => OpRef::NONE,
-                },
                 ..ctx.fbw_mode
             },
             session: ctx.session,
@@ -4957,7 +4937,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
         // Track this callee for the lifetime of the sub-walk so nested
         // self-calls see the correct recursion depth.
-        let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parent_frame);
+        //
+        // A constructor pauses TWO levels here, outermost-first: the caller at
+        // its CALL, then `descr_call`'s tail, which upstream is an ordinary
+        // `MIFrame` between them.  Recording it on this level is what puts it
+        // at its own depth for every guard below, including one inside a
+        // callee `__init__` itself inlines.
+        let mut parents: Vec<InlineParentFrame> = parent_frame.into_iter().collect();
+        if let Some((instance, _)) = constructor_result
+            && callee_frame_materialized_has_resume
+        {
+            let Some(tail) = super::ctor_continuation_parent_frame(instance) else {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            };
+            parents.push(tail);
+        }
+        let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parents);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
@@ -7755,7 +7750,6 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
                 // `descr_call`'s tail.  `walker_capture_multi_frame_inline_
                 // snapshot` routes this mode away before it reads the field,
                 // so this is the statement of intent rather than the fix.
-                ctor_continuation_instance: OpRef::NONE,
                 ..ctx.fbw_mode
             },
             session: ctx.session,
