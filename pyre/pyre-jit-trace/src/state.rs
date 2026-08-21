@@ -10922,6 +10922,14 @@ impl JitState for PyreJitState {
                 .filter(|op| !op.is_none())
                 .unwrap_or(OpRef::NONE)
         };
+        // Both outcomes compile, so only the tally separates the bridge that
+        // carries the live red from the one whose first `ec` consumer re-derives
+        // it off the frame.
+        crate::trace::fbw_diag::bump(if sym.execution_context.is_none() {
+            crate::trace::fbw_diag::BRIDGE_EC_MISSING
+        } else {
+            crate::trace::fbw_diag::BRIDGE_EC_FROM_PORTAL_RED
+        });
         // pyjitpl.py rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
         // must be rebuilt from the resume data so subsequent vable

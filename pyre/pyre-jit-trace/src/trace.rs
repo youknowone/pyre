@@ -6568,6 +6568,21 @@ pub mod fbw_diag {
     pub const GATE_DECLINED_SHAPE: usize = 14;
     pub const GATE_DECLINED_FOR_ITER_REGION: usize = 15;
     pub const GATE_DECLINED_FUNCTION_ENTRY: usize = 16;
+    /// How `setup_bridge_sym` recovered the `ec` red, one slot per outcome, so
+    /// the two sum to the number of bridge setups.  `PyPyJitDriver.reds` names
+    /// `frame` and `ec`; `frame` comes back through the virtualizable rebuild,
+    /// but `ec` has no semantic PyFrame slot and is read from its dedicated
+    /// post-color register in the failing guard's frame-register section.
+    ///
+    /// `BRIDGE_EC_FROM_PORTAL_RED` is that read succeeding — the bridge carries
+    /// the same Box the parent trace did.  `BRIDGE_EC_MISSING` is the fallback:
+    /// a skeleton jitcode has no portal red colors (`u16::MAX`) and a resumed
+    /// register can be empty, and either way `sym.execution_context` stays
+    /// `NONE`, so the first consumer re-derives it with a `GetfieldGcR` off the
+    /// frame.  That re-derivation is sound but is not the live red, and nothing
+    /// else distinguishes the two.
+    pub const BRIDGE_EC_FROM_PORTAL_RED: usize = 17;
+    pub const BRIDGE_EC_MISSING: usize = 18;
 
     /// The `[jit-stats]` key for each tally slot, in index order, so a slot
     /// cannot be added without naming it and no reader can print a subset of
@@ -6588,7 +6603,7 @@ pub mod fbw_diag {
     /// with every other counter, so a bare name like `portal_only` collides
     /// with whatever else ever picks it.  The prefix names the producer —
     /// `fbw_` for the full-body walk, `gate_` for the admission gates that run
-    /// before it.
+    /// before it, `bridge_` for bridge setup.
     ///
     /// The length is `RING_BASE` because the tallies are exactly the slots
     /// below the ring.
@@ -6610,6 +6625,8 @@ pub mod fbw_diag {
         "gate_declined_shape",
         "gate_declined_for_iter_region",
         "gate_declined_function_entry",
+        "bridge_ec_from_portal_red",
+        "bridge_ec_missing",
     ];
 
     /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
@@ -6619,7 +6636,7 @@ pub mod fbw_diag {
     ///
     /// `pyre-wasm-runner` decodes the ring through its OWN copy of this
     /// constant (`main.rs`); the two have to move together.
-    pub const RING_BASE: usize = 17;
+    pub const RING_BASE: usize = 19;
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;
     pub const NAME_SLOTS: usize = 4;

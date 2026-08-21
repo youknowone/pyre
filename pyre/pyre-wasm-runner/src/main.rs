@@ -810,7 +810,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // PYRE_WASM_JIT_STATS, so printing them here would have kept them off
         // every gated wasm run.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
-            const RING_BASE: u32 = 17;
+            const RING_BASE: u32 = 19;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
@@ -1108,7 +1108,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // Both arrays take their length from this one constant, so a label
         // added without a slot (or the reverse) is a compile error rather than
         // a `zip` that silently drops the tail.
-        const FBW_SLOTS: usize = 17;
+        const FBW_SLOTS: usize = 19;
         let fbw_labels: [&str; FBW_SLOTS] = [
             "fbw_walks",
             "fbw_rolled_back_with_effects",
@@ -1127,6 +1127,8 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             "gate_declined_shape",
             "gate_declined_for_iter_region",
             "gate_declined_function_entry",
+            "bridge_ec_from_portal_red",
+            "bridge_ec_missing",
         ];
         let fbw_slots = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")
