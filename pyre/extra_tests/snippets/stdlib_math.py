@@ -377,6 +377,35 @@ assert_raises(
     lambda: math.isclose(1, 2, abs_tol=-1),
     _msg="tolerances must be non-negative",
 )
+# All four operands are converted before any of them is checked, so an
+# operand that is not a number is reported even when a tolerance is also
+# rejectable, and the conversions run left to right.
+assert_raises(
+    TypeError,
+    lambda: math.isclose("x", 1.0, rel_tol=-1),
+    _msg="the operand is converted before the tolerance is checked",
+)
+
+
+class _Reports:
+    def __init__(self, name, seen):
+        self.name = name
+        self.seen = seen
+
+    def __float__(self):
+        self.seen.append(self.name)
+        return 1.0
+
+
+_seen = []
+assert math.isclose(
+    _Reports("a", _seen),
+    _Reports("b", _seen),
+    rel_tol=_Reports("rel", _seen),
+    abs_tol=_Reports("abs", _seen),
+)
+assert _seen == ["a", "b", "rel", "abs"], _seen
+
 assert math.isclose(1.0, 1.0 + 1e-12)
 assert not math.isclose(1.0, 2.0)
 
@@ -486,6 +515,14 @@ assert type(math.comb(True, True)) is int
 assert math.comb(_IndexingInt(10), 4) == 210
 assert_raises(ValueError, lambda: math.comb(-1, -1), _msg="n must be a non-negative integer")
 assert_raises(ValueError, lambda: math.comb(1, -1), _msg="k must be a non-negative integer")
+# A METH_VARARGS entry point takes no keywords at all, so one is rejected
+# before the operands are read rather than reaching the body as an extra
+# argument.  Every arity is covered because the marker arrives appended.
+assert_raises(TypeError, lambda: math.comb(5, k=2), _msg="comb takes no keywords")
+assert_raises(TypeError, lambda: math.comb(n=5, k=2), _msg="comb takes no keywords")
+assert_raises(TypeError, lambda: math.perm(5, k=2), _msg="perm takes no keywords")
+assert_raises(TypeError, lambda: math.gcd(5, b=2), _msg="gcd takes no keywords")
+assert_raises(TypeError, lambda: math.lcm(5, b=2), _msg="lcm takes no keywords")
 # Every small pair against the same value built by repeated addition, which
 # shares no code with either comb arm.
 _pascal = [[1]]

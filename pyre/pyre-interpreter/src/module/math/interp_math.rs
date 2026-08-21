@@ -993,6 +993,14 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     }
     // `rel_tol` and `abs_tol` are the only (keyword-only) parameters.
     crate::builtins::kwarg_reject_unknown(kwargs, &["rel_tol", "abs_tol"], "isclose")?;
+    // `interp_math.py:698-701` — all four operands are converted, in this
+    // order, before anything about them is checked, so a non-numeric `a` is
+    // reported even when a tolerance is negative.  An omitted tolerance
+    // arrives upstream as an already-wrapped float, so converting it can
+    // neither raise nor reach `__float__`; `None` stands in for that here and
+    // `pymath` supplies the same defaults.
+    let a = try_get_double(pos[0])?;
+    let b = try_get_double(pos[1])?;
     let read = |name: &str| -> Result<Option<f64>, crate::PyError> {
         match crate::builtins::kwarg_get(kwargs, name) {
             Some(v) => Ok(Some(try_get_double(v)?)),
@@ -1002,19 +1010,15 @@ pub fn isclose(args: &[PyObjectRef]) -> PyResult {
     let rel_tol = read("rel_tol")?;
     let abs_tol = read("abs_tol")?;
     // `interp_math.py:703-705` — the sanity check on the tolerances runs
-    // before the comparison and names them.  `pymath` reports the same
-    // rejection as EDOM, which `map_int_err` relabels "math domain error".
+    // after those conversions and before the comparison, and names them.
+    // `pymath` reports the same rejection as EDOM, which `map_int_err`
+    // relabels "math domain error".
     if rel_tol.is_some_and(|t| t < 0.0) || abs_tol.is_some_and(|t| t < 0.0) {
         return Err(crate::PyError::value_error(
             "tolerances must be non-negative",
         ));
     }
-    match pymath::math::isclose(
-        try_get_double(pos[0])?,
-        try_get_double(pos[1])?,
-        rel_tol,
-        abs_tol,
-    ) {
+    match pymath::math::isclose(a, b, rel_tol, abs_tol) {
         Ok(v) => Ok(w_bool_from(v)),
         Err(e) => Err(map_int_err(e)),
     }
