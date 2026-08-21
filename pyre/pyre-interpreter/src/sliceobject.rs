@@ -65,8 +65,20 @@ pub fn unwrap_start_stop_not_none(
     w_start: PyObjectRef,
     w_end: PyObjectRef,
 ) -> Result<(i64, i64), crate::PyError> {
-    let start = adapt_bound(size, eval_slice_index_not_none(w_start)?);
-    let end = adapt_bound(size, eval_slice_index_not_none(w_end)?);
+    // Converted one at a time, as `slice_unpack`: the first bound's
+    // `__index__` is user code that can collect, so the second is read back
+    // from the shadow stack rather than carried in the argument it arrived
+    // in. A caller that roots the container does not root these two.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_start, w_end]);
+    let start = adapt_bound(
+        size,
+        eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(base))?,
+    );
+    let end = adapt_bound(
+        size,
+        eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(base + 1))?,
+    );
     Ok((start, end))
 }
 
@@ -90,11 +102,17 @@ pub fn unwrap_start_stop(
     w_start: PyObjectRef,
     w_end: PyObjectRef,
 ) -> Result<(i64, i64), crate::PyError> {
+    // Rooted and read back for the same reason as
+    // `unwrap_start_stop_not_none`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_start, w_end]);
+    let w_start = pyre_object::gc_roots::shadow_stack_get(base);
     let start = if unsafe { is_none(w_start) } {
         0
     } else {
         adapt_lower_bound(size, w_start)?
     };
+    let w_end = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let end = if unsafe { is_none(w_end) } {
         debug_assert!(size >= 0);
         size
