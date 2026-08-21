@@ -755,6 +755,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "inline_decl_call_assembler",
                 "inline_decl_owner_invalidated",
                 "inline_decl_foreign_label",
+                "inline_decl_source_in_preamble",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

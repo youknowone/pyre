@@ -3583,3 +3583,413 @@ fn a_bridge_compiled_after_the_owner_was_invalidated_starts_valid() {
         "a bridge compiled after invalidate_loop starts valid"
     );
 }
+
+/// The same two-label shape, but with a backend-only live-in captured at the
+/// label the region resumes at: `v7` is produced before LABEL0, is not one of
+/// its args, and is read in the loop body. The region's back edge must restore
+/// it from its capture slot exactly as the entry `br_table`'s resume loader
+/// does, so the body's `v3 + v7` reports 5005 + 100.
+#[test]
+fn region_closing_at_a_non_header_label_restores_that_labels_captures() {
+    assert_eq!(run_non_header_capture_repro(), (5005, 5004, 5105));
+}
+
+fn run_non_header_capture_repro() -> (i64, i64, i64) {
+    let descr0 = majit_ir::make_loop_target_descr(30, false);
+    let descr1 = majit_ir::make_loop_target_descr(31, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1);
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        // Produced before LABEL0, not one of its args, read after the header:
+        // the capture plan must hold it across both resume paths.
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(100)],
+            OpRef::int_op(7),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(3), OpRef::int_op(7)],
+            OpRef::int_op(8),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(3), OpRef::const_int(10)],
+            OpRef::int_op(4),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(4)], &[OpRef::int_op(3)]),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(1000)],
+            OpRef::int_op(5),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(5)],
+            &[OpRef::int_op(3), OpRef::int_op(2), OpRef::int_op(8)],
+        ),
+        jump,
+    ];
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+
+    let region_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_jump.setdescr(descr0);
+    let region_ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+            OpRef::int_op(11),
+        ),
+        region_jump,
+    ];
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: vec![codegen::InlinedBridge {
+            source_fail_index: 0,
+            trace_id: 1,
+            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            ops: region_ops,
+            gc_table_base: 0,
+            constants: indexmap::IndexMap::new(),
+        }],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("non-header region merges");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let read = |off: u64| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, off as usize, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    assert_eq!(read(0), 1, "the second guard is the one that exits");
+    (
+        read(codegen::FRAME_SLOT_BASE),
+        read(codegen::FRAME_SLOT_BASE + 8),
+        read(codegen::FRAME_SLOT_BASE + 16),
+    )
+}
+
+/// Two regions attached to the SAME owner, both closing at the NON-header
+/// LABEL. Each region owns one of the blocks opened at the loop header, so the
+/// guard that reaches it and the back edge it takes must both name that
+/// region's own depth — region 0 innermost.
+///
+///   preamble  v1 = v0 + 1
+///   LABEL0    [v1]
+///   segment   v2 = v1 + 1
+///   LABEL1    [v2]                     <- header, the `loop`
+///   body      v3 = v2 + 1
+///             guard v3 > 10            <- fail 0, region A
+///             guard v3 > 6000          <- fail 1, region B
+///             guard v3 < 100000        <- fail 2, exits with [v3, v2, v1]
+///             JUMP -> LABEL1 [v3]
+///   region A  v11 = v10 + 5000;  JUMP -> LABEL0 [v11]
+///   region B  v21 = v20 + 50000; JUMP -> LABEL0 [v21]
+#[test]
+fn two_regions_closing_at_a_non_header_label_each_reenter_at_their_own_depth() {
+    assert_eq!(run_two_non_header_regions_repro(), (100000, 99999, 55005));
+}
+
+fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
+    let descr0 = majit_ir::make_loop_target_descr(40, false);
+    let descr1 = majit_ir::make_loop_target_descr(41, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0.clone());
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1);
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(3), OpRef::const_int(10)],
+            OpRef::int_op(4),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(4)], &[OpRef::int_op(3)]),
+        make_op(
+            OpCode::IntGt,
+            &[OpRef::int_op(3), OpRef::const_int(6000)],
+            OpRef::int_op(5),
+        ),
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(5)], &[OpRef::int_op(3)]),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(100000)],
+            OpRef::int_op(6),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(6)],
+            &[OpRef::int_op(3), OpRef::int_op(2), OpRef::int_op(1)],
+        ),
+        jump,
+    ];
+    assert_eq!(codegen::resumable_label_count(&ops), 2);
+
+    let region_a_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(11))]);
+    region_a_jump.setdescr(descr0.clone());
+    let region_a = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(10), OpRef::const_int(5000)],
+            OpRef::int_op(11),
+        ),
+        region_a_jump,
+    ];
+    let region_b_jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(21))]);
+    region_b_jump.setdescr(descr0);
+    let region_b = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(20), OpRef::const_int(50000)],
+            OpRef::int_op(21),
+        ),
+        region_b_jump,
+    ];
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: vec![
+            codegen::InlinedBridge {
+                source_fail_index: 0,
+                trace_id: 1,
+                inputargs: vec![InputArg::from_type(Type::Int, 10)],
+                ops: region_a,
+                gc_table_base: 0,
+                constants: indexmap::IndexMap::new(),
+            },
+            codegen::InlinedBridge {
+                source_fail_index: 1,
+                trace_id: 2,
+                inputargs: vec![InputArg::from_type(Type::Int, 20)],
+                ops: region_b,
+                gc_table_base: 0,
+                constants: indexmap::IndexMap::new(),
+            },
+        ],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).expect("two non-header regions merge");
+    validate_wasm(&bytes);
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, ());
+    let memory =
+        Memory::new(&mut store, MemoryType::new(2, None)).expect("test memory should allocate");
+    memory
+        .write(
+            &mut store,
+            codegen::FRAME_SLOT_BASE as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, 0)
+        .expect("generated trace should execute");
+
+    let read = |off: u64| {
+        let mut buf = [0u8; 8];
+        memory.read(&store, off as usize, &mut buf).unwrap();
+        i64::from_le_bytes(buf)
+    };
+    assert_eq!(read(0), 2, "the third guard is the one that exits");
+    (
+        read(codegen::FRAME_SLOT_BASE),
+        read(codegen::FRAME_SLOT_BASE + 8),
+        read(codegen::FRAME_SLOT_BASE + 16),
+    )
+}
+
+/// A region's guard must sit inside the `loop` whose blocks it branches to.
+/// `InlineGuard::branch_depth` counts those blocks from loop-body statement
+/// level; in the peeled preamble the same depth names a LABEL resume loader,
+/// so a bridge sourced there has to keep the out-of-line path.
+#[test]
+fn a_preamble_guard_is_reported_as_unreachable_from_the_region_blocks() {
+    let descr0 = majit_ir::make_loop_target_descr(50, false);
+    let descr1 = majit_ir::make_loop_target_descr(51, false);
+
+    let label0 = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
+    label0.setdescr(descr0);
+    let label1 = Op::new(OpCode::Label, &[rb(OpRef::int_op(2))]);
+    label1.setdescr(descr1.clone());
+    let jump = Op::new(OpCode::Jump, &[rb(OpRef::int_op(3))]);
+    jump.setdescr(descr1);
+
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+            OpRef::int_op(1),
+        ),
+        label0,
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(1), OpRef::const_int(50)],
+            OpRef::int_op(6),
+        ),
+        // exit 0: in the preamble, between the two LABELs.
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(6)], &[OpRef::int_op(1)]),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::const_int(1)],
+            OpRef::int_op(2),
+        ),
+        label1,
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(2), OpRef::const_int(1)],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), OpRef::const_int(100)],
+            OpRef::int_op(4),
+        ),
+        // exit 1: in the loop body.
+        make_guard(OpCode::GuardTrue, &[OpRef::int_op(4)], &[OpRef::int_op(3)]),
+        jump,
+    ];
+
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: vec![],
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        external_jump_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    assert!(codegen::inline_source_guard_precedes_loop_label(&inputs, 0));
+    assert!(!codegen::inline_source_guard_precedes_loop_label(
+        &inputs, 1
+    ));
+}

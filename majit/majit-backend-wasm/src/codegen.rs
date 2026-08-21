@@ -2285,6 +2285,38 @@ pub fn merged_stream_has_loop_label(inputs: &ModuleBuildInputs) -> bool {
     find_loop_label_index(&ops).is_some_and(|label_idx| label_idx < inputs.ops.len())
 }
 
+/// Whether the guard a region would attach to sits in the owner's peeled
+/// preamble, ahead of the loop header LABEL.
+///
+/// `InlineGuard::branch_depth` is a depth at loop-body statement level, where
+/// the per-region blocks are the innermost ones open. The preamble has not
+/// entered the `loop` those blocks are opened in; its innermost blocks are the
+/// LABEL resume pairs, so the same depth names a resume loader and the region
+/// body stays unreachable. Such a bridge must keep the out-of-line path.
+///
+/// `fail_index` is the exit ordinal within the owner's own stream — the
+/// numbering `collect_guards_and_vars` assigns and `InlinedBridge`
+/// records as `source_fail_index`.
+pub fn inline_source_guard_precedes_loop_label(
+    inputs: &ModuleBuildInputs,
+    fail_index: u32,
+) -> bool {
+    let Some(label_idx) = find_loop_label_index(&inputs.ops) else {
+        return false;
+    };
+    let mut exit_ordinal = 0u32;
+    for (pos, op) in inputs.ops.iter().enumerate() {
+        if !op.opcode.is_guard() && op.opcode != OpCode::Finish {
+            continue;
+        }
+        if exit_ordinal == fail_index {
+            return pos < label_idx;
+        }
+        exit_ordinal += 1;
+    }
+    false
+}
+
 impl Clone for InlinedBridge {
     fn clone(&self) -> Self {
         Self {

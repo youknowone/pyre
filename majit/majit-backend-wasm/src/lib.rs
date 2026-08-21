@@ -87,8 +87,10 @@ use std::sync::{Arc, Mutex};
 /// the region carries a CALL_ASSEMBLER the owner build emits no arm for; 50 =
 /// the owner is already invalidated, so a merged region would inherit its set
 /// flag instead of starting valid; 51 = the region's closing JUMP names a LABEL
-/// published by another module, which no in-module `br` can reach.
-pub static BRIDGE_DIAG: [AtomicU64; 52] = [const { AtomicU64::new(0) }; 52];
+/// published by another module, which no in-module `br` can reach; 52 = the
+/// region's source guard is in the peeled preamble, outside the `loop` its
+/// block is opened in.
+pub static BRIDGE_DIAG: [AtomicU64; 53] = [const { AtomicU64::new(0) }; 53];
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -3432,9 +3434,9 @@ impl majit_backend::Backend for WasmBackend {
                 decline("foreign_label");
             } else if !resumes_at_loop_header && !inline_nonheader_enabled() {
                 // Resuming at the header lets the region `br` straight to the
-                // `loop`. Resuming at an earlier LABEL needs the
-                // `loop`-wrapped dispatch, which is opt-in until its
-                // miscompile is root-caused (`inline_nonheader_enable`).
+                // `loop`. Resuming at an earlier LABEL goes through the
+                // `loop`-wrapped dispatch, still opt-in
+                // (`inline_nonheader_enable`) while its cost is measured.
                 diag_bump(38);
                 decline("not_header");
             } else if let Some(mut candidate) = original_token
@@ -3453,6 +3455,16 @@ impl majit_backend::Backend for WasmBackend {
                 } else if !codegen::merged_stream_has_loop_label(&candidate) {
                     diag_bump(39);
                     decline("no_loop_label");
+                } else if codegen::inline_source_guard_precedes_loop_label(
+                    &candidate,
+                    source_fail_index,
+                ) {
+                    // The guard is in the peeled preamble, which the `loop`
+                    // holding the region blocks has not been entered from, so
+                    // its branch would land in a LABEL resume loader and the
+                    // region body would be unreachable.
+                    diag_bump(52);
+                    decline("source_in_preamble");
                 } else {
                     self.collect_constants_from_ops(ops);
                     candidate.inlined_bridges.push(codegen::InlinedBridge {
