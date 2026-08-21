@@ -695,6 +695,10 @@ pub(crate) fn encode_text_codec(
     encoding: &str,
     errors: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // Rooted for the same window as `decode_text_codec`: the lookup runs
+    // Python while `w_obj` is still whatever the caller handed over.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
     let w_codec_info = lookup_text_codec("encode", encoding)?;
     if crate::importing::dev_mode_flag() {
         validate_error_handler(errors)?;
@@ -715,6 +719,15 @@ pub(crate) fn decode_text_codec(
     encoding: &str,
     errors: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // The lookup runs Python: an uncached name imports its `encodings` module
+    // and calls every registered search function, and only `call_codec` below
+    // publishes `w_obj` as a root.  Callers reach here with a value that has
+    // no heap edge — `decode_bytes_to_wtf8` copies the source bytes into a
+    // fresh one — and old-gen buys immobility, not survival, so the copy is
+    // swept mid-lookup and the decoder is handed a reused box.  Bytes do not
+    // move, so the pin is for liveness alone and the value is used as it is.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(w_obj);
     let w_codec_info = lookup_text_codec("decode", encoding)?;
     if crate::importing::dev_mode_flag() {
         validate_error_handler(errors)?;
