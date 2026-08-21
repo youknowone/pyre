@@ -3072,27 +3072,38 @@ pub fn fuse_boxing_alloc(
         owner: &str,
         struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     ) -> Option<Vec<(String, ValueType)>> {
-        let rows = if let Some(exact) = struct_field_attrs.get(owner) {
-            exact
-        } else {
-            let mut leaf_matches = struct_field_attrs
-                .iter()
-                .filter(|(k, _)| k.rsplit("::").next() == Some(owner));
-            let (_, only) = leaf_matches.next()?;
-            if leaf_matches.next().is_some() {
-                // The layout owner is ambiguous.  As with an unknown owner,
-                // leave malloc_typed residual instead of choosing one map row
-                // by HashMap iteration order.
-                return None;
-            }
-            only
-        };
         Some(
-            rows.iter()
+            registered_layout(owner, struct_field_attrs)?
+                .iter()
                 .filter(|(name, _)| !is_header_field(name))
                 .cloned()
                 .collect(),
         )
+    }
+
+    /// `owner`'s registered field layout, in struct-declaration order.
+    ///
+    /// The ctor carries the bare struct leaf (`W_FloatObject`) while the map is
+    /// keyed by the crate-stripped qualified path (`floatobject::W_FloatObject`),
+    /// so fall back to a leaf match when the exact key misses.
+    fn registered_layout<'a>(
+        owner: &str,
+        struct_field_attrs: &'a std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    ) -> Option<&'a Vec<(String, ValueType)>> {
+        if let Some(exact) = struct_field_attrs.get(owner) {
+            return Some(exact);
+        }
+        let mut leaf_matches = struct_field_attrs
+            .iter()
+            .filter(|(k, _)| k.rsplit("::").next() == Some(owner));
+        let (_, only) = leaf_matches.next()?;
+        if leaf_matches.next().is_some() {
+            // The layout owner is ambiguous. As with an unknown owner, leave
+            // `malloc_typed` residual instead of choosing one map row by
+            // HashMap iteration order.
+            return None;
+        }
+        Some(only)
     }
 
     let is_malloc_typed = |target: &CallTarget| -> bool {
@@ -3302,6 +3313,35 @@ pub fn fuse_boxing_alloc(
             _ => None,
         })
     }
+    /// Whether the header named by `root` declares no class word in its layout.
+    ///
+    /// `root` is a `SyntheticTransparentCtor` result, so the header struct is
+    /// the ctor's own name. An unresolvable owner or an unregistered layout
+    /// answers `false`: neither is evidence that a field is missing. Callers
+    /// separately reject a `w_class` store that contradicts this layout.
+    fn header_declares_no_class_word(
+        graph: &FunctionGraph,
+        root: &Variable,
+        struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    ) -> bool {
+        let owner = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match (&op.result, &op.kind) {
+                (
+                    Some(r),
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { name, .. },
+                        ..
+                    },
+                ) if r == root => Some(name.clone()),
+                _ => None,
+            });
+        let Some(owner) = owner else { return false };
+        registered_layout(&owner, struct_field_attrs)
+            .is_some_and(|rows| rows.iter().all(|(name, _)| name != "w_class"))
+    }
     struct Payload {
         field: FieldDescriptor,
         value: LinkArg,
@@ -3343,14 +3383,28 @@ pub fn fuse_boxing_alloc(
         for root in &roots {
             let vtable = store_value(graph, root, "ob_type")
                 .and_then(|obtype| const_ref_addr(graph, &obtype, 8))?;
-            // A header with no `w_class` store leaves nothing to keep and
-            // nothing that proves the vtable stands for it, so it declines.
-            let (field, value, ty) = unique_store(graph, root, "w_class")?;
-            let folds = value
-                .as_variable()
-                .and_then(|value| get_instantiate_arg_addr(graph, value, 8))
-                == Some(vtable);
-            let store = (!folds).then(|| (field.clone(), value.clone(), ty.clone()));
+            let declares_no_class_word =
+                header_declares_no_class_word(graph, root, struct_field_attrs);
+            let store = match unique_store(graph, root, "w_class") {
+                // A store to a field absent from the registered layout makes
+                // the layout evidence self-contradictory, so keep the original
+                // allocation rather than guessing which source is correct.
+                Some(_) if declares_no_class_word => return None,
+                Some((field, value, ty)) => {
+                    let folds = value
+                        .as_variable()
+                        .and_then(|value| get_instantiate_arg_addr(graph, value, 8))
+                        == Some(vtable);
+                    (!folds).then(|| (field.clone(), value.clone(), ty.clone()))
+                }
+                // RPython's root OBJECT declares only `typeptr`. With no
+                // per-instance class word, there is nothing that can disagree
+                // with the vtable carried by `NewWithVtable`.
+                None if declares_no_class_word => None,
+                // A layout that declares `w_class` still needs a unique store
+                // proving that the vtable stands for that per-instance class.
+                None => return None,
+            };
             match &w_class {
                 None => w_class = Some(store),
                 // Predecessors disagreeing about the class — one folding into
@@ -8871,6 +8925,237 @@ mod tests {
             )),
             "no malloc_typed call may survive the fusion"
         );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_lowers_a_header_that_declares_no_class_word() {
+        // Fusion normally proves that the per-instance `w_class` agrees with
+        // `ob_type`. A layout without that field has no class word to compare,
+        // so its type pointer is sufficient. The table also verifies that a
+        // declared-but-unstored class word and a store contradicting the layout
+        // both fail closed.
+        type Var = crate::flowspace::model::Variable;
+        const CLASS_ADDR: i64 = 4357049520;
+        const OTHER_CLASS_ADDR: i64 = 4357049600;
+
+        /// What the cluster's header stores into `w_class`, if anything.
+        enum WClass {
+            /// No `w_class` store at all — the one-word header shape.
+            Unstored,
+            /// `get_instantiate(&T)` for the type at this address.
+            Instantiate(i64),
+            /// A class read back off the shadow stack: a store whose value the
+            /// vtable cannot be compared against, the spelling
+            /// `w_bytes_subclass_from_bytes` (bytesobject.rs) uses.
+            ShadowStack,
+        }
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                        },
+                        args,
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        /// A one-payload `W_IntObject` cluster whose header is a `header_owner`
+        /// ctor storing `ob_type: &CLASS_ADDR` beside the `w_class` shape.
+        fn cluster(header_owner: &str, w_class: &WClass) -> FunctionGraph {
+            let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            };
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let payload = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+            let ob_type = graph
+                .push_op_var(entry, OpKind::ConstRefAddr(CLASS_ADDR), true)
+                .unwrap();
+            let header = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor(header_owner),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some(header_owner.into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(
+                entry,
+                field(&header, "ob_type", header_owner, &ob_type),
+                false,
+            );
+            let stored = match w_class {
+                WClass::Unstored => None,
+                WClass::Instantiate(addr) => {
+                    let arg = graph
+                        .push_op_var(entry, OpKind::ConstRefAddr(*addr), true)
+                        .unwrap();
+                    Some(call(
+                        &mut graph,
+                        entry,
+                        &["pyre_object", "pyobject", "get_instantiate"],
+                        vec![arg],
+                    ))
+                }
+                WClass::ShadowStack => {
+                    let base = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+                    Some(call(
+                        &mut graph,
+                        entry,
+                        &["pyre_object", "gc_roots", "shadow_stack_get"],
+                        vec![base],
+                    ))
+                }
+            };
+            if let Some(value) = stored {
+                graph.push_op_var(
+                    entry,
+                    field(&header, "w_class", header_owner, &value),
+                    false,
+                );
+            }
+            let agg = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor("W_IntObject"),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some("W_IntObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(
+                entry,
+                field(&agg, "ob_header", "W_IntObject", &header),
+                false,
+            );
+            graph.push_op_var(entry, field(&agg, "intval", "W_IntObject", &payload), false);
+            let ret = call(
+                &mut graph,
+                entry,
+                &["pyre_object", "lltype", "malloc_typed"],
+                vec![agg],
+            );
+            graph.set_return(entry, Some(ret));
+            graph
+        }
+
+        // The header layouts are keyed by their crate-stripped qualified path
+        // while the ctor carries the bare leaf, so every row also exercises
+        // `registered_layout`'s leaf fallback.
+        let one_word: &[&str] = &["ob_type"];
+        let two_word: &[&str] = &["ob_type", "w_class"];
+        let rows: [(&str, &str, Option<&[&str]>, WClass, usize); 6] = [
+            (
+                "a one-word header declaring no class word",
+                "TypeOnlyHeader",
+                Some(one_word),
+                WClass::Unstored,
+                1,
+            ),
+            (
+                "a two-word header storing its class word",
+                "PyObject",
+                Some(two_word),
+                WClass::Instantiate(CLASS_ADDR),
+                1,
+            ),
+            (
+                "a two-word header leaving its class word unstored",
+                "PyObject",
+                Some(two_word),
+                WClass::Unstored,
+                0,
+            ),
+            (
+                "a header whose layout is not registered at all",
+                "TypeOnlyHeader",
+                None,
+                WClass::Unstored,
+                0,
+            ),
+            (
+                "a one-word layout contradicted by a class-word store",
+                "TypeOnlyHeader",
+                Some(one_word),
+                WClass::ShadowStack,
+                0,
+            ),
+            (
+                "a one-word layout storing another type's class word",
+                "TypeOnlyHeader",
+                Some(one_word),
+                WClass::Instantiate(OTHER_CLASS_ADDR),
+                0,
+            ),
+        ];
+        for (label, header_owner, layout, w_class, expected) in rows {
+            let mut graph = cluster(header_owner, &w_class);
+            let entry = graph.startblock;
+            let mut attrs = std::collections::HashMap::from([(
+                "intobject::W_IntObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("intval".to_string(), ValueType::Int),
+                ],
+            )]);
+            if let Some(names) = layout {
+                attrs.insert(
+                    format!("object::{header_owner}"),
+                    names
+                        .iter()
+                        .map(|name| ((*name).to_string(), ValueType::Ref(None)))
+                        .collect(),
+                );
+            }
+            assert_eq!(
+                fuse_boxing_alloc(&mut graph, &attrs),
+                expected,
+                "{label}: wrong number of fused clusters"
+            );
+            let ops = &graph.block(entry).operations;
+            let residual = ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            });
+            assert_eq!(
+                residual,
+                expected == 0,
+                "{label}: malloc_typed residual must survive exactly when the cluster declines"
+            );
+            if expected == 1 {
+                assert!(
+                    ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::NewWithVtable { owner, vtable }
+                            if owner == "W_IntObject" && *vtable == CLASS_ADDR
+                    )),
+                    "{label}: the fused allocation must carry the resolved ob_type address"
+                );
+            }
+        }
     }
 
     #[test]

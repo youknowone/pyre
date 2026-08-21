@@ -26,13 +26,19 @@ fn loads_fixture_corpus() {
     // + `option_source` and `option_question_mark` (the Option `?` fixture)
     // + `bool_then_some` (the eager `then_some` sibling, no closure).
     //
+    // + 10 for the header-first object model: `w_object_type`, `w_new_int`,
+    // `w_new_type_only_int`, `w_number_add`, `w_int_add`,
+    // `lltype::malloc_typed`, the fixture's `pyobject::get_instantiate`, and
+    // the initializer bodies for `INT_CLASS`, `DOUBLE_CLASS`, and
+    // `_immutable_fields_W_IntObject`.
+    //
     // + 2 for the host-registered callback table: `host_registry_dispatch`
     // and `host_registry_dispatch_optional`. `HostCallback` is a type alias,
     // not an item, so it contributes no body.
     //
     // + 2 for the iterator element-kind pair, `slice_of_refs_sum` and
     // `array_of_refs_sum`.
-    assert_eq!(local_count, 16, "16 local fns expected");
+    assert_eq!(local_count, 26, "26 local fns expected");
 }
 
 #[test]

@@ -79,6 +79,30 @@ out in issue #97:
 | `parse_one`         | `match` with guards, internal helper for #4 | 9         |
 | `desugar_mix`       | `?` + `for` + `match` + `break`             | 22        |
 
+The corpus also includes a header-first object model. These functions pin
+lowering decisions that otherwise fail by leaving a residual call or an
+untyped field access rather than raising an error:
+
+| Function              | Premise it pins                                       |
+|-----------------------|-------------------------------------------------------|
+| `w_object_type`       | `(*w).ob_type` narrows to a *typed* `FieldRead`        |
+| `w_new_int`           | the boxing cluster fuses to one `NewWithVtable`        |
+| `w_new_type_only_int` | so does a cluster whose header declares no class word  |
+| `w_number_add`        | a narrowing-chain arm lowers to a direct `FunctionPath` call |
+
+`ObjectHeader` has both `ob_type` and a per-instance `w_class`.
+`TypeOnlyHeader` has only `ob_type`, matching RPython's root `OBJECT`, whose
+only data field is `typeptr`. The two-word allocation can fuse when its
+`w_class` is derived from the same class object as `ob_type`; the one-word
+allocation can fuse from its declared layout because no class word exists to
+disagree with the type pointer.
+
+The fixture spells `pyre_object::pyobject::get_instantiate` literally because
+`model.rs` currently recognises that path suffix. The one-word header does not
+use this helper. `_immutable_fields_W_IntObject` preserves the marker shape
+harvested by `front::llbc_hints`.
+
+
 ## Findings
 
 ### 1. `.llbc` top-level shape

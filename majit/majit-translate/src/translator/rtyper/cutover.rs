@@ -1409,289 +1409,347 @@ fn compare_real_against_legacy(
 ///
 /// PyPy `bookkeeper.py:108-127` propagates fixpoint failures uncaught;
 /// pyre's dual-gate Skip defers exactly the categories enumerated
-/// above.  Once every category is implemented, every match returns
-/// `false`, the legacy walker fallback at
+/// above. Once every category is implemented, every message returns
+/// `None`, the legacy walker fallback at
 /// `codewriter.rs::dual_gate_type_state` becomes dead code, and the
 /// predicate retires entirely.
-pub(crate) fn is_known_unported(msg: &str) -> bool {
-    msg.contains("not registered in PyreCallRegistry")
-        || msg.contains("translate_op: undefined operand")
-        || msg.contains("unimplemented operation")
-        || msg.contains("variable ")
-            && msg.contains(" used before definition")
-        // `normalize_unary_op_name: pyre UnaryOp` and
-        // `normalize_binop_name: pyre BinOp` are not Skip-classified:
-        // the `not` / `deref` / `same_as` / `invert` surfaces are
-        // desugared by the MIR front-end (rustc lowers `!`/`*` and the
-        // `&&`/`||` short-circuits into MIR branches/calls before
-        // lowering), and the bitwise `and` / `or` labels normalize to
-        // the flowspace `and_` / `or_` registrations.  Synthetic
-        // graphs that inject unported ops (anchor tests in
-        // `cutover.rs::tests::anchor_unary_*_surfaces_*`) call
-        // `specialize_legacy_graph` directly and never reach
-        // `is_known_unported`, so the absence of these substring
-        // matches does not affect them.  Any production reach surfaces
-        // as a dual-gate divergence panic — the parity-correct outcome.
-        // Field / method dispatch on a `SomeInstance(classdef=None)`
-        // — pyre's `Ref` ValueType currently lifts to a classdef-less
-        // SomeInstance, so `find_attribute`
-        // (`rclass.py:556+find_attribute_or_None`) cannot route the
-        // dispatch.  `InstanceRepr::rtype_getattr`
-        // (`rclass.py`) routes through `getclsfield`, which
-        // surfaces the upstream-orthodox `MissingRTypeAttribute(attr)`
-        // when find_attribute returns None.  The `"no method ... on
-        // Instance("` substring (`rmodel.rs` default
-        // `rtype_getattr` find_method failure path) is not classified
-        // here: every SomeInstance dispatch goes through the
-        // InstanceRepr override, so the default fn never fires for
-        // `Instance(...)`-shaped operands.  The MissingRTypeAttribute
-        // entry stays until typed-Ref ClassDef projection lands and
-        // field/method dispatch starts succeeding.
-        || msg.contains("MissingRTypeAttribute")
-        // Variable's `.annotation` slot empty at `bindingrepr`
-        // lookup time — `ValueType::Unknown` has no
-        // annotation-stage shell and `valuetype_to_someshell` returns
-        // `None` for it (intentionally fail-loud for "annotation gap"
-        // so producers know which slot missed seeding, see
-        // `seed_variable` at `flowspace_adapter.rs`).  Closing
-        // the gap means tightening the front-end / annotator
-        // producers so every slot has a non-`Unknown` annotation; the
-        // gate skips until then.  The mergeinputargs-side flavour of
-        // this gap (raising subjects' `follow_raise_link` reaching an
-        // unannotated exceptblock seed) was resolved 2026-05-31 via
-        // `setbinding(Impossible)` pre-registration in
-        // `specialize_legacy_graph_with_registry_returning_value_to_var`;
-        // the remaining producer is the rtyper-side `bindingrepr`
-        // gap on synthesized `current_sp`-like graphs.
-        || msg.contains("KeyError: no binding for arg")
-        // `cast_ptr_to_int` reached the typer with a non-`Ptr`
-        // operand — the front-end could not lower a real pointer for
-        // the source of an `expr as i64` cast.  The canonical hitter
-        // is `stack_check::current_sp` (`&probe as *const usize as
-        // usize`): taking the address of a stack local is a
-        // target-specific raw-SP read that `front::mir` lowers with
-        // the local's *value* (`Int(0)`) rather than its address, so
-        // `rtype_cast_ptr_to_int`'s late `InstanceRepr→PtrRepr` swap
-        // fallback finds `Signed` where it needs `Ptr(...)`.  The
-        // legacy walker handles these graphs; skip until the
-        // address-of-local lowering lands a typed pointer operand.
-        || msg.contains("rtype_cast_ptr_to_int: operand concretetype must be Ptr")
-        // Unported per-annotation Repr families.  `rmodel.rs`
-        // `rtyper_makerepr` fail-louds with this message shape for the
-        // SomeValue kinds whose upstream Repr port has not landed
-        // (rrange.py iterator reprs plus annotator/model.py SomeObject
-        // and SomeProperty cases; rlist.py ListRepr, rdict.py DictRepr,
-        // and rbytearray.py have since landed).  Reached once a graph
-        // annotates such a value past the exc-edge and classdef walls;
-        // the legacy walker keeps handling these graphs until each Repr
-        // is ported.
-        || msg.contains("rtyper_makerepr — port")
-        // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
-        // vs main / PyPy.  `bookkeeper.py:108-127` propagates fixpoint
-        // exceptions uncaught and `annrpython.py:643` lets
-        // `AnnotatorError` reach the caller; absorbing the four
-        // patterns below is a deviation that hides real
-        // annotator/rtyper parity gaps as "known unported".  Direct
-        // removal breaks `pyre-jit-trace` `build.rs` at every reachable
-        // hitter
-        // (`make_green_key`, `Frame::load_fast`, `PyFrame::locals_w_mut`,
-        // `<default methods of IterOpcodeHandler>::record_for_iter_guard`,
-        // `pyjitpl_step::Cannot find attribute`); production cannot
-        // compile until each underlying real-path gap is closed
-        // (classdef-less SomeInstance dispatch + `PyreCallRegistry::
-        // ensure_session` coverage — every analyser body routes through
-        // per-touch `arg_at` rather than an eager-prefix concrete
-        // walk).  Until each gap-hitter is
-        // ported, this Skip stays as documented divergence and the
-        // codewriter falls back to the legacy walker for production.
-        || msg.contains("compute_at_fixpoint failed")
-        || msg.contains("complete_pending_blocks failed")
-        || msg.contains("Cannot find attribute ")
-        || msg.contains("AnnotatorError:")
-        // `rtyper.py convertvar` — no conversion path between
-        // the two reprs.  The production hitter is the generic-ADT
-        // payload attribute (`core.result.Result.Ok.__pos_0` etc.):
-        // pyre collapses every `Result<T, E>` instantiation onto ONE
-        // classdef, so the attribute's merged annotation unions
-        // unrelated payload classes (unit-tuple placeholder `Adt`,
-        // `core.option.Option.None`, …) and `pairtype(InstanceRepr,
-        // InstanceRepr).convert_from_to` (rclass.py)
-        // correctly finds no common base.  Upstream never faces this
-        // shape — RPython has no generics, so each class attribute
-        // carries a single annotated type.  Skip until
-        // per-instantiation classdef specialization lands.
-        || msg.contains("don't know how to convert from")
-        // Annotation-stage flavour of the convertvar entry above
-        // (`annrpython.py mergeinputargs` → `UnionError`): two
-        // `SomeInstance`s with no common base meet at a block merge
-        // because pyre collapses every generic-ADT instantiation onto
-        // one classdef, so unrelated payload classes union at the phi.
-        // Upstream propagates the UnionError uncaught; the dual gate
-        // skips to the legacy walker until per-instantiation classdef
-        // specialization lands.
-        || msg.contains("cannot unify instances with no common base class")
-        // The union fallback marker — no arm handles this pair.  Upstream
-        // RAISES for the pairs that reach here: `pair(SomeObject, SomeObject)
-        // .union()` raises (binaryop.py), `pair(SomePtr, SomeObject)`
-        // raises (llannotation.py:118-120).  So a hit is a pyre PRODUCER
-        // divergence — a boxed `*mut PyObject` lifted as `SomePtr` where
-        // RPython carries `SomeInstance`, making a `SomeInstance ∪ SomePtr`
-        // phi RPython never constructs — not a missing union handler.  Skip
-        // to the legacy walker until the pointer values lift as instances
-        // (typed-Ref ClassDef projection).
-        || msg.contains("no upstream pair(s1, s2).union() handler in current subset")
-        // `InstanceRepr.getfield` walking the `rbase` chain before the
-        // repr's deferred `setup()` ran (upstream drains pending
-        // setups via `call_all_setups`, rtyper.py, after every
-        // specialized block; pyre's per-subject dual-gate can reach a
-        // getfield on a freshly minted inner repr first).  Also covers
-        // the `rbase missing — call setup() first` form: host-struct-
-        // seeded receivers (`*mut PyObject` params with a registry
-        // classdef) reach class-field reads through reprs minted
-        // outside the `rtyper.getrepr`/`setup()` queue.  Skip until
-        // the setup-ordering port lands.
-        || msg.contains("rbase missing")
-        // `rpbc` calltable row lookup miss at rtype time — the
-        // method-PBC came from the struct-root class-dict seeding
-        // (`seed_struct_root_method_members`), whose `simple_call`
-        // sites do not yet register call shapes into the CallFamily
-        // the way `bookkeeper.pbc_call` does for ordinary descs
-        // (pbc_call → getcallfamily row, bookkeeper.py).
-        // Skip until the seeded-method family registration lands.
-        || msg.contains("calltable row not found in CallFamily")
-        // A non-instance constant (e.g. a string literal) reaching
-        // `InstanceRepr.convert_const` — the receiver field was typed
-        // by the untyped FORCE_ATTRIBUTES shell (classdef-less
-        // SomeInstance) because no registry-row projection covered
-        // it, so a String-valued field rtypes as an instance (hitter:
-        // PyError.msg via the type_error raise stubs).  Skip until
-        // the typed-Ref field projection covers the remaining rows.
-        || msg.contains("InstanceRepr.convert_const: expected HostObject or None")
-        // `rmodel.py rtype_is_` — an `is` (pointer-identity)
-        // comparison where one side is not a pointer repr.  The
-        // production hitter is `py_type_check`'s `(*obj).ob_type ==
-        // tp` chain when `tp` flowed from a `&STATIC` host address:
-        // `HostStaticAddrs` annotates the static's address as a
-        // constant `SomeInteger`, so the comparison pairs
-        // `InstanceRepr` with `IntegerRepr`.  Upstream never faces
-        // this — a prebuilt instance constant stays `SomeInstance`.
-        // Skip until host static addresses annotate as typed
-        // instance pointers.
-        || msg.contains("is of instances of the non-pointers")
-        // `dyn Trait` dispatch still enters the real-rtyper flowspace
-        // adapter as pyre's pre-rtyper `CallTarget::Indirect` shape in
-        // some registry-prefill paths.  The production codewriter's
-        // jtransform path already runs `rpbc::lower_indirect_calls`
-        // before consuming these graphs; the real-rtyper cutover path
-        // cannot yet express the matching rclass/rpbc rewrite before
-        // adapter input without leaking post-rtyper `VtableMethodPtr` /
-        // `IndirectCall` ops into flowspace.  Treat this as a
-        // known-unported real-path gap so the dual gate falls back to
-        // the legacy type walker instead of panicking during registry
-        // population.
-        || (msg.contains("Call with CallTarget::Indirect") && msg.contains("rclass"))
-        // `annrpython.py mergeinputargs` — an inputarg Variable
-        // has no annotation. Happens when cross-block locals
-        // threading misses a name in the predecessor link; the
-        // annotator cannot merge `None` annotations.
-        || msg.contains("inputarg lacks annotation")
-        // `BrokenReprTyperError` (`rmodel.py`, ported at
-        // `rmodel.rs`): a Repr whose `setup()` failed earlier
-        // is re-requested and refuses to half-initialize.  In the
-        // per-graph census a Skipped subject can leave a shared
-        // session `ClassRepr` in the BROKEN state; the next graph
-        // touching the same repr then surfaces this message.  It is a
-        // secondary echo of the root failure (itself Skip-classified
-        // above), not an independent cause — absorb it so one broken
-        // repr does not fatal every later graph in the session.
-        || msg.contains("cannot setup already failed Repr")
-        // `AnnotatorError: immutablevalue(HostObject` is not
-        // Skip-classified for `SyntheticTransparentCtor` (Ok/Err/Some/
-        // None).  The adapter emits `HostObject::new_class(name, [])`
-        // (`flowspace_adapter.rs`'s `SyntheticTransparentCtor` arm),
-        // routing through the existing `is_class()` arm in
-        // [`crate::annotator::bookkeeper::Bookkeeper::immutablevalue_hostobject`]
-        // (`bookkeeper.py:315-316` parity).  No production emit-site of
-        // `HostObject::new_opaque` remains in `front/`/`translator/rtyper/`,
-        // so any future `immutablevalue(HostObject` failure is a real
-        // parity bug — let it surface as a dual-gate divergence panic.
-        // TODO(post-rtyper-jtransform-variant-leak): retire this Skip
-        // entry per upstream parity — `jit/codewriter/jtransform.py`
-        // raises straight through on unexpected opnames.  The most
-        // frequent reach is `OpKind::Abort` emitted by the surface-Rust
-        // DSL front-end's `lower_expr` `stop_unsupported` /
-        // `continue_with_unknown` helpers
-        // when the surface DSL hits an unsupported expression — pyre
-        // source like `execute_opcode_step` / `eval_loop_jit` carry such
-        // placeholders.  Retiring this entry needs each Abort
-        // emit-site at the front-end retired (closure
-        // body, complex match arms, unsupported literals), then
-        // every other post-rtyper variant (IndirectCall / ResidualCall
-        // / Vable* / JitMergePoint / LoopHeader / InlineCall /
-        // RecursiveCall) emitted from `rpbc.rs` / `rclass.rs` ahead
-        // of the rtyper.  Until then the Skip absorbs the placeholder
-        // leakage; without it `tests::test_codegen_output` /
-        // `tests::test_recognition_report` and the analyse-pyre-source
-        // pipeline panic at the first reachable Abort.
-        || msg.contains("post-rtyper jtransform variant")
-        // Cross-block body `Input` whose `name` was not threaded
-        // through `Link.args` / target `inputargs` by the predecessor.
-        // RPython flowspace has no body-`Input` op — every cross-block
-        // local reference goes via `flowcontext.py LOAD_FAST`
-        // (which writes into `self.locals_w`) and the target block's
-        // pre-allocated `inputargs[]`.  Pyre's body-`Input` emission
-        // (the `OpKind::Input` ops `front::mir` pushes into each block)
-        // is itself a TODO; when
-        // cross-block locals threading misses a shape, the adapter
-        // fails loud with this message instead of silently
-        // fabricating a fresh Variable (which would hide an
-        // SSA / alias-shape divergence from PyPy's flowspace).  Skip
-        // until either cross-block locals threading covers every
-        // shape, or the front-end's
-        // body-`Input` emission is replaced by a Link.args / inputargs
-        // threading pass that mirrors RPython.
-        || msg.contains("adapter cross-block body Input")
-        // `SomeValue::noneify()` reached a `SomePtr` operand — a block
-        // merge unioned a `_ptr` with `NoneType`.  The raise itself is
-        // parity-correct: RPython's default `noneify` raises `UnionError`
-        // (model.py:121-122) and `SomePtr` defines no override, while
-        // `pair(SomePtr, SomeObject).union` raises too
-        // (llannotation.py:119-120) — so this Skip catches a *correct*
-        // raise, it does not paper over a wrong annotation rule.  The
-        // only divergence is upstream of the merge: RPython spells a null
-        // pointer as `lltype.nullptr(T)`, which annotates as a
-        // (null-valued) `SomePtr`, so `pair(SomePtr, SomePtr).union`
-        // (llannotation.py:94-98) keeps it in the pointer lattice and
-        // `noneify` is never reached.  Pyre's `front::mir` still lowers
-        // some Rust null/`Option<*T>` shapes to a `SomeNone` rather than
-        // a typed null `SomePtr` (the same null-pointer-typing gap
-        // tracked by the `LLAddress(Null)` exceptblock work), so the
-        // merge surfaces `_ptr ∪ NoneType`.  CONVERGENCE: lower a typed
-        // null pointer at the `front::mir` producer; removing this Skip
-        // without that fix only hard-breaks on the parity-correct raise.
-        // Until then the legacy walker keeps handling the graphs.
-        || msg.contains("noneify() not supported")
-        // `flowspace_adapter::translate_op` rejected an UNFUSED
-        // `lltype::malloc_typed` `FunctionPath` (the finding's "option (b)"
-        // fail-closed guard).  `fuse_boxing_alloc` rewrites only the three
-        // numeric boxing structs to `NewWithVtable`; every other mallocable
-        // GC struct's `malloc_typed` survives with no ported
-        // `jtransform.rewrite_op_malloc` general lowering, so the adapter
-        // fails loud rather than matching a wrong residual `simple_call`.
-        // Skip-classify so the census falls back to the legacy walker until
-        // the general malloc->new path lands (boxing-lowering epic #134/#142).
-        || msg.contains("survived fuse_boxing_alloc unfused")
-        // `OrderedDictRepr::require_direct_compare_key` fail-closed gate
-        // (rordereddict.rs) — `build_ll_dict_lookup_helper_graph`'s
-        // `direct_compare_op` hardcodes `ptr_eq` for every `Ptr(_)` key
-        // lltype, which is wrong for keys whose repr defines a real
-        // structural equality (`get_ll_eq_function` returning `Some`, e.g.
-        // `StringRepr::ll_streq`). int/bool/char/unichar keys return `None`
-        // and proceed; every other key repr (str, instance) hits this
-        // TyperError instead of silently miscompiling dict getitem/contains
-        // to pointer-identity comparison. Skip-classify until the
-        // call-based keyeq branch is ported (#140 DictRepr epic).
-        || msg.contains("dict key eq function not wired")
+///
+/// The returned tag identifies the matching fallback condition. Keeping the
+/// category and the boolean decision in one function prevents diagnostic code
+/// from maintaining a second, drifting copy of the substring table. Lowering
+/// only tests whether the result is `Some`.
+pub(crate) fn unported_category(msg: &str) -> Option<&'static str> {
+    if msg.contains("not registered in PyreCallRegistry") {
+        return Some("call-registry-miss");
+    }
+    if msg.contains("translate_op: undefined operand") {
+        return Some("undefined-operand");
+    }
+    if msg.contains("unimplemented operation") {
+        return Some("unimplemented-operation");
+    }
+    if msg.contains("variable ") && msg.contains(" used before definition") {
+        return Some("used-before-definition");
+    }
+    // `normalize_unary_op_name: pyre UnaryOp` and
+    // `normalize_binop_name: pyre BinOp` are not Skip-classified:
+    // the `not` / `deref` / `same_as` / `invert` surfaces are
+    // desugared by the MIR front-end (rustc lowers `!`/`*` and the
+    // `&&`/`||` short-circuits into MIR branches/calls before
+    // lowering), and the bitwise `and` / `or` labels normalize to
+    // the flowspace `and_` / `or_` registrations.  Synthetic
+    // graphs that inject unported ops (anchor tests in
+    // `cutover.rs::tests::anchor_unary_*_surfaces_*`) call
+    // `specialize_legacy_graph` directly and never reach
+    // `is_known_unported`, so the absence of these substring
+    // matches does not affect them.  Any production reach surfaces
+    // as a dual-gate divergence panic — the parity-correct outcome.
+    // Field / method dispatch on a `SomeInstance(classdef=None)`
+    // — pyre's `Ref` ValueType currently lifts to a classdef-less
+    // SomeInstance, so `find_attribute`
+    // (`rclass.py:556+find_attribute_or_None`) cannot route the
+    // dispatch.  `InstanceRepr::rtype_getattr`
+    // (`rclass.py`) routes through `getclsfield`, which
+    // surfaces the upstream-orthodox `MissingRTypeAttribute(attr)`
+    // when find_attribute returns None.  The `"no method ... on
+    // Instance("` substring (`rmodel.rs:828` default
+    // `rtype_getattr` find_method failure path) is not classified
+    // here: every SomeInstance dispatch goes through the
+    // InstanceRepr override, so the default fn never fires for
+    // `Instance(...)`-shaped operands.  The MissingRTypeAttribute
+    // entry stays until typed-Ref ClassDef projection lands and
+    // field/method dispatch starts succeeding.
+    if msg.contains("MissingRTypeAttribute") {
+        return Some("missing-rtype-attribute");
+    }
+    // Variable's `.annotation` slot empty at `bindingrepr`
+    // lookup time — `ValueType::Unknown` has no
+    // annotation-stage shell and `valuetype_to_someshell` returns
+    // `None` for it (intentionally fail-loud for "annotation gap"
+    // so producers know which slot missed seeding, see
+    // `seed_variable` at `flowspace_adapter.rs:96-115`).  Closing
+    // the gap means tightening the front-end / annotator
+    // producers so every slot has a non-`Unknown` annotation; the
+    // gate skips until then.  The mergeinputargs-side flavour of
+    // this gap (raising subjects' `follow_raise_link` reaching an
+    // unannotated exceptblock seed) was resolved 2026-05-31 via
+    // `setbinding(Impossible)` pre-registration in
+    // `specialize_legacy_graph_with_registry_returning_value_to_var`;
+    // the remaining producer is the rtyper-side `bindingrepr`
+    // gap on synthesized `current_sp`-like graphs.
+    if msg.contains("KeyError: no binding for arg") {
+        return Some("bindingrepr-annotation-gap");
+    }
+    // `cast_ptr_to_int` reached the typer with a non-`Ptr`
+    // operand — the front-end could not lower a real pointer for
+    // the source of an `expr as i64` cast.  The canonical hitter
+    // is `stack_check::current_sp` (`&probe as *const usize as
+    // usize`): taking the address of a stack local is a
+    // target-specific raw-SP read that `front::mir` lowers with
+    // the local's *value* (`Int(0)`) rather than its address, so
+    // `rtype_cast_ptr_to_int`'s late `InstanceRepr→PtrRepr` swap
+    // fallback finds `Signed` where it needs `Ptr(...)`.  The
+    // legacy walker handles these graphs; skip until the
+    // address-of-local lowering lands a typed pointer operand.
+    if msg.contains("rtype_cast_ptr_to_int: operand concretetype must be Ptr") {
+        return Some("cast-ptr-to-int-non-ptr");
+    }
+    // Unported per-annotation Repr families.  `rmodel.rs`
+    // `rtyper_makerepr` fail-louds with this message shape for the
+    // SomeValue kinds whose upstream Repr port has not landed
+    // (rrange.py iterator reprs plus annotator/model.py SomeObject
+    // and SomeProperty cases; rlist.py ListRepr, rdict.py DictRepr,
+    // and rbytearray.py have since landed).  Reached once a graph
+    // annotates such a value past the exc-edge and classdef walls;
+    // the legacy walker keeps handling these graphs until each Repr
+    // is ported.
+    if msg.contains("rtyper_makerepr — port") {
+        return Some("unported-repr-family");
+    }
+    // TODO(annotator-fixpoint-fail-loud) — STRICT-PARITY REGRESSION
+    // vs main / PyPy.  `bookkeeper.py:108-127` propagates fixpoint
+    // exceptions uncaught and `annrpython.py:643` lets
+    // `AnnotatorError` reach the caller; absorbing the four
+    // patterns below is a deviation that hides real
+    // annotator/rtyper parity gaps as "known unported".  Direct
+    // removal breaks `pyre-jit-trace` `build.rs` at every reachable
+    // hitter
+    // (`make_green_key`, `Frame::load_fast`, `PyFrame::locals_w_mut`,
+    // `<default methods of IterOpcodeHandler>::record_for_iter_guard`,
+    // `pyjitpl_step::Cannot find attribute`); production cannot
+    // compile until each underlying real-path gap is closed
+    // (classdef-less SomeInstance dispatch + `PyreCallRegistry::
+    // ensure_session` coverage — every analyser body routes through
+    // per-touch `arg_at` rather than an eager-prefix concrete
+    // walk).  Until each gap-hitter is
+    // ported, this Skip stays as documented divergence and the
+    // codewriter falls back to the legacy walker for production.
+    if msg.contains("compute_at_fixpoint failed") {
+        return Some("annotator-fixpoint-failed");
+    }
+    if msg.contains("complete_pending_blocks failed") {
+        return Some("annotator-pending-blocks-failed");
+    }
+    if msg.contains("Cannot find attribute ") {
+        return Some("cannot-find-attribute");
+    }
+    if msg.contains("AnnotatorError:") {
+        return Some("annotator-error");
+    }
+    // `rtyper.py convertvar` — no conversion path between
+    // the two reprs.  The production hitter is the generic-ADT
+    // payload attribute (`core.result.Result.Ok.__pos_0` etc.):
+    // pyre collapses every `Result<T, E>` instantiation onto ONE
+    // classdef, so the attribute's merged annotation unions
+    // unrelated payload classes (unit-tuple placeholder `Adt`,
+    // `core.option.Option.None`, …) and `pairtype(InstanceRepr,
+    // InstanceRepr).convert_from_to` (rclass.py)
+    // correctly finds no common base.  Upstream never faces this
+    // shape — RPython has no generics, so each class attribute
+    // carries a single annotated type.  Skip until
+    // per-instantiation classdef specialization lands.
+    if msg.contains("don't know how to convert from") {
+        return Some("convertvar-no-path");
+    }
+    // Annotation-stage flavour of the convertvar entry above
+    // (`annrpython.py mergeinputargs` → `UnionError`): two
+    // `SomeInstance`s with no common base meet at a block merge
+    // because pyre collapses every generic-ADT instantiation onto
+    // one classdef, so unrelated payload classes union at the phi.
+    // Upstream propagates the UnionError uncaught; the dual gate
+    // skips to the legacy walker until per-instantiation classdef
+    // specialization lands.
+    if msg.contains("cannot unify instances with no common base class") {
+        return Some("union-no-common-base");
+    }
+    // The union fallback marker — no arm handles this pair.  Upstream
+    // RAISES for the pairs that reach here: `pair(SomeObject, SomeObject)
+    // .union()` raises (binaryop.py), `pair(SomePtr, SomeObject)`
+    // raises (llannotation.py:118-120).  So a hit is a pyre PRODUCER
+    // divergence — a boxed `*mut PyObject` lifted as `SomePtr` where
+    // RPython carries `SomeInstance`, making a `SomeInstance ∪ SomePtr`
+    // phi RPython never constructs — not a missing union handler.  Skip
+    // to the legacy walker until the pointer values lift as instances
+    // (typed-Ref ClassDef projection).
+    if msg.contains("no upstream pair(s1, s2).union() handler in current subset") {
+        return Some("union-no-handler");
+    }
+    // `InstanceRepr.getfield` walking the `rbase` chain before the
+    // repr's deferred `setup()` ran (upstream drains pending
+    // setups via `call_all_setups`, rtyper.py, after every
+    // specialized block; pyre's per-subject dual-gate can reach a
+    // getfield on a freshly minted inner repr first).  Also covers
+    // the `rbase missing — call setup() first` form: host-struct-
+    // seeded receivers (`*mut PyObject` params with a registry
+    // classdef) reach class-field reads through reprs minted
+    // outside the `rtyper.getrepr`/`setup()` queue.  Skip until
+    // the setup-ordering port lands.
+    if msg.contains("rbase missing") {
+        return Some("repr-setup-ordering");
+    }
+    // `rpbc` calltable row lookup miss at rtype time — the
+    // method-PBC came from the struct-root class-dict seeding
+    // (`seed_struct_root_method_members`), whose `simple_call`
+    // sites do not yet register call shapes into the CallFamily
+    // the way `bookkeeper.pbc_call` does for ordinary descs
+    // (pbc_call → getcallfamily row, bookkeeper.py).
+    // Skip until the seeded-method family registration lands.
+    if msg.contains("calltable row not found in CallFamily") {
+        return Some("calltable-row-missing");
+    }
+    // A non-instance constant (e.g. a string literal) reaching
+    // `InstanceRepr.convert_const` — the receiver field was typed
+    // by the untyped FORCE_ATTRIBUTES shell (classdef-less
+    // SomeInstance) because no registry-row projection covered
+    // it, so a String-valued field rtypes as an instance (hitter:
+    // PyError.msg via the type_error raise stubs).  Skip until
+    // the typed-Ref field projection covers the remaining rows.
+    if msg.contains("InstanceRepr.convert_const: expected HostObject or None") {
+        return Some("convert-const-non-instance");
+    }
+    // `rmodel.py rtype_is_` — an `is` (pointer-identity)
+    // comparison where one side is not a pointer repr.  The
+    // production hitter is `py_type_check`'s `(*obj).ob_type ==
+    // tp` chain when `tp` flowed from a `&STATIC` host address:
+    // `HostStaticAddrs` annotates the static's address as a
+    // constant `SomeInteger`, so the comparison pairs
+    // `InstanceRepr` with `IntegerRepr`.  Upstream never faces
+    // this — a prebuilt instance constant stays `SomeInstance`.
+    // Skip until host static addresses annotate as typed
+    // instance pointers.
+    if msg.contains("is of instances of the non-pointers") {
+        return Some("rtype-is-non-pointer");
+    }
+    // `dyn Trait` dispatch still enters the real-rtyper flowspace
+    // adapter as pyre's pre-rtyper `CallTarget::Indirect` shape in
+    // some registry-prefill paths.  The production codewriter's
+    // jtransform path already runs `rpbc::lower_indirect_calls`
+    // before consuming these graphs; the real-rtyper cutover path
+    // cannot yet express the matching rclass/rpbc rewrite before
+    // adapter input without leaking post-rtyper `VtableMethodPtr` /
+    // `IndirectCall` ops into flowspace.  Treat this as a
+    // known-unported real-path gap so the dual gate falls back to
+    // the legacy type walker instead of panicking during registry
+    // population.
+    if msg.contains("Call with CallTarget::Indirect") && msg.contains("rclass") {
+        return Some("indirect-call-pre-rtyper");
+    }
+    // `annrpython.py mergeinputargs` — an inputarg Variable
+    // has no annotation. Happens when cross-block locals
+    // threading misses a name in the predecessor link; the
+    // annotator cannot merge `None` annotations.
+    if msg.contains("inputarg lacks annotation") {
+        return Some("inputarg-lacks-annotation");
+    }
+    // `BrokenReprTyperError` (`rmodel.py`, ported at
+    // `rmodel.rs:449-456`): a Repr whose `setup()` failed earlier
+    // is re-requested and refuses to half-initialize.  In the
+    // per-graph census a Skipped subject can leave a shared
+    // session `ClassRepr` in the BROKEN state; the next graph
+    // touching the same repr then surfaces this message.  It is a
+    // secondary echo of the root failure (itself Skip-classified
+    // above), not an independent cause — absorb it so one broken
+    // repr does not fatal every later graph in the session.
+    if msg.contains("cannot setup already failed Repr") {
+        return Some("broken-repr-echo");
+    }
+    // `AnnotatorError: immutablevalue(HostObject` is not
+    // Skip-classified for `SyntheticTransparentCtor` (Ok/Err/Some/
+    // None).  The adapter emits `HostObject::new_class(name, [])`
+    // (`flowspace_adapter.rs:821 SyntheticTransparentCtor` arm),
+    // routing through the existing `is_class()` arm in
+    // [`crate::annotator::bookkeeper::Bookkeeper::immutablevalue_hostobject`]
+    // (`bookkeeper.py:315-316` parity).  No production emit-site of
+    // `HostObject::new_opaque` remains in `front/`/`translator/rtyper/`,
+    // so any future `immutablevalue(HostObject` failure is a real
+    // parity bug — let it surface as a dual-gate divergence panic.
+    // TODO(post-rtyper-jtransform-variant-leak): retire this Skip
+    // entry per upstream parity — `jit/codewriter/jtransform.py`
+    // raises straight through on unexpected opnames.  The most
+    // frequent reach is `OpKind::Abort` emitted by the surface-Rust
+    // DSL front-end's `lower_expr` `stop_unsupported` /
+    // `continue_with_unknown` helpers
+    // when the surface DSL hits an unsupported expression — pyre
+    // source like `execute_opcode_step` / `eval_loop_jit` carry such
+    // placeholders.  Retiring this entry needs each Abort
+    // emit-site at the front-end retired (closure
+    // body, complex match arms, unsupported literals), then
+    // every other post-rtyper variant (IndirectCall / ResidualCall
+    // / Vable* / JitMergePoint / LoopHeader / InlineCall /
+    // RecursiveCall) emitted from `rpbc.rs` / `rclass.rs` ahead
+    // of the rtyper.  Until then the Skip absorbs the placeholder
+    // leakage; without it `tests::test_codegen_output` /
+    // `tests::test_recognition_report` and the analyse-pyre-source
+    // pipeline panic at the first reachable Abort.
+    if msg.contains("post-rtyper jtransform variant") {
+        return Some("post-rtyper-variant-leak");
+    }
+    // Cross-block body `Input` whose `name` was not threaded
+    // through `Link.args` / target `inputargs` by the predecessor.
+    // RPython flowspace has no body-`Input` op — every cross-block
+    // local reference goes via `flowcontext.py LOAD_FAST`
+    // (which writes into `self.locals_w`) and the target block's
+    // pre-allocated `inputargs[]`.  Pyre's body-`Input` emission
+    // (the `OpKind::Input` ops `front::mir` pushes into each block)
+    // is itself a TODO; when
+    // cross-block locals threading misses a shape, the adapter
+    // fails loud with this message instead of silently
+    // fabricating a fresh Variable (which would hide an
+    // SSA / alias-shape divergence from PyPy's flowspace).  Skip
+    // until either cross-block locals threading covers every
+    // shape, or the front-end's
+    // body-`Input` emission is replaced by a Link.args / inputargs
+    // threading pass that mirrors RPython.
+    if msg.contains("adapter cross-block body Input") {
+        return Some("cross-block-body-input");
+    }
+    // `SomeValue::noneify()` reached a `SomePtr` operand — a block
+    // merge unioned a `_ptr` with `NoneType`.  The raise itself is
+    // parity-correct: RPython's default `noneify` raises `UnionError`
+    // (model.py:121-122) and `SomePtr` defines no override, while
+    // `pair(SomePtr, SomeObject).union` raises too
+    // (llannotation.py:119-120) — so this Skip catches a *correct*
+    // raise, it does not paper over a wrong annotation rule.  The
+    // only divergence is upstream of the merge: RPython spells a null
+    // pointer as `lltype.nullptr(T)`, which annotates as a
+    // (null-valued) `SomePtr`, so `pair(SomePtr, SomePtr).union`
+    // (llannotation.py:94-98) keeps it in the pointer lattice and
+    // `noneify` is never reached.  Pyre's `front::mir` still lowers
+    // some Rust null/`Option<*T>` shapes to a `SomeNone` rather than
+    // a typed null `SomePtr` (the same null-pointer-typing gap
+    // tracked by the `LLAddress(Null)` exceptblock work), so the
+    // merge surfaces `_ptr ∪ NoneType`.  CONVERGENCE: lower a typed
+    // null pointer at the `front::mir` producer; removing this Skip
+    // without that fix only hard-breaks on the parity-correct raise.
+    // Until then the legacy walker keeps handling the graphs.
+    if msg.contains("noneify() not supported") {
+        return Some("noneify-on-ptr");
+    }
+    // `flowspace_adapter::translate_op` rejected an UNFUSED
+    // `lltype::malloc_typed` `FunctionPath` (the finding's "option (b)"
+    // fail-closed guard).  `fuse_boxing_alloc` rewrites only the three
+    // numeric boxing structs to `NewWithVtable`; every other mallocable
+    // GC struct's `malloc_typed` survives with no ported
+    // `jtransform.rewrite_op_malloc` general lowering, so the adapter
+    // fails loud rather than matching a wrong residual `simple_call`.
+    // Skip-classify so the census falls back to the legacy walker until
+    // the general malloc->new path lands (boxing-lowering epic #134/#142).
+    if msg.contains("survived fuse_boxing_alloc unfused") {
+        return Some("malloc-typed-unfused");
+    }
+    // `OrderedDictRepr::require_direct_compare_key` fail-closed gate
+    // (rordereddict.rs) — `build_ll_dict_lookup_helper_graph`'s
+    // `direct_compare_op` hardcodes `ptr_eq` for every `Ptr(_)` key
+    // lltype, which is wrong for keys whose repr defines a real
+    // structural equality (`get_ll_eq_function` returning `Some`, e.g.
+    // `StringRepr::ll_streq`). int/bool/char/unichar keys return `None`
+    // and proceed; every other key repr (str, instance) hits this
+    // TyperError instead of silently miscompiling dict getitem/contains
+    // to pointer-identity comparison. Skip-classify until the
+    // call-based keyeq branch is ported (#140 DictRepr epic).
+    if msg.contains("dict key eq function not wired") {
+        return Some("dict-key-eq-missing");
+    }
     // There is no `normalize_unary_op_name: pyre UnaryOp` Skip entry:
     // the 13 typed numeric / ptr / Unsigned casts route through
     // `simple_call(<host_callable>, v)` — reaching
@@ -1703,8 +1761,16 @@ pub(crate) fn is_known_unported(msg: &str) -> bool {
     // accepts `same_as` straight through; any residual fail-loud
     // surfaces as a dual-gate divergence panic — the parity-correct
     // outcome.
+    None
 }
 
+/// Whether the dual gate should Skip this failure to the legacy walker.
+///
+/// The predicate is [`unported_category`] with its answer erased, so there is
+/// one list of fallback conditions.
+pub(crate) fn is_known_unported(msg: &str) -> bool {
+    unported_category(msg).is_some()
+}
 /// Populate a `PyreCallRegistry` from a
 /// `HashMap<CallPath, FunctionGraph>` (the shape pyre's
 /// `CallControl::function_graphs()` returns).
@@ -3979,10 +4045,12 @@ mod tests {
         let msg = "translate_op: Call with CallTarget::Indirect at result=Some(v4) \
                    must be lowered to VtableMethodPtr + IndirectCall by rclass.rs before \
                    reaching the flowspace adapter";
-        assert!(
-            is_known_unported(msg),
-            "registry population must skip/fallback on the current indirect-call cutover gap"
+        assert_eq!(
+            unported_category(msg),
+            Some("indirect-call-pre-rtyper"),
+            "the indirect-call gap keeps its stable fallback category"
         );
+        assert!(is_known_unported(msg));
     }
 
     #[test]
@@ -3992,10 +4060,19 @@ mod tests {
         // `noneify` raises, `SomePtr` has no override) the dual gate
         // defers to legacy until `front::mir` lowers a typed null pointer.
         let msg = "RPython noneify() not supported for this annotation";
-        assert!(
-            is_known_unported(msg),
-            "noneify-on-ptr merge must skip/fallback on the typed-null-pointer-lowering gap"
+        assert_eq!(
+            unported_category(msg),
+            Some("noneify-on-ptr"),
+            "the typed-null-pointer gap keeps its stable fallback category"
         );
+        assert!(is_known_unported(msg));
+    }
+
+    #[test]
+    fn unknown_rtyper_failure_is_not_skip_classified() {
+        let msg = "unexpected rtyper invariant failure";
+        assert_eq!(unported_category(msg), None);
+        assert!(!is_known_unported(msg));
     }
 
     #[test]
