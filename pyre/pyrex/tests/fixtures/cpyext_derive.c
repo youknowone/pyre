@@ -116,7 +116,15 @@ static PyGetSetDef cell_getset[] = {
     {"tag", cell_get_tag, cell_set_tag, NULL, NULL},
     {NULL, NULL, NULL, NULL, NULL}};
 
+/* A `tp_repr` written in C, so that a class derived from this type in Python
+   without a `__repr__` of its own has one to inherit. */
+static PyObject *cell_repr(PyObject *self)
+{
+    return PyUnicode_FromFormat("<Cell %ld>", ((CellObject *)self)->value);
+}
+
 static PyType_Slot cell_slots[] = {
+    {Py_tp_repr, (void *)cell_repr},
     {Py_tp_new, (void *)cell_new},
     {Py_tp_init, (void *)cell_init},
     {Py_tp_dealloc, (void *)cell_dealloc},

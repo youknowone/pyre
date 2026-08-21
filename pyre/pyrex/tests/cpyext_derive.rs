@@ -56,6 +56,15 @@ eq('the subtype answers attributes', sub['getattro'], True)
 eq('the subtype names its base', sub['base'], m.Cell)
 eq('the constructor is the base\'s', m.shares_new(Sub, m.Cell), True)
 
+# A method the subtype does not define is reached through the base's own slot,
+# not through one installed here.  A slot installed for an inherited method
+# would resolve the name back to the wrapper that reads this very slot, and
+# the two would call each other until the stack ran out.
+eq('the repr a C base declares', repr(m.Cell(1)), '<Cell 1>')
+eq('and the subtype inherits it', repr(Sub(2)), '<Cell 2>')
+eq('read off the type, as a compiled module reads it',
+   m.call_slot('tp_repr', Sub(3)), '<Cell 3>')
+
 # The size is the base's, because the base's fields are what the constructor
 # fills: a block sized for the plain header would take those writes past its
 # end.
@@ -252,6 +261,16 @@ class Louder(Counted):
 
 
 eq('an override answers the slot', m.call_slot('tp_repr', Louder()), '<louder>')
+
+
+class Quiet(Counted):
+    pass
+
+
+# A subclass that overrides nothing takes its base's slot, and that slot still
+# reaches the method the base defines.
+eq('an inherited method reaches the base slot', m.call_slot('sq_length', Quiet()), 4)
+eq('and so does an inherited repr', m.call_slot('tp_repr', Quiet()), '<counted>')
 
 # A raising method surfaces as the failure it is, not as a slot's own error.
 class Broken:

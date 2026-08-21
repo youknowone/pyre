@@ -977,45 +977,87 @@ fn fills_number_suite(w_type: PyObjectRef) -> bool {
         && !derived(&pyre_object::pyobject::STR_TYPE)
 }
 
-/// Where a filled slot is written.  The type is passed because a number
-/// suite is not written for every one of them.
-type SlotWriter = fn(*mut CPyTypeObject, PyObjectRef, *const c_void);
+/// The two halves of reaching one slot: what it holds, and how it is written.
+///
+/// The read is what lets an inherited slot be taken from a base as it stands;
+/// the write takes the type because a number suite is not written for every
+/// one of them.
+#[derive(Clone, Copy)]
+struct SlotAccess {
+    read: fn(*mut CPyTypeObject) -> *const c_void,
+    write: fn(*mut CPyTypeObject, PyObjectRef, *const c_void),
+}
 
 macro_rules! scalar_entry {
     ($field:ident) => {
-        (|tp, _, slot| unsafe { (*tp).$field = slot }) as SlotWriter
+        SlotAccess {
+            read: |tp| unsafe { (*tp).$field },
+            write: |tp, _, slot| unsafe { (*tp).$field = slot },
+        }
+    };
+}
+
+/// The entry of a suite, which a type may carry none of.
+macro_rules! suite_entry {
+    ($suite:ident, $shape:ty, $field:ident, $write:expr) => {
+        SlotAccess {
+            read: |tp| unsafe {
+                match (*tp).$suite.is_null() {
+                    true => std::ptr::null(),
+                    false => (*(*tp).$suite).$field,
+                }
+            },
+            write: $write,
+        }
     };
 }
 
 macro_rules! number_entry {
     ($field:ident) => {
-        (|tp, w_type, slot| {
-            if fills_number_suite(w_type) {
-                unsafe { (*table_of!(tp, tp_as_number, CPyNumberMethods)).$field = slot }
+        suite_entry!(
+            tp_as_number,
+            CPyNumberMethods,
+            $field,
+            |tp, w_type, slot| {
+                if fills_number_suite(w_type) {
+                    unsafe { (*table_of!(tp, tp_as_number, CPyNumberMethods)).$field = slot }
+                }
             }
-        }) as SlotWriter
+        )
     };
 }
 
 macro_rules! sequence_entry {
     ($field:ident) => {
-        (|tp, _, slot| unsafe {
-            (*table_of!(tp, tp_as_sequence, CPySequenceMethods)).$field = slot
-        }) as SlotWriter
+        suite_entry!(
+            tp_as_sequence,
+            CPySequenceMethods,
+            $field,
+            |tp, _, slot| unsafe {
+                (*table_of!(tp, tp_as_sequence, CPySequenceMethods)).$field = slot
+            }
+        )
     };
 }
 
 macro_rules! mapping_entry {
     ($field:ident) => {
-        (|tp, _, slot| unsafe { (*table_of!(tp, tp_as_mapping, CPyMappingMethods)).$field = slot })
-            as SlotWriter
+        suite_entry!(
+            tp_as_mapping,
+            CPyMappingMethods,
+            $field,
+            |tp, _, slot| unsafe {
+                (*table_of!(tp, tp_as_mapping, CPyMappingMethods)).$field = slot
+            }
+        )
     };
 }
 
 macro_rules! async_entry {
     ($field:ident) => {
-        (|tp, _, slot| unsafe { (*table_of!(tp, tp_as_async, CPyAsyncMethods)).$field = slot })
-            as SlotWriter
+        suite_entry!(tp_as_async, CPyAsyncMethods, $field, |tp, _, slot| unsafe {
+            (*table_of!(tp, tp_as_async, CPyAsyncMethods)).$field = slot
+        })
     };
 }
 
@@ -1024,7 +1066,7 @@ macro_rules! async_entry {
 const UNARY_SLOTS: [(
     &str,
     unsafe extern "C" fn(*mut CPyObject) -> *mut CPyObject,
-    SlotWriter,
+    SlotAccess,
 ); 14] = [
     ("__repr__", interp_tp_repr, scalar_entry!(tp_repr)),
     ("__str__", interp_tp_str, scalar_entry!(tp_str)),
@@ -1046,7 +1088,7 @@ const UNARY_SLOTS: [(
 const LENGTH_SLOTS: [(
     &str,
     unsafe extern "C" fn(*mut CPyObject) -> isize,
-    SlotWriter,
+    SlotAccess,
 ); 3] = [
     ("__hash__", interp_tp_hash, scalar_entry!(tp_hash)),
     ("__len__", interp_sq_length, sequence_entry!(sq_length)),
@@ -1057,7 +1099,7 @@ const LENGTH_SLOTS: [(
 const BINARY_SLOTS: [(
     &str,
     unsafe extern "C" fn(*mut CPyObject, *mut CPyObject) -> *mut CPyObject,
-    SlotWriter,
+    SlotAccess,
 ); 13] = [
     ("__add__", interp_nb_add, number_entry!(nb_add)),
     ("__sub__", interp_nb_subtract, number_entry!(nb_subtract)),
@@ -1086,7 +1128,7 @@ const BINARY_SLOTS: [(
 const SSIZE_ARG_SLOTS: [(
     &str,
     unsafe extern "C" fn(*mut CPyObject, isize) -> *mut CPyObject,
-    SlotWriter,
+    SlotAccess,
 ); 3] = [
     ("__getitem__", interp_sq_item, sequence_entry!(sq_item)),
     ("__mul__", interp_sq_repeat, sequence_entry!(sq_repeat)),
@@ -1113,16 +1155,60 @@ fn is_interpreter_slot(slot: *const c_void) -> bool {
             .any(|&(_, function, _)| named(function as *const c_void))
 }
 
-/// `typeobject.py update_all_slots_builtin` — fill the slots `w_type` answers
-/// for itself.
+/// Install one slot — the body `typeobject.py update_all_slots` and
+/// `update_all_slots_builtin` share.
+///
+/// The two differ in what earns a trampoline.  A type this runtime defines
+/// answers for every method its MRO carries, so the lookup finding one is
+/// enough.  A class written in Python earns one only for a method of its own;
+/// for anything inherited it takes the base's slot as it stands, because a
+/// trampoline installed for an inherited method resolves the name back to the
+/// wrapper that reads this very slot, and the two would call each other until
+/// the stack ran out.
+fn install_slot(
+    mirror: *mut CPyTypeObject,
+    w_type: PyObjectRef,
+    heaptype: bool,
+    method: &str,
+    access: SlotAccess,
+    function: *const c_void,
+) {
+    let found = unsafe { crate::baseobjspace::lookup_where(w_type, method) };
+    let owned = match heaptype {
+        true => found.is_some_and(|(owner, _)| owner == w_type),
+        false => found.is_some(),
+    };
+    let base = unsafe { (*mirror).tp_base };
+    let inherited = match owned || base.is_null() {
+        true => std::ptr::null(),
+        false => (access.read)(base),
+    };
+    let value = match inherited.is_null() {
+        // Nothing to inherit, so the trampoline is the slot -- but only where
+        // the type has the method at all.
+        true if owned => function,
+        true => return,
+        false => inherited,
+    };
+    (access.write)(mirror, w_type, value);
+}
+
+/// `typeobject.py update_all_slots` and `update_all_slots_builtin` — fill the
+/// slots `w_type` answers for itself.
 fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
+    let heaptype = unsafe { pyre_object::typeobject::w_type_is_heaptype(w_type) };
     let defines = |method| unsafe { crate::baseobjspace::lookup_in_type(w_type, method) }.is_some();
     macro_rules! fill {
         ($table:ident) => {
-            for (method, function, store) in $table {
-                if defines(method) {
-                    store(mirror, w_type, function as *const c_void);
-                }
+            for (method, function, access) in $table {
+                install_slot(
+                    mirror,
+                    w_type,
+                    heaptype,
+                    method,
+                    access,
+                    function as *const c_void,
+                );
             }
         };
     }
@@ -1130,14 +1216,33 @@ fn fill_interpreter_slots(mirror: *mut CPyTypeObject, w_type: PyObjectRef) {
     fill!(LENGTH_SLOTS);
     fill!(BINARY_SLOTS);
     fill!(SSIZE_ARG_SLOTS);
-    if defines("__pow__") {
-        number_entry!(nb_power)(mirror, w_type, interp_nb_power as *const c_void);
-    }
+    install_slot(
+        mirror,
+        w_type,
+        heaptype,
+        "__pow__",
+        number_entry!(nb_power),
+        interp_nb_power as *const c_void,
+    );
     // Both names, because one slot answers for the assignment and the
     // deletion and there is no spelling for having only one of them.
     if defines("__setitem__") && defines("__delitem__") {
-        mapping_entry!(mp_ass_subscript)(mirror, w_type, interp_mp_ass_subscript as *const c_void);
-        sequence_entry!(sq_ass_item)(mirror, w_type, interp_sq_ass_item as *const c_void);
+        install_slot(
+            mirror,
+            w_type,
+            heaptype,
+            "__setitem__",
+            mapping_entry!(mp_ass_subscript),
+            interp_mp_ass_subscript as *const c_void,
+        );
+        install_slot(
+            mirror,
+            w_type,
+            heaptype,
+            "__setitem__",
+            sequence_entry!(sq_ass_item),
+            interp_sq_ass_item as *const c_void,
+        );
     }
 }
 
