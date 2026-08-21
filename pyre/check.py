@@ -150,9 +150,10 @@ WASM_TIMEOUT_SCALE = 4.0
 # 4x when 3x was collecting per-fixture `max-wasm-ratio` allowances one at a
 # time (fannkuch, fib_recursive, raise_catch_loop,
 # short_circuit_value_kept_stack) rather than measuring anything, and came back
-# to 3.5 once every one of those allowances had been removed and the fixture
-# that still exceeded it -- fib_recursive, at 3.87x -- was fixed rather than
-# exempted. No fixture carries an allowance today.
+# to 3.5 once every one of those allowances had been removed and the fixtures
+# that still exceeded it -- fib_recursive and loop_callee_shared_mutation, both
+# bound by CALL_ASSEMBLER returns -- were fixed rather than exempted. No fixture
+# carries an allowance today.
 WASM_MAX_DYNASM_RATIO = 3.5
 # Native Windows CI can spend substantially more wall time than reported
 # process user-CPU while antivirus and concurrent matrix jobs contend for the
