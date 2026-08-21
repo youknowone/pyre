@@ -1365,8 +1365,14 @@ impl VirtualState {
                             .get_box_replacement_operand_opt(rb)
                             .and_then(|b| state.ctx.get_constant_box(&b))
                     });
+                    // The constant-folded reading above is not what the
+                    // Constant arm decides on: that one calls `runtime_value_of`,
+                    // which reads the box's OBSERVED value. Print both, or a
+                    // refusal that had an observed value all along reads as a
+                    // box with no value at all.
+                    let observed = runtime_box.and_then(|rb| state.ctx.runtime_value_of(rb));
                     eprintln!(
-                        "[jit][jte] virtualstate mismatch index={i} box={box_opref:?} runtime={runtime_box:?} runtime_value={runtime_value:?} expected={expected:?} incoming={incoming:?}"
+                        "[jit][jte] virtualstate mismatch index={i} box={box_opref:?} runtime={runtime_box:?} runtime_value={runtime_value:?} observed={observed:?} expected={expected:?} incoming={incoming:?}"
                     );
                 }
                 return Err(VirtualStatesCantMatch::default());
