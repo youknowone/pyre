@@ -5054,9 +5054,22 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
             .filter(|frame| !frame.is_none())
         else {
             // The old single-frame inline path has no callee red to read.  Do
-            // not borrow the root frame: the residual's unbound callee-frame
-            // argument will decline this trace instead of compiling the wrong
-            // namespace.
+            // not borrow the root frame — that collapses caller and callee
+            // identity — but the callee's OWN `__globals__` is recorded right
+            // here, and `try_walker_load_global_cell_fold`'s builtins leg is
+            // written for exactly this case (`frame_ptr == 0`, deriving the
+            // builtin module from the namespace's `__builtins__` cell).  Naming
+            // it directly is what lets that leg run; leaving the codewriter's
+            // null placeholder standing declines the fold and then aborts the
+            // trace on the residual's unbound callee-frame argument.
+            //
+            // Immovable only, matching `guard_current_frame_globals_identity`,
+            // where both fold legs end: a movable namespace declines there
+            // anyway, so substituting one would buy nothing and bake a pointer
+            // the GC may forward into the surviving residual.
+            if consts.w_globals != 0 && !majit_gc::can_move(majit_ir::GcRef(consts.w_globals)) {
+                *ns_box = ctx.trace_ctx.const_ref(consts.w_globals as i64);
+            }
             return;
         };
         let w_globals = crate::state::frame_get_globals_obj(ctx.trace_ctx, frame);
