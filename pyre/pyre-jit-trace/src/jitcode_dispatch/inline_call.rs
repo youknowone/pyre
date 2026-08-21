@@ -1953,6 +1953,42 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
 /// answering them here is the difference between one scan per callee and one
 /// per call site. `None` when the code has no installed jitcode body or descr
 /// pool, which is the same condition the callers already decline on.
+/// Whether `w_code` commits nothing a discarded sub-walk would double.
+///
+/// A route whose entry opcode is not a call boundary — `COMPARE_OP`,
+/// `BINARY_OP` — has no sound abort once the body has run.
+/// [`latch_abort_call_resume`] resumes *at* the call and so re-executes it,
+/// which is why it refuses as soon as `fbw_executed_effect_count()` has moved;
+/// and a bare `Err` leaves the walk driver replaying the loop from entry with
+/// the body's effects already applied.  Only a body that commits nothing can be
+/// thrown away either way, so admission is what has to carry the decision.
+///
+/// `DeferredCall` is not enough here.  Its promise is that a residual the lever
+/// cannot inline aborts and rewinds to the enclosing CALL, and the FOR_ITER
+/// gate already records why that rewind does not reach a `BINARY_OP` /
+/// `COMPARE_OP` entry: the flush resumes one operand short.
+fn callee_body_commits_nothing(w_code: *const ()) -> bool {
+    let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
+        return false;
+    };
+    let Some((descr_refs, _, _)) = crate::state::sub_jitcode_descr_pool_for_code(w_code) else {
+        return false;
+    };
+    matches!(
+        fbw_callee_body_replay_safety(
+            body.code,
+            &[],
+            body.num_regs_i,
+            body.constants_i,
+            body.num_regs_r,
+            body.constants_r,
+            &descr_refs,
+            false,
+        ),
+        CalleeReplaySafety::Clean
+    )
+}
+
 fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::InlineBodyFacts> {
     let body = crate::state::sub_jitcode_body_for_code(code)?;
     let (descr_refs, _, _) = crate::state::sub_jitcode_descr_pool_for_code(code)?;
@@ -7305,6 +7341,15 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             pyre_object::typeobject::w_type_get_name(w_class)
         }));
     }
+    // A `NotImplemented` result below is discarded with a bare `Err`, and this
+    // entry opcode is not a boundary that abort can rewind to, so a body that
+    // commits anything would have its effects replayed by the walk driver.
+    if !callee_body_commits_nothing(w_code) {
+        decline!(format_args!(
+            "{}.{dunder} commits a replayable effect",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    }
 
     let arg_concretes = vec![
         ConcreteValue::Ref(method),
@@ -7459,6 +7504,12 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         return Ok(None);
     };
     if nparams != 2 {
+        return Ok(None);
+    }
+    // A `NotImplemented` result below is discarded with a bare `Err`, and this
+    // entry opcode is not a boundary that abort can rewind to, so a body that
+    // commits anything would have its effects replayed by the walk driver.
+    if !callee_body_commits_nothing(w_code) {
         return Ok(None);
     }
 
