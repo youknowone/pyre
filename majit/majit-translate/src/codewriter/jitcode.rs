@@ -2288,6 +2288,12 @@ mod tests {
             is_immutable: false,
             is_quasi_immutable: false,
             index_in_parent: 0,
+            // Nothing declared this field a class word, which is what
+            // `bh_field_spec_from_parts` also records for a spec built with no
+            // layout in reach. `same_descr_layout` reads the name-derived
+            // inference rather than this field, so the test is unaffected
+            // either way.
+            is_class_word: None,
         }
     }
 
