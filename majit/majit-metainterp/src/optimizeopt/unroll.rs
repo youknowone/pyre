@@ -244,6 +244,42 @@ fn refresh_forwarded_const_ref(
     }
 }
 
+/// pyjitpl.py:3213 `live_arg_boxes[num_green_args:]` - `runtime_boxes` are
+/// the original boxes, InputArg and Op alike. Phase 2 recovers an Op arg's
+/// observed value through its producing op, but `find_producer_op` has
+/// nothing to return for an InputArg arg, so materialize the entry box's
+/// value as an inline Const, which carries it namespace-independently.
+/// `runtime_boxes` are only ever READ by `generate_guards`
+/// (virtualstate.py:646-652); the guard it emits carries the target
+/// state's own constant, never this one.
+fn fold_recorded_jump_args(
+    args: Vec<OpRef>,
+    inputarg_boxes: &[majit_ir::InputArgRc],
+) -> Vec<OpRef> {
+    args.into_iter()
+        .map(|arg| {
+            let inputarg_index = match arg {
+                OpRef::InputArgInt(i) | OpRef::InputArgFloat(i) | OpRef::InputArgRef(i) => {
+                    Some(i as usize)
+                }
+                _ => None,
+            };
+            let Some(inputarg_box) = inputarg_index.and_then(|i| inputarg_boxes.get(i)) else {
+                return arg;
+            };
+            if Some(inputarg_box.tp) != arg.ty() {
+                return arg;
+            }
+            match inputarg_box.get_value() {
+                Some(value) if !matches!(value, Value::Void) => {
+                    OpRef::const_inline_from_value(&value)
+                }
+                _ => arg,
+            }
+        })
+        .collect()
+}
+
 /// unroll.py: UnrollOptimizer — high-level loop optimization controller.
 ///
 /// Wraps the streaming OptUnroll pass with RPython's UnrollOptimizer API:
@@ -334,6 +370,12 @@ pub struct UnrollOptimizer {
     /// Propagated to Phase 1 and Phase 2 Optimizer.trace_inputargs
     /// so value_types covers inputarg OpRefs.
     pub trace_inputargs: Vec<majit_ir::OpRef>,
+    /// compile.py:275 `PreambleCompileData(trace, jumpargs, ...)` - the
+    /// ORIGINAL history boxes behind `runtime_boxes`. `trace_inputargs`
+    /// carries only each entry slot's position and type; these are the boxes
+    /// themselves, whose observed value virtualstate.py:400-405/:493-498/:579
+    /// /:601-620 read un-forwarded off `runtime_boxes[i]`.
+    pub trace_inputarg_boxes: Vec<majit_ir::InputArgRc>,
     /// Phase 1 emit ops (filtered to non-NONE pos, non-Void type) carried
     /// into Phase 2 so that `OptContext::op_at` resolves Phase 1 OpRefs
     /// directly via `op.type_` (history.py:220 box.type parity).
@@ -503,6 +545,7 @@ impl UnrollOptimizer {
             all_descrs: std::sync::Arc::new(Vec::new()),
             quasi_immutable_deps: Vec::new(),
             trace_inputargs: Vec::new(),
+            trace_inputarg_boxes: Vec::new(),
             phase1_emit_ops: Vec::new(),
             phase1_patchguardop: None,
             next_global_opref: 0,
@@ -856,11 +899,13 @@ impl UnrollOptimizer {
             // exported state below so the peeled-loop close reads it as
             // `state.runtime_boxes` (unroll.py:105 → :153/166) rather than the
             // peeled body's own jump args.
-            let recorded_jump_args: Vec<OpRef> = ops
-                .iter()
-                .rfind(|op| op.opcode == OpCode::Jump)
-                .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
-                .unwrap_or_default();
+            let recorded_jump_args = fold_recorded_jump_args(
+                ops.iter()
+                    .rfind(|op| op.opcode == OpCode::Jump)
+                    .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+                    .unwrap_or_default(),
+                &self.trace_inputarg_boxes,
+            );
             // Hand opt_p1 the per-iter operand pool that p1_iter
             // allocated. trace.get_iter() per-call
             // inputarg_from_tp(...) / cls() — each phase optimizes against a
@@ -7216,6 +7261,46 @@ mod tests {
             unroll_opt.optimize_trace_with_constants_and_inputs(&ops, &mut constants, 2);
         // The optimizer processes the trace; result should not be empty
         assert!(!result.is_empty(), "optimize_trace should produce output");
+    }
+
+    #[test]
+    fn test_recorded_jump_inputarg_keeps_observed_runtime_value() {
+        let mut unroll_opt = UnrollOptimizer::new();
+        unroll_opt.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[Type::Int]);
+        let inputarg_box = majit_ir::InputArg::new_int_rc(0);
+        inputarg_box.set_value(Value::Int(73));
+        unroll_opt.trace_inputarg_boxes = vec![inputarg_box];
+
+        let mut ops = vec![
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_inputarg_operand(Type::Int, 0),
+                    rooted_inputarg_operand(Type::Int, 0),
+                ],
+            ),
+            Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Int, 0)]),
+        ];
+        assign_positions(&mut ops, 1);
+        let mut constants = majit_ir::ConstMap::new();
+        let mut phase1_out = None;
+
+        unroll_opt
+            .optimize_trace_with_constants_and_inputs_vable_out(
+                &ops,
+                &mut constants,
+                1,
+                None,
+                Some(&mut phase1_out),
+            )
+            .expect("tiny loop should optimize");
+        let state = phase1_out.expect("Phase 1 should export loop state").1;
+
+        assert_eq!(
+            state.runtime_boxes[0],
+            OpRef::const_int(73),
+            "recorded closing-JUMP entry InputArg must retain observed runtime value",
+        );
     }
 
     #[test]

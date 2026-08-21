@@ -6754,6 +6754,7 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
+        unroll_opt.trace_inputarg_boxes = preamble_data.base.inputargs().to_vec();
         // resume.py parity: convert tracing-time snapshots to flat OpRef
         // vectors so the optimizer can rebuild fail_args from snapshot in
         // store_final_boxes_in_guard (RPython ResumeDataVirtualAdder.finish).
@@ -8583,6 +8584,7 @@ impl<M: Clone> MetaInterp<M> {
             .enumerate()
             .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
             .collect();
+        unroll_opt.trace_inputarg_boxes = trace.inputargs.clone();
         let (
             mut retrace_snapshot_boxes,
             retrace_snapshot_frame_sizes,
