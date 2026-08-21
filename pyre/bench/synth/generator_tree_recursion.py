@@ -3,11 +3,12 @@
 # Jitcounter decay is 0.96 every 32 minor collections
 # (majit-trace/src/counter.rs), so guard_failures tracks collection count during
 # each guard's warm-up rather than a compile decision. One host measured
-# 2951..2958 across nursery sizes; PYRE_JIT=decay=0 pinned 2999 everywhere,
-# while loops_compiled=3 and bridges_compiled=26 stayed invariant and remain
-# gated exactly. Width 8 adds one count of margin (0.27%); real regressions this
-# gate caught moved by hundreds to thousands (828 -> 4923, 404 -> 812,
-# 937 -> 7408).
+# 3648..3661 across nursery sizes; PYRE_JIT=decay=0 pinned 3600 everywhere,
+# while loops_compiled=3 and bridges_compiled=29 stayed invariant and remain
+# gated exactly. The fixture sets decay=0 itself, so the band covers the pinned
+# run, not that 13-wide unpinned spread; width 8 is margin (0.22%). Real
+# regressions this gate caught moved by hundreds to thousands (828 -> 4923,
+# 404 -> 812, 937 -> 7408).
 # Generator-driven accumulation over recursive tree/linear results. The
 # tree_sum recursion once silently miscompiled on cranelift (first checksum
 # already wrong) and recovered a regalloc panic on dynasm. Deterministic;

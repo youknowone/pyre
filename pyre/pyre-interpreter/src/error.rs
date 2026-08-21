@@ -425,6 +425,56 @@ pub struct PyError {
 /// traceback, or context state.
 pub type OperationError = PyError;
 
+/// [`PyError::to_exc_object`] behind the residual-call ABI:
+/// one pointer in, one pointer out, and a body the codewriter does not
+/// look inside.
+///
+/// The lowered raise path emits this spelling instead of the method
+/// (`front/result_exc.rs`'s callee rule), so materialising the exception
+/// keeps its shadow-stack roots, `w_exception_new_empty_impl`, and the
+/// WTF-8 and allocation machinery under it out of the caller's JitCode.
+/// A jitcode that merely *can* raise otherwise carries all of it, and one
+/// un-lowered call anywhere in that body refuses the whole descent.
+///
+/// The pointer spellings are load-bearing: the call-target trampoline
+/// reads word-sized arguments and cannot see through a reference or the
+/// `PyObjectRef` alias.
+///
+/// # Safety
+/// `err` must point to a live `PyError` no other borrow aliases.
+#[majit_macros::dont_look_inside]
+pub unsafe fn pyerror_to_exc_object(err: *mut PyError) -> *mut pyre_object::PyObject {
+    unsafe { (*err).to_exc_object() }
+}
+
+/// [`PyError::type_error`] and [`PyError::to_exc_object`] fused into one
+/// residual call, so a raise site carries neither body.
+///
+/// The two-call form leaves `PyError::new` in the caller's JitCode as a
+/// transparent constructor with no host symbol, and every descent that
+/// reaches it is refused. Fusing them removes the constructor from the
+/// caller entirely: the front rule
+/// (`front/result_exc.rs::fuse_kind_ctor_raise`) rewrites the
+/// `PyError::type_error` call to this one and drops the successor's
+/// `pyerror_to_exc_object`.
+///
+/// `w_msg` is the message *object*, not a `&str`: the JIT models a Rust
+/// string constant as a single `W_UnicodeObject` word, while `&str` is a
+/// two-word aggregate with no one-word residual-call ABI — the reason
+/// `stack_underflow_error` stays unpublished (`jit_fnaddr.rs`). The front
+/// rule only fires where the message resolves to a string literal, which is
+/// what makes that word a `box_str_constant` object.
+///
+/// # Safety
+/// `w_msg` must be a live `W_UnicodeObject`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn pyerror_type_error_to_exc_object(
+    w_msg: *mut pyre_object::PyObject,
+) -> *mut pyre_object::PyObject {
+    let msg = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_msg) }.to_owned();
+    PyError::type_error(msg).to_exc_object()
+}
+
 impl PyError {
     /// Forward the up-to-three GC-managed references a `PyError` holds — the
     /// cached exception object and the lazy NameError/AttributeError name/obj

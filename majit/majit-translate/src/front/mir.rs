@@ -2213,6 +2213,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 tail_forwarded_returns,
             )
             .map_err(LowerError::Unsupported)?;
+            // Fold each raise site's `PyError` constructor into its
+            // materialisation call, so the transparent constructor — which has
+            // no host symbol and therefore no address — leaves this graph.
+            crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
             if result_exc_ok_is_unit {
                 // Stamp `FUNC.RESULT = void`.  The exception-link lowering
                 // already returns the unit `()` (the callee no longer

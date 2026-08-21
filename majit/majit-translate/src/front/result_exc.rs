@@ -583,7 +583,18 @@ pub(crate) fn lower_result_exc_returns(
                 .push_op_var(
                     block_id,
                     OpKind::Call {
-                        target: CallTarget::method("to_exc_object", Some("PyError".to_string())),
+                        // The free-function spelling, not the method: it is
+                        // `dont_look_inside` and its address is published, so
+                        // the raise site records one residual call instead of
+                        // inlining the materialisation body — whose GC-root,
+                        // `w_exception_new_empty_impl`, WTF-8 and allocation
+                        // calls would otherwise sit in this JitCode and refuse
+                        // every descent that reaches it.
+                        target: CallTarget::FunctionPath {
+                            segments: ["pyre_interpreter", "error", "pyerror_to_exc_object"]
+                                .map(str::to_string)
+                                .to_vec(),
+                        },
                         args: vec![payload],
                         result_ty: ValueType::Ref(None),
                     },
@@ -2770,4 +2781,210 @@ pub(crate) fn collapse_pos0_read(
     block.exitswitch = sw;
     block.exits = exits;
     Ok(Some(payload_ty))
+}
+
+/// The one-argument `PyError` constructors this pass fuses, and the published
+/// helper each fuses into.
+///
+/// Measured over the 301 distinct gateway wrappers: `type_error` is the only
+/// constructor that reaches a raise site, 681 occurrences, all of them in the
+/// shape below. Extending the table is a one-line change plus its helper.
+const FUSED_KIND_CTORS: &[(&str, &str)] = &[("type_error", "pyerror_type_error_to_exc_object")];
+
+/// Fuse `PyError::<kind>(msg)` and the `pyerror_to_exc_object` that consumes
+/// it into a single published call.
+///
+/// [`lower_result_exc_returns`] leaves each raise site as a constructor in one
+/// block feeding a materialisation in its successor. The constructor is
+/// `PyError::new` once inlined — a transparent constructor with no host
+/// symbol, so it can never be given an address, and the descent that reaches
+/// it is refused. Rewriting the pair to one opaque call removes it from the
+/// caller's JitCode altogether.
+///
+/// The shape required, all of it verified before anything is mutated:
+///
+/// ```text
+///   pred:  v_msg = <string literal>          (may be several blocks back)
+///          v_err = PyError::<kind>(v_msg)
+///          -> succ, args[pos] = v_err        (pred's only exit)
+///   succ:  inputargs[pos] = v_payload        (pred is succ's only predecessor)
+///          v_exc = pyerror_to_exc_object(v_payload)   (succ's only operation)
+///          -> exceptblock, args = [v_exc, v_exc]
+/// ```
+///
+/// `v_msg` must resolve to a string literal: the helper reads it as a
+/// `W_UnicodeObject`, which is what a literal's one-word `r` constant
+/// materialises to, and a runtime-built message need not be one.
+pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
+    // (pred, ctor op index, helper leaf, succ, payload position)
+    let mut fusions: Vec<(usize, usize, &'static str, usize, usize)> = Vec::new();
+    for si in 0..graph.blocks.len() {
+        let succ = &graph.blocks[si];
+        // `succ` holds nothing but the materialisation, and raises its result.
+        let [op] = succ.operations.as_slice() else {
+            continue;
+        };
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some("pyerror_to_exc_object") {
+            continue;
+        }
+        let ([v_payload], Some(v_exc)) = (args.as_slice(), op.result.as_ref()) else {
+            continue;
+        };
+        let [exit] = succ.exits.as_slice() else {
+            continue;
+        };
+        if exit.target != graph.exceptblock
+            || !exit
+                .args
+                .iter()
+                .all(|a| matches!(a, LinkArg::Value(v) if v == v_exc))
+        {
+            continue;
+        }
+        let Some(pos) = succ.inputargs.iter().position(|v| v == v_payload) else {
+            continue;
+        };
+        // Exactly one predecessor, reaching `succ` by exactly one exit: any
+        // other producer of the payload would keep its own constructor.
+        let [pred_id] = graph.predecessors(BlockId(si))[..] else {
+            continue;
+        };
+        let pi = pred_id.0;
+        let pred = &graph.blocks[pi];
+        let [pred_exit] = pred.exits.as_slice() else {
+            continue;
+        };
+        let Some(LinkArg::Value(v_err)) = pred_exit.args.get(pos) else {
+            continue;
+        };
+        // The constructor, and the guarantee that the forwarding exit is the
+        // only thing that reads it — a second reader wants a real `PyError`.
+        let Some(ctor_idx) = pred.operations.iter().position(|o| {
+            o.result.as_ref() == Some(v_err) && matches!(&o.kind, OpKind::Call { .. })
+        }) else {
+            continue;
+        };
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &pred.operations[ctor_idx].kind
+        else {
+            continue;
+        };
+        let n = segments.len();
+        if n < 2 || segments[n - 2] != "PyError" {
+            continue;
+        }
+        let Some((_, helper)) = FUSED_KIND_CTORS.iter().find(|(c, _)| *c == segments[n - 1]) else {
+            continue;
+        };
+        let [v_msg] = args.as_slice() else {
+            continue;
+        };
+        let uses = count_var_uses(graph, v_err);
+        if uses.op_uses != 0 || uses.link_uses != 1 {
+            continue;
+        }
+        // The helper reads the message as a `W_UnicodeObject`.
+        if !message_is_str_literal(graph, pi, ctor_idx, v_msg) {
+            continue;
+        }
+        fusions.push((pi, ctor_idx, helper, si, pos));
+    }
+    for &(pi, ctor_idx, helper, si, pos) in &fusions {
+        if let OpKind::Call { target, .. } = &mut graph.blocks[pi].operations[ctor_idx].kind {
+            *target = CallTarget::FunctionPath {
+                segments: ["pyre_interpreter", "error", helper]
+                    .map(str::to_string)
+                    .to_vec(),
+            };
+        }
+        // The constructor's result variable now holds the exception object, so
+        // the value already forwarded into `succ` is what the raise link wants.
+        let payload = graph.blocks[si].inputargs[pos].clone();
+        graph.blocks[si].operations.clear();
+        let raise_arity = graph.blocks[si].exits[0].args.len();
+        graph.blocks[si].exits[0].args = vec![LinkArg::Value(payload); raise_arity];
+    }
+}
+
+/// Whether `var`, read in `block` before operation `before`, is a string
+/// literal on every path that reaches that read.
+///
+/// [`box_str_const_fold::dominating_literal`](crate::translator::rtyper::box_str_const_fold)
+/// answers the neighbouring question — *which* literal — and so accepts only
+/// straight-line control flow. A raise site's message routinely arrives at a
+/// merge block instead, where the paths carry different literals; the fusion
+/// does not need to know which one, only that every one of them is a literal,
+/// because that is what makes the word a `box_str_constant` object.
+///
+/// A value that is neither produced nor an input in the block it is read from
+/// is looked for in the predecessors unrenamed, mirroring the walk above; the
+/// entry block has none, so a parameter is not a literal and stops the proof.
+fn message_is_str_literal(
+    graph: &FunctionGraph,
+    block: usize,
+    before: usize,
+    var: &Variable,
+) -> bool {
+    let mut work = vec![(block, before, var.clone())];
+    let mut seen: Vec<(usize, Variable)> = Vec::new();
+    while let Some((bi, before, value)) = work.pop() {
+        if seen.contains(&(bi, value.clone())) {
+            continue;
+        }
+        seen.push((bi, value.clone()));
+        let block = &graph.blocks[bi];
+        if let Some(producer) = block.operations[..before]
+            .iter()
+            .rev()
+            .find(|op| op.result.as_ref() == Some(&value))
+        {
+            if crate::translator::rtyper::box_str_const_fold::str_literal_bytes(&producer.kind)
+                .is_none()
+            {
+                return false;
+            }
+            continue;
+        }
+        let slot = block.inputargs.iter().position(|a| *a == value);
+        let predecessors = graph.predecessors(BlockId(bi));
+        if predecessors.is_empty() {
+            return false;
+        }
+        for pred in predecessors {
+            let pb = &graph.blocks[pred.0];
+            let incoming = match slot {
+                None => vec![value.clone()],
+                Some(slot) => {
+                    let mut vs = Vec::new();
+                    for link in pb.exits.iter().filter(|l| l.target == BlockId(bi)) {
+                        let Some(LinkArg::Value(v)) = link.args.get(slot) else {
+                            return false;
+                        };
+                        vs.push(v.clone());
+                    }
+                    if vs.is_empty() {
+                        return false;
+                    }
+                    vs
+                }
+            };
+            work.extend(
+                incoming
+                    .into_iter()
+                    .map(|v| (pred.0, pb.operations.len(), v)),
+            );
+        }
+    }
+    true
 }

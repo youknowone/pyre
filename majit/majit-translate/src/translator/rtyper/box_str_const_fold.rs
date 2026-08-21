@@ -30,6 +30,25 @@ fn is_box_str_constant_call(kind: &OpKind) -> Option<&Variable> {
     .then_some(arg)
 }
 
+/// The bytes of a string literal, in either spelling it can have.
+///
+/// [`str_const_fold::fold_str_consts`](crate::translator::rtyper::str_const_fold::fold_str_consts)
+/// rewrites the front's synthetic `__str_const` call to [`OpKind::ConstStr`],
+/// but it runs in the codewriter — a front pass still sees the call.
+pub(crate) fn str_literal_bytes(kind: &OpKind) -> Option<Vec<u8>> {
+    match kind {
+        OpKind::ConstStr(bytes) => Some(bytes.clone()),
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const" => {
+            Some(segments[1].as_bytes().to_vec())
+        }
+        _ => None,
+    }
+}
+
 /// Resolve `value` to a string literal that dominates its use.
 ///
 /// The walk accepts only straight-line control flow. At a block input it also
@@ -59,10 +78,7 @@ fn dominating_literal(
             .rev()
             .find(|op| op.result.as_ref() == Some(&value))
         {
-            return match &producer.kind {
-                OpKind::ConstStr(bytes) => Some(bytes.clone()),
-                _ => None,
-            };
+            return str_literal_bytes(&producer.kind);
         }
 
         if let Some(slot) = block.inputargs.iter().position(|arg| arg == &value) {

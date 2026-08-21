@@ -1975,6 +1975,28 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_range_iter_new",
         pyre_object::jit_range_iter_new as *const (),
     );
+    // The lowered raise path's exception materialisation, opaque so that its
+    // body stays out of every JitCode that can raise.
+    let pyerror_to_exc_object: extern "C" fn(i64) -> i64 =
+        crate::error::__majit_call_target_pyerror_to_exc_object;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::error::pyerror_to_exc_object",
+        "pyre_interpreter::pyerror_to_exc_object",
+        pyerror_to_exc_object as *const (),
+    );
+    // The same materialisation with the `type_error` constructor folded in, so
+    // the raise site carries neither body. The typed local is the only
+    // compile-time check that the trampoline's signature matches the residual
+    // call — `push_alias_pair` performs none.
+    let pyerror_type_error_to_exc_object: extern "C" fn(i64) -> i64 =
+        crate::error::__majit_call_target_pyerror_type_error_to_exc_object;
+    push_alias_pair(
+        &mut entries,
+        "pyre_interpreter::error::pyerror_type_error_to_exc_object",
+        "pyre_interpreter::pyerror_type_error_to_exc_object",
+        pyerror_type_error_to_exc_object as *const (),
+    );
     // `elidable_cannot_raise` subclass-range check; the trampoline widens its
     // one-word bool return by zero-extension.
     let ll_issubclass: extern "C" fn(i64, i64) -> i64 =
