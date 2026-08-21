@@ -1023,11 +1023,12 @@ impl OptRewrite {
     /// `INFO_UNKNOWN` integer return into the local `Nullness` enum.
     fn getnullness(&self, opref: OpRef, ctx: &mut OptContext) -> Nullness {
         // optimizer.py `getnullness` has no missing-Box branch —
-        // every `op` has a backing `AbstractValue` per
-        // `resoperation.py:233-248`. `get_box_replacement_operand_opt` resolves
-        // the opref to its bound host; the read-only `getnullness` below
-        // never writes, so an unresolvable opref (OpRef::NONE sentinel,
-        // no upstream equivalent) maps to `INFO_UNKNOWN`.
+        // every `op` has a backing `AbstractValue`, because
+        // `resoperation.py` derives `AbstractResOpOrInputArg` from it and
+        // `AbstractResOp` from that. `get_box_replacement_operand_opt`
+        // resolves the opref to its bound host; the read-only `getnullness`
+        // below never writes, so an unresolvable opref (OpRef::NONE
+        // sentinel, no upstream equivalent) maps to `INFO_UNKNOWN`.
         let info = match ctx.get_box_replacement_operand_opt(opref) {
             Some(b) => ctx.getnullness(&b),
             None => crate::optimizeopt::INFO_UNKNOWN,
